@@ -16,6 +16,8 @@ const plugin_config = @import("../../engines/mlx/plugin/config.zig");
 const Generator = @import("../../engines/mlx/generate/generator.zig").Generator;
 const Tokenizer = @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer;
 const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+const both = @import("../../engines/mlx/plugin/both.zig");
+const sliding_ring = @import("../../sdk/config/sliding_ring.zig");
 
 const testing = std.testing;
 
@@ -287,6 +289,51 @@ test "gemma4 plugin: a 26B-A4B-shaped bf16 pack is bit-equal to the legacy forwa
 test "gemma4 plugin: the parse equals the legacy parse on the proof packs" {
     for ([_][]const u8{ e_series, dense31b, a4b }) |json|
         try proof.expectParseEqual(gemma4.config.Config, &gemma4.table, json, &proof.flip_waived);
+}
+
+/// `b`'s served model with every sliding layer's ring checked at window + slack, then run full (ring 0) against rings
+/// of window + 2 rows (`both.expectRingSame`), batched rows too when `batched`.
+fn expectRing(b: *proof.Both, comptime n: usize, batched: bool) !void {
+    const m: *gemma4.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
+    var full: [n]gemma4.decoder.Layer = undefined;
+    var ringed: [n]gemma4.decoder.Layer = undefined;
+    for (m.base.weights.layers, &full, &ringed) |l, *f, *r| {
+        try testing.expectEqual(sliding_ring.rows(l.attn.window), l.attn.ring);
+        f.* = l;
+        f.attn.ring = 0;
+        r.* = l;
+        r.attn.ring = if (l.attn.window > 0) l.attn.window + 2 else 0;
+    }
+    var fw = m.base.weights;
+    fw.layers = &full;
+    var rw = m.base.weights;
+    rw.layers = &ringed;
+    try both.expectRingSame(gemma4.decoder, &m.base.shared, b.xfm.s, &fw, &rw, n, batched);
+}
+
+test "gemma4 plugin: sliding layers keep a ring of window + slack rows, and a ring that drops rows reads as the full buffer" {
+    {
+        var p = fixture.Pack.init(0x9e60);
+        defer p.deinit();
+        try writeGemma4(&p, .{}, 256, 2, true, false);
+        var b = try proof.Both.openAs(&gemma4.table, &p, e_series, .none);
+        defer b.close();
+        try expectRing(&b, 6, true);
+    }
+    {
+        var p = fixture.Pack.init(0x9e61);
+        defer p.deinit();
+        try writeGemma4(&p, null, 0, 0, true, true);
+        var b = try proof.Both.openAs(&gemma4.table, &p, dense31b, .none);
+        defer b.close();
+        try expectRing(&b, 6, true);
+    }
+    var p = fixture.Pack.init(0x9e62);
+    defer p.deinit();
+    try writeGemma4Moe(&p, .{}, "language_model.model", false);
+    var b = try proof.Both.openAs(&gemma4.table, &p, a4b, .none);
+    defer b.close();
+    try expectRing(&b, 4, false);
 }
 
 // ── the Gemma 4 assistant drafter on the served trunk ──

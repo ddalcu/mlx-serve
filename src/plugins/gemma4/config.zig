@@ -8,6 +8,7 @@ const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const gemma = @import("../gemma3/config.zig");
+const sliding_ring = @import("../../sdk/config/sliding_ring.zig");
 
 pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .name = "gemma4",
@@ -73,6 +74,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         return unsupported("dimensions out of range");
     const v = gemma.finish(dir, d.root, c, stub, .{ .batches_decode = batches_decode and c.num_experts == 0, .moe = c.num_experts > 0, .exact_resumed = true, .dflash_capture = true, .prefill_mask = true }, out);
     if (!v.isOk()) return v;
+    out.cache.sliding_ring = if (c.has_sliding_window) sliding_ring.rows(c.sliding_window) else 0;
     // Gemma 4 opens its own `<|channel>thought` block when asked to think.
     out.chat.reasoning_dialect = .gemma_channel;
     gemma.readMedia(d.root, out) catch {

@@ -838,6 +838,55 @@ test "w8a8 linear matches the dense matmul, edge tiles included" {
     try testing.expect(try linearError(8250, 256, 320, s) < 0.02);
 }
 
+test "w8a8 GEMM stores an output past 2^31 elements where it belongs" {
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
+    if (@import("../../util/system.zig").getTotalMemBytes() < 32 << 30) return error.SkipZigTest; // a 4.3 GB output
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const m: c_int = 65600;
+    const n: c_int = 32768;
+    const k: c_int = 64;
+    const lo = mlx.mlx_array_new_int(-8);
+    defer _ = mlx.mlx_array_free(lo);
+    const hi = mlx.mlx_array_new_int(8);
+    defer _ = mlx.mlx_array_free(hi);
+    var act: Act = .{ .xq = mlx.mlx_array_new(), .xs = mlx.mlx_array_new() };
+    defer act.deinit();
+    var w: Weight = .{ .wq = mlx.mlx_array_new(), .ws = mlx.mlx_array_new(), .n = n, .k = k };
+    defer w.deinit();
+    for ([_]*mlx.mlx_array{ &act.xq, &w.wq }, [_]c_int{ m, n }, 0..) |dst, rows, seed| {
+        var key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(key);
+        try mlx.check(mlx.mlx_random_key(&key, seed));
+        try mlx.check(mlx.mlx_random_randint(dst, lo, hi, &[_]c_int{ rows, k }, 2, .int8, key, s));
+    }
+    try mlx.check(mlx.mlx_ones(&act.xs, &[_]c_int{m}, 1, .float32, s));
+    try mlx.check(mlx.mlx_ones(&w.ws, &[_]c_int{n}, 1, .float32, s));
+    const y = try gemm(act, &w, .bfloat16, false, s);
+    defer _ = mlx.mlx_array_free(y);
+    var wf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wf);
+    try mlx.check(mlx.mlx_astype(&wf, w.wq, .float32, s));
+    var wt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wt);
+    try mlx.check(mlx.mlx_transpose(&wt, wf, s));
+    for ([_]c_int{ 0, 65535, m - 1 }) |r| {
+        var xr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xr);
+        try mlx.check(mlx.mlx_slice(&xr, act.xq, &[_]c_int{ r, 0 }, 2, &[_]c_int{ r + 1, k }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        var xf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xf);
+        try mlx.check(mlx.mlx_astype(&xf, xr, .float32, s));
+        var ref = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref);
+        try mlx.check(mlx.mlx_matmul(&ref, xf, wt, s));
+        var yr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(yr);
+        try mlx.check(mlx.mlx_slice(&yr, y, &[_]c_int{ r, 0 }, 2, &[_]c_int{ r + 1, n }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        try testing.expect(try relRms(yr, ref, s) < 0.02);
+    }
+}
+
 test "w8a8 serves any row count: no floor, so a released original is never needed" {
     if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();

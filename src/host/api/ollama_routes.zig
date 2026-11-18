@@ -7,6 +7,7 @@ const model_mod = @import("../../sdk/config/model.zig");
 const log = @import("../../sdk/util/log.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const model_discovery = @import("../registry/discovery.zig");
+const stubMeta = @import("../registry/stub_cache.zig").stubMeta;
 const ModelRegistry = model_registry_mod.ModelRegistry;
 const LoadedModel = model_registry_mod.LoadedModel;
 const io_util = @import("../../sdk/util/io_util.zig");
@@ -255,7 +256,7 @@ fn handleOllamaShow(allocator: std.mem.Allocator, stream: *Conn, body: []const u
             const has_embedding = if (e_ready and e.config != null) e.config.?.hasEmbeddingCapability() else std.mem.eql(u8, e.arch_hint, "bert");
             const has_chat = !is_encoder;
             // An entry that is not resident has no live template or tower; its files still say what it can do.
-            const sm: model_discovery.StubMeta = if (e.state != .ready) model_discovery.readStubMeta(stream.io, allocator, e.path) else .{};
+            const sm: model_discovery.StubMeta = if (e.state != .ready) stubMeta(stream.io, allocator, e.path) else .{};
             rendered = try ollama_mod.renderShowJson(allocator, .{
                 .tag = ollamaTagEntryOf(stream.io, e),
                 .context_length = if (e_ready and e.config != null) getEffectiveContextLength(e.config.?) else 0,

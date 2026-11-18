@@ -90,7 +90,8 @@ pub fn next(self: *Generator, allocator: std.mem.Allocator) !?u32 {
 
             // Check stop conditions on the resolved token
             if (try self.checkStop()) {
-                if (self.ssmWrittenInPlace()) {
+                // A module that owns its state keeps them forwarded too (`commitModuleDecodeEnd`).
+                if (self.ssmWrittenInPlace() or self.xfm.ownsModuleDecodeState()) {
                     var look: i32 = 0;
                     try mlx.check(mlx.mlx_array_item_int32(&look, lazy_token));
                     self.forwarded_stop = .{ self.next_token_id, @intCast(look) };

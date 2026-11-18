@@ -64,8 +64,9 @@ pub fn build(b: *std.Build) void {
     macos.addServer(&graph, plugin_names);
     // `test-build`, `test`.
     const tests = macos.addUnitTests(&graph);
-    // `kit`, and the kit's example plugins built from it as dylibs the unit tests load.
+    // `kit`, and the kit's example plugins built from it as dylibs the unit tests load; its closure's tests join `test`.
     kit.add(b, graph.version, tests.runs);
+    kit.addTests(b, tests.step);
     // `exl3-test`.
     macos.addPluginTests(&graph, tests);
     // `check`.

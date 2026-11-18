@@ -31,8 +31,8 @@ if [ -z "$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/n
     exit 0
 fi
 
-pkill -f "mlx-serve.*--port $PORT_A" 2>/dev/null || true
-pkill -f "mlx-serve.*--port $PORT_B" 2>/dev/null || true
+srv_preclean "$PORT_A"
+srv_preclean "$PORT_B"
 sleep 1
 
 EMPTY_DIR=$(mktemp -d)

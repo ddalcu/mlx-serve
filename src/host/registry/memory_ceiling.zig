@@ -101,7 +101,9 @@ pub fn gpuCeilingWithWiredFloor(
 
 /// Test seam: `iogpu.wired_limit_mb` in MB; `null` reads the machine.
 /// The operator's overrides of the machine's memory limits, one copy for every compile unit (`Shared`).
-pub const Overrides = struct { wired_limit_mb: ?u64 = null, static_ceiling: ?u64 = null };
+pub const Overrides = struct { wired_limit_mb: ?u64 = null, static_ceiling: ?u64 = null, machine_free: ?MachineFree = null };
+/// Test seam for the two free-RAM readings `freeFor` takes from the machine.
+pub const MachineFree = struct { idle: u64, request: u64 };
 pub const overrides_shared = @import("../../sdk/util/shared.zig").Shared(Overrides, "memory_overrides", .{});
 pub inline fn overrides() *Overrides {
     return overrides_shared.get();
@@ -171,9 +173,34 @@ pub fn applyGpuCeilingEnv() void {
     log.warn("[diag] GPU ceiling forced to {d} MB (MLX_SERVE_GPU_CEILING_MB)\n", .{mb});
 }
 
-/// THE ceiling helper: `available`, `/props`, the hot-cache clamp, the auto-context pin and the
-/// admission bill all read it, so the wired-limit floor cannot reach some of them and not others.
+/// What the ceiling counts as free. A request's memory is given back when it ends, so it may count
+/// what macOS can compress or swap out of other apps; the hot cache stays while the server idles, so
+/// it counts only what nobody holds. Off macOS the two readings are the same.
+const Holder = enum { request, idle_cache };
+
+fn freeFor(holder: Holder) u64 {
+    if (overrides().machine_free) |m| return switch (holder) {
+        .request => m.request,
+        .idle_cache => m.idle,
+    };
+    return switch (holder) {
+        .request => metrics.getLoadRoomBytes(),
+        .idle_cache => metrics.getAvailableMemBytes() -| metrics.osReserveBytes(metrics.getTotalMemBytes(), mlx.weightsInDeviceMemory()),
+    };
+}
+
+/// THE ceiling helper: `available`, `/props`, the auto-context pin and the admission bill all read
+/// it, so the wired-limit floor cannot reach some of them and not others.
 pub fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u64) u64 {
+    return ceilingFor(config, active_mem, .request);
+}
+
+/// The ceiling the hot-cache clamp reads: the same terms over the idle figure.
+pub fn idleCacheGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u64) u64 {
+    return ceilingFor(config, active_mem, .idle_cache);
+}
+
+fn ceilingFor(config: ?*const model_mod.ModelConfig, active_mem: u64, holder: Holder) u64 {
     // The ANE's int8 copies are wired host buffers: invisible to MLX's own
     // accounting, but genuinely gone from free RAM. Left to leak in through
     // the noisy free-RAM term they made auto-context swing across boots of the
@@ -186,7 +213,7 @@ pub fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem
     return gpuCeilingWithWiredFloor(
         getGpuWorkingSetLimit(),
         active_mem +| @as(u64, cache_mem),
-        (metrics.getAvailableMemBytes() -| metrics.osReserveBytes(metrics.getTotalMemBytes(), mlx.weightsInDeviceMemory())) +| ane_bytes,
+        freeFor(holder) +| ane_bytes,
         wiredCeilingFloorFor(config),
     ) -| ane_bytes;
 }

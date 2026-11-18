@@ -49,6 +49,22 @@ final class ToolResultHistoryTests: XCTestCase {
 
     func testAnAnsweredResultIsStillCompacted() {
         let msgs = [ChatMessage(role: .user, content: "read it"), call("a"), result("a", 7000), call("b"), result("b", 300)]
-        XCTAssertEqual(toolResultLengths(msgs), [2000, 300])
+        let kept = 2000 + AgentEngine.toolResultCutMarker(dropped: 5000).count
+        XCTAssertEqual(toolResultLengths(msgs), [kept, 300])
+    }
+
+    /// A compacted result ends with a marker naming how much was cut.
+    func testACompactedResultSaysItWasCut() {
+        let msgs = [ChatMessage(role: .user, content: "read it"), call("a"), result("a", 7000), call("b"), result("b", 300)]
+        let tools = AgentEngine.buildAgentHistory(messages: msgs, contextLength: 131072, maxTokens: 4096)
+            .filter { ($0["role"] as? String) == "tool" }.compactMap { $0["content"] as? String }
+        XCTAssertTrue(tools[0].hasSuffix(AgentEngine.toolResultCutMarker(dropped: 5000)))
+        XCTAssertEqual(tools[1], String(repeating: "x", count: 300), "an uncut result carries no marker")
+    }
+
+    /// A cut that would save less than its marker costs is not made: the result goes through whole.
+    func testAResultJustOverTheLimitIsNotGrownByAMarker() {
+        let msgs = [ChatMessage(role: .user, content: "read it"), call("a"), result("a", 2050), call("b"), result("b", 300)]
+        XCTAssertEqual(toolResultLengths(msgs), [2050, 300])
     }
 }

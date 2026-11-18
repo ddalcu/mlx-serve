@@ -167,6 +167,18 @@ pub const Metrics = struct {
     ane_layers: Gauge,
     // qwen4 background page-cache warm of `ngram_table.bin`: bytes read so far; zero when nothing is warming.
     ngram_warm_bytes: Gauge,
+    // Who holds `mlx_active_bytes`: every billed owner, and the remainder none of them accounts for. A remainder
+    // that climbs at idle is retained memory without an owner; the evicted pair says whether evictions return
+    // what they were billed.
+    weights_live_bytes: Gauge,
+    hot_cache_bytes: Gauge,
+    live_kv_bytes: Gauge,
+    hot_cache_parked_bytes: Gauge,
+    hot_cache_checked_out_bytes: Gauge,
+    hot_cache_evicted_billed_bytes: Gauge,
+    hot_cache_evicted_live_bytes: Gauge,
+    mlx_unattributed_bytes: Gauge,
+    mlx_overbilled_bytes: Gauge,
     // Slots in the last batched decode group (0 = the last tick batched nothing).
     batched_group_size: Gauge,
     // Slot-ticks that decoded serial beside live company, per `BatchVerdict` reason.
@@ -210,6 +222,15 @@ pub const Metrics = struct {
             .ane_int8_bytes = Gauge.init(),
             .ane_layers = Gauge.init(),
             .ngram_warm_bytes = Gauge.init(),
+            .weights_live_bytes = Gauge.init(),
+            .hot_cache_bytes = Gauge.init(),
+            .live_kv_bytes = Gauge.init(),
+            .hot_cache_parked_bytes = Gauge.init(),
+            .hot_cache_checked_out_bytes = Gauge.init(),
+            .hot_cache_evicted_billed_bytes = Gauge.init(),
+            .hot_cache_evicted_live_bytes = Gauge.init(),
+            .mlx_unattributed_bytes = Gauge.init(),
+            .mlx_overbilled_bytes = Gauge.init(),
             .batched_group_size = Gauge.init(),
             .decode_serial_total = @splat(Counter.init()),
             .usage = @splat(ModelUsage.init("")),
@@ -241,6 +262,25 @@ pub const Metrics = struct {
     }
 
     /// A request refused before it owned a slot (context overflow, memory preflight).
+    pub const MemoryAttribution = struct { active: u64, weights_live: u64, hot_cache: u64, live_kv: u64, parked: u64, checked_out: u64, evicted_billed: u64, evicted_live: u64 };
+
+    /// The owners of `active` and what none of them accounts for. A checked-out entry is billed by the cache AND
+    /// as its slot's live KV, so it counts once.
+    pub fn setMemoryAttribution(self: *Metrics, a: MemoryAttribution) void {
+        self.weights_live_bytes.set(a.weights_live);
+        self.hot_cache_bytes.set(a.hot_cache);
+        self.live_kv_bytes.set(a.live_kv);
+        self.hot_cache_parked_bytes.set(a.parked);
+        self.hot_cache_checked_out_bytes.set(a.checked_out);
+        self.hot_cache_evicted_billed_bytes.set(a.evicted_billed);
+        self.hot_cache_evicted_live_bytes.set(a.evicted_live);
+        const owned = a.weights_live +| (a.hot_cache -| a.checked_out) +| a.live_kv +| a.parked;
+        self.mlx_unattributed_bytes.set(a.active -| owned);
+        // The other side: entries that share buffers each bill them, so the owners can sum past what is in use,
+        // and that excess hides the same amount of unattributed memory.
+        self.mlx_overbilled_bytes.set(owned -| a.active);
+    }
+
     pub fn recordRejected(self: *Metrics) void {
         self.requests_rejected_total.inc();
     }
@@ -367,6 +407,15 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeGauge(w, "mlx_serve:ane_int8_bytes", "Bytes of int8 weight copies held by the ANE prefill offload (0 when off)", m.ane_int8_bytes.load());
     try writeGauge(w, "mlx_serve:ane_layers", "Layers covered by compiled ANE prefill programs, mlp + gdn (0 when off)", m.ane_layers.load());
     try writeGauge(w, "mlx_serve:ngram_warm_bytes", "Bytes of the qwen4 n-gram table read so far by the background page-cache warm (0 when off or done with no table resident)", m.ngram_warm_bytes.load());
+    try writeGauge(w, "mlx_serve:weights_live_bytes", "MLX bytes the ready models hold as loaded (each load's own measure)", m.weights_live_bytes.load());
+    try writeGauge(w, "mlx_serve:hot_cache_bytes", "Bytes the prefix cache bills as resident", m.hot_cache_bytes.load());
+    try writeGauge(w, "mlx_serve:live_kv_bytes", "KV and recurrent state the live requests own", m.live_kv_bytes.load());
+    try writeGauge(w, "mlx_serve:hot_cache_parked_bytes", "KV bytes the prefix cache's SSD holders keep until their flush lands (in no other figure)", m.hot_cache_parked_bytes.load());
+    try writeGauge(w, "mlx_serve:hot_cache_checked_out_bytes", "Prefix-cache bytes a live request took by move (billed as cache and as live KV)", m.hot_cache_checked_out_bytes.load());
+    try writeGauge(w, "mlx_serve:hot_cache_evicted_billed_bytes", "Bytes every prefix-cache eviction since load was billed", m.hot_cache_evicted_billed_bytes.load());
+    try writeGauge(w, "mlx_serve:hot_cache_evicted_live_bytes", "Bytes MLX's allocator returned for those evictions", m.hot_cache_evicted_live_bytes.load());
+    try writeGauge(w, "mlx_serve:mlx_unattributed_bytes", "mlx_active_bytes less the loaded weights, the prefix cache, its SSD holders and the live requests' state: memory no figure owns", m.mlx_unattributed_bytes.load());
+    try writeGauge(w, "mlx_serve:mlx_overbilled_bytes", "The owners' bills past mlx_active_bytes (buffers shared between cache entries are billed by each); hides as much unattributed memory", m.mlx_overbilled_bytes.load());
     try writeGauge(w, "mlx_serve:batched_group_size", "Slots in the last batched decode group (0 when the last tick batched nothing)", m.batched_group_size.load());
     try w.print("# HELP mlx_serve:decode_serial_total Slot-ticks that decoded serial beside other live slots, by reason\n# TYPE mlx_serve:decode_serial_total counter\n", .{});
     for (SERIAL_REASONS, 0..) |name, i| {
@@ -505,9 +554,7 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
             "\"mlx_cache_bytes\":{d}," ++
             "\"ane_int8_bytes\":{d}," ++
             "\"ane_layers\":{d}," ++
-            "\"ngram_warm_bytes\":{d}," ++
-            "\"batched_group_size\":{d}" ++
-            "}},\"decode_serial\":{{",
+            "\"ngram_warm_bytes\":{d},",
         .{
             m.prompt_tokens_total.load(),
             m.prefill_tokens_total.load(),
@@ -533,6 +580,30 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
             m.ane_int8_bytes.load(),
             m.ane_layers.load(),
             m.ngram_warm_bytes.load(),
+        },
+    );
+    try w.print(
+            "\"weights_live_bytes\":{d}," ++
+            "\"hot_cache_bytes\":{d}," ++
+            "\"live_kv_bytes\":{d}," ++
+            "\"hot_cache_parked_bytes\":{d}," ++
+            "\"hot_cache_checked_out_bytes\":{d}," ++
+            "\"hot_cache_evicted_billed_bytes\":{d}," ++
+            "\"hot_cache_evicted_live_bytes\":{d}," ++
+            "\"mlx_unattributed_bytes\":{d}," ++
+            "\"mlx_overbilled_bytes\":{d}," ++
+            "\"batched_group_size\":{d}" ++
+            "}},\"decode_serial\":{{",
+        .{
+            m.weights_live_bytes.load(),
+            m.hot_cache_bytes.load(),
+            m.live_kv_bytes.load(),
+            m.hot_cache_parked_bytes.load(),
+            m.hot_cache_checked_out_bytes.load(),
+            m.hot_cache_evicted_billed_bytes.load(),
+            m.hot_cache_evicted_live_bytes.load(),
+            m.mlx_unattributed_bytes.load(),
+            m.mlx_overbilled_bytes.load(),
             m.batched_group_size.load(),
         },
     );
@@ -1063,6 +1134,28 @@ test "renderJson output parses as valid JSON via stdlib parser" {
     // Verify counters sub-object has expected key
     const counters = obj1.get("counters").?.object;
     try testing.expectEqual(@as(i64, 1), counters.get("requests_success_total").?.integer);
+}
+
+test "memory attribution: the owners and the unattributed remainder ride both surfaces, and the remainder never goes negative" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    m.setMemoryAttribution(.{ .active = 100, .weights_live = 60, .hot_cache = 20, .live_kv = 10, .parked = 4, .checked_out = 5, .evicted_billed = 9, .evicted_live = 3 });
+    // The checked-out bytes are in both the cache's bill and the live KV: counted once.
+    try testing.expectEqual(@as(u64, 11), m.mlx_unattributed_bytes.load());
+    var jbuf: [64 * 1024]u8 = undefined;
+    var jw: std.Io.Writer = .fixed(&jbuf);
+    try renderJson(&m, &.{}, &jw);
+    for ([_][]const u8{ "\"mlx_unattributed_bytes\":11", "\"hot_cache_parked_bytes\":4", "\"hot_cache_evicted_billed_bytes\":9", "\"hot_cache_evicted_live_bytes\":3", "\"weights_live_bytes\":60" }) |needle|
+        try testing.expect(std.mem.indexOf(u8, jbuf[0..jw.end], needle) != null);
+    var pbuf: [64 * 1024]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&pbuf);
+    try renderPrometheus(&m, &pw);
+    try testing.expect(std.mem.indexOf(u8, pbuf[0..pw.end], "mlx_serve:mlx_unattributed_bytes 11") != null);
+    try testing.expect(std.mem.indexOf(u8, pbuf[0..pw.end], "mlx_serve:hot_cache_checked_out_bytes 5") != null);
+
+    m.setMemoryAttribution(.{ .active = 50, .weights_live = 60, .hot_cache = 20, .live_kv = 0, .parked = 0, .checked_out = 0, .evicted_billed = 0, .evicted_live = 0 });
+    try testing.expectEqual(@as(u64, 0), m.mlx_unattributed_bytes.load());
+    try testing.expectEqual(@as(u64, 30), m.mlx_overbilled_bytes.load());
 }
 
 test "ngram_warm_bytes is a zero-when-off gauge on both surfaces" {

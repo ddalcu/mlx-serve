@@ -156,6 +156,25 @@ extension MediaBundle {
         )
     }
 
+    /// Ming-3.0-tts: one `model.safetensors`, bf16 or quantized. `dense` is a generic
+    /// `model_type`, so the markers also ask for what this model alone ships:
+    /// `campplus.safetensors`, the speaker encoder cloning needs. The inclusionAI repo
+    /// has only `campplus.onnx`, which a download does not fetch, so it fails too.
+    static func ming(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "ming:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true),
+                    readyMarkers: ["config.json", "model.safetensors", "tokenizer.json", "campplus.safetensors"]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// Kokoro: top-level weights + the `g2p/` dictionary subdir, so the download
     /// must be RECURSIVE.
     ///
@@ -679,11 +698,12 @@ extension ImageModelPreset {
 }
 
 extension AudioModelPreset {
-    /// The `.audio` slot hosts TWO architectures with different repo shapes, so
-    /// this dispatches instead of assuming Qwen3-TTS. `supportsCloning` is the
-    /// discriminator the preset already declares.
+    /// The `.audio` slot hosts THREE architectures with different repo shapes, so
+    /// this dispatches instead of assuming Qwen3-TTS. `isMing` and `supportsCloning`
+    /// are the discriminators the preset declares.
     var bundle: MediaBundle {
-        supportsCloning
+        if isMing { return .ming(repo: repo, displayName: name, sizeGB: approxDownloadGB) }
+        return supportsCloning
             ? .tts(repo: repo, displayName: name, sizeGB: approxDownloadGB)
             : .kokoro(repo: repo, displayName: name, sizeGB: approxDownloadGB)
     }
@@ -741,12 +761,13 @@ protocol MediaModelSizing: Identifiable where ID == String {
 }
 
 extension MediaModelSizing {
-    /// Whether this Mac's physical RAM covers what the model needs. A soft
-    /// signal for the UI (show a warning, never a download/use gate) — same
-    /// "warn, don't block" policy as `RecommendedModelPick.meetsSystemRequirements`
-    /// and `ImageGenView`'s oversized-model alert.
-    func meetsSystemRequirements(physicalMemoryBytes: UInt64) -> Bool {
-        physicalMemoryBytes >= UInt64(approxRAMGB) * 1_073_741_824
+    /// Whether what this Mac can give a model (the GPU's usable budget, not
+    /// physical RAM) covers what the model needs. A soft signal for the UI
+    /// (show a warning, never a download/use gate) — same "warn, don't block"
+    /// policy as `RecommendedModelPick.meetsSystemRequirements` and
+    /// `ImageGenView`'s oversized-model alert.
+    func meetsSystemRequirements(memory: SystemMemoryInfo) -> Bool {
+        memory.fit(neededGB: Double(approxRAMGB)).fitsAtAll
     }
 }
 

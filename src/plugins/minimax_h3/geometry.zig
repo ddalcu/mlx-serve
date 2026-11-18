@@ -62,6 +62,8 @@ pub const Config = struct {
     norm_eps: f32 = 1e-5,
     qk_norm_eps: f32 = 1e-5,
     final_norm_eps: f32 = 1e-5,
+    /// A two-time (HyperFlow) DiT's mix of its endpoint embedding: `temb = te(t) + gate * (ee(r) - te(t))`; 0 = one time.
+    two_time_gate: f32 = 0,
 
     pub fn innerDim(self: Config) u32 {
         return self.num_attention_heads * self.attention_head_dim;
@@ -93,6 +95,55 @@ pub const Geometry = struct {
     dit: Config = .{},
     te: TeConfig = .{},
     vae: DecCfg = .{},
+    /// A two-time few-step DiT's schedule (`config.json` `two_time`); null for the base model.
+    two_time: ?TwoTime = null,
+};
+
+/// A two-time DiT's trained schedules: raw (unshifted) sigma grids by step count, each shifted per modality when
+/// sampled, and the step count a request without `steps` runs.
+pub const TwoTime = struct {
+    default_steps: u32,
+    grids: [MAX_GRIDS][MAX_STEPS + 1]f64 = undefined,
+    steps: [MAX_GRIDS]u32 = undefined,
+    n_grids: u32 = 0,
+
+    pub const MAX_GRIDS = 8;
+    pub const MAX_STEPS = 32;
+
+    /// The raw grid for `steps` forwards (`steps + 1` points from 1 to 0), or null when none was trained.
+    pub fn grid(self: *const TwoTime, steps: u32) ?[]const f64 {
+        for (self.steps[0..self.n_grids], 0..) |n, i| if (n == steps) return self.grids[i][0 .. n + 1];
+        return null;
+    }
+
+    /// `sigma_grids` maps a step count to its grid; a grid that does not fall from 1 to 0, or a default without one,
+    /// is refused.
+    pub fn parse(o: std.json.ObjectMap) error{BadPackConfig}!TwoTime {
+        const d = o.get("default_steps") orelse return error.BadPackConfig;
+        const g = o.get("sigma_grids") orelse return error.BadPackConfig;
+        if (d != .integer or d.integer < 1 or g != .object) return error.BadPackConfig;
+        var tt = TwoTime{ .default_steps = @intCast(d.integer) };
+        var it = g.object.iterator();
+        while (it.next()) |e| {
+            const n = std.fmt.parseInt(u32, e.key_ptr.*, 10) catch return error.BadPackConfig;
+            const pts = e.value_ptr.*;
+            if (n < 1 or n > MAX_STEPS or tt.n_grids == MAX_GRIDS or pts != .array or pts.array.items.len != n + 1) return error.BadPackConfig;
+            const row = &tt.grids[tt.n_grids];
+            for (pts.array.items, 0..) |v, i| {
+                row[i] = switch (v) {
+                    .float => |f| f,
+                    .integer => |x| @floatFromInt(x),
+                    else => return error.BadPackConfig,
+                };
+                if (i > 0 and !(row[i] < row[i - 1])) return error.BadPackConfig;
+            }
+            if (row[0] != 1.0 or row[n] != 0.0) return error.BadPackConfig;
+            tt.steps[tt.n_grids] = n;
+            tt.n_grids += 1;
+        }
+        if (tt.grid(tt.default_steps) == null) return error.BadPackConfig;
+        return tt;
+    }
 };
 
 pub const SpeedConfig = struct { step_cache: f64, bcast_k: u32 };

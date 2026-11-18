@@ -195,7 +195,7 @@ test "flip: qwen3_tts answers its legacy arm's bytes" {
     var f: Fixture(@import("../../../plugins/qwen3_tts/plugin.zig"), @embedFile("../../../plugins/qwen3_tts/fixtures/legacy_http.golden")) = .{};
     try f.open(false);
     defer f.close();
-    try f.expectAudio(&.{ f.p.fx.body, try f.p.streamed(), "{}", "{\"input\":\"\"}", "{\"input\":\"hi\",\"voice\":\"af_heart\"}" });
+    try f.expectAudio(&.{ f.p.fx.body, try f.p.streamed(), "{}", "{\"input\":\"\"}", "{\"input\":\"hi\",\"voice\":\"default\"}" });
 }
 
 test "flip: acestep answers its legacy arm's bytes" {

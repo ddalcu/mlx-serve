@@ -11,6 +11,11 @@ comptime {
     @import("plugin_host_check.zig").reexports(@This());
 }
 
+/// The test process caps MLX's buffer pool as the server's `main` does; `build/test_runner.zig` calls it first.
+export fn msv_test_process_init() void {
+    @import("mlx/state.zig").applyMlxCacheLimit();
+}
+
 test {
     _ = @import("sdk/blocks/hc/hc_cuda_test.zig");
     _ = @import("plugins/stable_audio3/plugin.zig");
@@ -202,6 +207,9 @@ test {
     _ = @import("sdk/blocks/norms/add_norm.zig");
     _ = @import("sdk/blocks/moe/moe_fp4.zig");
     _ = @import("sdk/quant/exl3/sushi_pack.zig");
+    _ = @import("sdk/quant/outside_model.zig");
+    _ = @import("sdk/quant/bank_fit_key.zig");
+    _ = @import("engines/mlx/plugin/fit_key.zig");
     _ = @import("engines/mlx/load/sushi_adapt.zig");
     _ = @import("sdk/quant/nvfp4/modelopt_pack.zig");
     _ = @import("sdk/quant/formats.zig");
@@ -244,6 +252,8 @@ test {
     _ = @import("plugins/glm5_next/model_config.zig");
     _ = @import("plugins/glm5_next/proof_test.zig");
     _ = @import("plugins/glm5_next/served_test.zig");
+    _ = @import("sdk/bases/kda_hybrid/cuts_test.zig");
+    _ = @import("plugins/bailing_hybrid/bill_test.zig");
     _ = @import("engines/mlx/plugin/deepseek_test.zig");
     _ = @import("plugins/deepseek_v41/engram.zig");
     _ = @import("sdk/weights/nocache_reader.zig");
@@ -266,6 +276,7 @@ test {
     _ = @import("engines/mlx/cache/ssd/disk_tier.zig");
     _ = @import("engines/mlx/cache/ssd/writer.zig");
     _ = @import("host/registry/discovery.zig");
+    _ = @import("host/registry/stub_cache.zig");
     _ = @import("host/registry/pack_dir.zig");
     _ = @import("sdk/quant/gguf/engine_pick.zig");
     _ = @import("host/registry/registry.zig");
@@ -286,6 +297,8 @@ test {
     _ = @import("sdk/media/pack_bytes.zig");
     _ = @import("sdk/media/image_pixels.zig");
     _ = @import("sdk/media/lora_set.zig");
+    _ = @import("sdk/media/istft.zig");
+    _ = @import("sdk/media/number_words.zig");
     _ = @import("sdk/blocks/dit/w8a8_bill.zig");
     _ = @import("sdk/media/job.zig");
     _ = @import("sdk/media/image_request.zig");

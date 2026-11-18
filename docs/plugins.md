@@ -31,6 +31,9 @@ and field: [plugin-abi.md](plugin-abi.md) (generated from `src/abi/`).
 - **The kit.** `zig build kit` stages `zig-out/kit/mlx-serve-plugin-kit-<version>/` and its tarball: `build/kit/`,
   `src/kit.zig`'s import closure, mlx-c's headers, the MLX pin and the example plugins (`src/plugins/_example*`).
   `zig build test` builds every example from the staged kit, so the kit and the server cannot drift.
+  Its `checks/` folder holds test-only plugins the same tests build from the kit (`blocks`, every public function of the
+  kit's blocks; `outside_probe`, a model plugin that reaches the host's quant tables): they are not examples, and
+  `plugin new` never copies them.
 - **The kit** also carries `include/mlx_serve_plugin.h` (C/C++/Rust layouts, size-asserted; `src/kit_header.zig`) and
   `scripts/fetch-zig.sh` for the pinned Zig.
 - **The CLI** (`src/host/plugins/cli.zig`): `mlx-serve plugin new <name> [--media|--quant|--engine]` copies the kit's

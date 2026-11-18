@@ -53,7 +53,7 @@ fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
     out.* = .{};
 }
 
-const Loaded = struct {
+pub const Loaded = struct {
     base: bases.Model(Model),
     layers: []Model.Layer = &.{},
     owned: loader.Owned = .{},
@@ -143,6 +143,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
             },
             .mscale = if (yarn) |y| y[1] else .{},
             .window = if (global) 0 else c.sliding_window,
+            .ring = if (global) 0 else ctx.parsed.cache.sliding_ring,
         };
         var dqs: [4]Linear = undefined;
         for (&dqs, [_]Linear{ inner.q, inner.k, inner.v, inner.o }) |*d, l| {

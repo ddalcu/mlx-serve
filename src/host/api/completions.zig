@@ -36,6 +36,7 @@ const maxTokensOrigin = @import("sampling.zig").maxTokensOrigin;
 const MAX_TOKENS_DESC_LEN = @import("sampling.zig").MAX_TOKENS_DESC_LEN;
 const describeMaxTokens = @import("sampling.zig").describeMaxTokens;
 const requestEosSlice = @import("sampling.zig").requestEosSlice;
+const parseSuppressCjk = @import("sampling.zig").parseSuppressCjk;
 const finishDetailsField = @import("../chat/tools/pipeline.zig").finishDetailsField;
 const getEffectiveContextLength = @import("admission.zig").getEffectiveContextLength;
 const logStreamError = @import("../http/errors.zig").logStreamError;
@@ -177,6 +178,12 @@ pub fn handleCompletions(
     if (ablation.forRequest(stream, root, lm)) |r| {
         log.warn("POST /v1/completions -> {d} (ablation)\n", .{r.code});
         try sendErrorResponse(allocator, stream, r.status, if (r.code == 401) "authentication_error" else "invalid_request_error", r.msg, r.code);
+        return;
+    }
+    var suppress_cjk = false;
+    if (parseSuppressCjk(root, lm, &suppress_cjk)) |msg| {
+        log.warn("POST /v1/completions -> 400 ({s})\n", .{msg});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
         return;
     }
 
@@ -363,6 +370,7 @@ pub fn handleCompletions(
         .frequency_penalty = sampled.frequency_penalty,
         .logit_bias = logit_bias,
         .seed = seed,
+        .suppress_cjk = suppress_cjk,
     };
 
     if (is_stream) {
@@ -550,6 +558,7 @@ fn handleStreamingCompletion(
         .logprobs_n = logprobs_n,
         .cache_key = cache_key,
         .client = stream.client,
+        .priority = stream.priority,
         .ablation = stream.ablation,
     });
     var ts = StreamingTokenStream.initFromStream(running.?.stream, stream_mode, eos_token_ids);

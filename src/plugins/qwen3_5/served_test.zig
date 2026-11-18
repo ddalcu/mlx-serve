@@ -134,18 +134,21 @@ pub const Lane = struct {
     kv: KVCache,
     ssm: []SSMCacheEntry,
     off: usize = 0,
+    xfm: *Transformer,
     ctx: ForwardCtx = undefined,
 
     pub fn init(l: *Lane, x: *Transformer) !void {
         const n = x.config.num_hidden_layers;
-        l.* = .{ .kv = try KVCache.init(testing.allocator, n), .ssm = try fixture.newEntries(n) };
+        l.* = .{ .kv = try KVCache.init(testing.allocator, n), .ssm = try fixture.newEntries(n), .xfm = x };
         l.ctx = x.defaultCtx();
         l.ctx.cache = &l.kv;
         l.ctx.moe_seq_offset = &l.off;
         l.ctx.ssm_entries = l.ssm;
     }
+    /// A batched tick leaves the entries in the shell's group, which reads them until they are dropped.
     pub fn deinit(l: *Lane) void {
         l.kv.deinit();
+        l.xfm.ssmGroupDrop(l.ssm);
         fixture.freeEntries(l.ssm);
     }
 };

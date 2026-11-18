@@ -24,7 +24,7 @@ if [ ! -f "$MODEL/config.json" ]; then echo "SKIP: model not found at $MODEL"; e
 python3 -c "import PIL" 2>/dev/null || { echo "SKIP: PIL missing (needed to build the fine-print fixture)"; exit 0; }
 
 WORK=$(mktemp -d); LOG="$WORK/server.log"
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1
+srv_preclean "$PORT"
 ./zig-out/bin/mlx-serve --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG" 2>&1 &
 SRV=$!
 cleanup() { kill "$SRV" 2>/dev/null; rm -rf "$WORK"; }

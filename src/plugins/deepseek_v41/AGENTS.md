@@ -32,6 +32,9 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - GGUF expert banks (`--mlx-gguf`, ISTA's GSQ-RCO sets) decode up to `region_rows` through `ffnDecodeGguf`
   (`moe_gu_gguf` + `moe_dn_gguf`, built per ggml type by `gguf.pluginKernel`) and prefill on the matrix units
   (`gguf.gatherNaxSwiGLU`), a K-quant bank a 32-weight slice at a time (`deq_<type>_s`); Q3_K decodes `routed`.
+- Outside the routed experts a GGUF tensor must be in an MLX layout (the forward has no raw-block read there): Q6_K
+  is requantized to 8-bit g32 at load (`gguf.Arch.loadsMlx`); the in-set Engram table is read as IQ4_NL only and
+  another type is declined at the claim (`Arch.readsInPlace`), never at the load.
 
 ## Facts the table declares
 - `owns_decode_state`, `slot_state` + `batches_decode` (streamed: single-flight): active state in `dec_state`, other
@@ -39,8 +42,13 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   attention per state) and `dsparkDraftBatched`. Each State owns its pending capture.
 - `prefix_cache` for unpaired instances whose bank holds every expert; a streaming bank (fewer prompt or decode slot
   rows than `num_experts`, `bankStreams`) and a Thunderbolt pair keep legacy resume.
-  Snapshots retain every buffer and restore only at their exact position; the engine owns finished history. Pairs
+  Snapshots retain every buffer and restore whole only at their own position; the engine owns finished history. Pairs
   keep legacy resume.
+- A prompt abandoned mid-prefill hands over the state where its last forwarded chunk ended (`snapshotStateAtChunk`
+  through `AuxHooks.snapshot`: any chunk end restores whole; not with an image past it, not under a tensor pair).
+- A snapshot is cut to a shorter prefix (`sliceSnap`: global rows and index keys kept, where every pooling group is
+  closed) and restored by the tech report's SWA bounded replay (`rewind`, `Want.replay`: the last window run again,
+  its band stopped at its first row, no compressor). Text only, no pair or tensor split; a slice is never exported.
 - No spec rollback (DSpark rewinds inside the module); DSpark stages from `native_stages`;
   `spec.trunk_weight` lends the embedding and head; a pair's load re-reads `distributed.planFor` (idempotent).
 - A tensor pair (`InitOpts.tp`, `--dist tensor`) halves the experts and attention heads at load (the sliced `cfg` says so);
@@ -90,12 +98,21 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   about a plain tick, and the adaptive policy's prior ladder cut novel text from 54 to 40 tok/s.
 - A streamed bank's phase follows its decode capacity (`promptPhase`): a call past the decode regions OR past
   `Routed.decode_ids` routed ids runs the prompt phase; a 9-16 token prompt on the EXL3 bank failed `NotPrefill`.
-- Engram tables are read past the page cache only beside a streamed bank (`Table.readDirect`): on a resident MLX pack
-  the direct whole-grid read cost warm prompts 3% (the cache served their rows), and the bank needs that memory.
+- Engram tables are read whole and past the page cache only beside a streamed bank (`Table.readDirect`): on a resident
+  MLX pack the direct whole-grid read slowed warm prompts (the cache served their rows), and the bank needs that memory.
+- A resident pack reads its Engram CODES past the page cache while memory is tight (`Table.openCodes`, `pastCache`,
+  `engram.cacheTight`: under an eighth of RAM free, asked at each prompt chunk), its scales always through it: with
+  no room the cache evicted the scales to hold codes read once and every row cost two reads; with room the cache wins.
 - A fused decode stage is judged against an f32 model (`decode.expectNoWorse`), not against the chain's bits: greedy
   texts diverge from the chain's at bf16 near-ties. Stacked layers judge the median over seeds: one seed lands 1.6x
   either side of the chain (TF32 moves the f32 model itself 8% at the verify step on M5). Two dependent stages merged into one ticket-ordered dispatch
   measured slower than the pair (their threadgroup shapes differ): keep one dispatch a stage.
+- A cut restore is as far from a cold prompt as another prefill chunk width is, never bit-equal past one window: its
+  proof is the state (`proof_test`: a whole-prefix replay is the cold state bit for bit, the global rows are the
+  snapshot's own), its quality a live pair of answers with logprobs.
+- A prompt chunk of 4096 rows or more that nothing read ahead runs as its first half, then the rest (`extendCold`,
+  `leadRows`; the lead is `Want.encode`: no decoder replay, which the rest makes): the drive reads the rest's Engram
+  rows behind the lead. The log's `waited ... ms` is the meter.
 - Construct each MPP cooperative tensor from its owning op; copying one invokes incompatible Metal layout
   interfaces on some SDKs. Fill each operand's independent storage before running the matmul.
 
@@ -108,10 +125,10 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   (`wideLayer`), its routes predicted before the attention (`readAhead`) so the reads overlap it.
 - Slot rows per phase (`Routed.phase`): a call wider than `region_rows` is a prompt, else decode; the phase change
   grows the rows into what the prompt's working set held.
-- The bank bills its rows at the load (`streamBudget`: the GPU working set less the host's wired margin and
-  `stream_host_bytes`, the memory in use, the phase's working set at the context); the context is `ctx_size`, else
-  the largest `stream_context_rungs` rung keeping `stream_min_rows` (`bank_rows`). The engine's prefill guard leaves
-  the pack to it (`streamed_weights`); a prompt past the billed context is refused by name.
+- The bank bills its rows at the load (`streamBudget`: the GPU working set less the wired margin, `stream_host_bytes`,
+  the memory in use settled from the load's start (`inUseAt`) and the phase's working set at the context); the context
+  is `ctx_size`, else the largest `stream_context_rungs` rung keeping `stream_min_rows` (`bank_rows`). The engine's
+  prefill guard leaves the pack to it (`streamed_weights`); a prompt past the billed context is refused by name.
 - A plain MLX pack streams with the per-model `stream_experts` (`openPackBank`, the `trunk` arm): one fetch serves
   `Routed.decode_ids` experts, so a wider prompt call runs its experts in groups (`slotWide`). Decode is read-bound
   (nine scattered reads an expert vs one EXL3 record): the repack stays the fast way to stream.
@@ -124,13 +141,14 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 
 ## Known issues
 - Auxiliary snapshots persist through the disk tensor hooks as exact v10 module records; one-shot serialization
-  and shortened slices still return named unsupported verdicts. SSD-only module retention is unsupported.
+  still returns a named unsupported verdict. SSD-only module retention is unsupported.
 - Serial decode near the memory wall: 720 GB/s of ~1.1 TB/s, so kernel work buys 15-25%, not 2x.
 - Without NAX (M4 and older) `attn`, `idx_score` and the `wo_a` / `ffn_in` fusion behind them stay off: decode runs the
   pre-NAX split kernel and the compiled regions. The affine `moe_up` / `moe_down` stay off too (they lose to the
   compiled MoE there); `moe_fp4` is the non-NAX one.
-- Prefill is chunked at 8192 (`prefillChunkMax`), one MoE call per chunk: each chunk still reads every expert bank
-  once (the CED replay runs the decoder layers), so a narrower chunk pays that read twice as often.
+- Prefill is chunked at 8192 at most (`prefillChunkMax`, an explicit `--prefill-chunk` included), one MoE call per
+  chunk: each chunk still reads every expert bank once (the CED replay runs the decoder layers), so a narrower chunk
+  pays that read twice as often.
 - Past 0.95 x Metal's working set MLX's allocator evicts its buffer cache on every miss (two residency commits per
   allocation): DSpark at 8192 crosses it on a 256 GB Mac at the default `iogpu.wired_limit_mb`; raise it to bench.
 - DSpark on prose falls back to plain (acceptance 1.04/round): correct, prose runs ~54 tok/s.

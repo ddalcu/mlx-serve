@@ -73,7 +73,7 @@ fn lazyTower(m: *@import("plugin.zig").Model, dir: [:0]const u8, item: *const ab
 /// The image's span on a tower made from the pack's vision weights alone, computed before the tower goes.
 fn lazyRows(m: *@import("plugin.zig").Model, dir: []const u8, item: *const abi.MediaItem) !mlx.mlx_array {
     const io = std.Io.Threaded.global_single_threaded.io();
-    var w = try weights_load.loadWeightsOpt(io, gpa, dir, .{ .vision = true, .dsv41 = true, .index_owners = true, .keep_f16 = true, .skip = &notVision });
+    var w = try weights_load.loadWeightsOpt(io, gpa, dir, .{ .vision = true, .dsv41 = true, .keep_f16 = true, .skip = &notVision });
     defer w.deinit();
     var t = try vision.Dsv41Vision.init(gpa, m.cfg, &w);
     defer t.deinit();

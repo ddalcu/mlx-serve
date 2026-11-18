@@ -3,7 +3,7 @@
 # mlx-fault-step=<n> latch a synthetic Metal OOM at the n-th prefill-chunk / decode-step checkpoint and disarm: the faulting
 # request gets a 503 with a body (streaming: the SSE `error` event), `[mlx]` is logged, the process lives, and the
 # next request is a 200 with content; plus a long prompt with no max_tokens. mlx-fault-kind=cuda_lost: the
-# faulting and every later request answer the named 503 `gpu_context_lost`, /health answers 503 `cuda context lost`,
+# faulting and every later request answer the named 503 `gpu_context_lost`, /health answers 503 `gpu context lost`,
 # the loss is logged once, the process stays up.
 #
 #   ./tests/test_mlx_error_recovery.sh [model_dir] [port]
@@ -167,7 +167,7 @@ CODE9=$(req "Say hello.")
   ok "the next request is refused by name" ||
   bad "post-loss request status $CODE9: $(head -c 200 /tmp/mlxerr_body.json)"
 HEALTH=$(curl -s -m 5 -w ' %{http_code}' "$BASE/health")
-[ "$HEALTH" = '{"status":"cuda context lost"} 503' ] && ok "/health answers 503 cuda context lost" ||
+[ "$HEALTH" = '{"status":"gpu context lost"} 503' ] && ok "/health answers 503 gpu context lost" ||
   bad "/health after the loss: $HEALTH"
 kill -0 $SRV 2>/dev/null && ok "the process is still up" || bad "the process died"
 N=$(grep -c 'GPU context lost' "$LOG7")

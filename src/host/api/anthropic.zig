@@ -24,6 +24,7 @@ const Conn = @import("../http/conn.zig").Conn;
 const spec_gate_threshold = @import("request_options.zig").spec_gate_threshold;
 const parseKvAttnExplicit = @import("request_options.zig").parseKvAttnExplicit;
 const resolveSampling = @import("sampling.zig").resolveSampling;
+const parseSuppressCjk = @import("sampling.zig").parseSuppressCjk;
 const generationMaxTokens = @import("sampling.zig").generationMaxTokens;
 const requestProfile = @import("sampling.zig").requestProfile;
 const defaultEnableMtp = @import("request_options.zig").defaultEnableMtp;
@@ -73,6 +74,7 @@ const sendResponse = @import("../http/respond.zig").sendResponse;
 const logHttpSseEvent = @import("../http/respond.zig").logHttpSseEvent;
 const countRejected = @import("../http/errors.zig").countRejected;
 const contextOverflowMessage = @import("../http/errors.zig").contextOverflowMessage;
+const optionalReasonField = @import("../http/errors.zig").optionalReasonField;
 const cachedFormatChat = @import("format.zig").cachedFormatChat;
 const formatAnthropicUsage = @import("format.zig").formatAnthropicUsage;
 const formatTimingsObject = @import("format.zig").formatTimingsObject;
@@ -91,15 +93,25 @@ const handleAnthropicStreaming = @import("anthropic_stream.zig").handleAnthropic
 const countTextTokens = @import("tokenize.zig").countTextTokens;
 
 pub fn sendAnthropicError(allocator: std.mem.Allocator, stream: *Conn, err_type: []const u8, message: []const u8, status_code: u32) !void {
-    const escaped_msg = try jsonEscape(allocator, message);
-    defer allocator.free(escaped_msg);
-    const body = try std.fmt.allocPrint(allocator,
-        \\{{"type":"error","error":{{"type":"{s}","message":{s}}}}}
-    , .{ err_type, escaped_msg });
+    return sendAnthropicErrorWithReason(allocator, stream, err_type, message, status_code, null);
+}
+
+pub fn sendAnthropicErrorWithReason(allocator: std.mem.Allocator, stream: *Conn, err_type: []const u8, message: []const u8, status_code: u32, reason: ?[]const u8) !void {
+    const body = try buildAnthropicErrorBody(allocator, err_type, message, reason);
     defer allocator.free(body);
     var status_buf: [32]u8 = undefined;
     const status = std.fmt.bufPrint(&status_buf, "{d} Error", .{status_code}) catch "500 Error";
     try sendResponse(stream, status, "application/json", body);
+}
+
+pub fn buildAnthropicErrorBody(allocator: std.mem.Allocator, err_type: []const u8, message: []const u8, reason: ?[]const u8) ![]u8 {
+    const escaped_msg = try jsonEscape(allocator, message);
+    defer allocator.free(escaped_msg);
+    const reason_field = try optionalReasonField(allocator, reason);
+    defer allocator.free(reason_field);
+    return std.fmt.allocPrint(allocator,
+        \\{{"type":"error","error":{{"type":"{s}","message":{s}{s}}}}}
+    , .{ err_type, escaped_msg, reason_field });
 }
 
 pub fn sendAnthropicEvent(stream: *Conn, event_name: []const u8, data: []const u8) !void {
@@ -238,6 +250,12 @@ pub fn handleAnthropicMessages(
     const root = parsed.value.object;
     if (ablation.refuseOnSurface(root)) |r| {
         try sendAnthropicError(allocator, stream, "invalid_request_error", r.msg, r.code);
+        return;
+    }
+    var suppress_cjk = false;
+    if (parseSuppressCjk(root, lm, &suppress_cjk)) |msg| {
+        log.warn("POST /v1/messages -> 400 ({s})\n", .{msg});
+        try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
         return;
     }
 
@@ -783,6 +801,7 @@ pub fn handleAnthropicMessages(
         .presence_penalty = sampled.presence_penalty,
         .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
+        .suppress_cjk = suppress_cjk,
     };
 
     // Grammar-constrained sampling for `output_config.format` json_schema —
@@ -1122,4 +1141,22 @@ test "anthropicStopReason: a matched client stop sequence reports stop_sequence,
     try std.testing.expectEqualStrings("end_turn", anthropicStopReason("stop", null));
     try std.testing.expectEqualStrings("max_tokens", anthropicStopReason("length", "beta"));
     try std.testing.expectEqualStrings("tool_use", anthropicStopReason("tool_calls", "beta"));
+}
+
+test "memory refusal Anthropic body carries a reason" {
+    const body = try buildAnthropicErrorBody(std.testing.allocator, "invalid_request_error", "prompt does not fit", "memory_refused");
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt does not fit\",\"reason\":\"memory_refused\"}}",
+        body,
+    );
+}
+
+test "Anthropic errors without a reason preserve their existing body bytes" {
+    const body = try buildAnthropicErrorBody(std.testing.allocator, "invalid_request_error", "the prompt encodes to no tokens", null);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"the prompt encodes to no tokens\"}}",
+        body,
+    );
 }

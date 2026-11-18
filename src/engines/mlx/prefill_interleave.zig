@@ -22,6 +22,7 @@ const SpecTickMode = @import("spec/wiring.zig").SpecTickMode;
 const dspark_group = @import("spec/dspark_group.zig");
 const slotSpecMode = @import("spec/wiring.zig").slotSpecMode;
 const prefillAdmitted = @import("step.zig").prefillAdmitted;
+const AdmitOutcome = @import("step.zig").AdmitOutcome;
 const publishLiveKvResidency = @import("step.zig").publishLiveKvResidency;
 const scheduler_mod = @import("scheduler.zig");
 
@@ -41,6 +42,7 @@ pub const InterleaveCtx = struct {
     ticks: u32 = 0,
     /// Wall clock since the previous boundary's ticks ended: the chunk just forwarded.
     chunk_sw: io_util.Stopwatch,
+    priority_share: PriorityShare = .{},
 };
 
 /// Ticks a speculating slot must see company before it gives up speculation for the batch.
@@ -79,6 +81,11 @@ pub fn specYieldTick(active: []const *Slot) void {
         const gen = if (s.legacy_gen) |*g| g else continue;
         if (gen.spec_disabled_runtime) continue;
         const mode = slotSpecMode(s, gen);
+        // An exact-solo model batches no decode (`dspark_group.exactSolo`): its DSpark slots keep drafting beside company.
+        if (mode == .dspark) if (s.model.transformer) |t| if (dspark_group.exactSolo(t)) {
+            s.company_ticks = 0;
+            continue;
+        };
         const company = modelCompany(active, s, dspark_group.slotGroupable);
         if (!yieldsToCompany(mode, mlx.cudaAvailable(), s.model.config.?.isMoe(), company.others, mtpCrowdThresholdFor(s), company.dspark)) {
             s.company_ticks = 0;
@@ -163,6 +170,9 @@ pub const BOUNDARY_MAX_TAIL: usize = DECODE_SHARE_PREFILL_CHUNK;
 /// Requests admitted at one chunk boundary, across its admission scan and the gaps between its owed
 /// decode ticks. The wall-time cap in `BoundaryBudget` is the real bound.
 pub const BOUNDARY_MAX_COUNT: u32 = 4;
+/// The largest uncached tail a priority request (`X-MLX-Priority: high`) may prefill at a chunk boundary; what it may
+/// cost the outer is `PriorityShare`'s rule.
+pub const PRIORITY_MAX_TAIL: usize = 8 * BOUNDARY_MAX_TAIL;
 
 /// What the boundary gate reads about a pending request.
 pub const BoundaryCand = struct {
@@ -174,6 +184,7 @@ pub const BoundaryCand = struct {
     module_state: bool,
     /// Uncached tail, from `peekMatchedTokens`.
     tail: usize,
+    priority: bool = false,
 };
 
 pub const BoundaryCtx = struct {
@@ -184,20 +195,44 @@ pub const BoundaryCtx = struct {
     decoding: usize,
     max_concurrent: usize,
     max_tail: usize,
+    /// `PriorityShare.roomNs` of the outer prefill, and its chunk that ended at this boundary.
+    priority_room_ns: u64 = 0,
+    chunk_ns: u64 = 0,
 };
+
+/// Wall time of a prefill's own chunks and of the priority prefills it hosted at its boundaries. A priority request
+/// past `BOUNDARY_MAX_TAIL` starts only while its price fits in the room (`priorityCostNs` <= `roomNs`), so priority
+/// guests take at most half of any prefill's wall clock and a prefill never hosts one that costs more than it has read.
+pub const PriorityShare = struct {
+    own_ns: u64 = 0,
+    hosted_ns: u64 = 0,
+
+    pub fn roomNs(self: PriorityShare) u64 {
+        return self.own_ns -| self.hosted_ns;
+    }
+};
+
+/// A nested prefill's price: one outer chunk per `BOUNDARY_MAX_TAIL` tokens, the width both run at beside decoders
+/// (`decodeShareAdmissionCap`). Another outer width misprices it; `hosted_ns` then charges what it really took.
+pub fn priorityCostNs(tail: usize, chunk_ns: u64) u64 {
+    return chunk_ns *| (std.math.divCeil(usize, tail, BOUNDARY_MAX_TAIL) catch unreachable);
+}
 
 /// May this pending request be prefilled at the outer prefill's chunk boundary?
 pub fn boundaryEligible(c: BoundaryCand, x: BoundaryCtx) bool {
     if (x.share <= 0 or x.nested or x.outer_exclusive) return false;
     if (c.exclusive or c.has_media or c.prompt_logprobs or !c.generator_path or c.module_state) return false;
     if (x.decoding >= x.max_concurrent) return false;
-    return c.tail <= x.max_tail;
+    if (c.tail <= x.max_tail) return true;
+    return c.priority and c.tail <= PRIORITY_MAX_TAIL and priorityCostNs(c.tail, x.chunk_ns) <= x.priority_room_ns;
 }
 
 /// What one boundary may spend on nested prefills, so the outer always advances.
 pub const BoundaryBudget = struct {
     max_count: u32,
     ns_cap: u64,
+    /// The outer's chunk that ended at this boundary.
+    chunk_ns: u64 = 0,
     count: u32 = 0,
     spent_ns: u64 = 0,
 
@@ -225,7 +260,7 @@ pub fn orderByTail(tails: []const usize, order: []usize) void {
 /// Undo a hot-cache restore the slot has not started on: hand the checkout back and empty the
 /// slot's cache, so the request can wait in `pending` and restore again when its turn comes.
 pub fn resetRestoredSlot(slot: *Slot) void {
-    if (slot.model.prefix_cache) |hc| hc.releaseCheckout(@intFromPtr(slot), "tail over the boundary limit");
+    if (slot.prefix_cache) |hc| hc.releaseCheckout(@intFromPtr(slot), "tail over the boundary limit");
     emptySlotCache(slot);
     slot.restored_entry = 0;
 }
@@ -246,7 +281,7 @@ pub fn emptySlotCache(slot: *Slot) void {
 
 /// The first pending request that passes the boundary gate, removed from `pending` with its
 /// `in_pass` held. `outer` is the prefill whose chunk boundary this is.
-fn takeBoundaryCandidate(sch: *Scheduler, outer: *Slot) ?*Slot {
+fn takeBoundaryCandidate(sch: *Scheduler, outer: *Slot, priority_room_ns: u64, chunk_ns: u64) ?*Slot {
     sch.queue_mu.lockUncancelable(sch.io);
     defer sch.queue_mu.unlock(sch.io);
     var decoding: usize = 0;
@@ -261,6 +296,8 @@ fn takeBoundaryCandidate(sch: *Scheduler, outer: *Slot) ?*Slot {
         .decoding = decoding,
         .max_concurrent = sch.max_concurrent,
         .max_tail = BOUNDARY_MAX_TAIL,
+        .priority_room_ns = priority_room_ns,
+        .chunk_ns = chunk_ns,
     };
     const n = @min(sch.pending.items.len, 32);
     for (sch.pending.items[0..n], 0..) |s, i| {
@@ -272,6 +309,7 @@ fn takeBoundaryCandidate(sch: *Scheduler, outer: *Slot) ?*Slot {
             .generator_path = s.model.transformer != null,
             .module_state = if (s.model.transformer) |xf| xf.config.caps().shared_readonly_state else false,
             .tail = slotUncachedTail(s),
+            .priority = s.priority,
         };
         if (!boundaryEligible(c, x)) continue;
         _ = s.in_pass.fetchAdd(1, .acq_rel);
@@ -286,19 +324,20 @@ fn takeBoundaryCandidate(sch: *Scheduler, outer: *Slot) ?*Slot {
 /// first token does not wait for the whole prefill. The decode ticks that follow include them.
 /// `budget` is the boundary's, shared by its admission scan and the gaps between its owed ticks.
 /// Returns the wall time spent.
-fn admitSmallAtBoundary(ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget) u64 {
+fn admitSmallAtBoundary(ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget, comptime prefill: fn (*Scheduler, *Slot) AdmitOutcome) u64 {
     const sch = ic.sch;
     if (share <= 0 or sch.boundary_depth > 0) return 0;
     var total = io_util.Stopwatch.init(sch.io);
     while (budget.mayStart()) {
-        const slot = takeBoundaryCandidate(sch, ic.slot) orelse break;
+        const slot = takeBoundaryCandidate(sch, ic.slot, ic.priority_share.roomNs(), budget.chunk_ns) orelse break;
         var sw = io_util.Stopwatch.init(sch.io);
-        slot.boundary_max_tail = BOUNDARY_MAX_TAIL;
+        const priority = slot.priority;
+        slot.boundary_max_tail = if (priority) PRIORITY_MAX_TAIL else BOUNDARY_MAX_TAIL;
         sch.boundary_depth += 1;
         sch.boundary_outer = ic.slot;
         const saved_tokens = sch.inflight_prefill_tokens.load(.monotonic);
         const saved_expected = sch.inflight_prefill_expected.load(.monotonic);
-        const outcome = prefillAdmitted(sch, slot);
+        const outcome = prefill(sch, slot);
         // runPrefill zeroes the progress gauges on exit; the outer prefill's go back.
         sch.inflight_prefill_tokens.store(saved_tokens, .monotonic);
         sch.inflight_prefill_expected.store(saved_expected, .monotonic);
@@ -313,9 +352,11 @@ fn admitSmallAtBoundary(ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget)
         if (wait) sch.pending.insert(sch.allocator, 0, slot) catch slot.markError("OutOfMemory");
         sch.queue_mu.unlock(sch.io);
         _ = slot.in_pass.fetchSub(1, .acq_rel);
+        const spent = sw.read();
+        if (priority) ic.priority_share.hosted_ns +|= spent;
         if (wait) break;
-        if (outcome == .decoding) log.info("[boundary] admitted a {d}-token request beside a {d}-token prefill\n", .{ slot.prompt_tokens, ic.slot.full_prompt.len });
-        budget.charge(sw.read());
+        if (outcome == .decoding) log.info("[boundary] admitted a {d}-token {s}request beside a {d}-token prefill\n", .{ slot.prompt_tokens, if (priority) "priority " else "", ic.slot.full_prompt.len });
+        budget.charge(spent);
     }
     return total.read();
 }
@@ -325,7 +366,7 @@ fn admitSmallAtBoundary(ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget)
 pub fn slotUncachedTail(slot: *Slot) usize {
     const total = slot.full_prompt.len;
     if (slot.skip_prefix_cache or slot.cache_variant != 0 or slot.media.len > 0) return total;
-    const hc = if (slot.model.prefix_cache) |p| p else return total;
+    const hc = if (slot.prefix_cache) |p| p else return total;
     return total - @min(total, hc.peekMatchedTokens(slot.full_prompt, slot.has_tools, slot.cache.config, slot.ssm_entries != null));
 }
 
@@ -359,7 +400,7 @@ pub fn interleaveTicksFor(chunk_ns: u64, tick_ns: u64) u32 {
 pub fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const transformer_mod.SSMCheckpoint) void {
     const wc: *WriteThroughCtx = @ptrCast(@alignCast(opaque_ctx));
     const slot = wc.slot;
-    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |p| p else return;
+    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.prefix_cache) |p| p else return;
     if (!hc.ssd_first) return;
     const d = if (hc.disk) |*dd| dd else return;
     if (d.module_context != null) return;
@@ -426,7 +467,7 @@ fn writeThroughEnabled() bool {
 /// The one gate for the write-through: SSD-first + a live writer + a disk tier + a new span
 /// worth at least one chunk.
 pub fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
-    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |p| p else return false;
+    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.prefix_cache) |p| p else return false;
     if (slot.cache_variant != 0) return false;
     if (hc.disk) |*d| if (d.module_context != null) return false;
     if (!writeThroughEnabled()) {
@@ -483,13 +524,20 @@ pub fn chunkWidthCb(
     return decodeShareWidthCap(next, scheduler_mod.liveDecodingCount(wc.sch), prefillDecodeShare());
 }
 
+/// A chunk boundary of `ic.slot`'s prefill after a chunk of `chunk_ns`: the chunk joins the outer's own time, and
+/// the budget is what this boundary's nested prefills may spend.
+fn openBoundary(ic: *InterleaveCtx, chunk_ns: u64, share: f32) BoundaryBudget {
+    ic.priority_share.own_ns +|= chunk_ns;
+    return .{ .max_count = BOUNDARY_MAX_COUNT, .ns_cap = decodeShareBudgetNs(chunk_ns, share), .chunk_ns = chunk_ns };
+}
+
 /// What the owed-tick loop runs between boundaries: admit what arrived, then tick. Returns the
 /// admission time plus the tick's (0 only when nothing ran, which ends the loop).
 const OwedTickCtx = struct { ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget };
 
 fn admitThenTick(opaque_ctx: *anyopaque) u64 {
     const t: *OwedTickCtx = @ptrCast(@alignCast(opaque_ctx));
-    const nested = admitSmallAtBoundary(t.ic, t.share, t.budget);
+    const nested = admitSmallAtBoundary(t.ic, t.share, t.budget, prefillAdmitted);
     return interleaveDecodeTick(t.ic.sch) +| nested;
 }
 
@@ -505,9 +553,10 @@ pub fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     const share = prefillDecodeShare();
     // Small pending requests first, so the ticks below include them; their time is hosted time. A
     // request that arrives during the owed ticks is admitted between them, so no newcomer waits
-    // longer than the chunk in flight.
-    var budget: BoundaryBudget = .{ .max_count = BOUNDARY_MAX_COUNT, .ns_cap = decodeShareBudgetNs(chunk_ns, share) };
-    const nested_ns = admitSmallAtBoundary(ic, share, &budget);
+    // longer than the chunk in flight, or a priority guest and the next chunk: the guest spends the
+    // boundary's budget, and a nested prefill never admits.
+    var budget = openBoundary(ic, chunk_ns, share);
+    const nested_ns = admitSmallAtBoundary(ic, share, &budget, prefillAdmitted);
     const first_ns = interleaveDecodeTick(ic.sch);
     var owed: OwedTickCtx = .{ .ic = ic, .share = share, .budget = &budget };
     const r = runOwedDecodeTicks(share, chunk_ns +| nested_ns, first_ns, &owed, admitThenTick);
@@ -589,6 +638,7 @@ test "module disk tiers never arm or execute KV prefill write-through" {
     entry.prefix_cache = &hc;
     var slot: Slot = undefined;
     slot.model = &entry;
+    slot.prefix_cache = &hc;
     var prompt: [512]u32 = @splat(3);
     slot.full_prompt = &prompt;
     var ctx: WriteThroughCtx = .{ .slot = &slot };
@@ -639,6 +689,263 @@ test "boundaryEligible: a small plain request is admitted only under a share, ne
     try testing.expect(boundaryEligible(c, base_ctx));
     c.tail = base_ctx.max_tail + 1;
     try testing.expect(!boundaryEligible(c, base_ctx));
+}
+
+test "boundaryEligible: a priority request past the boundary tail needs room for its price and at most PRIORITY_MAX_TAIL" {
+    const cand: BoundaryCand = .{ .exclusive = false, .has_media = false, .prompt_logprobs = false, .generator_path = true, .module_state = false, .tail = BOUNDARY_MAX_TAIL + 1, .priority = true };
+    const ctx: BoundaryCtx = .{ .share = 0.25, .nested = false, .outer_exclusive = false, .decoding = 1, .max_concurrent = 8, .max_tail = BOUNDARY_MAX_TAIL, .priority_room_ns = 8 * 100, .chunk_ns = 100 };
+    try testing.expect(boundaryEligible(cand, ctx));
+
+    var c = cand;
+    c.tail = PRIORITY_MAX_TAIL;
+    try testing.expect(boundaryEligible(c, ctx));
+    c.tail = PRIORITY_MAX_TAIL + 1;
+    try testing.expect(!boundaryEligible(c, ctx));
+    c = cand;
+    c.priority = false;
+    try testing.expect(!boundaryEligible(c, ctx));
+
+    // One outer chunk per started BOUNDARY_MAX_TAIL tokens.
+    var x = ctx;
+    x.priority_room_ns = 200;
+    try testing.expect(boundaryEligible(cand, x));
+    x.priority_room_ns = 199;
+    try testing.expect(!boundaryEligible(cand, x));
+    x.priority_room_ns = 0;
+    // Within the boundary tail a priority request needs no room.
+    c = cand;
+    c.tail = BOUNDARY_MAX_TAIL;
+    try testing.expect(boundaryEligible(c, x));
+    // Every other gate still holds.
+    x = ctx;
+    x.share = 0;
+    try testing.expect(!boundaryEligible(cand, x));
+    x = ctx;
+    x.nested = true;
+    try testing.expect(!boundaryEligible(cand, x));
+    c = cand;
+    c.has_media = true;
+    try testing.expect(!boundaryEligible(c, ctx));
+}
+
+test "PriorityShare: the room is the outer's own time less what it hosted, never below zero" {
+    var s: PriorityShare = .{ .own_ns = 300, .hosted_ns = 100 };
+    try testing.expectEqual(@as(u64, 200), s.roomNs());
+    s.hosted_ns = 301;
+    try testing.expectEqual(@as(u64, 0), s.roomNs());
+}
+
+/// A scheduler with one outer prefill and pending requests built from slots without weights; `FakePrefill` stands
+/// in for `prefillAdmitted`.
+const BoundaryFixture = struct {
+    xf: transformer_mod.Transformer,
+    model: std.meta.Child(@FieldType(Slot, "model")),
+    sch: Scheduler,
+    prompt: [PRIORITY_MAX_TAIL + 1]u32,
+    slots: [16]Slot,
+    n_slots: usize,
+    share_was: f32,
+
+    const chunk_ns: u64 = 200 * std.time.ns_per_us;
+    const share: f32 = DEFAULT_DECODE_SHARE;
+
+    fn init(f: *BoundaryFixture) void {
+        f.xf = undefined;
+        f.xf.config = .{};
+        f.xf.plugin = null;
+        f.model = undefined;
+        f.model.transformer = &f.xf;
+        f.model.mtp = null;
+        f.model.prefix_cache = null;
+        f.sch = undefined;
+        f.sch.allocator = testing.allocator;
+        f.sch.io = testing.io;
+        f.sch.queue_mu = .init;
+        f.sch.pending = .empty;
+        f.sch.decoding = .empty;
+        f.sch.boundary_depth = 0;
+        f.sch.boundary_outer = null;
+        f.sch.boundary_slot = null;
+        f.sch.max_concurrent = 8;
+        f.sch.inflight_prefill_tokens = .init(0);
+        f.sch.inflight_prefill_expected = .init(0);
+        @memset(&f.prompt, 7);
+        f.n_slots = 0;
+        f.share_was = scheduler_mod.prefill_decode_share;
+        scheduler_mod.prefill_decode_share = share;
+        FakePrefill.reset();
+    }
+
+    fn deinit(f: *BoundaryFixture) void {
+        scheduler_mod.prefill_decode_share = f.share_was;
+        f.sch.pending.deinit(testing.allocator);
+        f.sch.decoding.deinit(testing.allocator);
+    }
+
+    /// A request of `tail` prompt tokens, none of them cached.
+    fn slot(f: *BoundaryFixture, tail: usize, priority: bool) *Slot {
+        const s = &f.slots[f.n_slots];
+        f.n_slots += 1;
+        s.* = undefined;
+        s.model = &f.model;
+        s.full_prompt = f.prompt[0..tail];
+        s.prompt_tokens = @intCast(tail);
+        s.priority = priority;
+        s.vision_embeddings = null;
+        s.media = &.{};
+        s.prefix_cache = null;
+        s.skip_prefix_cache = false;
+        s.cache_variant = 0;
+        s.boundary_max_tail = null;
+        s.prompt_logprobs = false;
+        s.enable_mtp = false;
+        s.legacy_gen = null;
+        s.finished = false;
+        s.error_code = null;
+        s.cancelled = .init(false);
+        s.in_pass = .init(0);
+        return s;
+    }
+
+    fn pend(f: *BoundaryFixture, s: *Slot) !void {
+        try f.sch.pending.append(testing.allocator, s);
+    }
+
+    /// The prefill whose boundaries these are; a test opens as many as it has chunks.
+    fn outer(f: *BoundaryFixture) InterleaveCtx {
+        return .{ .sch = &f.sch, .slot = f.slot(BOUNDARY_MAX_TAIL, false), .chunk_sw = io_util.Stopwatch.init(testing.io) };
+    }
+
+    /// One boundary of `ic`'s prefill, as `interleaveDecodeTickCb` opens and admits at it.
+    fn boundary(f: *BoundaryFixture, ic: *InterleaveCtx) void {
+        _ = f;
+        var budget = openBoundary(ic, chunk_ns, share);
+        _ = admitSmallAtBoundary(ic, share, &budget, FakePrefill.prefill);
+        // The owed ticks admit again between them, on the same budget.
+        _ = admitSmallAtBoundary(ic, share, &budget, FakePrefill.prefill);
+    }
+};
+
+/// Prefills a slot in one `BoundaryFixture.chunk_ns` per `BOUNDARY_MAX_TAIL` tokens, the outer's pace, and records it.
+const FakePrefill = struct {
+    var admitted: [16]*Slot = undefined;
+    var max_tail: [16]?usize = undefined;
+    var n: usize = 0;
+    /// Joins `pending` while the next prefill runs, which tries to admit it at its own boundary.
+    var arrives: ?*Slot = null;
+
+    fn reset() void {
+        n = 0;
+        arrives = null;
+    }
+
+    fn admittedAt(s: *Slot) ?usize {
+        for (admitted[0..n], 0..) |a, i| if (a == s) return i;
+        return null;
+    }
+
+    fn prefill(sch: *Scheduler, s: *Slot) AdmitOutcome {
+        admitted[n] = s;
+        max_tail[n] = s.boundary_max_tail;
+        n += 1;
+        if (arrives) |a| {
+            arrives = null;
+            sch.pending.append(sch.allocator, a) catch return .errored;
+            var nested: InterleaveCtx = .{ .sch = sch, .slot = s, .chunk_sw = io_util.Stopwatch.init(sch.io) };
+            var budget = openBoundary(&nested, BoundaryFixture.chunk_ns, BoundaryFixture.share);
+            _ = admitSmallAtBoundary(&nested, BoundaryFixture.share, &budget, prefill);
+        }
+        const ns = BoundaryFixture.chunk_ns * (std.math.divCeil(usize, s.full_prompt.len, BOUNDARY_MAX_TAIL) catch unreachable);
+        const sw = io_util.Stopwatch.init(sch.io);
+        while (sw.read() < ns) {}
+        return .decoding;
+    }
+};
+
+test "boundary admission: a 2-chunk prefill never hosts an 8-chunk priority request" {
+    var f: BoundaryFixture = undefined;
+    f.init();
+    defer f.deinit();
+    var ic = f.outer();
+    const guest = f.slot(PRIORITY_MAX_TAIL, true);
+    try f.pend(guest);
+    f.boundary(&ic);
+    try testing.expectEqual(@as(usize, 0), FakePrefill.n);
+    try testing.expectEqual(@as(usize, 1), f.sch.pending.items.len);
+}
+
+test "boundary admission: a priority request starts once the outer has read as long as it costs, a plain one of the same tail never" {
+    for ([_]usize{ 4 * BOUNDARY_MAX_TAIL, PRIORITY_MAX_TAIL }) |tail| {
+        var f: BoundaryFixture = undefined;
+        f.init();
+        defer f.deinit();
+        var ic = f.outer();
+        const plain = f.slot(tail, false);
+        const guest = f.slot(tail, true);
+        try f.pend(plain);
+        try f.pend(guest);
+        const cost_chunks = tail / BOUNDARY_MAX_TAIL;
+        var b: usize = 1;
+        while (b < cost_chunks) : (b += 1) f.boundary(&ic);
+        try testing.expectEqual(@as(usize, 0), FakePrefill.n);
+        f.boundary(&ic);
+        try testing.expectEqual(@as(?usize, 0), FakePrefill.admittedAt(guest));
+        try testing.expectEqual(@as(?usize, PRIORITY_MAX_TAIL), FakePrefill.max_tail[0]);
+        try testing.expect(ic.priority_share.hosted_ns >= cost_chunks * BoundaryFixture.chunk_ns);
+        while (b < 80) : (b += 1) f.boundary(&ic);
+        try testing.expectEqual(@as(?usize, null), FakePrefill.admittedAt(plain));
+    }
+}
+
+test "boundary admission: a flood of priority requests keeps at least half of a long prefill's wall clock" {
+    var f: BoundaryFixture = undefined;
+    f.init();
+    defer f.deinit();
+    var ic = f.outer();
+    var guests: [12]*Slot = undefined;
+    for (&guests) |*g| {
+        g.* = f.slot(PRIORITY_MAX_TAIL, true);
+        try f.pend(g.*);
+    }
+    var at: [guests.len]?usize = @splat(null);
+    var b: usize = 1;
+    while (b < 80) : (b += 1) {
+        const before = FakePrefill.n;
+        f.boundary(&ic);
+        for (FakePrefill.admitted[before..FakePrefill.n]) |s| {
+            for (guests, &at) |g, *a| if (g == s) {
+                a.* = b;
+            };
+        }
+    }
+    // Each costs eight chunks: the k-th starts no sooner than the outer has forwarded eight chunks per guest.
+    try testing.expectEqual(@as(?usize, 8), at[0]);
+    var admitted: usize = 0;
+    for (at, 1..) |a, k| if (a) |boundary_at| {
+        admitted += 1;
+        try testing.expect(boundary_at >= 8 * k);
+    };
+    try testing.expect(admitted <= 9);
+}
+
+test "boundary admission: a small request arriving while a priority request prefills waits for it and the outer's next chunk" {
+    var f: BoundaryFixture = undefined;
+    f.init();
+    defer f.deinit();
+    var ic = f.outer();
+    var b: usize = 1;
+    while (b < 8) : (b += 1) f.boundary(&ic);
+    const guest = f.slot(PRIORITY_MAX_TAIL, true);
+    const small = f.slot(64, false);
+    try f.pend(guest);
+    FakePrefill.arrives = small;
+    f.boundary(&ic);
+    // Nested prefills never admit, and the guest spent this boundary's budget.
+    try testing.expectEqual(@as(usize, 1), FakePrefill.n);
+    try testing.expectEqual(@as(?usize, 0), FakePrefill.admittedAt(guest));
+    f.boundary(&ic);
+    try testing.expectEqual(@as(?usize, 1), FakePrefill.admittedAt(small));
+    try testing.expectEqual(@as(?usize, BOUNDARY_MAX_TAIL), FakePrefill.max_tail[1]);
 }
 
 test "BoundaryBudget: stops at the count or the time cap, whichever comes first" {

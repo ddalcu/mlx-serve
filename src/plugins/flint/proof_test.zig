@@ -7,11 +7,7 @@ const plugin = @import("plugin.zig");
 const both = @import("../../engines/mlx/plugin/both.zig");
 const fixture = @import("../../sdk/bases/proof/fixture.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
-const abi = @import("../../abi/plugin.zig");
-const ops = @import("../../mlx/ops.zig");
 const family = @import("../laguna/family.zig");
-const cache_ops = @import("../../engines/mlx/kv/cache_ops.zig");
-const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
 const decode_attn_quant = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
 
 const H = 128;
@@ -125,38 +121,26 @@ test "flint plugin: a pack the plugin declines is refused by name (no legacy for
 }
 
 test "flint plugin: sliding layers through a ring cache read the same rows as the full buffer" {
-    const a = std.testing.allocator;
     var p = fixture.Pack.init(0xf118);
     defer p.deinit();
     try writePack(&p, true);
     var b = try both.Both.openAs(&plugin.table, &p, configJson(true), false, .none);
     defer b.close();
     const m: *family.Loaded(plugin.Model) = @ptrCast(@alignCast(b.xfm.plugin.?.model));
-    const full = m.base.weights;
-    var layers: [4]plugin.Model.Layer = undefined;
-    @memcpy(&layers, full.layers);
-    // Two rows past the window: the ring drops rows on most grows over these steps.
-    for (&layers) |*l| if (l.mixer.inner.window > 0) {
-        l.mixer.inner.ring = l.mixer.inner.window + 2;
-    };
-    var ringed = full;
-    ringed.layers = &layers;
-    var kv: [2]KVCache = .{ try KVCache.init(a, 4), try KVCache.init(a, 4) };
-    defer for (&kv) |*c| c.deinit();
-    var slots: [2]cache_ops.Slot = .{ .{ .kv = &kv[0] }, .{ .kv = &kv[1] } };
-    var pos: u32 = 0;
-    for (both.long_steps) |st| {
-        var g = ops.Graph.init(a, b.xfm.s);
-        defer g.deinit();
-        const ids = try fixture.tokens(&g, st.ids);
-        var outs: [2]ops.Array = undefined;
-        for ([_]*const plugin.Model.Weights{ &full, &ringed }, &slots, &outs) |w, *sl, *o| {
-            const handles = [_]abi.Handle{sl.handle()};
-            o.* = (try plugin.Model.forward(w, &m.base.shared, &g, ids, .{ .mode = st.mode, .rows = @intCast(st.ids.len), .positions = &.{pos}, .caches = &handles, .cache_ops = &cache_ops.ops, .logits = .all_rows })).logits;
-        }
-        try ops.expectBitEqual(outs[1], outs[0]);
-        pos += @intCast(st.ids.len);
+    var full: [4]plugin.Model.Layer = undefined;
+    var ringed: [4]plugin.Model.Layer = undefined;
+    for (m.base.weights.layers, &full, &ringed) |l, *f, *r| {
+        f.* = l;
+        f.mixer.inner.ring = 0;
+        r.* = l;
+        // Two rows past the window: the ring drops rows on most grows over these steps.
+        r.mixer.inner.ring = if (l.mixer.inner.window > 0) l.mixer.inner.window + 2 else 0;
     }
+    var fw = m.base.weights;
+    fw.layers = &full;
+    var rw = m.base.weights;
+    rw.layers = &ringed;
+    try both.expectRingSame(plugin.Model, &m.base.shared, b.xfm.s, &fw, &rw, 4, true);
 }
 
 test "flint plugin: under a launch override it serves through the plugin, the override in the engine config and its parse" {

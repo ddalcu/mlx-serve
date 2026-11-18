@@ -11,7 +11,7 @@ single-stream DiT, FlowMatchEuler, the 32-channel VAE with its encoder. Port of 
 | `config.zig` | MLX-free: claims (`flux2*`, or a configless pack whose `transformer/` names `double_stream_modulation_img`), caps, bills |
 | `plugin.zig` | the media table: the job (body via `sdk/media/image_request`, upload decode + edit geometry), LoRA, PNG, the tiny pack |
 | `engine.zig` | the loaded pipeline: low-memory encoder policy, the Qwen3 prompt template padded to 512, CFG, variation/edit wiring |
-| `flux.zig` | weights (affine linears, geometry read off the checkpoint), encoder on `sdk/blocks/text_encoders/qwen3`, DiT on `sdk/bases/dit` (`Hooks`), VAE on `sdk/blocks/vae`, schedule, the pipeline |
+| `flux.zig` | weights (`sdk/blocks/dit/mixed_linear`: affine or dense bf16; geometry read off the checkpoint), encoder on `sdk/blocks/text_encoders/qwen3`, DiT on `sdk/bases/dit` (`Hooks`), VAE on `sdk/blocks/vae`, schedule, the pipeline |
 
 ## Rules
 
@@ -20,7 +20,8 @@ single-stream DiT, FlowMatchEuler, the 32-channel VAE with its encoder. Port of 
   hardcoded 4B count against a 9B DiT loads without an error and draws a plausible wrong image. Encoder heads come
   from `q_proj` rows, not hidden/head_dim (20 on the 4B, wrong).
 - Bits and group size come off each linear's geometry (`inferQuantGeometry`, group 64 preferred): one loader serves
-  the 3/4/6/8-bit builds.
+  the 3/4/6/8-bit builds. A weight with no `.scales` is dense (mflux's bf16 build): every linear and the embed table
+  take either, per tensor.
 - Real CFG only for the undistilled base: `guidance_scale` 1.0 (the default) is ONE forward per step and
   byte-identical to the no-CFG path; anything else encodes the negative prompt (default "") and runs two.
 - The DiT's joint sequence is [text, image]; double blocks split it, run both streams, and join it again.
@@ -40,7 +41,8 @@ single-stream DiT, FlowMatchEuler, the 32-channel VAE with its encoder. Port of 
 ## Proofs
 
 - Tiny pack (`conformanceFixture`): 27-layer encoder at hidden 64, one double + one single block (inner 128), the
-  64-channel VAE with its encoder; the conformance suite runs a 256x256 job.
+  64-channel VAE with its encoder; the conformance suite runs a 256x256 job. Its bf16 twin (`fixtureOf(a, true)`,
+  the same weights dense) must load and draw the same image within the dense copy's rounding.
 - Blocks moved onto the sdk bit-equal: `MLX_SERVE_GOLDEN_DIR=<dir> zig build test -Dtest-filter=flux2` saved
   CFG + rebalance, an edit and a variation on the old code; the port compares bit for bit.
 - Reference oracles (env-gated, `FLUX_TEST_MODEL` + mflux dumps): encoder `prompt_embeds`, one DiT forward, VAE

@@ -14,6 +14,7 @@
 #
 # Usage: ./tests/test_oom_preflight.sh [model_dir] [port]
 #   Needs any loadable model dir for CPU-side setup (config.json + tokenizer).
+source "$(dirname "$0")/lib/server.sh"
 source "$(dirname "$0")/_lib_models.sh"
 
 set -u
@@ -42,7 +43,7 @@ if [ ! -x "$BINARY" ]; then
     exit 0
 fi
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 # Build the fake-OOM model: symlink the real (small) files so CPU-side setup

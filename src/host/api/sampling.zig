@@ -10,6 +10,7 @@ const model_mod = @import("../../sdk/config/model.zig");
 const log = @import("../../sdk/util/log.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
+const mlx_engine = @import("../engines/mlx.zig");
 const model_settings_mod = @import("../registry/model_settings.zig");
 const testing = std.testing;
 const http_server = @import("../http/server.zig");
@@ -54,6 +55,20 @@ pub fn parseLogitBias(allocator: std.mem.Allocator, root: std.json.ObjectMap) ![
     return out.toOwnedSlice(allocator);
 }
 
+/// Null = accepted, else the 400 message; checked before tokenizing. Only the generator's sampler applies
+/// the mask, so engines and archs that draw elsewhere refuse it instead of ignoring it.
+pub fn parseSuppressCjk(root: std.json.ObjectMap, lm: *const LoadedModel, on: *bool) ?[]const u8 {
+    const want = switch (root.get("suppress_cjk") orelse return null) {
+        .null => return null,
+        .bool => |b| b,
+        else => return "suppress_cjk must be a boolean",
+    };
+    if (!want) return null;
+    if (lm.engineBacked() or !mlx_engine.facts(lm).suppress_cjk) return "suppress_cjk is not available for this model";
+    on.* = true;
+    return null;
+}
+
 /// A zero rule means remaining context; an omitted rule uses the surface's fallback.
 pub fn generationMaxTokens(gen: generation_settings.Profile, v: ?std.json.Value, fallback: u32) u32 {
     const req = resolveRequestMaxTokens(v, 0);
@@ -68,7 +83,7 @@ pub var g_generation_settings_path: [std.fs.max_path_bytes]u8 = undefined;
 /// A request's generation defaults: the model's rules over the global file's, re-read when
 /// either file changes.
 pub fn requestProfile(io: std.Io, lm: *const LoadedModel) generation_settings.Profile {
-    return .overlay(g_generation_settings.generationDefaults(io, null), request_model.g_model_aliases.generationDefaults(io, lm.path));
+    return .overlay(g_generation_settings.generationDefaults(io, null), request_model.g_model_aliases.generationDefaults(io, .{ .path = lm.path, .real = lm.real_path }));
 }
 
 /// parseJsonFloat variant that distinguishes "omitted / wrong type" (null)

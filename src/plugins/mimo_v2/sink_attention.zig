@@ -6,7 +6,6 @@
 //! copied_from: sdk/blocks/attention/sinks.zig (`sinkAttnWith`, `sinkAttnSlots`, `sinkAttnCore`, `sinkAttnOut`,
 //! `mimoDecodeCopies`), engines/mlx/forward/layered.zig (the forward-level sliding masks).
 
-const abi = @import("../../abi/plugin.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const bases = @import("../../sdk/bases/bases.zig");
@@ -79,11 +78,11 @@ pub const SinkAttention = struct {
         const offset: c_int = @intCast(c.offset());
         const total = offset + s;
         const sv = sliding.view(w.window, w.geo.head_dim, total, s);
-        var view = try append(w, c, c.cache(), k, v, if (w.window > 0) sv.span else 0);
+        var view = try kv.appendSliding(c, c.cache(), k, v, if (w.window > 0) sv.span else 0, w.window, w.ring);
         defer kv.release(c, &view);
         const wc: c_int = @intCast(w.window);
         const decode_mask: Array = if (w.window > 0 and s == 1 and total > wc) try sliding.decodeOnce(c, @min(total, wc), wc) else .{};
-        return core(w, c, q, kv.dense(view), offset, sv.kv_len, decode_mask);
+        return core(w, c, q, kv.dense(view), offset, decode_mask);
     }
 
     /// Each batched slot's row of q/k/v appended at the slot's own length and read through its own view.
@@ -97,17 +96,17 @@ pub const SinkAttention = struct {
             const at: c_int = @intCast(i);
             const offset: c_int = @intCast(o.len(h, c.layer));
             const sv = sliding.view(w.window, w.geo.head_dim, offset + s, s);
-            var view = try append(w, c, h, try g.sliceAxis(k, 0, at, at + 1), try g.sliceAxis(v, 0, at, at + 1), if (w.window > 0) sv.span else 0);
+            var view = try kv.appendSliding(c, h, try g.sliceAxis(k, 0, at, at + 1), try g.sliceAxis(v, 0, at, at + 1), if (w.window > 0) sv.span else 0, w.window, w.ring);
             defer kv.release(c, &view);
             // A slot's decode view is exactly its window: no decode mask.
-            outs[i] = try core(w, c, try g.sliceAxis(q, 0, at, at + 1), kv.dense(view), offset, sv.kv_len, .{});
+            outs[i] = try core(w, c, try g.sliceAxis(q, 0, at, at + 1), kv.dense(view), offset, .{});
         }
         return g.concat(outs[0..c.caches.len], 0);
     }
 
     /// One slot's attention over its view (keys before this block numbering `offset`): the fused prefill kernels
     /// where they serve, the split-K decode kernel on a global layer, else MLX's SDPA with the sinks.
-    fn core(w: *const Weights, c: *Ctx, q: Array, dv: DenseKVView, offset: c_int, kv_len: c_int, decode_mask: Array) !Array {
+    fn core(w: *const Weights, c: *Ctx, q: Array, dv: DenseKVView, offset: c_int, decode_mask: Array) !Array {
         const g = c.g;
         const s = c.rows;
         const scale = w.geo.scale;
@@ -125,21 +124,9 @@ pub const SinkAttention = struct {
         const wc: c_int = @intCast(w.window);
         const total = offset + s;
         if (prefill and total <= wc) return da.sdpaSinks(g, q, dv.k, dv.v, scale, "causal", .{}, sinks, false);
-        if (prefill) return da.sdpaSinks(g, q, dv.k, dv.v, scale, "array", try sliding.bandOnce(c, s, kv_len, wc), sinks, false);
+        // The keys the view holds: a ring's whole-buffer view starts past position 0.
+        if (prefill) return da.sdpaSinks(g, q, dv.k, dv.v, scale, "array", try sliding.bandOnce(c, s, mlx.getShape(dv.k)[2], wc), sinks, false);
         if (total <= wc or decode_mask.ctx == null) return da.sdpaSinks(g, q, dv.k, dv.v, scale, "", .{}, sinks, false);
         return da.sdpaSinks(g, q, dv.k, dv.v, scale, "array", decode_mask, sinks, false);
-    }
-
-    /// Appends to `h` at the current layer: a sliding layer keeps only its ring.
-    fn append(w: *const Weights, c: *Ctx, h: abi.Handle, k: Array, v: Array, keep: u32) !abi.KvView {
-        const o = try c.cacheOps();
-        const st: abi.Stream = .{ .ctx = c.stream().ctx };
-        var out: abi.KvView = .{};
-        const verdict = if (keep > 0 and w.ring > 0)
-            o.append_ring(h, c.layer, .{ .ctx = k.ctx }, .{ .ctx = v.ctx }, keep, w.window, w.ring, st, &out)
-        else
-            o.append(h, c.layer, .{ .ctx = k.ctx }, .{ .ctx = v.ctx }, keep, st, &out);
-        if (!verdict.isOk()) return error.CacheOpFailed;
-        return out;
     }
 };

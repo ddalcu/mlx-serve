@@ -5,11 +5,11 @@ import Foundation
 /// front-matter strip. Kept out of the view so each is testable.
 enum ModelCard {
     static func pageURL(repoId: String) -> URL? {
-        URL(string: "https://huggingface.co/\(repoId)")
+        DownloadManager.hubURL("/\(repoId)")
     }
 
     static func readmeURL(repoId: String) -> URL? {
-        URL(string: "https://huggingface.co/\(repoId)/resolve/main/README.md")
+        DownloadManager.hubURL("/\(repoId)/resolve/main/README.md")
     }
 
     /// `org/repo` as-is; MTPLX's flat `Org--Name` folded back; a bare folder

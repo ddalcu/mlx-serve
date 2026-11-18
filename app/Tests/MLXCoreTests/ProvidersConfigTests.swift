@@ -129,4 +129,20 @@ final class SettingsFormStateProviderTests: XCTestCase {
         XCTAssertEqual(form.providerEntries.map(\.name), ["b"])
         XCTAssertEqual(form.providerModelText, [rows[1].id: "b"])
     }
+
+    /// A provider that does not answer says why (#1088): "Unreachable" alone read like a bad key.
+    func testAnUnreachableProviderSaysWhy() {
+        func row(_ down: String?) -> ProviderStatus {
+            var extra = ""
+            if let down { extra = ",\"down\":\"\(down)\"" }
+            let json = "{\"providers\":[{\"name\":\"shim\",\"url\":\"http://127.0.0.1:8080/v1\",\"up\":false,\"probed\":true,\"models\":0\(extra)}]}"
+            return ProviderStatus.decodeList(Data(json.utf8))[0]
+        }
+        XCTAssertEqual(row("refused").line, "Unreachable — nothing is listening at 127.0.0.1:8080")
+        XCTAssertEqual(row("dns").line, "Unreachable — 127.0.0.1 does not resolve")
+        XCTAssertEqual(row("timeout").line, "Unreachable — no answer from 127.0.0.1:8080 in time")
+        XCTAssertEqual(row("tls").line, "Unreachable — the secure connection to 127.0.0.1:8080 failed")
+        XCTAssertEqual(row(nil).line, "Unreachable", "an older server sends no reason")
+        XCTAssertEqual(row("other").line, "Unreachable")
+    }
 }

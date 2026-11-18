@@ -23,6 +23,7 @@ The only artifacts: the paste-ready rows bench.sh prints at the end, which go in
 ### Comparison traps (these cost real days)
 
 - **Only diff same-methodology cells.** Columns through 26.7.12 are the old in-repo harness; 26.8 on is llmprobe — different prompts, different warmup, different rate math. Never diff across that boundary. Same rule inside one column: a forced-spec cell and a shipping-defaults cell are not the same measurement.
+- **Boot the server with `--warmup-full`** (bench.sh and bench_versions.sh pass it to a binary that lists it). A Metal kernel compiles at its first use and Metal keeps it per build, so without the flag a build's first pass on a model carries one-time compiles (a cache-hit turn several times slower, a long prompt at a fraction of its rate) and the second pass does not. A binary without the flag: discard its first pass per model.
 - **"Reproducible ≠ not variance"** for spec-decode cells — sample across runs and boot orders before any regression claim. A cell that reads the same twice can still be variance.
 - **Attribute before believing.** Check whether the change could physically reach the cell that moved; reachability is faster to check than another bench and is what makes a repeat a confirmation.
 - **Never quote a win without naming the engine it is over** — vs LM-GGUF a row reads +33%; vs oMLX the same row is +1.6%.

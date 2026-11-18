@@ -107,6 +107,9 @@ pub const KVCache = struct {
     /// `reservedCacheTokens`). A grow is not in place, so a long prefill's peak carried a
     /// second copy of ~6 GB of KV at 458k; reserving on the first grow removes the transient.
     reserve_tokens: usize = 0,
+    /// The most tokens a grow allocates for: the context plus the widest verify (0: no limit). The proportional
+    /// policy's slack past it would never be written.
+    grow_limit: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, num_layers: u32) !KVCache {
         return initWithConfig(allocator, num_layers, KVQuantConfig.dense);
@@ -277,13 +280,26 @@ pub const KVCache = struct {
         if (tokens > self.reserve_tokens) self.reserve_tokens = tokens;
     }
 
-    /// The capacity a grow takes: the proportional policy, raised to the reservation when there is one.
+    /// Hold every grow to `tokens` (the context plus the widest verify), rounded up to a chunk.
+    pub fn limitGrowth(self: *KVCache, tokens: usize) void {
+        self.grow_limit = tokens;
+    }
+
+    /// The capacity a grow takes: the proportional policy, raised to the reservation when there is one, and held to
+    /// `grow_limit` (`limitedCapacity`).
     pub fn nextCapacityReserved(self: *const KVCache, current_cap: usize, needed: usize) usize {
         const policy = nextCapacity(current_cap, needed);
-        if (self.reserve_tokens <= policy) return policy;
+        if (self.reserve_tokens <= policy) return limitedCapacity(policy, needed, self.grow_limit);
         // Round the reservation the same way the policy rounds.
         const n_chunks = (self.reserve_tokens + chunk_step - 1) / chunk_step;
-        return n_chunks * chunk_step;
+        return limitedCapacity(n_chunks * chunk_step, needed, self.grow_limit);
+    }
+
+    /// PURE: a grow's capacity `want` held to `limit` rounded up to a chunk (0: no limit); a write past the limit
+    /// keeps `want`.
+    pub fn limitedCapacity(want: usize, needed: usize, limit: usize) usize {
+        if (limit == 0 or needed > limit) return want;
+        return @min(want, (limit + chunk_step - 1) / chunk_step * chunk_step);
     }
 
     pub fn update(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
@@ -556,13 +572,17 @@ pub const KVCache = struct {
     /// A grow: the capacity to allocate, and which of the current rows move into it.
     const Grow = struct { cap: c_int, drop: usize, kept: usize };
 
+    /// A sliding ring drops rows in whole blocks of this many, so a whole-buffer view keeps the absolute key-block
+    /// boundaries of the hd-256 band kernel (`attn256.metal` BK) and sums as a full buffer does, bit for bit.
+    pub const ring_drop_align = 32;
+
     /// The grow a write of `new_len` rows needs, or null. A sliding ring carries only its newest
-    /// `keep` rows across and ignores the request's reservation, which sizes a full buffer.
+    /// `keep` rows (up to one drop block more) across and ignores the request's reservation, which sizes a full buffer.
     fn planGrow(self: *const KVCache, entry: *const KVCacheEntry, new_len: usize) ?Grow {
         const rows = entry.offset - entry.base;
         const oversized = self.restoredOversized(entry, new_len);
         if (entry.initialized and !oversized and rows + new_len <= bufferCapacity(entry.keys)) return null;
-        const drop: usize = if (entry.initialized and entry.keep > 0 and rows > entry.keep) rows - entry.keep else 0;
+        const drop: usize = if (entry.initialized and entry.keep > 0 and rows > entry.keep) (rows - entry.keep) / ring_drop_align * ring_drop_align else 0;
         const kept: usize = if (entry.initialized) rows - drop else 0;
         const cur_cap = if (oversized) rows else if (entry.initialized) bufferCapacity(entry.keys) else 0;
         const cap = if (entry.keep > 0) nextCapacity(cur_cap, kept + new_len) else self.nextCapacityReserved(cur_cap, kept + new_len);

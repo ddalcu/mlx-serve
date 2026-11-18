@@ -1,6 +1,6 @@
 //! Builds the trunk from a pack's loaded map: the embedding and head, the layers (the engine's MoE layer binder),
-//! the final mixer, the n-gram state and table, the MTP head, the YaRN tables, then one batched eval of every
-//! weight. The map stays the caller's (the trunk borrows its arrays).
+//! the final mixer, the n-gram state and table, the MTP head, the YaRN tables, then an eval of every weight, a
+//! layer at a time. The map stays the caller's (the trunk borrows its arrays).
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
@@ -27,6 +27,9 @@ const mtp_nax_profile = @import("../../engines/mlx/spec/mtp_nax_profile.zig");
 const MoeLayerWeights = @import("../../engines/mlx/layer_weights.zig").MoeLayerWeights;
 const ternaryKernelCandidate = @import("../../sdk/quant/ternary.zig").ternaryKernelCandidate;
 const firstNonTernaryBias = @import("../../sdk/quant/ternary.zig").firstNonTernaryBias;
+const plugin_abi = @import("../../abi/plugin.zig");
+const outside_mod = @import("outside.zig");
+const headPrefix = @import("mtp.zig").headPrefix;
 
 /// A config field or bound weight the trunk's forward never reads (its arms are another family's), named; null when
 /// none. The plugin's config and the layer binder produce none of these for a qwen4_exp pack, so a hit is a layout
@@ -57,6 +60,10 @@ pub fn unservedLayout(config: *const model.ModelConfig, layers: []const MoeLayer
 pub const Options = struct {
     /// Quantize a dense bf16 head to MXFP8 at load (the lossy `lm_head_mxfp8` setting).
     head_mxfp8: bool = false,
+    /// The plugin load an outside quant plugin's table opens for; null: none is asked.
+    ctx: ?*const plugin_abi.LoadCtx = null,
+    /// The pack names `trunk_quant` (`Config.trunk_quant`): only the outside plugin claiming it reads its linears.
+    trunk_quant: bool = false,
 };
 
 /// `config` is borrowed for the trunk's life; `weights` must outlive it.
@@ -68,6 +75,13 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
     }
     const prefix = config.weight_prefix;
     var name_buf: [256]u8 = undefined;
+
+    // The outside quant plugin claiming the pack: its linears now, its banks once the layers are bound. The table is
+    // the load's; the weights it loaded stay the trunk's.
+    const ext: ?*outside_mod.Outside = if (opts.ctx) |ctx| try outside_mod.Outside.open(a, ctx, weights, s) else null;
+    errdefer if (ext) |o| o.destroy();
+    defer if (ext) |o| o.load.close();
+    try bindOutside(ext, config, weights, opts.trunk_quant, s);
 
     // Dense tables (float dtype) carry no scales; bias-less quant modes carry no biases.
     const bias_mandatory = config.quant_bits > 0 and config.quant_mode.hasBiases();
@@ -148,6 +162,10 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
         ssmFreeQsaState(e);
     }
     a.free(ml.ssm_entries);
+    if (ext) |o| for (ml.moe_layers, 0..) |*lw, li| if (lw.mlp == .moe) {
+        var bb: [160]u8 = undefined;
+        _ = try o.bindBanks(try std.fmt.bufPrint(&bb, "{s}.layers.{d}.mlp.switch_mlp", .{ prefix, li }), &lw.mlp.moe, config.hidden_size, config.moe_intermediate_size);
+    };
     if (fused_rows.fused_row_groups > 0) log.info("[load] row-joined projection groups: {d}\n", .{fused_rows.fused_row_groups});
     fused_rows.fused_row_groups = 0;
 
@@ -193,27 +211,31 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
         log.info("[rope] YaRN: factor {d:.4} (window {d} -> {d}), rotary {d} dims, ramp [{d:.0}, {d:.0}], mscale {d:.6}\n", .{ config.yarn_factor, config.yarn_orig_max_pos, config.contextCap(), rotary_dim, cr.low, cr.high, config.yarn_attention_factor });
     }
 
-    // One batched eval of every weight the trunk reads.
+    // Every weight the trunk reads, evaluated a layer at a time: one eval of all ~70 GB can outlast Metal's
+    // GPU watchdog while macOS makes room for it.
     {
         const eval_start = std.Io.Timestamp.now(io, .awake);
-        const all_vec = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(all_vec);
+        const head_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(head_vec);
         inline for (.{ emb_w, emb_s, emb_b, lm_head_w, lm_head_s, lm_head_b }) |arr| {
-            if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, arr);
+            if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(head_vec, arr);
         }
+        try mlx.check(mlx.mlx_eval(head_vec));
         for (ml.moe_layers) |lw| {
-            if (lw.hc_attn) |*hw| weights_util.appendStructArrays(all_vec, hw);
-            if (lw.hc_mlp) |*hw| weights_util.appendStructArrays(all_vec, hw);
-            if (lw.ple) |*pw| weights_util.appendStructArrays(all_vec, pw);
-            weights_util.appendHybridMlpWeights(all_vec, &lw.mlp);
+            const layer_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(layer_vec);
+            if (lw.hc_attn) |*hw| weights_util.appendStructArrays(layer_vec, hw);
+            if (lw.hc_mlp) |*hw| weights_util.appendStructArrays(layer_vec, hw);
+            if (lw.ple) |*pw| weights_util.appendStructArrays(layer_vec, pw);
+            weights_util.appendHybridMlpWeights(layer_vec, &lw.mlp);
             switch (lw.attn) {
-                .full => |fa| weights_util.appendFullAttnWeights(all_vec, &fa),
-                .linear => |la| weights_util.appendLinearAttnWeights(all_vec, &la),
+                .full => |fa| weights_util.appendFullAttnWeights(layer_vec, &fa),
+                .linear => |la| weights_util.appendLinearAttnWeights(layer_vec, &la),
             }
+            try mlx.check(mlx.mlx_eval(layer_vec));
         }
-        try mlx.check(mlx.mlx_eval(all_vec));
         const eval_ms: i64 = @intCast(@divTrunc(eval_start.untilNow(io, .awake).nanoseconds, std.time.ns_per_ms));
-        log.info("Batch eval all weights: {d}ms\n", .{eval_ms});
+        log.info("Eval all weights, a layer at a time: {d}ms\n", .{eval_ms});
     }
 
     // The final hyper-connection read and the module-owned n-gram hash + mmapped table.
@@ -238,6 +260,7 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
         log.err("[qwen4] ngram_table.bin geometry {d}x{d} does not match the config ({d} rows, {d} heads x dim)\n", .{ st.table.rows, st.table.dim, st.hash.total_rows, st.hash.n_heads });
         return error.NgramTableMismatch;
     }
+    if (st.table.fmt == .trellis) try trellisHeadBias(&st.table, weights, st.hash.n_heads);
     var weights_bytes: usize = 0;
     _ = mlx.mlx_get_active_memory(&weights_bytes);
     // A pipeline rank without the PLE layer, or a tensor worker, never reads the table.
@@ -250,6 +273,13 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
     // A pipeline split's head would read the last layer's stream, which lives on the worker.
     var head = if (config.dist_span != null) null else try loadQwen4Mtp(a, config.*, weights, &name_buf, s);
     errdefer if (head) |*h| h.deinit(a);
+    if (ext) |o| {
+        if (head) |*h| if (h.layer.mlp == .moe) {
+            var bb: [160]u8 = undefined;
+            _ = try o.bindBanks(try std.fmt.bufPrint(&bb, "{s}.layers.0.mlp.switch_mlp", .{headPrefix(weights).?}), &h.layer.mlp.moe, 0, 0);
+        };
+        try o.load.eval();
+    }
     log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, mmapped), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
 
     // Prism's ternary codec writes every affine bias as exactly -scale; only then do the 2-bit kernels serve.
@@ -269,7 +299,8 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
         const sh = mlx.getShape(lm_head_w);
         break :blk if (sh.len == 2) sh[0] else 0;
     };
-    const calibrated = mtp_nax_profile.mtpNaxCalibratedModelFrom(config, head_n) and config.quant_group_size == 64 and config.quant_mode == .affine;
+    // An outside plugin's pack keeps only a nominal affine block: no affine cost profile is its.
+    const calibrated = ext == null and mtp_nax_profile.mtpNaxCalibratedModelFrom(config, head_n) and config.quant_group_size == 64 and config.quant_mode == .affine;
     const uniform_bits = config.quant_bits == 4 or config.quant_bits == 6 or config.quant_bits == 8;
     return .{
         .config = config.*,
@@ -297,7 +328,53 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
         .dist_tp = if (config.dist_shard) |sh| if (sh.rank == 0) distributed_mod.peer() else null else null,
         .mtp_uniform_affine_trunk = calibrated and uniform_bits and mtp_nax_profile.mtpNaxUniformAffineTrunkFrom(config, ml.moe_layers),
         .mtp_oqe_affine_trunk = calibrated and config.quant_bits == 4 and mtp_nax_profile.mtpNaxOqeAffineTrunkFrom(config, ml.moe_layers),
+        .outside = ext,
     };
+}
+
+/// A pack only an outside quant plugin reads, refused by name when none claims it (its EXL3 weights would bind as
+/// affine); a claimed pack's f16 tables narrowed and its linears loaded on the table.
+fn bindOutside(ext: ?*outside_mod.Outside, config: *const model.ModelConfig, weights: *model.Weights, trunk_quant: bool, s: mlx.mlx_stream) !void {
+    const o = ext orelse {
+        if (trunk_quant) {
+            log.err("[qwen4] the pack's trunk_quant linears need the outside quant plugin that claims it, and none is loaded\n", .{});
+            return error.Qwen4TrunkQuantUnclaimed;
+        }
+        if (outside_mod.firstUnencoded(weights)) |name| {
+            log.err("[qwen4] {s} is in no MLX encoding, and no loaded quant plugin claims the pack\n", .{name});
+            return error.Qwen4OutsideFormatUnclaimed;
+        }
+        return;
+    };
+    // The banks and the n-gram rows are read per slot of the whole model.
+    if (config.dist_span != null or config.dist_shard != null) {
+        log.err("[qwen4] a pack an outside quant plugin claims is not split across Macs\n", .{});
+        return error.Qwen4OutsideDistributed;
+    }
+    try outside_mod.narrowTables(weights, s);
+    const n = try o.bindLinears(weights);
+    log.info("[qwen4] {s}: {d} trunk linears on the quant plugin\n", .{ o.load.format.?.name(), n });
+}
+
+/// A trellis n-gram table's per-head bias (`*.ple.ple_embedding.head_bias`, `[n_heads, dim]`), which the pack's shards
+/// hold and every gathered row adds.
+fn trellisHeadBias(table: *qwen4_mod.NgramTable, weights: *const model.Weights, n_heads: u32) !void {
+    var it = weights.map.iterator();
+    const hb = while (it.next()) |e| {
+        if (std.mem.endsWith(u8, e.key_ptr.*, ".ple.ple_embedding.head_bias")) break e.value_ptr.*;
+    } else {
+        log.err("[qwen4] the trellis n-gram table needs its per-head bias (ple.ple_embedding.head_bias), which the pack does not hold\n", .{});
+        return error.MissingWeight;
+    };
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var wide = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wide);
+    try mlx.check(mlx.mlx_astype(&wide, hb, .float32, cpu));
+    try mlx.check(mlx.mlx_array_eval(wide));
+    const n = mlx.mlx_array_size(wide);
+    const data = (mlx.mlx_array_data_float32(wide) orelse return error.NgramTableMismatch)[0..n];
+    try table.setHeadBias(data, n_heads);
 }
 
 /// A raw ggml table (its scales the GGUF type sentinel) carries no biases whatever the config's mode says.
@@ -339,4 +416,22 @@ test "qwen4_exp trunk: a raw ggml table needs no biases, an affine one under an 
     try std.testing.expect(!biasesRequired(true, w, sentinel));
     try std.testing.expect(biasesRequired(true, w, sc));
     try std.testing.expect(!biasesRequired(false, w, sc));
+}
+
+test "qwen4_exp trunk: a pack in an outside plugin's format that no loaded plugin claims is refused by name" {
+    const testing = std.testing;
+    var w = model.Weights.init(testing.allocator);
+    defer w.deinit();
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const c: model.ModelConfig = .{};
+    var plain = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&plain, &[_]c_int{ 4, 4 }, 2, .bfloat16, s));
+    try w.put("m.layers.0.self_attn.q_proj.weight", plain);
+    try bindOutside(null, &c, &w, false, s);
+    try testing.expectError(error.Qwen4TrunkQuantUnclaimed, bindOutside(null, &c, &w, true, s));
+    var trellis = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&trellis, &[_]c_int{ 4, 4, 32 }, 3, .uint16, s));
+    try w.put("m.layers.0.self_attn.k_proj.weight", trellis);
+    try testing.expectError(error.Qwen4OutsideFormatUnclaimed, bindOutside(null, &c, &w, false, s));
 }

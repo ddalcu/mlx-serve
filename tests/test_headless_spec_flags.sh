@@ -37,7 +37,7 @@ fi
 EMPTY_DIR="$(mktemp -d)"
 LOG="$(mktemp)"
 cleanup() {
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+    srv_preclean "$PORT"
     rm -rf "$EMPTY_DIR" "$LOG"
 }
 trap cleanup EXIT
@@ -45,7 +45,7 @@ trap cleanup EXIT
 # Boot headless over the empty dir, capture the banner, stop. Prints nothing;
 # the caller greps "$LOG".
 boot() {
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+    srv_preclean "$PORT"
     sleep 0.5
     : > "$LOG"
     "$BINARY" --serve --model-dir "$EMPTY_DIR" --port "$PORT" --log-file off "$@" > "$LOG" 2>&1 &
@@ -113,7 +113,7 @@ fi
 # surface absent against a headless boot for exactly this reason (2026-07-25).
 # Headless with an EMPTY model dir is the only place this is observable.
 echo "[5/5] endpoint existence does not depend on a model being loaded"
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 sleep 0.5
 : > "$LOG"
 "$BINARY" --serve --model-dir "$EMPTY_DIR" --port "$PORT" --log-file off > "$LOG" 2>&1 &

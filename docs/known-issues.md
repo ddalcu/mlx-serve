@@ -65,6 +65,10 @@ Declared today:
 - **Ollama sink**: SSE keepalive comments are dropped, and a LAN-tunnelled reply is not marked `length_framed`, so
   its close waits for the peer.
 - **K2-Horizon** with a JSON schema keeps thinking off.
+- **A sliding ring drops rows past window + 2048** (`mimo_v2`, `laguna`, `flint`, `kolibri1`, `gpt_oss`, `gemma4`): a
+  prefix-cache hit restores only where the entry still holds the window behind the match (`ringFloor`); on the SSD
+  tier the ring layers persist from the first whole chunk the ring still holds, so a disk restore serves only matches
+  past that chunk plus the window, and a session whose ring dropped rows writes its chunks instead of linking a donor's.
 - **`--kv-attn-mode fused` is a silent no-op on Gemma 4**: sliding layers keep a 512-key ring (under the packed reads'
   2048-key floor) and the hd-512 global layers at GQA 4 overflow the decode kernel's 10 KB threadgroup budget
   (`qkvDecBlockFor`), so every read stays dense (`tests/test_kv_quant_fused_equivalence.sh` defaults to Gemma 4 E4B).
@@ -88,7 +92,6 @@ classes the composed chain treats differently):
   on M1/M2, then probe per arm and width.
 - `msv_qmm_int8_prefill` accepts bf16 but the bf16 build fails when N % 128 == 0 (unreachable today: Hadamard packs
   are f16).
-- `msv_nax_attn_256_q8` (`--int8-qk`) fails to compile when exactly one scale input has fewer than 8 elements.
 - `mxfp8_qmv` and the NVFP4 kernels read e4m3 `0x7F`/`0xFF` (NaN) as 480; converters never write it.
 - `msv_keyed_sample` ignores the nucleus when a logit is NaN and `top_k` is 0.
 - The GELU tables (`gelu_erf_tables`, `gelu_tanh_tables` in `src/sdk/blocks/mlp/fused_activations.zig`) and the
@@ -115,6 +118,8 @@ classes the composed chain treats differently):
 - Quant blocks we ignore are not refused by name (bitsandbytes, compressed-tensors FP8, a modelopt_fp4 drafter).
 - ds4 reasoning budget on the plain path (refused by name).
 - EmbeddingGemma 2 audio; Muse's MoVA; the EigenLabs Nemotron-3.5-Bolt IQ2 pack (`iq2_xxs` is refused).
+- Gemma 3's SigLIP tower (`vision_tower.vision_model.*`, e.g. mlx-community/gemma-3-12b-it-4bit): the plugin has no
+  media hooks, the legacy encoder probes Gemma 4's names, so the pack logs `Vision weights missing` and serves text only.
 - Tokenizer parity: NFC normalization of U+2000-range spaces, DeepSeek's zero-width handling and Spark's blank-line
   shapes differ from HF.
 

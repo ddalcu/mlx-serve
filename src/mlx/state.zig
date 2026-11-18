@@ -90,3 +90,12 @@ test "mlxCacheLimitFromEnv: explicit bytes win, 0 disables, garbage falls throug
     try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv("lots", 128 * GB));
     try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv("", 128 * GB));
 }
+
+test "the test process runs under the server's MLX buffer-pool cap" {
+    const cap = mlxCacheLimitFromEnv(env.span(.MLX_SERVE_CACHE_LIMIT), metrics.getTotalMemBytes());
+    if (cap == 0) return error.SkipZigTest;
+    var now: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&now, cap);
+    defer _ = mlx.mlx_set_cache_limit(&now, now);
+    try testing.expect(now <= cap);
+}

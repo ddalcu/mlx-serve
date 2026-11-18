@@ -155,6 +155,11 @@ pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
         .working_set = mlx.maxRecommendedWorkingSet(),
         .model_bytes = model_bytes,
     };
+    // The GPU gather's kernel reads affine and bf16 rows, not trellis rings.
+    if (table.fmt == .trellis) {
+        log.info("[qwen4] ple gather: cpu (a trellis table decodes on the host)\n", .{});
+        return null;
+    }
     const src = table.embedded;
     // A fresh anonymous mapping is page-aligned by construction.
     const base: usize = if (src != null) 0 else @intFromPtr(table.map.ptr);

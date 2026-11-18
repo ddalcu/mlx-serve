@@ -46,7 +46,7 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 LOGFILE=$(mktemp)
 "$BINARY" --model-dir "$ROOT" --model "$ROOT/$M1" --serve --port "$PORT" --max-resident-models 4 ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$LOGFILE" 2>&1 &

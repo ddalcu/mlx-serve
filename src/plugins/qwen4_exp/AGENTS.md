@@ -23,6 +23,9 @@ an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`
   snapshot / bytes / serialize for the prefix cache and SSD; (6) group lanes and the grouped verify on the plugin arm;
   (7) the rerank on the head's mixer output; (8) the slot's whole M-RoPE table (`intree.enter` hands the engine's ctx,
   `plugin.engineCtx`, a `SharedThreadLocal`).
+- A pack an outside quant plugin claims (`outside.zig`): its non-MLX `.weight`s run on the table through `qmatmul`, its
+  banks ahead of Sushi's, keyed by the bound array; an `exl3_ngram_trellis` table (`ngram_table.file`) decodes on the
+  host; the rerank head is built from the head's identity matmul. Unclaimed or unserved layouts are refused by name.
 - Unserved hooks: `cache.aux` (QSA history + PLE prev in checkpoints/SSD ride the engine's SSM entries),
   `capture_stream_all` (no caller on this arch).
 - QSA's generic half is the SDK's block-sparse attention (`sdk/blocks/attention/sparse_block/`: `Blocks`/`Params`,

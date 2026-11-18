@@ -3,8 +3,8 @@
 //! slot's state and writes what it leaves back). Ling 3.0 shares this.
 
 const std = @import("std");
-const abi = @import("../../abi/plugin.zig");
-const mlx = @import("../../mlx/ffi.zig");
+const abi = @import("../../../abi/plugin.zig");
+const mlx = @import("../../../mlx/ffi.zig");
 const kda_mod = @import("kda.zig");
 const trunk = @import("trunk.zig");
 

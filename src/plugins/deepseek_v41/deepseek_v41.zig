@@ -10,6 +10,7 @@
 //! A chunk runs one layer at a time over all of its spans: each layer's
 //! experts are read once per chunk.
 const std = @import("std");
+const builtin = @import("builtin");
 const env = @import("../../env.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
@@ -24,6 +25,7 @@ const gather_nax = @import("../../sdk/blocks/moe/gather_qmm_nax.zig");
 const log = @import("../../sdk/util/log.zig");
 const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwiGLU;
 const engram = @import("engram.zig");
+const system = @import("../../sdk/util/system.zig");
 const cache_codec = @import("cache_codec.zig");
 const cache_abi = @import("../../abi/plugin.zig");
 const glm5 = @import("../glm5_next/glm5_next.zig");
@@ -458,6 +460,8 @@ pub const Dsv41Model = struct {
     /// The request's prompt, whose later chunks' Engram rows are read while an earlier one runs.
     prompt: []u32 = &.{},
     ahead: ?*engram.Prefetch = null,
+    /// The rows the next call brings when this module cut a chunk itself (`extendCold`): what the read-ahead reads.
+    next_rows: ?usize = null,
     rope_plain: Rope,
     rope_yarn: Rope,
     attn_dec_kernel: mlx.mlx_fast_metal_kernel,
@@ -523,6 +527,16 @@ pub const Dsv41Model = struct {
     ds_prof_comp_sync_ns: u64 = 0,
     /// The last draft's time, host sync included (`DsparkProfile`).
     ds_draft_ns: u64 = 0,
+    /// `MLX_SERVE_DSV41_EXACT` (`Exact`), read at load.
+    exact: Exact = .{},
+    /// Exact verify blocks that fell to the batched kernels (`exactMiss`).
+    exact_misses: u64 = 0,
+    /// A pair worker exact serves anyway: the gate's single-process worker (`decode/exact_test.zig`), whose host is
+    /// the test itself. A real pair's processes do not agree on the setting, so exact leaves them alone.
+    exact_pair_ok: bool = false,
+    /// The serial sampler's suppress mask `[V]` bool (the engine's `Transformer.suppress_mask`, not owned), set by the
+    /// engine before a DSpark round: an exact greedy accept masks the same ids. None: no mask.
+    suppress: A = none,
 
     fn dropAhead(self: *Dsv41Model) void {
         if (self.ahead) |a| a.finish();
@@ -710,6 +724,129 @@ fn head8From(v: ?[*:0]const u8) bool {
     return v == null or v.?[0] != '0';
 }
 
+/// `MLX_SERVE_DSV41_EXACT=1`: a DSpark verify row runs the kernels a plain step runs, so a greedy drafted request emits
+/// plain decode's tokens bit for bit, whatever the round schedule; plain decode itself is untouched. Copy verifies are
+/// cut to the decode-width rows (`maxVerifyDrafts`). The parts below are all on when exact is; only the gate
+/// (`decode/exact_test.zig`, `DSV41_EXACT_GATE_BATCHED`) leaves some on the batched kernels, to measure each one.
+pub const Exact = struct {
+    on: bool = false,
+    /// Each verify row's attention, attn_out and FFN as the plain step at its position runs them (`blockFusedRows`).
+    tail: bool = true,
+    /// Each row's Engram projection on its own (`engramRows`).
+    engram: bool = true,
+    /// Each row's final collapse, norm and LM head on its own (`headRows`).
+    head: bool = true,
+    /// The greedy accept masks the ids the serial sampler masks (`Dsv41Model.suppress`).
+    argmax: bool = true,
+    /// `MLX_SERVE_DSV41_EXACT=solo`: every request on the model ticks alone, whatever company it has. Nothing batches
+    /// its decode, and its DSpark slots keep drafting instead of yielding to the plain batch, so each request's tokens
+    /// are its solo plain decode's at any load (`exactSolo`). Off: exact covers one request at a time.
+    solo: bool = false,
+};
+
+pub fn exactWanted() Exact {
+    return exactFrom(env.get(.MLX_SERVE_DSV41_EXACT));
+}
+
+/// `MLX_SERVE_DSV41_EXACT`: unset, empty or `0` off; `solo` on and solo; any other value on.
+fn exactFrom(v: ?[*:0]const u8) Exact {
+    const t = std.mem.trim(u8, std.mem.span(v orelse return .{}), " ");
+    if (t.len == 0 or std.mem.eql(u8, t, "0")) return .{};
+    return .{ .on = true, .solo = std.mem.eql(u8, t, "solo") };
+}
+
+/// `e` with the parts named in `parts` (a comma list of tail, engram, head, argmax) left on the batched kernels: the
+/// gate's `DSV41_EXACT_GATE_BATCHED`, to measure what each part contributes.
+pub fn exactBatched(e: Exact, parts: ?[*:0]const u8) Exact {
+    var out = e;
+    var it = std.mem.tokenizeScalar(u8, std.mem.span(parts orelse return out), ',');
+    while (it.next()) |part| inline for (.{ "tail", "engram", "head", "argmax" }) |name| {
+        if (std.mem.eql(u8, std.mem.trim(u8, part, " "), name)) @field(out, name) = false;
+    };
+    return out;
+}
+
+test "dsv41 exact: MLX_SERVE_DSV41_EXACT values" {
+    try std.testing.expect(!exactFrom(null).on);
+    try std.testing.expect(!exactFrom("").on);
+    try std.testing.expect(!exactFrom("0").on);
+    try std.testing.expect(exactFrom("1").on and !exactFrom("1").solo);
+    try std.testing.expect(exactFrom("solo").on and exactFrom("solo").solo);
+    const b = exactBatched(exactFrom("1"), "head, argmax");
+    try std.testing.expect(b.on and b.tail and b.engram and !b.head and !b.argmax);
+}
+
+/// The expert stream's shim's one-row-kernel launch (csrc/dsv41_row_qmv.inc), on the macOS graphs that compile the
+/// shims (as `host/plugin_host_impl.zig`'s `shims`); elsewhere `rowQmv` declines and exact runs each row's projection
+/// on its own.
+const row_qmv_shim: ?type = if (builtin.os.tag == .macos) struct {
+    extern "c" fn dsv41_row_qmv(res: *A, x: A, w: A, scales: A, biases: A, group_size: c_int, bits: c_int, mode: [*:0]const u8, s: mlx.mlx_stream) c_int;
+    extern "c" fn dsv41_alloc_last_error() [*:0]const u8;
+} else null;
+
+/// `l` over up to 16 rows `x` (`[M, K]`, or `[B, M, K]` against a grouped `[B, N, K']`) on MLX's own one-row kernel
+/// (csrc/dsv41_row_qmv.inc): every row bit-equal to `l.apply` of that row alone. Null where it does not apply (a dense
+/// or f32 linear, a width off the kernel's block, more rows).
+pub fn rowQmv(sc: *Scope, l: *const Lin, x: A) !?A {
+    const shim = row_qmv_shim orelse return null;
+    if (l.s.ctx == null or mlx.mlx_array_dtype(x) != .bfloat16 or !mlx.streamIsGpu(sc.s)) return null;
+    const mode = l.qp.mode;
+    if (!((mode == .affine and l.qp.bits == 8) or (mode == .mxfp8 and l.qp.bits == 8 and l.qp.group_size == 32))) return null;
+    // The kernel the one-row call takes reads bf16 affine scales and biases, e8m0 (uint8) mxfp8 scales, packed uint32.
+    if (mlx.mlx_array_dtype(l.w) != .uint32) return null;
+    if (mode == .affine and (mlx.mlx_array_dtype(l.s) != .bfloat16 or l.b.ctx == null or mlx.mlx_array_dtype(l.b) != .bfloat16)) return null;
+    if (mode == .mxfp8 and (mlx.mlx_array_dtype(l.s) != .uint8 or l.b.ctx != null)) return null;
+    if (dim(x, -2) > 16 or @mod(dim(x, -1), 256) != 0) return null;
+    // The shim's shapes: x [M, K] against w [N, K'], or x [B, M, K] against a grouped w [B, N, K'].
+    const xn = mlx.mlx_array_ndim(x);
+    const wn = mlx.mlx_array_ndim(l.w);
+    if (!((xn == 2 and wn == 2) or (xn == 3 and wn == 3 and dim(x, 0) == dim(l.w, 0)))) return null;
+    var o = mlx.mlx_array_new();
+    if (shim.dsv41_row_qmv(&o, x, l.w, l.s, l.b, @intCast(l.qp.group_size), @intCast(l.qp.bits), mode.cstr(), sc.s) != 0) {
+        log.warn("deepseek_v41: dsv41_row_qmv: {s}\n", .{shim.dsv41_alloc_last_error()});
+        _ = mlx.mlx_array_free(o);
+        return error.Dsv41RowQmv;
+    }
+    return try sc.keep(o);
+}
+
+/// Whether exact serves `m` as it stands: on (`Exact.on`, which init keeps only on a non-NAX Apple GPU of the fused
+/// kernels' generation with bf16 activations), and every verify row takes `blockFusedRows`: no streamed bank (its
+/// blocks never enter `blockFused`), no tensor split and no pair (layers another process runs, under its own setting).
+pub fn exactServes(m: *const Dsv41Model) bool {
+    return m.exact.on and m.streamed == null and m.tp == null and (m.pair == null or m.exact_pair_ok);
+}
+
+/// Whether `m` keeps every request solo under exact (`Exact.solo`): the scheduler batches none of its decode and its
+/// DSpark slots never yield to company (`spec/dspark_group.zig` `exactSolo`).
+pub fn exactSolo(m: *const Dsv41Model) bool {
+    return exactServes(m) and m.exact.solo;
+}
+
+/// Whether an armed verify of `rows` rows takes exact part `part` (`Exact`).
+fn exactPart(m: *const Dsv41Model, verify: bool, rows: usize, comptime part: []const u8) bool {
+    return exactServes(m) and @field(m.exact, part) and verify and rows > 1 and rows <= dkern.max_rows;
+}
+
+/// The reason a held trunk layer's formats keep it off the fused decode kernels at verify width (q_kv, wq_b, the
+/// indexer's wq_b and weights_proj, the compressor), or null when every one serves.
+fn exactLayersDecline(m: *const Dsv41Model) ?[]const u8 {
+    for (0..m.n_layers) |li| {
+        if (!m.held(li)) continue;
+        const ly = &m.layers[li];
+        if (dkern.in_proj.planRows(m, ly, 2) == null) return "a layer's q_kv, weights_proj or compressor format (in_proj)";
+        if (!dkern.wq_b.servesLayer(m, ly)) return "a layer's wq_b format (wq_b)";
+    }
+    return null;
+}
+
+/// A verify block `exactServes` should have run on `blockFusedRows` fell to the batched kernels (`blockFused`
+/// declined a layer): counted, and logged once.
+fn exactMiss(m: *Dsv41Model, li: usize) void {
+    m.exact_misses += 1;
+    if (m.exact_misses == 1) log.warn("deepseek_v41: an exact verify block at layer {d} ran on the batched kernels (the fused decode kernels declined it): that round may differ from plain decode\n", .{li});
+}
+
 var ced_env: ?bool = null;
 /// `MLX_SERVE_DSV41_CED=0` keeps every prefill chunk on the full forward.
 fn cedEnabled() bool {
@@ -885,6 +1022,19 @@ fn ownConst(m: *Dsv41Model, shape: []const c_int, dt: mlx.mlx_dtype, v: f32) !A 
 fn ownCast(m: *Dsv41Model, x: A, dt: mlx.mlx_dtype) !A {
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&o, x, dt, m.s));
+    _ = try m.own(o);
+    try mlx.check(mlx.mlx_array_eval(o));
+    return o;
+}
+
+/// A weight the forward reads dense, owned by the model: as stored (cast to `dt` when given), or dequantized here
+/// when the pack quantized it (to `dt`, else the activation dtype).
+fn ownDense(m: *Dsv41Model, w: *const Weights, in_dim: usize, comptime base: []const u8, args: anytype, dt: ?mlx.mlx_dtype) !A {
+    const l = try getLin(m, w, in_dim, base, args);
+    if (l.ext != null or l.qp.mode == .gguf) return error.Dsv41QuantGeometry;
+    if (l.s.ctx == null) return if (dt) |d| ownCast(m, l.w, d) else l.w;
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_dequantize(&o, l.w, l.s, l.b, mlx.mlx_optional_int.some(@intCast(l.qp.group_size)), mlx.mlx_optional_int.some(@intCast(l.qp.bits)), l.qp.mode.cstr(), none, .{ .value = dt orelse m.act, .has_value = true }, m.s));
     _ = try m.own(o);
     try mlx.check(mlx.mlx_array_eval(o));
     return o;
@@ -1613,7 +1763,7 @@ pub fn pairRange(c: anytype, mine: u64, theirs: u64) ?[2]usize {
 /// from the shard the index names, the vision tower only on `vision` (its unread split copies never), the Engram
 /// projections kept beside its tables.
 pub fn loadPack(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, vision: bool) !Weights {
-    var w = try weights_load.loadWeightsOpt(io, gpa, dir, .{ .vision = vision, .dsv41 = true, .index_owners = true, .skip = &visionUnread });
+    var w = try weights_load.loadWeightsOpt(io, gpa, dir, .{ .vision = vision, .dsv41 = true, .skip = &visionUnread });
     errdefer w.deinit();
     const path = try std.fmt.allocPrintSentinel(gpa, "{s}/engram/engram-residents.safetensors", .{dir}, 0);
     defer gpa.free(path);
@@ -1792,18 +1942,36 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         u.* = .{ .pre = try ownConst(m, &.{ r, 1, ci(cfg.hidden_size) }, .bfloat16, 0), .post = try ownConst(m, &.{ r, 1 }, .float32, 1), .comb = try ownConst(m, &.{ r, 1, 1 }, .float32, 0) };
     };
     try compileRegions(m);
+    m.exact = exactWanted();
+    if (m.exact.on) {
+        // Proven (decode/exact_test.zig, the live corpus) only where every verify row takes the fused decode kernels'
+        // rows (`blockFusedRows`): an Apple GPU without NAX (the fused NAX indexer and attention give a verify row other
+        // picks, in another order, than the plain step's) of the generation the fused in_proj serves, bf16
+        // activations, a resident unsplit pack in MLX's own arrays (an outside quant plugin's `ext` weights have none
+        // for the per-row kernels to read), and every layer in the formats the fused kernels read.
+        const why: ?[]const u8 = if (comptime builtin.os.tag != .macos) "not an Apple GPU" else if (!mlx.streamIsGpu(s)) "not on the GPU" else if (device.naxAvailable()) "a NAX GPU" else if (device.deviceGeneration().gen < 15) "a GPU before the M3 generation" else if (m.act != .bfloat16) "activations not bf16" else if (m.tp != null or m.pair != null) "a tensor or pair split" else if (m.streamed_experts) "streamed experts" else if (opts.quant != null) "an outside quant plugin's weights" else if (m.dec.in_proj == null or m.dec.wq_b == null) "the fused decode kernels did not build" else exactLayersDecline(m);
+        if (why) |reason| {
+            log.warn("deepseek_v41: MLX_SERVE_DSV41_EXACT is proven only where every verify row takes the fused decode kernels ({s}); left off\n", .{reason});
+            m.exact.on = false;
+        }
+    }
+    if (m.exact.on) {
+        var ab: [64]u8 = undefined;
+        log.info("deepseek_v41: exact DSpark verify (MLX_SERVE_DSV41_EXACT) on {s} (NAX {any}): solo={any}; copy verifies cut to {d} drafts\n", .{ device.gpuArchitecture(&ab) orelse "?", device.naxAvailable(), m.exact.solo, dkern.max_rows - 1 });
+    }
     if (n_stages > 0) {
         for (0..n_stages) |si| m.layers[n_layers + si] = try loadLayer(m, w, "mtp", si, null);
         const last = n_stages - 1;
         const targets = cfg.dsv4_n_dspark_target_layers;
+        const rank = cfg.dsv4_dspark_markov_rank;
         m.dspark = .{
             .main_proj = try getLin(m, w, cfg.hidden_size * targets, "mtp.0.main_proj", .{}),
             .main_norm = try ownCast(m, try getW(w, "mtp.0.main_norm.weight", .{}), m.act),
             .norm = try ownCast(m, try getW(w, "mtp.{d}.norm.weight", .{last}), m.act),
             // The release's names (`markov_w1`, the bigram embedding; `markov_w2`, its head) where the pack keeps them.
-            .markov_embed = getOpt(w, "mtp.{d}.markov_head.markov_w1.weight", .{last}) orelse try getW(w, "mtp.{d}.markov_head.embed.weight", .{last}),
-            .markov_head = try ownCast(m, getOpt(w, "mtp.{d}.markov_head.markov_w2.weight", .{last}) orelse try getW(w, "mtp.{d}.markov_head.head.weight", .{last}), m.act),
-            .conf = try ownCast(m, try getW(w, "mtp.{d}.confidence_head.proj.weight", .{last}), .float32),
+            .markov_embed = if (getOpt(w, "mtp.{d}.markov_head.markov_w1.weight", .{last}) != null) try ownDense(m, w, rank, "mtp.{d}.markov_head.markov_w1", .{last}, null) else try ownDense(m, w, rank, "mtp.{d}.markov_head.embed", .{last}, null),
+            .markov_head = if (getOpt(w, "mtp.{d}.markov_head.markov_w2.weight", .{last}) != null) try ownDense(m, w, rank, "mtp.{d}.markov_head.markov_w2", .{last}, m.act) else try ownDense(m, w, rank, "mtp.{d}.markov_head.head", .{last}, m.act),
+            .conf = try ownDense(m, w, cfg.hidden_size + rank, "mtp.{d}.confidence_head.proj", .{last}, .float32),
         };
         m.n_mtp = n_stages;
         if (env.get(.DSPARK_PROFILE) != null) m.ds_prof = .{};
@@ -2042,7 +2210,7 @@ fn initEngram(m: *Dsv41Model, w: *Weights, dir: []const u8) !void {
             .qk = prod,
             .table = try engram.Table.open(m.gpa, dir, k, l, c.dsv41_engram_rows[k], c.dsv41_engram_head_dim),
         };
-        if (c.dsv41_streamed) m.engrams[k].table.readDirect();
+        if (c.dsv41_streamed) m.engrams[k].table.readDirect() else m.engrams[k].table.openCodes();
         opened += 1;
     }
 }
@@ -2767,6 +2935,18 @@ pub fn hcCollapse(sc: *Scope, x: A, pre: A) !A {
     const w = try sc.expand(pre, 1); // [L, 1, hc]
     const y = try sc.matmul(w, try sc.astype(x, .float32)); // [L, 1, D]
     return sc.astype(try sc.reshape(y, &.{ ci(dim(x, 0)), ci(dim(x, 2)) }), mlx.mlx_array_dtype(x));
+}
+
+/// The f32 logits of each final hidden row `h` [L, dim] on its own, as a plain step's one row (`Exact.head`).
+fn headRows(sc: *Scope, m: *const Dsv41Model, h: A) !A {
+    const L = dim(h, 0);
+    var ys: [dkern.max_rows]A = undefined;
+    if (L > ys.len) return error.Dsv41ExactWidth;
+    for (0..L) |l| ys[l] = try sc.rms(try sc.slice(h, 0, l, l + 1), m.norm, m.cfg.rms_norm_eps);
+    // The head over all the rows on the one-row kernel; else each row's head alone.
+    if (try rowQmv(sc, &m.head, try sc.concat(ys[0..L], 0))) |lg| return sc.astype(lg, .float32);
+    for (ys[0..L]) |*y| y.* = try sc.astype(try m.head.apply(sc, y.*), .float32);
+    return sc.concat(ys[0..L], 0);
 }
 
 /// `out[k] = post[k] * y + sum_j comb[j, k] * x[j]` — the new stream.
@@ -4431,6 +4611,20 @@ pub fn engramApply(sc: *Scope, m: *const Dsv41Model, e: *const EngramLayer, x: A
     return engramGateOps(sc, m, e.qk, x, kv);
 }
 
+/// `engramApply` over each row on its own, as the plain step at the row's position projects it (`Exact.engram`).
+fn engramRows(sc: *Scope, m: *const Dsv41Model, e: *const EngramLayer, x: A, rows: A) !A {
+    const L = dim(x, 0);
+    var ys: [dkern.max_rows]A = undefined;
+    if (L > ys.len) return error.Dsv41ExactWidth;
+    // The projection over all the rows on the one-row kernel, the gate a row at a time; else the whole row alone.
+    const kv = if (mlx.streamIsGpu(sc.s)) try rowQmv(sc, &e.wkv, try sc.astype(rows, m.act)) else null;
+    for (0..L) |l| ys[l] = if (kv) |k|
+        try engramGate(sc, m, e.qk, try sc.slice(x, 0, l, l + 1), try sc.slice(k, 0, l, l + 1))
+    else
+        try engramApply(sc, m, e, try sc.slice(x, 0, l, l + 1), try sc.slice(rows, 0, l, l + 1));
+    return sc.concat(ys[0..L], 0);
+}
+
 /// the widest Engram wkv call the gemv twin takes (a decode lane's verify; the decode-width
 /// regions run to 16 rows).
 const engram_twin_rows: usize = 16;
@@ -4509,7 +4703,11 @@ pub const ENGRAM_INS = [_][*:0]const u8{ "x", "kv", "qk", "cst" };
 
 // ── the forward ──────────────────────────────────────────────────────────
 
-pub const Want = enum { last, all };
+/// `replay`: no logits. The rows rebuild their layers' windows with the band stopped at the chunk's first row; no
+/// compressor runs, so the global rows and index keys stay as they are (`rewind`).
+/// `encode`: no logits. A prompt chunk the same call continues with one that replays (`extendCold`): the encoder's
+/// layers and the decoder's global rows, without the decoder's replay, whose windows the next chunk never reads.
+pub const Want = enum { last, all, replay, encode };
 
 /// One block over one span: the staggered hyper-connections around
 /// attention and the MoE. Returns the new stream; `pre` becomes the FFN's
@@ -4517,6 +4715,7 @@ pub const Want = enum { last, all };
 pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared) !A {
     if (sh.floor == null and sh.img.ctx == null and m.streamed == null and li < m.regions.len and dim(x, 0) <= dkern.max_rows and compiledAt(m, dim(x, 0)))
         if (try blockFused(sc, m, st, li, x, pre, p0, sh)) |y| return y;
+    if (exactPart(m, st.verify != null, dim(x, 0), "tail")) exactMiss(m, li);
     if (sh.floor == null and sh.img.ctx == null and li < m.regions.len and compiledAt(m, dim(x, 0)) and fetchServes(m, dim(x, 0))) {
         var a: [4]A = undefined; // the attention's pre, post, comb; its input
         try runRegion(sc, m, li, .attn_in, &.{ x, pre.* }, &a);
@@ -4580,7 +4779,6 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     const ly = &m.layers[li];
     const ls = &st.layers[li];
     const L = dim(x, 0);
-    const hd = m.cfg.head_dim;
     const a = try dkern.in_proj.run(sc, kp, m, ly, x, pre.*) orelse return null;
     const w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, try dkern.wq_b.rowsAt(sc, p0, L)) orelse return null;
     try ls.win.write(w.kv_row, p0, sc.s);
@@ -4593,24 +4791,159 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
         topk = sh.topk;
         if (clen > 0 and topk.ctx != null) comp_rows = try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view(clen, sc.s));
     }
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    if (m.tp == null and exactPart(m, st.verify != null, L, "tail")) return try blockFusedRows(sc, m, st, li, x, pre, p0, &w, topk);
+    return try blockTail(sc, m, st, li, x, pre, p0, w.q, w.sa, comp_rows, topk);
+}
+
+/// `blockFused` from attention on, over its rows' heads `q` and hc split `sa`: attention over the window and the picked
+/// compressed rows, attn_out and the FFN. `pre` becomes the FFN's mix.
+fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, q: A, sa: Split, comp_rows: A, topk: A) !A {
+    const ly = &m.layers[li];
+    const ls = &st.layers[li];
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(m.cfg.head_dim)));
     const inv = ropeFor(m, li).inv;
     var oa: ?A = null;
-    if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try dkern.attn.partials(sc, ka, m, w.q, ls.win, comp_rows, topk, p0, scale)) |p| {
-        oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counter, inv, try attnMeta(sc, m, w.q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l);
+    if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try dkern.attn.partials(sc, ka, m, q, ls.win, comp_rows, topk, p0, scale)) |p| {
+        oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counter, inv, try attnMeta(sc, m, q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l);
     };
     // `ffn_in` routes off wo_b's output, which a tensor split sums first.
-    if (m.tp == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &w.sa)) |f| {
+    if (m.tp == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &sa)) |f| {
         pre.* = f.sf.pre;
         return try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
     };
     var ao: [1]A = undefined;
-    if (oa) |v| ao[0] = try ly.wo_b.apply(sc, v) else try runRegion(sc, m, li, .attn_out, &.{try attnDecode(sc, m, ly, w.q, ls.win, comp_rows, topk, p0, scale, inv)}, &ao);
-    if (m.tp != null) return try tpFfn(sc, m, li, x, try tpSum(sc, m, ao[0]), &w.sa, pre);
+    if (oa) |v| ao[0] = try ly.wo_b.apply(sc, v) else try runRegion(sc, m, li, .attn_out, &.{try attnDecode(sc, m, ly, q, ls.win, comp_rows, topk, p0, scale, inv)}, &ao);
+    if (m.tp != null) return try tpFfn(sc, m, li, x, try tpSum(sc, m, ao[0]), &sa, pre);
     var out: [2]A = undefined;
-    try runRegion(sc, m, li, .ffn, &.{ x, ao[0], w.sa.pre, w.sa.post, w.sa.comb }, &out);
+    try runRegion(sc, m, li, .ffn, &.{ x, ao[0], sa.pre, sa.post, sa.comb }, &out);
     pre.* = out[1];
     return out[0];
+}
+
+/// Row `l`'s compressed rows and picks as the plain step at `p0 + l` reads them (`blockFusedRows`): none, none where it
+/// reads none.
+fn rowPicks(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, p0: usize, l: usize, topk: A, tr: usize) ![2]A {
+    const ly = &m.layers[li];
+    const p = p0 + l;
+    if (ly.ratio == 0 or topk.ctx == null) return .{ none, none };
+    const clen = (p + 1) / ly.ratio;
+    const k = @min(@as(usize, m.cfg.dsv4_index_topk), (p + 1) / tr);
+    if (clen == 0 or k == 0) return .{ none, none };
+    return .{ try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view(clen, sc.s)), try sc.slice(try sc.slice(topk, 0, l, l + 1), -1, 0, k) };
+}
+
+/// The non-NAX tail's attention, each row at its own position over its own picks, then attn_out over all the rows on
+/// the one-row kernel; null (nothing moved) where `rowQmv` declines wo_a or wo_b.
+fn blockRowsAttnOut(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, p0: usize, w: *const dkern.wq_b.Out, topk: A, tr: usize) !?A {
+    const ly = &m.layers[li];
+    const ls = &st.layers[li];
+    if (ly.wo_a.s.ctx == null or ly.wo_b.s.ctx == null) return null;
+    const L = dim(w.q, 0);
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(m.cfg.head_dim)));
+    const inv = ropeFor(m, li).inv;
+    var heads: [dkern.max_rows]A = undefined;
+    for (0..L) |l| {
+        const cr = try rowPicks(sc, m, st, li, p0, l, topk, tr);
+        heads[l] = try attnDecode(sc, m, ly, try sc.slice(w.q, 0, l, l + 1), ls.win, cr[0], cr[1], p0 + l, scale, inv);
+    }
+    const r = try sc.concat(heads[0..L], 0); // [L, H, hd], inverse-roped
+    const og = dim(ly.wo_a.w, 0);
+    const ob = try sc.transpose(try sc.reshape(r, &.{ ci(L), ci(og), -1 }), &.{ 1, 0, 2 }); // [og, L, in]
+    const oa = try rowQmv(sc, &ly.wo_a, ob) orelse return null; // [og, L, o_lora]
+    const a = try sc.astype(try sc.reshape(try sc.transpose(oa, &.{ 1, 0, 2 }), &.{ ci(L), -1 }), m.act);
+    return try rowQmv(sc, &ly.wo_b, a);
+}
+
+/// Layer `li`'s state the next plain step reads (`decode/exact_test.zig`): the window's last `sliding_window` rows, the
+/// compressed rows and index keys so far, and the open pooling group's rows (none where the layer keeps none).
+pub fn stateRowsForTest(sc: *Scope, m: *const Dsv41Model, st: *const State, li: usize) ![5]A {
+    const ls = &st.layers[li];
+    const n = st.n;
+    const lo = n -| m.cfg.sliding_window;
+    return .{
+        if (n > lo) try ls.win.read(sc, lo, n) else none,
+        if (ls.comp) |*r| (if (r.used > 0) try sc.keep(try r.view(r.used, sc.s)) else none) else none,
+        if (ls.idx_k) |*r| (if (r.used > 0) try sc.keep(try r.view(r.used, sc.s)) else none) else none,
+        ls.pend_kv,
+        ls.pend_gate,
+    };
+}
+
+/// The FFN stretch over an exact verify's rows: the hc expand, pre-norm and router over all the rows (one threadgroup a
+/// row in each of their kernels, compiled as `.ffn_pre`), then each row's one-row MoE kernels (`ffnDecode` at L = 1, the
+/// plain step's launch on that row's slices). The new stream and the FFN's mix, or null (nothing moved) where the
+/// one-row MoE declines.
+fn blockRowsFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split) !?[2]A {
+    const ly = &m.layers[li];
+    const L = dim(x, 0);
+    if (ly.experts.gu == null or ly.shared_gu == null or ly.experts.gate.qp.mode == .gguf) return null;
+    var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
+    try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, sa.pre, sa.post, sa.comb }, &p);
+    var ys: [dkern.max_rows]A = undefined;
+    for (0..L) |l| {
+        const sp: Split = .{ .pre = try sc.slice(p[1], 0, l, l + 1), .post = try sc.slice(p[2], 0, l, l + 1), .comb = try sc.slice(p[3], 0, l, l + 1) };
+        ys[l] = try ffnDecode(sc, m, ly, try sc.slice(p[4], 0, l, l + 1), try sc.slice(p[5], 0, l, l + 1), try sc.slice(p[6], 0, l, l + 1), try sc.slice(p[0], 0, l, l + 1), &sp) orelse return null;
+    }
+    return .{ try sc.concat(ys[0..L], 0), p[1] };
+}
+
+/// The ratio the picks layer `li` reads were scored at: the latest indexer at or above it (0: none).
+fn topkRatio(m: *const Dsv41Model, li: usize) usize {
+    var j = li + 1;
+    while (j > 0) : (j -= 1) if (m.layers[j - 1].idx != null) return m.ratio(j - 1);
+    return 0;
+}
+
+/// An exact verify's rows past the batched projections (`in_proj`, `wq_b`, the window write, compression and the
+/// indexer, whose per-row arithmetic does not depend on the row count), each through `blockTail` on its own as the
+/// plain step at its position runs it (`Exact.tail`): its own compressed rows and its own picks, the first
+/// min(index_topk, (p + 1) / ratio) of the block's (a row's picks come in index order, the groups it cannot see last as
+/// -1), so attention's split count and chunking, the one-row attn_out projections and the one-row MoE kernels are the
+/// serial step's.
+fn blockFusedRows(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, w: *const dkern.wq_b.Out, topk: A) !A {
+    const ly = &m.layers[li];
+    const L = dim(x, 0);
+    if (L > dkern.max_rows) return error.Dsv41ExactWidth;
+    const tr = topkRatio(m, li);
+    if (topk.ctx != null and tr == 0) return error.Dsv41ExactPicks;
+    var ys: [dkern.max_rows]A = undefined;
+    var pres: [dkern.max_rows]A = undefined;
+    // Without the NAX attention (whose partials feed the fused wo_a and ffn_in), the plain step's tail is attention,
+    // the attn_out stretch (wo_a, wo_b) and the FFN stretch: each row's attention on its own, attn_out over all the
+    // rows on the one-row kernel (`rowQmv`), each row's FFN on its own.
+    if (m.dec.attn == null) if (try blockRowsAttnOut(sc, m, st, li, p0, w, topk, tr)) |ao| {
+        if (try blockRowsFfn(sc, m, li, x, ao, &w.sa)) |f| {
+            pre.* = f[1];
+            return f[0];
+        }
+        for (0..L) |l| {
+            var out: [2]A = undefined;
+            try runRegion(sc, m, li, .ffn, &.{ try sc.slice(x, 0, l, l + 1), try sc.slice(ao, 0, l, l + 1), try sc.slice(w.sa.pre, 0, l, l + 1), try sc.slice(w.sa.post, 0, l, l + 1), try sc.slice(w.sa.comb, 0, l, l + 1) }, &out);
+            ys[l] = out[0];
+            pres[l] = out[1];
+        }
+        pre.* = try sc.concat(pres[0..L], 0);
+        return sc.concat(ys[0..L], 0);
+    };
+    for (0..L) |l| {
+        const p = p0 + l;
+        var comp_rows = none;
+        var picks = none;
+        if (ly.ratio > 0 and topk.ctx != null) {
+            const clen = (p + 1) / ly.ratio;
+            const k = @min(@as(usize, m.cfg.dsv4_index_topk), (p + 1) / tr);
+            if (clen > 0 and k > 0) {
+                picks = try sc.slice(try sc.slice(topk, 0, l, l + 1), -1, 0, k);
+                comp_rows = try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view(clen, sc.s));
+            }
+        }
+        var pr = try sc.slice(pre.*, 0, l, l + 1);
+        const sa: Split = .{ .pre = try sc.slice(w.sa.pre, 0, l, l + 1), .post = try sc.slice(w.sa.post, 0, l, l + 1), .comb = try sc.slice(w.sa.comb, 0, l, l + 1) };
+        ys[l] = try blockTail(sc, m, st, li, try sc.slice(x, 0, l, l + 1), &pr, p, try sc.slice(w.q, 0, l, l + 1), sa, comp_rows, picks);
+        pres[l] = pr;
+    }
+    pre.* = try sc.concat(pres[0..L], 0);
+    return sc.concat(ys[0..L], 0);
 }
 
 /// A tensor split's FFN at decode width, from the summed attention output `ao`: this rank's experts over the routes,
@@ -4762,7 +5095,7 @@ fn engramPrefetch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, tables: []
     m.ahead = null;
 
     // The next chunk is expected as wide as this one; hist already holds this chunk.
-    const w = if (mine) @min(m.prompt.len - p1, L) else 0;
+    const w = if (mine) @min(m.prompt.len - p1, m.next_rows orelse L) else 0;
     const next = try gpa.alloc(u32, if (w > region_rows) w * hs.n_layers * hs.cols() else 0);
     defer gpa.free(next);
     if (next.len > 0) {
@@ -4774,6 +5107,7 @@ fn engramPrefetch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, tables: []
     const ahead_spec: engram.Prefetch.Spec = .{ .at = p1, .len = w, .ids = next };
     if (adopted) |a| {
         if (next.len > 0) m.ahead = try engram.Prefetch.start(gpa, tables, &.{ahead_spec}, hs.cols(), span);
+        a.waited_ms = 0;
         return a;
     }
     const cur_spec: engram.Prefetch.Spec = .{ .at = p0, .len = L, .ids = rows };
@@ -4838,6 +5172,9 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     defer if (prefetch) |pf| if (m.ahead != pf) pf.finish();
     const eng_early = ids == .host and L > region_rows;
     if (eng_early) {
+        // A prompt chunk: its codes go past the page cache while the cache has no room for them.
+        const tight = eng_on and engram.cacheTight(system.getAvailableMemBytes(), system.getTotalMemBytes());
+        for (m.engrams) |*e| e.table.pastCache(tight);
         eng_ids = try engramIds(m, gpa, st, ids.host, images);
         if (eng_on) prefetch = try engramPrefetch(m, gpa, st, eng_tables, ids.host, eng_ids, span, images);
     }
@@ -4894,6 +5231,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     @memset(held, none);
     var sp = spansOf(held, n_spans, targets, span, L, p0);
     sp.whole = held[held.len - 4 ..][0..2];
+    if (want == .replay) sp.floor = p0;
     sp.eng_ids = eng_ids;
     sp.ncols = ncols;
     var img_mask: A = none;
@@ -4958,8 +5296,18 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
         try exchange(m, gpa, &sp, p0, st.snap_at != null and st.snap_at.? == p0 + L, if (st.verify) |v| v.n0 == p0 else false);
         from = p.hi;
     }
-    const enc_hi = if (tail != null) m.ced_split.? else m.n_layers;
+    if (want == .encode and (m.ced_split == null or m.pair != null or st.verify != null)) return error.Dsv41EncodeUnsupported;
+    const enc_hi = if (tail != null or want == .encode) m.ced_split.? else m.n_layers;
     try runLayers(m, gpa, st, &sp, held, from, enc_hi);
+    if (want == .encode) {
+        try cedCompress(m, gpa, st, &sp, enc_hi);
+        st.n = p0 + L;
+        var ev: std.ArrayList(A) = .empty;
+        defer ev.deinit(gpa);
+        for (st.layers) |*ls| try appendLayerState(gpa, &ev, ls);
+        try asyncEvalAll(ev.items);
+        return none;
+    }
     if (tail) |tl| {
         var tsp = spansOf(held[n_spans * (4 + targets) ..], n_tail, targets, span, tl, p0 + L - tl);
         tsp.whole = held[held.len - 2 ..][0..2];
@@ -4968,6 +5316,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
         m.ced_stats.chunks += 1;
         m.ced_stats.skipped += L - tl;
         log.info("[dsv41] CED prefill: {d} rows encoder-only, replay {d} rows\n", .{ L - tl, tl });
+        if (prefetch) |pf| log.debug("[dsv41] the chunk waited {d} ms on its Engram rows{s}\n", .{ pf.waited_ms, if (m.engrams[0].table.past_cache.load(.acquire)) ", codes past the page cache" else "" });
         try runLayers(m, gpa, st, &tsp, held, enc_hi, m.n_layers);
         sp = tsp;
     }
@@ -4984,8 +5333,18 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
             v.mh = sc.out(all);
         } else try commitMain(&sc, m, st, all, sp.p0);
     }
+    if (want == .replay) {
+        var ev: std.ArrayList(A) = .empty;
+        defer ev.deinit(gpa);
+        for (st.layers) |*ls| try appendLayerState(gpa, &ev, ls);
+        for (st.ds) |r| try ev.append(gpa, r.buf);
+        if (st.mh.ctx != null) try ev.append(gpa, st.mh);
+        try evalAll(ev.items);
+        return none;
+    }
 
     // The final collapse uses the last layer's FFN mix.
+    const exact_head = want == .all and m.head.w.ctx != null and exactPart(m, st.verify != null, L, "head");
     var h: A = undefined;
     if (want == .last) {
         const k = sp.xs.len - 1;
@@ -4994,11 +5353,14 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     } else {
         var parts: std.ArrayList(A) = .empty;
         defer parts.deinit(gpa);
-        for (0..sp.xs.len) |k| try parts.append(gpa, try hcCollapse(&sc, sp.xs[k], sp.pres[k]));
+        // An exact verify collapses each row on its own, as a plain step collapses its one row.
+        for (0..sp.xs.len) |k| if (exact_head) {
+            for (0..dim(sp.xs[k], 0)) |r| try parts.append(gpa, try hcCollapse(&sc, try sc.slice(sp.xs[k], 0, r, r + 1), try sc.slice(sp.pres[k], 0, r, r + 1)));
+        } else try parts.append(gpa, try hcCollapse(&sc, sp.xs[k], sp.pres[k]));
         h = try sc.concat(parts.items, 0);
     }
     // A tensor rank past 0 holds no head: its last stream stands in for the logits.
-    const logits = if (!m.hasHead()) try sc.astype(h, .float32) else try sc.astype(try m.head.apply(&sc, try sc.rms(h, m.norm, c.rms_norm_eps)), .float32);
+    const logits = if (!m.hasHead()) try sc.astype(h, .float32) else if (exact_head) try headRows(&sc, m, h) else try sc.astype(try m.head.apply(&sc, try sc.rms(h, m.norm, c.rms_norm_eps)), .float32);
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(gpa);
     try ev.append(gpa, logits);
@@ -5029,7 +5391,7 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
             // layer's evaluation frees each one when its consumers are done.
             var sc = Scope.init(gpa, m.s);
             defer sc.deinit();
-            var x = try spanIn(&sc, m, gpa, sp, li, k);
+            var x = try spanInAt(&sc, m, gpa, sp, li, k, st.verify != null);
             const a, const b = sp.bounds(k);
             var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor, .img = try sp.imgSlice(&sc, a, b), .last_row = sp.floor != null and li + 1 == m.n_layers and k + 1 == n_spans and m.trace == null };
             var pre = sp.pres[k];
@@ -5613,10 +5975,8 @@ fn spansOf(held: []A, n: usize, targets: usize, span: usize, L: usize, p0: usize
     return .{ .xs = held[0..n], .pres = held[n .. 2 * n], .topks = held[2 * n .. 3 * n], .cands = held[3 * n .. 4 * n], .mh = held[4 * n .. 4 * n + n * targets], .span = span, .L = L, .p0 = p0, .eng_ids = &.{}, .ncols = 0 };
 }
 
-/// CED: layer `li`'s compressor over every row of `sp` (the decoder's global KV and index keys exist at every
-/// position), then `sp`'s last rows become `tsp`'s spans, the decoder's input; `sp`'s streams are released. The rows
-/// before the tail get no decoder window KV, which no tail query reaches: the tail's band stops at its first row.
-fn cedReplayIn(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, tsp: *const Spans, li: usize) !void {
+/// CED: layer `li`'s compressor over every row of `sp`: the decoder's global KV and index keys exist at every position.
+fn cedCompress(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, li: usize) !void {
     const ly = &m.layers[li];
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
@@ -5624,6 +5984,15 @@ fn cedReplayIn(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Sp
         const pa = try hcPreNormWide(&sc, m, x, pre, &ly.hc_attn, ly.attn_norm);
         try compress(&sc, m, st, li, &ly.comp.?, pa.h, sp.p0 + k * sp.span);
     }
+}
+
+/// CED: `cedCompress`, then `sp`'s last rows become `tsp`'s spans, the decoder's input; `sp`'s streams are released.
+/// The rows before the tail get no decoder window KV, which no tail query reaches: the tail's band stops at its first
+/// row.
+fn cedReplayIn(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, tsp: *const Spans, li: usize) !void {
+    try cedCompress(m, gpa, st, sp, li);
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
     // The tail's rows come from the spans it overlaps.
     const skip = sp.L - tsp.L;
     const k0 = skip / sp.span;
@@ -5641,6 +6010,11 @@ fn cedReplayIn(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Sp
 /// Span `k`'s stream entering layer `li`: its Engram write, and its DSpark
 /// main row when the layer is a target.
 pub fn spanIn(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, li: usize, k: usize) !A {
+    return spanInAt(sc, m, gpa, sp, li, k, false);
+}
+
+/// `spanIn` of an armed verify's span (`verify`), whose rows an exact verify projects one at a time (`Exact.engram`).
+pub fn spanInAt(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, li: usize, k: usize, verify: bool) !A {
     const lo, const hi = sp.bounds(k);
     var x = sp.xs[k];
     for (m.engrams, 0..) |*e, ek| {
@@ -5657,7 +6031,8 @@ pub fn spanIn(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spa
             for (lo..hi) |t| @memcpy(mine[(t - lo) * nc ..][0..nc], sp.eng_ids[(t * m.engrams.len + ek) * nc ..][0..nc]);
             break :blk try sc.keep(try e.table.gather(gpa, mine, sc.s));
         };
-        const y = try engramApply(sc, m, e, x, try sc.reshape(rows, &.{ ci(hi - lo), -1 }));
+        const er = try sc.reshape(rows, &.{ ci(hi - lo), -1 });
+        const y = if (exactPart(m, verify, hi - lo, "engram")) try engramRows(sc, m, e, x, er) else try engramApply(sc, m, e, x, er);
         // An image span's rows get no Engram write (the reference shuts their gate).
         x = if (sp.img.ctx != null) try sc.where(try sc.expand(try sc.expand(try sp.imgSlice(sc, lo, hi), -1), -1), x, y) else y;
         if (m.trace) |t| try t.put("engram_{d}", .{li}, x);
@@ -5905,6 +6280,9 @@ pub const Snap = struct {
     ds: []A,
     mh: A,
     hist: []u32,
+    /// False: a slice (`sliceSnap`). Its global rows and index keys stop at `n`; its windows, open groups and DSpark
+    /// rows are the longer run's and `rewind` rebuilds them when it is restored.
+    whole: bool = true,
 
     const LSnap = struct { win: A, comp: ?Rows, idx_k: ?Rows, pend_kv: A, pend_gate: A };
 
@@ -5962,9 +6340,48 @@ pub const Snap = struct {
             .ds = ds,
             .mh = ref(self.mh),
             .hist = hist,
+            .whole = self.whole,
         };
     }
 };
+
+/// A snapshot of the longest prefix of at most `len` tokens that `sn` restores at: `sn`'s own when it ends there,
+/// else its global rows and index keys cut where every pooling group is closed, the windows left to `rewind`.
+/// Null: none (past its end, nothing left, image rows, a tensor split).
+pub fn sliceSnap(m: *const Dsv41Model, gpa: std.mem.Allocator, sn: *const Snap, len: usize) !?Snap {
+    if (len >= sn.n) return if (len == sn.n) try sn.clone(gpa) else null;
+    if (m.tp != null or m.pair != null or sn.vision_key != 0) return null;
+    var group: usize = 1;
+    for (m.layers[0..sn.layers.len], sn.layers) |*ly, l| if (l.comp != null) {
+        group = group / std.math.gcd(group, ly.ratio) * ly.ratio;
+    };
+    const n = len - len % group;
+    if (n == 0) return null;
+    var out = try sn.clone(gpa);
+    errdefer out.deinit(gpa);
+    out.ids = try gpa.realloc(out.ids, n);
+    out.hist = try gpa.realloc(out.hist, @min(out.hist.len, n));
+    out.n = n;
+    out.whole = false;
+    for (out.layers, m.layers[0..out.layers.len]) |*l, *ly| {
+        if (l.comp) |*r| r.used = n / ly.ratio;
+        if (l.idx_k) |*r| r.used = n / ly.ratio;
+        for ([_]*A{ &l.pend_kv, &l.pend_gate }) |a| hold(a, none);
+    }
+    return out;
+}
+
+/// The tech report's SWA bounded replay. `st` stands at `st.n` with a longer run's windows (a restored slice); the
+/// last window of `ids`, the state's own tokens, is run again from its first row, which rebuilds every layer's
+/// window and the DSpark stages' and leaves the global rows as they are. Approximate where the window was cut: the
+/// replay's first rows attend none of the rows before them.
+pub fn rewind(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32) !void {
+    if (ids.len != st.n) return error.Dsv41SnapshotGeometry;
+    const s = st.n -| m.cfg.sliding_window;
+    if (st.hist.items.len > s) st.hist.shrinkRetainingCapacity(s);
+    st.n = s;
+    _ = try extendIds(m, gpa, st, .{ .host = ids[s..] }, .replay, null);
+}
 
 fn cacheSetting(h: *std.hash.Wyhash, value: anytype) void {
     switch (@typeInfo(@TypeOf(value))) {
@@ -6062,6 +6479,8 @@ pub fn exportSnapshot(m: *const Dsv41Model, sn: *const Snap, out: *cache_abi.Aux
     out.tensor_len = 0;
     out.names_len = 0;
     out.header_len = 0;
+    // A slice is restored, never stored: its windows are not its own.
+    if (!sn.whole) return error.Dsv41SnapshotSliced;
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
     if (had_error) return error.Dsv41CacheMlxErrorPending;
@@ -6341,6 +6760,45 @@ pub fn snapshotStateIfDue(st: *State, gen: u64) !void {
     st.snap_at = null;
 }
 
+/// The capture an unfinished prompt leaves: the state where its last forwarded chunk ended, keyed by the armed ids up
+/// to there, so an abandoned prefill resumes instead of starting over. Nothing when no capture is armed, nothing
+/// was forwarded, or an image of the prompt lies past that point (the armed key hashes every image row).
+pub fn snapshotStateAtChunk(m: *const Dsv41Model, st: *State, gen: u64) !void {
+    const at = st.snap_at orelse return;
+    if (st.snap != null or st.n == 0 or st.n >= at) return;
+    if (m.imageRows(st.snap_ids[0..st.n]) != m.imageRows(st.snap_ids)) return;
+    const ids = try st.gpa.dupe(u32, st.snap_ids[0..st.n]);
+    st.gpa.free(st.snap_ids);
+    st.snap_ids = ids;
+    st.snap_at = st.n;
+    try snapshotStateIfDue(st, gen);
+}
+
+/// A prompt chunk of at least `LEAD_MIN` rows whose Engram rows nothing read ahead sends its first half ahead of the
+/// rest (0: the chunk runs whole): the drive reads the rest behind it, where the whole chunk holds the GPU at the first
+/// Engram layer until its last row is read. A narrower lead feeds the matrix units too few rows an expert.
+pub fn leadRows(L: usize, read_ahead: bool) usize {
+    return if (read_ahead or L < LEAD_MIN) 0 else L / 2 / SPAN * SPAN;
+}
+const LEAD_MIN: usize = 4096;
+
+/// `extendIds` of a prompt chunk for its last row's logits, its lead (`leadRows`) run first without the decoder's
+/// replay, which the rest of the chunk makes at its own end.
+fn extendCold(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32, vision: ?VisionRows) !A {
+    const whole = m.engrams.len == 0 or m.pair != null or m.tp != null or m.streamed != null or m.trace != null or
+        m.ced_split == null or st.verify != null or !cedEnabled();
+    const lead = if (whole) 0 else leadRows(ids.len, if (m.ahead) |a| a.covers(st.n, ids.len) else false);
+    if (lead == 0) return extendIds(m, gpa, st, .{ .host = ids }, .last, vision);
+    defer m.next_rows = null;
+    m.next_rows = ids.len - lead;
+    _ = try extendIds(m, gpa, st, .{ .host = ids[0..lead] }, .encode, vision);
+    var rest = vision;
+    if (rest) |*v| v.offset += std.mem.count(u32, ids[0..lead], &.{m.cfg.image_token_id});
+    // The prompt's next chunk is expected as wide as this whole one, not as its rest.
+    m.next_rows = ids.len;
+    return extendIds(m, gpa, st, .{ .host = ids[lead..] }, .last, rest);
+}
+
 /// `extend` that takes the armed snapshot on the way: a chunk crossing its
 /// position runs as two.
 /// One decode token still on the GPU (`Ids.gpu`), where `extendResumable` takes host ids.
@@ -6356,7 +6814,7 @@ pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32,
     const st = &m.dec_state.?;
     if (st.snap_at) |at| if (at > st.n and at < st.n + ids.len) {
         const k = at - st.n;
-        const head = try extendIds(m, gpa, st, .{ .host = ids[0..k] }, .last, vision);
+        const head = try extendCold(m, gpa, st, ids[0..k], vision);
         _ = mlx.mlx_array_free(head);
         try snapshotIfDue(m);
         // The tail's rows follow the head's.
@@ -6364,7 +6822,7 @@ pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32,
         if (rest) |*v| v.offset += std.mem.count(u32, ids[0..k], &.{m.cfg.image_token_id});
         return extendIds(m, gpa, st, .{ .host = ids[k..] }, .last, rest);
     };
-    const out = try extendIds(m, gpa, st, .{ .host = ids }, .last, vision);
+    const out = try extendCold(m, gpa, st, ids, vision);
     try snapshotIfDue(m);
     return out;
 }
@@ -6925,7 +7383,16 @@ pub const VERIFY_MAX_DRAFTS: usize = RING_SLACK - 1;
 
 /// Drafts one verify of `m` takes: on a streamed bank the verify stays a decode-phase call (`Routed.decode_ids`).
 pub fn maxVerifyDrafts(m: *const Dsv41Model) usize {
-    return verifyDraftsFor(if (m.streamed) |src| src.decode_ids else null, m.cfg.num_experts_per_tok);
+    const d = verifyDraftsFor(if (m.streamed) |src| src.decode_ids else null, m.cfg.num_experts_per_tok);
+    // An exact verify runs on the decode-width kernels: its rows (drafts and `t1`) stay within `dkern.max_rows`.
+    return if (exactServes(m)) @min(d, dkern.max_rows - 1) else d;
+}
+
+/// The draft a copy round must outrun to be worth a round (`dsparkCopyLen`): the stage block, whose drafts a stage round
+/// verifies anyway. An exact verify carries at most `maxVerifyDrafts` drafts, the block's own width, so there a copy
+/// of that many is worth its round (no stage forward, an agreement long enough to be strong).
+pub fn copyBlock(m: *const Dsv41Model) usize {
+    return if (exactServes(m)) @min(m.ds_block, maxVerifyDrafts(m) -| 1) else m.ds_block;
 }
 
 fn verifyDraftsFor(decode_ids: ?usize, top_k: usize) usize {
@@ -7062,7 +7529,17 @@ pub fn dsparkRoundWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u
     defer pending.deinit();
     var am = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(am);
-    try mlx.check(mlx.mlx_argmax_axis(&am, pending.vl_g, -1, false, m.s));
+    // The serial sampler's greedy argmax runs over `where(mask, -inf, logits)` (`applySuppressMask`): an exact accept
+    // and its bonus token take the same masked argmax, so no masked id is ever committed.
+    var masked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(masked);
+    const vl = if (exactServes(m) and m.exact.argmax and m.suppress.ctx != null) blk: {
+        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+        defer _ = mlx.mlx_array_free(neg_inf);
+        try mlx.check(mlx.mlx_where(&masked, m.suppress, neg_inf, pending.vl_g, m.s));
+        break :blk masked;
+    } else pending.vl_g;
+    try mlx.check(mlx.mlx_argmax_axis(&am, vl, -1, false, m.s));
     var am32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(am32);
     try mlx.check(mlx.mlx_astype(&am32, am, .int32, m.s));
@@ -9340,6 +9817,15 @@ test "dsv41 image token: without image rows it is text, as in the reference's te
     }
 }
 
+test "dsv41 lead: a wide prompt chunk nothing read ahead sends its first rows ahead, and what is left still replays" {
+    try testing.expectEqual(@as(usize, 0), leadRows(LEAD_MIN - 1, false));
+    try testing.expectEqual(@as(usize, 2048), leadRows(LEAD_MIN, false));
+    try testing.expectEqual(@as(usize, 3840), leadRows(8064, false));
+    try testing.expectEqual(@as(usize, 0), leadRows(8064, true));
+    // The rest keeps a window to replay and the rows a replaying chunk skips.
+    try testing.expect(LEAD_MIN - leadRows(LEAD_MIN, false) >= 128 + CED_MIN_SKIP);
+}
+
 test "dsv41 CED split:the decoder starts at the last KV source when everything after it reads its ratio-1 rows" {
     var c: Config = .{ .model_type = "deepseek_v41", .num_hidden_layers = 40, .sliding_window = 128 };
     for (0..40) |l| c.dsv4_compress_ratios[l] = if (l < 2) 0 else if (l < 20) 2 else 1;
@@ -9434,7 +9920,7 @@ test "dsv41 CED: a wide chunk replays its last window through the decoder, the s
     // The full forward, and the chunk replayed as one piece; traced once each.
     var tr: [2]Trace = .{ .{ .gpa = gpa }, .{ .gpa = gpa } };
     defer for (&tr) |*x| x.deinit();
-    var plain: [2][]f32 = undefined;
+    var plain: [2][]f32 = .{ &.{}, &.{} };
     defer for (plain) |p| gpa.free(p);
     for (0..2) |ced| {
         _ = setenv("MLX_SERVE_DSV41_CED", if (ced == 1) "1" else "0", 1);

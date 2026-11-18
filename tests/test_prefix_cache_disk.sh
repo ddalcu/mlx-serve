@@ -40,7 +40,7 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 # Isolated HOME so the test never touches the user's real kv-cache.

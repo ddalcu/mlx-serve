@@ -27,6 +27,7 @@ pub const NormConvention = enum { delta, folded };
 /// `NgramHash`'s fixed arrays (`qwen4_exp.MAX_NGRAM_SIZE`, `MAX_HEADS`); pinned against them in `model_config.zig`.
 pub const max_ngram_size = 8;
 pub const max_heads = 32;
+pub const ngram_file_max = 96;
 
 /// The family's parsed config. Defaults are the engine's, so a key a pack omits reads as it always has.
 pub const Config = struct {
@@ -62,6 +63,9 @@ pub const Config = struct {
     num_experts_per_tok: u32 = 0,
     /// A Sushi pack: routed experts in EXL3 (`expert_quant`, read by `toModelConfig`).
     expert_quant: bool = false,
+    /// The pack names `trunk_quant`: its trunk linears are in a format only the outside quant plugin claiming the
+    /// pack reads (`outside.zig`).
+    trunk_quant: bool = false,
     moe_intermediate_size: u32 = 0,
     shared_expert_intermediate_size: u32 = 0,
 
@@ -150,6 +154,9 @@ pub const Config = struct {
 
     /// The pack's index names n-gram shards beside the weights (oMLX, ModelOpt) instead of `ngram_table.bin`.
     embedded_ngram: bool = false,
+    /// `ngram_table.file`: the n-gram table's file in the pack (an `exl3_ngram_trellis` table); none: `ngram_table.bin`.
+    ngram_file: [ngram_file_max]u8 = @splat(0),
+    ngram_file_len: u8 = 0,
     /// The M-RoPE spectrum `Parsed.mrope` points at (the YaRN table when the rope scales).
     mrope_inv_freq: [64]f64 = @splat(0),
 
@@ -169,6 +176,11 @@ pub const Config = struct {
     pub fn isFullLayer(self: *const Config, li: u32) bool {
         if (self.full_attention_interval == 0) return true;
         return (li + 1) % self.full_attention_interval == 0;
+    }
+
+    /// The n-gram table's file name in the pack.
+    pub fn ngramTableFile(self: *const Config) []const u8 {
+        return if (self.ngram_file_len == 0) "ngram_table.bin" else self.ngram_file[0..self.ngram_file_len];
     }
 
     pub fn attnLayers(self: *const Config) u32 {
@@ -204,6 +216,8 @@ pub const ParseError = error{
     InvalidQwen4NgramVocab,
     InvalidQwen4PleGeometry,
     InvalidQwen4Indexer,
+    InvalidTrunkQuant,
+    InvalidNgramTableFile,
     /// A shape this plugin does not serve yet (the legacy path keeps it).
     Unsupported,
     OutOfMemory,
@@ -296,6 +310,11 @@ pub fn parseJson(c: *Config, outer: std.json.ObjectMap) ParseError!void {
     try readU32If(cfg, "num_experts", &c.num_experts);
     try readU32If(cfg, "num_experts_per_tok", &c.num_experts_per_tok);
     c.expert_quant = field(root, "expert_quant") != null;
+    if (field(root, "trunk_quant")) |tq| {
+        if (tq != .object) return error.InvalidTrunkQuant;
+        c.trunk_quant = true;
+    }
+    if (field(root, "ngram_table")) |nt| try parseNgramTable(c, nt);
     try readU32If(cfg, "moe_intermediate_size", &c.moe_intermediate_size);
     try readU32If(cfg, "shared_expert_intermediate_size", &c.shared_expert_intermediate_size);
     try readU32(cfg, "linear_num_key_heads", &c.linear_num_key_heads);
@@ -401,6 +420,22 @@ pub fn parseJson(c: *Config, outer: std.json.ObjectMap) ParseError!void {
         if (c.linear_num_key_heads == 0 or c.linear_num_value_heads == 0 or c.linear_num_value_heads % c.linear_num_key_heads != 0)
             return error.InvalidConfigField;
     }
+}
+
+/// The pack's `ngram_table` block when it names `exl3_ngram_trellis` (`NgramTable`'s trellis arm): the file holding
+/// its rows. Any other block (an MLX pack's affine table: `ngram_table.bin`, read as before) is left as the base
+/// parse leaves it.
+fn parseNgramTable(c: *Config, v: std.json.Value) ParseError!void {
+    if (v != .object) return;
+    const fmt = field(v.object, "format") orelse return;
+    if (fmt != .string or !std.mem.eql(u8, fmt.string, "exl3_ngram_trellis")) return;
+    const file = field(v.object, "file") orelse return error.InvalidNgramTableFile;
+    if (file != .string) return error.InvalidNgramTableFile;
+    // A name in the pack's own folder: no separator, no parent.
+    const name = file.string;
+    if (name.len == 0 or name.len > ngram_file_max or std.mem.indexOfAny(u8, name, "/\\") != null or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidNgramTableFile;
+    @memcpy(c.ngram_file[0..name.len], name);
+    c.ngram_file_len = @intCast(name.len);
 }
 
 fn parseQuantization(c: *Config, outer: std.json.ObjectMap) ParseError!void {
@@ -836,4 +871,34 @@ test "qwen4_exp config: a bad bound is refused by name, another family's key is 
     const audio = "{\"model_type\":\"qwen4_exp\",\"audio_config\":{}}";
     try testing.expectEqual(abi.Verdict.Code.unsupported, parse(&dir, .of(audio), .{}, null, true, &p).code);
     try testing.expectEqual(abi.Verdict.Code.unsupported, parse(&dir, .of(tiny_text), .{}, &.{ .first = 0, .count = 2 }, true, &p).code);
+}
+
+test "qwen4_exp config: a K pack's trunk_quant and trellis n-gram table parse; an MLX pack's table parses as before; a path is refused by name" {
+    const k_pack = "{\"trunk_quant\":{\"format\":\"exl3\"},\"expert_quant\":{\"format\":\"exl3\",\"k\":5,\"codebook\":\"mul1\"}," ++
+        "\"ngram_table\":{\"file\":\"ngram_embedding.safetensors\",\"format\":\"exl3_ngram_trellis\",\"k\":6}," ++ tiny_text[1..];
+    const c = try parseOk(k_pack);
+    defer gpa.destroy(c);
+    try testing.expect(c.trunk_quant and c.expert_quant);
+    try testing.expectEqualStrings("ngram_embedding.safetensors", c.ngramTableFile());
+    const plain = try parseOk(tiny_text);
+    defer gpa.destroy(plain);
+    try testing.expect(!plain.trunk_quant);
+    try testing.expectEqualStrings("ngram_table.bin", plain.ngramTableFile());
+    // An MLX pack's affine table (the iQ-MLX packs: file, bits, group_size, no format) parses as the base parse did.
+    inline for (.{ "{\"ngram_table\":{\"file\":\"ngram_table.bin\",\"bits\":4,\"group_size\":32},", "{\"ngram_table\":{\"file\":\"t.bin\",\"format\":\"affine\"}," }) |mlx_table| {
+        const m = try parseOk(mlx_table ++ tiny_text[1..]);
+        defer gpa.destroy(m);
+        try testing.expectEqualStrings("ngram_table.bin", m.ngramTableFile());
+    }
+    const mem: fixture.MemDir = .{ .files = &.{} };
+    const dir = mem.packDir();
+    inline for (.{
+        .{ "{\"ngram_table\":{\"file\":\"../t.bin\",\"format\":\"exl3_ngram_trellis\"},", "InvalidNgramTableFile" },
+        .{ "{\"trunk_quant\":\"exl3\",", "InvalidTrunkQuant" },
+    }) |bad| {
+        const json = bad[0] ++ tiny_text[1..];
+        var p: abi.Parsed = .{};
+        const v = parse(&dir, .of(json), .{}, null, true, &p);
+        try testing.expect(v.code == .failed and std.mem.indexOf(u8, v.why.slice(), bad[1]) != null and p.private == null);
+    }
 }

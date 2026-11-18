@@ -7,6 +7,7 @@
 #
 # Env: QWEN4_MODEL (pack), MLX_SERVE_BIN (a control binary must sit in zig-out/bin/ for its rpath), QWEN4_AB_OUT
 # (~/claude-tmp/qwen4-ab), QWEN4_AB_PORT. Engine env (MLX_SERVE_DIAG=mtp-trace, ...) passes to the server.
+source "$(dirname "$0")/lib/server.sh"
 source "$(dirname "$0")/_lib_models.sh"
 
 setopt nonomatch
@@ -17,7 +18,7 @@ PACK=${QWEN4_MODEL:-$(find_model ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit || ech
 BIN=${MLX_SERVE_BIN:-./zig-out/bin/mlx-serve}
 PORT=${QWEN4_AB_PORT:-11414}
 LOG=$O/${mode}_$tag.log
-pkill -f "mlx-serve --model.*--port $PORT"
+srv_preclean "$PORT"
 for i in $(seq 1 60); do lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1 || break; sleep 2; done
 flags=(--max-concurrent 4 --prefix-cache-entries 0 --log-level info)
 [[ $mode == mtp ]] && flags+=(--mtp)
@@ -49,4 +50,4 @@ else
   done
   echo "batched engagements: $(grep -c 'gdn batched decode engaged' $LOG)"
 fi
-pkill -f "mlx-serve --model.*--port $PORT"
+srv_preclean "$PORT"

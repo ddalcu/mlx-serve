@@ -25,6 +25,7 @@ const parseMergePair = @import("load.zig").parseMergePair;
 const MetaspaceOpts = @import("load.zig").MetaspaceOpts;
 const byteTokenValue = @import("load.zig").byteTokenValue;
 const decoderHasByteFallback = @import("load.zig").decoderHasByteFallback;
+const normalizerHasNfc = @import("load.zig").normalizerHasNfc;
 const appendedSpecialId = @import("load.zig").appendedSpecialId;
 const metaspaceFromPreTokenizer = @import("load.zig").metaspaceFromPreTokenizer;
 
@@ -1154,6 +1155,29 @@ test "decoderHasByteFallback: Sequence containing ByteFallback, bare ByteFallbac
     const bl = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"ByteLevel\"}", .{});
     defer bl.deinit();
     try testing.expect(!decoderHasByteFallback(bl.value));
+}
+
+test "normalizer NFC: a decomposed e + U+0301 encodes as the precomposed token" {
+    const a = testing.allocator;
+    const body =
+        \\"model":{"type":"BPE","vocab":{"\u00e9":0,"e":1,"\u0301":2},"merges":[]}}
+    ;
+    for ([_]struct { normalizer: []const u8, want: []const u32 }{
+        .{ .normalizer = "{\"normalizer\":{\"type\":\"NFC\"},", .want = &.{0} },
+        .{ .normalizer = "{\"normalizer\":{\"type\":\"Sequence\",\"normalizers\":[{\"type\":\"NFC\"}]},", .want = &.{0} },
+        .{ .normalizer = "{\"normalizer\":null,", .want = &.{ 1, 2 } },
+    }) |c| {
+        const json = try std.mem.concat(a, u8, &.{ c.normalizer, body });
+        defer a.free(json);
+        var tok = try parseTokenizerContent(testing.io, a, json);
+        defer tok.deinit();
+        const ids = try tok.encode(a, "e\u{301}");
+        defer a.free(ids);
+        try testing.expectEqualSlices(u32, c.want, ids);
+    }
+    const nfkc = try std.json.parseFromSlice(std.json.Value, a, "{\"type\":\"NFKC\"}", .{});
+    defer nfkc.deinit();
+    try testing.expect(!normalizerHasNfc(nfkc.value));
 }
 
 test "appendedSpecialId: the special a TemplateProcessing appends after a single sequence" {

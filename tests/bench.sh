@@ -72,7 +72,7 @@ TARGETS=(
 # Only ever called on the path that STARTED a server: --url may be pointed at
 # a local mlx-serve someone else is using, and a bench must not kill it.
 stop_server() {
-    pkill -f "mlx-serve --serve .*--port $PORT" 2>/dev/null
+    srv_preclean "$PORT"
     for _ in $(seq 1 30); do
         lsof -ti tcp:"$PORT" >/dev/null 2>&1 || return 0
         sleep 1
@@ -108,6 +108,8 @@ spec_flags() { # logical model_path -> FLAGS
     local d
     if d=$(drafter_for "$1"); then FLAGS+=(--drafter "$d"); fi
     if [[ "${ANE:-0}" == "1" ]]; then FLAGS+=(--ane-prefill); fi
+    # Else a build's first pass on a model carries its one-time kernel compiles. Older binaries refuse the flag.
+    if [[ "$("$BINARY" --help 2>&1)" == *--warmup-full* ]]; then FLAGS+=(--warmup-full); fi
 }
 
 # ── Run ──

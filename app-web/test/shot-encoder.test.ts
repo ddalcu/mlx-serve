@@ -75,6 +75,28 @@ describe("openShotEncoder", () => {
     expect(result.blob.size).toBeGreaterThan(0);
   });
 
+  it("keeps every frame: an encoder in realtime mode may drop them all on a busy machine", async () => {
+    const seen = fakeWebCodecs();
+    const Base = globalThis.VideoEncoder as unknown as new (init: object) => { encode(f: object): void };
+    vi.stubGlobal(
+      "VideoEncoder",
+      class extends Base {
+        static isConfigSupported = async () => ({ supported: true });
+        #realtime = false;
+        configure(c: { latencyMode?: string }) {
+          this.#realtime = c.latencyMode === "realtime";
+        }
+        encode(f: object) {
+          if (!this.#realtime) super.encode(f);
+        }
+      },
+    );
+    const encoder = await openShotEncoder(clip(3));
+    await encoder.add(clip(3), 0);
+    await expect(encoder.finish()).resolves.toMatchObject({ container: "mp4" });
+    expect(seen.frames).toHaveLength(3);
+  });
+
   it("refuses a shot whose canvas differs", async () => {
     fakeWebCodecs();
     const encoder = await openShotEncoder(clip(3));

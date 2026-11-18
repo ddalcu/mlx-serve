@@ -4,9 +4,9 @@
 //! copied_from: engines/mlx/forward/layered.zig (`forwardMoeWith`, its bailing arms).
 
 const mlx = @import("../../mlx/ffi.zig");
-const slots_mod = @import("../glm5_next/slots.zig");
-const trunk = @import("../glm5_next/trunk.zig");
-const glm_moe = @import("../glm5_next/moe.zig");
+const slots_mod = @import("../../sdk/bases/kda_hybrid/slots.zig");
+const trunk = @import("../../sdk/bases/kda_hybrid/trunk.zig");
+const glm_moe = @import("../../sdk/bases/kda_hybrid/moe.zig");
 const mla = @import("mla.zig");
 
 const Array = mlx.mlx_array;
@@ -65,7 +65,7 @@ pub fn hidden(m: *trunk.Model, st: *const Step, token_ids: Array) !Array {
             ff_normed = try m.rmsNorm(h, lw.post_norm);
         }
         const mlp_out = switch (lw.mlp) {
-            .moe => |*mw| try glm_moe.forward(mw, m.s, ff_normed),
+            .moe => |*mw| if (m.serial_rows) try glm_moe.forwardRows(mw, m.s, ff_normed) else try glm_moe.forward(mw, m.s, ff_normed),
             .dense => |*dw| try m.denseMlp(dw, ff_normed),
         };
         defer _ = mlx.mlx_array_free(mlp_out);

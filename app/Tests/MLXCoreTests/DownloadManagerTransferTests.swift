@@ -184,6 +184,30 @@ final class DownloadManagerTransferTests: XCTestCase {
                        "the menu would come back saying Resume over bytes we claimed to delete")
     }
 
+    /// Resume on a row asks for what the row was started for: a GGUF repo is a shelf of quants, and the
+    /// whole-repo request finds no files in it ("pick a quantization from the model's menu").
+    func testRetryFetchesTheGgufQuantTheTransferWasStartedFor() async throws {
+        let quant = GgufQuant(filename: "m-Q4_K_M.gguf", label: "Q4_K_M")
+        let files = [(quant.filename, Self.pseudoRandom(bytes: 1 << 20)), ("m-Q8_0.gguf", Self.pseudoRandom(bytes: 1 << 20))]
+        HuggingFaceStubProtocol.serve(repo: repoId, files: files, throttle: true)
+        let manager = DownloadManager(modelsRoot: tempRoot)
+        let stopped = expectation(description: "first try settled")
+        manager.startGguf(repoId: repoId, quant: quant) { stopped.fulfill() }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        manager.cancel(repoId)
+        await fulfillment(of: [stopped], timeout: 30)
+
+        HuggingFaceStubProtocol.serve(repo: repoId, files: files)
+        let resumed = expectation(description: "retry settled")
+        manager.retry(repoId: repoId) { resumed.fulfill() }
+        await fulfillment(of: [resumed], timeout: 60)
+
+        XCTAssertEqual(manager.downloads[repoId]?.status, .completed, manager.downloads[repoId]?.error ?? "")
+        let dir = DownloadManager.newLayoutDir(rootDir: tempRoot, repoId: repoId)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: (dir as NSString).appendingPathComponent(quant.filename)))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: (dir as NSString).appendingPathComponent("m-Q8_0.gguf")))
+    }
+
     /// Same path, sharded quant: the shards live in a subfolder, so the cleanup
     /// removes the folder — right for committed shards, and it has to hold for a
     /// folder containing only the first shard's `.partial` too.

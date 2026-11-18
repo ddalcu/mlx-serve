@@ -56,7 +56,7 @@ invalidate after tool calls and pad-only generations.
 ### Sliding layers keep the full buffer; the view is what is trimmed
 Defect: (design) Gemma 4 E4B's 512-token window. Fix: the buffer keeps every row, as mlx-lm's `RotatingKVCache` does;
 `slidingViewFor` sizes the view the forward reaches (`window + q_len - 1`), at prefill too (it was once decode-only,
-see below).
+see below). A plugin that declares `CacheFacts.sliding_ring` keeps a ring instead (below).
 
 ### A short restore kept the long donor's KV capacity (#492)
 Defect: a "hi" chat matching only an 80k session's system prompt kept 80k of capacity (1.9 GB), and the byte budget
@@ -70,8 +70,10 @@ just evicted more than it needed (4204 MB freed, the re-check still read 4607 MB
 went through. Cause: with the buffer pool at its cap an evicted entry goes back to the OS, and macOS shows returned
 memory about a second late (a freed 4 GiB read unchanged at once, a third at 200 ms, all of it by 1.2 s) while a new
 allocation takes it at once. Fix: `system.ReturnLag` credits what MLX returned between two close readings until the OS
-figure shows it or MLX takes it again; `getAvailableMemBytes` adds it, so admission, the load preflight and `/props`
-read one figure. Guard: `ReturnLag` test, `getAvailableMemBytes counts memory MLX has just returned`.
+figure shows it or MLX takes it again. `getAvailableMemBytes` and the load figure (`getLoadAvailableMemBytes`, which
+admission and the load preflight read on macOS) both add it, and both feed it the free figure: fed one figure by one
+reader and the other by the next, each reading wipes the other's credit. Guard: `ReturnLag` tests, `the load figure
+carries what MLX just returned, and a free-figure reading between does not wipe it`.
 
 ### Conversations sharing a cache key evicted each other's latest state (#1125)
 Defect: four DeepSeek-V4.1 conversations with one system prompt (an agent and its subagents, no `prompt_cache_key`)
@@ -1160,8 +1162,12 @@ replay. Guard: `tests/test_mimo_v2.sh` [9].
 Defect: 87% of MiMo's 222 KB/token KV was sliding rows attention never reads; at the app's 1M context the bill left no
 hot cache and an 88k agent turn re-prefilled every turn (~38 s). Fix: `slidingRing` keeps window + slack rows per
 sliding layer (`KVCache.updateSliding`, absolute `offset` via `entry.base`), billed once per slot; a ring cannot
-rewind past dropped rows, so restores stay above `ringFloor` and rings never spill to SSD. Guard: `KVCache sliding
-ring`, the prefix-cache and DiskTier ring tests.
+rewind past dropped rows, so restores stay above `ringFloor`; on SSD a ring's layers go only into the chunks it holds
+whole (meta v11 `ring.from`) and a restore reads their newest `keep` rows.
+MiMo, laguna's family, gpt_oss and gemma4 declare it (`CacheFacts.sliding_ring`). It drops whole 32-row blocks: the
+hd-256 band kernel tiles a whole-buffer view from its first row, and a ring starting off a block boundary summed its
+keys in other groups than the full buffer. Guard: `KVCache sliding ring`, the prefix-cache and DiskTier ring tests,
+each plugin's `keep a ring` proof.
 
 ## GLM-5.3 and Flash Next kernels
 
@@ -1424,6 +1430,19 @@ failed load parks the entry in `.error_state`, which fails fast; only the memory
 Fix: refusals the user fixes outside the pack retry (`failureRetries`), and the absent worker is a named 503
 (`worker_not_joined`). Guard: `a load refused for memory or an absent worker Mac is retried by the next request`.
 
+### A GPU timeout during a reload left the model failed until a restart
+Defect: reloading the 70 GB Qwen3.8-Flash-Next pack while a busy app rewrote 32 GB failed with Metal's
+`kIOGPUCommandBufferCallbackErrorTimeout` on 12 of 28 reloads, and every request after it 500'd with
+`PluginLoadFailed` until the server restarted. Cause: the plugin reports any MLX failure as `PluginLoadFailed`, which
+parks the entry in `.error_state`; and the failed eval's other command buffers kept failing after the load returned,
+latching a second timeout onto the next load a second later. Fix: the load reads its own latched MLX error
+(`loadFailureCause`): a GPU timeout is `GpuTimeout` (503 `gpu_timeout`) and a GPU out-of-memory is
+`InsufficientMemory`, both retried; a failed load waits out the in-flight GPU work (`mlx.drainGpu`) before the latch
+is dropped. Under steady pressure the retry timed out again as often as not, so qwen4_exp evaluates its trunk a layer at
+a time instead of all ~70 GB at once: 0 of 23 of the same reloads timed out, and the eval took 6-24 s where one batch
+took up to 59 s. Guard: `a load the GPU timed out or ran out of memory on fails for that reason, not as a broken pack`;
+live, warm reloads beside a busy 32 GB app after the last model's memory is freed.
+
 ### A DeepSeek-V4.1 GGUF with its DSpark file beside it failed to load on ds4
 Defect: ivanfioravanti's DS4 IQ2 pack died at boot on the ds4 engine (`error: LoadFailed`) unless `--no-ds4-mtp`.
 Cause: the adapter hands ds4 any `-DSpark-`/`-MTP-` GGUF in the model's folder, and the pinned ds4 refuses every
@@ -1466,3 +1485,102 @@ preflight refuses the setting without it) and two SDK calls every MoE on the sha
 no error): `openPack` takes GPU streams only. Guard: `residentModelDiskBytes: with stream_experts ...`, the
 conformance suite's streamed check, `mlx pack: a pack opened on a CPU stream is refused by name`.
 
+
+### A request cancelled while its prefill was held crashed the server
+Defect: with several agents on DeepSeek-V4.1, a client that disconnected while its request waited for memory took the
+whole server down (SIGSEGV in `logSpecStats`, #1163). Cause: `complete` looked for the slot in `pending` and
+`decoding`, found it in neither because a pass held it, and waited for the pass. The pass then put the held slot back
+in `pending` and let go; `complete` queued the slot for cleanup without looking again, so `pending` named freed
+memory and the next pass ran it. Fix: `complete` unlists again after every wait (`unlistLocked`); a pass takes a slot
+from a list only under `queue_mu`, so unlisted with `in_pass` at 0 means nothing holds it. Guard: `complete: a slot
+its pass puts back in pending while complete waits is unlisted before cleanup owns it`.
+
+
+### DeepSeek-V4.1 prefilled again what it had just written, and a changed tail cost the whole context
+Defect: every agent turn prefilled the previous turn's answer again, a second conversation under the same system
+prompt started cold, and a long conversation whose last message changed prefilled all of it.
+Cause: a module snapshot restored only at its exact length, and the only one a request left was at its prompt's
+boundary. Fix: the plugin cuts a snapshot to a shorter prefix and rebuilds its windows by replaying the last one (the
+tech report's SWA bounded replay, `deepseek_v41.rewind`); the cache restores an entry at what the prompt shares with
+it (`restoreModuleCut`) and also commits where decode stopped (`commitModuleDecodeEnd`), an entry that only fills
+spare budget. A cut restore differs from a cold prompt as much as another prefill chunk width does. Guards:
+`deepseek_v41 aux: a snapshot sliced short of its end restores there by replaying its window`, `HotPrefixCache
+module: an entry that outruns the prompt or leaves it is restored at what the plugin cuts it to`, `tests/test_dsv41.sh`
+[7c].
+
+### One slow DSpark round sent a request back to plain decode for hundreds of tokens
+Defect: the first DSpark request of a freshly installed build wrote code far slower than the next one.
+Cause: the drafting backoff averaged the round's wall time as measured, and a round that waited on a kernel
+compile read as "drafting loses" for a run of probes, each doubling the plain stretch. Fix: `Drafting.record`
+counts a round for at most twice the rounds before it, as `PlainCost` already did. Guard: `Drafting: a stalled round
+is not what a round costs`.
+
+### A cold DeepSeek-V4.1 prompt held the GPU at the first Engram layer
+Defect: the first chunk of a prompt whose text was new spent part of its time with the GPU idle. Cause: its
+Engram rows come off the SSD at the drive's pace, a read-ahead hides the next chunk's behind the current one, and the
+first chunk has nothing to hide behind: layer 1 waited until every row of the chunk was read. Fix: a chunk of 4096
+rows or more that nothing read ahead runs as its first half and then the rest (`extendCold`): the rest's rows are read
+while the lead computes, and the lead skips the decoder replay the rest makes at its own end. The answer is the bits
+a narrower prefill chunk gives. Guards: `deepseek_v41 CED: a lead chunk that skips the decoder leaves what the chunk
+after it reads`, `dsv41 lead: ...`; the debug log's `the chunk waited N ms on its Engram rows`.
+
+### DeepSeek-V4.1's full pack waited on the SSD in every prompt chunk
+Defect: with the full pack resident and little memory to spare, every prefill chunk stood at an Engram layer
+waiting on the drive. Cause: a row is two reads, its codes out of a table far larger than free memory and its
+scales out of a small one; both went through the page cache, which had little room left, so each chunk's code
+pages pushed the scale pages out and both reads hit the drive.
+Fix: a resident pack's table opens a second descriptor for the codes and reads them past the page cache while under an
+eighth of RAM is free (`Table.openCodes`, `engram.cacheTight`); the scales stay cached. With memory to spare the
+cache still serves the codes, which is faster there. Guards: `dsv41 engram: codes read past the page cache are the
+rows read through it`; the debug log's `waited N ms on its Engram rows, codes past the page cache`.
+
+### The first prompts of a new build timed its shader compiles
+Defect: the first benchmark pass of a build read like a regression (a cache-hit turn several times slower, a long
+prompt and a first chat at a fraction of their rates), and the second pass did not. Cause: a Metal kernel compiles
+at its first evaluation, and each wrapper builds one variant per row count, prompt size class, cache state and
+speculative mode. The load's warmup ran three bare forwards and reached a fraction of them; the rest compiled
+inside whichever request selected them first. Metal keeps what it compiled per bundle
+id, so only a build's first run on a machine paid, and paid again after every rebuild. Fix: the first time a build
+loads a model it serves requests of its own through the scheduler (`warm_requests.zig`), on a RAM twin of the prefix
+cache and outside every metric. Serving them all before ready made that load several times longer, so by default
+the model is ready first and serves a short plan when the server is idle (a forward at every verify width, a short
+chat, a long prompt, that prompt with other endings), each request admitted alone so a real one never decodes
+beside it, the model never held so it stays evictable (an unload drops the warm-up first); `--warmup-full` serves
+that and a ladder of prompt sizes before ready, which a benchmark needs. A marker per plan beside Metal's cache,
+keyed on the build, the OS build and the pack, makes every later load owe nothing. macOS only. Guards:
+`tests/test_first_request_compiles.sh` (a copy of the binary under another bundle id starts with an empty cache),
+`owed`, `nextStep`, `forget`, `an idle warm-up waits beside a real request without holding its model`.
+
+### A streamed bank's open read the box before macOS counted the trunk
+Defect: on about one load in six of a glm5_next streaming pack (GLM-5.3, Ling-3.1), the bank's open read the box's
+non-file memory below the server's own footprint, the bank took the trunk's size of extra room, and the box went past
+its GPU ceiling and paged. Cause: the trunk is evaluated and synchronized before the read and the task footprint shows
+its buffers at once, but `host_statistics64`'s page counts show new wired buffers a second or two late (the
+allocation side of `ReturnLag`); `in_use - footprint` saturated to 0, and a bills-only fit took its room less a low
+`in_use`. Fix: the load reads the box before the trunk (`Fit.load_start`); the open's in use is at least what was
+outside the server then plus the footprint now (`outside_model.settled`); a reading still below the footprint is
+refused by name (`BankReadingBelowFootprint`) and the bills stand on `total - available`. The bank-fit fitter voids a
+line whose in use is below its footprint. Guard: `outside model: an open reading below the server's footprint settles
+from the load's start, else is refused, never the whole room`.
+
+### A model Metal stopped taking work from answered 500 forever while /health said 200
+Defect: a pack read over SMB faulted pages inside a command buffer during warm-up; Metal's watchdog cancelled it and
+then ignored every later submission from the process ("Ignored (for causing prior/excessive GPU errors)"). Each
+request answered a bare 500 and `/health` stayed 200, so nothing restarted the server. Cause: the latch's sticky-error
+list knew CUDA's faults only. Fix: `SubmissionsIgnored` marks the GPU context lost like a CUDA fault (named 503,
+`/health` 503 `gpu context lost`). Guard: `a sticky CUDA error marks the GPU context lost; any other error does not`.
+
+### A streamed bank's second request ran outside the room the bank was sized against
+Defect: on a glm5_next streaming pack (GLM-5.3, Ling-3.1) a request could end past the GPU ceiling the bank was sized
+for: beside a hot-cache entry from an earlier turn, beside a second live request, or near the context limit on a
+bills-only bank. Cause: the bank leaves the hot cache 2 GiB (`GLM5_HOT_CACHE_BYTES` in the decode bill; the fitter,
+`g53_fit_bank.py`, adds the same 2 GiB to each fitted base), and admission bills a streamed pack at 0, so nothing evicts
+or holds on live memory. Yet the hot cache asked for one whole session at the working context (over 11 GiB for Ling at
+32K), an oversized commit's `trimmedCopy` was made before the entry it replaces was evicted, a second request
+interleaved in its own slot, and the bills-only fit ignored the bills' growth past the cell. Fix: a streamed bank's
+hot-cache budget is held to the term (`streamedHotCacheCapped`; a module-path plugin keeps its own accounting), its
+oversized commit evicts before it copies (`evict_before_copy`), a streamed bank is single-flight
+(`modelExclusiveDecode`), and every fit gives up the growth (`billsBudget`). Guards: `ungatedHotCacheAsk: a streamed
+bank's GLM or Ling asks no more than the hot-cache term its decode room holds`, `HotPrefixCache: a capped streamed
+bank's oversized commit evicts before it copies`, `outside model: a fitted base carries the hot cache's resident entry`,
+`a streamed bank's slot is exclusive on GLM and Ling`, `outside model: a bills-only fit gives each phase's bills' growth`.

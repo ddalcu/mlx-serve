@@ -20,8 +20,10 @@ pub fn unsupportedReason(f: *const gguf.File, buf: []u8) ?[]const u8 {
     var it = f.tensors.iterator();
     while (it.next()) |e| {
         const mapped = arch.mapTensor(&name_buf, e.key_ptr.*) orelse return std.fmt.bufPrint(buf, "tensor {s}", .{e.key_ptr.*}) catch "tensor";
-        // A tensor the arch skips is never loaded, whatever its type (DeepSeek-V4.1's I32/I64 hash tables).
-        if (mapped.name.len > 0 and !arch.serves(mapped.name, e.value_ptr.ty)) return std.fmt.bufPrint(buf, "tensor type of {s}", .{e.key_ptr.*}) catch "tensor type";
+        // A tensor the arch skips is never loaded, whatever its type (DeepSeek-V4.1's I32/I64 hash tables), unless
+        // the model reads it in place.
+        const served = if (mapped.name.len > 0) arch.serves(mapped.name, e.value_ptr.ty) else arch.readsInPlace(e.key_ptr.*, e.value_ptr.ty);
+        if (!served) return std.fmt.bufPrint(buf, "tensor type of {s}", .{e.key_ptr.*}) catch "tensor type";
     }
     return null;
 }
@@ -320,7 +322,7 @@ test "DeepSeek-V4.1's image placeholder stays one token when the DS4 converter t
 
 test "derived merges follow HF's order: score, then longer pieces, user-defined tokens as score 0" {
     // vocab: a b ab abb bb "  " (user-defined, spaces) with scores
-    const w = TestArrays{ .tokens = &.{ "a", "b", "\xe2\x96\x81", "ab", "abb", "bb", "  " }, .types = &.{ 1, 1, 1, 1, 1, 1, TOKEN_USER_DEFINED }, .scores = &.{ -1, -1, -1, -3, -2, -3, -1000 } };
+    var w = TestArrays{ .tokens = &.{ "a", "b", "\xe2\x96\x81", "ab", "abb", "bb", "  " }, .types = &.{ 1, 1, 1, 1, 1, 1, TOKEN_USER_DEFINED }, .scores = &.{ -1, -1, -1, -3, -2, -3, -1000 } };
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(std.testing.allocator);
     try appendDerivedMerges(std.testing.allocator, &out, w.tokens_arr(), w.types_arr(), w.scores_arr());
@@ -337,8 +339,8 @@ const TestArrays = struct {
     buf_y: [64]u8 = undefined,
     buf_s: [64]u8 = undefined,
 
-    fn tokens_arr(self: *const TestArrays) gguf.Array {
-        const buf = @constCast(&self.buf_t);
+    fn tokens_arr(self: *TestArrays) gguf.Array {
+        const buf = &self.buf_t;
         var n: usize = 0;
         for (self.tokens) |t| {
             std.mem.writeInt(u64, buf[n..][0..8], t.len, .little);
@@ -347,13 +349,13 @@ const TestArrays = struct {
         }
         return .{ .elem_type = .string, .len = self.tokens.len, .bytes = buf[0..n] };
     }
-    fn types_arr(self: *const TestArrays) gguf.Array {
-        const buf = @constCast(&self.buf_y);
+    fn types_arr(self: *TestArrays) gguf.Array {
+        const buf = &self.buf_y;
         for (self.types, 0..) |t, i| std.mem.writeInt(i32, buf[4 * i ..][0..4], @intCast(t), .little);
         return .{ .elem_type = .i32, .len = self.types.len, .bytes = buf[0 .. 4 * self.types.len] };
     }
-    fn scores_arr(self: *const TestArrays) gguf.Array {
-        const buf = @constCast(&self.buf_s);
+    fn scores_arr(self: *TestArrays) gguf.Array {
+        const buf = &self.buf_s;
         for (self.scores, 0..) |v, i| std.mem.writeInt(u32, buf[4 * i ..][0..4], @bitCast(v), .little);
         return .{ .elem_type = .f32, .len = self.scores.len, .bytes = buf[0 .. 4 * self.scores.len] };
     }
@@ -406,6 +408,30 @@ test "unsupportedReason serves DeepSeek-V4.1's DS4 layout: IQ2_XXS / Q2_K expert
     // A raw Q2_K bank outside the routed experts has no kernel in the forward.
     try f.tensors.put(a, "blk.0.ffn_down_shexp.weight", .{ .dims = .{ 2304, 5120, 1, 1 }, .n_dims = 2, .ty = .q2_k, .data = &.{} });
     try std.testing.expectEqualStrings("tensor type of blk.0.ffn_down_shexp.weight", unsupportedReason(&f, &buf).?);
+}
+
+test "unsupportedReason: a DeepSeek-V4.1 set's Q6_K head and Engram projection are served; its in-set Engram table only as IQ4_NL" {
+    const ds41 = @import("arch.zig").deepseek41;
+    var f = try ds41.testFileDs4(ds41.release_config);
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.kv.put(a, "general.architecture", .{ .string = ds41.arch_name });
+    try f.kv.put(a, "tokenizer.ggml.model", .{ .string = "gpt2" });
+    try f.kv.put(a, "tokenizer.ggml.pre", .{ .string = "joyai-llm" });
+    const Ty = @import("quants.zig").GgmlType;
+    const tensors = [_]struct { []const u8, [3]u64, Ty }{
+        .{ "token_embd.weight", .{ 5120, 129280, 1 }, .q8_0 },
+        .{ "output.weight", .{ 5120, 129280, 1 }, .q6_k },
+        .{ "blk.1.engram_kv.weight", .{ 6144, 25600, 1 }, .q6_k },
+        .{ "blk.0.ffn_down_exps.weight", .{ 2304, 5120, 384 }, .q6_k },
+    };
+    for (tensors) |t| try f.tensors.put(a, t[0], .{ .dims = .{ t[1][0], t[1][1], t[1][2], 1 }, .n_dims = if (t[1][2] > 1) 3 else 2, .ty = t[2], .data = &.{} });
+    var buf: [200]u8 = undefined;
+    for ([_]Ty{ .iq4_nl, .q5_k, .q6_k }) |table| {
+        try f.tensors.put(a, ds41.ple_table, .{ .dims = .{ 256, 768022850, 1, 1 }, .n_dims = 2, .ty = table, .data = &.{} });
+        const why = unsupportedReason(&f, &buf);
+        if (table == .iq4_nl) try std.testing.expectEqual(@as(?[]const u8, null), why) else try std.testing.expectEqualStrings("tensor type of " ++ ds41.ple_table, why.?);
+    }
 }
 
 test "real model: synthesized JSON parses and matches the GGUF (a real GGUF, env-gated)" {

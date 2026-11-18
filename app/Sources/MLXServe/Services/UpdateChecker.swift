@@ -35,6 +35,7 @@ final class UpdateChecker: ObservableObject {
     nonisolated static let bundledLlamaTag = "b10034"
     nonisolated static let autoCheckInterval: TimeInterval = 24 * 3600
     nonisolated static let lastCheckKey = "lastUpdateCheckAt"
+    nonisolated static let lastReleaseKey = "lastUpdateRelease"
     nonisolated static let autoCheckEnabledKey = "autoCheckUpdates"
 
     enum Phase: Equatable {
@@ -56,6 +57,13 @@ final class UpdateChecker: ObservableObject {
     var willRelaunch: (() -> Void)?
 
     private var timer: Timer?
+
+    /// The daily throttle outlives a relaunch, so what the last check found must too.
+    init() {
+        guard BuildFeatures.current.selfUpdate,
+              let saved = UserDefaults.standard.data(forKey: Self.lastReleaseKey) else { return }
+        available = Self.findUpdate(inReleaseJSON: saved, currentVersion: currentVersion)
+    }
 
     /// Default ON; `UserDefaults.bool` alone can't express that, so absence
     /// of the key means enabled.
@@ -231,7 +239,6 @@ final class UpdateChecker: ObservableObject {
         default: break
         }
         phase = .checking
-        UserDefaults.standard.set(Date(), forKey: Self.lastCheckKey)
         do {
             var request = URLRequest(url: Self.latestReleaseURL)
             request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
@@ -239,6 +246,9 @@ final class UpdateChecker: ObservableObject {
             if let http = response as? HTTPURLResponse, http.statusCode != 200 {
                 throw UpdateError.badStatus(http.statusCode)
             }
+            // Only an answer closes the daily throttle: offline at login must retry at the next tick.
+            UserDefaults.standard.set(Date(), forKey: Self.lastCheckKey)
+            UserDefaults.standard.set(data, forKey: Self.lastReleaseKey)
             let update = Self.findUpdate(inReleaseJSON: data, currentVersion: currentVersion)
             available = update
             phase = (update == nil && userInitiated) ? .upToDate : .idle

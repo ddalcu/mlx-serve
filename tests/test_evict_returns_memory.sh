@@ -32,7 +32,7 @@ BUDGET_GB=$(sysctl -n hw.memsize | awk '{printf "%d", $1/1073741824*3/4}')
     echo -e "${YELLOW}SKIP${NC}: victim ${V_GB}G + next ${N_GB}G exceed the ${BUDGET_GB}G budget"; exit 0; }
 
 BINARY="${MLX_SERVE_BINARY:-./zig-out/bin/mlx-serve}"
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 LOG=$(mktemp)
 SAMPLER=$(mktemp)

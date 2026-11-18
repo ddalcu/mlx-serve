@@ -85,6 +85,13 @@ pub const Scheduler = struct {
     /// `LoadParams.ctx_size` — the --ctx-size launch flag, kept for sizing
     /// GGUF stub configs on cold loads (see preloadGgufCpuState).
     gguf_ctx_size: u32,
+    /// `--no-warmup-eager` and `--warmup-full`, retained for cold loads.
+    warmup_eager: bool,
+    warmup_full: bool,
+    /// Warm-ups ready models still owe, first in first served (`warm_requests.tick`). Inference thread only.
+    warm_queue: std.ArrayList(*handles.WarmUp) = .empty,
+    /// 1 while a warm request is in `in_flight`: it is nobody's company. Guarded by `queue_mu`.
+    warm_in_flight: u32 = 0,
     /// Launch-flag prefix-cache settings, retained so COLD-LOADED models
     /// (`ensureLoaded` → /v1/load-model, model switches) get the same
     /// prefix-cache behavior as the `--model` primary. Pre-plumbing these
@@ -154,6 +161,14 @@ pub const Scheduler = struct {
     /// Every ready model's hot-cache entries for `/metrics.json`, under `digest_mu`.
     cached_sessions: [metrics_mod.MAX_SESSIONS]metrics_mod.Session = undefined,
     cached_session_count: usize = 0,
+
+    /// Hot-cache probes, published with the residency: bytes its two SSD holders keep (in no other figure), bytes
+    /// slots hold by checkout (billed above AND as live KV), and what every eviction since load was billed against
+    /// what the allocator returned for it.
+    hot_cache_parked_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    hot_cache_checked_out_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    hot_cache_evicted_billed_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    hot_cache_evicted_live_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// The part of the above an eviction can prove it will return (residency minus the largest entry).
     reclaimable_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),

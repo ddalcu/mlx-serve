@@ -55,7 +55,7 @@ pub fn serves(s: mlx.mlx_stream, hk: c_int, hv: c_int, dk: c_int, dv: c_int, act
 
 /// One tiny launch: Metal caps a kernel's threadgroup by its register use, and MLX only
 /// reports that at evaluation.
-fn probe(s: mlx.mlx_stream, h: c_int, act: mlx.mlx_dtype, plan: Plan) !bool {
+pub fn probe(s: mlx.mlx_stream, h: c_int, act: mlx.mlx_dtype, plan: Plan) !bool {
     var arrs: [6]mlx.mlx_array = undefined;
     const shapes = [_][]const c_int{ &.{ 1, 1, h, 128 }, &.{ 1, 1, h }, &.{h}, &.{ h, 128 }, &.{ 1, h, 128, 128 }, &.{1} };
     const dts = [_]mlx.mlx_dtype{ act, act, .float32, .float32, .float32, .float32 };
@@ -119,6 +119,17 @@ fn launch(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_arra
 pub fn recur(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, a: mlx.mlx_array, beta: mlx.mlx_array, a_log: mlx.mlx_array, dt_bias: mlx.mlx_array, lower_bound: f32, state: mlx.mlx_array) !Out {
     const h = mlx.getShape(q)[2];
     const plan = planFor(h, 128, @intCast(status.gpuCoreCount())).?;
+    const out = try recurAt(s, q, k, v, a, beta, a_log, dt_bias, lower_bound, state, plan);
+    if (!engaged) {
+        engaged = true;
+        @import("../../util/log.zig").info("[kda] per-core prefill recurrence engaged ({d} threadgroups x {d} rows)\n", .{ plan.ntg, plan.rows });
+    }
+    return out;
+}
+
+/// `recur` at a caller's plan, which the caller probes (`probe`) before it calls: its row ranges, not a row's
+/// arithmetic, follow the plan.
+pub fn recurAt(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, a: mlx.mlx_array, beta: mlx.mlx_array, a_log: mlx.mlx_array, dt_bias: mlx.mlx_array, lower_bound: f32, state: mlx.mlx_array, plan: Plan) !Out {
     const dt = mlx.mlx_array_dtype(q);
     var a_c = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(a_c);
@@ -135,12 +146,7 @@ pub fn recur(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_a
     const lbv = [1]f32{lower_bound};
     const lb = mlx.mlx_array_new_data(&lbv, &[_]c_int{1}, 1, .float32);
     defer _ = mlx.mlx_array_free(lb);
-    const out = try launch(s, q, k, v, a_c, beta_c, alog, dtb, lb, state, plan);
-    if (!engaged) {
-        engaged = true;
-        @import("../../util/log.zig").info("[kda] per-core prefill recurrence engaged ({d} threadgroups x {d} rows)\n", .{ plan.ntg, plan.rows });
-    }
-    return out;
+    return launch(s, q, k, v, a_c, beta_c, alog, dtb, lb, state, plan);
 }
 
 // ── decode ─────────────────────────────────────────────────────────────
@@ -249,7 +255,7 @@ fn decodeRows(s: mlx.mlx_stream, proj: mlx.mlx_array, off_ga: c_int, off_fa: c_i
         defer _ = mlx.mlx_vector_string_free(ov);
         const body = kernelSource("kernels/kda/kda_decode.metal");
         const source = if (gate5) "#define GATE5 1\n" ++ body else "#define GATE5 0\n" ++ body;
-        const k = mlx.mlx_fast_metal_kernel_new(if (gate5) "msv_kda_decode_q5" else "msv_kda_decode", iv, ov, source, kernelSource("plugins/glm5_next/kernels/qmv_header.metal"), true, false);
+        const k = mlx.mlx_fast_metal_kernel_new(if (gate5) "msv_kda_decode_q5" else "msv_kda_decode", iv, ov, source, kernelSource("kernels/kda/qmv_header.metal"), true, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         decode_kernels[slot] = k;
         break :blk k;

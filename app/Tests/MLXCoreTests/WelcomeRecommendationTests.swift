@@ -8,8 +8,13 @@ import XCTest
 final class WelcomeRecommendationTests: XCTestCase {
     private let gib: UInt64 = 1_073_741_824
 
+    /// A Mac of `gb` GB that gives models `usable` GB, by default 3/4 of RAM.
+    private func mem(_ gb: Double, usable: Double? = nil) -> SystemMemoryInfo {
+        SystemMemoryInfo(totalBytes: UInt64(gb * Double(gib)), usableBytes: UInt64((usable ?? gb * 3 / 4) * Double(gib)))
+    }
+
     func testRecommendsGemma12BForA24GBMac() {
-        let r = WelcomeRecommendation.forPhysicalMemory(bytes: 24 * gib)
+        let r = WelcomeRecommendation.forMemory(mem(24))
         XCTAssertEqual(r.memoryText, "24 GB")
         XCTAssertEqual(r.pick.id, "gemma-4-12b", "24 GB is the 16–32 GB tier → Gemma 4 12B")
         XCTAssertTrue(r.rationale.contains("24 GB"), "the rationale names the machine's RAM")
@@ -27,20 +32,20 @@ final class WelcomeRecommendationTests: XCTestCase {
     func testTiersMatchTheAppWideStarterPick() {
         // The welcome recommendation must equal `starterPick` at every tier —
         // a second copy of this decision is how surfaces start disagreeing.
-        for bytes: UInt64 in [6, 8, 12, 16, 24, 32, 64, 128].map({ $0 * gib }) {
+        for gb: Double in [6, 8, 12, 16, 24, 32, 64, 128] {
             XCTAssertEqual(
-                WelcomeRecommendation.forPhysicalMemory(bytes: bytes).pick,
-                RecommendedModelPick.starterPick(physicalMemoryBytes: bytes),
-                "welcome pick must delegate to starterPick for \(bytes / gib) GB"
+                WelcomeRecommendation.forMemory(mem(gb)).pick,
+                RecommendedModelPick.starterPick(memory: mem(gb)),
+                "welcome pick must delegate to starterPick for \(gb) GB"
             )
         }
     }
 
     func testBoundaryTiersFollowStarterPick() {
-        XCTAssertEqual(WelcomeRecommendation.forPhysicalMemory(bytes: 8 * gib).pick.id, "gemma-4-e4b")
-        XCTAssertEqual(WelcomeRecommendation.forPhysicalMemory(bytes: 16 * gib).pick.id, "gemma-4-e4b")
-        XCTAssertEqual(WelcomeRecommendation.forPhysicalMemory(bytes: 96 * gib).pick.id, "qwen38-flash-next")
-        XCTAssertEqual(WelcomeRecommendation.forPhysicalMemory(bytes: 32 * gib).pick.id, "qwen38-27b")
-        XCTAssertEqual(WelcomeRecommendation.forPhysicalMemory(bytes: 64 * gib).pick.id, "qwen38-27b-8bit")
+        XCTAssertEqual(WelcomeRecommendation.forMemory(mem(8)).pick.id, "gemma-4-e4b")
+        XCTAssertEqual(WelcomeRecommendation.forMemory(mem(16)).pick.id, "gemma-4-e4b")
+        XCTAssertEqual(WelcomeRecommendation.forMemory(mem(96, usable: 96 * 0.84)).pick.id, "qwen38-flash-next")
+        XCTAssertEqual(WelcomeRecommendation.forMemory(mem(32)).pick.id, "qwen38-27b")
+        XCTAssertEqual(WelcomeRecommendation.forMemory(mem(64)).pick.id, "qwen38-27b-8bit")
     }
 }

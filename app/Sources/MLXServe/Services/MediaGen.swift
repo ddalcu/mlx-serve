@@ -1382,6 +1382,8 @@ struct AudioModelPreset: Identifiable, Hashable {
     /// Built-in voice ids, empty when the backend has none. A comma-separated
     /// selection BLENDS them server-side.
     var builtInVoices: [String] = []
+    /// A Ming-3.0-tts pack: picks the download bundle, whose files differ from Qwen3-TTS.
+    var isMing: Bool = false
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -1434,6 +1436,31 @@ struct AudioModelPreset: Identifiable, Hashable {
         description: "The highest-fidelity voice model here, at full precision — best for expressive, long-form narration when you have the RAM to spare."
     )
 
+    /// Ming-3.0-tts 0.5B 8-bit — 44.1 kHz speech with cloning. The default Ming
+    /// download: affine 8-bit weights, dense norms and CAM++.
+    static let mingTTS8bit = AudioModelPreset(
+        id: "mlx-audio/ming-3.0-tts-0.5b-8bit",
+        name: "Ming-3.0-tts 0.5B 8-bit (44.1 kHz, ~1.6 GB)",
+        repo: "mlx-community/Ming-3.0-tts-0.5B-8bit",
+        approxDownloadGB: 1.6,
+        approxRAMGB: 4,
+        recommendedRefSeconds: 10,
+        description: "Clear 44.1 kHz speech in English, Chinese, French and more, faster than real time, with voice cloning from a clip of up to 20 seconds.",
+        isMing: true
+    )
+
+    /// Ming-3.0-tts 0.5B bf16 — the quality reference, on the fused kernels.
+    static let mingTTS = AudioModelPreset(
+        id: "mlx-audio/ming-3.0-tts-0.5b",
+        name: "Ming-3.0-tts 0.5B bf16 (full precision, ~2.9 GB)",
+        repo: "mlx-community/Ming-3.0-tts-0.5B-bf16",
+        approxDownloadGB: 2.9,
+        approxRAMGB: 6,
+        recommendedRefSeconds: 10,
+        description: "The same Ming voice model at full precision — the fastest Ming build on a Mac GPU, at more memory than the 8-bit build.",
+        isMing: true
+    )
+
     /// Kokoro-82M — the fast path. Non-autoregressive, so it is ~17x realtime
     /// against Qwen3-TTS's ~1.3x, at a fifth of the download and a tenth of the
     /// RAM. No cloning; instead 54 built-in voices that BLEND by naming several
@@ -1479,7 +1506,7 @@ struct AudioModelPreset: Identifiable, Hashable {
     /// AudioGenService's `ref_audio` both assume it, and Kokoro answers
     /// `ref_audio` with a named 400. Keeping Kokoro out makes that impossible
     /// BY CONSTRUCTION rather than by list ordering.
-    static let all: [AudioModelPreset] = [.qwen3TTS06B8bit, .qwen3TTS06B, .qwen3TTS17B8bit, .qwen3TTS17B]
+    static let all: [AudioModelPreset] = [.qwen3TTS06B8bit, .qwen3TTS06B, .mingTTS8bit, .qwen3TTS17B8bit, .mingTTS, .qwen3TTS17B]
 
     /// Every audio preset including voice-mode-only backends — for the model
     /// browser and the catalogue guards, never for a media pane's picker.

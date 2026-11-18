@@ -831,6 +831,18 @@ Defect: Qwen3.8-27B on a 48 GB laptop 400'd every turn after a while. Cause: pur
 drops first) read as taken. Fix: purgeable joins the grantable sum in `computeAvailableBytes` and the app's twin.
 Guard: `computeAvailableBytes sums the reclaimable classes…`, `testPurgeablePagesCountAsGrantable`.
 
+### A 70 GB pack was refused on a 128 GB Mac with ~98 GB to give
+Defect: with browsers and editors open, every cold load of Qwen3.8-Flash-Next 503'd (needs 77.1, "available" 73.2);
+loaded past the preflight, ~28 GB stayed free. Cause: the load read only free, file-backed and purgeable pages as
+available, but macOS compresses or swaps ANY app's pages to make room for a wiring: 21 of 21 live loads with 12 to
+36 GB of app memory held succeeded at a base figure as low as 31.9 GB. Crediting half the idle pages was tried first
+and still refused loads that fit. Fix: the load preflight takes the RAM outside wired + compressor, less the OS
+reserve (`computeLoadAvailableBytes`). The eviction planner and the GPU ceiling read the same room (`getLoadRoomBytes`),
+so a small load no longer unloads an idle model it fits beside, nor is its request then refused; another resident
+model is wired, so a load beside it is still refused. The hot cache stays while the server idles, so its clamp keeps
+the old figure (`idleCacheGpuMemoryCeiling`) and never sizes itself into memory other apps hold.
+Guard: `load preflight: a load macOS can make room for is admitted…`, `the hot cache is sized against memory nobody holds…`.
+
 ### A client that hung up during a cold prefill left the GPU prefilling for a ghost
 Defect: Claude Code retrying a 40K-token prompt queued abandoned prefills while no client was connected. Cause: the
 handler checked the peer only after a token arrived. Fix: keepalives flow while waiting for the first token, each
@@ -850,3 +862,19 @@ cold. Guard: `tests/test_llama_persistent_session.sh`.
 Defect: plugin-served packs with dense attention projections reported the requant off while it ran. Cause: only the
 legacy load set the shell's `dense_attn_proj`. Fix: one predicate (`load/init.denseAttnProj`) feeds both loads.
 Guard: `laguna plugin: a served pack reports its dense attention projections to /props`.
+
+### Model Settings never applied to a model in a symlinked folder (#1184)
+Defect: a locked temperature, a `ctx_size` and a `kv_quant` saved in Model Settings were ignored. Cause: the app keys
+`model-settings.json` by the folder's real path, discovery registers the symlink, and every settings lookup compared
+the two spellings byte for byte. Fix: request-path lookups take the entry's `real_path`, stored at registration, and a
+load resolves the path in `lookupPack`, the one load-time lookup. Guard: `tests/test_model_settings_symlink.sh`,
+`model_settings: a folder reached through a symlink answers to its real path's key…`.
+
+### One folder loaded twice when two `--model-dir` roots reached it (#1232)
+Defect: a model started by path listed as both `repo` and `org/repo`; a request naming the other id loaded a second
+resident copy, and on a 100 GB model the two copies evicted each other. Cause: the app adds the model's parent folder
+as a root when its covered check misses (a library root spelled through a symlink, say), and discovery deduped roots
+by id only, so the nested root registered the same folder under its bare name. Fix: `discoverModelsMany` keeps one
+entry per folder by real path, under the `org/name` id, and `rescan` compares real paths. Guard:
+`tests/test_multi_model_dir.sh` [5][6], `discoverModelsMany lists a folder two roots reach once…`,
+`ModelRegistry: rescan adds no second entry…`.

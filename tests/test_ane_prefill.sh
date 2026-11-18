@@ -82,7 +82,7 @@ print(json.dumps({'model': 'mlx-serve', 'max_tokens': 24, 'temperature': 0.0, 's
 
 echo "== ANE prefill offload =="
 echo "  model: $MODEL"
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 # Plant an orphaned staging dir (dead-pid marker): the on-arm's first ANE

@@ -48,7 +48,7 @@ EOF
 cleanup_root() { rm -rf "$TMPROOT"; }
 
 BINARY="${MLX_SERVE_BINARY:-./zig-out/bin/mlx-serve}"
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 LOGFILE=$(mktemp)
 "$BINARY" --model-dir "$TMPROOT" --model "$TMPROOT/$VALID_ID" --serve --port "$PORT" \

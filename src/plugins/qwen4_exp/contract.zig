@@ -179,6 +179,7 @@ const PoolRope = struct {
     /// The composed chain on the same inputs: `qsaPoolNorm` then `qsaPooledRopeComposed`.
     pub fn replaced(self: *PoolRope) ![]const u8 {
         var xfm: Trunk = undefined;
+        xfm.outside = null;
         xfm.s = self.rig.stream();
         xfm.allocator = self.rig.a;
         xfm.config = .{};

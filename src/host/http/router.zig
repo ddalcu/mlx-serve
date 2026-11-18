@@ -278,7 +278,7 @@ pub fn handleConnection(
         return;
     }
     if (std.mem.eql(u8, method, "GET") and isRoute(path, "/health")) {
-        if (mlx.gpuContextLost()) return sendResponse(stream, "503 Service Unavailable", "application/json", "{\"status\":\"cuda context lost\"}");
+        if (mlx.gpuContextLost()) return sendResponse(stream, "503 Service Unavailable", "application/json", "{\"status\":\"gpu context lost\"}");
         log.debug("GET  /health -> 200\n", .{});
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
         return;

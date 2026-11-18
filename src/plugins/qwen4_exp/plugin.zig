@@ -207,6 +207,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     model.resolveWeightPrefix(&m.cfg, &m.weights);
     m.trunk = try trunk_load.load(io, gpa, &m.cfg, &m.weights, .{
         .head_mxfp8 = lmHeadMxfp8On(headMxfp8Setting(ctx.settings_json.slice()), null, mlx.cudaIntegrated(), true, m.cfg.quant_bits),
+        .ctx = ctx,
+        .trunk_quant = config.of(ctx.parsed).trunk_quant,
     });
     m.trunk.prepare();
     return m;
@@ -595,6 +597,8 @@ test {
     _ = @import("oracle_test.zig");
     _ = @import("cost_profile.zig");
     _ = @import("trunk.zig");
+    _ = @import("outside.zig");
+    _ = trunk_load;
 }
 
 test "qwen4_exp batched forward: an M-RoPE slot runs at its cache position, its delta left to the rope" {

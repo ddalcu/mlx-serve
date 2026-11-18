@@ -28,8 +28,12 @@ pub fn MediaPack(comptime M: type) type {
 
         /// `a` must outlive the pack (an arena).
         pub fn open(a: std.mem.Allocator) !@This() {
+            return openFixture(a, try M.conformanceFixture(a));
+        }
+
+        /// The same, on a fixture the test built (a variant of the conformance pack).
+        pub fn openFixture(a: std.mem.Allocator, fx: fixture.Fixture) !@This() {
             if (ramShort(M)) return error.SkipZigTest;
-            const fx = try M.conformanceFixture(a);
             var tmp = testing.tmpDir(.{});
             errdefer tmp.cleanup();
             for (fx.files) |f| {

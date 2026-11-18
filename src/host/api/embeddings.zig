@@ -139,19 +139,9 @@ pub fn handleEmbeddings(
     var texts = std.ArrayList([]const u8).empty;
     defer texts.deinit(allocator);
 
-    switch (input_val) {
-        .string => |s| try texts.append(allocator, s),
-        .array => |arr| {
-            for (arr.items) |item| {
-                if (item == .string) {
-                    try texts.append(allocator, item.string);
-                }
-            }
-        },
-        else => {
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'input' must be a string or array of strings", null);
-            return;
-        },
+    if (try inputTexts(allocator, input_val, &texts)) |reject| {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reject, null);
+        return;
     }
 
     if (texts.items.len == 0) {
@@ -420,6 +410,23 @@ const EmbeddingPromptResult = union(enum) {
     }
 };
 
+const EMBED_INPUT_TYPE_REJECT = "'input' must be a string or array of strings";
+const EMBED_INPUT_PART_REJECT = "'input' takes strings only: send image and video parts in 'messages'";
+
+/// Appends the texts `input` names; returns the 400 message instead when it names something else.
+fn inputTexts(allocator: std.mem.Allocator, input_val: std.json.Value, texts: *std.ArrayList([]const u8)) !?[]const u8 {
+    switch (input_val) {
+        .string => |s| try texts.append(allocator, s),
+        .array => |arr| for (arr.items) |item| switch (item) {
+            .string => |s| try texts.append(allocator, s),
+            .object => return EMBED_INPUT_PART_REJECT,
+            else => return EMBED_INPUT_TYPE_REJECT,
+        },
+        else => return EMBED_INPUT_TYPE_REJECT,
+    }
+    return null;
+}
+
 const EMBED_PART_REJECT = "content parts must be text, image_url or video_url objects";
 
 const EMBED_NO_VISION_REJECT = "image and video parts need a model with a vision encoder: this one has none loaded (a text-only pack, or --no-vision)";
@@ -618,4 +625,28 @@ test "truncateEmbeddingDims: OpenAI dimensions semantics (truncate + L2-renormal
     const zt = truncateEmbeddingDims(&z, 2);
     try t.expectEqual(@as(usize, 2), zt.len);
     for (zt) |x| try t.expect(!std.math.isNan(x));
+}
+
+test "inputTexts: a member of 'input' that is not a string is refused by name, never dropped" {
+    const t = std.testing;
+    const cases = [_]struct { body: []const u8, texts: usize, reject: ?[]const u8 }{
+        .{ .body = "\"a\"", .texts = 1, .reject = null },
+        .{ .body = "[\"a\",\"b\"]", .texts = 2, .reject = null },
+        .{ .body = "[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:,\"}}]", .texts = 0, .reject = EMBED_INPUT_PART_REJECT },
+        .{ .body = "[\"a\",{\"type\":\"text\",\"text\":\"b\"}]", .texts = 1, .reject = EMBED_INPUT_PART_REJECT },
+        .{ .body = "[\"a\",42]", .texts = 1, .reject = EMBED_INPUT_TYPE_REJECT },
+        .{ .body = "[[1,2]]", .texts = 0, .reject = EMBED_INPUT_TYPE_REJECT },
+        .{ .body = "7", .texts = 0, .reject = EMBED_INPUT_TYPE_REJECT },
+    };
+    for (cases) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, c.body, .{});
+        defer parsed.deinit();
+        var texts = std.ArrayList([]const u8).empty;
+        defer texts.deinit(t.allocator);
+        const got = try inputTexts(t.allocator, parsed.value, &texts);
+        if (c.reject) |want| try t.expectEqualStrings(want, got orelse "") else {
+            try t.expectEqual(@as(?[]const u8, null), got);
+            try t.expectEqual(c.texts, texts.items.len);
+        }
+    }
 }

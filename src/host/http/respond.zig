@@ -74,11 +74,20 @@ fn responseBodyLogged(content_type: []const u8) bool {
     return !std.mem.startsWith(u8, content_type, "text/html");
 }
 
-/// The `Access-Control-Allow-Headers` value each SSE surface and every framed response (the OPTIONS preflight
-/// included) advertises.
-pub const SSE_ALLOW_HEADERS_DEFAULT = "Content-Type, Authorization, X-Ablation-Key";
+/// Every head's `Access-Control-Allow-Headers`: the headers all routes take, plus `extra`, the credential or
+/// protocol headers only that head's routes accept. A header every route takes is added here, once.
+pub fn allowHeaders(comptime extra: []const u8) []const u8 {
+    return "Content-Type, Authorization" ++ extra ++ ", X-MLX-Priority";
+}
 
-pub const SSE_ALLOW_HEADERS_ANTHROPIC = "Content-Type, Authorization, x-api-key, anthropic-version, X-Ablation-Key";
+pub const ALLOW_HEADERS = allowHeaders("");
+
+/// What each SSE surface and every framed response (the OPTIONS preflight included) advertises.
+pub const SSE_ALLOW_HEADERS_DEFAULT = allowHeaders(", X-Ablation-Key");
+
+pub const SSE_ALLOW_HEADERS_ANTHROPIC = allowHeaders(", x-api-key, anthropic-version, X-Ablation-Key");
+
+pub const UNAUTHORIZED_ALLOW_HEADERS = allowHeaders(", x-api-key");
 
 /// The one place a `text/event-stream` response head is written. Past this call a generation
 /// failure is an SSE `error` event; before it the stream answers like its non-streaming twin.
@@ -189,6 +198,13 @@ fn logHttpBody(label: []const u8, body: []const u8) void {
 }
 
 // ── tests ──
+
+test "a key header is allowed cross-origin only on the heads whose routes take it" {
+    try std.testing.expectEqualStrings("Content-Type, Authorization, X-MLX-Priority", ALLOW_HEADERS);
+    try std.testing.expectEqualStrings("Content-Type, Authorization, X-Ablation-Key, X-MLX-Priority", SSE_ALLOW_HEADERS_DEFAULT);
+    try std.testing.expectEqualStrings("Content-Type, Authorization, x-api-key, anthropic-version, X-Ablation-Key, X-MLX-Priority", SSE_ALLOW_HEADERS_ANTHROPIC);
+    try std.testing.expectEqualStrings("Content-Type, Authorization, x-api-key, X-MLX-Priority", UNAUTHORIZED_ALLOW_HEADERS);
+}
 
 test "a logged request never carries the API key" {
     try testing.expectEqualStrings("/metrics", logSafePath("/metrics?api_key=s3cret"));

@@ -497,7 +497,7 @@ class TestServer {
                 modelContextLength: appState.server.chatModelInfo?.contextLength
             )
             let session = appState.chatSessions.first(where: { $0.id == sessionId })
-            var history = AgentEngine.buildAgentHistory(
+            let history = AgentEngine.buildAgentHistory(
                 messages: session?.messages ?? [],
                 contextLength: contextLength,
                 maxTokens: appState.maxTokens
@@ -510,11 +510,7 @@ class TestServer {
             if let wd = workDir {
                 systemPrompt += AgentEngine.workingDirectoryContext(wd)
             }
-            var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
-            if let lastRole = history.last?["role"] as? String, lastRole == "tool" {
-                history.append(["role": "user", "content": AgentEngine.toolRoundNudge])
-            }
-            messages.append(contentsOf: history)
+            let messages = AgentEngine.requestMessages(systemPrompt: systemPrompt, history: history)
 
             // Add streaming assistant message
             var streamMsg = ChatMessage(role: .assistant, content: "")
