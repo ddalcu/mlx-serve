@@ -1580,3 +1580,16 @@ oversized commit evicts before it copies (`evict_before_copy`), a streamed bank 
 bank's GLM or Ling asks no more than the hot-cache term its decode room holds`, `HotPrefixCache: a capped streamed
 bank's oversized commit evicts before it copies`, `outside model: a fitted base carries the hot cache's resident entry`,
 `a streamed bank's slot is exclusive on GLM and Ling`, `outside model: a bills-only fit gives each phase's bills' growth`.
+
+### A grammar slot cannot take a plain slot's way into or out of the batched tick
+Defect: a json_schema request decoded serial beside every other request (`BatchVerdict.grammar`), so a constrained
+call waited on chats and chats on it. Batching it is not only a mask per row: its pipeline differs from a plain slot's.
+Cause: a serial constrained step EMITS and forwards the token it returns and leaves only `pending_logits` (fresh from
+prefill, `next_token_id` is 0), so `drainPipelineForBatch` re-emitted the last token (or a 0) and drew the next one
+unmasked; and a slot leaving the batch holds a drawn, unforwarded token with no pending logits, which the serial step
+read as the end of generation and cut the JSON short. Fix: a grammar row draws under its own mask
+(`batching/grammar.zig`, built on the CPU while the forward runs), its grammar advances by the drawn token before the
+next tick (`noteBatchedSample`), `joinBatch` draws a constrained slot's next position under the mask without emitting,
+and `commitBatchedToken` emits and forwards the drawn token when a serial step takes the slot over. The reasoning
+protocol's phases stay serial (`Constraint.prePayload`). Guards: `a grammar row keeps its stream across joins and
+leaves`, `batched grammar rows: each draws under its own schema's mask`, `test_batched_grammar.sh`.
