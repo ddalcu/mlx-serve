@@ -1,0 +1,67 @@
+name: Zig + mlx stage
+description: >-
+  What both Zig jobs build on: Xcode, the pinned Zig, brew deps, the self-built mlx + mlx-c (cached under the same key
+  as release.yml) and libllama. Run after actions/checkout with submodules.
+outputs:
+  submodules:
+    description: Short hash of the submodule set, for the Zig cache key
+    value: ${{ steps.mlxpin.outputs.submodules }}
+  xcode:
+    description: Xcode version string, for the Zig cache key
+    value: ${{ steps.mlxpin.outputs.xcode }}
+runs:
+  using: composite
+  steps:
+    - name: Select Xcode (Swift 6.1+ required by MCP swift-sdk)
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: latest-stable
+
+    # The pinned Zig tarball is ~50 MB off ziglang.org; fetch-zig.sh skips
+    # the download when the restored dir's stamp already matches the pin.
+    - name: Cache Zig toolchain
+      uses: actions/cache@v4
+      with:
+        path: .zig-toolchain
+        key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}
+
+    - name: Install Zig (pinned)
+      shell: bash
+      run: |
+        bash scripts/fetch-zig.sh
+        echo "$GITHUB_WORKSPACE/.zig-toolchain" >> "$GITHUB_PATH"
+
+    - name: Install dependencies
+      shell: bash
+      run: brew bundle install --file=Brewfile
+
+    # Same key as release.yml so CI runs on main keep the cache warm for
+    # release tag builds (and vice versa).
+    - name: Compute mlx pin cache key
+      id: mlxpin
+      shell: bash
+      run: |
+        echo "mlx=$(git -C lib/mlx-src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+        echo "mlxc=$(git -C lib/mlxc-src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+        echo "xcode=$(xcodebuild -version | tr ' \n' '--')" >> "$GITHUB_OUTPUT"
+        echo "submodules=$(git submodule status | shasum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+        echo "patches=$(cat scripts/build-mlx-patches.txt $(awk 'NF && $1 !~ /^#/ { print $2 }' scripts/build-mlx-patches.txt) | shasum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+    - name: Cache self-built mlx + mlx-c
+      uses: actions/cache@v4
+      with:
+        path: lib/mlx
+        key: mlx-stage-${{ steps.mlxpin.outputs.mlx }}-${{ steps.mlxpin.outputs.mlxc }}-${{ steps.mlxpin.outputs.patches }}-${{ steps.mlxpin.outputs.xcode }}
+
+    - name: Build mlx + mlx-c (NAX-enabled)
+      shell: bash
+      run: |
+        # Xcode 26 ships the Metal compiler as a separate component; fetch it
+        # if the image doesn't have it (build-mlx.sh hard-fails without it).
+        xcrun -sdk macosx metal --version >/dev/null 2>&1 \
+          || sudo xcodebuild -downloadComponent MetalToolchain
+        bash scripts/build-mlx.sh
+
+    - name: Fetch libllama (llama.cpp GGUF engine)
+      shell: bash
+      run: bash scripts/fetch-llama.sh
