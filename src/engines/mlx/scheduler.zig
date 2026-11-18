@@ -1273,7 +1273,9 @@ pub fn batchVerdict(self: *const Scheduler, slot: *const Slot) BatchVerdict {
     if (!slotTicksRegular(slot)) return .spec_active;
     // A slot whose module-head release is armed but not landed still holds the head.
     if (slotReleasePending(slot)) return .head_release_pending;
-    if (slot.sampling.constraint != null) return .grammar;
+    // A grammar row batches once its payload is under the JSON mask; the reasoning protocol's own
+    // masks and forced transitions before that run serial.
+    if (slot.sampling.constraint) |c| if (c.prePayload()) return .grammar;
     if (slot.logprobs_n > 0) return .logprobs;
     if (slot.sampling.penalized()) return .penalty;
     const cfg = slot.model.config orelse return .arch;
