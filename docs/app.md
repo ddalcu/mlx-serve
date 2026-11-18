@@ -54,6 +54,11 @@ And it goes well beyond text-to-X:
 | Music | ACE-Step 1.5 XL Turbo 8-bit (fast, 8 steps) | MiniMax Music 3 8-bit (sings your lyrics, songs up to 6 min, strongest vocals), YuE2 3B 8-bit (plans an editable score first; non-commercial license) | ACE 8 GB RAM, ~6.2 GB download; Music 3 ~20 GB RAM, 13.6 GB download; YuE2 ~10 GB RAM, 4.5 GB download |
 | 3D | Hunyuan3D-2.1 8-bit (shape + PBR texture) | — | 16 GB RAM |
 
+The server also supports [Breeze-TTS-2 over HTTP](breeze-tts.md), with speaker
+slots, instruction voice design and transcript-conditioned cloning. This does
+not add a Breeze-specific app catalog entry, Audio pane controls or Voice Mode
+integration; use the API guide for its setup and supported fields.
+
 > The 41 GB LTX 2.3 snapshot ships **both** transformer variants (1-stage distilled + 2-stage dev, ~11 GB each) plus a 7.6 GB distillation LoRA, so you can switch between Fast/Good/Quality/Super offline without re-downloading.
 
 > LTX-Video 2.5 brings its own text encoder, so there is no separate 8 GB download on first use. The 8-bit pack keeps detail the 4-bit one loses and adds a **Diffusion decoder** toggle (the decoder Lightricks' own published clips use, `"decoder": "diffusion"` over the API) for sharper texture and edges. The default canvas and frame ladder are sized per Mac; two-stage tiers denoise at half the chosen size and upscale.
