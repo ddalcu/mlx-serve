@@ -471,7 +471,7 @@ test "Conn: a request's X-Ablation line rides both response heads, and the next 
         const head = got[0 .. std.mem.indexOf(u8, got, "\r\n\r\n").? + 4];
         try testing.expect(std.mem.indexOf(u8, head, "\r\n" ++ line) != null);
         // A browser may send the key and the priority cross-origin and read the X-Ablation line back.
-        try testing.expect(std.mem.indexOf(u8, head, "\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Ablation-Key, X-MLX-Priority\r\n") != null);
+        try testing.expect(std.mem.indexOf(u8, head, "\r\nAccess-Control-Allow-Headers: " ++ SSE_ALLOW_HEADERS_DEFAULT ++ "\r\n") != null);
         try testing.expect(std.mem.indexOf(u8, head, "\r\nAccess-Control-Expose-Headers: X-Ablation\r\n") != null);
         try testing.expect(std.mem.indexOf(u8, got, "secret-value") == null);
         conn.noteRequestHeaders("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n");
