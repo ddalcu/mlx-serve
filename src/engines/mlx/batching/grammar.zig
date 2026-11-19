@@ -251,6 +251,8 @@ fn argmaxWhere(logits: []const f32, mask: ?[]const bool) ?i32 {
 
 /// One batched decode tick over `rows`, as `runBatchedDecodeTick` runs it: join, one forward, one draw per row, emit
 /// the previous token, stop or advance. A greedy row's draw must be the argmax of its OWN logits under its OWN mask.
+/// A mirror of `runBatchedDecodeTick`, not tick.zig itself: tick.zig's own order (the payload span published before
+/// the emit, `noteBatchedSample` after every stop check) is guarded only by tests/test_batched_grammar.sh on a live model.
 fn batchedTick(m: *Model, rows: []const *Row) !void {
     const a = testing.allocator;
     var live: [8]*Row = undefined;
@@ -389,6 +391,48 @@ test "a grammar request batched alone draws the same tokens as the serial path (
                 try testing.expect(n > 4);
                 try testing.expectEqualSlices(u32, serial.out.items[0..n], batched.out.items[0..n]);
             }
+        }
+    }.run);
+}
+
+test "the serial constrained step: the mask of the grammar before the token, one seeded draw, the next logits pending, a stop that never reaches the stream" {
+    try eachPack(struct {
+        fn run(m: *Model) !void {
+            const r = try Row.create(m, ENUM_SCHEMA, .{ .temperature = 0 });
+            defer r.destroy();
+            const c = r.gen.sampling.constraint.?;
+            var host: [264]f32 = undefined;
+            var want: [264]bool = undefined;
+            for (0..40) |_| {
+                if (r.ended) break;
+                try testing.expect(r.gen.has_pending_logits);
+                try hostRow(r.gen.pending_logits, &host);
+                const mask = want[0..c.mask_buf.len];
+                _ = try token_mask.buildMask(c.grammar, c.token_bytes, mask);
+                if (c.grammar.isComplete()) for (EOS) |e| {
+                    mask[e] = true;
+                };
+                const draw0 = r.gen.sampling.draw;
+                const len0 = r.gen.generated_ids.items.len;
+                try r.serialStep();
+                try testing.expectEqual(draw0 +% 1, r.gen.sampling.draw);
+                const want_id = argmaxWhere(&host, mask);
+                if (r.ended) {
+                    try testing.expectEqualStrings("stop", r.gen.finish_reason);
+                    try testing.expect(generate_mod.isEosId(r.gen.next_token_id, &EOS));
+                    try testing.expectEqual(want_id, @as(i32, @intCast(r.gen.next_token_id)));
+                    try testing.expectEqual(len0, r.gen.generated_ids.items.len);
+                    try testing.expect(!r.sc.grammar.dead);
+                } else {
+                    try testing.expectEqual(want_id, @as(i32, @intCast(r.out.items[r.out.items.len - 1])));
+                    try testing.expect(r.gen.has_pending_logits);
+                    try testing.expectEqual(len0 + 1, r.gen.generated_ids.items.len);
+                    try r.expectPositions();
+                }
+            }
+            try testing.expect(r.ended);
+            try testing.expectEqualStrings("stop", r.gen.finish_reason);
+            try r.expectValid();
         }
     }.run);
 }
