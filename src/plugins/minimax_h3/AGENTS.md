@@ -25,6 +25,8 @@ a student runs exactly its own), `seed`, `turbo` (needs `turbo_lora.safetensors`
 A two-time pack samples only its trained step counts (`two_time.sigma_grids`), default `default_steps`; no `turbo`.
 `init_video` (`{frames, audio}`, frames exactly `width`x`height` and the snapped count) + `init_step` k in [1, steps-1]:
 the target starts at `(1-σ_k)·x0 + σ_k·noise` (audio at its own clock's σ) and steps k..steps-1 run; PDD and chains refuse.
+No `audio` = a silent clip (a zero soundtrack noised like a real one); to keep the original sound, send it, and a
+client that wants it bit-for-bit muxes it back over the output.
 `cfg_scale`/`stg_scale`/`pipeline` are ignored, not refused (the app sends them for every video backend).
 
 ## Rules

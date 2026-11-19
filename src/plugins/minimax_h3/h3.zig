@@ -3737,7 +3737,7 @@ pub const GenRequest = struct {
 pub const InitClip = struct {
     /// `[1,3,T,H,W]` in [-1, 1] at the request's canvas, T = the snapped frame count.
     pixels: mlx.mlx_array,
-    /// 32 kHz stereo `[2, audio_t * HOP]`; null leaves the audio stream at pure noise.
+    /// 32 kHz stereo `[2, audio_t * HOP]`; null only on a pack without an audio VAE (`generate` refuses it otherwise).
     waveform: ?mlx.mlx_array = null,
     /// In [1, steps - 1].
     step: u32,
@@ -4077,6 +4077,8 @@ pub fn generate(
     progress: ?gen_sse.Progress,
     s: S,
 ) !GenResult {
+    // Audio rows left at pure noise would run from init_step with a mid-schedule audio timestep.
+    if (req.init) |ic| if (ic.waveform == null and paths.audio_vae != null) return error.InitClipNoSoundtrack;
     if (req.chain_windows > 1) {
         if (req.init != null) return error.InitClipChained;
         return generateChain(allocator, io, paths, req, progress, s);
@@ -4564,7 +4566,7 @@ fn generateOne(
         try mlx.check(mlx.mlx_array_eval(audio_x));
         log.info("[minimax-h3] init_video: init_step {d}, sigma_k video {d:.4} audio {d:.4}, running {d} of {d} steps; audio {s}\n", .{
             ic.step, sv, sa, req.steps - ic.step, req.steps,
-            if (init_audio_rows != null) "starts from the clip's soundtrack" else "starts from pure noise (no init audio)",
+            if (init_audio_rows != null) "starts from the clip's soundtrack" else "starts from pure noise (the pack has no audio VAE)",
         });
     }
 
@@ -5505,6 +5507,16 @@ fn writeWav(a: std.mem.Allocator, io: std.Io, wave: mlx.mlx_array, out_dir: []co
     var w = fh.writer(io, &wbuf);
     try w.interface.writeAll(bytes);
     try w.interface.flush();
+}
+
+test "minimax h3: an init clip without a soundtrack on a pack with an audio VAE never reaches the sampler" {
+    const px = mlx.mlx_array_new_float(0.0);
+    defer _ = mlx.mlx_array_free(px);
+    const paths: GenPaths = .{ .tokenizer_dir = "/nonexistent", .text_encoder = "/nonexistent/te", .dit = "/nonexistent/dit", .vae = "/nonexistent/vae", .audio_vae = "/nonexistent/audio_vae.safetensors" };
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try testing.expectError(error.InitClipNoSoundtrack, generate(testing.allocator, io, paths, .{ .prompt = "x", .steps = 2, .init = .{ .pixels = px, .step = 1 } }, null, s));
 }
 
 test "minimax h3: patchifyVideo matches the reference einsum order" {

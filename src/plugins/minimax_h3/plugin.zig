@@ -386,6 +386,29 @@ fn initClip(req: *const abi.Request, b: *const job.Body, need: InitNeeds, s: mlx
     if (fr.array.items.len != need.frame_count)
         return req.refuseFmt(.unsupported, "'init_video' has the wrong number of frames", "'init_video' has {d} frames; this request needs exactly {d} ('num_frames' {d} on the 17k+5 ladder)", .{ fr.array.items.len, need.frame_count, need.requested_frames });
 
+    // The soundtrack first: a bad one is refused before any frame is decoded. Without one, a pack with an audio VAE
+    // starts from silence, so the audio rows are noised on the same clock as the video's. What lands in `out` is
+    // owned by it: the caller's `deinit` frees whatever a refusal below leaves in it.
+    const want: usize = @as(usize, need.audio_t) * @import("audio.zig").HOP_LENGTH;
+    const au: std.json.Value = v.object.get("audio") orelse .null;
+    if (au != .null) {
+        if (au != .string) return bad("'init_video'.audio must be a base64 WAV string");
+        if (!need.audio_vae) return bad("'init_video'.audio needs the pack's audio VAE (audio_vae.safetensors), which this pack does not ship");
+        const pcm = wav32kStereo(au.string) catch return bad("'init_video'.audio must be a PCM16/PCM24/float32 WAV");
+        defer gpa.free(pcm);
+        const fitted = try fitSoundtrack(pcm, want) orelse
+            return req.refuseFmt(.unsupported, "'init_video'.audio is not the clip's length", "'init_video'.audio is {d} samples at 32 kHz; this clip's soundtrack is {d} (within 800)", .{ pcm.len / 2, want });
+        defer gpa.free(fitted);
+        if (pcm.len / 2 != want) log.info("[video] minimax-h3 init_video soundtrack fitted from {d} to {d} samples\n", .{ pcm.len / 2, want });
+        out.waveform = try planar(fitted);
+    } else if (need.audio_vae) {
+        const silence = try gpa.alloc(f32, want * 2);
+        defer gpa.free(silence);
+        @memset(silence, 0);
+        log.info("[video] minimax-h3 init_video: no soundtrack, treated as silence\n", .{});
+        out.waveform = try planar(silence);
+    }
+
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -398,22 +421,9 @@ fn initClip(req: *const abi.Request, b: *const job.Body, need: InitNeeds, s: mlx
             return req.refuseFmt(.unsupported, "an 'init_video' frame is not the request's width x height", "'init_video'.frames[{d}] is {d}x{d}; every frame must be exactly {d}x{d} (the request's width x height)", .{ i, sz.w, sz.h, need.width, need.height });
     }
 
-    // Owned by `out` from here: the caller's `deinit` frees whatever a refusal below leaves in it.
     out.pixels = try videoFrames(frames, need.height, need.width, 1, 2, s) orelse
         return bad("an 'init_video' frame could not be decoded (PNG/JPEG expected)");
     out.step = @intCast(k);
-    if (v.object.get("audio")) |au| if (au != .null) {
-        if (au != .string) return bad("'init_video'.audio must be a base64 WAV string");
-        if (!need.audio_vae) return bad("'init_video'.audio needs the pack's audio VAE (audio_vae.safetensors), which this pack does not ship");
-        const pcm = wav32kStereo(au.string) catch return bad("'init_video'.audio must be a PCM16/PCM24/float32 WAV");
-        defer gpa.free(pcm);
-        const want: usize = @as(usize, need.audio_t) * @import("audio.zig").HOP_LENGTH;
-        const fitted = try fitSoundtrack(pcm, want) orelse
-            return req.refuseFmt(.unsupported, "'init_video'.audio is not the clip's length", "'init_video'.audio is {d} samples at 32 kHz; this clip's soundtrack is {d} (within 800)", .{ pcm.len / 2, want });
-        defer gpa.free(fitted);
-        if (pcm.len / 2 != want) log.info("[video] minimax-h3 init_video soundtrack fitted from {d} to {d} samples\n", .{ pcm.len / 2, want });
-        out.waveform = try planar(fitted);
-    };
     return null;
 }
 
@@ -980,6 +990,8 @@ test "minimax_h3 plugin: init_video and init_step are refused by name unless the
         .{ .body = try std.fmt.allocPrint(a, "{{\"init_step\":1,\"init_video\":{{\"frames\":{s},\"audio\":\"{s}\"}}}}", .{ five, try testWav(a, want_samples) }), .need = silent_pack, .needle = "needs the pack's audio VAE" },
         .{ .body = try std.fmt.allocPrint(a, "{{\"init_step\":1,\"init_video\":{{\"frames\":{s},\"audio\":\"QUJD\"}}}}", .{five}), .need = base, .needle = "'init_video'.audio must be a PCM16" },
         .{ .body = try std.fmt.allocPrint(a, "{{\"init_step\":1,\"init_video\":{{\"frames\":{s},\"audio\":\"{s}\"}}}}", .{ five, try testWav(a, want_samples / 2) }), .need = base, .needle = "this clip's soundtrack is" },
+        // A bad soundtrack is refused before a bad frame is decoded.
+        .{ .body = "{\"init_step\":1,\"init_video\":{\"frames\":[\"QUJD\",\"!!!!\",\"QUJD\",\"QUJD\",\"QUJD\"],\"audio\":\"QUJD\"}}", .need = base, .needle = "'init_video'.audio must be a PCM16" },
     };
     for (cases) |c| {
         var b = job.Body.parse(testing.allocator, c.body).?;
@@ -1018,6 +1030,27 @@ test "minimax_h3 plugin: init_video and init_step are refused by name unless the
         try testing.expectEqual(@as(u32, 1), clip.step);
         try testing.expectEqualSlices(c_int, &.{ 1, 3, 5, 64, 64 }, mlx.getShape(clip.pixels));
         try testing.expectEqualSlices(c_int, &.{ 2, @intCast(want_samples) }, mlx.getShape(clip.waveform.?));
+    }
+    // No soundtrack: silence of the clip's length on a pack with an audio VAE, none on a pack without one.
+    {
+        const body = try std.fmt.allocPrint(a, "{{\"init_step\":1,\"init_video\":{{\"frames\":{s}}}}}", .{five});
+        for ([_]InitNeeds{ base, silent_pack }) |need| {
+            var b = job.Body.parse(testing.allocator, body).?;
+            defer b.deinit();
+            var out: InitMedia = .{};
+            defer out.deinit();
+            try testing.expect((try initClip(&req, &b, need, s, &out)) == null);
+            const clip = out.clip().?;
+            if (!need.audio_vae) {
+                try testing.expect(clip.waveform == null);
+                continue;
+            }
+            const track = clip.waveform orelse return error.NoSilence;
+            try testing.expectEqualSlices(c_int, &.{ 2, @intCast(want_samples) }, mlx.getShape(track));
+            try mlx.check(mlx.mlx_array_eval(track));
+            const data = mlx.mlx_array_data_float32(track).?[0 .. 2 * want_samples];
+            for (data) |x| try testing.expectEqual(@as(f32, 0), x);
+        }
     }
 }
 
