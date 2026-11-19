@@ -87,6 +87,9 @@ pub const Config = struct {
     // Engram: n-gram embedding injection on `engram_layers`; tables stream from disk (Plan 02).
     engram_layers: [64]bool = @splat(false),
     engram_layer_count: u32 = 0,
+    /// The table rows each engram layer carries (the head-vocab lists' sums; HF-keyed, summed here). The
+    /// bill prices the stream bank from these; the load cross-checks the pack's table against them.
+    engram_table_rows: [64]u64 = @splat(0),
     engram_vocab_sizes: [2]u32 = .{ 0, 0 },
     engram_ngram_heads: u32 = 8,
     engram_head_dim: u32 = 96,
@@ -386,13 +389,15 @@ fn readEngram(c: *Config, o: Objects) ParseError!void {
             c.engram_vocab_sizes[1] = try u32v(arr.items[1]);
         }
     }
+    // The config's ids are HF (1-based); the pack's tensors sit at index id-1 (omlx: block+1 is the
+    // config id). Store the PACK index; head-vocab lists key on the same id, so rows line up too.
     if (field(cfg, "engram_layer_ids")) |v| {
         const arr = try value(.array, v);
         try require(arr.items.len > 0 and arr.items.len <= 16);
         for (arr.items) |t| {
             const li = try u32v(t);
-            try require(li < c.num_hidden_layers);
-            c.engram_layers[li] = true;
+            try require(li > 0 and li <= c.num_hidden_layers);
+            c.engram_layers[li - 1] = true;
             c.engram_layer_count += 1;
         }
     } else return error.Unsupported;
@@ -400,11 +405,28 @@ fn readEngram(c: *Config, o: Objects) ParseError!void {
         const obj = try value(.object, v);
         try require(obj.keys().len == c.engram_layer_count);
         var it = obj.iterator();
+        var seen: u32 = 0;
         while (it.next()) |kv| {
+            // Head-vocab lists key on the HF (1-based) layer; the loader places tables by WEIGHT presence,
+            // so only the row SUM matters here (the bill's), and the two lists are the 8- and 3-gram tiers.
             const li = std.fmt.parseInt(u32, kv.key_ptr.*, 10) catch return error.InvalidConfigField;
-            try require(li < c.num_hidden_layers);
-            const rows = try value(.array, kv.value_ptr.*);
-            try require(rows.items.len == 2);
+            try require(li > 0 and li <= c.num_hidden_layers);
+            const tiers = try value(.array, kv.value_ptr.*);
+            try require(tiers.items.len == 2);
+            var total: u64 = 0;
+            for (tiers.items) |tier| {
+                const heads = try value(.array, tier);
+                try require(heads.items.len > 0 and heads.items.len <= 64);
+                for (heads.items) |hv| total += try u32v(hv);
+            }
+            try require(total > 0);
+            c.engram_table_rows[li - 1] = total;
+            seen += 1;
+        }
+        try require(seen == c.engram_layer_count);
+        for (c.engram_layers, 0..) |en, li| {
+            if (!en) continue;
+            try require(c.engram_table_rows[li] > 0);
         }
     }
 }
@@ -641,8 +663,7 @@ pub fn parseJson(json: []const u8, stub: bool, out: *abi.Parsed) abi.Verdict {
 }
 
 /// A tiny hy_v4_flash config with the same shape space as the pack (4 layers, DSA at 0, engram at 1).
-/// It is JSON, not kernel source; the lint's inline-kernel scan keys on the layer/dtype words below.
-const tiny_config = // lint: allow inline-kernel
+const tiny_config =
     \\{"model_type":"hy_v4_flash","text_config":{"model_type":"hy_v4_flash",
     \\"vocab_size":512,"hidden_size":64,"num_hidden_layers":4,"num_attention_heads":2,"head_dim":64,
     \\"rms_norm_eps":1e-5,"max_position_embeddings":4096,"bos_token_id":1,"eos_token_id":2,

@@ -568,7 +568,9 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
         std.mem.startsWith(u8, key, "vision_embedder.") or
         std.mem.startsWith(u8, key, "embed_audio.") or
         std.mem.startsWith(u8, key, "multi_modal_projector.") or
-        std.mem.startsWith(u8, key, "language_model.multi_modal_projector.");
+        std.mem.startsWith(u8, key, "language_model.multi_modal_projector.") or
+        // Hy4-flash nests its tower and projector verbatim under `vit.`.
+        std.mem.startsWith(u8, key, "vit.");
     // The heavy SigLIP-era conformer audio tower is still not wired — drop it.
     const is_audio_tower = std.mem.startsWith(u8, key, "audio_tower.") or
         std.mem.startsWith(u8, key, "language_model.audio_multi_modal_projector.");

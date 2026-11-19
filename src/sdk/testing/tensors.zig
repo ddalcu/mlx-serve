@@ -71,6 +71,14 @@ pub const Tensors = struct {
         try t.put(fmt, args, .U32, shape, out);
     }
 
+    /// Random little-endian words of `dtype` (I32 lookup tables, U16 id rows).
+    pub fn ints(t: *Tensors, comptime fmt: []const u8, args: anytype, shape: []const u64, dtype: Dtype) !void {
+        const n = count(shape);
+        const out = try t.a.alloc(u8, n * dtype.width());
+        t.prng.random().bytes(out);
+        try t.put(fmt, args, dtype, shape, out);
+    }
+
     /// Uniform random halfwords (EXL3 trellis codes).
     pub fn halfwords(t: *Tensors, comptime fmt: []const u8, args: anytype, shape: []const u64) !void {
         const out = try t.a.alloc(u8, count(shape) * 2);

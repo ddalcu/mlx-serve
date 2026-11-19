@@ -23,8 +23,10 @@ vision = Plan 07.
 
 ## Packs & fixtures
 
-- Full pack: `~/.mlx-serve/models/TensorFold/Hy4-flash-MLX-4bit-MTP` (148 shards, 129.9 GB; 89.5 GB minus Engram).
+- Full pack: `~/.mlx-serve/models/TensorFold/Hy4-flash-MLX-4bit-MTP` (148 shards, 129.9 GB; 90.3 GB minus Engram).
 - CI dev pack: `test-org-copilot/HYV4-0.7B-mlx` (~838 MB, no engram/DFly/vit weights); engram/DFly fixtures are
-  synthetic. Fixture config: `src/fixtures/model-configs/hy_v4-flash.json`.
-- Quant census: attention/embed at g64 4-bit, MoE experts and Engram embeddings at g32 (per-tensor overrides in
-  `quantization`), iHC f32, DFly bf16. `enable_lm_head_fp32` lies — the lm_head IS quantized.
+  synthetic. Fixture config: `src/fixtures/model-configs/hy_v4-flash.json`. Conformance + loader fixtures:
+  `src/plugins/hy_v4/fixture.zig` (a tiny config + safetensors set; the conformance subject returns null until
+  Plan 03's forward, which the loader's own checks in `loader_test.zig` stand in for).
+- Quant census: trunk linears/embed/lm_head at g64 4-bit, MoE experts and Engram embeddings at g32 (per-tensor
+  overrides in `quantization`), iHC f32, DFly bf16. `enable_lm_head_fp32` lies — the lm_head IS quantized.

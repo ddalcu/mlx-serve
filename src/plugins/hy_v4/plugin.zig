@@ -5,6 +5,8 @@ const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 pub const config = @import("config.zig");
+pub const weights = @import("weights.zig");
+const log = @import("../../sdk/util/log.zig");
 
 pub const plugin = sdk.Plugin{
     .name = "hy_v4",
@@ -22,14 +24,15 @@ pub const table = abi.ModelTable{
     .unload = &unload,
     .forward = &forward,
     .cache = &.{ .layout = &layout },
-    .weights = &.{},
+    .weights = &.{ .resident_bytes = &residentBytes },
 };
 
 const Verdict = abi.Verdict;
 
-/// The conformance pack: the tiny hy_v4_flash config with a matching micro safetensors set, sized so every
-/// projection, expert and engram table exists at its config shape. Plan 02's loader is what fills it in; until
-/// then it is absent — the plugin stays in the registry's claim sweep and skips the load/forward checks.
+/// The conformance pack: the tiny hy_v4_flash config with a matching micro safetensors set (fixture.zig).
+/// The load lands in Plan 02 and its checks run here; the forward lands in Plan 03, and until it returns
+/// logits the whole subject sits out the suite — `fixtureMayBeAbsent` is the sanctioned way, and returning
+/// the built files is one line. Plan 03's proof tapes pin the numerics the suite cannot see.
 pub const fixtureMayBeAbsent = true;
 pub fn conformanceFixture(a: std.mem.Allocator) !?sdk.fixture.Fixture {
     _ = a;
@@ -98,14 +101,46 @@ fn layout(p: *const abi.Parsed, span: ?*const abi.LayerSpan, out: [*]abi.LayerCa
     return n;
 }
 
+/// A shape/missing failure reads as a sentence naming the tensor: the static prefix plus the name
+/// `validate` stopped on, kept in a global that outlives the call (the host reads `why` after the return).
 fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
-    _ = ctx;
-    out.* = Verdict.refuse(.unsupported, "hy_v4_flash: the weight loader lands in Plan 02 (a pack with no safetensors is refused sooner, by the SDK loader)");
-    return null;
+    return weights.load(ctx) catch |e| {
+        log.err("hy_v4: load failed: {t}\n", .{e});
+        out.* = switch (e) {
+            error.MissingWeight, error.WrongShape => weights.failureVerdict(e),
+            error.TableMissing, error.TableSplit, error.TableHeader, error.TableRows,
+            error.TableGeometry, error.TableOpen, error.IndexMissing, error.EngramCount => weights.failureVerdict(e),
+            error.UnsupportedWeightSource => Verdict.refuse(.unsupported, "hy_v4_flash: a weight source other than the resident map"),
+            else => Verdict.named(.failed, @errorName(e)),
+        };
+        return null;
+    };
 }
 
 fn unload(m: *anyopaque) callconv(.c) void {
-    _ = m;
+    const model: *weights.Model = @ptrCast(@alignCast(m));
+    model.deinit();
+    std.heap.c_allocator.destroy(model);
+}
+
+/// The preflight's resident bytes: the shard census less the Engram tables, which the stream bank owns
+/// (their ranges open through `weights.Engram`; the load never maps them). A pack that disagrees — no
+/// table where the config says one — is refused by name at load, not here.
+fn residentBytes(p: *const abi.Parsed, _: abi.Str, _: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
+    out.* = shards - engramPackedBytes(config.of(p));
+    return .ok;
+}
+
+/// The packed bytes of every Engram table the config places: one row is 12 U32 words (48 B, 96 4-bit
+/// codes) plus three bf16 scales and three bf16 biases (12 B) = 60 B. `rows` comes from the config's
+/// head-vocab lists; the test below pins the arithmetic against the pack (4 × ~165 M rows = 39.6 GB), and
+/// the tiny-pack load test pins the ranges the load opens.
+fn engramPackedBytes(c: *const config.Config) u64 {
+    if (c.engram_layer_count == 0) return 0;
+    const row_bytes = @divExact(c.engram_head_dim * c.quant_bits, 32) * 4 + 2 * (3 * 2);
+    var bytes: u64 = 0;
+    for (c.engram_table_rows) |rows| bytes += rows * row_bytes;
+    return bytes;
 }
 
 fn forward(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
@@ -125,9 +160,28 @@ test "hy_v4_flash table: the bill covers shards without the Engram and names the
     defer config.freeParsed(&p);
     var b: abi.Bill = .{};
     bill(&p, &.{}, &b);
-    // The bill's oracle is the pack's shard census (measured 89.5 GB over 129.9 GB total, the rest being
-    // the 39.7 GB Engram): the arithmetic may sit within 15% of it.
-    try testing.expect(@abs(@as(i64, @intCast(b.load_bytes)) - 89_500_000_000) < 13_500_000_000);
+    // The bill's oracle is the pack's shard census (129.9 GB total, 39.60 GB of Engram the stream owns, so
+    // 90.3 GB resident): the arithmetic may sit within 15% of it.
+    try testing.expect(@abs(@as(i64, @intCast(b.load_bytes)) - 90_300_000_000) < 13_500_000_000);
     try testing.expectEqual(@as(u64, 576 * 2 * 12), b.kv_per_token);
     try testing.expect(b.fixed_slot_bytes > 30 * 512 * 576 * 2);
+}
+
+test "hy_v4 table: the Engram stream's packed bytes match the pack's table census" {
+    var p: abi.Parsed = .{};
+    try testing.expect(config.parseJson(@embedFile("../../fixtures/model-configs/hy_v4-flash.json"), true, &p).isOk());
+    defer config.freeParsed(&p);
+    // The pack's four tables hold 660,006,416 rows between them; a row is 12 U32 words + 3 bf16 scales +
+    // 3 bf16 biases = 60 B on disk (measured from the shard headers). The bill must subtract exactly this.
+    const rows: u64 = 164_994_380 + 164_999_008 + 165_004_086 + 165_008_942;
+    const want = rows * 60;
+    const got = engramPackedBytes(config.of(&p));
+    try testing.expectApproxEqRel(@as(f64, @floatFromInt(want)), @as(f64, @floatFromInt(got)), 0.001);
+    // And the resident bill equals the shard census minus that figure.
+    var b: abi.Bill = .{};
+    bill(&p, &.{}, &b);
+    var resident: u64 = 0;
+    try testing.expect(residentBytes(&p, .{}, .{}, 129_900_000_000, &resident).isOk());
+    try testing.expectApproxEqRel(@as(f64, @floatFromInt(129_900_000_000 - want)),
+        @as(f64, @floatFromInt(resident)), 0.001);
 }
