@@ -505,6 +505,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
 
     var init: InitMedia = .{};
     defer init.deinit();
+    const init_t0 = std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .boot);
     if (initClip(req, &b, .{
         .width = width,
         .height = height,
@@ -516,6 +517,9 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .chain_windows = chain_windows,
         .audio_vae = dir.fileBytes("audio_vae.safetensors") > 0,
     }, s, &init) catch |err| return job.failure(err, "MiniMax-H3 generation failed")) |v| return v;
+    if (init.pixels != null) log.info("[video] minimax-h3 init_video decoded from the request in {d} ms (base64 + image decode)\n", .{
+        @as(u64, @intCast(init_t0.untilNow(std.Io.Threaded.global_single_threaded.io(), .boot).nanoseconds)) / 1_000_000,
+    });
 
     // The request's own activations price the resident plan; when it does not fit, the staged DiT stage is checked
     // here, before any stage loads, since a Metal OOM mid-step is uncatchable.

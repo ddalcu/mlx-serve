@@ -4322,17 +4322,24 @@ fn generateOne(
     if (req.init) |ic| {
         if (req.pdd != null) return error.InitClipOnPdd;
         if (ic.step < 1 or ic.step >= req.steps) return error.InitStepOutOfRange;
+        var split = LapClock.init(io);
+        var vload_ms: u64 = 0;
+        var venc_ms: u64 = 0;
+        var aenc_ms: u64 = 0;
         {
             var vw = try model_mod.loadWeightsSingleFile(allocator, paths.vae);
             defer vw.deinit();
             var venc = try vae_mod.Encoder.load(allocator, &vw, s);
             defer venc.deinit();
+            try venc.materialize();
+            vload_ms = split.lapMs();
             const lat = try venc.encodeVideo(ic.pixels, allocator, s);
             defer _ = mlx.mlx_array_free(lat);
             const ls = mlx.getShape(lat);
             if (ls[2] != shape.latent_t or ls[3] != lat_h or ls[4] != lat_w) return error.InitLatentShapeMismatch;
             init_video_rows = try patchifyVideo(lat, s);
             try mlx.check(mlx.mlx_array_eval(init_video_rows.?));
+            venc_ms = split.lapMs();
         }
         if (ic.waveform) |wav| {
             const apath = paths.audio_vae orelse return error.InitAudioNeedsAudioVae;
@@ -4344,8 +4351,10 @@ fn generateOne(
             if (zs[2] != 2 or zs[3] != shape.audio_t) return error.InitAudioLengthMismatch;
             init_audio_rows = try audioLatentToRows(z, s);
             try mlx.check(mlx.mlx_array_eval(init_audio_rows.?));
+            aenc_ms = split.lapMs();
         }
         _ = mlx.mlx_clear_cache();
+        log.info("[minimax-h3] init_video split: video VAE load {d} ms, video encode {d} ms, audio load+encode {d} ms\n", .{ vload_ms, venc_ms, aenc_ms });
         log.info("[minimax-h3] init_video encoded: {d} video rows, {s} ({d} ms, encoders released)\n", .{
             mlx.getShape(init_video_rows.?)[0],
             if (init_audio_rows != null) "with its soundtrack" else "no soundtrack",

@@ -40,6 +40,8 @@ the target starts at `(1-σ_k)·x0 + σ_k·noise` (audio at its own clock's σ) 
 - The converted layouts BAKE OUT per-head interleaves; a sparse-attention pattern cannot be tuned into correctness.
 - A two-time DiT keys modulation rows by the PAIR (t, r): at step 0 video and audio share t = 0 but aim at different r.
 - FastH3 VSA: a per-block temporary of GBs is a fresh allocation in the server; pooling and assembly are kernels.
+- The video VAE encode lifts MLX's buffer pool to 32 GB (`vae.PoolLift`): each tile pass frees what the next
+  allocates again, and the server's smaller cap makes it slow; tests run uncapped and never see it.
 
 ## Fixtures
 - `conformanceFixture`: DiT at 64 (two 32-wide heads, one block + one refiner), text encoder at 64, VAE decoder at 32,
