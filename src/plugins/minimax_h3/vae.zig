@@ -28,6 +28,8 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../sdk/weights/load.zig");
 const log = @import("../../sdk/util/log.zig");
+const system = @import("../../sdk/util/system.zig");
+const pool = @import("../../mlx/pool.zig");
 const h3 = @import("h3.zig");
 const geometry = @import("geometry.zig");
 pub const DecCfg = geometry.DecCfg;
@@ -39,14 +41,14 @@ const S = mlx.mlx_stream;
 // ── Reference constants (vae.py MiniMaxH3VideoVAE.__init__) ─────────────────
 
 /// Frames folded into one VAE clip. Drives every temporal constant below.
-pub const CLIP_LENGTH: u32 = 17;
+pub const CLIP_LENGTH: u32 = geometry.VAE_CLIP;
 /// Temporal compression (prod of the encoder's time_down factors).
 pub const VAE_RATIO_T = geometry.VAE_RATIO_T;
 /// Spatial compression.
 pub const VAE_RATIO = geometry.VAE_RATIO;
 pub const TOKEN_DROP: u32 = 3;
 /// Spatial tile extent, in PIXELS.
-pub const TILE_SIZE: u32 = 256;
+pub const TILE_SIZE: u32 = geometry.VAE_TILE;
 
 /// (-clip_length) % ratio_t = 3 — frames shaved off the front of each decode.
 pub const FRAME_PRE_PADDING: u32 = (VAE_RATIO_T - (CLIP_LENGTH % VAE_RATIO_T)) % VAE_RATIO_T;
@@ -1370,38 +1372,6 @@ const EncLevel = struct {
     }
 };
 
-/// MLX buffer-pool cap while an encode runs: each tile pass frees the f32 transients the next one allocates again,
-/// and a smaller pool hands them back to the OS in between.
-pub const ENCODE_POOL_BYTES: usize = 32 << 30;
-
-/// Raises MLX's buffer-pool cap to at least `bytes` (never lowers it) until `end`, which puts the cap back and
-/// returns what the raised pool holds to the OS.
-pub const PoolLift = struct {
-    prev: usize,
-    raised: bool,
-
-    pub fn begin(bytes: usize) PoolLift {
-        var prev: usize = 0;
-        if (mlx.mlx_set_cache_limit(&prev, bytes) != 0) return .{ .prev = 0, .raised = false };
-        if (prev >= bytes) {
-            var t: usize = 0;
-            _ = mlx.mlx_set_cache_limit(&t, prev);
-            return .{ .prev = prev, .raised = false };
-        }
-        return .{ .prev = prev, .raised = true };
-    }
-
-    pub fn end(self: PoolLift) void {
-        if (!self.raised) return;
-        var cached: usize = 0;
-        _ = mlx.mlx_get_cache_memory(&cached);
-        var t: usize = 0;
-        _ = mlx.mlx_set_cache_limit(&t, self.prev);
-        _ = mlx.mlx_clear_cache();
-        log.debug("[minimax-h3-vae] encode pool: {d} MB cached at the end, cap back to {d} MB\n", .{ cached >> 20, self.prev >> 20 });
-    }
-};
-
 pub const Encoder = struct {
     allocator: std.mem.Allocator,
     conv_in_w: mlx.mlx_array,
@@ -1633,8 +1603,8 @@ pub const Encoder = struct {
     /// ladder read from the other end, so a caller that snapped its frame
     /// count to 17k+5 gets exactly `5k+2` latent frames back.
     pub fn encodeVideo(self: *const Encoder, pixels: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
-        const lift = PoolLift.begin(ENCODE_POOL_BYTES);
-        defer lift.end();
+        const lift = pool.Cap.raise(geometry.encodeLiftBytes(system.getTotalMemBytes()));
+        defer lift.restore();
         const pshp = mlx.getShape(pixels);
         const pt: u32 = @intCast(pshp[2]);
         const ph: u32 = @intCast(pshp[3]);
@@ -1834,34 +1804,6 @@ pub const Encoder = struct {
         return outp;
     }
 };
-
-test "minimax h3 vae: an encode raises a tighter buffer-pool cap and puts it back" {
-    const cap = struct {
-        fn now() usize {
-            var c: usize = 0;
-            _ = mlx.mlx_set_cache_limit(&c, 0);
-            var t: usize = 0;
-            _ = mlx.mlx_set_cache_limit(&t, c);
-            return c;
-        }
-        fn set(v: usize) void {
-            var t: usize = 0;
-            _ = mlx.mlx_set_cache_limit(&t, v);
-        }
-    };
-    const orig = cap.now();
-    defer cap.set(orig);
-    cap.set(8 << 30); // the server's cap on a 256 GB Mac
-    const lift = PoolLift.begin(ENCODE_POOL_BYTES);
-    try testing.expectEqual(ENCODE_POOL_BYTES, cap.now());
-    lift.end();
-    try testing.expectEqual(@as(usize, 8 << 30), cap.now());
-    cap.set(64 << 30); // a looser cap is never lowered
-    const kept = PoolLift.begin(ENCODE_POOL_BYTES);
-    try testing.expectEqual(@as(usize, 64 << 30), cap.now());
-    kept.end();
-    try testing.expectEqual(@as(usize, 64 << 30), cap.now());
-}
 
 test "minimax h3 vae: encoder geometry ladder matches the reference config" {
     // block_in = [mid[0]] ++ mid[:-1]; mid = ch * ch_mult.
