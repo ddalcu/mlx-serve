@@ -100,7 +100,7 @@ def chat(base, messages, max_tokens=24, first_token=None, cancel=False):
 
 
 def request(a):
-    msgs = continuation(read(a.seed)) if a.seed else initial_messages()
+    msgs = read(a.cancelled)["continuation"] if a.cancelled else continuation(read(a.seed)) if a.seed else initial_messages()
     result = chat(a.base, msgs, max_tokens=a.max_tokens)
     write(a.output, result)
     print(f"{a.output}: cached={cached(result)}/{result['usage']['prompt_tokens']}, ttft={result['ttft_s']:.3f}s")
@@ -182,17 +182,15 @@ def layout(a):
     until = time.monotonic() + a.wait
     n = boundary(a.boundary)
     while True:
-        records = [(path, meta) for path, meta in module_records(a.root) if meta["n"] == n]
+        records = [(path, meta) for path, meta in module_records(a.root) if meta["n"] == n or (a.at_least and meta["n"] > n)]
         if records:
             for path, meta in records:
                 validate_record(path, meta)
             break
-        require(time.monotonic() < until, f"no complete module record at exact position {n}")
+        require(time.monotonic() < until, f"no complete module record at {'or past ' if a.at_least else 'exact '}position {n}")
         time.sleep(0.1)
     for path, meta in records:
         print(f"v10 module {path}: n={meta['n']}, parts={len(meta['part_bytes'])}, bytes={meta['bytes']}")
-    if a.only:
-        require(all(meta["n"] == n for _, meta in module_records(a.root)), "cancelled continuation committed a replacement record")
     if a.snapshot:
         write(a.snapshot, {str(path.relative_to(cache_root(a.root))): {"meta": meta, "files": record_files(path, meta)}
                            for path, meta in records})
@@ -409,10 +407,11 @@ def cancel(a):
     state = {}
     offset = len(Path(a.log).read_text())
 
+    msgs = initial_messages() + [{"role": "assistant", "content": "Noted."},
+                                 {"role": "user", "content": "Write 4000 numbered lines, one integer per line, starting at one."}]
+
     def follow():
         try:
-            msgs = initial_messages() + [{"role": "assistant", "content": "Noted."},
-                                         {"role": "user", "content": "Write 4000 numbered lines, one integer per line, starting at one."}]
             state["reply"] = chat(a.base, msgs, max_tokens=8192, cancel=True,
                                   first_token=lambda: state.update(dirty=not bool(module_records(a.root))))
         except Exception as error:
@@ -424,7 +423,7 @@ def cancel(a):
     # restore. Starting at once keeps the idle window (and its export) short; a missed window SKIPs.
     seed = chat(a.base, initial_messages(), max_tokens=1)
     thread.start()
-    write(a.output, seed)
+    write(a.output, dict(seed, continuation=msgs))
     thread.join(timeout=1200)
     require(not thread.is_alive(), "continuation did not start")
     require("error" not in state, f"continuation failed: {state}")
@@ -475,7 +474,7 @@ def unit_owners(_):
         ("cache/prefix_cache.zig", "shutdown stops after one overdue module file"),
         ("cache/ssd/disk_tier.zig", "v10 module records are isolated from every KV entry point"),
         ("cache/ssd/disk_tier.zig", "v2 through v9 KV scans retain contiguous chunk salvage"),
-        ("cache/prefix_cache.zig", "failed and cancelled requests leave the old module export owed"),
+        ("cache/prefix_cache.zig", "failed and cancelled requests keep the restored module entry and its export owed"),
     ]:
         print(f'  src/engines/mlx/{filename}: test "{name}"')
 
@@ -484,7 +483,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     specs = {
-        "request": (request, "base output", "seed"),
+        "request": (request, "base output", "seed cancelled"),
         "result": (result, "", "boundary cold log source"),
         "layout": (layout, "root boundary", "snapshot"),
         "preserved": (preserved, "root snapshot", ""),
@@ -511,7 +510,7 @@ def main():
         "result": [("result", {}), ("--cached", {"type": int})],
         "kv-result": [("result", {})],
         "disabled": [("--reason", {"action": "store_true"})],
-        "layout": [("--wait", {"type": float, "default": 0}), ("--only", {"action": "store_true"})],
+        "layout": [("--wait", {"type": float, "default": 0}), ("--at-least", {"action": "store_true"})],
         "request": [("--max-tokens", {"type": int, "default": 24})],
         "port-free": [("--port", {"required": True, "type": int})],
         "mem-wait": [("--timeout", {"type": float, "default": 180})],
