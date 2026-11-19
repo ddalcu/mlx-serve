@@ -37,7 +37,7 @@ extern fn q3ld_test_delay(seed: u64, max_ns: i64) void;
 extern fn q3ld_test_spec_delay(max_ns: i64) void;
 
 
-const counters_n = 84;
+const counters_n = 82;
 const sc_started = 3;
 const sc_landed = 4;
 const sc_failed = 5;
@@ -264,7 +264,7 @@ fn sleepMs(n: i64) void {
 }
 
 test "demand_first: the setting's modes, the pool's ABI and its counters' count" {
-    try testing.expectEqual(@as(i32, 2026111801), q3ld_abi());
+    try testing.expectEqual(@as(i32, 2026110203), q3ld_abi());
     for ([_]i32{ -1, 3, 7 }) |m| try testing.expectEqual(@as(c_int, -1), q3ld_demand_first(m));
     var df: [df_n]i64 = @splat(0);
     try testing.expectEqual(@as(i32, df_n), q3ld_df_stats(&df, 0));

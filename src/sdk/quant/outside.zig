@@ -275,9 +275,6 @@ pub const Bank = struct {
             .source_decode_expand = if (offers(b, .rows_decode_expand)) C.expand(.rows_decode_expand) else null,
             .next_fn = if (offers(b, .next_ahead)) C.nextAhead else null,
             .source_hoist = if (offers(b, .rows_hoist)) C.rowsHoist else null,
-            // a pair: offered only together
-            .ahead_score_fn = if (offers(b, .ahead_score) and offers(b, .ahead_issue)) C.aheadScore else null,
-            .ahead_issue_fn = if (offers(b, .ahead_score) and offers(b, .ahead_issue)) C.aheadIssue else null,
         };
     }
 
@@ -337,14 +334,6 @@ pub const Bank = struct {
         fn settle(ctx: *anyopaque) routed_mod.Ret(void) {
             const b = &of(ctx).b;
             return ret(b.settle(b.ctx));
-        }
-        fn aheadScore(ctx: *anyopaque, layer: u32, x: A) routed_mod.Ret(void) {
-            const b = &of(ctx).b;
-            return ret(b.ahead_score.?(b.ctx, layer, .{ .ctx = x.ctx }));
-        }
-        fn aheadIssue(ctx: *anyopaque, layer: u32) routed_mod.Ret(void) {
-            const b = &of(ctx).b;
-            return ret(b.ahead_issue.?(b.ctx, layer));
         }
         fn phase(ctx: *anyopaque, prompt: bool) routed_mod.Ret(void) {
             const self = of(ctx);
@@ -571,34 +560,6 @@ const ToyBank = struct {
         out.size = @offsetOf(abi.Bank, "rows_hoist");
         return v;
     }
-    /// A bank that offers the decode read-ahead pair; `openAheadHalf` only its first member.
-    fn openAhead(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
-        const v = open(ctx, geo, budget, out);
-        out.ahead_score = &aheadScore;
-        out.ahead_issue = &aheadIssue;
-        return v;
-    }
-    fn openAheadHalf(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
-        const v = open(ctx, geo, budget, out);
-        out.ahead_score = &aheadScore;
-        return v;
-    }
-    fn openBeforeAhead(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
-        const v = openAhead(ctx, geo, budget, out);
-        out.size = @offsetOf(abi.Bank, "ahead_score");
-        return v;
-    }
-    var scored: ?*anyopaque = null;
-    var issued: u32 = 0;
-    fn aheadScore(_: ?*anyopaque, layer: u32, x: abi.Array) callconv(.c) common.Verdict {
-        if (layer != 1) return common.Verdict.named(.failed, "NotFirstRouted");
-        scored = x.ctx;
-        return .ok;
-    }
-    fn aheadIssue(_: ?*anyopaque, layer: u32) callconv(.c) common.Verdict {
-        issued += layer;
-        return .ok;
-    }
     var hoisted: ?*anyopaque = null;
     fn rowsHoist(_: ?*anyopaque, _: u32, _: abi.Array, _: abi.Array, _: abi.Array, hoist: abi.Array, out: *abi.Array) callconv(.c) common.Verdict {
         hoisted = hoist.ctx;
@@ -705,31 +666,4 @@ test "outside quant: a bank's hoisted decode call reads as Routed.source_hoist, 
     const before = (try f.openBank(geo, .{ .prompt = 1000, .decode = 1000 })).?;
     try testing.expect(before.routed().source_hoist == null and before.routed().rows_independent);
     before.close();
-}
-
-test "outside quant: a bank's decode read-ahead pair reads as Routed's, offered only whole and only where its size reaches it" {
-    const err_name = @import("../util/err_name.zig");
-    var table = Toy.table;
-    table.bank_rows = &ToyBank.rows;
-    table.open_bank = &ToyBank.openAhead;
-    const f: Format = .{ .a = testing.allocator, .t = &table, .config = &.{}, .block = &.{}, .source = undefined, .ctx = undefined };
-    const gates = [2]abi.BankGate{ .{}, .{} };
-    const geo: abi.BankGeometry = .{ .hidden = 8, .inter = 4, .top_k = 2, .n_experts = 16, .n_layers = 2, .gates = &gates };
-    var x: u8 = 0;
-    const b = (try f.openBank(geo, .{ .prompt = 1000, .decode = 1000 })).?;
-    const r = b.routed();
-    try r.ahead_score_fn.?(r.ctx, 1, .{ .ctx = &x }).get();
-    try testing.expectEqual(@as(?*anyopaque, &x), ToyBank.scored);
-    try r.ahead_issue_fn.?(r.ctx, 1).get();
-    try testing.expectEqual(@as(u32, 1), ToyBank.issued);
-    try testing.expectError(error.EngineFailed, r.ahead_score_fn.?(r.ctx, 0, .{ .ctx = &x }).get());
-    try testing.expectEqualStrings("NotFirstRouted", err_name.last());
-    b.close();
-    // Half a pair, a bank built before the pair, and the default bank: neither member.
-    for ([_]@TypeOf(table.open_bank){ &ToyBank.openAheadHalf, &ToyBank.openBeforeAhead, &ToyBank.open }) |open| {
-        table.open_bank = open;
-        const o = (try f.openBank(geo, .{ .prompt = 1000, .decode = 1000 })).?;
-        try testing.expect(o.routed().ahead_score_fn == null and o.routed().ahead_issue_fn == null);
-        o.close();
-    }
 }

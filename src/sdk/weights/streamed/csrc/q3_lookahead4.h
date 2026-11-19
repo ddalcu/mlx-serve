@@ -51,9 +51,6 @@ int64_t q3ld_monotonic_ns(void);
 int q3ld_spec_config(int32_t nthreads, const uint64_t *bufs, int32_t nslots, int64_t slot_bytes, int64_t rec_len,
                      int64_t chunk, int64_t *counters);
 int q3ld_spec_streams(int32_t idle_busy);   /* stopped pool, after spec_config: 0 or 1; 0 or -1 */
-/* Stopped pool: a range adopted from a speculative record is copied into its rows in up to n pieces, idle workers
- * taking some (2 .. MAX_WORKERS; 0 or 1 the one memcpy); the range publishes after its last piece.  0 or -1. */
-int q3ld_adopt_pieces(int32_t n);
 int q3ld_gu_split(int32_t mode);           /* dq1b: any time: 0 off, 1 the gate/up ranges in two jobs; 0 or -1 */
 int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t psize,
                int64_t *res_arr, int64_t n_tickets, int64_t *log_arr, int64_t n_log, int64_t *gauge_arr);
@@ -104,7 +101,7 @@ int32_t q3ld_ev_state(int64_t *out);        /* 10 words; returns the live gate c
 int q3ld_parts_config(int64_t block);
 /* PARTS' phase switch, at any time: 1 (the default) the route as configured, 0 every range staged.  0. */
 int q3ld_parts_live(int32_t on);
-int32_t q3ld_abi(void);                     /* 2026111801 */
+int32_t q3ld_abi(void);                     /* 2026110202 */
 int32_t q3ld_max_gates(void);
 int32_t q3ld_max_gate_tickets(void);
 int32_t q3ld_max_pre(void);
@@ -123,7 +120,6 @@ void q3ld_mtl_signal(void *event, uint64_t value);
 void q3ld_test_rules(int32_t n, const int64_t *off, const int64_t *code, const int64_t *arg);
 void q3ld_test_delay(uint64_t seed, int64_t max_ns);
 void q3ld_test_spec_delay(int64_t max_ns);
-void q3ld_test_copy_delay(int64_t ns);      /* a sleep before each piece of an adopted copy in pieces */
 /* The speculative hold: `starts` >= 0 turns it on with that many records still allowed to start (-1 turns it off);
  * a started unclaimed record's chunk waits at its start while it is on (a claim or the hold's end lets it go).
  * q3ld_test_spec_held waits until n records wait there: 0, or 1 at the timeout. */

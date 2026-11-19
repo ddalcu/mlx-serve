@@ -13,9 +13,6 @@ pub const q3ld = struct {
     pub fn q3ld_spec_streams(_: i32) c_int {
         return -1;
     }
-    pub fn q3ld_adopt_pieces(_: i32) c_int {
-        return -1;
-    }
     pub fn q3ld_gu_split(_: i32) c_int {
         return -1;
     }
@@ -112,7 +109,6 @@ pub const q3ld = struct {
     }
     pub fn q3ld_test_rules(_: i32, _: [*]const i64, _: [*]const i64, _: [*]const i64) void {}
     pub fn q3ld_test_delay(_: u64, _: i64) void {}
-    pub fn q3ld_test_copy_delay(_: i64) void {}
     pub fn q3ld_test_ev_log(_: ?[*]i64, _: i64) i64 {
         return 0;
     }

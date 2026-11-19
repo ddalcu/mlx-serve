@@ -25,7 +25,6 @@ const policy = @import("policy.zig");
 const c = if (builtin.os.tag == .macos) struct {
     pub extern fn q3ld_spec_config(nthreads: i32, bufs: ?[*]const u64, nslots: i32, slot_bytes: i64, rec_len: i64, chunk: i64, counters: ?[*]i64) c_int;
     pub extern fn q3ld_spec_streams(idle_busy: i32) c_int;
-    pub extern fn q3ld_adopt_pieces(n: i32) c_int;
     pub extern fn q3ld_gu_split(mode: i32) c_int;
     pub extern fn q3ld_demand_first(mode: i32) c_int;
     pub extern fn q3ld_df_stats(out: *[df_n]i64, n: i32) i32;
@@ -61,7 +60,6 @@ const c = if (builtin.os.tag == .macos) struct {
     /// Q3LD_INJECT builds (the test module) only.
     pub extern fn q3ld_test_rules(n: i32, off: [*]const i64, code: [*]const i64, arg: [*]const i64) void;
     pub extern fn q3ld_test_delay(seed: u64, max_ns: i64) void;
-    pub extern fn q3ld_test_copy_delay(ns: i64) void;
     pub extern fn q3ld_test_ev_log(buf: ?[*]i64, cap: i64) i64;
 } else @import("io_stub.zig").q3ld;
 
@@ -72,14 +70,13 @@ pub const test_abi = if (builtin.is_test) struct {
     pub const status_words = res_w;
 } else struct {};
 
-/// The C pool's ABI (`q3ld_abi`): 2026111801, the adopted copy in pieces (`q3ld_adopt_pieces`, `Spec.adopt_pieces`;
-/// the `adopt_split` and `adopt_helped` counters); 2026110203, the df1 (`q3ld_demand_first`, `Pool.demandFirst`: the lookahead's
+/// The C pool's ABI (`q3ld_abi`): 2026110203, the df1 (`q3ld_demand_first`, `Pool.demandFirst`: the lookahead's
 /// reads behind demand; `q3ld_df_stats`); 2026110202, the dq1b (`q3ld_gu_split`, `Pool.guSplit`: each record's gate/up
 /// range read as two range jobs of one ticket; the `split_*` counters; ten status words a ticket: `Result.lookahead` and
 /// `Result.wait_ns`); 2026110101, the PARTS route (`Options.parts_block`) and its counters (2026102401:
 /// SCATTER ranges; 2026101401: DIRECT reads as a construction-time route; 2026101201: the submit-wide WITHDRAW over the
 /// range-job queue).
-pub const abi_version = 2026111801;
+pub const abi_version = 2026110203;
 /// df1's counters (`q3ld_df_stats`, the C pool's DF_* order): unclaimed lookahead reads made in pieces; unclaimed records
 /// stopped for demand inside one of the lane's chunks and the rest of those chunks (bytes); mode 2: runs of a claimed
 /// record's pieces read by a demand worker, their bytes and time (ns), records landed by a demand worker, claimed records
@@ -199,12 +196,9 @@ pub const Counter = enum(u8) {
     split_pre_issued = 79,
     split_span_ns = 80,
     split_overlap_ns = 81,
-    /// `Spec.adopt_pieces`: adopted ranges copied in pieces, and the pieces a worker other than the adopting one copied.
-    adopt_split = 82,
-    adopt_helped = 83,
 };
 
-pub const counters_n = 84;
+pub const counters_n = 82;
 /// The speculative class: `slots` staging slots of `slotBytes(record_bytes)`,
 /// read by `threads` threads in `chunk_bytes` preadv steps.
 pub const Spec = struct {
@@ -216,9 +210,6 @@ pub const Spec = struct {
     /// Queue rule of speculative threads >= 1: an unclaimed chunk starts only
     /// while at most this many demand jobs execute (0 = demand idle).
     idle_busy: u32 = 0,
-    /// A range adopted from a speculative record is copied into its rows in up to this many pieces, the idle workers
-    /// taking some (`q3ld_adopt_pieces`): the same bytes into the same rows. 0 or 1: one memcpy; at most `max_workers`.
-    adopt_pieces: u32 = 0,
 };
 
 pub const Options = struct {
@@ -401,7 +392,7 @@ pub const Pool = struct {
         if (opt.workers == 0 or opt.workers > max_workers or opt.staging_bytes == 0 or opt.staging_bytes % page != 0 or opt.tickets < 2 * max_items)
             return error.InvalidOptions;
         if (opt.spec) |s| if (s.threads == 0 or s.threads > max_spec_threads or s.slots == 0 or s.slots > max_spec or s.record_bytes == 0 or
-            s.chunk_bytes == 0 or s.chunk_bytes % page != 0 or s.idle_busy > 1 or s.adopt_pieces > max_workers) return error.InvalidOptions;
+            s.chunk_bytes == 0 or s.chunk_bytes % page != 0 or s.idle_busy > 1) return error.InvalidOptions;
         var df_probe: [df_n]i64 = @splat(0);
         if (c.q3ld_abi() != abi_version or c.q3ld_counters_n() != counters_n or c.q3ld_max_spec() != max_spec or c.q3ld_max_pre() != max_pre or
             c.q3ld_max_gates() != max_gates or c.q3ld_max_gate_tickets() != max_gate_tickets or c.q3ld_df_stats(&df_probe, 0) != df_n) return error.PoolAbi;
@@ -437,7 +428,6 @@ pub const Pool = struct {
         if (c.q3ld_spec_config(threads, &bufs, nslots, @intCast(slot_bytes), rec_len, @intCast(if (opt.spec) |s| s.chunk_bytes else 0), &self.counters) != 0)
             return error.PoolUnavailable;
         if (opt.spec) |s| if (c.q3ld_spec_streams(@intCast(s.idle_busy)) != 0) return error.PoolUnavailable;
-        if (opt.spec) |s| if (c.q3ld_adopt_pieces(@intCast(s.adopt_pieces)) != 0) return error.PoolUnavailable;
         if (c.q3ld_direct_config(@intFromBool(opt.direct)) != 0) return error.PoolUnavailable;
         if (c.q3ld_parts_config(@intCast(opt.parts_block)) != 0) return error.PoolUnavailable;
         var ptrs: [max_workers]u64 = undefined;

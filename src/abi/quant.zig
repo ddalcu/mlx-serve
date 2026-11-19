@@ -218,15 +218,6 @@ pub const Bank = extern struct {
     /// `rows`' sum word for word; the model adds `hoist` itself. Null: not offered. Appended: read only where `size`
     /// reaches it.
     rows_hoist: ?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, hoist: Array, out: *Array) callconv(.c) Verdict = null,
-    /// A decode window's read-ahead of `layer`, a routed layer no routed call comes before in the forward (the first):
-    /// `ahead_score` takes the window's normed input `x` `[.., rows, hidden]` to the MLP of the layer before it, scores
-    /// `layer`'s router on it and commits the scores without a host wait; `ahead_issue`, once the model has committed
-    /// `layer`'s attention behind them, reads them back and reads `layer`'s likely records ahead of its route. Reads
-    /// only: the routes and the sums are the same. A prompt pass: nothing. Null: not offered. Appended: read only where
-    /// `size` reaches them.
-    ahead_score: ?*const fn (ctx: ?*anyopaque, layer: u32, x: Array) callconv(.c) Verdict = null,
-    /// `ahead_score`'s second half: the scores read back and `layer`'s likely records read ahead. Null: not offered.
-    ahead_issue: ?*const fn (ctx: ?*anyopaque, layer: u32) callconv(.c) Verdict = null,
 };
 
 pub const Swiglu = extern struct {
@@ -288,14 +279,6 @@ test "abi quant: a bank's hoisted decode call is declared after every earlier me
     try testing.expect(@offsetOf(Bank, "rows_hoist") > @offsetOf(Bank, "rows_independent"));
     const b: Bank = .{ .close = undefined, .decode_ids = 1, .rows = undefined, .settle = undefined, .phase = undefined, .read_ahead = undefined };
     try testing.expect(b.rows_hoist == null);
-}
-
-test "abi quant: a bank's decode read-ahead pair is declared after every earlier member" {
-    // Appended: a bank built before them ends at `ahead_score`, and the host reads both as not offered.
-    try testing.expect(@offsetOf(Bank, "ahead_score") > @offsetOf(Bank, "rows_hoist"));
-    try testing.expect(@offsetOf(Bank, "ahead_issue") > @offsetOf(Bank, "ahead_score"));
-    const b: Bank = .{ .close = undefined, .decode_ids = 1, .rows = undefined, .settle = undefined, .phase = undefined, .read_ahead = undefined };
-    try testing.expect(b.ahead_score == null and b.ahead_issue == null);
 }
 
 test "abi quant: a source's release is called only where its size reaches it" {

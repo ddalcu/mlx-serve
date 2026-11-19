@@ -21,8 +21,8 @@ extern fn q3ld_abi() i32;
 extern fn q3ld_counters_n() i32;
 
 
-const abi = 2026111801;
-const counters_n = 84;
+const abi = 2026110203;
+const counters_n = 82;
 /// The pool's SC_PARTS_DIRECT, SC_PARTS_DIRECT_BYTES, SC_PARTS_STAGED_BYTES.
 const sc_parts = 72;
 const res_w = 10;

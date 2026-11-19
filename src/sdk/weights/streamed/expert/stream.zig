@@ -791,9 +791,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// demand jobs run (0 = demand idle).
             idle_busy: u32 = 0,
             preread: bool = true,
-            /// A range adopted from a lookahead record is copied into its rows in up to this many pieces, the pool's idle
-            /// workers taking some (`expert_io.Spec.adopt_pieces`; 0, one memcpy). Only who copies moves.
-            adopt_pieces: u32 = 0,
         };
 
         pub const Event = struct {
@@ -1176,7 +1173,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         la.budget == 0 or la.budget > expert_lookahead.max_budget) return error.InvalidOptions;
                     const page = std.heap.pageSize();
                     const record = spanOf(&bank.layers[widest]);
-                    spec = .{ .threads = @min(la.budget, 2), .slots = 2 * la.budget, .record_bytes = record, .chunk_bytes = expert_io.chunkBytes(la.chunks, record, page), .idle_busy = la.idle_busy, .adopt_pieces = la.adopt_pieces };
+                    spec = .{ .threads = @min(la.budget, 2), .slots = 2 * la.budget, .record_bytes = record, .chunk_bytes = expert_io.chunkBytes(la.chunks, record, page), .idle_busy = la.idle_busy };
                     // A pre-read range is the record's gate/up span or its down span,
                     // back to back, each no larger than a staging buffer.
                     if (la.preread) for (bank.layers) |l| {
@@ -1985,51 +1982,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             pub fn speculateLate(self: *Stream, r: *const Route, scores: []const f32) Error!void {
                 if (self.failed or !self.route_lookahead) return;
                 return self.speculate(r, scores);
-            }
-
-            /// Routed layer `routed`'s likely records read ahead before its route, from `scores` (its router on a decode
-            /// window's rows, rows x n_experts f32, made before the layer before it routes: the first routed layer has no
-            /// route before it to predict it): `speculate`'s step with no route of its own, its records tagged for the
-            /// coming route, whose demand reads claim them and whose own step settles the rest. Returns the records read
-            /// ahead: none outside the decode phase, without the lookahead, with no scores or past the last routed layer.
-            pub fn speculateAhead(self: *Stream, routed: u32, scores: []const f32) Error!usize {
-                if (self.failed) return error.StreamFailed;
-                if (!self.route_lookahead or self.phase != .decode or scores.len == 0 or self.selector == null) return 0;
-                const sel = &self.selector.?;
-                var chosen: [expert_lookahead.max_budget]u16 = undefined;
-                var ranks: [expert_lookahead.max_budget]u8 = undefined;
-                var bases: [expert_lookahead.max_budget]i64 = undefined;
-                if (comptime multi_bank) {
-                    const bpl = B.banks_per_layer;
-                    if (routed >= self.layers.len / bpl) return 0;
-                    const Ctx = struct { s: *const Stream, routed: u32 };
-                    const resident = struct {
-                        fn f(cx: Ctx, e: u16) bool {
-                            const sl = cx.s.bank.streamLayer(cx.routed, e);
-                            return cx.s.layers[sl].policy.slotOf(e) != null;
-                        }
-                    }.f;
-                    const picked = sel.selectWith(scores, Ctx{ .s = self, .routed = routed }, resident, chosen[0..sel.budget], ranks[0..sel.budget]);
-                    var lens: [expert_lookahead.max_budget]i64 = undefined;
-                    var side: [expert_lookahead.max_budget]u8 = undefined;
-                    for (picked, 0..) |e, i| {
-                        const sl = self.bank.streamLayer(routed, e);
-                        bases[i] = @intCast(self.bank.recordOffset(sl, e));
-                        lens[i] = @intCast(spanOf(&self.bank.layers[sl]));
-                        side[i] = @intCast(sl - bpl * routed);
-                    }
-                    self.notePending(routed, picked, ranks[0..picked.len], side[0..picked.len]);
-                    _ = self.pool.specStepLens(self.bank.sidecar, self.clock, bases[0..picked.len], lens[0..picked.len]) catch
-                        return self.fail(error.SpecRefused);
-                    return picked.len;
-                }
-                if (routed >= self.layers.len) return 0;
-                const picked = sel.selectWith(scores, &self.layers[routed].policy, expert_lookahead.residentIn, chosen[0..sel.budget], ranks[0..sel.budget]);
-                for (picked, 0..) |e, i| bases[i] = @intCast(self.bank.recordOffset(routed, e));
-                self.notePending(routed, picked, ranks[0..picked.len], null);
-                _ = self.pool.specStep(self.bank.sidecar, self.clock, bases[0..picked.len], spanOf(&self.bank.layers[routed])) catch
-                    return self.fail(error.SpecRefused);
-                return picked.len;
             }
 
             /// `speculate` for a bank of several bank layers per routed layer (`B.banks_per_layer`): the next routed
@@ -3929,11 +3881,6 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// the read pool's demand-first order for the reads from here on (`expert_io.Pool.demandFirst`).
             pub fn demandFirst(self: *Stream, mode: u32) void {
                 self.pool.demandFirst(mode);
-            }
-            /// Since the pool's start (`Lookahead.adopt_pieces`): adopted ranges copied in pieces, and the pieces a worker
-            /// other than the adopting one copied.
-            pub fn adoptStats(self: *const Stream) [2]i64 {
-                return .{ self.pool.counter(.adopt_split), self.pool.counter(.adopt_helped) };
             }
 
             pub fn stats(self: *Stream) Stats {
