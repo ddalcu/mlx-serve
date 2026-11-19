@@ -28,3 +28,21 @@ Every tensor in the 148-shard pack opens, validates against the config bill, and
 
 ## Verification (plan-level)
 Load succeeds on the 512 GB host with the real pack (log line: bill == measured within tolerance); unload returns memory; unit tests green on hermetic fixtures; kernel-digest registration unchanged (no kernels yet).
+
+## Execution notes (2026-11-19) — committed 07eb701b
+
+- Task 1 + the Engram-open half of Task 2 landed: `weights.zig` (load/Holder/validate with the
+  packed-or-dense dual-arm checks, pread `Engram` tables over shard header ranges, per-stage
+  error sets so refusals name what failed), `fixture.zig` (the conformance micro-pack; the
+  subject returns null until Plan 03's forward), `loader_test.zig` (real-pack census, tiny-pack
+  load through the SDK loader AND the table-open arm, and a missing-tensor refusal test).
+- `engram_layer_ids` and the head-vocab lists are HF (1-based): config stores pack index
+  `id-1` (matches omlx's `block + 1`), and `engram_table_rows` (head-vocab sums, pack-indexed)
+  is cross-checked against the pack's tensor rows at load — refused, never clamped.
+- The engram row is 60 B (12 U32 codes + 3 bf16 scales + 3 bf16 biases); the bill test pins the
+  39.60 GB census within 0.1% and the resident bill = shards − that figure.
+- The 33 GB `biases` [AMBIGUOUS] line: the pack's tables carry per-row scale+bias pairs as
+  documented above; Plan 05's gather math confirms the fp8-embedding reading.
+- Carried to Task 2's second half (wave 2): eviction/LRU policy + a constrained-RAM load test;
+  kernel digest registrations ride Plan 04 (first kernel copy).
+
