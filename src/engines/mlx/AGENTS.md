@@ -162,6 +162,7 @@ Spec decode:
 - **A forward asked for hidden rows returns them or refuses** (`Forward.want_hidden`): the driver fails an `.ok` with none (`no hidden rows`); `/v1/embeddings` refuses a module-owned-state model by name before any forward.
 - **Round cost is MEASURED** (`round_cost.zig`): per model/width/KV bucket from solo SINGLE-CHUNK rounds; `tok` is a workload MIXTURE (plan on `planTok`); per-silicon rows are COLD-START caps (`mtp_depth_free`), never deleted.
 - **Table hygiene**: interleaved prefill drops the round clock; refuse past `IMPLAUSIBLE_STEP` 1.5x / `SELF_SPIKE` 3x at fold AND load; load sweep also `IMPLAUSIBLE_WIDER` 1.25x (#382). Persistence OPT-IN (`MLX_SERVE_ROUND_COST_PERSIST=1`), keyed on chip/model/quant/OS/engine build.
+- **A warm-up request teaches the round-cost table nothing** (`Generator.warm` from `Slot.warm`): its rounds time first-use compiles, and a cold first cell kept a fresh build's Flash Next drafting 2 wide for its first requests.
 - **Width trials** (`mtpWidthTrialTarget`): m_lo then m_lo+1, NEVER m_lo−1; `[spec-stats]` carries `width_trials= table=`.
 - **Auto MTP depth**: below 8192 KV plan tokens from acceptance EMAs + table round TIME in ONE chunk (`MtpDepthPolicy.accept`); past 8k legacy. Rank policies in `src/engines/mlx/spec/mtp_replay_test.zig`, never live tok/s.
 - **The adaptive serial switch serves sidecar heads too** (`mtpSerialProbeEarned`: 16 rounds, EMA < 2.0, floor 32k KV).
