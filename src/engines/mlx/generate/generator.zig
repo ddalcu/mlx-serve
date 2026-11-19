@@ -996,6 +996,8 @@ pub const Generator = struct {
     pub const nextChoiceStep = @import("step.zig").nextChoiceStep;
     pub const nextConstrained = @import("step.zig").nextConstrained;
     pub const nextConstrainedToken = @import("step.zig").nextConstrainedToken;
+    pub const constrainedCapStop = @import("step.zig").constrainedCapStop;
+    pub const drawConstrained = @import("step.zig").drawConstrained;
     pub const checkStop = @import("step.zig").checkStop;
     pub const startAsyncForward = @import("step.zig").startAsyncForward;
 };

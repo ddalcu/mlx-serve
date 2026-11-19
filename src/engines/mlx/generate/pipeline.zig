@@ -10,8 +10,6 @@ const ssmRestore = transformer_mod.ssmRestore;
 const Generator = @import("generator.zig").Generator;
 const applyPenalties = @import("../sampling/filters.zig").applyPenalties;
 const sampleTokenLazy = @import("../sampling/lazy.zig").sampleTokenLazy;
-const applyGrammarMask = @import("../sampling/sampler.zig").applyGrammarMask;
-const tokenStops = @import("../../../sdk/request/stops.zig").tokenStops;
 
 
 /// One pipelined step's recurrent state: the position it describes and a refcount snapshot per layer.
@@ -94,31 +92,9 @@ pub fn joinBatch(self: *Generator, allocator: std.mem.Allocator) !Join {
 /// stop short of forwarding or emitting it.
 fn joinBatchConstrained(self: *Generator, allocator: std.mem.Allocator) !Join {
     std.debug.assert(!self.has_pending_token and self.has_pending_logits);
-    const constraint = self.sampling.constraint.?;
-    const step_logits = self.pending_logits;
-    self.has_pending_logits = false;
-    defer _ = mlx.mlx_array_free(step_logits);
-    if (self.step >= self.max_tokens or self.stall.expired(self.timer.read(), self.generated_ids.items.len, self.timeout_ns)) {
-        self.done = true;
-        self.finish_reason = "length";
-        return .stopped;
-    }
-    try constraint.fillPayloadMask(self.eos_token_ids);
-    var masked = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(masked);
-    try applyGrammarMask(allocator, &masked, step_logits, constraint.mask_buf, self.xfm.s);
-    const lazy = self.sampleLazy(masked);
-    defer _ = mlx.mlx_array_free(lazy);
-    try mlx.check(mlx.mlx_array_eval(lazy));
-    var val: i32 = 0;
-    try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
-    self.next_token_id = @intCast(val);
-    if (tokenStops(self.next_token_id, self.eos_token_ids, &self.consecutive_pad)) {
-        self.done = true;
-        self.finish_reason = "stop";
-        return .stopped;
-    }
-    try noteBatchedSample(self, self.next_token_id);
+    if (self.constrainedCapStop()) return .stopped;
+    const d = (try self.drawConstrained(allocator, self.sampling.constraint.?, false)) orelse return .stopped;
+    try noteBatchedSample(self, d.token);
     return .{ .joined = null };
 }
 
