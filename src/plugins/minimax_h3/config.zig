@@ -171,13 +171,49 @@ pub fn billLoad(dir: *const abi.PackDir, m: *const abi.Machine) callconv(.c) u64
     return peakBytes(dir.fileBytes("text_encoder.safetensors"), dit, dir.fileBytes("video_vae.safetensors"), dir.fileBytes("audio_vae.safetensors"));
 }
 
-/// No reserve beyond the model's own estimate (legacy set none): the step itself refuses a canvas that does not fit,
-/// by name, against live memory (`canvasBill`).
+/// What the init_video encode holds beside the video VAE: the pool it lifts (`h3.encodeLiftBytes`), one tile pass
+/// above that, and the clip's own copies. It runs before the text encoder loads.
+pub fn encodeBytes(width: u32, height: u32, frames: u32, total_ram: u64) u64 {
+    return h3.encodeLiftBytes(total_ram) + h3.encodePassBytes() + h3.encodeClipBytes(width, height, frames);
+}
+
+/// A request with `init_video` reserves its encode stage too: the video VAE (its file bills the f32 encoder, which
+/// is smaller) plus `encodeBytes`. Any other request reserves the load's peak (0 here); the step refuses a canvas that
+/// does not fit against live memory, by name (`canvasBill`).
 pub fn billRequest(dir: *const abi.PackDir, m: *const abi.Machine, body: abi.Str) callconv(.c) u64 {
-    _ = dir;
-    _ = m;
-    _ = body;
-    return 0;
+    const c = initCanvas(body.slice()) orelse return 0;
+    const frames = h3.temporalShape(c.frames).frame_count;
+    return @max(billLoad(dir, m), dir.fileBytes("video_vae.safetensors") + encodeBytes(c.width, c.height, frames, m.ram_total));
+}
+
+const InitCanvas = struct { width: u32 = h3.DEFAULT_SIDE, height: u32 = h3.DEFAULT_SIDE, frames: u32 = h3.DEFAULT_FRAMES };
+
+/// The canvas of a body that carries `init_video`, read without copying its frames; null without one.
+fn initCanvas(body: []const u8) ?InitCanvas {
+    var stack: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&stack);
+    var sc = std.json.Scanner.initCompleteInput(fba.allocator(), body);
+    if ((sc.next() catch return null) != .object_begin) return null;
+    var c: InitCanvas = .{};
+    var has_init = false;
+    while (true) {
+        const key = switch (sc.next() catch return null) {
+            .string => |k| k,
+            else => break,
+        };
+        const field: ?*u32 = if (std.mem.eql(u8, key, "width")) &c.width else if (std.mem.eql(u8, key, "height")) &c.height else if (std.mem.eql(u8, key, "num_frames")) &c.frames else null;
+        if (field) |f| {
+            switch (sc.next() catch return null) {
+                .number => |n| f.* = std.fmt.parseInt(u32, n, 10) catch f.*,
+                .array_begin, .object_begin => return null,
+                else => {},
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, key, "init_video")) has_init = (sc.peekNextTokenType() catch return null) != .null;
+        sc.skipValue() catch return null;
+    }
+    return if (has_init) c else null;
 }
 
 test "h3 staged-residency peak bills the BIGGEST stage, never a sum of disjoint ones" {
@@ -343,4 +379,28 @@ test "h3 two-time packs: the schedule and gate come from config.json, and a grid
         "{\"two_time\":{\"gate\":0.25,\"default_steps\":2,\"sigma_grids\":{\"2\":[1.0,0.0,0.4]}}}",
         "{\"two_time\":{\"default_steps\":2,\"sigma_grids\":{\"2\":[1.0,0.4,0.0]}}}",
     }) |bad| try std.testing.expectError(error.BadPackConfig, geometry(a, bad));
+}
+
+test "h3 init_video bill: a request with a clip reserves its encode stage, read without copying the frames" {
+    const GB: u64 = 1 << 30;
+    const mem: @import("../../sdk/testing/fixture.zig").MemDir = .{ .files = &.{.{ .name = "video_vae.safetensors", .bytes = "12345678" }} };
+    const d = mem.packDir();
+    const big: abi.Machine = .{ .ram_total = 256 * GB };
+    const body = "{\"prompt\":\"a \\\"b\\\"\",\"width\":1344,\"height\":768,\"num_frames\":124,\"init_video\":{\"frames\":[\"iVBO\\/R\",\"x\"],\"audio\":\"UklG\"},\"init_step\":3}";
+    try std.testing.expectEqual(8 + encodeBytes(1344, 768, 124, 256 * GB), billRequest(&d, &big, .of(body)));
+    try std.testing.expectEqual(8 + encodeBytes(h3.DEFAULT_SIDE, h3.DEFAULT_SIDE, h3.DEFAULT_FRAMES, 256 * GB), billRequest(&d, &big, .of("{\"init_video\":{\"frames\":[]}}")));
+    // A small-RAM Mac bills no pool lift: it never gets one.
+    try std.testing.expectEqual(8 + h3.encodePassBytes() + h3.encodeClipBytes(1344, 768, 124), billRequest(&d, &.{ .ram_total = 16 * GB }, .of(body)));
+    try std.testing.expectEqual(@as(u64, 0), billRequest(&d, &big, .of("{\"width\":1344,\"init_video\":null}")));
+    try std.testing.expectEqual(@as(u64, 0), billRequest(&d, &big, .of("{\"width\":1344,\"height\":768}")));
+}
+
+test "h3 init_video encode stage outweighs a small canvas's DiT stage and stays above the measured peak" {
+    const GB: u64 = 1 << 30;
+    // The HyperFlow Flash REF2VA 8-bit pack: a two-time DiT keeps its whole file and runs no attention cache.
+    const vae: u64 = 5_207_808_496;
+    const dit = ditResidentBytes(14_971_410_087, false);
+    try std.testing.expect(vae + encodeBytes(256, 256, 22, 256 * GB) > dit + activationBytes(requestRows(256, 256, 22, 0), 0));
+    // A real 1344x768 x 124 encode on a 256 GB Mac: 1.0 GB of f32 encoder, then 36.3 GB more process footprint.
+    try std.testing.expect(vae + encodeBytes(1344, 768, 124, 256 * GB) > 37 * GB + 300 * (GB >> 10));
 }

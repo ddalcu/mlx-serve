@@ -1805,6 +1805,48 @@ pub const Encoder = struct {
     }
 };
 
+test "minimax h3 vae: a real encode stays within the billed pass and clip" {
+    // Bar: the active peak of the real encoder over full 256-px tiles stays under `encodePassBytes` + `encodeClipBytes`.
+    const raw_model = std.c.getenv("MINIMAX_H3_MODEL") orelse return error.SkipZigTest;
+    const model_dir = std.mem.sliceTo(raw_model, 0);
+    if (model_dir.len == 0 or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const vae_path = try std.fmt.allocPrint(a, "{s}/video_vae.safetensors", .{model_dir});
+    defer a.free(vae_path);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (std.Io.Dir.openFileAbsolute(io, vae_path, .{})) |f| f.close(io) else |_| return error.SkipZigTest;
+    var vw = try model_mod.loadWeightsSingleFile(a, vae_path);
+    defer vw.deinit();
+    var enc = try Encoder.load(a, &vw, s);
+    defer enc.deinit();
+    try enc.materialize();
+    const t: u32 = 22;
+    const h: u32 = 512;
+    const w: u32 = 768;
+    const shp = [_]c_int{ 1, 3, t, h, w };
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 7));
+    const lo = mlx.mlx_array_new_float(-1.0);
+    defer _ = mlx.mlx_array_free(lo);
+    const hi = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(hi);
+    var px = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(px);
+    try mlx.check(mlx.mlx_random_uniform(&px, lo, hi, &shp, shp.len, mlx.mlx_dtype.float32, key, s));
+    try mlx.check(mlx.mlx_array_eval(px));
+    _ = mlx.mlx_clear_cache();
+    var start: usize = 0;
+    _ = mlx.mlx_get_active_memory(&start);
+    _ = mlx.mlx_reset_peak_memory();
+    const lat = try enc.encodeVideo(px, a, s);
+    _ = mlx.mlx_array_free(lat);
+    var peak: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&peak);
+    try testing.expect(peak - start <= geometry.encodePassBytes() + geometry.encodeClipBytes(w, h, t));
+}
+
 test "minimax h3 vae: encoder geometry ladder matches the reference config" {
     // block_in = [mid[0]] ++ mid[:-1]; mid = ch * ch_mult.
     const want_in = [_]u32{ 128, 128, 256, 256, 512, 512 };

@@ -457,8 +457,8 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     if (two_time != null and e.lora_n > 0) return bad("'lora_paths' targets the base model's blocks — a two-time pack has dropped and factored some of them");
     if (turbo and dir.fileBytes("turbo_lora.safetensors") == 0) return bad("this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors");
 
-    const width = u32Field(&b, "width", 256);
-    const height = u32Field(&b, "height", 256);
+    const width = u32Field(&b, "width", h3.geometry.DEFAULT_SIDE);
+    const height = u32Field(&b, "height", h3.geometry.DEFAULT_SIDE);
     const steps = if (pdd_steps) |n|
         stepsIn(&b, n, n, n) orelse return req.refuseFmt(.unsupported, "this pack runs a fixed step count — omit 'steps'", "this pack is a distilled student that runs exactly {d} steps — omit 'steps' or send {d}", .{ n, n })
     else if (two_time) |tt| tts: {
@@ -468,7 +468,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     } else
         stepsIn(&b, if (turbo) 4 else 30, 1, 100) orelse return bad("'steps' must be in [1,100]");
     const seed = b.uint("seed") orelse 0;
-    const requested_frames = u32Field(&b, "num_frames", 56);
+    const requested_frames = u32Field(&b, "num_frames", h3.geometry.DEFAULT_FRAMES);
     if (width % 32 != 0 or height % 32 != 0) return bad("width and height must be multiples of 32");
     if (turbo and steps < 4) return bad("turbo needs at least 4 steps (the distillation's own floor, and its default)");
 
@@ -530,7 +530,18 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     const rows = config.requestRows(width, height, shape.frame_count, @intCast(kfs.n));
     const activations = config.activationBytes(rows, bcast_row);
     const mem = memNow(req);
-    const plan = residentFor(e, dir, activations, mem);
+    // An init_video encode runs in that memory before the DiT does (`config.encodeBytes`).
+    const init_encode: u64 = if (init.pixels != null) config.encodeBytes(width, height, shape.frame_count, mem.total) else 0;
+    const plan = residentFor(e, dir, @max(activations, init_encode), mem);
+    if (init_encode > 0) log.info("[minimax-h3] init_video encode billed ~{d:.1} GB above the video VAE (pool lift, one tile pass, the clip)\n", .{@as(f64, @floatFromInt(init_encode)) / (1024.0 * 1024.0 * 1024.0)});
+    if (plan == null and init_encode > 0) {
+        const need = dir.fileBytes("video_vae.safetensors") + init_encode;
+        const avail = config.availBytes(mem.host_avail, mem.gpu_limit, mem.gpu_active);
+        if (avail > 0 and need > avail) {
+            const gb = 1024.0 * 1024.0 * 1024.0;
+            return req.refuseFmt(.unsupported, "the 'init_video' encode does not fit in memory", "the 'init_video' encode needs ~{d:.1} GB (the video VAE and its 256-px tile passes) but {d:.1} GB is available", .{ @as(f64, @floatFromInt(need)) / gb, @as(f64, @floatFromInt(avail)) / gb });
+        }
+    }
     if (plan == null) {
         // A two-time DiT's AdaLN takes a 16-wide embedding: precompute frees next to nothing of it.
         const dit = config.ditResidentBytes(config.ditFileBytes(dir, &e.machine), two_time == null) + (if (turbo) dir.fileBytes("turbo_lora.safetensors") else 0);

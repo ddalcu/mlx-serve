@@ -6,6 +6,9 @@ const env = @import("../../env.zig");
 const pool_rule = @import("../../sdk/media/pool.zig");
 
 pub const FPS: u32 = 24;
+/// A request's canvas side and `num_frames` when it names none.
+pub const DEFAULT_SIDE: u32 = 256;
+pub const DEFAULT_FRAMES: u32 = 56;
 pub const AUDIO_LATENT_FPS: u32 = 40;
 /// Spatial compression: VAE 16x, then the DiT's 2x2 patch → 32x effective.
 pub const VAE_SPATIAL: u32 = 16;
@@ -31,6 +34,12 @@ pub fn encodePassBytes() u64 {
 /// buffer only to a request of about its size, so that takes twice the pass's peak.
 pub fn encodeLiftBytes(total_ram: u64) u64 {
     return pool_rule.liftBytes(2 * encodePassBytes(), total_ram);
+}
+
+/// The whole-clip f32 copies an encode holds beside its passes: the pixels, the encoder's input and its padded clips.
+pub fn encodeClipBytes(width: u32, height: u32, frames: u32) u64 {
+    const padded: u64 = (@as(u64, frames) + VAE_CLIP - 1) / VAE_CLIP * VAE_CLIP;
+    return 4 * padded * width * height * 3 * 4;
 }
 
 /// Snap UP to the model's 17k+5 grid. 40 -> 56, 200 -> 209, 363 -> 379.
