@@ -428,18 +428,6 @@ pub fn memNow(req: *const abi.Request) Mem {
     return .{ .host_avail = m.ram_available, .total = m.ram_total, .gpu_limit = mlx.maxRecommendedWorkingSet(), .gpu_active = active };
 }
 
-/// The resident cache for this request, or null for the staged plan (whatever was held is released first, so the
-/// staged peak starts from a clean slate). File sizes are read per request: a file can land while the server is up.
-fn residentFor(e: *Engine, dir: *const abi.PackDir, activations: u64, mem: Mem) ?struct { r: *h3.Resident, bytes: u64 } {
-    const need = config.residentBytes(dir.fileBytes("text_encoder.safetensors"), config.ditFileBytes(dir, &e.machine), dir.fileBytes("video_vae.safetensors") + dir.fileBytes("audio_vae.safetensors"), dir.fileBytes("turbo_lora.safetensors"), activations);
-    const avail = config.availBytes(mem.host_avail, mem.gpu_limit, mem.gpu_active);
-    if (!(config.residentEnabled() and !e.machine.ane_video and config.keepResident(avail, e.resident.bytes, need, config.residentMargin(mem.total)))) {
-        _ = e.resident.release();
-        return null;
-    }
-    return .{ .r = &e.resident, .bytes = need };
-}
-
 fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) callconv(.c) Verdict {
     const e: *Engine = @ptrCast(@alignCast(ep));
     const dir = req.dir orelse return Verdict.refuse(.failed, "minimax_h3: the host gave no pack dir");
@@ -530,33 +518,49 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     const rows = config.requestRows(width, height, shape.frame_count, @intCast(kfs.n));
     const activations = config.activationBytes(rows, bcast_row);
     const mem = memNow(req);
-    // An init_video encode runs in that memory before the DiT does (`config.encodeBytes`).
-    const init_encode: u64 = if (init.pixels != null) config.encodeBytes(width, height, shape.frame_count, mem.total) else 0;
-    const plan = residentFor(e, dir, @max(activations, init_encode), mem);
-    if (init_encode > 0) log.info("[minimax-h3] init_video encode billed ~{d:.1} GB above the video VAE (pool lift, one tile pass, the clip)\n", .{@as(f64, @floatFromInt(init_encode)) / (1024.0 * 1024.0 * 1024.0)});
-    if (plan == null and init_encode > 0) {
-        const need = dir.fileBytes("video_vae.safetensors") + init_encode;
-        const avail = config.availBytes(mem.host_avail, mem.gpu_limit, mem.gpu_active);
-        if (avail > 0 and need > avail) {
-            const gb = 1024.0 * 1024.0 * 1024.0;
-            return req.refuseFmt(.unsupported, "the 'init_video' encode does not fit in memory", "the 'init_video' encode needs ~{d:.1} GB (the video VAE and its 256-px tile passes) but {d:.1} GB is available", .{ @as(f64, @floatFromInt(need)) / gb, @as(f64, @floatFromInt(avail)) / gb });
-        }
-    }
-    if (plan == null) {
+    const vae_file = dir.fileBytes("video_vae.safetensors");
+    const encode_held = if (init.pixels != null) config.encodeHeldBytes(width, height, shape.frame_count) else h3.geometry.encodePassBytes();
+    const plan = config.plan(.{
+        .sizes = .{
+            .te = dir.fileBytes("text_encoder.safetensors"),
+            .dit_file = config.ditFileBytes(dir, &e.machine),
+            .video_vae = vae_file,
+            .audio_vae = dir.fileBytes("audio_vae.safetensors"),
+            .turbo_lora = dir.fileBytes("turbo_lora.safetensors"),
+        },
         // A two-time DiT's AdaLN takes a 16-wide embedding: precompute frees next to nothing of it.
-        const dit = config.ditResidentBytes(config.ditFileBytes(dir, &e.machine), two_time == null) + (if (turbo) dir.fileBytes("turbo_lora.safetensors") else 0);
-        const bill = config.canvasBill(dit, activations, mem.host_avail, mem.gpu_limit, mem.gpu_active, mlx.cudaAvailable());
-        if (dit > 0 and bill.avail > 0 and bill.need > bill.avail) {
-            const gb = 1024.0 * 1024.0 * 1024.0;
-            const cache = bcast_row > 0;
-            return req.refuseFmt(.unsupported, "the canvas does not fit in memory: use a smaller canvas or fewer frames", "{d}x{d} x {d} frames needs ~{d:.1} GB ({d:.1} GB DiT{s} + {d:.1} GB for {d} sequence rows{s}) but {d:.1} GB is available: use a smaller canvas or fewer frames{s}", .{
-                width,                                              height,                                    shape.frame_count,
-                @as(f64, @floatFromInt(bill.need)) / gb,            @as(f64, @floatFromInt(dit)) / gb,         if (mlx.cudaAvailable()) " paged to RAM" else "",
-                @as(f64, @floatFromInt(activations)) / gb,          rows,                                      if (cache) " with the fast recipe's attention cache" else "",
-                @as(f64, @floatFromInt(bill.avail)) / gb,           if (cache) ", or \"turbo\", which keeps no attention cache" else "",
-            });
-        }
+        .precompute = two_time == null,
+        .turbo = turbo,
+        .may_keep = config.residentEnabled() and !e.machine.ane_video,
+        .cache_now = e.resident.bytes,
+        .host_avail = mem.host_avail,
+        .total_ram = mem.total,
+        .gpu_limit = mem.gpu_limit,
+        .gpu_active = mem.gpu_active,
+        .weights_page = mlx.cudaAvailable(),
+        .activations = activations,
+        .encode_held = encode_held,
+        .init = init.pixels != null,
+        .billed_lift = config.billedEncodeLift(vae_file, encode_held, &e.machine),
+    });
+    // The staged plan starts from a clean slate.
+    if (plan.resident == null) _ = e.resident.release();
+    if (plan.refused) |r| {
+        const gb = 1024.0 * 1024.0 * 1024.0;
+        return switch (r.what) {
+            .encode => req.refuseFmt(.unsupported, "the 'init_video' encode does not fit in memory", "the 'init_video' encode needs ~{d:.1} GB (the video VAE and its 256-px tile passes) but {d:.1} GB is available", .{ @as(f64, @floatFromInt(r.need)) / gb, @as(f64, @floatFromInt(r.avail)) / gb }),
+            .canvas => canvas: {
+                const cache = bcast_row > 0;
+                break :canvas req.refuseFmt(.unsupported, "the canvas does not fit in memory: use a smaller canvas or fewer frames", "{d}x{d} x {d} frames needs ~{d:.1} GB ({d:.1} GB DiT{s} + {d:.1} GB for {d} sequence rows{s}) but {d:.1} GB is available: use a smaller canvas or fewer frames{s}", .{
+                    width,                                     height,                                 shape.frame_count,
+                    @as(f64, @floatFromInt(r.need)) / gb,      @as(f64, @floatFromInt(r.dit)) / gb,    if (mlx.cudaAvailable()) " paged to RAM" else "",
+                    @as(f64, @floatFromInt(activations)) / gb, rows,                                   if (cache) " with the fast recipe's attention cache" else "",
+                    @as(f64, @floatFromInt(r.avail)) / gb,     if (cache) ", or \"turbo\", which keeps no attention cache" else "",
+                });
+            },
+        };
     }
+    if (init.pixels != null) log.info("[minimax-h3] init_video encode: pool lift {d:.1} GB beside one tile pass and the clip ({d:.1} GB)\n", .{ @as(f64, @floatFromInt(plan.lift)) / (1024.0 * 1024.0 * 1024.0), @as(f64, @floatFromInt(encode_held)) / (1024.0 * 1024.0 * 1024.0) });
 
     const paths: h3.GenPaths = .{
         .tokenizer_dir = e.model_dir,
@@ -573,8 +577,9 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     const io = std.Io.Threaded.global_single_threaded.io();
     var res = h3.generate(gpa, io, paths, .{
         .geometry = e.geometry,
-        .resident = if (plan) |p| p.r else null,
-        .resident_bytes = if (plan) |p| p.bytes else 0,
+        .resident = if (plan.resident != null) &e.resident else null,
+        .resident_bytes = plan.resident orelse 0,
+        .encode_lift = plan.lift,
         .prompt = prompt,
         .width = width,
         .height = height,
@@ -1049,6 +1054,31 @@ const EncoderPackRoot = struct {
         return fx;
     }
 };
+
+test "minimax_h3 plugin: an init_video encode that cannot fit even unlifted is refused by name before any stage loads" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pack = try @import("../../sdk/testing/media_pack.zig").MediaPack(EncoderPackRoot).open(a);
+    defer pack.close();
+    const body = try std.fmt.allocPrint(a, "{{\"prompt\":\"x\",\"width\":32,\"height\":32,\"num_frames\":5,\"steps\":2,\"init_step\":1,\"init_video\":{{\"frames\":{s}}}}}", .{try testFrames(a, 5, 32, 32)});
+    // 4 GB free holds the tiny DiT stage but not one 256-px tile pass.
+    const m: abi.Machine = .{ .ram_total = 64 << 30, .ram_available = 4 << 30 };
+    var buf: [512]u8 = undefined;
+    var len: usize = 0;
+    const dir = pack.mem.packDir();
+    const req: abi.Request = .{ .body = .of(body), .machine = &m, .dir = &dir, .message = .{ .ptr = &buf, .cap = buf.len, .len = &len } };
+    const Quiet = struct {
+        fn report(_: ?*anyopaque, _: abi.Str, _: u32, _: u32) callconv(.c) void {}
+        fn boundary(_: ?*anyopaque) callconv(.c) bool {
+            return false;
+        }
+    };
+    const v = table.step(pack.engine, &req, &.{ .ctx = null, .report = Quiet.report, .boundary = Quiet.boundary });
+    try testing.expect(v.code == .unsupported);
+    try testing.expect(std.mem.startsWith(u8, buf[0..len], "the 'init_video' encode needs ~"));
+    try testing.expect(std.mem.endsWith(u8, buf[0..len], "4.0 GB is available"));
+}
 
 test "minimax_h3 plugin: an init_video run starts from the clip at init_step; a run without one is unchanged" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

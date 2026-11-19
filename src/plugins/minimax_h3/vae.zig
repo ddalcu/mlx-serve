@@ -28,7 +28,6 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../sdk/weights/load.zig");
 const log = @import("../../sdk/util/log.zig");
-const system = @import("../../sdk/util/system.zig");
 const pool = @import("../../mlx/pool.zig");
 const h3 = @import("h3.zig");
 const geometry = @import("geometry.zig");
@@ -1590,8 +1589,8 @@ pub const Encoder = struct {
     /// reference encodes tiled ALWAYS (`tiling=True`), blending MOMENTS at
     /// latent granularity against the RAW neighbours, so parity means doing
     /// the same.
-    pub fn encodeImage(self: *const Encoder, pixels: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
-        return self.encodeVideo(pixels, alloc, s);
+    pub fn encodeImage(self: *const Encoder, pixels: mlx.mlx_array, pool_lift: u64, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+        return self.encodeVideo(pixels, pool_lift, alloc, s);
     }
 
     /// `pixels` [1, 3, T, H, W] f32 in [-1, 1] -> NORMALIZED latents
@@ -1601,9 +1600,10 @@ pub const Encoder = struct {
     /// video, encoded in 17-FRAME CLIPS with the tail repeat-padded and the
     /// last `TOKEN_DROP` latent frames discarded. `videoLatentT` is the same
     /// ladder read from the other end, so a caller that snapped its frame
-    /// count to 17k+5 gets exactly `5k+2` latent frames back.
-    pub fn encodeVideo(self: *const Encoder, pixels: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
-        const lift = pool.Cap.raise(geometry.encodeLiftBytes(system.getTotalMemBytes()));
+    /// count to 17k+5 gets exactly `5k+2` latent frames back. MLX's pool is
+    /// lifted to `pool_lift` while it runs (`config.plan` sizes it).
+    pub fn encodeVideo(self: *const Encoder, pixels: mlx.mlx_array, pool_lift: u64, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+        const lift = pool.Cap.raise(pool_lift);
         defer lift.restore();
         const pshp = mlx.getShape(pixels);
         const pt: u32 = @intCast(pshp[2]);
@@ -1840,7 +1840,7 @@ test "minimax h3 vae: a real encode stays within the billed pass and clip" {
     var start: usize = 0;
     _ = mlx.mlx_get_active_memory(&start);
     _ = mlx.mlx_reset_peak_memory();
-    const lat = try enc.encodeVideo(px, a, s);
+    const lat = try enc.encodeVideo(px, 0, a, s);
     _ = mlx.mlx_array_free(lat);
     var peak: usize = 0;
     _ = mlx.mlx_get_peak_memory(&peak);
@@ -1907,7 +1907,7 @@ test "minimax h3 vae live: encoder parity vs the executed reference" {
         defer _ = mlx.mlx_array_free(x);
         const want = try ownWeight(&fx, pair[1]);
         defer _ = mlx.mlx_array_free(want);
-        const got = try enc.encodeVideo(x, a, s);
+        const got = try enc.encodeVideo(x, 0, a, s);
         defer _ = mlx.mlx_array_free(got);
         // Shape first: a temporal ladder that is one token off still scores a
         // high cosine on the overlapping rows, and cosineSimV would compare
@@ -2014,7 +2014,7 @@ test "minimax h3 vae live: encode->decode round trip preserves orientation" {
     const img = mlx.mlx_array_new_data(buf.ptr, &shape5, 5, mlx.mlx_dtype.float32);
     defer _ = mlx.mlx_array_free(img);
 
-    const lat = try enc.encodeImage(img, a, s);
+    const lat = try enc.encodeImage(img, 0, a, s);
     defer _ = mlx.mlx_array_free(lat);
     const pixels = try decode(&dec, lat, a, s);
     defer _ = mlx.mlx_array_free(pixels);
@@ -2097,7 +2097,7 @@ test "minimax h3 vae live: the Latent2RGB preview resembles the decoded frame" {
     const img = mlx.mlx_array_new_data(buf.ptr, &shape5, 5, mlx.mlx_dtype.float32);
     defer _ = mlx.mlx_array_free(img);
 
-    const lat = try enc.encodeImage(img, a, s);
+    const lat = try enc.encodeImage(img, 0, a, s);
     defer _ = mlx.mlx_array_free(lat);
     const latf = try astype(lat, mlx.mlx_dtype.float32, s);
     defer _ = mlx.mlx_array_free(latf);

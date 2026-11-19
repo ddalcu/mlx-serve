@@ -30,10 +30,10 @@ pub fn encodePassBytes() u64 {
     return ENC_PASS_COPIES * VAE_TILE * VAE_TILE * VAE_CLIP * ENC_WIDE_BYTES;
 }
 
-/// The pool an encode runs under: room for what one tile pass frees and the next allocates again. MLX hands a cached
-/// buffer only to a request of about its size, so that takes twice the pass's peak.
-pub fn encodeLiftBytes(total_ram: u64) u64 {
-    return pool_rule.liftBytes(2 * encodePassBytes(), total_ram);
+/// The pool an encode runs under: room for what one tile pass frees and the next allocates again, as much of it as
+/// `headroom` holds. MLX hands a cached buffer only to a request of about its size, so that takes twice the pass's peak.
+pub fn encodeLiftBytes(total_ram: u64, headroom: u64) u64 {
+    return pool_rule.liftBytes(2 * encodePassBytes(), total_ram, headroom);
 }
 
 /// The whole-clip f32 copies an encode holds beside its passes: the pixels, the encoder's input and its padded clips.
@@ -240,9 +240,9 @@ pub const DecCfg = struct {
 
 // ── tests ──
 
-test "h3 encode lift: twice the tile pass, never on a small-RAM Mac, never past RAM/8" {
+test "h3 encode lift: twice the tile pass where the headroom holds it, less where not, never on a small-RAM Mac" {
     const GB: u64 = 1 << 30;
-    try std.testing.expectEqual(2 * encodePassBytes(), encodeLiftBytes(256 * GB));
-    try std.testing.expectEqual(16 * GB, encodeLiftBytes(128 * GB));
-    try std.testing.expectEqual(@as(u64, 0), encodeLiftBytes(16 * GB));
+    try std.testing.expectEqual(2 * encodePassBytes(), encodeLiftBytes(36 * GB, 200 * GB));
+    try std.testing.expectEqual(5 * GB, encodeLiftBytes(36 * GB, 5 * GB));
+    try std.testing.expectEqual(@as(u64, 0), encodeLiftBytes(16 * GB, 200 * GB));
 }

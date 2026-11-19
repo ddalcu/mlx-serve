@@ -3673,6 +3673,8 @@ pub const GenRequest = struct {
     /// plan: load, run, free). `resident_bytes` is what the cache reports holding.
     resident: ?*Resident = null,
     resident_bytes: u64 = 0,
+    /// The pool the video VAE encodes lift to (`config.plan`).
+    encode_lift: u64 = 0,
     prompt: []const u8,
     width: u32 = 256,
     height: u32 = 256,
@@ -4238,7 +4240,7 @@ fn generateOne(
             defer enc.deinit();
             for (req.keyframes, 0..) |kf, ki| {
                 anchors_buf[ki] = kf.anchor;
-                const lat = try enc.encodeImage(kf.pixels, allocator, s);
+                const lat = try enc.encodeImage(kf.pixels, req.encode_lift, allocator, s);
                 defer _ = mlx.mlx_array_free(lat);
                 try rows_list.append(allocator, try patchifyVideo(lat, s));
             }
@@ -4248,7 +4250,7 @@ fn generateOne(
                 const px = m.pixels orelse return error.RefMissingPixels;
                 // encodeImage IS encodeVideo at T == 1; naming the two apart
                 // keeps the call site readable, not the behaviour different.
-                const lat = try enc.encodeVideo(px, allocator, s);
+                const lat = try enc.encodeVideo(px, req.encode_lift, allocator, s);
                 defer _ = mlx.mlx_array_free(lat);
                 const got_t: u32 = @intCast(mlx.getShape(lat)[2]);
                 const want_t: u32 = if (m.ref.kind == .image) 1 else m.ref.latent_t;
@@ -4333,7 +4335,7 @@ fn generateOne(
             defer venc.deinit();
             try venc.materialize();
             vload_ms = split.lapMs();
-            const lat = try venc.encodeVideo(ic.pixels, allocator, s);
+            const lat = try venc.encodeVideo(ic.pixels, req.encode_lift, allocator, s);
             defer _ = mlx.mlx_array_free(lat);
             const ls = mlx.getShape(lat);
             if (ls[2] != shape.latent_t or ls[3] != lat_h or ls[4] != lat_w) return error.InitLatentShapeMismatch;

@@ -89,7 +89,7 @@ test "pool cap: a lift inside a small-RAM media job leaves the job's cap" {
     capSet(2 << 30);
     const job = forMediaJob(16 * GB);
     try testing.expectEqual(@as(usize, rule.SMALL_RAM_CAP), capNow());
-    const lift = Cap.raise(rule.liftBytes(30 * GB, 16 * GB));
+    const lift = Cap.raise(rule.liftBytes(30 * GB, 16 * GB, 30 * GB));
     try testing.expectEqual(@as(usize, rule.SMALL_RAM_CAP), capNow());
     lift.restore();
     job.restore();
@@ -97,4 +97,26 @@ test "pool cap: a lift inside a small-RAM media job leaves the job's cap" {
     const roomy = forMediaJob(64 * GB);
     try testing.expectEqual(@as(usize, 2 << 30), capNow());
     roomy.restore();
+}
+
+test "pool cap: restoring a raised cap returns its buffers to the OS" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const orig = capNow();
+    defer capSet(orig);
+    capSet(0);
+    _ = mlx.mlx_clear_cache();
+    const up = Cap.raise(1 << 30);
+    const s = mlx.gpuStream();
+    var x = mlx.mlx_array_new();
+    _ = mlx.mlx_arange(&x, 0, 16 << 20, 1, mlx.mlx_dtype.float32, s);
+    _ = mlx.mlx_array_eval(x);
+    _ = mlx.mlx_array_free(x);
+    _ = mlx.mlx_synchronize(s);
+    var cached: usize = 0;
+    _ = mlx.mlx_get_cache_memory(&cached);
+    try testing.expect(cached >= 64 << 20);
+    up.restore();
+    _ = mlx.mlx_get_cache_memory(&cached);
+    try testing.expectEqual(@as(usize, 0), cached);
+    try testing.expectEqual(@as(usize, 0), capNow());
 }
