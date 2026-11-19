@@ -319,6 +319,104 @@ fn references(req: *const abi.Request, b: *const job.Body, gen_w: u32, gen_h: u3
     return null;
 }
 
+/// What `init_video` must match, from the request and the pack.
+const InitNeeds = struct {
+    width: u32,
+    height: u32,
+    /// The snapped frame count (17k+5) and what the request asked for.
+    frame_count: u32,
+    requested_frames: u32,
+    audio_t: u32,
+    steps: u32,
+    pdd: bool,
+    chain_windows: u32,
+    audio_vae: bool,
+};
+
+/// The decoded `init_video`, owned until `deinit`.
+const InitMedia = struct {
+    pixels: ?A = null,
+    waveform: ?A = null,
+    step: u32 = 0,
+
+    fn deinit(m: *InitMedia) void {
+        if (m.pixels) |x| _ = mlx.mlx_array_free(x);
+        if (m.waveform) |x| _ = mlx.mlx_array_free(x);
+    }
+
+    fn clip(m: *const InitMedia) ?h3.InitClip {
+        const px = m.pixels orelse return null;
+        return .{ .pixels = px, .waveform = m.waveform, .step = m.step };
+    }
+};
+
+/// A soundtrack trimmed or zero-padded to `want` stereo frames, when it is within one audio latent frame (25 ms) of
+/// it; null otherwise. Caller owns.
+fn fitSoundtrack(pcm: []const f32, want: usize) !?[]f32 {
+    const have = pcm.len / 2;
+    const slack = @import("audio.zig").HOP_LENGTH;
+    if (@max(have, want) - @min(have, want) > slack) return null;
+    const out = try gpa.alloc(f32, want * 2);
+    @memset(out, 0);
+    const n = @min(have, want) * 2;
+    @memcpy(out[0..n], pcm[0..n]);
+    return out;
+}
+
+/// `init_video` + `init_step` (video-to-video) decoded into `out`; a clip the run cannot start from is a named
+/// refusal. Neither field set leaves `out` empty.
+fn initClip(req: *const abi.Request, b: *const job.Body, need: InitNeeds, s: mlx.mlx_stream, out: *InitMedia) !?Verdict {
+    const has_clip = fieldSet(b, "init_video");
+    const has_step = fieldSet(b, "init_step");
+    if (!has_clip and !has_step) return null;
+    if (!has_step) return bad("'init_video' needs 'init_step': the step of the schedule to start from (1 to steps-1; lower keeps less of the clip)");
+    if (!has_clip) return bad("'init_step' needs 'init_video': the clip to start from ({\"frames\":[…],\"audio\":\"…\"})");
+    if (need.pdd) return bad("'init_video' is not supported on a PDD student pack (FastH3 Omni): its fused heads run a fixed schedule from pure noise — load a REF2VA, FL2VA or Flash pack");
+    if (need.chain_windows > 1) return bad("'init_video' cannot ride chained windows: send it with 'chain_windows' 1");
+
+    const sv = b.get("init_step").?;
+    if (need.steps < 2) return req.refuseFmt(.unsupported, "'init_step' needs a run of at least 2 steps", "'init_step' needs a run of at least 2 steps; this run has {d}", .{need.steps});
+    const k: i64 = if (sv == .integer) sv.integer else return req.refuseFmt(.unsupported, "'init_step' must be an integer", "'init_step' must be an integer in [1, {d}] for this {d}-step run", .{ need.steps - 1, need.steps });
+    if (k < 1 or k >= need.steps) return req.refuseFmt(.unsupported, "'init_step' is outside [1, steps-1]", "'init_step' must be in [1, {d}] for this {d}-step run; got {d}", .{ need.steps - 1, need.steps, k });
+
+    const v = b.get("init_video").?;
+    if (v != .object) return bad("'init_video' must be an object {\"frames\":[base64 PNG/JPEG…],\"audio\":\"<base64 WAV>\"}");
+    const fr = v.object.get("frames") orelse return bad("'init_video' needs a 'frames' array of base64 PNG/JPEG strings");
+    if (fr != .array) return bad("'init_video' needs a 'frames' array of base64 PNG/JPEG strings");
+    if (fr.array.items.len != need.frame_count)
+        return req.refuseFmt(.unsupported, "'init_video' has the wrong number of frames", "'init_video' has {d} frames; this request needs exactly {d} ('num_frames' {d} on the 17k+5 ladder)", .{ fr.array.items.len, need.frame_count, need.requested_frames });
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const frames = try a.alloc([]u8, fr.array.items.len);
+    for (fr.array.items, frames, 0..) |f, *dst, i| {
+        if (f != .string) return bad("'init_video'.frames must be an array of base64 PNG/JPEG strings");
+        dst.* = job.imageUpload(a, f.string) catch return req.refuseFmt(.unsupported, "an 'init_video' frame is not valid base64", "'init_video'.frames[{d}] is not valid base64", .{i});
+        const sz = image_pixels.nativeSize(dst.*) orelse return req.refuseFmt(.unsupported, "an 'init_video' frame could not be decoded (PNG/JPEG expected)", "could not decode 'init_video'.frames[{d}] (PNG/JPEG expected)", .{i});
+        if (sz.w != need.width or sz.h != need.height)
+            return req.refuseFmt(.unsupported, "an 'init_video' frame is not the request's width x height", "'init_video'.frames[{d}] is {d}x{d}; every frame must be exactly {d}x{d} (the request's width x height)", .{ i, sz.w, sz.h, need.width, need.height });
+    }
+
+    // Owned by `out` from here: the caller's `deinit` frees whatever a refusal below leaves in it.
+    out.pixels = try videoFrames(frames, need.height, need.width, 1, 2, s) orelse
+        return bad("an 'init_video' frame could not be decoded (PNG/JPEG expected)");
+    out.step = @intCast(k);
+    if (v.object.get("audio")) |au| if (au != .null) {
+        if (au != .string) return bad("'init_video'.audio must be a base64 WAV string");
+        if (!need.audio_vae) return bad("'init_video'.audio needs the pack's audio VAE (audio_vae.safetensors), which this pack does not ship");
+        const pcm = wav32kStereo(au.string) catch return bad("'init_video'.audio must be a PCM16/PCM24/float32 WAV");
+        defer gpa.free(pcm);
+        const want: usize = @as(usize, need.audio_t) * @import("audio.zig").HOP_LENGTH;
+        const fitted = try fitSoundtrack(pcm, want) orelse
+            return req.refuseFmt(.unsupported, "'init_video'.audio is not the clip's length", "'init_video'.audio is {d} samples at 32 kHz; this clip's soundtrack is {d} (within 800)", .{ pcm.len / 2, want });
+        defer gpa.free(fitted);
+        if (pcm.len / 2 != want) log.info("[video] minimax-h3 init_video soundtrack fitted from {d} to {d} samples\n", .{ pcm.len / 2, want });
+        out.waveform = try planar(fitted);
+    };
+    return null;
+}
+
 /// Live memory: host RAM (what the OS will grant, and the total) from the request's machine, and the GPU's
 /// working-set room. Unknown host RAM keeps nothing resident and skips the staged-canvas check.
 pub const Mem = struct { host_avail: u64 = 0, total: u64 = 0, gpu_limit: u64, gpu_active: u64 };
@@ -405,6 +503,20 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         if (!visual) return bad("this pack generates from references — attach at least one image or video ('ref_images' / 'ref_videos')");
     }
 
+    var init: InitMedia = .{};
+    defer init.deinit();
+    if (initClip(req, &b, .{
+        .width = width,
+        .height = height,
+        .frame_count = shape.frame_count,
+        .requested_frames = requested_frames,
+        .audio_t = shape.audio_t,
+        .steps = steps,
+        .pdd = pdd_steps != null,
+        .chain_windows = chain_windows,
+        .audio_vae = dir.fileBytes("audio_vae.safetensors") > 0,
+    }, s, &init) catch |err| return job.failure(err, "MiniMax-H3 generation failed")) |v| return v;
+
     // The request's own activations price the resident plan; when it does not fit, the staged DiT stage is checked
     // here, before any stage loads, since a Metal OOM mid-step is uncatchable.
     const distilled = turbo or pdd_steps != null or two_time != null;
@@ -463,6 +575,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .chain_windows = chain_windows,
         .keyframes = kfs.buf[0..kfs.n],
         .refs = refs.items,
+        .init = init.clip(),
     }, job.progressOf(progress), s) catch |err| return switch (err) {
         error.Cancelled => job.client_left,
         // The LoRA failures are the user's to fix, each with its own remedy.
@@ -566,6 +679,28 @@ pub fn fixtureTextEncoder(a: std.mem.Allocator) !sdk.tensors.Tensors {
 pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     var dit = try fixtureDit(a, true, 1);
     var te = try fixtureTextEncoder(a);
+    return .{
+        .files = try a.dupe(sdk.fixture.File, &.{
+            .{ .name = "config.json", .bytes =
+            \\{"model_type":"minimax_h3","partition":"fl2va","tasks":["t2va","fl2va"],
+            \\ "transformer":{"hidden_size":64,"num_layers":1,"token_refiner_num_layers":1,"num_attention_heads":2,
+            \\  "attention_head_dim":32,"ffn_hidden_size":64,"text_dim":64,"timestep_input_dim":32,
+            \\  "time_embed_hidden_size":64,"time_embed_dim":32,"rope_inv_freq_len":4},
+            \\ "text_encoder":{"hidden":64,"layers":1,"heads":2,"kv_heads":1,"head_dim":32,"intermediate":128},
+            \\ "video_vae":{"layers":1,"heads":2,"head_dim":16}}
+            },
+            .{ .name = "tokenizer.json", .bytes = try sdk.byte_tokenizer.json(a, &.{}) },
+            .{ .name = "transformer.safetensors", .bytes = try dit.bytes() },
+            .{ .name = "text_encoder.safetensors", .bytes = try te.bytes() },
+            .{ .name = "video_vae.safetensors", .bytes = try fixtureVae(a, false) },
+        }),
+        .body = "{\"prompt\":\"a red ball rolls\",\"width\":64,\"height\":64,\"num_frames\":5,\"steps\":2,\"seed\":3,\"fast\":false}",
+    };
+}
+
+/// The fixture's video VAE: a one-block decoder at 32 and, with `encoder`, the checkpoint's own encoder (its widths are
+/// fixed, so it is full size) appended after it, every same-shaped weight sharing one random draw.
+fn fixtureVae(a: std.mem.Allocator, encoder: bool) ![]u8 {
     const vd = 32; // decoder width: 2 heads x 16
     var vae = sdk.tensors.Tensors.init(a, 103);
     try vae.rand("decoder.x_embedder.weight", .{}, &.{ vd, 24 }, .BF16, 0.2);
@@ -586,24 +721,60 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
         try vae.rand(vp ++ l[0] ++ ".bias", .{}, &.{l[1]}, .BF16, 0.1);
     }
     inline for (.{ "norm1.weight", "norm2.weight", "scale1", "scale2" }) |n| try vae.fill(vp ++ n, .{}, &.{vd}, .BF16, 1);
+    if (encoder) try fixtureVaeEncoder(&vae);
+    return vae.bytes();
+}
 
-    return .{
-        .files = try a.dupe(sdk.fixture.File, &.{
-            .{ .name = "config.json", .bytes = 
-            \\{"model_type":"minimax_h3","partition":"fl2va","tasks":["t2va","fl2va"],
-            \\ "transformer":{"hidden_size":64,"num_layers":1,"token_refiner_num_layers":1,"num_attention_heads":2,
-            \\  "attention_head_dim":32,"ffn_hidden_size":64,"text_dim":64,"timestep_input_dim":32,
-            \\  "time_embed_hidden_size":64,"time_embed_dim":32,"rope_inv_freq_len":4},
-            \\ "text_encoder":{"hidden":64,"layers":1,"heads":2,"kv_heads":1,"head_dim":32,"intermediate":128},
-            \\ "video_vae":{"layers":1,"heads":2,"head_dim":16}}
-            },
-            .{ .name = "tokenizer.json", .bytes = try sdk.byte_tokenizer.json(a, &.{}) },
-            .{ .name = "transformer.safetensors", .bytes = try dit.bytes() },
-            .{ .name = "text_encoder.safetensors", .bytes = try te.bytes() },
-            .{ .name = "video_vae.safetensors", .bytes = try vae.bytes() },
-        }),
-        .body = "{\"prompt\":\"a red ball rolls\",\"width\":64,\"height\":64,\"num_frames\":5,\"steps\":2,\"seed\":3,\"fast\":false}",
-    };
+fn fixtureVaeEncoder(vae: *sdk.tensors.Tensors) !void {
+    const V = @import("vae.zig");
+    var drawn: std.ArrayList(struct { o: u64, i: u64, k: u64, name: []const u8 }) = .empty;
+    const conv = struct {
+        fn f(t: *sdk.tensors.Tensors, seen: anytype, name: []const u8, o: u64, i: u64, k: u64) !void {
+            for (seen.items) |d| if (d.o == o and d.i == i and d.k == k) return t.alias("{s}", .{name}, d.name);
+            const kd: []const u64 = if (k == 3) &.{ o, i, 3, 3, 3 } else &.{ o, i, 1, 1, 1 };
+            try t.rand("{s}", .{name}, kd, .BF16, 0.02);
+            try seen.append(t.a, .{ .o = o, .i = i, .k = k, .name = name });
+        }
+    }.f;
+    const vec = struct {
+        fn f(t: *sdk.tensors.Tensors, name: []const u8, n: u64, v: f32) !void {
+            try t.fill("{s}", .{name}, &.{n}, .BF16, v);
+        }
+    }.f;
+    const a = vae.a;
+    try conv(vae, &drawn, "encoder.conv_in.weight", V.ENC_CH, 3, 3);
+    try vec(vae, "encoder.conv_in.bias", V.ENC_CH, 0);
+    for (0..V.ENC_LEVELS) |lv| {
+        for (0..V.ENC_RES_BLOCKS) |bi| {
+            const in_ch: u64 = if (bi == 0) V.encBlockIn(lv) else V.encBlockMid(lv);
+            const mid: u64 = V.encBlockMid(lv);
+            const p = try std.fmt.allocPrint(a, "encoder.down.{d}.block.{d}.", .{ lv, bi });
+            try vec(vae, try std.mem.concat(a, u8, &.{ p, "norm1.weight" }), in_ch, 1);
+            try vec(vae, try std.mem.concat(a, u8, &.{ p, "norm1.bias" }), in_ch, 0);
+            try conv(vae, &drawn, try std.mem.concat(a, u8, &.{ p, "conv1.weight" }), mid, in_ch, 3);
+            try vec(vae, try std.mem.concat(a, u8, &.{ p, "conv1.bias" }), mid, 0);
+            try vec(vae, try std.mem.concat(a, u8, &.{ p, "norm2.weight" }), mid, 1);
+            try vec(vae, try std.mem.concat(a, u8, &.{ p, "norm2.bias" }), mid, 0);
+            try conv(vae, &drawn, try std.mem.concat(a, u8, &.{ p, "conv2.weight" }), mid, mid, 3);
+            try vec(vae, try std.mem.concat(a, u8, &.{ p, "conv2.bias" }), mid, 0);
+            if (in_ch != mid) {
+                try conv(vae, &drawn, try std.mem.concat(a, u8, &.{ p, "nin_shortcut.weight" }), mid, in_ch, 1);
+                try vec(vae, try std.mem.concat(a, u8, &.{ p, "nin_shortcut.bias" }), mid, 0);
+            }
+        }
+        if (V.encHasDown(lv)) {
+            const mid: u64 = V.encBlockMid(lv);
+            try conv(vae, &drawn, try std.fmt.allocPrint(a, "encoder.down.{d}.downsample.conv.weight", .{lv}), mid, mid, 3);
+            try vec(vae, try std.fmt.allocPrint(a, "encoder.down.{d}.downsample.conv.bias", .{lv}), mid, 0);
+        }
+    }
+    const top: u64 = V.encBlockMid(V.ENC_LEVELS - 1);
+    try vec(vae, "encoder.norm_out.weight", top, 1);
+    try vec(vae, "encoder.norm_out.bias", top, 0);
+    try conv(vae, &drawn, "encoder.conv_out.weight", 48, top, 3);
+    try vec(vae, "encoder.conv_out.bias", 48, 0);
+    try conv(vae, &drawn, "quant_conv.weight", 48, 48, 1);
+    try vec(vae, "quant_conv.bias", 48, 0);
 }
 
 // ── tests ──
@@ -717,6 +888,181 @@ test "minimax_h3 plugin: reference audio arrives as 32 kHz stereo in the encoder
     // Duplicated, not summed: both channels carry the mono signal.
     try testing.expectApproxEqAbs(pcm[0], pcm[1], 1e-6);
     try testing.expectApproxEqAbs(pcm[200], pcm[201], 1e-6);
+}
+
+/// `n` base64 PNG frames at `w`x`h`, each a different gradient, as a JSON array.
+fn testFrames(a: std.mem.Allocator, n: usize, w: u32, h: u32) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(a, '[');
+    const rgb = try a.alloc(u8, @as(usize, w) * h * 3);
+    for (0..n) |f| {
+        for (0..h) |y| for (0..w) |x| {
+            const p = (y * w + x) * 3;
+            rgb[p] = @intCast((x * 4 + f * 40) % 256);
+            rgb[p + 1] = @intCast((y * 4) % 256);
+            rgb[p + 2] = @intCast((x + y + f * 17) % 256);
+        };
+        const png = try @import("../../sdk/media/png.zig").encodeRgb(a, rgb, w, h);
+        const b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
+        _ = std.base64.standard.Encoder.encode(b64, png);
+        try out.print(a, "{s}\"{s}\"", .{ if (f == 0) "" else ",", b64 });
+    }
+    try out.append(a, ']');
+    return out.items;
+}
+
+fn testWav(a: std.mem.Allocator, samples: usize) ![]u8 {
+    const pcm = try a.alloc(f32, samples * 2);
+    for (pcm, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.01) * 0.3;
+    const bytes = try wav.encodePcm16(a, pcm, 32000, 2);
+    const b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+    _ = std.base64.standard.Encoder.encode(b64, bytes);
+    return b64;
+}
+
+test "minimax_h3 plugin: init_video and init_step are refused by name unless the clip matches the run" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [512]u8 = undefined;
+    var len: usize = 0;
+    const m: abi.Machine = .{};
+    const req: abi.Request = .{ .body = .of("{}"), .machine = &m, .message = .{ .ptr = &buf, .cap = buf.len, .len = &len } };
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const five = try testFrames(a, 5, 64, 64);
+    const four = try testFrames(a, 4, 64, 64);
+    const narrow = try testFrames(a, 5, 32, 64);
+    const audio_t = h3.temporalShape(5).audio_t;
+    const want_samples = audio_t * @import("audio.zig").HOP_LENGTH;
+    const base: InitNeeds = .{ .width = 64, .height = 64, .frame_count = 5, .requested_frames = 5, .audio_t = audio_t, .steps = 2, .pdd = false, .chain_windows = 1, .audio_vae = true };
+    var pdd = base;
+    pdd.pdd = true;
+    var chained = base;
+    chained.chain_windows = 2;
+    var one_step = base;
+    one_step.steps = 1;
+    var silent_pack = base;
+    silent_pack.audio_vae = false;
+    const cases = [_]struct { body: []const u8, need: InitNeeds, needle: []const u8 }{
+        .{ .body = try std.fmt.allocPrint(a, "{{\"init_video\":{{\"frames\":{s}}}}}", .{five}), .need = base, .needle = "'init_video' needs 'init_step'" },
+        .{ .body = "{\"init_step\":1}", .need = base, .needle = "'init_step' needs 'init_video'" },
+        .{ .body = try std.fmt.allocPrint(a, "{{\"init_step\":1,\"init_video\":{{\"frames\":{s}}}}}", .{five}), .need = pdd, .needle = "PDD student" },
+        .{ .body = try std.fmt.allocPrint(a, "{{\"init_step\":1,\"init_video\":{{\"frames\":{s}}}}}", .{five}), .need = chained, .needle = "chained windows" },
+        .{ .body = try std.fmt.allocPrint(a, "{{\"init_step\":1,\"init_video\":{{\"frames\":{s}}}}}", .{five}), .need = one_step, .needle = "at least 2 steps; this run has 1" },
+        .{ .body = try std.fmt.allocPrint(a, "{{\"init_step\":0,\"init_video\":{{\"frames\":{s}}}}}", .{five}), .need = base, .needle = "must be in [1, 1] for this 2-step run; got 0" },
+        .{ .body = try std.fmt.allocPrint(a, "{{\"init_step\":2,\"init_video\":{{\"frames\":{s}}}}}", .{five}), .need = base, .needle = "got 2" },
+        .{ .body = try std.fmt.allocPrint(a, "{{\"init_step\":\"1\",\"init_video\":{{\"frames\":{s}}}}}", .{five}), .need = base, .needle = "'init_step' must be an integer" },
+        .{ .body = "{\"init_step\":1,\"init_video\":[\"QUJD\"]}", .need = base, .needle = "'init_video' must be an object" },
+        .{ .body = try std.fmt.allocPrint(a, "{{\"init_step\":1,\"init_video\":{{\"frames\":{s}}}}}", .{four}), .need = base, .needle = "has 4 frames; this request needs exactly 5" },
+        .{ .body = try std.fmt.allocPrint(a, "{{\"init_step\":1,\"init_video\":{{\"frames\":{s}}}}}", .{narrow}), .need = base, .needle = "'init_video'.frames[0] is 32x64; every frame must be exactly 64x64" },
+        .{ .body = "{\"init_step\":1,\"init_video\":{\"frames\":[\"QUJD\",\"!!!!\",\"QUJD\",\"QUJD\",\"QUJD\"]}}", .need = base, .needle = "could not decode 'init_video'.frames[0]" },
+        .{ .body = try std.fmt.allocPrint(a, "{{\"init_step\":1,\"init_video\":{{\"frames\":{s},\"audio\":\"{s}\"}}}}", .{ five, try testWav(a, want_samples) }), .need = silent_pack, .needle = "needs the pack's audio VAE" },
+        .{ .body = try std.fmt.allocPrint(a, "{{\"init_step\":1,\"init_video\":{{\"frames\":{s},\"audio\":\"QUJD\"}}}}", .{five}), .need = base, .needle = "'init_video'.audio must be a PCM16" },
+        .{ .body = try std.fmt.allocPrint(a, "{{\"init_step\":1,\"init_video\":{{\"frames\":{s},\"audio\":\"{s}\"}}}}", .{ five, try testWav(a, want_samples / 2) }), .need = base, .needle = "this clip's soundtrack is" },
+    };
+    for (cases) |c| {
+        var b = job.Body.parse(testing.allocator, c.body).?;
+        defer b.deinit();
+        var out: InitMedia = .{};
+        defer out.deinit();
+        len = 0;
+        const v = (try initClip(&req, &b, c.need, s, &out)) orelse {
+            std.debug.print("accepted: {s}\n", .{c.needle});
+            return error.ExpectedRejection;
+        };
+        const msg = if (len > 0) buf[0..len] else v.why.slice();
+        testing.expect(std.mem.indexOf(u8, msg, c.needle) != null) catch |e| {
+            std.debug.print("want '{s}', got '{s}'\n", .{ c.needle, msg });
+            return e;
+        };
+    }
+    // Neither field: the feature is off.
+    {
+        var b = job.Body.parse(testing.allocator, "{\"prompt\":\"x\"}").?;
+        defer b.deinit();
+        var out: InitMedia = .{};
+        defer out.deinit();
+        try testing.expect((try initClip(&req, &b, base, s, &out)) == null);
+        try testing.expect(out.clip() == null);
+    }
+    // A matching clip, its soundtrack 10 samples long: decoded at the canvas, the track fitted to the clip's length.
+    {
+        const body = try std.fmt.allocPrint(a, "{{\"init_step\":1,\"init_video\":{{\"frames\":{s},\"audio\":\"{s}\"}}}}", .{ five, try testWav(a, want_samples + 10) });
+        var b = job.Body.parse(testing.allocator, body).?;
+        defer b.deinit();
+        var out: InitMedia = .{};
+        defer out.deinit();
+        try testing.expect((try initClip(&req, &b, base, s, &out)) == null);
+        const clip = out.clip().?;
+        try testing.expectEqual(@as(u32, 1), clip.step);
+        try testing.expectEqualSlices(c_int, &.{ 1, 3, 5, 64, 64 }, mlx.getShape(clip.pixels));
+        try testing.expectEqualSlices(c_int, &.{ 2, @intCast(want_samples) }, mlx.getShape(clip.waveform.?));
+    }
+}
+
+test "minimax_h3 plugin: init_step without init_video is refused through the step" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var pack = try MediaPack.open(arena.allocator());
+    defer pack.close();
+    try testing.expect(std.mem.startsWith(u8, (try pack.run("{\"prompt\":\"x\",\"width\":64,\"height\":64,\"num_frames\":5,\"steps\":2,\"init_step\":1}")).refused.why.slice(), "'init_step' needs 'init_video'"));
+}
+
+test "minimax_h3 plugin: a soundtrack within one latent frame is fitted to the clip, a longer miss is not" {
+    const pcm = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 }; // 3 stereo frames
+    const longer = (try fitSoundtrack(&pcm, 5)).?;
+    defer gpa.free(longer);
+    try testing.expectEqualSlices(f32, &.{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0, 0, 0, 0 }, longer);
+    const shorter = (try fitSoundtrack(&pcm, 2)).?;
+    defer gpa.free(shorter);
+    try testing.expectEqualSlices(f32, &.{ 0.1, 0.2, 0.3, 0.4 }, shorter);
+    try testing.expect((try fitSoundtrack(&pcm, 3 + @import("audio.zig").HOP_LENGTH + 1)) == null);
+}
+
+/// The conformance pack with the video VAE's encoder: what an `init_video` run needs.
+const EncoderPackRoot = struct {
+    pub const plugin = config.plugin;
+    pub const table = @import("plugin.zig").table;
+    pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
+        var fx = try @import("plugin.zig").conformanceFixture(a);
+        const files = try a.dupe(sdk.fixture.File, fx.files);
+        for (files) |*f| if (std.mem.eql(u8, f.name, "video_vae.safetensors")) {
+            f.bytes = try fixtureVae(a, true);
+        };
+        fx.files = files;
+        return fx;
+    }
+};
+
+test "minimax_h3 plugin: an init_video run starts from the clip at init_step; a run without one is unchanged" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var plain = try MediaPack.open(a);
+    defer plain.close();
+    const no_init = try a.dupe(u8, (try plain.run(plain.fx.body)).ok);
+
+    var pack = try @import("../../sdk/testing/media_pack.zig").MediaPack(EncoderPackRoot).open(a);
+    defer pack.close();
+    // The encoder's weights change nothing for a run that does not ask for it.
+    try testing.expectEqualStrings(no_init, (try pack.run(pack.fx.body)).ok);
+
+    // 32x32: the encoder is the checkpoint's full width, and its CPU convs at 64x64 cost gigabytes.
+    const plain_32 = "{\"prompt\":\"a red ball rolls\",\"width\":32,\"height\":32,\"num_frames\":5,\"steps\":2,\"seed\":3,\"fast\":false";
+    const no_init_32 = try a.dupe(u8, (try pack.run(plain_32 ++ "}")).ok);
+    const body = try std.fmt.allocPrint(a, "{s},\"init_step\":1,\"init_video\":{{\"frames\":{s}}}}}", .{ plain_32, try testFrames(a, 5, 32, 32) });
+    const first = switch (try pack.run(body)) {
+        .ok => |o| try a.dupe(u8, o),
+        .refused => |v| {
+            std.debug.print("init run refused: {s}\n", .{v.why.slice()});
+            return error.InitRunRefused;
+        },
+    };
+    try testing.expect(std.mem.startsWith(u8, first, "\"frames\":5,\"height\":32,\"width\":32,\"fps\":24,\"format\":\"rgb8\",\"data\":\""));
+    try testing.expectEqual(no_init_32.len, first.len);
+    try testing.expect(!std.mem.eql(u8, no_init_32, first));
+    try testing.expectEqualStrings(first, (try pack.run(body)).ok);
 }
 
 const MediaPack = @import("../../sdk/testing/media_pack.zig").MediaPack(@This());

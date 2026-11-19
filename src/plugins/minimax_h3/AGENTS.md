@@ -23,6 +23,8 @@ a student runs exactly its own), `seed`, `turbo` (needs `turbo_lora.safetensors`
 `chain_windows` 1-6 (FL2VA only; `num_frames` per window), `first_frame_image` / `last_frame_image`, `ref_images` /
 `ref_videos` (`{frames, audio}`) / `ref_audios` + `ref_image_size` (REF2VA only), `lora_paths`/`lora_scales`.
 A two-time pack samples only its trained step counts (`two_time.sigma_grids`), default `default_steps`; no `turbo`.
+`init_video` (`{frames, audio}`, frames exactly `width`x`height` and the snapped count) + `init_step` k in [1, steps-1]:
+the target starts at `(1-σ_k)·x0 + σ_k·noise` (audio at its own clock's σ) and steps k..steps-1 run; PDD and chains refuse.
 `cfg_scale`/`stg_scale`/`pipeline` are ignored, not refused (the app sends them for every video backend).
 
 ## Rules
