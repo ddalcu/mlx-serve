@@ -164,6 +164,7 @@ enum FluxVariant: String, Hashable, Codable {
     case qwenImage21      // Qwen-Image-2.1 block-causal DiT — served by the qwen_image backend; undistilled (40 steps, optional real CFG)
     case qwenImage21Turbo // Qwen-Image-2.1-Turbo — same backend; its pack's 8-sigma grid sets the steps server-side
     case mossImage        // OpenMOSS MOSS-Image 5B single-stream DiT — served by the moss_image backend; undistilled (50 steps, CFG 3)
+    case minimaxH3Image   // MiniMax-H3-Image — H3's DiT as a six-step PDD student, served by the minimax_h3_image backend
 }
 
 struct ImageQualitySettings: Hashable {
@@ -622,6 +623,44 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "OpenMOSS's 5B image model — long prompts, tag lists or a JSON layout that places each object and line of text, with in-image text in English and Chinese. Undistilled: 50 steps with guidance, so it is slow. Open (Apache-2.0)."
     )
 
+    /// The release's 16 MP sizes and their 4 MP halves. Any side from 16 to 6272 is taken as typed: the server
+    /// generates on its own 32-pixel canvas (at least 2048x2048 in area) and resizes back to the request.
+    private static let h3ImageResolutions: [ResolutionOption] = [
+        .init(width: 2048, height: 2048, label: "2048 × 2048 (square, 4 MP)"),
+        .init(width: 4096, height: 4096, label: "4096 × 4096 (square, 16 MP)"),
+        .init(width: 2368, height: 1776, label: "2368 × 1776 (landscape 4:3, 4 MP)"),
+        .init(width: 1776, height: 2368, label: "1776 × 2368 (portrait 3:4, 4 MP)"),
+        .init(width: 2736, height: 1536, label: "2736 × 1536 (landscape 16:9, 4 MP)"),
+        .init(width: 1536, height: 2736, label: "1536 × 2736 (portrait 9:16, 4 MP)"),
+        .init(width: 4736, height: 3552, label: "4736 × 3552 (landscape 4:3, 16 MP)"),
+        .init(width: 3552, height: 4736, label: "3552 × 4736 (portrait 3:4, 16 MP)"),
+        .init(width: 5472, height: 3072, label: "5472 × 3072 (landscape 16:9, 16 MP)"),
+        .init(width: 3072, height: 5472, label: "3072 × 5472 (portrait 9:16, 16 MP)"),
+        .init(width: 6272, height: 2688, label: "6272 × 2688 (cinematic 21:9, 16 MP)"),
+    ]
+
+    /// MiniMax-H3-Image, 4-bit (`tests/convert_minimax_h3_weights.py --partition image --bits 4`): 15.9 GB peak
+    /// on M1 to M4. The 8-bit pack is published but not listed: it needs a 48 GB Mac for a little more fine detail.
+    static let minimaxH3Image_4bit = ImageModelPreset(
+        id: "ddalcu/minimax-h3-image-4bit",
+        name: "MiniMax-H3-Image 4-bit (~37 GB)",
+        variant: .minimaxH3Image,
+        configName: "minimax_h3_image",
+        repo: "ddalcu/MiniMax-H3-Image-MLX-Serve-4bit",
+        approxDownloadGB: 37,
+        approxRAMGB: 17,
+        resolutions: h3ImageResolutions,
+        defaultResolution: h3ImageResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 6),
+            .good:         .init(steps: 6),
+            .quality:      .init(steps: 6),
+            .superQuality: .init(steps: 6),
+        ],
+        defaultQuality: .good,
+        description: "MiniMax's H3 image model — photoreal detail and sharp in-image text from 4 to 16 megapixels, and edits that combine up to 16 pictures, in six steps. MiniMax-H3-Image Community License (not for use in the EU, UK, South Korea or the US)."
+    )
+
     /// Catalog ordered cheapest → heaviest. Default (`first`) is FLUX.2-klein
     /// 4B Q4 — smallest download.
     static let all: [ImageModelPreset] = [
@@ -636,6 +675,7 @@ struct ImageModelPreset: Identifiable, Hashable {
         .qwenImage21_8bit,                             // 18
         .qwenImage21Turbo_8bit,                        // 18
         .mossImageSFT_bf16,                            // 27
+        .minimaxH3Image_4bit,                          // 37
     ]
 }
 
@@ -2431,7 +2471,7 @@ extension ImageModelPreset {
     var condWeightCount: Int {
         switch variant {
         case .krea2Turbo: return 12
-        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo, .mossImage: return 0
+        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo, .mossImage, .minimaxH3Image: return 0
         default: return 3
         }
     }
@@ -2449,6 +2489,9 @@ extension ImageModelPreset {
         // widest preset edge.
         case .flux2Klein4B, .flux2Klein9B, .flux2Klein9BBase:
             return ResolutionGrid(alignment: 32, minDim: 256, maxDim: 1536)
+        // The plugin resizes its 32-pixel canvas back to the requested size, so nothing is rounded.
+        case .minimaxH3Image:
+            return ResolutionGrid(alignment: 1, minDim: 16, maxDim: 6272)
         }
     }
 
@@ -2458,7 +2501,8 @@ extension ImageModelPreset {
     /// Turbo (txt2img) can only do renoise variations.
     var supportsReferenceEdit: Bool {
         switch variant {
-        case .flux2Klein4B, .flux2Klein9B, .flux2Klein9BBase, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo:
+        case .flux2Klein4B, .flux2Klein9B, .flux2Klein9BBase, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo,
+             .minimaxH3Image:
             return true
         case .krea2Turbo, .mageFlowTurbo, .mossImage:
             return false
@@ -2471,6 +2515,7 @@ extension ImageModelPreset {
     var maxReferenceImages: Int {
         switch variant {
         case .qwenImage21, .qwenImage21Turbo: return 9
+        case .minimaxH3Image: return 15
         default: return 3
         }
     }
@@ -2506,7 +2551,7 @@ extension ImageModelPreset {
     /// all: sending a source without `mode:"edit"` is a 400.
     var supportsImg2Img: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo, .mossImage: return false
+        case .mageFlowTurbo, .mageFlowEditTurbo, .mossImage, .minimaxH3Image: return false
         default: return true
         }
     }
@@ -2515,7 +2560,7 @@ extension ImageModelPreset {
     /// Mage-Flow has no LoRA path, so a picked adapter matches 0 modules → 400.
     var supportsLoRA: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo: return false
+        case .mageFlowTurbo, .mageFlowEditTurbo, .minimaxH3Image: return false
         default: return true
         }
     }
@@ -2525,17 +2570,23 @@ extension ImageModelPreset {
     /// 8 steps costs 2× and 12 costs 4× for a DIFFERENT image, not a better one.
     var stepsAreFixed: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21Turbo: return true
+        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21Turbo, .minimaxH3Image: return true
         default: return false
         }
     }
 
     /// The pack's own sampling grid sets the step count server-side, so a
     /// `steps` field would be a control that does nothing.
-    var stepsSetByCheckpoint: Bool { variant == .qwenImage21Turbo }
+    var stepsSetByCheckpoint: Bool { variant == .qwenImage21Turbo || variant == .minimaxH3Image }
 
     /// The fixed step count for a distilled preset (its `.good` profile).
     var fixedSteps: Int { settings(.good).steps }
+
+    /// MiniMax-H3-Image's prompts name the pictures of an edit `<Picture i>`, as its release does.
+    var namesPicturesInPrompt: Bool { variant == .minimaxH3Image }
+
+    /// How the prompt refers to the n-th picture of an edit (the source is 1).
+    func referenceName(_ n: Int) -> String { namesPicturesInPrompt ? "<Picture \(n)>" : "image \(n)" }
 
     /// Lays out whole pages of text (infographics, slides, posters), verified
     /// live: the Infographics templates and Enhance's layout rules follow it.
@@ -2546,6 +2597,7 @@ extension ImageModelPreset {
     /// only way to discover that it can produce a depth map or de-rain a photo
     /// is to be shown the sentence that does it.
     func promptExamples(editing: Bool) -> [ImagePromptExampleGroup] {
+        if variant == .minimaxH3Image && !editing { return [ImagePromptExamples.minimaxH3] }
         guard editing && supportsReferenceEdit else {
             if variant == .mossImage { return ImagePromptExamples.textToImage + [ImagePromptExamples.mossImage] }
             return rendersDenseText ? ImagePromptExamples.textToImage + [ImagePromptExamples.infographics]
