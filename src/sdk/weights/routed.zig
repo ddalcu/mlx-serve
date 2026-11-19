@@ -59,6 +59,10 @@ pub const Routed = struct {
     /// Model layer `layer`'s predicted routes (an unevaluated int32 [rows, k] array made before the call before it),
     /// read ahead during that call once its routes are made. Null: not offered.
     next_fn: ?*const fn (*anyopaque, u32, mlx.mlx_array) Ret(void) = null,
+    /// `source` for a decode-lane call (at most `decode_ids` ids) with a hoist (the last argument: an array the call does
+    /// not read, the model's shared expert over its rows), which the source may commit while the call waits for its
+    /// reads: `source`'s sum word for word; the model adds the hoist itself. Null: not offered.
+    source_hoist: ?*const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array) = null,
 
     pub fn settle(r: Routed) !void {
         return r.settle_fn(r.ctx).get();

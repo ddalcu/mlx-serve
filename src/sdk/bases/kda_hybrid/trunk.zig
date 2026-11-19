@@ -427,6 +427,11 @@ pub const Hooks = struct {
     /// A routed layer's own router (`moe.RouterHook`) from its router weight as stored (`[experts, hidden]`,
     /// unquantized), for the trunk's routed layers (a head's keeps the block's route); null from `fill`: the block's.
     router: ?Router = null,
+    /// Each f16 matrix `lin` serves as a bf16 copy (`servedBf16`) lets its f16 bytes go once the copy is evaluated:
+    /// the load's views of it are freed and the source's tensor released (`Source.releaseTensor`) before a streaming
+    /// pack's bank reads the memory, so the bank's rows take the bytes. Off: they stay until the unload (views) or the
+    /// load's end (source).
+    free_f16_sources: bool = false,
 
     pub const FusedDecode = struct { rows: c_int, run: @FieldType(moe.Fused, "run") };
     pub const Router = struct { ctx: ?*anyopaque = null, fill: *const fn (ctx: ?*anyopaque, stored: Array) anyerror!?moe.RouterHook };
@@ -458,8 +463,9 @@ pub fn exl3Spec(hooks: Hooks, expert_quant_json: []const u8, top_k: u32) !?Hooks
 }
 
 /// A weight triple as stored (`<base>.{weight,scales,biases}`), scales and biases absent on a dense weight; or a
-/// projection the pack's outside quant plugin loaded (`ext`, `w` its first array).
-const Triple = struct { w: Array, s: Array = .{}, b: Array = .{}, ext: ?outside.Weight = null };
+/// projection the pack's outside quant plugin loaded (`ext`, `w` its first array). `stored`: the `w` a view replaced
+/// (`Loader.transposed`).
+const Triple = struct { w: Array, s: Array = .{}, b: Array = .{}, ext: ?outside.Weight = null, stored: Array = .{} };
 
 const Loader = struct {
     src: *const quant_abi.Source,
@@ -472,6 +478,8 @@ const Loader = struct {
     experts: ?*streamed.Streamed = null,
     /// The outside quant plugin claiming the pack (`format` null: none).
     quant: *outside_model.Load,
+    /// `Hooks.free_f16_sources`: the f16 handles `lin` served as bf16 copies, let go by `letGoF16`.
+    f16_sources: std.ArrayList(Array) = .empty,
 
     /// Takes `a`, an array this load made.
     fn own(l: *Loader, a: Array) !Array {
@@ -541,6 +549,7 @@ const Loader = struct {
     /// A dense weight stored `[out, in]` as the `[in, out]` view a plain matmul reads.
     fn transposed(l: *Loader, t: *Triple) !void {
         if (t.s.ctx != null or t.w.ctx == null or t.ext != null) return;
+        t.stored = t.w;
         t.w = try l.own(try transposeLast(t.w, l.s));
     }
 
@@ -551,15 +560,35 @@ const Loader = struct {
 
     fn lin(l: *Loader, raw: Triple, in_dim: ?u32) !Linear {
         if (raw.ext != null) return .{ .w = raw.w, .ext = raw.ext };
-        // A pack an outside plugin claims keeps its plain matrices f16: run in the activation dtype, none promotes.
-        if (l.quant.format != null and raw.s.ctx == null and raw.w.ctx != null and mlx.mlx_array_dtype(raw.w) == .float16 and mlx.getShape(raw.w).len >= 2)
-            return .{ .w = try l.own(try astypeEval(raw.w, .bfloat16, l.s)) };
+        if (raw.w.ctx != null and servedBf16(l.quant.format != null, raw.s.ctx != null, mlx.mlx_array_dtype(raw.w), mlx.getShape(raw.w).len)) {
+            const bf = try l.own(try astypeEval(raw.w, .bfloat16, l.s));
+            if (l.hooks.free_f16_sources) try l.f16_sources.appendSlice(gpa, &.{ raw.w, raw.stored });
+            return .{ .w = bf };
+        }
         const t = try l.kept(raw);
         if (t.s.ctx == null) return .{ .w = t.w };
         // e4m3: the matmul knows it by its dtypes; no affine kernel may claim it.
         if (fp8_claim.isBlockScaled(t.w, t.s)) return .{ .w = t.w, .s = t.s, .bits = 0, .group_size = fp8_claim.block_cols };
         const qp = resolve(l.c, t.w, t.s, in_dim);
         return .{ .w = t.w, .s = t.s, .b = t.b, .bits = qp.bits, .group_size = qp.group_size, .mode = qp.mode };
+    }
+
+    /// Frees the views among `f16_sources` (their bf16 copies evaluated) and releases the source's own handles.
+    fn letGoF16(l: *Loader) void {
+        const xs = l.f16_sources.items;
+        for (xs, 0..) |a, i| {
+            if (a.ctx == null) continue;
+            if (for (xs[0..i]) |e| {
+                if (e.ctx == a.ctx) break true;
+            } else false) continue;
+            const owned = for (l.owned.items, 0..) |o, j| {
+                if (o.ctx == a.ctx) break j;
+            } else null;
+            if (owned) |j| {
+                _ = mlx.mlx_array_free(l.owned.orderedRemove(j));
+            } else _ = l.src.releaseTensor(.{ .ctx = a.ctx });
+        }
+        l.f16_sources.clearRetainingCapacity();
     }
 
     /// `<base>` as a projection over `in_dim` inputs (a dense one pre-transposed).
@@ -983,6 +1012,12 @@ fn lastDim(x: Array) c_int {
     return if (sh.len == 0) 0 else sh[sh.len - 1];
 }
 
+/// Whether a plain matrix is served as a bf16 copy (`Loader.lin`): a claimed pack keeps its unscaled matrices f16,
+/// which would promote the bf16 activations they meet.
+fn servedBf16(claimed: bool, scaled: bool, dtype: mlx.mlx_dtype, ndim: usize) bool {
+    return claimed and !scaled and dtype == .float16 and ndim >= 2;
+}
+
 fn astypeEval(x: Array, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !Array {
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -1028,6 +1063,7 @@ pub fn load(ctx: *const abi.LoadCtx, hooks: Hooks) !*Model {
     defer m.quant.close();
     if (c.streamed_bank and m.quant.format == null) return error.StreamedBankUnclaimed;
     var l: Loader = .{ .src = src, .c = c, .s = s, .prefix = prefix, .owned = &m.owned, .exl3 = null, .hooks = hooks, .quant = &m.quant };
+    defer l.f16_sources.deinit(gpa);
     if (c.num_experts > 0 and !c.streamed_bank) m.experts = try streamed.Streamed.forLoad(gpa, ctx, c.num_experts, s);
     if (m.experts) |*x| l.experts = x;
     l.exl3 = try exl3Spec(hooks, c.expert_quant_json, c.num_experts_per_tok);
@@ -1080,6 +1116,8 @@ pub fn load(ctx: *const abi.LoadCtx, hooks: Hooks) !*Model {
     // The drafts' readout of a head the outside plugin runs, before the bank takes its room: the engine borrows it at
     // the bind (`trunk_weight`).
     if ((m.mtp != null or m.ling_mtp != null) and m.head.ext != null) try draftReadout(m);
+    // Past every read of the load's borrowed handles, before the bank's open reads the memory.
+    if (hooks.free_f16_sources) l.letGoF16();
     if (c.streamed_bank) {
         // The head resident before the bank's open reads the memory (else lazy until `HeadHooks.load`, past the open).
         if (m.mtp != null) try readyHead(m);
@@ -1259,4 +1297,12 @@ pub fn readyHead(m: *Model) !void {
     try mlx.evalFields(h);
     try m.quant.eval();
     m.mtp_ready = true;
+}
+
+test "glm5_next trunk: a claimed pack's unscaled f16 matrix alone is served as a bf16 copy (whose f16 bytes free_f16_sources lets go)" {
+    try std.testing.expect(servedBf16(true, false, .float16, 2));
+    try std.testing.expect(!servedBf16(false, false, .float16, 2));
+    try std.testing.expect(!servedBf16(true, true, .float16, 2));
+    try std.testing.expect(!servedBf16(true, false, .bfloat16, 2));
+    try std.testing.expect(!servedBf16(true, false, .float16, 1));
 }
