@@ -2144,7 +2144,7 @@ fn registerVerify(set: *kc.Set) !void {
 const ksrc = @import("../../../mlx/kernels.zig").source;
 const gqn = @import("gather_qmm_nax.zig");
 const hc_prefill = @import("../hc/hc_prefill.zig");
-const nax_header = ksrc("kernels/moe/gather_qmm_nax_header.metal");
+const nax_header = gqn.NAX_HEADER;
 const nax_mapped_header = nax_header ++ ksrc("kernels/moe/gather_qmm_nax_mapped_header.metal");
 const nax_mm_in = [_][*:0]const u8{ "x", "w", "scales", "biases", "tiles", "tile_count", "params" };
 const nax_map_in = [_][*:0]const u8{ "x", "w", "scales", "biases", "up_w", "up_scales", "up_biases", "tiles", "tile_count", "params", "sigtab", "rmap", "gsc", "usc" };
