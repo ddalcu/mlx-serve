@@ -2612,7 +2612,7 @@ fn registerNax(set: *kc.Set) !void {
     try set.add(GqmmNax, .init(a, .paired, .mxfp4, 4, 32, 32), .{ .name = "gather_qmm_nax paired bf16 (MXFP4)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = chain, .served = paired[0..1] }, null);
     var lim = GqmmNax.init(a, .paired, .affine, 4, 64, 32);
     lim.limit = 7;
-    try set.add(GqmmNax, lim, .{ .name = "gather_qmm_nax paired bf16 (4-bit g64, limit 7)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = "take (the row map) -> " ++ gather ++ " for gate and up -> clampedSwiGLU", .served = paired[0..1], .known = limit_drops_nan }, null);
+    try set.add(GqmmNax, lim, .{ .name = "gather_qmm_nax paired bf16 (4-bit g64, limit 7)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = "take (the row map) -> " ++ gather ++ " for gate and up -> clampedSwiGLU", .served = paired[0..1] }, null);
     // Per-expert scales (ModelOpt NVFP4's global scales) in the pair's epilogue, both fp4 formats: the gate's alone
     // (an unclamped SwiGLU, the up x down scales riding the scores), and gate and up before a clamp.
     try set.add(GqmmNax, .init(a, .paired, .nvfp4, 4, 16, 32), .{ .name = "gather_qmm_nax paired bf16 (NVFP4)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = chain, .served = paired[0..1] }, null);
@@ -2625,7 +2625,7 @@ fn registerNax(set: *kc.Set) !void {
     var both = GqmmNax.init(a, .paired, .nvfp4, 4, 16, 32);
     both.esc = 3;
     both.limit = 7;
-    try set.add(GqmmNax, both, .{ .name = "gather_qmm_nax paired bf16 (NVFP4, gate and up scales, limit 7)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = "take (the row map) -> " ++ gather ++ " for gate and up -> take (the scales) -> multiply -> clampedSwiGLU", .served = paired[0..1], .known = limit_drops_nan }, null);
+    try set.add(GqmmNax, both, .{ .name = "gather_qmm_nax paired bf16 (NVFP4, gate and up scales, limit 7)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = "take (the row map) -> " ++ gather ++ " for gate and up -> take (the scales) -> multiply -> clampedSwiGLU", .served = paired[0..1] }, null);
 }
 
 // ── the stream-read microbenchmark ──
@@ -2875,7 +2875,7 @@ fn registerFp4(set: *kc.Set) !void {
         f = Fp4.init(a, .gateup, .nvfp4);
         f.gscale = true;
         f.clamp = LIMIT;
-        try addFp4(set, f, "moe_fp4 gateup bf16 (NVFP4, gate scale, clamp 10)", gu_served, limit_drops_nan);
+        try addFp4(set, f, "moe_fp4 gateup bf16 (NVFP4, gate scale, clamp 10)", gu_served, null);
         f = Fp4.init(a, .gateup, .mxfp4);
         try addFp4(set, f, "moe_fp4 gateup bf16 (MXFP4)", gu_served, null);
         f = Fp4.init(a, .gateup, .mxfp4);

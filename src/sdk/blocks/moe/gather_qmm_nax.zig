@@ -1097,6 +1097,134 @@ test "segmented NAX paired SwiGLU with per-expert scales matches the split path 
     try scaledPairCase(3301, 512, 10, 640, 2560, 32, true, s);
 }
 
+/// `a` and `b` equal element for element, a NaN equal to a NaN.
+fn expectBitEqualNan(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !void {
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, a, b, true, s));
+    var same = false;
+    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+    try std.testing.expect(same);
+}
+
+test "segmented NAX gathers on every fp4 code: all 16 e2m1 codes, every e4m3 / e8m0 scale code (NaNs, subnormals, 2^-127..2^127), NaN rows, the clamp on NaN" {
+    try requireNax();
+    errdefer dropOwnLatch();
+    const s = mlx.gpuStream();
+    const experts: c_int = 8;
+    const n: c_int = 64;
+    const k: c_int = 512;
+    const tokens: c_int = 96;
+    const rows = tokens * 4;
+    const alloc = std.testing.allocator;
+    const ids_data = try alloc.alloc(u32, @intCast(rows));
+    defer alloc.free(ids_data);
+    for (ids_data, 0..) |*v, i| v.* = @intCast(i * @as(usize, @intCast(experts)) / @as(usize, @intCast(rows)));
+    const ids = mlx.mlx_array_new_data(ids_data.ptr, &[_]c_int{rows}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    const map_data = try alloc.alloc(u32, @intCast(rows));
+    defer alloc.free(map_data);
+    for (map_data, 0..) |*v, i| v.* = @intCast((i * 37 + 5) % @as(usize, @intCast(tokens)));
+    const row_map = mlx.mlx_array_new_data(map_data.ptr, &[_]c_int{rows}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(row_map);
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 0xC0DE));
+    var xn = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xn);
+    try mlx.check(mlx.mlx_random_normal(&xn, &[_]c_int{ tokens * k }, 1, .bfloat16, 0, 0.5, key, s));
+    try mlx.check(mlx.mlx_array_eval(xn));
+    // Token 3 is all NaN, token 7 has one NaN: NaN must reach every output it feeds.
+    const xh = try alloc.alloc(u16, @intCast(tokens * k));
+    defer alloc.free(xh);
+    @memcpy(xh, @as([*]const u16, @ptrCast(mlx.mlx_array_data_bfloat16(xn) orelse return error.NoData))[0..xh.len]);
+    for (xh[@intCast(3 * k)..][0..@intCast(k)]) |*v| v.* = 0x7FC0;
+    xh[@intCast(7 * k + 100)] = 0x7FC0;
+    const x = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ tokens, 1, k }, 3, .bfloat16);
+    defer _ = mlx.mlx_array_free(x);
+    var x_rep = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x_rep);
+    try mlx.check(mlx.mlx_take_axis(&x_rep, x, row_map, 0, s));
+    const sigtab = try @import("../hc/hc_prefill.zig").sigmoidTable(s);
+    for ([_]u32{ 16, 32 }) |group| {
+        // Every word cycles the 16 e2m1 codes (-0 included); the scale bytes cycle all 256 codes, the up bank's
+        // shifted so gate and up meet different codes.
+        const words = try alloc.alloc(u32, @intCast(experts * n * @divExact(k, 8)));
+        defer alloc.free(words);
+        for (words, 0..) |*w, i| w.* = @as(u32, 0x76543210) +% @as(u32, @intCast(i % 2)) *% 0x88888888;
+        const nsc: usize = @intCast(experts * n * @divExact(k, @as(c_int, @intCast(group))));
+        var banks: [2][2]mlx.mlx_array = undefined;
+        for (&banks, 0..) |*b, which| {
+            const codes = try alloc.alloc(u8, nsc);
+            defer alloc.free(codes);
+            for (codes, 0..) |*c, i| c.* = @intCast((i * 7 + which * 101) % 256);
+            b.* = .{
+                mlx.mlx_array_new_data(words.ptr, &[_]c_int{ experts, n, @divExact(k, 8) }, 3, .uint32),
+                mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ experts, n, @divExact(k, @as(c_int, @intCast(group))) }, 3, .uint8),
+            };
+        }
+        defer for (banks) |b| for (b) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const none = mlx.mlx_array{ .ctx = null };
+        for (banks) |b| {
+            const got = (try sortedGatherPrompt(x_rep, b[0], b[1], none, ids, 4, group, true, true, s)) orelse return error.KernelDeclinedTestShape;
+            defer _ = mlx.mlx_array_free(got);
+            const ref = try stockGather(x_rep, b[0], b[1], none, ids, 4, group, true, s);
+            defer _ = mlx.mlx_array_free(ref);
+            try expectBitEqualNan(ref, got, s);
+        }
+        // The paired kernel, clamped at 1 after per-expert scales (one NaN among them would be refused at load, so
+        // finite ones here), against the split path on the same banks: a NaN gate or up stays NaN through the clamp.
+        var esc: [2]mlx.mlx_array = undefined;
+        for (&esc, [_]f32{ 0.75, 1.5 }) |*o, v| {
+            var vals: [8]u16 = undefined;
+            for (&vals, 0..) |*h, i| h.* = @truncate(@as(u32, @bitCast(v * @as(f32, @floatFromInt(i + 1)))) >> 16);
+            o.* = mlx.mlx_array_new_data(&vals, &[_]c_int{experts}, 1, .bfloat16);
+        }
+        defer for (esc) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const mg = (try sortedGatherMapped(x, row_map, banks[0][0], banks[0][1], none, ids, 4, group, true, true, s)) orelse return error.KernelDeclinedTestShape;
+        defer _ = mlx.mlx_array_free(mg);
+        const mu = (try sortedGatherMapped(x, row_map, banks[1][0], banks[1][1], none, ids, 4, group, true, true, s)) orelse return error.KernelDeclinedTestShape;
+        defer _ = mlx.mlx_array_free(mu);
+        var scaled: [2]mlx.mlx_array = undefined;
+        for (&scaled, [_]mlx.mlx_array{ mg, mu }, esc) |*o, y, sc| {
+            var picked = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(picked);
+            try mlx.check(mlx.mlx_take_axis(&picked, sc, ids, 0, s));
+            var col = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(col);
+            try mlx.check(mlx.mlx_reshape(&col, picked, &[_]c_int{ rows, 1, 1 }, 3, s));
+            o.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(o, y, col, s));
+        }
+        defer for (scaled) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        for ([_]u32{ 0, 1 }) |limit| {
+            const fused = (try sortedGateUpScaled(x, row_map, banks[0][0], banks[0][1], none, banks[1][0], banks[1][1], none, ids, sigtab, limit, .{ .gate = esc[0], .up = esc[1] }, 4, group, true, true, s)) orelse return error.KernelDeclinedTestShape;
+            defer _ = mlx.mlx_array_free(fused);
+            var ref = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ref);
+            if (limit > 0) {
+                _ = mlx.mlx_array_free(ref);
+                ref = try @import("../mlp/activations.zig").clampedSwiGLU(s, scaled[0], scaled[1], 1.0);
+            } else {
+                var sig = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(sig);
+                var act = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(act);
+                try mlx.check(mlx.mlx_sigmoid(&sig, scaled[0], s));
+                try mlx.check(mlx.mlx_multiply(&act, scaled[0], sig, s));
+                try mlx.check(mlx.mlx_multiply(&ref, act, scaled[1], s));
+            }
+            try expectBitEqualNan(ref, fused, s);
+        }
+    }
+}
+
 test "segmented NAX paired SwiGLU refuses scales it cannot bind" {
     try requireNax();
     errdefer dropOwnLatch();

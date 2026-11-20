@@ -34,7 +34,7 @@ pub fn of(mode: QuantMode, group_size: u32) ?Format {
     };
 }
 
-/// `mlxserve_fp4_scale_x2m8<GS>` / `mlxserve_fp4_scale_of<GS>`: an e8m0 or e4m3 group scale as MLX reads it.
+/// `mlxserve_fp4_scale_of<GS>`: an e8m0 or e4m3 group scale as MLX reads it (its fp8.h, copied).
 pub const SCALE_HEADER = kernelSource("kernels/common/fp4_scale.metal");
 
 const std = @import("std");
@@ -47,4 +47,102 @@ test "fp4 formats: the (mode, group) pairs and nothing else" {
     try std.testing.expect(of(.affine, 32) == null);
     try std.testing.expect(of(.mxfp8, 32) == null);
     for ([_]Format{ .nvfp4, .mxfp4 }) |f| try std.testing.expectEqual(f, of(f.mode(), f.group()).?);
+}
+
+const mlx = @import("../../mlx/ffi.zig");
+
+/// The 256 codes through `mlxserve_fp4_scale_of<GS>` on the GPU, as f32: [0, 256) the read as stored, [256, 512) the read
+/// times a 1.0 loaded at run time (a product, flushed where the GPU flushes one).
+fn decodeAll(gs: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    var codes: [256]u8 = undefined;
+    for (&codes, 0..) |*c, i| c.* = @intCast(i);
+    const in = mlx.mlx_array_new_data(&codes, &[_]c_int{256}, 1, .uint8);
+    defer _ = mlx.mlx_array_free(in);
+    const ones: [16]f32 = @splat(1.0);
+    const one = mlx.mlx_array_new_data(&ones, &[_]c_int{16}, 1, .float32);
+    defer _ = mlx.mlx_array_free(one);
+    const ins = [_][*:0]const u8{ "codes", "one" };
+    const outs = [_][*:0]const u8{"y"};
+    const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&outs, 1);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new("mlxserve_fp4_scale_codes", iv, ov, "const uint i = thread_position_in_grid.x;\nconst float v = mlxserve_fp4_scale_of<GS>(uint(codes[i]));\ny[i] = v;\ny[256 + i] = v * one[i % 16];\n", SCALE_HEADER, true, false);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k);
+    const c = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{512}, 1, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "GS", gs));
+    const arrs = [_]mlx.mlx_array{ in, one };
+    const v = mlx.mlx_vector_array_new_data(&arrs, arrs.len);
+    defer _ = mlx.mlx_vector_array_free(v);
+    var o = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o, k, v, c, s));
+    var y = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&y, o, 0));
+    try mlx.check(mlx.mlx_array_eval(y));
+    return y;
+}
+
+/// MLX's fp8.h `operator float` on the host: fp8_e4m3 by bit placement into a half (0x7f / 0xff NaN) times 256,
+/// fp8_e8m0 as a float exponent (0 is 2^-127, 0xff NaN).
+fn mlxRead(f: Format, code: u8) f32 {
+    return switch (f) {
+        .nvfp4 => blk: {
+            const v: u16 = code & 0x7F;
+            const u: u16 = (v << 7) | (((v + 1) >> 7) << 14) | (@as(u16, code & 0x80) << 8);
+            break :blk @as(f32, @floatCast(@as(f16, @bitCast(u)) * 256.0));
+        },
+        .mxfp4 => @bitCast(if (code == 0) @as(u32, 0x400000) else if (code == 0xFF) @as(u32, 0x7FC00000) else @as(u32, code) << 23),
+    };
+}
+
+/// MLX's own read of the 256 scale codes: `mlx_dequantize` of a bank whose every e2m1 code is 1.0 (code 2) and whose
+/// group g has scale code g, as f32 (element g * GS).
+fn mlxAll(f: Format, s: mlx.mlx_stream) !mlx.mlx_array {
+    const gs: usize = f.group();
+    var words: [256 * 32 / 8]u32 = @splat(0x22222222);
+    var codes: [256]u8 = undefined;
+    for (&codes, 0..) |*c, i| c.* = @intCast(i);
+    const k: c_int = @intCast(256 * gs);
+    const w = mlx.mlx_array_new_data(&words, &[_]c_int{ 1, @divExact(k, 8) }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(w);
+    const sc = mlx.mlx_array_new_data(&codes, &[_]c_int{ 1, 256 }, 2, .uint8);
+    defer _ = mlx.mlx_array_free(sc);
+    var y = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_dequantize(&y, w, sc, .{ .ctx = null }, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(4), f.mode().cstr(), .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_array_eval(y));
+    return y;
+}
+
+test "fp4 scale decode: every e4m3 and e8m0 code is MLX's fp8.h read, and times a run-time 1.0 MLX's dequant bit for bit" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    for ([_]Format{ .nvfp4, .mxfp4 }) |f| {
+        const ours = try decodeAll(@intCast(f.group()), s);
+        defer _ = mlx.mlx_array_free(ours);
+        const theirs = try mlxAll(f, s);
+        defer _ = mlx.mlx_array_free(theirs);
+        const o = (mlx.mlx_array_data_float32(ours) orelse return error.NoData)[0..512];
+        const t = mlx.mlx_array_data_float32(theirs) orelse return error.NoData;
+        for (0..256) |code| {
+            const read = mlxRead(f, @intCast(code));
+            const dq = t[code * @as(usize, f.group())];
+            if (!sameValue(o[code], read) or !sameValue(o[256 + code], dq))
+                std.debug.print("{t} code 0x{x:0>2}: ours {e} / x1 {e}, MLX read {e} / dequant {e}\n", .{ f, code, o[code], o[256 + code], read, dq });
+            try std.testing.expect(sameValue(o[code], read));
+            try std.testing.expect(sameValue(o[256 + code], dq));
+        }
+        // The dequant product flushes e8m0 0x00 (2^-127, a subnormal) to 0 on the GPU, MLX's and ours alike.
+        if (f == .mxfp4) try std.testing.expectEqual(@as(f32, 0), o[256]);
+    }
+}
+
+/// Bit for bit, or both NaN.
+fn sameValue(a: f32, b: f32) bool {
+    if (std.math.isNan(b)) return std.math.isNan(a);
+    return @as(u32, @bitCast(a)) == @as(u32, @bitCast(b));
 }

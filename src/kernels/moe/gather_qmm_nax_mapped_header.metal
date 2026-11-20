@@ -440,8 +440,10 @@ METAL_FUNC void store_act(
             u = T(u * us);
           }
           if constexpr (EPI > 1) {
-            g = metal::min(g, T(EPI - 1));
-            u = metal::max(metal::min(u, T(EPI - 1)), T(1 - EPI));
+            // MLX's Minimum / Clip: a NaN stays NaN (metal::min / max return the other operand).
+            g = g > T(EPI - 1) ? T(EPI - 1) : g;
+            u = u < T(1 - EPI) ? T(1 - EPI) : u;
+            u = u > T(EPI - 1) ? T(EPI - 1) : u;
           }
           const T a = T(g * sigtab[as_type<ushort>(g)]);
           v[j] = T(a * u);
