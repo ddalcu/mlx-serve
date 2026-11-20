@@ -1,11 +1,12 @@
 //! The moe area's kernel contract. The decode gathers that read an expert bank in place: `gather_qmv` (one
-//! projection, shared or per-expert x, optional ReLU^2) is held to float64. The fused gate+up+SwiGLU (solo and rows)
-//! replaces two gathers and MLX's SwiGLU chain bit for bit; the rows down+reduce replaces the solo one per row; the
+//! projection, shared or per-expert x, optional ReLU^2) is held to float64. The fused gate+up+SwiGLU (one kernel for
+//! one row and for rows; per-expert gate / up scales and the clamp) replaces two gathers, the scale multiplies and
+//! MLX's SwiGLU chain bit for bit; the rows down+reduce replaces the solo one per row; the
 //! solo down+reduce (8 or 16 lanes a row, a bf16 sum over the slots) is held to float64 with its rounding chain priced.
 //! Listed in `kernel_contract/registry.zig`. Shapes: rows are top-k slots (solo kernels) or batch rows (rows kernels,
 //! top-k 8); a bank holds 8 experts (16 and 24 for Nemotron's wider top-k), N is cut to a few hundred rows (a runtime
 //! argument). NaN enters through x where an x row feeds only some outputs, else through the bank's scales: affine
-//! scales take NaN and Inf, an NVFP4 scale only e4m3's NaN code 0x7f.
+//! scales take NaN and Inf, an fp4 scale only its NaN code (e4m3 0x7f, e8m0 0xff).
 //! The rows down+reduce is compared with the solo kernel through its declared launch: the shipped `gatherQmvDownReduce`
 //! and `gatherQmvDownReduceRows` cache their config without K (KP is a template argument), so a second K at the same
 //! (top-k, N, bits, group, dtype) reuses the first K's KP (reported; not a gate's finding).
@@ -20,11 +21,12 @@
 //! exact. A mapped launch under 8 routed rows does not compile (MLX binds the row map in `constant`); the wrapper
 //! takes 16 rows or more, so the registration's mapped rows are tokens of four routed rows.
 //! `ubench_stream_wide` (a read-ceiling probe, not served) is held exact as integers.
-//! Known issues: e4m3_nan_code (the NVFP4 kernels whose x feeds every output), act2_drops_nan, limit_drops_nan.
+//! Known issues: limit_drops_nan (moe_fp4's and the NAX pair's clamps).
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const ops = @import("../../../mlx/ops.zig");
+const env = @import("../../../env.zig");
 const kc = @import("../../testing/kernel_contract/root.zig");
 const gq = @import("gather_qmv.zig");
 const gqr = @import("gather_qmv_rows.zig");
@@ -58,44 +60,35 @@ const Kind = enum { qmv, gateup, gateup_rows, down, down_rows };
 
 const aff_in = [_][*:0]const u8{ "x", "w_q", "scales", "biases", "inds", "K_size", "N_size" };
 const nv_in = [_][*:0]const u8{ "x", "w_q", "scales", "inds", "K_size", "N_size" };
-const gu_aff_in = [_][*:0]const u8{ "x", "wg_q", "g_scales", "g_biases", "wu_q", "u_scales", "u_biases", "inds", "sigtab", "K_size", "N_size" };
-const gu_nv_in = [_][*:0]const u8{ "x", "wg_q", "g_scales", "wu_q", "u_scales", "inds", "sigtab", "K_size", "N_size" };
-const gur_nv_in = gu_nv_in ++ [_][*:0]const u8{"gsc"};
 const dr_aff_in = [_][*:0]const u8{ "x", "w_q", "scales", "biases", "inds", "scores", "K_size", "N_size" };
 const dr_nv_in = [_][*:0]const u8{ "x", "w_q", "scales", "inds", "scores", "K_size", "N_size" };
 
-fn header(nv: bool) [:0]const u8 {
-    return if (nv) gq.GQMV_NVFP4_HEADER else gq.GQMV_AFFINE_HEADER;
+fn dequantOf(f: Fmt) gq.Dequant {
+    return if (f == .affine) .affine else .fp4;
 }
 
-/// Indexed [nvfp4][x per expert].
+/// Indexed [Dequant][x per expert].
 const qmv_launches = [2][2]metal.Launch{
     .{
-        .{ .name = "mlxserve_moe_gather_qmv", .inputs = &aff_in, .outputs = &.{"y"}, .source = gq.GQMV_SOURCES[0][0], .header = header(false), .tg_bytes = 0, .m1 = 928, .m2 = 928 },
-        .{ .name = "mlxserve_moe_gather_qmv_px", .inputs = &aff_in, .outputs = &.{"y"}, .source = gq.GQMV_SOURCES[0][1], .header = header(false), .tg_bytes = 0, .m1 = 928, .m2 = 928 },
+        .{ .name = "mlxserve_moe_gather_qmv", .inputs = &aff_in, .outputs = &.{"y"}, .source = gq.GQMV_SOURCES[0][0], .header = gq.header(.affine), .tg_bytes = 0, .m1 = 928, .m2 = 928 },
+        .{ .name = "mlxserve_moe_gather_qmv_px", .inputs = &aff_in, .outputs = &.{"y"}, .source = gq.GQMV_SOURCES[0][1], .header = gq.header(.affine), .tg_bytes = 0, .m1 = 928, .m2 = 928 },
     },
     .{
-        .{ .name = "mlxserve_moe_gather_qmv_nvfp4", .inputs = &nv_in, .outputs = &.{"y"}, .source = gq.GQMV_SOURCES[1][0], .header = header(true), .tg_bytes = 0, .m1 = 1024, .m2 = 1024 },
-        .{ .name = "mlxserve_moe_gather_qmv_nvfp4_px", .inputs = &nv_in, .outputs = &.{"y"}, .source = gq.GQMV_SOURCES[1][1], .header = header(true), .tg_bytes = 0, .m1 = 928, .m2 = 928 },
+        .{ .name = "mlxserve_moe_gather_qmv_fp4", .inputs = &nv_in, .outputs = &.{"y"}, .source = gq.GQMV_SOURCES[1][0], .header = gq.header(.fp4), .tg_bytes = 0, .m1 = 1024, .m2 = 1024 },
+        .{ .name = "mlxserve_moe_gather_qmv_fp4_px", .inputs = &nv_in, .outputs = &.{"y"}, .source = gq.GQMV_SOURCES[1][1], .header = gq.header(.fp4), .tg_bytes = 0, .m1 = 928, .m2 = 928 },
     },
 };
+/// One gate+up+SwiGLU kernel for one row and for 2..8 (ONE_ROW), indexed by `Dequant`.
 const gateup_launches = [2]metal.Launch{
-    .{ .name = "mlxserve_moe_gather_qmv_gateup", .inputs = &gu_aff_in, .outputs = &.{"y"}, .source = gq.GQMV_GATEUP_SOURCES[0], .header = header(false), .tg_bytes = 0, .m1 = 576, .m2 = 576 },
-    .{ .name = "mlxserve_moe_gather_qmv_gateup_nvfp4", .inputs = &gu_nv_in, .outputs = &.{"y"}, .source = gq.GQMV_GATEUP_SOURCES[1], .header = header(true), .tg_bytes = 0, .m1 = 512, .m2 = 512 },
-};
-const gateup_rows_launches = [2]metal.Launch{
-    .{ .name = "mlxserve_moe_gather_qmv_gateup_rows", .inputs = &gu_aff_in, .outputs = &.{"y"}, .source = gqr.GQMV_GATEUP_ROWS_SOURCES[0], .header = header(false), .tg_bytes = 0, .m1 = 576, .m2 = 576 },
-    .{ .name = "mlxserve_moe_gather_qmv_gateup_rows_nvfp4", .inputs = &gur_nv_in, .outputs = &.{"y"}, .source = gqr.GQMV_GATEUP_ROWS_SOURCES[1], .header = header(true), .tg_bytes = 0, .m1 = 928, .m2 = 928 },
+    .{ .name = gq.GQMV_GATEUP_NAMES[0], .inputs = &gq.GQMV_GATEUP_INPUTS_AFFINE, .outputs = &.{"y"}, .source = gq.GQMV_GATEUP_SOURCES[0], .header = gq.header(.affine), .tg_bytes = 0, .m1 = 576, .m2 = 576 },
+    .{ .name = gq.GQMV_GATEUP_NAMES[1], .inputs = &gq.GQMV_GATEUP_INPUTS_FP4, .outputs = &.{"y"}, .source = gq.GQMV_GATEUP_SOURCES[1], .header = gq.header(.fp4), .tg_bytes = 0, .m1 = 512, .m2 = 512 },
 };
 /// `slot_vals[TOPK * ROWS]` T: 32 slots of 4 rows at most.
 const down_tg: u32 = 32 * 4 * 2;
+/// One down+reduce kernel for one row and for 2..8 (ONE_ROW), indexed by `Dequant`.
 const down_launches = [2]metal.Launch{
-    .{ .name = "mlxserve_moe_gather_qmv_downred", .inputs = &dr_aff_in, .outputs = &.{"y"}, .source = dr.GQMV_DOWNRED_SOURCES[0], .header = header(false), .tg_bytes = down_tg, .m1 = 512, .m2 = 512 },
-    .{ .name = "mlxserve_moe_gather_qmv_downred_nvfp4", .inputs = &dr_nv_in, .outputs = &.{"y"}, .source = dr.GQMV_DOWNRED_SOURCES[1], .header = header(true), .tg_bytes = down_tg, .m1 = 512, .m2 = 512 },
-};
-const down_rows_launches = [2]metal.Launch{
-    .{ .name = "mlxserve_moe_gather_qmv_downred_rows", .inputs = &dr_aff_in, .outputs = &.{"y"}, .source = dr.GQMV_DOWNRED_ROWS_SOURCES[0], .header = header(false), .tg_bytes = down_tg, .m1 = 512, .m2 = 512 },
-    .{ .name = "mlxserve_moe_gather_qmv_downred_rows_nvfp4", .inputs = &dr_nv_in, .outputs = &.{"y"}, .source = dr.GQMV_DOWNRED_ROWS_SOURCES[1], .header = header(true), .tg_bytes = down_tg, .m1 = 512, .m2 = 512 },
+    .{ .name = dr.GQMV_DOWNRED_NAMES[0], .inputs = &dr_aff_in, .outputs = &.{"y"}, .source = dr.GQMV_DOWNRED_SOURCES[0], .header = gq.header(.affine), .tg_bytes = down_tg, .m1 = 512, .m2 = 512 },
+    .{ .name = dr.GQMV_DOWNRED_NAMES[1], .inputs = &dr_nv_in, .outputs = &.{"y"}, .source = dr.GQMV_DOWNRED_SOURCES[1], .header = gq.header(.fp4), .tg_bytes = down_tg, .m1 = 512, .m2 = 512 },
 };
 
 /// An expert bank [E, N, K] as its checkpoint stores it: affine (MLX's quantize), NVFP4 (e2m1 nibbles, one e4m3 scale
@@ -152,7 +145,7 @@ const Bank = struct {
         for (b.scf, b.sc) |*o, s| o.* = @floatFromInt(s);
     }
 
-    /// Element (r, i) dequantized as MLX reads the format (an e4m3 code 0x7f / 0xff is NaN).
+    /// Element (r, i) dequantized as MLX reads the format (an e4m3 code 0x7f / 0xff, an e8m0 code 0xff is NaN).
     fn w(b: *const Bank, r: usize, i: usize) f64 {
         const at = r * b.aff.k + i;
         if (b.fmt == .affine) {
@@ -160,7 +153,7 @@ const Bank = struct {
             return @as(f64, @floatFromInt(b.aff.codes[at])) * b.aff.scales[g] + b.aff.biases[g];
         }
         const s = b.sc[at / b.aff.gs];
-        if (b.fmt == .mxfp4) return host.e2m1(b.codes[at]) * host.e8m0(s);
+        if (b.fmt == .mxfp4) return if (s == 0xff) std.math.nan(f64) else host.e2m1(b.codes[at]) * host.e8m0(s);
         if (s & 0x7f == 0x7f) return std.math.nan(f64);
         return host.e2m1(b.codes[at]) * host.e4m3(s);
     }
@@ -241,6 +234,7 @@ const Gather = struct {
     act2: bool = false,
     limit: u32 = 0,
     gscale: bool = false,
+    uscale: bool = false,
     lpr: usize = 8,
     /// Experts in the bank.
     ne: usize = E,
@@ -251,11 +245,12 @@ const Gather = struct {
     inds: []f64 = &.{},
     scores: []f64 = &.{},
     gsc: []f64 = &.{},
+    usc: []f64 = &.{},
     table: []f64 = &.{},
     /// Exact dot products [bank][slot * N + n] and their magnitudes, computed once a prepare.
     dv: []f64 = &.{},
     dm: []f64 = &.{},
-    args: [12]mlx.mlx_array = undefined,
+    args: [14]mlx.mlx_array = undefined,
     n_args: usize = 0,
     msg: [256]u8 = undefined,
     /// The rows down+reduce's baseline: the solo kernel's launches and their bytes.
@@ -263,13 +258,11 @@ const Gather = struct {
     base_bytes: std.ArrayList(u8) = .empty,
 
     fn init(a: std.mem.Allocator, kind: Kind, f: Fmt, b: u32, g: usize) Gather {
-        const nv = f == .nvfp4;
+        const di: usize = @intFromEnum(dequantOf(f));
         const l: *const metal.Launch = switch (kind) {
-            .qmv => &qmv_launches[@intFromBool(nv)][0],
-            .gateup => &gateup_launches[@intFromBool(nv)],
-            .gateup_rows => &gateup_rows_launches[@intFromBool(nv)],
-            .down => &down_launches[@intFromBool(nv)],
-            .down_rows => &down_rows_launches[@intFromBool(nv)],
+            .qmv => &qmv_launches[di][0],
+            .gateup, .gateup_rows => &gateup_launches[di],
+            .down, .down_rows => &down_launches[di],
         };
         return .{ .rig = metal.Rig.init(a), .base = metal.Rig.init(a), .launch = l, .kind = kind, .banks = .{ Bank.init(f, b, g), Bank.init(f, b, g) } };
     }
@@ -280,7 +273,7 @@ const Gather = struct {
         self.base.deinit();
         self.base_bytes.deinit(a);
         for (&self.banks) |*b| b.deinit(a);
-        for ([_][]f64{ self.x, self.inds, self.scores, self.gsc, self.table, self.dv, self.dm }) |s| a.free(s);
+        for ([_][]f64{ self.x, self.inds, self.scores, self.gsc, self.usc, self.table, self.dv, self.dm }) |s| a.free(s);
     }
 
     fn fmt(self: *const Gather) Fmt {
@@ -349,14 +342,13 @@ const Gather = struct {
                 g.int("BITS", self.bits());
                 switch (self.kind) {
                     .qmv => g.flag("ACT2", self.act2),
-                    .gateup => {
-                        g.int("KP", kp);
-                        g.int("LIMIT", self.limit);
-                    },
                     else => {
                         g.int("KP", kp);
-                        g.int("TOPK", TOPK);
-                        if (self.fmt() == .nvfp4) g.int("GSCALE", @intFromBool(self.gscale));
+                        g.int("TOPK", if (self.kind == .gateup) shape.rows else TOPK);
+                        g.flag("ONE_ROW", self.kind == .gateup);
+                        g.int("LIMIT", self.limit);
+                        g.int("GSCALE", @intFromBool(self.gscale));
+                        g.int("USCALE", @intFromBool(self.uscale));
                     },
                 }
             },
@@ -376,6 +368,7 @@ const Gather = struct {
                 g.int("ROWS", rows);
                 g.int("LPR", self.lpr);
                 g.int("KP", kp);
+                g.flag("ONE_ROW", self.kind == .down);
             },
         }
         return g;
@@ -385,7 +378,7 @@ const Gather = struct {
         if (self.geometry(shape) == null) return false;
         const a = self.rig.a;
         self.shape = shape;
-        for ([_]*[]f64{ &self.x, &self.inds, &self.scores, &self.gsc, &self.dv, &self.dm }) |p| {
+        for ([_]*[]f64{ &self.x, &self.inds, &self.scores, &self.gsc, &self.usc, &self.dv, &self.dm }) |p| {
             a.free(p.*);
             p.* = &.{};
         }
@@ -411,6 +404,8 @@ const Gather = struct {
         for (self.scores) |*s| s.* = if (stress) 1 else host.rt(self.dt, 0.05 + 0.25 * rng.float(f64));
         self.gsc = try a.alloc(f64, self.ne);
         for (self.gsc) |*s| s.* = if (stress) 1 else host.rt(self.dt, 0.5 + 1.5 * rng.float(f64));
+        self.usc = try a.alloc(f64, self.ne);
+        for (self.usc) |*s| s.* = if (stress) 1 else host.rt(self.dt, 0.5 + 1.5 * rng.float(f64));
         if (fill == .nonfinite) self.plant(k);
         try self.bind();
         return true;
@@ -436,9 +431,11 @@ const Gather = struct {
         const b = &self.banks[0];
         const n = self.shape.n;
         const row = [3]usize{ @as(usize, @intFromFloat(self.inds[0])) * n + 1, @as(usize, @intFromFloat(self.inds[1])) * n + 2, @as(usize, @intFromFloat(self.inds[2])) * n + 3 };
-        if (b.fmt == .nvfp4) {
-            b.sc[row[0] * k / 16] = 0x7f;
-            b.scf[row[0] * k / 16] = 0x7f;
+        if (b.fmt != .affine) {
+            // The format's NaN code: e4m3 0x7f, e8m0 0xff.
+            const code: u8 = if (b.fmt == .nvfp4) 0x7f else 0xff;
+            b.sc[row[0] * k / b.aff.gs] = code;
+            b.scf[row[0] * k / b.aff.gs] = @floatFromInt(code);
             return;
         }
         const groups = k / b.aff.gs;
@@ -447,7 +444,7 @@ const Gather = struct {
         b.aff.biases[row[2] * groups] = -inf;
     }
 
-    const Args = struct { x: mlx.mlx_array, b: [2][3]mlx.mlx_array, inds: mlx.mlx_array, sig: mlx.mlx_array, scores: mlx.mlx_array, gsc: mlx.mlx_array, kk: mlx.mlx_array, nn: mlx.mlx_array };
+    const Args = struct { x: mlx.mlx_array, b: [2][3]mlx.mlx_array, inds: mlx.mlx_array, sig: mlx.mlx_array, scores: mlx.mlx_array, gsc: mlx.mlx_array, usc: mlx.mlx_array, kk: mlx.mlx_array, nn: mlx.mlx_array };
 
     fn bind(self: *Gather) !void {
         const rig = &self.rig;
@@ -469,9 +466,10 @@ const Gather = struct {
         if (self.twoBanks()) h.sig = try rig.input(self.dt, &.{65536}, self.table);
         if (self.kind == .down or self.kind == .down_rows) h.scores = try rig.input(self.dt, if (self.rowsKind()) &.{ @intCast(self.shape.rows), @intCast(TOPK) } else &.{ns}, self.scores);
         if (self.gscale) h.gsc = try rig.input(self.dt, &.{@intCast(self.ne)}, self.gsc);
+        if (self.uscale) h.usc = try rig.input(self.dt, &.{@intCast(self.ne)}, self.usc);
         h.kk = try rig.input(.int32, &.{}, &.{@floatFromInt(self.shape.k)});
         h.nn = try rig.input(.int32, &.{}, &.{@floatFromInt(n)});
-        const nv = self.fmt() == .nvfp4;
+        const nv = self.fmt() != .affine;
         var list: std.ArrayList(mlx.mlx_array) = .initBuffer(&self.args);
         list.appendAssumeCapacity(h.x);
         switch (self.kind) {
@@ -489,8 +487,11 @@ const Gather = struct {
         }
         list.appendAssumeCapacity(h.kk);
         list.appendAssumeCapacity(h.nn);
-        // Without a gate scale the rows kernel never reads `gsc`; any array binds, as in the wrapper.
-        if (self.kind == .gateup_rows and nv) list.appendAssumeCapacity(if (self.gscale) h.gsc else h.sig);
+        // An absent scale is never read; any array binds, as in the wrapper.
+        if (self.twoBanks()) {
+            list.appendAssumeCapacity(if (self.gscale) h.gsc else h.sig);
+            list.appendAssumeCapacity(if (self.uscale) h.usc else h.sig);
+        }
         self.n_args = list.items.len;
     }
 
@@ -562,6 +563,7 @@ const Gather = struct {
                 var gt = host.rt(dt, dv[at]);
                 var u = host.rt(dt, dv[sn + at]);
                 if (self.gscale) gt = host.rt(dt, gt * self.gsc[self.expert(s)]);
+                if (self.uscale) u = host.rt(dt, u * self.usc[self.expert(s)]);
                 if (self.limit > 0) {
                     const lim: f64 = @floatFromInt(self.limit);
                     gt = clampNaN(gt, -std.math.inf(f64), lim);
@@ -639,13 +641,13 @@ const Gather = struct {
     }
 
     fn bankArgs(self: *const Gather, bi: usize) [3]mlx.mlx_array {
-        const nv = self.fmt() == .nvfp4;
+        const nv = self.fmt() != .affine;
         const base: usize = 1 + bi * @as(usize, if (nv) 2 else 3);
         return .{ self.args[base], self.args[base + 1], if (nv) .{ .ctx = null } else self.args[base + 2] };
     }
 
     fn indsArg(self: *const Gather) mlx.mlx_array {
-        const nv = self.fmt() == .nvfp4;
+        const nv = self.fmt() != .affine;
         const per: usize = if (nv) 2 else 3;
         return self.args[1 + per * @as(usize, if (self.twoBanks()) 2 else 1)];
     }
@@ -656,6 +658,8 @@ const Gather = struct {
         const s = self.rig.stream();
         var g = ops.Graph.init(self.rig.a, s);
         defer g.deinit();
+        const mx = env.override(.MLX_SERVE_MOE_GQMV_MXFP4, "1");
+        defer mx.restore();
         const x = self.args[0];
         const inds = self.indsArg();
         const rows: usize = if (self.rowsKind()) self.shape.rows else 1;
@@ -676,11 +680,11 @@ const Gather = struct {
                 var list: [8]mlx.mlx_array = undefined;
                 var len: usize = 0;
                 for ([_]mlx.mlx_array{ try g.reshape(xr, &.{ topk, @intCast(self.shape.k) }), b[0], b[1], b[2], ir, sc, self.args[self.n_args - 2], self.args[self.n_args - 1] }, 0..) |v, i| {
-                    if (i == 3 and self.fmt() == .nvfp4) continue;
+                    if (i == 3 and self.fmt() != .affine) continue;
                     list[len] = v;
                     len += 1;
                 }
-                try self.base.launch(&down_launches[@intFromBool(self.fmt() == .nvfp4)], solo.geometry(solo.shape).?, list[0..len]);
+                try self.base.launch(&down_launches[@intFromEnum(dequantOf(self.fmt()))], solo.geometry(solo.shape).?, list[0..len]);
                 try self.base_bytes.appendSlice(self.rig.a, self.base.outputBytes());
                 continue;
             }
@@ -689,10 +693,12 @@ const Gather = struct {
                 const b = self.bankArgs(bi);
                 p.* = try g.adopt((try gq.gatherQmv(s, xr, b[0], b[1], b[2], ir, self.bits(), @intCast(self.gs()), self.mode(), false)) orelse return error.Declined);
             }
-            if (self.gscale) {
-                const per = try g.reshape(try g.take(self.args[self.n_args - 1], ir, 0), &.{ topk, 1 });
-                pair[0] = try g.mul(pair[0], per);
-            }
+            // Each expert's scale as the split path multiplies it: gate before the SiLU, up before the clamp.
+            const per_row: c_int = @intCast(if (self.rowsKind()) TOPK else self.shape.rows);
+            for ([_]bool{ self.gscale, self.uscale }, 0..) |on, i| if (on) {
+                const per = try g.reshape(try g.take(self.args[self.n_args - 2 + i], ir, 0), &.{ per_row, 1 });
+                pair[i] = try g.mul(pair[i], per);
+            };
             outs[r] = if (self.limit > 0)
                 try g.adopt(try activations.clampedSwiGLU(s, pair[0], pair[1], @floatFromInt(self.limit)))
             else
@@ -705,20 +711,27 @@ const Gather = struct {
     /// The shipped wrapper on the same inputs.
     fn wrapper(self: *Gather) ![]const u8 {
         const s = self.rig.stream();
+        const mx = env.override(.MLX_SERVE_MOE_GQMV_MXFP4, "1");
+        defer mx.restore();
         const x = self.args[0];
         const inds = self.indsArg();
         const b0 = self.bankArgs(0);
         const nb = self.bits();
         const gsz: u32 = @intCast(self.gs());
+        const sc: gq.Scales = .{
+            .gate = if (self.gscale) self.args[self.n_args - 2] else null,
+            .up = if (self.uscale) self.args[self.n_args - 1] else null,
+            .clamp = self.limit,
+        };
         const y = switch (self.kind) {
             .qmv => try gq.gatherQmvAct(s, x, b0[0], b0[1], b0[2], inds, nb, gsz, self.mode(), self.px, self.act2),
             .gateup => blk: {
                 const b1 = self.bankArgs(1);
-                break :blk try gq.gatherQmvGateUp(s, x, b0[0], b0[1], b0[2], b1[0], b1[1], b1[2], inds, nb, gsz, self.mode(), self.limit);
+                break :blk try gq.gatherQmvGateUpScaled(s, x, b0[0], b0[1], b0[2], b1[0], b1[1], b1[2], inds, nb, gsz, self.mode(), sc);
             },
             .gateup_rows => blk: {
                 const b1 = self.bankArgs(1);
-                break :blk try gqr.gatherQmvGateUpRows(s, x, b0[0], b0[1], b0[2], b1[0], b1[1], b1[2], inds, nb, gsz, self.mode(), if (self.gscale) self.args[self.n_args - 1] else null);
+                break :blk try gqr.gatherQmvGateUpRowsScaled(s, x, b0[0], b0[1], b0[2], b1[0], b1[1], b1[2], inds, nb, gsz, self.mode(), sc);
             },
             .down => try dr.gatherQmvDownReduce(s, x, b0[0], b0[1], b0[2], inds, self.args[self.n_args - 3], nb, gsz, self.mode()),
             .down_rows => try dr.gatherQmvDownReduceRows(s, x, b0[0], b0[1], b0[2], inds, self.args[self.n_args - 3], nb, gsz, self.mode()),
@@ -732,8 +745,6 @@ fn depthK(shape: Shape) usize {
     return shape.k + 4; // a row's sum, behind the dequant (q * s + b) and the product
 }
 
-const e4m3_nan_code: spec.Known = .{ .gate = .nonfinite, .finding = "an NVFP4 scale decodes by bit placement, so e4m3's NaN code 0x7f reads as 480 where MLX's fp8_e4m3 gives NaN; with one x for every output, a NaN code is the only non-finite input that leaves some outputs finite, and it comes out finite" };
-const act2_drops_nan: spec.Known = .{ .gate = .nonfinite, .finding = "ReLU^2 runs metal::max(o, 0), which returns 0 for a NaN, where MLX's maximum (the chain it stands for) keeps the NaN: a NaN sum gives 0" };
 const limit_drops_nan: spec.Known = .{ .gate = .nonfinite, .finding = "metal::min / max return the other operand for a NaN, where MLX's Minimum and Clip (the clampedSwiGLU chain it replaces) keep the NaN: a NaN gate or up gives a finite output" };
 
 fn gatherSpec(comptime name: []const u8, g: Gather, served: []const Shape, replaces: ?[]const u8, known: ?spec.Known) spec.Spec {
@@ -2776,22 +2787,31 @@ fn registerGathers(set: *kc.Set) !void {
         g = Gather.init(a, .qmv, .affine, 4, 64);
         g.act2 = true;
         g.ne = 24;
-        try add(set, g, "gather_qmv bf16 (4-bit g64, ReLU^2)", &.{ .{ .rows = 6, .n = 512, .k = 2688 }, .{ .rows = 22, .n = 256, .k = 1024 } }, null, act2_drops_nan);
+        try add(set, g, "gather_qmv bf16 (4-bit g64, ReLU^2)", &.{ .{ .rows = 6, .n = 512, .k = 2688 }, .{ .rows = 22, .n = 256, .k = 1024 } }, null, null);
         g = Gather.init(a, .qmv, .affine, 4, 64);
         g.launch = &qmv_launches[0][1];
         g.px = true;
         g.act2 = true;
         g.ne = 16;
-        try add(set, g, "gather_qmv bf16 (4-bit g64, ReLU^2, x per pair)", &.{.{ .rows = 12, .n = 256, .k = 2688 }}, null, act2_drops_nan);
-        g = Gather.init(a, .qmv, .nvfp4, 4, 16);
-        try add(set, g, "gather_qmv bf16 (NVFP4)", up_served, null, e4m3_nan_code);
-        g = Gather.init(a, .qmv, .nvfp4, 4, 16);
+        try add(set, g, "gather_qmv bf16 (4-bit g64, ReLU^2, x per pair)", &.{.{ .rows = 12, .n = 256, .k = 2688 }}, null, null);
+    }
+    // fp4: NVFP4 (e4m3 per 16) and MXFP4 (e8m0 per 32), one kernel by the group.
+    inline for (.{ .{ Fmt.nvfp4, 16, "NVFP4" }, .{ Fmt.mxfp4, 32, "MXFP4" } }) |f| {
+        var g = Gather.init(a, .qmv, f[0], 4, f[1]);
+        try add(set, g, "gather_qmv bf16 (" ++ f[2] ++ ")", up_served, null, null);
+        g = Gather.init(a, .qmv, f[0], 4, f[1]);
         g.launch = &qmv_launches[1][1];
         g.px = true;
-        try add(set, g, "gather_qmv bf16 (NVFP4, x per expert)", down_served, null, null);
+        try add(set, g, "gather_qmv bf16 (" ++ f[2] ++ ", x per expert)", down_served, null, null);
+    }
+    {
+        var g = Gather.init(a, .qmv, .mxfp4, 4, 32);
+        g.dt = .float16;
+        try add(set, g, "gather_qmv f16 (MXFP4)", up_served, null, null);
     }
     const chain = "gather_qmv gate and up -> sigmoid -> multiply -> multiply";
     const clamp_chain = "gather_qmv gate and up -> minimum, clip -> sigmoid -> multiply -> multiply";
+    const scaled_chain = "gather_qmv gate and up -> take, multiply (the gate and up scales) -> minimum, clip -> sigmoid -> multiply -> multiply";
     inline for (.{ .{ 4, 64 }, .{ 3, 64 }, .{ 8, 64 }, .{ 5, 32 }, .{ 6, 64 }, .{ 2, 64 } }) |bg| {
         try add(set, .init(a, .gateup, .affine, bg[0], bg[1]), std.fmt.comptimePrint("gather_qmv_gateup bf16 ({d}-bit g{d})", .{ bg[0], bg[1] }), up_served, chain, null);
     }
@@ -2801,8 +2821,7 @@ fn registerGathers(set: *kc.Set) !void {
         try add(set, g, "gather_qmv_gateup f16 (4-bit g64)", up_served, chain, null);
         g = Gather.init(a, .gateup, .affine, 4, 64);
         g.limit = LIMIT;
-        try add(set, g, "gather_qmv_gateup bf16 (4-bit g64, limit 10)", up_served, clamp_chain, limit_drops_nan);
-        try add(set, .init(a, .gateup, .nvfp4, 4, 16), "gather_qmv_gateup bf16 (NVFP4)", up_served, chain, e4m3_nan_code);
+        try add(set, g, "gather_qmv_gateup bf16 (4-bit g64, limit 10)", up_served, clamp_chain, null);
     }
     // The batched decode tick: 2..8 rows of top-k 8.
     const rows_served: []const Shape = &.{ .{ .rows = 4, .n = 256, .k = 2048 }, .{ .rows = 8, .n = 128, .k = 1024 } };
@@ -2813,20 +2832,42 @@ fn registerGathers(set: *kc.Set) !void {
     try add(set, .init(a, .gateup_rows, .affine, 6, 64), "gather_qmv_gateup_rows bf16 (6-bit g64)", rows_served, per_row, null);
     // GGUF Q2_0 expert banks load as 2-bit g64 (sdk/quant/gguf/affine.zig).
     try add(set, .init(a, .gateup_rows, .affine, 2, 64), "gather_qmv_gateup_rows bf16 (2-bit g64)", rows_served, per_row, null);
-    try add(set, .init(a, .gateup_rows, .nvfp4, 4, 16), "gather_qmv_gateup_rows bf16 (NVFP4)", rows_served, per_row, null);
     {
-        var g = Gather.init(a, .gateup_rows, .nvfp4, 4, 16);
-        g.gscale = true;
-        try add(set, g, "gather_qmv_gateup_rows bf16 (NVFP4, ModelOpt gate scale)", rows_served, "gather_qmv gate and up per row -> multiply by the gate scale -> sigmoid -> multiply -> multiply", null);
+        var g = Gather.init(a, .gateup_rows, .affine, 4, 64);
+        g.limit = LIMIT;
+        try add(set, g, "gather_qmv_gateup_rows bf16 (4-bit g64, limit 10)", rows_served, clamp_chain, null);
+    }
+    // fp4 one row and rows: plain, ModelOpt's gate scale, gate and up scales with GLM's clamp.
+    inline for (.{ .{ Kind.gateup, up_served, "gather_qmv_gateup" }, .{ Kind.gateup_rows, rows_served, "gather_qmv_gateup_rows" } }) |kk| {
+        inline for (.{ .{ Fmt.nvfp4, 16, "NVFP4" }, .{ Fmt.mxfp4, 32, "MXFP4" } }) |f| {
+            try add(set, .init(a, kk[0], f[0], 4, f[1]), kk[2] ++ " bf16 (" ++ f[2] ++ ")", kk[1], chain, null);
+            var g = Gather.init(a, kk[0], f[0], 4, f[1]);
+            g.gscale = true;
+            try add(set, g, kk[2] ++ " bf16 (" ++ f[2] ++ ", gate scale)", kk[1], "gather_qmv gate and up -> take, multiply (the gate scale) -> sigmoid -> multiply -> multiply", null);
+            g = Gather.init(a, kk[0], f[0], 4, f[1]);
+            g.gscale = true;
+            g.uscale = true;
+            g.limit = LIMIT;
+            try add(set, g, kk[2] ++ " bf16 (" ++ f[2] ++ ", gate and up scales, limit 10)", kk[1], scaled_chain, null);
+        }
+        var g = Gather.init(a, kk[0], .mxfp4, 4, 32);
+        g.dt = .float16;
+        g.limit = LIMIT;
+        try add(set, g, kk[2] ++ " f16 (MXFP4, limit 10)", kk[1], clamp_chain, null);
     }
     // Down + score weighting + top-k sum, at 8 lanes a row (every GPU but M5) and 16 (M5).
     inline for (.{ 8, 16 }) |lpr| {
         var g = Gather.init(a, .down, .affine, 4, 64);
         g.lpr = lpr;
         try add(set, g, std.fmt.comptimePrint("down_reduce bf16 (4-bit g64, {d} lanes)", .{lpr}), down_served, null, null);
-        g = Gather.init(a, .down, .nvfp4, 4, 16);
-        g.lpr = lpr;
-        try add(set, g, std.fmt.comptimePrint("down_reduce bf16 (NVFP4, {d} lanes)", .{lpr}), down_served, null, e4m3_nan_code);
+        inline for (.{ .{ Fmt.nvfp4, 16, "NVFP4" }, .{ Fmt.mxfp4, 32, "MXFP4" } }) |f| {
+            g = Gather.init(a, .down, f[0], 4, f[1]);
+            g.lpr = lpr;
+            try add(set, g, std.fmt.comptimePrint("down_reduce bf16 ({s}, {d} lanes)", .{ f[2], lpr }), down_served, null, null);
+            g = Gather.init(a, .down_rows, f[0], 4, f[1]);
+            g.lpr = lpr;
+            try add(set, g, std.fmt.comptimePrint("down_reduce_rows bf16 ({s}, {d} lanes)", .{ f[2], lpr }), &.{.{ .rows = 4, .n = 1024, .k = 512 }}, "down_reduce per row", null);
+        }
         g = Gather.init(a, .down_rows, .affine, 4, 64);
         g.lpr = lpr;
         try add(set, g, std.fmt.comptimePrint("down_reduce_rows bf16 (4-bit g64, {d} lanes)", .{lpr}), &.{ .{ .rows = 4, .n = 1024, .k = 512 }, .{ .rows = 8, .n = 256, .k = 768 } }, "down_reduce per row", null);
@@ -2846,9 +2887,6 @@ fn registerGathers(set: *kc.Set) !void {
         g = Gather.init(a, .down_rows, .affine, 2, 64);
         g.lpr = lpr;
         try add(set, g, std.fmt.comptimePrint("down_reduce_rows bf16 (2-bit g64, {d} lanes)", .{lpr}), &.{.{ .rows = 4, .n = 1024, .k = 512 }}, "down_reduce per row", null);
-        g = Gather.init(a, .down_rows, .nvfp4, 4, 16);
-        g.lpr = lpr;
-        try add(set, g, std.fmt.comptimePrint("down_reduce_rows bf16 (NVFP4, {d} lanes)", .{lpr}), &.{.{ .rows = 4, .n = 1024, .k = 512 }}, "down_reduce per row", null);
     }
     {
         var g = Gather.init(a, .down, .affine, 8, 64);
@@ -2858,6 +2896,10 @@ fn registerGathers(set: *kc.Set) !void {
         g = Gather.init(a, .down, .affine, 6, 64);
         g.lpr = 8;
         try add(set, g, "down_reduce bf16 (6-bit g64, 8 lanes)", down_served, null, null);
+        g = Gather.init(a, .down, .mxfp4, 4, 32);
+        g.dt = .float16;
+        g.lpr = 8;
+        try add(set, g, "down_reduce f16 (MXFP4, 8 lanes)", down_served, null, null);
     }
 }
 

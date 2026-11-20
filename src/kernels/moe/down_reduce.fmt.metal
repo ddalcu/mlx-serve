@@ -1,6 +1,8 @@
 auto lane = thread_index_in_simdgroup;
 uint slot = simdgroup_index_in_threadgroup;   // top-K slot
 uint tile = threadgroup_position_in_grid.x;   // block of ROWS output rows
+// grid.y: the batch row; ONE_ROW (the single-row decode) has one.
+uint row = ONE_ROW ? 0u : threadgroup_position_in_grid.y;
 
 int K = int(K_size);
 int N = int(N_size);
@@ -9,8 +11,8 @@ int K_by_w = K * BITS / 32;
 int K_by_gs = K / GS;
 uint mask = (1u << BITS) - 1u;
 
-uint eid = inds[slot];
-size_t xoff = (size_t)slot * (size_t)K;
+uint eid = inds[(size_t)row * (size_t)TOPK + slot];
+size_t xoff = ((size_t)row * (size_t)TOPK + (size_t)slot) * (size_t)K;
 threadgroup T slot_vals[uint(TOPK) * uint(ROWS)];
 uint r = lane / uint(LPR);
 uint sub = lane % uint(LPR);
@@ -34,7 +36,6 @@ for (int i = 0; i < IT; ++i) {{
 }}
 float acc = (a0 + a1) + (a2 + a3);
 for (uint d = uint(LPR) / 2u; d >= 1u; d >>= 1u) acc += simd_shuffle_xor(acc, ushort(d));
-acc = acc{s};
 if (sub == 0u) {{
   slot_vals[slot * uint(ROWS) + r] = T(acc);
 }}
@@ -43,8 +44,8 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
 if (slot == 0 && lane < uint(ROWS)) {{
   T total = T(0.0f);
   for (uint s2 = 0; s2 < uint(TOPK); ++s2) {{
-    T p = slot_vals[s2 * uint(ROWS) + lane] * scores[s2];
+    T p = slot_vals[s2 * uint(ROWS) + lane] * scores[(size_t)row * (size_t)TOPK + s2];
     total = total + p;
   }}
-  y[(size_t)tile * (size_t)ROWS + (size_t)lane] = total;
+  y[(size_t)row * (size_t)N + (size_t)tile * (size_t)ROWS + (size_t)lane] = total;
 }}

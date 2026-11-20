@@ -37,6 +37,7 @@ test {
     _ = @import("sdk/blocks/mlp/fused_activations_test.zig");
     _ = @import("sdk/blocks/moe/decode_test.zig");
     _ = @import("sdk/blocks/moe/verify_kernels_test.zig");
+    _ = @import("sdk/blocks/moe/gqmv_fp4_test.zig");
     _ = @import("sdk/quant/block_test.zig");
     _ = @import("sdk/quant/fp4.zig");
     _ = @import("sdk/quant/hadamard/format_test.zig");
