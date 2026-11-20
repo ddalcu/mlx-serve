@@ -6,5 +6,5 @@
   float d1 = float(x[xi + 1]) * p1.x + float(x[xi + 5]) * p1.y;
   float d2 = float(x[xi + 2]) * p2.x + float(x[xi + 6]) * p2.y;
   float d3 = float(x[xi + 3]) * p3.x + float(x[xi + 7]) * p3.y;
-  a0 += mlxserve_gqmv_term(d0, sj); a1 += mlxserve_gqmv_term(d1, sj);
-  a2 += mlxserve_gqmv_term(d2, sj); a3 += mlxserve_gqmv_term(d3, sj);
+  a0 += mlxserve_gqmv_term<FOLD>(d0, sj); a1 += mlxserve_gqmv_term<FOLD>(d1, sj);
+  a2 += mlxserve_gqmv_term<FOLD>(d2, sj); a3 += mlxserve_gqmv_term<FOLD>(d3, sj);

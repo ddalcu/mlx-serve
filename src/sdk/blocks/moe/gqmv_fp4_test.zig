@@ -513,3 +513,61 @@ test "gqmv fp4: refusals are by shape, not by format" {
     try testing.expect((try gq.gatherQmvGateUpScaled(s, x, b.w, b.sc, none, b.w, b.sc, none, inds, 4, 32, .mxfp4, .{ .gate = short })) == null);
     try testing.expect((try gq.gatherQmvGateUpScaled(s, x, b.w, b.sc, none, b.w, b.sc, none, inds, 4, 32, .mxfp4, .{ .up = f32sc })) == null);
 }
+
+/// An NVFP4 bank as MLX quantizes a normal draw of `sigma` (its e4m3 scales where such weights put them).
+fn mlxNvfp4Bank(g: *ops.Graph, e: c_int, n: c_int, k: c_int, sigma: f32, seed: u64, s: mlx.mlx_stream) !Bank {
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, seed));
+    var wf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wf);
+    try mlx.check(mlx.mlx_random_normal(&wf, &[_]c_int{ e, n, k }, 3, .bfloat16, 0, sigma, key, s));
+    var q = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(q);
+    try mlx.check(mlx.mlx_quantize(&q, wf, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{}, s));
+    var w = mlx.mlx_array_new();
+    var sc = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&w, q, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&sc, q, 1));
+    return .{ .w = try g.adopt(w), .sc = try g.adopt(sc) };
+}
+
+test "gqmv fp4: MLX_SERVE_FP4_FOLD22 (the 2^22 fold) gives the MLX-exact read's bytes on NVFP4 at GLM-5.3 Pro's shape" {
+    if (skip()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const E: c_int = 16;
+    const H: c_int = 6144;
+    const I: c_int = 2048;
+    const TOPK: c_int = 8;
+    const R: c_int = 4;
+    // Weights a few hundredths wide (the e4m3 codes near 2^-6) and a few units wide (codes up to 448).
+    for ([_]f32{ 0.05, 8.0 }, 0..) |sigma, si| {
+        var g = ops.Graph.init(testing.allocator, s);
+        defer g.deinit();
+        var prng = std.Random.DefaultPrng.init(0xF01D + si);
+        const rng = prng.random();
+        const gate = try mlxNvfp4Bank(&g, E, I, H, sigma, 0x6A7E + si, s);
+        const up = try mlxNvfp4Bank(&g, E, I, H, sigma, 0x0B0B + si, s);
+        const down = try mlxNvfp4Bank(&g, E, H, I, sigma, 0xD0D0 + si, s);
+        var ids: [32]u32 = undefined;
+        routes(rng, ids[0 .. R * TOPK], @intCast(E), @intCast(TOPK));
+        const inds = try u32s(&g, ids[0..@intCast(TOPK)], &.{TOPK});
+        const rinds = try u32s(&g, ids[0..@intCast(R * TOPK)], &.{ R, TOPK });
+        const x = try g.adopt(try testRandUniformBf16(rng, &.{H}, -2.0, 2.0, s));
+        const xr = try g.adopt(try testRandUniformBf16(rng, &.{ R, H }, -2.0, 2.0, s));
+        const xd = try g.adopt(try testRandUniformBf16(rng, &.{ R, TOPK, I }, -0.5, 0.5, s));
+        const rscores = try g.adopt(try testRandUniformBf16(rng, &.{ R, TOPK }, 0.05, 0.6, s));
+        const scales: gq.Scales = .{ .gate = try g.adopt(try testRandUniformBf16(rng, &.{E}, 0.5, 2.0, s)) };
+        var outs: [2][4]Array = undefined;
+        for ([_][*:0]const u8{ "0", "1" }, &outs) |fold, *o| {
+            const ov = env.override(.MLX_SERVE_FP4_FOLD22, fold);
+            defer ov.restore();
+            o[0] = try g.adopt((try gq.gatherQmv(s, x, gate.w, gate.sc, none, inds, 4, 16, .nvfp4, false)) orelse return error.GatherQmvDeclined);
+            o[1] = try g.adopt((try gq.gatherQmvGateUpScaled(s, x, gate.w, gate.sc, none, up.w, up.sc, none, inds, 4, 16, .nvfp4, scales)) orelse return error.GateUpDeclined);
+            o[2] = try g.adopt((try gqr.gatherQmvGateUpRowsScaled(s, xr, gate.w, gate.sc, none, up.w, up.sc, none, rinds, 4, 16, .nvfp4, scales)) orelse return error.GateUpRowsDeclined);
+            o[3] = try g.adopt((try dr.gatherQmvDownReduceRows(s, xd, down.w, down.sc, none, rinds, rscores, 4, 16, .nvfp4)) orelse return error.DownRowsDeclined);
+        }
+        for ([_][]const u8{ "gather_qmv", "gateup", "gateup_rows", "down_reduce_rows" }, outs[0], outs[1]) |name, exact, folded|
+            try expectSameBits(name, exact, folded, s);
+    }
+}

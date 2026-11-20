@@ -92,7 +92,7 @@ pub fn downredLpr() c_int {
     return downredLanesFor(g.gen, g.phone);
 }
 
-const DownRedCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, lpr: c_int, one_row: bool };
+const DownRedCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, lpr: c_int, one_row: bool, fold: bool };
 const DownRedCfgSlot = struct {
     cfg: ?mlx.mlx_fast_metal_kernel_config = null,
     key: DownRedCfgKey = std.mem.zeroes(DownRedCfgKey),
@@ -219,7 +219,7 @@ fn downReduceLaunch(
     const rows: c_int = @divExact(32, lpr);
     if (@rem(N, rows) != 0) return null;
 
-    const key = DownRedCfgKey{ .nrows = nrows, .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd, .lpr = lpr, .one_row = one_row };
+    const key = DownRedCfgKey{ .nrows = nrows, .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd, .lpr = lpr, .one_row = one_row, .fold = @import("gather_qmv.zig").fold22(mode) };
     const slot = &downred_cfg[@intFromBool(one_row)];
     if (slot.cfg == null or !std.meta.eql(slot.key, key)) {
         if (slot.cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
@@ -241,6 +241,7 @@ fn downReduceLaunch(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LPR", lpr));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KP", affineQmvPackUnits(K, bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "ONE_ROW", one_row));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "FOLD", @intFromBool(key.fold)));
         slot.* = .{ .cfg = cfg, .key = key };
     }
 

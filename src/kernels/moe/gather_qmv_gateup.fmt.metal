@@ -44,6 +44,10 @@ for (int i = 0; i < IT; ++i) {{
 }}
 float acc_g = simd_sum((g0 + g1) + (g2 + g3));
 float acc_u = simd_sum((u0 + u1) + (u2 + u3));
+if (FOLD != 0) {{
+  acc_g *= 4194304.0f;
+  acc_u *= 4194304.0f;
+}}
 if (lane == 0) {{
   // Round where the split path's gathers write T(acc); each expert's scale is the split path's rounded multiply.
   T gt = T(acc_g);
