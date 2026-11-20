@@ -368,7 +368,9 @@ pub const Bank = struct {
 /// commit at every kernel.
 
 /// `ext`: banks (w1, w3, w2) an outside quant plugin loaded and runs (the DSpark stages'); the MLX banks are then unset.
-pub const Experts = struct { gate: Bank, up: Bank, down: Bank, gu: ?Bank = null, views: ?[2]Bank = null, ext: ?[3]outside.Weight = null };
+/// `scale`: an NVFP4 bank's ModelOpt per-expert globals (`expertScales`), each `[E]` bf16: the gate's on the gate
+/// output before the SiLU, the up's on the up output before the clamp, the down's on the routing weight.
+pub const Experts = struct { gate: Bank, up: Bank, down: Bank, gu: ?Bank = null, views: ?[2]Bank = null, ext: ?[3]outside.Weight = null, scale: [3]?A = .{ null, null, null } };
 pub const Layer = struct {
     attn_norm: A,
     ffn_norm: A,
@@ -678,7 +680,7 @@ pub const Dec = struct {
     fn init(gpa: std.mem.Allocator, cfg: *const Config) !Dec {
         const nax = device.naxAvailable();
         // Without NAX the affine moe_up / moe_down lose to today's MoE kernels at every row count.
-        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .attn = if (nax) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = if (nax) null else try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
+        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .attn = if (nax) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
         errdefer d.deinit();
         try dkern.topk.probe(gpa, &d.topk.?, mlx.gpuStream());
         if (d.moe_down) |kd| d.moe_down_rb = dkern.moe_down.probe(gpa, kd, cfg.moe_intermediate_size, cfg.hidden_size) catch |e| blk: {
@@ -1170,7 +1172,7 @@ fn fuseExperts(m: *Dsv41Model, w: *Weights, e: Experts) !Experts {
     const u: Lin = .{ .w = e.up.w, .s = e.up.s, .b = e.up.b, .qp = e.up.qp };
     const f = (try fuseRows(m, w, g, u, 1)) orelse return e;
     const gu = bankOf(f);
-    return .{ .gate = .{ .w = none }, .up = .{ .w = none }, .down = e.down, .gu = gu, .views = .{ try oneExpert(m, gu), try oneExpert(m, e.down) } };
+    return .{ .gate = .{ .w = none }, .up = .{ .w = none }, .down = e.down, .gu = gu, .views = .{ try oneExpert(m, gu), try oneExpert(m, e.down) }, .scale = e.scale };
 }
 
 fn oneExpert(m: *Dsv41Model, b: Bank) !Bank {
@@ -1185,6 +1187,59 @@ fn oneExpert(m: *Dsv41Model, b: Bank) !Bank {
 }
 
 fn loadExperts(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usize, n_experts: usize, inter: usize) !Experts {
+    var e = try loadBanks(m, w, pfx, li, n_experts, inter);
+    e.scale = try expertScales(m, w, pfx, li, &e);
+    return e;
+}
+
+const scale_names = [3][]const u8{ ".{d}.ffn.experts.gate_proj.expert_scale", ".{d}.ffn.experts.up_proj.expert_scale", ".{d}.ffn.experts.expert_scale" };
+
+/// ModelOpt's per-expert globals of an NVFP4 bank (`scripts/dsv41_nvfp4_pack.py --experts-nvfp4`): gate, up and down,
+/// each `[E]` bf16, finite and positive (`modelopt_pack.globalScale`'s rule). All three or none (the swiglu clamp keeps
+/// the up scale apart from the down's), on an MLX NVFP4 bank, neither streamed nor tensor-split; refused by name else.
+fn expertScales(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usize, e: *const Experts) ![3]?A {
+    var out: [3]?A = .{ null, null, null };
+    var n: usize = 0;
+    inline for (scale_names, 0..) |nm, i| if (getOpt(w, pfx ++ nm, .{li})) |a| {
+        out[i] = a;
+        n += 1;
+    };
+    if (n == 0) return out;
+    var buf: NameBuf = undefined;
+    const name = std.fmt.bufPrint(&buf, pfx ++ ".{d}.ffn.experts", .{li}) catch return error.NameTooLong;
+    if (n != 3) {
+        log.err("deepseek_v41: {s} has {d} of ModelOpt's three per-expert scales (gate_proj, up_proj, down on the route)\n", .{ name, n });
+        return error.Dsv41ExpertScales;
+    }
+    if (e.ext != null or e.gate.qp.mode != .nvfp4 or e.down.qp.mode != .nvfp4) {
+        log.err("deepseek_v41: {s} carries per-expert scales beside banks that are not MLX nvfp4\n", .{name});
+        return error.Dsv41ExpertScales;
+    }
+    if (m.tp != null) {
+        log.err("deepseek_v41: {s}: per-expert scales under a tensor split are not served\n", .{name});
+        return error.Dsv41ExpertScales;
+    }
+    const experts = dim(e.gate.w, 0);
+    for (out, 0..) |a, i| {
+        const v = a.?;
+        if (mlx.getShape(v).len != 1 or dim(v, 0) != experts or mlx.mlx_array_dtype(v) != .bfloat16) {
+            log.err("deepseek_v41: {s}{s} is not [{d}] bf16\n", .{ name, scale_names[i][".{d}.ffn.experts".len..], experts });
+            return error.Dsv41ExpertScales;
+        }
+        var f = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f);
+        try mlx.check(mlx.mlx_astype(&f, v, .float32, m.s));
+        try mlx.check(mlx.mlx_array_eval(f));
+        const host = (mlx.mlx_array_data_float32(f) orelse return error.NoData)[0..experts];
+        for (host, 0..) |x, ex| if (!std.math.isFinite(x) or x <= 0) {
+            log.err("deepseek_v41: {s}{s}[{d}] = {d}: a global scale must be finite and positive\n", .{ name, scale_names[i][".{d}.ffn.experts".len..], ex, x });
+            return error.Dsv41ExpertScales;
+        };
+    }
+    return out;
+}
+
+fn loadBanks(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usize, n_experts: usize, inter: usize) !Experts {
     const d = m.cfg.hidden_size;
     if (getOpt(w, pfx ++ ".{d}.ffn.experts.gate_proj.weight", .{li}) != null) return .{
         .gate = bankOf(try getLin(m, w, d, pfx ++ ".{d}.ffn.experts.gate_proj", .{li})),
@@ -1236,6 +1291,15 @@ fn loadExperts(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usize,
     }
     log.err("deepseek_v41: {s}.{d} has no routed experts\n", .{ pfx, li });
     return error.MissingWeight;
+}
+
+/// A streamed layer's experts: none resident. A slot row is not an expert id, so per-expert scales are refused by name.
+fn streamedExperts(w: *Weights, comptime pfx: []const u8, li: usize) !Experts {
+    if (getOpt(w, pfx ++ scale_names[0], .{li}) != null) {
+        log.err("deepseek_v41: layer {d}'s per-expert scales: streamed experts are not served with them\n", .{li});
+        return error.Dsv41StreamedExpertScales;
+    }
+    return .{ .gate = .{ .w = none }, .up = .{ .w = none }, .down = .{ .w = none } };
 }
 
 pub fn loadLayer(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usize, trunk_li: ?usize) !Layer {
@@ -1304,7 +1368,7 @@ pub fn loadLayer(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usiz
             try getLin(m, w, d, pfx ++ ".{d}.ffn.shared_experts.w3", .{li}),
             try getLin(m, w, inter, pfx ++ ".{d}.ffn.shared_experts.w2", .{li}),
         },
-        .experts = if (trunk_li != null and m.streamed_experts) .{ .gate = .{ .w = none }, .up = .{ .w = none }, .down = .{ .w = none } } else try fuseExperts(m, w, try loadExperts(m, w, pfx, li, n_experts, inter)),
+        .experts = if (trunk_li != null and m.streamed_experts) try streamedExperts(w, pfx, li) else try fuseExperts(m, w, try loadExperts(m, w, pfx, li, n_experts, inter)),
     };
     if (trunk_li == 0) for ([_]Bank{ ly.experts.gate, ly.experts.down }) |bank| if (gguf_kernels.infoOf(bank.w, bank.s)) |gi| if (gi.ty == .q3_k) {
         log.warn("[dsv41] Q3_K expert banks decode on the composed path, not the fused GGUF FFN (docs/known-issues.md)\n", .{});
@@ -1998,7 +2062,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     // twin in their place).
     if (m.attn_gather != null) try warmRing(m);
     log.info("deepseek_v41: {d} layers, engram {d} layers, DSpark {d} stages{s}{s}\n", .{ n_layers, m.engrams.len, n_stages, if (opts.quant != null) ", weights on " else "", if (opts.quant) |q| q.name() else "" });
-    if (m.dec.moe_fp4 != null) log.info("deepseek_v41: fused mxfp4 MoE decode kernels on\n", .{});
+    if (fp4Decode(m) != null) log.info("deepseek_v41: fused fp4 MoE decode kernels on\n", .{});
     return m;
 }
 
@@ -3887,10 +3951,29 @@ pub fn gatherMm(sc: *Scope, x: A, b: *const Bank, lhs: A, idx: A, sorted: bool) 
 }
 
 pub fn gateUp(sc: *Scope, e: *const Experts, x: A, lhs: A, idx: A, sorted: bool) ![2]A {
-    const gu = e.gu orelse return .{ try gatherMm(sc, x, &e.gate, lhs, idx, sorted), try gatherMm(sc, x, &e.up, lhs, idx, sorted) };
+    const gu = e.gu orelse return .{
+        try expertScaled(sc, try gatherMm(sc, x, &e.gate, lhs, idx, sorted), e.scale[0], idx),
+        try expertScaled(sc, try gatherMm(sc, x, &e.up, lhs, idx, sorted), e.scale[1], idx),
+    };
     const y = try gatherMm(sc, x, &gu, lhs, idx, sorted);
     const n = dim(y, -1) / 2;
-    return .{ try sc.slice(y, -1, 0, n), try sc.slice(y, -1, n, 2 * n) };
+    return .{ try expertScaled(sc, try sc.slice(y, -1, 0, n), e.scale[0], idx), try expertScaled(sc, try sc.slice(y, -1, n, 2 * n), e.scale[1], idx) };
+}
+
+/// `y` (a gather's rows for the experts `idx`, rounded to its dtype) times each row's expert scale, rounded again (the
+/// SDK block's `scaleExperts`); `y` itself without one.
+fn expertScaled(sc: *Scope, y: A, scale: ?A, idx: A) !A {
+    const v = scale orelse return y;
+    var s = try sc.take(v, idx, 0);
+    while (mlx.getShape(s).len < mlx.getShape(y).len) s = try sc.expand(s, -1);
+    return sc.mul(y, s);
+}
+
+/// Routing weights `wts` (f32) for the experts `idx` with the layer's down scales on them (f32), as the SDK block puts
+/// ModelOpt's down scale on the route; `wts` itself without them.
+fn routeScaled(sc: *Scope, ly: *const Layer, idx: A, wts: A) !A {
+    const v = ly.experts.scale[2] orelse return wts;
+    return sc.mul(wts, try sc.take(v, idx, 0));
 }
 
 pub const MOE_GU_INS = [_][*:0]const u8{ "x", "w", "scales", "biases", "sw", "sscales", "sbiases", "inds", "wts", "lim" };
@@ -3906,7 +3989,7 @@ pub fn ffnDecode(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: 
     const sgu = ly.shared_gu orelse return null;
     const dn = &ly.experts.down;
     const sdn = &ly.shared[2];
-    if (m.dec.moe_fp4) |kf| if (try dkern.moe_fp4.moeUp(sc, m, kf, ly, h, idx, wts)) |act|
+    if (fp4Decode(m)) |kf| if (try fp4Up(sc, m, kf, ly, h, idx, wts)) |act|
         if (try dkern.moe_fp4.moeDown(sc, kf, ly, act, idx, x1, sp)) |y| return y;
     if (m.dec.moe_up) |ku| if (m.dec.moe_down) |kd| if (ly.experts.views) |v| if (try dkern.moe_up.moeUp(sc, m, ku, ly, h, idx, wts)) |act|
         if (try dkern.moe_down.moeDown(sc, kd, m.dec.moe_down_rb, &v[1], sdn, act, idx, x1, sp)) |y| return y;
@@ -3930,6 +4013,19 @@ pub fn ffnDecode(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: 
     const act = try moeKernel(sc, m.moe_gu_kernel, &.{ h, vgu.w, vgu.s, vgu.b, sgu.w, sgu.s, sgb, flat, try sc.reshape(wts, &.{ci(k)}), lim }, &.{ ci(k + 1), ci(inter) }, dt, gu.qp, sgu.qp, d, inter, k);
     if (m.dec.moe_down) |kern| if (try dkern.moe_down.moeDown(sc, kern, m.dec.moe_down_rb, &vdn, sdn, try sc.reshape(act, &.{ 1, ci(k + 1), ci(inter) }), idx, x1, sp)) |y| return y;
     return try moeKernel(sc, m.moe_dn_kernel, &.{ act, vdn.w, vdn.s, vdn.b, sdn.w, sdn.s, sdb, flat, x1, sp.post, sp.comb }, mlx.getShape(x1), dt, dn.qp, sdn.qp, inter, d, k);
+}
+
+/// The fused fp4 MoE decode kernels where they serve: without NAX, and on a NAX GPU only under
+/// `MLX_SERVE_DSV41_MOE_FP4_NAX` (read each call; there `routed`'s gathers run without it).
+fn fp4Decode(m: *const Dsv41Model) ?dkern.moe_fp4.Kernels {
+    const k = m.dec.moe_fp4 orelse return null;
+    if (device.naxAvailable() and !env.on(.MLX_SERVE_DSV41_MOE_FP4_NAX)) return null;
+    return k;
+}
+
+/// The fused gate/up launch with the layer's gate and up scales (its down scale already rides `wts`).
+fn fp4Up(sc: *Scope, m: *const Dsv41Model, kf: dkern.moe_fp4.Kernels, ly: *const Layer, h: A, idx: A, wts: A) !?A {
+    return dkern.moe_fp4.moeUpScaled(sc, m, kf, ly, h, idx, wts, .{ .gate = ly.experts.scale[0], .up = ly.experts.scale[1] });
 }
 
 /// Rows a simdgroup in the MoE kernels: swept on M5 Ultra over 1..8 rows and 1..4 simdgroups a threadgroup.
@@ -4391,8 +4487,9 @@ fn moePrefill(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, 
         break :blk try sc.astype(try sc.mul(a, try sc.reshape(w_sorted, &.{ ci(n), 1, 1 })), dt);
     } else blk: {
         if (try ggufGateUp(sc, m, e, x3, rows, sidx, w_sorted)) |a| break :blk a;
-        const y = if (e.gu) |*gu| try sortedBank(sc, x3, rows, gu, sidx) else try sc.concat(&.{ try sortedBank(sc, x3, rows, &e.gate, sidx), try sortedBank(sc, x3, rows, &e.up, sidx) }, -1); // [n, 1, 2 inter]
+        var y = if (e.gu) |*gu| try sortedBank(sc, x3, rows, gu, sidx) else try sc.concat(&.{ try sortedBank(sc, x3, rows, &e.gate, sidx), try sortedBank(sc, x3, rows, &e.up, sidx) }, -1); // [n, 1, 2 inter]
         const inter = dim(y, -1) / 2;
+        if (e.scale[0] != null) y = try sc.concat(&.{ try expertScaled(sc, try sc.slice(y, -1, 0, inter), e.scale[0], sidx), try expertScaled(sc, try sc.slice(y, -1, inter, 2 * inter), e.scale[1], sidx) }, -1);
         const lim = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.dsv4_swiglu_limit}, &[_]c_int{1}, 1, .float32));
         break :blk try flatKernel(sc, m.moe_act_kernel, &.{ try sc.reshape(y, &.{ ci(n), ci(2 * inter) }), w_sorted, lim }, &.{ ci(n), 1, ci(inter) }, dt, n * inter, &.{.{ .name = "N", .v = ci(inter) }});
     };
@@ -4457,7 +4554,8 @@ pub fn routeFrom(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, logits: A, 
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, m.route_kernel, iv, cfg, sc.s));
     var idx = mlx.mlx_array_new();
     var wts = mlx.mlx_array_new();
-    return .{ .idx = try sc.res(mlx.mlx_vector_array_get(&idx, ov, 0), &idx), .wts = try sc.res(mlx.mlx_vector_array_get(&wts, ov, 1), &wts) };
+    const r: Routes = .{ .idx = try sc.res(mlx.mlx_vector_array_get(&idx, ov, 0), &idx), .wts = try sc.res(mlx.mlx_vector_array_get(&wts, ov, 1), &wts) };
+    return .{ .idx = r.idx, .wts = try routeScaled(sc, ly, r.idx, r.wts) };
 }
 
 /// The routed sum `y` (f32) plus the shared expert.
@@ -4996,8 +5094,8 @@ fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, p
 /// The routed and shared rows this rank holds on the fused mxfp4 launches (`[R, dim]`), or null where they decline:
 /// the down launch's hc expand over one copy with no residual and a unit post is the MoE output itself.
 fn moeFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: A, wts: A) !?A {
-    const kf = m.dec.moe_fp4 orelse return null;
-    const act = try dkern.moe_fp4.moeUp(sc, m, kf, ly, h, idx, wts) orelse return null;
+    const kf = fp4Decode(m) orelse return null;
+    const act = try fp4Up(sc, m, kf, ly, h, idx, wts) orelse return null;
     const R = dim(h, 0);
     const one = &m.tp_units[R - 1];
     const y = try dkern.moe_fp4.moeDown(sc, kf, ly, act, idx, one.pre, one) orelse return null;
@@ -5012,7 +5110,9 @@ fn ffnInFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, oa: A, x: A, s
     const c = &m.cfg;
     const dims: dkern.ffn_in.Dims = .{ .rows = dim(x, 0), .d = c.hidden_size, .k = dim(oa, 1), .e = dim(ly.gate_w, 0), .top_k = ly.top_k, .iters = c.dsv4_hc_sinkhorn_iters, .norm = c.moe_route_norm and ly.top_k > 1 };
     const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{c.router_scaling_factor}, &[_]c_int{1}, 1, .float32));
-    return dkern.ffn_in.launch(sc, k, dims, dkern.ffn_in.weightsOf(ly), oa, x, sa, try hcEps(sc, m), scal);
+    var out = (try dkern.ffn_in.launch(sc, k, dims, dkern.ffn_in.weightsOf(ly), oa, x, sa, try hcEps(sc, m), scal)) orelse return null;
+    out.wts = try routeScaled(sc, ly, out.idx, out.wts);
+    return out;
 }
 
 /// A block up to its FFN: the stream after attention, the FFN's mix and the
