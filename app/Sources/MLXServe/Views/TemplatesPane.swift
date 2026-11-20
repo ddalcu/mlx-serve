@@ -104,7 +104,7 @@ private struct TemplateGallery: View {
                 if let t = run.template, run.isBusy || run.phase == .done {
                     ContinueBanner(template: t, run: run)
                 }
-                CastStrip(cast: cast, onEdit: { editing = .edit($0) }, onAdd: { editing = .add(slot: nil, pets: nil) })
+                CastStrip(cast: cast, onEdit: { editing = .edit($0) }, onAdd: { editing = .add(slot: nil) })
                 if let hero = MediaTemplate.allCases.first {
                     HeroCard(template: hero, readiness: readiness(hero), busy: run.isBusy && run.template != hero) {
                         run.open(hero)
@@ -462,13 +462,13 @@ private struct LoopingVideo: NSViewRepresentable {
 // MARK: - Cast
 
 private enum CastEditTarget: Identifiable {
-    /// A new member; `slot` is the blank to fill with them, `pets` what kind to start on.
-    case add(slot: String?, pets: Bool?)
+    /// A new member; `slot` is the blank to fill with them.
+    case add(slot: String?)
     case edit(CastMember)
 
     var id: String {
         switch self {
-        case .add(let slot, _): "add-\(slot ?? "")"
+        case .add(let slot): "add-\(slot ?? "")"
         case .edit(let m): m.id.uuidString
         }
     }
@@ -628,9 +628,6 @@ private struct CastEditorSheet: View {
     private func load() {
         if let m = existing {
             name = m.name; kind = m.kind; voice = m.voice; looks = m.looks; consent = m.consent
-        } else if case .add(_, let pets) = target {
-            kind = pets == false ? .woman : .dog
-            voice = .default(for: kind)
         }
     }
 
@@ -722,7 +719,7 @@ private struct TemplatePage: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .sheet(item: $editing) { target in
             CastEditorSheet(cast: cast, target: target) { saved in
-                if let saved, case .add(let slot?, _) = target { run.fill.cast[slot] = saved }
+                if let saved, case .add(let slot?) = target { run.fill.cast[slot] = saved }
                 editing = nil
             }
         }
@@ -781,8 +778,8 @@ private struct SlotRow: View {
                 if slot.optional { Text("optional").font(.app(.annotation)).foregroundStyle(.secondary) }
             }
             switch slot.kind {
-            case .cast(let filter):
-                CastPicker(slot: slot, filter: filter, run: run, cast: cast, editing: $editing)
+            case .cast:
+                CastPicker(slot: slot, run: run, cast: cast, editing: $editing)
             case .text(let example):
                 TextField(example, text: answer).textFieldStyle(.roundedBorder).font(.app(.value))
             case .choice(let options):
@@ -823,17 +820,16 @@ private struct ChoiceTile: View {
     }
 }
 
-/// The cast as faces to tap: the half that fits the blank, plus Add.
+/// The cast as faces to tap, minus anyone in another blank, plus Add.
 private struct CastPicker: View {
     let slot: TemplateSlot
-    let filter: CastFilter
     @ObservedObject var run: TemplateRunner
     @ObservedObject var cast: CastStore
     @Binding var editing: CastEditTarget?
 
     var body: some View {
         let taken = Set(run.fill.cast.filter { $0.key != slot.key }.map(\.value.id))
-        let offered = cast.members.filter { filter.admits($0.kind) && !taken.contains($0.id) }
+        let offered = cast.members.filter { !taken.contains($0.id) }
         FlowLayout(spacing: 12, rowSpacing: 10) {
             if slot.optional {
                 Button { run.fill.cast[slot.key] = nil } label: { NoneChip(selected: run.fill.cast[slot.key] == nil) }
@@ -845,9 +841,7 @@ private struct CastPicker: View {
                 }
                 .buttonStyle(.plain)
             }
-            AddCastButton(size: 48) {
-                editing = .add(slot: slot.key, pets: filter == .anyone ? nil : filter == .pets)
-            }
+            AddCastButton(size: 48) { editing = .add(slot: slot.key) }
         }
     }
 }
@@ -990,6 +984,10 @@ private struct MakeStep: View {
             }
             .buttonStyle(.borderedProminent)
             .disabled(run.isBusy || template.linesMissing(run.fill, run.lines))
+            Button { run.openInEditor(app: appState) } label: {
+                Label("Advanced Editor", systemImage: "slider.horizontal.3").font(.app(.value))
+            }
+            .help(L10n.text("Open this in the full editor with every option"))
             Text(verbatim: note).font(.app(.annotation)).foregroundStyle(.secondary)
         }
     }
@@ -1133,8 +1131,8 @@ private struct DoneActions: View {
             HStack(spacing: 10) {
                 Button { run.anotherTake(app: appState) } label: { Label("Another take", systemImage: "dice").font(.app(.value)) }
                 Button { run.editFill() } label: { Text("Change the details").font(.app(.value)) }
-                if run.template?.kind == .video {
-                    Button { run.openInVideo(app: appState) } label: { Text("Open in Video").font(.app(.value)) }
+                Button { run.openInEditor(app: appState) } label: {
+                    Label("Advanced Editor", systemImage: "slider.horizontal.3").font(.app(.value))
                 }
             }
         }

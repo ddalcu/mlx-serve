@@ -176,8 +176,10 @@ final class TemplateRunner: ObservableObject {
                     let song = URL(fileURLWithPath: try await app.musicGen.generateForAgent(
                         Self.songRequest(t, fill: fill, lines: lines, seed: seed, peer: peer), server: app.server, onProgress: onProgress))
                     url = Self.songVideoURL(song)
-                    let cover = t.cast(fill).first.map { app.cast.photoURL($0) }
-                    try await SongVideo.make(cover: cover ?? song, title: lines["title"] ?? "", song: song, shape: shape, to: url)
+                    let photo = t.cast(fill).first.map { app.cast.photoURL($0) } ?? song
+                    let cover = await songCover(t, fill: fill, photo: photo, seed: seed, app: app, onProgress: onProgress)
+                    try Task.checkCancellation()
+                    try await SongVideo.make(cover: cover, title: lines["title"] ?? "", song: song, shape: shape, to: url)
                 }
                 try Task.checkCancellation()
                 clip = url
@@ -206,6 +208,21 @@ final class TemplateRunner: ObservableObject {
             }
         }
         return true
+    }
+
+    /// The song's cover: their photo restyled where the template asks for it
+    /// and the picture model is here or on the network, else the photo itself.
+    private func songCover(_ t: MediaTemplate, fill: TemplateFill, photo: URL, seed: Int, app: AppState,
+                           onProgress: @escaping (MediaGenProgress) -> Void) async -> URL {
+        guard let prompt = t.songCoverPrompt(fill) else { return photo }
+        let m = MediaTemplate.imageModel
+        let peer = app.downloads.bundleReady(m.bundle) ? nil
+            : TemplateReadiness.peer(repo: m.repo, capability: "image", in: app.server.lanModels(capability: "image"))
+        guard app.downloads.bundleReady(m.bundle) || peer != nil else { return photo }
+        var r = Self.imageRequest(t, fill: fill, shape: .square, seed: seed, cast: app.cast, peer: peer)
+        r.prompt = prompt
+        guard let path = try? await app.imageGen.generateForAgent(r, server: app.server, onProgress: onProgress) else { return photo }
+        return URL(fileURLWithPath: path)
     }
 
     /// Where a song's shareable video goes: beside the song, under a name that
@@ -275,24 +292,66 @@ final class TemplateRunner: ObservableObject {
         }
     }
 
-    /// Hands the whole request to the Video pane, for anyone who wants every knob.
-    func openInVideo(app: AppState) {
+    /// Advanced Editor: hands what the template would make to its full pane,
+    /// for anyone who wants every knob.
+    func openInEditor(app: AppState) {
         guard let t = template else { return }
         let peer: String? = if case .onPeer(let id) = Self.readiness(t, shape: shape, app: app) { id } else { nil }
-        let request = Self.request(t, fill: fill, lines: lines, shape: shape, seed: seed, cast: app.cast, peer: peer)
-        var s = VideoGenSettings.load()
-        s.modelId = LanPick.persisted(lanModel: peer, presetId: request.model.id)
-        s.prompt = request.prompt
-        s.refImagePaths = request.refImagePaths
-        s.seed = request.seed
-        s.numFrames = request.numFrames
-        s.steps = request.steps
+        switch t.kind {
+        case .video:
+            let request = Self.request(t, fill: fill, lines: lines, shape: shape, seed: seed, cast: app.cast, peer: peer)
+            var s = VideoGenSettings.load()
+            s.modelId = LanPick.persisted(lanModel: peer, presetId: request.model.id)
+            s.prompt = request.prompt
+            s.refImagePaths = request.refImagePaths
+            s.seed = request.seed
+            s.numFrames = request.numFrames
+            s.steps = request.steps
+            s.resolutionId = ResolutionOption.custom.id
+            s.customWidth = request.width
+            s.customHeight = request.height
+            s.storyboardMode = false
+            s.save()
+            app.showCreate(.video)
+        case .image:
+            Self.imageSettings(t, fill: fill, shape: shape, seed: seed, cast: app.cast, peer: peer).save()
+            app.showCreate(.image)
+        case .audio:
+            Self.musicSettings(t, fill: fill, lines: lines, seed: seed, peer: peer).save()
+            UserDefaults.standard.set(AudioGenView.Tab.music.rawValue, forKey: "audioGenTab")
+            app.showCreate(.audio)
+        }
+    }
+
+    static func imageSettings(_ t: MediaTemplate, fill: TemplateFill, shape: ShareShape, seed: Int, cast: CastStore,
+                              peer: String?) -> ImageGenSettings {
+        let r = imageRequest(t, fill: fill, shape: shape, seed: seed, cast: cast, peer: peer)
+        var s = ImageGenSettings.load()
+        s.modelId = LanPick.persisted(lanModel: peer, presetId: r.model.id)
+        s.prompt = r.prompt
+        s.sourcePath = r.initImagePath
+        s.refPaths = []
+        s.editMode = true
+        s.seed = seed
         s.resolutionId = ResolutionOption.custom.id
-        s.customWidth = request.width
-        s.customHeight = request.height
-        s.storyboardMode = false
-        s.save()
-        app.showCreate(.video)
+        s.customWidth = r.width
+        s.customHeight = r.height
+        return s
+    }
+
+    static func musicSettings(_ t: MediaTemplate, fill: TemplateFill, lines: [String: String], seed: Int,
+                              peer: String?) -> MusicGenSettings {
+        let r = songRequest(t, fill: fill, lines: lines, seed: seed, peer: peer)
+        var s = MusicGenSettings.load()
+        s.modelId = LanPick.persisted(lanModel: peer, presetId: r.model.id)
+        s.prompt = r.prompt
+        s.lyrics = r.lyrics
+        s.durationSeconds = r.durationSeconds
+        s.autoLength = false
+        s.instrumental = false
+        s.task = .text2music
+        s.seed = seed
+        return s
     }
 
     static func imageRequest(_ t: MediaTemplate, fill: TemplateFill, shape: ShareShape, seed: Int, cast: CastStore,

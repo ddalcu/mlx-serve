@@ -10,12 +10,10 @@ final class MediaTemplateTests: XCTestCase {
     }
 
     /// A fill with every slot answered: the template's own defaults plus a cast member per cast slot.
-    private func filled(_ t: MediaTemplate) -> TemplateFill {
+    private func filled(_ t: MediaTemplate, as kind: CastKind = .girl) -> TemplateFill {
         var fill = t.defaultFill()
-        for slot in t.slots {
-            if case .cast(let filter) = slot.kind {
-                fill.cast[slot.key] = member(slot.key.capitalized, filter == .people ? .girl : .dog)
-            }
+        for slot in t.slots where slot.kind == .cast {
+            fill.cast[slot.key] = member(slot.key.capitalized, kind)
         }
         return fill
     }
@@ -187,7 +185,7 @@ final class MediaTemplateTests: XCTestCase {
     }
 
     func testEachReactionSaysItsOneLineOrNothing() {
-        var fill = filled(.reaction)
+        var fill = filled(.reaction, as: .dog)
         for (reaction, keys) in [(Reaction.mindBlown, ["line"]), (.eyeRoll, []), (.sayLess, ["line"])] {
             fill.answers["reaction"] = reaction.label
             XCTAssertEqual(MediaTemplate.reaction.lineKeys(fill), keys, reaction.label)
@@ -215,8 +213,6 @@ final class MediaTemplateTests: XCTestCase {
         XCTAssertTrue(doc.contains("<Subject 1> and <Subject 3> dancing upright on their hind legs"), "the man stays on his feet")
         XCTAssertFalse(doc.contains("<Picture 4>"), "a skipped blank does not leave a gap in the numbering")
         XCTAssertTrue(MediaTemplate.party.lineKeys(fill).isEmpty)
-        XCTAssertTrue(CastFilter.anyone.admits(.man) && CastFilter.anyone.admits(.cat))
-        XCTAssertFalse(CastFilter.pets.admits(.girl))
     }
 
     /// The bandana a photo shows is lost unless the document says to keep it.
@@ -400,5 +396,59 @@ final class MediaTemplateTests: XCTestCase {
         run.anotherTake(app: app)
         XCTAssertEqual(run.phase, .done)
         XCTAssertEqual(run.result, clip)
+    }
+
+    /// Any member of the cast fills any blank, and the words fit what they are.
+    func testEveryBlankTakesAnyoneInTheCast() {
+        for t in MediaTemplate.allCases {
+            for kind in [CastKind.dog, .boy] {
+                let fill = filled(t, as: kind)
+                XCTAssertNil(t.missing(fill), "\(t) refused a \(kind)")
+                let lines = Dictionary(uniqueKeysWithValues: t.lineKeys(fill).map { ($0, "Hello there.") })
+                let words = [t.document(fill, lines: lines), t.ask(fill), t.imagePrompt(fill)].joined(separator: " ")
+                if kind == .dog {
+                    XCTAssertFalse(words.contains("hair and clothing"), "\(t) gives a dog hair and clothing")
+                    XCTAssertFalse(words.contains("a child") || words.contains("the child"), "\(t) calls a dog a child")
+                } else {
+                    XCTAssertFalse(words.contains("ears perked"), "\(t) perks a boy's ears")
+                    XCTAssertFalse(words.contains("talking-pet"), "\(t) calls a boy a pet")
+                }
+            }
+        }
+    }
+
+    /// A roast's cover shows them as a rapper, still themselves; the other songs keep their photo.
+    func testARoastRapsCoverMakesThemARapper() {
+        var fill = MediaTemplate.roast.defaultFill()
+        fill.cast["who"] = member("Luna", .cat)
+        let prompt = MediaTemplate.roast.songCoverPrompt(fill)
+        XCTAssertTrue(prompt?.contains("the same cat from the photo") == true)
+        XCTAssertTrue(prompt?.contains("rapper") == true)
+        XCTAssertNil(MediaTemplate.birthday.songCoverPrompt(fill))
+    }
+
+    /// Advanced Editor hands the full pane exactly what the template would have made.
+    @MainActor
+    func testTheAdvancedEditorGetsWhatTheTemplateWouldMake() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tpl-adv-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let cast = CastStore(rootDir: dir)
+        var fill = MediaTemplate.figure.defaultFill()
+        fill.cast["who"] = member("Max", .dog)
+        let image = TemplateRunner.imageSettings(.figure, fill: fill, shape: .story, seed: 9, cast: cast, peer: nil)
+        XCTAssertEqual(image.modelId, MediaTemplate.imageModel.id)
+        XCTAssertEqual(image.prompt, MediaTemplate.figure.imagePrompt(fill))
+        XCTAssertEqual(image.sourcePath, cast.photoURL(try XCTUnwrap(fill.cast["who"])).path)
+        XCTAssertTrue(image.editMode)
+        XCTAssertEqual([image.customWidth, image.customHeight], [576, 1024])
+        XCTAssertEqual(image.seed, 9)
+
+        let lines = ["title": "T", "lyrics": "[verse]\nHi"]
+        let song = TemplateRunner.musicSettings(.roast, fill: fill, lines: lines, seed: 9, peer: "m@studio")
+        XCTAssertEqual(song.modelId, LanPick.persisted(lanModel: "m@studio", presetId: MediaTemplate.songModel.id))
+        XCTAssertEqual(song.prompt, MediaTemplate.roast.songStyle(fill))
+        XCTAssertEqual(song.lyrics, "[verse]\nHi")
+        XCTAssertEqual(song.durationSeconds, MediaTemplate.roast.seconds)
+        XCTAssertFalse(song.autoLength)
     }
 }

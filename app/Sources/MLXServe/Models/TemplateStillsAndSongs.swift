@@ -29,11 +29,7 @@ extension MediaTemplate {
     /// kept as they are. Never the meme text: the model would misspell it, so
     /// it is burned on afterwards.
     func imagePrompt(_ fill: TemplateFill) -> String {
-        let m = fill.cast["who"] ?? CastMember.placeholder(.dog)
-        let looks = TemplateText.clean(m.looks)
-        let keep = "the same \(m.kind.noun) from the photo, keeping \(m.kind.their) exact face"
-            + (m.kind.isPerson ? " and hair" : ", fur colours and markings")
-            + (looks.isEmpty ? "" : ", including \(looks)")
+        let keep = Self.keep(fill.cast["who"])
         switch self {
         case .portrait:
             return "Turn this into a grand Renaissance oil painting: \(keep), posed as a pompous royal noble in a velvet robe with an ermine collar, a jewelled crown and a gold medallion, seated on a red velvet throne in a candlelit palace hall, dramatic chiaroscuro lighting, visible brush strokes, ornate gold frame."
@@ -49,7 +45,22 @@ extension MediaTemplate {
         }
     }
 
+    /// Who the edit keeps, and what of them.
+    private static func keep(_ who: CastMember?) -> String {
+        let m = who ?? CastMember.placeholder(.dog)
+        let looks = TemplateText.clean(m.looks)
+        return "the same \(m.kind.noun) from the photo, keeping \(m.kind.their) exact face"
+            + (m.kind.isPerson ? " and hair" : ", fur colours and markings")
+            + (looks.isEmpty ? "" : ", including \(looks)")
+    }
+
     // MARK: - Songs
+
+    /// The edit that makes a song's cover, or nil to use their photo as it is.
+    func songCoverPrompt(_ fill: TemplateFill) -> String? {
+        guard self == .roast else { return nil }
+        return "Turn this into a hip-hop album cover: \(Self.keep(fill.cast["who"])), as a confident rapper wearing a backwards cap, oversized sunglasses, a hoodie and heavy gold chains, holding a microphone and striking a swagger pose, a graffiti wall and city lights behind, purple and gold neon lighting, gritty and bold, no text."
+    }
 
     /// ACE-Step's style caption: genre, instruments, voice and tempo.
     func songStyle(_ fill: TemplateFill) -> String {

@@ -87,7 +87,7 @@ enum MediaTemplate: String, CaseIterable, Identifiable {
 
     var blurb: String {
         switch self {
-        case .santa: "Santa says your child's name and holds up their photo by the fire."
+        case .santa: "Santa says their name and holds up their photo by the fire."
         case .pets: "Your pets host a podcast, read the news or confess on the couch."
         case .reaction: "Anyone in your cast, mind blown, rolling their eyes or saying say less. Add meme text, save a GIF."
         case .party: "Up to four of your cast dancing their hearts out at a packed house party."
@@ -137,29 +137,29 @@ enum MediaTemplate: String, CaseIterable, Identifiable {
     var slots: [TemplateSlot] {
         switch self {
         case .santa:
-            [TemplateSlot(key: "child", label: "Who is it for?", kind: .cast(.people)),
+            [TemplateSlot(key: "child", label: "Who is it for?", kind: .cast),
              TemplateSlot(key: "age", label: "How old are they?", kind: .text(example: "6")),
              TemplateSlot(key: "deed", label: "Something good they did this year",
                           kind: .text(example: "helped their little sister learn to ride a bike")),
              TemplateSlot(key: "wish", label: "What are they hoping for?", kind: .text(example: "a telescope"))]
         case .pets:
-            [TemplateSlot(key: "a", label: "Who's talking?", kind: .cast(.pets)),
-             TemplateSlot(key: "b", label: "And who answers?", kind: .cast(.pets), optional: true),
+            [TemplateSlot(key: "a", label: "Who's talking?", kind: .cast),
+             TemplateSlot(key: "b", label: "And who answers?", kind: .cast, optional: true),
              TemplateSlot(key: "topic", label: "What about?", kind: .text(example: "why the couch cushion is missing")),
              TemplateSlot(key: "format", label: "Where?", kind: .choice(PetFormat.allCases.map(\.label)))]
         case .reaction:
-            [TemplateSlot(key: "who", label: "Who's reacting?", kind: .cast(.anyone)),
+            [TemplateSlot(key: "who", label: "Who's reacting?", kind: .cast),
              TemplateSlot(key: "reaction", label: "Reaction", kind: .choice(Reaction.allCases.map(\.label))),
              TemplateSlot(key: "top", label: "Meme text on top", kind: .text(example: "when the WiFi drops mid-game"),
                           optional: true)]
         case .party:
-            [TemplateSlot(key: "a", label: "Who dances out front?", kind: .cast(.anyone)),
-             TemplateSlot(key: "b", label: "Dancing behind", kind: .cast(.anyone), optional: true),
-             TemplateSlot(key: "c", label: "Dancing behind", kind: .cast(.anyone), optional: true),
-             TemplateSlot(key: "d", label: "Dancing behind", kind: .cast(.anyone), optional: true)]
+            [TemplateSlot(key: "a", label: "Who dances out front?", kind: .cast),
+             TemplateSlot(key: "b", label: "Dancing behind", kind: .cast, optional: true),
+             TemplateSlot(key: "c", label: "Dancing behind", kind: .cast, optional: true),
+             TemplateSlot(key: "d", label: "Dancing behind", kind: .cast, optional: true)]
         case .hug:
-            [TemplateSlot(key: "now", label: "You, today", kind: .cast(.people)),
-             TemplateSlot(key: "young", label: "You as a child", kind: .cast(.people)),
+            [TemplateSlot(key: "now", label: "You, today", kind: .cast),
+             TemplateSlot(key: "young", label: "You as a child", kind: .cast),
              TemplateSlot(key: "whisper", label: "What do you whisper?", kind: .text(example: "I'm so proud of you."))]
         case .portrait:
             memeSlots(top: "his royal highness", bottom: "duke of the couch")
@@ -168,27 +168,27 @@ enum MediaTemplate: String, CaseIterable, Identifiable {
         case .poster:
             memeSlots(top: "this summer, one good boy", bottom: "the last nap")
         case .figure:
-            [TemplateSlot(key: "who", label: "Who's in it?", kind: .cast(.anyone)),
+            [TemplateSlot(key: "who", label: "Who's in it?", kind: .cast),
              TemplateSlot(key: "gear", label: "Their accessories", kind: .text(example: "a coffee mug, a laptop and a tiny dog bed")),
              TemplateSlot(key: "top", label: "Top text", kind: .text(example: "limited edition"), optional: true),
              TemplateSlot(key: "bottom", label: "Bottom text", kind: .text(example: "batteries not included"), optional: true)]
         case .birthday:
-            [TemplateSlot(key: "who", label: "Who's it for?", kind: .cast(.anyone)),
+            [TemplateSlot(key: "who", label: "Who's it for?", kind: .cast),
              TemplateSlot(key: "love", label: "Something they love", kind: .text(example: "pizza and long walks"))]
         case .theme:
-            [TemplateSlot(key: "who", label: "Whose theme song?", kind: .cast(.anyone)),
+            [TemplateSlot(key: "who", label: "Whose theme song?", kind: .cast),
              TemplateSlot(key: "known", label: "What are they known for?", kind: .text(example: "stealing socks and snoring"))]
         case .ballad:
-            [TemplateSlot(key: "who", label: "Whose heartbreak?", kind: .cast(.anyone)),
+            [TemplateSlot(key: "who", label: "Whose heartbreak?", kind: .cast),
              TemplateSlot(key: "what", label: "What went wrong?", kind: .text(example: "my coffee went cold"))]
         case .roast:
-            [TemplateSlot(key: "who", label: "Who's getting roasted?", kind: .cast(.anyone)),
+            [TemplateSlot(key: "who", label: "Who's getting roasted?", kind: .cast),
              TemplateSlot(key: "tease", label: "Roast them about", kind: .text(example: "always being late"))]
         }
     }
 
     private func memeSlots(top: String, bottom: String) -> [TemplateSlot] {
-        [TemplateSlot(key: "who", label: "Who's in it?", kind: .cast(.anyone)),
+        [TemplateSlot(key: "who", label: "Who's in it?", kind: .cast),
          TemplateSlot(key: "top", label: "Top text", kind: .text(example: top), optional: true),
          TemplateSlot(key: "bottom", label: "Bottom text", kind: .text(example: bottom), optional: true)]
     }
@@ -272,16 +272,16 @@ enum MediaTemplate: String, CaseIterable, Identifiable {
             + keys.joined(separator: ", ") + "."
         switch self {
         case .santa:
-            let name = fill.cast["child"]?.name ?? "the child"
-            return "Write what Santa Claus says, looking into the camera, in a personal video message to a child. "
-                + "Child: \(name), age \(fill.text("age")). Something good they did this year: \(fill.text("deed")). "
+            let m = fill.cast["child"] ?? CastMember.placeholder(.girl)
+            return "Write what Santa Claus says, looking into the camera, in a personal video message to \(m.name), "
+                + "a \(m.kind.noun) aged \(fill.text("age")). Something good they did this year: \(fill.text("deed")). "
                 + "What they are hoping for: \(fill.text("wish")). Start with a warm greeting that uses the name, "
                 + "mention the good deed, hint about the wish without promising it. Warm and jolly, at most "
                 + "\(TemplateText.wordBudget(seconds: seconds) - 2) words of spoken English." + rules
         case .pets:
             let format = PetFormat(label: fill.text("format"))
-            var brief = keys.count == 1 ? "Write one line for a funny talking-pet video. "
-                : "Write a two-line exchange for a funny talking-pet video. "
+            var brief = keys.count == 1 ? "Write one line for a funny talking video. "
+                : "Write a two-line exchange for a funny talking video. "
             for key in keys {
                 guard let m = fill.cast[key] else { continue }
                 brief += "\(m.name) (key \(key)) is a \(m.kind.noun), \(m.voice.trait). "
@@ -348,7 +348,7 @@ enum MediaTemplate: String, CaseIterable, Identifiable {
         [reference generation] The target video is a single shot of Santa Claus by his workshop fireplace, holding up a framed photograph of <Subject 1> and speaking a personal message to them.
 
         retention_analysis:
-        <Subject 1> (appears in [Shot 1] as the framed photograph Santa holds): fully_preserved - the \(child.kind.noun)'s face, hair and clothing are retained inside the photograph.
+        <Subject 1> (appears in [Shot 1] as the framed photograph Santa holds): fully_preserved - \(keeps(child)) inside the photograph.
 
         detailed_description:
         The target video is in a warm, magical cinematic style with flickering firelight and soft twinkling lights.
@@ -370,7 +370,7 @@ enum MediaTemplate: String, CaseIterable, Identifiable {
         var defs = definition(1, a)
         var keep = "<Subject 1> (appears in [Shot 1]): fully_preserved - \(keeps(a))."
         var shot = "[Shot 1] A medium static shot at eye level frames <Subject 1> (S1)"
-        var action = "<Subject 1> leans \(format.toward) with ears perked and eyebrows raised, and says in \(a.voice.phrase), <d>[English] \(lines["a"] ?? "")</d>"
+        var action = "<Subject 1> leans \(format.toward) with \(a.kind.isPerson ? "eyebrows" : "ears perked and eyebrows") raised, and says in \(a.voice.phrase), <d>[English] \(lines["a"] ?? "")</d>"
         if let b {
             defs += "\n" + definition(2, b)
             keep += "\n<Subject 2> (appears in [Shot 1]): fully_preserved - \(keeps(b))."
@@ -464,10 +464,14 @@ enum MediaTemplate: String, CaseIterable, Identifiable {
         let now = fill.cast["now"] ?? CastMember.placeholder(.woman)
         let young = fill.cast["young"] ?? CastMember.placeholder(.girl)
         let they = now.kind.they.capitalized
+        let little = young.kind.isPerson ? "the child" : "the young \(young.kind.noun)"
+        let embrace = now.kind.isPerson
+            ? "<Subject 1> opens \(now.kind.their) arms and \(little) walks into them; they hold each other tightly, eyes closing."
+            : "<Subject 1> nuzzles \(little) gently and they cuddle up close, eyes closing."
         return """
         subject_definitions:
         \(definition(1, now))
-        \(definition(2, young, extra: ", the same person as a young child"))
+        \(definition(2, young, extra: young.kind.isPerson ? ", the same person as a young child" : ", the same \(young.kind.noun) when young"))
 
         summary:
         [reference generation] The target video is a single emotional shot of <Subject 1> kneeling down to hug <Subject 2>, \(now.kind.their) younger self, in a sunlit backyard.
@@ -478,7 +482,7 @@ enum MediaTemplate: String, CaseIterable, Identifiable {
 
         detailed_description:
         The target video is in a soft, dreamy cinematic style with warm golden-hour backlight.
-        [Shot 1] A medium shot with a slow push in frames <Subject 2> standing in tall green grass in a quiet backyard, against a wooden fence and a blur of trees. Golden late-afternoon sun shines from behind and lights the edges of the child's hair. <Subject 1> (S1) steps into the frame from the right, stops and looks at the child for a moment with glistening eyes, then kneels down to the child's eye level. The child looks up shyly, then breaks into a wide smile. <Subject 1> opens \(now.kind.their) arms and the child walks into them; they hold each other tightly, eyes closing. \(they) whispers softly, <d>[English] \(lines["whisper"] ?? "")</d> The camera keeps pushing in slowly on the embrace as the low sun flares softly behind them and a few seed heads drift through the light.
+        [Shot 1] A medium shot with a slow push in frames <Subject 2> standing in tall green grass in a quiet backyard, against a wooden fence and a blur of trees. Golden late-afternoon sun shines from behind and lights the edges of \(little)'s \(young.kind.isPerson ? "hair" : "fur"). <Subject 1> (S1) steps into the frame from the right, stops and looks at \(little) for a moment with glistening eyes, then lowers down to \(little)'s eye level. <Subject 2> looks up shyly, then brightens. \(embrace) \(they) whispers softly, <d>[English] \(lines["whisper"] ?? "")</d> The camera keeps pushing in slowly on the embrace as the low sun flares softly behind them and a few seed heads drift through the light.
 
         overall_soundscape:
         Gentle evening birdsong, a soft rustle of grass as \(now.kind.they) kneels, the faint rustle of clothing during the hug and a quiet, close whisper.
@@ -492,8 +496,8 @@ enum MediaTemplate: String, CaseIterable, Identifiable {
 /// One blank on a template's form.
 struct TemplateSlot: Identifiable, Equatable {
     enum Kind: Equatable {
-        /// A photo from the cast, of the kind the blank takes.
-        case cast(CastFilter)
+        /// A photo from the cast: anyone in it, person or pet.
+        case cast
         case text(example: String)
         case choice([String])
     }
@@ -518,19 +522,6 @@ struct TemplateFill: Equatable {
     /// taken up, and a member removed since is dropped.
     func resolved(in members: [CastMember]) -> TemplateFill {
         TemplateFill(cast: cast.compactMapValues { m in members.first { $0.id == m.id } }, answers: answers)
-    }
-}
-
-/// Which of the cast a blank offers.
-enum CastFilter: Equatable {
-    case pets, people, anyone
-
-    func admits(_ kind: CastKind) -> Bool {
-        switch self {
-        case .pets: !kind.isPerson
-        case .people: kind.isPerson
-        case .anyone: true
-        }
     }
 }
 
@@ -777,9 +768,13 @@ enum TemplateReadiness: Equatable {
 
     /// The first Mac on the network serving the pack `t` is made on.
     static func peer(for t: MediaTemplate, in lanModels: [ModelInfo]) -> String? {
-        let name = (t.modelRepo as NSString).lastPathComponent
+        peer(repo: t.modelRepo, capability: t.lanCapability, in: lanModels)
+    }
+
+    static func peer(repo: String, capability: String, in lanModels: [ModelInfo]) -> String? {
+        let name = (repo as NSString).lastPathComponent
         return lanModels.first { m in
-            m.lanAdvertises(t.lanCapability) && (LanPick.base(of: m.name) as NSString).lastPathComponent == name
+            m.lanAdvertises(capability) && (LanPick.base(of: m.name) as NSString).lastPathComponent == name
         }?.name
     }
 }
