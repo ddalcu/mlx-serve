@@ -4,6 +4,8 @@ DeepSeek-V4.1-Flash (`model_type: deepseek_v41`, 1M context, MLX packs) with its
 module-owned arch. Unpaired captures transfer to the engine's prefix cache, keyed on image rows. Packs:
 `ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw`, `mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-mtp`, and
 OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin (its trunk and its `experts.bin` bank).
+NVIDIA's `DeepSeek-V4.1-Flash-1017-NVFP4` converted by `scripts/dsv41_nvfp4_pack.py` (headers only), its NVFP4 experts
+through CommunityServe's `modelopt_ds41` quant plugin, its mxfp4 Engram tables read as stored.
 
 ## Files
 - `plugin.zig`: the table; `CacheHooks.aux` / live `state_bytes`; streamed/paired legacy `resume_prompt`;
@@ -99,6 +101,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   about a plain tick, and the adaptive policy's prior ladder cut novel text from 54 to 40 tok/s.
 - A streamed bank's phase follows its decode capacity (`promptPhase`): a call past the decode regions OR past
   `Routed.decode_ids` routed ids runs the prompt phase; a 9-16 token prompt on the EXL3 bank failed `NotPrefill`.
+- Engram tables are held in memory where they fit (`Table.hold`, `MLX_SERVE_DSV41_ENGRAM_RESIDENT`, billed by
+  `residentDiskBytes`): read once past the page cache at load, each lookup a copy; else the reads below.
 - Engram tables are read whole and past the page cache only beside a streamed bank (`Table.readDirect`): on a resident
   MLX pack the direct whole-grid read slowed warm prompts (the cache served their rows), and the bank needs that memory.
 - A resident pack reads its Engram CODES past the page cache while memory is tight (`Table.openCodes`, `pastCache`,
