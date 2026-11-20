@@ -5,6 +5,10 @@ const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../util/log.zig");
+const fp4 = @import("../../quant/fp4.zig");
+
+/// The gathers' shared header, after the one fp4 scale decode its `Fp4Q` reads.
+pub const NAX_HEADER = fp4.SCALE_HEADER ++ kernelSource("kernels/moe/gather_qmm_nax_header.metal");
 
 pub const Plan = struct { sched: enum { seg, db }, bm: c_int, bk: c_int, gx: c_int, pad: c_int };
 /// `mx`: an FP4 bank (uint8 scales, no biases: e8m0 per 32 for MXFP4, e4m3 per 16 for NVFP4) instead of affine.
@@ -83,9 +87,9 @@ fn kernel(scan: bool) !mlx.mlx_fast_metal_kernel {
     const out_vec = if (scan) mlx.mlx_vector_string_new_data(&out_names_scan, out_names_scan.len) else mlx.mlx_vector_string_new_data(&out_names_mm, out_names_mm.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
     const value = if (scan)
-        mlx.mlx_fast_metal_kernel_new("msv_gqmm_tile_scan", in_vec, out_vec, kernelSource("kernels/moe/gather_qmm_nax_scan.metal"), kernelSource("kernels/moe/gather_qmm_nax_header.metal"), true, false)
+        mlx.mlx_fast_metal_kernel_new("msv_gqmm_tile_scan", in_vec, out_vec, kernelSource("kernels/moe/gather_qmm_nax_scan.metal"), NAX_HEADER, true, false)
     else
-        mlx.mlx_fast_metal_kernel_new("msv_gqmm_affine", in_vec, out_vec, kernelSource("kernels/moe/gather_qmm_nax.metal"), kernelSource("kernels/moe/gather_qmm_nax_header.metal"), true, false);
+        mlx.mlx_fast_metal_kernel_new("msv_gqmm_affine", in_vec, out_vec, kernelSource("kernels/moe/gather_qmm_nax.metal"), NAX_HEADER, true, false);
     if (value.ctx == null) return error.MetalKernelCompileFailed;
     if (scan) scan_kernel = value else mm_kernel = value;
     return value;
@@ -100,7 +104,7 @@ fn mapKernel(paired: bool) !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(ins_vec);
     const outs_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
     defer _ = mlx.mlx_vector_string_free(outs_vec);
-    const header = kernelSource("kernels/moe/gather_qmm_nax_header.metal") ++ kernelSource("kernels/moe/gather_qmm_nax_mapped_header.metal");
+    const header = NAX_HEADER ++ kernelSource("kernels/moe/gather_qmm_nax_mapped_header.metal");
     const value = mlx.mlx_fast_metal_kernel_new(if (paired) "msv_gqmm_affine_pair" else "msv_gqmm_affine_map", ins_vec, outs_vec, kernelSource("kernels/moe/gather_qmm_nax_mapped.metal"), header, true, false);
     if (value.ctx == null) return error.MetalKernelCompileFailed;
     slot.* = value;
