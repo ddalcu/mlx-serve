@@ -252,6 +252,11 @@ test {
     _ = @import("plugins/glm5_next/model_config.zig");
     _ = @import("plugins/glm5_next/proof_test.zig");
     _ = @import("plugins/hy_v4/loader_test.zig");
+    _ = @import("plugins/hy_v4/blocks/ihc.zig");
+    _ = @import("plugins/hy_v4/blocks/router.zig");
+    _ = @import("plugins/hy_v4/blocks/proj.zig");
+    _ = @import("plugins/hy_v4/blocks/moe.zig");
+    _ = @import("plugins/hy_v4/blocks/mla.zig");
     _ = @import("plugins/glm5_next/served_test.zig");
     _ = @import("sdk/bases/kda_hybrid/cuts_test.zig");
     _ = @import("plugins/bailing_hybrid/bill_test.zig");

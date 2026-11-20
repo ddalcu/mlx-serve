@@ -38,3 +38,26 @@ Text-only forward runs end to end at reference parity for greedy tokens: embed (
 ## Verification (plan-level)
 Tiny-pack parity test in CI; full-pack greedy parity script (`tests/test_hyv4_parity.sh`, 512 GB host, env-gated like other cos-oracles); lint 0.
 Deferred-scope note: tiny dev pack `test-org-copilot/HYV4-0.7B` (`-mlx`, ~838 MB) covers the text path in CI; engram/DFly/vit fixtures are synthetic (Plan 02 fixtures).
+
+## Execution notes (plan 03)
+
+- The forward ships with plain MLX ops (Graph + `sdk/bases` cache helpers), correctness-first: `blocks/ihc.zig`
+  (pre/post mix, lane write, head collapse), `blocks/mla.zig` (absorbed MLA, sinks through MLX's SDPA `sinks`
+  arm, gate + sandwich norm, full/SWA window masks), `blocks/router.zig` (sigmoid + bias choice, ascending ids,
+  unbiased weights), `blocks/proj.zig` (packed/dense projections and the sorted expert gather), `blocks/moe.zig`
+  (latent MoE + shared expert + combine norm, dense L0 with `post_fc2_norm`), `trunk.zig` (layer build + loop).
+- Geometry resolved (the Plan-01 [AMBIGUOUS] "2× padded" note was wrong): DSA layers are 32 heads ×(192+64) and
+  SWA layers 64 heads ×(192+64); `q_b_proj` 8192/16384 and `kv_b_proj` 14336/28672 are the natural head-major
+  widths, not padding. Validate now checks per-kind heads, the 3-D expert triples over the LATENT width, and the
+  iHC table shapes.
+- KV decision: the cache row is 1088 halves — K = `[latent | k_rot]` (576), V = the latent (512), because MLA
+  lifts values from the latent after the reduction; `kv_b`'s two halves are dense bf16 copies at load (billed,
+  frozen `kv_b_proj` splits). A later port can drop the V copy by slicing K (measured A/B deferred).
+- Text M-RoPE is a no-op interleave (all axes share the position): rope is adjacent-pair rotation over the
+  trailing 64 channels, theta per layer kind. The oracle test pins MLX's `traditional=true` arm to that form.
+- Oracles: iHC mix/post/head vs f64, router vs f64 (ids + weights), latent MoE end-to-end vs f64 (clamp,
+  shared, combine norm), MLA attention vs f64 over a real `TestCache` (prefill 3 rows + decode row).
+- Conformance: the tiny pack loads and forwards prefill/decode/verify with finite logits of the declared shape;
+  `fixtureMayBeAbsent` is gone. Batched decode stays off (`batches_decode=false`) until Plan 04.
+- Deferred: compressed indexer selection (Plan 04 — DSA layers attend full causal until then, which is exactly
+  the reference below the 2048-token budget), Engram residual (Plan 05), DFly2 (Plan 06), tower (Plan 07).

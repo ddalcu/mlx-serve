@@ -7,6 +7,7 @@ const sdk = @import("../../sdk/root.zig");
 pub const config = @import("config.zig");
 pub const weights = @import("weights.zig");
 const log = @import("../../sdk/util/log.zig");
+const mlx = @import("../../mlx/ffi.zig");
 
 pub const plugin = sdk.Plugin{
     .name = "hy_v4",
@@ -30,13 +31,8 @@ pub const table = abi.ModelTable{
 const Verdict = abi.Verdict;
 
 /// The conformance pack: the tiny hy_v4_flash config with a matching micro safetensors set (fixture.zig).
-/// The load lands in Plan 02 and its checks run here; the forward lands in Plan 03, and until it returns
-/// logits the whole subject sits out the suite — `fixtureMayBeAbsent` is the sanctioned way, and returning
-/// the built files is one line. Plan 03's proof tapes pin the numerics the suite cannot see.
-pub const fixtureMayBeAbsent = true;
-pub fn conformanceFixture(a: std.mem.Allocator) !?sdk.fixture.Fixture {
-    _ = a;
-    return null;
+pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
+    return .{ .files = try @import("fixture.zig").build(a) };
 }
 
 /// The Plan-01 bill. It prices the arch from the config; the load-side test's oracle is the pack's real
@@ -75,9 +71,9 @@ fn bill(p: *const abi.Parsed, shape: *const abi.Shape, out: *abi.Bill) callconv(
         load_bytes += d * (c.q_lora_rank + @as(u64, c.num_attention_heads) * 256 + c.kv_lora_rank + 8192 + 9216 * 3) * 2; // bf16 draft layer
     }
     load_bytes += 4 * 3 * d * 4; // hc_head, f32
-    // Plan 04 owns the indexer's pooled-key state; Plan 02 bills the Engram tables as a stream bank. Until then the
-    // latent KV row reads 576 bf16 for the DSA layers (full length) and the SWA layers keep a 512-token ring.
-    const kv_row: u64 = (c.kv_lora_rank + c.qk_rope_head_dim) * 2;
+    // The KV row the forward writes: the latent K row carries `[latent | k_rot]` (576 halves) and the V slot holds
+    // the same latent (512 halves) for MLA's post-reduction lift. Plan 04 adds the indexer's per-token keys.
+    const kv_row: u64 = (2 * c.kv_lora_rank + c.qk_rope_head_dim) * 2;
     const swa: u64 = c.num_hidden_layers - c.dsa_layer_count;
     out.* = .{
         .kv_per_token = kv_row * c.dsa_layer_count,
@@ -144,13 +140,25 @@ fn engramPackedBytes(c: *const config.Config) u64 {
 }
 
 fn forward(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
-    _ = f;
-    _ = out;
-    _ = m;
-    return Verdict.refuse(.unsupported, "hy_v4_flash: the forward lands in Plan 03");
+    const model: *weights.Model = @ptrCast(@alignCast(m));
+    if (!abi.declaresMode(model.trunk.caps, f.mode)) return Verdict.refuse(.unsupported, "hy_v4_flash: forward mode not declared");
+    if (f.cache_ops == null) return Verdict.refuse(.unsupported, "hy_v4_flash: a forward without cache_ops");
+    out.* = model.trunk.forward(f) catch |e| {
+        log.err("hy_v4: forward failed: {t}\n", .{e});
+        if (mlx.takeError(&error_buf)) |text| log.err("hy_v4: latched MLX error: {s}\n", .{text});
+        return Verdict.named(.failed, @errorName(e));
+    };
+    return .ok;
 }
 
+var error_buf: [512]u8 = undefined;
+
 // ── tests ──
+
+test "hy_v4 conformance: the tiny pack claims, loads and forwards in every declared mode" {
+    try @import("../../sdk/testing/conformance.zig").expectPlugin(@This());
+}
+
 
 const testing = std.testing;
 
@@ -163,8 +171,8 @@ test "hy_v4_flash table: the bill covers shards without the Engram and names the
     // The bill's oracle is the pack's shard census (129.9 GB total, 39.60 GB of Engram the stream owns, so
     // 90.3 GB resident): the arithmetic may sit within 15% of it.
     try testing.expect(@abs(@as(i64, @intCast(b.load_bytes)) - 90_300_000_000) < 13_500_000_000);
-    try testing.expectEqual(@as(u64, 576 * 2 * 12), b.kv_per_token);
-    try testing.expect(b.fixed_slot_bytes > 30 * 512 * 576 * 2);
+    try testing.expectEqual(@as(u64, (2 * 512 + 64) * 2 * 12), b.kv_per_token);
+    try testing.expect(b.fixed_slot_bytes > 30 * 512 * (2 * 512 + 64) * 2);
 }
 
 test "hy_v4 table: the Engram stream's packed bytes match the pack's table census" {

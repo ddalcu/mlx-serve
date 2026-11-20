@@ -47,26 +47,28 @@ pub fn build(a: std.mem.Allocator) ![]const File {
     try t.fill("model.norm.weight", .{}, &.{@as(u64, 64)}, .BF16, 1);
     try q4(&t, "lm_head", .{}, &.{64}, 64);
     try t.fill("model.hc_head.hc_head_base", .{}, &.{@as(u64, 4)}, .F32, 0.5);
-    try t.fill("model.hc_head.hc_head_fn", .{}, &.{ 4, 48 }, .F32, 0.1);
+    try t.fill("model.hc_head.hc_head_fn", .{}, &.{ 4, 256 }, .F32, 0.1);
     try t.fill("model.hc_head.hc_head_scale", .{}, &.{@as(u64, 1)}, .F32, 1);
     for (0..2) |li| {
         try t.fill("model.layers.{d}.input_layernorm.weight", .{li}, &.{@as(u64, 64)}, .BF16, 1);
         try t.fill("model.layers.{d}.post_attention_layernorm.weight", .{li}, &.{@as(u64, 64)}, .BF16, 1);
         try q4(&t, "model.layers.{d}.self_attn.q_a_proj", .{li}, &.{64}, 64);
         try t.fill("model.layers.{d}.self_attn.q_a_layernorm.weight", .{li}, &.{@as(u64, 64)}, .BF16, 1);
-        try q4(&t, "model.layers.{d}.self_attn.q_b_proj", .{li}, &.{512}, 64);
+        // Layer 0 is a DSA layer (2 heads), layer 1 a SWA layer (4 heads): both geometries live in the pack.
+        const h: u64 = if (li == 0) 2 else 4;
+        try q4(&t, "model.layers.{d}.self_attn.q_b_proj", .{li}, &.{h * 256}, 64);
         try q4(&t, "model.layers.{d}.self_attn.kv_a_proj_with_mqa", .{li}, &.{128}, 64);
         try t.fill("model.layers.{d}.self_attn.kv_a_layernorm.weight", .{li}, &.{@as(u64, 64)}, .BF16, 1);
-        try q4(&t, "model.layers.{d}.self_attn.kv_b_proj", .{li}, &.{512}, 64);
-        try q4(&t, "model.layers.{d}.self_attn.linear_gate", .{li}, &.{128}, 64);
-        try q4(&t, "model.layers.{d}.self_attn.o_proj", .{li}, &.{64}, 128);
+        try q4(&t, "model.layers.{d}.self_attn.kv_b_proj", .{li}, &.{h * 256}, 64);
+        try q4(&t, "model.layers.{d}.self_attn.linear_gate", .{li}, &.{h * 64}, 64);
+        try q4(&t, "model.layers.{d}.self_attn.o_proj", .{li}, &.{64}, h * 64);
         try t.fill("model.layers.{d}.self_attn.post_proj_norm.weight", .{li}, &.{@as(u64, 64)}, .BF16, 1);
-        try t.fill("model.layers.{d}.self_attn.learnable_sink_param", .{li}, &.{@as(u64, 2)}, .F32, 0);
+        try t.fill("model.layers.{d}.self_attn.learnable_sink_param", .{li}, &.{h}, .F32, 0);
         try t.fill("model.layers.{d}.hc_attn_layer.hc_pre.hc_base", .{li}, &.{@as(u64, 8)}, .F32, 0);
-        try t.fill("model.layers.{d}.hc_attn_layer.hc_pre.hc_fn", .{li}, &.{ 8, 64 }, .F32, 0.1);
+        try t.fill("model.layers.{d}.hc_attn_layer.hc_pre.hc_fn", .{li}, &.{ 8, 256 }, .F32, 0.1);
         try t.fill("model.layers.{d}.hc_attn_layer.hc_pre.hc_scale", .{li}, &.{@as(u64, 2)}, .F32, 0);
         try t.fill("model.layers.{d}.hc_mlp_layer.hc_pre.hc_base", .{li}, &.{@as(u64, 8)}, .F32, 0);
-        try t.fill("model.layers.{d}.hc_mlp_layer.hc_pre.hc_fn", .{li}, &.{ 8, 64 }, .F32, 0.1);
+        try t.fill("model.layers.{d}.hc_mlp_layer.hc_pre.hc_fn", .{li}, &.{ 8, 256 }, .F32, 0.1);
         try t.fill("model.layers.{d}.hc_mlp_layer.hc_pre.hc_scale", .{li}, &.{@as(u64, 2)}, .F32, 0);
         if (li == 0) {
             // The DSA layer: the compressed indexer arms.
@@ -86,8 +88,8 @@ pub fn build(a: std.mem.Allocator) ![]const File {
             // The engram + MoE layer.
             try t.fill("model.layers.{d}.mlp.gate.weight", .{li}, &.{ 4, 64 }, .BF16, 0.1);
             try t.fill("model.layers.{d}.mlp.gate.e_score_correction_bias", .{li}, &.{@as(u64, 4)}, .F32, 0);
-            try q4(&t, "model.layers.{d}.mlp.experts.gate_up_proj", .{li}, &.{512}, 64);
-            try q4(&t, "model.layers.{d}.mlp.experts.down_proj", .{li}, &.{256}, 64);
+            try q4Experts(&t, "model.layers.{d}.mlp.experts.gate_up_proj", .{li}, 4, 128, 64);
+            try q4Experts(&t, "model.layers.{d}.mlp.experts.down_proj", .{li}, 4, 64, 64);
             try q4(&t, "model.layers.{d}.mlp.routed_expert_up_proj", .{li}, &.{64}, 64);
             try q4(&t, "model.layers.{d}.mlp.routed_expert_down_proj", .{li}, &.{64}, 64);
             try q4(&t, "model.layers.{d}.mlp.shared_experts.gate_proj", .{li}, &.{64}, 64);
@@ -126,16 +128,25 @@ pub fn build(a: std.mem.Allocator) ![]const File {
 
 /// One affine packed triple, laid out the way the pack stores quant triples: `.weight` as U32 words of
 /// eight 4-bit weights (out x in/8), `.scales`/`.biases` as bf16 at one value per 64-column group rounded
-/// up. `out_shape` is the logical out-feature shape (1-D for a 2-D linear, 2-D for an expert stack).
+/// up. `out_shape` is the logical out-feature shape (1-D for a 2-D linear).
 pub fn q4(t: *Tensors, comptime fmt: []const u8, args: anytype, out_shape: []const u64, in_features: u64) !void {
     var wshape = try t.a.alloc(u64, out_shape.len + 1);
     @memcpy(wshape[0..out_shape.len], out_shape);
     wshape[wshape.len - 1] = @divExact(in_features, 8); // 8 nibbles per U32
     try t.words(fmt ++ ".weight", args, wshape);
-    const groups = (in_features + 63) / 64;
+    const groups = @divExact(in_features, 64);
     var gshape = try t.a.alloc(u64, out_shape.len + 1);
     @memcpy(gshape[0..out_shape.len], out_shape);
     gshape[gshape.len - 1] = groups;
     try t.rand(fmt ++ ".scales", args, gshape, .BF16, 1);
     try t.rand(fmt ++ ".biases", args, gshape, .BF16, 0);
+}
+
+/// One fused expert triple, three axes like the pack: `[experts, out, in/8]` U32 words with bf16
+/// `[experts, out, in/64]` scales and biases. The in-features are the routed latent width.
+pub fn q4Experts(t: *Tensors, comptime fmt: []const u8, args: anytype, experts: u64, out_rows: u64, in_features: u64) !void {
+    const groups = @divExact(in_features, 64);
+    try t.words(fmt ++ ".weight", args, &.{ experts, out_rows, @divExact(in_features, 8) });
+    try t.rand(fmt ++ ".scales", args, &.{ experts, out_rows, groups }, .BF16, 1);
+    try t.rand(fmt ++ ".biases", args, &.{ experts, out_rows, groups }, .BF16, 0);
 }

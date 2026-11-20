@@ -339,6 +339,17 @@ fn dsaBits(bits: u64) [64]bool {
     return out;
 }
 
+/// A layer's attention heads: DSA layers keep `num_attention_heads`, SWA layers the wider
+/// `swa_num_attention_heads` (the pack stores both geometries, per layer).
+pub fn layerHeads(c: *const Config, li: u32) u32 {
+    return if (li < c.dsa_layers.len and c.dsa_layers[li]) c.num_attention_heads else c.swa_num_attention_heads;
+}
+
+/// A layer's RoPE base: the sparse layers rotate long (1e7), the sliding ones short (1e4).
+pub fn layerTheta(c: *const Config, li: u32) f32 {
+    return if (li < c.dsa_layers.len and c.dsa_layers[li]) c.rope_theta_dsa else c.rope_theta_swa;
+}
+
 fn readMoe(c: *Config, o: Objects) ParseError!void {
     const cfg = o.cfg;
     if (field(cfg, "n_routed_experts")) |v| c.n_routed_experts = try u32v(v);

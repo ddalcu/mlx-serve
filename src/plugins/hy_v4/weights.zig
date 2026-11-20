@@ -15,6 +15,7 @@ const ple = @import("../qwen4_exp/ple_table.zig");
 const crt = @import("../../sdk/util/crt.zig");
 const log = @import("../../sdk/util/log.zig");
 const config = @import("config.zig");
+const trunk = @import("trunk.zig");
 
 const gpa = std.heap.c_allocator;
 const C = config.Config;
@@ -37,8 +38,11 @@ pub const Model = struct {
     c: *const C,
     weights: weights_load.Weights,
     engrams: []Engram,
+    /// The per-layer weight structs the forward reads (borrowing the map's handles) and its own derived copies.
+    trunk: *trunk.Model,
 
     pub fn deinit(m: *Model) void {
+        m.trunk.deinit();
         for (m.engrams) |*e| e.close();
         gpa.free(m.engrams);
         m.weights.deinit();
@@ -60,9 +64,16 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
         for (engrams) |*e| e.close();
         gpa.free(engrams);
     }
+    // Build the trunk over the validated map: projections, hyper-connections, FFN. A failure frees what it built.
+    const tr = trunk.build(c, &holder.w) catch |e| {
+        holder.release();
+        for (engrams) |*x| x.close();
+        gpa.free(engrams);
+        return e;
+    };
     const m = try gpa.create(Model);
     errdefer gpa.destroy(m);
-    m.* = .{ .c = c, .weights = holder.adopt(), .engrams = engrams };
+    m.* = .{ .c = c, .weights = holder.adopt(), .engrams = engrams, .trunk = tr };
     return m;
 }
 
@@ -129,10 +140,10 @@ const Check = struct {
         }
         if (!std.mem.eql(u64, got, &.{ out_row, in_features })) return error.WrongShape;
     }
-    /// One fused expert triple at its own group: the U32 nibble rows and the two bf16 leaves. A pack whose
-    /// in-features sit under the SDK loader's dequantise-small line reaches the map as one dense row per
-    /// expert instead; both layouts pass, each at its exact shape.
-    fn qfused(self: *Check, comptime fmt: []const u8, args: anytype, rows: u64, in_features: u64, group: u64) !void {
+    /// One fused expert triple, three axes: the pack stores `[experts, out, in/8]` U32 nibble words with
+    /// bf16 `[experts, out, in/group]` scales and biases. A pack whose in-features sit under the SDK loader's
+    /// dequantise-small line reaches the map as one dense `[experts, out, in]` stack instead; both layouts pass.
+    fn qfused3(self: *Check, comptime fmt: []const u8, args: anytype, experts: u64, out_rows: u64, in_features: u64, group: u64) !void {
         if (in_features % group != 0) return error.WrongShape;
         const packed_cols = @divExact(in_features * self.c.quant_bits, 32);
         const groups = @divExact(in_features, group);
@@ -140,12 +151,12 @@ const Check = struct {
         const arr = self.w.get(wname) orelse return error.MissingWeight;
         var wb: [8]u64 = undefined;
         const got = mlxShape(arr, &wb) orelse return error.MissingWeight;
-        if (std.mem.eql(u64, got, &.{ rows, packed_cols })) {
-            try self.shape(fmt ++ ".scales", args, &.{ rows, groups });
-            try self.shape(fmt ++ ".biases", args, &.{ rows, groups });
+        if (std.mem.eql(u64, got, &.{ experts, out_rows, packed_cols })) {
+            try self.shape(fmt ++ ".scales", args, &.{ experts, out_rows, groups });
+            try self.shape(fmt ++ ".biases", args, &.{ experts, out_rows, groups });
             return;
         }
-        if (!std.mem.eql(u64, got, &.{ rows, in_features })) return error.WrongShape;
+        if (!std.mem.eql(u64, got, &.{ experts, out_rows, in_features })) return error.WrongShape;
     }
 };
 
@@ -176,30 +187,33 @@ fn validate(c: *const C, w: *const weights_load.Weights) !void {
     }
     const d: u64 = c.hidden_size;
     const V1: u64 = c.vocab_size;
-    const H: u64 = c.num_attention_heads;
     try V.q("model.embed_tokens", .{}, V1, d);
     try V.q("lm_head", .{}, V1, d);
     try V.shape("model.norm.weight", .{}, &.{d});
-    for (&[_][]const u8{ "hc_head_base", "hc_head_fn", "hc_head_scale" }) |s|
-        try V.has("model.hc_head.{s}", .{s});
+    // The head's collapse table: `[lanes, lanes*hidden]` f32, plus its base and scale.
+    try V.shape("model.hc_head.hc_head_fn", .{}, &.{ c.hc_mult, c.hc_mult * d });
+    try V.shape("model.hc_head.hc_head_base", .{}, &.{c.hc_mult});
+    try V.shape("model.hc_head.hc_head_scale", .{}, &.{1});
 
     for (0..c.num_hidden_layers) |li| {
         const n: u64 = li;
         try V.shape("model.layers.{d}.input_layernorm.weight", .{n}, &.{d});
         try V.shape("model.layers.{d}.post_attention_layernorm.weight", .{n}, &.{d});
         const a = "model.layers.{d}.self_attn";
+        // The pack's own geometry: DSA layers carry `num_attention_heads` (32), SWA layers the wider
+        // `swa_num_attention_heads` (64); both share nope/rope/v widths. The kind comes from WEIGHT presence
+        // (`compressed_indexer.*`), never the HF-offset `layer_types` list.
+        const h: u64 = config.layerHeads(c, @intCast(li));
         try V.q(a ++ ".q_a_proj", .{n}, c.q_lora_rank, d);
         try V.shape(a ++ ".q_a_layernorm.weight", .{n}, &.{c.q_lora_rank});
-        // q_b, the gate and o_proj ship 2x the 32-head MLA width (8192 = 2x4096): the loader keeps the stored
-        // shape verbatim; Plan 03's A/B decides how the forward reads the extra half.
-        try V.q(a ++ ".q_b_proj", .{n}, 2 * H * (c.qk_nope_head_dim + c.v_head_dim) / 2, c.q_lora_rank);
+        try V.q(a ++ ".q_b_proj", .{n}, h * (c.qk_nope_head_dim + c.qk_rope_head_dim), c.q_lora_rank);
         try V.q(a ++ ".kv_a_proj_with_mqa", .{n}, c.kv_lora_rank + c.qk_rope_head_dim, d);
         try V.shape(a ++ ".kv_a_layernorm.weight", .{n}, &.{c.kv_lora_rank});
-        try V.q(a ++ ".kv_b_proj", .{n}, H * (c.qk_nope_head_dim + c.v_head_dim), c.q_lora_rank);
-        try V.q(a ++ ".linear_gate", .{n}, H * c.v_head_dim, d);
-        try V.q(a ++ ".o_proj", .{n}, d, 2 * H * c.v_head_dim / 2);
+        try V.q(a ++ ".kv_b_proj", .{n}, h * (c.qk_nope_head_dim + c.v_head_dim), c.kv_lora_rank);
+        try V.q(a ++ ".linear_gate", .{n}, h * c.v_head_dim, d);
+        try V.q(a ++ ".o_proj", .{n}, d, h * c.v_head_dim);
         try V.shape(a ++ ".post_proj_norm.weight", .{n}, &.{d});
-        try V.has(a ++ ".learnable_sink_param", .{n});
+        try V.shape(a ++ ".learnable_sink_param", .{n}, &.{h});
         if (c.dsa_layers[li]) {
             const ci = a ++ ".compressed_indexer";
             try V.q(ci ++ ".query_projection", .{n}, c.index_n_heads * c.index_head_dim, d);
@@ -212,10 +226,11 @@ fn validate(c: *const C, w: *const weights_load.Weights) !void {
             try V.has(ci ++ ".intra_group_ape", .{n});
         }
         for (&[_][]const u8{ "hc_attn_layer", "hc_mlp_layer" }) |hc| {
-            // iHC: f32 tables — a [hc_mult*hidden, 3*hidden] fn plus the base/scale rows, both arms, every layer.
-            try V.has("model.layers.{d}." ++ "{s}" ++ ".hc_pre.hc_fn", .{ n, hc });
-            try V.has("model.layers.{d}." ++ "{s}" ++ ".hc_pre.hc_base", .{ n, hc });
-            try V.has("model.layers.{d}." ++ "{s}" ++ ".hc_pre.hc_scale", .{ n, hc });
+            // iHC: `hc_fn` `[2*lanes, lanes*hidden]` f32 (pre gates then post gates), `hc_base` `[2*lanes]`,
+            // `hc_scale` `[2]` — both sublayers, every layer.
+            try V.shape("model.layers.{d}." ++ "{s}" ++ ".hc_pre.hc_fn", .{ n, hc }, &.{ 2 * c.hc_mult, c.hc_mult * d });
+            try V.shape("model.layers.{d}." ++ "{s}" ++ ".hc_pre.hc_base", .{ n, hc }, &.{2 * c.hc_mult});
+            try V.shape("model.layers.{d}." ++ "{s}" ++ ".hc_pre.hc_scale", .{ n, hc }, &.{2});
         }
         try validateMlp(&V, @intCast(li));
     }
@@ -237,14 +252,14 @@ fn validateMlp(V: *Check, li: u32) !void {
     }
     try V.shape("model.layers.{d}.mlp.gate.weight", .{n}, &.{ c.n_routed_experts, d });
     try V.shape("model.layers.{d}.mlp.gate.e_score_correction_bias", .{n}, &.{c.n_routed_experts});
-    // The routed experts ride fused exactly as the pack ships them (gate+up [E, 3072, 192] U32 nibbles at g32,
-    // down [E, 1536, 192]): the fused triple's leaf shapes, name-checked row for row.
-    // The routed experts ride fused exactly as the pack ships them, at the config's own widths (census:
-    // gate+up [E, moe*2, in/8] nibble words, down [E, in, moe/8], both with bf16 scale+bias leaves).
+    // The routed experts ride fused exactly as the pack ships them: gate+up `[E, 2*moe_intermediate, latent/8]`
+    // U32 nibbles over the LATENT width (routed_expert_hidden_size), down `[E, latent, moe_intermediate/8]`,
+    // both with bf16 scale+bias leaves at g64.
     const e: u64 = c.n_routed_experts;
     const mi: u64 = c.moe_intermediate_size;
-    try V.qfused("model.layers.{d}.mlp.experts.gate_up_proj", .{n}, e * 2 * mi, d, c.quant_group_size);
-    try V.qfused("model.layers.{d}.mlp.experts.down_proj", .{n}, e * d, mi, c.quant_group_size);
+    const lat: u64 = c.routed_expert_hidden_size;
+    try V.qfused3("model.layers.{d}.mlp.experts.gate_up_proj", .{n}, e, 2 * mi, lat, c.quant_group_size);
+    try V.qfused3("model.layers.{d}.mlp.experts.down_proj", .{n}, e, lat, mi, c.quant_group_size);
     try V.q("model.layers.{d}.mlp.routed_expert_up_proj", .{n}, d, c.routed_expert_hidden_size);
     try V.q("model.layers.{d}.mlp.routed_expert_down_proj", .{n}, c.routed_expert_hidden_size, d);
     try V.q("model.layers.{d}.mlp.shared_experts.gate_proj", .{n}, c.intermediate_size, d);
@@ -299,7 +314,6 @@ fn validateVision(V: *Check) !void {
 fn validateDfly(V: *Check) !void {
     const c = V.c;
     const d: u64 = c.hidden_size;
-    const H: u64 = c.num_attention_heads;
     for (0..c.dfly_layers) |di| {
         const n: u64 = di;
         const a = "model.dfly_layers.{d}.self_attn";
@@ -315,7 +329,6 @@ fn validateDfly(V: *Check) !void {
         try V.has(a ++ ".learnable_sink_param", .{n});
         for (&[_][]const u8{ "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj" }) |p|
             try V.has("model.dfly_layers.{d}." ++ "{s}" ++ ".weight", .{ n, p });
-        _ = H;
     }
     for (&[_][]const u8{ "final_norm.weight", "mtp_fusion.eh_proj.weight", "mtp_fusion.enorm.weight",
         "mtp_fusion.hnorm.weight", "mtp_fusion.gate", "hidden_correction.down_proj.weight",
