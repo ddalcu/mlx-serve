@@ -32,3 +32,22 @@ Replace Plan 03's DSA placeholder with the real selection: pooled key scoring â†
 
 ## Verification (plan-level)
 DSA parity test green; indexer selection exact-match test in CI on fixtures; lint 0.
+
+## Execution notes (plan 04)
+
+- The HF reference's compressed indexer is ONE stage (`compressed_indexer_skip_fine_select: true`): gated fp32
+  pooling over complete groups -> group keys roped at the group start -> `relu(q @ keys^T)` per head, mixed by
+  `head_weight_projection(x) * (heads*dim)^-0.5` -> best `group_topk - 1` closed groups + the query's own group.
+  The plan's "fine token-key score over candidates / top-2048" belongs to the skipped stage; Task 1's spec line
+  is corrected here.
+- Own-group follows the query's SLOT (`query_slots // ratio`), not its absolute position: a prefix-cache restore
+  keeps slots contiguous while positions carry the prefix; rope positions stay absolute.
+- Selection is an additive mask over the slot axis (causal + recall), which is exactly the reference's arm
+  (`_mask_unrecalled_tokens` masks a dense causal mask). Below `index_topk` (2048 tokens) the layer attends
+  densely. The gather-only kernel is a perf step, deferred.
+- DSA layers cache their per-token indexer key beside the latent (K row becomes
+  `latent | k_rot | token_key`, 704 halves; V stays the latent). The bill says 1216 halves/token/DSA layer.
+- Oracle: pooling + head-weighted recall + own-group + causal, per slot, against f64 (12-token fixture, ratio 4,
+  group_topk 2), on a `TestCache`-shaped history.
+- Deferred: incremental pool state (groups pooled once, not re-pooled per step), the gather kernel, batched
+  decode (`batches_decode` stays off), and the `tests/test_hyv4_dsa.sh` long-context script (needs the full pack).

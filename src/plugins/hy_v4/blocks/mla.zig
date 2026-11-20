@@ -16,6 +16,7 @@ const kv = @import("../../../sdk/bases/kv.zig");
 const sliding = @import("../../../sdk/bases/blocks/sliding.zig");
 const sliding_ring = @import("../../../sdk/config/sliding_ring.zig");
 const proj = @import("proj.zig");
+const indexer_mod = @import("indexer.zig");
 
 const Array = ops.Array;
 const Graph = ops.Graph;
@@ -46,6 +47,8 @@ pub const Attn = struct {
     theta: f32,
     /// Keys a sliding layer attends; 0 = the full causal history.
     window: u32,
+    /// The compressed indexer (DSA layers); null = attend the full causal history.
+    indexer: ?*const indexer_mod.Indexer = null,
     rms_eps: f32,
 
     pub fn forwards(self: *const Attn, c: *Ctx, x: Array) !Array {
@@ -82,8 +85,15 @@ pub const Attn = struct {
         const q_abs = try t.matmul(q_nope, self.wk); // [slots, heads, rows, rank]
         const q_cat = try t.concat(&.{ q_abs, q_rot_r }, -1);
 
-        const k_row = try t.reshape(try t.concat(&.{ latent, k_rot_r }, -1),
-            &.{ ops.shape(x)[0], 1, s, rank + rope_dim });
+        // A DSA layer caches its token keys beside the latent (the indexer pools them); the attention keys are
+        // the leading `rank + rope` channels.
+        const ix_dim: c_int = if (self.indexer) |ix| @intCast(ix.dim) else 0;
+        const token_keys = if (self.indexer) |ix| try ix.tokenKeys(&t, x) else Array{};
+        const k_row = if (ix_dim > 0)
+            try t.reshape(try t.concat(&.{ latent, k_rot_r, token_keys }, -1),
+                &.{ ops.shape(x)[0], 1, s, rank + rope_dim + ix_dim })
+        else
+            try t.reshape(try t.concat(&.{ latent, k_rot_r }, -1), &.{ ops.shape(x)[0], 1, s, rank + rope_dim });
         const v_row = try t.reshape(latent, &.{ ops.shape(x)[0], 1, s, rank });
 
         const total: c_int = @as(c_int, @intCast(off)) + s;
@@ -93,7 +103,18 @@ pub const Attn = struct {
             var view = try kv.append(c, k_row, v_row, 0);
             defer kv.release(c, &view);
             const dv = kv.dense(view);
-            o_lat = try sdpa(&t, q_cat, dv.k, dv.v, scale, sinks, if (s > 1) "causal" else "", .{});
+            const kv_len: c_int = ops.shape(dv.k)[2];
+            const keys = if (ix_dim > 0)
+                try t.slice(dv.k, &.{ 0, 0, 0, 0 }, &.{ 1, 1, kv_len, rank + rope_dim })
+            else dv.k;
+            const budget: c_int = if (self.indexer) |ix| @intCast(ix.budget) else 0;
+            if (self.indexer != null and kv_len > budget) {
+                // Beyond the recall budget the compressed indexer picks which slots each query may read.
+                const tk_all = try t.slice(dv.k, &.{ 0, 0, 0, rank + rope_dim }, &.{ 1, 1, kv_len, rank + rope_dim + ix_dim });
+                const base_pos: c_int = @as(c_int, @intCast(off)) - (kv_len - s);
+                const mask = try self.indexer.?.recallMask(&t, x, q_resid, tk_all, kv_len, base_pos, c.positions);
+                o_lat = try sdpa(&t, q_cat, keys, dv.v, scale, sinks, "array", mask);
+            } else o_lat = try sdpa(&t, q_cat, keys, dv.v, scale, sinks, if (s > 1) "causal" else "", .{});
         } else {
             const wc: c_int = @intCast(self.window);
             const sv = sliding.view(self.window, qk, total, s);
@@ -101,14 +122,15 @@ pub const Attn = struct {
             defer kv.release(c, &view);
             const dv = kv.dense(view);
             const kv_len: c_int = ops.shape(dv.k)[2];
+            const keys_w = dv.k;
             if (s > 1 and total <= wc) {
-                o_lat = try sdpa(&t, q_cat, dv.k, dv.v, scale, sinks, "causal", .{});
+                o_lat = try sdpa(&t, q_cat, keys_w, dv.v, scale, sinks, "causal", .{});
             } else if (s > 1) {
-                o_lat = try sdpa(&t, q_cat, dv.k, dv.v, scale, sinks, "array", try sliding.bandMask(g, s, kv_len, wc));
+                o_lat = try sdpa(&t, q_cat, keys_w, dv.v, scale, sinks, "array", try sliding.bandMask(g, s, kv_len, wc));
             } else if (total <= wc) {
-                o_lat = try sdpa(&t, q_cat, dv.k, dv.v, scale, sinks, "", .{});
+                o_lat = try sdpa(&t, q_cat, keys_w, dv.v, scale, sinks, "", .{});
             } else {
-                o_lat = try sdpa(&t, q_cat, dv.k, dv.v, scale, sinks, "array", try sliding.decodeMask(g, kv_len, wc));
+                o_lat = try sdpa(&t, q_cat, keys_w, dv.v, scale, sinks, "array", try sliding.decodeMask(g, kv_len, wc));
             }
         }
 
@@ -139,10 +161,20 @@ fn sdpa(t: *Graph, q: Array, k: Array, v: Array, scale: f32, sinks: Array, mode:
 
 const testing = std.testing;
 
+/// An array's values as f32: bf16/f16 casts first (`mlx_array_data_float32` reads f32 buffers only).
 fn readF32(a: Array) ![]const f32 {
-    try ops.eval(a);
-    const n = mlx.mlx_array_size(a);
-    const data = mlx.mlx_array_data_float32(a) orelse return error.NoData;
+    if (mlx.mlx_array_dtype(a) == .float32) {
+        try ops.eval(a);
+        const n = mlx.mlx_array_size(a);
+        const data = mlx.mlx_array_data_float32(a) orelse return error.NoData;
+        return data[0..n];
+    }
+    var cast = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(cast);
+    try mlx.check(mlx.mlx_astype(&cast, a, .float32, mlx.gpuStream()));
+    try ops.eval(cast);
+    const n = mlx.mlx_array_size(cast);
+    const data = mlx.mlx_array_data_float32(cast) orelse return error.NoData;
     return data[0..n];
 }
 

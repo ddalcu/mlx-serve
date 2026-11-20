@@ -257,6 +257,7 @@ test {
     _ = @import("plugins/hy_v4/blocks/proj.zig");
     _ = @import("plugins/hy_v4/blocks/moe.zig");
     _ = @import("plugins/hy_v4/blocks/mla.zig");
+    _ = @import("plugins/hy_v4/blocks/indexer.zig");
     _ = @import("plugins/glm5_next/served_test.zig");
     _ = @import("sdk/bases/kda_hybrid/cuts_test.zig");
     _ = @import("plugins/bailing_hybrid/bill_test.zig");

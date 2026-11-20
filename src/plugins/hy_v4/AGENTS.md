@@ -2,8 +2,9 @@
 
 `model_type: hy_v4_flash`. The trunk is a DeepSeek-family MLA + compressed-DSA MoE with iHC streams, an Engram
 n-gram PLE on 4 layers, and a DFly2 draft stack in `model.dfly_layers.*`. Plans done: 01 claim/parse/bill/cache
-layout, 02 loader + Engram stream tables, 03 text forward (iHC, MLA with sinks, SWA, latent MoE, dense L0).
-Pending: 04 indexer, 05 Engram, 06 DFly2, 07 vision, 08 proofs/docs.
+layout, 02 loader + Engram stream tables, 03 text forward (iHC, MLA with sinks, SWA, latent MoE, dense L0),
+04 compressed indexer (recall beyond the budget).
+Pending: 05 Engram, 06 DFly2, 07 vision, 08 proofs/docs.
 
 ## Rules
 
@@ -37,8 +38,15 @@ Pending: 04 indexer, 05 Engram, 06 DFly2, 07 vision, 08 proofs/docs.
 - **The Engram tables never go resident**: 4× `U32[165M,12]` 4-bit·g32 ≈ 39.6 GB packed (60 B/row: 12 U32 codes
   + 3 bf16 scales + 3 bf16 biases). They stream from an SSD bank (Plan 05 reads rows; Plan 02 opens the ranges);
   the bill excludes them.
-- **Fine indexer stays off** (`compressed_indexer_skip_fine_select: true`): compressed IndexPool only — 4×
-  pooling → top-512 groups → top-2048 tokens. A pack with it on is refused by name.
+- **The compressed indexer is the ONLY selector** (`compressed_indexer_skip_fine_select: true`, no second
+  per-token stage): the DSA layer's cached token keys pool by a gated fp32 convex combination
+  (`key_value_projection` * softmax(`key_gate_projection` + `intra_group_ape`)), the group key takes `key_norm`
+  and the RoPE phase of its group's FIRST token, scores are `relu(q @ group_keys^T)` per head weighted by
+  `head_weight_projection(x) * (heads*dim)^-0.5`, and each query keeps the best `group_topk - 1` CLOSED groups
+  plus its own — 512 groups × ratio 4 = the 2048-token budget. Below `index_topk` tokens (2048) the layer attends
+  densely, exactly as the reference does. A pack with the fine stage on is refused by name.
+- **Attention reads the recall set as an additive mask over the slot axis** (dense masked attention — the
+  reference's own arm). A gather kernel that reads only the recalled rows is a perf step, not a correctness one.
 - The DFly2 draft reads the target's indexer top-2048 snapshot at the last-accepted row ∪ its own causal block;
   its KV aliases target layers 25/29/33/37/41; fusion happens on slot 0 only. HF transformers does NOT implement
   DFly2 — the semantics live in SGLang #51159 / vLLM #68296 (see `~/claude-tmp/hy4-port/SEMANTICS.md`).
@@ -54,8 +62,9 @@ Pending: 04 indexer, 05 Engram, 06 DFly2, 07 vision, 08 proofs/docs.
 - Quant census: trunk linears/embed/lm_head at g64 4-bit, MoE experts at g64 (24 groups over the 1536 latent) and
   Engram embeddings at g32 (per-tensor overrides in `quantization`), iHC f32, DFly bf16. `enable_lm_head_fp32`
   lies — the lm_head IS quantized.
-- KV per token: 1088 halves/layer (576 K + 512 V; MLA reads its values from the latent). DSA layers are full
-  length, SWA layers a `window + 2048` ring.
+- KV per token: 1088 halves/layer on SWA layers and 1216 on DSA layers (K = latent 512 + k_rot 64 +
+  indexer token key 128, V = the latent 512; MLA lifts values from the latent). DSA layers are full length,
+  SWA layers a `window + 2048` ring.
 
 ## Files
 

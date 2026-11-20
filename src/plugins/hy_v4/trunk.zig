@@ -15,6 +15,7 @@ const proj = @import("blocks/proj.zig");
 const ihc = @import("blocks/ihc.zig");
 const mla = @import("blocks/mla.zig");
 const moe = @import("blocks/moe.zig");
+const indexer_mod = @import("blocks/indexer.zig");
 const config = @import("config.zig");
 const weights_load = @import("../../sdk/weights/load.zig");
 const log = @import("../../sdk/util/log.zig");
@@ -253,8 +254,42 @@ fn buildAttn(c: *const C, w: *const weights_load.Weights, owned: *std.ArrayList(
         .rank = c.kv_lora_rank,
         .theta = config.layerTheta(c, li),
         .window = if (li < c.dsa_layers.len and c.dsa_layers[li]) 0 else c.sliding_window,
+        .indexer = if (li < c.dsa_layers.len and c.dsa_layers[li]) try buildIndexer(c, w, owned, li) else null,
         .rms_eps = c.rms_norm_eps,
     };
+}
+
+/// A DSA layer's compressed indexer: packed query/token-key/head-weight projections, the dense fp32 pooling
+/// matrices, the norms and the intra-group position embedding.
+fn buildIndexer(c: *const C, w: *const weights_load.Weights, owned: *std.ArrayList(Array), li: u32) !*const indexer_mod.Indexer {
+    const ci = "model.layers.{d}.self_attn.compressed_indexer";
+    const ix = try gpa.create(indexer_mod.Indexer);
+    ix.* = .{
+        .query = try buildBank(c, w, owned, ci ++ ".query_projection", li),
+        .head_weight = try buildBank(c, w, owned, ci ++ ".head_weight_projection", li),
+        .token_key = try buildBank(c, w, owned, ci ++ ".token_key_projection", li),
+        .token_key_norm = try require(w, ci ++ ".token_key_norm.weight", .{li}),
+        .value_proj = try denseProj(owned, try require(w, ci ++ ".key_value_projection.weight", .{li})),
+        .gate_proj = try denseProj(owned, try require(w, ci ++ ".key_gate_projection.weight", .{li})),
+        .key_norm = try require(w, ci ++ ".key_norm.weight", .{li}),
+        .ape = try require(w, ci ++ ".intra_group_ape", .{li}),
+        .heads = c.index_n_heads,
+        .dim = c.index_head_dim,
+        .ratio = c.compressed_ratio,
+        .group_topk = c.compressed_group_topk,
+        .budget = c.index_topk,
+        .rope_dim = c.qk_rope_head_dim,
+        .theta = config.layerTheta(c, li),
+        .rms_eps = c.rms_norm_eps,
+    };
+    return ix;
+}
+
+/// A dense fp32 weight (`[out, in]` on disk) as a `Proj` reading `[in, out]`.
+fn denseProj(owned: *std.ArrayList(Array), src: Array) !Proj {
+    const t = try transposeTo(src);
+    try owned.append(gpa, t);
+    return .{ .w = t };
 }
 
 fn buildHc(c: *const C, w: *const weights_load.Weights, owned: *std.ArrayList(Array), comptime fmt: []const u8, li: u32) !ihc.Params {

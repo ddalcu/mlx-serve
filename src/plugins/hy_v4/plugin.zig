@@ -71,12 +71,14 @@ fn bill(p: *const abi.Parsed, shape: *const abi.Shape, out: *abi.Bill) callconv(
         load_bytes += d * (c.q_lora_rank + @as(u64, c.num_attention_heads) * 256 + c.kv_lora_rank + 8192 + 9216 * 3) * 2; // bf16 draft layer
     }
     load_bytes += 4 * 3 * d * 4; // hc_head, f32
-    // The KV row the forward writes: the latent K row carries `[latent | k_rot]` (576 halves) and the V slot holds
-    // the same latent (512 halves) for MLA's post-reduction lift. Plan 04 adds the indexer's per-token keys.
+    // The KV row the forward writes: the latent K row carries `[latent | k_rot]` (576 halves) — plus the
+    // indexer's per-token key (128) on DSA layers — and the V slot holds the same latent (512 halves) for MLA's
+    // post-reduction lift.
     const kv_row: u64 = (2 * c.kv_lora_rank + c.qk_rope_head_dim) * 2;
+    const kv_row_dsa: u64 = kv_row + @as(u64, c.index_head_dim) * 2;
     const swa: u64 = c.num_hidden_layers - c.dsa_layer_count;
     out.* = .{
-        .kv_per_token = kv_row * c.dsa_layer_count,
+        .kv_per_token = kv_row_dsa * c.dsa_layer_count,
         .fixed_slot_bytes = swa * c.sliding_window * kv_row +
             @as(u64, 4) * (8 * c.hc_mult + @as(u64, 4) * 8) * c.hidden_size * 4 + // iHC streams + engram per-token state
             @as(u64, c.dsa_layer_count) * 2048 * 4, // the indexer's latest top-k set per slot
@@ -91,7 +93,8 @@ fn layout(p: *const abi.Parsed, span: ?*const abi.LayerSpan, out: [*]abi.LayerCa
         .kind = if (c.dsa_layers[i]) .full else .sliding,
         .window = if (c.dsa_layers[i]) 0 else c.sliding_window,
         .kv_heads = 1,
-        .k_dim = c.kv_lora_rank + c.qk_rope_head_dim,
+        // DSA layers cache their token keys beside the latent (the compressed indexer pools them).
+        .k_dim = c.kv_lora_rank + c.qk_rope_head_dim + if (c.dsa_layers[i]) c.index_head_dim else 0,
         .v_dim = c.kv_lora_rank,
     };
     return n;
@@ -171,7 +174,7 @@ test "hy_v4_flash table: the bill covers shards without the Engram and names the
     // The bill's oracle is the pack's shard census (129.9 GB total, 39.60 GB of Engram the stream owns, so
     // 90.3 GB resident): the arithmetic may sit within 15% of it.
     try testing.expect(@abs(@as(i64, @intCast(b.load_bytes)) - 90_300_000_000) < 13_500_000_000);
-    try testing.expectEqual(@as(u64, (2 * 512 + 64) * 2 * 12), b.kv_per_token);
+    try testing.expectEqual(@as(u64, (2 * 512 + 64 + 128) * 2 * 12), b.kv_per_token);
     try testing.expect(b.fixed_slot_bytes > 30 * 512 * (2 * 512 + 64) * 2);
 }
 
