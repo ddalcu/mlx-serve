@@ -99,7 +99,13 @@ pub fn moeUpScaled(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernels, 
 }
 
 /// The gate/up launch over arrays already checked.
+var up_logged = false;
+
 pub fn runUp(sc: *dsv41.Scope, kern: Kernels, f: fp4.Format, rows: usize, k: usize, n: usize, topk: usize, x: A, w: A, scales: A, sw: A, sscales: A, idx: A, wts: A, es: Scales) !A {
+    if (!up_logged) {
+        up_logged = true;
+        @import("../../../sdk/util/log.zig").info("deepseek_v41: fp4 MoE decode engaged: {t} (group {d}), rows={d} topk={d} k={d} n={d}, per-expert scales gate={} up={} down={}\n", .{ f, f.group(), rows, topk, k, n, es.gate != null, es.up != null, es.down != null });
+    }
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(rows), ci(topk + 1), ci(n) }, 3, .bfloat16));

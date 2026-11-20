@@ -413,7 +413,7 @@ fn sortedGatherAt(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx
     const out = try launch(x, w, sc, bi, idx, bits, group, mx, p, s);
     if (!engaged_logged) {
         engaged_logged = true;
-        log.info("[gather-nax] engaged: {s} bm={d} bk={d} M={d} E={d} N={d} K={d}\n", .{ @tagName(p.sched), p.bm, p.bk, xs[0], ws[0], ws[1], xs[2] });
+        log.info("[gather-nax] engaged: {s} bm={d} bk={d} M={d} E={d} N={d} K={d} {s}\n", .{ @tagName(p.sched), p.bm, p.bk, xs[0], ws[0], ws[1], xs[2], modeName(mx, group) });
     }
     return out;
 }
@@ -557,7 +557,7 @@ fn sortedGatherMappedAt(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_arr
     const out = try launchMapped(x, row_map, w, sc, bi, idx, null, bits, group, mx, key.plan, s);
     if (!mapped_engaged_logged) {
         mapped_engaged_logged = true;
-        log.info("[gather-nax] row map engaged: M={d} E={d} N={d} K={d}\n", .{ mlx.getShape(idx)[0], mlx.getShape(w)[0], mlx.getShape(w)[1], mlx.getShape(x)[2] });
+        log.info("[gather-nax] row map engaged: M={d} E={d} N={d} K={d} {s}\n", .{ mlx.getShape(idx)[0], mlx.getShape(w)[0], mlx.getShape(w)[1], mlx.getShape(x)[2], modeName(mx, group) });
     }
     return out;
 }
