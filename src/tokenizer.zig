@@ -42,6 +42,17 @@ fn isOutputOnlySpecial(content: []const u8) bool {
     return std.mem.eql(u8, content, "<|constrain|>");
 }
 
+// Hy4 constructs markers with `.format(HYTK)` instead of spelling the
+// resulting token literally. Exempt only expressions present in its template.
+fn hy4FormattedSpecial(template: []const u8, content: []const u8) bool {
+    const suffix = ":opensource";
+    if (std.mem.indexOf(u8, template, "set HYTK = ':opensource'") == null) return false;
+    const pos = std.mem.indexOf(u8, content, suffix) orelse return false;
+    var buf: [512]u8 = undefined;
+    const expr = std.fmt.bufPrint(&buf, "'{s}{{}}{s}'.format(HYTK)", .{ content[0..pos], content[pos + suffix.len ..] }) catch return false;
+    return std.mem.indexOf(u8, template, expr) != null;
+}
+
 pub fn reservedOutputIds(
     allocator: std.mem.Allocator,
     flagged: []const FlaggedSpecial,
@@ -55,7 +66,7 @@ pub fn reservedOutputIds(
         for (exempt_ids) |e| {
             if (sp.id == e) continue :outer;
         }
-        if (std.mem.indexOf(u8, template_source, sp.content) != null) continue;
+        if (std.mem.indexOf(u8, template_source, sp.content) != null or hy4FormattedSpecial(template_source, sp.content)) continue;
         if (isOutputOnlySpecial(sp.content)) continue;
         try out.append(allocator, sp.id);
     }

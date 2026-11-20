@@ -104,6 +104,7 @@ test {
     _ = @import("dsv41_engram.zig");
     _ = @import("nocache_reader.zig");
     _ = @import("deepseek_v41.zig");
+    _ = @import("hy_v4_flash.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("ple_gpu.zig");
     _ = @import("kokoro.zig");

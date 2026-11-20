@@ -2,6 +2,18 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### Hy4 Engram projections carry biases
+
+Real Hy4 checkpoints contain separate value_proj.bias and key_projs.*.bias tensors in addition to quantization biases. Apply those projection biases before Engram normalization and honor engram_fp8_embedding with per-head E4M3 rounding. A previously saved real-A layer reference diverges when projection biases are applied; its provenance needs investigation before using it as an acceptance oracle.
+
+### Hy4 Engram rows and formatted special tokens
+
+Engram table heads occupy consecutive slices; advance the row offset by each head's vocabulary size, not once per n-gram order. Hy4 also builds its special tokens with .format(HYTK) in the chat template: reserved-output suppression must recognize those expressions or it masks valid thinking and tool markers.
+
+### Hy4 prefix snapshots omit module-owned state
+
+Hy4 keeps its KV and Engram history on the model, so the generic hot prefix snapshot cannot restore it. Exclude hy_v4_flash from the hot prefix cache until that state can be snapshotted; otherwise a reused prefix can change greedy output.
+
 ### A restored LiLiCorr context had no correlation anchor
 
 Defect: a request restored from the prefix cache failed under LiLiCorr. Cause: snapshots keep the drafter K/V but not the latest target feature. Fix: take one plain round to capture it, then resume speculation; layout unchanged. Guard: `lilicorr missing restored anchor takes a plain round and recovers it`.

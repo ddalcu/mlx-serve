@@ -3,6 +3,7 @@ const crt = @import("crt.zig");
 const builtin = @import("builtin");
 const dsv4_mod = @import("deepseek_v4.zig");
 const dsv41_mod = @import("deepseek_v41.zig");
+const hy4_mod = @import("hy_v4_flash.zig");
 const mlx_stream_mod = if (@import("build_options").mlx_stream) @import("arch/mlx_stream.zig") else @import("arch/mlx_stream_stub.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
 const distributed_mod = @import("distributed.zig");
@@ -11785,6 +11786,7 @@ test "persistent group: drop a member does not free kinds the adopt still reads"
 fn ssmTickStubXfm(alloc: std.mem.Allocator, s: mlx.mlx_stream, persist: bool) Transformer {
     var xfm: Transformer = undefined;
     xfm.rht = null;
+    xfm.hy4 = null;
     xfm.s = s;
     xfm.allocator = alloc;
     xfm.persistent_group_state_override = persist;
@@ -17518,6 +17520,7 @@ pub const Transformer = struct {
     /// DeepSeek-V4.1 (deepseek_v41): its own module (src/deepseek_v41.zig)
     /// in the same shell, request state on the module.
     dsv41: ?*dsv41_mod.Dsv41Model = null,
+    hy4: ?*hy4_mod.Model = null,
     /// An mlx-stream pack (`arch/mlx_stream.zig`: DeepSeek-V4.1's EXL3 repack or MiMo-V2.6-Flash): the plugin's module.
     mlx_stream_ext: ?*mlx_stream_mod.Model = null,
 
@@ -17679,6 +17682,7 @@ pub const Transformer = struct {
         if (config.glm_stream) return initMlxStream(io, allocator, config, s);
         if (config.glm5_stream) return initMlxStream(io, allocator, config, s);
         if (config.isDsv41()) return initDsv41(io, allocator, config, weights, s);
+        if (std.mem.eql(u8, config.model_type, "hy_v4_flash")) return initHy4(io, allocator, config, weights, s);
 
         // Embeddings: the table's own name is the checkpoint's, not a family
         // trait — one lookup table, three call sites (weight/scales/biases)
@@ -19170,6 +19174,11 @@ pub const Transformer = struct {
         if (self.dsv41) |mdl| {
             mdl.deinit();
             self.dsv41 = null;
+        }
+        if (self.hy4) |mdl| {
+            mdl.deinit();
+            self.allocator.destroy(mdl);
+            self.hy4 = null;
         }
         if (self.mlx_stream_ext) |m| {
             mlx_stream_mod.close(m);
@@ -20833,7 +20842,7 @@ pub const Transformer = struct {
     /// slot deinits and rebuilds the live request's state and both then append
     /// to the ONE state. Add a new arm here the moment its pointer field is
     /// added above, or the arch serves two clients one mangled stream.
-    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "dsv41", "mlx_stream_ext", "dist_peer" };
+    pub const module_owned_state_fields = [_][]const u8{ "dsv4", "dsv41", "hy4", "mlx_stream_ext", "dist_peer" };
 
     /// Module pointer fields that hold READ-ONLY per-model state (qwen4: the
     /// n-gram hash + mmapped table). Every per-request thing lives on the
@@ -20915,6 +20924,7 @@ pub const Transformer = struct {
         if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
         if (self.dsv4) |mdl| return forwardDsv4WithImpl(self, ctx, token_ids, mdl);
         if (self.dsv41) |mdl| return forwardDsv41WithImpl(self, ctx, token_ids, mdl);
+        if (self.hy4) |mdl| return forwardHy4WithImpl(self, ctx, token_ids, mdl);
         if (self.mlx_stream_ext) |m| return forwardMlxStream(self, ctx, token_ids, m);
         if (self.bert_layers != null) return self.forwardBertWith(ctx, token_ids);
         // Bidirectional embedding models (EmbeddingGemma 1 on gemma3 weights, 2 on Gemma 4's) never run causal decode.
@@ -20930,7 +20940,7 @@ pub const Transformer = struct {
     /// Does `forwardWith` route this model through `forwardStandardWith`?
     /// Mirrors the dispatch chain above IN ORDER.
     pub fn usesStandardForward(self: *const Transformer) bool {
-        return self.dsv4 == null and self.dsv41 == null and self.mlx_stream_ext == null and
+        return self.dsv4 == null and self.dsv41 == null and self.hy4 == null and self.mlx_stream_ext == null and
             self.bert_layers == null and
             !self.config.use_bidirectional_attention and
             self.hybrid_layers == null and
@@ -20943,7 +20953,7 @@ pub const Transformer = struct {
     /// `DflashModel.bind` gates on this predicate. Mirrors the dispatch chain
     /// above IN ORDER.
     pub fn supportsLayerCapture(self: *const Transformer) bool {
-        return self.dsv4 == null and self.dsv41 == null and self.mlx_stream_ext == null and
+        return self.dsv4 == null and self.dsv41 == null and self.hy4 == null and self.mlx_stream_ext == null and
             self.bert_layers == null and
             !self.config.use_bidirectional_attention;
     }
@@ -46208,6 +46218,50 @@ fn initDsv41(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weig
     return t;
 }
 
+/// Hy4 Flash: text-only, batch 1. The module keeps its own decode state;
+/// `ctx.cache.step` still drives prefill-vs-decode admission.
+fn forwardHy4WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, mdl: *hy4_mod.Model) !mlx.mlx_array {
+    // A decode tick hands us the sampler's freshly-produced token, a LAZY GPU
+    // array with no host buffer yet. Read it through hostIds (astype+eval), as
+    // the dsv41 path does — calling mlx_array_data_int32 directly segfaults on
+    // the second forward (KERN_INVALID_ADDRESS in Buffer::raw_ptr).
+    const ids = try hostIds(self, token_ids);
+    defer self.allocator.free(ids);
+    const n = ids.len;
+    if (ctx.cache.step == 0) mdl.resetState();
+    const logits = try mdl.forward(ids);
+    defer _ = mlx.mlx_array_free(logits);
+    ctx.cache.step += n;
+    // The sampler consumes the last position's logits [1, 1, V].
+    const sh = mlx.getShape(logits);
+    var last = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(last);
+    const start = [_]c_int{ @intCast(sh[0] - 1), 0 };
+    const stop = [_]c_int{ @intCast(sh[0]), @intCast(sh[1]) };
+    const stride = [_]c_int{ 1, 1 };
+    try mlx.check(mlx.mlx_slice(&last, logits, &start, 2, &stop, 2, &stride, 2, self.s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, last, &[_]c_int{ 1, 1, @intCast(mdl.cfg.vocab) }, 3, self.s));
+    return out;
+}
+
+fn initHy4(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Transformer {
+    const dir = config.pack_dir orelse return error.MissingModelDir;
+    const json_path = try std.fs.path.join(allocator, &.{ dir, "config.json" });
+    defer allocator.free(json_path);
+    const json = try std.Io.Dir.cwd().readFileAlloc(io, json_path, allocator, .limited(1 << 22));
+    defer allocator.free(json);
+    var hycfg = try hy4_mod.parseRealConfig(allocator, json);
+    hycfg.model_dir = dir;
+    var t = try moduleShell(allocator, config, s);
+    const m = try allocator.create(hy4_mod.Model);
+    errdefer allocator.destroy(m);
+    m.* = try hy4_mod.Model.init(allocator, hycfg, weights, s);
+    t.hy4 = m;
+    return t;
+}
+
 /// A pack mlx-stream serves (DeepSeek-V4.1's EXL3 repack, a MiMo stream pack or a GLM-5.3 pack): the plugin's module.
 fn initMlxStream(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, s: mlx.mlx_stream) !Transformer {
     const m = try mlx_stream_mod.open(allocator, io, s, &config);
@@ -66785,6 +66839,7 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     t.rht = null;
     t.dsv4 = null;
     t.dsv41 = null;
+    t.hy4 = null;
     t.mlx_stream_ext = null;
     t.qwen4 = null;
     t.dist_peer = null;
@@ -66799,6 +66854,10 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     t.dsv41 = &fake_dsv41;
     try testing.expect(t.ownsModuleDecodeState());
     t.dsv41 = null;
+    var fake_hy4: hy4_mod.Model = undefined;
+    t.hy4 = &fake_hy4;
+    try testing.expect(t.ownsModuleDecodeState());
+    t.hy4 = null;
     var fake_ext: mlx_stream_mod.Model = undefined;
     t.mlx_stream_ext = &fake_ext;
     try testing.expect(t.ownsModuleDecodeState());

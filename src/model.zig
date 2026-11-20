@@ -1780,6 +1780,9 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 
     var config = try parseConfigFromJson(allocator, content);
     errdefer config.deinit(allocator);
+    if (std.mem.eql(u8, config.model_type, "hy_v4_flash")) {
+        config.pack_dir = try allocator.dupe(u8, model_dir);
+    }
     if (config.isDsv41()) {
         config.pack_dir = try allocator.dupe(u8, model_dir);
         const bank = try std.fmt.allocPrint(allocator, "{s}/experts.bin", .{model_dir});
@@ -4643,6 +4646,24 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             .integer => |i| std.math.cast(u32, i) orelse return error.InvalidConfigField,
             else => 2,
         };
+    } else if (std.mem.eql(u8, model_type, "hy_v4_flash")) {
+        // Hy4 Flash (tencent/Hy4-flash). The converter's MLX pack uses bare
+        // `model.layers.N.*` names and a nested text_config; the dedicated
+        // module re-reads its geometry from config.json in initHy4.
+        config.model_type = "hy_v4_flash";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false;
+        config.hidden_act = .silu;
+        config.has_vision = false; // text path only in this port
+        config.num_key_value_heads = config.num_attention_heads;
+        if (jsonField(cfg_obj, "qk_rope_head_dim")) |v| config.dsv4_rope_head_dim = try jsonU32(v);
+        if (jsonField(cfg_obj, "q_lora_rank")) |v| config.dsv4_q_lora_rank = try jsonU32(v);
+        if (jsonField(cfg_obj, "n_routed_experts")) |v| config.num_experts = try jsonU32(v);
+        if (jsonField(cfg_obj, "num_experts_per_tok")) |v| config.num_experts_per_tok = try jsonU32(v);
+        if (jsonField(cfg_obj, "routed_scaling_factor")) |v| config.router_scaling_factor = try jsonFloat(v);
     } else {
         // Llama-family defaults (qwen3, llama, mistral, etc.)
         if (std.mem.eql(u8, model_type, "qwen3")) {

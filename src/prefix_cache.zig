@@ -779,8 +779,8 @@ pub const HotPrefixCache = struct {
         // the KVCache — a snapshot restore would advance cache.step without
         // rebuilding that state. Off until dsv4 state rides the ssm-entry
         // machinery (needsSsmEntries class).
-        // GLM-5.3 on mlx-stream keeps its decode state on the plugin's module the same way.
-        if (std.mem.eql(u8, config.model_type, "deepseek_v4") or config.isDsv41() or config.glm_stream) return false;
+        // Hy4 and GLM-5.3 on mlx-stream likewise keep decode state on the module.
+        if (std.mem.eql(u8, config.model_type, "deepseek_v4") or std.mem.eql(u8, config.model_type, "hy_v4_flash") or config.isDsv41() or config.glm_stream) return false;
         // A pipeline worker holds the later layers' state at the live position only: a restore
         // here would rewind this rank and not the worker.
         if (config.dist_span != null) return false;
