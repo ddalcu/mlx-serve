@@ -98,6 +98,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   about a plain tick, and the adaptive policy's prior ladder cut novel text from 54 to 40 tok/s.
 - A streamed bank's phase follows its decode capacity (`promptPhase`): a call past the decode regions OR past
   `Routed.decode_ids` routed ids runs the prompt phase; a 9-16 token prompt on the EXL3 bank failed `NotPrefill`.
+- Engram tables are held in memory where they fit (`Table.hold`, `MLX_SERVE_DSV41_ENGRAM_RESIDENT`, billed by
+  `residentDiskBytes`): read once past the page cache at load, each lookup a copy; else the reads below.
 - Engram tables are read whole and past the page cache only beside a streamed bank (`Table.readDirect`): on a resident
   MLX pack the direct whole-grid read slowed warm prompts (the cache served their rows), and the bank needs that memory.
 - A resident pack reads its Engram CODES past the page cache while memory is tight (`Table.openCodes`, `pastCache`,

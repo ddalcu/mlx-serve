@@ -26,6 +26,7 @@ const log = @import("../../sdk/util/log.zig");
 const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwiGLU;
 const engram = @import("engram.zig");
 const system = @import("../../sdk/util/system.zig");
+const crt = @import("../../sdk/util/crt.zig");
 const cache_codec = @import("cache_codec.zig");
 const cache_abi = @import("../../abi/plugin.zig");
 const glm5 = @import("../glm5_next/glm5_next.zig");
@@ -1987,6 +1988,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         m.lhs_gu = try m.own(mlx.mlx_array_new_data(&ks, &[_]c_int{ 1, ci(k) }, 2, .uint32));
     }
     try evalWeights(m);
+    try holdEngram(m);
     // the gemv twin's launches for the indexer's linears compiled now, not in a request's first verify.
     if (mlx.streamIsGpu(s)) try warmTwin(m);
     // the gemv twin's launches for each Engram layer's plain wkv compiled now, not in a request's first
@@ -1998,6 +2000,27 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     log.info("deepseek_v41: {d} layers, engram {d} layers, DSpark {d} stages{s}{s}\n", .{ n_layers, m.engrams.len, n_stages, if (opts.quant != null) ", weights on " else "", if (opts.quant) |q| q.name() else "" });
     if (m.dec.moe_fp4 != null) log.info("deepseek_v41: fused mxfp4 MoE decode kernels on\n", .{});
     return m;
+}
+
+/// The Engram tables read into memory once (`MLX_SERVE_DSV41_ENGRAM_RESIDENT`) where they fit beside what the weights
+/// hold, as the bill asked (`residentDiskBytes`); else read from disk per lookup. The info line names the choice.
+fn holdEngram(m: *Dsv41Model) !void {
+    if (m.engrams.len == 0) return;
+    const set = try engram.residentSetting(env.span(.MLX_SERVE_DSV41_ENGRAM_RESIDENT));
+    var bytes: u64 = 0;
+    for (m.engrams) |*e| bytes += e.table.tableBytes();
+    const gb = @as(f64, @floatFromInt(bytes)) / 1e9;
+    if (set == .off) return log.info("deepseek_v41: Engram tables ({d:.1} GB) read from disk per lookup (MLX_SERVE_DSV41_ENGRAM_RESIDENT=0)\n", .{gb});
+    const total = system.getTotalMemBytes();
+    const in_use = total -| system.getAvailableMemBytes();
+    if (!engram.residentFits(in_use, bytes, total, mlx.maxRecommendedWorkingSet()))
+        return log.info("deepseek_v41: Engram tables ({d:.1} GB) read from disk per lookup: {d:.1} GB in use, past 7/8 of RAM or the GPU working set with them\n", .{ gb, @as(f64, @floatFromInt(in_use)) / 1e9 });
+    const t0 = crt.monotonicMs();
+    for (m.engrams, 0..) |*e, k| e.table.hold(32, set == .wired) catch |err| {
+        for (m.engrams[0 .. k + 1]) |*h| h.table.unholdAll();
+        return log.warn("deepseek_v41: Engram tables read from disk per lookup: holding them failed ({s})\n", .{@errorName(err)});
+    };
+    log.info("deepseek_v41: Engram tables held in memory: {d} tables, {d:.1} GB read in {d} ms{s}\n", .{ m.engrams.len, gb, crt.monotonicMs() - t0, if (set == .wired) ", wired" else "" });
 }
 
 /// the gemv twin's served launches (gemv_twin.zig `served`) for the indexer's plain
@@ -2119,11 +2142,16 @@ pub fn dsparkWanted(cfg: *const Config, pair: ?Pair, mtp: ?bool) bool {
 /// index does not name for it).
 pub fn residentDiskBytes(gpa: std.mem.Allocator, dir: []const u8, cfg: *const Config, mtp: ?bool, shards: u64) !u64 {
     var total = shards -| try droppedBytes(gpa, dir, dsparkWanted(cfg, null, mtp), cfg.has_vision);
+    var tables: u64 = 0;
     for (cfg.dsv41_engram_layers[0..cfg.dsv41_n_engram_layers], 0..) |l, k| {
         var t = try engram.Table.open(gpa, dir, k, l, cfg.dsv41_engram_rows[k], cfg.dsv41_engram_head_dim);
         defer t.close();
         total -|= t.shardBytes();
+        tables += t.tableBytes();
     }
+    // Tables the load will hold in memory (`holdEngram`) are resident.
+    if (tables > 0 and try engram.residentSetting(env.span(.MLX_SERVE_DSV41_ENGRAM_RESIDENT)) != .off and
+        engram.residentFits(total, tables, system.getTotalMemBytes(), mlx.maxRecommendedWorkingSet())) total +|= tables;
     // Its rows' LRU (`MLX_SERVE_DSV41_ENGRAM_LRU_MB`) fills on every load.
     if (cfg.dsv41_n_engram_layers > 0) total +|= edec.billBytes(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB));
     return total;
