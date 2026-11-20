@@ -34,7 +34,14 @@ pub const Opts = struct {
     /// Every routed projection affine at this width over groups of 128 (the expert-pruned packs) instead of the iQ
     /// pack's plan (gate/up 2 or 3 bits, down 3, groups of 64).
     experts_affine: ?u32 = null,
+    /// The routed experts as `dsv41_nvfp4_pack.py --experts-nvfp4` writes NVIDIA's: MLX nvfp4, group 16.
+    experts_nvfp4: bool = false,
+    /// ModelOpt's per-expert globals beside the routed experts, under the converter's names.
+    expert_scales: ExpertScales = .none,
 };
+
+/// The per-expert global tensors a fixture writes: none, all three in (0.5, 2), or a set the load refuses.
+pub const ExpertScales = enum { none, all, missing_up, nan_gate };
 
 pub const Fixture = struct {
     gpa: std.mem.Allocator,
@@ -44,15 +51,20 @@ pub const Fixture = struct {
     draws: u64 = 0,
     /// The routed experts' affine group.
     group: c_int = 64,
+    /// The routed experts in MLX nvfp4 (`Opts.experts_nvfp4`).
+    nvfp4: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, opts: Opts) !*Fixture {
         const fx = try gpa.create(Fixture);
         errdefer gpa.destroy(fx);
         var cfg = try releaseConfig();
         cfg.num_experts = opts.experts;
-        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed, .group = if (opts.experts_affine != null) 128 else 64 };
+        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed, .group = if (opts.experts_affine != null) 128 else 64, .nvfp4 = opts.experts_nvfp4 };
         errdefer fx.w.deinit();
-        for (opts.lo..opts.hi) |li| try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4, opts.experts_affine);
+        for (opts.lo..opts.hi) |li| {
+            try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4, opts.experts_affine);
+            try fx.putExpertScales(li, opts.experts, opts.expert_scales);
+        }
         if (opts.tp) |t| try fx.sliceShard(t);
         fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = .{ .lo = opts.lo, .hi = opts.hi, .worker = true }, .act = opts.act, .tp = opts.tp });
         errdefer fx.m.deinit();
@@ -189,14 +201,40 @@ pub const Fixture = struct {
                 try mlx.check(mlx.mlx_array_eval(d));
                 return fx.putNamed(base ++ ".weight", args, d);
             },
-            .mxfp8, .mxfp4, .affine => {
+            .mxfp8, .mxfp4, .nvfp4, .affine => {
                 defer _ = mlx.mlx_array_free(w);
-                const q = if (fmt == .mxfp8) try quantize(w, 32, 8, "mxfp8") else if (fmt == .mxfp4) try quantize(w, 32, 4, "mxfp4") else try quantize(w, fx.group, @intCast(fmt.affine), "affine");
+                const q = switch (fmt) {
+                    .mxfp8 => try quantize(w, 32, 8, "mxfp8"),
+                    .mxfp4 => try quantize(w, 32, 4, "mxfp4"),
+                    .nvfp4 => try quantize(w, 16, 4, "nvfp4"),
+                    else => try quantize(w, fx.group, @intCast(fmt.affine), "affine"),
+                };
                 try fx.putNamed(base ++ ".weight", args, q[0]);
                 try fx.putNamed(base ++ ".scales", args, q[1]);
                 if (q[2].ctx != null) try fx.putNamed(base ++ ".biases", args, q[2]);
             },
         }
+    }
+
+    /// Layer `li`'s per-expert globals as `dsv41_nvfp4_pack.py --experts-nvfp4` names them, `[E]` bf16.
+    fn putExpertScales(fx: *Fixture, li: usize, E: u32, plan: ExpertScales) !void {
+        if (plan == .none) return;
+        const names = .{ "gate_proj.expert_scale", "up_proj.expert_scale", "expert_scale" };
+        inline for (names, 0..) |n, i| if (!(plan == .missing_up and i == 1)) {
+            const u = try fx.uniform(&.{@intCast(E)}, 0.5, 2);
+            defer _ = mlx.mlx_array_free(u);
+            var v = mlx.mlx_array_new();
+            if (plan == .nan_gate and i == 0) {
+                const nan = mlx.mlx_array_new_float(std.math.nan(f32));
+                defer _ = mlx.mlx_array_free(nan);
+                var t = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(t);
+                try mlx.check(mlx.mlx_add(&t, u, nan, mlx.gpuStream()));
+                try mlx.check(mlx.mlx_astype(&v, t, .bfloat16, mlx.gpuStream()));
+            } else try mlx.check(mlx.mlx_astype(&v, u, .bfloat16, mlx.gpuStream()));
+            try mlx.check(mlx.mlx_array_eval(v));
+            try fx.putNamed("layers.{d}.ffn.experts." ++ n, .{li}, v);
+        };
     }
 
     fn putVec(fx: *Fixture, comptime name: []const u8, args: anytype, shape: []const c_int, dt: mlx.mlx_dtype, mean: f32, std_: f32) !void {
@@ -259,14 +297,15 @@ pub const Fixture = struct {
         try fx.putLin(pfx ++ "ffn.shared_experts.w2", .{li}, &.{ d, inter }, .mxfp8);
         // One tensor an expert (the loader stacks them), so a full 384-expert bank never exists in bf16.
         for (0..E) |x| {
-            try fx.putLin(pfx ++ "ffn.experts.{d}.w1", .{ li, x }, &.{ inter, d }, if (fp4) .mxfp4 else .{ .affine = gu_bits });
-            try fx.putLin(pfx ++ "ffn.experts.{d}.w3", .{ li, x }, &.{ inter, d }, if (fp4) .mxfp4 else .{ .affine = gu_bits });
-            try fx.putLin(pfx ++ "ffn.experts.{d}.w2", .{ li, x }, &.{ d, inter }, if (fp4) .mxfp4 else .{ .affine = affine orelse 3 });
+            const nv = fx.nvfp4 and std.mem.startsWith(u8, pfx, "layers.");
+            try fx.putLin(pfx ++ "ffn.experts.{d}.w1", .{ li, x }, &.{ inter, d }, if (nv) .nvfp4 else if (fp4) .mxfp4 else .{ .affine = gu_bits });
+            try fx.putLin(pfx ++ "ffn.experts.{d}.w3", .{ li, x }, &.{ inter, d }, if (nv) .nvfp4 else if (fp4) .mxfp4 else .{ .affine = gu_bits });
+            try fx.putLin(pfx ++ "ffn.experts.{d}.w2", .{ li, x }, &.{ d, inter }, if (nv) .nvfp4 else if (fp4) .mxfp4 else .{ .affine = affine orelse 3 });
         }
     }
 };
 
-const Fmt = union(enum) { bf16, fp8_exact, mxfp8, mxfp4, affine: u32 };
+const Fmt = union(enum) { bf16, fp8_exact, mxfp8, mxfp4, nvfp4, affine: u32 };
 
 pub fn quantize(w: A, gs: c_int, bits: c_int, mode: [*:0]const u8) ![3]A {
     var qv = mlx.mlx_vector_array_new();
