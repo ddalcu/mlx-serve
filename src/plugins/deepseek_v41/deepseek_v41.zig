@@ -4033,6 +4033,9 @@ pub fn moeKernel(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, ins: []const A, sh
 }
 
 pub fn routed(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, wts: A) !A {
+    // An outside plugin's resident banks hold no MLX arrays here: every caller (a decode step, a fused block's
+    // fallback, a compiled prompt region) reaches its math through this one arm.
+    if (ly.experts.ext) |*e| return routedOutside(sc, m, e, x, idx, wts);
     const L = dim(x, 0);
     const k = dim(idx, 1);
     const d = dim(x, 1);
