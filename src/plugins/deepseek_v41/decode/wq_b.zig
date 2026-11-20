@@ -13,7 +13,7 @@ const A = mlx.mlx_array;
 const none: A = .{ .ctx = null };
 
 pub const SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_wq_b.metal");
-pub const HEADER = dsv41.FP8_HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_wq_b_header.metal");
+pub const HEADER = dsv41.FP8_HEADER ++ kernelSource("plugins/deepseek_v41/kernels/fp8_read_header.metal") ++ kernelSource("plugins/deepseek_v41/kernels/dec_wq_b_header.metal");
 pub const INS = [_][*:0]const u8{ "qa", "qn", "w_q", "s_q", "w_i", "s_i", "kv", "kvn", "periods", "periods_i", "pos", "z", "eps" };
 pub const OUTS = [_][*:0]const u8{ "q", "q_idx", "kv_row", "pre", "post", "comb" };
 
@@ -121,6 +121,7 @@ pub fn launch(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: mlx.mlx_fast_m
         .{ "RD", c.dsv4_rope_head_dim },
     }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", act));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "FOLD", decode.fp8Fold()));
     const eps = try dsv41.hcEps(sc, m);
     const iv = mlx.mlx_vector_array_new_data(&[_]A{ qa, ly.q_norm, ly.wq_b.w, ly.wq_b.s, iw_q.w, iw_q.s, kv, ly.kv_norm, dsv41.ropeFor(m, li).fwd, m.rope_yarn.fwd, pos, z, eps }, INS.len);
     defer _ = mlx.mlx_vector_array_free(iv);
@@ -341,6 +342,7 @@ const Wqb = struct {
         g.out(&.{ ci(s.rows), cx.HC, cx.HC }, .float32);
         inline for (.{ .{ "R", s.rows }, .{ "SGS", SGS }, .{ "G", p.g }, .{ "NQ", s.n }, .{ "NI", s.k }, .{ "HC", cx.HC }, .{ "ITERS", cx.ITERS }, .{ "RD", cx.RD } }) |t| g.int(t[0], t[1]);
         g.dtype("T", cx.act);
+        g.int("FOLD", 0);
         return g;
     }
 
@@ -968,4 +970,9 @@ test "dsv41 dec wq_b: ubench" {
         const sc_ = try splitTime(b, kern, groups(), rows, with_idx, true);
         std.debug.print("[dec-ubench-eval] {s} R={d}: host build {d:.1} us of the above, device alone {d:.1} us ({d:.0} GB/s); replaced chain {d:.1} + {d:.1}\n", .{ if (with_idx) "wq_b+idx" else "wq_b", rows, sp[0], sp[1], bytes / sp[1] / 1e3, sc_[0], sc_[1] });
     };
+}
+
+test "dsv41 dec wq_b: MLX's mxfp8 reads give the FOLD form's bytes on finite codes" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try decode.expectFoldSame(Wqb, &wq_b_l, .{ .g = 9 }, &.{ .{ .rows = 1, .n = 2 * KV, .k = 2 * cx.IHD }, .{ .rows = 6, .n = KV, .k = cx.IHD } });
 }

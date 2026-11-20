@@ -6,7 +6,6 @@ const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
-const mxfp8_qmv = @import("../../../sdk/blocks/qmm/mxfp8_qmv.zig");
 const kit = @import("../../deepseek_v4/contract_kit.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const contract = @import("../contract.zig");
@@ -20,7 +19,7 @@ const mixes = (2 + hc) * hc;
 
 const A_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in.metal");
 const B_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_post.metal");
-const HEADER = mxfp8_qmv.HEADER;
+const HEADER = decode.FP8_READ_HEADER;
 
 const A_INS = [_][*:0]const u8{ "oa", "w_q", "scales", "x", "spre", "spost", "scomb" };
 /// `ctr`, `parts` and `scores` are launch 2's scratch: launch 1 zeroes the counters and writes neither of the others.
@@ -200,7 +199,7 @@ pub fn launchA(sc: *dsv41.Scope, ks: Kernels, p: Dims, w: Weights, oa: A, x: A, 
         .{ .shape = &.{16}, .dt = .uint32 },
         .{ .shape = &.{ci(partsLen(p))}, .dt = .float32 },
         .{ .shape = &.{ ci(p.rows), ci(p.e) }, .dt = .float32 },
-    }, gridA(p), a_nsg * 32, &aTargs(p));
+    }, gridA(p), a_nsg * 32, &(aTargs(p) ++ [_]TArg{.{ .name = "FOLD", .v = @intCast(decode.fp8Fold()) }}));
     return .{ .x1 = a[0], .hv = a[1], .ctr = a[2], .parts = a[3], .logits = a[4] };
 }
 
@@ -302,6 +301,7 @@ const FfnA = struct {
         g.out(&.{ci(partsLen(p))}, .float32);
         g.out(&.{ ci(p.rows), ci(p.e) }, .float32);
         for (aTargs(p)) |t| g.int(t.name, t.v);
+        g.int("FOLD", 0);
         g.dtype("T", act);
         return g;
     }
@@ -1335,4 +1335,9 @@ test "dsv41 dec ffn_in: ubench, R = 1 and 6 against today's chain over 2.3 GB of
         decode.report("ffn_in", rows, us[0].total, 49.2e6, us[1].total);
         std.debug.print("[dec-ubench] ffn_in R={d}: graph build {d:.1} us (chain {d:.1}); launch 1 alone {d:.1} us\n", .{ rows, us[0].build, us[1].build, us[2].total });
     }
+}
+
+test "dsv41 dec ffn_in: wo_b's MLX mxfp8 reads give the FOLD form's bytes on finite codes" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try decode.expectFoldSame(FfnA, &launch_a, .{}, &.{ .{ .rows = 1, .n = 256, .k = 8192 }, .{ .rows = 6, .n = 256, .k = 8192 }, .{ .rows = 1, .n = 5120, .k = 8192 } });
 }
