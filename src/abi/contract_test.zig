@@ -323,11 +323,15 @@ fn checkTable(engine: *const abi.Engine, fx: Fixture) !void {
     if (i.size < @sizeOf(abi.Info) or i.name.len == 0 or i.context_window == 0 or i.max_concurrent == 0) return error.InfoHeader;
     if ((i.threading == .host_gpu_thread) != (engine.step != null)) return error.ThreadingMismatch;
     const c = i.caps;
-    const media = c.images or c.video or c.audio;
     if (c.embed != (engine.embed != null) or c.decide != (engine.decide != null) or
-        media != (engine.media_rows != null) or
         (c.owns_tokenizer and (engine.tokenize == null or engine.token_bytes == null)) or
         (c.owns_template and engine.render == null)) return error.CapsEntryMismatch;
+    // Media crosses one of two ways, and the entry points must match it: the `media_rows` callback, or an
+    // image-only engine that announces its atom and serves the host's tokenizer.
+    const media = c.images or c.video or c.audio;
+    const atom_route = c.images and !c.video and !c.audio and
+        i.image_placeholder.len != 0 and engine.tokenize != null and engine.token_bytes != null;
+    if (media != (engine.media_rows != null or atom_route)) return error.CapsEntryMismatch;
 }
 
 fn checkOrderAndLength(engine: *const abi.Engine, fx: Fixture) !void {

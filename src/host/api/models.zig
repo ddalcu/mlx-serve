@@ -180,6 +180,7 @@ fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) 
 }
 
 pub fn loadedSupportsVideo(entry: *const LoadedModel) bool {
+    if (entry.engine) |e| return e.caps().video;
     return mlx_engine.api().supports_video(entry);
 }
 
@@ -217,8 +218,9 @@ pub fn renderModelEntry(
             entry.engineBacked(),
         );
         const mf = mlx_engine.facts(entry);
-        const has_vision = mf.images;
-        const has_audio = mf.audio;
+        const has_vision = if (entry.engine) |e| e.caps().images else mf.images;
+        const has_audio = if (entry.engine) |e| e.caps().audio else mf.audio;
+        const has_video = if (entry.engine) |e| e.caps().video else mf.video;
         var caps = try readyCapsJson(allocator, .{
             .has_chat = has_chat,
             .has_vision = has_vision,
@@ -247,7 +249,7 @@ pub fn renderModelEntry(
         } else try allocator.dupe(u8, "");
         defer allocator.free(speech_part);
 
-        const mods = try inputModalities(allocator, has_vision, mf.video, has_audio);
+        const mods = try inputModalities(allocator, has_vision, has_video, has_audio);
         defer allocator.free(mods);
 
         // Loaded and unloaded rows report the same `architecture` — the
@@ -998,6 +1000,54 @@ test "appendAliasedRow: the alias rides the row, the id stays canonical" {
     try appendAliasedRow(a, &out, "{\"id\":\"org/Q\"}", "q");
     try appendAliasedRow(a, &out, "{\"id\":\"g\"}", null);
     try std.testing.expectEqualStrings("{\"alias\":\"q\",\"id\":\"org/Q\"}{\"id\":\"g\"}", out.items);
+}
+
+test "engine image transport catalog advertises only the opened engine's input capabilities" {
+    const a = testing.allocator;
+    const io = testing.io;
+    const reg = try model_registry_mod.ModelRegistry.init(a, io, null, 1, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("external", "/path/to/model", 0);
+    var engine: @import("../engines/served.zig").Served = undefined;
+    engine.kind = .ds4;
+    engine.info = std.mem.zeroes(@import("../../abi/engine.zig").Info);
+    engine.info.caps.images = true;
+    var config = model_mod.ModelConfig{};
+    var cc = chat_mod.ChatConfig{
+        .chat_template = "template",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = a,
+    };
+    entry.config = &config;
+    entry.chat_config = &cc;
+    entry.engine = &engine;
+    entry.state = .ready;
+    defer {
+        entry.engine = null;
+        entry.config = null;
+        entry.chat_config = null;
+        entry.state = .unloaded;
+    }
+    for ([_]bool{ true, false }) |images| {
+        engine.info.caps.images = images;
+        const json = try renderModelEntry(a, io, entry);
+        defer a.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer parsed.deinit();
+        const mods = parsed.value.object.get("input_modalities").?.array.items;
+        try testing.expectEqual(@as(usize, if (images) 2 else 1), mods.len);
+        try testing.expectEqualStrings("text", mods[0].string);
+        if (images) try testing.expectEqualStrings("image", mods[1].string);
+        var vision = false;
+        for (parsed.value.object.get("capabilities").?.array.items) |cap| {
+            if (std.mem.eql(u8, cap.string, "vision")) vision = true;
+        }
+        try testing.expectEqual(images, vision);
+        try testing.expect(!loadedSupportsVideo(entry));
+        try testing.expect(entry.vision_encoder == null);
+    }
 }
 
 test "input_modalities renders resident video weights and native unloaded capabilities" {

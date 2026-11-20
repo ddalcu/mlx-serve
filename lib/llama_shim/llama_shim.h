@@ -121,10 +121,63 @@ float  *mlx_llama_seq_logits(mlx_llama_ctx *c, int32_t seq);
 // by the next token (also not yet in the KV) to `out` (capacity max_drafts + 1);
 // returns that count (>= 1), or -1 on failure. Sampling as mlx_llama_seq_sample.
 // A head that fails is dropped (mlx_llama_ctx_mtp_drafts() then reports 0) and
-// the round decodes plain.
+// the round decodes plain. A sequence that holds image embeddings refuses the
+// round: the head never saw the pixels.
 int32_t mlx_llama_seq_spec_step(mlx_llama_ctx *c, int32_t seq, int32_t id_last, int32_t max_drafts,
                                 float temperature, int32_t top_k, float top_p, float min_p, uint64_t *rng,
                                 int32_t *out, char *err, size_t errlen);
+
+// ── vision (llama.cpp's mtmd) ─────────────────────────────────────────────
+//
+// A vision projector (an mmproj GGUF) turns images into the embeddings the
+// text model reads. The prompt carries a media marker ("<__media__>") where
+// each image sits; the marker is tokenized like any other word, and the
+// projector replaces it with the model's own vision tokens.
+
+// Attach a projector to the engine, replacing one attached earlier. 0 ok,
+// -1 on failure (`err` filled; the engine keeps its old projector).
+int32_t mlx_llama_attach_vision(mlx_llama_engine *e, const char *mmproj_path, char *err, size_t errlen);
+// True when a projector is attached and it takes images.
+bool    mlx_llama_has_vision(mlx_llama_engine *e);
+// The media marker a multimodal prompt must carry. Borrowed, static.
+const char *mlx_llama_media_marker(mlx_llama_engine *e);
+
+// One image of a multimodal prompt.
+typedef struct {
+    int32_t  at;                   // the token index where the marker's first token sits
+    uint32_t width;                // pixels
+    uint32_t height;               // pixels
+    const unsigned char * pixels;  // RGB8, width*height*3 bytes
+} mlx_llama_image;
+
+// Evaluate a multimodal prompt on `seq`.
+//
+// `prompt` holds the prompt's token ids (the media marker tokenized as
+// ordinary text), `images` the pictures in prompt order (each one at the
+// token index where its marker starts) and `marker` the marker's own token
+// ids. The prompt's text tokens are decoded as they are; each image is
+// encoded by the projector and decoded in the model's place.
+//
+// The sequence is cold-prefilled: it is cleared first, so no KV from an
+// earlier request leaks into this one. `out_expanded` receives the expanded
+// prompt length (the KV cells the prompt took: the text plus the images'
+// patches). `max_tokens` is the requested generation budget, reduced in place
+// to the space remaining after expansion.
+//
+// `cancelled` is polled between the images and between the text decode's
+// chunks; when it returns true the prompt is abandoned and the sequence is
+// left cleared. 0 ok, -1 on failure (`err` filled; the sequence is left
+// cleared), -2 a refusal the caller can fix: `err` names it (the expanded
+// prompt leaves no generation space in the context, or a non-causal projector
+// needs an image inside one ubatch).
+int32_t mlx_llama_seq_sync_images(mlx_llama_ctx *c, int32_t seq,
+                                  const int32_t *prompt, int32_t n_prompt,
+                                  const mlx_llama_image *images, int32_t n_images,
+                                  const int32_t *marker, int32_t n_marker,
+                                  uint32_t *max_tokens,
+                                  uint32_t *out_expanded,
+                                  bool (*cancelled)(void *), void *cancel_ud,
+                                  char *err, size_t errlen);
 
 #ifdef __cplusplus
 }

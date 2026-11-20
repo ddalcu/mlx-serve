@@ -55,10 +55,9 @@ pub fn loopStopDecision(generated_ids: []const u32, fresh: usize) ?LoopStop {
     return .{ .tier = d.tier, .trim_start = d.start };
 }
 
-/// `loopStopDecision` for a slot: none for a request that ignores EOS, which reaches the engine as an empty EOS set
-/// (`requestEosSlice`) and runs to `max_tokens` by contract; bench clients force equal decode lengths with it.
-fn slotLoopStop(eos_token_ids: []const u32, generated_ids: []const u32, fresh: usize) ?LoopStop {
-    if (eos_token_ids.len == 0) return null;
+/// Requests explicitly ignoring EOS run to max_tokens; a missing EOS list does not disable the guard.
+fn slotLoopStop(ignore_eos: bool, generated_ids: []const u32, fresh: usize) ?LoopStop {
+    if (ignore_eos) return null;
     return loopStopDecision(generated_ids, fresh);
 }
 
@@ -93,7 +92,6 @@ fn loopRecoveryAction(tb: ?*generate_mod.ThinkBound, ids: []const u32, completio
     return .close_thought;
 }
 
-
 /// Every single-slot decode tick funnels through here, so a decode-time MLX failure is
 /// attributed to the slot whose forward raised it instead of the next request's prefill.
 /// The repetition-loop guard every decode tick runs first. True = the slot was finished here.
@@ -108,7 +106,7 @@ pub fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     const generated = gen.generated_ids.items.len;
     const fresh = generated -| slot.loop_guard_seen;
     slot.loop_guard_seen = generated;
-    if (slotLoopStop(slot.eos_token_ids, gen.generated_ids.items[loop_guard_start..], fresh)) |relative_stop| cut: {
+    if (slotLoopStop(slot.sampling.ignore_eos, gen.generated_ids.items[loop_guard_start..], fresh)) |relative_stop| cut: {
         if (toolCallHoldsCut(slot, gen, relative_stop.tier)) break :cut;
         if (gen.hasPrePayloadConstraint()) {
             switch (try gen.forceConstraintTransition(slot.allocator)) {
@@ -243,9 +241,8 @@ test "slotLoopStop: a request that ignores EOS runs to its cap, every other requ
     for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| {
         try ids.appendSlice(testing.allocator, &[_]u32{ 101, 102, 103 });
     }
-    try testing.expect(slotLoopStop(&[_]u32{1}, ids.items, 1) != null);
-    // `ignore_eos` reaches the engine as an empty EOS set (`requestEosSlice`): only max_tokens ends that reply.
-    try testing.expect(slotLoopStop(&.{}, ids.items, 1) == null);
+    try testing.expect(slotLoopStop(false, ids.items, 1) != null);
+    try testing.expect(slotLoopStop(true, ids.items, 1) == null);
 }
 
 test "loopStopReason: periods past the long tier stay uncut" {
