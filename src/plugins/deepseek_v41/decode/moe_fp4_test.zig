@@ -842,3 +842,151 @@ test "dsv41 dec moe_fp4 rules: NaN through the dot, the per-expert scales and th
         try expectSameBits("nan/clamp", .{ .name = "edge", .k = K, .n = N, .topk = 1 }, f, R, got_a, comp_a);
     }
 }
+
+// ── NVIDIA's NVFP4 experts through the plugin (`dsv41_nvfp4_pack.py --experts-nvfp4`) ──
+
+const fixture = @import("fixture.zig");
+const env = @import("../../../env.zig");
+
+test "dsv41 nvfp4 experts: the load reads MLX nvfp4 banks with their per-expert scales, and refuses a partial or non-finite set and scales beside mxfp4 by name" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const base: fixture.Opts = .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .experts_nvfp4 = true, .expert_scales = .all };
+    const fx = try fixture.Fixture.init(gpa, base);
+    defer fx.deinit();
+    const e = &fx.layer(20).experts;
+    try testing.expectEqual(fp4.Format.nvfp4, fp4.of(e.gu.?.qp.mode, e.gu.?.qp.group_size).?);
+    try testing.expectEqual(fp4.Format.nvfp4, fp4.of(e.down.qp.mode, e.down.qp.group_size).?);
+    for (e.scale) |v| try testing.expect(v != null);
+    var o = base;
+    o.expert_scales = .missing_up;
+    try testing.expectError(error.Dsv41ExpertScales, fixture.Fixture.init(gpa, o));
+    o.expert_scales = .nan_gate;
+    try testing.expectError(error.Dsv41ExpertScales, fixture.Fixture.init(gpa, o));
+    o = base;
+    o.experts_nvfp4 = false;
+    o.experts_fp4 = true;
+    try testing.expectError(error.Dsv41ExpertScales, fixture.Fixture.init(gpa, o));
+}
+
+test "dsv41 nvfp4 experts: the route carries each pick's down scale, bit for bit the unscaled weight times it" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .experts_nvfp4 = true, .expert_scales = .all });
+    defer fx.deinit();
+    const ly = fx.layer(20);
+    var bare = ly.*;
+    bare.experts.scale = .{ null, null, null };
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const x = try sc.keep(try fx.normal(&.{ decode.max_rows, ci(fx.m.cfg.hidden_size) }, .bfloat16, 0, 1));
+    const r = try dsv41.route(&sc, fx.m, ly, x, none);
+    const r0 = try dsv41.route(&sc, fx.m, &bare, x, none);
+    const want = try sc.mul(r0.wts, try sc.take(ly.experts.scale[2].?, r0.idx, 0));
+    const ia = try dsv41.hostF32(r.idx);
+    defer gpa.free(ia);
+    const ib = try dsv41.hostF32(r0.idx);
+    defer gpa.free(ib);
+    try testing.expectEqualSlices(f32, ib, ia);
+    const a = try dsv41.hostF32(r.wts);
+    defer gpa.free(a);
+    const b = try dsv41.hostF32(want);
+    defer gpa.free(b);
+    for (a, b) |p, q| try testing.expectEqual(@as(u32, @bitCast(q)), @as(u32, @bitCast(p)));
+}
+
+/// The layer's MoE output `[L, D]` in f32 from the dequantized banks: the gate and up outputs times their expert's
+/// scale, the clamped SwiGLU, the down rows, the picks weighted by `wts` (the route already holds the down scale), plus
+/// the shared expert.
+fn moeTruth(sc: *Scope, ly: *const dsv41.Layer, h: A, idx: A, wts: A, lim: f32) !A {
+    const gu = ly.experts.gu.?;
+    const L = dims(h, 0);
+    const k = dims(idx, 1);
+    const n = dims(gu.w, 1) / 2;
+    const E = dims(gu.w, 0);
+    const hf = try astype(sc, h, .float32);
+    const hu = try sc.matmul(hf, try sc.transpose(try dequantF32(sc, gu.w, gu.s, gu.qp), &.{ 0, 2, 1 })); // [E, L, 2N]
+    var g = try sc.slice(hu, -1, 0, n);
+    var u = try sc.slice(hu, -1, n, 2 * n);
+    if (ly.experts.scale[0]) |v| g = try sc.mul(g, try reshape(sc, try astype(sc, v, .float32), &.{ ci(E), 1, 1 }));
+    if (ly.experts.scale[1]) |v| u = try sc.mul(u, try reshape(sc, try astype(sc, v, .float32), &.{ ci(E), 1, 1 }));
+    const a = try dsv41.clampedSwiglu(sc, g, u, lim);
+    const dn = try sc.transpose(try sc.matmul(a, try sc.transpose(try dequantF32(sc, ly.experts.down.w, ly.experts.down.s, ly.experts.down.qp), &.{ 0, 2, 1 })), &.{ 1, 0, 2 }); // [L, E, D]
+    const picked = try sc.takeAlong(dn, try reshape(sc, idx, &.{ ci(L), ci(k), 1 }), 1);
+    const routed = try sc.sum(try sc.mul(picked, try reshape(sc, wts, &.{ ci(L), ci(k), 1 })), 1, false);
+    const sgu = ly.shared_gu.?;
+    const su = try sc.matmul(hf, try sc.transpose(try dequantF32(sc, sgu.w, sgu.s, sgu.qp), &.{ 1, 0 }));
+    const sa = try dsv41.clampedSwiglu(sc, try sc.slice(su, -1, 0, n), try sc.slice(su, -1, n, 2 * n), lim);
+    return sc.add(routed, try sc.matmul(sa, try sc.transpose(try dequantF32(sc, ly.shared[2].w, ly.shared[2].s, ly.shared[2].qp), &.{ 1, 0 })));
+}
+
+fn relRms(a: []const f32, t: []const f32) f64 {
+    var e: f64 = 0;
+    var s: f64 = 0;
+    for (a, t) |x, r| {
+        e += (x - r) * (x - r);
+        s += @as(f64, r) * r;
+    }
+    return @sqrt(e / s);
+}
+
+test "dsv41 nvfp4 experts: decode (composed and the fused fp4 kernels) and prefill with the per-expert scales stay within the f32 model's bar" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .experts_nvfp4 = true, .expert_scales = .all, .fused = true });
+    defer fx.deinit();
+    const m = fx.m;
+    const ly = fx.layer(20);
+    const lim = m.cfg.dsv4_swiglu_limit;
+    const d = m.cfg.hidden_size;
+    const hc = m.cfg.dsv4_hc_mult;
+    // On a NAX GPU the fused kernels serve only under their switch.
+    const sw = env.override(.MLX_SERVE_DSV41_MOE_FP4_NAX, "1");
+    defer sw.restore();
+    for ([_]usize{ 1, decode.max_rows, 2048 }) |L| {
+        var sc = Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const h = try sc.keep(try fx.normal(&.{ ci(L), ci(d) }, .bfloat16, 0, 1));
+        const r = try dsv41.route(&sc, m, ly, h, none);
+        const truth = try moeTruth(&sc, ly, h, r.idx, r.wts, lim);
+        const comp = try sc.add(try dsv41.routed(&sc, m, ly, h, r.idx, r.wts), try astype(&sc, try dsv41.shared(&sc, m, ly, h), .float32));
+        var label: [64]u8 = undefined;
+        if (L > decode.max_rows) {
+            // The prompt: the sorted gathers (`moePrefill`, through `moeShare`).
+            const got = try sc.keep(try dsv41.moeShare(m, gpa, 20, h, r.idx, r.wts));
+            const g = try dsv41.hostF32(got);
+            defer gpa.free(g);
+            const c = try dsv41.hostF32(comp);
+            defer gpa.free(c);
+            const t = try dsv41.hostF32(truth);
+            defer gpa.free(t);
+            const eg = relRms(g, t);
+            const ec = relRms(c, t);
+            std.debug.print("[nvfp4 experts] prefill L={d}: prefill-truth {e:.2}, composed-truth {e:.2}\n", .{ L, eg, ec });
+            try testing.expect(ec < 1e-2);
+            try testing.expect(eg <= 1.25 * ec + 1e-4);
+            continue;
+        }
+        // Decode: the fused kernels (they must take the layer: null is a decline) against the composed path, both
+        // through the hc expand.
+        const x1 = try sc.keep(try fx.stream(L));
+        const sp: dsv41.Split = .{ .pre = none, .post = try sc.keep(try fx.uniform(&.{ ci(L), ci(hc) }, 0.05, 1.5)), .comb = try sc.keep(try fx.uniform(&.{ ci(L), ci(hc), ci(hc) }, -0.5, 0.5)) };
+        const got = (try dsv41.ffnDecode(&sc, m, ly, h, r.idx, r.wts, x1, &sp)) orelse return error.Fp4KernelsDeclined;
+        const want = try dsv41.hcExpand(&sc, x1, try astype(&sc, comp, .bfloat16), &sp);
+        const tx = try dsv41.hcExpand(&sc, try astype(&sc, x1, .float32), truth, &sp);
+        const g = try dsv41.hostF32(got);
+        defer gpa.free(g);
+        const w = try dsv41.hostF32(want);
+        defer gpa.free(w);
+        const t = try dsv41.hostF32(tx);
+        defer gpa.free(t);
+        try decode.expectNoWorse(try std.fmt.bufPrint(&label, "nvfp4 experts decode R={d}", .{L}), g, w, t);
+        // The routed part alone: the composed path holds the scales (a scale left out moves it far more than this).
+        const c = try dsv41.hostF32(comp);
+        defer gpa.free(c);
+        const tr = try dsv41.hostF32(truth);
+        defer gpa.free(tr);
+        std.debug.print("[nvfp4 experts] decode R={d}: composed-truth {e:.2}\n", .{ L, relRms(c, tr) });
+        try testing.expect(relRms(c, tr) < 1e-2);
+    }
+}
