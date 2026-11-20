@@ -26,9 +26,10 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   `flash_attn`: the lossy flash kernel, default on beside a plugin bank only).
 - `spec/markov.zig`: DSpark's Markov chain in B + 1 launches; `decode/engram_decode.zig` the Engram LRU,
   `decode/gemv_twin.zig` the batched GEMV twin of MLX's M=1 words.
-- `decode/moe_fp4.zig`: the MoE's two launches over mxfp4 routed experts (the Lossless pack), rows 1..6, built only
-  without NAX (unmeasured on M5); `moe_up` / `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or
-  128 (the expert-pruned packs are 2-bit g128). Otherwise `routed` runs.
+- `decode/moe_fp4.zig`: the MoE's two launches over fp4 routed experts (MXFP4, the Lossless pack; NVFP4 with ModelOpt's
+  per-expert scales through `moeUpScaled`), rows 1..6, built only without NAX (unmeasured on M5); `moe_up` /
+  `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or 128 (the expert-pruned packs are 2-bit g128).
+  Otherwise `routed` runs.
 - GGUF expert banks (`--mlx-gguf`, ISTA's GSQ-RCO sets) decode up to `region_rows` through `ffnDecodeGguf`
   (`moe_gu_gguf` + `moe_dn_gguf`, built per ggml type by `gguf.pluginKernel`) and prefill on the matrix units
   (`gguf.gatherNaxSwiGLU`), a K-quant bank a 32-weight slice at a time (`deq_<type>_s`); Q3_K decodes `routed`.
