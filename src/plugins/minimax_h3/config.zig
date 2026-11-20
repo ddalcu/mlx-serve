@@ -243,7 +243,10 @@ pub fn plan(in: PlanIn) Plan {
     if (in.may_keep and keepResident(avail, in.cache_now, need, margin)) {
         const set = need - @max(in.activations, init_held);
         const lift = encodeLift(in.billed_lift, in.total_ram, (avail +| in.cache_now) -| margin, set + in.encode_held);
-        return .{ .resident = set + @max(in.activations, init_held + (if (in.init) lift else 0)), .lift = lift };
+        // What the cache holds afterwards: the weights and the request's activations. The clip's f32 copies and the
+        // encode's lift are freed when the request ends, so counting them would let the next request keep the set
+        // on room that is not there.
+        return .{ .resident = set + in.activations, .lift = lift };
     }
     if (in.init and avail > 0 and sz.video_vae + in.encode_held > avail)
         return .{ .refused = .{ .what = .encode, .need = sz.video_vae + in.encode_held, .avail = avail } };
@@ -526,6 +529,18 @@ test "h3 plan: the encode lifts into what the plan leaves of free memory less th
             try std.testing.expect(flash8.video_vae + q.held + q.p.lift + margin <= free);
         }
     };
+}
+
+test "h3 plan: the resident set's bytes leave out the init clip and the encode lift" {
+    const GB: u64 = 1 << 30;
+    // 256 GB Mac, nothing else running: resident either way, and the init request really gets a lift.
+    const plain = flashPlan(256 * GB, 240 * GB, 0, 1344, 768, 124, false);
+    const clip = flashPlan(256 * GB, 240 * GB, 0, 1344, 768, 124, true);
+    try std.testing.expect(plain.p.resident != null and clip.p.resident != null);
+    try std.testing.expect(clip.p.lift > 0);
+    // The cache keeps weights + activations after either request; the clip and the lift are gone by then.
+    try std.testing.expectEqual(plain.p.resident.?, clip.p.resident.?);
+    try std.testing.expectEqual(residentBytes(flash8.te, flash8.dit_file, flash8.video_vae + flash8.audio_vae, 0, clip.in.activations), clip.p.resident.?);
 }
 
 test "h3 plan: other apps' memory shrinks the lift, and an encode that cannot fit even unlifted is refused" {
