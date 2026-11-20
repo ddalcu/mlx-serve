@@ -1,6 +1,5 @@
 //! The [spec-stats] and QSA arm log lines.
 const std = @import("std");
-const mlx_stream = @import("../modules/stream.zig");
 const log = @import("../../../sdk/util/log.zig");
 const plugin_settle = @import("../plugin/settle.zig");
 const round_cost = @import("round_cost.zig");
@@ -9,11 +8,6 @@ const StepTrace = @import("../generate/step.zig").StepTrace;
 const mtpDepthPolicy = @import("mtp/ev_plan.zig").mtpDepthPolicy;
 const mtpDepthPolicyFor = @import("mtp/ev_plan.zig").mtpDepthPolicyFor;
 
-
-/// The `[spec-stats] mode=` word of an mlx-stream lane: the first word of the plugin's lane name.
-fn laneMode(lane: []const u8) []const u8 {
-    return lane[0 .. std.mem.indexOfScalar(u8, lane, ' ') orelse lane.len];
-}
 
 /// Emit a stable, easy-to-grep one-line summary of spec-decode acceptance
 /// for this request. External tooling parses the `[spec-stats]` prefix;
@@ -63,17 +57,6 @@ pub fn logSpecStats(self: *const Generator) void {
     if (self.dspark_enabled and self.dspark_attempted > 0) {
         const avg_per_round: f64 = @as(f64, @floatFromInt(self.dspark_accepted_tokens)) /
             @as(f64, @floatFromInt(self.dspark_attempted));
-        if (self.xfm.mlx_stream_ext) |m| {
-            // The plugin's lane names the mode (DeepSeek-V4.1: dspark, MiMo: mtp).
-            const lane = mlx_stream.laneName(m);
-            log.info(
-                "  [spec-stats] mode={s} attempts={d} accepts={d} avg_per_round={d:.2} plugin=mlx-stream lane=\"{s}\"\n",
-                .{ laneMode(lane), self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round, lane },
-            );
-            var lane_buf: [512]u8 = undefined;
-            if (mlx_stream.laneReceipt(m, &lane_buf)) |line| if (line.len > 0) log.info("  [spec-stats] {s}\n", .{line});
-            return;
-        }
         log.info(
             "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2} stage_rounds={d} copy_rounds={d} copy_drafted={d} copy_accepted={d} group_rounds={d}\n",
             .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round, self.dspark_attempted - self.dspark_copies, self.dspark_copies, self.dspark_copy_drafted, self.dspark_copy_accepted, self.dspark_group_rounds },
@@ -219,9 +202,3 @@ pub fn logSpecStats(self: *const Generator) void {
 
 // ── tests ──
 
-
-test "laneMode: the spec-stats mode is the first word of the lane name" {
-    try std.testing.expectEqualStrings("dspark", laneMode("dspark typical 0.3"));
-    try std.testing.expectEqualStrings("mtp", laneMode("mtp typical 0.5 depth 2"));
-    try std.testing.expectEqualStrings("serial", laneMode("serial"));
-}

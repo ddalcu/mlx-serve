@@ -2,13 +2,11 @@
 //! Owns defaultCtx, module_owned_state_fields, module_shared_readonly_fields, ownsModuleDecodeState, sharesModuleReadonlyState, moduleSpecWiring, and 7 more.
 
 const std = @import("std");
-const mlx_stream_mod = @import("modules/stream.zig");
 const distributed_mod = @import("cluster/distributed.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const abi = @import("../../abi/plugin.zig");
 const ForwardCtx = @import("forward_ctx.zig").ForwardCtx;
 const testing = @import("kv/cache.zig").testing;
-const forwardMlxStream = @import("modules/mlx_stream.zig").forwardMlxStream;
 const Transformer = @import("transformer.zig").Transformer;
 const plugin_driver = @import("plugin/driver.zig");
 const intree = @import("plugin/intree.zig");
@@ -35,7 +33,7 @@ pub fn defaultCtx(self: *Transformer) ForwardCtx {
 /// slot deinits and rebuilds the live request's state and both then append
 /// to the ONE state. Add a new arm here the moment its pointer field is
 /// added above, or the arch serves two clients one mangled stream.
-pub const module_owned_state_fields = [_][]const u8{"mlx_stream_ext"};
+pub const module_owned_state_fields = [_][]const u8{};
 
 /// Module pointer fields that hold READ-ONLY per-model state (qwen4: the trunk module with the
 /// n-gram hash + mmapped table). Every per-request thing lives on the
@@ -87,10 +85,9 @@ pub fn moduleSpecWiring(self: *const Transformer) bool {
 /// pinned against fresh forwards at every accepted count. dsv4 cannot:
 /// its rings and compressed caches have no per-position capture, and it
 /// has DSpark for drafting anyway.
-/// mlx-stream runs its own prompt pass: the generator hands it the whole prompt in one forward.
 pub fn prefillsWholePrompt(self: *const Transformer) bool {
-    if (servedCaps(self)) |c| if (c.whole_prompt_prefill) return true;
-    return self.mlx_stream_ext != null;
+    if (servedCaps(self)) |c| return c.whole_prompt_prefill;
+    return false;
 }
 
 /// DeepSeek's own DSpark draft stages (V4 or V4.1) loaded on this model.
@@ -98,7 +95,6 @@ pub fn dsparkStages(self: *const Transformer) usize {
     if (intree.dsv4(self)) |m| return m.n_mtp;
     if (intree.dsv41(self)) |m| return m.n_mtp;
     if (plugin_driver.nativeStages(self) > 0) return plugin_driver.nativeStages(self);
-    if (self.mlx_stream_ext) |m| return @intFromBool(mlx_stream_mod.blockSize(m) > 0);
     return 0;
 }
 
@@ -129,7 +125,6 @@ pub fn forward(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
 pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
     if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
     if (self.plugin) |b| return plugin_driver.forward(self, b, ctx, token_ids);
-    if (self.mlx_stream_ext) |m| return forwardMlxStream(self, ctx, token_ids, m);
     return error.PluginDeclinedNoLegacy;
 }
 
@@ -151,12 +146,7 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     var t: Transformer = undefined;
     t.plugin = null;
     t.rht = null;
-    t.mlx_stream_ext = null;
     try testing.expect(!t.ownsModuleDecodeState());
-
-    var fake_ext: mlx_stream_mod.Model = undefined;
-    t.mlx_stream_ext = &fake_ext;
-    try testing.expect(t.ownsModuleDecodeState());
 }
 
 test "every optional pointer on Transformer is declared module-owned, shared read-only or engine-owned" {

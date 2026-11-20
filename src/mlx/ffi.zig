@@ -618,6 +618,7 @@ pub extern "c" fn mlx_fast_metal_kernel_config_free(cls: mlx_fast_metal_kernel_c
 pub extern "c" fn mlx_fast_metal_kernel_config_add_output_arg(cls: mlx_fast_metal_kernel_config, shape: [*]const c_int, size: usize, dtype: mlx_dtype) c_int;
 pub extern "c" fn mlx_fast_metal_kernel_config_set_grid(cls: mlx_fast_metal_kernel_config, g1: c_int, g2: c_int, g3: c_int) c_int;
 pub extern "c" fn mlx_fast_metal_kernel_config_set_thread_group(cls: mlx_fast_metal_kernel_config, t1: c_int, t2: c_int, t3: c_int) c_int;
+pub extern "c" fn mlx_fast_metal_kernel_config_set_init_value(cls: mlx_fast_metal_kernel_config, value: f32) c_int;
 pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int;
 pub extern "c" fn mlx_any_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c_int) c_int;
@@ -1338,10 +1339,11 @@ pub fn mlxErrorIsMemory(msg: []const u8) bool {
     return false;
 }
 
-/// CUDA's sticky errors: once one is raised, every later call in the context fails the same
-/// way, so the process can serve nothing until it restarts.
+/// CUDA's sticky errors, and Metal ignoring a process whose command buffers caused GPU errors: once
+/// one is raised, every later call fails the same way, so the process can serve nothing until it restarts.
 pub fn mlxErrorIsContextLost(msg: []const u8) bool {
     const needles = [_][]const u8{
+        "kIOGPUCommandBufferCallbackErrorSubmissionsIgnored",
         "an illegal memory access was encountered",
         "an illegal instruction was encountered",
         "misaligned address",
@@ -1354,6 +1356,29 @@ pub fn mlxErrorIsContextLost(msg: []const u8) bool {
         if (std.mem.indexOf(u8, msg, n) != null) return true;
     }
     return false;
+}
+
+/// Metal's watchdog cancelled a command buffer that ran too long, as it does while the OS makes room in
+/// RAM. The device stays usable, so the work can be retried.
+pub fn mlxErrorIsGpuTimeout(msg: []const u8) bool {
+    return std.mem.indexOf(u8, msg, "kIOGPUCommandBufferCallbackErrorTimeout") != null or
+        std.mem.indexOf(u8, msg, "GPU Timeout Error") != null;
+}
+
+/// Waits out the GPU work still in flight: after a failure the rest of a failed eval's command buffers keep
+/// failing, and their errors must latch before the caller drops them, not during the next load.
+pub fn drainGpu() void {
+    const s = gpuStream();
+    defer _ = mlx_stream_free(s);
+    _ = mlx_synchronize(s);
+}
+
+/// True when an error is latched and `pred` holds for its message; the latch stays.
+pub fn latchedErrorIs(comptime pred: fn ([]const u8) bool) bool {
+    if (!latch().mlx_error_latched.load(.acquire)) return false;
+    lockErrBuf();
+    defer unlockErrBuf();
+    return pred(latch().mlx_error_buf[0..latch().mlx_error_len]);
 }
 
 /// True once the latch has seen a sticky CUDA error: requests are refused, /health says so.
@@ -1620,6 +1645,8 @@ test "a sticky CUDA error marks the GPU context lost; any other error does not" 
 
     try t.expect(mlxErrorIsContextLost("cudaGraphLaunch(graph_exec, stream_) failed: an illegal memory access was encountered at array.cpp:352"));
     try t.expect(mlxErrorIsContextLost("cuLaunchKernelEx(&config, func, params, nullptr) failed: unspecified launch failure"));
+    try t.expect(mlxErrorIsContextLost("[METAL] Command buffer execution failed: Ignored (for causing prior/excessive GPU errors) (00000004:kIOGPUCommandBufferCallbackErrorSubmissionsIgnored)"));
+    try t.expect(!mlxErrorIsContextLost("[METAL] Command buffer execution failed: Caused GPU Timeout Error (00000002:kIOGPUCommandBufferCallbackErrorTimeout)"));
     try t.expect(!mlxErrorIsContextLost("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15"));
     try t.expect(!mlxErrorIsContextLost("cudaMallocAsync(&data, size, stream) failed: out of memory"));
 

@@ -21,7 +21,9 @@ private struct AudioPresetReplica {
 private let audioPresetsReplica: [AudioPresetReplica] = [
     .init(id: "mlx-audio/qwen3-tts-0.6b-base-8bit", repo: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit", approxRAMGB: 3),
     .init(id: "mlx-audio/qwen3-tts-0.6b-base",      repo: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16", approxRAMGB: 4),
+    .init(id: "mlx-audio/ming-3.0-tts-0.5b-8bit",   repo: "mlx-community/Ming-3.0-tts-0.5B-8bit",        approxRAMGB: 4),
     .init(id: "mlx-audio/qwen3-tts-1.7b-base-8bit", repo: "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit", approxRAMGB: 5),
+    .init(id: "mlx-audio/ming-3.0-tts-0.5b",        repo: "mlx-community/Ming-3.0-tts-0.5B-bf16",        approxRAMGB: 6),
     .init(id: "mlx-audio/qwen3-tts-1.7b-base",      repo: "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16", approxRAMGB: 8),
 ]
 

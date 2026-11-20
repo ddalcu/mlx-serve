@@ -4,7 +4,10 @@
 # ~4k-token prefill B and a 30-token request C sent 0.8 s into B. [1] with a share, C's first-token wait is under half
 # of B's remaining prefill; [2] at share 0 it is at least 80% (that schedule must not change); [3] every request ends
 # with text; [4] only the share arm logs `[boundary] admitted`; [5] C dropping while it waits, and B dropping after C
-# was admitted, leave every other request finishing and the server answering.
+# was admitted, leave every other request finishing and the server answering; [6] at the default share a C whose
+# tail is past the boundary limit, sent on /v1/chat/completions, /v1/messages and /api/generate, waits under half of a
+# longer B's remaining prefill with `X-MLX-Priority: high` and at least 80% without it, and each route logs its
+# priority admission with a prompt between the two limits (B and C are sized through /tokenize).
 #
 #   BOUNDARY_TEST_MODEL=<dir> BINARY=./zig-out/bin/mlx-serve ./tests/test_boundary_admission.sh [port]
 #
@@ -38,42 +41,105 @@ if [ ! -d "$MODEL" ]; then
 fi
 
 cat > "$WORK/probe.py" <<'PYEOF'
-import json, random, sys, threading, time, urllib.request
+import json, random, re, sys, threading, time, urllib.request
 
 PORT = int(sys.argv[1])
 B_WORDS = int(sys.argv[2])
 MODE = sys.argv[3] if len(sys.argv) > 3 else "normal"
-URL = f"http://127.0.0.1:{PORT}/v1/chat/completions"
+LOG = sys.argv[4] if len(sys.argv) > 4 else ""
+BASE = f"http://127.0.0.1:{PORT}"
+ROUTES = {"chat": "/v1/chat/completions", "messages": "/v1/messages", "generate": "/api/generate"}
+# The priority arm's B is long enough to host C several times over; C is past the 1024-token boundary limit and well
+# under the 8192 priority limit, so it is admitted after about three of B's chunks.
+P_B_TOKENS = 24 * 1024
+C_TOKENS = 3 * 1024
+ADMITTED = re.compile(r"\[boundary\] admitted a (\d+)-token priority request")
 
 
-def stream(payload, out, abort_after=None):
+def parse(route, line, out):
+    """One line of a stream into `out`: text, finish reason and prompt tokens, in the route's wire format."""
+    text = None
+    if route == "generate":
+        obj = json.loads(line)
+        text = obj.get("response")
+        if obj.get("done"):
+            out["finish"] = obj.get("done_reason") or "stop"
+            out["prompt_tokens"] = obj.get("prompt_eval_count")
+    elif line.startswith("data: ") and line != "data: [DONE]":
+        obj = json.loads(line[6:])
+        if route == "messages":
+            kind = obj.get("type")
+            if kind == "message_start":
+                out["prompt_tokens"] = obj["message"]["usage"]["input_tokens"]
+            elif kind == "content_block_delta":
+                text = obj["delta"].get("text")
+            elif kind == "message_delta" and obj["delta"].get("stop_reason"):
+                out["finish"] = obj["delta"]["stop_reason"]
+        else:
+            if obj.get("usage"):
+                out["prompt_tokens"] = obj["usage"].get("prompt_tokens")
+            for ch in obj.get("choices", []):
+                text = ch.get("delta", {}).get("content") or text
+                if ch.get("finish_reason"):
+                    out["finish"] = ch["finish_reason"]
+    if text:
+        out.setdefault("first", time.monotonic())
+        out["text"].append(text)
+
+
+def stream(payload, out, abort_after=None, priority=False, route="chat"):
     """Records request start, the time of the first content chunk, the text and the finish reason.
     `abort_after` seconds after the start the client drops the connection."""
     out["start"] = time.monotonic()
     out["text"] = []
-    req = urllib.request.Request(URL, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if priority:
+        headers["X-MLX-Priority"] = "high"
+    req = urllib.request.Request(BASE + ROUTES[route], data=json.dumps(payload).encode(), headers=headers)
     with urllib.request.urlopen(req, timeout=600) as r:
         if abort_after is not None:
             threading.Timer(abort_after, r.close).start()
         for raw in r:
             line = raw.decode("utf-8", "replace").strip()
-            if not line.startswith("data: ") or line == "data: [DONE]":
-                continue
-            obj = json.loads(line[6:])
-            for ch in obj.get("choices", []):
-                d = ch.get("delta", {}).get("content")
-                if d:
-                    out.setdefault("first", time.monotonic())
-                    out["text"].append(d)
-                if ch.get("finish_reason"):
-                    out["finish"] = ch["finish_reason"]
+            if line:
+                parse(route, line, out)
     out["end"] = time.monotonic()
 
 
 def payload(content, max_tokens):
     return {"model": "mlx-serve", "temperature": 0.0, "max_tokens": max_tokens, "stream": True,
             "messages": [{"role": "user", "content": content}]}
+
+
+def route_payload(route, content, max_tokens):
+    if route == "messages":
+        return {"model": "mlx-serve", "temperature": 0.0, "max_tokens": max_tokens, "stream": True,
+                "messages": [{"role": "user", "content": content}]}
+    if route == "generate":
+        return {"model": "mlx-serve", "prompt": content, "stream": True,
+                "options": {"temperature": 0.0, "num_predict": max_tokens}}
+    p = payload(content, max_tokens)
+    p["stream_options"] = {"include_usage": True}
+    return p
+
+
+def tokens(text):
+    req = urllib.request.Request(BASE + "/tokenize", data=json.dumps({"content": text, "add_special": False}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return len(json.load(r)["tokens"])
+
+
+def sized(stem, target):
+    """Words `<stem><i>` of about `target` tokens in this model's tokenizer."""
+    sample = 200
+    n = max(1, round(sample * target / tokens(" ".join(f"{stem}{i}" for i in range(sample)))))
+    return " ".join(f"{stem}{i}" for i in range(n))
+
+
+def priority_admissions():
+    with open(LOG, errors="replace") as f:
+        return [int(n) for n in ADMITTED.findall(f.read())]
 
 
 def survived(out):
@@ -114,8 +180,42 @@ def cancel_case(drop):
     return all(survived(x) for x in expect_ok)
 
 
+def priority_case(priority, route):
+    """B prefills beside a decoding A; C, sent on `route` 0.8 s into B, has a tail past the boundary limit."""
+    a, b, c = {}, {}, {}
+    salt = random.randint(0, 10**9)
+    words = sized(f"w{salt}x", P_B_TOKENS)
+    c_body = route_payload(route, f"Reply with the single word ok. {sized(f'p{salt}y', C_TOKENS)}", 4)
+    ta = threading.Thread(target=stream, args=(payload("Count from 1 to 400, one number per line.", 800), a))
+    ta.start()
+    while len(a.get("text", [])) < 20:
+        time.sleep(0.01)
+    tb = threading.Thread(target=stream, args=(payload(f"Summarize in one word. {words}", 4), b))
+    tb.start()
+    time.sleep(0.8)
+    tc = threading.Thread(target=stream, args=(c_body, c, None, priority, route))
+    tc.start()
+    tc.join()
+    tb.join()
+    ta.join()
+    ratio = (c.get("first", c["end"]) - c["start"]) / max(1e-3, b["end"] - c["start"])
+    return ratio, all(x.get("finish") for x in (a, b, c)), c.get("prompt_tokens")
+
+
 if MODE == "cancel":
     print(json.dumps({"cancel_c": cancel_case("c"), "cancel_b": cancel_case("b")}))
+    sys.exit(0)
+
+if MODE == "priority":
+    out = {}
+    for route in ROUTES:
+        before = len(priority_admissions())
+        with_r, with_ok, c_tokens = priority_case(True, route)
+        admitted = priority_admissions()[before:]
+        without_r, without_ok, _ = priority_case(False, route)
+        out[route] = {"with": with_r, "without": without_r, "finished": with_ok and without_ok,
+                      "c_tokens": c_tokens, "admitted": admitted}
+    print(json.dumps(out))
     sys.exit(0)
 
 a, b, c = {}, {}, {}
@@ -177,6 +277,17 @@ python3 "$WORK/probe.py" "$PORT" "$B_WORDS" cancel > "$WORK/cancel.json" || { ec
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || { echo "[fail] server stopped answering after the cancel cases"; exit 1; }
 kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
 
+# Priority on a default-share server: C past the boundary limit, with and without the header.
+"$BINARY" --serve --model "$MODEL" --host 127.0.0.1 --port "$PORT" --prefix-cache-entries 0 \
+    --max-concurrent 8 --prefill-chunk 1024 \
+    --log-level debug --log-file "$WORK/priority.log" >"$WORK/priority.stdout" 2>&1 &
+SERVER_PID=$!
+srv_wait_health "http://127.0.0.1:$PORT" 480 0.5 || { echo "[fail] server did not start (priority arm)"; exit 1; }
+for rep in 1 2 3; do
+    python3 "$WORK/probe.py" "$PORT" "$B_WORDS" priority "$WORK/priority.log" > "$WORK/priority.r$rep.json" || { echo "[fail] priority probe (rep $rep)"; exit 1; }
+done
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
+
 # ratio = C's wait over B's remaining prefill at C's arrival, median over reps 2 and 3.
 ratio() {
     python3 - "$WORK/$1.r2.json" "$WORK/$1.r3.json" <<'PY'
@@ -219,4 +330,26 @@ import json, sys
 r = json.load(open(sys.argv[1]))
 sys.exit(0 if r["cancel_c"] and r["cancel_b"] else 1)
 PY
-echo "[pass] a small request arriving mid-prefill is admitted at a chunk boundary; share 0 is unchanged; cancels at either end leave the rest finishing"
+# Per route, median over reps 2 and 3 of each priority arm; each rep's priority C logged its own admission.
+python3 - "$WORK/priority.r2.json" "$WORK/priority.r3.json" <<'PY' || { echo "[fail] priority arm: $(cat "$WORK"/priority.r?.json)"; exit 1; }
+import json, sys
+rs = [json.load(open(p)) for p in sys.argv[1:]]
+ok = True
+for route in rs[0]:
+    cs = [r[route] for r in rs]
+    w = sorted(c["with"] for c in cs)[len(cs) // 2]
+    wo = sorted(c["without"] for c in cs)[len(cs) // 2]
+    print(f"priority {route}: C wait / B remaining: with={w:.3f} without={wo:.3f}; C prompt tokens {[c['c_tokens'] for c in cs]}")
+    for c in cs:
+        if not (c["c_tokens"] and 1024 < c["c_tokens"] <= 8192):
+            print(f"[fail] {route}: fixture, C has {c['c_tokens']} prompt tokens, wants 1024 < N <= 8192")
+            ok = False
+        elif not any(1024 < n <= 8192 for n in c["admitted"]):
+            print(f"[fail] {route}: no priority admission logged for C (logged {c['admitted']})")
+            ok = False
+    if not (all(c["finished"] for c in cs) and w < 0.5 and wo >= 0.8):
+        print(f"[fail] {route}: with the header C must wait under half of B's remaining prefill, without it at least 80%")
+        ok = False
+sys.exit(0 if ok else 1)
+PY
+echo "[pass] a small request arriving mid-prefill is admitted at a chunk boundary; share 0 is unchanged; cancels at either end leave the rest finishing; a priority request past the boundary limit is admitted on every route"

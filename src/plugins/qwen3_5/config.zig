@@ -199,7 +199,7 @@ pub fn parseAs(comptime variant: Variant, dir: *const abi.PackDir, config_json: 
     // prefill programs read unrotated separate GDN projections.
     const dense = !next and !prism and !c.moe();
     const exact = dense and c.quant.bits > 0 and c.quant.mode == .affine;
-    var p: abi.Parsed = .{ .caps = .{ .batches_decode = !next and c.rope != .dynamic, .moe = c.moe(), .exact_resumed = true, .dflash_capture = true, .exact_drafted = exact, .spec_tree = dense and c.rope != .dynamic, .ane_prefill = !next and !prism, .merged_state = true } };
+    var p: abi.Parsed = .{ .caps = .{ .batches_decode = !next and c.rope != .dynamic, .moe = c.moe(), .exact_resumed = true, .dflash_capture = true, .exact_drafted = exact, .spec_tree = dense and c.rope != .dynamic, .ane_prefill = !next and !prism, .merged_state = true, .experts_stream = c.moe() } };
     if (rope_scaling.layoutNamespace(c.rope)) |ns| p.cache.layout_namespace = abi.Str.of(ns);
     // The grafted head over-speculates in auto mode (`ModelConfig.mtpDepth`).
     if (prism) p.spec.mtp_default_depth = 2;

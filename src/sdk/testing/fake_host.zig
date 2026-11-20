@@ -192,6 +192,16 @@ const refusing_gpu: abi.HostGpu = .{
             return refused;
         }
     }.f,
+    .alias = struct {
+        fn f(_: ?*anyopaque, _: abi.Array, _: u64, _: [*]const i32, _: usize, _: i32, _: *abi.Array) callconv(.c) abi.Verdict {
+            return refused;
+        }
+    }.f,
+    .command_buffer_limits = struct {
+        fn f(_: ?*anyopaque, _: i32, _: i32, _: *i32, _: *i32) callconv(.c) abi.Verdict {
+            return refused;
+        }
+    }.f,
 };
 
 const testing = std.testing;

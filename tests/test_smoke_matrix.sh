@@ -10,6 +10,7 @@
 # completions, messages, responses, Ollama, /v1/models, /metrics.json, alive + no `[mlx]` error.
 # Each boot has a scratch HOME (a saved model-settings profile outranks launch flags). Packs come from
 # tests/_lib_models.sh (fetch_test_models.sh downloads the rest); ~1 h for the full box.
+source "$(dirname "$0")/lib/server.sh"
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -104,7 +105,7 @@ boot() { # $1 model path, $2... extra flags
 stop() {
     [[ -n "$SERVER_PID" ]] || return
     kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
-    pkill -f "zig-out/bin/mlx-serve.*--port $PORT" 2>/dev/null || true
+    srv_preclean "$PORT"
 }
 trap stop EXIT
 

@@ -123,6 +123,9 @@ pub const Dspark = struct {
 /// The DS4 converter's vision tower (`*-Vision.gguf`, ds4's `--vision`): the release's tower under its own names.
 pub const vision_arch = "deepseek4-vision";
 const vp = vision_arch ++ ".";
+/// llama.cpp's mmproj of the same tower (`general.architecture` `clip`): the projector it names, and its key prefix.
+pub const clip_projector = "deepseek41v";
+const cvp = "clip.vision.";
 
 /// A tower GGUF's geometry, the `vision_config` of our packs; refused unless it was built for the trunk it sits beside.
 pub const Vision = struct {
@@ -142,17 +145,14 @@ pub const Vision = struct {
     /// `revision` is the trunk's `general.source.revision`: ds4 pairs a tower with its language GGUF by it, and the
     /// September tower has the 1017 trunk's shapes.
     pub fn read(f: *const gguf.File, hp: Hparams, revision: ?[]const u8) !Vision {
+        if (std.mem.eql(u8, f.getString("general.architecture") orelse "", "clip")) return readClip(f, hp);
         if (!std.mem.eql(u8, f.getString("general.architecture") orelse "", vision_arch)) return error.UnsupportedArch;
         if (!std.mem.eql(u8, f.getString(vp ++ "checkpoint_variant") orelse "", "v4.1-flash")) return error.BadMetadata;
         if (revision) |r| if (f.getString("general.source.revision")) |own| if (!std.mem.eql(u8, r, own)) return error.OtherCheckpoint;
         if (try arch.u32Key(f, vp ++ "projection_length") != hp.hidden or
             try arch.u32Key(f, vp ++ "language.block_count") != hp.n_layers or
             try arch.u32Key(f, vp ++ "language.expert_count") != hp.n_experts) return error.BadMetadata;
-        // Every tensor one the tower loads: anything else would fail the whole load after vision was advertised.
-        for (f.tensors.keys(), f.tensors.values()) |name, t| switch (t.ty) {
-            .f32, .f16, .bf16 => if (mapVisionTensor(name) == null) return error.UnsupportedTensor,
-            else => return error.UnsupportedTensor,
-        };
+        try knownTensors(f);
         return .{
             .layers = try arch.u32Key(f, vp ++ "block_count"),
             .hidden = try arch.u32Key(f, vp ++ "embedding_length"),
@@ -167,13 +167,65 @@ pub const Vision = struct {
             .image_token = try arch.u32Key(f, vp ++ "image.token_id"),
         };
     }
+
+    /// The mmproj names no checkpoint, token budget, aspect cap, rope base or image token: those are the release's.
+    fn readClip(f: *const gguf.File, hp: Hparams) !Vision {
+        if (!std.mem.eql(u8, f.getString("clip.projector_type") orelse "", clip_projector)) return error.UnsupportedArch;
+        if (try arch.u32Key(f, cvp ++ "projection_dim") != hp.hidden) return error.BadMetadata;
+        try knownTensors(f);
+        return .{
+            .layers = try arch.u32Key(f, cvp ++ "block_count"),
+            .hidden = try arch.u32Key(f, cvp ++ "embedding_length"),
+            .ffn = try arch.u32Key(f, cvp ++ "feed_forward_length"),
+            .heads = try arch.u32Key(f, cvp ++ "attention.head_count"),
+            .patch = try arch.u32Key(f, cvp ++ "patch_size"),
+            .downsample = try arch.u32Key(f, cvp ++ "projector.scale_factor"),
+            .max_tokens = 1024,
+            .min_pixels = try arch.u32Key(f, cvp ++ "image_min_pixels"),
+            .max_wh_ratio = 0,
+            .rope_theta = 10000,
+            // `<｜deepseek_image｜>` in every V4.1 trunk.
+            .image_token = 129264,
+        };
+    }
+
+    /// Every tensor one the tower loads: anything else would fail the whole load after vision was advertised.
+    fn knownTensors(f: *const gguf.File) !void {
+        var buf: [96]u8 = undefined;
+        for (f.tensors.keys(), f.tensors.values()) |name, t| switch (t.ty) {
+            .f32, .f16, .bf16 => if (mapVisionTensor(&buf, name) == null) return error.UnsupportedTensor,
+            else => return error.UnsupportedTensor,
+        };
+    }
 };
 
 /// A tower GGUF's tensor under the name `plugins/deepseek_v41/vision.zig` reads (the release's own), null when unknown.
-pub fn mapVisionTensor(name: []const u8) ?arch.Mapped {
+/// An mmproj's gate and up are `mlp.w1_gate` / `mlp.w1_up`, which `weights.loadVision` joins into `mlp.w1`.
+pub fn mapVisionTensor(buf: []u8, name: []const u8) ?arch.Mapped {
     const ours = std.mem.startsWith(u8, name, "vision.") or std.mem.startsWith(u8, name, "aligner.") or
         std.mem.eql(u8, name, "image_start") or std.mem.eql(u8, name, "image_end") or std.mem.eql(u8, name, "image_newline");
-    return if (ours) .{ .name = name, .transform = .none } else null;
+    if (ours) return .{ .name = name, .transform = .none };
+    const whole = [_][2][]const u8{
+        .{ "v.post_ln.weight", "vision.norm.weight" },             .{ "v.patch_embd.weight", "vision.patch_embed.proj.weight" },
+        .{ "v.patch_embd.bias", "vision.patch_embed.proj.bias" },   .{ "v.token_embd.img_start", "image_start" },
+        .{ "v.token_embd.img_end", "image_end" },                   .{ "v.image_newline", "image_newline" },
+        .{ "mm.1.weight", "aligner.w1.weight" },                    .{ "mm.1.bias", "aligner.w1.bias" },
+        .{ "mm.2.weight", "aligner.w2.weight" },                    .{ "mm.2.bias", "aligner.w2.bias" },
+    };
+    for (whole) |w| if (std.mem.eql(u8, name, w[0])) return .{ .name = w[1], .transform = .none };
+    if (!std.mem.startsWith(u8, name, "v.blk.")) return null;
+    const rest = name["v.blk.".len..];
+    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+    const leaf = rest[dot + 1 ..];
+    const block_leaves = [_][2][]const u8{
+        .{ "attn_qkv.", "attn.wqkv." }, .{ "attn_out.", "attn.wo." }, .{ "ffn_down.", "mlp.w2." }, .{ "ln1.", "norm1." },
+        .{ "ln2.", "norm2." },          .{ "ffn_gate.", "mlp.w1_gate." }, .{ "ffn_up.", "mlp.w1_up." },
+    };
+    for (block_leaves) |l| if (std.mem.startsWith(u8, leaf, l[0])) {
+        const n = std.fmt.bufPrint(buf, "vision.blocks.{s}.{s}{s}", .{ rest[0..dot], l[1], leaf[l[0].len..] }) catch return null;
+        return .{ .name = n, .transform = .none };
+    };
+    return null;
 }
 
 pub const Hparams = struct {
@@ -1272,12 +1324,70 @@ test "Vision.read: the DS4 converter's tower gives our packs' vision_config; ano
     try std.testing.expectError(error.UnsupportedTensor, Vision.read(&x, hp, rev));
 }
 
+/// llama.cpp's mmproj for the same tower (`mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf`, projector `deepseek41v`): its
+/// metadata and two of its tensors, as a File (tests only).
+pub fn testVisionFileClip() !gguf.File {
+    var f: gguf.File = .{ .arena = .init(std.testing.allocator), .version = 3 };
+    errdefer f.deinit();
+    const a = f.arena.allocator();
+    try f.kv.put(a, "general.architecture", .{ .string = "clip" });
+    try f.kv.put(a, "clip.projector_type", .{ .string = clip_projector });
+    const ints = [_]struct { []const u8, u64 }{
+        .{ cvp ++ "block_count", 32 },  .{ cvp ++ "embedding_length", 1024 }, .{ cvp ++ "feed_forward_length", 2816 },
+        .{ cvp ++ "attention.head_count", 16 }, .{ cvp ++ "projection_dim", 5120 }, .{ cvp ++ "patch_size", 14 },
+        .{ cvp ++ "projector.scale_factor", 3 }, .{ cvp ++ "image_min_pixels", 295936 }, .{ cvp ++ "image_size", 672 },
+    };
+    for (ints) |kv| try f.kv.put(a, kv[0], .{ .uint = kv[1] });
+    try f.tensors.put(a, "v.patch_embd.weight", .{ .dims = .{ 14, 14, 3, 1024 }, .n_dims = 4, .ty = .f32, .data = &.{} });
+    try f.tensors.put(a, "mm.1.weight", .{ .dims = .{ 9216, 5120, 1, 1 }, .n_dims = 2, .ty = .bf16, .data = &.{} });
+    return f;
+}
+
+test "Vision.read: llama.cpp's mmproj of the tower gives the DS4 tower's vision_config; another projector or trunk is refused" {
+    var t = try testFileDs4(release_config);
+    defer t.deinit();
+    const hp = try Hparams.read(&t);
+    var c = try testVisionFileClip();
+    defer c.deinit();
+    var d = try testVisionFileDs4();
+    defer d.deinit();
+    try std.testing.expectEqualDeep(try Vision.read(&d, hp, null), try Vision.read(&c, hp, "1bae0e1088993b9b82de08f59de5be5a34e42170"));
+    var o = try testVisionFileClip();
+    defer o.deinit();
+    try o.kv.put(o.arena.allocator(), "clip.projector_type", .{ .string = "qwen3vl_merger" });
+    try std.testing.expectError(error.UnsupportedArch, Vision.read(&o, hp, null));
+    var w = try testVisionFileClip();
+    defer w.deinit();
+    try w.kv.put(w.arena.allocator(), cvp ++ "projection_dim", .{ .uint = 4096 });
+    try std.testing.expectError(error.BadMetadata, Vision.read(&w, hp, null));
+}
+
+test "mapVisionTensor: llama.cpp's mmproj names onto the tower's; gate and up land apart for loadVision to join" {
+    var buf: [96]u8 = undefined;
+    const want = [_][2][]const u8{
+        .{ "mm.1.weight", "aligner.w1.weight" },                         .{ "mm.2.bias", "aligner.w2.bias" },
+        .{ "v.blk.0.attn_qkv.weight", "vision.blocks.0.attn.wqkv.weight" }, .{ "v.blk.31.attn_out.bias", "vision.blocks.31.attn.wo.bias" },
+        .{ "v.blk.7.ffn_down.weight", "vision.blocks.7.mlp.w2.weight" },  .{ "v.blk.7.ln1.weight", "vision.blocks.7.norm1.weight" },
+        .{ "v.blk.7.ln2.weight", "vision.blocks.7.norm2.weight" },        .{ "v.blk.7.ffn_gate.weight", "vision.blocks.7.mlp.w1_gate.weight" },
+        .{ "v.blk.7.ffn_up.weight", "vision.blocks.7.mlp.w1_up.weight" }, .{ "v.post_ln.weight", "vision.norm.weight" },
+        .{ "v.patch_embd.weight", "vision.patch_embed.proj.weight" },     .{ "v.patch_embd.bias", "vision.patch_embed.proj.bias" },
+        .{ "v.token_embd.img_start", "image_start" },                     .{ "v.token_embd.img_end", "image_end" },
+        .{ "v.image_newline", "image_newline" },
+    };
+    for (want) |w| {
+        const m = mapVisionTensor(&buf, w[0]) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(w[1], m.name);
+    }
+    for ([_][]const u8{ "v.blk.0.ffn_norm.weight", "mm.0.weight", "v.position_embd.weight" }) |n| try std.testing.expect(mapVisionTensor(&buf, n) == null);
+}
+
 test "mapVisionTensor: the tower keeps the release's names, which the plugin's tower reads; anything else is unknown" {
+    var buf: [96]u8 = undefined;
     for ([_][]const u8{ "vision.blocks.31.mlp.w1.weight", "vision.patch_embed.proj.bias", "vision.norm.weight", "aligner.w2.bias", "image_start", "image_end", "image_newline" }) |n| {
-        const m = mapVisionTensor(n) orelse return error.TestUnexpectedResult;
+        const m = mapVisionTensor(&buf, n) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings(n, m.name);
         try std.testing.expect(m.transform == .none);
     }
-    for ([_][]const u8{ "image_pad", "layers.0.ffn.gate.bias_vl", "token_embd.weight", "v.patch_embd.weight" }) |n|
-        try std.testing.expect(mapVisionTensor(n) == null);
+    for ([_][]const u8{ "image_pad", "layers.0.ffn.gate.bias_vl", "token_embd.weight" }) |n|
+        try std.testing.expect(mapVisionTensor(&buf, n) == null);
 }

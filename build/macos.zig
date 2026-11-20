@@ -1,6 +1,6 @@
 //! The macOS graph: the engine module (the server's root and the unit tests' share one setup), the executable and its
-//! `-Dunits` objects, the unit tests run as shards, the artifacts Zig collects tests from on their own (Sushi's EXL3,
-//! mlx-stream), and the type check.
+//! `-Dunits` objects, the unit tests run as shards, the artifact Zig collects tests from on its own (Sushi's EXL3), and
+//! the type check.
 
 const std = @import("std");
 const config = @import("config.zig");
@@ -64,10 +64,6 @@ pub const Graph = struct {
         // option, NOT `ios` — `ios` keeps its own meaning (low-mem policy, sandboxing).
         build_options.addOption(bool, "ds4_engine", true);
         build_options.addOption(bool, "llama_engine", true);
-        // DeepSeek-V4.1's EXL3 repack through mlx-stream (macOS only; Linux and iOS build the stub).
-        build_options.addOption(bool, "mlx_stream", true);
-        // `-Dplugin-profile`: the plugin's profile probes (its sdk reads `mlx_host.plugin_profile`) and their C shims.
-        build_options.addOption(bool, "plugin_profile", libs.pluginProfile(b));
         // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
         // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
         build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
@@ -155,7 +151,7 @@ const Shared = struct {
         // dylib + headers extracted from the pinned XCFramework). See src/engines/llama/bridge.zig.
         libs.addLlamaLib(b, mod);
         _ = libs.addExl3Module(b, mod, target, optimize);
-        libs.addMlxStreamModule(b, mod, target, optimize);
+        libs.addStreamSources(b, mod, std.mem.eql(u8, root, "src/tests.zig"));
 
         // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
         // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels
@@ -247,11 +243,10 @@ fn unitModule(g: *const Graph, includes: []const std.Build.Module.IncludeDir, ro
     const b = g.b;
     const m = b.createModule(.{ .root_source_file = b.path(root), .target = g.target, .optimize = g.optimize, .link_libcpp = true });
     var it = g.exe_mod.import_table.iterator();
-    while (it.next()) |e| if (!std.mem.eql(u8, e.key_ptr.*, "sushi_exl3") and !std.mem.eql(u8, e.key_ptr.*, "mlx_stream")) m.addImport(e.key_ptr.*, e.value_ptr.*);
+    while (it.next()) |e| if (!std.mem.eql(u8, e.key_ptr.*, "sushi_exl3")) m.addImport(e.key_ptr.*, e.value_ptr.*);
     m.include_dirs.appendSlice(b.allocator, includes) catch @panic("OOM");
     libs.addMlxLib(b, m);
     _ = libs.addExl3Module(b, m, g.target, g.optimize);
-    m.addImport("mlx_stream", libs.mlxStreamPkg(b, m, "src/mlx_stream.zig", g.target, g.optimize, false, false));
     return m;
 }
 
@@ -285,9 +280,12 @@ pub fn addUnitTests(g: *const Graph) Tests {
 
     // The one test binary runs as `test-shards` processes in parallel, each every n-th test (build/test_runner.zig);
     // a filtered run is one process.
-    const shards: u32 = if (test_filter != null) 1 else b.option(u32, "test-shards", "Unit-test processes run in parallel (default 8)") orelse 8;
+    const shards: u32 = if (test_filter != null) 1 else b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse defaultShards();
     const test_runs = b.allocator.alloc(*std.Build.Step.Run, shards) catch @panic("OOM");
     const test_step = b.step("test", "Run unit tests");
+    // A Run step given an env var copies the WHOLE configure-time environment into the cached configuration, so the
+    // tests' own variables (MLX_SERVE_TAPE_RECORD, *_TEST_MODEL) would stay frozen at the last reconfigure.
+    b.graph.poisonCache();
     for (test_runs, 0..) |*run, k| {
         run.* = b.addRunArtifact(unit_tests);
         if (shards > 1) {
@@ -306,13 +304,21 @@ pub fn addUnitTests(g: *const Graph) Tests {
         test_step.dependOn(&run.*.step);
     }
     plugins.addTests(b, test_step);
+    config.addTests(b, test_step);
     test_step.dependOn(&b.top_level_steps.get("lint-test").?.step);
     test_step.dependOn(&b.top_level_steps.get("unit-closure").?.step);
     return .{ .step = test_step, .build = test_build, .runs = test_runs, .filter = test_filter };
 }
 
-/// `exl3-test`, `mlx-stream-test`, `mlx-stream-conformance`: Zig collects tests from an artifact's root module only, so
-/// the modules over the plugin host surface (`src/plugin_host.zig`) are artifacts of their own.
+/// Every shard holds its own GPU tests' memory, and the heaviest (dsv41 moe_down) wants ~10 GB: a 16 GB Mac hung with
+/// two shards (a Metal command buffer that fails for memory never signals, so its test waits forever).
+fn defaultShards() u32 {
+    const gib = (std.process.totalSystemMemory() catch return 8) >> 30;
+    return @intCast(std.math.clamp((gib -| 16) / 16, 1, 8));
+}
+
+/// `exl3-test`: Zig collects tests from an artifact's root module only, so the module over the plugin host surface
+/// (`src/plugin_host.zig`) is an artifact of its own.
 pub fn addPluginTests(g: *const Graph, tests: Tests) void {
     const b = g.b;
     {
@@ -327,31 +333,6 @@ pub fn addPluginTests(g: *const Graph, tests: Tests) void {
         // ~13 min and 14 GB: its own step, run at phase gates, outside `zig build test`.
         b.step("exl3-test", "Run the in-tree EXL3/STQ (sushi) tests").dependOn(&b.addRunArtifact(t).step);
     }
-    {
-        const t = addMlxStreamTests(g, tests.filter, "src/mlx_stream_tests.zig", "mlx-stream-test");
-        tests.build.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-        const run = b.addRunArtifact(t);
-        tests.step.dependOn(&run.step);
-        b.step("mlx-stream-test", "Run the mlx-stream plugin's tests").dependOn(&run.step);
-        // Its own binary (the last test checks that nothing in it created a Metal device), outside `zig build test`:
-        // it recompiles every plugin file's tests.
-        const conf = b.addRunArtifact(addMlxStreamTests(g, null, "src/mlx_stream_conformance.zig", "mlx-stream-conformance"));
-        conf.setEnvironmentVariable("MLX_DEFAULT_DEVICE", "cpu");
-        b.step("mlx-stream-conformance", "Run the mlx-stream plugin's conformance suite (CPU lane, no device)").dependOn(&conf.step);
-    }
-}
-
-/// One of the plugin's own test roots (src/tests.zig, src/conformance.zig) over the host surface plugins import
-/// (`src/plugin_host.zig`), with the read pool's scripted faults.
-fn addMlxStreamTests(g: *const Graph, filter: ?[]const u8, root: []const u8, name: []const u8) *std.Build.Step.Compile {
-    const b = g.b;
-    const host = b.createModule(.{ .root_source_file = b.path("src/plugin_host.zig"), .target = g.target, .optimize = g.optimize, .link_libc = true, .link_libcpp = true });
-    libs.addMlxLib(b, host);
-    _ = libs.addExl3Module(b, host, g.target, g.optimize);
-    if (g.host.frameworks) |fw| host.addFrameworkPath(.{ .cwd_relative = fw });
-    for ([_][]const u8{ "IOKit", "CoreFoundation", "Foundation", "Metal", "IOSurface" }) |f| host.linkFramework(f, .{});
-    const m = libs.mlxStreamPkg(b, host, root, g.target, g.optimize, true, true);
-    return b.addTest(.{ .name = name, .root_module = m, .filters = if (filter) |f| &.{f} else &.{} });
 }
 
 /// `zig build check`: type-check the engine and its tests without generating

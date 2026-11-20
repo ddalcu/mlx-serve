@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const crt = @import("crt.zig");
+const os_mutex = @import("os_mutex.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
 const is_macos = builtin.os.tag == .macos;
@@ -133,11 +134,20 @@ pub fn getAppMemFootprintMb() u32 {
 /// already contains them and `external` carries them back) plus file-backed plus
 /// purgeable (anonymous caches macOS drops before it compresses anything), capped
 /// by the RAM outside wired + compressor. 0 on a failed query.
-fn computeAvailableBytes(total_mem: u64, free_pages: u64, speculative_pages: u64, external_pages: u64, purgeable_pages: u64, wire_pages: u64, compressor_pages: u64, page: u64) u64 {
+pub fn computeAvailableBytes(total_mem: u64, free_pages: u64, speculative_pages: u64, external_pages: u64, purgeable_pages: u64, wire_pages: u64, compressor_pages: u64, page: u64) u64 {
     if (total_mem == 0) return 0;
     const reclaimable: u64 = (free_pages -| speculative_pages) +| external_pages +| purgeable_pages;
     const outside: u64 = total_mem -| (wire_pages +| compressor_pages) *| page;
     return @min(reclaimable *| page, outside);
+}
+
+/// What a model LOAD can count on: the RAM outside wired and compressor memory, less the OS reserve. macOS
+/// compresses or swaps any app's pages to make room for a wiring, so only wired memory (another loaded
+/// model, the kernel) and the compressor's own pages bind. Loads and request admission read it on macOS
+/// (`getLoadRoomBytes`); the hot cache and the app's meter keep `computeAvailableBytes`. 0 on a failed query.
+pub fn computeLoadAvailableBytes(total_mem: u64, wire_pages: u64, compressor_pages: u64, page: u64, reserve: u64) u64 {
+    if (total_mem == 0) return 0;
+    return (total_mem -| (wire_pages +| compressor_pages) *| page) -| reserve;
 }
 
 extern "c" fn os_proc_available_memory() usize;
@@ -161,8 +171,104 @@ pub fn getTotalMemBytes() u64 {
     return memoryPool(mlx.weightsInDeviceMemory(), mlx.maxRecommendedWorkingSet(), hostTotalMemBytes());
 }
 
+/// The box's memory in use outside the file cache: wired + anonymous - purgeable + compressor (macOS's counts; the
+/// `memory.tsv` `used_gb` figure). Unlike `total - available`, it does not move with how macOS counts recently read
+/// file pages. Elsewhere `total - available`.
+pub fn getNonFileMemBytes() u64 {
+    if (comptime !builtin.os.tag.isDarwin()) return hostTotalMemBytes() -| hostAvailableMemBytes();
+    const v = darwinVm() orelse return 0;
+    return nonFileBytes(v.vm, v.page);
+}
+
+/// A planted `reading_override` from byte counts (tests): the rest of the box free.
+pub fn plantVm(total: u64, page: u64, b: struct { wired: u64, anonymous: u64, compressor: u64, purgeable: u64, file: u64 }) @TypeOf(reading_override.?) {
+    var vm = std.mem.zeroes(VmStats64);
+    vm.wire_count = @intCast(b.wired / page);
+    vm.internal_page_count = @intCast(b.anonymous / page);
+    vm.compressor_page_count = @intCast(b.compressor / page);
+    vm.purgeable_count = @intCast(b.purgeable / page);
+    vm.external_page_count = @intCast(b.file / page);
+    vm.free_count = @intCast((total -| b.wired -| b.anonymous -| b.compressor -| b.file) / page);
+    return .{ .vm = .{ .total = total, .page = page, .vm = vm }, .footprint = 0, .now_ms = 1000 };
+}
+
+fn nonFileBytes(vm: VmStats64, page: u64) u64 {
+    const pages = (@as(u64, vm.wire_count) +| vm.internal_page_count +| vm.compressor_page_count) -| vm.purgeable_count;
+    return pages *| page;
+}
+
 pub fn getAvailableMemBytes() u64 {
-    return memoryPool(mlx.weightsInDeviceMemory(), mlx.freeDeviceMemory(), hostAvailableMemBytes());
+    const host = hostAvailableMemBytes();
+    return memoryPool(mlx.weightsInDeviceMemory(), mlx.freeDeviceMemory(), host +| returnedNotShown(host));
+}
+
+/// macOS shows memory MLX handed back about a second late, while a new allocation can take it at once: a reading
+/// taken right after an eviction or an unload refused work that fit. This carries what MLX returned between two
+/// close readings until the OS figure shows it, or MLX takes it again.
+pub const ReturnLag = struct {
+    /// The OS figure catches up well inside this; a credit older than it is dropped.
+    pub const WINDOW_MS: i64 = 2000;
+
+    at_ms: i64 = 0,
+    /// MLX's active memory and buffer pool at the last reading: it shrinks only by what went back to the OS.
+    footprint: u64 = 0,
+    os_free: u64 = 0,
+    pending: u64 = 0,
+    pending_at_ms: i64 = 0,
+
+    /// The bytes to add to `os_free` at this reading.
+    pub fn credit(self: *ReturnLag, now_ms: i64, footprint: u64, os_free: u64) u64 {
+        if (now_ms - self.pending_at_ms > WINDOW_MS) self.pending = 0;
+        if (self.at_ms != 0 and now_ms - self.at_ms <= WINDOW_MS and footprint < self.footprint) {
+            self.pending +|= self.footprint - footprint;
+            self.pending_at_ms = now_ms;
+        }
+        self.pending -|= os_free -| self.os_free;
+        self.pending -|= footprint -| self.footprint;
+        self.at_ms = now_ms;
+        self.footprint = footprint;
+        self.os_free = os_free;
+        return self.pending;
+    }
+};
+
+const ReturnLagState = struct { mtx: os_mutex.Mutex = .{}, lag: ReturnLag = .{} };
+pub const return_lag_shared = @import("shared.zig").Shared(ReturnLagState, "mem_return_lag", .{});
+
+fn returnedNotShown(os_free: u64) u64 {
+    if (comptime !is_macos) return 0;
+    if (os_free == 0) return 0;
+    var active: usize = 0;
+    var pool: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.mlx_get_cache_memory(&pool);
+    var footprint: u64 = @as(u64, active) +| pool;
+    var now_ms = crt.monotonicMs();
+    if (reading_override) |r| {
+        footprint = r.footprint;
+        now_ms = r.now_ms;
+    }
+    const st = return_lag_shared.get();
+    st.mtx.lock();
+    defer st.mtx.unlock();
+    return st.lag.credit(now_ms, footprint, os_free);
+}
+
+/// Test seam: the kernel's counts, MLX's footprint and the clock, read in place of the machine's.
+pub var reading_override: ?struct { vm: DarwinVm, footprint: u64, now_ms: i64 } = null;
+
+/// `getAvailableMemBytes` for a model load (`computeLoadAvailableBytes`). Other hosts' readings
+/// already count what their OS reclaims (Linux `MemAvailable`, Windows `ullAvailPhys`).
+pub fn getLoadAvailableMemBytes() u64 {
+    return memoryPool(mlx.weightsInDeviceMemory(), mlx.freeDeviceMemory(), hostLoadAvailableMemBytes());
+}
+
+/// RAM a new wiring or allocation can take beside everything resident: `getLoadAvailableMemBytes` less the
+/// OS reserve, which macOS's figure already leaves out.
+pub fn getLoadRoomBytes() u64 {
+    const avail = getLoadAvailableMemBytes();
+    if (comptime builtin.os.tag == .macos) return avail;
+    return avail -| osReserveBytes(getTotalMemBytes(), mlx.weightsInDeviceMemory());
 }
 
 /// The kernel's memory-pressure level: 1 normal, 2 warning, 4 critical; 0 where the OS has no such reading.
@@ -212,18 +318,38 @@ pub fn parseOsReserveGib(raw: []const u8) error{InvalidOsReserve}!u64 {
 fn hostAvailableMemBytes() u64 {
     if (comptime builtin.os.tag == .windows) return windowsMemStatus().ullAvailPhys;
     if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemAvailable:") * 1024;
+    return darwinFree(darwinVm() orelse return 0);
+}
+
+fn darwinFree(v: DarwinVm) u64 {
+    return computeAvailableBytes(v.total, v.vm.free_count, v.vm.speculative_count, v.vm.external_page_count, v.vm.purgeable_count, v.vm.wire_count, v.vm.compressor_page_count, v.page);
+}
+
+fn hostLoadAvailableMemBytes() u64 {
+    if (comptime builtin.os.tag != .macos) return hostAvailableMemBytes();
+    const v = darwinVm() orelse return 0;
+    const room = computeLoadAvailableBytes(v.total, v.vm.wire_count, v.vm.compressor_page_count, v.page, osReserveBytes(v.total, false));
+    // MLX's buffers are wired, so this figure shows a return as late as the free one. The credit follows the free
+    // figure from every reader: fed this one here and the free one elsewhere, each reading would wipe the other's.
+    return room +| returnedNotShown(darwinFree(v));
+}
+
+const DarwinVm = struct { total: u64, page: u64, vm: VmStats64 };
+
+/// Total RAM, page size and the kernel's page counts; null on a failed query.
+fn darwinVm() ?DarwinVm {
+    if (reading_override) |r| return r.vm;
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
-    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
+    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return null;
 
     var page: usize = 0;
-    if (host_page_size(mach_host_self(), &page) != 0) return 0;
+    if (host_page_size(mach_host_self(), &page) != 0) return null;
 
     var vm = std.mem.zeroes(VmStats64);
     var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
-    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
-
-    return computeAvailableBytes(total_mem, vm.free_count, vm.speculative_count, vm.external_page_count, vm.purgeable_count, vm.wire_count, vm.compressor_page_count, page);
+    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return null;
+    return .{ .total = total_mem, .page = page, .vm = vm };
 }
 
 const MemoryStatusEx = extern struct {
@@ -289,6 +415,112 @@ fn readProcFile(path: []const u8, buf: []u8) ?usize {
     return @intCast(n);
 }
 
+test "ReturnLag: bytes MLX returned between two close readings are credited until the OS figure shows them" {
+    const GB: u64 = 1 << 30;
+    var lag: ReturnLag = .{};
+    // The first reading has no baseline.
+    try std.testing.expectEqual(@as(u64, 0), lag.credit(1000, 30 * GB, 10 * GB));
+    // An eviction returned 4 GB and the OS figure has not moved: all 4 are credited.
+    try std.testing.expectEqual(4 * GB, lag.credit(1001, 26 * GB, 10 * GB));
+    // The OS shows 1 GB of it 200 ms later, then the rest.
+    try std.testing.expectEqual(3 * GB, lag.credit(1200, 26 * GB, 11 * GB));
+    try std.testing.expectEqual(@as(u64, 0), lag.credit(2200, 26 * GB, 14 * GB));
+    // A return the OS shows within the same pair of readings needs no credit.
+    try std.testing.expectEqual(@as(u64, 0), lag.credit(2300, 24 * GB, 16 * GB));
+    // What MLX takes again is no longer room.
+    try std.testing.expectEqual(4 * GB, lag.credit(2400, 20 * GB, 16 * GB));
+    try std.testing.expectEqual(1 * GB, lag.credit(2401, 23 * GB, 16 * GB));
+    // A figure that never rises stops being credited after the window.
+    try std.testing.expectEqual(@as(u64, 0), lag.credit(2401 + ReturnLag.WINDOW_MS + 1, 23 * GB, 16 * GB));
+    // A drop seen across readings further apart than the window had time to show: no credit.
+    try std.testing.expectEqual(@as(u64, 0), lag.credit(20_000, 19 * GB, 16 * GB));
+}
+
+test "ReturnLag sees a buffer MLX frees past its pool as returned" {
+    // Bar: with the pool full a freed buffer leaves MLX's footprint, which is what the credit reads. The OS figure is
+    // held fixed here: other processes move the real one.
+    if (!is_macos or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var prev: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&prev, 0); // a free goes back to the OS, as with the pool at its cap
+    defer {
+        var t: usize = 0;
+        _ = mlx.mlx_set_cache_limit(&t, prev);
+    }
+    const footprint = struct {
+        fn now() u64 {
+            var active: usize = 0;
+            var pool: usize = 0;
+            _ = mlx.mlx_get_active_memory(&active);
+            _ = mlx.mlx_get_cache_memory(&pool);
+            return @as(u64, active) +| pool;
+        }
+    }.now;
+    const bytes: u64 = 1 << 30;
+    var a = mlx.mlx_array_new();
+    const shape = [_]c_int{1 << 28};
+    const s = mlx.gpuStream();
+    try mlx.check(mlx.mlx_ones(&a, &shape, 1, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(a));
+    // The eval's command buffer holds the buffer until its completion ran.
+    _ = mlx.mlx_synchronize(s);
+    var lag: ReturnLag = .{};
+    _ = lag.credit(1000, footprint(), 8 << 30);
+    _ = mlx.mlx_array_free(a);
+    try std.testing.expect(lag.credit(1001, footprint(), 8 << 30) >= bytes - bytes / 8);
+}
+
+test "the load figure carries what MLX just returned, and a free-figure reading between does not wipe it" {
+    if (!is_macos) return error.SkipZigTest;
+    const GB: u64 = 1 << 30;
+    const page: u64 = 16384;
+    const st = return_lag_shared.get();
+    st.lag = .{};
+    defer {
+        st.lag = .{};
+        reading_override = null;
+    }
+    var vm = std.mem.zeroes(VmStats64);
+    vm.free_count = @intCast(20 * GB / page);
+    vm.wire_count = @intCast(80 * GB / page);
+    reading_override = .{ .vm = .{ .total = 128 * GB, .page = page, .vm = vm }, .footprint = 70 * GB, .now_ms = 1000 };
+    const load_before = getLoadAvailableMemBytes();
+    const free_before = getAvailableMemBytes();
+    // An eviction returned 4 GB; the kernel's counts have not moved yet.
+    reading_override.?.footprint = 66 * GB;
+    reading_override.?.now_ms = 1001;
+    try std.testing.expectEqual(load_before + 4 * GB, getLoadAvailableMemBytes());
+    reading_override.?.now_ms = 1002;
+    try std.testing.expectEqual(free_before + 4 * GB, getAvailableMemBytes());
+    reading_override.?.now_ms = 1003;
+    try std.testing.expectEqual(load_before + 4 * GB, getLoadAvailableMemBytes());
+}
+
+test "getNonFileMemBytes: the file pages macOS keeps do not move it; wired, anonymous and compressor do, purgeable not" {
+    if (!is_macos) return error.SkipZigTest;
+    const GB: u64 = 1 << 30;
+    const page: u64 = 16384;
+    defer reading_override = null;
+    // one box state, twice: the second with 7 GB more file-backed pages, taken from free
+    var low = std.mem.zeroes(VmStats64);
+    low.wire_count = @intCast(20 * GB / page);
+    low.internal_page_count = @intCast(10 * GB / page);
+    low.compressor_page_count = @intCast(1 * GB / page);
+    low.purgeable_count = @intCast(GB / 2 / page);
+    low.external_page_count = @intCast(4 * GB / page);
+    low.free_count = @intCast(80 * GB / page);
+    var high = low;
+    high.external_page_count = @intCast(11 * GB / page);
+    high.free_count = @intCast(73 * GB / page);
+    reading_override = .{ .vm = .{ .total = 128 * GB, .page = page, .vm = low }, .footprint = 0, .now_ms = 1000 };
+    const at_low = getNonFileMemBytes();
+    reading_override = .{ .vm = .{ .total = 128 * GB, .page = page, .vm = high }, .footprint = 0, .now_ms = 1000 };
+    try std.testing.expectEqual(at_low, getNonFileMemBytes());
+    try std.testing.expectEqual(20 * GB + 10 * GB + GB - GB / 2, at_low);
+    var more = high;
+    more.internal_page_count += @intCast(GB / page);
+    try std.testing.expectEqual(at_low + GB, nonFileBytes(more, page));
+}
+
 test "memoryPool: device-memory weights bill VRAM, every other platform its host reading" {
     const GB: u64 = 1024 * 1024 * 1024;
     try std.testing.expectEqual(15 * GB, memoryPool(true, 15 * GB, 9 * GB)); // Windows: 13 GB fits the card
@@ -335,6 +567,21 @@ test "computeAvailableBytes sums the reclaimable classes, capped by wired headro
     // Purgeable pages are anonymous caches the OS discards before compressing
     // anything: a laptop's browsers park gigabytes there (#932).
     try std.testing.expectEqual(@as(u64, 7 * GB), computeAvailableBytes(16 * GB, 2 * ppg, 0, 1 * ppg, 4 * ppg, 3 * ppg, 1 * ppg, page));
+}
+
+test "computeLoadAvailableBytes is the RAM outside wired and compressor memory, less the OS reserve" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const page: u64 = 16384;
+    const ppg: u64 = GB / page;
+
+    // 128 GB box, 8 wired + 2 compressor, 8 reserved: 110 GB, whatever the apps hold, since macOS moves them for a wiring.
+    try std.testing.expectEqual(@as(u64, 110 * GB), computeLoadAvailableBytes(128 * GB, 8 * ppg, 2 * ppg, page, 8 * GB));
+    // Another model wired at 70 GB leaves 40: wired memory is the one thing nothing moves.
+    try std.testing.expectEqual(@as(u64, 40 * GB), computeLoadAvailableBytes(128 * GB, 78 * ppg, 2 * ppg, page, 8 * GB));
+    // Past the RAM: 0, never a wrapped figure.
+    try std.testing.expectEqual(@as(u64, 0), computeLoadAvailableBytes(16 * GB, 13 * ppg, 2 * ppg, page, 2 * GB));
+    // A failed query reads 0.
+    try std.testing.expectEqual(@as(u64, 0), computeLoadAvailableBytes(0, 0, 0, page, 8 * GB));
 }
 
 pub fn getSysMemPct() u32 {

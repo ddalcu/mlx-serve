@@ -333,7 +333,27 @@ pub const Upstream = struct {
 
 const PROBE_INTERVAL_S: u32 = 60;
 
-const Slot = struct { cfg: Config, rows: []Model = &.{}, up: bool = false, probed: bool = false };
+/// Why a probe got no HTTP answer, from curl's exit code: "Unreachable" alone read like a bad key.
+pub const Down = enum {
+    none,
+    refused,
+    dns,
+    timeout,
+    tls,
+    other,
+
+    pub fn ofCurlExit(code: u8) Down {
+        return switch (code) {
+            7 => .refused,
+            6 => .dns,
+            28 => .timeout,
+            35, 51, 53, 54, 58, 59, 60, 77, 80, 82, 83, 90, 91 => .tls,
+            else => .other,
+        };
+    }
+};
+
+const Slot = struct { cfg: Config, rows: []Model = &.{}, up: bool = false, probed: bool = false, down: Down = .none };
 
 pub const Providers = struct {
     alloc: std.mem.Allocator,
@@ -492,6 +512,10 @@ pub const Providers = struct {
             try js.write(s.probed);
             try js.objectField("models");
             try js.write(s.rows.len);
+            if (s.probed and !s.up and s.down != .none) {
+                try js.objectField("down");
+                try js.write(@tagName(s.down));
+            }
             try js.endObject();
         }
         try js.endArray();
@@ -535,14 +559,15 @@ pub const Providers = struct {
         var cfg = cfg_copy orelse return;
         defer cfg.deinit(p.alloc);
 
-        var answer = curlProbe(p.alloc, p.io, cfg);
+        var down: Down = .none;
+        var answer = curlProbe(p.alloc, p.io, cfg, &down);
         defer if (answer) |a| p.alloc.free(a.body);
         var adopted_v1: ?[]u8 = null;
         defer if (adopted_v1) |u| p.alloc.free(u);
         if (!listsModels(p.alloc, answer, cfg.name)) if (v1Candidate(p.alloc, cfg.url) catch null) |v1| {
             var alt = cfg;
             alt.url = v1;
-            const alt_answer = curlProbe(p.alloc, p.io, alt);
+            const alt_answer = curlProbe(p.alloc, p.io, alt, null);
             if (listsModels(p.alloc, alt_answer, cfg.name)) {
                 if (answer) |a| p.alloc.free(a.body);
                 answer = alt_answer;
@@ -563,6 +588,7 @@ pub const Providers = struct {
             freeModels(p.alloc, s.rows);
             s.rows = rows;
             s.up = answer != null;
+            s.down = if (s.up) .none else down;
             if (adopted_v1) |u| if (p.alloc.dupe(u8, u)) |owned| {
                 p.alloc.free(s.cfg.url);
                 s.cfg.url = owned;
@@ -571,7 +597,7 @@ pub const Providers = struct {
                 if (s.up)
                     log.info("[providers] {s}: up, {d} models ({s})\n", .{ name, rows.len, if (answer.?.status == 200 and !declaredOnly(cfg, rows)) "listed" else "declared" })
                 else
-                    log.warn("[providers] {s}: unreachable at {s}\n", .{ name, cfg.url });
+                    log.warn("[providers] {s}: unreachable at {s} ({s})\n", .{ name, cfg.url, @tagName(down) });
             }
             s.probed = true;
             return;
@@ -620,8 +646,9 @@ fn threadMain(p: *Providers) void {
 
 const CURL_MAX_TIME_PROBE_S = 10;
 
-/// GET `<url>/models`; `null` when curl got no HTTP answer at all.
-fn curlProbe(alloc: std.mem.Allocator, io: std.Io, cfg: Config) ProbeAnswer {
+/// GET `<url>/models`; `null` when curl got no HTTP answer at all, with why in `down` when given.
+fn curlProbe(alloc: std.mem.Allocator, io: std.Io, cfg: Config, down: ?*Down) ProbeAnswer {
+    if (down) |d| d.* = .other;
     const url = std.fmt.allocPrint(alloc, "{s}/models", .{cfg.url}) catch return null;
     defer alloc.free(url);
     var argv: std.ArrayList([]const u8) = .empty;
@@ -636,6 +663,7 @@ fn curlProbe(alloc: std.mem.Allocator, io: std.Io, cfg: Config) ProbeAnswer {
     errdefer alloc.free(result.stdout);
     switch (result.term) {
         .exited => |code| if (code != 0) {
+            if (down) |d| d.* = Down.ofCurlExit(code);
             log.debug("[providers] probe {s}: curl exit {d}: {s}\n", .{ cfg.name, code, std.mem.trim(u8, result.stderr, " \n") });
             alloc.free(result.stdout);
             return null;
@@ -983,6 +1011,31 @@ const TestSink = struct {
         return false;
     }
 };
+
+test "providers: a failed probe keeps why: nothing listening, no such host, no answer in time" {
+    try t.expectEqual(Down.refused, Down.ofCurlExit(7));
+    try t.expectEqual(Down.dns, Down.ofCurlExit(6));
+    try t.expectEqual(Down.timeout, Down.ofCurlExit(28));
+    try t.expectEqual(Down.tls, Down.ofCurlExit(35));
+    try t.expectEqual(Down.tls, Down.ofCurlExit(60));
+    try t.expectEqual(Down.other, Down.ofCurlExit(52));
+
+    const a = t.allocator;
+    var p = Providers{ .alloc = a, .io = undefined, .path = try a.dupe(u8, "/nonexistent") };
+    defer {
+        p.freeSlots(p.slots);
+        a.free(p.path);
+    }
+    const cfgs = try parseConfigs(a, "[{\"name\":\"shim\",\"url\":\"http://127.0.0.1:9/v1\"}]", fakeEnv);
+    p.slots = try a.alloc(Slot, cfgs.len);
+    for (p.slots, cfgs) |*s, c| s.* = .{ .cfg = c };
+    a.free(cfgs);
+    p.slots[0].probed = true;
+    p.slots[0].down = .refused;
+    const st = try p.statusJson(a);
+    defer a.free(st);
+    try t.expect(std.mem.indexOf(u8, st, "\"up\":false,\"probed\":true,\"models\":0,\"down\":\"refused\"}") != null);
+}
 
 test "providers: proxyChat relays status + content-type, streams the decoded body, swaps in the key" {
     // A tiny HTTP/1.1 upstream on loopback: asserts the Authorization header

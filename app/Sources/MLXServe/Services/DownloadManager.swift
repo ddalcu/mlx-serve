@@ -366,7 +366,7 @@ class DownloadManager: ObservableObject {
     nonisolated static func requiredMediaMarker(modelType: String) -> String? {
         switch modelType {
         case "AudioVideo": return "connector.safetensors"
-        case "minimax_h3": return "transformer.safetensors"
+        case "minimax_h3", "minimax_h3_image": return "transformer.safetensors"
         case "minimax_music3": return "vocoder.safetensors"
         case "yue2": return "vae.safetensors"
         case "acestep": return "text_encoder/model.safetensors"
@@ -824,7 +824,7 @@ class DownloadManager: ObservableObject {
             // returns `mtp` as a bare directory entry and the file filter skips
             // it, silently dropping the sidecar (and the model's spec-decode
             // speedup). `selectNeededFiles` keeps top-level files + mtp/ only.
-            let listURL = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=true")!
+            let listURL = Self.hubURL("/api/models/\(repoId)/tree/main?recursive=true")!
             let (listData, _) = try await DownloadSession.shared.data(for: Self.hfApiRequest(listURL))
             guard let files = try JSONSerialization.jsonObject(with: listData) as? [[String: Any]] else {
                 throw URLError(.cannotParseResponse)
@@ -835,7 +835,7 @@ class DownloadManager: ObservableObject {
             // Unreadable = the old allowlist alone.
             var indexed: Set<String> = []
             if files.contains(where: { ($0["path"] as? String) == "model.safetensors.index.json" }),
-               let indexURL = URL(string: "https://huggingface.co/\(repoId)/resolve/main/model.safetensors.index.json"),
+               let indexURL = Self.hubURL("/\(repoId)/resolve/main/model.safetensors.index.json"),
                let (indexData, _) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(indexURL)) {
                 indexed = Self.indexedShardNames(fromIndexData: indexData) ?? []
             }
@@ -892,7 +892,7 @@ class DownloadManager: ObservableObject {
                 downloads[repoId]?.bytesPerSecond = 0
                 downloads[repoId]?.statusText = "\(filePath) (\(sizeStr))"
 
-                let fileURL = URL(string: "https://huggingface.co/\(repoId)/resolve/main/\(filePath)")!
+                let fileURL = Self.hubURL("/\(repoId)/resolve/main/\(filePath)")!
                 let maxRetries = 20
 
                 for attempt in 0..<maxRetries {
@@ -968,7 +968,7 @@ class DownloadManager: ObservableObject {
     /// download path reassembles a sharded quant from its ordered shard list.
     /// Sidecars (mmproj/tokenizer) are dropped. Empty on error.
     func listGgufFiles(repoId: String) async -> [String] {
-        guard let url = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=true") else { return [] }
+        guard let url = Self.hubURL("/api/models/\(repoId)/tree/main?recursive=true") else { return [] }
         guard let (data, response) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(url)),
               let http = response as? HTTPURLResponse, http.statusCode == 200,
               let files = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
@@ -982,6 +982,7 @@ class DownloadManager: ObservableObject {
     /// runs after the inner work returns (whether completion, failure, or
     /// cancellation) so the caller can refresh model lists exactly once.
     func start(repoId: String, onFinish: @escaping @MainActor () -> Void) {
+        lastRequest[repoId] = .repo
         activeTasks[repoId]?.cancel()
         let task = Task { @MainActor [weak self] in
             await self?.download(repoId: repoId)
@@ -992,6 +993,23 @@ class DownloadManager: ObservableObject {
             onFinish()
         }
         activeTasks[repoId] = task
+    }
+
+    /// What a repo's last transfer was started for, so Resume or Retry on its row asks for the same files: a
+    /// GGUF repo's quant, an MLX shelf's variant, a bundle's component selection. The whole-repo request finds
+    /// nothing in a shelf.
+    enum TransferRequest { case repo, gguf(GgufQuant), mlxVariant(MlxVariant), bundle(MediaBundle) }
+    private var lastRequest: [String: TransferRequest] = [:]
+
+    /// Start `repoId` again the way it was last started (`lastRequest`); a repo never started here takes the
+    /// whole-repo request.
+    func retry(repoId: String, onFinish: @escaping @MainActor () -> Void) {
+        switch lastRequest[repoId] {
+        case .gguf(let quant): startGguf(repoId: repoId, quant: quant, onFinish: onFinish)
+        case .mlxVariant(let variant): startMlxVariant(repoId: repoId, variant: variant, onFinish: onFinish)
+        case .bundle(let bundle): startBundle(bundle, onFinish: onFinish)
+        case .repo, nil: start(repoId: repoId, onFinish: onFinish)
+        }
     }
 
     // MARK: - Speculation gems (the Model Settings socket)
@@ -1315,7 +1333,10 @@ class DownloadManager: ObservableObject {
     /// disk). `onFinish` runs once after the last component settles. Stops the
     /// bundle if a component fails.
     func startBundle(_ bundle: MediaBundle, onFinish: @escaping @MainActor () -> Void) {
-        for comp in bundle.components { mediaBundleRepos.insert(comp.repo) }
+        for comp in bundle.components {
+            mediaBundleRepos.insert(comp.repo)
+            lastRequest[comp.repo] = .bundle(bundle)
+        }
         activeTasks[bundle.id]?.cancel()
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -1413,6 +1434,7 @@ class DownloadManager: ObservableObject {
     /// whole-folder wipe would delete them as collateral for cancelling a
     /// second download.
     func startGguf(repoId: String, quant: GgufQuant, onFinish: @escaping @MainActor () -> Void) {
+        lastRequest[repoId] = .gguf(quant)
         activeTasks[repoId]?.cancel()
         // Scope cancellation to this quant up front; the task augments the list
         // with the MTP dependency once it's resolved from the repo tree.
@@ -1448,7 +1470,7 @@ class DownloadManager: ObservableObject {
     /// Fetch the repo's full tree (NO sidecar filter — the MTP head is filtered
     /// out of the selectable-quant lists) and return the MTP draft-head path.
     private func repoMtpSidecar(repoId: String) async -> String? {
-        guard let url = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=true") else { return nil }
+        guard let url = Self.hubURL("/api/models/\(repoId)/tree/main?recursive=true") else { return nil }
         guard let (data, response) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(url)),
               let http = response as? HTTPURLResponse, http.statusCode == 200,
               let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
@@ -1475,6 +1497,7 @@ class DownloadManager: ObservableObject {
     /// the generic whole-folder wipe would be aimed at the parent repo, which
     /// holds nothing, leaving the interrupted variant behind.
     func startMlxVariant(repoId: String, variant: MlxVariant, onFinish: @escaping @MainActor () -> Void) {
+        lastRequest[repoId] = .mlxVariant(variant)
         activeTasks[repoId]?.cancel()
         let dest = MlxVariantScan.localRepoId(repoId: repoId, folder: variant.folder)
         activeVariantDest[repoId] = dest
@@ -1806,7 +1829,7 @@ class DownloadManager: ObservableObject {
             .split(separator: "/", omittingEmptySubsequences: false)
             .map { $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }
             .joined(separator: "/")
-        return URL(string: "https://huggingface.co/\(repoId)/resolve/main/\(encoded)")!
+        return Self.hubURL("/\(repoId)/resolve/main/\(encoded)")!
     }
 
     private func presentFailureAlert(repoId: String, message: String) {
@@ -1841,7 +1864,7 @@ class DownloadManager: ObservableObject {
             partialPath: partialPath,
             fileSize: fileSize,
             session: DownloadSession.shared,
-            headers: Self.hfHeaders(),
+            headers: Self.hfHeaders(for: url),
             connections: DownloadChunking.configuredConnections()
         )
         downloader.onProgress = { [weak self] fileBytesTotal, speed in
@@ -1951,7 +1974,10 @@ class DownloadManager: ObservableObject {
         let defect = weightDefect(inDir: resolved, entries: entries)
 
         var meta = parseConfigMetadata(atPath: configPath)
-        if let marked { meta.modelType = marked }
+        if let marked {
+            meta.modelType = marked
+            meta.lacksMediaMarkers = false
+        }
         let modelType = meta.modelType
 
         let size = directorySize(resolved)
@@ -1977,7 +2003,8 @@ class DownloadManager: ObservableObject {
             activeExperts: meta.activeExperts,
             hasMtpHead: dirHasMtpHead(atDir: resolved),
             sizeBytes: Int64(size),
-            defect: defect
+            defect: defect,
+            lacksMediaMarkers: meta.lacksMediaMarkers
         )]
     }
 
@@ -2078,6 +2105,7 @@ class DownloadManager: ObservableObject {
     /// reliably carries the headline param count, which isn't a config field).
     struct ConfigMetadata: Equatable {
         var modelType = "unknown"
+        var lacksMediaMarkers = false
         var hasVision = false
         var quantBits: Int? = nil
         var contextLength: Int? = nil
@@ -2092,7 +2120,10 @@ class DownloadManager: ObservableObject {
         var meta = ConfigMetadata()
         guard let data = FileManager.default.contents(atPath: configPath),
               let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return meta }
-        if let mt = cfg["model_type"] as? String { meta.modelType = mt }
+        if let mt = cfg["model_type"] as? String {
+            meta.modelType = mt
+            meta.lacksMediaMarkers = !mediaMarkersHold(modelType: mt, config: cfg)
+        }
         // Vision: a NON-EMPTY `vision_config` block on a non-`_text` arch. Both
         // guards earn their place — `_text` skips text-only quantized
         // checkpoints with a vestigial block, and the emptiness check catches
@@ -2201,7 +2232,12 @@ class DownloadManager: ObservableObject {
             out.append(contentsOf: Self.dualLayoutModels(atRoot: root, idPrefix: "custom:", source: .custom))
         }
 
-        return Self.markingInFlight(out, activeDirs: inputs.inFlightDirs)
+        var seenPaths = Set<String>()
+        let unique = out.filter {
+            seenPaths.insert(URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().standardizedFileURL.path).inserted
+        }
+
+        return Self.markingInFlight(unique, activeDirs: inputs.inFlightDirs)
             // By label, not name: sibling quants of one repo share a name, and a
             // name-only sort leaves their relative order at the mercy of the
             // filesystem.
@@ -2531,12 +2567,38 @@ class DownloadManager: ObservableObject {
         return ["Authorization": "Bearer \(token)"]
     }
 
+    nonisolated static let defaultHub = "https://huggingface.co"
+
+    /// The hub downloads come from, no trailing slash: `HF_ENDPOINT` (a mirror such as https://hf-mirror.com), else
+    /// huggingface.co. The Zig CLI's rule (`sdk/util/hub.zig`): a value that is not an http(s) URL with a host is
+    /// ignored, because the token rides every request to it.
+    nonisolated static func hubBase(environment: [String: String] = LoginShellEnv.huggingFaceEnvironment()) -> String {
+        var raw = (environment["HF_ENDPOINT"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        while raw.hasSuffix("/") { raw.removeLast() }
+        guard let url = URL(string: raw), let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http",
+              let host = url.host, !host.isEmpty else { return defaultHub }
+        return raw
+    }
+
+    /// `path` (starting with `/`) on the hub.
+    nonisolated static func hubURL(_ path: String, environment: [String: String] = LoginShellEnv.huggingFaceEnvironment()) -> URL? {
+        URL(string: hubBase(environment: environment) + path)
+    }
+
+    /// The token's headers for `url`, only when it is on the hub: nothing else is sent it.
+    nonisolated static func hfHeaders(for url: URL, environment: [String: String] = LoginShellEnv.huggingFaceEnvironment(),
+                                      home: String = NSHomeDirectory()) -> [String: String] {
+        guard let hub = URL(string: hubBase(environment: environment)),
+              url.host?.lowercased() == hub.host?.lowercased(), url.port == hub.port else { return [:] }
+        return hfHeaders(environment: environment, home: home)
+    }
+
     /// A GET against the HF API on the shared session, carrying the token when
     /// we have one. Every listing call goes through here so a gated repo fails
     /// the same way everywhere.
     nonisolated static func hfApiRequest(_ url: URL) -> URLRequest {
         var request = URLRequest(url: url)
-        for (key, value) in hfHeaders() { request.setValue(value, forHTTPHeaderField: key) }
+        for (key, value) in hfHeaders(for: url) { request.setValue(value, forHTTPHeaderField: key) }
         return request
     }
 

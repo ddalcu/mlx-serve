@@ -5,13 +5,15 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
-const mlx_stream = @import("../modules/stream.zig");
 const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const log = @import("../../../sdk/util/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const mtp_mod = @import("../../../sdk/spec/mtp/mtp.zig");
 const mtp_acceptance = @import("../../../sdk/spec/mtp_acceptance.zig");
 const round_cost = @import("../spec/round_cost.zig");
+const context = @import("../admission/context.zig");
+const mtp_group_planner = @import("../spec/mtp_group_planner.zig");
+const dflash_policy = @import("../spec/dflash/policy.zig");
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ForwardCtx = transformer_mod.ForwardCtx;
@@ -52,9 +54,17 @@ const sampleTokenLazy = @import("../sampling/lazy.zig").sampleTokenLazy;
 const shouldCheckpointSsmPrefill = @import("prefill_chunk.zig").shouldCheckpointSsmPrefill;
 const ssmCapturePos = @import("prefill_chunk.zig").ssmCapturePos;
 const ssmSnapshotBackoff = @import("prefill_chunk.zig").ssmSnapshotBackoff;
+const WholePromptPlan = @import("prefill_chunk.zig").WholePromptPlan;
+const wholePromptPlan = @import("prefill_chunk.zig").wholePromptPlan;
+const PromptCheckpoints = @import("../ssm/checkpoint.zig").PromptCheckpoints;
+const fileCheckpoint = @import("../ssm/checkpoint.zig").fileCheckpoint;
+const CheckpointSink = @import("../kv/cache_ops.zig").CheckpointSink;
 const intree = @import("../plugin/intree.zig");
 const plugin_driver = @import("../plugin/driver.zig");
 
+/// The most rows a spec round's verify writes past its last accepted token: an MTP chain at its deepest, or a DFlash
+/// block.
+pub const verify_rows_max: usize = @max(mtp_group_planner.MAX_DEPTH + 1, dflash_policy.MAX_ROWS);
 
 pub fn initWithOptions(
     io: std.Io,
@@ -73,13 +83,17 @@ pub fn initWithOptions(
     // stochastic-verify filters, batched decode via `gen.sampling`)
     // inherits the model's mask without per-site wiring.
     var sampling = sampling_in;
-    sampling.suppress_mask = xfm.suppress_mask;
-    sampling.keyed = xfm.config.rowExactDecode() and mlx.metalKernelsAvailable(); // the keyed sampler is a Metal kernel
+    sampling.suppress_mask = if (sampling_in.suppress_cjk)
+        xfm.suppress_mask_cjk orelse return error.SuppressCjkUnavailable
+    else
+        xfm.suppress_mask;
+    // MLX_SERVE_KEYED_SAMPLING: every clean sampled request keyed, not only a row-exact trunk's; DSpark's stochastic
+    // arm then takes the serial verdict (spec/dspark.zig `serialVerdict`).
+    sampling.keyed = (xfm.config.rowExactDecode() or (env.on(.MLX_SERVE_KEYED_SAMPLING) and !sampling.shapesLogits())) and mlx.metalKernelsAvailable(); // the keyed sampler is a Metal kernel
     sampling.position_base = pickLookupPromptSource(prompt_ids, options_in.lookup_prompt).len;
-    // Spec drafts and verify rows share the serial sampler's keys (and
-    // mlx-stream's lane draws from the seed), so an unseeded sampled
-    // request gets its own random seed.
-    if ((sampling.keyed or xfm.mlx_stream_ext != null) and sampling.seed == null and sampling.temperature > 0.01) {
+    // Spec drafts and verify rows share the serial sampler's keys, so an
+    // unseeded sampled request gets its own random seed.
+    if (sampling.keyed and sampling.seed == null and sampling.temperature > 0.01) {
         var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) ^ @intFromPtr(xfm)));
         sampling.seed = prng.random().int(u64);
     }
@@ -95,7 +109,7 @@ pub fn initWithOptions(
     var options = options_in;
     var dspark_active = false;
     var dspark_stochastic = false;
-    if ((intree.dsv4(xfm) != null or intree.dsv41(xfm) != null or xfm.mlx_stream_ext != null or plugin_driver.nativeDrafter(xfm) != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
+    if ((intree.dsv4(xfm) != null or intree.dsv41(xfm) != null or plugin_driver.nativeDrafter(xfm) != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
         // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
         // snapshot rollback inside deepseek_v4.zig) may engage when the
         // checkpoint ships stages and the request is CLEAN (no
@@ -108,7 +122,7 @@ pub fn initWithOptions(
         // remain hard-off regardless: their verify forwards go through
         // machinery this arch cannot roll back.
         const native = plugin_driver.nativeDrafter(xfm) != null;
-        const ds_block = if (intree.dsv4(xfm)) |d| d.ds_block else if (intree.dsv41(xfm)) |d| d.ds_block else if (native) xfm.config.plugin.?.parsed.spec.native_block else mlx_stream.blockSize(xfm.mlx_stream_ext.?);
+        const ds_block = if (intree.dsv4(xfm)) |d| d.ds_block else if (intree.dsv41(xfm)) |d| d.ds_block else xfm.config.plugin.?.parsed.spec.native_block;
         const dspark_env_off = !dsparkEnabled();
         // A plugin whose drafter cannot hand the verify back accepts greedily: a sampled request runs serial.
         const arm = if (!options.mtp_enabled or xfm.config.mtp_override == false)
@@ -117,16 +131,7 @@ pub fn initWithOptions(
             DsparkArm.off
         else
             dsparkArmFor(sampling, options.logprobs_n);
-        // mlx-stream's lane samples a sampled request itself, from the request's own settings.
-        const lane_sampling: ?mlx_stream.SamplingParams = if (dspark_env_off or arm == .off) null else .{
-            .temperature = sampling.temperature,
-            .top_p = sampling.top_p,
-            .top_k = sampling.top_k,
-            .min_p = sampling.min_p,
-            .seed = sampling.seed orelse 0,
-        };
-        const lane_arms = if (xfm.mlx_stream_ext) |m| mlx_stream.arm(m, lane_sampling) else true;
-        if (xfm.dsparkStages() > 0 and !dspark_env_off and arm != .off and lane_arms) {
+        if (xfm.dsparkStages() > 0 and !dspark_env_off and arm != .off) {
             dspark_active = true;
             dspark_stochastic = arm == .stochastic;
             if (dspark_stochastic) {
@@ -152,6 +157,10 @@ pub fn initWithOptions(
     // `&ctx` to every forward call below; the cache/moe/ssm fields
     // mutate in-place through their pointers.
     var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
+    // Only an echo of prompt logprobs reads a prompt forward's logits before its last row.
+    ctx.last_row_logits = options.prompt_logprobs == null;
+    // A grow allocates no slack past the context and the rows a verify writes past its last token.
+    ctx.cache.limitGrowth(@as(usize, context.getEffectiveContextLength(&xfm.config)) + verify_rows_max);
 
     const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
     defer allocator.free(ids_i32);
@@ -193,7 +202,7 @@ pub fn initWithOptions(
     // start at ssm_checkpoint_pos_offset, so the final KV length is that
     // offset plus everything we're about to forward.
     const total_ctx_for_chunk = options.ssm_checkpoint_pos_offset + prompt_ids.len;
-    const PREFILL_CHUNK: usize = decodeShareCapped(effectivePrefillChunk(
+    const PREFILL_CHUNK: usize = decodeShareCapped(xfm.config.cappedPrefillChunk(effectivePrefillChunk(
         xfm.config.prefillScoreHeadDim(),
         xfm.config.num_attention_heads,
         total_ctx_for_chunk,
@@ -201,7 +210,7 @@ pub fn initWithOptions(
         xfm.config.isMoe(),
         xfm.config.longCtxGated(),
         options.pinned_prefill_chunk,
-    ), options.decode_share_width_cap);
+    )), options.decode_share_width_cap);
     // Phase-level prefill instrumentation. Enabled at debug level OR via
     // diag prefill-trace (which forces the trace line at info).
     // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill
@@ -258,6 +267,8 @@ pub fn initWithOptions(
     // checkpoint-retention `ssm_low_anchors` wiring. A non-gated arch keeps the
     // coarsened stride's own boundary chunking — the grid adds it no chunks.
     const dense_low_grid: bool = xfm.config.longCtxGated();
+    // The prefill's checkpoint retention: one value for the chunk loop and a whole-prompt prefill.
+    const cp_thin: transformer_mod.ThinPolicy = if (xfm.config.longCtxGated()) .min_span_recency else .oldest;
 
     // Qwen native MTP: build the head's committed-history KV cache during
     // prefill. Entry j pairs (trunk hidden at prompt position j, token at
@@ -374,10 +385,7 @@ pub fn initWithOptions(
         // is not in place, so a long prefill's peak carried a second copy of everything so
         // far (~7.75 GB at 458k on qwen4_exp, #353). Same number the admission guard billed
         // (`KVCache.reservedTokens`), in ABSOLUTE positions: `prompt_ids` is the tail after
-        // a prefix-cache hit. `cp_thin` names this site's previous retention policy.
-        const cp_thin: transformer_mod.ThinPolicy =
-            if (xfm.config.longCtxGated()) .min_span_recency else .oldest;
-
+        // a prefix-cache hit.
         const reserved_tokens = reservedPrefillTokens(
             &xfm.config,
             total_ctx_for_chunk,
@@ -559,7 +567,7 @@ pub fn initWithOptions(
             const abs_end_for_cp2 = end + ssm_cp_offset;
             if (want_ssm_cp and ssmCapturePos(ssm_cp_stride, abs_end_for_cp2, dense_low_grid)) {
                 const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
-                ssm_checkpoints.append(allocator, cp) catch |e| {
+                fileCheckpoint(allocator, &ssm_checkpoints, cp, options.ssm_checkpoint_max, cp_thin, options.ssm_low_anchors) catch |e| {
                     var doomed = cp;
                     doomed.deinit(allocator);
                     return e;
@@ -572,21 +580,6 @@ pub fn initWithOptions(
                 if (mtp_active) if (xfm.qwen4Trunk()) |t| t.qwen4MtpMarkQsaLeftover(abs_end_for_cp2 -| mtp_position_base) catch |e| {
                     log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                 };
-                // Thin the interior, never the oldest (#330): drop-oldest survivors covered only
-                // the last `max * stride` tokens and left no affordable trim point.
-                if (options.ssm_checkpoint_max > 0 and
-                    ssm_checkpoints.items.len > options.ssm_checkpoint_max)
-                {
-                    var dropped = ssm_checkpoints.orderedRemove(
-                        transformer_mod.ssmCheckpointDropIndexLowAnchored(
-                            ssm_checkpoints.items,
-                            cp_thin,
-                            null,
-                            options.ssm_low_anchors,
-                        ),
-                    );
-                    dropped.deinit(allocator);
-                }
             }
 
             if (has_vision) {
@@ -683,7 +676,7 @@ pub fn initWithOptions(
                 // or a partial tail (also evaluated). The snapshot is a
                 // cheap refcount-share.
                 const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, final_abs, xfm.s);
-                ssm_checkpoints.append(allocator, cp) catch |e| {
+                fileCheckpoint(allocator, &ssm_checkpoints, cp, options.ssm_checkpoint_max, cp_thin, options.ssm_low_anchors) catch |e| {
                     var doomed = cp;
                     doomed.deinit(allocator);
                     return e;
@@ -696,19 +689,6 @@ pub fn initWithOptions(
                 if (mtp_active) if (xfm.qwen4Trunk()) |t| t.qwen4MtpMarkQsaLeftover(final_abs -| mtp_position_base) catch |e| {
                     log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                 };
-                if (options.ssm_checkpoint_max > 0 and
-                    ssm_checkpoints.items.len > options.ssm_checkpoint_max)
-                {
-                    var dropped = ssm_checkpoints.orderedRemove(
-                        transformer_mod.ssmCheckpointDropIndexLowAnchored(
-                            ssm_checkpoints.items,
-                            cp_thin,
-                            null,
-                            options.ssm_low_anchors,
-                        ),
-                    );
-                    dropped.deinit(allocator);
-                }
             }
             // One copy of the QSA key history on the latest snap. Stride
             // captures skipped it so a 400k prefill is not 32× the
@@ -770,6 +750,37 @@ pub fn initWithOptions(
         ctx.prefill_progress = options.prefill_progress;
     }
     defer ctx.prefill_progress = null;
+    // It is handed the spans the chunk loop would have run and the checkpoint positions the loop's list would keep, and
+    // files its checkpoints onto that list through `CacheOps.checkpoint`.
+    var whole_plan: ?WholePromptPlan = null;
+    defer if (whole_plan) |*wp| wp.deinit(allocator);
+    var prompt_cps: PromptCheckpoints = undefined;
+    var prompt_cp_sink: CheckpointSink = undefined;
+    if (final_start == 0 and tail_len > 1) {
+        whole_plan = try wholePromptPlan(allocator, prompt_ids.len, PREFILL_CHUNK, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, options.adaptive_chunk_width, dense_low_grid, .{
+            .max = options.ssm_checkpoint_max,
+            .thin = cp_thin,
+            .low_anchors = options.ssm_low_anchors,
+        });
+        ctx.prompt_spans = whole_plan.?.spans;
+        // The cache capacity the chunk loop reserves: a model that appends span by span grows it no more often.
+        ctx.cache.reserve(@intCast(reservedPrefillTokens(&xfm.config, total_ctx_for_chunk, max_tokens, PREFILL_CHUNK)));
+        if (whole_plan.?.checkpoints.len > 0) {
+            prompt_cps = .{
+                .allocator = allocator,
+                .list = &ssm_checkpoints,
+                .positions = whole_plan.?.checkpoints,
+                .layers = ctx.ssm_entries.?.len,
+                .s = xfm.s,
+                .max = options.ssm_checkpoint_max,
+                .thin = cp_thin,
+                .low_anchors = options.ssm_low_anchors,
+            };
+            prompt_cp_sink = prompt_cps.sink();
+            ctx.ssm_cp_positions = whole_plan.?.checkpoints;
+            ctx.cp_sink = &prompt_cp_sink;
+        }
+    }
     const raw_logits = if (tail_mtp_capture) blk: {
         has_captured_hidden = true;
         break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);
@@ -777,38 +788,64 @@ pub fn initWithOptions(
         has_captured_hidden = true;
         break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
     } else try xfm.forwardWith(&ctx, last_input);
+    // The plan, the sink and the last-row read are the prompt's: the generator below keeps a copy of `ctx`.
+    ctx.prompt_spans = &.{};
+    ctx.ssm_cp_positions = &.{};
+    ctx.cp_sink = null;
+    ctx.last_row_logits = false;
     // History entries for the held-back span: (hidden[j], token[j+1]) for
     // j in [final_start, prefix_len) — same pairing as the chunk loop.
     // The last row's pair (hidden[last], t1) is appended by the first
-    // nextMtp round, exactly as before.
+    // nextMtp round, exactly as before. A whole-prompt prefill appends its
+    // history over the chunk loop's spans, window rule included, each span
+    // evaluated before the next: one head forward over the whole prompt would
+    // score every row against every key at once.
     if (tail_mtp_capture) {
-        if (!mtp_history_started) {
-            std.debug.assert(mtp_cache.?.step() == 0);
-            mtp_position_base = ssm_cp_offset + final_start;
-            mtp_history_started = true;
+        const prefix_len = prompt_ids.len - 1;
+        const ends: []const u64 = if (whole_plan) |wp| wp.spans else &.{};
+        const hist_window = effectiveMtpHistoryWindow(prefix_len, generate_mod.mtp_history_window_override);
+        var lo: usize = final_start;
+        var k: usize = 0;
+        while (lo < prefix_len) : (k += 1) {
+            const last = k + 1 >= ends.len;
+            const hi: usize = if (last) prefix_len else @intCast(ends[k] - ssm_cp_offset);
+            if (hi <= lo) continue;
+            defer lo = hi;
+            if (!last and !chunkNeedsMtpHistory(lo, hi, prefix_len, hist_window)) continue;
+            if (!mtp_history_started) {
+                std.debug.assert(mtp_cache.?.step() == 0);
+                mtp_position_base = ssm_cp_offset + lo;
+                mtp_history_started = true;
+            }
+            var span_hidden = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(span_hidden);
+            const all_shape = mlx.getShape(tail_hidden_all);
+            const start = [_]c_int{ 0, @intCast(lo - final_start), 0 };
+            const stop = [_]c_int{ all_shape[0], @intCast(hi - final_start), all_shape[2] };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&span_hidden, tail_hidden_all, &start, 3, &stop, 3, &strides, 3, xfm.s));
+            const tail_mrope_ctx: ?mtp_mod.MropeContext = if (ctx.mrope_pos) |positions| .{
+                .pos = positions,
+                .total = ctx.mrope_total,
+                .delta = ctx.mrope_delta,
+                .base = mtp_position_base,
+            } else null;
+            try options.mtp.?.appendHistory(
+                xfm,
+                &mtp_cache.?,
+                prompt_ids[lo + 1 .. hi + 1],
+                span_hidden,
+                @intCast(mtp_cache.?.step()),
+                tail_mrope_ctx,
+                allocator,
+            );
+            if (!last) {
+                const eval_vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(eval_vec);
+                mtp_cache.?.appendEvalArrays(eval_vec);
+                try mlx.check(mlx.mlx_eval(eval_vec));
+            }
         }
-        var tail_hist_hidden = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(tail_hist_hidden);
-        const all_shape = mlx.getShape(tail_hidden_all);
-        const start = [_]c_int{ 0, 0, 0 };
-        const stop = [_]c_int{ all_shape[0], @intCast(tail_len - 1), all_shape[2] };
-        const strides = [_]c_int{ 1, 1, 1 };
-        try mlx.check(mlx.mlx_slice(&tail_hist_hidden, tail_hidden_all, &start, 3, &stop, 3, &strides, 3, xfm.s));
-        const tail_mrope_ctx: ?mtp_mod.MropeContext = if (ctx.mrope_pos) |positions| .{
-            .pos = positions,
-            .total = ctx.mrope_total,
-            .delta = ctx.mrope_delta,
-            .base = mtp_position_base,
-        } else null;
-        try options.mtp.?.appendHistory(
-            xfm,
-            &mtp_cache.?,
-            prompt_ids[final_start + 1 .. prompt_ids.len],
-            tail_hist_hidden,
-            @intCast(mtp_cache.?.step()),
-            tail_mrope_ctx,
-            allocator,
-        );
     }
     if (dflash_active) {
         ctx.capture_layers = null;
@@ -971,7 +1008,8 @@ pub fn initWithOptions(
             .pld_enabled = pld_active,
             .dspark_enabled = dspark_active,
             .dspark_stochastic = dspark_stochastic,
-            .dspark_pol = if (dspark_active and intree.dsv41(xfm) != null) .{ .calib = .{ .head = true } } else null,
+            // A streamed EXL3 bank verifies the whole block on a greedy request: its verify costs about a plain tick.
+            .dspark_pol = if (dspark_active) if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else null else null,
             .drafter = if (drafter_active) options.drafter else null,
             .drafter_block_size = options.drafter_block_size,
             .dflash = if (dflash_active) options.dflash else null,
@@ -1147,4 +1185,36 @@ pub fn initWithOptions(
 
     attachCp(&gen, &ssm_checkpoints, allocator);
     return gen;
+}
+
+// ── tests ──
+
+const testing = std.testing;
+const model_mod = @import("../../../sdk/config/model.zig");
+
+test "initWithOptions: suppress_cjk wires the CJK mask and fails without one" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try dflash_mod.TinyFix.writeTrunk(io, tmp.dir, path, s);
+    var cfg = try model_mod.parseConfig(io, a, path);
+    defer cfg.deinit(a);
+    var xfm = try plugin_driver.load(io, a, &cfg, path, s);
+    defer xfm.deinit();
+    var tok: Tokenizer = undefined;
+    const prompt = [_]u32{ 3, 7, 1 };
+    const cjk: SamplingParams = .{ .temperature = 0, .suppress_cjk = true };
+    try testing.expectError(error.SuppressCjkUnavailable, initWithOptions(io, a, &xfm, &tok, &prompt, 4, cjk, &.{}, .{}));
+    const mask_buf = try a.alloc(bool, cfg.vocab_size);
+    defer a.free(mask_buf);
+    @memset(mask_buf, false);
+    xfm.suppress_mask_cjk = mlx.mlx_array_new_data(mask_buf.ptr, &[_]c_int{@intCast(cfg.vocab_size)}, 1, .bool_);
+    var gen = try initWithOptions(io, a, &xfm, &tok, &prompt, 4, cjk, &.{}, .{ .skip_lazy_preforward = true });
+    defer gen.deinit(a);
+    try testing.expectEqual(xfm.suppress_mask_cjk.?.ctx, gen.sampling.suppress_mask.?.ctx);
 }

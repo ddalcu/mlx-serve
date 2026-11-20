@@ -365,9 +365,9 @@ if gh_line is not None:
     check("$FAST_DEV" in guard,
           "the `gh` round-trip is skipped under FAST_DEV too")
     # The skip has to LAND somewhere: an ad-hoc build still needs a CALVER.
-    adhoc_ver = b_first(r'CALVER="\$\(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString"')
+    adhoc_ver = b_first(r'CALVER="\$\(bash "\$PROJECT_ROOT/scripts/dev-version.sh"')
     check(adhoc_ver is not None and adhoc_ver < gh_line,
-          "the no-`gh` arm reuses the version already in the plist")
+          "the no-`gh` arm takes the source's version from scripts/dev-version.sh (git tags, then the plist)")
 
 stamp_targets = [l for l in b_code if "PlistBuddy" in l and "Set :CFBundle" in l]
 check(stamp_targets and all("$CONTENTS/Info.plist" in l for l in stamp_targets),

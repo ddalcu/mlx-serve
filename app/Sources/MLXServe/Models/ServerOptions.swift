@@ -308,6 +308,10 @@ struct ServerOptions: Codable, Equatable {
     /// server restart.
     var toolsOnlyWhenAsked: Bool = false
 
+    /// ON = ⌘Q closes the app's windows and keeps the app and the server
+    /// running in the menu bar (`QuitCommand`). App-level, like `sandbox`.
+    var quitKeepsRunning: Bool = false
+
     // MARK: Voice clone (app-level — NOT a server-launch flag, NOT per-request)
     /// Absolute path to the normalized voice-clone reference clip (24 kHz mono
     /// WAV) that hands-free voice mode speaks with, via Qwen3-TTS zero-shot
@@ -1012,6 +1016,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(TelegramConfig.self, forKey: .telegram) { telegram = v }
         if let v = try c.decodeIfPresent(SandboxConfig.self, forKey: .sandbox) { sandbox = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .toolsOnlyWhenAsked) { toolsOnlyWhenAsked = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .quitKeepsRunning) { quitKeepsRunning = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceClonePath) { voiceClonePath = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .voiceCloneEnabled) { voiceCloneEnabled = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceCloneLabel) { voiceCloneLabel = v }

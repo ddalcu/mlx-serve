@@ -38,14 +38,7 @@ mkdir -p "$RESULTS"
 [[ -x "$BINARY" ]] || { echo "[fatal] $BINARY not found — zig build -Doptimize=ReleaseFast"; exit 1; }
 command -v node >/dev/null || { echo "[fatal] node is required (llmprobe + the planner)"; exit 1; }
 
-kill_servers() {
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
-    for _ in $(seq 1 20); do
-        pgrep -f "mlx-serve.*--port $PORT" >/dev/null || return 0
-        sleep 0.5
-    done
-    pkill -9 -f "mlx-serve.*--port $PORT" 2>/dev/null || true
-}
+kill_servers() { srv_preclean "$PORT"; }
 trap 'kill_servers' EXIT
 
 # boot <logfile> <extra flags...> ; 0 = healthy and the model is resident

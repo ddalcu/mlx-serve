@@ -277,6 +277,7 @@ RESULT=$(curl -sf "$BASE/v1/messages" \
   -d '{
     "model": "mlx-serve",
     "max_tokens": 128,
+    "temperature": 0,
     "messages": [
       {"role": "user", "content": "What day is it?"},
       {"role": "assistant", "content": [
@@ -482,6 +483,42 @@ STREAM_CACHE_READ=$(printf '%s' "$STREAM_USAGE" | jq -r '.cache_read_input_token
 assert_gt "streaming message_delta usage.cache_read_input_tokens on repeat prompt" "$STREAM_CACHE_READ" "0"
 STREAM_TOTAL=$(printf '%s' "$STREAM_USAGE" | jq -r '.input_tokens + (.cache_creation_input_tokens // 0) + .cache_read_input_tokens')
 assert_eq "accumulated streaming input buckets equal actual prompt" "$PROMPT_TOKENS" "$STREAM_TOTAL"
+echo ""
+
+# ── Test: usage.output_tokens_details.thinking_tokens ──
+# A thinking block means a count above 0 and within output_tokens, no thinking means 0; streaming reports it on
+# message_delta. The tools case runs the stream's buffered (tool-gated) arm, the plain case its think-block arm.
+echo "=== Thinking usage reporting ==="
+assert_thinking_usage() {
+    local desc="$1" blocks="$2" thinking="$3" output="$4"
+    echo "  $desc: thinking blocks=$blocks thinking_tokens=$thinking output_tokens=$output"
+    if [ "$blocks" -gt 0 ] 2>/dev/null; then
+        assert_gt "$desc: thinking_tokens with a thinking block" "$thinking" 0
+        assert_gt "$desc: thinking_tokens within output_tokens" "$((output + 1))" "$thinking"
+    else
+        assert_eq "$desc: thinking_tokens without thinking" "0" "$thinking"
+    fi
+}
+WEATHER_TOOL='[{"name":"get_weather","description":"Get current weather for a city","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]'
+for CASE in "adaptive|plain|What is 17+25? Answer with just the number." \
+            "adaptive|tools|What is the weather in Paris right now? Use the get_weather tool." \
+            "disabled|plain|What is 17+25? Answer with just the number."; do
+    IFS='|' read -r THINK ARM PROMPT <<< "$CASE"
+    BODY=$(jq -nc --arg type "$THINK" --arg prompt "$PROMPT" --arg arm "$ARM" --argjson tools "$WEATHER_TOOL" \
+        '{model:"mlx-serve",max_tokens:800,temperature:0,thinking:{type:$type},messages:[{role:"user",content:$prompt}]}
+         + (if $arm == "tools" then {tools:$tools} else {} end)')
+    RESP=$(curl -sf -m 180 "$BASE/v1/messages" -H "Content-Type: application/json" -d "$BODY")
+    read -r BLOCKS THINKING OUTPUT <<< "$(printf '%s' "$RESP" | jq -r '[
+        ([.content[] | select(.type == "thinking" and (.thinking | length) > 0)] | length),
+        (.usage.output_tokens_details.thinking_tokens // "missing"), .usage.output_tokens] | @tsv')"
+    assert_thinking_usage "non-stream $ARM thinking=$THINK" "$BLOCKS" "$THINKING" "$OUTPUT"
+    EVENTS=$(curl -sf -N -m 180 "$BASE/v1/messages" -H "Content-Type: application/json" -d "$(printf '%s' "$BODY" | jq -c '.stream = true')")
+    read -r BLOCKS THINKING OUTPUT <<< "$(printf '%s' "$EVENTS" | jq -Rn -r '[inputs | select(startswith("data: ")) | .[6:] | fromjson] as $ev
+        | ([$ev[] | select(.type == "message_delta")] | last | .usage) as $u
+        | [([$ev[] | select(.type == "content_block_start" and .content_block.type == "thinking")] | length),
+           ($u.output_tokens_details.thinking_tokens // "missing"), $u.output_tokens] | @tsv')"
+    assert_thinking_usage "stream $ARM thinking=$THINK" "$BLOCKS" "$THINKING" "$OUTPUT"
+done
 echo ""
 
 # ── Summary ──

@@ -184,6 +184,20 @@ ended. Cause: the checkpoint samples Claude's dialect; no parser, gate or scrubb
 `<function_calls>` / `<invoke …` prefixes; `bareInvokeMarkupCut` cuts only beside `<parameter ` or `</invoke>`. Guard:
 corpus family `qwen4_exp`, the prose and in-value negative tests.
 
+### Qwen3.8 Flash Next collapsed its call: the tool name in a parameter tag (#1114)
+Defect: a pi turn streamed only reasoning, then `stop` with no content and no call. Cause: the model wrote
+`<tool_call><parameter=bash><parameter=command>…</function>`, the `<function=bash>` layer spelled as a parameter;
+no parser took it and the leak trim cut the held block. Fix: `hermesCollapsedOpenerRepair` reads a first, valueless
+`<parameter=NAME>` directly followed by another opener as `<function=NAME>`, `.inferred` (a declared tool only).
+Guard: corpus family `qwen4_exp` (the call, and an undeclared name that stays no call).
+
+### `tool_choice: "required"` returned a tool named `call` (#1153)
+Defect: with one declared tool and an off-topic prompt, Qwen3.8-Flash-Next's forced call came back as
+`function.name: "call"`. Cause: `required` commits the bare opener `<tool_call>\n<function` and leaves the name to
+the model, which had started a prose answer. Fix: a forced choice over a single declared tool is that tool
+(`narrowForced`), so the opener and the instruction line spell its name, as the named form always did. With several
+tools the name is still the model's. Guard: `narrowForced` test.
+
 ### LFM2.5's pythonic call grammar
 Defect: LFM2.5 tool requests came back empty. Cause: `<|tool_call_start|>[get_weather(city='Paris',
 metric=True)]<|tool_call_end|>` matched no parser, and the leak trim cut it. Fix: `pythonicLiteral` parses Python

@@ -69,7 +69,9 @@ enum ContextCompaction {
         // The caller passes the complete transcript. Retain at least twelve
         // semantic messages; display-only cards must not consume the tail.
         let raw = transcript(source)
-        let meaningful = raw.indices.filter { !raw[$0].isAgentSummary && !raw[$0].failedRetry && !raw[$0].isStreaming }
+        let meaningful = raw.indices.filter {
+            !raw[$0].isAgentSummary && !raw[$0].isStreaming && isSummarizable(raw[$0])
+        }
         guard meaningful.count > 14 else { return nil }
         var cut = meaningful[meaningful.count - 12]
         // A result and all sibling results stay with their initiating call.
@@ -105,13 +107,15 @@ enum ContextCompaction {
         return messages
     }
 
+    private static func isSummarizable(_ message: ChatMessage) -> Bool {
+        (!message.isAgentSummary || message.contextCheckpoint != nil)
+            && !message.failedRetry && message.errorNotice == nil && !message.isLegacyFailure
+            && (!message.content.isEmpty || !(message.toolCalls ?? []).isEmpty || message.toolCallId != nil
+                || !(message.images ?? []).isEmpty || !(message.videos ?? []).isEmpty || !(message.audio ?? []).isEmpty)
+    }
+
     static func summaryText(_ source: [ChatMessage]) -> String {
-        let messages: [[String: Any]] = source.filter {
-            (!$0.isAgentSummary || $0.contextCheckpoint != nil) && !$0.failedRetry && $0.errorNotice == nil
-                && !$0.isLegacyFailure
-                && (!$0.content.isEmpty || !($0.toolCalls ?? []).isEmpty || $0.toolCallId != nil
-                    || !($0.images ?? []).isEmpty || !($0.videos ?? []).isEmpty || !($0.audio ?? []).isEmpty)
-        }.map { msg in
+        let messages: [[String: Any]] = source.filter(isSummarizable).map { msg in
             var paths: [String] = (msg.images ?? []).map { $0.path ?? "image \($0.id)" }
             paths += (msg.videos ?? []).map { $0.path ?? $0.name }
             paths += (msg.audio ?? []).map { $0.path ?? $0.name }

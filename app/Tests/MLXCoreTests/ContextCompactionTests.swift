@@ -124,15 +124,19 @@ struct ContextCompactionTests {
         api.count = 30000
         api.onCount = nil
         api.onSummary = { state.chatSessions[index].messages[0].content = "edited during summary" }
-        do {
-            _ = try await state.chatEngine.prepareCompactedContext(api: api, sessionId: session.id,
-                config: .init(agentMode: false, mcpMode: false, enableThinking: false, voiceStyle: false,
-                              workingDirectory: nil, tools: [], maxTokens: 256),
-                context: 32768, tools: String(repeating: "x", count: 90000)) { _ in
-                    [["role": "user", "content": "original"]]
-                }
-            Issue.record("Failed summary must not send history edited while it was running")
-        } catch ContextCompaction.Failure.changedHistory { }
+        for events in [nil, [SSEEvent.content("summary"), .done]] {
+            state.chatSessions[index].messages[0].content = "original"
+            api.summaryEvents = events
+            do {
+                _ = try await state.chatEngine.prepareCompactedContext(api: api, sessionId: session.id,
+                    config: .init(agentMode: false, mcpMode: false, enableThinking: false, voiceStyle: false,
+                                  workingDirectory: nil, tools: [], maxTokens: 256),
+                    context: 32768, tools: String(repeating: "x", count: 90000)) { _ in
+                        [["role": "user", "content": "original"]]
+                    }
+                Issue.record("Summary must not send history edited while it was running")
+            } catch ContextCompaction.Failure.changedHistory { }
+        }
         #expect(!state.chatSessions[index].messages.contains { $0.contextCheckpoint != nil })
     }
 
@@ -322,7 +326,8 @@ struct ContextCompactionTests {
         let history = ContextCompaction.appendingSummary(to: AgentEngine.buildAgentHistory(messages: source,
             contextLength: 32768, maxTokens: 4096), source: source)
         #expect((history.first?["content"] as? String)?.contains("retained facts") == true)
-        #expect((history.first { $0["tool_call_id"] as? String == "answered" }?["content"] as? String)?.count == 2000)
+        let answered = history.first { $0["tool_call_id"] as? String == "answered" }?["content"] as? String
+        #expect(answered == String(repeating: "x", count: 2000) + AgentEngine.toolResultCutMarker(dropped: 2000))
         #expect((history.first { $0["tool_call_id"] as? String == "unanswered" }?["content"] as? String)?.count == 4000)
         #expect(history.contains { $0["reasoning_content"] as? String == "reasoning" })
     }
@@ -506,4 +511,23 @@ struct ContextCompactionTests {
             print("ENGINE_COMPACTION mode=\(agent ? "agent" : "plain") oversized=\(oversized) retained=ENGINE-771 compacted=\(shouldCompact)")
         }
     }
+
+    @Test func testDisplayOnlyErrorsAndEmptyRowsDoNotConsumeRecentTail() throws {
+        let real = (0..<20).map {
+            ChatMessage(role: $0 % 2 == 0 ? .user : .assistant, content: "real fact \($0)")
+        }
+        var source = real
+        for _ in 0..<4 {
+            var error = ChatMessage(role: .assistant, content: "request failed")
+            error.errorNotice = ChatErrorNotice(kind: .contextOverflow, message: "failure", neededTokens: 300, contextLength: 256)
+            source += [ChatMessage(role: .assistant, content: ""), error,
+                       ChatMessage(role: .assistant, content: "couldn't generate a response")]
+        }
+        let plan = try #require(ContextCompaction.plan(source))
+        source.append(ContextCompaction.checkpoint(summary: "older facts", source: source, boundary: plan.boundary))
+        let realIDs = Set(real.map(\.id))
+        let kept = ContextCompaction.activeMessages(source).filter { realIDs.contains($0.id) }
+        #expect(kept.count >= 12)
+    }
+
 }

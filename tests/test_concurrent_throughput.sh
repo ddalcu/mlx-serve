@@ -4,6 +4,7 @@
 # "batching is serialized", not a speed claim).
 #
 #   CONCURRENT_TEST_MODEL=<dir> ./tests/test_concurrent_throughput.sh [port]   # default gemma-4-e4b-it-8bit
+source "$(dirname "$0")/lib/server.sh"
 source "$(dirname "$0")/_lib_models.sh"
 
 set -e
@@ -61,7 +62,7 @@ echo "  model: $MODEL"
 echo "  max_tokens: $MAX_TOKENS, parallel: $N_PARALLEL, threshold: ${SPEEDUP_THRESHOLD}× speedup"
 echo
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 LOGFILE=$(mktemp)

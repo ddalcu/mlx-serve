@@ -31,7 +31,7 @@ fi
 M1="${MODELS[0]}"; M2="${MODELS[1]}"
 
 BINARY="${MLX_SERVE_BINARY:-./zig-out/bin/mlx-serve}"
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 LOGFILE=$(mktemp)
 "$BINARY" --model-dir "$ROOT" --model "$ROOT/$M1" --serve --port "$PORT" \

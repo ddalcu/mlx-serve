@@ -317,3 +317,194 @@ test "plugin MTP heads: a round opens at head 0, each chained draft runs the nex
     _ = try h.forward(&b.xfm, &c, try idArr(&g, &.{11}), trunk, 3, .mixed, null, null);
     try testing.expectEqual(@as(u32, 0), Heads3.ran[Heads3.n - 1]);
 }
+
+/// A head that records each history append's rows and position and hands the trunk hidden back otherwise.
+const History = struct {
+    var rows: [16]u32 = undefined;
+    var at: [16]u32 = undefined;
+    var n: usize = 0;
+
+    fn forward(_: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+        if (f.logits == .none and !f.want_hidden) {
+            if (n < rows.len) {
+                rows[n] = f.rows;
+                at[n] = f.positions.slice()[0];
+            }
+            n += 1;
+            return .ok;
+        }
+        var h = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&h, .{ .ctx = f.hidden_in.ctx });
+        out.hidden = .{ .ctx = h.ctx };
+        return .ok;
+    }
+    const hooks: abi.HeadHooks = blk: {
+        var hk = head_hooks;
+        hk.forward = &forward;
+        break :blk hk;
+    };
+    const spec: abi.SpecHooks = .{ .head = &hooks, .trunk_weight = llama.table.spec.?.trunk_weight };
+    const table: abi.ModelTable = blk: {
+        var t = llama.table;
+        t.spec = &spec;
+        break :blk t;
+    };
+};
+
+// Bar: a whole-prompt prefill reserves the chunk loop's KV capacity and appends its MTP history in the chunk loop's
+// appends (rows and positions), never one.
+test "plugin MTP head: a whole-prompt prefill reserves the chunk loop's KV and appends the history over its spans" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var b: proof.Served = undefined;
+    try b.open(.{ .quantized = true }, 0x3e7c);
+    defer b.close();
+    b.xfm.plugin.?.table = &History.table;
+    const served = plugin_head.load(io, a, &b.xfm, b.dir) orelse return error.TestHeadNotLoaded;
+    defer plugin_head.destroy(served, a);
+    // 64-token chunks with the 512-token tail merge: the 507 tokens past 192 join the third chunk, so the spans end at 64,
+    // 128 and 699, then the last token.
+    var prompt: [700]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(4 + (i * 37) % 250);
+    var got: [2][]const u32 = undefined;
+    var got_at: [2][]const u32 = undefined;
+    var bufs: [2][2][16]u32 = undefined;
+    for ([_]bool{ true, false }, 0..) |whole, k| {
+        b.xfm.config.plugin.?.parsed.caps.whole_prompt_prefill = whole;
+        try b.xfm.resetCache();
+        History.n = 0;
+        var tok: Tokenizer = undefined; // never read by the Generator
+        var gen = try Generator.initWithOptions(io, a, &b.xfm, &tok, &prompt, 2, .{ .temperature = 0.0 }, &.{}, .{
+            .mtp_enabled = true,
+            .mtp = .{ .plugin = served },
+            .model_has_mtp = true,
+            .mtp_depth = 1,
+            .pinned_prefill_chunk = 64,
+        });
+        defer gen.deinit(a);
+        // The fixture's cache starts unreserved: 700 prompt tokens plus one 64-token chunk of slack.
+        if (whole) try testing.expectEqual(@as(usize, 764), gen.ctx.cache.reserve_tokens);
+        try testing.expect(History.n <= History.rows.len);
+        bufs[k][0] = History.rows;
+        bufs[k][1] = History.at;
+        got[k] = bufs[k][0][0..History.n];
+        got_at[k] = bufs[k][1][0..History.n];
+    }
+    try testing.expectEqualSlices(u32, &.{ 64, 64, 571 }, got[1]);
+    try testing.expectEqualSlices(u32, got[0], got[1]);
+    try testing.expectEqualSlices(u32, got_at[0], got_at[1]);
+}
+
+/// A whole-prompt model that chunks its own prompt (`Caps.whole_prompt_prefill`, as deepseek_v41 runs its own calls):
+/// handed the chunk loop's spans (`Forward.prompt_spans`), it runs llama's forward a span, each span's logits and
+/// hidden rows joined, so its rows are the chunk loop's; any other forward is llama's. Its head is the test head.
+const SelfChunked = struct {
+    fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+        if (f.mode != .prefill or f.prompt_spans.len == 0) return llama.table.forward(mp, f, out);
+        spans(mp, f, out) catch return abi.Verdict.refuse(.failed, "self-chunked prompt");
+        return .ok;
+    }
+
+    fn spans(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) !void {
+        if (f.ids.ctx == null or f.capture_layers.len > 0) return error.SelfChunkedForward;
+        var g = ops.Graph.init(testing.allocator, fixture.stream());
+        defer g.deinit();
+        var logits: std.ArrayList(Array) = .empty;
+        defer logits.deinit(testing.allocator);
+        var hidden: std.ArrayList(Array) = .empty;
+        defer hidden.deinit(testing.allocator);
+        const ids: Array = .{ .ctx = f.ids.ctx };
+        const pos0: u64 = f.positions.slice()[0];
+        const ends = f.prompt_spans.slice();
+        var lo = pos0;
+        for (ends, 0..) |hi, k| {
+            const at = [_]u32{@intCast(lo)};
+            var sub = f.*;
+            sub.mode = if (hi - lo == 1) .decode else .prefill;
+            sub.rows = @intCast(hi - lo);
+            sub.positions = .of(&at);
+            sub.ids = .{ .ctx = (try g.sliceAxis(ids, 1, @intCast(lo - pos0), @intCast(hi - pos0))).ctx };
+            sub.logits = if (f.logits == .last_row and k + 1 < ends.len) .none else f.logits;
+            sub.prompt_spans = .{};
+            sub.ssm_checkpoints = .{};
+            sub.progress = null;
+            var so: abi.ForwardOut = .{};
+            const v = llama.table.forward(mp, &sub, &so);
+            if (so.logits.ctx != null) try logits.append(testing.allocator, try g.adopt(.{ .ctx = so.logits.ctx }));
+            if (so.hidden.ctx != null) try hidden.append(testing.allocator, try g.adopt(.{ .ctx = so.hidden.ctx }));
+            if (!v.isOk()) return error.SelfChunkedSpan;
+            lo = hi;
+        }
+        if (logits.items.len > 0) out.logits = .{ .ctx = g.escape(try g.concat(logits.items, 0)).ctx };
+        if (hidden.items.len > 0) out.hidden = .{ .ctx = g.escape(try g.concat(hidden.items, 1)).ctx };
+    }
+
+    const table: abi.ModelTable = blk: {
+        var t = llama.table;
+        t.spec = &spec_hooks;
+        t.forward = &forward;
+        break :blk t;
+    };
+};
+
+// Bar: a model that chunks its own whole prompt reserves the chunk loop's KV capacity and leaves the MTP head's history
+// (rows, keys and values) the chunk loop's, bit for bit.
+test "plugin MTP head: a self-chunking whole-prompt model's KV reservation and MTP history are the chunk loop's, bit for bit" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const geo: proof.Geo = .{ .quantized = true };
+    var b: proof.Served = undefined;
+    try b.open(geo, 0x3e7d);
+    defer b.close();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const head_dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    try writeHead(head_dir, geo);
+    // The qwen-layout head's q projection carries its output gate (a llama trunk never reads the flag).
+    b.xfm.config.attn_output_gate = true;
+    double.m = try mtp_mod.loadMtp(io, a, fixture.stream(), head_dir);
+    defer double.m.deinit();
+    double.target = &b.xfm;
+    b.xfm.plugin.?.table = &SelfChunked.table;
+    const served = plugin_head.load(io, a, &b.xfm, b.dir) orelse return error.TestHeadNotLoaded;
+    defer plugin_head.destroy(served, a);
+    // 64-token chunks with the 512-token tail merge: the 507 tokens past 192 join the third chunk, so the spans end at 64,
+    // 128 and 699, then the last token.
+    var prompt: [700]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(4 + (i * 37) % 250);
+    var g = ops.Graph.init(a, fixture.stream());
+    defer g.deinit();
+    var reserved: [2]usize = undefined;
+    var rows: [2]usize = undefined;
+    var keys: [2]Array = undefined;
+    var values: [2]Array = undefined;
+    for ([_]bool{ false, true }, 0..) |whole, k| {
+        b.xfm.config.plugin.?.parsed.caps.whole_prompt_prefill = whole;
+        try b.xfm.resetCache();
+        var tok: Tokenizer = undefined; // never read by the Generator
+        var gen = try Generator.initWithOptions(io, a, &b.xfm, &tok, &prompt, 2, .{ .temperature = 0.0 }, &.{}, .{
+            .mtp_enabled = true,
+            .mtp = .{ .plugin = served },
+            .model_has_mtp = true,
+            .mtp_depth = 1,
+            .pinned_prefill_chunk = 64,
+        });
+        defer gen.deinit(a);
+        reserved[k] = gen.ctx.cache.reserve_tokens;
+        const e = gen.mtp_cache.?.plugin.kv.entries[0];
+        rows[k] = e.offset - e.base;
+        keys[k] = try g.sliceAxis(e.keys, 2, 0, @intCast(rows[k]));
+        values[k] = try g.sliceAxis(e.values, 2, 0, @intCast(rows[k]));
+        try ops.eval(keys[k]);
+        try ops.eval(values[k]);
+    }
+    // The chunk loop's reservation (`reservedPrefillTokens`: 700 prompt tokens and a 64-token chunk) on both paths.
+    try testing.expectEqual(@as(usize, 764), reserved[0]);
+    try testing.expectEqual(reserved[0], reserved[1]);
+    // The history holds the prompt's 699 pairs (the last row's pair is the first round's), the same words on both.
+    try testing.expectEqual(@as(usize, 699), rows[0]);
+    try testing.expectEqual(rows[0], rows[1]);
+    try ops.expectBitEqual(keys[1], keys[0]);
+    try ops.expectBitEqual(values[1], values[0]);
+}

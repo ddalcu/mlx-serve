@@ -1,14 +1,13 @@
 //! A standard MLX pack's routed experts streamed as downloaded (mlx-lm / mlx-community layout, affine): every tensor
-//! named `<prefix>.switch_mlp.{gate,up,down}_proj.{weight,scales,biases}` (experts stacked on axis 0) or
+//! named `<prefix>.{switch_mlp,experts}.{gate,up,down}_proj.{weight,scales,biases}` (experts stacked on axis 0) or
 //! `<prefix>.experts.<e>.{gate,up,down}_proj.*` (one tensor per expert) is located in its shard through the
 //! safetensors headers and read part by part into the expert stream's slot rows (`scatter`: an expert's nine parts live
 //! in separate tensors, possibly separate shards). The MTP head's experts are not routed layers here. The stream, its
-//! residency policy and the read pool are `sdk_ext.expert`'s; the MoE math stays the trunk's.
+//! residency policy and the read pool are `expert.zig`'s; the MoE math stays the trunk's.
 
 const std = @import("std");
-const sdk = @import("sdk");
-const mlx = sdk.mlx;
-const expert = @import("sdk_ext.zig").expert;
+const mlx = @import("../../../mlx/ffi.zig");
+const expert = @import("expert.zig");
 const io = expert.io;
 const Module = @This();
 
@@ -173,8 +172,10 @@ const Found = struct {
                 if (!std.mem.eql(u8, t.dtype, want_dtype)) return error.StreamedPackDtype;
                 const sh = if (stacked) t.shape[1..] else t.shape;
                 if (sh.len != 2 or (stacked and (t.shape.len != 3 or t.shape[0] != n_experts))) return error.StreamedPackShape;
-                const one = sh[0] * sh[1] * elem;
-                if (t.len != one * @as(u64, if (stacked) n_experts else 1)) return error.StreamedPackShape;
+                // A downloaded header's dims: the slot arrays take them as `c_int`, and their product must not wrap.
+                if (sh[0] > std.math.maxInt(c_int) or sh[1] > std.math.maxInt(c_int)) return error.StreamedPackShape;
+                const one = std.math.mul(u64, sh[0] * sh[1], elem) catch return error.StreamedPackShape;
+                if (t.len != (std.math.mul(u64, one, if (stacked) n_experts else 1) catch return error.StreamedPackShape)) return error.StreamedPackShape;
                 if (e == 0) {
                     l.segments[c] = .{ .dtype = if (c % 3 == 0) .U32 else .BF16, .shape = .{ sh[0], sh[1] }, .offset = l.logical_bytes, .length = one };
                     l.logical_bytes += one;
@@ -246,7 +247,7 @@ fn scanShard(a: std.mem.Allocator, fd: io.UncachedFd, file: u32, found: *std.Str
 
 /// A routed expert tensor's layer prefix, expert (null: stacked) and component; null for any other tensor (the MTP
 /// head's included).
-fn routedOf(key: []const u8) ?struct { prefix: []const u8, expert: ?u32, comp: u8 } {
+pub fn routedOf(key: []const u8) ?struct { prefix: []const u8, expert: ?u32, comp: u8 } {
     if (std.mem.startsWith(u8, key, "mtp.") or std.mem.indexOf(u8, key, ".mtp.") != null) return null;
     const parts = [_][]const u8{ ".weight", ".scales", ".biases" };
     const projs = [_][]const u8{ ".gate_proj", ".up_proj", ".down_proj" };
@@ -264,7 +265,7 @@ fn routedOf(key: []const u8) ?struct { prefix: []const u8, expert: ?u32, comp: u
     rest = rest[0 .. rest.len - (if (v4) v4_projs else projs)[proj].len];
     const comp: u8 = @intCast(proj * 3 + part);
     if (v4) return if (std.mem.endsWith(u8, rest, ".experts")) .{ .prefix = rest[0 .. rest.len - ".experts".len], .expert = null, .comp = comp } else null;
-    if (std.mem.endsWith(u8, rest, ".switch_mlp")) return .{ .prefix = rest[0 .. rest.len - ".switch_mlp".len], .expert = null, .comp = comp };
+    for ([_][]const u8{ ".switch_mlp", ".experts" }) |c| if (std.mem.endsWith(u8, rest, c)) return .{ .prefix = rest[0 .. rest.len - c.len], .expert = null, .comp = comp };
     const at = std.mem.lastIndexOf(u8, rest, ".experts.") orelse return null;
     const e = std.fmt.parseInt(u32, rest[at + ".experts.".len ..], 10) catch return null;
     return .{ .prefix = rest[0..at], .expert = e, .comp = comp };
@@ -378,6 +379,22 @@ pub const Source = struct {
 
 const testing = std.testing;
 
+test "mlx pack: a header whose expert dims pass c_int or whose bytes wrap u64 is refused by name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fds = [_]io.UncachedFd{.{ .fd = -1, .size = 0 }};
+    const big: u64 = std.math.maxInt(c_int);
+    // The stacked bytes at [2, big, big] wrap u64; the claimed lengths are the wrapped products.
+    inline for (.{ [_]u64{ 2, big, big }, [_]u64{ 2, big + 1, 1 } }) |shape| {
+        var f: Found = .{};
+        for (&f.stacked, 0..) |*x, c| {
+            const elem: u64 = if (c % 3 == 0) 4 else 2;
+            x.* = .{ .file = 0, .start = 0, .len = shape[1] *% shape[2] *% elem *% 2, .dtype = if (c % 3 == 0) "U32" else "BF16", .shape = &shape };
+        }
+        try testing.expectError(error.StreamedPackShape, f.layer(arena.allocator(), "p", &fds));
+    }
+}
+
 test "mlx pack: routed expert names, stacked and per expert; the MTP head's and other tensors are not" {
     const st = routedOf("language_model.model.layers.3.mlp.switch_mlp.down_proj.biases").?;
     try testing.expectEqualStrings("language_model.model.layers.3.mlp", st.prefix);
@@ -392,7 +409,10 @@ test "mlx pack: routed expert names, stacked and per expert; the MTP head's and 
     try testing.expectEqual(@as(?u32, null), ds.expert);
     try testing.expectEqual(@as(u8, 4), ds.comp);
     try testing.expectEqual(@as(u8, 6), routedOf("language_model.layers.5.ffn.experts.w2.weight").?.comp);
-    for ([_][]const u8{ "language_model.layers.5.ffn.shared_experts.w1.weight", "language_model.mtp.0.ffn.experts.w1.weight", "mtp.layers.0.mlp.switch_mlp.gate_proj.weight", "model.layers.0.mlp.shared_expert.gate_proj.weight", "model.layers.0.mlp.gate.weight", "model.layers.0.mlp.switch_mlp.gate_proj.bias" }) |k|
+    const ox = routedOf("model.layers.2.mlp.experts.gate_proj.weight").?;
+    try testing.expectEqualStrings("model.layers.2.mlp", ox.prefix);
+    try testing.expectEqual(@as(?u32, null), ox.expert);
+    for ([_][]const u8{ "model.layers.0.mlp.shared_experts.gate_proj.weight", "language_model.layers.5.ffn.shared_experts.w1.weight", "language_model.mtp.0.ffn.experts.w1.weight", "mtp.layers.0.mlp.switch_mlp.gate_proj.weight", "model.layers.0.mlp.shared_expert.gate_proj.weight", "model.layers.0.mlp.gate.weight", "model.layers.0.mlp.switch_mlp.gate_proj.bias" }) |k|
         try testing.expect(routedOf(k) == null);
     try testing.expectEqual(@as(u64, 12), layerNumber("model.layers.12.mlp"));
 }

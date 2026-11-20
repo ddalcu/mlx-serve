@@ -6,6 +6,7 @@
 # (or flips) the gap.
 #
 # Output: FUSED_KV_RESULTS.md.
+source "$(dirname "$0")/lib/server.sh"
 
 set -uo pipefail
 
@@ -35,7 +36,7 @@ CONFIGS=(
 if [[ ! -x "$BINARY" ]]; then
     echo "[fatal] binary missing: $BINARY"; exit 1
 fi
-pkill -f "mlx-serve.*--port $PORT" >/dev/null 2>&1 || true
+srv_preclean "$PORT"
 sleep 1
 
 echo "# Fused KV-attention measurement — $(date '+%Y-%m-%d %H:%M')" > "$RESULTS"
@@ -94,7 +95,7 @@ run_cell() {
     sleep 2
 }
 
-trap 'pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true' EXIT
+trap 'srv_preclean "$PORT"' EXIT
 
 for m in "${MODELS[@]}"; do
     IFS='|' read -r name display path <<< "$m"

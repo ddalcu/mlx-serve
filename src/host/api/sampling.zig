@@ -2,6 +2,7 @@
 //! clamps, requestEosSlice; clampMaxTokens, optSamplingRecJson; repeat penalty, kv_quant override
 
 const std = @import("std");
+const abi = @import("../../abi/engine.zig");
 const kv_quant_mod = @import("../../sdk/blocks/attention/kv_quant.zig");
 const cache = @import("../../sdk/kv/cache.zig");
 const generation_settings = @import("generation_settings.zig");
@@ -9,6 +10,7 @@ const model_mod = @import("../../sdk/config/model.zig");
 const log = @import("../../sdk/util/log.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
+const mlx_engine = @import("../engines/mlx.zig");
 const model_settings_mod = @import("../registry/model_settings.zig");
 const testing = std.testing;
 const http_server = @import("../http/server.zig");
@@ -33,6 +35,40 @@ pub fn resolveSampling(gen: generation_settings.Profile, root: std.json.ObjectMa
     };
 }
 
+/// OpenAI's `logit_bias`: `{"<token id>": bias}`, each bias clamped to [-100, 100]. A key that is not a token id or a
+/// value that is not a number is skipped. The caller frees the slice.
+pub fn parseLogitBias(allocator: std.mem.Allocator, root: std.json.ObjectMap) ![]const abi.Bias {
+    const v = root.get("logit_bias") orelse return &.{};
+    if (v != .object) return &.{};
+    var out: std.ArrayList(abi.Bias) = .empty;
+    errdefer out.deinit(allocator);
+    var it = v.object.iterator();
+    while (it.next()) |e| {
+        const token = std.fmt.parseInt(u32, e.key_ptr.*, 10) catch continue;
+        const bias: f32 = switch (e.value_ptr.*) {
+            .float => |f| @floatCast(f),
+            .integer => |i| @floatFromInt(i),
+            else => continue,
+        };
+        try out.append(allocator, .{ .token = token, .bias = std.math.clamp(bias, -100, 100) });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Null = accepted, else the 400 message; checked before tokenizing. Only the generator's sampler applies
+/// the mask, so engines and archs that draw elsewhere refuse it instead of ignoring it.
+pub fn parseSuppressCjk(root: std.json.ObjectMap, lm: *const LoadedModel, on: *bool) ?[]const u8 {
+    const want = switch (root.get("suppress_cjk") orelse return null) {
+        .null => return null,
+        .bool => |b| b,
+        else => return "suppress_cjk must be a boolean",
+    };
+    if (!want) return null;
+    if (lm.engineBacked() or !mlx_engine.facts(lm).suppress_cjk) return "suppress_cjk is not available for this model";
+    on.* = true;
+    return null;
+}
+
 /// A zero rule means remaining context; an omitted rule uses the surface's fallback.
 pub fn generationMaxTokens(gen: generation_settings.Profile, v: ?std.json.Value, fallback: u32) u32 {
     const req = resolveRequestMaxTokens(v, 0);
@@ -47,7 +83,7 @@ pub var g_generation_settings_path: [std.fs.max_path_bytes]u8 = undefined;
 /// A request's generation defaults: the model's rules over the global file's, re-read when
 /// either file changes.
 pub fn requestProfile(io: std.Io, lm: *const LoadedModel) generation_settings.Profile {
-    return .overlay(g_generation_settings.generationDefaults(io, null), request_model.g_model_aliases.generationDefaults(io, lm.path));
+    return .overlay(g_generation_settings.generationDefaults(io, null), request_model.g_model_aliases.generationDefaults(io, .{ .path = lm.path, .real = lm.real_path }));
 }
 
 /// parseJsonFloat variant that distinguishes "omitted / wrong type" (null)
@@ -537,6 +573,16 @@ test "OpenAI frequency_penalty is its own additive penalty, never a repeat_penal
     const got = resolveSampling(.{}, body.value.object, &.{});
     try std.testing.expectEqual(@as(f32, 1.0), got.frequency_penalty);
     try std.testing.expectEqual(@as(f32, 1.0), got.repeat_penalty);
+}
+
+test "parseLogitBias: token ids with their bias, clamped; anything else is skipped" {
+    const a = std.testing.allocator;
+    const body = try std.json.parseFromSlice(std.json.Value, a, "{\"logit_bias\":{\"15\":-100,\"7\":2.5,\"9\":500,\"x\":1,\"3\":\"no\"}}", .{});
+    defer body.deinit();
+    const got = try parseLogitBias(a, body.value.object);
+    defer a.free(got);
+    try std.testing.expectEqualSlices(abi.Bias, &.{ .{ .token = 15, .bias = -100 }, .{ .token = 7, .bias = 2.5 }, .{ .token = 9, .bias = 100 } }, got);
+    try std.testing.expectEqual(@as(usize, 0), (try parseLogitBias(a, .empty)).len);
 }
 
 test "requestRepeatPenalty: repetition_penalty alias and repeat_penalty precedence" {

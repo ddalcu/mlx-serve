@@ -1,8 +1,8 @@
 #!/bin/bash
 # test_embeddings.sh — /v1/embeddings end to end. [1-4] encoder BERT (EMBED_TEST_MODEL, default bge-small-en-v1.5-8bit):
 # OpenAI shape, batched == single cosine across mixed lengths (padding mask + masked mean-pool), > EMBED_MAX_BATCH,
-# `dimensions` (truncate + L2 renorm; out of range 400), 400 on generation, hot-load + stub capability beside a chat
-# default, load-by-absolute-path (incl. the `\/` JSON form), the CLS name-fallback boot log, `embedding_max_length`
+# `dimensions` (truncate + L2 renorm; out of range 400), a non-string `input` member's named 400, 400 on generation,
+# hot-load + stub capability beside a chat default, load-by-absolute-path (incl. the `\/` JSON form), the CLS name-fallback boot log, `embedding_max_length`
 # and the over-limit 400. [4c] a decoder embedder (QWEN3_EMBED_TEST_MODEL, Qwen3-Embedding-0.6B): sub-batches equal
 # the same inputs alone, then the server still answers. [4d] EmbeddingGemma 2 (EG2_TEST_MODEL): unit vectors, the
 # card's ranking, the 512 band, `dimensions=256`, the 8192 400, and `messages` with images and video frames (sizes,
@@ -167,6 +167,12 @@ print(f"dimszero {1 if code_zero == 400 else 0} code={code_zero}")
 # `messages` carries images and video: only a multimodal embedder takes it, and says so.
 code_msg, body_msg = post({"model": "mlx-serve", "messages": [{"role": "user", "content": text}]})
 print(f"messages400 {1 if code_msg == 400 and 'multimodal' in json.dumps(body_msg) else 0} code={code_msg}")
+
+# A content part or a number inside `input` is refused by name, never dropped from the batch.
+part = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+for tag, inp, needle in (("inputpart", [part], "messages"), ("inputmix", [text, part], "messages"), ("inputnum", [text, 42], "array of strings")):
+    code_i, body_i = post({"model": "mlx-serve", "input": inp})
+    print(f"{tag} {1 if code_i == 400 and needle in json.dumps(body_i) else 0} code={code_i} {json.dumps(body_i)[:120]}")
 EOF
 check "dimensions=64: truncated + L2-renormalized first-64 of the full vector" \
     "$(awk '/^dims64/{print $2}' /tmp/test_embeddings_dims.out)" \
@@ -180,6 +186,11 @@ check "dimensions=0 returns 400" \
 check "messages on a text-only encoder returns 400 naming the multimodal models" \
     "$(awk '/^messages400/{print $2}' /tmp/test_embeddings_dims.out)" \
     "$(grep '^messages400' /tmp/test_embeddings_dims.out)"
+for tag in inputpart inputmix inputnum; do
+    check "input [$tag]: a non-string member returns a named 400" \
+        "$(awk -v t="$tag" '$1 == t {print $2}' /tmp/test_embeddings_dims.out)" \
+        "$(grep "^$tag " /tmp/test_embeddings_dims.out)"
+done
 
 # --- 4. generation rejected on encoder-only ---
 GEN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 30 "$BASE/v1/chat/completions" \

@@ -68,7 +68,7 @@ pub const Open = extern struct {
     max_concurrent: u32,
     memory_budget: u64, // what the engine may hold: GPU ceiling less memory in use, OS reserve out
     settings_json: Str, // launch flags + Model Settings that shape a load (kv_quant, mtp, drafter, caches, cluster)
-    options_json: Str, // Model Settings `engine_options`, verbatim
+    options_json: Str, // empty: an engine plugin reads its settings as its options (`abi.dylib.Option`)
     host: *const Host, // lives until `close`
 };
 
@@ -100,9 +100,16 @@ pub const Sampling = extern struct {
 };
 pub const Bias = extern struct { token: u32, bias: f32 };
 
+// Named, so the kit's C header names them too.
+pub const GrammarKind = enum(u8) { json_object, json_schema, regex, choice, ebnf };
+pub const MediaKind = enum(u8) { image, video_frame, audio };
+pub const EventKind = enum(u8) { prefilled, tokens, finished, audio };
+pub const Reason = enum(u8) { stop, length, cancelled, failed };
+pub const Report = enum(u8) { props, metrics };
+
 pub const Grammar = extern struct {
     size: u32 = @sizeOf(Grammar),
-    kind: enum(u8) { json_object, json_schema, regex, choice, ebnf },
+    kind: GrammarKind,
     text: Str,
     after: u32 = no_token, // with thinking on, the constraint starts after this token
 };
@@ -124,7 +131,7 @@ pub const ToolGate = extern struct {
 };
 
 pub const Media = extern struct {
-    kind: enum(u8) { image, video_frame, audio },
+    kind: MediaKind,
     at: u32, // where its placeholder run starts in the prompt
     width: u32,
     height: u32,
@@ -175,11 +182,11 @@ pub const Stats = extern struct {
 /// before its prefill completes (cancelled, failed) gets `finished` alone.
 pub const Event = extern struct {
     size: u32 = @sizeOf(Event),
-    kind: enum(u8) { prefilled, tokens, finished, audio },
+    kind: EventKind,
     cached: u32 = 0, // prefilled: prompt tokens restored from a kept prefix
     tokens: Span(u32) = .{}, // tokens: committed ids in order, valid during the call
     logprobs: Span(Logprob) = .{}, // tokens: one per id when asked for
-    reason: enum(u8) { stop, length, cancelled, failed } = .stop, // finished
+    reason: Reason = .stop, // finished
     stats: ?*const Stats = null, // finished
     verdict: Verdict = .{}, // finished(failed): the named error
     prompt_tokens: u32 = 0, // prefilled: the prompt as the engine counted it
@@ -225,7 +232,7 @@ pub const Engine = extern struct {
     // ── state the host reads (any thread; never touches the GPU)
     status: *const fn (e: *anyopaque, out: *Status) callconv(.c) void,
     memory: *const fn (e: *anyopaque, out: *Memory) callconv(.c) void,
-    report_json: ?*const fn (e: *anyopaque, what: enum(u8) { props, metrics }, out: *Str) callconv(.c) void,
+    report_json: ?*const fn (e: *anyopaque, what: Report, out: *Str) callconv(.c) void,
     trim: ?*const fn (e: *anyopaque, want_bytes: u64) callconv(.c) u64, // drop caches under memory pressure
 
     // ── optional entry points, each behind its Caps bit

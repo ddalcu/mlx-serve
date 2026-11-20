@@ -1,8 +1,9 @@
 # qwen3_tts
 
 Qwen3-TTS (12 Hz) on `/v1/audio/speech`: a Qwen3 talker writes codebook 0 per frame, a 5-layer code predictor the
-other 15, the speech tokenizer's decoder turns 16 codebooks into 24 kHz mono. `-Base` checkpoints ship an
-ECAPA-TDNN speaker encoder for zero-shot cloning. Packs: `mlx-community/Qwen3-TTS-12Hz-{0.6B,1.7B}-Base-{8bit,bf16}`.
+other 15, the speech tokenizer's decoder turns 16 codebooks into 24 kHz mono. The checkpoint's `tts_model_type` says
+what sets the voice: `base` clones a clip (ECAPA-TDNN speaker encoder), `custom_voice` has built-in speakers,
+`voice_design` reads a description. Packs: `mlx-community/Qwen3-TTS-12Hz-{0.6B,1.7B}-{Base,CustomVoice,VoiceDesign}-{8bit,bf16}`.
 
 ## Files
 - `plugin.zig`: the media table (speech and warm-up jobs) and the tiny conformance pack.
@@ -14,12 +15,22 @@ ECAPA-TDNN speaker encoder for zero-shot cloning. Packs: `mlx-community/Qwen3-TT
 unusable one (bad base64, undecodable WAV, no speaker encoder) is a named 400, empty or absent = the plain voice), `warm_only` (embed + cache `ref_audio` without synthesizing;
 answers `{"warmed":true,"cache":"hit"|"miss"}`), `language` (a `talker_config.codec_language_id` name, any case, dialects
 excluded: the codec prefix becomes `[think, think_bos, <id>, think_eos]`; absent or `auto` = the auto prefix; anything
-else a named 400). Generation stops at codec EOS or 2048 frames.
+else a named 400), `seed` (the sampler's; absent = 0). Generation stops at codec EOS or 2048 frames.
+
+Voice controls are honoured or refused by name, never dropped:
+- `voice` (or `speaker`): on CustomVoice a `talker_config.spk_id` name (any case), REQUIRED; the 400 lists the
+  names. A dialect voice (`spk_is_dialect`) speaks its dialect under `auto` or Chinese. Elsewhere only absent, empty
+  or `default`.
+- `instructions`: a VoiceDesign's voice description (REQUIRED there) or a 1.7B CustomVoice's style; a named 400 on
+  Base and on 0.6B CustomVoice (the reference drops it there).
 
 ## Rules
 - `TimeDelayNetBlock` = conv + IMPLICIT ReLU.
 - Embedding lookups reshape to the TABLE's width (0.6B's text table is wider than its talker; the projection bridges).
-- A clone voice is the ECAPA embedding as one codec-prefix position (the codec stream grows 5 → 6).
+- A voice is ONE codec-prefix position (the codec stream grows 5 → 6): a clone's ECAPA embedding or a built-in
+  speaker's row of the codec table. `instructions` are a `user` turn through the text projection, ahead of the role.
+- Base streams its text (first token in the prefix, one a frame after); VoiceDesign and CustomVoice read ALL of it in
+  the prefix, the reference's default for them (`TtsModel.prefill`).
 - The codec decoder's geometry is `speech_tokenizer/config.json`'s `decoder_config` (published values = defaults).
 
 ## Shared blocks
@@ -31,4 +42,5 @@ Diag `tts-trace` only.
 ## Fixtures
 - `conformanceFixture`: talker + predictor at hidden 32 (one layer each), byte-level tokenizer, decoder at latent
   16 / decoder 32; the codec head's EOS bias keeps a seeded job to a few frames.
-- Live: `tests/test_tts.sh`, `test_tts_quant.sh`, `test_tts_clone_cache.sh`.
+- Live: `tests/test_tts.sh` (any kind of pack), `test_tts_quant.sh`, `test_tts_clone_cache.sh`.
+- Oracle: `tests/dump_qwen3_tts_voice_fixture.py` (mlx-audio) → `a voice prefix matches the reference`.

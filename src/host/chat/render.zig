@@ -773,6 +773,25 @@ test "renderChatTemplate: |min picks the smaller element, |max the larger" {
     try testing.expect(std.mem.indexOf(u8, rendered, "1/3") != null);
 }
 
+test "renderChatTemplate: |unique keeps the first of each value, lowercased unless case_sensitive, or by attribute" {
+    // GLM-5.3-Flash's template counts its tool-call ids with `unique(case_sensitive=true) | list | length`.
+    const allocator = testing.allocator;
+    const tpl =
+        \\{{ ['b', 'a', 'B', 'a'] | unique | join(',') }}/{{ ['b', 'a', 'B', 'a'] | unique(case_sensitive=true) | list | length }}/{{ [3, 1, 3] | unique | join(',') }}/{{ [{'id': 'x'}, {'id': 'y'}, {'id': 'x'}] | unique(attribute='id') | list | length }}
+    ;
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false, null, false);
+    defer allocator.free(rendered);
+    try testing.expectEqualStrings("b,a/3/3,1/2", rendered);
+}
+
 test "renderChatTemplate: a namespace attribute named like a dict method is the attribute" {
     // `ns.items` resolved to dict.items(), `+` raised, and the render fell back to the generic format.
     const allocator = testing.allocator;
@@ -1156,6 +1175,35 @@ test "renderChatTemplate: a set inside a for loop does not carry into the next i
     defer allocator.free(glm);
     try testing.expect(std.mem.indexOf(u8, glm, "<|assistant|><think>THOUGHT-1</think>one") != null);
     try testing.expect(std.mem.indexOf(u8, glm, "<|assistant|><think></think>two") != null);
+}
+
+test "renderChatTemplate: Z.ai's current GLM-5.3-Flash template renders a tool round natively" {
+    // Bar: the tool-result turn keeps GLM's own markup. The template's id check (`unique`) once raised there, and the
+    // request fell back to the generic format.
+    const allocator = testing.allocator;
+    var config = ChatConfig{
+        .chat_template = @embedFile("../../fixtures/glm5_next_chat_template_1015.jinja"),
+        .bos_token = null,
+        .eos_token = "<|endoftext|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "add", .arguments = "{\"a\":17,\"b\":25}" }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Use the add tool to calculate 17 plus 25." },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "{\"result\":42}", .tool_call_id = "call_1" },
+        .{ .role = "user", .content = "Reply with only the numeric result returned by the tool." },
+    };
+    const tools =
+        \\[{"type":"function","function":{"name":"add","description":"Add two integers.","parameters":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"]}}}]
+    ;
+    const rendered = try renderChatTemplate(allocator, &messages, &config, tools, null, false, null, false);
+    defer allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<|observation|>") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "{\"result\":42}") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<tool_call>add") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
 }
 
 test "templateReferencesToolRole detects role branches" {

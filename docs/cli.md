@@ -10,8 +10,11 @@ mlx-serve pull qwen3.6:27b  # just download (resumable, straight from Hugging Fa
 mlx-serve list              # what's on disk
 mlx-serve serve             # serve everything you've pulled — models load on demand by name
 mlx-serve launch claude     # configure + launch a coding agent CLI against the local server
-mlx-serve plugin new toy    # start a plugin from the plugin kit (also: check, fixture, install)
+mlx-serve plugin new toy    # start a plugin from the plugin kit (--media, --quant, --engine; also: check, fixture, install)
 ```
+
+Downloads come from Hugging Face. Behind a mirror, `HF_ENDPOINT=https://hf-mirror.com` (any hub URL) moves `pull`,
+`run` and the server's own downloads to it; `HF_TOKEN`, for gated repos, is sent to that hub.
 
 Outside plugins (dylibs built with the plugin kit, [plugins.md](plugins.md)) load from `~/.mlx-serve/plugins/` when
 `~/.mlx-serve/plugins.json` says `"enabled": true`; `--no-plugins` turns them off for one run.
@@ -89,9 +92,9 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--llama-ubatch N` | libllama's 512 | llama.cpp prefill batch in tokens; 1024-2048 prefill faster, mostly on MoE, for more scratch memory |
 | `--tokenize-cache-entries N` | `4` | Chat-template + tokenize cache size |
 | `--max-concurrent N` | `1` | Sizes the request queue (N + 32 wait before a new one blocks) and caps how many decoders a long prefill admits a newcomer beside; concurrent requests batch-decode either way |
-| `--prefill-decode-share S` | `0.25` | Wall-time fraction (0..0.9) decoding streams keep during another request's prefill; the prefill runs 1024-token chunks meanwhile and admits small newcomers at its chunk boundaries. `0` = the old schedule. |
+| `--prefill-decode-share S` | `0.25` | Wall-time fraction (0..0.9) decoding streams keep during another request's prefill; the prefill runs 1024-token chunks meanwhile and admits small newcomers at its chunk boundaries (`X-MLX-Priority: high` requests from this machine up to 8192 uncached tokens). `0` = the old schedule. |
 | `--prefix-cache-entries N` | auto | Shared-prefix KV cache entry cap |
-| `--prefix-cache-mem N{KB,MB,GB}` | `2 GB`, or one session at the working context on hybrid (Qwen3.5+, GLM-5.3, Nemotron-H, LFM2, Ling), sliding-ring (MiMo) and qwen4_exp models when larger | Shared-prefix KV cache memory cap |
+| `--prefix-cache-mem N{KB,MB,GB}` | `2 GB`, or one session at the working context on hybrid (Qwen3.5+, GLM-5.3-Flash, Nemotron-H, LFM2, Ling), sliding-ring (MiMo) and qwen4_exp models when larger | Shared-prefix KV cache memory cap |
 | `--prefix-cache-disk N{MB,GB}` | off | SSD tier: prefixes survive restarts (11K-token restart TTFT 5.9 s → 0.7 s) |
 | `--shutdown-persist-secs N` | `45` | On SIGTERM, finish writing the SSD-tier slices not yet on disk for at most N seconds, then exit; 0 disables. Under launchd, set `ExitTimeOut` above it |
 | `--metrics` | off | Prometheus `/metrics` + live dashboard panel on `/` |
@@ -108,7 +111,8 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--max-resident-mem N{MB,GB}` | auto | Summed memory cap across loaded models; decides whether a model may load at all (auto = the GPU working-set limit, `0` disables) |
 | `--max-resident-models N` | `3` | How many models stay loaded at once (LRU-evicted) |
 | `--idle-evict-secs N` | off | Unload models nobody is using after this many idle seconds |
-| `--no-warmup-eager` | off | Skip the eager warmup at boot (benchmarking / minimal-footprint deployments) |
+| `--no-warmup-eager` | off | Skip the eager warmup at boot and the warm-up a build owes a model the first time it loads it (the first prompts then compile its Metal kernels) |
+| `--warmup-full` | off | Compile a model's Metal kernels before it reports ready: the first time a build loads a model it serves itself a ladder of prompt sizes first (seconds to a minute, that one load only). **Strongly recommended when benchmarking.** Without it the model is ready at once, a short warm-up runs when the server is idle, and the first long prompts still compile |
 | `--skip-mem-preflight` | off | Skip the free-RAM pre-flight on load (the cap above is checked first, and still applies). Either way, a load that would not fit in free RAM first unloads idle models when that makes it fit |
 | `--no-tool-autocorrect` | off | Turn off schema-driven repair of model-emitted tool arguments |
 | `--log-level` | `info` | Log level (error, warn, info, debug) |

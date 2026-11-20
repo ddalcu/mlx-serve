@@ -58,7 +58,7 @@ private let bytesPerGiB: Double = 1_073_741_824
 
 /// Which curated section a pick belongs to. Gemma/Qwen are vendor families;
 /// `largest` is a RAM tier — the biggest models this app runs (Qwen 3.8
-/// Flash-Next, DeepSeek-V4-Flash and V4.1-Flash on the native MLX arch),
+/// Flash-Next and DeepSeek-V4.1-Flash on the native MLX arch),
 /// grouped by "needs a very large Mac" rather than vendor.
 enum RecommendedModelFamily: String {
     case gemma = "Gemma"
@@ -128,10 +128,10 @@ struct RecommendedModelPick: Identifiable, Hashable {
             let bits = name[r].dropFirst("mixed-".count).dropLast("bit".count).split(separator: "-")
             return "mixed \(bits.joined(separator: "/"))-bit"
         }
-        if let r = name.range(of: "(iQ-MLX|Sushi)-[0-9.]+bpw", options: .regularExpression) {
+        if let r = name.range(of: "(iQ-MLX|Sushi)(-Pruned[0-9]+)?-[0-9.]+bpw", options: .regularExpression) {
             let tag = name[r].dropLast("bpw".count)
             let dash = tag.lastIndex(of: "-")!
-            return "\(tag[..<dash]) \(tag[tag.index(after: dash)...]) bpw"
+            return "\(tag[..<dash].replacingOccurrences(of: "-Pruned", with: " Pruned")) \(tag[tag.index(after: dash)...]) bpw"
         }
         if let r = name.range(of: "(?<![A-Za-z0-9])[0-9]+bit", options: .regularExpression) {
             return name[r].dropLast("bit".count) + "-bit"
@@ -167,14 +167,14 @@ struct RecommendedModelPick: Identifiable, Hashable {
     /// `GemmaModelOption.sizeEstimate` budget for elsewhere in the app.
     var approxRAMNeededGB: Double { ramOverrideGB ?? sizeGB * 1.2 }
 
-    /// Whether this Mac's physical RAM covers what the model needs. This is a
-    /// SOFT signal for the UI (dim the row, explain why) — never a hard
-    /// download gate. The rest of the app never blocks on this either
-    /// (Discover just colors a fitness dot; ImageGenView warns and lets the
-    /// user proceed anyway), so a pick that doesn't meet requirements stays
-    /// fully downloadable/usable here too.
-    func meetsSystemRequirements(physicalMemoryBytes: UInt64) -> Bool {
-        Double(physicalMemoryBytes) >= approxRAMNeededGB * bytesPerGiB
+    /// Whether what this Mac can give a model (the GPU's usable budget, not
+    /// physical RAM) covers what the model needs. This is a SOFT signal for the
+    /// UI (dim the row, explain why) — never a hard download gate. The rest of
+    /// the app never blocks on this either (Discover just colors a fitness dot;
+    /// ImageGenView warns and lets the user proceed anyway), so a pick that
+    /// doesn't meet requirements stays fully downloadable/usable here too.
+    func meetsSystemRequirements(memory: SystemMemoryInfo) -> Bool {
+        memory.fit(neededGB: approxRAMNeededGB).fitsAtAll
     }
 }
 
@@ -371,36 +371,25 @@ extension RecommendedModelPick {
         activeParamsB: 27.0
     )
 
-    /// DeepSeek-V4-Flash via the embedded ds4 engine — a frontier-scale model
-    /// on a very large Mac — now on our OWN native `deepseek_v4` MLX arch
-    /// rather than the embedded ds4 GGUF engine, so the curated pick is our
-    /// mixed 2/3/8-bit mirror (whole safetensors repo, no quant file to name).
-    /// It supersedes the `antirez/deepseek-v4-gguf` IQ2XXS pick: same model,
-    /// engine-native instead of converted, at the cost of the 96 GB tier —
-    /// this build wants 128 GB.
-    static let deepseekV4Flash = RecommendedModelPick(
-        id: "deepseek-v4-flash",
-        name: "DeepSeek-V4-Flash",
-        tagline: "Frontier model, native MLX",
-        blurb: "A frontier-scale DeepSeek model that runs natively on Apple Silicon through MLX — no GGUF conversion, no llama.cpp — for top-tier reasoning, coding, and agent work. It wakes only a fraction of itself per word (mixture of experts) and holds around a million words of context. This is our own iQ-MLX conversion at 3.3 bits per weight, about 130 GB on disk, so it wants a Mac with 128 GB of memory (raise the GPU wired limit and close other apps to fit a useful context); it also ships DeepSeek's own DSpark draft stages, which Settings can switch on for a faster reply on Macs with more than 128 GB.",
-        repoId: "ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw",
-        sizeGB: 129.6,
+    /// DeepSeek-V4.1-Flash for a 128 GB Mac: our pack keeps 192 of each layer's 384 experts at 2 bits (the
+    /// 256 GB pick's model, so its intelligence and context). The RAM gate is the 91 GB measured active on a
+    /// 128 GB M4 Max plus room for macOS: a 96 GB Mac has none. `speed` is that M4 Max's 31 tok/s with DSpark
+    /// (on by default), measured with the Engram table read from another Mac's disk.
+    static let deepseekV41Pruned = RecommendedModelPick(
+        id: "deepseek-v41-flash-pruned192",
+        name: "DeepSeek-V4.1-Flash Pruned",
+        tagline: "DeepSeek V4.1 for 128 GB",
+        blurb: "DeepSeek's newest frontier model, slimmed to fit a Mac with 128 GB of memory: each layer keeps the 192 of its 384 experts our agent and coding traffic uses most, at 2 bits per weight. Code, reasoning and tool calls hold up best; chat is weaker than the full model and other languages than English are much weaker. It holds around a million words of context and reads images. About 92 GB stays in memory plus a 203 GB lookup table read from disk as it runs, so plan for the 296 GB download on a fast internal SSD and close other apps first.",
+        repoId: "ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-Pruned192-2.25bpw",
+        sizeGB: 296.2,
         family: .largest,
-        intelligence: 67,
-        intelligenceIsEstimated: false,
-        // Plain autoregressive decode measures ~23 tok/s on an M4 Max, level
-        // with the dense 31B (ties are what the activeParams invariant leaves
-        // free). DSpark takes it to ~35 but is opt-in, so it stays out of the
-        // score and is named in the blurb instead — see the file header.
-        speed: 14,
+        intelligence: deepseekV41Flash.intelligence,
+        intelligenceIsEstimated: true,
+        speed: 16,
+        speedIsWithMtp: true,
         contextTokens: 1_048_576,
-        activeParamsB: 13.0,
-        // Weights×1.2 would demand 141 GB and hide the model from the exact
-        // machine the conversion targets: it serves in ~110 GB resident on a
-        // 128 GB Mac, tight against Metal's default ~107 GB working set there
-        // (the blurb says to raise the wired limit), and still above a 96 GB
-        // Mac's gate.
-        ramOverrideGB: 104.0
+        activeParamsB: 16.0,
+        ramOverrideGB: 100.0
     )
 
     /// DeepSeek-V4.1-Flash in our iQ-MLX 3.0 bpw pack on the native
@@ -518,11 +507,11 @@ extension RecommendedModelPick {
     ]
 
     /// The largest models this app runs, ascending by on-disk size (the app's
-    /// smallest-first convention) — Qwen 3.8 Flash-Next (~100 GB),
-    /// DeepSeek-V4-Flash (~130 GB) then V4.1-Flash (~430 GB). Grouped by
+    /// smallest-first convention) — Qwen 3.8 Flash-Next (~100 GB), DeepSeek-V4.1-Flash
+    /// pruned for 128 GB (~296 GB download) then V4.1-Flash (~430 GB). Grouped by
     /// "needs a very large Mac" rather than by vendor.
     static let largestCatalog: [RecommendedModelPick] = [
-        .sushi2bpw, .qwen38FlashNext, .deepseekV4Flash, .deepseekV41Flash,
+        .sushi2bpw, .qwen38FlashNext, .deepseekV41Pruned, .deepseekV41Flash,
     ]
 
     /// Liquid LFM3, the Recommended pane's first section: the small text model and the Omni that sees, hears and
@@ -538,7 +527,7 @@ extension RecommendedModelPick {
     // MARK: - The starter recommendation
 
     /// The ONE model to offer someone who has downloaded nothing yet, chosen
-    /// from this Mac's physical RAM. Total by construction — every input
+    /// from this Mac's memory. Total by construction — every input
     /// returns a pick — and the single source of truth for all three surfaces
     /// that make this recommendation: the Model Browser's "Best for your Mac"
     /// card, the welcome window's starter card, and the chat gate. Two copies
@@ -548,7 +537,7 @@ extension RecommendedModelPick {
     /// anything else (`approxRAMNeededGB` = weights × 1.2, the app's ~20%
     /// runtime overhead), never merely the largest that fits:
     ///
-    /// | Physical RAM | Pick | Disk | RAM needed |
+    /// | Physical RAM (band cap) | Pick | Disk | RAM needed |
     /// |---|---|---|---|
     /// | ≤ 16 GB  | Gemma 4 E4B         |  4.8 GB |  5.8 GB |
     /// | 16–32 GB | Gemma 4 12B         |  6.3 GB |  7.6 GB |
@@ -560,15 +549,21 @@ extension RecommendedModelPick {
     /// 16 GB is upper-inclusive (a 16 GB Mac gets E4B); the bands above are
     /// lower-inclusive, since 32, 36, 48 and 96 GB are the Macs each pick is
     /// chosen for.
-    static func starterPick(physicalMemoryBytes: UInt64) -> RecommendedModelPick {
-        let gib = Double(physicalMemoryBytes) / bytesPerGiB
-        if gib <= 16 { return .gemmaE4B }
-        if gib < 32 { return .gemma12B }
-        if gib < 36 { return .qwen38_27b }
-        if gib < 48 { return .qwen38_27b6bit }
-        if gib < 96 { return .qwen38_27b8bit }
-        return .qwen38FlashNext
+    ///
+    /// The band only caps the pick: it steps down to the largest pick at or
+    /// below it that fits what the GPU can give a model (`usableBytes`, not
+    /// physical RAM): a 36 GB Mac gives models about 28 GB, and the 6-bit 27B
+    /// needs 32.4.
+    static func starterPick(memory: SystemMemoryInfo) -> RecommendedModelPick {
+        let gib = memory.totalGB
+        let band = gib <= 16 ? 0 : gib < 32 ? 1 : gib < 36 ? 2 : gib < 48 ? 3 : gib < 96 ? 4 : 5
+        return starterLadder[...band].last { $0.meetsSystemRequirements(memory: memory) } ?? .gemmaE4B
     }
+
+    /// The starter picks, smallest first, one per RAM band of `starterPick`.
+    static let starterLadder: [RecommendedModelPick] = [
+        .gemmaE4B, .gemma12B, .qwen38_27b, .qwen38_27b6bit, .qwen38_27b8bit, .qwen38FlashNext,
+    ]
 }
 
 extension Array where Element == RecommendedModelPick {
@@ -577,11 +572,11 @@ extension Array where Element == RecommendedModelPick {
     /// Recommended pane shows the first inline and tucks the second behind a
     /// "Requires more RAM" disclosure — nothing is ever dropped, just
     /// deferred until the user asks to see it.
-    func partitionedByRequirements(physicalMemoryBytes: UInt64) -> (fits: [RecommendedModelPick], requiresMoreRAM: [RecommendedModelPick]) {
+    func partitionedByRequirements(memory: SystemMemoryInfo) -> (fits: [RecommendedModelPick], requiresMoreRAM: [RecommendedModelPick]) {
         var fits: [RecommendedModelPick] = []
         var requiresMoreRAM: [RecommendedModelPick] = []
         for pick in self {
-            if pick.meetsSystemRequirements(physicalMemoryBytes: physicalMemoryBytes) {
+            if pick.meetsSystemRequirements(memory: memory) {
                 fits.append(pick)
             } else {
                 requiresMoreRAM.append(pick)

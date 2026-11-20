@@ -37,8 +37,6 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     build_options.addOption(bool, "units", false);
     build_options.addOption(bool, "ds4_engine", !windows);
     build_options.addOption(bool, "llama_engine", true);
-    build_options.addOption(bool, "mlx_stream", false);
-    build_options.addOption(bool, "plugin_profile", false);
     // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
     // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
     build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
@@ -132,6 +130,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     const unit_tests = b.addTest(.{
         .root_module = mods[1],
         .filters = if (test_filter) |f| &.{f} else &.{},
+        .test_runner = .{ .path = b.path("build/test_runner.zig"), .mode = .server },
     });
     const test_step = b.step("test", "Run unit tests");
     if (builtin.os.tag != .windows) test_step.dependOn(&b.top_level_steps.get("lint-test").?.step); // no python3 there

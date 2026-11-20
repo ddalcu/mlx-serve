@@ -236,8 +236,8 @@ pub fn editFormErrorMessage(err: EditFormError) []const u8 {
 /// Returns owned JSON (caller frees). Files are re-encoded as base64 (the
 /// internal schema's transport); everything OpenAI accepts but we can't honor
 /// is an explicit error rather than a silently ignored field.
-/// Most images one edit form carries (Qwen-Image-2.1's reference cap, the largest; each plugin checks its own).
-pub const MAX_EDIT_IMAGES = 10;
+/// Most images one edit form carries (MiniMax-H3-Image's reference cap, the largest; each plugin checks its own).
+pub const MAX_EDIT_IMAGES = 16;
 
 pub fn openaiEditFormToJson(allocator: std.mem.Allocator, body: []const u8, content_type: []const u8) EditFormError![]u8 {
     const boundary = multipart.boundaryFromContentType(content_type) orelse return error.NotMultipart;

@@ -94,6 +94,12 @@ pub fn publishHotCacheResidency(sch: *Scheduler) void {
     sch.resident_hot_cache_bytes.store(bytes, .monotonic);
     const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
     sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
+    if (sch.hot_prefix_cache) |hc| {
+        sch.hot_cache_parked_bytes.store(hc.parkedBytes(), .monotonic);
+        sch.hot_cache_checked_out_bytes.store(hc.checkedOut().bytes, .monotonic);
+        sch.hot_cache_evicted_billed_bytes.store(hc.evicted_billed_bytes, .monotonic);
+        sch.hot_cache_evicted_live_bytes.store(hc.evicted_live_bytes, .monotonic);
+    } else for ([_]*std.atomic.Value(u64){ &sch.hot_cache_parked_bytes, &sch.hot_cache_checked_out_bytes }) |gauge| gauge.store(0, .monotonic);
     // Live module state is published with the live KV (`publishLiveKvResidency`, per pass and per chunk), never here:
     // it is not evictable, and republishing live sessions here would drop the slot being prefilled.
     publishHotCacheDigests(sch);
@@ -157,6 +163,12 @@ pub fn reclaimableHotCacheBytesFor(sch: *Scheduler, prompt_tokens: []const u32) 
     );
 }
 
+/// The loop is about to park with no request alive: refresh the probes and let the cache say what is still checked out.
+pub fn noteIdle(sch: *Scheduler) void {
+    if (sch.hot_prefix_cache) |hc| hc.noteIdle();
+    publishHotCacheResidency(sch);
+}
+
 /// One bounded SSD slice per resident model that still owes one (its oldest owed session first);
 /// returns progress, busy, or done. The caller re-checks for work between calls.
 /// Inference thread only: unloads run here too, so the collected pointers stay valid.
@@ -166,7 +178,8 @@ pub fn flushOwedDiskSlices(sch: *Scheduler) prefix_cache_mod.FlushResult {
     for (owed[0..diskCaches(sch, &owed, true)]) |o| {
         const slice = if (admitModuleStaging(sch, o.hc)) o.hc.flushOwedSlice(o.s) else .busy;
         if (slice == .progress) result = .progress;
-        if (slice == .busy and result == .done) result = .busy;
+        if (slice == .busy and result != .progress) result = .busy;
+        if (slice == .quiet and result == .done) result = .quiet;
     }
     return result;
 }
@@ -499,6 +512,9 @@ test "module live residency is counted once per model and cannot be credited as 
     sch.digest_mu = .init;
     sch.queue_mu = .init;
     sch.decoding = .empty;
+    sch.pending = .empty;
+    sch.cleanup_queue = .empty;
+    sch.offloaded = .empty;
     sch.resident_hot_cache_bytes = .init(0);
     sch.reclaimable_hot_cache_bytes = .init(0);
     sch.resident_live_kv_bytes = .init(0);

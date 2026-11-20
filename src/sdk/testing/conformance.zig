@@ -17,6 +17,7 @@ const test_cache = @import("cache_ops.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const Resident = @import("../weights/resident.zig").Resident;
 const loadWeightsOpt = @import("../weights/load.zig").loadWeightsOpt;
+const streamed = @import("../weights/streamed.zig");
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -44,6 +45,7 @@ pub const Subject = struct {
         model: *const model_abi.ModelTable,
         media: *const media_abi.MediaTable,
         quant: *const quant_abi.QuantTable,
+        engine: *const engine_abi.Engine,
     };
 };
 
@@ -73,8 +75,69 @@ pub fn expectSubject(io: std.Io, a: Allocator, s: Subject) !void {
         .model => |t| try expectModel(io, a, s, t),
         .media => |t| try expectMedia(io, a, s, t),
         .quant => |t| try expectQuant(s, t),
+        .engine => |t| try expectEngine(io, a, s, t),
     }
 }
+
+/// An engine plugin on its fixture staged on disk: it probes and opens it on its own thread (an outside engine never
+/// calls MLX), serves one request (prefilled, tokens, one `finished`) and closes. The full engine contract
+/// (`abi/contract_test.zig`) runs on the kit's example engine in `zig build test`.
+fn expectEngine(io: std.Io, a: Allocator, s: Subject, t: *const engine_abi.Engine) !void {
+    if (t.size != @sizeOf(engine_abi.Engine) or t.version != engine_abi.version) return fail(s.name, "table size or version is not this ABI's", .{});
+    var staged = try Staged.init(io, a, s.fixture);
+    defer staged.deinit();
+    const cfg = s.fixture.file("config.json") orelse "";
+    var v: Verdict = .{};
+    if (!t.probe(.of(staged.path), .of(cfg), &v)) return fail(s.name, "does not probe its own fixture", v.why);
+    var run: EngineRun = .{};
+    const host: engine_abi.Host = .{ .ctx = &run, .log = EngineRun.log, .wake = EngineRun.wake };
+    const o: engine_abi.Open = .{ .model_dir = .of(staged.path), .model_type = .{}, .config_json = .of(cfg), .context = 0, .max_concurrent = 1, .memory_budget = 1 << 30, .settings_json = .{}, .options_json = .{}, .host = &host };
+    var info: engine_abi.Info = .{ .name = .{}, .version = .{}, .caps = .{}, .threading = .host_gpu_thread, .context_window = 0, .max_concurrent = 0, .embedding_dims = 0, .eos = .{}, .startup = .{} };
+    const e = t.open(&o, &info, &v) orelse return fail(s.name, "does not open its own fixture", v.why);
+    defer t.close(e);
+    if (info.size != @sizeOf(engine_abi.Info) or info.name.len == 0 or info.context_window == 0 or info.max_concurrent == 0) return fail(s.name, "info lacks its size, name, window or concurrency", .{});
+    if (info.threading != .own_thread or t.step != null) return fail(s.name, "an outside engine runs its own runtime on its own thread (`Threading.own_thread`, no `step`)", .{});
+    const prompt = [_]u32{ 1, 2, 3 };
+    const r: engine_abi.Request = .{ .prompt = .of(&prompt), .max_tokens = 4 };
+    const sv = t.submit(e, 1, &r, .{ .ctx = &run, .event = EngineRun.event });
+    if (!sv.isOk()) return fail(s.name, "refuses a plain request", sv.why);
+    var waited: u32 = 0;
+    while (run.finished.load(.acquire) == 0) : (waited += 1) {
+        if (waited == 30_000) return fail(s.name, "a plain request never finished", .{});
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    if (run.bad.load(.acquire)) return fail(s.name, "a request's events are out of order (prefilled, tokens, one finished)", .{});
+    if (run.reason != .length or run.tokens.load(.acquire) != 4) return fail(s.name, "a plain request does not run to its max_tokens", .{});
+}
+
+/// What one request's events looked like, recorded on the engine's thread.
+const EngineRun = struct {
+    prefilled: std.atomic.Value(u32) = .init(0),
+    tokens: std.atomic.Value(u32) = .init(0),
+    finished: std.atomic.Value(u32) = .init(0),
+    bad: std.atomic.Value(bool) = .init(false),
+    reason: @FieldType(engine_abi.Event, "reason") = .stop,
+
+    fn log(_: *anyopaque, _: u8, _: Str) callconv(.c) void {}
+    fn wake(_: *anyopaque) callconv(.c) void {}
+    fn event(ctx: *anyopaque, id: u64, ev: *const engine_abi.Event) callconv(.c) engine_abi.Action {
+        const r: *EngineRun = @ptrCast(@alignCast(ctx));
+        if (id != 1 or ev.size < @sizeOf(engine_abi.Event) or r.finished.load(.acquire) > 0) r.bad.store(true, .release);
+        switch (ev.kind) {
+            .prefilled => if (r.prefilled.fetchAdd(1, .acq_rel) > 0 or r.tokens.load(.acquire) > 0) r.bad.store(true, .release),
+            .tokens => {
+                if (r.prefilled.load(.acquire) == 0 or ev.tokens.len == 0) r.bad.store(true, .release);
+                _ = r.tokens.fetchAdd(@intCast(ev.tokens.len), .acq_rel);
+            },
+            .audio => r.bad.store(true, .release),
+            .finished => {
+                r.reason = ev.reason;
+                _ = r.finished.fetchAdd(1, .release);
+            },
+        }
+        return .go;
+    }
+};
 
 fn fail(name: []const u8, comptime what: []const u8, why: Str) error{Conformance} {
     std.debug.print("conformance: plugin {s}: " ++ what ++ " ({s})\n", .{ name, why.slice() });
@@ -128,24 +191,54 @@ pub const Loaded = struct {
     stream: mlx.mlx_stream,
     parsed: model_abi.Parsed = .{},
     model: *anyopaque = undefined,
+    /// The map's zeroed experts (`Opts.zero_experts`), held to ask whether anything evaluated them.
+    zeroed: std.ArrayList(mlx.mlx_array) = .empty,
+
+    pub const Opts = struct {
+        /// The load's settings (`LoadCtx.settings_json`, the parse's too).
+        settings: []const u8 = "",
+        /// The fixture's routed experts affine 8-bit on disk (`quantizeExperts`).
+        quantize_experts: bool = false,
+        /// The engine's map holds those experts zeroed: only a load that reads them from the pack serves them.
+        zero_experts: bool = false,
+        /// On the GPU stream (the stream's reads land behind Metal events), not the CPU's.
+        gpu: bool = false,
+    };
 
     pub fn open(io: std.Io, a: Allocator, name: []const u8, table: *const model_abi.ModelTable, fx: fixture.Fixture) !Loaded {
+        return openWith(io, a, name, table, fx, .{});
+    }
+
+    pub fn openWith(io: std.Io, a: Allocator, name: []const u8, table: *const model_abi.ModelTable, fx: fixture.Fixture, opts: Opts) !Loaded {
         const cfg = fx.file("config.json") orelse return error.FixtureWithoutConfig;
-        var self: Loaded = .{ .name = name, .table = table, .staged = try Staged.init(io, a, fx), .stream = mlx.mlx_default_cpu_stream_new() };
+        var self: Loaded = .{ .name = name, .table = table, .staged = try Staged.init(io, a, fx), .stream = if (opts.gpu) mlx.mlx_default_gpu_stream_new() else mlx.mlx_default_cpu_stream_new() };
         errdefer {
             _ = mlx.mlx_stream_free(self.stream);
             self.staged.deinit();
         }
-        try expectOk(name, "parse of its fixture", table.parse(&self.staged.dir, .of(cfg), .{}, null, false, &self.parsed));
+        if (opts.quantize_experts) try quantizeExperts(io, a, self.staged.path, fx);
+        try expectOk(name, "parse of its fixture", table.parse(&self.staged.dir, .of(cfg), .of(opts.settings), null, false, &self.parsed));
         errdefer table.free_parsed(&self.parsed);
         // The engine's loader reads the fixture's tensors, as it does for a served pack.
         // The towers its parse declares load too, as a served load keeps them.
         const caps = self.parsed.caps;
         var weights = Resident.adopt(try loadWeightsOpt(io, std.heap.c_allocator, self.staged.path, .{ .vision = caps.images or caps.video or caps.audio, .audio_tower = caps.audio }));
         defer weights.deinit();
+        if (opts.zero_experts) {
+            var it = weights.weights.map.iterator();
+            while (it.next()) |e| if (streamed.expertTensor(e.key_ptr.*)) {
+                var z = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_zeros(&z, mlx.mlx_array_shape(e.value_ptr.*), mlx.mlx_array_ndim(e.value_ptr.*), mlx.mlx_array_dtype(e.value_ptr.*), self.stream));
+                _ = mlx.mlx_array_free(e.value_ptr.*);
+                e.value_ptr.* = z;
+                var held = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&held, z));
+                try self.zeroed.append(std.heap.c_allocator, held);
+            };
+        }
         const src = weights.source();
         var why: Verdict = .{};
-        self.model = table.load(&.{ .model_dir = .of(self.staged.path), .dir = &self.staged.dir, .parsed = &self.parsed, .stream = .{ .ctx = self.stream.ctx }, .weights = &src }, &why) orelse {
+        self.model = table.load(&.{ .model_dir = .of(self.staged.path), .dir = &self.staged.dir, .parsed = &self.parsed, .settings_json = .of(opts.settings), .stream = .{ .ctx = self.stream.ctx }, .weights = &src }, &why) orelse {
             // A plugin whose kernels this device cannot run says so by name; the suite has nothing to check here.
             if (why.code == .unsupported) return error.UnsupportedOnThisDevice;
             return fail(name, "load of its fixture", why.why);
@@ -157,10 +250,82 @@ pub const Loaded = struct {
         _ = mlx.mlx_synchronize(self.stream);
         self.table.unload(self.model);
         self.table.free_parsed(&self.parsed);
+        for (self.zeroed.items) |z| _ = mlx.mlx_array_free(z);
+        self.zeroed.deinit(std.heap.c_allocator);
         _ = mlx.mlx_stream_free(self.stream);
         self.staged.deinit();
     }
 };
+
+/// Rewrites the staged fixture's float routed-expert weights as affine 8-bit at group 32 (scales and biases bf16, as
+/// mlx-lm stores them) and indexes every shard (`model.safetensors.index.json`), as a downloaded pack is.
+fn quantizeExperts(io: std.Io, a: Allocator, dir: []const u8, fx: fixture.Fixture) !void {
+    // A safetensors load evaluates on the CPU only.
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var index: std.Io.Writer.Allocating = .init(a);
+    try index.writer.writeAll("{\"metadata\":{},\"weight_map\":{");
+    var first = true;
+    for (fx.files) |f| if (std.mem.endsWith(u8, f.name, ".safetensors")) {
+        const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, f.name }, 0);
+        var in = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(in);
+        var meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        try mlx.check(mlx.mlx_load_safetensors(&in, &meta, path.ptr, s));
+        const out = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(out);
+        const all = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(all);
+        const it = mlx.mlx_map_string_to_array_iterator_new(in);
+        defer _ = mlx.mlx_map_string_to_array_iterator_free(it);
+        var key: ?[*:0]const u8 = null;
+        var v = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v);
+        while (mlx.mlx_map_string_to_array_iterator_next(&key, &v, it) == 0) {
+            const k = std.mem.span(key.?);
+            const sh = mlx.mlx_array_shape(v);
+            const nd = mlx.mlx_array_ndim(v);
+            const float = switch (mlx.mlx_array_dtype(v)) {
+                .float32, .float16, .bfloat16 => true,
+                else => false,
+            };
+            const parts: [3]mlx.mlx_array = if (std.mem.endsWith(u8, k, ".weight") and streamed.expertTensor(k) and float and nd >= 2 and @mod(sh[nd - 1], 32) == 0) blk: {
+                var q = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(q);
+                try mlx.check(mlx.mlx_quantize(&q, v, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "affine", .{ .ctx = null }, s));
+                var r: [3]mlx.mlx_array = undefined;
+                for (&r, 0..) |*x, i| {
+                    var raw = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_vector_array_get(&raw, q, i));
+                    x.* = if (i == 0) raw else c: {
+                        var c = mlx.mlx_array_new();
+                        try mlx.check(mlx.mlx_astype(&c, raw, .bfloat16, s));
+                        _ = mlx.mlx_array_free(raw);
+                        break :c c;
+                    };
+                }
+                break :blk r;
+            } else .{ v, .{ .ctx = null }, .{ .ctx = null } };
+            const base = k[0 .. k.len - (if (parts[1].ctx != null) ".weight".len else 0)];
+            for (parts, [_][]const u8{ if (parts[1].ctx != null) ".weight" else "", ".scales", ".biases" }) |x, suffix| if (x.ctx != null) {
+                const name = try std.fmt.allocPrintSentinel(a, "{s}{s}", .{ base, suffix }, 0);
+                try mlx.check(mlx.mlx_map_string_to_array_insert(out, name.ptr, x));
+                try mlx.check(mlx.mlx_vector_array_append_value(all, x));
+                try index.writer.print("{s}\"{s}\":\"{s}\"", .{ if (first) "" else ",", name, f.name });
+                first = false;
+                if (parts[1].ctx != null) _ = mlx.mlx_array_free(x);
+            };
+        }
+        // Every array read before the file under it is replaced.
+        try mlx.check(mlx.mlx_eval(all));
+        try mlx.check(mlx.mlx_save_safetensors(path.ptr, out, meta));
+    };
+    try index.writer.writeAll("}}");
+    var d = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer d.close(io);
+    try d.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = index.written() });
+}
 
 /// Plugin root `M`'s fixture, loaded (`Loaded`).
 pub fn Pack(comptime M: type) type {
@@ -239,6 +404,100 @@ fn expectModel(io: std.Io, a: Allocator, s: Subject, t: *const model_abi.ModelTa
     if (attention == 0 and b1.kv_per_token != 0) return fail(name, "bills KV with no attention layer", .{});
 
     inline for (@typeInfo(model_abi.Mode).@"enum".field_names) |f| try expectForward(a, &pack, @field(model_abi.Mode, f));
+    if (pack.parsed.caps.experts_stream) try expectStreamedExperts(io, a, name, t, fx);
+}
+
+/// A plugin that streams its experts (`Caps.experts_stream`) serves the same logits streamed as in memory, over its
+/// fixture with the routed experts affine 8-bit (what the stream reads). The streamed load's map holds them zeroed, so
+/// only a load that reads them from the pack matches.
+pub fn expectStreamedExperts(io: std.Io, a: Allocator, name: []const u8, t: *const model_abi.ModelTable, fx: fixture.Fixture) !void {
+    // Said, not skipped: the registry runs every plugin in one test, and a skip would end it at the first.
+    if (!streamed.built or mlx.noGpuBackend() or mlx.virtualGpu()) {
+        std.debug.print("conformance: plugin {s}: streamed experts unchecked here (no expert streamer or no real GPU)\n", .{name});
+        return;
+    }
+    var resident = try Loaded.openWith(io, a, name, t, fx, .{ .quantize_experts = true, .gpu = true });
+    defer resident.close();
+    var live = try Loaded.openWith(io, a, name, t, fx, .{ .quantize_experts = true, .zero_experts = true, .gpu = true, .settings = "{\"stream_experts\":true}" });
+    defer live.close();
+    try expectSameLogits(name, try promptThenStep(a, &resident), try promptThenStep(a, &live), "streamed experts serve other logits than the same experts in memory");
+    // A batched decode over two row groups of 8 (GLM's) serves streamed what it serves in memory; a streamed load may
+    // run single-flight (refused `unsupported`). A fixture's few experts all fit the transient rows, so this cannot
+    // see a fetch rewrite rows a pending group still reads (glm5_next evaluates each group first).
+    if (model_abi.declaresMode(resident.parsed.caps, .batched_rows)) {
+        const want = (try batchedStep(a, &resident, 16)) orelse return fail(name, "a declared batched decode is refused", .{});
+        if (try batchedStep(a, &live, 16)) |got| try expectSameLogits(name, want, got, "a batched decode over streamed experts serves other logits than in memory");
+    }
+    // Logits cannot see a load that keeps its experts too: the zeroed copies the map holds stay unread.
+    for (live.zeroed.items) |z| {
+        var read = false;
+        _ = mlx._mlx_array_is_available(&read, z);
+        if (read) return fail(name, "a streamed load made the experts it streams resident", .{});
+    }
+}
+
+fn expectSameLogits(name: []const u8, want: []const f32, got: []const f32, comptime why: []const u8) !void {
+    var top: f32 = 0;
+    var diff: f32 = 0;
+    for (want, got) |w, g| {
+        top = @max(top, @abs(w));
+        diff = @max(diff, @abs(w - g));
+    }
+    if (!(diff <= 1e-3 * @max(1, top))) {
+        std.debug.print("conformance: plugin {s}: streamed logits differ by {d} (largest {d})\n", .{ name, diff, top });
+        return fail(name, why, .{});
+    }
+}
+
+/// The logits of one batched decode step over `n` fresh slots, a token each; null when the load refuses the mode.
+fn batchedStep(a: Allocator, pack: *Loaded, n: u32) !?[]f32 {
+    const vocab = pack.parsed.shell.vocab_size;
+    const tokens = try a.alloc(u32, n);
+    const slot_ids = try a.alloc(u32, n);
+    const positions = try a.alloc(u32, n);
+    for (tokens, slot_ids, 0..) |*tok, *s, i| {
+        tok.* = @intCast((i * 7 + 1) % vocab);
+        s.* = @intCast(i);
+    }
+    @memset(positions, 0);
+    const caches = try a.alloc(test_cache.TestCache, n);
+    const handles = try a.alloc(model_abi.Handle, n);
+    for (caches, handles) |*c, *h| {
+        c.* = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
+        h.* = c.handle();
+    }
+    defer for (caches) |*c| c.deinit();
+    var fo: model_abi.ForwardOut = .{};
+    const v = pack.table.forward(pack.model, &.{ .mode = .batched_rows, .logits = .last_row, .rows = 1, .tokens = .of(tokens), .slots = .of(slot_ids), .positions = .of(positions), .caches = .of(handles), .cache_ops = &test_cache.ops }, &fo);
+    if (v.code == .unsupported and fo.logits.ctx == null) return null;
+    // A fixture's bank (a row or two) is too small for MLX's row-block class a wide batch takes; a pack's holds dozens.
+    if (std.mem.eql(u8, v.why.slice(), "StreamedBankTooFewRows")) return null;
+    try expectOk(pack.name, "batched decode over streamed experts", v);
+    if (fo.hidden.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = fo.hidden.ctx });
+    const l = try consumeF32(a, fo.logits);
+    if (l.len != n * vocab) return fail(pack.name, "batched logits are not [slots, vocab]", .{});
+    return l;
+}
+
+/// The logits of a four-token prompt (last row) then of one decode step on its cache, back to back.
+fn promptThenStep(a: Allocator, pack: *Loaded) ![]f32 {
+    const vocab = pack.parsed.shell.vocab_size;
+    var cache = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
+    defer cache.deinit();
+    const out = try a.alloc(f32, 2 * vocab);
+    for ([_]u32{ 4, 1 }, [_]u32{ 0, 4 }, 0..) |rows, pos, k| {
+        const tokens = try a.alloc(u32, rows);
+        for (tokens, 0..) |*tok, i| tok.* = @intCast((pos + i) * 7 % vocab + 1);
+        const handles = [_]model_abi.Handle{cache.handle()};
+        var fo: model_abi.ForwardOut = .{};
+        const mode: model_abi.Mode = if (rows > 1) .prefill else .decode;
+        try expectOk(pack.name, "forward over streamed experts", pack.table.forward(pack.model, &.{ .mode = mode, .rows = rows, .tokens = .of(tokens), .slots = .of(&[_]u32{0}), .positions = .of(&[_]u32{pos}), .caches = .of(&handles), .cache_ops = &test_cache.ops }, &fo));
+        if (fo.hidden.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = fo.hidden.ctx });
+        const l = try consumeF32(a, fo.logits);
+        if (l.len != vocab) return fail(pack.name, "logits are not [1, vocab]", .{});
+        @memcpy(out[k * vocab ..][0..vocab], l);
+    }
+    return out;
 }
 
 fn expectParsed(name: []const u8, p: *const model_abi.Parsed) !void {

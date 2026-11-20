@@ -2,18 +2,20 @@
 # test_multi_model_dir.sh — `--model-dir` is REPEATABLE and every folder it names is served: three folders all
 # discovered; a duplicate id resolves to the FIRST folder (the copies declare different model_types, so
 # meta.architecture names the winner) and the skip is logged; one folder is unchanged; an unreachable folder is
-# SKIPPED with a warning, not fatal; a 9th --model-dir is REFUSED by name, never silently dropped.
+# SKIPPED with a warning, not fatal; a 9th --model-dir is REFUSED by name, never silently dropped; a folder two
+# roots reach (nested or symlinked) is ONE row under its org/name id, also after a rescan; with a small model on
+# disk, a request naming that id leaves exactly one resident copy.
 #
-#   ./tests/test_multi_model_dir.sh [port]
+#   [BINARY=<mlx-serve>] ./tests/test_multi_model_dir.sh [port]
 #
-# FULLY HERMETIC: the "models" are dirs holding a config.json; nothing loads. Hermetic twins: discoverModelsMany,
-# ModelRootsTests (swift).
+# HERMETIC except [6]: the "models" are dirs holding a config.json; nothing loads. [6] SKIPs without
+# mlx-community/Qwen3.5-0.8B-MLX-4bit. Hermetic twins: discoverModelsMany, ModelRegistry rescan, ModelRootsTests (swift).
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11378}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$ROOT/zig-out/bin/mlx-serve"
+BIN="${BINARY:-$ROOT/zig-out/bin/mlx-serve}"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/mlxserve-roots.XXXXXX")"
@@ -97,6 +99,48 @@ if [ $? -ne 0 ] && grep -q "at most 8 folders" "$TMP/toomany.log"; then
   echo "PASS: a 9th --model-dir is refused by name"
 else
   echo "FAIL: over-cap launch did not refuse (see $TMP/toomany.log)"; rc=1
+fi
+
+# ── [5] One folder reached by two roots (nested, or through a symlink) is ONE row,
+# named org/name whichever root comes first; a rescan adds no second row.
+mk lib/org/nested qwen3
+ln -s "$TMP/lib" "$TMP/link"
+for pair in "lib lib/org" "lib/org lib" "link lib/org"; do
+  set -- $pair
+  boot "$TMP/overlap.log" "$TMP/$1" "$TMP/$2" || exit 1
+  GOT="$(ids)"
+  [ "$GOT" = "org/nested" ] \
+    && echo "PASS: roots [$1, $2] list the folder once ($GOT)" \
+    || { echo "FAIL: roots [$1, $2] listed [$GOT], wanted [org/nested]"; rc=1; }
+  ADDED=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/models/rescan")
+  GOT="$(ids)"
+  [ "$GOT" = "org/nested" ] \
+    && echo "PASS: a rescan adds no second row ($ADDED)" \
+    || { echo "FAIL: after a rescan roots [$1, $2] listed [$GOT]"; rc=1; }
+  stop
+done
+
+# ── [6] Live: a model started by PATH, with the app's library root and the
+# model's own parent both scanned, keeps one resident copy when a request names
+# its org/name id.
+source "$(dirname "$0")/_lib_models.sh"
+REPO="mlx-community/Qwen3.5-0.8B-MLX-4bit"
+if MODEL="$(find_model "$REPO")"; then
+  LIB="$(dirname "$(dirname "$MODEL")")"
+  HOME="$TMP" "$BIN" --serve --port "$PORT" --model "$MODEL" --model-dir "$LIB" --model-dir "$(dirname "$MODEL")" \
+    >"$TMP/live.log" 2>&1 &
+  SRV=$!
+  srv_wait_health "http://127.0.0.1:$PORT" 120 0.5 "$SRV" || { echo "FAIL: live server never became healthy"; exit 1; }
+  curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'content-type: application/json' \
+    -d "{\"model\":\"$REPO\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":4}" >/dev/null
+  RESIDENT=$(curl -s "http://127.0.0.1:$PORT/v1/models" | python3 -c \
+    "import sys,json;print(' '.join(m['id'] for m in json.load(sys.stdin)['data'] if m['loaded'] and m['id'].endswith('Qwen3.5-0.8B-MLX-4bit')))")
+  [ "$RESIDENT" = "$REPO" ] \
+    && echo "PASS: one resident copy after a request naming $REPO" \
+    || { echo "FAIL: resident copies of the folder: [$RESIDENT], wanted [$REPO]"; rc=1; }
+  stop
+else
+  echo "SKIP: [6] needs $REPO (./tests/fetch_test_models.sh)"
 fi
 
 [ $rc -eq 0 ] && echo "ALL PASS" || echo "SOME FAILURES"

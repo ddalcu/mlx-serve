@@ -18,13 +18,24 @@ Configs, templates, tokenizers:
 - **Digit GROUPING is per-model** (`Tokenizer.digit_group`; a COMBINED Split regex hides it); the CASED grammar (`\p{Lu}` + attached contractions) is `.llama3` (Muse, `[\r\n/]*` tail) or `.cased` (Flint: `[\p{P}\p{S}]` punct, newline-only tail, an unmatched `\p{C}` run kept whole), the plain Llama-3 regex is `.gpt2` + 3-digit groups; `ignore_merges` emits a vocab word whole; `\s` is Unicode White_Space (U+3000, NBSP), `\s*[\r\n]+` BACKTRACKS to a run's last newline, and a Split entry of its OWN (DeepSeek's and Flint's digits, CJK) cuts the text first under EITHER grammar (`isolated_runs`). Guard: `tests/test_tokenizer_hf_parity.sh`. The degenerate-tail guard has a LONG-period tier (`isDegenerateTailLoopRange`).
 
 Weights, quant, loading:
+- **A quant triple can straddle two shards** (mlx-lm shards by size: a `.biases` in shard 2, its `.weight` in shard 1):
+  per-shard load logic never takes a lone leaf for a duplicate (`shardCarries`). Guard: `loadWeights keeps a quant
+  triple the shards split, with no key duplicated`.
 - **Tree, prefix and axis order are CONVERTER choices — probe** (`resolveWeightPrefix`, `lagunaRouterBase`, `hy3ExpertContainer`, `resolveVisionPrefix` + `patchProjLayout`). A family's geometry comes from the CHECKPOINT once a second size exists (FLUX klein 4B/9B).
 - **Quant resolves PER WEIGHT** (`computeQuantParams`; scales dtype decides fp8 vs affine; overrides can hide inside the fp family, `fpParamsFromGeometry`); affine bits outside {2,3,4,5,6,8} rejected at PARSE; no engine hardcodes a width (`affineParamsFromGeometry`, scan-pinned). A table or projection loaded WITHOUT its input width (hint 0, config gs) reads another group size: Gemma 4 E4B mixed 4/6-bit declares gs 32, stores gs 64 (`tests/test_gemma4_mixed_quant.sh`).
+- **An MoE plugin streams its experts with two SDK calls and one cap** (`Streamed.forLoad`, `moe.bindStreamed`,
+  `Caps.experts_stream`): conformance serves its fixture streamed vs in memory (1e-3 of the top logit, one slot and 16
+  batched) and fails a load that reads them. Several lazy passes evaluate each before the next fetch rewrites the rows.
+  An MoE on its own block (inkling) leaves the cap off.
 - **A loader that COPIES a large file reads it uncached** (`gguf.File.readUncached`: `F_NOCACHE`, page-aligned): macOS
   keeps every read page (no madvise/msync drops it) and compresses the copies first; DeepSeek-V4.1's 138 GB set swapped.
 - **A GGUF weight is `.gguf` ONLY when its scales are the bool TYPE SENTINEL**: affine-coded types load as MLX affine
   triples and floats dense, so a reader keying on "GGUF set + scales" sent affine codes to `gather_qmm` as `gguf`
   (`ggufProj`, llama `modeOf`). Raw ggml bytes only through `kernels.infoOf`; such a weight has no biases.
+- **A claim checks what the model reads IN PLACE too** (`gguf.Arch.readsInPlace`): a tensor the loader skips is not
+  type-checked by `serves`, so a DeepSeek-V4.1 set with a Q5_K Engram table passed the claim though its reader
+  refuses it at load (`EngramTableGeometry`); a decline hands the set to llama.cpp. Guard: `unsupportedReason: a
+  DeepSeek-V4.1 set's Q6_K head ...`.
 - **Dense checkpoints**: scales absence PER-TENSOR (`getLayerScaleOpt`); dense contracted weights owe `maybeTransposeForBf16` — never depthwise conv or SSM state.
 - **ModelOpt's NVFP4 `weight_scale_2` is amax / (448 x 6); MLX's nvfp4 `global_scale` is the amax** (`modelopt_pack.dequantDense`): passed through raw, every weight shrank 2688x and the vision tower saw a blank image.
 - **A pack runs in its reference's numerics** (`actDtype`, `LoadOpts.keep_f16`; Bonsai 2 f16 + f32 GDN state; qwen4 f32 GDN state + gate, `MLX_SERVE_GDN_STATE_F32=0` = bf16); constants take the activation dtype. Guard: `test_hadamard_fidelity.sh`.

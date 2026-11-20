@@ -78,6 +78,46 @@ pub const Tensors = struct {
         try t.put(fmt, args, .U16, shape, out);
     }
 
+    /// Every affine triple (`<p>.weight` u32 codes with `<p>.scales` and `<p>.biases` in bf16, `bits` wide in groups
+    /// of `group`) as the dense bf16 `[out, in]` weight it decodes to: a pack's bf16 twin on the same weights.
+    pub fn affineToDense(t: *Tensors, bits: u32, group: u32) !void {
+        var kept: std.ArrayList(Entry) = .empty;
+        for (t.list.items) |e| {
+            std.debug.assert(e.alias == null);
+            const dot = std.mem.lastIndexOfScalar(u8, e.name, '.').?;
+            const stem = e.name[0..dot];
+            const leaf = e.name[dot..];
+            const packed_w = if (t.find(stem, ".weight")) |w| w.dtype == .U32 else false;
+            if (packed_w and (std.mem.eql(u8, leaf, ".scales") or std.mem.eql(u8, leaf, ".biases"))) continue;
+            if (!packed_w or !std.mem.eql(u8, leaf, ".weight")) {
+                try kept.append(t.a, e);
+                continue;
+            }
+            const scales = (t.find(stem, ".scales") orelse return error.NoSuchTensor).bytes;
+            const biases = (t.find(stem, ".biases") orelse return error.NoSuchTensor).bytes;
+            const out: usize = @intCast(e.shape[0]);
+            const in: usize = @intCast(e.shape[1] * 32 / bits);
+            const dense = try t.a.alloc(u8, out * in * 2);
+            for (0..out * in) |i| {
+                const at = (i / in) * e.shape[1] * 32 + (i % in) * bits;
+                const lo: u64 = std.mem.readInt(u32, e.bytes[at / 32 * 4 ..][0..4], .little);
+                const hi: u64 = if (at / 32 * 4 + 8 <= e.bytes.len) std.mem.readInt(u32, e.bytes[at / 32 * 4 + 4 ..][0..4], .little) else 0;
+                const code: f32 = @floatFromInt(((hi << 32 | lo) >> @intCast(at % 32)) & ((@as(u64, 1) << @intCast(bits)) - 1));
+                const g = (i / in) * (in / group) + (i % in) / group;
+                writeFloat(dense, .BF16, i, readBf16(scales, g) * code + readBf16(biases, g));
+            }
+            try kept.append(t.a, .{ .name = e.name, .dtype = .BF16, .shape = try t.a.dupe(u64, &.{ out, in }), .bytes = dense });
+        }
+        t.list = kept;
+    }
+
+    fn find(t: *const Tensors, stem: []const u8, comptime leaf: []const u8) ?Entry {
+        for (t.list.items) |e| {
+            if (e.name.len == stem.len + leaf.len and std.mem.startsWith(u8, e.name, stem) and std.mem.endsWith(u8, e.name, leaf)) return e;
+        }
+        return null;
+    }
+
     /// The safetensors bytes (8-byte header length, JSON header, data), in insertion order.
     /// `name` as a second tensor over `existing`'s bytes (dtype and shape too): fixed-width layers share one buffer.
     pub fn alias(t: *Tensors, comptime fmt: []const u8, args: anytype, existing: []const u8) !void {
@@ -112,6 +152,10 @@ pub const Tensors = struct {
         return out;
     }
 };
+
+fn readBf16(b: []const u8, i: usize) f32 {
+    return @bitCast(@as(u32, std.mem.readInt(u16, b[i * 2 ..][0..2], .little)) << 16);
+}
 
 fn writeFloat(out: []u8, dtype: Dtype, i: usize, v: f32) void {
     switch (dtype) {

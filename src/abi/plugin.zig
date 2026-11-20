@@ -16,7 +16,9 @@ pub const Stream = common.Stream;
 pub const Claim = common.Claim;
 pub const PackDir = common.PackDir;
 
-pub const version: u32 = 1;
+/// Moves when a struct the plugin writes whole (`Parsed`, `Bill`) grows: an older host refuses the newer table, so a
+/// plugin never writes past the host's shorter struct; this host takes every older table, whose structs it reads by size.
+pub const version: u32 = 2;
 
 const nan = std.math.nan(f32);
 
@@ -134,7 +136,14 @@ pub const Caps = packed struct(u64) {
     /// rounds included). A plugin that resumes its own state across requests (`CacheHooks.resume_prompt`) resumes
     /// only under the same `Ablation.keys` entry.
     ablation: bool = false,
-    _: u33 = 0,
+    /// A prompt forward asked for `Logits.last_row` returns its last row's logits alone, bit-identical to that row of
+    /// its `.all_rows` result, and still every hidden and captured row it is asked for. The host asks for it on the
+    /// prefill's prompt forwards unless the request echoes prompt logprobs.
+    prompt_last_row: bool = false,
+    /// The load streams an MLX pack's routed experts on the `stream_experts` setting (`sdk/weights/streamed.zig`):
+    /// the preflight bills their slot rows, not the experts. Without it the setting is refused by name.
+    experts_stream: bool = false,
+    _: u31 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };
@@ -337,6 +346,19 @@ pub const Parsed = extern struct {
     /// The plugin's own parsed config, read by its `bill` and `load`.
     private: ?*anyopaque = null,
     speech: SpeechFacts = .{},
+    /// Ends the struct at the size a plugin built before `engine_config` writes (728 bytes: `speech` ends at 724, the
+    /// rest was padding it may have left unset), so `engine_config` lies past it and the size gate reads it unset.
+    _pre_engine_config: u32 = 0,
+    /// This plugin serves a `model_type` the engine parses and wants the engine's own config (family fields, weight
+    /// renames, bills) with its binding attached, instead of the generic config of its facts alone. The engine then
+    /// sizes and bills the pack as it does that type, so the plugin must match the engine's layout for that type.
+    /// A pack the engine cannot parse keeps the generic config. Read through `wantsEngineConfig`.
+    engine_config: bool = false,
+
+    /// `engine_config`; false for a plugin built before it (its `size` ends before the field).
+    pub fn wantsEngineConfig(p: *const Parsed) bool {
+        return p.size >= @offsetOf(Parsed, "engine_config") + @sizeOf(bool) and p.engine_config;
+    }
 };
 
 // ── Bill ──
@@ -351,6 +373,7 @@ pub const Shape = extern struct {
 };
 
 /// The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout.
+/// `flags` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
 pub const Bill = extern struct {
     size: u32 = @sizeOf(Bill),
     kv_per_token: u64 = 0,
@@ -363,6 +386,32 @@ pub const Bill = extern struct {
     prefill_attn_keys: ?*const fn (p: *const Parsed, seq: u64) callconv(.c) u64 = null,
     prefill_bytes: ?*const fn (p: *const Parsed, seq: u64, chunk: u32, kv_bits: u8, warm: u64) callconv(.c) u64 = null,
     batched_kv_len: ?*const fn (p: *const Parsed, kv: u32, gather_on: bool, min: u32) callconv(.c) u32 = null,
+    /// A u32 at offset 88, read through `billFlags`. Zero keeps the host's rules from before it.
+    flags: BillFlags = .{},
+
+    /// `flags`, or null from a plugin whose Bill predates it.
+    pub fn billFlags(b: *const Bill) ?BillFlags {
+        if (b.size < @offsetOf(Bill, "flags") + @sizeOf(BillFlags)) return null;
+        return b.flags;
+    }
+};
+
+pub const BillFlags = packed struct(u32) {
+    decode_room: DecodeRoom = .by_name,
+    /// A decode-billed request reserves its whole KV (prompt, reply to the context, verify rows) at its prompt and
+    /// its decode bill prices that KV once (`reservedPrefillTokens`, `glm5DecodeMemoryNeeded`).
+    reserves_request: bool = false,
+    _: u29 = 0,
+};
+
+/// Whether a streamed model's decode phase gets a room of its own (`LoadCtx.stream_room_decode`, `stream_grow_decode`).
+/// `billed` prices it with the KDA-hybrid trunk's decode bill (`glm5DecodeMemoryNeeded`), so only a model on that trunk
+/// (GLM-5, Ling) sets it: another streamed family (DeepSeek) must not, since that bill is not its own.
+pub const DecodeRoom = enum(u2) {
+    /// The host's rule: a GLM-5 whose plugin prices no prompt, and Ling. The unnamed values 2 and 3 read as this.
+    by_name = 0,
+    billed = 1,
+    _,
 };
 
 // ── Load and forward ──
@@ -391,7 +440,90 @@ pub const LoadCtx = extern struct {
     /// `tp_size` 0 = whole.
     tp_rank: u32 = 0,
     tp_size: u32 = 0,
+    /// GPU bytes a streamed bank may fill in the decode phase: the GPU ceiling less the decode phase's bill at 16K + 1K
+    /// and the wired margin; 0 = the host has none (`decodeRoom`).
+    stream_room_decode: u64 = 0,
+    /// The GPU ceiling both rooms were taken from (a bank calibration's key); 0 = unknown.
+    gpu_ceiling_bytes: u64 = 0,
+    /// Each phase's bill growth from the rooms' cell (`stream_room_cell`) to the server's context limit: what a bank
+    /// calibrated at the cell gives up for a longer context; 0 = none or unknown.
+    stream_grow_prompt: u64 = 0,
+    stream_grow_decode: u64 = 0,
+    /// The key a bank calibration must carry to apply on this server (`bank-fit.json` v3): the canonical key text
+    /// (`sdk/quant/bank_fit_key.zig`), empty when the host has none.
+    bank_fit_key: Str = .{},
+
+    /// The decode phase's room: `stream_room_decode`, or `stream_room` from a host that sets none or predates it.
+    pub fn decodeRoom(c: *const LoadCtx) u64 {
+        if (c.size < @offsetOf(LoadCtx, "stream_room_decode") + @sizeOf(u64) or c.stream_room_decode == 0) return c.stream_room;
+        return c.stream_room_decode;
+    }
+    /// `gpu_ceiling_bytes`, or 0 from a host that predates it.
+    pub fn gpuCeiling(c: *const LoadCtx) u64 {
+        if (c.size < @offsetOf(LoadCtx, "gpu_ceiling_bytes") + @sizeOf(u64)) return 0;
+        return c.gpu_ceiling_bytes;
+    }
+    /// The bills' growth past the cell (`stream_grow_prompt`, `stream_grow_decode`), 0s from a host that predates it.
+    pub fn streamGrowth(c: *const LoadCtx) struct { prompt: u64, decode: u64 } {
+        if (c.size < @offsetOf(LoadCtx, "stream_grow_decode") + @sizeOf(u64)) return .{ .prompt = 0, .decode = 0 };
+        return .{ .prompt = c.stream_grow_prompt, .decode = c.stream_grow_decode };
+    }
+    /// `bank_fit_key`, or null from a host that sets none or predates it.
+    pub fn fitKey(c: *const LoadCtx) ?[]const u8 {
+        if (c.size < @offsetOf(LoadCtx, "bank_fit_key") + @sizeOf(Str)) return null;
+        const k = c.bank_fit_key.slice();
+        return if (k.len == 0) null else k;
+    }
 };
+
+/// The request the stream rooms are billed at (16K prompt + 1K reply): a bank calibration's evidence cell.
+pub const stream_room_cell: u64 = 16_384 + 1_024;
+
+test "abi plugin: LoadCtx's decode room and ceiling read past an older host's struct as its prompt room and 0" {
+    const dir: PackDir = undefined;
+    const parsed: Parsed = .{};
+    var c: LoadCtx = .{ .model_dir = .{}, .dir = &dir, .parsed = &parsed, .stream_room = 50, .stream_room_decode = 70, .gpu_ceiling_bytes = 110 };
+    try std.testing.expectEqual(@as(u64, 70), c.decodeRoom());
+    try std.testing.expectEqual(@as(u64, 110), c.gpuCeiling());
+    c.stream_room_decode = 0;
+    try std.testing.expectEqual(@as(u64, 50), c.decodeRoom());
+    c.stream_room_decode = 70;
+    c.stream_grow_prompt = 3;
+    c.stream_grow_decode = 4;
+    try std.testing.expectEqual(@as(u64, 4), c.streamGrowth().decode);
+    c.size = @offsetOf(LoadCtx, "stream_grow_prompt");
+    try std.testing.expectEqual(@as(u64, 0), c.streamGrowth().prompt);
+    c.size = @offsetOf(LoadCtx, "stream_room_decode");
+    try std.testing.expectEqual(@as(u64, 50), c.decodeRoom());
+    try std.testing.expectEqual(@as(u64, 0), c.gpuCeiling());
+}
+
+test "abi plugin: a Bill's flag word is one u32 at its offset, read past an older plugin's struct as absent" {
+    try testing.expectEqual(@as(usize, 4), @sizeOf(BillFlags));
+    try testing.expectEqual(@as(usize, 32), @bitSizeOf(BillFlags));
+    try testing.expectEqual(@as(usize, 88), @offsetOf(Bill, "flags"));
+    var b: Bill = .{ .flags = .{ .decode_room = .billed } };
+    try testing.expect(b.billFlags().?.decode_room == .billed);
+    b.size = @offsetOf(Bill, "flags");
+    try testing.expect(b.billFlags() == null);
+    try testing.expect((BillFlags{}).decode_room == .by_name and @as(u32, @bitCast(BillFlags{})) == 0);
+}
+
+test "abi plugin: a decode room is named by_name or billed; every other value is the host's rule" {
+    try testing.expectEqual(@as(usize, 2), @typeInfo(DecodeRoom).@"enum".field_names.len);
+}
+
+test "abi plugin: LoadCtx's bank fit key reads null past an older host's struct and when empty" {
+    const dir: PackDir = undefined;
+    const parsed: Parsed = .{};
+    var c: LoadCtx = .{ .model_dir = .{}, .dir = &dir, .parsed = &parsed, .bank_fit_key = .of("build=x\n") };
+    try std.testing.expectEqualStrings("build=x\n", c.fitKey().?);
+    c.size = @offsetOf(LoadCtx, "bank_fit_key");
+    try std.testing.expect(c.fitKey() == null);
+    c.size = @sizeOf(LoadCtx);
+    c.bank_fit_key = .{};
+    try std.testing.expect(c.fitKey() == null);
+}
 
 pub const Mode = enum(u8) { prefill, decode, verify, batched_rows };
 pub const Logits = enum(u8) { last_row, all_rows, none };
@@ -461,6 +593,14 @@ pub const Forward = extern struct {
     progress: ?*u64 = null,
     /// Directional ablation for this forward's slots (`Caps.ablation`); null = none, the forward unchanged.
     ablation: ?*const Ablation = null,
+    /// A prompt forward the engine does not chunk: a whole-prompt prefill (`Caps.whole_prompt_prefill`), or a hybrid's
+    /// restored tail inside the snapshot backoff. The absolute positions where the engine's chunk loop would end its
+    /// spans, ascending, the last `positions[0] + rows`; empty = the model chunks as it likes. Read it only when `size`
+    /// reaches it: an older host's `Forward` ends before it.
+    prompt_spans: Span(u64) = .{},
+    /// The absolute positions after which the engine files recurrent-state checkpoints for its prefix cache, ascending,
+    /// each one of `prompt_spans` (`CacheOps.checkpoint`); empty = none wanted. Read it only when `size` reaches it.
+    ssm_checkpoints: Span(u64) = .{},
 };
 
 /// Directional ablation (Arditi et al. 2024): slot i's forward removes `strengths[i]` times the component along its
@@ -540,6 +680,16 @@ pub const KvView = extern struct {
 /// prework (`prework_k`, `prework_v`, `prework_gb`) in place of `state_seq`. Writing a null array clears a slot.
 pub const StateSlot = enum(u8) { conv, ssm, conv_input, state_seq, state_in, prework_k, prework_v, prework_gb };
 
+/// One recurrent layer's state after a checkpoint position (`CacheOps.checkpoint`): the convolution window
+/// `[B, K-1, C]` and the scan state `[B, Hv, Dv, Dk]`, borrowed for the call. As an array element, this layout is
+/// frozen for ABI version 1.
+pub const LayerState = extern struct {
+    size: u32 = @sizeOf(LayerState),
+    layer: u32 = 0,
+    conv: Array = .{},
+    ssm: Array = .{},
+};
+
 /// The engine's calls on a slot's cache (`Handle`), handed in `Forward.cache_ops`: blocks append and read KV and
 /// recurrent state through it and never see the engine's types. Every `Array` passed in stays the caller's.
 pub const CacheOps = extern struct {
@@ -571,9 +721,17 @@ pub const CacheOps = extern struct {
     /// Each handle is an SDK `cache_ops.Slot` (`sdk/kv/cache_ops.zig`), which an in-tree model may read directly. A
     /// flag, not the table's address: every compile unit holds its own copy of the table.
     sdk_slots: bool = false,
+    /// A whole-prompt prefill's checkpoint: the named layers' states after `pos` tokens, `pos` the next position of
+    /// `Forward.ssm_checkpoints`. The engine files its own copies; a layer not named keeps none. Null = not served.
+    checkpoint: ?*const fn (cache: Handle, pos: u64, states: Span(LayerState)) callconv(.c) Verdict = null,
 
     pub fn sdkSlots(self: *const CacheOps) bool {
         return self.size >= @sizeOf(CacheOps) and self.sdk_slots;
+    }
+
+    /// `checkpoint`, or null from a host whose table ends before it.
+    pub fn checkpointOp(self: *const CacheOps) @FieldType(CacheOps, "checkpoint") {
+        return if (self.size >= @offsetOf(CacheOps, "checkpoint") + @sizeOf(@FieldType(CacheOps, "checkpoint"))) self.checkpoint else null;
     }
 };
 
@@ -664,11 +822,13 @@ pub const AuxHooks = extern struct {
     size: u32 = @sizeOf(AuxHooks),
     reserve: *const fn (m: *anyopaque, slot: u32, tokens: u64) callconv(.c) Verdict,
     commit: *const fn (m: *anyopaque, slot: u32, len: u64) callconv(.c) Verdict,
-    /// Transfers the slot's completed capture to the caller; null means no checkpoint was reached.
+    /// Transfers the slot's completed capture to the caller; a plugin that can also hands over the state where an
+    /// armed prompt it never finished stopped (`describe` says where). Null means neither.
     snapshot: *const fn (m: *anyopaque, slot: u32, out: *Handle) callconv(.c) Verdict,
     /// Accepts only `pos == snap.n`; builds the replacement before installing it. The caller keeps the snapshot.
     restore_at: *const fn (m: *anyopaque, slot: u32, snap: Handle, pos: u64) callconv(.c) Verdict,
-    /// Clones references when `len == snap.n`; any other length returns named `.unsupported`.
+    /// A snapshot of the longest prefix of at most `len` tokens the plugin restores at (`describe` says where): a
+    /// clone at `len == snap.n`, shorter where the plugin can cut its state; named `.unsupported` when it holds none.
     slice: *const fn (m: *anyopaque, snap: Handle, len: u64, out: *Handle) callconv(.c) Verdict,
     handoff: *const fn (m: *anyopaque, from_slot: u32, to_slot: u32) callconv(.c) Verdict,
     /// Releases the complete snapshot and its host allocations exactly once.
@@ -950,6 +1110,23 @@ test "abi plugin: caps fit one word with the generic defaults" {
     try testing.expectEqual(@as(usize, 8), @sizeOf(Caps));
     const c: Caps = .{};
     try testing.expect(c.prefix_cache and c.batch_per_slot_attn and c.batch_pads_kv and !c.batches_decode);
+}
+
+test "abi plugin: an older plugin's caps word ends before prompt_last_row, which it reads unset" {
+    try testing.expectEqual(@bitOffsetOf(Caps, "ablation") + 1, @bitOffsetOf(Caps, "prompt_last_row"));
+    const older: Caps = @bitCast((@as(u64, 1) << @bitOffsetOf(Caps, "prompt_last_row")) - 1);
+    try testing.expect(older.ablation and !older.prompt_last_row);
+}
+
+test "abi plugin: a Parsed of an older size ends before engine_config, which it reads unset" {
+    // A plugin built before the field writes a 728-byte Parsed, its tail padding unset: the field lies past it.
+    try testing.expectEqual(@as(usize, 728), @offsetOf(Parsed, "engine_config"));
+    var p: Parsed = .{ .engine_config = true };
+    try testing.expect(p.wantsEngineConfig());
+    p.size = @offsetOf(Parsed, "engine_config");
+    try testing.expect(!p.wantsEngineConfig());
+    p = .{};
+    try testing.expect(!p.wantsEngineConfig());
 }
 
 test "abi plugin: every struct opens with its size, set by default" {

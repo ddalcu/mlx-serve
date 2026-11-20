@@ -21,7 +21,7 @@ print(para*int('${PREFILL_AB_PARAS:-260}'))")
 
 arm() {
   local val="$1" label="$2"
-  pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 2
+  srv_preclean "$PORT"
   env "$VAR=$val" "$BIN" --model "$MODEL" --serve --port "$PORT" >"$HOME/claude-tmp/prefill-ab/$PORT-${label// /}.log" 2>&1 &
   local pid=$!
   srv_wait_health "http://127.0.0.1:$PORT" 900 1 "$pid" || true

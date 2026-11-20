@@ -20,7 +20,7 @@ ROBOT="tests/fixtures/robot.png"
 if [ ! -f "$MODEL/config.json" ]; then echo "SKIP: model not found at $MODEL"; exit 0; fi
 
 LOG=$(mktemp); NVLOG=$(mktemp)
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1
+srv_preclean "$PORT"
 ./zig-out/bin/mlx-serve --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG" 2>&1 &
 SRV=$!
 cleanup() { kill "$SRV" 2>/dev/null; }

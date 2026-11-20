@@ -6,14 +6,15 @@ const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const host = @import("host.zig");
+const host = @import("../../sdk/bases/kda_hybrid/host.zig");
 const fwd = @import("table_forward.zig");
 const head = @import("head.zig");
-const fixture = @import("fixture.zig");
+const fixture = @import("../../sdk/bases/kda_hybrid/fixture.zig");
 const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
-const build_options = @import("build_options");
-const streamed = @import("../../sdk/weights/streamed.zig");
-const trunk = @import("trunk.zig");
+const trunk = @import("../../sdk/bases/kda_hybrid/trunk.zig");
+const builtin_formats = @import("../../sdk/bases/kda_hybrid/builtin_formats.zig");
+const moe_fused = @import("moe_fused.zig");
+const glm5 = @import("glm5_next.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -30,6 +31,7 @@ pub const table = abi.ModelTable{
     .cache = &.{ .layout = &layout },
     .weights = &.{ .resident_bytes = &residentBytes },
     .spec = &.{ .trunk_weight = &host.trunkWeight, .head = &head.hooks },
+    .meters = &host.meters,
 };
 
 const Verdict = abi.Verdict;
@@ -55,87 +57,32 @@ fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
     out.* = .{
         .kv_per_token = @as(u64, c.attnLayerCount()) * (c.dsa_kv_lora_rank + 2 * c.dsa_index_head_dim) * 2,
         .ssm_checkpoint = c.ssmCheckpointBytes(4),
+        .flags = .{ .decode_room = if (c.streamed_bank) .billed else .by_name },
     };
 }
 
 fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
-    // The bank's EXL3 prompt GEMMs are built on MLX's NAX tiles: below the M5 they compute wrong.
-    if (config.of(ctx.parsed).streamed and !@import("../../mlx/device.zig").naxAvailable()) {
-        out.* = Verdict.refuse(.unsupported, "glm5_next: the streamed EXL3 repack needs an M5 or newer GPU (its prompt kernels run on the M5's matrix units)");
-        return null;
-    }
-    const mp = host.load(plugin.name, ctx, out) orelse return null;
-    if (config.of(ctx.parsed).streamed) openBank(host.of(mp), ctx.model_dir.slice(), ctx.stream_room) catch |e| {
-        std.log.err("glm5_next: the streamed bank does not open: {t}", .{e});
-        host.unload(mp);
-        out.* = if (e == error.StreamedWeightsUnsupported) Verdict.refuse(.unsupported, "glm5_next: a streamed (experts.bin) pack needs the macOS build's expert streamer") else Verdict.named(.failed, @errorName(e));
-        return null;
-    };
-    return mp;
+    return host.load(plugin.name, ctx, .{ .exl3 = &builtin_formats.exl3, .fused_decode = .{ .rows = glm5.MOE_DECODE_MAX_ROWS, .run = &moe_fused.fusedDecode } }, out);
 }
 
-/// The pack's EXL3 bank bound to every routed layer, at the slot rows the box holds beside the loaded residents and
-/// one prompt (`LoadCtx.stream_room`).
-fn openBank(m: *host.Model, dir: []const u8, room: u64) !void {
-    if (comptime !build_options.mlx_stream) return error.StreamedWeightsUnsupported;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const gpa = std.heap.c_allocator;
-    const geo = try streamed.Glm5n.geometryOf(gpa, io, dir);
-    const rows = streamRows(m.c, room, geo.record_bytes, geo.num_moe_layers, streamed.Glm5n.transient_rows);
-    const gates = try gpa.alloc(streamed.Glm5n.Gate, m.layers.len);
-    defer gpa.free(gates);
-    for (gates, m.layers) |*g, *l| g.* = if (l.mlp == .moe) .{ .w = l.router_raw, .bias = l.mlp.moe.route.sigmoid_bias.expert_bias } else .{ .w = .{ .ctx = null }, .bias = .{ .ctx = null } };
-    _ = mlx.mlx_synchronize(m.s);
-    const b = try streamed.Glm5n.Source.open(gpa, io, dir, m.s, gates, geo.num_moe_layers, geo.num_experts, .{ .prompt = rows.prompt, .decode = rows.decode });
-    std.log.info("glm5_next: streamed experts, {d} prompt / {d} decode slot rows per layer ({d} B a row)", .{ rows.prompt, rows.decode, geo.record_bytes });
-    m.bank = b;
-    const r = streamed.glm5nRouted(b);
-    for (m.layers, 0..) |*l, li| if (l.mlp == .moe) {
-        l.mlp.moe.streamed = .{ .routed = r, .layer = @intCast(li) };
-    };
-}
-
-/// A streamed pack's slot rows per routed layer (`record` bytes a row in each of `n_moe` layers), sized after the
-/// residents load: `room` less the memory in use; the prompt phase also leaves the bank's `transient` rows for its
-/// wide calls. At least `top_k` rows.
-fn streamRows(c: *const config.Config, room: u64, record: u64, n_moe: u32, transient: u32) struct { prompt: u32, decode: u32 } {
-    const system = @import("../../sdk/util/system.zig");
-    const free = room -| (system.getTotalMemBytes() -| system.getAvailableMemBytes());
-    const row = @max(record * n_moe, 1);
-    const lo: u64 = @max(c.num_experts_per_tok, 1);
-    const decode = std.math.clamp(free / row, lo, c.num_experts);
-    const prompt = std.math.clamp((free -| @as(u64, transient) * record) / row, lo, decode);
-    return .{ .prompt = @intCast(prompt), .decode = @intCast(decode) };
-}
-
-/// A Sushi pack is held as its adapter leaves it (`SushiBill`); a streamed pack as stored beside its bank's fewest
-/// slot rows and transient rows; every other pack as stored.
+/// A Sushi pack is held as its adapter leaves it (`SushiBill`); every other pack as stored (a streaming pack's bank
+/// is its outside plugin's bill), plus a streaming pack's draft readout (`draftReadoutBytes`).
 fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, _: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
     const c = config.of(p);
-    out.* = shards;
-    if (c.streamed) {
-        if (comptime !build_options.mlx_stream) return Verdict.refuse(.unsupported, "glm5_next: a streamed pack needs the expert streamer");
-        const geo = streamed.Glm5n.geometryOf(std.heap.page_allocator, std.Io.Threaded.global_single_threaded.io(), model_dir.slice()) catch |e|
-            return Verdict.named(.failed, @errorName(e));
-        out.* = shards +| (@as(u64, c.num_experts_per_tok) * geo.num_moe_layers + streamed.Glm5n.transient_rows) * geo.record_bytes +| mtpBankBytes(model_dir.slice());
-        return .ok;
-    }
+    out.* = shards + draftReadoutBytes(c);
     if (c.expert_quant_json.len == 0) return .ok;
     const io = std.Io.Threaded.global_single_threaded.io();
     out.* = sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir.slice(), SushiBill{ .layers = c.num_hidden_layers, .kv_lora_rank = c.dsa_kv_lora_rank }) catch |e|
         return Verdict.named(.failed, @errorName(e));
+    out.* += draftReadoutBytes(c);
     return .ok;
 }
 
-/// The NextN layer's NVFP4 experts a streaming pack ships beside its bank (held resident); 0 without them.
-fn mtpBankBytes(dir: []const u8) u64 {
-    const crt = @import("../../sdk/util/crt.zig");
-    var buf: [std.fs.max_path_bytes:0]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&buf, "{s}/mtp-experts-nvfp4.bin", .{dir}, 0) catch return 0;
-    const fd = crt.openRead(path);
-    if (fd < 0) return 0;
-    defer crt.close(fd);
-    return @intCast(@max(crt.seekEnd(fd), 0));
+/// The MTP drafts' readout a GLM streaming pack lends (`trunk.draftReadout`, at `trunk.readoutBits`), as
+/// bailing_hybrid bills its own. An upper bound: the load builds it only when the outside plugin runs the head.
+pub fn draftReadoutBytes(c: *const config.Config) u64 {
+    if (!c.streamed_bank or !c.isGlm5()) return 0;
+    return trunk.draftReadoutBytes(c.vocab_size, c.hidden_size, trunk.readoutBits(c));
 }
 
 /// A Sushi GLM tensor as the load holds it: the vision tower and the EXL3 MTP layer past the trunk not at all, the
@@ -197,7 +144,7 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const m = host.of(mp);
     if (!abi.declaresMode(m.caps, f.mode)) return Verdict.refuse(.unsupported, "glm5_next: forward mode not declared");
     const ops = f.cache_ops orelse return Verdict.refuse(.unsupported, "glm5_next: a forward without cache_ops");
-    if (comptime build_options.mlx_stream) if (m.bank) |b| return streamedForward(m, b, ops, f, out);
+    trunk.bankPhase(m, if (f.mode == .batched_rows) @min(f.caches.len, fwd.MOE_DECODE_BATCH_MAX) else f.rows) catch |e| return Verdict.named(.failed, @errorName(e));
     if (f.mode == .batched_rows) {
         if (f.rows != 1 or f.tokens.len != f.caches.len or f.positions.len != f.caches.len) return Verdict.refuse(.unsupported, "glm5_next: batched rows take one host token per slot");
         if (f.capture_layers.len > 0 or f.media.ctx != null) return Verdict.refuse(.unsupported, "glm5_next: no captures or media on batched rows");
@@ -205,25 +152,10 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
             host.clear(out, 0);
             return Verdict.named(.failed, @errorName(e));
         };
-        return .ok;
+        return host.settleBank(m, f, out);
     }
-    return host.forwardOne(plugin.name, fwd, m, ops, f, out);
-}
-
-/// A streamed pack's forward: a call past the bank's decode lane in its prompt phase, every other in decode; the
-/// result evaluated before the call's routes settle (their slot rows are free for the next call's reads).
-fn streamedForward(m: *host.Model, b: *trunk.Bank, ops: *const abi.CacheOps, f: *const abi.Forward, out: *abi.ForwardOut) Verdict {
-    b.setPhase(f.rows > streamed.Glm5n.decode_lane_rows) catch |e| return Verdict.named(.failed, @errorName(e));
     const v = host.forwardOne(plugin.name, fwd, m, ops, f, out);
-    if (!v.isOk()) return v;
-    const vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(vec);
-    inline for (.{ out.logits, out.hidden }) |a| if (a.ctx != null) {
-        _ = mlx.mlx_vector_array_append_value(vec, .{ .ctx = a.ctx });
-    };
-    mlx.check(mlx.mlx_eval(vec)) catch |e| return Verdict.named(.failed, @errorName(e));
-    b.settle() catch |e| return Verdict.named(.failed, @errorName(e));
-    return .ok;
+    return if (v.isOk()) host.settleBank(m, f, out) else v;
 }
 
 /// N slots' next tokens in as few trunk forwards as the MoE row limit allows, each slot's token a row of one window:
@@ -254,9 +186,17 @@ fn batched(m: *host.Model, ops: *const abi.CacheOps, f: *const abi.Forward, out:
         made += 1;
         try rows2d(m, logits, &parts[made - 1][0]);
         try rows2d(m, hidden, &parts[made - 1][1]);
+        // Streamed experts: the next group's fetches rewrite the slot rows this group's last MoE layer reads.
+        if ((m.experts != null or m.bank != null) and end < n) try evalParts(&parts[made - 1]);
     }
     out.logits = .{ .ctx = (try joinRows(m, parts[0..made], 0)).ctx };
     if (f.want_hidden) out.hidden = .{ .ctx = (try joinRows(m, parts[0..made], 1)).ctx };
+}
+
+fn evalParts(p: *const [2]Array) !void {
+    const vec = mlx.mlx_vector_array_new_data(p, 2);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_eval(vec));
 }
 
 /// `[1, R, W]` as `[R, W]`.
@@ -287,8 +227,25 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 // ── tests ──
 
+test "glm5_next resident bill: a GLM streaming pack bills its 8-bit draft readout, 643 MiB at GLM-5.3-Flash's head" {
+    var c: config.Config = .{ .model_type = "glm5_next", .vocab_size = 154880, .hidden_size = 4096, .streamed_bank = true };
+    try std.testing.expectEqual(@as(u64, 674_037_760), draftReadoutBytes(&c));
+    c.streamed_bank = false;
+    try std.testing.expectEqual(@as(u64, 0), draftReadoutBytes(&c));
+}
+
+test "glm5_next bill: a streaming pack bills its own decode room, a resident one leaves it to the host's rule" {
+    var c: config.Config = .{ .model_type = "glm5_next", .streamed_bank = true };
+    const p: abi.Parsed = .{ .private = &c };
+    var b: abi.Bill = .{};
+    bill(&p, &.{}, &b);
+    try std.testing.expect(b.billFlags().?.decode_room == .billed);
+    c.streamed_bank = false;
+    bill(&p, &.{}, &b);
+    try std.testing.expect(b.billFlags().?.decode_room == .by_name);
+}
+
 test {
     _ = config;
     _ = fixture;
-    _ = @import("../../sdk/quant/nvfp4/stream_bank.zig");
 }

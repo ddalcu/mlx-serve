@@ -4,6 +4,7 @@
 # `[scheduler]` lines are counted to catch slots that accept submits but never complete.
 #
 #   CANCEL_TEST_MODEL=<dir> ./tests/test_concurrent_cancellation.sh [port] [cycles]   # PLD_TEST_MODEL fallback chain
+source "$(dirname "$0")/lib/server.sh"
 source "$(dirname "$0")/_lib_models.sh"
 
 set -e
@@ -70,7 +71,7 @@ echo "  model: $MODEL"
 echo "  cycles: $CYCLES"
 echo
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 LOGFILE=$(mktemp)

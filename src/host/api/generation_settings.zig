@@ -15,10 +15,14 @@ pub const Profile = struct {
         self.rules.set(field, .{ .value = v, .force = force });
     }
 
-    /// The model's rules replace the global ones field by field, force flag included.
+    /// The model's rules replace the global ones field by field, force flag included. A model
+    /// effort rule without a thinking rule also displaces the global's unforced thinking rule,
+    /// because the thinking rule outranks the effort rule for on/off (`resolveThinking`).
     pub fn overlay(global: Profile, model: Profile) Profile {
         var out = global;
         for (std.enums.values(Field)) |f| if (model.rules.get(f)) |r| out.rules.set(f, r);
+        if (model.rules.get(.reasoning_effort) != null and model.rules.get(.enable_thinking) == null and !global.forced(.enable_thinking))
+            out.rules.set(.enable_thinking, null);
         return out;
     }
 
@@ -112,6 +116,21 @@ test "generation settings: forced rule > client > rule > fallback; model rules r
     p = Profile.overlay(global, .{});
     try std.testing.expectEqual(@as(u32, 100), p.resolve(u32, .max_tokens, 12, 200));
     try std.testing.expectEqual(@as(?f32, null), p.resolveOpt(f32, .min_p, null, null));
+}
+
+test "generation settings: a model's effort rule displaces the global's unforced thinking rule, never a lock" {
+    var global = Profile{};
+    global.set(.enable_thinking, .{ .boolean = false }, false);
+    global.set(.reasoning_effort, .{ .effort = .low }, false);
+    var model = Profile{};
+    model.set(.reasoning_effort, .{ .effort = .high }, false);
+    try std.testing.expectEqual(@as(?bool, null), Profile.overlay(global, model).value(bool, .enable_thinking));
+    var with_thinking = model;
+    with_thinking.set(.enable_thinking, .{ .boolean = true }, false);
+    try std.testing.expectEqual(@as(?bool, true), Profile.overlay(global, with_thinking).value(bool, .enable_thinking));
+    try std.testing.expectEqual(@as(?bool, false), Profile.overlay(global, .{}).value(bool, .enable_thinking));
+    global.set(.enable_thinking, .{ .boolean = false }, true);
+    try std.testing.expect(Profile.overlay(global, model).forced(.enable_thinking));
 }
 
 test "generation settings: a bad rule rejects the whole profile" {

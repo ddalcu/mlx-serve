@@ -604,6 +604,25 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         }
     }
 
+    /// Carry on a transcript that ends on a tool result (a scheduled run resumed after its approval): the model
+    /// answers the result itself, and no user message is added.
+    func resumeTurn(sessionId: UUID, config: TurnConfig,
+                    approval: @escaping (APIClient.ToolCall) async -> Bool) {
+        guard Self.endsOnToolResult(session(sessionId)?.messages ?? []),
+              Self.canRunTurn(serverRunning: server.status == .running,
+                              apple: appState.useAppleModel) else { return }
+        stop(sessionId: sessionId)
+        let token = ledger.begin(session: sessionId)
+        publishTurnState()
+        runAgentTurn(sessionId: sessionId, text: nil, images: nil, audio: nil,
+                     config: config, token: token, approval: approval)
+    }
+
+    /// Whether the last message the MODEL will see is a tool result (display-only summaries aside).
+    nonisolated static func endsOnToolResult(_ messages: [ChatMessage]) -> Bool {
+        messages.last { !$0.isAgentSummary }?.toolCallId != nil
+    }
+
     /// Regenerate the last reply: drop the last user turn (and whatever
     /// followed it — the old assistant reply, any tool-call chain) and
     /// resubmit that same user text as a fresh turn. Reuses `runTurn` rather
@@ -678,6 +697,15 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             try Task.checkCancellation()
             guard let current = session(sessionId) else { throw CancellationError() }
             let source = current.messages
+            let raw = ContextCompaction.transcript(source)
+            let sourceDigest = ContextCompaction.fingerprint(raw)
+            func checkedSessionIndex() throws -> Int {
+                try Task.checkCancellation()
+                guard let index = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
+                      ContextCompaction.fingerprint(ContextCompaction.transcript(appState.chatSessions[index].messages)) == sourceDigest
+                else { throw ContextCompaction.Failure.changedHistory }
+                return index
+            }
             let messages = ContextCompaction.appendingSummary(to: buildMessages(source), source: source)
             let measurement: Int?
             do {
@@ -685,21 +713,11 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     messages: messages, tools: tools, context: context, output: turnMaxTokens(config),
                     calibration: contextCalibration[sessionId] ?? 1)
             } catch {
-                try Task.checkCancellation()
                 if error is CancellationError { throw error }
-                guard let current = session(sessionId),
-                      ContextCompaction.fingerprint(ContextCompaction.transcript(current.messages)) ==
-                        ContextCompaction.fingerprint(ContextCompaction.transcript(source)) else {
-                    throw ContextCompaction.Failure.changedHistory
-                }
+                _ = try checkedSessionIndex()
                 return messages
             }
-            try Task.checkCancellation()
-            guard let current = session(sessionId),
-                  ContextCompaction.fingerprint(ContextCompaction.transcript(current.messages)) ==
-                    ContextCompaction.fingerprint(ContextCompaction.transcript(source)) else {
-                throw ContextCompaction.Failure.changedHistory
-            }
+            _ = try checkedSessionIndex()
             guard let measured = measurement else {
                 contextMeasurements.removeValue(forKey: sessionId)
                 return messages
@@ -710,7 +728,6 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 return messages
             }
             guard let plan = ContextCompaction.plan(source) else { return messages }
-            let raw = ContextCompaction.transcript(source)
             let digest = ContextCompaction.fingerprint(Array(raw.prefix(plan.boundary + 1)))
             let boundary = ContextCheckpoint(boundaryID: raw[plan.boundary].id, digest: digest)
             if contextFailures[sessionId] == boundary { return messages }
@@ -723,21 +740,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 marker = try await ContextCompactionRunner.summarize(source: source, boundary: plan.boundary,
                     api: api, port: server.port, model: requestModelId(config), context: context)
             } catch {
-                try Task.checkCancellation()
                 if error is CancellationError { throw error }
-                guard let current = session(sessionId),
-                      ContextCompaction.fingerprint(ContextCompaction.transcript(current.messages)) ==
-                        ContextCompaction.fingerprint(raw) else {
-                    throw ContextCompaction.Failure.changedHistory
-                }
+                _ = try checkedSessionIndex()
                 contextFailures[sessionId] = boundary
                 print("[ContextCompaction] failed session=\(sessionId) boundary=\(boundary.boundaryID): \(error.localizedDescription) Using existing history; this boundary will not be retried.")
                 return messages
             }
-            try Task.checkCancellation()
-            guard let index = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
-                  ContextCompaction.fingerprint(ContextCompaction.transcript(appState.chatSessions[index].messages)) ==
-                    ContextCompaction.fingerprint(raw) else { throw ContextCompaction.Failure.changedHistory }
+            let index = try checkedSessionIndex()
             // Preserve updateLastMessage's streaming target, including Continue.
             let insertion = appState.chatSessions[index].messages.last?.isStreaming == true
                 ? appState.chatSessions[index].messages.count - 1 : appState.chatSessions[index].messages.count
@@ -936,15 +945,18 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
     // MARK: - Agent mode (native tool calling)
 
-    private func runAgentTurn(sessionId: UUID, text: String,
+    /// - Parameter text: the user's message; nil resumes a transcript that already ends on a tool result.
+    private func runAgentTurn(sessionId: UUID, text: String?,
                               images: [ChatImage]?, videos: [ChatVideo]? = nil, audio: [ChatAudio]?,
                               config: TurnConfig, token: UUID,
                               approval: @escaping (APIClient.ToolCall) async -> Bool) {
-        var userMsg = ChatMessage(role: .user, content: text)
-        userMsg.images = images
-        userMsg.videos = videos
-        userMsg.audio = audio
-        appState.appendMessage(to: sessionId, message: userMsg)
+        if let text {
+            var userMsg = ChatMessage(role: .user, content: text)
+            userMsg.images = images
+            userMsg.videos = videos
+            userMsg.audio = audio
+            appState.appendMessage(to: sessionId, message: userMsg)
+        }
 
         let api = APIClient()
         let workDir = config.workingDirectory
@@ -1076,7 +1088,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     historyImages: useServerPreprocess
                 )
             }
-            var history = buildHistory(session(sessionId)?.messages ?? [])
+            let history = buildHistory(session(sessionId)?.messages ?? [])
             let userMsg = history.last { ($0["role"] as? String) == "user" }?["content"] as? String ?? ""
             let mcpToolsJSON = config.mcpMode ? mcpManager.toolDefinitionsJSON() : nil
             let mcpListing = config.mcpMode ? mcpManager.toolListingForPrompt() : ""
@@ -1168,11 +1180,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     phrase: config.wakePhrase ?? appState.serverOptions.wakePhrase,
                     hasPersona: !config.systemPromptPrefix.isEmpty)
             }
-            var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
-            if let lastRole = history.last?["role"] as? String, lastRole == "tool" {
-                history.append(["role": "user", "content": AgentEngine.toolRoundNudge])
-            }
-            messages.append(contentsOf: history)
+            var messages = AgentEngine.requestMessages(systemPrompt: systemPrompt, history: history)
 
             AgentEngine.dumpDebugRequest(messages: messages, maxTokens: turnMax)
 
@@ -1197,11 +1205,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 await server.ensureDefaultChatModel(selectedModelPath: appState.selectedModelPath)
                 messages = try await prepareCompactedContext(api: api, sessionId: sessionId,
                     config: config, context: contextLength, tools: combinedToolsJSON) { source in
-                    var history = buildHistory(source)
-                    if history.last?["role"] as? String == "tool" {
-                        history.append(["role": "user", "content": AgentEngine.toolRoundNudge])
-                    }
-                    return [["role": "system", "content": systemPrompt]] + history
+                    AgentEngine.requestMessages(systemPrompt: systemPrompt, history: buildHistory(source))
                 }
                 AgentEngine.dumpDebugRequest(messages: messages, maxTokens: turnMax)
             } else {

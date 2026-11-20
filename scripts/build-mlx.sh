@@ -39,9 +39,16 @@ die() { echo "[build-mlx] ERROR: $*" >&2; exit 1; }
 
 MLX_SHA="$(git -C "$MLX_SRC" rev-parse --short=12 HEAD)"
 MLXC_SHA="$(git -C "$MLXC_SRC" rev-parse --short=12 HEAD)"
-# The mlx-c patch below is part of the build: an edited patch must rebuild.
-MLXC_PATCH="$REPO_ROOT/patches/mlxc-gather-qmm-global-scale.patch"
-PATCH_SHA="$(shasum "$MLXC_PATCH" | cut -c1-12)"
+# The patches are part of the build: an edited, added or dropped patch must rebuild.
+PATCH_DIRS=()
+PATCH_FILES=()
+while read -r dir patch || [ -n "$dir" ]; do
+  case "$dir" in ''|\#*) continue ;; esac
+  PATCH_DIRS+=("$REPO_ROOT/$dir")
+  PATCH_FILES+=("$REPO_ROOT/$patch")
+done < "$SCRIPT_DIR/build-mlx-patches.txt"
+# An empty list hashes nothing: unguarded, bash 3.2 dies on the unset array and a newer one leaves `cat` on stdin.
+PATCH_SHA="$(cat /dev/null ${PATCH_FILES[@]+"${PATCH_FILES[@]}"} | shasum | cut -c1-12)"
 WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA target=$DEPLOYMENT_TARGET"
 
 # Idempotent: skip when the staged build already matches the pinned SHAs.
@@ -69,6 +76,14 @@ echo "[build-mlx] SDK $SDK_VERSION, deployment target $DEPLOYMENT_TARGET, $WANT"
 
 NCPU="$(sysctl -n hw.ncpu)"
 
+# The files a patch touches are reset first, so an edited patch replaces the old one; local edits anywhere else in the
+# submodule are kept.
+for i in ${PATCH_FILES[@]+"${!PATCH_FILES[@]}"}; do
+  src="${PATCH_DIRS[$i]}" patch="${PATCH_FILES[$i]}"
+  git -C "$src" checkout -- $(git -C "$src" apply --numstat -p1 "$patch" | cut -f3)
+  git -C "$src" apply -p1 "$patch"
+done
+
 # ── mlx (C++ core + metallib) ────────────────────────────────────────────────
 cmake -S "$MLX_SRC" -B "$BUILD_ROOT/mlx" \
   -DCMAKE_BUILD_TYPE=Release \
@@ -81,12 +96,6 @@ cmake --build "$BUILD_ROOT/mlx" -j "$NCPU"
 cmake --install "$BUILD_ROOT/mlx" >/dev/null
 
 # ── mlx-c against the staged mlx (same pairing brew uses: USE_SYSTEM_MLX) ────
-# MLX 0.32.3's gather_qmm takes a global_scale before sorted_indices; the
-# pinned mlx-c predates it (the same patch the Linux build applies). The files
-# the patch touches are reset first, so an edited patch replaces the old one;
-# local edits anywhere else in the submodule are kept.
-git -C "$MLXC_SRC" checkout -- $(git -C "$MLXC_SRC" apply --numstat -p1 "$MLXC_PATCH" | cut -f3)
-git -C "$MLXC_SRC" apply -p1 "$MLXC_PATCH"
 cmake -S "$MLXC_SRC" -B "$BUILD_ROOT/mlxc" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \

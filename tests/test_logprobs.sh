@@ -26,7 +26,7 @@ BASE="http://127.0.0.1:$PORT"
 
 ID="$(basename "$MODEL")"
 LOG="$(mktemp)"
-pkill -f "mlx-serve --serve.*port $PORT" 2>/dev/null; sleep 1
+srv_preclean "$PORT"
 "$BIN" --serve --model "$MODEL" --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -f "$LOG"' EXIT

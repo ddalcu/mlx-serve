@@ -43,7 +43,7 @@ if [ ! -d "$MODEL" ]; then
     exit 0
 fi
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 sleep 1
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --ctx-size 8192 --log-level info > /tmp/test_thinking_split.log 2>&1 &
 SERVER_PID=$!
@@ -164,6 +164,44 @@ if [ "$CALLED" = True ]; then
 else
     check "tools+thinking: answer (391) in content deltas" "$(echo "$CONTENT" | grep -q 391 && echo 1 || echo 0)"
 fi
+
+echo "8. usage.completion_tokens_details.reasoning_tokens: non-stream and stream (include_usage), plain and with tools"
+# Reasoning in the reply means a count above 0 and within completion_tokens, none means no completion_tokens_details.
+# The tools case runs the stream's tool-gated arm and, when the model calls, the tool-call reply; plain runs the think arm.
+WEATHER_TOOL='[{"type":"function","function":{"name":"get_weather","description":"Get current weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]'
+for CASE in "true|plain|What is 17+25? Answer with just the number." \
+            "true|tools|What is the weather in Paris right now? Use the get_weather tool." \
+            "false|plain|What is 17+25? Answer with just the number."; do
+    IFS='|' read -r THINK ARM Q <<< "$CASE"
+    EXTRA=""
+    [ "$ARM" = tools ] && EXTRA=",\"tools\":$WEATHER_TOOL"
+    for STREAM in false true; do
+        [ "$STREAM" = true ] && SEXTRA=",\"stream\":true,\"stream_options\":{\"include_usage\":true}" || SEXTRA=""
+        read -r RLEN CALLED RTOK CTOK <<< "$(curl -sN -m 180 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
+            -d "{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":800,\"temperature\":0,\"enable_thinking\":$THINK$EXTRA$SEXTRA}" | python3 -c "
+import json,sys
+raw=sys.stdin.read(); r=''; called=False; u={}
+if raw.lstrip().startswith('data:'):
+    for line in raw.splitlines():
+        p=line[5:].strip() if line.startswith('data:') else ''
+        if not p or p=='[DONE]': continue
+        o=json.loads(p); u=o.get('usage') or u
+        d=(o.get('choices') or [{}])[0].get('delta',{})
+        r+=d.get('reasoning_content') or ''; called=called or bool(d.get('tool_calls'))
+else:
+    o=json.loads(raw); m=o['choices'][0]['message']; u=o['usage']
+    r=m.get('reasoning_content') or ''; called=bool(m.get('tool_calls'))
+print(len(r), called, (u.get('completion_tokens_details') or {}).get('reasoning_tokens','missing'), u.get('completion_tokens','missing'))")"
+        DESC="stream=$STREAM $ARM thinking=$THINK called=$CALLED"
+        echo "  $DESC: reasoning ${RLEN}B, reasoning_tokens=$RTOK completion_tokens=$CTOK"
+        if [ "$RLEN" -gt 0 ] 2>/dev/null; then
+            check "$DESC: reasoning_tokens above 0" "$([ "$RTOK" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
+            check "$DESC: reasoning_tokens within completion_tokens" "$([ "$RTOK" -le "$CTOK" ] 2>/dev/null && echo 1 || echo 0)"
+        else
+            check "$DESC: no reasoning_tokens without reasoning" "$([ "$RTOK" = missing ] && echo 1 || echo 0)"
+        fi
+    done
+done
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

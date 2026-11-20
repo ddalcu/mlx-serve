@@ -772,6 +772,7 @@ test "exit status maps signals the way a shell does" {
 extern "c" fn socketpair(domain: c_int, sock_type: c_int, protocol: c_int, fds: *[2]c_int) c_int;
 const usleep = c.usleep;
 extern "c" fn getpid() c_int;
+extern "c" fn umask(mask: std.c.mode_t) std.c.mode_t;
 // `AF_UNIX` and `unlink` are declared above, for the interop-test listener.
 
 const Harness = struct {
@@ -976,6 +977,10 @@ test "e2e: a detached process outlives the connection and reports its pid" {
     const log_file = try std.fmt.allocPrintSentinel(gpa, "/tmp/vz-agent-detach-{d}.log", .{getpid()}, 0);
     defer gpa.free(log_file);
     defer _ = unlink(log_file.ptr);
+
+    // The detached child inherits this process's umask, which clears bits of the log's mode.
+    const caller_umask = umask(0o022);
+    defer _ = umask(caller_umask);
 
     var h = try Harness.start(.{
         .command = "echo backgrounded",

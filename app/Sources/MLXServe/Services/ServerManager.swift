@@ -646,12 +646,17 @@ class ServerManager: ObservableObject {
             memoryInfo = memory
             specCost = props.specCost
             batching = props.batching
-            cluster = props.cluster
+            noteCluster(props.cluster)
             await noteRegistryGeneration(props.registryGeneration)
         }
         // `/v1/models` reads every model's config, so it is re-read only when
         // `registry_generation` says a load, unload or eviction (from any
         // client) has changed it.
+    }
+
+    /// Takes `/props`' pair state, stored only when it moved (as `noteLoadProgress`).
+    func noteCluster(_ reading: ClusterInfo?) {
+        if reading != cluster { cluster = reading }
     }
 
     private func noteRegistryGeneration(_ reported: UInt64?) async {
@@ -665,7 +670,7 @@ class ServerManager: ObservableObject {
     /// where the tray's `/props` ticker does not.
     func refreshPairState() async {
         guard status == .running, let props = try? await api.fetchProps(port: port) else { return }
-        cluster = props.cluster
+        noteCluster(props.cluster)
         await noteRegistryGeneration(props.registryGeneration)
     }
 
@@ -756,15 +761,21 @@ class ServerManager: ObservableObject {
             while !Task.isCancelled {
                 guard let self else { return }
                 if let p = try? await self.api.loadProgress(port: self.port), !Task.isCancelled {
-                    let ended = !self.loadProgress.isEmpty && p.isEmpty
-                    self.loadProgress = p
                     // Another client's load ended: the model list moved.
-                    if ended, self.loadsInFlight == 0, self.status == .running { await self.refreshModels() }
+                    if self.noteLoadProgress(p), self.loadsInFlight == 0, self.status == .running { await self.refreshModels() }
                 }
                 let loading = !self.loadProgress.isEmpty || self.loadsInFlight > 0
                 try? await Task.sleep(for: Self.loadProgressInterval(loading: loading))
             }
         }
+    }
+
+    /// Takes one reading of `/v1/load-progress`; true when the last load just ended. Stored only when it moved:
+    /// `@Published` announces every assignment, and `AppState` passes each one on to every view.
+    func noteLoadProgress(_ reading: [String: LoadProgress]) -> Bool {
+        let ended = !loadProgress.isEmpty && reading.isEmpty
+        if reading != loadProgress { loadProgress = reading }
+        return ended
     }
 
     private func stopLoadProgressPolling() {
@@ -961,6 +972,10 @@ class ServerManager: ObservableObject {
     /// The app's environment plus the bundled frameworks the engine loads its dylibs from.
     nonisolated static func launchEnvironment() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
+        // The server's own pulls (`/api/pull`, `run`) must reach the hub the user's shell names: a Finder launch
+        // has no shell environment to inherit it from.
+        let hf = LoginShellEnv.huggingFaceEnvironment(process: env)
+        for name in ["HF_ENDPOINT", "HF_TOKEN"] where env[name] == nil { env[name] = hf[name] }
         if let frameworksPath = Bundle.main.privateFrameworksPath {
             let existing = env["DYLD_LIBRARY_PATH"] ?? ""
             env["DYLD_LIBRARY_PATH"] = existing.isEmpty ? frameworksPath : "\(frameworksPath):\(existing)"
@@ -977,19 +992,19 @@ class ServerManager: ObservableObject {
                 return bundled
             }
         }
-        // 2. Development: zig-out/bin/mlx-serve relative to this source file's repo root
-        //    The Swift package lives in app/, so the repo root is one level up.
-        let repoRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent() // Services/
-            .deletingLastPathComponent() // MLXServe/
-            .deletingLastPathComponent() // Sources/
-            .deletingLastPathComponent() // app/
-            .path
-        let zigOut = (repoRoot as NSString).appendingPathComponent("zig-out/bin/mlx-serve")
-        if FileManager.default.fileExists(atPath: zigOut) {
-            return zigOut
+        // 2. Development: the checkout's own build.
+        if FileManager.default.fileExists(atPath: sourceBuildBinaryPath) {
+            return sourceBuildBinaryPath
         }
         return "mlx-serve"
+    }
+
+    /// `zig-out/bin/mlx-serve` at the checkout root, which sits four folders above this file
+    /// (app/Sources/MLXServe/Services/).
+    nonisolated static var sourceBuildBinaryPath: String {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { root.deleteLastPathComponent() }
+        return root.appendingPathComponent("zig-out/bin/mlx-serve").path
     }
 
     /// Note this never runs at app exit — a `@StateObject` is not deallocated

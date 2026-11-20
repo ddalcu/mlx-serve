@@ -8,7 +8,6 @@ const keyed_sample = @import("../sampling/keyed_sample.zig");
 const transformer_mod = @import("../transformer.zig");
 const dsv4_mod = @import("../../../plugins/deepseek_v4/deepseek_v4.zig");
 const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
-const mlx_stream = @import("../modules/stream.zig");
 const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const model_mod = @import("../../../sdk/config/model.zig");
 const log = @import("../../../sdk/util/log.zig");
@@ -562,6 +561,13 @@ pub const Generator = struct {
 
     pub fn loopGuardStart(self: *const Generator) usize {
         return @min(self.loop_guard_start, self.generated_ids.items.len);
+    }
+
+    /// GPU bytes of this request's private MTP head history; the live-residency
+    /// term must carry it or under-reads what the process holds.
+    pub fn mtpCacheBytes(self: *const Generator) u64 {
+        if (self.mtp_cache) |*cache| return cache.residentBytes();
+        return 0;
     }
 
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {

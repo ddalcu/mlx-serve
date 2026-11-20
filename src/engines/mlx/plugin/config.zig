@@ -21,8 +21,31 @@ const ModelConfig = model.ModelConfig;
 pub const Binding = struct {
     table: *const abi.ModelTable,
     parsed: abi.Parsed = .{},
-    /// An outside plugin's (`host/plugins`): the legacy parse knows nothing of its packs.
+    /// An outside plugin's (`host/plugins`): its config is its facts alone (`adapted`) unless its parse asks for the
+    /// legacy parse's (`Parsed.engine_config`).
     outside: bool = false,
+    /// The bill's shape-free terms, read once where a load binds the table (`readBillTerms`); null on a binding made
+    /// without it, which reads the bill at each use.
+    bill_terms: ?BillTerms = null,
+
+    /// The bill terms admission reads at every request; none depends on the shape.
+    pub const BillTerms = struct {
+        /// null from a plugin whose Bill predates them.
+        flags: ?abi.BillFlags,
+        prices_prompt: bool,
+    };
+
+    pub fn billTerms(b: *const Binding) BillTerms {
+        if (b.bill_terms) |t| return t;
+        var bill: abi.Bill = .{};
+        b.table.bill(&b.parsed, &.{ .context = abi.stream_room_cell }, &bill);
+        return .{ .flags = bill.billFlags(), .prices_prompt = bill.prefill_bytes != null };
+    }
+
+    /// Called once, after the parse and before any other thread reads the binding.
+    pub fn readBillTerms(b: *Binding) void {
+        b.bill_terms = b.billTerms();
+    }
 
     pub fn destroy(b: *Binding, a: std.mem.Allocator) void {
         b.table.free_parsed(&b.parsed);
@@ -64,7 +87,7 @@ pub fn adapted(b: *Binding) ModelConfig {
 }
 
 /// The plugin's claim and parse of the pack at `model_dir` (caller owns the binding); null for a pack of a type no
-/// plugin serves (an mlx-stream pack is its stream module's), `error.PluginDeclinedNoLegacy` for a served type's pack
+/// plugin serves, `error.PluginDeclinedNoLegacy` for a served type's pack
 /// its plugin declines. The engine's config of a served pack is the legacy parse with this binding attached.
 pub fn bindServed(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config_json: []const u8) !?*Binding {
     const why = switch (try resolve(io, a, model_dir, config_json)) {
@@ -75,21 +98,8 @@ pub fn bindServed(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, confi
     defer arena.deinit();
     const model_type = sdk_plugin.modelTypeOf(arena.allocator(), config_json) catch return null;
     if (!served.serves(model_type)) return null;
-    if (streamPack(io, a, model_dir, config_json)) {
-        log.info("[plugin] {s}: {s}; its stream module serves it\n", .{ model_type, why });
-        return null;
-    }
     log.err("[plugin] {s}: {s}; no other path serves it\n", .{ model_type, why });
     return error.PluginDeclinedNoLegacy;
-}
-
-/// An mlx-stream pack: a declared expert bank, or an `experts.bin` beside the trunk.
-fn streamPack(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config_json: []const u8) bool {
-    if (model.declaresExpertStreaming(a, config_json)) return true;
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const bank = std.fmt.bufPrint(&buf, "{s}/experts.bin", .{model_dir}) catch return false;
-    std.Io.Dir.accessAbsolute(io, bank, .{}) catch return false;
-    return true;
 }
 
 /// `table`'s parse of the pack at `dir` (caller owns the binding), for an engine that serves a pack through one named
@@ -116,6 +126,7 @@ pub fn bindTableWith(io: std.Io, a: std.mem.Allocator, dir: []const u8, table: *
         a.destroy(b);
         return null;
     }
+    b.readBillTerms();
     return b;
 }
 
@@ -125,7 +136,7 @@ fn parseSettings(a: std.mem.Allocator, io: std.Io, buf: []u8, model_dir: []const
     var path: [std.fs.max_path_bytes]u8 = undefined;
     var s = model_settings.load(a, io, model_settings.defaultPath(&path));
     defer s.deinit();
-    var o = s.lookup(a, model_dir);
+    var o = model_settings.lookupPack(&s, a, io, model_dir);
     defer o.deinit(a);
     return switch (o.stream_experts orelse return "") {
         .on => "{\"stream_experts\":true}",
@@ -162,12 +173,17 @@ pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json
         a.destroy(b);
         return .{ .declined = v.why.slice() };
     }
+    if (!ringCoversWindows(table, &b.parsed)) {
+        b.destroy(a);
+        return .{ .declined = "sliding ring narrower than a sliding window" };
+    }
     // The engine reads an embedding pack's pooling from its folder name, which `parse` never sees: an encoder serves
     // under that config's pooling, a decoder only where its plugin serves the embedding batch.
     if (!b.parsed.caps.embed and !served.servesDecoderEmbedding(model_type) and model.poolingFromDirName(std.fs.path.basename(model_dir), model_type) != null) {
         b.destroy(a);
         return .{ .declined = "an embedding pack by its folder name" };
     }
+    b.readBillTerms();
     return .{ .bound = b };
 }
 
@@ -297,6 +313,17 @@ pub fn applyLayout(c: *ModelConfig, table: *const abi.ModelTable, p: *const abi.
     c.sliding_window = window;
 }
 
+/// A declared `CacheFacts.sliding_ring` keeps at least the widest sliding window: a narrower ring drops keys the
+/// layer still reads.
+fn ringCoversWindows(table: *const abi.ModelTable, p: *const abi.Parsed) bool {
+    if (p.cache.sliding_ring == 0) return true;
+    const layout = table.cache.layout orelse return true;
+    var buf: [128]abi.LayerCache = undefined;
+    const n = layout(p, null, &buf, buf.len);
+    for (buf[0..n]) |l| if (l.kind == .sliding and l.window > p.cache.sliding_ring) return false;
+    return true;
+}
+
 // ── tests ──
 
 const testing = std.testing;
@@ -342,6 +369,22 @@ test "plugin config: the cache layout sets the sliding window, the global layers
     try testing.expect(!plain.scale_embeddings);
 }
 
+test "plugin config: a sliding ring must hold every sliding layer's window" {
+    const T = struct {
+        fn layout(_: *const abi.Parsed, _: ?*const abi.LayerSpan, out: [*]abi.LayerCache, cap: u32) callconv(.c) u32 {
+            const ls = [_]abi.LayerCache{ .{ .kind = .sliding, .window = 512 }, .{ .kind = .full }, .{ .kind = .sliding, .window = 1024 } };
+            const n = @min(cap, ls.len);
+            @memcpy(out[0..n], ls[0..n]);
+            return n;
+        }
+    };
+    const t: abi.ModelTable = .{ .name = .of("t"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &.{ .layout = &T.layout }, .weights = undefined };
+    for ([_]struct { ring: u32, ok: bool }{ .{ .ring = 0, .ok = true }, .{ .ring = 1024, .ok = true }, .{ .ring = 3072, .ok = true }, .{ .ring = 1023, .ok = false }, .{ .ring = 512, .ok = false } }) |c| {
+        const p: abi.Parsed = .{ .shell = .{ .num_hidden_layers = 3 }, .cache = .{ .sliding_ring = c.ring } };
+        try testing.expectEqual(c.ok, ringCoversWindows(&t, &p));
+    }
+}
+
 test "plugin config: a served model's facts layer on the legacy config; an unset fact keeps the legacy arm" {
     const t: abi.ModelTable = .{ .name = .of("t"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &.{}, .weights = undefined };
     var b: Binding = .{ .table = &t };
@@ -380,4 +423,131 @@ test "plugin config: sampling defaults fill the knobs the pack left null; a wild
     try testing.expectEqual(@as(?f32, 0.6), modelConfig(&wild).gen_temperature);
     wild.shell.gen.temperature = 0.7;
     try testing.expectEqual(@as(?f32, 0.7), modelConfig(&wild).gen_temperature);
+}
+
+/// An outside MODEL plugin (`toy.dylib`) that claims glm5_next, bailing_hybrid and a type the legacy parse cannot
+/// read; its parse leaves its own facts (hidden 7, moe) so a test sees which config the engine got, and asks for the
+/// engine's config (`Parsed.engine_config`) as `engine_config` says.
+const ToyOutside = struct {
+    var freed: u32 = 0;
+    var engine_config = false;
+    fn parse(_: *const abi.PackDir, _: abi.Str, _: abi.Str, _: ?*const abi.LayerSpan, _: bool, out: *abi.Parsed) callconv(.c) abi.Verdict {
+        out.* = .{ .shell = .{ .model_type = .of("toy"), .hidden_size = 7, .num_hidden_layers = 2 }, .caps = .{ .moe = true }, .engine_config = engine_config };
+        return .ok;
+    }
+    fn freeParsed(_: *abi.Parsed) callconv(.c) void {
+        freed += 1;
+    }
+    /// Every term the engine's: a load reads the bill where it binds the table.
+    fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{};
+    }
+    const cache: abi.CacheHooks = .{};
+    const table: abi.ModelTable = .{ .name = .of("toy_outside"), .claims = sdk_plugin.claimsByType(&.{ "glm5_next", "bailing_hybrid", "toy_outside_arch" }), .parse = &parse, .free_parsed = &freeParsed, .bill = &bill, .load = undefined, .unload = undefined, .forward = undefined, .cache = &cache, .weights = undefined };
+    const manifest: @import("../../../abi/dylib.zig").Manifest = .{ .name = .of("toy_outside"), .kind = .model, .mlx = .of(""), .table = &table, .fixture = undefined, .fixture_free = undefined };
+
+    /// `model.parseConfig` of a pack whose config.json is `json`, with this plugin the process's one outside plugin
+    /// and its parse asking for the engine's config when `ask`.
+    fn parseConfig(json: []const u8, ask: bool) !ModelConfig {
+        const io = testing.io;
+        const st = outside.process.get();
+        const saved = st.*;
+        defer st.* = saved;
+        const plugin: outside.Plugin = .{ .path = "toy.dylib", .manifest = &manifest, .sha256 = @splat('0') };
+        var plugins: [1]outside.Plugin = undefined;
+        var entries: [1]sdk_plugin.Entry = undefined;
+        st.* = .{ .set = .{ .plugins = .initBuffer(&plugins), .entries = .initBuffer(&entries) } };
+        st.set.plugins.appendAssumeCapacity(plugin);
+        st.set.entries.appendAssumeCapacity(plugin.entry());
+        engine_config = ask;
+        defer engine_config = false;
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
+        var path: [std.fs.max_path_bytes]u8 = undefined;
+        const n = try tmp.dir.realPath(io, &path);
+        return model.parseConfig(io, testing.allocator, path[0..n]);
+    }
+
+    /// The config carries this plugin's binding, marked outside, with its parse.
+    fn expectBound(c: *const ModelConfig) !void {
+        const b = c.plugin orelse return error.TestNotBound;
+        try testing.expect(b.outside);
+        try testing.expectEqual(@as(*const abi.ModelTable, &table), b.table);
+        try testing.expectEqual(@as(u32, 7), b.parsed.shell.hidden_size);
+        try testing.expect(b.parsed.caps.moe);
+    }
+
+    /// The config is this plugin's facts alone (`adapted`), not the engine's parse.
+    fn expectAdapted(c: *const ModelConfig) !void {
+        try expectBound(c);
+        try testing.expectEqualStrings("toy", c.model_type);
+        try testing.expectEqual(@as(u32, 7), c.hidden_size);
+        try testing.expectEqual(@as(u32, 2), c.num_hidden_layers);
+        try testing.expect(!c.expert_bank);
+    }
+};
+
+/// The GLM streaming pack: the mlx-community release's config.json beside a turboexl3 `expert_streaming` bank.
+fn glmStreamingJson() ![]u8 {
+    const base = @embedFile("../../../fixtures/model-configs/glm5_next-mlx-community-4bit.json");
+    const bank = "{\"expert_streaming\":{\"family\":\"turboexl3\",\"manifest\":\"expert-manifest-v2.json\"},";
+    return std.mem.concat(testing.allocator, u8, &.{ bank, std.mem.trimStart(u8, base, " \n{") });
+}
+
+const ling_stream_json = @embedFile("../../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json");
+
+// Bar: an outside model plugin that asks for the engine's config (`Parsed.engine_config`) over a type the engine
+// parses gets the engine's own config with its binding attached, as an in-tree plugin does: the GLM streaming pack's
+// expert_bank (the trunk renames) and every family field the engine's bills read. Without the ask, or over a type the
+// engine cannot parse, it gets the plugin's facts alone, as before.
+test "outside model plugin keeps the engine's config: glm5_next streaming pack, asked" {
+    const json = try glmStreamingJson();
+    defer testing.allocator.free(json);
+    const freed = ToyOutside.freed;
+    {
+        var c = try ToyOutside.parseConfig(json, true);
+        defer c.deinit(testing.allocator);
+        try ToyOutside.expectBound(&c);
+        try testing.expect(c.isGlm5() and c.expert_bank and !c.has_vision);
+        try testing.expectEqual(@as(u32, 4096), c.hidden_size);
+        try testing.expectEqual(@as(u32, 45), c.num_hidden_layers);
+        try testing.expectEqual(@as(u32, 512), c.dsa_kv_lora_rank);
+        try testing.expectEqual(@as(u32, 2048), c.dsa_index_topk);
+        try testing.expectEqual(@as(u32, 4), c.dsa_index_kpool);
+        try testing.expectEqual(@as(u32, 64), c.linear_num_key_heads);
+        try testing.expect(c.kvBytesPerToken() > 0 and c.ssmCheckpointBytes() > 0);
+    }
+    // The config's deinit frees the binding once.
+    try testing.expectEqual(freed + 1, ToyOutside.freed);
+}
+
+test "outside model plugin keeps the engine's config: bailing_hybrid streaming pack, asked" {
+    var c = try ToyOutside.parseConfig(ling_stream_json, true);
+    defer c.deinit(testing.allocator);
+    try ToyOutside.expectBound(&c);
+    try testing.expectEqualStrings("bailing_hybrid", c.model_type);
+    try testing.expectEqual(@as(u32, 4096), c.hidden_size);
+    try testing.expectEqual(@as(u32, 72), c.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 8), c.full_attention_interval);
+    try testing.expectEqual(@as(u32, 64), c.linear_num_key_heads);
+    try testing.expectEqual(@as(u32, 512), c.mla_kv_lora_rank);
+    try testing.expect(c.isMla() and c.kda_vector_gate);
+    try testing.expect(c.kvBytesPerToken() > 0 and c.ssmCheckpointBytes() > 0);
+}
+
+test "outside model plugin keeps the engine's config: unasked, an engine-parsed type stays the plugin's facts" {
+    const json = try glmStreamingJson();
+    defer testing.allocator.free(json);
+    for ([_][]const u8{ json, ling_stream_json }) |j| {
+        var c = try ToyOutside.parseConfig(j, false);
+        defer c.deinit(testing.allocator);
+        try ToyOutside.expectAdapted(&c);
+    }
+}
+
+test "outside model plugin keeps the engine's config: asked, a type the engine cannot parse is the plugin's facts" {
+    var c = try ToyOutside.parseConfig("{\"model_type\":\"toy_outside_arch\",\"hidden_size\":4096,\"num_hidden_layers\":45}", true);
+    defer c.deinit(testing.allocator);
+    try ToyOutside.expectAdapted(&c);
 }

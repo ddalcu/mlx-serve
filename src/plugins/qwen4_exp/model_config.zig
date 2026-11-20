@@ -18,11 +18,12 @@ fn convert(comptime Dst: type, src: anytype) Dst {
 }
 
 /// `dir` (the pack's folder, absent in a stub) places the n-gram table the way the engine's `parseConfig` does:
-/// `ngram_table.bin` beside the weights, or the shards the index names, measured. `ModelConfig.deinit` frees it.
+/// `ngram_table.bin` (or the file the pack's `ngram_table` names) beside the weights, or the shards the index names,
+/// measured. `ModelConfig.deinit` frees it.
 pub fn toModelConfig(a: std.mem.Allocator, c: *const Config, dir: ?[]const u8) !model.ModelConfig {
     var m: model.ModelConfig = .{};
     inline for (@typeInfo(Config).@"struct".field_names) |name| {
-        if (comptime std.mem.eql(u8, name, "embedded_ngram") or std.mem.eql(u8, name, "mrope_inv_freq") or std.mem.eql(u8, name, "expert_quant")) continue;
+        if (comptime isPluginOnly(name)) continue;
         @field(m, name) = convert(@TypeOf(@field(m, name)), @field(c, name));
     }
     m.model_type = "qwen4_exp";
@@ -46,12 +47,21 @@ pub fn toModelConfig(a: std.mem.Allocator, c: *const Config, dir: ?[]const u8) !
             m.ngram_table_path = try gguf_files.resolveGgufFile(io, a, d);
             return m;
         }
-        m.ngram_table_path = try std.fmt.allocPrint(a, "{s}/ngram_table.bin", .{d});
+        m.ngram_table_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ d, c.ngramTableFile() });
         errdefer m.deinit(a);
         if (try qwen4_exp.inspectEmbedded(d, try model.qwen4EmbeddedSpec(&m))) |info| m.embedded_ple_payload_bytes = info.payload_bytes;
         if (c.expert_quant) m.exl3 = try sushiSpec(a, d, m.num_experts_per_tok);
     }
     return m;
+}
+
+/// The family's fields the engine's config has no slot for.
+fn isPluginOnly(comptime name: []const u8) bool {
+    @setEvalBranchQuota(10_000);
+    for ([_][]const u8{ "embedded_ngram", "mrope_inv_freq", "expert_quant", "trunk_quant", "ngram_file", "ngram_file_len" }) |n| {
+        if (std.mem.eql(u8, name, n)) return true;
+    }
+    return false;
 }
 
 /// A Sushi pack's `expert_quant` (config.json in `dir`): its EXL3 banks' codebook, window and rate.
@@ -182,4 +192,22 @@ test "qwen4_exp model config: an index naming n-gram shards measures the embedde
 test "qwen4_exp model config: a Sushi pack's EXL3 experts equal the engine's parse" {
     const sushi = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2,\"codebook\":\"mcg\",\"window\":15}," ++ config.tiny_text[1..];
     try expectEngineParse(&.{.{ .name = "config.json", .bytes = sushi }});
+}
+
+test "qwen4_exp model config: a pack naming its n-gram table's file places that file beside the weights" {
+    const io = testing.io;
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    const cfg = "{\"ngram_table\":{\"file\":\"ngram_embedding.safetensors\",\"format\":\"exl3_ngram_trellis\"}," ++ config.tiny_text[1..];
+    try td.dir.writeFile(io, .{ .sub_path = "config.json", .data = cfg });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = buf[0..try td.dir.realPath(io, &buf)];
+    const mem: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = cfg }} };
+    const pd = mem.packDir();
+    var p: abi.Parsed = .{};
+    try testing.expect(config.parse(&pd, .of(cfg), .{}, null, true, &p).isOk());
+    defer config.freeParsed(&p);
+    var got = try toModelConfig(testing.allocator, config.of(&p), path);
+    defer got.deinit(testing.allocator);
+    try testing.expect(std.mem.endsWith(u8, got.ngram_table_path.?, "/ngram_embedding.safetensors"));
 }

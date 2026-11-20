@@ -11,21 +11,23 @@ const loader = @import("loader.zig");
 const log = @import("../../sdk/util/log.zig");
 const common = @import("../../abi/common.zig");
 const model_abi = @import("../../abi/plugin.zig");
+const engine_abi = @import("../../abi/engine.zig");
 const sdk_plugin = @import("../../sdk/plugin.zig");
 const FsPackDir = @import("../registry/pack_dir.zig").FsPackDir;
 
 const Allocator = std.mem.Allocator;
 
 pub const usage =
-    \\usage: mlx-serve plugin new <name> [--media|--quant] [--kit <dir>] [--dir <parent>]
+    \\usage: mlx-serve plugin new <name> [--media|--quant|--engine] [--kit <dir>] [--dir <parent>]
     \\       mlx-serve plugin check <file.dylib | plugin folder> [--model <dir>]
     \\       mlx-serve plugin fixture <file.dylib | plugin folder> <dir>
     \\       mlx-serve plugin install <file.dylib> [--yes]
     \\
-    \\  new      A plugin folder from the kit's example (model, or --media / --quant). The kit is the
+    \\  new      A plugin folder from the kit's example (model, or --media / --quant / --engine). The kit is the
     \\           release's mlx-serve-plugin-kit tarball, extracted to --kit, $MLX_SERVE_KIT or ~/.mlx-serve/kit.
     \\  check    Loads the dylib (a folder: its zig-out/lib/*.dylib) and runs the conformance suite on its fixture;
-    \\           with --model, also has it claim and parse the pack in <dir> (the pack alone when it has no fixture).
+    \\           with --model, also has it claim and parse the pack in <dir> (an engine: probe it), the pack
+    \\           alone when it has no fixture.
     \\  fixture  Writes the plugin's own tiny pack (its conformance fixture) into <dir>, to serve.
     \\  install  Copies it into ~/.mlx-serve/plugins/ with a receipt of its hash and signature. A downloaded
     \\           (quarantined) file installs only once you confirm (--yes confirms). Plugins load at startup once
@@ -50,7 +52,7 @@ pub fn cmdPlugin(gpa: Allocator, io: std.Io, args: []const []const u8) !void {
         var parent: []const u8 = ".";
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "--media")) kind = .media else if (std.mem.eql(u8, args[i], "--quant")) kind = .quant else if (i + 1 < args.len and std.mem.eql(u8, args[i], "--kit")) {
+            if (std.mem.eql(u8, args[i], "--media")) kind = .media else if (std.mem.eql(u8, args[i], "--quant")) kind = .quant else if (std.mem.eql(u8, args[i], "--engine")) kind = .engine else if (i + 1 < args.len and std.mem.eql(u8, args[i], "--kit")) {
                 i += 1;
                 kit = args[i];
             } else if (i + 1 < args.len and std.mem.eql(u8, args[i], "--dir")) {
@@ -123,13 +125,14 @@ fn out(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
 
 // ── new ──
 
-pub const Kind = enum { model, media, quant };
+pub const Kind = enum { model, media, quant, engine };
 
 fn exampleOf(kind: Kind) []const u8 {
     return switch (kind) {
         .model => "_example",
         .media => "_example_media",
         .quant => "_example_quant",
+        .engine => "_example_engine",
     };
 }
 
@@ -140,6 +143,15 @@ fn newError(e: anyerror) []const u8 {
         error.PathAlreadyExists => "the folder already exists",
         else => @errorName(e),
     };
+}
+
+/// `text` with example `ex`'s name replaced by `name`, lower- and upper-cased (its option names).
+fn renamed(a: Allocator, text: []const u8, ex: []const u8, name: []const u8) ![]u8 {
+    const lower = try std.mem.replaceOwned(u8, a, text, ex, name);
+    defer a.free(lower);
+    var up_ex: [64]u8 = undefined;
+    var up_name: [64]u8 = undefined;
+    return std.mem.replaceOwned(u8, a, lower, std.ascii.upperString(&up_ex, ex), std.ascii.upperString(&up_name, name));
 }
 
 /// Copies the kit's example for `kind` into `<parent>/<name>`, renamed, with a build.zig.zon depending on the kit at
@@ -161,7 +173,7 @@ pub fn new(io: std.Io, a: Allocator, name: []const u8, kind: Kind, kit: []const 
     defer dst.close(io);
     for ([_][]const u8{ "build.zig", "plugin.zig", "config.zig" }) |f| {
         const text = try src.readFileAlloc(io, f, a, .limited(1 << 20));
-        try dst.writeFile(io, .{ .sub_path = f, .data = try std.mem.replaceOwned(u8, a, text, ex, name) });
+        try dst.writeFile(io, .{ .sub_path = f, .data = try renamed(a, text, ex, name) });
     }
     var dest_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dest_abs = dest_buf[0..try dst.realPath(io, &dest_buf)];
@@ -233,6 +245,8 @@ pub fn checkPlugin(io: std.Io, gpa: Allocator, p: loader.Plugin) !void {
             .model => .{ .model = @ptrCast(@alignCast(m.table)) },
             .media => .{ .media = @ptrCast(@alignCast(m.table)) },
             .quant => .{ .quant = @ptrCast(@alignCast(m.table)) },
+            .engine => .{ .engine = @ptrCast(@alignCast(m.table)) },
+            _ => unreachable, // `negotiate` refused it
         },
         .fixture = try sdk_dylib.filesOf(a, &f),
     });
@@ -246,6 +260,15 @@ pub fn checkPack(io: std.Io, a: Allocator, p: loader.Plugin, dir: []const u8) ![
     defer fs.close();
     const pd = fs.packDir();
     const cfg = std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "config.json" }), a, .limited(4 << 20)) catch "";
+    if (p.manifest.kind == .engine) {
+        const t: *const engine_abi.Engine = @ptrCast(@alignCast(p.manifest.table));
+        var v: common.Verdict = .{};
+        if (!t.probe(.of(abs_buf[0..n]), .of(cfg), &v)) {
+            log.err("probe: {s}\n", .{v.why.slice()});
+            return error.ProbeRefused;
+        }
+        return "it probes the pack (the engine serves the model folders it names)";
+    }
     const mt = try sdk_plugin.modelTypeOf(a, cfg);
     const e = p.entry();
     var claim: [1]common.Claim = undefined;
@@ -272,6 +295,7 @@ fn packError(e: anyerror) []const u8 {
         error.NoPack => "not a readable folder",
         error.NotClaimed => "it does not claim the pack",
         error.ParseRefused => "it refuses to parse the pack (above)",
+        error.ProbeRefused => "its probe refuses the pack (above)",
         else => @errorName(e),
     };
 }
@@ -354,7 +378,11 @@ pub fn install(io: std.Io, a: Allocator, src: []const u8, dir: []const u8, confi
     const source = if (std.Io.Dir.cwd().realPathFile(io, src, &abs_buf)) |n| abs_buf[0..n] else |_| src;
     const types = try a.alloc([]const u8, p.manifest.claims.len);
     for (p.manifest.claims.slice(), types) |c, *t| t.* = c.slice();
-    const receipt: loader.Receipt = .{ .name = p.name(), .kind = @tagName(p.manifest.kind), .version = p.version(), .sha256 = try a.dupe(u8, &hash), .signature = signature, .source = try a.dupe(u8, source), .model_types = types };
+    const models = try a.alloc([]const u8, p.manifest.declaredModels().len);
+    for (p.manifest.declaredModels(), models) |m, *o| o.* = m.slice();
+    const options = try a.alloc(loader.ReceiptOption, p.manifest.declaredOptions().len);
+    for (p.manifest.declaredOptions(), options) |o, *r| r.* = .{ .name = o.name.slice(), .kind = o.kind, .default = o.default_value.slice(), .help = o.help.slice() };
+    const receipt: loader.Receipt = .{ .name = p.name(), .kind = @tagName(p.manifest.kind), .version = p.version(), .sha256 = try a.dupe(u8, &hash), .signature = signature, .source = try a.dupe(u8, source), .model_types = types, .models = models, .options = options };
     try plugins.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}.json", .{p.name()}), .data = try std.json.Stringify.valueAlloc(a, receipt, .{}) });
     return .{ .ok = receipt };
 }
@@ -368,6 +396,12 @@ test "plugin new: a bad name or a missing kit is refused before anything is writ
     try testing.expectError(error.BadName, new(testing.io, testing.allocator, "_x", .model, "/nonexistent", "."));
     try testing.expectError(error.BadName, new(testing.io, testing.allocator, "9x", .model, "/nonexistent", "."));
     try testing.expectError(error.KitMissing, new(testing.io, testing.allocator, "toy", .model, "/nonexistent-kit-dir", "."));
+}
+
+test "plugin new: the example's name is replaced in both cases, so its options take the new prefix" {
+    const got = try renamed(testing.allocator, "name = \"_example_engine\", option = \"_EXAMPLE_ENGINE_REPLY\"", "_example_engine", "raw_metal");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("name = \"raw_metal\", option = \"RAW_METAL_REPLY\"", got);
 }
 
 test "plugin new: the manifest's fingerprint carries the name's checksum, as Zig checks it" {

@@ -1,5 +1,5 @@
 //! Our SDK's root, reached by relative `@import` from inside the main module until P4/P6 makes it a module (the
-//! build's `sdk` module is still mlx-stream's). MLX-free, so a plugin's `config.zig` may import it.
+//! kit ships it as `kit.sdk`). MLX-free, so a plugin's `config.zig` may import it.
 
 pub const plugin = @import("plugin.zig");
 pub const Plugin = plugin.Plugin;

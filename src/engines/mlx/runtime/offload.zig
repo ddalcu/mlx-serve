@@ -31,6 +31,7 @@ fn without(a: abi.Caps, b: abi.Caps) abi.Caps {
 fn needs(sampling: request_mod.SamplingParams, logprobs_n: u32, prompt_logprobs: bool) abi.Caps {
     return .{
         .penalties = sampling.penalized(),
+        .logit_bias = sampling.logit_bias.len > 0,
         .logprobs = logprobs_n > 0,
         .grammar = sampling.constraint != null,
         .think_budget = sampling.think_bound != null,
@@ -71,6 +72,7 @@ pub fn submit(slot: *Slot, s: *Served) !void {
             .repeat_penalty = sp.repeat_penalty,
             .frequency_penalty = sp.frequency_penalty,
             .presence_penalty = sp.presence_penalty,
+            .logit_bias = abi.span(abi.Bias, sp.logit_bias),
         },
         .eos = abi.span(u32, eos.items),
         .logprobs = @intCast(@min(slot.logprobs_n, std.math.maxInt(u8))),
@@ -174,7 +176,7 @@ fn logSpec(kind: Kind, st: *const abi.Stats) void {
         .ane => log.info("[ane] spec: {d} cycles, {d}% of drafts accepted, {d:.2} tokens per call\n", .{
             st.rounds, 100 * st.accepted / @max(st.drafted, 1), @as(f64, @floatFromInt(st.accepted + st.rounds)) / @as(f64, @floatFromInt(st.rounds)),
         }),
-        .ds4, .mlx => {},
+        .ds4, .mlx, .plugin => {},
     }
 }
 
@@ -182,12 +184,15 @@ fn logSpec(kind: Kind, st: *const abi.Stats) void {
 
 const testing = std.testing;
 
-test "missingCap: plain sampling is served; a grammar, a penalty, logprobs, a forced tool call or prompt logprobs names its cap" {
+test "missingCap: plain sampling is served; a grammar, a penalty, a logit bias, logprobs, a forced tool call or prompt logprobs names its cap" {
     const plain: request_mod.SamplingParams = .{ .temperature = 0.7, .top_p = 0.9, .top_k = 20 };
     try testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(needs(plain, 0, false))));
     try testing.expectEqualStrings("penalties", abi.missing(.{}, needs(.{ .repeat_penalty = 1.1 }, 0, false)).?);
     try testing.expectEqualStrings("grammar", abi.missing(.{}, needs(.{ .constraint = @ptrFromInt(8) }, 0, false)).?);
     try testing.expectEqualStrings("tool_gate", abi.missing(.{}, needs(.{ .tool_force = @ptrFromInt(8) }, 0, false)).?);
+    const bias = [_]abi.Bias{.{ .token = 3, .bias = -100 }};
+    try testing.expectEqualStrings("logit_bias", abi.missing(.{ .penalties = true, .logprobs = true }, needs(.{ .logit_bias = &bias }, 0, false)).?);
+    try testing.expect(abi.missing(.{ .logit_bias = true }, needs(.{ .logit_bias = &bias }, 0, false)) == null);
     try testing.expectEqualStrings("logprobs", abi.missing(.{ .penalties = true }, needs(.{}, 5, false)).?);
     try testing.expectEqualStrings("prompt_logprobs", abi.missing(.{ .logprobs = true }, needs(.{}, 0, true)).?);
     try testing.expect(abi.missing(.{ .logprobs = true, .penalties = true }, needs(.{ .presence_penalty = 0.5 }, 2, false)) == null);

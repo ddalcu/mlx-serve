@@ -10,6 +10,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const bases = @import("../../sdk/bases/bases.zig");
 const run_mod = @import("../../sdk/bases/run.zig");
 const moe = @import("../../sdk/bases/blocks/moe.zig");
+const streamed = @import("../../sdk/weights/streamed.zig");
 const gated = @import("../../sdk/bases/blocks/gated_attention.zig");
 const qk_rope = @import("../../sdk/bases/blocks/qk_rope.zig");
 const compiled = @import("../../sdk/bases/blocks/compiled.zig");
@@ -65,8 +66,11 @@ pub const Loaded = struct {
     route_fn: compiled.Closure = .{ .ctx = null },
     /// The MTP head, once `HeadHooks.load` found one.
     head: ?*mtp_head.Head = null,
+    /// The routed experts streamed from the pack (the `stream_experts` setting).
+    experts: ?streamed.Streamed = null,
 
     fn release(m: *Loaded) void {
+        if (m.experts) |*x| x.close();
         if (m.head) |h| {
             h.deinit();
             gpa.destroy(h);
@@ -95,6 +99,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     errdefer gpa.destroy(m);
     m.* = .{ .base = .{ .weights = undefined, .shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps), .a = gpa, .s = r.s, .placeholders = ctx.parsed.placeholder_ids } };
     errdefer m.release();
+    if (c.experts > 0) m.experts = try streamed.Streamed.forLoad(gpa, ctx, c.experts, r.s);
     m.layers = try gpa.alloc(Model.Layer, c.num_hidden_layers);
     for (m.layers, 0..) |*L, i| L.* = try loadLayer(m, &r, c, @intCast(i));
 
@@ -190,6 +195,7 @@ fn mlpOf(m: *Loaded, r: *reader.Reader, c: *const config.Config, i: u32) !Mlp.We
         .top_k = @intCast(c.top_k),
         .experts = @intCast(c.experts),
     };
+    if (m.experts) |*x| try moe.bindStreamed(&w, x, try r.name(&nb, "layers.{d}.mlp", .{i}));
     if (try r.projOpt(try r.name(&nb, "layers.{d}.mlp.shared_mlp.gate_proj", .{i}), hidden)) |sg| {
         try m.owned.linear(sg);
         const su = try r.proj(try r.name(&nb, "layers.{d}.mlp.shared_mlp.up_proj", .{i}), hidden);

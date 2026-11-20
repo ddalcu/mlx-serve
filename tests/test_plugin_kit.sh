@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The plugin kit's proof (plan 3.10): the kit staged by `zig build kit` builds `_example` (and a `plugin new`
-# copy of it) as dylibs with no checkout of the server; `mlx-serve plugin check|fixture|install` take them; and the
+# copy of it) and `_example_engine` as dylibs with no checkout of the server; `mlx-serve plugin check|fixture|install` take them; and the
 # built binary, with plugins switched on in a scratch HOME, loads `_example` and serves its tiny model (the
 # plugin's own fixture written as a pack) on /v1/models and /v1/chat/completions. With `--no-plugins` discovery
 # skips the pack. No model download: the pack is the plugin's. Scratch under ~/claude-tmp.
@@ -103,6 +103,58 @@ if srv_wait_health "$URL" 120 0.5 "$SRV"; then
 else
     check "server with plugins off became healthy" 0
     tail -20 "$LOG"
+fi
+
+srv_stop "$SRV"; SRV=""
+
+echo "[5] an engine plugin serves the model folder it names, on its own runtime"
+(cd "$KIT/examples/_example_engine" && "$ZIG" build --prefix "$SCRATCH/out/_example_engine" --cache-dir "$SCRATCH/zig-cache") >>"$SCRATCH/build.log" 2>&1
+EDYLIB="$SCRATCH/out/_example_engine/lib/lib_example_engine.dylib"
+check "_example_engine builds from the kit alone" "$([ -f "$EDYLIB" ] && echo 1 || echo 0)"
+EPACK="$SCRATCH/models/t/_example_engine"
+mlxs plugin fixture "$EDYLIB" "$EPACK" >/dev/null 2>&1
+OUT="$(mlxs plugin check "$EDYLIB" --model "$EPACK" 2>&1)"
+check "plugin check --model: conformant, its probe takes the pack" "$(echo "$OUT" | grep -q 'passes the conformance suite' && echo "$OUT" | grep -q 'probes the pack' && echo 1 || echo 0)"
+mlxs plugin install "$EDYLIB" >/dev/null 2>&1
+check "its receipt names the folder it serves" "$(grep -q '"models":\["_example_engine"\]' "$FAKE_HOME/.mlx-serve/plugins/_example_engine.json" 2>/dev/null && echo 1 || echo 0)"
+check "its receipt declares its option" "$(grep -q '"options":\[{"name":"_EXAMPLE_ENGINE_REPLY","kind":"text"' "$FAKE_HOME/.mlx-serve/plugins/_example_engine.json" 2>/dev/null && echo 1 || echo 0)"
+serve
+if srv_wait_health "$URL" 120 0.5 "$SRV"; then
+    R="$(row t/_example_engine)"
+    check "/v1/models lists the folder with the engine's badge" "$([ "$(field "$R" plugin)" = "_example_engine" ] && echo 1 || echo 0)"
+    CODE=$(curl -s -o "$SCRATCH/echat.json" -w '%{http_code}' "$URL/v1/chat/completions" -H 'Content-Type: application/json' \
+        -d '{"model":"t/_example_engine","messages":[{"role":"user","content":"hi"}],"max_tokens":64,"temperature":0}')
+    TEXT=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['choices'][0]['message']['content'])" "$SCRATCH/echat.json" 2>/dev/null)
+    check "chat → 200 with the engine's reply ($CODE: $TEXT)" "$([ "$CODE" = "200" ] && [ "${TEXT#Hello from an engine plugin.}" != "$TEXT" ] && echo 1 || echo 0)"
+    check "the engine, not MLX, served it" "$(grep -q '\[plugin\] _example_engine serves' "$LOG" && echo 1 || echo 0)"
+    STREAM=$(curl -sN "$URL/v1/chat/completions" -H 'Content-Type: application/json' \
+        -d '{"model":"t/_example_engine","messages":[{"role":"user","content":"hi"}],"max_tokens":5,"temperature":0,"stream":true}')
+    check "a streamed chat stops at max_tokens and ends with [DONE]" "$(echo "$STREAM" | grep -q '"finish_reason":"length"' && echo "$STREAM" | grep -q '\[DONE\]' && ! echo "$STREAM" | grep -q '"error"' && echo 1 || echo 0)"
+else
+    check "server with the engine plugin became healthy" 0
+    tail -20 "$LOG"
+fi
+srv_stop "$SRV"; SRV=""
+# The app's saved value wins over the shell's, and /props says what the server set.
+echo '{"enabled": true, "options": {"_example_engine": {"_EXAMPLE_ENGINE_REPLY": "Set by an option. "}}}' >"$FAKE_HOME/.mlx-serve/plugins.json"
+_EXAMPLE_ENGINE_REPLY="Set by the shell. " serve
+if srv_wait_health "$URL" 120 0.5 "$SRV"; then
+    TEXT=$(curl -s "$URL/v1/chat/completions" -H 'Content-Type: application/json' \
+        -d '{"model":"t/_example_engine","messages":[{"role":"user","content":"hi"}],"max_tokens":24,"temperature":0}' |
+        python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null)
+    check "a saved option reaches the engine over the shell's value ($TEXT)" "$([ "${TEXT#Set by an option.}" != "$TEXT" ] && echo 1 || echo 0)"
+    check "/props reports the option it set" "$(curl -s "$URL/props" | python3 -c "import json,sys; r=[p for p in json.load(sys.stdin)['plugins'] if p['name']=='_example_engine']; print(1 if r and r[0].get('options')=={'_EXAMPLE_ENGINE_REPLY':'Set by an option. '} else 0)" 2>/dev/null)"
+else
+    check "server with the option set became healthy" 0
+    tail -20 "$LOG"
+fi
+srv_stop "$SRV"; SRV=""
+echo '{"enabled": true}' >"$FAKE_HOME/.mlx-serve/plugins.json"
+serve --no-plugins
+if srv_wait_health "$URL" 120 0.5 "$SRV"; then
+    check "--no-plugins: no row for a folder only the engine serves" "$([ -z "$(row t/_example_engine)" ] && echo 1 || echo 0)"
+else
+    check "server with plugins off became healthy" 0
 fi
 
 echo

@@ -21,7 +21,7 @@ pub const Resident = struct {
 
     /// The formats' view; borrows `self`, which must not move while it is in use.
     pub fn source(self: *const Resident) abi.Source {
-        return .{ .ctx = @constCast(self), .get = get, .resident = true };
+        return .{ .ctx = @constCast(self), .get = get, .resident = true, .release = release };
     }
 
     /// The whole map behind `src` when it is a resident source, moved out (the source is left empty): an in-tree
@@ -38,6 +38,11 @@ pub const Resident = struct {
         const self: *const Resident = @ptrCast(@alignCast(ctx.?));
         const a = self.weights.get(name.slice()) orelse return .{};
         return .{ .ctx = a.ctx };
+    }
+
+    fn release(ctx: ?*anyopaque, a: abi.Array) callconv(.c) bool {
+        const self: *Resident = @ptrCast(@alignCast(ctx.?));
+        return self.weights.removeArray(.{ .ctx = a.ctx });
     }
 };
 
@@ -68,6 +73,16 @@ pub const Weights = struct {
 
     pub fn get(self: *const Weights, name: []const u8) ?mlx.mlx_array {
         return self.map.get(name);
+    }
+
+    /// The formats' view of the map; borrows `self`, which must not move while it is in use.
+    pub fn source(self: *const Weights) abi.Source {
+        return .{ .ctx = @constCast(self), .get = getIn };
+    }
+
+    fn getIn(ctx: ?*anyopaque, name: abi.Str) callconv(.c) abi.Array {
+        const self: *const Weights = @ptrCast(@alignCast(ctx.?));
+        return .{ .ctx = (self.get(name.slice()) orelse return .{}).ctx };
     }
 
     /// Hand the map a new array under `name`, freeing the one it held (load-time
@@ -114,6 +129,16 @@ pub const Weights = struct {
         const kv = self.map.fetchRemove(name) orelse return;
         _ = mlx.mlx_array_free(kv.value);
         self.allocator.free(kv.key);
+    }
+
+    /// Drop the entry holding the handle `arr` and free it; false when no entry holds it.
+    pub fn removeArray(self: *Weights, arr: mlx.mlx_array) bool {
+        var it = self.map.iterator();
+        while (it.next()) |e| if (e.value_ptr.ctx == arr.ctx) {
+            self.remove(e.key_ptr.*);
+            return true;
+        };
+        return false;
     }
 
     pub fn count(self: *const Weights) u32 {
@@ -238,4 +263,21 @@ test "resident: the source hands out the map's own arrays and an empty one for a
     const src = r.source();
     try testing.expectEqual(a.ctx, src.tensor("x.weight").ctx);
     try testing.expectEqual(@as(?*anyopaque, null), src.tensor("x.scales").ctx);
+}
+
+test "resident: a release drops the source's own handle, and refuses one it does not hold" {
+    var w = Weights.init(testing.allocator);
+    const a = mlx.mlx_array_new_float(2.0);
+    try w.put("x.weight", a);
+    try w.put("y.weight", mlx.mlx_array_new_float(3.0));
+    var r = Resident.adopt(w);
+    defer r.deinit();
+    const src = r.source();
+    const other = mlx.mlx_array_new_float(4.0);
+    defer _ = mlx.mlx_array_free(other);
+    try testing.expect(!src.releaseTensor(.{ .ctx = other.ctx }));
+    try testing.expect(src.releaseTensor(.{ .ctx = a.ctx }));
+    try testing.expectEqual(@as(?*anyopaque, null), src.tensor("x.weight").ctx);
+    try testing.expect(src.tensor("y.weight").ctx != null);
+    try testing.expectEqual(@as(u32, 1), r.weights.count());
 }

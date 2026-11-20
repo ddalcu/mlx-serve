@@ -11,7 +11,8 @@ const test_cache = @import("../../sdk/testing/cache_ops.zig");
 const sdk_dylib = @import("../../sdk/dylib.zig");
 const dylib_abi = @import("../../abi/dylib.zig");
 const model_abi = @import("../../abi/plugin.zig");
-const examples = [_][]const u8{ "_example", "_example_media", "_example_quant" };
+/// In the loader's order (file names sorted).
+const examples = [_][]const u8{ "_example", "_example_engine", "_example_media", "_example_quant" };
 
 const testing = std.testing;
 
@@ -70,15 +71,15 @@ test "kit examples: built from the kit, installed with receipts, loaded, negotia
         try testing.expectEqualStrings(ex, p.name());
         try cli.checkPlugin(testing.io, testing.allocator, p);
     }
-    try testing.expectEqual(dylib_abi.Kind.media, inst.set.plugins.items[1].manifest.kind);
+    try testing.expectEqual(dylib_abi.Kind.media, inst.set.plugins.items[2].manifest.kind);
     // The receipt Settings lists: the plugin's own version and the file's signer beside its hash.
     for (inst.receipts, inst.set.plugins.items) |r, p| {
         try testing.expectEqualStrings("0.1.0", r.version);
-        if (p.manifest.kind != .quant) try testing.expectEqualStrings(p.name(), r.model_types[0]);
+        if (p.manifest.kind == .model or p.manifest.kind == .media) try testing.expectEqualStrings(p.name(), r.model_types[0]);
         try testing.expectEqualStrings(&p.sha256, r.sha256);
         try testing.expect(r.signature.len > 0);
     }
-    try testing.expect(inst.set.entries.items[0].model != null and inst.set.entries.items[2].quant != null);
+    try testing.expect(inst.set.entries.items[0].model != null and inst.set.entries.items[3].quant != null);
 }
 
 test "kit examples: a changed install is refused by its receipt; a disabled one is not opened" {
@@ -93,7 +94,7 @@ test "kit examples: a changed install is refused by its receipt; a disabled one 
     // A new file renamed over it: this process has the old one mapped.
     try plugins.writeFile(testing.io, .{ .sub_path = "swap.tmp", .data = other });
     try plugins.rename("swap.tmp", plugins, "_example_media.dylib", testing.io);
-    var set = try loader.loadDir(testing.io, testing.allocator, dir, .{ .enabled = true, .disabled = &.{"_example"} }, @import("mlx_stamp").bytes);
+    var set = try loader.loadDir(testing.io, testing.allocator, dir, .{ .enabled = true, .disabled = &.{ "_example", "_example_engine" } }, @import("mlx_stamp").bytes);
     defer set.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), set.plugins.items.len);
     try testing.expectEqualStrings("_example_quant", set.plugins.items[0].name());
@@ -102,7 +103,9 @@ test "kit examples: a changed install is refused by its receipt; a disabled one 
     // Built against another MLX: refused by negotiation.
     var stale = try loader.loadDir(testing.io, testing.allocator, dir, .{ .enabled = true, .disabled = &.{"_example_media"} }, "mlx=another");
     defer stale.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 0), stale.plugins.items.len);
+    // The engine never calls MLX: another MLX leaves it loading.
+    try testing.expectEqual(@as(usize, 1), stale.plugins.items.len);
+    try testing.expectEqualStrings("_example_engine", stale.plugins.items[0].name());
     try testing.expectEqualStrings("plugin was built against another MLX: rebuild it with this release's kit", stale.refused.items[0].why);
     // A rebuild fixes that one, not the changed hash.
     try testing.expect(stale.refused.items[0].rebuild and !set.refused.items[0].rebuild);
@@ -160,7 +163,7 @@ test "kit examples: the model plugin's fixture written as a pack is one it claim
         try inst.tmp.dir.access(testing.io, try std.fs.path.join(a, &.{ "pack", f }), .{});
     try testing.expectEqualStrings("_example, 2 layers, hidden 16, vocab 260 (by_type)", try cli.checkPack(testing.io, a, p, pack));
     // The media example claims nothing of a model pack.
-    try testing.expectError(error.NotClaimed, cli.checkPack(testing.io, a, inst.set.plugins.items[1], pack));
+    try testing.expectError(error.NotClaimed, cli.checkPack(testing.io, a, inst.set.plugins.items[2], pack));
 }
 
 test "kit examples: a plugin with no fixture is told apart from one failing the suite, and its pack still checks" {
@@ -218,4 +221,177 @@ fn expectAreaExposed(comptime area: []const u8) !void {
         if (!listed) std.debug.print("src/sdk/blocks/{s}/{s} is not in kit.blocks.{s} (src/kit.zig)\n", .{ area, e.name, area });
         try testing.expect(listed);
     }
+}
+
+test "kit: the module names the sdk files the Ling and GLM runners import, each as that file" {
+    // (the name a plugin reaches, its path from `kit`, the file the runner imports: the KDA-hybrid base's trunk, kda.zig
+    // and moe.zig, and the base itself, for both runners; bailing_hybrid's plugin.zig, mla.zig and table_forward.zig for
+    // Ling; mlx_scope (glm5_next.zig), system (GLM's per-core lever) and mlx_device (the NAX router's naxAvailable and
+    // tf32Matmul) for GLM's outside plugin; the kernel contract for a plugin's own kernel gates)
+    const want = .{
+        .{ "bases.run", .{ "bases", "run" }, @import("../../sdk/bases/run.zig") },
+        .{ "bases.blocks.compiled", .{ "bases", "blocks", "compiled" }, @import("../../sdk/bases/blocks/compiled.zig") },
+        .{ "bases.blocks.conv1d", .{ "bases", "blocks", "conv1d" }, @import("../../sdk/bases/blocks/conv1d.zig") },
+        .{ "bases.blocks.gdn", .{ "bases", "blocks", "gdn" }, @import("../../sdk/bases/blocks/gdn.zig") },
+        .{ "bases.blocks.moe", .{ "bases", "blocks", "moe" }, @import("../../sdk/bases/blocks/moe.zig") },
+        .{ "bases.blocks.state", .{ "bases", "blocks", "state" }, @import("../../sdk/bases/blocks/state.zig") },
+        .{ "bill.prefill", .{ "bill", "prefill" }, @import("../../sdk/bill/prefill.zig") },
+        .{ "outside_model", .{"outside_model"}, @import("../../sdk/quant/outside_model.zig") },
+        .{ "blocks.kda.gate", .{ "blocks", "kda", "gate" }, @import("../../sdk/blocks/kda/gate.zig") },
+        .{ "blocks.kda.recurrence", .{ "blocks", "kda", "recurrence" }, @import("../../sdk/blocks/kda/recurrence.zig") },
+        .{ "testing.kernel_contract", .{ "testing", "kernel_contract" }, @import("../../sdk/testing/kernel_contract/root.zig") },
+        .{ "log", .{"log"}, @import("../../sdk/util/log.zig") },
+        .{ "mlx_ops", .{"mlx_ops"}, @import("../../mlx/ops.zig") },
+        .{ "mlx_array", .{"mlx_array"}, @import("../../mlx/array.zig") },
+        .{ "mlx_scope", .{"mlx_scope"}, @import("../../mlx/scope.zig") },
+        .{ "system", .{"system"}, @import("../../sdk/util/system.zig") },
+        .{ "mlx_device", .{"mlx_device"}, @import("../../mlx/device.zig") },
+        .{ "bases.kda_hybrid.config", .{ "bases", "kda_hybrid", "config" }, @import("../../sdk/bases/kda_hybrid/config.zig") },
+        .{ "bases.kda_hybrid.trunk", .{ "bases", "kda_hybrid", "trunk" }, @import("../../sdk/bases/kda_hybrid/trunk.zig") },
+        .{ "bases.kda_hybrid.kda", .{ "bases", "kda_hybrid", "kda" }, @import("../../sdk/bases/kda_hybrid/kda.zig") },
+        .{ "bases.kda_hybrid.slots", .{ "bases", "kda_hybrid", "slots" }, @import("../../sdk/bases/kda_hybrid/slots.zig") },
+        .{ "bases.kda_hybrid.host", .{ "bases", "kda_hybrid", "host" }, @import("../../sdk/bases/kda_hybrid/host.zig") },
+        .{ "bases.kda_hybrid.moe", .{ "bases", "kda_hybrid", "moe" }, @import("../../sdk/bases/kda_hybrid/moe.zig") },
+        .{ "bases.kda_hybrid.fixture", .{ "bases", "kda_hybrid", "fixture" }, @import("../../sdk/bases/kda_hybrid/fixture.zig") },
+    };
+    var missing: usize = 0;
+    inline for (want) |w| {
+        const ok = if (comptime named(w[1])) |T| T == w[2] else false;
+        if (!ok) {
+            std.debug.print("kit.{s} does not name the file the runners import\n", .{w[0]});
+            missing += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), missing);
+}
+
+/// The declaration a plugin reaches as `kit.<path[0]>.<path[1]>...`, where each step is a type; null where the kit has
+/// no such name.
+fn named(comptime path: anytype) ?type {
+    comptime var T: type = @import("../../kit.zig");
+    inline for (path) |d| {
+        if (!@hasDecl(T, d) or @TypeOf(@field(T, d)) != type) return null;
+        T = @field(T, d);
+    }
+    return T;
+}
+
+test "kit examples: the engine example serves the model it names, passes the engine contract and claims no pack" {
+    var inst = try Installed.init();
+    defer inst.deinit();
+    const a = inst.arena.allocator();
+    const p = &inst.set.plugins.items[1];
+    try testing.expectEqual(dylib_abi.Kind.engine, p.manifest.kind);
+    try testing.expectEqualStrings("_example_engine", inst.receipts[1].models[0]);
+    try testing.expectEqual(@as(?*const loader.Plugin, p), loader.engineIn(inst.set.plugins.items, "_example_engine"));
+    try testing.expect(loader.engineIn(inst.set.plugins.items, "_example") == null);
+    const e = inst.set.entries.items[1];
+    try testing.expect(e.model == null and e.media == null and e.quant == null);
+    const pack = try inst.path("engine_pack");
+    try cli.writeFixture(testing.io, a, p.*, pack);
+    try testing.expectEqualStrings("it probes the pack (the engine serves the model folders it names)", try cli.checkPack(testing.io, a, p.*, pack));
+    const cfg = try inst.tmp.dir.readFileAlloc(testing.io, "engine_pack/config.json", a, .limited(1 << 16));
+    try @import("../../abi/contract_test.zig").run(@ptrCast(@alignCast(p.manifest.table)), .{ .model_dir = pack, .model_type = "", .config_json = cfg, .prompt = &.{ 258, 'h', 'i', 256, 259 } });
+}
+
+
+/// The host's own quant table for the outside probe: it claims a block naming "_outside_toy" and counts its opens and
+/// closes; it loads nothing.
+const OutsideToy = struct {
+    const quant = @import("../../abi/quant.zig");
+    var opens: u32 = 0;
+    var closes: u32 = 0;
+    fn claims(block: quant.Str, _: quant.Str) callconv(.c) quant.Claim {
+        return if (std.mem.indexOf(u8, block.slice(), "_outside_toy") != null) .by_type else .no;
+    }
+    fn validate(_: quant.Str, _: quant.Str, _: *const quant.PackDir) callconv(.c) quant.Verdict {
+        return .ok;
+    }
+    fn bill(_: quant.Str, _: quant.Str, stored: u64) callconv(.c) u64 {
+        return stored;
+    }
+    fn open(_: *quant.LoadCtx) callconv(.c) quant.Verdict {
+        opens += 1;
+        return .ok;
+    }
+    fn close(_: *quant.LoadCtx) callconv(.c) void {
+        closes += 1;
+    }
+    fn load(_: *const quant.LoadCtx, _: quant.Str, _: u32, _: *quant.Weight) callconv(.c) quant.Verdict {
+        return quant.Verdict.refuse(.unsupported, "_outside_toy");
+    }
+    fn release(_: *quant.Weight) callconv(.c) void {}
+    fn matmul(_: *const quant.Weight, _: quant.Array, _: quant.Stream, _: *quant.Array) callconv(.c) quant.Verdict {
+        return quant.Verdict.refuse(.unsupported, "_outside_toy");
+    }
+    fn moe(_: *const quant.Weight, _: quant.Array, _: quant.Array, _: quant.Array, _: bool, _: quant.Stream, _: *quant.Array) callconv(.c) quant.Verdict {
+        return quant.Verdict.refuse(.unsupported, "_outside_toy");
+    }
+    const table: quant.QuantTable = .{ .name = .of("_outside_toy"), .claims = &claims, .validate = &validate, .bill = &bill, .open = &open, .close = &close, .load_tensor = &load, .load_bank = &load, .release = &release, .matmul = &matmul, .moe = &moe };
+};
+
+test "kit outside quant: a kit-built model dylib, its own quant tables empty, opens its pack through the host's quant_claimant; with the member null nothing claims it" {
+    const built = std.mem.span(env.get(.MLX_SERVE_KIT_PLUGINS) orelse return error.SkipZigTest);
+    const outside = @import("../../sdk/quant/outside.zig");
+    const host_impl = @import("../plugin_host_impl.zig");
+    const FsPackDir = @import("../../sdk/util/pack_dir.zig").FsPackDir;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
+
+    // The probe, installed and loaded as any outside model plugin.
+    const plugins_dir = try std.fs.path.join(a, &.{ root, "plugins" });
+    const src = try std.fmt.allocPrint(a, "{s}/_outside_probe/lib/lib_outside_probe.dylib", .{built});
+    switch (try cli.install(testing.io, a, src, plugins_dir, &Installed.yes)) {
+        .ok => {},
+        .refused => |why| {
+            std.debug.print("install _outside_probe: {s}\n", .{why});
+            return error.Refused;
+        },
+    }
+    var set = try loader.loadDir(testing.io, testing.allocator, plugins_dir, .{ .enabled = true }, @import("mlx_stamp").bytes);
+    defer set.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), set.plugins.items.len);
+    const model = set.plugins.items[0].entry().model.?;
+
+    // A pack the toy claims, and the toy registered with the host (the probe's own list stays empty).
+    try tmp.dir.createDirPath(testing.io, "pack");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "pack/config.json", .data = "{\"model_type\":\"_outside_probe\",\"quantization_config\":{\"quant_method\":\"_outside_toy\"}}" });
+    const pack = try std.fs.path.join(a, &.{ root, "pack" });
+    var fs = try FsPackDir.open(testing.io, pack);
+    defer fs.close();
+    const pd = fs.packDir();
+    const saved = outside.tables.get().*;
+    defer outside.tables.get().* = saved;
+    outside.tables.get().* = .{};
+    outside.register(&OutsideToy.table);
+    OutsideToy.opens = 0;
+    OutsideToy.closes = 0;
+
+    var b: host_impl.Builtin = undefined;
+    b.init(.{ .allocator = testing.allocator });
+    defer b.deinit();
+    var parsed: model_abi.Parsed = .{};
+    var ctx: model_abi.LoadCtx = .{ .model_dir = .of(pack), .dir = &pd, .parsed = &parsed, .host = b.host() };
+    var v: model_abi.Verdict = .{};
+    const h = model.load(&ctx, &v) orelse {
+        std.debug.print("_outside_probe load: {s}\n", .{v.why.slice()});
+        return error.ProbeRefused;
+    };
+    model.unload(h);
+    try testing.expectEqual(@as(u32, 1), OutsideToy.opens);
+    try testing.expectEqual(@as(u32, 1), OutsideToy.closes);
+
+    // The same host with its member null: the probe's own empty list is all it has.
+    var bare = b.table;
+    bare.quant_claimant = null;
+    ctx.host = &bare;
+    v = .{};
+    try testing.expect(model.load(&ctx, &v) == null);
+    try testing.expectEqualStrings("_outside_probe: no outside quant table claims the pack", v.why.slice());
+    try testing.expectEqual(@as(u32, 1), OutsideToy.opens);
 }

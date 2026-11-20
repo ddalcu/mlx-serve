@@ -15,11 +15,9 @@ const Verdict = common.Verdict;
 pub fn Manifest(comptime M: type, comptime mlx_pin: []const u8) type {
     comptime sdk_plugin.check(M, M.plugin.name);
     return struct {
-        const claims: [M.plugin.claims.len]Str = blk: {
-            var out: [M.plugin.claims.len]Str = undefined;
-            for (M.plugin.claims, &out) |c, *o| o.* = Str.of(c);
-            break :blk out;
-        };
+        const claims = strs(M.plugin.claims);
+        const models = strs(M.plugin.models);
+        const options = optionsOf(M.plugin.options);
 
         pub const value: dylib_abi.Manifest = .{
             .name = Str.of(M.plugin.name),
@@ -27,13 +25,16 @@ pub fn Manifest(comptime M: type, comptime mlx_pin: []const u8) type {
                 .model => .model,
                 .media => .media,
                 .quant => .quant,
+                .engine => .engine,
             },
-            .mlx = Str.of(mlx_pin),
+            .mlx = Str.of(if (M.plugin.kind == .engine) dylib_abi.engine_pin else mlx_pin),
             .table = &M.table,
             .claims = .of(&claims),
             .fixture = &fixtureOf,
             .fixture_free = &fixtureFree,
             .plugin_version = Str.of(if (@hasDecl(M, "version")) M.version else ""),
+            .models = .of(&models),
+            .options = .of(&options),
         };
 
         const Owned = struct { arena: std.heap.ArenaAllocator };
@@ -66,6 +67,18 @@ pub fn Manifest(comptime M: type, comptime mlx_pin: []const u8) type {
     };
 }
 
+fn strs(comptime list: []const []const u8) [list.len]Str {
+    var out: [list.len]Str = undefined;
+    for (list, &out) |c, *o| o.* = Str.of(c);
+    return out;
+}
+
+fn optionsOf(comptime list: []const sdk_plugin.Option) [list.len]dylib_abi.Option {
+    var out: [list.len]dylib_abi.Option = undefined;
+    for (list, &out) |o, *x| x.* = .{ .name = Str.of(o.name), .kind = o.kind, .default_value = Str.of(o.default), .help = Str.of(o.help) };
+    return out;
+}
+
 /// Exports `M`'s manifest as `abi.dylib.symbol`: the dylib's one entry point.
 pub fn exportManifest(comptime M: type, comptime mlx_pin: []const u8) void {
     @export(&Manifest(M, mlx_pin).value, .{ .name = dylib_abi.symbol });
@@ -82,6 +95,7 @@ pub fn filesOf(a: std.mem.Allocator, f: *const dylib_abi.Fixture) !fixture.Fixtu
 
 const testing = std.testing;
 const quant_abi = @import("../abi/quant.zig");
+const engine_abi = @import("../abi/engine.zig");
 
 const Toy = struct {
     pub const plugin = sdk_plugin.Plugin{ .name = "toy_fmt", .kind = .quant, .claims = &.{ "a", "b" } };
@@ -104,6 +118,20 @@ test "sdk dylib: the manifest carries the root's name, kind, table and claims, a
     try testing.expectEqualStrings("b", m.claims.slice()[1].slice());
     try testing.expect(dylib_abi.negotiate(m, "pin-1").isOk());
     try testing.expect(!dylib_abi.negotiate(m, "pin-2").isOk());
+}
+
+const ToyEngine = struct {
+    pub const plugin = sdk_plugin.Plugin{ .name = "toy_engine", .kind = .engine, .models = &.{"Toy-1B"} };
+    pub const table = engine_abi.Engine{ .probe = undefined, .load_bytes = undefined, .open = undefined, .close = undefined, .submit = undefined, .cancel = undefined, .step = null, .status = undefined, .memory = undefined, .report_json = null, .trim = null, .media_rows = null, .embed = null, .decide = null, .tokenize = null, .token_bytes = null, .chat_template = null, .render = null };
+    pub fn conformanceFixture(a: std.mem.Allocator) !fixture.Fixture {
+        return .{ .files = try a.dupe(fixture.File, &.{.{ .name = "config.json", .bytes = try a.dupe(u8, "{}") }}) };
+    }
+};
+
+test "sdk dylib: an engine's manifest carries a pin no MLX matches, so a host that reads every pin refuses it" {
+    const m = &Manifest(ToyEngine, "pin-1").value;
+    try testing.expectEqualStrings(dylib_abi.engine_pin, m.mlx.slice());
+    try testing.expect(dylib_abi.negotiate(m, "pin-1").isOk());
 }
 
 test "sdk dylib: the fixture crosses as plugin-owned files and is freed by the plugin" {

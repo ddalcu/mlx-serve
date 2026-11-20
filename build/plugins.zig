@@ -75,13 +75,7 @@ pub fn writeUnitRoots(b: *std.Build, groups: []const []const []const u8) []const
             \\pub const env = @import("env.zig");
             \\pub const mlx = @import("mlx/ffi.zig");
             \\pub const io_util = @import("sdk/util/io_util.zig");
-            \\pub const shared = @import("sdk/util/shared.zig");
-            \\pub const mtp_acceptance = @import("sdk/spec/mtp_acceptance.zig");
-            \\pub const exl3 = @import("sdk/quant/exl3/format.zig");
-            \\pub const dsa_nax = @import("plugins/glm5_next/dsa_nax.zig");
-            \\pub const fp8_block128_gemv = @import("sdk/quant/fp8_block128_gemv.zig");
             \\pub const log = @import("sdk/util/log.zig");
-            \\pub const plugin_profile: bool = @import("build_options").plugin_profile;
             \\
         ) catch @panic("OOM");
         path.* = b.fmt("src/unit_{d}.zig", .{g});
@@ -274,9 +268,10 @@ fn writeIfChanged(io: std.Io, root: std.Io.Dir, path: []const u8, bytes: []const
 
 const testing = std.testing;
 
-const MapReader = struct {
+/// A source tree in memory (path, text), for the closure tests here and in `build/kit.zig`.
+pub const MapReader = struct {
     files: []const [2][]const u8,
-    fn read(self: MapReader, path: []const u8) ![]const u8 {
+    pub fn read(self: MapReader, path: []const u8) ![]const u8 {
         for (self.files) |f| if (std.mem.eql(u8, f[0], path)) return f[1];
         return error.FileNotFound;
     }

@@ -113,6 +113,41 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
  *   needed before the drive reached them (P7 early_whole_trim: the read-ahead jobs still queued when the prompt call's
  *   plans exist).  It never touches the speculative class (no claim is released; the prompt pass issues none).
  *   Inject event kind 11 (withdrawn).
+ *
+ * GU SPLIT: q3ld_gu_split(mode), at any time (the stream's phase change: its decode
+ *   on, its prompt off), makes every later deadline-free submit read each record's gate/up range as TWO range jobs of the
+ *   same ticket, split at the component boundary nearest the range's byte midpoint (a classic bank's gate/up boundary; an
+ *   a4k bank's up code alone in the second), queued side by side (a record's first half, its second, the next record's;
+ *   then every down range as before), so two workers read one record's gate/up span at once.  Each half is a range of
+ *   its own (its parts back to back from its own offset): the stock range loop, adoption out of a speculative record,
+ *   or a pre-range of its own (the pre-read queues the halves while the split is on; a submit that finds a pre-range of
+ *   the whole range takes it whole, unsplit).  The ticket's status words are the halves' (status the first half's when it
+ *   failed, else the second's; preadv calls, bytes and payload summed; errno the first nonzero; t_start the earlier,
+ *   t_end the later; worker the first half's; the lookahead flags or-ed, their chunk counts summed; the wait the longer),
+ *   written and published once, by the worker that finishes the second half.  Exact: the same bytes into the same rows; only the
+ *   preadv calls covering a range change.  WITHDRAW takes a split submit's jobs with it, all or none.  Not with the
+ *   DIRECT route (it reads every range whole).  Counters SC_SPLIT_*.
+ *   dq1a's measurement rides along (RES_W 10): word 8 the range's lookahead flags (bit 0: an unclaimed speculative chunk
+ *   in flight at its start; >> 1: those started while it read; a pre-bound range's: its pre-read's), word 9 its wait (an
+ *   adopted range's for its record's chunks; a pre-bound range's for its pre-read).
+ *
+ * DEMAND FIRST: q3ld_demand_first(mode), at any time (the stream's phase change: its
+ *   decode the setting's mode, its prompt 0), orders the speculative class behind demand.  A record keeps the mode it
+ *   started with.  Mode 1: an UNCLAIMED record starts and continues only while no demand job is queued or executes
+ *   (busy == 0 for every speculative thread, where the lane's rule let thread 0 run beside one), and is read in PIECES of
+ *   df_piece bytes (1 MiB, doubled until 64 pieces cover a slot) instead of chunks, so the rule is met at every piece
+ *   boundary: a demand job that starts while a piece is in flight sits behind at most that piece per thread, and the
+ *   record pauses at the next boundary, its landed pieces kept, until demand drains.  Claimed records read their chunks
+ *   back to back as before.  Mode 2: mode 1, and a CLAIMED record's untaken pieces go to the demand ranges that need
+ *   them.  A record started in mode 2 keeps two piece bitmaps (taken: handed to a reader; done: landed); its speculative
+ *   thread takes the first run of untaken pieces (one piece unclaimed, a chunk's worth claimed); a deadline-free demand
+ *   range that finds its record claimed and its bytes not all landed reads the untaken pieces under its own bytes itself
+ *   (preadv into the record's staging at their offsets, as the speculative thread would) instead of waiting, and adopts
+ *   the range once every piece under it is done (not only the record's landed prefix).  The landed prefix is the done
+ *   pieces' leading run.  A reader's failed or short piece fails the record once no reader is left (its waiting ranges
+ *   then read the stock way).  A record whose pieces are all taken while others still read it is released by its
+ *   speculative thread; its last reader lands it.  Exact: the same file bytes into the same staging and the same rows;
+ *   only which thread reads a piece, and when.  Counters of its own (q3ld_df_stats, DF_*): SC_N stays.
  */
 #include <errno.h>
 #include <mach/mach_time.h>
@@ -125,7 +160,9 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
 #include <time.h>
 #include <unistd.h>
 
-#define RES_W 8
+/* The status words of a ticket: status, preadv calls, bytes returned, payload, errno, t_start, t_end, worker, then
+ * (dq1a's, ABI 2026110202) the lookahead flags and the wait (the GU SPLIT paragraph above). */
+#define RES_W 10
 #define MAX_WORKERS 8
 #define MAX_COMP 6
 #define MAX_ITEMS 8
@@ -208,6 +245,18 @@ enum {
     SC_EV_HOST_RELEASED,  /* gates the host released (error paths) */
     SC_EV_STOP_RELEASED,  /* live gates released at stop */
     SC_DIRECT_RANGES,     /* demand ranges read straight into their rows (q3ld_direct_config: no staging, no copy) */
+    /* PARTS (q3ld_parts_config) */
+    SC_PARTS_DIRECT,      /* range parts read straight into their rows (offset, length and row on the block) */
+    SC_PARTS_DIRECT_BYTES,
+    SC_PARTS_STAGED_BYTES, /* bytes of the other parts of those ranges (the staging loop + the copy) */
+    /* GU SPLIT (dq1b) */
+    SC_SPLIT_TICKETS,     /* gate/up tickets read as two range jobs */
+    SC_SPLIT_READ,        /* halves read by the stock loop */
+    SC_SPLIT_ADOPTED,     /* halves copied out of a speculative record */
+    SC_SPLIT_PRE,         /* halves served by a pre-range of their own */
+    SC_SPLIT_PRE_ISSUED,  /* half pre-ranges queued */
+    SC_SPLIT_SPAN_NS,     /* the split tickets' spans: the earlier half's start to the later half's end */
+    SC_SPLIT_OVERLAP_NS,  /* the time both halves of a ticket were in flight at once */
     SC_N
 };
 
@@ -245,6 +294,7 @@ typedef struct {
     int64_t file_size;
     int64_t deadline;
     int64_t ticket;     /* the job's one range */
+    int32_t half;       /* GU SPLIT (dq1b): 0 the whole range; 1 / 2 its first / second half */
 } job_t;
 
 typedef struct {
@@ -267,6 +317,12 @@ typedef struct {
     int32_t readers;    /* demand ranges copying out of buf */
     int32_t adopted;    /* ranges served since it was queued */
     char *buf;
+    /* DEMAND FIRST (df1): the mode the record started with; mode 2's pieces handed to a reader and landed (bit p: bytes
+     * [p * df_piece, (p + 1) * df_piece) from `aligned`, the last cut at `span`), its readers now, a reader's failure */
+    int df;
+    uint64_t df_taken, df_done;
+    int32_t df_live;
+    int32_t df_bad;
 } spec_t;
 
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
@@ -289,8 +345,35 @@ static spec_t spec[MAX_SPEC];
 static int nspec = 0, nspec_threads = 0, nspec_started = 0, spec_inflight = 0, spec_configured = 0;
 static int64_t spec_slot_bytes = 0, spec_rec_len = 0, spec_chunk = 0;
 static int spec_idle_busy = SPEC_MAX_DEMAND_BUSY;   /* the queue rule's demand-busy limit for threads >= 1 */
+/* dq1a: unclaimed speculative chunks being read now, and those started since the configuration (the demand ranges'
+ * lookahead flags) */
+static int spec_reading = 0;
+static uint64_t spec_chunk_starts = 0;
+/* dq1a: a range's lookahead flags (caller holds mu): bit 0 an unclaimed chunk in flight at its start (at_start), >> 1 the
+ * unclaimed chunks started since (s0: spec_chunk_starts at its start) */
+static int64_t dq_flags(int at_start, uint64_t s0) { return (int64_t)((spec_chunk_starts - s0) << 1) | (at_start ? 1 : 0); }
 static uint64_t spec_order = 0;
 static int64_t *sc = 0;
+/* DEMAND FIRST (df1): 0 off, 1 demand first, 2 also claimed pieces to the demand (q3ld_demand_first); the piece (1 MiB,
+ * doubled until DF_MAX_PIECES cover a slot: q3ld_spec_config); the counters since the start (q3ld_df_stats) */
+#define DF_PIECE_MIN ((int64_t)1 << 20)
+#define DF_MAX_PIECES 64
+enum {
+    DF_PIECES = 0,        /* unclaimed lookahead reads made in pieces (modes 1, 2) */
+    DF_STOPS,             /* unclaimed records that stopped for demand inside one of the lane's chunks */
+    DF_STOP_BYTES,        /* ... the rest of those chunks: what the lane would still have read beside the demand */
+    DF_HELP_RUNS,         /* mode 2: runs of a claimed record's pieces read by a demand worker */
+    DF_HELP_BYTES,
+    DF_HELP_NS,           /* ... the time in those reads */
+    DF_HELP_LANDS,        /* mode 2: records landed by their last reader, a demand worker (the speculative thread gone) */
+    DF_RELEASES,          /* mode 2: claimed records a speculative thread left with every piece taken and readers on */
+    DF_EARLY_ADOPTS,      /* mode 2: ranges adopted with every piece under them done, ahead of the landed prefix */
+    DF_FAILED,            /* mode 2: records failed by a reader's piece */
+    DF_N
+};
+static int demand_first = 0;
+static int64_t df_piece = DF_PIECE_MIN;
+static int64_t df_stats[DF_N];
 
 /* ---- the pre-read class (lookahead3) */
 #define MAX_PRE 32
@@ -319,6 +402,12 @@ static int64_t pre_gu_total = 0;
 static uint64_t pre_order = 0;
 static int32_t *pre_of = 0;   /* per ticket: 1 + the pre-range bound to that range at submit, 0 = none */
 static int32_t *sub_len = 0;  /* WITHDRAW: per ticket, the range jobs of the submit it starts (0: it starts none) */
+/* GU SPLIT (dq1b): 0 off, 1 on (q3ld_gu_split); per ticket the halves still to finish (0: not split), both halves'
+ * status words (2 x RES_W), and the pre-range bound to its second half */
+static int gu_split = 0;
+static int32_t *split_left = 0;
+static int64_t *split_words = 0;
+static int32_t *pre_of_b = 0;
 
 /* ---- the event-gate class (lookahead4) */
 #define MAX_GATES 512         /* the live gates of every route a stream holds: 6 routes x (48 parts + 1) <= 512 */
@@ -512,17 +601,57 @@ static int run_range_direct_route(const job_t *job, const range_t *rg, char *sta
 static int run_range_scatter(const job_t *job, const range_t *rg, char *stage, int64_t *out);
 static int (*run_range)(const job_t *, const range_t *, char *, int64_t *) = run_range_staged;
 
+/* PARTS: the demand ranges' per-part route, set on a
+ * stopped pool by q3ld_parts_config(block).  block > 0 (the file system block, fstatfs f_bsize: APFS 4,096 B, a power of
+ * two >= 512): a range's parts are read in file order, each part whose file offset, length and row address are
+ * multiples of `block` straight into its row (preadv, the uncached F_NOCACHE path: no staging, no copy), each run of
+ * the others through the staging loop and the copy, as the staged route reads the whole range.  The test is per part
+ * and per read: a part off the block stages.  0: off.  DIRECT, when on, proves every part aligned and wins.  Either way
+ * the file's bytes land in the rows; the route decides only the copy.  Pre-ranges (read before their rows exist) and
+ * the speculative records' copies are untouched.  Counters SC_PARTS_*. */
+static int64_t parts_block = 0;
+static int parts_live = 1;   /* q3ld_parts_live */
+static int run_range_parts(const job_t *job, const range_t *rg, char *stage, int64_t *out);
+
+/* the demand route the configuration names (caller holds mu): DIRECT, else PARTS, else the staging loop */
+static void route_pick(void) {
+    run_range = direct_reads ? run_range_direct_route : parts_block > 0 ? run_range_parts : run_range_staged;
+}
+
 int q3ld_direct_config(int32_t on) {
     pthread_mutex_lock(&mu);
     if (running) { pthread_mutex_unlock(&mu); return -1; }
     direct_reads = on != 0;
-    run_range = direct_reads ? run_range_direct_route : run_range_staged;
+    route_pick();
     pthread_mutex_unlock(&mu);
     return 0;
 }
 
-/* the DIRECT read: preadv into the rows until every part is full; the status words as run_range's */
-static int run_range_direct(const job_t *job, const range_t *rg, int64_t *out) {
+/* PARTS: block 0 (off) or a power of two >= 512, on a stopped pool.  0 or -1. */
+int q3ld_parts_config(int64_t block) {
+    pthread_mutex_lock(&mu);
+    if (running || block < 0 || (block > 0 && (block < 512 || (block & (block - 1)) != 0))) {
+        pthread_mutex_unlock(&mu);
+        return -1;
+    }
+    parts_block = block;
+    __atomic_store_n(&parts_live, 1, __ATOMIC_RELEASE);
+    route_pick();
+    pthread_mutex_unlock(&mu);
+    return 0;
+}
+
+/* PARTS' phase switch, set at any time (an atomic word each range reads as it starts): 1 (the default, again at each
+ * q3ld_parts_config and stop) the route as configured; 0 every range staged and copied, as without the route
+ *.  Returns 0. */
+int q3ld_parts_live(int32_t on) {
+    __atomic_store_n(&parts_live, on != 0 ? 1 : 0, __ATOMIC_RELEASE);
+    return 0;
+}
+
+/* preadv straight into the rows until every part is full; the status words as run_range's (DIRECT's range, PARTS'
+ * block-aligned part) */
+static int read_direct(const job_t *job, const range_t *rg, int64_t *out) {
     struct iovec iov[MAX_COMP];
     int n = 0;
     int64_t want = 0;
@@ -549,14 +678,20 @@ static int run_range_direct(const job_t *job, const range_t *rg, int64_t *out) {
         while (first < n && left >= (int64_t)iov[first].iov_len) { left -= (int64_t)iov[first].iov_len; first++; }
         if (first < n && left > 0) { iov[first].iov_base = (char *)iov[first].iov_base + left; iov[first].iov_len -= (size_t)left; }
     }
-    pthread_mutex_lock(&mu);
-    sc[SC_DIRECT_RANGES] += 1;
-    pthread_mutex_unlock(&mu);
     out[1] = calls;
     out[2] = returned;
     out[3] = total;
     out[5] = t_start ? t_start : q3ld_monotonic_ns();
     out[6] = q3ld_monotonic_ns();
+    return status;
+}
+
+/* the DIRECT read: preadv into the rows until every part is full; the status words as run_range's */
+static int run_range_direct(const job_t *job, const range_t *rg, int64_t *out) {
+    int status = read_direct(job, rg, out);
+    pthread_mutex_lock(&mu);
+    sc[SC_DIRECT_RANGES] += 1;
+    pthread_mutex_unlock(&mu);
     return status;
 }
 
@@ -618,6 +753,63 @@ static int run_range_staged(const job_t *job, const range_t *rg, char *stage, in
     out[1] = calls;
     out[2] = returned;
     out[3] = read_total;
+    out[5] = t_start ? t_start : q3ld_monotonic_ns();
+    out[6] = q3ld_monotonic_ns();
+    return status;
+}
+
+/* PARTS: a part read straight into its row: its file offset, its length and its row multiples of the block */
+static int part_direct(int64_t off, int64_t len, uint64_t dst) {
+    return len > 0 && off % parts_block == 0 && len % parts_block == 0 && dst % (uint64_t)parts_block == 0;
+}
+
+/* PARTS: the range's parts in file order, each block-aligned part read straight into its row (read_direct), each run of
+ * the others through the staging loop and the copy (run_range_staged over the run).  The status is the first failing
+ * piece's (the pieces after it are not read, as the staged loop stops), the status words the pieces' sums, t_start the
+ * first piece's. */
+static int run_range_parts(const job_t *job, const range_t *rg, char *stage, int64_t *out) {
+    if (!__atomic_load_n(&parts_live, __ATOMIC_ACQUIRE)) return run_range_staged(job, rg, stage, out);
+    int64_t calls = 0, returned = 0, total = 0, t_start = 0, n_direct = 0, direct_bytes = 0, staged_bytes = 0;
+    int status = ST_OK;
+    int64_t pos = rg->offset;
+    int32_t d = 0;
+    out[4] = 0;
+    while (d < rg->ndst && status == ST_OK) {
+        if (!rg->len[d]) { d++; continue; }
+        const int direct = part_direct(pos, rg->len[d], rg->dst[d]);
+        range_t piece = { 0 };
+        piece.offset = pos;
+        int64_t n = 0;
+        int32_t e = d;
+        for (;;) {                                  /* the direct part alone, or the run of parts up to the next one */
+            if (rg->len[e]) {
+                piece.dst[piece.ndst] = rg->dst[e];
+                piece.len[piece.ndst] = rg->len[e];
+                piece.ndst++;
+                n += rg->len[e];
+            }
+            e++;
+            if (direct || e >= rg->ndst || part_direct(pos + n, rg->len[e], rg->dst[e])) break;
+        }
+        int64_t o[RES_W] = { 0 };
+        status = direct ? read_direct(job, &piece, o) : run_range_staged(job, &piece, stage, o);
+        calls += o[1];
+        returned += o[2];
+        total += o[3];
+        if (o[4]) out[4] = o[4];
+        if (!t_start) t_start = o[5];
+        if (direct) { n_direct += 1; direct_bytes += o[3]; } else staged_bytes += o[3];
+        pos += n;
+        d = e;
+    }
+    pthread_mutex_lock(&mu);
+    sc[SC_PARTS_DIRECT] += n_direct;
+    sc[SC_PARTS_DIRECT_BYTES] += direct_bytes;
+    sc[SC_PARTS_STAGED_BYTES] += staged_bytes;
+    pthread_mutex_unlock(&mu);
+    out[1] = calls;
+    out[2] = returned;
+    out[3] = total;
     out[5] = t_start ? t_start : q3ld_monotonic_ns();
     out[6] = q3ld_monotonic_ns();
     return status;
@@ -741,11 +933,13 @@ static void run_pre(int i, int w, char *stage) {
     p->state = PR_INFLIGHT;
     busy += 1;
     sc[SC_PRE_STARTED] += 1;
+    const int dq_at = spec_reading > 0;           /* dq1a: the pre-read's lookahead flags */
+    const uint64_t dq_s0 = spec_chunk_starts;
     int n = 0;
     for (int k = 0; k < MAX_PRE; k++) n += pre[k].state == PR_INFLIGHT;
     if (n > sc[SC_PRE_MAX_INFLIGHT]) sc[SC_PRE_MAX_INFLIGHT] = n;
     EV(9, p->rg.offset);
-    job_t job = { p->fd, p->file_size, -1, 0 };
+    job_t job = { p->fd, p->file_size, -1, 0, 0 };
     pthread_mutex_unlock(&mu);
     RANGE_DELAY();
     int64_t out[RES_W] = { 0 };
@@ -760,6 +954,8 @@ static void run_pre(int i, int w, char *stage) {
     } else {
         for (int k = 1; k < RES_W; k++) p->words[k] = out[k];
         p->words[7] = w;
+        p->words[8] = dq_flags(dq_at, dq_s0);
+        p->words[9] = 0;
         p->words[0] = status;
         p->state = PR_DONE;
     }
@@ -801,6 +997,133 @@ static int spec_containing(int fd, int64_t off, int64_t total) {
     return -1;
 }
 
+/* ---------------------------------------------------------------- DEMAND FIRST (df1): the pieces (caller holds mu) */
+static int df_npieces(const spec_t *s) { return (int)((s->span + df_piece - 1) / df_piece); }
+static int df_chunk_pieces(void) { const int64_t n = (spec_chunk + df_piece - 1) / df_piece; return n > 0 ? (int)n : 1; }
+static int64_t df_end(const spec_t *s, int p) { const int64_t e = (int64_t)p * df_piece; return e < s->span ? e : s->span; }
+
+static uint64_t df_mask(int a, int b) {   /* bits [a, b), 0 <= a, b <= 64 */
+    if (b <= a) return 0;
+    const uint64_t hi = b >= 64 ? ~0ULL : (1ULL << b) - 1;
+    return hi & ~((1ULL << a) - 1);
+}
+
+/* mode 2: the first run of untaken pieces in [a, b) (b capped at the record's pieces), at most `most` long: its first
+ * piece (*end its end), or -1 */
+static int df_run(const spec_t *s, int a, int b, int most, int *end) {
+    const int n = df_npieces(s);
+    if (b > n) b = n;
+    int p = a;
+    while (p < b && ((s->df_taken >> p) & 1)) p++;
+    if (p >= b) return -1;
+    int e = p + 1;
+    while (e < b && e - p < most && !((s->df_taken >> e) & 1)) e++;
+    *end = e;
+    return p;
+}
+
+/* mode 2: a piece left to take and no reader failed */
+static int df_open(const spec_t *s) {
+    int e;
+    return !s->df_bad && df_run(s, 0, DF_MAX_PIECES, 1, &e) >= 0;
+}
+
+/* mode 2: every piece under the record's bytes [off, off + total) landed */
+static int df_covers(const spec_t *s, int64_t off, int64_t total) {
+    if (s->df_bad) return 0;
+    const int64_t a = off - s->aligned, b = off + total - s->aligned;
+    if (a < 0 || b > s->span) return 0;
+    const uint64_t m = df_mask((int)(a / df_piece), (int)((b + df_piece - 1) / df_piece));
+    return m && (s->df_done & m) == m;
+}
+
+/* mode 2: a reader's pieces [a, b) ended (ok: every byte of them landed).  The landed prefix moves over the done
+ * pieces' leading run; a failure marks the record, which fails once no reader is left. */
+static void df_landed(spec_t *s, int a, int b, int ok) {
+    s->df_live -= 1;
+    if (!ok) s->df_bad = 1;
+    else s->df_done |= df_mask(a, b);
+    if (!s->df_bad) {
+        const int n = df_npieces(s);
+        int p = (int)(s->got / df_piece);
+        while (p < n && ((s->df_done >> p) & 1)) p++;
+        s->got = df_end(s, p);
+        int64_t payload = s->aligned + s->got - s->base;
+        if (payload > s->len) payload = s->len;               /* EXL3_LANE_PORT */
+        s->landed = payload > 0 ? payload : 0;
+    }
+    pthread_cond_broadcast(&land_cv);
+}
+
+/* mode 2: a record no speculative thread owns ends with its last reader: landed (every piece done), or failed (a reader
+ * failed); with pieces untaken and no reader it waits for a speculative thread (pickable) */
+static void df_end_released(spec_t *s) {
+    if (s->state != SP_INFLIGHT || s->running || s->df_live > 0) return;
+    if (!s->df_bad && s->got < s->span) return;
+    if (!s->df_bad && s->landed > 0) {
+        sc[SC_LANDED] += 1;
+        df_stats[DF_HELP_LANDS] += 1;
+        s->state = SP_LANDED;
+    } else {
+        s->landed = 0;
+        sc[SC_FAILED] += 1;
+        df_stats[DF_FAILED] += 1;
+        s->state = SP_FAILED;
+    }
+    EV(4, s->base);
+    pthread_cond_broadcast(&land_cv);
+    pthread_cond_broadcast(&done_cv);
+}
+
+/* modes 1, 2: an unclaimed record stopped for demand at its landed prefix: counted when the stop falls inside one of the
+ * lane's chunks (the rest of that chunk is what the lane would still have read beside the demand) */
+static void df_stop(const spec_t *s) {
+    const int64_t r = s->got % spec_chunk;
+    if (!r) return;
+    int64_t left = spec_chunk - r;
+    if (left > s->span - s->got) left = s->span - s->got;
+    df_stats[DF_STOPS] += 1;
+    df_stats[DF_STOP_BYTES] += left;
+}
+
+/* mode 2: the demand range [off, off + total) of claimed record s reads the first run of its untaken pieces itself:
+ * preadv into the record's staging at their offsets, as the speculative thread would (drops mu for the read).  1 when it
+ * read (the caller looks again), 0 when none of its pieces was left to take. */
+static int df_help(spec_t *s, int64_t off, int64_t total) {
+    if (s->df_bad) return 0;
+    const int64_t a = off - s->aligned, b = off + total - s->aligned;
+    int pb = 0;
+    const int pa = df_run(s, (int)(a / df_piece), (int)((b + df_piece - 1) / df_piece), DF_MAX_PIECES, &pb);
+    if (pa < 0) return 0;
+    s->df_taken |= df_mask(pa, pb);
+    s->df_live += 1;
+    const int64_t at = (int64_t)pa * df_piece, n = df_end(s, pb) - at;
+    char *dst = s->buf + at;
+    const int fd = s->fd;
+    const off_t foff = (off_t)(s->aligned + at);
+    pthread_mutex_unlock(&mu);
+    gauge_enter();
+    const int64_t t = q3ld_monotonic_ns();
+    int64_t done = 0;
+    int err = 0;
+    while (done < n) {
+        struct iovec iov = { dst + done, (size_t)(n - done) };
+        ssize_t r = do_preadv(fd, &iov, 1, foff + done);
+        if (r < 0) { err = 1; break; }
+        if (r == 0) break;
+        done += r;
+    }
+    const int64_t dt = q3ld_monotonic_ns() - t;
+    gauge_exit();
+    pthread_mutex_lock(&mu);
+    df_stats[DF_HELP_RUNS] += 1;
+    df_stats[DF_HELP_BYTES] += done;
+    df_stats[DF_HELP_NS] += dt;
+    df_landed(s, pa, pb, !err && done == n);
+    df_end_released(s);
+    return 1;
+}
+
 /* ---------------------------------------------------------------- speculative: demand-side adoption */
 /* Serve one demand range from a speculative record.  Returns -1 when no record serves it (the caller reads
  * it the stock way), else the range status (ST_OK, or ST_DEADLINE when the deadline passed while waiting). */
@@ -816,9 +1139,13 @@ static int try_adopt(const job_t *job, const range_t *rg, int64_t *out) {
         spec_t *s = &spec[i];
         int64_t need = rg->offset + total - s->base;
         if (s->landed >= need && (s->state == SP_LANDED || s->state == SP_INFLIGHT)) break;
+        /* DEMAND FIRST mode 2: every piece under the range landed, ahead of the record's landed prefix */
+        if (s->state == SP_INFLIGHT && s->df == 2 && df_covers(s, rg->offset, total)) { df_stats[DF_EARLY_ADOPTS] += 1; break; }
         /* adoptable only if it will land: a landed-short record (EOF) or an unclaimed / queued one is not */
         if (s->state != SP_INFLIGHT || !s->claimed) { pthread_mutex_unlock(&mu); return -1; }
         if (!waited) { waited = 1; sc[SC_ADOPT_WAITS] += 1; }
+        /* DEMAND FIRST mode 2: the range's untaken pieces read by this worker instead of waited for */
+        if (s->df == 2 && job->deadline < 0 && df_help(s, rg->offset, total)) continue;
         if (job->deadline >= 0) {
             int64_t left = job->deadline - q3ld_monotonic_ns();
             if (left <= 0) {
@@ -865,6 +1192,7 @@ static int try_adopt(const job_t *job, const range_t *rg, int64_t *out) {
     out[4] = 0;
     out[5] = t_start;
     out[6] = q3ld_monotonic_ns();
+    out[9] = t_start - t0;   /* dq1a: the wait for the record's chunks (and its claim) before the copy */
     return ST_OK;
 }
 
@@ -872,7 +1200,7 @@ static int try_adopt(const job_t *job, const range_t *rg, int64_t *out) {
 static void claim_ranges(int fd, int64_t first, int32_t count) {
     int woke = 0;
     for (int32_t i = 0; i < count; i++) {
-        if (pre_of && pre_of[first + i]) continue;          /* PRE: served by its pre-range */
+        if (pre_of && pre_of[first + i] && !(split_left && split_left[first + i] && !pre_of_b[first + i])) continue;   /* PRE: served by its pre-range (GU SPLIT: both halves by theirs) */
         const range_t *rg = &ranges[first + i];
         int k = spec_containing(fd, rg->offset, range_total(rg));
         if (k < 0) continue;
@@ -961,6 +1289,58 @@ static void ev_flush(void) {
     pthread_mutex_unlock(&sig_mu);
 }
 
+/* GU SPLIT (dq1b): the boundary h (1 <= h < n) of n parts of `lens` nearest their byte midpoint (ties to the lower);
+ * 0 when no boundary leaves bytes on both sides */
+static int32_t split_at_lens(const int64_t *lens, int32_t n) {
+    int64_t total = 0, acc = 0, best_d = 0;
+    int32_t best = 0;
+    for (int32_t c = 0; c < n; c++) total += lens[c];
+    for (int32_t h = 1; h < n; h++) {
+        acc += lens[h - 1];
+        if (acc == 0 || acc == total) continue;
+        int64_t d = 2 * acc - total;
+        if (d < 0) d = -d;
+        if (!best || d < best_d) { best = h; best_d = d; }
+    }
+    return best;
+}
+
+/* GU SPLIT: half `half` (1: parts [0, h), 2: parts [h, ndst)) of a range as a range of its own */
+static void half_of(const range_t *rg, int32_t h, int half, range_t *out) {
+    memset(out, 0, sizeof(*out));
+    const int32_t c0 = half == 1 ? 0 : h, c1 = half == 1 ? h : rg->ndst;
+    int64_t off = rg->offset;
+    for (int32_t c = 0; c < c0; c++) off += rg->len[c];
+    out->offset = off;
+    out->ndst = c1 - c0;
+    for (int32_t c = c0; c < c1; c++) {
+        out->dst[c - c0] = rg->dst[c];
+        out->len[c - c0] = rg->len[c];
+    }
+}
+
+/* GU SPLIT: ticket t's words from both halves' (caller holds mu, both in): status the first half's when it failed, else
+ * the second's; preadv calls, bytes and payload summed; errno the first nonzero; the earlier start, the later end; the
+ * first half's worker; the lookahead flags or-ed, their chunk counts summed; the longer wait.  The halves' overlap and
+ * the ticket's span go to the counters. */
+static void split_join(int64_t t, int64_t *m) {
+    const int64_t *a = split_words + (t * 2) * RES_W, *b = a + RES_W;
+    m[0] = a[0] != ST_OK ? a[0] : b[0];
+    m[1] = a[1] + b[1];
+    m[2] = a[2] + b[2];
+    m[3] = a[3] + b[3];
+    m[4] = a[4] ? a[4] : b[4];
+    m[5] = a[5] < b[5] ? a[5] : b[5];
+    m[6] = a[6] > b[6] ? a[6] : b[6];
+    m[7] = a[7];
+    m[8] = (((a[8] >> 1) + (b[8] >> 1)) << 1) | ((a[8] | b[8]) & 1);
+    m[9] = a[9] > b[9] ? a[9] : b[9];
+    const int64_t lo = a[5] > b[5] ? a[5] : b[5], hi = a[6] < b[6] ? a[6] : b[6];
+    sc[SC_SPLIT_OVERLAP_NS] += hi > lo ? hi - lo : 0;
+    sc[SC_SPLIT_SPAN_NS] += m[6] > m[5] ? m[6] - m[5] : 0;
+}
+
+
 static void publish(int64_t t) {
     /* caller holds mu; res[t] already written */
     logbuf[seq % (uint64_t)logn] = t;
@@ -987,12 +1367,26 @@ static void *worker(void *arg) {
         __atomic_store_n(&qlen, qlen - 1, __ATOMIC_RELAXED);
         EV(2, job.ticket);
         busy += 1;
+        const int dq_at = spec_reading > 0;           /* dq1a: the range's lookahead flags */
+        const uint64_t dq_s0 = spec_chunk_starts;
         pthread_mutex_unlock(&mu);
         const int64_t t = job.ticket;
+        /* GU SPLIT (dq1b): a half reads its own parts into words of its own; the ticket's are written once both are in */
+        range_t half;
+        int64_t hw[RES_W];
+        const range_t *rg = &ranges[t];
         int64_t *out = res + t * RES_W;
-        int pb = pre_of ? pre_of[t] : 0;
+        if (job.half) {
+            half_of(&ranges[t], split_at_lens(ranges[t].len, ranges[t].ndst), job.half, &half);
+            rg = &half;
+            for (int k = 0; k < RES_W; k++) hw[k] = 0;
+            out = hw;
+        }
+        int pb = pre_of ? (job.half == 2 ? pre_of_b[t] : pre_of[t]) : 0;
         int status;
         int ww = w;
+        int how = 0;                                   /* GU SPLIT: 0 read, 1 adopted, 2 its pre-range */
+        int64_t dq_wait = 0;                           /* dq1a: a pre-bound range's wait for its pre-read */
         if (pb) {                                      /* PRE: the bound pre-range's result */
             pre_t *p = &pre[pb - 1];
             pthread_mutex_lock(&mu);
@@ -1000,31 +1394,56 @@ static void *worker(void *arg) {
                 int64_t tw = q3ld_monotonic_ns();
                 sc[SC_PRE_WAITS] += 1;
                 while (p->state != PR_DONE) pthread_cond_wait(&pre_cv, &mu);
-                sc[SC_PRE_WAIT_NS] += q3ld_monotonic_ns() - tw;
+                dq_wait = q3ld_monotonic_ns() - tw;
+                sc[SC_PRE_WAIT_NS] += dq_wait;
             }
             for (int k = 1; k < RES_W; k++) out[k] = p->words[k];
             status = (int)p->words[0];
             ww = (int)p->words[7];
             p->state = PR_FREE; p->bound = 0; p->cancel = 0;
-            pre_of[t] = 0;
+            if (job.half == 2) pre_of_b[t] = 0;
+            else pre_of[t] = 0;
             sc[SC_PRE_SERVED] += 1;
-            EV(10, ranges[t].offset);
+            EV(10, rg->offset);
             pthread_mutex_unlock(&mu);
+            how = 2;
         } else {
             RANGE_DELAY();
-            status = ranges[t].scatter ? -1 : try_adopt(&job, &ranges[t], out);
+            out[9] = 0;                                /* dq1a: try_adopt's wait where it adopts */
+            status = rg->scatter ? -1 : try_adopt(&job, rg, out);
+            if (status >= 0) how = 1;
             if (status < 0) {
                 gauge_enter();
-                status = ranges[t].scatter ? run_range_scatter(&job, &ranges[t], stage, out) : run_range(&job, &ranges[t], stage, out);
+                status = rg->scatter ? run_range_scatter(&job, rg, stage, out) : run_range(&job, rg, stage, out);
                 gauge_exit();
             }
         }
         out[7] = ww;
         pthread_mutex_lock(&mu);
-        out[0] = status;
-        publish(t);
+        /* dq1a: a read's lookahead flags (a pre-bound range has its pre-read's), a pre-bound range's wait */
+        if (pb) out[9] = dq_wait;
+        else out[8] = dq_flags(dq_at, dq_s0);
+        int done = 1;
+        if (job.half) {                                /* GU SPLIT: this half's words in; the ticket's once both are */
+            out[0] = status;
+            sc[how == 2 ? SC_SPLIT_PRE : how == 1 ? SC_SPLIT_ADOPTED : SC_SPLIT_READ] += 1;
+            for (int k = 0; k < RES_W; k++) split_words[(t * 2 + job.half - 1) * RES_W + k] = out[k];
+            split_left[t] -= 1;
+            done = split_left[t] == 0;
+            if (done) {
+                int64_t m[RES_W];
+                split_join(t, m);
+                out = res + t * RES_W;
+                for (int k = 1; k < RES_W; k++) out[k] = m[k];
+                status = (int)m[0];
+            }
+        }
+        if (done) {
+            out[0] = status;
+            publish(t);
+        }
         pthread_mutex_unlock(&mu);
-        ev_flush();                                    /* EVENT: the gate this range completed, if any */
+        if (done) ev_flush();                          /* EVENT: the gate this range completed, if any */
         pthread_mutex_lock(&mu);
         busy -= 1;
         pthread_cond_broadcast(&done_cv);
@@ -1035,6 +1454,7 @@ static void *worker(void *arg) {
 
 /* ---------------------------------------------------------------- speculative: reader threads */
 static int rule_ok(int ti) {   /* THE QUEUE RULE, demand side, for speculative thread ti (caller holds mu) */
+    if (demand_first) return qlen == 0 && busy == 0;          /* DEMAND FIRST: no demand job queued or executing */
     return qlen == 0 && busy <= (ti == 0 ? SPEC_MAX_DEMAND_BUSY : spec_idle_busy);
 }
 
@@ -1046,8 +1466,10 @@ static int nearer_queued(int prio) {   /* QUEUED records of a nearer horizon cla
     return n;
 }
 
-static int pickable(const spec_t *s) {   /* queued, or parked (in flight, unowned) */
-    return s->state == SP_QUEUED || (s->state == SP_INFLIGHT && !s->running);
+static int pickable(const spec_t *s) {   /* queued, or parked (in flight, unowned; DEMAND FIRST mode 2: a piece left) */
+    if (s->state == SP_QUEUED) return 1;
+    if (s->state != SP_INFLIGHT || s->running) return 0;
+    return s->df != 2 || df_open(s);
 }
 
 /* caller holds mu: claimed (parked) first, then the nearest class, then the oldest; -1 if none */
@@ -1129,9 +1551,14 @@ static void *spec_worker(void *arg) {
             if (s->file_size - s->aligned < s->span) s->span = s->file_size - s->aligned;
             s->got = 0;
             s->landed = 0;
+            s->df = demand_first;                                 /* DEMAND FIRST: the record's mode, all its reads */
+            s->df_taken = s->df_done = 0;
+            s->df_live = 0;
+            s->df_bad = 0;
         }
         s->running = 1;
         spec_inflight += 1;
+        int64_t df_stop_at = -1;                                  /* DEMAND FIRST: the last stop counted */
         for (;;) {
             /* chunk boundary (also before the first chunk) */
             if ((s->abandon || stopping) && !s->claimed) {
@@ -1145,6 +1572,23 @@ static void *spec_worker(void *arg) {
                 else { sc[SC_FAILED] += 1; spec_end(s, SP_FAILED); }
                 break;
             }
+            if (s->df == 2 && !df_open(s)) {
+                /* DEMAND FIRST mode 2: every piece taken, or a reader failed.  No reader left: a reader failed (every
+                 * piece landed would have landed it above).  Else the last reader ends it (df_end_released). */
+                if (s->df_live == 0) {
+                    s->landed = 0;
+                    sc[SC_FAILED] += 1;
+                    df_stats[DF_FAILED] += 1;
+                    spec_end(s, SP_FAILED);
+                } else {
+                    df_stats[DF_RELEASES] += 1;
+                    s->running = 0;
+                    spec_inflight -= 1;
+                    pthread_cond_broadcast(&done_cv);
+                    pthread_cond_broadcast(&spec_cv);
+                }
+                break;
+            }
             if (!s->claimed && !stopping && s->prio > 0 && (!rule_ok(ti) || nearer_queued(s->prio))) {
                 /* PARK: free this thread for demand-nearer work; any thread resumes the record later */
                 sc[SC_PARKS] += 1;
@@ -1156,6 +1600,7 @@ static void *spec_worker(void *arg) {
             }
             if (!s->claimed && !stopping && !rule_ok(ti)) {
                 sc[SC_PAUSES] += 1;
+                if (s->df && s->got != df_stop_at) { df_stop_at = s->got; df_stop(s); }
                 pthread_cond_wait(&spec_cv, &mu);
                 continue;
             }
@@ -1172,11 +1617,28 @@ static void *spec_worker(void *arg) {
             }
             EV(s->claimed ? 7 : (ti > 0 ? 8 : 3), s->claimed ? s->base : nq);
             SPEC_HOLD(s);
-            int64_t n = s->span - s->got;
-            if (n > spec_chunk) n = spec_chunk;
-            char *dst = s->buf + s->got;
+            int64_t at, n;
+            int pa = 0, pb = 0;
+            if (s->df == 2) {
+                /* DEMAND FIRST mode 2: the first run of untaken pieces, one piece unclaimed, a chunk's worth claimed (none
+                 * left: readers took the rest meanwhile, and the boundary ends or releases it) */
+                if (s->df_bad || (pa = df_run(s, 0, DF_MAX_PIECES, s->claimed ? df_chunk_pieces() : 1, &pb)) < 0) continue;
+                s->df_taken |= df_mask(pa, pb);
+                s->df_live += 1;
+                at = (int64_t)pa * df_piece;
+                n = df_end(s, pb) - at;
+            } else {
+                at = s->got;
+                n = s->span - s->got;
+                const int64_t step = s->df && !s->claimed ? df_piece : spec_chunk;   /* DEMAND FIRST: unclaimed, in pieces */
+                if (n > step) n = step;
+            }
+            char *dst = s->buf + at;
             int fd = s->fd;
-            off_t off = (off_t)(s->aligned + s->got);
+            off_t off = (off_t)(s->aligned + at);
+            const int dq_uc = !s->claimed;            /* dq1a: an unclaimed chunk (the demand ranges' lookahead flags) */
+            if (dq_uc) { spec_reading += 1; spec_chunk_starts += 1; }
+            if (s->df && dq_uc) df_stats[DF_PIECES] += 1;
             pthread_mutex_unlock(&mu);
             SPEC_DELAY();
             int64_t done = 0;
@@ -1189,8 +1651,13 @@ static void *spec_worker(void *arg) {
                 done += r;
             }
             pthread_mutex_lock(&mu);
+            if (dq_uc) spec_reading -= 1;
             sc[SC_SPEC_CHUNKS] += 1;
             sc[SC_SPEC_BYTES] += done;
+            if (s->df == 2) {                                 /* DEMAND FIRST mode 2: the bitmaps; the boundary decides */
+                df_landed(s, pa, pb, !err && done == n);
+                continue;
+            }
             if (err) { s->landed = 0; sc[SC_FAILED] += 1; spec_end(s, SP_FAILED); break; }
             s->got += done;
             int64_t payload = s->aligned + s->got - s->base;
@@ -1233,6 +1700,10 @@ int q3ld_spec_config(int32_t nthreads, const uint64_t *bufs, int32_t nslots, int
     }
     spec_order = 0;
     spec_inflight = 0;
+    spec_reading = 0;
+    spec_chunk_starts = 0;                            /* dq1a */
+    df_piece = DF_PIECE_MIN;                          /* DEMAND FIRST: DF_MAX_PIECES pieces cover a slot */
+    while (df_piece * DF_MAX_PIECES < slot_bytes) df_piece *= 2;
     spec_configured = 1;
     pthread_mutex_unlock(&mu);
     return 0;
@@ -1255,18 +1726,23 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
     if (tb_denom == 0 && q3ld_init() != 0) return -1;
     pthread_mutex_lock(&mu);
     if (running || !spec_configured || nw < 1 || nw > MAX_WORKERS || psize <= 0 || sbytes % psize
-        || (nspec && (spec_slot_bytes % psize || spec_chunk % psize))) { pthread_mutex_unlock(&mu); return -1; }
+        || (nspec && (spec_slot_bytes % psize || spec_chunk % psize || df_piece % psize))) { pthread_mutex_unlock(&mu); return -1; }
     for (int i = 0; i < nspec; i++) {
         if (((uintptr_t)spec[i].buf) % (uintptr_t)psize) { pthread_mutex_unlock(&mu); return -1; }
     }
     ranges = (range_t *)calloc((size_t)n_tickets, sizeof(range_t));
-    queue = (job_t *)calloc((size_t)n_tickets, sizeof(job_t));
+    queue = (job_t *)calloc((size_t)n_tickets * 2, sizeof(job_t));   /* GU SPLIT: up to two jobs a ticket */
     pre_of = (int32_t *)calloc((size_t)n_tickets, sizeof(int32_t));
     sub_len = (int32_t *)calloc((size_t)n_tickets, sizeof(int32_t));
     gate_of = (int64_t *)calloc((size_t)n_tickets, sizeof(int64_t));
-    if (!ranges || !queue || !pre_of || !sub_len || !gate_of) {
+    split_left = (int32_t *)calloc((size_t)n_tickets, sizeof(int32_t));     /* GU SPLIT */
+    split_words = (int64_t *)calloc((size_t)n_tickets * 2 * RES_W, sizeof(int64_t));
+    pre_of_b = (int32_t *)calloc((size_t)n_tickets, sizeof(int32_t));
+    if (!ranges || !queue || !pre_of || !sub_len || !gate_of || !split_left || !split_words || !pre_of_b) {
         free(ranges); free(queue); free(pre_of); free(sub_len); free(gate_of);
+        free(split_left); free(split_words); free(pre_of_b);
         ranges = 0; queue = 0; pre_of = 0; sub_len = 0; gate_of = 0;
+        split_left = 0; split_words = 0; pre_of_b = 0;
         pthread_mutex_unlock(&mu);
         return -ENOMEM;
     }
@@ -1275,7 +1751,10 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
     memset(gates, 0, sizeof(gates));                  /* EVENT: armed later by q3ld_ev_config */
     g_head = g_tail = 0; ev_hi = ev_target = ev_sent = 0; ev_target_t = 0; ev_kind = EVK_OFF; ev_obj = 0;
     wd_stop = 0; wd_running = 0;
-    qcap = n_tickets; qhead = 0; __atomic_store_n(&qlen, 0, __ATOMIC_RELAXED);
+    qcap = n_tickets * 2; qhead = 0; __atomic_store_n(&qlen, 0, __ATOMIC_RELAXED);
+    gu_split = 0;                                     /* GU SPLIT: a new pool reads ranges whole until told */
+    demand_first = 0;                                 /* DEMAND FIRST: the lane's rule until told */
+    memset(df_stats, 0, sizeof(df_stats));
     res = res_arr; nt = n_tickets; logbuf = log_arr; logn = n_log; gauge = gauge_arr;
     staging_bytes = sbytes; page_size = psize;
     __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); busy = 0; seq = 0;
@@ -1304,7 +1783,7 @@ static int run_range_scatter(const job_t *job, const range_t *rg, char *stage, i
     int status = ST_OK;
     out[4] = 0;
     for (int32_t d = 0; d < rg->ndst && status == ST_OK; d++) {
-        job_t part = { rg->fds[d], rg->sizes[d], job->deadline, job->ticket };
+        job_t part = { rg->fds[d], rg->sizes[d], job->deadline, job->ticket, 0 };
         range_t one = { 0 };
         one.offset = rg->offs[d];
         one.ndst = 1;
@@ -1325,7 +1804,8 @@ static int run_range_scatter(const job_t *job, const range_t *rg, char *stage, i
 }
 
 /* One job (a stock fill unit) -- q3_nativeissue.c's q3ni_submit, plus the claim of the speculative records
- * containing its ranges.  Returns 0; -1 bad args / not running; -2 a ticket is still pending; -3 queue full. */
+ * containing its ranges.  Returns 0; -1 bad args / not running; -2 a ticket is still pending; -3 queue full.
+ * GU SPLIT (dq1b): while the split is on, a deadline-free submit's gate/up ranges go as two range jobs each. */
 int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int32_t ngu, int32_t ndown,
                 const int64_t *offsets, const uint64_t *const *rows, const int64_t *lens, int64_t first) {
     if (n < 1 || n > MAX_ITEMS || ngu < 1 || ndown < 1 || ngu > MAX_COMP || ndown > MAX_COMP) return -1;
@@ -1336,7 +1816,9 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
     for (int32_t i = 0; i < count; i++) {
         if (res[(first + i) * RES_W] == ST_PENDING) { pthread_mutex_unlock(&mu); return -2; }
     }
-    if (qlen + count > qcap) { pthread_mutex_unlock(&mu); return -3; }
+    /* GU SPLIT: the gate/up ranges' boundary (every record of a submit has the same lengths); 0 = none split */
+    const int32_t h = gu_split && deadline < 0 && !direct_reads ? split_at_lens(lens, ngu) : 0;
+    if (qlen + count + (h ? n : 0) > qcap) { pthread_mutex_unlock(&mu); return -3; }
     for (int32_t i = 0; i < count; i++) {
         int down = i >= n;
         int32_t item = down ? i - n : i;
@@ -1353,6 +1835,8 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
         for (int k = 1; k < RES_W; k++) out[k] = 0;
         out[0] = ST_PENDING;
         pre_of[first + i] = 0;
+        pre_of_b[first + i] = 0;
+        split_left[first + i] = h && !down ? 2 : 0;
         sub_len[first + i] = i == 0 ? count : 0;       /* WITHDRAW: the submit's range jobs, on its first ticket */
         gate_of[first + i] = 0;                        /* EVENT: a gate maps a ticket only after this submit */
     }
@@ -1361,27 +1845,57 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
         for (int32_t i = 0; i < count; i++) {
             range_t *rg = &ranges[first + i];
             int p = pre_find(fd, rg);
-            if (p < 0) continue;
-            pre_t *pr = &pre[p];
-            if (pr->state == PR_QUEUED) {
-                pr->state = PR_FREE;
-                sc[SC_PRE_CANCELLED] += 1;
-                continue;
+            if (p >= 0) {
+                pre_t *pr = &pre[p];
+                if (pr->state == PR_QUEUED) {
+                    pr->state = PR_FREE;
+                    sc[SC_PRE_CANCELLED] += 1;
+                } else {                           /* GU SPLIT: a pre-range of the whole range serves it whole */
+                    for (int32_t c = 0; c < rg->ndst; c++) pr->rg.dst[c] = rg->dst[c];
+                    pr->bound = 1;
+                    pre_of[first + i] = p + 1;
+                    sc[SC_PRE_BOUND] += 1;
+                    woke = 1;
+                    split_left[first + i] = 0;
+                    continue;
+                }
             }
-            for (int32_t c = 0; c < rg->ndst; c++) pr->rg.dst[c] = rg->dst[c];
-            pr->bound = 1;
-            pre_of[first + i] = p + 1;
-            sc[SC_PRE_BOUND] += 1;
-            woke = 1;
+            if (!split_left[first + i]) continue;
+            for (int half = 1; half <= 2; half++) {    /* GU SPLIT: each half's own pre-range */
+                range_t hr;
+                half_of(rg, h, half, &hr);
+                int q = pre_find(fd, &hr);
+                if (q < 0) continue;
+                pre_t *pr = &pre[q];
+                if (pr->state == PR_QUEUED) {
+                    pr->state = PR_FREE;
+                    sc[SC_PRE_CANCELLED] += 1;
+                    continue;
+                }
+                for (int32_t c = 0; c < hr.ndst; c++) pr->rg.dst[c] = hr.dst[c];
+                pr->bound = 1;
+                if (half == 1) pre_of[first + i] = q + 1;
+                else pre_of_b[first + i] = q + 1;
+                sc[SC_PRE_BOUND] += 1;
+                woke = 1;
+            }
         }
         if (woke) pthread_cond_broadcast(&pre_cv);
     }
     if (nspec) claim_ranges(fd, first, count);
+    int32_t jobs = 0;
     for (int32_t i = 0; i < count; i++) {          /* a job per range, in ticket order: every gate/up, then every down */
-        job_t *job = &queue[(qhead + qlen) % qcap];
-        job->fd = fd; job->file_size = file_size; job->deadline = deadline; job->ticket = first + i;
-        __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);
+        const int32_t parts = split_left[first + i] ? 2 : 1;   /* GU SPLIT: a split range's halves side by side */
+        if (parts == 2) sc[SC_SPLIT_TICKETS] += 1;
+        for (int32_t k = 0; k < parts; k++) {
+            job_t *job = &queue[(qhead + qlen) % qcap];
+            job->fd = fd; job->file_size = file_size; job->deadline = deadline; job->ticket = first + i;
+            job->half = parts == 2 ? k + 1 : 0;
+            __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);
+            jobs += 1;
+        }
     }
+    sub_len[first] = jobs;                         /* WITHDRAW: the submit's range jobs */
     EV(1, first);
     pthread_cond_broadcast(&work_cv);
     pthread_mutex_unlock(&mu);
@@ -1421,12 +1935,15 @@ int q3ld_submit_scatter(int32_t n, int32_t ngu, int32_t ndown, const int32_t *fd
         for (int k = 1; k < RES_W; k++) out[k] = 0;
         out[0] = ST_PENDING;
         pre_of[first + i] = 0;
+        pre_of_b[first + i] = 0;
+        split_left[first + i] = 0;
         sub_len[first + i] = i == 0 ? count : 0;
         gate_of[first + i] = 0;
     }
     for (int32_t i = 0; i < count; i++) {
         job_t *job = &queue[(qhead + qlen) % qcap];
         job->fd = -1; job->file_size = 0; job->deadline = -1; job->ticket = first + i;
+        job->half = 0;
         __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);
     }
     EV(1, first);
@@ -1436,37 +1953,44 @@ int q3ld_submit_scatter(int32_t n, int32_t ngu, int32_t ndown, const int32_t *fd
 }
 
 /* WITHDRAW: take the submit whose first ticket is `first` back out of the FIFO while no worker has started it: its
- * sub_len[first] range jobs, adjacent in the queue in ticket order (one submit queues them under the pool mutex), leave
- * it together, the jobs behind them keeping their order; its tickets get ST_WITHDRAWN words (no preadv, payload 0, no
- * row written) and are published in ticket order.  The FIFO takes a submit's ranges in ticket order, so its first
- * range still queued means none of it was taken.  Returns 1 withdrawn; 0 not queued (a worker started it and every
- * range of it runs as submitted, it is done, or no submit starts at `first`); -1 not running / bad ticket; -2 refused
- * (a ticket bound to a pre-range or waited on by a live event gate: its bytes are promised elsewhere). */
+ * sub_len[first] range jobs, adjacent in the queue in ticket order (one submit queues them under the pool mutex; GU
+ * SPLIT: a split range's two halves side by side), leave it together, the jobs behind them keeping their order; its
+ * tickets get ST_WITHDRAWN words (no preadv, payload 0, no row written) and are published in ticket order.  The FIFO
+ * takes a submit's jobs in order, so its first job still queued means none of it was taken.  Returns 1 withdrawn; 0 not
+ * queued (a worker started it and every range of it runs as submitted, it is done, or no submit starts at `first`);
+ * -1 not running / bad ticket; -2 refused (a ticket bound to a pre-range or waited on by a live event gate: its bytes
+ * are promised elsewhere). */
 int q3ld_withdraw(int64_t first) {
     if (first < 0) return -1;
     pthread_mutex_lock(&mu);
     if (!running || first >= nt) { pthread_mutex_unlock(&mu); return -1; }
-    const int32_t count = sub_len[first];
-    if (count < 1) { pthread_mutex_unlock(&mu); return 0; }
+    const int32_t jobs = sub_len[first];
+    if (jobs < 1) { pthread_mutex_unlock(&mu); return 0; }
     int64_t k = 0;
     while (k < qlen && queue[(qhead + k) % qcap].ticket != first) k++;
-    if (k == qlen) { pthread_mutex_unlock(&mu); return 0; }
-    for (int32_t i = 0; i < count; i++) {           /* the submit's ranges, adjacent and in ticket order */
-        if (k + i >= qlen || queue[(qhead + k + i) % qcap].ticket != first + i) { pthread_mutex_unlock(&mu); return 0; }
-        int64_t t = first + i;
-        if (pre_of[t] || (gate_of[t] && gate_live(gate_of[t] - 1))) { pthread_mutex_unlock(&mu); return -2; }
+    if (k == qlen || queue[(qhead + k) % qcap].half > 1) { pthread_mutex_unlock(&mu); return 0; }
+    int64_t last = first;
+    for (int32_t i = 0; i < jobs; i++) {            /* the submit's jobs, adjacent and in ticket order */
+        if (k + i >= qlen) { pthread_mutex_unlock(&mu); return 0; }
+        const job_t *jb = &queue[(qhead + k + i) % qcap];
+        if (jb->ticket != last && jb->ticket != last + 1) { pthread_mutex_unlock(&mu); return 0; }
+        last = jb->ticket;
+        const int64_t t = jb->ticket;
+        if (pre_of[t] || pre_of_b[t] || (gate_of[t] && gate_live(gate_of[t] - 1))) { pthread_mutex_unlock(&mu); return -2; }
     }
-    for (int64_t m = k; m + count < qlen; m++) queue[(qhead + m) % qcap] = queue[(qhead + m + count) % qcap];
-    __atomic_store_n(&qlen, qlen - count, __ATOMIC_RELAXED);
+    for (int64_t m = k; m + jobs < qlen; m++) queue[(qhead + m) % qcap] = queue[(qhead + m + jobs) % qcap];
+    __atomic_store_n(&qlen, qlen - jobs, __ATOMIC_RELAXED);
     sub_len[first] = 0;
     int64_t now = q3ld_monotonic_ns();
-    for (int32_t i = 0; i < count; i++) {
-        int64_t *out = res + (first + i) * RES_W;
+    for (int64_t t = first; t <= last; t++) {
+        int64_t *out = res + t * RES_W;
         out[1] = out[2] = out[3] = out[4] = 0;
         out[5] = out[6] = now;
         out[7] = -1;
+        out[8] = out[9] = 0;
+        split_left[t] = 0;
         out[0] = ST_WITHDRAWN;
-        publish(first + i);
+        publish(t);
     }
     EV(11, first);
     pthread_cond_broadcast(&spec_cv);          /* the demand queue got shallower: the speculative queue rule may pass */
@@ -1535,6 +2059,10 @@ static int32_t issue(int32_t fd, int64_t file_size, int64_t cur, int64_t tag, in
         s->aligned = b / page_size * page_size;
         s->span = s->got = s->landed = 0;
         s->adopted = 0;
+        s->df = 0;                                      /* DEMAND FIRST: set at its start */
+        s->df_taken = s->df_done = 0;
+        s->df_live = 0;
+        s->df_bad = 0;
         sc[SC_SUBMITTED] += 1;
         sc[SC_H_SUBMITTED + origin - 1] += 1;
         queued += 1;
@@ -1746,8 +2274,13 @@ int q3ld_stop(void) {
     running = 0; nworkers = 0; nspec_started = 0; __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); nspec = 0; nspec_threads = 0; spec_configured = 0;
     spec_idle_busy = SPEC_MAX_DEMAND_BUSY;
     direct_reads = 0;
+    parts_block = 0;
+    parts_live = 1;
     run_range = run_range_staged;
     free(ranges); free(queue); free(pre_of); free(sub_len); ranges = 0; queue = 0; pre_of = 0; sub_len = 0;
+    free(split_left); free(split_words); free(pre_of_b);
+    split_left = 0; split_words = 0; pre_of_b = 0; gu_split = 0;
+    demand_first = 0;
     for (int i = 0; i < MAX_PRE; i++) { memset(&pre[i], 0, sizeof(pre_t)); pre[i].fd = -1; }
     pre_on = 0; pre_ngu = pre_ndown = 0; pre_gu_total = 0;
     res = 0; logbuf = 0; gauge = 0; sc = 0;
@@ -1782,10 +2315,8 @@ int q3ld_pre_config(int32_t ngu, int32_t ndown, const int64_t *lens) {
     return 0;
 }
 
-/* queue one pre-range (caller holds mu); 1 queued, 0 not */
-static int pre_issue(int32_t fd, int64_t file_size, int64_t tag, int64_t offset, int down, const int64_t *lens_all) {
-    int32_t nd = down ? pre_ndown : pre_ngu;
-    const int64_t *lens = lens_all + (down ? pre_ngu : 0);          /* EXL3_LANE_PORT: the call's lengths */
+/* queue one pre-range of nd parts of `lens` at `offset` (caller holds mu); 1 queued, 0 not */
+static int pre_issue_parts(int32_t fd, int64_t file_size, int64_t tag, int64_t offset, const int64_t *lens, int32_t nd) {
     int64_t total = 0;
     for (int32_t c = 0; c < nd; c++) total += lens[c];
     int64_t a0 = offset / page_size * page_size;
@@ -1813,6 +2344,12 @@ static int pre_issue(int32_t fd, int64_t file_size, int64_t tag, int64_t offset,
     for (int32_t c = 0; c < nd; c++) p->rg.len[c] = lens[c];
     sc[SC_PRE_ISSUED] += 1;
     return 1;
+}
+
+/* queue one pre-range (caller holds mu); 1 queued, 0 not */
+static int pre_issue(int32_t fd, int64_t file_size, int64_t tag, int64_t offset, int down, const int64_t *lens_all) {
+    /* EXL3_LANE_PORT: the call's lengths */
+    return pre_issue_parts(fd, file_size, tag, offset, lens_all + (down ? pre_ngu : 0), down ? pre_ndown : pre_ngu);
 }
 
 /* One layer-call's pre-read (PyDLL: GIL held, never blocks beyond the pool mutex), right after the router barrier
@@ -1859,7 +2396,18 @@ static int32_t pre_read_with(int32_t fd, int64_t file_size, int64_t tag, int32_t
         }
         if (nt < 2 * MAX_PRE) todo[nt++] = b;
     }
-    for (int32_t k = 0; k < nt; k++) queued += pre_issue(fd, file_size, tag, todo[k], 0, lens_all);
+    /* GU SPLIT (dq1b): while the split is on, each gate/up range's halves (the submit binds them half by half) */
+    const int32_t h = gu_split && !direct_reads ? split_at_lens(lens_all, pre_ngu) : 0;
+    int64_t len_a = 0;
+    for (int32_t c = 0; c < h; c++) len_a += lens_all[c];
+    for (int32_t k = 0; k < nt; k++) {
+        if (h) {
+            const int q = pre_issue_parts(fd, file_size, tag, todo[k], lens_all, h)
+                + pre_issue_parts(fd, file_size, tag, todo[k] + len_a, lens_all + h, pre_ngu - h);
+            sc[SC_SPLIT_PRE_ISSUED] += q;
+            queued += q;
+        } else queued += pre_issue(fd, file_size, tag, todo[k], 0, lens_all);
+    }
     for (int32_t k = 0; k < nt; k++) queued += pre_issue(fd, file_size, tag, todo[k] + gu_total, 1, lens_all);
     if (n) sc[SC_PRE_CALLS] += 1;
     if (queued) pthread_cond_broadcast(&work_cv);
@@ -2073,7 +2621,37 @@ int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap) {
 }
 #endif
 
-int32_t q3ld_abi(void) { return 2026102401; }              /* SCATTER ranges; 2026101401 DIRECT as a construction route; 2026101201 WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
+/* GU SPLIT (dq1b): the gate/up split for the submits and pre-reads from here on (any time; the stream's phase change):
+ * 0 off, 1 split.  Returns 0, -1 for another mode. */
+int q3ld_gu_split(int32_t mode) {
+    if (mode < 0 || mode > 1) return -1;
+    pthread_mutex_lock(&mu);
+    gu_split = mode;
+    pthread_mutex_unlock(&mu);
+    return 0;
+}
+
+/* DEMAND FIRST (df1): the speculative class's order behind demand for the reads from here on (any time; the stream's
+ * phase change): 0 off (the lane's rule, chunks), 1 demand first, 2 demand first and claimed records' untaken pieces to
+ * the demand ranges that need them.  A record keeps the mode it started with.  Returns 0, -1 for another mode. */
+int q3ld_demand_first(int32_t mode) {
+    if (mode < 0 || mode > 2) return -1;
+    pthread_mutex_lock(&mu);
+    demand_first = mode;
+    pthread_cond_broadcast(&spec_cv);            /* the queue rule may differ */
+    pthread_mutex_unlock(&mu);
+    return 0;
+}
+
+/* DEMAND FIRST: the counters since the pool started (DF_*) -> out[min(n, DF_N)]; returns DF_N. */
+int32_t q3ld_df_stats(int64_t *out, int32_t n) {
+    pthread_mutex_lock(&mu);
+    for (int32_t i = 0; i < n && i < DF_N; i++) out[i] = df_stats[i];
+    pthread_mutex_unlock(&mu);
+    return DF_N;
+}
+
+int32_t q3ld_abi(void) { return 2026110203; }              /* df1: DEMAND FIRST (q3ld_demand_first, q3ld_df_stats); 2026110202 dq1b: GU SPLIT (q3ld_gu_split, the SC_SPLIT_* counters), RES_W 10 (dq1a's lookahead flags and wait); 2026110101 PARTS route; 2026102401 SCATTER ranges; 2026101401 DIRECT as a construction route; 2026101201 WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
 int32_t q3ld_max_gates(void) { return MAX_GATES; }
 int32_t q3ld_max_gate_tickets(void) { return MAX_GATE_TICKETS; }
 int32_t q3ld_max_pre(void) { return MAX_PRE; }

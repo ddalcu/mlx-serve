@@ -15,7 +15,6 @@ const model_discovery = @import("../../../host/registry/discovery.zig");
 const mlx_gguf = @import("../../../sdk/quant/gguf/claim.zig");
 const status = @import("../../../host/status.zig");
 const streamed = @import("../../../sdk/weights/streamed.zig");
-const mlx_stream = @import("../modules/stream.zig");
 const testing = std.testing;
 
 /// A load whose own bill exceeds the memory cap is refused whatever else is resident.
@@ -126,6 +125,11 @@ pub fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     return total;
 }
 
+fn streamRefused() error{StreamExpertsUnsupported} {
+    log.err("[preflight] stream_experts: this model's load does not stream its experts; turn the setting off\n", .{});
+    return error.StreamExpertsUnsupported;
+}
+
 /// A ModelOpt pack also bills the banks' decoded scales, which are smaller on disk.
 pub fn residentModelDiskBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
     const shards = try shardResidentBytes(allocator, io, model_dir, config);
@@ -134,14 +138,14 @@ pub fn residentModelDiskBytes(allocator: std.mem.Allocator, io: std.Io, model_di
 }
 
 fn shardResidentBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
-    if (config.mlxStream()) return mlx_stream.loadBytes(allocator, io, config);
     var shards = modelDiskBytes(io, model_dir);
-    // An expert bank's plugin bills its rows (`resident_bytes`).
-    if (config.stream_experts_override) |st| if (!config.expert_bank) {
+    if (config.stream_experts_override) |st| {
+        const b = config.plugin orelse return streamRefused();
+        if (!b.parsed.caps.experts_stream) return streamRefused();
         // The routed experts stay on disk; their slot rows are resident.
-        const s = try streamed.Streamed.packBytes(allocator, model_dir, st.slotRows(config.num_experts));
+        const s = try streamed.Streamed.packBytes(allocator, model_dir, st);
         shards = shards -| s.experts +| s.slots;
-    };
+    }
     const b = config.plugin orelse return shards;
     const f = b.table.weights.resident_bytes orelse return shards;
     var settings: [128]u8 = undefined;
@@ -154,10 +158,21 @@ fn shardResidentBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []con
     return out;
 }
 
+pub fn ggufGateBytes(discovered: ?u64, disk_only: u64) ?u64 {
+    return if (discovered) |bytes| bytes -| disk_only else null;
+}
+
 pub fn residentGateBytes(validated: ?u64, discovered: ?u64, mlx_text: bool) ?u64 {
     if (!mlx_text) return discovered;
     if (validated) |bytes| if (bytes > 0) return bytes;
     return discovered orelse 0;
+}
+
+test "GGUF accounting: disk-only tensors leave the resident gate but unknown sizes stay unknown" {
+    try std.testing.expectEqual(@as(?u64, 45), ggufGateBytes(147, 102));
+    try std.testing.expectEqual(@as(?u64, 147), ggufGateBytes(147, 0));
+    try std.testing.expectEqual(@as(?u64, 0), ggufGateBytes(100, 101));
+    try std.testing.expectEqual(@as(?u64, null), ggufGateBytes(null, 102));
 }
 
 pub fn committedTextBytes(model_bytes: u64, config: *const model_mod.ModelConfig) u64 {
@@ -199,17 +214,16 @@ fn waitForUnload(need: u64, avail: u64, mark: model_registry_mod.UnloadMark, now
 }
 
 fn loadAvail(_: std.Io) u64 {
-    return effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
+    return effectiveAvailableBytes(status.getLoadAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
 }
 
-/// RAM a load can still take beside everything resident: what the OS grants less the reserve it
-/// keeps (iOS's per-process headroom already is what the process may take). Null when unreadable.
+/// RAM a load can still take beside everything resident (`getLoadRoomBytes`; iOS's per-process headroom
+/// already is what the process may take). Null when unreadable.
 pub fn loadRamRoom() ?u64 {
     const proc = status.getProcAvailableMemBytes();
     if (proc > 0) return proc;
-    const host = status.getAvailableMemBytes();
-    if (host == 0) return null;
-    return host -| status.osReserveBytes(status.getTotalMemBytes(), mlx.weightsInDeviceMemory());
+    if (status.getLoadAvailableMemBytes() == 0) return null;
+    return status.getLoadRoomBytes();
 }
 
 fn pauseLoadAvail(io: std.Io) void {
@@ -265,6 +279,14 @@ pub fn mtpSidecarDiskBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: 
     const rel = mtp_mod.resolveMtpSidecarInDir(io, allocator, dir) orelse return 0;
     const st = dir.statFile(io, rel, .{}) catch return 0;
     return @intCast(st.size);
+}
+
+/// The coarse shortlist head an MTP bind builds from the trunk head (`mtp.buildRerankCoarse`, or the draft-only head
+/// `buildDraftHead` keeps instead), billed with the weights when the load carries an MTP head: a served model whose
+/// facts declare one (`SpecFacts.mtp_layout`), a legacy model whose pack ships one.
+pub fn mtpCoarseBytes(config: *const model_mod.ModelConfig, legacy_head: bool) u64 {
+    const head = if (config.plugin) |b| b.parsed.spec.mtp_layout != .none else legacy_head;
+    return if (head) mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), mtp_mod.DRAFT_HEAD_BITS) else 0;
 }
 
 /// Resident bytes a sidecar takes once loaded: `bits` per weight plus a bf16
@@ -630,6 +652,26 @@ test "a sidecar bills its loaded width, and only an in-dir one is dropped to fit
     try std.testing.expectEqual(PreflightVerdict.fits, preflightVerdict(20 * GB, 0, 25 * GB, true));
 }
 
+test "load preflight: a load macOS can make room for is admitted; one beside another resident model is refused" {
+    const system = @import("../../../sdk/util/system.zig");
+    const GB: u64 = 1024 * 1024 * 1024;
+    const page: u64 = 16384;
+    const total: u64 = 128 * GB;
+    const reserve = system.osReserveBytes(total, false);
+    const weights: u64 = @intFromFloat(70.13 * @as(f64, @floatFromInt(GB)));
+    const pages = struct {
+        fn of(gb: f64) u64 {
+            return @intFromFloat(gb * @as(f64, @floatFromInt(GB / page)));
+        }
+    }.of;
+    // A 128 GB Mac holding 36 GB of idle app memory: free 12.5, file-backed 19.4, wired 8.3, compressor 2.5 GB.
+    // The base figure reads ~31.9 GB, yet the 70.13 GB pack (needs ~77.1) loads there.
+    try testing.expect(memInsufficientForLoad(weights, system.computeAvailableBytes(total, pages(12.5), 0, pages(19.4), 0, pages(8.3), pages(2.5), page)));
+    try testing.expect(!memInsufficientForLoad(weights, system.computeLoadAvailableBytes(total, pages(8.3), pages(2.5), page, reserve)));
+    // The same pack already resident in another server (wired 77.6, compressor 9.6 GB) is refused.
+    try testing.expect(memInsufficientForLoad(weights, system.computeLoadAvailableBytes(total, pages(77.6), pages(9.6), page, reserve)));
+}
+
 test "memInsufficientForLoad: headroom + unknown-query guards" {
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;
@@ -686,17 +728,44 @@ test "a refusal right after a two-model eviction waits for the memory to come ba
     try std.testing.expect(waitForUnload(211 * GiB, 108 * GiB, mark, 1_200));
 }
 
-test "residentModelDiskBytes: with stream_experts a pack bills its residents and slot rows, not the experts" {
-    if (!@import("build_options").mlx_stream) return error.SkipZigTest;
+test "residentModelDiskBytes: with stream_experts a pack whose plugin streams them bills its residents and slot rows" {
+    if (!streamed.built) return error.SkipZigTest;
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
     var buf: [512]u8 = undefined;
     const dir = buf[0..try td.dir.realPath(io, &buf)];
     try @import("../../../sdk/weights/streamed/mlx_pack_test.zig").writePack(dir);
+    const table: abi.ModelTable = .{ .name = .of("t"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = undefined, .weights = &.{} };
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = &table };
     var config: model_mod.ModelConfig = .{ .num_experts = @import("../../../sdk/weights/streamed/mlx_pack_test.zig").E, .stream_experts_override = .{ .rows = 2 } };
-    const b = try streamed.Streamed.packBytes(std.testing.allocator, dir, 2);
+    // A model whose load does not stream its experts would hold them all beside a bill of slot rows.
+    try std.testing.expectError(error.StreamExpertsUnsupported, residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+    config.plugin = &binding;
+    try std.testing.expectError(error.StreamExpertsUnsupported, residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+    binding.parsed.caps.experts_stream = true;
+    const b = try streamed.Streamed.packBytes(std.testing.allocator, dir, .{ .rows = 2 });
     try std.testing.expectEqual(modelDiskBytes(io, dir) - b.experts + b.slots, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+    // A plugin's adapted config names no expert count: the bank's own sizes the rows.
+    config.num_experts = 0;
+    config.stream_experts_override = .on;
+    const on = try streamed.Streamed.packBytes(std.testing.allocator, dir, .on);
+    try std.testing.expect(on.slots > 0);
+    try std.testing.expectEqual(modelDiskBytes(io, dir) - on.experts + on.slots, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
     config.stream_experts_override = null;
     try std.testing.expectEqual(modelDiskBytes(io, dir), try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+}
+
+test "the preflight bills the MTP bind's coarse head where the load carries a head, and nothing where it does not" {
+    var c: model_mod.ModelConfig = .{};
+    c.vocab_size = 157_184;
+    c.hidden_size = 4096;
+    try std.testing.expectEqual(@as(u64, 281_673_728), mtpCoarseBytes(&c, true));
+    try std.testing.expectEqual(@as(u64, 0), mtpCoarseBytes(&c, false));
+    var table: abi.ModelTable = undefined;
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = &table, .parsed = .{ .spec = .{ .mtp_layout = .in_checkpoint } } };
+    c.plugin = &binding;
+    try std.testing.expectEqual(@as(u64, 281_673_728), mtpCoarseBytes(&c, false));
+    binding.parsed.spec.mtp_layout = .none;
+    try std.testing.expectEqual(@as(u64, 0), mtpCoarseBytes(&c, true));
 }

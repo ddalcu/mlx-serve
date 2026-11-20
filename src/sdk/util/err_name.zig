@@ -9,10 +9,10 @@ pub const Known = error{
     EmptyPrompt,
     EngineBusy,
     EngineUnsupported,
-    ForeignBytesReaderBusy,
     GenerationFailed,
     GenerationOutOfMemory,
     GpuContextLost,
+    GpuTimeout,
     InsufficientMemory,
     DistWorkerNotJoined,
     LoadFailed,
@@ -29,6 +29,7 @@ pub const Known = error{
     ModelBusy,
     NotEmbeddingModel,
     NoVisionEncoder,
+    MissingVisionWeights,
     Timeout,
     EmbedFailed,
     VisionEncodeFailed,
@@ -61,7 +62,11 @@ pub fn check(name: ?[]const u8) Known!void {
 
 test "err_name: a known name comes back as the same error; an unknown one keeps its name" {
     try std.testing.expectEqual(error.PrefillDoesNotFit, toError("PrefillDoesNotFit"));
+    // A load the GPU timed out on answers its own 503, not a generic 500.
+    try std.testing.expectEqual(error.GpuTimeout, toError("GpuTimeout"));
     try std.testing.expectEqual(error.EngineFailed, toError("InvalidQwen4Indexer"));
+    // The engine's load tells a missing tower (vision off) from a failed load, across the module unit too.
+    try std.testing.expectEqual(error.MissingVisionWeights, toError("MissingVisionWeights"));
     try std.testing.expectEqualStrings("InvalidQwen4Indexer", last());
     try check(null);
 }

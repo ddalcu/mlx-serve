@@ -152,12 +152,12 @@ struct ToolApprovalSheet: View {
     }
 }
 
-/// Horizontal strip of pending attachment chips (images, PDFs, audio) shown
+/// Horizontal strip of pending attachment chips (images, documents, audio) shown
 /// above the message input. Extracted from `ChatDetailView` so its body stays
 /// within the Swift type-checker's complexity budget.
 private struct AttachmentPreviewRow: View {
     @Binding var images: [PendingImage]
-    @Binding var pdfs: [(name: String, text: String)]
+    @Binding var docs: [PendingTextDoc]
     @Binding var videos: [ChatVideo]
     @Binding var audio: [ChatAudio]
 
@@ -170,9 +170,11 @@ private struct AttachmentPreviewRow: View {
                 // Each `detail` is localized by its producer, not by `fileChip`:
                 // a format key has to be completed BEFORE the catalog lookup, or
                 // the lookup keys on the finished sentence and can never match.
-                ForEach(Array(pdfs.enumerated()), id: \.offset) { idx, pdf in
-                    fileChip(idx: idx, name: pdf.name, detail: L10n.format("PDF · %lld chars", pdf.text.count),
-                             icon: "doc.text.fill", tint: .red) { pdfs.remove(at: idx) }
+                ForEach(Array(docs.enumerated()), id: \.offset) { idx, doc in
+                    fileChip(idx: idx, name: doc.name,
+                             detail: doc.kind == .pdf ? L10n.format("PDF · %lld chars", doc.text.count) : L10n.format("Text · %lld chars", doc.text.count),
+                             icon: doc.kind == .pdf ? "doc.text.fill" : "doc.plaintext.fill",
+                             tint: doc.kind == .pdf ? .red : .blue) { docs.remove(at: idx) }
                 }
                 ForEach(Array(videos.enumerated()), id: \.offset) { idx, vid in
                     fileChip(idx: idx, name: vid.name, detail: L10n.format("Video · %lld frames", vid.frameCount),
@@ -397,12 +399,13 @@ private struct MicButton: View {
 /// A top-level (non-`@MainActor`) type so the routing is unit-testable without
 /// the rendered view — it mirrors the attach button's dispatch (see ChatPasteTests).
 enum PasteFileKind: String, Equatable {
-    case folder, pdf, audio, video, image, unhandled
+    case folder, pdf, text, audio, video, image, unhandled
 
     static func classify(ext: String, isDirectory: Bool, audioSupported: Bool, videoSupported: Bool = false) -> PasteFileKind {
         if isDirectory { return .folder }
         let e = ext.lowercased()
         if e == "pdf" { return .pdf }
+        if TextAttachment.isTextFile(ext: e) { return .text }
         if let ut = UTType(filenameExtension: e) {
             if ut.conforms(to: .audio) { return audioSupported ? .audio : .unhandled }
             if ut.conforms(to: .movie) { return videoSupported ? .video : .unhandled }
@@ -430,7 +433,7 @@ struct ChatView: View {
     /// The starter recommendation this Mac gets — same function the welcome
     /// window and the Model Browser read.
     private var starterPick: RecommendedModelPick {
-        RecommendedModelPick.starterPick(physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory)
+        RecommendedModelPick.starterPick(memory: .current())
     }
 
     /// Blocking whenever nothing on this Mac can serve a chat. The progress
@@ -1623,48 +1626,16 @@ struct ChatSidebar: View {
             // to, so that answer belongs on the first line rather than in a
             // caption under a title derived from whatever you typed first.
             let agent = appState.agents.agent(id: session.agentId)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 4) {
-                    if session.isExternalBridge {
-                        Image(systemName: "paperplane.fill")
-                            .font(.app(.caption2))
-                            .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
-                            .help("Telegram conversation (view only)")
-                    }
-                    if let agent {
-                        Image(systemName: agent.symbol)
-                            .font(.app(.caption2))
-                            .foregroundStyle(Color.accentColor)
-                    } else if !session.isExternalBridge {
-                        // Every row in this column carries a glyph saying what
-                        // it is — a terminal, an agent, a plain conversation.
-                        Image(systemName: "bubble.left")
-                            .font(.app(.subheadline, weight: .medium))
-                            .foregroundStyle(.secondary)
-                    }
-                    let displayTitle = ChatSessionTitle.display(title: session.title,
-                                                                agentName: agent?.name)
-                    Text(displayTitle == "New Chat" ? L10n.text(displayTitle) : displayTitle)
-                        .font(.app(.rowTitle))
-                        .lineLimit(1)
-                        .foregroundStyle(.primary)
-                    if let dot = activity.dot(for: session.id, isSelected: isSelected) {
-                        activityDot(for: dot)
-                    }
-                }
-                // What this particular conversation is about, displaced from
-                // the title line by the agent's name. It is also the only
-                // thing telling a second thread with the same agent apart
-                // from the first — without it the sidebar draws two identical
-                // rows. Absent until the thread has said something, so a new
-                // one is a single line exactly like a destination row.
-                if let subject = ChatSessionTitle.subject(title: session.title,
-                                                          agentName: agent?.name) {
-                    Text(L10n.text(subject))
-                        .font(.app(.caption2))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .foregroundStyle(.secondary)
+            let displayTitle = ChatSessionTitle.display(title: session.title, agentName: agent?.name)
+            SidebarSessionLabel(
+                title: displayTitle == "New Chat" ? L10n.text(displayTitle) : displayTitle,
+                subject: ChatSessionTitle.subject(title: session.title, agentName: agent?.name).map { subject in L10n.text(subject) },
+                agentSymbol: agent?.symbol,
+                isExternalBridge: session.isExternalBridge,
+                isSelected: isSelected
+            ) {
+                if let dot = activity.dot(for: session.id, isSelected: isSelected) {
+                    activityDot(for: dot)
                 }
             }
             // Room kept for the delete button at ALL times, not only while
@@ -2077,7 +2048,7 @@ struct ChatDetailView: View {
     @State private var scrollPosition = ScrollPosition(idType: Never.self, edge: .bottom)
     @State private var pasteMonitor: Any?
     @State private var pendingImages: [PendingImage] = []
-    @State private var pendingPDFs: [(name: String, text: String)] = []
+    @State private var pendingDocs: [PendingTextDoc] = []
     @State private var pendingVideos: [ChatVideo] = []
     @State private var pendingAudio: [ChatAudio] = []
     @StateObject private var recorder = AudioRecorder()
@@ -2889,8 +2860,8 @@ struct ChatDetailView: View {
                 .padding(.vertical, 12)
               } else {
                 // Pending attachment thumbnails (images + PDFs + videos + audio)
-                if !pendingImages.isEmpty || !pendingPDFs.isEmpty || !pendingVideos.isEmpty || !pendingAudio.isEmpty {
-                    AttachmentPreviewRow(images: $pendingImages, pdfs: $pendingPDFs, videos: $pendingVideos, audio: $pendingAudio)
+                if !pendingImages.isEmpty || !pendingDocs.isEmpty || !pendingVideos.isEmpty || !pendingAudio.isEmpty {
+                    AttachmentPreviewRow(images: $pendingImages, docs: $pendingDocs, videos: $pendingVideos, audio: $pendingAudio)
                 }
 
                 // Attached document folder (mini RAG) — indexing progress / ready chip
@@ -2975,15 +2946,22 @@ struct ChatDetailView: View {
                 .frame(width: 0, height: 0)
                 .opacity(0)
         )
-        .onDrop(of: [.image, .pdf, .audio, .movie], isTargeted: nil) { providers in
+        .onDrop(of: [.image, .pdf, .audio, .movie, .fileURL], isTargeted: nil) { providers in
             for provider in providers {
-                if provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
+                // A text or source file, told by its name: a `.zig` has no system type, and a `.ts` has a video one.
+                if TextAttachment.isTextFile(ext: ((provider.suggestedName ?? "") as NSString).pathExtension)
+                    || provider.registeredTypeIdentifiers.contains(where: { UTType($0).map(TextAttachment.isTextType) ?? false }) {
+                    _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                        guard let url, TextAttachment.isTextFile(ext: url.pathExtension) else { return }
+                        DispatchQueue.main.async { addTextAttachment(url) }
+                    }
+                } else if provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
                     provider.loadFileRepresentation(forTypeIdentifier: UTType.pdf.identifier) { url, _ in
                         guard let url = url else { return }
                         let name = url.lastPathComponent
                         if let text = Self.extractPDFText(from: url) {
                             DispatchQueue.main.async {
-                                pendingPDFs.append((name: name, text: text))
+                                pendingDocs.append(PendingTextDoc(name: name, text: text, kind: .pdf))
                             }
                         } else {
                             DispatchQueue.main.async { showPDFError(name) }
@@ -3378,7 +3356,7 @@ struct ChatDetailView: View {
         .disabled(!canAnswer
                   || (composerState == .idle
                       && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                      && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingVideos.isEmpty && pendingAudio.isEmpty))
+                      && pendingImages.isEmpty && pendingDocs.isEmpty && pendingVideos.isEmpty && pendingAudio.isEmpty))
         }
     }
 
@@ -3493,10 +3471,12 @@ struct ChatDetailView: View {
             attachDocumentFolder(url)
         case .pdf:
             if let text = Self.extractPDFText(from: url) {
-                pendingPDFs.append((name: url.lastPathComponent, text: text))
+                pendingDocs.append(PendingTextDoc(name: url.lastPathComponent, text: text, kind: .pdf))
             } else {
                 showPDFError(url.lastPathComponent)
             }
+        case .text:
+            addTextAttachment(url)
         case .audio:
             addAudioAttachment(url)
         case .video:
@@ -3517,7 +3497,7 @@ struct ChatDetailView: View {
     private func pickAttachment() {
         let panel = OpenPanel.make()
         // Only offer audio/video on models that can use them.
-        var types: [UTType] = [.image, .pdf]
+        var types: [UTType] = [.image, .pdf] + TextAttachment.contentTypes
         if videoSupported { types.append(.movie) }
         if audioSupported { types.append(.audio) }
         panel.allowedContentTypes = types
@@ -3528,10 +3508,12 @@ struct ChatDetailView: View {
             for url in panel.urls {
                 if url.pathExtension.lowercased() == "pdf" {
                     if let text = Self.extractPDFText(from: url) {
-                        pendingPDFs.append((name: url.lastPathComponent, text: text))
+                        pendingDocs.append(PendingTextDoc(name: url.lastPathComponent, text: text, kind: .pdf))
                     } else {
                         showPDFError(url.lastPathComponent)
                     }
+                } else if TextAttachment.isTextFile(ext: url.pathExtension) {
+                    addTextAttachment(url)
                 } else if let utType = UTType(filenameExtension: url.pathExtension), utType.conforms(to: .audio) {
                     addAudioAttachment(url)
                 } else if videoSupported, let utType = UTType(filenameExtension: url.pathExtension), utType.conforms(to: .movie) {
@@ -3671,13 +3653,25 @@ struct ChatDetailView: View {
         alert.runModal()
     }
 
-    /// Build a preamble string that joins all pending PDFs and clears the list.
-    /// Returns "" when nothing is pending.
-    private func consumePendingPDFsAsText() -> String {
-        guard !pendingPDFs.isEmpty else { return "" }
-        let combined = pendingPDFs.map { "[PDF: \($0.name)]\n\($0.text)" }.joined(separator: "\n\n")
-        pendingPDFs = []
-        return combined
+    /// The preamble that carries the pending PDFs and text files, clearing the list. "" when nothing is pending.
+    private func consumePendingDocsAsText() -> String {
+        defer { pendingDocs = [] }
+        return PendingTextDoc.preamble(pendingDocs)
+    }
+
+    /// Attach a text or source file, or say why it cannot be read as one.
+    private func addTextAttachment(_ url: URL) {
+        let name = url.lastPathComponent
+        if let text = TextAttachment.read(url) {
+            pendingDocs.append(PendingTextDoc(name: name, text: text, kind: .text))
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = L10n.text("Couldn't read text file")
+        alert.informativeText = L10n.format("%@ is empty, binary, or larger than %@.", name,
+                                            ByteCountFormatter.string(fromByteCount: Int64(TextAttachment.maxBytes), countStyle: .file))
+        alert.alertStyle = .warning
+        alert.runModal()
     }
 
     /// Write the pending attachments out and hand back the messages' images,
@@ -4059,7 +4053,7 @@ struct ChatDetailView: View {
         let attachedImages = consumePendingImages()
         let attachedVideos = consumePendingVideos()
         let attachedAudio = consumePendingAudio()
-        let pdfText = consumePendingPDFsAsText()
+        let pdfText = consumePendingDocsAsText()
         guard !text.isEmpty || attachedImages != nil || attachedVideos != nil || attachedAudio != nil || !pdfText.isEmpty,
               composerState != .generatingHere, canAnswer else { return }
         inputText = ""

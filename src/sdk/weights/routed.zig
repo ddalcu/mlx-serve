@@ -35,6 +35,34 @@ pub const Routed = struct {
     read_ahead_fn: ?*const fn (*anyopaque, u32, []const u16) Ret(void) = null,
     /// Routed ids a decode-phase call takes: a wider call is a prompt pass, which a source refuses in decode.
     decode_ids: usize = max_call_ids,
+    /// A `source` call of at most `decode_ids` ids gives each row the bytes that row's call alone gets.
+    exact_rows: bool = false,
+    /// A prompt call of `source` (more ids than `decode_ids`) sums each routed row by itself (its bytes do not depend on
+    /// the call's other rows), so a model may join several prompt spans' rows into one call.
+    rows_independent: bool = false,
+
+    /// A wide call's routed sum plus the shared expert's rows (`[n, hidden]` f32, the last argument) as one combine over
+    /// the call's unjoined outputs: `source`'s sum + the shared rows, word for word. A narrower call (a replaying chunk's
+    /// last row) runs on a wide call's waves and combine too. Null: the source has none.
+    source_shared: ?*const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array) = null,
+    /// `source_shared` (the shared expert as the model made it) with the model's hc expand of the streams `res`
+    /// [n, hc, d] by `pc` (f32 [n, hc + hc * hc], each row's post then comb) in the combine's kernel: the layer's new
+    /// streams. Null: not offered.
+    source_expand: ?*const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array) = null,
+    /// `source_expand` for a decode-lane call (at most `decode_ids` ids), the shared expert's rows committed behind the
+    /// call's waves: the layer's new streams, the words of `source`'s sum and the model's `ffn_post_shared`. Null: not
+    /// offered.
+    source_decode_expand: ?*const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array) = null,
+    /// `source_expand` with the new streams written over `res` in place (the model's x1 region); returns the write's
+    /// one-word carrier. Null: not offered.
+    source_expand_into: ?*const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array) = null,
+    /// Model layer `layer`'s predicted routes (an unevaluated int32 [rows, k] array made before the call before it),
+    /// read ahead during that call once its routes are made. Null: not offered.
+    next_fn: ?*const fn (*anyopaque, u32, mlx.mlx_array) Ret(void) = null,
+    /// `source` for a decode-lane call (at most `decode_ids` ids) with a hoist (the last argument: an array the call does
+    /// not read, the model's shared expert over its rows), which the source may commit while the call waits for its
+    /// reads: `source`'s sum word for word; the model adds the hoist itself. Null: not offered.
+    source_hoist: ?*const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array) = null,
 
     pub fn settle(r: Routed) !void {
         return r.settle_fn(r.ctx).get();

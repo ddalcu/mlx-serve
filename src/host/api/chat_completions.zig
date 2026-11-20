@@ -26,6 +26,8 @@ const Conn = @import("../http/conn.zig").Conn;
 const spec_gate_threshold = @import("request_options.zig").spec_gate_threshold;
 const parseKvAttnExplicit = @import("request_options.zig").parseKvAttnExplicit;
 const resolveSampling = @import("sampling.zig").resolveSampling;
+const parseLogitBias = @import("sampling.zig").parseLogitBias;
+const parseSuppressCjk = @import("sampling.zig").parseSuppressCjk;
 const generationMaxTokens = @import("sampling.zig").generationMaxTokens;
 const requestProfile = @import("sampling.zig").requestProfile;
 const defaultEnableMtp = @import("request_options.zig").defaultEnableMtp;
@@ -58,10 +60,8 @@ const clampMaxTokens = @import("sampling.zig").clampMaxTokens;
 const mediaRejectReason = @import("media_gate.zig").mediaRejectReason;
 const dropMedia = @import("media_gate.zig").dropMedia;
 const imageUrlOfPart = @import("media_gate.zig").imageUrlOfPart;
-const encodeText = @import("tokenize.zig").encodeText;
+const countTextTokens = @import("tokenize.zig").countTextTokens;
 const jsonEscapeOrEmpty = @import("tokenize.zig").jsonEscapeOrEmpty;
-const effortWordOnly = @import("../chat/reasoning/request.zig").effortWordOnly;
-const implicitEffortBudgetFor = @import("../chat/reasoning/request.zig").implicitEffortBudgetFor;
 const defaultReasoningBudget = @import("../chat/reasoning/request.zig").defaultReasoningBudget;
 const forcedReasoningBudget = @import("../chat/reasoning/request.zig").forcedReasoningBudget;
 const resolveChatThinking = @import("../chat/reasoning/request.zig").resolveChatThinking;
@@ -91,6 +91,7 @@ const cachedFormatChat = @import("format.zig").cachedFormatChat;
 const speech_stream = @import("speech_stream.zig");
 const speech_api = @import("speech.zig");
 const formatChatUsage = @import("format.zig").formatChatUsage;
+const formatChatUsageWithReasoning = @import("format.zig").formatChatUsageWithReasoning;
 const formatTimingsObject = @import("format.zig").formatTimingsObject;
 const formatPerfBracket = @import("format.zig").formatPerfBracket;
 const jsonEscape = @import("format.zig").jsonEscape;
@@ -150,6 +151,12 @@ pub fn handleChatCompletions(
     if (ablation.forRequest(stream, root, lm)) |r| {
         log.warn("POST /v1/chat/completions -> {d} (ablation)\n", .{r.code});
         try sendErrorResponse(allocator, stream, r.status, if (r.code == 401) "authentication_error" else "invalid_request_error", r.msg, r.code);
+        return;
+    }
+    var suppress_cjk = false;
+    if (parseSuppressCjk(root, lm, &suppress_cjk)) |msg| {
+        log.warn("POST /v1/chat/completions -> 400 ({s})\n", .{msg});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
         return;
     }
 
@@ -399,6 +406,8 @@ pub fn handleChatCompletions(
     const repeat_penalty = sampled.repeat_penalty;
 
     const presence_penalty = sampled.presence_penalty;
+    const logit_bias = try parseLogitBias(allocator, root);
+    defer allocator.free(logit_bias);
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
@@ -461,6 +470,7 @@ pub fn handleChatCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", speech_api.TEXT_TOOLS, 400);
         return;
     }
+    if (forced_tool) |ft| forced_tool = chat_mod.narrowForced(ft, root.get("tools"));
     if (forced_tool) |ft| if (ft == .name and !chat_mod.toolsDeclare(root.get("tools"), ft.name)) {
         const msg = try std.fmt.allocPrint(allocator, "tool_choice names function \"{s}\", which is not in tools", .{ft.name});
         defer allocator.free(msg);
@@ -584,18 +594,17 @@ pub fn handleChatCompletions(
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
     const default_budget = defaultReasoningBudget(gen);
-    const thinking = resolveChatThinking(root, gen, config.defaultEnableThinking(tools_json != null), default_budget, effortWordOnly(allocator, lm, tok));
+    const thinking = resolveChatThinking(root, gen, config.defaultEnableThinking(tools_json != null), default_budget);
     const effort_cfg = thinking.effort;
     // The card's spoken recipes open no think block (`handleSpeech` likewise): the reply speaks from its first slot.
     var enable_thinking = thinking.enable and speech_ask == null;
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
-    // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
-    const effort_budget: i32 = if (effort_cfg) |e| e.budget else implicitEffortBudgetFor(allocator, lm, tok, default_budget);
+    // explicit reasoning_budget_tokens > --reasoning-budget (or the model rule); an effort word sets none.
     const reasoning_budget: i32 = forcedReasoningBudget(gen, if (root.get("reasoning_budget_tokens")) |v| switch (v) {
         .integer => |i| clampJsonI32(i),
-        else => effort_budget,
-    } else effort_budget);
+        else => default_budget,
+    } else default_budget);
 
     // Wave 1.A: per-request KV-quant override. When unset, falls back to the
     // process-level --kv-quant default carried on the scheduler. Cross-scheme
@@ -860,7 +869,9 @@ pub fn handleChatCompletions(
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
         .frequency_penalty = sampled.frequency_penalty,
+        .logit_bias = logit_bias,
         .seed = seed,
+        .suppress_cjk = suppress_cjk,
     };
 
     // Build grammar-constrained sampling state if a JSON schema was supplied.
@@ -1214,23 +1225,8 @@ fn handleNonStreamingGeneration(
                 try allocator.alloc(u8, 0);
             defer allocator.free(tc_timings_field);
 
-            const tc_usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, "");
-            defer allocator.free(tc_usage_obj);
-
-            const response = try std.fmt.allocPrint(allocator,
-                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
-            , .{
-                nowMs(stream.io),
-                nowSecs(stream.io),
-                model_name,
-                tc_content_json,
-                tc_reasoning_json,
-                tc_buf.items,
-                toolCallFinishReason(finish_reason),
-                finishDetailsField(toolCallFinishReason(finish_reason), result.finish_details),
-                tc_usage_obj,
-                tc_timings_field,
-            });
+            const tc_reasoning_tokens = if (tc_think_split.reasoning_content) |reasoning| countTextTokens(allocator, lm, tok, reasoning) else 0;
+            const response = try formatToolCallReply(allocator, stream.io, model_name, .{ .content = tc_content_json, .reasoning = tc_reasoning_json, .tool_calls = tc_buf.items }, finish_reason, result, tc_reasoning_tokens, tc_timings_field);
             defer allocator.free(response);
             try sendResponse(stream, "200 OK", "application/json", response);
             return;
@@ -1274,8 +1270,7 @@ fn handleNonStreamingGeneration(
     // key on the request's thinking flag.
     var reasoning_json: []const u8 = "";
     var reasoning_allocated = false;
-    var usage_details_json: []const u8 = "";
-    var usage_details_allocated = false;
+    var reasoning_tokens: u32 = 0;
     {
         // Use budget-truncated reasoning if available, otherwise use full reasoning
         const reasoning_text = if (budget_truncated_reasoning) |tr| tr else think_split.reasoning_content;
@@ -1286,15 +1281,10 @@ fn handleNonStreamingGeneration(
             reasoning_allocated = true;
             // usage.completion_tokens_details.reasoning_tokens (OpenAI/LM Studio
             // parity) so clients can budget visible content separately.
-            if (encodeText(allocator, lm, tok, reasoning, false)) |rids| {
-                defer allocator.free(rids);
-                usage_details_json = try std.fmt.allocPrint(allocator, ",\"completion_tokens_details\":{{\"reasoning_tokens\":{d}}}", .{rids.len});
-                usage_details_allocated = true;
-            } else |_| {}
+            reasoning_tokens = countTextTokens(allocator, lm, tok, reasoning);
         }
     }
     defer if (reasoning_allocated) allocator.free(reasoning_json);
-    defer if (usage_details_allocated) allocator.free(usage_details_json);
 
     const timings_obj = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
     defer allocator.free(timings_obj);
@@ -1307,38 +1297,89 @@ fn handleNonStreamingGeneration(
     // A spoken reply is OpenAI's `message.audio`: the speech, its id, and the text as its transcript.
     var audio_field: []const u8 = "";
     defer if (audio_field.len > 0) allocator.free(audio_field);
+    var audio_details: []const u8 = "";
+    defer if (audio_details.len > 0) allocator.free(audio_details);
     if (speech) |ask| {
         const data = try speech_api.encode(allocator, result.audio_samples orelse &.{}, result.sample_rate, ask.format);
         defer allocator.free(data);
         const frames = if (result.audio_codes) |c| c.len / lm.config.?.speech().?.codebooks else 0;
-        if (!usage_details_allocated) {
-            usage_details_json = try std.fmt.allocPrint(allocator, ",\"completion_tokens_details\":{{\"audio_tokens\":{d}}}", .{frames});
-            usage_details_allocated = true;
+        if (reasoning_tokens == 0) {
+            audio_details = try std.fmt.allocPrint(allocator, ",\"completion_tokens_details\":{{\"audio_tokens\":{d}}}", .{frames});
         }
         const audio_id = speech_api.Store.newId(stream.io);
         try speech_api.store.put(stream.io, audio_id, nowSecs(stream.io), content_text);
         audio_field = try std.fmt.allocPrint(allocator, ",\"audio\":{{\"id\":\"{s}\",\"data\":\"{s}\",\"expires_at\":{d},\"transcript\":{s}}}", .{ &audio_id, data, nowSecs(stream.io) + speech_api.Store.TTL_SECS, escaped_text });
     }
 
-    const usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, usage_details_json);
-    defer allocator.free(usage_obj);
-
-    const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
-    , .{
-        nowMs(stream.io),
-        nowSecs(stream.io),
-        model_name,
-        if (speech != null) "null" else escaped_text,
-        reasoning_json,
-        audio_field,
-        logprobs_json,
-        finish_reason,
-        finishDetailsField(finish_reason, result.finish_details),
-        usage_obj,
-        timings_field,
-    });
+    const response = try formatChatReply(allocator, stream.io, model_name, .{ .content = if (speech != null) "null" else escaped_text, .reasoning = reasoning_json, .audio = audio_field }, logprobs_json, finish_reason, result, .{ .reasoning_tokens = reasoning_tokens, .audio = audio_details }, timings_field);
     defer allocator.free(response);
 
     try sendResponse(stream, "200 OK", "application/json", response);
+}
+
+/// The non-stream reply. `message` is encoded already: the content value, the `reasoning_content` and audio fields or
+/// "". A spoken reply's `details.audio` replaces the reasoning count in `completion_tokens_details`.
+fn formatChatReply(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_name: []const u8,
+    message: struct { content: []const u8, reasoning: []const u8, audio: []const u8 },
+    logprobs_json: []const u8,
+    finish_reason: []const u8,
+    result: request_mod.GenerationResult,
+    details: struct { reasoning_tokens: u32, audio: []const u8 },
+    timings_field: []const u8,
+) ![]u8 {
+    const usage = if (details.audio.len > 0)
+        try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, details.audio)
+    else
+        try formatChatUsageWithReasoning(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, details.reasoning_tokens);
+    defer allocator.free(usage);
+    return std.fmt.allocPrint(allocator,
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
+    , .{ nowMs(io), nowSecs(io), model_name, message.content, message.reasoning, message.audio, logprobs_json, finish_reason, finishDetailsField(finish_reason, result.finish_details), usage, timings_field });
+}
+
+/// The non-stream reply that called tools. `message` is encoded already: the content value, the `reasoning_content`
+/// field or "", the tool_calls array.
+fn formatToolCallReply(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_name: []const u8,
+    message: struct { content: []const u8, reasoning: []const u8, tool_calls: []const u8 },
+    finish_reason: []const u8,
+    result: request_mod.GenerationResult,
+    reasoning_tokens: u32,
+    timings_field: []const u8,
+) ![]u8 {
+    const usage = try formatChatUsageWithReasoning(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, reasoning_tokens);
+    defer allocator.free(usage);
+    const finish = toolCallFinishReason(finish_reason);
+    return std.fmt.allocPrint(allocator,
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
+    , .{ nowMs(io), nowSecs(io), model_name, message.content, message.reasoning, message.tool_calls, finish, finishDetailsField(finish, result.finish_details), usage, timings_field });
+}
+
+// ── tests ──
+
+test "a tool-call reply's usage reports its reasoning tokens" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const result: request_mod.GenerationResult = .{ .text = &.{}, .token_ids = &.{}, .prompt_tokens = 1000, .completion_tokens = 50, .finish_reason = "stop", .prefill_tps = 0, .decode_tps = 0 };
+    const json = try formatToolCallReply(a, testing.io, "m", .{ .content = "null", .reasoning = "", .tool_calls = "[]" }, "stop", result, 40, "");
+    const usage = (try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{})).object.get("usage").?.object;
+    try testing.expectEqual(@as(?i64, 40), if (usage.get("completion_tokens_details")) |d| d.object.get("reasoning_tokens").?.integer else null);
+}
+
+test "a reply's usage caps its re-encoded reasoning tokens at completion_tokens" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const result: request_mod.GenerationResult = .{ .text = &.{}, .token_ids = &.{}, .prompt_tokens = 1000, .completion_tokens = 50, .finish_reason = "stop", .prefill_tps = 0, .decode_tps = 0 };
+    const json = try formatChatReply(a, testing.io, "m", .{ .content = "\"ok\"", .reasoning = "", .audio = "" }, "null", "stop", result, .{ .reasoning_tokens = 51, .audio = "" }, "");
+    const usage = (try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{})).object.get("usage").?.object;
+    try testing.expectEqual(@as(?i64, 50), if (usage.get("completion_tokens_details")) |d| d.object.get("reasoning_tokens").?.integer else null);
 }

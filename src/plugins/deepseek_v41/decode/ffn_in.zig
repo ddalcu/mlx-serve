@@ -1088,7 +1088,7 @@ fn equivalence(gpa: std.mem.Allocator, fx: *Fixture, ks: Kernels, ly: *const dsv
 }
 
 test "dsv41 dec ffn_in: R = 1, 2, 4, 6 on layers 20..25 match today's wo_b, expand, norm, mixes and router, no further from float64" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const fx = try Fixture.init(gpa, .{ .ctx = 8 });
     defer fx.deinit();
@@ -1141,7 +1141,7 @@ fn freeWeights(w: Weights) void {
 }
 
 test "dsv41 dec ffn_in: R = 1 and 6 at the release's 384 experts match today's chain, no further from float64" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const fx = try Fixture.init(gpa, .{ .ctx = 8 });
     defer fx.deinit();
@@ -1299,7 +1299,7 @@ const Bench = struct {
 };
 
 test "dsv41 dec ffn_in: ubench, R = 1 and 6 against today's chain over 2.3 GB of distinct weights" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     if (!decode.ubenchOn()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const fx = try Fixture.init(gpa, .{ .ctx = 8 });

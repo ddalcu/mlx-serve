@@ -11,18 +11,16 @@ const decodeDenseMlp = @import("../../../sdk/quant/exl3/sushi_pack.zig").decodeD
 const renameHyperConnections = @import("../../../sdk/quant/exl3/sushi_pack.zig").renameHyperConnections;
 const splitFusedQkv = @import("../../../sdk/quant/exl3/sushi_pack.zig").splitFusedQkv;
 const splitKvB = @import("../../../sdk/quant/exl3/sushi_pack.zig").splitKvB;
+const renameGlmMtp = @import("../../../sdk/quant/exl3/sushi_pack.zig").renameGlmMtp;
 
 /// Also serves NVIDIA's ModelOpt GLM pack and GLM's streaming packs (`expert_bank`), which ship the same source layout.
 pub fn adapt(config: *const ModelConfig, weights: *Weights, s: mlx.mlx_stream) !void {
-    if (config.exl3 == null and !config.modelopt and !(config.expert_bank and config.isGlm5())) return;
+    if (config.exl3 == null and !config.modelopt and !config.expert_bank) return;
     if (config.isMimo() and config.exl3 != null) {
         try dequantFp8Trunk(config, weights, s);
     }
-    if (config.isGlm5() and config.expert_bank) {
-        // A streaming pack: the NextN layer under the release's names, its experts in their own NVFP4 bank.
-        try @import("../../../sdk/quant/exl3/sushi_pack.zig").renameGlmMtp(weights, "model.language_model", config.num_hidden_layers);
-        if (config.pack_dir) |dir| try @import("../../../sdk/quant/nvfp4/stream_bank.zig").load(weights, dir, "mtp-expert-manifest-nvfp4.json", "model.language_model.mtp.0.block");
-    }
+    // A streaming pack keeps the NextN layer past the trunk under the release's names.
+    if (config.isGlm5() and config.expert_bank) try renameGlmMtp(weights, "model.language_model", config.num_hidden_layers);
     if (config.isGlm5()) {
         try renameHyperConnections(weights);
         try splitKvB(weights, .{

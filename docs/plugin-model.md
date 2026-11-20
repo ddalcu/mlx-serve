@@ -57,7 +57,7 @@ A plugin is a table (`abi.ModelTable`) of C-ABI functions. The host calls them i
 | `claims(model_type, config_json, dir)` | discovery, no GPU | return `.no`, `.by_type` or `.by_marker` |
 | `parse(dir, config_json, settings_json, span, stub, out)` | discovery (`stub` true: `config.json` only) and load | fill `out.shell` and `out.caps`; keep your own config in `out.private`; refuse by name |
 | `free_parsed` | after | free `private` |
-| `bill(parsed, shape, out)` | admission | `load_bytes`, `kv_per_token` (zero = engine default arithmetic); `shape` has context, slots, KV bits |
+| `bill(parsed, shape, out)` | admission | `load_bytes`, `kv_per_token` (zero = engine default arithmetic); `shape` has context, slots, KV bits. A streamed model's decode room: `flags.decode_room` `.billed` opts in; the default `.by_name` keeps the host's rule (GLM-5 without a prompt bill, and Ling). `.billed` prices it with the KDA-hybrid trunk's decode bill (`glm5DecodeMemoryNeeded`), so only a model on that trunk (GLM-5, Ling) sets it: another streamed family (DeepSeek) must not |
 | `load(ctx, out_verdict)` | once | return your model pointer, or null with a refusal |
 | `forward(model, fwd, out)` | per step | write `out.logits` (and `out.hidden` when `fwd.want_hidden`) |
 | `unload` | end | free everything `load` made |
@@ -81,7 +81,8 @@ A plugin is a table (`abi.ModelTable`) of C-ABI functions. The host calls them i
 - **MLX** is the mlx-c API (`@import("mlx_c")`): ops like `mlx_fast_rms_norm`, `mlx_fast_rope`,
   `mlx_fast_scaled_dot_product_attention`, `mlx_matmul`. A plugin can write its layers on mlx-c, or call the
   server's own blocks through `kit.blocks`: norms, conv, ssm, schedulers, vae, dit pieces, embedding, and the
-  transformer blocks (linear, qmm, mlp, rope, attention, moe, hc, gdn; Metal only, no CUDA files). Blocks are
+  transformer blocks (linear, qmm, mlp, rope, attention, moe, hc, gdn, kda; Metal only, no CUDA files), and the
+  language-model bases' routed MLP and gated-delta layer and the KDA-hybrid base (`kit.bases`). Blocks are
   compiled into your dylib and take `kit.mlx` handles (`{ ctx }`, like mlx-c's: convert with `.{ .ctx = x.ctx }`).
   They are versioned with the kit and a newer kit may rename or change them: build against one kit and pin it.
   A block that does not apply returns null and the caller keeps its own ops (`_example`'s `addNorm`).

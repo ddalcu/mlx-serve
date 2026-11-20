@@ -3,6 +3,7 @@
 # gs 64 stored): warmup, a text turn and an image turn must all run with no MLX error.
 #
 # Usage: tests/test_gemma4_mixed_quant.sh [model_dir] [port]   (MLX_SERVE_BIN picks the binary)
+source "$(dirname "$0")/lib/server.sh"
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -15,7 +16,7 @@ HOUSE="tests/fixtures/house.jpeg"
 if [ ! -f "$MODEL/config.json" ]; then echo "SKIP: model not found at $MODEL"; exit 0; fi
 
 WORK=$(mktemp -d); LOG="$WORK/server.log"
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1
+srv_preclean "$PORT"
 "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG" 2>&1 &
 SRV=$!
 cleanup() { kill "$SRV" 2>/dev/null; rm -rf "$WORK"; }

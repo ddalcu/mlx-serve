@@ -143,33 +143,17 @@ pub fn aneGateHeadroom(config: *const model_mod.ModelConfig, chunk: u32) u64 {
 /// Both the auto-context sizer and the prefill admission guard bill through
 /// here. The sizer used to bill fp16 unconditionally, so a `--kv-quant 4`
 /// server reported — and served — under a third of the context it can hold.
-/// An expert-bank pack's slot rows per routed layer when the model sets none (mlx-stream's fill): the rows the GPU
-/// ceiling holds once the residents, the stream's transient rows, the KV of the model's context (else the standard
-/// 16K prompt and 1K generation), one prompt chunk's transients and the wired margin are billed; every expert at most,
-/// `num_experts_per_tok` at least.
-pub fn expertBankFillRows(config: *const model_mod.ModelConfig) u32 {
-    const dir = config.pack_dir orelse return config.num_experts;
-    const streamed = @import("../../../sdk/weights/streamed.zig").Streamed;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const a = std.heap.page_allocator;
-    const one = streamed.bankBytes(a, io, dir, 1) catch return config.num_experts;
-    const two = streamed.bankBytes(a, io, dir, 2) catch return config.num_experts;
-    const per_row = two - one;
-    const kv_bits = defaultKvBits(config);
-    const manual: u64 = http_server.manualContext(config);
-    const ctx: u64 = if (manual > 0) manual else 16_384 + 1_024;
-    const chunk: u64 = generate_mod.WIDE_PREFILL_CHUNK;
-    const reserve = @import("../runtime/preflight.zig").modelDiskBytes(io, dir) +| (one - per_row) +|
-        sessionBytesPerToken(config, kv_bits) *| ctx +| slotFixedKvBytes(config, kv_bits, chunk) +|
-        prefillTransientReserve(config, kv_bits, chunk) +| http_server.serverState().wired_limit_margin_bytes;
-    const rows = (http_server.staticGpuMemoryCeiling() -| reserve) / @max(per_row, 1);
-    return @intCast(std.math.clamp(rows, @max(config.num_experts_per_tok, 1), config.num_experts));
-}
-
 /// KV every live slot holds whatever its length: the QSA key ring and the sliding rings
 /// (`ModelConfig.slidingRing`), whose buffers hold keep + one prefill chunk of rows.
 pub fn slotFixedKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64) u64 {
-    const ring_rows: u64 = @as(u64, config.slidingKeepRows()) +| chunk;
+    return slotFixedKvBytesUpTo(config, kv_bits, chunk, std.math.maxInt(u64));
+}
+
+/// `slotFixedKvBytes` for a request whose rings never hold more than `rows`: its prompt and the generation it may add.
+/// Counts rows held, not the buffer planGrow allocates (KVCache.nextCapacity rounds up in 256-row steps);
+/// full-attention layers round the same way, and the flat runtime floor (KVCache.RESERVE_MIN_TOKENS) covers it.
+fn slotFixedKvBytesUpTo(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64, rows: u64) u64 {
+    const ring_rows: u64 = @min(@as(u64, config.slidingKeepRows()) +| chunk, rows);
     return config.qsaRingBytes() +| kvBytesPerTokenAtBits(config.slidingRowBytes(), kv_bits) *| ring_rows;
 }
 
@@ -427,13 +411,16 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     // Arch gate for the reservation and state terms (measured on qwen4_exp alone; the
     // reservation's allocator twin is gated too, so an ungated guard billed memory never reserved).
     const dq_min_rows: u64 = transformer_mod.prefillDqGemmMinRows(config.quant_bits);
+    // A request's chunk is never longer than its prompt.
+    const ring_reach = seq +| @min(max_tokens, transformer_mod.KVCache.RESERVE_GEN_HEADROOM);
+    const slot_fixed = slotFixedKvBytesUpTo(config, kv_bits, @min(chunk, seq), ring_reach);
     if (!config.longCtxGated()) {
         // A checked-out entry is the slot's own buffer on every arch; both terms are zero for a share.
         const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
         return .{
             .shared_resident_bytes = warm.creditedRows(seq) *| kv_per_tok,
             .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
-            .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, chunk),
+            .slot_fixed_kv_bytes = slot_fixed,
             .dq_min_rows = dq_min_rows,
         };
     }
@@ -455,7 +442,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk),
         .shared_resident_bytes = credited *| kv_per_tok,
         .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
-        .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, chunk) +| head_qsa_ring,
+        .slot_fixed_kv_bytes = slot_fixed +| head_qsa_ring,
         .mtp_head_kv_bytes = reserved *| head_per_tok,
         .dq_min_rows = dq_min_rows,
     };

@@ -142,7 +142,7 @@ echo "  model: $MODEL"
 echo "  --kv-quant 4, comparing dense vs fused attention path"
 echo
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 DENSE_COMPL=""

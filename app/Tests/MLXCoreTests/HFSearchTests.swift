@@ -740,7 +740,7 @@ final class HFModelQuantGateTests: XCTestCase {
             XCTAssertTrue(mlx(id: "TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP",
                               tags: ["mlx", "safetensors", type, "glm", "text-generation"]).isSupportedArchitecture)
         }
-        // GLM-5 (glm_moe_dsa) loads only from an mlx-stream pack, so the search does not offer it; GLM-4 MoE is not served.
+        // GLM-5 (glm_moe_dsa) and GLM-4 MoE are not served.
         XCTAssertFalse(mlx(id: "mlx-community/GLM-5-4bit", tags: ["mlx", "safetensors", "glm_moe_dsa", "glm"]).isSupportedArchitecture)
         XCTAssertFalse(mlx(id: "mlx-community/GLM-4.6-4bit", tags: ["mlx", "safetensors", "glm4_moe", "glm"]).isSupportedArchitecture)
     }
@@ -765,7 +765,7 @@ final class HFModelQuantGateTests: XCTestCase {
                            "bonsai", "text-generation", "conversational"])
         XCTAssertTrue(m.isSupportedArchitecture)
         XCTAssertNil(m.incompatibleReason)
-        for type in supportedModelTypes.subtracting(streamOnlyModelTypes) {
+        for type in supportedModelTypes {
             XCTAssertTrue(mlx(id: "org/x", tags: ["mlx", type]).isSupportedArchitecture,
                           "a repo tagged with served model_type \"\(type)\" reads as unsupported")
         }
@@ -1057,5 +1057,18 @@ final class SupportedModelTypeSyncTests: XCTestCase {
         let missing = types.filter { !supportedModelTypes.contains($0) }
         XCTAssertTrue(missing.isEmpty,
                       "served by Zig but missing from HFModels.swift supportedModelTypes: \(missing)")
+    }
+}
+
+/// Discover's dot reads what the GPU can give a model, by the Recommended pane's rule, never physical RAM.
+final class RAMFitnessTests: XCTestCase {
+    private let gib: Int64 = 1_073_741_824
+
+    func testTheDotReadsTheUsableBudgetNotPhysicalRam() {
+        let mac96 = SystemMemoryInfo(totalBytes: 96 * 1_073_741_824, usableBytes: 72 * 1_073_741_824)
+        XCTAssertEqual(RAMFitness.of(bytes: 78 * gib, memory: mac96), .wontFit)
+        XCTAssertEqual(RAMFitness.of(bytes: 70 * gib, memory: mac96), .tight)
+        XCTAssertEqual(RAMFitness.of(bytes: 42 * gib, memory: mac96), .fits)
+        XCTAssertEqual(RAMFitness.of(bytes: 0, memory: mac96), .unknown)
     }
 }

@@ -7,19 +7,41 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const glm5 = @import("glm5_next.zig");
-const slots_mod = @import("slots.zig");
-const trunk = @import("trunk.zig");
-const kda = @import("kda.zig");
+const slots_mod = @import("../../sdk/bases/kda_hybrid/slots.zig");
+const trunk = @import("../../sdk/bases/kda_hybrid/trunk.zig");
+const kda = @import("../../sdk/bases/kda_hybrid/kda.zig");
 const kda_recurrence = @import("../../sdk/blocks/kda/recurrence.zig");
 const spliceVisionRows = @import("../../sdk/vision/splice.zig").spliceVisionRows;
 const axisView = @import("../../mlx/array.zig").axisView;
 const concatAxis1 = @import("../../mlx/array.zig").concatAxis1;
-const glm_moe = @import("moe.zig");
+const glm_moe = @import("../../sdk/bases/kda_hybrid/moe.zig");
 
 const Array = mlx.mlx_array;
 const Slots = slots_mod.Slots;
 const Model = trunk.Model;
 const Layer = trunk.Layer;
+
+/// Per-head projection over `q` `[H, out, in]`: `x @ w^T` when `transpose`, else `x @ w`.
+fn headMm(m: *const Model, x: Array, q: *const trunk.Linear, transpose: bool) !Array {
+    const s = m.s;
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    if (q.s.ctx == null) {
+        if (transpose) {
+            var wt = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wt);
+            try mlx.check(mlx.mlx_swapaxes(&wt, q.w, -1, -2, s));
+            try mlx.check(mlx.mlx_matmul(&out, x, wt, s));
+        } else try mlx.check(mlx.mlx_matmul(&out, x, q.w, s));
+        return out;
+    }
+    if (transpose and q.mode == .affine) if (try glm5.headQmv(s, x, q.w, q.s, q.b, q.bits, q.group_size, 1.0)) |y| {
+        _ = mlx.mlx_array_free(out);
+        return y;
+    };
+    try mlx.check(mlx.mlx_quantized_matmul(&out, x, q.w, q.s, q.b, transpose, mlx.mlx_optional_int.some(@intCast(q.group_size)), mlx.mlx_optional_int.some(@intCast(q.bits)), q.mode.cstr(), s));
+    return out;
+}
 
 /// The rows a batched tick carries per trunk forward (the MoE decode kernels' row limit).
 pub const MOE_DECODE_BATCH_MAX = 8;
@@ -328,9 +350,9 @@ pub fn dsaAttn(m: *const Model, sl: Slots, slot: usize, x: Array, d: *const trun
         var kv_rows = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(kv_rows);
         try mlx.check(mlx.mlx_slice(&kv_rows, view.k, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ batch, 1, @as(c_int, @intCast(offset)) + dense_rows, r }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
-        const keys = try m.headMm(kv_rows, &d.embed_q, false);
+        const keys = try headMm(m, kv_rows, &d.embed_q, false);
         defer _ = mlx.mlx_array_free(keys);
-        const values = try m.headMm(kv_rows, &d.unembed, true);
+        const values = try headMm(m, kv_rows, &d.unembed, true);
         defer _ = mlx.mlx_array_free(values);
         var q_rows = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_rows);
@@ -352,7 +374,7 @@ pub fn dsaAttn(m: *const Model, sl: Slots, slot: usize, x: Array, d: *const trun
                     break :blk y;
                 };
             }
-            break :blk try m.headMm(qh_s, &d.embed_q, true);
+            break :blk try headMm(m, qh_s, &d.embed_q, true);
         };
         defer _ = mlx.mlx_array_free(q_abs);
         var o_lat = mlx.mlx_array_new();
@@ -409,7 +431,7 @@ pub fn dsaAttn(m: *const Model, sl: Slots, slot: usize, x: Array, d: *const trun
             _ = mlx.mlx_array_free(o_lat);
             o_lat = lat_out;
         }
-        parts[1] = try m.headMm(o_lat, &d.unembed, true);
+        parts[1] = try headMm(m, o_lat, &d.unembed, true);
     }
     var o = mlx.mlx_array_new(); // [B, H, S, hd]
     defer _ = mlx.mlx_array_free(o);

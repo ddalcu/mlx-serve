@@ -9,6 +9,7 @@ const sdk = @import("../../sdk/root.zig");
 const generation = @import("../../sdk/config/generation.zig");
 const quant_config = @import("../../sdk/config/quantization_config.zig");
 const llama = @import("../llama/config.zig");
+const sliding_ring = @import("../../sdk/config/sliding_ring.zig");
 
 const field = llama.field;
 const int = llama.int;
@@ -212,7 +213,8 @@ pub fn Parser(comptime kind: Kind) type {
                 c.tie_word_embeddings = v.bool;
             };
 
-            var p: abi.Parsed = .{ .caps = .{ .batches_decode = kind == .flint, .dflash_capture = true } };
+            var p: abi.Parsed = .{ .caps = .{ .batches_decode = kind == .flint, .dflash_capture = true, .experts_stream = c.num_experts > 0 } };
+            p.cache.sliding_ring = sliding_ring.rows(c.sliding_window);
             const s = &p.shell;
             s.* = .{
                 .vocab_size = c.vocab_size,

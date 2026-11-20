@@ -48,6 +48,14 @@ final class KoreanLocalizationTests: XCTestCase {
         }
     }
 
+    func testQuitCommandCopyResolves() throws {
+        let bundle = try XCTUnwrap(Bundle(url: resources.appendingPathComponent("ko.lproj")))
+        for key in ["Quit MLX-Serve", "Keep running when I press ⌘Q",
+                    "⌘Q closes the window and the server keeps running. Quit in the menu bar still stops both."] {
+            XCTAssertNotEqual(bundle.localizedString(forKey: key, value: nil, table: nil), key)
+        }
+    }
+
     func testKoreanPermissionDescriptionsResolve() throws {
         let bundle = try XCTUnwrap(Bundle(url: resources.appendingPathComponent("ko.lproj")))
         for key in ["NSAppleEventsUsageDescription", "NSLocalNetworkUsageDescription", "NSMicrophoneUsageDescription"] {

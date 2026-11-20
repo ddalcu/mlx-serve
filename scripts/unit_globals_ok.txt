@@ -106,3 +106,9 @@ sdk.spec.mtp.mtp.top32_partial_cached
 sdk.blocks.linear.verify_projection.verify_wide_configs
 # foreign quant layouts an outside plugin registers in its own dylib; a server unit holds an empty copy
 sdk.quant.foreign.registry
+
+# DeepSeek-V4.1's kernel caches and the Markov chain's weight check (each unit makes its own on first use)
+plugins.deepseek_v41.prompt.gate_gemm.kern
+plugins.deepseek_v41.deepseek_v41.hcf_k
+plugins.deepseek_v41.spec.markov.conf_seen
+plugins.deepseek_v41.spec.markov.conf_exact

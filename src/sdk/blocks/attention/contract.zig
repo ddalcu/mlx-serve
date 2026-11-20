@@ -4,8 +4,7 @@
 //! rounds it): msv_attn_p256 (causal, band, QSA mask, MiMo's 192/128 with sinks, and the carried-state chunk
 //! passes), the decode windows (row_attn and lane_attn: partial, tail, merge), the packed-KV kernels (dec, verify,
 //! the matmul2d page kernel) and the NAX prefill kernel (one pass, key-range passes, the int8 Q/K entry). Rows are
-//! KV heads. M1 and up but the tensor-unit kernels (M4 / M5, declared per launch). Known issue:
-//! msv_nax_attn_256_q8's scale inputs (`q8_scales_known`).
+//! KV heads. M1 and up but the tensor-unit kernels (M4 / M5, declared per launch).
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -272,17 +271,17 @@ const Q23 = 0x1p-23;
 /// A key a kernel block takes for one query row: its score in the kernel's units (log2 units under exp2), the
 /// score's error, whether a mask hides it (the score is then the kernel's mask value), the weight its exp carries
 /// into the sum (a joined chunk's sum; 1 for a key), its value row and that row's errors (a dequantized row).
-const Key = struct { s: f64, e: f64 = 0, on: bool = true, w: f64 = 1, v: []const f64, ve: ?[]const f64 = null };
+pub const Key = struct { s: f64, e: f64 = 0, on: bool = true, w: f64 = 1, v: []const f64, ve: ?[]const f64 = null };
 
 /// exp2 on log2-unit scores or exp; P's rounding before P·V (half: 2^-11 of it, 2^-25 at least); a block whose
 /// keys are all masked to -Inf leaves the max and sum as they were (lane_attn's rule).
-const Soft = struct { base2: bool = false, p_unit: f64 = 0, p_abs: f64 = 0, keep_empty: bool = false };
+pub const Soft = struct { base2: bool = false, p_unit: f64 = 0, p_abs: f64 = 0, keep_empty: bool = false };
 
 /// The state a row starts from: the kernel's starting max, or a carried / sink state (`l` > 0) whose max is `e` off.
-const Init = struct { m: f64, e: f64 = 0, l: f64 = 0, o: ?[]const f64 = null };
+pub const Init = struct { m: f64, e: f64 = 0, l: f64 = 0, o: ?[]const f64 = null };
 
 /// A row's max and sum after its blocks, with their errors (the unnormalized output and its errors land in o, eo).
-const Row = struct { m: f64, em: f64, l: f64, el: f64 };
+pub const Row = struct { m: f64, em: f64, l: f64, el: f64 };
 
 const inf = std.math.inf(f64);
 
@@ -295,7 +294,7 @@ fn expIn(base2: bool, x: f64) f64 {
 /// as Metal's does; a -Inf score weighs 0; no rescale while the max is still -Inf). Each output's error is bounded against the final max: per visible term
 /// its score's and the max's error, its exp, the rescales it passed (a fast exp: 3 ulps each, plus 2 per unit the
 /// max moved), P's rounding and the f32 sums; the carried term the same without a score.
-fn online(soft: Soft, init: Init, keys: []const Key, ends: []const usize, o: []f64, eo: []f64) Row {
+pub fn online(soft: Soft, init: Init, keys: []const Key, ends: []const usize, o: []f64, eo: []f64) Row {
     var m = init.m;
     var l = init.l;
     if (init.o) |c| @memcpy(o, c) else @memset(o, 0);
@@ -372,7 +371,7 @@ fn joinMax(m: []const f64, l: []const f64, o: []const f64, d: usize, out: []f64,
 }
 
 /// o / l as a kernel stores it (a reciprocal and a product, or a divide): values in o, errors in eo.
-fn normalize(r: Row, o: []f64, eo: []f64) void {
+pub fn normalize(r: Row, o: []f64, eo: []f64) void {
     for (o, eo) |*y, *e| {
         y.* /= r.l;
         e.* = (e.* + @abs(y.*) * r.el) / r.l + 2 * host.U * @abs(y.*);
@@ -389,12 +388,12 @@ fn granule(t: f64) f64 {
 }
 
 /// How gate 4 runs a kernel's sums (null: exact).
-const Sim = ?struct { acc: spec.Accum, order: spec.Order };
+pub const Sim = ?struct { acc: spec.Accum, order: spec.Order };
 
 /// q·k times `scale` in float64, with its error: k's own errors (`kerr`, a dequantized row), f32 sums `depth` deep
 /// over the products' magnitude (none when every product is an integer and the magnitude stays under 2^24, where any
 /// f32 order is exact), then `roundings` of the scaled value. Gate 4 runs the sum in its accumulator.
-fn dot(q: []const f64, k: []const f64, scale: f64, depth: usize, roundings: f64, sim: Sim, terms: []f64) host.Val {
+pub fn dot(q: []const f64, k: []const f64, scale: f64, depth: usize, roundings: f64, sim: Sim, terms: []f64) host.Val {
     return dotErr(q, k, null, scale, depth, roundings, sim, terms);
 }
 
@@ -1756,7 +1755,7 @@ const lane_registrations = .{
 
 // ── packed-KV attention (kv-quant 4 / 8): decode, verify widths, the matmul2d page kernel ──
 
-const QkvKind = enum { dec, verify, mpp };
+const QkvKind = enum { dec, mma, verify, mpp };
 
 /// One instantiation: the cache's bits and group, q/k head width, query heads per kv head; `mask` binds the
 /// additive mask row (decode only).
@@ -1788,6 +1787,18 @@ fn qkvLaunch(comptime kind: QkvKind, comptime tg: u32, comptime m: u32, comptime
             .inputs = &.{ "q", "kq", "ksc", "kbi", "vq", "vsc", "vbi", "scl", "tk", "msk" },
             .outputs = &.{ "m_out", "l_out", "o_out" },
             .source = kvq.QKV_DEC_KERNEL_SOURCE,
+            .contiguous = false,
+            .tg_bytes = tg,
+            .m1 = m,
+            .m2 = m,
+            .caps = caps,
+        },
+        .mma => .{
+            .name = "qkv_attn_dec_mma",
+            .inputs = &.{ "q", "kq", "ksc", "kbi", "vq", "vsc", "vbi", "scl", "tk", "msk" },
+            .outputs = &.{ "m_out", "l_out", "o_out" },
+            .source = kvq.QKV_DEC_MMA_KERNEL_SOURCE,
+            .header = "#include <metal_simdgroup_matrix>\n",
             .contiguous = false,
             .tg_bytes = tg,
             .m1 = m,
@@ -1872,6 +1883,10 @@ const Qkv = struct {
                 const b = qkvDecBlock(c.gqa, c.dk) orelse return null;
                 return .{ shape.rows * c.gqa, (tk + b - 1) / b };
             },
+            .mma => {
+                if (tq != 1 or !kvq.qkvDecMmaFits(cInt(c.gqa), cInt(c.dk), cInt(c.dk), cInt(c.gs))) return null;
+                return .{ shape.rows * c.gqa, @intCast(kvq.qkvDecMmaSplits(cInt(tk))) };
+            },
             .verify => {
                 if (tq < 2 or c.gqa * tq > QKV_NT) return null;
                 const b = qkvVerifyBlock(c.gqa * tq) orelse return null;
@@ -1887,6 +1902,11 @@ const Qkv = struct {
     fn block(self: *const Qkv, tq: usize) usize {
         return switch (self.cfg.kind) {
             .dec => qkvDecBlock(self.cfg.gqa, self.cfg.dk).?,
+            // A split is its 4 simdgroups' contiguous spans of whole 8-row tiles.
+            .mma => blk: {
+                const ns: usize = @intCast(kvq.qkvDecMmaSplits(cInt(self.shape.k)));
+                break :blk 4 * (((self.shape.k + ns * 4 - 1) / (ns * 4) + 7) / 8 * 8);
+            },
             .verify => qkvVerifyBlock(self.cfg.gqa * tq).?,
             .mpp => MPP_PAGE,
         };
@@ -1921,6 +1941,7 @@ const Qkv = struct {
                 g.int("BLOCK", self.block(1));
                 g.int("HAS_MASK", @intFromBool(c.mask));
             },
+            .mma => g.int("HAS_MASK", @intFromBool(c.mask)),
             .verify => {
                 g.int("TQ", shape.n);
                 g.int("BLOCK", self.block(shape.n));
@@ -2024,11 +2045,11 @@ const Qkv = struct {
         }
         self.args[7] = try rig.input(.float32, &.{1}, &.{self.scale});
         self.args[8] = try rig.input(.int32, &.{1}, &.{@floatFromInt(self.shape.k)});
-        if (c.kind == .dec) self.args[9] = if (c.mask) try rig.input(c.dt, &.{ 1, 1, 1, tk }, self.mask) else try rig.input(.float32, &.{1}, &.{0});
+        if (c.kind == .dec or c.kind == .mma) self.args[9] = if (c.mask) try rig.input(c.dt, &.{ 1, 1, 1, tk }, self.mask) else try rig.input(.float32, &.{1}, &.{0});
     }
 
     pub fn run(self: *Qkv) !void {
-        try self.rig.launch(self.launch, self.geometry(self.shape).?, self.args[0..if (self.cfg.kind == .dec) 10 else 9]);
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, self.args[0..if (self.cfg.kind == .dec or self.cfg.kind == .mma) 10 else 9]);
     }
 
     pub fn count(self: *const Qkv) usize {
@@ -2103,15 +2124,15 @@ const Qkv = struct {
             for (qs, qrow) |*x, y| x.* = host.rt(.float32, y * self.scale);
             const t0 = b * blk;
             var n: usize = 0;
-            for (t0..@min(t0 + blk, tk)) |pos| {
+            for (@min(t0, tk)..@min(t0 + blk, tk)) |pos| {
                 const v = kr(self.kv[1], self.cap, d, hk, pos);
                 const ve = kr(self.ke[1], self.cap, d, hk, pos);
                 // Decode stages q * scale in f32 and sums against it; verify sums q, then scales.
-                const x = if (c.kind == .dec)
+                const x = if (c.kind == .dec or c.kind == .mma)
                     dotErr(qs, kr(self.kv[0], self.cap, d, hk, pos), kr(self.ke[0], self.cap, d, hk, pos), 1, d, 0, sim, terms)
                 else
                     dotErr(qrow, kr(self.kv[0], self.cap, d, hk, pos), kr(self.ke[0], self.cap, d, hk, pos), self.scale, d, 1, sim, terms);
-                const madd = if (c.kind == .dec and c.mask) self.mask[pos] else 0;
+                const madd = if ((c.kind == .dec or c.kind == .mma) and c.mask) self.mask[pos] else 0;
                 const vis = if (c.kind == .verify) pos < tk - tq + 1 + t else madd != -inf;
                 keys[n] = if (vis) .{ .s = x.v + madd, .e = x.e + host.U * @abs(x.v + madd), .v = v, .ve = ve } else .{ .s = -inf, .on = false, .v = v };
                 n += 1;
@@ -2157,7 +2178,7 @@ const Qkv = struct {
             l = try g.reshape(try g.slice(try g.transpose(l, &.{ 0, 2, 1 }), &.{ 0, 0, 0 }, &.{ hkv, mr, ns }), &.{ hkv * mr, ns });
             o = try g.reshape(try g.slice(try g.transpose(o, &.{ 0, 2, 1, 3 }), &.{ 0, 0, 0, 0 }, &.{ hkv, mr, ns, d }), &.{ hkv * mr, ns, d });
         }
-        const out = try g.adopt(try kvq.qkvMergeArrays(st, m, l, o, c.dt));
+        const out = try g.adopt(if (c.kind == .mma) try kvq.qkvMergeFused(st, m, l, o, c.dt) else try kvq.qkvMergeArrays(st, m, l, o, c.dt));
         return self.rig.bytesOf(&.{try g.reshape(out, &.{ 1, hq, tq, d })});
     }
 
@@ -2166,9 +2187,11 @@ const Qkv = struct {
         const vw = self.view();
         kvq.qkv_ver_override = true;
         defer kvq.qkv_ver_override = null;
+        kvq.qkv_dec_mma_override = c.kind == .mma;
+        defer kvq.qkv_dec_mma_override = null;
         const st = self.rig.stream();
         const got = switch (c.kind) {
-            .dec => try kvq.qkvAttnDecodeKernel(st, self.args[0], &vw, @floatCast(self.scale), if (c.mask) "array" else "", if (c.mask) self.args[9] else .{ .ctx = null }),
+            .dec, .mma => try kvq.qkvAttnDecodeKernel(st, self.args[0], &vw, @floatCast(self.scale), if (c.mask) "array" else "", if (c.mask) self.args[9] else .{ .ctx = null }),
             .verify => try kvq.qkvAttnVerifyKernel(st, self.args[0], &vw, @floatCast(self.scale), "causal"),
             .mpp => blk: {
                 // The wrapper pads q itself: hand it the [1, Hq, TQ, D] rows.
@@ -2196,6 +2219,7 @@ fn putQkv(want: []f64, mag: ?[]f64, rows: usize, d: usize, at: usize, st: Row, o
 fn qkvTg(comptime c: QkvCfg, comptime tq: usize) u32 {
     return switch (c.kind) {
         .dec => c.gqa * c.dk * 4 + c.gqa * qkvDecBlock(c.gqa, c.dk).? * 4 + QKV_NT * 4 + 8 * c.gqa,
+        .mma => @intCast(kvq.qkvDecMmaTgBytes(cInt(c.gqa), cInt(c.dk), cInt(c.dk))),
         .verify => c.gqa * tq * qkvVerifyBlock(c.gqa * tq).? * 4 + QKV_NT * 4 + 8 * c.gqa * tq,
         // tile [32 * D] T, scores and probs [MPAD * 32] f32, rmax / rsum / pscale [MPAD] f32.
         .mpp => MPP_PAGE * c.dk * 2 + 2 * ((c.gqa * tq + 7) / 8 * 8) * MPP_PAGE * 4 + 3 * ((c.gqa * tq + 7) / 8 * 8) * 4,
@@ -2211,13 +2235,17 @@ fn qkvSpec(comptime name: []const u8, cfg: QkvCfg, served: []const Shape) spec.S
         .tiles = .{ .{}, .{}, .{ .size = if (cfg.kind == .mpp) MPP_PAGE else 128, .min = 16 } },
         .served = served,
         // Decode stages q x 1/sqrt(DK) in f32 before its sums: off a power of two (DK 128) no input makes them exact.
-        .sums = if (cfg.kind == .dec and cfg.dk == 128) .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "q is staged as q / sqrt(128) in f32, so no input makes its sums exact in f32" } else .{ .exact = false },
+        .sums = if ((cfg.kind == .dec or cfg.kind == .mma) and cfg.dk == 128) .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "q is staged as q / sqrt(128) in f32, so no input makes its sums exact in f32" } else .{ .exact = false },
     };
 }
 
 const qkv_dec_4_256 = QkvCfg{ .kind = .dec, .bits = 4, .dk = 256, .gqa = 6 };
 const qkv_dec_8_256 = QkvCfg{ .kind = .dec, .bits = 8, .dk = 256, .gqa = 6 };
 const qkv_dec_8_128m = QkvCfg{ .kind = .dec, .bits = 8, .dk = 128, .gqa = 4, .mask = true };
+const qkv_mma_4_256 = QkvCfg{ .kind = .mma, .bits = 4, .dk = 256, .gqa = 6 };
+const qkv_mma_8_256 = QkvCfg{ .kind = .mma, .bits = 8, .dk = 256, .gqa = 12 };
+const qkv_mma_4_128 = QkvCfg{ .kind = .mma, .bits = 4, .dk = 128, .gqa = 10 };
+const qkv_mma_8_128m = QkvCfg{ .kind = .mma, .bits = 8, .dk = 128, .gqa = 4, .mask = true };
 const qkv_ver_4_256 = QkvCfg{ .kind = .verify, .bits = 4, .dk = 256, .gqa = 6 };
 const qkv_ver_8_256 = QkvCfg{ .kind = .verify, .bits = 8, .dk = 256, .gqa = 6 };
 const qkv_ver_8_128 = QkvCfg{ .kind = .verify, .bits = 8, .dk = 128, .gqa = 4 };
@@ -2227,6 +2255,10 @@ const qkv_mpp_4 = QkvCfg{ .kind = .mpp, .bits = 4, .dk = 256, .gqa = 6 };
 const qkv_dec_4_256_l = qkvLaunch(.dec, qkvTg(qkv_dec_4_256, 1), 1024, &.{});
 const qkv_dec_8_256_l = qkvLaunch(.dec, qkvTg(qkv_dec_8_256, 1), 1024, &.{});
 const qkv_dec_8_128m_l = qkvLaunch(.dec, qkvTg(qkv_dec_8_128m, 1), 1024, &.{});
+const qkv_mma_4_256_l = qkvLaunch(.mma, qkvTg(qkv_mma_4_256, 1), QKV_NT, &.{});
+const qkv_mma_8_256_l = qkvLaunch(.mma, qkvTg(qkv_mma_8_256, 1), QKV_NT, &.{});
+const qkv_mma_4_128_l = qkvLaunch(.mma, qkvTg(qkv_mma_4_128, 1), QKV_NT, &.{});
+const qkv_mma_8_128m_l = qkvLaunch(.mma, qkvTg(qkv_mma_8_128m, 1), QKV_NT, &.{});
 const qkv_ver_4_256_l = qkvLaunch(.verify, qkvTg(qkv_ver_4_256, 2), 576, &.{});
 const qkv_ver_8_256_l = qkvLaunch(.verify, qkvTg(qkv_ver_8_256, 2), 640, &.{});
 const qkv_ver_128_l = qkvLaunch(.verify, qkvTg(qkv_ver_8_128, 3), 640, &.{.{ .n = 2, .m1 = 832, .m2 = 832 }});
@@ -2240,6 +2272,10 @@ const qkv_registrations = .{
     .{ "qkv_attn_dec bf16 (4-bit, DK 256, GQA 6)", qkv_dec_4_256, qk(&.{ .{ 1, 1, 300 }, .{ 2, 1, 1000 } }), &qkv_dec_4_256_l },
     .{ "qkv_attn_dec bf16 (8-bit, DK 256, GQA 6)", qkv_dec_8_256, qk(&.{ .{ 1, 1, 300 }, .{ 1, 1, 700 } }), &qkv_dec_8_256_l },
     .{ "qkv_attn_dec bf16 (8-bit, DK 128, GQA 4, mask row)", qkv_dec_8_128m, qk(&.{ .{ 1, 1, 300 }, .{ 2, 1, 600 } }), &qkv_dec_8_128m_l },
+    .{ "qkv_attn_dec_mma bf16 (4-bit, DK 256, GQA 6)", qkv_mma_4_256, qk(&.{ .{ 1, 1, 300 }, .{ 2, 1, 2100 } }), &qkv_mma_4_256_l },
+    .{ "qkv_attn_dec_mma bf16 (8-bit, DK 256, GQA 12)", qkv_mma_8_256, qk(&.{ .{ 1, 1, 300 }, .{ 2, 1, 1000 } }), &qkv_mma_8_256_l },
+    .{ "qkv_attn_dec_mma bf16 (4-bit, DK 128, GQA 10)", qkv_mma_4_128, qk(&.{ .{ 1, 1, 37 }, .{ 2, 1, 3000 } }), &qkv_mma_4_128_l },
+    .{ "qkv_attn_dec_mma bf16 (8-bit, DK 128, GQA 4, mask row)", qkv_mma_8_128m, qk(&.{ .{ 1, 1, 300 }, .{ 2, 1, 600 } }), &qkv_mma_8_128m_l },
     .{ "qkv_attn_verify bf16 (4-bit, DK 256, GQA 6)", qkv_ver_4_256, qk(&.{ .{ 1, 2, 300 }, .{ 1, 2, 900 } }), &qkv_ver_4_256_l },
     .{ "qkv_attn_verify bf16 (8-bit, DK 256, GQA 6)", qkv_ver_8_256, qk(&.{ .{ 1, 2, 300 }, .{ 1, 2, 700 } }), &qkv_ver_8_256_l },
     .{ "qkv_attn_verify bf16 (8-bit, DK 128, GQA 4)", qkv_ver_8_128, qk(&.{ .{ 1, 3, 300 }, .{ 1, 2, 500 } }), &qkv_ver_128_l },
@@ -2659,11 +2695,6 @@ const NaxAttn = struct {
     }
 };
 
-/// The int8 entry's two scale inputs share one template parameter, but MLX binds an input under 8 elements in the
-/// constant address space and a larger one in device: when one of the Q tile scales (B x H x tiles) and the K block
-/// scales (B x Hkv x blocks) is under 8 and the other is not, the instantiation does not compile.
-const q8_scales_known = spec.Known{ .gate = .shapes, .finding = "msv_nax_attn_256_q8 does not compile when exactly one of its scale inputs has under 8 elements (qs = H x q tiles, ks = Hkv x key blocks): MLX binds that one `constant`, the other `device`, and `attention_nax_bdv_qt` takes both as one ScalePtr. 8 q / 2 kv heads (Qwen3.5-2B) at a 64-token first prefill: qs 8, ks 4, MLX error; also 4 q / 1 kv heads (Gemma 3 1B) at 64..127 rows past 224 cached keys. Opt-in (--int8-qk), M5 only" };
-
 fn naxSpec(comptime name: []const u8, cfg: NaxCfg, served: []const Shape) spec.Spec {
     return .{
         .name = name,
@@ -2674,7 +2705,6 @@ fn naxSpec(comptime name: []const u8, cfg: NaxCfg, served: []const Shape) spec.S
         .tiles = .{ .{}, .{ .size = if (cfg.q8 or cfg.phase == .single) 64 else 32, .min = 9 }, .{ .size = NAX_BK, .min = 9 } },
         .served = served,
         .sums = .{ .exact = false },
-        .known = if (cfg.q8) q8_scales_known else null,
     };
 }
 

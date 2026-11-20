@@ -15,7 +15,6 @@ const reader = @import("../../sdk/bases/reader.zig");
 const EitherMlp = @import("../lfm2/plugin.zig").EitherMlp;
 const SinkAttention = @import("sink_attention.zig").SinkAttention;
 const mtp_head = @import("mtp_head.zig");
-const streamed = @import("../../sdk/weights/streamed.zig");
 const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
 pub const config = @import("config.zig");
 
@@ -68,17 +67,11 @@ fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
     out.* = .{};
 }
 
-/// A Sushi pack is held as its adapter leaves it (`SushiBill`); a streaming pack as its residents plus the stream's
-/// rows (`slotRows`); every other pack as stored.
-fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, settings_json: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
+/// A Sushi pack is held as its adapter leaves it (`SushiBill`); every other pack as stored.
+fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, _: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
     const c = config.of(p);
     out.* = shards;
     const io = std.Io.Threaded.global_single_threaded.io();
-    if (c.streamed) {
-        const bank = streamed.Streamed.bankBytes(gpa, io, model_dir.slice(), slotRows(c, settings_json.slice())) catch |e| return Verdict.named(.failed, @errorName(e));
-        out.* = shards +| bank;
-        return .ok;
-    }
     if (c.expert_block_json.len == 0) return .ok;
     out.* = sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir.slice(), SushiBill{ .layers = c.num_hidden_layers }) catch |e|
         return Verdict.named(.failed, @errorName(e));
@@ -108,15 +101,12 @@ pub const Loaded = struct {
     route_fn: compiled.Closure = .{ .ctx = null },
     /// The MTP heads, once `HeadHooks.load` found them.
     head: ?*mtp_head.Heads = null,
-    /// A streaming pack's routed experts (`experts.bin`).
-    experts: ?streamed.Streamed = null,
 
     fn release(m: *Loaded) void {
         if (m.head) |h| {
             h.deinit();
             gpa.destroy(h);
         }
-        if (m.experts) |*x| x.close();
         compiled.free(&m.route_fn);
         m.owned.deinit();
         gpa.free(m.layers);
@@ -142,21 +132,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     errdefer gpa.destroy(m);
     m.* = .{ .base = .{ .weights = undefined, .shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps), .a = gpa, .s = r.s } };
     errdefer m.release();
-    if (c.streamed) {
-        const rows = try gpa.alloc(u32, c.num_hidden_layers - c.first_k_dense);
-        defer gpa.free(rows);
-        @memset(rows, slotRows(c, ctx.settings_json.slice()));
-        m.experts = try streamed.Streamed.open(gpa, std.Io.Threaded.global_single_threaded.io(), ctx.model_dir.slice(), r.s, .{ .rows = rows });
-    }
     m.layers = try gpa.alloc(Model.Layer, c.num_hidden_layers);
     for (m.layers, 0..) |*L, i| L.* = try loadLayer(m, &r, if (xr) |*x| x else null, c, @intCast(i));
-    // A streamed layer's decode calls predict the next routed layer's experts with its router.
-    if (m.experts != null) for (m.layers[0 .. m.layers.len - 1], m.layers[1..]) |*L, *next| switch (L.mlp) {
-        .second => |*w| if (next.mlp == .second and next.mlp.second.router.s.ctx == null) {
-            w.streamed.?.next = .{ .router = next.mlp.second.router.w, .bias = next.mlp.second.route.sigmoid_bias.expert_bias };
-        },
-        .first => {},
-    };
 
     var nb: [256]u8 = undefined;
     const hidden = c.hidden_size;
@@ -257,10 +234,6 @@ fn mlpOf(m: *Loaded, r: *reader.Reader, xr: ?*reader.Reader, c: *const config.Co
             for ([_]@import("../../abi/quant.zig").Array{ w.w, w.scales, w.biases }) |a| try m.owned.own(.{ .ctx = a.ctx });
         }
         fb = .{ .table = x.fmt, .gate = fw[0], .up = fw[1], .down = fw[2] };
-    } else if (m.experts != null) {
-        // The bank's quant params only: each call's fetch names the slots.
-        if (c.quant.mode != .mxfp4) return error.MimoStreamedBankNotMxfp4;
-        banks = @splat(reader.bank(.{}, c.quant));
     } else for (&banks, [_][]const u8{ "gate_proj", "up_proj", "down_proj" }, [_]u32{ hidden, hidden, c.moe_intermediate }) |*bk, leaf, in_dim| {
         const l = try r.proj(try r.name(&nb, "layers.{d}.mlp.switch_mlp.{s}", .{ i, leaf }), in_dim);
         try m.owned.linear(l);
@@ -280,15 +253,9 @@ fn mlpOf(m: *Loaded, r: *reader.Reader, xr: ?*reader.Reader, c: *const config.Co
         .experts = @intCast(c.experts),
         .format_banks = fb,
     };
-    if (m.experts) |*x| w.streamed = .{ .routed = x.routedSource(), .layer = i };
     if (m.route_fn.ctx == null) m.route_fn = moe.compileRouting(&w, r.s);
     w.route_fn = m.route_fn;
     return .{ .second = w };
-}
-
-/// A streaming pack's slot rows per routed layer: the model's `stream_experts`, else every expert.
-fn slotRows(c: *const config.Config, settings_json: []const u8) u32 {
-    return if (streamed.Setting.parse(settings_json)) |st| st.slotRows(c.experts) else c.experts;
 }
 
 fn unload(mp: *anyopaque) callconv(.c) void {

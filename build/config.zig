@@ -142,6 +142,86 @@ fn verifyMlxStage(b: *std.Build) void {
         );
         std.process.exit(1);
     }
+    const stamp = buildRootHandle(b).readFileAlloc(b.graph.io, "lib/mlx/.version", b.allocator, .limited(256)) catch return;
+    b.dependOnFileContents(b.path("lib/mlx/.version"));
+    const patch_list = "scripts/build-mlx-patches.txt";
+    const inputs = [_]StageInput{
+        .{ .key = "mlx=", .path = "lib/mlx-src", .have = submoduleCommit(b, "lib/mlx-src") },
+        .{ .key = "mlxc=", .path = "lib/mlxc-src", .have = submoduleCommit(b, "lib/mlxc-src") },
+        .{ .key = "patch=", .path = patch_list, .have = patchesSha1(b.allocator, RootReader{ .b = b }, patch_list) },
+    };
+    if (staleStageInput(stamp, &inputs)) |s| {
+        std.debug.print(
+            "\n[mlx-serve] lib/mlx was staged for {s}{s} but {s} is at {s}. Run:\n  ./scripts/build-mlx.sh\n\n",
+            .{ s.input.key, s.staged, s.input.path, s.input.have.? },
+        );
+        std.process.exit(1);
+    }
+}
+
+/// A submodule's checked-out commit, short as scripts/build-mlx.sh stamps it, read without git: its `.git` file names
+/// the git dir, whose detached HEAD holds the commit. Null without a checkout or on a branch.
+fn submoduleCommit(b: *std.Build, dir: []const u8) ?[]const u8 {
+    const root = buildRootHandle(b);
+    const link = root.readFileAlloc(b.graph.io, b.pathJoin(&.{ dir, ".git" }), b.allocator, .limited(512)) catch return null;
+    const git_dir = std.mem.cutPrefix(u8, std.mem.trim(u8, link, " \t\r\n"), "gitdir: ") orelse return null;
+    const head_path = std.fs.path.resolveAlloc(b.allocator, &.{ dir, git_dir, "HEAD" }) catch return null;
+    const head = root.readFileAlloc(b.graph.io, head_path, b.allocator, .limited(256)) catch return null;
+    b.dependOnFileContents(if (std.fs.path.isAbsolute(head_path)) .{ .cwd_relative = head_path } else b.path(head_path));
+    const sha = std.mem.trim(u8, head, " \t\r\n");
+    if (sha.len < 12 or std.mem.startsWith(u8, sha, "ref:")) return null;
+    return sha[0..12];
+}
+
+/// The patches `list` names (`<submodule> <patch>` lines; blank and `#` lines skipped), concatenated in order, as SHA-1
+/// short as `cat <patches> | shasum | cut -c1-12` prints it. Null when the list or a patch cannot be read.
+fn patchesSha1(a: std.mem.Allocator, reader: anytype, list: []const u8) ?[]const u8 {
+    const text = reader.read(list) catch return null;
+    var sha1 = std.crypto.hash.Sha1.init(.{});
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeAny(u8, line, " \t\r");
+        const submodule = fields.next() orelse continue;
+        if (submodule[0] == '#') continue;
+        sha1.update(reader.read(fields.next() orelse return null) catch return null);
+    }
+    return a.dupe(u8, std.fmt.bytesToHex(sha1.finalResult(), .lower)[0..12]) catch @panic("OOM");
+}
+
+/// Reads a file under the build root and declares it a configure input.
+const RootReader = struct {
+    b: *std.Build,
+    fn read(self: RootReader, path: []const u8) ![]const u8 {
+        self.b.dependOnFileContents(self.b.path(path));
+        return buildRootHandle(self.b).readFileAlloc(self.b.graph.io, path, self.b.allocator, .limited(1 << 20));
+    }
+};
+
+/// The build's own tests of this file, on the host.
+pub fn addTests(b: *std.Build, step: *std.Build.Step) void {
+    const t = b.addTest(.{ .name = "build-config-test", .root_module = b.createModule(.{
+        .root_source_file = b.path("build/config.zig"),
+        .target = b.graph.host,
+    }) });
+    step.dependOn(&b.addRunArtifact(t).step);
+}
+
+/// One input scripts/build-mlx.sh stamps into lib/mlx/.version: its key, where it lives, and its value now (12 hex),
+/// null when this tree cannot tell (no submodule checkout), which leaves it unchecked.
+const StageInput = struct { key: []const u8, path: []const u8, have: ?[]const u8 };
+
+/// The first input whose value differs from the one `stamp` records, with the recorded value ("none" when absent).
+fn staleStageInput(stamp: []const u8, inputs: []const StageInput) ?struct { input: StageInput, staged: []const u8 } {
+    for (inputs) |in| {
+        const have = in.have orelse continue;
+        var staged: []const u8 = "none";
+        var it = std.mem.tokenizeAny(u8, stamp, " \t\r\n");
+        while (it.next()) |tok| {
+            if (std.mem.cutPrefix(u8, tok, in.key)) |v| staged = v;
+        }
+        if (!std.mem.eql(u8, staged, have)) return .{ .input = in, .staged = staged };
+    }
+    return null;
 }
 
 /// A Homebrew formula the macOS graph links: its name, the pkg-config file and header a copied prefix must hold, and
@@ -220,5 +300,47 @@ fn verifyBrewDeps(b: *std.Build) void {
             );
             std.process.exit(1);
         }
+    }
+}
+
+test "build config: a stage stamped for other pins names the first stale input; an input it cannot read is skipped" {
+    const stamp = "mlx=64ea011cb65f mlxc=56b2d39fc831 patch=613a4be4d66a target=26.2\n";
+    const mlxc: StageInput = .{ .key = "mlxc=", .path = "lib/mlxc-src", .have = "56b2d39fc831" };
+    const patch: StageInput = .{ .key = "patch=", .path = "patches/mlxc.patch", .have = "613a4be4d66a" };
+    const mlx_staged: StageInput = .{ .key = "mlx=", .path = "lib/mlx-src", .have = "64ea011cb65f" };
+    const mlx_bumped: StageInput = .{ .key = "mlx=", .path = "lib/mlx-src", .have = "c69303b00f5f" };
+    try std.testing.expectEqual(null, staleStageInput(stamp, &.{ mlx_staged, mlxc, patch }));
+    const stale = staleStageInput(stamp, &.{ mlxc, mlx_bumped, patch }).?;
+    try std.testing.expectEqualStrings("lib/mlx-src", stale.input.path);
+    try std.testing.expectEqualStrings("64ea011cb65f", stale.staged);
+    try std.testing.expectEqualStrings("none", staleStageInput("mlx=64ea011cb65f target=26.2", &.{patch}).?.staged);
+    try std.testing.expectEqual(null, staleStageInput(stamp, &.{.{ .key = "mlx=", .path = "lib/mlx-src", .have = null }}));
+}
+
+const MapReader = struct {
+    files: []const [2][]const u8,
+    fn read(self: MapReader, path: []const u8) ![]const u8 {
+        for (self.files) |f| if (std.mem.eql(u8, f[0], path)) return f[1];
+        return error.FileNotFound;
+    }
+};
+
+test "build config: patch= covers each patch the list names, hashed as `cat <patches> | shasum` prints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const list = "# <submodule> <patch>\nlib/mlx-src patches/a.patch\n\nlib/mlxc-src patches/b.patch\n";
+    const staged: MapReader = .{ .files = &.{ .{ "list", list }, .{ "patches/a.patch", "a\n" }, .{ "patches/b.patch", "b\n" } } };
+    try std.testing.expectEqualStrings("05dec960e24d", patchesSha1(a, staged, "list").?);
+    const stamp = "mlx=c69303b00f5f mlxc=56b2d39fc831 patch=05dec960e24d target=26.2";
+    const edited_a: MapReader = .{ .files = &.{ .{ "list", list }, .{ "patches/a.patch", "a2\n" }, .{ "patches/b.patch", "b\n" } } };
+    const edited_b: MapReader = .{ .files = &.{ .{ "list", list }, .{ "patches/a.patch", "a\n" }, .{ "patches/b.patch", "b2\n" } } };
+    const dropped_b: MapReader = .{ .files = &.{ .{ "list", "lib/mlx-src patches/a.patch\n" }, .{ "patches/a.patch", "a\n" } } };
+    // A list with no patch left is SHA-1 of nothing, as `cat /dev/null | shasum` prints.
+    const none: MapReader = .{ .files = &.{.{ "list", "# <submodule> <patch>\n" }} };
+    try std.testing.expectEqualStrings("da39a3ee5e6b", patchesSha1(a, none, "list").?);
+    for ([_]MapReader{ staged, edited_a, edited_b, dropped_b }, [_]bool{ false, true, true, true }) |r, stale| {
+        const in: StageInput = .{ .key = "patch=", .path = "list", .have = patchesSha1(a, r, "list") };
+        try std.testing.expectEqual(stale, staleStageInput(stamp, &.{in}) != null);
     }
 }

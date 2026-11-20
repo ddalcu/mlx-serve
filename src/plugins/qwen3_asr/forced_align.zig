@@ -43,12 +43,7 @@ pub fn freeUnits(a: std.mem.Allocator, us: []Unit) void {
 }
 
 /// The reference's `is_cjk_char`.
-fn isCjk(cp: u21) bool {
-    return switch (cp) {
-        0x4E00...0x9FFF, 0x3400...0x4DBF, 0x20000...0x2A6DF, 0x2A700...0x2B73F, 0x2B740...0x2B81F, 0x2B820...0x2CEAF, 0xF900...0xFAFF => true,
-        else => false,
-    };
-}
+const isCjk = tokenizer.isCjkExtended;
 
 /// Letters, numbers and the apostrophe (`is_kept_char`); the rest is dropped.
 fn isKept(cp: u21) bool {

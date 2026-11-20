@@ -41,7 +41,6 @@ pub const Api = struct {
     free_model_state: *const fn (*LoadedModel) void,
     unload_resident: *const fn (*LoadedModel) void,
     holds_pair: *const fn ([]const u8) bool,
-    set_foreign_bytes: *const fn (u64) void,
     hot_cache_bytes: *const fn (*const LoadedModel) u64,
     // ── GPU-thread jobs
     run_generation: *const fn (*Scheduler, *requests.GenRequest) Err,
@@ -115,6 +114,8 @@ pub const Facts = struct {
     /// The model batches decode at all (`configBatchesDecode`).
     batches_decode: bool = false,
     hot_cache_bytes: u64 = 0,
+    /// A `suppress_cjk` request is honored: the CJK mask is built and the generator's sampler draws.
+    suppress_cjk: bool = false,
 };
 
 /// Engine-wide settings `/props` reports.
@@ -140,9 +141,6 @@ pub const ModelProps = struct {
     mtp_loaded: bool = false,
     mtp_acceptance: mtp_acceptance.Mode = .exact,
     mtp_greedy_tail: bool = false,
-    /// The pack's own speculation lane (a stream pack), empty when none.
-    native_lane: []const u8 = "",
-    native_block: u32 = 0,
 };
 
 /// The launch flags that set the engine's own process-wide settings, applied once (`configure`) before a model loads.

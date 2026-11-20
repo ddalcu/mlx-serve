@@ -3,6 +3,7 @@
 # The echo-heavy prompt (repeat a snippet with one change) gives PLD long matches; zero matches still must agree.
 #
 #   PLD_TEST_MODEL=<dir> ./tests/test_pld_equivalence.sh [port]   # default gemma-4-e4b-it-8bit; SKIP without one
+source "$(dirname "$0")/lib/server.sh"
 
 set -e
 
@@ -166,7 +167,7 @@ echo "  prompt: <echo-heavy code rename>"
 echo
 
 # Pre-emptively kill any stale server on the test port.
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 OUT_NOPLD=$(run_request "without --pld" "--no-pld") || exit 1

@@ -39,11 +39,6 @@ private let supportedArchitectureTagPrefixes: [String] = [
 /// model_type values from config.json that the Zig server can load.
 /// MLX-format DeepSeek-V4 is intentionally NOT in this set — DSV4 is served
 /// by the embedded ds4 engine, which loads the GGUF checkpoint directly.
-/// Served model types the Hugging Face search does not offer: the server loads them only
-/// from an mlx-stream pack (the trunk beside an `experts.bin` bank), and an ordinary
-/// checkpoint with the same model_type does not load. A local pack still lists and picks.
-let streamOnlyModelTypes: Set<String> = ["glm_moe_dsa"]
-
 let supportedModelTypes: Set<String> = [
     "gemma3", "gemma3_text", "gemma4", "gemma4_text",
     "gemma4_unified", "gemma4_unified_text",
@@ -62,7 +57,6 @@ let supportedModelTypes: Set<String> = [
     "flint", // Recursive Flint (39.8B-A2.5B MoE coder)
     "mimo_v2", "mimo_v2_flash", // Xiaomi MiMo-V2.6-Flash (309B-A15B MoE, mlx-lm layout packs)
     "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA hybrid MoE, text + vision)
-    "glm_moe_dsa", // Z.ai GLM-5.3 (744B MoE): an mlx-stream pack (the trunk beside an experts.bin bank)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
     "muse_glimmer", "muse_glimmer_text", // meta-models Muse-Glimmer-30B (text + vision)
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
@@ -78,7 +72,7 @@ let supportedModelTypes: Set<String> = [
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so
     // neither should be flagged "unsupported architecture" in the model browser.
     "gguf", "deepseek_v4",
-    "deepseek_v41", // DeepSeek-V4.1-Flash: MLX packs (src/plugins/deepseek_v41/deepseek_v41.zig), the EXL3 repack on mlx-stream
+    "deepseek_v41", // DeepSeek-V4.1-Flash: MLX packs (src/plugins/deepseek_v41/deepseek_v41.zig), the EXL3 repack through the turboexl3_ds41 plugin
     "gpt_oss",
 ]
 
@@ -105,9 +99,23 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // `MediaModalityParityTests` reads every media plugin's `model_types` out of src/plugins/*/config.zig and
 // asserts this agrees; the server's own discovery and dispatch read those plugins.
 private let mediaModelTypeExactValues: Set<String> = [
-    "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya", "kev",
-    "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d", "idol",
+    "qwen3_tts", "dense", "AudioVideo", "acestep", "minimax_h3", "minimax_h3_image", "minimax_music3", "kokoro",
+    "mageflow", "laya", "kev", "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d",
+    "idol",
 ]
+
+/// `dense` is a generic `model_type`: the server's ming_tts claims it only beside `ditar_config` and
+/// `aggregator_config` (`src/plugins/ming_tts/config.zig`). A local config is judged on the same keys.
+let mediaTypeMarkers: [String: [String]] = ["dense": ["ditar_config", "aggregator_config"]]
+
+/// A Hub search row's config carries only `model_type` and `architectures`, so there the class the
+/// marker-claimed packs declare stands in for the markers.
+let mediaTypeHubArchitectures: [String: String] = ["dense": "BailingMMNativeForConditionalGeneration"]
+
+/// False when `config` declares a marker-claimed media type without its markers.
+func mediaMarkersHold(modelType: String, config: [String: Any]) -> Bool {
+    mediaTypeMarkers[modelType].map { $0.allSatisfy { config[$0] != nil } } ?? true
+}
 
 func isMediaModelType(_ modelType: String) -> Bool {
     if mediaModelTypeExactValues.contains(modelType) { return true }
@@ -169,10 +177,10 @@ enum MediaModality: CaseIterable {
     init?(modelType: String) {
         if modelType.hasPrefix("flux2") || modelType.hasPrefix("krea")
             || modelType.hasPrefix("mage_flow") || modelType == "mageflow"
-            || modelType.hasPrefix("qwen_image") || modelType == "moss_image" { self = .image; return }
+            || modelType.hasPrefix("qwen_image") || modelType == "moss_image" || modelType == "minimax_h3_image" { self = .image; return }
         if modelType.hasPrefix("hunyuan3d") || modelType == "trellis2" || modelType == "pixal3d" || modelType == "idol" { self = .mesh; return }
         switch modelType {
-        case "qwen3_tts", "kokoro": self = .voice
+        case "qwen3_tts", "kokoro", "dense": self = .voice
         case "acestep", "minimax_music3", "yue2": self = .music
         case "stable_audio3": self = .sound
         case "AudioVideo", "minimax_h3": self = .video
@@ -222,13 +230,14 @@ enum MediaModality: CaseIterable {
 struct HFConfigMeta: Codable {
     let modelType: String?
     var diffusers: DiffusersMeta? = nil
+    var architectures: [String]? = nil
     var diffusersClassName: String? { diffusers?.className }
 
     struct DiffusersMeta: Codable {
         let className: String?
         enum CodingKeys: String, CodingKey { case className = "_class_name" }
     }
-    enum CodingKeys: String, CodingKey { case modelType = "model_type", diffusers }
+    enum CodingKeys: String, CodingKey { case modelType = "model_type", diffusers, architectures }
 }
 
 /// Served media families recognizable from a diffusers repo's `_class_name`.
@@ -294,9 +303,12 @@ struct HFModel: Identifiable, Codable {
     /// nil = not a media repo we serve; Kokoro deliberately maps nowhere
     /// (voice-mode-only catalog rule — see `discoverableMediaModelType`).
     var mediaFamilyModelType: String? {
-        if let t = config?.modelType, discoverableMediaModelType(t) { return t }
+        if let t = config?.modelType, discoverableMediaModelType(t) {
+            guard let arch = mediaTypeHubArchitectures[t] else { return t }
+            return config?.architectures?.contains(arch) == true ? t : nil
+        }
         if let c = config?.diffusersClassName, let t = servedDiffusersClasses[c] { return t }
-        return (tags ?? []).first(where: discoverableMediaModelType)
+        return (tags ?? []).first { discoverableMediaModelType($0) && mediaTypeMarkers[$0] == nil }
     }
 
     var isServedMediaRepo: Bool { mediaFamilyModelType != nil }
@@ -332,7 +344,7 @@ struct HFModel: Identifiable, Codable {
         // HF tags every repo with its config.json model_type, so a served
         // model_type counts verbatim, no family prefix needed.
         return tags.contains { tag in
-            (supportedModelTypes.contains(tag) && !streamOnlyModelTypes.contains(tag))
+            supportedModelTypes.contains(tag)
                 || supportedArchitectureTagPrefixes.contains { tag.hasPrefix($0) }
         }
     }
@@ -636,6 +648,17 @@ enum HFSortField: String {
 
 enum RAMFitness {
     case fits, tight, wontFit, unknown
+
+    /// A Discover row's dot: a model needing `bytes` against what the GPU can give a model, by the Recommended
+    /// pane's rule (`SystemMemoryInfo.fit`).
+    static func of(bytes: Int64, memory: SystemMemoryInfo) -> RAMFitness {
+        guard bytes > 0 else { return .unknown }
+        switch memory.fit(neededGB: Double(bytes) / 1_073_741_824) {
+        case .comfortable: return .fits
+        case .tight: return .tight
+        case .exceeds: return .wontFit
+        }
+    }
 }
 
 func formatCount(_ n: Int) -> String {

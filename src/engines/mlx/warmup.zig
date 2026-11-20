@@ -11,8 +11,9 @@ const Transformer = @import("transformer.zig").Transformer;
 ///   2. [1, 8] prefill-shape: compiles short-prefill kernel
 /// then resets the cache so the first real request starts from clean state.
 /// Idempotent — calling twice is wasted work but not incorrect.
-pub fn warmup(self: *Transformer) !void {
-    if (self.mlx_stream_ext != null) return; // mlx-stream warms its own kernels at construction
+/// `verify_rows` is the widest block a speculative round verifies, 0 on a load that leaves the sweep to its idle
+/// warm-up or owes none (`warm_requests.owed`).
+pub fn warmup(self: *Transformer, verify_rows: u32) !void {
     const dummy_id: i32 = 0; // BOS-ish placeholder; the actual id doesn't matter for warmup
     const decode_shape = [_]c_int{ 1, 1 };
     const decode_input = mlx.mlx_array_new_data(&dummy_id, &decode_shape, 2, .int32);
@@ -57,4 +58,30 @@ pub fn warmup(self: *Transformer) !void {
         _ = mlx.mlx_clear_cache();
         try self.resetCache();
     }
+
+    for (0..verify_rows) |i| try sweepWidth(self, @intCast(i + 1));
+}
+
+/// One width of the verify sweep: a kernel sized by its row count compiles one variant a width, so `width` rows run
+/// once on a cache that already holds a prompt, as a round's does.
+pub fn sweepWidth(self: *Transformer, width: u32) !void {
+    const ids: [32]i32 = @splat(0);
+    for ([_]u32{ 8, @min(width, ids.len) }) |rows| {
+        const shape = [_]c_int{ 1, @intCast(rows) };
+        const input = mlx.mlx_array_new_data(&ids, &shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(input);
+        const logits = try self.forward(input);
+        defer _ = mlx.mlx_array_free(logits);
+        const eval_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(eval_vec);
+        _ = mlx.mlx_vector_array_append_value(eval_vec, logits);
+        for (self.cache.entries) |*entry| {
+            if (!entry.initialized) continue;
+            _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
+        }
+        _ = mlx.mlx_eval(eval_vec);
+    }
+    _ = mlx.mlx_clear_cache();
+    try self.resetCache();
 }

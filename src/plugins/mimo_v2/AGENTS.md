@@ -13,10 +13,6 @@ mlx-lm's layout (`tests/convert_mimo_v2.py`, mlx-community's mxfp4-q8 packs).
   `fixtures/*.tape` (`both.Both.replay`).
 - `mtp_head.zig` (+ `mtp_head_test.zig`): the MTP heads behind `SpecHooks.head`, bit-equal to the recorded legacy heads.
 - `fixtures.zig`: the served MiMo against `modeling_mimo_v2.py` (model-gated).
-- `streamed_test.zig`: the experts read from an `experts.bin` (the stream packs' MXFP4 bank) through the MoE block's
-  `Routed` hook (`moe.Moe.Weights.streamed`), bit-equal to the in-memory banks (served logits and the block alone,
-  evictions included); at the release's 4096 / 2048 the hook's decode MoE against fp32 truth. A streaming pack (fp8 residents, `experts.bin`) loaded through the table serves the same pack's
-  in-memory logits bit for bit.
 - `dec_attn.zig`: the split-K kernel's names (`sdk/blocks/attention/dec_attn.zig`) for gpt_oss.
 
 ## Facts the table declares
@@ -24,13 +20,8 @@ mlx-lm's layout (`tests/convert_mimo_v2.py`, mlx-community's mxfp4-q8 packs).
   `dflash_capture`, `moe`, thinking ON by default (the template thinks unless `enable_thinking: false`).
 - MTP: `mtp_heads` = `num_nextn_predict_layers` (at most 3), `in_checkpoint`, reading the final-normed hidden; the
   pack must ship exactly that many `model.mtp.layers.{k}` (read from the shards the index names for `model.mtp.*`).
-- Streaming packs (`expert_streaming`: mlx-stream's MXFP4 bank): the routed experts
-  come from `experts.bin` through `sdk/weights/streamed.zig` (`Moe.Weights.streamed`, the trunk's own MoE math), the
-  residents from the index (`fp8_block128` q/k/v and dense MLP: the shared Linear's e4m3 arm), the MTP heads from
-  `mtp-heads.safetensors`. The engine serves them here (`ModelConfig.expert_bank`): slot rows per routed layer are the
-  model's `stream_experts` setting, a quarter of the experts when it sets none; the load bills the residents and
-  those rows (`preflight.shardResidentBytes`).
-- Parse declines (`unsupported`): another `expert_streaming` bank or `residents_format`, `n_group` > 1, a layer span. The original release (a `quantization_config` with a `quant_method` and no `expert_quant`) FAILS by
+- Parse declines (`unsupported`): a streaming pack (`expert_streaming`, an `experts.bin` bank: a plugin can stream
+  it), a `residents_format` other than `fp8_block128`, `n_group` > 1, a layer span. The original release (a `quantization_config` with a `quant_method` and no `expert_quant`) FAILS by
   name: convert it with `tests/convert_mimo_v2.py`.
 - Sushi packs (`expert_quant`): the engine's loader adapts the shards (`sushi_pack.adapt`: the fused e4m3 QKV split
   into row-scaled e4m3 q/k/v, the dense MLP decoded to bf16); the routed experts load and run through the pack's
@@ -43,7 +34,7 @@ mlx-lm's layout (`tests/convert_mimo_v2.py`, mlx-community's mxfp4-q8 packs).
   `attention_sink_bias`); K 192 / V 128, RoPE on `int(192 * partial_rotary_factor)` = 64 channels, V scaled by
   `attention_value_scale` (in V's dtype) BEFORE caching; additive q/k/v/o biases, no q/k norm.
 - A full-buffer sliding layer caches every token it never reads: the sliding layers keep a RING of window + slack
-  rows (`CacheFacts.sliding_ring`), billed per slot, restored above the ring floor, never spilled.
+  rows (`CacheFacts.sliding_ring`), billed per slot, restored above the ring floor, spilled from the first whole chunk it holds.
 - Decode-attn-quant side copies are read at decode width AND on a speculative verify window up to `dec_attn.MAX_ROWS`
   (a verify scoring drafts on other weights than the serial steps would diverge); a prompt chunk prefills dense.
 - Global layers decode through the split-K kernel (`dec_attn`: a KV group's heads x positions are one MMA tile's
@@ -71,5 +62,5 @@ and `round.zig`/`round_finish.zig`'s `isMimo` rollback stay (the served shell's 
 
 ## Fixtures
 - `conformanceFixture`: a dense global and an MoE sliding layer with sinks, width 64, head 32 / V 16, f32. Proof
-  packs: 4-bit and bf16, four layers, both router and sink names, one MoE layer without a bias; a 2200-row ring case.
-  Oracles (model-gated): `tests/dump_mimo_v2_fixtures.py`, `MIMO_V2_MODEL` / `MIMO_V2_FIXTURE`.
+  packs: 4-bit and bf16, four layers, both router and sink names, one MoE layer without a bias; ring cases at 2200
+  rows and at head 256. Oracles (model-gated): `tests/dump_mimo_v2_fixtures.py`, `MIMO_V2_MODEL` / `MIMO_V2_FIXTURE`.

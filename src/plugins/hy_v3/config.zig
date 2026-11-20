@@ -85,7 +85,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
 
     // A tower the engine reads as its generic (SigLIP) one: its rows splice at the image token.
     const vision = json.field(root, "vision_config") != null;
-    var p: abi.Parsed = .{ .caps = .{ .moe = c.experts > 0, .dflash_capture = true, .images = vision } };
+    var p: abi.Parsed = .{ .caps = .{ .moe = c.experts > 0, .dflash_capture = true, .images = vision, .experts_stream = c.experts > 0 } };
     // The `mtp.*` head in `model-mtp.safetensors` (or the trunk's shards).
     p.spec = .{ .mtp_layout = .sidecar };
     const s = &p.shell;

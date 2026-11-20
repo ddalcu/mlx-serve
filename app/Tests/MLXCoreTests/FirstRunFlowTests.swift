@@ -147,7 +147,7 @@ final class FirstRunFlowTests: XCTestCase {
     func testEveryStarterTierHasItsOwnLeadSentence() {
         let GiB: UInt64 = 1_073_741_824
         for bytes: UInt64 in [8 * GiB, 16 * GiB, 32 * GiB, 128 * GiB] {
-            let pick = RecommendedModelPick.starterPick(physicalMemoryBytes: bytes)
+            let pick = RecommendedModelPick.starterPick(memory: SystemMemoryInfo(totalBytes: bytes, usableBytes: bytes / 4 * 3))
             let lead = RecommendedStarterCard.lead(for: pick)
             XCTAssertFalse(lead.hasPrefix("A local AI assistant"), "\(pick.id) fell through to the fallback lead")
             // Leads with WHAT it is, then the size — never the catalog's

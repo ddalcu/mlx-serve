@@ -6,26 +6,66 @@ import Foundation
 enum PluginCatalog {
     static let repoURL = "https://github.com/CommunityServe/plugins.git"
     static let ref = "main"
+
+    private static var repoWebURL: String { repoURL.replacingOccurrences(of: ".git", with: "") }
+
+    /// The plugin's own folder in the plugins repo.
+    static func folderURL(_ name: String) -> URL {
+        URL(string: repoWebURL + "/tree/\(ref)/plugins/" + name)!
+    }
+
+    private static var rawBase: String { "https://raw.githubusercontent.com/CommunityServe/plugins/\(ref)/" }
+
+    /// The catalog's own mark, beside its link.
+    static var logoURL: URL { URL(string: rawBase + "docs/assets/logo.png")! }
+
+    /// The icon, only as a `.png` directly inside the plugin's own folder: the catalog is untrusted input.
+    static func iconURL(_ entry: Entry) -> URL? {
+        let prefix = "plugins/\(entry.name)/"
+        guard entry.icon.hasPrefix(prefix), entry.icon.hasSuffix(".png") else { return nil }
+        let file = entry.icon.dropFirst(prefix.count)
+        guard !file.hasPrefix("."), file.allSatisfy({ $0.isLetter || $0.isNumber || "_.-".contains($0) }) else { return nil }
+        return URL(string: rawBase + entry.icon)
+    }
+
+    static func homepageURL(_ entry: Entry) -> URL? {
+        guard let url = URL(string: entry.homepage), url.scheme == "https", url.host != nil else { return nil }
+        return url
+    }
+
+    /// The fetched tree a user approves, on GitHub; nil for anything but a full hex commit.
+    static func commitURL(_ commit: String) -> URL? {
+        guard commit.count == 40, commit.allSatisfy(\.isHexDigit) else { return nil }
+        return URL(string: repoWebURL + "/tree/" + commit)
+    }
     static let catalogURL = URL(string: "https://raw.githubusercontent.com/CommunityServe/plugins/\(ref)/plugins.json")!
 
     struct Entry: Decodable, Equatable, Identifiable {
         var name: String
+        /// The name people read ("Project - Model"); "" shows `name`.
+        var title: String
         var kind: String
         var version: String
         var summary: String
         var models: [String]
         var requiresMlxServe: String
+        /// Repo-relative path of the plugin's PNG icon; "" draws its monogram.
+        var icon: String
+        /// The original project the plugin packages.
+        var homepage: String
 
         var id: String { name }
 
         private enum CodingKeys: String, CodingKey {
-            case name, kind, version, summary, models
+            case name, title, kind, version, summary, models, icon, homepage
             case requiresMlxServe = "requires_mlx_serve"
         }
 
-        init(name: String, kind: String, version: String, summary: String = "", models: [String] = [], requiresMlxServe: String = "") {
-            self.name = name; self.kind = kind; self.version = version
+        init(name: String, kind: String, version: String, summary: String = "", models: [String] = [], requiresMlxServe: String = "",
+             icon: String = "", homepage: String = "", title: String = "") {
+            self.name = name; self.title = title; self.kind = kind; self.version = version
             self.summary = summary; self.models = models; self.requiresMlxServe = requiresMlxServe
+            self.icon = icon; self.homepage = homepage
         }
 
         init(from decoder: Decoder) throws {
@@ -35,7 +75,10 @@ enum PluginCatalog {
                       version: try c.decodeIfPresent(String.self, forKey: .version) ?? "",
                       summary: try c.decodeIfPresent(String.self, forKey: .summary) ?? "",
                       models: try c.decodeIfPresent([String].self, forKey: .models) ?? [],
-                      requiresMlxServe: try c.decodeIfPresent(String.self, forKey: .requiresMlxServe) ?? "")
+                      requiresMlxServe: try c.decodeIfPresent(String.self, forKey: .requiresMlxServe) ?? "",
+                      icon: try c.decodeIfPresent(String.self, forKey: .icon) ?? "",
+                      homepage: try c.decodeIfPresent(String.self, forKey: .homepage) ?? "",
+                      title: (try c.decodeIfPresent(String.self, forKey: .title) ?? "").trimmingCharacters(in: .whitespaces))
         }
     }
 
@@ -108,6 +151,8 @@ enum PluginCatalog {
         var loaded: Bool
         var rebuild: Bool
         var why: String
+        /// The option values it set for the plugin when it started.
+        var options: [String: String] = [:]
     }
 
     /// The `plugins` array of a `/props` body by name; empty from a server too old to report it.
@@ -118,7 +163,7 @@ enum PluginCatalog {
         for row in rows {
             guard let name = row["name"] as? String else { continue }
             out[name] = ServerStatus(loaded: row["loaded"] as? Bool ?? false, rebuild: row["rebuild"] as? Bool ?? false,
-                                     why: row["why"] as? String ?? "")
+                                     why: row["why"] as? String ?? "", options: row["options"] as? [String: String] ?? [:])
         }
         return out
     }

@@ -4,13 +4,22 @@
 
 comptime {
     _ = @import("sdk/util/err_name.zig").last_tls;
-    if (@import("build_options").mlx_stream) _ = @import("mlx_stream").shared_state;
+    _ = @import("sdk/weights/streamed/expert.zig").expertState_shared;
     _ = @import("host/plugins/loader.zig").process;
+    _ = @import("sdk/quant/outside.zig").tables;
+    _ = @import("plugins/deepseek_v41/decode/engram_decode.zig").shared_state;
+    _ = @import("plugins/deepseek_v41/prompt/engram_direct.zig").shared_state;
+    _ = @import("plugins/deepseek_v41/prompt/flash_attn.zig").shared_state;
+    _ = @import("plugins/deepseek_v41/prompt/scratch.zig").shared_state;
+    _ = @import("plugins/deepseek_v41/prompt/scratch_attn.zig").shared_state;
+    _ = @import("plugins/deepseek_v41/prompt/scratch_x1.zig").shared_state;
+    _ = @import("plugins/deepseek_v41/prompt/transient_keep.zig").shared_state;
     _ = @import("host/plugin_host_impl.zig").process_shared;
     _ = @import("host/host_table.zig").published;
     _ = @import("host/http/server.zig").serverState_shared;
     _ = @import("host/http/server.zig").launch_shared;
     _ = @import("host/registry/memory_ceiling.zig").overrides_shared;
+    _ = @import("sdk/util/system.zig").return_lag_shared;
     _ = @import("host/registry/registry.zig").generations_shared;
     _ = @import("host/engines/refusal.zig").refused_tls;
     _ = @import("plugins/minimax_h3/cluster.zig").hooks_shared;
@@ -35,7 +44,6 @@ comptime {
     _ = @import("engines/mlx/cluster/distributed.zig").cluster_shared;
     _ = @import("engines/mlx/diag/profile.zig").profileState_shared;
     _ = @import("engines/mlx/ssm/group.zig").ssmGroup_shared;
-    _ = @import("engines/mlx/modules/stream_glue.zig").glueState_shared;
     _ = @import("mlx/ffi.zig").latch_shared;
     _ = @import("mlx/ffi.zig").fault_chunk;
     _ = @import("mlx/ffi.zig").fault_step;

@@ -5,7 +5,6 @@ const mlx = @import("../../mlx/ffi.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
 const metrics_mod = @import("../../host/metrics/metrics.zig");
 const log = @import("../../sdk/util/log.zig");
-const mlx_stream = @import("modules/stream.zig");
 const testing = std.testing;
 
 const publishHotCacheResidency = @import("cache/budget.zig").publishHotCacheResidency;
@@ -157,16 +156,27 @@ pub fn recordSlotCleanup(metrics: ?*metrics_mod.Metrics, slot: anytype) void {
     recordSlotEnd(m, slot, cleanupOutcome(slot));
 }
 
+/// `finishSlot`'s count. The slot leaves the in-flight aggregate before its tokens reach
+/// `generation_tokens_total`: a gauge sample taken before the tick-exit store would count them twice.
+/// Saturating, since `completion_tokens` can be ahead of the aggregate by this tick's tokens.
+fn recordSlotFinish(metrics: ?*metrics_mod.Metrics, inflight: *std.atomic.Value(u64), slot: anytype, outcome: metrics_mod.Outcome) void {
+    if (metrics == null or slot.metrics_recorded) return;
+    inflight.store(inflight.load(.monotonic) -| slot.completion_tokens, .monotonic);
+    recordSlotEnd(metrics, slot, outcome);
+}
+
 pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
     // finalize here instead.
     if (slot.legacy_gen) |*g| {
-        g.logSpecStats();
-        // `[qsa-arms]` rides the same seam: the SERVE path finalizes here, so
-        // wiring it only beside generate.zig's own logSpecStats() calls (the
-        // legacy/CLI path) makes it dead on every served request.
-        g.logQsaArms();
+        if (!slot.warm) {
+            g.logSpecStats();
+            // `[qsa-arms]` rides the same seam: the SERVE path finalizes here, so
+            // wiring it only beside generate.zig's own logSpecStats() calls (the
+            // legacy/CLI path) makes it dead on every served request.
+            g.logQsaArms();
+        }
         g.persistRoundCost();
         // The cache commit below snapshots the n-gram history: settle the pipelined step's owed advance first.
         g.xfm.flushDeferredPle(&g.ctx) catch g.xfm.discardDeferredPle(&g.ctx);
@@ -175,20 +185,20 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     if (latched) |name| {
         log.err("[scheduler] finish suppressed: the last forward failed ({s}) but produced a \"{s}\" — failing this request rather than answering 200 with what Metal never wrote\n", .{ name, reason });
     }
-    if (slot.completion_tokens <= 2) logShortGen(slot, reason);
+    if (slot.completion_tokens <= 2 and !slot.warm) logShortGen(slot, reason);
     commitSlotIfApplicable(sch, slot);
     releasePluginSlot(slot);
     publishHotCacheResidency(sch);
     // Restore by move: a slot that ended without committing still holds its checkout, and
     // the record now describes bytes that die with `slot.cache`. Above every early return.
-    if (slot.model.prefix_cache) |hc| hc.releaseCheckout(@intFromPtr(slot), reason);
+    if (slot.prefix_cache) |hc| hc.releaseCheckout(@intFromPtr(slot), reason);
     // SSD flush runs AFTER markFinished so the client never waits on the
     // chunk-append — but everything it needs must be captured BEFORE the
     // broadcast: the conn thread may complete()+free the slot immediately.
     // The prefix cache and stream live on the registry-owned LoadedModel,
     // which outlives the slot (unload also runs on this thread).
     const hc_opt: ?*prefix_cache_mod.HotPrefixCache =
-        if (slot.model.prefix_cache) |p| p else null;
+        if (slot.prefix_cache) |p| p else null;
     const stream_opt: ?mlx.mlx_stream =
         if (slot.model.transformer) |x| x.s else null;
     // Record per-request metrics while slot fields are still live (before
@@ -197,9 +207,7 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // a single per-request branch. real_ttft = first_token_ns (queue+prefill,
     // captured exactly at prefill completion); recordRequest derives
     // e2e = first_token_ns + decode_ns.
-    recordSlotEnd(sch.metrics, slot, finishOutcome(reason, latched));
-    // mlx-stream: the arch's request end (GLM-5.3's decode line), before the terminator.
-    if (slot.model.transformer) |x| if (x.mlx_stream_ext) |m| mlx_stream.end(m);
+    recordSlotFinish(sch.metrics, &sch.inflight_generated_tokens, slot, finishOutcome(reason, latched));
     publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {
         if (stream_opt) |s| {
@@ -373,6 +381,24 @@ test "outcome row 9: metrics off does no work and leaves the slot untouched" {
     recordSlotCleanup(null, &s);
     s.finish(null, "stop");
     try testing.expect(!s.metrics_recorded);
+}
+
+test "a finish moves its tokens from the in-flight aggregate to the counter, so live counts them once" {
+    var m = metrics_mod.Metrics.init();
+    // The last tick exit published this slot's 10 tokens beside another slot's 5.
+    var inflight = std.atomic.Value(u64).init(15);
+    var s = OutcomeStub{};
+    recordSlotFinish(&m, &inflight, &s, .success);
+    try testing.expectEqual(@as(u64, 15), metrics_mod.liveGenerationTokens(&m, inflight.load(.monotonic)));
+
+    var ahead = OutcomeStub{};
+    ahead.completion_tokens = 7;
+    recordSlotFinish(&m, &inflight, &ahead, .success);
+    try testing.expectEqual(@as(u64, 0), inflight.load(.monotonic));
+
+    inflight.store(3, .monotonic);
+    recordSlotFinish(&m, &inflight, &s, .success);
+    try testing.expectEqual(@as(u64, 3), inflight.load(.monotonic));
 }
 
 test "[short-gen] carries both token counts, the ids and what they decode to" {

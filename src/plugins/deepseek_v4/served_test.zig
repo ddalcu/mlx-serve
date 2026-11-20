@@ -302,6 +302,7 @@ const Requests = struct {
         h.sch.decoding = .empty;
         h.sch.pending = .empty;
         h.sch.cleanup_queue = .empty;
+        h.sch.offloaded = .empty;
         h.sch.vision_queue = .empty;
         h.sch.embed_queue = .empty;
         h.sch.max_concurrent = 4;
@@ -352,6 +353,8 @@ const Requests = struct {
         hc.disk = try @import("../../engines/mlx/load.zig").initPrefixDisk(testing.allocator, h.sch.io, path, "module-requests", 0, 512, prefix_cache.ModuleBinding.init(&p.xfm).?, path);
         hc.disk.?.armTestSpace(1 << 40, 2 << 40);
         hc.armDiskTier(&p.cfg);
+        // These tests exercise the write path, not the wait before it.
+        hc.module_quiet_ms = 0;
         try testing.expect(!hc.ssd_first);
         try testing.expect(hc.disk.?.writer != null);
     }
@@ -759,6 +762,65 @@ test "deepseek_v41 served: cancel, pad-only, failed forward and mismatched snaps
     try testing.expectEqual(@as(u64, 0), driver.stateBytes(&p.xfm));
 }
 
+test "deepseek_v41 served: a prefill cancelled past the commit floor is committed where it stopped, and the same prompt resumes there" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    var prompt: [900]u32 = undefined;
+    for (&prompt, 0..) |*id, i| id.* = @intCast((i * 7 + 3) % 90 + 2);
+    p.cfg.pinned_prefill_chunk = 128;
+    // The client leaves after `leave_at` rows: the scheduler sees it at the next chunk.
+    const Leave = struct {
+        var original: *const fn (*anyopaque, *const abi.Forward, *abi.ForwardOut) callconv(.c) abi.Verdict = undefined;
+        var slot: ?*RequestSlot = null;
+        var rows: usize = 0;
+        var leave_at: usize = 0;
+        fn forward(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            const v = original(m, f, out);
+            const s = slot orelse return v;
+            rows += f.rows;
+            if (rows >= leave_at) s.cancelled.store(true, .release);
+            return v;
+        }
+    };
+    const bound = p.xfm.plugin.?;
+    const old = bound.table;
+    defer bound.table = old;
+    var table = old.*;
+    Leave.original = old.forward;
+    table.forward = &Leave.forward;
+    bound.table = &table;
+    // Two abandoned tries in a row: the second resumes where the first stopped and moves the committed point on.
+    var stop: usize = 0;
+    for ([_]usize{ prefix_cache.MIN_CANCELLED_COMMIT_TOKENS, 128 }) |leave_at| {
+        const abandoned = try h.newSlot(&prompt);
+        Leave.leave_at = leave_at;
+        Leave.rows = 0;
+        Leave.slot = abandoned;
+        const outcome = @import("../../engines/mlx/step.zig").prefillAdmitted(&h.sch, abandoned);
+        Leave.slot = null;
+        try testing.expectEqual(.finished, outcome);
+        try testing.expectEqual(@as(u32, @intCast(stop)), abandoned.cached_tokens);
+        stop += Leave.rows;
+        try testing.expect(Leave.rows >= leave_at and stop < prompt.len - 1);
+        abandoned.deinit();
+        try testing.expectEqual(@as(u64, 0), driver.stateBytes(&p.xfm));
+        const hit = h.entry.prefix_cache.?.findModuleMatch(prefix_cache.ModuleBinding.init(&p.xfm).?, &prompt, false, &.{}, null, KVQuantConfig.dense).?;
+        try testing.expectEqual(stop, hit.n);
+    }
+    bound.table = old;
+
+    // The retry prefills only what the abandoned request had not forwarded.
+    const s = try h.prefill(&prompt);
+    defer s.deinit();
+    try testing.expectEqual(@as(u32, @intCast(stop)), s.cached_tokens);
+    finish_request.releasePluginSlot(s);
+}
+
 test "deepseek_v41 served: restored state is discarded once when only cold prefill fits" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -872,7 +934,8 @@ test "deepseek_v41 served: an excluded instance keeps legacy resume through requ
     const p = try Served.open(&P.table, try fixture.v41Files(arena.allocator(), 7), "");
     defer p.close();
     const m: *P.Model = @ptrCast(@alignCast(p.xfm.plugin.?.model));
-    m.cfg.dsv41_streamed = true;
+    m.bank_streams = true;
+    defer m.bank_streams = false;
     try testing.expect(!prefix_cache.HotPrefixCache.shouldUseInstance(&p.cfg, true, &p.xfm));
     const h = try Requests.open(p);
     defer h.close();
@@ -994,7 +1057,36 @@ test "deepseek_v41 served: DSpark rounds (greedy, then seeded sampling) equal th
     defer arena.deinit();
     const files = try fixture.v41DsparkFiles(arena.allocator(), 7);
     try expectDspark(@import("../deepseek_v41/plugin.zig"), files, .{ .temperature = 0 }, 4, @embedFile("../deepseek_v41/fixtures/dspark-greedy.tape"));
-    try expectDspark(@import("../deepseek_v41/plugin.zig"), files, .{ .temperature = 0.8, .top_p = 0.95, .seed = 0xd5 }, 4, @embedFile("../deepseek_v41/fixtures/dspark-sampled.tape"));
+    try expectDspark(@import("../deepseek_v41/plugin.zig"), files, .{ .temperature = 0.8, .top_p = 0.95, .seed = 4 }, 4, @embedFile("../deepseek_v41/fixtures/dspark-sampled.tape"));
+}
+
+test "deepseek_v41 served: a pack that quantized its DSpark heads drafts from them dequantized" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const dsv41 = @import("../deepseek_v41/deepseek_v41.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ds = env.override(.MLX_SERVE_DSV4_DSPARK, "1");
+    defer ds.restore();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41DsparkQuantHeadFiles(arena.allocator(), 7), "");
+    defer p.close();
+    const a = testing.allocator;
+    const m = intree.dsv41(&p.xfm).?;
+    // hidden 128, vocab 96, rank 64: the weights' own shapes, not their packed words'.
+    const heads = m.dspark.?;
+    try testing.expectEqualSlices(c_int, &.{ 1, 128 + 64 }, mlx.getShape(heads.conf));
+    try testing.expectEqualSlices(c_int, &.{ 96, 64 }, mlx.getShape(heads.markov_embed));
+    try testing.expectEqualSlices(c_int, &.{ 96, 64 }, mlx.getShape(heads.markov_head));
+    var g = ops.Graph.init(a, mlx.gpuStream());
+    defer g.deinit();
+    var st = try dsv41.initState(m, a);
+    defer st.deinit();
+    _ = try g.adopt(try dsv41.extend(m, a, &st, &.{ 3, 17, 42, 9, 7, 25, 1, 60, 11, 2, 90 }, .last));
+    var d = try dsv41.dsparkDraft(m, a, &st, 5);
+    defer d.deinit(a);
+    try testing.expectEqual(@as(usize, 4), d.ids.len);
+    try testing.expectEqual(@as(u32, 5), d.ids[0]);
+    for (d.ids) |id| try testing.expect(id < 96);
 }
 
 /// The largest gap between two `[rows, V]` logit sets, against the reference's largest magnitude.

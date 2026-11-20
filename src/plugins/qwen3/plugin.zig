@@ -12,6 +12,7 @@ const bases = @import("../../sdk/bases/bases.zig");
 const run_mod = @import("../../sdk/bases/run.zig");
 const compiled = @import("../../sdk/bases/blocks/compiled.zig");
 const moe_affine4 = @import("../../sdk/blocks/moe/moe_affine4.zig");
+const streamed = @import("../../sdk/weights/streamed.zig");
 const QuantParams = @import("../../sdk/quant/params.zig").QuantParams;
 const QuantMode = @import("../../sdk/quant/params.zig").QuantMode;
 const ld = @import("load.zig");
@@ -90,8 +91,11 @@ pub const Loaded = struct {
         moe: struct { base: bases.Model(Moe), layers: []Moe.Layer, routes: []compiled.Closure, angles: b.qk_rope.AngleCache = .{} },
     },
     owned: ld.Owned = .{},
+    /// The routed experts streamed from the pack (the `stream_experts` setting).
+    experts: ?streamed.Streamed = null,
 
     fn release(m: *Loaded) void {
+        if (m.experts) |*x| x.close();
         switch (m.body) {
             .dense => |*d| {
                 gpa.free(d.layers);
@@ -141,6 +145,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     if (c.moe) {
         m.body = .{ .moe = .{ .base = .{ .weights = undefined, .shared = shared, .a = gpa, .s = s, .placeholders = ctx.parsed.placeholder_ids }, .layers = &.{}, .routes = &.{} } };
         errdefer m.release();
+        m.experts = try streamed.Streamed.forLoad(gpa, ctx, c.num_experts, s);
         try loadMoe(m, &r, c, s);
     } else {
         m.body = .{ .dense = .{ .base = .{ .weights = undefined, .shared = shared, .a = gpa, .s = s, .placeholders = ctx.parsed.placeholder_ids }, .layers = &.{} } };
@@ -304,11 +309,12 @@ fn loadMoe(m: *Loaded, r: *ld.Reader, c: *const config.Config, s: mlx.mlx_stream
                 .gate = bankOf(gate, c.quant),
                 .up = bankOf(up, c.quant),
                 .down = bankOf(down, c.quant),
-                .bank_views = try bankViews(&m.owned, gate, up, down, s),
+                .bank_views = if (m.experts == null) try bankViews(&m.owned, gate, up, down, s) else null,
                 .top_k = @intCast(c.num_experts_per_tok),
                 .experts = @intCast(c.num_experts),
             },
         };
+        if (m.experts) |*x| try b.moe.bindStreamed(&L.mlp, x, try r.name(&nb, "layers.{d}.mlp", .{i}));
         // The engine compiles the routing chain only where a GPU runs it.
         if (!mlx.noGpuBackend() and mlx.streamIsGpu(s)) {
             e.routes[i] = b.moe.compileRouting(&L.mlp, s);
@@ -336,6 +342,11 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
 
 /// The tiny pack the conformance suite runs: two layers, width 64, seeded random f32 weights.
 pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
+    return fixtureOf(a, 0);
+}
+
+/// `conformanceFixture`, or with `experts` > 0 its qwen3_moe twin (top 2 of `experts` at width 64).
+fn fixtureOf(a: std.mem.Allocator, experts: u64) !sdk.fixture.Fixture {
     const v = 64;
     const h = 64;
     const inter = 128;
@@ -373,16 +384,28 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
         try put(a, &tensors, &seed, try L.n(a, i, "self_attn.k_proj.weight"), &.{ kv_heads * hd, h }, 0.1);
         try put(a, &tensors, &seed, try L.n(a, i, "self_attn.v_proj.weight"), &.{ kv_heads * hd, h }, 0.1);
         try put(a, &tensors, &seed, try L.n(a, i, "self_attn.o_proj.weight"), &.{ h, heads * hd }, 0.1);
+        if (experts > 0) {
+            try put(a, &tensors, &seed, try L.n(a, i, "mlp.gate.weight"), &.{ experts, h }, 0.1);
+            try put(a, &tensors, &seed, try L.n(a, i, "mlp.switch_mlp.gate_proj.weight"), &.{ experts, 64, h }, 0.1);
+            try put(a, &tensors, &seed, try L.n(a, i, "mlp.switch_mlp.up_proj.weight"), &.{ experts, 64, h }, 0.1);
+            try put(a, &tensors, &seed, try L.n(a, i, "mlp.switch_mlp.down_proj.weight"), &.{ experts, h, 64 }, 0.1);
+            continue;
+        }
         try put(a, &tensors, &seed, try L.n(a, i, "mlp.gate_proj.weight"), &.{ inter, h }, 0.1);
         try put(a, &tensors, &seed, try L.n(a, i, "mlp.up_proj.weight"), &.{ inter, h }, 0.1);
         try put(a, &tensors, &seed, try L.n(a, i, "mlp.down_proj.weight"), &.{ h, inter }, 0.1);
     }
     return .{ .files = try a.dupe(sdk.fixture.File, &.{
-        .{ .name = "config.json", .bytes =
-        \\{"model_type":"qwen3","hidden_size":64,"intermediate_size":128,"num_hidden_layers":2,"num_attention_heads":2,
-        \\ "num_key_value_heads":1,"head_dim":32,"vocab_size":64,"rms_norm_eps":1e-6,"rope_theta":1000000.0,
-        \\ "max_position_embeddings":4096,"hidden_act":"silu","eos_token_id":2}
-        },
+        .{ .name = "config.json", .bytes = if (experts == 0)
+            \\{"model_type":"qwen3","hidden_size":64,"intermediate_size":128,"num_hidden_layers":2,"num_attention_heads":2,
+            \\ "num_key_value_heads":1,"head_dim":32,"vocab_size":64,"rms_norm_eps":1e-6,"rope_theta":1000000.0,
+            \\ "max_position_embeddings":4096,"hidden_act":"silu","eos_token_id":2}
+        else try std.fmt.allocPrint(a,
+            \\{{"model_type":"qwen3_moe","hidden_size":64,"intermediate_size":128,"num_hidden_layers":2,"num_attention_heads":2,
+            \\ "num_key_value_heads":1,"head_dim":32,"vocab_size":64,"rms_norm_eps":1e-6,"rope_theta":1000000.0,
+            \\ "max_position_embeddings":4096,"hidden_act":"silu","eos_token_id":2,"num_experts":{d},"num_experts_per_tok":2,
+            \\ "moe_intermediate_size":64,"decoder_sparse_step":1,"mlp_only_layers":[],"norm_topk_prob":true}}
+        , .{experts}) },
         .{ .name = "model.safetensors", .bytes = try sdk.fixture.safetensors(a, tensors.items) },
     }) };
 }
@@ -391,4 +414,10 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 test {
     _ = config;
+}
+
+test "qwen3 plugin: a qwen3_moe pack streams its experts with the logits of the same experts in memory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try @import("../../sdk/testing/conformance.zig").expectStreamedExperts(std.testing.io, arena.allocator(), plugin.name, &table, try fixtureOf(arena.allocator(), 4));
 }

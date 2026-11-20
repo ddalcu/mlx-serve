@@ -63,7 +63,11 @@ enum CustomMediaModels {
     /// rule (`ref_audio` there is a named 400), and ACE-Step advertises
     /// "audio" too but answers the music endpoint.
     private static func audioFamily(arch: String) -> AudioModelPreset? {
-        arch == "qwen3_tts" ? .qwen3TTS06B8bit : nil
+        switch arch {
+        case "qwen3_tts": return .qwen3TTS06B8bit
+        case "dense": return .mingTTS8bit
+        default: return nil
+        }
     }
 
     private static func musicFamily(arch: String) -> MusicModelPreset? {

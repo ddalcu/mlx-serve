@@ -6,6 +6,8 @@ const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const mrope = @import("../../sdk/vision/mrope.zig");
 const exl3 = @import("../../sdk/quant/exl3/format.zig");
+const outside_quant = @import("../../sdk/quant/outside.zig");
+const outside_model = @import("../../sdk/quant/outside_model.zig");
 const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
 const KVQuantConfig = @import("../../engines/mlx/cache/kv_quant.zig").KVQuantConfig;
 const model_mod = @import("../../sdk/config/model.zig");
@@ -26,6 +28,7 @@ const init = @import("../../engines/mlx/load/init.zig").init;
 const initMoeLayers = @import("../../engines/mlx/load/layers_layered.zig").initMoeLayers;
 const weightTriple = @import("../../engines/mlx/load/weights.zig").weightTriple;
 const SSMCacheEntry = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
+const ssmEntryBytes = @import("../../engines/mlx/ssm/entry.zig").ssmEntryBytes;
 const SSMCacheEntrySnapshot = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntrySnapshot;
 const ssmFreeSpecCapture = @import("../../engines/mlx/ssm/entry.zig").ssmFreeSpecCapture;
 const ssmRestore = @import("../../engines/mlx/ssm/entry.zig").ssmRestore;
@@ -142,14 +145,16 @@ pub const Qwen4Mtp = struct {
     }
 };
 
+/// The prefix the pack's MTP head sits under; null when it ships none.
+pub fn headPrefix(weights: *const Weights) ?[]const u8 {
+    if (weights.get("language_model.mtp.fc_hidden.weight") != null) return "language_model.mtp";
+    if (weights.get("mtp.fc_hidden.weight") != null) return "mtp";
+    return null;
+}
+
 /// Load the qwen4_exp MTP head when the pack ships `mtp.*` (null otherwise).
 pub fn loadQwen4Mtp(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !?Qwen4Mtp {
-    const mtp_prefix = if (weights.get("language_model.mtp.fc_hidden.weight") != null)
-        "language_model.mtp"
-    else if (weights.get("mtp.fc_hidden.weight") != null)
-        "mtp"
-    else
-        return null;
+    const mtp_prefix = headPrefix(weights) orelse return null;
     var mcfg = config;
     // The head's experts stay whole on a tensor-parallel rank 0 (`distributed.headOnly`).
     if (mcfg.dist_shard) |sh| {
@@ -229,6 +234,12 @@ pub const Qwen4MtpState = struct {
         self.seq_offset = m.stash_len;
         self.pos_base = m.origin;
         self.cache.step = m.cache_step;
+    }
+
+    /// GPU bytes this request's head half holds (KV rows + recurrent entry):
+    /// request-private, billed by neither the hot cache nor the module.
+    pub fn residentBytes(self: *const Qwen4MtpState) u64 {
+        return self.cache.residentBytes() + ssmEntryBytes(&self.entry);
     }
 
     pub fn deinit(self: *Qwen4MtpState) void {
@@ -1012,7 +1023,7 @@ pub fn qwen4BuildDraftRerank(self: *Trunk) bool {
     const io = std.Io.Threaded.global_single_threaded.io();
     const t0 = std.Io.Timestamp.now(io, .awake);
     // The ONE env read: the built head carries its width from here on.
-    const rc = mtp_mod.buildRerankCoarse(self.s, self, mtp_mod.DRAFT_HEAD_BITS) orelse return false;
+    const rc = (if (self.outsideLinear(self.lm_head_w)) |ext| outsideRerank(self, ext) else mtp_mod.buildRerankCoarse(self.s, self, mtp_mod.DRAFT_HEAD_BITS)) orelse return false;
     m.rerank = rc;
     const bytes = mtp_mod.rerankCoarseBytes(rc.rows, @intCast(self.config.hidden_size), rc.bits);
     const ms: u64 = @intCast(@divTrunc(t0.untilNow(io, .awake).nanoseconds, std.time.ns_per_ms));
@@ -1021,6 +1032,18 @@ pub fn qwen4BuildDraftRerank(self: *Trunk) bool {
         .{ rc.bits, bytes / (1024 * 1024), ms },
     );
     return true;
+}
+
+/// The coarse head over an outside quant plugin's lm_head, which stores no rows MLX reads: the rows its matmul computes
+/// over the identity (`outside_model.denseRows`) in one call of `hidden` rows, as a prefill chunk reaches the head,
+/// requantized once and dropped. Null keeps the full readout.
+fn outsideRerank(self: *Trunk, ext: *const outside_quant.Weight) ?mtp_mod.RerankCoarse {
+    const rows = outside_model.denseRows(ext, self.config.hidden_size, self.actDtype(), self.config.hidden_size, self.s) catch |err| {
+        log.warn("[qwen4] MTP draft rerank: the outside head's rows failed ({s}) - keeping the full readout\n", .{@errorName(err)});
+        return null;
+    };
+    defer _ = mlx.mlx_array_free(rows);
+    return mtp_mod.buildRerankCoarseRows(self.s, rows, mtp_mod.DRAFT_HEAD_BITS);
 }
 
 /// Is the qwen4_exp head's draft rerank available? A pure read once the
@@ -1098,6 +1121,7 @@ test "qwen4 MTP head: two explicit states with different origins and stash lengt
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
     xfm.qwen4_mtp_owner = null;
@@ -1153,6 +1177,7 @@ test "qwen4 MTP head: two requests keep their own state through activate/release
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
     xfm.qwen4_mtp_owner = null;
@@ -1737,6 +1762,7 @@ test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied histor
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -1809,6 +1835,7 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -1911,6 +1938,7 @@ test "qwen4 MTP head: a clamp whose retained ring is shorter than the kept lefto
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -1997,6 +2025,7 @@ test "qwen4 MTP head: a clamp whose retained ring is shorter than the kept lefto
 test "qwen4MtpResetOwned: a non-MTP request leaves the head untouched" {
     const t = std.testing;
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
     const head_cache = try KVCache.init(t.allocator, 1);
@@ -2124,6 +2153,7 @@ test "qwen4 MTP head: last-row and no-logits projections match the full block (Q
 test "qwen4 MTP head KV: the head cache is rebuilt under the scheme it is handed" {
     const t = std.testing;
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.config = .{};
     xfm.config.num_hidden_layers = 4;
     xfm.config.head_dim = 64;
@@ -2361,6 +2391,7 @@ test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" 
     defer ssmSnapshotDeinit(&aux);
 
     var xfm: Trunk = undefined;
+    xfm.outside = null;
 
     xfm.allocator = allocator;
     xfm.s = mlx.mlx_default_cpu_stream_new();
@@ -2394,6 +2425,7 @@ test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" 
 
 test "single-stream verify feature selection excludes prefill and ordinary decoding" {
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     const old_features = verify_projection.single_verify_test_features;
     defer verify_projection.single_verify_test_features = old_features;
     verify_projection.single_verify_test_features = @splat(true);

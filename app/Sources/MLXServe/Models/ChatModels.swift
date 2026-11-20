@@ -621,7 +621,7 @@ struct ModelInfo {
         switch engineName {
         case "ane": return "ANE"
         case "sushi": return "Sushi"
-        case "mlx-stream": return "Stream"
+        case "plugin": return "Plugin"
         default: break
         }
         switch engine {
@@ -1084,9 +1084,14 @@ struct LocalModel: Identifiable, Hashable {
     var defect: ModelDefect? = nil
     /// The destination of a live transfer: listed, never picked.
     var isDownloading: Bool = false
+    /// Its config declares a marker-claimed media type (`mediaTypeMarkers`) without the markers.
+    var lacksMediaMarkers: Bool = false
+
+    /// The type the media tables classify: empty for a pack that lacks its type's markers.
+    var mediaModelType: String { lacksMediaMarkers ? "" : modelType }
 
     var isSupportedArchitecture: Bool {
-        supportedModelTypes.contains(modelType) || isMediaModelType(modelType)
+        supportedModelTypes.contains(modelType) || isMediaModelType(mediaModelType)
             || OutsidePlugins.served.chat.contains(modelType) || OutsidePlugins.served.media.contains(modelType)
     }
 

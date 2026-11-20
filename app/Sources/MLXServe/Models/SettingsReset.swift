@@ -54,6 +54,7 @@ enum SettingsReset {
                 f("enableMetrics") { $0.enableMetrics = $1.enableMetrics },
                 f("apiKey") { $0.apiKey = $1.apiKey },
                 f("toolAutocorrect") { $0.toolAutocorrect = $1.toolAutocorrect },
+                f("quitKeepsRunning") { $0.quitKeepsRunning = $1.quitKeepsRunning },
             ]
 
         case .lanSharing:

@@ -12,6 +12,7 @@ const model_mod = @import("../../sdk/weights/load.zig");
 const sse = @import("../../sdk/media/progress.zig");
 const lora_mod = @import("../../sdk/weights/lora.zig");
 const w8a8 = @import("../../sdk/blocks/dit/w8a8.zig");
+const mixed_linear = @import("../../sdk/blocks/dit/mixed_linear.zig");
 const int8_attn = @import("../../sdk/blocks/dit/int8_attn.zig");
 const qwen3 = @import("../../sdk/blocks/text_encoders/qwen3.zig");
 const rope_blk = @import("../../sdk/blocks/dit/rope.zig");
@@ -56,34 +57,12 @@ fn fmtKey(a: std.mem.Allocator, comptime f: []const u8, args: anytype) ![]u8 {
     return std.fmt.allocPrint(a, f, args);
 }
 
-// ── Quantized Linear (affine; bits/group inferred per weight) ──
+// ── Linear: affine (bits/group inferred per weight, so one loader serves the 3/4/6/8-bit builds) or dense bf16 ──
 
-/// Infer (bits, group_size) of an affine-quantized weight from its packed
-/// geometry. `w` packs `in` logical columns into u32s (w_cols = in·bits/32)
-/// and scales have s_cols = in/gs, so w_cols·32/s_cols = bits·gs. The product
-/// alone is ambiguous ((3,64) vs (6,32)…), so group sizes are tried in
-/// convention order: mflux and mlx-community conversions use 64 (the mlx
-/// default); 32 and 128 are fallbacks. Lets ONE loader serve the 3/4/6/8-bit
-/// klein builds (the 3-bit one is what fits 8 GB iPhones).
-const QuantGeometry = struct { bits: u32, group_size: u32 };
-
-fn inferQuantGeometry(w_cols: usize, s_cols: usize) QuantGeometry {
-    const fallback: QuantGeometry = .{ .bits = 4, .group_size = 64 };
-    if (s_cols == 0 or (w_cols * 32) % s_cols != 0) return fallback;
-    const product = w_cols * 32 / s_cols; // bits · group_size
-    const valid_bits = [_]u32{ 2, 3, 4, 5, 6, 8 };
-    for ([_]u32{ 64, 32, 128 }) |gs| {
-        if (product % gs != 0) continue;
-        const bits: u32 = @intCast(product / gs);
-        for (valid_bits) |vb| {
-            if (bits == vb) return .{ .bits = bits, .group_size = gs };
-        }
-    }
-    return fallback;
-}
+const inferQuantGeometry = mixed_linear.inferQuantGeometry;
 
 /// Geometry of a loaded (weight, scales) pair → inferred quant params.
-fn inferQuantGeometryOf(w: mlx.mlx_array, scales: mlx.mlx_array) QuantGeometry {
+fn inferQuantGeometryOf(w: mlx.mlx_array, scales: mlx.mlx_array) mixed_linear.QuantGeometry {
     const wsh = mlx.getShape(w);
     const ssh = mlx.getShape(scales);
     if (wsh.len == 0 or ssh.len == 0) return .{ .bits = 4, .group_size = 64 };
@@ -92,74 +71,8 @@ fn inferQuantGeometryOf(w: mlx.mlx_array, scales: mlx.mlx_array) QuantGeometry {
     return inferQuantGeometry(w_cols, s_cols);
 }
 
-const QLinear = struct {
-    w: mlx.mlx_array,
-    scales: mlx.mlx_array,
-    biases: mlx.mlx_array, // quant zero-points (NOT additive bias)
-    add_bias: ?mlx.mlx_array = null, // optional additive bias (VAE attn)
-    bits: u32 = 4,
-    group_size: u32 = 64,
-    // Runtime adapters (non-owning; the plugin's lora.Stack owns the arrays).
-    // Fixed-capacity so attach/forward never allocate.
-    lora_refs: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined,
-    lora_count: u8 = 0,
-    /// The int8 copy that REPLACES `w`/`scales`/`biases` (`--w8a8`), built by `toW8a8`.
-    w8: ?w8a8.Weight = null,
-
-    fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8) !QLinear {
-        const wk = try fmtKey(a, "{s}.weight", .{prefix});
-        defer a.free(wk);
-        const sk = try fmtKey(a, "{s}.scales", .{prefix});
-        defer a.free(sk);
-        const bk = try fmtKey(a, "{s}.biases", .{prefix});
-        defer a.free(bk);
-        const ak = try fmtKey(a, "{s}.bias", .{prefix});
-        defer a.free(ak);
-        var ql: QLinear = .{
-            .w = try ownWeight(w, wk),
-            .scales = try ownWeight(w, sk),
-            .biases = try ownWeight(w, bk),
-            .add_bias = ownOpt(w, ak),
-        };
-        const geo = inferQuantGeometryOf(ql.w, ql.scales);
-        ql.bits = geo.bits;
-        ql.group_size = geo.group_size;
-        return ql;
-    }
-    fn deinit(self: *QLinear) void {
-        if (self.w8) |*q| q.deinit();
-        _ = mlx.mlx_array_free(self.w);
-        _ = mlx.mlx_array_free(self.scales);
-        _ = mlx.mlx_array_free(self.biases);
-        if (self.add_bias) |b| _ = mlx.mlx_array_free(b);
-    }
-    pub fn forward(self: *const QLinear, parent: *Graph, x: Array) !Array {
-        var g = parent.scope();
-        defer g.deinit();
-        var o = if (self.w8) |*q|
-            try g.adopt(try w8a8.forward(try g.astype(x, .bfloat16), q, g.s))
-        else
-            try g.qmm(x, self.w, self.scales, self.biases, @intCast(self.group_size), @intCast(self.bits));
-        if (self.add_bias) |b| o = try g.add(o, b);
-        if (self.lora_count > 0) o = try g.add(o, try g.adopt(try lora_mod.deltaSum(x, self.lora_refs[0..self.lora_count], g.s)));
-        return parent.keep(o);
-    }
-
-    /// Replace the packed weights with their int8 copy when the route takes this shape.
-    fn toW8a8(self: *QLinear, s: S) !void {
-        self.w8 = try w8a8.takeLinear(&self.w, &self.scales, &self.biases, self.bits, self.group_size, s);
-    }
-
-    /// Install the stacked adapter Refs for this linear (from `Stack.findAll`).
-    fn setLoraRefs(self: *QLinear, refs: []const lora_mod.Ref) void {
-        self.lora_count = @intCast(refs.len);
-        @memcpy(self.lora_refs[0..refs.len], refs);
-    }
-
-    fn clearLoraRefs(self: *QLinear) void {
-        self.lora_count = 0;
-    }
-};
+/// A projection as the pack stores it: an affine triple, or a dense weight in the bf16 build.
+const QLinear = mixed_linear.MixedLinear(false);
 
 /// Dequantize a quantized embedding/weight table → bf16 [rows, cols].
 fn dequantTable(w_q: mlx.mlx_array, scales: mlx.mlx_array, biases: mlx.mlx_array, bits: u32, gs: u32, s: S) !mlx.mlx_array {
@@ -275,21 +188,19 @@ fn rowsOf(w: *const Weights, key: []const u8) u32 {
     return @intCast(sh[0]);
 }
 
-/// Logical (pre-packing) input width of an affine-quantized linear: the packed
-/// u32 columns carry `in·bits/32` of them, and the bit width is itself inferred
-/// from the scales' geometry.
+/// Input width of a linear. An affine one packs it: the u32 columns carry `in·bits/32`, and the bit width is itself
+/// inferred from the scales' geometry.
 fn logicalInDim(w: *const Weights, a: std.mem.Allocator, prefix: []const u8) u32 {
     const wk = fmtKey(a, "{s}.weight", .{prefix}) catch return 0;
     defer a.free(wk);
     const sk = fmtKey(a, "{s}.scales", .{prefix}) catch return 0;
     defer a.free(sk);
     const wa = w.get(wk) orelse return 0;
-    const sa = w.get(sk) orelse return 0;
     const wsh = mlx.getShape(wa);
     if (wsh.len == 0) return 0;
-    const geo = inferQuantGeometryOf(wa, sa);
-    if (geo.bits == 0) return 0;
     const w_cols: u32 = @intCast(wsh[wsh.len - 1]);
+    const geo = inferQuantGeometryOf(wa, w.get(sk) orelse return w_cols);
+    if (geo.bits == 0) return 0;
     return w_cols * 32 / geo.bits;
 }
 
@@ -415,15 +326,19 @@ pub fn loadTextEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir
     te.allocator = allocator;
     te.s = s;
 
-    // dequantize embed table once
+    // The embed table is gathered dense: an affine one is dequantized once, a bf16 build's is taken as stored.
     const ew = try ownWeight(&w, "embed_tokens.weight");
     defer _ = mlx.mlx_array_free(ew);
-    const es = try ownWeight(&w, "embed_tokens.scales");
-    defer _ = mlx.mlx_array_free(es);
-    const eb = try ownWeight(&w, "embed_tokens.biases");
-    defer _ = mlx.mlx_array_free(eb);
-    const embed_geo = inferQuantGeometryOf(ew, es);
-    te.embed_table = try dequantTable(ew, es, eb, embed_geo.bits, embed_geo.group_size, s);
+    if (ownOpt(&w, "embed_tokens.scales")) |es| {
+        defer _ = mlx.mlx_array_free(es);
+        const eb = try ownWeight(&w, "embed_tokens.biases");
+        defer _ = mlx.mlx_array_free(eb);
+        const embed_geo = inferQuantGeometryOf(ew, es);
+        te.embed_table = try dequantTable(ew, es, eb, embed_geo.bits, embed_geo.group_size, s);
+    } else {
+        te.embed_table = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&te.embed_table, ew, .bfloat16, s));
+    }
     te.norm = try ownWeight(&w, "norm.weight");
 
     te.layers = try allocator.alloc(TeLayer, te.cfg.te_layers);
@@ -453,15 +368,15 @@ pub fn loadTextEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir
         layer.* = .{
             .input_ln = try ownWeight(&w, p_in),
             .post_ln = try ownWeight(&w, p_post),
-            .q = try QLinear.load(&w, allocator, qp),
-            .k = try QLinear.load(&w, allocator, kp),
-            .v = try QLinear.load(&w, allocator, vp),
-            .o = try QLinear.load(&w, allocator, op),
+            .q = try QLinear.load(&w, allocator, qp, 0, s),
+            .k = try QLinear.load(&w, allocator, kp, 0, s),
+            .v = try QLinear.load(&w, allocator, vp, 0, s),
+            .o = try QLinear.load(&w, allocator, op, 0, s),
             .q_norm = try ownWeight(&w, qn),
             .k_norm = try ownWeight(&w, kn),
-            .gate = try QLinear.load(&w, allocator, gp),
-            .up = try QLinear.load(&w, allocator, upp),
-            .down = try QLinear.load(&w, allocator, dp),
+            .gate = try QLinear.load(&w, allocator, gp, 0, s),
+            .up = try QLinear.load(&w, allocator, upp, 0, s),
+            .down = try QLinear.load(&w, allocator, dp, 0, s),
         };
     }
     return te;
@@ -773,20 +688,20 @@ pub fn loadDit(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
     });
     d.allocator = allocator;
     d.s = s;
-    d.x_embedder = try QLinear.load(&w, allocator, "x_embedder");
-    d.context_embedder = try QLinear.load(&w, allocator, "context_embedder");
-    d.t_lin1 = try QLinear.load(&w, allocator, "time_guidance_embed.linear_1");
-    d.t_lin2 = try QLinear.load(&w, allocator, "time_guidance_embed.linear_2");
-    d.mod_img = try QLinear.load(&w, allocator, "double_stream_modulation_img.linear");
-    d.mod_txt = try QLinear.load(&w, allocator, "double_stream_modulation_txt.linear");
-    d.mod_single = try QLinear.load(&w, allocator, "single_stream_modulation.linear");
-    d.norm_out_lin = try QLinear.load(&w, allocator, "norm_out.linear");
-    d.proj_out = try QLinear.load(&w, allocator, "proj_out");
+    d.x_embedder = try QLinear.load(&w, allocator, "x_embedder", 0, s);
+    d.context_embedder = try QLinear.load(&w, allocator, "context_embedder", 0, s);
+    d.t_lin1 = try QLinear.load(&w, allocator, "time_guidance_embed.linear_1", 0, s);
+    d.t_lin2 = try QLinear.load(&w, allocator, "time_guidance_embed.linear_2", 0, s);
+    d.mod_img = try QLinear.load(&w, allocator, "double_stream_modulation_img.linear", 0, s);
+    d.mod_txt = try QLinear.load(&w, allocator, "double_stream_modulation_txt.linear", 0, s);
+    d.mod_single = try QLinear.load(&w, allocator, "single_stream_modulation.linear", 0, s);
+    d.norm_out_lin = try QLinear.load(&w, allocator, "norm_out.linear", 0, s);
+    d.proj_out = try QLinear.load(&w, allocator, "proj_out", 0, s);
     d.doubles = try allocator.alloc(DoubleBlock, d.cfg.double_layers);
     for (d.doubles, 0..) |*b, i| {
         const pfx = try fmtKey(allocator, "transformer_blocks.{d}", .{i});
         defer allocator.free(pfx);
-        b.* = try loadDouble(&w, allocator, pfx);
+        b.* = try loadDouble(&w, allocator, pfx, s);
         // The token-GEMM linears go int8 (`--w8a8`); modulation and embedders see one row or run once.
         inline for (.{ "q", "k", "v", "o", "add_q", "add_k", "add_v", "add_o", "ff_in", "ff_out", "ffc_in", "ffc_out" }) |f| try @field(b, f).toW8a8(s);
         if (w8a8.w8a8State().enabled) w.dropBlock("transformer_blocks.{d}.", i);
@@ -803,7 +718,7 @@ pub fn loadDit(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
         defer allocator.free(nq);
         const nk = try fmtKey(allocator, "{s}.attn.norm_k.weight", .{pfx});
         defer allocator.free(nk);
-        b.* = .{ .qkv_mlp = try QLinear.load(&w, allocator, qp), .o = try QLinear.load(&w, allocator, op), .nq = try ownWeight(&w, nq), .nk = try ownWeight(&w, nk) };
+        b.* = .{ .qkv_mlp = try QLinear.load(&w, allocator, qp, 0, s), .o = try QLinear.load(&w, allocator, op, 0, s), .nq = try ownWeight(&w, nq), .nk = try ownWeight(&w, nk) };
         try b.qkv_mlp.toW8a8(s);
         try b.o.toW8a8(s);
         if (w8a8.w8a8State().enabled) w.dropBlock("single_transformer_blocks.{d}.", i);
@@ -863,12 +778,12 @@ pub fn detachLora(dit: *Dit) void {
     }
 }
 
-fn loadDouble(w: *const Weights, a: std.mem.Allocator, pfx: []const u8) !DoubleBlock {
+fn loadDouble(w: *const Weights, a: std.mem.Allocator, pfx: []const u8, s: S) !DoubleBlock {
     const ld = struct {
-        fn q(ww: *const Weights, aa: std.mem.Allocator, p: []const u8, sub: []const u8) !QLinear {
+        fn q(ww: *const Weights, aa: std.mem.Allocator, p: []const u8, sub: []const u8, st: S) !QLinear {
             const k = try fmtKey(aa, "{s}.{s}", .{ p, sub });
             defer aa.free(k);
-            return QLinear.load(ww, aa, k);
+            return QLinear.load(ww, aa, k, 0, st);
         }
         fn n(ww: *const Weights, aa: std.mem.Allocator, p: []const u8, sub: []const u8) !mlx.mlx_array {
             const k = try fmtKey(aa, "{s}.{s}", .{ p, sub });
@@ -877,22 +792,22 @@ fn loadDouble(w: *const Weights, a: std.mem.Allocator, pfx: []const u8) !DoubleB
         }
     };
     return .{
-        .q = try ld.q(w, a, pfx, "attn.to_q"),
-        .k = try ld.q(w, a, pfx, "attn.to_k"),
-        .v = try ld.q(w, a, pfx, "attn.to_v"),
-        .o = try ld.q(w, a, pfx, "attn.to_out"),
-        .add_q = try ld.q(w, a, pfx, "attn.add_q_proj"),
-        .add_k = try ld.q(w, a, pfx, "attn.add_k_proj"),
-        .add_v = try ld.q(w, a, pfx, "attn.add_v_proj"),
-        .add_o = try ld.q(w, a, pfx, "attn.to_add_out"),
+        .q = try ld.q(w, a, pfx, "attn.to_q", s),
+        .k = try ld.q(w, a, pfx, "attn.to_k", s),
+        .v = try ld.q(w, a, pfx, "attn.to_v", s),
+        .o = try ld.q(w, a, pfx, "attn.to_out", s),
+        .add_q = try ld.q(w, a, pfx, "attn.add_q_proj", s),
+        .add_k = try ld.q(w, a, pfx, "attn.add_k_proj", s),
+        .add_v = try ld.q(w, a, pfx, "attn.add_v_proj", s),
+        .add_o = try ld.q(w, a, pfx, "attn.to_add_out", s),
         .nq = try ld.n(w, a, pfx, "attn.norm_q.weight"),
         .nk = try ld.n(w, a, pfx, "attn.norm_k.weight"),
         .naq = try ld.n(w, a, pfx, "attn.norm_added_q.weight"),
         .nak = try ld.n(w, a, pfx, "attn.norm_added_k.weight"),
-        .ff_in = try ld.q(w, a, pfx, "ff.linear_in"),
-        .ff_out = try ld.q(w, a, pfx, "ff.linear_out"),
-        .ffc_in = try ld.q(w, a, pfx, "ff_context.linear_in"),
-        .ffc_out = try ld.q(w, a, pfx, "ff_context.linear_out"),
+        .ff_in = try ld.q(w, a, pfx, "ff.linear_in", s),
+        .ff_out = try ld.q(w, a, pfx, "ff.linear_out", s),
+        .ffc_in = try ld.q(w, a, pfx, "ff_context.linear_in", s),
+        .ffc_out = try ld.q(w, a, pfx, "ff_context.linear_out", s),
     };
 }
 
@@ -1053,10 +968,10 @@ pub fn loadVae(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
     v.mid_attn = .{
         .gnw = try ownWeight(&w, "decoder.mid_block.attentions.0.group_norm.weight"),
         .gnb = try ownWeight(&w, "decoder.mid_block.attentions.0.group_norm.bias"),
-        .q = try QLinear.load(&w, allocator, "decoder.mid_block.attentions.0.to_q"),
-        .k = try QLinear.load(&w, allocator, "decoder.mid_block.attentions.0.to_k"),
-        .v = try QLinear.load(&w, allocator, "decoder.mid_block.attentions.0.to_v"),
-        .o = try QLinear.load(&w, allocator, "decoder.mid_block.attentions.0.to_out"),
+        .q = try QLinear.load(&w, allocator, "decoder.mid_block.attentions.0.to_q", 0, s),
+        .k = try QLinear.load(&w, allocator, "decoder.mid_block.attentions.0.to_k", 0, s),
+        .v = try QLinear.load(&w, allocator, "decoder.mid_block.attentions.0.to_v", 0, s),
+        .o = try QLinear.load(&w, allocator, "decoder.mid_block.attentions.0.to_out", 0, s),
     };
     for (0..4) |bi| {
         for (0..3) |ri| {
@@ -1203,10 +1118,10 @@ pub fn loadVaeEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir:
     v.mid_attn = .{
         .gnw = try ownWeight(&w, "encoder.mid_block.attentions.0.group_norm.weight"),
         .gnb = try ownWeight(&w, "encoder.mid_block.attentions.0.group_norm.bias"),
-        .q = try QLinear.load(&w, allocator, "encoder.mid_block.attentions.0.to_q"),
-        .k = try QLinear.load(&w, allocator, "encoder.mid_block.attentions.0.to_k"),
-        .v = try QLinear.load(&w, allocator, "encoder.mid_block.attentions.0.to_v"),
-        .o = try QLinear.load(&w, allocator, "encoder.mid_block.attentions.0.to_out"),
+        .q = try QLinear.load(&w, allocator, "encoder.mid_block.attentions.0.to_q", 0, s),
+        .k = try QLinear.load(&w, allocator, "encoder.mid_block.attentions.0.to_k", 0, s),
+        .v = try QLinear.load(&w, allocator, "encoder.mid_block.attentions.0.to_v", 0, s),
+        .o = try QLinear.load(&w, allocator, "encoder.mid_block.attentions.0.to_out", 0, s),
     };
     v.norm_out_w = try ownWeight(&w, "encoder.conv_norm_out.weight");
     v.norm_out_b = try ownWeight(&w, "encoder.conv_norm_out.bias");
@@ -2099,23 +2014,6 @@ test "flux geometry is read off the checkpoint, not assumed (klein 4B vs 9B)" {
     try testing.expectEqual(@as(u32, 36), empty_te.te_layers);
 }
 
-test "flux inferQuantGeometry resolves mflux/mlx-community bit widths" {
-    // in = 3072 logical columns at gs = 64 → s_cols = 48; w_cols = in·bits/32.
-    try testing.expectEqual(@as(u32, 3), inferQuantGeometry(288, 48).bits); // 3-bit (8 GB iPhones)
-    try testing.expectEqual(@as(u32, 64), inferQuantGeometry(288, 48).group_size);
-    try testing.expectEqual(@as(u32, 4), inferQuantGeometry(384, 48).bits);
-    try testing.expectEqual(@as(u32, 5), inferQuantGeometry(480, 48).bits);
-    try testing.expectEqual(@as(u32, 6), inferQuantGeometry(576, 48).bits);
-    try testing.expectEqual(@as(u32, 8), inferQuantGeometry(768, 48).bits);
-    // gs-128 conversion of the same 4-bit width: s_cols = 24 → product 512;
-    // 512/64 = 8 valid → convention prefers 64 (correct for every catalog
-    // repo; a real gs-128 build would need explicit metadata to win here).
-    try testing.expectEqual(@as(u32, 8), inferQuantGeometry(384, 24).bits);
-    // Degenerate/odd geometry falls back to the historical 4/64.
-    try testing.expectEqual(@as(u32, 4), inferQuantGeometry(0, 0).bits);
-    try testing.expectEqual(@as(u32, 4), inferQuantGeometry(383, 48).bits);
-}
-
 test "flux QLinear with inferred sub-4-bit geometry matches the dequantized reference" {
     // Quantize a synthetic weight at each shipped bit width, build a QLinear
     // through the same inference the loader uses, and require its forward to
@@ -2157,7 +2055,7 @@ test "flux QLinear with inferred sub-4-bit geometry matches the dequantized refe
             .{},
             s,
         ));
-        var ql: QLinear = .{ .w = mlx.mlx_array_new(), .scales = mlx.mlx_array_new(), .biases = mlx.mlx_array_new() };
+        var ql: QLinear = .{ .quantized = true, .w = mlx.mlx_array_new(), .scales = mlx.mlx_array_new(), .biases = mlx.mlx_array_new() };
         defer ql.deinit();
         try mlx.check(mlx.mlx_vector_array_get(&ql.w, vec, 0));
         try mlx.check(mlx.mlx_vector_array_get(&ql.scales, vec, 1));

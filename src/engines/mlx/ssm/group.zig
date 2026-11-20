@@ -1533,7 +1533,6 @@ test "persistent group: forwardWith releases a bound member between batched tick
         try ssmTickBindXfm(&o_xfm, &o_ctxs, kinds);
         try ssmTickBumpSlots(s, &o_ctxs, kinds);
     }
-    p_xfm.mlx_stream_ext = null;
     p_xfm.plugin = null;
     p_xfm.moe_layers = null;
     p_xfm.emb_w = .{ .ctx = null };

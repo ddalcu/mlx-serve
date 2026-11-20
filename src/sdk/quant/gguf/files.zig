@@ -233,10 +233,13 @@ pub fn isVisionGgufBasename(basename: []const u8) bool {
         (basename.len >= tail.len and std.ascii.eqlIgnoreCase(basename[basename.len - tail.len ..], tail));
 }
 
-/// Full path to the vision tower GGUF beside a model file, or null. Caller owns the returned slice.
+/// Full path to the vision tower GGUF beside a model file, else one folder up (a repo with one folder per quant ships
+/// its mmproj beside them), or null. Caller owns the returned slice.
 pub fn findVisionSidecar(io: std.Io, allocator: std.mem.Allocator, model_file_path: []const u8) ?[]u8 {
     const dir_path = std.fs.path.dirname(model_file_path) orelse return null;
-    return firstGgufIn(io, allocator, dir_path, std.fs.path.basename(model_file_path), isVisionGgufBasename);
+    const skip = std.fs.path.basename(model_file_path);
+    if (firstGgufIn(io, allocator, dir_path, skip, isVisionGgufBasename)) |p| return p;
+    return firstGgufIn(io, allocator, std.fs.path.dirname(dir_path) orelse return null, skip, isVisionGgufBasename);
 }
 
 /// The first GGUF in `dir_path` by name that `kind` accepts, other than `skip`.
@@ -304,4 +307,26 @@ test "a vision tower GGUF is a sidecar, never the model, and is found beside it"
     try std.testing.expectEqualStrings("A-1017-Vision.gguf", std.fs.path.basename(tower));
     try tmp.dir.deleteFile(io, "A-1017-Vision.gguf");
     try std.testing.expect(findVisionSidecar(io, a, model) == null);
+}
+
+test "a quant folder's vision tower is found one level up, as a repo ships its mmproj beside the quant folders" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "IQ2_XXS");
+    try tmp.dir.writeFile(io, .{ .sub_path = "IQ2_XXS/M-IQ2_XXS-00001-of-00006.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mmproj-M-BF16.gguf", .data = "x" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const model = try std.fs.path.join(a, &.{ root, "IQ2_XXS", "M-IQ2_XXS-00001-of-00006.gguf" });
+    defer a.free(model);
+    const tower = findVisionSidecar(io, a, model) orelse return error.TestUnexpectedResult;
+    defer a.free(tower);
+    try std.testing.expectEqualStrings("mmproj-M-BF16.gguf", std.fs.path.basename(tower));
+    // One beside the model wins over the folder above.
+    try tmp.dir.writeFile(io, .{ .sub_path = "IQ2_XXS/mmproj-own.gguf", .data = "x" });
+    const own = findVisionSidecar(io, a, model) orelse return error.TestUnexpectedResult;
+    defer a.free(own);
+    try std.testing.expectEqualStrings("mmproj-own.gguf", std.fs.path.basename(own));
 }

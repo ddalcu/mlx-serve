@@ -221,7 +221,7 @@ fn checkRows(gpa: std.mem.Allocator, fx: *fixture.Fixture, li: usize, kern: mlx.
 }
 
 test "dsv41 dec moe_down: 1 to 6 rows are no further from f32 truth than today's chain, distinct and shared picks" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     mlx.installErrorHandler();
     const kern = try build();
@@ -262,7 +262,7 @@ fn serve(sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, rb: usize, o: struct
 }
 
 test "dsv41 dec moe_down: declines what it does not serve and runs what it does" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const kern = try build();
     defer _ = mlx.mlx_fast_metal_kernel_free(kern);
@@ -380,7 +380,7 @@ const Chain = struct {
 };
 
 test "dsv41 dec moe_down: ubench" {
-    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     mlx.installErrorHandler();
     var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
@@ -674,7 +674,7 @@ test "dsv41 dec moe_down: the declared launch is the shipped wrapper's, byte for
 }
 
 test "dsv41 dec moe_down: the registered kernel passes the contract's gates 1-4" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var set = kc.Set.init(a);
     defer set.deinit();

@@ -464,6 +464,7 @@ test "MTP EV seed round-trips on the qwen4 head; a fresh or absent head reads nu
     // scratch. Only the two seed fields are touched here; the rest of the head
     // (and of the Transformer) is never read on this path.
     var t: @import("../../../../plugins/qwen4_exp/trunk.zig").Trunk = undefined;
+    t.outside = null;
     t.qwen4_mtp = null;
     const ref = MtpHeadRef{ .qwen4 = &t };
 

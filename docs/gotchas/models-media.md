@@ -214,6 +214,14 @@ true` tokens minus EOS ids minus specials the chat template uses (derived, never
 to the logits (`unpadded_vocab_size`), riding `SamplingParams.suppress_mask` into both samplers and the stochastic
 verify; logprobs stay raw, so rank 1 may differ from the emitted token by design. `[suppress]` logs engagement.
 
+### `suppress_cjk` rides the reserved mask, and PLD's greedy verify skipped it
+Defect: PLD's greedy verify compared each draft with the raw argmax, so a masked id copied from the prompt was
+committed. Fix: it reads `verifyArgmax` like every other block decoder. `suppress_cjk` takes the same chokepoint with a
+second mask (reserved plus every token that writes CJK, `installCjkMask`); a lane group whose rows differ stacks
+per-row masks `[N,1,V]` (`GroupMask`, `mtp.maskRows`); the host refuses the field by name where the generator's sampler
+does not draw (`Facts.suppress_cjk`). Guard: `tests/test_suppress_cjk.sh`, the `cjkBytes`, `fillCjkMask` and
+`GroupMask` tests.
+
 ### The degenerate-tail loop guard needs a long-period tier
 Defect: a two-sentence 58-token cycle repeated 26 times passed the period-≤8 scan. Fix: `isDegenerateTailLoopRange`
 also convicts periods 9..64 at 10 exact reps (long lines in real code repeat a handful of times, not ten), on span.
@@ -576,8 +584,25 @@ trims. Fix: `trainedSeconds` and `latentCount`. A condition works only as traini
 Defect: `MiMo-V2.6-Flash-Sushi-2.3bpw` died in warmup on a bf16 `o_proj`; later every boot logged MTP off. Cause: the
 source shard still carries bf16 copies beside the affine triples and the loader kept the last listed; the heads were
 stored like the trunk (fused e4m3 QKV) and never converted. Fix: duplicated tensors load from the shard the index
-names (`indexOwners`); embed/head are dense by dtype; the heads get the trunk's QKV split and MLP decode. Guard:
-`indexOwners: the index names the shard…`, the smoke `mimo_v2_sushi.mtp` cell.
+names (`indexOwners`; the loader resolves every duplicated `.weight` key against its shard headers, so this holds for
+any indexed pack); embed/head are dense by dtype; the heads get the trunk's QKV split and MLP decode. Guard: `indexOwners: the index names the shard…`, the smoke `mimo_v2_sushi.mtp` cell.
+
+### An abliteration fork's dense `o_proj` kept the trunk's retired quant pair
+Defect: `GLM-5.3-Flash-Sushi-2bpw-Abliterated` loaded 81.5 GB then 500'd every request: `[quantized_matmul] The weight
+matrix should be uint32 but received bfloat16`. Cause: the fork ships BF16 replacements in a shard the index names and
+retires the packed triple's entries, but the trunk still carries `weight`+`scales`+`biases`; which `weight` won the key
+was directory order, and the unnamed `scales`/`biases` always survived — a float weight beside set scales routes every
+quantized arm to a kernel that refuses a float weight. Fix: the load scans every shard header twice (a 100-shard pack:
+~1 MB, milliseconds) — once for which `.weight` keys sit packed somewhere, once folded into the carrier map — and a
+duplicated `.weight` resolves to its carrier of record before either shard places: the index's owner when a second
+carrier proves the fork adopted it; the PACKED carrier when the index names no carrier (its copy is the loadable arm
+of the pair); untracked (first copy wins, as an index-less pack) when the index is stale or two float carriers tie.
+Quant leaves ride the carrier of record, except a leaf the index names there — the winner's own pair (a modelopt pack
+indexes its scales) stays. A float winner sheds the pair; a packed winner keeps it. Placement drops run through one
+`foreign_copy` flag: a `continue` nested in the gate skips the rest of the loop body, including the placement itself.
+Guards: `loadWeights sheds a retired quant pair …` (both orders, the modelopt arm, the packed-owner arm),
+`keeps a retired pair whose adopted copy is packed`, `keeps a key an out-of-place index entry names`,
+`places an index-named weight over a packed copy`.
 
 ### MiMo's own DFlash drafter loaded, drafted garbage and outranked MTP
 Defect: Xiaomi's drafter accepted 2-4%, the gate turned it off, and the request ran serial at 32 tok/s against 67 with
@@ -798,3 +823,27 @@ Defect: ISTA-DASLab's Q2_0 Flash Next pack answered `!!` on the MLX GGUF path wh
 split-layout types (`packedRows`), so two Q6_K `ssm_out` layers fed the kernels a wrong layout; any qwen35 GGUF with a
 split-type out_proj and r > 1 had it too. Found by loading one tensor class raw at a time, the rest as 8-bit affine.
 Fix: the branch packs too. Guard: `a tiled-input weight of a split-layout type loads in the kernels' layout`.
+
+### MiniMax-H3-Image decoded noise from a pack that loaded cleanly
+Defect: the first MiniMax-H3-Image pack generated a texture of 16-px tiles for every prompt, at the right size and in
+the right time. Cause: the release's `transformer/` interleaves each attention's fused Q/K/V per head
+(`[h0 q | h0 k | h0 v | h1 q ...]`) while H3's engine splits `[q | k | v]` (the video packs come from Comfy-Org's
+repack); the converter passed it through, so every head attended with another head's keys. Found by matching rows of
+the release's diffusers copy against the original. Fix: `image_dit` reorders the rows. Guards:
+`tests/test_convert_minimax_h3_image.py` and the seam check in `tests/test_minimax_h3_image.sh`.
+
+### Long, large H3 clips washed out a few frames, at different frames every run (`w8a8`)
+Defect: REF2VA renders at 1152x864x243 showed about five washed-out, blocky frames in a row, at a different place on
+each run of the same seed; smaller jobs were clean and `--no-w8a8` cured it. Cause: the int8 GEMM built its operand
+and output tensors over the whole matrix, whose offsets are `int`: once an output passed 2^31 elements (H3's MLP
+past ~75k rows), the full-tile stores wrapped and wrote into other buffers, so every tile came out wrong. Fix: each
+tile's tensors start at its own rows with a 64-bit offset (same speed). Guard: `w8a8 GEMM stores an output past 2^31
+elements where it belongs`.
+
+### A dedupe of duplicate weights dropped the far half of every split quant triple
+Defect: right after #1161's carrier scan landed, gemma-3-12b-it-4bit failed every forward ("Scale type must be uint8"),
+FLUX.2-klein-4B-mflux-4bit refused to load (`MISSING WEIGHT ... .biases`), and GLM-5.3, Qwen3.6-35B, MiniCPM-V-35B and
+Nemotron-Transcribe packs carried the same layout. Cause: the scan resolves a duplicated `.weight` to one shard, and the
+placement dropped any quant leaf whose weight's carrier was another shard; mlx-lm shards by size, so a leaf alone in the
+next shard is its pair's only copy. Fix: a leaf is a retired copy only when its own shard also carries its weight.
+Guard: `loadWeights keeps a quant triple the shards split, with no key duplicated` (valid and stale index).

@@ -177,6 +177,11 @@ pub fn table() ?*const abi.HostAne {
 
 const testing = std.testing;
 const mil = @import("../sdk/ane/mil.zig");
+
+/// The table where a Neural Engine runs programs: a VM (GitHub's macOS runners) loads the bridge but has no ANE.
+fn testTable() ?*const abi.HostAne {
+    return if (@import("../mlx/ffi.zig").virtualGpu()) null else table();
+}
 const env = @import("../env.zig");
 
 /// The compile cache under a fresh directory, so a test neither reads nor fills the user's.
@@ -191,8 +196,14 @@ fn errText(err: []const u8) []const u8 {
     return std.mem.sliceTo(err, 0);
 }
 
+/// A Mac without a Neural Engine (CI's virtual one) loads the framework, so `table()` answers, then refuses every
+/// compile with this.
+fn noAneHardware(err: []const u8) bool {
+    return std.mem.indexOf(u8, errText(err), "ANE hardware not available") != null;
+}
+
 test "plugin ane: a raw MIL program compiles, binds by name, evaluates on the ANE, and counts as resident until freed" {
-    const ane = table() orelse return error.SkipZigTest;
+    const ane = testTable() orelse return error.SkipZigTest;
     var cb: [128]u8 = undefined;
     const root = try testCache(&cb);
     defer {
@@ -215,6 +226,7 @@ test "plugin ane: a raw MIL program compiles, binds by name, evaluates on the AN
     var err: [512]u8 = @splat(0);
     const before = ane.resident(ane.ctx);
     const p = ane.program_create(ane.ctx, "plugin-ane-test-affine", text.ptr, weights, bytes.len, 1, null, &err, err.len) orelse {
+        if (noAneHardware(&err)) return error.SkipZigTest;
         std.debug.print("program_create: {s}\n", .{errText(&err)});
         return error.TestUnexpectedResult;
     };
@@ -260,7 +272,7 @@ test "plugin ane: a raw MIL program compiles, binds by name, evaluates on the AN
 }
 
 test "plugin ane: a bad program is refused with its reason, and nothing stays resident" {
-    const ane = table() orelse return error.SkipZigTest;
+    const ane = testTable() orelse return error.SkipZigTest;
     var cb: [128]u8 = undefined;
     const root = try testCache(&cb);
     defer {
@@ -299,7 +311,7 @@ fn refSwiglu(h: usize, f: usize, gq: []const i8, gs: []const f32, uq: []const i8
 }
 
 test "plugin ane: a SwiGLU bank gives the int8 reference, clamped by its limit and not without one" {
-    const ane = table() orelse return error.SkipZigTest;
+    const ane = testTable() orelse return error.SkipZigTest;
     var cb: [128]u8 = undefined;
     const root = try testCache(&cb);
     defer {
@@ -336,6 +348,7 @@ test "plugin ane: a SwiGLU bank gives the int8 reference, clamped by its limit a
         return error.TestUnexpectedResult;
     }
     const m = ane.bank_finish(ane.ctx, b, "plugin-ane-test-swiglu", 0, null, null, &err, err.len) orelse {
+        if (noAneHardware(&err)) return error.SkipZigTest;
         std.debug.print("bank_finish: {s}\n", .{errText(&err)});
         return error.TestUnexpectedResult;
     };

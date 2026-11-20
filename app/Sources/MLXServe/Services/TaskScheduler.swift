@@ -414,15 +414,20 @@ final class TaskScheduler: ObservableObject {
     /// Run a (possibly resumed) session to completion, observing the dedicated
     /// engine's generation flag, then harvest the transcript. If a tool call paused
     /// the run, persist it as `needsApproval` instead of finishing.
+    /// - Parameter userText: the task's prompt; nil resumes a transcript that ends on a tool result.
     private func driveRun(run: TaskRun, task: ScheduledTask, sessionId: UUID,
-                          resolved: ResolvedAgentSettings, userText: String) async {
+                          resolved: ResolvedAgentSettings, userText: String?) async {
         var run = run
         let approval = makeApproval(runId: run.id, autonomy: task.autonomy,
                                     workDir: resolved.workingDirectory)
         var config = ChatTurnEngine.TurnConfig.from(resolved)
         config.modelPath = resolved.modelPath
-        runEngine.runTurn(sessionId: sessionId, userText: userText,
-                          images: nil, videos: nil, audio: nil, config: config, approval: approval)
+        if let userText {
+            runEngine.runTurn(sessionId: sessionId, userText: userText,
+                              images: nil, videos: nil, audio: nil, config: config, approval: approval)
+        } else {
+            runEngine.resumeTurn(sessionId: sessionId, config: config, approval: approval)
+        }
         if runEngine.isGenerating {
             for await generating in runEngine.$isGenerating.values where !generating { break }
         }
@@ -554,8 +559,7 @@ final class TaskScheduler: ObservableObject {
                              content: "Error: user denied this tool call. Do not retry; try a different approach or stop.")
         }
 
-        await driveRun(run: run, task: task, sessionId: sessionId, resolved: resolved,
-                       userText: "Continue. Use the tool result above. If the task is complete, reply with a short plain-text summary — no tool calls.")
+        await driveRun(run: run, task: task, sessionId: sessionId, resolved: resolved, userText: nil)
     }
 
     /// Append a tool result to a run session (display summary + tool-role message),

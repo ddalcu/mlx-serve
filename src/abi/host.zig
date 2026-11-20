@@ -7,6 +7,7 @@
 const std = @import("std");
 
 const common = @import("common.zig");
+const quant = @import("quant.zig");
 pub const Span = common.Span;
 pub const Str = common.Str;
 pub const Verdict = common.Verdict;
@@ -88,7 +89,19 @@ pub const Host = extern struct {
 
     /// The Neural Engine; read it through `aneOf`, which also answers null for a host older than this field.
     ane: ?*const HostAne = null,
+
+    /// The outside quant table the host loaded that claims a pack's quantization block `block_json` of `config_json`:
+    /// the highest claim; null when none claims or two tie (the host logs a tie by name). A model plugin's own dylib
+    /// holds no quant table, so its loads ask here (`outside.Format.open`). Read it through `quantClaimantOf`, which
+    /// also answers null for a host older than this field. Any thread.
+    quant_claimant: ?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable = null,
 };
+
+/// `h.quant_claimant`, or null where the host has none or predates it (its `size` ends before the field).
+pub fn quantClaimantOf(h: *const Host) ?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable {
+    if (h.size < @offsetOf(Host, "quant_claimant") + @sizeOf(@FieldType(Host, "quant_claimant"))) return null;
+    return h.quant_claimant;
+}
 
 /// `h.ane`, or null where the host has none or predates it (its `size` ends before the field).
 pub fn aneOf(h: *const Host) ?*const HostAne {
@@ -157,7 +170,26 @@ pub const HostGpu = extern struct {
     launch: *const fn (ctx: ?*anyopaque, outputs: *VectorArray, kernel: ?*anyopaque, inputs: VectorArray, config: KernelConfig, stream: Stream) callconv(.c) Verdict,
     /// Each evaluated, row-contiguous GPU array's buffer address + offset, for kernels reading sources from a table.
     buffer_addresses: *const fn (ctx: ?*anyopaque, arrays: [*]const Array, n: usize, out: [*]u64) callconv(.c) Verdict,
+    /// `out` (a fresh handle) becomes an evaluated [shape] array of `dtype` (mlx-c's `mlx_dtype` value) over `base`'s
+    /// bytes from `offset`, an MTLBuffer of its own over the same pages: MLX orders its work apart from `base`'s.
+    /// Refused unless `base` is evaluated at its buffer's start, `offset` is page-aligned and the range fits. It holds
+    /// `base` and adds no active memory; MLX cannot see aliases overlap, so tensors alive at once take disjoint ranges.
+    alias: *const fn (ctx: ?*anyopaque, base: Array, offset: u64, shape: [*]const i32, ndim: usize, dtype: i32, out: *Array) callconv(.c) Verdict,
+    /// MLX's command-buffer split: the operations (`ops`) and MB of bound arrays (`mb`) a command buffer takes before
+    /// it is committed, from each stream's next commit check (below 1 keeps the current value); the previous pair back.
+    /// The words are the same at any split. Optional: read it only when `size` reaches it (`gpu_min_size`).
+    command_buffer_limits: *const fn (ctx: ?*anyopaque, ops: i32, mb: i32, prev_ops: *i32, prev_mb: *i32) callconv(.c) Verdict,
 };
+
+/// The `HostGpu` size every plugin may rely on (through `alias`): members past it are optional, read only when the
+/// table's `size` reaches them, so a plugin built with a newer kit still loads on a host without them, and a plugin
+/// built before them loads on a host with them.
+pub const gpu_min_size: usize = @offsetOf(HostGpu, "command_buffer_limits");
+
+/// Whether the table `g` (a host's, of any size) reaches its member `name`.
+pub fn gpuHas(g: *const HostGpu, comptime name: []const u8) bool {
+    return g.size >= @offsetOf(HostGpu, name) + @sizeOf(@FieldType(HostGpu, name));
+}
 
 pub const ane_version: u32 = 1;
 
@@ -277,6 +309,24 @@ test "abi host: aneOf answers null for a host that predates the field, or a tabl
     try t.expect(aneOf(&h) == null);
 }
 
+test "abi host: quantClaimantOf answers null for a host that predates the field or leaves it null" {
+    const t = std.testing;
+    const S = struct {
+        fn claimant(_: ?*anyopaque, _: Str, _: Str) callconv(.c) ?*const quant.QuantTable {
+            return null;
+        }
+    };
+    var h: Host = undefined;
+    h.size = @sizeOf(Host);
+    h.quant_claimant = &S.claimant;
+    try t.expect(quantClaimantOf(&h) == &S.claimant);
+    h.size = @offsetOf(Host, "quant_claimant");
+    try t.expect(quantClaimantOf(&h) == null);
+    h.size = @sizeOf(Host);
+    h.quant_claimant = null;
+    try t.expect(quantClaimantOf(&h) == null);
+}
+
 test "abi host: the table layouts are pinned (size first, offsets fixed, growth only at the end)" {
     const t = std.testing;
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
@@ -287,10 +337,10 @@ test "abi host: the table layouts are pinned (size first, offsets fixed, growth 
         .{ "latch_pending", 64 },    .{ "latch_check", 72 },     .{ "latch_drop_unless", 80 },
         .{ "gpu_context_lost", 88 }, .{ "kernel", 96 },          .{ "lever", 104 },
         .{ "counter", 112 },         .{ "memory_ceiling", 120 }, .{ "gpu", 128 },
-        .{ "ane", 136 },
+        .{ "ane", 136 },             .{ "quant_claimant", 144 },
     };
     inline for (host_fields) |f| try t.expectEqual(f[1], @offsetOf(Host, f[0]));
-    try t.expectEqual(@as(usize, 144), @sizeOf(Host));
+    try t.expectEqual(@as(usize, 152), @sizeOf(Host));
     try t.expectEqual(host_fields.len, @typeInfo(Host).@"struct".field_names.len);
 
     const gpu_fields = [_]struct { []const u8, usize }{
@@ -298,10 +348,11 @@ test "abi host: the table layouts are pinned (size first, offsets fixed, growth 
         .{ "event_metal", 16 },      .{ "event_host", 24 },   .{ "wait", 32 },
         .{ "signal", 40 },           .{ "event_set", 48 },    .{ "event_value", 56 },
         .{ "event_stats", 64 },      .{ "alloc_uninit", 72 }, .{ "launch", 80 },
-        .{ "buffer_addresses", 88 },
+        .{ "buffer_addresses", 88 }, .{ "alias", 96 },       .{ "command_buffer_limits", 104 },
     };
     inline for (gpu_fields) |f| try t.expectEqual(f[1], @offsetOf(HostGpu, f[0]));
-    try t.expectEqual(@as(usize, 96), @sizeOf(HostGpu));
+    try t.expectEqual(@as(usize, 112), @sizeOf(HostGpu));
+    try t.expectEqual(@as(usize, 104), gpu_min_size);
     try t.expectEqual(gpu_fields.len, @typeInfo(HostGpu).@"struct".field_names.len);
 
     const ane_fields = [_][]const u8{

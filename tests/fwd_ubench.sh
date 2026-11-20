@@ -7,6 +7,7 @@
 # The unit of every decode-perf A/B here: one run per boot per arm, ALTERNATING arms per boot (a block-of-N schedule
 # reads drift as an effect). An exported MLX_SERVE_DIAG joins the server's: layer-cap=N (slope vs fixed cost),
 # dispatch-probe=N (prices one dispatch with N exact-1.0 multiplies per MoE layer).
+source "$(dirname "$0")/lib/server.sh"
 
 set -uo pipefail
 
@@ -18,7 +19,7 @@ BIN="${BIN:-./zig-out/bin/mlx-serve}"
 LOG="${LOG:-/tmp/fwd-ubench-$PORT.log}"
 [[ "$("$BIN" --version 2>/dev/null | head -1)" != *"(Debug)"* ]] || { echo "$BIN is a Debug build (2-4x slower) — build ReleaseFast first" >&2; exit 1; }
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 sleep 1
 
 MLX_SERVE_DIAG="decode-fwd-ubench=$ITERS${MLX_SERVE_DIAG:+,$MLX_SERVE_DIAG}" "$BIN" --model "$MODEL" --serve --port "$PORT" \

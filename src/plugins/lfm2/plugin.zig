@@ -10,6 +10,7 @@ const bases = @import("../../sdk/bases/bases.zig");
 const block = @import("../../sdk/bases/block.zig");
 const run_mod = @import("../../sdk/bases/run.zig");
 const moe = @import("../../sdk/bases/blocks/moe.zig");
+const streamed = @import("../../sdk/weights/streamed.zig");
 const reader = @import("../../sdk/bases/reader.zig");
 pub const config = @import("config.zig");
 
@@ -83,8 +84,11 @@ pub const Loaded = struct {
     base: bases.Model(Model),
     layers: []Model.Layer = &.{},
     owned: reader.Owned = .{},
+    /// The routed experts streamed from the pack (the `stream_experts` setting).
+    experts: ?streamed.Streamed = null,
 
     fn release(m: *Loaded) void {
+        if (m.experts) |*x| x.close();
         m.owned.deinit();
         gpa.free(m.layers);
         m.base.shared.deinit();
@@ -107,6 +111,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     errdefer gpa.destroy(m);
     m.* = .{ .base = .{ .weights = undefined, .shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps), .a = gpa, .s = r.s, .placeholders = ctx.parsed.placeholder_ids } };
     errdefer m.release();
+    if (c.moe) |mc| m.experts = try streamed.Streamed.forLoad(gpa, ctx, mc.experts, r.s);
     m.layers = try gpa.alloc(Model.Layer, c.num_hidden_layers);
     for (m.layers, 0..) |*L, i| L.* = try loadLayer(m, &r, c, @intCast(i));
 
@@ -196,7 +201,7 @@ fn mlpOf(m: *Loaded, r: *reader.Reader, c: *const config.Config, i: u32) !Mlp.We
         var bias = try r.share(try r.name(&nb, "layers.{d}.feed_forward.expert_bias", .{i}));
         if (bias.ctx == null) bias = try reader.zerosF32(mc.experts, r.s);
         try m.owned.own(bias);
-        return .{ .second = .{
+        var w: moe.Moe.Weights = .{
             .router = router,
             .route = .{ .sigmoid_bias = .{ .expert_bias = bias, .norm = mc.norm, .scale = mc.scale } },
             .gate = reader.bank(banks[0], c.quant),
@@ -204,7 +209,9 @@ fn mlpOf(m: *Loaded, r: *reader.Reader, c: *const config.Config, i: u32) !Mlp.We
             .down = reader.bank(banks[2], c.quant),
             .top_k = @intCast(mc.top_k),
             .experts = @intCast(mc.experts),
-        } };
+        };
+        if (m.experts) |*x| try moe.bindStreamed(&w, x, try r.name(&nb, "layers.{d}.feed_forward", .{i}));
+        return .{ .second = w };
     }
     // transformers' Lfm2 spells the SwiGLU w1/w3/w2; mlx-lm's lfm2_moe converter gate/up/down.
     const w1 = r.has(try r.name(&nb, "layers.{d}.feed_forward.w1.weight", .{i}));
@@ -284,4 +291,48 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 test {
     _ = config;
     _ = @import("../../sdk/config/json.zig");
+}
+
+test "lfm2 plugin: an lfm2_moe pack streams its experts with the logits of the same experts in memory" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = 64;
+    const e = 4;
+    const mi = 64;
+    var t = sdk.tensors.Tensors.init(a, 5);
+    try t.rand("model.embed_tokens.weight", .{}, &.{ 64, h }, .F32, 0.5);
+    try t.fill("model.embedding_norm.weight", .{}, &.{h}, .F32, 1);
+    for (0..2) |i| {
+        try t.fill("model.layers.{d}.operator_norm.weight", .{i}, &.{h}, .F32, 1);
+        try t.fill("model.layers.{d}.ffn_norm.weight", .{i}, &.{h}, .F32, 1);
+    }
+    try t.rand("model.layers.0.conv.in_proj.weight", .{}, &.{ 3 * h, h }, .F32, 0.1);
+    try t.rand("model.layers.0.conv.conv.weight", .{}, &.{ h, 3, 1 }, .F32, 0.3);
+    try t.rand("model.layers.0.conv.out_proj.weight", .{}, &.{ h, h }, .F32, 0.1);
+    try t.rand("model.layers.0.feed_forward.w1.weight", .{}, &.{ 128, h }, .F32, 0.1);
+    try t.rand("model.layers.0.feed_forward.w3.weight", .{}, &.{ 128, h }, .F32, 0.1);
+    try t.rand("model.layers.0.feed_forward.w2.weight", .{}, &.{ h, 128 }, .F32, 0.1);
+    for ([_][]const u8{ "q_proj", "k_proj", "v_proj" }, [_]u64{ 64, 32, 32 }) |n, rows| try t.rand("model.layers.1.self_attn.{s}.weight", .{n}, &.{ rows, h }, .F32, 0.1);
+    try t.rand("model.layers.1.self_attn.out_proj.weight", .{}, &.{ h, 64 }, .F32, 0.1);
+    try t.fill("model.layers.1.self_attn.q_layernorm.weight", .{}, &.{32}, .F32, 1);
+    try t.fill("model.layers.1.self_attn.k_layernorm.weight", .{}, &.{32}, .F32, 1);
+    try t.rand("model.layers.1.feed_forward.gate.weight", .{}, &.{ e, h }, .F32, 0.1);
+    // Affine 8-bit at group 32, as mlx-lm stores a quantized bank: packed words, bf16 scales and biases.
+    for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }, [_][2]u64{ .{ mi, h }, .{ mi, h }, .{ h, mi } }) |n, oi| {
+        try t.words("model.layers.1.feed_forward.switch_mlp.{s}.weight", .{n}, &.{ e, oi[0], oi[1] / 4 });
+        try t.rand("model.layers.1.feed_forward.switch_mlp.{s}.scales", .{n}, &.{ e, oi[0], oi[1] / 32 }, .BF16, 0.001);
+        try t.rand("model.layers.1.feed_forward.switch_mlp.{s}.biases", .{n}, &.{ e, oi[0], oi[1] / 32 }, .BF16, 0.01);
+    }
+    const fx: sdk.fixture.Fixture = .{ .files = try a.dupe(sdk.fixture.File, &.{
+        .{ .name = "config.json", .bytes =
+        \\{"model_type":"lfm2_moe","vocab_size":64,"hidden_size":64,"intermediate_size":128,"num_hidden_layers":2,
+        \\ "num_attention_heads":2,"num_key_value_heads":1,"max_position_embeddings":4096,"norm_eps":1e-5,
+        \\ "rope_theta":1000000.0,"conv_L_cache":3,"layer_types":["conv","full_attention"],"eos_token_id":2,
+        \\ "num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":64,"num_dense_layers":1,"norm_topk_prob":true,
+        \\ "quantization":{"group_size":32,"bits":8}}
+        },
+        .{ .name = "model.safetensors", .bytes = try t.bytes() },
+    }) };
+    try @import("../../sdk/testing/conformance.zig").expectStreamedExperts(std.testing.io, a, plugin.name, &table, fx);
 }

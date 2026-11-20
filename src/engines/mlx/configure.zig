@@ -13,7 +13,6 @@ const prefill_interleave = @import("prefill_interleave.zig");
 const distributed = @import("cluster/distributed.zig");
 const sleep_inhibit = @import("runtime/sleep_inhibit.zig");
 const depth_bounds = @import("spec/mtp_depth_bounds.zig");
-const mlx_stream = @import("modules/stream.zig");
 
 pub fn settings(out: *host.Settings) void {
     out.* = .{
@@ -35,14 +34,11 @@ pub fn gauges(out: *host.Gauges) void {
 
 pub fn modelProps(lm: *const LoadedModel, out: *host.ModelProps) void {
     const x = lm.transformer;
-    const native = if (x) |t| t.mlx_stream_ext else null;
     out.* = .{
         .decode_attn_quant = decode_attn_quant.decodeAttnQuantEnabled() and (if (x) |t| t.dense_attn_proj else false),
         .mtp_loaded = lm.mtp != null or (if (x) |t| t.dsparkStages() > 0 else false),
         .mtp_acceptance = if (lm.config) |c| c.mtpAcceptance(generate_mod.mtp_acceptance_default) else generate_mod.mtp_acceptance_default,
         .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(if (lm.config) |c| c.mtp_greedy_tail_override else null),
-        .native_lane = if (native) |m| mlx_stream.laneName(m) else "",
-        .native_block = if (native) |m| mlx_stream.blockSize(m) else 0,
     };
 }
 

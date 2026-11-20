@@ -19,7 +19,11 @@ pub fn refused() *Refused {
 pub fn refusalMessage(buf: []u8) []const u8 {
     const r = refused().* orelse return "This model's engine does not serve this request.";
     refused().* = null;
-    const fix = if (r.kind == .ane) "Use a GPU model for that." else "Use an MLX model for that.";
+    const fix = switch (r.kind) {
+        .ane => "Use a GPU model for that.",
+        .mlx => "Use a GGUF model for that.",
+        else => "Use an MLX model for that.",
+    };
     return std.fmt.bufPrint(buf, "This model runs on {s}, which does not serve {s}. {s}", .{ served_mod.displayName(r.kind), feature(r.cap), fix }) catch
         "This model's engine does not serve this request.";
 }
@@ -49,4 +53,6 @@ test "refusalMessage: names the engine, the feature and the fix, once" {
     try testing.expect(refused().* == null);
     refused().* = .{ .kind = .llama, .cap = "penalties" };
     try testing.expectEqualStrings("This model runs on the embedded llama.cpp engine (GGUF), which does not serve repetition, frequency or presence penalties. Use an MLX model for that.", refusalMessage(&buf));
+    refused().* = .{ .kind = .mlx, .cap = "logit_bias" };
+    try testing.expectEqualStrings("This model runs on MLX, which does not serve logit_bias. Use a GGUF model for that.", refusalMessage(&buf));
 }

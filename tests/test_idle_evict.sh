@@ -42,7 +42,7 @@ M="${MODELS[0]}"
 echo "  using $M"
 
 BINARY="${MLX_SERVE_BINARY:-./zig-out/bin/mlx-serve}"
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 LOGFILE=$(mktemp)
 # 2s window: idleEvictTickMs floors the sweep at 1s, so eviction lands ~3s after
@@ -163,7 +163,7 @@ if [ "$FAIL" = "0" ] && [ -n "$BASE_RSS" ]; then
 fi
 
 # Default off: the same binary with no flag must keep the model resident.
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 wait $SERVER_PID 2>/dev/null || true
 "$BINARY" --model-dir "$ROOT" --serve --port "$PORT" ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$LOGFILE" 2>&1 &
 SERVER_PID=$!

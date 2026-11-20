@@ -22,9 +22,10 @@ The model plugin table (`ModelTable`) and every struct that crosses it. Extern l
 | `Stream` | `common.Stream` |  |
 | `Claim` | `common.Claim` |  |
 | `PackDir` | `common.PackDir` |  |
-| `version` | `u32 = 1` |  |
+| `version` | `u32 = 2` | Moves when a struct the plugin writes whole (`Parsed`, `Bill`) grows: an older host refuses the newer table, so a plugin never writes past the host's shorter struct; this host takes every older table, whose structs it reads by size. |
 | `Handle` | `?*anyopaque` | An object the engine owns and the plugin only passes back (a slot's KV cache): opaque until P3 types it. |
 | `max_eos` | `16` |  |
+| `stream_room_cell` | `u64 = 16_384 + 1_024` | The request the stream rooms are billed at (16K prompt + 1K reply): a bank calibration's evidence cell. |
 | `max_round_tokens` | `32` | The most tokens a native drafter's round commits (`Round.tokens`). |
 
 ### `LayerSpan` (extern struct)
@@ -153,7 +154,9 @@ Model facts the host keeps once at load. Defaults are the generic model's.
 | `merged_state` | `bool` | `false` | A batch's recurrent state is read and written only through `CacheOps.state_rows` / `set_state_rows`, so the engine may keep it merged across batched ticks instead of re-stacking every layer each tick. |
 | `slot_state` | `bool` | `false` | Module-owned state (`owns_decode_state`) kept per slot (`Forward.slots`, `release_slot`, `activate_slot`): requests interleave and batch instead of running single-flight. |
 | `ablation` | `bool` | `false` | The forward honours `Forward.ablation` on every pass that writes the residual stream (a native drafter's rounds included). A plugin that resumes its own state across requests (`CacheHooks.resume_prompt`) resumes only under the same `Ablation.keys` entry. |
-| `_` | `u33` | `0` |  |
+| `prompt_last_row` | `bool` | `false` | A prompt forward asked for `Logits.last_row` returns its last row's logits alone, bit-identical to that row of its `.all_rows` result, and still every hidden and captured row it is asked for. The host asks for it on the prefill's prompt forwards unless the request echoes prompt logprobs. |
+| `experts_stream` | `bool` | `false` | The load streams an MLX pack's routed experts on the `stream_experts` setting (`sdk/weights/streamed.zig`): the preflight bills their slot rows, not the experts. Without it the setting is refused by name. |
+| `_` | `u31` | `0` |  |
 
 ### `ThinkingDefault` (enum(u8))
 
@@ -431,6 +434,8 @@ Every `Str` here points at static text or at memory the plugin owns until `Model
 | `mrope` | `MropeFacts` | `.{}` |  |
 | `private` | `?*anyopaque` | `null` | The plugin's own parsed config, read by its `bill` and `load`. |
 | `speech` | `SpeechFacts` | `.{}` |  |
+| `_pre_engine_config` | `u32` | `0` | Ends the struct at the size a plugin built before `engine_config` writes (728 bytes: `speech` ends at 724, the rest was padding it may have left unset), so `engine_config` lies past it and the size gate reads it unset. |
+| `engine_config` | `bool` | `false` | This plugin serves a `model_type` the engine parses and wants the engine's own config (family fields, weight renames, bills) with its binding attached, instead of the generic config of its facts alone. The engine then sizes and bills the pack as it does that type, so the plugin must match the engine's layout for that type. A pack the engine cannot parse keeps the generic config. Read through `wantsEngineConfig`. |
 
 ### `Shape` (extern struct)
 
@@ -445,7 +450,7 @@ The load-time shape `bill` prices.
 
 ### `Bill` (extern struct)
 
-The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout.
+The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout. `flags` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
 
 | Field | Type | Default | |
 |---|---|---|---|
@@ -460,6 +465,25 @@ The plugin's memory terms. A zero or null term is the engine's default arithmeti
 | `prefill_attn_keys` | `?*const fn (p: *const Parsed, seq: u64) callconv(.c) u64` | `null` |  |
 | `prefill_bytes` | `?*const fn (p: *const Parsed, seq: u64, chunk: u32, kv_bits: u8, warm: u64) callconv(.c) u64` | `null` |  |
 | `batched_kv_len` | `?*const fn (p: *const Parsed, kv: u32, gather_on: bool, min: u32) callconv(.c) u32` | `null` |  |
+| `flags` | `BillFlags` | `.{}` | A u32 at offset 88, read through `billFlags`. Zero keeps the host's rules from before it. |
+
+### `BillFlags` (packed struct(u32))
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `decode_room` | `DecodeRoom` | `.by_name` |  |
+| `reserves_request` | `bool` | `false` | A decode-billed request reserves its whole KV (prompt, reply to the context, verify rows) at its prompt and its decode bill prices that KV once (`reservedPrefillTokens`, `glm5DecodeMemoryNeeded`). |
+| `_` | `u29` | `0` |  |
+
+### `DecodeRoom` (enum(u2))
+
+Whether a streamed model's decode phase gets a room of its own (`LoadCtx.stream_room_decode`, `stream_grow_decode`). `billed` prices it with the KDA-hybrid trunk's decode bill (`glm5DecodeMemoryNeeded`), so only a model on that trunk (GLM-5, Ling) sets it: another streamed family (DeepSeek) must not, since that bill is not its own.
+
+| Member | Value | |
+|---|---|---|
+| `by_name` | `0` | The host's rule: a GLM-5 whose plugin prices no prompt, and Ling. The unnamed values 2 and 3 read as this. |
+| `billed` | `1` |  |
+| `_` | |  |
 
 ### `LoadCtx` (extern struct)
 
@@ -481,6 +505,11 @@ Valid during `load` only: the model keeps none of its pointers.
 | `wired_margin_bytes` | `u64` | `8 << 30` | The host's wired-limit margin (`--wired-margin-gib`): the GPU ceiling's stop a streamed bank leaves unplanned. |
 | `tp_rank` | `u32` | `0` | Tensor parallel (DeepSeek-V4.1): this rank's slice of every expert and attention head, the weights already sliced; `tp_size` 0 = whole. |
 | `tp_size` | `u32` | `0` |  |
+| `stream_room_decode` | `u64` | `0` | GPU bytes a streamed bank may fill in the decode phase: the GPU ceiling less the decode phase's bill at 16K + 1K and the wired margin; 0 = the host has none (`decodeRoom`). |
+| `gpu_ceiling_bytes` | `u64` | `0` | The GPU ceiling both rooms were taken from (a bank calibration's key); 0 = unknown. |
+| `stream_grow_prompt` | `u64` | `0` | Each phase's bill growth from the rooms' cell (`stream_room_cell`) to the server's context limit: what a bank calibrated at the cell gives up for a longer context; 0 = none or unknown. |
+| `stream_grow_decode` | `u64` | `0` |  |
+| `bank_fit_key` | `Str` | `.{}` | The key a bank calibration must carry to apply on this server (`bank-fit.json` v3): the canonical key text (`sdk/quant/bank_fit_key.zig`), empty when the host has none. |
 
 ### `Mode` (enum(u8))
 
@@ -535,6 +564,8 @@ One forward. `tokens` holds `rows` tokens per slot, slot after slot; `slots`, `p
 | `embeds` | `Array` | `.{}` | Input rows `[slots, rows, hidden]` in place of the ids' embedding (a spoken frame's `SpeechHooks.frame_rows`); empty = embed the ids. |
 | `progress` | `?*u64` | `null` | A prompt forward's live progress: a model that chunks the prompt itself (`Caps.whole_prompt_prefill`) stores the rows it has forwarded so far here (`@atomicStore`, monotonic) after each chunk; null = nobody is watching. |
 | `ablation` | `?*const Ablation` | `null` | Directional ablation for this forward's slots (`Caps.ablation`); null = none, the forward unchanged. |
+| `prompt_spans` | `Span(u64)` | `.{}` | A prompt forward the engine does not chunk: a whole-prompt prefill (`Caps.whole_prompt_prefill`), or a hybrid's restored tail inside the snapshot backoff. The absolute positions where the engine's chunk loop would end its spans, ascending, the last `positions[0] + rows`; empty = the model chunks as it likes. Read it only when `size` reaches it: an older host's `Forward` ends before it. |
+| `ssm_checkpoints` | `Span(u64)` | `.{}` | The absolute positions after which the engine files recurrent-state checkpoints for its prefix cache, ascending, each one of `prompt_spans` (`CacheOps.checkpoint`); empty = none wanted. Read it only when `size` reaches it. |
 
 ### `Ablation` (extern struct)
 
@@ -622,6 +653,17 @@ A recurrent layer's states: the convolution window and the scan state, and what 
 | `prework_v` | |  |
 | `prework_gb` | |  |
 
+### `LayerState` (extern struct)
+
+One recurrent layer's state after a checkpoint position (`CacheOps.checkpoint`): the convolution window `[B, K-1, C]` and the scan state `[B, Hv, Dv, Dk]`, borrowed for the call. As an array element, this layout is frozen for ABI version 1.
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `size` | `u32` | `@sizeOf(LayerState)` |  |
+| `layer` | `u32` | `0` |  |
+| `conv` | `Array` | `.{}` |  |
+| `ssm` | `Array` | `.{}` |  |
+
 ### `CacheOps` (extern struct)
 
 The engine's calls on a slot's cache (`Handle`), handed in `Forward.cache_ops`: blocks append and read KV and recurrent state through it and never see the engine's types. Every `Array` passed in stays the caller's.
@@ -640,6 +682,7 @@ The engine's calls on a slot's cache (`Handle`), handed in `Forward.cache_ops`: 
 | `state_rows` | `*const fn (caches: [*]const Handle, n: u32, layer: u32, slot: StateSlot, s: Stream) callconv(.c) Array` |  | Layer `layer`'s `slot` over `caches[0..n]`, stacked on the batch axis (axis 1 for `.state_seq`): a new reference the caller frees; a null array when any cache holds none yet. An engine that keeps a batch's states merged across ticks hands its group's array, with no concat. |
 | `set_state_rows` | `*const fn (caches: [*]const Handle, n: u32, layer: u32, slot: StateSlot, value: Array, s: Stream) callconv(.c) Verdict` |  | Replaces layer `layer`'s `slot` of `caches[0..n]` with the rows of `value` (the engine takes its own reference). A merged group keeps `value` whole and splits a row out only when that cache is read alone or leaves the group. |
 | `sdk_slots` | `bool` | `false` | Each handle is an SDK `cache_ops.Slot` (`sdk/kv/cache_ops.zig`), which an in-tree model may read directly. A flag, not the table's address: every compile unit holds its own copy of the table. |
+| `checkpoint` | `?*const fn (cache: Handle, pos: u64, states: Span(LayerState)) callconv(.c) Verdict` | `null` | A whole-prompt prefill's checkpoint: the named layers' states after `pos` tokens, `pos` the next position of `Forward.ssm_checkpoints`. The engine files its own copies; a layer not named keeps none. Null = not served. |
 
 ### `Round` (extern struct)
 
@@ -738,9 +781,9 @@ A plugin's opaque per-slot state beside the KV cache, under the RAM prefix cache
 | `size` | `u32` | `@sizeOf(AuxHooks)` |  |
 | `reserve` | `*const fn (m: *anyopaque, slot: u32, tokens: u64) callconv(.c) Verdict` |  |  |
 | `commit` | `*const fn (m: *anyopaque, slot: u32, len: u64) callconv(.c) Verdict` |  |  |
-| `snapshot` | `*const fn (m: *anyopaque, slot: u32, out: *Handle) callconv(.c) Verdict` |  | Transfers the slot's completed capture to the caller; null means no checkpoint was reached. |
+| `snapshot` | `*const fn (m: *anyopaque, slot: u32, out: *Handle) callconv(.c) Verdict` |  | Transfers the slot's completed capture to the caller; a plugin that can also hands over the state where an armed prompt it never finished stopped (`describe` says where). Null means neither. |
 | `restore_at` | `*const fn (m: *anyopaque, slot: u32, snap: Handle, pos: u64) callconv(.c) Verdict` |  | Accepts only `pos == snap.n`; builds the replacement before installing it. The caller keeps the snapshot. |
-| `slice` | `*const fn (m: *anyopaque, snap: Handle, len: u64, out: *Handle) callconv(.c) Verdict` |  | Clones references when `len == snap.n`; any other length returns named `.unsupported`. |
+| `slice` | `*const fn (m: *anyopaque, snap: Handle, len: u64, out: *Handle) callconv(.c) Verdict` |  | A snapshot of the longest prefix of at most `len` tokens the plugin restores at (`describe` says where): a clone at `len == snap.n`, shorter where the plugin can cut its state; named `.unsupported` when it holds none. |
 | `handoff` | `*const fn (m: *anyopaque, from_slot: u32, to_slot: u32) callconv(.c) Verdict` |  |  |
 | `free` | `*const fn (m: *anyopaque, snap: Handle) callconv(.c) void` |  | Releases the complete snapshot and its host allocations exactly once. |
 | `bytes` | `*const fn (m: *anyopaque, snap: Handle) callconv(.c) u64` |  | Resident bytes, including retained buffer capacities; encoded size is a separate quantity. |
@@ -1176,6 +1219,7 @@ Where a format reads a pack's tensors: the resident source (`sdk/weights/residen
 | `ctx` | `?*anyopaque` |  |  |
 | `get` | `*const fn (ctx: ?*anyopaque, name: Str) callconv(.c) Array` |  | The tensor `name` (the full key, `<base>.weight`) as the source holds it, borrowed for the source's life; an empty array when the pack has none. |
 | `resident` | `bool` | `false` | `ctx` is an SDK `Resident` whose map an in-tree model may take (`Resident.take`). A flag, not `get`'s address: every compile unit holds its own copy of the function. |
+| `release` | `?*const fn (ctx: ?*anyopaque, a: Array) callconv(.c) bool` | `null` | Lets go of the source's own handle `a` (a tensor `get` handed out) before the source's life ends: `get` and the engine's reads after the load no longer see it, and the caller holds no borrowed handle of it. True when the source held it. Null = every tensor kept for the source's life. Appended: called only where `size` reaches it. |
 
 ### `Weight` (extern struct)
 
@@ -1230,6 +1274,78 @@ A quant plugin's table, exported as `exportName(name, version)`. `claims`, `vali
 | `moe` | `*const fn (bank: *const Weight, x: Array, lhs: Array, rhs: Array, sorted: bool, s: Stream, out: *Array) callconv(.c) Verdict` |  | Routed experts: `x` through the bank rows `rhs` selects (`lhs` the gathered input rows, or empty; `sorted` when `rhs` is sorted). `out` receives a new array. |
 | `register_kernels` | `?*const fn (host: ?*const Host) callconv(.c) Verdict` | `null` | Registers the format's kernels with the kernel contract (P2 step 6). |
 | `swiglu` | `?*const fn (gate: *const Weight, up: *const Weight, down: *const Weight, x: Array, inds: Array, scores: Array, opts: *const Swiglu, s: Stream, out: *Array) callconv(.c) Verdict` | `null` | Routed SwiGLU experts in one dispatch, for a format whose kernels fuse the three projections (EXL3): `x` [B, S, D] through the banks' experts `inds` [B, S, K], weighted by `scores`. Null: compose `moe` per projection. |
+| `bank_rows` | `?*const fn (ctx: *const LoadCtx, geo: *const BankGeometry, budget: BankBudget, out: *BankRows) callconv(.c) Verdict` | `null` | The slot rows per routed layer `budget` buys over the pack's streamed expert bank, no memory taken (`open_bank`'s rows); refused by name when none fit. Null: the format streams no bank. |
+| `open_bank` | `?*const fn (ctx: *const LoadCtx, geo: *const BankGeometry, budget: BankBudget, out: *Bank) callconv(.c) Verdict` | `null` | The pack's streamed expert bank at the rows `budget` buys; it outlives `close`. |
+| `swiglu_limit_out` | `bool` | `false` | `swiglu` reads `Swiglu.limit_out`. Appended: the host passes a post-SiLU limit only to a table whose `size` reaches this flag and sets it (`clampsOut`), and refuses the call by name otherwise, so a table built before the field is never asked a clamp it would skip. |
+| `exact_rows` | `u32` | `0` | `matmul` over up to this many rows gives each row the bytes of its own one-row call; 0 = not declared, so a host that needs a row's one-row bytes calls one row at a time. Appended: read through `exactRows`. |
+
+### `BankGate` (extern struct)
+
+A layer's router as the trunk loaded it. The `gates` list is valid for the call only; the arrays it names live with the trunk, which outlives the bank.
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `w` | `Array` | `.{}` |  |
+| `bias` | `Array` | `.{}` |  |
+
+### `BankGeometry` (extern struct)
+
+The trunk's routed MoE a streamed bank serves.
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `size` | `u32` | `@sizeOf(BankGeometry)` |  |
+| `hidden` | `u32` |  |  |
+| `inter` | `u32` |  |  |
+| `top_k` | `u32` |  |  |
+| `n_experts` | `u32` |  |  |
+| `n_layers` | `u32` |  | The trunk's layers: `gates` and a call's `layer` index them alike. |
+| `swiglu_limit` | `f32` | `0` | > 0: the SwiGLU's clamp. |
+| `gates` | `?[*]const BankGate` | `null` | Every layer's router (`n_layers`); null for `bank_rows`. |
+| `limits_out` | `?[*]const f32` | `null` | Every layer's routed SwiGLU clamped AFTER the SiLU (`n_layers`, as `gates`; valid for the call only): > 0 the limit L of min(silu(g), L) * clamp(u, -L, L) (Ling-3.1's `expert_swiglu_limit_list`), 0 none; null: no layer clamps so. Appended: read it through `limitOut`, which a geometry from a host built before it (a smaller `size`) answers 0, so a plugin built with it loads on an older host, and a plugin built before it loads as before. |
+
+### `BankBudget` (extern struct)
+
+Bytes the slot rows and the bank's own buffers may hold in each phase (a prompt pass, decode).
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `prompt` | `u64` |  |  |
+| `decode` | `u64` |  |  |
+
+### `BankRows` (extern struct)
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `size` | `u32` | `@sizeOf(BankRows)` |  |
+| `prompt` | `u32` | `0` |  |
+| `decode` | `u32` | `0` |  |
+| `row_bytes` | `u64` | `0` | One slot row in every layer. |
+
+### `Bank` (extern struct)
+
+A streamed bank of routed experts, as the trunk's MoE reads one whose math it does not have (`sdk/weights/routed.zig` `Routed`, its `source` arm): a call returns the routed sum (`[n, hidden]` f32, a new array) of the normed input `x` over the routes `idx` weighted by `wts`. Every entry takes `ctx`; a refusal names its error.
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `size` | `u32` | `@sizeOf(Bank)` |  |
+| `ctx` | `?*anyopaque` | `null` |  |
+| `close` | `*const fn (ctx: ?*anyopaque) callconv(.c) void` |  |  |
+| `about` | `Str` | `.{}` | The load line's account of the bank, valid until `close`. |
+| `decode_ids` | `u32` |  | Routed ids a decode-phase call takes: a wider call is a prompt pass, which the bank refuses in decode. |
+| `rows` | `*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, out: *Array) callconv(.c) Verdict` |  | Every `layer` below is the trunk's layer index (`BankGeometry.n_layers`). |
+| `settle` | `*const fn (ctx: ?*anyopaque) callconv(.c) Verdict` |  | After the eval that consumed a forward's calls. |
+| `phase` | `*const fn (ctx: ?*anyopaque, prompt: bool) callconv(.c) Verdict` |  | Before each forward: a prompt pass or decode (the slot rows follow it). |
+| `read_ahead` | `*const fn (ctx: ?*anyopaque, layer: u32, ids: [*]const u16, n: usize) callconv(.c) Verdict` |  | A prompt pass's predicted routes of `layer` (every row's ids), read while its attention runs. |
+| `rows_shared` | `?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, shared: Array, out: *Array) callconv(.c) Verdict` | `null` | The fused forms the trunk takes where offered (`Routed`'s of the same names); null: not offered. |
+| `rows_expand` | `?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, shared: Array, res: Array, pc: Array, out: *Array) callconv(.c) Verdict` | `null` |  |
+| `rows_expand_into` | `?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, shared: Array, res: Array, pc: Array, out: *Array) callconv(.c) Verdict` | `null` |  |
+| `rows_decode_expand` | `?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, shared: Array, res: Array, pc: Array, out: *Array) callconv(.c) Verdict` | `null` |  |
+| `next_ahead` | `?*const fn (ctx: ?*anyopaque, layer: u32, ids: Array) callconv(.c) Verdict` | `null` |  |
+| `meters` | `?*const fn (ctx: ?*anyopaque, out: *Str) callconv(.c) void` | `null` | The bank's lines for the request's summary (`[stream-stats]` by phase, newline-separated), valid until the next call; the model logs them beside `[spec-stats]` at the request's end. Null: none. |
+| `exact_rows` | `bool` | `false` | A decode-phase `rows` call (at most `decode_ids` ids) gives each row the bytes that row's call alone gets. Appended: read only where `size` reaches it. |
+| `rows_independent` | `bool` | `false` | A prompt-phase `rows` call (more ids than `decode_ids`) sums each routed row by itself: a row's bytes do not depend on the call's other rows, so a model may join several prompt spans' rows into one call. False: not declared. Appended: read only where `size` reaches it. |
+| `rows_hoist` | `?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, hoist: Array, out: *Array) callconv(.c) Verdict` | `null` | `rows` for a decode-phase call (at most `decode_ids` ids) with `hoist`, an array the call does not read (the model's shared expert over the same rows): the bank may commit it while the call waits for its reads. `out` is `rows`' sum word for word; the model adds `hoist` itself. Null: not offered. Appended: read only where `size` reaches it. |
 
 ### `Swiglu` (extern struct)
 
@@ -1238,6 +1354,7 @@ A quant plugin's table, exported as `exportName(name, version)`. `claims`, `vali
 | `size` | `u32` | `@sizeOf(Swiglu)` |  |
 | `limit` | `i32` | `0` | > 0: the SwiGLU's clamp (GLM's `swiglu_limit`). |
 | `verify_rows` | `bool` | `false` | Spec-verify rows: the decode chain at any width. |
+| `limit_out` | `f32` | `0` | > 0: the SwiGLU clamped AFTER the SiLU, min(silu(g), L) * clamp(u, -L, L) (Ling-3.1's; `limit` is then 0). Appended: read only by a table that declares it (`QuantTable.clampsOut`). |
 
 ## `host.zig`
 
@@ -1252,6 +1369,7 @@ The `Host` table: everything process-wide a plugin reaches (the allocator, the l
 | `Stream` | `common.Stream` |  |
 | `version` | `u32 = 1` |  |
 | `gpu_version` | `u32 = 1` |  |
+| `gpu_min_size` | `usize = @offsetOf(HostGpu, "command_buffer_limits")` | The `HostGpu` size every plugin may rely on (through `alias`): members past it are optional, read only when the table's `size` reaches them, so a plugin built with a newer kit still loads on a host without them, and a plugin built before them loads on a host with them. |
 | `ane_version` | `u32 = 1` |  |
 | `AneProgram` | `opaque {}` | A compiled MIL program (`HostAne.program_create`), a request binding one procedure's surfaces, and an IOSurface. |
 | `AneRequest` | `opaque {}` |  |
@@ -1338,6 +1456,11 @@ One custom kernel as mlx-c's `mlx_fast_{metal,cuda}_kernel_new` takes it. The ca
 | `memory_ceiling` | `*const fn (ctx: ?*anyopaque) callconv(.c) u64` |  | Bytes the plugin may still allocate on the GPU right now: the host's ceiling less what is resident. |
 | `gpu` | `*const HostGpu` |  |  |
 | `ane` | `?*const HostAne` | `null` | The Neural Engine; read it through `aneOf`, which also answers null for a host older than this field. |
+| `quant_claimant` | `?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable` | `null` | The outside quant table the host loaded that claims a pack's quantization block `block_json` of `config_json`: the highest claim; null when none claims or two tie (the host logs a tie by name). A model plugin's own dylib holds no quant table, so its loads ask here (`outside.Format.open`). Read it through `quantClaimantOf`, which also answers null for a host older than this field. Any thread. |
+
+### `quantClaimantOf(h: *const Host) ?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable`
+
+`h.quant_claimant`, or null where the host has none or predates it (its `size` ends before the field).
 
 ### `aneOf(h: *const Host) ?*const HostAne`
 
@@ -1407,6 +1530,12 @@ The C API below MLX's kernel API: one implementation in the host against MLX's i
 | `alloc_uninit` | `*const fn (ctx: ?*anyopaque, shape: [*]const i32, ndim: usize, dtype: i32, out: *Array) callconv(.c) Verdict` |  | `out` (a fresh handle) becomes an evaluated [shape] array of `dtype` (mlx-c's `mlx_dtype` value) over one buffer from MLX's allocator, its bytes unspecified until written. |
 | `launch` | `*const fn (ctx: ?*anyopaque, outputs: *VectorArray, kernel: ?*anyopaque, inputs: VectorArray, config: KernelConfig, stream: Stream) callconv(.c) Verdict` |  | `mlx_fast_metal_kernel_apply`'s contract; a kernel from the host's cache launches MLX's built pipeline directly once MLX has built it (no per-launch source regeneration). Bit-identical to MLX's apply. |
 | `buffer_addresses` | `*const fn (ctx: ?*anyopaque, arrays: [*]const Array, n: usize, out: [*]u64) callconv(.c) Verdict` |  | Each evaluated, row-contiguous GPU array's buffer address + offset, for kernels reading sources from a table. |
+| `alias` | `*const fn (ctx: ?*anyopaque, base: Array, offset: u64, shape: [*]const i32, ndim: usize, dtype: i32, out: *Array) callconv(.c) Verdict` |  | `out` (a fresh handle) becomes an evaluated [shape] array of `dtype` (mlx-c's `mlx_dtype` value) over `base`'s bytes from `offset`, an MTLBuffer of its own over the same pages: MLX orders its work apart from `base`'s. Refused unless `base` is evaluated at its buffer's start, `offset` is page-aligned and the range fits. It holds `base` and adds no active memory; MLX cannot see aliases overlap, so tensors alive at once take disjoint ranges. |
+| `command_buffer_limits` | `*const fn (ctx: ?*anyopaque, ops: i32, mb: i32, prev_ops: *i32, prev_mb: *i32) callconv(.c) Verdict` |  | MLX's command-buffer split: the operations (`ops`) and MB of bound arrays (`mb`) a command buffer takes before it is committed, from each stream's next commit check (below 1 keeps the current value); the previous pair back. The words are the same at any split. Optional: read it only when `size` reaches it (`gpu_min_size`). |
+
+### `gpuHas(g: *const HostGpu, comptime name: []const u8) bool`
+
+Whether the table `g` (a host's, of any size) reaches its member `name`.
 
 ### `AneIo` (extern struct)
 
@@ -1556,7 +1685,7 @@ What the host shows while it waits on an engine, reported as deltas from any of 
 | `max_concurrent` | `u32` |  |  |
 | `memory_budget` | `u64` |  | what the engine may hold: GPU ceiling less memory in use, OS reserve out |
 | `settings_json` | `Str` |  | launch flags + Model Settings that shape a load (kv_quant, mtp, drafter, caches, cluster) |
-| `options_json` | `Str` |  | Model Settings `engine_options`, verbatim |
+| `options_json` | `Str` |  | empty: an engine plugin reads its settings as its options (`abi.dylib.Option`) |
 | `host` | `*const Host` |  | lives until `close` |
 
 ### `Info` (extern struct)
@@ -1597,12 +1726,55 @@ What the host shows while it waits on an engine, reported as deltas from any of 
 | `token` | `u32` |  |  |
 | `bias` | `f32` |  |  |
 
+### `GrammarKind` (enum(u8))
+
+| Member | Value | |
+|---|---|---|
+| `json_object` | |  |
+| `json_schema` | |  |
+| `regex` | |  |
+| `choice` | |  |
+| `ebnf` | |  |
+
+### `MediaKind` (enum(u8))
+
+| Member | Value | |
+|---|---|---|
+| `image` | |  |
+| `video_frame` | |  |
+| `audio` | |  |
+
+### `EventKind` (enum(u8))
+
+| Member | Value | |
+|---|---|---|
+| `prefilled` | |  |
+| `tokens` | |  |
+| `finished` | |  |
+| `audio` | |  |
+
+### `Reason` (enum(u8))
+
+| Member | Value | |
+|---|---|---|
+| `stop` | |  |
+| `length` | |  |
+| `cancelled` | |  |
+| `failed` | |  |
+
+### `Report` (enum(u8))
+
+| Member | Value | |
+|---|---|---|
+| `props` | |  |
+| `metrics` | |  |
+
 ### `Grammar` (extern struct)
 
 | Field | Type | Default | |
 |---|---|---|---|
 | `size` | `u32` | `@sizeOf(Grammar)` |  |
-| `kind` | `enum(u8) { json_object, json_schema, regex, choice, ebnf }` |  |  |
+| `kind` | `GrammarKind` |  |  |
 | `text` | `Str` |  |  |
 | `after` | `u32` | `no_token` | with thinking on, the constraint starts after this token |
 
@@ -1630,7 +1802,7 @@ What the host shows while it waits on an engine, reported as deltas from any of 
 
 | Field | Type | Default | |
 |---|---|---|---|
-| `kind` | `enum(u8) { image, video_frame, audio }` |  |  |
+| `kind` | `MediaKind` |  |  |
 | `at` | `u32` |  | where its placeholder run starts in the prompt |
 | `width` | `u32` |  |  |
 | `height` | `u32` |  |  |
@@ -1696,11 +1868,11 @@ Per request: at most one `prefilled`, then `tokens`*, then exactly one `finished
 | Field | Type | Default | |
 |---|---|---|---|
 | `size` | `u32` | `@sizeOf(Event)` |  |
-| `kind` | `enum(u8) { prefilled, tokens, finished, audio }` |  |  |
+| `kind` | `EventKind` |  |  |
 | `cached` | `u32` | `0` | prefilled: prompt tokens restored from a kept prefix |
 | `tokens` | `Span(u32)` | `.{}` | tokens: committed ids in order, valid during the call |
 | `logprobs` | `Span(Logprob)` | `.{}` | tokens: one per id when asked for |
-| `reason` | `enum(u8) { stop, length, cancelled, failed }` | `.stop` | finished |
+| `reason` | `Reason` | `.stop` | finished |
 | `stats` | `?*const Stats` | `null` | finished |
 | `verdict` | `Verdict` | `.{}` | finished(failed): the named error |
 | `prompt_tokens` | `u32` | `0` | prefilled: the prompt as the engine counted it |
@@ -1765,7 +1937,7 @@ Runs on the engine's thread; returns at once. `stop` ends the request as `finish
 | `step` | `?*const fn (e: *anyopaque, until_ns: u64) callconv(.c) bool` |  | host_gpu_thread only: true = did work |
 | `status` | `*const fn (e: *anyopaque, out: *Status) callconv(.c) void` |  |  |
 | `memory` | `*const fn (e: *anyopaque, out: *Memory) callconv(.c) void` |  |  |
-| `report_json` | `?*const fn (e: *anyopaque, what: enum(u8) { props, metrics }, out: *Str) callconv(.c) void` |  |  |
+| `report_json` | `?*const fn (e: *anyopaque, what: Report, out: *Str) callconv(.c) void` |  |  |
 | `trim` | `?*const fn (e: *anyopaque, want_bytes: u64) callconv(.c) u64` |  | drop caches under memory pressure |
 | `media_rows` | `?*const fn (e: *anyopaque, m: *const Media) callconv(.c) u32` |  | placeholder run length |
 | `embed` | `?*const fn (e: *anyopaque, inputs: Span(Span(u32)), out: [*]f32) callconv(.c) Verdict` |  |  |
@@ -1906,14 +2078,19 @@ An outside plugin's dylib: the one symbol it exports (`Manifest`, under `symbol`
 | `Verdict` | `common.Verdict` |  |
 | `version` | `u32 = 2` |  |
 | `symbol` | `"mlx_serve_plugin"` | The manifest's export name. Unversioned: a dylib built for another manifest version is refused by name, never reported as "no plugin here". |
+| `engine_pin` | `"engine plugin: links no MLX"` | An engine manifest's `mlx`: equal to no MLX build, so a host older than engine plugins (which checks every pin) refuses one by name instead of switching on a kind it has no arm for. |
 
 ### `Kind` (enum(u8))
+
+`engine`: a whole engine of its own (`abi/engine.zig`), its own runtime on its own thread, for the models it names. Open: a kind a later kit adds is refused by name (`negotiate`), never switched on.
 
 | Member | Value | |
 |---|---|---|
 | `model` | |  |
 | `media` | |  |
 | `quant` | |  |
+| `engine` | |  |
+| `_` | |  |
 
 ### `File` (extern struct)
 
@@ -1942,12 +2119,42 @@ The plugin's conformance fixture (`sdk.fixture.Fixture` across the boundary), in
 | `version` | `u32` | `version` |  |
 | `name` | `Str` |  |  |
 | `kind` | `Kind` |  |  |
-| `mlx` | `Str` |  | The MLX build the plugin was compiled against (the kit's `mlx.version`): one MLX per process. |
-| `table` | `*const anyopaque` |  | The kind's table (`ModelTable`, `MediaTable` or `QuantTable`), `size` and `version` first. |
+| `mlx` | `Str` |  | The MLX build the plugin was compiled against (the kit's `mlx.version`): one MLX per process. An engine never calls MLX: its pin is not read. |
+| `table` | `*const anyopaque` |  | The kind's table (`ModelTable`, `MediaTable`, `QuantTable` or `Engine`), `size` and `version` first. |
 | `claims` | `Span(Str)` | `.{}` | The `model_type`s it declares (`sdk.Plugin.claims`), for the conformance suite. |
 | `fixture` | `*const fn (out: *Fixture) callconv(.c) Verdict` |  |  |
 | `fixture_free` | `*const fn (f: *Fixture) callconv(.c) void` |  |  |
 | `plugin_version` | `Str` | `.{}` | The plugin's own version (its root's `version`), shown at install and in Settings; "" when it declares none. |
+| `models` | `Span(Str)` | `.{}` | An engine's models: the model folders it serves, by name (`Qwen3-0.6B-4bit` serves `<models>/<org>/Qwen3-0.6B-4bit`), and no others. Read through `declaredModels`: a manifest built before it ends at `plugin_version`. |
+| `options` | `Span(Option)` | `.{}` | The settings it reads from its environment (`getenv`, or the Host table's `lever`): the app draws them on the plugin's page, and the host sets each saved value before it opens the plugin, over one the shell set. Read through `declaredOptions`. |
+
+### `OptionKind` (enum(u8))
+
+| Member | Value | |
+|---|---|---|
+| `bool` | |  |
+| `number` | |  |
+| `text` | |  |
+| `_` | |  |
+
+### `Option` (extern struct)
+
+One setting (`Manifest.options`).
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `name` | `Str` |  | The plugin's name upper-cased, `_`, then [A-Z0-9_] (`optionNameOk`), never `MLX_`, `MTL_`, `METAL_` or `DYLD_`. Two plugins whose names nest (`foo`, `foo_bar`) can still declare one name: the loader sets it for the first. |
+| `kind` | `OptionKind` |  |  |
+| `default_value` | `Str` | `.{}` | The plugin's own value when none is set ("" when it names none), else a value of `kind` (`valueOk`). |
+| `help` | `Str` | `.{}` | One line the app shows under the name. |
+
+### `optionNameOk(plugin: []const u8, name: []const u8) bool`
+
+Whether plugin `plugin` may declare option `name` (`Option.name`); at most 128 bytes.
+
+### `valueOk(kind: OptionKind, value: []const u8) bool`
+
+Whether the host sets `value` for an option of `kind`: `0` or `1`, a plain decimal number, or text up to 1 KiB.
 
 ### `negotiate(m: *const Manifest, host_mlx: []const u8) Verdict`
 

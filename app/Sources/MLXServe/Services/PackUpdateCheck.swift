@@ -104,7 +104,7 @@ enum PackUpdateCheck {
         guard let repo = marker?.repo ?? ModelCard.repoId(localName: m.name) else { return .skipped("no Hugging Face name") }
         if let quant = m.quantFile { return .check(repo: repo, selection: .gguf(quant)) }
         if let sub = marker?.subfolder { return .check(repo: repo, selection: .variant(sub)) }
-        if isMediaModelType(m.modelType) || m.modelType == "laya",
+        if isMediaModelType(m.mediaModelType) || m.modelType == "laya",
            let bundle = CustomMediaModels.bundle(arch: m.modelType, repoId: repo) {
             let comp = bundle.components.first { $0.repo == repo } ?? bundle.components[0]
             return .check(repo: repo, selection: .media(comp.selection))
@@ -196,7 +196,7 @@ extension DownloadManager {
 
     /// The listing with its HTTP status (0 when the request never answered).
     func fetchListingStatus(repoId: String) async -> (Int, [[String: Any]]?) {
-        guard let url = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=true"),
+        guard let url = DownloadManager.hubURL("/api/models/\(repoId)/tree/main?recursive=true"),
               let (data, response) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(url)) else { return (0, nil) }
         return ((response as? HTTPURLResponse)?.statusCode ?? 0, try? JSONSerialization.jsonObject(with: data) as? [[String: Any]])
     }

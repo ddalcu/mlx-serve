@@ -36,7 +36,7 @@ if [ ! -d "$MODEL" ]; then
     exit 0
 fi
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 sleep 1
 # --no-pld for predictable prefill timing; big ctx for the long prompt.
 # A prefill shorter than the 5 s keepalive period observes nothing: on a chip that

@@ -4,6 +4,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const Constraint = @import("../grammar/constraint.zig").Constraint;
 const ThinkBound = @import("forced.zig").ThinkBound;
 const ToolForce = @import("forced.zig").ToolForce;
+const Bias = @import("../../abi/engine.zig").Bias;
 
 /// Sampling parameters for token generation.
 pub const SamplingParams = struct {
@@ -15,6 +16,8 @@ pub const SamplingParams = struct {
     presence_penalty: f32 = 0.0, // 0.0 = disabled
     /// OpenAI's: subtracted once per earlier occurrence of a token (0.0 = disabled).
     frequency_penalty: f32 = 0.0,
+    /// OpenAI's `logit_bias`, owned by the request handler. Served by an engine that declares `Caps.logit_bias`.
+    logit_bias: []const Bias = &.{},
     seed: ?u64 = null,
     /// Draw index under `seed`: every sample takes a fresh key.
     draw: u64 = 0,
@@ -39,6 +42,9 @@ pub const SamplingParams = struct {
     /// sampling policy. Null = no suppression (kill switch, no-template
     /// models, every non-suppressing arch).
     suppress_mask: ?mlx.mlx_array = null,
+    /// Read only by `Generator.initWithOptions`, which then wires
+    /// `Transformer.suppress_mask_cjk` instead of `suppress_mask`.
+    suppress_cjk: bool = false,
     /// Seeded draws go through `keyed_sample`: a token's noise is a hash of
     /// (seed, position, id), so a draft shares the draw its verify row makes
     /// (row-exact archs, `ModelConfig.rowExactDecode`).

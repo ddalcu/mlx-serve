@@ -51,8 +51,11 @@ enum DockReopen {
 /// App delegate installed via `@NSApplicationDelegateAdaptor`: the Dock-reopen
 /// hook (SwiftUI has no scene-level equivalent) and launch-time setup.
 final class MLXCoreAppDelegate: NSObject, NSApplicationDelegate {
+    private var quitSignals: [DispatchSourceSignal] = []
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = InstallId.current()
+        quitSignals = QuitSignals.install()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication,

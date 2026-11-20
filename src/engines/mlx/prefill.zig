@@ -14,7 +14,6 @@ const io_util = @import("../../sdk/util/io_util.zig");
 const plugin_driver = @import("plugin/driver.zig");
 const plugin_abi = @import("../../abi/plugin.zig");
 const plugin_settle = @import("plugin/settle.zig");
-const mlx_stream = @import("modules/stream.zig");
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
 const Generator = generate_mod.Generator;
@@ -47,7 +46,7 @@ const intree = @import("plugin/intree.zig");
 
 fn beginModulePrompt(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, n: usize) !void {
     const id = plugin_settle.slotId(slot.model.transformer.?.plugin.?, &slot.ctx);
-    const capture = if (slot.model.prefix_cache) |hc| hc.ram_enabled and hc.max_entries > 0 else false;
+    const capture = if (slot.prefix_cache) |hc| hc.ram_enabled and hc.max_entries > 0 else false;
     const v = plugin_driver.auxBeginPrompt(binding.xfm, id, slot.full_prompt, slot.vision_embeddings, n, capture);
     if (!v.isOk()) {
         log.err("[hot-cache] module prompt setup failed: {s}\n", .{v.why.slice()});
@@ -59,33 +58,40 @@ fn beginModulePrompt(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, n: us
 
 fn restoreModulePrompt(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.ModuleBinding) !usize {
     const id = plugin_settle.slotId(slot.model.transformer.?.plugin.?, &slot.ctx);
-    const selected = modulePromptMatch(slot, binding);
+    var selected = modulePromptMatch(slot, binding, true);
     var n = if (selected) |match| restoreModuleMatch(sch, slot, binding, match, id) else 0;
+    // The plugin holds no such cut: what an entry restores whole.
+    if (n == 0) if (selected) |match| if (match.cut > 0) {
+        selected = modulePromptMatch(slot, binding, false);
+        n = if (selected) |whole| restoreModuleMatch(sch, slot, binding, whole, id) else 0;
+    };
     slot.cached_tokens = 0;
     slot.restored_entry = 0;
     const had_error = mlx.errorPending();
     beginModulePrompt(slot, binding, n) catch |err| {
         if (n == 0) return err;
         mlx.dropLatchedErrorUnless(had_error);
-        if (selected) |match| if (match.source == .disk) slot.model.prefix_cache.?.disk.?.retireModule(match.disk_id);
+        if (selected) |match| if (match.source == .disk) slot.prefix_cache.?.disk.?.retireModule(match.disk_id);
         n = 0;
         try beginModulePrompt(slot, binding, 0);
     };
     if (n > 0) if (selected) |match| {
-        log.info("[hot-cache] module restored source={s} id={d} position={d}\n", .{ @tagName(match.source), if (match.source == .ram) match.entry_id else match.disk_id, n });
+        log.info("[hot-cache] module restored source={s} id={d} position={d}{s}\n", .{ @tagName(match.source), if (match.source == .ram) match.entry_id else match.disk_id, n, if (match.cut > 0) " (cut from a longer entry)" else "" });
     };
     return n;
 }
 
-fn modulePromptMatch(slot: *Slot, binding: prefix_cache_mod.ModuleBinding) ?prefix_cache_mod.ModuleMatch {
+fn modulePromptMatch(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, cuts: bool) ?prefix_cache_mod.ModuleMatch {
     if (slot.skip_prefix_cache) return null;
-    const hc = slot.model.prefix_cache orelse return null;
+    const hc = slot.prefix_cache orelse return null;
     if (!hc.ram_enabled or hc.max_entries == 0) return null;
+    if (!cuts) return hc.findWholeModuleMatch(binding, slot.full_prompt, slot.has_tools, slot.media, slot.vision_embeddings, slot.cache.config);
     return hc.findModuleMatch(binding, slot.full_prompt, slot.has_tools, slot.media, slot.vision_embeddings, slot.cache.config);
 }
 
 fn restoreModuleMatch(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.ModuleBinding, match: prefix_cache_mod.ModuleMatch, id: u32) usize {
-    if (match.source == .ram) return slot.model.prefix_cache.?.restoreModule(binding, match.entry_id, id);
+    if (match.source == .ram and match.cut > 0) return slot.prefix_cache.?.restoreModuleCut(binding, match.entry_id, id, match.cut);
+    if (match.source == .ram) return slot.prefix_cache.?.restoreModule(binding, match.entry_id, id);
     const restored = restoreDiskModule(sch, slot, binding, match, id) catch |err| {
         log.warn("[disk-cache] module import id={d} failed: {s}; prefilling cold\n", .{ match.disk_id, @errorName(err) });
         return 0;
@@ -107,7 +113,7 @@ const ModuleImportProbe = struct {
 
 /// Plan and admit before loading any part. Keep all inputs private until exact restore and prompt setup succeed.
 fn restoreDiskModule(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.ModuleBinding, match: prefix_cache_mod.ModuleMatch, id: u32) !bool {
-    const hc = slot.model.prefix_cache orelse return false;
+    const hc = slot.prefix_cache orelse return false;
     const d = if (hc.disk) |*disk| disk else return false;
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
@@ -212,7 +218,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const owns_module_state = slot.model.transformer != null and
         slot.model.transformer.?.moduleSpecWiring();
     const has_native_draft = slot.model.transformer != null and
-        (intree.dsv4(slot.model.transformer.?) != null or intree.dsv41(slot.model.transformer.?) != null or plugin_driver.nativeDrafter(slot.model.transformer.?) != null or slot.model.transformer.?.mlx_stream_ext != null);
+        (intree.dsv4(slot.model.transformer.?) != null or intree.dsv41(slot.model.transformer.?) != null or plugin_driver.nativeDrafter(slot.model.transformer.?) != null);
     const module_spec_rollback = slot.model.transformer != null and
         slot.model.transformer.?.moduleStateSpecRollback();
     const wiring = specInitWiring(
@@ -269,7 +275,9 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // because the conn thread holds a refcount on slot.model.
     const xfm_ptr: *Transformer = slot.model.transformer.?;
     const module_binding = prefix_cache_mod.ModuleBinding.forVariant(xfm_ptr, slot.cache_variant);
-    errdefer if (module_binding != null) {
+    // A cancelled prefill keeps its state for `finishSlot`, which commits what was forwarded and then releases it.
+    var cancelled_prefill = false;
+    errdefer if (module_binding != null and !cancelled_prefill) {
         @import("finish.zig").releasePluginSlot(slot);
         publishHotCacheResidency(sch);
     };
@@ -280,12 +288,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     } else {
         // DeepSeek-V4.1 keeps its own state: a prompt that extends its last one resumes there.
         const resume_at = if (slot.ctx.ablation == null) plugin_driver.resumePrompt(xfm_ptr, &slot.ctx, slot.full_prompt, slot.vision_embeddings) else null;
-        const resumed: u64 = if (resume_at) |n|
-            n
-        else if (xfm_ptr.mlx_stream_ext) |m|
-            try mlx_stream.begin(m, slot.full_prompt, slot.max_tokens, mlx_stream.contextLength(&xfm_ptr.config))
-        else
-            0;
+        const resumed: u64 = resume_at orelse 0;
         if (resumed > 0) {
             hot_matched = @intCast(resumed);
             prefill_tokens = slot.full_prompt[resumed..];
@@ -293,7 +296,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             log.info("[dsv41] resumed {d} of {d} prompt tokens\n", .{ resumed, slot.full_prompt.len });
         }
     }
-    if (module_binding == null) if (slot.model.prefix_cache) |hc| {
+    if (module_binding == null) if (slot.prefix_cache) |hc| {
         {
             // Only build a restore target when this request will actually
             // draft — a non-dflash turn leaves the payload in the entry for
@@ -386,7 +389,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // and ignore the stride entirely (no-op even at stride > 0). When the
     // hot prefix cache is disabled or off, set stride to 0 to skip
     // snapshot work that would just be discarded.
-    const cp_stride: u32 = if (slot.model.prefix_cache != null) slot.model.ssm_checkpoint_stride else 0;
+    const cp_stride: u32 = if (slot.prefix_cache != null) slot.model.ssm_checkpoint_stride else 0;
     const cp_max: u32 = slot.model.ssm_checkpoint_max;
 
     // Evict the hot cache to admit (#353). Here, not on the connection thread: the inference
@@ -441,7 +444,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 fits = Probe.call(&probe);
             };
             // A shared restore is billed a whole second copy; taking the entry over moves it instead.
-            if (!fits and !hot_checked_out and hot_matched > 0) if (slot.model.prefix_cache) |hc| {
+            if (!fits and !hot_checked_out and hot_matched > 0) if (slot.prefix_cache) |hc| {
                 if (hc.checkoutRestored(@intFromPtr(slot), slot.full_prompt.len)) {
                     hot_checked_out = true;
                     probe.warm_will_donate = true;
@@ -455,7 +458,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 }
                 // Per-model, off the slot: `sch.hot_prefix_cache` is whichever model loaded last.
                 // Captured by pointer: a `|hc|` capture would evict from a stack copy.
-                const report = if (slot.model.prefix_cache) |hc|
+                const report = if (slot.prefix_cache) |hc|
                     // Never evict the entry this request restored from: its buffers are shared.
                     hc.evictLruToAdmit(slot.full_prompt.len, &probe, Probe.call, true)
                 else
@@ -475,7 +478,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                     probe.warm_will_donate = false;
                     publishHotCacheResidency(sch);
                     // Dropping the restore can also unpin buffers shared with remaining entries.
-                    const cold_report = slot.model.prefix_cache.?.evictLruToAdmit(slot.full_prompt.len, &probe, Probe.call, false);
+                    const cold_report = slot.prefix_cache.?.evictLruToAdmit(slot.full_prompt.len, &probe, Probe.call, false);
                     evicted_live_bytes += cold_report.bytes;
                     fits = cold_report.admitted;
                     publishHotCacheResidency(sch);
@@ -542,10 +545,10 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Restore by move, the transfer: the last point at which nothing has written to `slot.cache`.
     // Everything above can still refuse and `releaseCheckout` then hands the entry back whole;
     // nothing between here and `initWithOptions` may fail.
-    if (slot.model.prefix_cache) |hc| hc.donateCheckout(@intFromPtr(slot));
+    if (slot.prefix_cache) |hc| hc.donateCheckout(@intFromPtr(slot));
     const graphs_were = mlx.setCudaGraphs(mlx.prefillKeepsCudaGraphs());
     defer _ = mlx.setCudaGraphs(graphs_were);
-    var gen = try Generator.initWithOptions(
+    var gen = Generator.initWithOptions(
         sch.io,
         slot.allocator,
         xfm_ptr,
@@ -628,7 +631,12 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .logprobs_n = slot.logprobs_n,
             .prompt_logprobs = if (slot.prompt_logprobs) slot.freshPromptLogprobs() else null,
         },
-    );
+    ) catch |err| {
+        cancelled_prefill = err == error.Cancelled;
+        // What the slot restored, so the cancelled commit can tell new chunks from the entry it started on.
+        if (cancelled_prefill) slot.cached_tokens = hot_matched;
+        return err;
+    };
     slot.prefill_interleaved_ns = interleave_ctx.decode_ns;
     gen.timeout_ns = slot.timeout_ns;
     gen.logprobs_n = slot.logprobs_n;

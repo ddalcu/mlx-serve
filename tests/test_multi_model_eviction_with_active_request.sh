@@ -32,7 +32,7 @@ M1="${MODELS[0]}"; M2="${MODELS[1]}"; M3="${MODELS[2]}"
 echo "  using $M1 (active), $M2 (lru-victim), $M3 (incoming)"
 
 BINARY="${MLX_SERVE_BINARY:-./zig-out/bin/mlx-serve}"
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 LOGFILE=$(mktemp); STREAM1=$(mktemp); RESP3=$(mktemp)
 "$BINARY" --model-dir "$ROOT" --model "$ROOT/$M1" --serve --port "$PORT" \

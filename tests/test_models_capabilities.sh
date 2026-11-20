@@ -62,6 +62,11 @@ cleanup() {
     echo "Stopping server (PID $SERVER_PID)..."
     kill $SERVER_PID 2>/dev/null
     wait $SERVER_PID 2>/dev/null
+    if [ -n "${PIN_PID:-}" ]; then
+        kill $PIN_PID 2>/dev/null
+        wait $PIN_PID 2>/dev/null
+    fi
+    if [ -n "${PIN_HOME:-}" ]; then rm -rf "$PIN_HOME"; fi
 }
 trap cleanup EXIT
 
@@ -282,6 +287,56 @@ print("ok")
 ' 2>&1)
 run_test "existing meta block preserved" \
     "$( [ "$META" = ok ] && echo PASS || echo FAIL )" "$META"
+
+# ── Test 6: an unloaded stub advertises its model-settings ctx_size pin ──
+# The stub must carry the window a load serves at (manualContext), not the native
+# max: launch bakes the advertised context once. Isolated HOME: the user's settings stay untouched.
+PIN_HOME=$(cd "$(mktemp -d)" && pwd -P)
+PACK="$PIN_HOME/.mlx-serve/models/pinned-stub"
+mkdir -p "$PACK"
+cat > "$PACK/config.json" <<EOF
+{"model_type":"llama","max_position_embeddings":1048576}
+EOF
+echo '{{ messages }}' > "$PACK/chat_template.jinja"
+# A second pack with no pin: it advertises the launch --ctx-size.
+cp -R "$PACK" "$PIN_HOME/.mlx-serve/models/flag-stub"
+cat > "$PIN_HOME/.mlx-serve/model-settings.json" <<EOF
+{"$PACK": {"ctx_size": 262144}}
+EOF
+PIN_PORT=$((PORT + 1))
+HOME="$PIN_HOME" ./zig-out/bin/mlx-serve --serve --port $PIN_PORT --ctx-size 131072 --log-level info \
+    >/tmp/mlx-serve-models-test-pin.log 2>&1 &
+PIN_PID=$!
+PIN_OK="fail:pin-server-did-not-start"
+for i in $(seq 1 30); do
+    if curl -sf "http://127.0.0.1:$PIN_PORT/health" > /dev/null 2>&1; then
+        PIN_OK=$(curl -sf "http://127.0.0.1:$PIN_PORT/v1/models" | python3 -c '
+import sys, json
+rows = json.loads(sys.stdin.read())["data"]
+m = next((r for r in rows if r["id"].endswith("pinned-stub")), None)
+if m is None:
+    print("fail:no_stub_row:" + repr([r["id"] for r in rows]))
+    sys.exit()
+meta = m.get("meta") or {}
+checks = {
+    "context_length": (m.get("context_length"), 262144),
+    "max_model_len": (m.get("max_model_len"), 262144),
+    "meta.context_length": (meta.get("context_length"), 262144),
+    "meta.model_max_tokens": (meta.get("model_max_tokens"), 1048576),
+    "agent_budget.context": ((m.get("agent_budget") or {}).get("context"), 262144),
+}
+f = next((r for r in rows if r["id"].endswith("flag-stub")), None) or {}
+checks["flag.context_length"] = (f.get("context_length"), 131072)
+checks["flag.meta.model_max_tokens"] = ((f.get("meta") or {}).get("model_max_tokens"), 1048576)
+bad = {k: v for k, v in checks.items() if v[0] != v[1]}
+print("ok" if not bad else "fail:" + repr(bad))
+' 2>&1)
+        break
+    fi
+    sleep 1
+done
+run_test "unloaded stub advertises the ctx_size pin, else --ctx-size; model_max_tokens stays native" \
+    "$( [ "$PIN_OK" = ok ] && echo PASS || echo FAIL )" "$PIN_OK"
 
 echo ""
 echo "=== Result: $PASS/$TOTAL passed ==="

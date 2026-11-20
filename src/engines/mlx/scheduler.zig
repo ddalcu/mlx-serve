@@ -70,7 +70,6 @@ const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const status = @import("../../host/status.zig");
 const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
-const mlx_stream = @import("modules/stream.zig");
 const sleep_inhibit = @import("runtime/sleep_inhibit.zig");
 
 const Transformer = transformer_mod.Transformer;
@@ -140,6 +139,7 @@ const mlxActiveBytes = @import("runtime/preflight.zig").mlxActiveBytes;
 const pleTableBill = @import("runtime/preflight.zig").pleTableBill;
 const residentModelDiskBytes = @import("runtime/preflight.zig").residentModelDiskBytes;
 const residentGateBytes = @import("runtime/preflight.zig").residentGateBytes;
+const ggufGateBytes = @import("runtime/preflight.zig").ggufGateBytes;
 pub const loadRequirementBytes = @import("runtime/preflight.zig").loadRequirementBytes;
 
 test {
@@ -259,6 +259,8 @@ pub fn init(
         .drafter_block_size = params.draft_block_size,
         .kv_quant_config = params.kv_quant_config,
         .gguf_ctx_size = params.ctx_size,
+        .warmup_eager = params.launch_warmup_eager,
+        .warmup_full = params.warmup_full,
         .prefix_cache_capacity = params.prefix_cache_capacity,
         .prefix_cache_ram_enabled = params.prefix_cache_ram_enabled,
         .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
@@ -490,13 +492,27 @@ pub fn decodingCount(self: *Scheduler) usize {
 pub fn hasCompany(self: *Scheduler) bool {
     self.queue_mu.lockUncancelable(self.io);
     defer self.queue_mu.unlock(self.io);
-    return self.in_flight > self.offloaded.items.len;
+    return self.in_flight -| self.warm_in_flight > self.offloaded.items.len;
 }
 
 /// Submit a new request. Builds a Slot, queues it, returns the handle.
 /// Blocks if the queue is full (i.e. `in_flight >= queue_cap`). When
 /// the scheduler is shutting down this returns `error.Shutdown`.
 pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
+    return submitWaiting(self, params, true);
+}
+
+/// `submit` from the inference thread: it is the thread that frees queue room, so a full queue is
+/// `error.QueueFull`, never a wait.
+pub fn submitNow(self: *Scheduler, params: SubmitParams) !*Slot {
+    self.queue_mu.lockUncancelable(self.io);
+    const full = self.in_flight >= self.queue_cap;
+    self.queue_mu.unlock(self.io);
+    if (full) return error.QueueFull;
+    return submitWaiting(self, params, false);
+}
+
+fn submitWaiting(self: *Scheduler, params: SubmitParams, wait: bool) !*Slot {
     // Construct the slot up front so we don't hold the queue mutex
     // through any allocation. Per-request `kv_quant_config` override (Wave
     // 1.A) wins over the process-level default carried on the scheduler.
@@ -511,6 +527,10 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
         refusal.refused().* = .{ .kind = e.kind, .cap = cap };
         return error.EngineUnsupported;
     };
+    if (params.model.engine == null and params.sampling.logit_bias.len > 0) {
+        refusal.refused().* = .{ .kind = .mlx, .cap = "logit_bias" };
+        return error.EngineUnsupported;
+    }
     // Every decode path reads the prompt's last token; `""` on a BOS-less vocab encodes to none.
     if (params.prompt_ids.len == 0) return error.EmptyPrompt;
     const eff_kv_quant = params.kv_quant_config orelse slot_config.kv_quant_override orelse self.kv_quant_config;
@@ -520,7 +540,11 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
     self.queue_mu.lockUncancelable(self.io);
     defer self.queue_mu.unlock(self.io);
 
+    var blocked: Blocked = .{};
+    defer blocked.leave(&self.submit_waiting);
     while (self.in_flight >= self.queue_cap and !self.shutdown.load(.acquire)) {
+        if (!wait) return error.QueueFull;
+        blocked.enter(&self.submit_waiting);
         self.submit_cond.waitUncancelable(self.io, &self.queue_mu);
     }
     if (self.shutdown.load(.acquire)) return error.Shutdown;
@@ -530,6 +554,8 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
     // then claim it (released in `complete`).
     if (params.model.sessionCapacity()) |cap| {
         while (params.model.session_claims >= cap and !self.shutdown.load(.acquire)) {
+            if (!wait) return error.QueueFull;
+            blocked.enter(&self.submit_waiting);
             self.session_cond.waitUncancelable(self.io, &self.queue_mu);
         }
         if (self.shutdown.load(.acquire)) return error.Shutdown;
@@ -564,11 +590,71 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
     return slot;
 }
 
+/// One `submit` call's share of `submit_waiting`: counted at its first wait, however many waits follow, and given
+/// back when the call returns.
+const Blocked = struct {
+    counted: bool = false,
+
+    fn enter(self: *Blocked, waiting: *u32) void {
+        if (self.counted) return;
+        self.counted = true;
+        waiting.* += 1;
+    }
+
+    fn leave(self: *Blocked, waiting: *u32) void {
+        if (self.counted) waiting.* -= 1;
+    }
+};
+
+test "a submit blocked for queue room and then for a session counts as one waiting request until it returns" {
+    var waiting: u32 = 0;
+    var a: Blocked = .{};
+    a.enter(&waiting);
+    a.enter(&waiting);
+    var b: Blocked = .{};
+    b.enter(&waiting);
+    try std.testing.expectEqual(@as(u32, 2), waiting);
+    a.leave(&waiting);
+    try std.testing.expectEqual(@as(u32, 1), waiting);
+    // A call that never waited gives nothing back.
+    var c: Blocked = .{};
+    c.leave(&waiting);
+    b.leave(&waiting);
+    try std.testing.expectEqual(@as(u32, 0), waiting);
+}
+
+test "submitNow: a full queue is refused at once, where submit would wait for the thread that is calling" {
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.queue_mu = .init;
+    sch.queue_cap = 2;
+    sch.in_flight = 2;
+    // Refused before the request is read: nothing of it is touched.
+    try testing.expectError(error.QueueFull, submitNow(&sch, undefined));
+}
+
 /// Give back the slot's session claim. Caller holds `queue_mu`.
 fn releaseSessionLocked(self: *Scheduler, slot: *Slot) void {
     slot.model.session_claims -= 1;
     slot.holds_session = false;
     self.session_cond.broadcast(self.io);
+}
+
+/// Take the slot out of every list a pass reads. Caller holds `queue_mu`.
+fn unlistLocked(self: *Scheduler, slot: *Slot) void {
+    for (self.pending.items, 0..) |s, i| if (s == slot) {
+        _ = self.pending.orderedRemove(i);
+        break;
+    };
+    for (self.decoding.items, 0..) |s, i| if (s == slot) {
+        _ = self.decoding.orderedRemove(i);
+        break;
+    };
+    for (self.offloaded.items, 0..) |s, i| if (s == slot) {
+        _ = self.offloaded.swapRemove(i);
+        engine_requests.cancel(slot);
+        break;
+    };
 }
 
 /// Hand the slot off to the inference thread for cleanup, and notify any
@@ -588,42 +674,21 @@ pub fn complete(self: *Scheduler, slot: *Slot) void {
     slot.cancelled.store(true, .release);
 
     self.queue_mu.lockUncancelable(self.io);
-
-    // Remove from pending (rare — only if conn thread cancels before
-    // prefill) and from decoding (the common case). After this, only the
-    // cleanup queue references the slot, so the next inference-thread
-    // cleanup drain can safely deinit it.
-    var i: usize = 0;
-    while (i < self.pending.items.len) : (i += 1) {
-        if (self.pending.items[i] == slot) {
-            _ = self.pending.orderedRemove(i);
-            break;
-        }
-    }
-    i = 0;
-    while (i < self.decoding.items.len) : (i += 1) {
-        if (self.decoding.items[i] == slot) {
-            _ = self.decoding.orderedRemove(i);
-            break;
-        }
-    }
-    for (self.offloaded.items, 0..) |s, j| if (s == slot) {
-        _ = self.offloaded.swapRemove(j);
-        engine_requests.cancel(slot);
-        break;
-    };
+    unlistLocked(self, slot);
 
     // Release the session claim (if this slot held it) so the next queued
     // request can claim it AND reuse the KV prefix it now holds. Done before
     // enqueueing cleanup so a waiting submitter can proceed immediately.
     if (slot.holds_session) releaseSessionLocked(self, slot);
 
-    // Out of every list, so no new pass can take it; wait out the one that has it,
-    // before the cleanup queue owns (and may free) the slot.
-    if (slot.in_pass.load(.acquire) != 0) {
+    // Wait out a pass that has the slot, before the cleanup queue owns (and may free) it. A pass
+    // can put a held slot back in `pending` before it lets go, so unlist again each time: a pass
+    // takes a slot from a list under `queue_mu`, so unlisted with `in_pass` at 0 means no one has it.
+    while (slot.in_pass.load(.acquire) != 0) {
         self.queue_mu.unlock(self.io);
         while (slot.in_pass.load(.acquire) != 0) std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
         self.queue_mu.lockUncancelable(self.io);
+        unlistLocked(self, slot);
     }
 
     self.cleanup_queue.append(self.allocator, slot) catch {
@@ -800,7 +865,8 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
     // Peeked OUTSIDE the registry mutex — it stats the model dir, and no
     // other load should block on our filesystem.
     const media_peak = mediaPeakFor(self, entry);
-    const mlx_text = owned.gguf == null and gen_mod.modalityFromType(owned.config.model_type) == null;
+    const mlx_text = owned.gguf == null and gen_mod.modalityFromType(owned.config.model_type) == null and
+        !@import("../../host/plugins/loader.zig").engineServes(entry.path);
     const validated_model_bytes: ?u64 = if (mlx_text)
         residentModelDiskBytes(self.allocator, self.io, entry.path, owned.config) catch |err| {
             self.registry.mutex.lockUncancelable(self.io);
@@ -810,7 +876,8 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
         }
     else
         null;
-    const resident_model_bytes = residentGateBytes(validated_model_bytes, entry.bytes_on_disk, mlx_text);
+    const discovered_bytes = if (owned.gguf) |g| ggufGateBytes(entry.bytes_on_disk, g.disk_only_bytes) else entry.bytes_on_disk;
+    const resident_model_bytes = residentGateBytes(validated_model_bytes, discovered_bytes, mlx_text);
     // A Neural Engine load holds int8 copies of the pack's 4- to 8-bit weights, and its KV.
     const ane_bytes: ?u64 = if (mlx_text and engines_served.aneWanted(owned.config, self.ane))
         engines_load.aneBytes(self.allocator, entry.path, self.ane_slots)
@@ -844,9 +911,6 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
             }
         }
 
-        // One stream pack at a time reads the process's foreign-bytes value (DeepSeek-V4.1, GLM-5.3).
-        const foreign_reader = try self.registry.foreignReaderVictimLocked(entry.id, owned.config);
-
         // Claim the slot.
         std.debug.assert(self.registry.tryBeginLoadLocked(entry));
         // From the claim: while victims unload or the queue waits, not the last load's numbers.
@@ -870,7 +934,7 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
         // (multi-victim). On failure — every other resident model is pinned
         // by an in-flight request — roll back and surface a 503 instead of
         // loading anyway and crashing.
-        const n = self.registry.planEvictionsLocked(entry.id, foreign_reader, &victims_buf, mlxActiveBytes()) orelse {
+        const n = self.registry.planEvictionsLocked(entry.id, &victims_buf, mlxActiveBytes()) orelse {
             // Name the numbers. A refusal that logs NOTHING sends the user
             // hunting for a concurrent request that does not exist: on an
             // idle server the cause is always the static cap (#126), and
@@ -921,7 +985,8 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
         .drafter_dir = coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
         .no_drafter = self.no_drafter,
         .load_vision = coldLoadVision(owned.config.has_vision),
-        .warmup_eager = true,
+        .warmup_eager = self.warmup_eager,
+        .warmup_full = self.warmup_full,
         .draft_block_size = self.draft_block_size,
         .draft_block_size_explicit = self.draft_block_size_explicit,
         .kv_quant_config = self.kv_quant_config,
@@ -1212,6 +1277,9 @@ pub fn batchVerdict(self: *const Scheduler, slot: *const Slot) BatchVerdict {
     if (slot.logprobs_n > 0) return .logprobs;
     if (slot.sampling.penalized()) return .penalty;
     const cfg = slot.model.config orelse return .arch;
+    // A DeepSeek-V4.1 model under MLX_SERVE_DSV41_EXACT=solo decodes every request alone: a batched row's bits depend
+    // on its company, and the mode promises each request its solo plain decode's tokens.
+    if (slot.model.transformer) |t| if (@import("spec/dspark_group.zig").exactSolo(t)) return .arch;
     if (modelBatchable(cfg)) return .ok;
     // A GatedDeltaNet trunk is rejected by the pure-config predicate (it is
     // a hybrid), but has its own batched kernel. Ask the transformer, never
@@ -1296,9 +1364,15 @@ test "company: a slot on an engine beside MLX never batches, so it does not coun
     defer sch.offloaded.deinit(testing.allocator);
     var ane: Slot = undefined;
     try sch.offloaded.append(testing.allocator, &ane);
+    sch.warm_in_flight = 0;
     sch.in_flight = 1;
     try testing.expect(!hasCompany(&sch));
     sch.in_flight = 2;
+    try testing.expect(hasCompany(&sch));
+    // Nor does the model's own warm request.
+    sch.warm_in_flight = 1;
+    try testing.expect(!hasCompany(&sch));
+    sch.in_flight = 3;
     try testing.expect(hasCompany(&sch));
 }
 
@@ -1328,6 +1402,42 @@ test "failInFlight: a decoding request ends with the error by name, its stuck pa
     try testing.expectEqualStrings("DistWorkerLeft", slot.error_code.?);
     // The stuck pass's hold is dropped, so the reader's `complete` returns.
     try testing.expectEqual(@as(u32, 0), slot.in_pass.load(.acquire));
+}
+
+test "complete: a slot its pass puts back in pending while complete waits is unlisted before cleanup owns it" {
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.allocator = testing.allocator;
+    sch.queue_mu = .init;
+    sch.queue_cond = .init;
+    sch.submit_cond = .init;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.offloaded = .empty;
+    sch.cleanup_queue = .empty;
+    sch.in_flight = 1;
+    defer sch.pending.deinit(testing.allocator);
+    defer sch.cleanup_queue.deinit(testing.allocator);
+    var slot: Slot = undefined;
+    slot.cancelled = .init(false);
+    slot.holds_session = false;
+    slot.in_pass = .init(1);
+    // A pass that holds the slot outside every list, then requeues it as a held prefill does and lets go.
+    const Pass = struct {
+        fn requeue(s: *Scheduler, sl: *Slot) void {
+            while (!sl.cancelled.load(.acquire)) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            testing.io.sleep(.fromMilliseconds(20), .awake) catch {}; // past `complete`'s first look
+            s.queue_mu.lockUncancelable(s.io);
+            s.pending.insert(s.allocator, 0, sl) catch {};
+            s.queue_mu.unlock(s.io);
+            _ = sl.in_pass.fetchSub(1, .acq_rel);
+        }
+    };
+    const pass = try std.Thread.spawn(.{}, Pass.requeue, .{ &sch, &slot });
+    complete(&sch, &slot);
+    pass.join();
+    try testing.expectEqual(@as(usize, 0), sch.pending.items.len);
+    try testing.expectEqual(@as(usize, 1), sch.cleanup_queue.items.len);
 }
 
 test "cancelAllInFlight: a request being prefilled at a chunk boundary is cancelled too" {

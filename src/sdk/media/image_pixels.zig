@@ -124,7 +124,20 @@ pub fn decodeCover(allocator: std.mem.Allocator, encoded: []const u8, target_h: 
 
 /// [1, 3|4, H, W] f32 in [0, 1] → PNG bytes (RGB, or RGBA for 4 channels; caller frees). Evaluates the image: a
 /// lazy generation's failure surfaces here.
-pub fn toPng(allocator: std.mem.Allocator, img: mlx.mlx_array, s: mlx.mlx_stream) ![]u8 {
+/// Interleaved u8 pixels (`channels` 3 or 4), truncated from [0, 1] the way `toPng` writes them.
+pub const Pixels8 = struct {
+    px: []u8,
+    w: u32,
+    h: u32,
+    channels: u32,
+
+    pub fn deinit(p: Pixels8, allocator: std.mem.Allocator) void {
+        allocator.free(p.px);
+    }
+};
+
+/// [1, C, H, W] f32 in [0, 1] (C 3 or 4) -> interleaved u8. Caller frees.
+pub fn toPixels8(allocator: std.mem.Allocator, img: mlx.mlx_array, s: mlx.mlx_stream) !Pixels8 {
     var cf = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(cf);
     try mlx.check(mlx.mlx_contiguous(&cf, img, false, s));
@@ -136,13 +149,23 @@ pub fn toPng(allocator: std.mem.Allocator, img: mlx.mlx_array, s: mlx.mlx_stream
     const W: usize = @intCast(sh[3]);
     const d = mlx.mlx_array_data_float32(cf) orelse return error.NoData;
     const pixels = try allocator.alloc(u8, W * H * channels);
-    defer allocator.free(pixels);
     const plane = W * H;
     for (0..H) |y| for (0..W) |x| {
         const o = (y * W + x) * channels;
         for (0..channels) |c| pixels[o + c] = @intFromFloat(std.math.clamp(d[c * plane + y * W + x] * 255.0, 0, 255));
     };
-    return if (channels == 4) png.encodeRgba(allocator, pixels, @intCast(W), @intCast(H)) else png.encodeRgb(allocator, pixels, @intCast(W), @intCast(H));
+    return .{ .px = pixels, .w = @intCast(W), .h = @intCast(H), .channels = @intCast(channels) };
+}
+
+/// Interleaved RGB or RGBA u8 -> PNG bytes. Caller frees.
+pub fn encodePng(allocator: std.mem.Allocator, p: Pixels8) ![]u8 {
+    return if (p.channels == 4) png.encodeRgba(allocator, p.px, p.w, p.h) else png.encodeRgb(allocator, p.px, p.w, p.h);
+}
+
+pub fn toPng(allocator: std.mem.Allocator, img: mlx.mlx_array, s: mlx.mlx_stream) ![]u8 {
+    const p = try toPixels8(allocator, img, s);
+    defer p.deinit(allocator);
+    return encodePng(allocator, p);
 }
 
 // ── tests ──

@@ -17,10 +17,12 @@ const AdmissionBill = @import("../../abi/engine.zig").Bill;
 const PROMPT_LOGPROBS_UNAVAILABLE_MSG = @import("../api/completions.zig").PROMPT_LOGPROBS_UNAVAILABLE_MSG;
 const sendResponse = @import("respond.zig").sendResponse;
 const jsonEscape = @import("../api/format.zig").jsonEscape;
-const sendAnthropicError = @import("../api/anthropic.zig").sendAnthropicError;
+const sendAnthropicErrorWithReason = @import("../api/anthropic.zig").sendAnthropicErrorWithReason;
 const sendAnthropicEvent = @import("../api/anthropic.zig").sendAnthropicEvent;
 const sendResponsesEvent = @import("../api/responses/events.zig").sendResponsesEvent;
 const engine_requests = @import("../engines/refusal.zig");
+
+pub const MEMORY_REFUSAL_REASON = "memory_refused";
 
 /// A slot that errored reports why: the MLX error latch's `error.OutOfMemory` is a memory
 /// failure the operator can act on. One helper for the three slot-drain sites.
@@ -75,6 +77,7 @@ pub const GenErrorWire = struct {
     openai_type: []const u8,
     anthropic_type: []const u8,
     message: []const u8,
+    reason: ?[]const u8 = null,
 };
 
 /// The mapping from a failed generation to what the client is told. It existed only on the
@@ -105,6 +108,7 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .openai_type = "invalid_request_error",
             .anthropic_type = "invalid_request_error",
             .message = prefillNoFitMessage(buf),
+            .reason = MEMORY_REFUSAL_REASON,
         },
         error.EmptyPrompt => .{
             .status_line = "400 Bad Request",
@@ -159,27 +163,41 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
 fn buildOpenAiStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
     const esc = try jsonEscape(allocator, w.message);
     defer allocator.free(esc);
+    const reason = try optionalReasonField(allocator, w.reason);
+    defer allocator.free(reason);
     return std.fmt.allocPrint(allocator,
-        \\data: {{"error":{{"message":{s},"type":"{s}","param":null,"code":{d}}},"choices":[{{"index":0,"delta":{{}},"finish_reason":"error"}}]}}
-    ++ "\n\n", .{ esc, w.openai_type, w.code });
+        \\data: {{"error":{{"message":{s},"type":"{s}","param":null,"code":{d}{s}}},"choices":[{{"index":0,"delta":{{}},"finish_reason":"error"}}]}}
+    ++ "\n\n", .{ esc, w.openai_type, w.code, reason });
 }
 
 /// The `/v1/messages` terminal `error` event payload.
 fn buildAnthropicStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
     const esc = try jsonEscape(allocator, w.message);
     defer allocator.free(esc);
+    const reason = try optionalReasonField(allocator, w.reason);
+    defer allocator.free(reason);
     return std.fmt.allocPrint(allocator,
-        \\{{"type":"error","error":{{"type":"{s}","message":{s}}}}}
-    , .{ w.anthropic_type, esc });
+        \\{{"type":"error","error":{{"type":"{s}","message":{s}{s}}}}}
+    , .{ w.anthropic_type, esc, reason });
 }
 
 /// The `/v1/responses` terminal `error` event payload (`sendResponsesEvent` adds `sequence_number`).
 fn buildResponsesStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
     const esc = try jsonEscape(allocator, w.message);
     defer allocator.free(esc);
+    const reason = try optionalReasonField(allocator, w.reason);
+    defer allocator.free(reason);
     return std.fmt.allocPrint(allocator,
-        \\{{"type":"error","code":"{s}","message":{s},"param":null}}
-    , .{ w.openai_type, esc });
+        \\{{"type":"error","code":"{s}","message":{s},"param":null{s}}}
+    , .{ w.openai_type, esc, reason });
+}
+
+/// `,"reason":"<r>"` for an error object, or nothing: an error without a reason keeps its bytes.
+pub fn optionalReasonField(allocator: std.mem.Allocator, reason: ?[]const u8) ![]u8 {
+    const value = reason orelse return allocator.alloc(u8, 0);
+    const escaped = try jsonEscape(allocator, value);
+    defer allocator.free(escaped);
+    return std.fmt.allocPrint(allocator, ",\"reason\":{s}", .{escaped});
 }
 
 /// Which wire dialect a generative surface speaks its errors in.
@@ -203,8 +221,8 @@ pub fn sendGenerationError(allocator: std.mem.Allocator, stream: *Conn, err: any
 
     if (!stream.sse_headers_sent) {
         return switch (surface) {
-            .anthropic => sendAnthropicError(allocator, stream, w.anthropic_type, w.message, w.code),
-            else => sendErrorResponse(allocator, stream, w.status_line, w.openai_type, w.message, w.code),
+            .anthropic => sendAnthropicErrorWithReason(allocator, stream, w.anthropic_type, w.message, w.code, w.reason),
+            else => sendErrorResponseWithReason(allocator, stream, w.status_line, w.openai_type, w.message, w.code, w.reason),
         };
     }
 
@@ -278,7 +296,10 @@ pub fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
 }
 
 pub const gpu_context_lost_message =
-    "The GPU context was lost (a CUDA kernel faulted) and every GPU call now fails. Restart the server; the server log names the first error.";
+    "The GPU context was lost (a CUDA kernel faulted, or Metal stopped taking this process's work after GPU errors) and every GPU call now fails. Restart the server; the server log names the first error.";
+
+pub const gpu_timeout_load_message =
+    "The GPU timed out while loading the model, as it can while macOS makes room in memory. Retry the request; the next one loads it again.";
 
 /// Body text for a context-overflow 400, in a caller-owned buffer.
 ///
@@ -332,7 +353,7 @@ pub fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched:
         error.Shutdown => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503),
         error.DistWorkerNotJoined => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "worker_not_joined", "This model is served with a second Mac that has not joined: start `mlx-serve worker` there, then retry", 503),
         error.GpuContextLost => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "gpu_context_lost", gpu_context_lost_message, 503),
-        error.ForeignBytesReaderBusy => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_busy", "Another DeepSeek-V4.1 or GLM-5.3 stream pack is in use; retry when its request finishes", 503),
+        error.GpuTimeout => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "gpu_timeout", gpu_timeout_load_message, 503),
         // Other errors (CPU-side preload failures like FileNotFound on a
         // missing tokenizer.json, JSON parse errors on a malformed
         // config.json, etc.) bubble out of `preloadCpuState`. Surface a
@@ -383,20 +404,29 @@ pub fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []con
 }
 
 pub fn sendErrorResponse(allocator: std.mem.Allocator, stream: *Conn, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32) !void {
+    return sendErrorResponseWithReason(allocator, stream, status, err_type, message, code, null);
+}
+
+pub fn sendErrorResponseWithReason(allocator: std.mem.Allocator, stream: *Conn, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32, reason: ?[]const u8) !void {
+    const body = try buildErrorResponseBody(allocator, err_type, message, code, reason);
+    defer allocator.free(body);
+    try sendResponse(stream, status, "application/json", body);
+}
+
+pub fn buildErrorResponseBody(allocator: std.mem.Allocator, err_type: []const u8, message: []const u8, code: ?u32, reason: ?[]const u8) ![]u8 {
     const escaped_msg = try jsonEscape(allocator, message);
     defer allocator.free(escaped_msg);
-
+    const reason_field = try optionalReasonField(allocator, reason);
+    defer allocator.free(reason_field);
     var code_buf: [16]u8 = undefined;
     const code_str = if (code) |c|
         std.fmt.bufPrint(&code_buf, "{d}", .{c}) catch "null"
     else
         "null";
 
-    const body = try std.fmt.allocPrint(allocator,
-        \\{{"error":{{"message":{s},"type":"{s}","param":null,"code":{s}}}}}
-    , .{ escaped_msg, err_type, code_str });
-    defer allocator.free(body);
-    try sendResponse(stream, status, "application/json", body);
+    return std.fmt.allocPrint(allocator,
+        \\{{"error":{{"message":{s},"type":"{s}","param":null,"code":{s}{s}}}}}
+    , .{ escaped_msg, err_type, code_str, reason_field });
 }
 
 // ── tests ──
@@ -620,4 +650,65 @@ test "outcome row 7/9: countRejected moves the rejected counter, and does nothin
     try t.expectEqual(@as(u64, 1), m.requests_rejected_total.load());
     try t.expectEqual(@as(u64, 0), m.requests_failed_total.load());
     try t.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
+}
+
+test "memory refusal generation errors carry a reason on every stream dialect" {
+    const t = std.testing;
+    const a = t.allocator;
+    var buf: [320]u8 = undefined;
+    const w = mapGenerationError(error.PrefillDoesNotFit, &buf);
+
+    const openai = try buildOpenAiStreamError(a, w);
+    defer a.free(openai);
+    try t.expect(std.mem.indexOf(u8, openai, "\"code\":400,\"reason\":\"memory_refused\"") != null);
+
+    const anthropic = try buildAnthropicStreamError(a, w);
+    defer a.free(anthropic);
+    try t.expect(std.mem.indexOf(u8, anthropic, "\"reason\":\"memory_refused\"") != null);
+
+    const responses = try buildResponsesStreamError(a, w);
+    defer a.free(responses);
+    try t.expect(std.mem.indexOf(u8, responses, "\"param\":null,\"reason\":\"memory_refused\"") != null);
+}
+
+test "memory refusal non-streaming bodies carry a reason" {
+    const t = std.testing;
+    const a = t.allocator;
+    const body = try buildErrorResponseBody(a, "invalid_request_error", "prompt does not fit", 400, "memory_refused");
+    defer a.free(body);
+    try t.expect(std.mem.indexOf(u8, body, "\"code\":400,\"reason\":\"memory_refused\"") != null);
+}
+
+test "errors without a reason preserve their existing body bytes" {
+    const t = std.testing;
+    const a = t.allocator;
+    var buf: [320]u8 = undefined;
+    const w = mapGenerationError(error.EmptyPrompt, &buf);
+
+    const openai = try buildErrorResponseBody(a, w.openai_type, w.message, w.code, null);
+    defer a.free(openai);
+    try t.expectEqualStrings("{\"error\":{\"message\":\"the prompt encodes to no tokens\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":400}}", openai);
+
+    const openai_stream = try buildOpenAiStreamError(a, w);
+    defer a.free(openai_stream);
+    try t.expectEqualStrings("data: {\"error\":{\"message\":\"the prompt encodes to no tokens\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":400},\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\"}]}\n\n", openai_stream);
+
+    const anthropic_stream = try buildAnthropicStreamError(a, w);
+    defer a.free(anthropic_stream);
+    try t.expectEqualStrings("{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"the prompt encodes to no tokens\"}}", anthropic_stream);
+
+    const responses = try buildResponsesStreamError(a, w);
+    defer a.free(responses);
+    try t.expectEqualStrings("{\"type\":\"error\",\"code\":\"invalid_request_error\",\"message\":\"the prompt encodes to no tokens\",\"param\":null}", responses);
+}
+
+test "generation out of memory does not carry a refusal reason" {
+    const t = std.testing;
+    const a = t.allocator;
+    var buf: [320]u8 = undefined;
+    const w = mapGenerationError(error.GenerationOutOfMemory, &buf);
+
+    const openai = try buildOpenAiStreamError(a, w);
+    defer a.free(openai);
+    try t.expect(std.mem.indexOf(u8, openai, "\"reason\"") == null);
 }

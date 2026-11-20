@@ -9,6 +9,7 @@ pub const abi = struct {
     pub const quant = @import("abi/quant.zig");
     pub const host = @import("abi/host.zig");
     pub const dylib = @import("abi/dylib.zig");
+    pub const engine = @import("abi/engine.zig");
 };
 
 /// `sdk.Plugin`, `claimsByType`, `fixture`, `tensors`, `byte_tokenizer`, as built-in plugins see them.
@@ -29,9 +30,54 @@ pub const ane = struct {
 /// The MLX bindings `blocks` are written on: their `mlx_array` and `mlx_stream` are `{ ctx }` like mlx-c's, so a
 /// plugin converts at the call (`.{ .ctx = x.ctx }`).
 pub const mlx = @import("mlx/ffi.zig");
+/// The `Graph` the blocks build their layers in (it owns every array it makes until it ends; `call` runs any mlx-c op),
+/// and the array helpers beside it (`materializedOwnedCopy`, the axis views and concatenations).
+pub const mlx_ops = @import("mlx/ops.zig");
+pub const mlx_array = @import("mlx/array.zig");
+/// The server's leveled log: a plugin's lines go to stderr and the server's log file like the blocks' own.
+pub const log = @import("sdk/util/log.zig");
+/// The op scope over mlx-c (`mlx/scope.zig`): a forward's intermediates kept in the scope and freed together.
+pub const mlx_scope = @import("mlx/scope.zig");
+/// What the machine has and how loaded it is (`sdk/util/system.zig`): memory, memory pressure, CPU and GPU load, GPU
+/// cores.
+pub const system = @import("sdk/util/system.zig");
+/// What the GPU is (`mlx/device.zig`): its generation, whether the NAX matrix units serve (`naxAvailable`) and
+/// whether a matmul runs in TF32 (`tf32Matmul`), as the server's own kernels choose their paths.
+pub const mlx_device = @import("mlx/device.zig");
+/// The expert stream (`sdk/weights/streamed.zig`): routed experts read from SSD into slot rows, its residency policy and
+/// read pool, for a plugin's own bank format (`expert.stream.StreamOf` over the plugin's bank) or an MLX pack's experts
+/// as downloaded (`Streamed.openPack`). macOS only. The read pool is C a plugin compiles in (`build.zig`
+/// `streamSources`); its MLX internals reach the server through the `HostGpu` table (the plugin's own C shims over it).
+pub const streamed = @import("sdk/weights/streamed.zig");
 
 /// Register a quant layout of your own (`foreign.register`) so the blocks' `qmatmul` and expert matmul read it.
 pub const foreign = @import("sdk/quant/foreign.zig");
+
+/// The language-model bases' blocks a model plugin's own forward composes (`sdk/bases/blocks/`: the routed MLP, the
+/// gated-delta layer and its conv and state, the compiled-graph helpers), the bases' eval cadence (`run`), and the
+/// KDA-hybrid base (`kda_hybrid`: GLM-5.3-Flash's and Ling 3.0's trunk, KDA layer, slots and table glue).
+pub const bases = struct {
+    pub const run = @import("sdk/bases/run.zig");
+    pub const kda_hybrid = @import("sdk/bases/kda_hybrid/kda_hybrid.zig");
+    pub const blocks = struct {
+        pub const compiled = @import("sdk/bases/blocks/compiled.zig");
+        pub const conv1d = @import("sdk/bases/blocks/conv1d.zig");
+        pub const gdn = @import("sdk/bases/blocks/gdn.zig");
+        pub const moe = @import("sdk/bases/blocks/moe.zig");
+        pub const state = @import("sdk/bases/blocks/state.zig");
+    };
+};
+/// The prompt pass's memory bill a model plugin reports in `Bill.prefill_bytes`.
+pub const bill = struct {
+    pub const prefill = @import("sdk/bill/prefill.zig");
+};
+/// A model plugin's side of an outside quant plugin's pack: its stored projections, resident experts and the bank's fit.
+pub const outside_model = @import("sdk/quant/outside_model.zig");
+/// The kernel contract (`sdk/testing/kernel_contract/REGISTERING.md`): a plugin registers its own kernels' specs and runs
+/// the gates in its own test step.
+pub const testing = struct {
+    pub const kernel_contract = @import("sdk/testing/kernel_contract/root.zig");
+};
 
 /// Layer blocks the server's own plugins are built from, for a plugin that would rather call them than write the layer
 /// on mlx-c. They are versioned with the kit: build against one kit version and pin it, a newer kit may rename or
@@ -64,6 +110,7 @@ pub const blocks = struct {
         pub const timestep = @import("sdk/blocks/dit/timestep.zig");
         pub const rope = @import("sdk/blocks/dit/rope.zig");
         pub const linear = @import("sdk/blocks/dit/linear.zig");
+        pub const mixed_linear = @import("sdk/blocks/dit/mixed_linear.zig");
         pub const dit_kernels = @import("sdk/blocks/dit/dit_kernels.zig");
         pub const int8_attn = @import("sdk/blocks/dit/int8_attn.zig");
         pub const w8a8 = @import("sdk/blocks/dit/w8a8.zig");
@@ -140,6 +187,10 @@ pub const blocks = struct {
         pub const gate = @import("sdk/blocks/gdn/gate.zig");
         pub const gated_delta_net = @import("sdk/blocks/gdn/gated_delta_net.zig");
         pub const kernels = @import("sdk/blocks/gdn/kernels.zig");
+    };
+    pub const kda = struct {
+        pub const gate = @import("sdk/blocks/kda/gate.zig");
+        pub const recurrence = @import("sdk/blocks/kda/recurrence.zig");
     };
 };
 

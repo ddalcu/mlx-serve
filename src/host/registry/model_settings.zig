@@ -71,6 +71,10 @@ pub const Override = struct {
     }
 };
 
+/// A registered model as the request path names it: the path it was registered at and the
+/// real path the registry resolved then ("" when it could not), so a lookup does no I/O.
+pub const ModelPath = struct { path: []const u8, real: []const u8 = "" };
+
 pub const Settings = struct {
     parsed: ?std.json.Parsed(std.json.Value) = null,
 
@@ -95,6 +99,13 @@ pub const Settings = struct {
         return null;
     }
 
+    /// The spelling `m`'s entry is keyed by: its own, else its real path (the app keys a
+    /// folder reached through a symlink by the folder it resolves to).
+    fn keyOf(self: *const Settings, m: ModelPath) []const u8 {
+        if (m.real.len == 0 or self.entry(m.path) != null) return m.path;
+        return m.real;
+    }
+
     /// The model path whose `alias` is `name`; a name claimed twice goes to the
     /// lowest path. Borrowed from the parsed file.
     pub fn pathForAlias(self: *const Settings, name: []const u8) ?[]const u8 {
@@ -113,6 +124,16 @@ pub const Settings = struct {
     /// The valid alias set for `model_path`, borrowed from the parsed file.
     pub fn aliasForPath(self: *const Settings, model_path: []const u8) ?[]const u8 {
         return aliasOf(self.entry(model_path) orelse return null);
+    }
+
+    /// The `ctx_size` pinned for `model_path`; 0 when the file sets none or
+    /// names it badly — the same parse rule `lookup` applies, on the folder's
+    /// own key (a load's `.gguf`-file fallback lives in `lookupPack`).
+    pub fn ctxSize(self: *const Settings, model_path: []const u8) u32 {
+        const e = self.entry(model_path) orelse return 0;
+        if (e != .object) return 0;
+        const c = e.object.get("ctx_size") orelse return 0;
+        return ctxSizeValue(c);
     }
 
     pub const Duplicate = struct { alias: []const u8, a: []const u8, b: []const u8 };
@@ -162,18 +183,25 @@ fn trimSlash(p: []const u8) []const u8 {
     return s;
 }
 
+/// The `ctx_size` a JSON value pins; 0 when it is absent, not an integer, or
+/// outside a positive u32 — the one parse rule every reader shares.
+fn ctxSizeValue(c: std.json.Value) u32 {
+    return switch (c) {
+        .integer => |i| if (i > 0 and i <= std.math.maxInt(u32)) @intCast(i) else 0,
+        else => 0,
+    };
+}
+
 fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
     const obj = switch (v) {
         .object => |o| o,
         else => return .{},
     };
     var o: Override = .{};
-    if (obj.get("ctx_size")) |c| switch (c) {
-        .integer => |i| if (i > 0 and i <= std.math.maxInt(u32)) {
-            o.ctx_size = @intCast(i);
-        },
-        else => {},
-    };
+    if (obj.get("ctx_size")) |c| {
+        const pin = ctxSizeValue(c);
+        if (pin > 0) o.ctx_size = pin;
+    }
     if (obj.get("kv_quant")) |k| o.kv_quant = kv_quant.KVQuantConfig.fromJsonValue(k);
     if (obj.get("mtp")) |m| switch (m) {
         .bool => |b| o.mtp = b,
@@ -285,32 +313,37 @@ pub const Cache = struct {
         return copyInto(buf, self.settings.pathForAlias(name));
     }
 
-    /// The alias of `model_path`, copied into `buf`.
-    pub fn aliasForPath(self: *Cache, io: std.Io, model_path: []const u8, buf: []u8) ?[]const u8 {
+    /// The alias of `model`, copied into `buf`.
+    pub fn aliasForPath(self: *Cache, io: std.Io, model: ModelPath, buf: []u8) ?[]const u8 {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.refresh(io);
-        return copyInto(buf, self.settings.aliasForPath(model_path));
+        return copyInto(buf, self.settings.aliasForPath(self.settings.keyOf(model)));
     }
 
-    /// The generation rules of `model_path`'s entry; null reads the whole file as one
+    /// The `ctx_size` pinned for `model`, 0 when none: the window a load
+    /// will enforce (`http/server.zig manualContext`), for a row that must
+    /// advertise it before the model is resident.
+    pub fn ctxSizeFor(self: *Cache, io: std.Io, model: ModelPath) u32 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.refresh(io);
+        return self.settings.ctxSize(self.settings.keyOf(model));
+    }
+
+    /// The generation rules of `model`'s entry; null reads the whole file as one
     /// profile (`generation-settings.json`). Read per request, so an edit applies to the next one.
-    pub fn generationDefaults(self: *Cache, io: std.Io, model_path: ?[]const u8) generation.Profile {
+    pub fn generationDefaults(self: *Cache, io: std.Io, model: ?ModelPath) generation.Profile {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.refresh(io);
         const parsed = self.settings.parsed orelse return .{};
-        const path = model_path orelse return generation.parseProfile(parsed.value) catch |err| {
+        const m = model orelse return generation.parseProfile(parsed.value) catch |err| {
             log.warn("[generation-settings] {s} ignored ({s})\n", .{ self.path, @errorName(err) });
             return .{};
         };
-        if (parsed.value != .object) return .{};
-        var it = parsed.value.object.iterator();
-        while (it.next()) |kv| {
-            if (!std.mem.eql(u8, trimSlash(kv.key_ptr.*), trimSlash(path))) continue;
-            return if (kv.value_ptr.* == .object) generationProfile(kv.value_ptr.object) else .{};
-        }
-        return .{};
+        const e = self.settings.entry(self.settings.keyOf(m)) orelse return .{};
+        return if (e == .object) generationProfile(e.object) else .{};
     }
 
     /// Re-read the file if it changed; lookups call it, and a caller that must
@@ -352,20 +385,24 @@ pub fn ggufEngineFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     var s = load(alloc, io, defaultPath(&buf));
     defer s.deinit();
-    var o = s.lookup(alloc, model_path);
+    var o = lookupPack(&s, alloc, io, model_path);
     defer o.deinit(alloc);
     return o.ggufEngine();
 }
 
-/// `model_path`'s entry; a GGUF pack, registered by its folder, also answers to the `.gguf` the folder serves (the
-/// app keys a GGUF by its file), under that spelling or its real path. The folder's own key wins.
-fn lookupPack(s: *const Settings, alloc: std.mem.Allocator, io: std.Io, model_path: []const u8) Override {
-    if (s.entry(model_path) != null or std.mem.endsWith(u8, model_path, ".gguf")) return s.lookup(alloc, model_path);
+/// `model_path`'s entry, the one lookup a load makes: its own key, else its real path's (a folder or file reached
+/// through a symlink); a GGUF pack, registered by its folder, also answers to the `.gguf` the folder serves (the app
+/// keys a GGUF by its file), under that spelling or its real path. The model's own key wins.
+pub fn lookupPack(s: *const Settings, alloc: std.mem.Allocator, io: std.Io, model_path: []const u8) Override {
+    if (s.entry(model_path) != null) return s.lookup(alloc, model_path);
     if (!std.fs.path.isAbsolute(model_path)) return .{};
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real = buf[0 .. std.Io.Dir.realPathFileAbsolute(io, model_path, &buf) catch return .{}];
+    if (s.entry(real) != null) return s.lookup(alloc, real);
+    if (std.mem.endsWith(u8, model_path, ".gguf")) return .{};
     const file = gguf_files.resolveGgufFile(io, alloc, model_path) catch return .{};
     defer alloc.free(file);
     if (s.entry(file) != null) return s.lookup(alloc, file);
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
     return s.lookup(alloc, buf[0 .. std.Io.Dir.realPathFileAbsolute(io, file, &buf) catch return .{}]);
 }
 
@@ -424,6 +461,30 @@ test "model_settings: parse + lookup with and without trailing slash" {
     try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
 }
 
+test "ctxSize: the pin; 0 for absent, zero, non-integer, over-u32, or a non-object entry" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"ctx_size": 65536}, "/m/b": {"ctx_size": 0}, "/m/c": {"ctx_size": "big"}, "/m/d": 3, "/m/e": {"ctx_size": -1}, "/m/f": {"ctx_size": 99999999999}}
+    );
+    defer s.deinit();
+    const t = std.testing.allocator;
+    try std.testing.expectEqual(@as(u32, 65536), s.ctxSize("/m/a"));
+    try std.testing.expectEqual(@as(u32, 65536), s.ctxSize("/m/a/"));
+    try std.testing.expectEqual(@as(u32, 0), s.ctxSize("/m/b"));
+    try std.testing.expectEqual(@as(u32, 0), s.ctxSize("/m/c"));
+    try std.testing.expectEqual(@as(u32, 0), s.ctxSize("/m/d"));
+    try std.testing.expectEqual(@as(u32, 0), s.ctxSize("/m/e"));
+    try std.testing.expectEqual(@as(u32, 0), s.ctxSize("/m/f")); // past maxInt(u32)
+    try std.testing.expectEqual(@as(u32, 0), s.ctxSize("/m/none"));
+    // The request-path Cache with an empty path: answers from the held settings, never reads a file.
+    var cache: Cache = .{ .path = "", .settings = try parse(t,
+        \\{"/m/p": {"ctx_size": 262144}}
+    ) };
+    defer cache.deinit();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try std.testing.expectEqual(@as(u32, 262144), cache.ctxSizeFor(io, .{ .path = "/m/p" }));
+    try std.testing.expectEqual(@as(u32, 0), cache.ctxSizeFor(io, .{ .path = "/m/gone" }));
+}
+
 test "model_settings: a GGUF folder answers to the key of the .gguf it serves, by its spelling or real path" {
     const t = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -452,6 +513,47 @@ test "model_settings: a GGUF folder answers to the key of the .gguf it serves, b
     const mlx = try std.fs.path.join(t, &.{ root, "mlx" });
     defer t.free(mlx);
     try std.testing.expect(lookupPack(&s, t, io, mlx).isEmpty());
+}
+
+test "model_settings: a folder reached through a symlink answers to its real path's key; its own key wins" {
+    const t = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "real/m");
+    try tmp.dir.symLink(io, "real/m", "link", .{ .is_directory = true });
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = rbuf[0..try tmp.dir.realPath(io, &rbuf)];
+    const link = try std.fs.path.join(t, &.{ root, "link" });
+    defer t.free(link);
+    const json = try std.fmt.allocPrint(t, "{{\"{s}/real/m\": {{\"ctx_size\": 4096}}}}", .{root});
+    defer t.free(json);
+    var s = try parse(t, json);
+    defer s.deinit();
+    try std.testing.expectEqual(@as(?u32, 4096), lookupPack(&s, t, io, link).ctx_size);
+    const both = try std.fmt.allocPrint(t, "{{\"{s}/real/m\": {{\"ctx_size\": 4096}}, \"{s}\": {{\"ctx_size\": 8192}}}}", .{ root, link });
+    defer t.free(both);
+    var s2 = try parse(t, both);
+    defer s2.deinit();
+    try std.testing.expectEqual(@as(?u32, 8192), lookupPack(&s2, t, io, link).ctx_size);
+}
+
+test "model_settings: the request-path lookups read a model's stored real path, never an empty one" {
+    const t = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var c: Cache = .{ .path = "", .settings = try parse(t,
+        \\{"/vol/m": {"ctx_size": 4096, "alias": "linky",
+        \\  "generation_defaults": {"max_tokens": {"value": 3, "ignore_client": true}}},
+        \\ "/link/own": {"ctx_size": 8192}, "/vol/own": {"ctx_size": 4096}, "": {"ctx_size": 1}}
+    ) };
+    defer c.deinit();
+    var buf: [64]u8 = undefined;
+    const linked: ModelPath = .{ .path = "/models/t/linked", .real = "/vol/m" };
+    try std.testing.expectEqual(@as(u32, 4096), c.ctxSizeFor(io, linked));
+    try std.testing.expectEqualStrings("linky", c.aliasForPath(io, linked, &buf).?);
+    try std.testing.expectEqual(@as(u32, 3), c.generationDefaults(io, linked).resolve(u32, .max_tokens, 32, 0));
+    try std.testing.expectEqual(@as(u32, 8192), c.ctxSizeFor(io, .{ .path = "/link/own", .real = "/vol/own" }));
+    try std.testing.expectEqual(@as(u32, 0), c.ctxSizeFor(io, .{ .path = "/models/t/unresolved" }));
 }
 
 test "model_settings: entry is the model's raw object, keys the Override does not read included" {
@@ -492,14 +594,14 @@ test "model_settings: generation rules re-read per request; kwargs thinking keys
         \\{"/m/a/": {"chat_template_kwargs": {"enable_thinking": true, "reasoning_effort": "high"},
         \\  "generation_defaults": {"reasoning_effort": {"value": "low", "ignore_client": true}}}}
     });
-    var p = c.generationDefaults(io, "/m/a");
+    var p = c.generationDefaults(io, .{ .path = "/m/a" });
     try std.testing.expectEqual(true, p.value(bool, .enable_thinking).?);
     try std.testing.expectEqual(generation.Effort.low, p.value(generation.Effort, .reasoning_effort).?);
     try std.testing.expect(p.forced(.reasoning_effort));
     try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data =
         \\{"/m/a": {"generation_defaults": {"temperature": {"value": 0.5}, "top_k": {"value": -1}}}}
     });
-    p = c.generationDefaults(io, "/m/a"); // a bad rule drops the profile, never the request
+    p = c.generationDefaults(io, .{ .path = "/m/a" }); // a bad rule drops the profile, never the request
     try std.testing.expect(p.rules.get(.temperature) == null);
     try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data = "{\"max_tokens\": {\"value\": 12, \"ignore_client\": true}}" });
     p = c.generationDefaults(io, null);
@@ -670,8 +772,8 @@ test "model_settings: the alias cache rereads the file only after it changes, at
     try std.testing.expectEqualStrings("/m/a", c.pathForAlias(io, "q", &buf).?);
     c.recheck_ms = 0;
     try std.testing.expectEqualStrings("/m/bb", c.pathForAlias(io, "q", &buf).?);
-    try std.testing.expectEqualStrings("q", c.aliasForPath(io, "/m/bb/", &buf).?);
-    try std.testing.expect(c.aliasForPath(io, "/m/a", &buf) == null);
+    try std.testing.expectEqualStrings("q", c.aliasForPath(io, .{ .path = "/m/bb/" }, &buf).?);
+    try std.testing.expect(c.aliasForPath(io, .{ .path = "/m/a" }, &buf) == null);
 }
 
 test "model_settings: an alias two models claim is named with both paths" {

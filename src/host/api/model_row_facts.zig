@@ -31,6 +31,8 @@ pub fn modalityName(io: std.Io, path: []const u8, model_type: []const u8) ?[]con
 /// has one and the pack's layout runs there.
 pub fn enginesFor(io: std.Io, allocator: std.mem.Allocator, path: []const u8, model_type: []const u8, mlx_gguf: bool) Engines {
     var set = Engines.empty;
+    // An engine plugin's model: no engine to pick from (its row names the plugin).
+    if (@import("../plugins/loader.zig").engineServes(path)) return set;
     if (!std.fs.path.isAbsolute(path)) return set; // every probe opens the path absolute
     if (discovery.isGgufModelPath(io, path)) {
         if (mlx_gguf) set.insert(.mlx);

@@ -708,6 +708,21 @@ test "sushi pack: hyper-connection tensors take the loader's names" {
     }
 }
 
+test "sushi pack: GLM's NextN layer takes the head's names; the trunk's layers keep theirs" {
+    var w = Weights.init(testing.allocator);
+    defer w.deinit();
+    for ([_][]const u8{ "layers.2.eh_proj.trellis", "layers.2.enorm.weight", "layers.2.shared_head.norm.weight", "layers.2.mlp.gate.weight", "layers.1.mlp.gate.weight" }) |leaf| {
+        var buf: [96]u8 = undefined;
+        try putNew(&w, try std.fmt.bufPrint(&buf, "model.language_model.{s}", .{leaf}), mlx.mlx_array_new_float(1));
+    }
+    try renameGlmMtp(&w, "model.language_model", 2);
+    try testing.expectEqual(@as(u32, 5), w.count());
+    for ([_][]const u8{ "mtp.0.eh_proj.trellis", "mtp.0.enorm.weight", "mtp.0.norm.weight", "mtp.0.block.mlp.gate.weight", "layers.1.mlp.gate.weight" }) |name| {
+        var buf: [96]u8 = undefined;
+        try testing.expect(w.get(try std.fmt.bufPrint(&buf, "model.language_model.{s}", .{name})) != null);
+    }
+}
+
 test "sushi pack: kv_b_proj splits into the per-head halves the loader reads" {
     const s = cpuStream();
     defer _ = mlx.mlx_stream_free(s);

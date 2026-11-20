@@ -83,8 +83,8 @@ pub fn report(name: []const u8, rows: usize, us: f64, bytes: f64, chain_us: f64)
     std.debug.print("[dec-ubench] {s} R={d}: {d:.1} us, {d:.0} GB/s ({d:.0}% of floor {d:.1} us), replaced chain {d:.1} us\n", .{ name, rows, us, bytes / us / 1e3, 100 * floor / us, floor, chain_us });
 }
 
-test "dsv41 dec layers: the fused kernels decode no further from an f32 model than today's chain, one row and a verify block" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+test "dsv41 dec layers: the fused kernels decode no further from an f32 model than today's chain over seeds, one row and a verify block" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     // Ratio 1 (KV source, owner, candidate source, an index non-owner), ratio 2 (KV source pooling pairs), ratio 0.
     for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 }, .{ 0, 1 } }) |range| try layersAgree(gpa, range[0], range[1], false);
@@ -99,66 +99,79 @@ test "dsv41 dec layers: the fused kernels over mxfp4 experts decode no further f
 }
 
 fn layersAgree(gpa: std.mem.Allocator, lo: usize, hi: usize, fp4: bool) !void {
-    // Same seed, so the same weights, prefill and step inputs: the fused kernels, today's chain, and the f32 reference.
-    var fxs: [3]*fixture.Fixture = undefined;
-    var made: usize = 0;
-    defer for (fxs[0..made]) |fx| fx.deinit();
-    for (&fxs, [_]mlx.mlx_dtype{ .bfloat16, .bfloat16, .float32 }, [_]bool{ true, false, false }) |*fx, act, fused| {
-        fx.* = try fixture.Fixture.init(gpa, .{ .lo = lo, .hi = hi, .ctx = 601, .seed = 9, .act = act, .fused = fused, .experts_fp4 = fp4 });
-        made += 1;
-    }
-    var p0: usize = 601;
-    for ([_]usize{ 1, 1, 1, max_rows, 1 }) |rows| {
-        var got: [3][]f32 = undefined;
-        for (fxs, &got) |fx, *g| {
-            const x = try fx.stream(rows);
-            defer _ = mlx.mlx_array_free(x);
-            const pre = try fx.cpre(rows);
-            defer _ = mlx.mlx_array_free(pre);
-            const out = try dsv41.workerStep(fx.m, gpa, x, pre, p0, false, false);
-            defer for (out) |o| {
-                _ = mlx.mlx_array_free(o);
-            };
-            g.* = try dsv41.hostF32(out[0]);
+    // One seed lands up to 1.6x either side of the chain (five random layers amplify any rounding; under TF32 the f32
+    // model itself moves 8% at the verify step), so the bar is each step's median over seeds.
+    const seeds = [_]u64{ 9, 1, 2, 3, 4, 5, 6 };
+    const steps = [_]usize{ 1, 1, 1, max_rows, 1 };
+    var ratio: [steps.len][seeds.len]f64 = undefined;
+    for (seeds, 0..) |seed, si| {
+        // Same seed, so the same weights, prefill and step inputs: the fused kernels, today's chain, and the f32 model.
+        var fxs: [3]*fixture.Fixture = undefined;
+        var made: usize = 0;
+        defer for (fxs[0..made]) |fx| fx.deinit();
+        for (&fxs, [_]mlx.mlx_dtype{ .bfloat16, .bfloat16, .float32 }, [_]bool{ true, false, false }) |*fx, act, fused| {
+            fx.* = try fixture.Fixture.init(gpa, .{ .lo = lo, .hi = hi, .ctx = 601, .seed = seed, .act = act, .fused = fused, .experts_fp4 = fp4 });
+            made += 1;
         }
-        defer for (got) |g| gpa.free(g);
-        std.debug.print("[dec] layers {d}..{d}, {d} rows at {d}: fused vs chain {e:.2}\n", .{ lo, hi, rows, p0, relRms(got[0], got[1]) });
-        try expectNoWorse("layers", got[0], got[1], got[2]);
-        p0 += rows;
+        var p0: usize = 601;
+        for (steps, 0..) |rows, k| {
+            var got: [3][]f32 = undefined;
+            for (fxs, &got) |fx, *g| {
+                const x = try fx.stream(rows);
+                defer _ = mlx.mlx_array_free(x);
+                const pre = try fx.cpre(rows);
+                defer _ = mlx.mlx_array_free(pre);
+                const out = try dsv41.workerStep(fx.m, gpa, x, pre, p0, false, false);
+                defer for (out) |o| {
+                    _ = mlx.mlx_array_free(o);
+                };
+                g.* = try dsv41.hostF32(out[0]);
+            }
+            defer for (got) |g| gpa.free(g);
+            for (got[0]) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+            ratio[k][si] = relRms(got[0], got[2]) / @max(relRms(got[1], got[2]), 1e-4);
+            p0 += rows;
+        }
+    }
+    for (&ratio, steps) |*r, rows| {
+        std.mem.sort(f64, r, {}, std.sort.asc(f64));
+        std.debug.print("[dec] layers {d}..{d}, {d} rows: fused/chain distance to the f32 model, median {d:.3} (min {d:.2}, max {d:.2})\n", .{ lo, hi, rows, r[seeds.len / 2], r[0], r[seeds.len - 1] });
+        if (r[seeds.len / 2] > 1.15) return error.FurtherFromTruth;
     }
 }
 
 test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs today's chain, 1 and 6 rows" {
-    if (!ubenchOn() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!ubenchOn() or !mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const iou = @import("../../../sdk/util/io_util.zig");
-    // 64 experts a layer: 20 layers hold ~20 GB, so a step's weights come from DRAM, not the SLC.
-    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 40, .experts = 64, .ctx = 4096, .fused = true });
-    defer fx.deinit();
-    const dec = fx.m.dec;
-    defer fx.m.dec = dec;
-    var p0: usize = 4096;
-    for ([_]usize{ 1, max_rows }) |rows| for ([_]bool{ true, false }) |fused| {
-        fx.m.dec = if (fused) dec else .{};
-        const x = try fx.stream(rows);
-        defer _ = mlx.mlx_array_free(x);
-        const pre = try fx.cpre(rows);
-        defer _ = mlx.mlx_array_free(pre);
-        var times: [9]f64 = undefined;
-        for (0..3 + times.len) |rep| {
-            const t0 = iou.nowUsMonotonic(io);
-            const out = try dsv41.workerStep(fx.m, gpa, x, pre, p0, false, false);
-            for (out) |o| _ = mlx.mlx_array_free(o);
-            if (rep >= 3) times[rep - 3] = @floatFromInt(iou.nowUsMonotonic(io) - t0);
-            p0 += rows;
+    // A fixture an arm: the compiled `.ffn` region keeps the MoE kernels of its first trace.
+    for ([_]bool{ true, false }) |fused| {
+        // 64 experts a layer: 20 layers hold ~20 GB, so a step's weights come from DRAM, not the SLC.
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 40, .experts = 64, .ctx = 4096, .fused = fused });
+        defer fx.deinit();
+        var p0: usize = 4096;
+        for ([_]usize{ 1, max_rows }) |rows| {
+            const x = try fx.stream(rows);
+            defer _ = mlx.mlx_array_free(x);
+            const pre = try fx.cpre(rows);
+            defer _ = mlx.mlx_array_free(pre);
+            var times: [9]f64 = undefined;
+            for (0..3 + times.len) |rep| {
+                const t0 = iou.nowUsMonotonic(io);
+                const out = try dsv41.workerStep(fx.m, gpa, x, pre, p0, false, false);
+                for (out) |o| _ = mlx.mlx_array_free(o);
+                if (rep >= 3) times[rep - 3] = @floatFromInt(iou.nowUsMonotonic(io) - t0);
+                p0 += rows;
+            }
+            std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+            std.debug.print("[dec-ubench] layers 20..40 R={d} {s}: {d:.1} us a layer (median step {d:.0} us)\n", .{ rows, if (fused) "fused" else "chain", times[times.len / 2] / 20, times[times.len / 2] });
         }
-        std.mem.sort(f64, &times, {}, std.sort.asc(f64));
-        std.debug.print("[dec-ubench] layers 20..40 R={d} {s}: {d:.1} us a layer (median step {d:.0} us)\n", .{ rows, if (fused) "fused" else "chain", times[times.len / 2] / 20, times[times.len / 2] });
-    };
+    }
 }
 
 test {
     _ = fixture;
+    _ = @import("exact_test.zig");
     inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_down }) |k| _ = k;
 }

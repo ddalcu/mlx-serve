@@ -219,10 +219,9 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         }
         // Say it once per model, wherever the model was pinned from (startup
         // primary or on-demand load) — a narrowed prefill otherwise reads as an
-        // unexplained slowdown. mlx-stream takes GLM-5.3's whole prompt in one
-        // forward and chunks it itself.
+        // unexplained slowdown.
         if (config.pinned_prefill_chunk < generate_mod.prefillCli().override and
-            !generate_mod.prefillCli().explicit and !config.glm_stream)
+            !generate_mod.prefillCli().explicit)
         {
             log.info("Prefill chunk: {d} tokens (memory-sized down from {d}; --prefill-chunk overrides)\n", .{ config.pinned_prefill_chunk, generate_mod.prefillCli().override });
         }
@@ -255,7 +254,6 @@ pub fn prefillNeededAtChunk(
     const hidden: u64 = config.hidden_size;
     const ffn: u64 = prefillFfnWidth(config);
     if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
-    if (config.mlxStream()) return 0; // billed at construction (`mlx_stream.loadBytes`)
     // A streamed bank's slot rows are filled at the load beside the prompt working set it reserves (DeepSeek-V4.1's
     // `bill.streamBudget`); a longer prompt is the plugin's refusal by name.
     if (config.plugin) |b| if (b.parsed.caps.streamed_weights) return 0;
@@ -343,7 +341,7 @@ pub fn requestPrefillChunkNow(
 ) u32 {
     const pin: u32 = config.pinned_prefill_chunk;
     const explicit: u32 = explicitPrefillChunk();
-    if (explicit > 0) return explicit;
+    if (explicit > 0) return @intCast(config.cappedPrefillChunk(explicit));
     if (!perRequestPrefillChunkEnabled(config)) return pin;
 
     const seq: u64 = @intCast(prompt_len);

@@ -287,8 +287,9 @@ def r_raw_mlx_c(f, ctx):
                 yield i, f"{n} raw mlx-c reference{'s' if n > 1 else ''}"
 
 
-# The guest agent is its own binary (its own module root, the VM's environment), so it cannot reach src/env.zig.
-ENV_EXEMPT = {"src/env.zig", "src/host/sandbox/vz_agent.zig"}
+# The guest agent is its own binary (its own module root, the VM's environment), and the example engine an outside
+# plugin built from the kit: neither can reach src/env.zig.
+ENV_EXEMPT = {"src/env.zig", "src/host/sandbox/vz_agent.zig", "src/plugins/_example_engine/plugin.zig"}
 
 
 def env_lines(f):
@@ -429,13 +430,18 @@ def check_pins(pins, files):
             yield n, f"{pat}: {needle!r} not found ({rule or 'no rule'})"
 
 
+def read_text(p):
+    with open(p, errors="replace") as f:
+        return f.read()
+
+
 def pin_files(pins_text, files):
     """The files a pin glob names beyond the scanned .zig ones (kernel .metal), for the pins alone."""
     out = {}
     for _, pat, _, _ in read_pins(pins_text):
         for p in glob.glob(pat):
             if p not in files and os.path.isfile(p):
-                out[p] = open(p, errors="replace").read()
+                out[p] = read_text(p)
     return out
 
 
@@ -494,8 +500,8 @@ def run(files, pins_text, enforced):
 def load_tree():
     files = {}
     for p in census.zig_files(SRC):
-        files[p] = open(p, errors="replace").read()
-    pins = open(PINS).read() if os.path.exists(PINS) else ""
+        files[p] = read_text(p)
+    pins = read_text(PINS) if os.path.exists(PINS) else ""
     enforced = []
     if os.path.exists(ENFORCED):
         enforced = [l.strip() for l in open(ENFORCED) if l.strip() and not l.lstrip().startswith("#")]

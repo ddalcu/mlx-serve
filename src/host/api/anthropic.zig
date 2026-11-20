@@ -24,6 +24,7 @@ const Conn = @import("../http/conn.zig").Conn;
 const spec_gate_threshold = @import("request_options.zig").spec_gate_threshold;
 const parseKvAttnExplicit = @import("request_options.zig").parseKvAttnExplicit;
 const resolveSampling = @import("sampling.zig").resolveSampling;
+const parseSuppressCjk = @import("sampling.zig").parseSuppressCjk;
 const generationMaxTokens = @import("sampling.zig").generationMaxTokens;
 const requestProfile = @import("sampling.zig").requestProfile;
 const defaultEnableMtp = @import("request_options.zig").defaultEnableMtp;
@@ -51,8 +52,6 @@ const checkAttentionMemory = @import("admission.zig").checkAttentionMemory;
 const clampMaxTokens = @import("sampling.zig").clampMaxTokens;
 const mediaRejectReason = @import("media_gate.zig").mediaRejectReason;
 const dropMedia = @import("media_gate.zig").dropMedia;
-const effortWordOnly = @import("../chat/reasoning/request.zig").effortWordOnly;
-const implicitEffortBudgetFor = @import("../chat/reasoning/request.zig").implicitEffortBudgetFor;
 const defaultReasoningBudget = @import("../chat/reasoning/request.zig").defaultReasoningBudget;
 const forcedReasoningBudget = @import("../chat/reasoning/request.zig").forcedReasoningBudget;
 const reasoningEffortFromWord = @import("../chat/reasoning/request.zig").reasoningEffortFromWord;
@@ -75,6 +74,7 @@ const sendResponse = @import("../http/respond.zig").sendResponse;
 const logHttpSseEvent = @import("../http/respond.zig").logHttpSseEvent;
 const countRejected = @import("../http/errors.zig").countRejected;
 const contextOverflowMessage = @import("../http/errors.zig").contextOverflowMessage;
+const optionalReasonField = @import("../http/errors.zig").optionalReasonField;
 const cachedFormatChat = @import("format.zig").cachedFormatChat;
 const formatAnthropicUsage = @import("format.zig").formatAnthropicUsage;
 const formatTimingsObject = @import("format.zig").formatTimingsObject;
@@ -90,17 +90,28 @@ const RequestMedia = @import("../media/request_media.zig").RequestMedia;
 const appendAnthropicImageBlock = @import("../media/request_media.zig").appendAnthropicImageBlock;
 const IMAGE_DECODE_REJECT = @import("../media/request_media.zig").IMAGE_DECODE_REJECT;
 const handleAnthropicStreaming = @import("anthropic_stream.zig").handleAnthropicStreaming;
+const countTextTokens = @import("tokenize.zig").countTextTokens;
 
 pub fn sendAnthropicError(allocator: std.mem.Allocator, stream: *Conn, err_type: []const u8, message: []const u8, status_code: u32) !void {
-    const escaped_msg = try jsonEscape(allocator, message);
-    defer allocator.free(escaped_msg);
-    const body = try std.fmt.allocPrint(allocator,
-        \\{{"type":"error","error":{{"type":"{s}","message":{s}}}}}
-    , .{ err_type, escaped_msg });
+    return sendAnthropicErrorWithReason(allocator, stream, err_type, message, status_code, null);
+}
+
+pub fn sendAnthropicErrorWithReason(allocator: std.mem.Allocator, stream: *Conn, err_type: []const u8, message: []const u8, status_code: u32, reason: ?[]const u8) !void {
+    const body = try buildAnthropicErrorBody(allocator, err_type, message, reason);
     defer allocator.free(body);
     var status_buf: [32]u8 = undefined;
     const status = std.fmt.bufPrint(&status_buf, "{d} Error", .{status_code}) catch "500 Error";
     try sendResponse(stream, status, "application/json", body);
+}
+
+pub fn buildAnthropicErrorBody(allocator: std.mem.Allocator, err_type: []const u8, message: []const u8, reason: ?[]const u8) ![]u8 {
+    const escaped_msg = try jsonEscape(allocator, message);
+    defer allocator.free(escaped_msg);
+    const reason_field = try optionalReasonField(allocator, reason);
+    defer allocator.free(reason_field);
+    return std.fmt.allocPrint(allocator,
+        \\{{"type":"error","error":{{"type":"{s}","message":{s}{s}}}}}
+    , .{ err_type, escaped_msg, reason_field });
 }
 
 pub fn sendAnthropicEvent(stream: *Conn, event_name: []const u8, data: []const u8) !void {
@@ -239,6 +250,12 @@ pub fn handleAnthropicMessages(
     const root = parsed.value.object;
     if (ablation.refuseOnSurface(root)) |r| {
         try sendAnthropicError(allocator, stream, "invalid_request_error", r.msg, r.code);
+        return;
+    }
+    var suppress_cjk = false;
+    if (parseSuppressCjk(root, lm, &suppress_cjk)) |msg| {
+        log.warn("POST /v1/messages -> 400 ({s})\n", .{msg});
+        try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
         return;
     }
 
@@ -530,6 +547,7 @@ pub fn handleAnthropicMessages(
             }
         }
     }
+    if (forced_tool) |ft| forced_tool = chat_mod.narrowForced(ft, root.get("tools"));
     if (forced_tool) |ft| if (ft == .name and !chat_mod.toolsDeclare(root.get("tools"), ft.name)) {
         const msg = try std.fmt.allocPrint(allocator, "tool_choice names tool \"{s}\", which is not in tools", .{ft.name});
         defer allocator.free(msg);
@@ -554,7 +572,6 @@ pub fn handleAnthropicMessages(
     // (muse+tools delivers its always-on reasoning as thinking blocks rather
     // than paying for it and discarding it); a PRESENT object decides
     // explicitly, exactly as before.
-    const word_only = effortWordOnly(allocator, lm, tok);
     const default_budget = defaultReasoningBudget(gen);
     var thinking_on: ?bool = null;
     var budget_tokens: ?i32 = null;
@@ -584,12 +601,11 @@ pub fn handleAnthropicMessages(
         try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
         return;
     };
-    const request_effort = if (output_cfg.effort) |word| reasoningEffortFromWord(word, default_budget, word_only) else null;
-    const thinking = resolveThinking(gen, thinking_on, request_effort, config.defaultEnableThinking(root.get("tools") != null), default_budget, word_only);
+    const request_effort = if (output_cfg.effort) |word| reasoningEffortFromWord(word, default_budget) else null;
+    const thinking = resolveThinking(gen, thinking_on, request_effort, config.defaultEnableThinking(root.get("tools") != null), default_budget);
     var enable_thinking = thinking.enable;
     const effort_word: ?[]const u8 = if (thinking.effort) |cfg| cfg.effort else null;
-    const reasoning_budget = forcedReasoningBudget(gen, budget_tokens orelse
-        if (thinking.effort) |cfg| cfg.budget else implicitEffortBudgetFor(allocator, lm, tok, default_budget));
+    const reasoning_budget = forcedReasoningBudget(gen, budget_tokens orelse default_budget);
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
     const model_name = echoModelName(root, config.model_type);
 
@@ -785,6 +801,7 @@ pub fn handleAnthropicMessages(
         .presence_penalty = sampled.presence_penalty,
         .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
+        .suppress_cjk = suppress_cjk,
     };
 
     // Grammar-constrained sampling for `output_config.format` json_schema —
@@ -963,6 +980,7 @@ fn handleAnthropicNonStreaming(
     // the request's thinking flag shaped the prompt, never the delivery.
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
+    var thinking_tokens: u32 = 0;
     {
         const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, true, opens_think);
         // Reasoning is never fed back to the parser, so it is cut here.
@@ -971,6 +989,8 @@ fn handleAnthropicNonStreaming(
             break :blk if (t.len > 0) t else null;
         } else null;
         if (split_reasoning) |reasoning| {
+            // The whole thought: output_tokens bills it even when the budget cuts the block below.
+            thinking_tokens = countTextTokens(allocator, lm, tok, reasoning);
             // Apply budget truncation
             var truncated_reasoning = reasoning;
             var trunc_allocated = false;
@@ -1092,7 +1112,7 @@ fn handleAnthropicNonStreaming(
         try allocator.alloc(u8, 0);
     defer allocator.free(timings_field);
 
-    const usage = try formatAnthropicUsage(allocator, prompt_token_count, result.completion_tokens, result.cached_tokens);
+    const usage = try formatAnthropicUsage(allocator, prompt_token_count, result.completion_tokens, result.cached_tokens, thinking_tokens);
     defer allocator.free(usage);
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":{s},"usage":{s}{s}}}
@@ -1121,4 +1141,22 @@ test "anthropicStopReason: a matched client stop sequence reports stop_sequence,
     try std.testing.expectEqualStrings("end_turn", anthropicStopReason("stop", null));
     try std.testing.expectEqualStrings("max_tokens", anthropicStopReason("length", "beta"));
     try std.testing.expectEqualStrings("tool_use", anthropicStopReason("tool_calls", "beta"));
+}
+
+test "memory refusal Anthropic body carries a reason" {
+    const body = try buildAnthropicErrorBody(std.testing.allocator, "invalid_request_error", "prompt does not fit", "memory_refused");
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt does not fit\",\"reason\":\"memory_refused\"}}",
+        body,
+    );
+}
+
+test "Anthropic errors without a reason preserve their existing body bytes" {
+    const body = try buildAnthropicErrorBody(std.testing.allocator, "invalid_request_error", "the prompt encodes to no tokens", null);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"the prompt encodes to no tokens\"}}",
+        body,
+    );
 }

@@ -256,6 +256,43 @@ final class GgufQuantTests: XCTestCase {
         XCTAssertTrue(models.allSatisfy { $0.isChatPickable })
     }
 
+    func testSharedDownloadAndLMStudioRootListsEachQuantOnceWithDownloadSourceFirst() throws {
+        _ = try makeGgufRepo("unsloth/Qwen3.5-4B-GGUF", files: [
+            "Qwen3.5-4B-Q4_K_M.gguf",
+            "Qwen3.5-4B-Q8_0.gguf",
+        ])
+        let models = DownloadManager.discoverLocalModels(.init(
+            ownedRoots: [tempRoot], lmStudioRoot: tempRoot, huggingFaceRoot: nil,
+            customRoot: nil, toolRoots: [], inFlightDirs: []
+        ))
+
+        XCTAssertEqual(models.count, 2, "the shared physical files appear once per quant")
+        XCTAssertEqual(Set(models.map(\.path)).count, 2, "different quant files remain separate rows")
+        XCTAssertTrue(models.allSatisfy { $0.source == .mlxServe }, "the configured download source wins")
+    }
+
+    func testSeparateCopiesOfTheSameRepoRemainAvailable() throws {
+        let managedRoot = (tempRoot as NSString).appendingPathComponent("managed")
+        let lmStudioRoot = (tempRoot as NSString).appendingPathComponent("lm-studio")
+        let managed = DownloadManager.newLayoutDir(rootDir: managedRoot, repoId: "acme/demo")
+        let external = DownloadManager.newLayoutDir(rootDir: lmStudioRoot, repoId: "acme/demo")
+        for path in [managed, external] {
+            try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+            try "{\"model_type\":\"llama\"}".write(
+                toFile: (path as NSString).appendingPathComponent("config.json"),
+                atomically: true, encoding: .utf8)
+        }
+
+        let models = DownloadManager.discoverLocalModels(.init(
+            ownedRoots: [managedRoot], lmStudioRoot: lmStudioRoot, huggingFaceRoot: nil,
+            customRoot: nil, toolRoots: [], inFlightDirs: []
+        ))
+
+        XCTAssertEqual(models.count, 2, "only the same resolved model path is collapsed")
+        XCTAssertEqual(Set(models.map(\.path)).count, 2)
+        XCTAssertEqual(Set(models.map(\.source)), [.mlxServe, .lmStudio])
+    }
+
     func testDiscoveryLabelsEachQuantDistinctly() throws {
         let dir = try makeGgufRepo("unsloth/Qwen3.5-4B-GGUF", files: [
             "Qwen3.5-4B-Q4_K_M.gguf",

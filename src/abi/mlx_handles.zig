@@ -12,4 +12,5 @@ pub const DrafterModel = if (host_only) opaque {} else @import("../plugins/gemma
 pub const DflashModel = if (host_only) opaque {} else @import("../engines/mlx/spec/dflash/dflash.zig").DflashModel;
 pub const MtpHeadRef = if (host_only) opaque {} else @import("../engines/mlx/spec/mtp_head_ref.zig").MtpHeadRef;
 pub const HotPrefixCache = if (host_only) opaque {} else @import("../engines/mlx/cache/prefix_cache.zig").HotPrefixCache;
+pub const WarmUp = if (host_only) opaque {} else @import("../engines/mlx/warm_requests.zig").Idle;
 pub const Slot = if (host_only) opaque {} else @import("../engines/mlx/slot.zig").Slot;

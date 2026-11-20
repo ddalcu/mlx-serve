@@ -8,6 +8,7 @@ const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
 const exl3 = @import("../../../sdk/quant/exl3/format.zig");
+const outside_mod = @import("../outside.zig");
 const distributed_mod = @import("../../../engines/mlx/cluster/distributed.zig");
 const gather_qmm_nax = @import("../../../sdk/blocks/moe/gather_qmm_nax.zig");
 const gather_qmv = @import("../../../sdk/blocks/moe/gather_qmv.zig");
@@ -85,7 +86,8 @@ pub fn moeSharedProject(self: *Trunk, comptime proj: SharedProjKind, x: mlx.mlx_
     return switch (proj) {
         .qmatmul => try self.qmatmul(x, w, sc, bi),
         .mtp_rows => try self.mtpProjectionRows(x, w, sc, bi, false),
-        .verify_rows => try verifySharedProjection(self.s, x, w, sc, bi, widths),
+        // Joined verify rows read affine rows an outside plugin's weight has not: the caller projects per row.
+        .verify_rows => if (self.outsideLinear(w) != null) null else try verifySharedProjection(self.s, x, w, sc, bi, widths),
     };
 }
 
@@ -398,6 +400,14 @@ pub fn moeMLP2WithRouter(self: *Trunk, router_x: mlx.mlx_array, expert_x_in: mlx
         norm_scores = scaled_scores;
     }
 
+    // The outside quant plugin's banks, where it loaded the block's, ahead of Sushi's.
+    if (self.outside) |o| if (o.banksOf(mw)) |fb| {
+        const y = try outside_mod.routed(fb, expert_x, inds, norm_scores, self.s);
+        if (skip_shared) return y;
+        if (mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return y;
+        defer _ = mlx.mlx_array_free(y);
+        return self.moeAddGatedShared(y, expert_x, mw, null);
+    };
     if (cfg.exl3) |spec| {
         const bank: exl3.Bank = .{
             .gate = .{ .trellis = mw.switch_gate_w, .suh = mw.switch_gate_s, .svh = mw.switch_gate_b },

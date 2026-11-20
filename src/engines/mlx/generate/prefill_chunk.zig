@@ -7,7 +7,12 @@ const mtp_mod = @import("../../../sdk/spec/mtp/mtp.zig");
 const testing = std.testing;
 const generate_mod = @import("../generate.zig");
 const WIDE_PREFILL_CHUNK = @import("../generate.zig").WIDE_PREFILL_CHUNK;
+const PrefillCli = @import("../generate.zig").PrefillCli;
 const attn256 = @import("../../../sdk/blocks/attention/attn256.zig");
+const checkpoint = @import("../ssm/checkpoint.zig");
+const glm5_bill = @import("../admission/glm5_bill.zig");
+const getEffectiveContextLength = @import("../admission/context.zig").getEffectiveContextLength;
+const verify_rows_max = @import("init.zig").verify_rows_max;
 
 
 /// `--prefill-chunk` for an embedded engine's u32 chunk (ds4): 0 = the engine's default.
@@ -349,16 +354,25 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
 
 /// Tokens of KV capacity this prefill reserves up front (#353). A multi-chunk prompt reserves
 /// itself plus one chunk of slack on every arch, since each chunk-by-chunk grow copies the whole
-/// cache; generation headroom is pre-bought only under `longCtxGated`.
+/// cache; generation headroom is pre-bought only under `longCtxGated`. A request whose bill reserves it
+/// (`glm5_bill.reservesRequest`) reserves it all, so its decode never grows.
 pub fn reservedPrefillTokens(
     config: *const model_mod.ModelConfig,
     seq: u64,
     max_tokens: u64,
     chunk: u64,
 ) u64 {
+    if (glm5_bill.reservesRequest(config)) return wholeRequestTokens(seq, max_tokens, getEffectiveContextLength(config));
     const prompt = if (seq > chunk) seq +| chunk else 0;
     if (!config.longCtxGated()) return prompt;
     return @max(prompt, transformer_mod.KVCache.reservedTokens(seq, max_tokens, chunk, config.max_position_embeddings));
+}
+
+/// PURE: the rows a whole request writes: the prompt, its reply held to the context `ctx` (none past it), and the rows
+/// a verify writes past the last token. Not `KVCache.reservedTokens`, which caps the reply and skips a short prompt.
+pub fn wholeRequestTokens(seq: u64, max_tokens: u64, ctx: u64) u64 {
+    const reply = if (ctx > seq) @min(max_tokens, ctx - seq) else 0;
+    return seq +| reply +| verify_rows_max;
 }
 
 /// A prompt checkpoints SSM state at its chunk boundaries, a vision prompt included (it chunks like text, #197):
@@ -429,6 +443,71 @@ pub fn shouldClearAllocatorCache(step: u32, last_clear: u32, interval: u32) bool
 /// `longCtxGated`: every other arch keeps its previous call pattern exactly.
 pub fn clearsPoolAtPrefillEnd(config: *const model_mod.ModelConfig) bool {
     return config.longCtxGated();
+}
+
+/// A whole-prompt prefill's plan in absolute positions (`Forward.prompt_spans`, `Forward.ssm_checkpoints`).
+pub const WholePromptPlan = struct {
+    spans: []u64,
+    checkpoints: []u64,
+
+    pub fn deinit(self: *WholePromptPlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.spans);
+        allocator.free(self.checkpoints);
+        self.* = undefined;
+    }
+};
+
+/// How a prefill's list keeps its checkpoints: `fileCheckpoint`'s cap (0 = none), policy and low anchors.
+pub const CheckpointKeep = struct { max: usize = 0, thin: checkpoint.ThinPolicy = .oldest, low_anchors: usize = 0 };
+
+/// The spans the chunk loop would run over an `n`-token prompt at width `chunk`, ending each where `nextChunkEnd`
+/// does up to the snapshot backoff, then at `n`; and of the positions it would checkpoint after (`ssmCapturePos`,
+/// then the backoff point), the ones its list keeps (`keep`). One forward cannot re-price its width, so every span
+/// keeps `chunk`.
+pub fn wholePromptPlan(
+    allocator: std.mem.Allocator,
+    n: usize,
+    chunk: usize,
+    want_ssm_cp: bool,
+    ssm_cp_stride: usize,
+    ssm_cp_offset: usize,
+    adaptive_width: bool,
+    dense_low_grid: bool,
+    keep: CheckpointKeep,
+) !WholePromptPlan {
+    var spans: std.ArrayList(u64) = .empty;
+    errdefer spans.deinit(allocator);
+    var cps: std.ArrayList(u64) = .empty;
+    errdefer cps.deinit(allocator);
+    const prefix_len = n -| 1;
+    const loop_end = prefix_len - ssmSnapshotBackoff(want_ssm_cp, prefix_len, ssm_cp_offset > 0);
+    var pos: usize = 0;
+    while (pos < loop_end) {
+        const end = nextChunkEnd(pos, loop_end, chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, adaptive_width, dense_low_grid);
+        try spans.append(allocator, end + ssm_cp_offset);
+        if (want_ssm_cp and ssmCapturePos(ssm_cp_stride, end + ssm_cp_offset, dense_low_grid)) try cps.append(allocator, end + ssm_cp_offset);
+        pos = end;
+    }
+    if (want_ssm_cp and loop_end > 0 and (cps.items.len == 0 or cps.items[cps.items.len - 1] != loop_end + ssm_cp_offset))
+        try cps.append(allocator, loop_end + ssm_cp_offset);
+    cps.shrinkRetainingCapacity(checkpoint.thinPositions(cps.items, keep.max, keep.thin, keep.low_anchors));
+    if (n > loop_end) try spans.append(allocator, n + ssm_cp_offset);
+    const span_slice = try spans.toOwnedSlice(allocator);
+    errdefer allocator.free(span_slice);
+    return .{ .spans = span_slice, .checkpoints = try cps.toOwnedSlice(allocator) };
+}
+
+/// The most checkpoints a whole-prompt prefill of at most `n` tokens can plan (`wholePromptPlan`) at the model's
+/// `base_stride` and cap `max`, whatever width it runs, warm or cold: the multiples of the narrowest stride it can
+/// coarsen to, up to the snapshot backoff, the dense low anchors, and the backoff point. 0 at `base_stride` 0.
+pub fn wholePromptCheckpointBound(n: usize, base_stride: usize, dense_low_grid: bool, max: usize) usize {
+    const stride = effectiveSsmCheckpointStride(base_stride, generate_mod.prefillCli().override);
+    if (stride == 0) return 0;
+    const prefix_len = n -| 1;
+    const loop_end = prefix_len - ssmSnapshotBackoff(true, prefix_len, false);
+    var k = loop_end / stride + @intFromBool(loop_end % stride != 0);
+    if (dense_low_grid) k += @min(loop_end, SSM_GRID_LOW_DENSE_TOP) / SSM_GRID_LOW_DENSE_STRIDE;
+    return if (max > 0) @min(k, max) else k;
 }
 
 // ── tests ──
@@ -1084,4 +1163,139 @@ test "explicitPrefillChunkU32: unset is 0, a flag past u32 clamps instead of ove
     try std.testing.expectEqual(@as(u32, 256), explicitPrefillChunkU32());
     generate_mod.prefillCli().override = 5_000_000_000;
     try std.testing.expectEqual(std.math.maxInt(u32), explicitPrefillChunkU32());
+}
+
+test "wholePromptPlan: a whole-prompt prefill's spans are the chunk loop's ends then the prompt's end, its checkpoints the loop's" {
+    const Case = struct { n: usize, want: bool, stride: usize, offset: usize, dense: bool, spans: []const u64, cps: []const u64 };
+    const cases = [_]Case{
+        // Checkpointing: the loop stops the backoff short of the prompt end and snapshots there.
+        .{ .n = 10_000, .want = true, .stride = 4096, .offset = 0, .dense = false, .spans = &.{ 4096, 8192, 9969, 10_000 }, .cps = &.{ 4096, 8192, 9969 } },
+        // None: chunks up to the last token, which is a span of its own.
+        .{ .n = 10_000, .want = false, .stride = 0, .offset = 0, .dense = false, .spans = &.{ 4096, 8192, 9999, 10_000 }, .cps = &.{} },
+        // A restored prefix of 5000: absolute positions, the first chunk cut at the 8192 boundary.
+        .{ .n = 6000, .want = true, .stride = 4096, .offset = 5000, .dense = false, .spans = &.{ 8192, 10_969, 11_000 }, .cps = &.{ 8192, 10_969 } },
+        // A tail under the merge bound joins the chunk before it.
+        .{ .n = 4200, .want = false, .stride = 0, .offset = 0, .dense = false, .spans = &.{ 4199, 4200 }, .cps = &.{} },
+        // A restored tail inside the backoff window is one span and files nothing.
+        .{ .n = 20, .want = true, .stride = 4096, .offset = 300, .dense = false, .spans = &.{320}, .cps = &.{} },
+        // The dense low grid adds its anchors under a coarse stride.
+        .{ .n = 20_000, .want = true, .stride = 16_384, .offset = 0, .dense = true, .spans = &.{ 4096, 8192, 12_288, 16_384, 19_969, 20_000 }, .cps = &.{ 8192, 16_384, 19_969 } },
+    };
+    for (cases) |c| {
+        var p = try wholePromptPlan(testing.allocator, c.n, 4096, c.want, c.stride, c.offset, false, c.dense, .{});
+        defer p.deinit(testing.allocator);
+        try testing.expectEqualSlices(u64, c.spans, p.spans);
+        try testing.expectEqualSlices(u64, c.cps, p.checkpoints);
+    }
+}
+
+/// An `n`-token prompt's plan at `offset` against the same plan's checkpoints filed one at a time through
+/// `fileCheckpoint` (`max`, `thin`, `anchors`), as the chunk loop files them.
+fn expectPlanKeeps(n: usize, chunk: usize, stride: usize, offset: usize, dense: bool, max: usize, thin: checkpoint.ThinPolicy, anchors: usize) !void {
+    const a = testing.allocator;
+    var all = try wholePromptPlan(a, n, chunk, true, stride, offset, false, dense, .{});
+    defer all.deinit(a);
+    var list: std.ArrayList(checkpoint.SSMCheckpoint) = .empty;
+    defer {
+        for (list.items) |*cp| cp.deinit(a);
+        list.deinit(a);
+    }
+    for (all.checkpoints) |pos| try checkpoint.fileCheckpoint(a, &list, .{ .pos = @intCast(pos), .layers = &.{} }, max, thin, anchors);
+    var kept = try wholePromptPlan(a, n, chunk, true, stride, offset, false, dense, .{ .max = max, .thin = thin, .low_anchors = anchors });
+    defer kept.deinit(a);
+    try testing.expectEqual(list.items.len, kept.checkpoints.len);
+    for (list.items, kept.checkpoints) |cp, pos| try testing.expectEqual(@as(u64, cp.pos), pos);
+}
+
+// Bar: the plan's checkpoints are the list the prefill keeps past its cap (each policy, low anchors on and off) at
+// strides 256 to 16,384, prompts to 300,000 tokens, cold and warm, and on a second turn restored from the first.
+test "wholePromptPlan: its checkpoints are the ones the prefill's list keeps" {
+    const lens = [_]usize{ 2, 31, 32, 33, 300, 4_097, 16_927, 18_380, 32_767, 65_600, 131_071, 300_000 };
+    for ([_]usize{ 256, 512, 1024, 2048, 4096, 8192, 16_384 }) |stride| for ([_]usize{ 256, stride }) |chunk| for (lens) |n| for ([_]usize{ 0, 5_000 }) |offset| for ([_]checkpoint.ThinPolicy{ .oldest, .min_span_recency }) |thin| for ([_]usize{ 0, 2 }) |anchors| {
+        try expectPlanKeeps(n, chunk, stride, offset, thin == .min_span_recency, 16, thin, anchors);
+    };
+    // A second turn extending the first restores at the first's last checkpoint and plans its tail from there.
+    for ([_][2]usize{ .{ 1536, 8192 }, .{ 256, 256 } }) |cs| {
+        var first = try wholePromptPlan(testing.allocator, 18_380, cs[0], true, cs[1], 0, false, false, .{ .max = 16 });
+        defer first.deinit(testing.allocator);
+        const at: usize = @intCast(first.checkpoints[first.checkpoints.len - 1]);
+        for ([_]usize{ 4_000, 40_000 }) |more| try expectPlanKeeps(18_380 + more - at, cs[0], cs[1], at, false, 16, .oldest, 0);
+    }
+}
+
+// Bar: 5,000 tokens at chunk and stride 64 plan 70 checkpoints; the pass is handed the list's keep over the same spans.
+test "wholePromptPlan: a plan of more than 64 checkpoints hands the pass only the ones the list keeps, over the same spans" {
+    const a = testing.allocator;
+    var all = try wholePromptPlan(a, 5_000, 64, true, 64, 0, false, false, .{});
+    defer all.deinit(a);
+    try testing.expectEqual(@as(usize, 70), all.checkpoints.len);
+    for ([_]usize{ 0, 4, 16 }) |max| for ([_]checkpoint.ThinPolicy{ .oldest, .min_span_recency }) |thin| for ([_]usize{ 0, 2 }) |anchors| {
+        var kept = try wholePromptPlan(a, 5_000, 64, true, 64, 0, false, false, .{ .max = max, .thin = thin, .low_anchors = anchors });
+        defer kept.deinit(a);
+        try testing.expectEqualSlices(u64, all.spans, kept.spans);
+        try testing.expectEqual(if (max == 0) all.checkpoints.len else max, kept.checkpoints.len);
+        for (kept.checkpoints) |pos| try testing.expect(std.mem.indexOfScalar(u64, kept.spans, pos) != null);
+        try expectPlanKeeps(5_000, 64, 64, 0, false, max, thin, anchors);
+    };
+}
+
+// Bar: no plan the prefill can make for a prompt of up to `n` tokens names more checkpoints than the bill's bound: any
+// width at or past the narrowest stride's coarsening, cold or warm, the dense low grid on and off, capped or not.
+test "wholePromptCheckpointBound: no width, offset or cap plans more checkpoints than the bound" {
+    const saved = generate_mod.prefillCli().*;
+    defer generate_mod.prefillCli().* = saved;
+    const lens = [_]usize{ 2, 31, 32, 33, 300, 4_097, 16_927, 18_380, 32_767, 65_600, 131_071, 300_000 };
+    for ([_]PrefillCli{ .{}, .{ .override = 64, .explicit = true }, .{ .override = 256, .explicit = true }, .{ .override = 4096, .explicit = true } }) |cli| {
+        generate_mod.prefillCli().* = cli;
+        for ([_]usize{ 0, 256, 1024, 8192 }) |base| for ([_]usize{ 64, 256, 1024, 1536, 4096, 16_384 }) |chunk| for (lens) |n| for ([_]usize{ 0, 5_000, n / 2 }) |offset| for ([_]bool{ false, true }) |dense| for ([_]usize{ 0, 4, 16 }) |max| {
+            if (offset >= n) continue;
+            const stride = effectiveSsmCheckpointStride(base, @max(chunk, cli.override));
+            var p = try wholePromptPlan(testing.allocator, n - offset, chunk, stride > 0, stride, offset, false, dense, .{ .max = max });
+            defer p.deinit(testing.allocator);
+            try testing.expect(p.checkpoints.len <= wholePromptCheckpointBound(n, base, dense, max));
+        };
+    }
+}
+
+// Bar: a decode-billed model that sets reserves_request reserves its prompt, its reply to the context and the verify
+// rows, a reply past 8,192 and a prompt under 32,768 included; a model without it keeps the prompt and a chunk.
+test "reservedPrefillTokens: a reserving model reserves its whole request to the context; the others as before" {
+    const t = std.testing;
+    const abi = @import("../../../abi/plugin.zig");
+    const plugin_config = @import("../plugin/config.zig");
+    const verify_rows = @import("init.zig").verify_rows_max;
+    const Probe = struct {
+        fn prefill(_: *const abi.Parsed, _: u64, _: u32, _: u8, _: u64) callconv(.c) u64 {
+            return 3 << 30;
+        }
+        fn reserving(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .prefill_bytes = &prefill, .flags = .{ .decode_room = .billed, .reserves_request = true } };
+        }
+        fn billed(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .flags = .{ .decode_room = .billed } };
+        }
+        fn byName(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .prefill_bytes = &prefill, .flags = .{ .reserves_request = true } };
+        }
+    };
+    var table: abi.ModelTable = undefined;
+    table.bill = &Probe.reserving;
+    var binding: plugin_config.Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true } } };
+    var ling = model_mod.ModelConfig{ .model_type = "bailing_hybrid", .plugin = &binding, .ctx_override = 49_975, .max_position_embeddings = 262_144 };
+    // A 33,591-token prompt and an 11,198-token reply: past the 8,192 tokens `KVCache.reservedTokens` pre-buys.
+    try t.expectEqual(33_591 + 11_198 + verify_rows, reservedPrefillTokens(&ling, 33_591, 11_198, 512));
+    // An 18,380-token prompt: under the 32,768 below which `KVCache.reservedTokens` reserves nothing.
+    try t.expectEqual(18_380 + 1_024 + verify_rows, reservedPrefillTokens(&ling, 18_380, 1_024, 1536));
+    // An omitted max_tokens on a one-chunk prompt: the reply runs to the context.
+    try t.expectEqual(49_975 + verify_rows, reservedPrefillTokens(&ling, 900, std.math.maxInt(u32) / 4, 4096));
+    // Decode-billed without the flag (a streamed GLM's shape), or the flag without a decode room: as before.
+    var glm = model_mod.ModelConfig{ .model_type = "glm5_next", .plugin = &binding, .ctx_override = 49_975, .max_position_embeddings = 262_144 };
+    table.bill = &Probe.billed;
+    try t.expectEqual(@as(u64, 33_591 + 512), reservedPrefillTokens(&glm, 33_591, 11_198, 512));
+    try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&glm, 900, std.math.maxInt(u32) / 4, 4096));
+    // The flag on a model the name rule gives no decode room.
+    table.bill = &Probe.byName;
+    var toy = ling;
+    toy.model_type = "toy_hybrid";
+    try t.expectEqual(@as(u64, 33_591 + 512), reservedPrefillTokens(&toy, 33_591, 11_198, 512));
 }

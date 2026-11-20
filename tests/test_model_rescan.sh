@@ -46,12 +46,12 @@ LOG="$(mktemp)"
 SERVER_PID=""
 cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+    srv_preclean "$PORT"
     rm -rf "$ROOT_DIR" "$HOME_DIR" "$LOG"
 }
 trap cleanup EXIT
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 sleep 0.5
 HOME="$HOME_DIR" "$BINARY" --serve --model-dir "$ROOT_DIR" --port "$PORT" --log-file off > "$LOG" 2>&1 &
 SERVER_PID=$!

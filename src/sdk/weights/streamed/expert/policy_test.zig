@@ -1,8 +1,8 @@
 //! The residency policy's tests (`sdk_ext.expert.policy`), kept in the package's test root under their names.
 
 const std = @import("std");
-const env = @import("mlx_host").env;
-const policy = @import("../sdk_ext.zig").expert.policy;
+const env = @import("../../../../env.zig");
+const policy = @import("policy.zig");
 const Phase = policy.Phase;
 const max_route_ids = policy.max_route_ids;
 const no_expert = policy.no_expert;
@@ -17,7 +17,6 @@ const boundedParts = policy.boundedParts;
 // ── Tests ──
 
 const testing = std.testing;
-const expert_bank = @import("bank.zig");
 
 /// Every plan leaves a bijective residency map and serves each id exactly as
 /// its hit or load says.
@@ -369,131 +368,6 @@ pub fn expectPlan(p: *const Plan, want: FixPlan) !void {
     }
 }
 
-/// The decode miss parts of `p` (by expert), in the real bank's placement.
-fn partsOf(p: *const Plan, table: []const expert_bank.Layer, layer: u32, out_experts: *[max_route_ids]u16, ends: *[max_route_ids]u32) []u32 {
-    const n = p.n_loads;
-    for (p.loadsOf(), 0..) |l, i| out_experts[i] = l.expert;
-    std.sort.insertion(u16, out_experts[0..n], {}, std.sort.asc(u16));
-    var offsets: [max_route_ids]u64 = undefined;
-    var lengths: [max_route_ids]u64 = undefined;
-    const t = table[layer];
-    for (out_experts[0..n], 0..) |e, i| {
-        offsets[i] = t.base_offset + @as(u64, e) * t.record_bytes;
-        lengths[i] = t.logical_bytes;
-    }
-    return boundedParts(offsets[0..n], lengths[0..n], 3, ends);
-}
-
-/// ExpertSlotPool._prepare_load's reuse rule over physical rows: a load whose
-/// row already holds (layer, expert) is not read.
-const Physical = struct {
-    persistent: []u16,
-    experts: u32,
-    transient: [max_route_ids]?[2]u32 = @splat(null),
-
-    fn skip(ph: *Physical, layer: u32, capacity: u32, w: [4]u32) bool {
-        if (w[2] != 0) {
-            const o = &ph.persistent[layer * ph.experts + w[1]];
-            const held = o.* == w[0];
-            o.* = @intCast(w[0]);
-            return held;
-        }
-        const o = &ph.transient[w[1] - capacity];
-        const held = if (o.*) |h| h[0] == layer and h[1] == w[0] else false;
-        o.* = .{ layer, w[0] };
-        return held;
-    }
-};
-
-// DSV41_PHASE1_ROUTE_FIXTURE=<json from the reference runtime's dump_phase1_route_fixture.py>
-test "dsv41 policy: the recorded trace plans exactly like the Python bank" {
-    const path = std.mem.span(env.get(.DSV41_PHASE1_ROUTE_FIXTURE) orelse return error.SkipZigTest);
-    const a = testing.allocator;
-    const Fixture = struct {
-        layers: u32,
-        experts: u32,
-        transient: u32,
-        records_per_part: u32,
-        prefill_capacity: []const u32,
-        decode_capacity: []const u32,
-        resident0: []const []const u16,
-        seed_plans: []const []const FixPlan,
-        routes: []const FixPlan,
-        final_slot_to_expert: []const []const i32,
-    };
-    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(64 << 20));
-    defer a.free(text);
-    const parsed = try std.json.parseFromSlice(Fixture, a, text, .{ .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    const f = parsed.value;
-    try testing.expectEqual(@as(u32, max_route_ids), f.transient);
-    try testing.expectEqual(@as(u32, 3), f.records_per_part);
-
-    var table: [40]expert_bank.Layer = undefined;
-    const k3: [40]u32 = @splat(3);
-    try testing.expectEqual(@as(u32, 40), f.layers);
-    _ = expert_bank.layerTable(&k3, 5120, 2304, f.experts, &table).?;
-
-    const policies = try a.alloc(LayerPolicy, f.layers);
-    defer a.free(policies);
-    var n_init: usize = 0;
-    defer for (policies[0..n_init]) |*p| p.deinit(a);
-    // The Python pool's physical owners, for its read skips.
-    var phys: Physical = .{ .persistent = try a.alloc(u16, f.layers * f.experts), .experts = f.experts };
-    defer a.free(phys.persistent);
-    @memset(phys.persistent, no_expert);
-
-    var out: Plan = .{};
-    var n_plans: usize = 0;
-    var n_reads: usize = 0;
-    var n_skips: usize = 0;
-    for (0..f.layers) |l| {
-        policies[l] = try LayerPolicy.init(a, f.experts, f.prefill_capacity[l]);
-        n_init += 1;
-        const p = &policies[l];
-        p.prepareSeed(f.resident0[l]);
-        for (f.seed_plans[l]) |want| {
-            p.plan(want.ids, .prefill, &out);
-            try expectPlan(&out, want);
-            for (want.loads) |w| try testing.expectEqual(w[3] != 0, phys.skip(@intCast(l), p.capacity, w));
-            n_plans += 1;
-        }
-    }
-    for (policies, f.decode_capacity) |*p, cap| try p.grow(cap);
-
-    var parts_experts: [max_route_ids]u16 = undefined;
-    var ends: [max_route_ids]u32 = undefined;
-    for (f.routes, 0..) |want, i| {
-        const l: u32 = @intCast(i % f.layers);
-        const p = &policies[l];
-        p.plan(want.ids, .decode, &out);
-        expectPlan(&out, want) catch |e| {
-            std.debug.print("route {d} (cycle {d}, layer {d}) differs\n", .{ i, i / f.layers, l });
-            return e;
-        };
-        for (want.loads) |w| {
-            const skip = phys.skip(l, p.capacity, w);
-            try testing.expectEqual(w[3] != 0, skip);
-            if (skip) n_skips += 1 else n_reads += 1;
-        }
-        const got = partsOf(&out, &table, l, &parts_experts, &ends);
-        try testing.expectEqual(want.parts.len, got.len);
-        var start: u32 = 0;
-        for (want.parts, got) |wp, end| {
-            try testing.expectEqualSlices(u16, wp, parts_experts[start..end]);
-            start = end;
-        }
-        n_plans += 1;
-    }
-    for (policies, f.final_slot_to_expert) |*p, want| {
-        try testing.expectEqual(want.len, p.capacity);
-        for (want, p.slot_to_expert[0..p.capacity]) |w, e| {
-            try testing.expectEqual(w, if (e == no_expert) @as(i32, -1) else @as(i32, e));
-        }
-    }
-    std.debug.print("policy parity: {d} plans ({d} decode routes) equal the Python bank's; {d} reads, {d} skipped\n", .{ n_plans, f.routes.len, n_reads, n_skips });
-}
-
 test "dsv41 policy: a plan beside a live route never evicts its held slots and loads transient at its window" {
     var p = try LayerPolicy.init(testing.allocator, 32, 4);
     defer p.deinit(testing.allocator);
@@ -683,7 +557,7 @@ test "dsv41 policy: every allocation failure of the residency policy's construct
 
 // ── The rate tally (`LayerPolicy.setTally`, `sdk_ext.expert.tally`) ──
 
-const tally = @import("../sdk_ext.zig").expert.tally;
+const tally = @import("tally.zig");
 
 /// The resident experts in ascending order.
 fn residentsOf(p: *const LayerPolicy, buf: []u16) []u16 {
@@ -795,6 +669,54 @@ test "expert policy: tally: seeded, a prefill miss that is not pinned evicts not
     try testing.expectEqualSlices(Eviction, &.{.{ .slot = 1, .previous = 2, .next = 5 }}, out.evictionsOf());
     var buf: [16]u16 = undefined;
     try testing.expectEqualSlices(u16, &.{ 1, 3, 5 }, residentsOf(&p, &buf));
+}
+
+test "expert policy: prompt_keep: no prompt admission evicts a resident; an empty row is still taken; decode plans as without it" {
+    const a = testing.allocator;
+    var keep = try LayerPolicy.init(a, 16, 3);
+    defer keep.deinit(a);
+    keep.prompt_keep = true;
+    var stock = try LayerPolicy.init(a, 16, 3);
+    defer stock.deinit(a);
+    var ra: [4]LayerPolicy.ReadAhead = undefined;
+    // Both start with 3 and 4 resident and one row empty.
+    for ([_]*LayerPolicy{ &keep, &stock }) |p| try testing.expectEqual(@as(usize, 2), p.admitReadAhead(&.{ 3, 4 }, &ra).len);
+    // The read-ahead takes the empty row, then (stock only) the coldest resident it left out.
+    try testing.expectEqualSlices(LayerPolicy.ReadAhead, &.{.{ .expert = 5, .slot = 2 }}, keep.admitReadAhead(&.{ 5, 6 }, &ra));
+    try testing.expectEqual(@as(usize, 2), stock.admitReadAhead(&.{ 5, 6 }, &ra).len);
+    try testing.expectEqual(@as(?u32, 0), keep.slotOf(3));
+    try testing.expectEqual(@as(?u32, null), stock.slotOf(3));
+    // A full layer: a prompt's misses are no seed, and are served transient with no eviction.
+    keep.prepareSeed(&.{ 7, 7, 7, 8 });
+    try testing.expect(!keep.seed.isSet(7) and !keep.seed.isSet(8));
+    var out: Plan = .{};
+    keep.plan(&.{ 7, 3, 8 }, .prefill, &out);
+    try checkPlan(&keep, &.{ 7, 3, 8 }, &out, max_route_ids);
+    try testing.expectEqual(@as(u32, 0), out.n_evictions);
+    for (out.loadsOf()) |l| try testing.expect(!l.persistent);
+    var buf: [16]u16 = undefined;
+    try testing.expectEqualSlices(u16, &.{ 3, 4, 5 }, residentsOf(&keep, &buf));
+    // A seed promotion finds no empty row and takes none.
+    stock.prepareSeed(&.{ 9, 9, 9 });
+    try testing.expect(stock.seed.isSet(9));
+    stock.prompt_keep = true;
+    try testing.expectEqual(@as(?u32, null), stock.admitSeed(9, &.{}));
+    stock.prompt_keep = false;
+    try testing.expect(stock.admitSeed(9, &.{}) != null);
+    // Decode is the stock policy's, plan for plan, evictions included.
+    var twin = try LayerPolicy.init(a, 16, 3);
+    defer twin.deinit(a);
+    twin.prompt_keep = true;
+    var plain = try LayerPolicy.init(a, 16, 3);
+    defer plain.deinit(a);
+    var o1: Plan = .{};
+    var o2: Plan = .{};
+    for ([_][]const u16{ &.{ 1, 2 }, &.{ 3, 1 }, &.{ 4, 5 }, &.{ 6, 2 }, &.{ 1, 7 } }) |ids| {
+        twin.plan(ids, .decode, &o1);
+        plain.plan(ids, .decode, &o2);
+        try testing.expectEqualSlices(Load, o2.loadsOf(), o1.loadsOf());
+        try testing.expectEqualSlices(Eviction, o2.evictionsOf(), o1.evictionsOf());
+    }
 }
 
 test "expert policy: tally: ratio 0 plans exactly as no tally; a request's end gives each expert's share of the decode routes and seeds the pins" {

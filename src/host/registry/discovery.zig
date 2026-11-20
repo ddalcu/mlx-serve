@@ -80,6 +80,12 @@ const ConfigPeek = union(enum) {
     missing_or_unparseable,
 };
 
+/// A `model_type` of [A-Za-z0-9_.-] only.
+fn plainModelType(s: []const u8) bool {
+    for (s) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-')) return false;
+    return true;
+}
+
 /// Peek at a candidate's `config.json`: classify by `model_type` and
 /// `quantization.mode`. Discovery uses this to filter out:
 ///   - unsupported archs (e.g. deepseek_v4, which crashes the tokenizer)
@@ -106,6 +112,11 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
     defer parsed.deinit();
     if (parsed.value != .object) return .missing_or_unparseable;
     const root = parsed.value.object;
+    const declared: []const u8 = if (root.get("model_type")) |v| (if (v == .string) v.string else "") else "";
+    // `/v1/models` writes the type unescaped.
+    if (!plainModelType(declared)) return .missing_or_unparseable;
+    // An engine plugin's model is its own: no MLX check applies.
+    if (outside_plugins.engineFor(entry_name) != null) return .{ .supported = allocator.dupe(u8, declared) catch return .missing_or_unparseable };
     // The DFlash contract outranks model_type: v1 assistants at least carry a
     // `*_assistant` suffix, but a DFlash2 sidecar is config-indistinguishable
     // from its trunk family without this probe (one predicate, shared with
@@ -423,6 +434,12 @@ pub fn discoverModelsMany(io: std.Io, allocator: std.mem.Allocator, roots: []con
         }
         merged.deinit(allocator);
     }
+    // `merged.items[i]`'s real path ("" when it cannot be resolved).
+    var reals = std.ArrayList([]const u8).empty;
+    defer {
+        for (reals.items) |r| if (r.len > 0) allocator.free(r);
+        reals.deinit(allocator);
+    }
 
     for (roots) |root| {
         const one = discoverModels(io, allocator, root) catch |err| {
@@ -432,26 +449,69 @@ pub fn discoverModelsMany(io: std.Io, allocator: std.mem.Allocator, roots: []con
         // Transfer ownership per model, freeing only the ones we drop — the
         // whole result's `deinit` would free the strings we just handed over.
         defer allocator.free(one.models);
-        for (one.models) |m| {
+        for (one.models) |*m| {
+            const real = realPathOrEmpty(io, allocator, m.path);
+            errdefer if (real.len > 0) allocator.free(real);
             var dup = false;
-            for (merged.items) |seen| {
+            for (merged.items, reals.items) |*seen, seen_real| {
+                // Nested or symlinked roots reach one folder under two ids, and
+                // the same weights would load twice. The org/name id wins.
+                if (sameDir(seen.path, seen_real, m.path, real)) {
+                    if (idDepth(m.id) > idDepth(seen.id) and !idTaken(merged.items, m.id))
+                        std.mem.swap([]const u8, &seen.id, &m.id);
+                    dup = true;
+                    break;
+                }
                 if (std.mem.eql(u8, seen.id, m.id)) {
+                    log.warn("[discovery] {s}: already found in an earlier --model-dir, skipping {s}\n", .{ m.id, m.path });
                     dup = true;
                     break;
                 }
             }
             if (dup) {
-                log.warn("[discovery] {s}: already found in an earlier --model-dir, skipping {s}\n", .{ m.id, m.path });
+                if (real.len > 0) allocator.free(real);
                 allocator.free(m.id);
                 allocator.free(m.path);
                 if (m.model_type.len > 0) allocator.free(m.model_type);
                 continue;
             }
-            try merged.append(allocator, m);
+            try merged.ensureUnusedCapacity(allocator, 1);
+            try reals.ensureUnusedCapacity(allocator, 1);
+            merged.appendAssumeCapacity(m.*);
+            reals.appendAssumeCapacity(real);
         }
     }
 
     return .{ .models = try merged.toOwnedSlice(allocator), .allocator = allocator, .roots = roots_owned };
+}
+
+/// `path` with every symlink resolved, in `buf`; "" when it cannot be resolved.
+pub fn realPathInto(io: std.Io, path: []const u8, buf: *[std.fs.max_path_bytes]u8) []const u8 {
+    if (!std.fs.path.isAbsolute(path)) return "";
+    return buf[0 .. std.Io.Dir.realPathFileAbsolute(io, path, buf) catch return ""];
+}
+
+/// `realPathInto`, allocator-owned.
+pub fn realPathOrEmpty(io: std.Io, allocator: std.mem.Allocator, path: []const u8) []const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real = realPathInto(io, path, &buf);
+    if (real.len == 0) return "";
+    return allocator.dupe(u8, real) catch "";
+}
+
+/// One folder under two spellings: equal real paths, else equal paths.
+pub fn sameDir(a_path: []const u8, a_real: []const u8, b_path: []const u8, b_real: []const u8) bool {
+    if (a_real.len > 0 and b_real.len > 0) return std.mem.eql(u8, a_real, b_real);
+    return std.mem.eql(u8, trimTrailingSlash(a_path), trimTrailingSlash(b_path));
+}
+
+fn idDepth(id: []const u8) usize {
+    return std.mem.count(u8, id, "/");
+}
+
+fn idTaken(models: []const DiscoveredModel, id: []const u8) bool {
+    for (models) |m| if (std.mem.eql(u8, m.id, id)) return true;
+    return false;
 }
 
 /// Core scan over an already-open root. Two layouts are recognized:
@@ -913,8 +973,8 @@ fn applyServedStub(meta: *StubMeta, st: mlx_engine.PluginStub) void {
 
 /// Read `StubMeta` for the model directory at `abs_path` (config.json + a
 /// chat-template-presence check). Best-effort: any I/O / parse failure yields
-/// `.found=false`. Called per unloaded entry from `/v1/models` — cheap (small
-/// JSON files) and that endpoint isn't hot.
+/// `.found=false`. `/v1/models` asks through `stub_cache.zig`, which keeps the
+/// answer while the dir's files stand.
 pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const u8) StubMeta {
     const trimmed = trimTrailingSlash(abs_path);
     const base = std.fs.path.basename(trimmed);
@@ -1158,6 +1218,48 @@ test "discoverModelsMany merges roots in order and de-dups by id" {
     var none = try discoverModelsMany(io, allocator, &.{});
     defer none.deinit();
     try std.testing.expectEqual(@as(usize, 0), none.models.len);
+}
+
+test "discoverModelsMany lists a folder two roots reach once, under its org/name id" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "lib/org/m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/org/m/config.json", .data = "{\"model_type\":\"qwen3\"}" });
+    try tmp.dir.symLink(io, "lib", "link", .{ .is_directory = true });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const base = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    defer allocator.free(base);
+    const lib = try std.fmt.allocPrint(allocator, "{s}/lib", .{base});
+    defer allocator.free(lib);
+    const org = try std.fmt.allocPrint(allocator, "{s}/lib/org", .{base});
+    defer allocator.free(org);
+    const link = try std.fmt.allocPrint(allocator, "{s}/link", .{base});
+    defer allocator.free(link);
+
+    // Nested roots in either order, and a symlinked root beside the real folder.
+    const cases = [_][2][]const u8{ .{ lib, org }, .{ org, lib }, .{ link, org }, .{ org, link } };
+    for (cases) |roots| {
+        var result = try discoverModelsMany(io, allocator, &roots);
+        defer result.deinit();
+        try testing.expectEqual(@as(usize, 1), result.models.len);
+        try testing.expectEqualStrings("org/m", result.models[0].id);
+    }
+
+    // The org/name id already names another folder: the bare id stays, ids stay unique.
+    try tmp.dir.createDirPath(io, "other/org/m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "other/org/m/config.json", .data = "{\"model_type\":\"qwen3\"}" });
+    const other = try std.fmt.allocPrint(allocator, "{s}/other", .{base});
+    defer allocator.free(other);
+    var taken = try discoverModelsMany(io, allocator, &.{ org, other, lib });
+    defer taken.deinit();
+    try testing.expectEqual(@as(usize, 2), taken.models.len);
+    try testing.expectEqualStrings("m", taken.models[0].id);
+    try testing.expectEqualStrings("org/m", taken.models[1].id);
 }
 
 test "discovery measures a SYMLINKED (HF hub cache) model dir's real bytes" {
@@ -1840,8 +1942,8 @@ test "isSupportedModelType accepts every served arch spelling (glm5_next)" {
     try testing.expect(isSupportedModelType("glm5_next"));
     try testing.expect(isSupportedModelType("glm5_next_text"));
     try testing.expect(isSupportedModelType("deepseek_v41"));
-    try testing.expect(isSupportedModelType("glm_moe_dsa"));
-    try testing.expectEqual(ModelKind.chat, modelKindFromType("glm_moe_dsa"));
+    // GLM-5.3 left the tree with its streamed pack: an outside plugin can claim it.
+    try testing.expect(!isSupportedModelType("glm_moe_dsa"));
 }
 
 test "isSupportedModelType accepts gemma3_text (text-only Gemma3ForCausalLM)" {
@@ -1897,6 +1999,15 @@ test "a Qwen3-ForcedAligner pack is discovered as the aligner, never as an ASR" 
     defer if (peek == .supported) a.free(peek.supported);
     try testing.expect(peek == .supported);
     try testing.expectEqualStrings("qwen3_forced_aligner", peek.supported);
+}
+
+test "peekConfig: a model_type that is not a plain identifier is no model" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "odd");
+    try tmp.dir.writeFile(io, .{ .sub_path = "odd/config.json", .data = "{\"model_type\":\"llama\\\",\\\"x\"}" });
+    try testing.expect(peekConfig(io, testing.allocator, tmp.dir, "odd") == .missing_or_unparseable);
 }
 
 test "parseStubMeta reads the native Nemotron omni language config" {

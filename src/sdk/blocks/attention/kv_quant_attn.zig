@@ -5,6 +5,7 @@ const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../util/log.zig");
+const env = @import("../../../env.zig");
 const verifyQmmNaxAvailable = @import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
 const verifyQmmTile = @import("../linear/verify_qmm_nax.zig").verifyQmmTile;
 const DenseKVView = @import("kv_view.zig").DenseKVView;
@@ -115,6 +116,154 @@ var qkv_dec_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var qkv_dec_cfg_key: QkvDecCfgKey = std.mem.zeroes(QkvDecCfgKey);
 var qkv_dec_engaged: bool = false;
 
+// Decode on the 8x8 simdgroup-matrix units: grid (128, H_kv, splits), each of the 4 simdgroups walks its own
+// span in 8-row tiles (S^T = Q K^T, an online softmax, O += P V with O in registers); query heads pad to
+// multiples of 8. The 4 spans combine in threadgroup memory, so a split emits one (m, l, O) partial.
+pub const QKV_DEC_MMA_KERNEL_SOURCE = kernelSource("kernels/attention/qkv_dec_mma.metal");
+pub const QKV_MERGE_KERNEL_SOURCE = kernelSource("kernels/attention/qkv_merge.metal");
+const QKV_DEC_MMA_MAX_SPLITS: c_int = 32;
+
+/// O lives in registers as ceil(GQA / 8) x DV / 8 tiles (at most 64); K and V rows load as uint4.
+pub fn qkvDecMmaFits(gqa: c_int, dk: c_int, dv: c_int, gs: c_int) bool {
+    if (gqa < 1 or gqa > 16) return false;
+    if (dv != 64 and dv != 128 and dv != 256) return false;
+    return @rem(dk, 32) == 0 and dk <= 256 and @rem(gs, 8) == 0;
+}
+
+/// Whether a decode-width call goes to the simdgroup-matrix kernel ahead of the matmul2d page kernel: on the M4
+/// family's shader tile (measured there); a GPU with matrix units keeps the page kernel past its window.
+/// The one gate for both sites (the matmul2d skip and the dispatch); the test seam wins over the tile.
+fn qkvDecMmaTakes(q: mlx.mlx_array, view: *const DenseKVView) bool {
+    if (!(qkv_dec_mma_override orelse (qkvDecMmaEnabled() and verifyQmmTile() != .nax))) return false;
+    if ((view.bits != 4 and view.bits != 8) or view.group_size == 0) return false;
+    const qs = mlx.getShape(q);
+    const ks = mlx.getShape(view.k_triple_q);
+    const vs = mlx.getShape(view.v_triple_q);
+    if (qs[0] != 1 or qs[2] != 1 or ks[1] <= 0 or @rem(qs[1], ks[1]) != 0 or vs.len != 4) return false;
+    const vpw: c_int = @divExact(@as(c_int, 32), @as(c_int, view.bits));
+    return qkvDecMmaFits(@divExact(qs[1], ks[1]), ks[3] * vpw, vs[3] * vpw, @intCast(view.group_size));
+}
+
+pub fn qkvDecMmaSplits(t_k: c_int) c_int {
+    return std.math.clamp(@divTrunc(t_k + 63, 64), 1, QKV_DEC_MMA_MAX_SPLITS);
+}
+
+pub fn qkvDecMmaTgBytes(gqa: c_int, dk: c_int, dv: c_int) c_int {
+    const nht = @divTrunc(gqa + 7, 8);
+    const rows: c_int = @max(nht * 8 * dk, 8 * dv);
+    return rows * 4 + 2 * 4 * nht * 8 * 4;
+}
+
+pub var qkv_dec_mma_override: ?bool = null; // test seam
+pub var qkv_dec_mma_calls: usize = 0; // test seam: dispatches of the kernel
+var qkv_dec_mma_env: ?bool = null;
+fn qkvDecMmaEnabled() bool {
+    if (qkv_dec_mma_env) |v| return v;
+    const v = if (env.get(.MLX_SERVE_KV_ATTN_MMA)) |x| x[0] != '0' else true;
+    qkv_dec_mma_env = v;
+    return v;
+}
+
+var qkv_dec_mma_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var qkv_merge_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const QkvDecMmaCfgKey = struct { hq: c_int, hkv: c_int, dk: c_int, dv: c_int, bits: u8, gs: u32, gqa: c_int, nsplit: c_int, has_mask: bool, dtype: mlx.mlx_dtype };
+var qkv_dec_mma_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var qkv_dec_mma_cfg_key: QkvDecMmaCfgKey = std.mem.zeroes(QkvDecMmaCfgKey);
+var qkv_dec_mma_engaged: bool = false;
+
+fn kernelNamed(cache: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, inputs: []const [*:0]const u8, outputs: []const [*:0]const u8, source: [*:0]const u8, header: [*:0]const u8, contiguous: bool) !mlx.mlx_fast_metal_kernel {
+    if (cache.*) |k| return k;
+    const in_vec = mlx.mlx_vector_string_new_data(inputs.ptr, inputs.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(outputs.ptr, outputs.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const k = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, contiguous, false);
+    if (k.ctx == null) return error.MetalKernelCompileFailed;
+    cache.* = k;
+    return k;
+}
+
+fn qkvAttnDecodeMma(s: mlx.mlx_stream, q: mlx.mlx_array, view: *const DenseKVView, scale: f32, mask: ?mlx.mlx_array, h_q: c_int, h_kv: c_int, dk: c_int, dv: c_int, t_k: c_int, qdt: mlx.mlx_dtype) !mlx.mlx_array {
+    const kernel = try kernelNamed(&qkv_dec_mma_kernel, "qkv_attn_dec_mma", &.{ "q", "kq", "ksc", "kbi", "vq", "vsc", "vbi", "scl", "tk", "msk" }, &.{ "m_out", "l_out", "o_out" }, QKV_DEC_MMA_KERNEL_SOURCE, "#include <metal_simdgroup_matrix>\n", false);
+    const gqa = @divExact(h_q, h_kv);
+    const nsplit = qkvDecMmaSplits(t_k);
+    const key = QkvDecMmaCfgKey{ .hq = h_q, .hkv = h_kv, .dk = dk, .dv = dv, .bits = view.bits, .gs = view.group_size, .gqa = gqa, .nsplit = nsplit, .has_mask = mask != null, .dtype = qdt };
+    if (qkv_dec_mma_cfg == null or !std.meta.eql(qkv_dec_mma_cfg_key, key)) {
+        if (qkv_dec_mma_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        qkv_dec_mma_cfg = null;
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        const ml_shape = [_]c_int{ h_q, nsplit };
+        const o_shape = [_]c_int{ h_q, nsplit, dv };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 2, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 2, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, QKV_DEC_NT, h_kv, nsplit));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, QKV_DEC_NT, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", qdt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(view.bits)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(view.group_size)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DK", dk));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DV", dv));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GQA", gqa));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HAS_MASK", @intFromBool(mask != null)));
+        qkv_dec_mma_cfg = config;
+        qkv_dec_mma_cfg_key = key;
+    }
+    const one = [_]c_int{1};
+    const scl = mlx.mlx_array_new_data(&[_]f32{scale}, &one, 1, .float32);
+    defer _ = mlx.mlx_array_free(scl);
+    const tk = mlx.mlx_array_new_data(&[_]i32{t_k}, &one, 1, .int32);
+    defer _ = mlx.mlx_array_free(tk);
+    const dummy = mlx.mlx_array_new_data(&[_]f32{0}, &one, 1, .float32);
+    defer _ = mlx.mlx_array_free(dummy);
+    const inputs_arr = [_]mlx.mlx_array{ q, view.k_triple_q, view.k_triple_scales, view.k_triple_biases, view.v_triple_q, view.v_triple_scales, view.v_triple_biases, scl, tk, mask orelse dummy };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qkv_dec_mma_cfg.?, s));
+    var parts: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (parts) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&parts, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, outputs_vec, i));
+    const o_t = try qkvMergeFused(s, parts[0], parts[1], parts[2], qdt);
+    defer _ = mlx.mlx_array_free(o_t);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, o_t, &[_]c_int{ 1, h_q, 1, dv }, 4, s));
+    qkv_dec_mma_calls += 1;
+    if (!qkv_dec_mma_engaged) {
+        qkv_dec_mma_engaged = true;
+        log.info("[kv-attn] decode kernel (simdgroup matrix) engaged: bits={d} gs={d} DK={d} DV={d} Hq={d} Hkv={d} splits={d} mask={}\n", .{ view.bits, view.group_size, dk, dv, h_q, h_kv, nsplit, mask != null });
+    }
+    return out;
+}
+
+/// `qkvMergeArrays` in one dispatch: one threadgroup per row, one thread per output element.
+pub fn qkvMergeFused(s: mlx.mlx_stream, m_b: mlx.mlx_array, l_b: mlx.mlx_array, o_b: mlx.mlx_array, qdt: mlx.mlx_dtype) !mlx.mlx_array {
+    const os = mlx.getShape(o_b);
+    const kernel = try kernelNamed(&qkv_merge_kernel, "qkv_merge_partials", &.{ "m_in", "l_in", "o_in" }, &.{"out"}, QKV_MERGE_KERNEL_SOURCE, "", true);
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ os[0], os[2] }, 2, qdt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, os[2], os[0], 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, os[2], 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", qdt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NS", os[1]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DV", os[2]));
+    const inputs_arr = [_]mlx.mlx_array{ m_b, l_b, o_b };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var res = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(res);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&res, kernel, inputs_vec, config, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, res, 0));
+    return out;
+}
+
 /// Try the decode-width quantized-KV attention kernel. Returns null when a
 /// precondition doesn't hold — the caller falls back to the composed
 /// quantAttention. Preconditions are the kernel's OWN requirements, never a
@@ -130,7 +279,7 @@ pub fn qkvAttnDecodeKernel(
     if (!qkvDecKernelEnabled()) return null;
     if (!view.has_quant_triple) return null;
     if (!qkvVerifyForced() and mlx.mlx_array_ndim(q) == 4 and mlx.mlx_array_ndim(view.k_triple_q) == 4 and
-        qkvMppWins(mlx.getShape(q)[2], mlx.getShape(view.k_triple_q)[2]))
+        qkvMppWins(mlx.getShape(q)[2], mlx.getShape(view.k_triple_q)[2]) and !qkvDecMmaTakes(q, view))
     {
         if (try qkvAttnMppKernel(s, q, view, scale, mask_mode)) |o| return o;
     }
@@ -173,6 +322,10 @@ pub fn qkvAttnDecodeKernel(
         has_mask = true;
     } else if (!std.mem.eql(u8, mask_mode, "") and !std.mem.eql(u8, mask_mode, "causal")) {
         return null;
+    }
+
+    if (qkvDecMmaTakes(q, view)) {
+        return try qkvAttnDecodeMma(s, q, view, scale, if (has_mask) mask_arr else null, h_q, h_kv, dk, dv, t_k, qdt);
     }
 
     const kernel = getQkvDecKernel() catch return null;

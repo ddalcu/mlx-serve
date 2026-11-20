@@ -17,7 +17,6 @@ pub const serializeMessagesJsonFor = @import("serialize.zig").serializeMessagesJ
 pub const messageHasMedia = @import("serialize.zig").messageHasMedia;
 pub const isImageItemStart = @import("serialize.zig").isImageItemStart;
 pub const isQwen38EffortTemplate = @import("effort.zig").isQwen38EffortTemplate;
-pub const templateConsumesEffort = @import("effort.zig").templateConsumesEffort;
 pub const dsv4EffortFor = @import("effort.zig").dsv4EffortFor;
 pub const mergeTemplateKwargs = @import("effort.zig").mergeTemplateKwargs;
 pub const thinkOpenTagLenAt = @import("reasoning/think_tags.zig").thinkOpenTagLenAt;
@@ -69,6 +68,7 @@ pub const appendJsonString = @import("../../sdk/util/json_text.zig").appendJsonS
 pub const ForcedTool = @import("tools/tool_choice.zig").ForcedTool;
 pub const toolChoiceInstruction = @import("tools/tool_choice.zig").toolChoiceInstruction;
 pub const toolsDeclare = @import("tools/tool_choice.zig").toolsDeclare;
+pub const narrowForced = @import("tools/tool_choice.zig").narrowForced;
 pub const forcedToolOpener = @import("tools/tool_choice.zig").forcedToolOpener;
 
 test {

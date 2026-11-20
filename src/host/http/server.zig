@@ -265,7 +265,12 @@ pub fn configuredKvQuantFor(config: *const model_mod.ModelConfig) kv_quant_mod.K
 /// The explicit context for THIS model: its `model-settings.json` `ctx_size`, else `--ctx-size`.
 /// 0 = auto. Every reader of the manual context goes through here, never `server_config.max_context_size`.
 pub fn manualContext(config: *const model_mod.ModelConfig) u32 {
-    return if (config.ctx_override > 0) config.ctx_override else serverState().server_config.max_context_size;
+    return manualContextFor(config.ctx_override);
+}
+
+/// `manualContext` from the pin alone, for a model that has no loaded config yet (an unloaded `/v1/models` row).
+pub fn manualContextFor(pin: u32) u32 {
+    return if (pin > 0) pin else serverState().server_config.max_context_size;
 }
 
 /// Plan 05 — model registry. Always non-null in serve mode (set by
@@ -751,6 +756,17 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     _ = mlx.mlx_get_cache_memory(&mlx_cache);
     ctx.metrics.mlx_active_bytes.set(@as(u64, mlx_active));
     ctx.metrics.mlx_cache_bytes.set(@as(u64, mlx_cache));
+    const sch = ctx.scheduler;
+    ctx.metrics.setMemoryAttribution(.{
+        .active = mlx_active,
+        .weights_live = if (global_registry) |reg| reg.residentLiveBytes(sch.io) else 0,
+        .hot_cache = sch.resident_hot_cache_bytes.load(.monotonic),
+        .live_kv = sch.resident_live_kv_bytes.load(.monotonic),
+        .parked = sch.hot_cache_parked_bytes.load(.monotonic),
+        .checked_out = sch.hot_cache_checked_out_bytes.load(.monotonic),
+        .evicted_billed = sch.hot_cache_evicted_billed_bytes.load(.monotonic),
+        .evicted_live = sch.hot_cache_evicted_live_bytes.load(.monotonic),
+    });
     // ANE prefill offload totals — published by the engines themselves
     // (ane.publishLive / deinit), so this is a lock-free read.
     const eg = mlx_engine.gauges();
@@ -762,7 +778,7 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // Request queue depth — brief lock to read two scheduler counters only.
     ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);
     const running = @as(u64, ctx.scheduler.in_flight);
-    const waiting = @as(u64, ctx.scheduler.pending.items.len);
+    const waiting = @as(u64, ctx.scheduler.pending.items.len) + ctx.scheduler.submit_waiting;
     ctx.scheduler.queue_mu.unlock(ctx.scheduler.io);
     ctx.metrics.requests_running.set(running);
     ctx.metrics.requests_waiting.set(waiting);

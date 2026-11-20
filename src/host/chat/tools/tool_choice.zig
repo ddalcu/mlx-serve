@@ -20,13 +20,26 @@ pub fn toolsDeclare(tools: ?std.json.Value, name: []const u8) bool {
     const arr = tools orelse return false;
     if (arr != .array) return false;
     for (arr.array.items) |t| {
-        if (t != .object) continue;
-        const holder = if (t.object.get("function")) |f| f else t;
-        if (holder != .object) continue;
-        const n = holder.object.get("name") orelse continue;
-        if (n == .string and std.mem.eql(u8, n.string, name)) return true;
+        if (std.mem.eql(u8, toolName(t) orelse continue, name)) return true;
     }
     return false;
+}
+
+fn toolName(t: std.json.Value) ?[]const u8 {
+    if (t != .object) return null;
+    const holder = if (t.object.get("function")) |f| f else t;
+    if (holder != .object) return null;
+    const n = holder.object.get("name") orelse return null;
+    return if (n == .string) n.string else null;
+}
+
+/// A forced choice over a request that declares ONE tool is that tool, so the opener spells its name: a bare opener
+/// leaves the name to the model, and an off-topic prompt drew `call` (#1153). The name borrows from `tools`.
+pub fn narrowForced(forced: ForcedTool, tools: ?std.json.Value) ForcedTool {
+    if (forced != .any) return forced;
+    const arr = tools orelse return forced;
+    if (arr != .array or arr.array.items.len != 1) return forced;
+    return .{ .name = toolName(arr.array.items[0]) orelse return forced };
 }
 
 /// The assistant text that commits a tool call in the template's own dialect,
@@ -85,6 +98,22 @@ test "toolsDeclare: a name in the OpenAI, Anthropic or Responses tool shape" {
     try testing.expect(!toolsDeclare(chat, "bogus"));
     try testing.expect(toolsDeclare(flat, "probe_ping"));
     try testing.expect(!toolsDeclare(null, "calculator"));
+}
+
+test "narrowForced: a forced choice over one declared tool names it; several tools or a named choice stay" {
+    const body =
+        \\{"one":[{"type":"function","function":{"name":"get_weather"}}],"flat":[{"name":"probe_ping"}],
+        \\ "two":[{"type":"function","function":{"name":"a"}},{"type":"function","function":{"name":"b"}}],"odd":[{"type":"web_search"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try testing.expectEqualStrings("get_weather", narrowForced(.any, o.get("one")).name);
+    try testing.expectEqualStrings("probe_ping", narrowForced(.any, o.get("flat")).name);
+    try testing.expect(narrowForced(.any, o.get("two")) == .any);
+    try testing.expect(narrowForced(.any, o.get("odd")) == .any);
+    try testing.expect(narrowForced(.any, null) == .any);
+    try testing.expectEqualStrings("b", narrowForced(.{ .name = "b" }, o.get("one")).name);
 }
 
 test "forcedToolOpener: the XML dialect commits a call in the template's own spelling" {

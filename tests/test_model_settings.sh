@@ -36,11 +36,11 @@ LOG="$FAKE_HOME/server.log"
 SRV=""
 cleanup() {
     [ -n "$SRV" ] && kill "$SRV" 2>/dev/null
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+    srv_preclean "$PORT"
     rm -rf "$FAKE_HOME"
 }
 trap cleanup EXIT
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 sleep 0.5
 
 write_settings() { # write_settings <ctx> <kv>  — override for MODEL_A only

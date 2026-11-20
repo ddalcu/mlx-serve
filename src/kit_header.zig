@@ -10,8 +10,9 @@ const model = @import("abi/plugin.zig");
 const media = @import("abi/media.zig");
 const quant = @import("abi/quant.zig");
 const host = @import("abi/host.zig");
+const engine = @import("abi/engine.zig");
 
-const roots = [_]type{ dylib.Manifest, model.ModelTable, media.MediaTable, quant.QuantTable, host.Host, host.HostGpu };
+const roots = [_]type{ dylib.Manifest, model.ModelTable, media.MediaTable, quant.QuantTable, host.Host, host.HostGpu, engine.Engine };
 
 pub fn main(init: std.process.Init) !void {
     var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
@@ -83,18 +84,25 @@ fn collectRefs(comptime T: type, comptime acc: []const type) []const type {
 }
 
 /// `abi.<file>.Name` → `Name` (generic arguments too), `<file>_Name` where two files share a name.
+/// `mlxs_<name>`; a name two ABI files share takes its file (`mlxs_media_Request`). The engine table joined after the
+/// others: only its side of a clash takes the file, so a name a released header had never changes.
 fn cName(comptime T: type) []const u8 {
     return comptime blk: {
-        @setEvalBranchQuota(10_000_000);
+        @setEvalBranchQuota(100_000_000);
         const short = strip(@typeName(T), false);
-        for (types) |U| if (U != T and std.mem.eql(u8, strip(@typeName(U), false), short)) break :blk "mlxs_" ++ strip(@typeName(T), true);
+        for (types) |U| if (U != T and std.mem.eql(u8, strip(@typeName(U), false), short) and (late(T) or !late(U)))
+            break :blk "mlxs_" ++ strip(@typeName(T), true);
         break :blk "mlxs_" ++ short;
     };
 }
 
+fn late(comptime T: type) bool {
+    return std.mem.startsWith(u8, @typeName(T), "abi.engine.");
+}
+
 fn strip(comptime name: []const u8, comptime keep_file: bool) []const u8 {
     return comptime blk: {
-        @setEvalBranchQuota(10_000_000);
+        @setEvalBranchQuota(100_000_000);
         var out: []const u8 = "";
         var i: usize = 0;
         while (i < name.len) {
@@ -201,6 +209,7 @@ const versions = [_]Version{
     .{ "MLXS_QUANT_TABLE_VERSION", quant.version },
     .{ "MLXS_HOST_VERSION", host.version },
     .{ "MLXS_HOST_GPU_VERSION", host.gpu_version },
+    .{ "MLXS_ENGINE_VERSION", engine.version },
 };
 
 pub fn write(a: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
@@ -209,7 +218,7 @@ pub fn write(a: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
         \\ * plugin kit; do not edit. A plugin is a dylib exporting one symbol, `
     ++ dylib.symbol ++
         \\`, a const mlxs_Manifest whose `table` points
-        \\ * at its kind's table (mlxs_ModelTable, mlxs_MediaTable or mlxs_QuantTable). Strings and slices cross as pointer
+        \\ * at its kind's table (mlxs_ModelTable, mlxs_MediaTable, mlxs_QuantTable or mlxs_Engine). Strings and slices cross as pointer
         \\ * + length (never NUL-terminated); every struct passed by pointer opens with `size` and `version` and grows at its
         \\ * end; memory is freed by whoever allocated it. mlx-c's arrays and streams cross as their `ctx` handles. */
         \\#ifndef MLX_SERVE_PLUGIN_H
@@ -280,4 +289,17 @@ pub fn write(a: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
         \\#endif
         \\
     , .{ dylib.symbol, dylib.symbol });
+}
+
+test "kit header: the engine's types yield on a clash, so the released C names stay" {
+    try std.testing.expectEqualStrings("mlxs_Caps", cName(model.Caps));
+    try std.testing.expectEqualStrings("mlxs_Bill", cName(model.Bill));
+    try std.testing.expectEqualStrings("mlxs_MediaKind", cName(model.MediaKind));
+    try std.testing.expectEqualStrings("mlxs_Host", cName(host.Host));
+    try std.testing.expectEqualStrings("mlxs_Event", cName(host.Event));
+    try std.testing.expectEqualStrings("mlxs_EventKind", cName(host.EventKind));
+    try std.testing.expectEqualStrings("mlxs_Request", cName(media.Request));
+    try std.testing.expectEqualStrings("mlxs_Progress", cName(media.Progress));
+    try std.testing.expectEqualStrings("mlxs_engine_Caps", cName(engine.Caps));
+    try std.testing.expectEqualStrings("mlxs_engine_Request", cName(engine.Request));
 }

@@ -6,7 +6,6 @@ const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
 const generate_mod = @import("../generate.zig");
 const model_mod = @import("../../../sdk/config/model.zig");
-const mlx_stream = @import("../modules/stream.zig");
 const metrics = @import("../../../host/status.zig");
 const system_vars = @import("../../../sdk/util/system.zig");
 const testing = std.testing;
@@ -96,12 +95,8 @@ pub fn pinAutoContext(config: *model_mod.ModelConfig) u32 {
 
 /// The startup line for a context `pinAutoContext` just froze: where the number came from.
 pub fn logPinnedContext(config: *const model_mod.ModelConfig, pinned: u32) void {
-    if (config.glm_stream) {
-        log.info("Context size: {d} tokens (mlx-stream: the prompts this load billed and the generation past them)\n", .{mlx_stream.contextLength(config)});
-    } else if (manualContext(config) > 0) {
+    if (manualContext(config) > 0) {
         log.info("Context size: {d} tokens (manual)\n", .{manualContext(config)});
-    } else if (config.mlxStream()) {
-        log.info("Context size: {d} tokens (the streaming pack's standard request; --ctx-size widens it)\n", .{getEffectiveContextLength(config)});
     } else {
         const memory_ctx = computeMemoryContext(config);
         const memory_allows = safeAutoContext(memory_ctx);
@@ -116,7 +111,6 @@ pub fn logPinnedContext(config: *const model_mod.ModelConfig, pinned: u32) void 
 }
 
 pub fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
-    if (config.mlxStream()) return mlx_stream.contextLength(config);
     if (manualContext(config) > 0) return manualContext(config);
     if (config.pinned_context > 0) return config.pinned_context;
     // Not pinned yet (a discovery stub that was never loaded): compute from
@@ -192,7 +186,7 @@ pub fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     const per_tok: u64 = sessionBytesPerToken(config, kv_bits);
 
     // `total_ctx = 0` asks for the unshrunk cap: the widest forward any prompt can run.
-    const chunk: u64 = @intCast(generate_mod.effectivePrefillChunk(
+    const chunk: u64 = @intCast(config.cappedPrefillChunk(generate_mod.effectivePrefillChunk(
         config.prefillScoreHeadDim(),
         config.num_attention_heads,
         0,
@@ -200,7 +194,7 @@ pub fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
         config.isMoe(),
         config.longCtxGated(),
         config.pinned_prefill_chunk,
-    ));
+    )));
 
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
@@ -330,15 +324,6 @@ test "pinAutoContext is idempotent and a no-op under --ctx-size" {
     http_server.serverState().server_config.max_context_size = 8192;
     try testing.expectEqual(@as(u32, 8192), pinAutoContext(&manual));
     try testing.expectEqual(@as(u32, 0), manual.pinned_context);
-}
-
-test "a GLM-5.3 request of 16,387 prompt tokens asking max_tokens 131,072 keeps all of it: the arch's maxOutput, not the plugin's 8,192" {
-    if (comptime !mlx_stream.built) return error.SkipZigTest;
-    // The pack's parse records its arch's maxOutput (GLM-5.3's default, 131,072) beside its billed context.
-    mlx_stream.noteMaxOutput("/packs/glm-5.3-clamp", 131072);
-    var config: model_mod.ModelConfig = .{ .model_type = "glm_moe_dsa", .pack_dir = "/packs/glm-5.3-clamp", .glm_stream = true, .ctx_override = 16448 };
-    try testing.expectEqual(@as(u32, 16448 + 131072), getEffectiveContextLength(&config));
-    try testing.expectEqual(@as(u32, 131072), clampMaxTokens(131072, 16387, getEffectiveContextLength(&config)));
 }
 
 test "getEffectiveContextLength uses ctx_size override" {

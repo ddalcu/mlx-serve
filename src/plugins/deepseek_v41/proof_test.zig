@@ -23,26 +23,30 @@ test "deepseek_v41 plugin: prefill, GPU decode, a verify block and a later chunk
     try proof.expectSteps(v41, t);
 }
 
-test "deepseek_v41 plugin: excluded configuration keeps the legacy resume and continues bit-equal" {
+test "deepseek_v41 plugin: a paired instance keeps the legacy resume and continues bit-equal" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const first = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
     const second = first ++ [_]u32{ 11, 2, 90 };
+    const paired: dsv41.Pair = .{ .lo = 2, .hi = 4, .worker = false };
     for ([_]bool{ false, true }) |release_parked| {
         const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), @embedFile("fixtures/proof-resume.tape"));
         defer t.close();
         const model: *v41.Model = @ptrCast(@alignCast(t.m));
-        model.cfg.dsv41_streamed = true;
         for ([_][]const u32{ &first, &second }, 0..) |prompt, turn| {
+            model.mdl.pair = paired;
             const n: u32 = @intCast(v41.resumePrompt(t.m, 7, .of(prompt), .{}));
+            model.mdl.pair = null;
             if (turn == 1) try testing.expect(n > 0);
             try t.check(mlx.mlx_array_new_data(&n, &[_]c_int{1}, 1, .uint32));
             try t.check(try t.plugin(.{ .mode = .prefill, .ids = prompt[n..] }, n));
             if (turn == 0 and release_parked)
                 testing.allocator.free(try slotForward(t, .prefill, &.{8}, &.{ 4, 12, 6 }, &.{0}));
+            model.mdl.pair = paired;
             v41.table.release_slot.?(t.m, 7);
+            model.mdl.pair = null;
             if (turn == 0 and !release_parked)
                 testing.allocator.free(try slotForward(t, .prefill, &.{8}, &.{ 4, 12, 6 }, &.{0}));
         }
@@ -188,8 +192,6 @@ test "deepseek_v41 aux: overlapping captures survive either release order and re
             try testing.expect(aux.bytes(t.m, sn) > 0);
             try testing.expectEqual(abi.Verdict.Code.unsupported, aux.restore_at(t.m, 3, sn, info.n - 1).code);
             var clone: abi.Handle = null;
-            try testing.expectEqual(abi.Verdict.Code.unsupported, aux.slice(t.m, sn, info.n - 1, &clone).code);
-            try testing.expect(clone == null);
             try testing.expectEqual(abi.Verdict.Code.unsupported, aux.slice(t.m, sn, info.n + 1, &clone).code);
             try testing.expect(clone == null);
             try testing.expect(aux.slice(t.m, sn, info.n, &clone).isOk());
@@ -231,6 +233,268 @@ test "deepseek_v41 aux: overlapping captures survive either release order and re
     }
 }
 
+test "deepseek_v41 aux: a snapshot sliced short of its end restores there by replaying its window" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var long: [41]u32 = undefined;
+    for (&long, 0..) |*x, i| x.* = @intCast(3 + (i * 37 + i * i) % 90);
+    const tail = [_]u32{ 11, 29, 5 };
+    // The run the snapshot comes from and the cold runs it is judged against are chunked alike and kept on the wide
+    // path, so a row is the same bits wherever it was made.
+    const chunks = [_]usize{ 0, 8, 24, 40 };
+    for ([_]bool{ false, true }) |dspark| {
+        const files = if (dspark) try fixture.v41DsparkFiles(arena.allocator(), 7) else try fixture.v41Files(arena.allocator(), 7);
+        const wide = try WideTwin.open(files);
+        defer wide.close();
+        const t = wide.t;
+        const model = wide.model();
+        const w: usize = model.mdl.cfg.sliding_window;
+        const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
+        try testing.expect(aux.begin_prompt(t.m, 1, .of(&long), .{}, 0, true).isOk());
+        for (chunks[0..3], chunks[1..]) |lo, hi| testing.allocator.free(try slotForward(t, .prefill, &.{1}, long[lo..hi], &.{@intCast(lo)}));
+        var sn: abi.Handle = null;
+        try testing.expect(aux.snapshot(t.m, 1, &sn).isOk());
+        try testing.expect(sn != null);
+        defer aux.free(t.m, sn);
+        const src: *const dsv41.Snap = @ptrCast(@alignCast(sn.?));
+        v41.table.release_slot.?(t.m, 1);
+        var ends: [2][]f32 = .{ &.{}, &.{} };
+        defer for (ends) |e| testing.allocator.free(e);
+        ends[0] = try restoredTail(t, aux, sn, &long, long[40..]);
+
+        // A cut at one window replays the whole prefix (nothing is truncated); one at 31 stands at the pooling
+        // group below it.
+        for ([_][2]usize{ .{ 8, 8 }, .{ 24, 24 }, .{ 31, 30 } }) |c| {
+            const n = c[1];
+            var cut: abi.Handle = null;
+            try testing.expect(aux.slice(t.m, sn, c[0], &cut).isOk());
+            defer aux.free(t.m, cut);
+            var info: abi.AuxSnapshotInfo = .{};
+            try testing.expect(aux.describe(t.m, cut, &info).isOk());
+            try testing.expectEqual(n, @as(usize, @intCast(info.n)));
+            try testing.expectEqualSlices(u32, long[0..n], info.ids.slice());
+            var out: abi.AuxExport = .{};
+            try testing.expectEqual(abi.Verdict.Code.failed, aux.export_arrays(t.m, cut, &out).code);
+            try testing.expectEqual(abi.Verdict.Code.unsupported, aux.restore_at(t.m, 2, cut, info.n + 2).code);
+            try testing.expect(aux.restore_at(t.m, 2, cut, info.n).isOk());
+            const ws = &model.mdl.dec_state.?;
+            try testing.expectEqual(n, ws.n);
+
+            const cold_twin = try WideTwin.open(files);
+            defer cold_twin.close();
+            const r = cold_twin.t;
+            const cold_model = cold_twin.model();
+            for (chunks[0..3], chunks[1..]) |lo, hi| {
+                if (lo < n) testing.allocator.free(try slotForward(r, .prefill, &.{1}, long[lo..@min(hi, n)], &.{@intCast(lo)}));
+            }
+            const cs = &cold_model.mdl.dec_state.?;
+            // Bars: the global rows and index keys are the snapshot's own, cut; the first layer's window is the cold
+            // prompt's (nothing below it was truncated), and so is every layer's when the replay is the whole prefix.
+            for (ws.layers, cs.layers, src.layers) |*wl, *cl, sl| {
+                try testing.expect(wl.pend_kv.ctx == null and wl.pend_gate.ctx == null);
+                inline for (.{ "comp", "idx_k" }) |f| if (@field(wl, f)) |rows| {
+                    try testing.expectEqual(@field(cl, f).?.used, rows.used);
+                    try expectRowsEqual(rows.buf, @field(sl, f).?.buf, 0, rows.used, rows.used);
+                    if (n <= 24) try expectRowsEqual(rows.buf, @field(cl, f).?.buf, 0, rows.used, rows.used);
+                };
+                if (n == w) try expectRowsEqual(wl.win.buf, cl.win.buf, n - w, n, wl.win.cap) else try expectFinite(wl.win.buf);
+            }
+            if (n > w) {
+                // The replay makes the first layer's window in one call of `w` rows; a row's bits can depend on its
+                // call's width, so the cold prompt it is judged against ends with that same call.
+                const split = try WideTwin.open(files);
+                defer split.close();
+                const r2 = split.t;
+                const split_model = split.model();
+                for (chunks[0..3], chunks[1..]) |lo, hi| {
+                    if (lo < n - w) testing.allocator.free(try slotForward(r2, .prefill, &.{1}, long[lo..@min(hi, n - w)], &.{@intCast(lo)}));
+                }
+                testing.allocator.free(try slotForward(r2, .prefill, &.{1}, long[n - w .. n], &.{@intCast(n - w)}));
+                const first = split_model.mdl.dec_state.?.layers[0].win;
+                try expectRowsEqual(ws.layers[0].win.buf, first.buf, n - w, n, ws.layers[0].win.cap);
+            }
+            if (n == w) {
+                for (ws.ds, cs.ds) |wr, cr| try expectRowsEqual(wr.buf, cr.buf, 0, n, wr.cap);
+                if (ws.mh.ctx != null) try expectRowsEqual(ws.mh, cs.mh, 0, 1, 1);
+            }
+            try testing.expectEqualSlices(u32, cs.hist.items, ws.hist.items);
+
+            var prompt: [44]u32 = undefined;
+            @memcpy(prompt[0..n], long[0..n]);
+            @memcpy(prompt[n..][0..tail.len], &tail);
+            try testing.expect(aux.begin_prompt(t.m, 2, .of(prompt[0 .. n + tail.len]), .{}, info.n, false).isOk());
+            const warm = try slotForward(t, .prefill, &.{2}, &tail, &.{@intCast(n)});
+            defer testing.allocator.free(warm);
+            v41.table.release_slot.?(t.m, 2);
+            const cold = try slotForward(r, .prefill, &.{1}, &tail, &.{@intCast(n)});
+            defer testing.allocator.free(cold);
+            for (warm) |x| try testing.expect(std.math.isFinite(x));
+            if (n == w) try testing.expectEqualSlices(f32, cold, warm);
+        }
+        // The snapshot the slices were cut from is untouched: it restores at its end as before them.
+        ends[1] = try restoredTail(t, aux, sn, &long, long[40..]);
+        try testing.expectEqualSlices(f32, ends[0], ends[1]);
+    }
+}
+
+test "deepseek_v41 CED: a lead chunk that skips the decoder leaves what the chunk after it reads" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var ids: [40]u32 = undefined;
+    for (&ids, 0..) |*x, i| x.* = @intCast(3 + (i * 37 + i * i) % 90);
+    {
+        const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+        defer t.close();
+        const model: *v41.Model = @ptrCast(@alignCast(t.m));
+        const mdl = model.mdl;
+        try testing.expect(mdl.ced_split != null);
+        const w: usize = mdl.cfg.sliding_window;
+        const skip = mdl.ced_min_skip;
+        defer mdl.ced_min_skip = skip;
+        mdl.ced_min_skip = w; // a chunk of two windows replays its last one
+        // The same two chunks, the first with its decoder replay and without.
+        var sts: [2]dsv41.State = undefined;
+        var logits: [2][]f32 = undefined;
+        for (&sts, &logits, [_]dsv41.Want{ .last, .encode }) |*st, *out, lead| {
+            st.* = try dsv41.initState(mdl, testing.allocator);
+            const head = try dsv41.extend(mdl, testing.allocator, st, ids[0..16], lead);
+            if (head.ctx != null) _ = mlx.mlx_array_free(head);
+            const rest = try dsv41.extend(mdl, testing.allocator, st, ids[16..], .last);
+            defer _ = mlx.mlx_array_free(rest);
+            out.* = try hostRows(rest);
+        }
+        defer for (&sts, logits) |*st, l| {
+            st.deinit();
+            testing.allocator.free(l);
+        };
+        try testing.expectEqual(@as(u64, 2 + 1), mdl.ced_stats.chunks);
+        try testing.expectEqualSlices(f32, logits[0], logits[1]);
+        const n = ids.len;
+        for (sts[0].layers, sts[1].layers) |*a, *b| {
+            inline for (.{ "comp", "idx_k" }) |f| if (@field(a, f)) |rows| {
+                try testing.expectEqual(rows.used, @field(b, f).?.used);
+                try expectRowsEqual(@field(b, f).?.buf, rows.buf, 0, rows.used, rows.used);
+            };
+            try expectRowsEqual(b.win.buf, a.win.buf, n - w, n, a.win.cap);
+        }
+    }
+}
+
+/// The logits of `tail` on a slot restored from `sn` at its end (the prompt `ids`).
+fn restoredTail(t: *Twin, aux: *const abi.AuxHooks, sn: abi.Handle, ids: []const u32, tail: []const u32) ![]f32 {
+    const n = ids.len - tail.len;
+    try testing.expect(aux.restore_at(t.m, 3, sn, n).isOk());
+    try testing.expect(aux.begin_prompt(t.m, 3, .of(ids), .{}, n, false).isOk());
+    defer v41.table.release_slot.?(t.m, 3);
+    return slotForward(t, .prefill, &.{3}, tail, &.{@intCast(n)});
+}
+
+fn hostRows(a: mlx.mlx_array) ![]f32 {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, a, .float32, mlx.gpuStream()));
+    try mlx.check(mlx.mlx_array_eval(f));
+    return testing.allocator.dupe(f32, (mlx.mlx_array_data_float32(f) orelse return error.NoData)[0..mlx.mlx_array_size(f)]);
+}
+
+/// A twin kept on the wide prompt path (its compiled regions set aside until close).
+const WideTwin = struct {
+    t: *Twin,
+    regions: @FieldType(std.meta.Child(@FieldType(v41.Model, "mdl")), "regions"),
+
+    fn open(files: anytype) !WideTwin {
+        const t = try Twin.open(files, "");
+        const m: *v41.Model = @ptrCast(@alignCast(t.m));
+        const regions = m.mdl.regions;
+        m.mdl.regions = regions[0..0];
+        return .{ .t = t, .regions = regions };
+    }
+
+    fn model(self: WideTwin) *v41.Model {
+        return @ptrCast(@alignCast(self.t.m));
+    }
+
+    fn close(self: WideTwin) void {
+        self.model().mdl.regions = self.regions;
+        self.t.close();
+    }
+};
+
+/// Rows of positions [lo, hi) of two `[cap, width]` arrays (a ring's slots, or rows in order when `cap` covers them).
+fn expectRowsEqual(a: mlx.mlx_array, b: mlx.mlx_array, lo: usize, hi: usize, cap: usize) !void {
+    const x = try hostRows(a);
+    defer testing.allocator.free(x);
+    const y = try hostRows(b);
+    defer testing.allocator.free(y);
+    const width = x.len / @as(usize, @intCast(mlx.getShape(a)[0]));
+    for (lo..hi) |p| {
+        const s = if (cap == 0) p else p % @max(cap, 1);
+        try testing.expectEqualSlices(f32, y[s * width ..][0..width], x[s * width ..][0..width]);
+    }
+}
+
+fn expectFinite(a: mlx.mlx_array) !void {
+    const x = try hostRows(a);
+    defer testing.allocator.free(x);
+    for (x) |v| try testing.expect(std.math.isFinite(v));
+}
+
+test "deepseek_v41 aux: a prompt abandoned mid-prefill leaves a snapshot at its last chunk, and a restore there continues the cold prefill bit for bit" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    var p: [40]u32 = undefined;
+    for (&p, 0..) |*id, i| id.* = @intCast((i * 7 + 3) % 90 + 2);
+    const cut = 23; // inside a pooling group and past the window: any chunk end is a restore point
+    const t = try Twin.open(files, "");
+    defer t.close();
+    const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
+
+    // Armed for its end, forwarded up to `cut`, then abandoned.
+    try testing.expect(aux.begin_prompt(t.m, 1, .of(&p), .{}, 0, true).isOk());
+    var none: abi.Handle = null;
+    try testing.expect(aux.snapshot(t.m, 1, &none).isOk());
+    try testing.expect(none == null); // nothing forwarded yet
+    testing.allocator.free(try slotForward(t, .prefill, &.{1}, p[0..9], &.{0}));
+    testing.allocator.free(try slotForward(t, .prefill, &.{1}, p[9..cut], &.{9}));
+    var sn: abi.Handle = null;
+    defer aux.free(t.m, sn);
+    try testing.expect(aux.snapshot(t.m, 1, &sn).isOk());
+    try testing.expect(sn != null);
+    var info: abi.AuxSnapshotInfo = .{};
+    try testing.expect(aux.describe(t.m, sn, &info).isOk());
+    try testing.expectEqual(@as(u64, cut), info.n);
+    try testing.expectEqualSlices(u32, p[0..cut], info.ids.slice());
+    try testing.expect(aux.snapshot(t.m, 1, &none).isOk());
+    try testing.expect(none == null); // handed over once
+    v41.table.release_slot.?(t.m, 1);
+
+    // The same prompt resumes from it and still captures its own end.
+    try testing.expect(aux.restore_at(t.m, 2, sn, cut).isOk());
+    try testing.expect(aux.begin_prompt(t.m, 2, .of(&p), .{}, cut, true).isOk());
+    testing.allocator.free(try slotForward(t, .prefill, &.{2}, p[cut .. p.len - 1], &.{cut}));
+    const warm = try slotForward(t, .prefill, &.{2}, p[p.len - 1 ..], &.{@intCast(p.len - 1)});
+    defer testing.allocator.free(warm);
+    var end: abi.Handle = null;
+    defer aux.free(t.m, end);
+    try testing.expect(aux.snapshot(t.m, 2, &end).isOk());
+    try testing.expect(aux.describe(t.m, end, &info).isOk());
+    try testing.expectEqual(@as(u64, p.len - 1), info.n);
+
+    const reference = try Twin.open(files, "");
+    defer reference.close();
+    testing.allocator.free(try slotForward(reference, .prefill, &.{1}, p[0..9], &.{0}));
+    testing.allocator.free(try slotForward(reference, .prefill, &.{1}, p[9..cut], &.{9}));
+    testing.allocator.free(try slotForward(reference, .prefill, &.{1}, p[cut .. p.len - 1], &.{cut}));
+    const cold = try slotForward(reference, .prefill, &.{1}, p[p.len - 1 ..], &.{@intCast(p.len - 1)});
+    defer testing.allocator.free(cold);
+    for (cold) |value| try testing.expect(std.math.isFinite(value));
+    try testing.expectEqualSlices(f32, cold, warm);
+}
+
 test "deepseek_v41 aux: disabled capture and short prompts retain no checkpoint" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -251,7 +515,7 @@ test "deepseek_v41 aux: disabled capture and short prompts retain no checkpoint"
     }
 }
 
-test "deepseek_v41 aux: candidate image key ignores later rows and eligibility excludes streamed and paired instances" {
+test "deepseek_v41 aux: candidate image key ignores later rows and eligibility excludes streaming banks and paired instances" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -275,12 +539,18 @@ test "deepseek_v41 aux: candidate image key ignores later rows and eligibility e
     try testing.expect(key[0] != key[1]);
     try testing.expect(aux.enabled(t.m));
     m.cfg.dsv41_streamed = true;
-    try testing.expect(!aux.enabled(t.m));
-    try testing.expectEqual(abi.Verdict.Code.unsupported, aux.begin_prompt(t.m, 1, .of(&.{ 3, 4 }), .{}, 0, true).code);
+    try testing.expect(aux.enabled(t.m));
     m.cfg.dsv41_streamed = false;
+    m.bank_streams = true;
+    try testing.expect(!aux.enabled(t.m));
+    m.bank_streams = false;
+    try testing.expect(v41.bankStreams(146, 183, 384));
+    try testing.expect(v41.bankStreams(384, 200, 384));
+    try testing.expect(!v41.bankStreams(384, 384, 384));
     m.mdl.pair = .{ .lo = 2, .hi = 4, .worker = false };
     defer m.mdl.pair = null;
     try testing.expect(!aux.enabled(t.m));
+    try testing.expectEqual(abi.Verdict.Code.unsupported, aux.begin_prompt(t.m, 1, .of(&.{ 3, 4 }), .{}, 0, true).code);
 }
 
 const codec = @import("cache_codec.zig");

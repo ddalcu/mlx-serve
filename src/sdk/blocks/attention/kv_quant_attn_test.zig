@@ -196,6 +196,41 @@ test "qkv decode kernel parity: multi-block split-KV merge (T_k > BLOCK)" {
     try qkvDecParityCase(8, 2, 128, 8, 700, true);
 }
 
+test "qkv decode simdgroup-matrix kernel: two head tiles, 8-bit dims across words, ragged spans; block kernel when off" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    // Dispatch leaves the kernel to the block kernel on NAX; forced off, it is checked on every GPU.
+    const nax = @import("../linear/verify_qmm_nax.zig");
+    const saved = nax.vqmm_nax_probe_override;
+    defer nax.vqmm_nax_probe_override = saved;
+    nax.vqmm_nax_probe_override = false;
+    try qkvDecParityCase(20, 2, 128, 4, 3001, false);
+    try qkvDecParityCase(32, 2, 128, 8, 2500, true);
+    try qkvDecParityCase(24, 2, 256, 4, 3001, false);
+    try qkvDecParityCase(6, 1, 256, 8, 9, false);
+    try testing.expect(!kv_quant_attn.qkvDecMmaFits(17, 128, 128, 64));
+    try testing.expect(!kv_quant_attn.qkvDecMmaFits(8, 512, 512, 64));
+    kv_quant_attn.qkv_dec_mma_override = false;
+    defer kv_quant_attn.qkv_dec_mma_override = null;
+    try qkvDecParityCase(8, 2, 128, 4, 700, true);
+    try qkvDecParityCase(6, 1, 256, 8, 700, false);
+}
+
+test "qkv decode simdgroup-matrix kernel: a NAX GPU keeps the block kernel at 4K keys" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const nax = @import("../linear/verify_qmm_nax.zig");
+    // Both arms forced, so the test means the same on an M4 and an M5.
+    const saved = nax.vqmm_nax_probe_override;
+    defer nax.vqmm_nax_probe_override = saved;
+    nax.vqmm_nax_probe_override = false;
+    const before = kv_quant_attn.qkv_dec_mma_calls;
+    try qkvDecParityCase(8, 2, 128, 4, 4096, false);
+    try testing.expect(kv_quant_attn.qkv_dec_mma_calls > before);
+    nax.vqmm_nax_probe_override = true;
+    const at = kv_quant_attn.qkv_dec_mma_calls;
+    try qkvDecParityCase(8, 2, 128, 4, 4096, false);
+    try testing.expectEqual(at, kv_quant_attn.qkv_dec_mma_calls);
+}
+
 fn qkvVerParityCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usize, t_q: c_int) !void {
     return qkvVerParityCaseWith(h_q, h_kv, d, bits, t_prefill, t_q, false);
 }

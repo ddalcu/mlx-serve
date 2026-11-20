@@ -98,8 +98,21 @@ WITHOUT_PLD="$(edit_task)"
 assert_contains "edit task answers" 'result' "$WITH_PLD"
 if [ "$WITH_PLD" = "$WITHOUT_PLD" ]; then ok "PLD output equals --no-pld"; else bad "PLD output equals --no-pld" "$(diff <(echo "$WITH_PLD") <(echo "$WITHOUT_PLD") | head -5)"; fi
 
-# 6. --engine llama turns the MLX engine off for the same file.
+# 6. --engine llama turns the MLX engine off for the same file: not for the ds4-only archs, which llama.cpp cannot
+#    open (`engine_pick.preferredEngine`; a split set of them has no embedded engine at all).
 stop
+ARCH="$(python3 -I - "$MODEL" <<'PY'
+import struct, sys
+f = open(sys.argv[1], 'rb'); f.read(8); f.read(8); n = struct.unpack('<Q', f.read(8))[0]
+for _ in range(n):
+    k = f.read(struct.unpack('<Q', f.read(8))[0]).decode(); t = struct.unpack('<I', f.read(4))[0]
+    if t != 8: break
+    v = f.read(struct.unpack('<Q', f.read(8))[0]).decode()
+    if k == 'general.architecture': print(v); break
+PY
+)"
+case "$ARCH" in deepseek41|qwen4exp|glm-dsa|glm5-next)
+    echo -e "  ${YELLOW}SKIP${NC} --engine llama and the opt-in checks: llama.cpp has no $ARCH"; continue ;; esac
 boot --engine llama
 assert_contains "--engine llama routes to llama.cpp" "\[llama\] engine ready" "$(cat "$LOG")"
 assert_lacks    "--engine llama skips the mlx engine" "\[gguf\] engine: mlx" "$(cat "$LOG")"

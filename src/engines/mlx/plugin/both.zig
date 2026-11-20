@@ -12,6 +12,7 @@ const model = @import("../../../sdk/config/model.zig");
 const driver = @import("driver.zig");
 const plugin_config = @import("config.zig");
 const fixture = @import("../../../sdk/bases/proof/fixture.zig");
+const sdk_fixture = @import("../../../sdk/testing/fixture.zig");
 const lazyForward = @import("../generate/step.zig").lazyForward;
 const FsPackDir = @import("../../../host/registry/pack_dir.zig").FsPackDir;
 const KVCache = @import("../kv/cache.zig").KVCache;
@@ -63,6 +64,11 @@ pub const Both = struct {
     }
 
     pub fn openAs(table: *const abi.ModelTable, pack: *fixture.Pack, config_json: []const u8, legacy_config: bool, oracle: Oracle) !Both {
+        return openWith(table, pack, config_json, legacy_config, oracle, &.{});
+    }
+
+    /// `openAs` with `extra` files written beside the pack before its parse (a streaming pack's `experts.bin`).
+    pub fn openWith(table: *const abi.ModelTable, pack: *fixture.Pack, config_json: []const u8, legacy_config: bool, oracle: Oracle, extra: []const sdk_fixture.File) !Both {
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
         // First: a tape that skips here (off Metal) must do so before anything is allocated.
@@ -73,6 +79,7 @@ pub const Both = struct {
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
         try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config_json });
+        for (extra) |f| try tmp.dir.writeFile(io, .{ .sub_path = f.name, .data = f.bytes });
         var path_buf: [512]u8 = undefined;
         const dir = try a.dupe(u8, path_buf[0..try tmp.dir.realPath(io, &path_buf)]);
         errdefer a.free(dir);
@@ -139,6 +146,31 @@ pub const Both = struct {
             try b.check(hidden, false);
             for (caps) |c| try b.check(try g.adopt(c), false);
         }
+    }
+
+    /// A verify of `window` after `prompt` gives every row the logits serial decode gives its token, and leaves the
+    /// state serial decode leaves (a decode of `next` after both), bit for bit: an exact verify's bar.
+    pub fn expectVerifyIsSerial(b: *Both, prompt: []const i32, window: []const i32, next: i32) !void {
+        var serial: Slot = undefined;
+        try serial.init(b, &b.xfm);
+        defer serial.deinit();
+        var verify: Slot = undefined;
+        try verify.init(b, &b.xfm);
+        defer verify.deinit();
+        var g = ops.Graph.init(testing.allocator, b.xfm.s);
+        defer g.deinit();
+        for ([_]*Slot{ &serial, &verify }) |s| _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, prompt)));
+        const rows = try testing.allocator.alloc(Array, window.len);
+        defer testing.allocator.free(rows);
+        for (rows, window) |*r, t| r.* = try g.adopt(try b.xfm.forwardWith(&serial.ctx, try fixture.tokens(&g, &.{t})));
+        verify.ctx.spec_verify = true;
+        verify.ctx.capture_ssm_seq = true;
+        const got = try g.adopt(try b.xfm.forwardWith(&verify.ctx, try fixture.tokens(&g, window)));
+        verify.ctx.spec_verify = false;
+        verify.ctx.capture_ssm_seq = false;
+        try ops.expectBitEqual(got, try g.concat(rows, 1));
+        const after = try g.adopt(try b.xfm.forwardWith(&verify.ctx, try fixture.tokens(&g, &.{next})));
+        try ops.expectBitEqual(after, try g.adopt(try b.xfm.forwardWith(&serial.ctx, try fixture.tokens(&g, &.{next}))));
     }
 
     /// Greedy decode through the pipelined step (`lazyForward`: the next token stays a lazy argmax), tokens equal.
@@ -392,6 +424,117 @@ pub fn servedUnderOverrides(config_json: []const u8) !model.ModelConfig {
     errdefer cfg.deinit(a);
     if (cfg.plugin == null) return error.TestExpectedPluginServed;
     return cfg;
+}
+
+/// `n` token ids below 250.
+fn ringIds(comptime n: usize, comptime seed: usize) [n]i32 {
+    var out: [n]i32 = undefined;
+    for (&out, 0..) |*x, i| x.* = @intCast((i * 37 + seed) % 250);
+    return out;
+}
+
+const ring_chunk_a = ringIds(260, 11);
+const ring_chunk_b = ringIds(300, 5);
+const ring_second_a = ringIds(200, 3);
+const ring_second_b = ringIds(54, 17);
+
+/// `long_steps`, then chunks past the cache's first capacity (a grow), decode and verify between them.
+const ring_steps = long_steps ++ [_]Step{
+    .{ .mode = .prefill, .ids = &ring_chunk_a },
+    .{ .mode = .decode, .ids = &.{40} },
+    .{ .mode = .verify, .ids = &.{ 8, 13, 21, 34, 55 } },
+    .{ .mode = .prefill, .ids = &ring_chunk_b },
+    .{ .mode = .decode, .ids = &.{77} },
+    .{ .mode = .decode, .ids = &.{78} },
+};
+
+/// A second slot that fills its first capacity to two rows short, so the batched rows grow it.
+const ring_second = [_]Step{ .{ .mode = .prefill, .ids = &ring_second_a }, .{ .mode = .prefill, .ids = &ring_second_b } };
+
+/// `ring_steps` through `M.forward` on `full` (every sliding layer's `ring` 0) and on `ringed` (the same weights with
+/// rings short enough to drop rows), each through its own cache, then with `batched` a second slot per arm and six
+/// batched decode rows: every step's logits bit-equal, and only the ringed caches dropped rows.
+pub fn expectRingSame(comptime M: type, shared: anytype, s: mlx.mlx_stream, full: *const M.Weights, ringed: *const M.Weights, layers: u32, batched: bool) !void {
+    const a = testing.allocator;
+    const cache_ops = @import("../kv/cache_ops.zig");
+    var kv: [4]KVCache = undefined;
+    var made: usize = 0;
+    defer for (kv[0..made]) |*c| c.deinit();
+    for (&kv) |*c| {
+        c.* = try KVCache.init(a, layers);
+        made += 1;
+    }
+    var slots: [4]cache_ops.Slot = undefined;
+    for (&slots, &kv) |*sl, *c| sl.* = .{ .kv = c };
+    const arms = [_]*const M.Weights{ full, ringed };
+    var pos = [2]u32{ 0, 0 };
+    for ([_][]const Step{ &ring_steps, if (batched) &ring_second else &.{} }, 0..) |run, slot| {
+        for (run) |st| {
+            var g = ops.Graph.init(a, s);
+            defer g.deinit();
+            const ids = try fixture.tokens(&g, st.ids);
+            var outs: [2]ops.Array = undefined;
+            for (arms, 0..) |w, arm| {
+                const handles = [_]abi.Handle{slots[2 * slot + arm].handle()};
+                outs[arm] = (try M.forward(w, shared, &g, ids, .{ .mode = st.mode, .rows = @intCast(st.ids.len), .positions = &.{pos[slot]}, .caches = &handles, .cache_ops = &cache_ops.ops, .logits = .all_rows })).logits;
+            }
+            try ops.expectBitEqual(outs[1], outs[0]);
+            pos[slot] += @intCast(st.ids.len);
+        }
+    }
+    if (batched) for (0..6) |i| {
+        var g = ops.Graph.init(a, s);
+        defer g.deinit();
+        const t: i32 = @intCast(i);
+        const ids = try g.fromSlice(i32, &.{ 3 + t, 90 + t }, &.{ 2, 1 });
+        var outs: [2]ops.Array = undefined;
+        for (arms, 0..) |w, arm| {
+            const handles = [_]abi.Handle{ slots[arm].handle(), slots[2 + arm].handle() };
+            outs[arm] = (try M.forward(w, shared, &g, ids, .{ .mode = .batched_rows, .rows = 1, .slots = 2, .positions = &pos, .caches = &handles, .cache_ops = &cache_ops.ops, .logits = .all_rows })).logits;
+        }
+        try ops.expectBitEqual(outs[1], outs[0]);
+        pos[0] += 1;
+        pos[1] += 1;
+    };
+    for (kv[0..if (batched) 4 else 2], 0..) |c, i| {
+        var dropped = false;
+        for (c.entries) |e| dropped = dropped or e.base > 0;
+        try testing.expectEqual(i % 2 == 1, dropped);
+    }
+}
+
+/// A prompt prefilled in chunks wide enough for a whole-buffer view (16 rows or more at head 256) on `s`, through
+/// `full` and `ringed` as `expectRingSame` takes them: every chunk's logits bit-equal, only the ringed cache dropped rows.
+pub fn expectRingSameWide(comptime M: type, shared: anytype, s: mlx.mlx_stream, full: *const M.Weights, ringed: *const M.Weights, layers: u32) !void {
+    const a = testing.allocator;
+    const cache_ops = @import("../kv/cache_ops.zig");
+    var kv: [2]KVCache = undefined;
+    var made: usize = 0;
+    defer for (kv[0..made]) |*c| c.deinit();
+    for (&kv) |*c| {
+        c.* = try KVCache.init(a, layers);
+        made += 1;
+    }
+    var slots: [2]cache_ops.Slot = undefined;
+    for (&slots, &kv) |*sl, *c| sl.* = .{ .kv = c };
+    var pos: u32 = 0;
+    for ([_]usize{ 250, 40, 20 }) |n| {
+        var g = ops.Graph.init(a, s);
+        defer g.deinit();
+        const ids = try fixture.tokens(&g, ring_chunk_a[0..n]);
+        var outs: [2]ops.Array = undefined;
+        for ([_]*const M.Weights{ full, ringed }, &slots, &outs) |w, *sl, *o| {
+            const handles = [_]abi.Handle{sl.handle()};
+            o.* = (try M.forward(w, shared, &g, ids, .{ .mode = .prefill, .rows = @intCast(n), .positions = &.{pos}, .caches = &handles, .cache_ops = &cache_ops.ops, .logits = .all_rows })).logits;
+        }
+        try ops.expectBitEqual(outs[1], outs[0]);
+        pos += @intCast(n);
+    }
+    for (kv, 0..) |c, i| {
+        var dropped = false;
+        for (c.entries) |e| dropped = dropped or e.base > 0;
+        try testing.expectEqual(i == 1, dropped);
+    }
 }
 
 /// A released pack's config at a proof pack's geometry: `real` with every key of `fixture` but `keep` taken from the

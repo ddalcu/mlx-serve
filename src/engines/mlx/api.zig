@@ -16,7 +16,6 @@ const model_state = @import("runtime/model_state.zig");
 const distributed = @import("cluster/distributed.zig");
 const request_policy = @import("request_policy.zig");
 const configure_mod = @import("configure.zig");
-const mlx_stream = @import("modules/stream.zig");
 const Scheduler = scheduler.Scheduler;
 const Slot = scheduler.Slot;
 
@@ -37,7 +36,6 @@ pub const table: host.Api = .{
     .free_model_state = model_state.freeMlx,
     .unload_resident = model_state.unloadResident,
     .holds_pair = distributed.holds,
-    .set_foreign_bytes = mlx_stream.setForeignBytes,
     .hot_cache_bytes = hotCacheBytes,
     .run_generation = runGeneration,
     .compute_embeddings = computeEmbeddings,
@@ -201,6 +199,7 @@ fn facts(lm: *const LoadedModel, out: *host.Facts) void {
         .video = supportsVideo(lm),
         .batches_decode = if (lm.config) |c| verdict.configBatchesDecode(c) else false,
         .hot_cache_bytes = hotCacheBytes(lm),
+        .suppress_cjk = if (lm.transformer) |t| t.suppress_mask_cjk != null and !t.ownsModuleDecodeState() else false,
     };
 }
 

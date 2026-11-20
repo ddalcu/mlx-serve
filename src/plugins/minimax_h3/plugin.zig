@@ -321,9 +321,9 @@ fn references(req: *const abi.Request, b: *const job.Body, gen_w: u32, gen_h: u3
 
 /// Live memory: host RAM (what the OS will grant, and the total) from the request's machine, and the GPU's
 /// working-set room. Unknown host RAM keeps nothing resident and skips the staged-canvas check.
-const Mem = struct { host_avail: u64 = 0, total: u64 = 0, gpu_limit: u64, gpu_active: u64 };
+pub const Mem = struct { host_avail: u64 = 0, total: u64 = 0, gpu_limit: u64, gpu_active: u64 };
 
-fn memNow(req: *const abi.Request) Mem {
+pub fn memNow(req: *const abi.Request) Mem {
     var active: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
     const m = req.machine orelse &abi.Machine{};
@@ -354,14 +354,20 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
 
     const turbo = b.flag("turbo");
     const pdd_steps: ?u32 = if (e.pdd) |p| p.steps() else null;
-    if (turbo and pdd_steps != null) return bad("'turbo' is the base model's few-step adapter — this pack is already a distilled student and runs its own trained steps");
+    const two_time = if (e.geometry.two_time) |*tt| tt else null;
+    if (turbo and (pdd_steps != null or two_time != null)) return bad("'turbo' is the base model's few-step adapter — this pack is already a distilled student and runs its own trained steps");
+    if (two_time != null and e.lora_n > 0) return bad("'lora_paths' targets the base model's blocks — a two-time pack has dropped and factored some of them");
     if (turbo and dir.fileBytes("turbo_lora.safetensors") == 0) return bad("this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors");
 
     const width = u32Field(&b, "width", 256);
     const height = u32Field(&b, "height", 256);
     const steps = if (pdd_steps) |n|
         stepsIn(&b, n, n, n) orelse return req.refuseFmt(.unsupported, "this pack runs a fixed step count — omit 'steps'", "this pack is a distilled student that runs exactly {d} steps — omit 'steps' or send {d}", .{ n, n })
-    else
+    else if (two_time) |tt| tts: {
+        const n = stepsIn(&b, tt.default_steps, 1, h3.TwoTime.MAX_STEPS) orelse 0;
+        if (tt.grid(n) == null) return req.refuseFmt(.unsupported, "this pack samples only the step counts it was trained for", "this pack samples only the step counts it was trained for ({any}) — omit 'steps' for {d}", .{ tt.steps[0..tt.n_grids], tt.default_steps });
+        break :tts n;
+    } else
         stepsIn(&b, if (turbo) 4 else 30, 1, 100) orelse return bad("'steps' must be in [1,100]");
     const seed = b.uint("seed") orelse 0;
     const requested_frames = u32Field(&b, "num_frames", 56);
@@ -401,7 +407,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
 
     // The request's own activations price the resident plan; when it does not fit, the staged DiT stage is checked
     // here, before any stage loads, since a Metal OOM mid-step is uncatchable.
-    const distilled = turbo or pdd_steps != null;
+    const distilled = turbo or pdd_steps != null or two_time != null;
     const fast: ?bool = if (b.get("fast")) |v| (if (v == .bool) v.bool else null) else null;
     const speed = h3.resolveSpeed(fast, distilled);
     const bcast_row: u64 = if (speed.bcast_k > 0) @as(u64, e.geometry.dit.num_layers) * e.geometry.dit.hidden_size * 2 else 0;
@@ -410,7 +416,8 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     const mem = memNow(req);
     const plan = residentFor(e, dir, activations, mem);
     if (plan == null) {
-        const dit = config.ditResidentBytes(config.ditFileBytes(dir, &e.machine), true) + (if (turbo) dir.fileBytes("turbo_lora.safetensors") else 0);
+        // A two-time DiT's AdaLN takes a 16-wide embedding: precompute frees next to nothing of it.
+        const dit = config.ditResidentBytes(config.ditFileBytes(dir, &e.machine), two_time == null) + (if (turbo) dir.fileBytes("turbo_lora.safetensors") else 0);
         const bill = config.canvasBill(dit, activations, mem.host_avail, mem.gpu_limit, mem.gpu_active, mlx.cudaAvailable());
         if (dit > 0 and bill.avail > 0 and bill.need > bill.avail) {
             const gb = 1024.0 * 1024.0 * 1024.0;
@@ -490,20 +497,21 @@ fn encode(ep: *anyopaque, out: *abi.Str) callconv(.c) Verdict {
     return .ok;
 }
 
-/// A tiny random H3: a one-layer DiT at 64 (two 32-wide heads, one refiner block), a one-layer text encoder at 64
-/// over a byte tokenizer, a one-block video VAE decoder at 32 and no audio VAE (the clip comes back silent).
-pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
+/// The tiny DiT the conformance packs share: 64 wide (two 32-wide heads, one block + one refiner), `out_heads`
+/// stacked video output heads, and the audio stream unless `audio` is false.
+pub fn fixtureDit(a: std.mem.Allocator, audio: bool, out_heads: u64) !sdk.tensors.Tensors {
     const H = 64;
     const heads = 2;
     const hd = 32;
     const ffn = 64;
     const ted = 32; // time_embed_dim
-    const vocab = 260;
     var dit = sdk.tensors.Tensors.init(a, 101);
     try dit.rand("video_patch_proj.weight", .{}, &.{ H, 96 }, .F32, 0.1);
     try dit.rand("video_patch_proj.bias", .{}, &.{H}, .F32, 0.1);
-    try dit.rand("audio_patch_proj.weight", .{}, &.{ H, 32 }, .F32, 0.1);
-    try dit.rand("audio_patch_proj.bias", .{}, &.{H}, .F32, 0.1);
+    if (audio) {
+        try dit.rand("audio_patch_proj.weight", .{}, &.{ H, 32 }, .F32, 0.1);
+        try dit.rand("audio_patch_proj.bias", .{}, &.{H}, .F32, 0.1);
+    }
     try dit.rand("condition_proj.weight", .{}, &.{ H, H }, .BF16, 0.1);
     try dit.rand("condition_proj.bias", .{}, &.{H}, .BF16, 0.1);
     try dit.rand("time_embedder.proj_in.weight", .{}, &.{ H, 32 }, .F32, 0.1);
@@ -527,11 +535,20 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     try dit.rand("final_layer.adaln_proj.linear.weight", .{}, &.{ 2 * H, ted }, .BF16, 0.05);
     try dit.rand("final_layer.adaln_proj.linear.bias", .{}, &.{2 * H}, .BF16, 0.05);
     try dit.fill("final_layer.norm.weight", .{}, &.{H}, .BF16, 1);
-    try dit.rand("final_layer.video_out.weight", .{}, &.{ 96, H }, .F32, 0.1);
-    try dit.rand("final_layer.video_out.bias", .{}, &.{96}, .F32, 0.1);
-    try dit.rand("final_layer.audio_out.weight", .{}, &.{ 32, H }, .F32, 0.1);
-    try dit.rand("final_layer.audio_out.bias", .{}, &.{32}, .F32, 0.1);
+    try dit.rand("final_layer.video_out.weight", .{}, &.{ 96 * out_heads, H }, .F32, 0.1);
+    try dit.rand("final_layer.video_out.bias", .{}, &.{96 * out_heads}, .F32, 0.1);
+    if (audio) {
+        try dit.rand("final_layer.audio_out.weight", .{}, &.{ 32, H }, .F32, 0.1);
+        try dit.rand("final_layer.audio_out.bias", .{}, &.{32}, .F32, 0.1);
+    }
+    return dit;
+}
 
+/// The tiny text encoder the conformance packs share: one Qwen3 layer at 64 over a byte tokenizer.
+pub fn fixtureTextEncoder(a: std.mem.Allocator) !sdk.tensors.Tensors {
+    const H = 64;
+    const hd = 32;
+    const vocab = 260;
     var te = sdk.tensors.Tensors.init(a, 102);
     try te.rand("model.embed_tokens.weight", .{}, &.{ vocab, H }, .BF16, 0.5);
     const tp = "model.layers.0.";
@@ -541,7 +558,14 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
         try te.rand(tp ++ l[0] ++ ".weight", .{}, &.{ l[1], l[2] }, .BF16, 0.1);
     try te.fill(tp ++ "self_attn.q_norm.weight", .{}, &.{hd}, .BF16, 1);
     try te.fill(tp ++ "self_attn.k_norm.weight", .{}, &.{hd}, .BF16, 1);
+    return te;
+}
 
+/// A tiny random H3: a one-layer DiT at 64 (two 32-wide heads, one refiner block), a one-layer text encoder at 64
+/// over a byte tokenizer, a one-block video VAE decoder at 32 and no audio VAE (the clip comes back silent).
+pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
+    var dit = try fixtureDit(a, true, 1);
+    var te = try fixtureTextEncoder(a);
     const vd = 32; // decoder width: 2 heads x 16
     var vae = sdk.tensors.Tensors.init(a, 103);
     try vae.rand("decoder.x_embedder.weight", .{}, &.{ vd, 24 }, .BF16, 0.2);

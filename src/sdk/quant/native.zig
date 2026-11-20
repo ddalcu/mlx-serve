@@ -18,9 +18,8 @@ const Str = abi.Str;
 const Verdict = abi.Verdict;
 const QuantMode = @import("params.zig").QuantMode;
 
-/// `Weight.layout`: dense (pre-transposed `[in, out]`), an MLX mode, row-scaled e4m3 (`sushi_pack.fp8Linear`), or
-/// e4m3 on a 64 x 128 scale grid (`fp8_block128.linear`).
-pub const Layout = enum(u8) { dense, affine, nvfp4, mxfp4, mxfp8, fp8_rows, fp8_block128 };
+/// `Weight.layout` (`layout.zig`).
+pub const Layout = @import("layout.zig").Layout;
 
 /// The per-load state: the block's declaration as the engine's resolver reads it.
 pub const State = struct {

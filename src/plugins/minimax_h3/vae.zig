@@ -460,17 +460,19 @@ pub const Decoder = struct {
 
     fn buildRope(self: *const Decoder, ids: []const f32, n_rows: usize, s: S) !h3.RopeTables {
         const nf = self.cfg.ropeFreqs();
-        const half: usize = @as(usize, nf) * 3;
+        const axes: usize = self.cfg.rope_axes;
+        const half: usize = @as(usize, nf) * axes;
         const ang = try self.allocator.alloc(f32, n_rows * half);
         defer self.allocator.free(ang);
         const two_pi: f64 = 2.0 * std.math.pi;
         for (0..n_rows) |r| {
-            for (0..3) |ax| {
-                const p: f64 = ids[r * 3 + ax];
+            // A 2-axis decoder ropes the trailing (h, w) of each (t, h, w) id.
+            for (0..axes) |ax| {
+                const p: f64 = ids[r * 3 + 3 - axes + ax];
                 for (0..nf) |j| {
                     // inv_freq = 1 / theta^(j * 2*n_dim/dim); with dim = 48 and
                     // n_dim = 3 the exponent step is 0.125.
-                    const step = 2.0 * 3.0 / (@as(f64, @floatFromInt(self.cfg.head_dim)) * self.cfg.rope_dim_ratio);
+                    const step = 2.0 * @as(f64, @floatFromInt(axes)) / (@as(f64, @floatFromInt(self.cfg.head_dim)) * self.cfg.rope_dim_ratio);
                     const inv = 1.0 / std.math.pow(f64, self.cfg.rope_theta, @as(f64, @floatFromInt(j)) * step);
                     ang[r * half + ax * nf + j] = @floatCast(two_pi * p * inv);
                 }
@@ -813,15 +815,12 @@ fn decodeSpatial(dec: *const Decoder, z: mlx.mlx_array, alloc: std.mem.Allocator
     return outp;
 }
 
-/// Full decode: normalized latents [1,24,T,H,W] -> pixels [1,3,frames,H*16,W*16]
-/// in [-1, 1].
-pub fn decode(dec: *const Decoder, z_norm: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+/// Normalized latents [1,C,T,H,W] -> what the ViT reads: `z * std + mean`, then the 1x1x1 post-quant mix.
+fn decoderInput(dec: *const Decoder, z_norm: mlx.mlx_array, s: S) !mlx.mlx_array {
     const shp = mlx.getShape(z_norm);
     const latent_t: u32 = @intCast(shp[2]);
     const lat_h: u32 = @intCast(shp[3]);
     const lat_w: u32 = @intCast(shp[4]);
-
-    // Denormalize: z * std + mean, then the 1x1x1 post-quant mix.
     const zf = try astype(z_norm, mlx.mlx_dtype.float32, s);
     defer _ = mlx.mlx_array_free(zf);
     const cshape = [_]c_int{ 1, @intCast(dec.cfg.in_channels), 1, 1, 1 };
@@ -850,7 +849,50 @@ pub fn decode(dec: *const Decoder, z_norm: mlx.mlx_array, alloc: std.mem.Allocat
     defer _ = mlx.mlx_array_free(back);
     const backc = try contig(back, s);
     defer _ = mlx.mlx_array_free(backc);
-    var z = try reshape(backc, &[_]c_int{ 1, @intCast(dec.cfg.in_channels), @intCast(latent_t), @intCast(lat_h), @intCast(lat_w) }, s);
+    return reshape(backc, &[_]c_int{ 1, @intCast(dec.cfg.in_channels), @intCast(latent_t), @intCast(lat_h), @intCast(lat_w) }, s);
+}
+
+/// The decoder's ImageNet-normalized output -> RGB in [0, 1], f32.
+fn unitPixels(decoded: mlx.mlx_array, pshape: []const c_int, s: S) !mlx.mlx_array {
+    const df = try astype(decoded, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(df);
+    const pm_arr = mlx.mlx_array_new_data(&IMAGENET_MEAN, pshape.ptr, @intCast(pshape.len), mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(pm_arr);
+    const ps_arr = mlx.mlx_array_new_data(&IMAGENET_STD, pshape.ptr, @intCast(pshape.len), mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(ps_arr);
+    const m1 = try mulA(df, ps_arr, s);
+    defer _ = mlx.mlx_array_free(m1);
+    const a1 = try addA(m1, pm_arr, s);
+    defer _ = mlx.mlx_array_free(a1);
+    const lo = mlx.mlx_array_new_float(0.0);
+    defer _ = mlx.mlx_array_free(lo);
+    const hi = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(hi);
+    var cl = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(cl);
+    try mlx.check(mlx.mlx_clip(&cl, a1, lo, hi, s));
+    return cl;
+}
+
+/// One image: normalized latents [1,C,1,H,W] -> RGB [1,3,H*16,W*16] in [0, 1]. The 2D decoder has no temporal
+/// clip to walk; the canvas is still decoded in the reference's blended 256-pixel tiles.
+pub fn decodeImage(dec: *const Decoder, z_norm: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+    if (mlx.getShape(z_norm)[2] != 1 or dec.cfg.patch_size_t != 1) return error.NotAnImageLatent;
+    const z = try decoderInput(dec, z_norm, s);
+    defer _ = mlx.mlx_array_free(z);
+    const px = try decodeSpatial(dec, z, alloc, s);
+    defer _ = mlx.mlx_array_free(px);
+    const shp = mlx.getShape(px);
+    const flat = try reshape(px, &[_]c_int{ 1, 3, shp[3], shp[4] }, s);
+    defer _ = mlx.mlx_array_free(flat);
+    return unitPixels(flat, &[_]c_int{ 1, 3, 1, 1 }, s);
+}
+
+/// Full decode: normalized latents [1,24,T,H,W] -> pixels [1,3,frames,H*16,W*16]
+/// in [-1, 1].
+pub fn decode(dec: *const Decoder, z_norm: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+    const latent_t: u32 = @intCast(mlx.getShape(z_norm)[2]);
+    var z = try decoderInput(dec, z_norm, s);
     defer _ = mlx.mlx_array_free(z);
 
     const plan = planTemporal(latent_t);
@@ -933,25 +975,9 @@ pub fn decode(dec: *const Decoder, z_norm: mlx.mlx_array, alloc: std.mem.Allocat
     }
 
     // Pixel denormalization: ImageNet stats, clamp to [0,1], then to [-1,1].
-    const df = try astype(dec_all, mlx.mlx_dtype.float32, s);
+    const cl = try unitPixels(dec_all, &[_]c_int{ 1, 3, 1, 1, 1 }, s);
     _ = mlx.mlx_array_free(dec_all);
-    defer _ = mlx.mlx_array_free(df);
-    const pshape = [_]c_int{ 1, 3, 1, 1, 1 };
-    const pm_arr = mlx.mlx_array_new_data(&IMAGENET_MEAN, &pshape, 5, mlx.mlx_dtype.float32);
-    defer _ = mlx.mlx_array_free(pm_arr);
-    const ps_arr = mlx.mlx_array_new_data(&IMAGENET_STD, &pshape, 5, mlx.mlx_dtype.float32);
-    defer _ = mlx.mlx_array_free(ps_arr);
-    const m1 = try mulA(df, ps_arr, s);
-    defer _ = mlx.mlx_array_free(m1);
-    const a1 = try addA(m1, pm_arr, s);
-    defer _ = mlx.mlx_array_free(a1);
-    const lo = mlx.mlx_array_new_float(0.0);
-    defer _ = mlx.mlx_array_free(lo);
-    const hi = mlx.mlx_array_new_float(1.0);
-    defer _ = mlx.mlx_array_free(hi);
-    var cl = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(cl);
-    try mlx.check(mlx.mlx_clip(&cl, a1, lo, hi, s));
     const two = mlx.mlx_array_new_float(2.0);
     defer _ = mlx.mlx_array_free(two);
     const scaled2 = try mulA(cl, two, s);
@@ -1068,6 +1094,16 @@ test "minimax h3 vae: decoder geometry matches the checkpoint" {
     try testing.expect(cfg.rotDim() < cfg.head_dim);
     // proj_out width: 3 channels x 4 frames x 16 x 16.
     try testing.expectEqual(@as(u32, 3072), cfg.outPatchDim());
+}
+
+test "minimax h3 vae: the image decoder ropes (h, w) only" {
+    const cfg = DecCfg.image;
+    try testing.expectEqual(@as(u32, 1024), cfg.dim());
+    // RotaryPosEmbed(64 * 0.5, num_axes=2): arange(0, 1, 2*2/32) = 8 freqs, 8 x 2 axes x 2 = 32 rotated.
+    try testing.expectEqual(@as(u32, 8), cfg.ropeFreqs());
+    try testing.expectEqual(@as(u32, 32), cfg.rotDim());
+    // proj_out [768, 1024]: 3 channels x 16 x 16, one frame.
+    try testing.expectEqual(@as(u32, 768), cfg.outPatchDim());
 }
 
 test "minimax h3 vae live: tiled decode seam energy stays at ambient level" {
@@ -1552,7 +1588,45 @@ pub const Encoder = struct {
         const pt: u32 = @intCast(pshp[2]);
         const ph: u32 = @intCast(pshp[3]);
         const pw: u32 = @intCast(pshp[4]);
+        const nthwc = try encoderInput(pixels, s);
+        defer _ = mlx.mlx_array_free(nthwc);
 
+        const moments = if (pt == 1)
+            try self.adaptiveEncode(nthwc, ph, pw, alloc, s)
+        else
+            try self.encodeTemporal(nthwc, pt, ph, pw, alloc, s);
+        defer _ = mlx.mlx_array_free(moments);
+
+        // mean = first 24 channels; normalize by the latent statistics.
+        const mean24 = try sliceAxis(moments, 1, 0, 24, s);
+        defer _ = mlx.mlx_array_free(mean24);
+        return self.normalize(mean24, s);
+    }
+
+    /// One image's posterior moments (`pixels` [1,3,1,H,W] in [-1, 1]) -> [1, 48, 1, H/16, W/16] f32: mean, then
+    /// log-variance, un-normalized — for a caller that samples the posterior instead of taking its mean.
+    pub fn imageMoments(self: *const Encoder, pixels: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+        const pshp = mlx.getShape(pixels);
+        if (pshp[2] != 1) return error.NotAnImage;
+        const nthwc = try encoderInput(pixels, s);
+        defer _ = mlx.mlx_array_free(nthwc);
+        return self.adaptiveEncode(nthwc, @intCast(pshp[3]), @intCast(pshp[4]), alloc, s);
+    }
+
+    /// `(z - latents_mean) / latents_std` per channel, [1, 24, T, H, W].
+    pub fn normalize(self: *const Encoder, z: mlx.mlx_array, s: S) !mlx.mlx_array {
+        const csh = [_]c_int{ 1, 24, 1, 1, 1 };
+        const lm = try reshape(self.latents_mean, &csh, s);
+        defer _ = mlx.mlx_array_free(lm);
+        const ls = try reshape(self.latents_std, &csh, s);
+        defer _ = mlx.mlx_array_free(ls);
+        const centered = try subA(z, lm, s);
+        defer _ = mlx.mlx_array_free(centered);
+        return divA(centered, ls, s);
+    }
+
+    /// [1,3,T,H,W] in [-1, 1] -> [1,T,H,W,3] ImageNet-normalized f32, the encoder's input.
+    fn encoderInput(pixels: mlx.mlx_array, s: S) !mlx.mlx_array {
         // [1,3,T,H,W] -> [1,T,H,W,3], then [-1,1] -> ImageNet normalization.
         const t5 = try transpose(pixels, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
         defer _ = mlx.mlx_array_free(t5);
@@ -1573,26 +1647,7 @@ pub const Encoder = struct {
         defer _ = mlx.mlx_array_free(psd);
         const cen = try subA(unit01, pm, s);
         defer _ = mlx.mlx_array_free(cen);
-        const nthwc = try divA(cen, psd, s);
-        defer _ = mlx.mlx_array_free(nthwc);
-
-        const moments = if (pt == 1)
-            try self.adaptiveEncode(nthwc, ph, pw, alloc, s)
-        else
-            try self.encodeTemporal(nthwc, pt, ph, pw, alloc, s);
-        defer _ = mlx.mlx_array_free(moments);
-
-        // mean = first 24 channels; normalize by the latent statistics.
-        const mean24 = try sliceAxis(moments, 1, 0, 24, s);
-        defer _ = mlx.mlx_array_free(mean24);
-        const csh = [_]c_int{ 1, 24, 1, 1, 1 };
-        const lm = try reshape(self.latents_mean, &csh, s);
-        defer _ = mlx.mlx_array_free(lm);
-        const ls = try reshape(self.latents_std, &csh, s);
-        defer _ = mlx.mlx_array_free(ls);
-        const centered = try subA(mean24, lm, s);
-        defer _ = mlx.mlx_array_free(centered);
-        return divA(centered, ls, s);
+        return divA(cen, psd, s);
     }
 
     /// Single pass or spatially tiled, per the reference's `_adaptive_encode`.
