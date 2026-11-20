@@ -28,6 +28,7 @@ pub const types = [_][]const u8{
     "nemotron_h",
     "nemotron_h_puzzle",
     "hy_v3",
+    "hy_v4_flash",
     "deepseek_v4",
     "deepseek_v41",
     "inkling_mm_model",
