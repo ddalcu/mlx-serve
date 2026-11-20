@@ -92,3 +92,39 @@ pub extern fn mlx_llama_seq_spec_step(
     err: ?[*]u8,
     errlen: usize,
 ) i32;
+
+// ── vision (llama.cpp's mtmd) ─────────────────────────────────────────────
+
+/// One image of a multimodal prompt, as the shim takes it.
+pub const Image = extern struct {
+    /// The token index where the media marker's first token sits in the prompt.
+    at: i32,
+    width: u32,
+    height: u32,
+    /// RGB8 pixels, `width * height * 3` bytes.
+    pixels: ?[*]const u8,
+};
+
+pub extern fn mlx_llama_attach_vision(e: *Engine, mmproj_path: [*:0]const u8, err: ?[*]u8, errlen: usize) i32;
+pub extern fn mlx_llama_has_vision(e: *Engine) bool;
+pub extern fn mlx_llama_media_marker(e: *Engine) ?[*:0]const u8;
+
+/// The shim's cancellation callback: polled between the images.
+pub const CancelFn = ?*const fn (?*anyopaque) callconv(.c) bool;
+
+pub extern fn mlx_llama_seq_sync_images(
+    c: *Ctx,
+    seq: i32,
+    prompt: [*]const i32,
+    n_prompt: i32,
+    images: [*]const Image,
+    n_images: i32,
+    marker: [*]const i32,
+    n_marker: i32,
+    max_tokens: *u32,
+    out_expanded: *u32,
+    cancelled: CancelFn,
+    cancel_ud: ?*anyopaque,
+    err: ?[*]u8,
+    errlen: usize,
+) i32;

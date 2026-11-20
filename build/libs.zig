@@ -168,6 +168,7 @@ pub fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
     module.linkSystemLibrary("llama", .{ .use_pkg_config = .no });
     // The macOS dylib merges ggml in; the Linux and Windows releases keep it separate.
     if (os == .linux or os == .windows) {
+        module.linkSystemLibrary("mtmd", .{ .use_pkg_config = .no });
         module.linkSystemLibrary("ggml", .{ .use_pkg_config = .no });
         module.linkSystemLibrary("ggml-base", .{ .use_pkg_config = .no });
     }

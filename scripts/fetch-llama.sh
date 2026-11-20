@@ -40,7 +40,9 @@ STAMP="$DEST/.version"
 case "$OS" in Linux) LIB=libllama.so ;; Windows) LIB=llama.lib ;; *) LIB=libllama.dylib ;; esac
 
 # Idempotent: skip when the staged copy already matches the pinned tag.
-if [ -f "$STAMP" ] && [ -f "$DEST_LIB/$LIB" ] && [ -f "$DEST_INC/llama.h" ]; then
+case "$OS" in Linux) MTMD=libmtmd.so ;; Windows) MTMD=mtmd.lib ;; *) MTMD="$LIB" ;; esac
+if [ -f "$STAMP" ] && [ -f "$DEST_LIB/$LIB" ] && [ -f "$DEST_LIB/$MTMD" ] &&
+   [ -f "$DEST_INC/llama.h" ] && [ -f "$DEST_INC/mtmd.h" ] && [ -f "$DEST_INC/mtmd-helper.h" ]; then
   if [ "$(cat "$STAMP")" = "$LLAMA_TAG" ]; then
     echo "[fetch-llama] lib/llama already at $LLAMA_TAG — nothing to do"
     exit 0
@@ -59,16 +61,16 @@ if [ "$OS" = Windows ]; then
   curl -fSL --retry 3 -o "$TMP/$f" "$RELEASE/$f"
   curl -fSL --retry 3 -o "$TMP/src.tgz" "https://github.com/ggml-org/llama.cpp/archive/refs/tags/${LLAMA_TAG}.tar.gz"
   mkdir -p "$TMP/src"
-  tar -xzf "$TMP/src.tgz" -C "$TMP/src" --strip-components=1 --wildcards '*/include/*.h'
+  tar -xzf "$TMP/src.tgz" -C "$TMP/src" --strip-components=1 --wildcards '*/include/*.h' '*/tools/mtmd/mtmd.h' '*/tools/mtmd/mtmd-helper.h'
   rm -rf "$DEST"
   mkdir -p "$DEST/bin" "$DEST_LIB" "$DEST_INC"
   for f in "$TMP"/*.zip; do unzip -q -o "$f" -d "$DEST/bin"; done
-  cp "$TMP/src/include/"*.h "$TMP/src/ggml/include/"*.h "$DEST_INC/"
+  cp "$TMP/src/include/"*.h "$TMP/src/ggml/include/"*.h "$TMP/src/tools/mtmd/"*.h "$DEST_INC/"
   exports() { # the names a DLL exports, one per line
     if command -v llvm-readobj >/dev/null; then llvm-readobj --coff-exports "$1" | sed -n 's/^  Name: //p'
     else dumpbin -nologo -exports "$1" | awk '$1 ~ /^[0-9]+$/ && $3 ~ /^[0-9A-F]+$/ { print $4 }'; fi | tr -d '\r'
   }
-  for dll in llama ggml ggml-base; do
+  for dll in llama mtmd ggml ggml-base; do
     { echo "LIBRARY $dll.dll"; echo EXPORTS; exports "$DEST/bin/$dll.dll" | sed 's/^/  /'; } > "$TMP/$dll.def"
     "$ZIG" dlltool -m i386:x86-64 -d "$TMP/$dll.def" -l "$DEST_LIB/$dll.lib" -D "$dll.dll"
   done
@@ -85,11 +87,11 @@ if [ "$OS" = Linux ]; then
   curl -fSL --retry 3 -o "$TMP/src.tgz" "https://github.com/ggml-org/llama.cpp/archive/refs/tags/${LLAMA_TAG}.tar.gz"
   mkdir -p "$TMP/bin" "$TMP/src"
   tar -xzf "$TMP/bin.tgz" -C "$TMP/bin"
-  tar -xzf "$TMP/src.tgz" -C "$TMP/src" --strip-components=1 --wildcards '*/include/*.h'
+  tar -xzf "$TMP/src.tgz" -C "$TMP/src" --strip-components=1 --wildcards '*/include/*.h' '*/tools/mtmd/mtmd.h' '*/tools/mtmd/mtmd-helper.h'
   rm -rf "$DEST_LIB" "$DEST_INC"
   mkdir -p "$DEST_LIB" "$DEST_INC"
-  find "$TMP/bin" \( -name 'libllama.so*' -o -name 'libggml*.so*' \) -exec cp -P {} "$DEST_LIB/" \;
-  cp "$TMP/src/include/"*.h "$TMP/src/ggml/include/"*.h "$DEST_INC/"
+  find "$TMP/bin" \( -name 'libllama.so*' -o -name 'libmtmd.so*' -o -name 'libggml*.so*' \) -exec cp -P {} "$DEST_LIB/" \;
+  cp "$TMP/src/include/"*.h "$TMP/src/ggml/include/"*.h "$TMP/src/tools/mtmd/"*.h "$DEST_INC/"
   echo "$LLAMA_TAG" > "$STAMP"
   echo "[fetch-llama] staged libllama ($LLAMA_TAG, CUDA) in $DEST_LIB"
   exit 0

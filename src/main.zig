@@ -851,6 +851,7 @@ pub fn main(init: std.process.Init) !void {
             timeout = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--no-vision")) {
             no_vision = true;
+            server_mod.llama_settings.vision = false;
             // Module global so on-demand /v1/load-model cold loads honor the
             // flag too (they used to hardcode vision from config.has_vision).
             engine_flags.no_vision = true;
@@ -2123,7 +2124,7 @@ fn runGgufOffline(
     const settings = if (engine == .ds4)
         try std.json.Stringify.valueAlloc(allocator, ds4_load.Flags{ .mtp = ds4_mtp, .dspark = ds4_dspark, .ssd_streaming = ds4_ssd_streaming, .prefill_chunk = mlx_engine.settings().explicit_prefill_chunk, .vision = vision }, .{})
     else
-        try std.json.Stringify.valueAlloc(allocator, llama_load.Settings{ .seqs = 1, .mtp_drafts = 0 }, .{});
+        try std.json.Stringify.valueAlloc(allocator, llama_load.Settings{ .seqs = 1, .mtp_drafts = 0, .vision = vision }, .{});
     defer allocator.free(settings);
     var progress: @import("host/registry/load_progress.zig").Progress = .{};
     var gauges: engines_served.Gauges = .{};
