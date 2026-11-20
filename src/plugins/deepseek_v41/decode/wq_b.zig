@@ -536,7 +536,6 @@ pub fn register(set: *kc.Set) !void {
         .out = .bf16,
         .outs = &.{ .{ .elem = .bf16, .count = qN }, .{ .elem = .f32, .count = idxN }, .{ .elem = .bf16, .count = kvN }, .{ .elem = .f32, .count = preN }, .{ .elem = .f32, .count = preN }, .{ .elem = .f32, .count = combN } },
         .nan = cx.quant_nan,
-        .known = cx.nan_code,
         .tiles = .{ .{ .size = 4 }, .{}, .{ .size = cx.IHD, .step = cx.IHD, .min = cx.IHD } },
         .served = &.{ .{ .rows = 1, .n = 2 * KV, .k = 2 * cx.IHD }, .{ .rows = 6, .n = KV, .k = cx.IHD }, .{ .rows = 1, .n = KV, .k = 0 }, .{ .rows = 6, .n = 2 * KV, .k = 0 } },
     });

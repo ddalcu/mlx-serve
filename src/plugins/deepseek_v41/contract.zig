@@ -908,9 +908,9 @@ const IdxTile = struct {
     }
 };
 
-// ── the V4.1 quantizers (`FP8_HEADER`): e4m3 round trips, ue8m0 / e4m3 scales, e2m1 codes ──
+// ── the V4.1 quantizers (`FP8_HEADER`, MLX's encoders): e4m3 round trips, ue8m0 / e4m3 scales, e2m1 codes ──
 
-/// e4m3fn round-to-nearest-even, saturating at 448 (the kernel sends 464 and above, NaN included, to 448).
+/// e4m3fn round-to-nearest-even, saturating at 448 (464 and above, infinities included; a NaN stays NaN).
 fn fp8(v: f64) f64 {
     if (std.math.isNan(v)) return nan;
     const a = @abs(v);
@@ -928,20 +928,22 @@ fn rintEven(x: f64) f64 {
     return if (@mod(f, 2) == 0) f else f + 1;
 }
 
-/// The smallest power of two at or above `a` (an f32; subnormals give 2^-126).
+/// The smallest power of two at or above `a` (an f32; subnormals give 2^-126): MLX's e8m0 rounded up, whose
+/// non-finite code reads back NaN.
 fn pow2ceil(a: f32) f64 {
+    if (!std.math.isFinite(a)) return nan;
     const b: u32 = @bitCast(a);
     const e = ((b >> 23) & 0xff) + @intFromBool(b & 0x7fffff != 0);
     return @as(f32, @bitCast(e << 23));
 }
 
-/// e2m1 by the kernel's thresholds (a NaN propagates in float64).
+/// e2m1 by the kernel's thresholds (MLX's fp4_e2m1), the sign kept (a zero below 0 is -0; a NaN propagates in float64).
 fn e2m1(v: f64) f64 {
     if (std.math.isNan(v)) return nan;
     const m = @abs(v);
     const lut = [_]f64{ 0, 0.5, 1, 1.5, 2, 3, 4, 6 };
     const k = @as(usize, @intFromBool(m > 0.25)) + @intFromBool(m > 1.25) + @intFromBool(m > 2.5) + @intFromBool(m > 5) + @intFromBool(m >= 0.75) + @intFromBool(m >= 1.75) + @intFromBool(m >= 3.5);
-    return if (v > 0) lut[k] else if (v < 0) -lut[k] else 0;
+    return std.math.copysign(lut[k], v);
 }
 
 /// A QAT round trip: fp8 / 32 / ue8m0 (1), fp4 / 32 / ue8m0 (2), fp4 / 16 / e4m3 scale (3).
@@ -4157,7 +4159,6 @@ const combine_l = launch("dsv41_moe_combine", &.{ "dn", "inv", "sh" }, &.{"out"}
 
 pub const relu_nan: spec.Known = .{ .gate = .nonfinite, .finding = "a NaN q . k dot scores as 0: metal::max(dot, 0) drops NaN where relu (the reference, torch) propagates it" };
 pub const quant_nan: spec.Nan = .{ .stated = "classes as float64 gives them; quantized entries within the quantizer's envelope of their bounds" };
-pub const nan_code: spec.Known = .{ .gate = .nonfinite, .finding = "a NaN in a quantized block is written as a finite code: metal::max drops it from the block max and the fp8 encoder saturates it to 448 (float64 and the reference propagate it)" };
 const squares: spec.Sums = .{ .f16 = 0, .bf16 = 0, .why = "a sum of squares cannot cancel" };
 const short_sums: spec.Sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "four positive terms a sum, inside 39 normalizations" };
 const softmax_sums: spec.Sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "positive exp terms: the sum cannot cancel" };
@@ -4295,7 +4296,6 @@ pub fn register(set: *kc.Set) !void {
         .depth = depthOne,
         .out = .f32,
         .nan = quant_nan,
-        .known = nan_code,
         .served = &.{ .{ .rows = 1, .n = IH, .k = IHD }, .{ .rows = REGION, .n = IH, .k = IHD } },
     });
     try kit.add(set, RopeTail, &rope_l, .{ .qk = .fp4, .scal = 4, .off = 750 }, .{
@@ -4304,7 +4304,6 @@ pub fn register(set: *kc.Set) !void {
         .depth = depthOne,
         .out = .bf16,
         .nan = quant_nan,
-        .known = nan_code,
         .served = &.{ .{ .rows = 1, .n = 1, .k = IHD }, .{ .rows = 64, .n = 1, .k = IHD } },
     });
     try kit.add(set, RopeTail, &rope_l, .{ .qk = .fp4_e4m3, .scal = 4, .off = 750 }, .{
@@ -4313,7 +4312,6 @@ pub fn register(set: *kc.Set) !void {
         .depth = depthOne,
         .out = .bf16,
         .nan = quant_nan,
-        .known = nan_code,
         .served = &.{ .{ .rows = 1, .n = 1, .k = HD }, .{ .rows = 64, .n = 1, .k = HD } },
     });
     try kit.add(set, KvRow, &kv_l, .{}, .{
@@ -4322,7 +4320,6 @@ pub fn register(set: *kc.Set) !void {
         .depth = depthK,
         .out = .bf16,
         .nan = quant_nan,
-        .known = nan_code,
         .served = &.{ .{ .rows = 1, .n = 1, .k = HD }, .{ .rows = 64, .n = 1, .k = HD } },
         .sums = squares,
     });

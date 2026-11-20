@@ -24,7 +24,7 @@ if (d >= head) {
   r = float(T((d - head) % 2 == 0 ? x1 * cs - x2 * sn : x1 * sn + x2 * cs));
 }
 if (QAT) {
-  const float scale = dsv41_pow2ceil(metal::max(metal::simd_max(metal::abs(r)), 1e-4f) * (1.0f / 448.0f));
-  r = dsv41_fp8_roundtrip(metal::clamp(r / scale, -448.0f, 448.0f)) * scale;
+  const float scale = mlxserve_mx_scale_round_up(mlxserve_maximum(mlxserve_simd_max(metal::abs(r)), 1e-4f) * (1.0f / 448.0f));
+  r = mlxserve_fp8_e4m3_round(mlxserve_clip(r / scale, -448.0f, 448.0f)) * scale;
 }
 out[o] = T(r);
