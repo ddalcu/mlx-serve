@@ -2011,16 +2011,20 @@ fn holdEngram(m: *Dsv41Model) !void {
     for (m.engrams) |*e| bytes += e.table.tableBytes();
     const gb = @as(f64, @floatFromInt(bytes)) / 1e9;
     if (set == .off) return log.info("deepseek_v41: Engram tables ({d:.1} GB) read from disk per lookup (MLX_SERVE_DSV41_ENGRAM_RESIDENT=0)\n", .{gb});
-    const total = system.getTotalMemBytes();
-    const in_use = total -| system.getAvailableMemBytes();
-    if (!engram.residentFits(in_use, bytes, total, mlx.maxRecommendedWorkingSet()))
-        return log.info("deepseek_v41: Engram tables ({d:.1} GB) read from disk per lookup: {d:.1} GB in use, past 7/8 of RAM or the GPU working set with them\n", .{ gb, @as(f64, @floatFromInt(in_use)) / 1e9 });
+    if (!engramRoom(bytes))
+        return log.info("deepseek_v41: Engram tables ({d:.1} GB) read from disk per lookup: {d:.1} GB in use outside the file cache, past 7/8 of RAM or the GPU working set with them\n", .{ gb, @as(f64, @floatFromInt(system.getNonFileMemBytes())) / 1e9 });
     const t0 = crt.monotonicMs();
     for (m.engrams, 0..) |*e, k| e.table.hold(32, set == .wired) catch |err| {
         for (m.engrams[0 .. k + 1]) |*h| h.table.unholdAll();
         return log.warn("deepseek_v41: Engram tables read from disk per lookup: holding them failed ({s})\n", .{@errorName(err)});
     };
     log.info("deepseek_v41: Engram tables held in memory: {d} tables, {d:.1} GB read in {d} ms{s}\n", .{ m.engrams.len, gb, crt.monotonicMs() - t0, if (set == .wired) ", wired" else "" });
+}
+
+/// Whether `bytes` of Engram fit beside what the box holds now outside the file cache: the weights are in, and the
+/// pack's file pages a load leaves behind are reclaimable, not in use.
+fn engramRoom(bytes: u64) bool {
+    return engram.residentFits(system.getNonFileMemBytes(), bytes, system.getTotalMemBytes(), mlx.maxRecommendedWorkingSet());
 }
 
 /// the gemv twin's served launches (gemv_twin.zig `served`) for the indexer's plain
@@ -10558,4 +10562,17 @@ test "dsv41 pair: a layer split refuses an MLX pack's streamed experts by name b
     var w = Weights.init(std.testing.allocator);
     defer w.deinit();
     try std.testing.expectError(error.Dsv41PairStreamedExperts, init(std.testing.allocator, &cfg, &w, mlx.gpuStream(), .{ .pair = .{ .lo = 4, .hi = 8, .worker = false }, .streamed_experts = true }));
+}
+
+test "deepseek_v41 engram room: the file cache a load leaves behind does not keep the tables on disk" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    defer system.reading_override = null;
+    const total = system.getTotalMemBytes();
+    const t10 = total / 10;
+    // The weights in (60%), the pack's file pages cached (30%): the tables (10%) fit beside the weights alone.
+    system.reading_override = system.plantVm(total, 16384, .{ .wired = 6 * t10, .anonymous = 0, .compressor = 0, .purgeable = 0, .file = 3 * t10 });
+    try std.testing.expect(engramRoom(t10));
+    // The same memory as anonymous pages is in use: no room.
+    system.reading_override = system.plantVm(total, 16384, .{ .wired = 6 * t10, .anonymous = 3 * t10, .compressor = 0, .purgeable = 0, .file = 0 });
+    try std.testing.expect(!engramRoom(t10));
 }
