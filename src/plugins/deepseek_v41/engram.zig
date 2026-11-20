@@ -965,9 +965,9 @@ pub fn residentSetting(raw: ?[]const u8) !Resident {
     return error.EngramResidentSetting;
 }
 
-/// Whether `tables` bytes of Engram fit beside `other` bytes in memory: within 7/8 of RAM and the GPU working set
-/// (`gpu`, 0 = unknown), the load preflight's bound. The bill (`other` = the pack's other bytes) and the load
-/// (`other` = the memory in use once the weights are in) ask the same.
+/// Whether `tables` bytes of Engram fit beside `other` bytes in memory: within 7/8 of RAM and, for the bill (`other` =
+/// the pack's other bytes), the GPU working set the load preflight holds it to (`gpu`; 0 = none: the load's own check,
+/// `other` = the memory in use once the weights are in).
 pub fn residentFits(other: u64, tables: u64, total_ram: u64, gpu: u64) bool {
     const need = other +| tables;
     return need <= total_ram - total_ram / 8 and (gpu == 0 or need <= gpu);

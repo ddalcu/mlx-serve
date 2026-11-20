@@ -2012,7 +2012,7 @@ fn holdEngram(m: *Dsv41Model) !void {
     const gb = @as(f64, @floatFromInt(bytes)) / 1e9;
     if (set == .off) return log.info("deepseek_v41: Engram tables ({d:.1} GB) read from disk per lookup (MLX_SERVE_DSV41_ENGRAM_RESIDENT=0)\n", .{gb});
     if (!engramRoom(bytes))
-        return log.info("deepseek_v41: Engram tables ({d:.1} GB) read from disk per lookup: {d:.1} GB in use outside the file cache, past 7/8 of RAM or the GPU working set with them\n", .{ gb, @as(f64, @floatFromInt(system.getNonFileMemBytes())) / 1e9 });
+        return log.info("deepseek_v41: Engram tables ({d:.1} GB) read from disk per lookup: {d:.1} GB in use outside the file cache, past 7/8 of RAM with them\n", .{ gb, @as(f64, @floatFromInt(system.getNonFileMemBytes())) / 1e9 });
     const t0 = crt.monotonicMs();
     for (m.engrams, 0..) |*e, k| e.table.hold(32, set == .wired) catch |err| {
         for (m.engrams[0 .. k + 1]) |*h| h.table.unholdAll();
@@ -2022,9 +2022,10 @@ fn holdEngram(m: *Dsv41Model) !void {
 }
 
 /// Whether `bytes` of Engram fit beside what the box holds now outside the file cache: the weights are in, and the
-/// pack's file pages a load leaves behind are reclaimable, not in use.
+/// pack's file pages a load leaves behind are reclaimable, not in use. The tables are host pages: RAM bounds them
+/// here, while the GPU working set bounds the bill they joined (`residentDiskBytes`).
 fn engramRoom(bytes: u64) bool {
-    return engram.residentFits(system.getNonFileMemBytes(), bytes, system.getTotalMemBytes(), mlx.maxRecommendedWorkingSet());
+    return engram.residentFits(system.getNonFileMemBytes(), bytes, system.getTotalMemBytes(), 0);
 }
 
 /// the gemv twin's served launches (gemv_twin.zig `served`) for the indexer's plain
