@@ -4,6 +4,8 @@ DeepSeek-V4.1-Flash (`model_type: deepseek_v41`, 1M context, MLX packs) with its
 module-owned arch. Unpaired captures transfer to the engine's prefix cache, keyed on image rows. Packs:
 `ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw`, `mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-mtp`, and
 OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin (its trunk and its `experts.bin` bank).
+NVIDIA's `DeepSeek-V4.1-Flash-1017-NVFP4` converted by `scripts/dsv41_nvfp4_pack.py` (headers only), its NVFP4 experts
+through CommunityServe's `modelopt_ds41` quant plugin, its mxfp4 Engram tables read as stored.
 
 ## Files
 - `plugin.zig`: the table; `CacheHooks.aux` / live `state_bytes`; streamed/paired legacy `resume_prompt`;
