@@ -73,6 +73,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 **Tool calling, thinking, sampling, formats**
 - `test_tool_args.sh`, `test_tool_parsing.sh`, `test_tool_call_parse.sh` argument parsing · `test_tool_response.sh` Gemma 4 round trip
 - `test_tool_choice_required.sh` forced calls · `test_tools_concurrent.sh` per-stream calls under batching
+- `test_tool_call_ids.sh` tool-call ids random, ≥ 22 chars, distinct on every surface
 - `test_tools_long_context.sh` calls at 16-64k · `test_cancel_mid_tool_buffer.sh` disconnect while buffering
 - `test_no_tools_markup_passthrough.sh` no `tools` = raw text · `test_minicpm5_tool_call.sh` MiniCPM5 XML calls
 - `test_thinking_split.sh`, `test_thinking_streaming.sh`, `test_thinking_tools.sh` reasoning/content split
