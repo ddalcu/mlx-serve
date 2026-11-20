@@ -243,9 +243,6 @@ fn unpackTokenMap(map: []u32, raw: []const u8) !void {
     if (at != raw.len) return error.EngramTokenMap;
 }
 
-pub const Hy4Spec = @import("../hy_v4_flash/config.zig").Hy4Spec;
-pub const parseHy4Spec = @import("../hy_v4_flash/config.zig").parseHy4Spec;
-
 /// One layer's table, read per lookup from disk: the repack's flat mxfp8
 /// records (code bytes, then one e8m0 scale per 32), or an MLX affine
 /// table inside a safetensors shard (weight / scales / biases tensors).
@@ -408,53 +405,6 @@ pub const Table = struct {
             .slen = @intCast(scols * 2),
             .b_off = base + regions[2].start,
             .in_shards = true,
-        };
-    }
-
-    /// A Hy4-flash pack's external `engram_table.bin`: one safetensors-format
-    /// file, not named by any shard index, holding weight U32 [rows, head_dim*
-    /// bits/32] and BF16 scales/biases [rows, head_dim/group_size]. Opening it
-    /// through the same fields as `open` means read/dequant/gather/prefetch
-    /// below are shared verbatim — there is no second gather mechanism.
-    pub fn openHy4(a: std.mem.Allocator, dir_path: []const u8, spec: *const Hy4Spec) !Table {
-        if (comptime builtin.os.tag == .windows) return error.EngramUnsupportedOnWindows;
-        if (spec.bits != 4 or spec.group_size != 32 or spec.head_dim == 0 or spec.head_dim % 32 != 0 or spec.rows == 0) return error.EngramTableHeader;
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        const aa = arena.allocator();
-        const fd = try openAt(aa, dir_path, spec.file);
-        errdefer crt.close(fd);
-        var hl: [8]u8 = undefined;
-        if (crt.pread(fd, &hl, 8, 0) != 8) return error.EngramTableHeader;
-        const hlen = std.mem.readInt(u64, &hl, .little);
-        if (hlen == 0 or hlen > 16 << 20) return error.EngramTableHeader;
-        const hbuf = try aa.alloc(u8, @intCast(hlen));
-        if (crt.pread(fd, hbuf.ptr, hbuf.len, 8) != @as(isize, @intCast(hlen))) return error.EngramTableHeader;
-        const hdr = std.json.parseFromSliceLeaky(std.json.Value, aa, hbuf, .{}) catch return error.EngramTableHeader;
-        if (hdr != .object) return error.EngramTableHeader;
-        const size = fileSize(fd);
-        const base: usize = 8 + @as(usize, @intCast(hlen));
-        const wcols: u32 = spec.head_dim * spec.bits / 32;
-        const scols: u32 = spec.head_dim / spec.group_size;
-        const w = qwen4_ple.headerRegion(hdr.object, "weight", "U32", 4, size, base, .matrix) catch return error.EngramTableHeader;
-        const s = qwen4_ple.headerRegion(hdr.object, "scales", "BF16", 2, size, base, .matrix) catch return error.EngramTableHeader;
-        const b = qwen4_ple.headerRegion(hdr.object, "biases", "BF16", 2, size, base, .matrix) catch return error.EngramTableHeader;
-        if (w.rows != spec.rows or s.rows != spec.rows or b.rows != spec.rows) return error.EngramTableSize;
-        if (w.cols != wcols or s.cols != scols or b.cols != scols) return error.EngramTableGeometry;
-        return .{
-            .fd = fd,
-            .rows = spec.rows,
-            .head_dim = spec.head_dim,
-            .mode = .affine,
-            .bits = spec.bits,
-            .group_size = spec.group_size,
-            .w_off = base + w.start,
-            .w_stride = @as(u64, wcols) * 4,
-            .wlen = @as(usize, wcols) * 4,
-            .s_off = base + s.start,
-            .s_stride = @as(u64, scols) * 2,
-            .slen = @as(usize, scols) * 2,
-            .b_off = base + b.start,
         };
     }
 
@@ -1572,46 +1522,4 @@ test "dsv41 engram: an affine table bills the shard bytes it occupies, a repack 
     var r = try Table.open(testing.allocator, dir, 0, 1, 4, 64);
     defer r.close();
     try testing.expectEqual(@as(u64, 0), r.shardBytes());
-}
-
-test "hy4 engram: the external engram_table.bin is read through the shared Table gather" {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var td = testing.tmpDir(.{});
-    defer td.cleanup();
-    // 4 rows, head_dim 32: weight U32 [4,4], scales/biases BF16 [4,1].
-    const hdr = "{\"weight\":{\"dtype\":\"U32\",\"shape\":[4,4],\"data_offsets\":[0,64]}," ++
-        "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[64,72]}," ++
-        "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[72,80]}}";
-    const pad = (8 - hdr.len % 8) % 8;
-    var bin: [8 + hdr.len + pad + 80]u8 = @splat(0);
-    std.mem.writeInt(u64, bin[0..8], hdr.len + pad, .little);
-    @memcpy(bin[8..][0..hdr.len], hdr);
-    @memset(bin[8 + hdr.len ..][0..pad], ' ');
-    const data = bin[8 + hdr.len + pad ..];
-    for (data[0..64]) |*x| x.* = 0x11; // all nibbles = 1
-    for (0..4) |r| {
-        std.mem.writeInt(u16, data[64 + 2 * r ..][0..2], 0x4000, .little); // scale 2
-        std.mem.writeInt(u16, data[72 + 2 * r ..][0..2], 0x3f00, .little); // bias 0.5
-    }
-    try td.dir.writeFile(io, .{ .sub_path = "engram_table.bin", .data = &bin });
-    const spec_json = "{\"model_type\":\"hy_v4_flash\",\"engram_table\":{\"file\":\"engram_table.bin\",\"bits\":4,\"group_size\":32,\"head_dim\":32,\"rows\":4,\"layers\":[1,11,21,31],\"table_rows\":[1,1,1,1]}}";
-    var buf: [512]u8 = undefined;
-    const dir = buf[0..try td.dir.realPath(io, &buf)];
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const spec = (try parseHy4Spec(a, spec_json)).?;
-    defer a.free(spec.file);
-    defer a.free(spec.layers);
-    defer a.free(spec.table_rows);
-    try testing.expectEqual(@as(u64, 2), spec.rowOffset(2));
-    var t = try Table.openHy4(a, dir, &spec);
-    defer t.close();
-    const s = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    const got = try t.gather(testing.allocator, &.{ 3, 0 }, s);
-    defer _ = mlx.mlx_array_free(got);
-    try mlx.check(mlx.mlx_array_eval(got));
-    const v = mlx.mlx_array_data_float32(got).?;
-    for (0..64) |i| try testing.expectEqual(@as(f32, 2.5), v[i]); // 1*2 + 0.5
 }

@@ -437,6 +437,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     cfg = dict(
+        model_type="hy_v4_flash",
         hidden=32, vocab=64, layers=4, eps=1e-4, hc_mult=2, hc_magnitude=2.0,
         indexed_heads=2, swa_heads=4, qk_nope=8, rope_dim=8, v_dim=8,
         swa_qk_nope=8, swa_v_dim=8, kv_lora=12, q_lora=12,

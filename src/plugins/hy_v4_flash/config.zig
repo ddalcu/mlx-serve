@@ -82,6 +82,20 @@ pub const Config = struct {
     engram_sizes: []const []const usize = &.{},
     hash_mult: []const i64 = &.{},
 
+    pub fn isIndexed(self: Config, layer: usize) bool {
+        if (layer < self.indexed.len) return self.indexed[layer];
+        return (layer % 2 == 0);
+    }
+
+    pub fn isDense(self: Config, layer: usize) bool {
+        if (layer < self.sparse.len) return !self.sparse[layer];
+        return (layer == 0);
+    }
+
+    pub fn pad_id(self: Config) usize {
+        return self.pad;
+    }
+
     pub fn deinit(self: *Config, a: std.mem.Allocator) void {
         if (self.indexed.len > 0) a.free(self.indexed);
         if (self.sparse.len > 0) a.free(self.sparse);
