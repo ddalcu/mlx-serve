@@ -24,7 +24,7 @@ for (int pack = int(lane); pack < K_by_p; pack += 32) {{
   int gi = k_base / GS;                  // GS >= VPW, so one group per word
 {s}
 }}
-float acc = simd_sum((a0 + a1) + (a2 + a3)){s};
+float acc = simd_sum((a0 + a1) + (a2 + a3));
 if (lane == 0) {{
   float o = float(T(acc));
   // MLX's maximum keeps a NaN; metal::max would return the 0.

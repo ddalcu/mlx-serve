@@ -47,7 +47,6 @@ fn gatherQmvDownReduceSource(comptime d: Dequant) [:0]const u8 {
     // One source serves one row (ONE_ROW) and 2..8 rows (grid.y); at one row the two compile to the same code.
     return std.fmt.comptimePrint(kernelSource("kernels/moe/down_reduce.fmt.metal"), .{
         if (d == .fp4) GQMV_BODY_FP4 else GQMV_BODY_AFFINE,
-        if (d == .fp4) " * mlxserve_gqmv_fold<GS>()" else "",
     });
 }
 

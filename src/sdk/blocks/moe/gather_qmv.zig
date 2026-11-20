@@ -58,13 +58,7 @@ fn gatherQmvSource(comptime d: Dequant, comptime x_per_expert: bool) [:0]const u
     return std.fmt.comptimePrint(kernelSource("kernels/moe/gather_qmv.fmt.metal"), .{
         if (x_per_expert) "(size_t)e * (size_t)K" else "0",
         if (d == .fp4) GQMV_BODY_FP4 else GQMV_BODY_AFFINE,
-        fold(d),
     });
-}
-
-/// What the fp4 bodies' sums still owe the scale's power of two (`gqmv_fp4_header.metal`), once per finished sum.
-fn fold(comptime d: Dequant) []const u8 {
-    return if (d == .fp4) " * mlxserve_gqmv_fold<GS>()" else "";
 }
 
 pub const GQMV_BODY_AFFINE = kernelSource("kernels/moe/gqmv_body_affine.metal");
@@ -81,7 +75,7 @@ pub const GQMV_AFFINE_HEADER = kernelSource("kernels/moe/gqmv_affine_header.meta
 
 // An e2m1 nibble becomes a `half` by shifting its bits straight into the half's
 // exponent/mantissa/sign fields (exact for all 16 codes, -0 kept), the true value
-// times 2^-14; the group scale is `fp4.SCALE_HEADER`'s, the one fp4 scale decode.
+// times 2^-14; the group scale is `fp4.SCALE_HEADER`'s (MLX's fp8.h read, both formats).
 pub const GQMV_FP4_HEADER = GQMV_AFFINE_HEADER ++ moe_fp4.E2M1_HEADER ++ moe_fp4.E2M1X2_HEADER ++ fp4.SCALE_HEADER ++ kernelSource("kernels/moe/gqmv_fp4_header.metal");
 
 pub fn header(d: Dequant) [:0]const u8 {
@@ -136,8 +130,6 @@ pub fn bankDequant(mode: QuantMode, bits: u32, group_size: u32, sc: mlx.mlx_arra
 fn gatherQmvGateUpSource(comptime d: Dequant) [:0]const u8 {
     return std.fmt.comptimePrint(kernelSource("kernels/moe/gather_qmv_gateup.fmt.metal"), .{
         if (d == .fp4) GQMV_GATEUP_BODY_FP4 else GQMV_GATEUP_BODY_AFFINE,
-        fold(d),
-        fold(d),
     });
 }
 

@@ -42,8 +42,8 @@ for (int i = 0; i < IT; ++i) {{
   int gi = k_base / GS;
 {s}
 }}
-float acc_g = simd_sum((g0 + g1) + (g2 + g3)){s};
-float acc_u = simd_sum((u0 + u1) + (u2 + u3)){s};
+float acc_g = simd_sum((g0 + g1) + (g2 + g3));
+float acc_u = simd_sum((u0 + u1) + (u2 + u3));
 if (lane == 0) {{
   // Round where the split path's gathers write T(acc); each expert's scale is the split path's rounded multiply.
   T gt = T(acc_g);
@@ -55,7 +55,8 @@ if (lane == 0) {{
     const T lim = T(LIMIT);
     const T nlim = T(-LIMIT);
     gt = gt > lim ? lim : gt;
-    ut = ut > lim ? lim : (ut < nlim ? nlim : ut);
+    ut = ut < nlim ? nlim : ut;
+    ut = ut > lim ? lim : ut;
   }}
   T sig = sigtab[as_type<ushort>(gt)];
   y[(((size_t)row * (size_t)TOPK) + e) * (size_t)N + (size_t)n] = (gt * sig) * ut;
