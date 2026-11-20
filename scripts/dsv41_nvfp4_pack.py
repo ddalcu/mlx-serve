@@ -26,9 +26,10 @@ block).
 `--experts-mxfp4` (numpy) writes the NVFP4 routed experts as MLX mxfp4 at group 32, which the model serves itself with
 no quant plugin. NVIDIA converted them from mxfp4 losslessly: in every 32-group, each 16-half that holds a nonzero
 code has e4m3 scale x `weight_scale_2` = the same power of two 2^k, so the codes stay as stored (U32 [out, in/8]) and
-`<base>.scales` is k + 127 (e8m0, U8 [out, in/32], in `model-mxfp4-scales-<shard>.safetensors`). A group that breaks
-this stops the conversion by name. `weight_scale`, `weight_scale_2` and `input_scale` leave the header (their bytes
-stay in the clone, unread). `--check` then dequantizes every expert both ways and requires every value equal.
+`<base>.scales` is k + 127 (e8m0, U8 [out, in/32]). A group that breaks this stops the conversion by name. A shard
+that holds experts is written whole rather than cloned: `weight_scale`, `weight_scale_2` and `input_scale` leave it and
+the e8m0 scales join it, so its size is what the load holds. `--check` then dequantizes every expert both ways and
+requires every value equal, and compares every other tensor of those shards byte for byte.
 """
 
 import json
@@ -232,6 +233,54 @@ def write_side(path, tensors):
     return off
 
 
+def write_compact(sp, n, dp, new, extra):
+    """`dp` as a new shard: `new`'s tensors (their data_offsets still the source's) copied from `sp` in order, then
+    `extra` [(key, bytes, shape)] U8. Returns the data bytes."""
+    hdr = {}
+    off = 0
+    order = []
+    for k, v in new.items():
+        if k == "__metadata__":
+            continue
+        a, b = v["data_offsets"]
+        hdr[k] = dict(v, data_offsets=[off, off + b - a])
+        order.append((a, b))
+        off += b - a
+    for k, data, shape in extra:
+        hdr[k] = {"dtype": "U8", "shape": shape, "data_offsets": [off, off + len(data)]}
+        off += len(data)
+    if "__metadata__" in new:
+        hdr["__metadata__"] = new["__metadata__"]
+    raw = json.dumps(hdr, separators=(",", ":")).encode()
+    raw += b" " * (-len(raw) % 8)
+    nocache = (lambda fd: __import__("fcntl").fcntl(fd, 48, 1)) if sys.platform == "darwin" else (lambda fd: None)
+    out = os.open(dp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    src = os.open(sp, os.O_RDONLY)
+    try:
+        nocache(out)
+        nocache(src)
+        os.write(out, struct.pack("<Q", len(raw)) + raw)
+        buf = bytearray(64 << 20)
+        for a, b in order:
+            pos, end = 8 + n + a, 8 + n + b
+            while pos < end:
+                k = os.preadv(src, [memoryview(buf)[: min(len(buf), end - pos)]], pos)
+                if k <= 0:
+                    raise SystemExit(f"{sp}: short read")
+                w = 0
+                while w < k:
+                    w += os.write(out, memoryview(buf)[w:k])
+                pos += k
+        for _, data, _ in extra:
+            w = 0
+            while w < len(data):
+                w += os.write(out, memoryview(data)[w:])
+    finally:
+        os.close(src)
+        os.close(out)
+    return off
+
+
 def convert(src, dst, mx=False):
     os.makedirs(dst, exist_ok=True)
     idx = json.load(open(os.path.join(src, "model.safetensors.index.json")))
@@ -249,31 +298,36 @@ def convert(src, dst, mx=False):
         new, side, changed, experts = plan_shard(h, mx)
         if os.path.lexists(dp):
             os.remove(dp)
+        for base, out, inn, bk in side:
+            grid = read_tensor(sp, n, h[base + ".scale"])
+            side_tensors.append((base + ".scales", expand(grid, out, inn), [out, inn // BLOCK]))
+        if experts:
+            # Written whole: the NVFP4 scales leave the shard and the mxfp4 scales join it, so it bills what it holds.
+            from multiprocessing import Pool
+
+            jobs = [(sp, n, b, h[b + ".weight"], h[b + ".weight_scale"], h[b + ".weight_scale_2"], o, i) for b, o, i in experts]
+            with Pool(24, initializer=mx_init) as pool:
+                got = dict(pool.map(mx_scales, jobs, chunksize=8))
+            extra = [(b + ".scales", got[b], [o, i // BLOCK]) for b, o, i in experts]
+            total += write_compact(sp, n, dp, new, extra)
+            for k in new:
+                if k != "__metadata__":
+                    weight_map[k] = name
+            for k, _, _ in extra:
+                weight_map[k] = name
+            print(f"{name}: written whole, {len(side)} fp8 scale grids, {len(experts)} NVFP4 experts as mxfp4", flush=True)
+            continue
         if changed:
             subprocess.run(["cp", "-c", sp, dp], check=True)
             write_header_in_place(dp, n, new)
         else:
             os.symlink(sp, dp)
-        for base, out, inn, bk in side:
-            grid = read_tensor(sp, n, h[base + ".scale"])
-            side_tensors.append((base + ".scales", expand(grid, out, inn), [out, inn // BLOCK]))
         for k, v in new.items():
             if k == "__metadata__":
                 continue
             weight_map[k] = name
             total += nbytes(v)
-        if experts:
-            from multiprocessing import Pool
-
-            jobs = [(sp, n, b, h[b + ".weight"], h[b + ".weight_scale"], h[b + ".weight_scale_2"], o, i) for b, o, i in experts]
-            shapes = {b: [o, i // BLOCK] for b, o, i in experts}
-            with Pool(24, initializer=mx_init) as pool:
-                got = pool.map(mx_scales, jobs, chunksize=8)
-            side_name = "model-mxfp4-scales-" + name.split("-")[1] + ".safetensors"
-            total += write_side(os.path.join(dst, side_name), [(b + ".scales", data, shapes[b]) for b, data in got])
-            for b, _ in got:
-                weight_map[b + ".scales"] = side_name
-        print(f"{name}: {'header rewritten' if changed else 'linked'}, {len(side)} fp8 scale grids, {len(experts)} NVFP4 experts as mxfp4", flush=True)
+        print(f"{name}: {'header rewritten' if changed else 'linked'}, {len(side)} fp8 scale grids", flush=True)
     # The side shard: every fp8 linear's row scales.
     off = sum(len(d) for _, d, _ in side_tensors)
     for k, data, shape in side_tensors:
@@ -298,9 +352,9 @@ def mx_same(job):
     """Every value of one expert: NVIDIA's e2m1 x e4m3 x global against the mxfp4 e2m1 x 2^(scale - 127)."""
     import numpy as np
 
-    sp, on, dp, dn, xp, xn, base, codes_t, scale_t, s2_t, mx_t, out, inn = job
+    sp, on, dp, dn, xp, xn, base, codes_t, dcodes_t, scale_t, s2_t, mx_t, out, inn = job
     c = np.frombuffer(read_tensor(sp, on, codes_t), np.uint8).reshape(out, inn // 32, 16)
-    if read_tensor(dp, dn, codes_t) != c.tobytes():
+    if read_tensor(dp, dn, dcodes_t) != c.tobytes():
         return base, "codes differ"
     s = np.frombuffer(read_tensor(sp, on, scale_t), np.uint8).reshape(out, inn // 32, 2)
     s2 = np.float64(np.frombuffer(read_tensor(sp, on, s2_t), np.float32)[0])
@@ -324,7 +378,8 @@ def check(src, dst, mx=False):
     for name in sorted(set(sidx["weight_map"].values())):
         on, oh = read_header(os.path.join(src, name))
         nn, nh = read_header(os.path.join(dst, name))
-        if on != nn:
+        compact = mx and any(nvfp4_expert(oh, k) for k in oh)
+        if on != nn and not compact:
             raise SystemExit(f"{name}: header length moved")
         for k, v in oh.items():
             if k == "__metadata__":
@@ -335,8 +390,8 @@ def check(src, dst, mx=False):
                         raise SystemExit(f"{k}: still named")
                     continue
                 base = k[: -len(".weight")]
-                if nh[k]["data_offsets"] != v["data_offsets"] or nh[k]["dtype"] != "U32":
-                    raise SystemExit(f"{k}: codes moved")
+                if nbytes(nh[k]) != nbytes(v) or nh[k]["dtype"] != "U32":
+                    raise SystemExit(f"{k}: codes resized")
                 xp = os.path.join(dst, idx["weight_map"][base + ".scales"])
                 if xp not in sides:
                     sides[xp] = read_header(xp)
@@ -344,8 +399,18 @@ def check(src, dst, mx=False):
                 out, half = v["shape"]
                 if xh[base + ".scales"]["shape"] != [out, half * 2 // BLOCK]:
                     raise SystemExit(f"{base}.scales: shape")
-                mx_jobs.append((os.path.join(src, name), on, os.path.join(dst, name), nn, xp, xn, base, v,
+                mx_jobs.append((os.path.join(src, name), on, os.path.join(dst, name), nn, xp, xn, base, v, nh[k],
                                 oh[base + ".weight_scale"], oh[base + ".weight_scale_2"], xh[base + ".scales"], out, half * 2))
+                continue
+            if compact:
+                nk = k
+                if k.endswith(".scale") and k[:-6] + ".weight" in oh and ".engram.embed." not in k:
+                    nk = k[:-6] + (".block_scale" if oh[k[:-6] + ".weight"]["dtype"] == "F8_E4M3" else ".scales")
+                if nk not in nh or nbytes(nh[nk]) != nbytes(v) or read_tensor(os.path.join(src, name), on, v) != read_tensor(os.path.join(dst, name), nn, nh[nk]):
+                    raise SystemExit(f"{k}: not copied whole into the compact shard")
+                if idx["weight_map"].get(nk) != name:
+                    raise SystemExit(f"{nk}: the index does not name {name}")
+                n_fp8 += nk.endswith(".block_scale")
                 continue
             if k.endswith(".scale") and ".engram.embed." not in k and k[:-6] + ".weight" in oh:
                 base = k[:-6]
@@ -377,7 +442,7 @@ def check(src, dst, mx=False):
             if idx["weight_map"].get(k) != name:
                 raise SystemExit(f"{k}: the index does not name {name}")
         # A sample of tensors byte for byte (clones share the blocks; this proves the header kept every offset).
-        keys = [k for k in oh if k != "__metadata__" and not k.endswith(".scale") and not (mx and nvfp4_expert(oh, k))]
+        keys = [] if compact else [k for k in oh if k != "__metadata__" and not k.endswith(".scale")]
         for k in rng.sample(keys, min(4, len(keys))):
             a = read_tensor(os.path.join(src, name), on, oh[k])
             b = read_tensor(os.path.join(dst, name), nn, nh[k])
