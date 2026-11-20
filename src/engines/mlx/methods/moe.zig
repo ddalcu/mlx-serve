@@ -474,12 +474,17 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
             defer _ = mlx.mlx_array_free(row_map);
             try mlx.check(mlx.mlx_astype(&row_map, lhs_idx, .uint32, self.s));
             const clamp = swigluClampLimit(cfg.swiglu_limit, cfg.swiglu_clamp);
+            const scaled = mw.gate_expert_scale.ctx != null or mw.up_expert_scale.ctx != null;
             if (self.compiled_geglu == null and swigluFusedEnabled() and cfg.hidden_act == .silu and clamp != null and
-                mw.gate_expert_scale.ctx == null and mw.up_expert_scale.ctx == null and
+                (!scaled or gather_qmm_nax.scaledPrefillEnabled()) and
                 gate_qp.bits == up_qp.bits and gate_qp.group_size == up_qp.group_size)
             {
                 const sigtab = try @import("../../../sdk/blocks/hc/hc_prefill.zig").sigmoidTable(self.s);
-                if (try gather_qmm_nax.sortedGateUp(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, sigtab, clamp.?, gate_qp.bits, gate_qp.group_size, gate_qp.mode.isFp4(), nax_available, self.s)) |act3| {
+                const esc: gather_qmm_nax.ExpertScales = .{
+                    .gate = if (mw.gate_expert_scale.ctx != null) mw.gate_expert_scale else null,
+                    .up = if (mw.up_expert_scale.ctx != null) mw.up_expert_scale else null,
+                };
+                if (try gather_qmm_nax.sortedGateUpScaled(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, sigtab, clamp.?, esc, gate_qp.bits, gate_qp.group_size, gate_qp.mode.isFp4(), nax_available, self.s)) |act3| {
                     // The kernel writes [M, 1, n]; the down gather below takes [M, n] like the squeezed stock path.
                     defer _ = mlx.mlx_array_free(act3);
                     var act = mlx.mlx_array_new();

@@ -2147,7 +2147,7 @@ const hc_prefill = @import("../hc/hc_prefill.zig");
 const nax_header = ksrc("kernels/moe/gather_qmm_nax_header.metal");
 const nax_mapped_header = nax_header ++ ksrc("kernels/moe/gather_qmm_nax_mapped_header.metal");
 const nax_mm_in = [_][*:0]const u8{ "x", "w", "scales", "biases", "tiles", "tile_count", "params" };
-const nax_map_in = [_][*:0]const u8{ "x", "w", "scales", "biases", "up_w", "up_scales", "up_biases", "tiles", "tile_count", "params", "sigtab", "rmap" };
+const nax_map_in = [_][*:0]const u8{ "x", "w", "scales", "biases", "up_w", "up_scales", "up_biases", "tiles", "tile_count", "params", "sigtab", "rmap", "gsc", "usc" };
 
 /// `Ws` at the largest plan: seg 128 x 128, one 64 x (128 + 8) bf16 tile and its 8 KiB pad.
 const nax_tg: u32 = 64 * 136 * 2 + 8192;
@@ -2302,6 +2302,9 @@ const GqmmNax = struct {
     kind: NaxKind,
     ne: usize,
     limit: u32 = 0,
+    /// The pair's per-expert scales (`gqn.ExpertScales`): bit 0 the gate's, bit 1 the up's, `[ne]` bf16 each.
+    esc: u32 = 0,
+    escv: [2][]f64 = .{ &.{}, &.{} },
     banks: [2]Bank,
     shape: Shape = undefined,
     m: usize = 0,
@@ -2311,7 +2314,7 @@ const GqmmNax = struct {
     table: []f64 = &.{},
     dv: []f64 = &.{},
     dm: []f64 = &.{},
-    args: [12]mlx.mlx_array = undefined,
+    args: [14]mlx.mlx_array = undefined,
     n_args: usize = 0,
 
     fn init(a: std.mem.Allocator, kind: NaxKind, f: Fmt, b: u32, g: usize, ne: usize) GqmmNax {
@@ -2323,7 +2326,7 @@ const GqmmNax = struct {
         const a = self.rig.a;
         self.rig.deinit();
         for (&self.banks) |*b| b.deinit(a);
-        for ([_][]f64{ self.x, self.rmap, self.ids, self.table, self.dv, self.dm }) |s| a.free(s);
+        for ([_][]f64{ self.x, self.rmap, self.ids, self.table, self.dv, self.dm, self.escv[0], self.escv[1] }) |s| a.free(s);
     }
 
     fn mx(self: *const GqmmNax) bool {
@@ -2366,6 +2369,7 @@ const GqmmNax = struct {
         g.int("GX", p.gx);
         g.int("PAD", p.pad);
         if (self.kind != .mm) g.int("EPI", if (self.kind == .paired) 1 + self.limit else 0);
+        if (self.kind != .mm) g.int("ESC", @as(c_int, @intCast(self.esc)));
         return g;
     }
 
@@ -2374,7 +2378,7 @@ const GqmmNax = struct {
         if (self.geometry(shape) == null) return false;
         const a = self.rig.a;
         self.shape = shape;
-        for ([_]*[]f64{ &self.x, &self.rmap, &self.ids, &self.dv, &self.dm }) |p| {
+        for ([_]*[]f64{ &self.x, &self.rmap, &self.ids, &self.dv, &self.dm, &self.escv[0], &self.escv[1] }) |p| {
             a.free(p.*);
             p.* = &.{};
         }
@@ -2392,6 +2396,11 @@ const GqmmNax = struct {
         if (fill == .nonfinite) plantRows(self.x, shape.k);
         self.rmap = try a.alloc(f64, self.m);
         for (self.rmap, 0..) |*v, i| v.* = @floatFromInt((i * 73 + 11) % xr);
+        // Per-expert scales over two octaves either side of 1, so the rounding after the multiply and the clamp both act.
+        for (&self.escv, 0..) |*v, bit| if (self.esc & (@as(u32, 1) << @intCast(bit)) != 0) {
+            v.* = try a.alloc(f64, self.ne);
+            host.uniformInto(rng, v.*, 0.25, 4.0, .bfloat16);
+        };
         try self.bind();
         return true;
     }
@@ -2430,8 +2439,13 @@ const GqmmNax = struct {
             return;
         }
         const sig = if (self.kind == .paired) try rig.input(.bfloat16, &.{65536}, self.table) else b[0][2];
-        self.args = .{ x, b[0][0], b[0][1], b[0][2], b[1][0], b[1][1], b[1][2], t, count_, params, sig, try rig.input(.uint32, &.{rows}, self.rmap) };
-        self.n_args = 12;
+        // An absent scale binds the sigmoid table (or the bias slot), as the wrapper does; ESC leaves it unread.
+        var sc: [2]mlx.mlx_array = .{ sig, sig };
+        for (&sc, self.escv) |*o, v| if (v.len > 0) {
+            o.* = try rig.input(.bfloat16, &.{@intCast(self.ne)}, v);
+        };
+        self.args = .{ x, b[0][0], b[0][1], b[0][2], b[1][0], b[1][1], b[1][2], t, count_, params, sig, try rig.input(.uint32, &.{rows}, self.rmap), sc[0], sc[1] };
+        self.n_args = 14;
     }
 
     pub fn run(self: *GqmmNax) !void {
@@ -2468,7 +2482,8 @@ const GqmmNax = struct {
         };
     }
 
-    /// The bf16 product, or for the pair MLX's SwiGLU on the two rounded products (clamped first under a limit).
+    /// The bf16 product, or for the pair MLX's SwiGLU on the two rounded products (each first times its expert's
+    /// scale, rounded again, then clamped under a limit).
     fn epilogue(self: *const GqmmNax, dv: []const f64, want: []f64) void {
         if (self.kind != .paired) return @memcpy(want, dv[0..want.len]);
         const cnt = want.len;
@@ -2476,6 +2491,9 @@ const GqmmNax = struct {
         for (want, 0..) |*y, i| {
             var g = host.rt(.bfloat16, dv[i]);
             var u = host.rt(.bfloat16, dv[cnt + i]);
+            const e: usize = @intFromFloat(self.ids[i / self.shape.n]);
+            if (self.escv[0].len > 0) g = host.rt(.bfloat16, g * self.escv[0][e]);
+            if (self.escv[1].len > 0) u = host.rt(.bfloat16, u * self.escv[1][e]);
             if (self.limit > 0) {
                 g = clampNaN(g, -std.math.inf(f64), lim);
                 u = clampNaN(u, -lim, lim);
@@ -2531,9 +2549,13 @@ const GqmmNax = struct {
         var g = ops.Graph.init(self.rig.a, s);
         defer g.deinit();
         const x = if (self.kind == .mm) self.args[0] else try g.take(self.args[0], self.args[11], 0);
-        const gate = try self.gatherQmm(&g, x, 0);
+        var gate = try self.gatherQmm(&g, x, 0);
         if (self.kind != .paired) return self.rig.bytesOf(&.{gate});
-        const up = try self.gatherQmm(&g, x, 1);
+        var up = try self.gatherQmm(&g, x, 1);
+        // The split path's `scaleExperts`: each row times its expert's scale.
+        const ids = self.rig.ins.items[0].view;
+        if (self.escv[0].len > 0) gate = try g.mul(gate, try g.reshape(try g.take(self.args[12], ids, 0), &.{ -1, 1, 1 }));
+        if (self.escv[1].len > 0) up = try g.mul(up, try g.reshape(try g.take(self.args[13], ids, 0), &.{ -1, 1, 1 }));
         if (self.limit > 0) return self.rig.bytesOf(&.{try g.adopt(try activations.clampedSwiGLU(s, gate, up, @floatFromInt(self.limit)))});
         return self.rig.bytesOf(&.{try g.mul(try g.mul(gate, try g.sigmoid(gate)), up)});
     }
@@ -2550,7 +2572,10 @@ const GqmmNax = struct {
         const y = switch (self.kind) {
             .mm => try gqn.sortedGather(x[0], x[1], x[2], bias, ids, bits, group, self.mx(), true, s),
             .mapped => try gqn.sortedGatherMapped(x[0], x[11], x[1], x[2], bias, ids, bits, group, self.mx(), true, s),
-            .paired => try gqn.sortedGateUp(x[0], x[11], x[1], x[2], bias, x[4], x[5], if (self.mx()) none else x[6], ids, x[10], self.limit, bits, group, self.mx(), true, s),
+            .paired => try gqn.sortedGateUpScaled(x[0], x[11], x[1], x[2], bias, x[4], x[5], if (self.mx()) none else x[6], ids, x[10], self.limit, .{
+                .gate = if (self.escv[0].len > 0) x[12] else null,
+                .up = if (self.escv[1].len > 0) x[13] else null,
+            }, bits, group, self.mx(), true, s),
         } orelse return error.Declined;
         defer _ = mlx.mlx_array_free(y);
         return self.rig.bytesOf(&.{y});
@@ -2588,6 +2613,19 @@ fn registerNax(set: *kc.Set) !void {
     var lim = GqmmNax.init(a, .paired, .affine, 4, 64, 32);
     lim.limit = 7;
     try set.add(GqmmNax, lim, .{ .name = "gather_qmm_nax paired bf16 (4-bit g64, limit 7)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = "take (the row map) -> " ++ gather ++ " for gate and up -> clampedSwiGLU", .served = paired[0..1], .known = limit_drops_nan }, null);
+    // Per-expert scales (ModelOpt NVFP4's global scales) in the pair's epilogue, both fp4 formats: the gate's alone
+    // (an unclamped SwiGLU, the up x down scales riding the scores), and gate and up before a clamp.
+    try set.add(GqmmNax, .init(a, .paired, .nvfp4, 4, 16, 32), .{ .name = "gather_qmm_nax paired bf16 (NVFP4)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = chain, .served = paired[0..1] }, null);
+    const scaled_chain = "take (the row map) -> " ++ gather ++ " for gate and up -> take (the scales) -> multiply -> sigmoid -> multiply -> multiply";
+    for ([_]Fmt{ .nvfp4, .mxfp4 }) |f| {
+        var gs = GqmmNax.init(a, .paired, f, 4, if (f == .nvfp4) 16 else 32, 32);
+        gs.esc = 1;
+        try set.add(GqmmNax, gs, .{ .name = if (f == .nvfp4) "gather_qmm_nax paired bf16 (NVFP4, gate scale)" else "gather_qmm_nax paired bf16 (MXFP4, gate scale)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = scaled_chain, .served = paired[0..1] }, null);
+    }
+    var both = GqmmNax.init(a, .paired, .nvfp4, 4, 16, 32);
+    both.esc = 3;
+    both.limit = 7;
+    try set.add(GqmmNax, both, .{ .name = "gather_qmm_nax paired bf16 (NVFP4, gate and up scales, limit 7)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = "take (the row map) -> " ++ gather ++ " for gate and up -> take (the scales) -> multiply -> clampedSwiGLU", .served = paired[0..1], .known = limit_drops_nan }, null);
 }
 
 // ── the stream-read microbenchmark ──

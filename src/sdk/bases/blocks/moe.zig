@@ -830,11 +830,16 @@ fn sortedDown(w: *const Moe.Weights, g: *Graph, x_flat: Array, lhs: Array, gate:
     if (blocked and nax and gq.mode == uq.mode and (gq.mode == .affine or gq.mode.isFp4())) {
         const x_tok = try g.reshape(x_flat, &.{ ops.shape(x_flat)[0], 1, D });
         const row_map = try g.astype(lhs, .uint32);
-        if (fused_act.swigluFusedEnabled() and w.clamp != null and gate.expert_scale.ctx == null and up.expert_scale.ctx == null and
+        const scaled = gate.expert_scale.ctx != null or up.expert_scale.ctx != null;
+        if (fused_act.swigluFusedEnabled() and w.clamp != null and (!scaled or gather_qmm_nax.scaledPrefillEnabled()) and
             gq.bits == uq.bits and gq.group_size == uq.group_size)
         {
             const sigtab = try sigmoidTable(g.s);
-            if (try gather_qmm_nax.sortedGateUp(x_tok, row_map, gate.w, gate.s, gate.b, up.w, up.s, up.b, idx, sigtab, w.clamp.?, gq.bits, gq.group_size, gq.mode.isFp4(), nax, g.s)) |a3| {
+            const esc: gather_qmm_nax.ExpertScales = .{
+                .gate = if (gate.expert_scale.ctx != null) gate.expert_scale else null,
+                .up = if (up.expert_scale.ctx != null) up.expert_scale else null,
+            };
+            if (try gather_qmm_nax.sortedGateUpScaled(x_tok, row_map, gate.w, gate.s, gate.b, up.w, up.s, up.b, idx, sigtab, w.clamp.?, esc, gq.bits, gq.group_size, gq.mode.isFp4(), nax, g.s)) |a3| {
                 const sh = ops.shape(a3);
                 act = try g.reshape(try g.adopt(a3), &.{ sh[0], sh[2] });
             }
