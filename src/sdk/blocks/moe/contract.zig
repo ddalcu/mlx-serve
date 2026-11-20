@@ -765,7 +765,7 @@ fn add(set: *kc.Set, g0: Gather, comptime name: []const u8, served: []const Shap
 
 const fp4_gateup_in = [_][*:0]const u8{ "x", "wg_q", "g_scales", "wu_q", "u_scales", "inds", "sigtab", "gsc", "usc" };
 const fp4_downred_in = [_][*:0]const u8{ "act", "wd_q", "d_scales", "inds", "scores", "sdown", "glog" };
-const fp4_headers = [2][:0]const u8{ moe_fp4.E2M1_HEADER ++ moe_fp4.NV_SCALE ++ moe_fp4.DOT16, moe_fp4.E2M1_HEADER ++ moe_fp4.MX_SCALE ++ moe_fp4.DOT16 };
+const fp4_headers = [2][:0]const u8{ moe_fp4.HEADER, moe_fp4.HEADER };
 /// Indexed [part][nv, mx].
 const fp4_launches = [2][2]metal.Launch{
     .{

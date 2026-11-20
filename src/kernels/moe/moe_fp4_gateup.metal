@@ -17,8 +17,8 @@ for (int k = 0; k < K; k += 512) {
     const int gi = kk / GS;
     for (int r = 0; r < ROWS; ++r) {
       const size_t sg = (row + r) * KG + gi;
-      ag[r] += mlxserve_fp4_dot16(gw[r * KW2 + k / 16], xr) * mlxserve_fp4_scale(uint(g_scales[sg]));
-      au[r] += mlxserve_fp4_dot16(uw[r * KW2 + k / 16], xr) * mlxserve_fp4_scale(uint(u_scales[sg]));
+      ag[r] += mlxserve_fp4_dot16(gw[r * KW2 + k / 16], xr) * mlxserve_fp4_scale_x2m8<GS>(uint(g_scales[sg]));
+      au[r] += mlxserve_fp4_dot16(uw[r * KW2 + k / 16], xr) * mlxserve_fp4_scale_x2m8<GS>(uint(u_scales[sg]));
     }
   }
 }

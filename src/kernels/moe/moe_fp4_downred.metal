@@ -15,7 +15,7 @@ for (int e = tok * TOPK; e < (tok + 1) * TOPK; ++e) {
       for (int i = 0; i < 16; ++i) xr[i] = float(act[size_t(e) * I + kk + i]);
       const int gi = kk / GS;
       for (int r = 0; r < ROWS; ++r)
-        acc[r] += sc * mlxserve_fp4_dot16(dw[r * KW2 + k / 16], xr) * mlxserve_fp4_scale(uint(d_scales[(row + r) * KG + gi]));
+        acc[r] += sc * mlxserve_fp4_dot16(dw[r * KW2 + k / 16], xr) * mlxserve_fp4_scale_x2m8<GS>(uint(d_scales[(row + r) * KG + gi]));
     }
   }
 }
