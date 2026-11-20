@@ -281,6 +281,7 @@ pub fn mtpRoundUntimed(self: *Generator) void {
 /// Price a lookup round into the table's lookup row: the wall since the previous round
 /// ended, the quantity the width grid stores. No sample before the regime clock runs.
 pub fn mtpLookupObserve(self: *Generator, drafts: u32, tokens: u32) void {
+    if (self.warm) return;
     const c = if (self.mtp_regime_clock) |*c| c else return;
     const ms = @as(f32, @floatFromInt(c.read())) / @as(f32, std.time.ns_per_ms);
     _ = self.xfm.round_cost.observeLookup(drafts, self.mtpKvLen(), ms, @floatFromInt(tokens), self.spec_cost_solo);

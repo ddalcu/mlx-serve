@@ -2527,3 +2527,19 @@
 "Quit MLX-Serve" = "退出 MLX-Serve";
 "Keep running when I press ⌘Q" = "按 ⌘Q 时保持运行";
 "⌘Q closes the window and the server keeps running. Quit in the menu bar still stops both." = "⌘Q 关闭窗口，服务器继续运行。菜单栏中的“退出”仍会同时停止两者。";
+
+/* MiniMax-H3-Image */
+"MiniMax's H3 image model — photoreal detail and sharp in-image text from 4 to 16 megapixels, and edits that combine up to 16 pictures, in six steps. MiniMax-H3-Image Community License (not for use in the EU, UK, South Korea or the US)." = "MiniMax 的 H3 图像模型——400 万到 1600 万像素下的写实细节与清晰的图中文字，编辑时最多可组合 16 张图片，只需六步。MiniMax-H3-Image 社区许可（不可在欧盟、英国、韩国或美国使用）。";
+"Refer to the pictures by name — the source is <Picture 1>, references follow in order: “put the hat from <Picture 2> on the man in <Picture 1>”. Click a picture to drop its name into the prompt." = "用名称来指代图片 —— 源图是 <Picture 1>，参考图按顺序跟在后面：“把 <Picture 2> 中的帽子戴到 <Picture 1> 中男子的头上”。点击图片即可把它的名称插入提示词。";
+"2048 × 2048 (square, 4 MP)" = "2048 × 2048（方形，400 万像素）";
+"4096 × 4096 (square, 16 MP)" = "4096 × 4096（方形，1600 万像素）";
+"2368 × 1776 (landscape 4:3, 4 MP)" = "2368 × 1776（横版 4:3，400 万像素）";
+"1776 × 2368 (portrait 3:4, 4 MP)" = "1776 × 2368（竖版 3:4，400 万像素）";
+"2736 × 1536 (landscape 16:9, 4 MP)" = "2736 × 1536（横版 16:9，400 万像素）";
+"1536 × 2736 (portrait 9:16, 4 MP)" = "1536 × 2736（竖版 9:16，400 万像素）";
+"4736 × 3552 (landscape 4:3, 16 MP)" = "4736 × 3552（横版 4:3，1600 万像素）";
+"3552 × 4736 (portrait 3:4, 16 MP)" = "3552 × 4736（竖版 3:4，1600 万像素）";
+"5472 × 3072 (landscape 16:9, 16 MP)" = "5472 × 3072（横版 16:9，1600 万像素）";
+"3072 × 5472 (portrait 9:16, 16 MP)" = "3072 × 5472（竖版 9:16，1600 万像素）";
+"6272 × 2688 (cinematic 21:9, 16 MP)" = "6272 × 2688（电影宽幅 21:9，1600 万像素）";
+"Travel poster" = "旅行海报";

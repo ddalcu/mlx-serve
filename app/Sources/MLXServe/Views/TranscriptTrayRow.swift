@@ -389,10 +389,14 @@ final class TrayTranscript: ObservableObject {
     }
 
     /// `POST /v1/audio/transcriptions` with `wav` as the file; the body of a 200, else the server's own error.
-    nonisolated static func post(_ wav: Data, model: String, server: String, format: String) async throws -> Data {
+    /// `words` asks for per-word times (`verbose_json` only).
+    nonisolated static func post(_ wav: Data, model: String, server: String, format: String,
+                                 words: Bool = false) async throws -> Data {
         let boundary = UUID().uuidString
         var body = Data()
-        for (name, value) in [("model", model), ("response_format", format)] {
+        var fields = [("model", model), ("response_format", format)]
+        if words { fields.append(("timestamp_granularities[]", "word")) }
+        for (name, value) in fields {
             body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".utf8))
         }
         body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"recording.wav\"\r\nContent-Type: audio/wav\r\n\r\n".utf8))

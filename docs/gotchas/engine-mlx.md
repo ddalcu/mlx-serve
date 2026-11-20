@@ -1551,6 +1551,14 @@ keyed on the build, the OS build and the pack, makes every later load owe nothin
 `tests/test_first_request_compiles.sh` (a copy of the binary under another bundle id starts with an empty cache),
 `owed`, `nextStep`, `forget`, `an idle warm-up waits beside a real request without holding its model`.
 
+### A fresh build's warm-up taught the round-cost table its shader compiles
+Defect: on a build's first load of Flash Next, the first requests drafted 2 wide where 3 to 5 pay, and a release
+bench read 151 tok/s against 167 for the same binary on a later load. Cause: the warm-up requests (`warm_requests.zig`)
+draft at several widths while their kernels compile, and their rounds fed the model-wide round-cost table like any
+request's: a width's first cell (w3 at 17.7 ms per token, about three times a warm round) priced it out until enough
+later samples outvoted it. Fix: a warm slot's generator (`Generator.warm`) skips every table feed (width grid, serial
+row, lookup row). Guard: `specObserveRound: a warm-up's round teaches the model's round-cost table nothing`.
+
 ### A streamed bank's open read the box before macOS counted the trunk
 Defect: on about one load in six of a glm5_next streaming pack (GLM-5.3, Ling-3.1), the bank's open read the box's
 non-file memory below the server's own footprint, the bank took the trunk's size of extra room, and the box went past

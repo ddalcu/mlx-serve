@@ -197,9 +197,11 @@ final class ImageGenService: ObservableObject {
         var json: [String: Any] = [
             "model": modelName,
             "prompt": request.prompt,
-            "steps": request.steps,
             "seed": seed,
         ]
+        // A pack whose own grid sets the steps ignores the field (Qwen-Image Turbo) or refuses any other count
+        // (MiniMax-H3-Image), so it never goes out.
+        if !request.model.stepsSetByCheckpoint { json["steps"] = request.steps }
         // width/height 0 = "Match source": OMIT `size` so the server keeps the
         // reference image's own resolution instead of re-gridding it to a bucket.
         if request.width > 0 && request.height > 0 {

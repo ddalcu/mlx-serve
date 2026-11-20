@@ -658,6 +658,27 @@ extension MediaBundle {
         )
     }
 
+    /// A MiniMax-H3-Image pack: the three weight files at the root beside config + tokenizer (`assets/` stays on the hub).
+    static func minimaxH3Image(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "minimax-h3-image:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(keepSafetensors: [
+                        "transformer.safetensors", "text_encoder.safetensors", "image_vae.safetensors",
+                    ]),
+                    readyMarkers: [
+                        "config.json", "transformer.safetensors", "text_encoder.safetensors",
+                        "image_vae.safetensors", "tokenizer.json",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// The subdirectory LTX 2.5 ships its own text encoder in. Cross-pinned
     /// with the server's `ltx_video.LtxVersion.textEncoderSubdir` — the server
     /// resolves the encoder from this exact path, so a rename here silently
@@ -687,6 +708,8 @@ extension ImageModelPreset {
             return .qwenImage(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .mossImage:
             return .mossImage(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        case .minimaxH3Image:
+            return .minimaxH3Image(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .flux2Klein9B, .flux2Klein9BBase:
             // The MLX conversions of klein 9B — distilled and base alike —
             // ship no root config.json.

@@ -157,7 +157,7 @@ struct ImageGenView: View {
             Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
         .sheet(isPresented: $showEnhance) {
-            PromptRewriteSheet(title: "Rewrite image prompt", request: { _ in PromptRewriter.image(text: prompt, editing: isEditing, groups: model.promptExamples(editing: isEditing), denseText: model.rendersDenseText, mossCanvas: model.variant == .mossImage ? .init(width: effectiveSize.width, height: effectiveSize.height) : nil) }, onApply: { prompt = $0 })
+            PromptRewriteSheet(title: "Rewrite image prompt", request: { _ in PromptRewriter.image(text: prompt, editing: isEditing, groups: model.promptExamples(editing: isEditing), denseText: model.rendersDenseText, mossCanvas: model.variant == .mossImage ? .init(width: effectiveSize.width, height: effectiveSize.height) : nil, detailedCaption: model.variant == .minimaxH3Image) }, onApply: { prompt = $0 })
                 .environmentObject(appState)
         }
     }
@@ -264,6 +264,10 @@ struct ImageGenView: View {
                         Text("Describe the change in the prompt — “make the hair blue”, “remove the monitor”. The model sees the original and keeps the rest.")
                             .font(.app(.caption2))
                             .foregroundStyle(.secondary)
+                    } else if model.namesPicturesInPrompt {
+                        Text("Refer to the pictures by name — the source is <Picture 1>, references follow in order: “put the hat from <Picture 2> on the man in <Picture 1>”. Click a picture to drop its name into the prompt.")
+                            .font(.app(.caption2))
+                            .foregroundStyle(.secondary)
                     } else {
                         Text("Refer to the pictures by number — the source is image 1, references follow in order: “replace the face of the man in image 1 with the face from image 2”. Click a picture to drop its name into the prompt.")
                             .font(.app(.caption2))
@@ -341,7 +345,7 @@ struct ImageGenView: View {
     /// form.
     private var imagesPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
-            RefTileGrid(urls: attachedImages, label: { "image \($0 + 1)" }, kind: .image,
+            RefTileGrid(urls: attachedImages, label: { model.referenceName($0 + 1) }, kind: .image,
                         insert: insertMarker)
             if imageRoom > 0 {
                 Button { chooseRefImage() } label: {

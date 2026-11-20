@@ -110,7 +110,7 @@ pub fn specObserveRound(self: *Generator, width: u32, wall_ms: f32, tokens: f32,
         (if (self.spec_round_prev_width2) |p| p != width else true);
     self.spec_round_prev_width2 = self.spec_round_prev_width;
     self.spec_round_prev_width = width;
-    if (!observe) {
+    if (!observe or self.warm) {
         log.debug("  [spec-cost] w{d} ms={d:.2} tok={d:.0} -> unobserved\n", .{ width, wall_ms, tokens });
         return;
     }
@@ -120,4 +120,22 @@ pub fn specObserveRound(self: *Generator, width: u32, wall_ms: f32, tokens: f32,
     if (v == .bad_sample or v == .out_of_range) {
         log.warn("[spec-cost] table rejected sample ({s}): width={d} kv={d} ms={d:.2} tokens={d:.1}\n", .{ @tagName(v), width, kv, wall_ms, tokens });
     }
+}
+
+test "specObserveRound: a warm-up's round teaches the model's round-cost table nothing" {
+    const Transformer = @import("../../transformer.zig").Transformer;
+    var xfm: Transformer = undefined;
+    xfm.round_cost = .{};
+    var gen: Generator = undefined;
+    gen.xfm = &xfm;
+    gen.prompt_ids_owned = &.{};
+    gen.generated_ids = .empty;
+    gen.spec_cost_solo = true;
+    for ([_]bool{ true, false }) |warm| {
+        gen.warm = warm;
+        gen.spec_round_prev_width = 3;
+        gen.spec_round_prev_width2 = 3;
+        gen.specObserveRound(3, 20.0, 3.0, true, false);
+    }
+    try std.testing.expectEqual(@as(u32, 1), xfm.round_cost.folded);
 }

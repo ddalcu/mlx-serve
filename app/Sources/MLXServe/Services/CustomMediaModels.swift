@@ -47,6 +47,7 @@ enum CustomMediaModels {
             return id.range(of: "turbo", options: .caseInsensitive) != nil ? .qwenImage21Turbo_8bit : .qwenImage21_8bit
         }
         if arch == "moss_image" { return .mossImageSFT_8bit }
+        if arch == "minimax_h3_image" { return .minimaxH3Image_4bit }
         return nil
     }
 

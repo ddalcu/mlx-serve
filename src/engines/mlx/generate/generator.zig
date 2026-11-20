@@ -381,6 +381,9 @@ pub const Generator = struct {
     /// stops feeding the kv-term learner rather than teaching it a lie.
     /// Set per tick by the scheduler.
     spec_cost_solo: bool = true,
+    /// A kernel warm-up the server serves itself (`Slot.warm`): its rounds pay first-use compiles, so they teach the
+    /// model-wide round-cost table nothing.
+    warm: bool = false,
     /// Draft-depth cap while this slot verifies inside a batched group (0 = none):
     /// the group's rows must stay on the split-K verify lane (`scheduler.mtpSubGroupPlan`).
     mtp_group_cap: u32 = 0,

@@ -210,7 +210,7 @@ pub fn observeSerialTick(self: *Generator) void {
         self.mtp_serial_warm = 0;
         return;
     }
-    if (!self.spec_cost_solo) {
+    if (!self.spec_cost_solo or self.warm) {
         self.mtp_serial_clock = null;
         self.mtp_serial_warm = 0;
         return;

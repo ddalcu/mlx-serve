@@ -2459,3 +2459,19 @@
 "Quit MLX-Serve" = "MLX-Serve 종료";
 "Keep running when I press ⌘Q" = "⌘Q를 눌러도 계속 실행";
 "⌘Q closes the window and the server keeps running. Quit in the menu bar still stops both." = "⌘Q는 창을 닫고 서버는 계속 실행됩니다. 메뉴 막대의 종료는 여전히 둘 다 중지합니다.";
+
+/* MiniMax-H3-Image */
+"MiniMax's H3 image model — photoreal detail and sharp in-image text from 4 to 16 megapixels, and edits that combine up to 16 pictures, in six steps. MiniMax-H3-Image Community License (not for use in the EU, UK, South Korea or the US)." = "MiniMax의 H3 이미지 모델 — 400만~1600만 화소에서 사실적인 디테일과 선명한 이미지 속 글자를 만들고, 최대 16장의 그림을 조합해 편집하며, 6단계로 끝납니다. MiniMax-H3-Image 커뮤니티 라이선스(EU, 영국, 한국, 미국에서는 사용할 수 없음).";
+"Refer to the pictures by name — the source is <Picture 1>, references follow in order: “put the hat from <Picture 2> on the man in <Picture 1>”. Click a picture to drop its name into the prompt." = "그림은 이름으로 지칭하세요 — 원본이 <Picture 1>이고 참조 그림이 순서대로 이어집니다: “put the hat from <Picture 2> on the man in <Picture 1>”. 그림을 클릭하면 그 이름이 프롬프트에 삽입됩니다.";
+"2048 × 2048 (square, 4 MP)" = "2048 × 2048 (정사각형, 400만 화소)";
+"4096 × 4096 (square, 16 MP)" = "4096 × 4096 (정사각형, 1600만 화소)";
+"2368 × 1776 (landscape 4:3, 4 MP)" = "2368 × 1776 (가로 4:3, 400만 화소)";
+"1776 × 2368 (portrait 3:4, 4 MP)" = "1776 × 2368 (세로 3:4, 400만 화소)";
+"2736 × 1536 (landscape 16:9, 4 MP)" = "2736 × 1536 (가로 16:9, 400만 화소)";
+"1536 × 2736 (portrait 9:16, 4 MP)" = "1536 × 2736 (세로 9:16, 400만 화소)";
+"4736 × 3552 (landscape 4:3, 16 MP)" = "4736 × 3552 (가로 4:3, 1600만 화소)";
+"3552 × 4736 (portrait 3:4, 16 MP)" = "3552 × 4736 (세로 3:4, 1600만 화소)";
+"5472 × 3072 (landscape 16:9, 16 MP)" = "5472 × 3072 (가로 16:9, 1600만 화소)";
+"3072 × 5472 (portrait 9:16, 16 MP)" = "3072 × 5472 (세로 9:16, 1600만 화소)";
+"6272 × 2688 (cinematic 21:9, 16 MP)" = "6272 × 2688 (시네마틱 21:9, 1600만 화소)";
+"Travel poster" = "여행 포스터";

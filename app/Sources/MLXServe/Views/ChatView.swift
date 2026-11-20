@@ -595,6 +595,7 @@ struct ChatView: View {
     @ViewBuilder
     private func createPane(_ experiment: GenExperiment) -> some View {
         switch experiment {
+        case .templates: TemplatesPane(run: appState.templates, cast: appState.cast)
         case .image:   ImageGenView().environmentObject(appState.imageGen)
         case .video:   VideoGenView().environmentObject(appState.videoGen)
         case .audio:   AudioGenView()

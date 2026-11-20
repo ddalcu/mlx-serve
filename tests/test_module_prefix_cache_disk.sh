@@ -186,17 +186,18 @@ for deadline in 0 1; do
 done
 echo "PASS: shutdown log controls (expiry during a slice remains unit-owned)"
 
-echo "cancelling a continuation preserves the consumed dirty export"
+# A cancelled continuation commits its prompt as far as it got, superseding the dirty export it restored: after a
+# restart, retrying it resumes from disk.
+echo "cancelling a continuation persists the conversation where it stopped"
 start_server r47-seed "$OUT/cancel-home"
 if probe cancel --base "$BASE" --root "$CASE_HOME" --log "$LOGFILE" --output "$OUT/cancel1.json"; then
-    probe layout --root "$CASE_HOME" --boundary "$OUT/cancel1.json" --wait 120
+    probe layout --root "$CASE_HOME" --boundary "$OUT/cancel1.json" --wait 120 --at-least
     stop_server
-    probe layout --root "$CASE_HOME" --boundary "$OUT/cancel1.json" --only
     start_server r47-restart "$OUT/cancel-home"
-    request --max-tokens 1 --output "$OUT/cancel-restart1.json"
-    probe result "$OUT/cancel-restart1.json" --boundary "$OUT/cancel1.json" --cold "$OUT/cancel1.json" --log "$LOGFILE" --source disk
+    request --max-tokens 1 --cancelled "$OUT/cancel1.json" --output "$OUT/cancel-restart1.json"
+    probe result "$OUT/cancel-restart1.json" --boundary "$OUT/cancel-restart1.json" --log "$LOGFILE" --source disk
     stop_server
-    echo "PASS: cancelling a continuation preserves the consumed dirty export"
+    echo "PASS: cancelling a continuation persists the conversation where it stopped"
 else
     rc=$?
     [ "$rc" = 77 ] || exit "$rc"

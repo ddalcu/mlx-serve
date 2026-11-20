@@ -97,7 +97,7 @@ final class ChatEmptyStateTests: XCTestCase {
         let expected = ChatEmptyState.mediaItems.filter { $0.action != .create(.model3d) }
         XCTAssertEqual(ChatEmptyState.sidebarCreateItems.map(\.id), expected.map(\.id),
                        "same items, same order as the shared catalogue")
-        XCTAssertEqual(ChatEmptyState.sidebarCreateItems.count, 3)
+        XCTAssertEqual(ChatEmptyState.sidebarCreateItems.count, 4)
         for item in ChatEmptyState.sidebarCreateItems {
             guard case .create = item.action else {
                 return XCTFail("\(item.id) is not a Create page — the sidebar rows only link to generators")
