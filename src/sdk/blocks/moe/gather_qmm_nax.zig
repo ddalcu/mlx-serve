@@ -575,7 +575,7 @@ pub fn scaledPrefillEnabled() bool {
 }
 
 /// The arm an unset `MLX_SERVE_MOE_SCALED_PREFILL` takes.
-const scaled_prefill_default = false;
+const scaled_prefill_default = true;
 
 /// `sortedGateUp` with each expert's own gate / up scale in the epilogue (`ExpertScales`): the two gathers, the
 /// `scaleExperts` multiplies and the SwiGLU (clamped under `limit`) of the split path in one dispatch, bit for bit.
