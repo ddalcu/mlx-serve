@@ -640,6 +640,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     slot.prefill_interleaved_ns = interleave_ctx.decode_ns;
     gen.timeout_ns = slot.timeout_ns;
     gen.logprobs_n = slot.logprobs_n;
+    gen.warm = slot.warm;
 
     slot.legacy_gen = gen;
     // The last chunks' transient is freed AFTER the loop's own per-chunk clear, so it

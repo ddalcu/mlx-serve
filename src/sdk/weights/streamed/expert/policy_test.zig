@@ -671,6 +671,54 @@ test "expert policy: tally: seeded, a prefill miss that is not pinned evicts not
     try testing.expectEqualSlices(u16, &.{ 1, 3, 5 }, residentsOf(&p, &buf));
 }
 
+test "expert policy: prompt_keep: no prompt admission evicts a resident; an empty row is still taken; decode plans as without it" {
+    const a = testing.allocator;
+    var keep = try LayerPolicy.init(a, 16, 3);
+    defer keep.deinit(a);
+    keep.prompt_keep = true;
+    var stock = try LayerPolicy.init(a, 16, 3);
+    defer stock.deinit(a);
+    var ra: [4]LayerPolicy.ReadAhead = undefined;
+    // Both start with 3 and 4 resident and one row empty.
+    for ([_]*LayerPolicy{ &keep, &stock }) |p| try testing.expectEqual(@as(usize, 2), p.admitReadAhead(&.{ 3, 4 }, &ra).len);
+    // The read-ahead takes the empty row, then (stock only) the coldest resident it left out.
+    try testing.expectEqualSlices(LayerPolicy.ReadAhead, &.{.{ .expert = 5, .slot = 2 }}, keep.admitReadAhead(&.{ 5, 6 }, &ra));
+    try testing.expectEqual(@as(usize, 2), stock.admitReadAhead(&.{ 5, 6 }, &ra).len);
+    try testing.expectEqual(@as(?u32, 0), keep.slotOf(3));
+    try testing.expectEqual(@as(?u32, null), stock.slotOf(3));
+    // A full layer: a prompt's misses are no seed, and are served transient with no eviction.
+    keep.prepareSeed(&.{ 7, 7, 7, 8 });
+    try testing.expect(!keep.seed.isSet(7) and !keep.seed.isSet(8));
+    var out: Plan = .{};
+    keep.plan(&.{ 7, 3, 8 }, .prefill, &out);
+    try checkPlan(&keep, &.{ 7, 3, 8 }, &out, max_route_ids);
+    try testing.expectEqual(@as(u32, 0), out.n_evictions);
+    for (out.loadsOf()) |l| try testing.expect(!l.persistent);
+    var buf: [16]u16 = undefined;
+    try testing.expectEqualSlices(u16, &.{ 3, 4, 5 }, residentsOf(&keep, &buf));
+    // A seed promotion finds no empty row and takes none.
+    stock.prepareSeed(&.{ 9, 9, 9 });
+    try testing.expect(stock.seed.isSet(9));
+    stock.prompt_keep = true;
+    try testing.expectEqual(@as(?u32, null), stock.admitSeed(9, &.{}));
+    stock.prompt_keep = false;
+    try testing.expect(stock.admitSeed(9, &.{}) != null);
+    // Decode is the stock policy's, plan for plan, evictions included.
+    var twin = try LayerPolicy.init(a, 16, 3);
+    defer twin.deinit(a);
+    twin.prompt_keep = true;
+    var plain = try LayerPolicy.init(a, 16, 3);
+    defer plain.deinit(a);
+    var o1: Plan = .{};
+    var o2: Plan = .{};
+    for ([_][]const u16{ &.{ 1, 2 }, &.{ 3, 1 }, &.{ 4, 5 }, &.{ 6, 2 }, &.{ 1, 7 } }) |ids| {
+        twin.plan(ids, .decode, &o1);
+        plain.plan(ids, .decode, &o2);
+        try testing.expectEqualSlices(Load, o2.loadsOf(), o1.loadsOf());
+        try testing.expectEqualSlices(Eviction, o2.evictionsOf(), o1.evictionsOf());
+    }
+}
+
 test "expert policy: tally: ratio 0 plans exactly as no tally; a request's end gives each expert's share of the decode routes and seeds the pins" {
     const a = testing.allocator;
     var p = try LayerPolicy.init(a, 32, 5);

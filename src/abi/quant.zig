@@ -26,9 +26,20 @@ pub const Source = extern struct {
     /// `ctx` is an SDK `Resident` whose map an in-tree model may take (`Resident.take`). A flag, not `get`'s address:
     /// every compile unit holds its own copy of the function.
     resident: bool = false,
+    /// Lets go of the source's own handle `a` (a tensor `get` handed out) before the source's life ends: `get` and the
+    /// engine's reads after the load no longer see it, and the caller holds no borrowed handle of it. True when the
+    /// source held it. Null = every tensor kept for the source's life. Appended: called only where `size` reaches it.
+    release: ?*const fn (ctx: ?*anyopaque, a: Array) callconv(.c) bool = null,
 
     pub fn tensor(self: *const Source, name: []const u8) Array {
         return self.get(self.ctx, Str.of(name));
+    }
+
+    /// `release`; false on a source without it.
+    pub fn releaseTensor(self: *const Source, a: Array) bool {
+        if (self.size < @offsetOf(Source, "release") + @sizeOf(?*const anyopaque)) return false;
+        const f = self.release orelse return false;
+        return f(self.ctx, a);
     }
 };
 
@@ -202,6 +213,11 @@ pub const Bank = extern struct {
     /// depend on the call's other rows, so a model may join several prompt spans' rows into one call. False: not
     /// declared. Appended: read only where `size` reaches it.
     rows_independent: bool = false,
+    /// `rows` for a decode-phase call (at most `decode_ids` ids) with `hoist`, an array the call does not read (the
+    /// model's shared expert over the same rows): the bank may commit it while the call waits for its reads. `out` is
+    /// `rows`' sum word for word; the model adds `hoist` itself. Null: not offered. Appended: read only where `size`
+    /// reaches it.
+    rows_hoist: ?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, hoist: Array, out: *Array) callconv(.c) Verdict = null,
 };
 
 pub const Swiglu = extern struct {
@@ -256,6 +272,36 @@ test "abi quant: a bank's independent prompt rows are declared after every earli
     try testing.expect(@offsetOf(Bank, "rows_independent") > @offsetOf(Bank, "meters"));
     const b: Bank = .{ .close = undefined, .decode_ids = 1, .rows = undefined, .settle = undefined, .phase = undefined, .read_ahead = undefined };
     try testing.expect(!b.rows_independent);
+}
+
+test "abi quant: a bank's hoisted decode call is declared after every earlier member" {
+    // Appended: a bank built before it ends at `rows_hoist`, and the host reads it as not offered.
+    try testing.expect(@offsetOf(Bank, "rows_hoist") > @offsetOf(Bank, "rows_independent"));
+    const b: Bank = .{ .close = undefined, .decode_ids = 1, .rows = undefined, .settle = undefined, .phase = undefined, .read_ahead = undefined };
+    try testing.expect(b.rows_hoist == null);
+}
+
+test "abi quant: a source's release is called only where its size reaches it" {
+    const F = struct {
+        var calls: u32 = 0;
+        fn get(_: ?*anyopaque, _: Str) callconv(.c) Array {
+            return .{};
+        }
+        fn release(_: ?*anyopaque, a: Array) callconv(.c) bool {
+            calls += 1;
+            return a.ctx != null;
+        }
+    };
+    var x: u8 = 0;
+    var src: Source = .{ .ctx = null, .get = &F.get, .release = &F.release };
+    try testing.expect(src.releaseTensor(.{ .ctx = &x }));
+    // A host built before the field: its source ends before `release`.
+    src.size = @offsetOf(Source, "release");
+    try testing.expect(!src.releaseTensor(.{ .ctx = &x }));
+    // A source without it keeps every tensor.
+    src = .{ .ctx = null, .get = &F.get };
+    try testing.expect(!src.releaseTensor(.{ .ctx = &x }));
+    try testing.expectEqual(@as(u32, 1), F.calls);
 }
 
 test "abi quant: a post-SiLU SwiGLU limit reaches only a table that declares it" {

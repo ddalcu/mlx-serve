@@ -176,7 +176,8 @@ final class ChatWorkspaceTests: XCTestCase {
                       "Sources/MLXServe/Views/AgentsWindow.swift",
                       // Models ▸ Plugins reads the download manager for its pack rows.
                       "Sources/MLXServe/Views/PluginsPane.swift",
-                      "Sources/MLXServe/Views/TerminalPane.swift"]
+                      "Sources/MLXServe/Views/TerminalPane.swift",
+                      "Sources/MLXServe/Views/TemplatesPane.swift"]
         let pattern = try NSRegularExpression(pattern: #"@EnvironmentObject\s+var\s+\w+\s*:\s*(\w+)"#)
         var types = Set<String>()
         for path in hosted {
@@ -601,10 +602,10 @@ final class ChatWorkspaceTests: XCTestCase {
     /// would switch the window to a blank column.
     func testEveryGeneratorStillHasAPage() throws {
         let chat = try source("Sources/MLXServe/Views/ChatView.swift")
-        for view in ["ImageGenView()", "VideoGenView()", "AudioGenView()", "Model3DGenView()"] {
+        for view in ["TemplatesPane(", "ImageGenView()", "VideoGenView()", "AudioGenView()", "Model3DGenView()"] {
             XCTAssertTrue(chat.contains(view), "create mode must host \(view)")
         }
-        XCTAssertEqual(GenExperiment.allCases.count, 4,
-                       "a fifth generator needs a case in ChatDetailView.createPane")
+        XCTAssertEqual(GenExperiment.allCases.count, 5,
+                       "a sixth generator needs a case in ChatDetailView.createPane")
     }
 }

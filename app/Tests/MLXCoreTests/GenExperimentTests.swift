@@ -15,7 +15,7 @@ final class GenExperimentTests: XCTestCase {
     /// regression this pins (3D is the fourth).
     func testSectionHasExactlyTheMediaToolsInOrder() {
         XCTAssertEqual(GenExperiment.allCases.map(\.title),
-                       ["Image", "Video", "Audio", "3D"])
+                       ["Quick Create", "Image", "Video", "Audio", "3D"])
     }
 
     /// Every tile has a non-empty tooltip naming its modality — the tile

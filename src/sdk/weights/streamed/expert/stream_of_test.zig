@@ -109,6 +109,51 @@ test "dsv41 bank contract: a MiMo-shaped MXFP4 bank (6 components, gate/up 4) st
     }
 }
 
+test "expert stream: prompt_keep reaches every layer's policy; its prompt routes serve each slot its record and evict no resident" {
+    var layers = [_]MxBank.Layer{ MxBank.layerOf(256, 128), MxBank.layerOf(256, 128) };
+    const rec = layers[0].logical_bytes;
+    const n_experts: u32 = 24;
+    const image = try testing.allocator.alloc(u8, rec * n_experts * layers.len);
+    defer testing.allocator.free(image);
+    for (image, 0..) |*b, k| b.* = @truncate(k *% 2654435761 >> 9);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "experts.bin", .data = image });
+    var root: [512]u8 = undefined;
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/experts.bin", .{root[0..try tmp.dir.realPath(testing.io, &root)]}, 0);
+    defer testing.allocator.free(path);
+    const fd = try contract.openUncached(path.ptr, null);
+    defer fd.close();
+    const bank: MxBank.Bank = .{ .layers = &layers, .n_experts = n_experts, .sidecar = fd, .record_bytes = rec };
+    // The same prompt routes with and without the switch: only the stock stream evicts.
+    var evictions: [2]u64 = undefined;
+    for ([_]bool{ false, true }, &evictions) |keep, *ev| {
+        const s = try MxStream.init(testing.allocator, &bank, .{ .rows = &.{ 4, 3 }, .max_route_ids = 8, .transient_rows = 8, .prompt_keep = keep, .pool = .{ .workers = 2, .staging_bytes = 65536, .tickets = 256 } });
+        defer s.deinit();
+        for (s.layers) |*ls| try testing.expectEqual(keep, ls.policy.prompt_keep);
+        var rng = std.Random.DefaultPrng.init(11);
+        var ids: [8]u16 = undefined;
+        for (0..40) |step| {
+            const l: u32 = @intCast(step % 2);
+            const n = 1 + rng.random().uintLessThan(usize, ids.len);
+            var k: usize = 0;
+            while (k < n) {
+                const e = rng.random().uintLessThan(u16, @intCast(n_experts));
+                if (std.mem.indexOfScalar(u16, ids[0..k], e) == null) {
+                    ids[k] = e;
+                    k += 1;
+                }
+            }
+            const r = try s.serve(l, ids[0..n]);
+            try s.expectServed(r, ids[0..n], image);
+            s.release(r);
+        }
+        ev.* = s.counters.expert_cache_evictions;
+    }
+    try testing.expect(evictions[0] > 0);
+    try testing.expectEqual(@as(u64, 0), evictions[1]);
+}
+
 test "dsv41 bank contract: a top-8 arch's lookahead measures tau from each row's eighth score, a top-6 arch's from its sixth" {
     const a = testing.allocator;
     // One row over 16 experts, scores 15 - e: the 6th score is 10, the 8th is 8. With tau 1 and k 10, a top-6 selector keeps

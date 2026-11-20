@@ -67,10 +67,14 @@ enum PromptRewriter {
     /// so a picture with text is written as Qwen's own prompt enhancer writes it.
     /// `mossCanvas`: MOSS-Image, whose reply may be a pixel layout draft for
     /// that canvas (compiled by `finish`).
+    /// `detailedCaption`: MiniMax-H3-Image, whose text-to-image prompt is one detailed caption.
     static func image(text: String, editing: Bool, groups: [ImagePromptExampleGroup], denseText: Bool,
-                      mossCanvas: MossLayout.Canvas? = nil) -> Request {
+                      mossCanvas: MossLayout.Canvas? = nil, detailedCaption: Bool = false) -> Request {
         // An edit repertoire has up to eight groups: two each keeps the system prompt short.
         let examples = groups.flatMap { $0.examples.prefix(2) }.map(\.body)
+        if detailedCaption && !editing {
+            return request(noun: "image prompt", shape: detailedCaptionShape, examples: examples, text: text)
+        }
         if editing {
             return request(noun: "image edit instruction",
                            shape: "Write ONE imperative instruction about the attached picture, like the examples: what to change and what must stay the same.",
@@ -97,6 +101,24 @@ enum PromptRewriter {
         Write one or two sentences of plain prose like the examples: subject, setting, lighting, composition, medium. \
         Put any text that must appear in the picture in double quotes, word for word: never drop, shorten or reword it.
         """
+
+    /// MiniMax-H3-Image was trained on long captions written by MiniMax's expander (MiniMax-H3-Image-PE): what the
+    /// image is, then each element where it sits, then the light. Written from its published examples, not copied.
+    private static let detailedCaptionShape = """
+        Write ONE paragraph of plain English that describes the whole picture in detail, like the examples:
+        - Open with what the image is (a photograph, an illustration, a poster, a screenshot), its viewpoint and framing.
+        - Then the main subject: what it is, how it looks, what it wears, its pose and expression, what it holds or touches.
+        - Then every other element, each placed in the frame (on the left, in the upper right corner, behind the subject).
+        - Close with the setting, the light (its direction and colour), the palette and the lens or medium.
+        Keep every fact the user gave: names, numbers, colours and how many main subjects there are. \
+        A named character, person, place or product keeps its exact name and gets no looks the user did not give \
+        (face, hair, costume, colours): the image model already knows it, and a wrong detail overrides that. \
+        Describe only what can be seen: no moods, stories or sounds. \
+        Put any text in the picture in double quotes, word for word, and say where it sits; \
+        a poster, chart, menu or screen is described region by region in reading order. \
+        Write in English whatever the language of the request, keeping quoted text as given. Aim for 120 to 220 words.
+        """
+
 
     /// Condensed from the text-image rules of Qwen-Image's prompt enhancer
     /// (QwenLM/Qwen-Image `prompt_utils_2512.py`, Apache-2.0; see NOTICE).

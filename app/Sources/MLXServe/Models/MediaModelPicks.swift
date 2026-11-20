@@ -60,10 +60,11 @@ enum MediaModelPicks {
 /// not the architecture. They're also the grouping key, so two models sharing a
 /// label are treated as a ranking and only the better one is featured.
 extension ImageModelPreset {
-    /// Qwen-Image edits too, but it stays a generator first: moving it into
-    /// the editor group would change which model each group features.
+    /// Qwen-Image and MiniMax-H3-Image edit too, but they stay generators first:
+    /// moving them into the editor group would change which model each group features.
     var capabilityLabel: String {
         let editsFirst = supportsReferenceEdit && variant != .qwenImage21 && variant != .qwenImage21Turbo
+            && variant != .minimaxH3Image
         return editsFirst ? "Best for editing photos" : "Best for creating images"
     }
 }
