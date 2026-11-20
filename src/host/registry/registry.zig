@@ -247,6 +247,9 @@ pub const LoadedModel = struct {
     /// An engine beside MLX serving this model (ds4 or llama.cpp for a GGUF, the Neural Engine for an MLX pack;
     /// `host/engines/`): the MLX fields stay null. A GGUF's tokenizer and template are the engine's.
     engine: ?*Served = null,
+    /// This load claims the process's ds4 engine; retained through eviction. Loading claims set it before
+    /// native open; publication derives it from the opened engine, including eager startup loads.
+    ds4_route: bool = false,
     /// Whether src/sdk/quant/gguf would claim this (unloaded) entry; answered
     /// once, on the first `/v1/models` render.
     mlx_gguf_claim: ?bool = null,
@@ -490,7 +493,6 @@ pub const LoadedModel = struct {
             self.tokenize_cache = null;
         }
     }
-
 };
 
 /// Snapshot of a single entry, returned by `ModelRegistry.snapshot` for
@@ -1051,6 +1053,24 @@ pub const ModelRegistry = struct {
         }
     }
 
+    /// ds4 has process-wide model globals and exits on a second open. Evict an idle owner; refuse another load
+    /// while that owner is busy, loading or evicting.
+    pub fn ds4EngineVictimLocked(self: *ModelRegistry, exclude_id: []const u8, incoming_ds4: bool) error{Ds4EngineBusy}!?*LoadedModel {
+        if (!incoming_ds4) return null;
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (std.mem.eql(u8, entry.id, exclude_id) or !entry.ds4_route) continue;
+            if (entry.state != .ready and entry.state != .loading and entry.state != .evicting) continue;
+            if (entry.state != .ready or entry.refcount.load(.acquire) != 0) {
+                log.err("{s}: refused: {s} holds the process ds4 engine and is busy\n", .{ exclude_id, entry.id });
+                return error.Ds4EngineBusy;
+            }
+            return entry;
+        }
+        return null;
+    }
+
     /// Release a borrowed pointer obtained from `ensureLoaded`. Decrements
     /// the refcount and bumps `last_used_ns` so LRU picks an older entry
     /// over this one next. Wakes anyone waiting on eviction.
@@ -1146,6 +1166,7 @@ pub const ModelRegistry = struct {
         self.releaseReservationLocked(entry); // pending estimate → actual residency
         entry.bytes_resident = bytes_resident;
         generations().last_unload.consume(bytes_resident);
+        entry.ds4_route = if (entry.engine) |engine| engine.kind == .ds4 else false;
         entry.state = .ready;
         entry.error_name = null;
         self.lru_clock += 1;
@@ -1224,12 +1245,22 @@ pub const ModelRegistry = struct {
     /// too small) — in which case any victims marked here are rolled back so
     /// the registry is left untouched. Caller holds `mutex` and must drain each
     /// returned victim's refcount, then hand them to the load request to free.
-    pub fn planEvictionsLocked(self: *ModelRegistry, exclude_id: []const u8, out: []*LoadedModel, live_bytes: u64) ?usize {
+    pub fn planEvictionsLocked(self: *ModelRegistry, exclude_id: []const u8, forced: ?*LoadedModel, out: []*LoadedModel, live_bytes: u64) ?usize {
         var n: usize = 0;
         var freed: u64 = 0;
         // Live bytes a victim gives back: its weights and its hot prefix cache.
         var freed_live: u64 = 0;
         var freed_slots: u32 = 0;
+        // An exclusive-resource holder (the process's one ds4 engine) goes first:
+        // the new load cannot proceed beside it regardless of what the caps say.
+        if (forced) |v| {
+            self.markEvictingLocked(v);
+            out[0] = v;
+            n = 1;
+            freed = v.bytes_resident;
+            freed_live = liveBytesFreed(v);
+            freed_slots = @intFromBool(takesSlot(v));
+        }
         const loading_slot: u32 = if (self.entries.get(exclude_id)) |e| @intFromBool(takesSlot(e)) else 1;
         while (true) {
             // Resident-after-plan = current minus what these victims free, plus
@@ -2161,7 +2192,7 @@ test "planEvictions: evicts one LRU victim to fit the memory budget" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    const n = reg.planEvictionsLocked(c.id, &buf, 0).?;
+    const n = reg.planEvictionsLocked(c.id, null, &buf, 0).?;
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqualStrings("a", buf[0].id); // LRU victim
     try testing.expectEqual(LoadState.evicting, buf[0].state);
@@ -2178,9 +2209,9 @@ test "planEvictions: live memory above the billed weights forces an eviction" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(c.id, &buf, 0));
+    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(c.id, null, &buf, 0));
     // KV, caches and a wired table put 95 bytes live: 95 + 10 > 100.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 95));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, null, &buf, 95));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
@@ -2199,7 +2230,7 @@ test "planEvictions: an idle victim's prefix cache counts as freed live memory (
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
     // 95 live = a's 40 weights + its 50-byte cache + 5: evicting a leaves 5 + 50 <= 100.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, &buf, 95));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, null, &buf, 95));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
@@ -2215,7 +2246,7 @@ test "planEvictions: a victim frees the live bytes its load measured, not just i
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
     // 85 live, 80 of them a's: evicting a leaves 5 + 50 <= 100.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, &buf, 85));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, null, &buf, 85));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
@@ -2231,7 +2262,7 @@ test "planEvictions: multi-victim — evicts as many as needed to fit" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    const n = reg.planEvictionsLocked(d.id, &buf, 0).?;
+    const n = reg.planEvictionsLocked(d.id, null, &buf, 0).?;
     try testing.expectEqual(@as(usize, 2), n); // a and b (the two oldest)
 }
 
@@ -2245,7 +2276,7 @@ test "planEvictions: returns null and rolls back when every victim is pinned" {
     const b = try beginLoad(reg, "b", 80); // 80 + 80 = 160 > 100 → must evict a
     reg.mutex.lockUncancelable(io);
     var buf: [16]*LoadedModel = undefined;
-    const plan = reg.planEvictionsLocked(b.id, &buf, 0);
+    const plan = reg.planEvictionsLocked(b.id, null, &buf, 0);
     try testing.expectEqual(@as(?usize, null), plan); // can't evict the pinned victim
     try testing.expectEqual(LoadState.ready, a.state); // rolled back, not left .evicting
     // Scheduler then rolls back the load → releases the reservation.
@@ -2309,7 +2340,7 @@ test "reservation: concurrent in-flight load is visible in the budget gate" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, &buf, 0));
+    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, null, &buf, 0));
 }
 
 test "planEvictions: a transcription's aligner and diarizer take no model slot" {
@@ -2328,12 +2359,12 @@ test "planEvictions: a transcription's aligner and diarizer take no model slot" 
     reg.reserveLoadLocked(diarizer, 10);
     var buf: [16]*LoadedModel = undefined;
     // chat and asr fill the two slots; the companions sit beside them.
-    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(diarizer.id, &buf, 0));
+    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(diarizer.id, null, &buf, 0));
     reg.markReadyLocked(diarizer, 10);
     // A third model that takes a slot evicts the oldest that holds one, never a companion.
     try testing.expect(reg.tryBeginLoadLocked(image));
     reg.reserveLoadLocked(image, 10);
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(image.id, &buf, 0));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(image.id, null, &buf, 0));
     try testing.expectEqual(chat, buf[0]);
 }
 
@@ -2348,7 +2379,7 @@ test "planEvictions: another model still loading counts against the model cap" {
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
     // a + b + c would be three models under a cap of two: `a` has to go.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 0));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, null, &buf, 0));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
@@ -2596,6 +2627,80 @@ test "ModelRegistry: registerByPath registers under the caller's org/name id" {
     try testing.expect(reg.peek("org/name") != null);
     try testing.expectEqualStrings(id, try reg.registerByPath(io, path, "org/name"));
     try testing.expectEqual(@as(usize, 1), reg.entries.count());
+}
+
+test "ModelRegistry: a second ds4 GGUF unloads an idle ds4 model and is refused by a busy one" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const first = try makeReadyStub(reg, "first-gguf", 180_000_000_000);
+    first.ds4_route = true;
+    const plain = try makeReadyStub(reg, "plain", 20_000_000_000);
+    const second = try beginLoad(reg, "second-gguf", 100);
+
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    // A load that does not open ds4 is unaffected; a reload of the same id is not a second engine.
+    try testing.expect(try reg.ds4EngineVictimLocked("plain", false) == null);
+    try testing.expect(try reg.ds4EngineVictimLocked("first-gguf", true) == null);
+    // Busy: refused, nothing marked.
+    _ = first.refcount.fetchAdd(1, .acq_rel);
+    try testing.expectError(error.Ds4EngineBusy, reg.ds4EngineVictimLocked("second-gguf", true));
+    try testing.expectEqual(LoadState.ready, first.state);
+    try testing.expectEqual(LoadState.ready, plain.state);
+    first.refcount.store(0, .release);
+    // Idle: the plan evicts it although both caps hold.
+    const victim = (try reg.ds4EngineVictimLocked("second-gguf", true)).?;
+    try testing.expectEqualStrings("first-gguf", victim.id);
+    var buf: [16]*LoadedModel = undefined;
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(second.id, victim, &buf, 0));
+    try testing.expectEqual(LoadState.evicting, first.state);
+    try testing.expectEqual(LoadState.ready, plain.state);
+    reg.unmarkEvictingLocked(first);
+    reg.markUnloadedLocked(second);
+}
+
+test "ModelRegistry: a second ds4 GGUF is refused while the owner is loading or evicting" {
+    const reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const first = try makeReadyStub(reg, "first-gguf", 100);
+    first.ds4_route = true;
+    const second = try reg.registerStub("second-gguf", "/second-gguf", 100);
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    for ([_]LoadState{ .loading, .evicting }) |state| {
+        first.state = state;
+        try testing.expectError(error.Ds4EngineBusy, reg.ds4EngineVictimLocked(second.id, true));
+        try testing.expectEqual(state, first.state);
+        try testing.expectEqual(LoadState.unloaded, second.state);
+        try testing.expect(try reg.ds4EngineVictimLocked(second.id, false) == null);
+    }
+    first.state = .ready;
+    try testing.expectEqual(first, (try reg.ds4EngineVictimLocked(second.id, true)).?);
+    reg.markUnloadedLocked(first);
+    try testing.expect(try reg.ds4EngineVictimLocked(second.id, true) == null);
+}
+
+test "ModelRegistry: ds4 ownership follows the published native engine including eager loads" {
+    const reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const first = try reg.registerStub("first-gguf", "/first-gguf", 100);
+    var engine: Served = undefined;
+    engine.kind = .ds4;
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    try testing.expect(reg.tryBeginLoadLocked(first));
+    try testing.expect(!first.ds4_route);
+    first.engine = &engine;
+    defer first.engine = null;
+    reg.markReadyLocked(first, 100);
+    try testing.expect(first.ds4_route);
+    try testing.expectEqual(first, (try reg.ds4EngineVictimLocked("second-gguf", true)).?);
+    reg.markUnloadedLocked(first);
+    try testing.expect(reg.tryBeginLoadLocked(first));
+    engine.kind = .llama;
+    reg.markReadyLocked(first, 100);
+    try testing.expect(!first.ds4_route);
+    try testing.expect(try reg.ds4EngineVictimLocked("second-gguf", true) == null);
 }
 
 test "UnloadMark: models unloaded together count as one pending release" {

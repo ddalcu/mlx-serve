@@ -1,6 +1,7 @@
 //! handleAnthropicStreaming, delta/thinking emitters
 
 const std = @import("std");
+const abi = @import("../../abi/engine.zig");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
@@ -76,6 +77,7 @@ pub fn handleAnthropicStreaming(
     allow_batch_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     media: []const MediaSpan,
+    engine_media: []const abi.Media,
     mrope: MropeData,
     cache_key: u64,
     /// Wave 1.A: per-request KV-quant override.
@@ -133,6 +135,7 @@ pub fn handleAnthropicStreaming(
         .logprobs_n = 0,
         .vision_embeddings = slot_ve_anth,
         .media = media,
+        .engine_media = engine_media,
         .cache_key = cache_key,
         .client = stream.client,
         .priority = stream.priority,

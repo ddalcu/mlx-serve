@@ -10,6 +10,13 @@ const testing = std.testing;
 
 const parseImageUrlContent = @import("request_media.zig").parseImageUrlContent;
 const decodeImageToPixels = @import("decode.zig").decodeImageToPixels;
+const LoadedModel = @import("../registry/registry.zig").LoadedModel;
+
+/// External engines own their image processor; the host hands them decoded RGB8.
+pub fn visionPreprocForModel(lm: *const LoadedModel, config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
+    if (lm.engine) |e| if (e.caps().images) return .{ .mode = .plugin_rgb };
+    return visionPreprocFromConfig(config);
+}
 
 /// Decode a JPEG/PNG image buffer to float32 CHW pixels, resized to target_size.
 /// Uses stb_image for decoding, then nearest-neighbor resize + CHW conversion.
@@ -101,6 +108,29 @@ pub fn logVisionPixelClamp(declared: u32) void {
 }
 
 // ── tests ──
+
+test "engine image transport decodes RGB without an MLX tower or plugin config" {
+    const a = testing.allocator;
+    const Served = @import("../engines/served.zig").Served;
+    var engine: Served = undefined;
+    engine.info = std.mem.zeroes(@import("../../abi/engine.zig").Info);
+    engine.info.caps.images = true;
+    var lm: @import("../registry/registry.zig").LoadedModel = undefined;
+    lm.engine = &engine;
+    lm.vision_encoder = null;
+    const config = model_mod.ModelConfig{ .qwen_vision = true };
+    const vp = visionPreprocForModel(&lm, &config);
+    try testing.expectEqual(.plugin_rgb, vp.mode);
+    const url = try @import("request_media.zig").solidPngUrl(a, 3, 2, .{ 11, 22, 33, 255 });
+    defer a.free(url);
+    const img = parseImageUrlContent(a, url, vp) orelse return error.TestUnexpectedNull;
+    defer a.free(img.pixels);
+    try testing.expectEqual(@as(u32, 3), img.width);
+    try testing.expectEqual(@as(u32, 2), img.height);
+    try testing.expectEqualSlices(u8, &.{ 11, 22, 33, 11, 22, 33, 11, 22, 33, 11, 22, 33, 11, 22, 33, 11, 22, 33 }, img.pixels);
+    lm.engine = null;
+    try testing.expectEqual(.qwen, visionPreprocForModel(&lm, &config).mode);
+}
 
 test "visionPreprocFromConfig threads each tower's processor bounds" {
     const qwen = visionPreprocFromConfig(&.{

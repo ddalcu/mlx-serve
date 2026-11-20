@@ -15,6 +15,32 @@ const LoadedModel = model_registry_mod.LoadedModel;
 const ollama_mod = @import("ollama/translate.zig");
 const testing = std.testing;
 
+test "engine image transport atoms survive text-only and typed chat templates" {
+    const a = testing.allocator;
+    const images = [_]chat_mod.ImageData{
+        .{ .pixels = &.{}, .width = 1, .height = 1 },
+        .{ .pixels = &.{}, .width = 1, .height = 1 },
+    };
+    const messages = [_]chat_mod.Message{.{ .role = "user", .content = "compare", .images = &images }};
+    const templates = [_][]const u8{
+        "{% for m in messages %}{{ m.content }}{% endfor %}",
+        "{% for m in messages %}{% if m.content is string %}{{ m.content }}{% else %}{% for p in m.content %}{% if p.type == 'image' %}unreadable{% else %}{{ p.text }}{% endif %}{% endfor %}{% endif %}{% endfor %}",
+    };
+    for (templates) |template| {
+        const config = chat_mod.ChatConfig{
+            .chat_template = template,
+            .bos_token = null,
+            .eos_token = null,
+            .add_bos_token = false,
+            .allocator = a,
+            .image_placeholder = "<start><image><end>",
+        };
+        const rendered = try chat_mod.renderChatTemplate(a, &messages, &config, null, null, false, null, false);
+        defer a.free(rendered);
+        try testing.expectEqualStrings("<start><image><end>\n\n<start><image><end>\n\ncompare", rendered);
+    }
+}
+
 /// Returns the number of trailing bytes that form an incomplete UTF-8 sequence.
 /// If the string ends with a complete codepoint (or is empty), returns 0.
 pub fn utf8TrailingIncomplete(s: []const u8) usize {
