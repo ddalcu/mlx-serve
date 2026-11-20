@@ -728,6 +728,7 @@ pub fn register(set: *kc.Set) !void {
 
 test "dsv41 dec in_proj: the declared launches are the shipped wrapper's, byte for byte" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    if (device.deviceGeneration().gen < first_gen) return error.SkipZigTest; // the wrapper declines there
     const gpa = testing.allocator;
     const kn = try Kernels.build();
     defer kn.deinit();
@@ -767,7 +768,7 @@ test "dsv41 dec in_proj: the registered kernels pass the contract's gates 1-4" {
     try kit.gates.runAll(gpa, set.kernels.items, 0xc0de, &t);
     std.debug.print("[dec] in_proj contract: {d}/{d} launches pass gates 1-4 (virtual GPU {})\n", .{ t.passed, t.kernels, mlx.virtualGpu() });
     try testing.expectEqual(@as(usize, 0), t.problems());
-    try testing.expectEqual(set.kernels.items.len, t.kernels);
+    try testing.expectEqual(set.kernels.items.len, t.kernels + t.skipped);
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────
@@ -962,6 +963,7 @@ fn expectLayer(gpa: std.mem.Allocator, fx: *fixture.Fixture, k: *const Kernels, 
 test "dsv41 dec in_proj: layers 20..25 and 2..4 (KV sources, index sources, plain) match today's chain at R = 1, 2, 4, 6" {
     if (mlx.virtualGpu()) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (device.deviceGeneration().gen < first_gen) return error.SkipZigTest; // the wrapper declines there
     const gpa = testing.allocator;
     const k = try Kernels.build();
     defer k.deinit();

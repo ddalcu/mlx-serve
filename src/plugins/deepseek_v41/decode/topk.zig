@@ -714,6 +714,8 @@ test "dsv41 dec topk: picks and candidate blocks equal the reference on scores w
     const gpa = testing.allocator;
     var ks = try Kernels.build();
     defer ks.deinit();
+    try probe(gpa, &ks, mlx.gpuStream());
+    const widest = ks.tg;
     const g: Geom = .{};
     var prng = std.Random.DefaultPrng.init(11);
     const rng = prng.random();
@@ -737,6 +739,7 @@ test "dsv41 dec topk: picks and candidate blocks equal the reference on scores w
             if (ceilDiv(c.n, g.bs) > g.kb) try refCand(gpa, scores[r * c.n ..][0..c.n], g.bs, lensOf(c, r), want_cand[r * g.kb ..][0..g.kb]);
         }
         for (widths) |tg| {
+            if (tg > widest) continue;
             ks.tg = tg;
             for ([_]bool{ false, true }) |made| {
                 var sc = Scope.init(gpa, mlx.gpuStream());
@@ -768,6 +771,8 @@ test "dsv41 dec topk: gathered picks equal the picks of the full row masked to t
     const gpa = testing.allocator;
     var ks = try Kernels.build();
     defer ks.deinit();
+    try probe(gpa, &ks, mlx.gpuStream());
+    const widest = ks.tg;
     const g: Geom = .{};
     var prng = std.Random.DefaultPrng.init(12);
     const rng = prng.random();
@@ -796,6 +801,7 @@ test "dsv41 dec topk: gathered picks equal the picks of the full row masked to t
             try refPicks(gpa, masked, g.k, lensOf(c, r), want[r * g.k ..][0..g.k]);
         }
         for (widths) |tg| {
+            if (tg > widest) continue;
             ks.tg = tg;
             var sc = Scope.init(gpa, mlx.gpuStream());
             defer sc.deinit();
@@ -926,6 +932,7 @@ test "dsv41 dec topk: picks and candidate blocks equal today's topkRows chain" {
     const gpa = testing.allocator;
     var ks = try Kernels.build();
     defer ks.deinit();
+    try probe(gpa, &ks, mlx.gpuStream());
     var m = try todayModel();
     defer _ = mlx.mlx_fast_metal_kernel_free(m.topk_kernel);
     const g: Geom = .{};
@@ -1156,6 +1163,7 @@ test "dsv41 dec topk: each declared launch is the wrapper's, byte for byte" {
     const a = testing.allocator;
     var ks = try Kernels.build();
     defer ks.deinit();
+    try probe(a, &ks, mlx.gpuStream());
     const g: Geom = .{};
     const Served = struct { l: *const metal.Launch, p: Sel.Params, shape: Shape, made: bool };
     for ([_]Served{
@@ -1173,7 +1181,7 @@ test "dsv41 dec topk: each declared launch is the wrapper's, byte for byte" {
             a.destroy(c);
         }
         try testing.expect(try c.prepare(sv.shape, .random, 7));
-        try c.run();
+        c.run() catch |e| if (e == error.ThreadgroupCap) continue else return e;
         const want = try a.dupe(u8, c.rig.outputBytes());
         defer a.free(want);
         var sc = Scope.init(a, mlx.gpuStream());
@@ -1201,7 +1209,7 @@ test "dsv41 dec topk: the kernel contract's gates 1-4 hold for every registered 
     try kc.gates.runAll(a, set.kernels.items, 0xc0de, &t);
     std.debug.print("[dec] topk contract: {d}/{d} launches pass gates 1-4 (virtual GPU {})\n", .{ t.passed, t.kernels, mlx.virtualGpu() });
     try testing.expectEqual(@as(usize, 0), t.problems());
-    try testing.expectEqual(set.kernels.items.len, t.passed);
+    try testing.expectEqual(set.kernels.items.len, t.passed + t.skipped);
 }
 
 const fixture = @import("fixture.zig");
@@ -1232,6 +1240,7 @@ test "dsv41 dec topk: the fixture's real scores at layers 20 and 24 give today's
     const gpa = testing.allocator;
     var ks = try Kernels.build();
     defer ks.deinit();
+    try probe(gpa, &ks, mlx.gpuStream());
     const g: Geom = .{};
     // More keys than the candidate source keeps blocks for: layer 20 has 20 000 keys, 2 500 blocks.
     const ctx = 20000;
