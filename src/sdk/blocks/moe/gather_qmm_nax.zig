@@ -568,8 +568,8 @@ pub fn sortedGateUp(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, 
 
 var scaled_engaged_logged = false;
 
-/// `MLX_SERVE_MOE_SCALED_PREFILL`: the paired kernel on banks with per-expert scales and the fused prefill weighted
-/// sum at hidden 6144 (`verify_kernels.moePrefillExpertReduce`); read on every call (a kill switch), unset = off.
+/// `MLX_SERVE_MOE_SCALED_PREFILL`: the paired kernel on banks with per-expert scales; read on every call (a kill
+/// switch), unset = off.
 pub fn scaledPrefillEnabled() bool {
     return if (env.get(.MLX_SERVE_MOE_SCALED_PREFILL)) |v| v[0] != '0' else scaled_prefill_default;
 }

@@ -97,8 +97,13 @@ pub fn moePrefillExpertReduce(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: m
     // Verify widths (<= 32 tokens) keep verifyExpertReduce's own gates.
     if (ss.len != 3 or ss[0] * ss[1] <= 32) return null;
     if (mlx.cudaAvailable()) return @import("moe_prefill_cuda.zig").weightedSum(s, down, inverse, scores);
-    // Hidden 6144 (top-k 8) behind `MLX_SERVE_MOE_SCALED_PREFILL`: prompt widths only (verify keeps its own list).
-    return expertReduceApply(s, down, inverse, scores, &prefill_expert_reduce_cfgs, @import("gather_qmm_nax.zig").scaledPrefillEnabled());
+    // Hidden 6144 (top-k 8) behind `MLX_SERVE_MOE_PREFILL_WSUM_6144`: prompt widths only (verify keeps its own list).
+    return expertReduceApply(s, down, inverse, scores, &prefill_expert_reduce_cfgs, wsum6144Enabled());
+}
+
+/// `MLX_SERVE_MOE_PREFILL_WSUM_6144`, read on every call (a kill switch); unset = off.
+pub fn wsum6144Enabled() bool {
+    return if (@import("../../../env.zig").get(.MLX_SERVE_MOE_PREFILL_WSUM_6144)) |v| v[0] != '0' else false;
 }
 
 /// `wide`: also hidden 6144 at top-k 8.
