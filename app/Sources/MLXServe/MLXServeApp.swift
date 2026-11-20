@@ -98,6 +98,7 @@ struct MLXCoreApp: App {
                 openVideoGen: { appState.showCreate(.video) },
                 openAudioGen: { appState.showCreate(.audio) },
                 openModel3DGen: { appState.showCreate(.model3d) },
+                openTemplates: { appState.showCreate(.templates) },
                 openSettings: { appState.showSettings() },
                 openServerLog: { openAndFocus("serverLog") },
                 openModelSettings: {

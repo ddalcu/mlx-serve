@@ -268,6 +268,9 @@ class AppState: ObservableObject {
     }()
     lazy var soundGen = SoundGenService()
     lazy var model3dGen = Model3DGenService()
+    /// Create ▸ Quick Create: the run in progress survives the pane unmounting.
+    lazy var templates = TemplateRunner()
+    lazy var cast = CastStore()
     /// The server always starts with the app; tests that build an AppState opt out.
     private let startServerAtLaunch: Bool
     /// Whether launch loads a model with the server (`StartupModelChoice.launch`).

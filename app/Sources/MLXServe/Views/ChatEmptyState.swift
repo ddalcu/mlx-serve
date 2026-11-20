@@ -34,9 +34,11 @@ enum ChatEmptyState {
         }
     }
 
-    /// The four generation windows behind the "Create Media" chip — and the
-    /// Tools menu's media section (same array, deliberately).
+    /// The Create pages behind the "Create Media" chip — and the Tools menu's
+    /// media section (same array, deliberately).
     static let mediaItems: [Item] = [
+        Item(id: "media-templates", title: "Quick Create", systemImage: "sparkles.rectangle.stack",
+             tint: .orange, action: .create(.templates)),
         Item(id: "media-image", title: "Image Generation", systemImage: "photo",
              tint: .purple, action: .create(.image)),
         Item(id: "media-video", title: "Video Generation", systemImage: "film",

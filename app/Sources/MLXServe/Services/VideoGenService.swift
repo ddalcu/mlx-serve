@@ -538,7 +538,8 @@ final class VideoGenService: ObservableObject {
     /// hijacks the Video window. `onProgress` drives the chat's own meter, which
     /// matters most here: this is the tool that takes minutes.
     func generateForAgent(_ request: VideoGenRequest, server: ServerManager,
-                          onProgress: ((MediaGenProgress) -> Void)? = nil) async throws -> String {
+                          onProgress: ((MediaGenProgress) -> Void)? = nil,
+                          onPreview: ((NSImage) -> Void)? = nil) async throws -> String {
         guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw MediaGenError.emptyInput("Prompt")
         }
@@ -555,6 +556,11 @@ final class VideoGenService: ObservableObject {
                                          message: message, startedAt: startedAt))
         }
         report(0, 0, "Loading model")
+        guard let refs = await Task.detached(priority: .userInitiated, operation: {
+            await Self.refPayloads(for: request)
+        }).value else {
+            throw MediaGenError.server(L10n.text("Couldn't read one of the reference files."))
+        }
 
         let (port, modelId, unloadId) = try await server.prepareGenModel(
             lanModelId: request.lanModelId, repo: request.model.repo)
@@ -564,11 +570,14 @@ final class VideoGenService: ObservableObject {
         do {
             var decoded: DecodedFrames? = nil
             let body = Self.requestBody(model: modelId, prompt: request.prompt,
-                                        request: request, firstFrameB64: nil, audioB64: nil)
+                                        request: request, firstFrameB64: nil, audioB64: nil, refs: refs)
             for try await ev in api.streamGeneration(
                 port: port, path: "/v1/video/generations", json: body) {
                 switch MediaSSE.classify(ev) {
                 case .progress(let step, let total, let stage):
+                    if let onPreview, let jpeg = MediaSSE.previewJPEG(ev), let img = NSImage(data: jpeg) {
+                        onPreview(img)
+                    }
                     report(step, total == 0 ? steps : total, MediaSSE.stageLabel(stage))
                 case .complete:
                     decoded = await offMain { Self.decodeFrames(ev) }
