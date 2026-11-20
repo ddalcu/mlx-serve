@@ -18,10 +18,21 @@ Each shard is an APFS clone of NVIDIA's (`cp -c`: no data copied) whose header i
 length (padded with spaces), so every tensor keeps its offsets; a shard with no change is a symlink. The index is
 written new. Runs on the box that holds the pack, never on a laptop:
 
-    python3 -I dsv41_nvfp4_pack.py SRC_DIR DST_DIR [--check] [--experts-mxfp4]
+    python3 -I dsv41_nvfp4_pack.py SRC_DIR DST_DIR [--check] [--experts-mxfp4 | --experts-nvfp4]
 
 `--check` re-reads DST and proves each converted tensor against SRC (codes byte for byte, every row scale against its
 block).
+
+`--experts-nvfp4` keeps the NVFP4 routed experts as MLX nvfp4 at group 16 in place (headers only, like the rest): the
+codes as U32 [out, in/8], `weight_scale` renamed `<base>.scales` (U8 e4m3 bytes, [out, in/16]). ModelOpt's per-expert
+global (`weight_scale_2`, F32, one an expert and projection) leaves the shard header and joins one side shard
+(`model-expert-scales.safetensors`) as BF16 [E] a layer and projection, named as the SDK block reads them
+(`sdk/quant/nvfp4/modelopt_pack.zig`) under DeepSeek's tree: w1's `layers.L.ffn.experts.gate_proj.expert_scale`
+(before the SiLU), w3's `layers.L.ffn.experts.up_proj.expert_scale` (before the swiglu clamp) and w2's
+`layers.L.ffn.experts.expert_scale` (on the routing weight). A global that is not finite and positive, or that BF16
+does not hold exactly, stops the conversion by name. `input_scale` (activations; MLX's nvfp4 reads bf16 inputs) leaves
+the header. Removed tensors stay as unnamed bytes in the clone. `--check` proves the codes and scales kept their
+bytes and every side global equals its source.
 
 `--experts-mxfp4` (numpy) writes the NVFP4 routed experts as MLX mxfp4 at group 32, which the model serves itself with
 no quant plugin. NVIDIA converted them from mxfp4 losslessly: in every 32-group, each 16-half that holds a nonzero
@@ -41,6 +52,10 @@ import subprocess
 import sys
 
 SIDE = "model-mxfp8-scales.safetensors"
+EXPERT_SIDE = "model-expert-scales.safetensors"
+# ModelOpt's per-projection global -> the side tensor's name under `layers.L.ffn.experts.` (DeepSeek clamps its SwiGLU:
+# the up scale stays apart, the down scale alone rides the routing weight).
+GLOBAL_NAMES = {"w1": "gate_proj.expert_scale", "w3": "up_proj.expert_scale", "w2": "expert_scale"}
 EXPERT_RE = __import__("re").compile(r"^(layers\.\d+\.ffn\.experts\.\d+\.w[123])\.(weight|weight_scale|weight_scale_2|input_scale)$")
 BLOCK = 32
 DTYPE_BYTES = {"F8_E4M3": 1, "F8_E8M0": 1, "U8": 1, "I8": 1, "U32": 4, "F32": 4, "BF16": 2, "F16": 2, "I32": 4, "I64": 8}
@@ -66,9 +81,9 @@ def nvfp4_expert(t, k):
     return m.group(1) if m and m.group(1) + ".weight_scale_2" in t else None
 
 
-def plan_shard(h, mx=False):
-    """The shard's new header, the side scales it owes ([(base, out, in, block-scale tensor)]) and, with `mx`, its
-    NVFP4 experts ([(base, out, in)])."""
+def plan_shard(h, mx=False, nv=False):
+    """The shard's new header, the side scales it owes ([(base, out, in, block-scale tensor)]) and, with `mx` or `nv`,
+    its NVFP4 experts ([(base, out, in)])."""
     meta = h.get("__metadata__")
     t = {k: v for k, v in h.items() if k != "__metadata__"}
     new = {}
@@ -77,6 +92,26 @@ def plan_shard(h, mx=False):
     changed = False
     for k, v in t.items():
         v = dict(v)
+        if nv and nvfp4_expert(t, k):
+            base = nvfp4_expert(t, k)
+            if k.endswith(".weight"):
+                out, half = v["shape"]
+                if v["dtype"] != "U8" or half % 8:
+                    raise SystemExit(f"{k}: NVFP4 codes other than U8 pairs in whole 16-groups")
+                v["dtype"], v["shape"] = "U32", [out, half // 4]
+                new[k] = v
+                experts.append((base, out, half * 2))
+            elif k.endswith(".weight_scale"):
+                out, half = t[base + ".weight"]["shape"]
+                if v["dtype"] != "F8_E4M3" or v["shape"] != [out, half * 2 // 16]:
+                    raise SystemExit(f"{k}: an NVFP4 scale other than one e4m3 per 16 along the row: {v}")
+                v["dtype"] = "U8"
+                new[base + ".scales"] = v
+            elif k.endswith(".weight_scale_2") and (v["dtype"] != "F32" or v["shape"] not in ([], [1])):
+                raise SystemExit(f"{k}: a global scale other than one F32: {v}")
+            # weight_scale_2 joins the side shard; input_scale (the activations') is not read.
+            changed = True
+            continue
         if mx and nvfp4_expert(t, k):
             if k.endswith(".weight"):
                 out, half = v["shape"]
@@ -216,11 +251,11 @@ def mx_init():
     E4M3 = e4m3_lut()
 
 
-def write_side(path, tensors):
+def write_side(path, tensors, dtype="U8"):
     hdr = {}
     off = 0
     for k, data, shape in tensors:
-        hdr[k] = {"dtype": "U8", "shape": shape, "data_offsets": [off, off + len(data)]}
+        hdr[k] = {"dtype": dtype, "shape": shape, "data_offsets": [off, off + len(data)]}
         off += len(data)
     hdr["__metadata__"] = {"format": "pt"}
     raw = json.dumps(hdr, separators=(",", ":")).encode()
@@ -281,7 +316,38 @@ def write_compact(sp, n, dp, new, extra):
     return off
 
 
-def convert(src, dst, mx=False):
+def bf16_bits(v):
+    """`v`'s BF16 bits when BF16 holds it exactly, else None."""
+    u = struct.unpack("<I", struct.pack("<f", v))[0]
+    return None if u & 0xFFFF else u >> 16
+
+
+def read_global(path, n, t):
+    return struct.unpack("<f", read_tensor(path, n, t)[:4])[0]
+
+
+def global_tensors(found):
+    """The side shard's tensors from {(layer, proj): {expert: global}}: BF16 [E] each, every expert present, every global
+    finite, positive and exact in BF16."""
+    out = []
+    for (layer, proj), g in sorted(found.items()):
+        name = f"{layer}.ffn.experts.{GLOBAL_NAMES[proj]}"
+        if sorted(g) != list(range(len(g))):
+            raise SystemExit(f"{name}: experts {sorted(set(range(max(g) + 1)) - set(g))} have no global")
+        data = bytearray()
+        for e in range(len(g)):
+            v = g[e]
+            if not (v == v and 0 < v < float("inf")):
+                raise SystemExit(f"{layer}.ffn.experts.{e}.{proj}.weight_scale_2: {v} is not a finite positive scale")
+            b = bf16_bits(v)
+            if b is None:
+                raise SystemExit(f"{layer}.ffn.experts.{e}.{proj}.weight_scale_2: {v!r} is not exact in BF16")
+            data += struct.pack("<H", b)
+        out.append((name, bytes(data), [len(g)]))
+    return out
+
+
+def convert(src, dst, mx=False, nv=False):
     os.makedirs(dst, exist_ok=True)
     idx = json.load(open(os.path.join(src, "model.safetensors.index.json")))
     shards = sorted(set(idx["weight_map"].values()))
@@ -290,18 +356,22 @@ def convert(src, dst, mx=False):
             raise SystemExit(f"{name}: missing in {src}")
     weight_map = {}
     side_tensors = []  # (key, bytes, shape)
+    found = {}  # (layer, proj) -> {expert: global}, with `nv`
     total = 0
     for name in shards:
         sp = os.path.join(src, name)
         dp = os.path.join(dst, name)
         n, h = read_header(sp)
-        new, side, changed, experts = plan_shard(h, mx)
+        new, side, changed, experts = plan_shard(h, mx, nv)
         if os.path.lexists(dp):
             os.remove(dp)
         for base, out, inn, bk in side:
             grid = read_tensor(sp, n, h[base + ".scale"])
             side_tensors.append((base + ".scales", expand(grid, out, inn), [out, inn // BLOCK]))
-        if experts:
+        for base, _, _ in experts if nv else ():
+            layer, e, proj = base.rsplit(".", 4)[0], int(base.split(".")[-2]), base.split(".")[-1]
+            found.setdefault((layer, proj), {})[e] = read_global(sp, n, h[base + ".weight_scale_2"])
+        if experts and mx:
             # Written whole: the NVFP4 scales leave the shard and the mxfp4 scales join it, so it bills what it holds.
             from multiprocessing import Pool
 
@@ -335,6 +405,13 @@ def convert(src, dst, mx=False):
         total += len(data)
     write_side(os.path.join(dst, SIDE), side_tensors)
     print(f"{SIDE}: {len(side_tensors)} row-scale tensors, {off} B", flush=True)
+    if nv:
+        globals_ = global_tensors(found)
+        write_side(os.path.join(dst, EXPERT_SIDE), globals_, "BF16")
+        for k, data, _ in globals_:
+            weight_map[k] = EXPERT_SIDE
+            total += len(data)
+        print(f"{EXPERT_SIDE}: {len(globals_)} per-expert global tensors over {len(found) // 3} layers", flush=True)
     meta = dict(idx.get("metadata", {}))
     meta["total_size"] = total
     meta["converted_by"] = "mlx-serve scripts/dsv41_nvfp4_pack.py"
@@ -367,7 +444,7 @@ def mx_same(job):
     return base, f"{bad} values differ" if bad else None
 
 
-def check(src, dst, mx=False):
+def check(src, dst, mx=False, nv=False):
     idx = json.load(open(os.path.join(dst, "model.safetensors.index.json")))
     sidx = json.load(open(os.path.join(src, "model.safetensors.index.json")))
     sn, sh = read_header(os.path.join(dst, SIDE))
@@ -375,6 +452,10 @@ def check(src, dst, mx=False):
     n_fp8 = n_fp4 = n_relabel = 0
     mx_jobs = []
     sides = {}
+    n_nv = 0
+    found = {}
+    if nv:
+        gn, gh = read_header(os.path.join(dst, EXPERT_SIDE))
     for name in sorted(set(sidx["weight_map"].values())):
         on, oh = read_header(os.path.join(src, name))
         nn, nh = read_header(os.path.join(dst, name))
@@ -383,6 +464,23 @@ def check(src, dst, mx=False):
             raise SystemExit(f"{name}: header length moved")
         for k, v in oh.items():
             if k == "__metadata__":
+                continue
+            if nv and nvfp4_expert(oh, k):
+                base = nvfp4_expert(oh, k)
+                if k.endswith(".weight") or k.endswith(".weight_scale"):
+                    nk = k if k.endswith(".weight") else base + ".scales"
+                    want = "U32" if k.endswith(".weight") else "U8"
+                    if nk not in nh or nh[nk]["data_offsets"] != v["data_offsets"] or nh[nk]["dtype"] != want or nbytes(nh[nk]) != nbytes(v):
+                        raise SystemExit(f"{k}: not kept in place as {nk} ({want})")
+                    if idx["weight_map"].get(nk) != name:
+                        raise SystemExit(f"{nk}: the index does not name {name}")
+                    n_nv += k.endswith(".weight")
+                    continue
+                if k in nh or k in idx["weight_map"]:
+                    raise SystemExit(f"{k}: still named")
+                if k.endswith(".weight_scale_2"):
+                    layer, e, proj = base.rsplit(".", 4)[0], int(base.split(".")[-2]), base.split(".")[-1]
+                    found.setdefault((layer, proj), {})[e] = read_global(os.path.join(src, name), on, v)
                 continue
             if mx and nvfp4_expert(oh, k):
                 if not k.endswith(".weight"):
@@ -442,7 +540,7 @@ def check(src, dst, mx=False):
             if idx["weight_map"].get(k) != name:
                 raise SystemExit(f"{k}: the index does not name {name}")
         # A sample of tensors byte for byte (clones share the blocks; this proves the header kept every offset).
-        keys = [] if compact else [k for k in oh if k != "__metadata__" and not k.endswith(".scale")]
+        keys = [] if compact else [k for k in oh if k != "__metadata__" and not k.endswith(".scale") and k in nh]
         for k in rng.sample(keys, min(4, len(keys))):
             a = read_tensor(os.path.join(src, name), on, oh[k])
             b = read_tensor(os.path.join(dst, name), nn, nh[k])
@@ -455,6 +553,14 @@ def check(src, dst, mx=False):
             bad = [r for r in pool.imap_unordered(mx_same, mx_jobs, chunksize=8) if r[1]]
         if bad:
             raise SystemExit(f"{len(bad)} experts differ, first {bad[0]}")
+    if nv:
+        for name, data, shape in global_tensors(found):
+            t = gh.get(name)
+            if t is None or t["dtype"] != "BF16" or t["shape"] != shape or read_tensor(os.path.join(dst, EXPERT_SIDE), gn, t) != data:
+                raise SystemExit(f"{name}: the side global differs from the experts' weight_scale_2")
+            if idx["weight_map"].get(name) != EXPERT_SIDE:
+                raise SystemExit(f"{name}: the index does not name {EXPERT_SIDE}")
+        print(f"check: {n_nv} NVFP4 projections kept as MLX nvfp4 in place, {len(found)} global vectors equal their sources")
     print(f"check: {n_fp8} fp8 grids expanded exactly, {n_fp4} fp4 scales renamed, {n_relabel} tensors relabelled, "
           f"{len(mx_jobs)} NVFP4 experts equal as mxfp4 value for value, offsets all kept")
 
@@ -464,8 +570,11 @@ if __name__ == "__main__":
     if len(args) != 2:
         raise SystemExit(__doc__)
     mx = "--experts-mxfp4" in sys.argv
+    nv = "--experts-nvfp4" in sys.argv
+    if mx and nv:
+        raise SystemExit("--experts-mxfp4 and --experts-nvfp4: one or the other")
     if mx:
         mx_init()
     if "--check" not in sys.argv:
-        convert(args[0], args[1], mx)
-    check(args[0], args[1], mx)
+        convert(args[0], args[1], mx, nv)
+    check(args[0], args[1], mx, nv)
