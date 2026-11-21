@@ -52,6 +52,7 @@ const toolCallFinishReason = @import("../chat/tools/pipeline.zig").toolCallFinis
 const shouldParseToolCalls = @import("../chat/tools/pipeline.zig").shouldParseToolCalls;
 const finishDetailsField = @import("../chat/tools/pipeline.zig").finishDetailsField;
 const parseToolCallsForRequest = @import("../chat/tools/pipeline.zig").parseToolCallsForRequest;
+const toolParseText = @import("../chat/tools/pipeline.zig").toolParseText;
 const getEffectiveContextLength = @import("admission.zig").getEffectiveContextLength;
 const logStreamError = @import("../http/errors.zig").logStreamError;
 const sendGenerationError = @import("../http/errors.zig").sendGenerationError;
@@ -1160,7 +1161,7 @@ fn handleNonStreamingGeneration(
     // Check for tool calls in the output
     if (has_tools and shouldParseToolCalls(result.finish_details)) {
         log.debug("  checking {d} bytes of generated text for tool calls\n", .{final_text.len});
-        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools);
+        const found_calls = try parseToolCallsForRequest(allocator, toolParseText(final_text, opens_think), tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
