@@ -205,14 +205,21 @@ pub const Policy = struct {
     /// First unverified drafts the next token decided, and how many of those it took: the switch's engagement line.
     free_seen: u64 = 0,
     free_hit: u64 = 0,
+    /// Time is the prior ladder in plain steps, never a stopwatch: the widths depend on the drafts and verdicts alone.
+    modeled: bool = false,
+
+    /// The unit time is priced in: a plain step under `modeled`, else ms.
+    fn unit(self: *const Policy, plain_ms: f32) f32 {
+        return if (self.modeled) 1 else plain_ms;
+    }
 
     /// Drafts to verify of `conf_logits` (the confidence head's logits, one per draft).
     pub fn verifyDrafts(self: *const Policy, conf_logits: []const f32, plain_ms: f32) usize {
         var p: [MAX_DRAFTS]f32 = undefined;
         const n = @min(conf_logits.len, p.len);
         for (conf_logits[0..n], p[0..n], 0..) |c, *o, k| o.* = self.calib.probability(k, sigmoid(c));
-        const costs = self.cost.costs(plain_ms);
-        return chooseRows(p[0..n], &costs, self.rate.perMs(plain_ms)).rows - 1;
+        const costs = self.cost.costs(self.unit(plain_ms));
+        return chooseRows(p[0..n], &costs, self.rate.perMs(self.unit(plain_ms))).rows - 1;
     }
 
     /// A drafted round verified `verified` of the drafts behind `conf_logits` and kept `accepted`. `next_hit`, when the
@@ -233,6 +240,12 @@ pub const Policy = struct {
 
     /// A drafted round of `rows` rows committed `tokens` in `took` ms.
     pub fn roundDone(self: *Policy, plain_ms: f32, rows: usize, tokens: usize, took: f32) void {
+        if (self.modeled) {
+            const steps = priorMs(1, @min(@max(rows, 1), MAX_ROWS));
+            self.rate.add(@floatFromInt(tokens), steps);
+            self.drafting.record(@floatFromInt(tokens), steps);
+            return;
+        }
         if (!std.math.isFinite(took) or took <= 0) return;
         const guess = self.cost.ms(plain_ms, @min(@max(rows, 1), MAX_ROWS));
         self.cost.sample(plain_ms, rows, took);
@@ -242,7 +255,7 @@ pub const Policy = struct {
 
     /// A plain tick took `took` ms.
     pub fn plainDone(self: *Policy, plain_ms: f32, took: f32) void {
-        self.rate.add(1, std.math.clamp(took, 0.5 * plain_ms, 2 * plain_ms));
+        self.rate.add(1, if (self.modeled) 1 else std.math.clamp(took, 0.5 * plain_ms, 2 * plain_ms));
     }
 };
 
@@ -419,4 +432,43 @@ test "policy2 Drafting: a cold start's stalls owe a few plain rounds, never a la
         old.record(2.8 * 17.7, if (drafted <= 5) 2000 else 1.9 * 17.7);
     }
     try testing.expect(old_skipped > 100);
+}
+
+/// The widths a request of 300 rounds verifies, each round's time `took(rows) * jitter` on a `plain_ms` machine.
+fn widthTrace(modeled: bool, plain_ms: f32, slow_wide: f32, seed: u64) [300]u8 {
+    var prng = std.Random.DefaultPrng.init(42);
+    const r = prng.random();
+    var jit = std.Random.DefaultPrng.init(seed);
+    const j = jit.random();
+    var p2 = Policy{ .modeled = modeled };
+    var out: [300]u8 = undefined;
+    for (&out) |*w| {
+        var conf: [5]f32 = undefined;
+        for (&conf) |*c| c.* = -1 + 5 * r.float(f32);
+        const n = p2.verifyDrafts(&conf, plain_ms);
+        var accepted: usize = 0;
+        while (accepted < n and r.float(f32) < sigmoid(conf[accepted])) accepted += 1;
+        const next_hit: ?bool = if (accepted == n and n < 5) r.float(f32) < sigmoid(conf[n]) else null;
+        p2.learn(&conf, n, accepted, next_hit);
+        const wide: f32 = if (n + 1 >= 3) slow_wide else 1;
+        p2.roundDone(plain_ms, n + 1, accepted + 1, priorMs(plain_ms, n + 1) * wide * (0.9 + 0.2 * j.float(f32)));
+        if (r.float(f32) < 0.1) p2.plainDone(plain_ms, plain_ms * (0.9 + 0.2 * j.float(f32)));
+        w.* = @intCast(n);
+    }
+    return out;
+}
+
+test "policy2 modeled: the same drafts and verdicts give the same widths whatever the round timers and the plain step" {
+    // Jittered timers, another machine's plain step, a slower wide verify: one trace.
+    const base = widthTrace(true, 17.7, 1, 1);
+    try testing.expectEqualSlices(u8, &base, &widthTrace(true, 17.7, 1, 2));
+    try testing.expectEqualSlices(u8, &base, &widthTrace(true, 15.0, 1.25, 3));
+    // The timed policy follows its timers: a slower wide verify (3 rows and up) buys fewer wide rounds.
+    var timed: usize = 0;
+    var slow: usize = 0;
+    for (widthTrace(false, 17.7, 1, 1), widthTrace(false, 17.7, 1.25, 1)) |a, b| {
+        timed += @intFromBool(a >= 2);
+        slow += @intFromBool(b >= 2);
+    }
+    try testing.expect(slow < timed);
 }
