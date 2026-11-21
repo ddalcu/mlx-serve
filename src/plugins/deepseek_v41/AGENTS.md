@@ -29,7 +29,8 @@ serves either from the pack, with no flag.
   kernels (`attn_core`, `q_tail`, `scratch_attn` regions and ring), the hc and router fusions (`hc_fuse`, `gate_gemm`),
   span grouping (`idx_group`), buffers kept or reused (`transient_keep`, `scratch_x1` on `scratch`),
   Engram's direct read (`engram_direct`), the embedding pread and a plugin bank's own pieces (`wide_early`, `woa_rows`,
-  `flash_attn`: the lossy flash kernel, default on beside a plugin bank only).
+  `flash_attn`: the lossy flash kernel, default on beside a plugin bank only), an fp4 bank's gate and up with `moe_act`
+  in one paired launch (`moe_pair`); `wide_test.zig` proves each default-off rewrite's bytes.
 - `spec/markov.zig`: DSpark's Markov chain in B + 1 launches; `decode/engram_decode.zig` the Engram LRU,
   `decode/gemv_twin.zig` the batched GEMV twin of MLX's M=1 words.
 - `decode/moe_fp4.zig`: the MoE's two launches over fp4 routed experts (MXFP4; NVFP4 with ModelOpt's

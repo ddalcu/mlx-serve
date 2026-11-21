@@ -78,6 +78,8 @@ const acore = @import("prompt/attn_core.zig");
 /// a wide span's attention as one flash
 /// kernel (an online softmax; the scores and probabilities never leave a threadgroup), not exact.
 const fa = @import("prompt/flash_attn.zig");
+/// the moe_pair.zig: a prompt call's fp4 gate and up with `moe_act` in one paired NAX launch.
+const mpair = @import("prompt/moe_pair.zig");
 const Shard = @import("../../sdk/weights/shard.zig").Shard;
 
 const A = mlx.mlx_array;
@@ -4498,7 +4500,7 @@ pub fn flatKernel(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, ins: []const A, s
 /// The routed experts over `L` rows at once plus the shared expert `sh`, as `[L, d]` in `x`'s dtype:
 /// the n = L k pairs sorted by expert so each bank streams once, gate+up and down as sorted gathers
 /// (`sortedBank`), the SwiGLU x weight and the unsort + k-sum + shared add one kernel each.
-fn moePrefill(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, wts: A, sh: A) !A {
+pub fn moePrefill(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, wts: A, sh: A) !A {
     const L = dim(x, 0);
     const k = dim(idx, 1);
     const d = dim(x, 1);
@@ -4514,7 +4516,7 @@ fn moePrefill(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, 
     const sidx = try sc.take(flat, order, 0);
     const x3 = try sc.reshape(x, &.{ ci(L), 1, ci(d) });
     const w_sorted = try sc.take(try sc.reshape(wts, &.{ci(n)}), order, 0);
-    const act = if (try gateUpPaired(sc, m, e, x3, rows, sidx)) |a| blk: {
+    const act = if (try mpair.act(sc, m, e, x3, rows, sidx, w_sorted)) |a| a else if (try gateUpPaired(sc, m, e, x3, rows, sidx)) |a| blk: {
         // The routing weight on the activation, as the split path's kernel applies it.
         const inter = dim(a, -1);
         if (m.moe_wt_kernel) |kw| break :blk try flatKernel(sc, kw, &.{ a, w_sorted }, &.{ ci(n), 1, ci(inter) }, dt, n * inter, &.{.{ .name = "N", .v = ci(inter) }});
