@@ -1164,3 +1164,199 @@ test "dsv41 fp4 schedule: the MoE a plain step runs (ffnDecode, one row) gives e
     }
     try testing.expectEqual(@as(usize, 0), bad);
 }
+
+// ── NVFP4 that is MXFP4: NVIDIA's DeepSeek-V4.1-Flash pack ──
+
+/// A bank as NVIDIA's DeepSeek-V4.1-Flash NVFP4 pack stores it (`nv`, group 16) and its MXFP4 conversion (`mx`, group
+/// 32), the same e2m1 codes: each 32-span's two e4m3 scales one power of two 2^e, the expert's global 2^g (`g_lo` on
+/// rows below `split`, `g_hi` on the rest), the e8m0 scale 2^(e + g).
+const PairBank = struct { nv: [2]A, mx: [2]A };
+
+fn pow2Banks(sc: *Scope, rng: std.Random, E: usize, rows: usize, K: usize, split: usize, g_lo: []const i32, g_hi: []const i32) !PairBank {
+    const gpa = testing.allocator;
+    const words = try gpa.alloc(u32, E * rows * K / 8);
+    defer gpa.free(words);
+    for (words) |*w| w.* = rng.int(u32);
+    const nvs = try gpa.alloc(u8, E * rows * K / 16);
+    defer gpa.free(nvs);
+    const mxs = try gpa.alloc(u8, E * rows * K / 32);
+    defer gpa.free(mxs);
+    for (mxs, 0..) |*b, i| {
+        const r = i / (K / 32);
+        const x = r / rows;
+        const e = rng.intRangeAtMost(i32, -4, 2);
+        nvs[2 * i] = pow2Code(.nvfp4, e);
+        nvs[2 * i + 1] = nvs[2 * i];
+        b.* = pow2Code(.mxfp4, e + (if (r % rows < split) g_lo[x] else g_hi[x]));
+    }
+    return .{ .nv = try fp4Words(sc, words, nvs, &.{ E, rows }, K, 16), .mx = try fp4Words(sc, words, mxs, &.{ E, rows }, K, 32) };
+}
+
+/// Powers of two 2^e as `[E]` bf16.
+fn pow2Vec(sc: *Scope, es: []const i32) !A {
+    var v: [64]f32 = undefined;
+    for (es, 0..) |e, i| v[i] = std.math.ldexp(@as(f32, 1), e);
+    return bf16Vec(sc, v[0..es.len]);
+}
+
+test "dsv41 fp4 nvfp4 as mxfp4: the fused decode: NVIDIA's power-of-two NVFP4 bank with its per-expert globals gives its MXFP4 conversion's bytes through both launches, rows 1..6 (DeepSeek-V4.1-Flash widths)" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const d = deepseek;
+    const E = d.experts;
+    const m = bf16Model();
+    const kern = try moe_fp4.build(lim_ds);
+    defer kern.deinit();
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var prng = std.Random.DefaultPrng.init(0x4E5F);
+    const rng = prng.random();
+    var gx: [3][16]i32 = undefined; // each expert's gate, up and down global exponents
+    for (&gx) |*row| for (row[0..E]) |*e| {
+        e.* = rng.intRangeAtMost(i32, -9, -6);
+    };
+    const gu = try pow2Banks(&sc, rng, E, 2 * d.n, d.k, d.n, gx[0][0..E], gx[1][0..E]);
+    const dn = try pow2Banks(&sc, rng, E, d.k, d.n, d.k, gx[2][0..E], gx[2][0..E]);
+    var g: Gen = .{ .seed = 0x4E5F };
+    const sgu = try quant(&sc, try g.normal(&sc, &.{ ci(2 * d.n), ci(d.k) }, 1 / @sqrt(@as(f32, @floatFromInt(d.k)))), mxfp8);
+    const sdn = try quant(&sc, try g.normal(&sc, &.{ ci(d.k), ci(d.n) }, 1 / @sqrt(@as(f32, @floatFromInt(d.n)))), mxfp8);
+    const nv = layerOf(d, Fmt.nvfp4.qp(), gu.nv, dn.nv, sgu, sdn);
+    const mx = layerOf(d, Fmt.mxfp4.qp(), gu.mx, dn.mx, sgu, sdn);
+    const gsc = try pow2Vec(&sc, gx[0][0..E]);
+    const usc = try pow2Vec(&sc, gx[1][0..E]);
+    const dsc = try pow2Vec(&sc, gx[2][0..E]);
+    const in = try rowIns(&sc, &g, rng, d);
+    // The served form's routing weights: the down global on each pick's weight (`routeScaled`, f32).
+    const wts_nv = try sc.mul(in.wts, try sc.take(try astype(&sc, dsc, .float32), in.idx, 0));
+    var bad: usize = 0;
+    for (1..decode.max_rows + 1) |R| {
+        const h2 = try rowsOf(&sc, in.h2, 0, R);
+        const idx = try rowsOf(&sc, in.idx, 0, R);
+        const x1 = try rowsOf(&sc, in.x1, 0, R);
+        const sp: dsv41.Split = .{ .pre = none, .post = try rowsOf(&sc, in.post, 0, R), .comb = try rowsOf(&sc, in.comb, 0, R) };
+        const wts = try rowsOf(&sc, in.wts, 0, R);
+        const up_mx = (try moe_fp4.moeUpScaled(&sc, &m, kern, &mx, h2, idx, wts, .{})) orelse return error.Declined;
+        const y_mx = (try moe_fp4.moeDown(&sc, kern, &mx, up_mx, idx, x1, &sp)) orelse return error.Declined;
+        // The gate/up launch with the gate and up globals; the down global in the kernel (DSCALE) and on the route.
+        const up_nv = (try moe_fp4.moeUpScaled(&sc, &m, kern, &nv, h2, idx, wts, .{ .gate = gsc, .up = usc })) orelse return error.Declined;
+        const up_ds = (try moe_fp4.moeUpScaled(&sc, &m, kern, &nv, h2, idx, wts, .{ .gate = gsc, .up = usc, .down = dsc })) orelse return error.Declined;
+        const up_rt = (try moe_fp4.moeUpScaled(&sc, &m, kern, &nv, h2, idx, try rowsOf(&sc, wts_nv, 0, R), .{ .gate = gsc, .up = usc })) orelse return error.Declined;
+        const y_ds = (try moe_fp4.moeDown(&sc, kern, &nv, up_ds, idx, x1, &sp)) orelse return error.Declined;
+        const y_rt = (try moe_fp4.moeDown(&sc, kern, &nv, up_rt, idx, x1, &sp)) orelse return error.Declined;
+        const cases = [_]struct { []const u8, A, A }{ .{ "up (gate and up globals)", up_nv, up_mx }, .{ "chain, down global in the launch", y_ds, y_mx }, .{ "chain, down global on the route", y_rt, y_mx } };
+        for (cases) |c| {
+            const a = try moe_up.bitsOf(c[1]);
+            defer gpa.free(a);
+            const b = try moe_up.bitsOf(c[2]);
+            defer gpa.free(b);
+            var diff: usize = 0;
+            for (a, b) |p, q| diff += @intFromBool(p != q);
+            std.debug.print("[moe_fp4 nvfp4-as-mxfp4] R={d} {s}: {d} of {d} outputs differ from the MXFP4 conversion's\n", .{ R, c[0], diff, a.len });
+            bad += diff;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+/// NVIDIA's NVFP4 experts and their MXFP4 conversion (`pow2Banks`) at a fixture layer's widths, with the per-expert
+/// globals as bf16 `[E]` (gate, up, down).
+const PackPair = struct {
+    gu: PairBank,
+    dn: PairBank,
+    globals: [3]A,
+
+    fn init(sc: *Scope, rng: std.Random, E: usize, d: usize, n: usize) !PackPair {
+        var gx: [3][64]i32 = undefined;
+        for (&gx) |*row| for (row[0..E]) |*e| {
+            e.* = rng.intRangeAtMost(i32, -9, -6);
+        };
+        return .{
+            .gu = try pow2Banks(sc, rng, E, 2 * n, d, n, gx[0][0..E], gx[1][0..E]),
+            .dn = try pow2Banks(sc, rng, E, d, n, d, gx[2][0..E], gx[2][0..E]),
+            .globals = .{ try pow2Vec(sc, gx[0][0..E]), try pow2Vec(sc, gx[1][0..E]), try pow2Vec(sc, gx[2][0..E]) },
+        };
+    }
+
+    /// `ly`'s routed experts as the NVFP4 arm (with its globals) or the MXFP4 one (none).
+    fn install(p: *const PackPair, ly: *dsv41.Layer, nv: bool) void {
+        const f: Fmt = if (nv) .nvfp4 else .mxfp4;
+        const gu = if (nv) p.gu.nv else p.gu.mx;
+        const dn = if (nv) p.dn.nv else p.dn.mx;
+        ly.experts.gate = .{ .w = none };
+        ly.experts.up = .{ .w = none };
+        ly.experts.gu = .{ .w = gu[0], .s = gu[1], .qp = f.qp() };
+        ly.experts.down = .{ .w = dn[0], .s = dn[1], .qp = f.qp() };
+        ly.experts.views = null;
+        ly.experts.scale = if (nv) .{ p.globals[0], p.globals[1], p.globals[2] } else .{ null, null, null };
+    }
+
+    /// The NVFP4 arm's routing weights: the down global on each pick's weight, as `routeFrom` puts it (f32).
+    fn nvWeights(p: *const PackPair, sc: *Scope, idx: A, wts: A) !A {
+        return sc.mul(wts, try sc.take(try astype(sc, p.globals[2], .float32), idx, 0));
+    }
+};
+
+/// Elements whose bits differ between two arrays of one dtype (bf16 or f32), printed under `label`.
+fn bitDiff(label: []const u8, a: A, b: A) !usize {
+    const gpa = testing.allocator;
+    const x = try dsv41.hostF32(a);
+    defer gpa.free(x);
+    const y = try dsv41.hostF32(b);
+    defer gpa.free(y);
+    var diff: usize = 0;
+    for (x, y) |p, q| diff += @intFromBool(@as(u32, @bitCast(p)) != @as(u32, @bitCast(q)));
+    std.debug.print("[nvfp4 as mxfp4] {s}: {d} of {d} outputs differ from the MXFP4 conversion's\n", .{ label, diff, x.len });
+    return diff;
+}
+
+test "dsv41 fp4 nvfp4 as mxfp4: decode's routed gathers (the fused fp4 kernels off) of NVIDIA's power-of-two NVFP4 bank with its globals give its MXFP4 conversion's bytes, R = 1..6 (DeepSeek-V4.1-Flash widths)" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const E = 16;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = E, .ctx = 0, .experts_nvfp4 = true, .expert_scales = .all });
+    defer fx.deinit();
+    const m = fx.m;
+    const ly = fx.layer(20);
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var prng = std.Random.DefaultPrng.init(0x9F10);
+    const p = try PackPair.init(&sc, prng.random(), E, m.cfg.hidden_size, m.cfg.moe_intermediate_size);
+    var bad: usize = 0;
+    for (1..decode.max_rows + 1) |R| {
+        const h = try sc.keep(try fx.normal(&.{ ci(R), ci(m.cfg.hidden_size) }, .bfloat16, 0, 1));
+        p.install(ly, false);
+        const r = try dsv41.route(&sc, m, ly, h, none);
+        const y_mx = try dsv41.routed(&sc, m, ly, h, r.idx, r.wts);
+        p.install(ly, true);
+        const y_nv = try dsv41.routed(&sc, m, ly, h, r.idx, try p.nvWeights(&sc, r.idx, r.wts));
+        var label: [48]u8 = undefined;
+        bad += try bitDiff(try std.fmt.bufPrint(&label, "decode gathers R={d}", .{R}), y_nv, y_mx);
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "dsv41 fp4 nvfp4 as mxfp4: prefill's sorted gathers of NVIDIA's power-of-two NVFP4 bank with its globals give its MXFP4 conversion's bytes (DeepSeek-V4.1-Flash widths)" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const E = 16;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = E, .ctx = 0, .experts_nvfp4 = true, .expert_scales = .all });
+    defer fx.deinit();
+    const m = fx.m;
+    const ly = fx.layer(20);
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var prng = std.Random.DefaultPrng.init(0x9F11);
+    const p = try PackPair.init(&sc, prng.random(), E, m.cfg.hidden_size, m.cfg.moe_intermediate_size);
+    var bad: usize = 0;
+    for ([_]usize{ 512, 2048 }) |L| {
+        const h = try sc.keep(try fx.normal(&.{ ci(L), ci(m.cfg.hidden_size) }, .bfloat16, 0, 1));
+        p.install(ly, false);
+        const r = try dsv41.route(&sc, m, ly, h, none);
+        const y_mx = try sc.keep(try dsv41.moeShare(m, gpa, 20, h, r.idx, r.wts));
+        p.install(ly, true);
+        const y_nv = try sc.keep(try dsv41.moeShare(m, gpa, 20, h, r.idx, try p.nvWeights(&sc, r.idx, r.wts)));
+        var label: [48]u8 = undefined;
+        bad += try bitDiff(try std.fmt.bufPrint(&label, "prefill L={d}", .{L}), y_nv, y_mx);
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
