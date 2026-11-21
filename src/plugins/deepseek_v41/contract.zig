@@ -870,11 +870,10 @@ const HcMixMma = struct {
     pub const Params = struct {};
 
     pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
-        if (s.rows == 0 or (HC * s.n) % (hmma.SG * 8) != 0) return null;
+        if (s.rows == 0 or (HC * s.n) % hmma.KC != 0) return null;
         const rows = hmma.RT * 8;
-        var g = metal.Geometry{ .grid = .{ ci((s.rows + rows - 1) / rows * hmma.SG * 32), 1, 1 }, .tg = .{ ci(hmma.SG * 32), 1, 1 } };
+        var g = metal.Geometry{ .grid = .{ ci((s.rows + rows - 1) / rows * hmma.RT * 32), 1, 1 }, .tg = .{ ci(hmma.RT * 32), 1, 1 } };
         g.out(&.{ ci(s.rows), MIX }, .float32);
-        g.int("SG", hmma.SG);
         g.int("RT", hmma.RT);
         g.int("MT", MIX / 8);
         return g;
@@ -4239,7 +4238,7 @@ const flash_l = metal.Launch{ .name = "dsv41_attn_flash", .inputs = &v41.GatherA
 const gather_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 } };
 const qk_t_l = metal.Launch{ .name = "dsv41_attn_qk_t", .inputs = &.{ "q", "kw", "comp", "picks", "meta", "qt" }, .outputs = &.{"s"}, .source = qtail.attn_qk_t_source, .header = v41.MPP_HEADER, .tg_bytes = 2 * 64 * 64 * 2, .offline = false, .min_gen = 17 };
 const mix_norm_l = launch("dsv41_hc_mix_norm", &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, &.{ "z", "h_out", "h2" }, hcf.mix_norm_source, "", 4 * (4 * 6 + 4) * 32, 1024, true);
-const mix_mma_l = metal.Launch{ .name = "dsv41_hc_mix_mma", .inputs = &hmma.ins, .outputs = &.{"z"}, .source = hmma.source, .header = "", .tg_bytes = 4 * (hmma.SG * hmma.RT * 8 * MIX + hmma.SG * hmma.RT * 32 + hmma.RT * 8) };
+const mix_mma_l = metal.Launch{ .name = "dsv41_hc_mix_mma", .inputs = &hmma.ins, .outputs = &.{"z"}, .source = hmma.source, .header = "", .tg_bytes = 4 * (hmma.RT * 8 * hmma.KC + hmma.KC * MIX + hmma.RT * 8 * MIX + hmma.RT * 8 * 4) };
 /// The wide mixes at 8 rows a threadgroup (`MLX_SERVE_DSV41_HC_MIX8`), served on NAX GPUs only.
 const mix8_l = metal.Launch{ .name = "dsv41_hc_mix", .inputs = &.{ "x", "fn", "scale", "base", "eps" }, .outputs = &.{"z"}, .source = v41.HC_MIX_SOURCE, .header = "", .tg_bytes = 4 * (8 * 6 + 8) * 32, .adapts = true, .min_gen = 17 };
 const mix_norm8_l = metal.Launch{ .name = "dsv41_hc_mix_norm", .inputs = &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, .outputs = &.{ "z", "h_out", "h2" }, .source = hcf.mix_norm_source, .header = "", .tg_bytes = 4 * (8 * 6 + 8) * 32, .adapts = true, .min_gen = 17 };

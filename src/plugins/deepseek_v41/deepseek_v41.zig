@@ -3110,8 +3110,7 @@ pub fn hcExpandNormLaunch(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *con
 /// one launch (`hcMixNormFused`, unless hc_fuse.zig's kernels were refused at load).
 fn attnHcWide(sc: *Scope, m: *const Dsv41Model, x: A, pres: A, ly: *const Layer, w2: ?A) !struct { pa: Normed, hp: A } {
     const eps = try hcEps(sc, m);
-    // `MLX_SERVE_DSV41_HC_MIX_TILED`: the mixes on the matrix units, then hc_norm (no read-ahead norm beside it).
-    if (hcf_k != null and (w2 != null or !env.on(.MLX_SERVE_DSV41_HC_MIX_TILED) or !hmma.fits(ly.hc_attn.fn_w, x))) {
+    if (hcf_k != null) {
         const r = try hcMixNormFused(sc, m, x, pres, &ly.hc_attn, ly.attn_norm, w2, eps);
         return .{ .pa = r.n, .hp = r.h2 };
     }

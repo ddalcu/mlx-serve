@@ -1,6 +1,8 @@
-//! A wide layer's hc mixes on the simdgroup matrix units (`MLX_SERVE_DSV41_HC_MIX_TILED`, `kernels/hc_mix_mma.metal`):
-//! hc_mix's z in f32 with one read of each stream row for all 24 mixes and one read of `fn` per 32 rows, where hc_mix
-//! reads a row once per group of 6 mixes and `fn` (24 x 20480 f32) once per 4 rows. The same sums in another order.
+//! A wide layer's FFN-side hc mixes on the simdgroup matrix units (`MLX_SERVE_DSV41_HC_MIX_TILED`,
+//! `kernels/hc_mix_mma.metal`): hc_mix's z in f32 with one read of each stream row for all 24 mixes and one read of
+//! `fn` per 32 rows, both staged through threadgroup memory in whole-row loads, where hc_mix reads a row once per group
+//! of 6 mixes and `fn` (24 x 20480 f32) once per 4 rows. The same sums in another order. The attention side keeps the
+//! fused mix and norm (`hcMixNormFused`).
 
 const std = @import("std");
 const env = @import("../../../env.zig");
@@ -13,21 +15,21 @@ const A = mlx.mlx_array;
 
 pub const source = kernelSource("plugins/deepseek_v41/kernels/hc_mix_mma.metal");
 pub const ins = [_][*:0]const u8{ "x", "fn", "scale", "base", "eps" };
-/// Simdgroups a threadgroup (each a K slice) and 8-row tiles a threadgroup.
-pub const SG = 8;
+/// 8-row tiles a threadgroup, one a simdgroup; the columns a staging step.
 pub const RT = 4;
+pub const KC = 64;
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 var engaged_logged: std.atomic.Value(bool) = .init(false);
 
 /// Whether the kernel takes mixes `[mix, K]` f32 over rows of `K` values: whole 8-wide mix tiles (at most 3), K in
-/// whole 8-column steps of every simdgroup's slice.
+/// whole staging steps.
 pub fn fits(fn_w: A, x: A) bool {
     const fs = mlx.getShape(fn_w);
     if (fs.len != 2 or mlx.mlx_array_dtype(fn_w) != .float32) return false;
     const nmix = fs[0];
     const K = fs[1];
-    if (@rem(nmix, 8) != 0 or @divExact(nmix, 8) > 3 or @rem(K, SG * 8) != 0) return false;
+    if (@rem(nmix, 8) != 0 or @divExact(nmix, 8) > 3 or @rem(K, KC) != 0) return false;
     const xs = mlx.getShape(x);
     return xs.len > 0 and xs[0] > 0 and mlx.mlx_array_size(x) == @as(usize, @intCast(xs[0])) * @as(usize, @intCast(K));
 }
@@ -48,9 +50,8 @@ pub fn launch(sc: *dsv41.Scope, x: A, hc: *const dsv41.Hc, eps: A) !A {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ @intCast(L), nmix }, 2, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast((L + rows - 1) / rows * SG * 32), 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, SG * 32, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SG", SG));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast((L + rows - 1) / rows * RT * 32), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, RT * 32, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RT", RT));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "MT", @divExact(nmix, 8)));
     const iv = mlx.mlx_vector_array_new_data(&[_]A{ x, hc.fn_w, hc.scale, hc.base, eps }, 5);
