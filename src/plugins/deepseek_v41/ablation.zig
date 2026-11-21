@@ -270,7 +270,11 @@ pub const StreamTap = struct {
         };
         const v = mlx.mlx_vector_array_new_data(&[_]A{mean}, 1);
         defer _ = mlx.mlx_vector_array_free(v);
-        try mlx.check(mlx.mlx_async_eval(v));
+        // Evaluated here, not async: a record's rows can alias a scratch region whose next writer binds only that
+        // region's own last reader (`Region.released`), which does not know this read exists, so a deferred record
+        // could execute after the writer overwrites it. The tap runs only during calibration passes, and one sync per
+        // layer is the price of a record that reads what it recorded.
+        try mlx.check(mlx.mlx_eval(v));
     }
 
     pub fn clear(self: *StreamTap) void {

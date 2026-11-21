@@ -4630,7 +4630,9 @@ fn engramRows(sc: *Scope, m: *const Dsv41Model, e: *const EngramLayer, x: A, row
     var ys: [dkern.max_rows]A = undefined;
     if (L > ys.len) return error.Dsv41ExactWidth;
     // The projection over all the rows on the one-row kernel, the gate a row at a time; else the whole row alone.
-    const kv = if (mlx.streamIsGpu(sc.s)) try rowQmv(sc, &e.wkv, try sc.astype(rows, m.act)) else null;
+    // The fast path hands `kv` straight to the gate, skipping the `abl.ablateValue` on its value slice that
+    // `engramApply` runs: under an ablation each row takes that path instead.
+    const kv = if (m.ablation == null and mlx.streamIsGpu(sc.s)) try rowQmv(sc, &e.wkv, try sc.astype(rows, m.act)) else null;
     for (0..L) |l| ys[l] = if (kv) |k|
         try engramGate(sc, m, e.qk, try sc.slice(x, 0, l, l + 1), try sc.slice(k, 0, l, l + 1))
     else
@@ -4918,7 +4920,10 @@ fn blockFusedRows(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: 
     // Without the NAX attention (whose partials feed the fused wo_a and ffn_in), the plain step's tail is attention,
     // the attn_out stretch (wo_a, wo_b) and the FFN stretch: each row's attention on its own, attn_out over all the
     // rows on the one-row kernel (`rowQmv`), each row's FFN on its own.
-    if (m.dec.attn == null) if (try blockRowsAttnOut(sc, m, st, li, p0, w, topk, tr)) |ao| {
+    // Under an ablation the row-wise shortcut skips the residual writes' ablations (`blockRowsFfn` ablates nothing,
+    // and its fallback's `.ffn` region does neither), so it declines and each row runs `blockTail`, the plain step's
+    // tail, which ablates `ao` and expands through `ffnStretch`.
+    if (m.dec.attn == null and m.ablation == null) if (try blockRowsAttnOut(sc, m, st, li, p0, w, topk, tr)) |ao| {
         if (try blockRowsFfn(sc, m, li, x, ao, &w.sa)) |f| {
             pre.* = f[1];
             return f[0];
