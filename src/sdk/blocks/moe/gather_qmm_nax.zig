@@ -638,7 +638,7 @@ pub var routed_decline: []const u8 = "";
 
 /// `sortedGateUpFused` with deepseek_v41's `moe_act` in the epilogue: each rounded product times its expert's scale
 /// (`scales`, rounded again), then in f32 the SwiGLU clamped under `limit` (none at 0 or below) times the row's
-/// routing weight (`route`, `[M]` f32), rounded once: `[M, 1, n]`, the bytes of the gather, the scale multiplies and
+/// routing weight (`route`, `[M]` f32), rounded once: `[M, 1, n]`, the math of the gather, the scale multiplies and
 /// `moe_act` it replaces.
 pub fn sortedGateUpRouted(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, route: mlx.mlx_array, limit: f32, scales: ExpertScales, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!nax_available or !mlx.streamIsGpu(s)) return declineRouted("no NAX GPU stream");
