@@ -42,8 +42,10 @@ pub const Config = struct {
     /// Qwen3-Next (`qwen3_next`): flat `model.*` weights, q|k|v|z and b|a projections combined per key head, its own
     /// pipelined-prefill table, serial decode.
     next: bool = false,
-    /// A Prism pack's Hadamard block (`modules[].block`): f16 activations, an f32 GDN state; 0 = not rotated.
+    /// A Prism pack's Hadamard block: f16 activations, an f32 GDN state; 0 = not rotated.
     hadamard_block: u32 = 0,
+    /// JANG language RMS weights are stored as `w - 1`. The engine adds the one before the f16 narrow.
+    centred_language_norms: bool = false,
     vocab_size: u32,
     hidden_size: u32,
     intermediate_size: u32 = 0,
@@ -118,7 +120,7 @@ pub fn parseAs(comptime variant: Variant, dir: *const abi.PackDir, config_json: 
     const types: []const []const u8 = switch (variant) {
         .qwen3_5 => &model_types,
         .next => &.{"qwen3_next"},
-        .prism => &.{"prism_hadamard_qwen35"},
+        .prism => &.{ "prism_hadamard_qwen35", "qwen3_5" },
     };
     if (span != null) return unsupported("a layer span (the cluster split)");
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -188,7 +190,18 @@ pub fn parseAs(comptime variant: Variant, dir: *const abi.PackDir, config_json: 
     if (!c.moe() and c.intermediate_size == 0) return unsupported("intermediate_size");
     c.quant = q3.quantizationOf(root, prism) catch return unsupported("quantization");
     if (prism) {
-        c.hadamard_block = hadamardBlock(root) orelse return unsupported("modules without one shared rotation block");
+        // A stray block must not retarget a 4-bit `qwen3_5` pack. The official type is not re-checked.
+        if (std.mem.eql(u8, d.model_type, "qwen3_5") and !ternaryAffine(root)) return unsupported("quantization");
+        const jang = jangNotes(dir) catch return unsupported("jang_config.json");
+        if (jang.expand) return unsupported("a JANG affine expansion");
+        // `unsupported` takes a comptime string, so the two misses stay separate returns.
+        const block = rotationBlock(root, dir) catch return unsupported("hadamard.json");
+        if (block) |found| {
+            c.hadamard_block = found;
+            c.centred_language_norms = jang.centred;
+        } else if (field(root, "modules") != null) {
+            return unsupported("modules without one shared rotation block");
+        } else return unsupported("no Hadamard block");
         // The format refuses rotated expert banks.
         if (c.moe()) return unsupported("a routed-expert Hadamard pack");
     }
@@ -268,15 +281,42 @@ pub fn parseAs(comptime variant: Variant, dir: *const abi.PackDir, config_json: 
         p.mrope = .{ .sections = sections, .rope_dims = rd, .inv_freq = .of(cfg_out.inv_freq), .mscale = rope_scaling.mscale(c.rope) };
     }
     p.private = cfg_out;
+    p.hadamard_block = c.hadamard_block;
+    p.centred_language_norms = c.centred_language_norms;
     out.* = p;
     return .ok;
 }
 
-/// The rotation block every listed module shares (Prism's `modules[].block`), as the engine's parse reads it; null
-/// when there is no list or the modules disagree.
-fn hadamardBlock(root: std.json.ObjectMap) ?u32 {
+/// Affine 2-bit group 128. A missing `mode` is affine. The only `qwen3_5` width Prism claims.
+pub fn ternaryAffine(root: std.json.ObjectMap) bool {
+    const q = field(root, "quantization") orelse return false;
+    if (q != .object) return false;
+    if ((int(field(q.object, "bits")) orelse return false) != 2) return false;
+    if ((int(field(q.object, "group_size")) orelse 64) != 128) return false;
+    if (field(q.object, "mode")) |m| {
+        if (m != .string or !std.mem.eql(u8, m.string, "affine")) return false;
+    }
+    return true;
+}
+
+/// The rotation block: `hadamard.block_size`, else one shared `modules[].block`, else `hadamard.json`'s
+/// `prism.hadamard.block_size`. Null when the pack names none, or its modules disagree.
+pub fn rotationBlock(root: std.json.ObjectMap, dir: *const abi.PackDir) error{TooLarge}!?u32 {
+    if (objectBlock(root)) |b| return b;
+    // A modules list that disagrees is not "no list": do not fall through to the sidecar.
+    if (field(root, "modules") != null) return modulesBlock(root);
+    return sidecarBlock(dir);
+}
+
+fn objectBlock(root: std.json.ObjectMap) ?u32 {
+    const h = field(root, "hadamard") orelse return null;
+    if (h != .object) return null;
+    return nonzero(int(field(h.object, "block_size")));
+}
+
+fn modulesBlock(root: std.json.ObjectMap) ?u32 {
     const mods = field(root, "modules") orelse return null;
-    if (mods != .array) return null;
+    if (mods != .array or mods.array.items.len == 0) return null;
     var blk: u32 = 0;
     for (mods.array.items) |m| {
         if (m != .object) return null;
@@ -285,6 +325,65 @@ fn hadamardBlock(root: std.json.ObjectMap) ?u32 {
         blk = v;
     }
     return if (blk == 0) null else blk;
+}
+
+fn nonzero(v: ?u32) ?u32 {
+    const n = v orelse return null;
+    return if (n == 0) null else n;
+}
+
+fn sidecarBlock(dir: *const abi.PackDir) error{TooLarge}!?u32 {
+    const bytes = try readWhole(dir, "hadamard.json") orelse return null;
+    defer gpa.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), bytes, .{}) catch return null;
+    if (v != .object) return null;
+    return nonzero(int(field(v.object, "prism.hadamard.block_size")));
+}
+
+const JangNotes = struct { expand: bool = false, centred: bool = false };
+
+/// Top-level `requires_jang_affine1_expansion` and `layout.language_norms`. A missing file is neither.
+fn jangNotes(dir: *const abi.PackDir) error{Broken}!JangNotes {
+    const found = readWhole(dir, "jang_config.json") catch return error.Broken;
+    const bytes = found orelse return .{};
+    defer gpa.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), bytes, .{}) catch return error.Broken;
+    if (v != .object) return error.Broken;
+    const expand = if (field(v.object, "requires_jang_affine1_expansion")) |e| e == .bool and e.bool else false;
+    var centred = false;
+    if (field(v.object, "layout")) |lay| if (lay == .object) {
+        if (field(lay.object, "language_norms")) |n| centred = n == .string and std.mem.eql(u8, n.string, "zero-centered-runtime-plus-one");
+    };
+    return .{ .expand = expand, .centred = centred };
+}
+
+/// `hadamard.json` is the sign payload. Past this the file is not a note we parse.
+const note_cap: u64 = 8 << 20;
+
+fn readWhole(dir: *const abi.PackDir, name: []const u8) error{TooLarge}!?[]u8 {
+    const n = dir.fileBytes(name);
+    if (n == 0) return null;
+    if (n > note_cap) return error.TooLarge;
+    const buf = gpa.alloc(u8, @intCast(n)) catch return error.TooLarge;
+    var why: abi.Verdict = .{};
+    const got = dir.readFile(name, buf, &why) orelse {
+        gpa.free(buf);
+        return if (why.code == .too_large) error.TooLarge else null;
+    };
+    // `readFile` returns `buf[0..len]`. A shorter fill is shrunk so the free is the allocation.
+    if (got.len == buf.len) return buf;
+    if (got.len == 0) {
+        gpa.free(buf);
+        return null;
+    }
+    return gpa.realloc(buf, got.len) catch {
+        gpa.free(buf);
+        return error.TooLarge;
+    };
 }
 
 /// One snapshot of every linear layer's recurrent state and conv window (`ModelConfig.ssmCheckpointBytes`).

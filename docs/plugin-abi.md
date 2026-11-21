@@ -436,6 +436,8 @@ Every `Str` here points at static text or at memory the plugin owns until `Model
 | `speech` | `SpeechFacts` | `.{}` |  |
 | `_pre_engine_config` | `u32` | `0` | Ends the struct at the size a plugin built before `engine_config` writes (728 bytes: `speech` ends at 724, the rest was padding it may have left unset), so `engine_config` lies past it and the size gate reads it unset. |
 | `engine_config` | `bool` | `false` | This plugin serves a `model_type` the engine parses and wants the engine's own config (family fields, weight renames, bills) with its binding attached, instead of the generic config of its facts alone. The engine then sizes and bills the pack as it does that type, so the plugin must match the engine's layout for that type. A pack the engine cannot parse keeps the generic config. Read through `wantsEngineConfig`. |
+| `hadamard_block` | `u32` | `0` | Rotation width of a Hadamard pack; 0 = this pack is not rotated. |
+| `centred_language_norms` | `bool` | `false` | Language RMS weights are stored as `w - 1`. The engine adds the one before the f16 narrow. |
 
 ### `Shape` (extern struct)
 
