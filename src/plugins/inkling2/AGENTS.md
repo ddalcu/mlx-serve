@@ -14,8 +14,10 @@ pack's reference). Live: `tests/test_inkling2.sh`. `inkling2` (Small, no loop) a
 - Not bit-exact against mlx-lm, by construction: the NVFP4 expert scale is applied after `gather_qmm` in f32 (mlx-c has
   no global-scale argument), the down scale folds into the routing weights, the sorted gather may take the NAX path,
   and mlx-lm's compiled clip / SwiGLU are eager here.
-- Attention is composed MLX ops (`kernels.zig` is a stub that declines): the prefill holds `[H, L, S]` f32 logits per
-  visit.
+- The relative and depth attention kernels (`kernels.zig`, `MLX_SERVE_INKLING2_KERNELS=0` turns both off) keep the
+  composed path as fallback. The composed prefill holds `[H, L, S]` f32 logits per visit.
+- `inkling2 proof: the quantized pack ...` runs with the kernels off: its `tiny_q` seed was chosen on mlx-lm's composed
+  GPU run, and the kernel flips a router near-tie in it; kernel exactness is the contract's.
 - Sliding visits keep a full KV buffer (band view, no ring), so at the default context the KV bill leaves the hot
   prefix cache 0 MB; the live test passes `--ctx-size 32768` to exercise it.
 - `inkling2 pack: ...`'s 0.99 bar is per row on its own prompt: on another prompt, compare a low row against both of

@@ -483,7 +483,19 @@ Used in mlx-serve:
   * The global-sort MoE gather (`_gather_sort`: argsort the flattened
     (token, expert) pairs, gather rows, run with sorted indices, then inverse
     permute) is theirs, used by our multi-position MoE paths in
-    `src/engines/mlx/transformer.zig` and `src/plugins/deepseek_v4/deepseek_v4.zig`.
+    `src/engines/mlx/transformer.zig`, `src/plugins/deepseek_v4/deepseek_v4.zig`
+    and `src/plugins/inkling2/moe.zig`.
+  * The Inkling 2 relative attention prefill kernel
+    (`src/plugins/inkling2/kernels/relative_attention.metal`) is a port of
+    `mlx_lm/models/inkling2/kernels.py`'s `_RELATIVE_ATTENTION_SOURCE`
+    (`relative_attention`). Modifications: launched from Zig through mlx-c
+    (`src/plugins/inkling2/kernels.zig`) for one batch row with a scalar
+    `key_start`; the kernel body is unchanged.
+  * The Inkling 2 depth attention kernel
+    (`src/plugins/inkling2/kernels/depth_attention.metal`) is a port of
+    `mlx_lm/models/inkling2/kernels.py`'s `_DEPTH_ATTENTION_SOURCE`
+    (`depth_attention`). Modifications: launched from Zig through mlx-c
+    (`src/plugins/inkling2/kernels.zig`); the kernel body is unchanged.
 
 Modifications by mlx-serve: reimplemented in Zig against mlx-c, and the GDN
 kernel is extended by a sequence variant (`GDN_KERNEL_SEQ_SOURCE`) that records

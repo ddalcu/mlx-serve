@@ -6,7 +6,7 @@
 #
 #   [1] /v1/models lists the pack                [4] an image part is a 400 naming images
 #   [2] greedy raw completion: " Berlin"         [5] reasoning_effort: 200 with non-empty content
-#   [3] prefix cache: the same chat twice reuses
+#   [3] prefix cache: the same chat twice reuses  [6] both kernels log their engaged line
 #       its prefix and returns the same tokens;
 #       a chat sharing a long prefix restores at a checkpoint and equals a cold server's answer
 #
@@ -101,6 +101,9 @@ ok("[4] an image part is a 400 naming images", st == 400 and "image" in r.get("e
 st, r = chat("What is 3*7? Answer with just the number.", max_tokens=400, reasoning_effort="low")
 ok("[5] reasoning_effort: 200 with content", st == 200 and (r["choices"][0]["message"].get("content") or "").strip(), r)
 
+text = open(log, errors="replace").read()
+ok("[6] relative_attention engaged", "[inkling2] relative_attention engaged" in text)
+ok("[6] depth_attention engaged", "[inkling2] depth_attention engaged" in text)
 sys.exit(1 if fails else 0)
 PY
 

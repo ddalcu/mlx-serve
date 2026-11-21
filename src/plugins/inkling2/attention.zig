@@ -108,7 +108,6 @@ pub fn forward(w: *const Weights, c: *block.Ctx, q_in: Array, k_in: Array, v_in:
 
 /// The composed prefill: q `[1,H,L,hd]`, k/v `[1,Hk,S,hd]`, pb `[1,L,H,R]`, sinks `[1,L,H]`; query i sits at
 /// `off + i`, key j at `kv_start + j`. Returns `[1,L,H,hd]` in v's dtype.
-// ceiling: O(H*L*S) memory per chunk; upgrade path: kernels.relativeAttention
 pub fn referenceAttention(g: *Graph, q: Array, k: Array, v: Array, pb: Array, sinks: Array, off: u32, kv_start: u32, window: u32, scale: f32) !Array {
     var t = g.scope();
     defer t.deinit();
