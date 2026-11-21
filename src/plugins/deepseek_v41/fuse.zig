@@ -729,8 +729,9 @@ test "dsv41 fuse mxfp8_qmm: a prompt chunk's mxfp8 linears (q_kv, wo_b, the grou
         const x = try sc.keep(try fx.normal(if (c[2]) grouped[0..] else grouped[1..], .bfloat16, 0, 1));
         var ys: [3]A = undefined;
         for ([_]?[*:0]const u8{ null, "1" }, 0..) |v, i| {
+            const was = ps().mxfp8_qmm;
             ps().mxfp8_qmm = v != null;
-            defer ps().mxfp8_qmm = false;
+            defer ps().mxfp8_qmm = was;
             engaged.mxfp8_qmm = false;
             ys[i] = if (c[2]) try dsv41.attnOutA(&sc, m, ly, x, null) else try l.apply(&sc, x);
             try testing.expectEqual(i == 1, engaged.mxfp8_qmm);
@@ -742,8 +743,9 @@ test "dsv41 fuse mxfp8_qmm: a prompt chunk's mxfp8 linears (q_kv, wo_b, the grou
         var bad = l.*;
         bad.s = up;
         {
+            const was = ps().mxfp8_qmm;
             ps().mxfp8_qmm = true;
-            defer ps().mxfp8_qmm = false;
+            defer ps().mxfp8_qmm = was;
             var lb = ly.*;
             lb.wo_a = bad;
             ys[2] = if (c[2]) try dsv41.attnOutA(&sc, m, &lb, x, null) else try bad.apply(&sc, x);
@@ -994,6 +996,10 @@ test "dsv41 fuse pf_bf16_trunk: a prompt chunk's mxfp8 linears (q_kv, wo_b, the 
     defer sc.deinit();
     const L: usize = 2048;
     const og: usize = @intCast(mlx.getShape(ly.wo_a.w)[0]);
+    // The per-chunk dequantize is the path the copy replaces: mxfp8_qmm (default on) would take these calls off it.
+    const qmm = ps().mxfp8_qmm;
+    ps().mxfp8_qmm = false;
+    defer ps().mxfp8_qmm = qmm;
     // Today's outputs, before any copy exists.
     const cases = [_]struct { []const u8, *dsv41.Lin, bool }{ .{ "q_kv", &ly.q_kv.?, false }, .{ "wo_b", &ly.wo_b, false }, .{ "shared_gu", &ly.shared_gu.?, false }, .{ "shared down", &ly.shared[2], false }, .{ "wo_a", &ly.wo_a, true } };
     var xs: [cases.len]A = undefined;
