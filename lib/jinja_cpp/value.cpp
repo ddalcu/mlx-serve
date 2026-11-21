@@ -4,6 +4,7 @@
 // for converting from JSON to jinja values
 #include <nlohmann/json.hpp>
 
+#include <charconv>
 #include <sstream>
 #include <string>
 #include <cctype>
@@ -1399,6 +1400,36 @@ void global_from_json(context & ctx, const nlohmann::ordered_json & json_obj, bo
     }
 }
 
+// Python's float repr, which json.dumps also writes: the shortest digits that round-trip,
+// in exponent form below 1e-4 and from 1e16 on.
+std::string float_repr(double v) {
+    if (std::isnan(v)) return "nan";
+    if (std::isinf(v)) return v < 0 ? "-inf" : "inf";
+    char buf[32];
+    char * end = std::to_chars(buf, buf + sizeof(buf), v, std::chars_format::scientific).ptr;
+    std::string sci(buf, end);
+    std::string out;
+    size_t i = 0;
+    if (sci[0] == '-') { out.push_back('-'); i = 1; }
+    size_t e = sci.find('e');
+    std::string digits;
+    for (size_t k = i; k < e; ++k) if (sci[k] != '.') digits.push_back(sci[k]);
+    int exp = std::stoi(sci.substr(e + 1));
+    int n = static_cast<int>(digits.size());
+    if (exp < -4 || exp >= 16) {
+        out += digits[0];
+        if (n > 1) out += "." + digits.substr(1);
+        std::string mag = std::to_string(exp < 0 ? -exp : exp);
+        out += exp < 0 ? "e-" : "e+";
+        if (mag.size() < 2) out.push_back('0');
+        return out + mag;
+    }
+    int point = exp + 1;
+    if (point <= 0) return out + "0." + std::string(-point, '0') + digits;
+    if (point >= n) return out + digits + std::string(point - n, '0') + ".0";
+    return out + digits.substr(0, point) + "." + digits.substr(point);
+}
+
 // recursively convert value to JSON string
 // TODO: avoid circular references
 static void value_to_json_internal(std::ostringstream & oss, const value & val, int curr_lvl, int indent, const std::string_view item_sep, const std::string_view key_sep, bool sort_keys) {
@@ -1416,7 +1447,7 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
     } else if (is_val<value_int>(val)) {
         oss << val->as_int();
     } else if (is_val<value_float>(val)) {
-        oss << val->as_float();
+        oss << float_repr(val->as_float());
     } else if (is_val<value_string>(val)) {
         oss << "\"";
         for (char c : val->as_string().str()) {
