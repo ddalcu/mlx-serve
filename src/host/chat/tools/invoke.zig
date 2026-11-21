@@ -16,6 +16,7 @@ const balancedJsonObject = @import("json_infer.zig").balancedJsonObject;
 const inklingTrailingNameRun = @import("inkling.zig").inklingTrailingNameRun;
 const dsmlAttr = @import("dsml.zig").dsmlAttr;
 const freeParsedCalls = @import("dsml.zig").freeParsedCalls;
+const isJsonLiteral = @import("../../../sdk/util/json_text.zig").isJsonLiteral;
 
 // ── ATEM tool calls (Muse-Glimmer / `muse_glimmer`) ────────────────────
 //
@@ -39,11 +40,13 @@ const InvokeDialect = struct {
     invoke_close: []const u8,
     /// Not the model's own dialect: kept only when it names a declared tool (`filterInferredBySchema`).
     inferred: bool,
+    /// Every value that parses as JSON keeps its type; when false (Claude spells strings raw), only true/false/null/numbers do.
+    json_values: bool,
 };
-pub const ATEM_INVOKE: InvokeDialect = .{ .invoke = "<atem:invoke", .param = "<atem:parameter", .param_close = "</atem:parameter>", .invoke_close = "</atem:invoke>", .inferred = false };
+pub const ATEM_INVOKE: InvokeDialect = .{ .invoke = "<atem:invoke", .param = "<atem:parameter", .param_close = "</atem:parameter>", .invoke_close = "</atem:invoke>", .inferred = false, .json_values = true };
 /// Anthropic's spelling of the same grammar (`<function_calls><invoke name="X"><parameter name="k">`),
 /// which models trained on Claude transcripts emit in place of their own (qwen4_exp, #928).
-pub const BARE_INVOKE: InvokeDialect = .{ .invoke = "<invoke", .param = "<parameter", .param_close = "</parameter>", .invoke_close = "</invoke>", .inferred = true };
+pub const BARE_INVOKE: InvokeDialect = .{ .invoke = "<invoke", .param = "<parameter", .param_close = "</parameter>", .invoke_close = "</invoke>", .inferred = true, .json_values = false };
 pub const FUNCTION_CALLS_TAG = "<function_calls>";
 
 /// gpt_oss / harmony tool calls. Structurally unlike every other family here:
@@ -157,8 +160,9 @@ pub fn parseInvokeToolCalls(allocator: std.mem.Allocator, text: []const u8, call
 }
 
 /// Assemble `<atem:parameter name="k">v</atem:parameter>` runs into a JSON
-/// object string. A value that parses as COMPLETE JSON keeps its spelled type;
-/// everything else is a raw string, exact bytes. Keys are escaped + deduped
+/// object string. A value that parses as COMPLETE JSON keeps its spelled type
+/// (bare `<invoke>`: only true/false/null/numbers, as in Hermes XML); everything
+/// else is a raw string, exact bytes. Keys are escaped + deduped
 /// (last wins) via ObjectMap+Stringify, so emitted arguments are ALWAYS valid
 /// JSON. Returns null when no complete parameter was found.
 fn invokeParamsToJson(allocator: std.mem.Allocator, body: []const u8, comptime d: InvokeDialect) !?[]const u8 {
@@ -182,7 +186,8 @@ fn invokeParamsToJson(allocator: std.mem.Allocator, body: []const u8, comptime d
         // dropped.
         const vend_rel = std.mem.indexOf(u8, body[vstart..], d.param_close) orelse break;
         const raw = body[vstart .. vstart + vend_rel];
-        const v: std.json.Value = std.json.parseFromSliceLeaky(std.json.Value, aa, raw, .{}) catch
+        const typed = d.json_values or isJsonLiteral(std.mem.trim(u8, raw, " \t\r\n"));
+        const v: std.json.Value = if (!typed) .{ .string = raw } else std.json.parseFromSliceLeaky(std.json.Value, aa, raw, .{}) catch
             std.json.Value{ .string = raw };
         try map.put(aa, pname, v);
         found = true;
