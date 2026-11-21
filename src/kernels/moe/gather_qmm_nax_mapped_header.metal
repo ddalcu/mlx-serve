@@ -451,13 +451,13 @@ METAL_FUNC void store_act(
           if constexpr (EPI < 0) {
             float gf = float(g), uf = float(u);
             if (lim > 0.0f) { gf = metal::min(gf, lim); uf = metal::clamp(uf, -lim, lim); }
-            // g * sigmoid(g) from e^-|g|/2, which never overflows: g / (1 + e^-g) at g >= 0,
-            // (g e^(g/2)) e^(g/2) / (1 + e^g) below, so a result past e^-88 stays a normal f32
-            // instead of 0 (moe_act's 1 / (1 + e^|g|) overflows there).
+            // g * sigmoid(g) * u * w from e^-|g|/2, which never overflows: g u w / (1 + e^-g) at g >= 0,
+            // ((g e^(g/2)) (u w)) e^(g/2) / (1 + e^g) below, each partial product at least the result's
+            // size, so every result a normal f32 holds stays normal (the GPU flushes subnormals to 0).
             const float h = metal::precise::exp(-0.5f * metal::abs(gf));
             const float q = h * h;
-            const float a = gf < 0.0f ? (gf * h) * h / (1.0f + q) : gf / (1.0f + q);
-            v[j] = T(a * uf * rw[r]);
+            const float uw = uf * rw[r];
+            v[j] = T(gf < 0.0f ? (gf * h) * uw * h / (1.0f + q) : gf * uw / (1.0f + q));
           } else {
             if constexpr (EPI > 1) {
               // MLX's Minimum / Clip: a NaN stays NaN (metal::min / max return the other operand).
