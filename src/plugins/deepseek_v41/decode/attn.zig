@@ -892,7 +892,8 @@ test "dsv41 dec attn merge: wo_a over the merged split is wo_a over the splits (
     const kw = try wo_a.build();
     defer _ = mlx.mlx_fast_metal_kernel_free(kw);
     const counter = try sc.keep(newCounter());
-    const wcounter = try sc.keep(wo_a.newCounter());
+    // A counter each wo_a launch: launches without a dependency between them may run at once.
+    const wcounters = [3]A{ try sc.keep(wo_a.newCounter()), try sc.keep(wo_a.newCounter()), try sc.keep(wo_a.newCounter()) };
     const nosink = try sc.keep(noSink(HEADS));
     const wts = try woaWeights(&sc, 77);
     var worst: f64 = 0;
@@ -903,13 +904,13 @@ test "dsv41 dec attn merge: wo_a over the merged split is wo_a over the splits (
         const sink = try sc.reshape(rig.sink, &.{HEADS});
         const meta = try sc.ints(&[_]i32{ @intCast(ctx), @intCast(R), @intCast(k), WINDOW, 144, @intCast(ctx) }, &.{6});
         const pl = (try partials(&sc, kern, &m, rig.q, rig.win(), rig.comps[0], rig.picks[0], rig.p0, SCALE)) orelse return error.Declined;
-        const want = (try wo_a.launch(&sc, kw, 64, .bfloat16, .{ pl.acc, pl.m, pl.l, sink, meta, wts[2], wts[0], wts[1] }, wcounter, null)) orelse return error.Declined;
+        const want = (try wo_a.launch(&sc, kw, 64, .bfloat16, .{ pl.acc, pl.m, pl.l, sink, meta, wts[2], wts[0], wts[1] }, wcounters[0], null)) orelse return error.Declined;
         const pm = (try partialsMerged(&sc, km, &m, rig.q, rig.win(), rig.comps[0], rig.picks[0], rig.p0, SCALE, sink, counter)) orelse return error.Declined;
         try testing.expectEqual(@as(c_int, 1), pm.splits);
         try mergedIsHostMerge(&sc, pl, pm, sink);
-        const got = (try wo_a.launch(&sc, kw, 64, .bfloat16, .{ pm.acc, pm.m, pm.l, nosink, meta, wts[2], wts[0], wts[1] }, wcounter, null)) orelse return error.Declined;
+        const got = (try wo_a.launch(&sc, kw, 64, .bfloat16, .{ pm.acc, pm.m, pm.l, nosink, meta, wts[2], wts[0], wts[1] }, wcounters[1], null)) orelse return error.Declined;
         // The planted bug: wo_a weighs the layer's sink against the merged split too (the sink counted twice).
-        const bad = (try wo_a.launch(&sc, kw, 64, .bfloat16, .{ pm.acc, pm.m, pm.l, sink, meta, wts[2], wts[0], wts[1] }, wcounter, null)) orelse return error.Declined;
+        const bad = (try wo_a.launch(&sc, kw, 64, .bfloat16, .{ pm.acc, pm.m, pm.l, sink, meta, wts[2], wts[0], wts[1] }, wcounters[2], null)) orelse return error.Declined;
         const w = try dsv41.hostF32(want);
         defer gpa.free(w);
         const g = try dsv41.hostF32(got);
