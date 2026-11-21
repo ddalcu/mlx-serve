@@ -1249,3 +1249,35 @@ test "deepseek_v4 served: mlx-community's withdrawn preview pack is refused by t
     try testing.expectError(error.PluginDeclinedNoLegacy, model.parseConfig(io, testing.allocator, dir));
 }
 
+
+test "deepseek_v41 served: a prefill that fails after admission gives its memory promise back" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    h.sch.promise_ledger = .{};
+    h.sch.gen_reserve_bytes = 0;
+    const Bill = struct {
+        fn numbers(_: *const model.ModelConfig, _: usize, _: u32, _: KVQuantConfig, _: bool) [2]u64 {
+            return .{ 1 << 30, 1 << 40 };
+        }
+        fn refuse(_: *const model.ModelConfig, _: usize, _: u32, _: KVQuantConfig, _: u64, _: u64, _: bool, _: bool) bool {
+            return false;
+        }
+    };
+    const old_numbers = scheduler.prefill_admission_numbers;
+    defer scheduler.prefill_admission_numbers = old_numbers;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_numbers = &Bill.numbers;
+    scheduler.prefill_admission_fits = &Bill.refuse;
+    const s = try h.newSlot(&.{ 3, 17, 42, 9, 7, 25, 1, 60 });
+    defer s.deinit();
+    try testing.expectEqual(.errored, @import("../../engines/mlx/step.zig").prefillAdmitted(&h.sch, s));
+    try testing.expectEqual(@as(u64, 0), h.sch.promise_ledger.promised);
+    try testing.expectEqual(@as(u64, 0), s.memory_promised);
+    finish_request.releasePluginSlot(s);
+}
