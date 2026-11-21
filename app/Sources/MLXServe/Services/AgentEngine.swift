@@ -101,6 +101,8 @@ enum AgentEngine {
         historyImages: Bool = false
     ) -> [[String: Any]] {
 
+        let allMessages = ContextCompaction.activeMessages(allMessages)
+
         // --- Budget calculation ---
 
         let safetyBuffer = 1024
@@ -168,7 +170,7 @@ enum AgentEngine {
             if msg.role == .system && msg.toolCallId == nil { continue }
             if msg.isAgentSummary { continue }
             if msg.failedRetry { continue }
-            if msg.role == .assistant && msg.content.contains("couldn't generate a response") { continue }
+            if msg.isLegacyFailure { continue }
 
             let cost = tokenCostForMessage(msg, withImages: sendsImages)
             if cost > remainingBudget { break }
@@ -253,7 +255,7 @@ enum AgentEngine {
             }
             if msg.role == .system { continue }
             if msg.isAgentSummary { continue }
-            if msg.role == .assistant && msg.content.contains("couldn't generate a response") { continue }
+            if msg.isLegacyFailure { continue }
 
             // Assistant messages with tool_calls
             if msg.role == .assistant, let tcs = msg.toolCalls, !tcs.isEmpty {
@@ -268,6 +270,15 @@ enum AgentEngine {
                 // from turn 2. Key omitted when absent (`is string` gates).
                 if let rc = msg.reasoningContent, !rc.isEmpty {
                     dict["reasoning_content"] = rc
+                }
+                let following = window.dropFirst(i + 1).filter {
+                    !$0.isAgentSummary && !$0.failedRetry
+                        && ($0.toolCallId != nil || !$0.content.isEmpty || !($0.toolCalls ?? []).isEmpty)
+                }
+                let resultIDs = Set(following.prefix { $0.toolCallId != nil }.compactMap(\.toolCallId))
+                guard tcs.allSatisfy({ resultIDs.contains($0.id) }) else {
+                    if !content.isEmpty { history.append(dict) }
+                    continue
                 }
                 dict["tool_calls"] = tcs.map { tc -> [String: Any] in
                     [
