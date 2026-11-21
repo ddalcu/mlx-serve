@@ -10,6 +10,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const mpair = @import("moe_pair.zig");
+const mtail = @import("moe_tail.zig");
 const fixture = @import("../decode/fixture.zig");
 
 const testing = std.testing;
@@ -244,6 +245,45 @@ test "dsv41 wide tol: the paired fp4 gate+up with moe_act in its epilogue is the
     try testing.expect(ok);
 }
 
+test "dsv41 wide tol: the MoE combine and hc expand in one launch are moePrefill then hcExpand within 1% at the release widths, NVFP4 with per-expert scales, prompt row counts to 8192; a dropped shared expert or swapped post fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const experts: c_int = 48;
+    var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    var m: dsv41.Dsv41Model = undefined;
+    m.cfg = .{};
+    m.cfg.dsv4_swiglu_limit = 10;
+    m.act = .bfloat16;
+    m.moe_wt_kernel = null;
+    m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
+    m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
+    var ly: dsv41.Layer = undefined;
+    ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .gu = try fp4Bank(&sc, 0x7A11, experts, 2 * inter, hidden, true), .down = try fp4Bank(&sc, 0x7A12, experts, hidden, inter, true) };
+    for (&ly.experts.scale, 0..) |*v, i| v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x7A13 + i);
+    var ok = true;
+    for ([_]usize{ 17, 500, 3072, 8192 }, 0..) |L, ci| {
+        var csc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer csc.deinit();
+        const c = try call(&csc, L, @intCast(experts), 0x2000 + ci, L == 500);
+        const Lc: c_int = @intCast(L);
+        const x1 = try normal(&csc, &.{ Lc, 4, @intCast(hidden) }, .bfloat16, 1, 0x2100 + ci);
+        const sp: dsv41.Split = .{ .pre = none, .post = try uniform(&csc, &.{ Lc, 4 }, .float32, 0.1, 2, 0x2200 + ci), .comb = try uniform(&csc, &.{ Lc, 4, 4 }, .float32, 0, 1, 0x2300 + ci) };
+        const want = try dsv41.hcExpand(&csc, x1, try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh), &sp);
+        const p = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+        var lb: [64]u8 = undefined;
+        if (!try close(try std.fmt.bufPrint(&lb, "moe tail rows {d}", .{L}), want, try mtail.launch(&csc, p, x1, &sp), x1, tol_kernel)) ok = false;
+        // Planted: the shared expert dropped, then each row's post on the wrong copies.
+        const no_sh = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, try csc.zeros(&.{ Lc, @intCast(hidden) }, .bfloat16));
+        try testing.expect(!try close("  planted: shared expert dropped", want, try mtail.launch(&csc, no_sh, x1, &sp), x1, tol_kernel));
+        const rolled_post: dsv41.Split = .{ .pre = none, .post = try csc.concat(&.{ try csc.slice(sp.post, 1, 1, 4), try csc.slice(sp.post, 1, 0, 1) }, 1), .comb = sp.comb };
+        try testing.expect(!try close("  planted: post on the wrong copies", want, try mtail.launch(&csc, p, x1, &rolled_post), x1, tol_kernel));
+    }
+    try testing.expect(ok);
+}
+
 // ── the hc stages ──
 
 /// A model holding only the hc kernels, at the release's widths, the fused ones built and probed.
@@ -383,7 +423,7 @@ test "dsv41 wide tol: the hc mixes on the simdgroup matrix units are hc_mix's mi
 
 // ── a release-shape pair worker's prefill ──
 
-const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_HC_MIX_TILED };
+const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_HC_MIX_TILED, .MLX_SERVE_DSV41_MOE_TAIL };
 
 /// The pair worker's streams and mixes after its layers over `x` / `pre`, from a fresh state (caller frees).
 fn prefill(fx: *fixture.Fixture, x: A, pre: A) ![2]A {

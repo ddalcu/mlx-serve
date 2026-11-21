@@ -12,6 +12,7 @@ const qtail = @import("prompt/q_tail.zig");
 const hcf = @import("prompt/hc_fuse.zig");
 const sx1 = @import("prompt/scratch_x1.zig");
 const hmma = @import("prompt/hc_mix_mma.zig");
+const mtail = @import("prompt/moe_tail.zig");
 const gtwin = @import("decode/gemv_twin.zig");
 const ggemm = @import("prompt/gate_gemm.zig");
 const markov = @import("spec/markov.zig");
@@ -622,6 +623,76 @@ const MoeCombine = struct {
         };
     }
 };
+
+/// kernels/moe_tail.metal (`MLX_SERVE_DSV41_MOE_TAIL`): moe_combine's rows (rounded to T), then the hc expand from them.
+const MoeTail = struct {
+    pub const Params = struct { k: usize = TOPK };
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n == 0 or s.n % 4 != 0 or s.k != p.k) return null;
+        var g = metal.Geometry{ .grid = .{ ci(s.n / 4), ci(s.rows), 1 }, .tg = .{ ci(@min(256, s.n / 4)), 1, 1 } };
+        g.out(&.{ ci(s.rows), HC, ci(s.n) }, act);
+        g.dtype("T", act);
+        g.int("HC", HC);
+        g.int("D", s.n);
+        g.int("K", p.k);
+        return g;
+    }
+
+    /// moe_combine's `dn`, `inv` and `sh`, then the expand's `res`, `post` and `comb`.
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        try MoeCombine.fill(k, f, rng);
+        const L = k.shape.rows;
+        const D = k.shape.n;
+        const res = try k.add(act, &.{ L, HC, D });
+        const post = try k.add(.float32, &.{ L, HC });
+        const comb = try k.add(.float32, &.{ L, HC, HC });
+        kit.uniform(rng, res, -3, 3);
+        kit.uniform(rng, post, 0, 2);
+        kit.uniform(rng, comb, 0, 0.5);
+        if (f == .nonfinite) kit.plantRows(res, L, HC * D);
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * HC * s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const D = k.shape.n;
+        const K = k.p.k;
+        const res = k.in(3);
+        const post = k.in(4);
+        const comb = k.in(5);
+        var t: [17]f64 = undefined;
+        for (0..k.shape.rows) |l| for (0..D) |d| {
+            var ym: f64 = 0;
+            for (0..K) |j| {
+                const row: usize = @intFromFloat(k.in(1)[l * K + j]);
+                t[j] = k.in(0)[row * D + d];
+            }
+            t[K] = k.in(2)[l * D + d];
+            for (t[0 .. K + 1]) |v| ym += @abs(v);
+            // The combined row rounds to T before the expand reads it.
+            const y = bf(sum.of(t[0 .. K + 1]));
+            for (0..HC) |i| {
+                const o = (l * HC + i) * D + d;
+                var v = post[l * HC + i] * y;
+                var m = @abs(post[l * HC + i]) * ym;
+                for (0..HC) |j| {
+                    const c = comb[(l * HC + j) * HC + i] * res[(l * HC + j) * D + d];
+                    v += c;
+                    m += @abs(c);
+                }
+                out[o] = v;
+                mag[o] = m;
+            }
+        };
+    }
+};
+
+fn depthTail(s: Shape) usize {
+    return s.k + 1 + HC;
+}
 
 // ── hyper-connections: mix (dots and rms of the flattened stream), split (Sinkhorn), norm (split + collapse + rms) ──
 
@@ -4192,6 +4263,7 @@ fn GgufMoe(comptime ty: gguf_quants.GgmlType) type {
 const dn_l = launch("dsv41_moe_dn", moe_dn_ins, &.{"out"}, v41.MOE_DN_SOURCE, v41.MOE_HEADER, 0, 928, false);
 const act_l = launch("dsv41_moe_act", &.{ "y", "wts", "lim" }, &.{"out"}, v41.MOE_ACT_SOURCE, "", 0, 1024, false);
 const combine_l = launch("dsv41_moe_combine", &.{ "dn", "inv", "sh" }, &.{"out"}, v41.MOE_COMBINE_SOURCE, "", 0, 1024, false);
+const moe_tail_l = launch("dsv41_moe_tail", &mtail.ins, &.{"out"}, mtail.source, "", 0, 1024, false);
 
 pub const relu_nan: spec.Known = .{ .gate = .nonfinite, .finding = "a NaN q . k dot scores as 0: metal::max(dot, 0) drops NaN where relu (the reference, torch) propagates it" };
 pub const quant_nan: spec.Nan = .{ .stated = "classes as float64 gives them; quantized entries within the quantizer's envelope of their bounds" };
@@ -4545,6 +4617,15 @@ pub fn register(set: *kc.Set) !void {
         .name = "dsv41 moe_combine (prefill unsort + K-sum + shared)",
         .accum = .f32,
         .depth = depthK1,
+        .out = .bf16,
+        .served = &.{ .{ .rows = 17, .n = DIM, .k = TOPK }, .{ .rows = 64, .n = 256, .k = TOPK } },
+    });
+    try kit.add(set, MoeTail, &moe_tail_l, .{}, .{
+        .name = "dsv41 moe_tail (prefill combine + hc expand)",
+        .accum = .f32,
+        .depth = depthTail,
+        .ops = 2,
+        .mids = 1,
         .out = .bf16,
         .served = &.{ .{ .rows = 17, .n = DIM, .k = TOPK }, .{ .rows = 64, .n = 256, .k = TOPK } },
     });
@@ -5130,5 +5211,10 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
     {
         const r = try ours(MoeCombine, a, &combine_l, .{}, .{ .rows = 3, .n = 256, .k = TOPK });
         try Expect.same(r.c, r.bytes, &.{try v41.flatKernel(&sc, m.moe_combine_kernel, r.c.args[0..3], &.{ 3, 256 }, act, 3 * 256, &.{ .{ .name = "D", .v = 256 }, .{ .name = "K", .v = TOPK } })});
+    }
+    {
+        const r = try ours(MoeTail, a, &moe_tail_l, .{}, .{ .rows = 3, .n = 256, .k = TOPK });
+        const sp: v41.Split = .{ .pre = none, .post = r.c.args[4], .comb = r.c.args[5] };
+        try Expect.same(r.c, r.bytes, &.{try mtail.launch(&sc, .{ .dn = r.c.args[0], .inv = r.c.args[1], .sh = r.c.args[2] }, r.c.args[3], &sp)});
     }
 }
