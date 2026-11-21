@@ -183,3 +183,71 @@ test "dsv41 wide exact: the paired fp4 gate+up with moe_act in its epilogue give
     }
     if (differs) return error.TestExpectedEqual;
 }
+
+// ── the hc stages ──
+
+/// A model holding only the hc kernels, at the release's widths, the fused ones built and probed.
+fn hcModel(m: *dsv41.Dsv41Model) !void {
+    m.cfg = .{};
+    m.cfg.hidden_size = hidden;
+    m.cfg.dsv4_hc_mult = 4;
+    m.cfg.dsv4_hc_sinkhorn_iters = 20;
+    m.s = mlx.gpuStream();
+    m.act = .bfloat16;
+    m.hc_tg = 1024;
+    m.hc_mix_kernel = try dsv41.buildKernel("dsv41_hc_mix", &.{ "x", "fn", "scale", "base", "eps" }, &.{"z"}, dsv41.HC_MIX_SOURCE, "");
+    m.hc_norm_kernel = try dsv41.buildKernel("dsv41_hc_norm", &.{ "z", "x", "cpre", "w", "eps" }, &.{ "pre", "post", "comb", "h_out" }, dsv41.HC_NORM_SOURCE, "");
+    m.hc_split_kernel = try dsv41.buildKernel("dsv41_hc_split", &.{ "z", "eps" }, &.{ "pre", "post", "comb" }, dsv41.HC_SPLIT_SOURCE, "");
+    try dsv41.hcFuseInit(testing.allocator, m);
+}
+
+fn hcModelFree(m: *dsv41.Dsv41Model) void {
+    for ([_]mlx.mlx_fast_metal_kernel{ m.hc_mix_kernel, m.hc_norm_kernel, m.hc_split_kernel }) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+}
+
+/// `L` rows of a wide layer's hc inputs: the stream, the block output, its split, the previous mix, the mix weights
+/// and the norm.
+const HcRows = struct { x: A, y: A, sp: dsv41.Split, cpre: A, hc: dsv41.Hc, w: A };
+
+fn hcRows(sc: *dsv41.Scope, L: c_int, seed: u64) !HcRows {
+    const d: c_int = @intCast(hidden);
+    return .{
+        .x = try normal(sc, &.{ L, 4, d }, .bfloat16, 1, seed),
+        .y = try normal(sc, &.{ L, d }, .bfloat16, 1, seed + 1),
+        .sp = .{ .pre = none, .post = try uniform(sc, &.{ L, 4 }, .float32, 0.1, 2, seed + 2), .comb = try uniform(sc, &.{ L, 4, 4 }, .float32, 0, 1, seed + 3) },
+        .cpre = try uniform(sc, &.{ L, 4 }, .float32, 0.05, 0.45, seed + 4),
+        .hc = .{ .fn_w = try normal(sc, &.{ 24, 4 * d }, .float32, 0.01, seed + 5), .scale = try uniform(sc, &.{24}, .float32, 0.5, 1.5, seed + 6), .base = try uniform(sc, &.{24}, .float32, -0.5, 0.5, seed + 7) },
+        .w = try uniform(sc, &.{d}, .bfloat16, 0.5, 1.5, seed + 8),
+    };
+}
+
+test "dsv41 wide exact: the FFN-side hc expand and norm in one launch give the stock launches' stream, split and norm bit for bit at prompt widths" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var m: dsv41.Dsv41Model = undefined;
+    try hcModel(&m);
+    defer hcModelFree(&m);
+    const unset = env.override(.MLX_SERVE_DSV41_HC_EXPAND_NORM, null);
+    defer unset.restore();
+    for ([_]c_int{ 17, 256, 1027, 4096, 8192 }, 0..) |L, i| {
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const r = try hcRows(&sc, L, 0x4C00 + 16 * @as(u64, i));
+        const want = try dsv41.hcExpandPreNorm(&sc, &m, r.x, r.y, &r.sp, r.cpre, &r.hc, r.w);
+        const on = env.override(.MLX_SERVE_DSV41_HC_EXPAND_NORM, "1");
+        defer on.restore();
+        const got = (try dsv41.hcExpandNormFresh(&sc, &m, r.x, r.y, &r.sp, r.cpre, &r.hc, r.w)) orelse return error.FusedHcRefused;
+        const served = try dsv41.hcExpandPreNorm(&sc, &m, r.x, r.y, &r.sp, r.cpre, &r.hc, r.w);
+        for ([_]dsv41.Staged{ got, served }) |g| for ([_][2]A{ .{ want.x1, g.x1 }, .{ want.h, g.h }, .{ want.sp.pre, g.sp.pre }, .{ want.sp.post, g.sp.post }, .{ want.sp.comb, g.sp.comb } }, 0..) |pr, k| {
+            if (!try sameBytes(pr[0], pr[1])) {
+                std.debug.print("hc expand norm rows {d}: output {d} differs from the stock launches'\n", .{ L, k });
+                return error.TestExpectedEqual;
+            }
+        };
+        // Planted: the fused launch at 512 threads (another reduction order) must not pass for the stock bytes.
+        m.hc_tg = 512;
+        const planted = (try dsv41.hcExpandNormFresh(&sc, &m, r.x, r.y, &r.sp, r.cpre, &r.hc, r.w)) orelse return error.FusedHcRefused;
+        m.hc_tg = 1024;
+        try testing.expect(!(try sameBytes(want.h, planted.h) and try sameBytes(want.sp.comb, planted.sp.comb)));
+    }
+}

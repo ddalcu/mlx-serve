@@ -2796,6 +2796,7 @@ pub fn hcStage(sc: *Scope, m: *const Dsv41Model, x: A, ex: ?Expand, cpre: A, hc:
 /// block pays for that rebuild in every mix, so it expands once.
 pub fn hcExpandPreNorm(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const Split, cpre: A, hc: *const Hc, norm_w: A) !Staged {
     const s: Staged = if (dim(x, 0) <= region_rows) try hcStage(sc, m, x, .{ .y = y, .sp = sp }, cpre, hc, norm_w) else blk: {
+        if (try hcExpandNormFresh(sc, m, x, y, sp, cpre, hc, norm_w)) |f| break :blk f;
         const x1 = try hcExpand(sc, x, y, sp);
         const r = try hcPreNormWide(sc, m, x1, cpre, hc, norm_w);
         break :blk .{ .x1 = x1, .sp = r.sp, .h = r.h };
@@ -3043,6 +3044,16 @@ fn hcExpandNormScratch(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const 
     const z = try hcMixWide(sc, m, x1, hc, eps);
     // The layer's tail may write in place over the region (`moeExpand`'s `into`), as the stock path's.
     return .{ .x1 = x1, .sp = try hcSplitWide(sc, m, z, eps), .h = f.h, .in_region = true };
+}
+
+/// hc_fuse.zig: `hcExpandPreNorm`'s expand and norm as one launch into a fresh stream, then the mixes over it and the
+/// split from them, the stock launches' words (`MLX_SERVE_DSV41_HC_EXPAND_NORM`); null where that is off or the fused
+/// kernels were refused at load.
+pub fn hcExpandNormFresh(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const Split, cpre: A, hc: *const Hc, norm_w: A) !?Staged {
+    if (hcf_k == null or !env.on(.MLX_SERVE_DSV41_HC_EXPAND_NORM)) return null;
+    const eps = try hcEps(sc, m);
+    const f = try hcExpandNormLaunch(sc, m, x, y, sp, cpre, norm_w, eps, null, none);
+    return .{ .x1 = f.x1, .sp = try hcSplitWide(sc, m, try hcMixWide(sc, m, f.x1, hc, eps), eps), .h = f.h };
 }
 
 /// Collapse the hc copies `[L, hc, D]` with `pre` `[L, hc]`, in f32.
