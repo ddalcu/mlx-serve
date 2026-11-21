@@ -78,6 +78,8 @@ const acore = @import("prompt/attn_core.zig");
 /// a wide span's attention as one flash
 /// kernel (an online softmax; the scores and probabilities never leave a threadgroup), not exact.
 const fa = @import("prompt/flash_attn.zig");
+/// A prompt pass's last wide layer committed, not waited for (exact).
+const pass_async = @import("prompt/pass_async.zig");
 const Shard = @import("../../sdk/weights/shard.zig").Shard;
 
 const A = mlx.mlx_array;
@@ -5559,6 +5561,8 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
     const n_spans = sp.xs.len;
     // Wide spans run a layer's row-wise stages over the whole chunk, attention's core per span.
     const wide = n_spans > 1 and sp.span > region_rows and m.trace == null;
+    // pass_async.zig: the pass's last wide layer is committed too.
+    const last_async = wide and m.streamed == null and m.pair == null and m.tp == null and pass_async.on(sp.L);
     // The kept projection outputs: a kept set no wide layer of this pass took is let go at its end.
     defer tkeep.drop();
     for (lo..hi) |li| {
@@ -5586,7 +5590,7 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
             try appendLayerState(gpa, &ev, &st.layers[li]);
             // a wide layer with a wide one after it is committed, not waited for: the next layer's start
             // (its graph, its read-ahead's first buffers) runs under this one's tail.
-            if (wide and li + 1 < hi) {
+            if (wide and (li + 1 < hi or last_async)) {
                 const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
                 defer _ = mlx.mlx_vector_array_free(vec);
                 try mlx.check(mlx.mlx_async_eval(vec));
