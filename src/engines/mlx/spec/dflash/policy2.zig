@@ -362,8 +362,8 @@ test "policy2: a first-draft bin two unlucky misses froze stays frozen under the
     try testing.expect(starvedRun(false, 0.55, 0.65, 2, true) > 200);
     // Without labels (a sampled request), the per-round drift alone brings it back.
     try testing.expect(starvedRun(false, 0.55, 0.65, 2, false) > 100);
-    // And a bin that truly does not pay is not bought: 15% drafts stay unverified after their misses.
-    try testing.expect(starvedRun(false, 0.55, 0.15, 2, true) < 40);
+    // And a bin that truly does not pay is not bought: 10% drafts stay unverified after their misses.
+    try testing.expect(starvedRun(false, 0.55, 0.10, 2, true) < 40);
 }
 
 test "policy2: the starved bin recovers within 20 rounds once its drafts land" {

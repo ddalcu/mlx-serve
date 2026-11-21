@@ -62,7 +62,8 @@ pub fn logSpecStats(self: *const Generator) void {
             .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round, self.dspark_attempted - self.dspark_copies, self.dspark_copies, self.dspark_copy_drafted, self.dspark_copy_accepted, self.dspark_group_rounds },
         );
         if (self.dspark_pol) |pol| {
-            const skipped, const probes = if (pol.p2) |p| .{ p.drafting.skipped, p.drafting.probes } else .{ pol.drafting.skipped, pol.drafting.probes };
+            const skipped = if (pol.p2) |p| p.drafting.skipped else pol.drafting.skipped;
+            const probes = if (pol.p2) |p| p.drafting.probes else pol.drafting.probes;
             log.info(
                 "  [spec-stats] dspark policy: plain_ticks={d} skipped={d} probes={d} plain_ms={d:.2} acc_pos={s} rows_hist={s}\n",
                 .{ self.dspark_plain, skipped, probes, pol.plain.ms, self.dspark_stats.formatAcc(&acc_buf), self.dspark_stats.formatRows(&rows_buf) },
