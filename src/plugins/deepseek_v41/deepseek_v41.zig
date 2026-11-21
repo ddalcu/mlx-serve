@@ -78,6 +78,8 @@ const acore = @import("prompt/attn_core.zig");
 /// a wide span's attention as one flash
 /// kernel (an online softmax; the scores and probabilities never leave a threadgroup), not exact.
 const fa = @import("prompt/flash_attn.zig");
+/// A prompt chunk's CED replay left to its first reader, dropped when the next chunk replays (exact).
+const ced_lazy = @import("prompt/ced_lazy.zig");
 /// A prompt pass's last wide layer committed, not waited for (exact).
 const pass_async = @import("prompt/pass_async.zig");
 const Shard = @import("../../sdk/weights/shard.zig").Shard;
@@ -2478,6 +2480,8 @@ pub const State = struct {
     snap_at: ?usize = null,
     snap_ids: []u32 = &.{},
     snap_vision_key: u64 = 0,
+    /// prompt/ced_lazy.zig: the decoder layers' window rings and the DSpark rows hold the last chunk's replay, unevaluated.
+    ced_lazy: bool = false,
 
     pub fn deinit(self: *State) void {
         if (self.snap) |*sn| sn.deinit(self.gpa);
@@ -5396,6 +5400,12 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     // replay tail's spans when the chunk has one.
     const n_spans = (L + span - 1) / span;
     const tail = cedTail(m, st, L, want);
+    // ced_lazy.zig: the last chunk's replay, still unevaluated, is dropped where this call replays its own tail (a
+    // lead's rest does); any other call reads it.
+    if (st.ced_lazy) {
+        st.ced_lazy = false;
+        if (tail != null or want == .encode) try cedDrop(m, st);
+    }
     const n_tail = if (tail) |t| (t + span - 1) / span else 0;
     const targets: usize = if (m.n_mtp > 0) c.dsv4_n_dspark_target_layers else 0;
     // (+ 4: `Spans.whole`'s two slots for the chunk's spans and two for the tail's)
@@ -5539,15 +5549,44 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     }
     // A tensor rank past 0 holds no head: its last stream stands in for the logits.
     const logits = if (!m.hasHead()) try sc.astype(h, .float32) else try headLogits(&sc, m, h, want == .all and st.verify != null);
+    // ced_lazy.zig: a replay that another replaying chunk of the prompt follows is left to its first reader: the
+    // logits, the decoder layers' window rings and the DSpark rows stay unevaluated.
+    const lazy = tail != null and ced_lazy.on() and m.tp == null and m.streamed == null and ids == .host and
+        ced_lazy.defers(m.prompt, ids.host, p0, c.sliding_window, m.ced_min_skip, st.snap_at);
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(gpa);
-    try ev.append(gpa, logits);
-    for (st.layers) |*ls| try appendLayerState(gpa, &ev, ls);
-    for (st.ds) |r| try ev.append(gpa, r.buf);
+    if (!lazy) try ev.append(gpa, logits);
+    for (st.layers, 0..) |*ls, li| if (lazy and li >= m.ced_split.?) try appendCaches(gpa, &ev, ls) else try appendLayerState(gpa, &ev, ls);
+    if (!lazy) for (st.ds) |r| try ev.append(gpa, r.buf);
+    st.ced_lazy = lazy;
     const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_async_eval(vec));
     return sc.out(logits);
+}
+
+/// ced_lazy.zig: the last chunk's replay, never evaluated, dropped: the decoder layers' window rings and the DSpark
+/// stages' start again as zeros (the next replay writes every row a read reaches) and its main row goes.
+fn cedDrop(m: *const Dsv41Model, st: *State) !void {
+    for (st.layers[m.ced_split.?..]) |*ls| try freshRing(&ls.win, m.s);
+    for (st.ds) |*r| try freshRing(r, m.s);
+    if (st.mh.ctx != null) _ = mlx.mlx_array_free(st.mh);
+    st.mh = none;
+    log.info("[dsv41] CED_LAZY: the replay before position {d} dropped: this chunk replays its own tail\n", .{st.n});
+}
+
+fn freshRing(r: *Ring, s: S) !void {
+    const fresh = try Ring.init(r.cap, r.width, mlx.mlx_array_dtype(r.buf), s);
+    r.deinit();
+    r.* = fresh;
+}
+
+/// `appendLayerState` without the window ring: what the encoder side writes into a decoder layer.
+fn appendCaches(gpa: std.mem.Allocator, ev: *std.ArrayList(A), ls: *const LState) !void {
+    if (ls.comp) |r| if (r.buf.ctx != null) try ev.append(gpa, r.buf);
+    if (ls.idx_k) |r| if (r.buf.ctx != null) try ev.append(gpa, r.buf);
+    if (ls.pend_kv.ctx != null) try ev.append(gpa, ls.pend_kv);
+    if (ls.pend_gate.ctx != null) try ev.append(gpa, ls.pend_gate);
 }
 
 fn monoUs() i64 {
