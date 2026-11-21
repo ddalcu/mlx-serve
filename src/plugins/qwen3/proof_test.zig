@@ -405,6 +405,20 @@ test "qwen3 plugin: a Qwen3-Embedding pack's pooled rows equal the legacy dense 
     }
 }
 
+test "qwen3 plugin: an embedding request leaves no KV or pooled buffers behind" {
+    const a = testing.allocator;
+    var b: Both = undefined;
+    try b.open(.{ .quantized = true, .last_token_pooling = true }, 0x3e01);
+    defer b.close();
+    const rows = try pooling.computeEmbeddingsBatch(a, &b.xfm, &.{&.{ 5, 9, 33, 70, 2 }});
+    for (rows) |row| a.free(row);
+    a.free(rows);
+    try testing.expectEqual(@as(u64, 0), b.xfm.cache.residentBytes());
+    var pooled: usize = 0;
+    _ = mlx.mlx_get_cache_memory(&pooled);
+    try testing.expectEqual(@as(usize, 0), pooled);
+}
+
 test "qwen3 plugin: missing untied chat head fails without double cleanup" {
     var b: Both = undefined;
     try testing.expectError(error.MissingWeight, b.open(.{ .head_dim = 256, .omit_head = true }, 0x3e02));
