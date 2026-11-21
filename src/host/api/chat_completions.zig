@@ -1371,6 +1371,7 @@ test "extractJsonField and declaresTools see tools only in a non-empty top-level
         .{ .body = "{\"messages\":[]}", .tools = null },
         .{ .body = "{\"messages\":[],\"tools\":null}", .tools = null },
         .{ .body = "{\"messages\":[],\"tools\":[]}", .tools = null },
+        .{ .body = "{\"messages\":[],\"tools\":{\"type\":\"function\"}}", .tools = null },
         .{ .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"tools\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\"}}]}", .tools = "[{\"type\":\"function\",\"function\":{\"name\":\"f\"}}]" },
     };
     for (cases) |c| {

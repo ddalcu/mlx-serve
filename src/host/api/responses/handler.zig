@@ -1481,13 +1481,13 @@ fn completedEventPayload(allocator: std.mem.Allocator, envelope: []const u8, tim
 
 const ResponsesRequestTools = struct { json: ?[]const u8 = null, has_tools: bool = false };
 
-/// The chat template's tool list for a Responses request and whether it runs in tool mode; the caller frees `json`.
+/// The caller frees `json`.
 fn responsesRequestTools(allocator: std.mem.Allocator, tools: ?std.json.Value, include_tools: bool, aliases: *responses_mod.NamespaceAliases) !ResponsesRequestTools {
     var out: ResponsesRequestTools = .{ .has_tools = include_tools and chat_mod.declaresTools(tools) };
-    if (out.has_tools) if (tools) |tools_val| if (tools_val == .array) {
-        out.json = try responses_mod.buildToolsJson(allocator, tools_val.array, aliases);
+    if (out.has_tools) {
+        out.json = try responses_mod.buildToolsJson(allocator, tools.?.array, aliases);
         out.has_tools = out.json.?.len > 2;
-    };
+    }
     return out;
 }
 
