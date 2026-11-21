@@ -6,6 +6,7 @@ const json_grammar = @import("json_grammar.zig");
 const json_schema = @import("json_schema.zig");
 const token_mask = @import("token_mask.zig");
 const rp_mod = @import("protocol.zig");
+const log = @import("../util/log.zig");
 
 pub const Constraint = struct {
     grammar: *json_grammar.Grammar,
@@ -22,6 +23,45 @@ pub const Constraint = struct {
     /// authoritative reasoning→answer boundary the response emitters route
     /// on. Set exactly once, at the transition; `null` until then.
     pending_span: ?rp_mod.ConstraintSpan = null,
+
+    /// The reasoning protocol still drives the next token (its own masks and forced transitions), not the JSON grammar.
+    pub fn prePayload(self: *const Constraint) bool {
+        return self.proto != null and self.pstate.phase != .json_body;
+    }
+
+    /// Fill `mask_buf` for the next payload token: the grammar's legal tokens, every stop id once
+    /// the value is complete, and the whole vocabulary (grammar marked dead) when nothing is legal.
+    pub fn fillPayloadMask(self: *Constraint, eos_token_ids: []const u32) std.mem.Allocator.Error!void {
+        var allowed = (try token_mask.buildMask(self.grammar, self.token_bytes, self.mask_buf)).allowed;
+        // The tokenizer's EOS is not necessarily the model's only stop id.
+        if (self.grammar.isComplete()) {
+            for (eos_token_ids) |eos_id| {
+                if (eos_id < self.mask_buf.len and !self.mask_buf[eos_id]) {
+                    self.mask_buf[eos_id] = true;
+                    allowed += 1;
+                }
+            }
+        }
+        if (allowed == 0) {
+            log.warn("[grammar] no token satisfies the schema at this position — disabling further mask enforcement\n", .{});
+            self.grammar.dead = true;
+            @memset(self.mask_buf, true);
+        }
+    }
+
+    /// Advance the grammar by a sampled payload token's bytes. The mask admitted every byte (or the token has
+    /// no byte form, e.g. a special tag), so a rejection is a bug: it is logged and the grammar is marked dead.
+    pub fn acceptPayloadToken(self: *Constraint, token: u32) std.mem.Allocator.Error!void {
+        if (token >= self.token_bytes.bytes.len) return;
+        const bytes = self.token_bytes.bytes[token] orelse return;
+        for (bytes) |b| {
+            if (!try self.grammar.acceptByte(b)) {
+                log.warn("[grammar] sampled token {d} produced byte 0x{x} that was rejected — disabling further mask enforcement\n", .{ token, b });
+                self.grammar.dead = true;
+                return;
+            }
+        }
+    }
 };
 
 /// A forced recovery must leave room for the whole remaining transition AND

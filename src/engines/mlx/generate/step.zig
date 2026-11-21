@@ -454,42 +454,30 @@ pub fn nextConstrained(self: *Generator, allocator: std.mem.Allocator) !?u32 {
     return token;
 }
 
-pub fn nextConstrainedToken(self: *Generator, allocator: std.mem.Allocator) !?u32 {
-    if (!self.has_pending_logits) {
-        self.done = true;
-        return null;
-    }
+/// Stall and `max_tokens` caps for a constrained draw; sets the length finish and returns true when hit.
+pub fn constrainedCapStop(self: *Generator) bool {
     if (self.stall.expired(self.timer.read(), self.generated_ids.items.len, self.timeout_ns)) {
         self.done = true;
         self.finish_reason = "length";
-        return null;
+        return true;
     }
     if (self.step >= self.max_tokens) {
         self.done = true;
         self.finish_reason = "length";
-        return null;
+        return true;
     }
-    const constraint = self.sampling.constraint.?;
-    if (constraint.proto) |proto| {
-        if (constraint.pstate.phase != .json_body) return self.nextReasoningStep(allocator, constraint, proto);
-    }
+    return false;
+}
+
+pub const ConstrainedDraw = struct { token: u32, next_logits: ?mlx.mlx_array };
+
+/// One schema-constrained draw from the pending logits: mask, one seeded sample, stop rules. The grammar, step and
+/// stream are untouched; a stop ends the generator and returns null. With `forward`, the next forward is dispatched
+/// on the sample and its logits are returned for the caller to own.
+pub fn drawConstrained(self: *Generator, allocator: std.mem.Allocator, constraint: *Constraint, forward: bool) !?ConstrainedDraw {
     const s = self.xfm.s;
 
-    var allowed = (try token_mask.buildMask(constraint.grammar, constraint.token_bytes, constraint.mask_buf)).allowed;
-    // The tokenizer's EOS is not necessarily the model's only stop id.
-    if (constraint.grammar.isComplete()) {
-        for (self.eos_token_ids) |eos_id| {
-            if (eos_id < constraint.mask_buf.len and !constraint.mask_buf[eos_id]) {
-                constraint.mask_buf[eos_id] = true;
-                allowed += 1;
-            }
-        }
-    }
-    if (allowed == 0) {
-        log.warn("[grammar] no token satisfies the schema at this position — disabling further mask enforcement\n", .{});
-        constraint.grammar.dead = true;
-        @memset(constraint.mask_buf, true);
-    }
+    try constraint.fillPayloadMask(self.eos_token_ids);
 
     const step_logits = self.pending_logits;
     self.has_pending_logits = false;
@@ -506,7 +494,7 @@ pub fn nextConstrainedToken(self: *Generator, allocator: std.mem.Allocator) !?u3
     const lazy = self.sampleLazy(masked_logits);
     defer _ = mlx.mlx_array_free(lazy);
     var next_logits: ?mlx.mlx_array = null;
-    if (self.step + 1 < self.max_tokens) {
+    if (forward and self.step + 1 < self.max_tokens) {
         if (lazyForward(self.xfm, &self.ctx, lazy)) |nl| {
             const arr = [_]mlx.mlx_array{ lazy, nl };
             const vec = mlx.mlx_vector_array_new_data(&arr, 2);
@@ -524,68 +512,75 @@ pub fn nextConstrainedToken(self: *Generator, allocator: std.mem.Allocator) !?u3
     const token: u32 = @intCast(val);
     self.next_token_id = token;
 
-    // Stop on EOS — do not advance grammar or include in output. A
-    // dispatched forward on the stop token is dropped, as on the lazy path.
-    for (self.eos_token_ids) |eos_id| {
-        if (token == eos_id) {
-            if (next_logits) |nl| _ = mlx.mlx_array_free(nl);
-            self.done = true;
-            self.finish_reason = "stop";
-            return null;
-        }
+    // Stop on EOS: the token never reaches the grammar or the output, and a
+    // dispatched forward on it is dropped, as on the lazy path.
+    if (tokenStops(token, self.eos_token_ids, &self.consecutive_pad)) {
+        if (next_logits) |nl| _ = mlx.mlx_array_free(nl);
+        self.done = true;
+        self.finish_reason = "stop";
+        return null;
     }
-    if (token == 0) {
-        self.consecutive_pad += 1;
-        if (self.consecutive_pad >= 3) {
-            if (next_logits) |nl| _ = mlx.mlx_array_free(nl);
-            self.done = true;
-            self.finish_reason = "stop";
-            return null;
-        }
-    } else {
-        self.consecutive_pad = 0;
+    return .{ .token = token, .next_logits = next_logits };
+}
+
+pub fn nextConstrainedToken(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+    if (self.batched_unforwarded) return try commitBatchedToken(self, allocator);
+    if (!self.has_pending_logits) {
+        self.done = true;
+        return null;
+    }
+    if (constrainedCapStop(self)) return null;
+    const constraint = self.sampling.constraint.?;
+    if (constraint.proto) |proto| {
+        if (constraint.pstate.phase != .json_body) return self.nextReasoningStep(allocator, constraint, proto);
     }
 
-    // Advance the grammar by the sampled token's byte sequence. The mask
-    // guarantees every byte is accepted (or the token has no byte form, e.g. a
-    // special tag) — so a rejection here means a bug we want to surface.
-    if (token < constraint.token_bytes.bytes.len) {
-        if (constraint.token_bytes.bytes[token]) |bytes| {
-            for (bytes) |b| {
-                const ok = try constraint.grammar.acceptByte(b);
-                if (!ok) {
-                    log.warn("[grammar] sampled token {d} produced byte 0x{x} that was rejected — disabling further mask enforcement\n", .{ token, b });
-                    constraint.grammar.dead = true;
-                    break;
-                }
-            }
-        }
-    }
+    const d = (try drawConstrained(self, allocator, constraint, true)) orelse return null;
+    errdefer if (d.next_logits) |nl| {
+        _ = mlx.mlx_array_free(nl);
+    };
+
+    try constraint.acceptPayloadToken(d.token);
 
     self.advanceStep(1);
-    try self.generated_ids.append(allocator, token);
+    try self.generated_ids.append(allocator, d.token);
 
-    if (next_logits) |nl| {
+    if (d.next_logits) |nl| {
         self.pending_logits = nl;
         self.has_pending_logits = true;
-    } else if (self.step < self.max_tokens) {
-        // Pipeline miss: forward the realized token.
-        const tok_i32: i32 = @intCast(token);
-        const tok_shape = [_]c_int{ 1, 1 };
-        const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
-        defer _ = mlx.mlx_array_free(tok_input);
-        const nl = try self.xfm.forwardWith(&self.ctx, tok_input);
-        const arr = [_]mlx.mlx_array{nl};
-        const vec = mlx.mlx_vector_array_new_data(&arr, 1);
-        _ = mlx.mlx_async_eval(vec);
-        _ = mlx.mlx_vector_array_free(vec);
-        self.pending_logits = nl;
-        self.has_pending_logits = true;
-    } else {
+    } else try forwardRealized(self, d.token);
+
+    return d.token;
+}
+
+/// Pipeline miss: forward the realized `token` so its successor's logits are pending, or end at the cap.
+fn forwardRealized(self: *Generator, token: u32) !void {
+    if (self.step >= self.max_tokens) {
         self.done = true;
         self.finish_reason = "length";
+        return;
     }
+    const tok_i32: i32 = @intCast(token);
+    const tok_shape = [_]c_int{ 1, 1 };
+    const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+    defer _ = mlx.mlx_array_free(tok_input);
+    const nl = try self.xfm.forwardWith(&self.ctx, tok_input);
+    const arr = [_]mlx.mlx_array{nl};
+    const vec = mlx.mlx_vector_array_new_data(&arr, 1);
+    _ = mlx.mlx_async_eval(vec);
+    _ = mlx.mlx_vector_array_free(vec);
+    self.pending_logits = nl;
+    self.has_pending_logits = true;
+}
 
+/// A batched tick drew `next_token_id` under the grammar and already advanced the grammar by it: emit and forward
+/// it here, so a slot that left the batch picks up where the tick stopped.
+fn commitBatchedToken(self: *Generator, allocator: std.mem.Allocator) !u32 {
+    self.batched_unforwarded = false;
+    const token = self.next_token_id;
+    self.advanceStep(1);
+    try self.generated_ids.append(allocator, token);
+    try forwardRealized(self, token);
     return token;
 }
 

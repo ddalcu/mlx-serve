@@ -1273,7 +1273,9 @@ pub fn batchVerdict(self: *const Scheduler, slot: *const Slot) BatchVerdict {
     if (!slotTicksRegular(slot)) return .spec_active;
     // A slot whose module-head release is armed but not landed still holds the head.
     if (slotReleasePending(slot)) return .head_release_pending;
-    if (slot.sampling.constraint != null) return .grammar;
+    // A grammar row batches once its payload is under the JSON mask; the reasoning protocol's own
+    // masks and forced transitions before that run serial.
+    if (slot.sampling.constraint) |c| if (c.prePayload()) return .grammar;
     if (slot.logprobs_n > 0) return .logprobs;
     if (slot.sampling.penalized()) return .penalty;
     const cfg = slot.model.config orelse return .arch;
@@ -1458,4 +1460,27 @@ test "cancelAllInFlight: a request being prefilled at a chunk boundary is cancel
     sch.boundary_slot = &slot;
     cancelAllInFlight(&sch);
     try testing.expect(slot.cancelled.load(.acquire));
+}
+
+test "batchVerdict: a grammar slot batches once its reasoning protocol reached the JSON body, not before" {
+    var lm: LoadedModel = undefined;
+    lm.engine = null;
+    lm.transformer = null;
+    lm.prefix_cache = null;
+    var cfg: ModelConfig = .{};
+    cfg.num_hidden_layers = 0;
+    lm.config = &cfg;
+    var c: @import("../../sdk/grammar/constraint.zig").Constraint = .{ .grammar = undefined, .token_bytes = undefined, .mask_buf = &.{} };
+    const params: SubmitParams = .{ .model = &lm, .prompt_ids = &.{ 5, 6, 7 }, .sampling = .{ .temperature = 0, .constraint = &c }, .eos_token_ids = &.{}, .max_tokens = 1 };
+    const slot = try Slot.init(testing.allocator, testing.io, &cfg, params, .dense);
+    defer slot.deinit();
+    var sch: Scheduler = undefined;
+    try testing.expectEqual(BatchVerdict.ok, batchVerdict(&sch, slot));
+    const proto: rp_mod.Protocol = undefined;
+    c.proto = &proto;
+    try testing.expectEqual(BatchVerdict.ok, batchVerdict(&sch, slot));
+    for ([_]rp_mod.Phase{ .choice, .header, .reasoning }) |phase| {
+        c.pstate.phase = phase;
+        try testing.expectEqual(BatchVerdict.grammar, batchVerdict(&sch, slot));
+    }
 }

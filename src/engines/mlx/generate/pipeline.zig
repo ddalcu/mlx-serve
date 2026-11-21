@@ -72,6 +72,40 @@ pub fn drainPipelineForBatch(self: *Generator, allocator: std.mem.Allocator) !?u
     return token;
 }
 
+pub const Join = union(enum) {
+    /// The slot rides this tick; a pipelined token it drained is published first.
+    joined: ?u32,
+    /// Generation ended while draining (`finish_reason` is set).
+    stopped,
+};
+
+/// Bring a slot to the batched-tick entry invariant (`next_token_id` sampled, not forwarded, no pending state).
+pub fn joinBatch(self: *Generator, allocator: std.mem.Allocator) !Join {
+    if (!self.has_pending_logits and !self.has_pending_token) return .{ .joined = null };
+    if (self.sampling.constraint != null) return joinBatchConstrained(self, allocator);
+    const emitted = try self.drainPipelineForBatch(allocator) orelse return .stopped;
+    return .{ .joined = emitted };
+}
+
+/// A constrained slot holds no lookahead: what it returned is already emitted and forwarded, and `pending_logits`
+/// (or the prefill's) are the next position's. Draw that position under the grammar, as the serial step does, and
+/// stop short of forwarding or emitting it.
+fn joinBatchConstrained(self: *Generator, allocator: std.mem.Allocator) !Join {
+    std.debug.assert(!self.has_pending_token and self.has_pending_logits);
+    if (self.constrainedCapStop()) return .stopped;
+    const d = (try self.drawConstrained(allocator, self.sampling.constraint.?, false)) orelse return .stopped;
+    try noteBatchedSample(self, d.token);
+    return .{ .joined = null };
+}
+
+/// A batched row drew `token` and keeps going (not a stop): advance its grammar now, so the next tick's mask is
+/// built from it, and mark the token unforwarded for a serial step that takes the slot over.
+pub fn noteBatchedSample(self: *Generator, token: u32) !void {
+    const constraint = self.sampling.constraint orelse return;
+    try constraint.acceptPayloadToken(token);
+    self.batched_unforwarded = true;
+}
+
 /// Resolve the deferred pending token: eval the lazy array and extract the u32 value.
 /// This is called at the START of each iteration, giving the GPU maximum time
 /// to compute since the async_eval at the END of the previous iteration.

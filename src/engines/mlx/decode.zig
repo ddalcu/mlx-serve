@@ -85,8 +85,8 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
 
     // active.len >= 2 (or force_batched at len==1): split into batchable +
     // non-batchable. Batchable slots share one `forwardBatchedDecode` call.
-    // Non-batchable (slots running PLD/drafter or grammar-constrained) fall
-    // back to legacy single-slot decode this tick.
+    // Non-batchable (slots running PLD/drafter, or a grammar still in its
+    // reasoning protocol) fall back to legacy single-slot decode this tick.
     //
     // Plan 05 Phase D: batched decode requires all participating slots to
     // share a transformer. We partition `batchable` by `slot.model` and
@@ -101,6 +101,10 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     for (active) |s| {
         const why = @import("scheduler.zig").batchVerdict(sch, s);
         if (why == .ok and batchable_n < batchable_buf.len) {
+            // A grammar row keeps the serial step's repetition guard: a loop under a dead grammar runs to the cap otherwise.
+            if (s.legacy_gen) |*g| {
+                if (g.sampling.constraint != null and try loopGuardTick(sch, s, g)) continue;
+            }
             batchable_buf[batchable_n] = s;
             batchable_n += 1;
         } else if (why == .spec_active and slotMtpGroupable(s) and mtp_n < mtp_buf.len) {
@@ -110,7 +114,7 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
             ds_buf[ds_n] = s;
             ds_n += 1;
         } else {
-            // legacy single-slot for spec / grammar / overflow
+            // legacy single-slot for spec / grammar protocol / overflow
             noteSerial(sch, s, why);
             try runSingleDecodeTick(sch, s);
         }
