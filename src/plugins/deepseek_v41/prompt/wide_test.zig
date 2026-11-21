@@ -345,9 +345,45 @@ test "dsv41 wide tol: the hc mixes at 8 rows a threadgroup are the 4-row launche
     try testing.expect(ok);
 }
 
+test "dsv41 wide tol: the hc mixes on the simdgroup matrix units are hc_mix's mixes, and with hc_norm the fused attention-side launch's split and norm, within 1% at prompt widths; a dropped mix scale or base fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var m: dsv41.Dsv41Model = undefined;
+    try hcModel(&m);
+    defer hcModelFree(&m);
+    const off = env.override(.MLX_SERVE_DSV41_HC_MIX_TILED, "0");
+    defer off.restore();
+    var ok = true;
+    for ([_]c_int{ 17, 33, 1027, 5001, 8192 }, 0..) |L, i| {
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const r = try hcRows(&sc, L, 0x9900 + 16 * @as(u64, i));
+        const eps = try dsv41.hcEps(&sc, &m);
+        const z4 = try dsv41.hcMixWide(&sc, &m, r.x, &r.hc, eps);
+        const f = try dsv41.hcMixNormFused(&sc, &m, r.x, r.cpre, &r.hc, r.w, null, eps);
+        const on = env.override(.MLX_SERVE_DSV41_HC_MIX_TILED, "1");
+        defer on.restore();
+        const zt = try dsv41.hcMixWide(&sc, &m, r.x, &r.hc, eps);
+        const n = try dsv41.hcNorm(&sc, &m, zt, r.x, r.cpre, r.w, eps);
+        const names = [_][]const u8{ "z", "fused z", "h", "pre", "post", "comb" };
+        for ([_][2]A{ .{ z4, zt }, .{ f.z, zt }, .{ f.n.h, n.h }, .{ f.n.sp.pre, n.sp.pre }, .{ f.n.sp.post, n.sp.post }, .{ f.n.sp.comb, n.sp.comb } }, names) |pr, nm| {
+            var lb: [64]u8 = undefined;
+            if (!try close(try std.fmt.bufPrint(&lb, "hc mix tiled rows {d} {s}", .{ L, nm }), pr[0], pr[1], null, tol_kernel)) ok = false;
+        }
+        // Planted: the mixes' scale dropped, then their base dropped (ones and zeros in their places).
+        var bad_s = r.hc;
+        bad_s.scale = try sc.ones(mlx.getShape(r.hc.scale), .float32);
+        try testing.expect(!try close("  planted: mix scale dropped", z4, try dsv41.hcMixWide(&sc, &m, r.x, &bad_s, eps), null, tol_kernel));
+        var bad_b = r.hc;
+        bad_b.base = try sc.zeros(mlx.getShape(r.hc.base), .float32);
+        try testing.expect(!try close("  planted: mix base dropped", z4, try dsv41.hcMixWide(&sc, &m, r.x, &bad_b, eps), null, tol_kernel));
+    }
+    try testing.expect(ok);
+}
+
 // ── a release-shape pair worker's prefill ──
 
-const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN };
+const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_HC_MIX_TILED };
 
 /// The pair worker's streams and mixes after its layers over `x` / `pre`, from a fresh state (caller frees).
 fn prefill(fx: *fixture.Fixture, x: A, pre: A) ![2]A {

@@ -81,6 +81,8 @@ const acore = @import("prompt/attn_core.zig");
 const fa = @import("prompt/flash_attn.zig");
 /// the moe_pair.zig: a prompt call's fp4 gate and up with `moe_act` in one paired NAX launch.
 const mpair = @import("prompt/moe_pair.zig");
+/// hc_mix_mma.zig: a wide layer's hc mixes on the simdgroup matrix units (`MLX_SERVE_DSV41_HC_MIX_TILED`).
+const hmma = @import("prompt/hc_mix_mma.zig");
 const Shard = @import("../../sdk/weights/shard.zig").Shard;
 
 const A = mlx.mlx_array;
@@ -2697,6 +2699,7 @@ pub fn hcPreNormWide(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *const
 }
 /// `hcPreNormWide`'s mix kernel: `x`'s mix logits `[L, mix]` f32, which `hcNorm` turns into the split.
 pub fn hcMixWide(sc: *Scope, m: *const Dsv41Model, x: A, hc: *const Hc, eps: A) !A {
+    if (try hmma.mix(sc, x, hc, eps)) |z| return z;
     const L = dim(x, 0);
     const mix = dim(hc.fn_w, 0);
     const tg = m.hc_tg;
@@ -3078,7 +3081,8 @@ pub fn hcExpandNormLaunch(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *con
 /// one launch (`hcMixNormFused`, unless hc_fuse.zig's kernels were refused at load).
 fn attnHcWide(sc: *Scope, m: *const Dsv41Model, x: A, pres: A, ly: *const Layer, w2: ?A) !struct { pa: Normed, hp: A } {
     const eps = try hcEps(sc, m);
-    if (hcf_k != null) {
+    // `MLX_SERVE_DSV41_HC_MIX_TILED`: the mixes on the matrix units, then hc_norm (no read-ahead norm beside it).
+    if (hcf_k != null and (w2 != null or !env.on(.MLX_SERVE_DSV41_HC_MIX_TILED) or !hmma.fits(ly.hc_attn.fn_w, x))) {
         const r = try hcMixNormFused(sc, m, x, pres, &ly.hc_attn, ly.attn_norm, w2, eps);
         return .{ .pa = r.n, .hp = r.h2 };
     }
