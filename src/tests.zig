@@ -118,6 +118,7 @@ test {
     _ = @import("version.zig");
     _ = @import("mlx/ops.zig");
     _ = @import("mlx/kernels.zig");
+    _ = @import("mlx/pool.zig");
     _ = @import("sdk/bases/bases.zig");
     _ = @import("engines/mlx/plugin/proof.zig");
     _ = @import("engines/mlx/plugin/audit.zig");
@@ -291,6 +292,7 @@ test {
     }
     _ = @import("sdk/media/wav.zig");
     _ = @import("sdk/media/bill.zig");
+    _ = @import("sdk/media/pool.zig");
     _ = @import("sdk/media/video_out.zig");
     _ = @import("sdk/media/image_pixels.zig");
     _ = @import("sdk/media/config_fields.zig");

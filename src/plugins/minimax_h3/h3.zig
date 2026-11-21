@@ -3673,6 +3673,8 @@ pub const GenRequest = struct {
     /// plan: load, run, free). `resident_bytes` is what the cache reports holding.
     resident: ?*Resident = null,
     resident_bytes: u64 = 0,
+    /// The pool the video VAE encodes lift to (`config.plan`).
+    encode_lift: u64 = 0,
     prompt: []const u8,
     width: u32 = 256,
     height: u32 = 256,
@@ -3726,7 +3728,42 @@ pub const GenRequest = struct {
     /// blocks: a reference has no cond row of its own competing with the tower,
     /// and the prompt addresses it as `<Picture i>` / `<Video k>` / `<Audio j>`.
     refs: []const RefMedia = &.{},
+    /// Video-to-video: the target starts from this clip at step `init.step` instead of pure noise.
+    init: ?InitClip = null,
 };
+
+/// A clip the target starts from (`init_video`): its latents are noised to the schedule's sigma at `step` and the
+/// sampler runs steps `step..steps-1`. Condition rows are untouched.
+pub const InitClip = struct {
+    /// `[1,3,T,H,W]` in [-1, 1] at the request's canvas, T = the snapped frame count.
+    pixels: mlx.mlx_array,
+    /// 32 kHz stereo `[2, audio_t * HOP]`; null only on a pack without an audio VAE (`generate` refuses it otherwise).
+    waveform: ?mlx.mlx_array = null,
+    /// In [1, steps - 1].
+    step: u32,
+};
+
+/// The rectified-flow point at noise level `sigma` between clean `x0` and `noise`: `(1 - sigma) * x0 + sigma * noise`,
+/// the state the sampler's `x0 = x - sigma * v` and Euler `x += v * dsigma` assume. f32 like the sampler's latents.
+pub fn noisedAt(x0: mlx.mlx_array, noise: mlx.mlx_array, sigma: f64, s: S) !mlx.mlx_array {
+    const xf = try astype(x0, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(xf);
+    const keep = try scalarLike(@floatCast(1.0 - sigma), xf, s);
+    defer _ = mlx.mlx_array_free(keep);
+    const mix = try scalarLike(@floatCast(sigma), noise, s);
+    defer _ = mlx.mlx_array_free(mix);
+    const a = try mulA(xf, keep, s);
+    defer _ = mlx.mlx_array_free(a);
+    const b = try mulA(noise, mix, s);
+    defer _ = mlx.mlx_array_free(b);
+    return addA(a, b, s);
+}
+
+/// The audio stream's noise level when the video stream is at `sigma_v`: the clock `buildTimestepPlan` gives the
+/// audio rows (`t_a = 1 - this`).
+pub fn audioSigmaAt(sigma_v: f64, max_t: f64, shift_v: f64, shift_a: f64) f64 {
+    return max_t * timeShiftSigma(sigma_v / max_t, shift_v, shift_a);
+}
 
 /// What the audio latent is advanced by this step, per unit of the
 /// slope-scaled velocity the forward returns (`Output.audio` carries
@@ -4040,7 +4077,12 @@ pub fn generate(
     progress: ?gen_sse.Progress,
     s: S,
 ) !GenResult {
-    if (req.chain_windows > 1) return generateChain(allocator, io, paths, req, progress, s);
+    // Audio rows left at pure noise would run from init_step with a mid-schedule audio timestep.
+    if (req.init) |ic| if (ic.waveform == null and paths.audio_vae != null) return error.InitClipNoSoundtrack;
+    if (req.chain_windows > 1) {
+        if (req.init != null) return error.InitClipChained;
+        return generateChain(allocator, io, paths, req, progress, s);
+    }
     return generateOne(allocator, io, paths, req, progress, s);
 }
 
@@ -4200,7 +4242,7 @@ fn generateOne(
             defer enc.deinit();
             for (req.keyframes, 0..) |kf, ki| {
                 anchors_buf[ki] = kf.anchor;
-                const lat = try enc.encodeImage(kf.pixels, allocator, s);
+                const lat = try enc.encodeImage(kf.pixels, req.encode_lift, allocator, s);
                 defer _ = mlx.mlx_array_free(lat);
                 try rows_list.append(allocator, try patchifyVideo(lat, s));
             }
@@ -4210,7 +4252,7 @@ fn generateOne(
                 const px = m.pixels orelse return error.RefMissingPixels;
                 // encodeImage IS encodeVideo at T == 1; naming the two apart
                 // keeps the call site readable, not the behaviour different.
-                const lat = try enc.encodeVideo(px, allocator, s);
+                const lat = try enc.encodeVideo(px, req.encode_lift, allocator, s);
                 defer _ = mlx.mlx_array_free(lat);
                 const got_t: u32 = @intCast(mlx.getShape(lat)[2]);
                 const want_t: u32 = if (m.ref.kind == .image) 1 else m.ref.latent_t;
@@ -4268,6 +4310,58 @@ fn generateOne(
             req.refs.len,
             if (cond_rows) |cr| mlx.getShape(cr)[0] else 0,
             if (audio_cond_rows) |cr| mlx.getShape(cr)[0] else 0,
+            phase_timer.lapMs(),
+        });
+    }
+
+    // ── 1.6 init_video: the clip the target starts from, encoded and its encoders released before the text encoder ──
+    var init_video_rows: ?mlx.mlx_array = null;
+    defer if (init_video_rows) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    var init_audio_rows: ?mlx.mlx_array = null;
+    defer if (init_audio_rows) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    if (req.init) |ic| {
+        if (req.pdd != null) return error.InitClipOnPdd;
+        if (ic.step < 1 or ic.step >= req.steps) return error.InitStepOutOfRange;
+        var split = LapClock.init(io);
+        var vload_ms: u64 = 0;
+        var venc_ms: u64 = 0;
+        var aenc_ms: u64 = 0;
+        {
+            var vw = try model_mod.loadWeightsSingleFile(allocator, paths.vae);
+            defer vw.deinit();
+            var venc = try vae_mod.Encoder.load(allocator, &vw, s);
+            defer venc.deinit();
+            try venc.materialize();
+            vload_ms = split.lapMs();
+            const lat = try venc.encodeVideo(ic.pixels, req.encode_lift, allocator, s);
+            defer _ = mlx.mlx_array_free(lat);
+            const ls = mlx.getShape(lat);
+            if (ls[2] != shape.latent_t or ls[3] != lat_h or ls[4] != lat_w) return error.InitLatentShapeMismatch;
+            init_video_rows = try patchifyVideo(lat, s);
+            try mlx.check(mlx.mlx_array_eval(init_video_rows.?));
+            venc_ms = split.lapMs();
+        }
+        if (ic.waveform) |wav| {
+            const apath = paths.audio_vae orelse return error.InitAudioNeedsAudioVae;
+            var aw = try model_mod.loadWeightsSingleFile(allocator, apath);
+            defer aw.deinit();
+            const z = try audio_mod.encode(allocator, &aw, wav, s);
+            defer _ = mlx.mlx_array_free(z);
+            const zs = mlx.getShape(z);
+            if (zs[2] != 2 or zs[3] != shape.audio_t) return error.InitAudioLengthMismatch;
+            init_audio_rows = try audioLatentToRows(z, s);
+            try mlx.check(mlx.mlx_array_eval(init_audio_rows.?));
+            aenc_ms = split.lapMs();
+        }
+        _ = mlx.mlx_clear_cache();
+        log.info("[minimax-h3] init_video split: video VAE load {d} ms, video encode {d} ms, audio load+encode {d} ms\n", .{ vload_ms, venc_ms, aenc_ms });
+        log.info("[minimax-h3] init_video encoded: {d} video rows, {s} ({d} ms, encoders released)\n", .{
+            mlx.getShape(init_video_rows.?)[0],
+            if (init_audio_rows != null) "with its soundtrack" else "no soundtrack",
             phase_timer.lapMs(),
         });
     }
@@ -4455,6 +4549,26 @@ fn generateOne(
             x.* = scaled;
         }
     }
+    // init_video: the target rows start on the schedule at step k from the clip, the same seeded noise mixed in.
+    const start_step: usize = if (req.init) |ic| ic.step else 0;
+    if (req.init) |ic| {
+        const sv = sigmas[ic.step];
+        const sa = audioSigmaAt(sv, max_t, req.shift_video, req.shift_audio);
+        const nv = try noisedAt(init_video_rows.?, video_x, sv, s);
+        _ = mlx.mlx_array_free(video_x);
+        video_x = nv;
+        if (init_audio_rows) |ar| {
+            const na = try noisedAt(ar, audio_x, sa, s);
+            _ = mlx.mlx_array_free(audio_x);
+            audio_x = na;
+        }
+        try mlx.check(mlx.mlx_array_eval(video_x));
+        try mlx.check(mlx.mlx_array_eval(audio_x));
+        log.info("[minimax-h3] init_video: init_step {d}, sigma_k video {d:.4} audio {d:.4}, running {d} of {d} steps; audio {s}\n", .{
+            ic.step, sv, sa, req.steps - ic.step, req.steps,
+            if (init_audio_rows != null) "starts from the clip's soundtrack" else "starts from pure noise (the pack has no audio VAE)",
+        });
+    }
 
     // Profiling arms: never set by any server path; the live-test harness and
     // profile drivers own the env. A non-empty junk value is LOUDLY off.
@@ -4593,7 +4707,7 @@ fn generateOne(
             }
         }
 
-        for (0..req.steps) |i| {
+        for (start_step..req.steps) |i| {
             model.ablate = switch (abl_mode) {
                 .off => .none,
                 .ladder => ladderArmForStep(i),
@@ -4670,7 +4784,8 @@ fn generateOne(
                 _ = mlx.mlx_array_free(audio_in);
             };
 
-            const refresh = attnBroadcastRefresh(i, req.steps, bcast_k, sc_consec > 0);
+            // The first step run fills the broadcast cache, whatever step it is.
+            const refresh = attnBroadcastRefresh(i, req.steps, bcast_k, sc_consec > 0) or i == start_step;
             if (attn_bcast != null and !refresh) bcast_reused += 1;
             var fused: ?Model.Heads = if (req.pdd) |*p| try model.pddHeads(p, @intCast(i), req.shift_video, req.shift_audio, s) else null;
             defer if (fused) |*f| f.deinit();
@@ -5392,6 +5507,16 @@ fn writeWav(a: std.mem.Allocator, io: std.Io, wave: mlx.mlx_array, out_dir: []co
     var w = fh.writer(io, &wbuf);
     try w.interface.writeAll(bytes);
     try w.interface.flush();
+}
+
+test "minimax h3: an init clip without a soundtrack on a pack with an audio VAE never reaches the sampler" {
+    const px = mlx.mlx_array_new_float(0.0);
+    defer _ = mlx.mlx_array_free(px);
+    const paths: GenPaths = .{ .tokenizer_dir = "/nonexistent", .text_encoder = "/nonexistent/te", .dit = "/nonexistent/dit", .vae = "/nonexistent/vae", .audio_vae = "/nonexistent/audio_vae.safetensors" };
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try testing.expectError(error.InitClipNoSoundtrack, generate(testing.allocator, io, paths, .{ .prompt = "x", .steps = 2, .init = .{ .pixels = px, .step = 1 } }, null, s));
 }
 
 test "minimax h3: patchifyVideo matches the reference einsum order" {
@@ -7977,4 +8102,31 @@ test "minimax h3 flash parity: one DiT forward matches the stable-diffusion.cpp 
         std.debug.print("[flash-parity] {s}: max abs {d:.5} mean abs {d:.5} ref rms {d:.5} cos {d:.6} ({d} values)\n", .{ c.name, max_err, sum_err / n, @sqrt(ww / n), cos, g32.len });
         try testing.expect(cos > 0.99);
     }
+}
+
+test "minimax h3: an init clip starts at (1 - sigma) * x0 + sigma * noise, the point x0 = x - sigma * v undoes" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const x0d = [_]f32{ 1.0, -2.0, 0.5, 4.0 };
+    const nd = [_]f32{ 0.3, 0.7, -1.0, 2.0 };
+    const shp = [_]c_int{ 2, 2 };
+    const x0 = mlx.mlx_array_new_data(&x0d, &shp, 2, .float32);
+    defer _ = mlx.mlx_array_free(x0);
+    const noise = mlx.mlx_array_new_data(&nd, &shp, 2, .float32);
+    defer _ = mlx.mlx_array_free(noise);
+    const sigma = 0.25;
+    const x = try noisedAt(x0, noise, sigma, s);
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_array_eval(x));
+    const got = mlx.mlx_array_data_float32(x).?;
+    for (x0d, nd, 0..) |c, n, i| {
+        try testing.expectApproxEqAbs((1.0 - sigma) * c + sigma * n, got[i], 1e-6);
+        // The flow's velocity is noise - x0; the sampler's clean estimate recovers x0.
+        try testing.expectApproxEqAbs(c, got[i] - sigma * (n - c), 1e-6);
+    }
+    // The audio stream's level at a video sigma is the one the timestep plan gives its rows.
+    for ([_]f64{ 1.0, 0.9231, 0.5, 0.1 }) |sv| {
+        try testing.expectApproxEqAbs(timeShiftSigma(sv, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO), audioSigmaAt(sv, 1.0, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO), 1e-12);
+    }
+    try testing.expectApproxEqAbs(@as(f64, 1.0), audioSigmaAt(1.0, 1.0, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO), 1e-12);
 }
