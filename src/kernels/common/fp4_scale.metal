@@ -34,14 +34,16 @@ inline float mlxserve_fp4_scale_of(uint b) {
   }
 }
 
-// An e2m1 code (low 4 bits) as its value times 2^-14, by bit placement into a half: exact for all 16 codes, -0 kept
-// (MLX's fp4 read, scaled).
-inline float mlxserve_e2m1(uint c) {
-  return float(as_type<half>(ushort(((c & 0x7u) << 9) | ((c & 0x8u) << 12))));
+// fp4.h fp4_e2m1 operator float: an e2m1 code (low 4 bits) as its value, the magnitude placed in a half times 2^14,
+// code 8 and up negative (-0 kept). The sign is a select on the finished value: placed in the half's sign bit, the NAX
+// prefill gathers' per-weight dequantize ran slower.
+inline float mlxserve_fp4_e2m1_value(uint c) {
+  const float v = float(as_type<half>(ushort((c & 0x7u) << 9))) * 16384.0f;
+  return (c & 0x8u) ? -v : v;
 }
 
 // Nibbles j and j+4 of `w` as their e2m1 values times 2^-14: one shift puts them in a half2's two halves, then the
-// same bit placement as `mlxserve_e2m1` serves both lanes.
+// same bit placement serves both lanes, the sign bit with it.
 inline float2 mlxserve_e2m1x2(uint w, int j) {
   const uint v = w >> (4 * j);
   return float2(as_type<half2>(((v & 0x70007u) << 9) | ((v & 0x80008u) << 12)));

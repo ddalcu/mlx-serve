@@ -53,8 +53,15 @@ inline uint mlxserve_fp8_e8m0_bits(float x) {
   return uint(n + 127);
 }
 
-// fp8.h mx_scale_round_up: the smallest e8m0 at or above x (a NaN or infinite x reads back NaN), as a float.
+// fp8.h mx_scale_round_up: the smallest e8m0 at or above x (a NaN or infinite x reads back NaN), as a float. A
+// positive normal x takes the bit form, its exponent one up when a mantissa bit is set, at most 2^127: MLX's round of
+// log2 and its bump give that on every such float. Zero, subnormals, negatives and non-finite x run MLX's steps.
 inline float mlxserve_mx_scale_round_up(float x) {
+  const uint b = as_type<uint>(x);
+  if (b - 0x00800000u < 0x7F000000u) {
+    const uint e = (b >> 23) + ((b & 0x7FFFFFu) != 0u ? 1u : 0u);
+    return as_type<float>(metal::min(e, 254u) << 23);
+  }
   uint s = mlxserve_fp8_e8m0_bits(x);
   if (s < 0xFEu && mlxserve_fp4_e8m0(s) < x) {
     s += 1u;
@@ -91,14 +98,7 @@ inline uint mlxserve_fp4_e2m1_bits(float x) {
   return bits | sign_bit;
 }
 
-// fp4.h fp4_e2m1 operator float: the code's magnitude placed in a half times 2^14, code 8 and up negative.
-inline float mlxserve_fp4_e2m1_value(uint bits) {
-  half converted = as_type<half>(ushort((bits & 7) << 9));
-  converted *= 16384.0;
-  return float((bits & 8) ? -converted : converted);
-}
-
-// `f` through e2m1 and back.
+// `f` through e2m1 and back (the read is fp4_scale.metal's `mlxserve_fp4_e2m1_value`).
 inline float mlxserve_fp4_e2m1_round(float f) {
   return mlxserve_fp4_e2m1_value(mlxserve_fp4_e2m1_bits(f));
 }
@@ -118,9 +118,9 @@ inline float mlxserve_minimum(float x, float y) {
   return x < y ? x : y;
 }
 
-// MLX's clip: minimum(maximum(a, lo), hi).
+// MLX's clip, minimum(maximum(a, lo), hi), for finite lo <= hi: a NaN a is the result, else Metal's clamp is the same.
 inline float mlxserve_clip(float a, float lo, float hi) {
-  return mlxserve_minimum(mlxserve_maximum(a, lo), hi);
+  return metal::isnan(a) ? a : metal::clamp(a, lo, hi);
 }
 
 // reduction/ops.h Max's simdgroup step on floats: NaN if any lane holds one.

@@ -206,7 +206,7 @@ struct Fp4Q {
     return P{mlxserve_fp4_scale_of<GS>(uint(scales[g]))};
   }
   METAL_FUNC static WT dq(thread const P& p, const uint32_t q) {
-    return static_cast<WT>(p.s * (mlxserve_e2m1(q) * 16384.0f));
+    return static_cast<WT>(p.s * mlxserve_fp4_e2m1_value(q));
   }
 };
 

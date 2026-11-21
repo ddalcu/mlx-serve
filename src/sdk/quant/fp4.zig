@@ -147,6 +147,48 @@ fn sameValue(a: f32, b: f32) bool {
     return @as(u32, @bitCast(a)) == @as(u32, @bitCast(b));
 }
 
+test "fp4 e2m1 read: every code (mlxserve_fp4_e2m1_value) is MLX's fp4 dequant at scale 1.0, bit for bit, -0 kept" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    // One mxfp4 group of 32 under e8m0 code 127 (1.0): codes 0..15 twice, low nibble first.
+    var words = [_]u32{ 0x76543210, 0xFEDCBA98, 0x76543210, 0xFEDCBA98 };
+    var scale = [_]u8{127};
+    const w = mlx.mlx_array_new_data(&words, &[_]c_int{ 1, 4 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(w);
+    const sc = mlx.mlx_array_new_data(&scale, &[_]c_int{ 1, 1 }, 2, .uint8);
+    defer _ = mlx.mlx_array_free(sc);
+    var want = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(want);
+    try mlx.check(mlx.mlx_dequantize(&want, w, sc, .{ .ctx = null }, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "mxfp4", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_array_eval(want));
+    const ins = [_][*:0]const u8{"w"};
+    const outs = [_][*:0]const u8{"y"};
+    const iv = mlx.mlx_vector_string_new_data(&ins, 1);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&outs, 1);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new("mlxserve_e2m1_codes", iv, ov, "const uint i = thread_position_in_grid.x;\ny[i] = mlxserve_fp4_e2m1_value((w[i / 8] >> (4 * (i % 8))) & 0xFu);\n", SCALE_HEADER, true, false);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k);
+    const c = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{32}, 1, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
+    const v = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{w}, 1);
+    defer _ = mlx.mlx_vector_array_free(v);
+    var o = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o, k, v, c, s));
+    var y = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, o, 0));
+    try mlx.check(mlx.mlx_array_eval(y));
+    const got = (mlx.mlx_array_data_float32(y) orelse return error.NoData)[0..32];
+    const ref = (mlx.mlx_array_data_float32(want) orelse return error.NoData)[0..32];
+    for (got, ref) |g, r| try std.testing.expectEqual(@as(u32, @bitCast(r)), @as(u32, @bitCast(g)));
+    try std.testing.expectEqual(@as(u32, 0x80000000), @as(u32, @bitCast(got[8])));
+}
+
 test "fp4 scale decode: the e4m3 pair read (mlxserve_e4m3x2_h) is MLX's read x 2^-8 for every code in both lanes" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
