@@ -9,6 +9,7 @@ const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const model_mod = @import("../../../sdk/config/model.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const dflash_policy = @import("dflash/policy.zig");
+const DflashPol = @import("dflash.zig").DflashPol;
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const testing = std.testing;
@@ -90,7 +91,7 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
     // A skipped round is a tick of the serial pipeline; the first drafted round after it drains the pipeline.
     if (self.dspark_pol) |*pol| {
-        if (pol.pin_rows == 0 and !pol.drafting.shouldDraft() and self.dflashCanPipeline()) return try self.dsparkPlainPipelined(allocator);
+        if (pol.pin_rows == 0 and !policyDrafts(pol) and self.dflashCanPipeline()) return try self.dsparkPlainPipelined(allocator);
         pol.plain_watch = null;
         if (self.has_pending_logits or self.has_pending_token) switch (try self.drainPipelineForSpec(allocator)) {
             .drained => |tok| return try mtpSerialOneToken(allocator, tok),
@@ -201,7 +202,11 @@ pub fn dsparkPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?Dr
     const tok = (try self.next(allocator)) orelse return null;
     self.dspark_plain += 1;
     const pol = &self.dspark_pol.?;
-    if (pol.plain_watch) |*w| pol.plain.sample(@as(f32, @floatFromInt(w.read())) / @as(f32, std.time.ns_per_ms));
+    if (pol.plain_watch) |*w| {
+        const ms = @as(f32, @floatFromInt(w.read())) / @as(f32, std.time.ns_per_ms);
+        pol.plain.sample(ms);
+        if (pol.p2) |*p| p.plainDone(pol.plain.ms, ms);
+    }
     pol.plain_watch = io_util.Stopwatch.init(self.timer.io);
     return try mtpSerialOneToken(allocator, tok);
 }
@@ -242,7 +247,13 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     const t1 = self.next_token_id;
     var d = try dsv41_mod.dsparkDraft(mdl, allocator, st, t1);
     defer d.deinit(allocator);
-    d.len = if (pol.pin_rows > 0) pinnedDrafts(d.len, pol.pin_rows) else dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
+    const drafted = d.len;
+    d.len = if (pol.pin_rows > 0)
+        pinnedDrafts(d.len, pol.pin_rows)
+    else if (pol.p2) |*p|
+        p.verifyDrafts(d.confidence[0..d.len], pol.plain.ms)
+    else
+        dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
     // An exact verify stays within the decode-width rows (`maxVerifyDrafts`; the block itself otherwise).
     d.len = @min(d.len, dsv41_mod.maxVerifyDrafts(mdl));
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
@@ -250,14 +261,31 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
         try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &d)
     else
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &d, cap);
+    self.dspark_stats.record(@intCast(d.len), round.accepted);
+    const wall_ms = @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms);
+    if (pol.p2) |*p| {
+        p.learn(d.confidence[0..drafted], d.len, round.accepted, nextDecides(&d, drafted, round.accepted, round.next_token, self.dspark_stochastic));
+        p.roundDone(pol.plain.ms, d.len + 1, round.tokens.len, wall_ms);
+        return self.commitDsparkRound(allocator, round, st.n);
+    }
     for (d.confidence[0..d.len], 0..) |c, k| {
         if (k > round.accepted) break;
         pol.calib.observe(sigmoid(c), k < round.accepted);
     }
-    self.dspark_stats.record(@intCast(d.len), round.accepted);
-    const wall_ms = @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms);
     pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, wall_ms);
     return self.commitDsparkRound(allocator, round, st.n);
+}
+
+/// Whether this round drafts at all, under the request's backoff.
+pub fn policyDrafts(pol: *DflashPol) bool {
+    return if (pol.p2) |*p| p.drafting.shouldDraft() else pol.drafting.shouldDraft();
+}
+
+/// A greedy round that kept every verified draft of `drafted` knows the first one it did not verify: the trunk's
+/// `next_token` stands where it would. Null when there is none, or the round was sampled (its next token is a draw).
+pub fn nextDecides(d: *const dsv41_mod.DsparkDraft, drafted: usize, accepted: usize, next_token: u32, stochastic: bool) ?bool {
+    if (stochastic or accepted != d.len or d.len >= drafted or d.len + 1 >= d.ids.len) return null;
+    return d.ids[d.len + 1] == next_token;
 }
 
 pub fn sigmoid(x: f32) f32 {
@@ -882,6 +910,22 @@ test "dsparkVerifyDrafts: a sure head verifies the block, an unsure one t1 alone
     // A head that keeps claiming certainty the trunk rejects stops buying rows.
     for (0..40) |_| calib.observe(G.sigmoid(9), false);
     try testing.expectEqual(@as(usize, 0), G.dsparkVerifyDrafts(&.{ 9, 9, 9, 9, 9 }, &calib, 17.6));
+}
+
+test "dspark nextDecides: a greedy round that kept every verified draft learns the first unverified one from its next token" {
+    var ids = [_]u32{ 10, 11, 12, 13, 14, 15 };
+    var conf = [_]f32{ 1, 1, 1, 1, 1 };
+    var d: dsv41_mod.DsparkDraft = .{ .ids = &ids, .len = 2, .logits = &.{}, .confidence = &conf };
+    // Drafts 0 and 1 (ids 11, 12) kept: the trunk's next token is draft 2 (id 13), a hit; any other id, a miss.
+    try testing.expectEqual(@as(?bool, true), nextDecides(&d, 5, 2, 13, false));
+    try testing.expectEqual(@as(?bool, false), nextDecides(&d, 5, 2, 99, false));
+    // A reject among the verified drafts, a sampled round, or no draft past the verified ones: nothing to learn.
+    try testing.expectEqual(@as(?bool, null), nextDecides(&d, 5, 1, 12, false));
+    try testing.expectEqual(@as(?bool, null), nextDecides(&d, 5, 2, 13, true));
+    try testing.expectEqual(@as(?bool, null), nextDecides(&d, 2, 2, 13, false));
+    // A round that verified t1 alone learns draft 0 (id 11).
+    d.len = 0;
+    try testing.expectEqual(@as(?bool, true), nextDecides(&d, 5, 0, 11, false));
 }
 
 test "dspark drafting backoff: prose rounds that lose to the plain step are skipped, copy-like rounds are not" {

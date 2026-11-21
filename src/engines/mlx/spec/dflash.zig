@@ -64,6 +64,8 @@ pub const DflashPol = struct {
     copy: dflash_policy.CopyStats = .{},
     /// Since the last pipelined plain tick ended; null once any other kind of round has run.
     plain_watch: ?io_util.Stopwatch = null,
+    /// `MLX_SERVE_DSPARK_POLICY2`: a solo DeepSeek-V4.1 round's rows, calibration and backoff instead of the fields above.
+    p2: ?@import("dflash/policy2.zig").Policy = null,
 };
 
 /// DFlash block-drafter step. ONE assistant forward proposes
