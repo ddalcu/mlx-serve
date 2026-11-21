@@ -7552,15 +7552,31 @@ pub const VERIFY_MAX_DRAFTS: usize = RING_SLACK - 1;
 /// Drafts one verify of `m` takes: on a streamed bank the verify stays a decode-phase call (`Routed.decode_ids`).
 pub fn maxVerifyDrafts(m: *const Dsv41Model) usize {
     const d = verifyDraftsFor(if (m.streamed) |src| src.decode_ids else null, m.cfg.num_experts_per_tok);
-    // An exact verify runs on the decode-width kernels: its rows (drafts and `t1`) stay within `dkern.max_rows`.
-    return if (exactServes(m)) @min(d, dkern.max_rows - 1) else d;
+    return verifyCap(d, decodeWidthVerify(m));
+}
+
+/// Whether `m`'s verifies keep to the decode-width kernels' rows, as a plain step's bits need: exact, or a resident
+/// bank, where a copy round's wider verify would run the prompt kernels and round its rows apart from plain decode's.
+fn decodeWidthVerify(m: *const Dsv41Model) bool {
+    return exactServes(m) or m.streamed == null;
+}
+
+/// `drafts` cut to what a verify of `dkern.max_rows` rows (drafts and `t1`) carries, where `decode_width`.
+fn verifyCap(drafts: usize, decode_width: bool) usize {
+    return if (decode_width) @min(drafts, dkern.max_rows - 1) else drafts;
+}
+
+test "dsv41 verify drafts: a resident bank's verify, a copy round's too, stays within the decode-width rows" {
+    try testing.expectEqual(dkern.max_rows - 1, verifyCap(VERIFY_MAX_DRAFTS, true));
+    try testing.expectEqual(@as(usize, 3), verifyCap(3, true));
+    try testing.expectEqual(VERIFY_MAX_DRAFTS, verifyCap(VERIFY_MAX_DRAFTS, false));
 }
 
 /// The draft a copy round must outrun to be worth a round (`dsparkCopyLen`): the stage block, whose drafts a stage round
-/// verifies anyway. An exact verify carries at most `maxVerifyDrafts` drafts, the block's own width, so there a copy
-/// of that many is worth its round (no stage forward, an agreement long enough to be strong).
+/// verifies anyway. A decode-width verify (`decodeWidthVerify`) carries at most `maxVerifyDrafts` drafts, the block's
+/// own width, so there a copy of that many is worth its round (no stage forward, an agreement long enough to be strong).
 pub fn copyBlock(m: *const Dsv41Model) usize {
-    return if (exactServes(m)) @min(m.ds_block, maxVerifyDrafts(m) -| 1) else m.ds_block;
+    return if (decodeWidthVerify(m)) @min(m.ds_block, maxVerifyDrafts(m) -| 1) else m.ds_block;
 }
 
 fn verifyDraftsFor(decode_ids: ?usize, top_k: usize) usize {
