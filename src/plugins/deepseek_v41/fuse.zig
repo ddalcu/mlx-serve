@@ -241,7 +241,8 @@ fn wrapRegion(mem: []align(std.heap.page_size_min) u8) !?A {
 }
 
 /// `e`'s held codes and scales as GPU buffers (`EngramLayer.gpu`), where the kernel can gather from them: a held
-/// mxfp4 or mxfp8 table of separate code and scale regions, 16-byte aligned rows, each region within Metal's largest
+/// mxfp4 or mxfp8 table of separate code and scale regions, rows aligned to the kernels' code loads (8 bytes for e2m1,
+/// 16 for e4m3), each region within Metal's largest
 /// buffer. Logs why it declines.
 pub fn wrapHeld(e: *dsv41.EngramLayer) bool {
     const t = &e.table;
@@ -249,7 +250,9 @@ pub fn wrapHeld(e: *dsv41.EngramLayer) bool {
         if (!t.isHeld()) break :blk "not held";
         if (t.records() or t.held[1].len == 0 or !t.dequantsTo()) break :blk "not separate mxfp4/mxfp8 code and scale regions";
         const page = std.heap.pageSize();
-        if ((t.w_off % page) % 16 != 0 or t.w_stride % 16 != 0) break :blk "code rows not 16-byte aligned";
+        // A lane loads 16 codes at once: a uint2 of e2m1, a uint4 of e4m3.
+        const al: u64 = if (t.bits == 4) 8 else 16;
+        if ((t.w_off % page) % al != 0 or t.w_stride % al != 0) break :blk "code rows not aligned to the kernels' loads";
         var arrs: [2]A = undefined;
         for (&arrs, t.held[0..2]) |*a, mem| a.* = (wrapRegion(mem) catch null) orelse {
             if (a != &arrs[0]) _ = mlx.mlx_array_free(arrs[0]);
@@ -864,7 +867,8 @@ test "dsv41 fuse engram (resident): the wkv gathered by id out of the held table
         const wlen = hd * bits / 8;
         const slen = hd / 32;
         var e: dsv41.EngramLayer = .{ .layer = 0, .wkv = .{ .w = eq[0], .s = eq[1], .b = eq[2], .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } }, .qk = qk, .table = .{ .fd = -1, .rows = n_rows, .head_dim = @intCast(hd), .mode = mode, .bits = bits, .group_size = 32, .w_off = 0, .w_stride = wlen, .wlen = wlen, .s_off = 0, .s_stride = slen, .slen = slen } };
-        try heldTable(&e.table, n_rows, 4096 + 48, rng);
+        // Row 0 at 8 bytes past a 16-byte boundary for e2m1 (the release's layer-1 table), 16-aligned for e4m3.
+        try heldTable(&e.table, n_rows, if (bits == 4) 4096 + 952 else 4096 + 48, rng);
         defer for (e.table.held[0..2]) |mem| std.posix.munmap(mem);
         try testing.expect(wrapHeld(&e));
         defer {
