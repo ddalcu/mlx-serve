@@ -37,6 +37,9 @@ serves either from the pack, with no flag.
   them off on NAX); with `wo_a` on its vector kernel a verify row is its plain step's bytes; `moe_up` /
   `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or 128 (the expert-pruned packs are 2-bit g128).
   Otherwise `routed` runs.
+- `mx_view.zig`: `MLX_SERVE_DSV41_MXFP4_VIEW` (off): an NVFP4 bank whose every 32-span is one power of two loads as
+  the MXFP4 bank of its values (the converter's `--experts-mxfp4` bytes), a layer at a time, billed so
+  (`residentBytes`); a bank with any other span stays NVFP4, named in the log.
 - GGUF expert banks (`--mlx-gguf`, ISTA's GSQ-RCO sets) decode up to `region_rows` through `ffnDecodeGguf`
   (`moe_gu_gguf` + `moe_dn_gguf`, built per ggml type by `gguf.pluginKernel`) and prefill on the matrix units
   (`gguf.gatherNaxSwiGLU`), a K-quant bank a 32-weight slice at a time (`deq_<type>_s`); Q3_K decodes `routed`.

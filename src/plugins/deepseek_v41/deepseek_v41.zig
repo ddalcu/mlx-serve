@@ -25,6 +25,7 @@ const gather_nax = @import("../../sdk/blocks/moe/gather_qmm_nax.zig");
 const log = @import("../../sdk/util/log.zig");
 const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwiGLU;
 const engram = @import("engram.zig");
+const mx_view = @import("mx_view.zig");
 const system = @import("../../sdk/util/system.zig");
 const crt = @import("../../sdk/util/crt.zig");
 const cache_codec = @import("cache_codec.zig");
@@ -508,6 +509,8 @@ pub const Dsv41Model = struct {
     regions: []LayerRegions = &.{},
     /// Arrays made at load (casts, reshapes, stacks); freed in `deinit`.
     owned: std.ArrayList(A) = .empty,
+    /// The NVFP4 banks the load served as MXFP4 (`mxView`).
+    view: mx_view.Tally = .{},
     /// The outside quant plugin that reads the pack's weights (`InitOpts.quant`), while `init` runs.
     quant: ?*const outside.Format = null,
     /// Every weight it loaded, released in `deinit`.
@@ -1193,7 +1196,44 @@ fn oneExpert(m: *Dsv41Model, b: Bank) !Bank {
 fn loadExperts(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usize, n_experts: usize, inter: usize) !Experts {
     var e = try loadBanks(m, w, pfx, li, n_experts, inter);
     e.scale = try expertScales(m, w, pfx, li, &e);
+    if (e.scale[0] != null and mx_view.on()) try mxView(m, w, pfx, li, &e);
     return e;
+}
+
+/// `MLX_SERVE_DSV41_MXFP4_VIEW`: the NVFP4 bank served as the MXFP4 bank of its values (`mx_view.scales`), its e4m3
+/// scales and globals let go a layer at a time, so the two scale sets never sit whole side by side; else NVFP4, named.
+fn mxView(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usize, e: *Experts) !void {
+    const t0 = crt.monotonicMs();
+    const banks = [3]*Bank{ &e.gate, &e.up, &e.down };
+    var mx: [3]A = .{ none, none, none };
+    defer for (mx) |x| if (x.ctx != null) {
+        _ = mlx.mlx_array_free(x);
+    };
+    for (banks, e.scale, &mx, 0..) |b, g, *x, i| switch (try mx_view.scales(m.gpa, m.s, b.s, g.?)) {
+        .mx => |a| x.* = a,
+        .nv => |why| {
+            var buf: NameBuf = undefined;
+            m.view.refused += 1;
+            return mx_view.refused(std.fmt.bufPrint(&buf, pfx ++ ".{d}.ffn.experts", .{li}) catch pfx, i, why);
+        },
+    };
+    for (banks, &mx) |b, *x| {
+        m.view.nv_bytes += mlx.mlx_array_size(b.s);
+        m.view.mx_bytes += mlx.mlx_array_size(x.*);
+        release(m, w, b.s);
+        const a = x.*;
+        x.* = none;
+        b.s = try m.own(a);
+        b.qp = .{ .bits = 4, .group_size = 32, .mode = .mxfp4 };
+    }
+    for (e.scale) |g| m.view.nv_bytes += mlx.mlx_array_size(g.?) * mlx.mlx_array_itemsize(g.?);
+    inline for (scale_names) |nm| {
+        var buf: NameBuf = undefined;
+        w.remove(std.fmt.bufPrint(&buf, pfx ++ nm, .{li}) catch return error.NameTooLong);
+    }
+    e.scale = .{ null, null, null };
+    m.view.viewed += 1;
+    m.view.ms += crt.monotonicMs() - t0;
 }
 
 const scale_names = [3][]const u8{ ".{d}.ffn.experts.gate_proj.expert_scale", ".{d}.ffn.experts.up_proj.expert_scale", ".{d}.ffn.experts.expert_scale" };
@@ -2071,6 +2111,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         const b = ex.gu orelse ex.gate;
         if (b.w.ctx != null) log.info("deepseek_v41: routed experts {t} bits={d} group={d}, per-expert scales gate={} up={} down={}\n", .{ b.qp.mode, b.qp.bits, b.qp.group_size, ex.scale[0] != null, ex.scale[1] != null, ex.scale[2] != null });
     }
+    m.view.report();
     return m;
 }
 

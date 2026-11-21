@@ -118,6 +118,7 @@ test {
     _ = @import("sdk/weights/streamed/expert/demand_first_test.zig");
     _ = @import("sdk/weights/streamed/mlx_pack_test.zig");
     _ = @import("plugins/deepseek_v41/streamed_test.zig");
+    _ = @import("plugins/deepseek_v41/mx_view.zig");
     _ = @import("version.zig");
     _ = @import("mlx/ops.zig");
     _ = @import("mlx/kernels.zig");
