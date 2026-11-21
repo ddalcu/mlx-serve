@@ -510,3 +510,34 @@ test "qwen4_exp plugin: a GDN layer with the combined in_proj_qkvz/in_proj_ba pr
         try testing.expect(try relErr(e_comb.ssm_state, e_sep.ssm_state) < 1e-2);
     }
 }
+
+test "qwen4_exp plugin: a GDN projection op that fails returns MlxError and frees only the arrays it made" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.files(arena.allocator(), 71, .bf16));
+    defer t.close();
+    const la = &t.xfm.moe_layers[0].attn.linear;
+    var prng = std.Random.DefaultPrng.init(0xFA17);
+    const x = try randRows(prng.random(), 3);
+    defer _ = mlx.mlx_array_free(x);
+
+    var e = freshEntry();
+    defer freeEntry(&e);
+    _ = mlx.mlx_array_free(try t.xfm.gatedDeltaNet(x, la, &e, 0, 1, 3, true));
+
+    const before = mlx.op_count.load(.monotonic);
+    const proj = try t.xfm.gdnProjGpu(x, la);
+    for ([_]Array{ proj.qkv, proj.z, try t.xfm.qmatmul(x, la.a_w, la.a_s, la.a_b), try t.xfm.qmatmul(x, la.b_w, la.b_s, la.b_b) }) |a| _ = mlx.mlx_array_free(a);
+    const proj_ops = mlx.op_count.load(.monotonic) - before;
+    try testing.expect(proj_ops > 1);
+
+    var k: u64 = 1;
+    while (k <= proj_ops) : (k += 1) {
+        mlx.fault.arm(k);
+        const r = t.xfm.gatedDeltaNet(x, la, &e, 0, 1, 3, true);
+        mlx.fault.disarm();
+        try testing.expect(mlx.fault.didFire());
+        try testing.expectError(error.MlxError, r);
+    }
+}

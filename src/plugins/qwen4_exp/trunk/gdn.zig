@@ -86,15 +86,15 @@ pub fn gatedDeltaNetProjected(
     const kernel: c_int = @intCast(cfg.linear_conv_kernel_dim);
 
     // Projections: combined (qkvz+ba) or separate (qkv+z+a+b)
-    var qkv: mlx.mlx_array = undefined;
-    var z_proj: mlx.mlx_array = undefined;
+    var qkv: mlx.mlx_array = .{ .ctx = null };
+    var z_proj: mlx.mlx_array = .{ .ctx = null };
     // [qkv | z | a | b] from one joined matmul: the verify kernels read its columns in place.
     var in_all: mlx.mlx_array = .{ .ctx = null };
     defer if (in_all.ctx != null) {
         _ = mlx.mlx_array_free(in_all);
     };
-    var a_proj: mlx.mlx_array = undefined;
-    var b_proj: mlx.mlx_array = undefined;
+    var a_proj: mlx.mlx_array = .{ .ctx = null };
+    var b_proj: mlx.mlx_array = .{ .ctx = null };
     defer _ = mlx.mlx_array_free(qkv);
     defer _ = mlx.mlx_array_free(z_proj);
     defer _ = mlx.mlx_array_free(a_proj);
