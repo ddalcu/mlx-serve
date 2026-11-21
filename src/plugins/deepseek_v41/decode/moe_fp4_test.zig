@@ -534,7 +534,7 @@ test "dsv41 dec moe_fp4 down rows: the all-rows launch gives the one-row launch'
     const src = try std.mem.replaceOwned(u8, gpa, moe_fp4.DOWN_ROWS_SOURCE, "const uint items = nl + 1;", "const uint items = nl;");
     defer gpa.free(src);
     try testing.expect(!std.mem.eql(u8, src, moe_fp4.DOWN_ROWS_SOURCE));
-    const srcz = try gpa.dupeZ(u8, src);
+    const srcz = try gpa.dupeSentinel(u8, src, 0);
     defer gpa.free(srcz);
     var planted = kern;
     planted.down_rows = try dsv41.buildKernel("dsv41_dec_moe_fp4_down_rows_planted", &moe_fp4.DOWN_INS, &.{"out"}, srcz, moe_fp4.ROWS_HEADER);
