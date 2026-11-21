@@ -1,3 +1,4 @@
+// Ported from MLX (Copyright (c) 2023-2025 Apple Inc., MIT). See NOTICE.
 // The fp4 group scale, one decode for every fp4 kernel: MXFP4's e8m0 (a group of 32) and NVFP4's e4m3 (a group of
 // 16), picked by the group size GS. MLX's own reads, copied from mlx/backend/metal/kernels/fp8.h (fp8_e8m0 and
 // fp8_e4m3 `operator float`, `dequantize_scale` in fp_quantized.h): e8m0 0x00 is 2^-127, 0xff NaN, else a float

@@ -1,3 +1,4 @@
+// Ported from MLX (Copyright (c) 2023-2025 Apple Inc., MIT); its e4m3 encoder from PyTorch (BSD-3-Clause). See NOTICE.
 // The fp8 / fp4 encoders of every kernel that quantizes inside itself: MLX's own, copied from
 // mlx/backend/metal/kernels/fp8.h (the fp8_e4m3 and fp8_e8m0 constructors, mx_scale_round_up) and fp4.h (the
 // fp4_e2m1 constructor and operator float). The e4m3 / e8m0 reads are fp4_scale.metal's: put it before this header.
