@@ -11,6 +11,7 @@ const sleep_inhibit = @import("runtime/sleep_inhibit.zig");
 const testing = std.testing;
 
 const slotHoldsForMemory = @import("admission/pending.zig").slotHoldsForMemory;
+const releasePromise = @import("admission/pending.zig").releasePromise;
 const AdmitCand = @import("admission/pending.zig").AdmitCand;
 const admitPendingTick = @import("admission/pending.zig").admitPendingTick;
 const slotExclusiveDecode = @import("batching/verdict.zig").slotExclusiveDecode;
@@ -62,6 +63,13 @@ pub const AdmitOutcome = enum {
 /// One admitted slot's cancelled check, memory hold, prefill (with the one QSA-gap retry), first-token
 /// publish and move into `decoding`. The caller holds the slot's `in_pass`.
 pub fn prefillAdmitted(sch: *Scheduler, slot: *Slot) AdmitOutcome {
+    const outcome = admitAndPrefill(sch, slot);
+    // Only a slot in `decoding` reaches the cull that releases its promise; a requeued one is billed again.
+    if (outcome != .decoding) releasePromise(sch, slot);
+    return outcome;
+}
+
+fn admitAndPrefill(sch: *Scheduler, slot: *Slot) AdmitOutcome {
     if (slot.cancelled.load(.acquire)) {
         // finishSlot (not raw markFinished) so the metrics sink
         // counts the cancellation; safe pre-prefill — commit
@@ -331,8 +339,7 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
             const drop = s.cancelled.load(.acquire) or s.finished or s.error_code != null;
             const grown = if (s.legacy_gen) |*g| promiseMaterialized(g.completion_tokens) else false;
             if (drop or grown) {
-                sch.promise_ledger.release(s.memory_promised);
-                s.memory_promised = 0;
+                releasePromise(sch, s);
             }
             if (drop) {
                 if (!s.finished and s.error_code == null) {
