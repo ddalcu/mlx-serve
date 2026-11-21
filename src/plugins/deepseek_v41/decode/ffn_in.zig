@@ -1493,12 +1493,13 @@ test "dsv41 dec ffn_in nax: MLX_SERVE_DSV41_GEMV_R26_FFN_IN=1, rows 1..6 on laye
     defer freeWeights(w);
     const ly = layerWith(fx.layer(21), w);
     for (1..decode.max_rows + 1) |rows| try equivalence(gpa, fx, ks, &ly, w, rows);
-    // The planted bug: the launch reads another wo_b than the chain.
+    // The planted bug: the launch reads another wo_b than the chain (the truth follows the launch's weights, so the
+    // chain's distance or the routes give it away).
     const other = try randomWeights(81);
     defer freeWeights(other);
     var bad = w;
     bad.wo_w = other.wo_w;
-    try std.testing.expectError(error.FurtherFromTruth, equivalence(gpa, fx, ks, &ly, bad, 4));
+    if (equivalence(gpa, fx, ks, &ly, bad, 4)) |_| return error.PlantedBugPassed else |_| {}
 }
 
 test "dsv41 dec ffn_in fused: a planted dropped router bias fails the equivalence" {
