@@ -189,6 +189,10 @@ pub const Metrics = struct {
     usage_other: ModelUsage,
     usage_count: std.atomic.Value(u32),
     usage_lock: std.atomic.Mutex,
+    /// A slot's tokens leave an in-flight aggregate and reach `generation_tokens_total` in two
+    /// writes; `liveGenerationTokens` retries a sample that overlaps one (see `beginTokenMove`).
+    token_moves_begun: std.atomic.Value(u64) = .init(0),
+    token_moves_done: std.atomic.Value(u64) = .init(0),
 
     pub fn init() Metrics {
         return .{
@@ -340,7 +344,7 @@ pub const Metrics = struct {
         const restored = @min(cached_tokens, prompt_tokens);
         self.prefill_tokens_total.add(prompt_tokens - restored);
         self.prefix_cache_tokens_total.add(restored);
-        self.generation_tokens_total.add(completion_tokens);
+        _ = self.generation_tokens_total.value.fetchAdd(completion_tokens, .seq_cst);
 
         const u = self.usageFor(model);
         u.requests.inc();
@@ -359,6 +363,17 @@ pub const Metrics = struct {
         self.prompt_tokens_hist.observe(@as(u64, prompt_tokens));
         self.output_tokens_hist.observe(@as(u64, completion_tokens));
     }
+
+    /// Brackets a slot's exit from an in-flight aggregate and its `recordRequest`. Writes to the
+    /// aggregate inside the bracket must be `.seq_cst`, like the add to the total, so a sample that
+    /// sees either write also sees the bracket open.
+    pub fn beginTokenMove(self: *Metrics) void {
+        _ = self.token_moves_begun.fetchAdd(1, .seq_cst);
+    }
+
+    pub fn endTokenMove(self: *Metrics) void {
+        _ = self.token_moves_done.fetchAdd(1, .seq_cst);
+    }
 };
 
 /// Pure: the live-tokens gauge value = completed generation tokens PLUS the
@@ -367,8 +382,16 @@ pub const Metrics = struct {
 /// sampler thread calls this each tick to set `generation_tokens_live`. Kept
 /// here (not inline in the sampler) so the arithmetic is unit-testable and the
 /// "at rest ⇒ live == total" invariant is pinned without a running server.
-pub fn liveGenerationTokens(m: *const Metrics, inflight: u64) u64 {
-    return m.generation_tokens_total.load() + inflight;
+/// `inflight` is a tuple of pointers to the aggregates. A sample that overlaps a token move would
+/// count the moving request twice or not at all, depending on load order, so it is retaken.
+pub fn liveGenerationTokens(m: *const Metrics, inflight: anytype) u64 {
+    while (true) {
+        const done = m.token_moves_done.load(.seq_cst);
+        var sum = m.generation_tokens_total.value.load(.seq_cst);
+        inline for (inflight) |src| sum += src.load(.seq_cst);
+        if (m.token_moves_begun.load(.seq_cst) == done) return sum;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -830,12 +853,80 @@ test "liveGenerationTokens = total + inflight aggregate" {
     const testing = std.testing;
     var m = Metrics.init();
     m.generation_tokens_total.add(100);
+    var inflight = std.atomic.Value(u64).init(30);
+    var engine = std.atomic.Value(u64).init(7);
     // Live gauge = completed (100) + in-flight aggregate (37) published by the
     // scheduler once per decode tick.
-    try testing.expectEqual(@as(u64, 137), liveGenerationTokens(&m, 37));
+    try testing.expectEqual(@as(u64, 137), liveGenerationTokens(&m, .{ &inflight, &engine }));
     // At rest (nothing decoding ⇒ inflight aggregate 0) the live gauge must
     // equal the completion counter — the invariant test_metrics.sh checks.
-    try testing.expectEqual(@as(u64, 100), liveGenerationTokens(&m, 0));
+    inflight.store(0, .monotonic);
+    engine.store(0, .monotonic);
+    try testing.expectEqual(@as(u64, 100), liveGenerationTokens(&m, .{ &inflight, &engine }));
+}
+
+/// An in-flight source whose first `load` lets a request finish, as the inference thread would
+/// mid-sample. `.leave` and `.arrive` split one move across two sources, so the sample falls
+/// between the aggregate write and the total add.
+const MoveOnLoad = struct {
+    const Step = enum { whole_after, whole_before, leave, arrive };
+    m: *Metrics,
+    tokens: u64,
+    step: Step,
+    pending: u64 = 0,
+    fired: bool = false,
+
+    fn load(self: *@This(), _: std.builtin.AtomicOrder) u64 {
+        const seen = self.tokens;
+        if (self.fired) return seen;
+        self.fired = true;
+        switch (self.step) {
+            .whole_after => {
+                self.m.beginTokenMove();
+                self.tokens = 0;
+                self.m.generation_tokens_total.add(seen);
+                self.m.endTokenMove();
+                return seen;
+            },
+            .whole_before => {
+                self.m.beginTokenMove();
+                self.tokens = 0;
+                self.m.generation_tokens_total.add(seen);
+                self.m.endTokenMove();
+                return 0;
+            },
+            .leave => {
+                self.m.beginTokenMove();
+                self.tokens = 0;
+                return 0;
+            },
+            .arrive => {
+                self.m.generation_tokens_total.add(self.pending);
+                self.m.endTokenMove();
+                return seen;
+            },
+        }
+    }
+};
+
+test "liveGenerationTokens counts a request finishing during the sample once, not twice" {
+    var m = Metrics.init();
+    m.generation_tokens_total.add(100);
+    var slot = MoveOnLoad{ .m = &m, .tokens = 37, .step = .whole_after };
+    try std.testing.expectEqual(@as(u64, 137), liveGenerationTokens(&m, .{&slot}));
+}
+
+test "liveGenerationTokens counts a request finishing during the sample once, not zero times" {
+    var m = Metrics.init();
+    m.generation_tokens_total.add(100);
+    var slot = MoveOnLoad{ .m = &m, .tokens = 37, .step = .leave };
+    var total = MoveOnLoad{ .m = &m, .tokens = 0, .step = .arrive, .pending = 37 };
+    try std.testing.expectEqual(@as(u64, 137), liveGenerationTokens(&m, .{ &slot, &total }));
+
+    var m2 = Metrics.init();
+    m2.generation_tokens_total.add(100);
+    var before = MoveOnLoad{ .m = &m2, .tokens = 37, .step = .whole_before };
+    try std.testing.expectEqual(@as(u64, 137), liveGenerationTokens(&m2, .{&before}));
 }
 
 test "prefill throughput must exclude cache-restored tokens" {
