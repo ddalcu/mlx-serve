@@ -5,6 +5,9 @@
 //!   launch (`decode/engram_kv.zig`: no dequant, cast or f32 rows in memory), then the gate; a prompt chunk's rows
 //!   dequantize straight to the activation dtype (`Table.dequantTo`), not to f32 and a cast. Not bit-equal: the
 //!   projection sums in another order.
+//! - `MLX_SERVE_DSV41_FUSE_MXFP8_QMM` (read each call, `mxfp8Qmm`): an mxfp8 linear over a prompt chunk's rows runs
+//!   MLX's quantized matmul (its NAX qmm dequantizes the codes in the GEMM's tile loads) instead of dequantizing the
+//!   whole weight to bf16 and running the dense GEMM (`Lin.denseAt`).
 
 const std = @import("std");
 const env = @import("../../env.zig");
@@ -13,6 +16,7 @@ const log = @import("../../sdk/util/log.zig");
 const dsv41 = @import("deepseek_v41.zig");
 const dkern = @import("decode/decode.zig");
 const engram = @import("engram.zig");
+const QuantMode = @import("../../sdk/quant/params.zig").QuantMode;
 
 const A = mlx.mlx_array;
 const none: A = .{ .ctx = null };
@@ -30,7 +34,7 @@ pub const Fuse = struct {
 };
 
 /// The fusions that have served, each logged the first time (an A/B arm's engagement lines).
-pub var engaged: struct { down_scale: bool = false, engram: bool = false, engram_rows: bool = false } = .{};
+pub var engaged: struct { down_scale: bool = false, engram: bool = false, engram_rows: bool = false, mxfp8_qmm: bool = false } = .{};
 
 fn engage(comptime which: []const u8, comptime what: []const u8) void {
     if (@field(engaged, which)) return;
@@ -85,11 +89,18 @@ pub fn engramRowsDtype(m: *const dsv41.Dsv41Model, t: *const engram.Table) mlx.m
     return m.act;
 }
 
+/// Whether an `mode` linear over a prompt chunk's rows stays on MLX's quantized matmul (`Lin.denseAt`): mxfp8 under
+/// `MLX_SERVE_DSV41_FUSE_MXFP8_QMM`.
+pub fn mxfp8Qmm(mode: QuantMode) bool {
+    if (mode != .mxfp8 or !env.on(.MLX_SERVE_DSV41_FUSE_MXFP8_QMM)) return false;
+    engage("mxfp8_qmm", "mxfp8 prompt linears (MLX's quantized matmul, no bf16 weight)");
+    return true;
+}
+
 // ── tests ──
 
 const testing = std.testing;
 const fixture = @import("decode/fixture.zig");
-const QuantMode = @import("../../sdk/quant/params.zig").QuantMode;
 
 fn free(a: A) void {
     _ = mlx.mlx_array_free(a);
@@ -364,5 +375,93 @@ test "dsv41 fuse engram: a prompt chunk's mxfp4 and mxfp8 rows dequantize straig
         std.debug.print("[fuse] engram rows {t}: {d} of {d} bf16 values differ from the f32 rows cast; with the scales a code up, {d}\n", .{ mode, differ, wb.len, planted });
         try testing.expectEqual(@as(usize, 0), differ);
         try testing.expect(planted > 0);
+    }
+}
+
+/// `x` [.., K] f32 against `l`'s weight dequantized to f32 on the CPU stream (no TF32): `[.., N]`, the grouped
+/// `[G, N, K]` weight per group.
+fn truthOf(l: *const dsv41.Lin, x: A, cpu: mlx.mlx_stream) !A {
+    var wd = mlx.mlx_array_new();
+    defer free(wd);
+    try mlx.check(mlx.mlx_dequantize(&wd, l.w, l.s, l.b, mlx.mlx_optional_int.some(@intCast(l.qp.group_size)), mlx.mlx_optional_int.some(@intCast(l.qp.bits)), l.qp.mode.cstr(), none, .{ .value = .float32, .has_value = true }, cpu));
+    const nd = mlx.mlx_array_ndim(wd);
+    var wt = mlx.mlx_array_new();
+    defer free(wt);
+    try mlx.check(mlx.mlx_swapaxes(&wt, wd, @intCast(nd - 2), @intCast(nd - 1), cpu));
+    var x32 = mlx.mlx_array_new();
+    defer free(x32);
+    try mlx.check(mlx.mlx_astype(&x32, x, .float32, cpu));
+    var y = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_matmul(&y, x32, wt, cpu));
+    return y;
+}
+
+test "dsv41 fuse mxfp8_qmm: a prompt chunk's mxfp8 linears (q_kv, wo_b, the grouped wo_a) on MLX's quantized matmul are no further from f32 truth than the dequantized bf16 GEMM, 2048 rows; the scales a code up differ" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .ctx = 0, .fused = true });
+    defer fx.deinit();
+    const m = fx.m;
+    const ly = fx.layer(20);
+    const s = mlx.gpuStream();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var sc = dsv41.Scope.init(gpa, s);
+    defer sc.deinit();
+    const L: usize = 2048;
+    const og: usize = @intCast(mlx.getShape(ly.wo_a.w)[0]);
+    const cases = [_]struct { []const u8, *const dsv41.Lin, bool }{ .{ "q_kv", &ly.q_kv.?, false }, .{ "wo_b", &ly.wo_b, false }, .{ "wo_a", &ly.wo_a, true } };
+    for (cases) |c| {
+        const l = c[1];
+        try testing.expectEqual(QuantMode.mxfp8, l.qp.mode);
+        const K: usize = @intCast(mlx.getShape(l.w)[mlx.getShape(l.w).len - 1] * 4);
+        const grouped = [_]c_int{ ci(og), ci(L), ci(K) };
+        const x = try sc.keep(try fx.normal(if (c[2]) grouped[0..] else grouped[1..], .bfloat16, 0, 1));
+        var ys: [3]A = undefined;
+        for ([_]?[*:0]const u8{ null, "1" }, 0..) |v, i| {
+            const sw = env.override(.MLX_SERVE_DSV41_FUSE_MXFP8_QMM, v);
+            defer sw.restore();
+            engaged.mxfp8_qmm = false;
+            ys[i] = if (c[2]) try dsv41.attnOutA(&sc, m, ly, x, null) else try l.apply(&sc, x);
+            try testing.expectEqual(i == 1, engaged.mxfp8_qmm);
+        }
+        // The plant: the same codes under scales a code up (every weight doubled).
+        var up = mlx.mlx_array_new();
+        defer free(up);
+        try mlx.check(mlx.mlx_add(&up, l.s, try sc.keep(mlx.mlx_array_new_data(&[_]u8{1}, &[_]c_int{1}, 1, .uint8)), s));
+        var bad = l.*;
+        bad.s = up;
+        {
+            const sw = env.override(.MLX_SERVE_DSV41_FUSE_MXFP8_QMM, "1");
+            defer sw.restore();
+            var lb = ly.*;
+            lb.wo_a = bad;
+            ys[2] = if (c[2]) try dsv41.attnOutA(&sc, m, &lb, x, null) else try bad.apply(&sc, x);
+        }
+        var truth = try truthOf(l, x, cpu);
+        defer free(truth);
+        if (c[2]) {
+            // [og, L, n] to the wrapper's [L, og * n].
+            var tt = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_transpose_axes(&tt, truth, &[_]c_int{ 1, 0, 2 }, 3, cpu));
+            free(truth);
+            var r = mlx.mlx_array_new();
+            defer free(tt);
+            try mlx.check(mlx.mlx_reshape(&r, tt, &[_]c_int{ ci(L), -1 }, 2, cpu));
+            truth = r;
+        }
+        const off = try dsv41.hostF32(ys[0]);
+        defer gpa.free(off);
+        const on = try dsv41.hostF32(ys[1]);
+        defer gpa.free(on);
+        const pl = try dsv41.hostF32(ys[2]);
+        defer gpa.free(pl);
+        const tr = try dsv41.hostF32(truth);
+        defer gpa.free(tr);
+        var label: [48]u8 = undefined;
+        try dkern.expectNoWorse(try std.fmt.bufPrint(&label, "fuse mxfp8_qmm {s}", .{c[0]}), on, off, tr);
+        const ep = dkern.relRms(pl, off);
+        std.debug.print("[fuse] mxfp8_qmm {s}: scales a code up {e:.2} from the dense path (bar > 0.5)\n", .{ c[0], ep });
+        try testing.expect(ep > 0.5);
     }
 }

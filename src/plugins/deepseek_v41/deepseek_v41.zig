@@ -321,10 +321,16 @@ pub const Lin = struct {
         if (self.ext) |*e| return sc.keep(try e.matmul(x, sc.s));
         if (self.s.ctx == null) return sc.matmul(x, try sc.t2(self.w));
         // Not f32: MLX runs f32 GEMMs on the matrix units as TF32.
-        if (mlx.mlx_array_dtype(x) != .float32 and mlx.mlx_array_size(x) / @as(usize, @intCast(dim(x, -1))) >= DENSE_ROWS)
+        if (mlx.mlx_array_dtype(x) != .float32 and self.denseAt(mlx.mlx_array_size(x) / @as(usize, @intCast(dim(x, -1)))))
             return sc.matmul(x, try sc.t2(try self.dense(sc, mlx.mlx_array_dtype(x))));
         var o = mlx.mlx_array_new();
         return sc.res(mlx.mlx_quantized_matmul(&o, x, self.w, self.s, self.b, true, mlx.mlx_optional_int.some(@intCast(self.qp.group_size)), mlx.mlx_optional_int.some(@intCast(self.qp.bits)), self.qp.mode.cstr(), sc.s), &o);
+    }
+
+    /// Whether a call over `n` rows dequantizes the weight for the dense GEMM (`DENSE_ROWS`); `fuse.mxfp8Qmm` keeps
+    /// an mxfp8 weight on MLX's quantized matmul.
+    pub fn denseAt(self: *const Lin, n: usize) bool {
+        return n >= DENSE_ROWS and !fusion.mxfp8Qmm(self.qp.mode);
     }
 
     /// The weight dequantized to `dt` (lossless for the packs' fp8 and affine codes in bf16).
@@ -3728,7 +3734,7 @@ pub fn attnOutA(sc: *Scope, m: *Dsv41Model, ly: *const Layer, ob: A, dense_wo_a:
     const L = dim(ob, 1);
     // An outside plugin's groups: its grouped linear reads `[L, og, in]`.
     if (ly.wo_a.ext) |*e| return sc.astype(try sc.reshape(try sc.keep(try e.matmul(try sc.transpose(ob, &.{ 1, 0, 2 }), sc.s)), &.{ ci(L), -1 }), m.act);
-    const wd = dense_wo_a orelse if (ly.wo_a.s.ctx == null) ly.wo_a.w else if (L >= DENSE_ROWS) try ly.wo_a.dense(sc, mlx.mlx_array_dtype(ob)) else none;
+    const wd = dense_wo_a orelse if (ly.wo_a.s.ctx == null) ly.wo_a.w else if (ly.wo_a.denseAt(L)) try ly.wo_a.dense(sc, mlx.mlx_array_dtype(ob)) else none;
     const oa = if (wd.ctx != null)
         try sc.matmul(ob, try sc.transpose(wd, &.{ 0, 2, 1 }))
     else blk: {
@@ -6001,7 +6007,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
                 run_scope = null;
             }
         } else {
-            if (woa_dense.ctx == null and ly.wo_a.s.ctx != null and sp.L >= DENSE_ROWS) woa_dense = try ly.wo_a.dense(&sc, m.act);
+            if (woa_dense.ctx == null and ly.wo_a.s.ctx != null and ly.wo_a.denseAt(sp.L)) woa_dense = try ly.wo_a.dense(&sc, m.act);
             const oa = try attnOutA(&ssc, m, ly, o_k, if (woa_dense.ctx != null) woa_dense else null);
             // A tensor split sums each span's wo_b on the CPU stream while the GPU runs the next span's attention.
             heads[n_heads] = try sc.keep(ssc.out(if (m.tp != null) try tpSum(&ssc, m, try ly.wo_b.apply(&ssc, oa)) else oa));
