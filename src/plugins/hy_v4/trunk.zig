@@ -16,8 +16,11 @@ const ihc = @import("blocks/ihc.zig");
 const mla = @import("blocks/mla.zig");
 const moe = @import("blocks/moe.zig");
 const indexer_mod = @import("blocks/indexer.zig");
+const engram_mod = @import("blocks/engram.zig");
+const numpy_rng = @import("blocks/numpy_rng.zig");
 const config = @import("config.zig");
 const weights_load = @import("../../sdk/weights/load.zig");
+const weights = @import("weights.zig");
 const log = @import("../../sdk/util/log.zig");
 
 const Array = ops.Array;
@@ -32,6 +35,8 @@ pub const Layer = struct {
     attn: mla.Attn,
     hc_attn: ihc.Params,
     hc_mlp: ihc.Params,
+    /// The Engram memory injected before attention (null = not an Engram layer).
+    engram: ?*engram_mod.Engram = null,
     ffn: union(enum) { dense: moe.Dense, sparse: moe.Moe },
 };
 
@@ -50,6 +55,10 @@ pub const Model = struct {
     owned: std.ArrayList(Array),
 
     pub fn deinit(m: *Model) void {
+        for (m.layers) |*l| if (l.engram) |en| {
+            gpa.free(en.lookup_host);
+            gpa.destroy(en);
+        };
         for (m.owned.items) |x| _ = mlx.mlx_array_free(x);
         m.owned.deinit(gpa);
         gpa.free(m.layers);
@@ -94,6 +103,11 @@ pub const Model = struct {
 
         for (m.layers, 0..) |*l, li| {
             ctx.layer = @intCast(li);
+            // The Engram residual lands on the streams BEFORE the attention mix, as the reference injects it.
+            if (l.engram) |en| {
+                const r = try en.forward(&g, streams, ids);
+                streams = try g.add(streams, r);
+            }
             const pa = try ihc.pre(&g, streams, &l.hc_attn);
             defer {
                 _ = mlx.mlx_array_free(pa.post);
@@ -152,7 +166,7 @@ pub const Model = struct {
 };
 
 /// Builds the trunk from the loaded map: every layer's projections, hyper-connections and FFN.
-pub fn build(c: *const C, w: *const weights_load.Weights) !*Model {
+pub fn build(c: *const C, w: *const weights_load.Weights, tables: []const weights.Engram) !*Model {
     var owned_store: std.ArrayList(Array) = .empty;
     const owned = &owned_store;
     errdefer {
@@ -163,11 +177,18 @@ pub fn build(c: *const C, w: *const weights_load.Weights) !*Model {
     errdefer gpa.free(layers);
 
     const head_fn = try transposeOwned(owned, try require(w, "model.hc_head.hc_head_fn", .{}));
+    var engram_i: usize = 0;
     for (layers, 0..) |*l, li| {
+        l.engram = null; // `gpa.alloc` leaves the slice undefined; only Engram layers fill it
         l.input_norm = try require(w, "model.layers.{d}.input_layernorm.weight", .{@as(u32, @intCast(li))});
         l.post_attn_norm = try require(w, "model.layers.{d}.post_attention_layernorm.weight", .{@as(u32, @intCast(li))});
         l.attn = try buildAttn(c, w, owned, @intCast(li));
         l.hc_attn = try buildHc(c, w, owned, "model.layers.{d}.hc_attn_layer.hc_pre", @intCast(li));
+        if (li < c.engram_layers.len and c.engram_layers[li]) {
+            if (engram_i >= tables.len) return error.EngramTableMissing;
+            l.engram = try buildEngram(c, w, owned, tables[engram_i], @intCast(li));
+            engram_i += 1;
+        }
         l.hc_mlp = try buildHc(c, w, owned, "model.layers.{d}.hc_mlp_layer.hc_pre", @intCast(li));
         if (li < c.first_k_dense_replace) {
             l.ffn = .{ .dense = .{
@@ -257,6 +278,111 @@ fn buildAttn(c: *const C, w: *const weights_load.Weights, owned: *std.ArrayList(
         .indexer = if (li < c.dsa_layers.len and c.dsa_layers[li]) try buildIndexer(c, w, owned, li) else null,
         .rms_eps = c.rms_norm_eps,
     };
+}
+
+/// A layer's Engram memory: the frozen lookup table (host copy), numpy-exact multipliers, the per-head moduli and
+/// the projections/norms/scales the residual math reads.
+fn buildEngram(c: *const C, w: *const weights_load.Weights, owned: *std.ArrayList(Array), tbl: weights.Engram, li: u32) !*engram_mod.Engram {
+    const e = try gpa.create(engram_mod.Engram);
+    errdefer gpa.destroy(e);
+    const lookup = try require(w, "model.layers.{d}.engram_layer.lookup_table", .{li});
+    // Evaluate the table once and keep a host copy: the hash is host-side int arithmetic. The pack's table and
+    // the config's `engram_lookup_table_size` must agree, or the multipliers were drawn over another range.
+    try mlx.check(mlx.mlx_array_eval(lookup));
+    const lsize = mlx.mlx_array_shape(lookup)[0];
+    if (lsize != @as(c_int, @intCast(c.engram_lookup_size))) return error.LookupTableSizeMismatch;
+    const src = mlx.mlx_array_data_int32(lookup) orelse return error.NoData;
+    const host = try gpa.alloc(i32, c.engram_lookup_size);
+    errdefer gpa.free(host);
+    @memcpy(host, src[0..c.engram_lookup_size]);
+    // The multiplier bound is drawn from the LOADED map's compressed vocabulary (`max+1`), not the table's
+    // length: the pack's map is trained, so the two differ and a bound off its max reads the wrong rows.
+    var max_comp: i32 = 0;
+    for (host) |v| {
+        if (v < 0) return error.LookupTableInvalid;
+        max_comp = @max(max_comp, v);
+    }
+    const compressed_vocab: u64 = @as(u64, @intCast(max_comp)) + 1;
+    // The multipliers are numpy's draw for this layer's HF id (1-based), not stored in the pack.
+    var mult: [3]i64 = undefined;
+    numpy_rng.hashMultipliers(c.engram_seed + 10007 * (li + 1), compressed_vocab, 3,
+        @as([*]u64, @ptrCast(&mult))[0..3]);
+
+    var moduli: [16]u32 = @splat(0);
+    var offs: [16]u32 = @splat(0);
+    var acc: u32 = 0;
+    for (0..16) |h| {
+        moduli[h] = c.engram_moduli[li][h];
+        offs[h] = acc;
+        acc += moduli[h];
+    }
+    e.* = .{
+        .tbl = tbl,
+        .lookup_host = host,
+        .mult = mult,
+        .moduli = moduli,
+        .head_off = offs,
+        // One head per (order, head slot) pair: orders 2..max_ngram, each `engram_n_head_per_ngram` wide.
+        .heads = (c.engram_max_ngram - 1) * c.engram_ngram_heads,
+        .head_dim = c.engram_head_dim,
+        .emb_width = (c.engram_max_ngram - 1) * c.engram_ngram_heads * c.engram_head_dim,
+        .key_proj = .{
+            try buildBank(c, w, owned, "model.layers.{d}.engram_layer.key_projs.0", li),
+            try buildBank(c, w, owned, "model.layers.{d}.engram_layer.key_projs.1", li),
+            try buildBank(c, w, owned, "model.layers.{d}.engram_layer.key_projs.2", li),
+            try buildBank(c, w, owned, "model.layers.{d}.engram_layer.key_projs.3", li),
+        },
+        .key_bias = .{
+            try require(w, "model.layers.{d}.engram_layer.key_projs.0.bias", .{li}),
+            try require(w, "model.layers.{d}.engram_layer.key_projs.1.bias", .{li}),
+            try require(w, "model.layers.{d}.engram_layer.key_projs.2.bias", .{li}),
+            try require(w, "model.layers.{d}.engram_layer.key_projs.3.bias", .{li}),
+        },
+        .norm_key = .{
+            try require(w, "model.layers.{d}.engram_layer.norm_key.0.weight", .{li}),
+            try require(w, "model.layers.{d}.engram_layer.norm_key.1.weight", .{li}),
+            try require(w, "model.layers.{d}.engram_layer.norm_key.2.weight", .{li}),
+            try require(w, "model.layers.{d}.engram_layer.norm_key.3.weight", .{li}),
+        },
+        .norm_query = .{
+            try require(w, "model.layers.{d}.engram_layer.norm_query.0.weight", .{li}),
+            try require(w, "model.layers.{d}.engram_layer.norm_query.1.weight", .{li}),
+            try require(w, "model.layers.{d}.engram_layer.norm_query.2.weight", .{li}),
+            try require(w, "model.layers.{d}.engram_layer.norm_query.3.weight", .{li}),
+        },
+        .value_proj = try buildBank(c, w, owned, "model.layers.{d}.engram_layer.value_proj", li),
+        .value_bias = try require(w, "model.layers.{d}.engram_layer.value_proj.bias", .{li}),
+        .head_norm_w = try stackHeadNorms(w, owned, li),
+        .pre_gamma = try require(w, "model.layers.{d}.engram_layer.unified_pre_gamma", .{li}),
+        .hc_scales = .{
+            try require(w, "model.layers.{d}.engram_layer.unified_per_hc_scales.0", .{li}),
+            try require(w, "model.layers.{d}.engram_layer.unified_per_hc_scales.1", .{li}),
+            try require(w, "model.layers.{d}.engram_layer.unified_per_hc_scales.2", .{li}),
+            try require(w, "model.layers.{d}.engram_layer.unified_per_hc_scales.3", .{li}),
+        },
+        .pad_id = c.engram_pad_id,
+        .image_token_id = c.image_token_id,
+        .video_token_id = c.video_token_id,
+        .lookup_size = c.engram_lookup_size,
+        .fp8 = c.engram_fp8,
+        .hc_mult = c.hc_mult,
+        .hidden = c.hidden_size,
+    };
+    return e;
+}
+
+/// The 16 per-head norm weights `[96]` stacked to `[16, 96]`, evaluated once at load.
+fn stackHeadNorms(w: *const weights_load.Weights, owned: *std.ArrayList(Array), li: u32) !Array {
+    var parts: [16]Array = undefined;
+    for (0..16) |h| parts[h] = try require(w, "model.layers.{d}.engram_layer.lookup_per_head_norms.{d}.weight", .{ li, @as(u32, @intCast(h)) });
+    var g = ops.Graph.init(gpa, mlx.gpuStream());
+    defer g.deinit();
+    const cat = try g.concat(&parts, -1);
+    const shaped = try g.reshape(cat, &.{ 16, @intCast(@as(u32, 96)) });
+    try mlx.check(mlx.mlx_array_eval(shaped));
+    const escaped = g.escape(shaped);
+    try owned.append(gpa, escaped);
+    return escaped;
 }
 
 /// A DSA layer's compressed indexer: packed query/token-key/head-weight projections, the dense fp32 pooling

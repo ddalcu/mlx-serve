@@ -436,6 +436,10 @@ fn expectTinyLoad(st: []const u8, cfg_json: []const u8) !void {
         defer plugin_table.unload(m);
         // The load placed everything, and the text forward runs over the tiny pack: a 3-token prompt through a
         // real cache yields one finite logit row of the pack's vocab width.
+        // An error an earlier test in this shard latched would abort our first dispatch: drop it first, as the
+        // conformance suite does.
+        var err_buf: [512]u8 = undefined;
+        if (mlx.takeError(&err_buf)) |stale| std.debug.print("hy_v4 loader: dropped an earlier test's MLX error ({s})\n", .{stale});
         const cached = @import("../../sdk/testing/cache_ops.zig");
         var cache = try cached.TestCache.init(testing.allocator, p.shell.num_hidden_layers);
         defer cache.deinit();

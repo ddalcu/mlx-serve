@@ -34,6 +34,7 @@ pub const tiny_config =
         \\"moe_router_enable_expert_bias":true,"gating_type":"elementwise",
         \\"enable_ihc":true,"hc_mult":4,"hc_magnitude":2.0,"hc_eps":1e-6,
         \\"engram_max_ngram_size":3,"engram_n_head_per_ngram":8,"engram_n_embed_per_ngram":768,"engram_pad_id":3,
+        \\"engram_lookup_table_size":64,
         \\"engram_vocab_size":[50,50],"engram_layer_ids":[2],
         \\"engram_layer_head_vocab_sizes":{"2":[[50,50,50,50,50,50,50,50],[50,50,50,50,50,50,50,50]]},
         \\"num_nextn_predict_layers":0},
@@ -98,15 +99,16 @@ pub fn build(a: std.mem.Allocator) ![]const File {
             try t.fill("model.layers.{d}.mlp.combine_output_norm.weight", .{li}, &.{@as(u64, 64)}, .BF16, 1);
             inline for (.{ @as(u64, 0), 1, 2, 3 }) |pi| {
                 const nm = "model.layers.{d}.engram_layer.key_projs." ++ "0123"[pi .. pi + 1];
-                try q4(&t, nm, .{li}, &.{64}, 64);
+                // The memory is 16 heads x 96 = 1536 wide; each lane's key projection reads it.
+                try q4(&t, nm, .{li}, &.{64}, 1536);
                 try t.fill(nm ++ ".bias", .{li}, &.{@as(u64, 64)}, .BF16, 0);
                 try t.fill("model.layers.{d}.engram_layer.norm_query." ++ "0123"[pi .. pi + 1] ++ ".weight", .{li}, &.{@as(u64, 64)}, .BF16, 1);
                 try t.fill("model.layers.{d}.engram_layer.norm_key." ++ "0123"[pi .. pi + 1] ++ ".weight", .{li}, &.{@as(u64, 64)}, .BF16, 1);
                 try t.fill("model.layers.{d}.engram_layer.unified_per_hc_scales." ++ "0123"[pi .. pi + 1], .{li}, &.{@as(u64, 64)}, .BF16, 1);
             }
-            try q4(&t, "model.layers.{d}.engram_layer.value_proj", .{li}, &.{64}, 64);
+            try q4(&t, "model.layers.{d}.engram_layer.value_proj", .{li}, &.{64}, 1536);
             try t.fill("model.layers.{d}.engram_layer.value_proj.bias", .{li}, &.{@as(u64, 64)}, .BF16, 0);
-            try t.ints("model.layers.{d}.engram_layer.lookup_table", .{li}, &.{@as(u64, 64)}, .I32);
+            try t.intsSeq("model.layers.{d}.engram_layer.lookup_table", .{li}, &.{@as(u64, 64)}, .I32);
             try t.fill("model.layers.{d}.engram_layer.unified_pre_gamma", .{li}, &.{@as(u64, 64)}, .BF16, 1);
             const heads = [_][]const u8{ "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15" };
             inline for (heads) |hn| try t.fill(

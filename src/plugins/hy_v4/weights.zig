@@ -28,6 +28,7 @@ pub const Engram = struct {
     s_off: u64,
     s_stride: u64,
     b_off: u64,
+    b_stride: u64,
 
     fn close(self: *const Engram) void {
         crt.close(self.fd);
@@ -65,7 +66,7 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
         gpa.free(engrams);
     }
     // Build the trunk over the validated map: projections, hyper-connections, FFN. A failure frees what it built.
-    const tr = trunk.build(c, &holder.w) catch |e| {
+    const tr = trunk.build(c, &holder.w, engrams) catch |e| {
         holder.release();
         for (engrams) |*x| x.close();
         gpa.free(engrams);
@@ -267,14 +268,16 @@ fn validateMlp(V: *Check, li: u32) !void {
     try V.q("model.layers.{d}.mlp.shared_experts.down_proj", .{n}, d, c.intermediate_size);
     try V.shape("model.layers.{d}.mlp.combine_output_norm.weight", .{n}, &.{d});
     if (!c.engram_layers[li]) return;
+    // The Engram memory is `(max_ngram-1) * heads * head_dim` wide (16 heads x 96 = 1536).
+    const emb_w: u64 = (c.engram_max_ngram - 1) * c.engram_ngram_heads * c.engram_head_dim;
     for (0..4) |pi| {
-        try V.q("model.layers.{d}.engram_layer.key_projs.{d}", .{ n, @as(usize, pi) }, d, d);
+        try V.q("model.layers.{d}.engram_layer.key_projs.{d}", .{ n, @as(usize, pi) }, d, emb_w);
         try V.has("model.layers.{d}.engram_layer.key_projs.{d}.bias", .{ n, @as(usize, pi) });
         try V.shape("model.layers.{d}.engram_layer.norm_query.{d}.weight", .{ n, @as(usize, pi) }, &.{d});
         try V.shape("model.layers.{d}.engram_layer.norm_key.{d}.weight", .{ n, @as(usize, pi) }, &.{d});
         try V.has("model.layers.{d}.engram_layer.unified_per_hc_scales.{d}", .{ n, @as(usize, pi) });
     }
-    try V.q("model.layers.{d}.engram_layer.value_proj", .{n}, d, d);
+    try V.q("model.layers.{d}.engram_layer.value_proj", .{n}, d, emb_w);
     try V.has("model.layers.{d}.engram_layer.value_proj.bias", .{n});
     try V.has("model.layers.{d}.engram_layer.lookup_table", .{n});
     try V.has("model.layers.{d}.engram_layer.unified_pre_gamma", .{n});
@@ -463,6 +466,7 @@ fn openEngram(c: *const C, dir_path: []const u8, li: u32) OpenError!Engram {
         .s_off = base + regs[1].start,
         .s_stride = regs[1].cols * 2,
         .b_off = base + regs[2].start,
+        .b_stride = regs[2].cols * 2,
     };
 }
 

@@ -214,16 +214,19 @@ test "hy_v4 numpy rng: SeedSequence/PCG64/Lemire reproduce numpy's integers draw
 }
 
 test "hy_v4 numpy rng: the Engram hash multipliers match numpy's per-layer draws" {
-    // `seed + 10007*layer_id`, bound `INT64_MAX // 120818 // 2`, multipliers `drawn * 2 + 1`.
-    const cases = [_]struct { layer: u64, want: [3]u64 }{
-        .{ .layer = 1, .want = .{ 62851790804471, 3969549254569, 29493253070477 } },
-        .{ .layer = 11, .want = .{ 22336449643973, 44285148858881, 12542810976105 } },
-        .{ .layer = 21, .want = .{ 52983446356765, 40055345721131, 74516235862003 } },
-        .{ .layer = 31, .want = .{ 30953447287281, 19390831170335, 27885025344865 } },
+    // `seed + 10007*HF_layer_id` (1-based: pack layers 1/11/21/31 are HF ids 2/12/22/32). The bound is
+    // `INT64_MAX // (max(lookup map)+1) // 2`: the pack's trained map tops at 92619 (compressed vocab 92620),
+    // so it is NOT the table's 120818-row length. Multipliers are `drawn * 2 + 1`.
+    const cases = [_]struct { layer: u64, comp: u64, want: [3]u64 }{
+        .{ .layer = 2, .comp = 92620, .want = .{ 81853575799317, 39690085502883, 24229915018165 } },
+        .{ .layer = 12, .comp = 92620, .want = .{ 19457948045719, 44729556510419, 84779352922315 } },
+        .{ .layer = 22, .comp = 92620, .want = .{ 72974230057307, 21530602121221, 55998057243097 } },
+        .{ .layer = 32, .comp = 92620, .want = .{ 29128509562787, 16745155128523, 22474588302733 } },
+        .{ .layer = 2, .comp = 64, .want = .{ 118457471727074801, 57438995613704923, 35065230140349983 } },
     };
     for (cases) |c| {
         var got: [3]u64 = undefined;
-        hashMultipliers(10007 * c.layer, 120818, 3, &got);
+        hashMultipliers(10007 * c.layer, c.comp, 3, &got);
         try testing.expectEqualSlices(u64, &c.want, &got);
         // Every multiplier is odd, as the reference requires.
         for (got) |m| try testing.expect(m & 1 == 1);

@@ -3,8 +3,8 @@
 `model_type: hy_v4_flash`. The trunk is a DeepSeek-family MLA + compressed-DSA MoE with iHC streams, an Engram
 n-gram PLE on 4 layers, and a DFly2 draft stack in `model.dfly_layers.*`. Plans done: 01 claim/parse/bill/cache
 layout, 02 loader + Engram stream tables, 03 text forward (iHC, MLA with sinks, SWA, latent MoE, dense L0),
-04 compressed indexer (recall beyond the budget).
-Pending: 05 Engram, 06 DFly2, 07 vision, 08 proofs/docs.
+04 compressed indexer (recall beyond the budget), 05 Engram (hash + streamed gather + injection).
+Pending: 06 DFly2, 07 vision, 08 proofs/docs.
 
 ## Rules
 
@@ -36,8 +36,24 @@ Pending: 05 Engram, 06 DFly2, 07 vision, 08 proofs/docs.
   at the chosen ids), top-16 sorted ascending by expert id (the reference's accumulation order), normalized by
   `sum + 1e-20`, × `routed_scaling_factor` 3.998. `n_group`/`topk_group` are 1 here, so no group masking.
 - **The Engram tables never go resident**: 4× `U32[165M,12]` 4-bit·g32 ≈ 39.6 GB packed (60 B/row: 12 U32 codes
-  + 3 bf16 scales + 3 bf16 biases). They stream from an SSD bank (Plan 05 reads rows; Plan 02 opens the ranges);
-  the bill excludes them.
+  + 3 bf16 scales + 3 bf16 biases). They stream from an SSD bank (`weights.Engram` ranges); the forward preads
+  16 rows per token per layer and dequantizes off-disk; the bill excludes them.
+- **The Engram hash is numpy-exact**: the odd multipliers are NOT in the pack (transformers redraws them), so
+  `blocks/numpy_rng.zig` reproduces `SeedSequence -> PCG64 -> Lemire` bit for bit; `seed + 10007*HF_layer_id`,
+  bound `INT64_MAX // (max(lookup_map)+1) // 2` — the pack's map is TRAINED (max 92619), not its 120818-row
+  length, so a bound off the table size draws different multipliers and reads the wrong rows. The frozen
+  `lookup_table` maps tokens to compressed ids (past it, or before the sequence, reads the pad row), the ids
+  multiply and XOR (order 2 then 3), and each of the 16 heads (`(max_ngram-1) * n_head_per_ngram`) reduces
+  modulo its own vocab size. Row = head offset (cumsum of the 16 sizes) + id.
+- **Every Engram norm is torch's DEFAULT eps, not the config's**: the per-head 96-wide norms, the signal's
+  unweighted norm and the key/query norms are plain `nn.RMSNorm` over bf16 activations, so all take
+  `finfo(bf16).eps` (2^-7). Only the layer norms outside Engram read `rms_norm_eps`. The independent MLX port
+  (omlx) used f32 eps — we follow HF.
+- **fp8 is a HOST round trip**: the pinned MLX FFI has no float8 dtype, so each gathered 96-vector is scaled by
+  `max|x|/448`, clamped, snapped to the e4m3fn grid (ties to even) and rescaled in Zig before upload.
+- **The n-gram is the CURRENT call's tokens**: HF's `build_ngram_tokens` pads positions before the call, so a
+  decode step is `[t, pad, pad]`. A chunked prompt therefore pads at chunk boundaries where HF (no chunking)
+  would see history — parity holds for prompts forwarded whole.
 - **The compressed indexer is the ONLY selector** (`compressed_indexer_skip_fine_select: true`, no second
   per-token stage): the DSA layer's cached token keys pool by a gated fp32 convex combination
   (`key_value_projection` * softmax(`key_gate_projection` + `intra_group_ape`)), the group key takes `key_norm`

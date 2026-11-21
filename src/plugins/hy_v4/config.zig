@@ -91,6 +91,13 @@ pub const Config = struct {
     /// bill prices the stream bank from these; the load cross-checks the pack's table against them.
     engram_table_rows: [64]u64 = @splat(0),
     engram_vocab_sizes: [2]u32 = .{ 0, 0 },
+    /// The per-head hash moduli, tier-major (order 2's 8 heads then order 3's 8), per pack layer slot.
+    engram_moduli: [64][16]u32 = @splat(@splat(0)),
+    /// `engram_lookup_table_size` (HF default 120818) and the seed the multipliers are drawn from.
+    engram_lookup_size: u32 = 120818,
+    engram_seed: u64 = 0,
+    /// `engram_fp8_embedding`: the looked-up rows round-trip through e4m3.
+    engram_fp8: bool = true,
     engram_ngram_heads: u32 = 8,
     engram_head_dim: u32 = 96,
     engram_max_ngram: u32 = 3,
@@ -237,7 +244,12 @@ fn readAttention(c: *Config, o: Objects) ParseError!void {
     if (field(cfg, "swa_num_attention_heads")) |v| c.swa_num_attention_heads = try u32v(v);
     if (field(cfg, "sliding_window")) |v| c.sliding_window = try u32v(v);
     try require(c.q_lora_rank > 0 and c.kv_lora_rank > 0);
-    try require(c.qk_nope_head_dim + c.qk_rope_head_dim == c.head_dim + c.qk_rope_head_dim - c.head_dim + 256 or c.qk_nope_head_dim + c.qk_rope_head_dim == 256);
+    try require(c.qk_nope_head_dim + c.qk_rope_head_dim == 256);
+    // One nope/rope/v width serves both arms in the forward: a pack with a wider SWA geometry is refused
+    // by name rather than read at the DSA width.
+    if (field(cfg, "swa_qk_nope_head_dim")) |v| try require(try u32v(v) == c.qk_nope_head_dim);
+    if (field(cfg, "swa_qk_rope_head_dim")) |v| try require(try u32v(v) == c.qk_rope_head_dim);
+    if (field(cfg, "swa_v_head_dim")) |v| try require(try u32v(v) == c.v_head_dim);
     if (field(cfg, "gated_mla")) |v| c.gated_mla = try boolV(v);
     if (field(cfg, "learnable_sink")) |v| c.learnable_sink = try boolV(v);
     if (field(cfg, "sandwich_norm")) |v| c.sandwich_norm = try boolV(v);
@@ -390,6 +402,10 @@ fn readEngram(c: *Config, o: Objects) ParseError!void {
     try intIf(cfg, "engram_n_head_per_ngram", &c.engram_ngram_heads);
     try intIf(cfg, "engram_n_embed_per_ngram", &c.engram_head_dim);
     try intIf(cfg, "engram_pad_id", &c.engram_pad_id);
+    try intIf(cfg, "engram_lookup_table_size", &c.engram_lookup_size);
+    if (field(cfg, "engram_seed")) |v| c.engram_seed = @intCast(try u32v(v));
+    if (field(cfg, "engram_fp8_embedding")) |v| c.engram_fp8 = try boolV(v);
+    try require(c.engram_lookup_size > 0 and c.engram_pad_id < c.engram_lookup_size);
     try require(c.engram_max_ngram == 3 and c.engram_ngram_heads == 8);
     try require(c.engram_head_dim == 8 * 96);
     c.engram_head_dim = 96;
@@ -425,11 +441,20 @@ fn readEngram(c: *Config, o: Objects) ParseError!void {
             const tiers = try value(.array, kv.value_ptr.*);
             try require(tiers.items.len == 2);
             var total: u64 = 0;
+            var head_i: usize = 0;
             for (tiers.items) |tier| {
                 const heads = try value(.array, tier);
-                try require(heads.items.len > 0 and heads.items.len <= 64);
-                for (heads.items) |hv| total += try u32v(hv);
+                // Each tier carries one modulus per hash head: the n-gram orders flatten head-major.
+                try require(heads.items.len == c.engram_ngram_heads);
+                for (heads.items) |hv| {
+                    const m = try u32v(hv);
+                    try require(m > 0);
+                    if (head_i < 16) c.engram_moduli[li - 1][head_i] = m;
+                    head_i += 1;
+                    total += m;
+                }
             }
+            try require(head_i == 2 * c.engram_ngram_heads);
             try require(total > 0);
             c.engram_table_rows[li - 1] = total;
             seen += 1;
