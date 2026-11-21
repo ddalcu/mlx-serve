@@ -154,10 +154,7 @@ fn finished(s: *Served, slot: *Slot, ev: *const abi.Event) void {
         .length => "length",
         .cancelled, .failed => "cancelled",
     };
-    if (s.metrics) |m| m.beginTokenMove();
-    _ = s.gauges.generated.fetchSub(slot.completion_tokens, .seq_cst);
-    finish.recordSlotEnd(s.metrics, slot, if (ev.reason == .failed) .failed else finish.finishOutcome(reason, null));
-    if (s.metrics) |m| m.endTokenMove();
+    finish.moveSlotTokens(s.metrics, &s.gauges.generated, slot, if (ev.reason == .failed) .failed else finish.finishOutcome(reason, null));
     if (ev.reason == .failed) {
         const why = abi.items(u8, ev.verdict.why);
         log.err("[{s}] request failed: {s}\n", .{ @tagName(s.kind), why });
