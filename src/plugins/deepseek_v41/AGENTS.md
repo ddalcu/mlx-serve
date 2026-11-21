@@ -14,6 +14,9 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - `deepseek_v41.zig` (model), `engram.zig`, `vision.zig`. The legacy seam is deleted: a pack the plugin declines is
   refused by name (`load/init.zig`).
 - `streamed_test.zig`: the trunk with its experts streamed from the pack (`stream_experts`) bit-equal to the in-memory banks.
+- `ablation.zig`: per-slot directional ablation (`Caps.ablation`, `Forward.ablation`) armed on the slot's `State` so
+  every pass that writes the residual stream ablates, DSpark rounds and batched passes included; `MLX_SERVE_DIAG=dsv41-tap-dir=<dir>`
+  arms the calibration tap (f32 `[layers + 1, rows, dim]` npy plus a `.json` sidecar apiece, dir 0700, files 0600).
 - `fixtures/`: proof tapes recorded from the legacy forward (`fixtures/MANIFEST.md`).
 - `contract.zig`: kernel contract registrations of `kernels/*.metal`.
 - `decode/`: the fused decode kernels (`kernels/dec_*.metal`, one file a stage) a step or verify of up to `max_rows`
@@ -40,6 +43,9 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - `owns_decode_state`, `slot_state` + `batches_decode` (streamed: single-flight): active state in `dec_state`, other
   live slots in `parked`; decode and DSpark rounds batch through `extendBatched` (rows a state, projections shared,
   attention per state) and `dsparkDraftBatched`. Each State owns its pending capture.
+- `ablation`: a request's `Forward.ablation` is armed on the slot's state (`stateArm`) and freed with it; embedding,
+  attention, FFN/MoE, Engram value and rewind replays ablate, DSpark rounds included. Pair/tensor splits refuse it;
+  a snapshot keeps its ablation and key and resumes that variant; an unkeyed ablation never continues rows.
 - `prefix_cache` for unpaired instances whose bank holds every expert; a streaming bank (fewer prompt or decode slot
   rows than `num_experts`, `bankStreams`) and a Thunderbolt pair keep legacy resume.
   Snapshots retain every buffer and restore whole only at their own position; the engine owns finished history. Pairs

@@ -1373,6 +1373,7 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         .ablation = ablation,
         .prompt_spans = if (mode == .prefill) .of(ctx.prompt_spans) else .{},
         .ssm_checkpoints = if (mode == .prefill) .of(ctx.ssm_cp_positions) else .{},
+        .prefill = ctx.prefill,
     };
     var out: abi.ForwardOut = .{ .captured = &captured };
     intree.enter(ctx);

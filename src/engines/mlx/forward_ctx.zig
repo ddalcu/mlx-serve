@@ -103,6 +103,10 @@ pub const ForwardCtx = struct {
     /// A prompt forward read at most at its last row's logits (no prompt logprobs): a model declaring
     /// `Caps.prompt_last_row` is asked for that row alone.
     last_row_logits: bool = false,
+    /// The engine's prompt forwarding: a prompt chunk, or the split prefill's final-token span, which is one row and so
+    /// reaches the plugin as `Mode.decode`. False from the first decode step on. Reaches plugins as `Forward.prefill`,
+    /// which the calibration tap gates on: by mode alone, the last prompt token is dropped.
+    prefill: bool = false,
     /// Hand the graph built so far to the GPU every this many layers (0 =
     /// build it whole): a spec round's verify waits on the host otherwise.
     pipeline_build: u32 = 0,
