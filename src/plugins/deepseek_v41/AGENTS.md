@@ -33,8 +33,8 @@ serves either from the pack, with no flag.
 - `spec/markov.zig`: DSpark's Markov chain in B + 1 launches; `decode/engram_decode.zig` the Engram LRU,
   `decode/gemv_twin.zig` the batched GEMV twin of MLX's M=1 words.
 - `decode/moe_fp4.zig`: the MoE's two launches over fp4 routed experts (MXFP4; NVFP4 with ModelOpt's
-  per-expert scales through `moeUpScaled`), rows 1..6, serving without NAX, on NAX only under
-  `MLX_SERVE_DSV41_MOE_FP4_NAX` (unmeasured on M5); `moe_up` /
+  per-expert scales through `moeUpScaled`), rows 1..6, serving everywhere (`MLX_SERVE_DSV41_MOE_FP4_NAX=0` turns
+  them off on NAX); with `wo_a` on its vector kernel a verify row is its plain step's bytes; `moe_up` /
   `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or 128 (the expert-pruned packs are 2-bit g128).
   Otherwise `routed` runs.
 - GGUF expert banks (`--mlx-gguf`, ISTA's GSQ-RCO sets) decode up to `region_rows` through `ffnDecodeGguf`

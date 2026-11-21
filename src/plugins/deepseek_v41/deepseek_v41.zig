@@ -4020,12 +4020,24 @@ pub fn ffnDecode(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: 
     return try moeKernel(sc, m.moe_dn_kernel, &.{ act, vdn.w, vdn.s, vdn.b, sdn.w, sdn.s, sdb, flat, x1, sp.post, sp.comb }, mlx.getShape(x1), dt, dn.qp, sdn.qp, inter, d, k);
 }
 
-/// The fused fp4 MoE decode kernels where they serve: without NAX, and on a NAX GPU only under
-/// `MLX_SERVE_DSV41_MOE_FP4_NAX` (read each call; there `routed`'s gathers run without it).
+/// The fused fp4 MoE decode kernels where they serve: everywhere, unless `MLX_SERVE_DSV41_MOE_FP4_NAX=0` on a NAX GPU
+/// (read each call; there `routed`'s gathers run).
 fn fp4Decode(m: *const Dsv41Model) ?dkern.moe_fp4.Kernels {
     const k = m.dec.moe_fp4 orelse return null;
-    if (device.naxAvailable() and !env.on(.MLX_SERVE_DSV41_MOE_FP4_NAX)) return null;
+    if (device.naxAvailable() and !fp4NaxOn(env.get(.MLX_SERVE_DSV41_MOE_FP4_NAX))) return null;
     return k;
+}
+
+/// `MLX_SERVE_DSV41_MOE_FP4_NAX`: unset or anything but `0` keeps the fused fp4 decode on a NAX GPU.
+fn fp4NaxOn(raw: ?[*:0]const u8) bool {
+    const v = raw orelse return true;
+    return v[0] != '0';
+}
+
+test "dsv41 fused fp4 decode: on a NAX GPU by default, off only at MLX_SERVE_DSV41_MOE_FP4_NAX=0" {
+    try std.testing.expect(fp4NaxOn(null));
+    try std.testing.expect(fp4NaxOn("1"));
+    try std.testing.expect(!fp4NaxOn("0"));
 }
 
 /// The fused gate/up launch with the layer's gate and up scales (its down scale already rides `wts`).
