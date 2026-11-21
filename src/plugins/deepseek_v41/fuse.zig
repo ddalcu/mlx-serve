@@ -36,7 +36,7 @@ pub const Fuse = struct {
 
     pub fn wanted() Fuse {
         return .{
-            .down_scale = env.on(.MLX_SERVE_DSV41_FUSE_DOWN_SCALE),
+            .down_scale = env.onUnlessZero(.MLX_SERVE_DSV41_FUSE_DOWN_SCALE),
             .engram = env.on(.MLX_SERVE_DSV41_FUSE_ENGRAM),
             .mxfp8_qmm = env.onUnlessZero(.MLX_SERVE_DSV41_FUSE_MXFP8_QMM),
             .pf_bf16_trunk = env.on(.MLX_SERVE_DSV41_PF_BF16_TRUNK),
