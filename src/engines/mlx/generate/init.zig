@@ -1011,7 +1011,7 @@ pub fn initWithOptions(
             .dspark_stochastic = dspark_stochastic,
             // A streamed EXL3 bank verifies the whole block on a greedy request: its verify costs about a plain tick.
             // MLX_SERVE_DSPARK_PIN_ROWS=N pins every round at N rows (the width sweep).
-            .dspark_pol = if (dspark_active) if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = dsparkPinRows(!dspark_stochastic and dm.cfg.dsv41_exl3_bank, env.get(.MLX_SERVE_DSPARK_PIN_ROWS)), .p2 = if (env.on(.MLX_SERVE_DSPARK_POLICY2)) .{} else null } else null else null,
+            .dspark_pol = if (dspark_active) if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = dsparkPinRows(!dspark_stochastic and dm.cfg.dsv41_exl3_bank, env.get(.MLX_SERVE_DSPARK_PIN_ROWS)), .p2 = if (env.onUnlessZero(.MLX_SERVE_DSPARK_POLICY2)) .{} else null } else null else null,
             .drafter = if (drafter_active) options.drafter else null,
             .drafter_block_size = options.drafter_block_size,
             .dflash = if (dflash_active) options.dflash else null,
