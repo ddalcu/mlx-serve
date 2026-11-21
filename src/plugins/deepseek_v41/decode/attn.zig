@@ -819,6 +819,62 @@ fn woaWeights(sc: *Scope, seed: u64) ![3]A {
     };
 }
 
+/// The merged split `pm` against the host's float64 merge of the plain kernel's partials `pl` with `sink`: within 1e-5
+/// of each head's scale, its max 0 and its sum 1 (the first misses printed).
+fn mergedIsHostMerge(sc: *Scope, pl: Partials, pm: Partials, sink: A) !void {
+    _ = sc;
+    const gpa = testing.allocator;
+    const acc = try dsv41.hostF32(pl.acc);
+    defer gpa.free(acc);
+    const mm = try dsv41.hostF32(pl.m);
+    defer gpa.free(mm);
+    const ll = try dsv41.hostF32(pl.l);
+    defer gpa.free(ll);
+    const sk = try dsv41.hostF32(sink);
+    defer gpa.free(sk);
+    const got = try dsv41.hostF32(pm.acc);
+    defer gpa.free(got);
+    const gm = try dsv41.hostF32(pm.m);
+    defer gpa.free(gm);
+    const gl = try dsv41.hostF32(pm.l);
+    defer gpa.free(gl);
+    const S: usize = @intCast(pl.splits);
+    const H = sk.len;
+    const R = got.len / (H * HD);
+    var misses: usize = 0;
+    for (0..R) |i| for (0..H) |h| {
+        const base = (i * H + h) * S;
+        var M: f64 = sk[h];
+        for (0..S) |j| M = @max(M, mm[base + j]);
+        var total = @exp(sk[h] - M);
+        var w: [MAX_SPLITS]f64 = undefined;
+        for (0..S) |j| {
+            w[j] = if (ll[base + j] > 0) @exp(mm[base + j] - M) else 0;
+            total += ll[base + j] * w[j];
+        }
+        var scale: f64 = 1e-30;
+        var o: [HD]f64 = @splat(0);
+        for (0..HD) |d| {
+            for (0..S) |j| o[d] += acc[(base + j) * HD + d] * w[j];
+            o[d] /= total;
+            scale = @max(scale, @abs(o[d]));
+        }
+        for (0..HD) |d| {
+            const g = got[(i * H + h) * HD + d];
+            if (!(@abs(g - o[d]) <= 1e-5 * scale)) {
+                if (misses < 8) std.debug.print("[attn merge] row {d} head {d} ch {d}: merged {e} host {e} (max {e} sum {e})\n", .{ i, h, d, g, o[d], gm[i * H + h], gl[i * H + h] });
+                misses += 1;
+            }
+        }
+        if (gm[i * H + h] != 0 or gl[i * H + h] != 1) {
+            if (misses < 8) std.debug.print("[attn merge] row {d} head {d}: max {e} sum {e}\n", .{ i, h, gm[i * H + h], gl[i * H + h] });
+            misses += 1;
+        }
+    };
+    if (misses > 0) std.debug.print("[attn merge] {d} misses of {d}\n", .{ misses, R * H * (HD + 1) });
+    try testing.expectEqual(@as(usize, 0), misses);
+}
+
 test "dsv41 dec attn merge: wo_a over the merged split is wo_a over the splits (rel rms 1e-3), rows 1, 2, 4, 6; the partials are the plain kernel's; the sink counted twice fails" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const wo_a = @import("wo_a.zig");
@@ -850,6 +906,7 @@ test "dsv41 dec attn merge: wo_a over the merged split is wo_a over the splits (
         const want = (try wo_a.launch(&sc, kw, 64, .bfloat16, .{ pl.acc, pl.m, pl.l, sink, meta, wts[2], wts[0], wts[1] }, wcounter, null)) orelse return error.Declined;
         const pm = (try partialsMerged(&sc, km, &m, rig.q, rig.win(), rig.comps[0], rig.picks[0], rig.p0, SCALE, sink, counter)) orelse return error.Declined;
         try testing.expectEqual(@as(c_int, 1), pm.splits);
+        try mergedIsHostMerge(&sc, pl, pm, sink);
         const got = (try wo_a.launch(&sc, kw, 64, .bfloat16, .{ pm.acc, pm.m, pm.l, nosink, meta, wts[2], wts[0], wts[1] }, wcounter, null)) orelse return error.Declined;
         // The planted bug: wo_a weighs the layer's sink against the merged split too (the sink counted twice).
         const bad = (try wo_a.launch(&sc, kw, 64, .bfloat16, .{ pm.acc, pm.m, pm.l, sink, meta, wts[2], wts[0], wts[1] }, wcounter, null)) orelse return error.Declined;
