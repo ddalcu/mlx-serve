@@ -2399,6 +2399,42 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
     try testing.expectEqual(chat.StreamThinkGate.flush_text, chat.streamThinkGate("The visible answer.", true, true));
 }
 
+fn freeCalls(a: std.mem.Allocator, calls: []chat.ParsedToolCall) void {
+    for (calls) |tc| {
+        a.free(tc.name);
+        a.free(tc.arguments);
+    }
+    a.free(calls);
+}
+
+test "format corpus: no surface reports a call sketched in a never-closed template thought" {
+    // The thought the template opened runs to a max_tokens cut; every surface's finish must agree there is no call.
+    const a = testing.allocator;
+    const chat_completions = @import("../api/chat_completions.zig");
+    const chat_stream = @import("../api/chat_stream.zig");
+    const anthropic = @import("../api/anthropic.zig");
+    const anthropic_stream = @import("../api/anthropic_stream.zig");
+    const responses = @import("../api/responses/handler.zig");
+    const raw = "The user wants a clean tree. Plan: <tool_call>\n<function=bash>\n<parameter=command>\nrm -rf build\n</parameter>\n</function>\n</tool_call> but first I should che";
+    freeCalls(a, (try chat_completions.replyToolCalls(a, raw, false, bash_tool_schema, true)).?);
+    var routed: ?@import("../../sdk/grammar/protocol.zig").Delivery = null;
+    const split = try chat_completions.splitConstrainedResponse(a, &routed, .{}, raw, null, true, true);
+    const found = [_]struct { []const u8, ?[]chat.ParsedToolCall }{
+        .{ "/v1/messages", try anthropic.messageToolCalls(a, split, bash_tool_schema, true) },
+        .{ "/v1/messages stream", try anthropic_stream.messageStreamEndToolCalls(a, raw, true, false, bash_tool_schema, true) },
+        .{ "/v1/chat/completions", try chat_completions.replyToolCalls(a, raw, true, bash_tool_schema, true) },
+        .{ "/v1/chat/completions stream", try chat_stream.streamEndToolCalls(a, raw, true, false, bash_tool_schema, true) },
+        .{ "/v1/responses", try responses.responseToolCalls(a, raw, true, bash_tool_schema, true) },
+    };
+    var failed = false;
+    for (found) |f| if (f[1]) |calls| {
+        std.debug.print("\n{s} reported a call from the thought: {s}\n", .{ f[0], calls[0].name });
+        freeCalls(a, calls);
+        failed = true;
+    };
+    if (failed) return error.FormatCorpusExpectFailed;
+}
+
 /// Length of a `<|…>` special-token marker starting `s`, or null.
 fn specialMarkerLenAt(s: []const u8) ?usize {
     if (!std.mem.startsWith(u8, s, "<|")) return null;

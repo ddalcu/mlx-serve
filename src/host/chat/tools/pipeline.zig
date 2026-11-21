@@ -46,7 +46,8 @@ pub fn shouldParseToolCalls(finish_details: ?[]const u8) bool {
 }
 
 /// The text a finished generation's tool calls are parsed from. A thought the TEMPLATE opened and the model
-/// never closed is reasoning to its last byte, so a call written in it is not work.
+/// never closed is reasoning to its last byte, so a call written in it is not work, also when the generation
+/// ended on EOS (finish "stop"): a call inside the think block is never recovered (docs/gotchas/tool-calling.md).
 pub fn toolParseText(text: []const u8, opened_by_template: bool) []const u8 {
     if (opened_by_template and chat_mod.splitThinkBlockKeepingMarkup(text, true, true).content.len == 0) return "";
     return text;

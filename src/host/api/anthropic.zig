@@ -981,8 +981,8 @@ fn handleAnthropicNonStreaming(
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
     var thinking_tokens: u32 = 0;
+    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, true, opens_think);
     {
-        const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, true, opens_think);
         // Reasoning is never fed back to the parser, so it is cut here.
         const split_reasoning: ?[]const u8 = if (think_split.reasoning_content) |r| blk: {
             const t = if (has_tools) chat_mod.trimLeakedToolMarkup(r) else r;
@@ -1018,7 +1018,7 @@ fn handleAnthropicNonStreaming(
 
     // Check for tool calls
     if (has_tools and shouldParseToolCalls(result.finish_details)) {
-        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools);
+        const found_calls = try messageToolCalls(allocator, think_split, tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -1127,6 +1127,11 @@ fn handleAnthropicNonStreaming(
     });
     defer allocator.free(response);
     try sendResponse(stream, "200 OK", "application/json", response);
+}
+
+/// The tool calls a finished /v1/messages reply reports: from the split's content, never its reasoning.
+pub fn messageToolCalls(allocator: std.mem.Allocator, think_split: chat_mod.ThinkSplit, tools_json: ?[]const u8, allow_parallel: bool) !?[]chat_mod.ParsedToolCall {
+    return parseToolCallsForRequest(allocator, think_split.content, tools_json, allow_parallel);
 }
 
 // ── tests ──
