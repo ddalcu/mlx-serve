@@ -383,15 +383,21 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
     // Every case and switch runs; each out of tolerance is reported.
     var ok = true;
     for ([_]Case{ .{ .lo = 14, .rows = 5000 }, .{ .lo = 20, .rows = 8192 } }) |c| inline for (.{ false, true }) |nv| {
-        const fx = try fixture.Fixture.init(gpa, .{ .lo = c.lo, .hi = c.lo + 2, .ctx = 0, .experts_fp4 = !nv, .experts_nvfp4 = nv, .expert_scales = if (nv) .all else .none });
-        defer fx.deinit();
         var lb: [64]u8 = undefined;
         const label = try std.fmt.bufPrint(&lb, "{d}-{d} {s} at {d} rows", .{ c.lo, c.lo + 1, if (nv) "NVFP4" else "MXFP4", c.rows });
+        const fx = fixture.Fixture.init(gpa, .{ .lo = c.lo, .hi = c.lo + 2, .ctx = 0, .experts_fp4 = !nv, .experts_nvfp4 = nv, .expert_scales = if (nv) .all else .none }) catch |e| {
+            std.debug.print("wide layer {s}: the fixture refused: {s}\n", .{ label, @errorName(e) });
+            return e;
+        };
+        defer fx.deinit();
         const x = try fx.stream(c.rows);
         defer _ = mlx.mlx_array_free(x);
         const pre = try fx.cpre(c.rows);
         defer _ = mlx.mlx_array_free(pre);
-        const want = try prefill(fx, x, pre);
+        const want = prefill(fx, x, pre) catch |e| {
+            std.debug.print("wide layer {s}: the stock prefill failed: {s}\n", .{ label, @errorName(e) });
+            return e;
+        };
         defer for (want) |o| {
             _ = mlx.mlx_array_free(o);
         };
@@ -401,10 +407,18 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
             defer sc.deinit();
             const ly = fx.layer(c.lo);
             const h = try normal(&sc, &.{ @intCast(c.rows), @intCast(hidden) }, .bfloat16, 1, 0x77);
-            const r = try dsv41.route(&sc, fx.m, ly, h, none);
+            const r = dsv41.route(&sc, fx.m, ly, h, none) catch |e| {
+                std.debug.print("wide layer {s}: the route failed: {s}\n", .{ label, @errorName(e) });
+                return e;
+            };
             env.set(if (nv) .MLX_SERVE_DSV41_MOE_PAIR_SCALED else .MLX_SERVE_DSV41_MOE_PAIR, "1");
             defer env.unset(if (nv) .MLX_SERVE_DSV41_MOE_PAIR_SCALED else .MLX_SERVE_DSV41_MOE_PAIR);
-            try testing.expect(try actOf(&sc, fx.m, &ly.experts, h, r.idx, r.wts) != null);
+            const served = (actOf(&sc, fx.m, &ly.experts, h, r.idx, r.wts) catch |e| {
+                std.debug.print("wide layer {s}: the paired kernel failed: {s}\n", .{ label, @errorName(e) });
+                return e;
+            }) != null;
+            if (!served) std.debug.print("wide layer {s}: the paired kernel declines the loaded experts (gu {}, mode {s})\n", .{ label, ly.experts.gu != null, if (ly.experts.gu) |g| @tagName(g.qp.mode) else "-" });
+            try testing.expect(served);
         }
         if (!try closeAs(fx, x, pre, want, label, "the stock path again")) ok = false;
         inline for (switches) |n| {
