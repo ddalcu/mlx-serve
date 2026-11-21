@@ -19,7 +19,7 @@ const A = mlx.mlx_array;
 /// declines.
 pub fn act(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.Experts, x3: A, rows: A, sidx: A, w_sorted: A) !?A {
     const scaled = e.scale[0] != null or e.scale[1] != null;
-    if (!(if (scaled) env.on(.MLX_SERVE_DSV41_MOE_PAIR_SCALED) else env.on(.MLX_SERVE_DSV41_MOE_PAIR))) return null;
+    if (!(if (scaled) scaledOn(env.get(.MLX_SERVE_DSV41_MOE_PAIR_SCALED)) else env.on(.MLX_SERVE_DSV41_MOE_PAIR))) return null;
     const name: []const u8 = if (scaled) "MOE_PAIR_SCALED" else "MOE_PAIR";
     const L = mlx.getShape(x3)[0];
     const P = mlx.getShape(sidx)[0];
@@ -38,4 +38,16 @@ var declined_logged: std.atomic.Value(bool) = .init(false);
 fn decline(name: []const u8, L: c_int, P: c_int, why: []const u8) ?A {
     if (!declined_logged.swap(true, .monotonic)) log.info("[dsv41] {s} declined (rows {d}, pairs {d}): {s}\n", .{ name, L, P, why });
     return null;
+}
+
+/// `MLX_SERVE_DSV41_MOE_PAIR_SCALED`: on unless set to `0` (an NVFP4 bank with per-expert scales pairs by default).
+fn scaledOn(raw: ?[*:0]const u8) bool {
+    const v = raw orelse return true;
+    return v[0] != '0';
+}
+
+test "dsv41 moe pair: the scaled switch is on unset and off only at 0" {
+    try std.testing.expect(scaledOn(null));
+    try std.testing.expect(scaledOn("1"));
+    try std.testing.expect(!scaledOn("0"));
 }

@@ -182,7 +182,7 @@ test "dsv41 wide tol: the paired fp4 gate+up with moe_act in its epilogue is the
     const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
     const unset = env.override(.MLX_SERVE_DSV41_MOE_PAIR, null);
     defer unset.restore();
-    const unset_scaled = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, null);
+    const unset_scaled = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "0");
     defer unset_scaled.restore();
     // Every format and row count runs; each out of tolerance is reported.
     var ok = true;
@@ -377,7 +377,7 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;
-    inline for (switches) |n| env.unset(n);
+    inline for (switches) |n| env.set(n, "0");
     // A ratio-2 pair (layers 8, 9) and a ratio-1 pair (20, 21), each range its own KV and index source and no Engram
     // layer (14 reads Engram, which a pair worker's fixture does not hold).
     const Case = struct { lo: usize, rows: usize };
@@ -413,7 +413,7 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
                 return e;
             };
             env.set(if (nv) .MLX_SERVE_DSV41_MOE_PAIR_SCALED else .MLX_SERVE_DSV41_MOE_PAIR, "1");
-            defer env.unset(if (nv) .MLX_SERVE_DSV41_MOE_PAIR_SCALED else .MLX_SERVE_DSV41_MOE_PAIR);
+            defer env.set(if (nv) .MLX_SERVE_DSV41_MOE_PAIR_SCALED else .MLX_SERVE_DSV41_MOE_PAIR, "0");
             const served = (actOf(&sc, fx.m, &ly.experts, h, r.idx, r.wts) catch |e| {
                 std.debug.print("wide layer {s}: the paired kernel failed: {s}\n", .{ label, @errorName(e) });
                 return e;
@@ -424,12 +424,12 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
         if (!try closeAs(fx, x, pre, want, label, "the stock path again")) ok = false;
         inline for (switches) |n| {
             env.set(n, "1");
-            defer env.unset(n);
+            defer env.set(n, "0");
             if (!try closeAs(fx, x, pre, want, label, @tagName(n))) ok = false;
         }
         inline for (switches) |n| env.set(n, "1");
         defer {
-            inline for (switches) |n| env.unset(n);
+            inline for (switches) |n| env.set(n, "0");
         }
         if (!try closeAs(fx, x, pre, want, label, "every switch")) ok = false;
         // Planted: every switch on with the routed experts' sum at half its scale.
