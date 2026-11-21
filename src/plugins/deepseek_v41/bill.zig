@@ -69,6 +69,13 @@ pub fn bill(p: *const abi.Parsed, shape: *const abi.Shape, out: *abi.Bill) callc
     out.* = .{ .kv_per_token = kvPerToken(cfg_mod.of(p)), .prefill_attn_keys = &attnKeys, .prefill_bytes = &prefillBytes };
 }
 
+/// `MLX_SERVE_DSV41_PF_BF16_TRUNK`'s bf16 trunk (`fuse.trunkBytes`) on a pack whose experts do not stream, which the
+/// load's resident bytes carry (`plugin.residentBytes`); a load that settles on ssd makes none, so it bills high there.
+pub fn pfTrunkBytes(c: *const cfg_mod.Config) u64 {
+    if (!env.on(.MLX_SERVE_DSV41_PF_BF16_TRUNK) or c.dsv41_streamed) return 0;
+    return @import("fuse.zig").trunkBytes(c);
+}
+
 pub fn kvPerToken(c: *const cfg_mod.Config) u64 {
     var sum: u64 = 0;
     for (0..c.num_hidden_layers) |l| {

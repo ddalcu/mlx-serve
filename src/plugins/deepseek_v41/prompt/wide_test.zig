@@ -329,7 +329,7 @@ test "dsv41 wide tol: the FFN-side hc expand and norm in one launch are the stoc
     var m: dsv41.Dsv41Model = undefined;
     try hcModel(&m);
     defer hcModelFree(&m);
-    const unset = env.override(.MLX_SERVE_DSV41_HC_EXPAND_NORM, null);
+    const unset = env.override(.MLX_SERVE_DSV41_HC_EXPAND_NORM, "0");
     defer unset.restore();
     var ok = true;
     for ([_]c_int{ 17, 256, 1027, 4096, 8192 }, 0..) |L, i| {

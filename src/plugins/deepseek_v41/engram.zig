@@ -828,6 +828,17 @@ pub const Table = struct {
     }
     /// The first `n` rows of `raw` dequantized: f32 `[n, head_dim]` (caller frees).
     pub fn dequant(self: *const Table, raw: Raw, n: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+        return self.dequantTo(raw, n, .float32, s);
+    }
+
+    /// Whether `dequantTo` honours its dtype: mxfp4 and mxfp8 codes, each times a power of two (exact in f32) and
+    /// rounded once into the output type, so the rows in `dt` hold what f32 rows cast to `dt` hold.
+    pub fn dequantsTo(self: *const Table) bool {
+        return self.mode == .mxfp4 or self.mode == .mxfp8;
+    }
+
+    /// `dequant` into `dt` where `dequantsTo`, else f32.
+    pub fn dequantTo(self: *const Table, raw: Raw, n: usize, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
         if (self.mode == .gguf) {
             // IQ4_NL blocks in the kernels' split row layout.
             const kernels = gguf_root.kernels;
@@ -853,7 +864,8 @@ pub const Table = struct {
         };
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
-        try mlx.check(mlx.mlx_dequantize(&out, wa, sa, ba, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), self.mode.cstr(), .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+        const out_dt: mlx.mlx_dtype = if (self.dequantsTo()) dt else .float32;
+        try mlx.check(mlx.mlx_dequantize(&out, wa, sa, ba, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), self.mode.cstr(), .{ .ctx = null }, .{ .value = out_dt, .has_value = true }, s));
         return out;
     }
 
