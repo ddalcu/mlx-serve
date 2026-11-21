@@ -411,6 +411,8 @@ pub const EngramLayer = struct {
     wkv: Lin,
     qk: A, // f32 [hc, dim]: q_weight * k_weight
     table: engram.Table,
+    /// The held table's codes and scales as GPU buffers (`fuse.wrapHeld`), which the fused wkv gathers from.
+    gpu: ?[2]A = null,
 };
 
 pub const DsparkW = struct {
@@ -562,7 +564,10 @@ pub const Dsv41Model = struct {
         if (self.dec_state) |*st| st.deinit();
         self.dropAhead();
         self.gpa.free(self.prompt);
-        for (self.engrams) |*e| e.table.close();
+        for (self.engrams) |*e| {
+            fusion.unwrap(e);
+            e.table.close();
+        }
         if (self.embed_tab) |*t| t.close();
         self.gpa.free(self.engrams);
         self.gpa.free(self.token_map);
@@ -1964,7 +1969,10 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     errdefer {
         freeRegions(m);
         m.freeQuant();
-        for (m.engrams) |*e| e.table.close();
+        for (m.engrams) |*e| {
+            fusion.unwrap(e);
+            e.table.close();
+        }
         gpa.free(m.engrams);
         gpa.free(m.token_map);
         for (m.owned.items) |x| _ = mlx.mlx_array_free(x);
@@ -2029,7 +2037,6 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     };
     try compileRegions(m);
     m.exact = exactWanted();
-    m.fuse = fusion.Fuse.wanted();
     if (m.exact.on) {
         // Proven (decode/exact_test.zig, the live corpus) only where every verify row takes the fused decode kernels'
         // rows (`blockFusedRows`): an Apple GPU without NAX (the fused NAX indexer and attention give a verify row other
@@ -2075,6 +2082,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     }
     try evalWeights(m);
     try holdEngram(m);
+    try fusion.settle(m);
     // the gemv twin's launches for the indexer's linears compiled now, not in a request's first verify.
     if (mlx.streamIsGpu(s)) try warmTwin(m);
     // the gemv twin's launches for each Engram layer's plain wkv compiled now, not in a request's first
@@ -6209,9 +6217,10 @@ pub fn spanInAt(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const S
     for (m.engrams, 0..) |*e, ek| {
         if (e.layer != li) continue;
         const nc = sp.ncols;
-        // `fuse.engram`: a decode-width span's write straight from the raw rows (`fusion.engramWrite`).
-        var fused: ?A = null;
-        const rows = if (sp.prefetch) |pf| blk: {
+        // `fuse.engram`: a decode-width span's write gathered from the resident table (`fusion.engramHeld`), else
+        // from the rows read out of it (`fusion.engramWrite`).
+        var fused: ?A = try fusion.engramHeld(sc, m, e, sp.eng_ids, m.engrams.len, ek, nc, lo, hi, x);
+        const rows = if (fused != null) none else if (sp.prefetch) |pf| blk: {
             // A batch reads grid k, state k's rows, as one span.
             const raw = if (sp.offs.len > 0) try pf.take(k, ek, 0) else try pf.take(sp.p0, ek, k);
             defer raw.deinit(gpa);

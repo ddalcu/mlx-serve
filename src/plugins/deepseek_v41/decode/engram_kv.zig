@@ -1,5 +1,7 @@
 //! An Engram layer's wkv over its decode rows straight from the table's codes (`dec_engram_kv.metal`, `fuse.engram`):
-//! the rows' dequant, their cast and the mxfp8 projection in one launch, the rows never in memory.
+//! the rows' dequant, their cast and the mxfp8 projection in one launch, the rows never in memory. The rows are
+//! picked by id out of any byte buffer (`Geo`): the rows copied out of the table, or the whole resident table
+//! wrapped as one GPU buffer (`fuse.engram_gather`), so the gather is the kernel's own load.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -12,7 +14,7 @@ const A = mlx.mlx_array;
 pub const SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_engram_kv.metal");
 /// The e2m1, e4m3 and e8m0 reads (`fp4_scale.metal` and the mxfp8 pair decode).
 pub const HEADER = @import("../../../sdk/blocks/qmm/mxfp8_qmv.zig").HEADER;
-pub const INS = [_][*:0]const u8{ "codes", "tsc", "w", "wsc" };
+pub const INS = [_][*:0]const u8{ "codes", "tsc", "ids", "geo", "w", "wsc" };
 /// A threadgroup's output rows (the kernel's SG x RT), its threads, and the inputs it stages at a time (CH).
 pub const cols = 16;
 pub const threads = 256;
@@ -20,6 +22,19 @@ pub const chunk = 1024;
 
 /// The table rows' geometry: `hd` inputs a row, `tb` bits a code (4: e2m1, 8: e4m3), an e8m0 scale per 32.
 pub const Table = struct { hd: usize, tb: usize };
+
+/// Where table row `id`'s codes and scales sit in their buffers: byte offset of row 0 and the row stride of each.
+pub const Geo = struct {
+    w_base: u64,
+    w_stride: u64,
+    s_base: u64,
+    s_stride: u64,
+
+    /// The kernel's `geo` input: each base as two 32-bit halves, then its stride.
+    pub fn words(g: Geo) [6]u32 {
+        return .{ @truncate(g.w_base), @truncate(g.w_base >> 32), @intCast(g.w_stride), @truncate(g.s_base), @truncate(g.s_base >> 32), @intCast(g.s_stride) };
+    }
+};
 
 /// Built at first use (one per `-Dunits` unit, as the SDK's mxfp8 qmv).
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -39,18 +54,19 @@ fn is(a: A, dt: mlx.mlx_dtype, want: []const usize) bool {
     return true;
 }
 
-/// kv `[rows, N]` bf16 = x . W^T, row r of x the `K / hd` table rows `codes` (u32 words) and `tsc` (u8) hold at
-/// `r * K / hd ..`; W mxfp8 `w` `[N, K / 4]` u32 with e8m0 `wsc` `[N, K / 32]`. Null where the kernel does not serve:
-/// not a GPU stream, more rows than a decode step, K off the stage width or the table rows, N off the threadgroup's.
-pub fn launch(sc: *dsv41.Scope, t: Table, rows: usize, codes: A, tsc: A, w: A, wsc: A) !?A {
+/// kv `[rows, N]` bf16 = x . W^T, row r of x the `K / hd` table rows `ids[r * K / hd ..]` (u32), each read out of the
+/// byte buffers `codes` and `tsc` where `geo` (`Geo.words`, u32 [6]) puts it; W mxfp8 `w` `[N, K / 4]` u32 with e8m0
+/// `wsc` `[N, K / 32]`. The caller vouches that every id's bytes lie inside the buffers (4-aligned rows of codes).
+/// Null where the kernel does not serve: not a GPU stream, more rows than a decode step, K off the stage width or the
+/// table rows, N off the threadgroup's.
+pub fn launch(sc: *dsv41.Scope, t: Table, rows: usize, codes: A, tsc: A, ids: A, geo: A, w: A, wsc: A) !?A {
     if (!mlx.streamIsGpu(sc.s) or rows < 1 or rows > decode.max_rows) return null;
     if (!(t.tb == 4 or t.tb == 8) or t.hd == 0 or t.hd % 32 != 0) return null;
-    if (mlx.getShape(w).len != 2) return null;
+    if (mlx.getShape(w).len != 2 or codes.ctx == null or tsc.ctx == null) return null;
     const N = dims(w, 0);
     const K = dims(w, 1) * 4;
     if (K == 0 or K % chunk != 0 or K % t.hd != 0 or N == 0 or N % cols != 0) return null;
-    const tr = rows * K / t.hd;
-    if (!is(codes, .uint32, &.{ tr, t.hd * t.tb / 32 }) or !is(tsc, .uint8, &.{ tr, t.hd / 32 })) return null;
+    if (!is(ids, .uint32, &.{rows * K / t.hd}) or !is(geo, .uint32, &.{6})) return null;
     if (!is(w, .uint32, &.{ N, K / 4 }) or !is(wsc, .uint8, &.{ N, K / 32 })) return null;
     if (kernel == null) kernel = try dsv41.buildKernel("dsv41_dec_engram_kv", &INS, &.{"kv"}, SOURCE, HEADER);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -60,7 +76,7 @@ pub fn launch(sc: *dsv41.Scope, t: Table, rows: usize, codes: A, tsc: A, w: A, w
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, threads, 1, 1));
     inline for (.{ .{ "R", rows }, .{ "K", K }, .{ "N", N }, .{ "HD", t.hd }, .{ "TB", t.tb } }) |a| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, a[0], ci(a[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
-    const ins = [_]A{ codes, tsc, w, wsc };
+    const ins = [_]A{ codes, tsc, ids, geo, w, wsc };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -154,6 +170,13 @@ const K_ = struct {
         const tr = R * K / HD;
         const codes = try k.add(.uint32, &.{ tr, HD * tb / 32 });
         const tsc = try k.add(.uint8, &.{ tr, HD / 32 });
+        // The rows read through a shuffle of their ids, as a gather out of the whole table reads them (the stress
+        // fill keeps each row's own, its mirrored halves in one row of x).
+        const ids = try k.add(.uint32, &.{tr});
+        const geo = try k.add(.uint32, &.{6});
+        for (ids, 0..) |*v, i| v.* = @floatFromInt(i);
+        if (f != .stress) rng.shuffle(f64, ids);
+        for (geo, (Geo{ .w_base = 0, .w_stride = HD * tb / 8, .s_base = 0, .s_stride = HD / 32 }).words()) |*g, v| g.* = @floatFromInt(v);
         const w = try k.add(.uint32, &.{ N, K / 4 });
         const wsc = try k.add(.uint8, &.{ N, K / 32 });
         const perm = try k.scratch().alloc(usize, K / 2);
@@ -199,7 +222,7 @@ const K_ = struct {
     fn xAt(k: anytype, r: usize, i: usize) f64 {
         const tb = k.p.tb;
         const K = k.shape.k;
-        const row = r * (K / HD) + i / HD;
+        const row: usize = @intFromFloat(k.in(2)[r * (K / HD) + i / HD]);
         const p = i % HD;
         const s = e8m0(k.in(1)[row * (HD / 32) + p / 32]);
         const per: usize = 32 / tb;
@@ -224,7 +247,7 @@ const K_ = struct {
             x[r * K + i] = xAt(k, r, i);
         };
         for (0..N) |n| {
-            for (0..K) |i| t[i] = moe_fp4.sharedAt(k.in(2), k.in(3), n, i, K);
+            for (0..K) |i| t[i] = moe_fp4.sharedAt(k.in(4), k.in(5), n, i, K);
             for (0..R) |r| {
                 var m: f64 = 0;
                 for (0..K) |i| {
@@ -274,7 +297,7 @@ test "dsv41 dec engram_kv: the contract's launch is the wrapper's, byte for byte
         defer a.free(mine);
         var sc = dsv41.Scope.init(a, c.rig.stream());
         defer sc.deinit();
-        const y = (try launch(&sc, .{ .hd = HD, .tb = tb }, R, c.args[0], c.args[1], c.args[2], c.args[3])) orelse return error.Declined;
+        const y = (try launch(&sc, .{ .hd = HD, .tb = tb }, R, c.args[0], c.args[1], c.args[2], c.args[3], c.args[4], c.args[5])) orelse return error.Declined;
         const theirs = try c.rig.bytesOf(&.{y});
         try std.testing.expectEqualSlices(u8, mine, theirs);
     };
