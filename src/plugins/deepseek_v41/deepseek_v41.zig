@@ -687,6 +687,8 @@ pub const Dec = struct {
     moe_down: ?mlx.mlx_fast_metal_kernel = null,
     /// `dkern.moe_down.probe`'s output rows a threadgroup on this GPU.
     moe_down_rb: usize = 0,
+    /// The `MLX_SERVE_DSV41_FUSE_*` switches that have served a layer, each logged once (`engaged`).
+    engaged: u8 = 0,
 
     fn init(gpa: std.mem.Allocator, cfg: *const Config) !Dec {
         const nax = device.naxAvailable();
@@ -866,6 +868,14 @@ fn exactLayersDecline(m: *const Dsv41Model) ?[]const u8 {
         if (!dkern.wq_b.servesLayer(m, ly)) return "a layer's wq_b format (wq_b)";
     }
     return null;
+}
+
+/// Logs `name` the first time its switch (`bit`) serves a layer, so a served log shows the arm engaged.
+fn engaged(m: *Dsv41Model, bit: u3, name: []const u8) void {
+    const b = @as(u8, 1) << bit;
+    if (m.dec.engaged & b != 0) return;
+    m.dec.engaged |= b;
+    log.info("[dsv41] {s} engaged\n", .{name});
 }
 
 /// A verify block `exactServes` should have run on `blockFusedRows` fell to the batched kernels (`blockFused`
@@ -5042,6 +5052,7 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     const wr = if (m.dec.wq_b_ring != null and dkern.wq_b.ringOn()) try dkern.wq_b.runRing(sc, m, kq, ly, li, a.qa, a.kv, a.z, pos, .{ .kern = m.dec.wq_b_ring.?, .buf = ls.win.buf }) else null;
     const w = wr orelse try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, pos) orelse return null;
     if (w.ring.ctx != null) {
+        engaged(m, 0, "MLX_SERVE_DSV41_FUSE_WQB_RING");
         _ = mlx.mlx_array_free(ls.win.buf);
         ls.win.buf = sc.out(w.ring);
     } else try ls.win.write(w.kv_row, p0, sc.s);
@@ -5070,12 +5081,14 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     // merged split (against a sink that weighs nothing) instead of each of its tiles re-merging them.
     const merged = if (m.dec.attn_merge != null and m.dec.wo_a != null and dkern.attn.mergeOn()) try dkern.attn.partialsMerged(sc, m.dec.attn_merge.?, m, q, ls.win, comp_rows, topk, p0, scale, ly.sink, m.dec.attn_counter) else null;
     if (merged) |p| {
+        engaged(m, 1, "MLX_SERVE_DSV41_FUSE_ATTN_MERGE");
         oa = try dkern.wo_a.applySink(sc, m, ly, m.dec.wo_a.?, m.dec.wo_a_counter, inv, try attnMeta(sc, m, q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l, m.dec.attn_nosink);
     } else if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try dkern.attn.partials(sc, ka, m, q, ls.win, comp_rows, topk, p0, scale)) |p| {
         oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counter, inv, try attnMeta(sc, m, q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l);
     };
     // `ffn_in` routes off wo_b's output, which a tensor split sums first.
     if (m.tp == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &sa)) |f| {
+        if (f.fused) engaged(m, 2, "MLX_SERVE_DSV41_FUSE_FFN_IN");
         pre.* = f.sf.pre;
         return try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
     };

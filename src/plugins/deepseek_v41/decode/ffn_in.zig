@@ -3,6 +3,7 @@
 //! and the router with its top K. Rows 1..6, every weight read once whatever the rows.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
@@ -20,28 +21,64 @@ const mixes = (2 + hc) * hc;
 const A_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in.metal");
 const B_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_post.metal");
 const HEADER = decode.FP8_READ_HEADER;
+const TAIL_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_tail.metal");
+/// The one-launch variant (`MLX_SERVE_DSV41_FUSE_FFN_IN`): launch 1's body, then launch 2's work in its tail.
+const F_SOURCE = A_SOURCE ++ TAIL_SOURCE;
+const F_HEADER = HEADER ++ "#define DSV41_FFN_FUSED 1\n";
 
 const A_INS = [_][*:0]const u8{ "oa", "w_q", "scales", "x", "spre", "spost", "scomb" };
 /// `ctr`, `parts` and `scores` are launch 2's scratch: launch 1 zeroes the counters and writes neither of the others.
 const A_OUTS = [_][*:0]const u8{ "x1", "hv", "ctr", "parts", "logits" };
 const B_INS = [_][*:0]const u8{ "x1", "hv", "fn", "scale", "base", "w", "gate_w", "bias", "scal", "eps", "ctr", "parts", "logits" };
 const B_OUTS = [_][*:0]const u8{ "h2", "pre", "post", "comb", "idx", "wts" };
+const F_INS = A_INS ++ [_][*:0]const u8{ "fn", "scale", "base", "w", "gate_w", "bias", "scal", "eps", "facc" };
+const F_OUTS = [_][*:0]const u8{ "x1", "hv", "h2", "pre", "post", "comb", "idx", "wts" };
 
 pub const Kernels = struct {
     a: mlx.mlx_fast_metal_kernel,
     b: mlx.mlx_fast_metal_kernel,
+    fused: mlx.mlx_fast_metal_kernel,
+    /// The fused launch's persistent scratch (`dec_ffn_in_tail.metal`), zero between its dispatches.
+    facc: A,
 };
 
-/// Both launches' kernels, built once.
+/// The fused launch's scratch words: the logits, sums and mix partials of up to 6 rows, then the counters.
+const facc_words = 16384;
+
+fn faccNeed(p: Dims) usize {
+    return 6 * p.e + 8 + 6 * slices(p) * (mixes + 1) + slices(p) + 1;
+}
+
+/// The launches' kernels, built once.
 pub fn build() !Kernels {
     const a = try dsv41.buildKernel("dsv41_dec_ffn_in", &A_INS, &A_OUTS, A_SOURCE, HEADER);
     errdefer _ = mlx.mlx_fast_metal_kernel_free(a);
-    return .{ .a = a, .b = try dsv41.buildKernel("dsv41_dec_ffn_in_post", &B_INS, &B_OUTS, B_SOURCE, "") };
+    const b = try dsv41.buildKernel("dsv41_dec_ffn_in_post", &B_INS, &B_OUTS, B_SOURCE, "");
+    errdefer _ = mlx.mlx_fast_metal_kernel_free(b);
+    const f = try dsv41.buildKernel("dsv41_dec_ffn_in_fused", &F_INS, &F_OUTS, F_SOURCE, F_HEADER);
+    return .{ .a = a, .b = b, .fused = f, .facc = newScratch() };
+}
+
+fn newScratch() A {
+    return mlx.mlx_array_new_data(&std.mem.zeroes([facc_words]u32), &[_]c_int{facc_words}, 1, .uint32);
 }
 
 pub fn free(k: Kernels) void {
     _ = mlx.mlx_fast_metal_kernel_free(k.a);
     _ = mlx.mlx_fast_metal_kernel_free(k.b);
+    _ = mlx.mlx_fast_metal_kernel_free(k.fused);
+    _ = mlx.mlx_array_free(k.facc);
+}
+
+/// `MLX_SERVE_DSV41_FUSE_FFN_IN` (read each call): =1 the two launches run as one (`launchFused`).
+pub fn fusedOn() bool {
+    const v = env.get(.MLX_SERVE_DSV41_FUSE_FFN_IN) orelse return false;
+    return v[0] == '1';
+}
+
+/// Whether the one launch takes `p`: launch 1's shapes, whole 128-column slices, and its scratch and top K.
+fn servesFused(p: Dims) bool {
+    return servesA(p) and p.d % slice_cols == 0 and slice_cols % (a_nsg * aCols(p.rows)) == 0 and p.top_k >= 1 and p.top_k <= 32 and p.e >= p.top_k and p.e <= 1024 and faccNeed(p) <= facc_words;
 }
 
 fn ci(v: usize) c_int {
@@ -156,7 +193,7 @@ pub const Weights = struct {
     gate_bias: A,
 };
 
-pub const Out = struct { x1: A, h2: A, sf: dsv41.Split, idx: A, wts: A };
+pub const Out = struct { x1: A, h2: A, sf: dsv41.Split, idx: A, wts: A, fused: bool = false };
 pub const AOut = struct { x1: A, hv: A, ctr: A, parts: A, logits: A };
 pub const BOut = struct { h2: A, sf: dsv41.Split, idx: A, wts: A };
 
@@ -217,9 +254,30 @@ pub fn launchB(sc: *dsv41.Scope, ks: Kernels, p: Dims, w: Weights, a: AOut, eps:
     return .{ .h2 = b[0], .sf = .{ .pre = b[1], .post = b[2], .comb = b[3] }, .idx = b[4], .wts = b[5] };
 }
 
+fn fTargs(p: Dims) [11]TArg {
+    const a = aTargs(p);
+    return a ++ [_]TArg{ .{ .name = "E", .v = p.e }, .{ .name = "TOPK", .v = p.top_k }, .{ .name = "ITERS", .v = p.iters }, .{ .name = "NORM", .v = @intFromBool(p.norm) } };
+}
+
+/// Both launches as one (`dec_ffn_in_tail.metal`), over the persistent scratch `facc`.
+pub fn launchFused(sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, facc: A, p: Dims, w: Weights, oa: A, x: A, sa: *const dsv41.Split, eps: A, scal: A) !Out {
+    const f = try run(8, sc, kern, &.{ oa, w.wo_w, w.wo_s, x, sa.pre, sa.post, sa.comb, w.fn_w, w.fn_scale, w.fn_base, w.norm_w, w.gate_w, w.gate_bias, scal, eps, facc }, .{
+        .{ .shape = &.{ ci(p.rows), hc, ci(p.d) }, .dt = act },
+        .{ .shape = &.{ ci(p.rows), ci(p.d) }, .dt = act },
+        .{ .shape = &.{ ci(p.rows), ci(p.d) }, .dt = act },
+        .{ .shape = &.{ ci(p.rows), hc }, .dt = .float32 },
+        .{ .shape = &.{ ci(p.rows), hc }, .dt = .float32 },
+        .{ .shape = &.{ ci(p.rows), hc, hc }, .dt = .float32 },
+        .{ .shape = &.{ ci(p.rows), ci(p.top_k) }, .dt = .uint32 },
+        .{ .shape = &.{ ci(p.rows), ci(p.top_k) }, .dt = .float32 },
+    }, gridA(p), a_nsg * 32, &(fTargs(p) ++ [_]TArg{.{ .name = "FOLD", .v = @intCast(decode.fp8Fold()) }}));
+    return .{ .x1 = f[0], .h2 = f[2], .sf = .{ .pre = f[3], .post = f[4], .comb = f[5] }, .idx = f[6], .wts = f[7], .fused = true };
+}
+
 /// wo_b, the hc expand, the FFN norm and mixes, the router and its top K; null where `serves` says no.
 pub fn launch(sc: *dsv41.Scope, ks: Kernels, p: Dims, w: Weights, oa: A, x: A, sa: *const dsv41.Split, eps: A, scal: A) !?Out {
     if (!serves(p)) return null;
+    if (fusedOn() and servesFused(p)) return try launchFused(sc, ks.fused, ks.facc, p, w, oa, x, sa, eps, scal);
     const a = try launchA(sc, ks, p, w, oa, x, sa);
     const b = try launchB(sc, ks, p, w, a, eps, scal);
     return .{ .x1 = a.x1, .h2 = b.h2, .sf = b.sf, .idx = b.idx, .wts = b.wts };
@@ -263,6 +321,9 @@ fn outAt(k: anytype, e: spec.Elem, off: usize, i: usize) f64 {
 
 fn perD(s: Shape) usize {
     return s.rows * s.n;
+}
+fn perX1(s: Shape) usize {
+    return s.rows * hc * s.n;
 }
 fn perHc(s: Shape) usize {
     return s.rows * hc;
@@ -688,6 +749,12 @@ const FfnB = struct {
     /// h2 within its roundings' intervals; the split within the mixes' propagated allowance; the picks the best of the
     /// scores of the h2 the kernel wrote, up to those scores' own error, the weights by their sums.
     pub fn check(k: anytype, at: spec.Gate) !?[]const u8 {
+        return checkWith(k, at, false);
+    }
+
+    /// `check`; `exact_router`: the scores from the unrounded normed collapse (`norm_w * hv / rms`, the fused launch's
+    /// router input) instead of the h2 the kernel wrote.
+    fn checkWith(k: anytype, at: spec.Gate, comptime exact_router: bool) !?[]const u8 {
         const p = dims(k.shape);
         const R = p.rows;
         const D = p.d;
@@ -744,6 +811,13 @@ const FfnB = struct {
                 if (!ok) return std.fmt.bufPrint(&k.msg, "row {d} split output {d} is {e} where float64 gives {e}", .{ r, o, g, w }) catch "split";
             }
             // The router: logits from the h2 the kernel wrote; a score's error is the dot's, carried by the score's slope (<= 0.6).
+            if (exact_router) {
+                const hvr = k.in(1)[r * D ..][0..D];
+                var ss: f64 = 0;
+                for (hvr) |v| ss += v * v;
+                const inv = 1 / @sqrt(ss / @as(f64, @floatFromInt(D)) + eps0);
+                for (h2, hvr, k.in(5)) |*o, v, wd| o.* = wd * v * inv;
+            }
             for (0..E) |e| {
                 var acc: f64 = 0;
                 var mg: f64 = 0;
@@ -789,6 +863,119 @@ const FfnB = struct {
     }
 };
 
+/// The fused launch: `FfnA`'s outputs then `FfnB`'s, judged by their rules: launch 1's by `FfnA.check`, launch 2's by
+/// `FfnB`'s on the x1 and hv the launch wrote, its router from the unrounded normed collapse. Shape: rows, D, K; `e`
+/// the experts. The scratch input (the last) starts zero (the fused tests check that the launch leaves it zero).
+const FfnFused = struct {
+    pub const Params = struct { e: usize = 64 };
+
+    fn dims(p: Params, s: Shape) Dims {
+        return .{ .rows = s.rows, .d = s.n, .k = s.k, .e = p.e };
+    }
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        const d = dims(p, s);
+        if (!servesFused(d)) return null;
+        var g = metal.Geometry{ .grid = .{ ci(gridA(d)), 1, 1 }, .tg = .{ ci(a_nsg * 32), 1, 1 } };
+        g.out(&.{ ci(d.rows), hc, ci(d.d) }, act);
+        g.out(&.{ ci(d.rows), ci(d.d) }, act);
+        g.out(&.{ ci(d.rows), ci(d.d) }, act);
+        g.out(&.{ ci(d.rows), hc }, .float32);
+        g.out(&.{ ci(d.rows), hc }, .float32);
+        g.out(&.{ ci(d.rows), hc, hc }, .float32);
+        g.out(&.{ ci(d.rows), ci(d.top_k) }, .uint32);
+        g.out(&.{ ci(d.rows), ci(d.top_k) }, .float32);
+        for (fTargs(d)) |t| g.int(t.name, t.v);
+        g.int("FOLD", 0);
+        g.dtype("T", act);
+        return g;
+    }
+
+    /// `FfnA`'s inputs, then `FfnB`'s weights as its own fill draws them, then the zeroed scratch.
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        try FfnA.fill(k, f, rng);
+        const d = dims(k.p, k.shape);
+        const fnw = try k.add(.float32, &.{ mixes, hc * d.d });
+        const scale = try k.add(.float32, &.{mixes});
+        const base = try k.add(.float32, &.{mixes});
+        const w = try k.add(act, &.{d.d});
+        const gw = try k.add(act, &.{ d.e, d.d });
+        const bias = try k.add(.float32, &.{ 1, d.e });
+        const scal = try k.add(.float32, &.{1});
+        const eps = try k.add(.float32, &.{2});
+        _ = try k.add(.uint32, &.{facc_words});
+        kit.uniform(rng, fnw, -0.02, 0.02);
+        kit.uniform(rng, scale, 0.5, 1.5);
+        kit.uniform(rng, base, -0.5, 0.5);
+        kit.uniform(rng, w, 0.5, 1.5);
+        kit.uniform(rng, gw, -0.05, 0.05);
+        kit.uniform(rng, bias, -0.5, 0.5);
+        scal[0] = router_scale;
+        eps[0] = eps_rms;
+        eps[1] = eps_hc;
+    }
+
+    pub fn count(p: Params, s: Shape) usize {
+        return FfnA.count(.{}, s) + FfnB.count(.{}, .{ .rows = s.rows, .n = s.n, .k = p.e });
+    }
+
+    /// `FfnB`'s view of a fused case: x1 and hv are `xh` (the launch's, or the reference's), the weights the case's
+    /// inputs 7.., the outputs those after x1 and hv.
+    fn View(comptime K: type) type {
+        return struct {
+            k: *K,
+            xh: [2][]f64,
+            shape: Shape,
+            p: FfnB.Params = .{},
+            msg: [256]u8 = undefined,
+            rig: Rig,
+
+            const Rig = struct {
+                b: []const u8,
+                pub fn outputBytes(r: Rig) []const u8 {
+                    return r.b;
+                }
+            };
+
+            pub fn in(v: *const @This(), i: usize) []f64 {
+                return if (i < 2) v.xh[i] else v.k.in(i + 5);
+            }
+
+            pub fn scratch(v: *const @This()) std.mem.Allocator {
+                return v.k.scratch();
+            }
+        };
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const R = k.shape.rows;
+        const D = k.shape.n;
+        const na = FfnA.count(.{}, k.shape);
+        try FfnA.compute(k, out[0..na], mag[0..na], sum);
+        var v: View(@TypeOf(k.*)) = .{ .k = @constCast(k), .xh = .{ out[0 .. R * hc * D], out[R * hc * D .. na] }, .shape = .{ .rows = R, .n = D, .k = k.p.e }, .rig = .{ .b = &.{} } };
+        try FfnB.compute(&v, out[na..], mag[na..], sum);
+    }
+
+    pub fn check(k: anytype, at: spec.Gate) !?[]const u8 {
+        if (try FfnA.check(k, at)) |why| return why;
+        const R = k.shape.rows;
+        const D = k.shape.n;
+        const na = FfnA.count(.{}, k.shape);
+        const a = k.scratch();
+        const xh = try a.alloc(f64, na);
+        defer a.free(xh);
+        const bytes = k.rig.outputBytes();
+        for (xh, 0..) |*o, i| o.* = spec.read(.bf16, bytes, i);
+        var v: View(@TypeOf(k.*)) = .{ .k = k, .xh = .{ xh[0 .. R * hc * D], xh[R * hc * D ..] }, .shape = .{ .rows = R, .n = D, .k = k.p.e }, .rig = .{ .b = bytes[2 * na ..] } };
+        if (try FfnB.checkWith(&v, at, true)) |why| {
+            const n = @min(why.len, k.msg.len);
+            @memcpy(k.msg[0..n], why[0..n]);
+            return k.msg[0..n];
+        }
+        return null;
+    }
+};
+
 // A launch of one of the two kernels as the contract builds it: threadgroup bytes at the widest instantiation, M1/M2
 // thread limits from `kernel contract offline`.
 const launch_a = metal.Launch{
@@ -809,6 +996,17 @@ const launch_b = metal.Launch{
     .tg_bytes = 4 * 7728 + 4,
     .m1 = 704,
     .m2 = 704,
+};
+
+const launch_f = metal.Launch{
+    .name = "dsv41_dec_ffn_in_fused",
+    .inputs = &F_INS,
+    .outputs = &F_OUTS,
+    .source = F_SOURCE,
+    .header = F_HEADER,
+    .tg_bytes = 4 * decode.max_rows * a_nsg * 2 + 4 * decode.max_rows * (128 + mixes + 1) + 4 * 8 + 4,
+    .m1 = 512,
+    .m2 = 512,
 };
 
 const nan_rule: spec.Nan = .{ .stated = "classes as float64 gives them; every output within the intervals of its roundings, the picks by the stated rule (a NaN score is picked last, lowest index first)" };
@@ -843,6 +1041,28 @@ pub fn register(set: *kc.Set) !void {
         .nan = nan_rule,
         .tiles = .{ .{ .size = 3 }, .{}, .{ .size = 16, .step = 8, .min = 8 } },
         .served = &.{ .{ .rows = 1, .n = 5120, .k = 384 }, .{ .rows = 6, .n = 5120, .k = 384 } },
+    });
+    try kit.add(set, FfnFused, &launch_f, .{}, .{
+        .name = "dsv41 dec ffn_in fused (wo_b, expand, collapse; mixes, split, norm, router in the tails)",
+        .accum = .none,
+        .depth = depthA,
+        .ops = split_ops,
+        .mids = 1,
+        .out = .bf16,
+        .outs = &.{
+            .{ .elem = .bf16, .count = perX1 },
+            .{ .elem = .bf16, .count = perD },
+            .{ .elem = .bf16, .count = perD },
+            .{ .elem = .f32, .count = perHc },
+            .{ .elem = .f32, .count = perHc },
+            .{ .elem = .f32, .count = perComb },
+            .{ .elem = .u32, .count = perPick },
+            .{ .elem = .f32, .count = perPick },
+        },
+        .in_place = true,
+        .nan = nan_rule,
+        .tiles = .{ .{ .size = 3 }, .{ .size = 128, .step = 128, .min = 256 }, .{ .size = 1024, .step = 1024, .min = 1024 } },
+        .served = &.{ .{ .rows = 1, .n = 512, .k = 8192 }, .{ .rows = 6, .n = 512, .k = 8192 }, .{ .rows = 3, .n = 256, .k = 1024 } },
     });
 }
 
@@ -1151,6 +1371,49 @@ test "dsv41 dec ffn_in: R = 1 and 6 at the release's 384 experts match today's c
     defer freeWeights(w);
     const ly = layerWith(fx.layer(21), w);
     for ([_]usize{ 1, 6 }) |rows| try equivalence(gpa, fx, ks, &ly, w, rows);
+}
+
+test "dsv41 dec ffn_in fused: MLX_SERVE_DSV41_FUSE_FFN_IN=1, rows 1..6 on layers 21 and 23 and at 384 experts, match today's chain, no further from float64, twice over the reused scratch" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    var ov = env.override(.MLX_SERVE_DSV41_FUSE_FFN_IN, "1");
+    defer ov.restore();
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .ctx = 8 });
+    defer fx.deinit();
+    const ks = try build();
+    defer free(ks);
+    // Each case twice: the second dispatch runs on the scratch the first one handed back zeroed.
+    for ([_]usize{ 21, 23 }) |li| for (1..decode.max_rows + 1) |rows| for (0..2) |_| {
+        const ly = fx.layer(li);
+        try equivalence(gpa, fx, ks, ly, weightsOf(ly), rows);
+    };
+    const w = try randomWeights(78);
+    defer freeWeights(w);
+    const ly = layerWith(fx.layer(21), w);
+    for (1..decode.max_rows + 1) |rows| try equivalence(gpa, fx, ks, &ly, w, rows);
+    // The scratch is all zeros after the dispatches.
+    const left = mlx.mlx_array_data_uint32(ks.facc) orelse return error.NoData;
+    for (left[0..facc_words]) |v| try std.testing.expectEqual(@as(u32, 0), v);
+}
+
+test "dsv41 dec ffn_in fused: a planted dropped router bias fails the equivalence" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    var ov = env.override(.MLX_SERVE_DSV41_FUSE_FFN_IN, "1");
+    defer ov.restore();
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .ctx = 8 });
+    defer fx.deinit();
+    const ks = try build();
+    defer free(ks);
+    const w = try randomWeights(79);
+    defer freeWeights(w);
+    const ly = layerWith(fx.layer(21), w);
+    var bad = w;
+    var z = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{ 1, 384 }, 2, .float32, mlx.gpuStream()));
+    defer _ = mlx.mlx_array_free(z);
+    bad.gate_bias = z;
+    try std.testing.expectError(error.TestUnexpectedResult, equivalence(gpa, fx, ks, &ly, bad, 6));
 }
 
 /// `a` and `b` hold the same bytes.
