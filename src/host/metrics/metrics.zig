@@ -291,7 +291,7 @@ pub const Metrics = struct {
     /// Record per-request metrics once per request that owned a slot.
     ///
     /// `.success`: updates all latency histograms, token histograms, and counters but `generation_tokens_total`,
-    /// which the caller moves with the in-flight aggregate; returns true.
+    /// which the caller adds; returns true.
     ///
     /// `.cancelled`: only increments `requests_cancelled_total`. Latency
     /// histograms are NOT touched: a cancelled slot's decode_ns is zero or
