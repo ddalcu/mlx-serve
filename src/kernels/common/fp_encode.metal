@@ -91,14 +91,7 @@ inline uint mlxserve_fp4_e2m1_bits(float x) {
   return bits | sign_bit;
 }
 
-// fp4.h fp4_e2m1 operator float: the code's magnitude placed in a half times 2^14, code 8 and up negative.
-inline float mlxserve_fp4_e2m1_value(uint bits) {
-  half converted = as_type<half>(ushort((bits & 7) << 9));
-  converted *= 16384.0;
-  return float((bits & 8) ? -converted : converted);
-}
-
-// `f` through e2m1 and back.
+// `f` through e2m1 and back (the read is fp4_scale.metal's `mlxserve_fp4_e2m1_value`).
 inline float mlxserve_fp4_e2m1_round(float f) {
   return mlxserve_fp4_e2m1_value(mlxserve_fp4_e2m1_bits(f));
 }
