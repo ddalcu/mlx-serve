@@ -134,9 +134,14 @@ pub fn launch(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, rd: usize, odt: mlx.m
 /// Null (the old path runs) off the GPU, where wo_a is not the release's 8-bit mxfp8 of group 32, or past the rows,
 /// splits or head width `plan` declines.
 pub fn apply(sc: *Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer, kern: mlx.mlx_fast_metal_kernel, counter: A, inv: A, meta: A, pacc: A, pm: A, pl: A) !?A {
+    return applySink(sc, m, ly, kern, counter, inv, meta, pacc, pm, pl, ly.sink);
+}
+
+/// `apply` merging against `sink` (`dkern.attn.noSink` for the attention's own merged split) instead of the layer's.
+pub fn applySink(sc: *Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer, kern: mlx.mlx_fast_metal_kernel, counter: A, inv: A, meta: A, pacc: A, pm: A, pl: A, sink: A) !?A {
     const wo = &ly.wo_a;
     if (!mlx.streamIsGpu(sc.s) or wo.s.ctx == null or wo.qp.mode != .mxfp8 or wo.qp.bits != 8 or wo.qp.group_size != 32) return null;
-    return launch(sc, kern, m.cfg.dsv4_rope_head_dim, m.act, .{ pacc, pm, pl, ly.sink, meta, inv, wo.w, wo.s }, counter, null);
+    return launch(sc, kern, m.cfg.dsv4_rope_head_dim, m.act, .{ pacc, pm, pl, sink, meta, inv, wo.w, wo.s }, counter, null);
 }
 
 // ── the kernel contract ──

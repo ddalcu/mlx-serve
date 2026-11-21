@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
+const env = @import("../../../env.zig");
 const device = @import("../../../mlx/device.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
@@ -32,6 +33,39 @@ pub fn build() !mlx.mlx_fast_metal_kernel {
     return dsv41.buildKernel("dsv41_dec_attn", &INS, &OUTS, SOURCE, HEADER);
 }
 
+/// The merge variant (`MLX_SERVE_DSV41_FUSE_ATTN_MERGE`): the same kernel, whose last split of each (row, 16 heads)
+/// merges the splits with the sink once, so wo_a reads one merged split instead of re-merging the splits in each of
+/// its 16 output tiles of the head.
+pub const MERGE_HEADER = HEADER ++ "#define DSV41_ATTN_MERGE 1\n";
+pub const MERGE_INS = INS ++ [_][*:0]const u8{ "sink", "counter" };
+pub const MERGE_OUTS = OUTS ++ [_][*:0]const u8{ "merged", "pmo", "plo" };
+
+pub fn buildMerge() !mlx.mlx_fast_metal_kernel {
+    return dsv41.buildKernel("dsv41_dec_attn_merge", &MERGE_INS, &MERGE_OUTS, SOURCE, MERGE_HEADER);
+}
+
+/// `MLX_SERVE_DSV41_FUSE_ATTN_MERGE` (read each call): =1 the decode attention merges its splits (`partialsMerged`).
+pub fn mergeOn() bool {
+    const v = env.get(.MLX_SERVE_DSV41_FUSE_ATTN_MERGE) orelse return false;
+    return v[0] == '1';
+}
+
+/// Words of the merge variant's arrival counter: a word a (row, 16 heads), zeroed once; each launch's last arrival
+/// zeroes its word again.
+pub const counter_words = 256;
+
+pub fn newCounter() A {
+    return mlx.mlx_array_new_data(&std.mem.zeroes([counter_words]u32), &[_]c_int{counter_words}, 1, .uint32);
+}
+
+/// The sink wo_a reads against a merged split: so low that its weight is 0 (exp underflows), so the merged split
+/// passes through unchanged (max 0, weight sum 1).
+pub fn noSink(heads: usize) A {
+    var v: [256]f32 = undefined;
+    @memset(&v, -3.0e38);
+    return mlx.mlx_array_new_data(&v, &[_]c_int{@intCast(heads)}, 1, .float32);
+}
+
 /// What `attn_split_epilogue.metal` writes: each split's unnormalised weighted keys `acc` [R, H, splits, 512], its max
 /// score `m` and weight sum `l` [R, H, splits], all f32. `m` is -inf and `l` 0 where no key counted.
 pub const Partials = struct { acc: A, m: A, l: A, splits: c_int };
@@ -57,7 +91,20 @@ pub fn partials(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, m: *const dsv41.Dsv
     return run(sc, kern, m, q, win, comp_rows, topk, p0, scal);
 }
 
+/// `partials` on the merge variant: the splits merged with `sink` [H] (f32) by their last arrival, as ONE split
+/// (`acc` [R, H, 1, 512], `m` 0, `l` 1) for a consumer that merges against `noSink`. Null as `partials`.
+pub fn partialsMerged(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, m: *const dsv41.Dsv41Model, q: A, win: dsv41.Ring, comp_rows: A, topk: A, p0: usize, scale: f32, sink: A, counter: A) !?Partials {
+    const qs = mlx.getShape(q);
+    if (qs.len != 3 or mlx.mlx_array_size(sink) != qs[1] or mlx.mlx_array_dtype(sink) != .float32 or qs[0] * @divTrunc(qs[1], 16) > counter_words) return null;
+    const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{scale}, &[_]c_int{1}, 1, .float32));
+    return runWith(sc, kern, m, q, win, comp_rows, topk, p0, scal, .{ sink, counter });
+}
+
 fn run(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, m: *const dsv41.Dsv41Model, q: A, win: dsv41.Ring, comp_rows: A, topk: A, p0: usize, scal: A) !?Partials {
+    return runWith(sc, kern, m, q, win, comp_rows, topk, p0, scal, null);
+}
+
+fn runWith(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, m: *const dsv41.Dsv41Model, q: A, win: dsv41.Ring, comp_rows: A, topk: A, p0: usize, scal: A, merge: ?[2]A) !?Partials {
     if (!mlx.streamIsGpu(sc.s) or !device.naxAvailable()) return null;
     const qs = mlx.getShape(q);
     if (qs.len != 3 or qs[2] != HD or @mod(qs[1], 16) != 0 or qs[0] < 1 or qs[0] > decode.max_rows) return null;
@@ -77,24 +124,29 @@ fn run(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, m: *const dsv41.Dsv41Model, 
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ R, H, S, HD }, 4, .float32));
     for (0..2) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ R, H, S }, 3, .float32));
+    if (merge != null) {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ R, H, 1, HD }, 4, .float32));
+        for (0..2) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ R, H, 1 }, 3, .float32));
+    }
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(H, 16) * TG, R, S));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, TG, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "S", S));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", K));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", H));
-    const inputs = [_]A{ q, win.buf, comp, ids, meta, scal };
-    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    const inputs = [_]A{ q, win.buf, comp, ids, meta, scal, if (merge) |g| g[0] else none, if (merge) |g| g[1] else none };
+    const iv = mlx.mlx_vector_array_new_data(&inputs, if (merge != null) MERGE_INS.len else INS.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, sc.s));
-    var parts: [3]A = undefined;
-    for (&parts, 0..) |*x, k| {
+    var parts: [MERGE_OUTS.len]A = undefined;
+    for (parts[0..if (merge != null) MERGE_OUTS.len else OUTS.len], 0..) |*x, k| {
         x.* = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_vector_array_get(x, ov, k));
         _ = try sc.keep(x.*);
     }
+    if (merge != null) return .{ .acc = parts[3], .m = parts[4], .l = parts[5], .splits = 1 };
     return .{ .acc = parts[0], .m = parts[1], .l = parts[2], .splits = S };
 }
 
@@ -165,6 +217,120 @@ const DecAttn = struct {
     pub const check = contract.AttnSplit.check;
 };
 
+const merge_decl = kit.metal.Launch{
+    .name = "dsv41_dec_attn_merge",
+    .inputs = &MERGE_INS,
+    .outputs = &MERGE_OUTS,
+    .source = SOURCE,
+    .header = MERGE_HEADER,
+    .tg_bytes = TG_BYTES + 4 * 16 * (MAX_SPLITS + 1) + 4,
+    .offline = false,
+    .min_gen = 17,
+};
+
+/// The merge variant: `DecAttn`'s partials, then the splits of each (row, head) merged with the sink (input 6) as one
+/// split `merged` [R, H, 1, 512] f32 with max 0 and sum 1. Its rule: the partials are `DecAttn`'s, the merge is the
+/// float64 merge of the launch's own partials within the merge's rounding, and the max and sum are exactly 0 and 1.
+const MergeAttn = struct {
+    pub const Params = DecAttn.Params;
+
+    pub fn geometry(p: Params, s: kit.Shape) ?kit.metal.Geometry {
+        var g = DecAttn.geometry(p, s) orelse return null;
+        if (s.rows * s.n / 16 > counter_words) return null;
+        g.out(&.{ ci(s.rows), ci(s.n), 1, HD }, .float32);
+        g.out(&.{ ci(s.rows), ci(s.n), 1 }, .float32);
+        g.out(&.{ ci(s.rows), ci(s.n), 1 }, .float32);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: kit.Fill, rng: std.Random) !void {
+        try DecAttn.fill(k, f, rng);
+        kit.uniform(rng, try k.add(.float32, &.{k.shape.n}), -3, 3);
+        _ = try k.add(.uint32, &.{counter_words});
+    }
+
+    fn splitCount(p: Params, s: kit.Shape) usize {
+        return contract.AttnSplit.count(p, s);
+    }
+
+    pub fn count(p: Params, s: kit.Shape) usize {
+        return splitCount(p, s) + s.rows * s.n * (HD + 2);
+    }
+
+    /// Head (i, h)'s merge of the partials `part` (pacc, then pm, then pl, as the kernel lays them out) with the sink,
+    /// in float64: the channels into `o` and each one's bound (the merge's f32 rounding) into `e`.
+    fn mergeHead(k: anytype, part: []const f64, i: usize, h: usize, o: *[HD]f64, e: *[HD]f64) void {
+        const L = k.shape.rows;
+        const H = k.shape.n;
+        const S = k.p.s;
+        const nm = L * H * S * HD;
+        const base = (i * H + h) * S;
+        const sk = k.in(6)[h];
+        var M = sk;
+        for (0..S) |j| M = if (std.math.isNan(part[nm + base + j])) M else @max(M, part[nm + base + j]);
+        var total = @exp(sk - M);
+        var om: [HD]f64 = @splat(0);
+        o.* = @splat(0);
+        var spread: f64 = @abs(sk - M);
+        for (0..S) |j| {
+            const l = part[nm + L * H * S + base + j];
+            const w = if (l > 0) @exp(part[nm + base + j] - M) else 0;
+            if (l > 0) spread = @max(spread, @abs(part[nm + base + j] - M));
+            total += l * w;
+            for (0..HD) |d| {
+                o[d] += part[(base + j) * HD + d] * w;
+                om[d] += @abs(part[(base + j) * HD + d] * w);
+            }
+        }
+        const rel = (@as(f64, @floatFromInt(S)) + 8 + spread) * contract.u;
+        for (o, e, om) |*v, *b, m| {
+            v.* /= total;
+            b.* = m / total * rel + @abs(v.*) * rel;
+        }
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: kit.Sum) !void {
+        const L = k.shape.rows;
+        const H = k.shape.n;
+        const ns = splitCount(k.p, k.shape);
+        try contract.AttnSplit.compute(k, out[0..ns], mag[0..ns], sum);
+        var o: [HD]f64 = undefined;
+        var e: [HD]f64 = undefined;
+        for (0..L) |i| for (0..H) |h| {
+            mergeHead(k, out[0..ns], i, h, &o, &e);
+            @memcpy(out[ns + (i * H + h) * HD ..][0..HD], &o);
+        };
+        @memset(out[ns + L * H * HD ..][0 .. L * H], 0);
+        @memset(out[ns + L * H * HD + L * H ..][0 .. L * H], 1);
+        @memset(mag, 0);
+    }
+
+    pub fn check(k: anytype, at: kit.spec.Gate) !?[]const u8 {
+        if (try contract.AttnSplit.check(k, at)) |why| return why;
+        const L = k.shape.rows;
+        const H = k.shape.n;
+        const ns = splitCount(k.p, k.shape);
+        const a = k.scratch();
+        const part = try a.alloc(f64, ns);
+        defer a.free(part);
+        const bytes = k.rig.outputBytes();
+        for (part, 0..) |*v, i| v.* = kit.spec.read(.f32, bytes, i);
+        var o: [HD]f64 = undefined;
+        var e: [HD]f64 = undefined;
+        for (0..L) |i| for (0..H) |h| {
+            mergeHead(k, part, i, h, &o, &e);
+            for (o, e, 0..) |want, b, d| {
+                const got = kit.spec.read(.f32, bytes, ns + (i * H + h) * HD + d);
+                const ok = if (at == .nonfinite) kit.spec.classOf(got) == kit.spec.classOf(want) else @abs(got - want) <= b + 0x1p-140;
+                if (!ok) return std.fmt.bufPrint(&k.msg, "row {d} head {d} channel {d} merged {e}, the partials' merge {e}", .{ i, h, d, got, want }) catch "merge";
+            }
+            if (kit.spec.read(.f32, bytes, ns + L * H * HD + i * H + h) != 0 or kit.spec.read(.f32, bytes, ns + L * H * HD + L * H + i * H + h) != 1)
+                return std.fmt.bufPrint(&k.msg, "row {d} head {d}: the merged split's max and sum are not 0 and 1", .{ i, h }) catch "ml";
+        };
+        return null;
+    }
+};
+
 pub fn register(set: *kc.Set) !void {
     const nan: kit.spec.Nan = .{ .stated = "a split whose weights go NaN reports max -inf and a NaN partial output and sum, which the merge propagates; else classes as float64 gives them" };
     try kit.add(set, DecAttn, &launch_decl, .{ .s = 8 }, .{
@@ -178,6 +344,24 @@ pub fn register(set: *kc.Set) !void {
     });
     try kit.add(set, DecAttn, &launch_decl, .{ .s = 4 }, .{
         .name = "dsv41 dec attn S=4, window only",
+        .accum = .none,
+        .depth = contract.depthAttn,
+        .out = .f32,
+        .nan = nan,
+        .nax = true,
+        .served = &.{ .{ .rows = 1, .n = 16, .k = 0 }, .{ .rows = 6, .n = 16, .k = 0 } },
+    });
+    try kit.add(set, MergeAttn, &merge_decl, .{ .s = 8 }, .{
+        .name = "dsv41 dec attn merge S=8 (the last split merges the splits with the sink)",
+        .accum = .none,
+        .depth = contract.depthAttn,
+        .out = .f32,
+        .nan = nan,
+        .nax = true,
+        .served = &.{ .{ .rows = 1, .n = 16, .k = 512 }, .{ .rows = 6, .n = 32, .k = 512 }, .{ .rows = 2, .n = 16, .k = 100 } },
+    });
+    try kit.add(set, MergeAttn, &merge_decl, .{ .s = 4 }, .{
+        .name = "dsv41 dec attn merge S=4, window only",
         .accum = .none,
         .depth = contract.depthAttn,
         .out = .f32,
@@ -604,3 +788,159 @@ test "dsv41 dec attn: ubench" {
         decode.report(try std.fmt.bufPrint(&name, "attn K={d} ctx={d}", .{ k, ctx }), R, us, @floatFromInt(R * k * HD * 2 + WINDOW * HD * 2 + R * HEADS * HD * 2), chain_us);
     };
 }
+
+/// Random mxfp8 wo_a weights `[groups, 1024, 8 * 512]` (never S.1111.111, scales around 1) and the inverse periods.
+fn woaWeights(sc: *Scope, seed: u64) ![3]A {
+    const gpa = testing.allocator;
+    const G = 8;
+    const OL = 1024;
+    const KW = 8 * HD;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+    const words = try gpa.alloc(u32, G * OL * KW / 4);
+    defer gpa.free(words);
+    for (words) |*w| {
+        var b: [4]u8 = undefined;
+        for (&b) |*x| {
+            x.* = rnd.int(u8);
+            if (x.* & 0x7f == 0x7f) x.* -= 1;
+        }
+        w.* = std.mem.readInt(u32, &b, .little);
+    }
+    const sc8 = try gpa.alloc(u8, G * OL * KW / 32);
+    defer gpa.free(sc8);
+    for (sc8) |*e| e.* = rnd.intRangeAtMost(u8, 118, 124);
+    var per: [32]f32 = undefined;
+    for (&per, 0..) |*v, i| v.* = std.math.pow(f32, 10000, @as(f32, @floatFromInt(2 * i)) / 64.0);
+    return .{
+        try sc.keep(mlx.mlx_array_new_data(words.ptr, &[_]c_int{ G, OL, KW / 4 }, 3, .uint32)),
+        try sc.keep(mlx.mlx_array_new_data(sc8.ptr, &[_]c_int{ G, OL, KW / 32 }, 3, .uint8)),
+        try sc.keep(mlx.mlx_array_new_data(&per, &[_]c_int{32}, 1, .float32)),
+    };
+}
+
+test "dsv41 dec attn merge: wo_a over the merged split is wo_a over the splits (rel rms 1e-3), rows 1, 2, 4, 6; the partials are the plain kernel's; the sink counted twice fails" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const wo_a = @import("wo_a.zig");
+    const gpa = testing.allocator;
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m: dsv41.Dsv41Model = undefined;
+    m.cfg = .{};
+    m.cfg.sliding_window = WINDOW;
+    m.act = .bfloat16;
+    const kern = try build();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    const km = try buildMerge();
+    defer _ = mlx.mlx_fast_metal_kernel_free(km);
+    const kw = try wo_a.build();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kw);
+    const counter = try sc.keep(newCounter());
+    const wcounter = try sc.keep(wo_a.newCounter());
+    const nosink = try sc.keep(noSink(HEADS));
+    const wts = try woaWeights(&sc, 77);
+    var worst: f64 = 0;
+    var least_bad: f64 = 1e9;
+    for ([_]usize{ 512, 100, 0 }) |k| for ([_]usize{ 1, 2, 4, 6 }) |R| for ([_]usize{ 300, 5000 }) |ctx| {
+        const rig = try Rig.init(&sc, R, ctx, k, 1, 1, ctx, 11 + R + k);
+        defer rig.deinit();
+        const sink = try sc.reshape(rig.sink, &.{HEADS});
+        const meta = try sc.ints(&[_]i32{ @intCast(ctx), @intCast(R), @intCast(k), WINDOW, 144, @intCast(ctx) }, &.{6});
+        const pl = (try partials(&sc, kern, &m, rig.q, rig.win(), rig.comps[0], rig.picks[0], rig.p0, SCALE)) orelse return error.Declined;
+        const want = (try wo_a.launch(&sc, kw, 64, .bfloat16, .{ pl.acc, pl.m, pl.l, sink, meta, wts[2], wts[0], wts[1] }, wcounter, null)) orelse return error.Declined;
+        const pm = (try partialsMerged(&sc, km, &m, rig.q, rig.win(), rig.comps[0], rig.picks[0], rig.p0, SCALE, sink, counter)) orelse return error.Declined;
+        try testing.expectEqual(@as(c_int, 1), pm.splits);
+        const got = (try wo_a.launch(&sc, kw, 64, .bfloat16, .{ pm.acc, pm.m, pm.l, nosink, meta, wts[2], wts[0], wts[1] }, wcounter, null)) orelse return error.Declined;
+        // The planted bug: wo_a weighs the layer's sink against the merged split too (the sink counted twice).
+        const bad = (try wo_a.launch(&sc, kw, 64, .bfloat16, .{ pm.acc, pm.m, pm.l, sink, meta, wts[2], wts[0], wts[1] }, wcounter, null)) orelse return error.Declined;
+        const w = try dsv41.hostF32(want);
+        defer gpa.free(w);
+        const g = try dsv41.hostF32(got);
+        defer gpa.free(g);
+        const b = try dsv41.hostF32(bad);
+        defer gpa.free(b);
+        for (g) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+        const e = decode.relRms(g, w);
+        const eb = decode.relRms(b, w);
+        std.debug.print("[attn merge] k {d} R {d} ctx {d}: oa rel rms merged {e:.2}, sink twice {e:.2}\n", .{ k, R, ctx, e, eb });
+        try testing.expect(e <= 1e-3);
+        try testing.expect(eb > 1e-2);
+        worst = @max(worst, e);
+        least_bad = @min(least_bad, eb);
+    };
+    std.debug.print("[attn merge] worst merged {e:.2}, least planted {e:.2}\n", .{ worst, least_bad });
+}
+
+test "dsv41 dec attn merge: the declared launch is the wrapper's, byte for byte; the registrations add" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var set = kc.Set.init(a);
+    defer set.deinit();
+    try register(&set);
+    try testing.expectEqual(@as(usize, 4), set.kernels.items.len);
+    var m: dsv41.Dsv41Model = undefined;
+    m.cfg = .{};
+    m.cfg.sliding_window = WINDOW;
+    m.act = .bfloat16;
+    var sc = Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const km = try buildMerge();
+    defer _ = mlx.mlx_fast_metal_kernel_free(km);
+    inline for (.{ .{ 8, 6, 64, 512 }, .{ 8, 1, 16, 100 }, .{ 4, 3, 32, 0 } }) |c| {
+        const cs = try a.create(kit.Case(MergeAttn));
+        defer {
+            cs.deinit();
+            a.destroy(cs);
+        }
+        cs.* = .init(a, &merge_decl, .{ .s = c[0] });
+        try testing.expect(try cs.prepare(.{ .rows = c[1], .n = c[2], .k = c[3] }, .random, 7));
+        try cs.run();
+        const declared = try a.dupe(u8, cs.rig.outputBytes());
+        defer a.free(declared);
+        const g = cs.p.g;
+        const win: dsv41.Ring = .{ .buf = cs.args[1], .cap = g.cap, .width = HD };
+        const p = (try runWith(&sc, km, &m, cs.args[0], win, if (c[3] > 0) cs.args[2] else none, cs.args[3], g.p0, cs.args[5], .{ cs.args[6], cs.args[7] })) orelse return error.Declined;
+        try testing.expectEqual(@as(c_int, 1), p.splits);
+        const h = try dsv41.hostF32(p.acc);
+        defer a.free(h);
+        const ns = MergeAttn.splitCount(cs.p, .{ .rows = c[1], .n = c[2], .k = c[3] });
+        try testing.expectEqualSlices(u8, declared[4 * ns ..][0 .. 4 * h.len], std.mem.sliceAsBytes(h));
+    }
+}
+
+test "dsv41 dec attn merge: MLX_SERVE_DSV41_FUSE_ATTN_MERGE=1 decodes the fixture's layers within 1e-2 of the switch off over plain steps and verify blocks" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const steps = [_]usize{ 1, 1, decode.max_rows, 1, 3, 1 };
+    for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 } }) |range| {
+        var outs: [2][steps.len][]f32 = undefined;
+        for ([_]bool{ false, true }, 0..) |on, arm| {
+            var ov = env.override(.MLX_SERVE_DSV41_FUSE_ATTN_MERGE, if (on) "1" else "0");
+            defer ov.restore();
+            const fx = try fixture.Fixture.init(gpa, .{ .lo = range[0], .hi = range[1], .ctx = 601, .seed = 9, .act = .bfloat16, .fused = true });
+            defer fx.deinit();
+            var p0: usize = 601;
+            for (steps, 0..) |rows, k| {
+                const x = try fx.stream(rows);
+                defer _ = mlx.mlx_array_free(x);
+                const pre = try fx.cpre(rows);
+                defer _ = mlx.mlx_array_free(pre);
+                const out = try dsv41.workerStep(fx.m, gpa, x, pre, p0, false, false);
+                defer for (out) |o| {
+                    _ = mlx.mlx_array_free(o);
+                };
+                outs[arm][k] = try dsv41.hostF32(out[0]);
+                p0 += rows;
+            }
+        }
+        for (outs[0], outs[1], steps) |a, b, rows| {
+            defer gpa.free(a);
+            defer gpa.free(b);
+            for (b) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+            const e = decode.relRms(b, a);
+            std.debug.print("[attn merge] layers {d}..{d}, {d} rows: stream rel rms on vs off {e:.2}\n", .{ range[0], range[1], rows, e });
+            try testing.expect(e <= 1e-2);
+        }
+    }
+}
+
