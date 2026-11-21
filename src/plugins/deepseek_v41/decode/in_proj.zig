@@ -6,7 +6,6 @@ const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const device = @import("../../../mlx/device.zig");
 const mlx = @import("../../../mlx/ffi.zig");
-const mxfp8_qmv = @import("../../../sdk/blocks/qmm/mxfp8_qmv.zig");
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 const decode = @import("decode.zig");
 const v41 = @import("../deepseek_v41.zig");
@@ -17,7 +16,7 @@ const none: A = .{ .ctx = null };
 const MAIN_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_in_proj.metal");
 const STAGE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_in_proj_stage.metal");
 /// bf16 pairs from a word, and the mxfp8 e4m3 pair decode.
-const HEADER = mxfp8_qmv.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_in_proj_header.metal");
+const HEADER = decode.FP8_READ_HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_in_proj_header.metal");
 const MAIN_INS = [_][*:0]const u8{ "x", "cpre", "attn_w", "eps", "hin", "fn_w", "scale", "base", "wq", "wsc", "wp", "cw" };
 const MAIN_OUTS = [_][*:0]const u8{ "h", "qa", "kv", "iw", "comp", "z" };
 const STAGE_INS = [_][*:0]const u8{ "x", "cpre", "w", "eps" };
@@ -189,8 +188,9 @@ fn ci(v: usize) c_int {
     return @intCast(v);
 }
 
-/// The main kernel's dispatch: its grid, its six outputs (one that a plan lacks is one element) and its template args.
-fn launchGeometry(p: Plan) kc.metal.Geometry {
+/// The main kernel's dispatch: its grid, its six outputs (one that a plan lacks is one element) and its template args;
+/// `fold` the mxfp8 reads' `FOLD` (`decode.fp8Fold`).
+fn launchGeometry(p: Plan, fold: c_int) kc.metal.Geometry {
     var g: kc.metal.Geometry = .{ .grid = .{ ci(p.groups() * p.threads()), 1, 1 }, .tg = .{ ci(p.threads()), 1, 1 } };
     const r = ci(p.rows);
     if (p.fuse) g.out(&.{ r, ci(p.dim) }, .bfloat16) else g.out(&.{1}, .bfloat16);
@@ -202,6 +202,7 @@ fn launchGeometry(p: Plan) kc.metal.Geometry {
     inline for (.{ .{ "R", p.rows }, .{ "RT", rt }, .{ "NQ", p.nq }, .{ "QA", p.qa }, .{ "NW", p.nw }, .{ "NC", p.nc }, .{ "D", p.dim } }) |t| g.int(t[0], t[1]);
     g.flag("FUSE", p.fuse);
     g.dtype("CT", p.compDtype());
+    g.int("FOLD", fold);
     // The outputs the plan does not make are never written.
     g.unread = @as(u8, if (p.fuse) 0 else 1) | @as(u8, if (p.nw == 0) 8 else 0) | @as(u8, if (p.nc == 0) 16 else 0);
     return g;
@@ -253,7 +254,7 @@ fn project(sc: *v41.Scope, k: *const Kernels, p: Plan, a: Args, hin: ?A) !Out {
     std.debug.assert((hin == null) == p.fuse);
     var o: [6]A = undefined;
     // An input the launch does not read is the stream (bf16, like the rows it stands in for).
-    try dispatch(sc, k.main, launchGeometry(p), &.{ a.x, a.cpre, a.attn_w, a.eps, hin orelse a.x, a.fn_w, a.scale, a.base, a.wq, a.wsc, a.wp orelse a.x, a.cw orelse a.x }, &o);
+    try dispatch(sc, k.main, launchGeometry(p, decode.fp8Fold()), &.{ a.x, a.cpre, a.attn_w, a.eps, hin orelse a.x, a.fn_w, a.scale, a.base, a.wq, a.wsc, a.wp orelse a.x, a.cw orelse a.x }, &o);
     return .{ .h = hin orelse o[0], .qa = o[1], .kv = o[2], .iw = if (p.nw > 0) o[3] else null, .comp = if (p.nc > 0) o[4] else null, .z = o[5] };
 }
 
@@ -436,7 +437,7 @@ fn Main(comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf
 
         pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
             if (s.rows < 1 or s.rows > decode.max_rows or s.k != DIM) return null;
-            return launchGeometry(planOf(s));
+            return launchGeometry(planOf(s), 0);
         }
 
         /// The outputs in the kernel's order: h (this arm makes it), q_kv's two halves and weights_proj in bf16, then the
@@ -1150,4 +1151,10 @@ test "dsv41 dec in_proj: ubench against its byte floor and the chain it replaces
             decode.report(try std.fmt.bufPrint(&name_buf, "in_proj ({s}, {d} copies)", .{ kind.name, cyc.n }), rows, us, @as(f64, @floatFromInt(bytes)), chain_us);
         }
     }
+}
+
+test "dsv41 dec in_proj: q_kv's MLX mxfp8 reads give the FOLD form's bytes on finite codes" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try decode.expectFoldSame(Main(true, 8, 16, true), &main_l, .{}, fused_shapes);
+    try decode.expectFoldSame(Main(false, 8, 16, false), &main_l, .{}, staged_shapes);
 }

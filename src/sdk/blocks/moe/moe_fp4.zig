@@ -19,20 +19,15 @@ pub const SGS: c_int = 2;
 /// past two rows MLX's sorted gather (one read per expert per row group) wins.
 pub const MAX_ROWS: c_int = 2;
 
-/// e2m1 nibble -> its value times 2^-14, by bit placement into a half.
-pub const E2M1_HEADER = kernelSource("kernels/moe/moe_fp4_e2m1_header.metal");
 /// Group scale -> its value times 2^-8, either format by the GS template (`fp4.SCALE_HEADER`, the one fp4 scale
 /// decode). With the e2m1 2^-14, one 2^22 multiply restores both.
 pub const SCALE = fp4.SCALE_HEADER;
 
-/// Nibbles j and j+4 of a word decode together: one shift puts them in the two halves of a
-/// half2, then the e2m1 bit placement serves both lanes.
-pub const E2M1X2_HEADER = kernelSource("kernels/moe/moe_fp4_e2m1x2_header.metal");
-
-pub const DOT16 = E2M1X2_HEADER ++ kernelSource("kernels/moe/moe_fp4_dot16.metal");
+/// The 16-value dot (`mlxserve_e2m1x2` from `SCALE`).
+pub const DOT16 = kernelSource("kernels/moe/moe_fp4_dot16.metal");
 
 /// Both kernels' header, both formats: the format is the GS template argument.
-pub const HEADER = E2M1_HEADER ++ SCALE ++ DOT16;
+pub const HEADER = SCALE ++ DOT16;
 
 // grid (32, N/ROWS, R*TOPK), threadgroup (32, SGS, 1): slot e is token e / TOPK's
 // e % TOPK-th expert. USCALE and CLAMP are the per-expert up scale and GLM's whole-number SwiGLU clamp. The e2m1 and scale decodes each scale by a power of two;

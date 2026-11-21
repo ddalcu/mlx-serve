@@ -10,7 +10,10 @@ pub const MAX_ROWS: c_int = 8;
 const SGS: c_int = 4;
 
 /// Bytes 0 and 2 of `w` as a half2 (value x 2^-8), the e4m3 fields shifted into half's.
-pub const HEADER = kernelSource("kernels/qmm/mxfp8_qmv_header.metal");
+/// The e4m3 pair read over the shared fp4 scale header (MLX's e8m0 / e4m3 reads; guarded, so a kernel that also
+/// prepends the scale header compiles once).
+pub const HEADER = @import("../../quant/fp4.zig").SCALE_HEADER ++ kernelSource("kernels/qmm/mxfp8_qmv_header.metal");
+pub const QMV_HEADER = HEADER;
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 var engaged = false;
@@ -43,7 +46,7 @@ pub fn linear(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.mlx_
         defer _ = mlx.mlx_vector_string_free(in_vec);
         const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(out_vec);
-        const k = mlx.mlx_fast_metal_kernel_new("mlxserve_mxfp8_qmv", in_vec, out_vec, kernelSource("kernels/qmm/mxfp8_qmv.metal"), HEADER, true, false);
+        const k = mlx.mlx_fast_metal_kernel_new("mlxserve_mxfp8_qmv", in_vec, out_vec, kernelSource("kernels/qmm/mxfp8_qmv.metal"), QMV_HEADER, true, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         kernel = k;
     }
@@ -179,4 +182,72 @@ fn mxfp8Case(N: c_int, K: c_int) !void {
         std.debug.print("[mxfp8] rows={d}: rel rms vs fp32 truth stock {d:.6} ours {d:.6}\n", .{ rows, errs[0], errs[1] });
         try testing.expect(errs[1] <= errs[0] * 1.05 + 1e-6);
     }
+}
+
+test "mxfp8 qmv: every e4m3 weight byte under every e8m0 scale code reads as MLX's mxfp8 dequant (NaN codes, subnormals, 2^-127..2^127)" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const xfm = @import("../../../mlx/device.zig");
+    xfm.device_gen_override = .{ .gen = 17, .phone = false };
+    defer xfm.device_gen_override = null;
+    const s = mlx.gpuStream();
+    const a = std.testing.allocator;
+    // Row n holds e4m3 byte n everywhere; group g of every row has e8m0 code g. A one-hot x row picks one weight, so
+    // each output is one weight times 1.0: the read itself, rounded to bf16, where MLX's dequant puts it. A launch
+    // keeps only its own group's code (the rest 1.0), since a NaN scale elsewhere would reach the sum through 0 x NaN.
+    const N: c_int = 256;
+    const K: c_int = 256 * 32;
+    const words = try a.alloc(u32, @intCast(N * @divExact(K, 4)));
+    defer a.free(words);
+    for (0..@intCast(N)) |n| @memset(words[n * @as(usize, @intCast(@divExact(K, 4))) ..][0..@intCast(@divExact(K, 4))], @as(u32, @intCast(n)) * 0x01010101);
+    const codes = try a.alloc(u8, @intCast(N * 256));
+    defer a.free(codes);
+    for (codes, 0..) |*c, i| c.* = @intCast(i % 256);
+    const w = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ N, @divExact(K, 4) }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(w);
+    const sc = mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ N, 256 }, 2, .uint8);
+    defer _ = mlx.mlx_array_free(sc);
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    try mlx.check(mlx.mlx_dequantize(&deq, w, sc, .{ .ctx = null }, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, s));
+    try mlx.check(mlx.mlx_array_eval(deq));
+    const want = (mlx.mlx_array_data_bfloat16(deq) orelse return error.NoData)[0..@intCast(N * K)];
+    // One x row a launch: a NaN code in another selected group would reach this row through 0 x NaN.
+    const rows: usize = 1;
+    const x = try a.alloc(u16, rows * @as(usize, @intCast(K)));
+    defer a.free(x);
+    var differ: usize = 0;
+    var g: usize = 0;
+    while (g < 256) : (g += rows) {
+        @memset(x, 0);
+        for (0..rows) |m| x[m * @as(usize, @intCast(K)) + (g + m) * 32 + 5] = 0x3F80; // 1.0 at column 5 of group g + m
+        const xa = mlx.mlx_array_new_data(x.ptr, &[_]c_int{ @intCast(rows), K }, 2, .bfloat16);
+        defer _ = mlx.mlx_array_free(xa);
+        const own = try a.dupe(u8, codes);
+        defer a.free(own);
+        for (own, 0..) |*c, i| {
+            if (i % 256 < g or i % 256 >= g + rows) c.* = 127;
+        }
+        const sca = mlx.mlx_array_new_data(own.ptr, &[_]c_int{ N, 256 }, 2, .uint8);
+        defer _ = mlx.mlx_array_free(sca);
+        const y = (try linear(xa, w, sca, s)) orelse return error.KernelDeclined;
+        defer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_array_eval(y));
+        const got = (mlx.mlx_array_data_bfloat16(y) orelse return error.NoData)[0 .. rows * @as(usize, @intCast(N))];
+        for (0..rows) |m| for (0..@intCast(N)) |n| {
+            const wv = want[n * @as(usize, @intCast(K)) + (g + m) * 32 + 5];
+            const gv = got[m * @as(usize, @intCast(N)) + n];
+            const nan = struct {
+                fn is(b: u16) bool {
+                    return b & 0x7F80 == 0x7F80 and b & 0x7F != 0;
+                }
+            }.is;
+            // A zero's sign is the sum's (it starts at +0, as MLX's matmul does), not the weight's: -0 reads as +0.
+            const zero = wv & 0x7FFF == 0 and gv & 0x7FFF == 0;
+            if (!(wv == gv or zero or (nan(wv) and nan(gv)))) {
+                if (differ < 8) std.debug.print("mxfp8 e4m3 0x{x:0>2} e8m0 {d}: kernel 0x{x:0>4}, MLX 0x{x:0>4}\n", .{ n, g + m, gv, wv });
+                differ += 1;
+            }
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 0), differ);
 }

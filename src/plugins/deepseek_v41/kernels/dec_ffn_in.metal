@@ -29,14 +29,15 @@ for (int s0 = 0; s0 < STEPS; s0 += U) {
   }
   for (int u = 0; u < U; ++u) {
     const int s = s0 + u;
-    float wv[NR][16], sc[NR];
+    float wv[NR][16];
+    float2 sc[NR];
     for (int j = 0; j < NR; ++j) {
-      // e8m0 as 2^(e - 127), times the 2^8 the e4m3 bit placement leaves out.
-      sc[j] = as_type<float>(e[u][j] == 0u ? 0x400000u : (e[u][j] << 23)) * 256.0f;
+      // The e8m0 scale and the 2^8 the e4m3 reads leave out (fp8_read_header.metal).
+      sc[j] = dsv41_e8m0<FOLD>(e[u][j]);
       const uint words[4] = {q[u][j].x, q[u][j].y, q[u][j].z, q[u][j].w};
       for (int i = 0; i < 4; ++i) {
-        const float2 lo = mlxserve_e4m3x2(words[i]);
-        const float2 hi = mlxserve_e4m3x2(words[i] >> 8);
+        const float2 lo = dsv41_e4m3x2<FOLD>(words[i]);
+        const float2 hi = dsv41_e4m3x2<FOLD>(words[i] >> 8);
         wv[j][4 * i + 0] = lo.x;
         wv[j][4 * i + 1] = hi.x;
         wv[j][4 * i + 2] = lo.y;
@@ -55,7 +56,7 @@ for (int s0 = 0; s0 < STEPS; s0 += U) {
       for (int j = 0; j < NR; ++j) {
         float d = 0.0f;
         for (int i = 0; i < 16; ++i) d += xf[i] * wv[j][i];
-        acc[j][r] += d * sc[j];
+        acc[j][r] += (d * sc[j].y) * sc[j].x;
       }
     }
   }

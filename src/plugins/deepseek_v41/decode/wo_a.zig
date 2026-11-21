@@ -10,7 +10,6 @@ const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
-const mxfp8_qmv = @import("../../../sdk/blocks/qmm/mxfp8_qmv.zig");
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 const kit = @import("../../deepseek_v4/contract_kit.zig");
 const contract = @import("../contract.zig");
@@ -22,8 +21,8 @@ const A = mlx.mlx_array;
 const Scope = dsv41.Scope;
 
 pub const SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_wo_a.metal");
-/// The e4m3 pair decode the SDK's mxfp8 GEMV uses, a word's four values, and the matrix units' tile op.
-pub const HEADER = mxfp8_qmv.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_wo_a_header.metal") ++ kernelSource("plugins/deepseek_v41/kernels/dec_nax_header.metal");
+/// The mxfp8 reads (MLX's, or the fold under `FOLD`) and the matrix units' tile op.
+pub const HEADER = decode.FP8_READ_HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_nax_header.metal");
 pub const INS = [_][*:0]const u8{ "pacc", "pm", "pl", "sink", "meta", "periods", "w", "scales", "counter" };
 pub const OUTS = [_][*:0]const u8{ "out", "parts" };
 
@@ -115,6 +114,7 @@ pub fn launch(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, rd: usize, odt: mlx.m
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, p.tg[0], p.tg[1], p.tg[2]));
     for (p.ints) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, t.name, t.v));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OT", odt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "FOLD", decode.fp8Fold()));
     var all: [10]A = undefined;
     @memcpy(all[0..8], &ins);
     all[8] = counter;
@@ -193,6 +193,7 @@ const WoA = struct {
         g.out(&pl.parts, .float32);
         for (pl.ints) |t| g.int(t.name, t.v);
         g.dtype("OT", act);
+        g.int("FOLD", 0);
         return g;
     }
 
@@ -733,4 +734,10 @@ test "dsv41 dec wo_a: ubench" {
 
 test "dsv41 wo_a: every row a launch serves, a verify block's included, takes the vector kernel a plain step takes" {
     for (1..decode.max_rows + 1) |r| try testing.expect(!useNax(@intCast(r)));
+}
+
+test "dsv41 dec wo_a: MLX's mxfp8 reads give the FOLD form's bytes on finite codes, vector and matrix units" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try decode.expectFoldSame(WoA, &decl, .{}, &served);
+    if (device.naxAvailable()) try decode.expectFoldSame(WoA, &decl_nax, .{ .nax = true }, &served_nax);
 }
