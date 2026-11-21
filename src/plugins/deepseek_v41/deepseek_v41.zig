@@ -7714,7 +7714,7 @@ fn greedyRows(vl: A, suppress: A, s: mlx.mlx_stream) !A {
 test "dsv41 dspark: a greedy round's ids skip the ids the serial sampler masks" {
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    const vl = mlx.mlx_array_new_data(&[_]f32{ 0.1, 0.9, 0.5, 0.2, 0.7, 0.3 }, &[_]c_int{ 2, 3 }, 2, .float32);
+    const vl = mlx.mlx_array_new_data(&[_]f32{ 0.1, 0.9, 0.5, 0.6, 0.7, 0.3 }, &[_]c_int{ 2, 3 }, 2, .float32);
     defer _ = mlx.mlx_array_free(vl);
     const mask = mlx.mlx_array_new_data(&[_]bool{ false, true, false }, &[_]c_int{3}, 1, .bool_);
     defer _ = mlx.mlx_array_free(mask);
