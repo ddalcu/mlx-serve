@@ -9743,6 +9743,13 @@ test "dsv41 DSpark round: draft, verify and finish timed apart, greedy (DSV41_RO
     });
 }
 
+/// `DSV41_VERIFY_ROWS`' draft: `b` synthetic ids after the verify's first row.
+fn verifyRowsDraft(gpa: std.mem.Allocator, m: *const Dsv41Model, b: usize) !DsparkDraft {
+    const ids = try gpa.alloc(u32, b + 1);
+    for (ids, 0..) |*t, k| t.* = @intCast((k * 104729 + 7) % @min(m.vocab, 100000));
+    return .{ .ids = ids, .len = b, .logits = &.{}, .confidence = &.{} };
+}
+
 test "dsv41 verify width: time of a verify block per draft count (DSV41_VERIFY_ROWS)" {
     // DSV41_VERIFY_ROWS = a pack dir; DSV41_STEP_CTX prompt tokens first (default 2048).
     const dir = std.mem.span(std.c.getenv("DSV41_VERIFY_ROWS") orelse return error.SkipZigTest);
@@ -9765,10 +9772,19 @@ test "dsv41 verify width: time of a verify block per draft count (DSV41_VERIFY_R
         break :blk try argmaxHost(l);
     };
     const iou = @import("../../sdk/util/io_util.zig");
-    for ([_]usize{ 1, 3, 5, 7, 8, 9, 10, 11, 12, 15 }) |b| {
-        const ids = try gpa.alloc(u32, b + 1);
-        for (ids, 0..) |*t, k| t.* = @intCast((k * 104729 + 7) % @min(m.vocab, 100000));
-        var d: DsparkDraft = .{ .ids = ids, .len = b, .logits = &.{}, .confidence = &.{} };
+    // Every width once untimed first (its kernels' first calls, and the prefill's buffer cache the first verifies run
+    // on), then the widths timed in an order that is not ascending, two rows first and again last.
+    for ([_]usize{ 0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 15 }) |b| {
+        var d = try verifyRowsDraft(gpa, m, b);
+        defer d.deinit(gpa);
+        var pending = try dsparkBeginWith(m, gpa, &st, t1, &d);
+        defer pending.deinit();
+        try mlx.check(mlx.mlx_array_eval(pending.vl_g));
+        var r = try dsparkFinish(m, gpa, &st, &pending, 0, 0);
+        r.deinit(gpa);
+    }
+    for ([_]usize{ 1, 3, 0, 5, 2, 4, 15, 7, 12, 8, 11, 9, 10, 1 }) |b| {
+        var d = try verifyRowsDraft(gpa, m, b);
         defer d.deinit(gpa);
         var total: i64 = 0;
         var cold: i64 = 0;
