@@ -274,5 +274,41 @@ fi
 run_test "chat \$ref into \$defs" "$( [ "$OK" = ok ] && echo PASS || echo FAIL )" "$OK"
 echo ""
 
+# ── Case H: an array that reaches maxItems closes; a comma there killed the mask ──
+# The prompt asks for more tags than maxItems allows; enum items keep every tag short.
+echo "--- Case H: /v1/chat/completions + array at maxItems ---"
+TAGS='["temples","tea","history","gardens","culture","food","shrines","art","nature","festivals"]'
+TAGS_SCHEMA='{"type":"object","additionalProperties":false,"required":["city","population","tags"],"properties":{"city":{"type":"string"},"population":{"type":"integer","minimum":0},"tags":{"type":"array","items":{"enum":'"$TAGS"'},"maxItems":3}}}'
+LOG_MARK=$(wc -l < /tmp/mlx-serve-schema-test.log)
+OK=ok
+for SEED in $(seq 1 10); do
+    BODY=$(jq -n --argjson schema "$TAGS_SCHEMA" --argjson seed "$SEED" '{
+        model:"mlx-serve",
+        messages:[{role:"user",content:"Give facts about Kyoto with ten tags."}],
+        response_format:{type:"json_schema",json_schema:{name:"city",schema:$schema,strict:true}},
+        max_tokens:256, temperature:0.7, seed:$seed, enable_thinking:false
+    }')
+    R=$(curl -sf "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "$BODY" | TAGS="$TAGS" python3 -c '
+import sys, json, os
+tags = json.loads(os.environ["TAGS"])
+try:
+    c = json.loads(sys.stdin.read())["choices"][0]
+    o = json.loads(c["message"]["content"] or "")
+except Exception:
+    print("fail:no_json_reply"); sys.exit()
+if c["finish_reason"] != "stop" or not isinstance(o, dict) or set(o) != {"city", "population", "tags"} \
+        or not isinstance(o["city"], str) or type(o["population"]) is not int or o["population"] < 0 \
+        or not isinstance(o["tags"], list) or len(o["tags"]) > 3 or any(t not in tags for t in o["tags"]):
+    print("fail:off_schema:" + repr(o)[:80]); sys.exit()
+print("ok")
+')
+    [ "$R" = ok ] || OK="$R (seed $SEED)"
+done
+if tail -n +"$((LOG_MARK + 1))" /tmp/mlx-serve-schema-test.log | grep -q "disabling further mask enforcement"; then
+    OK="fail:mask_disabled"
+fi
+run_test "chat array at maxItems" "$( [ "$OK" = ok ] && echo PASS || echo FAIL )" "$OK"
+echo ""
+
 echo "=== Result: $PASS/$TOTAL passed ==="
 [ "$FAIL" -eq 0 ]
