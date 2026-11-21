@@ -74,6 +74,7 @@ pub fn logSpecStats(self: *const Generator) void {
                     "  [spec-stats] dspark policy2: next_decided={d} next_took={d} rate_tok_ms={d:.4} round_ms={d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}\n",
                     .{ p.free_seen, p.free_hit, p.rate.perMs(pol.plain.ms), c[1], c[2], c[3], c[4], c[5], c[6] },
                 );
+                if (p.modeled) log.info("  [spec-stats] dspark policy2 modeled: widths priced by the fitted ladder in plain steps, rate_tok_step={d:.4}\n", .{p.rate.perMs(1)});
             }
         }
         return;
