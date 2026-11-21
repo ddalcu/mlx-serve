@@ -136,7 +136,7 @@ pub fn recordSlotEnd(metrics: ?*metrics_mod.Metrics, slot: anytype, outcome: met
 fn countSlot(m: *metrics_mod.Metrics, slot: anytype, outcome: metrics_mod.Outcome) bool {
     if (slot.metrics_recorded) return false;
     slot.metrics_recorded = true;
-    return m.recordOutcome(
+    return m.recordRequest(
         outcome,
         slot.first_token_ns,
         slot.prefill_ns,
@@ -148,10 +148,8 @@ fn countSlot(m: *metrics_mod.Metrics, slot: anytype, outcome: metrics_mod.Outcom
     );
 }
 
-/// A finishing slot's tokens leave `inflight` and reach `generation_tokens_total`, and its outcome is counted.
-/// Both writes are `.seq_cst` inside the move bracket, as are the sampler's loads: a sample that sees either write
-/// also sees the bracket open and is retaken. Saturating, since `completion_tokens` can be ahead of an aggregate
-/// published once per tick.
+/// Both writes are `.seq_cst` inside the bracket, as are the sampler's loads: a sample that sees either one also
+/// sees the bracket open and is retaken. Saturating: `completion_tokens` can be ahead of a per-tick aggregate.
 pub fn moveSlotTokens(metrics: ?*metrics_mod.Metrics, inflight: *std.atomic.Value(u64), slot: anytype, outcome: metrics_mod.Outcome) void {
     if (metrics) |m| m.beginTokenMove();
     defer if (metrics) |m| m.endTokenMove();
