@@ -700,15 +700,14 @@ const HcSplit = struct {
 };
 
 const HcMix = struct {
-    pub const Params = struct { tg: usize = 1024, cols: usize = 6 };
-    const R = 4;
+    pub const Params = struct { tg: usize = 1024, cols: usize = 6, rows: usize = 4 };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or MIX % p.cols != 0) return null;
-        var g = metal.Geometry{ .grid = .{ ci(MIX / p.cols * p.tg), ci((s.rows + R - 1) / R), 1 }, .tg = .{ ci(p.tg), 1, 1 } };
+        var g = metal.Geometry{ .grid = .{ ci(MIX / p.cols * p.tg), ci((s.rows + p.rows - 1) / p.rows), 1 }, .tg = .{ ci(p.tg), 1, 1 } };
         g.out(&.{ ci(s.rows), MIX }, .float32);
         g.int("TG", p.tg);
-        g.int("R", R);
+        g.int("R", p.rows);
         g.int("M", p.cols);
         return g;
     }
@@ -776,6 +775,20 @@ const HcMix = struct {
                 mag[l * MIX + m] = mg * @abs(r * k.in(2)[m]) + @abs(d * r * k.in(2)[m]) / 2;
             }
         }
+    }
+
+    /// The 4-row launch, as `hcMixWide` serves it without `MLX_SERVE_DSV41_HC_MIX8`.
+    pub fn replaced(k: anytype) ![]const u8 {
+        var sc = v41.Scope.init(k.rig.a, k.rig.stream());
+        defer sc.deinit();
+        var m: v41.Dsv41Model = undefined;
+        m.s = k.rig.stream();
+        m.cfg = .{};
+        m.hc_tg = k.p.tg;
+        m.hc_mix_kernel = try v41.buildKernel("dsv41_hc_mix", &.{ "x", "fn", "scale", "base", "eps" }, &.{"z"}, v41.HC_MIX_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.hc_mix_kernel);
+        const hc: v41.Hc = .{ .fn_w = k.args[1], .scale = k.args[2], .base = k.args[3] };
+        return k.rig.bytesOf(&.{try v41.hcMixWide(&sc, &m, k.args[0], &hc, k.args[4])});
     }
 };
 
@@ -1160,12 +1173,11 @@ fn normedCollapse(x: []const f64, cpre: []const f64, ws: []const []const f64, ep
 }
 
 const HcMixNorm = struct {
-    pub const Params = struct { tg: usize = 1024, cols: usize = 6, h2: bool = true };
-    const R = 4;
+    pub const Params = struct { tg: usize = 1024, cols: usize = 6, h2: bool = true, rows: usize = 4 };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or s.n == 0 or MIX % p.cols != 0) return null;
-        var g = metal.Geometry{ .grid = .{ ci((MIX / p.cols + 1) * p.tg), ci((s.rows + R - 1) / R), 1 }, .tg = .{ ci(p.tg), 1, 1 } };
+        var g = metal.Geometry{ .grid = .{ ci((MIX / p.cols + 1) * p.tg), ci((s.rows + p.rows - 1) / p.rows), 1 }, .tg = .{ ci(p.tg), 1, 1 } };
         g.out(&.{ ci(s.rows), MIX }, .float32);
         g.out(&.{ ci(s.rows), ci(s.n) }, act);
         if (p.h2) g.out(&.{ ci(s.rows), ci(s.n) }, act) else {
@@ -1173,7 +1185,7 @@ const HcMixNorm = struct {
             g.unread = 1 << 2;
         }
         g.int("TG", p.tg);
-        g.int("R", R);
+        g.int("R", p.rows);
         g.int("M", p.cols);
         g.int("HC", HC);
         g.int("H2", @intFromBool(p.h2));
@@ -4131,6 +4143,9 @@ const flash_l = metal.Launch{ .name = "dsv41_attn_flash", .inputs = &v41.GatherA
 const gather_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 } };
 const qk_t_l = metal.Launch{ .name = "dsv41_attn_qk_t", .inputs = &.{ "q", "kw", "comp", "picks", "meta", "qt" }, .outputs = &.{"s"}, .source = qtail.attn_qk_t_source, .header = v41.MPP_HEADER, .tg_bytes = 2 * 64 * 64 * 2, .offline = false, .min_gen = 17 };
 const mix_norm_l = launch("dsv41_hc_mix_norm", &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, &.{ "z", "h_out", "h2" }, hcf.mix_norm_source, "", 4 * (4 * 6 + 4) * 32, 1024, true);
+/// The wide mixes at 8 rows a threadgroup (`MLX_SERVE_DSV41_HC_MIX8`), served on NAX GPUs only.
+const mix8_l = metal.Launch{ .name = "dsv41_hc_mix", .inputs = &.{ "x", "fn", "scale", "base", "eps" }, .outputs = &.{"z"}, .source = v41.HC_MIX_SOURCE, .header = "", .tg_bytes = 4 * (8 * 6 + 8) * 32, .adapts = true, .min_gen = 17 };
+const mix_norm8_l = metal.Launch{ .name = "dsv41_hc_mix_norm", .inputs = &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, .outputs = &.{ "z", "h_out", "h2" }, .source = hcf.mix_norm_source, .header = "", .tg_bytes = 4 * (8 * 6 + 8) * 32, .adapts = true, .min_gen = 17 };
 const rope_only_l = launch("dsv41_rope_tail_only", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_only_source, "", 0, 1024, false);
 const kv_l = launch("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, v41.KV_ROW_SOURCE, v41.FP8_HEADER, 4 * (32 + 1024), 1024, false);
 const engram_l = launch("dsv41_engram", &.{ "x", "kv", "qk", "cst" }, &.{"out"}, v41.ENGRAM_SOURCE, "", 4 * (3 * 32 + 1), 928, false);
@@ -4218,6 +4233,17 @@ pub fn register(set: *kc.Set) !void {
         .out = .f32,
         .tiles = .{ .{ .size = 4 }, .{}, .{} },
         .served = &.{ .{ .rows = 17, .n = DIM, .k = HC * DIM }, .{ .rows = 64, .n = DIM, .k = HC * DIM } },
+    });
+    try kit.add(set, HcMix, &mix8_l, .{ .rows = 8 }, .{
+        .name = "dsv41 hc_mix (wide mixes, 8 rows a threadgroup)",
+        .accum = .f32,
+        .depth = depthK,
+        .ops = 4,
+        .out = .f32,
+        .replaces = "hc_mix at 4 rows a threadgroup",
+        .tiles = .{ .{ .size = 8 }, .{}, .{} },
+        .served = &.{ .{ .rows = 17, .n = DIM, .k = HC * DIM }, .{ .rows = 64, .n = DIM, .k = HC * DIM } },
+        .nax = true,
     });
     try kit.add(set, HcNorm, &norm_l, .{}, .{
         .name = "dsv41 hc_norm (split + normed collapse)",
@@ -4683,6 +4709,20 @@ fn registerStreamed(set: *kc.Set) !void {
         .served = mix_norm_served,
         .sums = .{ .bf16 = 0, .exact = false, .why = "on hc_mix's stress rows the collapse's sums are not exact, so the float64 bound holds them, and a bf16 miss hides under it" },
     });
+    inline for (.{ true, false }) |h2| try kit.add(set, HcMixNorm, &mix_norm8_l, .{ .h2 = h2, .rows = 8 }, .{
+        .name = if (h2) "dsv41 hc_mix_norm (mixes + normed collapse, twice, 8 rows a threadgroup)" else "dsv41 hc_mix_norm (mixes + normed collapse, 8 rows a threadgroup)",
+        .accum = .f32,
+        .depth = depthK,
+        .ops = 4,
+        .mids = 2,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .f32, .count = rowsMix }, .{ .elem = .bf16, .count = rowsN } },
+        .replaces = "hc_mix then hc_norm (the stock launches at 4 rows)",
+        .tiles = .{ .{ .size = 8 }, .{}, .{} },
+        .served = mix_norm_served,
+        .sums = .{ .bf16 = 0, .exact = false, .why = "on hc_mix's stress rows the collapse's sums are not exact, so the float64 bound holds them, and a bf16 miss hides under it" },
+        .nax = true,
+    });
     try kit.add(set, RopeTailOnly, &rope_only_l, .{}, .{
         .name = "dsv41 rope_tail_only (the query tail)",
         .accum = .none,
@@ -4904,6 +4944,19 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const hc: v41.Hc = .{ .fn_w = r.c.args[1], .scale = r.c.args[2], .base = r.c.args[3] };
         const f = try v41.hcMixNormFused(&sc, m, r.c.args[0], r.c.args[5], &hc, r.c.args[6], if (h2) r.c.args[7] else null, r.c.args[4]);
         try Expect.same(r.c, r.bytes, if (h2) &.{ f.z, f.n.h, f.h2 } else &.{ f.z, f.n.h });
+    }
+    if (@import("../../mlx/device.zig").naxAvailable()) {
+        const o = @import("../../env.zig").override(.MLX_SERVE_DSV41_HC_MIX8, "1");
+        defer o.restore();
+        {
+            const r = try ours(HcMix, a, &mix8_l, .{ .rows = 8 }, .{ .rows = 18, .n = 300, .k = HC * 300 });
+            const hc: v41.Hc = .{ .fn_w = r.c.args[1], .scale = r.c.args[2], .base = r.c.args[3] };
+            try Expect.same(r.c, r.bytes, &.{try v41.hcMixWide(&sc, m, r.c.args[0], &hc, r.c.args[4])});
+        }
+        const r = try ours(HcMixNorm, a, &mix_norm8_l, .{ .rows = 8 }, .{ .rows = 6, .n = 300, .k = HC * 300 });
+        const hc: v41.Hc = .{ .fn_w = r.c.args[1], .scale = r.c.args[2], .base = r.c.args[3] };
+        const f = try v41.hcMixNormFused(&sc, m, r.c.args[0], r.c.args[5], &hc, r.c.args[6], r.c.args[7], r.c.args[4]);
+        try Expect.same(r.c, r.bytes, &.{ f.z, f.n.h, f.h2 });
     }
     {
         const r = try ours(RopeTailOnly, a, &rope_only_l, .{}, .{ .rows = 3, .n = 4, .k = HD });

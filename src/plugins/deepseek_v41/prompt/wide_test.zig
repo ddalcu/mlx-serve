@@ -251,3 +251,36 @@ test "dsv41 wide exact: the FFN-side hc expand and norm in one launch give the s
         try testing.expect(!(try sameBytes(want.h, planted.h) and try sameBytes(want.sp.comb, planted.sp.comb)));
     }
 }
+
+test "dsv41 wide exact: the hc mixes at 8 rows a threadgroup give the 4-row launches' mixes, split and norms bit for bit at prompt widths" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var m: dsv41.Dsv41Model = undefined;
+    try hcModel(&m);
+    defer hcModelFree(&m);
+    const unset = env.override(.MLX_SERVE_DSV41_HC_MIX8, null);
+    defer unset.restore();
+    for ([_]c_int{ 17, 1027, 5001, 8192 }, 0..) |L, i| {
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const r = try hcRows(&sc, L, 0x8800 + 16 * @as(u64, i));
+        const eps = try dsv41.hcEps(&sc, &m);
+        const z4 = try dsv41.hcMixWide(&sc, &m, r.x, &r.hc, eps);
+        const f4 = try dsv41.hcMixNormFused(&sc, &m, r.x, r.cpre, &r.hc, r.w, r.w, eps);
+        const on = env.override(.MLX_SERVE_DSV41_HC_MIX8, "1");
+        defer on.restore();
+        const z8 = try dsv41.hcMixWide(&sc, &m, r.x, &r.hc, eps);
+        const f8 = try dsv41.hcMixNormFused(&sc, &m, r.x, r.cpre, &r.hc, r.w, r.w, eps);
+        for ([_][2]A{ .{ z4, z8 }, .{ f4.z, f8.z }, .{ f4.n.h, f8.n.h }, .{ f4.h2, f8.h2 }, .{ f4.n.sp.comb, f8.n.sp.comb } }, 0..) |pr, k| {
+            if (!try sameBytes(pr[0], pr[1])) {
+                std.debug.print("hc mix rows {d}: output {d} at 8 rows a threadgroup differs from 4's\n", .{ L, k });
+                return error.TestExpectedEqual;
+            }
+        }
+        // Planted: 8 rows at 512 threads (another reduction order) must not pass for the 4-row bytes.
+        m.hc_tg = 512;
+        const planted = try dsv41.hcMixWide(&sc, &m, r.x, &r.hc, eps);
+        m.hc_tg = 1024;
+        try testing.expect(!try sameBytes(z4, planted));
+    }
+}
