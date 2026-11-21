@@ -30,6 +30,7 @@ serves either from the pack, with no flag.
   span grouping (`idx_group`), buffers kept or reused (`transient_keep`, `scratch_x1` on `scratch`),
   Engram's direct read (`engram_direct`), the embedding pread and a plugin bank's own pieces (`wide_early`, `woa_rows`,
   `flash_attn`: the lossy flash kernel, default on beside a plugin bank only).
+- `fuse.zig`: launch fusions, each off by default behind its own `MLX_SERVE_DSV41_FUSE_*` switch (`Dsv41Model.fuse`).
 - `spec/markov.zig`: DSpark's Markov chain in B + 1 launches; `decode/engram_decode.zig` the Engram LRU,
   `decode/gemv_twin.zig` the batched GEMV twin of MLX's M=1 words.
 - `decode/moe_fp4.zig`: the MoE's two launches over fp4 routed experts (MXFP4; NVFP4 with ModelOpt's
@@ -154,8 +155,8 @@ serves either from the pack, with no flag.
   still returns a named unsupported verdict. SSD-only module retention is unsupported.
 - An NVFP4 bank's per-expert globals (`expertScales`: gate, up and down, `[E]` bf16, finite and positive, all three or
   none) apply where the SDK block applies them: the gate and up gather outputs (`gateUp`, `moePrefill`, the fused
-  kernel's flags), each rounded again; the down scale on the routing weight (`routeFrom`, `ffnInFused`). Streamed or
-  tensor-split experts with them are refused by name.
+  kernel's flags), each rounded again; the down scale on the routing weight (`routeFrom`, `blockTail`; under
+  `fuse.down_scale` the fused gate/up launch's `DSCALE`). Streamed or tensor-split experts with them are refused by name.
 - Serial decode near the memory wall: 720 GB/s of ~1.1 TB/s, so kernel work buys 15-25%, not 2x.
 - Without NAX (M4 and older) `attn`, `idx_score` and the `wo_a` / `ffn_in` fusion behind them stay off: decode runs the
   pre-NAX split kernel and the compiled regions. The affine `moe_up` / `moe_down` stay off too (they lose to the

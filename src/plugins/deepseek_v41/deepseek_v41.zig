@@ -78,6 +78,8 @@ const acore = @import("prompt/attn_core.zig");
 /// a wide span's attention as one flash
 /// kernel (an online softmax; the scores and probabilities never leave a threadgroup), not exact.
 const fa = @import("prompt/flash_attn.zig");
+/// launch fusions, each behind its own default-off switch (`Dsv41Model.fuse`).
+const fusion = @import("fuse.zig");
 const Shard = @import("../../sdk/weights/shard.zig").Shard;
 
 const A = mlx.mlx_array;
@@ -532,6 +534,8 @@ pub const Dsv41Model = struct {
     ds_draft_ns: u64 = 0,
     /// `MLX_SERVE_DSV41_EXACT` (`Exact`), read at load.
     exact: Exact = .{},
+    /// The launch fusions switched on (`fuse.zig`), read at load.
+    fuse: fusion.Fuse = .{},
     /// Exact verify blocks that fell to the batched kernels (`exactMiss`).
     exact_misses: u64 = 0,
     /// A pair worker exact serves anyway: the gate's single-process worker (`decode/exact_test.zig`), whose host is
@@ -2019,6 +2023,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     };
     try compileRegions(m);
     m.exact = exactWanted();
+    m.fuse = fusion.Fuse.wanted();
     if (m.exact.on) {
         // Proven (decode/exact_test.zig, the live corpus) only where every verify row takes the fused decode kernels'
         // rows (`blockFusedRows`): an Apple GPU without NAX (the fused NAX indexer and attention give a verify row other
@@ -4039,7 +4044,7 @@ pub fn ffnDecode(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: 
 
 /// The fused fp4 MoE decode kernels where they serve: everywhere, unless `MLX_SERVE_DSV41_MOE_FP4_NAX=0` on a NAX GPU
 /// (read each call; there `routed`'s gathers run).
-fn fp4Decode(m: *const Dsv41Model) ?dkern.moe_fp4.Kernels {
+pub fn fp4Decode(m: *const Dsv41Model) ?dkern.moe_fp4.Kernels {
     const k = m.dec.moe_fp4 orelse return null;
     if (device.naxAvailable() and !fp4NaxOn(env.get(.MLX_SERVE_DSV41_MOE_FP4_NAX))) return null;
     return k;
@@ -4983,7 +4988,10 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     // `ffn_in` routes off wo_b's output, which a tensor split sums first.
     if (m.tp == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &sa)) |f| {
         pre.* = f.sf.pre;
-        return try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
+        // `fuse.down_scale`: the fused fp4 launches put the down scale on the routes themselves.
+        if (m.fuse.down_scale) if (try fusion.ffnDownScaled(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf)) |y| return y;
+        const wts = try routeScaled(sc, ly, f.idx, f.wts);
+        return try ffnDecode(sc, m, ly, f.h2, f.idx, wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, wts)), &f.sf);
     };
     var ao: [1]A = undefined;
     if (oa) |v| ao[0] = try ly.wo_b.apply(sc, v) else try runRegion(sc, m, li, .attn_out, &.{try attnDecode(sc, m, ly, q, ls.win, comp_rows, topk, p0, scale, inv)}, &ao);
@@ -5142,7 +5150,8 @@ fn moeFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: A, wt
     return try sc.reshape(y, &.{ ci(R), ci(dim(h, 1)) });
 }
 
-/// wo_b through the routes on the fused `ffn_in` launches: the new stream, the FFN's normed input, split and routes.
+/// wo_b through the routes on the fused `ffn_in` launches: the new stream, the FFN's normed input, split and routes, the
+/// routes' weights without the down scale (`routeScaled`).
 fn ffnInFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, oa: A, x: A, sa: *const Split) !?dkern.ffn_in.Out {
     const k = m.dec.ffn_in orelse return null;
     const wo = &ly.wo_b;
@@ -5150,9 +5159,7 @@ fn ffnInFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, oa: A, x: A, s
     const c = &m.cfg;
     const dims: dkern.ffn_in.Dims = .{ .rows = dim(x, 0), .d = c.hidden_size, .k = dim(oa, 1), .e = dim(ly.gate_w, 0), .top_k = ly.top_k, .iters = c.dsv4_hc_sinkhorn_iters, .norm = c.moe_route_norm and ly.top_k > 1 };
     const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{c.router_scaling_factor}, &[_]c_int{1}, 1, .float32));
-    var out = (try dkern.ffn_in.launch(sc, k, dims, dkern.ffn_in.weightsOf(ly), oa, x, sa, try hcEps(sc, m), scal)) orelse return null;
-    out.wts = try routeScaled(sc, ly, out.idx, out.wts);
-    return out;
+    return dkern.ffn_in.launch(sc, k, dims, dkern.ffn_in.weightsOf(ly), oa, x, sa, try hcEps(sc, m), scal);
 }
 
 /// A block up to its FFN: the stream after attention, the FFN's mix and the
