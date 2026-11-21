@@ -216,7 +216,7 @@ const K_ = struct {
             .random, .nonfinite => {
                 for (0..R) |r| packRow(tb, codes, tsc, r, K, null, null, rng);
                 try moe_fp4.fillShared(rng, w, wsc, N, K, f, perm, k.scratch());
-                // A NaN weight (e4m3 0x7f) on every fifth row: its outputs are NaN for every row of x.
+                // A NaN weight (e4m3 0x7f, MLX's NaN code) on every fifth output row: its outputs are NaN for every row of x.
                 if (f == .nonfinite) {
                     var n: usize = 1;
                     while (n < N) : (n += 5) {
@@ -263,6 +263,15 @@ const K_ = struct {
         return v * s;
     }
 
+    /// W's input i of row n as the kernel reads it: MLX's e4m3 (S.1111.111 NaN, which the shared host table reads as
+    /// 480) times its e8m0 exponent.
+    fn wAt(words: []const f64, exps: []const f64, n: usize, i: usize, K: usize) f64 {
+        const word: u32 = @intFromFloat(words[n * (K / 4) + i / 4]);
+        const byte: u8 = @truncate(word >> @intCast(8 * (i % 4)));
+        if (byte & 0x7f == 0x7f) return kit.nan;
+        return kc.host.e4m3(byte) * e8m0(exps[n * (K / 32) + i / 32]);
+    }
+
     pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
         const R = k.shape.rows;
         const N = k.shape.n;
@@ -278,7 +287,7 @@ const K_ = struct {
             x[r * K + i] = xAt(k, r, i);
         };
         for (0..N) |n| {
-            for (0..K) |i| t[i] = moe_fp4.sharedAt(k.in(4), k.in(5), n, i, K);
+            for (0..K) |i| t[i] = wAt(k.in(4), k.in(5), n, i, K);
             for (0..R) |r| {
                 var m: f64 = 0;
                 for (0..K) |i| {
