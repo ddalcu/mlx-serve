@@ -326,14 +326,14 @@ fn packBytes(words: []f64, bytes: []const u8) void {
 }
 
 /// Row `r` input i of an mxfp8 operand (`words` of e4m3 bytes, e8m0 `exps`) as float64.
-fn sharedAt(words: []const f64, exps: []const f64, r: usize, i: usize, k: usize) f64 {
+pub fn sharedAt(words: []const f64, exps: []const f64, r: usize, i: usize, k: usize) f64 {
     const word: u32 = @intFromFloat(words[r * (k / 4) + i / 4]);
     const byte: u8 = @truncate(word >> @intCast(8 * (i % 4)));
     return kc.host.e4m3(byte) * std.math.pow(f64, 2, exps[r * (k / 32) + i / 32] - 127);
 }
 
 /// Fills an mxfp8 operand `[rows, k]` with random bytes (the NaN code excluded) or, for `.stress`, mirrored integers.
-fn fillShared(rng: std.Random, words: []f64, exps: []f64, rows: usize, K: usize, f: Fill, perm: []const usize, scratch: std.mem.Allocator) !void {
+pub fn fillShared(rng: std.Random, words: []f64, exps: []f64, rows: usize, K: usize, f: Fill, perm: []const usize, scratch: std.mem.Allocator) !void {
     const bytes = try scratch.alloc(u8, rows * K);
     defer scratch.free(bytes);
     switch (f) {

@@ -18,6 +18,7 @@ pub const ffn_in = @import("ffn_in.zig");
 pub const moe_up = @import("moe_up.zig");
 pub const moe_fp4 = @import("moe_fp4.zig");
 pub const moe_down = @import("moe_down.zig");
+pub const engram_kv = @import("engram_kv.zig");
 
 const dsv41 = @import("../deepseek_v41.zig");
 
@@ -30,7 +31,7 @@ pub const max_rows = 6;
 pub const stream_bytes_per_us: f64 = 1.065e6;
 
 pub fn register(set: *kc.Set) !void {
-    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_fp4, moe_down }) |k| try k.register(set);
+    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_fp4, moe_down, engram_kv }) |k| try k.register(set);
 }
 
 /// Root-mean-square of `got - want` over that of `want`.
@@ -209,7 +210,7 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
 test {
     _ = fixture;
     _ = @import("exact_test.zig");
-    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_down }) |k| _ = k;
+    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_down, engram_kv }) |k| _ = k;
 }
 
 test "dsv41 dec fp8 reads: every e4m3 code at every byte reads as MLX's from_fp8, every e8m0 code as MLX's fp8.h; FOLD differs only where it overflows or misses a NaN" {
