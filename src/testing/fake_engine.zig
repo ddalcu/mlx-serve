@@ -17,6 +17,13 @@ pub const caps: abi.Caps = .{ .penalties = true, .logit_bias = true, .logprobs =
 pub const max_concurrent = 8;
 pub const eos = [_]u32{2};
 pub const first_count: u32 = 1000;
+/// The atom an engine that expands images itself announces; the host renders it and hands the engine
+/// the pixels at it.
+pub const image_atom = "<start><image><end>";
+
+/// What a table declares about media: nothing, images served through the atom above, or images counted
+/// through the row-count callback.
+pub const Media = enum { none, images, rows };
 
 pub const Flaw = enum {
     none,
@@ -26,6 +33,10 @@ pub const Flaw = enum {
     accepts_undeclared,
     locks_across_sink,
     drops_on_close,
+    images_without_atom, // declares images, announces no atom
+    images_without_tokenizer, // the atom route without the tokenizer the host needs
+    images_without_token_bytes, // the atom route without the byte decoder
+    stray_media_rows, // the row-count callback without any media caps
     // exactness: a token moves when drafted / resumed / in company; a reference that is not plain or not cold
     drafted_drifts,
     resumed_drifts,
@@ -35,8 +46,13 @@ pub const Flaw = enum {
     forgets_on_close,
 };
 
-pub const own_thread = Fake(.own_thread, .none).engine;
-pub const host_gpu_thread = Fake(.host_gpu_thread, .none).engine;
+pub const own_thread = Fake(.own_thread, .none, .none).engine;
+pub const host_gpu_thread = Fake(.host_gpu_thread, .none, .none).engine;
+/// The fake shaped like an engine that expands images itself (the mode ds4 serves vision in).
+pub const own_thread_images = Fake(.own_thread, .none, .images).engine;
+pub const host_gpu_thread_images = Fake(.host_gpu_thread, .none, .images).engine;
+/// The fake shaped like an engine that counts its image rows through the callback.
+pub const own_thread_rows = Fake(.own_thread, .none, .rows).engine;
 
 /// The fake's SSD tier: the prompts a closed `"ssd"` instance kept, read by the next one.
 var disk: std.ArrayList([]u32) = .empty;
@@ -52,8 +68,21 @@ pub fn tokenAt(prompt: []const u32, k: u64) u32 {
     return if (k < prompt.len) prompt[@intCast(k)] else first_count + @as(u32, @intCast(k - prompt.len));
 }
 
-pub fn Fake(comptime threading: abi.Threading, comptime flaw: Flaw) type {
+/// `media` declares the image capability an engine with its own vision tower serves in (it
+/// announces the atom and expands the placeholder itself); the flaws break that contract.
+pub fn Fake(comptime threading: abi.Threading, comptime flaw: Flaw, comptime media: Media) type {
     return struct {
+        /// The caps this table declares: the shared caps, plus images for an engine that takes them.
+        const declared: abi.Caps = blk: {
+            var c = caps;
+            c.images = media != .none;
+            break :blk c;
+        };
+        /// The atom it announces; empty when it takes no image or announces none.
+        const atom: abi.Str = if (media == .images and flaw != .images_without_atom) abi.Str.of(image_atom) else .{};
+        /// An engine that expands images itself tokenizes the atom for the host.
+        const expands_images = media == .images;
+
         pub const engine: abi.Engine = .{
             .probe = probe,
             .load_bytes = loadBytes,
@@ -66,11 +95,11 @@ pub fn Fake(comptime threading: abi.Threading, comptime flaw: Flaw) type {
             .memory = memory,
             .report_json = null,
             .trim = null,
-            .media_rows = null,
+            .media_rows = if (media == .rows or flaw == .stray_media_rows) mediaRows else null,
             .embed = null,
             .decide = null,
-            .tokenize = null,
-            .token_bytes = null,
+            .tokenize = if (expands_images and flaw != .images_without_tokenizer) tokenize else null,
+            .token_bytes = if (expands_images and flaw != .images_without_token_bytes) tokenBytes else null,
             .chat_template = null,
             .render = null,
         };
@@ -131,6 +160,31 @@ pub fn Fake(comptime threading: abi.Threading, comptime flaw: Flaw) type {
             return .{};
         }
 
+        /// The row-count callback: the callback route's entry point, and the stray-callback flaw's.
+        fn mediaRows(_: *anyopaque, _: *const abi.Media) callconv(.c) u32 {
+            return 1;
+        }
+
+        /// One id per byte, 1000 + b: a functional tokenizer, so the host's atom route can run.
+        fn tokenize(_: *anyopaque, text: abi.Str, _: bool, out: [*]u32, cap: usize) callconv(.c) usize {
+            const t = abi.items(u8, text);
+            for (t[0..@min(t.len, cap)], 0..) |b, i| out[i] = first_count + b;
+            return t.len;
+        }
+
+        const byte_table = blk: {
+            var t: [256]u8 = undefined;
+            for (&t, 0..) |*x, i| x.* = @intCast(i);
+            break :blk t;
+        };
+
+        /// Each id's bytes, engine-owned and stable: 1000 + b is byte b.
+        fn tokenBytes(_: *anyopaque, token: u32) callconv(.c) abi.Str {
+            if (token < first_count or token >= first_count + byte_table.len) return .{};
+            const i: usize = @intCast(token - first_count);
+            return abi.span(u8, byte_table[i..][0..1]);
+        }
+
         fn open(o: *const abi.Open, info: *abi.Info, out: *abi.Verdict) callconv(.c) ?*anyopaque {
             const st = gpa.create(State) catch {
                 out.* = .{ .code = .failed, .why = abi.span(u8, "out of memory") };
@@ -152,13 +206,14 @@ pub fn Fake(comptime threading: abi.Threading, comptime flaw: Flaw) type {
             info.* = .{
                 .name = abi.span(u8, "fake"),
                 .version = abi.span(u8, "1"),
-                .caps = caps,
+                .caps = declared,
                 .threading = threading,
                 .context_window = 4096,
                 .max_concurrent = max_concurrent,
                 .embedding_dims = 0,
                 .eos = abi.span(u32, &eos),
                 .startup = abi.span(u8, "fake engine: no model, no GPU"),
+                .image_placeholder = atom,
             };
             return st;
         }
@@ -187,7 +242,7 @@ pub fn Fake(comptime threading: abi.Threading, comptime flaw: Flaw) type {
 
         fn submit(e: *anyopaque, id: u64, r: *const abi.Request, sink: abi.Sink) callconv(.c) abi.Verdict {
             const st: *State = @ptrCast(@alignCast(e));
-            if (flaw != .accepts_undeclared) if (abi.refusal(caps, abi.needs(r))) |v| return v;
+            if (flaw != .accepts_undeclared) if (abi.refusal(declared, abi.needs(r))) |v| return v;
             const req = gpa.create(Req) catch return .{ .code = .failed, .why = abi.span(u8, "out of memory") };
             const drafts = !r.no_drafts or flaw == .ignores_no_drafts;
             req.* = .{ .id = id, .prompt = &.{}, .eos = &.{}, .max_tokens = r.max_tokens, .logprobs = r.logprobs, .drafts = drafts, .sink = sink };
@@ -362,18 +417,32 @@ test "fake engine: the host-GPU-thread table passes the contract" {
     try contract.run(&host_gpu_thread, fixture);
 }
 
+test "fake engine: an engine that expands images itself passes the contract" {
+    // The atom route: the capability, the atom, a tokenizer, and no row-count callback.
+    try contract.run(&own_thread_images, fixture);
+    try contract.run(&host_gpu_thread_images, fixture);
+}
+
+test "fake engine: an engine that counts its image rows through the callback passes the contract" {
+    try contract.run(&own_thread_rows, fixture);
+}
+
 test "fake engine: the contract catches every planted flaw, by name, in both threading modes" {
     const cases = .{
-        .{ Flaw.double_finished, error.EventAfterFinished },
-        .{ Flaw.ignores_stop, error.StopIgnored },
-        .{ Flaw.overshoots_max_tokens, error.MaxTokensExceeded },
-        .{ Flaw.accepts_undeclared, error.UndeclaredCapAccepted },
-        .{ Flaw.locks_across_sink, error.StatusBlocked },
-        .{ Flaw.drops_on_close, error.CloseDroppedFinished },
+        .{ Flaw.double_finished, error.EventAfterFinished, Media.none },
+        .{ Flaw.ignores_stop, error.StopIgnored, Media.none },
+        .{ Flaw.overshoots_max_tokens, error.MaxTokensExceeded, Media.none },
+        .{ Flaw.accepts_undeclared, error.UndeclaredCapAccepted, Media.none },
+        .{ Flaw.locks_across_sink, error.StatusBlocked, Media.none },
+        .{ Flaw.drops_on_close, error.CloseDroppedFinished, Media.none },
+        .{ Flaw.images_without_atom, error.CapsEntryMismatch, Media.images },
+        .{ Flaw.images_without_tokenizer, error.CapsEntryMismatch, Media.images },
+        .{ Flaw.images_without_token_bytes, error.CapsEntryMismatch, Media.images },
+        .{ Flaw.stray_media_rows, error.CapsEntryMismatch, Media.none },
     };
     inline for (.{ abi.Threading.own_thread, abi.Threading.host_gpu_thread }) |mode| {
         inline for (cases) |c| {
-            const broken = Fake(mode, c[0]).engine;
+            const broken = Fake(mode, c[0], c[2]).engine;
             try std.testing.expectError(c[1], contract.run(&broken, fixture));
         }
     }
@@ -413,7 +482,7 @@ test "fake engine: the exactness check catches every planted break, by name, in 
     inline for (.{ abi.Threading.own_thread, abi.Threading.host_gpu_thread }) |mode| {
         inline for (cases) |c| {
             wipeDisk();
-            const broken = Fake(mode, c[0]).engine;
+            const broken = Fake(mode, c[0], .none).engine;
             try std.testing.expectError(c[1], exactness.expect(&broken, exact_fixture, all));
         }
     }
@@ -421,7 +490,7 @@ test "fake engine: the exactness check catches every planted break, by name, in 
 
 test "conformance: only the contracts a plugin declares run on the engine serving it" {
     defer wipeDisk();
-    const drifts = Fake(.host_gpu_thread, .concurrent_drifts).engine;
+    const drifts = Fake(.host_gpu_thread, .concurrent_drifts, .none).engine;
     try conformance.expectExactness(&drifts, exact_fixture, .{ .exact_drafted = true, .exact_resumed = true });
     try std.testing.expectError(error.ConcurrentDiffers, conformance.expectExactness(&drifts, exact_fixture, .{ .exact_concurrent = true }));
 }

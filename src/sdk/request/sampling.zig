@@ -19,6 +19,8 @@ pub const SamplingParams = struct {
     /// OpenAI's `logit_bias`, owned by the request handler. Served by an engine that declares `Caps.logit_bias`.
     logit_bias: []const Bias = &.{},
     seed: ?u64 = null,
+    /// Ignore both configured and engine-reported EOS; stop strings remain active.
+    ignore_eos: bool = false,
     /// Draw index under `seed`: every sample takes a fresh key.
     draw: u64 = 0,
     /// When non-null, generation is constrained to outputs that satisfy the

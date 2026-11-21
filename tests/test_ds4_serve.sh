@@ -47,7 +47,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[ok] booting ds4 server on port $PORT (gguf: $(basename "$GGUF"))"
-"$BINARY" --model "$GGUF" --serve --port "$PORT" --max-tokens 32 >/tmp/test_ds4_serve.log 2>&1 &
+"$BINARY" --model "$GGUF" --serve --port "$PORT" --max-tokens 32 --prefix-cache-disk 2GB >/tmp/test_ds4_serve.log 2>&1 &
 SERVER_PID=$!
 
 # Wait for /health to flip green (engine open takes a few seconds).
@@ -72,9 +72,15 @@ fi
 
 # Non-streaming chat completion.
 echo "[ok] POST /v1/chat/completions (non-streaming)"
+CACHE_BODY=$(python3 - <<'PY'
+import json
+prompt = 'Describe how a shared memory pool serves the CPU and GPU. ' * 80
+print(json.dumps({'model': 'mlx-serve', 'messages': [{'role': 'user', 'content': prompt}], 'max_tokens': 32, 'temperature': 0}))
+PY
+)
 RESP=$(curl -sf -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
     -H 'Content-Type: application/json' \
-    -d '{"model":"mlx-serve","messages":[{"role":"user","content":"Write a haiku about Apple Silicon GPUs."}],"max_tokens":32,"temperature":0.0}')
+    -d "$CACHE_BODY")
 
 CONTENT=$(printf '%s' "$RESP" | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r["choices"][0]["message"]["content"])' 2>/dev/null || true)
 
@@ -102,7 +108,7 @@ echo "----"
 echo "[ok] POST /v1/chat/completions (repeat, expects cached prefix)"
 RESP2=$(curl -sf -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
     -H 'Content-Type: application/json' \
-    -d '{"model":"mlx-serve","messages":[{"role":"user","content":"Write a haiku about Apple Silicon GPUs."}],"max_tokens":32,"temperature":0.0}')
+    -d "$CACHE_BODY")
 CACHED=$(printf '%s' "$RESP2" | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r["usage"]["prompt_tokens_details"]["cached_tokens"])' 2>/dev/null || echo 0)
 if (( CACHED < 1 )); then
     echo "[fail] repeated prompt reported cached_tokens=$CACHED (persistent session not reused)"

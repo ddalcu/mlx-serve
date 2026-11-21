@@ -225,9 +225,11 @@ pub fn firstMtpGgufIn(io: std.Io, allocator: std.mem.Allocator, dir_path: []cons
     return firstGgufIn(io, allocator, dir_path, skip, isMtpGgufBasename);
 }
 
-/// True for a vision tower GGUF shipped beside a language model: an `mmproj-*` file, or ds4's `*-Vision.gguf`
+/// True for a vision tower GGUF shipped beside a language model: an `mmproj-*` file, or ds4's `*-Vision[-Encoder].gguf`
 /// (a suffix only: `Llama-3.2-11B-Vision-Instruct-Q4_K_M.gguf` is a model).
 pub fn isVisionGgufBasename(basename: []const u8) bool {
+    const encoder_tail = "-vision-encoder.gguf";
+    if (basename.len >= encoder_tail.len and std.ascii.eqlIgnoreCase(basename[basename.len - encoder_tail.len ..], encoder_tail)) return true;
     const tail = "-vision.gguf";
     return isMmprojGgufBasename(basename) or
         (basename.len >= tail.len and std.ascii.eqlIgnoreCase(basename[basename.len - tail.len ..], tail));
@@ -291,6 +293,7 @@ test "a vision tower GGUF is a sidecar, never the model, and is found beside it"
     const io = std.testing.io;
     const a = std.testing.allocator;
     try std.testing.expect(isGgufSidecarBasename("DeepSeek-V4.1-Flash-1017-Vision.gguf") and isVisionGgufBasename("mmproj-gemma-4-E4B-it-BF16.gguf"));
+    try std.testing.expect(isVisionGgufBasename("GLM-5.3-Flash-Vision-Encoder.gguf"));
     try std.testing.expect(!isGgufSidecarBasename("Llama-3.2-11B-Vision-Instruct-Q4_K_M.gguf"));
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();

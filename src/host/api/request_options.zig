@@ -134,7 +134,18 @@ pub fn dsv4DraftStages(lm: *LoadedModel) bool {
 /// the bare conjunct silently killed the flag for dsv4 at submit while the
 /// default/dispatch layers were correct (the per-surface wiring class).
 pub fn mtpCapable(lm: *LoadedModel) bool {
+    if (lm.engine) |e| return e.caps().drafts;
     return lm.mtp != null or dsv4DraftStages(lm);
+}
+
+test "mtpCapable: an external engine reports its own ready drafts" {
+    var engine: @import("../engines/served.zig").Served = undefined;
+    engine.info = .{ .name = .{}, .version = .{}, .caps = .{}, .threading = .own_thread, .context_window = 4096, .max_concurrent = 1, .embedding_dims = 0, .eos = .{}, .startup = .{} };
+    var lm: LoadedModel = undefined;
+    lm.engine = &engine;
+    try testing.expect(!mtpCapable(&lm));
+    engine.info.caps.drafts = true;
+    try testing.expect(mtpCapable(&lm));
 }
 
 /// `--max-mtp-ctx` admission: MTP is refused past the operator's context ceiling. Called once

@@ -42,7 +42,22 @@ pub const TextGenTarget = struct {
 /// house). Older and tool-result media are dropped from the render instead
 /// (`dropMedia`), so a session that switched models, or an agent's image read,
 /// does not wedge every later turn.
-pub fn mediaRejectReason(messages: []const chat_mod.Message, continue_final: bool) ?[]const u8 {
+pub const MediaSupport = struct {
+    images: bool = false,
+    video: bool = false,
+    audio: bool = false,
+};
+
+pub fn mediaSupportOf(lm: *const LoadedModel) MediaSupport {
+    if (lm.engine) |e| {
+        const caps = e.caps();
+        return .{ .images = caps.images, .video = caps.video, .audio = caps.audio };
+    }
+    const tower = lm.vision_encoder != null;
+    return .{ .images = tower, .video = tower, .audio = tower };
+}
+
+pub fn mediaRejectReason(messages: []const chat_mod.Message, continue_final: bool, support: MediaSupport) ?[]const u8 {
     var i = messages.len;
     // A continuation's trailing assistant prefix belongs to the latest turn.
     if (continue_final and i > 0) i -= 1;
@@ -51,20 +66,23 @@ pub fn mediaRejectReason(messages: []const chat_mod.Message, continue_final: boo
         const m = messages[i];
         if (std.mem.eql(u8, m.role, "assistant")) break;
         if (!std.mem.eql(u8, m.role, "user")) continue;
-        if (m.images != null or m.videos != null) return "This model is serving without its vision tower (--no-vision, no vision weights, or on the Neural Engine); image/video content is not supported";
-        if (m.audio != null) return "This model is serving without its audio embedder; input_audio content is not supported";
+        if ((m.images != null and !support.images) or (m.videos != null and !support.video)) return "This model is serving without a vision tower or projector for this input (--no-vision or no matching vision weights); image/video content is not supported";
+        if (m.audio != null and !support.audio) return "This model is serving without its audio embedder; input_audio content is not supported";
     }
     return null;
 }
 
-const MEDIA_DROPPED_NOTE = "[attachment omitted: this model cannot see images, video or audio]";
+const MEDIA_DROPPED_NOTE = "[attachment omitted: this model does not support this media type]";
 
 /// Strip media the model cannot read, leaving a note where it was so an agent
 /// whose read returned an image learns the model never saw it. The rewritten
 /// content is appended to `owned`.
-pub fn dropMedia(allocator: std.mem.Allocator, messages: []chat_mod.Message, owned: *std.ArrayList([]const u8)) !void {
+pub fn dropMedia(allocator: std.mem.Allocator, messages: []chat_mod.Message, owned: *std.ArrayList([]const u8), support: MediaSupport) !void {
     for (messages) |*m| {
-        if (!chat_mod.messageHasMedia(m.*)) continue;
+        const images = m.images != null and !support.images;
+        const videos = m.videos != null and !support.video;
+        const audio = m.audio != null and !support.audio;
+        if (!images and !videos and !audio) continue;
         const text = if (m.content.len > 0)
             try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ m.content, MEDIA_DROPPED_NOTE })
         else
@@ -74,9 +92,9 @@ pub fn dropMedia(allocator: std.mem.Allocator, messages: []chat_mod.Message, own
             return err;
         };
         m.content = text;
-        m.images = null;
-        m.videos = null;
-        m.audio = null;
+        if (images) m.images = null;
+        if (videos) m.videos = null;
+        if (audio) m.audio = null;
     }
 }
 
@@ -166,16 +184,16 @@ test "textGenTargetOf: reads config unless the entry is mid-load" {
 test "mediaRejectReason: media on a tower-less model is refused by name, text passes" {
     const t = std.testing;
     const text = [_]chat_mod.Message{.{ .role = "user", .content = "hi" }};
-    try t.expect(mediaRejectReason(&text, false) == null);
+    try t.expect(mediaRejectReason(&text, false, .{}) == null);
     const img = [_]chat_mod.Message{ .{ .role = "user", .content = "hi" }, .{ .role = "user", .content = "look", .images = &[_]chat_mod.ImageData{} } };
-    try t.expect(std.mem.indexOf(u8, mediaRejectReason(&img, false).?, "vision tower") != null);
+    try t.expect(std.mem.indexOf(u8, mediaRejectReason(&img, false, .{}).?, "vision tower") != null);
     const aud = [_]chat_mod.Message{.{ .role = "user", .content = "listen", .audio = &[_]chat_mod.AudioData{} }};
-    try t.expect(std.mem.indexOf(u8, mediaRejectReason(&aud, false).?, "audio") != null);
+    try t.expect(std.mem.indexOf(u8, mediaRejectReason(&aud, false, .{}).?, "audio") != null);
     const history = [_]chat_mod.Message{ img[1], .{ .role = "assistant", .content = "a house" }, .{ .role = "user", .content = "thanks" } };
-    try t.expect(mediaRejectReason(&history, false) == null);
+    try t.expect(mediaRejectReason(&history, false, .{}) == null);
     // A continuation's trailing assistant prefix is not the turn boundary.
     const prefill = [_]chat_mod.Message{ img[1], .{ .role = "assistant", .content = "It shows" } };
-    try t.expect(mediaRejectReason(&prefill, true) != null);
+    try t.expect(mediaRejectReason(&prefill, true, .{}) != null);
 }
 
 test "imageUrlOfPart: the object and bare-string shapes name the URL, any other shape is refused" {
@@ -207,10 +225,51 @@ test "dropMedia tells the model an attachment it cannot see was there" {
         .{ .role = "tool", .content = "Read image file [image/png]", .images = &imgs },
         .{ .role = "user", .content = "next" },
     };
-    try dropMedia(std.testing.allocator, &msgs, &owned);
+    try dropMedia(std.testing.allocator, &msgs, &owned, .{});
     try std.testing.expect(msgs[0].images == null);
     try std.testing.expectEqualStrings("Read image file [image/png]\n" ++ MEDIA_DROPPED_NOTE, msgs[0].content);
     try std.testing.expectEqualStrings("next", msgs[1].content);
+}
+
+test "engine image transport gate keeps supported images and rejects unsupported audio and video" {
+    const a = std.testing.allocator;
+    const Served = @import("../engines/served.zig").Served;
+    var engine: Served = undefined;
+    engine.info = std.mem.zeroes(@import("../../abi/engine.zig").Info);
+    engine.info.caps.images = true;
+    var lm: LoadedModel = undefined;
+    lm.engine = &engine;
+    lm.vision_encoder = null;
+    const support = mediaSupportOf(&lm);
+    const images = [_]chat_mod.ImageData{.{ .pixels = &.{ 1, 2, 3 }, .width = 1, .height = 1 }};
+    const audio = [_]chat_mod.AudioData{.{ .samples = &.{} }};
+    const videos = [_]chat_mod.VideoData{.{ .pixels = &.{}, .grid_t = 1, .grid_h = 1, .grid_w = 1 }};
+    var msgs = [_]chat_mod.Message{.{ .role = "user", .content = "look", .images = &images }};
+    try expectMediaReason(support, &msgs, false, null);
+    msgs[0].audio = &audio;
+    try expectMediaReason(support, &msgs, false, "audio");
+    msgs[0].audio = null;
+    msgs[0].videos = &videos;
+    try expectMediaReason(support, &msgs, false, "video");
+    msgs[0].role = "tool";
+    var owned: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (owned.items) |s| a.free(s);
+        owned.deinit(a);
+    }
+    try dropMedia(a, &msgs, &owned, support);
+    try std.testing.expect(msgs[0].images != null);
+    try std.testing.expect(msgs[0].videos == null);
+    try std.testing.expect(std.mem.indexOf(u8, msgs[0].content, "attachment omitted") != null);
+    engine.info.caps.images = false;
+    try expectMediaReason(mediaSupportOf(&lm), &.{.{ .role = "user", .content = "look", .images = &images }}, false, "vision tower");
+}
+
+fn expectMediaReason(support: MediaSupport, messages: []const chat_mod.Message, continue_final: bool, contains: ?[]const u8) !void {
+    const reason = mediaRejectReason(messages, continue_final, support);
+    if (contains) |text| {
+        try std.testing.expect(std.mem.indexOf(u8, reason orelse return error.TestUnexpectedNull, text) != null);
+    } else try std.testing.expect(reason == null);
 }
 
 test "textGenRejectReason: media + encoder models rejected, chat models pass (SIGSEGV class 2026-07-06)" {

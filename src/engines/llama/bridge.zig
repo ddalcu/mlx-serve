@@ -31,7 +31,37 @@ pub const Error = error{
     SessionSyncFailed,
     SessionEvalFailed,
     TokenizeFailed,
+    VisionAttachFailed,
+    MediaSyncFailed,
+    MediaRefused,
     OutOfMemory,
+};
+
+/// Why a multimodal prompt was refused before it reached the model.
+pub const MediaError = error{
+    /// The prompt is longer than the shim can index.
+    PromptTooLong,
+    /// The media marker is empty.
+    MarkerMissing,
+    /// The prompt holds a media marker no image owns.
+    MarkerOrphan,
+    /// The images and the prompt's markers do not match one to one.
+    ImageCountMismatch,
+    /// An image does not sit at its media marker.
+    ImageNotAtMarker,
+    /// An image's size and its pixels disagree.
+    ImageSizeMismatch,
+};
+
+/// One image of a multimodal prompt: where its media marker sits in the
+/// prompt and the pixels it holds.
+pub const Image = struct {
+    /// The token index where the media marker's first token sits in the prompt.
+    at: u32,
+    width: u32,
+    height: u32,
+    /// RGB8 pixels, `width * height * 3` bytes.
+    pixels: []const u8,
 };
 
 pub const OpenOptions = struct {
@@ -111,6 +141,31 @@ pub const LlamaEngine = struct {
     /// An MTP head is loaded (the sidecar, or the trunk's own heads).
     pub fn hasMtp(self: *LlamaEngine) bool {
         return ffi.mlx_llama_has_mtp(self.handle);
+    }
+
+    /// Attach a vision projector (an mmproj GGUF): the text model keeps
+    /// decoding, the projector turns images into the embeddings it reads.
+    pub fn attachVision(self: *LlamaEngine, path: []const u8) Error!void {
+        const path_z = self.allocator.dupeSentinel(u8, path, 0) catch return Error.OutOfMemory;
+        defer self.allocator.free(path_z);
+        var err_buf: [256]u8 = undefined;
+        err_buf[0] = 0;
+        if (ffi.mlx_llama_attach_vision(self.handle, path_z.ptr, &err_buf, err_buf.len) != 0) {
+            log.err("[llama] vision projector failed: {s} ({s})\n", .{ std.mem.sliceTo(&err_buf, 0), path });
+            return Error.VisionAttachFailed;
+        }
+        log.info("[llama] vision projector ready ({s})\n", .{path});
+    }
+
+    /// A vision projector is attached and it takes images.
+    pub fn hasVision(self: *LlamaEngine) bool {
+        return ffi.mlx_llama_has_vision(self.handle);
+    }
+
+    /// The media marker a multimodal prompt must carry. Borrowed, static.
+    pub fn imageMarker(self: *LlamaEngine) []const u8 {
+        const raw = ffi.mlx_llama_media_marker(self.handle) orelse return "";
+        return std.mem.sliceTo(raw, 0);
     }
 
     /// Tokenize free-form text. `add_special` controls BOS/special insertion.
@@ -275,6 +330,50 @@ pub fn commonPrefixLen(a: []const i32, b: []const i32) usize {
     return i;
 }
 
+/// True when the prompt's media marker starts at `pos`.
+fn markerStartsAt(prompt: []const i32, pos: usize, marker: []const i32) bool {
+    if (pos + marker.len > prompt.len) return false;
+    for (marker, 0..) |m, i| if (prompt[pos + i] != m) return false;
+    return true;
+}
+
+/// Check that the prompt's media markers and the images match one to one, in
+/// order, and that every image carries the pixels its size says.
+///
+/// Pure, so it is unit-tested without a model. The shim trusts it and only
+/// re-checks the bounds it needs to stay inside the prompt.
+pub fn validateMedia(prompt: []const i32, images: []const Image, marker: []const i32) MediaError!void {
+    if (prompt.len > @as(usize, std.math.maxInt(i32))) return error.PromptTooLong;
+    if (marker.len == 0) return error.MarkerMissing;
+    if (marker.len > @as(usize, std.math.maxInt(i32))) return error.PromptTooLong;
+    if (images.len == 0) return error.ImageCountMismatch;
+    for (images) |img| {
+        if (img.width == 0 or img.height == 0) return error.ImageSizeMismatch;
+        const px = std.math.mul(u64, img.width, img.height) catch return error.ImageSizeMismatch;
+        const bytes = std.math.mul(u64, px, 3) catch return error.ImageSizeMismatch;
+        if (bytes != @as(u64, img.pixels.len)) return error.ImageSizeMismatch;
+    }
+    var img: usize = 0;
+    var pos: usize = 0;
+    while (pos < prompt.len) {
+        if (!markerStartsAt(prompt, pos, marker)) {
+            pos += 1;
+            continue;
+        }
+        if (img >= images.len) return error.MarkerOrphan;
+        if (@as(usize, images[img].at) != pos) return error.ImageNotAtMarker;
+        img += 1;
+        pos += marker.len;
+    }
+    if (img != images.len) return error.ImageCountMismatch;
+}
+
+/// The shim's cancellation callback: the request's cancel flag.
+fn mediaCancelled(ud: ?*anyopaque) callconv(.c) bool {
+    const flag: *const std.atomic.Value(bool) = @ptrCast(@alignCast(ud.?));
+    return flag.load(.acquire);
+}
+
 /// One llama_context holding `seqs.len` sequences. Single-threaded: only the
 /// inference thread calls in.
 pub const LlamaContext = struct {
@@ -333,6 +432,9 @@ pub const LlamaSeq = struct {
     last_used_ns: i64 = 0,
     /// A request is decoding on this sequence. Guarded by the scheduler's queue lock.
     busy: bool = false,
+    /// The sequence's KV holds image embeddings: no token prefix can reproduce
+    /// it, so the next text prompt starts cold.
+    has_media: bool = false,
 
     pub fn pos(self: *LlamaSeq) i32 {
         return ffi.mlx_llama_seq_pos(self.ctx.handle, self.id);
@@ -346,6 +448,9 @@ pub const LlamaSeq = struct {
     /// exist for sampling — even when the whole prompt is already resident we
     /// back off one position.
     pub fn sync(self: *LlamaSeq, prompt_ids: []const i32) Error!i32 {
+        // A sequence that held images cannot serve a text prompt from its KV:
+        // the images' embeddings sit in it and no token prefix reproduces them.
+        if (self.has_media) self.reset();
         var common = commonPrefixLen(self.resident.items, prompt_ids);
         if (common == prompt_ids.len and common > 0) common -= 1;
 
@@ -376,6 +481,74 @@ pub const LlamaSeq = struct {
     pub fn reset(self: *LlamaSeq) void {
         ffi.mlx_llama_seq_reset(self.ctx.handle, self.id);
         self.resident.clearRetainingCapacity();
+        self.has_media = false;
+    }
+
+    /// Cold-prefill `prompt` and its images into this sequence.
+    ///
+    /// The prompt's token ids are decoded as they are (no detokenize, no
+    /// retokenize); each image's media marker is replaced by the model's own
+    /// vision tokens, which the projector encodes into the embeddings the text
+    /// model reads.
+    ///
+    /// Returns the expanded prompt length: the KV cells the prompt took (the
+    /// text plus the images' patches). `max_tokens` is reduced to the remaining sequence capacity.
+    ///
+    /// The sequence is reset first: a multimodal prompt is never served from a
+    /// prefix, and the next text prompt on this sequence starts cold too.
+    pub fn syncImages(
+        self: *LlamaSeq,
+        prompt: []const i32,
+        images: []const Image,
+        marker: []const i32,
+        cancel: *const std.atomic.Value(bool),
+        max_tokens: *u32,
+    ) Error!u32 {
+        validateMedia(prompt, images, marker) catch |err| {
+            log.err("[llama] media prompt refused: {s}\n", .{@errorName(err)});
+            return Error.MediaSyncFailed;
+        };
+        var list: std.ArrayList(ffi.Image) = .empty;
+        defer list.deinit(self.ctx.allocator);
+        for (images) |img| {
+            list.append(self.ctx.allocator, .{
+                .at = @intCast(img.at),
+                .width = img.width,
+                .height = img.height,
+                .pixels = img.pixels.ptr,
+            }) catch return Error.OutOfMemory;
+        }
+
+        // Cold prefill: the images' embeddings cannot be reproduced by a token prefix.
+        self.reset();
+
+        var expanded: u32 = 0;
+        var err_buf: [256]u8 = undefined;
+        err_buf[0] = 0;
+        const rc = ffi.mlx_llama_seq_sync_images(
+            self.ctx.handle,
+            self.id,
+            prompt.ptr,
+            @intCast(prompt.len),
+            list.items.ptr,
+            @intCast(list.items.len),
+            marker.ptr,
+            @intCast(marker.len),
+            max_tokens,
+            &expanded,
+            mediaCancelled,
+            @ptrCast(@constCast(cancel)),
+            &err_buf,
+            err_buf.len,
+        );
+        if (rc != 0) {
+            log.err("[llama] media prefill failed: {s}\n", .{std.mem.sliceTo(&err_buf, 0)});
+            // The shim left the sequence cleared; the mirror follows it.
+            self.reset();
+            return if (rc == -2) Error.MediaRefused else Error.MediaSyncFailed;
+        }
+        self.has_media = true;
+        return expanded;
     }
 
     /// `sync` with a one-shot defense against libllama transients (the
@@ -571,6 +744,53 @@ test "llama: syncWithFallback matches sync on the happy path" {
     fb.reset();
     try std.testing.expectEqual(@as(usize, 0), fb.resident.items.len);
     try std.testing.expectEqual(@as(i32, 0), try fb.syncWithFallback(a));
+}
+
+// A multimodal prompt's media markers and its images must match one to one:
+// the shim splits the prompt at the markers, so a marker no image owns (or an
+// image that does not sit at its marker) would decode the wrong pixels.
+test "llama: a multimodal prompt's markers and images must match one to one" {
+    const marker = [_]i32{ 90, 91 };
+    const prompt = [_]i32{ 1, 2, 90, 91, 3, 90, 91, 4 };
+    const pixels = [_]u8{ 1, 2, 3, 4, 5, 6 }; // 2x1 RGB
+    const two = [_]Image{
+        .{ .at = 2, .width = 2, .height = 1, .pixels = &pixels },
+        .{ .at = 5, .width = 2, .height = 1, .pixels = &pixels },
+    };
+    try std.testing.expectError(error.MarkerMissing, validateMedia(&prompt, two[0..], &[_]i32{}));
+    try std.testing.expectError(error.ImageCountMismatch, validateMedia(&prompt, &[_]Image{}, &marker));
+    // The second marker has no image.
+    try std.testing.expectError(error.MarkerOrphan, validateMedia(&prompt, two[0..1], &marker));
+    // The second image does not sit at its marker.
+    const misplaced = [_]Image{ two[0], .{ .at = 6, .width = 2, .height = 1, .pixels = &pixels } };
+    try std.testing.expectError(error.ImageNotAtMarker, validateMedia(&prompt, misplaced[0..], &marker));
+    // The images are in the wrong order.
+    const swapped = [_]Image{ two[1], two[0] };
+    try std.testing.expectError(error.ImageNotAtMarker, validateMedia(&prompt, swapped[0..], &marker));
+    // The pixels do not match the size.
+    const short = [_]Image{.{ .at = 2, .width = 2, .height = 1, .pixels = &[_]u8{ 1, 2, 3 } }};
+    try std.testing.expectError(error.ImageSizeMismatch, validateMedia(&prompt, short[0..], &marker));
+    const empty = [_]Image{.{ .at = 2, .width = 0, .height = 1, .pixels = &pixels }};
+    try std.testing.expectError(error.ImageSizeMismatch, validateMedia(&prompt, empty[0..], &marker));
+    // A size whose pixel count would overflow.
+    const huge = [_]Image{.{ .at = 2, .width = std.math.maxInt(u32), .height = std.math.maxInt(u32), .pixels = &pixels }};
+    try std.testing.expectError(error.ImageSizeMismatch, validateMedia(&prompt, huge[0..], &marker));
+    // A prompt without the marker has no image to give.
+    try std.testing.expectError(error.ImageCountMismatch, validateMedia(prompt[0..2], two[0..1], &marker));
+    try validateMedia(&prompt, two[0..], &marker);
+}
+
+test "llama: a single-token media marker is found in the prompt" {
+    const marker = [_]i32{77};
+    const prompt = [_]i32{ 1, 77, 2, 77, 3 };
+    const pixels = [_]u8{ 9, 9, 9 };
+    const one = [_]Image{.{ .at = 1, .width = 1, .height = 1, .pixels = &pixels }};
+    try std.testing.expectError(error.MarkerOrphan, validateMedia(&prompt, one[0..], &marker));
+    const two = [_]Image{
+        .{ .at = 1, .width = 1, .height = 1, .pixels = &pixels },
+        .{ .at = 3, .width = 1, .height = 1, .pixels = &pixels },
+    };
+    try validateMedia(&prompt, two[0..], &marker);
 }
 
 test "commonPrefixLen: shared prefix, divergence, and bounds" {

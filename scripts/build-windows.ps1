@@ -44,6 +44,6 @@ New-Item -ItemType Directory -Force $pkg | Out-Null
 Copy-Item zig-out\bin\mlx-serve.exe, lib\mlx-win\bin\*.dll, LICENSE, LICENSE-APACHE-2.0, NOTICE $pkg
 Copy-Item -Recurse lib\mlx-win\include "$pkg\include"
 $llama = "lib\llama-win\bin"
-Copy-Item "$llama\llama.dll", "$llama\ggml.dll", "$llama\ggml-base.dll", "$llama\ggml-cuda.dll", "$llama\ggml-cpu-*.dll", "$llama\libomp.dll" $pkg
+Copy-Item "$llama\llama.dll", "$llama\mtmd.dll", "$llama\ggml.dll", "$llama\ggml-base.dll", "$llama\ggml-cuda.dll", "$llama\ggml-cpu-*.dll", "$llama\libomp.dll" $pkg
 Compress-Archive -Force -Path "$pkg\*" -DestinationPath "$pkg.zip"
 Write-Host "== built $pkg.zip"
