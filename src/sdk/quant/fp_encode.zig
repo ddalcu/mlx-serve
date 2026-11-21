@@ -69,6 +69,47 @@ test "fp encode: e4m3 encode is MLX's to_fp8 on every float32 bit pattern" {
     }
 }
 
+test "fp encode: mx_scale_round_up's bit form and clip's clamp are MLX's steps on every float32 bit pattern" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    // y = 1 where ours differs from MLX's own steps (fp8.h's round of log2 and bump; minimum(maximum(a, lo), hi)).
+    const src =
+        \\const uint i = thread_position_in_grid.x;
+        \\const float x = x_in[i];
+        \\uint e = mlxserve_fp8_e8m0_bits(x);
+        \\if (e < 0xFEu && mlxserve_fp4_e8m0(e) < x) e += 1u;
+        \\bool bad = as_type<uint>(mlxserve_mx_scale_round_up(x)) != as_type<uint>(mlxserve_fp4_e8m0(e));
+        \\bad = bad || as_type<uint>(mlxserve_clip(x, -448.0f, 448.0f)) != as_type<uint>(mlxserve_minimum(mlxserve_maximum(x, -448.0f), 448.0f));
+        \\bad = bad || as_type<uint>(mlxserve_clip(x, -6.0f, 6.0f)) != as_type<uint>(mlxserve_minimum(mlxserve_maximum(x, -6.0f), 6.0f));
+        \\y[i] = uchar(bad);
+        \\
+    ;
+    const chunk: u64 = 1 << 26;
+    var base: u64 = 0;
+    while (base < 1 << 32) : (base += chunk) {
+        var bits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bits);
+        try mlx.check(mlx.mlx_arange(&bits, @floatFromInt(base), @floatFromInt(base + chunk), 1, .uint32, s));
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_view(&x, bits, .float32, s));
+        var ours: [1]mlx.mlx_array = undefined;
+        try run("mlxserve_fp_encode_scale_clip", &.{"x_in"}, &.{x}, &.{"y"}, &.{@intCast(chunk)}, src, @intCast(chunk), 256, 32, &ours);
+        defer _ = mlx.mlx_array_free(ours[0]);
+        var same = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(same);
+        try mlx.check(mlx.mlx_logical_not(&same, ours[0], s));
+        var all = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(all);
+        try mlx.check(mlx.mlx_all(&all, same, false, s));
+        try mlx.check(mlx.mlx_array_eval(all));
+        var ok: bool = false;
+        try mlx.check(mlx.mlx_array_item_bool(&ok, all));
+        if (!ok) std.debug.print("scale or clip differs from MLX's steps in bit patterns [0x{x}, 0x{x})\n", .{ base, base + chunk });
+        try std.testing.expect(ok);
+    }
+}
+
 /// MLX's fp_quantize (fp_quantized.h) on our encoders: the block max over the simdgroup (16-lane halves for NVFP4),
 /// over 6, the e8m0 scale rounded up (MXFP4) or the e4m3 one (NVFP4), each value times the scale's inverse to e2m1.
 const quantize_src =
