@@ -18,12 +18,12 @@ Each shard is an APFS clone of NVIDIA's (`cp -c`: no data copied) whose header i
 length (padded with spaces), so every tensor keeps its offsets; a shard with no change is a symlink. The index is
 written new. Runs on the box that holds the pack, never on a laptop:
 
-    python3 -I dsv41_nvfp4_pack.py SRC_DIR DST_DIR [--check] [--experts-mxfp4 | --experts-nvfp4]
+    python3 -I dsv41_nvfp4_pack.py SRC_DIR DST_DIR [--check] [--experts-mxfp4]
 
 `--check` re-reads DST and proves each converted tensor against SRC (codes byte for byte, every row scale against its
 block).
 
-`--experts-nvfp4` keeps the NVFP4 routed experts as MLX nvfp4 at group 16 in place (headers only, like the rest): the
+By default the NVFP4 routed experts stay MLX nvfp4 at group 16 in place (headers only, like the rest): the
 codes as U32 [out, in/8], `weight_scale` renamed `<base>.scales` (U8 e4m3 bytes, [out, in/16]). ModelOpt's per-expert
 global (`weight_scale_2`, F32, one an expert and projection) leaves the shard header and joins one side shard
 (`model-expert-scales.safetensors`) as BF16 [E] a layer and projection, named as the SDK block reads them
@@ -34,13 +34,15 @@ does not hold exactly, stops the conversion by name. `input_scale` (activations;
 the header. Removed tensors stay as unnamed bytes in the clone. `--check` proves the codes and scales kept their
 bytes and every side global equals its source.
 
-`--experts-mxfp4` (numpy) writes the NVFP4 routed experts as MLX mxfp4 at group 32, which the model serves itself with
-no quant plugin. NVIDIA converted them from mxfp4 losslessly: in every 32-group, each 16-half that holds a nonzero
-code has e4m3 scale x `weight_scale_2` = the same power of two 2^k, so the codes stay as stored (U32 [out, in/8]) and
-`<base>.scales` is k + 127 (e8m0, U8 [out, in/32]). A group that breaks this stops the conversion by name. A shard
-that holds experts is written whole rather than cloned: `weight_scale`, `weight_scale_2` and `input_scale` leave it and
-the e8m0 scales join it, so its size is what the load holds. `--check` then dequantizes every expert both ways and
-requires every value equal, and compares every other tensor of those shards byte for byte.
+`--experts-mxfp4` (numpy) writes the NVFP4 routed experts as MLX mxfp4 at group 32 instead. NVFP4 is in general the
+more accurate format (16-value groups and e4m3 scales capture spiky weights); this pack's mxfp4 form is
+value-identical to NVIDIA's NVFP4 only because its scales are powers of two: in every 32-group, each 16-half that holds
+a nonzero code has e4m3 scale x `weight_scale_2` = the same power of two 2^k, so the codes stay as stored
+(U32 [out, in/8]) and `<base>.scales` is k + 127 (e8m0, U8 [out, in/32]). A group that breaks this stops the
+conversion by name. A shard that holds experts is written whole rather than cloned: `weight_scale`, `weight_scale_2`
+and `input_scale` leave it and the e8m0 scales join it, so its size is what the load holds. `--check` then
+dequantizes every expert both ways and requires every value equal, and compares every other tensor of those shards
+byte for byte.
 """
 
 import json
@@ -570,9 +572,7 @@ if __name__ == "__main__":
     if len(args) != 2:
         raise SystemExit(__doc__)
     mx = "--experts-mxfp4" in sys.argv
-    nv = "--experts-nvfp4" in sys.argv
-    if mx and nv:
-        raise SystemExit("--experts-mxfp4 and --experts-nvfp4: one or the other")
+    nv = not mx
     if mx:
         mx_init()
     if "--check" not in sys.argv:
