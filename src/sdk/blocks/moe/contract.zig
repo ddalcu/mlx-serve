@@ -2388,7 +2388,7 @@ const GqmmNax = struct {
         g.int("BK", p.bk);
         g.int("GX", p.gx);
         g.int("PAD", p.pad);
-        if (self.kind != .mm) g.int("EPI", if (self.moe_act) -1 else if (self.kind == .paired) 1 + self.limit else 0);
+        if (self.kind != .mm) g.int("EPI", if (self.moe_act) -1 else if (self.kind == .paired) 1 + @as(c_int, @intCast(self.limit)) else 0);
         if (self.kind != .mm) g.int("ESC", @as(c_int, @intCast(self.esc)));
         return g;
     }
