@@ -9772,17 +9772,49 @@ test "dsv41 verify width: time of a verify block per draft count (DSV41_VERIFY_R
     }
 }
 
+/// `n` plain steps on `st` from its prefill logits `l0`, the token kept on the GPU as the server pipelines it; each step's
+/// token and logits hash (and the prefill's) to `DSV41_VERIFY_EXACT_DUMP` when set; `keep` takes the tokens (`n + 1`)
+/// and each step's host logits.
+fn plainDump(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, l0: A, n: usize, keep: ?struct { toks: []u32, logits: [][]f32 }) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var tok = try argmaxHost(l0);
+    {
+        const h = try hostF32(l0);
+        defer gpa.free(h);
+        try out.print(gpa, "prefill {d} {x:0>16}\n", .{ tok, std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(h)) });
+    }
+    if (keep) |k| k.toks[0] = tok;
+    for (0..n) |i| {
+        const g = mlx.mlx_array_new_data(&tok, &[_]c_int{1}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(g);
+        const l = try extendIds(m, gpa, st, .{ .gpu = g }, .last, null);
+        defer _ = mlx.mlx_array_free(l);
+        const h = try hostF32(l);
+        tok = try argmaxHost(l);
+        try out.print(gpa, "step {d} {d} {x:0>16}\n", .{ i, tok, std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(h)) });
+        if (keep) |k| {
+            k.logits[i] = h;
+            k.toks[i + 1] = tok;
+        } else gpa.free(h);
+    }
+    if (std.c.getenv("DSV41_VERIFY_EXACT_DUMP")) |p| try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.mem.span(p), .data = out.items });
+}
+
 test "dsv41 verify exact: on a real pack, every verify row's logits are its plain step's bits (DSV41_VERIFY_EXACT)" {
     // DSV41_VERIFY_EXACT = a pack dir; DSV41_STEP_CTX prompt tokens first (default 17639); DSV41_ROUND_TEXT a text;
-    // DSV41_VERIFY_EXACT_STEPS plain steps (default 120).
+    // DSV41_VERIFY_EXACT_STEPS plain steps (default 120); DSV41_VERIFY_EXACT_DUMP a file for each plain step's token and
+    // logits hash; DSV41_VERIFY_EXACT_NODSPARK the stages left unloaded, plain steps only (two runs' dumps compare).
     const dir = std.mem.span(std.c.getenv("DSV41_VERIFY_EXACT") orelse return error.SkipZigTest);
+    const stages = std.c.getenv("DSV41_VERIFY_EXACT_NODSPARK") == null;
     const ctx = if (std.c.getenv("DSV41_STEP_CTX")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 17639;
     const gpa = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const cfg = try testConfig(io, dir);
     var w = try loadPack(io, gpa, dir, false);
     defer w.deinit();
-    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true, .dspark = true });
+    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true, .dspark = stages });
     defer m.deinit();
     const prompt = try gpa.alloc(u32, ctx);
     defer gpa.free(prompt);
@@ -9796,6 +9828,14 @@ test "dsv41 verify exact: on a real pack, every verify row's logits are its plai
         defer gpa.free(ids);
         if (ids.len < ctx) return error.SkipZigTest;
         @memcpy(prompt, ids[0..ctx]);
+    }
+    if (!stages) {
+        var sp = try initState(m, gpa);
+        defer sp.deinit();
+        const l0 = try meterPrefill(m, gpa, &sp, prompt);
+        defer _ = mlx.mlx_array_free(l0);
+        try plainDump(m, gpa, &sp, l0, if (std.c.getenv("DSV41_VERIFY_EXACT_STEPS")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 120, null);
+        return;
     }
     // Two states from one prompt: plain steps on one (the server's pipelined token), verifies of those tokens on the other.
     var sa = try initState(m, gpa);
@@ -9820,16 +9860,7 @@ test "dsv41 verify exact: on a real pack, every verify row's logits are its plai
         for (logits) |l| gpa.free(l);
         gpa.free(logits);
     }
-    var g = mlx.mlx_array_new_data(&toks[0], &[_]c_int{1}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(g);
-    for (0..n) |k| {
-        const l = try extendIds(m, gpa, &sa, .{ .gpu = g }, .last, null);
-        defer _ = mlx.mlx_array_free(l);
-        logits[k] = try hostF32(l);
-        toks[k + 1] = try argmaxHost(l);
-        _ = mlx.mlx_array_free(g);
-        g = mlx.mlx_array_new_data(&toks[k + 1], &[_]c_int{1}, 1, .uint32);
-    }
+    try plainDump(m, gpa, &sa, la, n, .{ .toks = toks, .logits = logits });
     // As a served round runs: the stages draft (their tokens discarded), then a verify of the plain tokens, R = 1..6
     // rows; every third round keeps one row fewer than it verified (a rollback), every seventh is a plain tick instead.
     var at: usize = 0;
