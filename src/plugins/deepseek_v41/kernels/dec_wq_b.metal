@@ -86,6 +86,30 @@ if (int(tg) == G - 1) {
   }
 }
 
+#if DSV41_WQB_NAX
+// The first unit's weights are in flight before the norm: a simdgroup a unit of 32 weight rows, the indexer's first.
+constexpr int NUI = NI / 32, NU = NUI + NQ / 32;
+const short qid = short(lane >> 2);
+const short fm = (qid & 4) | short((lane >> 1) & 3);
+const short f4 = (qid & 2) | short(lane & 1);
+auto unit_rows = [&](int un) {
+  const bool iu = un < NUI;
+  const int n_base = (iu ? un : un - NUI) * 32;
+  const device uint4* wb = (const device uint4*)(iu ? w_i : w_q);
+  const device uchar* sb = (const device uchar*)(iu ? s_i : s_q);
+  dsv41_nax_rows rows;
+  for (int j = 0; j < 4; ++j) {
+    const uint row = uint(n_base + fm + 8 * j);
+    rows.w[j] = wb + row * (K / 16) + f4;
+    rows.s[j] = sb + row * (K / 32) + (f4 >> 1);
+  }
+  return rows;
+};
+const int un0 = int(tg) * SGS + int(sg);
+const dsv41_nax_rows rows0 = unit_rows(un0 < NU ? un0 : 0);
+const dsv41_nax_first first0 = dsv41_nax_head(rows0);
+#endif
+
 // qr = rms(qa, q_norm) of the R rows into xs (each value a bf16 already): a thread takes 8 consecutive k of each row.
 float inv[R];
 for (int r = 0; r < R; ++r) {
@@ -141,25 +165,14 @@ threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 // against every row at once (`dsv41_nax_mxfp8`); a lane holds row fm's columns 4 f4 .. + 3 and 16 + 4 f4 .. + 3, so a
 // rope pair is in one lane and a 32-column fp4 block is the four lanes that share fm.
 {
-  const short qid = short(lane >> 2);
-  const short fm = (qid & 4) | short((lane >> 1) & 3);
-  const short f4 = (qid & 2) | short(lane & 1);
   const bool live = int(fm) < R;
   const threadgroup uint4* xp = xs4 + (live ? int(fm) : 0) * (K / 8) + f4 * 2;
   const float pos_r = float(pos[live ? int(fm) : 0]);
-  constexpr int NUI = NI / 32, NU = NUI + NQ / 32;
-  for (int un = int(tg) * SGS + int(sg); un < NU; un += G * SGS) {
+  for (int un = un0; un < NU; un += G * SGS) {
     const bool iu = un < NUI;
     const int n_base = (iu ? un : un - NUI) * 32;
-    const device uint4* wb = (const device uint4*)(iu ? w_i : w_q);
-    const device uchar* sb = (const device uchar*)(iu ? s_i : s_q);
-    dsv41_nax_rows rows;
-    for (int j = 0; j < 4; ++j) {
-      const uint row = uint(n_base + fm + 8 * j);
-      rows.w[j] = wb + row * (K / 16) + f4;
-      rows.s[j] = sb + row * (K / 32) + (f4 >> 1);
-    }
-    const dsv41_nax_first first = dsv41_nax_head(rows);
+    const dsv41_nax_rows rows = un == un0 ? rows0 : unit_rows(un);
+    const dsv41_nax_first first = un == un0 ? first0 : dsv41_nax_head(rows);
     float acc[16];
     for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
     dsv41_nax_mxfp8<K / 64, 4, 2, 8, FOLD>(acc, rows, first, xp, live);
