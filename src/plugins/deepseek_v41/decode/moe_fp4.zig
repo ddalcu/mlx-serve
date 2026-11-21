@@ -182,9 +182,17 @@ pub fn moeDownAs(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A
     if (mlx.getShape(down.w).len != 3 or mlx.getShape(down.s).len != 3 or dims(down.w, 1) != N or dims(down.w, 2) != K / 8 or dims(down.s, 1) != N or dims(down.s, 2) != K / f.group()) return null;
     if (mlx.getShape(shared.w).len != 2 or mlx.getShape(shared.s).len != 2 or dims(shared.w, 0) != N or dims(shared.w, 1) != K / 4 or dims(shared.s, 0) != N or dims(shared.s, 1) != K / 32) return null;
     const nc = downCols(K, N, hc) orelse return null;
-    if (rows and R >= 2) return try runDownRows(sc, kern.down_rows, f, R, K, N, topk, hc, nc, act, down.w, down.s, shared.w, shared.s, idx, x1, sp.post, sp.comb);
+    if (rows and R >= 2) {
+        if (!rows_logged) {
+            rows_logged = true;
+            @import("../../../sdk/util/log.zig").info("[dsv41] MLX_SERVE_DSV41_MOE_FP4_ROWS engaged: the fp4 MoE down launch over all {d} rows a threadgroup\n", .{R});
+        }
+        return try runDownRows(sc, kern.down_rows, f, R, K, N, topk, hc, nc, act, down.w, down.s, shared.w, shared.s, idx, x1, sp.post, sp.comb);
+    }
     return try runDown(sc, kern, f, R, K, N, topk, hc, nc, act, down.w, down.s, shared.w, shared.s, idx, x1, sp.post, sp.comb);
 }
+
+var rows_logged = false;
 
 /// The all-rows down launch (`dec_moe_fp4_down_rows`) over arrays `moeDownAs` checked: a threadgroup NC columns of every row.
 pub fn runDownRows(sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, f: fp4.Format, R: usize, K: usize, N: usize, topk: usize, hc: usize, nc: usize, act: A, w: A, scales: A, sw: A, sscales: A, idx: A, x1: A, post: A, comb: A) !A {

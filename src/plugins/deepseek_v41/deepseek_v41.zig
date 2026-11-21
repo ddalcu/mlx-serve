@@ -3361,6 +3361,7 @@ fn attnGather(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, qt: A, keys_w: A,
     // default served by the gather's fresh launches below (never the ring).
     if (fa.ps().explicit and g.flash != null and grouped != null and !fa_shape) return error.FlashAttnShape;
     if (g.flash) |fk| if (fa_shape) {
+        logOnce(&flash_logged, "[dsv41] MLX_SERVE_DSV41_FLASH_ATTN engaged: a wide prompt span on the flash kernel\n");
         const f_qt = if (qt.ctx != null) qt else q;
         const f_scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{scale}, &[_]c_int{1}, 1, .float32));
         const f_ins = [_]A{ q, keys_w, comp, picks, meta, f_qt, sink, f_scal, grouped.?.periods };
@@ -7639,7 +7640,10 @@ pub fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize,
     const ly = &m.layers[li];
     const si = li - m.n_layers;
     const fused = env.on(.MLX_SERVE_DSV41_DRAFT_FUSED);
-    if (fused and states.len == 1) if (try stageFused(sc, m, states[0], li, x, pre)) |y| return y;
+    if (fused and states.len == 1) if (try stageFused(sc, m, states[0], li, x, pre)) |y| {
+        logOnce(&draft_fused_logged, "[dsv41] MLX_SERVE_DSV41_DRAFT_FUSED engaged: a DSpark stage on in_proj, wq_b, ffn_in and the fused MoE\n");
+        return y;
+    };
     const pa = try hcPreNorm(sc, m, x, pre.*, &ly.hc_attn, ly.attn_norm);
     // The projections read their weights once for every state's rows; the rope and the attention are each state's.
     const rows = try qkvRows(sc, m, ly, pa.h);
@@ -7652,6 +7656,7 @@ pub fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize,
     }
     const r = if (states.len == 1) heads[0] else try sc.concat(heads[0..states.len], 0);
     if (fused) if (try stageFfnFused(sc, m, ly, r, x, &pa.sp)) |f| {
+        logOnce(&draft_ffn_logged, "[dsv41] MLX_SERVE_DSV41_DRAFT_FUSED engaged: a batched DSpark stage's FFN on ffn_in and the fused MoE\n");
         pre.* = f.pre;
         return f.x;
     };
@@ -7660,6 +7665,16 @@ pub fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize,
     const y = try moe(sc, m, li, pf.h, none);
     pre.* = pf.sp.pre;
     return hcExpand(sc, pf.x1, y, &pf.sp);
+}
+
+/// One line the first time a default-off switch's path runs (a unit's copy each: `-Dunits` may print it once a unit).
+var draft_fused_logged = false;
+var draft_ffn_logged = false;
+var flash_logged = false;
+fn logOnce(flag: *bool, comptime msg: []const u8) void {
+    if (flag.*) return;
+    flag.* = true;
+    log.info(msg, .{});
 }
 
 /// One state's stage on the fused decode kernels a trunk layer's decode runs (`blockFused`): in_proj (the hc mixes, the
