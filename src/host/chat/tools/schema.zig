@@ -126,14 +126,13 @@ fn parseContainerAllowingRepeats(allocator: std.mem.Allocator, text: []const u8)
 }
 
 /// Coerce ONE value to the declared type. Returns null when the value already
-/// matches or the spelling is undecidable. Allocated replacements are appended
-/// to `owned`; parsed sub-documents to `docs` — both are freed by the caller
-/// AFTER the object is re-serialized, because the returned Value borrows them.
+/// matches or the spelling is undecidable. Parsed sub-documents go to `docs`,
+/// freed by the caller AFTER the object is re-serialized, because the returned
+/// Value borrows them.
 fn coerceValueToType(
     allocator: std.mem.Allocator,
     v: std.json.Value,
     want: []const u8,
-    owned: *std.ArrayList([]const u8),
     docs: *std.ArrayList(std.json.Parsed(std.json.Value)),
 ) !?std.json.Value {
     // A CONTAINER param carried through a tag format arrives as a STRING — no tag
@@ -181,7 +180,7 @@ fn coerceValueToType(
         return switch (v) {
             .bool => null,
             .string => |s| if (looseBoolSpelling(s)) |b| std.json.Value{ .bool = b } else null,
-            .integer => |i| if (i == 0 or i == 1) std.json.Value{ .bool = i == 1 } else null,
+            .number_string => |s| if (std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "1")) std.json.Value{ .bool = s[0] == '1' } else null,
             else => null,
         };
     }
@@ -213,16 +212,6 @@ fn coerceValueToType(
         // only thing that can tell those apart.
         return switch (v) {
             .bool => |b| std.json.Value{ .string = if (b) "true" else "false" },
-            .integer => |i| blk: {
-                const s = try std.fmt.allocPrint(allocator, "{d}", .{i});
-                try owned.append(allocator, s);
-                break :blk std.json.Value{ .string = s };
-            },
-            .float => |f| blk: {
-                const s = try std.fmt.allocPrint(allocator, "{d}", .{f});
-                try owned.append(allocator, s);
-                break :blk std.json.Value{ .string = s };
-            },
             .number_string => |s| std.json.Value{ .string = s },
             else => null,
         };
@@ -345,15 +334,11 @@ pub fn coerceToolArgsToSchema(
     for (calls) |*call| {
         const props = toolPropertiesFor(tools.value, call.name) orelse continue;
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments, .{}) catch continue;
+        // Numbers stay as their source text: a string param spelled `0.30` must not come back as `0.3`.
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments, .{ .parse_numbers = false }) catch continue;
         defer parsed.deinit();
         if (parsed.value != .object) continue;
 
-        var owned = std.ArrayList([]const u8).empty;
-        defer {
-            for (owned.items) |s| allocator.free(s);
-            owned.deinit(allocator);
-        }
         // Parsed container sub-documents: the rewritten object BORROWS from these,
         // so they must outlive the Stringify below.
         var docs = std.ArrayList(std.json.Parsed(std.json.Value)).empty;
@@ -367,7 +352,7 @@ pub fn coerceToolArgsToSchema(
         while (it.next()) |entry| {
             const prop = props.get(entry.key_ptr.*) orelse continue;
             const want = declaredJsonType(prop) orelse continue;
-            const new_val = try coerceValueToType(allocator, entry.value_ptr.*, want, &owned, &docs) orelse continue;
+            const new_val = try coerceValueToType(allocator, entry.value_ptr.*, want, &docs) orelse continue;
             entry.value_ptr.* = new_val;
             changed = true;
         }
@@ -1488,4 +1473,25 @@ test "coerceToolArgsToSchema: an unmodelled declared type leaves the value alone
     defer allocator.free(before);
     try coerceToolArgsToSchema(allocator, calls, tools);
     try testing.expectEqualStrings(before, calls[0].arguments);
+}
+
+test "coerceToolArgsToSchema: a STRING param spelled like a number keeps its exact digits" {
+    const allocator = testing.allocator;
+    const raw = "<tool_call>\n<function=Edit>\n<parameter=file_path>\na.yaml\n</parameter>\n" ++
+        "<parameter=old_string>\n0.30\n</parameter>\n<parameter=new_string>\n1e3\n</parameter>\n" ++
+        "<parameter=replace_all>\n1\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try coerceToolArgsToSchema(allocator, calls, edit_tools_json_test);
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+    try testing.expectEqualStrings("0.30", parsed.value.object.get("old_string").?.string);
+    try testing.expectEqualStrings("1e3", parsed.value.object.get("new_string").?.string);
+    try testing.expectEqual(true, parsed.value.object.get("replace_all").?.bool);
 }
