@@ -3740,9 +3740,15 @@ pub fn attnOutRoped(sc: *Scope, m: *Dsv41Model, ly: *const Layer, r: A) !A {
 
 /// The grouped `wo_a` of heads already grouped and inverse-roped `[og, L, in]`: `[L, og * o_lora]` in `m.act`.
 pub fn attnOutA(sc: *Scope, m: *Dsv41Model, ly: *const Layer, ob: A, dense_wo_a: ?A) !A {
+    return sc.reshape(try attnOutAGroups(sc, m, ly, ob, dense_wo_a), &.{ ci(dim(ob, 1)), -1 });
+}
+
+/// `attnOutA` with each row's groups apart, `[L, og, o_lora]`: a view of the matmul's `[og, L, o_lora]`, so a wide
+/// layer's join of its spans copies it once (`MLX_SERVE_DSV41_WOA_JOIN`).
+pub fn attnOutAGroups(sc: *Scope, m: *Dsv41Model, ly: *const Layer, ob: A, dense_wo_a: ?A) !A {
     const L = dim(ob, 1);
     // An outside plugin's groups: its grouped linear reads `[L, og, in]`.
-    if (ly.wo_a.ext) |*e| return sc.astype(try sc.reshape(try sc.keep(try e.matmul(try sc.transpose(ob, &.{ 1, 0, 2 }), sc.s)), &.{ ci(L), -1 }), m.act);
+    if (ly.wo_a.ext) |*e| return sc.astype(try sc.keep(try e.matmul(try sc.transpose(ob, &.{ 1, 0, 2 }), sc.s)), m.act);
     const wd = dense_wo_a orelse if (ly.wo_a.s.ctx == null) ly.wo_a.w else if (L >= DENSE_ROWS) try ly.wo_a.dense(sc, mlx.mlx_array_dtype(ob)) else none;
     const oa = if (wd.ctx != null)
         try sc.matmul(ob, try sc.transpose(wd, &.{ 0, 2, 1 }))
@@ -3750,7 +3756,7 @@ pub fn attnOutA(sc: *Scope, m: *Dsv41Model, ly: *const Layer, ob: A, dense_wo_a:
         var ro = mlx.mlx_array_new();
         break :blk try sc.res(mlx.mlx_quantized_matmul(&ro, ob, ly.wo_a.w, ly.wo_a.s, ly.wo_a.b, true, mlx.mlx_optional_int.some(@intCast(ly.wo_a.qp.group_size)), mlx.mlx_optional_int.some(@intCast(ly.wo_a.qp.bits)), ly.wo_a.qp.mode.cstr(), sc.s), &ro);
     };
-    return sc.astype(try sc.reshape(try sc.transpose(oa, &.{ 1, 0, 2 }), &.{ ci(L), -1 }), m.act);
+    return sc.astype(try sc.transpose(oa, &.{ 1, 0, 2 }), m.act);
 }
 
 /// `x` [L, K] f32 through the dense linear `l` in f32: decode rows read `l`
@@ -5947,6 +5953,8 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     // woa_rows.zig: an EXL3 `wo_a` over runs of `woa.spansPer` spans' grouped heads, one grouped linear a run
     // (`woaRun`); a run of one span is the span-by-span path.
     const run: usize = if (ly.wo_a.ext != null) @min(n_spans, woa.spansPer(sp.span)) else 1;
+    // The span-by-span `wo_a` hands its rows' groups as views, joined once below (`attnOutAGroups`).
+    const woa_join = run == 1 and m.tp == null and env.on(.MLX_SERVE_DSV41_WOA_JOIN);
     const run_heads = try gpa.alloc(A, run);
     defer gpa.free(run_heads);
     var in_run: usize = 0;
@@ -6015,7 +6023,8 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
             }
         } else {
             if (woa_dense.ctx == null and ly.wo_a.s.ctx != null and sp.L >= DENSE_ROWS) woa_dense = try ly.wo_a.dense(&sc, m.act);
-            const oa = try attnOutA(&ssc, m, ly, o_k, if (woa_dense.ctx != null) woa_dense else null);
+            const wd: ?A = if (woa_dense.ctx != null) woa_dense else null;
+            const oa = if (woa_join) try attnOutAGroups(&ssc, m, ly, o_k, wd) else try attnOutA(&ssc, m, ly, o_k, wd);
             // A tensor split sums each span's wo_b on the CPU stream while the GPU runs the next span's attention.
             heads[n_heads] = try sc.keep(ssc.out(if (m.tp != null) try tpSum(&ssc, m, try ly.wo_b.apply(&ssc, oa)) else oa));
             n_heads += 1;
@@ -6033,7 +6042,8 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
             ig_start = k + 1;
         }
     }
-    const y = if (m.tp != null) try sc.concat(heads[0..n_heads], 0) else try ly.wo_b.apply(&sc, try sc.concat(heads[0..n_heads], 0));
+    const joined = try sc.concat(heads[0..n_heads], 0);
+    const y = if (m.tp != null) joined else try ly.wo_b.apply(&sc, if (woa_join) try sc.reshape(joined, &.{ ci(sp.L), -1 }) else joined);
     // scratch_x1.zig: the streams after the attention into the prompt's x1 region (a streamed bank runs one MoE
     // group, so that group's output is the region's last reader's).
     const x1_scratch = m.streamed != null and sp.L >= scratch_rows and mlx.streamIsGpu(m.s);
