@@ -55,6 +55,8 @@ const drafterResidentBytes = @import("runtime/preflight.zig").drafterResidentByt
 const preflightVerdict = @import("runtime/preflight.zig").preflightVerdict;
 const mlxActiveBytes = @import("runtime/preflight.zig").mlxActiveBytes;
 const loadRequirementBytes = @import("runtime/preflight.zig").loadRequirementBytes;
+const wiredLimitAdviceMb = @import("runtime/preflight.zig").wiredLimitAdviceMb;
+const loadGpuLimit = @import("runtime/preflight.zig").loadGpuLimit;
 const scheduler_mod = @import("scheduler.zig");
 
 /// Phase A1 → Plan 05: do the full model load on the inference thread.
@@ -145,6 +147,17 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 in_dir_drafter = null;
             },
             .refuse => {
+                const need = loadRequirementBytes(weights_bytes);
+                const ram = if (status.getProcAvailableMemBytes() > 0) status.getProcAvailableMemBytes() else status.getLoadAvailableMemBytes();
+                if (wiredLimitAdviceMb(need, loadGpuLimit(), ram, status.getTotalMemBytes())) |mb| {
+                    log.err("Insufficient memory to load model: Metal's working-set limit (iogpu.wired_limit_mb) holds {d:.1} GB, the load needs ~{d:.1} GB ({d:.1} GB of weights plus warmup headroom); RAM holds it. Raise the limit and retry: sudo sysctl iogpu.wired_limit_mb={d}\n", .{
+                        @as(f64, @floatFromInt(loadGpuLimit())) / gb,
+                        @as(f64, @floatFromInt(need)) / gb,
+                        @as(f64, @floatFromInt(weights_bytes)) / gb,
+                        mb,
+                    });
+                    return error.InsufficientMemory;
+                }
                 log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights{s} plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.{s}\n", .{
                     @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes))) / gb,
                     @as(f64, @floatFromInt(weights_bytes)) / gb,

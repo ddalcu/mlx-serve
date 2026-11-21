@@ -4,9 +4,12 @@ DeepSeek-V4.1-Flash (`model_type: deepseek_v41`, 1M context, MLX packs) with its
 module-owned arch. Unpaired captures transfer to the engine's prefix cache, keyed on image rows. Packs:
 `ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw`, `mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-mtp`, and
 OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin (its trunk and its `experts.bin` bank).
-NVIDIA's `DeepSeek-V4.1-Flash-1017-NVFP4` converted by `scripts/dsv41_nvfp4_pack.py` (headers only), its NVFP4 experts
-through CommunityServe's `modelopt_ds41` quant plugin, its mxfp4 Engram tables read as stored; with
-`--experts-nvfp4` the experts load as MLX nvfp4 banks with ModelOpt's per-expert globals (`Experts.scale`), served in core.
+NVIDIA's `DeepSeek-V4.1-Flash-1017-NVFP4` converted by `scripts/dsv41_nvfp4_pack.py` (headers only): its routed experts
+load as MLX nvfp4 banks with ModelOpt's per-expert globals (`Experts.scale`), its mxfp4 Engram tables as stored. The
+converter's `--experts-mxfp4` writes the experts as mxfp4 g32 instead: value-identical to NVIDIA's NVFP4 pack
+(16,986,931,200 groups checked) only because this release's scales are powers of two (NVFP4 is in general the more
+accurate format: 16-value groups and e4m3 scales capture spiky weights); faster prefill and 18 GB smaller. The core
+serves either from the pack, with no flag.
 
 ## Files
 - `plugin.zig`: the table; `CacheHooks.aux` / live `state_bytes`; streamed/paired legacy `resume_prompt`;
@@ -29,7 +32,7 @@ through CommunityServe's `modelopt_ds41` quant plugin, its mxfp4 Engram tables r
   `flash_attn`: the lossy flash kernel, default on beside a plugin bank only).
 - `spec/markov.zig`: DSpark's Markov chain in B + 1 launches; `decode/engram_decode.zig` the Engram LRU,
   `decode/gemv_twin.zig` the batched GEMV twin of MLX's M=1 words.
-- `decode/moe_fp4.zig`: the MoE's two launches over fp4 routed experts (MXFP4, the Lossless pack; NVFP4 with ModelOpt's
+- `decode/moe_fp4.zig`: the MoE's two launches over fp4 routed experts (MXFP4; NVFP4 with ModelOpt's
   per-expert scales through `moeUpScaled`), rows 1..6, serving without NAX, on NAX only under
   `MLX_SERVE_DSV41_MOE_FP4_NAX` (unmeasured on M5); `moe_up` /
   `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or 128 (the expert-pruned packs are 2-bit g128).
@@ -160,6 +163,12 @@ through CommunityServe's `modelopt_ds41` quant plugin, its mxfp4 Engram tables r
 - Prefill is chunked at 8192 at most (`prefillChunkMax`, an explicit `--prefill-chunk` included), one MoE call per
   chunk: each chunk still reads every expert bank once (the CED replay runs the decoder layers), so a narrower chunk
   pays that read twice as often.
+- A load that Metal's working-set limit refuses but RAM holds names `iogpu.wired_limit_mb` and logs the
+  `sudo sysctl iogpu.wired_limit_mb=<N>` that admits it (`wiredLimitAdviceMb`: the load's bill plus the 8 GiB wired
+  margin), never paging: the NVFP4 pack's ~400 GB needs it raised on a 512 GB Mac.
+- `MLX_SERVE_DSV41_EXACT` is refused on NAX (the load logs why): DSpark's schedule follows measured tick times and a
+  1-row step and an R-row verify differ in kernel numerics, so with DSpark on two M5 runs, or two A/B arms, can
+  decode different greedy text; a same-text A/B on M5 runs with DSpark off.
 - Past 0.95 x Metal's working set MLX's allocator evicts its buffer cache on every miss (two residency commits per
   allocation): DSpark at 8192 crosses it on a 256 GB Mac at the default `iogpu.wired_limit_mb`; raise it to bench.
 - DSpark on prose falls back to plain (acceptance 1.04/round): correct, prose runs ~54 tok/s.
