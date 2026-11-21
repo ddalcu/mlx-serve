@@ -86,6 +86,37 @@ pub fn launch(sc: *dsv41.Scope, t: Table, rows: usize, codes: A, tsc: A, ids: A,
     return try sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
 }
 
+pub const ROWS_SOURCE = kernelSource("plugins/deepseek_v41/kernels/engram_rows.metal");
+pub const ROWS_INS = [_][*:0]const u8{ "codes", "tsc", "ids", "geo" };
+/// Threads a threadgroup of the rows' gather (16 values a thread).
+pub const rows_threads = 256;
+var rows_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+/// `ids.len` table rows `[n, hd]` bf16, each gathered by id out of `codes` / `tsc` at `geo` and dequantized (a
+/// prompt chunk's Engram rows, the GEMM's input, from the resident table). Null off a GPU stream or off the layouts.
+pub fn gatherRows(sc: *dsv41.Scope, t: Table, codes: A, tsc: A, ids: A, geo: A) !?A {
+    if (!mlx.streamIsGpu(sc.s) or !(t.tb == 4 or t.tb == 8) or t.hd == 0 or t.hd % 32 != 0) return null;
+    if (codes.ctx == null or tsc.ctx == null or mlx.getShape(ids).len != 1 or mlx.mlx_array_dtype(ids) != .uint32 or !is(geo, .uint32, &.{6})) return null;
+    const n = dims(ids, 0);
+    if (n == 0) return null;
+    if (rows_kernel == null) rows_kernel = try dsv41.buildKernel("dsv41_engram_rows", &ROWS_INS, &.{"out"}, ROWS_SOURCE, HEADER);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(n), ci(t.hd) }, 2, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(n * t.hd / 16), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, rows_threads, 1, 1));
+    inline for (.{ .{ "HD", t.hd }, .{ "TB", t.tb } }) |a| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, a[0], ci(a[1])));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+    const ins = [_]A{ codes, tsc, ids, geo };
+    const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, rows_kernel.?, iv, cfg, sc.s));
+    var o = mlx.mlx_array_new();
+    return try sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+}
+
 // ── the kernel contract ──
 
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
@@ -261,11 +292,66 @@ const K_ = struct {
     }
 };
 
+/// The rows' gather: `s.rows` x `s.n` table rows of 256 (rows of x by n-gram rows) through shuffled ids, dequantized.
+const RowsK = struct {
+    pub const Params = struct { tb: usize = 4 };
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n == 0 or s.k != HD) return null;
+        var g = metal.Geometry{ .grid = .{ ci(s.rows * s.n * HD / 16), 1, 1 }, .tg = .{ rows_threads, 1, 1 } };
+        g.out(&.{ ci(s.rows * s.n), HD }, .bfloat16);
+        g.int("HD", HD);
+        g.int("TB", p.tb);
+        g.dtype("T", .bfloat16);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const tb = k.p.tb;
+        const n = k.shape.rows * k.shape.n;
+        const codes = try k.add(.uint32, &.{ n, HD * tb / 32 });
+        const tsc = try k.add(.uint8, &.{ n, HD / 32 });
+        const ids = try k.add(.uint32, &.{n});
+        const geo = try k.add(.uint32, &.{6});
+        for (0..n) |r| K_.packRow(tb, codes, tsc, r, HD, null, null, rng);
+        for (ids, 0..) |*v, i| v.* = @floatFromInt(i);
+        rng.shuffle(f64, ids);
+        for (geo, (Geo{ .w_base = 0, .w_stride = HD * tb / 8, .s_base = 0, .s_stride = HD / 32 }).words()) |*g, v| g.* = @floatFromInt(v);
+        // NaN scales (e8m0 0xff) on every seventh row: its values are NaN.
+        if (f == .nonfinite) {
+            var r: usize = 3;
+            while (r < n) : (r += 7) @memset(tsc[r * (HD / 32) ..][0 .. HD / 32], 255);
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n * HD;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        _ = sum;
+        const tb = k.p.tb;
+        const per: usize = 32 / tb;
+        for (0..k.shape.rows * k.shape.n) |i| {
+            const row: usize = @intFromFloat(k.in(2)[i]);
+            for (0..HD) |p| {
+                const s = e8m0(k.in(1)[row * (HD / 32) + p / 32]);
+                const word: u32 = @intFromFloat(k.in(0)[row * (HD * tb / 32) + p / per]);
+                const c = (word >> @intCast(tb * (p % per))) & ((@as(u32, 1) << @intCast(tb)) - 1);
+                const v = if (tb == 4) (if (c & 8 != 0) -e2m1[c & 7] else e2m1[c & 7]) else kc.host.e4m3(@intCast(c));
+                out[i * HD + p] = v * s;
+                mag[i * HD + p] = @abs(v * s);
+            }
+        }
+    }
+};
+
 fn depth(s: Shape) usize {
     return s.k;
 }
 
 const kv_l = cv.launch("dsv41_dec_engram_kv", &INS, &.{"kv"}, SOURCE, HEADER, 4 * decode.max_rows * chunk, threads, false);
+const rows_l = cv.launch("dsv41_engram_rows", &ROWS_INS, &.{"out"}, ROWS_SOURCE, HEADER, 0, rows_threads, false);
 
 /// Served shapes cut the output width to a few threadgroups (each runs the same code at its own rows); the reduction
 /// length is the release's (24 table rows of 256), the rows 1..6. One case a table format.
@@ -283,6 +369,21 @@ pub fn register(set: *kc.Set) !void {
         .served = &.{ .{ .rows = 1, .n = 64, .k = 6144 }, .{ .rows = 3, .n = 16, .k = 6144 }, .{ .rows = decode.max_rows, .n = 32, .k = 6144 } },
         .sums = .{ .f16 = 30, .bf16 = 30, .why = "mirrored halves: an exact sum of -8 behind partial sums near 10^5" },
     });
+    const rows = [_]struct { [:0]const u8, RowsK.Params }{
+        .{ "dsv41 engram_rows (mxfp4 table rows gathered by id to bf16)", .{ .tb = 4 } },
+        .{ "dsv41 engram_rows (mxfp8 table rows gathered by id to bf16)", .{ .tb = 8 } },
+    };
+    for (rows) |c| try kit.add(set, RowsK, &rows_l, c[1], .{
+        .name = c[0],
+        .accum = .none,
+        .depth = depthOne,
+        .out = .bf16,
+        .served = &.{ .{ .rows = 1, .n = 24, .k = HD }, .{ .rows = 64, .n = 24, .k = HD } },
+    });
+}
+
+fn depthOne(_: Shape) usize {
+    return 1;
 }
 
 test "dsv41 dec engram_kv: the contract's launch is the wrapper's, byte for byte (mxfp4 and mxfp8 table rows, R = 1..6)" {

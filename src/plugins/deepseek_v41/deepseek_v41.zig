@@ -6220,7 +6220,8 @@ pub fn spanInAt(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const S
         // `fuse.engram`: a decode-width span's write gathered from the resident table (`fusion.engramHeld`), else
         // from the rows read out of it (`fusion.engramWrite`).
         var fused: ?A = try fusion.engramHeld(sc, m, e, sp.eng_ids, m.engrams.len, ek, nc, lo, hi, x);
-        const rows = if (fused != null) none else if (sp.prefetch) |pf| blk: {
+        const held_rows = if (fused == null) try fusion.engramRowsHeld(sc, m, e, sp.eng_ids, m.engrams.len, ek, nc, lo, hi) else null;
+        const rows = if (fused != null) none else if (held_rows) |r| r else if (sp.prefetch) |pf| blk: {
             // A batch reads grid k, state k's rows, as one span.
             const raw = if (sp.offs.len > 0) try pf.take(k, ek, 0) else try pf.take(sp.p0, ek, k);
             defer raw.deinit(gpa);
