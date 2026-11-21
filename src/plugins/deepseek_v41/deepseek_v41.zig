@@ -671,6 +671,8 @@ pub const Dec = struct {
     idx_score: ?dkern.idx_score.Kernels = null,
     topk: ?dkern.topk.Kernels = null,
     wq_b: ?mlx.mlx_fast_metal_kernel = null,
+    /// `wq_b` that also writes the window ring (`MLX_SERVE_DSV41_FUSE_WQB_RING`).
+    wq_b_ring: ?mlx.mlx_fast_metal_kernel = null,
     attn: ?mlx.mlx_fast_metal_kernel = null,
     wo_a: ?mlx.mlx_fast_metal_kernel = null,
     /// `wo_a`'s arrival counter, zeroed once and shared by every layer's launch.
@@ -685,7 +687,7 @@ pub const Dec = struct {
     fn init(gpa: std.mem.Allocator, cfg: *const Config) !Dec {
         const nax = device.naxAvailable();
         // Without NAX the affine moe_up / moe_down lose to today's MoE kernels at every row count.
-        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .attn = if (nax) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
+        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .wq_b_ring = try dkern.wq_b.buildRing(), .attn = if (nax) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
         errdefer d.deinit();
         try dkern.topk.probe(gpa, &d.topk.?, mlx.gpuStream());
         if (d.moe_down) |kd| d.moe_down_rb = dkern.moe_down.probe(gpa, kd, cfg.moe_intermediate_size, cfg.hidden_size) catch |e| blk: {
@@ -704,7 +706,7 @@ pub const Dec = struct {
         if (d.moe_up) |k| k.deinit();
         if (d.moe_fp4) |k| k.deinit();
         if (d.ffn_in) |k| dkern.ffn_in.free(k);
-        inline for (.{ d.wq_b, d.attn, d.wo_a, d.moe_down }) |k| if (k) |kern| {
+        inline for (.{ d.wq_b, d.wq_b_ring, d.attn, d.wo_a, d.moe_down }) |k| if (k) |kern| {
             _ = mlx.mlx_fast_metal_kernel_free(kern);
         };
         if (d.wo_a_counter.ctx != null) _ = mlx.mlx_array_free(d.wo_a_counter);
@@ -5028,8 +5030,14 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     const ls = &st.layers[li];
     const L = dim(x, 0);
     const a = try dkern.in_proj.run(sc, kp, m, ly, x, pre.*) orelse return null;
-    const w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, try dkern.wq_b.rowsAt(sc, p0, L)) orelse return null;
-    try ls.win.write(w.kv_row, p0, sc.s);
+    const pos = try dkern.wq_b.rowsAt(sc, p0, L);
+    // `MLX_SERVE_DSV41_FUSE_WQB_RING=1`: wq_b returns the window ring with these rows written (no slice_update launch).
+    const wr = if (m.dec.wq_b_ring != null and dkern.wq_b.ringOn()) try dkern.wq_b.runRing(sc, m, kq, ly, li, a.qa, a.kv, a.z, pos, .{ .kern = m.dec.wq_b_ring.?, .buf = ls.win.buf }) else null;
+    const w = wr orelse try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, pos) orelse return null;
+    if (w.ring.ctx != null) {
+        _ = mlx.mlx_array_free(ls.win.buf);
+        ls.win.buf = sc.out(w.ring);
+    } else try ls.win.write(w.kv_row, p0, sc.s);
     var comp_rows = none;
     var topk = none;
     if (ly.ratio > 0) {
