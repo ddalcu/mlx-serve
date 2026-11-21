@@ -633,29 +633,36 @@ pub fn sortedGateUpFused(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_ar
 }
 
 var routed_engaged_logged = false;
+/// Why the last `sortedGateUpRouted` returned null, for a caller's one-time decline line.
+pub var routed_decline: []const u8 = "";
 
 /// `sortedGateUpFused` with deepseek_v41's `moe_act` in the epilogue: each rounded product times its expert's scale
 /// (`scales`, rounded again), then in f32 the SwiGLU clamped under `limit` (none at 0 or below) times the row's
 /// routing weight (`route`, `[M]` f32), rounded once: `[M, 1, n]`, the bytes of the gather, the scale multiplies and
 /// `moe_act` it replaces.
 pub fn sortedGateUpRouted(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, route: mlx.mlx_array, limit: f32, scales: ExpertScales, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
-    if (!nax_available or !mlx.streamIsGpu(s)) return null;
-    if (!supported(x, w, sc, bi, idx, bits, group, mx, row_map, true)) return null;
+    if (!nax_available or !mlx.streamIsGpu(s)) return declineRouted("no NAX GPU stream");
+    if (!supported(x, w, sc, bi, idx, bits, group, mx, row_map, true)) return declineRouted("shape: the bank or input is not a supported layout");
     const ws = mlx.getShape(w);
     const xs = mlx.getShape(x);
     const m = mlx.getShape(idx)[0];
-    if (@rem(ws[1], 64) != 0 or !scales.fits(ws[0], mlx.mlx_array_dtype(x))) return null;
-    if (route.ctx == null or mlx.mlx_array_dtype(route) != .float32 or mlx.mlx_array_ndim(route) != 1 or mlx.getShape(route)[0] != m) return null;
+    if (@rem(ws[1], 64) != 0 or !scales.fits(ws[0], mlx.mlx_array_dtype(x))) return declineRouted("shape: the gate/up width is not a multiple of 64 or the per-expert scales do not fit");
+    if (route.ctx == null or mlx.mlx_array_dtype(route) != .float32 or mlx.mlx_array_ndim(route) != 1 or mlx.getShape(route)[0] != m) return declineRouted("shape: the routing weights are not f32 [pairs]");
     const n = @divExact(ws[1], 2);
     const p = plan(m, ws[0], xs[2], n, true);
     const key: CanaryKey = .{ .plan = p, .bits = bits, .group = group, .align_n = @rem(n, 64) == 0, .align_k = @rem(xs[2], p.bk) == 0, .mx = mx };
-    if (!armed(key, s) or !armedMapped(key, false, s) or !armedMapped(key, true, s)) return null;
+    if (!armed(key, s) or !armedMapped(key, false, s) or !armedMapped(key, true, s)) return declineRouted("canary: the paired kernel's canary did not arm for this plan");
     const out = try launchMapped(x, row_map, w, sc, bi, idx, .{ .w = w, .sc = sc, .bi = bi, .sigtab = biasArg(.{ .ctx = null }), .up_off = n, .scales = scales, .route = route, .route_limit = limit }, bits, group, mx, p, s);
     if (!routed_engaged_logged) {
         routed_engaged_logged = true;
         log.info("[gather-nax] paired SwiGLU engaged with routing weights (gate scale={} up scale={} limit={d}): M={d} E={d} N={d} K={d} {s}\n", .{ scales.gate != null, scales.up != null, limit, m, ws[0], n, xs[2], modeName(mx, group) });
     }
     return out;
+}
+
+fn declineRouted(why: []const u8) ?mlx.mlx_array {
+    routed_decline = why;
+    return null;
 }
 
 fn requireNax() !void {

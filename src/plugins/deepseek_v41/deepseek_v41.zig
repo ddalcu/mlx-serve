@@ -1641,8 +1641,14 @@ const hc_mix_rows = 4;
 /// `MLX_SERVE_DSV41_HC_MIX8`: a wide mix threadgroup takes 8 rows on a NAX GPU, so a row group reads the mix weights
 /// once for twice the rows; each mix's sums are the same threads' in the same order at any row count.
 fn hcMixRows() usize {
-    return if (device.naxAvailable() and env.on(.MLX_SERVE_DSV41_HC_MIX8)) 8 else hc_mix_rows;
+    if (!(device.naxAvailable() and env.on(.MLX_SERVE_DSV41_HC_MIX8))) return hc_mix_rows;
+    if (!hc_mix8_logged.swap(true, .monotonic)) log.info("[dsv41] HC_MIX8 engaged (8 rows a threadgroup)\n", .{});
+    return 8;
 }
+// The pfkern switches' one-time engagement lines (first use a process; no per-call output).
+var hc_mix8_logged: std.atomic.Value(bool) = .init(false);
+var hc_expand_norm_logged: std.atomic.Value(bool) = .init(false);
+var woa_join_logged: std.atomic.Value(bool) = .init(false);
 const hc_mix_cols = [_]usize{ 6, 4, 3, 2, 1 };
 
 /// One hyper-connection stage as two kernels. The staggered collapse reads the PREVIOUS mix (`cpre`), so in
@@ -3058,6 +3064,7 @@ fn hcExpandNormScratch(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const 
 /// kernels were refused at load.
 pub fn hcExpandNormFresh(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const Split, cpre: A, hc: *const Hc, norm_w: A) !?Staged {
     if (hcf_k == null or !env.on(.MLX_SERVE_DSV41_HC_EXPAND_NORM)) return null;
+    if (!hc_expand_norm_logged.swap(true, .monotonic)) log.info("[dsv41] HC_EXPAND_NORM engaged (rows {d})\n", .{dim(x, 0)});
     const eps = try hcEps(sc, m);
     const f = try hcExpandNormLaunch(sc, m, x, y, sp, cpre, norm_w, eps, null, none);
     return .{ .x1 = f.x1, .sp = try hcSplitWide(sc, m, try hcMixWide(sc, m, f.x1, hc, eps), eps), .h = f.h };
@@ -5955,6 +5962,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     const run: usize = if (ly.wo_a.ext != null) @min(n_spans, woa.spansPer(sp.span)) else 1;
     // The span-by-span `wo_a` hands its rows' groups as views, joined once below (`attnOutAGroups`).
     const woa_join = run == 1 and m.tp == null and env.on(.MLX_SERVE_DSV41_WOA_JOIN);
+    if (woa_join and !woa_join_logged.swap(true, .monotonic)) log.info("[dsv41] WOA_JOIN engaged (layer {d}, spans {d})\n", .{ li, n_spans });
     const run_heads = try gpa.alloc(A, run);
     defer gpa.free(run_heads);
     var in_run: usize = 0;
