@@ -50,7 +50,7 @@ pub fn naxOn(rows: usize) bool {
     const v = env.get(.MLX_SERVE_DSV41_GEMV_R26_WQB) orelse return false;
     return v[0] == '1' and rows >= nax_min_rows;
 }
-pub const nax_min_rows: usize = 2;
+pub const nax_min_rows: usize = 4;
 
 /// `MLX_SERVE_DSV41_FUSE_WQB_RING` (read each call): =1 the plain step and verify write the window ring in wq_b.
 pub fn ringOn() bool {

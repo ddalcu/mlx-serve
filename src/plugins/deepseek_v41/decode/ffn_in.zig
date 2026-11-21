@@ -92,7 +92,7 @@ pub fn naxOn() bool {
 
 /// The matrix-unit launch 1: simdgroups splitting K, 32 columns a threadgroup, from this many rows.
 const nax_nsg: usize = 4;
-pub const nax_min_rows: usize = 2;
+pub const nax_min_rows: usize = 5;
 
 fn servesNax(p: Dims) bool {
     return p.rows >= 1 and p.rows <= decode.max_rows and p.d % 32 == 0 and p.k % (64 * nax_nsg) == 0;
