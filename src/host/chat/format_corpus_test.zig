@@ -2399,7 +2399,7 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
     try testing.expectEqual(chat.StreamThinkGate.flush_text, chat.streamThinkGate("The visible answer.", true, true));
 }
 
-test "format corpus: no surface reports a call sketched in a never-closed template thought" {
+test "format corpus: every surface's parse text drops a call sketched in a never-closed template thought" {
     // Bar: no call from any surface's parse text (toolParseText, or /v1/messages' split content); without the thought, one.
     const a = testing.allocator;
     const pipeline = @import("tools/pipeline.zig");
