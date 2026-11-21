@@ -25,9 +25,9 @@ var engaged_logged: std.atomic.Value(bool) = .init(false);
 pub fn fits(fn_w: A, x: A) bool {
     const fs = mlx.getShape(fn_w);
     if (fs.len != 2 or mlx.mlx_array_dtype(fn_w) != .float32) return false;
-    const mix = fs[0];
+    const nmix = fs[0];
     const K = fs[1];
-    if (@rem(mix, 8) != 0 or @divExact(mix, 8) > 3 or @rem(K, SG * 8) != 0) return false;
+    if (@rem(nmix, 8) != 0 or @divExact(nmix, 8) > 3 or @rem(K, SG * 8) != 0) return false;
     const xs = mlx.getShape(x);
     return xs.len > 0 and xs[0] > 0 and mlx.mlx_array_size(x) == @as(usize, @intCast(xs[0])) * @as(usize, @intCast(K));
 }

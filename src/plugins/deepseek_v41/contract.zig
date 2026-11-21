@@ -881,8 +881,11 @@ const HcMixMma = struct {
     }
 
     pub const fill = HcMix.fill;
-    pub const count = HcMix.count;
     pub const compute = HcMix.compute;
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * MIX;
+    }
 };
 
 // ── the indexer's scores: sum over heads of weight * relu(q . k), -inf past the groups a query sees ──
