@@ -118,11 +118,6 @@ const emitResponsesReasoningDelta = @import("responses/envelope.zig").emitRespon
 const emitResponsesMessageStart = @import("responses/envelope.zig").emitResponsesMessageStart;
 const emitResponsesMessageDelta = @import("responses/envelope.zig").emitResponsesMessageDelta;
 
-fn declaresTools(tools: ?std.json.Value) bool {
-    const t = tools orelse return false;
-    return t == .array and t.array.items.len > 0;
-}
-
 pub fn handleChatCompletions(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -430,7 +425,7 @@ pub fn handleChatCompletions(
 
     // Extract tools JSON from request body for chat template injection
     var tools_json: ?[]const u8 = null;
-    var has_tools = declaresTools(root.get("tools"));
+    var has_tools = chat_mod.declaresTools(root.get("tools"));
     var forced_tool: ?chat_mod.ForcedTool = null;
 
     // OpenAI parallel_tool_calls: only an explicit false clamps to one call
@@ -1380,7 +1375,7 @@ test "extractJsonField and declaresTools see tools only in a non-empty top-level
     };
     for (cases) |c| {
         const root = (try std.json.parseFromSliceLeaky(std.json.Value, a, c.body, .{})).object;
-        const has_tools = declaresTools(root.get("tools"));
+        const has_tools = chat_mod.declaresTools(root.get("tools"));
         try testing.expectEqual(c.tools != null, has_tools);
         if (c.tools) |want| try testing.expectEqualStrings(want, extractJsonField(c.body, "tools").?);
     }

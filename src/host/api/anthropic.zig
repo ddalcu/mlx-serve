@@ -15,6 +15,7 @@ const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
 const model_registry_mod = @import("../registry/registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const LoadedModel = model_registry_mod.LoadedModel;
+const ModelConfig = @import("../../sdk/config/model.zig").ModelConfig;
 const io_util = @import("../../sdk/util/io_util.zig");
 const nowMs = io_util.nowMs;
 const Stopwatch = io_util.Stopwatch;
@@ -602,7 +603,7 @@ pub fn handleAnthropicMessages(
         return;
     };
     const request_effort = if (output_cfg.effort) |word| reasoningEffortFromWord(word, default_budget) else null;
-    const thinking = resolveThinking(gen, thinking_on, request_effort, config.defaultEnableThinking(root.get("tools") != null), default_budget);
+    const thinking = resolveThinking(gen, thinking_on, request_effort, anthropicDefaultThinking(config, root.get("tools")), default_budget);
     var enable_thinking = thinking.enable;
     const effort_word: ?[]const u8 = if (thinking.effort) |cfg| cfg.effort else null;
     const reasoning_budget = forcedReasoningBudget(gen, budget_tokens orelse default_budget);
@@ -1129,7 +1130,27 @@ fn handleAnthropicNonStreaming(
     try sendResponse(stream, "200 OK", "application/json", response);
 }
 
+fn anthropicDefaultThinking(config: *const ModelConfig, tools: ?std.json.Value) bool {
+    return config.defaultEnableThinking(chat_mod.declaresTools(tools));
+}
+
 // ── tests ──
+
+test "anthropicDefaultThinking: only a non-empty tools array turns on a tools-gated thinking default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const muse: ModelConfig = .{ .legacy = .{ .thinking = .on_with_tools } };
+    const cases = [_]struct { tools: []const u8, thinks: bool }{
+        .{ .tools = "null", .thinks = false },
+        .{ .tools = "[]", .thinks = false },
+        .{ .tools = "[{\"name\":\"f\",\"input_schema\":{\"type\":\"object\"}}]", .thinks = true },
+    };
+    try std.testing.expect(!anthropicDefaultThinking(&muse, null));
+    for (cases) |c| {
+        const tools = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), c.tools, .{});
+        try std.testing.expectEqual(c.thinks, anthropicDefaultThinking(&muse, tools));
+    }
+}
 
 test "anthropicStopReason: a matched client stop sequence reports stop_sequence, truncation stays honest" {
     // Anthropic spec: when a CLIENT stop sequence cut the text, stop_reason is

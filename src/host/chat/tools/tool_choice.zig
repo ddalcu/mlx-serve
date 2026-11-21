@@ -25,6 +25,11 @@ pub fn toolsDeclare(tools: ?std.json.Value, name: []const u8) bool {
     return false;
 }
 
+pub fn declaresTools(tools: ?std.json.Value) bool {
+    const t = tools orelse return false;
+    return t == .array and t.array.items.len > 0;
+}
+
 fn toolName(t: std.json.Value) ?[]const u8 {
     if (t != .object) return null;
     const holder = if (t.object.get("function")) |f| f else t;
