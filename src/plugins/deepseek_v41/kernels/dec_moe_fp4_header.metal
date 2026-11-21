@@ -77,6 +77,11 @@ inline float dec_fp4_down_routed(const device uint32_t* w, const device uint8_t*
   return acc;
 }
 
+// Four e4m3 bytes of `w` as floats, bytes 0..3 in order, each 2^-8 of its value as MLX's fp8.h reads it.
+inline float4 dec_fp4_e4m3x4(uint w) {
+  return float4(mlxserve_fp4_e4m3_x2m8(w & 0xFFu), mlxserve_fp4_e4m3_x2m8((w >> 8) & 0xFFu), mlxserve_fp4_e4m3_x2m8((w >> 16) & 0xFFu), mlxserve_fp4_e4m3_x2m8(w >> 24));
+}
+
 // A lane's part of the shared expert's down row `row` (mxfp8, K inputs: a unit is 32 bytes) against `x`, as above.
 template <int K, typename T>
 inline float dec_fp4_down_shared(const device uint32_t* sw, const device uint8_t* ss, size_t row, const device T* x, uint first, uint step) {
@@ -92,15 +97,14 @@ inline float dec_fp4_down_shared(const device uint32_t* sw, const device uint8_t
     for (int c = 0; c < 4; ++c) {
       const uint4 xq = ((const device uint4*)x)[u * 4 + c];
       const float xf[8] = {dec_up_bf(xq.x, 0), dec_up_bf(xq.x, 1), dec_up_bf(xq.y, 0), dec_up_bf(xq.y, 1), dec_up_bf(xq.z, 0), dec_up_bf(xq.z, 1), dec_up_bf(xq.w, 0), dec_up_bf(xq.w, 1)};
-      const float4 a = dec_up_e4m3x4(qs[2 * c]), b = dec_up_e4m3x4(qs[2 * c + 1]);
+      const float4 a = dec_fp4_e4m3x4(qs[2 * c]), b = dec_fp4_e4m3x4(qs[2 * c + 1]);
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         d = fma(xf[i], a[i], d);
         d = fma(xf[4 + i], b[i], d);
       }
     }
-    const uint e = uint(sp[u]);
-    acc = fma(as_type<float>(e == 0u ? 0x400000u : (e << 23)) * 256.0f, d, acc);
+    acc = fma(mlxserve_fp4_e8m0(uint(sp[u])), d * 256.0f, acc);
   }
   return acc;
 }

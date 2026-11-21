@@ -1360,3 +1360,53 @@ test "dsv41 fp4 nvfp4 as mxfp4: prefill's sorted gathers of NVIDIA's power-of-tw
     }
     try testing.expectEqual(@as(usize, 0), bad);
 }
+
+test "dsv41 dec moe_fp4 rules: the shared expert's down reads every e4m3 code and every e8m0 scale code as MLX's mxfp8 composed path does, bit for bit" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const kern = try moe_fp4.build(lim_ds);
+    defer kern.deinit();
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    // Columns 0..255: the e8m0 scale byte c on the e4m3 code 1.0 at input 40 (unit 1); 256..511: the e4m3 code c - 256
+    // under scale 1. The shared slot's activation is 1 at input 40, the routed slot's bank all zero.
+    const N = 512;
+    const K = 64;
+    const at = 40;
+    const bytes = try gpa.alloc(u8, N * K);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    const s8 = try gpa.alloc(u8, N * K / 32);
+    defer gpa.free(s8);
+    @memset(s8, 127);
+    const want = try gpa.alloc(f32, N);
+    defer gpa.free(want);
+    for (0..N) |c| {
+        bytes[c * K + at] = if (c < 256) 0x38 else @intCast(c - 256);
+        if (c < 256) s8[c * (K / 32) + at / 32] = @intCast(c);
+        const v = if (c < 256) e8m0Rule(@intCast(c)) else e4m3Rule(@intCast(c - 256));
+        // A sum starts at +0: a -0 term leaves +0.
+        want[c] = bf16Round(if (v == 0) 0 else v);
+    }
+    const sdn = try mxfp8Bank(&sc, bytes, s8, N, K);
+    const zc = try gpa.alloc(u8, N * K);
+    defer gpa.free(zc);
+    @memset(zc, 0);
+    const zs = try gpa.alloc(u8, N * K / 32);
+    defer gpa.free(zs);
+    @memset(zs, 127);
+    const dn = try fp4Bank(&sc, zc, zs, &.{ 1, N }, K, 32);
+    var ly: dsv41.Layer = undefined;
+    ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .down = .{ .w = dn[0], .s = dn[1], .qp = Fmt.mxfp4.qp() } };
+    ly.shared[2] = .{ .w = sdn[0], .s = sdn[1], .qp = mxfp8 };
+    var av: [2 * K]f32 = @splat(0);
+    av[K + at] = 1;
+    const act = try bf16Of(&sc, &av, &.{ 1, 2, K });
+    const idx = try sc.keep(mlx.mlx_array_new_data(&[_]u32{0}, &[_]c_int{ 1, 1 }, 2, .uint32));
+    const sp, const x1 = try identitySplit(&sc, 1, 4, N);
+    const got = try dsv41.hostF32((try moe_fp4.moeDown(&sc, kern, &ly, act, idx, x1, &sp)) orelse return error.Declined);
+    defer gpa.free(got);
+    const comp = try dsv41.hostF32(try composedDown(&sc, &ly, act, idx, x1, &sp));
+    defer gpa.free(comp);
+    try checkColumns("shared down", .mxfp4, got[0..N], want, comp[0..N], N);
+}
