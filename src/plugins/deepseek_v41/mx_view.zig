@@ -448,9 +448,9 @@ fn splitPair(b: []u8, _: usize) void {
     b[1] = e4m3Of(if (a < 8) a + 1 else a - 1);
 }
 
-/// Row 0's spans one power of two lower (one higher at the least): still a view, of other values.
-fn shiftRow0(b: []u8, cols: usize) void {
-    for (b[0..cols]) |*v| {
+/// Every span one power of two lower (one higher at the least): still a view, of other values.
+fn shiftAll(b: []u8, _: usize) void {
+    for (b) |*v| {
         const a: i32 = e4m3Exponent(v.*).?;
         v.* = e4m3Of(if (a > -9) a - 1 else a + 1);
     }
@@ -503,6 +503,29 @@ fn bitDiff(label: []const u8, a: A, b: A) !usize {
     return diff;
 }
 
+/// The relative rms error of `a` against `b` in f32, `a`'s bits that differ printed beside it under `label`.
+fn relErr(label: []const u8, a: A, b: A) !f32 {
+    _ = try bitDiff(label, a, b);
+    var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const y = try sc.astype(b, .float32);
+    const d = try sc.op2(mlx.mlx_subtract, try sc.astype(a, .float32), y);
+    var sums: [2]f32 = undefined;
+    for ([_]A{ d, y }, &sums) |x, *o| {
+        var n = mlx.mlx_array_new();
+        const t = try sc.res(mlx.mlx_sum(&n, try sc.mul(x, x), false, sc.s), &n);
+        try mlx.check(mlx.mlx_array_eval(t));
+        try mlx.check(mlx.mlx_array_item_float32(o, t));
+    }
+    const e = @sqrt(sums[0] / sums[1]);
+    std.debug.print("[mxfp4 view] {s}: relative rms error {e}\n", .{ label, e });
+    return e;
+}
+
+/// A reordered sum (16-groups summed apart, other tiling) moves bf16 outputs by an ulp here and there, far below this;
+/// a wrong scale moves them by tens of percent.
+const tol: f32 = 1e-2;
+
 fn sameBytes(a: A, b: A) !bool {
     const x = try bytesOf(a);
     defer testing.allocator.free(x);
@@ -536,7 +559,7 @@ fn sameValues(sc: *dsv41.Scope, a: A, b: A) !bool {
     return same;
 }
 
-test "dsv41 mxfp4 view: NVIDIA's power-of-two NVFP4 bank loads as the MXFP4 bank of its values (the codes as stored, the converter's e8m0, no e4m3 scales or globals) and serves the NVFP4 bank's bytes: decode R = 1..6 (fused fp4, the gathers), prefill, the whole layer; an MXFP4 bank loads as it is" {
+test "dsv41 mxfp4 view: NVIDIA's power-of-two NVFP4 bank loads as the MXFP4 bank of its values (the codes as stored, the converter's e8m0, no e4m3 scales or globals) and serves the NVFP4 bank's outputs to a reorder's tolerance: decode R = 1..6 (fused fp4, the gathers), prefill, the whole layer; an MXFP4 bank loads as it is" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const fp4_nax = env.override(.MLX_SERVE_DSV41_MOE_FP4_NAX, "1");
@@ -560,10 +583,10 @@ test "dsv41 mxfp4 view: NVIDIA's power-of-two NVFP4 bank loads as the MXFP4 bank
     defer mx.deinit();
     const mx_on = try load(&cfg, try cloneMap(&base.w), li, li + 1, true);
     defer mx_on.deinit();
-    // The planted control: row 0 of every expert's gate one power of two off, still a view.
+    // The planted control: every expert's gate one power of two off, still a view.
     const off = blk: {
         var w = try cloneMap(&nv_map);
-        for (0..E) |x| editScales(&w, li, x, 0, &shiftRow0) catch |e| {
+        for (0..E) |x| editScales(&w, li, x, 0, &shiftAll) catch |e| {
             w.deinit();
             return e;
         };
@@ -609,8 +632,8 @@ test "dsv41 mxfp4 view: NVIDIA's power-of-two NVFP4 bank loads as the MXFP4 bank
     const MR = decode.max_rows;
     const hc = cfg.dsv4_hc_mult;
     const arms = [_]*fixture.Fixture{ view, mx };
-    var bad: usize = 0;
-    var control: [2]usize = .{ 0, 0 };
+    var worst: f32 = 0;
+    var control: f32 = std.math.inf(f32);
     var label: [80]u8 = undefined;
     // Decode: the fused fp4 kernels (they must take the layer), then the routed gathers.
     for (1..MR + 1) |R| {
@@ -628,10 +651,11 @@ test "dsv41 mxfp4 view: NVIDIA's power-of-two NVFP4 bank loads as the MXFP4 bank
             z.* = try dsv41.routed(&sc, fx.m, ly, h, r.idx, r.wts);
         }
         for (arms, 1..) |_, k| {
-            bad += try bitDiff(try std.fmt.bufPrint(&label, "decode fused R={d}, {s}", .{ R, if (k == 1) "view" else "mxfp4 pack" }), fused[k], fused[0]);
-            bad += try bitDiff(try std.fmt.bufPrint(&label, "decode gathers R={d}, {s}", .{ R, if (k == 1) "view" else "mxfp4 pack" }), gathers[k], gathers[0]);
+            worst = @max(worst, try relErr(try std.fmt.bufPrint(&label, "decode fused R={d}, {s}", .{ R, if (k == 1) "view" else "mxfp4 pack" }), fused[k], fused[0]));
+            worst = @max(worst, try relErr(try std.fmt.bufPrint(&label, "decode gathers R={d}, {s}", .{ R, if (k == 1) "view" else "mxfp4 pack" }), gathers[k], gathers[0]));
         }
-        control[0] += try bitDiff(try std.fmt.bufPrint(&label, "decode fused R={d}, planted control", .{R}), fused[3], fused[0]);
+        control = @min(control, try relErr(try std.fmt.bufPrint(&label, "decode fused R={d}, planted control", .{R}), fused[3], fused[0]));
+        control = @min(control, try relErr(try std.fmt.bufPrint(&label, "decode gathers R={d}, planted control", .{R}), gathers[3], gathers[0]));
     }
     // Prefill: the sorted gathers.
     for ([_]usize{ 512, 2048 }) |L| {
@@ -643,8 +667,8 @@ test "dsv41 mxfp4 view: NVIDIA's power-of-two NVFP4 bank loads as the MXFP4 bank
             const r = try dsv41.route(&sc, fx.m, fx.layer(li), h, none);
             o.* = try sc.keep(try dsv41.moeShare(fx.m, gpa, li, h, r.idx, r.wts));
         }
-        for (arms, 1..) |_, k| bad += try bitDiff(try std.fmt.bufPrint(&label, "prefill L={d}, {s}", .{ L, if (k == 1) "view" else "mxfp4 pack" }), y[k], y[0]);
-        control[1] += try bitDiff(try std.fmt.bufPrint(&label, "prefill L={d}, planted control", .{L}), y[3], y[0]);
+        for (arms, 1..) |_, k| worst = @max(worst, try relErr(try std.fmt.bufPrint(&label, "prefill L={d}, {s}", .{ L, if (k == 1) "view" else "mxfp4 pack" }), y[k], y[0]));
+        control = @min(control, try relErr(try std.fmt.bufPrint(&label, "prefill L={d}, planted control", .{L}), y[3], y[0]));
     }
     // The whole layer: a 512-row prompt, then steps of 1..6 rows on its state (the stream and the mix).
     var p0: usize = 0;
@@ -663,16 +687,16 @@ test "dsv41 mxfp4 view: NVIDIA's power-of-two NVFP4 bank loads as the MXFP4 bank
             have += 1;
         }
         for (1..3) |k| for (0..2) |j| {
-            bad += try bitDiff(try std.fmt.bufPrint(&label, "layer L={d} at {d} {s}, {s}", .{ L, p0, if (j == 0) "stream" else "mix", if (k == 1) "view" else "mxfp4 pack" }), out[k][j], out[0][j]);
+            worst = @max(worst, try relErr(try std.fmt.bufPrint(&label, "layer L={d} at {d} {s}, {s}", .{ L, p0, if (j == 0) "stream" else "mix", if (k == 1) "view" else "mxfp4 pack" }), out[k][j], out[0][j]));
         };
         p0 += L;
     }
-    try testing.expectEqual(@as(usize, 0), bad);
-    // A view one power of two off on one row of each gate moves the bytes: the comparison sees a wrong scale.
-    try testing.expect(control[0] > 0 and control[1] > 0);
+    try testing.expect(worst <= tol);
+    // A view one power of two off on every gate span: the comparison sees a wrong scale.
+    try testing.expect(control > 10 * tol);
 }
 
-test "dsv41 mxfp4 view: a bank with one span or one global off a power of two stays NVFP4 as loaded, named in the log, beside a layer the view takes; the mixed load serves the NVFP4 load's bytes" {
+test "dsv41 mxfp4 view: a bank with one span or one global off a power of two stays NVFP4 as loaded, named in the log, beside a layer the view takes; the mixed load serves the NVFP4 load's outputs to a reorder's tolerance" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -726,7 +750,7 @@ test "dsv41 mxfp4 view: a bank with one span or one global off a power of two st
         }
     }
     // The three layers, the view's mixed formats against the NVFP4 load: a prompt, then steps of 1 and 2 rows.
-    var bad: usize = 0;
+    var worst: f32 = 0;
     var p0: usize = 0;
     var label: [64]u8 = undefined;
     for ([_]usize{ 256, 1, 2 }) |L| {
@@ -742,8 +766,8 @@ test "dsv41 mxfp4 view: a bank with one span or one global off a power of two st
         defer for (b) |o| {
             _ = mlx.mlx_array_free(o);
         };
-        for (0..2) |j| bad += try bitDiff(try std.fmt.bufPrint(&label, "layers 20..22 L={d} {s}", .{ L, if (j == 0) "stream" else "mix" }), a[j], b[j]);
+        for (0..2) |j| worst = @max(worst, try relErr(try std.fmt.bufPrint(&label, "layers 20..22 L={d} {s}", .{ L, if (j == 0) "stream" else "mix" }), a[j], b[j]));
         p0 += L;
     }
-    try testing.expectEqual(@as(usize, 0), bad);
+    try testing.expect(worst <= tol);
 }
