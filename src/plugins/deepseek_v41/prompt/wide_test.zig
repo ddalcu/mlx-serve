@@ -378,11 +378,12 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
     mlx.installErrorHandler();
     const gpa = testing.allocator;
     inline for (switches) |n| env.unset(n);
-    // A ratio-2 pair (layers 14, 15) and a ratio-1 pair (20, 21), each range its own KV and index source.
+    // A ratio-2 pair (layers 8, 9) and a ratio-1 pair (20, 21), each range its own KV and index source and no Engram
+    // layer (14 reads Engram, which a pair worker's fixture does not hold).
     const Case = struct { lo: usize, rows: usize };
     // Every case and switch runs; each out of tolerance is reported.
     var ok = true;
-    for ([_]Case{ .{ .lo = 14, .rows = 5000 }, .{ .lo = 20, .rows = 8192 } }) |c| inline for (.{ false, true }) |nv| {
+    for ([_]Case{ .{ .lo = 8, .rows = 5000 }, .{ .lo = 20, .rows = 8192 } }) |c| inline for (.{ false, true }) |nv| {
         var lb: [64]u8 = undefined;
         const label = try std.fmt.bufPrint(&lb, "{d}-{d} {s} at {d} rows", .{ c.lo, c.lo + 1, if (nv) "NVFP4" else "MXFP4", c.rows });
         const fx = fixture.Fixture.init(gpa, .{ .lo = c.lo, .hi = c.lo + 2, .ctx = 0, .experts_fp4 = !nv, .experts_nvfp4 = nv, .expert_scales = if (nv) .all else .none }) catch |e| {
