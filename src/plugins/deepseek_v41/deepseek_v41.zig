@@ -3019,7 +3019,7 @@ pub fn hcExpandNormLaunch(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *con
 }
 /// The attention side's hc of a wide layer (`hcPreNormWide`; with `w2` also RA_FUSED's read-ahead norm, `.hp`):
 /// one launch (`hcMixNormFused`, unless hc_fuse.zig's kernels were refused at load).
-fn attnHcWide(sc: *Scope, m: *const Dsv41Model, x: A, pres: A, ly: *const Layer, w2: ?A) !struct { pa: Normed, hp: A } {
+pub fn attnHcWide(sc: *Scope, m: *const Dsv41Model, x: A, pres: A, ly: *const Layer, w2: ?A) !struct { pa: Normed, hp: A } {
     const eps = try hcEps(sc, m);
     if (hcf_k != null) {
         const r = try hcMixNormFused(sc, m, x, pres, &ly.hc_attn, ly.attn_norm, w2, eps);
