@@ -86,11 +86,11 @@ const float pos = float(g0 + gi);
       r[2 * pp + 1] = float(bfloat(x1 * sn + x2 * cs));
     }
   }
-  float amax = mlxserve_maximum(mlxserve_maximum(metal::abs(r[0]), metal::abs(r[1])), mlxserve_maximum(metal::abs(r[2]), metal::abs(r[3])));
-  amax = mlxserve_maximum(amax, metal::simd_shuffle_xor(amax, 1));
-  amax = mlxserve_maximum(amax, metal::simd_shuffle_xor(amax, 2));
-  const float scale = mlxserve_fp8_e4m3_round(mlxserve_maximum(amax, 6.0f * 0.001953125f) / 6.0f);
-  for (ushort i = 0; i < 4; ++i) comp[size_t(gi) * 512 + 4 * t + i] = bfloat(mlxserve_fp4_e2m1_round(mlxserve_clip(r[i] / scale, -6.0f, 6.0f)) * scale);
+  float amax = metal::max(metal::max(metal::abs(r[0]), metal::abs(r[1])), metal::max(metal::abs(r[2]), metal::abs(r[3])));
+  amax = metal::max(amax, metal::simd_shuffle_xor(amax, 1));
+  amax = metal::max(amax, metal::simd_shuffle_xor(amax, 2));
+  const float scale = dsv41_fp8_roundtrip(metal::max(amax, 6.0f * 0.001953125f) / 6.0f);
+  for (ushort i = 0; i < 4; ++i) comp[size_t(gi) * 512 + 4 * t + i] = bfloat(dsv41_e2m1(metal::clamp(r[i] / scale, -6.0f, 6.0f)) * scale);
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -145,10 +145,10 @@ if (sg == 0) {
       r[2 * pp + 1] = float(bfloat(x1 * sn + x2 * cs));
     }
   }
-  float amax = mlxserve_maximum(mlxserve_maximum(metal::abs(r[0]), metal::abs(r[1])), mlxserve_maximum(metal::abs(r[2]), metal::abs(r[3])));
-  amax = mlxserve_maximum(amax, metal::simd_shuffle_xor(amax, 1));
-  amax = mlxserve_maximum(amax, metal::simd_shuffle_xor(amax, 2));
-  amax = mlxserve_maximum(amax, metal::simd_shuffle_xor(amax, 4));
-  const float scale = mlxserve_mx_scale_round_up(mlxserve_maximum(amax, 6.0f * 1.17549435e-38f) * (1.0f / 6.0f));
-  for (ushort i = 0; i < 4; ++i) idx[size_t(gi) * 128 + 4 * lane + i] = bfloat(mlxserve_fp4_e2m1_round(mlxserve_clip(r[i] / scale, -6.0f, 6.0f)) * scale);
+  float amax = metal::max(metal::max(metal::abs(r[0]), metal::abs(r[1])), metal::max(metal::abs(r[2]), metal::abs(r[3])));
+  amax = metal::max(amax, metal::simd_shuffle_xor(amax, 1));
+  amax = metal::max(amax, metal::simd_shuffle_xor(amax, 2));
+  amax = metal::max(amax, metal::simd_shuffle_xor(amax, 4));
+  const float scale = dsv41_pow2ceil(metal::max(amax, 6.0f * 1.17549435e-38f) * (1.0f / 6.0f));
+  for (ushort i = 0; i < 4; ++i) idx[size_t(gi) * 128 + 4 * lane + i] = bfloat(dsv41_e2m1(metal::clamp(r[i] / scale, -6.0f, 6.0f)) * scale);
 }

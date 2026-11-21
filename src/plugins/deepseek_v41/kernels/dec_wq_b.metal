@@ -61,8 +61,8 @@ if (int(tg) == G - 1) {
       const float cs = metal::fast::cos(theta), sn = metal::fast::sin(theta);
       r = float(T(even ? x1 * cs - x2 * sn : x1 * sn + x2 * cs));
     }
-    const float scale = mlxserve_mx_scale_round_up(mlxserve_maximum(mlxserve_simd_max(metal::abs(r)), 1e-4f) * (1.0f / 448.0f));
-    r = mlxserve_fp8_e4m3_round(mlxserve_clip(r / scale, -448.0f, 448.0f)) * scale;
+    const float scale = dsv41_pow2ceil(metal::max(metal::simd_max(metal::abs(r)), 1e-4f) * (1.0f / 448.0f));
+    r = dsv41_fp8_roundtrip(metal::clamp(r / scale, -448.0f, 448.0f)) * scale;
     kv_row[kv_l * D + d] = T(r);
   }
 }
@@ -134,17 +134,17 @@ if constexpr (UI > 0) {
         vr = float(T(h == 0 ? x1 * cs - x2 * sn : x1 * sn + x2 * cs));
       }
       vals[p] = vr;
-      amax = mlxserve_maximum(amax, metal::abs(vr));
+      amax = metal::max(amax, metal::abs(vr));
     }
-    amax = mlxserve_maximum(amax, metal::simd_shuffle_xor(amax, 16));
+    amax = metal::max(amax, metal::simd_shuffle_xor(amax, 16));
     if (lane < R) ps[lane * SGS + sg] = amax;
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     float blk = 0.0f;
-    for (int g = 0; g < SGS; ++g) blk = mlxserve_maximum(blk, ps[metal::min(int(j), R - 1) * SGS + g]);
+    for (int g = 0; g < SGS; ++g) blk = metal::max(blk, ps[metal::min(int(j), R - 1) * SGS + g]);
     threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    const float scale = mlxserve_mx_scale_round_up(mlxserve_maximum(blk, 6.0f * 1.17549435e-38f) * (1.0f / 6.0f));
+    const float scale = dsv41_pow2ceil(metal::max(blk, 6.0f * 1.17549435e-38f) * (1.0f / 6.0f));
     for (int p = 0; p < PI; ++p) {
-      const float qv = mlxserve_fp4_e2m1_round(mlxserve_clip(vals[p] / scale, -6.0f, 6.0f)) * scale;
+      const float qv = dsv41_e2m1(metal::clamp(vals[p] / scale, -6.0f, 6.0f)) * scale;
       if (int(j) < R) q_idx[int(j) * NI + n_base + 2 * p + int(h)] = float(T(qv));
     }
   }

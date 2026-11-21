@@ -347,39 +347,33 @@ const PoolCase = struct {
         return groups(p, s) * (512 + channels) + if (leftover(p, s)) @as(usize, 1024) else 0;
     }
 
-    /// Float64's classes only. A NaN pooled value makes the group NaN throughout (its rms is). An infinite one with no
-    /// NaN gives an infinite rms, so the normed row is 0 but NaN at the infinite values (x * rsqrt(inf)): the comp row is
-    /// NaN in the 16-blocks holding one (the rope pairs stay inside a block), the index key throughout (wk's zeros
-    /// times NaN). Else finite.
+    /// Float64's classes only: a group with a non-finite pooled value is NaN throughout (its rms is), else finite.
     pub fn compute(k: anytype, out: []f64, mag: []f64, _: Sum) !void {
         const G = groups(k.p, k.shape);
         const np = k.shape.n;
         const rows = k.in(0);
         @memset(mag, 0);
         for (0..G) |g| {
-            var nan_in = false;
-            var inf_block: [512 / 16]bool = @splat(false);
+            var bad = false;
             for (0..512) |i| {
-                var x: f64 = undefined;
-                if (!k.p.pooling) x = rows[g * 512 + i] else {
-                    var kv: [2]f64 = undefined;
-                    var ga: [2]f64 = undefined;
-                    for (0..2) |j| {
-                        const c = 2 * g + j;
-                        kv[j] = if (c < np) k.in(1)[c * 512 + i] else rows[(c - np) * 1024 + i];
-                        ga[j] = if (c < np) k.in(2)[c * 512 + i] else rows[(c - np) * 1024 + 512 + i];
-                    }
-                    const m = kit.maxN(ga[0], ga[1]);
-                    const e0 = @exp(ga[0] - m);
-                    const e1 = @exp(ga[1] - m);
-                    x = kv[0] * (e0 / (e0 + e1)) + kv[1] * (e1 / (e0 + e1));
+                if (!k.p.pooling) {
+                    bad = bad or !std.math.isFinite(rows[g * 512 + i]);
+                    continue;
                 }
-                nan_in = nan_in or std.math.isNan(x);
-                if (std.math.isInf(x)) inf_block[i / 16] = true;
+                var kv: [2]f64 = undefined;
+                var ga: [2]f64 = undefined;
+                for (0..2) |j| {
+                    const c = 2 * g + j;
+                    kv[j] = if (c < np) k.in(1)[c * 512 + i] else rows[(c - np) * 1024 + i];
+                    ga[j] = if (c < np) k.in(2)[c * 512 + i] else rows[(c - np) * 1024 + 512 + i];
+                }
+                const m = kit.maxN(ga[0], ga[1]);
+                const e0 = @exp(ga[0] - m);
+                const e1 = @exp(ga[1] - m);
+                bad = bad or !std.math.isFinite(kv[0] * (e0 / (e0 + e1)) + kv[1] * (e1 / (e0 + e1)));
             }
-            const any_inf = std.mem.indexOfScalar(bool, &inf_block, true) != null;
-            for (inf_block, 0..) |inf_b, b| @memset(out[g * 512 + b * 16 ..][0..16], if (nan_in or inf_b) kit.nan else 0);
-            @memset(out[G * 512 + g * channels ..][0..channels], if (nan_in or any_inf) kit.nan else 0);
+            @memset(out[g * 512 ..][0..512], if (bad) kit.nan else 0);
+            @memset(out[G * 512 + g * channels ..][0..channels], if (bad) kit.nan else 0);
         }
         if (leftover(k.p, k.shape)) {
             const last = (k.shape.rows - 1) * 1024;
@@ -491,6 +485,7 @@ pub fn register(set: *kc.Set) !void {
         .outs = &.{ .{ .elem = .bf16, .count = pool2Comp }, .{ .elem = .f32, .count = pool2Comp } },
         .replaces = pool_chain,
         .served = &.{ .{ .rows = 6, .n = 0, .k = 512 }, .{ .rows = 1, .n = 1, .k = 512 }, .{ .rows = 2, .n = 1, .k = 512 }, .{ .rows = 3, .n = 0, .k = 512 }, .{ .rows = 4, .n = 1, .k = 512 }, .{ .rows = 5, .n = 0, .k = 512 } },
+        .known = c41.nan_code,
     });
     try kit.add(set, PoolCase, &pool1_l, .{ .pooling = false }, .{
         .name = "dsv41 dec idx_score pool (ratio 1: a group a row, index keys)",
@@ -499,6 +494,7 @@ pub fn register(set: *kc.Set) !void {
         .out = .bf16,
         .replaces = pool_chain,
         .served = &.{ .{ .rows = 6, .n = 0, .k = 512 }, .{ .rows = 1, .n = 0, .k = 512 }, .{ .rows = 3, .n = 0, .k = 512 } },
+        .known = c41.nan_code,
     });
 }
 

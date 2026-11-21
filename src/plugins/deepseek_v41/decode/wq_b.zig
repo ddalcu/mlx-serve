@@ -13,7 +13,7 @@ const A = mlx.mlx_array;
 const none: A = .{ .ctx = null };
 
 pub const SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_wq_b.metal");
-pub const HEADER = dsv41.FP8_HEADER ++ kernelSource("plugins/deepseek_v41/kernels/fp8_read_header.metal") ++ kernelSource("plugins/deepseek_v41/kernels/dec_wq_b_header.metal");
+pub const HEADER = dsv41.FP8_HEADER ++ @import("../../../sdk/quant/fp4.zig").SCALE_HEADER ++ kernelSource("plugins/deepseek_v41/kernels/fp8_read_header.metal") ++ kernelSource("plugins/deepseek_v41/kernels/dec_wq_b_header.metal");
 pub const INS = [_][*:0]const u8{ "qa", "qn", "w_q", "s_q", "w_i", "s_i", "kv", "kvn", "periods", "periods_i", "pos", "z", "eps" };
 pub const OUTS = [_][*:0]const u8{ "q", "q_idx", "kv_row", "pre", "post", "comb" };
 
@@ -538,6 +538,7 @@ pub fn register(set: *kc.Set) !void {
         .out = .bf16,
         .outs = &.{ .{ .elem = .bf16, .count = qN }, .{ .elem = .f32, .count = idxN }, .{ .elem = .bf16, .count = kvN }, .{ .elem = .f32, .count = preN }, .{ .elem = .f32, .count = preN }, .{ .elem = .f32, .count = combN } },
         .nan = cx.quant_nan,
+        .known = cx.nan_code,
         .tiles = .{ .{ .size = 4 }, .{}, .{ .size = cx.IHD, .step = cx.IHD, .min = cx.IHD } },
         .served = &.{ .{ .rows = 1, .n = 2 * KV, .k = 2 * cx.IHD }, .{ .rows = 6, .n = KV, .k = cx.IHD }, .{ .rows = 1, .n = KV, .k = 0 }, .{ .rows = 6, .n = 2 * KV, .k = 0 } },
     });

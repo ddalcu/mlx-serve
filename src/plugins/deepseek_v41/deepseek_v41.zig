@@ -1712,8 +1712,9 @@ pub const MOE_COMBINE_INS = [_][*:0]const u8{ "dn", "inv", "sh" };
 /// T, written as OT.
 pub const ROPE_TAIL_SOURCE = kernelSource("plugins/deepseek_v41/kernels/rope_tail.metal");
 
-/// The activation round trips' encoders: MLX's e4m3 / e8m0 / e2m1 and its NaN-keeping max and clip.
-pub const FP8_HEADER = @import("../../sdk/quant/fp_encode.zig").HEADER;
+/// e4m3 encode/decode exactly as MLX's `fp8_e4m3` (which takes it from
+/// PyTorch's `Float8_e4m3fn`): saturating, round to nearest even.
+pub const FP8_HEADER = kernelSource("plugins/deepseek_v41/kernels/fp8_header.metal");
 
 /// `kvRow` after its projection, one threadgroup (D threads) a row: MLX's
 /// rms_norm, the tail rope, then (QAT) the fp8 / 32 / ue8m0 round trip.
