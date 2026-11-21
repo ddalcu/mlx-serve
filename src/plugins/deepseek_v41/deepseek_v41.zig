@@ -9773,7 +9773,8 @@ test "dsv41 verify width: time of a verify block per draft count (DSV41_VERIFY_R
 }
 
 test "dsv41 verify exact: on a real pack, every verify row's logits are its plain step's bits (DSV41_VERIFY_EXACT)" {
-    // DSV41_VERIFY_EXACT = a pack dir; DSV41_STEP_CTX prompt tokens first (default 17639); DSV41_ROUND_TEXT a text.
+    // DSV41_VERIFY_EXACT = a pack dir; DSV41_STEP_CTX prompt tokens first (default 17639); DSV41_ROUND_TEXT a text;
+    // DSV41_VERIFY_EXACT_STEPS plain steps (default 120).
     const dir = std.mem.span(std.c.getenv("DSV41_VERIFY_EXACT") orelse return error.SkipZigTest);
     const ctx = if (std.c.getenv("DSV41_STEP_CTX")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 17639;
     const gpa = testing.allocator;
@@ -9810,8 +9811,9 @@ test "dsv41 verify exact: on a real pack, every verify row's logits are its plai
     const pb = try hostF32(lb);
     defer gpa.free(pb);
     try testing.expect(std.mem.eql(u8, std.mem.sliceAsBytes(pa), std.mem.sliceAsBytes(pb)));
-    const n = 120;
-    var toks: [n + 1]u32 = undefined;
+    const n = if (std.c.getenv("DSV41_VERIFY_EXACT_STEPS")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 120;
+    const toks = try gpa.alloc(u32, n + 1);
+    defer gpa.free(toks);
     toks[0] = try argmaxHost(la);
     const logits = try gpa.alloc([]f32, n);
     defer {
@@ -9828,13 +9830,35 @@ test "dsv41 verify exact: on a real pack, every verify row's logits are its plai
         _ = mlx.mlx_array_free(g);
         g = mlx.mlx_array_new_data(&toks[k + 1], &[_]c_int{1}, 1, .uint32);
     }
-    // Verifies of the plain tokens, R = 1..6 rows; every third round keeps one row fewer than it verified (a rollback).
+    // As a served round runs: the stages draft (their tokens discarded), then a verify of the plain tokens, R = 1..6
+    // rows; every third round keeps one row fewer than it verified (a rollback), every seventh is a plain tick instead.
     var at: usize = 0;
     var round: usize = 0;
     var bad_rows: usize = 0;
     var first_bad: ?[3]usize = null;
     var per_r: [dkern.max_rows + 1][2]usize = @splat(.{ 0, 0 });
     while (at < n) : (round += 1) {
+        if (round % 7 == 6) {
+            const gt = mlx.mlx_array_new_data(&toks[at], &[_]c_int{1}, 1, .uint32);
+            defer _ = mlx.mlx_array_free(gt);
+            const l = try extendIds(m, gpa, &sb, .{ .gpu = gt }, .last, null);
+            defer _ = mlx.mlx_array_free(l);
+            const got = try hostF32(l);
+            defer gpa.free(got);
+            per_r[0][0] += 1;
+            if (!std.mem.eql(u8, std.mem.sliceAsBytes(got), std.mem.sliceAsBytes(logits[at]))) {
+                per_r[0][1] += 1;
+                bad_rows += 1;
+                if (first_bad == null) first_bad = .{ at, 0, 0 };
+                if (bad_rows <= 12) std.debug.print("[verify-exact] step {d} (round {d}, a plain tick) differs\n", .{ at, round });
+            }
+            at += 1;
+            continue;
+        }
+        {
+            var dr = try dsparkDraft(m, gpa, &sb, toks[at]);
+            dr.deinit(gpa);
+        }
         const R = @min(1 + round % dkern.max_rows, n - at);
         const ids = try gpa.alloc(u32, R);
         @memcpy(ids, toks[at..][0..R]);
@@ -9863,7 +9887,7 @@ test "dsv41 verify exact: on a real pack, every verify row's logits are its plai
         res.deinit(gpa);
         at += keep;
     }
-    for (1..dkern.max_rows + 1) |R| std.debug.print("[verify-exact] ctx {d} R={d}: {d} of {d} rows differ\n", .{ ctx, R, per_r[R][1], per_r[R][0] });
+    for (0..dkern.max_rows + 1) |R| std.debug.print("[verify-exact] ctx {d} R={d}{s}: {d} of {d} rows differ\n", .{ ctx, R, if (R == 0) " (plain ticks)" else "", per_r[R][1], per_r[R][0] });
     if (first_bad) |f| std.debug.print("[verify-exact] first differing row: step {d} (R={d}, row {d})\n", .{ f[0], f[1], f[2] });
     try testing.expectEqual(@as(usize, 0), bad_rows);
 }
