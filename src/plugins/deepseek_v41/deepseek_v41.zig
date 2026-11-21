@@ -1714,6 +1714,7 @@ fn hcMixRows() usize {
 }
 // The pfkern switches' one-time engagement lines (first use a process; no per-call output).
 var hc_mix8_logged: std.atomic.Value(bool) = .init(false);
+var ced_lazy_logged: std.atomic.Value(bool) = .init(false);
 var hc_expand_norm_logged: std.atomic.Value(bool) = .init(false);
 var woa_join_logged: std.atomic.Value(bool) = .init(false);
 const hc_mix_cols = [_]usize{ 6, 4, 3, 2, 1 };
@@ -5662,6 +5663,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     // logits, the decoder layers' window rings and the DSpark rows stay unevaluated.
     const lazy = tail != null and ced_lazy.on() and m.tp == null and m.streamed == null and ids == .host and
         ced_lazy.defers(m.prompt, ids.host, p0, c.sliding_window, m.ced_min_skip, st.snap_at);
+    if (lazy and !ced_lazy_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_CED_LAZY engaged: a prompt chunk's CED replay left to its first reader (chunk at {d})\n", .{p0});
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(gpa);
     if (!lazy) try ev.append(gpa, logits);
