@@ -77,6 +77,13 @@ pub fn on(comptime name: @EnumLiteral()) bool {
     return onValue(get(name));
 }
 
+/// A default-on flag: on unless set to a value starting with `0`.
+pub fn onUnlessZero(comptime name: @EnumLiteral()) bool {
+    comptime expectType(name, .flag);
+    const v = get(name) orelse return true;
+    return v[0] != '0';
+}
+
 /// Set at all, `FOO=0` included.
 pub fn present(comptime name: @EnumLiteral()) bool {
     return get(name) != null;
@@ -327,7 +334,7 @@ pub const vars = struct {
     pub const MLX_SERVE_DSV41_MOE_FP4_NAX: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "DeepSeek-V4.1 fused fp4 MoE decode kernels (MXFP4, NVFP4 with per-expert scales) on a NAX GPU too, read each call (=0: there decode runs the routed gathers; without NAX the kernels always serve)" };
     pub const MLX_SERVE_DSV41_MOE_PAIR: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "=1: DeepSeek-V4.1 prompt calls run an fp4 bank's gate and up without per-expert scales (MXFP4) as one paired NAX launch with moe_act in its epilogue (f32, one rounding where the split path rounds twice); read each call" };
     pub const MLX_SERVE_DSV41_MOE_PAIR_SCALED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "on (default): the same for an fp4 bank with ModelOpt's per-expert gate and up scales (NVFP4), applied in the epilogue; =0: the split gathers; read each call" };
-    pub const MLX_SERVE_DSV41_HC_EXPAND_NORM: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "=1: a wide prompt layer's FFN-side hc expand and norm as one launch into a fresh stream (the fused kernel a streamed bank's layers take), the stock launches' math; read each call" };
+    pub const MLX_SERVE_DSV41_HC_EXPAND_NORM: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "on (default; =0 off): a wide prompt layer's FFN-side hc expand and norm as one launch into a fresh stream (the fused kernel a streamed bank's layers take), the stock launches' math; read each call" };
     pub const MLX_SERVE_DSV41_WOA_JOIN: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "=1: a wide prompt layer joins its spans' wo_a rows from their groups' views (one copy where each span's reshape and the join made two), the same math; read each call" };
     pub const MLX_SERVE_DSV41_HC_MIX8: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "=1: a NAX GPU's wide prompt layers run the hc mixes 8 rows a threadgroup instead of 4 (the mix weights read half as often), the same sums; read each call" };
     pub const MLX_SERVE_DSV41_MXFP4_VIEW: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "serves pow2-scale NVFP4 routed banks as MXFP4; default off keeps NVFP4" };
@@ -340,6 +347,11 @@ pub const vars = struct {
     pub const MLX_SERVE_DSV41_GEMV_R26_FFN_IN: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "=1: the DeepSeek-V4.1 fused decode ffn_in's wo_b launch runs on the matrix units from 5 rows (a wide verify block's; the ubench: slower at 2..4): every row against the weights in one tile op, the simdgroups splitting K; off: the vector kernel; read each call" };
     pub const MLX_SERVE_DSV41_FUSE_WQB_RING: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "=1: the DeepSeek-V4.1 fused decode wq_b launch also writes the step's window rows into the layer's ring (a copy of the ring with the rows at their slots), so no slice_update launch sits between wq_b and attention; off: the ring's own write; read each call" };
     pub const MLX_SERVE_DSV41_FP8_FOLD: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "on (default): the DeepSeek-V4.1 decode kernels' mxfp8 reads fold 2^8 onto the e8m0 scale with e4m3 read at 2^-8 (the earlier form: e8m0 0xFF reads +Inf, codes 247 and up overflow, e4m3 S.1111.111 reads 480) instead of MLX's reads, each dot times its scale; the same bytes on every finite code under 247; =0: MLX's reads" };
+    pub const MLX_SERVE_DSV41_FUSE_DOWN_SCALE: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "=1: DeepSeek-V4.1 decode and verify put an NVFP4 bank's per-expert down scale on the routing weights inside the fused fp4 gate/up launch, not as three ops on the route (the same f32 products), read at load, resident path only" };
+    pub const MLX_SERVE_DSV41_FUSE_ENGRAM: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "=1: a DeepSeek-V4.1 decode step's or verify's Engram wkv projection reads the mxfp4/mxfp8 table rows' codes in one launch (no dequant, cast or f32 rows; the sums in another order), and a prompt chunk's rows dequantize straight to the activation dtype; a held table is wrapped as GPU buffers the kernel gathers its rows from by id; read at load, resident path only" };
+    pub const MLX_SERVE_DSV41_FUSE_MXFP8_QMM: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "on (default; =0 off): DeepSeek-V4.1 mxfp8 linears over 1024 rows or more (a prompt chunk's) run MLX's quantized matmul (its NAX qmm reads the codes), not a dequantized bf16 weight and the dense GEMM; read at load, resident path only" };
+    pub const MLX_SERVE_DSV41_PF_BF16_TRUNK: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "=1: DeepSeek-V4.1's mxfp8 trunk linears (attention, the indexer's wq_b, the shared expert, Engram wkv) dequantized to bf16 once at load for the prompt's dense GEMMs (the same bytes as the per-chunk dequantize; decode keeps mxfp8), billed at load; read at load, resident path only" };
+    pub const MLX_SERVE_DSV41_WEIGHT_PATH: Var = .{ .kind = .kill, .type = .text, .default = "auto", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "DeepSeek-V4.1 kernel family, read at load: resident = the in-memory fusions (MLX_SERVE_DSV41_FUSE_*, each still off by default), refused by name on a pack whose experts stream or whose Engram tables are not all held; ssd = the streamed and staged kernels, no fusion; auto (unset) resident when nothing streams and every Engram table is held, else ssd. The load logs the choice and why" };
     pub const MLX_SERVE_F16_PREFILL: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks", .since = "26.10.4", .doc = "bf16 prefill dequant+GEMM and sorted affine gather_qmm in fp16 (GPUs without fast bf16 math, e.g. M1)" };
     pub const MLX_SERVE_MOE_GQMV_MXFP4: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks/moe", .since = "26.11.4", .doc = "MXFP4 expert banks (e8m0 scale per 32) on the gather_qmv decode kernels (gather_qmv, the gate+up+SwiGLU and the down+reduce, one row and 2..8 rows) beside NVFP4 and affine (=0: those kernels decline MXFP4; the sorted or composed path serves it)" };
     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
@@ -848,6 +860,22 @@ pub const vars = struct {
 // ── tests ──
 
 const testing = std.testing;
+
+test "onUnlessZero: a default-on flag is on unset and off only at 0" {
+    {
+        const o = override(.MLX_SERVE_DSV41_HC_EXPAND_NORM, null);
+        defer o.restore();
+        try testing.expect(onUnlessZero(.MLX_SERVE_DSV41_HC_EXPAND_NORM));
+    }
+    {
+        const o = override(.MLX_SERVE_DSV41_HC_EXPAND_NORM, "0");
+        defer o.restore();
+        try testing.expect(!onUnlessZero(.MLX_SERVE_DSV41_HC_EXPAND_NORM));
+    }
+    const o = override(.MLX_SERVE_DSV41_HC_EXPAND_NORM, "1");
+    defer o.restore();
+    try testing.expect(onUnlessZero(.MLX_SERVE_DSV41_HC_EXPAND_NORM));
+}
 
 test "value readers: on is set-and-not-0, int and float fall back on empty or garbage" {
     try testing.expect(!onValue(null));
