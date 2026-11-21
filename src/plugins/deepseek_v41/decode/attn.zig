@@ -966,3 +966,84 @@ test "dsv41 dec attn merge: the declared launch is the wrapper's, byte for byte;
     }
 }
 
+
+/// A decode step's attention then wo_a, each step reading the previous step's `oa` (as its scale): the plain split
+/// kernel with wo_a's merge, or the merge variant with wo_a over one split; wo_a's weights cycle over `wts`.
+const WoaChain = struct {
+    gpa: std.mem.Allocator,
+    sc: Scope,
+    kern: mlx.mlx_fast_metal_kernel,
+    kw: mlx.mlx_fast_metal_kernel,
+    merged: bool,
+    m: *const dsv41.Dsv41Model,
+    rig: *const Rig,
+    sink: A,
+    nosink: A,
+    counter: A,
+    wcounter: A,
+    meta: A,
+    wts: []const [3]A,
+    scal0: A,
+    scal: A,
+
+    pub fn step(self: *WoaChain, i: usize) !A {
+        const wo_a = @import("wo_a.zig");
+        if (i == 0) {
+            self.sc.deinit();
+            self.sc = Scope.init(self.gpa, mlx.gpuStream());
+            self.scal = self.scal0;
+        }
+        const r = self.rig;
+        const w = self.wts[i % self.wts.len];
+        const p = (if (self.merged)
+            try runWith(&self.sc, self.kern, self.m, r.q, r.win(), r.comps[i % r.copies], r.picks[i % r.steps], r.p0, self.scal, .{ self.sink, self.counter })
+        else
+            try run(&self.sc, self.kern, self.m, r.q, r.win(), r.comps[i % r.copies], r.picks[i % r.steps], r.p0, self.scal)) orelse return error.Declined;
+        const oa = (try wo_a.launch(&self.sc, self.kw, 64, .bfloat16, .{ p.acc, p.m, p.l, if (self.merged) self.nosink else self.sink, self.meta, w[2], w[0], w[1] }, self.wcounter, null)) orelse return error.Declined;
+        self.scal = oa;
+        return oa;
+    }
+};
+
+test "dsv41 dec attn merge: ubench, attention then wo_a, R = 1..6, the merge variant against wo_a's merge" {
+    if (!decode.ubenchOn()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const wo_a = @import("wo_a.zig");
+    const gpa = testing.allocator;
+    var m: dsv41.Dsv41Model = undefined;
+    m.cfg = .{};
+    m.cfg.sliding_window = WINDOW;
+    m.act = .bfloat16;
+    const kern = try build();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    const km = try buildMerge();
+    defer _ = mlx.mlx_fast_metal_kernel_free(km);
+    const kw = try wo_a.build();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kw);
+    var keep = Scope.init(gpa, mlx.gpuStream());
+    defer keep.deinit();
+    // Eight copies of wo_a (276 MB): each step's weights come from DRAM.
+    var wts: [8][3]A = undefined;
+    for (&wts, 0..) |*w, i| {
+        w.* = try woaWeights(&keep, 300 + i);
+        try dsv41.evalAll(w[0..2]);
+    }
+    const counter = try keep.keep(newCounter());
+    const wcounter = try keep.keep(wo_a.newCounter());
+    const nosink = try keep.keep(noSink(HEADS));
+    for (1..decode.max_rows + 1) |R| {
+        const ctx = 32768;
+        const rig = try Rig.init(&keep, R, ctx, 512, 8, 400, ctx, 7);
+        defer rig.deinit();
+        const sink = try keep.reshape(rig.sink, &.{HEADS});
+        const meta = try keep.ints(&[_]i32{ ctx, @intCast(R), 512, WINDOW, 144, ctx }, &.{6});
+        const scal0 = try keep.keep(mlx.mlx_array_new_data(&[_]f32{SCALE}, &[_]c_int{1}, 1, .float32));
+        var us: [2]f64 = undefined;
+        for ([_]bool{ false, true }, &us) |merged, *t| {
+            var c: WoaChain = .{ .gpa = gpa, .sc = Scope.init(gpa, mlx.gpuStream()), .kern = if (merged) km else kern, .kw = kw, .merged = merged, .m = &m, .rig = rig, .sink = sink, .nosink = nosink, .counter = counter, .wcounter = wcounter, .meta = meta, .wts = &wts, .scal0 = scal0, .scal = scal0 };
+            defer c.sc.deinit();
+            t.* = try decode.chainUs(&c, 200);
+        }
+        std.debug.print("[dec-ubench] attn+wo_a R={d}: wo_a merging {d:.1} us, the merged split {d:.1} us a step ({d:.1} us saved)\n", .{ R, us[0], us[1], us[0] - us[1] });
+    }
+}
