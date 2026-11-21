@@ -9772,6 +9772,102 @@ test "dsv41 verify width: time of a verify block per draft count (DSV41_VERIFY_R
     }
 }
 
+test "dsv41 verify exact: on a real pack, every verify row's logits are its plain step's bits (DSV41_VERIFY_EXACT)" {
+    // DSV41_VERIFY_EXACT = a pack dir; DSV41_STEP_CTX prompt tokens first (default 17639); DSV41_ROUND_TEXT a text.
+    const dir = std.mem.span(std.c.getenv("DSV41_VERIFY_EXACT") orelse return error.SkipZigTest);
+    const ctx = if (std.c.getenv("DSV41_STEP_CTX")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 17639;
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cfg = try testConfig(io, dir);
+    var w = try loadPack(io, gpa, dir, false);
+    defer w.deinit();
+    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true, .dspark = true });
+    defer m.deinit();
+    const prompt = try gpa.alloc(u32, ctx);
+    defer gpa.free(prompt);
+    for (prompt, 0..) |*t, k| t.* = @intCast((k * 7919 + 13) % @min(m.vocab, 100000));
+    if (std.c.getenv("DSV41_ROUND_TEXT")) |tp| {
+        var tok = try @import("../../sdk/tokenizer/tokenizer.zig").loadTokenizer(io, gpa, dir);
+        defer tok.deinit();
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(tp), gpa, .limited(64 << 20));
+        defer gpa.free(text);
+        const ids = try tok.encode(gpa, text);
+        defer gpa.free(ids);
+        if (ids.len < ctx) return error.SkipZigTest;
+        @memcpy(prompt, ids[0..ctx]);
+    }
+    // Two states from one prompt: plain steps on one (the server's pipelined token), verifies of those tokens on the other.
+    var sa = try initState(m, gpa);
+    defer sa.deinit();
+    var sb = try initState(m, gpa);
+    defer sb.deinit();
+    const la = try meterPrefill(m, gpa, &sa, prompt);
+    defer _ = mlx.mlx_array_free(la);
+    const lb = try meterPrefill(m, gpa, &sb, prompt);
+    defer _ = mlx.mlx_array_free(lb);
+    const pa = try hostF32(la);
+    defer gpa.free(pa);
+    const pb = try hostF32(lb);
+    defer gpa.free(pb);
+    try testing.expect(std.mem.eql(u8, std.mem.sliceAsBytes(pa), std.mem.sliceAsBytes(pb)));
+    const n = 120;
+    var toks: [n + 1]u32 = undefined;
+    toks[0] = try argmaxHost(la);
+    const logits = try gpa.alloc([]f32, n);
+    defer {
+        for (logits) |l| gpa.free(l);
+        gpa.free(logits);
+    }
+    var g = mlx.mlx_array_new_data(&toks[0], &[_]c_int{1}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(g);
+    for (0..n) |k| {
+        const l = try extendIds(m, gpa, &sa, .{ .gpu = g }, .last, null);
+        defer _ = mlx.mlx_array_free(l);
+        logits[k] = try hostF32(l);
+        toks[k + 1] = try argmaxHost(l);
+        _ = mlx.mlx_array_free(g);
+        g = mlx.mlx_array_new_data(&toks[k + 1], &[_]c_int{1}, 1, .uint32);
+    }
+    // Verifies of the plain tokens, R = 1..6 rows; every third round keeps one row fewer than it verified (a rollback).
+    var at: usize = 0;
+    var round: usize = 0;
+    var bad_rows: usize = 0;
+    var first_bad: ?[3]usize = null;
+    var per_r: [dkern.max_rows + 1][2]usize = @splat(.{ 0, 0 });
+    while (at < n) : (round += 1) {
+        const R = @min(1 + round % dkern.max_rows, n - at);
+        const ids = try gpa.alloc(u32, R);
+        @memcpy(ids, toks[at..][0..R]);
+        var d: DsparkDraft = .{ .ids = ids, .len = R - 1, .logits = &.{}, .confidence = &.{} };
+        defer d.deinit(gpa);
+        var pending = try dsparkBeginWith(m, gpa, &sb, toks[at], &d);
+        defer pending.deinit();
+        const vl = try hostF32(pending.vl_g);
+        defer gpa.free(vl);
+        const V = logits[0].len;
+        for (0..R) |r| {
+            const want = logits[at + r];
+            const got = vl[r * V ..][0..V];
+            var diff: usize = 0;
+            for (want, got) |x, y| diff += @intFromBool(@as(u32, @bitCast(x)) != @as(u32, @bitCast(y)));
+            per_r[R][0] += 1;
+            if (diff > 0) {
+                per_r[R][1] += 1;
+                bad_rows += 1;
+                if (first_bad == null) first_bad = .{ at + r, R, r };
+                if (bad_rows <= 12) std.debug.print("[verify-exact] step {d} (round {d}, R={d}, row {d}): {d} of {d} logits differ\n", .{ at + r, round, R, r, diff, V });
+            }
+        }
+        const keep = if (round % 3 == 2 and R > 1) R - 1 else R;
+        var res = try dsparkFinish(m, gpa, &sb, &pending, keep - 1, toks[at + keep]);
+        res.deinit(gpa);
+        at += keep;
+    }
+    for (1..dkern.max_rows + 1) |R| std.debug.print("[verify-exact] ctx {d} R={d}: {d} of {d} rows differ\n", .{ ctx, R, per_r[R][1], per_r[R][0] });
+    if (first_bad) |f| std.debug.print("[verify-exact] first differing row: step {d} (R={d}, row {d})\n", .{ f[0], f[1], f[2] });
+    try testing.expectEqual(@as(usize, 0), bad_rows);
+}
+
 test "dsv41 group: greedy DSpark group rounds against batched plain steps, by states (DSV41_GROUP)" {
     // DSV41_GROUP = a pack dir; DSV41_ROUND_TEXT = a text whose stretches are the states' prompts (else synthetic
     // ids); DSV41_STEP_CTX prompt tokens a state (default 1024).
