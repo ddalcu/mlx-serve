@@ -413,8 +413,8 @@ METAL_FUNC void gather_mapped_db(
 // the expert's own gate / up scale (ModelOpt's per-expert global scale, `gsc` / `usc`
 // [E] in T) multiplies the rounded product before the clamp and the SiLU, rounded again,
 // as the split path's multiply does (and the fp4 decode kernel's GSCALE / USCALE).
-// EPI -1: deepseek_v41's moe_act statements on those values instead: in f32, clamped
-// under `lim` when it is positive, times the row's routing weight `rw[r]`, rounded once.
+// EPI -1: deepseek_v41's moe_act on those values instead: in f32, clamped under `lim` when it
+// is positive, times the row's routing weight `rw[r]`, rounded once.
 template <typename T, int EPI, int ESC, typename DTile>
 METAL_FUNC void store_act(
     thread DTile& D, device T* y, const int ld, const int rows,
@@ -451,8 +451,13 @@ METAL_FUNC void store_act(
           if constexpr (EPI < 0) {
             float gf = float(g), uf = float(u);
             if (lim > 0.0f) { gf = metal::min(gf, lim); uf = metal::clamp(uf, -lim, lim); }
-            const float s = 1.0f / (1.0f + metal::precise::exp(metal::abs(gf)));
-            v[j] = T(gf * (gf < 0.0f ? s : 1.0f - s) * uf * rw[r]);
+            // g * sigmoid(g) from e^-|g|/2, which never overflows: g / (1 + e^-g) at g >= 0,
+            // (g e^(g/2)) e^(g/2) / (1 + e^g) below, so a result past e^-88 stays a normal f32
+            // instead of 0 (moe_act's 1 / (1 + e^|g|) overflows there).
+            const float h = metal::precise::exp(-0.5f * metal::abs(gf));
+            const float q = h * h;
+            const float a = gf < 0.0f ? (gf * h) * h / (1.0f + q) : gf / (1.0f + q);
+            v[j] = T(a * uf * rw[r]);
           } else {
             if constexpr (EPI > 1) {
               // MLX's Minimum / Clip: a NaN stays NaN (metal::min / max return the other operand).
