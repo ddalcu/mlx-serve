@@ -42,6 +42,8 @@ test "quant block: each fixture config's quantization block is claimed by one bu
         .{ .file = "qwen4_exp-iq-mlx-4.7bpw.json", .key = "quantization", .format = "affine" },
         .{ .file = "qwen4_exp-iq-mlx-4.7bpw.json", .key = "quantization_config", .format = "affine" },
         .{ .file = "qwen4_exp-nvidia-fp4.json", .key = "quantization_config", .format = "nvfp4" },
+        .{ .file = "inkling2_loop-mlx-community-4bit.json", .key = "quantization", .format = "affine" },
+        .{ .file = "inkling2_loop-mlx-community-4bit.json", .key = "quantization_config", .format = "affine" },
         .{ .file = "embeddinggemma-300m-8bit.json", .key = "quantization", .format = "affine" },
         .{ .file = "gemma-3-12b-it-4bit.json", .key = "quantization", .format = "affine" },
         .{ .file = "gemma-3-1b-it-4bit.json", .key = "quantization", .format = "affine" },

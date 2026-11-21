@@ -31,6 +31,7 @@ pub const types = [_][]const u8{
     "deepseek_v4",
     "deepseek_v41",
     "inkling_mm_model",
+    "inkling2_loop",
     "lfm2_vl",
     "lfm2-vl",
     "nemotron_h_omni",

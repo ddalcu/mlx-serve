@@ -14,6 +14,7 @@ zig-out/
 # test that silently skips because its fixture is untracked protects nothing.
 !src/fixtures/*.safetensors
 !src/plugins/lfm3/fixtures/*/*.safetensors
+!src/plugins/inkling2/fixtures/*/*.safetensors
 
 # llama.cpp libllama, staged at build time by scripts/fetch-llama.sh (not vendored)
 /lib/llama/

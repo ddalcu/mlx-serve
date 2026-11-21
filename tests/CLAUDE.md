@@ -142,6 +142,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_qwen4_exp.sh` **E** Flash Next (external PLE or embedded `shards.N` / `shard_N`) · `test_qwen4_mtp_{padded_head,head_persist}.sh` **E** its MTP head
 - `test_qsa_nax_prefill.py` **R** QSA NAX prefill · `qsa_nax_precision.py` float64 QSA kernel oracle
 - `test_dsv4.sh` **E**, `test_dsv41.sh` **E** DeepSeek V4/V4.1 · `test_inkling.sh` **E** · `test_bailing_hybrid.sh` **E** Ling 3.0
+- `test_inkling2.sh` **E** Inkling 2 Mini: completion, prefix-cache restore vs a cold server, image 400 · `dump_inkling2_fixtures.py` mlx-lm references (`src/plugins/inkling2/fixtures`, `--pack`)
 - `test_muse_glimmer.sh` **E**, `test_muse_repetition.sh` **E** Muse · `test_mimo_v2.sh` **E** · `test_glm5_next.sh` **E**
 - `test_flint.sh` **E** · `test_kolibri1.py` **E** · `test_minicpmv4_7.sh` **E** · `test_nemotron_bolt.py` Nemotron 3.5
 - `test_ud_moe.sh` · `test_nvfp4.sh` · `test_dense_bf16.sh` · `test_hadamard_fidelity.sh` (+ `hadamard_fidelity.py`)

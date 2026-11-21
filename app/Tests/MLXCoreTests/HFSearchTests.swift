@@ -666,6 +666,17 @@ final class HFModelQuantGateTests: XCTestCase {
         XCTAssertFalse(older.isSupportedArchitecture)
     }
 
+    func testInkling2MiniIsSupportedArchitecture() {
+        // Inkling 2 Mini (model_type inkling2_loop): the HF rows match the "inkling" tag
+        // prefix; a downloaded pack is listed through supportedModelTypes.
+        let m = mlx(id: "mlx-community/Inkling-2-Mini-4bit",
+                    tags: ["mlx", "safetensors", "inkling2_loop", "moe", "image-text-to-text"],
+                    pipeline: "image-text-to-text")
+        XCTAssertTrue(m.isSupportedArchitecture)
+        XCTAssertNil(m.incompatibleReason)
+        XCTAssertTrue(supportedModelTypes.contains("inkling2_loop"))
+    }
+
     func testMuseGlimmerIsSupportedArchitecture() {
         // meta-models Muse-Glimmer-30B (config.json model_type=muse_glimmer) is
         // served by the MLX engine — same class as hy_v3/laguna: the model_type

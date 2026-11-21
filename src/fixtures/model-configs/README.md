@@ -31,3 +31,4 @@ Unmodified public `config.json` files. Hashes identify the captured bytes; the l
 | `gemma-4-26b-a4b-it-4bit.json` | [mlx-community/gemma-4-26b-a4b-it-4bit](https://huggingface.co/mlx-community/gemma-4-26b-a4b-it-4bit/blob/main/config.json) | `419e13a27ec359654c1ce7dd06d1a87149fd07d0c8af9f770494185e62e1b2ba` |
 | `gemma-4-31b-it-4bit.json` | [mlx-community/gemma-4-31b-it-4bit](https://huggingface.co/mlx-community/gemma-4-31b-it-4bit/blob/main/config.json) | `a01be3d45e0eb70ae89cef6d3e823dd44de6ec4dfc41b91dc357f97e457915c0` |
 | `gemma-4-e4b-it-4bit.json` | [mlx-community/gemma-4-e4b-it-4bit](https://huggingface.co/mlx-community/gemma-4-e4b-it-4bit/blob/main/config.json) | `780ccb3a514a5f1ced161d383f948fc22eca9b84b752ca19494f625bd9bad7a6` |
+| `inkling2_loop-mlx-community-4bit.json` | [mlx-community/Inkling-2-Mini-4bit](https://huggingface.co/mlx-community/Inkling-2-Mini-4bit/blob/main/config.json) | `0c72c706ad94ff52d4e4c8585e15bcc98eaa964db6143e2a62dc3d809acd8a71` |
