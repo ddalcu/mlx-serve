@@ -146,3 +146,41 @@ fn sameValue(a: f32, b: f32) bool {
     if (std.math.isNan(b)) return std.math.isNan(a);
     return @as(u32, @bitCast(a)) == @as(u32, @bitCast(b));
 }
+
+test "fp4 scale decode: the e4m3 pair read (mlxserve_e4m3x2_h) is MLX's read x 2^-8 for every code in both lanes" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    // Word w = code c at bits 0-7 and code 255 - c at bits 16-23; bytes 8-15 / 24-31 hold junk the read ignores.
+    var words: [256]u32 = undefined;
+    for (&words, 0..) |*w, c| w.* = @as(u32, @intCast(c)) | (0xA5 << 8) | (@as(u32, @intCast(255 - c)) << 16) | (0x5A << 24);
+    const in = mlx.mlx_array_new_data(&words, &[_]c_int{256}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(in);
+    const ins = [_][*:0]const u8{"words"};
+    const outs = [_][*:0]const u8{"y"};
+    const iv = mlx.mlx_vector_string_new_data(&ins, 1);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&outs, 1);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new("mlxserve_e4m3x2_codes", iv, ov, "const uint i = thread_position_in_grid.x;\nconst half2 h = mlxserve_e4m3x2_h(words[i]);\ny[2 * i] = float(h.x);\ny[2 * i + 1] = float(h.y);\n", SCALE_HEADER ++ SCALE_HEADER, true, false);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k);
+    const c = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{512}, 1, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 256, 1, 1));
+    const v = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{in}, 1);
+    defer _ = mlx.mlx_vector_array_free(v);
+    var o = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o, k, v, c, s));
+    var y = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, o, 0));
+    try mlx.check(mlx.mlx_array_eval(y));
+    const got = (mlx.mlx_array_data_float32(y) orelse return error.NoData)[0..512];
+    // The header twice in one source compiles once (its guard): a kernel may get it by more than one route.
+    for (0..256) |code| {
+        try std.testing.expect(sameValue(got[2 * code], mlxRead(.nvfp4, @intCast(code)) / 256.0));
+        try std.testing.expect(sameValue(got[2 * code + 1], mlxRead(.nvfp4, @intCast(255 - code)) / 256.0));
+    }
+}

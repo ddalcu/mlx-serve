@@ -40,6 +40,7 @@ test {
     _ = @import("sdk/blocks/moe/gqmv_fp4_test.zig");
     _ = @import("sdk/quant/block_test.zig");
     _ = @import("sdk/quant/fp4.zig");
+    _ = @import("sdk/quant/fp_encode.zig");
     _ = @import("sdk/quant/hadamard/format_test.zig");
     _ = @import("sdk/vision/splice_test.zig");
     _ = @import("sdk/blocks/kda/gate_test.zig");

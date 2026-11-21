@@ -76,7 +76,7 @@ pub const GQMV_AFFINE_HEADER = kernelSource("kernels/moe/gqmv_affine_header.meta
 // An e2m1 nibble becomes a `half` by shifting its bits straight into the half's
 // exponent/mantissa/sign fields (exact for all 16 codes, -0 kept), the true value
 // times 2^-14; the group scale is `fp4.SCALE_HEADER`'s (MLX's fp8.h read, both formats).
-pub const GQMV_FP4_HEADER = GQMV_AFFINE_HEADER ++ moe_fp4.E2M1_HEADER ++ moe_fp4.E2M1X2_HEADER ++ fp4.SCALE_HEADER ++ kernelSource("kernels/moe/gqmv_fp4_header.metal");
+pub const GQMV_FP4_HEADER = GQMV_AFFINE_HEADER ++ fp4.SCALE_HEADER ++ kernelSource("kernels/moe/gqmv_fp4_header.metal");
 
 pub fn header(d: Dequant) [:0]const u8 {
     return if (d == .fp4) GQMV_FP4_HEADER else GQMV_AFFINE_HEADER;
