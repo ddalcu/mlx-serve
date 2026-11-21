@@ -1276,7 +1276,24 @@ test "dsv41 fp4 nvfp4 as mxfp4: decode's routed gathers (the fused fp4 kernels o
     try testing.expectEqual(@as(usize, 0), bad);
 }
 
-test "dsv41 fp4 nvfp4 as mxfp4: prefill's sorted gathers of NVIDIA's power-of-two NVFP4 bank with its globals give its MXFP4 conversion's bytes (DeepSeek-V4.1-Flash widths)" {
+/// The prefill half's bar: the NVFP4 arm applies its globals in its paired epilogue in another order than the MXFP4
+/// arm's scale codes (MOE_PAIR_SCALED), so the two round apart now and then; 1e-3 relative rms holds that and fails a
+/// global on the wrong projection by orders of magnitude.
+const nv_as_mx_prefill_bar = 1e-3;
+
+/// `y` against the MXFP4 conversion's `want`: relative rms, printed under `label`.
+fn relRmsOf(label: []const u8, y: A, want: A) !f64 {
+    const gpa = testing.allocator;
+    const x = try dsv41.hostF32(y);
+    defer gpa.free(x);
+    const t = try dsv41.hostF32(want);
+    defer gpa.free(t);
+    const e = relRms(x, t);
+    std.debug.print("[nvfp4 as mxfp4] {s}: rel rms {e:.3} from the MXFP4 conversion's\n", .{ label, e });
+    return e;
+}
+
+test "dsv41 fp4 nvfp4 as mxfp4: prefill's sorted gathers of NVIDIA's power-of-two NVFP4 bank with its globals are its MXFP4 conversion's within 1e-3 rel rms; the gate and up globals swapped fail (DeepSeek-V4.1-Flash widths)" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const E = 16;
@@ -1288,17 +1305,20 @@ test "dsv41 fp4 nvfp4 as mxfp4: prefill's sorted gathers of NVIDIA's power-of-tw
     defer sc.deinit();
     var prng = std.Random.DefaultPrng.init(0x9F11);
     const p = try PackPair.init(&sc, prng.random(), E, m.cfg.hidden_size, m.cfg.moe_intermediate_size);
-    var bad: usize = 0;
     for ([_]usize{ 512, 2048 }) |L| {
         const h = try sc.keep(try fx.normal(&.{ ci(L), ci(m.cfg.hidden_size) }, .bfloat16, 0, 1));
         p.install(ly, false);
         const r = try dsv41.route(&sc, m, ly, h, none);
         const y_mx = try sc.keep(try dsv41.moeShare(m, gpa, 20, h, r.idx, r.wts));
         p.install(ly, true);
-        const y_nv = try sc.keep(try dsv41.moeShare(m, gpa, 20, h, r.idx, try p.nvWeights(&sc, r.idx, r.wts)));
-        var label: [48]u8 = undefined;
-        bad += try bitDiff(try std.fmt.bufPrint(&label, "prefill L={d}", .{L}), y_nv, y_mx);
+        const w_nv = try p.nvWeights(&sc, r.idx, r.wts);
+        const y_nv = try sc.keep(try dsv41.moeShare(m, gpa, 20, h, r.idx, w_nv));
+        var label: [64]u8 = undefined;
+        try testing.expect(try relRmsOf(try std.fmt.bufPrint(&label, "prefill L={d}", .{L}), y_nv, y_mx) <= nv_as_mx_prefill_bar);
+        // Planted: the gate's global on up and up's on the gate.
+        ly.experts.scale = .{ p.globals[1], p.globals[0], p.globals[2] };
+        const y_bad = try sc.keep(try dsv41.moeShare(m, gpa, 20, h, r.idx, w_nv));
+        try testing.expect(try relRmsOf(try std.fmt.bufPrint(&label, "planted: globals swapped, L={d}", .{L}), y_bad, y_mx) > nv_as_mx_prefill_bar);
     }
-    try testing.expectEqual(@as(usize, 0), bad);
 }
 

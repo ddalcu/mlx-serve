@@ -2525,16 +2525,16 @@ const GqmmNax = struct {
             if (self.escv[0].len > 0) g = host.rt(.bfloat16, g * self.escv[0][e]);
             if (self.escv[1].len > 0) u = host.rt(.bfloat16, u * self.escv[1][e]);
             if (self.moe_act) {
-                // moe_act: the clamp under the limit, the SwiGLU and the routing weight, unrounded; past ln(FLT_MAX)
-                // its f32 exp is infinite, so a gate under about -88.7 gets a weight of 0.
+                // moe_act: the clamp under the limit, the SwiGLU and the routing weight, unrounded; the kernel's f32
+                // flushes a result under 2^-126 (a subnormal) to a zero of its sign.
                 const rl: f64 = self.rlim;
                 if (rl > 0) {
                     g = clampNaN(g, -std.math.inf(f64), rl);
                     u = clampNaN(u, -rl, rl);
                 }
-                const ex = @exp(@abs(g));
-                const sg: f64 = if (ex > @as(f64, std.math.floatMax(f32))) 0 else 1 / (1 + ex);
-                y.* = g * (if (g < 0) sg else 1 - sg) * u * self.rwv[i / self.shape.n];
+                const q = @exp(-@abs(g));
+                const v = (if (g < 0) g * q / (1 + q) else g / (1 + q)) * u * self.rwv[i / self.shape.n];
+                y.* = if (@abs(v) < 0x1p-126) std.math.copysign(@as(f64, 0), v) else v;
                 continue;
             }
             if (self.limit > 0) {
