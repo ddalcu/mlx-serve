@@ -138,7 +138,7 @@ src/plugins/qwen4_exp/kernels/qsa_attn_d_vload.metal	!(thread T*)&	a kernel rein
 src/kernels/quant/norm_rotate.metal	!(thread T*)&	a kernel reinterprets a uint4 through as_type (msv_unpack8, msv_pack8), never a thread-pointer pun
 src/kernels/quant/norm_rotate.metal	!(thread const T*)&	a kernel reinterprets a uint4 through as_type (msv_unpack8, msv_pack8), never a thread-pointer pun
 tests/*.sh	!-f "mlx-serve	a test script frees its port with srv_preclean, never a pkill pattern (it takes a server the script did not start)
-src/host/api/chat_completions.zig	has_tools = chat_mod.declaresTools(root.get("tools"))	tool mode and the tools thinking default need a non-empty top-level tools array (declaresTools)
-src/host/api/responses/handler.zig	.has_tools = include_tools and chat_mod.declaresTools(tools)	tool mode and the tools thinking default need a non-empty top-level tools array (declaresTools)
+src/host/api/chat_completions.zig	var has_tools = chat_mod.declaresTools(root.get("tools"))	tool mode and the tools thinking default need a non-empty top-level tools array (declaresTools)
+src/host/api/responses/handler.zig	.has_tools = include_tools and chat_mod.declaresTools(tools)	tool mode needs a non-empty top-level tools array (declaresTools)
 src/host/api/anthropic.zig	defaultEnableThinking(chat_mod.declaresTools(root.get("tools")))	tool mode and the tools thinking default need a non-empty top-level tools array (declaresTools)
 src/host/api/*.zig	!get("tools") != null	tool mode and the tools thinking default need a non-empty top-level tools array (declaresTools)
