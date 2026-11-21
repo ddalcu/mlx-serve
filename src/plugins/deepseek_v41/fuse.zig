@@ -12,6 +12,9 @@
 //! - `mxfp8_qmm`: an mxfp8 linear over a prompt chunk's rows runs MLX's quantized matmul (its NAX qmm dequantizes the
 //!   codes in the GEMM's tile loads) instead of dequantizing the whole weight to bf16 and the dense GEMM
 //!   (`Lin.denseAt`, through `ps()`: `Lin` has no model).
+//! - `pf_bf16_trunk`: the trunk's mxfp8 linears dequantized to bf16 once at load (`bf16Trunk`, `Lin.pf`), the copy
+//!   every prompt chunk's dense GEMM reads instead of a dequantize per chunk; decode keeps the mxfp8 weights. The
+//!   same bf16 values the per-chunk dequantize makes (e4m3 times a power of two is exact in bf16): the same bytes.
 
 const std = @import("std");
 const env = @import("../../env.zig");
@@ -29,12 +32,14 @@ pub const Fuse = struct {
     down_scale: bool = false,
     engram: bool = false,
     mxfp8_qmm: bool = false,
+    pf_bf16_trunk: bool = false,
 
     pub fn wanted() Fuse {
         return .{
             .down_scale = env.on(.MLX_SERVE_DSV41_FUSE_DOWN_SCALE),
             .engram = env.on(.MLX_SERVE_DSV41_FUSE_ENGRAM),
             .mxfp8_qmm = env.on(.MLX_SERVE_DSV41_FUSE_MXFP8_QMM),
+            .pf_bf16_trunk = env.on(.MLX_SERVE_DSV41_PF_BF16_TRUNK),
         };
     }
 };
@@ -93,6 +98,10 @@ pub fn settle(m: *dsv41.Dsv41Model) !void {
         bytes += e.table.held[0].len + e.table.held[1].len;
     };
     log.info("deepseek_v41: weight path {s} ({s}); fusions down_scale={} engram={} ({d} of {d} tables gathered on the GPU) mxfp8_qmm={}\n", .{ if (mode.resident) "resident" else "ssd", mode.why, m.fuse.down_scale, m.fuse.engram, wrapped, m.engrams.len, m.fuse.mxfp8_qmm });
+    if (m.fuse.pf_bf16_trunk) {
+        const n = try bf16Trunk(m);
+        log.info("deepseek_v41: pf bf16 trunk: {d:.1} GB, {d} mxfp8 linears dequantized once for the prompt's GEMMs (billed {d:.1} GB)\n", .{ gbOf(n.bytes), n.linears, gbOf(trunkBytes(&m.cfg)) });
+    }
     if (wrapped > 0) {
         var active: usize = 0;
         _ = mlx.mlx_get_active_memory(&active);
@@ -100,6 +109,91 @@ pub fn settle(m: *dsv41.Dsv41Model) !void {
         const room = evictRoom(active, ws);
         log.info("deepseek_v41: engram: {d:.1} GB wrapped no-copy (pages already held, no new memory) now count in MLX's active memory, {d:.1} GB with them; MLX evicts its buffer cache on each miss past 0.95 x the working set, {d:.1} GB: {d:.1} GB of room{s}\n", .{ gbOf(bytes), gbOf(active), gbOf(evictLine(ws)), gbOf(room), if (room == 0) " (none: expect slower allocations)" else "" });
     }
+}
+
+/// The trunk's mxfp8 linears a prompt chunk's dense GEMMs read, of layer `ly` (unset ones skipped by the caller).
+fn trunkLins(ly: *dsv41.Layer) [10]?*dsv41.Lin {
+    var out: [10]?*dsv41.Lin = @splat(null);
+    const all = [_]*dsv41.Lin{ &ly.wq_a, &ly.wq_b, &ly.wkv, &ly.wo_a, &ly.wo_b, &ly.shared[0], &ly.shared[1], &ly.shared[2] };
+    for (all, 0..) |l, i| out[i] = l;
+    if (ly.q_kv) |*q| out[8] = q;
+    if (ly.shared_gu) |*g| out[9] = g;
+    return out;
+}
+
+fn trunkLin(l: *const dsv41.Lin) bool {
+    return l.ext == null and l.w.ctx != null and l.s.ctx != null and l.qp.mode == .mxfp8 and l.qp.bits == 8 and l.qp.group_size == 32;
+}
+
+/// Each held layer's mxfp8 trunk linears (attention, the indexer's wq_b, the shared expert) and each Engram wkv
+/// dequantized to bf16 once (`Lin.pf`), evaluated a layer at a time.
+pub fn bf16Trunk(m: *dsv41.Dsv41Model) !struct { bytes: u64, linears: usize } {
+    var bytes: u64 = 0;
+    var n: usize = 0;
+    for (0..m.n_layers) |li| {
+        if (!m.held(li)) continue;
+        const ly = &m.layers[li];
+        var lins: [11]?*dsv41.Lin = undefined;
+        lins[0..10].* = trunkLins(ly);
+        lins[10] = if (ly.idx) |*ix| &ix.wq_b else null;
+        for (lins) |maybe| {
+            const l = maybe orelse continue;
+            if (!trunkLin(l) or l.pf.ctx != null) continue;
+            l.pf = try m.own(try plainDense(l, m.s));
+            bytes += 2 * mlx.mlx_array_size(l.pf);
+            n += 1;
+        }
+        try evalOwned(m);
+    }
+    for (m.engrams) |*e| if (trunkLin(&e.wkv) and e.wkv.pf.ctx == null) {
+        e.wkv.pf = try m.own(try plainDense(&e.wkv, m.s));
+        bytes += 2 * mlx.mlx_array_size(e.wkv.pf);
+        n += 1;
+    };
+    try evalOwned(m);
+    return .{ .bytes = bytes, .linears = n };
+}
+
+/// `l` dequantized to bf16, a fresh array the caller owns.
+fn plainDense(l: *const dsv41.Lin, s: mlx.mlx_stream) !A {
+    var d = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(d);
+    try mlx.check(mlx.mlx_dequantize(&d, l.w, l.s, l.b, mlx.mlx_optional_int.some(@intCast(l.qp.group_size)), mlx.mlx_optional_int.some(@intCast(l.qp.bits)), l.qp.mode.cstr(), none, .{ .value = .bfloat16, .has_value = true }, s));
+    return d;
+}
+
+/// The model's owned arrays made since the last call evaluated (the bf16 copies, so none waits on the first prompt).
+fn evalOwned(m: *dsv41.Dsv41Model) !void {
+    const items = m.owned.items;
+    const vec = mlx.mlx_vector_array_new_data(items.ptr, items.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_eval(vec));
+}
+
+/// What `bf16Trunk` holds for config `c`, in bytes: two per weight of each layer's mxfp8 trunk linears (wq_a, wkv,
+/// wq_b, wo_a, wo_b, the shared expert's three, an index source layer's wq_b) and each Engram wkv. Billed at load
+/// under the switch (`bill.zig`).
+pub fn trunkBytes(c: anytype) u64 {
+    var w: u64 = 0;
+    for (0..c.num_hidden_layers) |li| w += layerWeights(c, li);
+    if (c.dsv41_n_engram_layers > 0) {
+        const cols: u64 = (@as(u64, c.dsv41_engram_max_ngram) - 1) * c.dsv41_engram_n_heads;
+        w += @as(u64, c.dsv41_n_engram_layers) * (c.dsv4_hc_mult + 1) * c.hidden_size * cols * c.dsv41_engram_head_dim;
+    }
+    return 2 * w;
+}
+
+/// Layer `li`'s mxfp8 trunk weights (`trunkBytes`).
+pub fn layerWeights(c: anytype, li: usize) u64 {
+    const d: u64 = c.hidden_size;
+    const hd: u64 = c.head_dim;
+    const ql: u64 = c.dsv4_q_lora_rank;
+    const H: u64 = c.num_attention_heads;
+    const og: u64 = c.dsv4_o_groups;
+    const ol: u64 = c.dsv4_o_lora_rank;
+    var w = ql * d + hd * d + H * hd * ql + og * ol * (H * hd / og) + d * og * ol + 3 * @as(u64, c.moe_intermediate_size) * d;
+    if ((c.dsv41_index_sources >> @intCast(li)) & 1 != 0) w += @as(u64, c.dsv4_index_n_heads) * c.dsv4_index_head_dim * ql;
+    return w;
 }
 
 /// MLX's line (`gc_limit_`, min(1.5 x, 0.95 x) the recommended working set `ws`): past it every new buffer first evicts
@@ -881,5 +975,52 @@ test "dsv41 fuse engram (resident): a prompt span's rows gathered by id on the G
         std.debug.print("[fuse] engram rows held {t}: {d} of {d} bf16 values differ from the copied rows'; ids one off, {d}\n", .{ mode, differ, wb.len, planted });
         try testing.expectEqual(@as(usize, 0), differ);
         try testing.expect(planted > wb.len / 2);
+    }
+}
+
+test "dsv41 fuse pf_bf16_trunk: a prompt chunk's mxfp8 linears (q_kv, wo_b, the shared gate/up and down, the grouped wo_a) on the bf16 copy made at load give the per-chunk dequantize's bytes, 2048 rows; a copy under scales a code up differs; the copy is the bill's bytes" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .ctx = 0, .fused = true });
+    defer fx.deinit();
+    const m = fx.m;
+    const ly = fx.layer(20);
+    const s = mlx.gpuStream();
+    var sc = dsv41.Scope.init(gpa, s);
+    defer sc.deinit();
+    const L: usize = 2048;
+    const og: usize = @intCast(mlx.getShape(ly.wo_a.w)[0]);
+    // Today's outputs, before any copy exists.
+    const cases = [_]struct { []const u8, *dsv41.Lin, bool }{ .{ "q_kv", &ly.q_kv.?, false }, .{ "wo_b", &ly.wo_b, false }, .{ "shared_gu", &ly.shared_gu.?, false }, .{ "shared down", &ly.shared[2], false }, .{ "wo_a", &ly.wo_a, true } };
+    var xs: [cases.len]A = undefined;
+    var want: [cases.len]A = undefined;
+    for (cases, &xs, &want) |c, *x, *w| {
+        try testing.expect(trunkLin(c[1]));
+        const K: usize = @intCast(mlx.getShape(c[1].w)[mlx.getShape(c[1].w).len - 1] * 4);
+        const grouped = [_]c_int{ ci(og), ci(L), ci(K) };
+        x.* = try sc.keep(try fx.normal(if (c[2]) grouped[0..] else grouped[1..], .bfloat16, 0, 1));
+        w.* = if (c[2]) try dsv41.attnOutA(&sc, m, ly, x.*, null) else try c[1].apply(&sc, x.*);
+    }
+    const n = try bf16Trunk(m);
+    try testing.expectEqual(2 * layerWeights(&m.cfg, 20), n.bytes);
+    for (cases, xs, want) |c, x, w| {
+        try testing.expect(c[1].pf.ctx != null);
+        const got = if (c[2]) try dsv41.attnOutA(&sc, m, ly, x, null) else try c[1].apply(&sc, x);
+        // The plant: a copy dequantized under scales a code up.
+        var up = mlx.mlx_array_new();
+        defer free(up);
+        try mlx.check(mlx.mlx_add(&up, c[1].s, try sc.keep(mlx.mlx_array_new_data(&[_]u8{1}, &[_]c_int{1}, 1, .uint8)), s));
+        var bad = c[1].*;
+        bad.s = up;
+        bad.pf = try sc.keep(try plainDense(&bad, s));
+        bad.s = c[1].s;
+        var lb = ly.*;
+        lb.wo_a = bad;
+        const plant = if (c[2]) try dsv41.attnOutA(&sc, m, &lb, x, null) else try bad.apply(&sc, x);
+        const d = try differing(got, w);
+        const p = try differing(plant, w);
+        std.debug.print("[fuse] pf_bf16_trunk {s}: {d} elements differ from the per-chunk dequantize; the planted copy, {d}\n", .{ c[0], d, p });
+        try testing.expectEqual(@as(usize, 0), d);
+        try testing.expect(p > 0);
     }
 }

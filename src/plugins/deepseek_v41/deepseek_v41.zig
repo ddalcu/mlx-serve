@@ -313,6 +313,9 @@ pub const Lin = struct {
     s: A = none,
     b: A = none,
     qp: QuantParams = .{ .bits = 0, .group_size = 0 },
+    /// The weight in bf16, made once at load for the prompt's dense GEMMs (`fuse.pf_bf16_trunk`), which `dense` hands
+    /// out in place of a dequantize; the quantized weight stays for decode.
+    pf: A = none,
 
     /// A weight an outside quant plugin loaded (`w` unset): its table runs the matmul. A grouped one (`wo_a`, the
     /// pack's slices) multiplies `[rows, groups, in]`.
@@ -336,6 +339,11 @@ pub const Lin = struct {
     /// The weight dequantized to `dt` (lossless for the packs' fp8 and affine codes in bf16).
     pub fn dense(self: *const Lin, sc: *Scope, dt: mlx.mlx_dtype) !A {
         if (self.ext != null) return error.Dsv41OutsideDense;
+        if (self.pf.ctx != null and mlx.mlx_array_dtype(self.pf) == dt) {
+            var o = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&o, self.pf);
+            return sc.keep(o);
+        }
         var d = mlx.mlx_array_new();
         return sc.res(mlx.mlx_dequantize(&d, self.w, self.s, self.b, mlx.mlx_optional_int.some(@intCast(self.qp.group_size)), mlx.mlx_optional_int.some(@intCast(self.qp.bits)), self.qp.mode.cstr(), .{ .ctx = null }, .{ .value = dt, .has_value = true }, sc.s), &d);
     }
@@ -617,7 +625,7 @@ pub const Dsv41Model = struct {
         return self.head.w.ctx != null or self.head.ext != null;
     }
 
-    fn own(self: *Dsv41Model, x: A) !A {
+    pub fn own(self: *Dsv41Model, x: A) !A {
         self.owned.append(self.gpa, x) catch |e| {
             _ = mlx.mlx_array_free(x);
             return e;
@@ -637,7 +645,7 @@ pub const Dsv41Model = struct {
         return if (t < self.token_map.len) self.token_map[t] else 0;
     }
 
-    fn held(self: *const Dsv41Model, li: usize) bool {
+    pub fn held(self: *const Dsv41Model, li: usize) bool {
         const p = self.pair orelse return true;
         return p.holds(li);
     }
