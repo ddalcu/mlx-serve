@@ -731,6 +731,7 @@ fn head8From(v: ?[*:0]const u8) bool {
 /// plain decode's tokens bit for bit, whatever the round schedule; plain decode itself is untouched. Copy verifies are
 /// cut to the decode-width rows (`maxVerifyDrafts`). The parts below are all on when exact is; only the gate
 /// (`decode/exact_test.zig`, `DSV41_EXACT_GATE_BATCHED`) leaves some on the batched kernels, to measure each one.
+/// `engram`, `head` and `argmax` serve every decode-width verify, exact or not (`exactPart`); `tail` needs exact.
 pub const Exact = struct {
     on: bool = false,
     /// Each verify row's attention, attn_out and FFN as the plain step at its position runs them (`blockFusedRows`).
@@ -826,9 +827,12 @@ pub fn exactSolo(m: *const Dsv41Model) bool {
     return exactServes(m) and m.exact.solo;
 }
 
-/// Whether an armed verify of `rows` rows takes exact part `part` (`Exact`).
+/// Whether an armed verify of `rows` rows takes exact part `part` (`Exact`). The Engram projection and the head do off
+/// exact too: MLX's quantized_matmul takes other kernels at 2..16 rows than at one (qmv_wide, qmv_mma), so a verify
+/// row's logits would round apart from its plain step's and a greedy near-tie pick another token.
 fn exactPart(m: *const Dsv41Model, verify: bool, rows: usize, comptime part: []const u8) bool {
-    return exactServes(m) and @field(m.exact, part) and verify and rows > 1 and rows <= dkern.max_rows;
+    if (!verify or rows <= 1 or rows > dkern.max_rows or !@field(m.exact, part)) return false;
+    return exactServes(m) or !std.mem.eql(u8, part, "tail");
 }
 
 /// The reason a held trunk layer's formats keep it off the fused decode kernels at verify width (q_kv, wq_b, the
@@ -3038,6 +3042,12 @@ pub fn hcCollapse(sc: *Scope, x: A, pre: A) !A {
     return sc.astype(try sc.reshape(y, &.{ ci(dim(x, 0)), ci(dim(x, 2)) }), mlx.mlx_array_dtype(x));
 }
 
+/// The f32 logits of the final hidden rows `h` [L, dim]; a verify's (`verify`) each as its plain step's one row.
+pub fn headLogits(sc: *Scope, m: *const Dsv41Model, h: A, verify: bool) !A {
+    if (exactPart(m, verify, dim(h, 0), "head")) return headRows(sc, m, h);
+    return sc.astype(try m.head.apply(sc, try sc.rms(h, m.norm, m.cfg.rms_norm_eps)), .float32);
+}
+
 /// The f32 logits of each final hidden row `h` [L, dim] on its own, as a plain step's one row (`Exact.head`).
 fn headRows(sc: *Scope, m: *const Dsv41Model, h: A) !A {
     const L = dim(h, 0);
@@ -4761,6 +4771,12 @@ pub fn engramApply(sc: *Scope, m: *const Dsv41Model, e: *const EngramLayer, x: A
     return engramGateOps(sc, m, e.qk, x, kv);
 }
 
+/// `engramApply` of the stream `x` `[L, hc, dim]`; a verify's (`verify`) rows each as its plain step projects it.
+pub fn engramWrite(sc: *Scope, m: *const Dsv41Model, e: *const EngramLayer, x: A, rows: A, verify: bool) !A {
+    if (exactPart(m, verify, dim(x, 0), "engram")) return engramRows(sc, m, e, x, rows);
+    return engramApply(sc, m, e, x, rows);
+}
+
 /// `engramApply` over each row on its own, as the plain step at the row's position projects it (`Exact.engram`).
 fn engramRows(sc: *Scope, m: *const Dsv41Model, e: *const EngramLayer, x: A, rows: A) !A {
     const L = dim(x, 0);
@@ -5496,7 +5512,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     }
 
     // The final collapse uses the last layer's FFN mix.
-    const exact_head = want == .all and m.head.w.ctx != null and exactPart(m, st.verify != null, L, "head");
+    const exact_head = want == .all and exactPart(m, st.verify != null, L, "head");
     var h: A = undefined;
     if (want == .last) {
         const k = sp.xs.len - 1;
@@ -5512,7 +5528,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
         h = try sc.concat(parts.items, 0);
     }
     // A tensor rank past 0 holds no head: its last stream stands in for the logits.
-    const logits = if (!m.hasHead()) try sc.astype(h, .float32) else if (exact_head) try headRows(&sc, m, h) else try sc.astype(try m.head.apply(&sc, try sc.rms(h, m.norm, c.rms_norm_eps)), .float32);
+    const logits = if (!m.hasHead()) try sc.astype(h, .float32) else try headLogits(&sc, m, h, want == .all and st.verify != null);
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(gpa);
     try ev.append(gpa, logits);
@@ -6184,7 +6200,7 @@ pub fn spanInAt(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const S
             break :blk try sc.keep(try e.table.gather(gpa, mine, sc.s));
         };
         const er = try sc.reshape(rows, &.{ ci(hi - lo), -1 });
-        const y = if (exactPart(m, verify, hi - lo, "engram")) try engramRows(sc, m, e, x, er) else try engramApply(sc, m, e, x, er);
+        const y = try engramWrite(sc, m, e, x, er, verify);
         // An image span's rows get no Engram write (the reference shuts their gate).
         x = if (sp.img.ctx != null) try sc.where(try sc.expand(try sc.expand(try sp.imgSlice(sc, lo, hi), -1), -1), x, y) else y;
         if (m.trace) |t| try t.put("engram_{d}", .{li}, x);
@@ -7675,27 +7691,47 @@ pub fn dsparkRound(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, 
     return dsparkRoundWith(m, gpa, st, t1, &d, accepted_cap);
 }
 
+/// Each verify row's greedy id `[rows]` int32 (evaluated) over `vl` `[rows, V]`, as the serial sampler's argmax runs:
+/// over `where(suppress, -inf, logits)` (`applySuppressMask`), so a round never commits an id plain decode masks.
+fn greedyRows(vl: A, suppress: A, s: mlx.mlx_stream) !A {
+    var masked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(masked);
+    if (suppress.ctx != null) {
+        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+        defer _ = mlx.mlx_array_free(neg_inf);
+        try mlx.check(mlx.mlx_where(&masked, suppress, neg_inf, vl, s));
+    }
+    var am = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(am);
+    try mlx.check(mlx.mlx_argmax_axis(&am, if (suppress.ctx != null) masked else vl, -1, false, s));
+    var am32 = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(am32);
+    try mlx.check(mlx.mlx_astype(&am32, am, .int32, s));
+    try mlx.check(mlx.mlx_array_eval(am32));
+    return am32;
+}
+
+test "dsv41 dspark: a greedy round's ids skip the ids the serial sampler masks" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const vl = mlx.mlx_array_new_data(&[_]f32{ 0.1, 0.9, 0.5, 0.2, 0.7, 0.3 }, &[_]c_int{ 2, 3 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(vl);
+    const mask = mlx.mlx_array_new_data(&[_]bool{ false, true, false }, &[_]c_int{3}, 1, .bool_);
+    defer _ = mlx.mlx_array_free(mask);
+    const got = try greedyRows(vl, mask, s);
+    defer _ = mlx.mlx_array_free(got);
+    try testing.expectEqualSlices(i32, &.{ 2, 0 }, mlx.mlx_array_data_int32(got).?[0..2]);
+    const raw = try greedyRows(vl, none, s);
+    defer _ = mlx.mlx_array_free(raw);
+    try testing.expectEqualSlices(i32, &.{ 1, 1 }, mlx.mlx_array_data_int32(raw).?[0..2]);
+}
+
 /// `dsparkRound` over a given draft (a copied continuation).
 pub fn dsparkRoundWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, d: *const DsparkDraft, accepted_cap: usize) !DsparkRound {
     var pending = try dsparkBeginWith(m, gpa, st, t1, d);
     defer pending.deinit();
-    var am = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(am);
-    // The serial sampler's greedy argmax runs over `where(mask, -inf, logits)` (`applySuppressMask`): an exact accept
-    // and its bonus token take the same masked argmax, so no masked id is ever committed.
-    var masked = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(masked);
-    const vl = if (exactServes(m) and m.exact.argmax and m.suppress.ctx != null) blk: {
-        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
-        defer _ = mlx.mlx_array_free(neg_inf);
-        try mlx.check(mlx.mlx_where(&masked, m.suppress, neg_inf, pending.vl_g, m.s));
-        break :blk masked;
-    } else pending.vl_g;
-    try mlx.check(mlx.mlx_argmax_axis(&am, vl, -1, false, m.s));
-    var am32 = mlx.mlx_array_new();
+    const am32 = try greedyRows(pending.vl_g, if (m.exact.argmax) m.suppress else none, m.s);
     defer _ = mlx.mlx_array_free(am32);
-    try mlx.check(mlx.mlx_astype(&am32, am, .int32, m.s));
-    try mlx.check(mlx.mlx_array_eval(am32));
     const best = mlx.mlx_array_data_int32(am32) orelse return error.NoData;
     var accepted: usize = 0;
     while (accepted < pending.b and @as(u32, @intCast(best[accepted])) == d.ids[accepted + 1]) accepted += 1;
