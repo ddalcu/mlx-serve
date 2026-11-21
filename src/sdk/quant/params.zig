@@ -148,6 +148,17 @@ pub fn quantParamsFromGeometry(
     return .{ .bits = (w_cols * 32) / in_dim, .group_size = in_dim / s_cols, .mode = mode };
 }
 
+/// The fp format a packed row names without an inner-dim hint: bits x group_size
+/// is 256 for mxfp8 g32, 128 for mxfp4 g32 and 64 for nvfp4 g16. With a hint the
+/// exact solve agrees whenever it names a format, since it has the same product.
+fn fpParamsFromPackedRatio(w_cols: u32, s_cols: u32) ?QuantParams {
+    if (s_cols == 0 or (w_cols * 32) % s_cols != 0) return null;
+    const per_group = (w_cols * 32) / s_cols;
+    const bits: u32 = if (per_group == 256) 8 else 4;
+    const mode = fpQuantModeFor(bits, per_group / bits) orelse return null;
+    return .{ .bits = bits, .group_size = per_group / bits, .mode = mode };
+}
+
 pub fn computeQuantParams(model: QuantParams, w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: ?u32) QuantParams {
     const w_shape = mlx.getShape(w);
     const s_shape = mlx.getShape(sc);
@@ -167,14 +178,12 @@ pub fn computeQuantParams(model: QuantParams, w: mlx.mlx_array, sc: mlx.mlx_arra
             // it exactly; solve, exactly as the affine arm below does.
             if (in_dim) |in| {
                 if (fpParamsFromGeometry(model, w_cols, s_cols, in)) |qp| return qp;
-            } else if (s_cols > 0 and (w_cols * 32) % s_cols == 0) {
-                const per_group = (w_cols * 32) / s_cols;
-                const bits: u32 = if (per_group == 256) 8 else 4;
-                const gs = per_group / bits;
-                if (fpQuantModeFor(bits, gs)) |mode| return .{ .bits = bits, .group_size = gs, .mode = mode };
-            }
+            } else if (fpParamsFromPackedRatio(w_cols, s_cols)) |qp| return qp;
             return model;
         }
+        // uint8 scales under an affine model are an fp bank beside an affine trunk
+        // (no per-tensor override names it); bits x group_size says which format.
+        if (fpParamsFromPackedRatio(w_cols, s_cols)) |qp| return qp;
         const gs: u32 = if (w_cols > 0 and s_cols > 0) (w_cols * 32) / (s_cols * 8) else 32;
         return .{ .bits = 8, .group_size = gs, .mode = .mxfp8 };
     }
@@ -403,6 +412,37 @@ test "computeQuantParams resolves an fp override INSIDE the fp family (mxfp8 emb
     try testing.expectEqual(@as(u32, 16), qp_nohint_nv.group_size);
     const qp_nohint_odd = computeQuantParams(cfg, wl, s_odd, null);
     try testing.expectEqual(QuantMode.mxfp4, qp_nohint_odd.mode);
+}
+
+test "computeQuantParams solves nvfp4 and mxfp8 expert banks under an affine model" {
+    // Bar: bias-less uint8 scales under an affine model resolve to the fp format their packed ratio names.
+    const s = mlx.gpuStream();
+    const mk = struct {
+        fn arr(shape: []const c_int, dt: mlx.mlx_dtype, st: mlx.mlx_stream) !mlx.mlx_array {
+            var a = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, dt, st));
+            return a;
+        }
+    };
+    const cfg: QuantParams = .{ .bits = 4, .group_size = 64, .mode = .affine };
+    const Case = struct { w: []const c_int, sc: []const c_int, bits: u32, gs: u32, mode: QuantMode };
+    const cases = [_]Case{
+        .{ .w = &.{ 2, 8, 8 }, .sc = &.{ 2, 8, 4 }, .bits = 4, .gs = 16, .mode = .nvfp4 },
+        .{ .w = &.{ 2, 8, 16 }, .sc = &.{ 2, 8, 2 }, .bits = 8, .gs = 32, .mode = .mxfp8 },
+        .{ .w = &.{ 2, 8, 8 }, .sc = &.{ 2, 8, 2 }, .bits = 4, .gs = 32, .mode = .mxfp4 },
+    };
+    for (cases) |c| {
+        const w = try mk.arr(c.w, .uint32, s);
+        defer _ = mlx.mlx_array_free(w);
+        const sc = try mk.arr(c.sc, .uint8, s);
+        defer _ = mlx.mlx_array_free(sc);
+        for ([_]?u32{ 64, null }) |hint| {
+            const qp = computeQuantParams(cfg, w, sc, hint);
+            try testing.expectEqual(c.mode, qp.mode);
+            try testing.expectEqual(c.bits, qp.bits);
+            try testing.expectEqual(c.gs, qp.group_size);
+        }
+    }
 }
 
 test "computeQuantParams resolves mixed nvfp4 + affine-override weights" {
