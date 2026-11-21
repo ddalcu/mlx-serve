@@ -6,6 +6,10 @@
 // `mlxserve_fp4_e4m3_x2m8` is the e4m3 value times 2^-8 (always a normal half/float). There is no e8m0 one: folding
 // 2^-8 into e8m0 codes under 9 makes a subnormal the GPU flushes where MLX's read does not.
 
+// A header joined after a line with no newline still starts here: the guard is past this comment.
+#ifndef MLXSERVE_FP4_SCALE_METAL
+#define MLXSERVE_FP4_SCALE_METAL
+
 inline float mlxserve_fp4_e4m3_x2m8(uint b) {
   const uint v = b & 0x7Fu;
   return float(as_type<half>(ushort((v << 7) | (((v + 1u) >> 7) << 14) | ((b & 0x80u) << 8))));
@@ -28,3 +32,17 @@ inline float mlxserve_fp4_scale_of(uint b) {
     return mlxserve_fp4_e8m0(b);
   }
 }
+
+// An e2m1 code (low 4 bits) as its value times 2^-14, by bit placement into a half: exact for all 16 codes, -0 kept
+// (MLX's fp4 read, scaled).
+inline float mlxserve_e2m1(uint c) {
+  return float(as_type<half>(ushort(((c & 0x7u) << 9) | ((c & 0x8u) << 12))));
+}
+
+// Two e4m3 bytes (bits 0-7 and 16-23) as MLX reads them, each times 2^-8, as a half2: the same bit placement,
+// 0x7f / 0xff a NaN. Every e4m3 pair decode (mxfp8, fp8 block-128, the Sushi GEMV) reads through it.
+inline half2 mlxserve_e4m3x2_h(uint w) {
+  const uint v = w & 0x007F007Fu;
+  return as_type<half2>((v << 7) | (((v + 0x00010001u) & 0x00800080u) << 7) | ((w & 0x00800080u) << 8));
+}
+#endif

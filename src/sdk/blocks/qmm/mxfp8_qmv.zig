@@ -10,9 +10,10 @@ pub const MAX_ROWS: c_int = 8;
 const SGS: c_int = 4;
 
 /// Bytes 0 and 2 of `w` as a half2 (value x 2^-8), the e4m3 fields shifted into half's.
-pub const HEADER = kernelSource("kernels/qmm/mxfp8_qmv_header.metal");
-/// The qmv kernel's header: the e4m3 pair read and MLX's e8m0 read (the shared fp4 scale header).
-pub const QMV_HEADER = HEADER ++ @import("../../quant/fp4.zig").SCALE_HEADER;
+/// The e4m3 pair read over the shared fp4 scale header (MLX's e8m0 / e4m3 reads; guarded, so a kernel that also
+/// prepends the scale header compiles once).
+pub const HEADER = @import("../../quant/fp4.zig").SCALE_HEADER ++ kernelSource("kernels/qmm/mxfp8_qmv_header.metal");
+pub const QMV_HEADER = HEADER;
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 var engaged = false;
