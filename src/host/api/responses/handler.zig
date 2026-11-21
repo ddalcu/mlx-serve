@@ -1318,7 +1318,7 @@ fn handleResponsesInner(
 
     var tool_calls: ?[]chat_mod.ParsedToolCall = null;
     if (active_has_tools and shouldParseToolCalls(result.finish_details)) {
-        tool_calls = try responseToolCalls(allocator, final_text, opens_think, active_tools_json, parallel_tool_calls_echo);
+        tool_calls = try parseToolCallsForRequest(allocator, toolParseText(final_text, opens_think), active_tools_json, parallel_tool_calls_echo);
     }
     defer if (tool_calls) |tcs| {
         for (tcs) |tc| {
@@ -1482,11 +1482,6 @@ fn handleResponsesInner(
     } else {
         try sendResponse(stream, "200 OK", "application/json", envelope);
     }
-}
-
-/// The tool calls a finished response reports.
-pub fn responseToolCalls(allocator: std.mem.Allocator, final_text: []const u8, opens_think: bool, tools_json: ?[]const u8, allow_parallel: bool) !?[]chat_mod.ParsedToolCall {
-    return parseToolCallsForRequest(allocator, toolParseText(final_text, opens_think), tools_json, allow_parallel);
 }
 
 /// The `response.completed` SSE payload. A non-empty `timings` object (the

@@ -925,7 +925,7 @@ pub fn handleStreamingGeneration(
         const norm_owned = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try streamEndToolCalls(allocator, gen_text, opens_think, think_closed, tools_json, allow_parallel_tools) else null;
+        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, toolParseText(gen_text, opens_think and !think_closed), tools_json, allow_parallel_tools) else null;
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -1046,11 +1046,6 @@ pub fn handleStreamingGeneration(
 }
 
 const StreamUsage = struct { prompt: u32, completion: u32, cached: u32, reasoning: u32 };
-
-/// The tool calls a chat stream reports at its end; `think_closed` = the stream already split off a closed thought.
-pub fn streamEndToolCalls(allocator: std.mem.Allocator, gen_text: []const u8, opens_think: bool, think_closed: bool, tools_json: ?[]const u8, allow_parallel: bool) !?[]chat_mod.ParsedToolCall {
-    return parseToolCallsForRequest(allocator, toolParseText(gen_text, opens_think and !think_closed), tools_json, allow_parallel);
-}
 
 /// The stream's end: the finish_reason chunk, the usage chunk when `usage` is set, then `[DONE]`.
 /// Timings ship once: on the usage chunk when one follows, else on the finish chunk (llama.cpp's

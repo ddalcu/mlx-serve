@@ -1161,7 +1161,7 @@ fn handleNonStreamingGeneration(
     // Check for tool calls in the output
     if (has_tools and shouldParseToolCalls(result.finish_details)) {
         log.debug("  checking {d} bytes of generated text for tool calls\n", .{final_text.len});
-        const found_calls = try replyToolCalls(allocator, final_text, opens_think, tools_json, allow_parallel_tools);
+        const found_calls = try parseToolCallsForRequest(allocator, toolParseText(final_text, opens_think), tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -1359,11 +1359,6 @@ fn formatToolCallReply(
     return std.fmt.allocPrint(allocator,
         \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
     , .{ nowMs(io), nowSecs(io), model_name, message.content, message.reasoning, message.tool_calls, finish, finishDetailsField(finish, result.finish_details), usage, timings_field });
-}
-
-/// The tool calls a finished non-stream chat completion reports.
-pub fn replyToolCalls(allocator: std.mem.Allocator, final_text: []const u8, opens_think: bool, tools_json: ?[]const u8, allow_parallel: bool) !?[]chat_mod.ParsedToolCall {
-    return parseToolCallsForRequest(allocator, toolParseText(final_text, opens_think), tools_json, allow_parallel);
 }
 
 // ── tests ──
