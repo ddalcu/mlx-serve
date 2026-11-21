@@ -10,10 +10,11 @@ inline float2 dec_fp4_pair(uint b) {
   return float2(as_type<half2>(v));
 }
 
-// `d` plus the dot of the codes in words [C0, C1) of `q` (eight codes a word) against their activations at `x` (bf16,
-// a uint4 a word), one fma chain in code order.
+// The dot of the codes in words [C0, C1) of `q` (eight codes a word) against their activations at `x` (bf16, a uint4
+// a word).
 template <int C0, int C1>
-inline float dec_fp4_dot(uint4 q, const device uint4* x, float d) {
+inline float dec_fp4_dot(uint4 q, const device uint4* x) {
+  float d = 0.0f;
 #pragma unroll
   for (int c = C0; c < C1; ++c) {
     const uint4 xq = x[c];
@@ -30,19 +31,14 @@ inline float dec_fp4_dot(uint4 q, const device uint4* x, float d) {
 }
 
 // `acc` plus one unit (the 32 codes in `q` against the 32 activations at `x`): each group's dot, its 2^14 restored
-// (exact), times its scale as MLX reads it (`s`: the unit's 32 / GS scale bytes). Two equal NVFP4 scale bytes take
-// MXFP4's order, one chain over the unit and one add, so a bank whose 16-halves share a scale (NVIDIA's DeepSeek pack)
-// gives its MXFP4 conversion's bytes.
+// (exact), times its scale as MLX reads it (`s`: the unit's 32 / GS scale bytes).
 template <int GS>
 inline float dec_fp4_unit(uint4 q, const device uint4* x, const device uint8_t* s, float acc) {
   if constexpr (GS == 32) {
-    return fma(mlxserve_fp4_scale_of<32>(uint(s[0])), dec_fp4_dot<0, 4>(q, x, 0.0f) * 16384.0f, acc);
+    return fma(mlxserve_fp4_scale_of<32>(uint(s[0])), dec_fp4_dot<0, 4>(q, x) * 16384.0f, acc);
   } else {
-    const bool one = s[0] == s[1];
-    const float d0 = dec_fp4_dot<0, 2>(q, x, 0.0f);
-    const float d1 = dec_fp4_dot<2, 4>(q, x, one ? d0 : 0.0f);
-    acc = one ? acc : fma(mlxserve_fp4_scale_of<16>(uint(s[0])), d0 * 16384.0f, acc);
-    return fma(mlxserve_fp4_scale_of<16>(uint(s[1])), d1 * 16384.0f, acc);
+    acc = fma(mlxserve_fp4_scale_of<16>(uint(s[0])), dec_fp4_dot<0, 2>(q, x) * 16384.0f, acc);
+    return fma(mlxserve_fp4_scale_of<16>(uint(s[1])), dec_fp4_dot<2, 4>(q, x) * 16384.0f, acc);
   }
 }
 
@@ -92,14 +88,15 @@ inline float dec_fp4_down_shared(const device uint32_t* sw, const device uint8_t
     for (int c = 0; c < 4; ++c) {
       const uint4 xq = ((const device uint4*)x)[u * 4 + c];
       const float xf[8] = {dec_up_bf(xq.x, 0), dec_up_bf(xq.x, 1), dec_up_bf(xq.y, 0), dec_up_bf(xq.y, 1), dec_up_bf(xq.z, 0), dec_up_bf(xq.z, 1), dec_up_bf(xq.w, 0), dec_up_bf(xq.w, 1)};
-      const float4 a = dsv41_e4m3x4<0>(qs[2 * c]), b = dsv41_e4m3x4<0>(qs[2 * c + 1]);
+      const float4 a = dsv41_e4m3x4<1>(qs[2 * c]), b = dsv41_e4m3x4<1>(qs[2 * c + 1]);
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         d = fma(xf[i], a[i], d);
         d = fma(xf[4 + i], b[i], d);
       }
     }
-    acc = fma(mlxserve_fp4_e8m0(uint(sp[u])), d * 256.0f, acc);
+    const uint e = uint(sp[u]);
+    acc = fma(as_type<float>(e == 0u ? 0x400000u : (e << 23)) * 256.0f, d, acc);
   }
   return acc;
 }

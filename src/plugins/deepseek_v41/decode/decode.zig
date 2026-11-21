@@ -57,9 +57,11 @@ pub fn expectNoWorse(label: []const u8, new: []const f32, chain: []const f32, tr
 /// The mxfp8 reads (MLX's, or the 2^8 fold under `FOLD`): `fp8_read_header.metal` after the e4m3 / e8m0 reads.
 pub const FP8_READ_HEADER = @import("../../../sdk/quant/fp4.zig").SCALE_HEADER ++ @import("../../../mlx/kernels.zig").source("plugins/deepseek_v41/kernels/fp8_read_header.metal");
 
-/// The mxfp8 reads' template int `FOLD` (`MLX_SERVE_DSV41_FP8_FOLD`, read every call): 0 MLX's reads, 1 the 2^8 fold.
+/// The mxfp8 reads' template int `FOLD` (`MLX_SERVE_DSV41_FP8_FOLD`, read every call): 1 the 2^8 fold (the default: the
+/// same product on every finite code under 247, fewer operations), 0 MLX's reads.
 pub fn fp8Fold() c_int {
-    return @intFromBool(env.on(.MLX_SERVE_DSV41_FP8_FOLD));
+    const v = env.get(.MLX_SERVE_DSV41_FP8_FOLD) orelse return 1;
+    return @intFromBool(v[0] != '0');
 }
 
 /// A contract kernel at `FOLD` 0 (MLX's mxfp8 reads) and 1 (the fold) on the same inputs, each served shape over three
