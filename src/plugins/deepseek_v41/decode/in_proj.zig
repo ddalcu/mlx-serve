@@ -6,6 +6,7 @@ const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const device = @import("../../../mlx/device.zig");
 const mlx = @import("../../../mlx/ffi.zig");
+const env = @import("../../../env.zig");
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 const decode = @import("decode.zig");
 const v41 = @import("../deepseek_v41.zig");
@@ -62,6 +63,8 @@ pub const Plan = struct {
     comp_f32: bool = false,
     /// Every threadgroup collapses the stream itself (up to `fuse_rows` rows); else `dec_in_proj_stage.metal` makes h first.
     fuse: bool = true,
+    /// Groups of `rt` rows a projection threadgroup takes against its h (`MLX_SERVE_DSV41_GEMV_R26_IN_PROJ`: `rpt_on`).
+    rpt: usize = 1,
 
     fn compDtype(p: Plan) mlx.mlx_dtype {
         return if (p.comp_f32) .float32 else .bfloat16;
@@ -73,7 +76,7 @@ pub const Plan = struct {
 
     /// q_kv, weights_proj and compressor threadgroups, then one per hc mix.
     fn groups(p: Plan) usize {
-        return (p.nq + p.nw + p.nc) / rt + n_mix;
+        return (p.nq + p.nw + p.nc) / (rt * p.rpt) + n_mix;
     }
 };
 
@@ -113,6 +116,14 @@ fn bf16Rows(l: *const v41.Lin, d: usize) ?usize {
     return @intCast(sh[0]);
 }
 
+/// `MLX_SERVE_DSV41_GEMV_R26_IN_PROJ` (read each call): =1 a projection threadgroup takes `rpt_on` groups of rows, so
+/// the h it makes or reads (every row's, the redundant part of a verify block's launch) serves 4x the weights.
+pub fn rptOn() bool {
+    const v = env.get(.MLX_SERVE_DSV41_GEMV_R26_IN_PROJ) orelse return false;
+    return v[0] == '1';
+}
+pub const rpt_on: usize = 4;
+
 /// The launch `ly` takes for the stream `x` `[R, hc, D]`, or null where the kernel does not serve it: another dtype,
 /// width or row count, a q_kv, weights_proj or compressor in another format, a layer without q_kv (the DSpark stages).
 pub fn plan(m: *const v41.Dsv41Model, ly: *const v41.Layer, x: A) ?Plan {
@@ -140,6 +151,8 @@ pub fn planRows(m: *const v41.Dsv41Model, ly: *const v41.Layer, rows: usize) ?Pl
         p.nc = bf16Rows(&cw.wkv, d) orelse return null;
         p.comp_f32 = ly.ratio > 1;
     }
+    const g = rt * rpt_on;
+    if (rptOn() and p.nq % g == 0 and p.nw % g == 0 and p.nc % g == 0) p.rpt = rpt_on;
     return p;
 }
 
@@ -199,7 +212,7 @@ fn launchGeometry(p: Plan, fold: c_int) kc.metal.Geometry {
     g.out(&.{ r, @max(ci(p.nw), 1) }, .bfloat16);
     g.out(&.{ r, @max(ci(p.nc), 1) }, p.compDtype());
     g.out(&.{ r, n_mix }, .float32);
-    inline for (.{ .{ "R", p.rows }, .{ "RT", rt }, .{ "NQ", p.nq }, .{ "QA", p.qa }, .{ "NW", p.nw }, .{ "NC", p.nc }, .{ "D", p.dim } }) |t| g.int(t[0], t[1]);
+    inline for (.{ .{ "R", p.rows }, .{ "RT", rt }, .{ "NQ", p.nq }, .{ "QA", p.qa }, .{ "NW", p.nw }, .{ "NC", p.nc }, .{ "D", p.dim }, .{ "RPT", p.rpt } }) |t| g.int(t[0], t[1]);
     g.flag("FUSE", p.fuse);
     g.dtype("CT", p.compDtype());
     g.int("FOLD", fold);
@@ -427,12 +440,17 @@ fn depthNorm(s: Shape) usize {
 /// The main kernel with `fuse` (every threadgroup collapses the stream; else `hin` holds the normed collapse), `nw`
 /// weights_proj rows and `nc` compressor rows (f32 when `cf32`).
 fn Main(comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf32: bool) type {
+    return MainRpt(fuse, nw, nc, cf32, 1);
+}
+
+/// `Main` with `rpt` row groups a projection threadgroup.
+fn MainRpt(comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf32: bool, comptime rpt: usize) type {
     return struct {
         pub const Params = struct {};
         const comp_elem: spec.Elem = if (cf32) .f32 else .bf16;
 
         fn planOf(s: Shape) Plan {
-            return .{ .rows = s.rows, .dim = s.k, .nq = NQ, .qa = QA, .nw = nw, .nc = nc, .comp_f32 = cf32, .fuse = fuse };
+            return .{ .rows = s.rows, .dim = s.k, .nq = NQ, .qa = QA, .nw = nw, .nc = nc, .comp_f32 = cf32, .fuse = fuse, .rpt = rpt };
         }
 
         pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
@@ -693,7 +711,11 @@ const fused_shapes: []const Shape = &.{ .{ .rows = 1, .n = NQ, .k = DIM }, .{ .r
 const staged_shapes: []const Shape = &.{ .{ .rows = fuse_rows + 1, .n = NQ, .k = DIM }, .{ .rows = decode.max_rows, .n = NQ, .k = DIM } };
 
 fn addMain(set: *kc.Set, comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf32: bool, comptime name: []const u8) !void {
-    const T = Main(fuse, nw, nc, cf32);
+    return addMainRpt(set, fuse, nw, nc, cf32, 1, name);
+}
+
+fn addMainRpt(set: *kc.Set, comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf32: bool, comptime rpt: usize, comptime name: []const u8) !void {
+    const T = MainRpt(fuse, nw, nc, cf32, rpt);
     try kit.add(set, T, &main_l, .{}, .{
         .name = name,
         .accum = .f32,
@@ -714,6 +736,8 @@ pub fn register(set: *kc.Set) !void {
     try addMain(set, false, 0, 0, false, "dsv41 dec in_proj, 3..6 rows (q_kv, hc mixes)");
     try addMain(set, false, 8, 16, true, "dsv41 dec in_proj, 3..6 rows (+ weights_proj, f32 compressor)");
     try addMain(set, false, 8, 16, false, "dsv41 dec in_proj, 3..6 rows (+ weights_proj, bf16 compressor)");
+    try addMainRpt(set, true, 16, 32, true, rpt_on, "dsv41 dec in_proj, 1..2 rows, 4 row groups a threadgroup (+ weights_proj, f32 compressor)");
+    try addMainRpt(set, false, 16, 32, false, rpt_on, "dsv41 dec in_proj, 3..6 rows, 4 row groups a threadgroup (+ weights_proj, bf16 compressor)");
     try kit.add(set, Stage, &stage_l, .{}, .{
         .name = "dsv41 dec in_proj_stage (normed collapse)",
         .accum = .f32,
@@ -883,8 +907,19 @@ fn dequantHost(sc: *v41.Scope, l: *const v41.Lin) ![]f32 {
 }
 
 fn expectLayer(gpa: std.mem.Allocator, fx: *fixture.Fixture, k: *const Kernels, li: usize, rows: usize) !void {
+    return expectLayerImpl(gpa, fx, k, li, rows, null);
+}
+
+/// `expectLayer` with the launch reading `q` as q_kv (the chain keeps the layer's): a planted wrong weight.
+fn expectLayerWith(gpa: std.mem.Allocator, fx: *fixture.Fixture, k: *const Kernels, li: usize, rows: usize, q: v41.Lin) !void {
+    return expectLayerImpl(gpa, fx, k, li, rows, q);
+}
+
+fn expectLayerImpl(gpa: std.mem.Allocator, fx: *fixture.Fixture, k: *const Kernels, li: usize, rows: usize, planted: ?v41.Lin) !void {
     const m = fx.m;
     const ly = fx.layer(li);
+    var lyl = ly.*;
+    if (planted) |q| lyl.q_kv = q;
     const d = m.cfg.hidden_size;
     const x = try fx.stream(rows);
     defer _ = mlx.mlx_array_free(x);
@@ -894,7 +929,7 @@ fn expectLayer(gpa: std.mem.Allocator, fx: *fixture.Fixture, k: *const Kernels, 
     defer sc.deinit();
     std.debug.print("[dec] in_proj layer {d} rows {d}\n", .{ li, rows });
 
-    const out = (try run(&sc, k, m, ly, x, cpre)) orelse return error.Declined;
+    const out = (try run(&sc, k, m, &lyl, x, cpre)) orelse return error.Declined;
     const staged = try v41.hcStage(&sc, m, x, null, cpre, &ly.hc_attn, ly.attn_norm);
     const tz = try todayStage(&sc, m, x, cpre, ly);
     const h_chain = try host(staged.h);
@@ -973,6 +1008,29 @@ test "dsv41 dec in_proj: layers 20..25 and 2..4 (KV sources, index sources, plai
         defer fx.deinit();
         for (rg[0]..rg[1]) |li| for ([_]usize{ 1, 2, 4, 6 }) |rows| try expectLayer(gpa, fx, &k, li, rows);
     }
+}
+
+test "dsv41 dec in_proj rpt: MLX_SERVE_DSV41_GEMV_R26_IN_PROJ=1, layers 20..25 and 2..4 at R = 1..6, match today's chain; another layer's q_kv fails" {
+    if (mlx.virtualGpu()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (device.deviceGeneration().gen < first_gen) return error.SkipZigTest;
+    var ov = env.override(.MLX_SERVE_DSV41_GEMV_R26_IN_PROJ, "1");
+    defer ov.restore();
+    const gpa = testing.allocator;
+    const k = try Kernels.build();
+    defer k.deinit();
+    for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 } }) |rg| {
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = rg[0], .hi = rg[1], .ctx = 0 });
+        defer fx.deinit();
+        for (rg[0]..rg[1]) |li| for (1..decode.max_rows + 1) |rows| {
+            try testing.expectEqual(rpt_on, planRows(fx.m, fx.layer(li), rows).?.rpt);
+            try expectLayer(gpa, fx, &k, li, rows);
+        };
+    }
+    // The planted bug: the launch reads layer 21's q_kv where the chain reads layer 20's.
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 22, .ctx = 0 });
+    defer fx.deinit();
+    try testing.expectError(error.FurtherFromTruth, expectLayerWith(gpa, fx, &k, 20, 4, fx.layer(21).q_kv.?));
 }
 
 // ── ubench ────────────────────────────────────────────────────────────────
@@ -1151,6 +1209,43 @@ test "dsv41 dec in_proj: ubench against its byte floor and the chain it replaces
             decode.report(try std.fmt.bufPrint(&name_buf, "in_proj ({s}, {d} copies)", .{ kind.name, cyc.n }), rows, us, @as(f64, @floatFromInt(bytes)), chain_us);
         }
     }
+}
+
+test "dsv41 dec in_proj rpt: ubench, R = 1..6, one row group a threadgroup against four (DSV41_DEC_UBENCH)" {
+    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const k = try Kernels.build();
+    defer k.deinit();
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 25, .ctx = 0 });
+    defer fx.deinit();
+    const m = fx.m;
+    for ([_]usize{ 21, 20 }) |li| for (1..decode.max_rows + 1) |rows| {
+        const ly = fx.layer(li);
+        const x = try fx.stream(rows);
+        defer _ = mlx.mlx_array_free(x);
+        const cpre = try fx.cpre(rows);
+        defer _ = mlx.mlx_array_free(cpre);
+        var sc = v41.Scope.init(gpa, m.s);
+        defer sc.deinit();
+        const base = argsOf(ly, x, cpre, try v41.hcEps(&sc, m));
+        var us: [2]f64 = undefined;
+        var bytes: usize = 0;
+        for ([_][*:0]const u8{ "0", "1" }, &us) |on, *t| {
+            var ov = env.override(.MLX_SERVE_DSV41_GEMV_R26_IN_PROJ, on);
+            defer ov.restore();
+            const p = plan(m, ly, x) orelse return error.Declined;
+            bytes = layerBytes(p);
+            const cyc = try Cycle.init(gpa, &sc, ly, bytes, 2_200_000_000);
+            defer cyc.deinit(gpa);
+            var own = v41.Scope.init(gpa, m.s);
+            defer own.deinit();
+            var c: Chain = .{ .sc = &own, .k = &k, .p = p, .cyc = &cyc, .base = base };
+            _ = try decode.chainUs(&c, cyc.n);
+            t.* = try decode.chainUs(&c, cyc.n);
+        }
+        const floor = @as(f64, @floatFromInt(bytes)) / decode.stream_bytes_per_us;
+        std.debug.print("[dec-ubench] in_proj layer {d} R={d}: one row group {d:.1} us ({d:.0}% of floor), four {d:.1} us ({d:.0}% of floor)\n", .{ li, rows, us[0], 100 * floor / us[0], us[1], 100 * floor / us[1] });
+    };
 }
 
 test "dsv41 dec in_proj: q_kv's MLX mxfp8 reads give the FOLD form's bytes on finite codes" {

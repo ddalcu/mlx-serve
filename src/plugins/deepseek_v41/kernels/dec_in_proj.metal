@@ -1,9 +1,10 @@
 // dec_in_proj: the attention input of R rows of one layer in one launch. A threadgroup of D / 8 threads, a thread 8 positions of K.
 // Threadgroups in order: q_kv rows (mxfp8, RT each), weights_proj and compressor rows (bf16, RT each), one hc mix each.
-// h = rms(collapse(x, cpre), attn_norm) is made in every threadgroup from x (FUSE), else `hin` holds it.
+// h = rms(collapse(x, cpre), attn_norm) is made in every threadgroup from x (FUSE), else `hin` holds it. A projection
+// threadgroup takes RPT groups of RT rows against the h it made or read once (`MLX_SERVE_DSV41_GEMV_R26_IN_PROJ`: 4).
 static_assert(RT == 4, "a threadgroup's rows are the lanes of one float4 of dots");
 constexpr int HC = 4, NMIX = (2 + HC) * HC, NT = D / 8, NSG = NT / 32;
-constexpr int NGQ = NQ / RT, NGW = NW / RT, NGC = NC / RT;
+constexpr int NGQ = NQ / RT / RPT, NGW = NW / RT / RPT, NGC = NC / RT / RPT;
 const uint t = thread_position_in_threadgroup.x, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
 const int tg = threadgroup_position_in_grid.x;
 threadgroup float part[(RT + 2) * R * NSG];
@@ -60,20 +61,24 @@ if (tg >= NGQ + NGW + NGC) {
 }
 
 const bool is_q = tg < NGQ, is_w = !is_q && tg < NGQ + NGW;
-const int row0 = (is_q ? tg : (is_w ? tg - NGQ : tg - NGQ - NGW)) * RT;
-uint2 wq8[RT];
-uint sc8[RT];
-uint4 wb[RT];
+const int rows0 = (is_q ? tg : (is_w ? tg - NGQ : tg - NGQ - NGW)) * RT * RPT;
+uint2 wq8[RPT][RT];
+uint sc8[RPT][RT];
+uint4 wb[RPT][RT];
 if (is_q) {
   #pragma unroll
-  for (int i = 0; i < RT; ++i) {
-    wq8[i] = *(const device uint2*)(wq + size_t(row0 + i) * (D / 4) + 2 * t);
-    sc8[i] = uint(wsc[size_t(row0 + i) * (D / 32) + t / 4]);
-  }
+  for (int g = 0; g < RPT; ++g)
+    #pragma unroll
+    for (int i = 0; i < RT; ++i) {
+      wq8[g][i] = *(const device uint2*)(wq + size_t(rows0 + g * RT + i) * (D / 4) + 2 * t);
+      sc8[g][i] = uint(wsc[size_t(rows0 + g * RT + i) * (D / 32) + t / 4]);
+    }
 } else {
   const device bfloat16_t* wr = is_w ? wp : cw;
   #pragma unroll
-  for (int i = 0; i < RT; ++i) wb[i] = *(const device uint4*)(wr + size_t(row0 + i) * D + 8 * t);
+  for (int g = 0; g < RPT; ++g)
+    #pragma unroll
+    for (int i = 0; i < RT; ++i) wb[g][i] = *(const device uint4*)(wr + size_t(rows0 + g * RT + i) * D + 8 * t);
 }
 
 float hf[R][8];
@@ -149,14 +154,18 @@ if (FUSE) {
 }
 
 // This thread's dot of each row against its 8 positions; a simdgroup's sums go to threadgroup memory a float4 at a time.
+#pragma unroll
+for (int g = 0; g < RPT; ++g) {
+const int row0 = rows0 + g * RT;
+if (g > 0) threadgroup_barrier(mem_flags::mem_threadgroup);
 float dv[RT][R];
 if (is_q) {
   #pragma unroll
   for (int i = 0; i < RT; ++i) {
     // The e8m0 scale and the 2^8 the e4m3 reads leave out (fp8_read_header.metal).
-    const float2 s = dsv41_e8m0<FOLD>(sc8[i]);
-    const float2 a0 = dsv41_e4m3x2<FOLD>(wq8[i].x), a1 = dsv41_e4m3x2<FOLD>(wq8[i].x >> 8);
-    const float2 a2 = dsv41_e4m3x2<FOLD>(wq8[i].y), a3 = dsv41_e4m3x2<FOLD>(wq8[i].y >> 8);
+    const float2 s = dsv41_e8m0<FOLD>(sc8[g][i]);
+    const float2 a0 = dsv41_e4m3x2<FOLD>(wq8[g][i].x), a1 = dsv41_e4m3x2<FOLD>(wq8[g][i].x >> 8);
+    const float2 a2 = dsv41_e4m3x2<FOLD>(wq8[g][i].y), a3 = dsv41_e4m3x2<FOLD>(wq8[g][i].y >> 8);
     const float w8[8] = {a0.x, a1.x, a0.y, a1.y, a2.x, a3.x, a2.y, a3.y};
     #pragma unroll
     for (int r = 0; r < R; ++r) {
@@ -169,7 +178,7 @@ if (is_q) {
 } else {
   #pragma unroll
   for (int i = 0; i < RT; ++i) {
-    const uint bw[4] = {wb[i].x, wb[i].y, wb[i].z, wb[i].w};
+    const uint bw[4] = {wb[g][i].x, wb[g][i].y, wb[g][i].z, wb[g][i].w};
     #pragma unroll
     for (int r = 0; r < R; ++r) {
       float d = 0.0f;
@@ -204,4 +213,5 @@ if (t < RT * R) {
   } else {
     comp[r * NC + n] = CT(a);
   }
+}
 }

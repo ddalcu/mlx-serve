@@ -5050,6 +5050,7 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     const ls = &st.layers[li];
     const L = dim(x, 0);
     const a = try dkern.in_proj.run(sc, kp, m, ly, x, pre.*) orelse return null;
+    if (dkern.in_proj.rptOn()) engaged(m, 5, "MLX_SERVE_DSV41_GEMV_R26_IN_PROJ");
     const pos = try dkern.wq_b.rowsAt(sc, p0, L);
     // `MLX_SERVE_DSV41_GEMV_R26_WQB=1`: a verify block's wq_b on the matrix units.
     const nax = m.dec.wq_b_nax != null and dkern.wq_b.naxOn(L);
