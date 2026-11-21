@@ -38,7 +38,7 @@ pub const Fuse = struct {
         return .{
             .down_scale = env.on(.MLX_SERVE_DSV41_FUSE_DOWN_SCALE),
             .engram = env.on(.MLX_SERVE_DSV41_FUSE_ENGRAM),
-            .mxfp8_qmm = env.on(.MLX_SERVE_DSV41_FUSE_MXFP8_QMM),
+            .mxfp8_qmm = env.onUnlessZero(.MLX_SERVE_DSV41_FUSE_MXFP8_QMM),
             .pf_bf16_trunk = env.on(.MLX_SERVE_DSV41_PF_BF16_TRUNK),
         };
     }

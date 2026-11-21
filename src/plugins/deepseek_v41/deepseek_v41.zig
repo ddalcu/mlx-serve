@@ -3131,7 +3131,7 @@ fn hcExpandNormScratch(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const 
 /// split from them, the stock launches' words (`MLX_SERVE_DSV41_HC_EXPAND_NORM`); null where that is off or the fused
 /// kernels were refused at load.
 pub fn hcExpandNormFresh(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const Split, cpre: A, hc: *const Hc, norm_w: A) !?Staged {
-    if (hcf_k == null or !env.on(.MLX_SERVE_DSV41_HC_EXPAND_NORM)) return null;
+    if (hcf_k == null or !env.onUnlessZero(.MLX_SERVE_DSV41_HC_EXPAND_NORM)) return null;
     if (!hc_expand_norm_logged.swap(true, .monotonic)) log.info("[dsv41] HC_EXPAND_NORM engaged (rows {d})\n", .{dim(x, 0)});
     const eps = try hcEps(sc, m);
     const f = try hcExpandNormLaunch(sc, m, x, y, sp, cpre, norm_w, eps, null, none);
