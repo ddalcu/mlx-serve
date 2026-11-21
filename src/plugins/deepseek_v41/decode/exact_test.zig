@@ -244,14 +244,22 @@ test "dsv41 exact: verify rows and the state they leave equal plain steps bit fo
     try std.testing.expectEqual(@as(u64, 0), t.misses);
 }
 
-test "dsv41 exact: verify rows against plain steps with fp4 experts, the fused fp4 MoE on and off, exact off (DSV41_EXACT_GATE, prints)" {
+test "dsv41 exact: verify rows against plain steps with fp4 experts, the fused fp4 MoE on and off, exact off (DSV41_EXACT_GATE)" {
     if (env.get(.DSV41_EXACT_GATE) == null) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    for ([_]?[*:0]const u8{ "1", null }) |fused| {
+    for ([_]?[*:0]const u8{ "1", "0" }) |fused| {
         const sw = env.override(.MLX_SERVE_DSV41_MOE_FP4_NAX, fused);
         defer sw.restore();
-        std.debug.print("[exact-gate] MLX_SERVE_DSV41_MOE_FP4_NAX={s}\n", .{fused orelse "unset"});
-        for ([_]Experts{ .mxfp4, .nvfp4 }) |e| _ = try runGateWith(false, e, true);
+        std.debug.print("[exact-gate] MLX_SERVE_DSV41_MOE_FP4_NAX={s}\n", .{fused.?});
+        for ([_]Experts{ .mxfp4, .nvfp4 }) |e| {
+            const t = try runGateWith(false, e, true);
+            // On NAX the fused fp4 decode serves every verify row on its plain step's kernels: the bar is every byte.
+            if (fused.?[0] == '1' and device.naxAvailable()) {
+                try std.testing.expectEqual(@as(usize, 0), t.row_diffs);
+                try std.testing.expectEqual(@as(usize, 0), t.probe_diffs);
+                try std.testing.expectEqual(@as(usize, 0), t.state_diffs);
+            }
+        }
     }
 }
 

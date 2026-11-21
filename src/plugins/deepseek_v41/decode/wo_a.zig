@@ -47,13 +47,14 @@ fn ci(v: usize) c_int {
 }
 
 /// Simdgroups of a threadgroup and the weight rows each streams: a threadgroup owns NSG * NR outputs. The matrix units
-/// take 32 rows a simdgroup, from `nax_rows` activation rows on (below, the vector units' one pass over the weights is
-/// the cheaper); they exist on M5 and newer.
+/// take 32 rows a simdgroup; they exist on M5 and newer.
 const NSG = 8;
 const NR = 8;
 const NAX_NSG = 4;
 const NAX_NR = 32;
-const nax_rows = 4;
+/// Every row a launch serves stays on the vector kernel: the matrix units' tile sums a row in another order, so a
+/// verify block's rows would not carry the plain step's bytes (DSV41_EXACT_GATE). The NAX kernel keeps its contract.
+const nax_rows = decode.max_rows + 1;
 
 fn useNax(rows: c_int) bool {
     return rows >= nax_rows and device.naxAvailable();
@@ -357,9 +358,11 @@ const served = [_]Shape{
     .{ .rows = 1, .n = 256, .k = HPG * HD },
     .{ .rows = 2, .n = 256, .k = HPG * HD },
     .{ .rows = 3, .n = 256, .k = HPG * HD },
+    .{ .rows = 4, .n = 256, .k = HPG * HD },
+    .{ .rows = decode.max_rows, .n = 256, .k = HPG * HD },
 };
 const served_nax = [_]Shape{
-    .{ .rows = nax_rows, .n = 256, .k = HPG * HD },
+    .{ .rows = 4, .n = 256, .k = HPG * HD },
     .{ .rows = decode.max_rows, .n = 256, .k = HPG * HD },
 };
 
@@ -598,15 +601,15 @@ test "dsv41 dec wo_a: the declared launches are the wrapper's, byte for byte" {
     defer _ = mlx.mlx_fast_metal_kernel_free(kern);
     var sc = Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
-    for ([_]bool{ false, true }) |nax| {
-        if (nax and !device.naxAvailable()) continue;
+    // The wrapper serves the vector launch at every row count a verify block has (`useNax`).
+    for ([_]usize{ 3, decode.max_rows }) |rows| {
         const c = try a.create(kit.Case(WoA));
         defer {
             c.deinit();
             a.destroy(c);
         }
-        c.* = .init(a, if (nax) &decl_nax else &decl, .{ .nax = nax });
-        try testing.expect(try c.prepare(.{ .rows = if (nax) 6 else 3, .n = 128, .k = HPG * HD }, .random, 7));
+        c.* = .init(a, &decl, .{ .nax = false });
+        try testing.expect(try c.prepare(.{ .rows = rows, .n = 128, .k = HPG * HD }, .random, 7));
         try c.run();
         const mine = try a.dupe(u8, c.rig.outputBytes());
         defer a.free(mine);
@@ -726,4 +729,8 @@ test "dsv41 dec wo_a: ubench" {
         decode.report("wo_a", R, try decode.chainUs(&b, copies.len), bytes, old_us);
         std.debug.print("[dec-ubench] wo_a R={d}: eval-only {d:.1} us, replaced chain {d:.1} us\n", .{ R, try evalUs(&b, copies.len), old_eval });
     }
+}
+
+test "dsv41 wo_a: every row a launch serves, a verify block's included, takes the vector kernel a plain step takes" {
+    for (1..decode.max_rows + 1) |r| try testing.expect(!useNax(@intCast(r)));
 }
