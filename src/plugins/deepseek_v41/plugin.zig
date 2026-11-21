@@ -23,6 +23,7 @@ const outside = @import("../../sdk/quant/outside.zig");
 const outside_model = @import("../../sdk/quant/outside_model.zig");
 const env = @import("../../env.zig");
 const engram_decode = @import("decode/engram_decode.zig");
+const mx_view = @import("mx_view.zig");
 const flash_attn = @import("prompt/flash_attn.zig");
 const scratch_attn = @import("prompt/scratch_attn.zig");
 pub const config = @import("config.zig");
@@ -800,9 +801,13 @@ fn auxImportArrays(mp: *anyopaque, ids: abi.Span(u32), header: abi.Str, arrays: 
 }
 
 /// The load reads its Engram tables from disk per lookup and drops the tensors it never loads
-/// (`dsv41.residentDiskBytes`); the `mtp` setting decides the DSpark stages.
+/// (`dsv41.residentDiskBytes`); the `mtp` setting decides the DSpark stages; plus a bf16 prompt trunk
+/// (`bill.pfTrunkBytes`).
 fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, settings_json: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
-    out.* = dsv41.residentDiskBytes(gpa, model_dir.slice(), config.of(p), mtpSetting(settings_json.slice()), shards) catch |e| return Verdict.named(.failed, @errorName(e));
+    const mtp = mtpSetting(settings_json.slice());
+    out.* = dsv41.residentDiskBytes(gpa, model_dir.slice(), config.of(p), mtp, shards) catch |e| return Verdict.named(.failed, @errorName(e));
+    if (mx_view.on()) out.* -|= mx_view.savedBytes(gpa, model_dir.slice(), dsv41.dsparkWanted(config.of(p), null, mtp)) catch |e| return Verdict.named(.failed, @errorName(e));
+    out.* += bill_mod.pfTrunkBytes(config.of(p));
     return .ok;
 }
 
@@ -884,6 +889,65 @@ test "deepseek_v41 resident bill: neither the vision tower nor DSpark stages tha
     // The stages load by default; the tower never does.
     try std.testing.expectEqual(10_000 - 288 - 32 + lru(), try engramResident(dir, "", 10_000));
     try std.testing.expectEqual(10_000 - 288 - 32 - 64 + lru(), try engramResident(dir, "{\"mtp\":false}", 10_000));
+}
+
+test "deepseek_v41 resident bill: under the mxfp4 view an NVFP4 bank's e4m3 scales bill as e8m0 (half) and its globals not at all; a bank without globals and stages that do not load bill as before" {
+    const env_mod = @import("../../env.zig");
+    env_mod.unset(.MLX_SERVE_DSV4_DSPARK);
+    defer env_mod.unset(.MLX_SERVE_DSV41_MXFP4_VIEW);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    // name, dtype, shape, bytes: one NVFP4 trunk bank and one stage bank with their globals, a shared expert's and an
+    // MXFP4 bank's scales beside them.
+    const ts = .{
+        .{ "layers.0.ffn.experts.0.w1.weight", "U32", "[2,2]", 16 },
+        .{ "layers.0.ffn.experts.0.w1.scales", "U8", "[2,4]", 8 },
+        .{ "layers.0.ffn.experts.0.w3.scales", "U8", "[2,4]", 8 },
+        .{ "layers.0.ffn.experts.0.w2.scales", "U8", "[2,4]", 8 },
+        .{ "layers.0.ffn.experts.gate_proj.expert_scale", "BF16", "[1]", 2 },
+        .{ "layers.0.ffn.experts.up_proj.expert_scale", "BF16", "[1]", 2 },
+        .{ "layers.0.ffn.experts.expert_scale", "BF16", "[1]", 2 },
+        .{ "layers.0.ffn.shared_experts.w1.scales", "U8", "[2,4]", 8 },
+        .{ "layers.1.ffn.experts.0.w1.scales", "U8", "[2,2]", 4 },
+        .{ "mtp.0.ffn.experts.0.w1.scales", "U8", "[2,4]", 8 },
+        .{ "mtp.0.ffn.experts.gate_proj.expert_scale", "BF16", "[1]", 2 },
+        .{ "mtp.0.ffn.experts.up_proj.expert_scale", "BF16", "[1]", 2 },
+        .{ "mtp.0.ffn.experts.expert_scale", "BF16", "[1]", 2 },
+    };
+    const hdr, const idx, const data = comptime blk: {
+        var h: []const u8 = "{";
+        var x: []const u8 = "{\"weight_map\":{";
+        var off: u32 = 0;
+        for (ts, 0..) |t, i| {
+            const sep = if (i > 0) "," else "";
+            h = h ++ sep ++ std.fmt.comptimePrint("\"{s}\":{{\"dtype\":\"{s}\",\"shape\":{s},\"data_offsets\":[{d},{d}]}}", .{ t[0], t[1], t[2], off, off + t[3] });
+            x = x ++ sep ++ "\"" ++ t[0] ++ "\":\"model-00001.safetensors\"";
+            off += t[3];
+        }
+        break :blk .{ h ++ "}", x ++ "}}", off };
+    };
+    var shard: [8 + hdr.len + data]u8 = @splat(0);
+    std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
+    @memcpy(shard[8..][0..hdr.len], hdr);
+    try td.dir.writeFile(io, .{ .sub_path = "model-00001.safetensors", .data = &shard });
+    try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = idx });
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try td.dir.realPath(io, &buf)];
+    var c: config.Config = .{ .model_type = "deepseek_v41" };
+    const bill = struct {
+        fn of(cfg: *config.Config, d: []const u8, settings: []const u8, view: bool) !u64 {
+            if (view) env_mod.set(.MLX_SERVE_DSV41_MXFP4_VIEW, "1") else env_mod.unset(.MLX_SERVE_DSV41_MXFP4_VIEW);
+            var out: u64 = 0;
+            if (!residentBytes(&.{ .private = cfg }, .of(d), .of(settings), 10_000, &out).isOk()) return error.Refused;
+            return out;
+        }
+    };
+    // The trunk bank: (3 x 8) / 2 + 3 x 2 = 18 bytes less; the stage bank's 8 / 2 + 6 = 10 while it loads.
+    try std.testing.expectEqual(@as(u64, 10_000), try bill.of(&c, dir, "", false));
+    try std.testing.expectEqual(@as(u64, 10_000 - 18 - 10), try bill.of(&c, dir, "", true));
+    try std.testing.expectEqual(@as(u64, 10_000 - 14), try bill.of(&c, dir, "{\"mtp\":false}", false));
+    try std.testing.expectEqual(@as(u64, 10_000 - 14 - 18), try bill.of(&c, dir, "{\"mtp\":false}", true));
 }
 
 test {

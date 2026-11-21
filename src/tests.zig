@@ -118,6 +118,7 @@ test {
     _ = @import("sdk/weights/streamed/expert/demand_first_test.zig");
     _ = @import("sdk/weights/streamed/mlx_pack_test.zig");
     _ = @import("plugins/deepseek_v41/streamed_test.zig");
+    _ = @import("plugins/deepseek_v41/mx_view.zig");
     _ = @import("version.zig");
     _ = @import("mlx/ops.zig");
     _ = @import("mlx/kernels.zig");
@@ -246,6 +247,7 @@ test {
     _ = @import("engines/mlx/spec/dflash/dflash.zig");
     _ = @import("engines/mlx/spec/dflash/lilicorr.zig");
     _ = @import("engines/mlx/spec/dflash/policy.zig");
+    _ = @import("engines/mlx/spec/dflash/policy2.zig");
     _ = @import("sdk/spec/mtp/mtp.zig");
     _ = @import("engines/mlx/spec/mtp_test.zig");
     _ = @import("engines/mlx/spec/round_cost.zig");
@@ -265,6 +267,8 @@ test {
     _ = @import("plugins/deepseek_v41/prompt/m_invariance_test.zig");
     _ = @import("plugins/deepseek_v41/prompt/pass_async_test.zig");
     _ = @import("plugins/deepseek_v41/prompt/ced_lazy_test.zig");
+    _ = @import("plugins/deepseek_v41/prompt/wide_test.zig");
+    _ = @import("plugins/deepseek_v41/fuse.zig");
     _ = @import("plugins/qwen4_exp/qwen4_exp.zig");
     _ = @import("plugins/qwen4_exp/ple_gpu.zig");
     _ = @import("plugins/kokoro/kokoro.zig");

@@ -8,6 +8,7 @@ comptime {
     _ = @import("host/plugins/loader.zig").process;
     _ = @import("sdk/quant/outside.zig").tables;
     _ = @import("plugins/deepseek_v41/decode/engram_decode.zig").shared_state;
+    _ = @import("plugins/deepseek_v41/fuse.zig").shared_state;
     _ = @import("plugins/deepseek_v41/prompt/engram_direct.zig").shared_state;
     _ = @import("plugins/deepseek_v41/prompt/flash_attn.zig").shared_state;
     _ = @import("plugins/deepseek_v41/prompt/pass_async.zig").shared_state;

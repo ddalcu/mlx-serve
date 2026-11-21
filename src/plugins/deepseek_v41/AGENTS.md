@@ -29,7 +29,11 @@ serves either from the pack, with no flag.
   kernels (`attn_core`, `q_tail`, `scratch_attn` regions and ring), the hc and router fusions (`hc_fuse`, `gate_gemm`),
   span grouping (`idx_group`), buffers kept or reused (`transient_keep`, `scratch_x1` on `scratch`),
   Engram's direct read (`engram_direct`), the embedding pread and a plugin bank's own pieces (`wide_early`, `woa_rows`,
-  `flash_attn`: the lossy flash kernel, default on beside a plugin bank only).
+  `flash_attn`: the lossy flash kernel, default on beside a plugin bank only), an fp4 bank's gate and up with `moe_act`
+  in one paired launch (`moe_pair`); `wide_test.zig` holds each default-off rewrite to a tolerance of the stock path,
+  with a planted bug each.
+- `fuse.zig`: launch fusions, each off by default behind its own `MLX_SERVE_DSV41_FUSE_*` switch (`Dsv41Model.fuse`),
+  served only on the resident weight path (`MLX_SERVE_DSV41_WEIGHT_PATH`, `settle`); `ssd` keeps today's kernels.
 - `spec/markov.zig`: DSpark's Markov chain in B + 1 launches; `decode/engram_decode.zig` the Engram LRU,
   `decode/gemv_twin.zig` the batched GEMV twin of MLX's M=1 words.
 - `decode/moe_fp4.zig`: the MoE's two launches over fp4 routed experts (MXFP4; NVFP4 with ModelOpt's
@@ -37,6 +41,9 @@ serves either from the pack, with no flag.
   them off on NAX); with `wo_a` on its vector kernel a verify row is its plain step's bytes; `moe_up` /
   `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or 128 (the expert-pruned packs are 2-bit g128).
   Otherwise `routed` runs.
+- `mx_view.zig`: `MLX_SERVE_DSV41_MXFP4_VIEW` (off): an NVFP4 bank whose every 32-span is one power of two loads as
+  the MXFP4 bank of its values (the converter's `--experts-mxfp4` bytes), a layer at a time, billed so
+  (`residentBytes`); a bank with any other span stays NVFP4, named in the log.
 - GGUF expert banks (`--mlx-gguf`, ISTA's GSQ-RCO sets) decode up to `region_rows` through `ffnDecodeGguf`
   (`moe_gu_gguf` + `moe_dn_gguf`, built per ggml type by `gguf.pluginKernel`) and prefill on the matrix units
   (`gguf.gatherNaxSwiGLU`), a K-quant bank a 32-weight slice at a time (`deq_<type>_s`); Q3_K decodes `routed`.
@@ -154,8 +161,8 @@ serves either from the pack, with no flag.
   still returns a named unsupported verdict. SSD-only module retention is unsupported.
 - An NVFP4 bank's per-expert globals (`expertScales`: gate, up and down, `[E]` bf16, finite and positive, all three or
   none) apply where the SDK block applies them: the gate and up gather outputs (`gateUp`, `moePrefill`, the fused
-  kernel's flags), each rounded again; the down scale on the routing weight (`routeFrom`, `ffnInFused`). Streamed or
-  tensor-split experts with them are refused by name.
+  kernel's flags), each rounded again; the down scale on the routing weight (`routeFrom`, `blockTail`; under
+  `fuse.down_scale` the fused gate/up launch's `DSCALE`). Streamed or tensor-split experts with them are refused by name.
 - Serial decode near the memory wall: 720 GB/s of ~1.1 TB/s, so kernel work buys 15-25%, not 2x.
 - Without NAX (M4 and older) `attn`, `idx_score` and the `wo_a` / `ffn_in` fusion behind them stay off: decode runs the
   pre-NAX split kernel and the compiled regions. The affine `moe_up` / `moe_down` stay off too (they lose to the

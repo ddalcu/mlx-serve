@@ -109,7 +109,8 @@ template <typename T, int EPI, int ESC, typename DTile>
 METAL_FUNC void store_act(thread DTile& D, device T* y, const int ld,
                           const int rows, const device T* sigtab,
                           const device T* gsc, const device T* usc,
-                          const uint expert);
+                          const uint expert, const device float* rw,
+                          const float lim);
 
 template <
     typename T,
@@ -138,7 +139,9 @@ METAL_FUNC void gather_mapped_seg(
     const device T* sigtab,
     const int up_off = 0,
     const device T* gsc = nullptr,
-    const device T* usc = nullptr) {
+    const device T* usc = nullptr,
+    const device float* rw = nullptr,
+    const float lim = 0.0f) {
   using WT = typename Q::WT;
   constexpr bool kPair = EPI != 0;
   static_assert(!kPair || ALIGN_N, "paired gate/up tiles are full");
@@ -244,7 +247,7 @@ METAL_FUNC void gather_mapped_seg(
       if (sg_active) {
         store_act<T, EPI, ESC>(
             Dtile, y + tm * ldy + tn / 2, ldy, int(sgp_sm), sigtab, gsc, usc,
-            expert);
+            expert, rw + row_start + tm, lim);
       }
     } else if (kAlignedM.value && sgp_sn == kSN) {
       Dtile.store(y + tm * N + tn, N);
@@ -273,7 +276,9 @@ METAL_FUNC void gather_mapped_db(
     const device T* sigtab,
     const int up_off = 0,
     const device T* gsc = nullptr,
-    const device T* usc = nullptr) {
+    const device T* usc = nullptr,
+    const device float* rw = nullptr,
+    const float lim = 0.0f) {
   using WT = typename Q::WT;
   static_assert(G::kBK == 64, "db runs 64-deep K steps");
   constexpr bool kPair = EPI != 0;
@@ -388,7 +393,9 @@ METAL_FUNC void gather_mapped_db(
           sigtab,
           gsc,
           usc,
-          expert);
+          expert,
+          rw + row_start + m0,
+          lim);
     }
   } else {
     device T* yb = y + size_t(row_start + m0) * N + y_col + kSN * (sgid % kWN);
@@ -406,11 +413,13 @@ METAL_FUNC void gather_mapped_db(
 // the expert's own gate / up scale (ModelOpt's per-expert global scale, `gsc` / `usc`
 // [E] in T) multiplies the rounded product before the clamp and the SiLU, rounded again,
 // as the split path's multiply does (and the fp4 decode kernel's GSCALE / USCALE).
+// EPI -1: deepseek_v41's moe_act on those values instead: in f32, clamped under `lim` when it
+// is positive, times the row's routing weight `rw[r]`, rounded once.
 template <typename T, int EPI, int ESC, typename DTile>
 METAL_FUNC void store_act(
     thread DTile& D, device T* y, const int ld, const int rows,
     const device T* sigtab, const device T* gsc, const device T* usc,
-    const uint expert) {
+    const uint expert, const device float* rw, const float lim) {
   T gs = T(1);
   T us = T(1);
   if constexpr ((ESC & 1) != 0) {
@@ -439,14 +448,26 @@ METAL_FUNC void store_act(
           if constexpr ((ESC & 2) != 0) {
             u = T(u * us);
           }
-          if constexpr (EPI > 1) {
-            // MLX's Minimum / Clip: a NaN stays NaN (metal::min / max return the other operand).
-            g = g > T(EPI - 1) ? T(EPI - 1) : g;
-            u = u < T(1 - EPI) ? T(1 - EPI) : u;
-            u = u > T(EPI - 1) ? T(EPI - 1) : u;
+          if constexpr (EPI < 0) {
+            float gf = float(g), uf = float(u);
+            if (lim > 0.0f) { gf = metal::min(gf, lim); uf = metal::clamp(uf, -lim, lim); }
+            // g * sigmoid(g) * u * w from e^-|g|/2, which never overflows: g u w / (1 + e^-g) at g >= 0,
+            // ((g e^(g/2)) (u w)) e^(g/2) / (1 + e^g) below, each partial product at least the result's
+            // size, so every result a normal f32 holds stays normal (the GPU flushes subnormals to 0).
+            const float h = metal::precise::exp(-0.5f * metal::abs(gf));
+            const float q = h * h;
+            const float uw = uf * rw[r];
+            v[j] = T(gf < 0.0f ? (gf * h) * uw * h / (1.0f + q) : gf * uw / (1.0f + q));
+          } else {
+            if constexpr (EPI > 1) {
+              // MLX's Minimum / Clip: a NaN stays NaN (metal::min / max return the other operand).
+              g = g > T(EPI - 1) ? T(EPI - 1) : g;
+              u = u < T(1 - EPI) ? T(1 - EPI) : u;
+              u = u > T(EPI - 1) ? T(EPI - 1) : u;
+            }
+            const T a = T(g * sigtab[as_type<ushort>(g)]);
+            v[j] = T(a * u);
           }
-          const T a = T(g * sigtab[as_type<ushort>(g)]);
-          v[j] = T(a * u);
         }
         *(device vec<T, 4>*)(y + size_t(r) * ld + sc.x) = v;
       }

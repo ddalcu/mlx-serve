@@ -25,6 +25,7 @@ const gather_nax = @import("../../sdk/blocks/moe/gather_qmm_nax.zig");
 const log = @import("../../sdk/util/log.zig");
 const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwiGLU;
 const engram = @import("engram.zig");
+const mx_view = @import("mx_view.zig");
 const system = @import("../../sdk/util/system.zig");
 const crt = @import("../../sdk/util/crt.zig");
 const cache_codec = @import("cache_codec.zig");
@@ -82,6 +83,10 @@ const fa = @import("prompt/flash_attn.zig");
 const ced_lazy = @import("prompt/ced_lazy.zig");
 /// A prompt pass's last wide layer committed, not waited for (exact).
 const pass_async = @import("prompt/pass_async.zig");
+/// the moe_pair.zig: a prompt call's fp4 gate and up with `moe_act` in one paired NAX launch.
+const mpair = @import("prompt/moe_pair.zig");
+/// launch fusions, each behind its own default-off switch (`Dsv41Model.fuse`).
+const fusion = @import("fuse.zig");
 const Shard = @import("../../sdk/weights/shard.zig").Shard;
 
 const A = mlx.mlx_array;
@@ -315,6 +320,9 @@ pub const Lin = struct {
     s: A = none,
     b: A = none,
     qp: QuantParams = .{ .bits = 0, .group_size = 0 },
+    /// The weight in bf16, made once at load for the prompt's dense GEMMs (`fuse.pf_bf16_trunk`), which `dense` hands
+    /// out in place of a dequantize; the quantized weight stays for decode.
+    pf: A = none,
 
     /// A weight an outside quant plugin loaded (`w` unset): its table runs the matmul. A grouped one (`wo_a`, the
     /// pack's slices) multiplies `[rows, groups, in]`.
@@ -323,15 +331,26 @@ pub const Lin = struct {
         if (self.ext) |*e| return sc.keep(try e.matmul(x, sc.s));
         if (self.s.ctx == null) return sc.matmul(x, try sc.t2(self.w));
         // Not f32: MLX runs f32 GEMMs on the matrix units as TF32.
-        if (mlx.mlx_array_dtype(x) != .float32 and mlx.mlx_array_size(x) / @as(usize, @intCast(dim(x, -1))) >= DENSE_ROWS)
+        if (mlx.mlx_array_dtype(x) != .float32 and self.denseAt(mlx.mlx_array_size(x) / @as(usize, @intCast(dim(x, -1)))))
             return sc.matmul(x, try sc.t2(try self.dense(sc, mlx.mlx_array_dtype(x))));
         var o = mlx.mlx_array_new();
         return sc.res(mlx.mlx_quantized_matmul(&o, x, self.w, self.s, self.b, true, mlx.mlx_optional_int.some(@intCast(self.qp.group_size)), mlx.mlx_optional_int.some(@intCast(self.qp.bits)), self.qp.mode.cstr(), sc.s), &o);
     }
 
+    /// Whether a call over `n` rows dequantizes the weight for the dense GEMM (`DENSE_ROWS`); `fuse.mxfp8Qmm` keeps
+    /// an mxfp8 weight on MLX's quantized matmul.
+    pub fn denseAt(self: *const Lin, n: usize) bool {
+        return n >= DENSE_ROWS and !fusion.mxfp8Qmm(self.qp.mode);
+    }
+
     /// The weight dequantized to `dt` (lossless for the packs' fp8 and affine codes in bf16).
     pub fn dense(self: *const Lin, sc: *Scope, dt: mlx.mlx_dtype) !A {
         if (self.ext != null) return error.Dsv41OutsideDense;
+        if (self.pf.ctx != null and mlx.mlx_array_dtype(self.pf) == dt) {
+            var o = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&o, self.pf);
+            return sc.keep(o);
+        }
         var d = mlx.mlx_array_new();
         return sc.res(mlx.mlx_dequantize(&d, self.w, self.s, self.b, mlx.mlx_optional_int.some(@intCast(self.qp.group_size)), mlx.mlx_optional_int.some(@intCast(self.qp.bits)), self.qp.mode.cstr(), .{ .ctx = null }, .{ .value = dt, .has_value = true }, sc.s), &d);
     }
@@ -407,6 +426,8 @@ pub const EngramLayer = struct {
     wkv: Lin,
     qk: A, // f32 [hc, dim]: q_weight * k_weight
     table: engram.Table,
+    /// The held table's codes and scales as GPU buffers (`fuse.wrapHeld`), which the fused wkv gathers from.
+    gpu: ?[2]A = null,
 };
 
 pub const DsparkW = struct {
@@ -512,6 +533,8 @@ pub const Dsv41Model = struct {
     regions: []LayerRegions = &.{},
     /// Arrays made at load (casts, reshapes, stacks); freed in `deinit`.
     owned: std.ArrayList(A) = .empty,
+    /// The NVFP4 banks the load served as MXFP4 (`mxView`).
+    view: mx_view.Tally = .{},
     /// The outside quant plugin that reads the pack's weights (`InitOpts.quant`), while `init` runs.
     quant: ?*const outside.Format = null,
     /// Every weight it loaded, released in `deinit`.
@@ -536,6 +559,8 @@ pub const Dsv41Model = struct {
     ds_draft_ns: u64 = 0,
     /// `MLX_SERVE_DSV41_EXACT` (`Exact`), read at load.
     exact: Exact = .{},
+    /// The launch fusions switched on (`fuse.zig`), read at load.
+    fuse: fusion.Fuse = .{},
     /// Exact verify blocks that fell to the batched kernels (`exactMiss`).
     exact_misses: u64 = 0,
     /// A pair worker exact serves anyway: the gate's single-process worker (`decode/exact_test.zig`), whose host is
@@ -556,7 +581,10 @@ pub const Dsv41Model = struct {
         if (self.dec_state) |*st| st.deinit();
         self.dropAhead();
         self.gpa.free(self.prompt);
-        for (self.engrams) |*e| e.table.close();
+        for (self.engrams) |*e| {
+            fusion.unwrap(e);
+            e.table.close();
+        }
         if (self.embed_tab) |*t| t.close();
         self.gpa.free(self.engrams);
         self.gpa.free(self.token_map);
@@ -606,7 +634,7 @@ pub const Dsv41Model = struct {
         return self.head.w.ctx != null or self.head.ext != null;
     }
 
-    fn own(self: *Dsv41Model, x: A) !A {
+    pub fn own(self: *Dsv41Model, x: A) !A {
         self.owned.append(self.gpa, x) catch |e| {
             _ = mlx.mlx_array_free(x);
             return e;
@@ -626,7 +654,7 @@ pub const Dsv41Model = struct {
         return if (t < self.token_map.len) self.token_map[t] else 0;
     }
 
-    fn held(self: *const Dsv41Model, li: usize) bool {
+    pub fn held(self: *const Dsv41Model, li: usize) bool {
         const p = self.pair orelse return true;
         return p.holds(li);
     }
@@ -1204,7 +1232,44 @@ fn oneExpert(m: *Dsv41Model, b: Bank) !Bank {
 fn loadExperts(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usize, n_experts: usize, inter: usize) !Experts {
     var e = try loadBanks(m, w, pfx, li, n_experts, inter);
     e.scale = try expertScales(m, w, pfx, li, &e);
+    if (e.scale[0] != null and mx_view.on()) try mxView(m, w, pfx, li, &e);
     return e;
+}
+
+/// `MLX_SERVE_DSV41_MXFP4_VIEW`: the NVFP4 bank served as the MXFP4 bank of its values (`mx_view.scales`), its e4m3
+/// scales and globals let go a layer at a time, so the two scale sets never sit whole side by side; else NVFP4, named.
+fn mxView(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usize, e: *Experts) !void {
+    const t0 = crt.monotonicMs();
+    const banks = [3]*Bank{ &e.gate, &e.up, &e.down };
+    var mx: [3]A = .{ none, none, none };
+    defer for (mx) |x| if (x.ctx != null) {
+        _ = mlx.mlx_array_free(x);
+    };
+    for (banks, e.scale, &mx, 0..) |b, g, *x, i| switch (try mx_view.scales(m.gpa, m.s, b.s, g.?)) {
+        .mx => |a| x.* = a,
+        .nv => |why| {
+            var buf: NameBuf = undefined;
+            m.view.refused += 1;
+            return mx_view.refused(std.fmt.bufPrint(&buf, pfx ++ ".{d}.ffn.experts", .{li}) catch pfx, i, why);
+        },
+    };
+    for (banks, &mx) |b, *x| {
+        m.view.nv_bytes += mlx.mlx_array_size(b.s);
+        m.view.mx_bytes += mlx.mlx_array_size(x.*);
+        release(m, w, b.s);
+        const a = x.*;
+        x.* = none;
+        b.s = try m.own(a);
+        b.qp = .{ .bits = 4, .group_size = 32, .mode = .mxfp4 };
+    }
+    for (e.scale) |g| m.view.nv_bytes += mlx.mlx_array_size(g.?) * mlx.mlx_array_itemsize(g.?);
+    inline for (scale_names) |nm| {
+        var buf: NameBuf = undefined;
+        w.remove(std.fmt.bufPrint(&buf, pfx ++ nm, .{li}) catch return error.NameTooLong);
+    }
+    e.scale = .{ null, null, null };
+    m.view.viewed += 1;
+    m.view.ms += crt.monotonicMs() - t0;
 }
 
 const scale_names = [3][]const u8{ ".{d}.ffn.experts.gate_proj.expert_scale", ".{d}.ffn.experts.up_proj.expert_scale", ".{d}.ffn.experts.expert_scale" };
@@ -1640,6 +1705,17 @@ pub const HC_MIX_SOURCE = kernelSource("plugins/deepseek_v41/kernels/hc_mix.meta
 /// `HC_MIX_SOURCE`'s tile: rows a threadgroup, and the mixes a threadgroup
 /// (the largest of these that divides the mix count).
 const hc_mix_rows = 4;
+/// `MLX_SERVE_DSV41_HC_MIX8`: a wide mix threadgroup takes 8 rows on a NAX GPU, so a row group reads the mix weights
+/// once for twice the rows; each mix's sums are the same threads' in the same order at any row count.
+fn hcMixRows() usize {
+    if (!(device.naxAvailable() and env.on(.MLX_SERVE_DSV41_HC_MIX8))) return hc_mix_rows;
+    if (!hc_mix8_logged.swap(true, .monotonic)) log.info("[dsv41] HC_MIX8 engaged (8 rows a threadgroup)\n", .{});
+    return 8;
+}
+// The pfkern switches' one-time engagement lines (first use a process; no per-call output).
+var hc_mix8_logged: std.atomic.Value(bool) = .init(false);
+var hc_expand_norm_logged: std.atomic.Value(bool) = .init(false);
+var woa_join_logged: std.atomic.Value(bool) = .init(false);
 const hc_mix_cols = [_]usize{ 6, 4, 3, 2, 1 };
 
 /// One hyper-connection stage as two kernels. The staggered collapse reads the PREVIOUS mix (`cpre`), so in
@@ -1958,7 +2034,10 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     errdefer {
         freeRegions(m);
         m.freeQuant();
-        for (m.engrams) |*e| e.table.close();
+        for (m.engrams) |*e| {
+            fusion.unwrap(e);
+            e.table.close();
+        }
         gpa.free(m.engrams);
         gpa.free(m.token_map);
         for (m.owned.items) |x| _ = mlx.mlx_array_free(x);
@@ -2068,6 +2147,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     }
     try evalWeights(m);
     try holdEngram(m);
+    try fusion.settle(m);
     // the gemv twin's launches for the indexer's linears compiled now, not in a request's first verify.
     if (mlx.streamIsGpu(s)) try warmTwin(m);
     // the gemv twin's launches for each Engram layer's plain wkv compiled now, not in a request's first
@@ -2083,6 +2163,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         const b = ex.gu orelse ex.gate;
         if (b.w.ctx != null) log.info("deepseek_v41: routed experts {t} bits={d} group={d}, per-expert scales gate={} up={} down={}\n", .{ b.qp.mode, b.qp.bits, b.qp.group_size, ex.scale[0] != null, ex.scale[1] != null, ex.scale[2] != null });
     }
+    m.view.report();
     return m;
 }
 
@@ -2661,10 +2742,11 @@ pub fn hcMixWide(sc: *Scope, m: *const Dsv41Model, x: A, hc: *const Hc, eps: A) 
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
         defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(mix) }, 2, .float32));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(mix / cols * tg), ci((L + hc_mix_rows - 1) / hc_mix_rows), 1));
+        const rows = hcMixRows();
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(mix / cols * tg), ci((L + rows - 1) / rows), 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TG", ci(tg)));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "R", ci(hc_mix_rows)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "R", ci(rows)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "M", ci(cols)));
         const iv = mlx.mlx_vector_array_new_data(&[_]A{ x, hc.fn_w, hc.scale, hc.base, eps }, 5);
         defer _ = mlx.mlx_vector_array_free(iv);
@@ -2800,6 +2882,7 @@ pub fn hcStage(sc: *Scope, m: *const Dsv41Model, x: A, ex: ?Expand, cpre: A, hc:
 /// block pays for that rebuild in every mix, so it expands once.
 pub fn hcExpandPreNorm(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const Split, cpre: A, hc: *const Hc, norm_w: A) !Staged {
     const s: Staged = if (dim(x, 0) <= region_rows) try hcStage(sc, m, x, .{ .y = y, .sp = sp }, cpre, hc, norm_w) else blk: {
+        if (try hcExpandNormFresh(sc, m, x, y, sp, cpre, hc, norm_w)) |f| break :blk f;
         const x1 = try hcExpand(sc, x, y, sp);
         const r = try hcPreNormWide(sc, m, x1, cpre, hc, norm_w);
         break :blk .{ .x1 = x1, .sp = r.sp, .h = r.h };
@@ -2963,10 +3046,11 @@ pub fn hcMixNormFused(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *cons
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(mix) }, 2, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(D) }, 2, dt));
     if (w2 != null) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(D) }, 2, dt)) else try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{1}, 1, dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci((mix / cols + 1) * tg), ci((L + hc_mix_rows - 1) / hc_mix_rows), 1));
+    const rows = hcMixRows();
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci((mix / cols + 1) * tg), ci((L + rows - 1) / rows), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TG", ci(tg)));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "R", ci(hc_mix_rows)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "R", ci(rows)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "M", ci(cols)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HC", ci(nh)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H2", @intFromBool(w2 != null)));
@@ -3047,6 +3131,17 @@ fn hcExpandNormScratch(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const 
     const z = try hcMixWide(sc, m, x1, hc, eps);
     // The layer's tail may write in place over the region (`moeExpand`'s `into`), as the stock path's.
     return .{ .x1 = x1, .sp = try hcSplitWide(sc, m, z, eps), .h = f.h, .in_region = true };
+}
+
+/// hc_fuse.zig: `hcExpandPreNorm`'s expand and norm as one launch into a fresh stream, then the mixes over it and the
+/// split from them, the stock launches' words (`MLX_SERVE_DSV41_HC_EXPAND_NORM`); null where that is off or the fused
+/// kernels were refused at load.
+pub fn hcExpandNormFresh(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const Split, cpre: A, hc: *const Hc, norm_w: A) !?Staged {
+    if (hcf_k == null or !env.onUnlessZero(.MLX_SERVE_DSV41_HC_EXPAND_NORM)) return null;
+    if (!hc_expand_norm_logged.swap(true, .monotonic)) log.info("[dsv41] HC_EXPAND_NORM engaged (rows {d})\n", .{dim(x, 0)});
+    const eps = try hcEps(sc, m);
+    const f = try hcExpandNormLaunch(sc, m, x, y, sp, cpre, norm_w, eps, null, none);
+    return .{ .x1 = f.x1, .sp = try hcSplitWide(sc, m, try hcMixWide(sc, m, f.x1, hc, eps), eps), .h = f.h };
 }
 
 /// Collapse the hc copies `[L, hc, D]` with `pre` `[L, hc]`, in f32.
@@ -3726,17 +3821,23 @@ pub fn attnOutRoped(sc: *Scope, m: *Dsv41Model, ly: *const Layer, r: A) !A {
 
 /// The grouped `wo_a` of heads already grouped and inverse-roped `[og, L, in]`: `[L, og * o_lora]` in `m.act`.
 pub fn attnOutA(sc: *Scope, m: *Dsv41Model, ly: *const Layer, ob: A, dense_wo_a: ?A) !A {
+    return sc.reshape(try attnOutAGroups(sc, m, ly, ob, dense_wo_a), &.{ ci(dim(ob, 1)), -1 });
+}
+
+/// `attnOutA` with each row's groups apart, `[L, og, o_lora]`: a view of the matmul's `[og, L, o_lora]`, so a wide
+/// layer's join of its spans copies it once (`MLX_SERVE_DSV41_WOA_JOIN`).
+pub fn attnOutAGroups(sc: *Scope, m: *Dsv41Model, ly: *const Layer, ob: A, dense_wo_a: ?A) !A {
     const L = dim(ob, 1);
     // An outside plugin's groups: its grouped linear reads `[L, og, in]`.
-    if (ly.wo_a.ext) |*e| return sc.astype(try sc.reshape(try sc.keep(try e.matmul(try sc.transpose(ob, &.{ 1, 0, 2 }), sc.s)), &.{ ci(L), -1 }), m.act);
-    const wd = dense_wo_a orelse if (ly.wo_a.s.ctx == null) ly.wo_a.w else if (L >= DENSE_ROWS) try ly.wo_a.dense(sc, mlx.mlx_array_dtype(ob)) else none;
+    if (ly.wo_a.ext) |*e| return sc.astype(try sc.keep(try e.matmul(try sc.transpose(ob, &.{ 1, 0, 2 }), sc.s)), m.act);
+    const wd = dense_wo_a orelse if (ly.wo_a.s.ctx == null) ly.wo_a.w else if (ly.wo_a.denseAt(L)) try ly.wo_a.dense(sc, mlx.mlx_array_dtype(ob)) else none;
     const oa = if (wd.ctx != null)
         try sc.matmul(ob, try sc.transpose(wd, &.{ 0, 2, 1 }))
     else blk: {
         var ro = mlx.mlx_array_new();
         break :blk try sc.res(mlx.mlx_quantized_matmul(&ro, ob, ly.wo_a.w, ly.wo_a.s, ly.wo_a.b, true, mlx.mlx_optional_int.some(@intCast(ly.wo_a.qp.group_size)), mlx.mlx_optional_int.some(@intCast(ly.wo_a.qp.bits)), ly.wo_a.qp.mode.cstr(), sc.s), &ro);
     };
-    return sc.astype(try sc.reshape(try sc.transpose(oa, &.{ 1, 0, 2 }), &.{ ci(L), -1 }), m.act);
+    return sc.astype(try sc.transpose(oa, &.{ 1, 0, 2 }), m.act);
 }
 
 /// `x` [L, K] f32 through the dense linear `l` in f32: decode rows read `l`
@@ -4045,7 +4146,7 @@ pub fn ffnDecode(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: 
 
 /// The fused fp4 MoE decode kernels where they serve: everywhere, unless `MLX_SERVE_DSV41_MOE_FP4_NAX=0` on a NAX GPU
 /// (read each call; there `routed`'s gathers run).
-fn fp4Decode(m: *const Dsv41Model) ?dkern.moe_fp4.Kernels {
+pub fn fp4Decode(m: *const Dsv41Model) ?dkern.moe_fp4.Kernels {
     const k = m.dec.moe_fp4 orelse return null;
     if (device.naxAvailable() and !fp4NaxOn(env.get(.MLX_SERVE_DSV41_MOE_FP4_NAX))) return null;
     return k;
@@ -4504,7 +4605,7 @@ pub fn flatKernel(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, ins: []const A, s
 /// The routed experts over `L` rows at once plus the shared expert `sh`, as `[L, d]` in `x`'s dtype:
 /// the n = L k pairs sorted by expert so each bank streams once, gate+up and down as sorted gathers
 /// (`sortedBank`), the SwiGLU x weight and the unsort + k-sum + shared add one kernel each.
-fn moePrefill(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, wts: A, sh: A) !A {
+pub fn moePrefill(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, wts: A, sh: A) !A {
     const L = dim(x, 0);
     const k = dim(idx, 1);
     const d = dim(x, 1);
@@ -4520,7 +4621,7 @@ fn moePrefill(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, 
     const sidx = try sc.take(flat, order, 0);
     const x3 = try sc.reshape(x, &.{ ci(L), 1, ci(d) });
     const w_sorted = try sc.take(try sc.reshape(wts, &.{ci(n)}), order, 0);
-    const act = if (try gateUpPaired(sc, m, e, x3, rows, sidx)) |a| blk: {
+    const act = if (try mpair.act(sc, m, e, x3, rows, sidx, w_sorted)) |a| a else if (try gateUpPaired(sc, m, e, x3, rows, sidx)) |a| blk: {
         // The routing weight on the activation, as the split path's kernel applies it.
         const inter = dim(a, -1);
         if (m.moe_wt_kernel) |kw| break :blk try flatKernel(sc, kw, &.{ a, w_sorted }, &.{ ci(n), 1, ci(inter) }, dt, n * inter, &.{.{ .name = "N", .v = ci(inter) }});
@@ -4595,8 +4696,14 @@ pub fn routeFrom(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, logits: A, 
     var idx = mlx.mlx_array_new();
     var wts = mlx.mlx_array_new();
     const r: Routes = .{ .idx = try sc.res(mlx.mlx_vector_array_get(&idx, ov, 0), &idx), .wts = try sc.res(mlx.mlx_vector_array_get(&wts, ov, 1), &wts) };
+    if (route_tap) |t| try t.ids.append(t.gpa, sc.out(r.idx));
     return .{ .idx = r.idx, .wts = try routeScaled(sc, ly, r.idx, r.wts) };
 }
+
+/// A test's record of every route's expert ids `[L, k]` in call order (caller frees), so `prompt/wide_test.zig` can
+/// count the rows whose top-k a reordered sum flipped.
+pub const RouteTap = struct { gpa: std.mem.Allocator, ids: std.ArrayList(A) = .empty };
+pub var route_tap: ?*RouteTap = null;
 
 /// The routed sum `y` (f32) plus the shared expert.
 pub fn withShared(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, y: A) !A {
@@ -4989,7 +5096,10 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     // `ffn_in` routes off wo_b's output, which a tensor split sums first.
     if (m.tp == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &sa)) |f| {
         pre.* = f.sf.pre;
-        return try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
+        // `fuse.down_scale`: the fused fp4 launches put the down scale on the routes themselves.
+        if (m.fuse.down_scale) if (try fusion.ffnDownScaled(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf)) |y| return y;
+        const wts = try routeScaled(sc, ly, f.idx, f.wts);
+        return try ffnDecode(sc, m, ly, f.h2, f.idx, wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, wts)), &f.sf);
     };
     var ao: [1]A = undefined;
     if (oa) |v| ao[0] = try ly.wo_b.apply(sc, v) else try runRegion(sc, m, li, .attn_out, &.{try attnDecode(sc, m, ly, q, ls.win, comp_rows, topk, p0, scale, inv)}, &ao);
@@ -5148,7 +5258,8 @@ fn moeFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: A, wt
     return try sc.reshape(y, &.{ ci(R), ci(dim(h, 1)) });
 }
 
-/// wo_b through the routes on the fused `ffn_in` launches: the new stream, the FFN's normed input, split and routes.
+/// wo_b through the routes on the fused `ffn_in` launches: the new stream, the FFN's normed input, split and routes, the
+/// routes' weights without the down scale (`routeScaled`).
 fn ffnInFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, oa: A, x: A, sa: *const Split) !?dkern.ffn_in.Out {
     const k = m.dec.ffn_in orelse return null;
     const wo = &ly.wo_b;
@@ -5156,9 +5267,7 @@ fn ffnInFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, oa: A, x: A, s
     const c = &m.cfg;
     const dims: dkern.ffn_in.Dims = .{ .rows = dim(x, 0), .d = c.hidden_size, .k = dim(oa, 1), .e = dim(ly.gate_w, 0), .top_k = ly.top_k, .iters = c.dsv4_hc_sinkhorn_iters, .norm = c.moe_route_norm and ly.top_k > 1 };
     const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{c.router_scaling_factor}, &[_]c_int{1}, 1, .float32));
-    var out = (try dkern.ffn_in.launch(sc, k, dims, dkern.ffn_in.weightsOf(ly), oa, x, sa, try hcEps(sc, m), scal)) orelse return null;
-    out.wts = try routeScaled(sc, ly, out.idx, out.wts);
-    return out;
+    return dkern.ffn_in.launch(sc, k, dims, dkern.ffn_in.weightsOf(ly), oa, x, sa, try hcEps(sc, m), scal);
 }
 
 /// A block up to its FFN: the stream after attention, the FFN's mix and the
@@ -5970,6 +6079,9 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     // woa_rows.zig: an EXL3 `wo_a` over runs of `woa.spansPer` spans' grouped heads, one grouped linear a run
     // (`woaRun`); a run of one span is the span-by-span path.
     const run: usize = if (ly.wo_a.ext != null) @min(n_spans, woa.spansPer(sp.span)) else 1;
+    // The span-by-span `wo_a` hands its rows' groups as views, joined once below (`attnOutAGroups`).
+    const woa_join = run == 1 and m.tp == null and env.on(.MLX_SERVE_DSV41_WOA_JOIN);
+    if (woa_join and !woa_join_logged.swap(true, .monotonic)) log.info("[dsv41] WOA_JOIN engaged (layer {d}, spans {d})\n", .{ li, n_spans });
     const run_heads = try gpa.alloc(A, run);
     defer gpa.free(run_heads);
     var in_run: usize = 0;
@@ -6037,8 +6149,9 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
                 run_scope = null;
             }
         } else {
-            if (woa_dense.ctx == null and ly.wo_a.s.ctx != null and sp.L >= DENSE_ROWS) woa_dense = try ly.wo_a.dense(&sc, m.act);
-            const oa = try attnOutA(&ssc, m, ly, o_k, if (woa_dense.ctx != null) woa_dense else null);
+            if (woa_dense.ctx == null and ly.wo_a.s.ctx != null and ly.wo_a.denseAt(sp.L)) woa_dense = try ly.wo_a.dense(&sc, m.act);
+            const wd: ?A = if (woa_dense.ctx != null) woa_dense else null;
+            const oa = if (woa_join) try attnOutAGroups(&ssc, m, ly, o_k, wd) else try attnOutA(&ssc, m, ly, o_k, wd);
             // A tensor split sums each span's wo_b on the CPU stream while the GPU runs the next span's attention.
             heads[n_heads] = try sc.keep(ssc.out(if (m.tp != null) try tpSum(&ssc, m, try ly.wo_b.apply(&ssc, oa)) else oa));
             n_heads += 1;
@@ -6056,7 +6169,8 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
             ig_start = k + 1;
         }
     }
-    const y = if (m.tp != null) try sc.concat(heads[0..n_heads], 0) else try ly.wo_b.apply(&sc, try sc.concat(heads[0..n_heads], 0));
+    const joined = try sc.concat(heads[0..n_heads], 0);
+    const y = if (m.tp != null) joined else try ly.wo_b.apply(&sc, if (woa_join) try sc.reshape(joined, &.{ ci(sp.L), -1 }) else joined);
     // scratch_x1.zig: the streams after the attention into the prompt's x1 region (a streamed bank runs one MoE
     // group, so that group's output is the region's last reader's).
     const x1_scratch = m.streamed != null and sp.L >= scratch_rows and mlx.streamIsGpu(m.s);
@@ -6239,19 +6353,24 @@ pub fn spanInAt(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const S
     for (m.engrams, 0..) |*e, ek| {
         if (e.layer != li) continue;
         const nc = sp.ncols;
-        const rows = if (sp.prefetch) |pf| blk: {
+        // `fuse.engram`: a decode-width span's write gathered from the resident table (`fusion.engramHeld`), else
+        // from the rows read out of it (`fusion.engramWrite`).
+        var fused: ?A = try fusion.engramHeld(sc, m, e, sp.eng_ids, m.engrams.len, ek, nc, lo, hi, x);
+        const held_rows = if (fused == null) try fusion.engramRowsHeld(sc, m, e, sp.eng_ids, m.engrams.len, ek, nc, lo, hi) else null;
+        const rows = if (fused != null) none else if (held_rows) |r| r else if (sp.prefetch) |pf| blk: {
             // A batch reads grid k, state k's rows, as one span.
             const raw = if (sp.offs.len > 0) try pf.take(k, ek, 0) else try pf.take(sp.p0, ek, k);
             defer raw.deinit(gpa);
-            break :blk try sc.keep(try e.table.dequant(raw, (hi - lo) * nc, sc.s));
+            fused = try fusion.engramWrite(sc, m, e, raw, x);
+            if (fused != null) break :blk none;
+            break :blk try sc.keep(try e.table.dequantTo(raw, (hi - lo) * nc, fusion.engramRowsDtype(m, &e.table), sc.s));
         } else blk: {
             const mine = try gpa.alloc(u32, (hi - lo) * nc);
             defer gpa.free(mine);
             for (lo..hi) |t| @memcpy(mine[(t - lo) * nc ..][0..nc], sp.eng_ids[(t * m.engrams.len + ek) * nc ..][0..nc]);
             break :blk try sc.keep(try e.table.gather(gpa, mine, sc.s));
         };
-        const er = try sc.reshape(rows, &.{ ci(hi - lo), -1 });
-        const y = try engramWrite(sc, m, e, x, er, verify);
+        const y = fused orelse try engramWrite(sc, m, e, x, try sc.reshape(rows, &.{ ci(hi - lo), -1 }), verify);
         // An image span's rows get no Engram write (the reference shuts their gate).
         x = if (sp.img.ctx != null) try sc.where(try sc.expand(try sc.expand(try sp.imgSlice(sc, lo, hi), -1), -1), x, y) else y;
         if (m.trace) |t| try t.put("engram_{d}", .{li}, x);
