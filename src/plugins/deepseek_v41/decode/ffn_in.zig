@@ -219,8 +219,8 @@ pub const Weights = struct {
     gate_bias: A,
 };
 
-pub const Out = struct { x1: A, h2: A, sf: dsv41.Split, idx: A, wts: A, fused: bool = false };
-pub const AOut = struct { x1: A, hv: A, ctr: A, parts: A, logits: A };
+pub const Out = struct { x1: A, h2: A, sf: dsv41.Split, idx: A, wts: A, fused: bool = false, nax: bool = false };
+pub const AOut = struct { x1: A, hv: A, ctr: A, parts: A, logits: A, nax: bool = false };
 pub const BOut = struct { h2: A, sf: dsv41.Split, idx: A, wts: A };
 
 const OutSpec = struct { shape: []const c_int, dt: mlx.mlx_dtype };
@@ -278,7 +278,7 @@ pub fn launchNax(sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, p: Dims, w: 
         .{ .shape = &.{ci(partsLen(p))}, .dt = .float32 },
         .{ .shape = &.{ ci(p.rows), ci(p.e) }, .dt = .float32 },
     }, p.d / 32 * nax_nsg * 32, nax_nsg * 32, &t);
-    return .{ .x1 = a[0], .hv = a[1], .ctr = a[2], .parts = a[3], .logits = a[4] };
+    return .{ .x1 = a[0], .hv = a[1], .ctr = a[2], .parts = a[3], .logits = a[4], .nax = true };
 }
 
 /// Launch 2: the FFN's 24 hc mixes and their split, the rms-normed collapse `h2`, the router's scores and each row's top K.
@@ -321,7 +321,7 @@ pub fn launch(sc: *dsv41.Scope, ks: Kernels, p: Dims, w: Weights, oa: A, x: A, s
     if (fusedOn() and servesFused(p)) return try launchFused(sc, ks.fused, ks.facc, p, w, oa, x, sa, eps, scal);
     const a = try launchA(sc, ks, p, w, oa, x, sa);
     const b = try launchB(sc, ks, p, w, a, eps, scal);
-    return .{ .x1 = a.x1, .h2 = b.h2, .sf = b.sf, .idx = b.idx, .wts = b.wts };
+    return .{ .x1 = a.x1, .h2 = b.h2, .sf = b.sf, .idx = b.idx, .wts = b.wts, .nax = a.nax };
 }
 
 // ── the kernel contract ──

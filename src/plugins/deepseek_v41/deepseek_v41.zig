@@ -673,6 +673,9 @@ pub const Dec = struct {
     wq_b: ?mlx.mlx_fast_metal_kernel = null,
     /// `wq_b` that also writes the window ring (`MLX_SERVE_DSV41_FUSE_WQB_RING`).
     wq_b_ring: ?mlx.mlx_fast_metal_kernel = null,
+    /// `wq_b` and `wq_b_ring` on the matrix units (`MLX_SERVE_DSV41_GEMV_R26_WQB`), NAX only.
+    wq_b_nax: ?mlx.mlx_fast_metal_kernel = null,
+    wq_b_ring_nax: ?mlx.mlx_fast_metal_kernel = null,
     attn: ?mlx.mlx_fast_metal_kernel = null,
     /// `attn` that merges its splits (`MLX_SERVE_DSV41_FUSE_ATTN_MERGE`), its arrival counter and wo_a's sink then.
     attn_merge: ?mlx.mlx_fast_metal_kernel = null,
@@ -693,7 +696,7 @@ pub const Dec = struct {
     fn init(gpa: std.mem.Allocator, cfg: *const Config) !Dec {
         const nax = device.naxAvailable();
         // Without NAX the affine moe_up / moe_down lose to today's MoE kernels at every row count.
-        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .wq_b_ring = try dkern.wq_b.buildRing(), .attn = if (nax) try dkern.attn.build() else null, .attn_merge = if (nax) try dkern.attn.buildMerge() else null, .attn_counter = dkern.attn.newCounter(), .attn_nosink = dkern.attn.noSink(cfg.num_attention_heads), .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
+        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .wq_b_ring = try dkern.wq_b.buildRing(), .wq_b_nax = if (nax) try dkern.wq_b.buildNax(false) else null, .wq_b_ring_nax = if (nax) try dkern.wq_b.buildNax(true) else null, .attn = if (nax) try dkern.attn.build() else null, .attn_merge = if (nax) try dkern.attn.buildMerge() else null, .attn_counter = dkern.attn.newCounter(), .attn_nosink = dkern.attn.noSink(cfg.num_attention_heads), .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
         errdefer d.deinit();
         try dkern.topk.probe(gpa, &d.topk.?, mlx.gpuStream());
         if (d.moe_down) |kd| d.moe_down_rb = dkern.moe_down.probe(gpa, kd, cfg.moe_intermediate_size, cfg.hidden_size) catch |e| blk: {
@@ -712,7 +715,7 @@ pub const Dec = struct {
         if (d.moe_up) |k| k.deinit();
         if (d.moe_fp4) |k| k.deinit();
         if (d.ffn_in) |k| dkern.ffn_in.free(k);
-        inline for (.{ d.wq_b, d.wq_b_ring, d.attn, d.attn_merge, d.wo_a, d.moe_down }) |k| if (k) |kern| {
+        inline for (.{ d.wq_b, d.wq_b_ring, d.wq_b_nax, d.wq_b_ring_nax, d.attn, d.attn_merge, d.wo_a, d.moe_down }) |k| if (k) |kern| {
             _ = mlx.mlx_fast_metal_kernel_free(kern);
         };
         inline for (.{ d.attn_counter, d.attn_nosink }) |a| if (a.ctx != null) {
@@ -5048,9 +5051,14 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     const L = dim(x, 0);
     const a = try dkern.in_proj.run(sc, kp, m, ly, x, pre.*) orelse return null;
     const pos = try dkern.wq_b.rowsAt(sc, p0, L);
+    // `MLX_SERVE_DSV41_GEMV_R26_WQB=1`: a verify block's wq_b on the matrix units.
+    const nax = m.dec.wq_b_nax != null and dkern.wq_b.naxOn(L);
+    if (nax) engaged(m, 3, "MLX_SERVE_DSV41_GEMV_R26_WQB");
+    const kqn = if (nax) m.dec.wq_b_nax.? else kq;
     // `MLX_SERVE_DSV41_FUSE_WQB_RING=1`: wq_b returns the window ring with these rows written (no slice_update launch).
-    const wr = if (m.dec.wq_b_ring != null and dkern.wq_b.ringOn()) try dkern.wq_b.runRing(sc, m, kq, ly, li, a.qa, a.kv, a.z, pos, .{ .kern = m.dec.wq_b_ring.?, .buf = ls.win.buf }) else null;
-    const w = wr orelse try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, pos) orelse return null;
+    const kr = if (nax) m.dec.wq_b_ring_nax else m.dec.wq_b_ring;
+    const wr = if (kr != null and dkern.wq_b.ringOn()) try dkern.wq_b.runRing(sc, m, kqn, ly, li, a.qa, a.kv, a.z, pos, .{ .kern = kr.?, .buf = ls.win.buf }) else null;
+    const w = wr orelse try dkern.wq_b.run(sc, m, kqn, ly, li, a.qa, a.kv, a.z, pos) orelse return null;
     if (w.ring.ctx != null) {
         engaged(m, 0, "MLX_SERVE_DSV41_FUSE_WQB_RING");
         _ = mlx.mlx_array_free(ls.win.buf);
@@ -5089,6 +5097,7 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     // `ffn_in` routes off wo_b's output, which a tensor split sums first.
     if (m.tp == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &sa)) |f| {
         if (f.fused) engaged(m, 2, "MLX_SERVE_DSV41_FUSE_FFN_IN");
+        if (f.nax) engaged(m, 4, "MLX_SERVE_DSV41_GEMV_R26_FFN_IN");
         pre.* = f.sf.pre;
         return try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
     };
