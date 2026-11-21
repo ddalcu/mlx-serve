@@ -4,6 +4,7 @@
 //! serves the packs that keep the release's experts as shipped.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const dsv41 = @import("../deepseek_v41.zig");
@@ -16,7 +17,10 @@ const A = mlx.mlx_array;
 
 pub const UP_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_up.metal");
 pub const DOWN_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_down.metal");
+/// The down launch over all of a verify's rows in one threadgroup (`MLX_SERVE_DSV41_MOE_FP4_ROWS`).
+pub const DOWN_ROWS_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_down_rows.metal");
 pub const HEADER = fp4.SCALE_HEADER ++ moe_up.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_header.metal");
+pub const ROWS_HEADER = HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_rows_header.metal");
 pub const UP_INS = [_][*:0]const u8{ "x", "w", "scales", "sw", "sscales", "inds", "wts", "lim", "gsc", "usc", "dsc" };
 pub const DOWN_INS = [_][*:0]const u8{ "x", "w", "scales", "sw", "sscales", "inds", "res", "post", "comb" };
 
@@ -27,11 +31,13 @@ const up_threads = 64;
 pub const Kernels = struct {
     up: mlx.mlx_fast_metal_kernel,
     down: mlx.mlx_fast_metal_kernel,
+    down_rows: mlx.mlx_fast_metal_kernel,
     lim: A,
 
     pub fn deinit(self: Kernels) void {
         _ = mlx.mlx_fast_metal_kernel_free(self.up);
         _ = mlx.mlx_fast_metal_kernel_free(self.down);
+        _ = mlx.mlx_fast_metal_kernel_free(self.down_rows);
         _ = mlx.mlx_array_free(self.lim);
     }
 };
@@ -40,7 +46,9 @@ pub fn build(limit: f32) !Kernels {
     const up = try dsv41.buildKernel("dsv41_dec_moe_fp4_up", &UP_INS, &.{"out"}, UP_SOURCE, HEADER);
     errdefer _ = mlx.mlx_fast_metal_kernel_free(up);
     const down = try dsv41.buildKernel("dsv41_dec_moe_fp4_down", &DOWN_INS, &.{"out"}, DOWN_SOURCE, HEADER);
-    return .{ .up = up, .down = down, .lim = mlx.mlx_array_new_data(&[_]f32{limit}, &[_]c_int{1}, 1, .float32) };
+    errdefer _ = mlx.mlx_fast_metal_kernel_free(down);
+    const down_rows = try dsv41.buildKernel("dsv41_dec_moe_fp4_down_rows", &DOWN_INS, &.{"out"}, DOWN_ROWS_SOURCE, ROWS_HEADER);
+    return .{ .up = up, .down = down, .down_rows = down_rows, .lim = mlx.mlx_array_new_data(&[_]f32{limit}, &[_]c_int{1}, 1, .float32) };
 }
 
 /// ModelOpt's per-expert scales of an NVFP4 bank (`modelopt_pack.buildBanks`), each `[E]` in the stream's dtype: the
@@ -143,6 +151,17 @@ pub fn downCols(k: usize, n: usize, hc: usize) ?usize {
 /// stream not bf16, K not a multiple of 32, more rows than a decode step, more than 16 picks or 32 streams, or no
 /// column split (`downCols`).
 pub fn moeDown(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A, idx: A, x1: A, sp: *const dsv41.Split) !?A {
+    return moeDownAs(sc, kern, ly, act, idx, x1, sp, rowsOn(env.get(.MLX_SERVE_DSV41_MOE_FP4_ROWS)));
+}
+
+/// `MLX_SERVE_DSV41_MOE_FP4_ROWS`: set and not `0`, a call of 2 or more rows takes the all-rows down launch.
+fn rowsOn(raw: ?[*:0]const u8) bool {
+    const v = raw orelse return false;
+    return v[0] != 0 and v[0] != '0';
+}
+
+/// `moeDown` on the all-rows launch where `rows` and the call has 2 or more rows, else on the one-row-a-threadgroup launch.
+pub fn moeDownAs(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A, idx: A, x1: A, sp: *const dsv41.Split, rows: bool) !?A {
     if (!mlx.streamIsGpu(sc.s)) return null;
     const down = if (ly.experts.views) |v| &v[1] else &ly.experts.down;
     const shared = &ly.shared[2];
@@ -163,7 +182,29 @@ pub fn moeDown(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A, 
     if (mlx.getShape(down.w).len != 3 or mlx.getShape(down.s).len != 3 or dims(down.w, 1) != N or dims(down.w, 2) != K / 8 or dims(down.s, 1) != N or dims(down.s, 2) != K / f.group()) return null;
     if (mlx.getShape(shared.w).len != 2 or mlx.getShape(shared.s).len != 2 or dims(shared.w, 0) != N or dims(shared.w, 1) != K / 4 or dims(shared.s, 0) != N or dims(shared.s, 1) != K / 32) return null;
     const nc = downCols(K, N, hc) orelse return null;
+    if (rows and R >= 2) return try runDownRows(sc, kern.down_rows, f, R, K, N, topk, hc, nc, act, down.w, down.s, shared.w, shared.s, idx, x1, sp.post, sp.comb);
     return try runDown(sc, kern, f, R, K, N, topk, hc, nc, act, down.w, down.s, shared.w, shared.s, idx, x1, sp.post, sp.comb);
+}
+
+/// The all-rows down launch (`dec_moe_fp4_down_rows`) over arrays `moeDownAs` checked: a threadgroup NC columns of every row.
+pub fn runDownRows(sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, f: fp4.Format, R: usize, K: usize, N: usize, topk: usize, hc: usize, nc: usize, act: A, w: A, scales: A, sw: A, sscales: A, idx: A, x1: A, post: A, comb: A) !A {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const shape = [_]c_int{ ci(R), ci(hc), ci(N) };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, shape.len, .bfloat16));
+    const tg = 32 * (topk + 1);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(N / nc * tg), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
+    inline for (.{ .{ "R", R }, .{ "K", K }, .{ "N", N }, .{ "TOPK", topk }, .{ "HC", hc }, .{ "NC", nc }, .{ "GS", f.group() } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+    const ins = [_]A{ act, w, scales, sw, sscales, idx, x1, post, comb };
+    const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, sc.s));
+    var o = mlx.mlx_array_new();
+    return try sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
 }
 
 /// The down launch over arrays already checked.
@@ -215,6 +256,8 @@ fn depth(s: Shape) usize {
 
 const up_l = cv.launch("dsv41_dec_moe_fp4_up", &UP_INS, &.{"out"}, UP_SOURCE, HEADER, 0, up_threads, false);
 const down_l = cv.launch("dsv41_dec_moe_fp4_down", &DOWN_INS, &.{"out"}, DOWN_SOURCE, HEADER, 4 * (TOPK + 1), 32 * (TOPK + 1), false);
+/// Its threadgroup arrays at NC 8, R 6: the slot sums, the leads' experts and pick indices, the lead flags, the count.
+const down_rows_l = cv.launch("dsv41_dec_moe_fp4_down_rows", &DOWN_INS, &.{"out"}, DOWN_ROWS_SOURCE, ROWS_HEADER, 4 * 8 * decode.max_rows * (TOPK + 1) + 5 * decode.max_rows * TOPK + decode.max_rows * TOPK * decode.max_rows + 4, 32 * (TOPK + 1), false);
 
 /// e2m1 magnitudes by code bits 0..2; bit 3 is the sign.
 const e2m1 = [8]f64{ 0, 0.5, 1, 1.5, 2, 3, 4, 6 };
@@ -612,6 +655,22 @@ const DownK = struct {
     }
 };
 
+/// `DownK` on the all-rows launch: the same inputs and outputs, one threadgroup NC columns of every row.
+const DownRowsK = struct {
+    pub const Params = DownK.Params;
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        var g = DownK.geometry(p, s) orelse return null;
+        g.grid[1] = 1;
+        g.int("R", s.rows);
+        return g;
+    }
+
+    pub const fill = DownK.fill;
+    pub const count = DownK.count;
+    pub const compute = DownK.compute;
+};
+
 /// Served shapes cut the output width to a few columns: each runs the same code at its own index; the reduction length
 /// and the rows (R = 1..6, over 8 experts so the rows share most of them) are the release's. One case a format: MXFP4,
 /// NVFP4, NVFP4 with ModelOpt's per-expert scales (the gate/up launch's; the down launch never reads them).
@@ -645,6 +704,20 @@ pub fn register(set: *kc.Set) !void {
         .out = .bf16,
         .tiles = .{ .{}, .{}, .{ .size = 32, .step = 32, .min = 32 } },
         .served = &.{ .{ .rows = 1, .n = 64, .k = 2304 }, .{ .rows = decode.max_rows, .n = 64, .k = 2304 }, .{ .rows = 2, .n = 32, .k = 32 } },
+    });
+    const rows = [_]struct { [:0]const u8, DownK.Params }{
+        .{ "dsv41 dec moe_fp4 down rows (mxfp4 routed + mxfp8 shared, hc expand, all rows a threadgroup)", .{} },
+        .{ "dsv41 dec moe_fp4 down rows (nvfp4 routed + mxfp8 shared, hc expand, all rows a threadgroup)", .{ .gs = 16 } },
+    };
+    for (rows) |c| try kit.add(set, DownRowsK, &down_rows_l, c[1], .{
+        .name = c[0],
+        .accum = .f32,
+        .depth = depth,
+        .ops = 4,
+        .mids = 1,
+        .out = .bf16,
+        .tiles = .{ .{}, .{}, .{ .size = 32, .step = 32, .min = 32 } },
+        .served = &.{ .{ .rows = 2, .n = 64, .k = 2304 }, .{ .rows = 4, .n = 64, .k = 2304 }, .{ .rows = decode.max_rows, .n = 64, .k = 2304 }, .{ .rows = 3, .n = 32, .k = 32 } },
     });
 }
 

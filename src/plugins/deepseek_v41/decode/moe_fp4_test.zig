@@ -502,6 +502,66 @@ test "dsv41 dec moe_fp4 matrix: with every sum exact, both launches equal the co
     try exact(glm);
 }
 
+/// The all-rows down launch against the one-row-a-threadgroup launch on the same inputs (`expect` bar: rel rms 1e-3,
+/// room for another summation order), and against the f32 model as `matrix` holds the one-row launch.
+fn downRowsVs(sc: *Scope, kern: moe_fp4.Kernels, l: *const Layer, g: *Gen, d: Dims, rows: usize, ids: []const u32, truth: bool) !f64 {
+    const gpa = testing.allocator;
+    const idx = try sc.keep(mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ ci(rows), ci(d.topk) }, 2, .uint32));
+    const act = try astype(sc, try g.normal(sc, &.{ ci(rows), ci(d.topk + 1), ci(d.n) }, 0.5), .bfloat16);
+    const x1 = try astype(sc, try g.normal(sc, &.{ ci(rows), ci(d.hc), ci(d.k) }, 1), .bfloat16);
+    const sp: dsv41.Split = .{ .pre = none, .post = try uniform(sc, g, &.{ ci(rows), ci(d.hc) }, 0.05, 1.5), .comb = try uniform(sc, g, &.{ ci(rows), ci(d.hc), ci(d.hc) }, -0.5, 0.5) };
+    const got = try dsv41.hostF32((try moe_fp4.moeDownAs(sc, kern, &l.ly, act, idx, x1, &sp, true)) orelse return error.Declined);
+    defer gpa.free(got);
+    const one = try dsv41.hostF32((try moe_fp4.moeDownAs(sc, kern, &l.ly, act, idx, x1, &sp, false)) orelse return error.Declined);
+    defer gpa.free(one);
+    for (got) |v| if (!std.math.isFinite(v)) return std.math.inf(f64);
+    if (truth) {
+        const tr = try truthDown(sc, &l.ly, act, ids, x1, &sp);
+        defer gpa.free(tr);
+        try decode.expectNoWorse("moe_fp4 down rows vs truth", got, one, tr);
+    }
+    return decode.relRms(got, one);
+}
+
+test "dsv41 dec moe_fp4 down rows: the all-rows launch gives the one-row launch's rows at R = 2..6, every routing and fp4 layout (DeepSeek-V4.1-Flash widths); a dropped shared expert fails" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const bar = 1e-3;
+    const d: Dims = .{ .name = deepseek.name, .k = deepseek.k, .n = deepseek.n, .topk = deepseek.topk, .experts = 12 };
+    const kern = try moe_fp4.build(lim_ds);
+    defer kern.deinit();
+    // The planted bug: the shared expert is no work item, so no row gets its down sum.
+    const src = try std.mem.replaceOwned(u8, gpa, moe_fp4.DOWN_ROWS_SOURCE, "const uint items = nl + 1;", "const uint items = nl;");
+    defer gpa.free(src);
+    try testing.expect(!std.mem.eql(u8, src, moe_fp4.DOWN_ROWS_SOURCE));
+    const srcz = try gpa.dupeZ(u8, src);
+    defer gpa.free(srcz);
+    var planted = kern;
+    planted.down_rows = try dsv41.buildKernel("dsv41_dec_moe_fp4_down_rows_planted", &moe_fp4.DOWN_INS, &.{"out"}, srcz, moe_fp4.ROWS_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(planted.down_rows);
+    for (fmts, 0..) |f, fi| {
+        var sc = Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        var g: Gen = .{ .seed = 0xD0E5 + fi };
+        var l = try randomLayer(&sc, &g, d, f);
+        defer l.deinit();
+        var prng = std.Random.DefaultPrng.init(0xA11 + fi);
+        for ([_]moe_up.Routing{ .random, .disjoint, .shared_all }) |how| for (2..decode.max_rows + 1) |rows| {
+            var ids: [64]u32 = undefined;
+            var ws: [64]f32 = undefined;
+            moe_up.route(prng.random(), how, rows, d.topk, @intCast(d.experts), &ids, &ws);
+            const e = try downRowsVs(&sc, kern, &l, &g, d, rows, ids[0 .. rows * d.topk], how == .random and rows == decode.max_rows);
+            std.debug.print("[moe_fp4 rows] {s} {t} R={d}: all-rows vs one-row rel rms {e:.2}\n", .{ @tagName(f), how, rows, e });
+            if (e > bar) return error.RowsDiffer;
+            const ep = try downRowsVs(&sc, planted, &l, &g, d, rows, ids[0 .. rows * d.topk], false);
+            if (ep <= bar) {
+                std.debug.print("[moe_fp4 rows] planted dropped shared expert passed: rel rms {e:.2}\n", .{ep});
+                return error.PlantedPassed;
+            }
+        };
+    }
+}
+
 // ── the decode rules, code by code ──
 
 /// e2m1 code `c` as f32 (OCP MX v1.0: all 16 finite, -0 kept).
