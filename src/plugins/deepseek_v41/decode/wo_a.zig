@@ -9,8 +9,8 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
-const mxfp8_qmv = @import("../../../sdk/blocks/qmm/mxfp8_qmv.zig");
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 const kit = @import("../../deepseek_v4/contract_kit.zig");
 const contract = @import("../contract.zig");
@@ -22,8 +22,8 @@ const A = mlx.mlx_array;
 const Scope = dsv41.Scope;
 
 pub const SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_wo_a.metal");
-/// The e4m3 pair decode the SDK's mxfp8 GEMV uses, a word's four values, and the matrix units' tile op.
-pub const HEADER = mxfp8_qmv.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_wo_a_header.metal") ++ kernelSource("plugins/deepseek_v41/kernels/dec_nax_header.metal");
+/// The mxfp8 reads (MLX's, or the fold under `FOLD`) and the matrix units' tile op.
+pub const HEADER = decode.FP8_READ_HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_nax_header.metal");
 pub const INS = [_][*:0]const u8{ "pacc", "pm", "pl", "sink", "meta", "periods", "w", "scales", "counter" };
 pub const OUTS = [_][*:0]const u8{ "out", "parts" };
 
@@ -47,16 +47,18 @@ fn ci(v: usize) c_int {
 }
 
 /// Simdgroups of a threadgroup and the weight rows each streams: a threadgroup owns NSG * NR outputs. The matrix units
-/// take 32 rows a simdgroup, from `nax_rows` activation rows on (below, the vector units' one pass over the weights is
-/// the cheaper); they exist on M5 and newer.
+/// take 32 rows a simdgroup; they exist on M5 and newer.
 const NSG = 8;
 const NR = 8;
 const NAX_NSG = 4;
 const NAX_NR = 32;
+/// The matrix units serve from `nax_rows` rows on (below, the vector units' one pass over the weights is the cheaper).
+/// Under `MLX_SERVE_DSV41_EXACT_VERIFY` every row stays on the vector kernel: the matrix units' tile sums a row in
+/// another order, so a verify block's rows would not carry the plain step's bytes.
 const nax_rows = 4;
 
 fn useNax(rows: c_int) bool {
-    return rows >= nax_rows and device.naxAvailable();
+    return rows >= nax_rows and device.naxAvailable() and !dsv41.exactVerify();
 }
 
 /// One dispatch from the shapes: the grid, the threadgroup, the outputs and the template ints; null where the kernel
@@ -114,6 +116,7 @@ pub fn launch(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, rd: usize, odt: mlx.m
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, p.tg[0], p.tg[1], p.tg[2]));
     for (p.ints) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, t.name, t.v));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OT", odt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "FOLD", decode.fp8Fold()));
     var all: [10]A = undefined;
     @memcpy(all[0..8], &ins);
     all[8] = counter;
@@ -192,6 +195,7 @@ const WoA = struct {
         g.out(&pl.parts, .float32);
         for (pl.ints) |t| g.int(t.name, t.v);
         g.dtype("OT", act);
+        g.int("FOLD", 0);
         return g;
     }
 
@@ -357,9 +361,11 @@ const served = [_]Shape{
     .{ .rows = 1, .n = 256, .k = HPG * HD },
     .{ .rows = 2, .n = 256, .k = HPG * HD },
     .{ .rows = 3, .n = 256, .k = HPG * HD },
+    .{ .rows = 4, .n = 256, .k = HPG * HD },
+    .{ .rows = decode.max_rows, .n = 256, .k = HPG * HD },
 };
 const served_nax = [_]Shape{
-    .{ .rows = nax_rows, .n = 256, .k = HPG * HD },
+    .{ .rows = 4, .n = 256, .k = HPG * HD },
     .{ .rows = decode.max_rows, .n = 256, .k = HPG * HD },
 };
 
@@ -598,15 +604,20 @@ test "dsv41 dec wo_a: the declared launches are the wrapper's, byte for byte" {
     defer _ = mlx.mlx_fast_metal_kernel_free(kern);
     var sc = Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
-    for ([_]bool{ false, true }) |nax| {
-        if (nax and !device.naxAvailable()) continue;
+    // The vector launch below `nax_rows`, the matrix units' from there on NAX, and under MLX_SERVE_DSV41_EXACT_VERIFY the
+    // vector launch at every row count a verify block has (`useNax`).
+    const Arm = struct { rows: usize, nax: bool, exact: bool };
+    for ([_]Arm{ .{ .rows = 3, .nax = false, .exact = false }, .{ .rows = decode.max_rows, .nax = true, .exact = false }, .{ .rows = decode.max_rows, .nax = false, .exact = true } }) |arm| {
+        if (arm.nax and !device.naxAvailable()) continue;
+        const sw = env.override(.MLX_SERVE_DSV41_EXACT_VERIFY, if (arm.exact) "1" else null);
+        defer sw.restore();
         const c = try a.create(kit.Case(WoA));
         defer {
             c.deinit();
             a.destroy(c);
         }
-        c.* = .init(a, if (nax) &decl_nax else &decl, .{ .nax = nax });
-        try testing.expect(try c.prepare(.{ .rows = if (nax) 6 else 3, .n = 128, .k = HPG * HD }, .random, 7));
+        c.* = .init(a, if (arm.nax) &decl_nax else &decl, .{ .nax = arm.nax });
+        try testing.expect(try c.prepare(.{ .rows = arm.rows, .n = 128, .k = HPG * HD }, .random, 7));
         try c.run();
         const mine = try a.dupe(u8, c.rig.outputBytes());
         defer a.free(mine);
@@ -726,4 +737,23 @@ test "dsv41 dec wo_a: ubench" {
         decode.report("wo_a", R, try decode.chainUs(&b, copies.len), bytes, old_us);
         std.debug.print("[dec-ubench] wo_a R={d}: eval-only {d:.1} us, replaced chain {d:.1} us\n", .{ R, try evalUs(&b, copies.len), old_eval });
     }
+}
+
+test "dsv41 wo_a: under MLX_SERVE_DSV41_EXACT_VERIFY every row a verify serves takes the vector kernel a plain step takes" {
+    const sw = env.override(.MLX_SERVE_DSV41_EXACT_VERIFY, "1");
+    defer sw.restore();
+    for (1..decode.max_rows + 1) |r| try testing.expect(!useNax(@intCast(r)));
+}
+
+test "dsv41 wo_a: without MLX_SERVE_DSV41_EXACT_VERIFY a NAX GPU's verify takes the matrix units from 4 rows" {
+    const sw = env.override(.MLX_SERVE_DSV41_EXACT_VERIFY, null);
+    defer sw.restore();
+    try testing.expect(!useNax(3));
+    try testing.expectEqual(device.naxAvailable(), useNax(4));
+}
+
+test "dsv41 dec wo_a: MLX's mxfp8 reads give the FOLD form's bytes on finite codes, vector and matrix units" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try decode.expectFoldSame(WoA, &decl, .{}, &served);
+    if (device.naxAvailable()) try decode.expectFoldSame(WoA, &decl_nax, .{ .nax = true }, &served_nax);
 }

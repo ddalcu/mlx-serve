@@ -54,6 +54,42 @@ pub fn expectNoWorse(label: []const u8, new: []const f32, chain: []const f32, tr
     if (en > 1.25 * ec + 1e-4) return error.FurtherFromTruth;
 }
 
+/// The mxfp8 reads (MLX's, or the 2^8 fold under `FOLD`): `fp8_read_header.metal` after the e4m3 / e8m0 reads.
+pub const FP8_READ_HEADER = @import("../../../sdk/quant/fp4.zig").SCALE_HEADER ++ @import("../../../mlx/kernels.zig").source("plugins/deepseek_v41/kernels/fp8_read_header.metal");
+
+/// The mxfp8 reads' template int `FOLD` (`MLX_SERVE_DSV41_FP8_FOLD`, read every call): 1 the 2^8 fold (the default: the
+/// same product on every finite code under 247, fewer operations), 0 MLX's reads.
+pub fn fp8Fold() c_int {
+    const v = env.get(.MLX_SERVE_DSV41_FP8_FOLD) orelse return 1;
+    return @intFromBool(v[0] != '0');
+}
+
+/// A contract kernel at `FOLD` 0 (MLX's mxfp8 reads) and 1 (the fold) on the same inputs, each served shape over three
+/// seeds of its random fill (finite e4m3 codes, e8m0 under 247): byte for byte, else `error.FoldDiffers`.
+pub fn expectFoldSame(comptime D: type, comptime launch: *const kc.metal.Launch, p: D.Params, shapes: []const kc.spec.Shape) !void {
+    const kit = @import("../../deepseek_v4/contract_kit.zig");
+    const a = std.testing.allocator;
+    for (shapes) |shape| for (1..4) |seed| {
+        var c = kit.Case(D).init(a, launch, p);
+        defer c.deinit();
+        if (!try c.prepare(shape, .random, seed)) continue;
+        var g = D.geometry(p, shape).?;
+        const mlx_reads = try a.dupe(u8, blk: {
+            try c.rig.launch(launch, g, c.args[0..c.n_in]);
+            break :blk c.rig.outputBytes();
+        });
+        defer a.free(mlx_reads);
+        for (g.targs[0..g.n_targs]) |*t| if (std.mem.orderZ(u8, t.name, "FOLD") == .eq) {
+            t.v = .{ .int = 1 };
+        };
+        try c.rig.launch(launch, g, c.args[0..c.n_in]);
+        if (!std.mem.eql(u8, mlx_reads, c.rig.outputBytes())) {
+            std.debug.print("{s} {d}x{d}x{d} seed {d}: FOLD=1 bytes differ from MLX's reads\n", .{ launch.name, shape.rows, shape.n, shape.k, seed });
+            return error.FoldDiffers;
+        }
+    };
+}
+
 /// The ubenches run only with `DSV41_DEC_UBENCH` set (under `~/claude-tmp/dsdec/with.sh gpu`).
 pub fn ubenchOn() bool {
     return env.get(.DSV41_DEC_UBENCH) != null;
@@ -174,4 +210,86 @@ test {
     _ = fixture;
     _ = @import("exact_test.zig");
     inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_down }) |k| _ = k;
+}
+
+test "dsv41 dec fp8 reads: every e4m3 code at every byte reads as MLX's from_fp8, every e8m0 code as MLX's fp8.h; FOLD differs only where it overflows or misses a NaN" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    // Word w holds codes 4w .. 4w + 3 rotated by w % 4 bytes, so each code lands at each byte position.
+    var words: [256]u32 = undefined;
+    for (&words, 0..) |*w, i| {
+        const base: u32 = @intCast((i / 4) * 4);
+        const raw = base | (base + 1) << 8 | (base + 2) << 16 | (base + 3) << 24;
+        w.* = std.math.rotl(u32, raw, 8 * (i % 4));
+    }
+    const src =
+        \\const uint i = thread_position_in_grid.x;
+        \\const float4 v = FOLD != 0 ? dsv41_e4m3x4<1>(w[i]) : dsv41_e4m3x4<0>(w[i]);
+        \\for (int b = 0; b < 4; ++b) e4[4 * i + b] = v[b] * 256.0f;
+        \\const float2 f = FOLD != 0 ? dsv41_e8m0<1>(i) : dsv41_e8m0<0>(i);
+        \\e8[2 * i] = f.x;
+        \\e8[2 * i + 1] = f.y;
+        \\
+    ;
+    const k = try dsv41.buildKernel("dsv41_fp8_read_codes", &.{"w"}, &.{ "e4", "e8" }, src, FP8_READ_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k);
+    const wa = mlx.mlx_array_new_data(&words, &[_]c_int{256}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(wa);
+    var code_bytes: [1024]u8 = undefined;
+    for (&code_bytes, 0..) |*c, j| c.* = @truncate(words[j / 4] >> @intCast(8 * (j % 4)));
+    const ca = mlx.mlx_array_new_data(&code_bytes, &[_]c_int{1024}, 1, .uint8);
+    defer _ = mlx.mlx_array_free(ca);
+    var mlx_e4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mlx_e4);
+    try mlx.check(mlx.mlx_from_fp8(&mlx_e4, ca, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(mlx_e4));
+    const want_e4 = mlx.mlx_array_data_float32(mlx_e4) orelse return error.NoData;
+    for ([_]c_int{ 0, 1 }) |fold| {
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{1024}, 1, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{512}, 1, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "FOLD", fold));
+        const iv = mlx.mlx_vector_array_new_data(&[_]A{wa}, 1);
+        defer _ = mlx.mlx_vector_array_free(iv);
+        var ov = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ov);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k, iv, cfg, s));
+        var outs: [2]A = undefined;
+        for (&outs, 0..) |*o, i| {
+            o.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(o, ov, i));
+            try mlx.check(mlx.mlx_array_eval(o.*));
+        }
+        defer for (outs) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        const e4 = mlx.mlx_array_data_float32(outs[0]) orelse return error.NoData;
+        const e8 = mlx.mlx_array_data_float32(outs[1]) orelse return error.NoData;
+        var differ: usize = 0;
+        for (0..1024) |j| {
+            const nan_code = code_bytes[j] & 0x7F == 0x7F;
+            const same = if (std.math.isNan(want_e4[j])) std.math.isNan(e4[j]) else @as(u32, @bitCast(e4[j])) == @as(u32, @bitCast(want_e4[j]));
+            if (fold == 0 or !nan_code) try std.testing.expect(same) else differ += @intFromBool(!same);
+        }
+        // MLX's e8m0 read (0 is 2^-127, 0xFF NaN) and the 2^8 on the dot; the fold's 2^8 x read is +Inf from 247 up.
+        for (0..256) |e| {
+            const read: f32 = if (e == 0xFF) std.math.nan(f32) else @bitCast(@as(u32, if (e == 0) 0x400000 else @as(u32, @intCast(e)) << 23));
+            if (fold == 0) {
+                try std.testing.expect(if (e == 0xFF) std.math.isNan(e8[2 * e]) else @as(u32, @bitCast(e8[2 * e])) == @as(u32, @bitCast(read)));
+                try std.testing.expectEqual(@as(f32, 256), e8[2 * e + 1]);
+            } else {
+                try std.testing.expectEqual(@as(f32, 1), e8[2 * e + 1]);
+                // Code 0's 2^-127 is a subnormal the GPU flushes before the x256 (MLX's products flush it too).
+                const want: f32 = if (e == 0) 0 else read * 256.0;
+                if (e < 247) try std.testing.expectEqual(want, e8[2 * e]) else differ += @intFromBool(std.math.isInf(e8[2 * e]));
+            }
+        }
+        // The fold reads S.1111.111 as 480 (8 bytes) and e8m0 247..255 as +Inf (9 codes).
+        if (fold == 1) try std.testing.expectEqual(@as(usize, 8 + 9), differ);
+    }
+    _ = a;
 }

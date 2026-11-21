@@ -153,17 +153,17 @@ float dv[RT][R];
 if (is_q) {
   #pragma unroll
   for (int i = 0; i < RT; ++i) {
-    // The e8m0 scale is 2^(e - 127); the e4m3 bit placement leaves out a 2^8.
-    const float s = as_type<float>(sc8[i] == 0u ? 0x400000u : (sc8[i] << 23)) * 256.0f;
-    const float2 a0 = mlxserve_e4m3x2(wq8[i].x), a1 = mlxserve_e4m3x2(wq8[i].x >> 8);
-    const float2 a2 = mlxserve_e4m3x2(wq8[i].y), a3 = mlxserve_e4m3x2(wq8[i].y >> 8);
+    // The e8m0 scale and the 2^8 the e4m3 reads leave out (fp8_read_header.metal).
+    const float2 s = dsv41_e8m0<FOLD>(sc8[i]);
+    const float2 a0 = dsv41_e4m3x2<FOLD>(wq8[i].x), a1 = dsv41_e4m3x2<FOLD>(wq8[i].x >> 8);
+    const float2 a2 = dsv41_e4m3x2<FOLD>(wq8[i].y), a3 = dsv41_e4m3x2<FOLD>(wq8[i].y >> 8);
     const float w8[8] = {a0.x, a1.x, a0.y, a1.y, a2.x, a3.x, a2.y, a3.y};
     #pragma unroll
     for (int r = 0; r < R; ++r) {
       float d = 0.0f;
       #pragma unroll
       for (int k = 0; k < 8; ++k) d = metal::fma(hf[r][k], w8[k], d);
-      dv[i][r] = d * s;
+      dv[i][r] = (d * s.y) * s.x;
     }
   }
 } else {

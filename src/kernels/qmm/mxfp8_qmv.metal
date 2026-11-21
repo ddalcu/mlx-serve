@@ -11,8 +11,9 @@ for (int m = 0; m < M; ++m) acc[m] = 0.0f;
 for (int k = int(lane) * 16; k < K; k += 512) {
   const uint4 q = wrow[k / 16];
   const uint e = uint(scales[(size_t)n * KG + k / 32]);
-  // e8m0 as 2^(e - 127), times the 2^8 the e4m3 bit placement leaves out.
-  const float sc = as_type<float>(e == 0u ? 0x400000u : (e << 23)) * 256.0f;
+  // e8m0 as MLX reads it (fp8.h: 0 is 2^-127, 0xff NaN); the 2^8 the e4m3 bit placement leaves out goes back on
+  // the dot, so no scale overflows.
+  const float sc = mlxserve_fp4_e8m0(e);
   float wv[16];
   const uint words[4] = {q.x, q.y, q.z, q.w};
   for (int i = 0; i < 4; ++i) {
@@ -27,7 +28,7 @@ for (int k = int(lane) * 16; k < K; k += 512) {
     const device T* xr = x + (size_t)m * K + k;
     float d = 0.0f;
     for (int i = 0; i < 16; ++i) d += float(xr[i]) * wv[i];
-    acc[m] += d * sc;
+    acc[m] += (d * 256.0f) * sc;
   }
 }
 for (int m = 0; m < M; ++m) {

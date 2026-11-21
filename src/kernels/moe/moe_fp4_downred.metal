@@ -15,12 +15,12 @@ for (int e = tok * TOPK; e < (tok + 1) * TOPK; ++e) {
       for (int i = 0; i < 16; ++i) xr[i] = float(act[size_t(e) * I + kk + i]);
       const int gi = kk / GS;
       for (int r = 0; r < ROWS; ++r)
-        acc[r] += sc * mlxserve_fp4_dot16(dw[r * KW2 + k / 16], xr) * mlxserve_fp4_scale(uint(d_scales[(row + r) * KG + gi]));
+        acc[r] += sc * (mlxserve_fp4_dot16(dw[r * KW2 + k / 16], xr) * 16384.0f) * mlxserve_fp4_scale_of<GS>(uint(d_scales[(row + r) * KG + gi]));
     }
   }
 }
 for (int r = 0; r < ROWS; ++r) {
-  const float v = simd_sum(acc[r]) * 4194304.0f;
+  const float v = simd_sum(acc[r]);
   if (lane == 0) {
     T out = T(v);
     if (SHARED != 0) {

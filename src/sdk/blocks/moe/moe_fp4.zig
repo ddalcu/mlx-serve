@@ -11,6 +11,7 @@ const fused_activations = @import("../mlp/fused_activations.zig");
 const parity = @import("../../testing/parity.zig");
 const moe_affine4 = @import("moe_affine4.zig");
 const QuantMode = @import("../../quant/params.zig").QuantMode;
+const fp4 = @import("../../quant/fp4.zig");
 
 pub const ROWS: c_int = 4;
 pub const SGS: c_int = 2;
@@ -18,19 +19,15 @@ pub const SGS: c_int = 2;
 /// past two rows MLX's sorted gather (one read per expert per row group) wins.
 pub const MAX_ROWS: c_int = 2;
 
-/// e2m1 nibble -> its value times 2^-14, by bit placement into a half.
-pub const E2M1_HEADER = kernelSource("kernels/moe/moe_fp4_e2m1_header.metal");
-/// Group scale -> its value times 2^-8: e4m3 (NVFP4) by bit placement into a
-/// half, e8m0 (MXFP4) as MLX's `fp8_e8m0` reads it (the byte is a float
-/// exponent, 0 is 2^-127). With the e2m1 2^-14, one 2^22 multiply restores both.
-pub const NV_SCALE = kernelSource("kernels/moe/moe_fp4_nv_scale.metal");
-pub const MX_SCALE = kernelSource("kernels/moe/moe_fp4_mx_scale.metal");
+/// Group scale -> its value times 2^-8, either format by the GS template (`fp4.SCALE_HEADER`, the one fp4 scale
+/// decode). With the e2m1 2^-14, one 2^22 multiply restores both.
+pub const SCALE = fp4.SCALE_HEADER;
 
-/// Nibbles j and j+4 of a word decode together: one shift puts them in the two halves of a
-/// half2, then the e2m1 bit placement serves both lanes.
-pub const E2M1X2_HEADER = kernelSource("kernels/moe/moe_fp4_e2m1x2_header.metal");
+/// The 16-value dot (`mlxserve_e2m1x2` from `SCALE`).
+pub const DOT16 = kernelSource("kernels/moe/moe_fp4_dot16.metal");
 
-pub const DOT16 = E2M1X2_HEADER ++ kernelSource("kernels/moe/moe_fp4_dot16.metal");
+/// Both kernels' header, both formats: the format is the GS template argument.
+pub const HEADER = SCALE ++ DOT16;
 
 // grid (32, N/ROWS, R*TOPK), threadgroup (32, SGS, 1): slot e is token e / TOPK's
 // e % TOPK-th expert. USCALE and CLAMP are the per-expert up scale and GLM's whole-number SwiGLU clamp. The e2m1 and scale decodes each scale by a power of two;
@@ -142,8 +139,8 @@ fn run(s: mlx.mlx_stream, x: mlx.mlx_array, geo: [3]Bank, bind: []const [3]Bank,
         if (rows != 1 or mlx.mlx_array_dtype(sh.down) != dt or mlx.mlx_array_dtype(sh.logit) != dt or mlx.mlx_array_size(sh.logit) != 1 or mlx.mlx_array_size(sh.down) != @as(usize, @intCast(hidden))) return null;
     }
 
-    const full_header = [2][:0]const u8{ E2M1_HEADER ++ NV_SCALE ++ DOT16, E2M1_HEADER ++ MX_SCALE ++ DOT16 };
-    const banks_header = [2][:0]const u8{ full_header[0] ++ BANKS_HEADER, full_header[1] ++ BANKS_HEADER };
+    const full_header = [2][:0]const u8{ HEADER, HEADER };
+    const banks_header = [2][:0]const u8{ HEADER ++ BANKS_HEADER, HEADER ++ BANKS_HEADER };
     const set = if (kinds != null) &banked[ki] else &kernels[ki];
     if (set.gateup == null) {
         const names = [2][2][*:0]const u8{ .{ "mlxserve_moe_fp4_gateup_nv", "mlxserve_moe_fp4_gateup_mx" }, .{ "mlxserve_moe_fp4_gateup_nv_banks", "mlxserve_moe_fp4_gateup_mx_banks" } };

@@ -953,18 +953,25 @@ test "deepseek_v41 resident bill: a --mlx-gguf set (a file, not a pack dir) bill
     try std.testing.expectEqual(@as(u64, 10_000), out);
 }
 
-test "deepseek_v41 resident bill: the Engram tables it preads bill their LRU, not their shards" {
+test "deepseek_v41 resident bill: Engram tables it preads bill their LRU, not their shards; tables it holds bill their bytes" {
+    const env_mod = @import("../../env.zig");
+    defer env_mod.unset(.MLX_SERVE_DSV41_ENGRAM_RESIDENT);
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
     try @import("engram.zig").writeAffineFixture(io, td.dir, "");
     var buf: [512]u8 = undefined;
     const dir = buf[0..try td.dir.realPath(io, &buf)];
+    env_mod.set(.MLX_SERVE_DSV41_ENGRAM_RESIDENT, "0");
     try std.testing.expectEqual(10_000 - 288 + lru(), try engramResident(dir, "", 10_000));
+    env_mod.unset(.MLX_SERVE_DSV41_ENGRAM_RESIDENT);
+    try std.testing.expectEqual(10_000 + lru(), try engramResident(dir, "", 10_000));
 }
 
 test "deepseek_v41 resident bill: neither the vision tower nor DSpark stages that will not load" {
     @import("../../env.zig").unset(.MLX_SERVE_DSV4_DSPARK); // test-order hygiene: `--dspark` (and tests) force the stages on
+    @import("../../env.zig").set(.MLX_SERVE_DSV41_ENGRAM_RESIDENT, "0");
+    defer @import("../../env.zig").unset(.MLX_SERVE_DSV41_ENGRAM_RESIDENT);
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();

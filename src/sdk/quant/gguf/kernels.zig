@@ -91,7 +91,7 @@ pub fn headerFor(comptime ty: GgmlType) [:0]const u8 {
         .iq1_s, .iq1_m => &.{ "tables/iq1s_grid_gpu", "blocks/iq1" },
         else => unreachable,
     };
-    comptime var h: [:0]const u8 = @embedFile("metal/blocks/common.h");
+    comptime var h: [:0]const u8 = @embedFile("metal/blocks/common.h") ++ (if (ty == .mxfp4) @import("../fp4.zig").SCALE_HEADER else "");
     inline for (parts) |p| h = h ++ @embedFile("metal/" ++ p ++ ".h");
     return h;
 }
@@ -929,6 +929,59 @@ test "GPU dequant equals the CPU reference for every type" {
             }
         }
     }
+}
+
+test "GPU dequant of MXFP4 on every e8m0 scale code and every e2m1 code is MLX's mxfp4 dequant bit for bit (0xff NaN, -0)" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const ty: GgmlType = .mxfp4;
+    // 4 rows of 64 blocks: block b has scale code b and nibble bytes cycling every e2m1 code in both halves.
+    const rows: usize = 4;
+    const in: usize = 64 * 32;
+    var blocks: [256 * 17]u8 = undefined;
+    for (0..256) |b| {
+        blocks[b * 17] = @intCast(b);
+        for (0..16) |j| blocks[b * 17 + 1 + j] = @intCast((b + j * 17) % 256);
+    }
+    const rb = rowBytes(ty, @intCast(in));
+    const packed_rows = try std.testing.allocator.alloc(u8, rows * rb);
+    defer std.testing.allocator.free(packed_rows);
+    if (isSplit(ty, @intCast(in))) packRows(ty, @intCast(in), packed_rows, &blocks) else @memcpy(packed_rows, blocks[0..packed_rows.len]);
+    const w = mlx.mlx_array_new_data(packed_rows.ptr, &[_]c_int{ @intCast(rows), @intCast(rb) }, 2, .uint8);
+    defer _ = mlx.mlx_array_free(w);
+    const got = try dequantize(ty, w, .float32, s);
+    defer _ = mlx.mlx_array_free(got);
+    // The same codes in MLX's mxfp4 layout: element e of a block in nibble e (low first), ggml's element j the low
+    // nibble of byte j and j + 16 its high nibble.
+    var words: [256 * 4]u32 = @splat(0);
+    var scales: [256]u8 = undefined;
+    for (0..256) |b| {
+        scales[b] = @intCast(b);
+        for (0..32) |e| {
+            const q = blocks[b * 17 + 1 + (e % 16)];
+            const code: u32 = if (e < 16) q & 0xF else q >> 4;
+            words[b * 4 + e / 8] |= code << @intCast(4 * (e % 8));
+        }
+    }
+    const mw = mlx.mlx_array_new_data(&words, &[_]c_int{ @intCast(rows), @intCast(in / 8) }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(mw);
+    const ms = mlx.mlx_array_new_data(&scales, &[_]c_int{ @intCast(rows), @intCast(in / 32) }, 2, .uint8);
+    defer _ = mlx.mlx_array_free(ms);
+    var want = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(want);
+    try mlx.check(mlx.mlx_dequantize(&want, mw, ms, .{ .ctx = null }, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "mxfp4", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+    const g = try readF32(got, rows * in);
+    const m = try readF32(want, rows * in);
+    var differ: usize = 0;
+    for (g, m, 0..) |a, b, i| {
+        const same = if (std.math.isNan(b)) std.math.isNan(a) else @as(u32, @bitCast(a)) == @as(u32, @bitCast(b));
+        if (!same) {
+            if (differ < 8) std.debug.print("mxfp4 element {d} (scale code {d}): gguf {e}, MLX {e}\n", .{ i, i / 32, a, b });
+            differ += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), differ);
 }
 
 test "linear equals a CPU dot product on the matvec (1 and several rows) and the 2-row fallback path" {

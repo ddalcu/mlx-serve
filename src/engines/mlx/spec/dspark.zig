@@ -206,6 +206,33 @@ pub fn dsparkPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?Dr
     return try mtpSerialOneToken(allocator, tok);
 }
 
+/// The DSpark policy's pinned verify rows: a streamed EXL3 bank's greedy request verifies the whole block (`whole`);
+/// else MLX_SERVE_DSPARK_PIN_ROWS=N (`raw`) pins N rows, and unset, 0 or not a number is the adaptive policy (0).
+pub fn dsparkPinRows(whole: bool, raw: ?[*:0]const u8) u32 {
+    if (whole) return std.math.maxInt(u32);
+    return env.intValue(u32, raw, 0);
+}
+
+/// Drafts a pinned round verifies: `pin_rows` rows are t1 and `pin_rows - 1` drafts, at most the `len` drafted.
+pub fn pinnedDrafts(len: usize, pin_rows: u32) usize {
+    return @min(len, pin_rows - 1);
+}
+
+test "dspark pin rows: MLX_SERVE_DSPARK_PIN_ROWS=N verifies N rows a round, unset is adaptive, an EXL3 bank the block" {
+    try testing.expectEqual(@as(u32, 0), dsparkPinRows(false, null));
+    try testing.expectEqual(@as(u32, 0), dsparkPinRows(false, "0"));
+    try testing.expectEqual(@as(u32, 0), dsparkPinRows(false, "x"));
+    try testing.expectEqual(std.math.maxInt(u32), dsparkPinRows(true, "3"));
+    for ([_][:0]const u8{ "2", "3", "4", "5", "6" }, 2..) |raw, n| {
+        const pin = dsparkPinRows(false, raw.ptr);
+        try testing.expectEqual(@as(u32, @intCast(n)), pin);
+        // A 5-draft block: N rows are t1 and N - 1 drafts.
+        try testing.expectEqual(n - 1, pinnedDrafts(5, pin));
+    }
+    try testing.expectEqual(@as(usize, 5), pinnedDrafts(5, 8));
+    try testing.expectEqual(@as(usize, 5), pinnedDrafts(5, std.math.maxInt(u32)));
+}
+
 /// One DeepSeek-V4.1 stage round under `dspark_pol`: draft, verify the prefix the calibrated confidence pays
 /// for (none = the trunk token alone), and teach the calibration and the drafting backoff what it bought.
 pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv41_mod.Dsv41Model) !?DrafterStepResult {
@@ -215,7 +242,7 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     const t1 = self.next_token_id;
     var d = try dsv41_mod.dsparkDraft(mdl, allocator, st, t1);
     defer d.deinit(allocator);
-    d.len = if (pol.pin_rows > 0) @min(d.len, pol.pin_rows - 1) else dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
+    d.len = if (pol.pin_rows > 0) pinnedDrafts(d.len, pol.pin_rows) else dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
     // An exact verify stays within the decode-width rows (`maxVerifyDrafts`; the block itself otherwise).
     d.len = @min(d.len, dsv41_mod.maxVerifyDrafts(mdl));
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);

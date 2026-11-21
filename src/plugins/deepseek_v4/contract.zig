@@ -246,10 +246,12 @@ const Qat = struct {
         return if (q.fp4) std.math.ldexp(@as(f64, 6), -126) else 1e-4;
     }
 
-    /// The group scale for `amax`: 2^ceil(log2(amax / cm)), the quotient rounded to f32 as the kernel takes it.
+    /// The group scale for `amax`: 2^ceil(log2(amax / cm)), the quotient rounded to f32 as the kernel takes it; MLX's
+    /// e8m0 rounded up, whose non-finite code reads back NaN.
     fn scaleFor(q: Qat, amax: f64) f64 {
         const x = spec.roundTo(.f32, amax / q.cm());
-        if (!(x > 0) or !std.math.isFinite(x)) return x;
+        if (!std.math.isFinite(x)) return kit.nan;
+        if (!(x > 0)) return x;
         const fr = std.math.frexp(x);
         const e = if (fr.significand == 0.5) fr.exponent - 1 else fr.exponent;
         return std.math.ldexp(@as(f64, 1), e);
@@ -783,7 +785,7 @@ const sinkhorn_launch = metal.Launch{ .name = "dsv4_sinkhorn", .inputs = &.{ "mi
 const sinkhorn_y_launch = metal.Launch{ .name = "dsv4_sinkhorn_y", .inputs = &.{ "mixes", "ssq", "scale", "base", "consts", "stream_in" }, .outputs = &.{ "out", "y" }, .source = dsv4.SINKHORN_Y_KERNEL_SOURCE, .tg_bytes = 4 * HC, .m1 = 640, .m2 = 640 };
 const dec_chain_in: []const [*:0]const u8 = &.{ "x", "w", "cosr", "sinr", "hada", "consts" };
 fn decChainLaunch(comptime d: usize, comptime post: u8) metal.Launch {
-    return .{ .name = "dsv4_dec_chain", .inputs = dec_chain_in, .outputs = &.{"y_out"}, .source = dsv4.DEC_CHAIN_KERNEL_SOURCE, .tg_bytes = decChainTg(d, post), .m1 = 1024, .m2 = 1024 };
+    return .{ .name = "dsv4_dec_chain", .inputs = dec_chain_in, .outputs = &.{"y_out"}, .source = dsv4.DEC_CHAIN_KERNEL_SOURCE, .header = dsv4.QAT_HEADER, .tg_bytes = decChainTg(d, post), .m1 = 1024, .m2 = 1024 };
 }
 const dec_q = decChainLaunch(512, 0);
 const dec_kv = decChainLaunch(512, 1);
@@ -791,7 +793,7 @@ const dec_idx = decChainLaunch(128, 2);
 const dec_o = decChainLaunch(512, 0);
 const emit_in: []const [*:0]const u8 = &.{ "cin", "pre_kv", "pre_sc", "ape", "nw", "cosr", "sinr", "hada", "consts" };
 fn emitLaunch(comptime d: usize, comptime rotate: bool) metal.Launch {
-    return .{ .name = "dsv4_emit_win", .inputs = emit_in, .outputs = &.{"outw"}, .source = dsv4.EMIT_WIN_KERNEL_SOURCE, .tg_bytes = emitTg(d, rotate), .m1 = 1024, .m2 = 1024 };
+    return .{ .name = "dsv4_emit_win", .inputs = emit_in, .outputs = &.{"outw"}, .source = dsv4.EMIT_WIN_KERNEL_SOURCE, .header = dsv4.QAT_HEADER, .tg_bytes = emitTg(d, rotate), .m1 = 1024, .m2 = 1024 };
 }
 const emit_kv4 = emitLaunch(512, false);
 const emit_kv128 = emitLaunch(512, false);
@@ -838,7 +840,6 @@ pub fn register(set: *kc.Set) !void {
     });
     const squares: spec.Sums = .{ .f16 = 0, .bf16 = 0, .why = "a sum of squares cannot cancel" };
     const quant_nan: spec.Nan = .{ .stated = "classes as float64 gives them; quantized entries within the quantizer's envelope of their bounds" };
-    const nan_code: spec.Known = .{ .gate = .nonfinite, .finding = "a NaN in a quantized group is written as the code -max x scale: metal::max drops it from the group max and metal::clamp from the code (float64 and the composed chain propagate it)" };
     try kit.add(set, DecChain, &dec_q, .{ .rms = true, .post = 0, .inv = false }, .{
         .name = "dsv4 dec_chain q (rms, rope)",
         .accum = .f32,
@@ -854,7 +855,6 @@ pub fn register(set: *kc.Set) !void {
         .depth = depthK,
         .out = .f32,
         .nan = quant_nan,
-        .known = nan_code,
         .served = &.{.{ .rows = 1, .n = 512, .k = 512 }},
         .sums = squares,
     });
@@ -864,7 +864,6 @@ pub fn register(set: *kc.Set) !void {
         .depth = depthK,
         .out = .f32,
         .nan = quant_nan,
-        .known = nan_code,
         .served = &.{.{ .rows = 64, .n = 128, .k = 128 }},
     });
     try kit.add(set, DecChain, &dec_o, .{ .rms = false, .post = 0, .inv = true }, .{
@@ -881,7 +880,6 @@ pub fn register(set: *kc.Set) !void {
         .depth = depthK,
         .out = .f32,
         .nan = quant_nan,
-        .known = nan_code,
         .served = &.{ .{ .rows = 1, .n = 512, .k = 4 }, .{ .rows = 2, .n = 512, .k = 4 }, .{ .rows = 128, .n = 512, .k = 4 } },
     });
     try kit.add(set, EmitWin, &emit_kv128, .{ .overlap = false, .rotate = false, .pre_n = 100, .base_mod = 100, .col_off = 0 }, .{
@@ -890,7 +888,6 @@ pub fn register(set: *kc.Set) !void {
         .depth = depthK,
         .out = .f32,
         .nan = quant_nan,
-        .known = nan_code,
         .served = &.{ .{ .rows = 1, .n = 512, .k = 128 }, .{ .rows = 4, .n = 512, .k = 128 } },
     });
     try kit.add(set, EmitWin, &emit_idx, .{ .overlap = true, .rotate = true, .pre_n = 5, .base_mod = 1, .col_off = 2048 }, .{
@@ -899,7 +896,6 @@ pub fn register(set: *kc.Set) !void {
         .depth = depthK,
         .out = .f32,
         .nan = quant_nan,
-        .known = nan_code,
         .served = &.{ .{ .rows = 1, .n = 128, .k = 4 }, .{ .rows = 128, .n = 128, .k = 4 } },
     });
 }

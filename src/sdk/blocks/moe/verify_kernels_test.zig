@@ -218,8 +218,12 @@ test "prefill expert reduction is bit-identical to unsort multiply and sum" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x5EED_3A11);
-    // (top_k, hidden): Qwen3-30B-A3B (8, 2048), Qwen3.6-35B (10, 2560), and MiMo-V2.6 (8, 4096) geometries.
-    for ([_][2]c_int{ .{ 8, 2048 }, .{ 10, 2560 }, .{ 8, 4096 } }) |kh| for ([_][2]c_int{ .{ 1, 33 }, .{ 1, 2048 }, .{ 2, 1024 }, .{ 1, 8192 } }) |shape| {
+    // Hidden 6144 serves behind MLX_SERVE_MOE_PREFILL_WSUM_6144: on for this test, and off declines it.
+    const wide = env.override(.MLX_SERVE_MOE_PREFILL_WSUM_6144, "1");
+    defer wide.restore();
+    // (top_k, hidden): Qwen3-30B-A3B (8, 2048), Qwen3.6-35B (10, 2560), MiMo-V2.6 (8, 4096) and GLM-5.3 Pro (8, 6144)
+    // geometries.
+    for ([_][2]c_int{ .{ 8, 2048 }, .{ 10, 2560 }, .{ 8, 4096 }, .{ 8, 6144 } }) |kh| for ([_][2]c_int{ .{ 1, 33 }, .{ 1, 2048 }, .{ 2, 1024 }, .{ 1, 8192 } }) |shape| {
         const count = shape[0] * shape[1] * kh[0];
         const down = try testRandWeightBf16(prng.random(), &.{ count, kh[1] }, s);
         defer _ = mlx.mlx_array_free(down);
@@ -236,6 +240,11 @@ test "prefill expert reduction is bit-identical to unsort multiply and sum" {
         const actual = (try moePrefillExpertReduce(s, down, inverse, scores)) orelse return error.ExpertReduceDeclined;
         defer _ = mlx.mlx_array_free(actual);
         try testing.expect(try bf16BitsEqual(expected, actual));
+        if (kh[1] == 6144 and shape[1] == 33) {
+            const off = env.override(.MLX_SERVE_MOE_PREFILL_WSUM_6144, "0");
+            defer off.restore();
+            try testing.expect((try moePrefillExpertReduce(s, down, inverse, scores)) == null);
+        }
     };
 }
 

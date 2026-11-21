@@ -116,7 +116,7 @@ if constexpr (UI > 0) {
     dsv41_wqb_w<PI> wi;
     dsv41_wqb_load<PI>(wi, (const device uint4*)w_i + n_base * 80, (const device uchar*)s_i + n_base * 40, lane);
     float acc[PI][R];
-    dsv41_wqb_dots<R, PI>(wi, xs, lane, acc);
+    dsv41_wqb_dots<R, PI, FOLD>(wi, xs, lane, acc);
     float vals[PI];
     float amax = 0.0f;
     for (int p = 0; p < PI; ++p) {
@@ -165,7 +165,7 @@ if (i_q < UI + UQ) {
       dsv41_wqb_load<1>(nx, (const device uint4*)w_q + n_next * 80, (const device uchar*)s_q + n_next * 40, lane);
     }
     float acc[1][R];
-    dsv41_wqb_dots<R, 1>(wq, xs, lane, acc);
+    dsv41_wqb_dots<R, 1, FOLD>(wq, xs, lane, acc);
     float vr = 0.0f;
     for (int r = 0; r < R; ++r) {
       const float t = float(T(dsv41_wqb_sum16(acc[0][r])));

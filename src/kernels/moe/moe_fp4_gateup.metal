@@ -17,21 +17,24 @@ for (int k = 0; k < K; k += 512) {
     const int gi = kk / GS;
     for (int r = 0; r < ROWS; ++r) {
       const size_t sg = (row + r) * KG + gi;
-      ag[r] += mlxserve_fp4_dot16(gw[r * KW2 + k / 16], xr) * mlxserve_fp4_scale(uint(g_scales[sg]));
-      au[r] += mlxserve_fp4_dot16(uw[r * KW2 + k / 16], xr) * mlxserve_fp4_scale(uint(u_scales[sg]));
+      // The e2m1 decode's 2^-14 restored on the 16-value dot (exact), times the scale as MLX reads it.
+      ag[r] += (mlxserve_fp4_dot16(gw[r * KW2 + k / 16], xr) * 16384.0f) * mlxserve_fp4_scale_of<GS>(uint(g_scales[sg]));
+      au[r] += (mlxserve_fp4_dot16(uw[r * KW2 + k / 16], xr) * 16384.0f) * mlxserve_fp4_scale_of<GS>(uint(u_scales[sg]));
     }
   }
 }
 for (int r = 0; r < ROWS; ++r) {
-  const float g = simd_sum(ag[r]) * 4194304.0f;
-  const float u = simd_sum(au[r]) * 4194304.0f;
+  const float g = simd_sum(ag[r]);
+  const float u = simd_sum(au[r]);
   if (lane == 0) {
     T gt = GSCALE != 0 ? T(T(g) * gsc[inds[e]]) : T(g);
     T ut = USCALE != 0 ? T(T(u) * usc[inds[e]]) : T(u);
     if (CLAMP != 0) {
-      const float hi = float(T(float(CLAMP)));
-      gt = T(min(float(gt), hi));
-      ut = T(clamp(float(ut), -hi, hi));
+      // MLX's Minimum / Clip: a NaN stays NaN (Metal's min / clamp would return the bound).
+      const T hi = T(float(CLAMP));
+      gt = gt > hi ? hi : gt;
+      ut = ut < -hi ? -hi : ut;
+      ut = ut > hi ? hi : ut;
     }
     y[size_t(e) * N + row0 + r] = (gt * sigtab[as_type<ushort>(gt)]) * ut;
   }

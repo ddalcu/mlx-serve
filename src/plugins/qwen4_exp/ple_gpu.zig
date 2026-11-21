@@ -187,7 +187,7 @@ pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 pub const SOURCE = kernelSource("plugins/qwen4_exp/kernels/ple_gather.metal");
-pub const HEADER = kernelSource("plugins/qwen4_exp/kernels/ple_gather_header.metal");
+pub const HEADER = @import("../../sdk/quant/fp4.zig").SCALE_HEADER ++ kernelSource("plugins/qwen4_exp/kernels/ple_gather_header.metal");
 
 fn getKernel() !mlx.mlx_fast_metal_kernel {
     if (kernel) |k| return k;

@@ -34,6 +34,7 @@ const countSpliceRows = @import("prefill_chunk.zig").countSpliceRows;
 const decodeShareCapped = @import("prefill_chunk.zig").decodeShareCapped;
 const dsparkArmFor = @import("../spec/dspark.zig").dsparkArmFor;
 const dsparkEnabled = @import("../spec/dspark.zig").dsparkEnabled;
+const dsparkPinRows = @import("../spec/dspark.zig").dsparkPinRows;
 const effectiveMtpHistoryWindow = @import("prefill_chunk.zig").effectiveMtpHistoryWindow;
 const effectivePrefillChunk = @import("prefill_chunk.zig").effectivePrefillChunk;
 const effectiveSsmCheckpointStride = @import("prefill_chunk.zig").effectiveSsmCheckpointStride;
@@ -1015,7 +1016,8 @@ pub fn initWithOptions(
             .dspark_enabled = dspark_active,
             .dspark_stochastic = dspark_stochastic,
             // A streamed EXL3 bank verifies the whole block on a greedy request: its verify costs about a plain tick.
-            .dspark_pol = if (dspark_active) if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else null else null,
+            // MLX_SERVE_DSPARK_PIN_ROWS=N pins every round at N rows (the width sweep).
+            .dspark_pol = if (dspark_active) if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = dsparkPinRows(!dspark_stochastic and dm.cfg.dsv41_exl3_bank, env.get(.MLX_SERVE_DSPARK_PIN_ROWS)) } else null else null,
             .drafter = if (drafter_active) options.drafter else null,
             .drafter_block_size = options.drafter_block_size,
             .dflash = if (dflash_active) options.dflash else null,
