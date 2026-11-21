@@ -183,14 +183,23 @@ fn checkCase(fx: *fixture.Fixture, in: Inputs, p0: usize, R: usize, keep: usize,
     }
 }
 
+/// The routed experts a gate run builds: the iQ pack's affine plan, or the release's fp4 (MXFP4, or NVIDIA's NVFP4 with
+/// its per-expert scales).
+const Experts = enum { iq, mxfp4, nvfp4 };
+
 fn runGate(exact_on: bool) !Tally {
+    return runGateWith(exact_on, .iq, false);
+}
+
+/// `quick`: each range at its first position only.
+fn runGateWith(exact_on: bool, experts: Experts, quick: bool) !Tally {
     const gpa = std.testing.allocator;
     var tally: Tally = .{};
     var ab: [64]u8 = undefined;
-    std.debug.print("[exact-gate] gpu {s}, NAX {any}, exact={any}\n", .{ device.gpuArchitecture(&ab) orelse "?", device.naxAvailable(), exact_on });
+    std.debug.print("[exact-gate] gpu {s}, NAX {any}, exact={any}, experts {t}\n", .{ device.gpuArchitecture(&ab) orelse "?", device.naxAvailable(), exact_on, experts });
     var misses: u64 = 0;
-    for (ranges) |rg| for (rg.p0s) |p0| {
-        const fx = try fixture.Fixture.init(gpa, .{ .lo = rg.lo, .hi = rg.hi, .ctx = p0 - 1, .seed = 7 + p0, .act = .bfloat16, .fused = true });
+    for (ranges) |rg| for (rg.p0s[0..if (quick) 1 else rg.p0s.len]) |p0| {
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = rg.lo, .hi = rg.hi, .ctx = p0 - 1, .seed = 7 + p0, .act = .bfloat16, .fused = true, .experts_fp4 = experts == .mxfp4, .experts_nvfp4 = experts == .nvfp4, .expert_scales = if (experts == .nvfp4) .all else .none });
         defer fx.deinit();
         fx.m.exact = dsv41.exactBatched(.{ .on = exact_on }, env.get(.DSV41_EXACT_GATE_BATCHED));
         fx.m.exact_pair_ok = true;
@@ -233,6 +242,17 @@ test "dsv41 exact: verify rows and the state they leave equal plain steps bit fo
     try std.testing.expectEqual(@as(usize, 0), t.probe_diffs);
     try std.testing.expectEqual(@as(usize, 0), t.state_diffs);
     try std.testing.expectEqual(@as(u64, 0), t.misses);
+}
+
+test "dsv41 exact: verify rows against plain steps with fp4 experts, the fused fp4 MoE on and off, exact off (DSV41_EXACT_GATE, prints)" {
+    if (env.get(.DSV41_EXACT_GATE) == null) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    for ([_]?[*:0]const u8{ "1", null }) |fused| {
+        const sw = env.override(.MLX_SERVE_DSV41_MOE_FP4_NAX, fused);
+        defer sw.restore();
+        std.debug.print("[exact-gate] MLX_SERVE_DSV41_MOE_FP4_NAX={s}\n", .{fused orelse "unset"});
+        for ([_]Experts{ .mxfp4, .nvfp4 }) |e| _ = try runGateWith(false, e, true);
+    }
 }
 
 fn randBf16(shape: []const c_int, std_: f32, seed: u64) !A {
