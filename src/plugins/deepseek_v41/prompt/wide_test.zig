@@ -245,7 +245,7 @@ test "dsv41 wide tol: the paired fp4 gate+up with moe_act in its epilogue is the
     try testing.expect(ok);
 }
 
-test "dsv41 wide tol: the MoE combine and hc expand in one launch are moePrefill then hcExpand within 1% at the release widths, NVFP4 with per-expert scales, prompt row counts to 8192; a dropped shared expert or swapped post fails" {
+test "dsv41 wide tol: the MoE combine and hc expand in one launch are moePrefill then hcExpand within 1% at the release widths, NVFP4 with per-expert scales, prompt row counts to 8192; an unsort off by a row or swapped post fails" {
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const experts: c_int = 48;
@@ -275,9 +275,11 @@ test "dsv41 wide tol: the MoE combine and hc expand in one launch are moePrefill
         const p = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
         var lb: [64]u8 = undefined;
         if (!try close(try std.fmt.bufPrint(&lb, "moe tail rows {d}", .{L}), want, try mtail.launch(&csc, p, x1, &sp), x1, tol_kernel)) ok = false;
-        // Planted: the shared expert dropped, then each row's post on the wrong copies.
-        const no_sh = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, try csc.zeros(&.{ Lc, @intCast(hidden) }, .bfloat16));
-        try testing.expect(!try close("  planted: shared expert dropped", want, try mtail.launch(&csc, no_sh, x1, &sp), x1, tol_kernel));
+        // Planted: each row combining the next row's pairs (the unsort off by a row), then each row's post on the wrong
+        // copies.
+        const n: usize = L * top_k;
+        const off_row: dsv41.MoeParts = .{ .dn = p.dn, .inv = try csc.concat(&.{ try csc.slice(p.inv, 0, top_k, n), try csc.slice(p.inv, 0, 0, top_k) }, 0), .sh = p.sh };
+        try testing.expect(!try close("  planted: the unsort off by a row", want, try mtail.launch(&csc, off_row, x1, &sp), x1, tol_kernel));
         const rolled_post: dsv41.Split = .{ .pre = none, .post = try csc.concat(&.{ try csc.slice(sp.post, 1, 1, 4), try csc.slice(sp.post, 1, 0, 1) }, 1), .comb = sp.comb };
         try testing.expect(!try close("  planted: post on the wrong copies", want, try mtail.launch(&csc, p, x1, &rolled_post), x1, tol_kernel));
     }
