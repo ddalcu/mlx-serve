@@ -8,6 +8,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const mpair = @import("moe_pair.zig");
+const fixture = @import("../decode/fixture.zig");
 
 const testing = std.testing;
 const A = mlx.mlx_array;
@@ -283,4 +284,80 @@ test "dsv41 wide exact: the hc mixes at 8 rows a threadgroup give the 4-row laun
         m.hc_tg = 1024;
         try testing.expect(!try sameBytes(z4, planted));
     }
+}
+
+// ── a release-shape pair worker's prefill ──
+
+const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN };
+
+/// The pair worker's streams and mixes after its layers over `x` / `pre`, from a fresh state (caller frees).
+fn prefill(fx: *fixture.Fixture, x: A, pre: A) ![2]A {
+    return dsv41.workerStep(fx.m, testing.allocator, x, pre, 0, false, false);
+}
+
+/// Whether the pair worker's prefill gives `want`'s bytes; prints the first output that differs.
+fn sameAs(fx: *fixture.Fixture, x: A, pre: A, want: [2]A, label: []const u8, what: []const u8) !bool {
+    const got = try prefill(fx, x, pre);
+    defer for (got) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    for (want, got, 0..) |w, g, k| if (!try sameBytes(w, g)) {
+        std.debug.print("wide layer {s}, {s}: output {d} differs from the stock path's\n", .{ label, what, k });
+        return false;
+    };
+    return true;
+}
+
+test "dsv41 wide exact: each switch, and all of them, keep a release-shape pair worker's prefill streams and mixes bit for bit, MXFP4 and NVFP4 experts with per-expert scales" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    inline for (switches) |n| env.unset(n);
+    // A ratio-2 pair (layers 14, 15) and a ratio-1 pair (20, 21), each range its own KV and index source.
+    const Case = struct { lo: usize, rows: usize };
+    // Every case and switch runs; each whose bytes differ is reported.
+    var ok = true;
+    for ([_]Case{ .{ .lo = 14, .rows = 5000 }, .{ .lo = 20, .rows = 8192 } }) |c| inline for (.{ false, true }) |nv| {
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = c.lo, .hi = c.lo + 2, .ctx = 0, .experts_fp4 = !nv, .experts_nvfp4 = nv, .expert_scales = if (nv) .all else .none });
+        defer fx.deinit();
+        var lb: [64]u8 = undefined;
+        const label = try std.fmt.bufPrint(&lb, "{d}-{d} {s} at {d} rows", .{ c.lo, c.lo + 1, if (nv) "NVFP4" else "MXFP4", c.rows });
+        const x = try fx.stream(c.rows);
+        defer _ = mlx.mlx_array_free(x);
+        const pre = try fx.cpre(c.rows);
+        defer _ = mlx.mlx_array_free(pre);
+        const want = try prefill(fx, x, pre);
+        defer for (want) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        // The layer's loaded experts take the paired kernel under their kind's switch.
+        {
+            var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+            defer sc.deinit();
+            const ly = fx.layer(c.lo);
+            const h = try normal(&sc, &.{ @intCast(c.rows), @intCast(hidden) }, .bfloat16, 1, 0x77);
+            const r = try dsv41.route(&sc, fx.m, ly, h, none);
+            env.set(if (nv) .MLX_SERVE_DSV41_MOE_PAIR_SCALED else .MLX_SERVE_DSV41_MOE_PAIR, "1");
+            defer env.unset(if (nv) .MLX_SERVE_DSV41_MOE_PAIR_SCALED else .MLX_SERVE_DSV41_MOE_PAIR);
+            try testing.expect(try actOf(&sc, fx.m, &ly.experts, h, r.idx, r.wts) != null);
+        }
+        // The stock path repeats its own bytes (so a switch's difference is the switch's).
+        if (!try sameAs(fx, x, pre, want, label, "the stock path again")) ok = false;
+        inline for (switches) |n| {
+            env.set(n, "1");
+            defer env.unset(n);
+            if (!try sameAs(fx, x, pre, want, label, @tagName(n))) ok = false;
+        }
+        inline for (switches) |n| env.set(n, "1");
+        defer {
+            inline for (switches) |n| env.unset(n);
+        }
+        if (!try sameAs(fx, x, pre, want, label, "every switch")) ok = false;
+        // Planted: every switch on with the clamp at 2 (the fixture's gate and up products spread about 1) must not
+        // pass for the stock bytes at 10.
+        fx.m.cfg.dsv4_swiglu_limit = 2;
+        defer fx.m.cfg.dsv4_swiglu_limit = 10;
+        try testing.expect(!try sameAs(fx, x, pre, want, label, "planted: the clamp at 2"));
+    };
+    try testing.expect(ok);
 }
