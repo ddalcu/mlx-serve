@@ -4690,8 +4690,14 @@ pub fn routeFrom(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, logits: A, 
     var idx = mlx.mlx_array_new();
     var wts = mlx.mlx_array_new();
     const r: Routes = .{ .idx = try sc.res(mlx.mlx_vector_array_get(&idx, ov, 0), &idx), .wts = try sc.res(mlx.mlx_vector_array_get(&wts, ov, 1), &wts) };
+    if (route_tap) |t| try t.ids.append(t.gpa, sc.out(r.idx));
     return .{ .idx = r.idx, .wts = try routeScaled(sc, ly, r.idx, r.wts) };
 }
+
+/// A test's record of every route's expert ids `[L, k]` in call order (caller frees), so `prompt/wide_test.zig` can
+/// count the rows whose top-k a reordered sum flipped.
+pub const RouteTap = struct { gpa: std.mem.Allocator, ids: std.ArrayList(A) = .empty };
+pub var route_tap: ?*RouteTap = null;
 
 /// The routed sum `y` (f32) plus the shared expert.
 pub fn withShared(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, y: A) !A {
