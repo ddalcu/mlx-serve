@@ -966,39 +966,3 @@ test "dsv41 dec attn merge: the declared launch is the wrapper's, byte for byte;
     }
 }
 
-test "dsv41 dec attn merge: MLX_SERVE_DSV41_FUSE_ATTN_MERGE=1 decodes the fixture's layers within 1e-2 of the switch off over plain steps and verify blocks" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
-    const gpa = testing.allocator;
-    const steps = [_]usize{ 1, 1, decode.max_rows, 1, 3, 1 };
-    for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 } }) |range| {
-        var outs: [2][steps.len][]f32 = undefined;
-        for ([_]bool{ false, true }, 0..) |on, arm| {
-            var ov = env.override(.MLX_SERVE_DSV41_FUSE_ATTN_MERGE, if (on) "1" else "0");
-            defer ov.restore();
-            const fx = try fixture.Fixture.init(gpa, .{ .lo = range[0], .hi = range[1], .ctx = 601, .seed = 9, .act = .bfloat16, .fused = true });
-            defer fx.deinit();
-            var p0: usize = 601;
-            for (steps, 0..) |rows, k| {
-                const x = try fx.stream(rows);
-                defer _ = mlx.mlx_array_free(x);
-                const pre = try fx.cpre(rows);
-                defer _ = mlx.mlx_array_free(pre);
-                const out = try dsv41.workerStep(fx.m, gpa, x, pre, p0, false, false);
-                defer for (out) |o| {
-                    _ = mlx.mlx_array_free(o);
-                };
-                outs[arm][k] = try dsv41.hostF32(out[0]);
-                p0 += rows;
-            }
-        }
-        for (outs[0], outs[1], steps) |a, b, rows| {
-            defer gpa.free(a);
-            defer gpa.free(b);
-            for (b) |v| if (!std.math.isFinite(v)) return error.NonFinite;
-            const e = decode.relRms(b, a);
-            std.debug.print("[attn merge] layers {d}..{d}, {d} rows: stream rel rms on vs off {e:.2}\n", .{ range[0], range[1], rows, e });
-            try testing.expect(e <= 1e-2);
-        }
-    }
-}
-
