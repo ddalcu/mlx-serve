@@ -247,6 +247,7 @@ test {
     _ = @import("engines/mlx/spec/dflash/dflash.zig");
     _ = @import("engines/mlx/spec/dflash/lilicorr.zig");
     _ = @import("engines/mlx/spec/dflash/policy.zig");
+    _ = @import("engines/mlx/spec/dflash/policy2.zig");
     _ = @import("sdk/spec/mtp/mtp.zig");
     _ = @import("engines/mlx/spec/mtp_test.zig");
     _ = @import("engines/mlx/spec/round_cost.zig");

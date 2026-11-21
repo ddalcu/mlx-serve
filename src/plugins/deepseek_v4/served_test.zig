@@ -1025,8 +1025,11 @@ fn expectDspark(comptime P: type, files: []const sdk.fixture.File, sampling: Sam
     });
     defer gen.deinit(a);
     try testing.expect(gen.dspark_enabled);
-    // The tapes' rounds were recorded under the logistic calibration prior.
-    if (gen.dspark_pol) |*pol| pol.calib.head = false;
+    // The tapes' rounds were recorded under the GLM-5.3-priced policy and its logistic calibration prior.
+    if (gen.dspark_pol) |*pol| {
+        pol.calib.head = false;
+        pol.p2 = null;
+    }
     // Each round as `[tokens..., accepted drafts, next token, position]`.
     var rec: [16]u32 = undefined;
     for (0..16) |_| {
