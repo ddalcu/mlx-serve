@@ -13,8 +13,8 @@ device T* o = out + size_t(i) * HD + p;
 if constexpr (TB == 4) {
   const uint2 cw = *(const device uint2*)(rc + p / 2);
   for (int k = 0; k < 8; ++k) {
-    o[k] = T((mlxserve_e2m1(cw.x >> (4 * k)) * 16384.0f) * e);
-    o[8 + k] = T((mlxserve_e2m1(cw.y >> (4 * k)) * 16384.0f) * e);
+    o[k] = T(mlxserve_fp4_e2m1_value(cw.x >> (4 * k)) * e);
+    o[8 + k] = T(mlxserve_fp4_e2m1_value(cw.y >> (4 * k)) * e);
   }
 } else {
   const uint4 cw = *(const device uint4*)(rc + p);

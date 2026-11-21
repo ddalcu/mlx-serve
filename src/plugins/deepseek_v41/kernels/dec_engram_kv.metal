@@ -39,8 +39,8 @@ for (int c = 0; c < K; c += CH) {
     if constexpr (TB == 4) {
       const uint2 cw = *(const device uint2*)(rc + p / 2);
       for (int i = 0; i < 8; ++i) {
-        v[i] = (mlxserve_e2m1(cw.x >> (4 * i)) * 16384.0f) * e;
-        v[8 + i] = (mlxserve_e2m1(cw.y >> (4 * i)) * 16384.0f) * e;
+        v[i] = mlxserve_fp4_e2m1_value(cw.x >> (4 * i)) * e;
+        v[8 + i] = mlxserve_fp4_e2m1_value(cw.y >> (4 * i)) * e;
       }
     } else {
       const uint4 cw = *(const device uint4*)(rc + p);
