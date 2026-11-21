@@ -166,9 +166,9 @@ serves either from the pack, with no flag.
 - A load that Metal's working-set limit refuses but RAM holds names `iogpu.wired_limit_mb` and logs the
   `sudo sysctl iogpu.wired_limit_mb=<N>` that admits it (`wiredLimitAdviceMb`: the load's bill plus the 8 GiB wired
   margin), never paging: the NVFP4 pack's ~400 GB needs it raised on a 512 GB Mac.
-- On NAX a resident pack's greedy DSpark text is plain decode's only with the fused fp4 decode on (the default): a
-  verify row's head, Engram wkv and greedy mask run as its plain step's (`exactPart`), and every verify, copy rounds
-  included, keeps to `dkern.max_rows` rows (`decodeWidthVerify`). Guards: `DSV41_EXACT_GATE`, `DSV41_VERIFY_EXACT`.
+- On NAX a resident pack's greedy DSpark text is plain decode's under `MLX_SERVE_DSV41_EXACT_VERIFY=1` with the fused
+  fp4 decode on: a verify row's head, Engram wkv and wo_a run as its plain step's, every verify keeps to `max_rows`.
+  Off (default) the multi-row kernels serve: the same math in another order. The greedy accept's mask is always on.
 - Past 0.95 x Metal's working set MLX's allocator evicts its buffer cache on every miss (two residency commits per
   allocation): DSpark at 8192 crosses it on a 256 GB Mac at the default `iogpu.wired_limit_mb`; raise it to bench.
 - DSpark on prose falls back to plain (acceptance 1.04/round): correct, prose runs ~54 tok/s.

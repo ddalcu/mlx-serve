@@ -731,7 +731,8 @@ fn head8From(v: ?[*:0]const u8) bool {
 /// plain decode's tokens bit for bit, whatever the round schedule; plain decode itself is untouched. Copy verifies are
 /// cut to the decode-width rows (`maxVerifyDrafts`). The parts below are all on when exact is; only the gate
 /// (`decode/exact_test.zig`, `DSV41_EXACT_GATE_BATCHED`) leaves some on the batched kernels, to measure each one.
-/// `engram`, `head` and `argmax` serve every decode-width verify, exact or not (`exactPart`); `tail` needs exact.
+/// `engram` and `head` also serve every decode-width verify under `MLX_SERVE_DSV41_EXACT_VERIFY` (`exactPart`);
+/// `argmax` serves every greedy accept; `tail` needs exact.
 pub const Exact = struct {
     on: bool = false,
     /// Each verify row's attention, attn_out and FFN as the plain step at its position runs them (`blockFusedRows`).
@@ -827,12 +828,18 @@ pub fn exactSolo(m: *const Dsv41Model) bool {
     return exactServes(m) and m.exact.solo;
 }
 
-/// Whether an armed verify of `rows` rows takes exact part `part` (`Exact`). The Engram projection and the head do off
-/// exact too: MLX's quantized_matmul takes other kernels at 2..16 rows than at one (qmv_wide, qmv_mma), so a verify
-/// row's logits would round apart from its plain step's and a greedy near-tie pick another token.
+/// Whether an armed verify of `rows` rows takes exact part `part` (`Exact`). The Engram projection and the head do
+/// under `MLX_SERVE_DSV41_EXACT_VERIFY` too: MLX's quantized_matmul takes other kernels at 2..16 rows than at one
+/// (qmv_wide, qmv_mma), the same math in another order.
 fn exactPart(m: *const Dsv41Model, verify: bool, rows: usize, comptime part: []const u8) bool {
     if (!verify or rows <= 1 or rows > dkern.max_rows or !@field(m.exact, part)) return false;
-    return exactServes(m) or !std.mem.eql(u8, part, "tail");
+    return exactServes(m) or (exactVerify() and !std.mem.eql(u8, part, "tail"));
+}
+
+/// `MLX_SERVE_DSV41_EXACT_VERIFY`: a verify row runs its plain step's kernels, so greedy DSpark text is plain decode's
+/// bytes. Read each call.
+pub fn exactVerify() bool {
+    return env.on(.MLX_SERVE_DSV41_EXACT_VERIFY);
 }
 
 /// The reason a held trunk layer's formats keep it off the fused decode kernels at verify width (q_kv, wq_b, the
@@ -7556,9 +7563,9 @@ pub fn maxVerifyDrafts(m: *const Dsv41Model) usize {
 }
 
 /// Whether `m`'s verifies keep to the decode-width kernels' rows, as a plain step's bits need: exact, or a resident
-/// bank, where a copy round's wider verify would run the prompt kernels and round its rows apart from plain decode's.
+/// bank under `MLX_SERVE_DSV41_EXACT_VERIFY`, where a copy round's wider verify would run the prompt kernels.
 fn decodeWidthVerify(m: *const Dsv41Model) bool {
-    return exactServes(m) or m.streamed == null;
+    return exactServes(m) or (m.streamed == null and exactVerify());
 }
 
 /// `drafts` cut to what a verify of `dkern.max_rows` rows (drafts and `t1`) carries, where `decode_width`.
@@ -7566,7 +7573,7 @@ fn verifyCap(drafts: usize, decode_width: bool) usize {
     return if (decode_width) @min(drafts, dkern.max_rows - 1) else drafts;
 }
 
-test "dsv41 verify drafts: a resident bank's verify, a copy round's too, stays within the decode-width rows" {
+test "dsv41 verify drafts: a decode-width verify, a copy round's too, stays within the decode-width rows" {
     try testing.expectEqual(dkern.max_rows - 1, verifyCap(VERIFY_MAX_DRAFTS, true));
     try testing.expectEqual(@as(usize, 3), verifyCap(3, true));
     try testing.expectEqual(VERIFY_MAX_DRAFTS, verifyCap(VERIFY_MAX_DRAFTS, false));
@@ -9840,6 +9847,8 @@ test "dsv41 verify exact: on a real pack, every verify row's logits are its plai
     // logits hash; DSV41_VERIFY_EXACT_NODSPARK the stages left unloaded, plain steps only (two runs' dumps compare).
     const dir = std.mem.span(std.c.getenv("DSV41_VERIFY_EXACT") orelse return error.SkipZigTest);
     const stages = std.c.getenv("DSV41_VERIFY_EXACT_NODSPARK") == null;
+    const xv = env.override(.MLX_SERVE_DSV41_EXACT_VERIFY, "1");
+    defer xv.restore();
     const ctx = if (std.c.getenv("DSV41_STEP_CTX")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 17639;
     const gpa = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();

@@ -9,6 +9,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 const kit = @import("../../deepseek_v4/contract_kit.zig");
@@ -51,12 +52,13 @@ const NSG = 8;
 const NR = 8;
 const NAX_NSG = 4;
 const NAX_NR = 32;
-/// Every row a launch serves stays on the vector kernel: the matrix units' tile sums a row in another order, so a
-/// verify block's rows would not carry the plain step's bytes (DSV41_EXACT_GATE). The NAX kernel keeps its contract.
-const nax_rows = decode.max_rows + 1;
+/// The matrix units serve from `nax_rows` rows on (below, the vector units' one pass over the weights is the cheaper).
+/// Under `MLX_SERVE_DSV41_EXACT_VERIFY` every row stays on the vector kernel: the matrix units' tile sums a row in
+/// another order, so a verify block's rows would not carry the plain step's bytes.
+const nax_rows = 4;
 
 fn useNax(rows: c_int) bool {
-    return rows >= nax_rows and device.naxAvailable();
+    return rows >= nax_rows and device.naxAvailable() and !dsv41.exactVerify();
 }
 
 /// One dispatch from the shapes: the grid, the threadgroup, the outputs and the template ints; null where the kernel
@@ -602,15 +604,20 @@ test "dsv41 dec wo_a: the declared launches are the wrapper's, byte for byte" {
     defer _ = mlx.mlx_fast_metal_kernel_free(kern);
     var sc = Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
-    // The wrapper serves the vector launch at every row count a verify block has (`useNax`).
-    for ([_]usize{ 3, decode.max_rows }) |rows| {
+    // The vector launch below `nax_rows`, the matrix units' from there on NAX, and under MLX_SERVE_DSV41_EXACT_VERIFY the
+    // vector launch at every row count a verify block has (`useNax`).
+    const Arm = struct { rows: usize, nax: bool, exact: bool };
+    for ([_]Arm{ .{ .rows = 3, .nax = false, .exact = false }, .{ .rows = decode.max_rows, .nax = true, .exact = false }, .{ .rows = decode.max_rows, .nax = false, .exact = true } }) |arm| {
+        if (arm.nax and !device.naxAvailable()) continue;
+        const sw = env.override(.MLX_SERVE_DSV41_EXACT_VERIFY, if (arm.exact) "1" else null);
+        defer sw.restore();
         const c = try a.create(kit.Case(WoA));
         defer {
             c.deinit();
             a.destroy(c);
         }
-        c.* = .init(a, &decl, .{ .nax = false });
-        try testing.expect(try c.prepare(.{ .rows = rows, .n = 128, .k = HPG * HD }, .random, 7));
+        c.* = .init(a, if (arm.nax) &decl_nax else &decl, .{ .nax = arm.nax });
+        try testing.expect(try c.prepare(.{ .rows = arm.rows, .n = 128, .k = HPG * HD }, .random, 7));
         try c.run();
         const mine = try a.dupe(u8, c.rig.outputBytes());
         defer a.free(mine);
@@ -732,8 +739,17 @@ test "dsv41 dec wo_a: ubench" {
     }
 }
 
-test "dsv41 wo_a: every row a launch serves, a verify block's included, takes the vector kernel a plain step takes" {
+test "dsv41 wo_a: under MLX_SERVE_DSV41_EXACT_VERIFY every row a verify serves takes the vector kernel a plain step takes" {
+    const sw = env.override(.MLX_SERVE_DSV41_EXACT_VERIFY, "1");
+    defer sw.restore();
     for (1..decode.max_rows + 1) |r| try testing.expect(!useNax(@intCast(r)));
+}
+
+test "dsv41 wo_a: without MLX_SERVE_DSV41_EXACT_VERIFY a NAX GPU's verify takes the matrix units from 4 rows" {
+    const sw = env.override(.MLX_SERVE_DSV41_EXACT_VERIFY, null);
+    defer sw.restore();
+    try testing.expect(!useNax(3));
+    try testing.expectEqual(device.naxAvailable(), useNax(4));
 }
 
 test "dsv41 dec wo_a: MLX's mxfp8 reads give the FOLD form's bytes on finite codes, vector and matrix units" {
