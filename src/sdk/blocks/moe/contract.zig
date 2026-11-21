@@ -17,11 +17,12 @@
 //! replace MLX's: gather_qmm row by row (`verify_expert_reuse`, N cut to 256 from 2560), the unsort-weight-sum (`verify_expert_reduce`, summing in bf16 as MLX does), the stable argsort
 //! (`verify_route_pack`, `prefill_route_scatter`); the prefill histogram and its scan are held exact.
 //! The NAX sorted gather (prefill; NAX GPUs only, no pre-NAX skip) replaces MLX's sorted gather_qmm bit for bit at
-//! one shape per plan, its mapped arm the row take first, its paired arm also MLX's SwiGLU; its tile scan is held
-//! exact. A mapped launch under 8 routed rows does not compile (MLX binds the row map in `constant`); the wrapper
+//! one shape per plan, its mapped arm the row take first, its paired arm also MLX's SwiGLU; its routed epilogue
+//! (deepseek_v41's moe_act, whose bits the plugin's tests prove) is held to float64 over MLX's gathers; its tile scan is
+//! held exact. A mapped launch under 8 routed rows does not compile (MLX binds the row map in `constant`); the wrapper
 //! takes 16 rows or more, so the registration's mapped rows are tokens of four routed rows.
 //! `ubench_stream_wide` (a read-ceiling probe, not served) is held exact as integers.
-//! Known issues: limit_drops_nan (moe_fp4's and the NAX pair's clamps).
+//! Known issues: limit_drops_nan (moe_fp4's and the NAX pair's clamps), routed_nan (the routed epilogue's clamp).
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -2161,7 +2162,7 @@ const hc_prefill = @import("../hc/hc_prefill.zig");
 const nax_header = gqn.NAX_HEADER;
 const nax_mapped_header = nax_header ++ ksrc("kernels/moe/gather_qmm_nax_mapped_header.metal");
 const nax_mm_in = [_][*:0]const u8{ "x", "w", "scales", "biases", "tiles", "tile_count", "params" };
-const nax_map_in = [_][*:0]const u8{ "x", "w", "scales", "biases", "up_w", "up_scales", "up_biases", "tiles", "tile_count", "params", "sigtab", "rmap", "gsc", "usc" };
+const nax_map_in = [_][*:0]const u8{ "x", "w", "scales", "biases", "up_w", "up_scales", "up_biases", "tiles", "tile_count", "params", "sigtab", "rmap", "gsc", "usc", "rw" };
 
 /// `Ws` at the largest plan: seg 128 x 128, one 64 x (128 + 8) bf16 tile and its 8 KiB pad.
 const nax_tg: u32 = 64 * 136 * 2 + 8192;
@@ -2319,6 +2320,11 @@ const GqmmNax = struct {
     /// The pair's per-expert scales (`gqn.ExpertScales`): bit 0 the gate's, bit 1 the up's, `[ne]` bf16 each.
     esc: u32 = 0,
     escv: [2][]f64 = .{ &.{}, &.{} },
+    /// The routed epilogue (`gqn.sortedGateUpRouted`, deepseek_v41's `moe_act`): clamped under `rlim`, times each routed
+    /// row's f32 weight `rwv`.
+    moe_act: bool = false,
+    rlim: f32 = 0,
+    rwv: []f64 = &.{},
     banks: [2]Bank,
     shape: Shape = undefined,
     m: usize = 0,
@@ -2328,7 +2334,7 @@ const GqmmNax = struct {
     table: []f64 = &.{},
     dv: []f64 = &.{},
     dm: []f64 = &.{},
-    args: [14]mlx.mlx_array = undefined,
+    args: [15]mlx.mlx_array = undefined,
     n_args: usize = 0,
 
     fn init(a: std.mem.Allocator, kind: NaxKind, f: Fmt, b: u32, g: usize, ne: usize) GqmmNax {
@@ -2340,7 +2346,7 @@ const GqmmNax = struct {
         const a = self.rig.a;
         self.rig.deinit();
         for (&self.banks) |*b| b.deinit(a);
-        for ([_][]f64{ self.x, self.rmap, self.ids, self.table, self.dv, self.dm, self.escv[0], self.escv[1] }) |s| a.free(s);
+        for ([_][]f64{ self.x, self.rmap, self.ids, self.table, self.dv, self.dm, self.escv[0], self.escv[1], self.rwv }) |s| a.free(s);
     }
 
     fn mx(self: *const GqmmNax) bool {
@@ -2382,7 +2388,7 @@ const GqmmNax = struct {
         g.int("BK", p.bk);
         g.int("GX", p.gx);
         g.int("PAD", p.pad);
-        if (self.kind != .mm) g.int("EPI", if (self.kind == .paired) 1 + self.limit else 0);
+        if (self.kind != .mm) g.int("EPI", if (self.moe_act) -1 else if (self.kind == .paired) 1 + self.limit else 0);
         if (self.kind != .mm) g.int("ESC", @as(c_int, @intCast(self.esc)));
         return g;
     }
@@ -2392,7 +2398,7 @@ const GqmmNax = struct {
         if (self.geometry(shape) == null) return false;
         const a = self.rig.a;
         self.shape = shape;
-        for ([_]*[]f64{ &self.x, &self.rmap, &self.ids, &self.dv, &self.dm, &self.escv[0], &self.escv[1] }) |p| {
+        for ([_]*[]f64{ &self.x, &self.rmap, &self.ids, &self.dv, &self.dm, &self.escv[0], &self.escv[1], &self.rwv }) |p| {
             a.free(p.*);
             p.* = &.{};
         }
@@ -2415,6 +2421,10 @@ const GqmmNax = struct {
             v.* = try a.alloc(f64, self.ne);
             host.uniformInto(rng, v.*, 0.25, 4.0, .bfloat16);
         };
+        if (self.moe_act) {
+            self.rwv = try a.alloc(f64, self.m);
+            host.uniformInto(rng, self.rwv, 0.05, 1.05, .float32);
+        }
         try self.bind();
         return true;
     }
@@ -2446,7 +2456,10 @@ const GqmmNax = struct {
             v[2] = try rig.input(.bfloat16, &.{16}, &zeros);
         };
         const width: f64 = @floatFromInt(if (self.kind == .paired) 2 * shape.n else shape.n);
-        const params = try rig.input(.int32, &.{3}, &.{ width, @floatFromInt(shape.k), 0 });
+        // The mapped launches' fourth word: the routed epilogue's limit as f32 bits.
+        const pv = [4]f64{ width, @floatFromInt(shape.k), 0, @floatFromInt(@as(i32, @bitCast(self.rlim))) };
+        const np: usize = if (self.kind == .mm) 3 else 4;
+        const params = try rig.input(.int32, &.{@intCast(np)}, pv[0..np]);
         if (self.kind == .mm) {
             self.args[0..7].* = .{ x, b[0][0], b[0][1], b[0][2], t, count_, params };
             self.n_args = 7;
@@ -2458,8 +2471,11 @@ const GqmmNax = struct {
         for (&sc, self.escv) |*o, v| if (v.len > 0) {
             o.* = try rig.input(.bfloat16, &.{@intCast(self.ne)}, v);
         };
-        self.args = .{ x, b[0][0], b[0][1], b[0][2], b[1][0], b[1][1], b[1][2], t, count_, params, sig, try rig.input(.uint32, &.{rows}, self.rmap), sc[0], sc[1] };
-        self.n_args = 14;
+        // Without the routed epilogue its weights' slot binds 16 f32 zeros, as the wrapper's does.
+        const zeros32: [16]f64 = @splat(0);
+        const rw = if (self.moe_act) try rig.input(.float32, &.{rows}, self.rwv) else try rig.input(.float32, &.{16}, &zeros32);
+        self.args = .{ x, b[0][0], b[0][1], b[0][2], b[1][0], b[1][1], b[1][2], t, count_, params, sig, try rig.input(.uint32, &.{rows}, self.rmap), sc[0], sc[1], rw };
+        self.n_args = 15;
     }
 
     pub fn run(self: *GqmmNax) !void {
@@ -2508,6 +2524,19 @@ const GqmmNax = struct {
             const e: usize = @intFromFloat(self.ids[i / self.shape.n]);
             if (self.escv[0].len > 0) g = host.rt(.bfloat16, g * self.escv[0][e]);
             if (self.escv[1].len > 0) u = host.rt(.bfloat16, u * self.escv[1][e]);
+            if (self.moe_act) {
+                // moe_act: the clamp under the limit, the SwiGLU and the routing weight, unrounded; past ln(FLT_MAX)
+                // its f32 exp is infinite, so a gate under about -88.7 gets a weight of 0.
+                const rl: f64 = self.rlim;
+                if (rl > 0) {
+                    g = clampNaN(g, -std.math.inf(f64), rl);
+                    u = clampNaN(u, -rl, rl);
+                }
+                const ex = @exp(@abs(g));
+                const sg: f64 = if (ex > @as(f64, std.math.floatMax(f32))) 0 else 1 / (1 + ex);
+                y.* = g * (if (g < 0) sg else 1 - sg) * u * self.rwv[i / self.shape.n];
+                continue;
+            }
             if (self.limit > 0) {
                 g = clampNaN(g, -std.math.inf(f64), lim);
                 u = clampNaN(u, -lim, lim);
@@ -2518,8 +2547,32 @@ const GqmmNax = struct {
 
     pub fn reference(self: *GqmmNax, want: []f64, mag: []f64) !void {
         try self.dots();
+        if (self.moe_act) {
+            const dv = try self.products();
+            defer self.rig.a.free(dv);
+            self.epilogue(dv, want);
+            return @memset(mag, 0);
+        }
         self.epilogue(self.dv, want);
         if (self.kind == .paired) @memset(mag, 0) else @memcpy(mag, self.dm);
+    }
+
+    /// The routed epilogue's inputs as the kernel holds them: MLX's gate and up gathers of the mapped rows (the NAX
+    /// gathers' bits), so the bound prices its f32 epilogue alone.
+    fn products(self: *GqmmNax) ![]f64 {
+        const s = self.rig.stream();
+        var g = ops.Graph.init(self.rig.a, s);
+        defer g.deinit();
+        const x = try g.take(self.args[0], self.args[11], 0);
+        const cnt = self.count();
+        const out = try self.rig.a.alloc(f64, 2 * cnt);
+        errdefer self.rig.a.free(out);
+        for (0..2) |bi| {
+            const v = try host.read(self.rig.a, try self.gatherQmm(&g, x, bi), s);
+            defer self.rig.a.free(v);
+            @memcpy(out[bi * cnt ..][0..cnt], v);
+        }
+        return out;
     }
 
     pub fn simulate(self: *GqmmNax, acc: spec.Accum, order: spec.Order, out: []f64) !void {
@@ -2586,7 +2639,17 @@ const GqmmNax = struct {
         const y = switch (self.kind) {
             .mm => try gqn.sortedGather(x[0], x[1], x[2], bias, ids, bits, group, self.mx(), true, s),
             .mapped => try gqn.sortedGatherMapped(x[0], x[11], x[1], x[2], bias, ids, bits, group, self.mx(), true, s),
-            .paired => try gqn.sortedGateUpScaled(x[0], x[11], x[1], x[2], bias, x[4], x[5], if (self.mx()) none else x[6], ids, x[10], self.limit, .{
+            .paired => if (self.moe_act) blk: {
+                // The routed wrapper reads one bank of each expert's gate rows, then its up rows.
+                var g = ops.Graph.init(self.rig.a, s);
+                defer g.deinit();
+                const w = try g.concat(&.{ x[1], x[4] }, 1);
+                const sc = try g.concat(&.{ x[2], x[5] }, 1);
+                break :blk try gqn.sortedGateUpRouted(x[0], x[11], w, sc, none, ids, x[14], self.rlim, .{
+                    .gate = if (self.escv[0].len > 0) x[12] else null,
+                    .up = if (self.escv[1].len > 0) x[13] else null,
+                }, bits, group, self.mx(), true, s);
+            } else try gqn.sortedGateUpScaled(x[0], x[11], x[1], x[2], bias, x[4], x[5], if (self.mx()) none else x[6], ids, x[10], self.limit, .{
                 .gate = if (self.escv[0].len > 0) x[12] else null,
                 .up = if (self.escv[1].len > 0) x[13] else null,
             }, bits, group, self.mx(), true, s),
@@ -2640,7 +2703,18 @@ fn registerNax(set: *kc.Set) !void {
     both.esc = 3;
     both.limit = 7;
     try set.add(GqmmNax, both, .{ .name = "gather_qmm_nax paired bf16 (NVFP4, gate and up scales, limit 7)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = "take (the row map) -> " ++ gather ++ " for gate and up -> take (the scales) -> multiply -> clampedSwiGLU", .served = paired[0..1] }, null);
+    // deepseek_v41's routed epilogue at its limit, both fp4 formats (NVFP4 with both scales): moe_act's f32 statements
+    // (the plugin's kernel, so no op chain here gives its bits), held to float64 over MLX's gathers of the same rows.
+    for ([_]Fmt{ .mxfp4, .nvfp4 }) |f| {
+        var r = GqmmNax.init(a, .paired, f, 4, if (f == .nvfp4) 16 else 32, 32);
+        r.moe_act = true;
+        r.rlim = 10;
+        if (f == .nvfp4) r.esc = 3;
+        try set.add(GqmmNax, r, .{ .name = if (f == .nvfp4) "gather_qmm_nax paired bf16 (NVFP4, gate and up scales, routed moe_act, limit 10)" else "gather_qmm_nax paired bf16 (MXFP4, routed moe_act, limit 10)", .accum = .f32, .depth = gqDepth, .ops = 12, .out = .bf16, .served = paired[0..1], .known = routed_nan }, null);
+    }
 }
+
+const routed_nan: spec.Known = .{ .gate = .nonfinite, .finding = "moe_act's clamp (metal::min / clamp) returns the limit for a NaN gate or up, where float64 keeps the NaN, as in the deepseek_v41 moe_act kernel it replaces" };
 
 // ── the stream-read microbenchmark ──
 
@@ -3072,7 +3146,7 @@ test "kernel contract moe: each verify launch is its wrapper's bytes, the prefil
 test "kernel contract moe: the NAX scan chained into each NAX gather launch is the wrapper's bytes" {
     if (mlx.noGpuBackend() or !device_mod.naxAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
-    const Case = struct { kind: NaxKind, f: Fmt = .affine, bits: u32 = 4, gs: usize = 64, shape: Shape };
+    const Case = struct { kind: NaxKind, f: Fmt = .affine, bits: u32 = 4, gs: usize = 64, moe_act: bool = false, shape: Shape };
     const cases = [_]Case{
         .{ .kind = .mm, .shape = .{ .rows = 1024, .n = 128, .k = 256 } },
         .{ .kind = .mm, .shape = .{ .rows = 2048, .n = 96, .k = 256 } },
@@ -3080,10 +3154,16 @@ test "kernel contract moe: the NAX scan chained into each NAX gather launch is t
         .{ .kind = .mapped, .shape = .{ .rows = 1024, .n = 128, .k = 512 } },
         .{ .kind = .paired, .shape = .{ .rows = 960, .n = 128, .k = 512 } },
         .{ .kind = .paired, .f = .mxfp4, .gs = 32, .shape = .{ .rows = 1024, .n = 128, .k = 1024 } },
+        .{ .kind = .paired, .f = .nvfp4, .gs = 16, .moe_act = true, .shape = .{ .rows = 512, .n = 128, .k = 512 } },
     };
     for (cases) |c| {
         var t = GqmmNax.init(a, c.kind, c.f, c.bits, c.gs, 32);
         defer t.deinit();
+        if (c.moe_act) {
+            t.moe_act = true;
+            t.rlim = 10;
+            t.esc = 3;
+        }
         try std.testing.expect(try t.prepare(c.shape, .random, 7));
         const scan = NaxScan.init(a, 32);
         const bm: usize = @intCast(t.planAt(c.shape).bm);

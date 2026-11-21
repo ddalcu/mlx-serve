@@ -13,7 +13,7 @@ pub const NAX_HEADER = fp4.SCALE_HEADER ++ kernelSource("kernels/moe/gather_qmm_
 pub const Plan = struct { sched: enum { seg, db }, bm: c_int, bk: c_int, gx: c_int, pad: c_int };
 /// `mx`: an FP4 bank (uint8 scales, no biases: e8m0 per 32 for MXFP4, e4m3 per 16 for NVFP4) instead of affine.
 const CanaryKey = struct { plan: Plan, bits: u32, group: u32, align_n: bool, align_k: bool, mx: bool };
-const MmKey = struct { rows: c_int, n: c_int, k: c_int, max_tiles: c_int, plan: Plan, bits: u32, group: u32, mx: bool, mapped: bool = false, paired: bool = false, limit: u32 = 0, esc: u32 = 0 };
+const MmKey = struct { rows: c_int, n: c_int, k: c_int, max_tiles: c_int, plan: Plan, bits: u32, group: u32, mx: bool, mapped: bool = false, paired: bool = false, limit: u32 = 0, esc: u32 = 0, routed: bool = false };
 var scan_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mm_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mapped_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -98,7 +98,7 @@ fn kernel(scan: bool) !mlx.mlx_fast_metal_kernel {
 fn mapKernel(paired: bool) !mlx.mlx_fast_metal_kernel {
     const slot = if (paired) &paired_kernel else &mapped_kernel;
     if (slot.*) |v| return v;
-    const names = [_][*:0]const u8{ "x", "w", "scales", "biases", "up_w", "up_scales", "up_biases", "tiles", "tile_count", "params", "sigtab", "rmap", "gsc", "usc" };
+    const names = [_][*:0]const u8{ "x", "w", "scales", "biases", "up_w", "up_scales", "up_biases", "tiles", "tile_count", "params", "sigtab", "rmap", "gsc", "usc", "rw" };
     const outs = [_][*:0]const u8{"y"};
     const ins_vec = mlx.mlx_vector_string_new_data(&names, names.len);
     defer _ = mlx.mlx_vector_string_free(ins_vec);
@@ -172,15 +172,16 @@ fn mmConfig(key: MmKey) !mlx.mlx_fast_metal_kernel_config {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BK", key.plan.bk));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GX", key.plan.gx));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "PAD", key.plan.pad));
-    if (key.mapped) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "EPI", if (key.paired) 1 + @as(c_int, @intCast(key.limit)) else 0));
+    if (key.mapped) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "EPI", if (key.routed) -1 else if (key.paired) 1 + @as(c_int, @intCast(key.limit)) else 0));
     if (key.mapped) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ESC", @intCast(key.esc)));
     return cfg;
 }
 
 /// `limit`: a `swiglu_limit` the epilogue clamps at (whole numbers; 0 = none). `up_off`: the up rows' offset in an
 /// expert of a bank fused along its rows (gate rows, then up rows; `w` is then the gate's bank too), else 0.
-/// `scales`: the per-expert gate / up scales the epilogue applies (`ExpertScales`).
-const Pair = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, sigtab: mlx.mlx_array, limit: u32 = 0, up_off: c_int = 0, scales: ExpertScales = .{} };
+/// `scales`: the per-expert gate / up scales the epilogue applies (`ExpertScales`). `route`: the f32 routing weight of
+/// each row, which selects the routed epilogue (`sortedGateUpRouted`, clamped under `route_limit`); `limit` is then unread.
+const Pair = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, sigtab: mlx.mlx_array, limit: u32 = 0, up_off: c_int = 0, scales: ExpertScales = .{}, route: ?mlx.mlx_array = null, route_limit: f32 = 0 };
 
 /// Per-expert scales `[E]` in x's dtype (ModelOpt NVFP4's global `weight_scale_2`) on the paired kernel's two products:
 /// `gate` multiplies the gate before the SiLU (and before a clamp), `up` the up before a clamp, each product rounded
@@ -212,6 +213,14 @@ fn biasArg(bi: mlx.mlx_array) mlx.mlx_array {
     return no_bias;
 }
 
+/// The routing weights' slot without the routed epilogue: 16 f32 zeros (the slot stays a `device float*`).
+var no_route: mlx.mlx_array = .{ .ctx = null };
+fn routeArg(rw: ?mlx.mlx_array) mlx.mlx_array {
+    if (rw) |v| return v;
+    if (no_route.ctx == null) no_route = mlx.mlx_array_new_data(&@as([16]f32, @splat(0)), &[_]c_int{16}, 1, .float32);
+    return no_route;
+}
+
 fn launchMapped(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, pair: ?Pair, bits: u32, group: u32, mx: bool, p: Plan, s: mlx.mlx_stream) !mlx.mlx_array {
     const xs = mlx.getShape(x);
     const ws = mlx.getShape(w);
@@ -222,7 +231,9 @@ fn launchMapped(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: 
     const k = xs[2];
     const t = try scanTiles(idx, m, e, p.bm, s);
     defer t.deinit();
-    const params = mlx.mlx_array_new_data(&[_]c_int{ if (pair != null) n * 2 else n, k, up_off }, &[_]c_int{3}, 1, .int32);
+    const route: ?mlx.mlx_array = if (pair) |v| v.route else null;
+    const lim: f32 = if (pair) |v| v.route_limit else 0;
+    const params = mlx.mlx_array_new_data(&[_]c_int{ if (pair != null) n * 2 else n, k, up_off, @bitCast(lim) }, &[_]c_int{4}, 1, .int32);
     defer _ = mlx.mlx_array_free(params);
     const pw = if (pair) |v| v.w else w;
     const ps = if (pair) |v| v.sc else sc;
@@ -230,8 +241,8 @@ fn launchMapped(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: 
     const sigtab = if (pair) |v| v.sigtab else biasArg(.{ .ctx = null }); // unread without a pair
     const esc: ExpertScales = if (pair) |v| v.scales else .{};
     // An absent scale binds the sigmoid table (a bf16 array past `constant`'s size); ESC keeps it unread.
-    const inputs = [_]mlx.mlx_array{ x, w, sc, biasArg(bi), pw, ps, biasArg(pb), t.tiles, t.count, params, sigtab, row_map, esc.gate orelse sigtab, esc.up orelse sigtab };
-    const cfg = try mmConfig(.{ .rows = m, .n = n, .k = k, .max_tiles = t.max_tiles, .plan = p, .bits = bits, .group = group, .mx = mx, .mapped = true, .paired = pair != null, .limit = if (pair) |v| v.limit else 0, .esc = esc.bits() });
+    const inputs = [_]mlx.mlx_array{ x, w, sc, biasArg(bi), pw, ps, biasArg(pb), t.tiles, t.count, params, sigtab, row_map, esc.gate orelse sigtab, esc.up orelse sigtab, routeArg(route) };
+    const cfg = try mmConfig(.{ .rows = m, .n = n, .k = k, .max_tiles = t.max_tiles, .plan = p, .bits = bits, .group = group, .mx = mx, .mapped = true, .paired = pair != null, .limit = if (pair) |v| v.limit else 0, .esc = esc.bits(), .routed = route != null });
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     return applyOne(try mapKernel(pair != null), &inputs, cfg, s);
 }
@@ -617,6 +628,32 @@ pub fn sortedGateUpFused(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_ar
     if (!paired_engaged_logged) {
         paired_engaged_logged = true;
         log.info("[gather-nax] paired SwiGLU engaged (fused bank): M={d} E={d} N={d} K={d}\n", .{ mlx.getShape(idx)[0], ws[0], n, xs[2] });
+    }
+    return out;
+}
+
+var routed_engaged_logged = false;
+
+/// `sortedGateUpFused` with deepseek_v41's `moe_act` in the epilogue: each rounded product times its expert's scale
+/// (`scales`, rounded again), then in f32 the SwiGLU clamped under `limit` (none at 0 or below) times the row's
+/// routing weight (`route`, `[M]` f32), rounded once: `[M, 1, n]`, the bytes of the gather, the scale multiplies and
+/// `moe_act` it replaces.
+pub fn sortedGateUpRouted(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, route: mlx.mlx_array, limit: f32, scales: ExpertScales, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!nax_available or !mlx.streamIsGpu(s)) return null;
+    if (!supported(x, w, sc, bi, idx, bits, group, mx, row_map, true)) return null;
+    const ws = mlx.getShape(w);
+    const xs = mlx.getShape(x);
+    const m = mlx.getShape(idx)[0];
+    if (@rem(ws[1], 64) != 0 or !scales.fits(ws[0], mlx.mlx_array_dtype(x))) return null;
+    if (route.ctx == null or mlx.mlx_array_dtype(route) != .float32 or mlx.mlx_array_ndim(route) != 1 or mlx.getShape(route)[0] != m) return null;
+    const n = @divExact(ws[1], 2);
+    const p = plan(m, ws[0], xs[2], n, true);
+    const key: CanaryKey = .{ .plan = p, .bits = bits, .group = group, .align_n = @rem(n, 64) == 0, .align_k = @rem(xs[2], p.bk) == 0, .mx = mx };
+    if (!armed(key, s) or !armedMapped(key, false, s) or !armedMapped(key, true, s)) return null;
+    const out = try launchMapped(x, row_map, w, sc, bi, idx, .{ .w = w, .sc = sc, .bi = bi, .sigtab = biasArg(.{ .ctx = null }), .up_off = n, .scales = scales, .route = route, .route_limit = limit }, bits, group, mx, p, s);
+    if (!routed_engaged_logged) {
+        routed_engaged_logged = true;
+        log.info("[gather-nax] paired SwiGLU engaged with routing weights (gate scale={} up scale={} limit={d}): M={d} E={d} N={d} K={d} {s}\n", .{ scales.gate != null, scales.up != null, limit, m, ws[0], n, xs[2], modeName(mx, group) });
     }
     return out;
 }
