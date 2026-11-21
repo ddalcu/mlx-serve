@@ -160,9 +160,12 @@ pub fn recordSlotCleanup(metrics: ?*metrics_mod.Metrics, slot: anytype) void {
 /// `generation_tokens_total`: a gauge sample taken before the tick-exit store would count them twice.
 /// Saturating, since `completion_tokens` can be ahead of the aggregate by this tick's tokens.
 fn recordSlotFinish(metrics: ?*metrics_mod.Metrics, inflight: *std.atomic.Value(u64), slot: anytype, outcome: metrics_mod.Outcome) void {
-    if (metrics == null or slot.metrics_recorded) return;
-    inflight.store(inflight.load(.monotonic) -| slot.completion_tokens, .monotonic);
-    recordSlotEnd(metrics, slot, outcome);
+    const m = metrics orelse return;
+    if (slot.metrics_recorded) return;
+    m.beginTokenMove();
+    defer m.endTokenMove();
+    inflight.store(inflight.load(.monotonic) -| slot.completion_tokens, .seq_cst);
+    recordSlotEnd(m, slot, outcome);
 }
 
 pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
@@ -389,7 +392,7 @@ test "a finish moves its tokens from the in-flight aggregate to the counter, so 
     var inflight = std.atomic.Value(u64).init(15);
     var s = OutcomeStub{};
     recordSlotFinish(&m, &inflight, &s, .success);
-    try testing.expectEqual(@as(u64, 15), metrics_mod.liveGenerationTokens(&m, inflight.load(.monotonic)));
+    try testing.expectEqual(@as(u64, 15), metrics_mod.liveGenerationTokens(&m, .{&inflight}));
 
     var ahead = OutcomeStub{};
     ahead.completion_tokens = 7;
