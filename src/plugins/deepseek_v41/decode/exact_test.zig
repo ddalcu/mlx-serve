@@ -32,7 +32,7 @@ const ranges = [_]Range{
     // 17640: the coding prompt's first decode step, every layer's index picks a few of its compressed rows.
     .{ .lo = 20, .hi = 25, .p0s = &.{ 60, 187, 190, 260, 286, 348, 509, 700, 16382, 17640 } },
     // Ratio 2 (a KV source pooling pairs): S 1 -> 2 at p 383, 2 -> 3 at 703, saturation at 1023; pairs straddle.
-    .{ .lo = 2, .hi = 4, .p0s = &.{ 61, 380, 382, 701, 1021, 1100 } },
+    .{ .lo = 2, .hi = 4, .p0s = &.{ 61, 380, 382, 701, 1021, 1100, 17640 } },
     // Ratio 0: the window alone, filling at 128.
     .{ .lo = 0, .hi = 1, .p0s = &.{ 60, 126 } },
 };
