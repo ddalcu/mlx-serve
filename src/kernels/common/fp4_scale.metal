@@ -39,6 +39,13 @@ inline float mlxserve_e2m1(uint c) {
   return float(as_type<half>(ushort(((c & 0x7u) << 9) | ((c & 0x8u) << 12))));
 }
 
+// Nibbles j and j+4 of `w` as their e2m1 values times 2^-14: one shift puts them in a half2's two halves, then the
+// same bit placement as `mlxserve_e2m1` serves both lanes.
+inline float2 mlxserve_e2m1x2(uint w, int j) {
+  const uint v = w >> (4 * j);
+  return float2(as_type<half2>(((v & 0x70007u) << 9) | ((v & 0x80008u) << 12)));
+}
+
 // Two e4m3 bytes (bits 0-7 and 16-23) as MLX reads them, each times 2^-8, as a half2: the same bit placement,
 // 0x7f / 0xff a NaN. Every e4m3 pair decode (mxfp8, fp8 block-128, the Sushi GEMV) reads through it.
 inline half2 mlxserve_e4m3x2_h(uint w) {

@@ -23,11 +23,8 @@ pub const MAX_ROWS: c_int = 2;
 /// decode). With the e2m1 2^-14, one 2^22 multiply restores both.
 pub const SCALE = fp4.SCALE_HEADER;
 
-/// Nibbles j and j+4 of a word decode together: one shift puts them in the two halves of a
-/// half2, then the e2m1 bit placement serves both lanes.
-pub const E2M1X2_HEADER = kernelSource("kernels/moe/moe_fp4_e2m1x2_header.metal");
-
-pub const DOT16 = E2M1X2_HEADER ++ kernelSource("kernels/moe/moe_fp4_dot16.metal");
+/// The 16-value dot (`mlxserve_e2m1x2` from `SCALE`).
+pub const DOT16 = kernelSource("kernels/moe/moe_fp4_dot16.metal");
 
 /// Both kernels' header, both formats: the format is the GS template argument.
 pub const HEADER = SCALE ++ DOT16;
