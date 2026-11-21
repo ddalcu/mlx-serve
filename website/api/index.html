@@ -231,14 +231,27 @@ claude   <span class="c"># Claude Code now talks to your Mac</span></pre></div>
     <p>Accepted fields: <code>model</code>, <code>prompt</code>, <code>image</code> / <code>image[]</code> (up to 4), <code>size</code>. Anything we can't honor is a named <code>400</code> rather than a silent no-op: <code>mask</code> (the editors are maskless), <code>n</code> &gt; 1, <code>response_format: "url"</code>, an <code>output_format</code> other than <code>png</code>, and <code>stream</code>.</p>
 
     <h3><span class="method m-post">POST</span><code>/v1/audio/speech</code></h3>
-    <p>Qwen3-TTS (voice cloning) or Kokoro-82M (54 built-in voices), whichever is loaded (<a href="../voice-cloning/">deep dive</a>). Returns WAV bytes. The two backends share the endpoint but not the controls, and asking one for the other's control is a named <code>400</code> rather than a quietly plain-voiced answer.</p>
+    <p>Qwen3-TTS, Kokoro-82M, Breeze-TTS-2 or Ming-3.0-tts, selected by the loaded model (<a href="../voice-cloning/">deep dive</a>). Returns WAV bytes. These backends share the endpoint, not one interchangeable set of voice and cloning controls.</p>
     <table class="ep-table">
       <tr><th>Field</th><th>Meaning</th></tr>
       <tr><td><code>input</code></td><td>The text to speak. Required (<code>text</code> also accepted).</td></tr>
-      <tr><td><code>ref_audio</code></td><td>Qwen3-TTS only. Base64 WAV (24 kHz mono) — a few seconds of any voice clones it zero-shot, no transcript needed. <code>{"warm_only": true}</code> with a <code>ref_audio</code> caches the speaker embedding without synthesizing, so the first sentence of a session isn't cold.</td></tr>
-      <tr><td><code>voice</code></td><td>Kokoro only. One of the 54 packs (default <code>af_heart</code>); a comma-separated list blends them, e.g. <code>"af_bella,af_sky"</code>. An unknown name is a <code>400</code>.</td></tr>
-      <tr><td><code>speed</code> / <code>seed</code></td><td>Kokoro only. Speaking rate in (0, 5], default 1.0; seed for reproducibility.</td></tr>
+      <tr><td><code>model</code></td><td>Model id from <code>GET /v1/models</code>; omit when the intended speech model is already the default.</td></tr>
+      <tr><td><code>ref_audio</code> / <code>ref_text</code></td><td>Base64 reference WAV. Qwen3-TTS Base uses a speaker embedding without reading a transcript; its <code>warm_only</code> request validates/warms the reference without speech. Breeze requires a matching non-empty <code>ref_text</code> and a pre-normalized 24 kHz mono PCM reference. Ming also accepts a transcript; see its <a href="https://github.com/ddalcu/mlx-serve/blob/main/docs/api.md#ming-30-tts-speech">backend controls</a>. Kokoro does not clone.</td></tr>
+      <tr><td><code>voice</code></td><td>Backend-specific: Kokoro's 54 names (default <code>af_heart</code>), blendable with commas; Breeze's optional <code>S0</code> through <code>S9</code> speaker slots; Qwen3-TTS CustomVoice's pack-defined names; or Ming's built-in voices. Names are not interchangeable.</td></tr>
+      <tr><td><code>instruction</code> / <code>instructions</code></td><td>Breeze voice/delivery description (either spelling; singular wins). Qwen3-TTS uses <code>instructions</code> on VoiceDesign and supported CustomVoice packs; Ming uses <code>instruction</code>. These are not Kokoro controls.</td></tr>
+      <tr><td><code>seed</code></td><td>Reproducibility control, with backend-specific behavior. Breeze uses a request-local non-negative integer seed, default <code>42</code>.</td></tr>
+      <tr><td><code>speed</code></td><td>Kokoro speaking rate in (0, 5], default 1.0. Breeze accepts this common key for compatibility but it does not adjust the generated rate.</td></tr>
+      <tr><td><code>stream</code></td><td><code>true</code> returns SSE progress followed by a <code>complete</code> event with <code>format: "wav"</code> and base64 <code>data</code>, not incremental audio chunks.</td></tr>
     </table>
+
+    <h4 id="breeze-tts-2">Breeze-TTS-2</h4>
+    <p>Use the complete dense bf16 <a href="https://huggingface.co/mlx-community/Breeze-TTS-2-mlx"><code>mlx-community/Breeze-TTS-2-mlx</code></a> pack (<code>model_type: breeze_tts</code>), including its <code>audio_tokenizer/</code> directory. Output is 24 kHz mono, 16-bit PCM WAV. The weights are <b>research/non-commercial</b>, not MIT; read the <a href="https://huggingface.co/BreezeBlue/Breeze-TTS-2#license-and-responsible-use">model's terms</a>. This is server support, not a Breeze-specific app or Voice Mode integration.</p>
+    <div class="code-doc"><pre>curl --fail-with-body http://localhost:11234/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"Clear skies today.","voice":"S2","instruction":"A calm, warm voice.","seed":7}' \
+  --output breeze.wav</pre></div>
+    <p>This assumes Breeze is the default model; otherwise add its registry <code>model</code> id. For cloning, send standard base64 WAV in <code>ref_audio</code>, the recording's exact transcript in <code>ref_text</code>, and the new text in <code>input</code>. Prepare the recording as 24 kHz mono PCM WAV before sending it. No <code>warm_only</code> mode exists on Breeze.</p>
+    <p><code>max_frames</code> is an optional non-negative integer cap <b>per text segment</b>, not a whole-request duration. At 12.5 frames/s, 125 frames is at most 10 seconds per segment; EOS and text/context limits can stop earlier. Long text is segmented and joined into one WAV. Unknown fields such as <code>language</code>, <code>temperature</code> and <code>max_tokens</code> are refused by name; language is inferred. <code>response_format</code> does not enable non-WAV formats on Breeze. <a href="https://github.com/ddalcu/mlx-serve/blob/main/docs/breeze-tts.md">Full setup, cloning examples, field reference and troubleshooting</a>.</p>
 
     <h3><span class="method m-post">POST</span><code>/v1/audio/music-generations</code></h3>
     <p>Text-to-music, WAV out (<a href="../music-generation/">deep dive</a>): <b>ACE-Step</b> (48 kHz stereo, fast) or <b>MiniMax Music 3</b> (sings full songs at 44.1 kHz, up to six minutes). On Music 3, <code>lyrics</code> is required and the musical-steering fields below don't exist; put tempo and key in the caption.</p>
