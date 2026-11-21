@@ -13,9 +13,10 @@ pub const Costs = policy.Costs;
 pub const Choice = policy.Choice;
 
 /// A DeepSeek-V4.1 round's wall ms by verify rows on an M5 Ultra, in plain steps: `BASE` for a drafted one-row round
-/// (the draft forward and the trunk row), `ROW` for each further row.
-const BASE: f32 = 1.27;
-const ROW: f32 = 0.262;
+/// (the draft forward and the trunk row), `ROW` for each further row; the line through adaptive requests' round ms
+/// against their mean verify rows.
+const BASE: f32 = 1.379;
+const ROW: f32 = 0.225;
 
 fn priorMs(plain_ms: f32, rows: usize) f32 {
     return plain_ms * (BASE + ROW * @as(f32, @floatFromInt(rows -| 1)));
@@ -258,10 +259,10 @@ fn logit(p: f32) f32 {
 test "policy2 RoundCost: the prior is DeepSeek-V4.1's ladder, the measured rounds take over, unvisited widths follow" {
     var c = RoundCost{};
     const prior = c.costs(17.7);
-    try testing.expectApproxEqAbs(@as(f32, 22.48), prior[1], 0.05);
-    try testing.expectApproxEqAbs(@as(f32, 45.67), prior[6], 0.1);
-    // Its second row costs 1.21x a drafted one-row round (GLM-5.3's prior: 1.44x the trunk row).
-    try testing.expect(prior[2] / prior[1] < 1.25);
+    try testing.expectApproxEqAbs(@as(f32, 24.41), prior[1], 0.05);
+    try testing.expectApproxEqAbs(@as(f32, 44.32), prior[6], 0.1);
+    // Its second row costs 1.16x a drafted one-row round (GLM-5.3's prior: 1.44x the trunk row).
+    try testing.expect(prior[2] / prior[1] < 1.2);
     for (2..MAX_ROWS + 1) |r| try testing.expect(prior[r] >= prior[r - 1]);
     // A machine 20% slower at rows 3 and 4 only: those widths reach it, the others move with the shared scale.
     for (0..300) |_| {
@@ -280,11 +281,11 @@ test "policy2 RoundCost: the prior is DeepSeek-V4.1's ladder, the measured round
 test "policy2 chooseRows: a draft is worth its row when its acceptance beats the request's rate times the row's ms" {
     const costs = (RoundCost{}).costs(17.7);
     const rate: f32 = 0.081; // tokens per ms: 81 tok/s
-    const step = costs[2] - costs[1]; // ~4.6 ms
-    // The bar is rate * step, ~0.38: a 0.45 first draft pays, a 0.30 one does not.
+    const step = costs[2] - costs[1]; // ~4.0 ms
+    // The bar is rate * step, ~0.32: a 0.45 first draft pays, a 0.30 one does not.
     try testing.expectEqual(@as(u32, 2), chooseRows(&[_]f32{0.45}, &costs, rate).rows);
     try testing.expectEqual(@as(u32, 1), chooseRows(&[_]f32{0.30}, &costs, rate).rows);
-    try testing.expect(rate * step > 0.33 and rate * step < 0.42);
+    try testing.expect(rate * step > 0.29 and rate * step < 0.36);
     // A sure chain verifies the block; a dead draft cuts the chain there.
     const sure: [5]f32 = @splat(0.95);
     try testing.expectEqual(@as(u32, 6), chooseRows(&sure, &costs, rate).rows);
@@ -355,15 +356,15 @@ fn starvedRun(old: bool, conf: f32, rate: f32, misses: usize, labels: bool) usiz
 }
 
 test "policy2: a first-draft bin two unlucky misses froze stays frozen under the old policy and recovers under policy2" {
-    // Drafts the head rates 0.55 land 65% of the time: worth their row (bar ~0.38) under either cost model.
+    // Drafts the head rates 0.55 land 65% of the time: worth their row (bar ~0.33) under either cost model.
     // Old policy: one early miss puts the bin at 0.41, under its ~0.47 bar, and nothing teaches it again.
     try testing.expectEqual(@as(usize, 0), starvedRun(true, 0.55, 0.65, 2, false));
     // Policy2: the next token decides the declined draft every round, and the bin is back within 200 rounds.
     try testing.expect(starvedRun(false, 0.55, 0.65, 2, true) > 200);
     // Without labels (a sampled request), the per-round drift alone brings it back.
     try testing.expect(starvedRun(false, 0.55, 0.65, 2, false) > 100);
-    // And a bin that truly does not pay is not bought: 10% drafts stay unverified after their misses.
-    try testing.expect(starvedRun(false, 0.55, 0.10, 2, true) < 40);
+    // And a bin that truly does not pay is not bought: 5% drafts stay unverified after their misses.
+    try testing.expect(starvedRun(false, 0.55, 0.05, 2, true) < 40);
 }
 
 test "policy2: the starved bin recovers within 20 rounds once its drafts land" {
