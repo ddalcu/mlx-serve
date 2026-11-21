@@ -990,3 +990,177 @@ test "dsv41 nvfp4 experts: decode (composed and the fused fp4 kernels) and prefi
         try testing.expect(relRms(c, tr) < 1e-2);
     }
 }
+
+// ── schedule invariance: a row's bytes whatever launch carries it ──
+
+/// Each launch below repeats this many times.
+const inv_reps = 50;
+
+/// Six decode rows' inputs: the gate/up's normed rows, picks and weights; the down's activations, stream and hc split.
+const RowIns = struct { h2: A, idx: A, wts: A, act: A, x1: A, post: A, comb: A };
+
+fn rowIns(sc: *Scope, g: *Gen, rng: std.Random, d: Dims) !RowIns {
+    const R = decode.max_rows;
+    var ids: [decode.max_rows * 16]u32 = undefined;
+    var ws: [decode.max_rows * 16]f32 = undefined;
+    moe_up.route(rng, .random, R, d.topk, @intCast(d.experts), &ids, &ws);
+    return .{
+        .h2 = try astype(sc, try g.normal(sc, &.{ ci(R), ci(d.k) }, 1), .bfloat16),
+        .idx = try sc.keep(mlx.mlx_array_new_data(&ids, &[_]c_int{ ci(R), ci(d.topk) }, 2, .uint32)),
+        .wts = try sc.keep(mlx.mlx_array_new_data(&ws, &[_]c_int{ ci(R), ci(d.topk) }, 2, .float32)),
+        .act = try astype(sc, try g.normal(sc, &.{ ci(R), ci(d.topk + 1), ci(d.n) }, 0.5), .bfloat16),
+        .x1 = try astype(sc, try g.normal(sc, &.{ ci(R), ci(d.hc), ci(d.k) }, 1), .bfloat16),
+        .post = try uniform(sc, g, &.{ ci(R), ci(d.hc) }, 0.05, 1.5),
+        .comb = try uniform(sc, g, &.{ ci(R), ci(d.hc), ci(d.hc) }, -0.5, 0.5),
+    };
+}
+
+/// Rows [lo, hi) of `a` in a buffer of their own, as a step or verify hands them over.
+fn rowsOf(sc: *Scope, a: A, lo: usize, hi: usize) !A {
+    var o = mlx.mlx_array_new();
+    return own(sc, mlx.mlx_copy(&o, try sc.slice(a, 0, lo, hi), sc.s), o);
+}
+
+/// The outputs compared: the gate/up `[R, k + 1, N]`, the down over `RowIns.act` `[R, hc, D]` and the chain (the down
+/// over the gate/up's output).
+const stages = [_][]const u8{ "up", "down", "chain" };
+
+/// The fused launches over rows [lo, hi) of `in`, as bits (caller frees).
+fn launchRows(sc: *Scope, kern: moe_fp4.Kernels, l: *const Layer, in: RowIns, lo: usize, hi: usize) ![3][]const u16 {
+    const m = bf16Model();
+    const idx = try rowsOf(sc, in.idx, lo, hi);
+    const x1 = try rowsOf(sc, in.x1, lo, hi);
+    const sp: dsv41.Split = .{ .pre = none, .post = try rowsOf(sc, in.post, lo, hi), .comb = try rowsOf(sc, in.comb, lo, hi) };
+    const up = (try moe_fp4.moeUpScaled(sc, &m, kern, &l.ly, try rowsOf(sc, in.h2, lo, hi), idx, try rowsOf(sc, in.wts, lo, hi), l.es)) orelse return error.Declined;
+    const dn = (try moe_fp4.moeDown(sc, kern, &l.ly, try rowsOf(sc, in.act, lo, hi), idx, x1, &sp)) orelse return error.Declined;
+    const ch = (try moe_fp4.moeDown(sc, kern, &l.ly, up, idx, x1, &sp)) orelse return error.Declined;
+    const b0 = try moe_up.bitsOf(up);
+    errdefer testing.allocator.free(b0);
+    const b1 = try moe_up.bitsOf(dn);
+    errdefer testing.allocator.free(b1);
+    return .{ b0, b1, try moe_up.bitsOf(ch) };
+}
+
+/// Launches whose bits differ: a repeat from the first run (`repeat`), a row of an R-row launch from that row's own
+/// one-row launch (`row`), per stage.
+const InvTally = struct { repeat: [3]usize = @splat(0), row: [3]usize = @splat(0) };
+
+/// Rows 0..5 at R = 1..6 (rows [0, R)) and each row alone, every launch `inv_reps` times.
+fn rowInvariance(sc: *Scope, kern: moe_fp4.Kernels, l: *const Layer, in: RowIns, label: []const u8) !InvTally {
+    const gpa = testing.allocator;
+    const MR = decode.max_rows;
+    var t: InvTally = .{};
+    // Launch j < MR: rows [0, j + 1); j >= MR: row j - MR alone. The first run's bits.
+    var first: [2 * MR][3][]const u16 = undefined;
+    var have: usize = 0;
+    defer for (first[0..have]) |b| for (b) |x| gpa.free(x);
+    for (0..inv_reps) |rep| {
+        var isc = Scope.init(gpa, sc.s);
+        defer isc.deinit();
+        for (0..2 * MR) |j| {
+            const lo: usize = if (j < MR) 0 else j - MR;
+            const hi: usize = if (j < MR) j + 1 else j - MR + 1;
+            const b = try launchRows(&isc, kern, l, in, lo, hi);
+            if (rep == 0) {
+                first[j] = b;
+                have += 1;
+                continue;
+            }
+            defer for (b) |x| gpa.free(x);
+            for (b, first[j], 0..) |x, y, s| if (!std.mem.eql(u16, x, y)) {
+                t.repeat[s] += 1;
+            };
+        }
+    }
+    for (1..MR + 1) |R| for (0..R) |r| for (0..3) |s| {
+        const want = first[MR + r][s];
+        const got = first[R - 1][s][r * want.len ..][0..want.len];
+        if (std.mem.eql(u16, got, want)) continue;
+        t.row[s] += 1;
+        var diff: usize = 0;
+        var at: usize = 0;
+        for (got, want, 0..) |a, b, i| if (a != b) {
+            if (diff == 0) at = i;
+            diff += 1;
+        };
+        std.debug.print("[moe_fp4 schedule] {s} {s} R={d} row {d}: {d} of {d} outputs differ from its one-row launch, first at {d}: 0x{x:0>4} vs 0x{x:0>4}\n", .{ label, stages[s], R, r, diff, want.len, at, got[at], want[at] });
+    };
+    std.debug.print("[moe_fp4 schedule] {s}: {d} reps; repeats differing up/down/chain {any}, rows differing from their one-row launch {any}\n", .{ label, inv_reps, t.repeat, t.row });
+    return t;
+}
+
+test "dsv41 fp4 schedule: a row's gate/up, down and chained bytes are its one-row launch's at R = 1..6, each launch the same 50 times (DeepSeek-V4.1-Flash widths; mxfp4, nvfp4, nvfp4 with per-expert scales)" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const kern = try moe_fp4.build(lim_ds);
+    defer kern.deinit();
+    var bad: usize = 0;
+    for (fmts, 0..) |f, fi| {
+        var sc = Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        var g: Gen = .{ .seed = 0x5C4E + fi };
+        var l = try randomLayer(&sc, &g, deepseek, f);
+        defer l.deinit();
+        var prng = std.Random.DefaultPrng.init(0x5C4E + fi);
+        const in = try rowIns(&sc, &g, prng.random(), deepseek);
+        const t = try rowInvariance(&sc, kern, &l, in, @tagName(f));
+        for (t.repeat, t.row) |a, b| bad += a + b;
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "dsv41 fp4 schedule: the MoE a plain step runs (ffnDecode, one row) gives each verify row's bytes at R = 1..6 (the fixture's mxfp4 and nvfp4 with per-expert scales banks, the fused fp4 kernels)" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const sw = env.override(.MLX_SERVE_DSV41_MOE_FP4_NAX, "1");
+    defer sw.restore();
+    var bad: usize = 0;
+    for ([_]bool{ false, true }) |nv| {
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 16, .ctx = 0, .experts_fp4 = !nv, .experts_nvfp4 = nv, .expert_scales = if (nv) .all else .none, .fused = true });
+        defer fx.deinit();
+        const m = fx.m;
+        const ly = fx.layer(20);
+        const MR = decode.max_rows;
+        const hc = m.cfg.dsv4_hc_mult;
+        var sc = Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const h = try sc.keep(try fx.normal(&.{ ci(MR), ci(m.cfg.hidden_size) }, .bfloat16, 0, 1));
+        const r = try dsv41.route(&sc, m, ly, h, none);
+        const x1 = try sc.keep(try fx.stream(MR));
+        const post = try sc.keep(try fx.uniform(&.{ ci(MR), ci(hc) }, 0.05, 1.5));
+        const comb = try sc.keep(try fx.uniform(&.{ ci(MR), ci(hc), ci(hc) }, -0.5, 0.5));
+        var first: [2 * MR][]const u16 = undefined;
+        var have: usize = 0;
+        defer for (first[0..have]) |b| gpa.free(b);
+        var repeat: usize = 0;
+        for (0..inv_reps) |rep| {
+            var isc = Scope.init(gpa, mlx.gpuStream());
+            defer isc.deinit();
+            for (0..2 * MR) |j| {
+                const lo: usize = if (j < MR) 0 else j - MR;
+                const hi: usize = if (j < MR) j + 1 else j - MR + 1;
+                const sp: dsv41.Split = .{ .pre = none, .post = try rowsOf(&isc, post, lo, hi), .comb = try rowsOf(&isc, comb, lo, hi) };
+                const y = (try dsv41.ffnDecode(&isc, m, ly, try rowsOf(&isc, h, lo, hi), try rowsOf(&isc, r.idx, lo, hi), try rowsOf(&isc, r.wts, lo, hi), try rowsOf(&isc, x1, lo, hi), &sp)) orelse return error.Fp4KernelsDeclined;
+                const b = try moe_up.bitsOf(y);
+                if (rep == 0) {
+                    first[j] = b;
+                    have += 1;
+                    continue;
+                }
+                defer gpa.free(b);
+                if (!std.mem.eql(u16, b, first[j])) repeat += 1;
+            }
+        }
+        var rows: usize = 0;
+        for (1..MR + 1) |R| for (0..R) |row| {
+            const want = first[MR + row];
+            if (!std.mem.eql(u16, first[R - 1][row * want.len ..][0..want.len], want)) {
+                rows += 1;
+                std.debug.print("[nvfp4 experts] ffnDecode {s} R={d}: row {d} differs from the one-row step\n", .{ if (nv) "nvfp4+scales" else "mxfp4", R, row });
+            }
+        };
+        std.debug.print("[nvfp4 experts] ffnDecode {s}: {d} reps; repeats differing {d}, verify rows differing from the one-row step {d}\n", .{ if (nv) "nvfp4+scales" else "mxfp4", inv_reps, repeat, rows });
+        bad += repeat + rows;
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
