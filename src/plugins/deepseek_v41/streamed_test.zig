@@ -112,6 +112,7 @@ const Resident = struct {
     m: *dsv41.Dsv41Model,
 
     fn open(dir: []const u8, opts: Numerics) !*Resident {
+        mlx.installErrorHandler(); // the model's threadgroup probes raise on M1/M2: latch it, never exit
         const gpa = testing.allocator;
         const r = try gpa.create(Resident);
         errdefer gpa.destroy(r);

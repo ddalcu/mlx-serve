@@ -38,6 +38,7 @@ pub fn Twin(comptime P: type) type {
 
         /// `tape`: the recorded legacy values (empty: a test that compares none).
         pub fn open(files: []const sdk.fixture.File, tape: []const u8) !*@This() {
+            mlx.installErrorHandler(); // the model's threadgroup probes raise on M1/M2: latch it, never exit
             const a = testing.allocator;
             const io = std.Io.Threaded.global_single_threaded.io();
             const t = try a.create(@This());
