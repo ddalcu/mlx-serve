@@ -215,14 +215,12 @@ pub fn parseSize(size: []const u8) ?Dims {
 /// A multiple of 32 in [256, 1536] (FLUX.2 klein's crop granularity); 0 = the 1024 default.
 pub fn clamp32(v: u32) u32 {
     if (v == 0) return 1024;
-    const rounded = ((v + 31) / 32) * 32;
-    return std.math.clamp(rounded, 256, 1536);
+    return (std.math.clamp(v, 256, 1536) + 31) / 32 * 32;
 }
 
 /// A multiple of 16 in [256, 2048] (one latent token per 16x16 tile).
 pub fn clamp16(v: u32) u32 {
-    const rounded = ((v + 15) / 16) * 16;
-    return std.math.clamp(rounded, 256, 2048);
+    return (std.math.clamp(v, 256, 2048) + 15) / 16 * 16;
 }
 
 /// An edit reference's own grid: its aspect at most ~1 MP, each side floored to /32, never upscaled, at least 32.
@@ -362,4 +360,11 @@ test "image request: a canvas past the headroom is refused with its size and bot
     const v = canvasRefusal(&req, 2048, 1024, 3 << 30, 1 << 30).?;
     try testing.expect(v.code == .unsupported);
     try testing.expectEqualStrings("2048x1024 needs ~3.0 GB of GPU memory but 1.0 GB is free: shrink 'size' or unload another model", buf[0..len]);
+}
+
+test "image request: a size near the u32 limit clamps to the cap instead of overflowing" {
+    try testing.expectEqual(@as(u32, 2048), clamp16(std.math.maxInt(u32)));
+    try testing.expectEqual(@as(u32, 2048), clamp16(4294967281));
+    try testing.expectEqual(@as(u32, 1536), clamp32(std.math.maxInt(u32)));
+    try testing.expectEqual(@as(u32, 1536), clamp32(4294967265));
 }
