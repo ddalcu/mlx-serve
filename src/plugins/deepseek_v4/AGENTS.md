@@ -44,8 +44,6 @@ Packs: `ddalcu/DeepSeek-V4-Flash-MLX-Serve` (0731+, our layout). `config.zig` is
   that frees it (here: `Dsv4Model.deinit`).
 
 ## Known issues (kernel contract, `contract.zig`; kernels unchanged)
-- `dec_chain` kv / indexer q and `emit_win` (3 arms): a NaN in a quantized group comes out a finite code (Metal's
-  max drops it from the group max, clamp from the code); float64 and the composed chain propagate it.
 - `moe_gateup` (2/4/8-bit): a NaN gate sum becomes the clip limit (Metal's min drops NaN, MLX's minimum keeps it).
 
 ## Fixtures

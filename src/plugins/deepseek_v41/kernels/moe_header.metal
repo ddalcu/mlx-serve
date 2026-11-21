@@ -13,10 +13,10 @@ inline void dsv41_dots(const device uint32_t* w, const device S* sc, const devic
     for (int r = 0; r < R; ++r) {
       const P q = mlxserve_qpack<BITS>(w, rows[r] * KW, pk);
       if (MX) {
-        // e8m0 as 2^(e - 127), times the 2^8 the e4m3 bit placement leaves out.
+        // MLX's e8m0 read times the dot with the 2^8 the e4m3 bit placement leaves out put back first, as MLX scales.
         const uint e = uint(sc[rows[r] * KG + gi]);
         const float2 lo = mlxserve_e4m3x2(uint(q)), hi = mlxserve_e4m3x2(uint(q) >> 8);
-        acc[r] += as_type<float>(e == 0u ? 0x400000u : (e << 23)) * 256.0f * (xp[0] * lo.x + xp[1] * hi.x + xp[2] * lo.y + xp[3] * hi.y);
+        acc[r] += mlxserve_fp4_e8m0(e) * (256.0f * (xp[0] * lo.x + xp[1] * hi.x + xp[2] * lo.y + xp[3] * hi.y));
       } else {
         float dq = 0.0f;
         for (int i = 0; i < VPW; ++i) dq += xp[i] * float(q & (MASK << (BITS * i)));

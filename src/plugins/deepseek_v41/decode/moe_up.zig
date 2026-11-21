@@ -23,7 +23,7 @@ const none: A = .{ .ctx = null };
 const testing = std.testing;
 
 pub const SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_moe_up.metal");
-pub const HEADER = kernelSource("plugins/deepseek_v41/kernels/dec_moe_up_header.metal");
+pub const HEADER = decode.FP8_READ_HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_moe_up_header.metal");
 pub const INS = [_][*:0]const u8{ "x", "w", "scales", "biases", "sw", "sscales", "inds", "wts", "lim" };
 
 /// The pipeline and the swiglu clamp it reads (`dsv4_swiglu_limit`).
@@ -92,6 +92,7 @@ pub fn run(sc: *dsv41.Scope, kern: Kernel, bits: usize, gs: usize, x: A, w: A, s
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, tg_threads, 1, 1));
     inline for (.{ .{ "R", rows }, .{ "K", k }, .{ "N", n }, .{ "TOPK", topk }, .{ "BITS", bits }, .{ "GS", gs } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "FOLD", decode.fp8Fold()));
     const ins = [_]A{ x, w, scales, biases, sw, sscales, idx, wts, kern.lim };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);
@@ -150,6 +151,7 @@ const MoeUp = struct {
         g.int("BITS", p.bits);
         g.int("GS", p.gs);
         g.dtype("T", act);
+        g.int("FOLD", 0);
         return g;
     }
 
@@ -861,4 +863,10 @@ test "dsv41 dec moe_up: ubench, R = 1 and 6 against today's chain (DSV41_DEC_UBE
         std.debug.print("[dec-ubench] moe_up {d}-bit g64, {s} routing (mean {d:.1} distinct experts, dependency op {d:.1} us taken off both, first call {d:.1} ms):\n", .{ bits, if (case[1] == 1) "overlapping" else "distinct", b.distinct, dep_us, compile_ms });
         decode.report("moe_up", rows, new_us - dep_us, b.bytes(), old_us - dep_us);
     };
+}
+
+test "dsv41 dec moe_up: the shared expert's MLX mxfp8 reads give the FOLD form's bytes on finite codes" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    inline for (.{ 2, 3 }) |bits| inline for (.{ 64, 128 }) |gs|
+        try decode.expectFoldSame(MoeUp, &moe_up_l, .{ .bits = bits, .gs = gs }, &.{ .{ .rows = 1, .n = 64, .k = 5120 }, .{ .rows = decode.max_rows, .n = 64, .k = 5120 } });
 }

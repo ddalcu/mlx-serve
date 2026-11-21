@@ -1642,9 +1642,8 @@ pub const MOE_COMBINE_INS = [_][*:0]const u8{ "dn", "inv", "sh" };
 /// T, written as OT.
 pub const ROPE_TAIL_SOURCE = kernelSource("plugins/deepseek_v41/kernels/rope_tail.metal");
 
-/// e4m3 encode/decode exactly as MLX's `fp8_e4m3` (which takes it from
-/// PyTorch's `Float8_e4m3fn`): saturating, round to nearest even.
-pub const FP8_HEADER = kernelSource("plugins/deepseek_v41/kernels/fp8_header.metal");
+/// The activation round trips' encoders: MLX's e4m3 / e8m0 / e2m1 and its NaN-keeping max and clip.
+pub const FP8_HEADER = @import("../../sdk/quant/fp_encode.zig").HEADER;
 
 /// `kvRow` after its projection, one threadgroup (D threads) a row: MLX's
 /// rms_norm, the tail rope, then (QAT) the fp8 / 32 / ue8m0 round trip.
@@ -10637,4 +10636,97 @@ test "dsv41 pair: a layer split refuses an MLX pack's streamed experts by name b
     var w = Weights.init(std.testing.allocator);
     defer w.deinit();
     try std.testing.expectError(error.Dsv41PairStreamedExperts, init(std.testing.allocator, &cfg, &w, mlx.gpuStream(), .{ .pair = .{ .lo = 4, .hi = 8, .worker = false }, .streamed_experts = true }));
+}
+
+test "dsv41 moe: the mxfp8 shared linear reads every e4m3 byte under every e8m0 code as MLX's mxfp8 dequant" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const a = std.testing.allocator;
+    // Row n holds e4m3 byte n everywhere; group g has e8m0 code g in its own launch (the rest 1.0, as a NaN scale
+    // elsewhere reaches the sum through 0 x NaN). A one-hot x picks one weight: the output is the read itself.
+    const N: c_int = 256;
+    const K: c_int = 256 * 32;
+    const KW: usize = @intCast(@divExact(K, 4));
+    const words = try a.alloc(u32, @as(usize, @intCast(N)) * KW);
+    defer a.free(words);
+    for (0..@intCast(N)) |n| @memset(words[n * KW ..][0..KW], @as(u32, @intCast(n)) * 0x01010101);
+    const codes = try a.alloc(u8, @intCast(N * 256));
+    defer a.free(codes);
+    for (codes, 0..) |*c, i| c.* = @intCast(i % 256);
+    const w = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ N, @divExact(K, 4) }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(w);
+    const sc_all = mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ N, 256 }, 2, .uint8);
+    defer _ = mlx.mlx_array_free(sc_all);
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    try mlx.check(mlx.mlx_dequantize(&deq, w, sc_all, .{ .ctx = null }, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, s));
+    try mlx.check(mlx.mlx_array_eval(deq));
+    const want = (mlx.mlx_array_data_bfloat16(deq) orelse return error.NoData)[0..@intCast(N * K)];
+
+    const ins = [_][*:0]const u8{ "x", "w", "sc" };
+    const outs = [_][*:0]const u8{"out"};
+    const in_vec = mlx.mlx_vector_string_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const src =
+        \\const uint lane = thread_index_in_simdgroup;
+        \\float acc[1];
+        \\size_t rows[1] = { size_t(thread_position_in_grid.y) };
+        \\dsv41_dots<8, 32, K, 1, true>(w, sc, sc, rows, x, lane, acc);
+        \\if (lane == 0) out[thread_position_in_grid.y] = T(acc[0]);
+    ;
+    const k = mlx.mlx_fast_metal_kernel_new("dsv41_test_mxfp8_dots", in_vec, out_vec, src, MOE_HEADER, true, false);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k);
+
+    const x = try a.alloc(u16, @intCast(K));
+    defer a.free(x);
+    const nan = struct {
+        fn is(b: u16) bool {
+            return b & 0x7F80 == 0x7F80 and b & 0x7F != 0;
+        }
+    }.is;
+    var differ: usize = 0;
+    for (0..256) |g| {
+        @memset(x, 0);
+        x[g * 32 + 5] = 0x3F80;
+        const xa = mlx.mlx_array_new_data(x.ptr, &[_]c_int{ 1, K }, 2, .bfloat16);
+        defer _ = mlx.mlx_array_free(xa);
+        const own = try a.dupe(u8, codes);
+        defer a.free(own);
+        for (own, 0..) |*c, i| if (i % 256 != g) {
+            c.* = 127;
+        };
+        const sca = mlx.mlx_array_new_data(own.ptr, &[_]c_int{ N, 256 }, 2, .uint8);
+        defer _ = mlx.mlx_array_free(sca);
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{N}, 1, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, 32, N, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "T", .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "K", K));
+        const inputs = [_]mlx.mlx_array{ xa, w, sca };
+        const v = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+        defer _ = mlx.mlx_vector_array_free(v);
+        var o = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(o);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o, k, v, c, s));
+        var y = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_vector_array_get(&y, o, 0));
+        try mlx.check(mlx.mlx_array_eval(y));
+        const got = (mlx.mlx_array_data_bfloat16(y) orelse return error.NoData)[0..@intCast(N)];
+        for (0..@intCast(N)) |n| {
+            const wv = want[n * @as(usize, @intCast(K)) + g * 32 + 5];
+            const gv = got[n];
+            // A zero's sign is the sum's (it starts at +0), not the weight's.
+            const zero = wv & 0x7FFF == 0 and gv & 0x7FFF == 0;
+            if (!(wv == gv or zero or (nan(wv) and nan(gv)))) {
+                if (differ < 8) std.debug.print("dsv41 mxfp8 shared e4m3 0x{x:0>2} e8m0 {d}: kernel 0x{x:0>4}, MLX 0x{x:0>4}\n", .{ n, g, gv, wv });
+                differ += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), differ);
 }

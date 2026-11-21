@@ -42,7 +42,7 @@ pub const INS = [_][*:0]const u8{ "x", "w", "scales", "biases", "sw", "sscales",
 /// threadgroup stages each pair's activation row once in threadgroup memory (terms prescaled by their field's shift, so a
 /// field is masked, never shifted), and walks the jobs: the row pairs ordered by expert, an expert's weights loading once.
 pub const SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_moe_down.metal");
-pub const HEADER = mxfp8_qmv.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_moe_down_header.metal");
+pub const HEADER = mxfp8_qmv.HEADER ++ decode.FP8_READ_HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_moe_down_header.metal");
 
 pub fn build() !mlx.mlx_fast_metal_kernel {
     return dsv41.buildKernel("dsv41_dec_moe_down", &INS, &.{"out"}, SOURCE, HEADER);
@@ -88,6 +88,7 @@ pub fn moeDown(sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, rb: usize, dow
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(nt), 1, 1));
     inline for (.{ .{ "K", K }, .{ "N", N }, .{ "ROWS", R }, .{ "RB", rb }, .{ "HC", HC }, .{ "TOPK", TOPK }, .{ "BITS", bits }, .{ "GS", gs } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", bfd));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "FOLD", decode.fp8Fold()));
     const ins = [_]A{ act, down.w, down.s, down.b, shared.w, shared.s, idx, x1, sp.post, sp.comb };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);
@@ -512,6 +513,7 @@ const DownK = struct {
         g.int("BITS", p.bits);
         g.int("GS", p.gs);
         g.dtype("T", adt);
+        g.int("FOLD", 0);
         return g;
     }
 
@@ -682,4 +684,10 @@ test "dsv41 dec moe_down: the registered kernel passes the contract's gates 1-4"
     var t: kc.gates.Tally = .{};
     try kc.gates.runAll(a, set.kernels.items, 0xc0de, &t);
     try std.testing.expectEqual(@as(usize, 0), t.problems());
+}
+
+test "dsv41 dec moe_down: the shared expert's MLX mxfp8 reads give the FOLD form's bytes on finite codes" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    inline for (.{ .{ 3, 64 }, .{ 2, 128 } }) |w|
+        try decode.expectFoldSame(DownK, &down_l, .{ .bits = w[0], .gs = w[1] }, &.{ .{ .rows = 1, .n = 64, .k = 2304 }, .{ .rows = 6, .n = 64, .k = 2304 } });
 }

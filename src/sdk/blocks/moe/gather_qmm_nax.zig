@@ -5,11 +5,15 @@ const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../util/log.zig");
+const fp4 = @import("../../quant/fp4.zig");
+
+/// The gathers' shared header, after the one fp4 scale decode its `Fp4Q` reads.
+pub const NAX_HEADER = fp4.SCALE_HEADER ++ kernelSource("kernels/moe/gather_qmm_nax_header.metal");
 
 pub const Plan = struct { sched: enum { seg, db }, bm: c_int, bk: c_int, gx: c_int, pad: c_int };
 /// `mx`: an FP4 bank (uint8 scales, no biases: e8m0 per 32 for MXFP4, e4m3 per 16 for NVFP4) instead of affine.
 const CanaryKey = struct { plan: Plan, bits: u32, group: u32, align_n: bool, align_k: bool, mx: bool };
-const MmKey = struct { rows: c_int, n: c_int, k: c_int, max_tiles: c_int, plan: Plan, bits: u32, group: u32, mx: bool, mapped: bool = false, paired: bool = false, limit: u32 = 0 };
+const MmKey = struct { rows: c_int, n: c_int, k: c_int, max_tiles: c_int, plan: Plan, bits: u32, group: u32, mx: bool, mapped: bool = false, paired: bool = false, limit: u32 = 0, esc: u32 = 0 };
 var scan_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mm_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mapped_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -83,9 +87,9 @@ fn kernel(scan: bool) !mlx.mlx_fast_metal_kernel {
     const out_vec = if (scan) mlx.mlx_vector_string_new_data(&out_names_scan, out_names_scan.len) else mlx.mlx_vector_string_new_data(&out_names_mm, out_names_mm.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
     const value = if (scan)
-        mlx.mlx_fast_metal_kernel_new("msv_gqmm_tile_scan", in_vec, out_vec, kernelSource("kernels/moe/gather_qmm_nax_scan.metal"), kernelSource("kernels/moe/gather_qmm_nax_header.metal"), true, false)
+        mlx.mlx_fast_metal_kernel_new("msv_gqmm_tile_scan", in_vec, out_vec, kernelSource("kernels/moe/gather_qmm_nax_scan.metal"), NAX_HEADER, true, false)
     else
-        mlx.mlx_fast_metal_kernel_new("msv_gqmm_affine", in_vec, out_vec, kernelSource("kernels/moe/gather_qmm_nax.metal"), kernelSource("kernels/moe/gather_qmm_nax_header.metal"), true, false);
+        mlx.mlx_fast_metal_kernel_new("msv_gqmm_affine", in_vec, out_vec, kernelSource("kernels/moe/gather_qmm_nax.metal"), NAX_HEADER, true, false);
     if (value.ctx == null) return error.MetalKernelCompileFailed;
     if (scan) scan_kernel = value else mm_kernel = value;
     return value;
@@ -94,13 +98,13 @@ fn kernel(scan: bool) !mlx.mlx_fast_metal_kernel {
 fn mapKernel(paired: bool) !mlx.mlx_fast_metal_kernel {
     const slot = if (paired) &paired_kernel else &mapped_kernel;
     if (slot.*) |v| return v;
-    const names = [_][*:0]const u8{ "x", "w", "scales", "biases", "up_w", "up_scales", "up_biases", "tiles", "tile_count", "params", "sigtab", "rmap" };
+    const names = [_][*:0]const u8{ "x", "w", "scales", "biases", "up_w", "up_scales", "up_biases", "tiles", "tile_count", "params", "sigtab", "rmap", "gsc", "usc" };
     const outs = [_][*:0]const u8{"y"};
     const ins_vec = mlx.mlx_vector_string_new_data(&names, names.len);
     defer _ = mlx.mlx_vector_string_free(ins_vec);
     const outs_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
     defer _ = mlx.mlx_vector_string_free(outs_vec);
-    const header = kernelSource("kernels/moe/gather_qmm_nax_header.metal") ++ kernelSource("kernels/moe/gather_qmm_nax_mapped_header.metal");
+    const header = NAX_HEADER ++ kernelSource("kernels/moe/gather_qmm_nax_mapped_header.metal");
     const value = mlx.mlx_fast_metal_kernel_new(if (paired) "msv_gqmm_affine_pair" else "msv_gqmm_affine_map", ins_vec, outs_vec, kernelSource("kernels/moe/gather_qmm_nax_mapped.metal"), header, true, false);
     if (value.ctx == null) return error.MetalKernelCompileFailed;
     slot.* = value;
@@ -169,12 +173,35 @@ fn mmConfig(key: MmKey) !mlx.mlx_fast_metal_kernel_config {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GX", key.plan.gx));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "PAD", key.plan.pad));
     if (key.mapped) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "EPI", if (key.paired) 1 + @as(c_int, @intCast(key.limit)) else 0));
+    if (key.mapped) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ESC", @intCast(key.esc)));
     return cfg;
 }
 
 /// `limit`: a `swiglu_limit` the epilogue clamps at (whole numbers; 0 = none). `up_off`: the up rows' offset in an
 /// expert of a bank fused along its rows (gate rows, then up rows; `w` is then the gate's bank too), else 0.
-const Pair = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, sigtab: mlx.mlx_array, limit: u32 = 0, up_off: c_int = 0 };
+/// `scales`: the per-expert gate / up scales the epilogue applies (`ExpertScales`).
+const Pair = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, sigtab: mlx.mlx_array, limit: u32 = 0, up_off: c_int = 0, scales: ExpertScales = .{} };
+
+/// Per-expert scales `[E]` in x's dtype (ModelOpt NVFP4's global `weight_scale_2`) on the paired kernel's two products:
+/// `gate` multiplies the gate before the SiLU (and before a clamp), `up` the up before a clamp, each product rounded
+/// to x's dtype first and the scaled value rounded again, as the split path's `scaleExperts` multiply and the fp4
+/// decode kernel's GSCALE / USCALE do. Null = none (an MXFP4 bank, or ModelOpt's up scale riding the scores).
+pub const ExpertScales = struct {
+    gate: ?mlx.mlx_array = null,
+    up: ?mlx.mlx_array = null,
+
+    fn bits(self: ExpertScales) u32 {
+        return @as(u32, @intFromBool(self.gate != null)) | (@as(u32, @intFromBool(self.up != null)) << 1);
+    }
+
+    /// Each scale an `[experts]` vector of `dt`, at least 8 long (MLX binds a shorter array in `constant`).
+    fn fits(self: ExpertScales, experts: c_int, dt: mlx.mlx_dtype) bool {
+        inline for (.{ self.gate, self.up }) |o| if (o) |a| {
+            if (a.ctx == null or mlx.mlx_array_dtype(a) != dt or mlx.mlx_array_ndim(a) != 1 or mlx.getShape(a)[0] != experts or experts < 8) return false;
+        };
+        return true;
+    }
+};
 
 /// An MXFP4 bank has no biases; the kernel signature still binds the slot. 16
 /// elements: MLX binds an array under 8 in `constant`, not `device`.
@@ -201,8 +228,10 @@ fn launchMapped(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: 
     const ps = if (pair) |v| v.sc else sc;
     const pb = if (pair) |v| v.bi else bi;
     const sigtab = if (pair) |v| v.sigtab else biasArg(.{ .ctx = null }); // unread without a pair
-    const inputs = [_]mlx.mlx_array{ x, w, sc, biasArg(bi), pw, ps, biasArg(pb), t.tiles, t.count, params, sigtab, row_map };
-    const cfg = try mmConfig(.{ .rows = m, .n = n, .k = k, .max_tiles = t.max_tiles, .plan = p, .bits = bits, .group = group, .mx = mx, .mapped = true, .paired = pair != null, .limit = if (pair) |v| v.limit else 0 });
+    const esc: ExpertScales = if (pair) |v| v.scales else .{};
+    // An absent scale binds the sigmoid table (a bf16 array past `constant`'s size); ESC keeps it unread.
+    const inputs = [_]mlx.mlx_array{ x, w, sc, biasArg(bi), pw, ps, biasArg(pb), t.tiles, t.count, params, sigtab, row_map, esc.gate orelse sigtab, esc.up orelse sigtab };
+    const cfg = try mmConfig(.{ .rows = m, .n = n, .k = k, .max_tiles = t.max_tiles, .plan = p, .bits = bits, .group = group, .mx = mx, .mapped = true, .paired = pair != null, .limit = if (pair) |v| v.limit else 0, .esc = esc.bits() });
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     return applyOne(try mapKernel(pair != null), &inputs, cfg, s);
 }
@@ -384,7 +413,7 @@ fn sortedGatherAt(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx
     const out = try launch(x, w, sc, bi, idx, bits, group, mx, p, s);
     if (!engaged_logged) {
         engaged_logged = true;
-        log.info("[gather-nax] engaged: {s} bm={d} bk={d} M={d} E={d} N={d} K={d}\n", .{ @tagName(p.sched), p.bm, p.bk, xs[0], ws[0], ws[1], xs[2] });
+        log.info("[gather-nax] engaged: {s} bm={d} bk={d} M={d} E={d} N={d} K={d} {s}\n", .{ @tagName(p.sched), p.bm, p.bk, xs[0], ws[0], ws[1], xs[2], modeName(mx, group) });
     }
     return out;
 }
@@ -528,20 +557,43 @@ fn sortedGatherMappedAt(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_arr
     const out = try launchMapped(x, row_map, w, sc, bi, idx, null, bits, group, mx, key.plan, s);
     if (!mapped_engaged_logged) {
         mapped_engaged_logged = true;
-        log.info("[gather-nax] row map engaged: M={d} E={d} N={d} K={d}\n", .{ mlx.getShape(idx)[0], mlx.getShape(w)[0], mlx.getShape(w)[1], mlx.getShape(x)[2] });
+        log.info("[gather-nax] row map engaged: M={d} E={d} N={d} K={d} {s}\n", .{ mlx.getShape(idx)[0], mlx.getShape(w)[0], mlx.getShape(w)[1], mlx.getShape(x)[2], modeName(mx, group) });
     }
     return out;
 }
 
 pub fn sortedGateUp(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, up_w: mlx.mlx_array, up_sc: mlx.mlx_array, up_bi: mlx.mlx_array, idx: mlx.mlx_array, sigtab: mlx.mlx_array, limit: u32, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    return sortedGateUpScaled(x, row_map, w, sc, bi, up_w, up_sc, up_bi, idx, sigtab, limit, .{}, bits, group, mx, nax_available, s);
+}
+
+var scaled_engaged_logged = false;
+
+/// `MLX_SERVE_MOE_SCALED_PREFILL`: the paired kernel on banks with per-expert scales; read on every call (a kill
+/// switch), unset = off.
+pub fn scaledPrefillEnabled() bool {
+    return if (env.get(.MLX_SERVE_MOE_SCALED_PREFILL)) |v| v[0] != '0' else scaled_prefill_default;
+}
+
+/// The arm an unset `MLX_SERVE_MOE_SCALED_PREFILL` takes.
+const scaled_prefill_default = true;
+
+/// `sortedGateUp` with each expert's own gate / up scale in the epilogue (`ExpertScales`): the two gathers, the
+/// `scaleExperts` multiplies and the SwiGLU (clamped under `limit`) of the split path in one dispatch, bit for bit.
+pub fn sortedGateUpScaled(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, up_w: mlx.mlx_array, up_sc: mlx.mlx_array, up_bi: mlx.mlx_array, idx: mlx.mlx_array, sigtab: mlx.mlx_array, limit: u32, scales: ExpertScales, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!nax_available or !mlx.streamIsGpu(s)) return null;
     if (!supported(x, w, sc, bi, idx, bits, group, mx, row_map, false) or !supported(x, up_w, up_sc, up_bi, idx, bits, group, mx, row_map, false)) return null;
     if (!std.mem.eql(c_int, mlx.getShape(w), mlx.getShape(up_w)) or @rem(mlx.getShape(w)[1], 32) != 0) return null;
     if (sigtab.ctx == null or mlx.mlx_array_dtype(sigtab) != .bfloat16 or mlx.mlx_array_size(sigtab) != 65536) return null;
+    if (!scales.fits(mlx.getShape(w)[0], mlx.mlx_array_dtype(x))) return null;
     const key = mappedKey(x, w, idx, bits, group, mx, true);
     if (!armed(key, s) or !armedMapped(key, false, s) or !armedMapped(key, true, s)) return null;
-    const out = try launchMapped(x, row_map, w, sc, bi, idx, .{ .w = up_w, .sc = up_sc, .bi = up_bi, .sigtab = sigtab, .limit = limit }, bits, group, mx, key.plan, s);
-    if (!paired_engaged_logged) {
+    const out = try launchMapped(x, row_map, w, sc, bi, idx, .{ .w = up_w, .sc = up_sc, .bi = up_bi, .sigtab = sigtab, .limit = limit, .scales = scales }, bits, group, mx, key.plan, s);
+    if (scales.bits() != 0) {
+        if (!scaled_engaged_logged) {
+            scaled_engaged_logged = true;
+            log.info("[gather-nax] paired SwiGLU engaged with per-expert scales (gate={} up={} limit={d}): M={d} E={d} N={d} K={d} {s}\n", .{ scales.gate != null, scales.up != null, limit, mlx.getShape(idx)[0], mlx.getShape(w)[0], mlx.getShape(w)[1], mlx.getShape(x)[2], modeName(mx, group) });
+        }
+    } else if (!paired_engaged_logged) {
         paired_engaged_logged = true;
         log.info("[gather-nax] paired SwiGLU engaged: M={d} E={d} N={d} K={d}\n", .{ mlx.getShape(idx)[0], mlx.getShape(w)[0], mlx.getShape(w)[1], mlx.getShape(x)[2] });
     }
@@ -937,6 +989,277 @@ test "segmented NAX sorted gather: a gate/up bank fused along its rows gives the
             defer _ = mlx.mlx_array_free(got);
             try expectBitEqual(want, got, s);
         }
+    }
+}
+
+/// The paired kernel with per-expert scales against the split path it replaces (`sortedDown`'s arm without it): the two
+/// mapped gathers, each times its expert's scale (`take` -> multiply, `scaleExperts`), then MLX's SwiGLU chain and the
+/// served `fusedSwiGLU` (unclamped: the gate's scale alone, then both), or `clampedSwiGLU` under a limit (both scales).
+fn scaledPairCase(tokens: c_int, experts: c_int, top_k: c_int, n: c_int, k: c_int, group: u32, mx: bool, s: mlx.mlx_stream) !void {
+    errdefer dropOwnLatch();
+    const alloc = std.testing.allocator;
+    const rows = tokens * top_k;
+    const ids_data = try alloc.alloc(u32, @intCast(rows));
+    defer alloc.free(ids_data);
+    skewedRouting(ids_data, @intCast(experts));
+    const map_data = try alloc.alloc(u32, @intCast(rows));
+    defer alloc.free(map_data);
+    for (map_data, 0..) |*v, i| v.* = @intCast((i * 73 + 11) % @as(usize, @intCast(tokens)));
+    const ids = mlx.mlx_array_new_data(ids_data.ptr, &[_]c_int{rows}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    const row_map = mlx.mlx_array_new_data(map_data.ptr, &[_]c_int{rows}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(row_map);
+    const gate = try randomBank(experts, n, k, 4, group, mx, 0x2267, s);
+    defer gate.deinit();
+    const up = try randomBank(experts, n, k, 4, group, mx, 0x4521, s);
+    defer up.deinit();
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_random_normal(&x, &[_]c_int{ tokens, 1, k }, 3, .bfloat16, 0, 0.5, gate.key, s));
+    // Per-expert scales in x's dtype over two octaves either side of 1: the multiply's rounding and the clamp both act.
+    var esc: [2]mlx.mlx_array = undefined;
+    for (&esc, [_]u64{ 0x5CA1E, 0x5CA1F }) |*o, seed| {
+        var key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(key);
+        try mlx.check(mlx.mlx_random_key(&key, seed));
+        const lo = mlx.mlx_array_new_float(0.25);
+        defer _ = mlx.mlx_array_free(lo);
+        const hi = mlx.mlx_array_new_float(4.0);
+        defer _ = mlx.mlx_array_free(hi);
+        o.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_uniform(o, lo, hi, &[_]c_int{experts}, 1, .bfloat16, key, s));
+        try mlx.check(mlx.mlx_array_eval(o.*));
+    }
+    defer for (esc) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const bias = mlx.mlx_array{ .ctx = null };
+    const mapped_g = (try sortedGatherMapped(x, row_map, gate.w, gate.sc, bias, ids, 4, group, mx, true, s)) orelse return error.KernelDeclinedTestShape;
+    defer _ = mlx.mlx_array_free(mapped_g);
+    const mapped_u = (try sortedGatherMapped(x, row_map, up.w, up.sc, bias, ids, 4, group, mx, true, s)) orelse return error.KernelDeclinedTestShape;
+    defer _ = mlx.mlx_array_free(mapped_u);
+    var scaled: [2]mlx.mlx_array = undefined;
+    for (&scaled, [_]mlx.mlx_array{ mapped_g, mapped_u }, esc) |*o, y, sc| {
+        var picked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(picked);
+        try mlx.check(mlx.mlx_take_axis(&picked, sc, ids, 0, s));
+        var col = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(col);
+        try mlx.check(mlx.mlx_reshape(&col, picked, &[_]c_int{ rows, 1, 1 }, 3, s));
+        o.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(o, y, col, s));
+    }
+    defer for (scaled) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const sigtab = try @import("../hc/hc_prefill.zig").sigmoidTable(s);
+    // The gate's scale alone (ModelOpt unclamped: up x down ride the scores), then both scales.
+    for ([_]bool{ false, true }) |with_up| {
+        const fused = (try sortedGateUpScaled(x, row_map, gate.w, gate.sc, bias, up.w, up.sc, bias, ids, sigtab, 0, .{ .gate = esc[0], .up = if (with_up) esc[1] else null }, 4, group, mx, true, s)) orelse return error.KernelDeclinedTestShape;
+        defer _ = mlx.mlx_array_free(fused);
+        const u = if (with_up) scaled[1] else mapped_u;
+        var sig = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sig);
+        var act = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(act);
+        var ref = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref);
+        try mlx.check(mlx.mlx_sigmoid(&sig, scaled[0], s));
+        try mlx.check(mlx.mlx_multiply(&act, scaled[0], sig, s));
+        try mlx.check(mlx.mlx_multiply(&ref, act, u, s));
+        try expectBitEqual(ref, fused, s);
+        const served = (try @import("../mlp/fused_activations.zig").fusedSwiGLU(s, scaled[0], u)) orelse return error.FusedSwiGLUDeclined;
+        defer _ = mlx.mlx_array_free(served);
+        try expectBitEqual(served, fused, s);
+    }
+    // A swiglu_limit of 1 after both scales: the clamp ops on the scaled gathers.
+    const clamped = (try sortedGateUpScaled(x, row_map, gate.w, gate.sc, bias, up.w, up.sc, bias, ids, sigtab, 1, .{ .gate = esc[0], .up = esc[1] }, 4, group, mx, true, s)) orelse return error.KernelDeclinedTestShape;
+    defer _ = mlx.mlx_array_free(clamped);
+    const clamp_ref = try @import("../mlp/activations.zig").clampedSwiGLU(s, scaled[0], scaled[1], 1.0);
+    defer _ = mlx.mlx_array_free(clamp_ref);
+    try expectBitEqual(clamp_ref, clamped, s);
+    // Without scales the scaled entry is `sortedGateUp`.
+    const plain = (try sortedGateUp(x, row_map, gate.w, gate.sc, bias, up.w, up.sc, bias, ids, sigtab, 0, 4, group, mx, true, s)) orelse return error.KernelDeclinedTestShape;
+    defer _ = mlx.mlx_array_free(plain);
+    const unscaled = (try sortedGateUpScaled(x, row_map, gate.w, gate.sc, bias, up.w, up.sc, bias, ids, sigtab, 0, .{}, 4, group, mx, true, s)) orelse return error.KernelDeclinedTestShape;
+    defer _ = mlx.mlx_array_free(unscaled);
+    try expectBitEqual(plain, unscaled, s);
+}
+
+test "segmented NAX paired SwiGLU with per-expert scales matches the split path (NVFP4 GLM-5.3 Pro and Flash Next shapes, MXFP4)" {
+    try requireNax();
+    const s = mlx.gpuStream();
+    // GLM-5.3 Pro (glm_moe_dsa): 256 experts, top-8, gate/up 6144 -> 2048, NVFP4.
+    try scaledPairCase(2048, 256, 8, 2048, 6144, 16, true, s);
+    // Qwen3.8 Flash Next (ModelOpt NVFP4): 512 experts, top-10, 2560 -> 640 (the paired test's shape).
+    try scaledPairCase(3301, 512, 10, 640, 2560, 16, true, s);
+    // The same geometry on MXFP4 banks: the epilogue is format-blind.
+    try scaledPairCase(3301, 512, 10, 640, 2560, 32, true, s);
+}
+
+/// `a` and `b` equal element for element, a NaN equal to a NaN.
+fn expectBitEqualNan(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !void {
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, a, b, true, s));
+    var same = false;
+    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+    try std.testing.expect(same);
+}
+
+test "segmented NAX gathers on every fp4 code: all 16 e2m1 codes, every e4m3 / e8m0 scale code (NaNs, subnormals, 2^-127..2^127), NaN rows, the clamp on NaN" {
+    try requireNax();
+    errdefer dropOwnLatch();
+    const s = mlx.gpuStream();
+    const experts: c_int = 8;
+    const n: c_int = 64;
+    const k: c_int = 512;
+    const tokens: c_int = 96;
+    const rows = tokens * 4;
+    const alloc = std.testing.allocator;
+    const ids_data = try alloc.alloc(u32, @intCast(rows));
+    defer alloc.free(ids_data);
+    for (ids_data, 0..) |*v, i| v.* = @intCast(i * @as(usize, @intCast(experts)) / @as(usize, @intCast(rows)));
+    const ids = mlx.mlx_array_new_data(ids_data.ptr, &[_]c_int{rows}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    const map_data = try alloc.alloc(u32, @intCast(rows));
+    defer alloc.free(map_data);
+    for (map_data, 0..) |*v, i| v.* = @intCast((i * 37 + 5) % @as(usize, @intCast(tokens)));
+    const row_map = mlx.mlx_array_new_data(map_data.ptr, &[_]c_int{rows}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(row_map);
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 0xC0DE));
+    var xn = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xn);
+    try mlx.check(mlx.mlx_random_normal(&xn, &[_]c_int{ tokens * k }, 1, .bfloat16, 0, 0.5, key, s));
+    try mlx.check(mlx.mlx_array_eval(xn));
+    // Token 3 is all NaN, token 7 has one NaN: NaN must reach every output it feeds.
+    const xh = try alloc.alloc(u16, @intCast(tokens * k));
+    defer alloc.free(xh);
+    @memcpy(xh, @as([*]const u16, @ptrCast(mlx.mlx_array_data_bfloat16(xn) orelse return error.NoData))[0..xh.len]);
+    for (xh[@intCast(3 * k)..][0..@intCast(k)]) |*v| v.* = 0x7FC0;
+    xh[@intCast(7 * k + 100)] = 0x7FC0;
+    const x = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ tokens, 1, k }, 3, .bfloat16);
+    defer _ = mlx.mlx_array_free(x);
+    var x_rep = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x_rep);
+    try mlx.check(mlx.mlx_take_axis(&x_rep, x, row_map, 0, s));
+    const sigtab = try @import("../hc/hc_prefill.zig").sigmoidTable(s);
+    for ([_]u32{ 16, 32 }) |group| {
+        // Every word cycles the 16 e2m1 codes (-0 included); the scale bytes cycle all 256 codes, the up bank's
+        // shifted so gate and up meet different codes.
+        const words = try alloc.alloc(u32, @intCast(experts * n * @divExact(k, 8)));
+        defer alloc.free(words);
+        for (words, 0..) |*w, i| w.* = @as(u32, 0x76543210) +% @as(u32, @intCast(i % 2)) *% 0x88888888;
+        const nsc: usize = @intCast(experts * n * @divExact(k, @as(c_int, @intCast(group))));
+        var banks: [2][2]mlx.mlx_array = undefined;
+        for (&banks, 0..) |*b, which| {
+            const codes = try alloc.alloc(u8, nsc);
+            defer alloc.free(codes);
+            for (codes, 0..) |*c, i| c.* = @intCast((i * 7 + which * 101) % 256);
+            b.* = .{
+                mlx.mlx_array_new_data(words.ptr, &[_]c_int{ experts, n, @divExact(k, 8) }, 3, .uint32),
+                mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ experts, n, @divExact(k, @as(c_int, @intCast(group))) }, 3, .uint8),
+            };
+        }
+        defer for (banks) |b| for (b) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const none = mlx.mlx_array{ .ctx = null };
+        for (banks) |b| {
+            const got = (try sortedGatherPrompt(x_rep, b[0], b[1], none, ids, 4, group, true, true, s)) orelse return error.KernelDeclinedTestShape;
+            defer _ = mlx.mlx_array_free(got);
+            const ref = try stockGather(x_rep, b[0], b[1], none, ids, 4, group, true, s);
+            defer _ = mlx.mlx_array_free(ref);
+            try expectBitEqualNan(ref, got, s);
+        }
+        // The paired kernel, clamped at 1 after per-expert scales (one NaN among them would be refused at load, so
+        // finite ones here), against the split path on the same banks: a NaN gate or up stays NaN through the clamp.
+        var esc: [2]mlx.mlx_array = undefined;
+        for (&esc, [_]f32{ 0.75, 1.5 }) |*o, v| {
+            var vals: [8]u16 = undefined;
+            for (&vals, 0..) |*h, i| h.* = @truncate(@as(u32, @bitCast(v * @as(f32, @floatFromInt(i + 1)))) >> 16);
+            o.* = mlx.mlx_array_new_data(&vals, &[_]c_int{experts}, 1, .bfloat16);
+        }
+        defer for (esc) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const mg = (try sortedGatherMapped(x, row_map, banks[0][0], banks[0][1], none, ids, 4, group, true, true, s)) orelse return error.KernelDeclinedTestShape;
+        defer _ = mlx.mlx_array_free(mg);
+        const mu = (try sortedGatherMapped(x, row_map, banks[1][0], banks[1][1], none, ids, 4, group, true, true, s)) orelse return error.KernelDeclinedTestShape;
+        defer _ = mlx.mlx_array_free(mu);
+        var scaled: [2]mlx.mlx_array = undefined;
+        for (&scaled, [_]mlx.mlx_array{ mg, mu }, esc) |*o, y, sc| {
+            var picked = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(picked);
+            try mlx.check(mlx.mlx_take_axis(&picked, sc, ids, 0, s));
+            var col = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(col);
+            try mlx.check(mlx.mlx_reshape(&col, picked, &[_]c_int{ rows, 1, 1 }, 3, s));
+            o.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(o, y, col, s));
+        }
+        defer for (scaled) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        for ([_]u32{ 0, 1 }) |limit| {
+            const fused = (try sortedGateUpScaled(x, row_map, banks[0][0], banks[0][1], none, banks[1][0], banks[1][1], none, ids, sigtab, limit, .{ .gate = esc[0], .up = esc[1] }, 4, group, true, true, s)) orelse return error.KernelDeclinedTestShape;
+            defer _ = mlx.mlx_array_free(fused);
+            var ref = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ref);
+            if (limit > 0) {
+                _ = mlx.mlx_array_free(ref);
+                ref = try @import("../mlp/activations.zig").clampedSwiGLU(s, scaled[0], scaled[1], 1.0);
+            } else {
+                var sig = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(sig);
+                var act = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(act);
+                try mlx.check(mlx.mlx_sigmoid(&sig, scaled[0], s));
+                try mlx.check(mlx.mlx_multiply(&act, scaled[0], sig, s));
+                try mlx.check(mlx.mlx_multiply(&ref, act, scaled[1], s));
+            }
+            try expectBitEqualNan(ref, fused, s);
+        }
+    }
+}
+
+test "segmented NAX paired SwiGLU refuses scales it cannot bind" {
+    try requireNax();
+    errdefer dropOwnLatch();
+    const s = mlx.gpuStream();
+    const experts: c_int = 32;
+    const tokens: c_int = 256;
+    const rows = tokens * 4;
+    const alloc = std.testing.allocator;
+    const ids_data = try alloc.alloc(u32, @intCast(rows));
+    defer alloc.free(ids_data);
+    skewedRouting(ids_data, @intCast(experts));
+    const ids = mlx.mlx_array_new_data(ids_data.ptr, &[_]c_int{rows}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    const map_data = try alloc.alloc(u32, @intCast(rows));
+    defer alloc.free(map_data);
+    for (map_data, 0..) |*v, i| v.* = @intCast(i % @as(usize, @intCast(tokens)));
+    const row_map = mlx.mlx_array_new_data(map_data.ptr, &[_]c_int{rows}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(row_map);
+    const gate = try randomBank(experts, 128, 512, 4, 16, true, 0x2267, s);
+    defer gate.deinit();
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_random_normal(&x, &[_]c_int{ tokens, 1, 512 }, 3, .bfloat16, 0, 0.5, gate.key, s));
+    const sigtab = try @import("../hc/hc_prefill.zig").sigmoidTable(s);
+    const bias = mlx.mlx_array{ .ctx = null };
+    var f32_scale = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32_scale);
+    try mlx.check(mlx.mlx_ones(&f32_scale, &[_]c_int{experts}, 1, .float32, s));
+    var short = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(short);
+    try mlx.check(mlx.mlx_ones(&short, &[_]c_int{experts - 1}, 1, .bfloat16, s));
+    // A scale not in x's dtype, or not one per expert, declines (the caller keeps the split path).
+    for ([_]mlx.mlx_array{ f32_scale, short }) |bad| {
+        try std.testing.expect((try sortedGateUpScaled(x, row_map, gate.w, gate.sc, bias, gate.w, gate.sc, bias, ids, sigtab, 0, .{ .gate = bad }, 4, 16, true, true, s)) == null);
+        try std.testing.expect((try sortedGateUpScaled(x, row_map, gate.w, gate.sc, bias, gate.w, gate.sc, bias, ids, sigtab, 0, .{ .up = bad }, 4, 16, true, true, s)) == null);
     }
 }
 

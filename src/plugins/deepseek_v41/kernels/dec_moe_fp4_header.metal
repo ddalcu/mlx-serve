@@ -1,24 +1,22 @@
-// dec_moe_fp4: the decode MoE over mxfp4 routed experts (and the mxfp8 shared expert, whose gate/up reader is
-// `dec_up_shared` of dec_moe_up_header.metal). A lane owns the units of 32 inputs u = 32 k + lane, so one load covers 32
-// adjacent units: 16 bytes of codes and one e8m0 scale byte a unit.
+// dec_moe_fp4: the decode MoE over fp4 routed experts, MXFP4 (GS 32) or NVFP4 (GS 16), and the mxfp8 shared expert
+// (whose gate/up reader is `dec_up_shared` of dec_moe_up_header.metal). A lane owns the units of 32 inputs
+// u = 32 k + lane, so one load covers 32 adjacent units: 16 bytes of codes and 32 / GS group-scale bytes a unit, each
+// decoded exactly by `mlxserve_fp4_scale_of<GS>` (kernels/common/fp4_scale.metal).
 
 // The two e2m1 codes of byte `b` (low nibble first) as floats, each 2^-14 of its value: sign, then the other three bits
-// placed as an fp16's top exponent and mantissa bits (a zero exponent field is the 0.5 subnormal).
+// placed as an fp16's top exponent and mantissa bits (a zero exponent field is the 0.5 subnormal). -0 stays -0.
 inline float2 dec_fp4_pair(uint b) {
   const uint v = ((b & 0x07u) << 9) | ((b & 0x08u) << 12) | ((b & 0x70u) << 21) | ((b & 0x80u) << 24);
   return float2(as_type<half2>(v));
 }
 
-// e8m0 `e` as 2^(e - 127), times the 2^14 `dec_fp4_pair` leaves out.
-inline float dec_fp4_scale(uint e) {
-  return as_type<float>(e == 0u ? 0x400000u : (e << 23)) * 16384.0f;
-}
-
-// One unit's dot: the 32 codes in `q` against the 32 activations at `x` (bf16).
+// The dot of the codes in words [C0, C1) of `q` (eight codes a word) against their activations at `x` (bf16, a uint4
+// a word).
+template <int C0, int C1>
 inline float dec_fp4_dot(uint4 q, const device uint4* x) {
   float d = 0.0f;
 #pragma unroll
-  for (int c = 0; c < 4; ++c) {
+  for (int c = C0; c < C1; ++c) {
     const uint4 xq = x[c];
     const float xf[8] = {dec_up_bf(xq.x, 0), dec_up_bf(xq.x, 1), dec_up_bf(xq.y, 0), dec_up_bf(xq.y, 1), dec_up_bf(xq.z, 0), dec_up_bf(xq.z, 1), dec_up_bf(xq.w, 0), dec_up_bf(xq.w, 1)};
     const uint a = c == 0 ? q.x : c == 1 ? q.y : c == 2 ? q.z : q.w;
@@ -32,35 +30,46 @@ inline float dec_fp4_dot(uint4 q, const device uint4* x) {
   return d;
 }
 
+// `acc` plus one unit (the 32 codes in `q` against the 32 activations at `x`): each group's dot, its 2^14 restored
+// (exact), times its scale as MLX reads it (`s`: the unit's 32 / GS scale bytes).
+template <int GS>
+inline float dec_fp4_unit(uint4 q, const device uint4* x, const device uint8_t* s, float acc) {
+  if constexpr (GS == 32) {
+    return fma(mlxserve_fp4_scale_of<32>(uint(s[0])), dec_fp4_dot<0, 4>(q, x) * 16384.0f, acc);
+  } else {
+    acc = fma(mlxserve_fp4_scale_of<16>(uint(s[0])), dec_fp4_dot<0, 2>(q, x) * 16384.0f, acc);
+    return fma(mlxserve_fp4_scale_of<16>(uint(s[1])), dec_fp4_dot<2, 4>(q, x) * 16384.0f, acc);
+  }
+}
+
 // The gate (acc[0]) and up (acc[1]) sums of the expert row `row` and `row + N` of the fused gate+up bank against `x`.
-template <int K, int N, typename T>
+template <int K, int N, int GS, typename T>
 inline void dec_fp4_up_routed(const device uint32_t* w, const device uint8_t* sc, size_t row, const device T* x, uint lane, thread float (&acc)[2]) {
-  constexpr uint KW = K / 8, KG = K / 32, UPL = K / 1024;
+  constexpr uint KW = K / 8, KG = K / GS, SPU = 32 / GS, UPL = K / 1024;
   const device uint4* w0 = (const device uint4*)(w + row * KW) + lane;
   const device uint4* w1 = (const device uint4*)(w + (row + N) * KW) + lane;
-  const device uint8_t* s0 = sc + row * KG + lane;
-  const device uint8_t* s1 = sc + (row + N) * KG + lane;
+  const device uint8_t* s0 = sc + row * KG + lane * SPU;
+  const device uint8_t* s1 = sc + (row + N) * KG + lane * SPU;
   acc[0] = acc[1] = 0.0f;
 #pragma unroll
   for (uint k = 0; k < UPL; ++k) {
     const uint4 q0 = w0[32 * k], q1 = w1[32 * k];
-    const float f0 = dec_fp4_scale(uint(s0[32 * k])), f1 = dec_fp4_scale(uint(s1[32 * k]));
     const device uint4* xu = (const device uint4*)x + (32 * k + lane) * 4;
-    acc[0] = fma(f0, dec_fp4_dot(q0, xu), acc[0]);
-    acc[1] = fma(f1, dec_fp4_dot(q1, xu), acc[1]);
+    acc[0] = dec_fp4_unit<GS>(q0, xu, s0 + 32 * SPU * k, acc[0]);
+    acc[1] = dec_fp4_unit<GS>(q1, xu, s1 + 32 * SPU * k, acc[1]);
   }
   acc[0] = simd_sum(acc[0]);
   acc[1] = simd_sum(acc[1]);
 }
 
-// A lane's part of the expert row `row` of the fused-down bank (mxfp4, K inputs) against `x`: units first, first + step...
-template <int K, typename T>
+// A lane's part of the expert row `row` of the fused-down bank (fp4, K inputs) against `x`: units first, first + step...
+template <int K, int GS, typename T>
 inline float dec_fp4_down_routed(const device uint32_t* w, const device uint8_t* sc, size_t row, const device T* x, uint first, uint step) {
-  constexpr uint NU = K / 32;
+  constexpr uint NU = K / 32, SPU = 32 / GS;
   const device uint4* wp = (const device uint4*)(w + row * (K / 8));
-  const device uint8_t* sp = sc + row * (K / 32);
+  const device uint8_t* sp = sc + row * (K / GS);
   float acc = 0.0f;
-  for (uint u = first; u < NU; u += step) acc = fma(dec_fp4_scale(uint(sp[u])), dec_fp4_dot(wp[u], (const device uint4*)x + u * 4), acc);
+  for (uint u = first; u < NU; u += step) acc = dec_fp4_unit<GS>(wp[u], (const device uint4*)x + u * 4, sp + u * SPU, acc);
   return acc;
 }
 
@@ -90,4 +99,13 @@ inline float dec_fp4_down_shared(const device uint32_t* sw, const device uint8_t
     acc = fma(as_type<float>(e == 0u ? 0x400000u : (e << 23)) * 256.0f, d, acc);
   }
   return acc;
+}
+
+// ModelOpt's per-expert scales (T [E]) on expert e's gate and up sums, each rounded to T where `gather_qmm` writes the
+// sum and again after the product, as the composed path multiplies them; a flag off leaves its sum as it is. `P` is
+// the scales' pointer: MLX binds a short input in the constant address space.
+template <int GSCALE, int USCALE, typename T, typename P>
+inline void dec_fp4_expert_scales(thread float (&acc)[2], P gsc, P usc, uint e) {
+  if constexpr (GSCALE != 0) acc[0] = float(T(float(T(acc[0])) * float(gsc[e])));
+  if constexpr (USCALE != 0) acc[1] = float(T(float(T(acc[1])) * float(usc[e])));
 }

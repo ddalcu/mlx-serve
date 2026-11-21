@@ -1,6 +1,7 @@
-//! The MoE for decode rows (R = 1..6) over mxfp4 routed experts, in two launches: gate/up with the clamped SwiGLU and the
-//! shared expert's, then the down projections, the combine and the hc expand. `moe_up.zig` and `moe_down.zig` serve the
-//! affine 2- and 3-bit packs; this serves the pack that keeps the release's experts as shipped.
+//! The MoE for decode rows (R = 1..6) over fp4 routed experts (MXFP4 at group 32, NVFP4 at group 16, with ModelOpt's
+//! optional per-expert scales), in two launches: gate/up with the clamped SwiGLU and the shared expert's, then the down
+//! projections, the combine and the hc expand. `moe_up.zig` and `moe_down.zig` serve the affine 2- and 3-bit packs; this
+//! serves the packs that keep the release's experts as shipped.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -9,13 +10,14 @@ const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
 const moe_up = @import("moe_up.zig");
 const params = @import("../../../sdk/quant/params.zig");
+const fp4 = @import("../../../sdk/quant/fp4.zig");
 
 const A = mlx.mlx_array;
 
 pub const UP_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_up.metal");
 pub const DOWN_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_down.metal");
-pub const HEADER = moe_up.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_header.metal");
-pub const UP_INS = [_][*:0]const u8{ "x", "w", "scales", "sw", "sscales", "inds", "wts", "lim" };
+pub const HEADER = fp4.SCALE_HEADER ++ moe_up.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_moe_fp4_header.metal");
+pub const UP_INS = [_][*:0]const u8{ "x", "w", "scales", "sw", "sscales", "inds", "wts", "lim", "gsc", "usc", "dsc" };
 pub const DOWN_INS = [_][*:0]const u8{ "x", "w", "scales", "sw", "sscales", "inds", "res", "post", "comb" };
 
 /// Threads a threadgroup of the gate/up launch: two simdgroups.
@@ -41,6 +43,10 @@ pub fn build(limit: f32) !Kernels {
     return .{ .up = up, .down = down, .lim = mlx.mlx_array_new_data(&[_]f32{limit}, &[_]c_int{1}, 1, .float32) };
 }
 
+/// ModelOpt's per-expert scales of an NVFP4 bank (`modelopt_pack.buildBanks`), each `[E]` in the stream's dtype: the
+/// gate's before the SiLU, the up's before the clamp, the down's on the routing weight. Null = none.
+pub const Scales = struct { gate: ?A = null, up: ?A = null, down: ?A = null };
+
 fn ci(v: usize) c_int {
     return @intCast(v);
 }
@@ -49,11 +55,23 @@ fn dims(a: A, axis: usize) usize {
     return @intCast(mlx.getShape(a)[axis]);
 }
 
+/// Whether `a` is a `[experts]` bf16 vector.
+fn expertVec(a: ?A, experts: usize) bool {
+    const v = a orelse return true;
+    return mlx.getShape(v).len == 1 and dims(v, 0) == experts and mlx.mlx_array_dtype(v) == .bfloat16;
+}
+
 /// The gate/up half of `h2`'s MoE (`h2` `[R, K]`, `idx` `[R, k]` u32, `wts` `[R, k]` f32; R <= `decode.max_rows`) as
 /// `[R, k + 1, N]`: slot j < k the clamped SwiGLU of row r's j-th expert times its weight, slot k the shared expert's.
-/// Null where the layer's formats are not the served ones (routed mxfp4 group 32 with no biases, shared mxfp8, a bf16
-/// stream) or the shape is not.
+/// A layer with ModelOpt per-expert scales goes through `moeUpScaled`.
 pub fn moeUp(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernels, ly: *const dsv41.Layer, h2: A, idx: A, wts: A) !?A {
+    return moeUpScaled(sc, m, kern, ly, h2, idx, wts, .{});
+}
+
+/// `moeUp` with `es` on the routed experts. Null where the kernel cannot serve the layer: routed experts not fp4 (MXFP4
+/// group 32 or NVFP4 group 16) or with biases, a shared expert not mxfp8 group 32, a stream not bf16, more rows than
+/// a decode step or more than 16 picks, K not a multiple of 1024 (a lane's 32-input units), a scale not `[E]` bf16.
+pub fn moeUpScaled(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernels, ly: *const dsv41.Layer, h2: A, idx: A, wts: A, es: Scales) !?A {
     const gu = ly.experts.gu orelse return null;
     const sgu = ly.shared_gu orelse return null;
     if (!mlx.streamIsGpu(sc.s) or gu.s.ctx == null or gu.b.ctx != null or sgu.s.ctx == null) return null;
@@ -64,30 +82,41 @@ pub fn moeUp(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernels, ly: *c
     const n2 = dims(gu.w, 1);
     if (rows < 1 or rows > decode.max_rows or topk < 1 or topk > 16 or k == 0 or k % 1024 != 0 or n2 % 2 != 0) return null;
     if (dims(idx, 0) != rows or !std.mem.eql(c_int, mlx.getShape(idx), mlx.getShape(wts))) return null;
-    if (gu.qp.mode != .mxfp4 or gu.qp.bits != 4 or gu.qp.group_size != 32 or dims(gu.w, 2) != k / 8 or dims(gu.s, 1) != n2 or dims(gu.s, 2) != k / 32) return null;
+    const f = fp4.of(gu.qp.mode, gu.qp.group_size) orelse return null;
+    if (gu.qp.bits != 4 or dims(gu.w, 2) != k / 8 or dims(gu.s, 1) != n2 or dims(gu.s, 2) != k / f.group()) return null;
     if (sgu.qp.mode != .mxfp8 or sgu.qp.bits != 8 or sgu.qp.group_size != 32) return null;
     const n = n2 / 2;
     if (mlx.mlx_array_dtype(h2) != .bfloat16 or h2.ctx == null or m.act != .bfloat16) return null;
     if (mlx.mlx_array_dtype(gu.w) != .uint32 or mlx.mlx_array_dtype(gu.s) != .uint8) return null;
     if (mlx.mlx_array_dtype(idx) != .uint32 or mlx.mlx_array_dtype(wts) != .float32) return null;
+    inline for (.{ es.gate, es.up, es.down }) |v| if (!expertVec(v, dims(gu.w, 0))) return null;
     const sw = mlx.getShape(sgu.w);
     const ss = mlx.getShape(sgu.s);
     if (sw.len != 2 or ss.len != 2 or sw[0] != ci(n2) or sw[1] != ci(k / 4) or ss[0] != ci(n2) or ss[1] != ci(k / 32)) return null;
     if (mlx.mlx_array_dtype(sgu.w) != .uint32 or mlx.mlx_array_dtype(sgu.s) != .uint8) return null;
     const vgu = if (ly.experts.views) |v| v[0] else gu;
-    return try runUp(sc, kern, rows, k, n, topk, h2, vgu.w, vgu.s, sgu.w, sgu.s, idx, wts);
+    return try runUp(sc, kern, f, rows, k, n, topk, h2, vgu.w, vgu.s, sgu.w, sgu.s, idx, wts, es);
 }
 
 /// The gate/up launch over arrays already checked.
-pub fn runUp(sc: *dsv41.Scope, kern: Kernels, rows: usize, k: usize, n: usize, topk: usize, x: A, w: A, scales: A, sw: A, sscales: A, idx: A, wts: A) !A {
+var up_logged = false;
+
+pub fn runUp(sc: *dsv41.Scope, kern: Kernels, f: fp4.Format, rows: usize, k: usize, n: usize, topk: usize, x: A, w: A, scales: A, sw: A, sscales: A, idx: A, wts: A, es: Scales) !A {
+    if (!up_logged) {
+        up_logged = true;
+        @import("../../../sdk/util/log.zig").info("deepseek_v41: fp4 MoE decode engaged: {t} (group {d}), rows={d} topk={d} k={d} n={d}, per-expert scales gate={} up={} down={}\n", .{ f, f.group(), rows, topk, k, n, es.gate != null, es.up != null, es.down != null });
+    }
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(rows), ci(topk + 1), ci(n) }, 3, .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(32 * n * (topk * rows + 1)), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, up_threads, 1, 1));
-    inline for (.{ .{ "R", rows }, .{ "K", k }, .{ "N", n }, .{ "TOPK", topk } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    const flags = .{ .{ "GSCALE", es.gate != null }, .{ "USCALE", es.up != null }, .{ "DSCALE", es.down != null } };
+    inline for (.{ .{ "R", rows }, .{ "K", k }, .{ "N", n }, .{ "TOPK", topk }, .{ "GS", f.group() } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    inline for (flags) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], @intFromBool(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
-    const ins = [_]A{ x, w, scales, sw, sscales, idx, wts, kern.lim };
+    // An absent scale binds x (bf16, never read: its flag is off).
+    const ins = [_]A{ x, w, scales, sw, sscales, idx, wts, kern.lim, es.gate orelse x, es.up orelse x, es.down orelse x };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -109,8 +138,10 @@ pub fn downCols(k: usize, n: usize, hc: usize) ?usize {
 }
 
 /// x' `[R, hc, N]` = `hcExpand(x1, y, sp)` for y = the `idx` `[R, k]` experts' down rows plus the shared expert's over
-/// `act` `[R, k + 1, K]` (what `moeUp` makes). Null where the kernel does not serve the call: the down bank is not
-/// mxfp4 group 32, the shared is not mxfp8, the stream is not bf16, or K is not a multiple of 32.
+/// `act` `[R, k + 1, K]` (what `moeUp` makes; a down scale rode its routing weights). Null where the kernel does not
+/// serve the call: the down bank not fp4 (MXFP4 group 32 or NVFP4 group 16) or with biases, the shared not mxfp8, the
+/// stream not bf16, K not a multiple of 32, more rows than a decode step, more than 16 picks or 32 streams, or no
+/// column split (`downCols`).
 pub fn moeDown(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A, idx: A, x1: A, sp: *const dsv41.Split) !?A {
     if (!mlx.streamIsGpu(sc.s)) return null;
     const down = if (ly.experts.views) |v| &v[1] else &ly.experts.down;
@@ -123,24 +154,30 @@ pub fn moeDown(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A, 
     const topk = dims(idx, 1);
     if (R < 1 or R > decode.max_rows or dims(act, 1) != topk + 1 or dims(x1, 0) != R or dims(idx, 0) != R or topk < 1 or topk > 16 or hc < 1 or hc > 32) return null;
     if (K == 0 or K % 32 != 0 or sp.post.ctx == null or sp.comb.ctx == null) return null;
-    if (down.qp.mode != .mxfp4 or down.qp.bits != 4 or down.qp.group_size != 32 or down.s.ctx == null or down.b.ctx != null) return null;
+    const f = fp4.of(down.qp.mode, down.qp.group_size) orelse return null;
+    if (down.qp.bits != 4 or down.s.ctx == null or down.b.ctx != null) return null;
     if (shared.qp.mode != .mxfp8 or shared.qp.bits != 8 or shared.qp.group_size != 32 or shared.s.ctx == null) return null;
     if (mlx.mlx_array_dtype(act) != .bfloat16 or mlx.mlx_array_dtype(x1) != .bfloat16 or mlx.mlx_array_dtype(idx) != .uint32) return null;
     if (mlx.mlx_array_dtype(down.w) != .uint32 or mlx.mlx_array_dtype(down.s) != .uint8 or mlx.mlx_array_dtype(shared.w) != .uint32 or mlx.mlx_array_dtype(shared.s) != .uint8) return null;
     if (mlx.mlx_array_dtype(sp.post) != .float32 or mlx.mlx_array_dtype(sp.comb) != .float32 or mlx.mlx_array_size(sp.post) != R * hc or mlx.mlx_array_size(sp.comb) != R * hc * hc) return null;
-    if (mlx.getShape(down.w).len != 3 or mlx.getShape(down.s).len != 3 or dims(down.w, 1) != N or dims(down.w, 2) != K / 8 or dims(down.s, 1) != N or dims(down.s, 2) != K / 32) return null;
+    if (mlx.getShape(down.w).len != 3 or mlx.getShape(down.s).len != 3 or dims(down.w, 1) != N or dims(down.w, 2) != K / 8 or dims(down.s, 1) != N or dims(down.s, 2) != K / f.group()) return null;
     if (mlx.getShape(shared.w).len != 2 or mlx.getShape(shared.s).len != 2 or dims(shared.w, 0) != N or dims(shared.w, 1) != K / 4 or dims(shared.s, 0) != N or dims(shared.s, 1) != K / 32) return null;
+    const nc = downCols(K, N, hc) orelse return null;
+    return try runDown(sc, kern, f, R, K, N, topk, hc, nc, act, down.w, down.s, shared.w, shared.s, idx, x1, sp.post, sp.comb);
+}
+
+/// The down launch over arrays already checked.
+pub fn runDown(sc: *dsv41.Scope, kern: Kernels, f: fp4.Format, R: usize, K: usize, N: usize, topk: usize, hc: usize, nc: usize, act: A, w: A, scales: A, sw: A, sscales: A, idx: A, x1: A, post: A, comb: A) !A {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     const shape = [_]c_int{ ci(R), ci(hc), ci(N) };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, shape.len, .bfloat16));
-    const nc = downCols(K, N, hc) orelse return null;
     const tg = 32 * (topk + 1);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(N / nc * tg), ci(R), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
-    inline for (.{ .{ "K", K }, .{ "N", N }, .{ "TOPK", topk }, .{ "HC", hc }, .{ "NC", nc } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    inline for (.{ .{ "K", K }, .{ "N", N }, .{ "TOPK", topk }, .{ "HC", hc }, .{ "NC", nc }, .{ "GS", f.group() } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
-    const ins = [_]A{ act, down.w, down.s, shared.w, shared.s, idx, x1, sp.post, sp.comb };
+    const ins = [_]A{ act, w, scales, sw, sscales, idx, x1, post, comb };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -193,24 +230,31 @@ fn intCode(c: u32) u32 {
     };
 }
 
-/// An mxfp4 operand of rows `lead..` x K as the kernel binds it: words (eight 4-bit codes, the first in the low nibble)
-/// and e8m0 scales, both held as integer-valued float64.
+/// An fp4 operand of rows `lead..` x K as the kernel binds it: words (eight 4-bit codes, the first in the low nibble)
+/// and group scales (e8m0 per 32, or e4m3 per 16), both held as integer-valued float64.
 const Fp4 = struct {
     w: []f64,
     s: []f64,
     k: usize,
+    gs: usize,
 
-    fn add(c: anytype, lead: []const usize, K: usize) !Fp4 {
+    fn add(c: anytype, lead: []const usize, K: usize, gs: usize) !Fp4 {
         var wd: [3]usize = undefined;
         @memcpy(wd[0..lead.len], lead);
         var sd = wd;
         wd[lead.len] = K / 8;
-        sd[lead.len] = K / 32;
-        return .{ .w = try c.add(.uint32, wd[0 .. lead.len + 1]), .s = try c.add(.uint8, sd[0 .. lead.len + 1]), .k = K };
+        sd[lead.len] = K / gs;
+        return .{ .w = try c.add(.uint32, wd[0 .. lead.len + 1]), .s = try c.add(.uint8, sd[0 .. lead.len + 1]), .k = K, .gs = gs };
     }
 
     fn rows(self: Fp4) usize {
-        return self.s.len / (self.k / 32);
+        return self.s.len / (self.k / self.gs);
+    }
+
+    /// A group scale's value.
+    fn scale(self: Fp4, byte: f64) f64 {
+        if (self.gs == 16) return kc.host.e4m3(@intFromFloat(byte));
+        return std.math.pow(f64, 2, byte - 127);
     }
 
     fn code(self: Fp4, row: usize, i: usize) u32 {
@@ -230,7 +274,7 @@ const Fp4 = struct {
     fn weight(self: Fp4, row: usize, i: usize) f64 {
         const c = self.code(row, i);
         const v = e2m1[c & 7];
-        return (if (c & 8 != 0) -v else v) * std.math.pow(f64, 2, self.s[row * (self.k / 32) + i / 32] - 127);
+        return (if (c & 8 != 0) -v else v) * self.scale(self.s[row * (self.k / self.gs) + i / self.gs]);
     }
 
     /// Random codes under scales near 2^-6.
@@ -241,7 +285,7 @@ const Fp4 = struct {
             for (codes) |*c| c.* = rng.uintLessThan(u32, 16);
             self.pack(r, codes);
         }
-        for (self.s) |*e| e.* = @floatFromInt(119 + rng.uintLessThan(u32, 5));
+        for (self.s) |*e| e.* = @floatFromInt(if (self.gs == 16) kc.host.e4m3Code(rng, -6, -2, false) else 119 + rng.uintLessThan(u32, 5));
     }
 
     /// Every row the same mirrored halves: integer magnitudes on the first half (1 on the first 8 entries, up to 6
@@ -259,7 +303,7 @@ const Fp4 = struct {
             }
             self.pack(r, codes);
         }
-        @memset(self.s, 127);
+        @memset(self.s, if (self.gs == 16) 0x38 else 127);
     }
 
     /// Row `r` against `x` [K]: the sum (`sum`'s accumulator) and its terms' magnitude.
@@ -313,9 +357,10 @@ fn fillShared(rng: std.Random, words: []f64, exps: []f64, rows: usize, K: usize,
     packBytes(words, bytes);
 }
 
-/// The block's gate/up half: `rows` decode rows over `Params.experts` routed mxfp4 experts plus the shared mxfp8 expert.
+/// The block's gate/up half: `rows` decode rows over `Params.experts` routed fp4 experts (groups of `gs`; `scaled`:
+/// with per-expert gate, up and down scales) plus the shared mxfp8 expert.
 const UpK = struct {
-    pub const Params = struct { experts: usize = 8, lim: f64 = 10 };
+    pub const Params = struct { experts: usize = 8, lim: f64 = 10, gs: usize = 32, scaled: bool = false };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or s.rows > decode.max_rows or s.n == 0 or s.k == 0 or s.k % 1024 != 0 or p.experts < TOPK or p.experts > 64) return null;
@@ -325,6 +370,8 @@ const UpK = struct {
         g.int("K", s.k);
         g.int("N", s.n);
         g.int("TOPK", TOPK);
+        g.int("GS", p.gs);
+        inline for (.{ "GSCALE", "USCALE", "DSCALE" }) |n| g.int(n, @intFromBool(p.scaled));
         g.dtype("T", adt);
         return g;
     }
@@ -335,15 +382,19 @@ const UpK = struct {
         const N = k.shape.n;
         const K = k.shape.k;
         const x = try k.add(adt, &.{ R, K });
-        const routed = try Fp4.add(k, &.{ p.experts, 2 * N }, K);
+        const routed = try Fp4.add(k, &.{ p.experts, 2 * N }, K, p.gs);
         const sw = try k.add(.uint32, &.{ 2 * N, K / 4 });
         const ss = try k.add(.uint8, &.{ 2 * N, K / 32 });
         const inds = try k.add(.uint32, &.{ R, TOPK });
         const wts = try k.add(.float32, &.{ R, TOPK });
         const lim = try k.add(.float32, &.{1});
+        var es: [3][]f64 = undefined;
+        for (&es) |*v| v.* = try k.add(adt, &.{p.experts});
         kit.uniform(rng, x, -2, 2);
         kit.uniform(rng, wts, 0.05, 0.5);
         lim[0] = p.lim;
+        // Unscaled, the flags leave them unread; scaled, near 1 under the stress fill's exact sums.
+        for (es) |v| if (p.scaled and f != .stress) kit.uniform(rng, v, 0.5, 2) else @memset(v, 1);
         for (0..R) |row| {
             var pool: [64]usize = undefined;
             for (pool[0..p.experts], 0..) |*e, i| e.* = i;
@@ -384,26 +435,42 @@ const UpK = struct {
         const R = k.shape.rows;
         const N = k.shape.n;
         const K = k.shape.k;
-        const routed: Fp4 = .{ .w = k.in(1), .s = k.in(2), .k = K };
+        const routed: Fp4 = .{ .w = k.in(1), .s = k.in(2), .k = K, .gs = k.p.gs };
         const t = try k.scratch().alloc(f64, K);
         defer k.scratch().free(t);
         const lim = k.in(7)[0];
+        // Each sum's error (and its bf16 rounding) as a sum error: gamma(K) of the terms' magnitude covers it.
+        const flip = 0x1p-8 / spec.gamma(@floatFromInt(K), u);
         for (0..R) |row| for (0..TOPK + 1) |j| for (0..N) |c| {
             const x = k.in(0)[row * K ..][0..K];
             var g: [2]f64 = undefined;
             var up: [2]f64 = undefined;
             var wt: f64 = 1;
+            var gt = bf(0);
+            var ut = bf(0);
             if (j < TOPK) {
                 const e: usize = @intFromFloat(k.in(5)[row * TOPK + j]);
                 g = routed.dot(e * 2 * N + c, x, sum, t);
                 up = routed.dot(e * 2 * N + N + c, x, sum, t);
                 wt = k.in(6)[row * TOPK + j];
+                gt = bf(g[0]);
+                ut = bf(up[0]);
+                if (k.p.scaled) {
+                    // A scaled sum is rounded again: its error grows by the scale, plus one more rounding.
+                    const gs = k.in(8)[e];
+                    const us = k.in(9)[e];
+                    gt = bf(gt * gs);
+                    ut = bf(ut * us);
+                    g = .{ g[0] * gs, (g[1] + 2 * @abs(g[0]) * flip) * @abs(gs) };
+                    up = .{ up[0] * us, (up[1] + 2 * @abs(up[0]) * flip) * @abs(us) };
+                    wt *= k.in(10)[e];
+                }
             } else {
                 g = sharedDot(k, c, x, sum, t);
                 up = sharedDot(k, N + c, x, sum, t);
+                gt = bf(g[0]);
+                ut = bf(up[0]);
             }
-            const gt = bf(g[0]);
-            const ut = bf(up[0]);
             const gc = kit.minN(gt, lim);
             const uc = if (std.math.isNan(ut)) kit.nan else std.math.clamp(ut, -lim, lim);
             const sig = 1 / (1 + @exp(-gc));
@@ -411,7 +478,7 @@ const UpK = struct {
             out[o] = gc * sig * uc * wt;
             // Each sum's error (and its bf16 rounding) reaches y scaled by y's slope in it.
             const slope_g = @abs(sig * (1 + gc * (1 - sig)) * uc * wt);
-            mag[o] = (g[1] + @abs(g[0]) * 0x1p-8 / spec.gamma(@floatFromInt(K), u)) * slope_g * 2 + (up[1] + @abs(up[0]) * 0x1p-8 / spec.gamma(@floatFromInt(K), u)) * @abs(gc * sig * wt) * 2;
+            mag[o] = (g[1] + @abs(g[0]) * flip) * slope_g * 2 + (up[1] + @abs(up[0]) * flip) * @abs(gc * sig * wt) * 2;
         };
     }
 
@@ -427,10 +494,10 @@ const UpK = struct {
     }
 };
 
-/// The block's down half: `rows` decode rows over `Params.experts` routed mxfp4 experts plus the shared mxfp8 expert, y
-/// rounded to bf16 once, then the hc expand.
+/// The block's down half: `rows` decode rows over `Params.experts` routed fp4 experts (groups of `gs`) plus the shared
+/// mxfp8 expert, y rounded to bf16 once, then the hc expand.
 const DownK = struct {
-    pub const Params = struct { experts: usize = 8 };
+    pub const Params = struct { experts: usize = 8, gs: usize = 32 };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows < 1 or s.rows > decode.max_rows or s.n == 0 or s.k == 0 or s.k % 32 != 0 or p.experts < TOPK or p.experts > 64) return null;
@@ -443,6 +510,7 @@ const DownK = struct {
         g.int("TOPK", TOPK);
         g.int("HC", HC);
         g.int("NC", nc);
+        g.int("GS", p.gs);
         g.dtype("T", adt);
         return g;
     }
@@ -453,7 +521,7 @@ const DownK = struct {
         const N = k.shape.n;
         const K = k.shape.k;
         const x = try k.add(adt, &.{ R, TOPK + 1, K });
-        const routed = try Fp4.add(k, &.{ p.experts, N }, K);
+        const routed = try Fp4.add(k, &.{ p.experts, N }, K, p.gs);
         const sw = try k.add(.uint32, &.{ N, K / 4 });
         const ss = try k.add(.uint8, &.{ N, K / 32 });
         const inds = try k.add(.uint32, &.{ R, TOPK });
@@ -502,7 +570,7 @@ const DownK = struct {
         const R = k.shape.rows;
         const N = k.shape.n;
         const K = k.shape.k;
-        const routed: Fp4 = .{ .w = k.in(1), .s = k.in(2), .k = K };
+        const routed: Fp4 = .{ .w = k.in(1), .s = k.in(2), .k = K, .gs = k.p.gs };
         const t = try k.scratch().alloc(f64, K);
         defer k.scratch().free(t);
         // y's one bf16 rounding, as a sum error: gamma(K) of the terms' magnitude covers an eighth-bit of the sum.
@@ -545,10 +613,16 @@ const DownK = struct {
 };
 
 /// Served shapes cut the output width to a few columns: each runs the same code at its own index; the reduction length
-/// and the rows (R = 1..6, over 8 experts so the rows share most of them) are the release's.
+/// and the rows (R = 1..6, over 8 experts so the rows share most of them) are the release's. One case a format: MXFP4,
+/// NVFP4, NVFP4 with ModelOpt's per-expert scales (the gate/up launch's; the down launch never reads them).
 pub fn register(set: *kc.Set) !void {
-    try kit.add(set, UpK, &up_l, .{}, .{
-        .name = "dsv41 dec moe_fp4 up (mxfp4 routed + mxfp8 shared)",
+    const ups = [_]struct { [:0]const u8, UpK.Params }{
+        .{ "dsv41 dec moe_fp4 up (mxfp4 routed + mxfp8 shared)", .{} },
+        .{ "dsv41 dec moe_fp4 up (nvfp4 routed + mxfp8 shared)", .{ .gs = 16 } },
+        .{ "dsv41 dec moe_fp4 up (nvfp4 routed with per-expert scales + mxfp8 shared)", .{ .gs = 16, .scaled = true } },
+    };
+    for (ups) |c| try kit.add(set, UpK, &up_l, c[1], .{
+        .name = c[0],
         .accum = .f32,
         .depth = depth,
         .ops = 8,
@@ -558,8 +632,12 @@ pub fn register(set: *kc.Set) !void {
         .served = &.{ .{ .rows = 1, .n = 64, .k = 5120 }, .{ .rows = 3, .n = 17, .k = 5120 }, .{ .rows = decode.max_rows, .n = 64, .k = 5120 } },
         .sums = .{ .f16 = 30, .bf16 = 30, .why = "a wrong sum's activation tends to 0, so a miss tops out near 1 / the bound" },
     });
-    try kit.add(set, DownK, &down_l, .{}, .{
-        .name = "dsv41 dec moe_fp4 down (mxfp4 routed + mxfp8 shared, hc expand)",
+    const downs = [_]struct { [:0]const u8, DownK.Params }{
+        .{ "dsv41 dec moe_fp4 down (mxfp4 routed + mxfp8 shared, hc expand)", .{} },
+        .{ "dsv41 dec moe_fp4 down (nvfp4 routed + mxfp8 shared, hc expand)", .{ .gs = 16 } },
+    };
+    for (downs) |c| try kit.add(set, DownK, &down_l, c[1], .{
+        .name = c[0],
         .accum = .f32,
         .depth = depth,
         .ops = 4,
@@ -832,43 +910,52 @@ test "dsv41 dec moe_fp4: formats and shapes it does not serve are declined" {
         ly.experts.gu.?.qp.group_size = 64;
         try testing.expect(try moeUp(&sc, m, kern, &ly, h2, idx, wts) == null);
         ly = fx.layer(20).*;
+        ly.experts.gu.?.qp.mode = .nvfp4; // an fp4 mode at another format's group
+        try testing.expect(try moeUp(&sc, m, kern, &ly, h2, idx, wts) == null);
+        ly = fx.layer(20).*;
         ly.shared_gu.?.qp.mode = .affine;
         try testing.expect(try moeUp(&sc, m, kern, &ly, h2, idx, wts) == null);
+        ly = fx.layer(20).*;
+        const wrong = try sc.keep(mlx.mlx_array_new_data(&[_]f32{ 1, 1, 1 }, &[_]c_int{3}, 1, .float32));
+        try testing.expect(try moeUpScaled(&sc, m, kern, &ly, h2, idx, wts, .{ .gate = wrong }) == null); // not [E] bf16
         ly = fx.layer(20).*;
         try testing.expect(try moeUp(&sc, m, kern, &ly, try moe_up.astype(&sc, h2, .float32), idx, wts) == null); // an f32 stream
     }
     try testing.expect(served != null); // the unchanged layer is served: the declines above are the changes
 }
 
-test "dsv41 dec moe_fp4: the declared launches are the wrappers', byte for byte" {
+test "dsv41 dec moe_fp4: the declared launches are the wrappers', byte for byte (mxfp4, nvfp4, nvfp4 with per-expert scales)" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = testing.allocator;
     const kern = try build(10);
     defer kern.deinit();
-    for ([_]usize{ 1, 2, 6 }) |rows| {
+    for ([_]UpK.Params{ .{}, .{ .gs = 16 }, .{ .gs = 16, .scaled = true } }) |p| for ([_]usize{ 1, 2, 6 }) |rows| {
+        const f = fp4.of(if (p.gs == 16) .nvfp4 else .mxfp4, @intCast(p.gs)).?;
         {
             const c = try a.create(kit.Case(UpK));
             defer {
                 c.deinit();
                 a.destroy(c);
             }
-            c.* = .init(a, &up_l, .{});
+            c.* = .init(a, &up_l, p);
             try testing.expect(try c.prepare(.{ .rows = rows, .n = 9, .k = 2048 }, .random, 7));
             try c.run();
             const mine = try a.dupe(u8, c.rig.outputBytes());
             defer a.free(mine);
             var sc = dsv41.Scope.init(a, c.rig.stream());
             defer sc.deinit();
-            const theirs = try runUp(&sc, .{ .up = kern.up, .down = kern.down, .lim = c.args[7] }, rows, 2048, 9, TOPK, c.args[0], c.args[1], c.args[2], c.args[3], c.args[4], c.args[5], c.args[6]);
+            const es: Scales = if (p.scaled) .{ .gate = c.args[8], .up = c.args[9], .down = c.args[10] } else .{};
+            const theirs = try runUp(&sc, .{ .up = kern.up, .down = kern.down, .lim = c.args[7] }, f, rows, 2048, 9, TOPK, c.args[0], c.args[1], c.args[2], c.args[3], c.args[4], c.args[5], c.args[6], es);
             try testing.expectEqualSlices(u8, try c.rig.bytesOf(&.{theirs}), mine);
         }
+        if (p.scaled) continue;
         {
             const c = try a.create(kit.Case(DownK));
             defer {
                 c.deinit();
                 a.destroy(c);
             }
-            c.* = .init(a, &down_l, .{});
+            c.* = .init(a, &down_l, .{ .gs = p.gs });
             try testing.expect(try c.prepare(.{ .rows = rows, .n = 64, .k = 256 }, .random, 7));
             try c.run();
             const mine = try a.dupe(u8, c.rig.outputBytes());
@@ -876,12 +963,12 @@ test "dsv41 dec moe_fp4: the declared launches are the wrappers', byte for byte"
             var sc = dsv41.Scope.init(a, c.rig.stream());
             defer sc.deinit();
             var ly: dsv41.Layer = undefined;
-            ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .down = .{ .w = c.args[1], .s = c.args[2], .b = none, .qp = .{ .bits = 4, .group_size = 32, .mode = .mxfp4 } } };
+            ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .down = .{ .w = c.args[1], .s = c.args[2], .b = none, .qp = .{ .bits = 4, .group_size = f.group(), .mode = f.mode() } } };
             ly.shared[2] = .{ .w = c.args[3], .s = c.args[4], .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } };
             const got = (try moeDown(&sc, kern, &ly, c.args[0], c.args[5], c.args[6], &.{ .pre = none, .post = c.args[7], .comb = c.args[8] })) orelse return error.Declined;
             try testing.expectEqualSlices(u8, try c.rig.bytesOf(&.{got}), mine);
         }
-    }
+    };
 }
 
 test "dsv41 dec moe_fp4: the registered kernels pass the contract's gates 1-4" {

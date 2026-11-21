@@ -615,10 +615,10 @@ const Q2 = struct {
 
 // ── mxfp8_qmv: e4m3 weights, an e8m0 exponent per 32 ──
 
-const fp8_launch = metal.Launch{ .name = "mlxserve_mxfp8_qmv", .inputs = &.{ "x", "w_q", "scales" }, .outputs = &.{"y"}, .source = kernelSource("kernels/qmm/mxfp8_qmv.metal"), .header = mxfp8_qmv.HEADER, .tg_bytes = 0, .m1 = 832, .m2 = 832, .min_gen = 16 };
+const fp8_launch = metal.Launch{ .name = "mlxserve_mxfp8_qmv", .inputs = &.{ "x", "w_q", "scales" }, .outputs = &.{"y"}, .source = kernelSource("kernels/qmm/mxfp8_qmv.metal"), .header = mxfp8_qmv.QMV_HEADER, .tg_bytes = 0, .m1 = 832, .m2 = 832, .min_gen = 16 };
 
-/// An e4m3 byte's value (the OCP fn variant: no infinities; the kernel reads S.1111.111, MLX's NaN, as 480, so the
-/// fills never draw it).
+/// An e4m3 byte's value (the OCP fn variant: no infinities; S.1111.111 is MLX's NaN, which the kernel reads too, so
+/// the fills never draw it).
 fn e4m3(b: u8) f64 {
     const sign: f64 = if (b & 0x80 != 0) -1 else 1;
     const e: i32 = (b >> 3) & 15;
