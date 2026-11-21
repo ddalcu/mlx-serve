@@ -217,7 +217,7 @@ fn validate(c: *const C, w: *const weights_load.Weights) !void {
         try V.shape(a ++ ".learnable_sink_param", .{n}, &.{h});
         if (c.dsa_layers[li]) {
             const ci = a ++ ".compressed_indexer";
-            try V.q(ci ++ ".query_projection", .{n}, c.index_n_heads * c.index_head_dim, d);
+            try V.q(ci ++ ".query_projection", .{n}, c.index_n_heads * c.index_head_dim, c.q_lora_rank);
             try V.q(ci ++ ".token_key_projection", .{n}, c.index_head_dim, d);
             try V.q(ci ++ ".head_weight_projection", .{n}, c.index_n_heads, d);
             try V.has(ci ++ ".key_value_projection.weight", .{n});
@@ -263,9 +263,9 @@ fn validateMlp(V: *Check, li: u32) !void {
     try V.qfused3("model.layers.{d}.mlp.experts.down_proj", .{n}, e, lat, mi, c.quant_group_size);
     try V.q("model.layers.{d}.mlp.routed_expert_up_proj", .{n}, d, c.routed_expert_hidden_size);
     try V.q("model.layers.{d}.mlp.routed_expert_down_proj", .{n}, c.routed_expert_hidden_size, d);
-    try V.q("model.layers.{d}.mlp.shared_experts.gate_proj", .{n}, c.intermediate_size, d);
-    try V.q("model.layers.{d}.mlp.shared_experts.up_proj", .{n}, c.intermediate_size, d);
-    try V.q("model.layers.{d}.mlp.shared_experts.down_proj", .{n}, d, c.intermediate_size);
+    try V.q("model.layers.{d}.mlp.shared_experts.gate_proj", .{n}, c.moe_intermediate_size, d);
+    try V.q("model.layers.{d}.mlp.shared_experts.up_proj", .{n}, c.moe_intermediate_size, d);
+    try V.q("model.layers.{d}.mlp.shared_experts.down_proj", .{n}, d, c.moe_intermediate_size);
     try V.shape("model.layers.{d}.mlp.combine_output_norm.weight", .{n}, &.{d});
     if (!c.engram_layers[li]) return;
     // The Engram memory is `(max_ngram-1) * heads * head_dim` wide (16 heads x 96 = 1536).
@@ -320,9 +320,10 @@ fn validateDfly(V: *Check) !void {
     for (0..c.dfly_layers) |di| {
         const n: u64 = di;
         const a = "model.dfly_layers.{d}.self_attn";
-        for (&[_][]const u8{ "input_layernorm", "post_attention_layernorm", "q_a_layernorm", "kv_a_layernorm",
-            "post_proj_norm" }) |s|
+        for (&[_][]const u8{ "input_layernorm", "post_attention_layernorm" }) |s|
             try V.has("model.dfly_layers.{d}." ++ "{s}" ++ ".weight", .{ n, s });
+        for (&[_][]const u8{ "q_a_layernorm", "kv_a_layernorm", "post_proj_norm" }) |s|
+            try V.has(a ++ "." ++ "{s}" ++ ".weight", .{ n, s });
         try V.has(a ++ ".q_a_proj.weight", .{n});
         try V.has(a ++ ".q_b_proj.weight", .{n});
         try V.has(a ++ ".kv_a_proj_with_mqa.weight", .{n});

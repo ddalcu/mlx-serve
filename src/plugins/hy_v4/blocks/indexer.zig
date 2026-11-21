@@ -118,17 +118,6 @@ pub const Indexer = struct {
         const ids = try t.argsort(try t.neg(masked), -1); // [rows, ng], descending logits
         const top = try t.slice(ids, &.{ 0, 0 }, &.{ rows, k });
         const recalled = try t.concat(&.{ top, try t.expandDims(own_arr, -1) }, -1); // [rows, group_topk]
-        try ops.eval(top);
-        try ops.eval(recalled);
-        {
-            const ti = mlx.mlx_array_data_int32(top) orelse @panic("x");
-            const ri = mlx.mlx_array_data_int32(recalled) orelse @panic("x");
-            std.debug.print("ix sh top={any}\ntop vals={any}\nrec={any}\nrec vals={any}\n", .{
-                ops.shape(top), ti[0..mlx.mlx_array_size(top)], ops.shape(recalled), ri[0..mlx.mlx_array_size(recalled)] });
-            try ops.eval(masked);
-            const mi = mlx.mlx_array_data_float32(masked) orelse @panic("x");
-            std.debug.print("ix masked={any}\n", .{mi[0..mlx.mlx_array_size(masked)]});
-        }
 
         // Recall slots: `group * ratio + i` for every i in the group; all complete, so none overflows.
         const slots = try t.reshape(
@@ -144,20 +133,7 @@ pub const Indexer = struct {
         try mlx.check(mlx.mlx_put_along_axis(&put, outside, slots, try t.zeros(&.{ rows, @intCast(ix.group_topk * ix.ratio) }, .bfloat16), -1, t.s));
         // Both arms are additive: causal + recall is 0 only where the query may read the slot.
         const causal = try causalMask(&t, rows, kv_len);
-        try ops.eval(causal);
-        {
-            const cvm = mlx.mlx_array_data_float32(causal) orelse @panic("x");
-            try ops.eval(try causalMask(&t, rows, kv_len));
-            std.debug.print("ix causal sh={any} vals={any}\n", .{ ops.shape(causal), cvm[0..mlx.mlx_array_size(causal)] });
-        }
         const put_owned = try t.adopt(put);
-        try ops.eval(put_owned);
-        try ops.eval(slots);
-        {
-            const pv = mlx.mlx_array_data_float32(put_owned) orelse @panic("x");
-            const sl = mlx.mlx_array_data_int32(slots) orelse @panic("x");
-            std.debug.print("ix put={any}\nslots={any}\n", .{ pv[0..mlx.mlx_array_size(put_owned)], sl[0..mlx.mlx_array_size(slots)] });
-        }
         const mask4 = try t.add(try t.reshape(put_owned, &.{ 1, 1, rows, kv_len }), causal);
         return t.escape(mask4);
     }

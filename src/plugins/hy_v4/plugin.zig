@@ -50,7 +50,7 @@ fn bill(p: *const abi.Parsed, shape: *const abi.Shape, out: *abi.Bill) callconv(
         @as(u64, (c.kv_lora_rank + c.qk_rope_head_dim)) * c.num_attention_heads * 256 +
         @as(u64, c.num_attention_heads) * c.v_head_dim * d + @as(u64, d) * c.num_attention_heads * c.v_head_dim) * (q + 2) / 8;
     // The compressed indexer's query/key projections (tiny; same affine layout).
-    const idx_bytes = @as(u64, c.index_n_heads) * c.index_head_dim * d * (q + 2) / 8 + @as(u64, d) * 256 * (q + 2) / 8;
+    const idx_bytes = @as(u64, c.index_n_heads) * c.index_head_dim * c.q_lora_rank * (q + 2) / 8 + @as(u64, d) * 256 * (q + 2) / 8;
     // Router gate (f32 rows) + bias ledger, iHC f32 tables, per-arm norms.
     const route_bytes = @as(u64, d) * c.n_routed_experts * 4 + @as(u64, c.n_routed_experts) * 4 + 800_000;
     for (0..c.num_hidden_layers) |li| {
@@ -62,7 +62,7 @@ fn bill(p: *const abi.Parsed, shape: *const abi.Shape, out: *abi.Bill) callconv(
             // Packed exactly as the pack ships it: gate+up fused into [512, 3072, 192] U32 nibbles (4-bit)
             // with g32 bf16 scale+bias, down [512, 1536, 192]. No fused SwiGLU is possible, so it is never billed.
             load_bytes += @as(u64, c.n_routed_experts) * (3072 * 192 * 4 + 2 * 3072 * 24 * 2 + 1536 * 192 * 4 + 2 * 1536 * 24 * 2);
-            load_bytes += @as(u64, c.n_shared_experts) * 3 * d * c.intermediate_size * (q + 2) / 8; // shared expert
+            load_bytes += @as(u64, c.n_shared_experts) * 3 * d * c.moe_intermediate_size * (q + 2) / 8; // shared expert
             load_bytes += route_bytes;
         }
     }

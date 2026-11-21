@@ -78,8 +78,10 @@ pub const Model = struct {
         var g = Graph.init(gpa, mlx.gpuStream());
         defer g.deinit();
 
-        const ids = if (f.ids.ctx != null)
-            try g.adopt(.{ .ctx = f.ids.ctx })
+        // The host owns the id array: borrow it, never adopt it into this graph (its deinit would free the
+        // host's handle twice).
+        const ids: Array = if (f.ids.ctx != null)
+            .{ .ctx = f.ids.ctx }
         else blk: {
             const buf = try gpa.alloc(i32, f.tokens.len);
             defer gpa.free(buf);
