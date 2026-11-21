@@ -105,6 +105,11 @@ fn run(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, m: *const dsv41.Dsv41Model, 
 }
 
 fn runWith(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, m: *const dsv41.Dsv41Model, q: A, win: dsv41.Ring, comp_rows: A, topk: A, p0: usize, scal: A, merge: ?[2]A) !?Partials {
+    return runSplits(sc, kern, m, q, win, comp_rows, topk, p0, scal, merge, null);
+}
+
+/// `runWith` at `splits` (null: `splitsFor`'s; the ubench's sweep), at least the keys' least.
+fn runSplits(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, m: *const dsv41.Dsv41Model, q: A, win: dsv41.Ring, comp_rows: A, topk: A, p0: usize, scal: A, merge: ?[2]A, splits: ?c_int) !?Partials {
     if (!mlx.streamIsGpu(sc.s) or !device.naxAvailable()) return null;
     const qs = mlx.getShape(q);
     if (qs.len != 3 or qs[2] != HD or @mod(qs[1], 16) != 0 or qs[0] < 1 or qs[0] > decode.max_rows) return null;
@@ -114,7 +119,9 @@ fn runWith(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, m: *const dsv41.Dsv41Mod
     const K: c_int = if (comp_rows.ctx != null) dimOf(topk, 1) else 0;
     const nc: c_int = if (K > 0) dimOf(comp_rows, 0) else 0;
     if (K > 0 and nc == 0) return null;
-    const S = splitsFor(m.cfg.sliding_window + @as(usize, @intCast(K))) orelse return null;
+    const keys = m.cfg.sliding_window + @as(usize, @intCast(K));
+    const S0 = splitsFor(keys) orelse return null;
+    const S: c_int = if (splits) |v| (if (v * BK >= keys and v <= MAX_SPLITS) v else return null) else S0;
     const meta_v = [_]i32{ @intCast(p0), nc, @intCast(m.cfg.sliding_window), @intCast(win.cap) };
     const meta = try sc.ints(&meta_v, &.{meta_v.len});
     const comp = if (K > 0) try sc.astype(comp_rows, .bfloat16) else win.buf;
@@ -985,6 +992,7 @@ const WoaChain = struct {
     wts: []const [3]A,
     scal0: A,
     scal: A,
+    splits: ?c_int = null,
 
     pub fn step(self: *WoaChain, i: usize) !A {
         const wo_a = @import("wo_a.zig");
@@ -996,9 +1004,9 @@ const WoaChain = struct {
         const r = self.rig;
         const w = self.wts[i % self.wts.len];
         const p = (if (self.merged)
-            try runWith(&self.sc, self.kern, self.m, r.q, r.win(), r.comps[i % r.copies], r.picks[i % r.steps], r.p0, self.scal, .{ self.sink, self.counter })
+            try runSplits(&self.sc, self.kern, self.m, r.q, r.win(), r.comps[i % r.copies], r.picks[i % r.steps], r.p0, self.scal, .{ self.sink, self.counter }, self.splits)
         else
-            try run(&self.sc, self.kern, self.m, r.q, r.win(), r.comps[i % r.copies], r.picks[i % r.steps], r.p0, self.scal)) orelse return error.Declined;
+            try runSplits(&self.sc, self.kern, self.m, r.q, r.win(), r.comps[i % r.copies], r.picks[i % r.steps], r.p0, self.scal, null, self.splits)) orelse return error.Declined;
         const oa = (try wo_a.launch(&self.sc, self.kw, 64, .bfloat16, .{ p.acc, p.m, p.l, if (self.merged) self.nosink else self.sink, self.meta, w[2], w[0], w[1] }, self.wcounter, null)) orelse return error.Declined;
         self.scal = oa;
         return oa;
@@ -1045,5 +1053,11 @@ test "dsv41 dec attn merge: ubench, attention then wo_a, R = 1..6, the merge var
             t.* = try decode.chainUs(&c, 200);
         }
         std.debug.print("[dec-ubench] attn+wo_a R={d}: wo_a merging {d:.1} us, the merged split {d:.1} us a step ({d:.1} us saved)\n", .{ R, us[0], us[1], us[0] - us[1] });
+        // The merged split at fewer splits (640 keys: at least 5 of 128).
+        for ([_]c_int{ 5, 6 }) |sp| {
+            var c: WoaChain = .{ .gpa = gpa, .sc = Scope.init(gpa, mlx.gpuStream()), .kern = km, .kw = kw, .merged = true, .m = &m, .rig = rig, .sink = sink, .nosink = nosink, .counter = counter, .wcounter = wcounter, .meta = meta, .wts = &wts, .scal0 = scal0, .scal = scal0, .splits = sp };
+            defer c.sc.deinit();
+            std.debug.print("[dec-ubench] attn+wo_a R={d}: the merged split at S={d} {d:.1} us a step\n", .{ R, sp, try decode.chainUs(&c, 200) });
+        }
     }
 }
