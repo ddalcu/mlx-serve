@@ -22,7 +22,7 @@ pub fn on() bool {
 /// caller runs that paired launch.
 pub fn gateUp(gu: *const dsv41.Bank, x3: A, rows: A, sidx: A, w_sorted: A, limit: f32, scales: gather_nax.ExpertScales, s: mlx.mlx_stream) !?A {
     const ws = mlx.getShape(gu.w);
-    if (env.on(.MLX_SERVE_DSV41_PF_GU_SEG) and !gather_nax.stagedServesGateUp(mlx.getShape(sidx)[0], ws[0], mlx.getShape(x3)[2], @divTrunc(ws[1], 2))) {
+    if (env.onUnlessZero(.MLX_SERVE_DSV41_PF_GU_SEG) and !gather_nax.stagedServesGateUp(mlx.getShape(sidx)[0], ws[0], mlx.getShape(x3)[2], @divTrunc(ws[1], 2))) {
         if (!gu_seg_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_GU_SEG engaged (pairs {d})\n", .{mlx.getShape(sidx)[0]});
         return null;
     }
