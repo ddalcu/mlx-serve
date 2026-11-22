@@ -17,9 +17,11 @@ pub fn on() bool {
     return env.onUnlessZero(.MLX_SERVE_DSV41_PF_FP4_GEMM);
 }
 
-/// `gather_nax.sortedGateUpRouted`'s output on the staged schedule, for the caller to keep; null where it declines (the
-/// caller runs today's).
+/// `gather_nax.sortedGateUpRouted`'s output on the staged schedule, for the caller to keep; null where the seg 128
+/// schedule serves the call (`gather_nax.stagedServesGateUp`) or the staged one declines (the caller runs today's).
 pub fn gateUp(gu: *const dsv41.Bank, x3: A, rows: A, sidx: A, w_sorted: A, limit: f32, scales: gather_nax.ExpertScales, s: mlx.mlx_stream) !?A {
+    const ws = mlx.getShape(gu.w);
+    if (!gather_nax.stagedServesGateUp(mlx.getShape(sidx)[0], ws[0], mlx.getShape(x3)[2], @divTrunc(ws[1], 2))) return null;
     const y = (try gather_nax.sortedGateUpRoutedStaged(x3, rows, gu.w, gu.s, gu.b, sidx, w_sorted, limit, scales, gu.qp.bits, gu.qp.group_size, gu.qp.mode.isFp4(), verify_qmm_nax.verifyQmmNaxAvailable(), s)) orelse
         return decline("gate+up", mlx.getShape(sidx)[0], gather_nax.routed_decline);
     gate_up_engaged.store(true, .monotonic);
@@ -35,7 +37,7 @@ pub fn down(sc: *dsv41.Scope, b: *const dsv41.Bank, act: A, sidx: A) !?A {
         return decline("down", P, "the bank is not fp4, or K or N is not a multiple of 64");
     if (!engaged_logged.swap(true, .monotonic)) {
         const st = gather_nax.stagedPlan(P, mlx.getShape(b.w)[0]);
-        log.info("[dsv41] MLX_SERVE_DSV41_PF_FP4_GEMM engaged (pairs {d}, gate+up {s}, down; tile bm={d} wm={d} wn={d})\n", .{ P, if (gate_up_engaged.load(.monotonic)) @as([]const u8, "staged") else "today's", st.bm, st.wm, st.wn });
+        log.info("[dsv41] MLX_SERVE_DSV41_PF_FP4_GEMM engaged (pairs {d}, gate+up {s}, down; tile bm={d} wm={d} wn={d})\n", .{ P, if (gate_up_engaged.load(.monotonic)) @as([]const u8, "staged") else "seg 128", st.bm, st.wm, st.wn });
     }
     _ = launches.fetchAdd(1, .monotonic);
     return try sc.keep(y);
