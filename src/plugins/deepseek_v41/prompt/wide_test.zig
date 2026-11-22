@@ -850,8 +850,11 @@ fn freePair(xs: [2]A) void {
     for (xs) |o| _ = mlx.mlx_array_free(o);
 }
 
-/// Whether the pair worker's prefill over `x` / `pre` is `want` word for word.
+/// Whether the pair worker's prefill over `x` / `pre` is `want` word for word, from an empty MLX cache (as the engine
+/// leaves it at each request's end).
 fn sameAs(fx: *fixture.Fixture, x: A, pre: A, want: [2]A) !bool {
+    _ = mlx.mlx_synchronize(mlx.gpuStream());
+    try mlx.check(mlx.mlx_clear_cache());
     const got = try prefill(fx, x, pre);
     defer freePair(got);
     return try sameWords(want[0], got[0]) and try sameWords(want[1], got[1]);
@@ -900,7 +903,8 @@ test "dsv41 wide: under MLX_SERVE_DSV41_PF_KEEP_WIDE's reserve a release-shape p
         try testing.expect(try sameAs(fx, xw, pw, want_w));
         const st = kw.stats();
         std.debug.print("keep wide {s}: {d} buffers {d} MB; hits {d} at {d} rows, {d} at {d} rows; misses {d} ({d} MB)\n", .{ label, st.buffers, st.bytes >> 20, h1 - h0, pinned_rows, h2 - h1, narrow_rows, st.misses, st.missed_bytes >> 20 });
-        try testing.expect(h1 > h0 and h2 > h1);
+        // Every reserve buffer serves the pinned width's pass.
+        try testing.expect(h1 - h0 >= n and h2 > h1);
         // Planted: the reserve hands out buffers it keeps idle, so live arrays share them.
         kw.plant(true);
         const bad = sameAs(fx, xw, pw, want_w);
