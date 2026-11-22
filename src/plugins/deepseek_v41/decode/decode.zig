@@ -235,14 +235,17 @@ fn layersFp4Levers(gpa: std.mem.Allocator, nv: bool, spec_: []const u8) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     const iou = @import("../../../sdk/util/io_util.zig");
     const L = moe_fp4.Levers;
-    const Arm = struct { []const u8, L };
+    // The third field: `MLX_SERVE_DSV41_MOE_DOWN_ORDER` (the down launch's column block major grid at 2 rows and up).
+    const Arm = struct { []const u8, L, bool };
     const named = [_]Arm{
-        .{ "dw", .{ .dec_word = true } },
-        .{ "us", .{ .up_split = true } },
-        .{ "all", .{ .dec_word = true, .up_split = true } },
+        .{ "dw", .{ .dec_word = true }, false },
+        .{ "us", .{ .up_split = true }, false },
+        .{ "all", .{ .dec_word = true, .up_split = true }, false },
+        .{ "ctl", .{ .dec_word = true }, false },
+        .{ "order", .{ .dec_word = true }, true },
     };
     var arms: [1 + named.len]Arm = undefined;
-    arms[0] = .{ "A (off)", .{} };
+    arms[0] = .{ "A (off)", .{}, false };
     var n: usize = 1;
     var it = std.mem.tokenizeAny(u8, spec_, " ,:");
     while (it.next()) |w| for (named) |c| if (std.mem.eql(u8, w, c[0])) {
@@ -250,7 +253,7 @@ fn layersFp4Levers(gpa: std.mem.Allocator, nv: bool, spec_: []const u8) !void {
         n += 1;
     };
     if (n == 1) {
-        arms[1] = .{ "as set", L.fromEnv() };
+        arms[1] = .{ "as set", L.fromEnv(), moe_fp4.orderOn() };
         n = 2;
     }
     std.debug.print("[dec-ubench] layers 20..40 {s} experts, {d} arms, two rounds\n", .{ if (nv) "nvfp4 + per-expert scales" else "mxfp4", n });
@@ -263,6 +266,8 @@ fn layersFp4Levers(gpa: std.mem.Allocator, nv: bool, spec_: []const u8) !void {
         defer o0.restore();
         const o1 = env.override(.MLX_SERVE_DSV41_FP4_UP_SPLIT, if (lv.up_split) "1" else "0");
         defer o1.restore();
+        const o2 = env.override(.MLX_SERVE_DSV41_MOE_DOWN_ORDER, if (arm[2]) "1" else "0");
+        defer o2.restore();
         const t_fx = iou.nowUsMonotonic(io);
         // 64 experts a layer: 20 layers hold ~30 GB, so a step's weights come from DRAM, not the SLC.
         const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 40, .experts = 64, .ctx = 4096, .fused = true, .experts_fp4 = !nv, .experts_nvfp4 = nv, .expert_scales = if (nv) .all else .none });
@@ -288,10 +293,19 @@ fn layersFp4Levers(gpa: std.mem.Allocator, nv: bool, spec_: []const u8) !void {
             std.debug.print("[dec-ubench] layers 20..40 R={d} {s}: {d:.1} us a layer (median step {d:.0} us, p10 {d:.0}, p90 {d:.0})\n", .{ rows, arm[0], med, times[times.len / 2], times[times.len / 10], times[times.len * 9 / 10] });
         }
     }
+    // Each arm against A, and an arm after "ctl" (the control's levers) against "ctl" too.
+    var ctl: ?usize = null;
+    for (arms[0..n], 0..) |a, j| if (std.mem.eql(u8, a[0], "ctl")) {
+        ctl = j;
+    };
     for (1..max_rows + 1) |rows| for (1..n) |j| {
         const a = us[0][rows - 1];
         const b = us[j][rows - 1];
         std.debug.print("[dec-ubench] layers 20..40 R={d} {s}: {d:.1} us a layer against A {d:.1} ({d:.1} us, {d:.2}%)\n", .{ rows, arms[j][0], b, a, b - a, 100 * (b - a) / a });
+        if (ctl) |c| if (j > c) {
+            const cu = us[c][rows - 1];
+            std.debug.print("[dec-ubench] layers 20..40 R={d} {s}: {d:.1} us a layer against ctl {d:.1} ({d:.1} us, {d:.2}%)\n", .{ rows, arms[j][0], b, cu, b - cu, 100 * (b - cu) / cu });
+        };
     };
 }
 
