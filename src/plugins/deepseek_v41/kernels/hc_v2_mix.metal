@@ -90,18 +90,16 @@ auto fetch = [&](int st, thread uint4* r) {
 threadgroup float fs[FSTEP];
 float4 fr[FSTEP / (4 * NSG * 32)];
 const device float4* fp4 = (const device float4*)fnp;
-auto ffetch = [&](int st) {
-  const size_t b = size_t(slice * NSTEP + st) * (FSTEP / 4);
-  for (int q = 0; q < FSTEP / (4 * NSG * 32); ++q) fr[q] = fp4[b + tid + q * NSG * 32];
-};
-auto fstore = [&]() {
+#define HC2_FFETCH(st)                                                                     \
+  for (int q = 0; q < FSTEP / (4 * NSG * 32); ++q)                                         \
+    fr[q] = fp4[size_t(slice * NSTEP + (st)) * (FSTEP / 4) + tid + q * NSG * 32];
+#define HC2_FSTORE()                                                                       \
   for (int q = 0; q < FSTEP / (4 * NSG * 32); ++q) ((threadgroup float4*)fs)[tid + q * NSG * 32] = fr[q];
-};
 simdgroup_matrix<float, 8, 8> c[3];
 for (int t = 0; t < 3; ++t) c[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 float ssx = 0.0f, ssh = 0.0f;
-ffetch(0);
-fstore();
+HC2_FFETCH(0)
+HC2_FSTORE()
 threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 #endif
 fetch(0, raw);
@@ -111,7 +109,7 @@ for (int st = 0; st < NSTEP; ++st) {
   if (more) {
     fetch(st + 1, nxt);
 #if MIXON
-    ffetch(st + 1);
+    HC2_FFETCH(st + 1)
 #endif
   }
   const int d = dlane + st * DC;
@@ -182,7 +180,7 @@ for (int st = 0; st < NSTEP; ++st) {
     }
   }
   threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-  if (more) fstore();
+  if (more) { HC2_FSTORE() }
   threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 #endif
   if (more) for (int p = 0; p < NP; ++p) raw[p] = nxt[p];

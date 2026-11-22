@@ -1527,15 +1527,14 @@ const HcV2Mix = struct {
         const ho = off;
         const po = off + rowsN(k.shape);
         // fn in its natural [MIX, N] order, from the packed input.
-        var fnw: []f64 = &.{};
+        const fnw = try a.alloc(f64, if (mixes(k.p)) hv2.N * hv2.MIX else 0);
+        defer a.free(fnw);
         if (mixes(k.p)) {
-            fnw = try a.alloc(f64, hv2.N * hv2.MIX);
             const fp = k.in(k.n_in - 1);
             for (0..D / hv2.DC) |s0| for (0..hv2.FSTEP) |q| {
                 fnw[hv2.packAt(s0, q)] = fp[s0 * hv2.FSTEP + q];
             };
         }
-        defer if (fnw.len > 0) a.free(fnw);
         const terms = try a.alloc(f64, 2 * HC * DS);
         defer a.free(terms);
         const hb = try a.alloc(f64, 2 * D);
