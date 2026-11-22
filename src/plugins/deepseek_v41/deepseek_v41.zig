@@ -708,6 +708,9 @@ pub const Dec = struct {
     wq_b_nax: ?mlx.mlx_fast_metal_kernel = null,
     wq_b_ring_nax: ?mlx.mlx_fast_metal_kernel = null,
     attn: ?mlx.mlx_fast_metal_kernel = null,
+    /// `attn` on its shape-cut kernel (`MLX_SERVE_DSV41_ATTN_DEC`), NAX only; `attn_tile_logged` once it served.
+    attn_tile: ?mlx.mlx_fast_metal_kernel = null,
+    attn_tile_logged: bool = false,
     /// `attn` that merges its splits (`MLX_SERVE_DSV41_FUSE_ATTN_MERGE`), its arrival counter and wo_a's sink then.
     attn_merge: ?mlx.mlx_fast_metal_kernel = null,
     attn_counter: A = none,
@@ -727,7 +730,7 @@ pub const Dec = struct {
     fn init(gpa: std.mem.Allocator, cfg: *const Config) !Dec {
         const nax = device.naxAvailable();
         // Without NAX the affine moe_up / moe_down lose to today's MoE kernels at every row count.
-        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .wq_b_ring = try dkern.wq_b.buildRing(), .wq_b_nax = if (nax) try dkern.wq_b.buildNax(false) else null, .wq_b_ring_nax = if (nax) try dkern.wq_b.buildNax(true) else null, .attn = if (nax) try dkern.attn.build() else null, .attn_merge = if (nax) try dkern.attn.buildMerge() else null, .attn_counter = dkern.attn.newCounter(), .attn_nosink = dkern.attn.noSink(cfg.num_attention_heads), .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
+        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .wq_b_ring = try dkern.wq_b.buildRing(), .wq_b_nax = if (nax) try dkern.wq_b.buildNax(false) else null, .wq_b_ring_nax = if (nax) try dkern.wq_b.buildNax(true) else null, .attn = if (nax) try dkern.attn.build() else null, .attn_tile = if (nax) try dkern.attn.buildTile() else null, .attn_merge = if (nax) try dkern.attn.buildMerge() else null, .attn_counter = dkern.attn.newCounter(), .attn_nosink = dkern.attn.noSink(cfg.num_attention_heads), .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
         errdefer d.deinit();
         try dkern.topk.probe(gpa, &d.topk.?, mlx.gpuStream());
         if (d.moe_down) |kd| d.moe_down_rb = dkern.moe_down.probe(gpa, kd, cfg.moe_intermediate_size, cfg.hidden_size) catch |e| blk: {
@@ -746,7 +749,7 @@ pub const Dec = struct {
         if (d.moe_up) |k| k.deinit();
         if (d.moe_fp4) |k| k.deinit();
         if (d.ffn_in) |k| dkern.ffn_in.free(k);
-        inline for (.{ d.wq_b, d.wq_b_ring, d.wq_b_nax, d.wq_b_ring_nax, d.attn, d.attn_merge, d.wo_a, d.moe_down }) |k| if (k) |kern| {
+        inline for (.{ d.wq_b, d.wq_b_ring, d.wq_b_nax, d.wq_b_ring_nax, d.attn, d.attn_tile, d.attn_merge, d.wo_a, d.moe_down }) |k| if (k) |kern| {
             _ = mlx.mlx_fast_metal_kernel_free(kern);
         };
         inline for (.{ d.attn_counter, d.attn_nosink }) |a| if (a.ctx != null) {
@@ -5149,7 +5152,7 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     if (merged) |p| {
         engaged(m, 1, "MLX_SERVE_DSV41_FUSE_ATTN_MERGE");
         oa = try dkern.wo_a.applySink(sc, m, ly, m.dec.wo_a.?, m.dec.wo_a_counter, inv, try attnMeta(sc, m, q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l, m.dec.attn_nosink);
-    } else if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try dkern.attn.partials(sc, ka, m, q, ls.win, comp_rows, topk, p0, scale)) |p| {
+    } else if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try attnPartials(sc, m, ka, q, ls.win, comp_rows, topk, p0, scale)) |p| {
         oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counter, inv, try attnMeta(sc, m, q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l);
     };
     // `ffn_in` routes off wo_b's output, which a tensor split sums first.
@@ -5169,6 +5172,17 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     try runRegion(sc, m, li, .ffn, &.{ x, ao[0], sa.pre, sa.post, sa.comb }, &out);
     pre.* = out[1];
     return out[0];
+}
+
+/// The fused decode attention's split partials: `MLX_SERVE_DSV41_ATTN_DEC=1` on the shape-cut kernel where it serves, else
+/// `dec_attn`.
+fn attnPartials(sc: *Scope, m: *Dsv41Model, ka: mlx.mlx_fast_metal_kernel, q: A, win: Ring, comp_rows: A, topk: A, p0: usize, scale: f32) !?dkern.attn.Partials {
+    if (m.dec.attn_tile) |kt| if (dkern.attn.tileOn()) if (try dkern.attn.partialsTile(sc, kt, m, q, win, comp_rows, topk, p0, scale)) |p| {
+        if (!m.dec.attn_tile_logged) log.info("[dsv41] MLX_SERVE_DSV41_ATTN_DEC engaged\n", .{});
+        m.dec.attn_tile_logged = true;
+        return p;
+    };
+    return dkern.attn.partials(sc, ka, m, q, win, comp_rows, topk, p0, scale);
 }
 
 /// Row `l`'s compressed rows and picks as the plain step at `p0 + l` reads them (`blockFusedRows`): none, none where it
