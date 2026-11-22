@@ -1024,11 +1024,12 @@ pub const ModelConfig = struct {
 
     /// DeepSeek-V4.1's pass plan (`deepseek_v41.passPlanned`): the chunk a prefill of `rows` prompt rows runs at the
     /// pinned pass `pinned` (the width the request was admitted at), near-equal chunks no wider
-    /// (`deepseek_v41.passRows`); null for every other load, or no pin. The forward's own config copy holds no pin,
-    /// so the pass comes in as the request's width.
+    /// (`deepseek_v41.passRows`); null for every other load, no pin, or a pin under the old 8192-row cap
+    /// (`deepseek_v41.PASS_MIN_ROWS`: a box or a `--prefill-chunk` that narrows the chunk keeps today's cut, the engine's
+    /// tail merge included). The forward's own config copy holds no pin, so the pass comes in as the request's width.
     pub fn passPrefillChunk(self: *const ModelConfig, pinned: usize, rows: usize) ?usize {
         const dsv41 = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
-        if (pinned == 0 or !dsv41.passPlanned(self)) return null;
+        if (pinned < dsv41.PASS_MIN_ROWS or !dsv41.passPlanned(self)) return null;
         return dsv41.passRows(rows, pinned);
     }
 

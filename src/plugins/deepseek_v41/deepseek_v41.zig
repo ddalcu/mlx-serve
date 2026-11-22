@@ -2245,6 +2245,10 @@ fn passSettle(m: *Dsv41Model) void {
     log.info("deepseek_v41: MLX_SERVE_DSV41_PF_PASS_SIZE: one MoE call a prompt pass, {s}\n", .{if (held) "no lead pass (every Engram table held)" else "the lead pass kept (Engram rows read from the drive)"});
 }
 
+/// The narrowest pinned pass the plan cuts near-equal (`ModelConfig.passPrefillChunk`): the old cap. Under it the
+/// engine's cut stands, its 512-row tail merge included.
+pub const PASS_MIN_ROWS: usize = MOE_ROWS;
+
 /// The engine's prompt chunk for `rows` prompt rows under `MLX_SERVE_DSV41_PF_PASS_SIZE`, no wider than `max` (the
 /// load's widest pass, `ModelConfig.dsv41_pass_rows`): the fewest passes that fit, `ceil(rows / max)`, cut near-equal,
 /// never full passes and a short tail. The cut is whole spans (`SPAN`) where that keeps the count and leaves the last

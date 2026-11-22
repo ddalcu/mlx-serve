@@ -164,6 +164,10 @@ test "dsv41 prefill chunk: under the pass plan the chunk loop cuts a prompt into
     cfg.dsv41_pass_rows = 8192;
     cfg.pinned_prefill_chunk = 8192;
     try t.expectEqualSlices(usize, &.{ 5888, 5888, 5862 }, Loop.cuts(&cfg, 17_638, &buf));
+    // A pin under the old cap (a tight box, an explicit narrower `--prefill-chunk`) keeps today's cut.
+    cfg.dsv41_pass_rows = 4096;
+    cfg.pinned_prefill_chunk = 4096;
+    try t.expectEqual(@as(?usize, null), cfg.passPrefillChunk(4096, 17_638));
     // The forward's own config copy holds no pass (no pin was taken on it): the switch and the request's width decide.
     const copy = try model.parseConfigFromJson(t.allocator, model.dsv41_release_config);
     {
