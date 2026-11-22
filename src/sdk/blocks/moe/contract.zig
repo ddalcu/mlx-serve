@@ -2173,6 +2173,9 @@ const nax_launches = [3]metal.Launch{
     .{ .name = "msv_gqmm_affine_map", .inputs = &nax_map_in, .outputs = &.{"y"}, .source = ksrc("kernels/moe/gather_qmm_nax_mapped.metal"), .header = nax_mapped_header, .tg_bytes = nax_tg, .m1 = 1024, .m2 = 1024, .offline = false, .min_gen = 17 },
     .{ .name = "msv_gqmm_affine_pair", .inputs = &nax_map_in, .outputs = &.{"y"}, .source = ksrc("kernels/moe/gather_qmm_nax_mapped.metal"), .header = nax_mapped_header, .tg_bytes = nax_tg, .m1 = 1024, .m2 = 1024, .offline = false, .min_gen = 17 },
 };
+/// The staged schedule's threadgroup arrays at its largest tile: one 64 x (64 + 8) bf16 weight buffer and 128 x (64 + 8)
+/// bf16 activations (the register-prefetch tiles hold two weight buffers, 18 KiB).
+const staged_launch = metal.Launch{ .name = "msv_gqmm_staged", .inputs = &gqn.STAGED_INPUTS, .outputs = &.{"y"}, .source = gqn.STAGED_SOURCE, .header = gqn.STAGED_HEADER, .tg_bytes = 64 * 72 * 2 + 128 * 72 * 2, .m1 = 1024, .m2 = 1024, .offline = false, .min_gen = 17 };
 
 /// Sorted ragged expert runs over `ne` experts: one in sixteen empty, one in eight four times the mean, the
 /// remainder on the last.
@@ -2249,7 +2252,7 @@ const NaxScan = struct {
     }
 
     pub fn geometry(self: *const NaxScan, shape: Shape) ?metal.Geometry {
-        if (shape.rows == 0 or self.ne > 2048 or (shape.n != 64 and shape.n != 96 and shape.n != 128)) return null;
+        if (shape.rows == 0 or self.ne > 2048 or std.mem.indexOfScalar(usize, &.{ 32, 64, 96, 128, 256 }, shape.n) == null) return null;
         var g = metal.Geometry{ .grid = .{ 1024, 1, 1 }, .tg = .{ 1024, 1, 1 } };
         g.out(&.{@intCast(4 * self.maxTiles(shape))}, .uint32);
         g.out(&.{1}, .uint32);
@@ -2316,6 +2319,8 @@ const GqmmNax = struct {
     launch: *const metal.Launch,
     kind: NaxKind,
     ne: usize,
+    /// The staged schedule (`gqn.launchStaged`) at the planner's tile, in place of the seg/db plan.
+    staged: bool = false,
     limit: u32 = 0,
     /// The pair's per-expert scales (`gqn.ExpertScales`): bit 0 the gate's, bit 1 the up's, `[ne]` bf16 each.
     esc: u32 = 0,
@@ -2342,6 +2347,13 @@ const GqmmNax = struct {
         return .{ .rig = metal.Rig.init(a), .launch = &nax_launches[@backingInt(kind)], .kind = kind, .ne = ne, .banks = .{ bank, bank } };
     }
 
+    fn initStaged(a: std.mem.Allocator, kind: NaxKind, f: Fmt, b: u32, g: usize, ne: usize) GqmmNax {
+        var t = init(a, kind, f, b, g, ne);
+        t.launch = &staged_launch;
+        t.staged = true;
+        return t;
+    }
+
     pub fn deinit(self: *GqmmNax) void {
         const a = self.rig.a;
         self.rig.deinit();
@@ -2366,8 +2378,51 @@ const GqmmNax = struct {
         return gqn.plan(@intCast(self.routed(shape)), @intCast(self.ne), @intCast(shape.k), @intCast(shape.n), self.kind == .paired);
     }
 
+    fn stagedAt(self: *const GqmmNax, shape: Shape) gqn.Staged {
+        return gqn.stagedPlan(@intCast(self.routed(shape)), @intCast(self.ne));
+    }
+
+    /// The rows a tile holds: what the scan cuts at.
+    fn tileBm(self: *const GqmmNax, shape: Shape) usize {
+        return @intCast(if (self.staged) self.stagedAt(shape).bm else self.planAt(shape).bm);
+    }
+
+    /// The 15-input launches: the mapped and paired ones, and the staged one for every kind.
+    fn wide(self: *const GqmmNax) bool {
+        return self.kind != .mm or self.staged;
+    }
+
+    fn stagedGeometry(self: *const GqmmNax, shape: Shape) ?metal.Geometry {
+        const n: c_int = @intCast(shape.n);
+        const width = if (self.kind == .paired) 2 * n else n;
+        if (@rem(width, 64) != 0 or shape.k % 64 != 0 or !self.mx()) return null;
+        const st = self.stagedAt(shape);
+        const mt: c_int = @intCast(naxMaxTiles(self.routed(shape), self.ne, @intCast(st.bm)));
+        const cols = @divExact(width, 64);
+        const gx = if (st.gx > 0) st.gx else cols;
+        const gy = if (st.gx > 0) @divTrunc(mt + st.gx - 1, st.gx) * cols else mt;
+        var g = metal.Geometry{ .grid = .{ @intCast(gx * 32), @intCast(gy * st.wn), @intCast(st.wm) }, .tg = .{ 32, @intCast(st.wn), @intCast(st.wm) } };
+        g.out(&.{ @intCast(self.routed(shape)), 1, n }, .bfloat16);
+        g.dtype("T", .bfloat16);
+        g.int("GS", self.banks[0].aff.gs);
+        g.int("BITS", self.banks[0].aff.bits);
+        g.int("MX", @intFromBool(self.mx()));
+        g.int("BM", st.bm);
+        g.int("WM", st.wm);
+        g.int("WN", st.wn);
+        g.int("GX", st.gx);
+        g.int("NW", width);
+        g.int("KD", @as(c_int, @intCast(shape.k)));
+        g.int("EPI", if (self.moe_act) -1 else if (self.kind == .paired) 1 + @as(c_int, @intCast(self.limit)) else 0);
+        g.int("ESC", @as(c_int, @intCast(self.esc)));
+        g.int("AS", @as(c_int, @intFromBool(st.tg_a)));
+        g.flag("MAP", self.kind != .mm);
+        return g;
+    }
+
     pub fn geometry(self: *const GqmmNax, shape: Shape) ?metal.Geometry {
         if (shape.rows == 0 or shape.n % 32 != 0 or shape.k % 32 != 0 or shape.k % self.banks[0].aff.gs != 0) return null;
+        if (self.staged) return self.stagedGeometry(shape);
         const p = self.planAt(shape);
         const mt: c_int = @intCast(naxMaxTiles(self.routed(shape), self.ne, @intCast(p.bm)));
         const n: c_int = @intCast(shape.n);
@@ -2437,11 +2492,11 @@ const GqmmNax = struct {
         const rows: c_int = @intCast(self.m);
         // The ids are input 0 of the rig (the wrapper's and the baseline's); the kernel reads them through the tiles.
         _ = try rig.input(.uint32, &.{rows}, self.ids);
-        const p = self.planAt(shape);
-        const mt = naxMaxTiles(self.m, self.ne, @intCast(p.bm));
+        const bm = self.tileBm(shape);
+        const mt = naxMaxTiles(self.m, self.ne, bm);
         const tiles = try a.alloc(u32, 4 * mt);
         defer a.free(tiles);
-        const tc = hostTiles(self.ids, self.ne, @intCast(p.bm), mt, tiles);
+        const tc = hostTiles(self.ids, self.ne, bm, mt, tiles);
         const tf = try a.alloc(f64, tiles.len);
         defer a.free(tf);
         for (tf, tiles) |*o, v| o.* = @floatFromInt(v);
@@ -2458,9 +2513,9 @@ const GqmmNax = struct {
         const width: f64 = @floatFromInt(if (self.kind == .paired) 2 * shape.n else shape.n);
         // The mapped launches' fourth word: the routed epilogue's limit as f32 bits.
         const pv = [4]f64{ width, @floatFromInt(shape.k), 0, @floatFromInt(@as(i32, @bitCast(self.rlim))) };
-        const np: usize = if (self.kind == .mm) 3 else 4;
+        const np: usize = if (self.wide()) 4 else 3;
         const params = try rig.input(.int32, &.{@intCast(np)}, pv[0..np]);
-        if (self.kind == .mm) {
+        if (!self.wide()) {
             self.args[0..7].* = .{ x, b[0][0], b[0][1], b[0][2], t, count_, params };
             self.n_args = 7;
             return;
@@ -2627,6 +2682,28 @@ const GqmmNax = struct {
         return self.rig.bytesOf(&.{try g.mul(try g.mul(gate, try g.sigmoid(gate)), up)});
     }
 
+    /// The staged wrappers on the same inputs (their own scan and plan).
+    fn stagedWrapper(self: *GqmmNax) ![]const u8 {
+        const s = self.rig.stream();
+        const ids = self.rig.ins.items[0].view;
+        const x = self.args;
+        const bits = self.banks[0].aff.bits;
+        const group: u32 = @intCast(self.banks[0].aff.gs);
+        var g = ops.Graph.init(self.rig.a, s);
+        defer g.deinit();
+        const y = switch (self.kind) {
+            .mm => try gqn.sortedGatherPromptStaged(x[0], x[1], x[2], .{ .ctx = null }, ids, bits, group, self.mx(), true, s),
+            .mapped => return error.Unregistered,
+            // One bank of each expert's gate rows, then its up rows, as the routed wrapper reads.
+            .paired => try gqn.sortedGateUpRoutedStaged(x[0], x[11], try g.concat(&.{ x[1], x[4] }, 1), try g.concat(&.{ x[2], x[5] }, 1), .{ .ctx = null }, ids, x[14], self.rlim, .{
+                .gate = if (self.escv[0].len > 0) x[12] else null,
+                .up = if (self.escv[1].len > 0) x[13] else null,
+            }, bits, group, self.mx(), true, s),
+        } orelse return error.Declined;
+        defer _ = mlx.mlx_array_free(y);
+        return self.rig.bytesOf(&.{y});
+    }
+
     /// The shipped wrapper on the same inputs (its own scan, plan and canaries).
     fn wrapper(self: *GqmmNax) ![]const u8 {
         const s = self.rig.stream();
@@ -2636,6 +2713,7 @@ const GqmmNax = struct {
         const bias = if (self.mx()) none else x[3];
         const bits = self.banks[0].aff.bits;
         const group: u32 = @intCast(self.banks[0].aff.gs);
+        if (self.staged) return self.stagedWrapper();
         const y = switch (self.kind) {
             .mm => try gqn.sortedGather(x[0], x[1], x[2], bias, ids, bits, group, self.mx(), true, s),
             .mapped => try gqn.sortedGatherMapped(x[0], x[11], x[1], x[2], bias, ids, bits, group, self.mx(), true, s),
@@ -2666,8 +2744,8 @@ fn registerNax(set: *kc.Set) !void {
     // One shape per plan at 32 experts: db 64 (under 36 rows an expert), db 96 with 32 column groups (K under
     // 1024, 120+ rows an expert), db 64 with 32 groups (K 1024, under 48), seg 64 (N off the 64-column grid).
     const plans: []const Shape = &.{ .{ .rows = 1024, .n = 128, .k = 256 }, .{ .rows = 4096, .n = 128, .k = 512 }, .{ .rows = 1280, .n = 128, .k = 1024 }, .{ .rows = 2048, .n = 96, .k = 256 } };
-    // The scan's n is BM: each tile height its plans use.
-    try set.add(NaxScan, .init(a, 32), .{ .name = "gather_qmm_nax tile scan (32 experts)", .accum = .none, .depth = routeDepth, .out = .f32, .nan = .{ .stated = nax_rule }, .served = &.{ .{ .rows = 1024, .n = 64, .k = 1 }, .{ .rows = 4096, .n = 96, .k = 1 }, .{ .rows = 4096, .n = 128, .k = 1 }, .{ .rows = 33, .n = 64, .k = 1 } } }, null);
+    // The scan's n is BM: each tile height its plans use (the seg/db plans' and the staged plans').
+    try set.add(NaxScan, .init(a, 32), .{ .name = "gather_qmm_nax tile scan (32 experts)", .accum = .none, .depth = routeDepth, .out = .f32, .nan = .{ .stated = nax_rule }, .served = &.{ .{ .rows = 1024, .n = 64, .k = 1 }, .{ .rows = 4096, .n = 96, .k = 1 }, .{ .rows = 4096, .n = 128, .k = 1 }, .{ .rows = 33, .n = 64, .k = 1 }, .{ .rows = 512, .n = 32, .k = 1 }, .{ .rows = 8192, .n = 256, .k = 1 } } }, null);
     try set.add(NaxScan, .init(a, 512), .{ .name = "gather_qmm_nax tile scan (512 experts)", .accum = .none, .depth = routeDepth, .out = .f32, .nan = .{ .stated = nax_rule }, .served = &.{ .{ .rows = 81920, .n = 96, .k = 1 }, .{ .rows = 2000, .n = 64, .k = 1 } } }, null);
     const gather = "MLX gather_qmm (sorted rhs indices)";
     const Case = struct { name: []const u8, f: Fmt, bits: u32, gs: usize, served: []const Shape };
@@ -2711,6 +2789,24 @@ fn registerNax(set: *kc.Set) !void {
         r.rlim = 10;
         if (f == .nvfp4) r.esc = 3;
         try set.add(GqmmNax, r, .{ .name = if (f == .nvfp4) "gather_qmm_nax paired bf16 (NVFP4, gate and up scales, routed moe_act, limit 10)" else "gather_qmm_nax paired bf16 (MXFP4, routed moe_act, limit 10)", .accum = .f32, .depth = gqDepth, .ops = 12, .out = .bf16, .served = paired[0..1], .known = routed_nan }, null);
+    }
+}
+
+/// The staged schedule on fp4 banks at the planner's three tiles (32 experts: 16, 64 and 128 rows an expert); the
+/// pair with deepseek_v41's routed epilogue, rows four a token.
+fn registerStaged(set: *kc.Set) !void {
+    const a = set.a;
+    const gather = "MLX gather_qmm (sorted rhs indices)";
+    const plain: []const Shape = &.{ .{ .rows = 512, .n = 128, .k = 256 }, .{ .rows = 2048, .n = 128, .k = 512 }, .{ .rows = 4096, .n = 192, .k = 256 } };
+    const paired: []const Shape = &.{ .{ .rows = 128, .n = 128, .k = 512 }, .{ .rows = 512, .n = 128, .k = 256 }, .{ .rows = 1024, .n = 96, .k = 512 } };
+    for ([_]Fmt{ .nvfp4, .mxfp4 }) |f| {
+        const gs: usize = if (f == .nvfp4) 16 else 32;
+        try set.add(GqmmNax, .initStaged(a, .mm, f, 4, gs, 32), .{ .name = if (f == .nvfp4) "gather_qmm_nax staged bf16 (NVFP4)" else "gather_qmm_nax staged bf16 (MXFP4)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = gather, .served = plain }, null);
+        var r = GqmmNax.initStaged(a, .paired, f, 4, gs, 32);
+        r.moe_act = true;
+        r.rlim = 10;
+        if (f == .nvfp4) r.esc = 3;
+        try set.add(GqmmNax, r, .{ .name = if (f == .nvfp4) "gather_qmm_nax staged paired bf16 (NVFP4, gate and up scales, routed moe_act, limit 10)" else "gather_qmm_nax staged paired bf16 (MXFP4, routed moe_act, limit 10)", .accum = .f32, .depth = gqDepth, .ops = 12, .out = .bf16, .served = paired, .known = routed_nan }, null);
     }
 }
 
@@ -2840,6 +2936,7 @@ pub fn register(set: *kc.Set) !void {
     try registerRouter(set);
     try registerVerify(set);
     try registerNax(set);
+    try registerStaged(set);
     try registerStream(set);
 }
 
@@ -3146,7 +3243,7 @@ test "kernel contract moe: each verify launch is its wrapper's bytes, the prefil
 test "kernel contract moe: the NAX scan chained into each NAX gather launch is the wrapper's bytes" {
     if (mlx.noGpuBackend() or !device_mod.naxAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
-    const Case = struct { kind: NaxKind, f: Fmt = .affine, bits: u32 = 4, gs: usize = 64, moe_act: bool = false, shape: Shape };
+    const Case = struct { kind: NaxKind, f: Fmt = .affine, bits: u32 = 4, gs: usize = 64, moe_act: bool = false, staged: bool = false, shape: Shape };
     const cases = [_]Case{
         .{ .kind = .mm, .shape = .{ .rows = 1024, .n = 128, .k = 256 } },
         .{ .kind = .mm, .shape = .{ .rows = 2048, .n = 96, .k = 256 } },
@@ -3155,9 +3252,12 @@ test "kernel contract moe: the NAX scan chained into each NAX gather launch is t
         .{ .kind = .paired, .shape = .{ .rows = 960, .n = 128, .k = 512 } },
         .{ .kind = .paired, .f = .mxfp4, .gs = 32, .shape = .{ .rows = 1024, .n = 128, .k = 1024 } },
         .{ .kind = .paired, .f = .nvfp4, .gs = 16, .moe_act = true, .shape = .{ .rows = 512, .n = 128, .k = 512 } },
+        .{ .kind = .mm, .f = .nvfp4, .gs = 16, .staged = true, .shape = .{ .rows = 4096, .n = 128, .k = 512 } },
+        .{ .kind = .mm, .f = .mxfp4, .gs = 32, .staged = true, .shape = .{ .rows = 512, .n = 128, .k = 256 } },
+        .{ .kind = .paired, .f = .nvfp4, .gs = 16, .moe_act = true, .staged = true, .shape = .{ .rows = 512, .n = 128, .k = 256 } },
     };
     for (cases) |c| {
-        var t = GqmmNax.init(a, c.kind, c.f, c.bits, c.gs, 32);
+        var t = if (c.staged) GqmmNax.initStaged(a, c.kind, c.f, c.bits, c.gs, 32) else GqmmNax.init(a, c.kind, c.f, c.bits, c.gs, 32);
         defer t.deinit();
         if (c.moe_act) {
             t.moe_act = true;
@@ -3166,7 +3266,7 @@ test "kernel contract moe: the NAX scan chained into each NAX gather launch is t
         }
         try std.testing.expect(try t.prepare(c.shape, .random, 7));
         const scan = NaxScan.init(a, 32);
-        const bm: usize = @intCast(t.planAt(c.shape).bm);
+        const bm = t.tileBm(c.shape);
         const shape = Shape{ .rows = t.m, .n = bm, .k = 1 };
         const mt = naxMaxTiles(shape.rows, 32, bm);
         const params = try t.rig.input(.int32, &.{3}, &.{ @floatFromInt(shape.rows), 32, @floatFromInt(mt) });
@@ -3176,7 +3276,7 @@ test "kernel contract moe: the NAX scan chained into each NAX gather launch is t
             _ = mlx.mlx_array_free(x);
         };
         for (&tiles, 0..) |*x, i| try mlx.check(mlx.mlx_array_set(x, t.rig.output(i)));
-        const at: usize = if (c.kind == .mm) 4 else 7;
+        const at: usize = if (t.wide()) 7 else 4;
         t.args[at] = tiles[0];
         t.args[at + 1] = tiles[1];
         try t.run();
