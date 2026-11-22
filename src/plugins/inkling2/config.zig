@@ -73,6 +73,15 @@ pub const Draft = struct {
     /// final-normed output.
     taps: [max_taps]u32 = @splat(0),
     tap_count: u32,
+    /// `mtp_config.local_layer_ids` as a mask: the sliding layers; the others attend every committed position. Null =
+    /// the config names none.
+    local: ?u32 = null,
+
+    /// Whether drafter layer `i` attends every committed position (not only the newest `window - 1`).
+    pub fn full(d: *const Draft, i: usize) bool {
+        const m = d.local orelse return false;
+        return i < 32 and (m >> @intCast(i)) & 1 == 0;
+    }
 };
 pub const max_taps = 8;
 
@@ -194,6 +203,16 @@ fn readDraft(o: std.json.ObjectMap, c: *const Config) ?Draft {
         if (if (last) d.taps[i] != c.visits() else d.taps[i] >= c.visits()) return null;
     }
     d.tap_count = @intCast(ids.array.items.len);
+    if (field(o, "local_layer_ids")) |v| {
+        if (v != .array) return null;
+        var m: u32 = 0;
+        for (v.array.items) |item| {
+            const i = int(item) orelse return null;
+            if (i >= 32) return null;
+            m |= @as(u32, 1) << @intCast(i);
+        }
+        d.local = m;
+    }
     if (d.layers == 0 or d.layers > 16 or d.heads == 0 or d.kv_heads == 0 or d.heads % d.kv_heads != 0 or d.head_dim == 0 or d.head_dim % 2 != 0 or
         d.intermediate == 0 or d.window < 2 or d.block < 2 or d.block > abi.max_round_tokens or d.rank == 0 or !(d.eps > 0) or !(d.theta > 1)) return null;
     return d;
@@ -477,6 +496,21 @@ test "inkling2 config: a draft head beside the pack declares its stages; one thi
     defer testing.allocator.free(other);
     const late = try std.mem.replaceOwned(u8, testing.allocator, with, "[2,5,10,16]", "[2,5,10,15]");
     defer testing.allocator.free(late);
+    {
+        const locals = try std.mem.replaceOwned(u8, testing.allocator, with, "\"block_size\"", "\"local_layer_ids\":[0,2],\"block_size\"");
+        defer testing.allocator.free(locals);
+        for ([_][]const u8{ with, locals }, [_]?u32{ null, 0b101 }) |json, mask| {
+            const files = [_]fixture.File{ .{ .name = "config.json", .bytes = json }, .{ .name = draft_file, .bytes = "x" } };
+            const mem: fixture.MemDir = .{ .files = &files };
+            const dir = mem.packDir();
+            var p: abi.Parsed = .{};
+            try testing.expect(parse(&dir, abi.Str.of(json), .{}, null, false, &p).isOk());
+            defer freeParsed(&p);
+            const dc = of(&p).draft.?;
+            try testing.expectEqual(mask, dc.local);
+            try testing.expectEqual([3]bool{ false, mask != null, false }, [3]bool{ dc.full(0), dc.full(1), dc.full(2) });
+        }
+    }
     for ([_]Case{
         .{ .json = with, .sidecar = true, .stages = 3, .modelled = true },
         .{ .json = with, .sidecar = false, .stages = 0, .modelled = true },
