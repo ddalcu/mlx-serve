@@ -1,4 +1,4 @@
-//! `MLX_SERVE_DSV41_PF_HC_V2` (default off): a resident wide prompt layer's hyper-connections in three passes over the
+//! `MLX_SERVE_DSV41_PF_HC_V2` (on by default; =0 the five passes): a resident wide prompt layer's hyper-connections in three passes over the
 //! stream instead of five, each a release-shape kernel (`kernels/hc_v2_mix.metal`, `kernels/hc_v2_fin.metal`).
 //!
 //! The control reads and writes the `[L, 4, 5120]` bf16 stream in five launches a layer (the attention side's mix and
@@ -120,7 +120,7 @@ const Slot = struct { li: usize = 0, x: ?*anyopaque = null, z: A = none, pre: A 
 
 /// Whether the switch serves this model's wide layers: the resident trunk on the GPU, bf16, the release's hc shapes.
 pub fn serves(m: *const dsv41.Dsv41Model) bool {
-    if (!env.on(.MLX_SERVE_DSV41_PF_HC_V2)) return false;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_HC_V2)) return false;
     return m.streamed == null and m.tp == null and m.trace == null and m.act == .bfloat16 and
         m.cfg.hidden_size == D and m.cfg.dsv4_hc_mult == HC and mlx.streamIsGpu(m.s);
 }
