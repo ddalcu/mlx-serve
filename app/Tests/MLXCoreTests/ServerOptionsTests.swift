@@ -246,12 +246,23 @@ final class ServerOptionsTests: XCTestCase {
                                flag: "--prefix-cache-mem", value: "2GB"))
     }
 
-    /// The n-gram table stays on disk unless the user opts in, matching the server default.
-    func testPleGpuIsOptIn() {
+    /// The n-gram GPU gather is the server default; the app only emits `--no-ple-gpu` when the
+    /// user declines it. A blob saved under the old opt-in key decodes to the default either way.
+    func testPleGpuGatherIsDefault() {
         var opts = ServerOptions()
+        XCTAssertFalse(opts.toCLIArgs(physicalMemoryBytes: 128 * Self.GiB).contains("--no-ple-gpu"))
         XCTAssertFalse(opts.toCLIArgs(physicalMemoryBytes: 128 * Self.GiB).contains("--ple-gpu"))
-        opts.pleGpu = true
-        XCTAssertTrue(opts.toCLIArgs(physicalMemoryBytes: 128 * Self.GiB).contains("--ple-gpu"))
+        opts.pleGpuHostRead = true
+        XCTAssertTrue(opts.toCLIArgs(physicalMemoryBytes: 128 * Self.GiB).contains("--no-ple-gpu"))
+    }
+
+    /// Old blobs stored `pleGpu` as an opt-in Bool; both stored values mean "the default", which is now the GPU gather.
+    func testPleGpuLegacyKeyDecodesToDefault() throws {
+        for legacy in ["false", "true"] {
+            let blob = Data("{\"pleGpu\":\(legacy)}".utf8)
+            let opts = try JSONDecoder().decode(ServerOptions.self, from: blob)
+            XCTAssertFalse(opts.pleGpuHostRead)
+        }
     }
 
     /// A blob saved while "2GB" was the default migrates to Auto once; a later "2GB" stays.

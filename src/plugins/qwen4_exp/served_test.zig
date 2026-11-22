@@ -276,7 +276,7 @@ test "qwen4_exp served: greedy decode and MTP rounds emit the legacy tokens and 
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     // A random head drafts what the trunk rejects (every round rolls back); a sign-reading lm_head makes the head
     // agree often, so rounds accept all, some or none of their drafts.
-    // The GPU n-gram gather (`--ple-gpu`) leaves the history owed past each decode step (`Owed.history`).
+    // The GPU n-gram gather (the default; `--no-ple-gpu` declines) leaves the history owed past each decode step (`Owed.history`).
     defer ple_gpu.pleGpu().enabled = false;
     for ([_]u64{ 47, 51, 51 }, [_]fixture.Opts{ .{}, .{ .sign_head = true }, .{ .sign_head = true } }, [_]bool{ false, false, true }, 0..) |seed, opts, gpu, k| {
         // The GPU arm keeps `HEADROOM` past the table: a 16 GB Mac's working set never has it.

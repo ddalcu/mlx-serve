@@ -981,7 +981,7 @@ test "deferred PLE at N rows: every row's capacity is checked against its OWN wi
 // ── qwen4 PLE: the GPU arm against the host gather (synthetic table, no model) ──
 
 /// A zeroed Trunk carrying only what `pleEmbedding` reads, over a synthetic 4-bit table.
-/// With `gate` the table goes through `ple_gpu.load`, so the `--ple-gpu` switch is what is tested;
+/// With `gate` the table goes through `ple_gpu.load`, so the arm switch (`--no-ple-gpu`) is what is tested;
 /// without it the table is wrapped directly, because `load`'s working-set gate (table plus
 /// 16 GB headroom) rightly picks the host gather on a small CI runner, and these tests are
 /// about the arms, not the gate. `arm(false)` hides the table buffer to run the host gather.
@@ -1186,7 +1186,7 @@ test "qwen4 PLE gpu arm: batched slots keep the host gather, a serial forward di
     try testing.expectEqual(d0 + 1, ple_gpu.dispatches);
 }
 
-test "qwen4 PLE gpu arm: without --ple-gpu the load wraps no table buffer and a forward never dispatches" {
+test "qwen4 PLE gpu arm: with --no-ple-gpu the load wraps no table buffer and a forward never dispatches" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var off: PleArmFixture = undefined;
     try off.init(false);

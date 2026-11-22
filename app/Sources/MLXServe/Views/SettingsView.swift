@@ -2783,15 +2783,15 @@ private struct MemorySectionContent: View {
                         .frame(width: 110)
                 }
             }
-            if let m = meta["pleGpu"] {
+            if let m = meta["pleGpuHostRead"] {
                 SettingsRow(
                     title: m.title,
                     explainer: m.explainer,
-                    isDirty: dirty.dirty(\.pleGpu),
+                    isDirty: dirty.dirty(\.pleGpuHostRead),
                     cost: m.cost,
-                    costActive: appState.serverOptions.pleGpu
+                    costActive: !appState.serverOptions.pleGpuHostRead
                 ) {
-                    Toggle("", isOn: opts.pleGpu)
+                    Toggle("", isOn: opts.pleGpuHostRead)
                         .labelsHidden()
                         .toggleStyle(.switch).font(.app(.body))
                 }

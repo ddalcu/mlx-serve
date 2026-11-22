@@ -15,8 +15,8 @@ pub const Arm = enum { gpu, off, bits, misaligned, too_large, low_memory };
 
 /// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
 const PleGpuState = struct {
-    /// `--ple-gpu`, set once in `main()`. Off by default: the first GPU forward makes the whole
-    /// table resident beside the weights, and the host gather faults in only the rows it reads.
+    /// On unless `--no-ple-gpu`, set once in `main()`. The first GPU forward makes the whole
+    /// table resident beside the weights; the host gather faults in only the rows it reads.
     enabled: bool = false,
 };
 pub const pleGpu_shared = @import("../../sdk/util/shared.zig").Shared(PleGpuState, "ple_gpu", .{});
@@ -141,8 +141,8 @@ fn gb(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1073741824.0;
 }
 
-/// Load-time arm choice for `table`; logs one line naming the arm. `on` is `--ple-gpu`,
-/// `model_bytes` the weights already resident. Null = the host gather. An embedded pack's
+/// Load-time arm choice for `table`; logs one line naming the arm. The GPU arm is the default
+/// (`--no-ple-gpu` keeps the host read), `model_bytes` the weights already resident. Null = the host gather. An embedded pack's
 /// shards are copied into one buffer, so the gate runs before anything is allocated.
 pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
     if (mlx.noGpuBackend() or !mlx.metalKernelsAvailable()) {
@@ -166,7 +166,7 @@ pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
     const len: usize = if (src) |e| @intCast(e.repackedLen()) else if (table.fmt == .ggml) table.rows * table.row_bytes else table.map.len;
     const arm = chooseArm(on, table.bits, base, len, b);
     if (arm == .off) {
-        log.info("[qwen4] ple gather: cpu (--ple-gpu keeps the {d:.1} GB table resident for the GPU gather)\n", .{gb(len)});
+        log.info("[qwen4] ple gather: cpu (--no-ple-gpu; the GPU gather keeps the {d:.1} GB table resident)\n", .{gb(len)});
         return null;
     }
     if (arm != .gpu) {
@@ -538,7 +538,7 @@ test "ple gpu: a declined embedded table keeps the host gather" {
     try testing.expect(load(&table, true, std.math.maxInt(u64)) == null);
 }
 
-test "ple gpu arm gate: off unless --ple-gpu, a width the kernel lacks, a misaligned base, an over-long buffer, a tight working set" {
+test "ple gpu arm gate: --no-ple-gpu, a width the kernel lacks, a misaligned base, an over-long buffer, a tight working set" {
     const GB: u64 = 1 << 30;
     const b: Budget = .{ .page = 16384, .max_buffer = 64 * GB, .working_set = 200 * GB, .model_bytes = 70 * GB };
     const len: usize = 32 * GB;

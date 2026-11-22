@@ -82,7 +82,7 @@ pub fn mlxActiveBytes() u64 {
     return n;
 }
 
-/// The n-gram table is resident, wired, only on the `--ple-gpu` arm, and sits outside the
+/// The n-gram table is resident, wired, only on the GPU-gather arm (the default; `--no-ple-gpu` declines), and sits outside the
 /// `.safetensors` sum; the host gather only faults in the rows it reads.
 pub fn pleTableBill(io: std.Io, config: *const model_mod.ModelConfig) u64 {
     if (!ple_gpu.pleGpu().enabled) return 0;

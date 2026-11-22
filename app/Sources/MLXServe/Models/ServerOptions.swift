@@ -173,9 +173,9 @@ struct ServerOptions: Codable, Equatable {
     /// disables the byte cap (count cap still applies). Empty = server default
     /// (2GB, or one session at the working context on qwen4_exp when larger).
     var prefixCacheMem: String = ""
-    /// `--ple-gpu`: Qwen3.8-Flash-Next keeps its ~30 GB n-gram table resident for the GPU
-    /// gather. OFF matches the server: rows are read from the mmapped file on demand.
-    var pleGpu: Bool = false
+    /// `--no-ple-gpu`: Qwen3.8-Flash-Next reads its ~30 GB n-gram table's rows from the mmapped
+    /// file instead of gathering them on the GPU from a resident copy. OFF matches the server.
+    var pleGpuHostRead: Bool = false
     /// SSD tier for the prefix cache. OFF by default because it can persist
     /// gigabytes of KV under ~/.mlx-serve/kv-cache. When on, seen prefixes
     /// survive restarts + RAM evictions (turns a cold 30-50 s long-context
@@ -577,7 +577,7 @@ struct ServerOptions: Codable, Equatable {
         hotPrefixCacheEnabled == other.hotPrefixCacheEnabled &&
         prefixCacheEntries == other.prefixCacheEntries &&
         prefixCacheMem == other.prefixCacheMem &&
-        pleGpu == other.pleGpu &&
+        pleGpuHostRead == other.pleGpuHostRead &&
         enablePrefixCacheDisk == other.enablePrefixCacheDisk &&
         prefixCacheDisk == other.prefixCacheDisk &&
         maxResidentMemGB == other.maxResidentMemGB &&
@@ -774,7 +774,7 @@ struct ServerOptions: Codable, Equatable {
         if !trimmedPrefixMem.isEmpty {
             args += ["--prefix-cache-mem", trimmedPrefixMem]
         }
-        if pleGpu { args += ["--ple-gpu"] }
+        if pleGpuHostRead { args += ["--no-ple-gpu"] }
         // ALWAYS emit — the SSD tier can persist gigabytes of KV, so the app is
         // authoritative: `off` when the toggle is off (regardless of any server
         // default), the chosen size when on. Mirrors the prefix-cache-entries
@@ -981,7 +981,7 @@ extension ServerOptions {
         }
         if let v = storedPrefixEntries { prefixCacheEntries = max(v, 1) }
         if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheMem) { prefixCacheMem = v }
-        if let v = try c.decodeIfPresent(Bool.self, forKey: .pleGpu) { pleGpu = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .pleGpuHostRead) { pleGpuHostRead = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePrefixCacheDisk) { enablePrefixCacheDisk = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheDisk) { prefixCacheDisk = v }
         if !c.contains(.hotPrefixCacheEnabled) && storedPrefixEntries == 0 { enablePrefixCacheDisk = false }
@@ -1259,9 +1259,9 @@ extension ServerOptions {
             title: "Prefix cache memory cap",
             explainer: "The most memory the conversation cache may use; leave blank to choose automatically.",
             needsRestart: true),
-        "pleGpu": .init(
-            title: "Keep n-gram table in memory (Qwen3.8-Flash-Next)",
-            explainer: "Faster long-context Qwen3.8 Flash Next replies for about 30 GB of extra memory.",
+        "pleGpuHostRead": .init(
+            title: "Read n-gram table from disk (Qwen3.8-Flash-Next)",
+            explainer: "Saves about 30 GB while Qwen3.8 Flash Next is loaded, at slower long-context replies.",
             needsRestart: true,
             cost: "Memory: about 30 GB more while Qwen3.8-Flash-Next is loaded."),
         "enablePrefixCacheDisk": .init(

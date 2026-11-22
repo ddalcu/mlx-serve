@@ -77,7 +77,7 @@ pub fn apply(f: *const host.Flags) void {
     scheduler_mod.no_vision_global = f.no_vision;
     sleep_inhibit.setEnabled(f.prevent_sleep);
     scheduler_mod.skip_mem_preflight = f.skip_mem_preflight;
-    if (f.ple_gpu) @import("../../plugins/qwen4_exp/ple_gpu.zig").pleGpu().enabled = true;
+    @import("../../plugins/qwen4_exp/ple_gpu.zig").pleGpu().enabled = f.ple_gpu;
     depth_bounds.active = .{ .min = f.mtp_depth_min, .max = f.mtp_depth_max };
     generate_mod.mtp_greedy_tail_default = f.mtp_greedy_tail;
     generate_mod.max_mtp_ctx = f.max_mtp_ctx;
@@ -91,4 +91,22 @@ pub fn apply(f: *const host.Flags) void {
     scheduler_mod.prefill_decode_share = f.prefill_decode_share;
     @import("transformer.zig").cli().mtp_head_kv_quant = f.mtp_head_kv_quant;
     generate_mod.mtp_acceptance_default = f.mtp_acceptance;
+}
+
+// ── tests ──
+
+const testing = std.testing;
+
+test "configure: the n-gram GPU gather follows the launch flag both ways, and the default flag set is on" {
+    const ple_gpu = @import("../../plugins/qwen4_exp/ple_gpu.zig");
+    try testing.expect((host.Flags{}).ple_gpu);
+    const was = ple_gpu.pleGpu().enabled;
+    defer ple_gpu.pleGpu().enabled = was;
+    ple_gpu.pleGpu().enabled = false;
+    apply(&host.Flags{});
+    try testing.expect(ple_gpu.pleGpu().enabled);
+    var declined = host.Flags{};
+    declined.ple_gpu = false;
+    apply(&declined);
+    try testing.expect(!ple_gpu.pleGpu().enabled);
 }

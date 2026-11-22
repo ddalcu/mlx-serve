@@ -51,7 +51,7 @@ an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`
 - A host read inside the layer loop is a GPU barrier: PLE defers (`ple_defer` + `flushDeferredPle`) and claims its
   spec slot at build time; the GPU arm settles its n-gram history at the NEXT forward.
 - PLE read path is calibrated on the inference thread before and after warming, median of 5 (`calibrateArm`); a cold
-  32 GB mmap is a serial SSD fault (`PrefetchPool`, `startWarm`); `--ple-gpu` gates the no-copy wrap BEFORE wrapping.
+  32 GB mmap is a serial SSD fault (`PrefetchPool`, `startWarm`); the arm choice (`--no-ple-gpu` declines) gates the no-copy wrap BEFORE wrapping.
 - Residual stream is bf16; the f32 fixture is the MATH oracle (`MLX_SERVE_DIAG=qwen4-stream-f32`); `qwen4 fixture bf16` pins
   streams at 0.999. GDN state + gate in f32 (`MLX_SERVE_GDN_STATE_F32=0` = bf16), its own SSD namespace.
 - Tiny MoE oracles tie everywhere: fixtures dump the reference's own margins; `Qwen4Ties` acquits by those.

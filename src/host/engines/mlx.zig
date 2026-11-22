@@ -149,7 +149,8 @@ pub const Flags = struct {
     no_vision: bool = false,
     prevent_sleep: bool = true,
     skip_mem_preflight: bool = false,
-    ple_gpu: bool = false,
+    /// `--no-ple-gpu` declines the qwen4 n-gram GPU gather and keeps the host row gather.
+    ple_gpu: bool = true,
     /// `--mtp-min-depth` / `--mtp-max-depth`; a max of 0 leaves the planner's own cap.
     mtp_depth_min: u32 = 1,
     mtp_depth_max: u32 = 0,

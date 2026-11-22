@@ -255,10 +255,10 @@ fn printUsage(io: std.Io) void {
         \\  --no-mtp            Disable the Qwen native MTP head (auto-loaded
         \\                        when the model dir ships mtp/weights.safetensors;
         \\                        priority: MTP > drafter > PLD).
-        \\  --ple-gpu           Qwen3.8-Flash-Next: gather the n-gram table on the
-        \\                        GPU. Keeps the whole ~30 GB table resident beside
-        \\                        the weights for a few % faster prefill/decode;
-        \\                        off = rows read from the mmapped file on demand.
+        \\  --no-ple-gpu        Qwen3.8-Flash-Next: read the ~30 GB n-gram table's rows
+        \\                        from the mmapped file on demand instead of gathering
+        \\                        them on the GPU from a resident copy (the default;
+        \\                        unsuitable machines are declined by name at load).
         \\  --ane-prefill       Offload a share of each prefill chunk's dense
         \\                        MLP rows to the Neural Engine (qwen3_5-family
         \\                        only; int8/fp16, lossy; needs >= 96 GB RAM).
@@ -942,8 +942,8 @@ pub fn main(init: std.process.Init) !void {
             mtp_forced = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
             mtp_head_kv_quant = true;
-        } else if (std.mem.eql(u8, args[i], "--ple-gpu")) {
-            engine_flags.ple_gpu = true;
+        } else if (std.mem.eql(u8, args[i], "--no-ple-gpu")) {
+            engine_flags.ple_gpu = false;
         } else if (std.mem.eql(u8, args[i], "--ane-prefill")) {
             // ANE prefill-MLP offload (perf-plan-aug-17 P5): opt-in, lossy
             // by design (int8 fp16 datapath). Eligibility + machine gates
