@@ -1016,7 +1016,7 @@ test "dsv41 dec moe_fp4: the declared launches are the wrappers', byte for byte 
             var sc = dsv41.Scope.init(a, c.rig.stream());
             defer sc.deinit();
             const es: Scales = if (p.scaled) .{ .gate = c.args[8], .up = c.args[9], .down = c.args[10] } else .{};
-            const theirs = try runUp(&sc, .{ .up = kern.up, .down = kern.down, .lim = c.args[7] }, f, rows, 2048, 9, TOPK, c.args[0], c.args[1], c.args[2], c.args[3], c.args[4], c.args[5], c.args[6], es);
+            const theirs = try runUp(&sc, .{ .up = kern.up, .down = kern.down, .down_order = kern.down_order, .lim = c.args[7] }, f, rows, 2048, 9, TOPK, c.args[0], c.args[1], c.args[2], c.args[3], c.args[4], c.args[5], c.args[6], es);
             try testing.expectEqualSlices(u8, try c.rig.bytesOf(&.{theirs}), mine);
         }
         if (p.scaled) continue;
