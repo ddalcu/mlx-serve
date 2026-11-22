@@ -315,6 +315,8 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     errdefer if (m.vision_dir) |d| gpa.free(d);
     m.tower = if (c.dsv41_vision and taken == null and !lazy_tower) try vision.Dsv41Vision.init(gpa, m.cfg, &m.weights) else null;
     if (lazy_tower) std.log.info("deepseek_v41: the vision tower is read from the pack for each image, not resident", .{});
+    // keep_wide.zig: the reserve's buffers a row, made at the engine's pin of the pass width.
+    keep_wide.prepare(&m.cfg);
     return m;
 }
 
@@ -417,8 +419,6 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     if (f.capture_layers.len > 0) return Verdict.refuse(.unsupported, "deepseek_v41: no layer capture");
     // Before any forward: a position-0 run would reset the live state for rows nobody reads.
     if (f.want_hidden) return Verdict.refuse(.unsupported, "deepseek_v41: no hidden-state output (embeddings)");
-    // keep_wide.zig: the reserve made at the load's first forward once the engine pinned the pass width.
-    keep_wide.armOnce(&m.cfg);
     if (f.mode == .batched_rows) return forwardBatched(m, f, out);
     if (f.slots.len > 1 or f.rows == 0) return Verdict.refuse(.unsupported, "deepseek_v41: one slot's rows at a time");
     if (f.slots.len == 1) activate(m, f.slots.slice()[0]) catch return Verdict.refuse(.failed, "deepseek_v41: out of memory parking a slot's state");

@@ -9,8 +9,8 @@
 //! 0 busy 189-193 ms against 153 for layer 3). MLX's cache could not serve them across requests anyway: it hands out a
 //! buffer only within two pages of the size asked, so a buffer kept at one prompt's width never serves another's.
 //!
-//! Armed (the plugin's first forward once the engine pinned the pass width, `pinned`): one buffer per entry of
-//! `sizes` at the pinned width, at least `min_bytes` each, the floor MLX's reserve serves from. An allocation of at least
+//! Armed at the load, on the inference thread, once the engine pinned the pass width (`pinned`, after the plugin's load
+//! named its buffers, `prepare`): one buffer per entry of `sizes` at the pinned width, at least `min_bytes` each, the floor MLX's reserve serves from. An allocation of at least
 //! the floor that MLX's cache cannot serve takes the smallest idle reserve buffer at least its size (so a narrower
 //! prompt's arrays take the pinned width's buffers), and its free puts it back. MLX's `clear_cache` (the engine's, at
 //! each request's end) and its cache limit never release the reserve; `disarm` (the model's unload) does.
@@ -58,6 +58,9 @@ const State = struct {
     reserve_fn: ?ReserveFn = null,
     stats_fn: ?StatsFn = null,
     plant_fn: ?PlantFn = null,
+    /// The loaded model's buffers, bytes a prompt row each (`prepare`); 0 = no load named them.
+    per_row: [max_buffers]usize = @splat(0),
+    n_per_row: usize = 0,
     /// The engine's pinned pass width and its billed working set (`pinned`); 0 = none yet.
     rows: usize = 0,
     bill: u64 = 0,
@@ -87,18 +90,10 @@ pub fn available() bool {
     return ps().reserve_fn != null and ps().stats_fn != null;
 }
 
-/// The engine, once it pinned the load's widest prompt pass (`dsv41PassRows`): its rows and the working set it bills
-/// at them (`prefillTransientReserve`).
-pub fn pinned(rows: usize, bill: u64) void {
-    ps().rows = rows;
-    ps().bill = bill;
-}
-
-/// The reserve's buffers at `rows` rows (bytes each, into `out`; the count): the arrays of at least `min_bytes` a
-/// request's first wide layers allocate fresh (MLX_METAL_WIDE_LOG, the release pack at 17,638 rows: 15 in layer 0, one
-/// more row of the stream in layer 1), at the activations' 2 bytes. Engram's fixed per-run buffers are not row-sized
-/// and stay MLX's.
-pub fn sizes(cfg: anytype, rows: usize, out: *[max_buffers]usize) usize {
+/// The reserve's buffers, bytes a prompt row each (into `out`; the count): the arrays a request's first wide layers
+/// allocate fresh at 64 MB or more (MLX_METAL_WIDE_LOG, the release pack at 17,638 rows: 15 in layer 0, 3 more in
+/// layer 1's FFN), at the activations' 2 bytes. Engram's per-run buffers are not row-sized and stay MLX's.
+pub fn perRow(cfg: anytype, out: *[max_buffers]usize) usize {
     const act: usize = 2;
     const h: usize = cfg.hidden_size;
     const inter: usize = cfg.moe_intermediate_size;
@@ -108,9 +103,9 @@ pub fn sizes(cfg: anytype, rows: usize, out: *[max_buffers]usize) usize {
     const classes = [_]Class{
         // A row of the stream: the attention norm's rows, `wo_b`'s output, the FFN's normed rows, the shared and routed
         // outputs' sums.
-        .{ .per_row = h * act, .n = 8 },
-        // The layer's stream in and out [rows, hc_mult, hidden].
-        .{ .per_row = @as(usize, cfg.dsv4_hc_mult) * h * act, .n = 2 },
+        .{ .per_row = h * act, .n = 10 },
+        // The layer's streams [rows, hc_mult, hidden].
+        .{ .per_row = @as(usize, cfg.dsv4_hc_mult) * h * act, .n = 3 },
         // `wq_b`'s heads, their roped tail, `wo_a`'s groups.
         .{ .per_row = @as(usize, cfg.num_attention_heads) * cfg.head_dim * act, .n = 1 },
         .{ .per_row = @as(usize, cfg.num_attention_heads) * cfg.dsv4_rope_head_dim * act, .n = 1 },
@@ -123,31 +118,53 @@ pub fn sizes(cfg: anytype, rows: usize, out: *[max_buffers]usize) usize {
     };
     var n: usize = 0;
     for (classes) |c| for (0..c.n) |_| {
-        const bytes = rows * c.per_row;
-        if (bytes < min_bytes or n == max_buffers) continue;
-        out[n] = bytes;
+        if (n == max_buffers) break;
+        out[n] = c.per_row;
         n += 1;
     };
     return n;
 }
 
-/// The plugin's forward: arms the reserve once a load, at the first forward after the engine pinned the pass width
-/// (the load's own forwards, before any request). One line names the outcome.
-pub fn armOnce(cfg: anytype) void {
-    if (ps().decided or ps().rows == 0) return;
-    if (!env.on(.MLX_SERVE_DSV41_PF_KEEP_WIDE)) return;
+/// `per_row`'s buffers at `rows` rows, those of at least `min_bytes` (into `out`; the count).
+fn atRows(per_row: []const usize, rows: usize, out: *[max_buffers]usize) usize {
+    var n: usize = 0;
+    for (per_row) |b| if (rows * b >= min_bytes) {
+        out[n] = rows * b;
+        n += 1;
+    };
+    return n;
+}
+
+/// The reserve's buffers at `rows` rows (bytes each, into `out`; the count).
+pub fn sizes(cfg: anytype, rows: usize, out: *[max_buffers]usize) usize {
+    var pr: [max_buffers]usize = undefined;
+    return atRows(pr[0..perRow(cfg, &pr)], rows, out);
+}
+
+/// The plugin's load: the model's buffers a row, for the engine's pin (`pinned`).
+pub fn prepare(cfg: anytype) void {
+    ps().n_per_row = perRow(cfg, &ps().per_row);
+}
+
+/// The engine, on the inference thread, once it pinned the load's widest prompt pass (`dsv41PassRows`): its rows and
+/// the working set it bills at them (`prefillTransientReserve`). Under the switch, the reserve is made now, once a
+/// load; one line names the outcome.
+pub fn pinned(rows: usize, bill: u64) void {
+    ps().rows = rows;
+    ps().bill = bill;
+    if (ps().decided or ps().n_per_row == 0 or !env.on(.MLX_SERVE_DSV41_PF_KEEP_WIDE)) return;
     ps().decided = true;
     if (!available()) return log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE declined: the loaded libmlx has no mlx_metal_wide_reserve (patches/mlx-metal-wide-reserve.patch)\n", .{});
     var buf: [max_buffers]usize = undefined;
-    const n = sizes(cfg, ps().rows, &buf);
+    const n = atRows(ps().per_row[0..ps().n_per_row], rows, &buf);
     var total: u64 = 0;
     for (buf[0..n]) |b| total += b;
-    if (n == 0) return log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE declined: no array of {d} rows reaches {d} MB\n", .{ ps().rows, min_bytes >> 20 });
-    if (total > ps().bill) return log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE declined: its {d} MB pass {d} MB of the {d}-row pass's working set\n", .{ total >> 20, ps().bill >> 20, ps().rows });
+    if (n == 0) return log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE declined: no array of {d} rows reaches {d} MB\n", .{ rows, min_bytes >> 20 });
+    if (total > bill) return log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE declined: its {d} MB pass the {d}-row pass's {d} MB working set\n", .{ total >> 20, rows, bill >> 20 });
     const t0 = crt.monotonicMs();
     const rc = arm(buf[0..n]);
     const st = ps().last;
-    log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE: a reserve of {d} buffers, {d} MB ({d:.2} GB) at {d} rows, inside the pass's {d} MB working set, made in {d} ms{s}\n", .{ st.buffers, st.bytes >> 20, @as(f64, @floatFromInt(st.bytes)) / 1e9, ps().rows, ps().bill >> 20, crt.monotonicMs() - t0, if (rc != 0) " (a buffer failed to allocate)" else "" });
+    log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE: a reserve of {d} buffers, {d} MB ({d:.2} GB) at {d} rows, inside the pass's {d} MB working set, made in {d} ms{s}\n", .{ st.buffers, st.bytes >> 20, @as(f64, @floatFromInt(st.bytes)) / 1e9, rows, bill >> 20, crt.monotonicMs() - t0, if (rc != 0) " (a buffer failed to allocate)" else "" });
 }
 
 /// MLX's reserve made anew: one buffer of each of `bytes` (`available` first).
@@ -192,6 +209,7 @@ pub fn disarm() void {
     ps().decided = false;
     ps().rows = 0;
     ps().bill = 0;
+    ps().n_per_row = 0;
     ps().last = .{};
 }
 
