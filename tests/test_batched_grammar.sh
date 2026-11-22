@@ -1,7 +1,8 @@
 #!/bin/bash
 # test_batched_grammar.sh — json_schema requests decode in the same batched group as plain ones.
-#   [1] a lone schema request (greedy and seeded) returns the same bytes on MLX_SERVE_FORCE_BATCHED=1 (its row runs
-#       the batched kernel and the per-row mask) as on a normal server (the serial constrained step);
+#   [1] a lone schema request (greedy and seeded) returns the same bytes and finish reason on MLX_SERVE_FORCE_BATCHED=1
+#       (its row runs the batched kernel and the per-row mask) as on a normal server (the serial constrained step),
+#       and an answer that falls into a repetition loop is cut by `[loop-stop]` on both;
 #   [2] churn: schema requests over four schemas join and leave a running group (staggered starts, short and long
 #       caps, one request cancelled mid-decode); every schema answer finishes, parses and satisfies its schema;
 #   [3] the group really formed with grammar rows (`[batched] grammar rows engaged`), and no schema slot decoded
@@ -45,6 +46,7 @@ S_ANIMAL='{"type":"object","properties":{"animal":{"type":"string","enum":["cat"
 S_CITY='{"type":"object","properties":{"city":{"type":"string","maxLength":40},"population":{"type":"integer","minimum":0},"tags":{"type":"array","items":{"type":"string","maxLength":20},"maxItems":3}},"required":["city","population","tags"],"additionalProperties":false}'
 S_ITEMS='{"type":"array","items":{"type":"object","properties":{"name":{"type":"string","maxLength":30},"price":{"type":"number","minimum":0}},"required":["name","price"],"additionalProperties":false},"minItems":2,"maxItems":4}'
 S_MOOD='{"type":"object","properties":{"sentiment":{"type":"string","enum":["positive","negative","neutral"]},"score":{"type":"number","minimum":0,"maximum":1},"reason":{"type":"string","maxLength":120}},"required":["sentiment","score","reason"],"additionalProperties":false}'
+S_TEXT='{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}'
 
 # schema_req <schema> <prompt> <sampling json fragment> <max_tokens>
 schema_req() {
@@ -101,7 +103,7 @@ except ValueError as e:
     print(f"schema violation: {e}: {text[:200]!r}"); sys.exit(1)
 PY
 }
-content() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["choices"][0]["message"].get("content"))' "$1" 2>/dev/null; }
+answer() { python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["choices"][0]; print(c["finish_reason"], c["message"].get("content"))' "$1" 2>/dev/null; }
 
 echo "=== [1] a lone schema row: batched kernel + per-row mask == serial constrained step ==="
 ID_REQS=(
@@ -109,6 +111,9 @@ ID_REQS=(
     "$(schema_req "$S_CITY" 'Give facts about Lisbon.' '"temperature":0' 128)"
     "$(schema_req "$S_ITEMS" 'List three fruits with prices.' '"temperature":0.8,"seed":17' 160)"
     "$(schema_req "$S_MOOD" 'Rate this review: the soup was cold but the staff were lovely.' '"temperature":0.7,"seed":5' 128)"
+    # Repetition loops (one per model family that falls into it): the serial path's loop guard cuts these.
+    "$(schema_req "$S_TEXT" 'Write the word go two hundred times.' '"temperature":0' 300)"
+    "$(schema_req "$S_TEXT" 'Say ha ha ha ha ha ha ha ha ha ha ha ha ha ha ha ha ha ha ha ha and keep going until I tell you to stop.' '"temperature":0' 300)"
 )
 for arm in serial batched; do
     if [[ $arm == batched ]]; then start "$WORK/id-$arm.log" MLX_SERVE_FORCE_BATCHED=1; else start "$WORK/id-$arm.log"; fi
@@ -117,9 +122,11 @@ for arm in serial batched; do
 done
 grep -q "grammar rows engaged" "$WORK/id-batched.log" && ok "forced-batched arm ran grammar rows" || bad "forced-batched arm ran grammar rows" "no [batched] grammar rows engaged line"
 for i in "${!ID_REQS[@]}"; do
-    a=$(content "$WORK/id-serial-$i.json"); b=$(content "$WORK/id-batched-$i.json")
+    a=$(answer "$WORK/id-serial-$i.json"); b=$(answer "$WORK/id-batched-$i.json")
     [[ -n "$a" && "$a" == "$b" ]] && ok "request $i byte-identical (serial vs batched)" || bad "request $i byte-identical" "serial=${a:0:120} batched=${b:0:120}"
 done
+LS=$(grep -c "\[loop-stop\]" "$WORK/id-serial.log"); LB=$(grep -c "\[loop-stop\]" "$WORK/id-batched.log")
+[[ $LS -gt 0 && $LS -eq $LB ]] && ok "a repetition loop is cut on both arms ($LS)" || bad "a repetition loop is cut on both arms" "serial cut $LS, batched cut $LB"
 
 echo "=== [2] churn: schema rows join and leave a running group ==="
 start "$WORK/churn.log"
