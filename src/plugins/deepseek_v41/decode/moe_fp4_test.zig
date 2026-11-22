@@ -331,6 +331,74 @@ test "dsv41 dec moe_fp4 matrix: mxfp4, nvfp4, nvfp4 with per-expert scales at GL
     try matrix(glm);
 }
 
+/// Both launches at `d` under `MLX_SERVE_DSV41_FP4_READS` = `fr`, every layout, rows 1, 3 and 6, against the composed
+/// path and the f32 model (`expectNoWorse`); with every row's picks rotated one expert, the fused side fails the bar.
+fn readsAgree(d: Dims, fr: [:0]const u8) !void {
+    const gpa = testing.allocator;
+    const sw = env.override(.MLX_SERVE_DSV41_FP4_READS, fr.ptr);
+    defer sw.restore();
+    const m = bf16Model();
+    const kern = try moe_fp4.build(lim_ds);
+    defer kern.deinit();
+    for (fmts, 0..) |f, fi| {
+        var sc = Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        var g: Gen = .{ .seed = 0xF0A + fi };
+        var l = try randomLayer(&sc, &g, d, f);
+        defer l.deinit();
+        var prng = std.Random.DefaultPrng.init(0xDA + fi);
+        for ([_]usize{ 1, 3, decode.max_rows }) |rows| {
+            var ids: [64]u32 = undefined;
+            var ws: [64]f32 = undefined;
+            moe_up.route(prng.random(), .random, rows, d.topk, @intCast(d.experts), &ids, &ws);
+            var off: [64]u32 = undefined;
+            for (off[0 .. rows * d.topk], ids[0 .. rows * d.topk]) |*o, v| o.* = (v + 1) % @as(u32, @intCast(d.experts));
+            const idx = try sc.keep(mlx.mlx_array_new_data(&ids, &[_]c_int{ ci(rows), ci(d.topk) }, 2, .uint32));
+            const bad = try sc.keep(mlx.mlx_array_new_data(&off, &[_]c_int{ ci(rows), ci(d.topk) }, 2, .uint32));
+            const wts = try sc.keep(mlx.mlx_array_new_data(&ws, &[_]c_int{ ci(rows), ci(d.topk) }, 2, .float32));
+            const h2 = try astype(&sc, try g.normal(&sc, &.{ ci(rows), ci(d.k) }, 1), .bfloat16);
+            var label: [128]u8 = undefined;
+            {
+                const want = try composedUp(&sc, &l.ly, h2, idx, wts, l.es, lim_ds);
+                const tr = try truthUp(&sc, &l, h2, ids[0 .. rows * d.topk], ws[0 .. rows * d.topk], lim_ds);
+                defer gpa.free(tr);
+                const wh = try dsv41.hostF32(want);
+                defer gpa.free(wh);
+                for ([_]A{ idx, bad }, 0..) |use, k| {
+                    const got = (try moe_fp4.moeUpScaled(&sc, &m, kern, &l.ly, h2, use, wts, l.es)) orelse return error.Declined;
+                    const gh = try dsv41.hostF32(got);
+                    defer gpa.free(gh);
+                    const lab = try std.fmt.bufPrint(&label, "moe_fp4 up FP4_READS={s} {s} R={d}{s}", .{ fr, @tagName(f), rows, if (k == 1) " (picks off by one, planted)" else "" });
+                    if (k == 0) try decode.expectNoWorse(lab, gh, wh, tr) else try testing.expectError(error.FurtherFromTruth, decode.expectNoWorse(lab, gh, wh, tr));
+                }
+            }
+            {
+                const act = try astype(&sc, try g.normal(&sc, &.{ ci(rows), ci(d.topk + 1), ci(d.n) }, 0.5), .bfloat16);
+                const x1 = try astype(&sc, try g.normal(&sc, &.{ ci(rows), ci(d.hc), ci(d.k) }, 1), .bfloat16);
+                const sp: dsv41.Split = .{ .pre = none, .post = try uniform(&sc, &g, &.{ ci(rows), ci(d.hc) }, 0.05, 1.5), .comb = try uniform(&sc, &g, &.{ ci(rows), ci(d.hc), ci(d.hc) }, -0.5, 0.5) };
+                const want = try composedDown(&sc, &l.ly, act, idx, x1, &sp);
+                const tr = try truthDown(&sc, &l.ly, act, ids[0 .. rows * d.topk], x1, &sp);
+                defer gpa.free(tr);
+                const wh = try dsv41.hostF32(want);
+                defer gpa.free(wh);
+                for ([_]A{ idx, bad }, 0..) |use, k| {
+                    const got = (try moe_fp4.moeDown(&sc, kern, &l.ly, act, use, x1, &sp)) orelse return error.Declined;
+                    const gh = try dsv41.hostF32(got);
+                    defer gpa.free(gh);
+                    const lab = try std.fmt.bufPrint(&label, "moe_fp4 down FP4_READS={s} {s} R={d}{s}", .{ fr, @tagName(f), rows, if (k == 1) " (picks off by one, planted)" else "" });
+                    if (k == 0) try decode.expectNoWorse(lab, gh, wh, tr) else try testing.expectError(error.FurtherFromTruth, decode.expectNoWorse(lab, gh, wh, tr));
+                }
+            }
+        }
+    }
+}
+
+test "dsv41 dec moe_fp4 FP4_READS: off (MLX's reads, an equal-scale NVFP4 span in MXFP4's order) and on (bit-placement reads, each 16-group apart) are both no further from f32 than the composed path, every layout at DeepSeek-V4.1-Flash's widths, R = 1, 3, 6; picks off by one expert fail" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try readsAgree(deepseek, "0");
+    try readsAgree(deepseek, "1");
+}
+
 // ── banks from host codes ──
 
 /// e2m1 codes by value: 0, 0.5, 1, 1.5, 2, 3, 4, 6 (bit 3 the sign).
@@ -1199,6 +1267,67 @@ fn pow2Vec(sc: *Scope, es: []const i32) !A {
     return bf16Vec(sc, v[0..es.len]);
 }
 
+test "dsv41 fp4 nvfp4 as mxfp4: the fused decode with FP4_READS off: NVIDIA's power-of-two NVFP4 bank with its per-expert globals gives its MXFP4 conversion's bytes through both launches, rows 1..6 (DeepSeek-V4.1-Flash widths)" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const sw = env.override(.MLX_SERVE_DSV41_FP4_READS, "0");
+    defer sw.restore();
+    const gpa = testing.allocator;
+    const d = deepseek;
+    const E = d.experts;
+    const m = bf16Model();
+    const kern = try moe_fp4.build(lim_ds);
+    defer kern.deinit();
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var prng = std.Random.DefaultPrng.init(0x4E5F);
+    const rng = prng.random();
+    var gx: [3][16]i32 = undefined; // each expert's gate, up and down global exponents
+    for (&gx) |*row| for (row[0..E]) |*e| {
+        e.* = rng.intRangeAtMost(i32, -9, -6);
+    };
+    const gu = try pow2Banks(&sc, rng, E, 2 * d.n, d.k, d.n, gx[0][0..E], gx[1][0..E]);
+    const dn = try pow2Banks(&sc, rng, E, d.k, d.n, d.k, gx[2][0..E], gx[2][0..E]);
+    var g: Gen = .{ .seed = 0x4E5F };
+    const sgu = try quant(&sc, try g.normal(&sc, &.{ ci(2 * d.n), ci(d.k) }, 1 / @sqrt(@as(f32, @floatFromInt(d.k)))), mxfp8);
+    const sdn = try quant(&sc, try g.normal(&sc, &.{ ci(d.k), ci(d.n) }, 1 / @sqrt(@as(f32, @floatFromInt(d.n)))), mxfp8);
+    const nv = layerOf(d, Fmt.nvfp4.qp(), gu.nv, dn.nv, sgu, sdn);
+    const mx = layerOf(d, Fmt.mxfp4.qp(), gu.mx, dn.mx, sgu, sdn);
+    const gsc = try pow2Vec(&sc, gx[0][0..E]);
+    const usc = try pow2Vec(&sc, gx[1][0..E]);
+    const dsc = try pow2Vec(&sc, gx[2][0..E]);
+    const in = try rowIns(&sc, &g, rng, d);
+    // The served form's routing weights: the down global on each pick's weight (`routeScaled`, f32).
+    const wts_nv = try sc.mul(in.wts, try sc.take(try astype(&sc, dsc, .float32), in.idx, 0));
+    var bad: usize = 0;
+    for (1..decode.max_rows + 1) |R| {
+        const h2 = try rowsOf(&sc, in.h2, 0, R);
+        const idx = try rowsOf(&sc, in.idx, 0, R);
+        const x1 = try rowsOf(&sc, in.x1, 0, R);
+        const sp: dsv41.Split = .{ .pre = none, .post = try rowsOf(&sc, in.post, 0, R), .comb = try rowsOf(&sc, in.comb, 0, R) };
+        const wts = try rowsOf(&sc, in.wts, 0, R);
+        const up_mx = (try moe_fp4.moeUpScaled(&sc, &m, kern, &mx, h2, idx, wts, .{})) orelse return error.Declined;
+        const y_mx = (try moe_fp4.moeDown(&sc, kern, &mx, up_mx, idx, x1, &sp)) orelse return error.Declined;
+        // The gate/up launch with the gate and up globals; the down global in the kernel (DSCALE) and on the route.
+        const up_nv = (try moe_fp4.moeUpScaled(&sc, &m, kern, &nv, h2, idx, wts, .{ .gate = gsc, .up = usc })) orelse return error.Declined;
+        const up_ds = (try moe_fp4.moeUpScaled(&sc, &m, kern, &nv, h2, idx, wts, .{ .gate = gsc, .up = usc, .down = dsc })) orelse return error.Declined;
+        const up_rt = (try moe_fp4.moeUpScaled(&sc, &m, kern, &nv, h2, idx, try rowsOf(&sc, wts_nv, 0, R), .{ .gate = gsc, .up = usc })) orelse return error.Declined;
+        const y_ds = (try moe_fp4.moeDown(&sc, kern, &nv, up_ds, idx, x1, &sp)) orelse return error.Declined;
+        const y_rt = (try moe_fp4.moeDown(&sc, kern, &nv, up_rt, idx, x1, &sp)) orelse return error.Declined;
+        const cases = [_]struct { []const u8, A, A }{ .{ "up (gate and up globals)", up_nv, up_mx }, .{ "chain, down global in the launch", y_ds, y_mx }, .{ "chain, down global on the route", y_rt, y_mx } };
+        for (cases) |c| {
+            const a = try moe_up.bitsOf(c[1]);
+            defer gpa.free(a);
+            const b = try moe_up.bitsOf(c[2]);
+            defer gpa.free(b);
+            var diff: usize = 0;
+            for (a, b) |p, q| diff += @intFromBool(p != q);
+            std.debug.print("[moe_fp4 nvfp4-as-mxfp4] R={d} {s}: {d} of {d} outputs differ from the MXFP4 conversion's\n", .{ R, c[0], diff, a.len });
+            bad += diff;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
 /// NVIDIA's NVFP4 experts and their MXFP4 conversion (`pow2Banks`) at a fixture layer's widths, with the per-expert
 /// globals as bf16 `[E]` (gate, up, down).
 const PackPair = struct {
@@ -1322,3 +1451,54 @@ test "dsv41 fp4 nvfp4 as mxfp4: prefill's sorted gathers of NVIDIA's power-of-tw
     }
 }
 
+test "dsv41 dec moe_fp4 rules: with FP4_READS off the shared expert's down reads every e4m3 code and every e8m0 scale code as MLX's mxfp8 composed path does, bit for bit" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const sw = env.override(.MLX_SERVE_DSV41_FP4_READS, "0");
+    defer sw.restore();
+    const gpa = testing.allocator;
+    const kern = try moe_fp4.build(lim_ds);
+    defer kern.deinit();
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    // Columns 0..255: the e8m0 scale byte c on the e4m3 code 1.0 at input 40 (unit 1); 256..511: the e4m3 code c - 256
+    // under scale 1. The shared slot's activation is 1 at input 40, the routed slot's bank all zero.
+    const N = 512;
+    const K = 64;
+    const at = 40;
+    const bytes = try gpa.alloc(u8, N * K);
+    defer gpa.free(bytes);
+    @memset(bytes, 0);
+    const s8 = try gpa.alloc(u8, N * K / 32);
+    defer gpa.free(s8);
+    @memset(s8, 127);
+    const want = try gpa.alloc(f32, N);
+    defer gpa.free(want);
+    for (0..N) |c| {
+        bytes[c * K + at] = if (c < 256) 0x38 else @intCast(c - 256);
+        if (c < 256) s8[c * (K / 32) + at / 32] = @intCast(c);
+        const v = if (c < 256) e8m0Rule(@intCast(c)) else e4m3Rule(@intCast(c - 256));
+        // A sum starts at +0: a -0 term leaves +0.
+        want[c] = bf16Round(if (v == 0) 0 else v);
+    }
+    const sdn = try mxfp8Bank(&sc, bytes, s8, N, K);
+    const zc = try gpa.alloc(u8, N * K);
+    defer gpa.free(zc);
+    @memset(zc, 0);
+    const zs = try gpa.alloc(u8, N * K / 32);
+    defer gpa.free(zs);
+    @memset(zs, 127);
+    const dn = try fp4Bank(&sc, zc, zs, &.{ 1, N }, K, 32);
+    var ly: dsv41.Layer = undefined;
+    ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .down = .{ .w = dn[0], .s = dn[1], .qp = Fmt.mxfp4.qp() } };
+    ly.shared[2] = .{ .w = sdn[0], .s = sdn[1], .qp = mxfp8 };
+    var av: [2 * K]f32 = @splat(0);
+    av[K + at] = 1;
+    const act = try bf16Of(&sc, &av, &.{ 1, 2, K });
+    const idx = try sc.keep(mlx.mlx_array_new_data(&[_]u32{0}, &[_]c_int{ 1, 1 }, 2, .uint32));
+    const sp, const x1 = try identitySplit(&sc, 1, 4, N);
+    const got = try dsv41.hostF32((try moe_fp4.moeDown(&sc, kern, &ly, act, idx, x1, &sp)) orelse return error.Declined);
+    defer gpa.free(got);
+    const comp = try dsv41.hostF32(try composedDown(&sc, &ly, act, idx, x1, &sp));
+    defer gpa.free(comp);
+    try checkColumns("shared down", .mxfp4, got[0..N], want, comp[0..N], N);
+}

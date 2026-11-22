@@ -11,9 +11,9 @@ const uint c = lane % NC;
 threadgroup float part[NC * (TOPK + 1)];
 float acc;
 if (sgi == uint(TOPK)) {
-  acc = dec_fp4_down_shared<K, T>(sw, sscales, d0 + c, x + size_t(r * (TOPK + 1) + TOPK) * K, lane / NC, 32 / NC);
+  acc = dec_fp4_down_shared<K, FR, T>(sw, sscales, d0 + c, x + size_t(r * (TOPK + 1) + TOPK) * K, lane / NC, 32 / NC);
 } else {
-  acc = dec_fp4_down_routed<K, GS, T>(w, scales, size_t(inds[r * TOPK + sgi]) * N + d0 + c, x + size_t(r * (TOPK + 1) + sgi) * K, lane / NC, 32 / NC);
+  acc = dec_fp4_down_routed<K, GS, FR, T>(w, scales, size_t(inds[r * TOPK + sgi]) * N + d0 + c, x + size_t(r * (TOPK + 1) + sgi) * K, lane / NC, 32 / NC);
 }
 #pragma unroll
 for (uint o = 16; o >= uint(NC); o >>= 1) acc += simd_shuffle_xor(acc, o);
