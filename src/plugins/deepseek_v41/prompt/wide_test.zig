@@ -304,7 +304,9 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_FP4_GEMM is today's output
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
-    const unset = env.override(.MLX_SERVE_DSV41_PF_FP4_GEMM, null);
+    // Off as "0", not unset: a run with the switch exported would unsetenv before the first stderr print, which
+    // std's lazy environ scan then reads past.
+    const unset = env.override(.MLX_SERVE_DSV41_PF_FP4_GEMM, "0");
     defer unset.restore();
     inline for (.{ true, false }) |nv| {
         const pk = if (nv) env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1") else env.override(.MLX_SERVE_DSV41_MOE_PAIR, "1");
