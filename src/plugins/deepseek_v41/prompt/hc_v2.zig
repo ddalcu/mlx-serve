@@ -159,7 +159,7 @@ fn packIndex() !A {
 }
 
 /// `fn` in the mix kernel's order, a fresh array a call (2 MB gathered).
-pub fn packed(sc: *dsv41.Scope, fn_w: A) !A {
+pub fn packFn(sc: *dsv41.Scope, fn_w: A) !A {
     return sc.take(try sc.reshape(fn_w, &.{-1}), try packIndex(), 0);
 }
 
@@ -247,7 +247,7 @@ pub fn attn(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, cpre: A, hc: *co
     const S = slicesFor(L);
     engaged(L);
     const eps = try dsv41.hcEps(sc, m);
-    const o = try mixLaunch(sc, .plain, &.{ x, cpre, try packed(sc, hc.fn_w) }, L, S);
+    const o = try mixLaunch(sc, .plain, &.{ x, cpre, try packFn(sc, hc.fn_w) }, L, S);
     return finLaunch(sc, o[1], o[0], hc, norm_w, eps, S, m.cfg.dsv4_hc_sinkhorn_iters);
 }
 
@@ -258,7 +258,7 @@ pub fn ffn(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, y: A, sa: *const 
     const S = slicesFor(L);
     engaged(L);
     const eps = try dsv41.hcEps(sc, m);
-    const o = try mixLaunch(sc, .ffn, &.{ x, try bf16(sc, y), sa.post, sa.comb, sa.pre, try packed(sc, hc.fn_w) }, L, S);
+    const o = try mixLaunch(sc, .ffn, &.{ x, try bf16(sc, y), sa.post, sa.comb, sa.pre, try packFn(sc, hc.fn_w) }, L, S);
     return finLaunch(sc, o[1], o[0], hc, norm_w, eps, S, m.cfg.dsv4_hc_sinkhorn_iters);
 }
 
@@ -279,7 +279,7 @@ pub fn tail(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, y: A, sa: *const
         return .{ .x2 = o[0], .next = null };
     };
     const eps = try dsv41.hcEps(sc, m);
-    const o = try mixLaunch(sc, .tail, &.{ x, yb, sa.post, sa.comb, y2b, sf.post, sf.comb, sf.pre, try packed(sc, n.hc.fn_w) }, L, S);
+    const o = try mixLaunch(sc, .tail, &.{ x, yb, sa.post, sa.comb, y2b, sf.post, sf.comb, sf.pre, try packFn(sc, n.hc.fn_w) }, L, S);
     return .{ .x2 = o[0], .next = try finLaunch(sc, o[2], o[1], n.hc, n.norm_w, eps, S, m.cfg.dsv4_hc_sinkhorn_iters) };
 }
 
