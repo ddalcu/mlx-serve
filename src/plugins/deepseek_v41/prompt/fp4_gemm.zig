@@ -17,11 +17,15 @@ pub fn on() bool {
     return env.onUnlessZero(.MLX_SERVE_DSV41_PF_FP4_GEMM);
 }
 
-/// `gather_nax.sortedGateUpRouted`'s output on the staged schedule, for the caller to keep; null where the seg 128
-/// schedule serves the call (`gather_nax.stagedServesGateUp`) or the staged one declines (the caller runs today's).
+/// `gather_nax.sortedGateUpRouted`'s output on the staged schedule, for the caller to keep; null where it declines, or
+/// under `MLX_SERVE_DSV41_PF_GU_SEG` where the seg 128 schedule serves the call (`gather_nax.stagedServesGateUp`): the
+/// caller runs that paired launch.
 pub fn gateUp(gu: *const dsv41.Bank, x3: A, rows: A, sidx: A, w_sorted: A, limit: f32, scales: gather_nax.ExpertScales, s: mlx.mlx_stream) !?A {
     const ws = mlx.getShape(gu.w);
-    if (!gather_nax.stagedServesGateUp(mlx.getShape(sidx)[0], ws[0], mlx.getShape(x3)[2], @divTrunc(ws[1], 2))) return null;
+    if (env.on(.MLX_SERVE_DSV41_PF_GU_SEG) and !gather_nax.stagedServesGateUp(mlx.getShape(sidx)[0], ws[0], mlx.getShape(x3)[2], @divTrunc(ws[1], 2))) {
+        if (!gu_seg_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_GU_SEG engaged (pairs {d})\n", .{mlx.getShape(sidx)[0]});
+        return null;
+    }
     const y = (try gather_nax.sortedGateUpRoutedStaged(x3, rows, gu.w, gu.s, gu.b, sidx, w_sorted, limit, scales, gu.qp.bits, gu.qp.group_size, gu.qp.mode.isFp4(), verify_qmm_nax.verifyQmmNaxAvailable(), s)) orelse
         return decline("gate+up", mlx.getShape(sidx)[0], gather_nax.routed_decline);
     gate_up_engaged.store(true, .monotonic);
@@ -50,6 +54,7 @@ pub var launches: std.atomic.Value(u32) = .init(0);
 var engaged_logged: std.atomic.Value(bool) = .init(false);
 var gate_up_engaged: std.atomic.Value(bool) = .init(false);
 var declined_logged: std.atomic.Value(bool) = .init(false);
+var gu_seg_logged: std.atomic.Value(bool) = .init(false);
 
 fn decline(what: []const u8, P: c_int, why: []const u8) ?A {
     if (!declined_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_FP4_GEMM declined for {s} (pairs {d}): {s}\n", .{ what, P, why });
