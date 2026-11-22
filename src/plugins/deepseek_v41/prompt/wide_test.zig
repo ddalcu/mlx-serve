@@ -10,6 +10,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const mpair = @import("moe_pair.zig");
+const pfroute = @import("pf_route.zig");
 const mtail = @import("moe_tail.zig");
 const hv2 = @import("hc_v2.zig");
 const fixture = @import("../decode/fixture.zig");
@@ -287,6 +288,98 @@ test "dsv41 wide tol: the MoE combine and hc expand in one launch are moePrefill
     try testing.expect(ok);
 }
 
+// ── the routed pairs' counting sort (pf_route.zig) ──
+
+/// `a` and `b` the same dtype, shape and words.
+fn sameWords(a: A, b: A) !bool {
+    if (mlx.mlx_array_dtype(a) != mlx.mlx_array_dtype(b) or !std.mem.eql(c_int, mlx.getShape(a), mlx.getShape(b))) return false;
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, a, b, false, mlx.gpuStream()));
+    try dsv41.evalAll(&.{eq});
+    var v = false;
+    try mlx.check(mlx.mlx_array_item_bool(&v, eq));
+    return v;
+}
+
+test "dsv41 wide: the counting-sort route pack gives the argsorts' pair order, rows, experts and routing weights word for word at the release's 384 experts, top-6, replay to chunk widths; weights put by the wrong pair fail" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const experts = 384;
+    for ([_]usize{ 33, 128, 500, 3072, 5001, 8192 }, 0..) |L, ci| {
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const c = try call(&sc, L, experts, 0x5017 + ci, false);
+        const n: c_int = @intCast(L * top_k);
+        const flat = try sc.reshape(c.idx, &.{n});
+        const wf = try sc.reshape(c.wts, &.{n});
+        var oo = mlx.mlx_array_new();
+        const order = try sc.res(mlx.mlx_argsort_axis(&oo, flat, 0, sc.s), &oo);
+        var oi = mlx.mlx_array_new();
+        const inv = try sc.res(mlx.mlx_argsort_axis(&oi, order, 0, sc.s), &oi);
+        const rows = try sc.op2(mlx.mlx_floor_divide, order, try sc.u(top_k));
+        const got = (try pfroute.pack(&sc, flat, wf, top_k, experts)) orelse return error.PackDeclined;
+        const ok = [_]bool{ try sameWords(inv, got.inv), try sameWords(rows, got.rows), try sameWords(try sc.take(flat, order, 0), got.sidx), try sameWords(try sc.take(wf, order, 0), got.w) };
+        std.debug.print("route pack rows {d}: inv {} rows {} experts {} weights {}\n", .{ L, ok[0], ok[1], ok[2], ok[3] });
+        try testing.expect(ok[0] and ok[1] and ok[2] and ok[3]);
+        // Planted: each row's weights on the wrong experts.
+        const bad = (try pfroute.pack(&sc, flat, try sc.reshape(try rolled(&sc, c.wts), &.{n}), top_k, experts)).?;
+        try testing.expect(!try sameWords(try sc.take(wf, order, 0), bad.w));
+    }
+}
+
+test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_MOE_EPI is the argsort path's output word for word, MXFP4 and NVFP4 with per-expert scales, paired and split gate/up, prompt rows to 8192" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
+    // On by default: the argsort arm needs the explicit 0.
+    const unset = env.override(.MLX_SERVE_DSV41_PF_MOE_EPI, "0");
+    defer unset.restore();
+    inline for (.{ false, true }) |nv| inline for (.{ false, true }) |paired| {
+        const pk = if (nv) env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, if (paired) "1" else "0") else env.override(.MLX_SERVE_DSV41_MOE_PAIR, if (paired) "1" else null);
+        defer pk.restore();
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        var m: dsv41.Dsv41Model = undefined;
+        m.cfg = .{};
+        m.cfg.dsv4_swiglu_limit = 10;
+        m.act = .bfloat16;
+        m.moe_wt_kernel = null;
+        m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
+        m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
+        var ly: dsv41.Layer = undefined;
+        // No router weight: the pack takes its expert count from the banks, as a caller building the banks alone needs.
+        ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .gu = try fp4Bank(&sc, 0x6A7E, experts, 2 * inter, hidden, nv), .down = try fp4Bank(&sc, 0xD0E1, experts, hidden, inter, nv) };
+        if (nv) for (&ly.experts.scale, 0..) |*v, i| {
+            v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x5CA1E + i);
+        };
+        for ([_]usize{ 40, 500, 3072, 8192 }, 0..) |L, ci| {
+            var csc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+            defer csc.deinit();
+            const c = try call(&csc, L, @intCast(experts), 0x2000 + ci, false);
+            const want = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const on = env.override(.MLX_SERVE_DSV41_PF_MOE_EPI, "1");
+            defer on.restore();
+            const got = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            // MOE_TAIL reads the parts: the same down rows and unsort.
+            const pw = blk: {
+                const off = env.override(.MLX_SERVE_DSV41_PF_MOE_EPI, "0");
+                defer off.restore();
+                break :blk try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            };
+            const pg = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const eq = try sameWords(want, got) and try sameWords(pw.inv, pg.inv) and try sameWords(pw.dn, pg.dn);
+            std.debug.print("pf route moePrefill {s} {s} rows {d}: same words {}\n", .{ if (nv) "NVFP4" else "MXFP4", if (paired) "paired" else "split", L, eq });
+            try testing.expect(eq);
+            // Planted: each row's weights on the wrong experts.
+            const bad = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, try rolled(&csc, c.wts), c.sh);
+            try testing.expect(!try sameWords(want, bad));
+        }
+    };
+}
+
 // ── the hc stages ──
 
 /// A model holding only the hc kernels, at the release's widths, the fused ones built and probed.
@@ -551,7 +644,7 @@ test "dsv41 wide tol: hc_v2's combining tail is moe_tail's combine, glm5's expan
 
 // ── a release-shape pair worker's prefill ──
 
-const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2 };
+const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2, .MLX_SERVE_DSV41_PF_MOE_EPI };
 
 /// The pair worker's streams and mixes after its layers over `x` / `pre`, from a fresh state (caller frees).
 fn prefill(fx: *fixture.Fixture, x: A, pre: A) ![2]A {
