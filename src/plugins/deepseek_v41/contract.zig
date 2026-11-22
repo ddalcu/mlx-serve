@@ -1481,31 +1481,42 @@ const HcV2Mix = struct {
     }
 
     /// Row `l`'s formed stream into `st` [HC, D] (each expand rounded to `act`, the stored x2 left unrounded in
-    /// `last` for the output) and its terms' magnitudes into `sm`.
-    fn stream(k: anytype, l: usize, st: []f64, sm: []f64, last: []f64) void {
+    /// `last` for the output), its terms' magnitudes into `sm` and into `se` the spread its bf16 roundings leave (a
+    /// rounding that lands a step apart from float64's moves every later term by that step).
+    fn stream(k: anytype, l: usize, st: []f64, sm: []f64, se: []f64, last: []f64) void {
         const D = k.shape.n;
         const x = k.in(0);
         for (0..HC) |i| for (0..D) |d| {
             st[i * D + d] = x[(l * HC + i) * D + d];
             sm[i * D + d] = @abs(st[i * D + d]);
+            se[i * D + d] = 0;
         };
+        var te: [HC]f64 = undefined;
         var t: [HC]f64 = undefined;
         for (0..expands(k.p)) |e| {
             const y = k.in(1 + 3 * e);
             const post = k.in(2 + 3 * e);
             const comb = k.in(3 + 3 * e);
             for (0..D) |d| {
-                for (0..HC) |j| t[j] = st[j * D + d];
+                for (0..HC) |j| {
+                    t[j] = st[j * D + d];
+                    te[j] = se[j * D + d];
+                }
+                var tm: [HC]f64 = undefined;
+                for (0..HC) |j| tm[j] = sm[j * D + d];
                 for (0..HC) |i| {
                     var v = post[l * HC + i] * y[l * D + d];
                     var m = @abs(v);
+                    var er: f64 = 0;
                     for (0..HC) |j| {
                         v += comb[(l * HC + j) * HC + i] * t[j];
-                        m += @abs(comb[(l * HC + j) * HC + i]) * sm[j * D + d];
+                        m += @abs(comb[(l * HC + j) * HC + i]) * tm[j];
+                        er += @abs(comb[(l * HC + j) * HC + i]) * te[j];
                     }
                     if (e + 1 == expands(k.p)) last[i * D + d] = v;
                     st[i * D + d] = bf(v);
                     sm[i * D + d] = m;
+                    se[i * D + d] = er + 0x1p-8 * @abs(v);
                 }
             }
         }
@@ -1517,10 +1528,13 @@ const HcV2Mix = struct {
         const S = hv2.slicesFor(L);
         const DS = D / S;
         const a = k.scratch();
-        const st = try a.alloc(f64, 3 * HC * D);
+        const st = try a.alloc(f64, 4 * HC * D);
         defer a.free(st);
         const sm = st[HC * D ..][0 .. HC * D];
         const last = st[2 * HC * D ..][0 .. HC * D];
+        const se = st[3 * HC * D ..][0 .. HC * D];
+        // The roundings' spread in the bound's units: the bound grants gamma(depth) of `mag`.
+        const per = 1 / spec.gamma(@floatFromInt(depthK(k.shape)), u);
         var off: usize = 0;
         const xo = off;
         if (expands(k.p) == 2) off += rowsX(k.shape);
@@ -1540,48 +1554,60 @@ const HcV2Mix = struct {
         const hb = try a.alloc(f64, 2 * D);
         defer a.free(hb);
         for (0..L) |l| {
-            stream(k, l, st[0 .. HC * D], sm, last);
+            stream(k, l, st[0 .. HC * D], sm, se, last);
             if (expands(k.p) == 2) for (0..HC * D) |q| {
                 out[xo + l * HC * D + q] = last[q];
-                mag[xo + l * HC * D + q] = sm[q];
+                // The stored x2's own rounding is the bound's; the spread before it is x1's.
+                mag[xo + l * HC * D + q] = sm[q] + (se[q] - 0x1p-8 * @abs(last[q])) * per;
             };
             if (!mixes(k.p)) continue;
             const cpre = k.in(k.n_in - 2);
             for (0..D) |d| {
                 var h: f64 = 0;
                 var m: f64 = 0;
+                var er: f64 = 0;
                 for (0..HC) |i| {
                     h += cpre[l * HC + i] * st[i * D + d];
                     m += @abs(cpre[l * HC + i]) * sm[i * D + d];
+                    er += @abs(cpre[l * HC + i]) * se[i * D + d];
                 }
                 out[ho + l * D + d] = h;
-                mag[ho + l * D + d] = m;
+                mag[ho + l * D + d] = m + er * per;
                 hb[d] = bf(h);
+                hb[D + d] = er + 0x1p-8 * @abs(h);
             }
             for (0..S) |sl| {
                 const base = po + (sl * L + l) * hv2.PW;
                 for (0..hv2.MIX) |mx| {
                     var n: usize = 0;
                     var mg: f64 = 0;
+                    var er: f64 = 0;
                     for (0..HC) |i| for (sl * DS..(sl + 1) * DS) |d| {
                         const v = st[i * D + d] * fnw[mx * hv2.N + i * D + d];
                         terms[n] = v;
                         n += 1;
                         mg += @abs(v);
+                        er += @abs(fnw[mx * hv2.N + i * D + d]) * se[i * D + d];
                     };
                     out[base + mx] = sum.of(terms[0..n]);
-                    mag[base + mx] = mg;
+                    mag[base + mx] = mg + er * per;
                 }
                 var n: usize = 0;
+                var er: f64 = 0;
                 for (0..HC) |i| for (sl * DS..(sl + 1) * DS) |d| {
                     terms[n] = st[i * D + d] * st[i * D + d];
                     n += 1;
+                    er += 2 * @abs(st[i * D + d]) * se[i * D + d];
                 };
                 out[base + hv2.MIX] = sum.of(terms[0..n]);
-                mag[base + hv2.MIX] = out[base + hv2.MIX];
-                for (sl * DS..(sl + 1) * DS, 0..) |d, q| terms[q] = hb[d] * hb[d];
+                mag[base + hv2.MIX] = out[base + hv2.MIX] + er * per;
+                er = 0;
+                for (sl * DS..(sl + 1) * DS, 0..) |d, q| {
+                    terms[q] = hb[d] * hb[d];
+                    er += 2 * @abs(hb[d]) * hb[D + d];
+                }
                 out[base + hv2.MIX + 1] = sum.of(terms[0..DS]);
-                mag[base + hv2.MIX + 1] = out[base + hv2.MIX + 1];
+                mag[base + hv2.MIX + 1] = out[base + hv2.MIX + 1] + er * per;
             }
         }
     }
