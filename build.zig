@@ -67,6 +67,8 @@ pub fn build(b: *std.Build) void {
     // `kit`, and the kit's example plugins built from it as dylibs the unit tests load; its closure's tests join `test`.
     kit.add(b, graph.version, tests.runs);
     kit.addTests(b, tests.step);
+    // `test-compile` (after `kit.add`: it takes the runs' dependencies).
+    macos.addTestCompile(b, tests);
     // `exl3-test`.
     macos.addPluginTests(&graph, tests);
     // `check`.
