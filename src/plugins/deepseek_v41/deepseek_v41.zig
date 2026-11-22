@@ -2185,6 +2185,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     if (m.attn_gather != null) try warmRing(m);
     log.info("deepseek_v41: {d} layers, engram {d} layers, DSpark {d} stages{s}{s}\n", .{ n_layers, m.engrams.len, n_stages, if (opts.quant != null) ", weights on " else "", if (opts.quant) |q| q.name() else "" });
     if (fp4Decode(m) != null) log.info("deepseek_v41: fused fp4 MoE decode kernels on\n", .{});
+    if (dkern.fp8Fold() == 1) log.info("deepseek_v41: decode mxfp8 reads folded (MLX_SERVE_DSV41_FP8_FOLD)\n", .{});
     if (m.layers.len > 0) {
         const ex = &m.layers[0].experts;
         const b = ex.gu orelse ex.gate;
@@ -4172,22 +4173,22 @@ pub fn ffnDecode(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: 
     return try moeKernel(sc, m.moe_dn_kernel, &.{ act, vdn.w, vdn.s, vdn.b, sdn.w, sdn.s, sdb, flat, x1, sp.post, sp.comb }, mlx.getShape(x1), dt, dn.qp, sdn.qp, inter, d, k);
 }
 
-/// The fused fp4 MoE decode kernels where they serve: everywhere, unless `MLX_SERVE_DSV41_MOE_FP4_NAX=0` on a NAX GPU
-/// (read each call; there `routed`'s gathers run).
+/// The fused fp4 MoE decode kernels where they serve: a GPU without NAX, and a NAX GPU at `MLX_SERVE_DSV41_MOE_FP4_NAX=1`
+/// (read each call; off there, the default of the restack, `routed`'s gathers run).
 pub fn fp4Decode(m: *const Dsv41Model) ?dkern.moe_fp4.Kernels {
     const k = m.dec.moe_fp4 orelse return null;
     if (device.naxAvailable() and !fp4NaxOn(env.get(.MLX_SERVE_DSV41_MOE_FP4_NAX))) return null;
     return k;
 }
 
-/// `MLX_SERVE_DSV41_MOE_FP4_NAX`: unset or anything but `0` keeps the fused fp4 decode on a NAX GPU.
+/// `MLX_SERVE_DSV41_MOE_FP4_NAX`: set and not `0` puts the fused fp4 decode on a NAX GPU; unset keeps the gathers.
 fn fp4NaxOn(raw: ?[*:0]const u8) bool {
-    const v = raw orelse return true;
-    return v[0] != '0';
+    const v = raw orelse return false;
+    return v[0] != 0 and v[0] != '0';
 }
 
-test "dsv41 fused fp4 decode: on a NAX GPU by default, off only at MLX_SERVE_DSV41_MOE_FP4_NAX=0" {
-    try std.testing.expect(fp4NaxOn(null));
+test "dsv41 fused fp4 decode: off on a NAX GPU by default, on at MLX_SERVE_DSV41_MOE_FP4_NAX=1" {
+    try std.testing.expect(!fp4NaxOn(null));
     try std.testing.expect(fp4NaxOn("1"));
     try std.testing.expect(!fp4NaxOn("0"));
 }
