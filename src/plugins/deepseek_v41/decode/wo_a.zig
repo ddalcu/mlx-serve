@@ -160,7 +160,7 @@ const OL = 1024;
 const act: mlx.mlx_dtype = .bfloat16;
 
 /// An e4m3 byte's value (sign, 4 exponent bits at bias 7, 3 mantissa bits; subnormal at exponent 0).
-fn e4m3(b: u8) f64 {
+pub fn e4m3(b: u8) f64 {
     const s: f64 = if (b & 0x80 != 0) -1 else 1;
     const e: i32 = (b >> 3) & 15;
     const m: f64 = @floatFromInt(b & 7);
@@ -168,7 +168,7 @@ fn e4m3(b: u8) f64 {
 }
 
 /// The e4m3 byte of the integer `c` (|c| <= 15, exact).
-fn e4m3Of(c: i32) u8 {
+pub fn e4m3Of(c: i32) u8 {
     if (c == 0) return 0;
     const a: u32 = @abs(c);
     const e: u5 = @intCast(31 - @clz(a));
