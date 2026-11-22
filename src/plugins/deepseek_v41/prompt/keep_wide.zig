@@ -94,28 +94,40 @@ pub fn pinned(rows: usize, bill: u64) void {
     ps().bill = bill;
 }
 
-/// The reserve's buffers at `rows` rows (bytes each, into `out`; the count): a wide layer's arrays of at least
-/// `min_bytes` that it allocates while the ones before it are still live, at most `max_buffers`.
+/// The reserve's buffers at `rows` rows (bytes each, into `out`; the count): the arrays of at least `min_bytes` a
+/// request's first wide layers allocate fresh (MLX_METAL_WIDE_LOG, the release pack at 17,638 rows: 15 in layer 0, one
+/// more row of the stream in layer 1), at the activations' 2 bytes. Engram's fixed per-run buffers are not row-sized
+/// and stay MLX's.
 pub fn sizes(cfg: anytype, rows: usize, out: *[max_buffers]usize) usize {
-    const r: usize = rows;
+    const act: usize = 2;
     const h: usize = cfg.hidden_size;
-    const heads: usize = cfg.num_attention_heads;
-    const hd: usize = cfg.head_dim;
-    const bf16: usize = 2;
-    const per_row = [_]usize{
-        // `wq_b`'s heads [rows, heads, head_dim].
-        heads * hd * bf16,
-        // The layer's stream [rows, 4, hidden].
-        4 * h * bf16,
+    const inter: usize = cfg.moe_intermediate_size;
+    const shared: usize = if (cfg.shared_expert_intermediate_size > 0) cfg.shared_expert_intermediate_size else inter;
+    const top_k: usize = cfg.num_experts_per_tok;
+    const Class = struct { per_row: usize, n: usize };
+    const classes = [_]Class{
+        // A row of the stream: the attention norm's rows, `wo_b`'s output, the FFN's normed rows, the shared and routed
+        // outputs' sums.
+        .{ .per_row = h * act, .n = 8 },
+        // The layer's stream in and out [rows, hc_mult, hidden].
+        .{ .per_row = @as(usize, cfg.dsv4_hc_mult) * h * act, .n = 2 },
+        // `wq_b`'s heads, their roped tail, `wo_a`'s groups.
+        .{ .per_row = @as(usize, cfg.num_attention_heads) * cfg.head_dim * act, .n = 1 },
+        .{ .per_row = @as(usize, cfg.num_attention_heads) * cfg.dsv4_rope_head_dim * act, .n = 1 },
+        .{ .per_row = @as(usize, cfg.dsv4_o_groups) * cfg.dsv4_o_lora_rank * act, .n = 1 },
+        // The shared expert's gate and up, its activation; the routed experts' activations and down outputs.
+        .{ .per_row = 2 * shared * act, .n = 1 },
+        .{ .per_row = shared * act, .n = 1 },
+        .{ .per_row = top_k * inter * act, .n = 1 },
+        .{ .per_row = top_k * h * act, .n = 1 },
     };
     var n: usize = 0;
-    for (per_row) |b| {
-        if (n == max_buffers) break;
-        const bytes = r * b;
-        if (bytes < min_bytes) continue;
+    for (classes) |c| for (0..c.n) |_| {
+        const bytes = rows * c.per_row;
+        if (bytes < min_bytes or n == max_buffers) continue;
         out[n] = bytes;
         n += 1;
-    }
+    };
     return n;
 }
 
