@@ -6534,7 +6534,7 @@ fn engramGathered(sc: *Scope, m: *const Dsv41Model, gpa: std.mem.Allocator, sp: 
 /// rows, not a span's 256) and the gate span by span on its slice; false (nothing taken) where it declines: the
 /// switch off, a fused Engram read, a batch, a trace, a DSpark target, a CPU stream, not one Engram table a layer.
 fn engramPass(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, li: usize, parts: []A) !bool {
-    if (!env.on(.MLX_SERVE_DSV41_PF_ENGRAM_PASS) or !mlx.streamIsGpu(sc.s) or m.fuse.engram or m.trace != null) return false;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_ENGRAM_PASS) or !mlx.streamIsGpu(sc.s) or m.fuse.engram or m.trace != null) return false;
     if (sp.eng_gpu.ctx != null or sp.offs.len > 0 or (m.n_mtp > 0 and m.dsparkTarget(li) != null)) return false;
     var found: ?usize = null;
     for (m.engrams, 0..) |*e, ek| if (e.layer == li) {
