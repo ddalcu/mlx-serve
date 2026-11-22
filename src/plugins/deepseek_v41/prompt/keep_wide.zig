@@ -158,7 +158,7 @@ pub fn arm(bytes: []const usize) c_int {
     return rc;
 }
 
-/// The tests' planted control: MLX's reserve hands out a buffer it keeps idle, so two live arrays may share it.
+/// The tests' planted control: every MLX reserve hit shares one buffer, so live arrays alias.
 pub fn plant(alias: bool) void {
     if (ps().plant_fn) |f| f(@intFromBool(alias));
 }

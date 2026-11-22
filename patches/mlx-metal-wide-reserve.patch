@@ -3,16 +3,16 @@ The caller arms it with a byte floor and a list of sizes; the buffers are alloca
 pages mapped then). An allocation of at least the floor that MLX's cache cannot serve takes the smallest idle reserve
 buffer at least its size (the cache only serves within two pages of the size); its free puts it back. clear_cache and
 the cache limit never release the reserve; disarming (floor 0) releases its idle buffers. mlx_metal_wide_reserve_stats
-reads its floor, size and hit counts; mlx_metal_wide_reserve_plant is the tests' planted aliasing bug.
-MLX_METAL_WIDE_LOG (diagnostic) prints each armed miss. Unarmed, MLX's own paths are unchanged (one load and test per
-allocation and free).
+reads its floor, size and hit counts; mlx_metal_wide_reserve_plant is the tests' planted aliasing bug (every hit shares
+one buffer). MLX_METAL_WIDE_LOG (diagnostic) prints each armed miss. Unarmed, MLX's own paths are unchanged (one load
+and test per allocation and free).
 
 Used by mlx-serve's DeepSeek-V4.1 plugin (MLX_SERVE_DSV41_PF_KEEP_WIDE): a prompt pass's large intermediates, freshly
 allocated by every request's first layer (the engine clears MLX's cache at each request's end), come from the reserve.
 Not reported upstream.
 
 diff --git a/mlx/backend/metal/allocator.cpp b/mlx/backend/metal/allocator.cpp
-index ff12293..eefa7de 100644
+index ff12293..f8ce713 100644
 --- a/mlx/backend/metal/allocator.cpp
 +++ b/mlx/backend/metal/allocator.cpp
 @@ -8,7 +8,10 @@
@@ -49,7 +49,7 @@ index ff12293..eefa7de 100644
 +  size_t hits{0};
 +  size_t misses{0};
 +  size_t miss_bytes{0};
-+  // The reserve tests' planted control: a hit leaves its buffer idle, so two live arrays may share it.
++  // The reserve tests' planted control: every hit takes the largest buffer and leaves it idle, so live arrays share it.
 +  bool plant_alias{false};
 +};
 +
@@ -70,7 +70,7 @@ index ff12293..eefa7de 100644
  MetalAllocator::MetalAllocator(Device& d)
      : device_(d.mtl_device()),
        residency_sets_(d.residency_sets()),
-@@ -128,8 +168,28 @@ Buffer MetalAllocator::malloc(size_t size) {
+@@ -128,8 +168,31 @@ Buffer MetalAllocator::malloc(size_t size) {
    // Try the cache
    std::unique_lock lk(mutex_);
    MTL::Buffer* buf = buffer_cache_.reuse_from_cache(size);
@@ -78,6 +78,9 @@ index ff12293..eefa7de 100644
 +  auto& w = wide();
 +  if (!buf && w.min_bytes && size >= w.min_bytes) {
 +    auto it = w.idle.lower_bound(size);
++    if (w.plant_alias && it != w.idle.end()) {
++      it = std::prev(w.idle.end()); // every hit the same, largest, buffer
++    }
 +    if (it != w.idle.end()) {
 +      buf = it->second;
 +      if (!w.plant_alias) {
@@ -100,7 +103,7 @@ index ff12293..eefa7de 100644
  
      // If we have a lot of memory pressure try to reclaim memory from the cache
      if (mem_required >= gc_limit_ || num_resources_ >= resource_limit_) {
-@@ -196,6 +256,15 @@ void MetalAllocator::free(Buffer buffer) {
+@@ -196,6 +259,15 @@ void MetalAllocator::free(Buffer buffer) {
  
    std::unique_lock lk(mutex_);
    active_memory_ -= buf->length();
@@ -116,7 +119,7 @@ index ff12293..eefa7de 100644
    if (get_cache_memory() < max_pool_size_) {
      buffer_cache_.recycle_to_cache(buf);
    } else {
-@@ -209,6 +278,99 @@ void MetalAllocator::free(Buffer buffer) {
+@@ -209,6 +281,99 @@ void MetalAllocator::free(Buffer buffer) {
    }
  }
  
@@ -216,7 +219,7 @@ index ff12293..eefa7de 100644
  size_t MetalAllocator::size(Buffer buffer) const {
    return static_cast<MTL::Buffer*>(buffer.ptr())->length();
  }
-@@ -286,3 +448,27 @@ void clear_cache() {
+@@ -286,3 +451,27 @@ void clear_cache() {
  }
  
  } // namespace mlx::core
@@ -239,7 +242,7 @@ index ff12293..eefa7de 100644
 +  mlx::core::metal::allocator().wide_stats(out, n);
 +}
 +
-+// The reserve's tests only: a hit leaves its buffer idle (a planted aliasing bug their checks must catch).
++// The reserve's tests only: every hit shares one buffer (a planted aliasing bug their checks must catch).
 +extern "C" __attribute__((visibility("default"))) void
 +mlx_metal_wide_reserve_plant(int alias) {
 +  mlx::core::metal::allocator().wide_plant(alias != 0);
