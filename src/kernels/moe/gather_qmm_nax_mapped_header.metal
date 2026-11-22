@@ -110,7 +110,7 @@ METAL_FUNC void store_act(thread DTile& D, device T* y, const int ld,
                           const int rows, const device T* sigtab,
                           const device T* gsc, const device T* usc,
                           const uint expert, const device float* rw,
-                          const float lim);
+                          const float lim, const short p = 0);
 
 template <
     typename T,
@@ -413,13 +413,14 @@ METAL_FUNC void gather_mapped_db(
 // the expert's own gate / up scale (ModelOpt's per-expert global scale, `gsc` / `usc`
 // [E] in T) multiplies the rounded product before the clamp and the SiLU, rounded again,
 // as the split path's multiply does (and the fp4 decode kernel's GSCALE / USCALE).
+// `p`: the 16-column pair D holds the gate and up of, in fragments 2p and 2p + 1.
 // EPI -1: deepseek_v41's moe_act on those values instead: in f32, clamped under `lim` when it
 // is positive, times the row's routing weight `rw[r]`, rounded once.
 template <typename T, int EPI, int ESC, typename DTile>
 METAL_FUNC void store_act(
     thread DTile& D, device T* y, const int ld, const int rows,
     const device T* sigtab, const device T* gsc, const device T* usc,
-    const uint expert, const device float* rw, const float lim) {
+    const uint expert, const device float* rw, const float lim, const short p) {
   T gs = T(1);
   T us = T(1);
   if constexpr ((ESC & 1) != 0) {
@@ -440,8 +441,8 @@ METAL_FUNC void store_act(
         STEEL_PRAGMA_UNROLL
         for (short j = 0; j < 4; j++) {
           const short e = h * 4 + j;
-          T g = T(D.frag_at(i, 0)[e]);
-          T u = T(D.frag_at(i, 1)[e]);
+          T g = T(D.frag_at(i, 2 * p)[e]);
+          T u = T(D.frag_at(i, 2 * p + 1)[e]);
           if constexpr ((ESC & 1) != 0) {
             g = T(g * gs);
           }
