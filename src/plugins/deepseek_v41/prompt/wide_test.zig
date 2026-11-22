@@ -10,7 +10,10 @@ const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const mpair = @import("moe_pair.zig");
+const pfroute = @import("pf_route.zig");
+const fp4gemm = @import("fp4_gemm.zig");
 const mtail = @import("moe_tail.zig");
+const hv2 = @import("hc_v2.zig");
 const fixture = @import("../decode/fixture.zig");
 
 const testing = std.testing;
@@ -286,6 +289,147 @@ test "dsv41 wide tol: the MoE combine and hc expand in one launch are moePrefill
     try testing.expect(ok);
 }
 
+// ── the routed pairs' counting sort (pf_route.zig) ──
+
+/// `a` and `b` the same dtype, shape and words.
+fn sameWords(a: A, b: A) !bool {
+    if (mlx.mlx_array_dtype(a) != mlx.mlx_array_dtype(b) or !std.mem.eql(c_int, mlx.getShape(a), mlx.getShape(b))) return false;
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, a, b, false, mlx.gpuStream()));
+    try dsv41.evalAll(&.{eq});
+    var v = false;
+    try mlx.check(mlx.mlx_array_item_bool(&v, eq));
+    return v;
+}
+
+test "dsv41 wide: the counting-sort route pack gives the argsorts' pair order, rows, experts and routing weights word for word at the release's 384 experts, top-6, replay to chunk widths; weights put by the wrong pair fail" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const experts = 384;
+    for ([_]usize{ 33, 128, 500, 3072, 5001, 8192 }, 0..) |L, ci| {
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const c = try call(&sc, L, experts, 0x5017 + ci, false);
+        const n: c_int = @intCast(L * top_k);
+        const flat = try sc.reshape(c.idx, &.{n});
+        const wf = try sc.reshape(c.wts, &.{n});
+        var oo = mlx.mlx_array_new();
+        const order = try sc.res(mlx.mlx_argsort_axis(&oo, flat, 0, sc.s), &oo);
+        var oi = mlx.mlx_array_new();
+        const inv = try sc.res(mlx.mlx_argsort_axis(&oi, order, 0, sc.s), &oi);
+        const rows = try sc.op2(mlx.mlx_floor_divide, order, try sc.u(top_k));
+        const got = (try pfroute.pack(&sc, flat, wf, top_k, experts)) orelse return error.PackDeclined;
+        const ok = [_]bool{ try sameWords(inv, got.inv), try sameWords(rows, got.rows), try sameWords(try sc.take(flat, order, 0), got.sidx), try sameWords(try sc.take(wf, order, 0), got.w) };
+        std.debug.print("route pack rows {d}: inv {} rows {} experts {} weights {}\n", .{ L, ok[0], ok[1], ok[2], ok[3] });
+        try testing.expect(ok[0] and ok[1] and ok[2] and ok[3]);
+        // Planted: each row's weights on the wrong experts.
+        const bad = (try pfroute.pack(&sc, flat, try sc.reshape(try rolled(&sc, c.wts), &.{n}), top_k, experts)).?;
+        try testing.expect(!try sameWords(try sc.take(wf, order, 0), bad.w));
+    }
+}
+
+test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_MOE_EPI is the argsort path's output word for word, MXFP4 and NVFP4 with per-expert scales, paired and split gate/up, prompt rows to 8192" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
+    // On by default: the argsort arm needs the explicit 0.
+    const unset = env.override(.MLX_SERVE_DSV41_PF_MOE_EPI, "0");
+    defer unset.restore();
+    inline for (.{ false, true }) |nv| inline for (.{ false, true }) |paired| {
+        const pk = if (nv) env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, if (paired) "1" else "0") else env.override(.MLX_SERVE_DSV41_MOE_PAIR, if (paired) "1" else null);
+        defer pk.restore();
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        var m: dsv41.Dsv41Model = undefined;
+        m.cfg = .{};
+        m.cfg.dsv4_swiglu_limit = 10;
+        m.act = .bfloat16;
+        m.moe_wt_kernel = null;
+        m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
+        m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
+        var ly: dsv41.Layer = undefined;
+        // No router weight: the pack takes its expert count from the banks, as a caller building the banks alone needs.
+        ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .gu = try fp4Bank(&sc, 0x6A7E, experts, 2 * inter, hidden, nv), .down = try fp4Bank(&sc, 0xD0E1, experts, hidden, inter, nv) };
+        if (nv) for (&ly.experts.scale, 0..) |*v, i| {
+            v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x5CA1E + i);
+        };
+        for ([_]usize{ 40, 500, 3072, 8192 }, 0..) |L, ci| {
+            var csc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+            defer csc.deinit();
+            const c = try call(&csc, L, @intCast(experts), 0x2000 + ci, false);
+            const want = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const on = env.override(.MLX_SERVE_DSV41_PF_MOE_EPI, "1");
+            defer on.restore();
+            const got = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            // MOE_TAIL reads the parts: the same down rows and unsort.
+            const pw = blk: {
+                const off = env.override(.MLX_SERVE_DSV41_PF_MOE_EPI, "0");
+                defer off.restore();
+                break :blk try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            };
+            const pg = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const eq = try sameWords(want, got) and try sameWords(pw.inv, pg.inv) and try sameWords(pw.dn, pg.dn);
+            std.debug.print("pf route moePrefill {s} {s} rows {d}: same words {}\n", .{ if (nv) "NVFP4" else "MXFP4", if (paired) "paired" else "split", L, eq });
+            try testing.expect(eq);
+            // Planted: each row's weights on the wrong experts.
+            const bad = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, try rolled(&csc, c.wts), c.sh);
+            try testing.expect(!try sameWords(want, bad));
+        }
+    };
+}
+
+test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_FP4_GEMM is today's output word for word, NVFP4 with per-expert scales and MXFP4, paired gate/up, odd prompt rows to 8192" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
+    // Off as "0", not unset: a run with the switch exported would unsetenv before the first stderr print, which
+    // std's lazy environ scan then reads past.
+    const unset = env.override(.MLX_SERVE_DSV41_PF_FP4_GEMM, "0");
+    defer unset.restore();
+    inline for (.{ true, false }) |nv| {
+        const pk = if (nv) env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1") else env.override(.MLX_SERVE_DSV41_MOE_PAIR, "1");
+        defer pk.restore();
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        var m: dsv41.Dsv41Model = undefined;
+        m.cfg = .{};
+        m.cfg.dsv4_swiglu_limit = 10;
+        m.act = .bfloat16;
+        m.moe_wt_kernel = null;
+        m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
+        m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
+        var ly: dsv41.Layer = undefined;
+        ly.gate_w = try sc.zeros(&.{ experts, 8 }, .bfloat16);
+        ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .gu = try fp4Bank(&sc, 0x6A7E, experts, 2 * inter, hidden, nv), .down = try fp4Bank(&sc, 0xD0E1, experts, hidden, inter, nv) };
+        if (nv) for (&ly.experts.scale, 0..) |*v, i| {
+            v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x5CA1E + i);
+        };
+        for ([_]usize{ 40, 777, 1254, 4097, 8192 }, 0..) |L, ci| {
+            var csc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+            defer csc.deinit();
+            const c = try call(&csc, L, @intCast(experts), 0x2100 + ci, false);
+            const want = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const on = env.override(.MLX_SERVE_DSV41_PF_FP4_GEMM, "1");
+            defer on.restore();
+            const before = fp4gemm.launches.load(.monotonic);
+            const got = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const served = fp4gemm.launches.load(.monotonic) - before;
+            const eq = try sameWords(want.dn, got.dn) and try sameWords(want.inv, got.inv);
+            std.debug.print("pf fp4 gemm moePrefill {s} rows {d}: staged launches {d}, same words {}\n", .{ if (nv) "NVFP4" else "MXFP4", L, served, eq });
+            try testing.expectEqual(@as(u32, 2), served);
+            try testing.expect(eq);
+            // Planted: each row's weights on the wrong experts.
+            const bad = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, try rolled(&csc, c.wts), c.sh);
+            try testing.expect(!try sameWords(want.dn, bad.dn));
+        }
+    }
+}
+
 // ── the hc stages ──
 
 /// A model holding only the hc kernels, at the release's widths, the fused ones built and probed.
@@ -387,108 +531,170 @@ test "dsv41 wide tol: the hc mixes at 8 rows a threadgroup are the 4-row launche
     try testing.expect(ok);
 }
 
-test "dsv41 wide tol: the hc mixes on the simdgroup matrix units are hc_mix's mixes, and with hc_norm the fused attention-side launch's split and norm, within 1% at prompt widths; a dropped mix scale or base fails" {
+/// hc_v2's prompt widths: below a threadgroup's 64 rows, the chunk tail, a lead half, an odd width, a full chunk.
+const v2_widths = [_]c_int{ 37, 1254, 4096, 5001, 8192 };
+
+fn v2Close(lb: []u8, what: []const u8, L: c_int, nm: []const u8, want: A, got: A) !bool {
+    return close(try std.fmt.bufPrint(lb, "hc_v2 {s} rows {d} {s}", .{ what, L, nm }), want, got, null, tol_kernel);
+}
+
+/// The mixes, split and normed collapse of `got` against the stock launches' (`want`), each printed.
+fn v2Same(what: []const u8, L: c_int, want_z: A, want: dsv41.Normed, got: hv2.Res) !bool {
+    var lb: [96]u8 = undefined;
+    var ok = true;
+    const names = [_][]const u8{ "z", "h", "pre", "post", "comb" };
+    for ([_][2]A{ .{ want_z, got.z }, .{ want.h, got.n.h }, .{ want.sp.pre, got.n.sp.pre }, .{ want.sp.post, got.n.sp.post }, .{ want.sp.comb, got.n.sp.comb } }, names) |pr, nm| {
+        if (pr[0].ctx == null) continue;
+        if (!try v2Close(&lb, what, L, nm, pr[0], pr[1])) ok = false;
+    }
+    return ok;
+}
+
+test "dsv41 wide tol: hc_v2's attention side is hc_mix_norm's mixes, split and norm within 1% at prompt widths; the wrong previous mix fails" {
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
     var m: dsv41.Dsv41Model = undefined;
     try hcModel(&m);
     defer hcModelFree(&m);
-    const off = env.override(.MLX_SERVE_DSV41_HC_MIX_TILED, "0");
-    defer off.restore();
     var ok = true;
-    for ([_]c_int{ 17, 33, 1027, 5001, 8192 }, 0..) |L, i| {
+    for (v2_widths, 0..) |L, i| {
         var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
         defer sc.deinit();
-        const r = try hcRows(&sc, L, 0x9900 + 16 * @as(u64, i));
+        const r = try hcRows(&sc, L, 0xA200 + 16 * @as(u64, i));
         const eps = try dsv41.hcEps(&sc, &m);
-        const z4 = try dsv41.hcMixWide(&sc, &m, r.x, &r.hc, eps);
-        const f = try dsv41.hcMixNormFused(&sc, &m, r.x, r.cpre, &r.hc, r.w, null, eps);
-        const on = env.override(.MLX_SERVE_DSV41_HC_MIX_TILED, "1");
-        defer on.restore();
-        const zt = try dsv41.hcMixWide(&sc, &m, r.x, &r.hc, eps);
-        const n = try dsv41.hcNorm(&sc, &m, zt, r.x, r.cpre, r.w, eps);
-        const names = [_][]const u8{ "z", "fused z", "h", "pre", "post", "comb" };
-        for ([_][2]A{ .{ z4, zt }, .{ f.z, zt }, .{ f.n.h, n.h }, .{ f.n.sp.pre, n.sp.pre }, .{ f.n.sp.post, n.sp.post }, .{ f.n.sp.comb, n.sp.comb } }, names) |pr, nm| {
-            var lb: [64]u8 = undefined;
-            if (!try close(try std.fmt.bufPrint(&lb, "hc mix tiled rows {d} {s}", .{ L, nm }), pr[0], pr[1], null, tol_kernel)) ok = false;
-        }
-        // Planted: the mixes' scale dropped, then their base dropped (ones and zeros in their places).
-        var bad_s = r.hc;
-        bad_s.scale = try sc.ones(mlx.getShape(r.hc.scale), .float32);
-        try testing.expect(!try close("  planted: mix scale dropped", z4, try dsv41.hcMixWide(&sc, &m, r.x, &bad_s, eps), null, tol_kernel));
-        var bad_b = r.hc;
-        bad_b.base = try sc.zeros(mlx.getShape(r.hc.base), .float32);
-        try testing.expect(!try close("  planted: mix base dropped", z4, try dsv41.hcMixWide(&sc, &m, r.x, &bad_b, eps), null, tol_kernel));
+        const want = try dsv41.hcMixNormFused(&sc, &m, r.x, r.cpre, &r.hc, r.w, null, eps);
+        const got = try hv2.attn(&sc, &m, r.x, r.cpre, &r.hc, r.w);
+        if (!try v2Same("attn", L, want.z, want.n, got)) ok = false;
+        // Planted: the collapse with this mix's own pre in place of the previous mix's.
+        const bad = try hv2.attn(&sc, &m, r.x, try sc.add(r.cpre, try sc.f(0.5)), &r.hc, r.w);
+        try testing.expect(!try close("  planted: the wrong previous mix", want.n.h, bad.n.h, null, tol_kernel));
     }
     try testing.expect(ok);
 }
 
-/// `n` launches of `f` (no dependence between them) evaluated together, best of 3: microseconds a launch.
-fn timeLaunches(comptime f: anytype, args: anytype, n: usize) !f64 {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const iou = @import("../../../sdk/util/io_util.zig");
-    var best: f64 = std.math.inf(f64);
-    for (0..4) |rep| {
-        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
-        defer sc.deinit();
-        const outs = try testing.allocator.alloc(A, n);
-        defer testing.allocator.free(outs);
-        const t0 = iou.nowUsMonotonic(io);
-        for (outs) |*o| o.* = try @call(.auto, f, .{&sc} ++ args);
-        try dsv41.evalAll(outs);
-        const us = @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0)) / @as(f64, @floatFromInt(n));
-        // The first pass compiles the kernels.
-        if (rep > 0) best = @min(best, us);
-    }
-    return best;
-}
-
-fn mixOnly(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, hc: *const dsv41.Hc, eps: A) !A {
-    return dsv41.hcMixWide(sc, m, x, hc, eps);
-}
-
-fn mixNormFused(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, cpre: A, hc: *const dsv41.Hc, w: A, eps: A) !A {
-    return (try dsv41.hcMixNormFused(sc, m, x, cpre, hc, w, null, eps)).n.h;
-}
-
-fn mixThenNorm(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, cpre: A, hc: *const dsv41.Hc, w: A, eps: A) !A {
-    return (try dsv41.hcNorm(sc, m, try dsv41.hcMixWide(sc, m, x, hc, eps), x, cpre, w, eps)).h;
-}
-
-test "dsv41 bench: the wide hc mixes, hc_mix against the simdgroup matrix kernel, alone and with the norm (DSV41_BENCH_HC_MIX = rows)" {
-    const rows_s = std.mem.span(std.c.getenv("DSV41_BENCH_HC_MIX") orelse return error.SkipZigTest);
+test "dsv41 wide tol: hc_v2's FFN side is the stock expand, norm and mixes' split and norm within 1% at prompt widths; a dropped norm weight and mix weights on the wrong copy fail" {
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
-    const L = try std.fmt.parseInt(c_int, rows_s, 10);
     var m: dsv41.Dsv41Model = undefined;
     try hcModel(&m);
     defer hcModelFree(&m);
-    var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
-    defer sc.deinit();
-    const r = try hcRows(&sc, L, 0xBE0C);
-    const eps = try dsv41.hcEps(&sc, &m);
-    try dsv41.evalAll(&.{ r.x, r.cpre, r.hc.fn_w, r.hc.scale, r.hc.base, r.w, eps });
-    const n = 50;
-    var t: [5]f64 = undefined;
-    {
-        const off = env.override(.MLX_SERVE_DSV41_HC_MIX_TILED, "0");
-        defer off.restore();
-        t[0] = try timeLaunches(mixOnly, .{ &m, r.x, &r.hc, eps }, n);
-        t[2] = try timeLaunches(mixThenNorm, .{ &m, r.x, r.cpre, &r.hc, r.w, eps }, n);
-        t[4] = try timeLaunches(mixNormFused, .{ &m, r.x, r.cpre, &r.hc, r.w, eps }, n);
+    var ok = true;
+    for (v2_widths, 0..) |L, i| {
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const r = try hcRows(&sc, L, 0xA400 + 16 * @as(u64, i));
+        const eps = try dsv41.hcEps(&sc, &m);
+        // The stock launches: glm5's expand, hc_mix over x1, hc_norm's split and normed collapse.
+        const x1 = try dsv41.hcExpand(&sc, r.x, r.y, &r.sp);
+        const z = try dsv41.hcMixWide(&sc, &m, x1, &r.hc, eps);
+        const want = try dsv41.hcNorm(&sc, &m, z, x1, r.cpre, r.w, eps);
+        const sa: dsv41.Split = .{ .pre = r.cpre, .post = r.sp.post, .comb = r.sp.comb };
+        const got = try hv2.ffn(&sc, &m, r.x, r.y, &sa, &r.hc, r.w);
+        if (!try v2Same("ffn", L, z, want, got)) ok = false;
+        const bad = try hv2.ffn(&sc, &m, r.x, r.y, &sa, &r.hc, try sc.ones(&.{@intCast(hidden)}, .bfloat16));
+        try testing.expect(!try close("  planted: norm weight dropped", want.h, bad.n.h, null, tol_kernel));
+        // Planted: the mix weights read one copy over (fn's columns rolled by 5120).
+        var hc_bad = r.hc;
+        const n4: usize = 4 * hidden;
+        hc_bad.fn_w = try sc.concat(&.{ try sc.slice(r.hc.fn_w, 1, hidden, n4), try sc.slice(r.hc.fn_w, 1, 0, hidden) }, 1);
+        const bad2 = try hv2.ffn(&sc, &m, r.x, r.y, &sa, &hc_bad, r.w);
+        try testing.expect(!try close("  planted: mix weights on the wrong copy", z, bad2.z, null, tol_kernel));
     }
-    {
-        const on = env.override(.MLX_SERVE_DSV41_HC_MIX_TILED, "1");
-        defer on.restore();
-        t[1] = try timeLaunches(mixOnly, .{ &m, r.x, &r.hc, eps }, n);
-        t[3] = try timeLaunches(mixThenNorm, .{ &m, r.x, r.cpre, &r.hc, r.w, eps }, n);
+    try testing.expect(ok);
+}
+
+test "dsv41 wide tol: hc_v2's tail is glm5's two expands' stream and the next layer's hc_mix_norm within 1% at prompt widths; a transposed comb fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var m: dsv41.Dsv41Model = undefined;
+    try hcModel(&m);
+    defer hcModelFree(&m);
+    var ok = true;
+    for (v2_widths, 0..) |L, i| {
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const r = try hcRows(&sc, L, 0xA600 + 16 * @as(u64, i));
+        const f = try hcRows(&sc, L, 0xA700 + 16 * @as(u64, i));
+        const eps = try dsv41.hcEps(&sc, &m);
+        const sa: dsv41.Split = .{ .pre = r.cpre, .post = r.sp.post, .comb = r.sp.comb };
+        const sf: dsv41.Split = .{ .pre = f.cpre, .post = f.sp.post, .comb = f.sp.comb };
+        // The stock launches: x1, then the tail's x2, then the next layer's fused mix and norm over x2.
+        const x1 = try dsv41.hcExpand(&sc, r.x, r.y, &sa);
+        const x2 = try dsv41.hcExpand(&sc, x1, f.y, &sf);
+        const want = try dsv41.hcMixNormFused(&sc, &m, x2, f.cpre, &f.hc, f.w, null, eps);
+        const got = try hv2.tail(&sc, &m, r.x, r.y, &sa, .{ .rows = f.y }, &sf, .{ .hc = &f.hc, .norm_w = f.w });
+        var lb: [96]u8 = undefined;
+        if (!try v2Close(&lb, "tail", L, "x2", x2, got.x2)) ok = false;
+        if (!try v2Same("tail next", L, want.z, want.n, got.next.?)) ok = false;
+        const only = try hv2.tail(&sc, &m, r.x, r.y, &sa, .{ .rows = f.y }, &sf, null);
+        if (!try v2Close(&lb, "tail only", L, "x2", x2, only.x2)) ok = false;
+        // Planted: the FFN split's comb transposed (the residual mixed the wrong way round).
+        const bad_sf: dsv41.Split = .{ .pre = f.cpre, .post = f.sp.post, .comb = try sc.transpose(f.sp.comb, &.{ 0, 2, 1 }) };
+        const bad = try hv2.tail(&sc, &m, r.x, r.y, &sa, .{ .rows = f.y }, &bad_sf, null);
+        try testing.expect(!try close("  planted: comb transposed", x2, bad.x2, x1, tol_kernel));
     }
-    std.debug.print("[hc mix] {d} rows, us a launch: hc_mix {d:.1}, simdgroup matrix {d:.1}; hc_mix + hc_norm {d:.1}, simdgroup matrix + hc_norm {d:.1}; fused mix_norm {d:.1}\n", .{ L, t[0], t[1], t[2], t[3], t[4] });
+    try testing.expect(ok);
+}
+
+/// A wide layer's MoE parts over `L` rows: sorted down rows, the unsort (a random permutation) and shared rows; and
+/// moe_tail's combine of them as ops (f32 route sum plus the shared row, rounded to bf16).
+fn moeParts(sc: *dsv41.Scope, L: c_int, seed: u64) !struct { p: dsv41.MoeParts, y: A } {
+    const d: c_int = @intCast(hidden);
+    const n: usize = @as(usize, @intCast(L)) * hv2.K;
+    const perm = try testing.allocator.alloc(u32, n);
+    defer testing.allocator.free(perm);
+    for (perm, 0..) |*v, q| v.* = @intCast(q);
+    var rng = std.Random.DefaultPrng.init(seed);
+    rng.random().shuffle(u32, perm);
+    const inv = try sc.keep(mlx.mlx_array_new_data(perm.ptr, &[_]c_int{@intCast(n)}, 1, .uint32));
+    const dn = try normal(sc, &.{ @intCast(n), d }, .bfloat16, 1, seed + 1);
+    const sh = try normal(sc, &.{ L, d }, .bfloat16, 1, seed + 2);
+    const rows = try sc.reshape(try sc.astype(try sc.take(dn, inv, 0), .float32), &.{ L, @intCast(hv2.K), d });
+    var o = mlx.mlx_array_new();
+    const sum = try sc.res(mlx.mlx_sum_axis(&o, rows, 1, false, sc.s), &o);
+    const y = try sc.astype(try sc.add(sum, try sc.astype(sh, .float32)), .bfloat16);
+    return .{ .p = .{ .dn = dn, .inv = inv, .sh = sh }, .y = y };
+}
+
+test "dsv41 wide tol: hc_v2's combining tail is moe_tail's combine, glm5's expands and the next layer's hc_mix_norm within 1% at prompt widths; the unsort off by a row fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var m: dsv41.Dsv41Model = undefined;
+    try hcModel(&m);
+    defer hcModelFree(&m);
+    var ok = true;
+    for (v2_widths, 0..) |L, i| {
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const r = try hcRows(&sc, L, 0xA800 + 16 * @as(u64, i));
+        const f = try hcRows(&sc, L, 0xA900 + 16 * @as(u64, i));
+        const mp = try moeParts(&sc, L, 0xAA00 + 16 * @as(u64, i));
+        const eps = try dsv41.hcEps(&sc, &m);
+        const sa: dsv41.Split = .{ .pre = r.cpre, .post = r.sp.post, .comb = r.sp.comb };
+        const sf: dsv41.Split = .{ .pre = f.cpre, .post = f.sp.post, .comb = f.sp.comb };
+        const x1 = try dsv41.hcExpand(&sc, r.x, r.y, &sa);
+        const x2 = try dsv41.hcExpand(&sc, x1, mp.y, &sf);
+        const want = try dsv41.hcMixNormFused(&sc, &m, x2, f.cpre, &f.hc, f.w, null, eps);
+        const got = try hv2.tail(&sc, &m, r.x, r.y, &sa, .{ .parts = mp.p }, &sf, .{ .hc = &f.hc, .norm_w = f.w });
+        var lb: [96]u8 = undefined;
+        if (!try v2Close(&lb, "tail combine", L, "x2", x2, got.x2)) ok = false;
+        if (!try v2Same("tail combine next", L, want.z, want.n, got.next.?)) ok = false;
+        const only = try hv2.tail(&sc, &m, r.x, r.y, &sa, .{ .parts = mp.p }, &sf, null);
+        if (!try v2Close(&lb, "tail combine only", L, "x2", x2, only.x2)) ok = false;
+        // Planted: the unsort off by a row (each row combines its neighbour's routes).
+        const n: c_int = L * @as(c_int, @intCast(hv2.K));
+        const rolled_inv = try sc.concat(&.{ try sc.slice(mp.p.inv, 0, hv2.K, @intCast(n)), try sc.slice(mp.p.inv, 0, 0, hv2.K) }, 0);
+        var bad_p = mp.p;
+        bad_p.inv = rolled_inv;
+        const bad = try hv2.tail(&sc, &m, r.x, r.y, &sa, .{ .parts = bad_p }, &sf, null);
+        try testing.expect(!try close("  planted: unsort off by a row", x2, bad.x2, x1, tol_kernel));
+    }
+    try testing.expect(ok);
 }
 
 // ── a release-shape pair worker's prefill ──
 
-const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_HC_MIX_TILED, .MLX_SERVE_DSV41_MOE_TAIL };
+const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2, .MLX_SERVE_DSV41_PF_MOE_EPI, .MLX_SERVE_DSV41_PF_IDX_NAX };
 
 /// The pair worker's streams and mixes after its layers over `x` / `pre`, from a fresh state (caller frees).
 fn prefill(fx: *fixture.Fixture, x: A, pre: A) ![2]A {

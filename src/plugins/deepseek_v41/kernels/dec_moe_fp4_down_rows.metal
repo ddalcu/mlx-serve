@@ -46,9 +46,9 @@ const uint items = nl + 1;
 for (uint it = sgi; it < items; it += NSG) {
   float acc[R];
   if (it == nl) {
-    dec_fp4_down_shared_rows<K, R, TOPK, T>(sw, sscales, d0 + c, x, lane / NC, 32 / NC, acc);
+    dec_fp4_down_shared_rows<K, FR, R, TOPK, T>(sw, sscales, d0 + c, x, lane / NC, 32 / NC, acc);
   } else {
-    dec_fp4_down_routed_rows<K, GS, R, TOPK, T>(w, scales, size_t(lead_e[it]) * N + d0 + c, x, lead_j + it * R, lane / NC, 32 / NC, acc);
+    dec_fp4_down_routed_rows<K, GS, FR, R, TOPK, T, DW>(w, scales, size_t(lead_e[it]) * N + d0 + c, x, lead_j + it * R, lane / NC, 32 / NC, acc);
   }
 #pragma unroll
   for (int r = 0; r < R; ++r) {

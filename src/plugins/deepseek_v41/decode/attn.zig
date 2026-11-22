@@ -157,6 +157,107 @@ fn runSplits(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, m: *const dsv41.Dsv41M
     return .{ .acc = parts[0], .m = parts[1], .l = parts[2], .splits = S };
 }
 
+// ── the shape-cut kernel (`MLX_SERVE_DSV41_ATTN_DEC`) ──
+
+pub const TILE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_attn_tile.metal");
+/// The planted control: the online softmax never rescales the sums when a later group raises the max.
+const TILE_PLANT_HEADER = HEADER ++ "#define DSV41_ATTN_DEC_PLANT 1\n";
+
+pub fn buildTile() !mlx.mlx_fast_metal_kernel {
+    return dsv41.buildKernel("dsv41_dec_attn_tile", &INS, &OUTS, TILE_SOURCE, HEADER);
+}
+
+fn buildTilePlant() !mlx.mlx_fast_metal_kernel {
+    return dsv41.buildKernel("dsv41_dec_attn_tile_plant", &INS, &OUTS, TILE_SOURCE, TILE_PLANT_HEADER);
+}
+
+/// `MLX_SERVE_DSV41_ATTN_DEC` (on by default, read each call; =0 `dec_attn`): the fused decode attention takes `partialsTile`.
+pub fn tileOn() bool {
+    return env.onUnlessZero(.MLX_SERVE_DSV41_ATTN_DEC);
+}
+
+/// A launch of the shape-cut kernel: `s` splits of at most `tk` keys (a multiple of 32, at most 128), `nsg`
+/// simdgroups of 512 / nsg channels each, `pf` the next 32 keys loaded while this 32 computes, `dsp` threadgroups a split
+/// (each P V over 512 / dsp channels).
+pub const TilePlan = struct { s: c_int, tk: c_int, nsg: c_int = 8, pf: c_int = 1, dsp: c_int = 1 };
+
+/// The release's lists are 128 window keys + 512 picks, or the window alone. The picks' list takes 8 splits of 96 at
+/// every row count without the next group's prefetch (the ubench's fastest at R = 1, 2, 4 and 6: the prefetch's
+/// registers cost more occupancy than its loads hide); the window alone 2 splits of 64. Null: more keys than 8
+/// splits of 128.
+pub fn tilePlan(rows: usize, keys: usize) ?TilePlan {
+    _ = rows;
+    const groups = (keys + 31) / 32;
+    if (groups == 0) return null;
+    if (keys <= 128) return .{ .s = @intCast((groups + 1) / 2), .tk = 64 };
+    var s = @min(MAX_SPLITS, groups);
+    while (s <= MAX_SPLITS) : (s += 1) {
+        const tk = ((keys + s - 1) / s + 31) / 32 * 32;
+        if (tk <= 128) return .{ .s = @intCast(s), .tk = @intCast(tk), .pf = 0 };
+    }
+    return null;
+}
+
+fn tileBytes(p: TilePlan) usize {
+    const nsg: usize = @intCast(p.nsg);
+    return 4 * @as(usize, @intCast(p.tk)) + 4 * nsg * 32 * 20 + 2 * 2 * 32 * 16 + 4 * 16;
+}
+
+/// `partials` on the shape-cut kernel (`dec_attn_tile.metal`): the same split bounds, outputs and semantics, at
+/// `tilePlan`'s splits. Null where it declines (as `partials`, or past `tilePlan`).
+pub fn partialsTile(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, m: *const dsv41.Dsv41Model, q: A, win: dsv41.Ring, comp_rows: A, topk: A, p0: usize, scale: f32) !?Partials {
+    const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{scale}, &[_]c_int{1}, 1, .float32));
+    return runTile(sc, kern, m, q, win, comp_rows, topk, p0, scal, null);
+}
+
+/// `partialsTile` at `plan` (null: `tilePlan`'s).
+fn runTile(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, m: *const dsv41.Dsv41Model, q: A, win: dsv41.Ring, comp_rows: A, topk: A, p0: usize, scal: A, plan: ?TilePlan) !?Partials {
+    if (!mlx.streamIsGpu(sc.s) or !device.naxAvailable()) return null;
+    const qs = mlx.getShape(q);
+    if (qs.len != 3 or qs[2] != HD or @mod(qs[1], 16) != 0 or qs[0] < 1 or qs[0] > decode.max_rows) return null;
+    if (mlx.mlx_array_dtype(q) != .bfloat16 or mlx.mlx_array_dtype(win.buf) != .bfloat16 or win.width != HD) return null;
+    const R = qs[0];
+    const H = qs[1];
+    const K: c_int = if (comp_rows.ctx != null) dimOf(topk, 1) else 0;
+    const nc: c_int = if (K > 0) dimOf(comp_rows, 0) else 0;
+    if (K > 0 and nc == 0) return null;
+    const keys = m.cfg.sliding_window + @as(usize, @intCast(K));
+    const p = plan orelse tilePlan(@intCast(R), keys) orelse return null;
+    if (@as(usize, @intCast(p.s * p.tk)) < keys or @mod(p.tk, 32) != 0 or p.tk > 128 or p.s > MAX_SPLITS or (p.nsg != 4 and p.nsg != 8) or (p.dsp != 1 and p.dsp != 2)) return null;
+    const meta_v = [_]i32{ @intCast(p0), nc, @intCast(m.cfg.sliding_window), @intCast(win.cap) };
+    const meta = try sc.ints(&meta_v, &.{meta_v.len});
+    const comp = if (K > 0) try sc.astype(comp_rows, .bfloat16) else win.buf;
+    const ids = if (K > 0) try sc.astype(topk, .int32) else meta;
+
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ R, H, p.s, HD }, 4, .float32));
+    for (0..2) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ R, H, p.s }, 3, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(H, 16) * p.dsp * p.nsg * 32, R, p.s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, p.nsg * 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "S", p.s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", K));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", H));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TK", p.tk));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NSG", p.nsg));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "PF", p.pf));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "DSP", p.dsp));
+    const inputs = [_]A{ q, win.buf, comp, ids, meta, scal };
+    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, sc.s));
+    var parts: [3]A = undefined;
+    for (&parts, 0..) |*x, k| {
+        x.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(x, ov, k));
+        _ = try sc.keep(x.*);
+    }
+    return .{ .acc = parts[0], .m = parts[1], .l = parts[2], .splits = p.s };
+}
+
 // ── the kernel contract: the split kernel's reference and rule, on this kernel's launch ──
 
 const WINDOW = 128;
@@ -224,6 +325,17 @@ const DecAttn = struct {
     pub const check = contract.AttnSplit.check;
 };
 
+const tile_decl = kit.metal.Launch{
+    .name = "dsv41_dec_attn_tile",
+    .inputs = &INS,
+    .outputs = &OUTS,
+    .source = TILE_SOURCE,
+    .header = HEADER,
+    .tg_bytes = 4 * 128 + 4 * 8 * 32 * 20 + 2 * 2 * 32 * 16 + 4 * 16,
+    .offline = false,
+    .min_gen = 17,
+};
+
 const merge_decl = kit.metal.Launch{
     .name = "dsv41_dec_attn_merge",
     .inputs = &MERGE_INS,
@@ -233,6 +345,38 @@ const merge_decl = kit.metal.Launch{
     .tg_bytes = TG_BYTES + 4 * 16 * (MAX_SPLITS + 1) + 4,
     .offline = false,
     .min_gen = 17,
+};
+
+/// The shape-cut kernel: `DecAttn`'s inputs, values, split bounds and rule at its own grid (a threadgroup of `nsg`
+/// simdgroups, splits of at most `tk` keys).
+const DecAttnTile = struct {
+    pub const Params = struct { s: usize, tk: usize, nsg: usize = 8, pf: usize = 1, dsp: usize = 1, g: @FieldType(contract.AttnSplit.Params, "g") = .{} };
+
+    pub fn geometry(p: Params, s: kit.Shape) ?kit.metal.Geometry {
+        if (s.rows == 0 or s.n == 0 or s.n % 16 != 0 or p.s == 0 or p.s * p.tk < WINDOW + s.k) return null;
+        var g = kit.metal.Geometry{ .grid = .{ ci(s.n / 16 * p.dsp * p.nsg * 32), ci(s.rows), ci(p.s) }, .tg = .{ ci(p.nsg * 32), 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(s.n), ci(p.s), HD }, .float32);
+        g.out(&.{ ci(s.rows), ci(s.n), ci(p.s) }, .float32);
+        g.out(&.{ ci(s.rows), ci(s.n), ci(p.s) }, .float32);
+        g.dtype("T", act);
+        g.int("S", p.s);
+        g.int("K", s.k);
+        g.int("H", s.n);
+        g.int("TK", p.tk);
+        g.int("NSG", p.nsg);
+        g.int("PF", p.pf);
+        g.int("DSP", p.dsp);
+        return g;
+    }
+
+    pub const fill = DecAttn.fill;
+
+    pub fn count(p: Params, s: kit.Shape) usize {
+        return contract.AttnSplit.count(.{ .s = p.s, .g = p.g }, s);
+    }
+
+    pub const compute = contract.AttnSplit.compute;
+    pub const check = contract.AttnSplit.check;
 };
 
 /// The merge variant: `DecAttn`'s partials, then the splits of each (row, head) merged with the sink (input 6) as one
@@ -338,8 +482,65 @@ const MergeAttn = struct {
     }
 };
 
+const tile_nan: kit.spec.Nan = .{ .stated = "a split whose weights go NaN reports max -inf and a NaN partial output and sum, which the merge propagates; else classes as float64 gives them" };
+
 pub fn register(set: *kc.Set) !void {
-    const nan: kit.spec.Nan = .{ .stated = "a split whose weights go NaN reports max -inf and a NaN partial output and sum, which the merge propagates; else classes as float64 gives them" };
+    try registerTile(set);
+    try registerRest(set);
+}
+
+/// The shape-cut kernel's registrations (`MLX_SERVE_DSV41_ATTN_DEC`).
+fn registerTile(set: *kc.Set) !void {
+    const nan = tile_nan;
+    try kit.add(set, DecAttnTile, &tile_decl, .{ .s = 8, .tk = 96 }, .{
+        .name = "dsv41 dec attn tile S=8 TK=96",
+        .accum = .none,
+        .depth = contract.depthAttn,
+        .out = .f32,
+        .nan = nan,
+        .nax = true,
+        .served = &.{ .{ .rows = 1, .n = 16, .k = 512 }, .{ .rows = 6, .n = 16, .k = 512 }, .{ .rows = 2, .n = 16, .k = 100 } },
+    });
+    try kit.add(set, DecAttnTile, &tile_decl, .{ .s = 5, .tk = 128 }, .{
+        .name = "dsv41 dec attn tile S=5 TK=128",
+        .accum = .none,
+        .depth = contract.depthAttn,
+        .out = .f32,
+        .nan = nan,
+        .nax = true,
+        .served = &.{ .{ .rows = 3, .n = 16, .k = 512 }, .{ .rows = 6, .n = 16, .k = 512 } },
+    });
+    try kit.add(set, DecAttnTile, &tile_decl, .{ .s = 8, .tk = 96, .nsg = 4, .pf = 0 }, .{
+        .name = "dsv41 dec attn tile S=8 TK=96, 4 simdgroups, no prefetch",
+        .accum = .none,
+        .depth = contract.depthAttn,
+        .out = .f32,
+        .nan = nan,
+        .nax = true,
+        .served = &.{ .{ .rows = 1, .n = 16, .k = 512 }, .{ .rows = 4, .n = 16, .k = 300 } },
+    });
+    try kit.add(set, DecAttnTile, &tile_decl, .{ .s = 8, .tk = 96, .dsp = 2 }, .{
+        .name = "dsv41 dec attn tile S=8 TK=96, a split's P V over two threadgroups",
+        .accum = .none,
+        .depth = contract.depthAttn,
+        .out = .f32,
+        .nan = nan,
+        .nax = true,
+        .served = &.{ .{ .rows = 1, .n = 16, .k = 512 }, .{ .rows = 2, .n = 16, .k = 100 } },
+    });
+    try kit.add(set, DecAttnTile, &tile_decl, .{ .s = 4, .tk = 32 }, .{
+        .name = "dsv41 dec attn tile S=4 TK=32, window only",
+        .accum = .none,
+        .depth = contract.depthAttn,
+        .out = .f32,
+        .nan = nan,
+        .nax = true,
+        .served = &.{ .{ .rows = 1, .n = 16, .k = 0 }, .{ .rows = 6, .n = 16, .k = 0 } },
+    });
+}
+
+fn registerRest(set: *kc.Set) !void {
+    const nan = tile_nan;
     try kit.add(set, DecAttn, &launch_decl, .{ .s = 8 }, .{
         .name = "dsv41 dec attn S=8",
         .accum = .none,
@@ -602,6 +803,8 @@ test "dsv41 dec attn: rows 1, 2, 4, 6 on the fixture equal today's split and mer
         const m = fx.m;
         const kern = try build();
         defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+        const tile = try buildTile();
+        defer _ = mlx.mlx_fast_metal_kernel_free(tile);
         var sc = Scope.init(gpa, mlx.gpuStream());
         defer sc.deinit();
         const st = fx.state();
@@ -644,6 +847,10 @@ test "dsv41 dec attn: rows 1, 2, 4, 6 on the fixture equal today's split and mer
                 defer gpa.free(truth);
                 var label: [96]u8 = undefined;
                 try decode.expectNoWorse(try std.fmt.bufPrint(&label, "attn layer {d} ctx {d} R={d}", .{ li, c.ctx, R }), got, want, truth);
+                const pt = (try partialsTile(&sc, tile, m, q, ring, comp_rows, topk, p0, SCALE)) orelse return error.Declined;
+                const got_t = try dsv41.hostF32(try mergeToday(&sc, m, pt, ly.sink, p0));
+                defer gpa.free(got_t);
+                try decode.expectNoWorse(try std.fmt.bufPrint(&label, "attn tile layer {d} ctx {d} R={d}", .{ li, c.ctx, R }), got_t, want, truth);
             }
         }
     }
@@ -671,6 +878,108 @@ test "dsv41 dec attn: the declared launch is the wrapper's, byte for byte" {
         const win: dsv41.Ring = .{ .buf = cs.args[1], .cap = g.cap, .width = HD };
         const p = (try run(&sc, kern, &m, cs.args[0], win, if (c[3] > 0) cs.args[2] else none, cs.args[3], g.p0, cs.args[5])) orelse return error.Declined;
         try testing.expectEqual(@as(c_int, c[0]), p.splits);
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(a);
+        for ([_]A{ p.acc, p.m, p.l }) |x| {
+            const h = try dsv41.hostF32(x);
+            defer a.free(h);
+            try got.appendSlice(a, std.mem.sliceAsBytes(h));
+        }
+        try testing.expectEqualSlices(u8, cs.rig.outputBytes(), got.items);
+    }
+}
+
+test "dsv41 dec attn tile: equals dec_attn after the merge at every plan, R = 1..6; the planted rescale bug fails" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m = try todayModel();
+    defer freeTodayModel(&m);
+    const kern = try build();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    const tile = try buildTile();
+    defer _ = mlx.mlx_fast_metal_kernel_free(tile);
+    const plant = try buildTilePlant();
+    defer _ = mlx.mlx_fast_metal_kernel_free(plant);
+    const plans = [_]?TilePlan{ null, .{ .s = 8, .tk = 96, .nsg = 4, .pf = 0 }, .{ .s = 5, .tk = 128 }, .{ .s = 7, .tk = 96, .pf = 0 }, .{ .s = 5, .tk = 128, .nsg = 4 }, .{ .s = 8, .tk = 96, .dsp = 2 }, .{ .s = 5, .tk = 128, .nsg = 4, .dsp = 2 } };
+    for ([_]usize{ 512, 100, 0 }) |k| for (1..decode.max_rows + 1) |R| for ([_]usize{ 300, 5000 }) |ctx| {
+        const rig = try Rig.init(&sc, R, ctx, k, 1, 1, ctx, 9 + R);
+        defer rig.deinit();
+        const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{SCALE}, &[_]c_int{1}, 1, .float32));
+        const p = (try partials(&sc, kern, &m, rig.q, rig.win(), rig.comps[0], rig.picks[0], rig.p0, SCALE)) orelse return error.Declined;
+        const want = try dsv41.hostF32(try mergeToday(&sc, &m, p, rig.sink, rig.p0));
+        defer gpa.free(want);
+        for (plans) |pl| {
+            if (pl) |v| if (@as(usize, @intCast(v.s * v.tk)) < WINDOW + k) continue;
+            const pt = (try runTile(&sc, tile, &m, rig.q, rig.win(), rig.comps[0], rig.picks[0], rig.p0, scal, pl)) orelse return error.Declined;
+            const got = try dsv41.hostF32(try mergeToday(&sc, &m, pt, rig.sink, rig.p0));
+            defer gpa.free(got);
+            for (got) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+            const e = decode.relRms(got, want);
+            if (e >= 1e-3) {
+                std.debug.print("[dec] attn tile K={d} R={d} ctx={d} splits {d}: rel rms vs dec_attn {e:.2}\n", .{ k, R, ctx, pt.splits, e });
+                return error.TestUnexpectedResult;
+            }
+        }
+        // Without the rescale a later group's larger max leaves the earlier keys overweighted.
+        if (k == 512) {
+            const pp = (try runTile(&sc, plant, &m, rig.q, rig.win(), rig.comps[0], rig.picks[0], rig.p0, scal, null)) orelse return error.Declined;
+            const bad = try dsv41.hostF32(try mergeToday(&sc, &m, pp, rig.sink, rig.p0));
+            defer gpa.free(bad);
+            const e = decode.relRms(bad, want);
+            std.debug.print("[dec] attn tile planted rescale bug K={d} R={d} ctx={d}: rel rms vs dec_attn {e:.2}\n", .{ k, R, ctx, e });
+            if (e < 1e-2) return error.PlantedBugPassed;
+        }
+    };
+}
+
+test "dsv41 dec attn tile: the registered tile kernels pass the contract's gates 1-4" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    var set = kc.Set.init(testing.allocator);
+    defer set.deinit();
+    try registerTile(&set);
+    var t: kit.gates.Tally = .{};
+    try kit.gates.runAll(testing.allocator, set.kernels.items, 0xc0de, &t);
+    try testing.expectEqual(@as(usize, 0), t.problems());
+}
+
+test "dsv41 dec attn tile: the plan covers the release's lists" {
+    for (1..decode.max_rows + 1) |R| {
+        for ([_]usize{ 128 + 512, 128 + 100, 128 }) |keys| {
+            const p = tilePlan(R, keys) orelse return error.TestUnexpectedResult;
+            try testing.expect(@as(usize, @intCast(p.s * p.tk)) >= keys and p.tk <= 128 and @mod(p.tk, 32) == 0 and p.s <= MAX_SPLITS);
+            try testing.expect(tileBytes(p) <= 32 * 1024);
+        }
+    }
+    try testing.expectEqual(TilePlan{ .s = 8, .tk = 96, .pf = 0 }, tilePlan(1, 640).?);
+    try testing.expectEqual(TilePlan{ .s = 8, .tk = 96, .pf = 0 }, tilePlan(4, 640).?);
+    try testing.expectEqual(TilePlan{ .s = 2, .tk = 64 }, tilePlan(1, 128).?);
+    try testing.expect(tilePlan(1, 1100) == null);
+}
+
+test "dsv41 dec attn tile: the declared launch is the wrapper's, byte for byte" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var m = try todayModel();
+    defer freeTodayModel(&m);
+    var sc = Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const kern = try buildTile();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    inline for (.{ .{ 8, 96, 8, 1, 6, 64, 512, 1 }, .{ 8, 96, 4, 0, 1, 16, 100, 1 }, .{ 5, 128, 8, 1, 3, 32, 512, 1 }, .{ 4, 32, 8, 1, 3, 32, 0, 1 }, .{ 8, 96, 8, 1, 2, 32, 512, 2 } }) |c| {
+        const cs = try a.create(kit.Case(DecAttnTile));
+        defer {
+            cs.deinit();
+            a.destroy(cs);
+        }
+        cs.* = .init(a, &tile_decl, .{ .s = c[0], .tk = c[1], .nsg = c[2], .pf = c[3], .dsp = c[7] });
+        try testing.expect(try cs.prepare(.{ .rows = c[4], .n = c[5], .k = c[6] }, .random, 7));
+        try cs.run();
+        const g = cs.p.g;
+        const win: dsv41.Ring = .{ .buf = cs.args[1], .cap = g.cap, .width = HD };
+        const plan: TilePlan = .{ .s = c[0], .tk = c[1], .nsg = c[2], .pf = c[3], .dsp = c[7] };
+        const p = (try runTile(&sc, kern, &m, cs.args[0], win, if (c[6] > 0) cs.args[2] else none, cs.args[3], g.p0, cs.args[5], plan)) orelse return error.Declined;
         var got: std.ArrayList(u8) = .empty;
         defer got.deinit(a);
         for ([_]A{ p.acc, p.m, p.l }) |x| {
@@ -726,6 +1035,29 @@ const NewChain = struct {
     }
 };
 
+/// The shape-cut kernel's chain at `plan`, fed like `NewChain`.
+const TileChain = struct {
+    gpa: std.mem.Allocator,
+    sc: Scope,
+    kern: mlx.mlx_fast_metal_kernel,
+    m: *const dsv41.Dsv41Model,
+    rig: *const Rig,
+    plan: TilePlan,
+    scal0: A,
+    scal: A,
+
+    pub fn step(self: *TileChain, i: usize) !A {
+        if (i == 0) {
+            self.sc.deinit();
+            self.sc = Scope.init(self.gpa, mlx.gpuStream());
+            self.scal = self.scal0;
+        }
+        const p = (try runTile(&self.sc, self.kern, self.m, self.rig.q, self.rig.win(), self.rig.comps[i % self.rig.copies], self.rig.picks[i % self.rig.steps], self.rig.p0, self.scal, self.plan)) orelse return error.Declined;
+        self.scal = p.l;
+        return p.acc;
+    }
+};
+
 /// The launch floor: a one-thread kernel in a dependent chain.
 const NoopChain = struct {
     gpa: std.mem.Allocator,
@@ -765,6 +1097,8 @@ test "dsv41 dec attn: ubench" {
     var ly: dsv41.Layer = undefined;
     const kern = try build();
     defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    const tile = try buildTile();
+    defer _ = mlx.mlx_fast_metal_kernel_free(tile);
     const noop = try dsv41.buildKernel("dsv41_dec_noop", &.{"x"}, &.{"out"}, "if (thread_position_in_grid.x == 0) out[0] = x[0] + 1.0f;", "");
     defer _ = mlx.mlx_fast_metal_kernel_free(noop);
     {
@@ -776,8 +1110,9 @@ test "dsv41 dec attn: ubench" {
         std.debug.print("[dec-ubench] attn: a dependent one-thread launch is {d:.1} us a step\n", .{try decode.chainUs(&chain, 400)});
     }
     // Picks over a compressed-row buffer of 1k, 32k and 128k rows (copies of it cycle over 2 GB), then window only.
-    for ([_]usize{ 512, 0 }) |k| for ([_]usize{ 1, 6 }) |R| for ([_]usize{ 1024, 32768, 131072 }) |ctx| {
+    for ([_]usize{ 512, 0 }) |k| for ([_]usize{ 1, 2, 3, 4, 6 }) |R| for ([_]usize{ 1024, 32768, 131072 }) |ctx| {
         if (k == 0 and ctx != 1024) continue;
+        if (R != 1 and R != 6 and ctx != 32768 and k > 0) continue;
         var keep = Scope.init(gpa, mlx.gpuStream());
         defer keep.deinit();
         const copies = @max(2, @min(2000, (2 << 30) / (ctx * HD * 2)));
@@ -791,8 +1126,18 @@ test "dsv41 dec attn: ubench" {
         defer new.sc.deinit();
         const chain_us = try decode.chainUs(&today, 400);
         const us = try decode.chainUs(&new, 400);
-        var name: [48]u8 = undefined;
+        var name: [96]u8 = undefined;
         decode.report(try std.fmt.bufPrint(&name, "attn K={d} ctx={d}", .{ k, ctx }), R, us, @floatFromInt(R * k * HD * 2 + WINDOW * HD * 2 + R * HEADS * HD * 2), chain_us);
+        // The shape-cut kernel at its plan and its neighbours, against dec_attn's time.
+        const sweep = if (k > 0) [_]TilePlan{ .{ .s = 8, .tk = 96 }, .{ .s = 8, .tk = 96, .pf = 0 }, .{ .s = 8, .tk = 96, .nsg = 4, .pf = 0 }, .{ .s = 5, .tk = 128 }, .{ .s = 7, .tk = 96 }, .{ .s = 8, .tk = 96, .dsp = 2 }, .{ .s = 5, .tk = 128, .dsp = 2 } } else [_]TilePlan{ .{ .s = 4, .tk = 32 }, .{ .s = 2, .tk = 64 }, .{ .s = 4, .tk = 32, .nsg = 4, .pf = 0 }, .{ .s = 1, .tk = 128 }, .{ .s = 8, .tk = 32 }, .{ .s = 4, .tk = 32, .dsp = 2 }, .{ .s = 2, .tk = 64, .dsp = 2 } };
+        const planned = tilePlan(R, WINDOW + k).?;
+        for (sweep) |pl| {
+            var tc: TileChain = .{ .gpa = gpa, .sc = Scope.init(gpa, mlx.gpuStream()), .kern = tile, .m = &m, .rig = rig, .plan = pl, .scal0 = scal0, .scal = scal0 };
+            defer tc.sc.deinit();
+            const tus = try decode.chainUs(&tc, 400);
+            const mark: []const u8 = if (std.meta.eql(pl, planned)) " (plan)" else "";
+            decode.report(try std.fmt.bufPrint(&name, "attn tile K={d} ctx={d} S={d} TK={d} NSG={d} PF={d} DSP={d}{s}", .{ k, ctx, pl.s, pl.tk, pl.nsg, pl.pf, pl.dsp, mark }), R, tus, @floatFromInt(R * k * HD * 2 + WINDOW * HD * 2 + R * HEADS * HD * 2), us);
+        }
     };
 }
 
@@ -942,7 +1287,7 @@ test "dsv41 dec attn merge: the declared launch is the wrapper's, byte for byte;
     var set = kc.Set.init(a);
     defer set.deinit();
     try register(&set);
-    try testing.expectEqual(@as(usize, 4), set.kernels.items.len);
+    try testing.expectEqual(@as(usize, 9), set.kernels.items.len);
     var m: dsv41.Dsv41Model = undefined;
     m.cfg = .{};
     m.cfg.sliding_window = WINDOW;

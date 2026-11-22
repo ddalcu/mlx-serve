@@ -244,14 +244,15 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
 }
 
-/// The settings a load reads, each refused by name at a bad value. A plugin-streamed bank's own (flash attention by
-/// default) apply to it alone.
+/// The settings a load reads, each refused by name at a bad value. Flash attention is on for every pack by default
+/// (`MLX_SERVE_DSV41_FLASH_ATTN`: unset, empty or 1 on, =0 the exact gather; its f32 output sits closer to float64 than
+/// the gather's).
 fn configureLoad(c: *const config.Config) !void {
-    const exl3 = c.dsv41_exl3_bank;
+    _ = c;
     engram_decode.ps().lru_mb = try engram_decode.parseMb(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB));
     flash_attn.ps().mode = .off;
     flash_attn.ps().explicit = false;
-    if (exl3 or env.span(.MLX_SERVE_DSV41_FLASH_ATTN) != null) try flash_attn.configure(env.span(.MLX_SERVE_DSV41_FLASH_ATTN));
+    try flash_attn.configure(env.span(.MLX_SERVE_DSV41_FLASH_ATTN));
     scratch_attn.ps().ring_regions = flash_attn.ps().mode != .on;
 }
 

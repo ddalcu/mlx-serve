@@ -696,7 +696,7 @@ test "dsv41 mxfp4 view: NVIDIA's power-of-two NVFP4 bank loads as the MXFP4 bank
     try testing.expect(control > 10 * tol);
 }
 
-test "dsv41 mxfp4 view: a bank with one span or one global off a power of two stays NVFP4 as loaded, named in the log, beside a layer the view takes; the mixed load serves the NVFP4 load's outputs to a reorder's tolerance" {
+test "dsv41 mxfp4 view: a bank with one span or one global off a power of two stays NVFP4 as loaded, named in the log, beside a layer the view takes; each layer's MoE serves the NVFP4 load's outputs at the defaults to a reorder's tolerance, and swapped gate and up globals fail" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -749,25 +749,45 @@ test "dsv41 mxfp4 view: a bank with one span or one global off a power of two st
             try testing.expect(view.w.get(try globalName(&nb, li, p)) != null);
         }
     }
-    // The three layers, the view's mixed formats against the NVFP4 load: a prompt, then steps of 1 and 2 rows.
+    // Each layer alone on one input, the view's mixed formats against the NVFP4 load at the defaults (MOE_PAIR_SCALED
+    // on): the prompt's MoE and decode's at 1 and 2 rows. One layer's routes are the same in both, so its reordered
+    // scale sums stay at their own size; chained, top-k picks amplify them.
     var worst: f32 = 0;
-    var p0: usize = 0;
     var label: [64]u8 = undefined;
-    for ([_]usize{ 256, 1, 2 }) |L| {
-        const x = try nv.stream(L);
-        defer _ = mlx.mlx_array_free(x);
-        const pre = try nv.cpre(L);
-        defer _ = mlx.mlx_array_free(pre);
-        const a = try dsv41.workerStep(view.m, gpa, x, pre, p0, false, false);
-        defer for (a) |o| {
-            _ = mlx.mlx_array_free(o);
-        };
-        const b = try dsv41.workerStep(nv.m, gpa, x, pre, p0, false, false);
-        defer for (b) |o| {
-            _ = mlx.mlx_array_free(o);
-        };
-        for (0..2) |j| worst = @max(worst, try relErr(try std.fmt.bufPrint(&label, "layers 20..22 L={d} {s}", .{ L, if (j == 0) "stream" else "mix" }), a[j], b[j]));
-        p0 += L;
-    }
+    for (lo..hi) |li| worst = @max(worst, try layerErr(&label, view, nv, li));
     try testing.expect(worst <= tol);
+    // Planted: the NVFP4 load's layer 20 with its gate and up globals swapped.
+    swapGlobals(&nv.layer(20).experts);
+    defer swapGlobals(&nv.layer(20).experts);
+    try testing.expect(try layerErr(&label, view, nv, 20) > 10 * tol);
+}
+
+fn swapGlobals(e: *dsv41.Experts) void {
+    e.scale = .{ e.scale[1], e.scale[0], e.scale[2] };
+}
+
+/// The worst relative rms error of layer `li`'s MoE in `a` against `b`: a 256-row prompt, then decode at 1 and 2 rows.
+fn layerErr(label: []u8, a: *fixture.Fixture, b: *fixture.Fixture, li: usize) !f32 {
+    const gpa = testing.allocator;
+    const d = b.m.cfg.hidden_size;
+    const hc = b.m.cfg.dsv4_hc_mult;
+    var worst: f32 = 0;
+    for ([_]usize{ 256, 1, 2 }) |L| {
+        var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const h = try sc.keep(try b.normal(&.{ ci(L), ci(d) }, .bfloat16, 0, 1));
+        const x1 = try sc.keep(try b.stream(L));
+        const sp: dsv41.Split = .{ .pre = none, .post = try sc.keep(try b.uniform(&.{ ci(L), ci(hc) }, 0.05, 1.5)), .comb = try sc.keep(try b.uniform(&.{ ci(L), ci(hc), ci(hc) }, -0.5, 0.5)) };
+        var y: [2]A = undefined;
+        for ([_]*fixture.Fixture{ a, b }, &y) |fx, *o| {
+            const ly = fx.layer(li);
+            const r = try dsv41.route(&sc, fx.m, ly, h, none);
+            o.* = if (L > decode.max_rows)
+                try sc.keep(try dsv41.moeShare(fx.m, gpa, li, h, r.idx, r.wts))
+            else
+                (try dsv41.ffnDecode(&sc, fx.m, ly, h, r.idx, r.wts, x1, &sp)) orelse return error.Fp4KernelsDeclined;
+        }
+        worst = @max(worst, try relErr(try std.fmt.bufPrint(label, "layer {d} L={d}", .{ li, L }), y[0], y[1]));
+    }
+    return worst;
 }

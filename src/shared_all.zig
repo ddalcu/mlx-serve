@@ -11,6 +11,9 @@ comptime {
     _ = @import("plugins/deepseek_v41/fuse.zig").shared_state;
     _ = @import("plugins/deepseek_v41/prompt/engram_direct.zig").shared_state;
     _ = @import("plugins/deepseek_v41/prompt/flash_attn.zig").shared_state;
+    _ = @import("plugins/deepseek_v41/prompt/hc_v2.zig").shared_state;
+    _ = @import("plugins/deepseek_v41/prompt/idx_nax.zig").shared_state;
+    _ = @import("plugins/deepseek_v41/prompt/pass_async.zig").shared_state;
     _ = @import("plugins/deepseek_v41/prompt/scratch.zig").shared_state;
     _ = @import("plugins/deepseek_v41/prompt/scratch_attn.zig").shared_state;
     _ = @import("plugins/deepseek_v41/prompt/scratch_x1.zig").shared_state;

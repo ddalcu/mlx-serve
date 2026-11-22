@@ -141,7 +141,9 @@ if (is_mix) {
     // The sqrt-softplus score of the logit.
     const float z = red[8 * RG + sg * RG + rr] + red[8 * RG + (sg + 1) * RG + rr];
     const float y = metal::exp(-metal::abs(z));
-    const float lp = y < 1e-4f ? y * (1.0f - y * (0.5f - y / 3.0f)) : metal::log(1.0f + y);
+    // log1p(y) below 1/4 as 2 atanh(y / (2 + y)): log(1 + y) loses y's low bits when 1 + y rounds.
+    const float lt = y / (2.0f + y), lt2 = lt * lt;
+    const float lp = y < 0.25f ? 2.0f * lt * (1.0f + lt2 * (1.0f / 3.0f + lt2 * (0.2f + lt2 * (1.0f / 7.0f + lt2 * (1.0f / 9.0f + lt2 * (1.0f / 11.0f)))))) : metal::log(1.0f + y);
     atomic_store_explicit(scorea + (size_t)(r0 + rr) * E + e, metal::sqrt(metal::max(z, 0.0f) + lp), metal::memory_order_relaxed);
   }
 }

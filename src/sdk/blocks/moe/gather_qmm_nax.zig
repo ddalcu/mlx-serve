@@ -641,13 +641,10 @@ pub var routed_decline: []const u8 = "";
 /// routing weight (`route`, `[M]` f32), rounded once: `[M, 1, n]`, the math of the gather, the scale multiplies and
 /// `moe_act` it replaces.
 pub fn sortedGateUpRouted(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, route: mlx.mlx_array, limit: f32, scales: ExpertScales, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
-    if (!nax_available or !mlx.streamIsGpu(s)) return declineRouted("no NAX GPU stream");
-    if (!supported(x, w, sc, bi, idx, bits, group, mx, row_map, true)) return declineRouted("shape: the bank or input is not a supported layout");
+    if (!routedFits(x, row_map, w, sc, bi, idx, route, scales, bits, group, mx, nax_available, s)) return null;
     const ws = mlx.getShape(w);
     const xs = mlx.getShape(x);
     const m = mlx.getShape(idx)[0];
-    if (@rem(ws[1], 64) != 0 or !scales.fits(ws[0], mlx.mlx_array_dtype(x))) return declineRouted("shape: the gate/up width is not a multiple of 64 or the per-expert scales do not fit");
-    if (route.ctx == null or mlx.mlx_array_dtype(route) != .float32 or mlx.mlx_array_ndim(route) != 1 or mlx.getShape(route)[0] != m) return declineRouted("shape: the routing weights are not f32 [pairs]");
     const n = @divExact(ws[1], 2);
     const p = plan(m, ws[0], xs[2], n, true);
     const key: CanaryKey = .{ .plan = p, .bits = bits, .group = group, .align_n = @rem(n, 64) == 0, .align_k = @rem(xs[2], p.bk) == 0, .mx = mx };
@@ -660,9 +657,129 @@ pub fn sortedGateUpRouted(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_a
     return out;
 }
 
+/// The routed call's argument checks; false sets `routed_decline`.
+fn routedFits(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, route: mlx.mlx_array, scales: ExpertScales, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) bool {
+    if (!nax_available or !mlx.streamIsGpu(s)) return refuseRouted("no NAX GPU stream");
+    if (!supported(x, w, sc, bi, idx, bits, group, mx, row_map, true)) return refuseRouted("shape: the bank or input is not a supported layout");
+    const ws = mlx.getShape(w);
+    if (@rem(ws[1], 64) != 0 or !scales.fits(ws[0], mlx.mlx_array_dtype(x))) return refuseRouted("shape: the gate/up width is not a multiple of 64 or the per-expert scales do not fit");
+    if (route.ctx == null or mlx.mlx_array_dtype(route) != .float32 or mlx.mlx_array_ndim(route) != 1 or mlx.getShape(route)[0] != mlx.getShape(idx)[0]) return refuseRouted("shape: the routing weights are not f32 [pairs]");
+    return true;
+}
+
 fn declineRouted(why: []const u8) ?mlx.mlx_array {
     routed_decline = why;
     return null;
+}
+
+fn refuseRouted(why: []const u8) bool {
+    routed_decline = why;
+    return false;
+}
+
+// ── the staged schedule (`gather_qmm_nax_staged_header.metal`) ──
+
+pub const STAGED_HEADER = NAX_HEADER ++ kernelSource("kernels/moe/gather_qmm_nax_mapped_header.metal") ++ kernelSource("kernels/moe/gather_qmm_nax_staged_header.metal");
+pub const STAGED_SOURCE = kernelSource("kernels/moe/gather_qmm_nax_staged.metal");
+pub const STAGED_INPUTS = [_][*:0]const u8{ "x", "w", "scales", "biases", "up_w", "up_scales", "up_biases", "tiles", "tile_count", "params", "sigtab", "rmap", "gsc", "usc", "rw" };
+var staged_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+/// A staged launch's tile: `bm` rows of one expert over `wm` x `wn` simdgroups, row tiles `gx` apart on the grid
+/// (`tile_of`; 0: one grid row a tile); `tg_a`: its activations staged through threadgroup memory
+/// (`gather_staged_tg`), else each simdgroup's fragments a step ahead in registers.
+pub const Staged = struct { bm: c_int, wm: c_int, wn: c_int, gx: c_int, tg_a: bool = false };
+
+/// The staged tile for `rows` routed rows over `experts`: 64 rows over four 16-row simdgroups at every prompt width.
+pub fn stagedPlan(rows: c_int, experts: c_int) Staged {
+    _ = .{ rows, experts };
+    return .{ .bm = 64, .wm = 4, .wn = 1, .gx = 32 };
+}
+
+/// Where the staged schedule serves: an fp4 bank (whole 64-deep steps, whole 64-column tiles).
+fn stagedFits(k: c_int, width: c_int, mx: bool) bool {
+    return mx and @rem(k, 64) == 0 and @rem(width, 64) == 0;
+}
+
+fn stagedKernel() !mlx.mlx_fast_metal_kernel {
+    if (staged_kernel) |v| return v;
+    const ins = mlx.mlx_vector_string_new_data(&STAGED_INPUTS, STAGED_INPUTS.len);
+    defer _ = mlx.mlx_vector_string_free(ins);
+    const outs_names = [_][*:0]const u8{"y"};
+    const outs = mlx.mlx_vector_string_new_data(&outs_names, outs_names.len);
+    defer _ = mlx.mlx_vector_string_free(outs);
+    const value = mlx.mlx_fast_metal_kernel_new("msv_gqmm_staged", ins, outs, STAGED_SOURCE, STAGED_HEADER, true, false);
+    if (value.ctx == null) return error.MetalKernelCompileFailed;
+    staged_kernel = value;
+    return value;
+}
+
+/// The staged launch's configuration: `[rows, 1, out_n]` bf16 over the tiles of a `nw`-wide product (2 n for the pair).
+pub const StagedKey = struct { rows: c_int, out_n: c_int, nw: c_int, k: c_int, max_tiles: c_int, st: Staged, bits: u32, group: u32, mx: bool, epi: c_int, esc: u32, map: bool };
+
+/// Caller frees the config.
+pub fn stagedConfig(key: StagedKey) !mlx.mlx_fast_metal_kernel_config {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const cols = @divExact(key.nw, 64);
+    const st = key.st;
+    const grid_x = if (st.gx > 0) st.gx else cols;
+    const grid_y = if (st.gx > 0) @divTrunc(key.max_tiles + st.gx - 1, st.gx) * cols else key.max_tiles;
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ key.rows, 1, key.out_n }, 3, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, grid_x * 32, grid_y * st.wn, st.wm));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, st.wn, st.wm));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+    inline for (.{ .{ "GS", @as(c_int, @intCast(key.group)) }, .{ "BITS", @as(c_int, @intCast(key.bits)) }, .{ "MX", @as(c_int, @intFromBool(key.mx)) }, .{ "BM", st.bm }, .{ "WM", st.wm }, .{ "WN", st.wn }, .{ "GX", st.gx }, .{ "NW", key.nw }, .{ "KD", key.k }, .{ "EPI", key.epi }, .{ "ESC", @as(c_int, @intCast(key.esc)) }, .{ "AS", @as(c_int, @intFromBool(st.tg_a)) } }) |t|
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], t[1]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "MAP", key.map));
+    return cfg;
+}
+
+/// `launchMapped` on the staged schedule; `row_map` null reads x's rows in order. `scan_bm`: the tile height the
+/// scan cuts at (the plan's; a test plants another).
+fn launchStaged(x: mlx.mlx_array, row_map: ?mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, pair: ?Pair, bits: u32, group: u32, mx: bool, st: Staged, scan_bm: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const ws = mlx.getShape(w);
+    const m = mlx.getShape(idx)[0];
+    const up_off: c_int = if (pair) |v| v.up_off else 0;
+    const n = ws[1] - up_off;
+    const nw = if (pair != null) 2 * n else n;
+    const k = mlx.getShape(x)[2];
+    const t = try scanTiles(idx, m, ws[0], scan_bm, s);
+    defer t.deinit();
+    const route: ?mlx.mlx_array = if (pair) |v| v.route else null;
+    const lim: f32 = if (pair) |v| v.route_limit else 0;
+    const params = mlx.mlx_array_new_data(&[_]c_int{ nw, k, up_off, @bitCast(lim) }, &[_]c_int{4}, 1, .int32);
+    defer _ = mlx.mlx_array_free(params);
+    const sigtab = if (pair) |v| v.sigtab else biasArg(.{ .ctx = null });
+    const esc: ExpertScales = if (pair) |v| v.scales else .{};
+    const pw = if (pair) |v| v.w else w;
+    const ps = if (pair) |v| v.sc else sc;
+    const pb = if (pair) |v| v.bi else bi;
+    // Unread slots bind an array already bound (MAP = false never reads `rmap`; ESC leaves an absent scale unread).
+    const inputs = [_]mlx.mlx_array{ x, w, sc, biasArg(bi), pw, ps, biasArg(pb), t.tiles, t.count, params, sigtab, row_map orelse idx, esc.gate orelse sigtab, esc.up orelse sigtab, routeArg(route) };
+    const epi: c_int = if (pair) |v| (if (v.route != null) -1 else 1 + @as(c_int, @intCast(v.limit))) else 0;
+    const cfg = try stagedConfig(.{ .rows = m, .out_n = n, .nw = nw, .k = k, .max_tiles = t.max_tiles, .st = st, .bits = bits, .group = group, .mx = mx, .epi = epi, .esc = esc.bits(), .map = row_map != null });
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    return applyOne(try stagedKernel(), &inputs, cfg, s);
+}
+
+/// `sortedGateUpRouted` on the staged schedule (an fp4 bank fused along its rows), the same words; null where it does
+/// not serve (`routed_decline` says why).
+pub fn sortedGateUpRoutedStaged(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, route: mlx.mlx_array, limit: f32, scales: ExpertScales, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!routedFits(x, row_map, w, sc, bi, idx, route, scales, bits, group, mx, nax_available, s)) return null;
+    const ws = mlx.getShape(w);
+    if (!stagedFits(mlx.getShape(x)[2], ws[1], mx)) return declineRouted("staged: the bank is not fp4 or K is not a multiple of 64");
+    const st = stagedPlan(mlx.getShape(idx)[0], ws[0]);
+    return try launchStaged(x, row_map, w, sc, bi, idx, .{ .w = w, .sc = sc, .bi = bi, .sigtab = biasArg(.{ .ctx = null }), .up_off = @divExact(ws[1], 2), .scales = scales, .route = route, .route_limit = limit }, bits, group, mx, st, st.bm, s);
+}
+
+/// `sortedGatherPrompt` on the staged schedule (an fp4 bank), the same words; null where it does not serve.
+pub fn sortedGatherPromptStaged(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!nax_available or !mlx.streamIsGpu(s)) return null;
+    if (!supported(x, w, sc, bi, idx, bits, group, mx, null, true)) return null;
+    const ws = mlx.getShape(w);
+    if (!stagedFits(mlx.getShape(x)[2], ws[1], mx)) return null;
+    const st = stagedPlan(mlx.getShape(idx)[0], ws[0]);
+    return try launchStaged(x, null, w, sc, bi, idx, null, bits, group, mx, st, st.bm, s);
 }
 
 fn requireNax() !void {
@@ -1442,6 +1559,308 @@ test "segmented NAX sorted gather µbench vs stock at 8192-token chunks (diag gq
             const got = try port_build(arm);
             defer _ = mlx.mlx_array_free(got);
             std.debug.print("[gqmm-ubench] {s} M={d}: stock {d:.2} ms, port {d:.2} ms = {d:.3}x ({s} bm={d} bk={d} gx={d} pad={d}, {s})\n", .{ shape.name, rows, ms[0], ms[1], ms[0] / ms[1], @tagName(p.sched), p.bm, p.bk, p.gx, p.pad, if (try arraysEqual(got, ref, s)) @as([]const u8, "bit-equal") else "DIFFERS" });
+        }
+    }
+}
+
+// ── the staged schedule at DeepSeek-V4.1's routed experts ──
+
+/// Every staged tile the planner or a sweep can pick; the equality test runs each.
+const staged_variants = [_]Staged{
+    .{ .bm = 32, .wm = 2, .wn = 1, .gx = 0 },
+    .{ .bm = 64, .wm = 4, .wn = 1, .gx = 32 },
+    .{ .bm = 128, .wm = 8, .wn = 1, .gx = 32 },
+    .{ .bm = 256, .wm = 16, .wn = 1, .gx = 16 },
+    .{ .bm = 64, .wm = 4, .wn = 1, .gx = 32, .tg_a = true },
+    .{ .bm = 64, .wm = 2, .wn = 1, .gx = 32, .tg_a = true },
+    .{ .bm = 64, .wm = 2, .wn = 2, .gx = 32, .tg_a = true },
+    .{ .bm = 128, .wm = 8, .wn = 1, .gx = 32, .tg_a = true },
+    .{ .bm = 128, .wm = 4, .wn = 1, .gx = 32, .tg_a = true },
+    .{ .bm = 128, .wm = 4, .wn = 2, .gx = 32, .tg_a = true },
+};
+
+const ds_experts: c_int = 384;
+const ds_top_k: usize = 6;
+const ds_hidden: c_int = 5120;
+const ds_inter: c_int = 2304;
+
+/// An fp4 bank `[experts, n, k]` of random codes under random scale bytes about 1 (e4m3 0.5..1.9 per 16, or e8m0
+/// 2^-2..2^1 per 32): every code is a value, so the draw needs no quantize pass over a bf16 bank.
+fn randomFp4Bank(experts: c_int, n: c_int, k: c_int, group: u32, seed: u64, s: mlx.mlx_stream) !Bank {
+    var key = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, seed));
+    var w = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_random_bits(&w, &[_]c_int{ experts, n, @divExact(k, 8) }, 3, 4, key, s));
+    var skey = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(skey);
+    try mlx.check(mlx.mlx_random_key(&skey, seed ^ 0x5CA1E));
+    var raw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(raw);
+    try mlx.check(mlx.mlx_random_bits(&raw, &[_]c_int{ experts, n, @divExact(k, @as(c_int, @intCast(group))) }, 3, 1, skey, s));
+    const mask = mlx.mlx_array_new_data(&[_]u8{if (group == 16) 0x0f else 0x03}, &[_]c_int{1}, 1, .uint8);
+    defer _ = mlx.mlx_array_free(mask);
+    const base = mlx.mlx_array_new_data(&[_]u8{if (group == 16) 0x30 else 125}, &[_]c_int{1}, 1, .uint8);
+    defer _ = mlx.mlx_array_free(base);
+    var low = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(low);
+    try mlx.check(mlx.mlx_bitwise_and(&low, raw, mask, s));
+    var sc = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_add(&sc, low, base, s));
+    try mlx.check(mlx.mlx_array_eval(w));
+    try mlx.check(mlx.mlx_array_eval(sc));
+    return .{ .w = w, .sc = sc, .bi = .{ .ctx = null }, .key = key };
+}
+
+/// A prompt call over DeepSeek-V4.1's routed experts: `tokens` rows, each on six distinct experts drawn with
+/// `skewedRouting`'s skew (one in sixteen never picked, one in sixty-four eight times as often), the pairs sorted by
+/// expert; the fused gate/up bank `[384, 4608, 5120]`, the down bank `[384, 5120, 2304]`, ModelOpt's per-expert scales,
+/// the routing weights and a down input `[pairs, 1, 2304]`.
+const DsCall = struct {
+    x: mlx.mlx_array,
+    map: mlx.mlx_array,
+    ids: mlx.mlx_array,
+    route: mlx.mlx_array,
+    act: mlx.mlx_array,
+    esc: [2]mlx.mlx_array,
+    pairs: c_int,
+    /// Experts with at least one row: the weight bytes a call must read.
+    touched: usize,
+
+    fn deinit(c: DsCall) void {
+        for ([_]mlx.mlx_array{ c.x, c.map, c.ids, c.route, c.act, c.esc[0], c.esc[1] }) |a| _ = mlx.mlx_array_free(a);
+    }
+};
+
+const DsBanks = struct {
+    gu: Bank,
+    down: Bank,
+    group: u32,
+
+    fn init(group: u32, s: mlx.mlx_stream) !DsBanks {
+        const gu = try randomFp4Bank(ds_experts, 2 * ds_inter, ds_hidden, group, 0x6A7E, s);
+        errdefer gu.deinit();
+        return .{ .gu = gu, .down = try randomFp4Bank(ds_experts, ds_hidden, ds_inter, group, 0xD0E1, s), .group = group };
+    }
+
+    fn deinit(b: DsBanks) void {
+        b.gu.deinit();
+        b.down.deinit();
+    }
+};
+
+fn dsCall(tokens: usize, seed: u64, s: mlx.mlx_stream) !DsCall {
+    const alloc = std.testing.allocator;
+    const ne: usize = @intCast(ds_experts);
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    var cum: [384]usize = undefined;
+    var total: usize = 0;
+    for (&cum, 0..) |*c, e| {
+        total += if (e % 16 == 5) 0 else if (e % 64 == 0) 8 else 1;
+        c.* = total;
+    }
+    const n = tokens * ds_top_k;
+    const pick = try alloc.alloc(u32, n);
+    defer alloc.free(pick);
+    for (0..tokens) |t| {
+        var j: usize = 0;
+        while (j < ds_top_k) {
+            const r = rng.uintLessThan(usize, total);
+            var e: u32 = 0;
+            while (cum[e] <= r) e += 1;
+            if (std.mem.indexOfScalar(u32, pick[t * ds_top_k ..][0..j], e) == null) {
+                pick[t * ds_top_k + j] = e;
+                j += 1;
+            }
+        }
+    }
+    // Counting sort by expert, pairs in token order within an expert.
+    var counts: [385]usize = @splat(0);
+    for (pick) |e| counts[e + 1] += 1;
+    var touched: usize = 0;
+    for (1..ne + 1) |e| {
+        if (counts[e] > 0) touched += 1;
+        counts[e] += counts[e - 1];
+    }
+    const ids = try alloc.alloc(u32, n);
+    defer alloc.free(ids);
+    const map = try alloc.alloc(u32, n);
+    defer alloc.free(map);
+    const rw = try alloc.alloc(f32, n);
+    defer alloc.free(rw);
+    for (pick, 0..) |e, p| {
+        const at = counts[e];
+        counts[e] += 1;
+        ids[at] = e;
+        map[at] = @intCast(p / ds_top_k);
+        rw[at] = 0.05 + rng.float(f32);
+    }
+    const pairs: c_int = @intCast(n);
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, seed));
+    var x = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_normal(&x, &[_]c_int{ @intCast(tokens), 1, ds_hidden }, 3, .bfloat16, 0, 0.5, key, s));
+    var akey = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(akey);
+    try mlx.check(mlx.mlx_random_key(&akey, seed + 1));
+    var act = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_normal(&act, &[_]c_int{ pairs, 1, ds_inter }, 3, .bfloat16, 0, 0.5, akey, s));
+    var esc: [2]mlx.mlx_array = undefined;
+    for (&esc, 0..) |*o, i| o.* = try randUniform(&[_]c_int{ds_experts}, 0.25, 4.0, seed + 2 + i, s);
+    const c: DsCall = .{
+        .x = x,
+        .map = mlx.mlx_array_new_data(map.ptr, &[_]c_int{pairs}, 1, .uint32),
+        .ids = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{pairs}, 1, .uint32),
+        .route = mlx.mlx_array_new_data(rw.ptr, &[_]c_int{pairs}, 1, .float32),
+        .act = act,
+        .esc = esc,
+        .pairs = pairs,
+        .touched = touched,
+    };
+    for ([_]mlx.mlx_array{ c.x, c.act, c.esc[0], c.esc[1] }) |a| try mlx.check(mlx.mlx_array_eval(a));
+    return c;
+}
+
+/// `[shape]` bf16 uniform over [lo, hi).
+fn randUniform(shape: []const c_int, lo: f32, hi: f32, seed: u64, s: mlx.mlx_stream) !mlx.mlx_array {
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, seed));
+    const lo_a = mlx.mlx_array_new_float(lo);
+    defer _ = mlx.mlx_array_free(lo_a);
+    const hi_a = mlx.mlx_array_new_float(hi);
+    defer _ = mlx.mlx_array_free(hi_a);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_uniform(&out, lo_a, hi_a, shape.ptr, shape.len, .bfloat16, key, s));
+    return out;
+}
+
+const ds_limit: f32 = 10;
+
+/// Today's routed gate/up launch (the seg/db plan) and down launch on the call.
+fn dsToday(c: DsCall, b: DsBanks, down: bool, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (down) return (try sortedGatherPrompt(c.act, b.down.w, b.down.sc, b.down.bi, c.ids, 4, b.group, true, true, s)) orelse error.KernelDeclinedTestShape;
+    return (try sortedGateUpRouted(c.x, c.map, b.gu.w, b.gu.sc, b.gu.bi, c.ids, c.route, ds_limit, .{ .gate = c.esc[0], .up = c.esc[1] }, 4, b.group, true, true, s)) orelse error.KernelDeclinedTestShape;
+}
+
+/// The staged launch of `st` on the call; `scan_bm` the scan's tile height (`st.bm`, or a planted other).
+fn dsStaged(c: DsCall, b: DsBanks, down: bool, st: Staged, scan_bm: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (down) return launchStaged(c.act, null, b.down.w, b.down.sc, b.down.bi, c.ids, null, 4, b.group, true, st, scan_bm, s);
+    return launchStaged(c.x, c.map, b.gu.w, b.gu.sc, b.gu.bi, c.ids, .{ .w = b.gu.w, .sc = b.gu.sc, .bi = b.gu.bi, .sigtab = biasArg(.{ .ctx = null }), .up_off = ds_inter, .scales = .{ .gate = c.esc[0], .up = c.esc[1] }, .route = c.route, .route_limit = ds_limit }, 4, b.group, true, st, scan_bm, s);
+}
+
+test "staged NAX sorted gather is the seg/db kernels' words at DeepSeek-V4.1's routed experts (NVFP4 and MXFP4, every staged tile, odd prompt rows)" {
+    try requireNax();
+    errdefer dropOwnLatch();
+    const s = mlx.gpuStream();
+    for ([_]u32{ 16, 32 }) |group| {
+        const b = try DsBanks.init(group, s);
+        defer b.deinit();
+        for ([_]usize{ 13, 777, 1254, 4097, 8192 }, 0..) |tokens, ti| {
+            const c = try dsCall(tokens, 0x2000 + ti, s);
+            defer c.deinit();
+            for ([_]bool{ false, true }) |down| {
+                const want = try dsToday(c, b, down, s);
+                defer _ = mlx.mlx_array_free(want);
+                for (staged_variants) |st| {
+                    const got = try dsStaged(c, b, down, st, st.bm, s);
+                    defer _ = mlx.mlx_array_free(got);
+                    const same = try arraysEqual(want, got, s);
+                    if (!same) std.debug.print("[gqmm-staged] {s} {s} tokens={d} bm={d} wm={d} wn={d} tg_a={}: DIFFERS\n", .{ modeName(true, group), if (down) @as([]const u8, "down") else "gate+up", tokens, st.bm, st.wm, st.wn, st.tg_a });
+                    try std.testing.expect(same);
+                }
+                // The public entries take the planner's tile.
+                const served = (if (down)
+                    try sortedGatherPromptStaged(c.act, b.down.w, b.down.sc, b.down.bi, c.ids, 4, group, true, true, s)
+                else
+                    try sortedGateUpRoutedStaged(c.x, c.map, b.gu.w, b.gu.sc, b.gu.bi, c.ids, c.route, ds_limit, .{ .gate = c.esc[0], .up = c.esc[1] }, 4, group, true, true, s)) orelse return error.KernelDeclinedTestShape;
+                defer _ = mlx.mlx_array_free(served);
+                try expectBitEqual(want, served, s);
+            }
+        }
+    }
+}
+
+test "staged NAX sorted gather: tiles cut taller than the kernel's tile (a planted plan mismatch) lose rows and differ" {
+    try requireNax();
+    errdefer dropOwnLatch();
+    const s = mlx.gpuStream();
+    const b = try DsBanks.init(16, s);
+    defer b.deinit();
+    const c = try dsCall(4096, 0x3001, s);
+    defer c.deinit();
+    const st: Staged = .{ .bm = 64, .wm = 4, .wn = 1, .gx = 32 };
+    for ([_]bool{ false, true }) |down| {
+        const want = try dsToday(c, b, down, s);
+        defer _ = mlx.mlx_array_free(want);
+        const bad = try dsStaged(c, b, down, st, 2 * st.bm, s);
+        defer _ = mlx.mlx_array_free(bad);
+        try std.testing.expect(!try arraysEqual(want, bad, s));
+    }
+    // Scales on the wrong experts move the gate/up words.
+    const wrong: DsCall = blk: {
+        var v = c;
+        v.esc = .{ c.esc[1], c.esc[0] };
+        break :blk v;
+    };
+    const want = try dsToday(c, b, false, s);
+    defer _ = mlx.mlx_array_free(want);
+    const bad = try dsStaged(wrong, b, false, st, st.bm, s);
+    defer _ = mlx.mlx_array_free(bad);
+    try std.testing.expect(!try arraysEqual(want, bad, s));
+}
+
+/// Milliseconds a call: four calls evaluated together, median of 7 after one warm round, today's and the staged
+/// interleaved.
+fn dsMedianMs(c: DsCall, b: DsBanks, down: bool, st: ?Staged, s: mlx.mlx_stream) !f64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var laps: [7]u64 = undefined;
+    for (0..laps.len + 1) |i| {
+        const mark = std.Io.Timestamp.now(io, .boot);
+        var outs: [4]mlx.mlx_array = undefined;
+        for (&outs) |*o| o.* = if (st) |v| try dsStaged(c, b, down, v, v.bm, s) else try dsToday(c, b, down, s);
+        defer for (outs) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        const vec = mlx.mlx_vector_array_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
+        if (i > 0) laps[i - 1] = @intCast(mark.untilNow(io, .boot).nanoseconds);
+    }
+    std.mem.sort(u64, &laps, {}, std.sort.asc(u64));
+    return @as(f64, @floatFromInt(laps[laps.len / 2])) / 4e6;
+}
+
+test "staged NAX sorted gather µbench at DeepSeek-V4.1's NVFP4 routed experts against today's seg/db (diag gqmm-ubench, =sweep: every staged tile)" {
+    const raw = env.get(.GQMM_UBENCH) orelse return error.SkipZigTest;
+    try requireNax();
+    errdefer dropOwnLatch();
+    const s = mlx.gpuStream();
+    const sweep = std.mem.eql(u8, std.mem.sliceTo(raw, 0), "sweep");
+    const b = try DsBanks.init(16, s);
+    defer b.deinit();
+    // Today's passes (4,096 + 4,096 + 8,192 + 1,254 rows of the p01 prompt) and one 17,639-row pass.
+    for ([_]usize{ 1254, 4096, 8192, 17639 }, 0..) |tokens, ti| {
+        const c = try dsCall(tokens, 0x4000 + ti, s);
+        defer c.deinit();
+        for ([_]bool{ false, true }) |down| {
+            const flops = 2.0 * @as(f64, @floatFromInt(c.pairs)) * @as(f64, @floatFromInt(ds_hidden)) * @as(f64, @floatFromInt(if (down) ds_inter else 2 * ds_inter));
+            // Codes plus one scale byte per 16, for every expert the call touches.
+            const bytes = @as(f64, @floatFromInt(c.touched)) * @as(f64, @floatFromInt(ds_hidden)) * @as(f64, @floatFromInt(if (down) ds_inter else 2 * ds_inter)) * (0.5 + 1.0 / 16.0);
+            const floor_ms = @max(flops / 120e9, bytes / 1.065e9);
+            const today = try dsMedianMs(c, b, down, null, s);
+            const p = plan(c.pairs, ds_experts, if (down) ds_inter else ds_hidden, if (down) ds_hidden else ds_inter, !down);
+            std.debug.print("[gqmm-ubench] dsv41 nvfp4 {s} tokens={d} pairs={d} experts={d}: today {d:.3} ms {d:.1} TFLOPS ({s} bm={d}), floor {d:.3} ms ({s})\n", .{ if (down) @as([]const u8, "down 2304->5120") else "gate+up+act 5120->2x2304", tokens, c.pairs, c.touched, today, flops / today / 1e9, @tagName(p.sched), p.bm, floor_ms, if (flops / 120e9 >= bytes / 1.065e9) @as([]const u8, "compute") else "weights" });
+            const pick = stagedPlan(c.pairs, ds_experts);
+            for (staged_variants) |st| {
+                if (!sweep and !std.meta.eql(st, pick)) continue;
+                const ms = try dsMedianMs(c, b, down, st, s);
+                std.debug.print("[gqmm-ubench]   staged bm={d} wm={d} wn={d} gx={d} {s}{s}: {d:.3} ms {d:.1} TFLOPS ({d:.0}% of 120), {d:.3}x today, {d:.0}% of floor\n", .{ st.bm, st.wm, st.wn, st.gx, if (st.tg_a) @as([]const u8, "tg-a") else "reg-a", if (std.meta.eql(st, pick)) @as([]const u8, " (plan)") else "", ms, flops / ms / 1e9, flops / ms / 1.2e9, today / ms, 100 * floor_ms / ms });
+            }
         }
     }
 }
