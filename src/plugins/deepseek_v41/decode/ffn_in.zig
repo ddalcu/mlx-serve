@@ -47,11 +47,11 @@ pub const Kernels = struct {
     facc: A,
 };
 
-/// The fused launch's scratch words: the logits, sums and mix partials of up to 6 rows, then the counters.
-const facc_words = 16384;
+/// The fused launch's scratch words: each slice's logits and sums of up to 6 rows, the mix partials, then the counters.
+const facc_words = 131072;
 
 fn faccNeed(p: Dims) usize {
-    return 6 * p.e + 8 + 6 * slices(p) * (mixes + 1) + slices(p) + 1;
+    return slices(p) * (6 * p.e + 8) + 6 * slices(p) * (mixes + 1) + slices(p) + 1;
 }
 
 /// The launches' kernels, built once.
@@ -63,11 +63,14 @@ pub fn build() !Kernels {
     const f = try dsv41.buildKernel("dsv41_dec_ffn_in_fused", &F_INS, &F_OUTS, F_SOURCE, F_HEADER);
     errdefer _ = mlx.mlx_fast_metal_kernel_free(f);
     const n = if (device.naxAvailable()) try dsv41.buildKernel("dsv41_dec_ffn_in_nax", &A_INS, &A_OUTS, NAX_SOURCE, NAX_HEADER) else null;
-    return .{ .a = a, .b = b, .fused = f, .nax = n, .facc = newScratch() };
+    return .{ .a = a, .b = b, .fused = f, .nax = n, .facc = try newScratch() };
 }
 
-fn newScratch() A {
-    return mlx.mlx_array_new_data(&std.mem.zeroes([facc_words]u32), &[_]c_int{facc_words}, 1, .uint32);
+fn newScratch() !A {
+    const z = try std.heap.page_allocator.alloc(u32, facc_words);
+    defer std.heap.page_allocator.free(z);
+    @memset(z, 0);
+    return mlx.mlx_array_new_data(z.ptr, &[_]c_int{facc_words}, 1, .uint32);
 }
 
 pub fn free(k: Kernels) void {
@@ -1499,6 +1502,47 @@ test "dsv41 dec ffn_in nax: MLX_SERVE_DSV41_GEMV_R26_FFN_IN=1, rows 1..6 on laye
     var bad = w;
     bad.wo_w = other.wo_w;
     if (equivalence(gpa, fx, ks, &ly, bad, 4)) |_| return error.PlantedBugPassed else |_| {}
+}
+
+test "dsv41 dec ffn_in fused: the same inputs give the same bytes, launch after launch, at the release's shapes" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .ctx = 8 });
+    defer fx.deinit();
+    const ks = try build();
+    defer free(ks);
+    const w = try randomWeights(84);
+    defer freeWeights(w);
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const eps = try dsv41.hcEps(&sc, fx.m);
+    const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{fx.m.cfg.router_scaling_factor}, &[_]c_int{1}, 1, .float32));
+    for ([_]usize{ 1, 6 }) |rows| {
+        const oa = try fx.normal(&.{ ci(rows), 8192 }, act, 0, 1);
+        defer _ = mlx.mlx_array_free(oa);
+        const x = try fx.stream(rows);
+        defer _ = mlx.mlx_array_free(x);
+        const cpre = try fx.cpre(rows);
+        defer _ = mlx.mlx_array_free(cpre);
+        const sa = (try dsv41.hcStage(&sc, fx.m, x, null, cpre, &fx.layer(21).hc_attn, fx.layer(21).attn_norm)).sp;
+        const p: Dims = .{ .rows = rows };
+        var first: ?[]u8 = null;
+        defer if (first) |f| gpa.free(f);
+        // The router's logits and the hv sums gather from 40 column slices: their sum must not follow arrival order.
+        for (0..24) |_| {
+            const o = try launchFused(&sc, ks.fused, ks.facc, p, w, oa, x, &sa, eps, scal);
+            const outs = [_]A{ o.h2, o.sf.pre, o.sf.post, o.sf.comb, o.idx, o.wts };
+            try dsv41.evalAll(&outs);
+            var bytes: std.ArrayList(u8) = .empty;
+            defer bytes.deinit(gpa);
+            for (outs) |a| {
+                const n = mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a);
+                const d = mlx.mlx_array_data_uint8(a) orelse return error.NoData;
+                try bytes.appendSlice(gpa, d[0..n]);
+            }
+            if (first) |f| try std.testing.expectEqualSlices(u8, f, bytes.items) else first = try gpa.dupe(u8, bytes.items);
+        }
+    }
 }
 
 test "dsv41 dec ffn_in fused: a planted dropped router bias fails the equivalence" {

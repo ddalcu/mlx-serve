@@ -1,11 +1,12 @@
 // dec_ffn_in's fused tail (`MLX_SERVE_DSV41_FUSE_FFN_IN`), after launch 1's body: launch 2's work in the same dispatch.
 // The last of a 128-column slice's threadgroups to finish takes the slice: its 24 hc mix partials and sum of squares
 // over x1 (stored as launch 2's slices store them), its sum of squares of hv, and the router's partial logits over its
-// columns, gate . (norm_w * hv) without the norm's 1 / rms (atomic adds). The last slice to finish then takes what
+// columns, gate . (norm_w * hv) without the norm's 1 / rms, each into the slice's own slots. The last slice to finish
+// sums the slots in slice order (one rounding whatever the arrival order) and takes what
 // launch 2's last threadgroups take: the Sinkhorn split from the slices' partials, h2 = rms-norm(hv), and each row's
 // scores (the logits times the rows' 1 / rms) with their top TOPK. The router reads the unrounded normed collapse, where
 // launch 2 reads h2 rounded to bf16: the same math in another rounding. `facc` is persistent scratch, zero between
-// dispatches: the logits [6 E], the hv sums [8], the mix partials [6 P PL] (floats), then the counters (P + 1 words,
+// dispatches: the logits [P 6 E], the hv sums [P 8], the mix partials [6 P PL] (floats), then the counters (P + 1 words,
 // from word FCTR); every slot is set back to zero by the dispatch that used it. Values cross threadgroups as relaxed
 // atomics: plain loads can hit another core's stale L1.
 constexpr int CT = NSG * NR;
@@ -13,8 +14,8 @@ constexpr int TPS = 128 / CT;
 constexpr int P = D / 128;
 constexpr int MIX = (2 + HC) * HC;
 constexpr int PL = MIX + 1;
-constexpr int SS0 = 6 * E;
-constexpr int PARTS0 = 6 * E + 8;
+constexpr int SS0 = P * 6 * E;
+constexpr int PARTS0 = SS0 + P * 8;
 constexpr int FCTR = PARTS0 + 6 * P * PL;
 constexpr int NTH = NSG * 32;
 constexpr int NE = (E + 31) / 32;
@@ -55,7 +56,7 @@ if (int(sg) < R) {
     s2 = metal::fma(v, v, s2);
   }
   s2 = metal::simd_sum(s2);
-  if (lane == 0) metal::atomic_fetch_add_explicit(fa + SS0 + r, s2, metal::memory_order_relaxed);
+  if (lane == 0) metal::atomic_store_explicit(fa + SS0 + slice * 8 + r, s2, metal::memory_order_relaxed);
 }
 threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 for (int i = tid; i < R * 128; i += NTH) {
@@ -99,7 +100,7 @@ for (int e = int(sg); e < E; e += NSG) {
     d = metal::fma(g2, h[2], d);
     d = metal::fma(g3, h[3], d);
     d = metal::simd_sum(d);
-    if (lane == 0) metal::atomic_fetch_add_explicit(fa + r * E + e, d, metal::memory_order_relaxed);
+    if (lane == 0) metal::atomic_store_explicit(fa + ((size_t)slice * 6 + r) * E + e, d, metal::memory_order_relaxed);
   }
 }
 
@@ -162,9 +163,13 @@ if (sg == 0 && int(lane) < 4 * R) {
 
 // Each row's 1 / rms of hv (launch 2's), h2 = T(w * T(hv * inv)), then the scores and the top TOPK, a simdgroup a row.
 if (tid < R) {
-  device metal::atomic_float* at = fa + SS0 + tid;
-  t_inv[tid] = metal::precise::rsqrt(metal::atomic_load_explicit(at, metal::memory_order_relaxed) / float(D) + eps[0]);
-  metal::atomic_store_explicit(at, 0.0f, metal::memory_order_relaxed);
+  float ss = 0.0f;
+  for (int p = 0; p < P; ++p) {
+    device metal::atomic_float* at = fa + SS0 + p * 8 + tid;
+    ss += metal::atomic_load_explicit(at, metal::memory_order_relaxed);
+    metal::atomic_store_explicit(at, 0.0f, metal::memory_order_relaxed);
+  }
+  t_inv[tid] = metal::precise::rsqrt(ss / float(D) + eps[0]);
 }
 threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 for (int i = tid; i < R * (D / 2); i += NTH) {
@@ -184,9 +189,13 @@ if (int(sg) < R) {
     sv2[t] = 0.0f;
     bv2[t] = -INFINITY;
     if (ex < E) {
-      device metal::atomic_float* at = fa + r * E + ex;
-      const float z = metal::atomic_load_explicit(at, metal::memory_order_relaxed) * t_inv[r];
-      metal::atomic_store_explicit(at, 0.0f, metal::memory_order_relaxed);
+      float lg = 0.0f;
+      for (int p = 0; p < P; ++p) {
+        device metal::atomic_float* at = fa + ((size_t)p * 6 + r) * E + ex;
+        lg += metal::atomic_load_explicit(at, metal::memory_order_relaxed);
+        metal::atomic_store_explicit(at, 0.0f, metal::memory_order_relaxed);
+      }
+      const float z = lg * t_inv[r];
       // The sqrt-softplus score of the logit; a NaN is the lowest pick (lowest index first) and weighs NaN.
       const float y = metal::exp(-metal::abs(z));
       const float lp = y < 1e-4f ? y * (1.0f - y * (0.5f - y / 3.0f)) : metal::log(1.0f + y);
