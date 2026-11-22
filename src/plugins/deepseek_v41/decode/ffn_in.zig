@@ -1118,7 +1118,7 @@ pub fn register(set: *kc.Set) !void {
         .out = .bf16,
         .nan = nan_rule,
         .nax = true,
-        .tiles = .{ .{ .size = 3 }, .{ .size = 32, .step = 32, .min = 32 }, .{ .size = 1024, .step = 1024, .min = 1024 } },
+        .tiles = .{ .{ .size = 3 }, .{ .size = 32, .step = 32, .min = 128 }, .{ .size = 1024, .step = 1024, .min = 1024 } },
         .served = &.{ .{ .rows = 2, .n = 256, .k = 8192 }, .{ .rows = 6, .n = 256, .k = 8192 }, .{ .rows = 4, .n = 5120, .k = 8192 } },
     });
     try kit.add(set, FfnFused, &launch_f, .{}, .{
