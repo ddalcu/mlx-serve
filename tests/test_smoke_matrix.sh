@@ -52,6 +52,7 @@ ARCHES=(
     "mimo_v2_sushi|yes|beamster/MiMo-V2.6-Flash-Sushi-2.3bpw"
     "glm5_next|yes|ddalcu/GLM-5.3-Flash-MLX-Serve-iQ-MLX-5.1bpw"
     "glm5_next_sushi|yes|beamster/GLM-5.3-Flash-Sushi-2bpw"
+    "inkling2|yes|mlx-community/Inkling-2-Mini-4bit|ddalcu/Inkling-2-Mini-MLX-8bit"
 )
 CONFIGS="${SMOKE_CONFIGS:-default,kv4,kv8,mtp,nospec,drafter,drafter_kv8}"
 # A DFlash drafter per arch when the pack carries none in drafter/.
