@@ -1,6 +1,6 @@
 // PF_HC_V2 (prompt/hc_v2.zig): one pass over a wide prompt layer's hc stream rows that forms each row's stream, stores
 // it where a later stage reads it, collapses it with `cpre` (rounded to T, its squares summed) and takes its 24 mixes
-// against `fnp`, all from registers: the stream is read once and never read back. The header's PRO picks the row:
+// against `fn`, all from registers: the stream is read once and never read back. The header's PRO picks the row:
 // 0 the stream `x` as it is (the attention side), 1 x1 = post * y + comb^T x rounded to T (the FFN side, x1 not
 // stored), 2 x1 as in 1, then x2 = post2 * y2 + comb2^T x1 rounded to T and stored (the layer's tail and the next
 // layer's attention side). MIXON 0: the tail's x2 alone. Every fma and rounding is hc_expand_norm's, hc_mix_norm's and
@@ -11,9 +11,10 @@
 // of a simdgroup holds row mr's columns g * 8 .. g * 8 + 7 of every copy: one uint4 (8 bf16) a copy, so a row's 4 lanes
 // read 64 contiguous bytes a plane and a step. Those 8 values of copy i are the lane's elements (mr, 2g), (mr, 2g + 1)
 // of 4 8 x 8 A fragments (k-tiles i * 4 + t, columns 2t, 2t + 1 of its 8): the mixes take the row values straight from
-// registers, no staging. `fnp` is fn packed host-side in the B fragments' lane order a step (hc_v2.zig `packIndex`):
-// 16 k-tiles x 3 mix tiles x 64 floats = 12 KB, copied into threadgroup memory once a step and read as one float2 a
-// lane a fragment (consecutive words: no bank conflict). The next step's stream words and fn words are loaded into
+// registers, no staging. A step of `fn` (f32 [MIX, HC * D], cache-resident) is gathered as it is stored into
+// threadgroup memory in the B fragments' lane order (hc_v2.zig `packAt`): 16 k-tiles x 3 mix tiles x 64 floats =
+// 12 KB, each thread's 12 element offsets fixed for the launch, read as one float2 a lane a fragment (consecutive
+// words: no bank conflict). The next step's stream words and fn words are loaded into
 // registers before this step's math (two steps in flight a lane). The f32 8x8 products run on the vector ALUs; they
 // are the register blocking (a fn word serves 8 rows, a row word 8 mixes), not extra throughput.
 //
@@ -37,7 +38,7 @@ constexpr int NP = HC + 1;
 constexpr int NP = HC + 2;
 #endif
 static_assert(D % (DC * S) == 0, "hc_v2_mix: D in whole steps a slice");
-static_assert(FSTEP % (4 * NSG * 32) == 0, "hc_v2_mix: fn's step in whole float4s a thread");
+static_assert(FSTEP % (NSG * 32) == 0, "hc_v2_mix: fn's step in whole floats a thread");
 
 const uint sg = simdgroup_index_in_threadgroup;
 const uint lane = thread_index_in_simdgroup;
@@ -88,13 +89,22 @@ auto fetch = [&](int st, thread uint4* r) {
 
 #if MIXON
 threadgroup float fs[FSTEP];
-float4 fr[FSTEP / (4 * NSG * 32)];
-const device float4* fp4 = (const device float4*)fnp;
+constexpr int FQ = FSTEP / (NSG * 32);
+// Packed float p = tid + q * 256 of a step: B fragment (kt, mt) lane ln's v-th value, fn[mt * 8 + mc + v] at the
+// column the fragment's k = mr carries (copy kt / 4, step column (mr / 2) * 8 + 2 (kt % 4) + mr % 2).
+uint fo[FQ];
+for (int q = 0; q < FQ; ++q) {
+  const int p = int(tid) + q * NSG * 32;
+  const int v = p & 1, ln = (p >> 1) & 31, mt = (p >> 6) % 3, kt = p / 192;
+  const int lq = ln >> 2;
+  const int kr = (lq & 4) + ((ln >> 1) & 3), kc = (lq & 2) * 2 + (ln & 1) * 2;
+  fo[q] = uint((mt * 8 + kc + v) * (HC * D) + (kt >> 2) * D + (kr >> 1) * 8 + 2 * (kt & 3) + (kr & 1));
+}
+float fr[FQ];
 #define HC2_FFETCH(st)                                                                     \
-  for (int q = 0; q < FSTEP / (4 * NSG * 32); ++q)                                         \
-    fr[q] = fp4[size_t(slice * NSTEP + (st)) * (FSTEP / 4) + tid + q * NSG * 32];
+  for (int q = 0; q < FQ; ++q) fr[q] = fn[fo[q] + uint((slice * NSTEP + (st)) * DC)];
 #define HC2_FSTORE()                                                                       \
-  for (int q = 0; q < FSTEP / (4 * NSG * 32); ++q) ((threadgroup float4*)fs)[tid + q * NSG * 32] = fr[q];
+  for (int q = 0; q < FQ; ++q) fs[int(tid) + q * NSG * 32] = fr[q];
 simdgroup_matrix<float, 8, 8> c[3];
 for (int t = 0; t < 3; ++t) c[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 float ssx = 0.0f, ssh = 0.0f;

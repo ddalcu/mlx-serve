@@ -1444,7 +1444,7 @@ const HcV2Mix = struct {
         return g;
     }
 
-    /// The inputs in the wrapper's order: x, then y / post / comb (and y2 / post2 / comb2), then cpre and packed fn.
+    /// The inputs in the wrapper's order: x, then y / post / comb (and y2 / post2 / comb2), then cpre and fn.
     pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
         const L = k.shape.rows;
         const D = k.shape.n;
@@ -1462,8 +1462,8 @@ const HcV2Mix = struct {
         if (!mixes(k.p)) return;
         const cpre = try k.add(.float32, &.{ L, HC });
         kit.uniform(rng, cpre, 0, 1);
-        const fnp = try k.add(.float32, &.{hv2.N * hv2.MIX});
-        kit.uniform(rng, fnp, -0.02, 0.02);
+        const fnw = try k.add(.float32, &.{ MIX, HC * D });
+        kit.uniform(rng, fnw, -0.02, 0.02);
     }
 
     fn rowsX(s: Shape) usize {
@@ -1541,14 +1541,7 @@ const HcV2Mix = struct {
         const ho = off;
         const po = off + rowsN(k.shape);
         // fn in its natural [MIX, N] order, from the packed input.
-        const fnw = try a.alloc(f64, if (mixes(k.p)) hv2.N * hv2.MIX else 0);
-        defer a.free(fnw);
-        if (mixes(k.p)) {
-            const fp = k.in(k.n_in - 1);
-            for (0..D / hv2.DC) |s0| for (0..hv2.FSTEP) |q| {
-                fnw[hv2.packAt(s0, q)] = fp[s0 * hv2.FSTEP + q];
-            };
-        }
+        const fnw: []const f64 = if (mixes(k.p)) k.in(k.n_in - 1) else &.{};
         const terms = try a.alloc(f64, 2 * HC * DS);
         defer a.free(terms);
         const hb = try a.alloc(f64, 2 * D);

@@ -9,8 +9,9 @@
 //!   NEXT layer's attention-side collapse and mixes of x2 from registers, handed over in `slot` (`take`); a layer
 //!   whose stream another stage changes first (an Engram layer) runs `attn` over its own stream instead.
 //! Each mix pass writes per-slice partials; `fin` sums them, makes the split and rms-norms the collapse. 64 rows a
-//! threadgroup share each 12 KB step of `fn` (packed host-side in the fragments' lane order, `packIndex`). The words
-//! are the stock kernels' fmas and roundings; only the sums' order differs.
+//! threadgroup share each 12 KB step of `fn`, gathered from its stored layout into threadgroup memory in the fragments'
+//! lane order (`packAt`); no pass converts or copies a weight. The words are the stock kernels' fmas and roundings; only
+//! the sums' order differs.
 
 const std = @import("std");
 const env = @import("../../../env.zig");
@@ -35,7 +36,7 @@ pub const DC: usize = 32;
 pub const ROWS: usize = 64;
 pub const PW: usize = MIX + 2;
 pub const FIN_TG: usize = 128;
-/// Floats of packed `fn` a step: 16 k-tiles x 3 mix tiles x 64.
+/// Floats of `fn` staged a step: 16 k-tiles x 3 mix tiles x 64.
 pub const FSTEP: usize = HC * DC / 8 * 3 * 64;
 
 /// The mix kernel's variants: the stream as it is, the FFN side's x1, the tail's x2 (with the next layer's mixes, or
@@ -44,9 +45,9 @@ pub const Pro = enum { plain, ffn, tail, tail_only };
 
 pub fn ins(p: Pro) []const [*:0]const u8 {
     return switch (p) {
-        .plain => &.{ "x", "cpre", "fnp" },
-        .ffn => &.{ "x", "y", "post", "comb", "cpre", "fnp" },
-        .tail => &.{ "x", "y", "post", "comb", "y2", "post2", "comb2", "cpre", "fnp" },
+        .plain => &.{ "x", "cpre", "fn" },
+        .ffn => &.{ "x", "y", "post", "comb", "cpre", "fn" },
+        .tail => &.{ "x", "y", "post", "comb", "y2", "post2", "comb2", "cpre", "fn" },
         .tail_only => &.{ "x", "y", "post", "comb", "y2", "post2", "comb2" },
     };
 }
@@ -83,11 +84,10 @@ pub fn slicesFor(L: usize) usize {
     return 40;
 }
 
-/// The kernels, `fn`'s packing index and the attention side handed to the next layer; one copy across `-Dunits` units.
+/// The kernels and the attention side handed to the next layer; one copy across `-Dunits` units.
 const State = struct {
     k: [4]?mlx.mlx_fast_metal_kernel = @splat(null),
     fin: ?mlx.mlx_fast_metal_kernel = null,
-    pack: A = none,
     logged: bool = false,
     slot: Slot = .{},
 };
@@ -128,9 +128,9 @@ fn finKernel() !mlx.mlx_fast_metal_kernel {
     return k;
 }
 
-/// Packed position `pos` of a step's `FSTEP` floats -> its element of `fn` `[MIX, N]`: B fragment (k-tile kt, mix
-/// tile mt) at lane `lane` holds fn[mt * 8 + mc + v] at the column the A fragment's k = mr carries, where k-tile
-/// kt = i * 4 + t of a step holds copy i's columns (k / 2) * 8 + 2t + k % 2 (the mix kernel's lane layout).
+/// Staged position `pos` of a step's `FSTEP` floats -> its element of `fn` `[MIX, N]` (the mix kernel's gather):
+/// B fragment (k-tile kt, mix tile mt) at lane `lane` holds fn[mt * 8 + mc + v] at the column the A fragment's
+/// k = mr carries, where k-tile kt = i * 4 + t of a step holds copy i's columns (k / 2) * 8 + 2t + k % 2.
 pub fn packAt(step: usize, pos: usize) u32 {
     const v = pos % 2;
     const lane = pos / 2 % 32;
@@ -143,24 +143,6 @@ pub fn packAt(step: usize, pos: usize) u32 {
     const mc = (qid & 2) * 2 + (lane % 2) * 2;
     const col = i * D + step * DC + (mr / 2) * 8 + 2 * t + mr % 2;
     return @intCast((mt * 8 + mc + v) * N + col);
-}
-
-/// The packing index `[N * MIX]` u32 (`packAt` over every step), made once.
-fn packIndex() !A {
-    if (ps().pack.ctx != null) return ps().pack;
-    const a = std.heap.page_allocator;
-    const idx = try a.alloc(u32, N * MIX);
-    defer a.free(idx);
-    for (0..D / DC) |st| for (0..FSTEP) |p| {
-        idx[st * FSTEP + p] = packAt(st, p);
-    };
-    ps().pack = mlx.mlx_array_new_data(idx.ptr, &[_]c_int{@intCast(N * MIX)}, 1, .uint32);
-    return ps().pack;
-}
-
-/// `fn` in the mix kernel's order, a fresh array a call (2 MB gathered).
-pub fn packFn(sc: *dsv41.Scope, fn_w: A) !A {
-    return sc.take(try sc.reshape(fn_w, &.{-1}), try packIndex(), 0);
 }
 
 fn ci(v: usize) c_int {
@@ -247,7 +229,7 @@ pub fn attn(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, cpre: A, hc: *co
     const S = slicesFor(L);
     engaged(L);
     const eps = try dsv41.hcEps(sc, m);
-    const o = try mixLaunch(sc, .plain, &.{ x, cpre, try packFn(sc, hc.fn_w) }, L, S);
+    const o = try mixLaunch(sc, .plain, &.{ x, cpre, hc.fn_w }, L, S);
     return finLaunch(sc, o[1], o[0], hc, norm_w, eps, S, m.cfg.dsv4_hc_sinkhorn_iters);
 }
 
@@ -258,7 +240,7 @@ pub fn ffn(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, y: A, sa: *const 
     const S = slicesFor(L);
     engaged(L);
     const eps = try dsv41.hcEps(sc, m);
-    const o = try mixLaunch(sc, .ffn, &.{ x, try bf16(sc, y), sa.post, sa.comb, sa.pre, try packFn(sc, hc.fn_w) }, L, S);
+    const o = try mixLaunch(sc, .ffn, &.{ x, try bf16(sc, y), sa.post, sa.comb, sa.pre, hc.fn_w }, L, S);
     return finLaunch(sc, o[1], o[0], hc, norm_w, eps, S, m.cfg.dsv4_hc_sinkhorn_iters);
 }
 
@@ -279,7 +261,7 @@ pub fn tail(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, y: A, sa: *const
         return .{ .x2 = o[0], .next = null };
     };
     const eps = try dsv41.hcEps(sc, m);
-    const o = try mixLaunch(sc, .tail, &.{ x, yb, sa.post, sa.comb, y2b, sf.post, sf.comb, sf.pre, try packFn(sc, n.hc.fn_w) }, L, S);
+    const o = try mixLaunch(sc, .tail, &.{ x, yb, sa.post, sa.comb, y2b, sf.post, sf.comb, sf.pre, n.hc.fn_w }, L, S);
     return .{ .x2 = o[0], .next = try finLaunch(sc, o[2], o[1], n.hc, n.norm_w, eps, S, m.cfg.dsv4_hc_sinkhorn_iters) };
 }
 
