@@ -87,8 +87,6 @@ const pass_async = @import("prompt/pass_async.zig");
 const mpair = @import("prompt/moe_pair.zig");
 /// hc_v2.zig: a resident wide layer's hc in three passes over the stream (`MLX_SERVE_DSV41_PF_HC_V2`).
 const hv2 = @import("prompt/hc_v2.zig");
-/// hc_mix_mma.zig: a wide layer's hc mixes on the simdgroup matrix units (`MLX_SERVE_DSV41_HC_MIX_TILED`).
-const hmma = @import("prompt/hc_mix_mma.zig");
 /// moe_tail.zig: a resident wide layer's MoE combine and hc expand in one launch (`MLX_SERVE_DSV41_MOE_TAIL`).
 const mtail = @import("prompt/moe_tail.zig");
 /// launch fusions, each behind its own default-off switch (`Dsv41Model.fuse`).
@@ -2767,7 +2765,6 @@ pub fn hcPreNormWide(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *const
 }
 /// `hcPreNormWide`'s mix kernel: `x`'s mix logits `[L, mix]` f32, which `hcNorm` turns into the split.
 pub fn hcMixWide(sc: *Scope, m: *const Dsv41Model, x: A, hc: *const Hc, eps: A) !A {
-    if (try hmma.mix(sc, x, hc, eps)) |z| return z;
     const L = dim(x, 0);
     const mix = dim(hc.fn_w, 0);
     const tg = m.hc_tg;
