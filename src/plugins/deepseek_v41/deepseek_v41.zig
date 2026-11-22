@@ -3357,6 +3357,9 @@ fn runGathers(c: *const Config, ratio: usize, start: usize, span: usize, run: us
 /// [o_groups, L, H / o_groups * D].
 pub const Grouped = struct { periods: A, p0: usize };
 
+/// One line the first time a wide prompt span runs on the flash kernel (`MLX_SERVE_DSV41_FLASH_ATTN`).
+var flash_logged = std.atomic.Value(bool).init(false);
+
 /// The wide core on the matrix units, null where it does not serve (no NAX, not bf16, another head geometry): each row's
 /// scores against its own window and selected rows, read in place, never gathered.
 /// The heads `[L, H, D]`, or with `grouped` already inverse-roped and grouped.
@@ -3406,6 +3409,7 @@ fn attnGather(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, qt: A, keys_w: A,
     // default served by the gather's fresh launches below (never the ring).
     if (fa.ps().explicit and g.flash != null and grouped != null and !fa_shape) return error.FlashAttnShape;
     if (g.flash) |fk| if (fa_shape) {
+        if (!flash_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_FLASH_ATTN engaged: a wide prompt span on the flash kernel\n", .{});
         const f_qt = if (qt.ctx != null) qt else q;
         const f_scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{scale}, &[_]c_int{1}, 1, .float32));
         const f_ins = [_]A{ q, keys_w, comp, picks, meta, f_qt, sink, f_scal, grouped.?.periods };
