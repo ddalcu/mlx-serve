@@ -60,7 +60,7 @@ var order_logged: std.atomic.Value(bool) = .init(false);
 
 pub fn orderOn() bool {
     const v = env.get(.MLX_SERVE_DSV41_MOE_DOWN_ORDER) orelse return false;
-    return v.len > 0 and v[0] == '1';
+    return v[0] == '1';
 }
 
 /// ModelOpt's per-expert scales of an NVFP4 bank (`modelopt_pack.buildBanks`), each `[E]` in the stream's dtype: the
