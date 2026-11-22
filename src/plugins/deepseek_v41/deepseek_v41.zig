@@ -81,6 +81,10 @@ const acore = @import("prompt/attn_core.zig");
 const fa = @import("prompt/flash_attn.zig");
 /// the moe_pair.zig: a prompt call's fp4 gate and up with `moe_act` in one paired NAX launch.
 const mpair = @import("prompt/moe_pair.zig");
+/// hc_mix_mma.zig: a wide layer's hc mixes on the simdgroup matrix units (`MLX_SERVE_DSV41_HC_MIX_TILED`).
+const hmma = @import("prompt/hc_mix_mma.zig");
+/// moe_tail.zig: a resident wide layer's MoE combine and hc expand in one launch (`MLX_SERVE_DSV41_MOE_TAIL`).
+const mtail = @import("prompt/moe_tail.zig");
 /// launch fusions, each behind its own default-off switch (`Dsv41Model.fuse`).
 const fusion = @import("fuse.zig");
 const Shard = @import("../../sdk/weights/shard.zig").Shard;
@@ -2746,6 +2750,7 @@ pub fn hcPreNormWide(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *const
 }
 /// `hcPreNormWide`'s mix kernel: `x`'s mix logits `[L, mix]` f32, which `hcNorm` turns into the split.
 pub fn hcMixWide(sc: *Scope, m: *const Dsv41Model, x: A, hc: *const Hc, eps: A) !A {
+    if (try hmma.mix(sc, x, hc, eps)) |z| return z;
     const L = dim(x, 0);
     const mix = dim(hc.fn_w, 0);
     const tg = m.hc_tg;
@@ -4622,6 +4627,18 @@ pub fn flatKernel(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, ins: []const A, s
 /// the n = L k pairs sorted by expert so each bank streams once, gate+up and down as sorted gathers
 /// (`sortedBank`), the SwiGLU x weight and the unsort + k-sum + shared add one kernel each.
 pub fn moePrefill(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, wts: A, sh: A) !A {
+    const p = try moePrefillParts(sc, m, ly, x, idx, wts, sh);
+    const L = dim(x, 0);
+    const d = dim(x, 1);
+    return flatKernel(sc, m.moe_combine_kernel, &.{ p.dn, p.inv, p.sh }, &.{ ci(L), ci(d) }, mlx.mlx_array_dtype(x), L * d, &.{ .{ .name = "D", .v = ci(d) }, .{ .name = "K", .v = ci(dim(idx, 1)) } });
+}
+
+/// What `moePrefill`'s combine reads: the down rows `[n, d]` in expert order, each pair's place in it `inv` `[n]`
+/// (pair `l * k + j` at row `inv[l * k + j]`) and the shared expert `sh` in `x`'s dtype.
+pub const MoeParts = struct { dn: A, inv: A, sh: A };
+
+/// `moePrefill` up to its combine.
+pub fn moePrefillParts(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, wts: A, sh: A) !MoeParts {
     const L = dim(x, 0);
     const k = dim(idx, 1);
     const d = dim(x, 1);
@@ -4651,7 +4668,7 @@ pub fn moePrefill(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx:
         break :blk try flatKernel(sc, m.moe_act_kernel, &.{ try sc.reshape(y, &.{ ci(n), ci(2 * inter) }), w_sorted, lim }, &.{ ci(n), 1, ci(inter) }, dt, n * inter, &.{.{ .name = "N", .v = ci(inter) }});
     };
     const dn = try sortedBank(sc, act, null, &e.down, sidx); // [n, 1, d]
-    return flatKernel(sc, m.moe_combine_kernel, &.{ try sc.reshape(dn, &.{ ci(n), ci(d) }), inv, try sc.astype(sh, dt) }, &.{ ci(L), ci(d) }, dt, L * d, &.{ .{ .name = "D", .v = ci(d) }, .{ .name = "K", .v = ci(k) } });
+    return .{ .dn = try sc.reshape(dn, &.{ ci(n), ci(d) }), .inv = inv, .sh = try sc.astype(sh, dt) };
 }
 
 pub const Routes = struct { idx: A, wts: A };
@@ -6201,7 +6218,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         // the region. The call's last wide layer keeps the fresh buffer: its
         // streams are read after the call's last eval (the CED replay, the head, the next chunk).
         const into = pf.in_region and k0 == 0 and k1 == n_spans and next_wide and (m.n_mtp == 0 or m.dsparkTarget(li + 1) == null);
-        const xg = if (try moeExpand(&gsc, m, li, hg, img, if (into) pf.x1 else x1g, &sf, .{ .next = next_ids, .ls = &st.layers[li] }, into)) |v| v else try hcExpand(&gsc, x1g, try moe(&gsc, m, li, hg, img), &sf);
+        const xg = if (try moeExpand(&gsc, m, li, hg, img, if (into) pf.x1 else x1g, &sf, .{ .next = next_ids, .ls = &st.layers[li] }, into)) |v| v else if (try mtail.tail(&gsc, m, li, hg, img, x1g, &sf)) |v| v else try hcExpand(&gsc, x1g, try moe(&gsc, m, li, hg, img), &sf);
         // scratch_x1.zig: the region's next writer waits for this, its last reader.
         if (x1_scratch and k1 == n_spans) try sx1.ps().x1.released(xg);
         for (k0..k1) |k| {
