@@ -7761,7 +7761,11 @@ pub fn stageFfnFused(sc: *Scope, m: *Dsv41Model, ly: *const Layer, r: A, x: A, s
     if (L > dkern.max_rows or ly.wo_a.ext != null or m.dec.ffn_in == null) return null;
     const oa = try attnOutA(sc, m, ly, try sc.transpose(try sc.reshape(r, &.{ ci(L), ci(dim(ly.wo_a.w, 0)), -1 }), &.{ 1, 0, 2 }), null);
     const f = try ffnInFused(sc, m, ly, oa, x, sa) orelse return null;
-    const y = try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
+    // As `blockTail`: `ffnInFused`'s routes come without the layer's down scale, which the fused fp4 launches take inside
+    // under `fuse.down_scale`, else `routeScaled` puts on them (a bank without ModelOpt's per-expert scales: neither).
+    if (m.fuse.down_scale) if (try fusion.ffnDownScaled(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf)) |y| return .{ .x = y, .pre = f.sf.pre };
+    const wts = try routeScaled(sc, ly, f.idx, f.wts);
+    const y = try ffnDecode(sc, m, ly, f.h2, f.idx, wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, wts)), &f.sf);
     return .{ .x = y, .pre = f.sf.pre };
 }
 
