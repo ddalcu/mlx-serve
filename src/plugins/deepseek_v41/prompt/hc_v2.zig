@@ -16,6 +16,7 @@
 const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
+const device = @import("../../../mlx/device.zig");
 const log = @import("../../../sdk/util/log.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const dsv41 = @import("../deepseek_v41.zig");
@@ -118,9 +119,11 @@ inline fn ps() *State {
 /// to (the spans' own, compared, never owned), the mixes, the split and the normed collapse (handles this slot owns).
 const Slot = struct { li: usize = 0, x: ?*anyopaque = null, z: A = none, pre: A = none, post: A = none, comb: A = none, h: A = none };
 
-/// Whether the switch serves this model's wide layers: the resident trunk on the GPU, bf16, the release's hc shapes.
+/// Whether the switch serves this model's wide layers: the resident trunk on a NAX GPU, bf16, the release's hc shapes.
+/// NAX only: the kernels' M1/M2 thread limits cannot be compiled offline (every requested build differs), so an older
+/// GPU keeps the stock hc launches.
 pub fn serves(m: *const dsv41.Dsv41Model) bool {
-    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_HC_V2)) return false;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_HC_V2) or !device.naxAvailable()) return false;
     return m.streamed == null and m.tp == null and m.trace == null and m.act == .bfloat16 and
         m.cfg.hidden_size == D and m.cfg.dsv4_hc_mult == HC and mlx.streamIsGpu(m.s);
 }
