@@ -108,8 +108,8 @@ pub fn fp4Reads() c_int {
 }
 var fp4_reads_logged = std.atomic.Value(bool).init(false);
 
-/// The decode levers of the two launches, each read every call (`MLX_SERVE_DSV41_FP4_DEC_WORD`, on by default, and
-/// `_UP_SPLIT`, off), each logged once when on: the same values in the same chains, so the same bytes as with them off.
+/// The decode levers of the two launches, each on by default and read every call (`MLX_SERVE_DSV41_FP4_DEC_WORD`,
+/// `_UP_SPLIT`), each logged once when on: the same values in the same chains, so the same bytes as with them off.
 pub const Levers = struct {
     /// The routed e2m1 codes decoded a word at a time (template `DW`, both launches).
     dec_word: bool = false,
@@ -118,7 +118,7 @@ pub const Levers = struct {
 
     pub fn fromEnv() Levers {
         const log = @import("../../../sdk/util/log.zig");
-        const l: Levers = .{ .dec_word = env.onUnlessZero(.MLX_SERVE_DSV41_FP4_DEC_WORD), .up_split = env.on(.MLX_SERVE_DSV41_FP4_UP_SPLIT) };
+        const l: Levers = .{ .dec_word = env.onUnlessZero(.MLX_SERVE_DSV41_FP4_DEC_WORD), .up_split = env.onUnlessZero(.MLX_SERVE_DSV41_FP4_UP_SPLIT) };
         if (l.dec_word and !dec_word_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_FP4_DEC_WORD engaged\n", .{});
         if (l.up_split and !up_split_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_FP4_UP_SPLIT engaged\n", .{});
         return l;
