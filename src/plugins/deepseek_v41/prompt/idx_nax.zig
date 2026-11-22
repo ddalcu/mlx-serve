@@ -93,7 +93,7 @@ pub fn inputs(sc: *dsv41.Scope, q: A, keys: A, weights: A, wscale: f32, p0: usiz
 /// `indexScoresTiled` on the matrix units; null (nothing launched) where the switch is off or the shapes, dtypes or GPU
 /// are not the kernel's.
 pub fn scores(sc: *dsv41.Scope, q: A, keys: A, weights: A, wscale: f32, p0: usize, ratio: usize) !?A {
-    if (!env.on(.MLX_SERVE_DSV41_PF_IDX_NAX) or !device.naxAvailable() or !mlx.streamIsGpu(sc.s) or ratio == 0) return null;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_IDX_NAX) or !device.naxAvailable() or !mlx.streamIsGpu(sc.s) or ratio == 0) return null;
     if (mlx.getShape(q).len != 3 or dim(q, 1) != heads or dim(q, 2) != channels or dim(q, 0) == 0) return null;
     if (mlx.getShape(keys).len != 2 or dim(keys, 1) != channels or dim(keys, 0) == 0 or mlx.mlx_array_dtype(keys) != .bfloat16) return null;
     if (mlx.getShape(weights).len != 2 or dim(weights, 0) != dim(q, 0) or dim(weights, 1) != heads or mlx.mlx_array_dtype(weights) != .bfloat16) return null;
