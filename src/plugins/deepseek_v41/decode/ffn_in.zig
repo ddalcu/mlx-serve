@@ -1602,6 +1602,114 @@ test "dsv41 dec ffn_in: the contract's launches write the shipped wrapper's byte
     for (got, 0..) |g, i| try std.testing.expect(try sameBytes(&cb.rig, g, cb.rig.output(i)));
 }
 
+/// A `[n]` f32 array of `v`, as `dt`.
+fn hostArray(v: []const f32, shape: []const c_int, dt: mlx.mlx_dtype) !A {
+    const a = mlx.mlx_array_new_data(v.ptr, shape.ptr, @intCast(shape.len), .float32);
+    if (dt == .float32) return a;
+    defer _ = mlx.mlx_array_free(a);
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&o, a, dt, mlx.gpuStream()));
+    try mlx.check(mlx.mlx_array_eval(o));
+    return o;
+}
+
+test "dsv41 dec ffn_in: launch 2's and the fused launch's router scores at logits near -9 (e^z about 1e-4) are within 1e-5 of float64" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ks = try build();
+    defer free(ks);
+    const D = 5120;
+    const E = 384;
+    // hv = 1 on every column (oa 0, a unit stream, comb the identity, pre 1/4) and a unit norm weight: expert e's logit
+    // is its one gate weight z_e = -(8 + (e % 24) / 16), and the bias makes experts 16..21 (z -9 .. -9.3125) the picks.
+    const zs = try gpa.alloc(f32, E * D);
+    defer gpa.free(zs);
+    @memset(zs, 0);
+    var bias: [E]f32 = undefined;
+    for (0..E) |e| {
+        zs[e * D + e] = -(8.0 + @as(f32, @floatFromInt(e % 24)) / 16.0);
+        bias[e] = if (e >= 16 and e < 22) 10 else 0;
+    }
+    const ones = try gpa.alloc(f32, 4 * D);
+    defer gpa.free(ones);
+    @memset(ones, 1);
+    const zeros = try gpa.alloc(f32, 8192);
+    defer gpa.free(zeros);
+    @memset(zeros, 0);
+    var eye: [16]f32 = @splat(0);
+    for (0..4) |i| eye[i * 4 + i] = 1;
+    const w0 = try randomWeights(85);
+    defer freeWeights(w0);
+    var w = w0;
+    w.norm_w = try hostArray(ones[0..D], &.{D}, act);
+    defer _ = mlx.mlx_array_free(w.norm_w);
+    w.gate_w = try hostArray(zs, &.{ E, D }, act);
+    defer _ = mlx.mlx_array_free(w.gate_w);
+    w.gate_bias = try hostArray(&bias, &.{ 1, E }, .float32);
+    defer _ = mlx.mlx_array_free(w.gate_bias);
+    const arrs = [_]A{
+        try hostArray(zeros, &.{ 1, 8192 }, act),         try hostArray(ones, &.{ 1, 4, D }, act),
+        try hostArray(&.{ 0.25, 0.25, 0.25, 0.25 }, &.{ 1, 4 }, .float32), try hostArray(&.{ 1, 1, 1, 1 }, &.{ 1, 4 }, .float32),
+        try hostArray(&eye, &.{ 1, 4, 4 }, .float32),     try hostArray(&.{ 1e-6, 1e-6 }, &.{2}, .float32),
+        try hostArray(&.{1.5}, &.{1}, .float32),
+    };
+    defer for (arrs) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const sa: dsv41.Split = .{ .pre = arrs[2], .post = arrs[3], .comb = arrs[4] };
+    const p: Dims = .{ .rows = 1, .e = E, .top_k = 6, .norm = false };
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const inv = 1 / @sqrt(1.0 + @as(f64, 1e-6));
+    for ([_]bool{ false, true }) |fused| {
+        var idx: A = undefined;
+        var wts: A = undefined;
+        if (fused) {
+            const o = try launchFused(&sc, ks.fused, ks.facc, p, w, arrs[0], arrs[1], &sa, arrs[5], arrs[6]);
+            idx = o.idx;
+            wts = o.wts;
+        } else {
+            const a = try launchA(&sc, ks, p, w, arrs[0], arrs[1], &sa);
+            const b = try launchB(&sc, ks, p, w, a, arrs[5], arrs[6]);
+            idx = b.idx;
+            wts = b.wts;
+        }
+        try dsv41.evalAll(&.{ idx, wts });
+        const ih = try dsv41.hostF32(idx);
+        defer gpa.free(ih);
+        const wh = try dsv41.hostF32(wts);
+        defer gpa.free(wh);
+        // Launch 2 routes off h2 = bf16(1 * bf16(inv)) = 1, the fused launch off the unrounded inv.
+        const f: f64 = if (fused) inv else 1;
+        for (ih, wh, 0..) |iv, wv, q| {
+            const e: usize = @intFromFloat(iv);
+            try std.testing.expectEqual(16 + q, e);
+            const z = @as(f64, zs[e * D + e]) * f;
+            const want = @sqrt(std.math.log1p(@exp(-@abs(z)))) * 1.5;
+            const rel = @abs(@as(f64, wv) - want) / want;
+            std.debug.print("[dec] ffn_in {s} pick {d}: z {d:.4}, weight {e} where float64 gives {e} ({e} rel)\n", .{ if (fused) "fused" else "launch 2", e, z, wv, want, rel });
+            try std.testing.expect(rel <= 1e-5);
+        }
+    }
+}
+
+test "dsv41 dec ffn_in: launch 2 and the fused launch pass the contract's gates 1-4, launch 2's sums gate at stress seed 0xc0de too" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var set = kc.Set.init(gpa);
+    defer set.deinit();
+    try register(&set);
+    var pick: std.ArrayList(kit.gates.Kernel) = .empty;
+    defer pick.deinit(gpa);
+    for (set.kernels.items) |k| if (std.mem.indexOf(u8, k.spec.name, "ffn_in B ") != null or std.mem.indexOf(u8, k.spec.name, "ffn_in fused ") != null) try pick.append(gpa, k);
+    try std.testing.expectEqual(@as(usize, 2), pick.items.len);
+    var t: kit.gates.Tally = .{};
+    try kit.gates.runAll(gpa, pick.items, 0xc0de, &t);
+    try std.testing.expectEqual(@as(usize, 0), t.problems());
+    // The stress inputs where f32 log(1 + y) put the routed weights 6.5x past the exact-sum bound.
+    try std.testing.expectEqual(kit.gates.Verdict.pass, try kit.gates.sums(gpa, pick.items[0], 0xc0de));
+}
+
 // ── ubench ──
 
 const Timing = struct { total: f64, build: f64 };
