@@ -11,6 +11,7 @@ const v41 = @import("deepseek_v41.zig");
 const qtail = @import("prompt/q_tail.zig");
 const hcf = @import("prompt/hc_fuse.zig");
 const sx1 = @import("prompt/scratch_x1.zig");
+const hv2 = @import("prompt/hc_v2.zig");
 const gtwin = @import("decode/gemv_twin.zig");
 const ggemm = @import("prompt/gate_gemm.zig");
 const markov = @import("spec/markov.zig");
@@ -1407,6 +1408,288 @@ const ExpandNorm = struct {
         const z = try sc.zeros(&.{ ci(k.shape.rows), MIX }, .float32);
         const n = try v41.hcNorm(&sc, &m, z, x1, k.args[4], k.args[5], k.args[6]);
         return k.rig.bytesOf(&.{ n.h, x1 });
+    }
+};
+
+// ── hc_v2 (`MLX_SERVE_DSV41_PF_HC_V2`): a wide layer's stream rows formed, collapsed and mixed in one pass, then the
+// slices summed into the mixes, split and normed collapse ──
+
+/// kernels/hc_v2_mix.metal at `p.pro`: x2 (the tail), the raw collapse and each slice's partial dots and squares.
+const HcV2Mix = struct {
+    pub const Params = struct { pro: hv2.Pro };
+
+    fn mixes(p: Params) bool {
+        return p.pro != .tail_only;
+    }
+    fn expands(p: Params) usize {
+        return switch (p.pro) {
+            .plain => 0,
+            .ffn => 1,
+            .tail, .tail_only => 2,
+        };
+    }
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n != hv2.D) return null;
+        const S = hv2.slicesFor(s.rows);
+        var g = metal.Geometry{ .grid = .{ ci((s.rows + hv2.ROWS - 1) / hv2.ROWS * 256), ci(S), 1 }, .tg = .{ 256, 1, 1 } };
+        if (expands(p) == 2) g.out(&.{ ci(s.rows), HC, ci(s.n) }, act);
+        if (mixes(p)) {
+            g.out(&.{ ci(s.rows), ci(s.n) }, act);
+            g.out(&.{ ci(S), ci(s.rows), hv2.PW }, .float32);
+        }
+        g.dtype("T", act);
+        g.int("D", s.n);
+        g.int("S", S);
+        return g;
+    }
+
+    /// The inputs in the wrapper's order: x, then y / post / comb (and y2 / post2 / comb2), then cpre and packed fn.
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const L = k.shape.rows;
+        const D = k.shape.n;
+        const x = try k.add(act, &.{ L, HC, D });
+        kit.uniform(rng, x, -3, 3);
+        if (f == .nonfinite) kit.plantRows(x, L, HC * D);
+        for (0..expands(k.p)) |_| {
+            const y = try k.add(act, &.{ L, D });
+            const post = try k.add(.float32, &.{ L, HC });
+            const comb = try k.add(.float32, &.{ L, HC, HC });
+            kit.uniform(rng, y, -3, 3);
+            kit.uniform(rng, post, 0, 2);
+            kit.uniform(rng, comb, 0, 0.5);
+        }
+        if (!mixes(k.p)) return;
+        const cpre = try k.add(.float32, &.{ L, HC });
+        kit.uniform(rng, cpre, 0, 1);
+        const fnp = try k.add(.float32, &.{hv2.N * hv2.MIX});
+        kit.uniform(rng, fnp, -0.02, 0.02);
+    }
+
+    fn rowsX(s: Shape) usize {
+        return s.rows * HC * s.n;
+    }
+    fn partCount(s: Shape) usize {
+        return hv2.slicesFor(s.rows) * s.rows * hv2.PW;
+    }
+
+    pub fn count(p: Params, s: Shape) usize {
+        var n: usize = 0;
+        if (expands(p) == 2) n += rowsX(s);
+        if (mixes(p)) n += rowsN(s) + partCount(s);
+        return n;
+    }
+
+    /// Row `l`'s formed stream into `st` [HC, D] (each expand rounded to `act`, the stored x2 left unrounded in
+    /// `last` for the output) and its terms' magnitudes into `sm`.
+    fn stream(k: anytype, l: usize, st: []f64, sm: []f64, last: []f64) void {
+        const D = k.shape.n;
+        const x = k.in(0);
+        for (0..HC) |i| for (0..D) |d| {
+            st[i * D + d] = x[(l * HC + i) * D + d];
+            sm[i * D + d] = @abs(st[i * D + d]);
+        };
+        var t: [HC]f64 = undefined;
+        for (0..expands(k.p)) |e| {
+            const y = k.in(1 + 3 * e);
+            const post = k.in(2 + 3 * e);
+            const comb = k.in(3 + 3 * e);
+            for (0..D) |d| {
+                for (0..HC) |j| t[j] = st[j * D + d];
+                for (0..HC) |i| {
+                    var v = post[l * HC + i] * y[l * D + d];
+                    var m = @abs(v);
+                    for (0..HC) |j| {
+                        v += comb[(l * HC + j) * HC + i] * t[j];
+                        m += @abs(comb[(l * HC + j) * HC + i]) * sm[j * D + d];
+                    }
+                    if (e + 1 == expands(k.p)) last[i * D + d] = v;
+                    st[i * D + d] = bf(v);
+                    sm[i * D + d] = m;
+                }
+            }
+        }
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const L = k.shape.rows;
+        const D = k.shape.n;
+        const S = hv2.slicesFor(L);
+        const DS = D / S;
+        const a = k.scratch();
+        const st = try a.alloc(f64, 3 * HC * D);
+        defer a.free(st);
+        const sm = st[HC * D ..][0 .. HC * D];
+        const last = st[2 * HC * D ..][0 .. HC * D];
+        var off: usize = 0;
+        const xo = off;
+        if (expands(k.p) == 2) off += rowsX(k.shape);
+        const ho = off;
+        const po = off + rowsN(k.shape);
+        // fn in its natural [MIX, N] order, from the packed input.
+        var fnw: []f64 = &.{};
+        if (mixes(k.p)) {
+            fnw = try a.alloc(f64, hv2.N * hv2.MIX);
+            const fp = k.in(k.n_in - 1);
+            for (0..D / hv2.DC) |s0| for (0..hv2.FSTEP) |q| {
+                fnw[hv2.packAt(s0, q)] = fp[s0 * hv2.FSTEP + q];
+            };
+        }
+        defer if (fnw.len > 0) a.free(fnw);
+        const terms = try a.alloc(f64, 2 * HC * DS);
+        defer a.free(terms);
+        const hb = try a.alloc(f64, 2 * D);
+        defer a.free(hb);
+        for (0..L) |l| {
+            stream(k, l, st[0 .. HC * D], sm, last);
+            if (expands(k.p) == 2) for (0..HC * D) |q| {
+                out[xo + l * HC * D + q] = last[q];
+                mag[xo + l * HC * D + q] = sm[q];
+            };
+            if (!mixes(k.p)) continue;
+            const cpre = k.in(k.n_in - 2);
+            for (0..D) |d| {
+                var h: f64 = 0;
+                var m: f64 = 0;
+                for (0..HC) |i| {
+                    h += cpre[l * HC + i] * st[i * D + d];
+                    m += @abs(cpre[l * HC + i]) * sm[i * D + d];
+                }
+                out[ho + l * D + d] = h;
+                mag[ho + l * D + d] = m;
+                hb[d] = bf(h);
+            }
+            for (0..S) |sl| {
+                const base = po + (sl * L + l) * hv2.PW;
+                for (0..hv2.MIX) |mx| {
+                    var n: usize = 0;
+                    var mg: f64 = 0;
+                    for (0..HC) |i| for (sl * DS..(sl + 1) * DS) |d| {
+                        const v = st[i * D + d] * fnw[mx * hv2.N + i * D + d];
+                        terms[n] = v;
+                        n += 1;
+                        mg += @abs(v);
+                    };
+                    out[base + mx] = sum.of(terms[0..n]);
+                    mag[base + mx] = mg;
+                }
+                var n: usize = 0;
+                for (0..HC) |i| for (sl * DS..(sl + 1) * DS) |d| {
+                    terms[n] = st[i * D + d] * st[i * D + d];
+                    n += 1;
+                };
+                out[base + hv2.MIX] = sum.of(terms[0..n]);
+                mag[base + hv2.MIX] = out[base + hv2.MIX];
+                for (sl * DS..(sl + 1) * DS, 0..) |d, q| terms[q] = hb[d] * hb[d];
+                out[base + hv2.MIX + 1] = sum.of(terms[0..DS]);
+                mag[base + hv2.MIX + 1] = out[base + hv2.MIX + 1];
+            }
+        }
+    }
+};
+
+/// kernels/hc_v2_fin.metal: the slices' partials into the mixes, the split and the normed collapse.
+const HcV2Fin = struct {
+    pub const Params = struct {};
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n != hv2.D) return null;
+        var g = metal.Geometry{ .grid = .{ hv2.FIN_TG, ci(s.rows), 1 }, .tg = .{ hv2.FIN_TG, 1, 1 } };
+        g.out(&.{ ci(s.rows), MIX }, .float32);
+        g.out(&.{ ci(s.rows), HC }, .float32);
+        g.out(&.{ ci(s.rows), HC }, .float32);
+        g.out(&.{ ci(s.rows), HC, HC }, .float32);
+        g.out(&.{ ci(s.rows), ci(s.n) }, act);
+        g.dtype("T", act);
+        g.int("D", s.n);
+        g.int("S", hv2.slicesFor(s.rows));
+        g.int("HC", HC);
+        g.int("ITERS", ITERS);
+        g.int("TG", hv2.FIN_TG);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const L = k.shape.rows;
+        const D = k.shape.n;
+        const S = hv2.slicesFor(L);
+        const part = try k.add(.float32, &.{ S, L, hv2.PW });
+        const hraw = try k.add(act, &.{ L, D });
+        const scale = try k.add(.float32, &.{MIX});
+        const base = try k.add(.float32, &.{MIX});
+        const w = try k.add(act, &.{D});
+        const eps = try k.add(.float32, &.{2});
+        kit.uniform(rng, hraw, -3, 3);
+        kit.uniform(rng, scale, 0.5, 1.5);
+        kit.uniform(rng, base, -0.5, 0.5);
+        kit.uniform(rng, w, 0.5, 1.5);
+        eps[0] = EPS_RMS;
+        eps[1] = EPS_HC;
+        // Each slice's dots about its share of an O(1) mix, its squares its share of the row's.
+        for (0..S) |sl| for (0..L) |l| {
+            const o = (sl * L + l) * hv2.PW;
+            kit.uniform(rng, part[o..][0..MIX], -2, 2);
+            part[o + MIX] = (2 + 4 * rng.float(f64)) * @as(f64, @floatFromInt(HC * D / S));
+            var hs: f64 = 0;
+            for (sl * (D / S)..(sl + 1) * (D / S)) |d| hs += bf(hraw[l * D + d]) * bf(hraw[l * D + d]);
+            part[o + MIX + 1] = hs;
+        };
+        if (f == .nonfinite) {
+            kit.plantRows(part, S * L, hv2.PW);
+            kit.plantRows(hraw, L, D);
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return rowsSplit(s) + s.rows * s.n;
+    }
+    fn rowsSplit(s: Shape) usize {
+        return s.rows * (MIX + 2 * HC + HC * HC);
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const L = k.shape.rows;
+        const D = k.shape.n;
+        const S = hv2.slicesFor(L);
+        const part = k.in(0);
+        const hraw = k.in(1);
+        const scale = k.in(2);
+        const base = k.in(3);
+        const w = k.in(4);
+        const eps0 = spec.roundTo(.f32, k.in(5)[0]);
+        var t: [64]f64 = undefined;
+        var pk: [2 * HC + HC * HC]f64 = undefined;
+        var zr: [MIX]f64 = undefined;
+        const ho = L * (MIX + 2 * HC + HC * HC);
+        for (0..L) |l| {
+            for (0..S) |sl| t[sl] = part[(sl * L + l) * hv2.PW + MIX];
+            const rr = 1 / @sqrt(sum.of(t[0..S]) / @as(f64, @floatFromInt(HC * D)) + eps0);
+            for (0..MIX) |m| {
+                var mg: f64 = 0;
+                for (0..S) |sl| {
+                    t[sl] = part[(sl * L + l) * hv2.PW + m];
+                    mg += @abs(t[sl]);
+                }
+                const y = sum.of(t[0..S]) * rr * scale[m];
+                zr[m] = y + base[m];
+                out[l * MIX + m] = zr[m];
+                mag[l * MIX + m] = mg * @abs(rr * scale[m]) + @abs(y) / 2;
+            }
+            splitRow(&zr, spec.roundTo(.f32, EPS_HC), sum, &pk);
+            const po = L * MIX;
+            for (0..HC) |j| {
+                out[po + l * HC + j] = pk[j];
+                out[po + L * HC + l * HC + j] = pk[HC + j];
+            }
+            for (0..HC * HC) |q| out[po + 2 * L * HC + l * HC * HC + q] = pk[2 * HC + q];
+            for (0..S) |sl| t[sl] = part[(sl * L + l) * hv2.PW + MIX + 1];
+            const inv = 1 / @sqrt(sum.of(t[0..S]) / @as(f64, @floatFromInt(D)) + eps0);
+            for (0..D) |d| {
+                out[ho + l * D + d] = w[d] * bf(hraw[l * D + d] * inv);
+                mag[ho + l * D + d] = @abs(out[ho + l * D + d]);
+            }
+        }
+        for (L * MIX..ho) |i| mag[i] = @abs(out[i]);
     }
 };
 
@@ -4142,6 +4425,11 @@ const markov_final_l = launch("dsv41_markov_final", &.{ "parts", "t1", "hout", "
 const flash_l = metal.Launch{ .name = "dsv41_attn_flash", .inputs = &v41.GatherAttn.FLASH_INS, .outputs = &.{"o"}, .source = fa.source, .header = @import("decode/attn.zig").HEADER, .tg_bytes = 4 * 2 * 128 + 4 * 2 * 4 * 4 * 16 + 2 * 4 * 8 * 256, .offline = false, .min_gen = 17 };
 const gather_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 } };
 const qk_t_l = metal.Launch{ .name = "dsv41_attn_qk_t", .inputs = &.{ "q", "kw", "comp", "picks", "meta", "qt" }, .outputs = &.{"s"}, .source = qtail.attn_qk_t_source, .header = v41.MPP_HEADER, .tg_bytes = 2 * 64 * 64 * 2, .offline = false, .min_gen = 17 };
+fn hcV2MixLaunch(comptime p: hv2.Pro) metal.Launch {
+    return .{ .name = hv2.name(p), .inputs = hv2.ins(p), .outputs = hv2.outs(p), .source = hv2.mix_source, .header = hv2.header(p), .tg_bytes = if (p == .tail_only) 0 else 4 * hv2.FSTEP };
+}
+const hc_v2_mix_l = [4]metal.Launch{ hcV2MixLaunch(.plain), hcV2MixLaunch(.ffn), hcV2MixLaunch(.tail), hcV2MixLaunch(.tail_only) };
+const hc_v2_fin_l = launch("dsv41_hc_v2_fin", &hv2.fin_ins, &hv2.fin_outs, hv2.fin_source, "", 0, 1024, false);
 const mix_norm_l = launch("dsv41_hc_mix_norm", &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, &.{ "z", "h_out", "h2" }, hcf.mix_norm_source, "", 4 * (4 * 6 + 4) * 32, 1024, true);
 /// The wide mixes at 8 rows a threadgroup (`MLX_SERVE_DSV41_HC_MIX8`), served on NAX GPUs only.
 const mix8_l = metal.Launch{ .name = "dsv41_hc_mix", .inputs = &.{ "x", "fn", "scale", "base", "eps" }, .outputs = &.{"z"}, .source = v41.HC_MIX_SOURCE, .header = "", .tg_bytes = 4 * (8 * 6 + 8) * 32, .adapts = true, .min_gen = 17 };
@@ -4696,6 +4984,30 @@ fn registerStreamed(set: *kc.Set) !void {
         .sums = fused_sums,
     });
     const mix_norm_served: []const Shape = &.{ .{ .rows = 17, .n = DIM, .k = HC * DIM }, .{ .rows = 64, .n = DIM, .k = HC * DIM } };
+    const hc_v2_served: []const Shape = &.{ .{ .rows = 17, .n = DIM, .k = HC * DIM }, .{ .rows = 130, .n = DIM, .k = HC * DIM } };
+    inline for (.{ hv2.Pro.plain, hv2.Pro.ffn, hv2.Pro.tail, hv2.Pro.tail_only }) |p| try kit.add(set, HcV2Mix, &hc_v2_mix_l[@intFromEnum(p)], .{ .pro = p }, .{
+        .name = "dsv41 hc_v2_mix (" ++ @tagName(p) ++ ": stream rows formed, collapsed and mixed in one pass)",
+        .accum = .f32,
+        .depth = depthK,
+        .ops = 4,
+        .mids = 3,
+        .out = .bf16,
+        .outs = if (p == .tail) &.{ .{ .elem = .bf16, .count = HcV2Mix.rowsX }, .{ .elem = .bf16, .count = rowsN }, .{ .elem = .f32, .count = HcV2Mix.partCount } } else if (p == .tail_only) &.{} else &.{ .{ .elem = .bf16, .count = rowsN }, .{ .elem = .f32, .count = HcV2Mix.partCount } },
+        .tiles = .{ .{ .size = hv2.ROWS }, .{}, .{} },
+        .served = hc_v2_served,
+        .sums = fused_sums,
+    });
+    try kit.add(set, HcV2Fin, &hc_v2_fin_l, .{}, .{
+        .name = "dsv41 hc_v2_fin (slices into the mixes, the split and the normed collapse)",
+        .accum = .f32,
+        .depth = depthHc,
+        .ops = sinkhorn_ops + 8,
+        .mids = 1,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .f32, .count = HcV2Fin.rowsSplit }, .{ .elem = .bf16, .count = rowsN } },
+        .served = hc_v2_served,
+        .sums = short_sums,
+    });
     inline for (.{ true, false }) |h2| try kit.add(set, HcMixNorm, &mix_norm_l, .{ .h2 = h2 }, .{
         .name = if (h2) "dsv41 hc_mix_norm (mixes + normed collapse, twice)" else "dsv41 hc_mix_norm (mixes + normed collapse)",
         .accum = .f32,
@@ -4920,6 +5232,22 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
             try mlx.check(mlx.mlx_array_eval(f.carrier));
             try Expect.same(r.c, r.bytes, &.{ f.h, dst });
         } else try Expect.same(r.c, r.bytes, &.{ f.h, f.x1 });
+    }
+    inline for (.{ hv2.Pro.plain, hv2.Pro.ffn, hv2.Pro.tail, hv2.Pro.tail_only }) |p| {
+        const r = try ours(HcV2Mix, a, &hc_v2_mix_l[@intFromEnum(p)], .{ .pro = p }, .{ .rows = 70, .n = DIM, .k = HC * DIM });
+        const o = try hv2.mixLaunch(&sc, p, r.c.args[0..r.c.n_in], 70, hv2.slicesFor(70));
+        const n: usize = switch (p) {
+            .plain, .ffn => 2,
+            .tail => 3,
+            .tail_only => 1,
+        };
+        try Expect.same(r.c, r.bytes, o[0..n]);
+    }
+    {
+        const r = try ours(HcV2Fin, a, &hc_v2_fin_l, .{}, .{ .rows = 70, .n = DIM, .k = HC * DIM });
+        const hc: v41.Hc = .{ .fn_w = none, .scale = r.c.args[2], .base = r.c.args[3] };
+        const f = try hv2.finLaunch(&sc, r.c.args[0], r.c.args[1], &hc, r.c.args[4], r.c.args[5], hv2.slicesFor(70), ITERS);
+        try Expect.same(r.c, r.bytes, &.{ f.z, f.n.sp.pre, f.n.sp.post, f.n.sp.comb, f.n.h });
     }
     {
         const r = try ours(ExpandInto, a, &expand_into_l, .{}, .{ .rows = 6, .n = 300, .k = HC });
