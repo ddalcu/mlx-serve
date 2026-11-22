@@ -37,8 +37,7 @@ pub const Ctx = struct {
 };
 
 pub fn on() bool {
-    const v = env.get(.MLX_SERVE_DSV41_ENGRAM_GPU_IDS) orelse return false;
-    return v[0] == '1';
+    return env.onUnlessZero(.MLX_SERVE_DSV41_ENGRAM_GPU_IDS);
 }
 
 /// The constants of `hs` over `map` (`Dsv41Model.token_map`).
