@@ -1624,6 +1624,8 @@ Defect: Inkling 2's agent run on an M5 re-prefilled its whole ~100k-token contex
 `sliding ring holds rows from ...; match ... falls behind them`. Cause: the native drafter's round kept every draft
 the trunk agreed with, a stop token and a draft after it included; the decode-end entry then held tokens the
 conversation never contains, the next prompt matched one or two short of its end, and the nearest checkpoint below
-that sat behind the sliding ring. Fix: the engine hands a round the request's stop ids (`Forward.stop_ids`) and the
-drafter verifies nothing after one (`draftsToVerify`). Guards: `plugin native drafter: a round is handed the
-request's stop ids`, `inkling2 draft: a round proposes no draft after a stop`.
+that sat behind the sliding ring. A kept stop alone still left the live state one row past the committed length,
+which `rollbackSsmTo` cannot undo after a drafted round, so no decode-end entry was written. Fix: the engine hands a
+round the request's stop ids (`Forward.stop_ids`) and the drafter never verifies one (`draftsToVerify`): the trunk's
+token carries the stop. Guards: `plugin native drafter: a round is handed the request's stop ids`, `inkling2 draft: a
+round never verifies a stop`.

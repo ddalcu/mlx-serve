@@ -605,9 +605,9 @@ pub const Forward = extern struct {
     /// arrives as `Mode.decode`. False on decode steps and verify blocks. Read it only when `size` reaches it: an older
     /// host's `Forward` ends before it.
     prefill: bool = false,
-    /// A native drafter's round (`NativeDrafter.step`, `verify`): the request's stop ids. A draft after one is never
-    /// the conversation's, and a state that kept it is one the prefix cache cannot restore. Read it only when `size`
-    /// reaches it.
+    /// A native drafter's round (`NativeDrafter.step`, `verify`): the request's stop ids. A round that verifies one
+    /// leaves the state past what the request commits, which the prefix cache cannot restore. Read it only when
+    /// `size` reaches it.
     stop_ids: Span(u32) = .{},
 };
 

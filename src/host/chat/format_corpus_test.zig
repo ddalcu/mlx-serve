@@ -1621,6 +1621,14 @@ const corpus = [_]Expect{
         .content_exact = "",
     },
     .{
+        .family = "inkling",
+        .name = "a reply cut after its message opener and a newline ships no marker",
+        .raw = "<|message_model|>\n",
+        .tools_json = bash_tool_schema,
+        .thinking = true,
+        .content_exact = "",
+    },
+    .{
         // Truncation salvage: the cut landed inside an argument VALUE — the
         // call keeps its NAME and ships `{}`, never a fragment.
         .family = "inkling",

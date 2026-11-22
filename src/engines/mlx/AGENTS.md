@@ -130,8 +130,8 @@ Spec decode:
 - **A capture gate is a promise the forward must keep**: `supportsLayerCapture` said yes while `forwardGlm5With` ignored `capture_layers`, and the first DFlash prefill crashed on an unfilled slot. An arch that passes the gate fills every slot (GLM taps the MEAN of its hyper-connection streams); `dflash.encodeContext` names an unfilled one (`DflashCaptureMissing`). Guard: `glm5_next DFlash capture`.
 - **A stalled round is not what a round costs** (`Drafting.record` bounds a round at twice the rounds before it): one round that waited on a kernel's first compile owed hundreds of plain ticks, and DeepSeek-V4.1's first request after an install wrote code at serial speed.
 - **A sparse target's DFlash is policy-driven** (`engines/mlx/spec/dflash/policy.zig`, GLM): rows follow the selector's calibrated confidence, plain ticks ride the serial pipeline with their taps parked (`dflash_pending`), and the plain cost is the REQUEST's own tick interval — the shared round-cost table's plain cell ran stale-high and the policy never stepped back.
-- **A native drafter's round is handed the request's stop ids and drafts nothing after one** (`Forward.stop_ids`): a kept row past the
-  stop left a decode-end state no next prompt matches, and an Inkling 2 agent re-prefilled its whole context every few turns.
+- **A native drafter's round is handed the request's stop ids and never verifies one** (`Forward.stop_ids`): the trunk's own
+  token carries the stop, as in serial decode; a kept stop row left no decode-end entry, and an agent re-prefilled its context.
 - **A block decoder checks its ENTRY token first** (`generate.tokenStops`, all five); only an ALL-pad generation declines commit (`commitDeclinesPadOnly`); a cancel mid batched tick still RECORDS the row (`batchedTickAction`).
 - **The token budget is a PRE-COMMIT invariant in every block decoder**; blocks publish through ONE `+= 1` loop.
 - **A spec path that refuses a KV scheme must be gated at LOAD, or implemented**: `compactRows` refused quantized KV mid-decode, so a draft tree under `--kv-quant 8` 500'd the second request. Guard: smoke `drafter_kv8`.

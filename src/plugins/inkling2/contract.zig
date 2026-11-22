@@ -14,6 +14,7 @@ const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const source = @import("../../mlx/kernels.zig").source;
 const kernels = @import("kernels.zig");
 const layers = @import("layers.zig");
+const config = @import("config.zig");
 const attn = @import("../../sdk/blocks/attention/contract.zig");
 
 const spec = kc.spec;
@@ -2298,6 +2299,291 @@ fn none(_: Shape) usize {
     return 0;
 }
 
+const router_launch = metal.Launch{ .name = "msv_inkling2_router", .inputs = &.{ "X", "RT" }, .outputs = &.{"SC"}, .source = source("plugins/inkling2/kernels/router.metal"), .tg_bytes = 0, .m1 = 1024, .m2 = 1024 };
+
+/// The widest stream a router row reads here.
+const ROUTER_MAX_D = 4096;
+
+/// A few rows' router logits: rows x experts x hidden, f32 throughout (`kernels.routerRows`).
+const Router = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch = &router_launch,
+    arena: std.heap.ArenaAllocator,
+    shape: Shape = undefined,
+    /// `x` `[S, D]`, `rt` `[E, D]`.
+    x: []f64 = &.{},
+    rt: []f64 = &.{},
+    args: [2]mlx.mlx_array = undefined,
+
+    fn init(al: std.mem.Allocator) Router {
+        return .{ .rig = metal.Rig.init(al), .arena = .init(al) };
+    }
+
+    pub fn deinit(self: *Router) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    pub fn geometry(_: *const Router, shape: Shape) ?metal.Geometry {
+        if (shape.rows == 0 or shape.n == 0 or shape.k == 0 or shape.k > ROUTER_MAX_D) return null;
+        var geo = metal.Geometry{ .grid = .{ @intCast(32 * shape.n), @intCast(shape.rows), 1 }, .tg = .{ 32, 1, 1 } };
+        geo.out(&.{ @intCast(shape.rows), @intCast(shape.n) }, .float32);
+        geo.int("D", shape.k);
+        geo.int("E", shape.n);
+        return geo;
+    }
+
+    pub fn prepare(self: *Router, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const al = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const d = shape.k;
+        self.x = try spread(al, rng, shape.rows * d, .f32);
+        self.rt = try spread(al, rng, shape.n * d, .f32);
+        switch (fill) {
+            .random => {},
+            // In the router's rows, which every row of the stream reads.
+            .nonfinite => plant(self.rt, d),
+            // Gate 4: a stream of ones over rows of 1, then 2^-12s, then -1: fp32 adds every small one, a half or
+            // bf16 sum drops those it meets beside the 1.
+            .stress => {
+                @memset(self.x, 1);
+                for (self.rt, 0..) |*v, i| v.* = if (i % d == 0) 1 else if (i % d == d - 1) -1 else 0x1p-12;
+            },
+        }
+        self.rig.reset();
+        self.args = .{
+            try self.rig.input(.float32, &.{ 1, @intCast(shape.rows), @intCast(d) }, self.x),
+            try self.rig.input(.float32, &.{ @intCast(shape.n), @intCast(d) }, self.rt),
+        };
+        return true;
+    }
+
+    pub fn run(self: *Router) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Router) usize {
+        return self.shape.rows * self.shape.n;
+    }
+
+    /// Output `o`'s products, row by expert.
+    fn products(self: *const Router, o: usize, out: []f64) void {
+        const d = self.shape.k;
+        const xr = self.x[(o / self.shape.n) * d ..][0..d];
+        const wr = self.rt[(o % self.shape.n) * d ..][0..d];
+        for (out, xr, wr) |*t, p, q| t.* = p * q;
+    }
+
+    pub fn reference(self: *const Router, want: []f64, mag: []f64) !void {
+        var t: [ROUTER_MAX_D]f64 = undefined;
+        const terms = t[0..self.shape.k];
+        for (want, mag, 0..) |*w, *m, o| {
+            self.products(o, terms);
+            var sum: f64 = 0;
+            var abs: f64 = 0;
+            for (terms) |v| {
+                sum += v;
+                abs += @abs(v);
+            }
+            w.* = sum;
+            m.* = if (std.math.isFinite(abs)) abs else 0;
+        }
+    }
+
+    pub fn simulate(self: *const Router, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+        var t: [ROUTER_MAX_D]f64 = undefined;
+        const terms = t[0..self.shape.k];
+        for (out, 0..) |*o, i| {
+            self.products(i, terms);
+            o.* = spec.sumIn(acc, order, terms);
+        }
+    }
+
+    fn wrapper(self: *Router) ![]const u8 {
+        var g = ops.Graph.init(self.rig.a, self.rig.stream());
+        defer g.deinit();
+        return self.rig.bytesOf(&.{try kernels.routerRows(&g, self.args[0], self.args[1])});
+    }
+};
+
+fn routerDepth(shape: Shape) usize {
+    return shape.k;
+}
+
+const norm_launch = metal.Launch{ .name = "msv_inkling2_norm", .inputs = &.{ "Y", "NW0", "NW1", "NW2", "RT", "PR" }, .outputs = &.{ "X", "SCORES" }, .source = source("plugins/inkling2/kernels/norm.metal"), .tg_bytes = 4 * (768 / 32) * 3, .m1 = 1024, .m2 = 1024, .adapts = true };
+
+/// The model's norm epsilon, as the kernel reads it.
+const NORM_EPS: f32 = 1e-6;
+
+fn sum64(x: []const f64) f64 {
+    var t: f64 = 0;
+    for (x) |v| t += v;
+    return t;
+}
+
+/// The visit's weighted RMS norms (`kernels.norm`): a later pass's three attention inputs, or the MLP input with the
+/// router's scores over it; rows x streams x hidden.
+fn Norm(comptime dt: mlx.mlx_dtype, comptime routed: bool) type {
+    return struct {
+        const Self = @This();
+        const J: usize = if (routed) 1 else 3;
+        const E: usize = if (routed) EXPERTS else 0;
+        rig: metal.Rig,
+        launch: *const metal.Launch = &norm_launch,
+        arena: std.heap.ArenaAllocator,
+        shape: Shape = undefined,
+        /// `y` `[J, S, D]`, `nw` `[D]` each, `rt` `[E, D]`.
+        y: []f64 = &.{},
+        nw: [3][]f64 = undefined,
+        rt: []f64 = &.{},
+        args: [6]mlx.mlx_array = undefined,
+
+        fn init(al: std.mem.Allocator) Self {
+            return .{ .rig = metal.Rig.init(al), .arena = .init(al) };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.rig.deinit();
+            self.arena.deinit();
+        }
+
+        pub fn geometry(_: *const Self, shape: Shape) ?metal.Geometry {
+            if (shape.rows == 0 or shape.n != J or shape.k == 0) return null;
+            const tg = kernels.streamGroup(@intCast(shape.k)) orelse return null;
+            const d: c_int = @intCast(shape.k);
+            const extra: c_int = if (routed) @divTrunc(@as(c_int, E) * 32 + tg - 1, tg) * tg else 0;
+            var geo = metal.Geometry{ .grid = .{ d + extra, @intCast(shape.rows), 1 }, .tg = .{ tg, 1, 1 } };
+            geo.out(&.{ @intCast(J), @intCast(shape.rows), d }, dt);
+            if (routed) geo.out(&.{ @intCast(shape.rows), @intCast(E) }, .float32) else {
+                geo.out(&.{1}, .float32);
+                geo.unread = 0b10;
+            }
+            geo.dtype("T", dt);
+            geo.int("TG", tg);
+            geo.int("D", d);
+            geo.int("J", @as(c_int, J));
+            geo.int("E", @as(c_int, E));
+            return geo;
+        }
+
+        pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+            if (self.geometry(shape) == null) return false;
+            self.shape = shape;
+            _ = self.arena.reset(.retain_capacity);
+            const al = self.arena.allocator();
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rng = prng.random();
+            const d = shape.k;
+            self.y = try spread(al, rng, J * shape.rows * d, .f32);
+            for (&self.nw) |*w| w.* = try spread(al, rng, d, elemOf(dt));
+            self.rt = try spread(al, rng, E * d, .f32);
+            switch (fill) {
+                .random => {},
+                .nonfinite => plant(self.y, d),
+                // Gate 4: the sums of squares over integers (exact in fp32, past fp16's range); weights of one and a
+                // router of zeros, so only those sums can miss.
+                .stress => {
+                    for (self.y) |*v| v.* = @floatFromInt(@as(i32, @intCast(rng.uintLessThan(u32, 65))) - 32);
+                    for (self.nw) |w| @memset(w, 1);
+                    @memset(self.rt, 0);
+                },
+            }
+            self.rig.reset();
+            const dd: c_int = @intCast(d);
+            const y = try self.rig.input(.float32, &.{ @intCast(J), @intCast(shape.rows), dd }, self.y);
+            self.args = .{
+                y,
+                try self.rig.input(dt, &.{dd}, self.nw[0]),
+                try self.rig.input(dt, &.{dd}, self.nw[1]),
+                try self.rig.input(dt, &.{dd}, self.nw[2]),
+                if (routed) try self.rig.input(.float32, &.{ @intCast(E), dd }, self.rt) else y,
+                try self.rig.input(.float32, &.{1}, &.{@as(f64, NORM_EPS)}),
+            };
+            return true;
+        }
+
+        pub fn run(self: *Self) !void {
+            try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+        }
+
+        pub fn count(self: *const Self) usize {
+            return (J * self.shape.k + E) * self.shape.rows;
+        }
+
+        /// Every output: float64 (`acc` null) or with the sums run in `acc` in `order` (gate 4).
+        fn outputsIn(self: *const Self, want: []f64, mag: ?[]f64, acc: ?spec.Accum, order: spec.Order) !void {
+            const s = self.shape.rows;
+            const d = self.shape.k;
+            const nx = J * s * d;
+            const a = self.arena.child_allocator;
+            const sq = try a.alloc(f64, d);
+            defer a.free(sq);
+            const normed = try a.alloc(f64, d);
+            defer a.free(normed);
+            const terms = try a.alloc(f64, d);
+            defer a.free(terms);
+            for (0..J) |j| for (0..s) |r| {
+                const row = self.y[(j * s + r) * d ..][0..d];
+                for (sq, row) |*q, v| q.* = v * v;
+                const ss = if (acc) |ac| spec.sumIn(ac, order, sq) else sum64(sq);
+                const inv = 1 / @sqrt(ss / @as(f64, @floatFromInt(d)) + @as(f64, NORM_EPS));
+                for (want[(j * s + r) * d ..][0..d], row, self.nw[j]) |*o, v, w| o.* = v * inv * w;
+                if (!routed or j != 0) continue;
+                // The router reads the normed row as the stream holds it.
+                for (normed, row, self.nw[0]) |*n, v, w| n.* = spec.roundTo(elemOf(dt), v * inv * w);
+                for (0..E) |ex| {
+                    for (terms, normed, self.rt[ex * d ..][0..d]) |*t, n, q| t.* = n * q;
+                    want[nx + r * E + ex] = if (acc) |ac| spec.sumIn(ac, order, terms) else sum64(terms);
+                    if (mag) |m| {
+                        var abs: f64 = 0;
+                        for (terms) |t| abs += @abs(t);
+                        m[nx + r * E + ex] = if (std.math.isFinite(abs)) abs else 0;
+                    }
+                }
+            };
+            if (mag) |m| for (m[0..nx], want[0..nx]) |*o, w| {
+                o.* = @abs(w) / 2;
+            };
+        }
+
+        pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+            try self.outputsIn(want, mag, null, .sequential);
+        }
+
+        pub fn simulate(self: *const Self, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+            try self.outputsIn(out, null, acc, order);
+        }
+
+        fn wrapper(self: *Self) ![]const u8 {
+            var g = ops.Graph.init(self.rig.a, self.rig.stream());
+            defer g.deinit();
+            var cfg: config.Config = undefined;
+            cfg.hidden_size = @intCast(self.shape.k);
+            cfg.num_experts = @intCast(EXPERTS);
+            cfg.rms_norm_eps = NORM_EPS;
+            const x = self.args;
+            const o = try kernels.norm(&g, &cfg, x[0], .{ x[1], x[2], x[3] }, @intCast(J), dt, if (routed) x[4] else null);
+            return self.rig.bytesOf(if (routed) &.{ o[0], o[1] } else &.{o[0]});
+        }
+    };
+}
+
+fn normsOf(shape: Shape) usize {
+    return shape.n * shape.rows * shape.k;
+}
+
+fn scoresOf(shape: Shape) usize {
+    return shape.rows * EXPERTS;
+}
+
+fn rowLength(shape: Shape) usize {
+    return shape.k;
+}
+
 const dtypes = [_]mlx.mlx_dtype{ .bfloat16, .float32 };
 
 fn name(comptime what: []const u8, comptime dt: mlx.mlx_dtype) []const u8 {
@@ -2468,6 +2754,40 @@ pub fn register(set: *kc.Set) !void {
         .served = &.{ .{ .rows = 3, .n = 1, .k = 2304 }, .{ .rows = 1, .n = 1, .k = 2304 } },
         .sums = .{ .f16 = 16, .exact = false, .why = "a half sum drops only the few small terms it meets beside the one" },
     }, null);
+    try set.add(Router, .init(set.a), .{
+        .name = "inkling2 router (few rows, f32)",
+        .accum = .f32,
+        .depth = routerDepth,
+        // Each product.
+        .ops = 1,
+        .out = .f32,
+        // A draft verify's rows, two rows and `small_rows`, over the model's experts.
+        .served = &.{ .{ .rows = 8, .n = EXPERTS, .k = 2304 }, .{ .rows = 2, .n = EXPERTS, .k = 2304 }, .{ .rows = kernels.small_rows, .n = EXPERTS, .k = 2304 } },
+    }, null);
+    inline for (dtypes) |dt| {
+        try set.add(Norm(dt, false), .init(set.a), .{
+            .name = name("inkling2 norm (three streams)", dt),
+            .accum = .f32,
+            .depth = rowLength,
+            // f32 roundings after the sum: the mean, + eps, rsqrt (2), the products with the row and the weight.
+            .ops = 6,
+            .out = elemOf(dt),
+            // A later pass's attention inputs: one row, a draft verify, a prompt chunk.
+            .served = &.{ .{ .rows = 1, .n = 3, .k = 2304 }, .{ .rows = 8, .n = 3, .k = 2304 }, .{ .rows = 512, .n = 3, .k = 2304 } },
+            .sums = .{ .f16 = 32, .bf16 = 0, .why = "positive squares: a pairwise bf16 sum stays near the output's rounding" },
+        }, null);
+        try set.add(Norm(dt, true), .init(set.a), .{
+            .name = name("inkling2 norm (MLP input + router)", dt),
+            .accum = .f32,
+            .depth = rowLength,
+            .ops = 6,
+            .out = elemOf(dt),
+            .outs = &.{ .{ .elem = comptime elemOf(dt), .count = normsOf }, .{ .elem = .f32, .count = scoresOf } },
+            // A later pass's MLP input with its router: one row, a draft verify, a prompt chunk.
+            .served = &.{ .{ .rows = 1, .n = 1, .k = 2304 }, .{ .rows = 8, .n = 1, .k = 2304 }, .{ .rows = 64, .n = 1, .k = 2304 } },
+            .sums = .{ .f16 = 32, .bf16 = 0, .why = "positive squares: a pairwise bf16 sum stays near the output's rounding" },
+        }, null);
+    }
     // Every affine width a pack's attention may carry at g64, 4-bit at g32 and g128, and the release's dense bf16.
     inline for (.{ 2, 3, 4, 5, 6, 8 }) |bits| try set.add(OProj, .init(set.a, bits, 64), oprojSpec(std.fmt.comptimePrint("inkling2 oproj bf16 ({d}-bit g64)", .{bits}), 64, .{}), null);
     try set.add(OProj, .init(set.a, 4, 32), oprojSpec("inkling2 oproj bf16 (4-bit g32)", 32, .{ .f16 = 40, .why = "stress codes under 16 in groups of 32: an fp16 sum misses by ~45x, short of 100x but far past fp32's exact sums" }), null);
@@ -2507,7 +2827,7 @@ test "kernel contract inkling2: each declared launch is the shipped wrapper's, b
             try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
         }
     };
-    inline for (.{ RelSplit, RelSplit, RelComb, RelSlots, MarkovRnn, MarkovFold, MarkovPick, Gate }) |T| {
+    inline for (.{ RelSplit, RelSplit, RelComb, RelSlots, MarkovRnn, MarkovFold, MarkovPick, Gate, Router, Norm(.bfloat16, false), Norm(.bfloat16, true), Norm(.float32, false), Norm(.float32, true) }) |T| {
         const k = set.kernels.items[at];
         at += 1;
         const p: *T = @ptrCast(@alignCast(k.ctx));

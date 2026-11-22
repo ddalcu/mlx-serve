@@ -400,7 +400,8 @@ fn openRound(m: *Loaded, f: *const abi.Forward) !Opened {
             m.row_cost.told = true;
             log.info("[inkling2] draft verify cut {d:.2} (a verified row {d:.2} of a plain step)\n", .{ min_sure, ratio });
         };
-        o.drafts = draftsToVerify(sure[0..cap], tokens[0..cap], min_sure, f.stop_ids.slice());
+        const stops: []const u32 = if (f.size >= @offsetOf(abi.Forward, "stop_ids") + @sizeOf(abi.Span(u32))) f.stop_ids.slice() else &.{};
+        o.drafts = draftsToVerify(sure[0..cap], tokens[0..cap], min_sure, stops);
         for (0..o.drafts) |k| o.ids[1 + k] = @intCast(tokens[k]);
         proposed = try g.sliceAxis(drafted.tokens, 0, 0, @intCast(o.drafts));
     }
@@ -425,11 +426,9 @@ fn openRound(m: *Loaded, f: *const abi.Forward) !Opened {
 fn draftsToVerify(sure: []const f32, tokens: []const i32, min_sure: f32, stops: []const u32) u32 {
     var run: f32 = 1;
     var n: u32 = 0;
-    while (n < sure.len) {
+    while (n < sure.len) : (n += 1) {
         run *= sure[n];
-        if (run < min_sure) break;
-        n += 1;
-        if (std.mem.indexOfScalar(u32, stops, @intCast(tokens[n - 1])) != null) break;
+        if (run < min_sure or std.mem.indexOfScalar(u32, stops, @intCast(tokens[n])) != null) break;
     }
     return n;
 }
@@ -1041,13 +1040,12 @@ test "inkling2: the bundled drafter loads on Apple9 and later only" {
     try std.testing.expect(!draftsOn(17, false));
 }
 
-// Bar: a round verifies drafts while their running probability clears the cut, and none after a stop id: a stop ends
-// the turn, so the state a row past it leaves is never the conversation's.
-test "inkling2 draft: a round proposes no draft after a stop" {
+// Bar: a round verifies drafts while their running probability clears the cut, never a stop: the trunk's token carries it.
+test "inkling2 draft: a round never verifies a stop" {
     const sure = [_]f32{ 0.99, 0.99, 0.99, 0.99 };
     const tokens = [_]i32{ 5, 9, 2, 8 };
     try std.testing.expectEqual(@as(u32, 4), draftsToVerify(&sure, &tokens, 0.5, &.{}));
-    try std.testing.expectEqual(@as(u32, 2), draftsToVerify(&sure, &tokens, 0.5, &.{ 70, 9 }));
-    try std.testing.expectEqual(@as(u32, 1), draftsToVerify(&sure, &tokens, 0.5, &.{5}));
+    try std.testing.expectEqual(@as(u32, 1), draftsToVerify(&sure, &tokens, 0.5, &.{ 70, 9 }));
+    try std.testing.expectEqual(@as(u32, 0), draftsToVerify(&sure, &tokens, 0.5, &.{5}));
     try std.testing.expectEqual(@as(u32, 2), draftsToVerify(&.{ 0.9, 0.6, 0.8, 0.9 }, &tokens, 0.5, &.{}));
 }

@@ -66,7 +66,7 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **One row's output gate rides the output projection** (`oGated`, `oproj.metal`): the launch it saves beats MLX's
   one-row qmv on this shape too. Affine at every width or dense (`oFormat`); anything else keeps `gated` + `projectRows`.
 - **The draft head** (`mtp.safetensors`, greedy and sampled requests): a round drafts 7 tokens,
-  verifies the prefix the drafter is sure of (`min_sure`, never past a stop id: `draftsToVerify`) as ONE forward that appends nothing (`kernels.Open`), and
+  verifies the prefix the drafter is sure of (`min_sure`, never a stop id: `draftsToVerify`) as ONE forward that appends nothing (`kernels.Open`), and
   commits the rows the trunk agrees with (`kernels.commit`): no rollback. Its taps are per engine slot (`Spec.select`).
 - **The draft head loads on Apple9+ only, with the kernels on** (`draftsOn`, told to the engine by `NativeDrafter.active`):
   on an M1 a few-row verify costs so much more than a step that drafted decode ran under serial, and only the kernels
@@ -95,6 +95,6 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
   splice, a verified block's commit, batched slots against each slot alone (CPU) or reordered and re-neighboured
   (GPU), and each kernel against its chain.
 - `contract.zig`: `gated`, `state`, `relmask`, `act`, `sum`, `topk`, `gate` (its one-row arm), `relsplit`, `relcomb`,
-  `relslots`, `markov_rnn`, `markov_fold`, `markov_pick`, `oproj`.
-  Owed: `pre`, `prep`, `mid`, `norm`, `ups`, `downs`, `relattn`, `router`, and `gate`'s prompt arm.
+  `relslots`, `markov_rnn`, `markov_fold`, `markov_pick`, `oproj`, `router`, `norm`.
+  Owed: `pre`, `prep`, `mid`, `ups`, `downs`, `relattn`, and `gate`'s prompt arm.
 - Not verified: an image against mlx-lm's tower, the drafter's tokens against oMLX's.

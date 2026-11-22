@@ -135,7 +135,7 @@ var stream_threads: u32 = 768;
 
 /// The threadgroup of a kernel that sums over the stream: SIMD groups of 32 that tile the width, as few groups as
 /// `stream_threads` allow (every group redoes the sums).
-fn streamGroup(hidden: u32) ?c_int {
+pub fn streamGroup(hidden: u32) ?c_int {
     var tg: u32 = stream_threads;
     while (tg >= 32) : (tg -= 32) if (hidden % tg == 0) return @intCast(tg);
     return null;
@@ -241,7 +241,7 @@ fn routerThreads(cfg: *const Config, tg: c_int) c_int {
 
 /// The `n` streams `y` `[n, S, D]` f32 under their weighted RMS norms, `[n, S, D]` in `dt`; with a `router`, its
 /// scores `[S, E]` f32 over the first.
-fn norm(g: *Graph, cfg: *const Config, y: Array, nw: [3]Array, n: c_int, dt: Dtype, router: ?Array) ![2]Array {
+pub fn norm(g: *Graph, cfg: *const Config, y: Array, nw: [3]Array, n: c_int, dt: Dtype, router: ?Array) ![2]Array {
     const d: c_int = @intCast(cfg.hidden_size);
     const s = ops.shape(y)[1];
     const experts_n: c_int = if (router != null) @intCast(cfg.num_experts) else 0;
