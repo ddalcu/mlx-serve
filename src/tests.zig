@@ -264,6 +264,9 @@ test {
     _ = @import("sdk/weights/nocache_reader.zig");
     _ = @import("plugins/deepseek_v41/deepseek_v41.zig");
     _ = @import("plugins/deepseek_v41/decode/moe_fp4_test.zig");
+    _ = @import("plugins/deepseek_v41/prompt/m_invariance_test.zig");
+    _ = @import("plugins/deepseek_v41/prompt/pass_async_test.zig");
+    _ = @import("plugins/deepseek_v41/prompt/ced_lazy_test.zig");
     _ = @import("plugins/deepseek_v41/prompt/wide_test.zig");
     _ = @import("plugins/deepseek_v41/fuse.zig");
     _ = @import("plugins/qwen4_exp/qwen4_exp.zig");
