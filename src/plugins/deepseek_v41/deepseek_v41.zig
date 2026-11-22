@@ -5176,7 +5176,7 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     return out[0];
 }
 
-/// The fused decode attention's split partials: `MLX_SERVE_DSV41_ATTN_DEC=1` on the shape-cut kernel where it serves, else
+/// The fused decode attention's split partials: `MLX_SERVE_DSV41_ATTN_DEC` (on by default) on the shape-cut kernel where it serves, else
 /// `dec_attn`.
 fn attnPartials(sc: *Scope, m: *Dsv41Model, ka: mlx.mlx_fast_metal_kernel, q: A, win: Ring, comp_rows: A, topk: A, p0: usize, scale: f32) !?dkern.attn.Partials {
     if (m.dec.attn_tile) |kt| if (dkern.attn.tileOn()) if (try dkern.attn.partialsTile(sc, kt, m, q, win, comp_rows, topk, p0, scale)) |p| {

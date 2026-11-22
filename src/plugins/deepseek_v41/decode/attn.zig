@@ -171,10 +171,9 @@ fn buildTilePlant() !mlx.mlx_fast_metal_kernel {
     return dsv41.buildKernel("dsv41_dec_attn_tile_plant", &INS, &OUTS, TILE_SOURCE, TILE_PLANT_HEADER);
 }
 
-/// `MLX_SERVE_DSV41_ATTN_DEC` (read each call): =1 the fused decode attention takes `partialsTile`.
+/// `MLX_SERVE_DSV41_ATTN_DEC` (on by default, read each call; =0 `dec_attn`): the fused decode attention takes `partialsTile`.
 pub fn tileOn() bool {
-    const v = env.get(.MLX_SERVE_DSV41_ATTN_DEC) orelse return false;
-    return v[0] == '1';
+    return env.onUnlessZero(.MLX_SERVE_DSV41_ATTN_DEC);
 }
 
 /// A launch of the shape-cut kernel: `s` splits of at most `tk` keys (a multiple of 32, at most 128), `nsg`
