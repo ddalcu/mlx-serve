@@ -21,7 +21,7 @@ var engaged_logged: std.atomic.Value(bool) = .init(false);
 /// The new streams `[L, hc, d]` after layer `li`'s MoE over the normed rows `x` (`img` its image rows) on the streams
 /// `x1` with the split `sf`; null where the switch is off or the layer's experts are not the trunk's resident banks.
 pub fn tail(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, li: usize, x: A, img: A, x1: A, sf: *const dsv41.Split) !?A {
-    if (!env.on(.MLX_SERVE_DSV41_MOE_TAIL)) return null;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_MOE_TAIL)) return null;
     if (li >= m.n_layers or m.streamed != null or m.tp != null or mlx.getShape(x)[0] <= dsv41.region_rows) return null;
     const ly = &m.layers[li];
     if (ly.experts.ext != null or mlx.mlx_array_dtype(x) != m.act or mlx.mlx_array_dtype(x1) != m.act) return null;

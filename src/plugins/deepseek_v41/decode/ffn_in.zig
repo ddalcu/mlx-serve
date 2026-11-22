@@ -86,8 +86,7 @@ pub fn fusedOn() bool {
 
 /// `MLX_SERVE_DSV41_GEMV_R26_FFN_IN` (read each call): =1 launch 1 runs on the matrix units from `nax_min_rows` rows.
 pub fn naxOn() bool {
-    const v = env.get(.MLX_SERVE_DSV41_GEMV_R26_FFN_IN) orelse return false;
-    return v[0] == '1';
+    return env.onUnlessZero(.MLX_SERVE_DSV41_GEMV_R26_FFN_IN);
 }
 
 /// The matrix-unit launch 1: simdgroups splitting K, 32 columns a threadgroup, from this many rows.

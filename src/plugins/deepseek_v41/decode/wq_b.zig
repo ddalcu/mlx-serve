@@ -54,8 +54,7 @@ pub const nax_min_rows: usize = 4;
 
 /// `MLX_SERVE_DSV41_FUSE_WQB_RING` (read each call): =1 the plain step and verify write the window ring in wq_b.
 pub fn ringOn() bool {
-    const v = env.get(.MLX_SERVE_DSV41_FUSE_WQB_RING) orelse return false;
-    return v[0] == '1';
+    return env.onUnlessZero(.MLX_SERVE_DSV41_FUSE_WQB_RING);
 }
 
 /// The ring a launch writes into: the layer's ring buffer `[cap, 512]` (the window's dtype, the rows'), `plant` 0
