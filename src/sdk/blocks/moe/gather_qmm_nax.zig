@@ -695,6 +695,18 @@ pub fn stagedPlan(rows: c_int, experts: c_int) Staged {
     return .{ .bm = 64, .wm = 4, .wn = 1, .gx = 32 };
 }
 
+/// Whether the staged schedule serves a routed gate/up call (`rows` routed rows over `experts`, K `k`, `n` a product):
+/// not where `plan` picks the seg 128 x 128 schedule (96 rows an expert and more), which runs the pair faster there.
+pub fn stagedServesGateUp(rows: c_int, experts: c_int, k: c_int, n: c_int) bool {
+    const p = plan(rows, experts, k, n, true);
+    return !(p.sched == .seg and p.bm == 128);
+}
+
+test "staged NAX gate/up: DeepSeek-V4.1's one-pass and 8192-row calls take the seg 128 schedule, narrower calls the staged one" {
+    for ([_]struct { tokens: c_int, staged: bool }{ .{ .tokens = 17638, .staged = false }, .{ .tokens = 8192, .staged = false }, .{ .tokens = 4096, .staged = true }, .{ .tokens = 1254, .staged = true } }) |c|
+        try std.testing.expectEqual(c.staged, stagedServesGateUp(c.tokens * 6, 384, 5120, 2304));
+}
+
 /// Where the staged schedule serves: an fp4 bank (whole 64-deep steps, whole 64-column tiles).
 fn stagedFits(k: c_int, width: c_int, mx: bool) bool {
     return mx and @rem(k, 64) == 0 and @rem(width, 64) == 0;
