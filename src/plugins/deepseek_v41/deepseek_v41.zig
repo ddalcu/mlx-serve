@@ -4662,7 +4662,7 @@ pub fn moePrefillParts(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A,
     const e = &ly.experts;
     const dt = mlx.mlx_array_dtype(x);
     const flat = try sc.reshape(try sc.astype(idx, .uint32), &.{ci(n)});
-    const sp = (if (env.on(.MLX_SERVE_DSV41_PF_MOE_EPI)) try pfroute.pack(sc, flat, try sc.reshape(wts, &.{ci(n)}), k, dim(ly.gate_w, 0)) else null) orelse blk: {
+    const sp = (if (env.onUnlessZero(.MLX_SERVE_DSV41_PF_MOE_EPI)) try pfroute.pack(sc, flat, try sc.reshape(wts, &.{ci(n)}), k, dim(ly.gate_w, 0)) else null) orelse blk: {
         var oo = mlx.mlx_array_new();
         const order = try sc.res(mlx.mlx_argsort_axis(&oo, flat, 0, sc.s), &oo);
         var oi = mlx.mlx_array_new();
