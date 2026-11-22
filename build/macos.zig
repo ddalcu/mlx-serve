@@ -280,9 +280,10 @@ pub fn addUnitTests(g: *const Graph) Tests {
     const test_build = b.step("test-build", "Compile unit tests without running them");
     test_build.dependOn(&b.addInstallArtifact(unit_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
 
-    // The one test binary runs as `test-shards` processes in parallel, each every n-th test (build/test_runner.zig);
-    // a filtered run is one process.
-    const shards: u32 = if (test_filters.len != 0) 1 else b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse defaultShards();
+    // The one test binary runs as `test-shards` processes in parallel, each every n-th test (build/test_runner.zig),
+    // filtered or not: a `sharded:` test (the kernel contract's gates 1-4) splits its own work across them, so a
+    // filtered contract run takes a shard's time, not the whole registry's on one core. `-Dtest-shards=1`: one process.
+    const shards: u32 = b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse defaultShards();
     const test_runs = b.allocator.alloc(*std.Build.Step.Run, shards) catch @panic("OOM");
     const test_step = b.step("test", "Run unit tests");
     // A Run step given an env var copies the WHOLE configure-time environment into the cached configuration, so the
