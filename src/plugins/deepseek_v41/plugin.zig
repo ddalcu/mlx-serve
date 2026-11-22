@@ -245,8 +245,8 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
 }
 
 /// The settings a load reads, each refused by name at a bad value. Flash attention is on for every pack by default
-/// (`MLX_SERVE_DSV41_FLASH_ATTN`: unset, empty or 1 on, =0 the exact gather; David 2026-11-22: its f32 output sits closer
-/// to float64 than the gather's).
+/// (`MLX_SERVE_DSV41_FLASH_ATTN`: unset, empty or 1 on, =0 the exact gather; its f32 output sits closer to float64 than
+/// the gather's).
 fn configureLoad(c: *const config.Config) !void {
     _ = c;
     engram_decode.ps().lru_mb = try engram_decode.parseMb(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB));
