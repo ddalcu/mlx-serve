@@ -106,7 +106,8 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
 /// A sampled round of the served plugin's drafter: the plugin drafts and verifies, the engine accepts under the
 /// request's sampling, the plugin keeps what was accepted.
 fn nativeSampledRound(self: *Generator, allocator: std.mem.Allocator, cap: u32) !?DrafterStepResult {
-    var v = try plugin_driver.nativeVerify(self.xfm, &self.ctx, self.next_token_id, cap);
+    const watch = io_util.Stopwatch.init(self.timer.io);
+    var v = try plugin_driver.nativeVerify(self.xfm, &self.ctx, self.next_token_id, cap, self.eos_token_ids);
     defer _ = mlx.mlx_array_free(v.logits);
     const ids = v.round.tokens[0..v.round.n];
     // A failure below leaves the plugin's verify open, which is the model's, not this request's: close it.
@@ -120,6 +121,9 @@ fn nativeSampledRound(self: *Generator, allocator: std.mem.Allocator, cap: u32) 
     const tokens = try allocator.dupe(u32, ids[0 .. 1 + verdict.accepted]);
     errdefer allocator.free(tokens);
     self.dspark_stats.record(v.round.rows -| 1, verdict.accepted);
+    if (self.dspark_pol) |*pol| if (std.math.isFinite(pol.plain.ms)) {
+        pol.drafting.record(@as(f32, @floatFromInt(1 + verdict.accepted)) * pol.plain.ms, @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms));
+    };
     return self.commitDsparkRound(allocator, .{ .tokens = tokens, .accepted = verdict.accepted, .next_token = verdict.next_token }, @intCast(position));
 }
 
@@ -135,10 +139,14 @@ fn nativeRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResu
     };
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
     if (self.dspark_stochastic) return nativeSampledRound(self, allocator, @min(cap, abi.max_round_tokens - 1));
-    const r = try plugin_driver.nativeRound(self.xfm, &self.ctx, self.next_token_id, @min(cap, abi.max_round_tokens - 1));
+    const watch = io_util.Stopwatch.init(self.timer.io);
+    const r = try plugin_driver.nativeRound(self.xfm, &self.ctx, self.next_token_id, @min(cap, abi.max_round_tokens - 1), self.eos_token_ids);
     const tokens = try allocator.dupe(u32, r.tokens[0..r.n]);
     errdefer allocator.free(tokens);
     self.dspark_stats.record(r.rows -| 1, r.accepted);
+    if (self.dspark_pol) |*pol| if (std.math.isFinite(pol.plain.ms)) {
+        pol.drafting.record(@as(f32, @floatFromInt(r.n)) * pol.plain.ms, @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms));
+    };
     return self.commitDsparkRound(allocator, .{ .tokens = tokens, .accepted = r.accepted, .next_token = r.next_token }, @intCast(r.position));
 }
 

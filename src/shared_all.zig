@@ -20,6 +20,7 @@ comptime {
     _ = @import("host/http/server.zig").launch_shared;
     _ = @import("host/registry/memory_ceiling.zig").overrides_shared;
     _ = @import("sdk/util/system.zig").return_lag_shared;
+    _ = @import("sdk/util/system.zig").os_reserve_shared;
     _ = @import("host/registry/registry.zig").generations_shared;
     _ = @import("host/engines/refusal.zig").refused_tls;
     _ = @import("plugins/minimax_h3/cluster.zig").hooks_shared;

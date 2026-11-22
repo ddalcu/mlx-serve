@@ -605,6 +605,10 @@ pub const Forward = extern struct {
     /// arrives as `Mode.decode`. False on decode steps and verify blocks. Read it only when `size` reaches it: an older
     /// host's `Forward` ends before it.
     prefill: bool = false,
+    /// A native drafter's round (`NativeDrafter.step`, `verify`): the request's stop ids. A draft after one is never
+    /// the conversation's, and a state that kept it is one the prefix cache cannot restore. Read it only when `size`
+    /// reaches it.
+    stop_ids: Span(u32) = .{},
 };
 
 /// Directional ablation (Arditi et al. 2024): slot i's forward removes `strengths[i]` times the component along its
@@ -915,6 +919,9 @@ pub const NativeDrafter = extern struct {
     /// The second half: keeps `t1` and the first `accepted` drafts of the open verify, rewinds the state to them and
     /// writes the model's position into `out.round.position`.
     finish: ?*const fn (m: *anyopaque, accepted: u32, out: *ForwardOut) callconv(.c) Verdict = null,
+    /// Whether this load drafts: a load may leave its drafter out (a GPU it loses on), and then the model has no
+    /// stages. Null = always. Read it only when `size` reaches it.
+    active: ?*const fn (m: *anyopaque) callconv(.c) bool = null,
 };
 
 /// A trunk tensor a drafter reads beside the trunk's forward.

@@ -374,3 +374,10 @@ Defect: a GLM-5.3-Flash answer restated one paragraph 52 times until the client 
 Cause: each copy opened with the same ~130-token head and ended with a tail the model reworded. No exact cycle exists, and the tails held the near-repeat novelty at 0.376, inside the healthy band; no novelty bar separates it from procedural code.
 Fix: a fourth tier, `recurring_span`: the last 96 tokens recur verbatim 12 times, carry at least 24 distinct tokens, and the copies cover `near_repeat_min_span` (`loop_guard.recurringSpanStart`). Records that share one long block fire it too, and a cut drops a whole tool call, so the tier abstains once the answer opens one (`loop_stop.spanCutYieldsToToolCall`). A speculative tick commits several tokens, so the tier checks every tail end committed since the guard last ran (`Slot.loop_guard_seen`), not a fixed count that a wider block would outgrow.
 Guard: the `degenerateTail` fixed-head tests (conviction, acquittal, the stride-8 walk) and `a recurring-span cut yields to an open tool call` (`loop_stop.zig`).
+
+### An Inkling reply cut after its opener shipped the marker
+Defect: a pi agent on a 16 GB Mac (Inkling 2, 45k context) ended its session on the reply `<|message_model|>`.
+Cause: near its window pi asked `max_tokens` 1; the one token was the message opener, `splitInklingChannels` stripped
+it, found no channel and returned null, and the generic split shipped the raw marker, which the leak trim (cutting at
+the invoke marker) let through. Fix: a text holding only the message head splits to empty content. Guard: corpus `a
+reply cut after its message opener ships no marker`.

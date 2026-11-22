@@ -1432,13 +1432,15 @@ pub fn nativeDrafter(xfm: *const Transformer) ?*const abi.NativeDrafter {
 
 /// The draft stages of the served model's native drafter (`SpecFacts.native_stages`); 0 without one.
 pub fn nativeStages(xfm: *const Transformer) u32 {
-    if (nativeDrafter(xfm) == null) return 0;
+    const nd = nativeDrafter(xfm) orelse return 0;
+    if (nd.size >= @offsetOf(abi.NativeDrafter, "active") + @sizeOf(?*const fn (*anyopaque) callconv(.c) bool))
+        if (nd.active) |f| if (!f(xfm.plugin.?.model)) return 0;
     return xfm.config.plugin.?.parsed.spec.native_stages;
 }
 
 /// One native drafter round from the committed token `t1` (`NativeDrafter.step`); the model's state,
 /// `ctx.cache.step` and `ctx.moe_seq_offset` move to the round's position.
-pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !abi.Round {
+pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32, stop_ids: []const u32) !abi.Round {
     const b = xfm.plugin.?;
     if (ctx.ablation != null) try roundServes(xfm, b, ctx);
     const nd = nativeDrafter(xfm).?;
@@ -1447,15 +1449,21 @@ pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !abi.
     const pos = [_]u32{@intCast(ctx.cache.step)};
     var ablated: Ablated = .{};
     defer ablated.deinit();
+    // A drafter on the engine's caches (not module-owned state) verifies and commits through them.
+    var slot = slotFor(xfm, ctx);
+    const handles = [_]abi.Handle{slot.handle()};
     const f: abi.Forward = .{
         .mode = .decode,
         .rows = 1,
         .tokens = .of(&tokens),
         .slots = .of(&slot_ids),
         .positions = .of(&pos),
+        .caches = .of(&handles),
+        .cache_ops = &cache_ops.ops,
         .accept_cap = cap,
         .suppress_mask = .{ .ctx = if (xfm.suppress_mask) |m| m.ctx else null },
         .ablation = try ablated.init(&.{ctx}),
+        .stop_ids = .of(stop_ids),
     };
     var out: abi.ForwardOut = .{};
     intree.enter(ctx);
@@ -1482,7 +1490,7 @@ pub const Verified = struct { round: abi.Round, logits: Array };
 
 /// The first half of a native round (`NativeDrafter.verify`): the verified rows' ids and logits `[rows, vocab]`, the
 /// verify left open until `nativeFinish`. The caller frees `logits`.
-pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !Verified {
+pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32, stop_ids: []const u32) !Verified {
     const b = xfm.plugin.?;
     if (ctx.ablation != null) try roundServes(xfm, b, ctx);
     const nd = nativeDrafter(xfm).?;
@@ -1491,7 +1499,22 @@ pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !Ver
     const pos = [_]u32{@intCast(ctx.cache.step)};
     var ablated: Ablated = .{};
     defer ablated.deinit();
-    const f: abi.Forward = .{ .mode = .verify, .rows = 1, .tokens = .of(&tokens), .slots = .of(&slot_ids), .positions = .of(&pos), .accept_cap = cap, .ablation = try ablated.init(&.{ctx}) };
+    // A drafter on the engine's caches commits through them at the finish: the slot outlives this call.
+    ctx.native_slot = slotFor(xfm, ctx);
+    const handles = [_]abi.Handle{ctx.native_slot.handle()};
+    const f: abi.Forward = .{
+        .mode = .verify,
+        .rows = 1,
+        .tokens = .of(&tokens),
+        .slots = .of(&slot_ids),
+        .positions = .of(&pos),
+        .caches = .of(&handles),
+        .cache_ops = &cache_ops.ops,
+        .accept_cap = cap,
+        .suppress_mask = .{ .ctx = if (xfm.suppress_mask) |m| m.ctx else null },
+        .ablation = try ablated.init(&.{ctx}),
+        .stop_ids = .of(stop_ids),
+    };
     var out: abi.ForwardOut = .{};
     intree.enter(ctx);
     const v = nd.verify.?(b.model, &f, &out);
@@ -2333,6 +2356,59 @@ test "unsupported disk hooks preserve RAM auxiliary snapshots" {
     try t.expectEqual(@as(usize, 1), fake.frees);
 }
 
+// Bar: a sampled round's verify hands the drafter the slot's caches, their ops and the suppress mask (a drafter on
+// the engine's caches commits through them at its finish), the slot living in the request's context past the call.
+test "plugin driver: a native verify carries the slot's cache, its ops and the suppress mask" {
+    const t = std.testing;
+    const Fake = struct {
+        var caches: usize = 0;
+        var handle: ?abi.Handle = null;
+        var ops_given = false;
+        var mask: ?*anyopaque = null;
+        fn verify(_: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            caches = f.caches.len;
+            handle = if (f.caches.len == 1) f.caches.slice()[0] else null;
+            ops_given = f.cache_ops != null;
+            mask = f.suppress_mask.ctx;
+            const one = [_]f32{0};
+            out.logits = .{ .ctx = mlx.mlx_array_new_data(&one, &[_]c_int{ 1, 1 }, 2, .float32).ctx };
+            out.round = .{ .n = 1, .rows = 1, .position = f.positions.slice()[0] };
+            return .ok;
+        }
+        fn step(_: *anyopaque, _: *const abi.Forward, _: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            return .ok;
+        }
+        fn finish(_: *anyopaque, _: u32, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            out.round = .{ .position = 13 };
+            return .ok;
+        }
+        const drafter: abi.NativeDrafter = .{ .step = &step, .verify = &verify, .finish = &finish };
+        const spec: abi.SpecHooks = .{ .native_drafter = &drafter };
+        const cache: abi.CacheHooks = .{};
+        const weights: abi.WeightHooks = .{};
+        const table: abi.ModelTable = .{ .name = .of("native_fixture"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &cache, .spec = &spec, .weights = &weights };
+    };
+    var m: u8 = 0;
+    var bound: Bound = .{ .table = &Fake.table, .model = &m, .positions = .hybrid };
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    x.batched_kv_append_override = null;
+    const zero = [_]u8{0};
+    const suppress = mlx.mlx_array_new_data(&zero, &[_]c_int{1}, 1, .bool_);
+    defer _ = mlx.mlx_array_free(suppress);
+    x.suppress_mask = suppress;
+    var kv: KVCache = undefined;
+    kv.step = 12;
+    var off: usize = 12;
+    var ctx: ForwardCtx = .{ .cache = &kv, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    const v = try nativeVerify(&x, &ctx, 5, 4, &.{});
+    defer _ = mlx.mlx_array_free(v.logits);
+    try t.expectEqual(@as(usize, 1), Fake.caches);
+    try t.expectEqual(@intFromPtr(&ctx.native_slot), @intFromPtr(Fake.handle.?));
+    try t.expect(Fake.ops_given);
+    try t.expectEqual(suppress.ctx, Fake.mask);
+}
+
 test "plugin driver: a native round and a finish move moe_seq_offset with cache.step" {
     const t = std.testing;
     const Fake = struct {
@@ -2360,7 +2436,7 @@ test "plugin driver: a native round and a finish move moe_seq_offset with cache.
     kv.step = 12;
     var off: usize = 12;
     var ctx: ForwardCtx = .{ .cache = &kv, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
-    const r = try nativeRound(&x, &ctx, 5, 4);
+    const r = try nativeRound(&x, &ctx, 5, 4, &.{});
     try t.expectEqual(@as(u64, 15), r.position);
     try t.expectEqual(@as(usize, 15), kv.step);
     try t.expectEqual(kv.step, off);

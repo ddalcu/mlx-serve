@@ -229,6 +229,8 @@ Used in mlx-serve (`src/engines/mlx/transformer.zig`):
     the sliding-window bound is ours.
   * The block-sparse VSA attention (`src/plugins/minimax_h3/kernels/vsa_nax.metal`): that
     attention kernel's loop walking each query tile's selected key tiles.
+  * Inkling 2's bundled DSpark drafter (`src/plugins/inkling2/draft.zig`), reimplemented in Zig after
+    the DFlash drafter of `omlx/patches/inkling2/dspark.py`, the one open reference that runs it.
 
 Used in mlx-serve for GLM-5-Next (`src/plugins/glm5_next/glm5_next.zig`, `src/plugins/glm5_next/dsa_nax.zig`,
 `src/sdk/blocks/kda/recurrence.zig`, `src/kernels/kda_*.metal`, `src/kernels/glm5_*.metal`),
@@ -483,7 +485,12 @@ Used in mlx-serve:
   * The global-sort MoE gather (`_gather_sort`: argsort the flattened
     (token, expert) pairs, gather rows, run with sorted indices, then inverse
     permute) is theirs, used by our multi-position MoE paths in
-    `src/engines/mlx/transformer.zig` and `src/plugins/deepseek_v4/deepseek_v4.zig`.
+    `src/engines/mlx/transformer.zig`, `src/plugins/deepseek_v4/deepseek_v4.zig`
+    and `src/plugins/inkling2/layers.zig`.
+  * `src/plugins/inkling2/kernels/relattn.metal` ports the `relative_attention`
+    kernel of the Inkling 2 model (`mlx_lm/models/inkling2/kernels.py`,
+    https://github.com/ml-explore/mlx-lm/pull/2086); `relsplit.metal` and
+    `relslots.metal` split that kernel's read over the keys and over slots.
 
 Modifications by mlx-serve: reimplemented in Zig against mlx-c, and the GDN
 kernel is extended by a sequence variant (`GDN_KERNEL_SEQ_SOURCE`) that records
@@ -754,6 +761,9 @@ and they are listed because they made that work possible.
   * The `inkling_mlx/` package bundled with Thinking Machines' Inkling Small
     checkpoints (Apache-2.0), the reference and parity oracle for
     `inkling_mm_model`.
+  * mlx-lm's `mlx_lm/models/inkling2` (MIT, ml-explore/mlx-lm#2086), the
+    reference and parity oracle for `inkling2_loop`, its image tower and its
+    processor.
   * inclusionAI's Ming-3.0-tts modeling code and Blaizzy/mlx-audio (MIT), the
     references for the `ming_tts` plugin's model, task and text frontend ports.
   * hexgrad/misaki (Apache-2.0), whose pronunciation dictionaries are fetched

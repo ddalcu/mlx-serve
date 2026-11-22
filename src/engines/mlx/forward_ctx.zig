@@ -11,6 +11,7 @@ const QsaArmCounts = @import("../../plugins/qwen4_exp/qsa/arms.zig").QsaArmCount
 const KVCache = @import("kv/cache.zig").KVCache;
 const SSMCacheEntry = @import("ssm/entry.zig").SSMCacheEntry;
 const CheckpointSink = @import("kv/cache_ops.zig").CheckpointSink;
+const CacheSlot = @import("kv/cache_ops.zig").Slot;
 const Transformer = @import("transformer.zig").Transformer;
 
 /// A draft tree's verify rows: row w sits at position offset + depth[w], and
@@ -124,6 +125,8 @@ pub const ForwardCtx = struct {
     prompt_spans: []const u64 = &.{},
     ssm_cp_positions: []const u64 = &.{},
     cp_sink: ?*const CheckpointSink = null,
+    /// The caches a native drafter's open verify commits through at its finish (`NativeDrafter.verify`).
+    native_slot: CacheSlot = undefined,
     /// Qwen3-VL interleaved M-RoPE. `mrope_pos` is the server-computed flat
     /// [3 × mrope_total] i32 position-id table (axis-major: t,h,w rows), borrowed
     /// from the slot. `mrope_delta` shifts the scalar decode RoPE (decode tokens

@@ -67,6 +67,7 @@ const cases = [_]Case{
     // DeepSeek-V4-Flash-4bit is the withdrawn preview, refused by both parses (`deepseek_v4/config.zig`).
     deepseek("mlx-community_DeepSeek-V4-Flash-0731-2.4bit-mixed"),
     case("mlx-community_Inkling-Small-mlx-2bit"),
+    case("mlx-community_Inkling-2-Mini-4bit"),
     case("mlx-community_Qwen3.8-Flash-Next-4bit"),
     case("Jundot_Qwen3.8-Flash-Next-oQ4e-mtp"),
     pinned("glm5_next-mlx-community-4bit"),
