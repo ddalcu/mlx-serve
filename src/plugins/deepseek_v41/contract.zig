@@ -5166,6 +5166,7 @@ fn registerStreamed(set: *kc.Set) !void {
     const v2_outs_tail: []const spec.Part = &.{ .{ .elem = .bf16, .count = HcV2Mix.rowsX }, .{ .elem = .bf16, .count = rowsN }, .{ .elem = .f32, .count = HcV2Mix.partCount } };
     const v2_outs_mix: []const spec.Part = &.{ .{ .elem = .bf16, .count = rowsN }, .{ .elem = .f32, .count = HcV2Mix.partCount } };
     const v2_outs_none: []const spec.Part = &.{};
+    const v2_sums: spec.Sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "its sums reorder the stock kernels' fp32 terms, held to the float64 bound (gate 3); random rows, not a stress" };
     const hc_v2_served: []const Shape = &.{ .{ .rows = 17, .n = DIM, .k = HC * DIM }, .{ .rows = 130, .n = DIM, .k = HC * DIM } };
     inline for (hv2.all) |p| try kit.add(set, HcV2Mix, &hc_v2_mix_l[@intFromEnum(p)], .{ .pro = p }, .{
         .name = "dsv41 hc_v2_mix (" ++ @tagName(p) ++ ": stream rows formed, collapsed and mixed in one pass)",
@@ -5177,7 +5178,7 @@ fn registerStreamed(set: *kc.Set) !void {
         .outs = if (hv2.isTail(p) and hv2.mixes(p)) v2_outs_tail else if (!hv2.mixes(p)) v2_outs_none else v2_outs_mix,
         .tiles = .{ .{ .size = hv2.ROWS }, .{}, .{} },
         .served = hc_v2_served,
-        .sums = fused_sums,
+        .sums = v2_sums,
     });
     try kit.add(set, HcV2Fin, &hc_v2_fin_l, .{}, .{
         .name = "dsv41 hc_v2_fin (slices into the mixes, the split and the normed collapse)",
