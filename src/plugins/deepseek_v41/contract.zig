@@ -1524,9 +1524,11 @@ const HcV2Mix = struct {
         };
     }
 
+    /// The shape's `k` is the launch's d-slices (`slicesFor` picks them by rows; a case names them, so small cases
+    /// cover every slicing the wide widths take).
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
-        if (s.rows == 0 or s.n != hv2.D) return null;
-        const S = hv2.slicesFor(s.rows);
+        if (s.rows == 0 or s.n != hv2.D or s.k == 0 or s.n % (hv2.DC * s.k) != 0) return null;
+        const S = s.k;
         var g = metal.Geometry{ .grid = .{ ci((s.rows + hv2.ROWS - 1) / hv2.ROWS * 256), ci(S), 1 }, .tg = .{ 256, 1, 1 } };
         if (expands(p) == 2) g.out(&.{ ci(s.rows), HC, ci(s.n) }, act);
         if (mixes(p)) {
@@ -1581,7 +1583,7 @@ const HcV2Mix = struct {
         return s.rows * HC * s.n;
     }
     fn partCount(s: Shape) usize {
-        return hv2.slicesFor(s.rows) * s.rows * hv2.PW;
+        return s.k * s.rows * hv2.PW;
     }
 
     pub fn count(p: Params, s: Shape) usize {
@@ -1649,7 +1651,7 @@ const HcV2Mix = struct {
     pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
         const L = k.shape.rows;
         const D = k.shape.n;
-        const S = hv2.slicesFor(L);
+        const S = k.shape.k;
         const DS = D / S;
         const a = k.scratch();
         const st = try a.alloc(f64, 4 * HC * D);
@@ -1658,15 +1660,17 @@ const HcV2Mix = struct {
         const last = st[2 * HC * D ..][0 .. HC * D];
         const se = st[3 * HC * D ..][0 .. HC * D];
         // The roundings' spread in the bound's units: the bound grants gamma(depth) of `mag`.
-        const per = 1 / spec.gamma(@floatFromInt(depthK(k.shape)), u);
+        const per = 1 / spec.gamma(@floatFromInt(depthV2(k.shape)), u);
         var off: usize = 0;
         const xo = off;
         if (expands(k.p) == 2) off += rowsX(k.shape);
         const ho = off;
         const po = off + rowsN(k.shape);
-        // fn in its natural [MIX, N] order, from the packed input.
         const fnw: []const f64 = if (mixes(k.p)) k.in(k.n_in - 1) else &.{};
-        const terms = try a.alloc(f64, 2 * HC * DS);
+        // A simulated sum (gate 4) needs each sum's terms; float64's runs as it goes.
+        const keep = sum.acc != null;
+        const T = HC * DS;
+        const terms = try a.alloc(f64, if (keep) (hv2.MIX + 2) * T else 0);
         defer a.free(terms);
         const hb = try a.alloc(f64, 2 * D);
         defer a.free(hb);
@@ -1695,47 +1699,58 @@ const HcV2Mix = struct {
             }
             for (0..S) |sl| {
                 const base = po + (sl * L + l) * hv2.PW;
-                for (0..hv2.MIX) |mx| {
-                    var n: usize = 0;
-                    var mg: f64 = 0;
-                    var er: f64 = 0;
-                    for (0..HC) |i| for (sl * DS..(sl + 1) * DS) |d| {
-                        const v = st[i * D + d] * fnw[mx * hv2.N + i * D + d];
-                        terms[n] = v;
-                        n += 1;
-                        mg += @abs(v);
-                        er += @abs(fnw[mx * hv2.N + i * D + d]) * se[i * D + d];
-                    };
-                    out[base + mx] = sum.of(terms[0..n]);
-                    mag[base + mx] = mg + er * per;
-                }
+                // One pass over the slice's stream values for all 24 dots and both squares.
+                var dot: [hv2.MIX]f64 = @splat(0);
+                var mg: [hv2.MIX]f64 = @splat(0);
+                var de: [hv2.MIX]f64 = @splat(0);
+                var sq: f64 = 0;
+                var sqe: f64 = 0;
                 var n: usize = 0;
-                var er: f64 = 0;
                 for (0..HC) |i| for (sl * DS..(sl + 1) * DS) |d| {
-                    terms[n] = st[i * D + d] * st[i * D + d];
+                    const v = st[i * D + d];
+                    const e = se[i * D + d];
+                    for (0..hv2.MIX) |mx| {
+                        const w = fnw[mx * hv2.N + i * D + d];
+                        const t = v * w;
+                        if (keep) terms[mx * T + n] = t else dot[mx] += t;
+                        mg[mx] += @abs(t);
+                        de[mx] += @abs(w) * e;
+                    }
+                    if (keep) terms[hv2.MIX * T + n] = v * v else sq += v * v;
+                    sqe += 2 * @abs(v) * e;
                     n += 1;
-                    er += 2 * @abs(st[i * D + d]) * se[i * D + d];
                 };
-                out[base + hv2.MIX] = sum.of(terms[0..n]);
-                mag[base + hv2.MIX] = out[base + hv2.MIX] + er * per;
-                er = 0;
-                for (sl * DS..(sl + 1) * DS, 0..) |d, q| {
-                    terms[q] = hb[d] * hb[d];
-                    er += 2 * @abs(hb[d]) * hb[D + d];
+                for (0..hv2.MIX) |mx| {
+                    out[base + mx] = if (keep) sum.of(terms[mx * T ..][0..T]) else dot[mx];
+                    mag[base + mx] = mg[mx] + de[mx] * per;
                 }
-                out[base + hv2.MIX + 1] = sum.of(terms[0..DS]);
-                mag[base + hv2.MIX + 1] = out[base + hv2.MIX + 1] + er * per;
+                out[base + hv2.MIX] = if (keep) sum.of(terms[hv2.MIX * T ..][0..T]) else sq;
+                mag[base + hv2.MIX] = out[base + hv2.MIX] + sqe * per;
+                var hs: f64 = 0;
+                var hse: f64 = 0;
+                for (sl * DS..(sl + 1) * DS, 0..) |d, q| {
+                    if (keep) terms[(hv2.MIX + 1) * T + q] = hb[d] * hb[d] else hs += hb[d] * hb[d];
+                    hse += 2 * @abs(hb[d]) * hb[D + d];
+                }
+                out[base + hv2.MIX + 1] = if (keep) sum.of(terms[(hv2.MIX + 1) * T ..][0..DS]) else hs;
+                mag[base + hv2.MIX + 1] = out[base + hv2.MIX + 1] + hse * per;
             }
         }
     }
 };
 
+/// hc_v2_mix's longest chain: a slice's dots run over at most HC x D terms (the bound stays the shape-free one).
+fn depthV2(_: Shape) usize {
+    return HC * DIM;
+}
+
 /// kernels/hc_v2_fin.metal: the slices' partials into the mixes, the split and the normed collapse.
 const HcV2Fin = struct {
     pub const Params = struct {};
 
+    /// The shape's `k` is the slices the partials hold.
     pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
-        if (s.rows == 0 or s.n != hv2.D) return null;
+        if (s.rows == 0 or s.n != hv2.D or s.k == 0 or s.k > 64) return null;
         var g = metal.Geometry{ .grid = .{ hv2.FIN_TG, ci(s.rows), 1 }, .tg = .{ hv2.FIN_TG, 1, 1 } };
         g.out(&.{ ci(s.rows), MIX }, .float32);
         g.out(&.{ ci(s.rows), HC }, .float32);
@@ -1744,7 +1759,7 @@ const HcV2Fin = struct {
         g.out(&.{ ci(s.rows), ci(s.n) }, act);
         g.dtype("T", act);
         g.int("D", s.n);
-        g.int("S", hv2.slicesFor(s.rows));
+        g.int("S", s.k);
         g.int("HC", HC);
         g.int("ITERS", ITERS);
         g.int("TG", hv2.FIN_TG);
@@ -1754,7 +1769,7 @@ const HcV2Fin = struct {
     pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
         const L = k.shape.rows;
         const D = k.shape.n;
-        const S = hv2.slicesFor(L);
+        const S = k.shape.k;
         const part = try k.add(.float32, &.{ S, L, hv2.PW });
         const hraw = try k.add(act, &.{ L, D });
         const scale = try k.add(.float32, &.{MIX});
@@ -1792,7 +1807,7 @@ const HcV2Fin = struct {
     pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
         const L = k.shape.rows;
         const D = k.shape.n;
-        const S = hv2.slicesFor(L);
+        const S = k.shape.k;
         const part = k.in(0);
         const hraw = k.in(1);
         const scale = k.in(2);
@@ -1845,7 +1860,7 @@ const HcV2Fin = struct {
 
 /// hc_v2_fin's longest chain: the slices' sums, then the split's four-term sums.
 fn depthFin(s: Shape) usize {
-    return hv2.slicesFor(s.rows) + HC;
+    return s.k + HC;
 }
 
 // ── decode/gemv_twin.zig: MLX's one-row gemv over a verify's rows, each row its one-row words ──
@@ -4580,6 +4595,18 @@ const markov_final_l = launch("dsv41_markov_final", &.{ "parts", "t1", "hout", "
 const flash_l = metal.Launch{ .name = "dsv41_attn_flash", .inputs = &v41.GatherAttn.FLASH_INS, .outputs = &.{"o"}, .source = fa.source, .header = @import("decode/attn.zig").HEADER, .tg_bytes = 4 * 2 * 128 + 4 * 2 * 4 * 4 * 16 + 2 * 4 * 8 * 256, .offline = false, .min_gen = 17 };
 const gather_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 } };
 const qk_t_l = metal.Launch{ .name = "dsv41_attn_qk_t", .inputs = &.{ "q", "kw", "comp", "picks", "meta", "qt" }, .outputs = &.{"s"}, .source = qtail.attn_qk_t_source, .header = v41.MPP_HEADER, .tg_bytes = 2 * 64 * 64 * 2, .offline = false, .min_gen = 17 };
+/// The slicing a variant's contract cases run at.
+fn v2Slices(p: hv2.Pro) usize {
+    return switch (p) {
+        .plain, .tail_only => 10,
+        .ffn, .tail_c => 20,
+        .tail, .tail_only_c => 40,
+    };
+}
+fn v2Served(comptime S: usize) []const Shape {
+    return &.{ .{ .rows = 17, .n = DIM, .k = S }, .{ .rows = 65, .n = DIM, .k = S } };
+}
+
 fn hcV2MixLaunch(comptime p: hv2.Pro) metal.Launch {
     return .{ .name = hv2.name(p), .inputs = hv2.ins(p), .outputs = hv2.outs(p), .source = hv2.mix_source, .header = hv2.header(p), .tg_bytes = if (hv2.mixes(p)) 4 * hv2.FSTEP else 0 };
 }
@@ -5167,17 +5194,18 @@ fn registerStreamed(set: *kc.Set) !void {
     const v2_outs_mix: []const spec.Part = &.{ .{ .elem = .bf16, .count = rowsN }, .{ .elem = .f32, .count = HcV2Mix.partCount } };
     const v2_outs_none: []const spec.Part = &.{};
     const v2_sums: spec.Sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "its sums reorder the stock kernels' fp32 terms, held to the float64 bound (gate 3); random rows, not a stress" };
-    const hc_v2_served: []const Shape = &.{ .{ .rows = 17, .n = DIM, .k = HC * DIM }, .{ .rows = 130, .n = DIM, .k = HC * DIM } };
+    // Each variant at one of the slicings the wide widths take (k = slices: 10 from 2048 rows, 20 from 512, 40 below),
+    // so every slicing runs on two variants; 65 rows cross the 64-row threadgroup edge.
     inline for (hv2.all) |p| try kit.add(set, HcV2Mix, &hc_v2_mix_l[@intFromEnum(p)], .{ .pro = p }, .{
         .name = "dsv41 hc_v2_mix (" ++ @tagName(p) ++ ": stream rows formed, collapsed and mixed in one pass)",
         .accum = .f32,
-        .depth = depthK,
+        .depth = depthV2,
         .ops = 4,
         .mids = 3,
         .out = .bf16,
         .outs = if (hv2.isTail(p) and hv2.mixes(p)) v2_outs_tail else if (!hv2.mixes(p)) v2_outs_none else v2_outs_mix,
         .tiles = .{ .{ .size = hv2.ROWS }, .{}, .{} },
-        .served = hc_v2_served,
+        .served = comptime v2Served(v2Slices(p)),
         .sums = v2_sums,
     });
     try kit.add(set, HcV2Fin, &hc_v2_fin_l, .{}, .{
@@ -5188,7 +5216,7 @@ fn registerStreamed(set: *kc.Set) !void {
         .mids = 2,
         .out = .f32,
         .outs = &.{ .{ .elem = .f32, .count = HcV2Fin.rowsSplit }, .{ .elem = .bf16, .count = rowsN } },
-        .served = hc_v2_served,
+        .served = &.{ .{ .rows = 17, .n = DIM, .k = 40 }, .{ .rows = 65, .n = DIM, .k = 10 } },
         .sums = short_sums,
     });
     inline for (.{ true, false }) |h2| try kit.add(set, HcMixNorm, &mix_norm_l, .{ .h2 = h2 }, .{
@@ -5417,14 +5445,14 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         } else try Expect.same(r.c, r.bytes, &.{ f.h, f.x1 });
     }
     inline for (hv2.all) |p| {
-        const r = try ours(HcV2Mix, a, &hc_v2_mix_l[@intFromEnum(p)], .{ .pro = p }, .{ .rows = 70, .n = DIM, .k = HC * DIM });
-        const o = try hv2.mixLaunch(&sc, p, r.c.args[0..r.c.n_in], 70, hv2.slicesFor(70));
+        const r = try ours(HcV2Mix, a, &hc_v2_mix_l[@intFromEnum(p)], .{ .pro = p }, .{ .rows = 70, .n = DIM, .k = v2Slices(p) });
+        const o = try hv2.mixLaunch(&sc, p, r.c.args[0..r.c.n_in], 70, v2Slices(p));
         try Expect.same(r.c, r.bytes, o[0..hv2.nOuts(p)]);
     }
     {
-        const r = try ours(HcV2Fin, a, &hc_v2_fin_l, .{}, .{ .rows = 70, .n = DIM, .k = HC * DIM });
+        const r = try ours(HcV2Fin, a, &hc_v2_fin_l, .{}, .{ .rows = 70, .n = DIM, .k = 20 });
         const hc: v41.Hc = .{ .fn_w = none, .scale = r.c.args[2], .base = r.c.args[3] };
-        const f = try hv2.finLaunch(&sc, r.c.args[0], r.c.args[1], &hc, r.c.args[4], r.c.args[5], hv2.slicesFor(70), ITERS);
+        const f = try hv2.finLaunch(&sc, r.c.args[0], r.c.args[1], &hc, r.c.args[4], r.c.args[5], 20, ITERS);
         try Expect.same(r.c, r.bytes, &.{ f.z, f.n.sp.pre, f.n.sp.post, f.n.sp.comb, f.n.h });
     }
     {
