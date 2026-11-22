@@ -79,6 +79,10 @@ const acore = @import("prompt/attn_core.zig");
 /// a wide span's attention as one flash
 /// kernel (an online softmax; the scores and probabilities never leave a threadgroup), not exact.
 const fa = @import("prompt/flash_attn.zig");
+/// A prompt chunk's CED replay left to its first reader, dropped when the next chunk replays (exact).
+const ced_lazy = @import("prompt/ced_lazy.zig");
+/// A prompt pass's last wide layer committed, not waited for (exact).
+const pass_async = @import("prompt/pass_async.zig");
 /// the moe_pair.zig: a prompt call's fp4 gate and up with `moe_act` in one paired NAX launch.
 const mpair = @import("prompt/moe_pair.zig");
 /// hc_v2.zig: a resident wide layer's hc in three passes over the stream (`MLX_SERVE_DSV41_PF_HC_V2`).
@@ -1738,6 +1742,7 @@ fn hcMixRows() usize {
 }
 // The pfkern switches' one-time engagement lines (first use a process; no per-call output).
 var hc_mix8_logged: std.atomic.Value(bool) = .init(false);
+var ced_lazy_logged: std.atomic.Value(bool) = .init(false);
 var hc_expand_norm_logged: std.atomic.Value(bool) = .init(false);
 var woa_join_logged: std.atomic.Value(bool) = .init(false);
 const hc_mix_cols = [_]usize{ 6, 4, 3, 2, 1 };
@@ -2182,6 +2187,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     if (m.attn_gather != null) try warmRing(m);
     log.info("deepseek_v41: {d} layers, engram {d} layers, DSpark {d} stages{s}{s}\n", .{ n_layers, m.engrams.len, n_stages, if (opts.quant != null) ", weights on " else "", if (opts.quant) |q| q.name() else "" });
     if (fp4Decode(m) != null) log.info("deepseek_v41: fused fp4 MoE decode kernels on\n", .{});
+    if (dkern.fp8Fold() == 1) log.info("deepseek_v41: decode mxfp8 reads folded (MLX_SERVE_DSV41_FP8_FOLD)\n", .{});
     if (m.layers.len > 0) {
         const ex = &m.layers[0].experts;
         const b = ex.gu orelse ex.gate;
@@ -2585,6 +2591,8 @@ pub const State = struct {
     snap_at: ?usize = null,
     snap_ids: []u32 = &.{},
     snap_vision_key: u64 = 0,
+    /// prompt/ced_lazy.zig: the decoder layers' window rings and the DSpark rows hold the last chunk's replay, unevaluated.
+    ced_lazy: bool = false,
 
     pub fn deinit(self: *State) void {
         if (self.snap) |*sn| sn.deinit(self.gpa);
@@ -3132,7 +3140,7 @@ pub fn hcExpandNormLaunch(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *con
 }
 /// The attention side's hc of a wide layer (`hcPreNormWide`; with `w2` also RA_FUSED's read-ahead norm, `.hp`):
 /// one launch (`hcMixNormFused`, unless hc_fuse.zig's kernels were refused at load).
-fn attnHcWide(sc: *Scope, m: *const Dsv41Model, x: A, pres: A, ly: *const Layer, w2: ?A) !struct { pa: Normed, hp: A } {
+pub fn attnHcWide(sc: *Scope, m: *const Dsv41Model, x: A, pres: A, ly: *const Layer, w2: ?A) !struct { pa: Normed, hp: A } {
     const eps = try hcEps(sc, m);
     if (hcf_k != null) {
         const r = try hcMixNormFused(sc, m, x, pres, &ly.hc_attn, ly.attn_norm, w2, eps);
@@ -4167,22 +4175,22 @@ pub fn ffnDecode(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: 
     return try moeKernel(sc, m.moe_dn_kernel, &.{ act, vdn.w, vdn.s, vdn.b, sdn.w, sdn.s, sdb, flat, x1, sp.post, sp.comb }, mlx.getShape(x1), dt, dn.qp, sdn.qp, inter, d, k);
 }
 
-/// The fused fp4 MoE decode kernels where they serve: everywhere, unless `MLX_SERVE_DSV41_MOE_FP4_NAX=0` on a NAX GPU
-/// (read each call; there `routed`'s gathers run).
+/// The fused fp4 MoE decode kernels where they serve: a GPU without NAX, and a NAX GPU at `MLX_SERVE_DSV41_MOE_FP4_NAX=1`
+/// (read each call; off there, the default of the restack, `routed`'s gathers run).
 pub fn fp4Decode(m: *const Dsv41Model) ?dkern.moe_fp4.Kernels {
     const k = m.dec.moe_fp4 orelse return null;
     if (device.naxAvailable() and !fp4NaxOn(env.get(.MLX_SERVE_DSV41_MOE_FP4_NAX))) return null;
     return k;
 }
 
-/// `MLX_SERVE_DSV41_MOE_FP4_NAX`: unset or anything but `0` keeps the fused fp4 decode on a NAX GPU.
+/// `MLX_SERVE_DSV41_MOE_FP4_NAX`: set and not `0` puts the fused fp4 decode on a NAX GPU; unset keeps the gathers.
 fn fp4NaxOn(raw: ?[*:0]const u8) bool {
-    const v = raw orelse return true;
-    return v[0] != '0';
+    const v = raw orelse return false;
+    return v[0] != 0 and v[0] != '0';
 }
 
-test "dsv41 fused fp4 decode: on a NAX GPU by default, off only at MLX_SERVE_DSV41_MOE_FP4_NAX=0" {
-    try std.testing.expect(fp4NaxOn(null));
+test "dsv41 fused fp4 decode: off on a NAX GPU by default, on at MLX_SERVE_DSV41_MOE_FP4_NAX=1" {
+    try std.testing.expect(!fp4NaxOn(null));
     try std.testing.expect(fp4NaxOn("1"));
     try std.testing.expect(!fp4NaxOn("0"));
 }
@@ -5564,6 +5572,12 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     // replay tail's spans when the chunk has one.
     const n_spans = (L + span - 1) / span;
     const tail = cedTail(m, st, L, want);
+    // ced_lazy.zig: the last chunk's replay, still unevaluated, is dropped where this call replays its own tail (a
+    // lead's rest does); any other call reads it.
+    if (st.ced_lazy) {
+        st.ced_lazy = false;
+        if (tail != null or want == .encode) try cedDrop(m, st);
+    }
     const n_tail = if (tail) |t| (t + span - 1) / span else 0;
     const targets: usize = if (m.n_mtp > 0) c.dsv4_n_dspark_target_layers else 0;
     // (+ 4: `Spans.whole`'s two slots for the chunk's spans and two for the tail's)
@@ -5707,15 +5721,45 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     }
     // A tensor rank past 0 holds no head: its last stream stands in for the logits.
     const logits = if (!m.hasHead()) try sc.astype(h, .float32) else try headLogits(&sc, m, h, want == .all and st.verify != null);
+    // ced_lazy.zig: a replay that another replaying chunk of the prompt follows is left to its first reader: the
+    // logits, the decoder layers' window rings and the DSpark rows stay unevaluated.
+    const lazy = tail != null and ced_lazy.on() and m.tp == null and m.streamed == null and ids == .host and
+        ced_lazy.defers(m.prompt, ids.host, p0, c.sliding_window, m.ced_min_skip, st.snap_at);
+    if (lazy and !ced_lazy_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_CED_LAZY engaged: a prompt chunk's CED replay left to its first reader (chunk at {d})\n", .{p0});
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(gpa);
-    try ev.append(gpa, logits);
-    for (st.layers) |*ls| try appendLayerState(gpa, &ev, ls);
-    for (st.ds) |r| try ev.append(gpa, r.buf);
+    if (!lazy) try ev.append(gpa, logits);
+    for (st.layers, 0..) |*ls, li| if (lazy and li >= m.ced_split.?) try appendCaches(gpa, &ev, ls) else try appendLayerState(gpa, &ev, ls);
+    if (!lazy) for (st.ds) |r| try ev.append(gpa, r.buf);
+    st.ced_lazy = lazy;
     const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_async_eval(vec));
     return sc.out(logits);
+}
+
+/// ced_lazy.zig: the last chunk's replay, never evaluated, dropped: the decoder layers' window rings and the DSpark
+/// stages' start again as zeros (the next replay writes every row a read reaches) and its main row goes.
+fn cedDrop(m: *const Dsv41Model, st: *State) !void {
+    for (st.layers[m.ced_split.?..]) |*ls| try freshRing(&ls.win, m.s);
+    for (st.ds) |*r| try freshRing(r, m.s);
+    if (st.mh.ctx != null) _ = mlx.mlx_array_free(st.mh);
+    st.mh = none;
+    log.info("[dsv41] CED_LAZY: the replay before position {d} dropped: this chunk replays its own tail\n", .{st.n});
+}
+
+fn freshRing(r: *Ring, s: S) !void {
+    const fresh = try Ring.init(r.cap, r.width, mlx.mlx_array_dtype(r.buf), s);
+    r.deinit();
+    r.* = fresh;
+}
+
+/// `appendLayerState` without the window ring: what the encoder side writes into a decoder layer.
+fn appendCaches(gpa: std.mem.Allocator, ev: *std.ArrayList(A), ls: *const LState) !void {
+    if (ls.comp) |r| if (r.buf.ctx != null) try ev.append(gpa, r.buf);
+    if (ls.idx_k) |r| if (r.buf.ctx != null) try ev.append(gpa, r.buf);
+    if (ls.pend_kv.ctx != null) try ev.append(gpa, ls.pend_kv);
+    if (ls.pend_gate.ctx != null) try ev.append(gpa, ls.pend_gate);
 }
 
 fn monoUs() i64 {
@@ -5729,6 +5773,8 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
     const n_spans = sp.xs.len;
     // Wide spans run a layer's row-wise stages over the whole chunk, attention's core per span.
     const wide = n_spans > 1 and sp.span > region_rows and m.trace == null;
+    // pass_async.zig: the pass's last wide layer is committed too.
+    const last_async = wide and m.streamed == null and m.pair == null and m.tp == null and pass_async.on(sp.L);
     // The kept projection outputs: a kept set no wide layer of this pass took is let go at its end.
     defer tkeep.drop();
     defer hv2.drop();
@@ -5757,7 +5803,7 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
             try appendLayerState(gpa, &ev, &st.layers[li]);
             // a wide layer with a wide one after it is committed, not waited for: the next layer's start
             // (its graph, its read-ahead's first buffers) runs under this one's tail.
-            if (wide and li + 1 < hi) {
+            if (wide and (li + 1 < hi or last_async)) {
                 const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
                 defer _ = mlx.mlx_vector_array_free(vec);
                 try mlx.check(mlx.mlx_async_eval(vec));
@@ -6102,7 +6148,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     // (`woaRun`); a run of one span is the span-by-span path.
     const run: usize = if (ly.wo_a.ext != null) @min(n_spans, woa.spansPer(sp.span)) else 1;
     // The span-by-span `wo_a` hands its rows' groups as views, joined once below (`attnOutAGroups`).
-    const woa_join = run == 1 and m.tp == null and env.on(.MLX_SERVE_DSV41_WOA_JOIN);
+    const woa_join = run == 1 and m.tp == null and env.onUnlessZero(.MLX_SERVE_DSV41_WOA_JOIN);
     if (woa_join and !woa_join_logged.swap(true, .monotonic)) log.info("[dsv41] WOA_JOIN engaged (layer {d}, spans {d})\n", .{ li, n_spans });
     const run_heads = try gpa.alloc(A, run);
     defer gpa.free(run_heads);
