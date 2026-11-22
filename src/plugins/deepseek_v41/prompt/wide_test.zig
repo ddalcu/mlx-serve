@@ -332,7 +332,8 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_MOE_EPI is the argsort pat
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
-    const unset = env.override(.MLX_SERVE_DSV41_PF_MOE_EPI, null);
+    // On by default: the argsort arm needs the explicit 0.
+    const unset = env.override(.MLX_SERVE_DSV41_PF_MOE_EPI, "0");
     defer unset.restore();
     inline for (.{ false, true }) |nv| inline for (.{ false, true }) |paired| {
         const pk = if (nv) env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, if (paired) "1" else "0") else env.override(.MLX_SERVE_DSV41_MOE_PAIR, if (paired) "1" else null);
@@ -349,7 +350,7 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_MOE_EPI is the argsort pat
         m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
         defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
         var ly: dsv41.Layer = undefined;
-        ly.gate_w = try sc.zeros(&.{ experts, 8 }, .bfloat16);
+        // No router weight: the pack takes its expert count from the banks, as a caller building the banks alone needs.
         ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .gu = try fp4Bank(&sc, 0x6A7E, experts, 2 * inter, hidden, nv), .down = try fp4Bank(&sc, 0xD0E1, experts, hidden, inter, nv) };
         if (nv) for (&ly.experts.scale, 0..) |*v, i| {
             v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x5CA1E + i);
@@ -364,7 +365,7 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_MOE_EPI is the argsort pat
             const got = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
             // MOE_TAIL reads the parts: the same down rows and unsort.
             const pw = blk: {
-                const off = env.override(.MLX_SERVE_DSV41_PF_MOE_EPI, null);
+                const off = env.override(.MLX_SERVE_DSV41_PF_MOE_EPI, "0");
                 defer off.restore();
                 break :blk try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
             };

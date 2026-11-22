@@ -4662,7 +4662,10 @@ pub fn moePrefillParts(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A,
     const e = &ly.experts;
     const dt = mlx.mlx_array_dtype(x);
     const flat = try sc.reshape(try sc.astype(idx, .uint32), &.{ci(n)});
-    const sp = (if (env.onUnlessZero(.MLX_SERVE_DSV41_PF_MOE_EPI)) try pfroute.pack(sc, flat, try sc.reshape(wts, &.{ci(n)}), k, dim(ly.gate_w, 0)) else null) orelse blk: {
+    // The pack's expert count is the down bank's: every layout stacks its experts on axis 0 (a tensor rank holds half of
+    // every expert), and a caller that builds the banks alone leaves the router's `gate_w` unset.
+    const pack_on = env.onUnlessZero(.MLX_SERVE_DSV41_PF_MOE_EPI) and e.down.w.ctx != null;
+    const sp = (if (pack_on) try pfroute.pack(sc, flat, try sc.reshape(wts, &.{ci(n)}), k, dim(e.down.w, 0)) else null) orelse blk: {
         var oo = mlx.mlx_array_new();
         const order = try sc.res(mlx.mlx_argsort_axis(&oo, flat, 0, sc.s), &oo);
         var oi = mlx.mlx_array_new();
