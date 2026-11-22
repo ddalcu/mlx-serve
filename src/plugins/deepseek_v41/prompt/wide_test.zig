@@ -11,6 +11,7 @@ const device = @import("../../../mlx/device.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const mpair = @import("moe_pair.zig");
 const pfroute = @import("pf_route.zig");
+const fp4gemm = @import("fp4_gemm.zig");
 const mtail = @import("moe_tail.zig");
 const hv2 = @import("hc_v2.zig");
 const fixture = @import("../decode/fixture.zig");
@@ -378,6 +379,55 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_MOE_EPI is the argsort pat
             try testing.expect(!try sameWords(want, bad));
         }
     };
+}
+
+test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_FP4_GEMM is today's output word for word, NVFP4 with per-expert scales and MXFP4, paired gate/up, odd prompt rows to 8192" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
+    // Off as "0", not unset: a run with the switch exported would unsetenv before the first stderr print, which
+    // std's lazy environ scan then reads past.
+    const unset = env.override(.MLX_SERVE_DSV41_PF_FP4_GEMM, "0");
+    defer unset.restore();
+    inline for (.{ true, false }) |nv| {
+        const pk = if (nv) env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1") else env.override(.MLX_SERVE_DSV41_MOE_PAIR, "1");
+        defer pk.restore();
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        var m: dsv41.Dsv41Model = undefined;
+        m.cfg = .{};
+        m.cfg.dsv4_swiglu_limit = 10;
+        m.act = .bfloat16;
+        m.moe_wt_kernel = null;
+        m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
+        m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
+        var ly: dsv41.Layer = undefined;
+        ly.gate_w = try sc.zeros(&.{ experts, 8 }, .bfloat16);
+        ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .gu = try fp4Bank(&sc, 0x6A7E, experts, 2 * inter, hidden, nv), .down = try fp4Bank(&sc, 0xD0E1, experts, hidden, inter, nv) };
+        if (nv) for (&ly.experts.scale, 0..) |*v, i| {
+            v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x5CA1E + i);
+        };
+        for ([_]usize{ 40, 777, 1254, 4097, 8192 }, 0..) |L, ci| {
+            var csc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+            defer csc.deinit();
+            const c = try call(&csc, L, @intCast(experts), 0x2100 + ci, false);
+            const want = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const on = env.override(.MLX_SERVE_DSV41_PF_FP4_GEMM, "1");
+            defer on.restore();
+            const before = fp4gemm.launches.load(.monotonic);
+            const got = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const served = fp4gemm.launches.load(.monotonic) - before;
+            const eq = try sameWords(want.dn, got.dn) and try sameWords(want.inv, got.inv);
+            std.debug.print("pf fp4 gemm moePrefill {s} rows {d}: staged launches {d}, same words {}\n", .{ if (nv) "NVFP4" else "MXFP4", L, served, eq });
+            try testing.expectEqual(@as(u32, 2), served);
+            try testing.expect(eq);
+            // Planted: each row's weights on the wrong experts.
+            const bad = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, try rolled(&csc, c.wts), c.sh);
+            try testing.expect(!try sameWords(want.dn, bad.dn));
+        }
+    }
 }
 
 // ── the hc stages ──

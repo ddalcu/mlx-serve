@@ -93,6 +93,8 @@ const mtail = @import("prompt/moe_tail.zig");
 const pfroute = @import("prompt/pf_route.zig");
 /// idx_nax.zig: a wide span's indexer scores on the matrix units (`MLX_SERVE_DSV41_PF_IDX_NAX`).
 const idx_nax = @import("prompt/idx_nax.zig");
+/// fp4_gemm.zig: a prompt call's fp4 routed experts on the staged NAX gather (`MLX_SERVE_DSV41_PF_FP4_GEMM`).
+const fp4gemm = @import("prompt/fp4_gemm.zig");
 /// launch fusions, each behind its own default-off switch (`Dsv41Model.fuse`).
 const fusion = @import("fuse.zig");
 const Shard = @import("../../sdk/weights/shard.zig").Shard;
@@ -4700,7 +4702,7 @@ pub fn moePrefillParts(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A,
         const lim = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.dsv4_swiglu_limit}, &[_]c_int{1}, 1, .float32));
         break :blk try flatKernel(sc, m.moe_act_kernel, &.{ try sc.reshape(y, &.{ ci(n), ci(2 * inter) }), w_sorted, lim }, &.{ ci(n), 1, ci(inter) }, dt, n * inter, &.{.{ .name = "N", .v = ci(inter) }});
     };
-    const dn = try sortedBank(sc, act, null, &e.down, sidx); // [n, 1, d]
+    const dn = (if (fp4gemm.on()) try fp4gemm.down(sc, &e.down, act, sidx) else null) orelse try sortedBank(sc, act, null, &e.down, sidx); // [n, 1, d]
     return .{ .dn = try sc.reshape(dn, &.{ ci(n), ci(d) }), .inv = inv, .sh = try sc.astype(sh, dt) };
 }
 
