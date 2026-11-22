@@ -3,7 +3,9 @@
 // against `fn`, all from registers: the stream is read once and never read back. The header's PRO picks the row:
 // 0 the stream `x` as it is (the attention side), 1 x1 = post * y + comb^T x rounded to T (the FFN side, x1 not
 // stored), 2 x1 as in 1, then x2 = post2 * y2 + comb2^T x1 rounded to T and stored (the layer's tail and the next
-// layer's attention side). MIXON 0: the tail's x2 alone. Every fma and rounding is hc_expand_norm's, hc_mix_norm's and
+// layer's attention side). MIXON 0: the tail's x2 alone. COMB 1 (PRO 2): y2 is moe_tail.metal's combine, made here
+// from the MoE's sorted down rows `dn` (K a row, unsorted by `inv`) and shared rows `sh`: f32 sums in route order plus
+// the shared row, rounded to T; the combined rows never go to memory. Every fma and rounding is hc_expand_norm's, hc_mix_norm's and
 // glm5's expand's; the sums run in another order.
 //
 // The release's shapes are compile-time: HC = 4, MIX = 24, D (5120) a template int, S d-slices a row (a template int).
@@ -33,6 +35,8 @@ constexpr int NSTEP = D / DC / S;
 #if PRO == 0
 constexpr int NP = HC;
 #elif PRO == 1
+constexpr int NP = HC + 1;
+#elif COMB
 constexpr int NP = HC + 1;
 #else
 constexpr int NP = HC + 2;
@@ -69,6 +73,10 @@ float pa[HC], ca[HC * HC];
 for (int i = 0; i < HC; ++i) pa[i] = post[lr * HC + i];
 for (int q = 0; q < HC * HC; ++q) ca[q] = comb[lr * HC * HC + q];
 #endif
+#if COMB
+uint iv[K];
+for (int j = 0; j < K; ++j) iv[j] = live ? inv[lr * K + j] : 0u;
+#endif
 #if PRO == 2
 float pb[HC], cb[HC * HC];
 for (int i = 0; i < HC; ++i) pb[i] = post2[lr * HC + i];
@@ -82,7 +90,7 @@ auto fetch = [&](int st, thread uint4* r) {
 #if PRO >= 1
   r[HC] = live ? *(const device uint4*)(y + lr * D + d) : uint4(0);
 #endif
-#if PRO == 2
+#if PRO == 2 && !COMB
   r[HC + 1] = live ? *(const device uint4*)(y2 + lr * D + d) : uint4(0);
 #endif
 };
@@ -123,6 +131,11 @@ for (int st = 0; st < NSTEP; ++st) {
 #endif
   }
   const int d = dlane + st * DC;
+#if COMB
+  uint4 dw[K], sw;
+  for (int j = 0; j < K; ++j) dw[j] = live ? *(const device uint4*)(dn + size_t(iv[j]) * D + d) : uint4(0);
+  sw = live ? *(const device uint4*)(sh + lr * D + d) : uint4(0);
+#endif
   float s[HC][8];
   #pragma clang loop unroll(full)
   for (int e = 0; e < 8; ++e) {
@@ -141,7 +154,13 @@ for (int st = 0; st < NSTEP; ++st) {
 #if PRO == 1
     for (int i = 0; i < HC; ++i) s[i][e] = x1[i];
 #else
+#if COMB
+    float ys = 0.0f;
+    for (int j = 0; j < K; ++j) ys += bfv(dw[j], e);
+    const float y2v = float(T(ys + bfv(sw, e)));
+#else
     const float y2v = bfv(raw[HC + 1], e);
+#endif
     for (int i = 0; i < HC; ++i) {
       float acc = 0.0f;
       for (int j = 0; j < HC; ++j) acc = fma(cb[j * HC + i], x1[j], acc);

@@ -40,30 +40,44 @@ pub const FIN_TG: usize = 128;
 pub const FSTEP: usize = HC * DC / 8 * 3 * 64;
 
 /// The mix kernel's variants: the stream as it is, the FFN side's x1, the tail's x2 (with the next layer's mixes, or
-/// alone).
-pub const Pro = enum { plain, ffn, tail, tail_only };
+/// alone), its MoE rows given (`y2`) or combined in the kernel from the MoE's parts (`_c`: moe_tail.metal's combine).
+pub const Pro = enum { plain, ffn, tail, tail_only, tail_c, tail_only_c };
+pub const all = [_]Pro{ .plain, .ffn, .tail, .tail_only, .tail_c, .tail_only_c };
 
+pub fn isTail(p: Pro) bool {
+    return p != .plain and p != .ffn;
+}
+pub fn mixes(p: Pro) bool {
+    return p != .tail_only and p != .tail_only_c;
+}
+pub fn combines(p: Pro) bool {
+    return p == .tail_c or p == .tail_only_c;
+}
 pub fn ins(p: Pro) []const [*:0]const u8 {
     return switch (p) {
         .plain => &.{ "x", "cpre", "fn" },
         .ffn => &.{ "x", "y", "post", "comb", "cpre", "fn" },
         .tail => &.{ "x", "y", "post", "comb", "y2", "post2", "comb2", "cpre", "fn" },
         .tail_only => &.{ "x", "y", "post", "comb", "y2", "post2", "comb2" },
+        .tail_c => &.{ "x", "y", "post", "comb", "dn", "inv", "sh", "post2", "comb2", "cpre", "fn" },
+        .tail_only_c => &.{ "x", "y", "post", "comb", "dn", "inv", "sh", "post2", "comb2" },
     };
 }
 pub fn outs(p: Pro) []const [*:0]const u8 {
     return switch (p) {
         .plain, .ffn => &.{ "hraw", "part" },
-        .tail => &.{ "x2", "hraw", "part" },
-        .tail_only => &.{"x2"},
+        .tail, .tail_c => &.{ "x2", "hraw", "part" },
+        .tail_only, .tail_only_c => &.{"x2"},
     };
 }
 pub fn header(p: Pro) [:0]const u8 {
     return switch (p) {
-        .plain => "#define PRO 0\n#define MIXON 1\n",
-        .ffn => "#define PRO 1\n#define MIXON 1\n",
-        .tail => "#define PRO 2\n#define MIXON 1\n",
-        .tail_only => "#define PRO 2\n#define MIXON 0\n",
+        .plain => "#define PRO 0\n#define MIXON 1\n#define COMB 0\n",
+        .ffn => "#define PRO 1\n#define MIXON 1\n#define COMB 0\n",
+        .tail => "#define PRO 2\n#define MIXON 1\n#define COMB 0\n",
+        .tail_only => "#define PRO 2\n#define MIXON 0\n#define COMB 0\n",
+        .tail_c => "#define PRO 2\n#define MIXON 1\n#define COMB 1\n",
+        .tail_only_c => "#define PRO 2\n#define MIXON 0\n#define COMB 1\n",
     };
 }
 pub fn name(p: Pro) [:0]const u8 {
@@ -72,8 +86,12 @@ pub fn name(p: Pro) [:0]const u8 {
         .ffn => "dsv41_hc_v2_ffn",
         .tail => "dsv41_hc_v2_tail",
         .tail_only => "dsv41_hc_v2_tail_only",
+        .tail_c => "dsv41_hc_v2_tail_c",
+        .tail_only_c => "dsv41_hc_v2_tail_only_c",
     };
 }
+/// The routes a row the combine sums (the release's top 6).
+pub const K: usize = 6;
 pub const fin_ins = [_][*:0]const u8{ "part", "hraw", "scale", "base", "w", "eps" };
 pub const fin_outs = [_][*:0]const u8{ "z", "pre", "post", "comb", "h" };
 
@@ -86,7 +104,7 @@ pub fn slicesFor(L: usize) usize {
 
 /// The kernels and the attention side handed to the next layer; one copy across `-Dunits` units.
 const State = struct {
-    k: [4]?mlx.mlx_fast_metal_kernel = @splat(null),
+    k: [all.len]?mlx.mlx_fast_metal_kernel = @splat(null),
     fin: ?mlx.mlx_fast_metal_kernel = null,
     logged: bool = false,
     slot: Slot = .{},
@@ -156,8 +174,8 @@ fn rows(x: A) usize {
 pub fn mixLaunch(sc: *dsv41.Scope, p: Pro, in: []const A, L: usize, S: usize) ![3]A {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    if (p == .tail or p == .tail_only) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), HC, D }, 3, .bfloat16));
-    if (p != .tail_only) {
+    if (isTail(p)) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), HC, D }, 3, .bfloat16));
+    if (mixes(p)) {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), D }, 2, .bfloat16));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(S), ci(L), PW }, 3, .float32));
     }
@@ -166,22 +184,23 @@ pub fn mixLaunch(sc: *dsv41.Scope, p: Pro, in: []const A, L: usize, S: usize) ![
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", D));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "S", ci(S)));
+    if (combines(p)) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", K));
     const iv = mlx.mlx_vector_array_new_data(in.ptr, in.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, try kernel(p), iv, cfg, sc.s));
     var got: [3]A = .{ none, none, none };
-    const n: usize = switch (p) {
-        .plain, .ffn => 2,
-        .tail => 3,
-        .tail_only => 1,
-    };
+    const n = nOuts(p);
     for (got[0..n], 0..) |*o, k| {
         var a = mlx.mlx_array_new();
         o.* = try sc.res(mlx.mlx_vector_array_get(&a, ov, k), &a);
     }
     return got;
+}
+
+pub fn nOuts(p: Pro) usize {
+    return (if (isTail(p)) @as(usize, 1) else 0) + (if (mixes(p)) @as(usize, 2) else 0);
 }
 
 pub const Res = struct { z: A, n: dsv41.Normed };
@@ -247,21 +266,47 @@ pub fn ffn(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, y: A, sa: *const 
 /// The next layer's attention side, made in the tail: its mix weights and norm.
 pub const Next = struct { hc: *const dsv41.Hc, norm_w: A };
 pub const Tail = struct { x2: A, next: ?Res };
+/// The MoE's output for the tail: its rows `[L, D]`, or its down rows, unsort and shared rows (`moePrefillParts`) for
+/// the kernel to combine.
+pub const Moe = union(enum) { rows: A, parts: dsv41.MoeParts };
 
-/// The tail: x2 = post2 y2 + comb2^T x1 (`sf`) where x1 = post y + comb^T x (`sa`), and with `nx` the next layer's
-/// attention side of x2 (its collapse with `sf.pre`, the next layer's previous mix).
-pub fn tail(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, y: A, sa: *const dsv41.Split, y2: A, sf: *const dsv41.Split, nx: ?Next) !Tail {
+/// The tail: x2 = post2 y2 + comb2^T x1 (`sf`) where x1 = post y + comb^T x (`sa`) and y2 the MoE's output, and with
+/// `nx` the next layer's attention side of x2 (its collapse with `sf.pre`, the next layer's previous mix).
+pub fn tail(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, y: A, sa: *const dsv41.Split, y2: Moe, sf: *const dsv41.Split, nx: ?Next) !Tail {
     const L = rows(x);
     const S = slicesFor(L);
     engaged(L);
     const yb = try bf16(sc, y);
-    const y2b = try bf16(sc, y2);
+    var in: [11]A = undefined;
+    var n_in: usize = 0;
+    for ([_]A{ x, yb, sa.post, sa.comb }) |a| {
+        in[n_in] = a;
+        n_in += 1;
+    }
+    const c = y2 == .parts;
+    switch (y2) {
+        .rows => |r| {
+            in[n_in] = try bf16(sc, r);
+            n_in += 1;
+        },
+        .parts => |p| for ([_]A{ try bf16(sc, p.dn), try sc.astype(p.inv, .uint32), try bf16(sc, p.sh) }) |a| {
+            in[n_in] = a;
+            n_in += 1;
+        },
+    }
+    for ([_]A{ sf.post, sf.comb }) |a| {
+        in[n_in] = a;
+        n_in += 1;
+    }
     const n = nx orelse {
-        const o = try mixLaunch(sc, .tail_only, &.{ x, yb, sa.post, sa.comb, y2b, sf.post, sf.comb }, L, S);
+        const o = try mixLaunch(sc, if (c) .tail_only_c else .tail_only, in[0..n_in], L, S);
         return .{ .x2 = o[0], .next = null };
     };
+    in[n_in] = sf.pre;
+    in[n_in + 1] = n.hc.fn_w;
+    n_in += 2;
     const eps = try dsv41.hcEps(sc, m);
-    const o = try mixLaunch(sc, .tail, &.{ x, yb, sa.post, sa.comb, y2b, sf.post, sf.comb, sf.pre, n.hc.fn_w }, L, S);
+    const o = try mixLaunch(sc, if (c) .tail_c else .tail, in[0..n_in], L, S);
     return .{ .x2 = o[0], .next = try finLaunch(sc, o[2], o[1], n.hc, n.norm_w, eps, S, m.cfg.dsv4_hc_sinkhorn_iters) };
 }
 
