@@ -5,7 +5,6 @@
 //! and two takes. Ties keep pair order, as MLX's argsort does, so the outputs are the same words.
 
 const std = @import("std");
-const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
 const vk = @import("../../../sdk/blocks/moe/verify_kernels.zig");
@@ -20,13 +19,7 @@ pub const Sorted = struct { inv: A, rows: A, sidx: A, w: A };
 var engaged_logged: std.atomic.Value(bool) = .init(false);
 
 /// `flat` `[n]` uint32 expert ids of `n / k` rows (`k` a row), `wts` `[n]` f32, ids under `experts`; null where the
-/// switch is off or the pack declines (decode widths, more than 1024 experts).
-pub fn sorted(sc: *dsv41.Scope, flat: A, wts: A, k: usize, experts: usize) !?Sorted {
-    if (!env.on(.MLX_SERVE_DSV41_PF_MOE_EPI)) return null;
-    return try pack(sc, flat, wts, k, experts);
-}
-
-/// `sorted` with the switch unread.
+/// pack declines (decode widths, more than 1024 experts). The caller reads the switch.
 pub fn pack(sc: *dsv41.Scope, flat: A, wts: A, k: usize, experts: usize) !?Sorted {
     var p = (try vk.moePrefillRoutePack(sc.s, flat, @intCast(k), @intCast(experts))) orelse return null;
     const inv = sc.keep(p.inverse) catch |e| {

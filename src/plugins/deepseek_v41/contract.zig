@@ -11,6 +11,8 @@ const v41 = @import("deepseek_v41.zig");
 const qtail = @import("prompt/q_tail.zig");
 const hcf = @import("prompt/hc_fuse.zig");
 const sx1 = @import("prompt/scratch_x1.zig");
+const hmma = @import("prompt/hc_mix_mma.zig");
+const mtail = @import("prompt/moe_tail.zig");
 const gtwin = @import("decode/gemv_twin.zig");
 const ggemm = @import("prompt/gate_gemm.zig");
 const markov = @import("spec/markov.zig");
@@ -622,6 +624,76 @@ const MoeCombine = struct {
     }
 };
 
+/// kernels/moe_tail.metal (`MLX_SERVE_DSV41_MOE_TAIL`): moe_combine's rows (rounded to T), then the hc expand from them.
+const MoeTail = struct {
+    pub const Params = struct { k: usize = TOPK };
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n == 0 or s.n % 4 != 0 or s.k != p.k) return null;
+        var g = metal.Geometry{ .grid = .{ ci(s.n / 4), ci(s.rows), 1 }, .tg = .{ ci(@min(256, s.n / 4)), 1, 1 } };
+        g.out(&.{ ci(s.rows), HC, ci(s.n) }, act);
+        g.dtype("T", act);
+        g.int("HC", HC);
+        g.int("D", s.n);
+        g.int("K", p.k);
+        return g;
+    }
+
+    /// moe_combine's `dn`, `inv` and `sh`, then the expand's `res`, `post` and `comb`.
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        try MoeCombine.fill(k, f, rng);
+        const L = k.shape.rows;
+        const D = k.shape.n;
+        const res = try k.add(act, &.{ L, HC, D });
+        const post = try k.add(.float32, &.{ L, HC });
+        const comb = try k.add(.float32, &.{ L, HC, HC });
+        kit.uniform(rng, res, -3, 3);
+        kit.uniform(rng, post, 0, 2);
+        kit.uniform(rng, comb, 0, 0.5);
+        if (f == .nonfinite) kit.plantRows(res, L, HC * D);
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * HC * s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const D = k.shape.n;
+        const K = k.p.k;
+        const res = k.in(3);
+        const post = k.in(4);
+        const comb = k.in(5);
+        var t: [17]f64 = undefined;
+        for (0..k.shape.rows) |l| for (0..D) |d| {
+            var ym: f64 = 0;
+            for (0..K) |j| {
+                const row: usize = @intFromFloat(k.in(1)[l * K + j]);
+                t[j] = k.in(0)[row * D + d];
+            }
+            t[K] = k.in(2)[l * D + d];
+            for (t[0 .. K + 1]) |v| ym += @abs(v);
+            // The combined row rounds to T before the expand reads it.
+            const y = bf(sum.of(t[0 .. K + 1]));
+            for (0..HC) |i| {
+                const o = (l * HC + i) * D + d;
+                var v = post[l * HC + i] * y;
+                var m = @abs(post[l * HC + i]) * ym;
+                for (0..HC) |j| {
+                    const c = comb[(l * HC + j) * HC + i] * res[(l * HC + j) * D + d];
+                    v += c;
+                    m += @abs(c);
+                }
+                out[o] = v;
+                mag[o] = m;
+            }
+        };
+    }
+};
+
+fn depthTail(s: Shape) usize {
+    return s.k + 1 + HC;
+}
+
 // ── hyper-connections: mix (dots and rms of the flattened stream), split (Sinkhorn), norm (split + collapse + rms) ──
 
 /// One row's split of the mixes `z`: pre = sigmoid + eps, post = 2 sigmoid, comb = softmax rows + eps, then
@@ -789,6 +861,29 @@ const HcMix = struct {
         defer _ = mlx.mlx_fast_metal_kernel_free(m.hc_mix_kernel);
         const hc: v41.Hc = .{ .fn_w = k.args[1], .scale = k.args[2], .base = k.args[3] };
         return k.rig.bytesOf(&.{try v41.hcMixWide(&sc, &m, k.args[0], &hc, k.args[4])});
+    }
+};
+
+// ── hc_mix_mma: hc_mix's mixes on the simdgroup matrix units (`MLX_SERVE_DSV41_HC_MIX_TILED`) ──
+
+const HcMixMma = struct {
+    pub const Params = struct {};
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or (HC * s.n) % hmma.KC != 0) return null;
+        const rows = hmma.RT * 8;
+        var g = metal.Geometry{ .grid = .{ ci((s.rows + rows - 1) / rows * hmma.RT * 32), 1, 1 }, .tg = .{ ci(hmma.RT * 32), 1, 1 } };
+        g.out(&.{ ci(s.rows), MIX }, .float32);
+        g.int("RT", hmma.RT);
+        g.int("MT", MIX / 8);
+        return g;
+    }
+
+    pub const fill = HcMix.fill;
+    pub const compute = HcMix.compute;
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * MIX;
     }
 };
 
@@ -4143,6 +4238,7 @@ const flash_l = metal.Launch{ .name = "dsv41_attn_flash", .inputs = &v41.GatherA
 const gather_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 } };
 const qk_t_l = metal.Launch{ .name = "dsv41_attn_qk_t", .inputs = &.{ "q", "kw", "comp", "picks", "meta", "qt" }, .outputs = &.{"s"}, .source = qtail.attn_qk_t_source, .header = v41.MPP_HEADER, .tg_bytes = 2 * 64 * 64 * 2, .offline = false, .min_gen = 17 };
 const mix_norm_l = launch("dsv41_hc_mix_norm", &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, &.{ "z", "h_out", "h2" }, hcf.mix_norm_source, "", 4 * (4 * 6 + 4) * 32, 1024, true);
+const mix_mma_l = metal.Launch{ .name = "dsv41_hc_mix_mma", .inputs = &hmma.ins, .outputs = &.{"z"}, .source = hmma.source, .header = "", .tg_bytes = 4 * (hmma.RT * 8 * hmma.KC + hmma.KC * MIX + hmma.RT * 8 * MIX + hmma.RT * 8 * 4) };
 /// The wide mixes at 8 rows a threadgroup (`MLX_SERVE_DSV41_HC_MIX8`), served on NAX GPUs only.
 const mix8_l = metal.Launch{ .name = "dsv41_hc_mix", .inputs = &.{ "x", "fn", "scale", "base", "eps" }, .outputs = &.{"z"}, .source = v41.HC_MIX_SOURCE, .header = "", .tg_bytes = 4 * (8 * 6 + 8) * 32, .adapts = true, .min_gen = 17 };
 const mix_norm8_l = metal.Launch{ .name = "dsv41_hc_mix_norm", .inputs = &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, .outputs = &.{ "z", "h_out", "h2" }, .source = hcf.mix_norm_source, .header = "", .tg_bytes = 4 * (8 * 6 + 8) * 32, .adapts = true, .min_gen = 17 };
@@ -4169,6 +4265,7 @@ fn GgufMoe(comptime ty: gguf_quants.GgmlType) type {
 const dn_l = launch("dsv41_moe_dn", moe_dn_ins, &.{"out"}, v41.MOE_DN_SOURCE, v41.MOE_HEADER, 0, 928, false);
 const act_l = launch("dsv41_moe_act", &.{ "y", "wts", "lim" }, &.{"out"}, v41.MOE_ACT_SOURCE, "", 0, 1024, false);
 const combine_l = launch("dsv41_moe_combine", &.{ "dn", "inv", "sh" }, &.{"out"}, v41.MOE_COMBINE_SOURCE, "", 0, 1024, false);
+const moe_tail_l = launch("dsv41_moe_tail", &mtail.ins, &.{"out"}, mtail.source, "", 0, 1024, false);
 
 pub const relu_nan: spec.Known = .{ .gate = .nonfinite, .finding = "a NaN q . k dot scores as 0: metal::max(dot, 0) drops NaN where relu (the reference, torch) propagates it" };
 pub const quant_nan: spec.Nan = .{ .stated = "classes as float64 gives them; quantized entries within the quantizer's envelope of their bounds" };
@@ -4244,6 +4341,15 @@ pub fn register(set: *kc.Set) !void {
         .tiles = .{ .{ .size = 8 }, .{}, .{} },
         .served = &.{ .{ .rows = 17, .n = DIM, .k = HC * DIM }, .{ .rows = 64, .n = DIM, .k = HC * DIM } },
         .nax = true,
+    });
+    try kit.add(set, HcMixMma, &mix_mma_l, .{}, .{
+        .name = "dsv41 hc_mix_mma (wide mixes on the simdgroup matrix units)",
+        .accum = .f32,
+        .depth = depthK,
+        .ops = 4,
+        .out = .f32,
+        .tiles = .{ .{ .size = hmma.RT * 8 }, .{}, .{} },
+        .served = &.{ .{ .rows = 17, .n = DIM, .k = HC * DIM }, .{ .rows = 64, .n = DIM, .k = HC * DIM } },
     });
     try kit.add(set, HcNorm, &norm_l, .{}, .{
         .name = "dsv41 hc_norm (split + normed collapse)",
@@ -4513,6 +4619,15 @@ pub fn register(set: *kc.Set) !void {
         .name = "dsv41 moe_combine (prefill unsort + K-sum + shared)",
         .accum = .f32,
         .depth = depthK1,
+        .out = .bf16,
+        .served = &.{ .{ .rows = 17, .n = DIM, .k = TOPK }, .{ .rows = 64, .n = 256, .k = TOPK } },
+    });
+    try kit.add(set, MoeTail, &moe_tail_l, .{}, .{
+        .name = "dsv41 moe_tail (prefill combine + hc expand)",
+        .accum = .f32,
+        .depth = depthTail,
+        .ops = 2,
+        .mids = 1,
         .out = .bf16,
         .served = &.{ .{ .rows = 17, .n = DIM, .k = TOPK }, .{ .rows = 64, .n = 256, .k = TOPK } },
     });
@@ -4959,6 +5074,11 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         try Expect.same(r.c, r.bytes, &.{ f.z, f.n.h, f.h2 });
     }
     {
+        const r = try ours(HcMixMma, a, &mix_mma_l, .{}, .{ .rows = 37, .n = 320, .k = HC * 320 });
+        const hc: v41.Hc = .{ .fn_w = r.c.args[1], .scale = r.c.args[2], .base = r.c.args[3] };
+        try Expect.same(r.c, r.bytes, &.{try hmma.launch(&sc, r.c.args[0], &hc, r.c.args[4])});
+    }
+    {
         const r = try ours(RopeTailOnly, a, &rope_only_l, .{}, .{ .rows = 3, .n = 4, .k = HD });
         try Expect.same(r.c, r.bytes, &.{try v41.ropeTailOnly(&sc, m, r.c.args[0], r.c.args[1], r.c.args[2])});
     }
@@ -5093,5 +5213,10 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
     {
         const r = try ours(MoeCombine, a, &combine_l, .{}, .{ .rows = 3, .n = 256, .k = TOPK });
         try Expect.same(r.c, r.bytes, &.{try v41.flatKernel(&sc, m.moe_combine_kernel, r.c.args[0..3], &.{ 3, 256 }, act, 3 * 256, &.{ .{ .name = "D", .v = 256 }, .{ .name = "K", .v = TOPK } })});
+    }
+    {
+        const r = try ours(MoeTail, a, &moe_tail_l, .{}, .{ .rows = 3, .n = 256, .k = TOPK });
+        const sp: v41.Split = .{ .pre = none, .post = r.c.args[4], .comb = r.c.args[5] };
+        try Expect.same(r.c, r.bytes, &.{try mtail.launch(&sc, .{ .dn = r.c.args[0], .inv = r.c.args[1], .sh = r.c.args[2] }, r.c.args[3], &sp)});
     }
 }
