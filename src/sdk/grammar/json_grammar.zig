@@ -456,6 +456,9 @@ fn stepString(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
                 return .consumed;
             }
             if (byte == '\\') {
+                // Every escape adds one to the length: at maxLength none can
+                // finish and the mask would come back empty. `"` is the way out.
+                if (schema.str_max_len) |max| if (s.byte_count >= max) return .reject;
                 s.phase = .after_backslash;
                 g.top().sub = .{ .in_string = s };
                 return .consumed;
@@ -983,6 +986,39 @@ test "grammar respects minLength and maxLength" {
         var g = try Grammar.init(testing.allocator, &schema);
         defer g.deinit();
         try testing.expectError(error.GrammarRejected, feed(&g, "\"abcd"));
+    }
+}
+
+test "a string at maxLength admits its closing quote and no escape" {
+    // A `\` at maxLength opens an escape no character can finish, so the mask
+    // comes back empty. maxLength counts raw bytes and whole escapes, one each.
+    const max3 =
+        \\{"type":"string","maxLength":3}
+    ;
+    const exactly3 =
+        \\{"type":"string","minLength":3,"maxLength":3}
+    ;
+    const cases = [_]struct { schema: []const u8, prefix: []const u8, byte: u8, ok: bool }{
+        .{ .schema = max3, .prefix = "\"abc", .byte = '\\', .ok = false },
+        .{ .schema = max3, .prefix = "\"abc", .byte = '"', .ok = true },
+        .{ .schema = max3, .prefix = "\"ab\\u00e9", .byte = '\\', .ok = false },
+        .{ .schema = max3, .prefix = "\"a\xc3\xa9", .byte = '\\', .ok = false },
+        // One unit short, an escape still finishes.
+        .{ .schema = max3, .prefix = "\"ab", .byte = '\\', .ok = true },
+        .{ .schema = max3, .prefix = "\"ab\\", .byte = 'n', .ok = true },
+        .{ .schema = max3, .prefix = "\"ab\\u00e", .byte = '9', .ok = true },
+        .{ .schema = exactly3, .prefix = "\"ab", .byte = '"', .ok = false },
+        .{ .schema = exactly3, .prefix = "\"ab\\n", .byte = '"', .ok = true },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("prefix {s} byte {c}\n", .{ c.prefix, c.byte });
+        var schema = try parseSchema(testing.allocator, c.schema);
+        defer schema.deinit();
+        var g = try Grammar.init(testing.allocator, &schema);
+        defer g.deinit();
+        try feed(&g, c.prefix);
+        const mask = try g.allowedBytes();
+        try testing.expectEqual(c.ok, mask.contains(c.byte));
     }
 }
 

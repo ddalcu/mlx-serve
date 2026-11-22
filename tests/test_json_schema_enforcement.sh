@@ -310,5 +310,37 @@ fi
 run_test "chat array at maxItems" "$( [ "$OK" = ok ] && echo PASS || echo FAIL )" "$OK"
 echo ""
 
+# ── Case I: a string that reaches maxLength closes; an escape opened there killed the mask ──
+echo "--- Case I: /v1/chat/completions + string at maxLength ---"
+QUOTE_SCHEMA='{"type":"object","additionalProperties":false,"required":["quote"],"properties":{"quote":{"type":"string","maxLength":20}}}'
+LOG_MARK=$(wc -l < /tmp/mlx-serve-schema-test.log)
+OK=ok
+for SEED in $(seq 1 30); do
+    BODY=$(jq -n --argjson schema "$QUOTE_SCHEMA" --argjson seed "$SEED" '{
+        model:"mlx-serve",
+        messages:[{role:"user",content:"Quote a famous line about Kyoto, keeping its double quotes."}],
+        response_format:{type:"json_schema",json_schema:{name:"quote",schema:$schema,strict:true}},
+        max_tokens:64, temperature:0.7, seed:$seed, enable_thinking:false
+    }')
+    R=$(curl -sf "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "$BODY" | python3 -c '
+import sys, json
+try:
+    c = json.loads(sys.stdin.read())["choices"][0]
+    o = json.loads(c["message"]["content"] or "")
+except Exception:
+    print("fail:no_json_reply"); sys.exit()
+if c["finish_reason"] != "stop" or not isinstance(o, dict) or set(o) != {"quote"} \
+        or not isinstance(o["quote"], str) or len(o["quote"]) > 20:
+    print("fail:off_schema:" + repr(o)[:80]); sys.exit()
+print("ok")
+')
+    [ "$R" = ok ] || OK="$R (seed $SEED)"
+done
+if tail -n +"$((LOG_MARK + 1))" /tmp/mlx-serve-schema-test.log | grep -q "disabling further mask enforcement"; then
+    OK="fail:mask_disabled"
+fi
+run_test "chat string at maxLength" "$( [ "$OK" = ok ] && echo PASS || echo FAIL )" "$OK"
+echo ""
+
 echo "=== Result: $PASS/$TOTAL passed ==="
 [ "$FAIL" -eq 0 ]

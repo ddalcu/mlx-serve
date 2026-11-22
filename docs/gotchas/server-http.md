@@ -400,6 +400,7 @@ property seen, leaving no legal byte; the sampler drew id 0 and enforcement swit
 when nothing can follow; a zero-count mask is a named bug before degrading. Guard:
 `tests/test_json_schema_enforcement.sh`.
 Same for an array at `maxItems`: its comma left only whitespace, then an empty mask, so `,` is refused there.
+Same for a string at `maxLength`: a `\` there opened an escape no character could finish, so `\` is refused there.
 
 ### JSON-schema decode was 60x slower on Flash Next (#380)
 Defect: 0.9 tok/s against 54 without `response_format`. Cause: `buildMask` walked all 248k tokens through the grammar
