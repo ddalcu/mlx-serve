@@ -198,6 +198,11 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
     const gpa = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const iou = @import("../../../sdk/util/io_util.zig");
+    // `DSV41_DEC_UBENCH` naming "nvfp4" or "mxfp4": the experts in that format, the fp4 MoE kernels' levers off against
+    // the arms it names (`layersFp4Levers`).
+    if (env.span(.DSV41_DEC_UBENCH)) |v| for ([_][]const u8{ "nvfp4", "mxfp4" }) |f| {
+        if (std.mem.indexOf(u8, v, f) != null) return layersFp4Levers(gpa, f[0] == 'n', v);
+    };
     // A fixture an arm: the compiled `.ffn` region keeps the MoE kernels of its first trace.
     for ([_]bool{ true, false }) |fused| {
         // 64 experts a layer: 20 layers hold ~20 GB, so a step's weights come from DRAM, not the SLC.
@@ -221,6 +226,73 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
             std.debug.print("[dec-ubench] layers 20..40 R={d} {s}: {d:.1} us a layer (median step {d:.0} us)\n", .{ rows, if (fused) "fused" else "chain", times[times.len / 2] / 20, times[times.len / 2] });
         }
     }
+}
+
+/// The layers ubench over fp4 experts (`nv`: NVFP4 with per-expert scales, else MXFP4), R = 1..6: the fp4 MoE
+/// kernels' levers (`moe_fp4.Levers`) off (A) against each B arm, A first, twice over (a fixture an arm). B arms: the
+/// words "dw", "us" (one lever each) and "all" in `DSV41_DEC_UBENCH`, else the levers as their switches are set.
+fn layersFp4Levers(gpa: std.mem.Allocator, nv: bool, spec_: []const u8) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const iou = @import("../../../sdk/util/io_util.zig");
+    const L = moe_fp4.Levers;
+    const Arm = struct { []const u8, L };
+    const named = [_]Arm{
+        .{ "dw", .{ .dec_word = true } },
+        .{ "us", .{ .up_split = true } },
+        .{ "all", .{ .dec_word = true, .up_split = true } },
+    };
+    var arms: [1 + named.len]Arm = undefined;
+    arms[0] = .{ "A (off)", .{} };
+    var n: usize = 1;
+    var it = std.mem.tokenizeAny(u8, spec_, " ,:");
+    while (it.next()) |w| for (named) |c| if (std.mem.eql(u8, w, c[0])) {
+        arms[n] = c;
+        n += 1;
+    };
+    if (n == 1) {
+        arms[1] = .{ "as set", L.fromEnv() };
+        n = 2;
+    }
+    std.debug.print("[dec-ubench] layers 20..40 {s} experts, {d} arms, two rounds\n", .{ if (nv) "nvfp4 + per-expert scales" else "mxfp4", n });
+    var us: [1 + named.len][max_rows]f64 = undefined;
+    for (&us) |*row| row.* = @splat(0);
+    for (0..2 * n) |k| {
+        const arm = arms[k % n];
+        const lv = arm[1];
+        const o0 = env.override(.MLX_SERVE_DSV41_FP4_DEC_WORD, if (lv.dec_word) "1" else "0");
+        defer o0.restore();
+        const o1 = env.override(.MLX_SERVE_DSV41_FP4_UP_SPLIT, if (lv.up_split) "1" else "0");
+        defer o1.restore();
+        const t_fx = iou.nowUsMonotonic(io);
+        // 64 experts a layer: 20 layers hold ~30 GB, so a step's weights come from DRAM, not the SLC.
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 40, .experts = 64, .ctx = 4096, .fused = true, .experts_fp4 = !nv, .experts_nvfp4 = nv, .expert_scales = if (nv) .all else .none });
+        defer fx.deinit();
+        std.debug.print("[dec-ubench] arm {s}: fixture {d:.1} s\n", .{ arm[0], @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t_fx)) / 1e6 });
+        var p0: usize = 4096;
+        for (1..max_rows + 1) |rows| {
+            const x = try fx.stream(rows);
+            defer _ = mlx.mlx_array_free(x);
+            const pre = try fx.cpre(rows);
+            defer _ = mlx.mlx_array_free(pre);
+            var times: [21]f64 = undefined;
+            for (0..3 + times.len) |rep| {
+                const t0 = iou.nowUsMonotonic(io);
+                const out = try dsv41.workerStep(fx.m, gpa, x, pre, p0, false, false);
+                for (out) |o| _ = mlx.mlx_array_free(o);
+                if (rep >= 3) times[rep - 3] = @floatFromInt(iou.nowUsMonotonic(io) - t0);
+                p0 += rows;
+            }
+            std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+            const med = times[times.len / 2] / 20;
+            us[k % n][rows - 1] += med / 2;
+            std.debug.print("[dec-ubench] layers 20..40 R={d} {s}: {d:.1} us a layer (median step {d:.0} us, p10 {d:.0}, p90 {d:.0})\n", .{ rows, arm[0], med, times[times.len / 2], times[times.len / 10], times[times.len * 9 / 10] });
+        }
+    }
+    for (1..max_rows + 1) |rows| for (1..n) |j| {
+        const a = us[0][rows - 1];
+        const b = us[j][rows - 1];
+        std.debug.print("[dec-ubench] layers 20..40 R={d} {s}: {d:.1} us a layer against A {d:.1} ({d:.1} us, {d:.2}%)\n", .{ rows, arms[j][0], b, a, b - a, 100 * (b - a) / a });
+    };
 }
 
 test {
