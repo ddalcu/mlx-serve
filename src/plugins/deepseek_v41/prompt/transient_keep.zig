@@ -107,7 +107,7 @@ pub fn drop() void {
 }
 
 test "dsv41 transient keep: a wide layer's output not yet evaluated is kept by reference, its buffer never read" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     drop();
     defer drop();
     const s = mlx.gpuStream();
