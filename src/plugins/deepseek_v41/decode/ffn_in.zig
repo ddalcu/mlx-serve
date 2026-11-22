@@ -1501,6 +1501,47 @@ test "dsv41 dec ffn_in nax: MLX_SERVE_DSV41_GEMV_R26_FFN_IN=1, rows 1..6 on laye
     if (equivalence(gpa, fx, ks, &ly, bad, 4)) |_| return error.PlantedBugPassed else |_| {}
 }
 
+test "dsv41 dec ffn_in fused: the same inputs give the same bytes, launch after launch, at the release's shapes" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .ctx = 8 });
+    defer fx.deinit();
+    const ks = try build();
+    defer free(ks);
+    const w = try randomWeights(84);
+    defer freeWeights(w);
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const eps = try dsv41.hcEps(&sc, fx.m);
+    const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{fx.m.cfg.router_scaling_factor}, &[_]c_int{1}, 1, .float32));
+    for ([_]usize{ 1, 6 }) |rows| {
+        const oa = try fx.normal(&.{ ci(rows), 8192 }, act, 0, 1);
+        defer _ = mlx.mlx_array_free(oa);
+        const x = try fx.stream(rows);
+        defer _ = mlx.mlx_array_free(x);
+        const cpre = try fx.cpre(rows);
+        defer _ = mlx.mlx_array_free(cpre);
+        const sa = (try dsv41.hcStage(&sc, fx.m, x, null, cpre, &fx.layer(21).hc_attn, fx.layer(21).attn_norm)).sp;
+        const p: Dims = .{ .rows = rows };
+        var first: ?[]u8 = null;
+        defer if (first) |f| gpa.free(f);
+        // The router's logits and the hv sums gather from 40 column slices: their sum must not follow arrival order.
+        for (0..24) |_| {
+            const o = try launchFused(&sc, ks.fused, ks.facc, p, w, oa, x, &sa, eps, scal);
+            const outs = [_]A{ o.h2, o.sf.pre, o.sf.post, o.sf.comb, o.idx, o.wts };
+            try dsv41.evalAll(&outs);
+            var bytes: std.ArrayList(u8) = .empty;
+            defer bytes.deinit(gpa);
+            for (outs) |a| {
+                const n = mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a);
+                const d = mlx.mlx_array_data_uint8(a) orelse return error.NoData;
+                try bytes.appendSlice(gpa, d[0..n]);
+            }
+            if (first) |f| try std.testing.expectEqualSlices(u8, f, bytes.items) else first = try gpa.dupe(u8, bytes.items);
+        }
+    }
+}
+
 test "dsv41 dec ffn_in fused: a planted dropped router bias fails the equivalence" {
     if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     var ov = env.override(.MLX_SERVE_DSV41_FUSE_FFN_IN, "1");
