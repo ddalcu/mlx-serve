@@ -41,10 +41,9 @@ pub fn buildPlant() !mlx.mlx_fast_metal_kernel {
     return dsv41.buildKernel("dsv41_dec_wo_a_plain_plant", &INS, &OUTS, SOURCE, PLANT_HEADER);
 }
 
-/// `MLX_SERVE_DSV41_WOA_PLAIN` (read each call): =1 the decode attention's output takes `apply`.
+/// `MLX_SERVE_DSV41_WOA_PLAIN` (on by default, read each call; =0 `dec_wo_a`): the decode attention's output takes `apply`.
 pub fn on() bool {
-    const v = env.get(.MLX_SERVE_DSV41_WOA_PLAIN) orelse return false;
-    return v[0] == '1';
+    return env.onUnlessZero(.MLX_SERVE_DSV41_WOA_PLAIN);
 }
 
 fn ci(v: usize) c_int {
