@@ -85,6 +85,8 @@ const ced_lazy = @import("prompt/ced_lazy.zig");
 const pass_async = @import("prompt/pass_async.zig");
 /// the moe_pair.zig: a prompt call's fp4 gate and up with `moe_act` in one paired NAX launch.
 const mpair = @import("prompt/moe_pair.zig");
+/// hc_v2.zig: a resident wide layer's hc in three passes over the stream (`MLX_SERVE_DSV41_PF_HC_V2`).
+const hv2 = @import("prompt/hc_v2.zig");
 /// hc_mix_mma.zig: a wide layer's hc mixes on the simdgroup matrix units (`MLX_SERVE_DSV41_HC_MIX_TILED`).
 const hmma = @import("prompt/hc_mix_mma.zig");
 /// moe_tail.zig: a resident wide layer's MoE combine and hc expand in one launch (`MLX_SERVE_DSV41_MOE_TAIL`).
@@ -710,6 +712,9 @@ pub const Dec = struct {
     wq_b_nax: ?mlx.mlx_fast_metal_kernel = null,
     wq_b_ring_nax: ?mlx.mlx_fast_metal_kernel = null,
     attn: ?mlx.mlx_fast_metal_kernel = null,
+    /// `attn` on its shape-cut kernel (`MLX_SERVE_DSV41_ATTN_DEC`), NAX only; `attn_tile_logged` once it served.
+    attn_tile: ?mlx.mlx_fast_metal_kernel = null,
+    attn_tile_logged: bool = false,
     /// `attn` that merges its splits (`MLX_SERVE_DSV41_FUSE_ATTN_MERGE`), its arrival counter and wo_a's sink then.
     attn_merge: ?mlx.mlx_fast_metal_kernel = null,
     attn_counter: A = none,
@@ -729,7 +734,7 @@ pub const Dec = struct {
     fn init(gpa: std.mem.Allocator, cfg: *const Config) !Dec {
         const nax = device.naxAvailable();
         // Without NAX the affine moe_up / moe_down lose to today's MoE kernels at every row count.
-        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .wq_b_ring = try dkern.wq_b.buildRing(), .wq_b_nax = if (nax) try dkern.wq_b.buildNax(false) else null, .wq_b_ring_nax = if (nax) try dkern.wq_b.buildNax(true) else null, .attn = if (nax) try dkern.attn.build() else null, .attn_merge = if (nax) try dkern.attn.buildMerge() else null, .attn_counter = dkern.attn.newCounter(), .attn_nosink = dkern.attn.noSink(cfg.num_attention_heads), .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
+        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .wq_b_ring = try dkern.wq_b.buildRing(), .wq_b_nax = if (nax) try dkern.wq_b.buildNax(false) else null, .wq_b_ring_nax = if (nax) try dkern.wq_b.buildNax(true) else null, .attn = if (nax) try dkern.attn.build() else null, .attn_tile = if (nax) try dkern.attn.buildTile() else null, .attn_merge = if (nax) try dkern.attn.buildMerge() else null, .attn_counter = dkern.attn.newCounter(), .attn_nosink = dkern.attn.noSink(cfg.num_attention_heads), .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
         errdefer d.deinit();
         try dkern.topk.probe(gpa, &d.topk.?, mlx.gpuStream());
         if (d.moe_down) |kd| d.moe_down_rb = dkern.moe_down.probe(gpa, kd, cfg.moe_intermediate_size, cfg.hidden_size) catch |e| blk: {
@@ -748,7 +753,7 @@ pub const Dec = struct {
         if (d.moe_up) |k| k.deinit();
         if (d.moe_fp4) |k| k.deinit();
         if (d.ffn_in) |k| dkern.ffn_in.free(k);
-        inline for (.{ d.wq_b, d.wq_b_ring, d.wq_b_nax, d.wq_b_ring_nax, d.attn, d.attn_merge, d.wo_a, d.moe_down }) |k| if (k) |kern| {
+        inline for (.{ d.wq_b, d.wq_b_ring, d.wq_b_nax, d.wq_b_ring_nax, d.attn, d.attn_tile, d.attn_merge, d.wo_a, d.moe_down }) |k| if (k) |kern| {
             _ = mlx.mlx_fast_metal_kernel_free(kern);
         };
         inline for (.{ d.attn_counter, d.attn_nosink }) |a| if (a.ctx != null) {
@@ -5159,7 +5164,7 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     if (merged) |p| {
         engaged(m, 1, "MLX_SERVE_DSV41_FUSE_ATTN_MERGE");
         oa = try dkern.wo_a.applySink(sc, m, ly, m.dec.wo_a.?, m.dec.wo_a_counter, inv, try attnMeta(sc, m, q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l, m.dec.attn_nosink);
-    } else if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try dkern.attn.partials(sc, ka, m, q, ls.win, comp_rows, topk, p0, scale)) |p| {
+    } else if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try attnPartials(sc, m, ka, q, ls.win, comp_rows, topk, p0, scale)) |p| {
         oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counter, inv, try attnMeta(sc, m, q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l);
     };
     // `ffn_in` routes off wo_b's output, which a tensor split sums first.
@@ -5179,6 +5184,17 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     try runRegion(sc, m, li, .ffn, &.{ x, ao[0], sa.pre, sa.post, sa.comb }, &out);
     pre.* = out[1];
     return out[0];
+}
+
+/// The fused decode attention's split partials: `MLX_SERVE_DSV41_ATTN_DEC` (on by default) on the shape-cut kernel where it serves, else
+/// `dec_attn`.
+fn attnPartials(sc: *Scope, m: *Dsv41Model, ka: mlx.mlx_fast_metal_kernel, q: A, win: Ring, comp_rows: A, topk: A, p0: usize, scale: f32) !?dkern.attn.Partials {
+    if (m.dec.attn_tile) |kt| if (dkern.attn.tileOn()) if (try dkern.attn.partialsTile(sc, kt, m, q, win, comp_rows, topk, p0, scale)) |p| {
+        if (!m.dec.attn_tile_logged) log.info("[dsv41] MLX_SERVE_DSV41_ATTN_DEC engaged\n", .{});
+        m.dec.attn_tile_logged = true;
+        return p;
+    };
+    return dkern.attn.partials(sc, ka, m, q, win, comp_rows, topk, p0, scale);
 }
 
 /// Row `l`'s compressed rows and picks as the plain step at `p0 + l` reads them (`blockFusedRows`): none, none where it
@@ -5785,6 +5801,7 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
     const last_async = wide and m.streamed == null and m.pair == null and m.tp == null and pass_async.on(sp.L);
     // The kept projection outputs: a kept set no wide layer of this pass took is let go at its end.
     defer tkeep.drop();
+    defer hv2.drop();
     for (lo..hi) |li| {
         if (wide) try wideLayer(m, gpa, st, sp, li, li + 1 < hi, li > lo) else for (0..n_spans) |k| {
             // A span's intermediates are dropped as soon as it is built, so the
@@ -6136,7 +6153,10 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         hp = r.hp;
     }
     if (ra_own) if (m.streamed) |src| if (src.read_ahead_fn) |ra| try readAhead(&sc, m, ly, li, hp, sp.img, ra, src.ctx);
-    if (!fused) pa = (try attnHcWide(&sc, m, x, pres, ly, null)).pa;
+    // hc_v2.zig: the layer before's tail made this side for this stream, else one pass over it.
+    const v2 = !fused and hv2.serves(m);
+    if (v2) pa = if (try hv2.take(&sc, li, x)) |r| r.n else (try hv2.attn(&sc, m, x, pres, &ly.hc_attn, ly.attn_norm)).n;
+    if (!fused and !v2) pa = (try attnHcWide(&sc, m, x, pres, ly, null)).pa;
     const pos = try sc.i(ci(sp.p0));
     // The heads unroped and their roped tail apart, where the gather reads them (a trace keeps the whole roped heads it
     // records).
@@ -6246,7 +6266,10 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     // scratch_x1.zig: the streams after the attention into the prompt's x1 region (a streamed bank runs one MoE
     // group, so that group's output is the region's last reader's).
     const x1_scratch = m.streamed != null and sp.L >= scratch_rows and mlx.streamIsGpu(m.s);
-    const pf = if (x1_scratch) try hcExpandPreNormScratch(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm) else try hcExpandPreNorm(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
+    const pf: Staged = if (v2) blk: {
+        const r = try hv2.ffn(&sc, m, x, y, &pa.sp, &ly.hc_ffn, ly.ffn_norm);
+        break :blk .{ .x1 = none, .sp = r.n.sp, .h = r.n.h, .z = r.z };
+    } else if (x1_scratch) try hcExpandPreNormScratch(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm) else try hcExpandPreNorm(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
     // A streamed bank reads each layer's experts once per call: one MoE over all of its rows.
     const group = if (m.streamed != null) n_spans else @max(1, m.moe_rows / sp.span);
     var k0: usize = 0;
@@ -6259,7 +6282,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         const hg = try gsc.slice(pf.h, 0, lo, hi);
         const img = try sp.imgSlice(&gsc, lo, hi);
         const sf: Split = .{ .pre = try gsc.slice(pf.sp.pre, 0, lo, hi), .post = try gsc.slice(pf.sp.post, 0, lo, hi), .comb = try gsc.slice(pf.sp.comb, 0, lo, hi) };
-        const x1g = try gsc.slice(pf.x1, 0, lo, hi);
+        const x1g = if (v2) none else try gsc.slice(pf.x1, 0, lo, hi);
         // Next-layer staging: the next wide layer's routes predicted from this layer's FFN rows, staged during this
         // layer's call (a prediction only: the reads, never the routes). The early commits: the prediction's ids kept
         // for the call's early commits.
@@ -6274,7 +6297,10 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         // the region. The call's last wide layer keeps the fresh buffer: its
         // streams are read after the call's last eval (the CED replay, the head, the next chunk).
         const into = pf.in_region and k0 == 0 and k1 == n_spans and next_wide and (m.n_mtp == 0 or m.dsparkTarget(li + 1) == null);
-        const xg = if (try moeExpand(&gsc, m, li, hg, img, if (into) pf.x1 else x1g, &sf, .{ .next = next_ids, .ls = &st.layers[li] }, into)) |v| v else if (try mtail.tail(&gsc, m, li, hg, img, x1g, &sf)) |v| v else try hcExpand(&gsc, x1g, try moe(&gsc, m, li, hg, img), &sf);
+        // hc_v2.zig: x1 rebuilt from x and y, the new stream, and (one group, the next layer wide with this stream as
+        // its own) the next layer's attention side.
+        const v2t: ?hv2.Tail = if (v2) try v2Tail(&gsc, m, sp, li, x, y, &pa.sp, lo, hi, hg, img, &sf, next_wide and k0 == 0 and k1 == n_spans) else null;
+        const xg = if (v2t) |t| t.x2 else if (try moeExpand(&gsc, m, li, hg, img, if (into) pf.x1 else x1g, &sf, .{ .next = next_ids, .ls = &st.layers[li] }, into)) |v| v else if (try mtail.tail(&gsc, m, li, hg, img, x1g, &sf)) |v| v else try hcExpand(&gsc, x1g, try moe(&gsc, m, li, hg, img), &sf);
         // scratch_x1.zig: the region's next writer waits for this, its last reader.
         if (x1_scratch and k1 == n_spans) try sx1.ps().x1.released(xg);
         for (k0..k1) |k| {
@@ -6287,6 +6313,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
             const one = k0 == 0 and k1 == n_spans;
             hold(&sp.whole[0], if (one) xg else none);
             hold(&sp.whole[1], if (one) pf.sp.pre else none);
+            if (v2t) |t| if (t.next) |r| hv2.put(li + 1, sp.whole[0], r);
         }
         // The new streams (the call's tail kernel and its inputs' small ops) committed at the last group's end, before this group's and the layer's scopes are torn down: the GPU runs them during the
         // teardown and the layer's last eval (runLayers) finds them under way. The holds above have just freed the
@@ -6297,6 +6324,26 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     // the teardown for the next wide layer of the pass: `wq_b`'s heads first, the attention norm's rows, the roped
     // tail.
     tkeep.layerEnd(&.{ pj.q, pa.h, pj.qt }, next_wide);
+}
+/// hc_v2.zig: rows `lo..hi`'s new stream from the layer's stream `x`, attention output `y`, attention split `sa`, the
+/// MoE over the normed rows `h` (its rows, image rows `img`) and FFN split `sf` (its rows); with `fold`, the next layer's
+/// attention side of it too, unless an Engram write changes that layer's stream first or the spans hold no whole
+/// stream. A trunk bank's MoE hands over its parts and the tail kernel combines them (moe_tail.zig's words, which it
+/// replaces); else the MoE's output rows.
+fn v2Tail(sc: *Scope, m: *const Dsv41Model, sp: *const Spans, li: usize, x: A, y: A, sa: *const Split, lo: usize, hi: usize, h: A, img: A, sf: *const Split, fold: bool) !hv2.Tail {
+    const rs: Split = .{ .pre = none, .post = try sc.slice(sa.post, 0, lo, hi), .comb = try sc.slice(sa.comb, 0, lo, hi) };
+    const xr = try sc.slice(x, 0, lo, hi);
+    const yr = try sc.slice(y, 0, lo, hi);
+    const engram_next = for (m.engrams) |e| {
+        if (e.layer == li + 1) break true;
+    } else false;
+    const next: ?hv2.Next = if (fold and sp.whole.len == 2 and li + 1 < m.n_layers and !engram_next) .{ .hc = &m.layers[li + 1].hc_attn, .norm_w = m.layers[li + 1].attn_norm } else null;
+    const ly = &m.layers[li];
+    const y2: hv2.Moe = if (ly.experts.ext == null and mlx.mlx_array_dtype(h) == m.act) blk: {
+        const r = try route(sc, m, ly, h, img);
+        break :blk .{ .parts = try moePrefillParts(sc, m, ly, h, r.idx, r.wts, try shared(sc, m, ly, h)) };
+    } else .{ .rows = try moe(sc, m, li, h, img) };
+    return hv2.tail(sc, m, xr, yr, &rs, y2, sf, next);
 }
 /// A full run's `wo_a` over its region `x` (`[rows, og, in]`, published): the plugin's grouped linear reads that
 /// layout as it is (no join, no transpose), `[rows, og * o_lora]` in `m.act`, a new handle the caller frees.

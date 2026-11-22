@@ -12,6 +12,7 @@ const dsv41 = @import("../deepseek_v41.zig");
 const mpair = @import("moe_pair.zig");
 const pfroute = @import("pf_route.zig");
 const mtail = @import("moe_tail.zig");
+const hv2 = @import("hc_v2.zig");
 const fixture = @import("../decode/fixture.zig");
 
 const testing = std.testing;
@@ -578,9 +579,170 @@ test "dsv41 bench: the wide hc mixes, hc_mix against the simdgroup matrix kernel
     std.debug.print("[hc mix] {d} rows, us a launch: hc_mix {d:.1}, simdgroup matrix {d:.1}; hc_mix + hc_norm {d:.1}, simdgroup matrix + hc_norm {d:.1}; fused mix_norm {d:.1}\n", .{ L, t[0], t[1], t[2], t[3], t[4] });
 }
 
+/// hc_v2's prompt widths: below a threadgroup's 64 rows, the chunk tail, a lead half, an odd width, a full chunk.
+const v2_widths = [_]c_int{ 37, 1254, 4096, 5001, 8192 };
+
+fn v2Close(lb: []u8, what: []const u8, L: c_int, nm: []const u8, want: A, got: A) !bool {
+    return close(try std.fmt.bufPrint(lb, "hc_v2 {s} rows {d} {s}", .{ what, L, nm }), want, got, null, tol_kernel);
+}
+
+/// The mixes, split and normed collapse of `got` against the stock launches' (`want`), each printed.
+fn v2Same(what: []const u8, L: c_int, want_z: A, want: dsv41.Normed, got: hv2.Res) !bool {
+    var lb: [96]u8 = undefined;
+    var ok = true;
+    const names = [_][]const u8{ "z", "h", "pre", "post", "comb" };
+    for ([_][2]A{ .{ want_z, got.z }, .{ want.h, got.n.h }, .{ want.sp.pre, got.n.sp.pre }, .{ want.sp.post, got.n.sp.post }, .{ want.sp.comb, got.n.sp.comb } }, names) |pr, nm| {
+        if (pr[0].ctx == null) continue;
+        if (!try v2Close(&lb, what, L, nm, pr[0], pr[1])) ok = false;
+    }
+    return ok;
+}
+
+test "dsv41 wide tol: hc_v2's attention side is hc_mix_norm's mixes, split and norm within 1% at prompt widths; the wrong previous mix fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var m: dsv41.Dsv41Model = undefined;
+    try hcModel(&m);
+    defer hcModelFree(&m);
+    var ok = true;
+    for (v2_widths, 0..) |L, i| {
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const r = try hcRows(&sc, L, 0xA200 + 16 * @as(u64, i));
+        const eps = try dsv41.hcEps(&sc, &m);
+        const want = try dsv41.hcMixNormFused(&sc, &m, r.x, r.cpre, &r.hc, r.w, null, eps);
+        const got = try hv2.attn(&sc, &m, r.x, r.cpre, &r.hc, r.w);
+        if (!try v2Same("attn", L, want.z, want.n, got)) ok = false;
+        // Planted: the collapse with this mix's own pre in place of the previous mix's.
+        const bad = try hv2.attn(&sc, &m, r.x, try sc.add(r.cpre, try sc.f(0.5)), &r.hc, r.w);
+        try testing.expect(!try close("  planted: the wrong previous mix", want.n.h, bad.n.h, null, tol_kernel));
+    }
+    try testing.expect(ok);
+}
+
+test "dsv41 wide tol: hc_v2's FFN side is the stock expand, norm and mixes' split and norm within 1% at prompt widths; a dropped norm weight and mix weights on the wrong copy fail" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var m: dsv41.Dsv41Model = undefined;
+    try hcModel(&m);
+    defer hcModelFree(&m);
+    var ok = true;
+    for (v2_widths, 0..) |L, i| {
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const r = try hcRows(&sc, L, 0xA400 + 16 * @as(u64, i));
+        const eps = try dsv41.hcEps(&sc, &m);
+        // The stock launches: glm5's expand, hc_mix over x1, hc_norm's split and normed collapse.
+        const x1 = try dsv41.hcExpand(&sc, r.x, r.y, &r.sp);
+        const z = try dsv41.hcMixWide(&sc, &m, x1, &r.hc, eps);
+        const want = try dsv41.hcNorm(&sc, &m, z, x1, r.cpre, r.w, eps);
+        const sa: dsv41.Split = .{ .pre = r.cpre, .post = r.sp.post, .comb = r.sp.comb };
+        const got = try hv2.ffn(&sc, &m, r.x, r.y, &sa, &r.hc, r.w);
+        if (!try v2Same("ffn", L, z, want, got)) ok = false;
+        const bad = try hv2.ffn(&sc, &m, r.x, r.y, &sa, &r.hc, try sc.ones(&.{@intCast(hidden)}, .bfloat16));
+        try testing.expect(!try close("  planted: norm weight dropped", want.h, bad.n.h, null, tol_kernel));
+        // Planted: the mix weights read one copy over (fn's columns rolled by 5120).
+        var hc_bad = r.hc;
+        const n4: usize = 4 * hidden;
+        hc_bad.fn_w = try sc.concat(&.{ try sc.slice(r.hc.fn_w, 1, hidden, n4), try sc.slice(r.hc.fn_w, 1, 0, hidden) }, 1);
+        const bad2 = try hv2.ffn(&sc, &m, r.x, r.y, &sa, &hc_bad, r.w);
+        try testing.expect(!try close("  planted: mix weights on the wrong copy", z, bad2.z, null, tol_kernel));
+    }
+    try testing.expect(ok);
+}
+
+test "dsv41 wide tol: hc_v2's tail is glm5's two expands' stream and the next layer's hc_mix_norm within 1% at prompt widths; a transposed comb fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var m: dsv41.Dsv41Model = undefined;
+    try hcModel(&m);
+    defer hcModelFree(&m);
+    var ok = true;
+    for (v2_widths, 0..) |L, i| {
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const r = try hcRows(&sc, L, 0xA600 + 16 * @as(u64, i));
+        const f = try hcRows(&sc, L, 0xA700 + 16 * @as(u64, i));
+        const eps = try dsv41.hcEps(&sc, &m);
+        const sa: dsv41.Split = .{ .pre = r.cpre, .post = r.sp.post, .comb = r.sp.comb };
+        const sf: dsv41.Split = .{ .pre = f.cpre, .post = f.sp.post, .comb = f.sp.comb };
+        // The stock launches: x1, then the tail's x2, then the next layer's fused mix and norm over x2.
+        const x1 = try dsv41.hcExpand(&sc, r.x, r.y, &sa);
+        const x2 = try dsv41.hcExpand(&sc, x1, f.y, &sf);
+        const want = try dsv41.hcMixNormFused(&sc, &m, x2, f.cpre, &f.hc, f.w, null, eps);
+        const got = try hv2.tail(&sc, &m, r.x, r.y, &sa, .{ .rows = f.y }, &sf, .{ .hc = &f.hc, .norm_w = f.w });
+        var lb: [96]u8 = undefined;
+        if (!try v2Close(&lb, "tail", L, "x2", x2, got.x2)) ok = false;
+        if (!try v2Same("tail next", L, want.z, want.n, got.next.?)) ok = false;
+        const only = try hv2.tail(&sc, &m, r.x, r.y, &sa, .{ .rows = f.y }, &sf, null);
+        if (!try v2Close(&lb, "tail only", L, "x2", x2, only.x2)) ok = false;
+        // Planted: the FFN split's comb transposed (the residual mixed the wrong way round).
+        const bad_sf: dsv41.Split = .{ .pre = f.cpre, .post = f.sp.post, .comb = try sc.transpose(f.sp.comb, &.{ 0, 2, 1 }) };
+        const bad = try hv2.tail(&sc, &m, r.x, r.y, &sa, .{ .rows = f.y }, &bad_sf, null);
+        try testing.expect(!try close("  planted: comb transposed", x2, bad.x2, x1, tol_kernel));
+    }
+    try testing.expect(ok);
+}
+
+/// A wide layer's MoE parts over `L` rows: sorted down rows, the unsort (a random permutation) and shared rows; and
+/// moe_tail's combine of them as ops (f32 route sum plus the shared row, rounded to bf16).
+fn moeParts(sc: *dsv41.Scope, L: c_int, seed: u64) !struct { p: dsv41.MoeParts, y: A } {
+    const d: c_int = @intCast(hidden);
+    const n: usize = @as(usize, @intCast(L)) * hv2.K;
+    const perm = try testing.allocator.alloc(u32, n);
+    defer testing.allocator.free(perm);
+    for (perm, 0..) |*v, q| v.* = @intCast(q);
+    var rng = std.Random.DefaultPrng.init(seed);
+    rng.random().shuffle(u32, perm);
+    const inv = try sc.keep(mlx.mlx_array_new_data(perm.ptr, &[_]c_int{@intCast(n)}, 1, .uint32));
+    const dn = try normal(sc, &.{ @intCast(n), d }, .bfloat16, 1, seed + 1);
+    const sh = try normal(sc, &.{ L, d }, .bfloat16, 1, seed + 2);
+    const rows = try sc.reshape(try sc.astype(try sc.take(dn, inv, 0), .float32), &.{ L, @intCast(hv2.K), d });
+    var o = mlx.mlx_array_new();
+    const sum = try sc.res(mlx.mlx_sum_axis(&o, rows, 1, false, sc.s), &o);
+    const y = try sc.astype(try sc.add(sum, try sc.astype(sh, .float32)), .bfloat16);
+    return .{ .p = .{ .dn = dn, .inv = inv, .sh = sh }, .y = y };
+}
+
+test "dsv41 wide tol: hc_v2's combining tail is moe_tail's combine, glm5's expands and the next layer's hc_mix_norm within 1% at prompt widths; the unsort off by a row fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var m: dsv41.Dsv41Model = undefined;
+    try hcModel(&m);
+    defer hcModelFree(&m);
+    var ok = true;
+    for (v2_widths, 0..) |L, i| {
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const r = try hcRows(&sc, L, 0xA800 + 16 * @as(u64, i));
+        const f = try hcRows(&sc, L, 0xA900 + 16 * @as(u64, i));
+        const mp = try moeParts(&sc, L, 0xAA00 + 16 * @as(u64, i));
+        const eps = try dsv41.hcEps(&sc, &m);
+        const sa: dsv41.Split = .{ .pre = r.cpre, .post = r.sp.post, .comb = r.sp.comb };
+        const sf: dsv41.Split = .{ .pre = f.cpre, .post = f.sp.post, .comb = f.sp.comb };
+        const x1 = try dsv41.hcExpand(&sc, r.x, r.y, &sa);
+        const x2 = try dsv41.hcExpand(&sc, x1, mp.y, &sf);
+        const want = try dsv41.hcMixNormFused(&sc, &m, x2, f.cpre, &f.hc, f.w, null, eps);
+        const got = try hv2.tail(&sc, &m, r.x, r.y, &sa, .{ .parts = mp.p }, &sf, .{ .hc = &f.hc, .norm_w = f.w });
+        var lb: [96]u8 = undefined;
+        if (!try v2Close(&lb, "tail combine", L, "x2", x2, got.x2)) ok = false;
+        if (!try v2Same("tail combine next", L, want.z, want.n, got.next.?)) ok = false;
+        const only = try hv2.tail(&sc, &m, r.x, r.y, &sa, .{ .parts = mp.p }, &sf, null);
+        if (!try v2Close(&lb, "tail combine only", L, "x2", x2, only.x2)) ok = false;
+        // Planted: the unsort off by a row (each row combines its neighbour's routes).
+        const n: c_int = L * @as(c_int, @intCast(hv2.K));
+        const rolled_inv = try sc.concat(&.{ try sc.slice(mp.p.inv, 0, hv2.K, @intCast(n)), try sc.slice(mp.p.inv, 0, 0, hv2.K) }, 0);
+        var bad_p = mp.p;
+        bad_p.inv = rolled_inv;
+        const bad = try hv2.tail(&sc, &m, r.x, r.y, &sa, .{ .parts = bad_p }, &sf, null);
+        try testing.expect(!try close("  planted: unsort off by a row", x2, bad.x2, x1, tol_kernel));
+    }
+    try testing.expect(ok);
+}
+
 // ── a release-shape pair worker's prefill ──
 
-const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_HC_MIX_TILED, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_MOE_EPI };
+const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_HC_MIX_TILED, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2, .MLX_SERVE_DSV41_PF_MOE_EPI };
 
 /// The pair worker's streams and mixes after its layers over `x` / `pre`, from a fresh state (caller frees).
 fn prefill(fx: *fixture.Fixture, x: A, pre: A) ![2]A {
