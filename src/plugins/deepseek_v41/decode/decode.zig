@@ -19,6 +19,7 @@ pub const moe_up = @import("moe_up.zig");
 pub const moe_fp4 = @import("moe_fp4.zig");
 pub const moe_down = @import("moe_down.zig");
 pub const engram_kv = @import("engram_kv.zig");
+pub const engram_ids = @import("engram_ids.zig");
 
 const dsv41 = @import("../deepseek_v41.zig");
 
@@ -224,7 +225,7 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
 test {
     _ = fixture;
     _ = @import("exact_test.zig");
-    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_down, engram_kv }) |k| _ = k;
+    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_down, engram_kv, engram_ids }) |k| _ = k;
 }
 
 test "dsv41 dec fp8 reads: every e4m3 code at every byte reads as MLX's from_fp8, every e8m0 code as MLX's fp8.h; FOLD differs only where it overflows or misses a NaN" {
