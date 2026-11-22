@@ -91,6 +91,8 @@ const hv2 = @import("prompt/hc_v2.zig");
 const mtail = @import("prompt/moe_tail.zig");
 /// pf_route.zig: a prompt call's routed pairs sorted by a counting sort (`MLX_SERVE_DSV41_PF_MOE_EPI`).
 const pfroute = @import("prompt/pf_route.zig");
+/// idx_nax.zig: a wide span's indexer scores on the matrix units (`MLX_SERVE_DSV41_PF_IDX_NAX`).
+const idx_nax = @import("prompt/idx_nax.zig");
 /// launch fusions, each behind its own default-off switch (`Dsv41Model.fuse`).
 const fusion = @import("fuse.zig");
 const Shard = @import("../../sdk/weights/shard.zig").Shard;
@@ -3634,7 +3636,7 @@ pub fn indexScores(sc: *Scope, m: *const Dsv41Model, q: A, keys: A, weights: A, 
     const ih = dim(q, 1);
     const ihd = dim(q, 2);
     if (dim(q, 0) > region_rows and dim(keys, 0) > 0 and ih % 8 == 0 and ih <= 128 and ihd % 8 == 0)
-        return indexScoresTiled(sc, m, q, keys, weights, wscale, p0, ratio);
+        return (try idx_nax.scores(sc, q, keys, weights, wscale, p0, ratio)) orelse indexScoresTiled(sc, m, q, keys, weights, wscale, p0, ratio);
     return indexScoresScalar(sc, m, q, keys, weights, wscale, p0, ratio);
 }
 

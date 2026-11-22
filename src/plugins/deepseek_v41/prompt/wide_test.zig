@@ -644,7 +644,7 @@ test "dsv41 wide tol: hc_v2's combining tail is moe_tail's combine, glm5's expan
 
 // ── a release-shape pair worker's prefill ──
 
-const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2, .MLX_SERVE_DSV41_PF_MOE_EPI };
+const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2, .MLX_SERVE_DSV41_PF_MOE_EPI, .MLX_SERVE_DSV41_PF_IDX_NAX };
 
 /// The pair worker's streams and mixes after its layers over `x` / `pre`, from a fresh state (caller frees).
 fn prefill(fx: *fixture.Fixture, x: A, pre: A) ![2]A {
