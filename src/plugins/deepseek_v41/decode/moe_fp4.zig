@@ -108,6 +108,30 @@ pub fn fp4Reads() c_int {
 }
 var fp4_reads_logged = std.atomic.Value(bool).init(false);
 
+/// The decode levers of the two launches, each a default-off switch read every call (`MLX_SERVE_DSV41_FP4_DEC_WORD`,
+/// `_UP_SPLIT`), each logged once when on: the same values in the same chains, so the same bytes as with them off.
+pub const Levers = struct {
+    /// The routed e2m1 codes decoded a word at a time (template `DW`, both launches).
+    dec_word: bool = false,
+    /// The shared expert's gate and up rows a simdgroup each in the gate/up launch (template `US`).
+    up_split: bool = false,
+
+    pub fn fromEnv() Levers {
+        const log = @import("../../../sdk/util/log.zig");
+        const l: Levers = .{ .dec_word = env.on(.MLX_SERVE_DSV41_FP4_DEC_WORD), .up_split = env.on(.MLX_SERVE_DSV41_FP4_UP_SPLIT) };
+        if (l.dec_word and !dec_word_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_FP4_DEC_WORD engaged\n", .{});
+        if (l.up_split and !up_split_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_FP4_UP_SPLIT engaged\n", .{});
+        return l;
+    }
+
+    /// The gate/up launch splits the shared expert only where a column's simdgroups pair up: TOPK x R + 2 even.
+    pub fn upSplit(l: Levers, topk: usize, rows: usize) bool {
+        return l.up_split and (topk * rows) % 2 == 0;
+    }
+};
+var dec_word_logged = std.atomic.Value(bool).init(false);
+var up_split_logged = std.atomic.Value(bool).init(false);
+
 /// The gate/up launch over arrays already checked.
 var up_logged = false;
 
@@ -116,12 +140,14 @@ pub fn runUp(sc: *dsv41.Scope, kern: Kernels, f: fp4.Format, rows: usize, k: usi
         up_logged = true;
         @import("../../../sdk/util/log.zig").info("deepseek_v41: fp4 MoE decode engaged: {t} (group {d}), rows={d} topk={d} k={d} n={d}, per-expert scales gate={} up={} down={}\n", .{ f, f.group(), rows, topk, k, n, es.gate != null, es.up != null, es.down != null });
     }
+    const lv = Levers.fromEnv();
+    const us = lv.upSplit(topk, rows);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(rows), ci(topk + 1), ci(n) }, 3, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(32 * n * (topk * rows + 1)), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(32 * n * (topk * rows + @as(usize, if (us) 2 else 1))), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, up_threads, 1, 1));
-    const flags = .{ .{ "GSCALE", es.gate != null }, .{ "USCALE", es.up != null }, .{ "DSCALE", es.down != null } };
+    const flags = .{ .{ "GSCALE", es.gate != null }, .{ "USCALE", es.up != null }, .{ "DSCALE", es.down != null }, .{ "DW", lv.dec_word }, .{ "US", us } };
     inline for (.{ .{ "R", rows }, .{ "K", k }, .{ "N", n }, .{ "TOPK", topk }, .{ "GS", f.group() } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "FR", fp4Reads()));
     inline for (flags) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], @intFromBool(t[1])));
@@ -183,11 +209,13 @@ pub fn runDown(sc: *dsv41.Scope, kern: Kernels, f: fp4.Format, R: usize, K: usiz
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     const shape = [_]c_int{ ci(R), ci(hc), ci(N) };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, shape.len, .bfloat16));
+    const lv = Levers.fromEnv();
     const tg = 32 * (topk + 1);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(N / nc * tg), ci(R), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
     inline for (.{ .{ "K", K }, .{ "N", N }, .{ "TOPK", topk }, .{ "HC", hc }, .{ "NC", nc }, .{ "GS", f.group() } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "FR", fp4Reads()));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "DW", @intFromBool(lv.dec_word)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
     const ins = [_]A{ act, w, scales, sw, sscales, idx, x1, post, comb };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
@@ -225,7 +253,8 @@ fn depth(s: Shape) usize {
     return s.k;
 }
 
-const up_l = cv.launch("dsv41_dec_moe_fp4_up", &UP_INS, &.{"out"}, UP_SOURCE, HEADER, 0, up_threads, false);
+/// Its threadgroup bytes: the split shared expert's R up sums (`Levers.up_split`).
+const up_l = cv.launch("dsv41_dec_moe_fp4_up", &UP_INS, &.{"out"}, UP_SOURCE, HEADER, 4 * decode.max_rows, up_threads, false);
 const down_l = cv.launch("dsv41_dec_moe_fp4_down", &DOWN_INS, &.{"out"}, DOWN_SOURCE, HEADER, 4 * (TOPK + 1), 32 * (TOPK + 1), false);
 
 /// e2m1 magnitudes by code bits 0..2; bit 3 is the sign.
@@ -373,11 +402,13 @@ pub fn fillShared(rng: std.Random, words: []f64, exps: []f64, rows: usize, K: us
 /// with per-expert gate, up and down scales) plus the shared mxfp8 expert.
 const UpK = struct {
     /// `fr`: `MLX_SERVE_DSV41_FP4_READS` on (`fp4Reads`).
-    pub const Params = struct { experts: usize = 8, lim: f64 = 10, gs: usize = 32, scaled: bool = false, fr: bool = false };
+    /// `lv`: the decode levers (`Levers`; the split where it pairs, as `runUp` takes it).
+    pub const Params = struct { experts: usize = 8, lim: f64 = 10, gs: usize = 32, scaled: bool = false, fr: bool = false, lv: Levers = .{} };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or s.rows > decode.max_rows or s.n == 0 or s.k == 0 or s.k % 1024 != 0 or p.experts < TOPK or p.experts > 64) return null;
-        var g = metal.Geometry{ .grid = .{ ci(32 * s.n * (TOPK * s.rows + 1)), 1, 1 }, .tg = .{ up_threads, 1, 1 } };
+        const us = p.lv.upSplit(TOPK, s.rows);
+        var g = metal.Geometry{ .grid = .{ ci(32 * s.n * (TOPK * s.rows + @as(usize, if (us) 2 else 1))), 1, 1 }, .tg = .{ up_threads, 1, 1 } };
         g.out(&.{ ci(s.rows), TOPK + 1, ci(s.n) }, adt);
         g.int("R", s.rows);
         g.int("K", s.k);
@@ -386,6 +417,8 @@ const UpK = struct {
         g.int("GS", p.gs);
         inline for (.{ "GSCALE", "USCALE", "DSCALE" }) |n| g.int(n, @intFromBool(p.scaled));
         g.int("FR", @intFromBool(p.fr));
+        g.int("DW", @intFromBool(p.lv.dec_word));
+        g.int("US", @intFromBool(us));
         g.dtype("T", adt);
         return g;
     }
@@ -512,13 +545,14 @@ const UpK = struct {
 /// mxfp8 expert, y rounded to bf16 once, then the hc expand.
 const DownK = struct {
     /// `fr`: `MLX_SERVE_DSV41_FP4_READS` on (`fp4Reads`).
-    pub const Params = struct { experts: usize = 8, gs: usize = 32, fr: bool = false };
+    /// `lv`: the decode levers (`Levers`; the down launch reads `dec_word`).
+    pub const Params = struct { experts: usize = 8, gs: usize = 32, fr: bool = false, lv: Levers = .{} };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows < 1 or s.rows > decode.max_rows or s.n == 0 or s.k == 0 or s.k % 32 != 0 or p.experts < TOPK or p.experts > 64) return null;
         const nc = downCols(s.k, s.n, HC) orelse return null;
         const tg = 32 * (TOPK + 1);
-        var g = metal.Geometry{ .grid = .{ ci(s.n / nc * tg), ci(s.rows), 1 }, .tg = .{ tg, 1, 1 } };
+        var g = metal.Geometry{ .grid = .{ ci(s.n / nc * tg), ci(s.rows), 1 }, .tg = .{ ci(tg), 1, 1 } };
         g.out(&.{ ci(s.rows), HC, ci(s.n) }, adt);
         g.int("K", s.k);
         g.int("N", s.n);
@@ -527,6 +561,7 @@ const DownK = struct {
         g.int("NC", nc);
         g.int("GS", p.gs);
         g.int("FR", @intFromBool(p.fr));
+        g.int("DW", @intFromBool(p.lv.dec_word));
         g.dtype("T", adt);
         return g;
     }
@@ -632,14 +667,24 @@ const DownK = struct {
 /// and the rows (R = 1..6, over 8 experts so the rows share most of them) are the release's. One case a format: MXFP4,
 /// NVFP4, NVFP4 with ModelOpt's per-expert scales (the gate/up launch's; the down launch never reads them).
 pub fn register(set: *kc.Set) !void {
-    const ups = [_]struct { [:0]const u8, UpK.Params }{
+    const UpCase = struct { [:0]const u8, UpK.Params };
+    const DownCase = struct { [:0]const u8, DownK.Params };
+    const ups = [_]UpCase{
         .{ "dsv41 dec moe_fp4 up (mxfp4 routed + mxfp8 shared)", .{} },
         .{ "dsv41 dec moe_fp4 up (nvfp4 routed + mxfp8 shared)", .{ .gs = 16 } },
         .{ "dsv41 dec moe_fp4 up (nvfp4 routed with per-expert scales + mxfp8 shared)", .{ .gs = 16, .scaled = true } },
         .{ "dsv41 dec moe_fp4 up, FP4_READS (nvfp4 routed, each 16-group apart, + mxfp8 shared)", .{ .gs = 16, .fr = true } },
         .{ "dsv41 dec moe_fp4 up, FP4_READS (nvfp4 routed with per-expert scales, each 16-group apart, + mxfp8 shared)", .{ .gs = 16, .scaled = true, .fr = true } },
     };
-    for (ups) |c| try kit.add(set, UpK, &up_l, c[1], .{
+    // The decode levers beside the default cases they change (`Levers`): the gate/up launch's two, the down launch's
+    // word decode.
+    const on: Levers = .{ .dec_word = true, .up_split = true };
+    const ups_lv = [_]UpCase{
+        .{ "dsv41 dec moe_fp4 up, DEC_WORD + UP_SPLIT (mxfp4 routed + mxfp8 shared)", .{ .lv = on } },
+        .{ "dsv41 dec moe_fp4 up, FP4_READS + DEC_WORD + UP_SPLIT (nvfp4 routed with per-expert scales, each 16-group apart, + mxfp8 shared)", .{ .gs = 16, .scaled = true, .fr = true, .lv = on } },
+        .{ "dsv41 dec moe_fp4 up, DEC_WORD + UP_SPLIT (nvfp4 routed, an equal-scale span in MXFP4's order, + mxfp8 shared)", .{ .gs = 16, .lv = on } },
+    };
+    for (ups ++ ups_lv) |c| try kit.add(set, UpK, &up_l, c[1], .{
         .name = c[0],
         .accum = .f32,
         .depth = depth,
@@ -650,13 +695,18 @@ pub fn register(set: *kc.Set) !void {
         .served = &.{ .{ .rows = 1, .n = 64, .k = 5120 }, .{ .rows = 3, .n = 17, .k = 5120 }, .{ .rows = decode.max_rows, .n = 64, .k = 5120 } },
         .sums = .{ .f16 = 30, .bf16 = 30, .why = "a wrong sum's activation tends to 0, so a miss tops out near 1 / the bound" },
     });
-    const downs = [_]struct { [:0]const u8, DownK.Params }{
+    const downs = [_]DownCase{
         .{ "dsv41 dec moe_fp4 down (mxfp4 routed + mxfp8 shared, hc expand)", .{} },
         .{ "dsv41 dec moe_fp4 down (nvfp4 routed + mxfp8 shared, hc expand)", .{ .gs = 16 } },
         .{ "dsv41 dec moe_fp4 down, FP4_READS (mxfp4 routed + mxfp8 shared read by bit placement, hc expand)", .{ .fr = true } },
         .{ "dsv41 dec moe_fp4 down, FP4_READS (nvfp4 routed each 16-group apart + mxfp8 shared read by bit placement, hc expand)", .{ .gs = 16, .fr = true } },
     };
-    for (downs) |c| try kit.add(set, DownK, &down_l, c[1], .{
+    const downs_lv = [_]DownCase{
+        .{ "dsv41 dec moe_fp4 down, FP4_READS + DEC_WORD (mxfp4 routed + mxfp8 shared read by bit placement, hc expand)", .{ .fr = true, .lv = .{ .dec_word = true } } },
+        .{ "dsv41 dec moe_fp4 down, FP4_READS + DEC_WORD (nvfp4 routed each 16-group apart + mxfp8 shared read by bit placement, hc expand)", .{ .gs = 16, .fr = true, .lv = .{ .dec_word = true } } },
+        .{ "dsv41 dec moe_fp4 down, DEC_WORD (nvfp4 routed, an equal-scale span in MXFP4's order, + mxfp8 shared as MLX reads it, hc expand)", .{ .gs = 16, .lv = .{ .dec_word = true } } },
+    };
+    for (downs ++ downs_lv) |c| try kit.add(set, DownK, &down_l, c[1], .{
         .name = c[0],
         .accum = .f32,
         .depth = depth,
