@@ -69,6 +69,10 @@ const Transformer = @import("../transformer.zig").Transformer;
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
 const KVCache = @import("../../../sdk/kv/cache.zig").KVCache;
 const SSMCacheEntry = @import("../ssm/entry.zig").SSMCacheEntry;
+const Slot = @import("../slot.zig").Slot;
+const Scheduler = @import("../scheduler.zig").Scheduler;
+const runDecodeTick = @import("../decode.zig").runDecodeTick;
+const LoadedModel = @import("../../../host/registry/registry.zig").LoadedModel;
 
 const EOS = [_]u32{ 2, 3 };
 const OBJECT_SCHEMA =
@@ -433,6 +437,106 @@ test "the serial constrained step: the mask of the grammar before the token, one
             try testing.expect(r.ended);
             try testing.expectEqualStrings("stop", r.gen.finish_reason);
             try r.expectValid();
+        }
+    }.run);
+}
+
+/// Fails its first allocation, then serves from `testing.allocator`: the failure is one the slot can still name.
+const FailsOnce = struct {
+    failed: bool = false,
+
+    fn allocator(self: *FailsOnce) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *FailsOnce = @ptrCast(@alignCast(ctx));
+        if (!self.failed) {
+            self.failed = true;
+            return null;
+        }
+        return testing.allocator.rawAlloc(len, a, ra);
+    }
+    fn resize(_: *anyopaque, mem: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        return testing.allocator.rawResize(mem, a, n, ra);
+    }
+    fn remap(_: *anyopaque, mem: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        return testing.allocator.rawRemap(mem, a, n, ra);
+    }
+    fn free(_: *anyopaque, mem: []u8, a: std.mem.Alignment, ra: usize) void {
+        testing.allocator.rawFree(mem, a, ra);
+    }
+};
+
+/// A scheduler slot over `r`: the row's generator moved in, its cache position mirrored where the batched tick reads it.
+fn slotOver(r: *Row, lm: *LoadedModel, allocator: ?std.mem.Allocator) !*Slot {
+    const slot = try Slot.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), &r.m.cfg, .{
+        .model = lm,
+        .prompt_ids = &.{ 'j', 's', 'o', 'n', '?', ' ' },
+        .sampling = r.gen.sampling,
+        .eos_token_ids = &EOS,
+        .max_tokens = 64,
+    }, .dense);
+    if (allocator) |a| slot.allocator = a;
+    slot.legacy_gen = r.gen;
+    slot.cache.step = r.cache.step;
+    slot.moe_seq_offset = r.off;
+    return slot;
+}
+
+/// The generator goes back to its row, which frees it.
+fn releaseSlot(slot: *Slot, r: *Row) void {
+    r.gen = slot.legacy_gen.?;
+    slot.legacy_gen = null;
+    slot.deinit();
+}
+
+test "runDecodeTick: a grammar row whose guard fails is failed alone; its neighbour still decodes (attention and GDN)" {
+    try eachPack(struct {
+        fn run(m: *Model) !void {
+            var lm: LoadedModel = undefined;
+            lm.engine = null;
+            lm.transformer = &m.xfm;
+            lm.config = &m.cfg;
+            lm.tokenizer = &m.tok;
+            lm.prefix_cache = null;
+            var sch: Scheduler = undefined;
+            sch.allocator = testing.allocator;
+            sch.io = std.Io.Threaded.global_single_threaded.io();
+            sch.force_batched = true;
+            sch.metrics = null;
+            sch.inflight_generated_tokens = std.atomic.Value(u64).init(0);
+
+            // The reference: B alone through the same entry.
+            const ref_row = try Row.create(m, ENUM_SCHEMA, .{ .temperature = 0 });
+            defer ref_row.destroy();
+            const ref_slot = try slotOver(ref_row, &lm, null);
+            defer releaseSlot(ref_slot, ref_row);
+            var ref_active = [_]*Slot{ref_slot};
+            try runDecodeTick(&sch, &ref_active);
+            try testing.expect(ref_slot.state != .errored);
+            try testing.expectEqual(@as(usize, 1), ref_slot.out_buf.items.len);
+
+            // A's thinking budget is due at once; committing the closer through a failing allocator errors its guard.
+            var bound: generate_mod.ThinkBound = .{ .budget = 0, .opener_id = null, .closer_id = 1, .forced = &.{'z'}, .in_think = true };
+            const a_row = try Row.create(m, OBJECT_SCHEMA, .{ .temperature = 0, .think_bound = &bound });
+            defer a_row.destroy();
+            const b_row = try Row.create(m, ENUM_SCHEMA, .{ .temperature = 0 });
+            defer b_row.destroy();
+            var fails = FailsOnce{};
+            const a_slot = try slotOver(a_row, &lm, fails.allocator());
+            defer releaseSlot(a_slot, a_row);
+            const b_slot = try slotOver(b_row, &lm, null);
+            defer releaseSlot(b_slot, b_row);
+            var active = [_]*Slot{ a_slot, b_slot };
+            try runDecodeTick(&sch, &active);
+
+            // The failure is the guard's: A's budget fired before the batch, not an allocation in the tick.
+            try testing.expect(fails.failed and bound.fired);
+            try testing.expectEqual(.errored, a_slot.state);
+            try testing.expectEqualStrings("OutOfMemory", a_slot.error_code.?);
+            try testing.expectEqual(@as(usize, 0), a_slot.out_buf.items.len);
+            try testing.expect(b_slot.state != .errored);
+            try testing.expectEqualSlices(u32, ref_slot.out_buf.items, b_slot.out_buf.items);
         }
     }.run);
 }
