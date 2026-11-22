@@ -1960,19 +1960,20 @@ const GemvTwin = struct {
 // ── prompt/gate_gemm.zig: the wide router's f32 logits as MLX's fused NAX GEMM over the stored types ──
 
 const GateGemm = struct {
-    pub const Params = struct {};
-    const t = ggemm.tile;
+    /// `bf16`: `gate_gemm.bf16F32` (PF_COMP_BF16, PF_ROUTER_BF16): both operands bf16, the MMA in bf16, at any rows.
+    pub const Params = struct { bf16: bool = false };
 
-    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
-        if (s.rows == 0 or s.n == 0 or s.k == 0 or !ggemm.mlxRegular(@intCast(s.rows), @intCast(s.n), @intCast(s.k))) return null;
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        const t: ggemm.Tile = if (p.bf16) ggemm.bf16_tile else ggemm.tile;
+        if (s.rows == 0 or s.n == 0 or s.k == 0 or (!p.bf16 and !ggemm.mlxRegular(@intCast(s.rows), @intCast(s.n), @intCast(s.k)))) return null;
         const swz: usize = @as(usize, 1) << @intCast(t.swz);
         const tiles_m = (s.rows + t.bm - 1) / t.bm;
         const tiles_n = (s.n + t.bn - 1) / t.bn;
         var g = metal.Geometry{ .grid = .{ ci(tiles_n * swz * 32), ci((tiles_m + swz - 1) / swz * t.wn), ci(t.wm) }, .tg = .{ 32, ci(t.wn), ci(t.wm) } };
         g.out(&.{ ci(s.rows), ci(s.n) }, .float32);
-        g.dtype("T", .float32);
+        g.dtype("T", if (p.bf16) .bfloat16 else .float32);
         g.dtype("TA", act);
-        g.dtype("TB", .float16);
+        g.dtype("TB", if (p.bf16) .bfloat16 else .float16);
         g.dtype("OUT_R", .float32);
         g.int("BM", t.bm);
         g.int("BN", t.bn);
@@ -1990,7 +1991,7 @@ const GateGemm = struct {
         const M = k.shape.rows;
         const K = k.shape.k;
         const x = try k.add(act, &.{ M, K });
-        const w = try k.add(.float16, &.{ k.shape.n, K });
+        const w = try k.add(if (k.p.bf16) .bfloat16 else .float16, &.{ k.shape.n, K });
         kit.uniform(rng, x, -2, 2);
         kit.uniform(rng, w, -2, 2);
         switch (f) {
@@ -5161,6 +5162,15 @@ fn registerStreamed(set: *kc.Set) !void {
         .replaces = "astype f32, MLX's matmul (its regular NAX kernel)",
         .served = &.{ .{ .rows = 256, .n = 384, .k = 512 }, .{ .rows = 100, .n = 384, .k = 768 }, .{ .rows = 77, .n = 200, .k = 300 } },
     });
+    try kit.add(set, GateGemm, &gate_gemm_l, .{ .bf16 = true }, .{
+        .name = "dsv41 gate_gemm bf16 (the MMA in bf16 over bf16 x and w, f32 out: PF_COMP_BF16's compressor, PF_ROUTER_BF16's router)",
+        .accum = .f32,
+        .depth = depthK,
+        .out = .f32,
+        .nax = true,
+        .replaces = "astype f32, MLX's matmul (TF32 or f32 MMA: the same exact products, reordered sums)",
+        .served = &.{ .{ .rows = 256, .n = 512, .k = 512 }, .{ .rows = 100, .n = 384, .k = 768 }, .{ .rows = 77, .n = 200, .k = 300 } },
+    });
     try kit.add(set, AttnQkT, &qk_t_l, .{}, .{
         .name = "dsv41 attn_qk_t (prompt width, the heads and their roped tail)",
         .accum = .f32,
@@ -5378,6 +5388,10 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const y = (try ggemm.router(m.s, r.c.args[0], r.c.args[1], true)).?;
         defer _ = mlx.mlx_array_free(y);
         try Expect.same(r.c, r.bytes, &.{y});
+        const rb = try ours(GateGemm, a, &gate_gemm_l, .{ .bf16 = true }, .{ .rows = 100, .n = 384, .k = 768 });
+        const yb = (try ggemm.bf16F32(m.s, rb.c.args[0], rb.c.args[1], true)).?;
+        defer _ = mlx.mlx_array_free(yb);
+        try Expect.same(rb.c, rb.bytes, &.{yb});
     }
     // The flash kernel as the model launches it (`flashLaunch`, grouped).
     if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {

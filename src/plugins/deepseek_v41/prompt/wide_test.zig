@@ -15,6 +15,7 @@ const fp4gemm = @import("fp4_gemm.zig");
 const mtail = @import("moe_tail.zig");
 const hv2 = @import("hc_v2.zig");
 const fixture = @import("../decode/fixture.zig");
+const ggemm = @import("gate_gemm.zig");
 
 const testing = std.testing;
 const A = mlx.mlx_array;
@@ -842,5 +843,92 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
         defer fx.m.cfg.router_scaling_factor = scale;
         try testing.expect(!try closeAs(fx, x, pre, want, &want_tap, label, "planted: the routed term at half its scale"));
     };
+    try testing.expect(ok);
+}
+
+test "dsv41 wide tol: gate_gemm's bf16 MMA (PF_COMP_BF16, PF_ROUTER_BF16) is the f32 chain within f32 reordering at the compressor's and router's shapes, K 5,120, prompt rows 257 to 17,639; a weight row moved fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    var ok = true;
+    for ([_]usize{ 512, 384 }) |n| for ([_]usize{ 257, 4097, 17_639 }) |rows| {
+        const x = try normal(&sc, &.{ @intCast(rows), @intCast(hidden) }, .bfloat16, 1, 0x51 + rows);
+        const w = try normal(&sc, &.{ @intCast(n), @intCast(hidden) }, .bfloat16, 1.0 / @sqrt(@as(f32, hidden)), 0x52 + n);
+        const want = try sc.matmul(try sc.astype(x, .float32), try sc.transpose(try sc.astype(w, .float32), &.{ 1, 0 }));
+        const got = (try ggemm.bf16F32(sc.s, x, w, true)) orelse return error.Declined;
+        _ = try sc.keep(got);
+        var lb: [96]u8 = undefined;
+        if (!try close(try std.fmt.bufPrint(&lb, "bf16 MMA, f32 out: {d} rows x {d}", .{ rows, n }), want, got, null, 1e-5)) ok = false;
+        // Planted: weight row 0 replaced by row 1.
+        const wp = try sc.concat(&.{ try sc.slice(w, 0, 1, 2), try sc.slice(w, 0, 1, n) }, 0);
+        const bad = (try ggemm.bf16F32(sc.s, x, wp, true)) orelse return error.Declined;
+        _ = try sc.keep(bad);
+        try testing.expect(!try close(try std.fmt.bufPrint(&lb, "planted: row 0 moved, {d} rows x {d}", .{ rows, n }), want, bad, null, 1e-5));
+    };
+    // Declines: another type, no NAX.
+    const xf = try normal(&sc, &.{ 300, @intCast(hidden) }, .float32, 1, 9);
+    const wb = try normal(&sc, &.{ 384, @intCast(hidden) }, .bfloat16, 1, 10);
+    try testing.expect((try ggemm.bf16F32(sc.s, xf, wb, true)) == null);
+    try testing.expect((try ggemm.bf16F32(sc.s, try sc.astype(xf, .bfloat16), wb, false)) == null);
+    try testing.expect(ok);
+}
+
+test "dsv41 wide tol: MLX_SERVE_DSV41_PF_COMP_BF16 and MLX_SERVE_DSV41_PF_ROUTER_BF16, each and both, keep a pair worker's prefill within 5% of the stock path's, MXFP4 and NVFP4 experts with per-expert scales, a ratio-2 and a ratio-1 pair; the compressor's kv and gate swapped and the logits negated fail" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    const sw = .{ .MLX_SERVE_DSV41_PF_COMP_BF16, .MLX_SERVE_DSV41_PF_ROUTER_BF16 };
+    inline for (sw) |n| env.set(n, "0");
+    defer {
+        inline for (sw) |n| env.set(n, "0");
+    }
+    const Case = struct { lo: usize, rows: usize, nv: bool };
+    var ok = true;
+    for ([_]Case{ .{ .lo = 8, .rows = 5000, .nv = false }, .{ .lo = 20, .rows = 4608, .nv = true } }) |c| {
+        var lb: [64]u8 = undefined;
+        const label = try std.fmt.bufPrint(&lb, "{d}-{d} {s} at {d} rows", .{ c.lo, c.lo + 1, if (c.nv) "NVFP4" else "MXFP4", c.rows });
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = c.lo, .hi = c.lo + 2, .ctx = 0, .experts_fp4 = !c.nv, .experts_nvfp4 = c.nv, .expert_scales = if (c.nv) .all else .none });
+        defer fx.deinit();
+        const x = try fx.stream(c.rows);
+        defer _ = mlx.mlx_array_free(x);
+        const pre = try fx.cpre(c.rows);
+        defer _ = mlx.mlx_array_free(pre);
+        var want_tap: dsv41.RouteTap = .{ .gpa = gpa };
+        defer freeTap(&want_tap);
+        const c0 = dsv41.comp_bf16_count.load(.monotonic);
+        const r0 = dsv41.router_bf16_count.load(.monotonic);
+        const want = try prefillTapped(fx, x, pre, &want_tap);
+        defer for (want) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        try testing.expectEqual(c0, dsv41.comp_bf16_count.load(.monotonic));
+        try testing.expectEqual(r0, dsv41.router_bf16_count.load(.monotonic));
+        const has_comp = fx.m.layers[c.lo].ratio > 1 or fx.m.layers[c.lo + 1].ratio > 1;
+        // Each alone, engaged: the compressor on a ratio-2 KV source's layers, the router on both layers.
+        env.set(.MLX_SERVE_DSV41_PF_COMP_BF16, "1");
+        if (!try closeAs(fx, x, pre, want, &want_tap, label, "PF_COMP_BF16")) ok = false;
+        std.debug.print("wide layer {s}: PF_COMP_BF16 served {d} layers\n", .{ label, dsv41.comp_bf16_count.load(.monotonic) - c0 });
+        if (has_comp) try testing.expect(dsv41.comp_bf16_count.load(.monotonic) > c0);
+        env.set(.MLX_SERVE_DSV41_PF_COMP_BF16, "0");
+        env.set(.MLX_SERVE_DSV41_PF_ROUTER_BF16, "1");
+        if (!try closeAs(fx, x, pre, want, &want_tap, label, "PF_ROUTER_BF16")) ok = false;
+        std.debug.print("wide layer {s}: PF_ROUTER_BF16 served {d} calls\n", .{ label, dsv41.router_bf16_count.load(.monotonic) - r0 });
+        try testing.expect(dsv41.router_bf16_count.load(.monotonic) > r0);
+        env.set(.MLX_SERVE_DSV41_PF_COMP_BF16, "1");
+        if (!try closeAs(fx, x, pre, want, &want_tap, label, "both")) ok = false;
+        // Planted: the logits negated; the compressor's kv and gate swapped (where it serves).
+        {
+            dsv41.router_bf16_plant = true;
+            defer dsv41.router_bf16_plant = false;
+            try testing.expect(!try closeAs(fx, x, pre, want, &want_tap, label, "planted: the logits negated"));
+        }
+        if (has_comp) {
+            dsv41.comp_bf16_plant = true;
+            defer dsv41.comp_bf16_plant = false;
+            try testing.expect(!try closeAs(fx, x, pre, want, &want_tap, label, "planted: the compressor's kv and gate swapped"));
+        }
+        inline for (sw) |n| env.set(n, "0");
+    }
     try testing.expect(ok);
 }

@@ -170,6 +170,25 @@ pub fn router(s: mlx.mlx_stream, x: A, w: A, nax: bool) !?A {
     return try launch(s, x, w, .float32, .float32, tile, mnk);
 }
 
+/// `MLX_SERVE_DSV41_PF_COMP_BF16` / `MLX_SERVE_DSV41_PF_ROUTER_BF16`: y f32 [M, N] = x [M, K] w [N, K]^T with x and w
+/// both stored bf16, the launch's MMA in bf16 (bf16 tiles into f32 accumulators: each product of two bf16 values is
+/// exact in f32, as in the f32 chain's MMA, so only the sums' order can differ) and the accumulators stored as f32
+/// (lazy, the caller owns y); null where it declines (no NAX, a CPU stream, another type or shape).
+pub fn bf16F32(s: mlx.mlx_stream, x: A, w: A, nax: bool) !?A {
+    return bf16F32At(s, x, w, nax, bf16_tile);
+}
+
+/// `bf16F32` at tile `t` (the ubench's other tiles).
+pub fn bf16F32At(s: mlx.mlx_stream, x: A, w: A, nax: bool, t: Tile) !?A {
+    if (!nax or !mlx.streamIsGpu(s) or !admitted(t)) return null;
+    if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(w) != .bfloat16) return null;
+    const mnk = shapeOf(x, w) orelse return null;
+    return try launch(s, x, w, .bfloat16, .float32, t, mnk);
+}
+
+/// The bf16 MMA's tile (the ubench's pick at the compressor's and router's shapes).
+pub const bf16_tile: Tile = tile;
+
 test "gate_gemm tiles: MLX's own and the pick are exact by construction; SN must be N pairs, BK whole steps" {
     try std.testing.expect(admitted(tile));
     try std.testing.expect(admitted(.{ .bm = 64, .bn = 128, .bk = 256, .wm = 2, .wn = 4, .swz = 2 }));
