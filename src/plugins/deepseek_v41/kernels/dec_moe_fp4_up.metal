@@ -20,7 +20,7 @@ if (u == uint(TOPK * R)) {
 const uint r = u / TOPK;
 const uint e = inds[u];
 float acc[2];
-dec_fp4_up_routed<K, N, GS, T>(w, scales, size_t(e) * (2 * N) + n_col, x + size_t(r) * K, lane, acc);
+dec_fp4_up_routed<K, N, GS, FR, T>(w, scales, size_t(e) * (2 * N) + n_col, x + size_t(r) * K, lane, acc);
 if (lane == 0) {
   dec_fp4_expert_scales<GSCALE, USCALE, T>(acc, gsc, usc, e);
   const float wt = DSCALE != 0 ? wts[u] * float(dsc[e]) : wts[u];

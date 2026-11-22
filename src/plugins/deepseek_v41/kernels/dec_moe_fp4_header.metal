@@ -10,11 +10,10 @@ inline float2 dec_fp4_pair(uint b) {
   return float2(as_type<half2>(v));
 }
 
-// The dot of the codes in words [C0, C1) of `q` (eight codes a word) against their activations at `x` (bf16, a uint4
-// a word).
+// `d` plus the dot of the codes in words [C0, C1) of `q` (eight codes a word) against their activations at `x` (bf16,
+// a uint4 a word), one fma chain in code order.
 template <int C0, int C1>
-inline float dec_fp4_dot(uint4 q, const device uint4* x) {
-  float d = 0.0f;
+inline float dec_fp4_dot(uint4 q, const device uint4* x, float d) {
 #pragma unroll
   for (int c = C0; c < C1; ++c) {
     const uint4 xq = x[c];
@@ -31,19 +30,27 @@ inline float dec_fp4_dot(uint4 q, const device uint4* x) {
 }
 
 // `acc` plus one unit (the 32 codes in `q` against the 32 activations at `x`): each group's dot, its 2^14 restored
-// (exact), times its scale as MLX reads it (`s`: the unit's 32 / GS scale bytes).
-template <int GS>
+// (exact), times its scale as MLX reads it (`s`: the unit's 32 / GS scale bytes). FR 0 (MLX_SERVE_DSV41_FP4_READS
+// off): two equal NVFP4 scale bytes take MXFP4's order, one chain over the unit and one add, so a bank whose
+// 16-halves share a scale (NVIDIA's DeepSeek pack) gives its MXFP4 conversion's bytes; FR 1: each 16-group apart.
+template <int GS, int FR>
 inline float dec_fp4_unit(uint4 q, const device uint4* x, const device uint8_t* s, float acc) {
   if constexpr (GS == 32) {
-    return fma(mlxserve_fp4_scale_of<32>(uint(s[0])), dec_fp4_dot<0, 4>(q, x) * 16384.0f, acc);
+    return fma(mlxserve_fp4_scale_of<32>(uint(s[0])), dec_fp4_dot<0, 4>(q, x, 0.0f) * 16384.0f, acc);
+  } else if constexpr (FR == 0) {
+    const bool one = s[0] == s[1];
+    const float d0 = dec_fp4_dot<0, 2>(q, x, 0.0f);
+    const float d1 = dec_fp4_dot<2, 4>(q, x, one ? d0 : 0.0f);
+    acc = one ? acc : fma(mlxserve_fp4_scale_of<16>(uint(s[0])), d0 * 16384.0f, acc);
+    return fma(mlxserve_fp4_scale_of<16>(uint(s[1])), d1 * 16384.0f, acc);
   } else {
-    acc = fma(mlxserve_fp4_scale_of<16>(uint(s[0])), dec_fp4_dot<0, 2>(q, x) * 16384.0f, acc);
-    return fma(mlxserve_fp4_scale_of<16>(uint(s[1])), dec_fp4_dot<2, 4>(q, x) * 16384.0f, acc);
+    acc = fma(mlxserve_fp4_scale_of<16>(uint(s[0])), dec_fp4_dot<0, 2>(q, x, 0.0f) * 16384.0f, acc);
+    return fma(mlxserve_fp4_scale_of<16>(uint(s[1])), dec_fp4_dot<2, 4>(q, x, 0.0f) * 16384.0f, acc);
   }
 }
 
 // The gate (acc[0]) and up (acc[1]) sums of the expert row `row` and `row + N` of the fused gate+up bank against `x`.
-template <int K, int N, int GS, typename T>
+template <int K, int N, int GS, int FR, typename T>
 inline void dec_fp4_up_routed(const device uint32_t* w, const device uint8_t* sc, size_t row, const device T* x, uint lane, thread float (&acc)[2]) {
   constexpr uint KW = K / 8, KG = K / GS, SPU = 32 / GS, UPL = K / 1024;
   const device uint4* w0 = (const device uint4*)(w + row * KW) + lane;
@@ -55,26 +62,28 @@ inline void dec_fp4_up_routed(const device uint32_t* w, const device uint8_t* sc
   for (uint k = 0; k < UPL; ++k) {
     const uint4 q0 = w0[32 * k], q1 = w1[32 * k];
     const device uint4* xu = (const device uint4*)x + (32 * k + lane) * 4;
-    acc[0] = dec_fp4_unit<GS>(q0, xu, s0 + 32 * SPU * k, acc[0]);
-    acc[1] = dec_fp4_unit<GS>(q1, xu, s1 + 32 * SPU * k, acc[1]);
+    acc[0] = dec_fp4_unit<GS, FR>(q0, xu, s0 + 32 * SPU * k, acc[0]);
+    acc[1] = dec_fp4_unit<GS, FR>(q1, xu, s1 + 32 * SPU * k, acc[1]);
   }
   acc[0] = simd_sum(acc[0]);
   acc[1] = simd_sum(acc[1]);
 }
 
 // A lane's part of the expert row `row` of the fused-down bank (fp4, K inputs) against `x`: units first, first + step...
-template <int K, int GS, typename T>
+template <int K, int GS, int FR, typename T>
 inline float dec_fp4_down_routed(const device uint32_t* w, const device uint8_t* sc, size_t row, const device T* x, uint first, uint step) {
   constexpr uint NU = K / 32, SPU = 32 / GS;
   const device uint4* wp = (const device uint4*)(w + row * (K / 8));
   const device uint8_t* sp = sc + row * (K / GS);
   float acc = 0.0f;
-  for (uint u = first; u < NU; u += step) acc = dec_fp4_unit<GS>(wp[u], (const device uint4*)x + u * 4, sp + u * SPU, acc);
+  for (uint u = first; u < NU; u += step) acc = dec_fp4_unit<GS, FR>(wp[u], (const device uint4*)x + u * 4, sp + u * SPU, acc);
   return acc;
 }
 
 // A lane's part of the shared expert's down row `row` (mxfp8, K inputs: a unit is 32 bytes) against `x`, as above.
-template <int K, typename T>
+// FR 0: e4m3 and e8m0 as MLX reads them (S.1111.111 and e8m0 0xFF NaN, codes 247..254 finite); FR 1: e4m3 by bit
+// placement and e8m0 as a float exponent times 2^8 (the same bytes on every finite code under 247).
+template <int K, int FR, typename T>
 inline float dec_fp4_down_shared(const device uint32_t* sw, const device uint8_t* ss, size_t row, const device T* x, uint first, uint step) {
   constexpr uint NU = K / 32;
   const device uint4* wp = (const device uint4*)(sw + row * (K / 4));
@@ -88,7 +97,7 @@ inline float dec_fp4_down_shared(const device uint32_t* sw, const device uint8_t
     for (int c = 0; c < 4; ++c) {
       const uint4 xq = ((const device uint4*)x)[u * 4 + c];
       const float xf[8] = {dec_up_bf(xq.x, 0), dec_up_bf(xq.x, 1), dec_up_bf(xq.y, 0), dec_up_bf(xq.y, 1), dec_up_bf(xq.z, 0), dec_up_bf(xq.z, 1), dec_up_bf(xq.w, 0), dec_up_bf(xq.w, 1)};
-      const float4 a = dsv41_e4m3x4<1>(qs[2 * c]), b = dsv41_e4m3x4<1>(qs[2 * c + 1]);
+      const float4 a = dsv41_e4m3x4<FR>(qs[2 * c]), b = dsv41_e4m3x4<FR>(qs[2 * c + 1]);
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         d = fma(xf[i], a[i], d);
@@ -96,7 +105,8 @@ inline float dec_fp4_down_shared(const device uint32_t* sw, const device uint8_t
       }
     }
     const uint e = uint(sp[u]);
-    acc = fma(as_type<float>(e == 0u ? 0x400000u : (e << 23)) * 256.0f, d, acc);
+    if constexpr (FR == 0) acc = fma(mlxserve_fp4_e8m0(e), d * 256.0f, acc);
+    else acc = fma(as_type<float>(e == 0u ? 0x400000u : (e << 23)) * 256.0f, d, acc);
   }
   return acc;
 }

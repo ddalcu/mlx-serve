@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
@@ -98,6 +99,15 @@ pub fn moeUpScaled(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernels, 
     return try runUp(sc, kern, f, rows, k, n, topk, h2, vgu.w, vgu.s, sgu.w, sgu.s, idx, wts, es);
 }
 
+/// `MLX_SERVE_DSV41_FP4_READS` (read every call) as the kernels' template int `FR`: 0 MLX's shared-down reads and an
+/// equal-scale NVFP4 span in MXFP4's order, 1 the bit-placement reads and each 16-group apart. Logged once when on.
+pub fn fp4Reads() c_int {
+    if (!env.on(.MLX_SERVE_DSV41_FP4_READS)) return 0;
+    if (!fp4_reads_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info("[dsv41] MLX_SERVE_DSV41_FP4_READS engaged\n", .{});
+    return 1;
+}
+var fp4_reads_logged = std.atomic.Value(bool).init(false);
+
 /// The gate/up launch over arrays already checked.
 var up_logged = false;
 
@@ -113,6 +123,7 @@ pub fn runUp(sc: *dsv41.Scope, kern: Kernels, f: fp4.Format, rows: usize, k: usi
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, up_threads, 1, 1));
     const flags = .{ .{ "GSCALE", es.gate != null }, .{ "USCALE", es.up != null }, .{ "DSCALE", es.down != null } };
     inline for (.{ .{ "R", rows }, .{ "K", k }, .{ "N", n }, .{ "TOPK", topk }, .{ "GS", f.group() } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "FR", fp4Reads()));
     inline for (flags) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], @intFromBool(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
     // An absent scale binds x (bf16, never read: its flag is off).
@@ -176,6 +187,7 @@ pub fn runDown(sc: *dsv41.Scope, kern: Kernels, f: fp4.Format, R: usize, K: usiz
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(N / nc * tg), ci(R), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
     inline for (.{ .{ "K", K }, .{ "N", N }, .{ "TOPK", topk }, .{ "HC", hc }, .{ "NC", nc }, .{ "GS", f.group() } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "FR", fp4Reads()));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
     const ins = [_]A{ act, w, scales, sw, sscales, idx, x1, post, comb };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
@@ -360,7 +372,8 @@ pub fn fillShared(rng: std.Random, words: []f64, exps: []f64, rows: usize, K: us
 /// The block's gate/up half: `rows` decode rows over `Params.experts` routed fp4 experts (groups of `gs`; `scaled`:
 /// with per-expert gate, up and down scales) plus the shared mxfp8 expert.
 const UpK = struct {
-    pub const Params = struct { experts: usize = 8, lim: f64 = 10, gs: usize = 32, scaled: bool = false };
+    /// `fr`: `MLX_SERVE_DSV41_FP4_READS` on (`fp4Reads`).
+    pub const Params = struct { experts: usize = 8, lim: f64 = 10, gs: usize = 32, scaled: bool = false, fr: bool = false };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or s.rows > decode.max_rows or s.n == 0 or s.k == 0 or s.k % 1024 != 0 or p.experts < TOPK or p.experts > 64) return null;
@@ -372,6 +385,7 @@ const UpK = struct {
         g.int("TOPK", TOPK);
         g.int("GS", p.gs);
         inline for (.{ "GSCALE", "USCALE", "DSCALE" }) |n| g.int(n, @intFromBool(p.scaled));
+        g.int("FR", @intFromBool(p.fr));
         g.dtype("T", adt);
         return g;
     }
@@ -497,7 +511,8 @@ const UpK = struct {
 /// The block's down half: `rows` decode rows over `Params.experts` routed fp4 experts (groups of `gs`) plus the shared
 /// mxfp8 expert, y rounded to bf16 once, then the hc expand.
 const DownK = struct {
-    pub const Params = struct { experts: usize = 8, gs: usize = 32 };
+    /// `fr`: `MLX_SERVE_DSV41_FP4_READS` on (`fp4Reads`).
+    pub const Params = struct { experts: usize = 8, gs: usize = 32, fr: bool = false };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows < 1 or s.rows > decode.max_rows or s.n == 0 or s.k == 0 or s.k % 32 != 0 or p.experts < TOPK or p.experts > 64) return null;
@@ -511,6 +526,7 @@ const DownK = struct {
         g.int("HC", HC);
         g.int("NC", nc);
         g.int("GS", p.gs);
+        g.int("FR", @intFromBool(p.fr));
         g.dtype("T", adt);
         return g;
     }
@@ -620,6 +636,8 @@ pub fn register(set: *kc.Set) !void {
         .{ "dsv41 dec moe_fp4 up (mxfp4 routed + mxfp8 shared)", .{} },
         .{ "dsv41 dec moe_fp4 up (nvfp4 routed + mxfp8 shared)", .{ .gs = 16 } },
         .{ "dsv41 dec moe_fp4 up (nvfp4 routed with per-expert scales + mxfp8 shared)", .{ .gs = 16, .scaled = true } },
+        .{ "dsv41 dec moe_fp4 up, FP4_READS (nvfp4 routed, each 16-group apart, + mxfp8 shared)", .{ .gs = 16, .fr = true } },
+        .{ "dsv41 dec moe_fp4 up, FP4_READS (nvfp4 routed with per-expert scales, each 16-group apart, + mxfp8 shared)", .{ .gs = 16, .scaled = true, .fr = true } },
     };
     for (ups) |c| try kit.add(set, UpK, &up_l, c[1], .{
         .name = c[0],
@@ -635,6 +653,8 @@ pub fn register(set: *kc.Set) !void {
     const downs = [_]struct { [:0]const u8, DownK.Params }{
         .{ "dsv41 dec moe_fp4 down (mxfp4 routed + mxfp8 shared, hc expand)", .{} },
         .{ "dsv41 dec moe_fp4 down (nvfp4 routed + mxfp8 shared, hc expand)", .{ .gs = 16 } },
+        .{ "dsv41 dec moe_fp4 down, FP4_READS (mxfp4 routed + mxfp8 shared read by bit placement, hc expand)", .{ .fr = true } },
+        .{ "dsv41 dec moe_fp4 down, FP4_READS (nvfp4 routed each 16-group apart + mxfp8 shared read by bit placement, hc expand)", .{ .gs = 16, .fr = true } },
     };
     for (downs) |c| try kit.add(set, DownK, &down_l, c[1], .{
         .name = c[0],
