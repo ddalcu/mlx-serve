@@ -12,6 +12,7 @@ const qtail = @import("prompt/q_tail.zig");
 const hcf = @import("prompt/hc_fuse.zig");
 const sx1 = @import("prompt/scratch_x1.zig");
 const hv2 = @import("prompt/hc_v2.zig");
+const inax = @import("prompt/idx_nax.zig");
 const mtail = @import("prompt/moe_tail.zig");
 const gtwin = @import("decode/gemv_twin.zig");
 const ggemm = @import("prompt/gate_gemm.zig");
@@ -981,6 +982,32 @@ const IdxTile = struct {
 
     pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
         // The wrapper casts q to the keys' dtype (exact: the rope kernel rounded it there).
+        try idxFill(k, f, rng, act, act);
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        try idxCompute(k, out, mag, sum);
+    }
+};
+
+/// `MLX_SERVE_DSV41_PF_IDX_NAX`'s wide indexer (prompt/idx_nax.zig): idx_tile's scores on the matrix units, the
+/// release's 32 heads of 128 channels only.
+const IdxNax = struct {
+    pub const Params = struct { ih: usize = IH };
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n == 0 or p.ih != inax.heads or s.k != inax.channels) return null;
+        var g = metal.Geometry{ .grid = .{ ci(inax.ranges(s.rows, s.n) * inax.NSG * 32), ci((s.rows + inax.NSG - 1) / inax.NSG), 1 }, .tg = .{ ci(inax.NSG * 32), 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(s.n) }, .float32);
+        g.int("NSG", inax.NSG);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
         try idxFill(k, f, rng, act, act);
     }
 
@@ -4560,6 +4587,7 @@ const norm_l = launch("dsv41_hc_norm", &.{ "z", "x", "cpre", "w", "eps" }, &.{ "
 const stage_l = launch("dsv41_hc_stage", hc_stage_ins, &.{ "h_out", "z" }, v41.HC_STAGE_SOURCE, "", 2 * 4 * 32, 1024, true);
 const stage_x_l = launch("dsv41_hc_stage_x", hc_stage_x_ins, &.{ "h_out", "z", "x1" }, v41.HC_STAGE_X_SOURCE, "", 2 * 4 * 32, 1024, true);
 const idx_l = launch("dsv41_index_scores", &.{ "q", "keys", "w", "meta", "wsc" }, &.{"scores"}, v41.IDX_SCORE_SOURCE, "", 4 * IH * IHD, 416, false);
+const idx_nax_l = metal.Launch{ .name = "dsv41_pf_idx_score", .inputs = &inax.ins, .outputs = &.{"scores"}, .source = inax.source, .header = inax.header, .tg_bytes = 0, .offline = false, .min_gen = 17 };
 const tile_l = launch("dsv41_index_tile", &.{ "q", "keys", "w", "meta", "wsc" }, &.{"scores"}, v41.IDX_TILE_SOURCE, "", 2 * IdxTile.KT * IHD + 4 * IH + 4 * 4 * 64, 1024, false);
 pub const rope_l = launch("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, v41.ROPE_TAIL_SOURCE, v41.FP8_HEADER, 0, 1024, false);
 const expand_into_l = launch("dsv41_hc_expand_into", &.{ "x", "res", "post", "comb", "dst", "after" }, &.{"carrier"}, sx1.expand_into_source, "", 0, 704, false);
@@ -4748,6 +4776,16 @@ pub fn register(set: *kc.Set) !void {
         .out = .f32,
         .tiles = .{ .{}, .{ .size = IdxTile.KT }, .{} },
         .served = &.{ .{ .rows = 17, .n = 300, .k = IHD }, .{ .rows = 24, .n = 200, .k = IHD } },
+        .known = relu_nan,
+    });
+    try kit.add(set, IdxNax, &idx_nax_l, .{}, .{
+        .name = "dsv41 pf idx_nax (wide indexer, NAX)",
+        .accum = .f32,
+        .depth = depthIdx,
+        .out = .f32,
+        .tiles = .{ .{ .size = inax.NSG }, .{ .size = 16 }, .{} },
+        .served = &.{ .{ .rows = 17, .n = 300, .k = IHD }, .{ .rows = 40, .n = 200, .k = IHD } },
+        .nax = true,
         .known = relu_nan,
     });
     const rope_served: []const Shape = &.{ .{ .rows = 1, .n = 8, .k = HD }, .{ .rows = REGION, .n = 8, .k = HD } };
@@ -5530,6 +5568,10 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const r = try ours(IdxTile, a, &tile_l, .{}, .{ .rows = 18, .n = 200, .k = IHD });
         try Expect.same(r.c, r.bytes, &.{try v41.indexScoresTiled(&sc, m, r.c.args[0], r.c.args[1], r.c.args[2], @floatCast(r.c.in(4)[0]), @intFromFloat(r.c.in(3)[0]), @intFromFloat(r.c.in(3)[1]))});
     }
+    if (@import("../../mlx/device.zig").naxAvailable()) {
+        const r = try ours(IdxNax, a, &idx_nax_l, .{}, .{ .rows = 18, .n = 200, .k = IHD });
+        try Expect.same(r.c, r.bytes, &.{try inax.launch(&sc, try inax.kernel(), r.c.args[0..5])});
+    }
     {
         const r = try ours(Engram, a, &engram_l, .{}, .{ .rows = 2, .n = HC, .k = DIM });
         try Expect.same(r.c, r.bytes, &.{try v41.engramGate(&sc, m, r.c.args[2], r.c.args[0], r.c.args[1])});
@@ -5601,5 +5643,32 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const r = try ours(MoeTail, a, &moe_tail_l, .{}, .{ .rows = 3, .n = 256, .k = TOPK });
         const sp: v41.Split = .{ .pre = none, .post = r.c.args[4], .comb = r.c.args[5] };
         try Expect.same(r.c, r.bytes, &.{try mtail.launch(&sc, .{ .dn = r.c.args[0], .inv = r.c.args[1], .sh = r.c.args[2] }, r.c.args[3], &sp)});
+    }
+}
+
+test "kernel contract dsv41: the router's scores at logits near -9 (e^z about 1e-4) are within 1e-5 of float64" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    var rig = metal.Rig.init(std.testing.allocator);
+    defer rig.deinit();
+    // z_e = -(8 + (e % 24) / 16), exact in f32; the bias makes experts 16..21 (z -9 .. -9.3125) the picks.
+    var z: [EXPERTS]f64 = undefined;
+    var bias: [EXPERTS]f64 = undefined;
+    for (0..EXPERTS) |e| {
+        z[e] = -(8.0 + @as(f64, @floatFromInt(e % 24)) / 16.0);
+        bias[e] = if (e >= 16 and e < 22) 10 else 0;
+    }
+    const lz = try rig.input(.float32, &.{ 1, EXPERTS }, &z);
+    const lb = try rig.input(.float32, &.{ 1, EXPERTS }, &bias);
+    const ls = try rig.input(.float32, &.{1}, &.{1.5});
+    try rig.launch(&route_l, Route.geometry(.{ .norm = false }, .{ .rows = 1, .n = TOPK, .k = EXPERTS }).?, &.{ lz, lb, ls });
+    const out = rig.outputBytes();
+    for (0..TOPK) |q| {
+        const e = std.mem.readInt(u32, out[4 * q ..][0..4], .little);
+        try std.testing.expectEqual(@as(u32, @intCast(16 + q)), e);
+        const got: f64 = @as(f32, @bitCast(std.mem.readInt(u32, out[4 * (TOPK + q) ..][0..4], .little)));
+        const want = softplusSqrt(z[e]) * 1.5;
+        const rel = @abs(got - want) / want;
+        std.debug.print("[dsv41] route pick {d}: z {d:.4}, weight {e} where float64 gives {e} ({e} rel)\n", .{ e, z[e], got, want, rel });
+        try std.testing.expect(rel <= 1e-5);
     }
 }
