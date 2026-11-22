@@ -17,13 +17,14 @@ pub fn on() bool {
     return env.on(.MLX_SERVE_DSV41_PF_FP4_GEMM);
 }
 
-/// `gather_nax.sortedGateUpRouted`'s output on the staged schedule; null where it declines (the caller runs today's).
-pub fn gateUp(sc: *dsv41.Scope, gu: *const dsv41.Bank, x3: A, rows: A, sidx: A, w_sorted: A, limit: f32, scales: gather_nax.ExpertScales) !?A {
-    const y = (try gather_nax.sortedGateUpRoutedStaged(x3, rows, gu.w, gu.s, gu.b, sidx, w_sorted, limit, scales, gu.qp.bits, gu.qp.group_size, gu.qp.mode.isFp4(), verify_qmm_nax.verifyQmmNaxAvailable(), sc.s)) orelse
+/// `gather_nax.sortedGateUpRouted`'s output on the staged schedule, for the caller to keep; null where it declines (the
+/// caller runs today's).
+pub fn gateUp(gu: *const dsv41.Bank, x3: A, rows: A, sidx: A, w_sorted: A, limit: f32, scales: gather_nax.ExpertScales, s: mlx.mlx_stream) !?A {
+    const y = (try gather_nax.sortedGateUpRoutedStaged(x3, rows, gu.w, gu.s, gu.b, sidx, w_sorted, limit, scales, gu.qp.bits, gu.qp.group_size, gu.qp.mode.isFp4(), verify_qmm_nax.verifyQmmNaxAvailable(), s)) orelse
         return decline("gate+up", mlx.getShape(sidx)[0], gather_nax.routed_decline);
     gate_up_engaged.store(true, .monotonic);
     _ = launches.fetchAdd(1, .monotonic);
-    return try sc.keep(y);
+    return y;
 }
 
 /// The down rows `[n, 1, d]` of the sorted pairs' activations on the staged schedule; null where it declines.
