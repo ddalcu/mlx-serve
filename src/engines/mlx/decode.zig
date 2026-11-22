@@ -423,3 +423,144 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     try testing.expectEqual(@as(u32, 0), slot.legacy_gen.?.mtp_group_cap);
     try testing.expectEqual(@as(u64, 0), sch.inflight_generated_tokens.load(.monotonic));
 }
+
+test "a batched row whose per-tick guard fails errors alone and the tick returns" {
+    var stale: [512]u8 = undefined;
+    _ = mlx.takeError(&stale);
+    try testing.expect(!mlx.errorPending());
+    var cfg = std.mem.zeroes(@import("../../sdk/config/model.zig").ModelConfig);
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.transformer = null;
+    model.config = &cfg;
+    // A reasoning budget already due: the guard's forced commit allocates first and fails.
+    var bound: generate_mod.ThinkBound = .{ .budget = 0, .opener_id = null, .closer_id = 9, .forced = &.{ 7, 9 }, .in_think = true };
+    var gen: Generator = undefined;
+    gen.mtp_planner_owned = false;
+    gen.speech = null;
+    gen.spec_disabled_runtime = true;
+    gen.mtp_adaptive.sticky_serial = false;
+    gen.generated_ids = .empty;
+    gen.loop_guard_start = 0;
+    gen.sampling = .{};
+    gen.sampling.think_bound = &bound;
+    gen.completion_tokens = 0;
+    gen.max_tokens = 100;
+    gen.has_pending_token = false;
+    gen.has_pending_logits = false;
+    gen.next_token_id = 0;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var slot: Slot = undefined;
+    slot.allocator = failing.allocator();
+    slot.io = testing.io;
+    slot.model = &model;
+    slot.legacy_gen = gen;
+    slot.sampling = .{};
+    slot.logprobs_n = 0;
+    slot.eos_token_ids = &.{};
+    slot.loop_guard_seen = 0;
+    slot.finished = false;
+    slot.error_code = null;
+    slot.cancelled = std.atomic.Value(bool).init(false);
+    slot.completion_tokens = 0;
+    slot.sink = null;
+    slot.out_mu = .init;
+    slot.out_cond = .init;
+    slot.out_event = .unset;
+    var sch: Scheduler = undefined;
+    sch.force_batched = true;
+    sch.metrics = null;
+    sch.inflight_generated_tokens = std.atomic.Value(u64).init(0);
+    var active = [_]*Slot{&slot};
+    try runDecodeTick(&sch, &active);
+    try testing.expectEqual(.errored, slot.state);
+}
+
+test "a crowded MTP row runs the per-tick guards before it joins the batched tick" {
+    var stale: [512]u8 = undefined;
+    _ = mlx.takeError(&stale);
+    try testing.expect(!mlx.errorPending());
+    var cfg = std.mem.zeroes(@import("../../sdk/config/model.zig").ModelConfig);
+    cfg.full_attention_interval = 4;
+    // One recurrent layer and no per-slot state: the batched merge is never ready, so the tick decodes rows serially.
+    var layers: [1]@import("layer_weights.zig").MoeLayerWeights = undefined;
+    layers[0].is_linear = true;
+    layers[0].ple = null;
+    layers[0].mlp = .{ .dense = undefined };
+    var xfm: Transformer = undefined;
+    xfm.config = cfg;
+    xfm.plugin = null;
+    xfm.moe_layers = &layers;
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.transformer = &xfm;
+    model.config = &cfg;
+    var trunk: @import("../../plugins/qwen4_exp/trunk.zig").Trunk = undefined;
+    var bounds: [MAX_BATCH_GROUP]generate_mod.ThinkBound = undefined;
+    var failing: [MAX_BATCH_GROUP]testing.FailingAllocator = undefined;
+    var slots: [MAX_BATCH_GROUP]Slot = undefined;
+    var active: [MAX_BATCH_GROUP]*Slot = undefined;
+    slots[0].model = &model;
+    const n = mtpCrowdThresholdFor(&slots[0]);
+    try testing.expect(n <= MAX_BATCH_GROUP);
+    for (slots[0..n], bounds[0..n], failing[0..n], active[0..n]) |*slot, *bound, *fa, *a| {
+        // A reasoning budget already due: the guard's forced commit allocates first and fails.
+        bound.* = .{ .budget = 0, .opener_id = null, .closer_id = 9, .forced = &.{ 7, 9 }, .in_think = true };
+        fa.* = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        var gen: Generator = undefined;
+        gen.mtp_planner_owned = false;
+        gen.speech = null;
+        gen.spec_disabled_runtime = false;
+        gen.mtp_adaptive.sticky_serial = false;
+        gen.mtp = .{ .qwen4 = &trunk };
+        gen.mtp_cache = .{ .qwen = undefined };
+        gen.mtp_pre_draft = null;
+        gen.mtp_hist_stash = null;
+        gen.has_last_hidden = true;
+        gen.mtp_serial_left = 0;
+        gen.mtp_serial_exit = .none;
+        gen.ctx.ssm_entries = &.{};
+        gen.drafter = null;
+        gen.dflash = null;
+        gen.pld_enabled = false;
+        gen.dspark_enabled = false;
+        gen.generated_ids = .empty;
+        gen.loop_guard_start = 0;
+        gen.sampling = .{};
+        gen.sampling.think_bound = bound;
+        gen.completion_tokens = 0;
+        gen.max_tokens = 100;
+        gen.has_pending_token = false;
+        gen.has_pending_logits = false;
+        gen.next_token_id = 0;
+        slot.allocator = fa.allocator();
+        slot.io = testing.io;
+        slot.model = &model;
+        slot.legacy_gen = gen;
+        slot.enable_mtp = true;
+        slot.enable_drafter = false;
+        slot.enable_pld = false;
+        slot.sampling = .{};
+        slot.logprobs_n = 0;
+        slot.eos_token_ids = &.{};
+        slot.loop_guard_seen = 0;
+        slot.finished = false;
+        slot.error_code = null;
+        slot.cancelled = std.atomic.Value(bool).init(false);
+        slot.completion_tokens = 0;
+        slot.sink = null;
+        slot.out_mu = .init;
+        slot.out_cond = .init;
+        slot.out_event = .unset;
+        slot.cache.step = 0;
+        a.* = slot;
+    }
+    var sch: Scheduler = undefined;
+    sch.allocator = testing.allocator;
+    sch.force_batched = false;
+    sch.metrics = null;
+    sch.inflight_generated_tokens = std.atomic.Value(u64).init(0);
+    try runDecodeTick(&sch, active[0..n]);
+    for (slots[0..n], bounds[0..n]) |*slot, *bound| {
+        try testing.expect(bound.fired);
+        try testing.expectEqual(.errored, slot.state);
+    }
+}
