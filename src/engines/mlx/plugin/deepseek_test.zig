@@ -92,3 +92,89 @@ test "dsv41 prefill chunk: pinned at 8192 on a big machine, and kept there howev
     for ([_]usize{ 8192, 65536, 131_072, 1 << 20 }) |ctx|
         try t.expectEqual(@as(usize, 8192), effectivePrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, ctx, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), cfg.pinned_prefill_chunk));
 }
+
+test "dsv41 prefill chunk: the pass plan pins the widest whole-span pass the ladder's share bills, up to the context, the explicit width over it, and the ladder's pin where not even 8192 rows fit" {
+    const t = std.testing;
+    const env = @import("../../../env.zig");
+    const pc = @import("../admission/prefill_chunk.zig");
+    const span = @import("../../../plugins/deepseek_v41/deepseek_v41.zig").SPAN;
+    var cfg = try model.parseConfigFromJson(t.allocator, model.dsv41_release_config);
+    const was = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, "1");
+    defer was.restore();
+    const gb: u64 = 1 << 30;
+    // The share bounds it on a long context: the widest whole span that fits, the next one past the cap.
+    cfg.ctx_override = 1 << 20;
+    const cap: u64 = 25 * gb;
+    const wide = pc.dsv41PassRows(&cfg, 16, cap, 0, 8192);
+    try t.expect(wide > 8192 and wide % span == 0);
+    try t.expect(dsv41PrefillMemoryNeeded(&cfg, wide, wide) <= cap);
+    try t.expect(dsv41PrefillMemoryNeeded(&cfg, wide + span, wide + span) > cap);
+    // Under the pass plan one MoE call takes every row, and the bill says so.
+    env.set(.MLX_SERVE_DSV41_PF_PASS_SIZE, "0");
+    const off = dsv41PrefillMemoryNeeded(&cfg, wide, wide);
+    env.set(.MLX_SERVE_DSV41_PF_PASS_SIZE, "1");
+    try t.expect(dsv41PrefillMemoryNeeded(&cfg, wide, wide) > off);
+    // A wider share never pins a narrower pass; the context bounds it.
+    try t.expect(pc.dsv41PassRows(&cfg, 16, 2 * cap, 0, 8192) >= wide);
+    cfg.ctx_override = 32768;
+    try t.expectEqual(@as(u32, 32768), pc.dsv41PassRows(&cfg, 16, 400 * gb, 0, 8192));
+    // The explicit width, and the ladder's pin on a box whose share takes no 8192-row pass.
+    try t.expectEqual(@as(u32, 12000), pc.dsv41PassRows(&cfg, 16, cap, 12000, 8192));
+    try t.expectEqual(@as(u32, 2048), pc.dsv41PassRows(&cfg, 16, gb / 4, 0, 2048));
+    // However wide the share or the flag, a pass's query heads stay indexable in 32 bits.
+    cfg.ctx_override = 1 << 20;
+    const limit = @import("../../../plugins/deepseek_v41/deepseek_v41.zig").passRowsLimit(&cfg);
+    try t.expectEqual(@as(u64, 65_280), limit);
+    try t.expectEqual(@as(u32, 65_280), pc.dsv41PassRows(&cfg, 16, 4096 * gb, 0, 8192));
+    try t.expectEqual(@as(u32, 65_280), pc.dsv41PassRows(&cfg, 16, cap, 1 << 20, 8192));
+}
+
+test "dsv41 prefill chunk: under the pass plan the chunk loop cuts a prompt into near-equal chunks no wider than the pinned pass; off, 8192-row chunks and the rest" {
+    const t = std.testing;
+    const env = @import("../../../env.zig");
+    var cfg = try model.parseConfigFromJson(t.allocator, model.dsv41_release_config);
+    const Loop = struct {
+        // As generate/init.zig picks it: the request's admitted width (the pin), the pass plan's cut of it, else the cap.
+        fn cuts(c: *const model.ModelConfig, rows: usize, out: []usize) []usize {
+            const pin: usize = c.pinned_prefill_chunk;
+            const chunk = c.passPrefillChunk(pin, rows) orelse c.cappedPrefillChunk(16384);
+            var pos: usize = 0;
+            var n: usize = 0;
+            while (pos < rows) : (n += 1) {
+                const end = generate_mod.nextChunkEnd(pos, rows, chunk, false, 0, 0, false, false);
+                out[n] = end - pos;
+                pos = end;
+            }
+            return out[0..n];
+        }
+    };
+    var buf: [64]usize = undefined;
+    // Off: 8192-row chunks and the rest.
+    {
+        const was = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, null);
+        defer was.restore();
+        cfg.pinned_prefill_chunk = 8192;
+        try t.expectEqualSlices(usize, &.{ 8192, 8192, 1254 }, Loop.cuts(&cfg, 17_638, &buf));
+    }
+    // On: the pin is the pass (`pinPrefillChunk` sets both).
+    cfg.dsv41_pass_rows = 32768;
+    cfg.pinned_prefill_chunk = 32768;
+    try t.expectEqualSlices(usize, &.{17_638}, Loop.cuts(&cfg, 17_638, &buf));
+    try t.expectEqualSlices(usize, &.{ 20_224, 19_776 }, Loop.cuts(&cfg, 40_000, &buf));
+    cfg.dsv41_pass_rows = 8192;
+    cfg.pinned_prefill_chunk = 8192;
+    try t.expectEqualSlices(usize, &.{ 5888, 5888, 5862 }, Loop.cuts(&cfg, 17_638, &buf));
+    // The forward's own config copy holds no pass (no pin was taken on it): the switch and the request's width decide.
+    const copy = try model.parseConfigFromJson(t.allocator, model.dsv41_release_config);
+    {
+        const was = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, "1");
+        defer was.restore();
+        try t.expectEqual(@as(?usize, 17_638), copy.passPrefillChunk(32768, 17_638));
+        try t.expectEqual(@as(?usize, null), copy.passPrefillChunk(0, 17_638));
+    }
+    {
+        const was = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, null);
+        defer was.restore();
+        try t.expectEqual(@as(?usize, null), copy.passPrefillChunk(32768, 17_638));
+    }
+}

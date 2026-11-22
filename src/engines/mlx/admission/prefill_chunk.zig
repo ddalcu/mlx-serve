@@ -210,6 +210,14 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
             hot_cache_ask,
             pin_override,
         );
+        // DeepSeek-V4.1's pass plan: its widest pass from the same share, and the pin that every bill reads.
+        if (dsv41_mod.passPlanned(config)) {
+            const cap = prefillChunkCap(config, currentGpuMemoryCeiling(config, active_mem), active_mem, sizerCtxKvBytes(config, kv_bits), hot_cache_ask);
+            const rows = dsv41PassRows(config, kv_bits, cap, explicitPrefillChunk(), config.pinned_prefill_chunk);
+            config.dsv41_pass_rows = rows;
+            config.pinned_prefill_chunk = rows;
+            log.info("[prefill] DeepSeek-V4.1 passes of up to {d} rows, cut near-equal (MLX_SERVE_DSV41_PF_PASS_SIZE; {s}, reserve {d} MB of {d} MB)\n", .{ rows, if (explicitPrefillChunk() > 0) "--prefill-chunk" else "memory-sized", prefillTransientReserve(config, kv_bits, rows) >> 20, cap >> 20 });
+        }
         // Say when the ctx bar is the binding one.
         if (config.longCtxGated() and explicitPrefillChunk() == 0) {
             const share_only = resolvePrefillChunk(config, kv_bits, currentGpuMemoryCeiling(config, active_mem), active_mem, 0, hot_cache_ask);
@@ -227,6 +235,30 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         }
     }
     return config.pinned_prefill_chunk;
+}
+
+/// DeepSeek-V4.1's widest prompt pass under `MLX_SERVE_DSV41_PF_PASS_SIZE` (`ModelConfig.dsv41_pass_rows`): the
+/// explicit `--prefill-chunk`; else the widest whole-span width, up to the context, whose prompt pass bill
+/// (`prefillTransientReserve`, its one MoE call over every row included) fits `cap`, the share the ladder sizes
+/// against; `ladder`, the ladder's pin, where not even the old 8192-row cap fits. The machine and its memory decide it,
+/// never a prompt. Never past `dsv41_mod.passRowsLimit` (a pass's widest tensor indexable in 32 bits), the explicit
+/// width included.
+pub fn dsv41PassRows(config: *const model_mod.ModelConfig, kv_bits: u64, cap: u64, explicit: u32, ladder: u32) u32 {
+    const span: u64 = dsv41_mod.SPAN;
+    const limit: u64 = dsv41_mod.passRowsLimit(config);
+    if (explicit > 0) return @intCast(@min(explicit, limit));
+    const floor: u64 = 8192 / span;
+    if (prefillTransientReserve(config, kv_bits, floor * span) > cap) return ladder;
+    const ctx: u64 = if (manualContext(config) > 0) manualContext(config) else config.contextCap();
+    var lo = floor;
+    var hi = @max(@min(ctx, limit) / span, floor);
+    if (prefillTransientReserve(config, kv_bits, hi * span) <= cap) return @intCast(hi * span);
+    // The bill grows with the width: the widest that fits lies in [lo, hi).
+    while (hi - lo > 1) {
+        const mid = lo + (hi - lo) / 2;
+        if (prefillTransientReserve(config, kv_bits, mid * span) <= cap) lo = mid else hi = mid;
+    }
+    return @intCast(lo * span);
 }
 
 /// The width a ladder rung actually forwards at for this prompt.
