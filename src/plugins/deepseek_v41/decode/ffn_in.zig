@@ -47,11 +47,11 @@ pub const Kernels = struct {
     facc: A,
 };
 
-/// The fused launch's scratch words: the logits, sums and mix partials of up to 6 rows, then the counters.
-const facc_words = 16384;
+/// The fused launch's scratch words: each slice's logits and sums of up to 6 rows, the mix partials, then the counters.
+const facc_words = 131072;
 
 fn faccNeed(p: Dims) usize {
-    return 6 * p.e + 8 + 6 * slices(p) * (mixes + 1) + slices(p) + 1;
+    return slices(p) * (6 * p.e + 8) + 6 * slices(p) * (mixes + 1) + slices(p) + 1;
 }
 
 /// The launches' kernels, built once.
@@ -63,11 +63,14 @@ pub fn build() !Kernels {
     const f = try dsv41.buildKernel("dsv41_dec_ffn_in_fused", &F_INS, &F_OUTS, F_SOURCE, F_HEADER);
     errdefer _ = mlx.mlx_fast_metal_kernel_free(f);
     const n = if (device.naxAvailable()) try dsv41.buildKernel("dsv41_dec_ffn_in_nax", &A_INS, &A_OUTS, NAX_SOURCE, NAX_HEADER) else null;
-    return .{ .a = a, .b = b, .fused = f, .nax = n, .facc = newScratch() };
+    return .{ .a = a, .b = b, .fused = f, .nax = n, .facc = try newScratch() };
 }
 
-fn newScratch() A {
-    return mlx.mlx_array_new_data(&std.mem.zeroes([facc_words]u32), &[_]c_int{facc_words}, 1, .uint32);
+fn newScratch() !A {
+    const z = try std.heap.page_allocator.alloc(u32, facc_words);
+    defer std.heap.page_allocator.free(z);
+    @memset(z, 0);
+    return mlx.mlx_array_new_data(z.ptr, &[_]c_int{facc_words}, 1, .uint32);
 }
 
 pub fn free(k: Kernels) void {
@@ -86,7 +89,7 @@ pub fn fusedOn() bool {
 
 /// `MLX_SERVE_DSV41_GEMV_R26_FFN_IN` (read each call): =1 launch 1 runs on the matrix units from `nax_min_rows` rows.
 pub fn naxOn() bool {
-    return env.onUnlessZero(.MLX_SERVE_DSV41_GEMV_R26_FFN_IN);
+    return env.on(.MLX_SERVE_DSV41_GEMV_R26_FFN_IN);
 }
 
 /// The matrix-unit launch 1: simdgroups splitting K, 32 columns a threadgroup, from this many rows.
@@ -1118,7 +1121,7 @@ pub fn register(set: *kc.Set) !void {
         .out = .bf16,
         .nan = nan_rule,
         .nax = true,
-        .tiles = .{ .{ .size = 3 }, .{ .size = 32, .step = 32, .min = 32 }, .{ .size = 1024, .step = 1024, .min = 1024 } },
+        .tiles = .{ .{ .size = 3 }, .{ .size = 32, .step = 32, .min = 128 }, .{ .size = 1024, .step = 1024, .min = 1024 } },
         .served = &.{ .{ .rows = 2, .n = 256, .k = 8192 }, .{ .rows = 6, .n = 256, .k = 8192 }, .{ .rows = 4, .n = 5120, .k = 8192 } },
     });
     try kit.add(set, FfnFused, &launch_f, .{}, .{
@@ -1501,6 +1504,47 @@ test "dsv41 dec ffn_in nax: MLX_SERVE_DSV41_GEMV_R26_FFN_IN=1, rows 1..6 on laye
     if (equivalence(gpa, fx, ks, &ly, bad, 4)) |_| return error.PlantedBugPassed else |_| {}
 }
 
+test "dsv41 dec ffn_in fused: the same inputs give the same bytes, launch after launch, at the release's shapes" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .ctx = 8 });
+    defer fx.deinit();
+    const ks = try build();
+    defer free(ks);
+    const w = try randomWeights(84);
+    defer freeWeights(w);
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const eps = try dsv41.hcEps(&sc, fx.m);
+    const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{fx.m.cfg.router_scaling_factor}, &[_]c_int{1}, 1, .float32));
+    for ([_]usize{ 1, 6 }) |rows| {
+        const oa = try fx.normal(&.{ ci(rows), 8192 }, act, 0, 1);
+        defer _ = mlx.mlx_array_free(oa);
+        const x = try fx.stream(rows);
+        defer _ = mlx.mlx_array_free(x);
+        const cpre = try fx.cpre(rows);
+        defer _ = mlx.mlx_array_free(cpre);
+        const sa = (try dsv41.hcStage(&sc, fx.m, x, null, cpre, &fx.layer(21).hc_attn, fx.layer(21).attn_norm)).sp;
+        const p: Dims = .{ .rows = rows };
+        var first: ?[]u8 = null;
+        defer if (first) |f| gpa.free(f);
+        // The router's logits and the hv sums gather from 40 column slices: their sum must not follow arrival order.
+        for (0..24) |_| {
+            const o = try launchFused(&sc, ks.fused, ks.facc, p, w, oa, x, &sa, eps, scal);
+            const outs = [_]A{ o.h2, o.sf.pre, o.sf.post, o.sf.comb, o.idx, o.wts };
+            try dsv41.evalAll(&outs);
+            var bytes: std.ArrayList(u8) = .empty;
+            defer bytes.deinit(gpa);
+            for (outs) |a| {
+                const n = mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a);
+                const d = mlx.mlx_array_data_uint8(a) orelse return error.NoData;
+                try bytes.appendSlice(gpa, d[0..n]);
+            }
+            if (first) |f| try std.testing.expectEqualSlices(u8, f, bytes.items) else first = try gpa.dupe(u8, bytes.items);
+        }
+    }
+}
+
 test "dsv41 dec ffn_in fused: a planted dropped router bias fails the equivalence" {
     if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     var ov = env.override(.MLX_SERVE_DSV41_FUSE_FFN_IN, "1");
@@ -1556,6 +1600,114 @@ test "dsv41 dec ffn_in: the contract's launches write the shipped wrapper's byte
     const b = try launchB(&sc, ks, pb, wb, ab, cb.args[9], cb.args[8]);
     const got = [_]A{ b.h2, b.sf.pre, b.sf.post, b.sf.comb, b.idx, b.wts };
     for (got, 0..) |g, i| try std.testing.expect(try sameBytes(&cb.rig, g, cb.rig.output(i)));
+}
+
+/// A `[n]` f32 array of `v`, as `dt`.
+fn hostArray(v: []const f32, shape: []const c_int, dt: mlx.mlx_dtype) !A {
+    const a = mlx.mlx_array_new_data(v.ptr, shape.ptr, @intCast(shape.len), .float32);
+    if (dt == .float32) return a;
+    defer _ = mlx.mlx_array_free(a);
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&o, a, dt, mlx.gpuStream()));
+    try mlx.check(mlx.mlx_array_eval(o));
+    return o;
+}
+
+test "dsv41 dec ffn_in: launch 2's and the fused launch's router scores at logits near -9 (e^z about 1e-4) are within 1e-5 of float64" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ks = try build();
+    defer free(ks);
+    const D = 5120;
+    const E = 384;
+    // hv = 1 on every column (oa 0, a unit stream, comb the identity, pre 1/4) and a unit norm weight: expert e's logit
+    // is its one gate weight z_e = -(8 + (e % 24) / 16), and the bias makes experts 16..21 (z -9 .. -9.3125) the picks.
+    const zs = try gpa.alloc(f32, E * D);
+    defer gpa.free(zs);
+    @memset(zs, 0);
+    var bias: [E]f32 = undefined;
+    for (0..E) |e| {
+        zs[e * D + e] = -(8.0 + @as(f32, @floatFromInt(e % 24)) / 16.0);
+        bias[e] = if (e >= 16 and e < 22) 10 else 0;
+    }
+    const ones = try gpa.alloc(f32, 4 * D);
+    defer gpa.free(ones);
+    @memset(ones, 1);
+    const zeros = try gpa.alloc(f32, 8192);
+    defer gpa.free(zeros);
+    @memset(zeros, 0);
+    var eye: [16]f32 = @splat(0);
+    for (0..4) |i| eye[i * 4 + i] = 1;
+    const w0 = try randomWeights(85);
+    defer freeWeights(w0);
+    var w = w0;
+    w.norm_w = try hostArray(ones[0..D], &.{D}, act);
+    defer _ = mlx.mlx_array_free(w.norm_w);
+    w.gate_w = try hostArray(zs, &.{ E, D }, act);
+    defer _ = mlx.mlx_array_free(w.gate_w);
+    w.gate_bias = try hostArray(&bias, &.{ 1, E }, .float32);
+    defer _ = mlx.mlx_array_free(w.gate_bias);
+    const arrs = [_]A{
+        try hostArray(zeros, &.{ 1, 8192 }, act),         try hostArray(ones, &.{ 1, 4, D }, act),
+        try hostArray(&.{ 0.25, 0.25, 0.25, 0.25 }, &.{ 1, 4 }, .float32), try hostArray(&.{ 1, 1, 1, 1 }, &.{ 1, 4 }, .float32),
+        try hostArray(&eye, &.{ 1, 4, 4 }, .float32),     try hostArray(&.{ 1e-6, 1e-6 }, &.{2}, .float32),
+        try hostArray(&.{1.5}, &.{1}, .float32),
+    };
+    defer for (arrs) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const sa: dsv41.Split = .{ .pre = arrs[2], .post = arrs[3], .comb = arrs[4] };
+    const p: Dims = .{ .rows = 1, .e = E, .top_k = 6, .norm = false };
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const inv = 1 / @sqrt(1.0 + @as(f64, 1e-6));
+    for ([_]bool{ false, true }) |fused| {
+        var idx: A = undefined;
+        var wts: A = undefined;
+        if (fused) {
+            const o = try launchFused(&sc, ks.fused, ks.facc, p, w, arrs[0], arrs[1], &sa, arrs[5], arrs[6]);
+            idx = o.idx;
+            wts = o.wts;
+        } else {
+            const a = try launchA(&sc, ks, p, w, arrs[0], arrs[1], &sa);
+            const b = try launchB(&sc, ks, p, w, a, arrs[5], arrs[6]);
+            idx = b.idx;
+            wts = b.wts;
+        }
+        try dsv41.evalAll(&.{ idx, wts });
+        const ih = try dsv41.hostF32(idx);
+        defer gpa.free(ih);
+        const wh = try dsv41.hostF32(wts);
+        defer gpa.free(wh);
+        // Launch 2 routes off h2 = bf16(1 * bf16(inv)) = 1, the fused launch off the unrounded inv.
+        const f: f64 = if (fused) inv else 1;
+        for (ih, wh, 0..) |iv, wv, q| {
+            const e: usize = @intFromFloat(iv);
+            try std.testing.expectEqual(16 + q, e);
+            const z = @as(f64, zs[e * D + e]) * f;
+            const want = @sqrt(std.math.log1p(@exp(-@abs(z)))) * 1.5;
+            const rel = @abs(@as(f64, wv) - want) / want;
+            std.debug.print("[dec] ffn_in {s} pick {d}: z {d:.4}, weight {e} where float64 gives {e} ({e} rel)\n", .{ if (fused) "fused" else "launch 2", e, z, wv, want, rel });
+            try std.testing.expect(rel <= 1e-5);
+        }
+    }
+}
+
+test "dsv41 dec ffn_in: launch 2 and the fused launch pass the contract's gates 1-4, launch 2's sums gate at stress seed 0xc0de too" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var set = kc.Set.init(gpa);
+    defer set.deinit();
+    try register(&set);
+    var pick: std.ArrayList(kit.gates.Kernel) = .empty;
+    defer pick.deinit(gpa);
+    for (set.kernels.items) |k| if (std.mem.indexOf(u8, k.spec.name, "ffn_in B ") != null or std.mem.indexOf(u8, k.spec.name, "ffn_in fused ") != null) try pick.append(gpa, k);
+    try std.testing.expectEqual(@as(usize, 2), pick.items.len);
+    var t: kit.gates.Tally = .{};
+    try kit.gates.runAll(gpa, pick.items, 0xc0de, &t);
+    try std.testing.expectEqual(@as(usize, 0), t.problems());
+    // The stress inputs where f32 log(1 + y) put the routed weights 6.5x past the exact-sum bound.
+    try std.testing.expectEqual(kit.gates.Verdict.pass, try kit.gates.sums(gpa, pick.items[0], 0xc0de));
 }
 
 // ── ubench ──

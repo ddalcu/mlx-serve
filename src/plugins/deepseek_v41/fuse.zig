@@ -322,7 +322,7 @@ fn kvLaunch(sc: *dsv41.Scope, e: *const dsv41.EngramLayer, rows: usize, codes: A
 }
 
 /// Whether `engramKv`'s kernel reads `e`'s table and projection.
-fn kvServes(m: *const dsv41.Dsv41Model, e: *const dsv41.EngramLayer, rows: usize) bool {
+pub fn kvServes(m: *const dsv41.Dsv41Model, e: *const dsv41.EngramLayer, rows: usize) bool {
     const t = &e.table;
     const l = &e.wkv;
     if (m.act != .bfloat16 or rows < 1 or rows > dkern.max_rows) return false;
@@ -827,7 +827,7 @@ test "dsv41 fuse weight path: a fixture model on the ssd path serves no fusion w
 /// A held table for the gather tests: `n` random rows (`rawRows`' codes and scales) in two page-aligned anonymous
 /// regions, as `Table.hold` lays them out, row 0 at `base` bytes into each (`base` under a page, as the file offset's
 /// remainder is).
-fn heldTable(t: *engram.Table, n: usize, base: usize, rng: std.Random) !void {
+pub fn heldTable(t: *engram.Table, n: usize, base: usize, rng: std.Random) !void {
     const page = std.heap.pageSize();
     const raw = try rawRows(testing.allocator, t, n, rng);
     defer raw.deinit(testing.allocator);
