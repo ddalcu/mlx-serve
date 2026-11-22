@@ -491,6 +491,8 @@ pub const Dsv41Model = struct {
     hash: ?engram.Hash = null,
     token_map: []u32 = &.{},
     engrams: []EngramLayer = &.{},
+    /// `MLX_SERVE_DSV41_ENGRAM_GPU_IDS`: the hash's constants on the GPU, where the switch serves (`engram_ids.settle`).
+    engram_ids: ?dkern.engram_ids.Ctx = null,
     /// The request's prompt, whose later chunks' Engram rows are read while an earlier one runs.
     prompt: []u32 = &.{},
     ahead: ?*engram.Prefetch = null,
@@ -592,6 +594,7 @@ pub const Dsv41Model = struct {
             e.table.close();
         }
         if (self.embed_tab) |*t| t.close();
+        if (self.engram_ids) |*c| c.deinit();
         self.gpa.free(self.engrams);
         self.gpa.free(self.token_map);
         for (self.owned.items) |x| _ = mlx.mlx_array_free(x);
@@ -2180,6 +2183,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     try evalWeights(m);
     try holdEngram(m);
     try fusion.settle(m);
+    try dkern.engram_ids.settle(m);
     // the gemv twin's launches for the indexer's linears compiled now, not in a request's first verify.
     if (mlx.streamIsGpu(s)) try warmTwin(m);
     // the gemv twin's launches for each Engram layer's plain wkv compiled now, not in a request's first
@@ -5647,7 +5651,20 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     sp.prefetch = prefetch;
 
     var from: usize = 0;
-    if (ids == .gpu and m.engrams.len > 0) {
+    // `MLX_SERVE_DSV41_ENGRAM_GPU_IDS`: the step's Engram ids hashed on the GPU; its token joins the history once the
+    // step is committed (below), so no host wait sits inside it.
+    var gpu_ids: A = none;
+    defer if (gpu_ids.ctx != null) {
+        _ = mlx.mlx_array_free(gpu_ids);
+    };
+    if (ids == .gpu and !images and (want == .last or want == .all)) if (m.engram_ids) |*ctx| {
+        var sc = Scope.init(gpa, m.s);
+        defer sc.deinit();
+        gpu_ids = sc.out(try dkern.engram_ids.rows(&sc, &m.hash.?, ctx, st.hist.items, ids.gpu, 0));
+        sp.eng_gpu = gpu_ids;
+        engaged(m, 6, "MLX_SERVE_DSV41_ENGRAM_GPU_IDS");
+    };
+    if (ids == .gpu and m.engrams.len > 0 and gpu_ids.ctx == null) {
         var first = m.n_layers;
         for (m.engrams) |e| first = @min(first, e.layer);
         try runLayers(m, gpa, st, &sp, held, 0, first);
@@ -5749,6 +5766,8 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_async_eval(vec));
+    // The step is on the GPU: its token (the previous step's output) joins the history now.
+    if (gpu_ids.ctx != null) try st.hist.append(st.gpa, m.compressedId(try hostToken(ids.gpu), false));
     return sc.out(logits);
 }
 
@@ -6388,6 +6407,8 @@ pub const Spans = struct {
     p0: usize,
     eng_ids: []const u32,
     ncols: usize,
+    /// `MLX_SERVE_DSV41_ENGRAM_GPU_IDS`: a decode row's Engram row ids hashed on the GPU, in place of `eng_ids`.
+    eng_gpu: A = none,
     prefetch: ?*engram.Prefetch = null,
     /// A replay tail's first position (`Shared.floor`).
     floor: ?usize = null,
@@ -6464,7 +6485,7 @@ pub fn spanInAt(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const S
         const nc = sp.ncols;
         // `fuse.engram`: a decode-width span's write gathered from the resident table (`fusion.engramHeld`), else
         // from the rows read out of it (`fusion.engramWrite`).
-        var fused: ?A = try fusion.engramHeld(sc, m, e, sp.eng_ids, m.engrams.len, ek, nc, lo, hi, x);
+        var fused: ?A = if (sp.eng_gpu.ctx != null) try dkern.engram_ids.write(sc, m, e, sp.eng_gpu, ek, nc, x) orelse return error.Dsv41EngramGpuIdsDeclined else try fusion.engramHeld(sc, m, e, sp.eng_ids, m.engrams.len, ek, nc, lo, hi, x);
         const held_rows = if (fused == null) try fusion.engramRowsHeld(sc, m, e, sp.eng_ids, m.engrams.len, ek, nc, lo, hi) else null;
         const rows = if (fused != null) none else if (held_rows) |r| r else if (sp.prefetch) |pf| blk: {
             // A batch reads grid k, state k's rows, as one span.
@@ -9904,6 +9925,55 @@ test "dsv41 prefill: chunk time against depth (DSV41_PREFILL)" {
         }
     }
     std.debug.print("[dsv41-prefill] chunk {d}: {d} tokens in {d:.2} s, peak transient {d} MB, bill {d} MB\n", .{ chunk, ctx, @as(f64, @floatFromInt(monoUs() - t_all)) / 1e6, transient >> 20, prefillBytes(&m.cfg, 0, ctx, chunk, 0) >> 20 });
+}
+
+test "dsv41 engram gpu ids: steps whose token stays on the GPU decode as with the host hash, the history the same, the switch engaged (DSV41_STEP pack)" {
+    const dir = std.mem.span(std.c.getenv("DSV41_STEP") orelse return error.SkipZigTest);
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var ov = env.override(.MLX_SERVE_DSV41_ENGRAM_GPU_IDS, "1");
+    defer ov.restore();
+    const cfg = try testConfig(io, dir);
+    var w = try loadPack(io, gpa, dir, false);
+    defer w.deinit();
+    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true });
+    defer m.deinit();
+    try testing.expect(m.engram_ids != null);
+    const prompt = try gpa.alloc(u32, 1024);
+    defer gpa.free(prompt);
+    for (prompt, 0..) |*t, k| t.* = @intCast((k * 7919 + 13) % @min(m.vocab, 100000));
+    // Two states on one model: [0] hashes on the host (the switch's constants set aside for its steps), [1] on the GPU.
+    var st: [2]State = .{ try initState(m, gpa), try initState(m, gpa) };
+    defer for (&st) |*x| x.deinit();
+    var l: [2]A = undefined;
+    for (&st, &l) |*x, *o| o.* = try extend(m, gpa, x, prompt, .last);
+    defer for (l) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    const ctx = m.engram_ids;
+    defer m.engram_ids = ctx;
+    var worst: f64 = 0;
+    for (0..16) |_| {
+        const tok = try argmaxHost(l[0]);
+        for (&st, &l, 0..) |*x, *o, k| {
+            const g = mlx.mlx_array_new_data(&tok, &[_]c_int{1}, 1, .uint32);
+            defer _ = mlx.mlx_array_free(g);
+            m.engram_ids = if (k == 1) ctx else null;
+            const n = try extendIds(m, gpa, x, .{ .gpu = g }, .last, null);
+            _ = mlx.mlx_array_free(o.*);
+            o.* = n;
+        }
+        const a = try hostF32(l[0]);
+        defer gpa.free(a);
+        const b = try hostF32(l[1]);
+        defer gpa.free(b);
+        worst = @max(worst, dkern.relRms(b, a));
+    }
+    std.debug.print("[engram-ids] 16 steps after a 1024-token prompt: logits rel rms vs the host hash, worst {e:.2}; history {s}\n", .{ worst, if (std.mem.eql(u32, st[0].hist.items, st[1].hist.items)) "equal" else "DIFFERS" });
+    try testing.expectEqualSlices(u32, st[0].hist.items, st[1].hist.items);
+    // The one-launch wkv sums in another order than the host rows' chain: a reordering's distance, not a token's.
+    try testing.expect(worst < 5e-2);
+    try testing.expect(m.dec.engaged & (1 << 6) != 0);
 }
 
 test "dsv41 decode step: serial one-token steps as the server pipelines them (DSV41_STEP)" {
