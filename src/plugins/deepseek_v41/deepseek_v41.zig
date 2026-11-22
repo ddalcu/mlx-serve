@@ -10085,7 +10085,8 @@ const PassArm = struct {
     arrays: []A,
     names: [][24]u8,
     n: usize,
-    tokens: [4]u32,
+    /// The greedy tokens after the prompt (`DSV41_PASS_EQ_GREEDY`, default 4).
+    tokens: []u32,
     ms: i64,
 
     fn deinit(a: *PassArm) void {
@@ -10093,6 +10094,7 @@ const PassArm = struct {
         for (a.arrays) |x| _ = mlx.mlx_array_free(x);
         testing.allocator.free(a.arrays);
         testing.allocator.free(a.names);
+        testing.allocator.free(a.tokens);
     }
 };
 
@@ -10104,7 +10106,7 @@ fn argmaxOf(row: []const f32) u32 {
     return @intCast(b);
 }
 
-fn passArm(m: *Dsv41Model, prompt: []const u32, cuts: []const [2]usize) !PassArm {
+fn passArm(m: *Dsv41Model, prompt: []const u32, cuts: []const [2]usize, greedy: usize) !PassArm {
     const gpa = testing.allocator;
     try reset(m, gpa);
     try armPrompt(m, prompt, null, true);
@@ -10150,9 +10152,10 @@ fn passArm(m: *Dsv41Model, prompt: []const u32, cuts: []const [2]usize) !PassArm
         };
     }
     try evalAll(xs.items);
-    var out: PassArm = .{ .logits = logits, .arrays = try xs.toOwnedSlice(gpa), .names = try names.toOwnedSlice(gpa), .n = st.n, .tokens = undefined, .ms = ms };
+    const out: PassArm = .{ .logits = logits, .arrays = try xs.toOwnedSlice(gpa), .names = try names.toOwnedSlice(gpa), .n = st.n, .tokens = try gpa.alloc(u32, greedy), .ms = ms };
     var tok = argmaxOf(logits);
-    for (&out.tokens) |*t| {
+    errdefer gpa.free(out.tokens);
+    for (out.tokens) |*t| {
         t.* = tok;
         const l = try extendResumable(m, gpa, &.{tok}, null);
         defer _ = mlx.mlx_array_free(l);
@@ -10161,6 +10164,15 @@ fn passArm(m: *Dsv41Model, prompt: []const u32, cuts: []const [2]usize) !PassArm
         tok = argmaxOf(row);
     }
     return out;
+}
+
+/// How many of `want`'s greedy tokens `got` repeats before the first that differs, in words.
+fn greedyAgree(buf: []u8, want: *const PassArm, got: *const PassArm) ![]const u8 {
+    const n = @min(want.tokens.len, got.tokens.len);
+    for (want.tokens[0..n], got.tokens[0..n], 0..) |a, b, k| {
+        if (a != b) return std.fmt.bufPrint(buf, "first divergent token at {d} of {d} ({d} vs {d})", .{ k, n, b, a });
+    }
+    return std.fmt.bufPrint(buf, "all {d} tokens agree", .{n});
 }
 
 /// How far `got` is from `want`: each state array's l2 distance over its norm (`state`, caller frees), and the next
@@ -10206,7 +10218,8 @@ fn passDist(want: *const PassArm, got: *const PassArm) !?PassDist {
 /// array within twice its spread plus 1%, the logits' 1 - cosine within twice the spread plus 1e-3. Printed either way,
 /// the worst array named, and (`profile`) every array's distance.
 fn passClose(label: []const u8, want: *const PassArm, got: *const PassArm, spread: *const PassDist, profile: bool) !bool {
-    std.debug.print("[dsv41-pass] {s}: {d} ms, position {d} (want {d}), next tokens {any} (want {any})\n", .{ label, got.ms, got.n, want.n, got.tokens, want.tokens });
+    var lb_g: [96]u8 = undefined;
+    std.debug.print("[dsv41-pass] {s}: {d} ms, position {d} (want {d}), greedy {s}\n", .{ label, got.ms, got.n, want.n, try greedyAgree(&lb_g, want, got) });
     const dist = (try passDist(want, got)) orelse {
         std.debug.print("[dsv41-pass] {s}: the position or the state's shapes differ\n", .{label});
         return false;
@@ -10235,10 +10248,12 @@ fn passClose(label: []const u8, want: *const PassArm, got: *const PassArm, sprea
 }
 
 test "dsv41 pass size: on a real pack the pass plan's prefill (near-equal passes, one MoE call each, no lead) is within the default plan's own spread across its cuts, one pass or two, and dropping the lead moves no word; a planted cut that repeats a boundary row fails (DSV41_PASS_EQ)" {
-    // DSV41_PASS_EQ = a pack dir; DSV41_PASS_EQ_CTX prompt tokens (default 17639); DSV41_PASS_EQ_TEXT a text file whose
-    // tokens, cycled, make the prompt (default: a fixed id walk).
+    // DSV41_PASS_EQ = a pack dir; DSV41_PASS_EQ_CTX prompt tokens (default 17639; 0 with DSV41_PASS_EQ_TEXT: the text's
+    // own tokens); DSV41_PASS_EQ_TEXT a text file whose tokens, cycled, make the prompt (default: a fixed id walk);
+    // DSV41_PASS_EQ_GREEDY the greedy tokens each arm runs after the prompt (default 4).
     const dir = std.mem.span(std.c.getenv("DSV41_PASS_EQ") orelse return error.SkipZigTest);
-    const ctx = if (std.c.getenv("DSV41_PASS_EQ_CTX")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 17639;
+    const ctx_env: ?usize = if (std.c.getenv("DSV41_PASS_EQ_CTX")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else null;
+    const greedy: usize = if (std.c.getenv("DSV41_PASS_EQ_GREEDY")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 4;
     const gpa = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const cfg = try testConfig(io, dir);
@@ -10258,18 +10273,22 @@ test "dsv41 pass size: on a real pack the pass plan's prefill (near-equal passes
     for (m.engrams) |*e| held = held and e.table.isHeld();
     std.debug.print("[dsv41-pass] switch: plan {} moe_rows {d} no_lead {} (tables held {})\n", .{ m.pass_plan, m.moe_rows, m.pass_no_lead, held });
     try testing.expect(m.pass_plan and m.moe_rows == PASS_MOE_ROWS and m.pass_no_lead == held);
-    const prompt = try gpa.alloc(u32, ctx);
-    defer gpa.free(prompt);
-    for (prompt, 0..) |*t, k| t.* = @intCast((k * 7919 + 13) % @min(m.vocab, 100000));
+    var text_ids: []const u32 = &.{};
+    defer gpa.free(text_ids);
     if (std.c.getenv("DSV41_PASS_EQ_TEXT")) |tp| {
         var tok = try @import("../../sdk/tokenizer/tokenizer.zig").loadTokenizer(io, gpa, dir);
         defer tok.deinit();
         const text = try std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(tp), gpa, .limited(64 << 20));
         defer gpa.free(text);
-        const ids = try tok.encode(gpa, text[0..@min(text.len, ctx * 8)]);
-        defer gpa.free(ids);
-        for (prompt, 0..) |*t, k| t.* = ids[k % ids.len];
+        const cap = ctx_env orelse 17639;
+        text_ids = try tok.encode(gpa, if (cap == 0) text else text[0..@min(text.len, cap * 8)]);
     }
+    const want_ctx = ctx_env orelse 17639;
+    const ctx = if (want_ctx == 0 and text_ids.len > 0) text_ids.len else if (want_ctx == 0) 17639 else want_ctx;
+    const prompt = try gpa.alloc(u32, ctx);
+    defer gpa.free(prompt);
+    for (prompt, 0..) |*t, k| t.* = if (text_ids.len > 0) text_ids[k % text_ids.len] else @intCast((k * 7919 + 13) % @min(m.vocab, 100000));
+    std.debug.print("[dsv41-pass] prompt: {d} tokens{s}, {d} greedy tokens an arm\n", .{ ctx, if (text_ids.len > 0) " of text" else " (id walk)", greedy });
     const rows = ctx - 1;
     var cuts: std.ArrayList([2]usize) = .empty;
     defer cuts.deinit(gpa);
@@ -10290,32 +10309,33 @@ test "dsv41 pass size: on a real pack the pass plan's prefill (near-equal passes
     m.moe_rows = MOE_ROWS;
     m.pass_no_lead = false;
     // A first prompt compiles the launches and fills the buffer cache: timed apart, not compared.
-    var warm = try passArm(m, prompt, try Plan.of(&cuts, rows, 8192));
+    var warm = try passArm(m, prompt, try Plan.of(&cuts, rows, 8192), greedy);
     std.debug.print("[dsv41-pass] warm-up (default plan): {d} ms\n", .{warm.ms});
     warm.deinit();
-    var want = try passArm(m, prompt, try Plan.of(&cuts, rows, 8192));
+    var want = try passArm(m, prompt, try Plan.of(&cuts, rows, 8192), greedy);
     defer want.deinit();
     const wide_cut = wide: {
         var w8: usize = 8192;
         while (w8 > 1707 and rows % w8 != 0 and rows % w8 < 1707) w8 -= SPAN;
         break :wide w8;
     };
-    var alt = try passArm(m, prompt, try Plan.of(&cuts, rows, wide_cut));
+    var alt = try passArm(m, prompt, try Plan.of(&cuts, rows, wide_cut), greedy);
     defer alt.deinit();
     const alt_cuts = cuts.items.len;
     const own = (try passDist(&want, &alt)) orelse return error.TestUnexpectedResult;
     defer gpa.free(own.state);
+    var lb_alt: [96]u8 = undefined;
     var rw: usize = 0;
     for (own.state, 0..) |e, k| {
         if (e > own.state[rw]) rw = k;
     }
-    std.debug.print("[dsv41-pass] default plan at 8192: {d} ms, {d} state arrays, next tokens {any}; at {d} ({d} chunks, none under 1,707 rows): {d} ms, next tokens {any}, worst {s} l2 {e:.3}, logits 1-cos {e:.3}\n", .{ want.ms, want.arrays.len, want.tokens, wide_cut, alt_cuts, alt.ms, alt.tokens, std.mem.sliceTo(&want.names[rw], 0), own.state[rw], own.logits });
+    std.debug.print("[dsv41-pass] default plan at 8192: {d} ms, {d} state arrays, greedy {any}; at {d} ({d} chunks, none under 1,707 rows): {d} ms, greedy {s}, worst {s} l2 {e:.3}, logits 1-cos {e:.3}\n", .{ want.ms, want.arrays.len, want.tokens, wide_cut, alt_cuts, alt.ms, try greedyAgree(&lb_alt, &want, &alt), std.mem.sliceTo(&want.names[rw], 0), own.state[rw], own.logits });
     m.moe_rows = PASS_MOE_ROWS;
     m.pass_no_lead = held;
     var ok = true;
     // One pass of every row, then two near-equal passes (`passRows` at half the rows).
     for ([_]usize{ rows, (rows + 1) / 2 }, 0..) |max, k| {
-        var got = try passArm(m, prompt, try Plan.of(&cuts, rows, passRows(rows, max)));
+        var got = try passArm(m, prompt, try Plan.of(&cuts, rows, passRows(rows, max)), greedy);
         defer got.deinit();
         var lb: [64]u8 = undefined;
         const label = try std.fmt.bufPrint(&lb, "{d} pass(es) of {d}", .{ cuts.items.len, passRows(rows, max) });
@@ -10327,13 +10347,13 @@ test "dsv41 pass size: on a real pack the pass plan's prefill (near-equal passes
     {
         m.moe_rows = MOE_ROWS;
         defer m.moe_rows = PASS_MOE_ROWS;
-        var d2 = try passArm(m, prompt, try Plan.of(&cuts, rows, wide_cut));
+        var d2 = try passArm(m, prompt, try Plan.of(&cuts, rows, wide_cut), greedy);
         defer d2.deinit();
         const same = try passSame(&alt, &d2);
         std.debug.print("[dsv41-pass] the {d} cut with no lead, the MoE at 8192: its bits with the lead: {}\n", .{ wide_cut, same });
         if (!same) ok = false;
         m.moe_rows = wide_cut;
-        var d1 = try passArm(m, prompt, try Plan.of(&cuts, rows, rows));
+        var d1 = try passArm(m, prompt, try Plan.of(&cuts, rows, rows), greedy);
         defer d1.deinit();
         std.debug.print("[dsv41-pass] one pass, the MoE in {d}-row calls: the default plan's bits at {d}: {}\n", .{ wide_cut, wide_cut, try passSame(&alt, &d1) });
     }
@@ -10341,7 +10361,7 @@ test "dsv41 pass size: on a real pack the pass plan's prefill (near-equal passes
     // ending one row early, so the position reached is the same.
     const c = passRows(rows, (rows + 1) / 2);
     const planted = [_][2]usize{ .{ 0, c }, .{ c - 1, rows - 1 } };
-    var bad = try passArm(m, prompt, &planted);
+    var bad = try passArm(m, prompt, &planted, greedy);
     defer bad.deinit();
     try testing.expect(!try passSame(&alt, &bad));
     try testing.expect(!try passClose("planted: a boundary row repeated", &want, &bad, &own, false));
