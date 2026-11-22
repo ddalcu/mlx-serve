@@ -47,11 +47,11 @@ pub const Kernels = struct {
     facc: A,
 };
 
-/// The fused launch's scratch words: the logits, sums and mix partials of up to 6 rows, then the counters.
-const facc_words = 16384;
+/// The fused launch's scratch words: each slice's logits and sums of up to 6 rows, the mix partials, then the counters.
+const facc_words = 131072;
 
 fn faccNeed(p: Dims) usize {
-    return 6 * p.e + 8 + 6 * slices(p) * (mixes + 1) + slices(p) + 1;
+    return slices(p) * (6 * p.e + 8) + 6 * slices(p) * (mixes + 1) + slices(p) + 1;
 }
 
 /// The launches' kernels, built once.
@@ -63,11 +63,14 @@ pub fn build() !Kernels {
     const f = try dsv41.buildKernel("dsv41_dec_ffn_in_fused", &F_INS, &F_OUTS, F_SOURCE, F_HEADER);
     errdefer _ = mlx.mlx_fast_metal_kernel_free(f);
     const n = if (device.naxAvailable()) try dsv41.buildKernel("dsv41_dec_ffn_in_nax", &A_INS, &A_OUTS, NAX_SOURCE, NAX_HEADER) else null;
-    return .{ .a = a, .b = b, .fused = f, .nax = n, .facc = newScratch() };
+    return .{ .a = a, .b = b, .fused = f, .nax = n, .facc = try newScratch() };
 }
 
-fn newScratch() A {
-    return mlx.mlx_array_new_data(&std.mem.zeroes([facc_words]u32), &[_]c_int{facc_words}, 1, .uint32);
+fn newScratch() !A {
+    const z = try std.heap.page_allocator.alloc(u32, facc_words);
+    defer std.heap.page_allocator.free(z);
+    @memset(z, 0);
+    return mlx.mlx_array_new_data(z.ptr, &[_]c_int{facc_words}, 1, .uint32);
 }
 
 pub fn free(k: Kernels) void {
