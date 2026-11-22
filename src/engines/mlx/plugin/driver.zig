@@ -1341,11 +1341,13 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     var ablated: Ablated = .{};
     defer ablated.deinit();
     const ablation = try ablated.init(&.{ctx});
+    const want_hidden = !head or ctx.capture_hidden != null or ctx.capture_hidden_all != null;
+    const drop_logits = head and ctx.no_logits and module and !capture and !ctx.spec_verify and !want_hidden and ids.len == 0;
     const f: abi.Forward = .{
         .mode = mode,
         .row_exact = xfm.config.dflash_bound,
-        .logits = if (!head) .none else if (last_row and !capture and !ctx.spec_verify) .last_row else .all_rows,
-        .want_hidden = !head or ctx.capture_hidden != null or ctx.capture_hidden_all != null,
+        .logits = if (!head or drop_logits) .none else if (last_row and !capture and !ctx.spec_verify) .last_row else .all_rows,
+        .want_hidden = want_hidden,
         .rows = rows,
         .tokens = .{},
         .ids = .{ .ctx = token_ids.ctx },
@@ -1413,6 +1415,10 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         var h = mlx.mlx_array_new();
         _ = mlx.mlx_array_set(&h, hidden);
         return h;
+    }
+    if (drop_logits) {
+        if (out.logits.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = out.logits.ctx });
+        return mlx.mlx_array_new();
     }
     const logits: Array = .{ .ctx = out.logits.ctx };
     defer _ = mlx.mlx_array_free(logits);

@@ -468,11 +468,14 @@ pub fn initWithOptions(
             errdefer if (dflash_active) {
                 for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
             };
+            errdefer ctx.no_logits = false;
+            ctx.no_logits = options.prompt_logprobs == null and !mtp_capture and !dflash_active and end < loop_end;
             const chunk_logits = if (mtp_capture) blk: {
                 var last_unused = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(last_unused);
                 break :blk try xfm.forwardWithCaptureAll(&ctx, chunk_input, &last_unused, &chunk_hidden_all);
             } else try xfm.forwardWith(&ctx, chunk_input);
+            ctx.no_logits = false;
             if (options.prompt_logprobs) |out| promptLogprobs(allocator, chunk_logits, prompt_ids[pos + 1 .. end + 1], options.logprobs_n, xfm.s, out) catch |err| {
                 _ = mlx.mlx_array_free(chunk_logits);
                 return err;
@@ -796,6 +799,7 @@ pub fn initWithOptions(
     ctx.ssm_cp_positions = &.{};
     ctx.cp_sink = null;
     ctx.last_row_logits = false;
+    ctx.no_logits = false;
     // The prompt is forwarded: from here on the generator's forwards are decode steps, and a plugin's prompt tap must
     // not dump one per token.
     ctx.prefill = false;

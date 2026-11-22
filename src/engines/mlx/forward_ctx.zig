@@ -104,6 +104,9 @@ pub const ForwardCtx = struct {
     /// A prompt forward read at most at its last row's logits (no prompt logprobs): a model declaring
     /// `Caps.prompt_last_row` is asked for that row alone.
     last_row_logits: bool = false,
+    /// An interior prefill chunk whose logits and hidden rows are discarded: `owns_decode_state` plugins receive
+    /// `abi.Logits.none` with `want_hidden = false`.
+    no_logits: bool = false,
     /// The engine's prompt forwarding: a prompt chunk, or the split prefill's final-token span, which is one row and so
     /// reaches the plugin as `Mode.decode`. False from the first decode step on. Reaches plugins as `Forward.prefill`,
     /// which the calibration tap gates on: by mode alone, the last prompt token is dropped.
