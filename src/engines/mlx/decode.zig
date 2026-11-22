@@ -38,6 +38,18 @@ const loopGuardTick = @import("loop_stop.zig").loopGuardTick;
 
 var kv_skew_split_logged: bool = false; // one-shot log guard
 
+/// The serial step's per-tick guards for a row joining a batched group. True = the row sits this tick out:
+/// its guard spent the tick, or failed this row alone; a latched MLX error still ends the tick.
+fn guardSpentTick(sch: *Scheduler, s: *Slot) !bool {
+    const gen = if (s.legacy_gen) |*g| g else return false;
+    return loopGuardTick(sch, s, gen) catch |e| {
+        if (mlx.errorPending()) return e;
+        log.err("[loop-stop] per-tick guards failed ({s}); failing this request only\n", .{@errorName(e)});
+        s.markError(@errorName(e));
+        return true;
+    };
+}
+
 pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     if (active.len == 0) return;
 
@@ -102,9 +114,7 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         const why = @import("scheduler.zig").batchVerdict(sch, s);
         if (why == .ok and batchable_n < batchable_buf.len) {
             // A row runs the serial step's per-tick guards first: the loop cut, the reasoning budget, a forced tool call.
-            if (s.legacy_gen) |*g| {
-                if (try loopGuardTick(sch, s, g)) continue;
-            }
+            if (try guardSpentTick(sch, s)) continue;
             batchable_buf[batchable_n] = s;
             batchable_n += 1;
         } else if (why == .spec_active and slotMtpGroupable(s) and mtp_n < mtp_buf.len) {
@@ -135,6 +145,7 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
             while (j < mtp_n and mtp_buf[j].model == mtp_buf[i].model) j += 1;
             if (j - i >= mtpCrowdThresholdFor(mtp_buf[i]) and batchable_n + (j - i) <= batchable_buf.len) {
                 for (mtp_buf[i..j]) |slot| {
+                    if (try guardSpentTick(sch, slot)) continue;
                     const gen = &slot.legacy_gen.?;
                     gen.mtpDetachHead(slot.allocator, true) catch |e| {
                         slot.markError(@errorName(e));
