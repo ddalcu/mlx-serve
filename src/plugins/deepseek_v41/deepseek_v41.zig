@@ -81,6 +81,8 @@ const acore = @import("prompt/attn_core.zig");
 const fa = @import("prompt/flash_attn.zig");
 /// the moe_pair.zig: a prompt call's fp4 gate and up with `moe_act` in one paired NAX launch.
 const mpair = @import("prompt/moe_pair.zig");
+/// hc_v2.zig: a resident wide layer's hc in three passes over the stream (`MLX_SERVE_DSV41_PF_HC_V2`).
+const hv2 = @import("prompt/hc_v2.zig");
 /// launch fusions, each behind its own default-off switch (`Dsv41Model.fuse`).
 const fusion = @import("fuse.zig");
 const Shard = @import("../../sdk/weights/shard.zig").Shard;
@@ -5670,6 +5672,7 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
     const wide = n_spans > 1 and sp.span > region_rows and m.trace == null;
     // The kept projection outputs: a kept set no wide layer of this pass took is let go at its end.
     defer tkeep.drop();
+    defer hv2.drop();
     for (lo..hi) |li| {
         if (wide) try wideLayer(m, gpa, st, sp, li, li + 1 < hi, li > lo) else for (0..n_spans) |k| {
             // A span's intermediates are dropped as soon as it is built, so the
@@ -6021,7 +6024,10 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         hp = r.hp;
     }
     if (ra_own) if (m.streamed) |src| if (src.read_ahead_fn) |ra| try readAhead(&sc, m, ly, li, hp, sp.img, ra, src.ctx);
-    if (!fused) pa = (try attnHcWide(&sc, m, x, pres, ly, null)).pa;
+    // hc_v2.zig: the layer before's tail made this side for this stream, else one pass over it.
+    const v2 = !fused and hv2.serves(m);
+    if (v2) pa = if (try hv2.take(&sc, li, x)) |r| r.n else (try hv2.attn(&sc, m, x, pres, &ly.hc_attn, ly.attn_norm)).n;
+    if (!fused and !v2) pa = (try attnHcWide(&sc, m, x, pres, ly, null)).pa;
     const pos = try sc.i(ci(sp.p0));
     // The heads unroped and their roped tail apart, where the gather reads them (a trace keeps the whole roped heads it
     // records).
@@ -6131,7 +6137,10 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     // scratch_x1.zig: the streams after the attention into the prompt's x1 region (a streamed bank runs one MoE
     // group, so that group's output is the region's last reader's).
     const x1_scratch = m.streamed != null and sp.L >= scratch_rows and mlx.streamIsGpu(m.s);
-    const pf = if (x1_scratch) try hcExpandPreNormScratch(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm) else try hcExpandPreNorm(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
+    const pf: Staged = if (v2) blk: {
+        const r = try hv2.ffn(&sc, m, x, y, &pa.sp, &ly.hc_ffn, ly.ffn_norm);
+        break :blk .{ .x1 = none, .sp = r.n.sp, .h = r.n.h, .z = r.z };
+    } else if (x1_scratch) try hcExpandPreNormScratch(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm) else try hcExpandPreNorm(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
     // A streamed bank reads each layer's experts once per call: one MoE over all of its rows.
     const group = if (m.streamed != null) n_spans else @max(1, m.moe_rows / sp.span);
     var k0: usize = 0;
@@ -6144,7 +6153,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         const hg = try gsc.slice(pf.h, 0, lo, hi);
         const img = try sp.imgSlice(&gsc, lo, hi);
         const sf: Split = .{ .pre = try gsc.slice(pf.sp.pre, 0, lo, hi), .post = try gsc.slice(pf.sp.post, 0, lo, hi), .comb = try gsc.slice(pf.sp.comb, 0, lo, hi) };
-        const x1g = try gsc.slice(pf.x1, 0, lo, hi);
+        const x1g = if (v2) none else try gsc.slice(pf.x1, 0, lo, hi);
         // Next-layer staging: the next wide layer's routes predicted from this layer's FFN rows, staged during this
         // layer's call (a prediction only: the reads, never the routes). The early commits: the prediction's ids kept
         // for the call's early commits.
@@ -6159,7 +6168,10 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         // the region. The call's last wide layer keeps the fresh buffer: its
         // streams are read after the call's last eval (the CED replay, the head, the next chunk).
         const into = pf.in_region and k0 == 0 and k1 == n_spans and next_wide and (m.n_mtp == 0 or m.dsparkTarget(li + 1) == null);
-        const xg = if (try moeExpand(&gsc, m, li, hg, img, if (into) pf.x1 else x1g, &sf, .{ .next = next_ids, .ls = &st.layers[li] }, into)) |v| v else try hcExpand(&gsc, x1g, try moe(&gsc, m, li, hg, img), &sf);
+        // hc_v2.zig: x1 rebuilt from x and y, the new stream, and (one group, the next layer wide with this stream as
+        // its own) the next layer's attention side.
+        const v2t: ?hv2.Tail = if (v2) try v2Tail(&gsc, m, sp, li, x, y, &pa.sp, lo, hi, try moe(&gsc, m, li, hg, img), &sf, next_wide and k0 == 0 and k1 == n_spans) else null;
+        const xg = if (v2t) |t| t.x2 else if (try moeExpand(&gsc, m, li, hg, img, if (into) pf.x1 else x1g, &sf, .{ .next = next_ids, .ls = &st.layers[li] }, into)) |v| v else try hcExpand(&gsc, x1g, try moe(&gsc, m, li, hg, img), &sf);
         // scratch_x1.zig: the region's next writer waits for this, its last reader.
         if (x1_scratch and k1 == n_spans) try sx1.ps().x1.released(xg);
         for (k0..k1) |k| {
@@ -6172,6 +6184,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
             const one = k0 == 0 and k1 == n_spans;
             hold(&sp.whole[0], if (one) xg else none);
             hold(&sp.whole[1], if (one) pf.sp.pre else none);
+            if (v2t) |t| if (t.next) |r| hv2.put(li + 1, sp.whole[0], r);
         }
         // The new streams (the call's tail kernel and its inputs' small ops) committed at the last group's end, before this group's and the layer's scopes are torn down: the GPU runs them during the
         // teardown and the layer's last eval (runLayers) finds them under way. The holds above have just freed the
@@ -6182,6 +6195,19 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     // the teardown for the next wide layer of the pass: `wq_b`'s heads first, the attention norm's rows, the roped
     // tail.
     tkeep.layerEnd(&.{ pj.q, pa.h, pj.qt }, next_wide);
+}
+/// hc_v2.zig: rows `lo..hi`'s new stream from the layer's stream `x`, attention output `y`, attention split `sa`, MoE
+/// output `y2` and FFN split `sf` (its rows already); with `fold`, the next layer's attention side of it too, unless an
+/// Engram write changes that layer's stream first or the spans hold no whole stream.
+fn v2Tail(sc: *Scope, m: *const Dsv41Model, sp: *const Spans, li: usize, x: A, y: A, sa: *const Split, lo: usize, hi: usize, y2: A, sf: *const Split, fold: bool) !hv2.Tail {
+    const rs: Split = .{ .pre = none, .post = try sc.slice(sa.post, 0, lo, hi), .comb = try sc.slice(sa.comb, 0, lo, hi) };
+    const xr = try sc.slice(x, 0, lo, hi);
+    const yr = try sc.slice(y, 0, lo, hi);
+    const engram_next = for (m.engrams) |e| {
+        if (e.layer == li + 1) break true;
+    } else false;
+    const next: ?hv2.Next = if (fold and sp.whole.len == 2 and li + 1 < m.n_layers and !engram_next) .{ .hc = &m.layers[li + 1].hc_attn, .norm_w = m.layers[li + 1].attn_norm } else null;
+    return hv2.tail(sc, m, xr, yr, &rs, y2, sf, next);
 }
 /// A full run's `wo_a` over its region `x` (`[rows, og, in]`, published): the plugin's grouped linear reads that
 /// layout as it is (no join, no transpose), `[rows, og * o_lora]` in `m.act`, a new handle the caller frees.
