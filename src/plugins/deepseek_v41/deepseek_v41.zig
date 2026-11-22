@@ -2244,7 +2244,7 @@ fn holdEngram(m: *Dsv41Model) !void {
 /// the passes, `passRows`); with every Engram table held, no drive read is left for a lead to hide, so a chunk runs as
 /// one pass (`extendCold`). One line names the choice.
 fn passSettle(m: *Dsv41Model) void {
-    if (!env.on(.MLX_SERVE_DSV41_PF_PASS_SIZE)) return;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_PASS_SIZE)) return;
     const why: ?[]const u8 = if (m.streamed_experts) "a streamed bank" else if (m.pair != null) "a layer pair" else if (m.tp != null) "a tensor split" else null;
     if (why) |w| return log.info("deepseek_v41: MLX_SERVE_DSV41_PF_PASS_SIZE off: {s}\n", .{w});
     m.pass_plan = true;
@@ -2288,10 +2288,10 @@ pub fn passPlanned(config: anytype) bool {
     const T = @TypeOf(config.*);
     if (comptime !@hasField(T, "dsv41_pass_rows")) {
         if (comptime !@hasField(T, "dsv41_streamed")) return false;
-        return env.on(.MLX_SERVE_DSV41_PF_PASS_SIZE) and !config.dsv41_streamed;
+        return env.onUnlessZero(.MLX_SERVE_DSV41_PF_PASS_SIZE) and !config.dsv41_streamed;
     }
     if (config.dsv41_pass_rows > 0) return true;
-    if (!env.on(.MLX_SERVE_DSV41_PF_PASS_SIZE) or !config.isDsv41()) return false;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_PASS_SIZE) or !config.isDsv41()) return false;
     if (config.dist_dsv41 != null or config.dist_span != null or config.dist_shard != null) return false;
     return if (config.plugin) |b| !b.parsed.caps.streamed_weights else true;
 }

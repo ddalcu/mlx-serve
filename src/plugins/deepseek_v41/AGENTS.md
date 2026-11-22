@@ -170,7 +170,7 @@ serves either from the pack, with no flag.
 - Prefill is chunked at 8192 at most (`prefillChunkMax`, an explicit `--prefill-chunk` included), one MoE call per
   chunk: each chunk still reads every expert bank once (the CED replay runs the decoder layers), so a narrower chunk
   pays that read twice as often.
-  `MLX_SERVE_DSV41_PF_PASS_SIZE=1` (default off, resident loads with no pair or tensor split) replaces that cap: the load
+  `MLX_SERVE_DSV41_PF_PASS_SIZE` (on by default, `=0` the 8192-row cut; resident loads with no pair or tensor split) replaces that cap: the load
   pins the widest whole-span pass whose prompt bill fits the ladder's memory share, up to the context
   (`dsv41PassRows`; an explicit `--prefill-chunk` is the pass), every prompt is cut into the fewest near-equal passes
   no wider (`passRows`), each pass runs its MoE in one call, and with every Engram table held a chunk sends no lead.

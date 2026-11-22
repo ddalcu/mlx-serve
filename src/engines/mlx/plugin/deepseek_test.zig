@@ -151,7 +151,7 @@ test "dsv41 prefill chunk: under the pass plan the chunk loop cuts a prompt into
     var buf: [64]usize = undefined;
     // Off: 8192-row chunks and the rest.
     {
-        const was = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, null);
+        const was = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, "0");
         defer was.restore();
         cfg.pinned_prefill_chunk = 8192;
         try t.expectEqualSlices(usize, &.{ 8192, 8192, 1254 }, Loop.cuts(&cfg, 17_638, &buf));
@@ -177,7 +177,7 @@ test "dsv41 prefill chunk: under the pass plan the chunk loop cuts a prompt into
         try t.expectEqual(@as(?usize, null), copy.passPrefillChunk(0, 17_638));
     }
     {
-        const was = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, null);
+        const was = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, "0");
         defer was.restore();
         try t.expectEqual(@as(?usize, null), copy.passPrefillChunk(32768, 17_638));
     }
