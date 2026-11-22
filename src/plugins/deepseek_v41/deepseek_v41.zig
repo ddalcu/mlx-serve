@@ -89,6 +89,8 @@ const mpair = @import("prompt/moe_pair.zig");
 const hv2 = @import("prompt/hc_v2.zig");
 /// moe_tail.zig: a resident wide layer's MoE combine and hc expand in one launch (`MLX_SERVE_DSV41_MOE_TAIL`).
 const mtail = @import("prompt/moe_tail.zig");
+/// pf_route.zig: a prompt call's routed pairs sorted by a counting sort (`MLX_SERVE_DSV41_PF_MOE_EPI`).
+const pfroute = @import("prompt/pf_route.zig");
 /// idx_nax.zig: a wide span's indexer scores on the matrix units (`MLX_SERVE_DSV41_PF_IDX_NAX`).
 const idx_nax = @import("prompt/idx_nax.zig");
 /// launch fusions, each behind its own default-off switch (`Dsv41Model.fuse`).
@@ -4662,14 +4664,25 @@ pub fn moePrefillParts(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A,
     const e = &ly.experts;
     const dt = mlx.mlx_array_dtype(x);
     const flat = try sc.reshape(try sc.astype(idx, .uint32), &.{ci(n)});
-    var oo = mlx.mlx_array_new();
-    const order = try sc.res(mlx.mlx_argsort_axis(&oo, flat, 0, sc.s), &oo);
-    var oi = mlx.mlx_array_new();
-    const inv = try sc.res(mlx.mlx_argsort_axis(&oi, order, 0, sc.s), &oi);
-    const rows = try sc.op2(mlx.mlx_floor_divide, order, try sc.u(@intCast(k)));
-    const sidx = try sc.take(flat, order, 0);
+    // The pack's expert count is the down bank's: every layout stacks its experts on axis 0 (a tensor rank holds half of
+    // every expert), and a caller that builds the banks alone leaves the router's `gate_w` unset.
+    const pack_on = env.onUnlessZero(.MLX_SERVE_DSV41_PF_MOE_EPI) and e.down.w.ctx != null;
+    const sp = (if (pack_on) try pfroute.pack(sc, flat, try sc.reshape(wts, &.{ci(n)}), k, dim(e.down.w, 0)) else null) orelse blk: {
+        var oo = mlx.mlx_array_new();
+        const order = try sc.res(mlx.mlx_argsort_axis(&oo, flat, 0, sc.s), &oo);
+        var oi = mlx.mlx_array_new();
+        break :blk pfroute.Sorted{
+            .inv = try sc.res(mlx.mlx_argsort_axis(&oi, order, 0, sc.s), &oi),
+            .rows = try sc.op2(mlx.mlx_floor_divide, order, try sc.u(@intCast(k))),
+            .sidx = try sc.take(flat, order, 0),
+            .w = try sc.take(try sc.reshape(wts, &.{ci(n)}), order, 0),
+        };
+    };
+    const inv = sp.inv;
+    const rows = sp.rows;
+    const sidx = sp.sidx;
     const x3 = try sc.reshape(x, &.{ ci(L), 1, ci(d) });
-    const w_sorted = try sc.take(try sc.reshape(wts, &.{ci(n)}), order, 0);
+    const w_sorted = sp.w;
     const act = if (try mpair.act(sc, m, e, x3, rows, sidx, w_sorted)) |a| a else if (try gateUpPaired(sc, m, e, x3, rows, sidx)) |a| blk: {
         // The routing weight on the activation, as the split path's kernel applies it.
         const inter = dim(a, -1);
