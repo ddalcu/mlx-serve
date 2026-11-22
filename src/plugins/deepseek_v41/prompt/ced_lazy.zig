@@ -1,4 +1,4 @@
-//! MLX_SERVE_DSV41_CED_LAZY (off by default, exact): a prompt chunk's CED replay (`cedTail`: the decoder layers over
+//! MLX_SERVE_DSV41_CED_LAZY (on by default, =0 off; exact): a prompt chunk's CED replay (`cedTail`: the decoder layers over
 //! its last window, run for its last row's logits and the decoder's window rows) is left unevaluated when another
 //! replaying chunk of the armed prompt follows, and dropped when that chunk comes (`State.ced_lazy`). That chunk's
 //! replay writes every window row a later read reaches (its band stops at its own first row), and the engine reads no
@@ -14,7 +14,7 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 
 pub fn on() bool {
-    return env.on(.MLX_SERVE_DSV41_CED_LAZY);
+    return env.onUnlessZero(.MLX_SERVE_DSV41_CED_LAZY);
 }
 
 /// Whether a replaying chunk `ids` at `p0` leaves its replay to a reader: it is the armed `prompt`'s, at least a
