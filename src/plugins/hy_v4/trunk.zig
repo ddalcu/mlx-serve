@@ -18,6 +18,7 @@ const moe = @import("blocks/moe.zig");
 const indexer_mod = @import("blocks/indexer.zig");
 const engram_mod = @import("blocks/engram.zig");
 const numpy_rng = @import("blocks/numpy_rng.zig");
+const vision_mod = @import("vision.zig");
 const config = @import("config.zig");
 const weights_load = @import("../../sdk/weights/load.zig");
 const weights = @import("weights.zig");
@@ -48,6 +49,8 @@ pub const Model = struct {
     /// `model.norm.weight`, the shared norm after the head collapse.
     norm: Array,
     head: ihc.HeadParams,
+    /// The SigLIP-style tower (null = no vision weights in the map / --no-vision).
+    vision: ?*vision_mod.Vision = null,
     /// The table's declared caps (what the forward serves).
     caps: abi.Caps,
     shared: block.Shared,
@@ -55,6 +58,7 @@ pub const Model = struct {
     owned: std.ArrayList(Array),
 
     pub fn deinit(m: *Model) void {
+        if (m.vision) |v| v.deinit();
         for (m.layers) |*l| if (l.engram) |en| {
             gpa.free(en.lookup_host);
             gpa.destroy(en);
@@ -90,7 +94,34 @@ pub const Model = struct {
         };
 
         const x = try m.embedRows(&g, ids); // [slots, rows, hidden]
-        var streams = try g.broadcast(try g.expandDims(x, -2), &.{ slots, rows, hc, hidden });
+        // Splice the vision tower's rows at the image placeholders, from `media_offset` on (a chunked
+        // prefill resumes there): every placeholder row takes the next tower row; the rest keep their
+        // token embedding.
+        var spliced = x;
+        if (f.media.ctx != null and slots == 1) {
+            const media: Array = .{ .ctx = f.media.ctx };
+            const msh = ops.shape(media);
+            if (msh.len == 3) {
+                try ops.eval(ids);
+                const tok = mlx.mlx_array_data_int32(ids) orelse return error.NoData;
+                const total: usize = @as(usize, @intCast(rows)) * @as(usize, @intCast(slots));
+                const idx = try gpa.alloc(i32, total);
+                defer gpa.free(idx);
+                var k: usize = f.media_offset;
+                for (0..total) |i| {
+                    if (tok[i] == @as(i32, @intCast(c.image_token_id))) {
+                        idx[i] = @intCast(k);
+                        k += 1;
+                    } else idx[i] = 0;
+                }
+                const idx_arr = try g.fromSlice(i32, idx, &.{ slots, rows });
+                const flat_media = try g.reshape(media, &.{ msh[1], msh[2] });
+                const picked = try g.take(flat_media, idx_arr, 0); // [slots, rows, hidden]
+                const mask = try g.expandDims(try g.equal(ids, try g.scalarLike(ids, @as(f32, @floatFromInt(c.image_token_id)))), -1);
+                spliced = try g.where(mask, picked, x);
+            }
+        }
+        var streams = try g.broadcast(try g.expandDims(spliced, -2), &.{ slots, rows, hc, hidden });
 
         var ctx: block.Ctx = .{
             .g = &g,
@@ -98,6 +129,7 @@ pub const Model = struct {
             .rows = rows,
             .slots = slots,
             .positions = if (f.positions.len > 0) f.positions.slice() else &.{0},
+            .mrope_positions = if (f.mrope_positions.ctx != null) .{ .ctx = f.mrope_positions.ctx } else null,
             .caches = f.caches.slice(),
             .cache_ops = f.cache_ops,
             .shared = &m.shared,
@@ -247,6 +279,10 @@ pub fn build(c: *const C, w: *const weights_load.Weights, tables: []const weight
         .shared = block.Shared.init(c.rms_norm_eps, c.rms_norm_eps),
         .owned = owned.*,
     };
+    errdefer m.deinit();
+    if (c.has_vision and w.get("vit.embeddings.patch_embedding.weight") != null) {
+        m.vision = try vision_mod.load(c, w);
+    }
     return m;
 }
 
@@ -276,6 +312,7 @@ fn buildAttn(c: *const C, w: *const weights_load.Weights, owned: *std.ArrayList(
         .v_dim = c.v_head_dim,
         .rank = c.kv_lora_rank,
         .theta = config.layerTheta(c, li),
+        .mrope_sections = c.mrope_section,
         .window = if (li < c.dsa_layers.len and c.dsa_layers[li]) 0 else c.sliding_window,
         .indexer = if (li < c.dsa_layers.len and c.dsa_layers[li]) try buildIndexer(c, w, owned, li) else null,
         .rms_eps = c.rms_norm_eps,

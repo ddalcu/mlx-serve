@@ -3,8 +3,9 @@
 `model_type: hy_v4_flash`. The trunk is a DeepSeek-family MLA + compressed-DSA MoE with iHC streams, an Engram
 n-gram PLE on 4 layers, and a DFly2 draft stack in `model.dfly_layers.*`. Plans done: 01 claim/parse/bill/cache
 layout, 02 loader + Engram stream tables, 03 text forward (iHC, MLA with sinks, SWA, latent MoE, dense L0),
-04 compressed indexer (recall beyond the budget), 05 Engram (hash + streamed gather + injection).
-Pending: 06 DFly2, 07 vision, 08 proofs/docs.
+04 compressed indexer (recall beyond the budget), 05 Engram (hash + streamed gather + injection),
+07 vision (SigLIP tower + projector + image/newline rows + Hy4 M-RoPE).
+Pending: 06 DFly2, 08 proofs/docs.
 
 ## Rules
 
@@ -67,6 +68,20 @@ Pending: 06 DFly2, 07 vision, 08 proofs/docs.
   its KV aliases target layers 25/29/33/37/41; fusion happens on slot 0 only. HF transformers does NOT implement
   DFly2 — the semantics live in SGLang #51159 / vLLM #68296 (see `~/claude-tmp/hy4-port/SEMANTICS.md`).
 - `confidence_head` ships in the pack; Tencent's engines skip it — load it, do not wire it.
+- **The tower has NO RoPE**: the learned 128x128 position grid (row 0 is an unused cls row) is bilinearly
+  resampled to the request's patch grid with Torch's `(size+0.1)/edge` scale_factor; attention is full and
+  bidirectional per image. `vit.perceive.norm` is the pre-merge RMSNorm, `proj.0` the 2x2 conv and `proj.2`
+  the 1x1 conv (the reference names them `before_rms`/`proj_conv`/`proj_out`).
+- **Preprocessing is `HYV4VLImageProcessor`, not Pillow**: smart resize on the patch*merge grid (32) within
+  [4096, min(2048², the engine's 1536² budget)], Torch's antialiased bicubic (`resizeRgbBicubicFloatChw`),
+  rescale 1/255 then `(x-0.5)/0.5`. Patchify is row-major patches with channel-major features (C, 16, 16).
+- **The merger appends one `image_newline` row per merged row**, so an image run is `(gh/2)*(gw/2+1)` image
+  tokens (the processor's `_num_frame_tokens`); the forward splices the tower's rows at those ids in order
+  from `Forward.media_offset` (a chunked prefill resumes there).
+- **Hy4 M-RoPE has a newline column**: each frame starts a block of `max(gh/2, gw/2+1)` positions and text
+  resumes at `max+1`; every layer ropes with its own theta (DSA 1e7, SWA 1e4). The raw 3-D table rides
+  `Forward.mrope_positions` — the engine's one-theta `Forward.mrope` angles are not used.
+- Video ids exist in the pack but video is refused by name (`prepare` refuses a non-image input).
 
 ## Packs & fixtures
 
@@ -85,4 +100,5 @@ Pending: 06 DFly2, 07 vision, 08 proofs/docs.
 ## Files
 
 `config.zig` claim/parse, `weights.zig` load + validate + Engram tables, `trunk.zig` per-layer build + forward,
-`blocks/{ihc,mla,proj,moe,router}.zig` the math, `fixture.zig` the tiny pack, `loader_test.zig` census + load.
+`vision.zig` tower + processor + media hooks, `blocks/{ihc,mla,proj,moe,router,indexer,engram,numpy_rng}.zig` the
+math, `fixture.zig` the tiny pack, `loader_test.zig` census + load, `vision_test.zig` tower parity dump.

@@ -22,6 +22,7 @@ const Array = ops.Array;
 const Graph = ops.Graph;
 const Ctx = block.Ctx;
 const Proj = proj.Proj;
+const gpa = std.heap.c_allocator;
 
 pub const Attn = struct {
     q_a: Proj,
@@ -45,6 +46,8 @@ pub const Attn = struct {
     rank: u32,
     /// RoPE base: sparse layers rotate long (1e7), sliding ones short (1e4).
     theta: f32,
+    /// Interleaved M-RoPE frequency split [t,h,w] for image prompts.
+    mrope_sections: [3]u32 = .{ 0, 0, 0 },
     /// Keys a sliding layer attends; 0 = the full causal history.
     window: u32,
     /// The compressed indexer (DSA layers); null = attend the full causal history.
@@ -78,8 +81,14 @@ pub const Attn = struct {
         const latent = try t.rmsNorm(lat_raw, self.kv_a_norm, self.rms_eps);
 
         const off = c.offset();
-        const q_rot_r = try rope(&t, q_rot, rope_dim, self.theta, @intCast(off));
-        const k_rot_r = try rope(&t, k_rot, rope_dim, self.theta, @intCast(off));
+        const q_rot_r = if (c.mrope_positions) |mp|
+            try ropeM(&t, q_rot, rope_dim, self.theta, self.mrope_sections, mp)
+        else
+            try rope(&t, q_rot, rope_dim, self.theta, @intCast(off));
+        const k_rot_r = if (c.mrope_positions) |mp|
+            try ropeM(&t, k_rot, rope_dim, self.theta, self.mrope_sections, mp)
+        else
+            try rope(&t, k_rot, rope_dim, self.theta, @intCast(off));
 
         // MLA absorption: q_nope @ Wk lands the query in the latent; V is lifted after the reduction.
         const q_abs = try t.matmul(q_nope, self.wk); // [slots, heads, rows, rank]
@@ -145,6 +154,59 @@ pub const Attn = struct {
         return g.adopt(t.escape(out));
     }
 };
+
+/// Interleaved M-RoPE on the trailing `dim` channels from RAW 3-D positions `[3, rows]` int32: frequency index
+/// `i` uses the time plane unless it falls in the height (`i % 3 == 1`, first `section[1]*3`) or width
+/// (`i % 3 == 2`, first `section[2]*3`) slice; each layer kind supplies its own base.
+fn ropeM(t: *Graph, x: Array, dim: c_int, base: f32, sections: [3]u32, pos: Array) !Array {
+    const sh = ops.shape(x);
+    const rank = sh.len;
+    if (rank < 3) return error.BadRopeShape;
+    const rows: usize = @intCast(sh[rank - 2]);
+    const dt = ops.dtype(x);
+    const half = @divExact(@as(usize, @intCast(dim)), 2);
+    try ops.eval(pos);
+    const p = mlx.mlx_array_data_int32(pos) orelse return error.NoData;
+    const cos_buf = try gpa.alloc(f32, rows * half);
+    defer gpa.free(cos_buf);
+    const sin_buf = try gpa.alloc(f32, rows * half);
+    defer gpa.free(sin_buf);
+    for (0..rows) |r| for (0..half) |i| {
+        const axis: usize = if (i < sections[1] * 3 and i % 3 == 1) 1 else if (i < sections[2] * 3 and i % 3 == 2) 2 else 0;
+        const ang = @as(f32, @floatFromInt(p[axis * rows + r])) * std.math.pow(f32, base, -@as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(half)));
+        cos_buf[r * half + i] = @cos(ang);
+        sin_buf[r * half + i] = @sin(ang);
+    };
+    const cos_dt = try t.astype(try t.fromSlice(f32, cos_buf, &.{ @intCast(rows), @intCast(half) }), dt);
+    const sin_dt = try t.astype(try t.fromSlice(f32, sin_buf, &.{ @intCast(rows), @intCast(half) }), dt);
+
+    var esh: [8]c_int = @splat(1);
+    esh[rank - 2] = @intCast(rows);
+    esh[rank - 1] = @intCast(half);
+    var csh: [8]c_int = esh;
+    csh[rank] = 1;
+    const cf = try t.reshape(try t.astype(cos_dt, .float32), csh[0 .. rank + 1]);
+    const sf = try t.reshape(try t.astype(sin_dt, .float32), csh[0 .. rank + 1]);
+
+    var psh: [8]c_int = undefined;
+    @memcpy(psh[0 .. rank - 1], sh[0 .. rank - 1]);
+    psh[rank - 1] = @intCast(half);
+    psh[rank] = 2;
+    const pairs = try t.reshape(x, psh[0 .. rank + 1]);
+    var lo0: [8]c_int = @splat(0);
+    var hi0: [8]c_int = psh;
+    hi0[rank] = 1;
+    var lo1: [8]c_int = lo0;
+    lo1[rank] = 1;
+    var hi1: [8]c_int = psh;
+    hi1[rank] = 2;
+    const x0 = try t.astype(try t.slice(pairs, lo0[0 .. rank + 1], hi0[0 .. rank + 1]), .float32);
+    const x1 = try t.astype(try t.slice(pairs, lo1[0 .. rank + 1], hi1[0 .. rank + 1]), .float32);
+    const o0 = try t.sub(try t.mul(x0, cf), try t.mul(x1, sf));
+    const o1 = try t.add(try t.mul(x0, sf), try t.mul(x1, cf));
+    const joined = try t.concat(&.{ o0, o1 }, -1);
+    return t.astype(try t.reshape(joined, sh), dt);
+}
 
 /// RoPE on the trailing `dim` channels of `x` (`[slots, heads, rows, dim]` or `[slots, rows, dim]`), adjacent-pair
 /// (interleaved) rotation: MLX's `traditional` arm rounds the angle table to the activation dtype before it rotates,
@@ -483,3 +545,36 @@ const MlaOracle = struct {
         norm(full[0..o.hidden], o.ppn, o.hidden, o.eps, y);
     }
 };
+
+test "hy_v4 mla: ropeM picks the time plane on i=0 and the height plane on i=1" {
+    const stream = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+    var g = Graph.init(testing.allocator, stream);
+    defer g.deinit();
+    var pos_buf = [_]i32{ 5, 6, 2, 3, 7, 8 }; // [3, rows]: t, h, w
+    const pos = try g.fromSlice(i32, &pos_buf, &.{ 3, 2 });
+    defer g.drop(pos);
+    var x = [_]f32{ 1.0, -1.0, 0.5, 2.0, 0.0, 1.0, 0.25, -3.0 };
+    const xa = try g.fromSlice(f32, &x, &.{ 1, 2, 4 });
+    defer g.drop(xa);
+    const out = try ropeM(&g, xa, 4, 10000.0, .{ 1, 1, 1 }, pos);
+    defer g.drop(out);
+    const got = try readF32(out);
+    // row 0: pair (0,1) by t=5, pair (2,3) by h=2; row 1: t=6, h=3.
+    const inv0: f32 = 1.0;
+    const inv1: f32 = std.math.pow(f32, 10000.0, -1.0 / 2.0);
+    for (0..2) |r| {
+        const t: f32 = if (r == 0) 5 else 6;
+        const h: f32 = if (r == 0) 2 else 3;
+        const a0 = t * inv0;
+        const a1 = h * inv1;
+        const x0 = x[r * 4];
+        const x1 = x[r * 4 + 1];
+        const y0 = x[r * 4 + 2];
+        const y1 = x[r * 4 + 3];
+        try testing.expectApproxEqAbs(x0 * @cos(a0) - x1 * @sin(a0), got[r * 4], 1e-5);
+        try testing.expectApproxEqAbs(x0 * @sin(a0) + x1 * @cos(a0), got[r * 4 + 1], 1e-5);
+        try testing.expectApproxEqAbs(y0 * @cos(a1) - y1 * @sin(a1), got[r * 4 + 2], 1e-5);
+        try testing.expectApproxEqAbs(y0 * @sin(a1) + y1 * @cos(a1), got[r * 4 + 3], 1e-5);
+    }
+}

@@ -77,6 +77,8 @@ pub const Ctx = struct {
     /// A prompt chunk's M-RoPE `cos`/`sin` rows, roped by in place of `positions`; null = 1-D positions (which
     /// carry the slot's M-RoPE delta).
     mrope: ?[2]Array = null,
+    /// A prompt chunk's RAW 3-D positions `[3, rows]` int32 (Hy4 ropes per layer kind); null = none.
+    mrope_positions: ?Array = null,
     /// A speculative verify: recurrent mixers leave each row's state for the partial-accept rollback
     /// (`StateSlot.conv_input`, `.state_seq`) and skip the fused steps that do not produce it.
     capture_spec: bool = false,

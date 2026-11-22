@@ -121,10 +121,16 @@ pub const Config = struct {
     vision_out_hidden_size: u32 = 3072,
     vision_merge_size: u32 = 2,
     vision_rope_theta: f32 = 10000.0,
+    vision_norm_eps: f32 = 1e-5,
+    vision_min_pixels: u32 = 4096,
+    vision_max_pixels: u32 = 4194304,
     vision_max_image_size: u32 = 2048,
     vision_min_image_size: u32 = 512,
     vision_max_seq_len: u32 = 16384,
     vision_img_max_tokens: u32 = 4096,
+    /// The driver's `Forward.mrope` inverse frequencies (the DSA base) and the plugin's raw 3-D layout.
+    mrope_inv: [32]f64 = @splat(0),
+    mrope_inv_len: usize = 0,
     image_start_id: u32 = 120118,
     image_end_id: u32 = 120119,
     image_newline_id: u32 = 120121,
@@ -547,6 +553,7 @@ fn readVision(c: *Config, root: std.json.ObjectMap) ParseError!void {
     try intIf(vc, "out_hidden_size", &c.vision_out_hidden_size);
     try intIf(vc, "spatial_merge_size", &c.vision_merge_size);
     try f32If(vc, "rope_2d_theta", &c.vision_rope_theta);
+    try f32If(vc, "rms_norm_eps", &c.vision_norm_eps);
     try intIf(vc, "max_image_size", &c.vision_max_image_size);
     try intIf(vc, "min_image_size", &c.vision_min_image_size);
     try intIf(vc, "max_vit_seq_len", &c.vision_max_seq_len);
@@ -633,6 +640,19 @@ pub fn parse(
         .batch_pads_kv = false,
         .moe = c.n_routed_experts > 0,
         .images = c.has_vision,
+    };
+    // The driver builds `Forward.mrope` off this (its angles are unused by Hy4, which ropes per layer
+    // kind from the raw table); the raw positions ride `Forward.mrope_positions`.
+    c.mrope_inv_len = c.qk_rope_head_dim / 2;
+    if (c.mrope_inv_len > c.mrope_inv.len) c.mrope_inv_len = c.mrope_inv.len;
+    for (0..c.mrope_inv_len) |i| {
+        c.mrope_inv[i] = std.math.pow(f64, c.rope_theta_dsa, -@as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(c.qk_rope_head_dim)));
+    }
+    p.mrope = .{
+        .sections = c.mrope_section,
+        .rope_dims = c.qk_rope_head_dim,
+        .inv_freq = .of(c.mrope_inv[0..c.mrope_inv_len]),
+        .hy4_layout = c.has_vision,
     };
     p.cache.layout_namespace = abi.Str.of("hy4-mla-latent-v1");
     p.placeholder_ids.image = c.image_token_id;

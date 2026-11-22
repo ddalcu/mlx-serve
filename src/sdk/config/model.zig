@@ -732,6 +732,8 @@ pub const ModelConfig = struct {
     // Interleaved M-RoPE sections [t, h, w]; sum = rotary_dim/2 (e.g. [11,11,10]).
     mrope_section: [3]u32 = .{ 0, 0, 0 },
     mrope_interleaved: bool = false,
+    /// Hy4-flash's vision layout: image runs carry one newline row per merged row.
+    hy4_vision: bool = false,
     // Qwen vision token ids (top-level config.json). image_token_id reuses the
     // shared field above (parsed generically at the image_token_id block).
     video_token_id: u32 = 0,

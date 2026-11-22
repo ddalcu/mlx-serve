@@ -24,3 +24,24 @@ Chat requests with images work: the 27-layer `vit.*` tower + `perceive` projecto
 
 ## Verification (plan-level)
 Vision parity script green; text-only tests untouched; lint 0. Deferred: video inputs (ids exist; refuse by name).
+
+## Execution notes (plan 07)
+
+- Tower: `vision.zig` loads the pack's `vit.*` dense bf16 (patch conv, learned 128x128 grid, 27 blocks,
+  `vit.perceive` projector), flattening the convs to MLX's `[out, kh, kw, in]`. Attention is full and
+  bidirectional per image (no rope: the learned grid is the only positional signal).
+- Preprocess: smart resize factor patch*merge=32 within [4096, min(2048², engine 1536²)], Torch's antialiased
+  bicubic, rescale 1/255 + mean/std 0.5, row-major patches with channel-major features. `prepare` derives
+  `rows = (gh/2)*(gw/2+1)` (one newline per merged row), which the host expands the placeholder to.
+- Parity: `tests/dump_hyv4_vision_ref.py` transcribes `HYV4VLVisionModel` in torch over the pack's tower (CPU,
+  ~1 GB) and dumps one 512x512 image's patches + features. `vision_test.zig` (HYV4_PACK, HYV4_VISION_FIXTURE)
+  loads the real pack and compares: cos 1.000000, rms ratio 1.000000, 272 rows.
+- M-RoPE: `host/media/hy4_mrope.zig` builds the newline-column table; the raw 3-D positions ride
+  `Forward.mrope_positions`, and the MLA ropes per layer kind (`ropeM`, sections [12,10,10]). The host's
+  placeholder splice in `trunk.forward` replaces image-token embeddings with the tower rows from
+  `media_offset`.
+- Live (full pack): robot.png (360x360 -> 352x352, 132 image rows) answers "a humanoid robot with a transparent
+  head revealing its internal circuitry"; text-only regression still answers; decode ~6.2 tok/s at 165 prompt
+  tokens. Video is refused by name.
+- Deferred: video inputs; the indexer's group-key RoPE at image positions (only matters past the 2048-token
+  recall budget).

@@ -6,6 +6,7 @@ const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 pub const config = @import("config.zig");
 pub const weights = @import("weights.zig");
+pub const vision_mod = @import("vision.zig");
 const log = @import("../../sdk/util/log.zig");
 const mlx = @import("../../mlx/ffi.zig");
 
@@ -25,6 +26,7 @@ pub const table = abi.ModelTable{
     .unload = &unload,
     .forward = &forward,
     .cache = &.{ .layout = &layout },
+    .media = &.{ .tower = &vision_mod.tower, .prepare = &vision_mod.prepare },
     .weights = &.{ .resident_bytes = &residentBytes },
 };
 
