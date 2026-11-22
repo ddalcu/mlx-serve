@@ -5603,3 +5603,30 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         try Expect.same(r.c, r.bytes, &.{try mtail.launch(&sc, .{ .dn = r.c.args[0], .inv = r.c.args[1], .sh = r.c.args[2] }, r.c.args[3], &sp)});
     }
 }
+
+test "kernel contract dsv41: the router's scores at logits near -9 (e^z about 1e-4) are within 1e-5 of float64" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    var rig = metal.Rig.init(std.testing.allocator);
+    defer rig.deinit();
+    // z_e = -(8 + (e % 24) / 16), exact in f32; the bias makes experts 16..21 (z -9 .. -9.3125) the picks.
+    var z: [EXPERTS]f64 = undefined;
+    var bias: [EXPERTS]f64 = undefined;
+    for (0..EXPERTS) |e| {
+        z[e] = -(8.0 + @as(f64, @floatFromInt(e % 24)) / 16.0);
+        bias[e] = if (e >= 16 and e < 22) 10 else 0;
+    }
+    const lz = try rig.input(.float32, &.{ 1, EXPERTS }, &z);
+    const lb = try rig.input(.float32, &.{ 1, EXPERTS }, &bias);
+    const ls = try rig.input(.float32, &.{1}, &.{1.5});
+    try rig.launch(&route_l, Route.geometry(.{ .norm = false }, .{ .rows = 1, .n = TOPK, .k = EXPERTS }).?, &.{ lz, lb, ls });
+    const out = rig.outputBytes();
+    for (0..TOPK) |q| {
+        const e = std.mem.readInt(u32, out[4 * q ..][0..4], .little);
+        try std.testing.expectEqual(@as(u32, @intCast(16 + q)), e);
+        const got: f64 = @as(f32, @bitCast(std.mem.readInt(u32, out[4 * (TOPK + q) ..][0..4], .little)));
+        const want = softplusSqrt(z[e]) * 1.5;
+        const rel = @abs(got - want) / want;
+        std.debug.print("[dsv41] route pick {d}: z {d:.4}, weight {e} where float64 gives {e} ({e} rel)\n", .{ e, z[e], got, want, rel });
+        try std.testing.expect(rel <= 1e-5);
+    }
+}
