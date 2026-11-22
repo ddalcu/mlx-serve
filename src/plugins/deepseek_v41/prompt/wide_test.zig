@@ -290,7 +290,7 @@ test "dsv41 wide tol: the MoE combine and hc expand in one launch are moePrefill
 // ── the routed pairs' counting sort (pf_route.zig) ──
 
 /// `a` and `b` the same dtype, shape and words.
-fn same(a: A, b: A) !bool {
+fn sameWords(a: A, b: A) !bool {
     if (mlx.mlx_array_dtype(a) != mlx.mlx_array_dtype(b) or !std.mem.eql(c_int, mlx.getShape(a), mlx.getShape(b))) return false;
     var eq = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(eq);
@@ -318,12 +318,12 @@ test "dsv41 wide: the counting-sort route pack gives the argsorts' pair order, r
         const inv = try sc.res(mlx.mlx_argsort_axis(&oi, order, 0, sc.s), &oi);
         const rows = try sc.op2(mlx.mlx_floor_divide, order, try sc.u(top_k));
         const got = (try pfroute.pack(&sc, flat, wf, top_k, experts)) orelse return error.PackDeclined;
-        const ok = [_]bool{ try same(inv, got.inv), try same(rows, got.rows), try same(try sc.take(flat, order, 0), got.sidx), try same(try sc.take(wf, order, 0), got.w) };
+        const ok = [_]bool{ try sameWords(inv, got.inv), try sameWords(rows, got.rows), try sameWords(try sc.take(flat, order, 0), got.sidx), try sameWords(try sc.take(wf, order, 0), got.w) };
         std.debug.print("route pack rows {d}: inv {} rows {} experts {} weights {}\n", .{ L, ok[0], ok[1], ok[2], ok[3] });
         try testing.expect(ok[0] and ok[1] and ok[2] and ok[3]);
         // Planted: each row's weights on the wrong experts.
         const bad = (try pfroute.pack(&sc, flat, try sc.reshape(try rolled(&sc, c.wts), &.{n}), top_k, experts)).?;
-        try testing.expect(!try same(try sc.take(wf, order, 0), bad.w));
+        try testing.expect(!try sameWords(try sc.take(wf, order, 0), bad.w));
     }
 }
 
@@ -368,12 +368,12 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_MOE_EPI is the argsort pat
                 break :blk try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
             };
             const pg = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
-            const eq = try same(want, got) and try same(pw.inv, pg.inv) and try same(pw.dn, pg.dn);
+            const eq = try sameWords(want, got) and try sameWords(pw.inv, pg.inv) and try sameWords(pw.dn, pg.dn);
             std.debug.print("pf route moePrefill {s} {s} rows {d}: same words {}\n", .{ if (nv) "NVFP4" else "MXFP4", if (paired) "paired" else "split", L, eq });
             try testing.expect(eq);
             // Planted: each row's weights on the wrong experts.
             const bad = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, try rolled(&csc, c.wts), c.sh);
-            try testing.expect(!try same(want, bad));
+            try testing.expect(!try sameWords(want, bad));
         }
     };
 }
