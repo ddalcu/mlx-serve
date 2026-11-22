@@ -388,105 +388,6 @@ test "dsv41 wide tol: the hc mixes at 8 rows a threadgroup are the 4-row launche
     try testing.expect(ok);
 }
 
-test "dsv41 wide tol: the hc mixes on the simdgroup matrix units are hc_mix's mixes, and with hc_norm the fused attention-side launch's split and norm, within 1% at prompt widths; a dropped mix scale or base fails" {
-    if (skip()) return error.SkipZigTest;
-    mlx.installErrorHandler();
-    var m: dsv41.Dsv41Model = undefined;
-    try hcModel(&m);
-    defer hcModelFree(&m);
-    const off = env.override(.MLX_SERVE_DSV41_HC_MIX_TILED, "0");
-    defer off.restore();
-    var ok = true;
-    for ([_]c_int{ 17, 33, 1027, 5001, 8192 }, 0..) |L, i| {
-        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
-        defer sc.deinit();
-        const r = try hcRows(&sc, L, 0x9900 + 16 * @as(u64, i));
-        const eps = try dsv41.hcEps(&sc, &m);
-        const z4 = try dsv41.hcMixWide(&sc, &m, r.x, &r.hc, eps);
-        const f = try dsv41.hcMixNormFused(&sc, &m, r.x, r.cpre, &r.hc, r.w, null, eps);
-        const on = env.override(.MLX_SERVE_DSV41_HC_MIX_TILED, "1");
-        defer on.restore();
-        const zt = try dsv41.hcMixWide(&sc, &m, r.x, &r.hc, eps);
-        const n = try dsv41.hcNorm(&sc, &m, zt, r.x, r.cpre, r.w, eps);
-        const names = [_][]const u8{ "z", "fused z", "h", "pre", "post", "comb" };
-        for ([_][2]A{ .{ z4, zt }, .{ f.z, zt }, .{ f.n.h, n.h }, .{ f.n.sp.pre, n.sp.pre }, .{ f.n.sp.post, n.sp.post }, .{ f.n.sp.comb, n.sp.comb } }, names) |pr, nm| {
-            var lb: [64]u8 = undefined;
-            if (!try close(try std.fmt.bufPrint(&lb, "hc mix tiled rows {d} {s}", .{ L, nm }), pr[0], pr[1], null, tol_kernel)) ok = false;
-        }
-        // Planted: the mixes' scale dropped, then their base dropped (ones and zeros in their places).
-        var bad_s = r.hc;
-        bad_s.scale = try sc.ones(mlx.getShape(r.hc.scale), .float32);
-        try testing.expect(!try close("  planted: mix scale dropped", z4, try dsv41.hcMixWide(&sc, &m, r.x, &bad_s, eps), null, tol_kernel));
-        var bad_b = r.hc;
-        bad_b.base = try sc.zeros(mlx.getShape(r.hc.base), .float32);
-        try testing.expect(!try close("  planted: mix base dropped", z4, try dsv41.hcMixWide(&sc, &m, r.x, &bad_b, eps), null, tol_kernel));
-    }
-    try testing.expect(ok);
-}
-
-/// `n` launches of `f` (no dependence between them) evaluated together, best of 3: microseconds a launch.
-fn timeLaunches(comptime f: anytype, args: anytype, n: usize) !f64 {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const iou = @import("../../../sdk/util/io_util.zig");
-    var best: f64 = std.math.inf(f64);
-    for (0..4) |rep| {
-        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
-        defer sc.deinit();
-        const outs = try testing.allocator.alloc(A, n);
-        defer testing.allocator.free(outs);
-        const t0 = iou.nowUsMonotonic(io);
-        for (outs) |*o| o.* = try @call(.auto, f, .{&sc} ++ args);
-        try dsv41.evalAll(outs);
-        const us = @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0)) / @as(f64, @floatFromInt(n));
-        // The first pass compiles the kernels.
-        if (rep > 0) best = @min(best, us);
-    }
-    return best;
-}
-
-fn mixOnly(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, hc: *const dsv41.Hc, eps: A) !A {
-    return dsv41.hcMixWide(sc, m, x, hc, eps);
-}
-
-fn mixNormFused(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, cpre: A, hc: *const dsv41.Hc, w: A, eps: A) !A {
-    return (try dsv41.hcMixNormFused(sc, m, x, cpre, hc, w, null, eps)).n.h;
-}
-
-fn mixThenNorm(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, cpre: A, hc: *const dsv41.Hc, w: A, eps: A) !A {
-    return (try dsv41.hcNorm(sc, m, try dsv41.hcMixWide(sc, m, x, hc, eps), x, cpre, w, eps)).h;
-}
-
-test "dsv41 bench: the wide hc mixes, hc_mix against the simdgroup matrix kernel, alone and with the norm (DSV41_BENCH_HC_MIX = rows)" {
-    const rows_s = std.mem.span(std.c.getenv("DSV41_BENCH_HC_MIX") orelse return error.SkipZigTest);
-    if (skip()) return error.SkipZigTest;
-    mlx.installErrorHandler();
-    const L = try std.fmt.parseInt(c_int, rows_s, 10);
-    var m: dsv41.Dsv41Model = undefined;
-    try hcModel(&m);
-    defer hcModelFree(&m);
-    var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
-    defer sc.deinit();
-    const r = try hcRows(&sc, L, 0xBE0C);
-    const eps = try dsv41.hcEps(&sc, &m);
-    try dsv41.evalAll(&.{ r.x, r.cpre, r.hc.fn_w, r.hc.scale, r.hc.base, r.w, eps });
-    const n = 50;
-    var t: [5]f64 = undefined;
-    {
-        const off = env.override(.MLX_SERVE_DSV41_HC_MIX_TILED, "0");
-        defer off.restore();
-        t[0] = try timeLaunches(mixOnly, .{ &m, r.x, &r.hc, eps }, n);
-        t[2] = try timeLaunches(mixThenNorm, .{ &m, r.x, r.cpre, &r.hc, r.w, eps }, n);
-        t[4] = try timeLaunches(mixNormFused, .{ &m, r.x, r.cpre, &r.hc, r.w, eps }, n);
-    }
-    {
-        const on = env.override(.MLX_SERVE_DSV41_HC_MIX_TILED, "1");
-        defer on.restore();
-        t[1] = try timeLaunches(mixOnly, .{ &m, r.x, &r.hc, eps }, n);
-        t[3] = try timeLaunches(mixThenNorm, .{ &m, r.x, r.cpre, &r.hc, r.w, eps }, n);
-    }
-    std.debug.print("[hc mix] {d} rows, us a launch: hc_mix {d:.1}, simdgroup matrix {d:.1}; hc_mix + hc_norm {d:.1}, simdgroup matrix + hc_norm {d:.1}; fused mix_norm {d:.1}\n", .{ L, t[0], t[1], t[2], t[3], t[4] });
-}
-
 /// hc_v2's prompt widths: below a threadgroup's 64 rows, the chunk tail, a lead half, an odd width, a full chunk.
 const v2_widths = [_]c_int{ 37, 1254, 4096, 5001, 8192 };
 
@@ -650,7 +551,7 @@ test "dsv41 wide tol: hc_v2's combining tail is moe_tail's combine, glm5's expan
 
 // ── a release-shape pair worker's prefill ──
 
-const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_HC_MIX_TILED, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2 };
+const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2 };
 
 /// The pair worker's streams and mixes after its layers over `x` / `pre`, from a fresh state (caller frees).
 fn prefill(fx: *fixture.Fixture, x: A, pre: A) ![2]A {
