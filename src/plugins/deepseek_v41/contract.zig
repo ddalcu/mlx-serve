@@ -4608,14 +4608,15 @@ fn v2Served(comptime S: usize) []const Shape {
 }
 
 fn hcV2MixLaunch(comptime p: hv2.Pro) metal.Launch {
-    return .{ .name = hv2.name(p), .inputs = hv2.ins(p), .outputs = hv2.outs(p), .source = hv2.mix_source, .header = hv2.header(p), .tg_bytes = if (hv2.mixes(p)) 4 * hv2.FSTEP else 0 };
+    return .{ .name = hv2.name(p), .inputs = hv2.ins(p), .outputs = hv2.outs(p), .source = hv2.mix_source, .header = hv2.header(p), .tg_bytes = if (hv2.mixes(p)) 4 * hv2.FSTEP else 0, .offline = false, .min_gen = 17 };
 }
 const hc_v2_mix_l = blk: {
     var l: [hv2.all.len]metal.Launch = undefined;
     for (hv2.all, 0..) |p, i| l[i] = hcV2MixLaunch(p);
     break :blk l;
 };
-const hc_v2_fin_l = launch("dsv41_hc_v2_fin", &hv2.fin_ins, &hv2.fin_outs, hv2.fin_source, "", 0, 1024, false);
+/// hc_v2's launches serve on NAX GPUs only (`hc_v2.serves`).
+const hc_v2_fin_l = metal.Launch{ .name = "dsv41_hc_v2_fin", .inputs = &hv2.fin_ins, .outputs = &hv2.fin_outs, .source = hv2.fin_source, .header = "", .tg_bytes = 0, .offline = false, .min_gen = 17 };
 const mix_norm_l = launch("dsv41_hc_mix_norm", &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, &.{ "z", "h_out", "h2" }, hcf.mix_norm_source, "", 4 * (4 * 6 + 4) * 32, 1024, true);
 const mix_mma_l = metal.Launch{ .name = "dsv41_hc_mix_mma", .inputs = &hmma.ins, .outputs = &.{"z"}, .source = hmma.source, .header = "", .tg_bytes = 4 * (hmma.RT * 8 * hmma.KC + hmma.KC * MIX + hmma.RT * 8 * MIX + hmma.RT * 8 * 4) };
 /// The wide mixes at 8 rows a threadgroup (`MLX_SERVE_DSV41_HC_MIX8`), served on NAX GPUs only.
@@ -5207,6 +5208,7 @@ fn registerStreamed(set: *kc.Set) !void {
         .tiles = .{ .{ .size = hv2.ROWS }, .{}, .{} },
         .served = comptime v2Served(v2Slices(p)),
         .sums = v2_sums,
+        .nax = true,
     });
     try kit.add(set, HcV2Fin, &hc_v2_fin_l, .{}, .{
         .name = "dsv41 hc_v2_fin (slices into the mixes, the split and the normed collapse)",
@@ -5217,6 +5219,7 @@ fn registerStreamed(set: *kc.Set) !void {
         .out = .f32,
         .outs = &.{ .{ .elem = .f32, .count = HcV2Fin.rowsSplit }, .{ .elem = .bf16, .count = rowsN } },
         .served = &.{ .{ .rows = 17, .n = DIM, .k = 40 }, .{ .rows = 65, .n = DIM, .k = 10 } },
+        .nax = true,
         .sums = short_sums,
     });
     inline for (.{ true, false }) |h2| try kit.add(set, HcMixNorm, &mix_norm_l, .{ .h2 = h2 }, .{
