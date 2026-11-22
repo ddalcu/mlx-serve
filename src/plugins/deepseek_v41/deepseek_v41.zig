@@ -81,6 +81,10 @@ const acore = @import("prompt/attn_core.zig");
 const fa = @import("prompt/flash_attn.zig");
 /// the moe_pair.zig: a prompt call's fp4 gate and up with `moe_act` in one paired NAX launch.
 const mpair = @import("prompt/moe_pair.zig");
+/// hc_mix_mma.zig: a wide layer's hc mixes on the simdgroup matrix units (`MLX_SERVE_DSV41_HC_MIX_TILED`).
+const hmma = @import("prompt/hc_mix_mma.zig");
+/// moe_tail.zig: a resident wide layer's MoE combine and hc expand in one launch (`MLX_SERVE_DSV41_MOE_TAIL`).
+const mtail = @import("prompt/moe_tail.zig");
 /// launch fusions, each behind its own default-off switch (`Dsv41Model.fuse`).
 const fusion = @import("fuse.zig");
 const Shard = @import("../../sdk/weights/shard.zig").Shard;
@@ -694,7 +698,16 @@ pub const Dec = struct {
     idx_score: ?dkern.idx_score.Kernels = null,
     topk: ?dkern.topk.Kernels = null,
     wq_b: ?mlx.mlx_fast_metal_kernel = null,
+    /// `wq_b` that also writes the window ring (`MLX_SERVE_DSV41_FUSE_WQB_RING`).
+    wq_b_ring: ?mlx.mlx_fast_metal_kernel = null,
+    /// `wq_b` and `wq_b_ring` on the matrix units (`MLX_SERVE_DSV41_GEMV_R26_WQB`), NAX only.
+    wq_b_nax: ?mlx.mlx_fast_metal_kernel = null,
+    wq_b_ring_nax: ?mlx.mlx_fast_metal_kernel = null,
     attn: ?mlx.mlx_fast_metal_kernel = null,
+    /// `attn` that merges its splits (`MLX_SERVE_DSV41_FUSE_ATTN_MERGE`), its arrival counter and wo_a's sink then.
+    attn_merge: ?mlx.mlx_fast_metal_kernel = null,
+    attn_counter: A = none,
+    attn_nosink: A = none,
     wo_a: ?mlx.mlx_fast_metal_kernel = null,
     /// `wo_a`'s arrival counter, zeroed once and shared by every layer's launch.
     wo_a_counter: A = none,
@@ -704,11 +717,13 @@ pub const Dec = struct {
     moe_down: ?mlx.mlx_fast_metal_kernel = null,
     /// `dkern.moe_down.probe`'s output rows a threadgroup on this GPU.
     moe_down_rb: usize = 0,
+    /// The `MLX_SERVE_DSV41_FUSE_*` switches that have served a layer, each logged once (`engaged`).
+    engaged: u8 = 0,
 
     fn init(gpa: std.mem.Allocator, cfg: *const Config) !Dec {
         const nax = device.naxAvailable();
         // Without NAX the affine moe_up / moe_down lose to today's MoE kernels at every row count.
-        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .attn = if (nax) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
+        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .wq_b_ring = try dkern.wq_b.buildRing(), .wq_b_nax = if (nax) try dkern.wq_b.buildNax(false) else null, .wq_b_ring_nax = if (nax) try dkern.wq_b.buildNax(true) else null, .attn = if (nax) try dkern.attn.build() else null, .attn_merge = if (nax) try dkern.attn.buildMerge() else null, .attn_counter = dkern.attn.newCounter(), .attn_nosink = dkern.attn.noSink(cfg.num_attention_heads), .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
         errdefer d.deinit();
         try dkern.topk.probe(gpa, &d.topk.?, mlx.gpuStream());
         if (d.moe_down) |kd| d.moe_down_rb = dkern.moe_down.probe(gpa, kd, cfg.moe_intermediate_size, cfg.hidden_size) catch |e| blk: {
@@ -727,8 +742,11 @@ pub const Dec = struct {
         if (d.moe_up) |k| k.deinit();
         if (d.moe_fp4) |k| k.deinit();
         if (d.ffn_in) |k| dkern.ffn_in.free(k);
-        inline for (.{ d.wq_b, d.attn, d.wo_a, d.moe_down }) |k| if (k) |kern| {
+        inline for (.{ d.wq_b, d.wq_b_ring, d.wq_b_nax, d.wq_b_ring_nax, d.attn, d.attn_merge, d.wo_a, d.moe_down }) |k| if (k) |kern| {
             _ = mlx.mlx_fast_metal_kernel_free(kern);
+        };
+        inline for (.{ d.attn_counter, d.attn_nosink }) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
         };
         if (d.wo_a_counter.ctx != null) _ = mlx.mlx_array_free(d.wo_a_counter);
         d.* = .{};
@@ -880,6 +898,14 @@ fn exactLayersDecline(m: *const Dsv41Model) ?[]const u8 {
         if (!dkern.wq_b.servesLayer(m, ly)) return "a layer's wq_b format (wq_b)";
     }
     return null;
+}
+
+/// Logs `name` the first time its switch (`bit`) serves a layer, so a served log shows the arm engaged.
+fn engaged(m: *Dsv41Model, bit: u3, name: []const u8) void {
+    const b = @as(u8, 1) << bit;
+    if (m.dec.engaged & b != 0) return;
+    m.dec.engaged |= b;
+    log.info("[dsv41] {s} engaged\n", .{name});
 }
 
 /// A verify block `exactServes` should have run on `blockFusedRows` fell to the batched kernels (`blockFused`
@@ -2724,6 +2750,7 @@ pub fn hcPreNormWide(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *const
 }
 /// `hcPreNormWide`'s mix kernel: `x`'s mix logits `[L, mix]` f32, which `hcNorm` turns into the split.
 pub fn hcMixWide(sc: *Scope, m: *const Dsv41Model, x: A, hc: *const Hc, eps: A) !A {
+    if (try hmma.mix(sc, x, hc, eps)) |z| return z;
     const L = dim(x, 0);
     const mix = dim(hc.fn_w, 0);
     const tg = m.hc_tg;
@@ -4600,6 +4627,18 @@ pub fn flatKernel(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, ins: []const A, s
 /// the n = L k pairs sorted by expert so each bank streams once, gate+up and down as sorted gathers
 /// (`sortedBank`), the SwiGLU x weight and the unsort + k-sum + shared add one kernel each.
 pub fn moePrefill(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, wts: A, sh: A) !A {
+    const p = try moePrefillParts(sc, m, ly, x, idx, wts, sh);
+    const L = dim(x, 0);
+    const d = dim(x, 1);
+    return flatKernel(sc, m.moe_combine_kernel, &.{ p.dn, p.inv, p.sh }, &.{ ci(L), ci(d) }, mlx.mlx_array_dtype(x), L * d, &.{ .{ .name = "D", .v = ci(d) }, .{ .name = "K", .v = ci(dim(idx, 1)) } });
+}
+
+/// What `moePrefill`'s combine reads: the down rows `[n, d]` in expert order, each pair's place in it `inv` `[n]`
+/// (pair `l * k + j` at row `inv[l * k + j]`) and the shared expert `sh` in `x`'s dtype.
+pub const MoeParts = struct { dn: A, inv: A, sh: A };
+
+/// `moePrefill` up to its combine.
+pub fn moePrefillParts(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, wts: A, sh: A) !MoeParts {
     const L = dim(x, 0);
     const k = dim(idx, 1);
     const d = dim(x, 1);
@@ -4629,7 +4668,7 @@ pub fn moePrefill(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx:
         break :blk try flatKernel(sc, m.moe_act_kernel, &.{ try sc.reshape(y, &.{ ci(n), ci(2 * inter) }), w_sorted, lim }, &.{ ci(n), 1, ci(inter) }, dt, n * inter, &.{.{ .name = "N", .v = ci(inter) }});
     };
     const dn = try sortedBank(sc, act, null, &e.down, sidx); // [n, 1, d]
-    return flatKernel(sc, m.moe_combine_kernel, &.{ try sc.reshape(dn, &.{ ci(n), ci(d) }), inv, try sc.astype(sh, dt) }, &.{ ci(L), ci(d) }, dt, L * d, &.{ .{ .name = "D", .v = ci(d) }, .{ .name = "K", .v = ci(k) } });
+    return .{ .dn = try sc.reshape(dn, &.{ ci(n), ci(d) }), .inv = inv, .sh = try sc.astype(sh, dt) };
 }
 
 pub const Routes = struct { idx: A, wts: A };
@@ -5061,8 +5100,20 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     const ls = &st.layers[li];
     const L = dim(x, 0);
     const a = try dkern.in_proj.run(sc, kp, m, ly, x, pre.*) orelse return null;
-    const w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, try dkern.wq_b.rowsAt(sc, p0, L)) orelse return null;
-    try ls.win.write(w.kv_row, p0, sc.s);
+    const pos = try dkern.wq_b.rowsAt(sc, p0, L);
+    // `MLX_SERVE_DSV41_GEMV_R26_WQB=1`: a verify block's wq_b on the matrix units.
+    const nax = m.dec.wq_b_nax != null and dkern.wq_b.naxOn(L);
+    if (nax) engaged(m, 3, "MLX_SERVE_DSV41_GEMV_R26_WQB");
+    const kqn = if (nax) m.dec.wq_b_nax.? else kq;
+    // `MLX_SERVE_DSV41_FUSE_WQB_RING=1`: wq_b returns the window ring with these rows written (no slice_update launch).
+    const kr = if (nax) m.dec.wq_b_ring_nax else m.dec.wq_b_ring;
+    const wr = if (kr != null and dkern.wq_b.ringOn()) try dkern.wq_b.runRing(sc, m, kqn, ly, li, a.qa, a.kv, a.z, pos, .{ .kern = kr.?, .buf = ls.win.buf }) else null;
+    const w = wr orelse try dkern.wq_b.run(sc, m, kqn, ly, li, a.qa, a.kv, a.z, pos) orelse return null;
+    if (w.ring.ctx != null) {
+        engaged(m, 0, "MLX_SERVE_DSV41_FUSE_WQB_RING");
+        _ = mlx.mlx_array_free(ls.win.buf);
+        ls.win.buf = sc.out(w.ring);
+    } else try ls.win.write(w.kv_row, p0, sc.s);
     var comp_rows = none;
     var topk = none;
     if (ly.ratio > 0) {
@@ -5084,11 +5135,19 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(m.cfg.head_dim)));
     const inv = ropeFor(m, li).inv;
     var oa: ?A = null;
-    if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try dkern.attn.partials(sc, ka, m, q, ls.win, comp_rows, topk, p0, scale)) |p| {
+    // `MLX_SERVE_DSV41_FUSE_ATTN_MERGE=1`: the attention's last split merges the splits once and wo_a reads that one
+    // merged split (against a sink that weighs nothing) instead of each of its tiles re-merging them.
+    const merged = if (m.dec.attn_merge != null and m.dec.wo_a != null and dkern.attn.mergeOn()) try dkern.attn.partialsMerged(sc, m.dec.attn_merge.?, m, q, ls.win, comp_rows, topk, p0, scale, ly.sink, m.dec.attn_counter) else null;
+    if (merged) |p| {
+        engaged(m, 1, "MLX_SERVE_DSV41_FUSE_ATTN_MERGE");
+        oa = try dkern.wo_a.applySink(sc, m, ly, m.dec.wo_a.?, m.dec.wo_a_counter, inv, try attnMeta(sc, m, q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l, m.dec.attn_nosink);
+    } else if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try dkern.attn.partials(sc, ka, m, q, ls.win, comp_rows, topk, p0, scale)) |p| {
         oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counter, inv, try attnMeta(sc, m, q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l);
     };
     // `ffn_in` routes off wo_b's output, which a tensor split sums first.
     if (m.tp == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &sa)) |f| {
+        if (f.fused) engaged(m, 2, "MLX_SERVE_DSV41_FUSE_FFN_IN");
+        if (f.nax) engaged(m, 4, "MLX_SERVE_DSV41_GEMV_R26_FFN_IN");
         pre.* = f.sf.pre;
         // `fuse.down_scale`: the fused fp4 launches put the down scale on the routes themselves.
         if (m.fuse.down_scale) if (try fusion.ffnDownScaled(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf)) |y| return y;
@@ -6159,7 +6218,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         // the region. The call's last wide layer keeps the fresh buffer: its
         // streams are read after the call's last eval (the CED replay, the head, the next chunk).
         const into = pf.in_region and k0 == 0 and k1 == n_spans and next_wide and (m.n_mtp == 0 or m.dsparkTarget(li + 1) == null);
-        const xg = if (try moeExpand(&gsc, m, li, hg, img, if (into) pf.x1 else x1g, &sf, .{ .next = next_ids, .ls = &st.layers[li] }, into)) |v| v else try hcExpand(&gsc, x1g, try moe(&gsc, m, li, hg, img), &sf);
+        const xg = if (try moeExpand(&gsc, m, li, hg, img, if (into) pf.x1 else x1g, &sf, .{ .next = next_ids, .ls = &st.layers[li] }, into)) |v| v else if (try mtail.tail(&gsc, m, li, hg, img, x1g, &sf)) |v| v else try hcExpand(&gsc, x1g, try moe(&gsc, m, li, hg, img), &sf);
         // scratch_x1.zig: the region's next writer waits for this, its last reader.
         if (x1_scratch and k1 == n_spans) try sx1.ps().x1.released(xg);
         for (k0..k1) |k| {

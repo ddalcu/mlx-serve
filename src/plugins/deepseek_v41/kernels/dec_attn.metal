@@ -22,7 +22,72 @@ const int chunk = (total + S - 1) / S;
 const int t_lo = sp * chunk;
 const int tile_keys = metal::max(0, metal::min(total, t_lo + chunk) - t_lo);
 
+#if DSV41_ATTN_MERGE
+// The merge variant (`MLX_SERVE_DSV41_FUSE_ATTN_MERGE`): the last of a (row, 16 heads)'s S splits to arrive merges
+// their partials with the sink into `merged` [R, H, 1, D] f32 (not inverse-roped), with `pmo` 0 and `plo` 1 [R, H, 1],
+// one already-merged split for `attn_merge`'s math (wo_a then reads it against a sink of -3e38). The counter word of
+// the (row, head group) counts the arrivals and the last one zeroes it. Partials cross threadgroups as atomics: plain
+// loads can hit another core's stale L1.
+threadgroup float mcoef[16 * (S + 1)];
+threadgroup bool mlast;
+#define DSV41_MERGE_LAST() do { \
+  metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, metal::thread_scope_device); \
+  threadgroup_barrier(metal::mem_flags::mem_device); \
+  if (tid == 0) { \
+    device metal::atomic_uint* c = (device metal::atomic_uint*)counter + qi * (H / 16) + head0 / 16; \
+    const uint old = metal::atomic_fetch_add_explicit(c, 1u, metal::memory_order_relaxed); \
+    mlast = old + 1u == uint(S); \
+    if (mlast) metal::atomic_store_explicit(c, 0u, metal::memory_order_relaxed); \
+  } \
+  threadgroup_barrier(metal::mem_flags::mem_threadgroup); \
+  if (mlast) { \
+  metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, metal::thread_scope_device); \
+  device metal::atomic_float* pacc_a = (device metal::atomic_float*)pacc; \
+  device metal::atomic_float* pm_a = (device metal::atomic_float*)pm; \
+  device metal::atomic_float* pl_a = (device metal::atomic_float*)pl; \
+  if (tid < 16) { \
+    const int h = head0 + int(tid); \
+    const size_t base = (size_t(qi) * H + h) * S; \
+    float mv[S], lv[S]; \
+    float mx = sink[h]; \
+    for (int j = 0; j < S; ++j) { \
+      mv[j] = metal::atomic_load_explicit(pm_a + base + j, metal::memory_order_relaxed); \
+      lv[j] = metal::atomic_load_explicit(pl_a + base + j, metal::memory_order_relaxed); \
+      mx = metal::max(mx, mv[j]); \
+    } \
+    float total = metal::exp(sink[h] - mx); \
+    for (int j = 0; j < S; ++j) { \
+      const float wj = lv[j] > 0.0f ? metal::exp(mv[j] - mx) : 0.0f; \
+      total += lv[j] * wj; \
+      mcoef[int(tid) * (S + 1) + j] = wj; \
+    } \
+    mcoef[int(tid) * (S + 1) + S] = 1.0f / total; \
+    pmo[size_t(qi) * H + h] = 0.0f; \
+    plo[size_t(qi) * H + h] = 1.0f; \
+  } \
+  threadgroup_barrier(metal::mem_flags::mem_threadgroup); \
+  for (int it = int(tid); it < 16 * D; it += 128) { \
+    const int hh = it / D, d = it % D; \
+    const size_t base = (size_t(qi) * H + head0 + hh) * S; \
+    float o = 0.0f; \
+    for (int j = 0; j < S; ++j) o += metal::atomic_load_explicit(pacc_a + (base + j) * D + d, metal::memory_order_relaxed) * mcoef[hh * (S + 1) + j]; \
+    merged[(size_t(qi) * H + head0 + hh) * D + d] = o * mcoef[hh * (S + 1) + S]; \
+  } \
+  } \
+} while (0)
+#endif
+
 if (tile_keys == 0) {
+#if DSV41_ATTN_MERGE
+  for (int idx = int(tid); idx < 16 * D; idx += 128)
+    metal::atomic_store_explicit((device metal::atomic_float*)pacc + ((size_t(qi) * H + head0 + idx / D) * S + sp) * D + idx % D, 0.0f, metal::memory_order_relaxed);
+  if (tid < 16) {
+    const size_t at = (size_t(qi) * H + head0 + int(tid)) * S + sp;
+    metal::atomic_store_explicit((device metal::atomic_float*)pm + at, -INFINITY, metal::memory_order_relaxed);
+    metal::atomic_store_explicit((device metal::atomic_float*)pl + at, 0.0f, metal::memory_order_relaxed);
+  }
+  DSV41_MERGE_LAST();
+#else
   for (int idx = int(tid); idx < 16 * D; idx += 128)
     pacc[((size_t(qi) * H + head0 + idx / D) * S + sp) * D + idx % D] = 0.0f;
   if (tid < 16) {
@@ -30,6 +95,7 @@ if (tile_keys == 0) {
     pm[at] = -INFINITY;
     pl[at] = 0.0f;
   }
+#endif
   return;
 }
 
@@ -204,14 +270,33 @@ for (short i = 0; i < 2; ++i) {
   device float* orow = pacc + at * D + sg * 128 + fn;
   for (short tn = 0; tn < 2; ++tn) {
     const short e = tn * 8 + i * 4;
+#if DSV41_ATTN_MERGE
+    // The last split reads these from another core: atomic stores reach L2.
+    device metal::atomic_float* oa = (device metal::atomic_float*)orow;
+    for (short q = 0; q < 4; ++q) {
+      metal::atomic_store_explicit(oa + tn * 16 + q, o0[e + q], metal::memory_order_relaxed);
+      metal::atomic_store_explicit(oa + 32 + tn * 16 + q, o1[e + q], metal::memory_order_relaxed);
+      metal::atomic_store_explicit(oa + 64 + tn * 16 + q, o2[e + q], metal::memory_order_relaxed);
+      metal::atomic_store_explicit(oa + 96 + tn * 16 + q, o3[e + q], metal::memory_order_relaxed);
+    }
+#else
     *(device float4*)(orow + tn * 16) = float4(o0[e], o0[e + 1], o0[e + 2], o0[e + 3]);
     *(device float4*)(orow + 32 + tn * 16) = float4(o1[e], o1[e + 1], o1[e + 2], o1[e + 3]);
     *(device float4*)(orow + 64 + tn * 16) = float4(o2[e], o2[e + 1], o2[e + 2], o2[e + 3]);
     *(device float4*)(orow + 96 + tn * 16) = float4(o3[e], o3[e + 1], o3[e + 2], o3[e + 3]);
+#endif
   }
   if (sg == 0 && row_writer) {
     const float l = ((red_sum[0][r] + red_sum[1][r]) + red_sum[2][r]) + red_sum[3][r];
+#if DSV41_ATTN_MERGE
+    metal::atomic_store_explicit((device metal::atomic_float*)pm + at, l > 0.0f ? mn[i] : -INFINITY, metal::memory_order_relaxed);
+    metal::atomic_store_explicit((device metal::atomic_float*)pl + at, l, metal::memory_order_relaxed);
+#else
     pm[at] = l > 0.0f ? mn[i] : -INFINITY;
     pl[at] = l;
+#endif
   }
 }
+#if DSV41_ATTN_MERGE
+DSV41_MERGE_LAST();
+#endif
