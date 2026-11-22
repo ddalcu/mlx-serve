@@ -53,9 +53,13 @@ pub fn build(limit: f32) !Kernels {
     return .{ .up = up, .down = down, .down_order = down_order, .lim = mlx.mlx_array_new_data(&[_]f32{limit}, &[_]c_int{1}, 1, .float32) };
 }
 
-/// `MLX_SERVE_DSV41_MOE_DOWN_ORDER` (read each call): =1 a verify's down launch runs its threadgroups column block
-/// major, a block's rows adjacent; one row is the same launch either way.
+/// `MLX_SERVE_DSV41_MOE_DOWN_ORDER` (read each call): =1 a verify's down launch of `order_min_rows` rows or more runs
+/// its threadgroups column block major, a block's rows adjacent; one row is the same launch either way.
 var order_logged: std.atomic.Value(bool) = .init(false);
+
+/// The layers ubench (nvfp4 with per-expert scales, against the control's levers): 2 rows +0.3% a layer, 3 rows -0.15%,
+/// 4..6 rows -0.8% to -2.1%.
+pub const order_min_rows = 3;
 
 pub fn orderOn() bool {
     return env.on(.MLX_SERVE_DSV41_MOE_DOWN_ORDER);
@@ -222,7 +226,7 @@ pub fn moeDown(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A, 
 
 /// The down launch over arrays already checked.
 pub fn runDown(sc: *dsv41.Scope, kern: Kernels, f: fp4.Format, R: usize, K: usize, N: usize, topk: usize, hc: usize, nc: usize, act: A, w: A, scales: A, sw: A, sscales: A, idx: A, x1: A, post: A, comb: A) !A {
-    const order = R > 1 and orderOn();
+    const order = R >= order_min_rows and orderOn();
     if (order and !order_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info("[dsv41] MLX_SERVE_DSV41_MOE_DOWN_ORDER engaged\n", .{});
     return launchDown(sc, if (order) kern.down_order else kern.down, order, f, R, K, N, topk, hc, nc, act, w, scales, sw, sscales, idx, x1, post, comb);
 }
