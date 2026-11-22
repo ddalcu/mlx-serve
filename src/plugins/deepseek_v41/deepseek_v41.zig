@@ -89,6 +89,10 @@ const mpair = @import("prompt/moe_pair.zig");
 const hv2 = @import("prompt/hc_v2.zig");
 /// moe_tail.zig: a resident wide layer's MoE combine and hc expand in one launch (`MLX_SERVE_DSV41_MOE_TAIL`).
 const mtail = @import("prompt/moe_tail.zig");
+/// pf_route.zig: a prompt call's routed pairs sorted by a counting sort (`MLX_SERVE_DSV41_PF_MOE_EPI`).
+const pfroute = @import("prompt/pf_route.zig");
+/// idx_nax.zig: a wide span's indexer scores on the matrix units (`MLX_SERVE_DSV41_PF_IDX_NAX`).
+const idx_nax = @import("prompt/idx_nax.zig");
 /// launch fusions, each behind its own default-off switch (`Dsv41Model.fuse`).
 const fusion = @import("fuse.zig");
 const Shard = @import("../../sdk/weights/shard.zig").Shard;
@@ -3636,7 +3640,7 @@ pub fn indexScores(sc: *Scope, m: *const Dsv41Model, q: A, keys: A, weights: A, 
     const ih = dim(q, 1);
     const ihd = dim(q, 2);
     if (dim(q, 0) > region_rows and dim(keys, 0) > 0 and ih % 8 == 0 and ih <= 128 and ihd % 8 == 0)
-        return indexScoresTiled(sc, m, q, keys, weights, wscale, p0, ratio);
+        return (try idx_nax.scores(sc, q, keys, weights, wscale, p0, ratio)) orelse indexScoresTiled(sc, m, q, keys, weights, wscale, p0, ratio);
     return indexScoresScalar(sc, m, q, keys, weights, wscale, p0, ratio);
 }
 
@@ -4664,14 +4668,25 @@ pub fn moePrefillParts(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A,
     const e = &ly.experts;
     const dt = mlx.mlx_array_dtype(x);
     const flat = try sc.reshape(try sc.astype(idx, .uint32), &.{ci(n)});
-    var oo = mlx.mlx_array_new();
-    const order = try sc.res(mlx.mlx_argsort_axis(&oo, flat, 0, sc.s), &oo);
-    var oi = mlx.mlx_array_new();
-    const inv = try sc.res(mlx.mlx_argsort_axis(&oi, order, 0, sc.s), &oi);
-    const rows = try sc.op2(mlx.mlx_floor_divide, order, try sc.u(@intCast(k)));
-    const sidx = try sc.take(flat, order, 0);
+    // The pack's expert count is the down bank's: every layout stacks its experts on axis 0 (a tensor rank holds half of
+    // every expert), and a caller that builds the banks alone leaves the router's `gate_w` unset.
+    const pack_on = env.onUnlessZero(.MLX_SERVE_DSV41_PF_MOE_EPI) and e.down.w.ctx != null;
+    const sp = (if (pack_on) try pfroute.pack(sc, flat, try sc.reshape(wts, &.{ci(n)}), k, dim(e.down.w, 0)) else null) orelse blk: {
+        var oo = mlx.mlx_array_new();
+        const order = try sc.res(mlx.mlx_argsort_axis(&oo, flat, 0, sc.s), &oo);
+        var oi = mlx.mlx_array_new();
+        break :blk pfroute.Sorted{
+            .inv = try sc.res(mlx.mlx_argsort_axis(&oi, order, 0, sc.s), &oi),
+            .rows = try sc.op2(mlx.mlx_floor_divide, order, try sc.u(@intCast(k))),
+            .sidx = try sc.take(flat, order, 0),
+            .w = try sc.take(try sc.reshape(wts, &.{ci(n)}), order, 0),
+        };
+    };
+    const inv = sp.inv;
+    const rows = sp.rows;
+    const sidx = sp.sidx;
     const x3 = try sc.reshape(x, &.{ ci(L), 1, ci(d) });
-    const w_sorted = try sc.take(try sc.reshape(wts, &.{ci(n)}), order, 0);
+    const w_sorted = sp.w;
     const act = if (try mpair.act(sc, m, e, x3, rows, sidx, w_sorted)) |a| a else if (try gateUpPaired(sc, m, e, x3, rows, sidx)) |a| blk: {
         // The routing weight on the activation, as the split path's kernel applies it.
         const inter = dim(a, -1);
@@ -6146,7 +6161,9 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     defer sc.deinit();
     const parts = try gpa.alloc(A, n_spans);
     defer gpa.free(parts);
-    for (parts, 0..) |*p, k| p.* = try spanIn(&sc, m, gpa, sp, li, k);
+    if (!try engramPass(&sc, m, gpa, sp, li, parts)) {
+        for (parts, 0..) |*p, k| p.* = try spanIn(&sc, m, gpa, sp, li, k);
+    }
     // The last wide layer's whole stream and mix when every span still holds its rows of them (this layer writes no
     // Engram rows, and nothing replaced a span since): the same words, no copy.
     const whole = sp.whole.len == 2 and sp.whole[0].ctx != null and (for (parts, sp.xs) |p, sx| {
@@ -6502,12 +6519,7 @@ pub fn spanInAt(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const S
             fused = try fusion.engramWrite(sc, m, e, raw, x);
             if (fused != null) break :blk none;
             break :blk try sc.keep(try e.table.dequantTo(raw, (hi - lo) * nc, fusion.engramRowsDtype(m, &e.table), sc.s));
-        } else blk: {
-            const mine = try gpa.alloc(u32, (hi - lo) * nc);
-            defer gpa.free(mine);
-            for (lo..hi) |t| @memcpy(mine[(t - lo) * nc ..][0..nc], sp.eng_ids[(t * m.engrams.len + ek) * nc ..][0..nc]);
-            break :blk try sc.keep(try e.table.gather(gpa, mine, sc.s));
-        };
+        } else try engramGathered(sc, m, gpa, sp, e, ek, lo, hi);
         const y = fused orelse try engramWrite(sc, m, e, x, try sc.reshape(rows, &.{ ci(hi - lo), -1 }), verify);
         // An image span's rows get no Engram write (the reference shuts their gate).
         x = if (sp.img.ctx != null) try sc.where(try sc.expand(try sc.expand(try sp.imgSlice(sc, lo, hi), -1), -1), x, y) else y;
@@ -6518,6 +6530,68 @@ pub fn spanInAt(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const S
     };
     return x;
 }
+
+/// Span rows [lo, hi)'s Engram rows of table `ek` gathered from the table (no prefetch).
+fn engramGathered(sc: *Scope, m: *const Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, e: *const EngramLayer, ek: usize, lo: usize, hi: usize) !A {
+    const nc = sp.ncols;
+    const mine = try gpa.alloc(u32, (hi - lo) * nc);
+    defer gpa.free(mine);
+    for (lo..hi) |t| @memcpy(mine[(t - lo) * nc ..][0..nc], sp.eng_ids[(t * m.engrams.len + ek) * nc ..][0..nc]);
+    return sc.keep(try e.table.gather(gpa, mine, sc.s));
+}
+
+/// `MLX_SERVE_DSV41_PF_ENGRAM_PASS`: every span's stream entering Engram layer `li` (`spanIn`'s words but for the
+/// sums' order) into `parts`, the layer's `wkv` run once over each run of `woa.spansPer` spans' rows (M = the run's
+/// rows, not a span's 256) and the gate span by span on its slice; false (nothing taken) where it declines: the
+/// switch off, a fused Engram read, a batch, a trace, a DSpark target, a CPU stream, not one Engram table a layer.
+fn engramPass(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, li: usize, parts: []A) !bool {
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_ENGRAM_PASS) or !mlx.streamIsGpu(sc.s) or m.fuse.engram or m.trace != null) return false;
+    if (sp.eng_gpu.ctx != null or sp.offs.len > 0 or (m.n_mtp > 0 and m.dsparkTarget(li) != null)) return false;
+    var found: ?usize = null;
+    for (m.engrams, 0..) |*e, ek| if (e.layer == li) {
+        if (found != null) return false;
+        found = ek;
+    };
+    const ek = found orelse return false;
+    const e = &m.engrams[ek];
+    if (!engram_pass_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_ENGRAM_PASS engaged (layer {d}, spans {d})\n", .{ li, sp.xs.len });
+    const per = woa.spansPer(sp.span);
+    var k0: usize = 0;
+    while (k0 < sp.xs.len) : (k0 += per) {
+        const k1 = @min(sp.xs.len, k0 + per);
+        const rows = try gpa.alloc(A, k1 - k0);
+        defer gpa.free(rows);
+        for (k0..k1, rows) |k, *r| {
+            const lo, const hi = sp.bounds(k);
+            const raw_rows = if (sp.prefetch) |pf| blk: {
+                const raw = try pf.take(sp.p0, ek, k);
+                defer raw.deinit(gpa);
+                break :blk try sc.keep(try e.table.dequantTo(raw, (hi - lo) * sp.ncols, fusion.engramRowsDtype(m, &e.table), sc.s));
+            } else try engramGathered(sc, m, gpa, sp, e, ek, lo, hi);
+            r.* = try sc.astype(try sc.reshape(raw_rows, &.{ ci(hi - lo), -1 }), m.act);
+        }
+        try engramRun(sc, m, e, sp.xs[k0..k1], rows, parts[k0..k1]);
+        // An image span's rows get no Engram write (the reference shuts their gate).
+        if (sp.img.ctx != null) for (k0..k1) |k| {
+            const lo, const hi = sp.bounds(k);
+            parts[k] = try sc.where(try sc.expand(try sc.expand(try sp.imgSlice(sc, lo, hi), -1), -1), sp.xs[k], parts[k]);
+        };
+    }
+    return true;
+}
+
+/// One run's Engram writes: the spans' rows `rows` (activation dtype) through one `wkv`, each span's stream `xs[k]`
+/// gated on its slice of it into `out[k]`.
+fn engramRun(sc: *Scope, m: *const Dsv41Model, e: *const EngramLayer, xs: []const A, rows: []const A, out: []A) !void {
+    const kv = try engramWkv(sc, e, if (rows.len == 1) rows[0] else try sc.concat(rows, 0));
+    var at: usize = 0;
+    for (xs, rows, out) |x, r, *o| {
+        const n = dim(r, 0);
+        o.* = try engramGate(sc, m, e.qk, x, try sc.slice(kv, 0, at, at + n));
+        at += n;
+    }
+}
+var engram_pass_logged: std.atomic.Value(bool) = .init(false);
 
 // ── compiled decode stretches ────────────────────────────────────────────
 
@@ -11270,4 +11344,111 @@ test "deepseek_v41 engram room: the file cache a load leaves behind does not kee
     // The same memory as anonymous pages is in use: no room.
     system.reading_override = system.plantVm(total, 16384, .{ .wired = 6 * t10, .anonymous = 3 * t10, .compressor = 0, .purgeable = 0, .file = 0 });
     try std.testing.expect(!engramRoom(t10));
+}
+
+/// A run of 16 spans' Engram inputs at the release's shapes: wkv mxfp8 [25600, 6144], streams [256, 4, 5120] bf16,
+/// rows [256, 6144] bf16, qk [4, 5120] f32 (caller frees through `sc`).
+const EngramRunCase = struct {
+    e: EngramLayer,
+    xs: [16]A,
+    rows: [16]A,
+
+    fn init(sc: *Scope, fx: *dkern.fixture.Fixture) !EngramRunCase {
+        var c: EngramRunCase = undefined;
+        const w = try sc.keep(try fx.normal(&.{ 25600, 6144 }, .bfloat16, 0, 1.0 / @sqrt(6144.0)));
+        const q = try dkern.fixture.quantize(w, 32, 8, "mxfp8");
+        for (q) |a| if (a.ctx != null) {
+            _ = try sc.keep(a);
+        };
+        c.e = .{ .layer = 1, .wkv = .{ .w = q[0], .s = q[1], .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } }, .qk = try sc.keep(try fx.normal(&.{ 4, 5120 }, .float32, 1, 0.1)), .table = undefined };
+        for (&c.xs, &c.rows) |*x, *r| {
+            x.* = try sc.keep(try fx.normal(&.{ 256, 4, 5120 }, .bfloat16, 0, 1));
+            r.* = try sc.keep(try fx.normal(&.{ 256, 6144 }, .bfloat16, 0, 1));
+        }
+        return c;
+    }
+};
+
+fn wordsOf(xs: []const A) ![]u8 {
+    var all: std.ArrayList(u8) = .empty;
+    errdefer all.deinit(std.testing.allocator);
+    for (xs) |x| {
+        var c = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(c);
+        try mlx.check(mlx.mlx_contiguous(&c, x, false, mlx.gpuStream()));
+        try mlx.check(mlx.mlx_array_eval(c));
+        const p = mlx.mlx_array_data_uint8(c) orelse return error.NoData;
+        try all.appendSlice(std.testing.allocator, p[0 .. mlx.mlx_array_size(c) * mlx.mlx_array_itemsize(c)]);
+    }
+    return all.toOwnedSlice(std.testing.allocator);
+}
+
+test "dsv41 pf engram pass: a run of 16 spans' wkv in one call and each span's gate on its slice are the span-by-span engramApply's words at the release's shapes; rows handed to the wrong span fail" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try dkern.fixture.Fixture.init(gpa, .{ .lo = 2, .hi = 3, .ctx = 0 });
+    defer fx.deinit();
+    // The served resident path: mxfp8 linears stay on MLX's quantized matmul at every width (`fuse.mxfp8_qmm`).
+    const saved = fusion.ps().mxfp8_qmm;
+    defer fusion.ps().mxfp8_qmm = saved;
+    fusion.ps().mxfp8_qmm = true;
+    var sc = Scope.init(gpa, fx.m.s);
+    defer sc.deinit();
+    const c = try EngramRunCase.init(&sc, fx);
+    var want: [16]A = undefined;
+    for (&want, c.xs, c.rows) |*o, x, r| o.* = try engramApply(&sc, fx.m, &c.e, x, r);
+    var got: [16]A = undefined;
+    try engramRun(&sc, fx.m, &c.e, &c.xs, &c.rows, &got);
+    const ww = try wordsOf(&want);
+    defer gpa.free(ww);
+    const gw = try wordsOf(&got);
+    defer gpa.free(gw);
+    try std.testing.expectEqualSlices(u8, ww, gw);
+    // The planted bug: spans 3 and 4's rows swapped.
+    var bad_rows = c.rows;
+    std.mem.swap(A, &bad_rows[3], &bad_rows[4]);
+    var bad: [16]A = undefined;
+    try engramRun(&sc, fx.m, &c.e, &c.xs, &bad_rows, &bad);
+    const bw = try wordsOf(&bad);
+    defer gpa.free(bw);
+    try std.testing.expect(!std.mem.eql(u8, ww, bw));
+}
+
+/// `n` (at most 4) copies of a run's Engram writes, as one `engramRun` (or span by span, `replaced`), all evaluated at
+/// once.
+const EngramRunBench = struct {
+    m: *const Dsv41Model,
+    c: *const EngramRunCase,
+    n: usize,
+    replaced: bool,
+    pub fn build(b: @This(), sc: *Scope) ![64]A {
+        var outs: [64]A = @splat(none);
+        for (0..b.n) |i| {
+            const o = outs[16 * i ..][0..16];
+            if (b.replaced) {
+                for (o, b.c.xs, b.c.rows) |*y, x, r| y.* = try engramApply(sc, b.m, &b.c.e, x, r);
+            } else try engramRun(sc, b.m, &b.c.e, &b.c.xs, &b.c.rows, o);
+        }
+        return outs;
+    }
+};
+
+test "dsv41 pf engram pass: ubench, a 4096-row run's wkv and gates against 16 span-by-span calls" {
+    if (!dkern.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try dkern.fixture.Fixture.init(gpa, .{ .lo = 2, .hi = 3, .ctx = 0 });
+    defer fx.deinit();
+    // The served resident path: mxfp8 linears stay on MLX's quantized matmul at every width (`fuse.mxfp8_qmm`).
+    const saved = fusion.ps().mxfp8_qmm;
+    defer fusion.ps().mxfp8_qmm = saved;
+    fusion.ps().mxfp8_qmm = true;
+    var sc = Scope.init(gpa, fx.m.s);
+    defer sc.deinit();
+    const c = try EngramRunCase.init(&sc, fx);
+    var b: EngramRunBench = .{ .m = fx.m, .c = &c, .n = 4, .replaced = false };
+    const us = try dkern.idx_score.evalTotalUs(gpa, fx.m.s, b) / 4;
+    b.replaced = true;
+    const chain = try dkern.idx_score.evalTotalUs(gpa, fx.m.s, b) / 4;
+    const flop: f64 = 2.0 * 4096 * 25600 * 6144;
+    std.debug.print("[pf-ubench] engram pass 4096 rows: {d:.0} us ({d:.1} TFLOPS of wkv, {d:.0}% of the 120 TFLOPS floor {d:.0} us), span by span {d:.0} us ({d:.1} TFLOPS)\n", .{ us, flop / us / 1e6, 100 * flop / 120e6 / us, flop / 120e6, chain, flop / chain / 1e6 });
 }
