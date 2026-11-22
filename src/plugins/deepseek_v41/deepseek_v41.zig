@@ -10150,7 +10150,7 @@ fn passClose(label: []const u8, want: *const PassArm, got: *const PassArm, sprea
     return ok;
 }
 
-test "dsv41 pass size: on a real pack the pass plan's prefill (near-equal passes, one MoE call each, no lead) is within the default plan's own spread across its cuts, one pass or two, and with its MoE cut as a cut with no chunk under 1,707 rows that cut's bits; a planted cut that repeats a boundary row fails (DSV41_PASS_EQ)" {
+test "dsv41 pass size: on a real pack the pass plan's prefill (near-equal passes, one MoE call each, no lead) is within the default plan's own spread across its cuts, one pass or two, and dropping the lead moves no word; a planted cut that repeats a boundary row fails (DSV41_PASS_EQ)" {
     // DSV41_PASS_EQ = a pack dir; DSV41_PASS_EQ_CTX prompt tokens (default 17639); DSV41_PASS_EQ_TEXT a text file whose
     // tokens, cycled, make the prompt (default: a fixed id walk).
     const dir = std.mem.span(std.c.getenv("DSV41_PASS_EQ") orelse return error.SkipZigTest);
@@ -10238,21 +10238,20 @@ test "dsv41 pass size: on a real pack the pass plan's prefill (near-equal passes
         std.debug.print("[dsv41-pass] {s}: the default plan's bits at {d}: {}\n", .{ label, wide_cut, try passSame(&alt, &got) });
         if (!try passClose(label, &want, &got, &own, k == 0)) ok = false;
     }
-    // Where the pass plan's words leave that cut's: the one pass with its MoE cut into that cut's calls (`moe_rows` at
-    // `wide_cut`) must be that cut's bits, so the one MoE call over the pass (the expert tiles' rows) is all that moves
-    // them; the cut itself with no lead is printed.
+    // Dropping the lead moves no word: the cut with no lead is its bits with the lead. Printed, not held: the one pass
+    // with its MoE in that cut's calls against that cut (a launch past 8192 rows rounds some stage in another order).
     {
-        m.moe_rows = wide_cut;
-        defer m.moe_rows = PASS_MOE_ROWS;
-        var d1 = try passArm(m, prompt, try Plan.of(&cuts, rows, rows));
-        defer d1.deinit();
-        const same = try passSame(&alt, &d1);
-        std.debug.print("[dsv41-pass] one pass, the MoE in {d}-row calls: the default plan's bits at {d}: {}\n", .{ wide_cut, wide_cut, same });
-        if (!same) ok = false;
         m.moe_rows = MOE_ROWS;
+        defer m.moe_rows = PASS_MOE_ROWS;
         var d2 = try passArm(m, prompt, try Plan.of(&cuts, rows, wide_cut));
         defer d2.deinit();
-        std.debug.print("[dsv41-pass] the {d} cut with no lead, the MoE at 8192: its bits with the lead: {}\n", .{ wide_cut, try passSame(&alt, &d2) });
+        const same = try passSame(&alt, &d2);
+        std.debug.print("[dsv41-pass] the {d} cut with no lead, the MoE at 8192: its bits with the lead: {}\n", .{ wide_cut, same });
+        if (!same) ok = false;
+        m.moe_rows = wide_cut;
+        var d1 = try passArm(m, prompt, try Plan.of(&cuts, rows, rows));
+        defer d1.deinit();
+        std.debug.print("[dsv41-pass] one pass, the MoE in {d}-row calls: the default plan's bits at {d}: {}\n", .{ wide_cut, wide_cut, try passSame(&alt, &d1) });
     }
     // Planted: the two passes, the second starting one row early (its first row the first pass's last again) and
     // ending one row early, so the position reached is the same.
