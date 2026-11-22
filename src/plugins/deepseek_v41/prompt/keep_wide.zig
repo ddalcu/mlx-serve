@@ -184,7 +184,9 @@ pub fn passEnd() void {
 /// The model's unload: the reserve's buffers released (MLX disarmed), the next load decides again.
 pub fn disarm() void {
     if (ps().armed) if (ps().reserve_fn) |f| {
+        const was = stats();
         _ = f(0, null, 0);
+        log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE: the reserve's {d} buffers ({d} MB) released; {d} left\n", .{ was.buffers, was.bytes >> 20, stats().buffers });
     };
     ps().armed = false;
     ps().decided = false;
