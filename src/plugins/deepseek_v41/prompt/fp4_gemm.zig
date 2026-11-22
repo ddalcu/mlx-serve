@@ -14,7 +14,7 @@ const dsv41 = @import("../deepseek_v41.zig");
 const A = mlx.mlx_array;
 
 pub fn on() bool {
-    return env.on(.MLX_SERVE_DSV41_PF_FP4_GEMM);
+    return env.onUnlessZero(.MLX_SERVE_DSV41_PF_FP4_GEMM);
 }
 
 /// `gather_nax.sortedGateUpRouted`'s output on the staged schedule, for the caller to keep; null where it declines (the
