@@ -126,10 +126,10 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     const run_step = b.step("run", "Run mlx-serve");
     run_step.dependOn(&run_cmd.step);
 
-    const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
+    const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this substring (repeat it: a test runs if it matches any)") orelse &.{};
     const unit_tests = b.addTest(.{
         .root_module = mods[1],
-        .filters = if (test_filter) |f| &.{f} else &.{},
+        .filters = test_filters,
         .test_runner = .{ .path = b.path("build/test_runner.zig"), .mode = .server },
     });
     const test_step = b.step("test", "Run unit tests");
@@ -137,7 +137,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     if (builtin.os.tag != .windows) test_step.dependOn(&b.top_level_steps.get("unit-closure").?.step);
     const run_unit_tests = b.addRunArtifact(unit_tests);
     // Rerun every time when filtered, as on macOS (env-gated tests).
-    if (test_filter != null) run_unit_tests.has_side_effects = true;
+    if (test_filters.len != 0) run_unit_tests.has_side_effects = true;
     test_step.dependOn(&run_unit_tests.step);
 }
 

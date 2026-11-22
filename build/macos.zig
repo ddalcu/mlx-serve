@@ -257,13 +257,15 @@ pub const Tests = struct {
     build: *std.Build.Step,
     /// The unit-test binary's shard runs.
     runs: []const *std.Build.Step.Run,
-    filter: ?[]const u8,
+    /// `-Dtest-filter`, once or repeated: a test runs when its name contains any of them; empty = every test.
+    filters: []const []const u8,
 };
 
 /// `test-build` and `test`: the unit tests, plus the plugins' own tests, the lint's and the import closure check.
 pub fn addUnitTests(g: *const Graph) Tests {
     const b = g.b;
-    const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
+    // Repeat `-Dtest-filter` to run several groups from ONE compile (a test runs when it matches any of them).
+    const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this substring (repeat it: a test runs if it matches any)") orelse &.{};
     const qwen_preprocess_fixture = b.option(
         []const u8,
         "qwen-preprocess-fixture",
@@ -271,16 +273,17 @@ pub fn addUnitTests(g: *const Graph) Tests {
     );
     const unit_tests = b.addTest(.{
         .root_module = g.test_mod,
-        .filters = if (test_filter) |f| &.{f} else &.{},
+        .filters = test_filters,
         .test_runner = .{ .path = b.path("build/test_runner.zig"), .mode = .server },
     });
 
     const test_build = b.step("test-build", "Compile unit tests without running them");
     test_build.dependOn(&b.addInstallArtifact(unit_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
 
-    // The one test binary runs as `test-shards` processes in parallel, each every n-th test (build/test_runner.zig);
-    // a filtered run is one process.
-    const shards: u32 = if (test_filter != null) 1 else b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse defaultShards();
+    // The one test binary runs as `test-shards` processes in parallel, each every n-th test (build/test_runner.zig),
+    // filtered or not: a `sharded:` test (the kernel contract's gates 1-4) splits its own work across them, so a
+    // filtered contract run takes a shard's time, not the whole registry's on one core. `-Dtest-shards=1`: one process.
+    const shards: u32 = b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse defaultShards();
     const test_runs = b.allocator.alloc(*std.Build.Step.Run, shards) catch @panic("OOM");
     const test_step = b.step("test", "Run unit tests");
     // A Run step given an env var copies the WHOLE configure-time environment into the cached configuration, so the
@@ -294,7 +297,7 @@ pub fn addUnitTests(g: *const Graph) Tests {
         }
         // A filtered run is a targeted one, often gated on an env var (ANE_TEST_PACK, QWEN4_TEST_MODEL)
         // that the run's cache key does not see: it reruns every time.
-        if (test_filter != null) run.*.has_side_effects = true;
+        if (test_filters.len != 0) run.*.has_side_effects = true;
         if (qwen_preprocess_fixture) |fixture| {
             run.*.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
             run.*.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
@@ -307,7 +310,15 @@ pub fn addUnitTests(g: *const Graph) Tests {
     config.addTests(b, test_step);
     test_step.dependOn(&b.top_level_steps.get("lint-test").?.step);
     test_step.dependOn(&b.top_level_steps.get("unit-closure").?.step);
-    return .{ .step = test_step, .build = test_build, .runs = test_runs, .filter = test_filter };
+    return .{ .step = test_step, .build = test_build, .runs = test_runs, .filters = test_filters };
+}
+
+/// `test-compile`: what the unit-test runs need (the binary, the kit plugins they load), built with no test run. A gate
+/// compiles off the GPU (in parallel with other compiles), then `test` with the same options finds it all cached and only
+/// runs. Wired after `kit.add`, which hangs the kit plugins' builds on the runs.
+pub fn addTestCompile(b: *std.Build, tests: Tests) void {
+    const step = b.step("test-compile", "Build everything the unit-test runs need, running no test");
+    for (tests.runs[0].step.dependencies.items) |d| step.dependOn(d);
 }
 
 /// Every shard holds its own GPU tests' memory, and the heaviest (dsv41 moe_down) wants ~10 GB: a 16 GB Mac hung with
@@ -328,7 +339,7 @@ pub fn addPluginTests(g: *const Graph, tests: Tests) void {
         libs.addMlxLib(b, host);
         if (g.host.frameworks) |fw| host.addFrameworkPath(.{ .cwd_relative = fw });
         for ([_][]const u8{ "IOKit", "CoreFoundation", "Foundation", "Metal", "IOSurface" }) |f| host.linkFramework(f, .{});
-        const t = b.addTest(.{ .name = "exl3-test", .root_module = libs.addExl3Module(b, host, g.target, opt), .filters = if (tests.filter) |f| &.{f} else &.{} });
+        const t = b.addTest(.{ .name = "exl3-test", .root_module = libs.addExl3Module(b, host, g.target, opt), .filters = tests.filters });
         tests.build.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         // ~13 min and 14 GB: its own step, run at phase gates, outside `zig build test`.
         b.step("exl3-test", "Run the in-tree EXL3/STQ (sushi) tests").dependOn(&b.addRunArtifact(t).step);
