@@ -1516,7 +1516,7 @@ const HcV2Mix = struct {
                     if (e + 1 == expands(k.p)) last[i * D + d] = v;
                     st[i * D + d] = bf(v);
                     sm[i * D + d] = m;
-                    se[i * D + d] = er + 0x1p-8 * @abs(v);
+                    se[i * D + d] = er + 0x1p-7 * @abs(v);
                 }
             }
         }
@@ -1551,7 +1551,7 @@ const HcV2Mix = struct {
             if (expands(k.p) == 2) for (0..HC * D) |q| {
                 out[xo + l * HC * D + q] = last[q];
                 // The stored x2's own rounding is the bound's; the spread before it is x1's.
-                mag[xo + l * HC * D + q] = sm[q] + (se[q] - 0x1p-8 * @abs(last[q])) * per;
+                mag[xo + l * HC * D + q] = sm[q] + (se[q] - 0x1p-7 * @abs(last[q])) * per;
             };
             if (!mixes(k.p)) continue;
             const cpre = k.in(k.n_in - 2);
@@ -1567,7 +1567,7 @@ const HcV2Mix = struct {
                 out[ho + l * D + d] = h;
                 mag[ho + l * D + d] = m + er * per;
                 hb[d] = bf(h);
-                hb[D + d] = er + 0x1p-8 * @abs(h);
+                hb[D + d] = er + 0x1p-7 * @abs(h);
             }
             for (0..S) |sl| {
                 const base = po + (sl * L + l) * hv2.PW;
@@ -1695,11 +1695,20 @@ const HcV2Fin = struct {
             }
             splitRow(&zr, spec.roundTo(.f32, EPS_HC), sum, &pk);
             const po = L * MIX;
+            // The mixes' own error moves the split: sigmoid' <= 1/4, 2 sigmoid' <= 1/2, and the Sinkhorn of exp(z)
+            // (each normalization contracting) by at most its row's largest comb-mix error, taken 4 times.
+            var zc: f64 = 0;
+            for (2 * HC..MIX) |m| zc = @max(zc, mag[l * MIX + m]);
             for (0..HC) |j| {
                 out[po + l * HC + j] = pk[j];
+                mag[po + l * HC + j] = @abs(pk[j]) + mag[l * MIX + j] / 4;
                 out[po + L * HC + l * HC + j] = pk[HC + j];
+                mag[po + L * HC + l * HC + j] = @abs(pk[HC + j]) + mag[l * MIX + HC + j] / 2;
             }
-            for (0..HC * HC) |q| out[po + 2 * L * HC + l * HC * HC + q] = pk[2 * HC + q];
+            for (0..HC * HC) |q| {
+                out[po + 2 * L * HC + l * HC * HC + q] = pk[2 * HC + q];
+                mag[po + 2 * L * HC + l * HC * HC + q] = @abs(pk[2 * HC + q]) + 4 * zc;
+            }
             for (0..S) |sl| t[sl] = part[(sl * L + l) * hv2.PW + MIX + 1];
             const inv = 1 / @sqrt(sum.of(t[0..S]) / @as(f64, @floatFromInt(D)) + eps0);
             for (0..D) |d| {
@@ -1707,9 +1716,13 @@ const HcV2Fin = struct {
                 mag[ho + l * D + d] = @abs(out[ho + l * D + d]);
             }
         }
-        for (L * MIX..ho) |i| mag[i] = @abs(out[i]);
     }
 };
+
+/// hc_v2_fin's longest chain: the slices' sums, then the split's four-term sums.
+fn depthFin(s: Shape) usize {
+    return hv2.slicesFor(s.rows) + HC;
+}
 
 // ── decode/gemv_twin.zig: MLX's one-row gemv over a verify's rows, each row its one-row words ──
 
@@ -5002,6 +5015,9 @@ fn registerStreamed(set: *kc.Set) !void {
         .sums = fused_sums,
     });
     const mix_norm_served: []const Shape = &.{ .{ .rows = 17, .n = DIM, .k = HC * DIM }, .{ .rows = 64, .n = DIM, .k = HC * DIM } };
+    const v2_outs_tail: []const spec.Part = &.{ .{ .elem = .bf16, .count = HcV2Mix.rowsX }, .{ .elem = .bf16, .count = rowsN }, .{ .elem = .f32, .count = HcV2Mix.partCount } };
+    const v2_outs_mix: []const spec.Part = &.{ .{ .elem = .bf16, .count = rowsN }, .{ .elem = .f32, .count = HcV2Mix.partCount } };
+    const v2_outs_none: []const spec.Part = &.{};
     const hc_v2_served: []const Shape = &.{ .{ .rows = 17, .n = DIM, .k = HC * DIM }, .{ .rows = 130, .n = DIM, .k = HC * DIM } };
     inline for (.{ hv2.Pro.plain, hv2.Pro.ffn, hv2.Pro.tail, hv2.Pro.tail_only }) |p| try kit.add(set, HcV2Mix, &hc_v2_mix_l[@intFromEnum(p)], .{ .pro = p }, .{
         .name = "dsv41 hc_v2_mix (" ++ @tagName(p) ++ ": stream rows formed, collapsed and mixed in one pass)",
@@ -5010,7 +5026,7 @@ fn registerStreamed(set: *kc.Set) !void {
         .ops = 4,
         .mids = 3,
         .out = .bf16,
-        .outs = if (p == .tail) &.{ .{ .elem = .bf16, .count = HcV2Mix.rowsX }, .{ .elem = .bf16, .count = rowsN }, .{ .elem = .f32, .count = HcV2Mix.partCount } } else if (p == .tail_only) &.{} else &.{ .{ .elem = .bf16, .count = rowsN }, .{ .elem = .f32, .count = HcV2Mix.partCount } },
+        .outs = if (p == .tail) v2_outs_tail else if (p == .tail_only) v2_outs_none else v2_outs_mix,
         .tiles = .{ .{ .size = hv2.ROWS }, .{}, .{} },
         .served = hc_v2_served,
         .sums = fused_sums,
@@ -5018,9 +5034,9 @@ fn registerStreamed(set: *kc.Set) !void {
     try kit.add(set, HcV2Fin, &hc_v2_fin_l, .{}, .{
         .name = "dsv41 hc_v2_fin (slices into the mixes, the split and the normed collapse)",
         .accum = .f32,
-        .depth = depthHc,
+        .depth = depthFin,
         .ops = sinkhorn_ops + 8,
-        .mids = 1,
+        .mids = 2,
         .out = .f32,
         .outs = &.{ .{ .elem = .f32, .count = HcV2Fin.rowsSplit }, .{ .elem = .bf16, .count = rowsN } },
         .served = hc_v2_served,
