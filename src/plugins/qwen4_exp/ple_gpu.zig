@@ -58,8 +58,13 @@ pub fn chooseArm(mode: Mode, bits: u32, base: usize, len: usize, b: Budget) Arm 
     const bytes = std.mem.alignForward(u64, len, b.page);
     if (bytes > b.max_buffer) return .too_large;
     if (b.model_bytes +| bytes +| HEADROOM > b.working_set) return .low_memory;
-    if (mode == .auto and b.model_bytes +| bytes +| HEADROOM +| b.ctx_room > b.ram_total) return .auto_tight;
+    if (mode == .auto and !autoFits(b.ram_total, b.model_bytes, bytes, b.ctx_room)) return .auto_tight;
     return .gpu;
+}
+
+/// The auto arm's host-RAM test: weights + the table + headroom + one full context fit in RAM.
+fn autoFits(ram: u64, model_bytes: u64, table_bytes: u64, ctx_room: u64) bool {
+    return model_bytes +| table_bytes +| HEADROOM +| ctx_room <= ram;
 }
 
 /// The KV bytes the auto arm must leave free: the model's own context, at most `AUTO_CTX_TOKENS`.
@@ -71,7 +76,7 @@ pub fn autoCtxRoom(config: *const @import("../../sdk/config/model.zig").ModelCon
 /// The auto arm's host-RAM room test alone (no GPU gates), so the load-time bill can predict
 /// what `load` will choose before the Metal numbers are in hand.
 pub fn autoWouldEnable(model_bytes: u64, table_bytes: u64, ctx_room: u64) bool {
-    return model_bytes +| table_bytes +| HEADROOM +| ctx_room <= system.getTotalMemBytes();
+    return autoFits(system.getTotalMemBytes(), model_bytes, table_bytes, ctx_room);
 }
 
 fn kernelBits(bits: u32) bool {
