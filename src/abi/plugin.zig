@@ -373,7 +373,7 @@ pub const Shape = extern struct {
 };
 
 /// The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout.
-/// `flags` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
+/// `flags`, `state_per_token` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
 pub const Bill = extern struct {
     size: u32 = @sizeOf(Bill),
     kv_per_token: u64 = 0,

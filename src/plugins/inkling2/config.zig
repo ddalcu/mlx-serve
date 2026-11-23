@@ -82,6 +82,13 @@ pub const Draft = struct {
         const m = d.local orelse return false;
         return i < 32 and (m >> @intCast(i)) & 1 == 0;
     }
+
+    /// Bytes a slot's full layers keep per committed position: bf16 keys and values (`ContextKv.fk`, `fv`).
+    pub fn fullBytesPerToken(d: *const Draft) u64 {
+        var n: u64 = 0;
+        for (0..d.layers) |i| n += @intFromBool(d.full(i));
+        return n * d.kv_heads * d.head_dim * 2 * 2;
+    }
 };
 pub const max_taps = 8;
 
@@ -404,6 +411,13 @@ pub fn layout(p: *const abi.Parsed, span: ?*const abi.LayerSpan, out: [*]abi.Lay
     return n;
 }
 
+/// The bytes per token a slot's drafter keeps beside the KV (`Bill.state_per_token`): its full layers' context, billed
+/// wherever the head ships and the kernels are on, Apple9+ (`draftsOn`) or not.
+pub fn draftStatePerToken(p: *const abi.Parsed) u64 {
+    const d = of(p).draft orelse return 0;
+    return if (p.spec.native_stages > 0 and fusedOn()) d.fullBytesPerToken() else 0;
+}
+
 pub fn freeParsed(p: *abi.Parsed) callconv(.c) void {
     if (p.private) |ptr| {
         const c: *Config = @ptrCast(@alignCast(ptr));
@@ -509,6 +523,9 @@ test "inkling2 config: a draft head beside the pack declares its stages; one thi
             const dc = of(&p).draft.?;
             try testing.expectEqual(mask, dc.local);
             try testing.expectEqual([3]bool{ false, mask != null, false }, [3]bool{ dc.full(0), dc.full(1), dc.full(2) });
+            // One full layer: 2 KV heads x 16 x keys and values x bf16 a token.
+            const per_token: u64 = if (mask != null and fusedOn()) 2 * 16 * 2 * 2 else 0;
+            try testing.expectEqual(per_token, draftStatePerToken(&p));
         }
     }
     for ([_]Case{

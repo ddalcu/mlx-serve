@@ -1270,6 +1270,17 @@ test "inkling2 draft: a layer outside local_layer_ids reads every committed posi
         const ring_only = try d.draft(&g, t1, anchor, newest, 40, &head, V - 4, 30, null);
         try testing.expect(try parity.maxAbsDiffF32(full_read.confidence, ring_only.confidence, fx_stream) > 1e-4);
     }
+    // Full buffers that end before the draft (no push since): the full layer reads the ring, as a fresh context does.
+    d.cfg.local = 1;
+    var behind: draft.ContextKv = .{ .chunk = 8 };
+    defer behind.release();
+    try d.appendFull(&g, &behind, try g.sliceAxis(all, 1, 0, 18), 0);
+    _ = try d.draft(&g, t1, anchor, try g.sliceAxis(all, 1, 18 - keep, 18), 18, &head, V - 4, 30, &behind);
+    const ring = try g.sliceAxis(all, 1, 22 - keep, 22);
+    const got = try d.draft(&g, t1, anchor, ring, 22, &head, V - 4, 30, &behind);
+    const want = try d.draft(&g, t1, anchor, ring, 22, &head, V - 4, 30, null);
+    try expectClose(got.tokens, want.tokens, 0, "drafted tokens");
+    try expectClose(got.confidence, want.confidence, 1e-5, "draft probabilities");
 }
 
 // Bar: the cut a round verifies drafts down to follows what a verified row costs against a plain step, as measured

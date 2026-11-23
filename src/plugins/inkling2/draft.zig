@@ -175,12 +175,6 @@ pub const Drafter = struct {
         return if (at) |p| g.rope(h, @intCast(d.cfg.head_dim), d.cfg.theta, p) else h;
     }
 
-    /// Whether a layer reads `ContextKv`'s full context: one `mtp_config.local_layer_ids` leaves out.
-    pub fn fullContext(d: *const Drafter) bool {
-        for (0..d.layers.len) |i| if (d.cfg.full(i)) return true;
-        return false;
-    }
-
     /// Appends the full layers' context keys and values of the taps `[1, n, taps * hidden]` at positions `first`.. to
     /// `cc` (restarted when it ends elsewhere), queued on the GPU.
     pub fn appendFull(d: *const Drafter, g: *Graph, cc: *ContextKv, taps: Array, first: u64) !void {
@@ -278,16 +272,17 @@ pub const Drafter = struct {
                 vc = try lg.sliceAxis(cc.fv[i], 2, 0, n_full);
             };
             const full_read = kc.ctx != null;
-            if (full_read) {} else if (new32) |rows32| {
+            // A layer with no ring copy (a full one whose buffers end elsewhere) projects the whole ring.
+            const own: c_int = if (fresh < n and cache.?.k[i].ctx == null) n else fresh;
+            if (full_read) {} else if (own > 0) {
+                const rows32 = if (own == fresh) new32.? else try tapsOf(&lg, taps, 0, n, cfg.tap_count, hidden);
                 const context = try d.mix(&lg, rows32, @intCast(i), L.mix_norm);
-                kc = try d.heads(&lg, try project(&lg, &L.k_ctx, context), cfg.kv_heads, L.k_norm_ctx, position - fresh);
+                kc = try d.heads(&lg, try project(&lg, &L.k_ctx, context), cfg.kv_heads, L.k_norm_ctx, position - own);
                 vc = try d.heads(&lg, try project(&lg, &L.v_ctx, context), cfg.kv_heads, null, null);
             }
-            if (!full_read and fresh < n) {
+            if (!full_read and own < n) {
                 const cc = cache.?;
-                // `appendFull` keeps a full layer's context with the ring's, so its ring copy is never wanted.
-                if (cc.k[i].ctx == null) return error.Inkling2DraftContext;
-                if (fresh > 0) {
+                if (own > 0) {
                     kc = try lg.concat(&.{ cc.k[i], kc }, 2);
                     vc = try lg.concat(&.{ cc.v[i], vc }, 2);
                 } else {

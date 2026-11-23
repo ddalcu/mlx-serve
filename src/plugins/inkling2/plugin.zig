@@ -509,9 +509,9 @@ fn msSince(t0: i64) f32 {
     return @as(f32, @floatFromInt(nowUs() - t0)) / 1000;
 }
 
-/// Every term is the engine's default arithmetic over the shell and the layout.
-fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
-    out.* = .{};
+/// The engine's default arithmetic over the shell and the layout, plus the drafter's context (`draftStatePerToken`).
+fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+    out.* = .{ .state_per_token = config.draftStatePerToken(p) };
 }
 
 pub const Loaded = struct {
@@ -828,7 +828,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         m.drafter = d;
         m.tap_visits = dc.taps;
         m.spec = .{ .visits = m.tap_visits[0 .. dc.tap_count - 1], .keep = @intCast(dc.window - 1) };
-        if (d.fullContext()) m.spec.full = d;
+        if (dc.fullBytesPerToken() > 0) m.spec.full = d;
         m.base.weights.spec = &m.spec;
     };
     // The parse's quant block is freed with it; the forward reads none of it.
