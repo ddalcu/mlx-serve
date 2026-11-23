@@ -746,6 +746,31 @@ test "inkling2 kernels: the stream kernels serve the projections of the chain th
     try expectClose(got, try g.astype(try g.rmsNorm(try layers.finalInput(&g, s.body, h, blocks), nw, s.body.cfg.rms_norm_eps), .bfloat16), 0.05, "final stream");
 }
 
+// Bar: as above. A 32-thread group (the narrowest an M1 falls to) with more sums than threads, on a looped global layer.
+test "inkling2 kernels: the stream kernel at its narrowest group folds every sum" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Stage.init(a);
+    defer s.deinit();
+    const saved = kernels.stream_threads;
+    defer kernels.stream_threads = saved;
+    kernels.stream_threads = 32;
+    const hidden: c_int = @intCast(s.body.cfg.hidden_size);
+    const L = &s.body.layers[5];
+    for ([_]c_int{ 1, 7 }) |rows| {
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        const h = try randomRow(&g, a, 9100, &.{ 1, rows, hidden }, 1.0, .float32);
+        // 1 + 3 queries x 7 sources + 4 messages x 4 sources = 38 sums.
+        const blocks = try randomRow(&g, a, 9101, &.{ 1, rows, 6, hidden }, 1.0, .float32);
+        const bank: [2]ops.Array = .{ try randomRow(&g, a, 9102, &.{ 1, rows, 3, hidden }, 1.0, .float32), try randomRow(&g, a, 9103, &.{ 1, rows, hidden }, 1.0, .float32) };
+        const got = try kernels.pre(&g, L, s.body, h, blocks, bank);
+        const want = try layers.project(&g, L, s.body, h, blocks, try layers.messagesFor(&g, L, bank[0], bank[1]));
+        for (got.proj, want.proj) |x, y| try expectClose(x, y, 2e-2, "projection");
+        try expectClose(got.normed, want.normed, 1e-4, "normed stream");
+    }
+}
+
 /// Random projections of `rows` rows for a layer, as `layers.project` hands them over.
 fn randomProjected(g: *ops.Graph, a: std.mem.Allocator, seed: u64, L: *const layers.Layer, cfg: *const @TypeOf(@as(layers.Body, undefined).cfg), rows: c_int, dt: ops.Dtype) !layers.Projected {
     const heads: c_int = @intCast(cfg.num_attention_heads);

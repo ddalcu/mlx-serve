@@ -131,7 +131,7 @@ fn floating(dt: Dtype) bool {
 
 /// The most threads a stream kernel's threadgroup takes. An M1 or M2 compiles a pipeline for what its registers
 /// allow, under 768 for some instantiations: a launch one refuses lowers this for the process (`narrow`).
-var stream_threads: u32 = 768;
+pub var stream_threads: u32 = 768;
 
 /// The threadgroup of a kernel that sums over the stream: SIMD groups of 32 that tile the width, as few groups as
 /// `stream_threads` allow (every group redoes the sums).
