@@ -1051,22 +1051,16 @@ const FfnSink = struct {
             .random => {},
             .nonfinite => kit.plantRows(parts, R, P * PL),
             .stress => {
-                // Mirrored integers: each dot's slices +-(2^17 + c) in pairs with a small odd remainder, the squares
-                // integers; every partial sum is an integer below 2^24, exact in fp32 in any order (fp16 and bf16
-                // sums miss), and eps 0.
+                // Mirrored integers: each dot's even slices +(2^12 + a), its odd ones -(2^12 + b) (a, b below 2^10),
+                // the squares integers, eps 0. Every partial sum is an integer below 2^18, exact in fp32 in any order;
+                // fp16 and bf16 round the terms themselves (2^12 + a needs 13 bits) and miss the small total.
                 eps[0] = 0;
                 @memset(scale, 1);
                 @memset(base, 0);
                 for (0..R) |r| for (0..PL) |m| for (0..P) |sl| {
-                    const big: f64 = 0x1p17 + @as(f64, @floatFromInt(rng.uintLessThan(u32, 1024)));
+                    const c: f64 = @floatFromInt(rng.uintLessThan(u32, 1024));
                     const v: *f64 = &parts[(r * P + sl) * PL + m];
-                    if (m == mixes) {
-                        v.* = 512 + @as(f64, @floatFromInt(rng.uintLessThan(u32, 64)));
-                    } else if (sl % 2 == 0) {
-                        v.* = big;
-                    } else {
-                        v.* = -parts[(r * P + sl - 1) * PL + m] + @as(f64, @floatFromInt(rng.uintLessThan(u32, 3))) - 1;
-                    }
+                    v.* = if (m == mixes) 512 + @as(f64, @floatFromInt(rng.uintLessThan(u32, 64))) else if (sl % 2 == 0) 0x1p12 + c else -(0x1p12 + c);
                 };
             },
         }
@@ -1078,18 +1072,22 @@ const FfnSink = struct {
 
     /// One row's 24 mixes from its slices in float64, and each one's allowance: the slices' sum (lanes, then the tree)
     /// on its terms, the rms's half on the product, the f32 tail.
-    fn rowZ(k: anytype, r: usize, z: *[mixes]f64, allow: *[mixes]f64) void {
+    /// `sum` (the gates' summation, the reference's when null) adds each sum's slices.
+    fn rowZ(k: anytype, r: usize, z: *[mixes]f64, allow: *[mixes]f64, sum: ?Sum) void {
         const p = dims(k.shape);
         const P = slices(p);
         const PL = mixes + 1;
         const parts = k.in(0);
         const eps0 = spec.roundTo(.f32, k.in(3)[0]);
+        var col: [256]f64 = undefined;
+        for (0..P) |sl| col[sl] = parts[(r * P + sl) * PL + mixes];
         var ss: f64 = 0;
         var ssm: f64 = 0;
-        for (0..P) |sl| {
-            ss += parts[(r * P + sl) * PL + mixes];
-            ssm += @abs(parts[(r * P + sl) * PL + mixes]);
+        for (col[0..P]) |v| {
+            ss += v;
+            ssm += @abs(v);
         }
+        if (sum) |sm| ss = sm.of(col[0..P]);
         const g = spec.gamma(@as(f64, @floatFromInt(P / 32 + 1)) + 5, u);
         const rs = 1 / @sqrt(ss / @as(f64, @floatFromInt(hc * p.d)) + eps0);
         const rs_rel = g * ssm / @max(@abs(ss), 0x1p-140) / 2 + 3 * u;
@@ -1098,9 +1096,11 @@ const FfnSink = struct {
             var mg: f64 = 0;
             for (0..P) |sl| {
                 const v = parts[(r * P + sl) * PL + m];
+                col[sl] = v;
                 d += v;
                 mg += @abs(v);
             }
+            if (sum) |sm| d = sm.of(col[0..P]);
             const y = d * rs * k.in(1)[m];
             o.* = y + k.in(2)[m];
             al.* = g * mg * @abs(rs * k.in(1)[m]) + (rs_rel + 3 * u) * @abs(y) + 2 * u * @abs(o.*) + 0x1p-140;
@@ -1108,13 +1108,12 @@ const FfnSink = struct {
     }
 
     pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
-        _ = sum;
         const R = k.shape.rows;
         const eps1 = spec.roundTo(.f32, k.in(3)[1]);
         for (0..R) |r| {
             var z: [mixes]f64 = undefined;
             var allow: [mixes]f64 = undefined;
-            rowZ(k, r, &z, &allow);
+            rowZ(k, r, &z, &allow, sum);
             var sp: [mixes]f64 = undefined;
             refSplit(&z, eps1, sinkIters(), &sp);
             @memcpy(out[r * hc ..][0..hc], sp[0..hc]);
@@ -1134,7 +1133,7 @@ const FfnSink = struct {
         for (0..R) |r| {
             var z: [mixes]f64 = undefined;
             var allow: [mixes]f64 = undefined;
-            rowZ(k, r, &z, &allow);
+            rowZ(k, r, &z, &allow, null);
             var want: [mixes]f64 = undefined;
             refSplit(&z, eps1, sinkIters(), &want);
             var slack: [mixes]f64 = undefined;
