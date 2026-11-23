@@ -756,7 +756,8 @@ const MoeWt = struct {
 };
 
 const MoeCombine = struct {
-    pub const Params = struct { k: usize = TOPK };
+    /// `tok` (`MoeParts.tok`, the `TOK` build): the down rows in pair order, read in place; `inv` the identity.
+    pub const Params = struct { k: usize = TOPK, tok: bool = false };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         const total = s.rows * s.n;
@@ -778,13 +779,16 @@ const MoeCombine = struct {
         const sh = try k.add(act, &.{ L, D });
         kit.uniform(rng, dn, -2, 2);
         kit.uniform(rng, sh, -2, 2);
-        // A permutation of the sorted rows, as argsort of the expert order gives.
+        // A permutation of the sorted rows, as argsort of the expert order gives (the TOK build: the rows in pair order,
+        // so the identity).
         for (inv, 0..) |*v, i| v.* = @floatFromInt(i);
-        const perm = try k.scratch().alloc(f64, inv.len);
-        defer k.scratch().free(perm);
-        @memcpy(perm, inv);
-        rng.shuffle(f64, perm);
-        @memcpy(inv, perm);
+        if (!k.p.tok) {
+            const perm = try k.scratch().alloc(f64, inv.len);
+            defer k.scratch().free(perm);
+            @memcpy(perm, inv);
+            rng.shuffle(f64, perm);
+            @memcpy(inv, perm);
+        }
         switch (f) {
             .random => {},
             .nonfinite => {
@@ -839,7 +843,7 @@ const MoeCombine = struct {
 
 /// kernels/moe_tail.metal (`MLX_SERVE_DSV41_MOE_TAIL`): moe_combine's rows (rounded to T), then the hc expand from them.
 const MoeTail = struct {
-    pub const Params = struct { k: usize = TOPK };
+    pub const Params = struct { k: usize = TOPK, tok: bool = false };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or s.n == 0 or s.n % 4 != 0 or s.k != p.k) return null;
@@ -1726,7 +1730,8 @@ const ExpandNorm = struct {
 
 /// kernels/hc_v2_mix.metal at `p.pro`: x2 (the tail), the raw collapse and each slice's partial dots and squares.
 const HcV2Mix = struct {
-    pub const Params = struct { pro: hv2.Pro };
+    /// `tok`: a combining tail's `TOK` build (`MoeParts.tok`), its down rows in pair order (`inv` the identity).
+    pub const Params = struct { pro: hv2.Pro, tok: bool = false };
 
     fn mixes(p: Params) bool {
         return hv2.mixes(p.pro);
@@ -1774,10 +1779,10 @@ const HcV2Mix = struct {
                 kit.uniform(rng, dn, -1, 1);
                 kit.uniform(rng, sh, -1, 1);
                 for (inv, 0..) |*v, q| v.* = @floatFromInt(q);
-                for (0..n) |q| {
+                if (!k.p.tok) for (0..n) |q| {
                     const j = q + rng.uintLessThan(usize, n - q);
                     std.mem.swap(f64, &inv[q], &inv[j]);
-                }
+                };
             } else {
                 const y = try k.add(act, &.{ L, D });
                 kit.uniform(rng, y, -3, 3);
@@ -4873,6 +4878,17 @@ const hc_v2_mix_l = blk: {
     for (hv2.all, 0..) |p, i| l[i] = hcV2MixLaunch(p);
     break :blk l;
 };
+/// The combining tails' `TOK` builds (`MoeParts.tok`: the down rows in pair order, read in place).
+const hc_v2_tok = [_]hv2.Pro{ .tail_c, .tail_only_c };
+const hc_v2_mix_tok_l = blk: {
+    var l: [hc_v2_tok.len]metal.Launch = undefined;
+    for (hc_v2_tok, 0..) |p, i| {
+        l[i] = hcV2MixLaunch(p);
+        l[i].name = hv2.name(p) ++ "_tok";
+        l[i].header = hv2.header(p) ++ "#define TOK 1\n";
+    }
+    break :blk l;
+};
 /// hc_v2's launches serve on NAX GPUs only (`hc_v2.serves`).
 const hc_v2_fin_l = metal.Launch{ .name = "dsv41_hc_v2_fin", .inputs = &hv2.fin_ins, .outputs = &hv2.fin_outs, .source = hv2.fin_source, .header = "", .tg_bytes = 0, .offline = false, .min_gen = 17 };
 const mix_norm_l = launch("dsv41_hc_mix_norm", &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, &.{ "z", "h_out", "h2" }, hcf.mix_norm_source, "", 4 * (4 * 6 + 4) * 32, 1024, true);
@@ -4905,6 +4921,9 @@ const dn_l = launch("dsv41_moe_dn", moe_dn_ins, &.{"out"}, v41.MOE_DN_SOURCE, v4
 const act_l = launch("dsv41_moe_act", &.{ "y", "wts", "lim" }, &.{"out"}, v41.MOE_ACT_SOURCE, "", 0, 1024, false);
 const combine_l = launch("dsv41_moe_combine", &.{ "dn", "inv", "sh" }, &.{"out"}, v41.MOE_COMBINE_SOURCE, "", 0, 1024, false);
 const moe_tail_l = launch("dsv41_moe_tail", &mtail.ins, &.{"out"}, mtail.source, "", 0, 1024, false);
+/// `MLX_SERVE_DSV41_PF_DOWN_TOKORD`'s builds: the down rows in pair order, read in place.
+const combine_tok_l = launch("dsv41_moe_combine_tok", &.{ "dn", "inv", "sh" }, &.{"out"}, v41.MOE_COMBINE_SOURCE, "#define TOK 1\n", 0, 1024, false);
+const moe_tail_tok_l = launch("dsv41_moe_tail_tok", &mtail.ins, &.{"out"}, mtail.source, "#define TOK 1\n", 0, 1024, false);
 
 pub const relu_nan: spec.Known = .{ .gate = .nonfinite, .finding = "a NaN q . k dot scores as 0: metal::max(dot, 0) drops NaN where relu (the reference, torch) propagates it" };
 pub const quant_nan: spec.Nan = .{ .stated = "classes as float64 gives them; quantized entries within the quantizer's envelope of their bounds" };
@@ -5307,6 +5326,22 @@ pub fn register(set: *kc.Set) !void {
         .out = .bf16,
         .served = &.{ .{ .rows = 17, .n = DIM, .k = TOPK }, .{ .rows = 64, .n = 256, .k = TOPK } },
     });
+    try kit.add(set, MoeCombine, &combine_tok_l, .{ .tok = true }, .{
+        .name = "dsv41 moe_combine tok (prefill K-sum + shared, the down rows in pair order)",
+        .accum = .f32,
+        .depth = depthK1,
+        .out = .bf16,
+        .served = &.{ .{ .rows = 17, .n = DIM, .k = TOPK }, .{ .rows = 64, .n = 256, .k = TOPK } },
+    });
+    try kit.add(set, MoeTail, &moe_tail_tok_l, .{ .tok = true }, .{
+        .name = "dsv41 moe_tail tok (prefill combine + hc expand, the down rows in pair order)",
+        .accum = .f32,
+        .depth = depthTail,
+        .ops = 2,
+        .mids = 1,
+        .out = .bf16,
+        .served = &.{ .{ .rows = 17, .n = DIM, .k = TOPK }, .{ .rows = 64, .n = 256, .k = TOPK } },
+    });
 }
 
 // ── tests ──
@@ -5550,6 +5585,19 @@ fn registerStreamed(set: *kc.Set) !void {
         .mids = 3,
         .out = .bf16,
         .outs = if (hv2.isTail(p) and hv2.mixes(p)) v2_outs_tail else if (!hv2.mixes(p)) v2_outs_none else v2_outs_mix,
+        .tiles = .{ .{ .size = hv2.ROWS }, .{}, .{} },
+        .served = comptime v2Served(v2Slices(p)),
+        .sums = v2_sums,
+        .nax = true,
+    });
+    inline for (hc_v2_tok, 0..) |p, i| try kit.add(set, HcV2Mix, &hc_v2_mix_tok_l[i], .{ .pro = p, .tok = true }, .{
+        .name = "dsv41 hc_v2_mix (" ++ @tagName(p) ++ " tok: the down rows in pair order, read in place)",
+        .accum = .f32,
+        .depth = depthV2,
+        .ops = 4,
+        .mids = 3,
+        .out = .bf16,
+        .outs = if (hv2.mixes(p)) v2_outs_tail else v2_outs_none,
         .tiles = .{ .{ .size = hv2.ROWS }, .{}, .{} },
         .served = comptime v2Served(v2Slices(p)),
         .sums = v2_sums,
@@ -5841,6 +5889,11 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const o = try hv2.mixLaunch(&sc, p, r.c.args[0..r.c.n_in], 70, v2Slices(p));
         try Expect.same(r.c, r.bytes, o[0..hv2.nOuts(p)]);
     }
+    inline for (hc_v2_tok, 0..) |p, i| {
+        const r = try ours(HcV2Mix, a, &hc_v2_mix_tok_l[i], .{ .pro = p, .tok = true }, .{ .rows = 70, .n = DIM, .k = v2Slices(p) });
+        const o = try hv2.mixLaunchTo(&sc, p, r.c.args[0..r.c.n_in], 70, v2Slices(p), true);
+        try Expect.same(r.c, r.bytes, o[0..hv2.nOuts(p)]);
+    }
     {
         const r = try ours(HcV2Fin, a, &hc_v2_fin_l, .{}, .{ .rows = 70, .n = DIM, .k = 20 });
         const hc: v41.Hc = .{ .fn_w = none, .scale = r.c.args[2], .base = r.c.args[3] };
@@ -6035,6 +6088,15 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const r = try ours(MoeTail, a, &moe_tail_l, .{}, .{ .rows = 3, .n = 256, .k = TOPK });
         const sp: v41.Split = .{ .pre = none, .post = r.c.args[4], .comb = r.c.args[5] };
         try Expect.same(r.c, r.bytes, &.{try mtail.launch(&sc, .{ .dn = r.c.args[0], .inv = r.c.args[1], .sh = r.c.args[2] }, r.c.args[3], &sp)});
+    }
+    {
+        const r = try ours(MoeCombine, a, &combine_tok_l, .{ .tok = true }, .{ .rows = 3, .n = 256, .k = TOPK });
+        try Expect.same(r.c, r.bytes, &.{try v41.flatKernel(&sc, try v41.moeCombineTok(), r.c.args[0..3], &.{ 3, 256 }, act, 3 * 256, &.{ .{ .name = "D", .v = 256 }, .{ .name = "K", .v = TOPK } })});
+    }
+    {
+        const r = try ours(MoeTail, a, &moe_tail_tok_l, .{ .tok = true }, .{ .rows = 3, .n = 256, .k = TOPK });
+        const sp: v41.Split = .{ .pre = none, .post = r.c.args[4], .comb = r.c.args[5] };
+        try Expect.same(r.c, r.bytes, &.{try mtail.launch(&sc, .{ .dn = r.c.args[0], .inv = r.c.args[1], .sh = r.c.args[2], .tok = true }, r.c.args[3], &sp)});
     }
 }
 

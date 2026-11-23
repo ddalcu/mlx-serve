@@ -7,7 +7,12 @@ if (d4 >= uint(D / 4)) return;
 const auto pr = post + row * HC;
 const auto cb = comb + row * HC * HC;
 float4 y = 0.0f;
+#if TOK
+// MoeParts.tok: the down rows in pair order, read in place.
+for (int j = 0; j < K; ++j) y += float4(*(const device vec<T, 4>*)(dn + size_t(row * K + j) * D + 4 * d4));
+#else
 for (int j = 0; j < K; ++j) y += float4(*(const device vec<T, 4>*)(dn + size_t(inv[row * K + j]) * D + 4 * d4));
+#endif
 const float4 xv = float4(vec<T, 4>(y + float4(*(const device vec<T, 4>*)(sh + size_t(row) * D + 4 * d4))));
 float4 sv[HC];
 for (int j = 0; j < HC; ++j) sv[j] = float4(*(const device vec<T, 4>*)(res + (size_t(row) * HC + j) * D + 4 * d4));
