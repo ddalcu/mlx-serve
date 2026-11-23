@@ -5032,7 +5032,7 @@ pub fn moePrefillParts(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A,
         break :blk try flatKernel(sc, m.moe_act_kernel, &.{ try sc.reshape(y, &.{ ci(n), ci(2 * inter) }), w_sorted, lim }, &.{ ci(n), 1, ci(inter) }, dt, n * inter, &.{.{ .name = "N", .v = ci(inter) }});
     };
     // MLX_SERVE_DSV41_PF_DOWN_TOKORD: the staged down writes each row to its pair's slot, so the combine reads in place.
-    if (fp4gemm.on() and env.on(.MLX_SERVE_DSV41_PF_DOWN_TOKORD)) if (try fp4gemm.downTok(sc, &e.down, act, sidx, rows, flat, k)) |tokdn| {
+    if (fp4gemm.on() and env.onUnlessZero(.MLX_SERVE_DSV41_PF_DOWN_TOKORD)) if (try fp4gemm.downTok(sc, &e.down, act, sidx, rows, flat, k)) |tokdn| {
         return .{ .dn = try sc.reshape(tokdn, &.{ ci(n), ci(d) }), .inv = inv, .sh = try sc.astype(sh, dt), .tok = true };
     };
     const dn = (if (fp4gemm.on()) try fp4gemm.down(sc, &e.down, act, sidx) else null) orelse try sortedBank(sc, act, null, &e.down, sidx); // [n, 1, d]
