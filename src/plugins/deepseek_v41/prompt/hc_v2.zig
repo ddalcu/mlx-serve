@@ -149,7 +149,7 @@ fn kernelTok(p: Pro) !mlx.mlx_fast_metal_kernel {
     const i = @intFromEnum(p);
     if (ps().k_tok[i]) |k| return k;
     const k = switch (p) {
-        inline .tail_c, .tail_only_c => |q| try dsv41.buildKernel(name(q) ++ "_tok", ins(q), outs(q), mix_source, header(q) ++ "#define TOK 1\n"),
+        inline .tail_c, .tail_only_c => |q| try dsv41.buildKernel(comptime (name(q) ++ "_tok"), ins(q), outs(q), mix_source, comptime (header(q) ++ "#define TOK 1\n")),
         else => return error.HcV2TokNotCombining,
     };
     ps().k_tok[i] = k;

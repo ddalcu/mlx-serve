@@ -2500,11 +2500,11 @@ const GqmmNax = struct {
             self.tokr = try a.alloc(f64, self.m);
             self.dest = try a.alloc(f64, self.m);
             self.ridx = try a.alloc(f64, self.m);
-            var run: usize = 0;
+            var span: usize = 0;
             for (0..self.m) |p| {
-                run = if (p > 0 and self.ids[p] == self.ids[p - 1]) run + 1 else 1;
+                span = if (p > 0 and self.ids[p] == self.ids[p - 1]) span + 1 else 1;
                 // A token picks an expert once.
-                if (run > T) return false;
+                if (span > T) return false;
                 const tok = p % T;
                 const j = p / T;
                 self.tokr[p] = @floatFromInt(tok);
