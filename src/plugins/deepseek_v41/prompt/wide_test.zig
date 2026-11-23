@@ -703,6 +703,19 @@ test "dsv41 wide tol: hc_v2's combining tail is moe_tail's combine, glm5's expan
 
 const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2, .MLX_SERVE_DSV41_PF_MOE_EPI, .MLX_SERVE_DSV41_PF_IDX_NAX };
 
+/// The flash kernel on `fx`'s model as its load sets it (`plugin.configureLoad`): the gather's kernels rebuilt with
+/// MLX_SERVE_DSV41_FLASH_ATTN on (`trim`: and MLX_SERVE_DSV41_FLASH_TRIM) and the ring off; off puts the stock gather
+/// back.
+fn flashOn(fx: *fixture.Fixture, on: bool, trim: bool) !void {
+    fa.ps().mode = if (on) .on else .off;
+    fa.ps().trim = on and trim;
+    fa.ps().explicit = false;
+    sat.ps().ring_regions = !on;
+    if (fx.m.attn_gather) |*g| g.deinit();
+    fx.m.attn_gather = null;
+    if (device.naxAvailable()) fx.m.attn_gather = try dsv41.GatherAttn.init();
+}
+
 /// The pair worker's streams and mixes after its layers over `x` / `pre`, from a fresh state (caller frees).
 fn prefill(fx: *fixture.Fixture, x: A, pre: A) ![2]A {
     return dsv41.workerStep(fx.m, testing.allocator, x, pre, 0, false, false);
@@ -838,6 +851,26 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
             defer env.set(n, "0");
             if (!try closeAs(fx, x, pre, want, &want_tap, label, @tagName(n))) ok = false;
         }
+        // FLASH_TRIM is FLASH_ATTN's values (on by default where the plugin loads): its prefill is FLASH_ATTN's, word
+        // for word.
+        {
+            try flashOn(fx, true, false);
+            defer flashOn(fx, false, false) catch {};
+            const want_fa = try prefill(fx, x, pre);
+            defer for (want_fa) |o| {
+                _ = mlx.mlx_array_free(o);
+            };
+            try flashOn(fx, true, true);
+            const got = try prefill(fx, x, pre);
+            defer for (got) |o| {
+                _ = mlx.mlx_array_free(o);
+            };
+            for (want_fa, got, 0..) |w, g, k| {
+                const same = try sameWords(w, g);
+                std.debug.print("wide layer {s}, MLX_SERVE_DSV41_FLASH_TRIM against MLX_SERVE_DSV41_FLASH_ATTN, output {d}: word for word {}\n", .{ label, k, same });
+                if (!same) ok = false;
+            }
+        }
         inline for (switches) |n| env.set(n, "1");
         defer {
             inline for (switches) |n| env.set(n, "0");
@@ -850,4 +883,246 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
         try testing.expect(!try closeAs(fx, x, pre, want, &want_tap, label, "planted: the routed term at half its scale"));
     };
     try testing.expect(ok);
+}
+
+// ── the flash kernel (flash_attn.zig) at the release's spans: float64 references and the softmax reorders' ubench ──
+
+const fa = @import("flash_attn.zig");
+const sat = @import("scratch_attn.zig");
+const dattn = @import("../decode/attn.zig");
+const ddec = @import("../decode/decode.zig");
+
+const HD: usize = 512;
+const HEADS: usize = 64;
+const WIN: usize = 128;
+const OG: usize = 8;
+/// The dims a head keeps unroped (the epilogue's fast trig rotates the last 64).
+const PLAIN: usize = HD - 64;
+
+/// A wide span as the prompt layer hands it to the gather: `L` rows at window offset `wp`, `K` picks among `nc`
+/// compressed rows (some -1); queries 4x wider than the keys so the scaled logits spread like attention's (std ~4).
+const SpanCase = struct { L: usize, wp: usize, nc: usize, K: usize };
+const Span = struct {
+    c: SpanCase,
+    sink: A,
+    q: A,
+    qt: A,
+    keys_w: A,
+    comp: A,
+    picks: A,
+    periods: A,
+    meta: A,
+    scal: A,
+    h_q: []f32,
+    h_kw: []f32,
+    h_comp: []const f32,
+    h_picks: []i32,
+    h_sink: []f32,
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(HD)));
+    const p0: usize = 1000;
+
+    fn init(sc: *dsv41.Scope, c: SpanCase, seed: u64) !Span {
+        const gpa = testing.allocator;
+        const sink = try normal(sc, &.{ 1, @intCast(HEADS), 1 }, .float32, 1, seed);
+        const q = try normal(sc, &.{ @intCast(c.L), @intCast(HEADS), @intCast(HD) }, .bfloat16, 4, seed + 1);
+        const qt = try normal(sc, &.{ @intCast(c.L), @intCast(HEADS), 64 }, .bfloat16, 4, seed + 2);
+        const keys_w = try normal(sc, &.{ @intCast(c.wp + c.L), @intCast(HD) }, .bfloat16, 1, seed + 3);
+        const comp = if (c.K > 0) try normal(sc, &.{ @intCast(c.nc), @intCast(HD) }, .bfloat16, 1, seed + 4) else none;
+        const picks_h = try gpa.alloc(i32, @max(c.L * c.K, 1));
+        for (picks_h, 0..) |*v, i| v.* = if (c.K == 0) 0 else if (i % 37 == 5) -1 else @intCast((i * 13 + i / c.K * 7) % c.nc);
+        const topk = if (c.K > 0) try sc.ints(picks_h, &.{ @intCast(c.L), @intCast(c.K) }) else none;
+        var per: [32]f32 = undefined;
+        for (&per, 0..) |*v, i| v.* = std.math.pow(f32, 10000, @as(f32, @floatFromInt(i)) / 32);
+        const periods = try sc.keep(mlx.mlx_array_new_data(&per, &[_]c_int{32}, 1, .float32));
+        const meta = try sc.ints(&.{ @intCast(c.wp), @intCast(WIN), @intCast(c.wp + c.L), @intCast(c.K), @intCast(HEADS), @intCast(HD), @intCast(p0), @intCast(c.L), @intCast(OG) }, &.{9});
+        const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{scale}, &[_]c_int{1}, 1, .float32));
+        return .{ .c = c, .sink = sink, .q = q, .qt = qt, .keys_w = keys_w, .comp = comp, .picks = if (c.K > 0) topk else meta, .periods = periods, .meta = meta, .scal = scal, .h_q = try dsv41.hostF32(q), .h_kw = try dsv41.hostF32(keys_w), .h_comp = if (c.K > 0) try dsv41.hostF32(comp) else &.{}, .h_picks = picks_h, .h_sink = try dsv41.hostF32(sink) };
+    }
+
+    fn deinit(s: *Span) void {
+        const gpa = testing.allocator;
+        gpa.free(s.h_q);
+        gpa.free(s.h_kw);
+        if (s.c.K > 0) gpa.free(s.h_comp);
+        gpa.free(s.h_picks);
+        gpa.free(s.h_sink);
+    }
+
+    /// Key `c` of row `l`'s list: a window row, a pick, or absent.
+    fn key(s: *const Span, l: usize, c: usize) ?[]const f32 {
+        if (c < WIN) {
+            const r = @as(isize, @intCast(s.c.wp + l)) - @as(isize, WIN - 1) + @as(isize, @intCast(c));
+            if (r < 0 or r >= s.c.wp + s.c.L) return null;
+            return s.h_kw[@as(usize, @intCast(r)) * HD ..][0..HD];
+        }
+        const r = s.h_picks[l * s.c.K + (c - WIN)];
+        if (r < 0) return null;
+        return s.h_comp[@as(usize, @intCast(r)) * HD ..][0..HD];
+    }
+
+    /// Row `l`'s heads in float64 (the sink in the denominator), their unroped dims, into `out` [HEADS, PLAIN].
+    fn reference(s: *const Span, l: usize, out: []f64) void {
+        const nk = WIN + s.c.K;
+        var sv: [WIN + 1024]f64 = undefined;
+        for (0..HEADS) |h| {
+            const qv = s.h_q[(l * HEADS + h) * HD ..][0..HD];
+            var m: f64 = s.h_sink[h];
+            for (0..nk) |c| {
+                sv[c] = -std.math.inf(f64);
+                const k = s.key(l, c) orelse continue;
+                var d: f64 = 0;
+                for (qv, k) |a, b| d += @as(f64, a) * b;
+                sv[c] = d * scale;
+                m = @max(m, sv[c]);
+            }
+            var den = @exp(@as(f64, s.h_sink[h]) - m);
+            const o = out[h * PLAIN ..][0..PLAIN];
+            @memset(o, 0);
+            for (0..nk) |c| {
+                const k = s.key(l, c) orelse continue;
+                const p = @exp(sv[c] - m);
+                den += p;
+                for (o, k[0..PLAIN]) |*x, v| x.* += p * v;
+            }
+            for (o) |*x| x.* /= den;
+        }
+    }
+
+    /// The flash kernel `k` over the span, heads grouped as `attnOut` reads them, in `ot`.
+    fn flash(s: *const Span, sc: *dsv41.Scope, k: mlx.mlx_fast_metal_kernel, qt_on: bool, ot: mlx.mlx_dtype) !A {
+        const ins = [_]A{ s.q, s.keys_w, if (s.c.K > 0) s.comp else s.keys_w, s.picks, s.meta, if (qt_on) s.qt else s.q, s.sink, s.scal, s.periods };
+        var o: [1]A = .{none};
+        try dsv41.flashLaunch(sc, k, &ins, &.{.{ .shape = &.{ @intCast(OG), @intCast(s.c.L), @intCast(HEADS / OG * HD) }, .dt = ot }}, s.c.L, HEADS, qt_on, ot, &o);
+        return o[0];
+    }
+};
+
+/// FLASH_ATTN's text, under its own name.
+fn flash1Kernel() !mlx.mlx_fast_metal_kernel {
+    return dsv41.buildKernel("dsv41_attn_flash_t1", &dsv41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, dattn.HEADER);
+}
+/// FLASH_TRIM's kernel (`plant` 1: the window's keys a row late), under its own name.
+fn flashTrimKernel(comptime plant: u1) !mlx.mlx_fast_metal_kernel {
+    const name = std.fmt.comptimePrint("dsv41_attn_flash_trim_t_{d}", .{plant});
+    return dsv41.buildKernel(name, &dsv41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, comptime dattn.HEADER ++ fa.plan.definesTrim(plant));
+}
+
+/// `got` (grouped [OG, L, H / OG * D]) against the float64 heads at rows `rows`, unroped dims: the error's norm over the
+/// reference's and its largest element over the reference's largest.
+const FErr = struct { l2: f64, max: f64 };
+fn spanErr(s: *const Span, got: A, rows: []const usize) !FErr {
+    const g = try dsv41.hostF32(got);
+    defer testing.allocator.free(g);
+    const ref = try testing.allocator.alloc(f64, HEADS * PLAIN);
+    defer testing.allocator.free(ref);
+    var dd: f64 = 0;
+    var rr: f64 = 0;
+    var dm: f64 = 0;
+    var rm: f64 = 0;
+    const hg = HEADS / OG;
+    for (rows) |l| {
+        s.reference(l, ref);
+        for (0..HEADS) |h| for (0..PLAIN) |d| {
+            const w = ref[h * PLAIN + d];
+            const x: f64 = g[((h / hg) * s.c.L + l) * hg * HD + (h % hg) * HD + d];
+            dd += (x - w) * (x - w);
+            rr += w * w;
+            dm = @max(dm, @abs(x - w));
+            rm = @max(rm, @abs(w));
+        };
+    }
+    return .{ .l2 = @sqrt(dd / rr), .max = dm / rm };
+}
+
+/// `a` against `b` (both grouped) over every row, all dims (the roped tail too), over `b`'s norm.
+fn spanDist(a: A, b: A) !f64 {
+    const ga = try dsv41.hostF32(a);
+    defer testing.allocator.free(ga);
+    const gb = try dsv41.hostF32(b);
+    defer testing.allocator.free(gb);
+    var dd: f64 = 0;
+    var rr: f64 = 0;
+    for (ga, gb) |x, y| {
+        dd += (@as(f64, x) - y) * (@as(f64, x) - y);
+        rr += @as(f64, y) * y;
+    }
+    return @sqrt(dd / rr);
+}
+
+const span_cases = [_]SpanCase{
+    .{ .L = 256, .wp = 127, .nc = 4096, .K = 512 }, // a full span: the window and 512 picks
+    .{ .L = 256, .wp = 0, .nc = 0, .K = 0 }, // the first span, window only
+    .{ .L = 200, .wp = 40, .nc = 300, .K = 512 }, // a short window, a short last span
+    .{ .L = 64, .wp = 500, .nc = 900, .K = 200 }, // a part-filled last block
+};
+
+test "dsv41 wide: FLASH_TRIM's heads are FLASH_ATTN's word for word at the release's spans, both query tails, f32 and bf16 out, so no further from float64; window keys a row late fail" {
+    if (skip()) return error.SkipZigTest;
+    var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const k1 = try flash1Kernel();
+    defer _ = mlx.mlx_fast_metal_kernel_free(k1);
+    const k2 = try flashTrimKernel(0);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k2);
+    const kp = try flashTrimKernel(1);
+    defer _ = mlx.mlx_fast_metal_kernel_free(kp);
+    var ok = true;
+    for (span_cases, 0..) |c, ci_| {
+        var s = try Span.init(&sc, c, 40 + 10 * ci_);
+        defer s.deinit();
+        const rows = [_]usize{ 0, 1, 2, c.L / 3, c.L / 2, c.L - 2, c.L - 1 };
+        var same = true;
+        for ([_]bool{ false, true }) |qt_on| for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |ot| {
+            if (!try sameWords(try s.flash(&sc, k2, qt_on, ot), try s.flash(&sc, k1, qt_on, ot))) same = false;
+        };
+        const e1 = try spanErr(&s, try s.flash(&sc, k1, false, .float32), &rows);
+        const e2 = try spanErr(&s, try s.flash(&sc, k2, false, .float32), &rows);
+        const ep = try spanErr(&s, try s.flash(&sc, kp, false, .float32), &rows);
+        std.debug.print("[ftrim] L={d} wp={d} K={d}: FLASH_ATTN's words {}; rel l2 / max vs float64 (f32 out): FLASH_ATTN {e:.3}/{e:.3} FLASH_TRIM {e:.3}/{e:.3} planted {e:.3}/{e:.3}\n", .{ c.L, c.wp, c.K, same, e1.l2, e1.max, e2.l2, e2.max, ep.l2, ep.max });
+        ok = ok and same and e2.l2 <= e1.l2 and e2.max <= e1.max;
+        // planted: window keys a row late leave FLASH_ATTN's own error far behind
+        ok = ok and ep.l2 > 10 * e1.l2;
+    }
+    try testing.expect(ok);
+}
+
+test "dsv41 wide ubench: FLASH_ATTN and FLASH_TRIM at the release's spans (DSV41_DEC_UBENCH)" {
+    if (!ddec.ubenchOn() or skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const iou = @import("../../../sdk/util/io_util.zig");
+    var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const Arm = struct { name: []const u8, k: mlx.mlx_fast_metal_kernel };
+    var arms = [_]Arm{
+        .{ .name = "FLASH_ATTN", .k = try flash1Kernel() },
+        .{ .name = "FLASH_TRIM", .k = try flashTrimKernel(0) },
+    };
+    defer for (arms) |a| {
+        _ = mlx.mlx_fast_metal_kernel_free(a.k);
+    };
+    const n = 16;
+    for ([_]SpanCase{ span_cases[0], span_cases[1] }, 0..) |c, ci_| {
+        var s = try Span.init(&sc, c, 7 + ci_);
+        defer s.deinit();
+        const flops = 4.0 * @as(f64, @floatFromInt(c.L * HEADS * (WIN + c.K) * HD));
+        // four rounds over the arms, each arm's median of 7 within a round
+        for (0..4) |round| for (&arms) |a| {
+            var times: [7]f64 = undefined;
+            for (0..2 + times.len) |rep| {
+                var inner = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+                defer inner.deinit();
+                var outs: [n]A = undefined;
+                const t0 = iou.nowUsMonotonic(io);
+                for (&outs) |*o| o.* = try s.flash(&inner, a.k, true, .bfloat16);
+                try dsv41.evalAll(&outs);
+                const us = @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0)) / n;
+                if (rep >= 2) times[rep - 2] = us;
+            }
+            std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+            const us = times[times.len / 2];
+            std.debug.print("[ftrim-ubench] round {d} L={d} keys={d} {s}: {d:.1} us (min {d:.1} max {d:.1}), {d:.1} TFLOPS useful, matrix floor {d:.1} us at 120\n", .{ round, c.L, WIN + c.K, a.name, us, times[0], times[times.len - 1], flops / us / 1e6, flops / 120e6 });
+        };
+    }
 }

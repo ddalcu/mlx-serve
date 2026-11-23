@@ -252,7 +252,8 @@ fn configureLoad(c: *const config.Config) !void {
     engram_decode.ps().lru_mb = try engram_decode.parseMb(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB));
     flash_attn.ps().mode = .off;
     flash_attn.ps().explicit = false;
-    try flash_attn.configure(env.span(.MLX_SERVE_DSV41_FLASH_ATTN));
+    flash_attn.ps().trim = false;
+    try flash_attn.configure(env.span(.MLX_SERVE_DSV41_FLASH_ATTN), try flash_attn.plan.parseTrim(env.span(.MLX_SERVE_DSV41_FLASH_TRIM)));
     scratch_attn.ps().ring_regions = flash_attn.ps().mode != .on;
 }
 
