@@ -3957,10 +3957,55 @@ pub fn qkvRows(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !Proj {
         const n = dim(y, -1);
         break :blk .{ try sc.slice(y, -1, 0, n - c.head_dim), try sc.slice(y, -1, n - c.head_dim, n) };
     } else .{ try ly.wq_a.apply(sc, x), try ly.wkv.apply(sc, x) };
-    const qr = try sc.rms(qa, ly.q_norm, c.rms_norm_eps);
+    const qr = (try rmsRows(sc, qa, ly.q_norm, c.rms_norm_eps)) orelse try sc.rms(qa, ly.q_norm, c.rms_norm_eps);
     const qb = try ly.wq_b.apply(sc, qr);
     return .{ .q = try sc.reshape(qb, &.{ ci(dim(x, 0)), -1, ci(c.head_dim) }), .kv = kv, .qr = qr };
 }
+
+/// `MLX_SERVE_DSV41_PF_RMS_ROWS`: MLX's rms of `x` [L, n] (kernels/rms_rows.metal: its single-row kernel, its sums
+/// and threadgroup) read where its rows lie, `x`'s row stride MLX's, so a slice of a wider projection is not copied
+/// first; the same words. Null where it declines (the switch off, decode widths, another dtype or rank, rows wider
+/// than MLX's single-row kernel takes).
+pub fn rmsRows(sc: *Scope, x: A, w: A, eps: f32) !?A {
+    if (!env.on(.MLX_SERVE_DSV41_PF_RMS_ROWS) or !mlx.streamIsGpu(sc.s)) return null;
+    const sh = mlx.getShape(x);
+    if (sh.len != 2 or sh[0] < 64 or sh[1] < 4 or sh[1] > 4096) return null;
+    const dt = mlx.mlx_array_dtype(x);
+    if (dt != mlx.mlx_array_dtype(w) or (dt != .bfloat16 and dt != .float16 and dt != .float32) or mlx.getShape(w).len != 1) return null;
+    const n: usize = @intCast(sh[1]);
+    const tg = ((n + 3) / 4 + 31) / 32 * 32;
+    if (rms_rows_k == null) {
+        const iv = mlx.mlx_vector_string_new_data(&[_][*:0]const u8{ "x", "w", "eps" }, 3);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&[_][*:0]const u8{"out"}, 1);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const k = mlx.mlx_fast_metal_kernel_new("dsv41_rms_rows", iv, ov, rms_rows_source, "", false, false);
+        if (k.ctx == null) return error.MetalKernelCompileFailed;
+        rms_rows_k = k;
+    }
+    const ev = try sc.keep(mlx.mlx_array_new_data(&[_]f32{eps}, &[_]c_int{1}, 1, .float32));
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ sh[0], sh[1] }, 2, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(tg * @as(usize, @intCast(sh[0]))), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "AX", ci(n)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    const iv = mlx.mlx_vector_array_new_data(&[_]A{ x, w, ev }, 3);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, rms_rows_k.?, iv, cfg, sc.s));
+    _ = rms_rows_calls.fetchAdd(1, .monotonic);
+    if (!rms_rows_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_RMS_ROWS engaged (rows {d}, width {d})\n", .{ sh[0], n });
+    var o = mlx.mlx_array_new();
+    return try sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+}
+pub const rms_rows_source = kernelSource("plugins/deepseek_v41/kernels/rms_rows.metal");
+var rms_rows_k: ?mlx.mlx_fast_metal_kernel = null;
+var rms_rows_logged = std.atomic.Value(bool).init(false);
+/// Strided rms launches taken (tests read it).
+pub var rms_rows_calls = std.atomic.Value(usize).init(0);
 
 /// `qkvRows`' rows at `pos` roped (the window row normed and fp8 round-tripped too).
 pub fn ropeProj(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, rows: Proj, pos: A) !Proj {
@@ -12143,5 +12188,47 @@ test "dsv41 pf comp and router bf16: ubench, a layer's compressor projection and
             const flop = if (arm == .router_bf16) router_flop else comp_flop;
             std.debug.print("[pf-ubench] {s} tile bm {d} bn {d} bk {d} wm {d} wn {d} swz {d}: {d:.0} us ({d:.1} TFLOPS)\n", .{ @tagName(arm), t.bm, t.bn, t.bk, t.wm, t.wn, t.swz, us, flop / us / 1e6 });
         }
+    }
+}
+
+test "dsv41 pf rms_rows (PF_RMS_ROWS): the query latent's rms read in place in q_kv's output is MLX's rms of its contiguous copy word for word, at the release's 1,280 of 1,792 and at other widths and row counts; a planted eps (1 for 1e-6) differs" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const on = env.override(.MLX_SERVE_DSV41_PF_RMS_ROWS, "1");
+    defer on.restore();
+    const cases = [_][3]usize{ .{ 17639, 1792, 1280 }, .{ 4096, 1792, 1280 }, .{ 100, 1792, 1280 }, .{ 777, 1000, 999 }, .{ 64, 512, 512 }, .{ 300, 4100, 4096 } };
+    for (cases) |cs| {
+        var sc = Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const L, const W, const n = cs;
+        var key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(key);
+        try mlx.check(mlx.mlx_random_key(&key, @intCast(L + n)));
+        var y = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&y, &[_]c_int{ ci(L), ci(W) }, 2, .bfloat16, 0, 3, key, sc.s));
+        _ = try sc.keep(y);
+        var wk = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wk);
+        try mlx.check(mlx.mlx_random_key(&wk, 99));
+        var w = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&w, &[_]c_int{ci(n)}, 1, .bfloat16, 1, 0.2, wk, sc.s));
+        _ = try sc.keep(w);
+        const x = try sc.slice(y, -1, 0, n);
+        const got = (try rmsRows(&sc, x, w, 1e-6)) orelse return error.RmsRowsDeclined;
+        const want = try sc.rms(x, w, 1e-6);
+        const planted = (try rmsRows(&sc, x, w, 1.0)) orelse return error.RmsRowsDeclined;
+        try evalAll(&.{ got, want, planted });
+        const nb = L * n * 2;
+        const gb = (mlx.mlx_array_data_uint8(got) orelse return error.NoData)[0..nb];
+        const wb = (mlx.mlx_array_data_uint8(want) orelse return error.NoData)[0..nb];
+        const pb = (mlx.mlx_array_data_uint8(planted) orelse return error.NoData)[0..nb];
+        var diff: usize = 0;
+        var i: usize = 0;
+        while (i < nb) : (i += 2) {
+            if (gb[i] != wb[i] or gb[i + 1] != wb[i + 1]) diff += 1;
+        }
+        std.debug.print("[rms_rows] {d} rows of {d} in {d}: {d} words differ from MLX's rms\n", .{ L, n, W, diff });
+        try std.testing.expectEqual(@as(usize, 0), diff);
+        try std.testing.expect(!std.mem.eql(u8, pb, wb));
     }
 }
