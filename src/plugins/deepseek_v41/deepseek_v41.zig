@@ -115,6 +115,9 @@ const HC_TG: usize = 1024;
 
 /// Rows one MoE call handles: a layer's expert banks stream once per call.
 const MOE_ROWS: usize = 8192;
+/// `MLX_SERVE_DSV41_PF_PASS_SIZE` (`passSettle`): one MoE call takes every row of a prompt pass, which the engine has
+/// already sized to the load's memory (`passRows`).
+const PASS_MOE_ROWS: usize = std.math.maxInt(u32);
 /// Window rows kept past the window, so a verify chunk can write its rows
 /// and still roll back to any prefix.
 const RING_SLACK: usize = 16;
@@ -473,6 +476,10 @@ pub const Dsv41Model = struct {
     span: usize = SPAN,
     /// Rows per MoE call: spans whose rows fit are routed and run together.
     moe_rows: usize = MOE_ROWS,
+    /// `MLX_SERVE_DSV41_PF_PASS_SIZE` serves this load (`passSettle`): the MoE takes a pass's rows in one call; with
+    /// every Engram table held (`pass_no_lead`) a prompt chunk runs as one pass, no lead (`extendCold`).
+    pass_plan: bool = false,
+    pass_no_lead: bool = false,
     /// CED: the decoder's first layer (`cedSplit`), the fewest rows a replaying chunk skips, and how much has
     /// replayed.
     ced_split: ?usize = null,
@@ -2193,6 +2200,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     }
     try evalWeights(m);
     try holdEngram(m);
+    passSettle(m);
     try fusion.settle(m);
     try dkern.engram_ids.settle(m);
     // the gemv twin's launches for the indexer's linears compiled now, not in a request's first verify.
@@ -2232,6 +2240,63 @@ fn holdEngram(m: *Dsv41Model) !void {
         return log.warn("deepseek_v41: Engram tables read from disk per lookup: holding them failed ({s})\n", .{@errorName(err)});
     };
     log.info("deepseek_v41: Engram tables held in memory: {d} tables, {d:.1} GB read in {d} ms{s}\n", .{ m.engrams.len, gb, crt.monotonicMs() - t0, if (set == .wired) ", wired" else "" });
+}
+
+/// `MLX_SERVE_DSV41_PF_PASS_SIZE`, at load once the Engram tables are held or not (`holdEngram`). On a resident bank
+/// with no layer pair or tensor split, one MoE call takes every row of a prompt pass (`PASS_MOE_ROWS`; the engine sizes
+/// the passes, `passRows`); with every Engram table held, no drive read is left for a lead to hide, so a chunk runs as
+/// one pass (`extendCold`). One line names the choice.
+fn passSettle(m: *Dsv41Model) void {
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_PASS_SIZE)) return;
+    const why: ?[]const u8 = if (m.streamed_experts) "a streamed bank" else if (m.pair != null) "a layer pair" else if (m.tp != null) "a tensor split" else null;
+    if (why) |w| return log.info("deepseek_v41: MLX_SERVE_DSV41_PF_PASS_SIZE off: {s}\n", .{w});
+    m.pass_plan = true;
+    m.moe_rows = PASS_MOE_ROWS;
+    var held = true;
+    for (m.engrams) |*e| held = held and e.table.isHeld();
+    m.pass_no_lead = held;
+    log.info("deepseek_v41: MLX_SERVE_DSV41_PF_PASS_SIZE: one MoE call a prompt pass, {s}\n", .{if (held) "no lead pass (every Engram table held)" else "the lead pass kept (Engram rows read from the drive)"});
+}
+
+/// The narrowest pinned pass the plan cuts near-equal (`ModelConfig.passPrefillChunk`): the old cap. Under it the
+/// engine's cut stands, its 512-row tail merge included.
+pub const PASS_MIN_ROWS: usize = MOE_ROWS;
+
+/// The engine's prompt chunk for `rows` prompt rows under `MLX_SERVE_DSV41_PF_PASS_SIZE`, no wider than `max` (the
+/// load's widest pass, `ModelConfig.dsv41_pass_rows`): the fewest passes that fit, `ceil(rows / max)`, cut near-equal,
+/// never full passes and a short tail. The cut is whole spans (`SPAN`) where that keeps the count and leaves the last
+/// pass at least half a pass; else the exact quotient. `rows` 0: `max`. Depends only on `rows` and `max`.
+pub fn passRows(rows: usize, max: usize) usize {
+    const w = @max(max, 1);
+    if (rows == 0) return w;
+    if (rows <= w) return rows;
+    const n = (rows + w - 1) / w;
+    const even = (rows + n - 1) / n;
+    const spans = (even + SPAN - 1) / SPAN * SPAN;
+    if (spans <= w and (n - 1) * spans < rows and rows - (n - 1) * spans >= spans / 2) return spans;
+    return even;
+}
+
+/// The widest prompt pass whose largest per-pass tensor (the query heads, `[rows, heads, head_dim]`; `wo_a`'s
+/// `[rows, groups, o_lora_in]` is as wide) keeps its element count under 2^31, whole spans: past it a 32-bit index wraps.
+pub fn passRowsLimit(config: anytype) u64 {
+    const per_row: u64 = @max(@as(u64, config.num_attention_heads) * config.head_dim, 1);
+    return ((@as(u64, 1) << 31) - 1) / per_row / SPAN * SPAN;
+}
+
+/// Whether `MLX_SERVE_DSV41_PF_PASS_SIZE` serves a load, for its prompt bill (`prefillBytes`): `passSettle`'s
+/// conditions as the engine's `ModelConfig` sees them (a resident bank, no layer pair, span or shard), or the plugin's
+/// own `Config` (a resident bank), so the two bills stay one.
+pub fn passPlanned(config: anytype) bool {
+    const T = @TypeOf(config.*);
+    if (comptime !@hasField(T, "dsv41_pass_rows")) {
+        if (comptime !@hasField(T, "dsv41_streamed")) return false;
+        return env.onUnlessZero(.MLX_SERVE_DSV41_PF_PASS_SIZE) and !config.dsv41_streamed;
+    }
+    if (config.dsv41_pass_rows > 0) return true;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_PASS_SIZE) or !config.isDsv41()) return false;
+    if (config.dist_dsv41 != null or config.dist_span != null or config.dist_shard != null) return false;
+    return if (config.plugin) |b| !b.parsed.caps.streamed_weights else true;
 }
 
 /// Whether `bytes` of Engram fit beside what the box holds now outside the file cache: the weights are in, and the
@@ -2323,8 +2388,10 @@ pub fn prefillBytes(config: anytype, kv_per_token: u64, seq: u64, chunk: u64, fl
     const attn = proj + span * config.num_attention_heads * (window + topk) * 6 +
         if (nax) 0 else span * topk * hd * 4 * 2 + span * config.num_attention_heads * ((window + topk) * 2 + hd * 4 * 2);
     const idx_bytes = span * seq * 4 * 3;
-    // A pair's gate/up rows, its activation and its down row, in the activation dtype (bf16).
-    const moe_bytes = @min(c, MOE_ROWS) * config.num_experts_per_tok * (3 * config.moe_intermediate_size + d) * 2;
+    // A pair's gate/up rows, its activation and its down row, in the activation dtype (bf16); under the pass plan
+    // (`passPlanned`) one call takes the chunk's every row.
+    const moe_rows: u64 = if (passPlanned(config)) c else @min(c, MOE_ROWS);
+    const moe_bytes = moe_rows * config.num_experts_per_tok * (3 * config.moe_intermediate_size + d) * 2;
     return (state + held + attn + idx_bytes + moe_bytes + wideEarlyBytes(config, c) + woaJoinBytes(config, c) + floor) * 5 / 4;
 }
 /// a streamed bank's wide call of `rows` rows holds its early shared expert's evaluation through the MoE
@@ -6496,11 +6563,38 @@ fn cedCompress(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Sp
     const ly = &m.layers[li];
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
+    if (cedHcWhole(m, sp)) {
+        // `MLX_SERVE_DSV41_PF_CED_HC`: the hc pre-norm once over the pass's whole stream (a row's mixes and norm are
+        // its own words whatever rows share the launch); the compressor still a span at a time (its linear's kernel
+        // moves with M below `DENSE_ROWS`).
+        if (!ced_hc_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_CED_HC engaged (layer {d}, rows {d}, spans {d})\n", .{ li, sp.L, sp.xs.len });
+        _ = ced_hc_passes.fetchAdd(1, .monotonic);
+        const pa = try hcPreNormWide(&sc, m, sp.whole[0], sp.whole[1], &ly.hc_attn, ly.attn_norm);
+        const shift = ced_hc_plant.load(.monotonic);
+        for (0..sp.xs.len) |k| {
+            const lo, const hi = sp.bounds(k);
+            const a = @min(lo + shift, sp.L - (hi - lo));
+            try compress(&sc, m, st, li, &ly.comp.?, try sc.slice(pa.h, 0, a, a + hi - lo), sp.p0 + k * sp.span);
+        }
+        return;
+    }
     for (sp.xs, sp.pres, 0..) |x, pre, k| {
         const pa = try hcPreNormWide(&sc, m, x, pre, &ly.hc_attn, ly.attn_norm);
         try compress(&sc, m, st, li, &ly.comp.?, pa.h, sp.p0 + k * sp.span);
     }
 }
+
+/// `cedCompress` takes the whole stream: the switch on, several spans whose one MoE group left the pass's stream and
+/// mix whole (`Spans.whole`), on the GPU.
+fn cedHcWhole(m: *const Dsv41Model, sp: *const Spans) bool {
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_CED_HC) or sp.xs.len < 2 or sp.whole.len != 2 or !mlx.streamIsGpu(m.s)) return false;
+    return sp.whole[0].ctx != null and sp.whole[1].ctx != null and dim(sp.whole[0], 0) == sp.L and dim(sp.whole[1], 0) == sp.L;
+}
+var ced_hc_logged: std.atomic.Value(bool) = .init(false);
+/// Passes whose compressor took the whole stream (a test's proof the switch engaged).
+pub var ced_hc_passes: std.atomic.Value(u32) = .init(0);
+/// The planted control (tests only): each span's compressor reads the whole stream's rows this many rows late.
+pub var ced_hc_plant: std.atomic.Value(usize) = .init(0);
 
 /// CED: `cedCompress`, then `sp`'s last rows become `tsp`'s spans, the decoder's input; `sp`'s streams are released.
 /// The rows before the tail get no decoder window KV, which no tail query reaches: the tail's band stops at its first
@@ -7359,13 +7453,18 @@ pub fn leadRows(L: usize, read_ahead: bool) usize {
     return if (read_ahead or L < LEAD_MIN) 0 else L / 2 / SPAN * SPAN;
 }
 const LEAD_MIN: usize = 4096;
+/// `MLX_SERVE_DSV41_PF_PASS_SIZE`'s engaged line, once a process.
+var pass_logged = std.atomic.Value(bool).init(false);
 
 /// `extendIds` of a prompt chunk for its last row's logits, its lead (`leadRows`) run first without the decoder's
 /// replay, which the rest of the chunk makes at its own end.
 fn extendCold(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32, vision: ?VisionRows) !A {
     const whole = m.engrams.len == 0 or m.pair != null or m.tp != null or m.streamed != null or m.trace != null or
         m.ced_split == null or st.verify != null or !cedEnabled();
-    const lead = if (whole) 0 else leadRows(ids.len, if (m.ahead) |a| a.covers(st.n, ids.len) else false);
+    // `MLX_SERVE_DSV41_PF_PASS_SIZE` with every Engram table held: nothing to read ahead of, one pass.
+    const lead = if (whole) 0 else leadRows(ids.len, m.pass_no_lead or if (m.ahead) |a| a.covers(st.n, ids.len) else false);
+    if (m.pass_plan and ids.len >= LEAD_MIN and !pass_logged.swap(true, .monotonic))
+        log.info("[dsv41] MLX_SERVE_DSV41_PF_PASS_SIZE engaged: a {d}-row prompt chunk, {s}, one MoE call a pass\n", .{ ids.len, if (lead == 0) "one pass" else "a lead and its rest" });
     if (lead == 0) return extendIds(m, gpa, st, .{ .host = ids }, .last, vision);
     defer m.next_rows = null;
     m.next_rows = ids.len - lead;
@@ -10037,6 +10136,315 @@ test "dsv41 prefill: chunk time against depth (DSV41_PREFILL)" {
     std.debug.print("[dsv41-prefill] chunk {d}: {d} tokens in {d:.2} s, peak transient {d} MB, bill {d} MB\n", .{ chunk, ctx, @as(f64, @floatFromInt(monoUs() - t_all)) / 1e6, transient >> 20, prefillBytes(&m.cfg, 0, ctx, chunk, 0) >> 20 });
 }
 
+/// One arm of the pass-plan test: the served path over `prompt` (armed as the server arms it), its rows but the last
+/// in the passes `cuts` (`[from, to)` into the prompt), then the last row: that row's logits, every layer's state at the
+/// prompt's end as the next step reads it (the window ring's rows for the last `sliding_window` positions, the compressed
+/// and indexer rows), named by layer, the position reached, and the greedy tokens after.
+const PassArm = struct {
+    logits: []f32,
+    arrays: []A,
+    names: [][24]u8,
+    n: usize,
+    /// The greedy tokens after the prompt (`DSV41_PASS_EQ_GREEDY`, default 4).
+    tokens: []u32,
+    ms: i64,
+
+    fn deinit(a: *PassArm) void {
+        testing.allocator.free(a.logits);
+        for (a.arrays) |x| _ = mlx.mlx_array_free(x);
+        testing.allocator.free(a.arrays);
+        testing.allocator.free(a.names);
+        testing.allocator.free(a.tokens);
+    }
+};
+
+fn argmaxOf(row: []const f32) u32 {
+    var b: usize = 0;
+    for (row, 0..) |v, k| {
+        if (v > row[b]) b = k;
+    }
+    return @intCast(b);
+}
+
+fn passArm(m: *Dsv41Model, prompt: []const u32, cuts: []const [2]usize, greedy: usize) !PassArm {
+    const gpa = testing.allocator;
+    try reset(m, gpa);
+    try armPrompt(m, prompt, null, true);
+    const t0 = monoUs();
+    for (cuts) |c| {
+        const l = try extendResumable(m, gpa, prompt[c[0]..c[1]], null);
+        try mlx.check(mlx.mlx_array_eval(l));
+        _ = mlx.mlx_array_free(l);
+        _ = mlx.mlx_clear_cache();
+    }
+    const last = try extendResumable(m, gpa, prompt[prompt.len - 1 ..], null);
+    defer _ = mlx.mlx_array_free(last);
+    const logits = try hostF32(last);
+    errdefer gpa.free(logits);
+    const ms = @divTrunc(monoUs() - t0, 1000);
+    const st = &m.dec_state.?;
+    var xs: std.ArrayList(A) = .empty;
+    errdefer {
+        for (xs.items) |x| _ = mlx.mlx_array_free(x);
+        xs.deinit(gpa);
+    }
+    var names: std.ArrayList([24]u8) = .empty;
+    errdefer names.deinit(gpa);
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const w = @min(m.cfg.sliding_window, st.n);
+    for (st.layers, 0..) |*l, li| {
+        var nm: [24]u8 = @splat(0);
+        try xs.append(gpa, sc.out(try l.win.read(&sc, st.n - w, st.n)));
+        try names.append(gpa, nm);
+        _ = try std.fmt.bufPrint(&names.items[names.items.len - 1], "layer {d} window", .{li});
+        if (l.comp) |*r| if (r.used > 0) {
+            try xs.append(gpa, try r.view(r.used, m.s));
+            nm = @splat(0);
+            _ = try std.fmt.bufPrint(&nm, "layer {d} compressed", .{li});
+            try names.append(gpa, nm);
+        };
+        if (l.idx_k) |*r| if (r.used > 0) {
+            try xs.append(gpa, try r.view(r.used, m.s));
+            nm = @splat(0);
+            _ = try std.fmt.bufPrint(&nm, "layer {d} index keys", .{li});
+            try names.append(gpa, nm);
+        };
+    }
+    try evalAll(xs.items);
+    const out: PassArm = .{ .logits = logits, .arrays = try xs.toOwnedSlice(gpa), .names = try names.toOwnedSlice(gpa), .n = st.n, .tokens = try gpa.alloc(u32, greedy), .ms = ms };
+    var tok = argmaxOf(logits);
+    errdefer gpa.free(out.tokens);
+    for (out.tokens) |*t| {
+        t.* = tok;
+        const l = try extendResumable(m, gpa, &.{tok}, null);
+        defer _ = mlx.mlx_array_free(l);
+        const row = try hostF32(l);
+        defer gpa.free(row);
+        tok = argmaxOf(row);
+    }
+    return out;
+}
+
+/// How many of `want`'s greedy tokens `got` repeats before the first that differs, in words.
+fn greedyAgree(buf: []u8, want: *const PassArm, got: *const PassArm) ![]const u8 {
+    const n = @min(want.tokens.len, got.tokens.len);
+    for (want.tokens[0..n], got.tokens[0..n], 0..) |a, b, k| {
+        if (a != b) return std.fmt.bufPrint(buf, "first divergent token at {d} of {d} ({d} vs {d})", .{ k, n, b, a });
+    }
+    return std.fmt.bufPrint(buf, "all {d} tokens agree", .{n});
+}
+
+/// How far `got` is from `want`: each state array's l2 distance over its norm (`state`, caller frees), and the next
+/// token's logits as 1 - cosine. Null where the position or the arrays' shapes differ.
+const PassDist = struct { state: []f32, logits: f64 };
+
+fn passDist(want: *const PassArm, got: *const PassArm) !?PassDist {
+    if (got.n != want.n or got.arrays.len != want.arrays.len) return null;
+    const out = try testing.allocator.alloc(f32, want.arrays.len);
+    errdefer testing.allocator.free(out);
+    for (want.arrays, got.arrays, out) |w, g, *e| {
+        if (!std.mem.eql(c_int, mlx.getShape(w), mlx.getShape(g))) {
+            testing.allocator.free(out);
+            return null;
+        }
+        var sc = Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const wf = try sc.astype(w, .float32);
+        const d = try sc.sub(try sc.astype(g, .float32), wf);
+        var o1 = mlx.mlx_array_new();
+        const dd = try sc.res(mlx.mlx_sum(&o1, try sc.mul(d, d), false, sc.s), &o1);
+        var o2 = mlx.mlx_array_new();
+        const ww = try sc.res(mlx.mlx_sum(&o2, try sc.mul(wf, wf), false, sc.s), &o2);
+        try evalAll(&.{ dd, ww });
+        var vd: f32 = 0;
+        var vw: f32 = 0;
+        try mlx.check(mlx.mlx_array_item_float32(&vd, dd));
+        try mlx.check(mlx.mlx_array_item_float32(&vw, ww));
+        e.* = if (vw > 0) @sqrt(vd / vw) else if (vd > 0) std.math.inf(f32) else 0;
+    }
+    var dot: f64 = 0;
+    var gg: f64 = 0;
+    var wsq: f64 = 0;
+    for (got.logits, want.logits) |a, b| {
+        dot += @as(f64, a) * b;
+        gg += @as(f64, a) * a;
+        wsq += @as(f64, b) * b;
+    }
+    return .{ .state = out, .logits = 1 - dot / @sqrt(gg * wsq) };
+}
+
+/// `got` against the default plan `want`, held to `spread`, the default plan's own spread across its cuts: every state
+/// array within twice its spread plus 1%, the logits' 1 - cosine within twice the spread plus 1e-3. Printed either way,
+/// the worst array named, and (`profile`) every array's distance.
+fn passClose(label: []const u8, want: *const PassArm, got: *const PassArm, spread: *const PassDist, profile: bool) !bool {
+    var lb_g: [96]u8 = undefined;
+    std.debug.print("[dsv41-pass] {s}: {d} ms, position {d} (want {d}), greedy {s}\n", .{ label, got.ms, got.n, want.n, try greedyAgree(&lb_g, want, got) });
+    const dist = (try passDist(want, got)) orelse {
+        std.debug.print("[dsv41-pass] {s}: the position or the state's shapes differ\n", .{label});
+        return false;
+    };
+    defer testing.allocator.free(dist.state);
+    var ok = true;
+    var worst: usize = 0;
+    var worst_r: f32 = 0;
+    var over: usize = 0;
+    for (dist.state, spread.state, 0..) |e, r, k| {
+        const bound = 2 * r + 1e-2;
+        if (!(e <= bound)) {
+            ok = false;
+            over += 1;
+        }
+        if (e / bound > worst_r) {
+            worst_r = e / bound;
+            worst = k;
+        }
+    }
+    const lb = 2 * spread.logits + 1e-3;
+    if (!(dist.logits <= lb)) ok = false;
+    if (profile) for (dist.state, spread.state, 0..) |e, r, k| std.debug.print("[dsv41-pass] {s}: {s} l2 {e:.3} (spread {e:.3})\n", .{ label, std.mem.sliceTo(&want.names[k], 0), e, r });
+    std.debug.print("[dsv41-pass] {s}: state {d} of {d} arrays past their bound, worst {s} l2 {e:.3} (default plan's own spread {e:.3}); logits 1-cos {e:.3} (bound {e:.3}) -> {s}\n", .{ label, over, dist.state.len, std.mem.sliceTo(&want.names[worst], 0), dist.state[worst], spread.state[worst], dist.logits, lb, if (ok) "within" else "OUT" });
+    return ok;
+}
+
+test "dsv41 pass size: on a real pack the pass plan's prefill (near-equal passes, one MoE call each, no lead) is within the default plan's own spread across its cuts, one pass or two, and dropping the lead moves no word; a planted cut that repeats a boundary row fails (DSV41_PASS_EQ)" {
+    // DSV41_PASS_EQ = a pack dir; DSV41_PASS_EQ_CTX prompt tokens (default 17639; 0 with DSV41_PASS_EQ_TEXT: the text's
+    // own tokens); DSV41_PASS_EQ_TEXT a text file whose tokens, cycled, make the prompt (default: a fixed id walk);
+    // DSV41_PASS_EQ_GREEDY the greedy tokens each arm runs after the prompt (default 4).
+    const dir = std.mem.span(std.c.getenv("DSV41_PASS_EQ") orelse return error.SkipZigTest);
+    const ctx_env: ?usize = if (std.c.getenv("DSV41_PASS_EQ_CTX")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else null;
+    const greedy: usize = if (std.c.getenv("DSV41_PASS_EQ_GREEDY")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 4;
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cfg = try testConfig(io, dir);
+    var w = try loadPack(io, gpa, dir, false);
+    defer w.deinit();
+    const was = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, "1");
+    const m = init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true, .dspark = false }) catch |e| {
+        was.restore();
+        return e;
+    };
+    defer m.deinit();
+    was.restore();
+    @import("../../mlx/state.zig").applyMlxCacheLimit();
+    _ = mlx.applyWiredPolicy();
+    // The switch engaged at load: one MoE call a pass, and (the tables held on a box that holds them) no lead.
+    var held = m.engrams.len > 0;
+    for (m.engrams) |*e| held = held and e.table.isHeld();
+    std.debug.print("[dsv41-pass] switch: plan {} moe_rows {d} no_lead {} (tables held {})\n", .{ m.pass_plan, m.moe_rows, m.pass_no_lead, held });
+    try testing.expect(m.pass_plan and m.moe_rows == PASS_MOE_ROWS and m.pass_no_lead == held);
+    var text_ids: []const u32 = &.{};
+    defer gpa.free(text_ids);
+    if (std.c.getenv("DSV41_PASS_EQ_TEXT")) |tp| {
+        var tok = try @import("../../sdk/tokenizer/tokenizer.zig").loadTokenizer(io, gpa, dir);
+        defer tok.deinit();
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(tp), gpa, .limited(64 << 20));
+        defer gpa.free(text);
+        const cap = ctx_env orelse 17639;
+        text_ids = try tok.encode(gpa, if (cap == 0) text else text[0..@min(text.len, cap * 8)]);
+    }
+    const want_ctx = ctx_env orelse 17639;
+    const ctx = if (want_ctx == 0 and text_ids.len > 0) text_ids.len else if (want_ctx == 0) 17639 else want_ctx;
+    const prompt = try gpa.alloc(u32, ctx);
+    defer gpa.free(prompt);
+    for (prompt, 0..) |*t, k| t.* = if (text_ids.len > 0) text_ids[k % text_ids.len] else @intCast((k * 7919 + 13) % @min(m.vocab, 100000));
+    std.debug.print("[dsv41-pass] prompt: {d} tokens{s}, {d} greedy tokens an arm\n", .{ ctx, if (text_ids.len > 0) " of text" else " (id walk)", greedy });
+    const rows = ctx - 1;
+    var cuts: std.ArrayList([2]usize) = .empty;
+    defer cuts.deinit(gpa);
+    const Plan = struct {
+        fn of(list: *std.ArrayList([2]usize), n: usize, chunk: usize) ![]const [2]usize {
+            list.clearRetainingCapacity();
+            var at: usize = 0;
+            while (at < n) : (at += chunk) try list.append(testing.allocator, .{ at, @min(n, at + chunk) });
+            return list.items;
+        }
+    };
+
+    // The default plan: the engine's chunks, the MoE at `MOE_ROWS`, the lead as today. Every row-wise stage gives a row
+    // the same words whatever rows share its launch, but the router under 1,707 rows (MLX's split-K matmul,
+    // prompt/m_invariance_test.zig): at 8192 the served cut's last chunk (17,638 rows: 1,254) routes on it. So the
+    // default plan's own spread is its 8192-row cut against a cut whose every chunk is 1,707 rows or more, and the pass
+    // plan must be that cut's bits.
+    m.moe_rows = MOE_ROWS;
+    m.pass_no_lead = false;
+    // A first prompt compiles the launches and fills the buffer cache: timed apart, not compared.
+    var warm = try passArm(m, prompt, try Plan.of(&cuts, rows, 8192), greedy);
+    std.debug.print("[dsv41-pass] warm-up (default plan): {d} ms\n", .{warm.ms});
+    warm.deinit();
+    var want = try passArm(m, prompt, try Plan.of(&cuts, rows, 8192), greedy);
+    defer want.deinit();
+    const wide_cut = wide: {
+        var w8: usize = 8192;
+        while (w8 > 1707 and rows % w8 != 0 and rows % w8 < 1707) w8 -= SPAN;
+        break :wide w8;
+    };
+    var alt = try passArm(m, prompt, try Plan.of(&cuts, rows, wide_cut), greedy);
+    defer alt.deinit();
+    const alt_cuts = cuts.items.len;
+    const own = (try passDist(&want, &alt)) orelse return error.TestUnexpectedResult;
+    defer gpa.free(own.state);
+    var lb_alt: [96]u8 = undefined;
+    var rw: usize = 0;
+    for (own.state, 0..) |e, k| {
+        if (e > own.state[rw]) rw = k;
+    }
+    std.debug.print("[dsv41-pass] default plan at 8192: {d} ms, {d} state arrays, greedy {any}; at {d} ({d} chunks, none under 1,707 rows): {d} ms, greedy {s}, worst {s} l2 {e:.3}, logits 1-cos {e:.3}\n", .{ want.ms, want.arrays.len, want.tokens, wide_cut, alt_cuts, alt.ms, try greedyAgree(&lb_alt, &want, &alt), std.mem.sliceTo(&want.names[rw], 0), own.state[rw], own.logits });
+    m.moe_rows = PASS_MOE_ROWS;
+    m.pass_no_lead = held;
+    var ok = true;
+    // One pass of every row, then two near-equal passes (`passRows` at half the rows).
+    for ([_]usize{ rows, (rows + 1) / 2 }, 0..) |max, k| {
+        var got = try passArm(m, prompt, try Plan.of(&cuts, rows, passRows(rows, max)), greedy);
+        defer got.deinit();
+        var lb: [64]u8 = undefined;
+        const label = try std.fmt.bufPrint(&lb, "{d} pass(es) of {d}", .{ cuts.items.len, passRows(rows, max) });
+        std.debug.print("[dsv41-pass] {s}: the default plan's bits at {d}: {}\n", .{ label, wide_cut, try passSame(&alt, &got) });
+        if (!try passClose(label, &want, &got, &own, k == 0)) ok = false;
+    }
+    // Dropping the lead moves no word: the cut with no lead is its bits with the lead. Printed, not held: the one pass
+    // with its MoE in that cut's calls against that cut (a launch past 8192 rows rounds some stage in another order).
+    {
+        m.moe_rows = MOE_ROWS;
+        defer m.moe_rows = PASS_MOE_ROWS;
+        var d2 = try passArm(m, prompt, try Plan.of(&cuts, rows, wide_cut), greedy);
+        defer d2.deinit();
+        const same = try passSame(&alt, &d2);
+        std.debug.print("[dsv41-pass] the {d} cut with no lead, the MoE at 8192: its bits with the lead: {}\n", .{ wide_cut, same });
+        if (!same) ok = false;
+        m.moe_rows = wide_cut;
+        var d1 = try passArm(m, prompt, try Plan.of(&cuts, rows, rows), greedy);
+        defer d1.deinit();
+        std.debug.print("[dsv41-pass] one pass, the MoE in {d}-row calls: the default plan's bits at {d}: {}\n", .{ wide_cut, wide_cut, try passSame(&alt, &d1) });
+    }
+    // Planted: the two passes, the second starting one row early (its first row the first pass's last again) and
+    // ending one row early, so the position reached is the same.
+    const c = passRows(rows, (rows + 1) / 2);
+    const planted = [_][2]usize{ .{ 0, c }, .{ c - 1, rows - 1 } };
+    var bad = try passArm(m, prompt, &planted, greedy);
+    defer bad.deinit();
+    try testing.expect(!try passSame(&alt, &bad));
+    try testing.expect(!try passClose("planted: a boundary row repeated", &want, &bad, &own, false));
+    try testing.expect(ok);
+}
+
+/// Whether `got` is `want` bit for bit: the position, every state array's words and the next token's logits.
+fn passSame(want: *const PassArm, got: *const PassArm) !bool {
+    if (got.n != want.n or got.arrays.len != want.arrays.len) return false;
+    if (!std.mem.eql(u8, std.mem.sliceAsBytes(want.logits), std.mem.sliceAsBytes(got.logits))) return false;
+    for (want.arrays, got.arrays) |w, g| {
+        if (!std.mem.eql(c_int, mlx.getShape(w), mlx.getShape(g))) return false;
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_array_equal(&eq, w, g, false, mlx.gpuStream()));
+        try mlx.check(mlx.mlx_array_eval(eq));
+        var v: bool = false;
+        try mlx.check(mlx.mlx_array_item_bool(&v, eq));
+        if (!v) return false;
+    }
+    return true;
+}
+
 test "dsv41 engram gpu ids: steps whose token stays on the GPU decode as with the host hash, the history the same, the switch engaged (DSV41_STEP pack)" {
     const dir = std.mem.span(std.c.getenv("DSV41_STEP") orelse return error.SkipZigTest);
     const gpa = testing.allocator;
@@ -10718,6 +11126,75 @@ test "dsv41 lead: a wide prompt chunk nothing read ahead sends its first rows ah
     try testing.expectEqual(@as(usize, 0), leadRows(8064, true));
     // The rest keeps a window to replay and the rows a replaying chunk skips.
     try testing.expect(LEAD_MIN - leadRows(LEAD_MIN, false) >= 128 + CED_MIN_SKIP);
+}
+
+/// Whether `cuts` (pass widths, in order) are a pass plan for `rows` rows under the widest pass `max`: they cover the
+/// rows, none is empty or wider than `max`, there are the fewest that fit, and the narrowest is at least half the widest.
+fn passCutsOk(cuts: []const usize, rows: usize, max: usize) bool {
+    var sum: usize = 0;
+    var lo: usize = std.math.maxInt(usize);
+    var hi: usize = 0;
+    for (cuts) |c| {
+        if (c == 0 or c > max) return false;
+        sum += c;
+        lo = @min(lo, c);
+        hi = @max(hi, c);
+    }
+    if (sum != rows or cuts.len != (rows + max - 1) / max) return false;
+    return 2 * lo >= hi;
+}
+
+/// The engine's chunk loop over `rows` rows at the constant width `chunk` (`nextChunkEnd` without checkpoints: a tail
+/// under `TAIL_MERGE_MAX` rides the chunk before it), into `out`.
+fn passLoop(rows: usize, chunk: usize, out: *std.ArrayList(usize)) !void {
+    const merge = @import("../../sdk/bases/run.zig").TAIL_MERGE_MAX;
+    out.clearRetainingCapacity();
+    var pos: usize = 0;
+    while (pos < rows) {
+        var end = @min(pos + chunk, rows);
+        if (end < rows and rows - end < merge) end = rows;
+        try out.append(testing.allocator, end - pos);
+        pos = end;
+    }
+}
+
+test "dsv41 pass size: any prompt length gets the fewest near-equal passes no wider than the widest pass; a planted cut of full passes and a short tail fails" {
+    var cuts: std.ArrayList(usize) = .empty;
+    defer cuts.deinit(testing.allocator);
+    // The widths a load pins: the old cap, a pass of whole spans past it, a wide box's, and odd ones.
+    for ([_]usize{ 8192, 8960, 17664, 32768, 81920 }) |max| {
+        var rows: usize = 1;
+        while (rows <= 200_000) : (rows += if (rows < 70_000) 1 else 997) {
+            const c = passRows(rows, max);
+            try passLoop(rows, c, &cuts);
+            if (!passCutsOk(cuts.items, rows, max)) {
+                std.debug.print("rows {d} max {d}: chunk {d} cuts {any}\n", .{ rows, max, c, cuts.items });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+    // A narrow pass (a load whose memory pinned the ladder's floor) still covers every row in no more than the fewest
+    // passes; the engine's tail merge may widen the last but one by under `TAIL_MERGE_MAX`, as it does off the plan.
+    const merge = @import("../../sdk/bases/run.zig").TAIL_MERGE_MAX;
+    for ([_]usize{ 1, 7, 256, 512, 1000, 4096 }) |max| for (1..9000) |rows| {
+        try passLoop(rows, passRows(rows, max), &cuts);
+        var sum: usize = 0;
+        for (cuts.items) |c| {
+            try testing.expect(c > 0 and c < max + merge);
+            sum += c;
+        }
+        try testing.expectEqual(rows, sum);
+        try testing.expect(cuts.items.len <= (rows + max - 1) / max);
+    };
+    // Whole spans where they keep the count, the plan a function of the length and the pass alone.
+    try testing.expectEqual(@as(usize, 17_638), passRows(17_638, 17_664));
+    try testing.expectEqual(@as(usize, 8_960), passRows(17_638, 8_960));
+    try testing.expectEqual(@as(usize, 5_888), passRows(17_638, 8_192));
+    try testing.expectEqual(@as(usize, 81_920), passRows(0, 81_920));
+    // Planted: the old cut (full 8192-row passes and the rest) fails the plan, as the served 17,638 rows show.
+    try passLoop(17_638, 8192, &cuts);
+    try testing.expectEqualSlices(usize, &.{ 8192, 8192, 1254 }, cuts.items);
+    try testing.expect(!passCutsOk(cuts.items, 17_638, 8192));
 }
 
 test "dsv41 CED split:the decoder starts at the last KV source when everything after it reads its ratio-1 rows" {

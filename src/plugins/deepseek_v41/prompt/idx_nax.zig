@@ -1,5 +1,5 @@
-//! `MLX_SERVE_DSV41_PF_IDX_NAX` (default off): a wide prompt span's indexer scores on the matrix units
-//! (`kernels/pf_idx_score.metal`), not `dsv41_index_tile`'s 8 x 8 simdgroup matrices.
+//! `MLX_SERVE_DSV41_PF_IDX_NAX` (on by default; `=0` idx_tile): a wide prompt span's indexer scores on the matrix
+//! units (`kernels/pf_idx_score.metal`), not `dsv41_index_tile`'s 8 x 8 simdgroup matrices.
 //!
 //! idx_tile runs a threadgroup a (row, 64 keys): each row re-reads every key tile and its queries per tile, at 22
 //! TFLOPS on the 17.6K card (81 ms of 1.9 TFLOP). Here a threadgroup is 8 adjacent rows over a range of 16-key tiles:

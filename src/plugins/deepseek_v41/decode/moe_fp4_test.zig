@@ -1502,3 +1502,118 @@ test "dsv41 dec moe_fp4 rules: with FP4_READS off the shared expert's down reads
     defer gpa.free(comp);
     try checkColumns("shared down", .mxfp4, got[0..N], want, comp[0..N], N);
 }
+
+// ── the decode levers: today's bytes ──
+
+/// A set of the decode levers (`moe_fp4.Levers`) as their switches set it.
+const LeverSet = struct { name: []const u8, lv: moe_fp4.Levers };
+const lever_off: LeverSet = .{ .name = "off", .lv = .{} };
+/// The levers that keep the bytes: each, and both.
+const lever_sets = [_]LeverSet{
+    .{ .name = "DEC_WORD", .lv = .{ .dec_word = true } },
+    .{ .name = "UP_SPLIT", .lv = .{ .up_split = true } },
+    .{ .name = "both", .lv = .{ .dec_word = true, .up_split = true } },
+};
+
+/// `launchRows` with the lever switches at `ls` (and FP4_READS at `fr`).
+fn launchLevers(sc: *Scope, kern: moe_fp4.Kernels, l: *const Layer, in: RowIns, lo: usize, hi: usize, ls: LeverSet, fr: [*:0]const u8) ![3][]const u16 {
+    const o0 = env.override(.MLX_SERVE_DSV41_FP4_DEC_WORD, if (ls.lv.dec_word) "1" else "0");
+    defer o0.restore();
+    const o1 = env.override(.MLX_SERVE_DSV41_FP4_UP_SPLIT, if (ls.lv.up_split) "1" else "0");
+    defer o1.restore();
+    const o3 = env.override(.MLX_SERVE_DSV41_FP4_READS, fr);
+    defer o3.restore();
+    return launchRows(sc, kern, l, in, lo, hi);
+}
+
+/// Host routed banks for `l` at `d` in `f`: every nibble a random code (all sixteen), scales near 2^-4; NVFP4 gives
+/// half of the 32-spans two equal scales (FP4_READS off sums those in MXFP4's order). `plant`: weight 0 of output 0 of
+/// every expert's gate and down bank one exponent bit off (a decode that misreads one code).
+fn hostRouted(sc: *Scope, l: *Layer, d: Dims, f: Fmt, seed: u64, plant: bool) !void {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    const E = d.experts;
+    const gs = f.format().group();
+    const banks = [2][2]usize{ .{ 2 * d.n, d.k }, .{ d.k, d.n } };
+    for (banks, 0..) |rk, bi| {
+        const rows = rk[0];
+        const K = rk[1];
+        const words = try gpa.alloc(u32, E * rows * K / 8);
+        defer gpa.free(words);
+        for (words) |*w| w.* = rng.int(u32);
+        const sb = try gpa.alloc(u8, E * rows * K / gs);
+        defer gpa.free(sb);
+        var i: usize = 0;
+        while (i < sb.len) : (i += 1) {
+            if (gs == 32) {
+                sb[i] = pow2Code(.mxfp4, rng.intRangeAtMost(i32, -5, -3));
+                continue;
+            }
+            sb[i] = kc.host.e4m3Code(rng, -5, -3, false);
+            if (i % 2 == 1 and rng.boolean()) sb[i] = sb[i - 1];
+        }
+        if (plant) for (0..E) |e| {
+            const w0 = e * rows * K;
+            setCode(words, w0, @as(u8, @intCast((words[w0 / 8] & 15) ^ 4)));
+        };
+        const b = try fp4Words(sc, words, sb, &.{ E, rows }, K, gs);
+        if (bi == 0) l.ly.experts.gu = .{ .w = b[0], .s = b[1], .qp = f.qp() } else l.ly.experts.down = .{ .w = b[0], .s = b[1], .qp = f.qp() };
+    }
+}
+
+/// Each lever set against the levers off at R = 1..6, every stage (gate/up, down, the chain): bit for bit, and the
+/// planted bank (one code off) differs at every R. Returns the bytes that differ unplanted.
+fn leversAgree(d: Dims, sets: []const LeverSet) !usize {
+    const gpa = testing.allocator;
+    const kern = try moe_fp4.build(lim_ds);
+    defer kern.deinit();
+    var bad: usize = 0;
+    // NVFP4 with FP4_READS off as well: the equal-scale spans take MXFP4's order there.
+    const cases = [_]struct { Fmt, [*:0]const u8 }{ .{ .mxfp4, "1" }, .{ .nvfp4, "1" }, .{ .nvfp4_scaled, "1" }, .{ .nvfp4, "0" }, .{ .mxfp4, "0" } };
+    for (cases, 0..) |cs, ci_| {
+        const f = cs[0];
+        var sc = Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        var g: Gen = .{ .seed = 0x1E7E + ci_ };
+        var l = try randomLayer(&sc, &g, d, f);
+        defer l.deinit();
+        var p = l;
+        try hostRouted(&sc, &l, d, f, 0x1E7E + ci_, false);
+        try hostRouted(&sc, &p, d, f, 0x1E7E + ci_, true);
+        var prng = std.Random.DefaultPrng.init(0x1E7E + ci_);
+        const in = try rowIns(&sc, &g, prng.random(), d);
+        for (1..decode.max_rows + 1) |R| {
+            var isc = Scope.init(gpa, sc.s);
+            defer isc.deinit();
+            const want = try launchLevers(&isc, kern, &l, in, 0, R, lever_off, cs[1]);
+            defer for (want) |b| gpa.free(b);
+            for (sets) |ls| {
+                const got = try launchLevers(&isc, kern, &l, in, 0, R, ls, cs[1]);
+                defer for (got) |b| gpa.free(b);
+                const pl = try launchLevers(&isc, kern, &p, in, 0, R, ls, cs[1]);
+                defer for (pl) |b| gpa.free(b);
+                var diff: [3]usize = @splat(0);
+                var seen: [3]usize = @splat(0);
+                for (0..3) |s| for (got[s], pl[s], want[s]) |a, b, w| {
+                    diff[s] += @intFromBool(a != w);
+                    seen[s] += @intFromBool(b != w);
+                };
+                if (diff[0] + diff[1] + diff[2] != 0 or seen[0] == 0 or seen[1] == 0 or seen[2] == 0)
+                    std.debug.print("[moe_fp4 levers] {s} {s} FP4_READS={s} R={d} {s}: up/down/chain bytes differing {any}, planted {any}\n", .{ d.name, @tagName(f), cs[1], R, ls.name, diff, seen });
+                bad += diff[0] + diff[1] + diff[2];
+                // The plant must show in every stage, or the comparison could not see a misread code.
+                for (seen) |v| if (v == 0) return error.PlantUnseen;
+            }
+        }
+        std.debug.print("[moe_fp4 levers] {s} {s} FP4_READS={s}: R = 1..6, {d} lever sets against the levers off\n", .{ d.name, @tagName(f), cs[1], sets.len });
+    }
+    return bad;
+}
+
+test "dsv41 dec moe_fp4 levers: DEC_WORD and UP_SPLIT, each and together, give today's bytes through both launches and the chain at R = 1..6 (mxfp4, nvfp4, nvfp4 with per-expert scales; FP4_READS on and off; DeepSeek-V4.1-Flash widths, both at GLM-5.3 Pro's); one misread code planted shows in every stage" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var bad = try leversAgree(deepseek, &lever_sets);
+    bad += try leversAgree(glm, lever_sets[2..]);
+    try testing.expectEqual(@as(usize, 0), bad);
+}
