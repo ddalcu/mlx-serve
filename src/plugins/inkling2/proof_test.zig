@@ -868,11 +868,12 @@ test "inkling2 kernels: the mid kernels serve the values of the chain they repla
         try expectClose(got.x, want.x, @max(tol, 2e-2), "mlp input");
         try testing.expectEqual(want.blocks != null, got.blocks != null);
         if (want.blocks) |b| try expectClose(got.blocks.?, b, 1e-6, "block stack");
-        const gi = try hostValues(a, &g, got.idx);
+        const picks = try kernels.topK(&g, got.scores, L.router_bias, try g.fromSlice(f32, &.{cfg.route_scale}, &.{1}), @intCast(top_k));
+        const gi = try hostValues(a, &g, picks[0]);
         defer a.free(gi);
         const wi = try hostValues(a, &g, want.idx);
         defer a.free(wi);
-        const gw = try hostValues(a, &g, got.weights);
+        const gw = try hostValues(a, &g, picks[1]);
         defer a.free(gw);
         const ww = try hostValues(a, &g, want.weights);
         defer a.free(ww);
@@ -995,7 +996,8 @@ test "inkling2 kernels: the expert tail kernels serve the stream and the conv st
         const kp = try randomRow(&g, a, seed + 7, &.{ 1, rows, kv_dim }, 1.0, dt);
         const vp = try randomRow(&g, a, seed + 8, &.{ 1, rows, kv_dim }, 1.0, dt);
         const op = try randomRow(&g, a, seed + 9, &.{ 1, rows, hidden }, 1.0, dt);
-        const got = try kernels.experts(&g, &L, cfg, &.{ .x = x, .idx = r.idx, .weights = r.weights, .residual = residual, .blocks = null, .op = op }, kp, vp, st, null);
+        const scores = try g.matmul(try g.astype(x, .float32), try g.transpose(L.router, &.{ 1, 0 }));
+        const got = try kernels.experts(&g, &L, cfg, &.{ .x = x, .scores = scores, .residual = residual, .blocks = null, .op = op }, kp, vp, st, null);
         const want = try layers.tail(&g, &L, &body, &.{ .x = x, .idx = r.idx, .weights = r.weights, .residual = residual, .blocks = null, .attn_state = x }, st);
         // The bf16 sums reach 20 and over, where one bf16 step is 0.125: a last-bit flip or two is not a miss.
         const tol: f32 = if (dt == .float32) 2e-3 else 0.3;
@@ -1005,6 +1007,43 @@ test "inkling2 kernels: the expert tail kernels serve the stream and the conv st
         const fed = try g.concat(&.{ try g.sliceAxis(st, 2, 0, 2 * kv_dim + hidden), try g.astype(try g.concat(&.{ kp, vp, op }, 2), .float32) }, 1);
         const left = try g.sliceAxis(fed, 1, rows, rows + taps - 1);
         try expectClose(got.state, try g.concat(&.{ left, want.mlp_state }, 2), tol, "conv state");
+    };
+}
+
+// Bar: the gate_up launch that ranks the router's logits itself writes the top-k kernel's picks and weights bit for
+// bit (a tied pair and a NaN logit among them), and the launch given those picks the same rows, on every packed
+// layout, one row and a few, with and without scales.
+test "inkling2 kernels: the gate_up launch ranks the router's picks as the top-k kernel does" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Stage.init(a);
+    defer s.deinit();
+    var cfg = s.body.cfg;
+    cfg.num_experts = 32;
+    cfg.top_k = 8;
+    cfg.moe_intermediate_size = 64;
+    const hidden: c_int = @intCast(cfg.hidden_size);
+    var seed: u64 = 15000;
+    for ([_]ExpertFormat{ .{ .mode = .nvfp4, .bits = 4, .group = 16 }, .{ .mode = .mxfp4, .bits = 4, .group = 32 }, .{ .mode = .mxfp8, .bits = 8, .group = 32 } } ++ affine_formats) |f| for ([_]c_int{ 1, 3 }) |rows| for ([_]bool{ true, false }) |scaled| {
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 10;
+        var L = s.body.layers[3];
+        L.gate_up = try packedBank(&g, a, seed, &.{ 32, 128, hidden }, f.bits, f.group, f.mode.?);
+        L.router_bias = try randomRow(&g, a, seed + 1, &.{32}, 0.05, .float32);
+        L.gate_up_scale = if (scaled) try g.addScalar(try randomRow(&g, a, seed + 2, &.{32}, 0.3, .float32), 1.5) else .{};
+        const x = try randomRow(&g, a, seed + 3, &.{ 1, rows, hidden }, 1.0, .bfloat16);
+        const logits = try fixture.randomF32(a, seed + 4, @intCast(rows * 32), 3.0);
+        defer a.free(logits);
+        logits[5] = logits[9];
+        logits[12] = std.math.nan(f32);
+        const scores = try g.fromSlice(f32, logits, &.{ rows, 32 });
+        const want = try kernels.topK(&g, scores, L.router_bias, try g.fromSlice(f32, &.{cfg.route_scale}, &.{1}), 8);
+        const got = try kernels.ups(&g, &L, &cfg, x, .{ .scores = scores });
+        try expectClose(try g.astype(got[1], .float32), try g.astype(want[0], .float32), 0, "routed picks");
+        try expectClose(got[2], want[1], 0, "routed weights");
+        const fed = try kernels.ups(&g, &L, &cfg, x, .{ .picks = try g.reshape(want[0], &.{rows * 8}) });
+        try expectClose(fed[0], got[0], 0, "rows from given picks");
     };
 }
 
