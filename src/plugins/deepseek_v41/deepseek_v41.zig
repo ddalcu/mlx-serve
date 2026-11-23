@@ -11150,6 +11150,57 @@ test "dsv41 DSpark round: draft, verify and finish timed apart, greedy (DSV41_RO
     });
 }
 
+/// Prints, for each piece of `commitRows` (main_proj, its norm, each stage's wkv and window row), whether the first `k`
+/// rows of a 6-row call are the bits of a `k`-row call: what `syncRound`'s all-rows commit needs to equal the host's.
+fn commitRowsInvariance(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
+    const ds = &(m.dspark orelse return);
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const R = 6;
+    const width = m.cfg.hidden_size * m.cfg.dsv4_n_dspark_target_layers;
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 7));
+    var mh = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mh);
+    try mlx.check(mlx.mlx_random_normal(&mh, &[_]c_int{ R, ci(width) }, 2, .float32, 0, 1, key, m.s));
+    const x = try sc.astype(mh, m.act);
+    for (1..R) |k| {
+        const part = try sc.slice(x, 0, 0, k);
+        const full_p = try sc.astype(try ds.main_proj.apply(&sc, x), .float32);
+        const part_p = try sc.astype(try ds.main_proj.apply(&sc, part), .float32);
+        const full_x = try sc.rms(try ds.main_proj.apply(&sc, x), ds.main_norm, m.cfg.rms_norm_eps);
+        const part_x = try sc.slice(full_x, 0, 0, k);
+        var same: [8]bool = @splat(true);
+        same[0] = try bitsEq(&sc, try sc.slice(full_p, 0, 0, k), part_p);
+        same[1] = try bitsEq(&sc, part_x, try sc.rms(try ds.main_proj.apply(&sc, part), ds.main_norm, m.cfg.rms_norm_eps));
+        for (0..@min(m.n_mtp, 3)) |si| {
+            const ly = &m.layers[m.n_layers + si];
+            const wf = try ly.wkv.apply(&sc, full_x);
+            const wp = try ly.wkv.apply(&sc, part_x);
+            same[2 + si] = try bitsEq(&sc, try sc.slice(wf, 0, 0, k), wp);
+            const kf = try kvRow(&sc, m, ly, m.rope_plain.fwd, wf, try sc.i(100));
+            const kp = try kvRow(&sc, m, ly, m.rope_plain.fwd, try sc.slice(wf, 0, 0, k), try sc.i(100));
+            same[5 + si] = try bitsEq(&sc, try sc.slice(kf, 0, 0, k), kp);
+        }
+        std.debug.print("[spec-sync] commit rows: the first {d} of 6 rows equal a {d}-row call: main_proj {}, norm {}, wkv {} {} {}, window row {} {} {}\n", .{ k, k, same[0], same[1], same[2], same[3], same[4], same[5], same[6], same[7] });
+    }
+}
+
+fn bitsEq(sc: *Scope, a: A, b: A) !bool {
+    const xa32 = try sc.astype(a, .float32);
+    const xb32 = try sc.astype(b, .float32);
+    try evalAll(&.{ xa32, xb32 });
+    const n = mlx.mlx_array_size(xa32);
+    if (n != mlx.mlx_array_size(xb32)) return false;
+    const contig_a = try sc.op1(mlx.mlx_copy, xa32);
+    const contig_b = try sc.op1(mlx.mlx_copy, xb32);
+    try evalAll(&.{ contig_a, contig_b });
+    const xa = mlx.mlx_array_data_float32(contig_a).?[0..n];
+    const xb = mlx.mlx_array_data_float32(contig_b).?[0..n];
+    return std.mem.eql(u32, @ptrCast(xa), @ptrCast(xb));
+}
+
 /// One `specSyncRun` round's record: the draft's ids and confidence bits, then what the round kept.
 const SyncRec = struct { ids: [17]u32 = @splat(0), conf: [16]u32 = @splat(0), len: usize = 0, tokens: [17]u32 = @splat(0), n_tok: usize = 0, accepted: u32 = 0, next: u32 = 0 };
 
@@ -11203,6 +11254,7 @@ test "dsv41 spec sync: GPU-accept rounds keep the host rounds' tokens, drafts an
     const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true, .dspark = true });
     defer m.deinit();
     try testing.expect(ctx + 1 >= m.cfg.sliding_window);
+    try commitRowsInvariance(m, gpa);
     const prompt = try gpa.alloc(u32, ctx);
     defer gpa.free(prompt);
     // a repeated run of 61 ids: the stages draft its continuation, so rounds keep drafts and roll others back
