@@ -8333,7 +8333,7 @@ pub const SampledDraft = struct { d: DsparkDraft, q: A };
 /// `MLX_SERVE_DSV41_DRAFT_SAMPLE` (default off, read each round): a sampled request's DSpark rounds draw each draft
 /// token from the draft's own distribution and accept it with min(1, p / q).
 pub fn draftSampleOn() bool {
-    return env.on(.MLX_SERVE_DSV41_DRAFT_SAMPLE);
+    return env.onUnlessZero(.MLX_SERVE_DSV41_DRAFT_SAMPLE);
 }
 
 /// The draft for the block at [n, n + B) as `dsparkDraft` makes it, each position's token drawn from softmax(row / T)
