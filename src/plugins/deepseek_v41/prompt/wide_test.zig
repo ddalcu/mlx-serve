@@ -284,7 +284,11 @@ test "dsv41 wide tol: the MoE combine and hc expand in one launch are moePrefill
         // Planted: each row combining the next row's pairs (the unsort off by a row), then each row's post on the wrong
         // copies.
         const n: usize = L * top_k;
-        const off_row: dsv41.MoeParts = .{ .dn = p.dn, .inv = try csc.concat(&.{ try csc.slice(p.inv, 0, top_k, n), try csc.slice(p.inv, 0, 0, top_k) }, 0), .sh = p.sh };
+        // (Under PF_DOWN_TOKORD the rows are in pair order: the off-by-a-row read is the rows rolled by a token.)
+        const off_row: dsv41.MoeParts = if (p.tok)
+            .{ .dn = try csc.concat(&.{ try csc.slice(p.dn, 0, top_k, n), try csc.slice(p.dn, 0, 0, top_k) }, 0), .inv = p.inv, .sh = p.sh, .tok = true }
+        else
+            .{ .dn = p.dn, .inv = try csc.concat(&.{ try csc.slice(p.inv, 0, top_k, n), try csc.slice(p.inv, 0, 0, top_k) }, 0), .sh = p.sh };
         try testing.expect(!try close("  planted: the unsort off by a row", want, try mtail.launch(&csc, off_row, x1, &sp), x1, tol_kernel));
         const rolled_post: dsv41.Split = .{ .pre = none, .post = try csc.concat(&.{ try csc.slice(sp.post, 1, 1, 4), try csc.slice(sp.post, 1, 0, 1) }, 1), .comb = sp.comb };
         try testing.expect(!try close("  planted: post on the wrong copies", want, try mtail.launch(&csc, p, x1, &rolled_post), x1, tol_kernel));
@@ -425,7 +429,8 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_FP4_GEMM is today's output
                 const before = fp4gemm.launches.load(.monotonic);
                 const got = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
                 const served = fp4gemm.launches.load(.monotonic) - before;
-                const eq = try sameWords(want.dn, got.dn) and try sameWords(want.inv, got.inv);
+                // Under PF_DOWN_TOKORD the staged down's rows are in pair order: today's sorted rows unsorted.
+                const eq = try sameWords(if (got.tok) try csc.take(want.dn, want.inv, 0) else want.dn, got.dn) and try sameWords(want.inv, got.inv);
                 std.debug.print("pf fp4 gemm moePrefill {s} rows {d} gu_seg {}: staged launches {d}, same words {}\n", .{ if (nv) "NVFP4" else "MXFP4", L, seg, served, eq });
                 // Down always staged; under PF_GU_SEG gate/up only where the seg 128 schedule does not serve the call.
                 const launches: u32 = if (!seg or gather_nax.stagedServesGateUp(@intCast(L * top_k), experts, @intCast(hidden), @intCast(inter))) 2 else 1;
