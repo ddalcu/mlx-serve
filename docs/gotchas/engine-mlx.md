@@ -792,6 +792,18 @@ Defect: `MLX_SERVE_FORCE_BATCHED=1` at one slot still has `batch == 1`, which ar
 QK-norm gates that real N>1 does not. Fix: `tests/test_batched_equivalence.sh` runs a real two-stream arm and both
 kernels log `[batched] ... engaged (slots=N)`; an arm whose curls did not overlap reports NOT-RUN.
 
+### A plain row in the batched tick skipped the serial step's per-tick guards
+Defect: a plain request decoding beside others ran a repetition loop to `max_tokens` that the same request alone had
+cut (`[loop-stop]`); its `reasoning_budget_tokens` never closed the thought and `tool_choice: required` never forced
+the call. Cause: `loopGuardTick` (the loop cut, then `thinkBoundTick` and `toolForceTick`) opens the serial step and the
+MTP and DSpark group rounds; the split loop sent a plain row straight to `runBatchedDecodeTick`. Fix: `guardSpentTick`
+runs it on every batchable row first, and on a crowded MTP group's rows (`mtp_plain_tick`) before they join the plain
+tick; a row whose guard spent the tick sits the group out, and a guard failure fails that row alone. A batched row's
+forced commit forwards its pending token inside the span's chunk (the serial step forwarded it alone), so a hybrid
+trunk's answer after the commit can round differently from the serial step's. Guards: `test_batched_tick_guards.sh`,
+`a batched row whose per-tick guard fails errors alone and the tick returns`, `a crowded MTP row runs the per-tick
+guards before it joins the batched tick`.
+
 ### DSpark on LFM2.5: three silent zeros
 Defect: LFM2.5 DSpark drafters loaded nothing, or engaged at near-zero acceptance, without an error. Cause: the
 contract splits across root and `dflash_config`; a hybrid veto aimed at the Gemma drafter blocked every hybrid trunk
@@ -1629,3 +1641,16 @@ which `rollbackSsmTo` cannot undo after a drafted round, so no decode-end entry 
 round the request's stop ids (`Forward.stop_ids`) and the drafter never verifies one (`draftsToVerify`): the trunk's
 token carries the stop. Guards: `plugin native drafter: a round is handed the request's stop ids`, `inkling2 draft: a
 round never verifies a stop`.
+
+### A grammar slot cannot take a plain slot's way into or out of the batched tick
+Defect: a json_schema request decoded serial beside every other request (`BatchVerdict.grammar`), so a constrained
+call waited on chats and chats on it. Batching it is not only a mask per row: its pipeline differs from a plain slot's.
+Cause: a serial constrained step EMITS and forwards the token it returns and leaves only `pending_logits` (fresh from
+prefill, `next_token_id` is 0), so `drainPipelineForBatch` re-emitted the last token (or a 0) and drew the next one
+unmasked; and a slot leaving the batch holds a drawn, unforwarded token with no pending logits, which the serial step
+read as the end of generation and cut the JSON short. Fix: a grammar row draws under its own mask
+(`batching/grammar.zig`, built on the CPU while the forward runs), its grammar advances by the drawn token before the
+next tick (`noteBatchedSample`), `joinBatch` draws a constrained slot's next position under the mask without emitting,
+and `commitBatchedToken` emits and forwards the drawn token when a serial step takes the slot over. The reasoning
+protocol's phases stay serial (`Constraint.prePayload`). Guards: `a grammar row keeps its stream across joins and
+leaves`, `batched grammar rows: each draws under its own schema's mask`, `test_batched_grammar.sh`.

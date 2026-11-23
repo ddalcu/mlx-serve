@@ -121,6 +121,7 @@ Attention + KV:
 - **INT4 long-greedy divergence is legit**; byte-stable greedy ⇒ no spec + `--kv-quant off/8`. A prefix-cache HIT is not bit-identical on a HYBRID (≤0.047 nats; GLM-5.3 low-margin tokens move >1 nat with chunk width, numerics not state) ⇒ `--prefix-cache-entries 0`.
 - **SSM/hybrid**: init checks `ssm_state.ctx == null`; param-free RMS norm uses `ones()`; Nemotron dt clip accepts numeric/positive-infinity `time_step_limit` only; restored LiLiCorr without an anchor takes one plain round; PLD snapshots guard each field. Guards: format corpus, LiLiCorr tests.
 - **A GDN trunk's `KVCache.step` is 0 forever**: batched rope offsets read the slot's `moe_seq_offset`, which the batched tick ADVANCES. Bar: `test_batched_equivalence.sh`.
+- **A grammar row batches once its payload is under the JSON mask** (`Constraint.prePayload`; the reasoning protocol stays serial): it masks its OWN row (`batching/grammar.zig`), joins through `joinBatch` (a constrained slot holds no lookahead: the plain drain re-emits) and leaves through `commitBatchedToken`. Guard: `test_batched_grammar.sh`.
 - **A speech slot is a state machine over `SpeechHooks`** (`generate/speech.zig`, mlx-vlm's `stream_slots`): text slots sample ids, audio slots feed a frame's rows back as `Forward.embeds`; serial (`BatchVerdict.speech`), spec off, the codec streams `.audio` events in 4-frame chunks.
 - **A plugin's towers run through `VisionEncoder.plugin`** (`plugin/media.zig`, set when the table declares `MediaHooks`): the host keeps decoded RGB (`.plugin` mode), each item's run comes back beside its rows (`item_runs`), and a cached item's rows count only while its run is kept.
 - **A model whose per-request state lives OUTSIDE the KVCache needs enabled `CacheHooks.aux` for prefix-cache reuse AND a `Transformer.deinit` arm.** `openDirAbsolute` on an empty/relative path is ReleaseFast UB — guard every site.
@@ -178,6 +179,7 @@ Spec decode:
 Sampling:
 - **Penalties apply in `Generator.sampleLazy`** (#564); `SamplingParams.penalized()` keeps a request off `next`'s fast path, spec and batching. `frequency_penalty` is OpenAI's, subtracted per occurrence, never a `repeat_penalty` multiplier (#912). Guard: `tests/test_repeat_penalty.sh`.
 - **`top_p` 0 is GREEDY** (`applyTopP` floors at `floatMin`). Filters cut by RANK with lowest-id tie break (`ranksDescending`, `topRanksDescending`); cumsum in f32; top-k + top-p are ONE pass (`filterTopKTopP`). Block helpers use `_axis` ops.
+- **Every decoding row runs `loopGuardTick` before its step** (the loop cut, `thinkBoundTick`, `toolForceTick`): the serial step, the MTP and DSpark group rounds and the batched tick's split loop, where a row whose guard spent the tick sits the group out. A crowded MTP group's rows (`mtp_plain_tick`) run it before they join the plain tick; a guard failure fails that row alone (`guardSpentTick`). Guards: `test_batched_tick_guards.sh`, decode.zig's two per-tick guard tests.
 
 Kernels + numerics:
 - **A Metal tensor over a whole matrix indexes in `int`**: past 2^31 elements its stores wrap into other memory (w8a8's

@@ -20,7 +20,7 @@ pub const forcedBoundaryCanContinue = @import("../../../sdk/grammar/constraint.z
 
 pub fn hasPrePayloadConstraint(self: *const Generator) bool {
     const constraint = self.sampling.constraint orelse return false;
-    return constraint.proto != null and constraint.pstate.phase != .json_body;
+    return constraint.prePayload();
 }
 
 /// The pending reasoning→payload boundary, consumed by the scheduler when

@@ -15,6 +15,8 @@ const runSingleDecodeTick = @import("../decode.zig").runSingleDecodeTick;
 const finishSlot = @import("../finish.zig").finishSlot;
 const Scheduler = @import("../scheduler.zig").Scheduler;
 const Slot = @import("../slot.zig").Slot;
+const Generator = @import("../generate/generator.zig").Generator;
+const grammar_rows = @import("grammar.zig");
 const batchedTickAction = @import("../spec/mtp_groups.zig").batchedTickAction;
 const Planner = @import("../spec/mtp_groups.zig").Planner;
 const plannerShape = @import("../spec/mtp_groups.zig").plannerShape;
@@ -71,7 +73,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // Legacy→batched transition: a slot arriving from a legacy single-slot
     // tick (or fresh from prefill) carries lazy pipeline state — a lookahead
     // token ALREADY FORWARDED into its KV cache plus `pending_logits` for
-    // the position after it. Consume that state via `drainPipelineForBatch`
+    // the position after it. Consume that state via `joinBatch`
     // (emit the lookahead, sample the new next_token_id from the pending
     // logits). Dropping it and re-forwarding `next_token_id` — the pre-fix
     // behavior — appended a duplicate cache position and re-emitted an
@@ -86,12 +88,19 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
             slot.markError("no_generator");
             continue;
         };
-        if (gen.has_pending_logits or gen.has_pending_token) {
-            const emitted = gen.drainPipelineForBatch(slot.allocator) catch |err| {
-                slot.markError(@errorName(err));
+        const join = gen.joinBatch(slot.allocator) catch |err| {
+            slot.markError(@errorName(err));
+            continue;
+        };
+        switch (join) {
+            .stopped => {
+                // checkStop fired on the pipelined lookahead (EOS / pad-run
+                // / max_tokens / timeout); nothing to emit.
+                slot.completion_tokens = gen.completion_tokens;
+                finishSlot(sch, slot, gen.finish_reason);
                 continue;
-            };
-            if (emitted) |tok| {
+            },
+            .joined => |emitted| if (emitted) |tok| {
                 slot.pushToken(tok);
                 if (Planner.enabled() and gen.mtp_planner_owned) {
                     gen.mtp_planner_plain_ticks += 1;
@@ -107,13 +116,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
                     finishSlot(sch, slot, "length");
                     continue;
                 }
-            } else {
-                // checkStop fired on the pipelined lookahead (EOS / pad-run
-                // / max_tokens / timeout); nothing to emit.
-                slot.completion_tokens = gen.completion_tokens;
-                finishSlot(sch, slot, gen.finish_reason);
-                continue;
-            }
+            },
         }
         live[live_n] = slot;
         live_n += 1;
@@ -198,19 +201,12 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // the initWithOptions chokepoint and carries the model's
     // reserved-token suppression mask; the slot's copy is the raw
     // request params.
-    var sample_params: [MAX_BATCH_GROUP]generate_mod.SamplingParams = undefined;
-    var sample_rows: [MAX_BATCH_GROUP]mlx.mlx_array = undefined;
+    var gens: [MAX_BATCH_GROUP]*Generator = undefined;
     var sample_ids: [MAX_BATCH_GROUP]i32 = undefined;
     std.debug.assert(live_n == logits_arr.len);
-    std.debug.assert(live_n <= sample_params.len);
-    for (batch, 0..) |slot, i| {
-        sample_params[i] = slot.legacy_gen.?.sampling;
-        sample_rows[i] = logits_arr[i];
-    }
-    if (live_n > 0) {
-        try generate_mod.sampleRows(sample_ids[0..live_n], sample_rows[0..live_n], sample_params[0..live_n], xfm_ptr.s);
-        for (batch, 0..) |slot, i| slot.legacy_gen.?.sampling.draw = sample_params[i].draw;
-    }
+    std.debug.assert(live_n <= gens.len);
+    for (batch, 0..) |slot, i| gens[i] = &slot.legacy_gen.?;
+    try grammar_rows.sampleBatchRows(allocator, sample_ids[0..live_n], gens[0..live_n], logits_arr, xfm_ptr.s);
 
     // Sample per slot, emit prev id, set new next_token_id.
     for (batch, 0..) |slot, i| {
@@ -228,6 +224,8 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         const val = sampled orelse continue;
         gen.next_token_id = @intCast(val);
         if (Planner.enabled()) plannerOutputClock(slot, gen);
+        // A grammar's payload boundary goes out before the token that carries it, as on the serial path.
+        if (gen.takeConstraintSpan()) |span| slot.publishConstraintSpan(span.token_index, span.byte_offset);
 
         // Stop checks (mirrors Generator.checkStop).
         if (generate_mod.isEosId(emit, slot.eos_token_ids)) {
@@ -262,6 +260,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
             finishSlot(sch, slot, "length");
             continue;
         }
+        gen.noteBatchedSample(gen.next_token_id) catch |err| slot.markError(@errorName(err));
     }
     if (price_clean and live_n == N) {
         var gaps: [Planner.MAX_ROWS]f32 = undefined;
