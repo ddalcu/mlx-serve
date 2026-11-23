@@ -4152,7 +4152,7 @@ pub fn kvRow(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, kv: A, po
     const L = dim(kv, 0);
     const D = dim(kv, 1);
     const eps = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.rms_norm_eps}, &[_]c_int{1}, 1, .float32));
-    if (env.on(.MLX_SERVE_DSV41_PF_KV_ROWS)) if (try kvRows(sc, m, ly, periods, kv, pos, eps)) |y| return y;
+    if (env.onUnlessZero(.MLX_SERVE_DSV41_PF_KV_ROWS)) if (try kvRows(sc, m, ly, periods, kv, pos, eps)) |y| return y;
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(D) }, 2, mlx.mlx_array_dtype(kv)));
