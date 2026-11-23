@@ -332,7 +332,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
     // Ungated is the previous `prefixCacheMemForLoad`.
     if (!config.longCtxGated()) {
         const chunk: u64 = pinPrefillChunk(config);
-        // `statePerTokenBilled` is 0 off qwen4_exp.
+        // `statePerTokenBilled` is 0 off qwen4_exp and a plugin that bills its own state.
         const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
             getEffectiveContextLength(config) +| slotFixedKvBytes(config, kv_bits, chunk);
         const ask = ungatedHotCacheAsk(config, requested, http_server.launch().prefix_cache_mem_explicit, kv_bits, getEffectiveContextLength(config), chunk);

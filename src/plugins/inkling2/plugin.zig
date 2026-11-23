@@ -54,6 +54,8 @@ pub const Spec = struct {
     opens: ?[]kernels.Open = null,
     /// A verify's taps `[1, S, taps * hidden]`, held until its accept.
     held: Array = .{},
+    /// Set when a drafter layer attends every committed position: a push hands it each forward's rows, all of them.
+    full: ?*const draft.Drafter = null,
 
     const Parked = struct { owner: u32 = 0, ring: Array = .{}, end: u64 = 0, at: u64 = 0, context: draft.ContextKv = .{} };
 
@@ -93,6 +95,7 @@ pub const Spec = struct {
         const n = ops.shape(taps)[1];
         const continues = sp.rows(first) > 0;
         if (!continues) sp.context.release();
+        if (sp.full) |d| try d.appendFull(g, &sp.context, taps, first);
         var all = if (continues) try g.concat(&.{ sp.ring, taps }, 1) else taps;
         const total = ops.shape(all)[1];
         if (total > sp.keep) all = try g.contiguous(try g.sliceAxis(all, 1, total - sp.keep, total));
@@ -226,7 +229,7 @@ pub const Model = struct {
         if (spec) |sp| {
             // The newest rows' taps, side by side; a verify's wait for its accept.
             taps[sp.visits.len] = final;
-            const from = @max(0, run.rows - sp.keep);
+            const from = if (sp.full != null) 0 else @max(0, run.rows - sp.keep);
             var parts: [config.max_taps]ops.Array = undefined;
             for (taps[0 .. sp.visits.len + 1], parts[0 .. sp.visits.len + 1]) |x, *part| part.* = try g.sliceAxis(x, 1, from, run.rows);
             const rows = try g.concat(parts[0 .. sp.visits.len + 1], 2);
@@ -506,9 +509,9 @@ fn msSince(t0: i64) f32 {
     return @as(f32, @floatFromInt(nowUs() - t0)) / 1000;
 }
 
-/// Every term is the engine's default arithmetic over the shell and the layout.
-fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
-    out.* = .{};
+/// The engine's default arithmetic over the shell and the layout, plus the drafter's context (`draftStatePerToken`).
+fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+    out.* = .{ .state_per_token = config.draftStatePerToken(p) };
 }
 
 pub const Loaded = struct {
@@ -825,6 +828,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         m.drafter = d;
         m.tap_visits = dc.taps;
         m.spec = .{ .visits = m.tap_visits[0 .. dc.tap_count - 1], .keep = @intCast(dc.window - 1) };
+        if (dc.fullBytesPerToken() > 0) m.spec.full = d;
         m.base.weights.spec = &m.spec;
     };
     // The parse's quant block is freed with it; the forward reads none of it.

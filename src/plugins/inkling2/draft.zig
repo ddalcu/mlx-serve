@@ -52,9 +52,17 @@ pub const ContextKv = struct {
     k: [max_layers]Array = @splat(.{}),
     v: [max_layers]Array = @splat(.{}),
     end: u64 = 0,
+    /// A full layer's context (`Drafter.appendFull`): the positions [`full_from`, `full_end`) at the front of buffers
+    /// that grow a chunk at a time.
+    fk: [max_layers]Array = @splat(.{}),
+    fv: [max_layers]Array = @splat(.{}),
+    full_from: u64 = 0,
+    full_end: u64 = 0,
+    /// The buffers' growth, in positions.
+    chunk: c_int = 4096,
 
     pub fn release(c: *ContextKv) void {
-        for (c.k ++ c.v) |a| if (a.ctx != null) {
+        for (c.k ++ c.v ++ c.fk ++ c.fv) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
         };
         c.* = .{};
@@ -167,6 +175,61 @@ pub const Drafter = struct {
         return if (at) |p| g.rope(h, @intCast(d.cfg.head_dim), d.cfg.theta, p) else h;
     }
 
+    /// Appends the full layers' context keys and values of the taps `[1, n, taps * hidden]` at positions `first`.. to
+    /// `cc` (restarted when it ends elsewhere), queued on the GPU.
+    pub fn appendFull(d: *const Drafter, g: *Graph, cc: *ContextKv, taps: Array, first: u64) !void {
+        const n = ops.shape(taps)[1];
+        if (n == 0) return;
+        const restart = cc.full_end != first;
+        if (restart) cc.full_from = first;
+        // Rows land in buffers grown a chunk at a time; the write is in place (the old handle is freed before it runs).
+        const chunk = cc.chunk;
+        const at: c_int = @intCast(first - cc.full_from);
+        const need = at + n;
+        var held: [2 * max_layers]Array = undefined;
+        var count: usize = 0;
+        const kv: c_int = @intCast(d.cfg.kv_heads);
+        const hd: c_int = @intCast(d.cfg.head_dim);
+        for (d.layers, 0..) |*L, i| {
+            if (!d.cfg.full(i)) continue;
+            var lg = g.scope();
+            defer lg.deinit();
+            var bufs = [2]Array{ cc.fk[i], cc.fv[i] };
+            for (&bufs) |*buf| {
+                if (restart and buf.ctx != null) buf.* = .{};
+                const cap: c_int = if (buf.ctx != null) ops.shape(buf.*)[2] else 0;
+                // Room past the rows for a draft's block keys (`draft` writes them there, then reads one view).
+                const room = need + @as(c_int, @intCast(d.cfg.block));
+                if (room > cap) {
+                    const grown = try lg.zeros(&.{ 1, kv, @divTrunc(room + chunk - 1, chunk) * chunk, hd }, ops.dtype(d.norm));
+                    buf.* = if (at > 0) try lg.sliceUpdate(grown, try lg.sliceAxis(buf.*, 2, 0, at), &.{ 0, 0, 0, 0 }, &.{ 1, kv, at, hd }) else grown;
+                }
+            }
+            // A prompt's rows a slice at a time, so the f32 tap mix stays small.
+            var r0: c_int = 0;
+            while (r0 < n) : (r0 += 1024) {
+                const r1 = @min(n, r0 + 1024);
+                const rows32 = try lg.astype(try lg.reshape(try lg.sliceAxis(taps, 1, r0, r1), &.{ 1, r1 - r0, @intCast(d.cfg.tap_count), @intCast(d.hidden) }), .float32);
+                const context = try d.mix(&lg, rows32, @intCast(i), L.mix_norm);
+                const k = try d.heads(&lg, try project(&lg, &L.k_ctx, context), d.cfg.kv_heads, L.k_norm_ctx, @as(c_int, @intCast(first)) + r0);
+                const v = try d.heads(&lg, try project(&lg, &L.v_ctx, context), d.cfg.kv_heads, null, null);
+                for ([2]Array{ k, v }, &bufs) |x, *buf| buf.* = try lg.sliceUpdate(buf.*, try lg.astype(x, ops.dtype(d.norm)), &.{ 0, 0, at + r0, 0 }, &.{ 1, kv, at + r1, hd });
+            }
+            for (bufs, [2]*Array{ &cc.fk[i], &cc.fv[i] }) |buf, dst| {
+                const next = lg.escape(buf);
+                if (dst.ctx != null) _ = mlx.mlx_array_free(dst.*);
+                dst.* = next;
+                held[count] = next;
+                count += 1;
+            }
+        }
+        cc.full_end = first + @as(u64, @intCast(n));
+        if (count == 0) return;
+        const vec = mlx.mlx_vector_array_new_data(&held, count);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_async_eval(vec));
+    }
+
     /// A drafted block: its tokens `[block - 1]` int32 and the drafter's probability of each `[block - 1]` f32, lazy.
     pub const Block = struct { tokens: Array, confidence: Array };
 
@@ -202,14 +265,24 @@ pub const Drafter = struct {
             defer lg.deinit();
             var kc: Array = .{};
             var vc: Array = .{};
-            if (new32) |rows32| {
+            // A full layer reads every committed position (kept by `appendFull`), not the ring's newest.
+            if (cache) |cc| if (cfg.full(i) and cc.fk[i].ctx != null and cc.full_end == at) {
+                const n_full: c_int = @intCast(cc.full_end - cc.full_from);
+                kc = try lg.sliceAxis(cc.fk[i], 2, 0, n_full);
+                vc = try lg.sliceAxis(cc.fv[i], 2, 0, n_full);
+            };
+            const full_read = kc.ctx != null;
+            // A layer with no ring copy (a full one whose buffers end elsewhere) projects the whole ring.
+            const own: c_int = if (fresh < n and cache.?.k[i].ctx == null) n else fresh;
+            if (full_read) {} else if (own > 0) {
+                const rows32 = if (own == fresh) new32.? else try tapsOf(&lg, taps, 0, n, cfg.tap_count, hidden);
                 const context = try d.mix(&lg, rows32, @intCast(i), L.mix_norm);
-                kc = try d.heads(&lg, try project(&lg, &L.k_ctx, context), cfg.kv_heads, L.k_norm_ctx, position - fresh);
+                kc = try d.heads(&lg, try project(&lg, &L.k_ctx, context), cfg.kv_heads, L.k_norm_ctx, position - own);
                 vc = try d.heads(&lg, try project(&lg, &L.v_ctx, context), cfg.kv_heads, null, null);
             }
-            if (fresh < n) {
+            if (!full_read and own < n) {
                 const cc = cache.?;
-                if (fresh > 0) {
+                if (own > 0) {
                     kc = try lg.concat(&.{ cc.k[i], kc }, 2);
                     vc = try lg.concat(&.{ cc.v[i], vc }, 2);
                 } else {
@@ -220,18 +293,40 @@ pub const Drafter = struct {
                 kc = try lg.sliceAxis(kc, 2, total - n, total);
                 vc = try lg.sliceAxis(vc, 2, total - n, total);
             }
-            if (cache) |cc| {
+            if (cache) |cc| if (!full_read) {
                 const k_held = lg.escape(kc);
                 const v_held = lg.escape(vc);
                 if (cc.k[i].ctx != null) _ = mlx.mlx_array_free(cc.k[i]);
                 if (cc.v[i].ctx != null) _ = mlx.mlx_array_free(cc.v[i]);
                 cc.k[i] = k_held;
                 cc.v[i] = v_held;
-            }
+            };
             const x = try lg.rmsNorm(h, L.in_norm, cfg.eps);
             const q = try d.heads(&lg, try project(&lg, &L.q, x), cfg.heads, L.q_norm, position);
-            const keys = try lg.concat(&.{ kc, try d.heads(&lg, try project(&lg, &L.k, x), cfg.kv_heads, L.k_norm, position) }, 2);
-            const values = try lg.concat(&.{ vc, try d.heads(&lg, try project(&lg, &L.v, x), cfg.kv_heads, null, null) }, 2);
+            const kb = try d.heads(&lg, try project(&lg, &L.k, x), cfg.kv_heads, L.k_norm, position);
+            const vb = try d.heads(&lg, try project(&lg, &L.v, x), cfg.kv_heads, null, null);
+            var keys: Array = .{};
+            var values: Array = .{};
+            if (full_read) {
+                // The block's keys go in place after the context, as one view: no copy of the whole context. The next
+                // push overwrites them.
+                const cc = cache.?;
+                const n_full: c_int = @intCast(cc.full_end - cc.full_from);
+                const sh = ops.shape(cc.fk[i]);
+                const end = n_full + block;
+                if (end <= sh[2]) {
+                    for ([2]Array{ kb, vb }, [2]*Array{ &cc.fk[i], &cc.fv[i] }, [2]*Array{ &keys, &values }) |x_new, dst, out| {
+                        const next = lg.escape(try lg.sliceUpdate(dst.*, try lg.astype(x_new, ops.dtype(dst.*)), &.{ 0, 0, n_full, 0 }, &.{ 1, sh[1], end, sh[3] }));
+                        _ = mlx.mlx_array_free(dst.*);
+                        dst.* = next;
+                        out.* = try lg.sliceAxis(next, 2, 0, end);
+                    }
+                }
+            }
+            if (keys.ctx == null) {
+                keys = try lg.concat(&.{ kc, kb }, 2);
+                values = try lg.concat(&.{ vc, vb }, 2);
+            }
             const read = try lg.reshape(try lg.transpose(try lg.sdpa(q, keys, values, scale, .none), &back), &.{ 1, block, -1 });
             const mid = try lg.add(h, try project(&lg, &L.o, read));
             const y = try lg.rmsNorm(mid, L.post_norm, cfg.eps);

@@ -93,6 +93,148 @@ test "inkling2 proof: a prompt in chunks and then token by token serves the rows
     }
 }
 
+/// The release parsed and loaded through the plugin table (its defaults), for the tests that run it.
+const Release = struct {
+    weights: @import("../../sdk/weights/resident.zig").Resident,
+    parsed: abi.Parsed = .{},
+    m: *plugin.Loaded,
+    s: mlx.mlx_stream,
+
+    fn open(a: std.mem.Allocator, pack_dir: []const u8) !Release {
+        const FsPackDir = @import("../../sdk/util/pack_dir.zig").FsPackDir;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var fs = try FsPackDir.open(io, pack_dir);
+        defer fs.close();
+        const pd = fs.packDir();
+        const cfg_json = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(a, "{s}/config.json", .{pack_dir}), a, .limited(1 << 20));
+        const Resident = @import("../../sdk/weights/resident.zig").Resident;
+        const loadWeightsOpt = @import("../../sdk/weights/load.zig").loadWeightsOpt;
+        var r: Release = .{ .weights = Resident.adopt(try loadWeightsOpt(io, std.heap.c_allocator, pack_dir, .{})), .m = undefined, .s = mlx.mlx_default_gpu_stream_new() };
+        const t = &plugin.table;
+        if (!t.parse(&pd, .of(cfg_json), .{}, null, false, &r.parsed).isOk()) return error.ParseRefused;
+        const src = r.weights.source();
+        var why: abi.Verdict = .{};
+        const mp = t.load(&.{ .model_dir = .of(pack_dir), .dir = &pd, .parsed = &r.parsed, .stream = .{ .ctx = r.s.ctx }, .weights = &src }, &why) orelse return error.LoadRefused;
+        r.m = @ptrCast(@alignCast(mp));
+        return r;
+    }
+
+    fn close(r: *Release) void {
+        _ = mlx.mlx_synchronize(r.s);
+        plugin.table.unload(r.m);
+        plugin.table.free_parsed(&r.parsed);
+        r.weights.deinit();
+        _ = mlx.mlx_stream_free(r.s);
+    }
+};
+
+fn argmaxOf(row: []const f32) u32 {
+    var best: usize = 0;
+    for (row, 0..) |x, i| if (x > row[best]) {
+        best = i;
+    };
+    return @intCast(best);
+}
+
+// Bar: on the release (`INKLING2_RELEASE`), a function defined further back than the drafter's window and then named
+// again: the first round's draft is not the one a read of only the newest window - 1 positions gives, and greedy
+// rounds (a verify, then its finish) commit the plain greedy decode's tokens up to the first difference, and there a
+// near-tie of the plain step's logits (the verify sums in another order than a decode row), within 1% of its top.
+test "inkling2 release: the drafter's full layer reads the prompt past its window" {
+    const env = @import("../../env.zig");
+    const pack_dir = std.mem.span(env.get(.INKLING2_RELEASE) orelse return error.SkipZigTest);
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var rel = try Release.open(a, pack_dir);
+    defer rel.close();
+    // Apple9+ only (`draftsOn`).
+    const d = rel.m.drafter orelse return error.SkipZigTest;
+    try testing.expect(rel.m.spec.full != null and rel.m.spec.full.? == d);
+    const t = &plugin.table;
+    const nd = t.spec.?.native_drafter.?;
+    const n_layers = rel.parsed.shell.num_hidden_layers;
+    // The release tokenizer's ids of "def scale_quokka_ledger(entries, factor):\n    total = ...\n\n", of a filler
+    // sentence, and of the function's first line again.
+    const def = [_]u32{ 1719, 152369, 62, 369, 140073, 62, 46025, 7, 80425, 11, 150935, 8, 25, 198, 149862, 150269, 196977, 150811, 7, 68, 13, 4605, 149887, 149888, 149881, 157358, 8, 198, 149862, 150583, 196989, 68, 13, 4605, 196987, 150935, 196990, 150269, 196986, 220, 15, 13, 80940, 149887, 149888, 149881, 157358, 60, 68014 };
+    const filler = [_]u32{ 371, 158897, 155511, 151470, 149876, 151346, 153194, 149880, 149876, 152504, 3661, 149894, 149876, 159167, 13, 220 };
+    const again = [_]u32{ 1719, 152369, 62, 369, 140073, 62, 46025, 7, 80425, 11, 150935, 8, 25, 198 };
+    var ids: std.ArrayList(u32) = .empty;
+    try ids.appendSlice(a, &def);
+    while (ids.items.len < def.len + d.cfg.window) try ids.appendSlice(a, &filler);
+    try ids.appendSlice(a, &again);
+    const n: u32 = @intCast(ids.items.len);
+    const prefill = struct {
+        fn run(m: *plugin.Loaded, al: std.mem.Allocator, cache: *test_cache.TestCache, tokens: []const u32, slot: u32) !u32 {
+            var h = [_]abi.Handle{cache.handle()};
+            var out: abi.ForwardOut = .{};
+            try testing.expect(plugin.table.forward(m, &.{ .mode = .prefill, .logits = .last_row, .rows = @intCast(tokens.len), .tokens = .of(tokens), .slots = .of(&[_]u32{slot}), .positions = .of(&[_]u32{0}), .caches = .of(&h), .cache_ops = &test_cache.ops }, &out).isOk());
+            return argmaxOf(try conformance.consumeF32(al, out.logits));
+        }
+    };
+    // Slot 0 the plain decode, slots 1 and 2 the rounds with and without the full read, each its own drafter context.
+    var plain = try test_cache.TestCache.init(std.heap.c_allocator, n_layers);
+    defer plain.deinit();
+    var want: [64]u32 = undefined;
+    var step_logits: [want.len][]f32 = undefined;
+    want[0] = try prefill.run(rel.m, a, &plain, ids.items, 0);
+    for (1..want.len) |i| {
+        var h = [_]abi.Handle{plain.handle()};
+        var out: abi.ForwardOut = .{};
+        try testing.expect(t.forward(rel.m, &.{ .mode = .decode, .logits = .last_row, .rows = 1, .tokens = .of(want[i - 1 .. i]), .slots = .of(&[_]u32{0}), .positions = .of(&[_]u32{n + @as(u32, @intCast(i)) - 1}), .caches = .of(&h), .cache_ops = &test_cache.ops }, &out).isOk());
+        step_logits[i] = try conformance.consumeF32(a, out.logits);
+        want[i] = argmaxOf(step_logits[i]);
+    }
+    var first_draft: [2][]const u32 = undefined;
+    for ([_]bool{ true, false }, 0..) |full, arm| {
+        const name = if (full) "full read" else "newest window only";
+        rel.m.spec.full = if (full) d else null;
+        defer rel.m.spec.full = d;
+        // The verify cut at its unmeasured 0.5 on both arms' first round.
+        rel.m.row_cost = .{};
+        const slot: u32 = @intCast(1 + arm);
+        var cache = try test_cache.TestCache.init(std.heap.c_allocator, n_layers);
+        defer cache.deinit();
+        var t1 = try prefill.run(rel.m, a, &cache, ids.items, slot);
+        var got: std.ArrayList(u32) = .empty;
+        var pos: u32 = n;
+        var verified: [abi.max_round_tokens]u32 = @splat(0);
+        var kept: [abi.max_round_tokens]u32 = @splat(0);
+        for (0..8) |r| {
+            var h = [_]abi.Handle{cache.handle()};
+            var out: abi.ForwardOut = .{};
+            try testing.expect(nd.verify.?(rel.m, &.{ .mode = .decode, .rows = 1, .tokens = .of(&[_]u32{t1}), .slots = .of(&[_]u32{slot}), .positions = .of(&[_]u32{pos}), .caches = .of(&h), .cache_ops = &test_cache.ops, .accept_cap = 7 }, &out).isOk());
+            const rows: usize = out.round.n;
+            const logits = try conformance.consumeF32(a, out.logits);
+            const vocab = logits.len / rows;
+            var accepted: usize = 0;
+            while (accepted + 1 < rows and argmaxOf(logits[accepted * vocab ..][0..vocab]) == out.round.tokens[accepted + 1]) accepted += 1;
+            for (1..rows) |k| verified[k] += 1;
+            for (1..accepted + 1) |k| kept[k] += 1;
+            if (r == 0) first_draft[arm] = try a.dupe(u32, out.round.tokens[1..rows]);
+            try got.appendSlice(a, out.round.tokens[0 .. 1 + accepted]);
+            t1 = argmaxOf(logits[accepted * vocab ..][0..vocab]);
+            var fin: abi.ForwardOut = .{};
+            try testing.expect(nd.finish.?(rel.m, @intCast(accepted), &fin).isOk());
+            pos = @intCast(fin.round.position);
+        }
+        std.debug.print("inkling2 release: {s}, a prompt of {d}: first draft {any}; draft positions 1 to {d} verified {any}, accepted {any}\n", .{ name, n, first_draft[arm], d.cfg.block - 1, verified[1..d.cfg.block], kept[1..d.cfg.block] });
+        const m = @min(got.items.len, want.len);
+        var same: usize = 0;
+        while (same < m and want[same] == got.items[same]) same += 1;
+        if (same < m) {
+            // Only a step past the first: the first token comes from each slot's own prompt forward.
+            try testing.expect(same >= 1);
+            const lg = step_logits[same];
+            const gap = lg[want[same]] - lg[got.items[same]];
+            std.debug.print("inkling2 release: {s} rounds and plain decode part at token {d} ({d} vs {d}): the plain step's logit gap {d:.4} of its top {d:.3}\n", .{ name, same, want[same], got.items[same], gap, lg[want[same]] });
+            try testing.expect(gap <= 0.01 * @abs(lg[want[same]]));
+        }
+    }
+    try testing.expect(!std.mem.eql(u32, first_draft[0], first_draft[1]));
+}
+
 test "inkling2 proof: a step reads every visit's conv windows and each loop pass's own KV" {
     for (streams()) |gpu| try stateMutations(gpu);
 }
@@ -1037,6 +1179,108 @@ test "inkling2 draft: rounds that carry the context keys and values draft what f
         try expectClose(got.tokens, want.tokens, 0, "drafted tokens");
         try expectClose(got.confidence, want.confidence, 1e-5, "draft probabilities");
     }
+}
+
+// Bar: a full layer's context appended a forward at a time, its buffers grown in place, drafts what one projection of
+// every row does, past the ring's reach; beside a sliding layer, a carried context drafts what a fresh one does; the
+// tokens exact, the probabilities to 1e-5.
+test "inkling2 draft: a layer outside local_layer_ids reads every committed position" {
+    const a = testing.allocator;
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const saved = fx_stream;
+    fx_stream = cpu;
+    defer fx_stream = saved;
+    var g = ops.Graph.init(a, cpu);
+    defer g.deinit();
+    const H = 32;
+    const HD = 16;
+    const V = 64;
+    const R = 8;
+    const dt: ops.Dtype = .float32;
+    var seed: u64 = 18000;
+    const W = struct {
+        fn of(gr: *ops.Graph, al: std.mem.Allocator, sd: *u64, shape: []const c_int, scale: f32) !ops.Array {
+            sd.* += 1;
+            return randomRow(gr, al, sd.*, shape, scale, .float32);
+        }
+        fn lin(gr: *ops.Graph, al: std.mem.Allocator, sd: *u64, out: c_int, in: c_int) !@import("../../sdk/bases/blocks/linear.zig").Linear {
+            return .{ .w = try of(gr, al, sd, &.{ out, in }, 0.2) };
+        }
+        fn layer(gr: *ops.Graph, al: std.mem.Allocator, sd: *u64, one: ops.Array, ones_hd: ops.Array) !draft.Layer {
+            return .{
+                .in_norm = one, .post_norm = one, .mix_norm = one,
+                .q = try lin(gr, al, sd, 2 * HD, H), .k = try lin(gr, al, sd, HD, H), .v = try lin(gr, al, sd, HD, H), .o = try lin(gr, al, sd, H, 2 * HD),
+                .k_ctx = try lin(gr, al, sd, HD, H), .v_ctx = try lin(gr, al, sd, HD, H),
+                .q_norm = ones_hd, .k_norm = ones_hd, .k_norm_ctx = ones_hd,
+                .gate = try lin(gr, al, sd, 48, H), .up = try lin(gr, al, sd, 48, H), .down = try lin(gr, al, sd, H, 48),
+            };
+        }
+    };
+    const one = try g.ones(&.{H}, dt);
+    const ones_hd = try g.ones(&.{HD}, dt);
+    var two = [_]draft.Layer{ try W.layer(&g, a, &seed, one, ones_hd), try W.layer(&g, a, &seed, one, ones_hd) };
+    var d: draft.Drafter = .{
+        .cfg = .{ .layers = 2, .heads = 2, .kv_heads = 1, .head_dim = HD, .intermediate = 48, .window = 13, .block = 4, .rank = R, .tap_count = 2, .local = 0 },
+        .hidden = H,
+        .s = cpu,
+    };
+    d.layers = two[0..];
+    d.norm = one;
+    d.mask = try W.of(&g, a, &seed, &.{ 1, 1, H }, 1.0);
+    d.alpha = try g.softmax(try W.of(&g, a, &seed, &.{ 3, 2, 1 }, 1.0), 1, true);
+    d.prev_rows = try W.of(&g, a, &seed, &.{ V, R }, 0.5);
+    d.rnn = .{ .w = try W.of(&g, a, &seed, &.{ 3 * R, 2 * R + 2 * H }, 0.1) };
+    d.rnn_bias = try W.of(&g, a, &seed, &.{3 * R}, 0.1);
+    d.rnn_norm = one;
+    d.fold = try W.of(&g, a, &seed, &.{ R, V }, 0.3);
+    d.fold_bias = try W.of(&g, a, &seed, &.{ 1, 1, V }, 0.3);
+    const head = try W.lin(&g, a, &seed, V, H);
+    const anchor = try W.of(&g, a, &seed, &.{ 1, 1, H }, 1.0);
+    const t1 = try g.fromSlice(i32, &.{7}, &.{1});
+    const all = try W.of(&g, a, &seed, &.{ 1, 40, 2 * H }, 1.0);
+    const keep: c_int = 12;
+    // Each round: the rows a forward pushes [from, to), then a draft at `to` from the ring's newest `keep`.
+    const pushes = [_][2]c_int{ .{ 0, 5 }, .{ 5, 9 }, .{ 9, 14 }, .{ 14, 18 }, .{ 18, 18 }, .{ 18, 40 } };
+    for ([_]?u32{ 0, 1 }) |local| {
+        d.cfg.local = local;
+        // Buffers grown 8 positions at a time: the pushes cross several growths.
+        var carried: draft.ContextKv = .{ .chunk = 8 };
+        defer carried.release();
+        for (pushes) |p| {
+            if (p[1] > p[0]) try d.appendFull(&g, &carried, try g.sliceAxis(all, 1, p[0], p[1]), @intCast(p[0]));
+            const ring = try g.sliceAxis(all, 1, @max(0, p[1] - keep), p[1]);
+            const got = try d.draft(&g, t1, anchor, ring, p[1], &head, V - 4, 30, &carried);
+            var want: draft.Drafter.Block = undefined;
+            var fresh: draft.ContextKv = .{};
+            defer fresh.release();
+            if (local.? == 0) {
+                // Every layer full: the draft over the whole context as its ring.
+                want = try d.draft(&g, t1, anchor, try g.sliceAxis(all, 1, 0, p[1]), p[1], &head, V - 4, 30, null);
+            } else {
+                try d.appendFull(&g, &fresh, try g.sliceAxis(all, 1, 0, p[1]), 0);
+                want = try d.draft(&g, t1, anchor, ring, p[1], &head, V - 4, 30, &fresh);
+            }
+            try expectClose(got.tokens, want.tokens, 0, "drafted tokens");
+            try expectClose(got.confidence, want.confidence, 1e-5, "draft probabilities");
+        }
+        // Past the ring the full layer changes the draft: the ring-only read differs.
+        const newest = try g.sliceAxis(all, 1, 40 - keep, 40);
+        const full_read = try d.draft(&g, t1, anchor, newest, 40, &head, V - 4, 30, &carried);
+        const ring_only = try d.draft(&g, t1, anchor, newest, 40, &head, V - 4, 30, null);
+        try testing.expect(try parity.maxAbsDiffF32(full_read.confidence, ring_only.confidence, fx_stream) > 1e-4);
+    }
+    // Full buffers that end before the draft (no push since): the full layer reads the ring, as a fresh context does.
+    d.cfg.local = 1;
+    var behind: draft.ContextKv = .{ .chunk = 8 };
+    defer behind.release();
+    try d.appendFull(&g, &behind, try g.sliceAxis(all, 1, 0, 18), 0);
+    _ = try d.draft(&g, t1, anchor, try g.sliceAxis(all, 1, 18 - keep, 18), 18, &head, V - 4, 30, &behind);
+    const ring = try g.sliceAxis(all, 1, 22 - keep, 22);
+    const got = try d.draft(&g, t1, anchor, ring, 22, &head, V - 4, 30, &behind);
+    const want = try d.draft(&g, t1, anchor, ring, 22, &head, V - 4, 30, null);
+    try expectClose(got.tokens, want.tokens, 0, "drafted tokens");
+    try expectClose(got.confidence, want.confidence, 1e-5, "draft probabilities");
 }
 
 // Bar: the cut a round verifies drafts down to follows what a verified row costs against a plain step, as measured

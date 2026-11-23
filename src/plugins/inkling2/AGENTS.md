@@ -68,6 +68,8 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **The draft head** (`mtp.safetensors`, greedy and sampled requests): a round drafts 7 tokens,
   verifies the prefix the drafter is sure of (`min_sure`, never a stop id: `draftsToVerify`) as ONE forward that appends nothing (`kernels.Open`), and
   commits the rows the trunk agrees with (`kernels.commit`): no rollback. Its taps are per engine slot (`Spec.select`).
+- **A drafter layer `local_layer_ids` leaves out reads every committed position** (`appendFull`, billed as `Bill.state_per_token`),
+  the others the ring's newest window - 1: read as a sliding layer, the release's layer 1 drafted blind past 1K tokens.
 - **The draft head loads on Apple9+ only, with the kernels on** (`draftsOn`, told to the engine by `NativeDrafter.active`):
   on an M1 a few-row verify costs so much more than a step that drafted decode ran under serial, and only the kernels
   serve a verified or batched visit (`MLX_SERVE_INKLING2_FUSED=0` also batches no slots).
