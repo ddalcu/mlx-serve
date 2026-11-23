@@ -476,6 +476,10 @@ pub const Dsv41Model = struct {
     /// `MLX_SERVE_DSV41_SPEC_SYNC`: the next round's draft, queued behind the last verify (`syncRound`), until
     /// `dsparkDraft` collects it.
     ds_next: ?DraftAhead = null,
+    /// `MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD`: the collected draft's verify rows' Engram kv (`engAheadLaunch`), until the
+    /// verify built on that draft takes it (`spanInAt`) and `dsparkBeginWith` lets it go (`extendIds`' drop of a
+    /// queued draft keeps it: it belongs to a draft already collected).
+    eng_next: ?EngNext = null,
     /// Host ns this round spent building the next round's draft (`syncRound`) less what the last round spent on this
     /// round's (`dsparkDraft`'s collect): `takeRoundShiftMs` gives a round the time its own draft and verify took.
     ds_shift_ns: i64 = 0,
@@ -604,6 +608,15 @@ pub const Dsv41Model = struct {
     }
 
     /// A queued draft (`ds_next`) no round collected: waited for, so nothing queued after it runs beside it, and let go.
+    fn dropEngNext(self: *Dsv41Model) void {
+        const e = &(self.eng_next orelse return);
+        for (&e.kv) |*x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x.*);
+            x.* = none;
+        };
+        self.eng_next = null;
+    }
+
     fn dropNext(self: *Dsv41Model) void {
         const a = &(self.ds_next orelse return);
         evalAll(&a.ev) catch {};
@@ -617,6 +630,7 @@ pub const Dsv41Model = struct {
         // scratch_x1.zig: the prompt's regions let go with the model.
         sx1.releaseAll();
         self.dropNext();
+        self.dropEngNext();
         if (self.dec_state) |*st| st.deinit();
         self.dropAhead();
         self.gpa.free(self.prompt);
@@ -5320,7 +5334,7 @@ const engram_twin_rows: usize = 16;
 /// M=1 words, so a row's keys and value are its one-row words at any verify width (MLX itself: gemv for one row,
 /// gemv_wide for 2..15, its GEMM past them; a verify's rows would round apart from the same rows decoded one at a time).
 /// One row (MLX's gemv: the same words), a wider call and a call the twin declines keep `wkv.apply`.
-fn engramWkv(sc: *Scope, e: *const EngramLayer, x: A) !A {
+pub fn engramWkv(sc: *Scope, e: *const EngramLayer, x: A) !A {
     const l = &e.wkv;
     const rows = dim(x, 0);
     if (l.ext == null and l.s.ctx == null and rows >= 2 and rows <= engram_twin_rows) {
@@ -6893,6 +6907,14 @@ pub fn spanInAt(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const S
     for (m.engrams, 0..) |*e, ek| {
         if (e.layer != li) continue;
         const nc = sp.ncols;
+        // `MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD`: a verify's kv made behind its draft, gated here.
+        if (verify and sp.img.ctx == null and sp.eng_gpu.ctx == null and !exactPart(m, verify, hi - lo, "engram")) if (m.eng_next) |*en| if (en.n == sp.p0 and lo == 0 and hi >= 2 and hi <= en.rows and en.kv[ek].ctx != null) {
+            x = try engramGate(sc, m, e.qk, x, try sc.slice(en.kv[ek], 0, 0, hi));
+            _ = eng_ahead_served.fetchAdd(1, .monotonic);
+            if (!eng_ahead_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD engaged: a verify's Engram kv made behind its draft ({d} rows)\n", .{hi});
+            if (m.trace) |tr| try tr.put("engram_{d}", .{li}, x);
+            continue;
+        };
         // `fuse.engram`: a decode-width span's write gathered from the resident table (`fusion.engramHeld`), else
         // from the rows read out of it (`fusion.engramWrite`).
         var fused: ?A = if (sp.eng_gpu.ctx != null) try dkern.engram_ids.write(sc, m, e, sp.eng_gpu, sp.eng_plan, ek, nc, x) orelse return error.Dsv41EngramGpuIdsDeclined else try fusion.engramHeld(sc, m, e, sp.eng_ids, m.engrams.len, ek, nc, lo, hi, x);
@@ -8062,6 +8084,13 @@ pub fn dsparkDraft(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32) 
             }
             _ = sync_collects.fetchAdd(1, .monotonic);
             m.ds_shift_ns -= @intCast(a.launch_ns);
+            if (a.eng_rows > 0) {
+                m.dropEngNext();
+                m.eng_next = .{ .kv = a.eng, .rows = a.eng_rows, .n = a.n };
+                a.eng = @splat(none);
+                a.eng_rows = 0;
+                _ = eng_ahead_taken.fetchAdd(1, .monotonic);
+            }
             return dsparkDraftCollect(m, gpa, a);
         }
         m.dropNext();
@@ -8084,13 +8113,89 @@ pub const DraftAhead = struct {
     launch_ns: u64 = 0,
     /// The state it drafts on (`ds_next`'s; null: any).
     st: ?*const State = null,
+    /// `MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD`: each Engram layer's kv over the verify rows [t1, the drafts] (`eng_rows`
+    /// of them), queued behind the draft (`engAheadLaunch`).
+    eng: [engram.MAX_LAYERS]A = @splat(none),
+    eng_rows: usize = 0,
     pub fn deinit(self: *DraftAhead) void {
         for (&self.ev) |*x| if (x.ctx != null) {
             _ = mlx.mlx_array_free(x.*);
             x.* = none;
         };
+        for (&self.eng) |*x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x.*);
+            x.* = none;
+        };
     }
 };
+
+/// `MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD`'s kv for the verify at position `n`: `rows` rows of each Engram layer's wkv
+/// over [t1, the drafts], the verify's first `L` rows taking its first `L`.
+pub const EngNext = struct { kv: [engram.MAX_LAYERS]A, rows: usize, n: usize };
+
+/// The verify rows the kv is made for: MLX runs an mxfp8 wkv of 2..5 rows on `qmv_wide`, whose every row is the same
+/// words at any row count, and 6 rows on the matrix units (`qmv_mma`), whose rows are other words; a 6-row verify (and
+/// a one-row one, on `qmv`) keeps its own wkv.
+pub const eng_ahead_rows = 5;
+
+pub fn engAheadOn() bool {
+    return env.on(.MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD);
+}
+var eng_ahead_logged = std.atomic.Value(bool).init(false);
+/// `MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD`'s verifies served (the tests' engagement count).
+pub var eng_ahead_served = std.atomic.Value(usize).init(0);
+/// Its kv launched behind a draft, and taken up with that draft by its round (the tests' counts).
+pub var eng_ahead_launched = std.atomic.Value(usize).init(0);
+pub var eng_ahead_taken = std.atomic.Value(usize).init(0);
+
+/// Whether the next verify's Engram kv can be made ahead: every Engram table wrapped on the GPU with its hash's
+/// constants there (`ENGRAM_GPU_IDS`' tables), a resident wkv, no fused or exact Engram write (those keep theirs).
+fn engAheadServes(m: *const Dsv41Model) bool {
+    return engAheadWhyNot(m) == null;
+}
+
+/// Why `engAheadServes` declines, or null.
+fn engAheadWhyNot(m: *const Dsv41Model) ?[]const u8 {
+    if (m.engrams.len == 0) return "no Engram layer";
+    if (m.hash == null) return "no Engram hash";
+    if (m.engram_ids == null) return "no GPU hash constants (MLX_SERVE_DSV41_ENGRAM_GPU_IDS off at load)";
+    if (m.fuse.engram) return "the fused Engram write";
+    if (exactPart(m, true, 2, "engram")) return "the exact verify (each row's own Engram wkv)";
+    if (m.act != .bfloat16 or !mlx.streamIsGpu(m.s)) return "not bf16 on the GPU";
+    for (m.engrams) |*e| if (e.gpu == null or e.wkv.ext != null or (e.table.bits != 4 and e.table.bits != 8)) return "an Engram table not wrapped on the GPU, or its wkv not resident";
+    return null;
+}
+
+/// `MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD`: the verify rows [t1, the drafts `a.ev[0]`] of the draft `a` queued for
+/// position `a.n` hashed on the GPU (`engram_ids.rowsMany` after the state's history), each Engram layer's rows
+/// gathered from its wrapped table (`engram_kv.gatherRows`: the host-copied rows' bf16 values) and projected by its
+/// wkv (`engramWkv`, as `engramApply`), handed to the GPU behind the draft: they run where the GPU would wait for the
+/// host to read the draft and build the verify, and the verify gates them instead of computing them.
+fn engAheadLaunch(sc: *Scope, m: *Dsv41Model, st: *const State, a: *DraftAhead, t1: u32) !void {
+    if (st.hist.items.len != a.n) return;
+    const ctx = &m.engram_ids.?;
+    const t = try sc.keep(mlx.mlx_array_new_data(&t1, &[_]c_int{1}, 1, .uint32));
+    const drafts = @min(mlx.mlx_array_size(a.ev[0]), eng_ahead_rows - 1);
+    if (drafts == 0) return;
+    const toks = try sc.concat(&.{ t, try sc.slice(try sc.astype(a.ev[0], .uint32), 0, 0, drafts) }, 0);
+    const R = mlx.mlx_array_size(toks);
+    const ids = try dkern.engram_ids.rowsMany(sc, &m.hash.?, ctx, st.hist.items, toks, 0);
+    const nc = m.hash.?.cols();
+    const page = std.heap.pageSize();
+    for (m.engrams, 0..) |*e, ek| {
+        const g = e.gpu.?;
+        const tb = &e.table;
+        const geo: dkern.engram_kv.Geo = .{ .w_base = tb.w_off % page, .w_stride = tb.w_stride, .s_base = tb.s_off % page, .s_stride = tb.s_stride };
+        const gw = geo.words();
+        const ga = try sc.keep(mlx.mlx_array_new_data(&gw, &[_]c_int{6}, 1, .uint32));
+        const mine = try sc.reshape(try sc.slice(ids, 1, ek * nc, (ek + 1) * nc), &.{ci(R * nc)});
+        const rows = (try dkern.engram_kv.gatherRows(sc, .{ .hd = tb.head_dim, .tb = tb.bits }, g[0], g[1], mine, ga)) orelse return;
+        hold(&a.eng[ek], try engramWkv(sc, e, try sc.reshape(rows, &.{ ci(R), -1 })));
+    }
+    a.eng_rows = R;
+    try asyncEvalAll(a.eng[0..m.engrams.len]);
+    _ = eng_ahead_launched.fetchAdd(1, .monotonic);
+}
 /// whether a draft can be launched ahead: the stages loaded.
 pub fn draftAheadOk(m: *const Dsv41Model) bool {
     return m.dspark != null and m.n_mtp > 0;
@@ -8478,6 +8583,8 @@ pub fn dsparkBeginWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u
     ids[0] = t1;
     @memcpy(ids[1 .. b + 1], d.ids[1 .. b + 1]);
     const t0 = monoUs();
+    // `MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD`: the kv made ahead serves this verify's graph only.
+    defer m.dropEngNext();
     const vl = extend(m, gpa, st, ids[0 .. b + 1], .all) catch |e| {
         st.dropVerify();
         return e;
@@ -8747,6 +8854,7 @@ fn syncRound(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, pending: *Dspar
     ahead.t1 = next_token;
     ahead.n = n0 + accepted + 1;
     const r = try dsparkFinishWith(m, gpa, st, pending, accepted, next_token, true);
+    if (engAheadOn() and engAheadServes(m)) try engAheadLaunch(&sc, m, st, &ahead, next_token);
     m.ds_shift_ns += @intCast(ahead.launch_ns);
     m.ds_next = ahead;
     _ = sync_rounds.fetchAdd(1, .monotonic);
@@ -11283,6 +11391,10 @@ test "dsv41 spec sync: GPU-accept rounds keep the host rounds' tokens, accepts a
     try specSyncRun(m, gpa, prompt, &gpu);
     const taken = sync_rounds.load(.monotonic);
     const collected = sync_collects.load(.monotonic);
+    // `MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD` on: the GPU rounds' verifies gate the kv made behind their drafts.
+    const ahead = eng_ahead_served.load(.monotonic);
+    std.debug.print("[spec-sync] SPEC_ENGRAM_AHEAD {} ({s}): kv launched behind {d} drafts, taken up with {d}; {d} verify Engram writes took it\n", .{ engAheadOn(), engAheadWhyNot(m) orelse "serves", eng_ahead_launched.load(.monotonic), eng_ahead_taken.load(.monotonic), ahead });
+    if (engAheadOn()) try testing.expect(ahead > 0);
     // What a round keeps (its tokens, accepted drafts and next token, the draft's width) is exact. The drafts' ids and
     // confidences are too, but under `MLX_SERVE_DSV41_DRAFT_QKV`: `syncRound` writes every verify row's window rows,
     // and the stage's wkv (a row view of the fused q_kv) rounds a row differently at another row count, so a draft
@@ -11322,6 +11434,99 @@ test "dsv41 spec sync: GPU-accept rounds keep the host rounds' tokens, accepts a
     for (host, plant) |h, p| planted += @intFromBool(!std.mem.eql(u32, &h.conf, &p.conf) or !std.mem.eql(u32, &h.ids, &p.ids));
     std.debug.print("[spec-sync] planted position: {d} of {d} drafts differ (unplanted {d})\n", .{ planted, N, draft_bits });
     try testing.expect(planted > 0 and planted > 4 * draft_bits);
+}
+
+test "dsv41 spec engram ahead: on the pack's Engram tables the verify write from the kv made ahead (t1 and 4 drafts hashed on the GPU, the wrapped tables' rows, wkv over 5 rows) is the served verify write word for word at every width it serves (2..5 rows); 1 and 6 rows keep the served write, which the ahead rows do not give; rotated rows fail (DSV41_SPEC_SYNC)" {
+    const dir = std.mem.span(std.c.getenv("DSV41_SPEC_SYNC") orelse return error.SkipZigTest);
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cfg = try testConfig(io, dir);
+    var w = try loadPack(io, gpa, dir, false);
+    defer w.deinit();
+    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true, .dspark = true });
+    defer m.deinit();
+    if (engAheadWhyNot(m)) |why| std.debug.print("[engram-ahead pack] the switch declines: {s}\n", .{why});
+    try testing.expect(engAheadServes(m));
+    const s = m.s;
+    const hc = m.cfg.dsv4_hc_mult;
+    const d = m.cfg.hidden_size;
+    const nc = m.hash.?.cols();
+    const nt = m.engrams.len * nc;
+    var prng = std.Random.DefaultPrng.init(0xA4EAD);
+    const rng = prng.random();
+    const vocab: u32 = @intCast(@min(m.vocab, 100000));
+    var equal: usize = 0;
+    var kept: [7]usize = @splat(0);
+    for (0..3) |seed| {
+        _ = seed;
+        var hist: [64]u32 = undefined;
+        for (&hist) |*v| v.* = m.compressedId(rng.uintLessThan(u32, vocab), false);
+        var toks: [6]u32 = undefined;
+        var comp: [6]u32 = undefined;
+        for (&toks, &comp) |*t, *c| {
+            t.* = rng.uintLessThan(u32, vocab);
+            c.* = m.compressedId(t.*, false);
+        }
+        var sc = Scope.init(gpa, s);
+        defer sc.deinit();
+        const page = std.heap.pageSize();
+        // The kv over 5 rows (the switch's) and over 6 (what a 6-row verify would read), each Engram layer.
+        var kv: [2][engram.MAX_LAYERS]A = undefined;
+        for ([_]usize{ eng_ahead_rows, 6 }, 0..) |rows, ri| {
+            const t = try sc.keep(mlx.mlx_array_new_data(&toks, &[_]c_int{@intCast(rows)}, 1, .uint32));
+            const ids = try dkern.engram_ids.rowsMany(&sc, &m.hash.?, &m.engram_ids.?, &hist, t, 0);
+            for (m.engrams, 0..) |*e, ek| {
+                const g = e.gpu.?;
+                const tb = &e.table;
+                const geo: dkern.engram_kv.Geo = .{ .w_base = tb.w_off % page, .w_stride = tb.w_stride, .s_base = tb.s_off % page, .s_stride = tb.s_stride };
+                const gw = geo.words();
+                const ga = try sc.keep(mlx.mlx_array_new_data(&gw, &[_]c_int{6}, 1, .uint32));
+                const mine = try sc.reshape(try sc.slice(ids, 1, ek * nc, (ek + 1) * nc), &.{ci(rows * nc)});
+                const tr = (try dkern.engram_kv.gatherRows(&sc, .{ .hd = tb.head_dim, .tb = tb.bits }, g[0], g[1], mine, ga)) orelse return error.Declined;
+                kv[ri][ek] = try engramWkv(&sc, e, try sc.reshape(tr, &.{ ci(rows), -1 }));
+            }
+        }
+        for (1..7) |R| for (m.engrams, 0..) |*e, ek| {
+            var key = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(key);
+            try mlx.check(mlx.mlx_random_key(&key, rng.int(u32)));
+            var xr = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&xr, &[_]c_int{ ci(R), ci(hc), ci(d) }, 3, .bfloat16, 0, 1, key, s));
+            const x = try sc.keep(xr);
+            // The served verify write: the host's ids, the rows read from the table, engramWrite over R rows.
+            var host: [6 * engram.MAX_LAYERS * engram.MAX_COLS]u32 = undefined;
+            m.hash.?.rows(&hist, comp[0..R], host[0 .. R * nt]);
+            var mine: [6 * engram.MAX_COLS]u32 = undefined;
+            for (0..R) |r| @memcpy(mine[r * nc ..][0..nc], host[r * nt + ek * nc ..][0..nc]);
+            const rows = try sc.keep(try e.table.gather(gpa, mine[0 .. R * nc], s));
+            const want = try engramWrite(&sc, m, e, x, try sc.reshape(rows, &.{ ci(R), -1 }), true);
+            const src = if (R <= eng_ahead_rows) kv[0][ek] else kv[1][ek];
+            const got = try engramGate(&sc, m, e.qk, x, try sc.slice(src, 0, 0, R));
+            const a = try hostF32(got);
+            defer gpa.free(a);
+            const b = try hostF32(want);
+            defer gpa.free(b);
+            var differ: usize = 0;
+            for (a, b) |u, v| differ += @intFromBool(@as(u32, @bitCast(u)) != @as(u32, @bitCast(v)));
+            const serves = R >= 2 and R <= eng_ahead_rows;
+            std.debug.print("[engram-ahead pack] rows {d} table {d} ({s}): {d} of {d} words differ from the served write\n", .{ R, ek, if (serves) "served from the 5-row kv" else "not served: the verify keeps its own wkv", differ, b.len });
+            if (serves) {
+                try testing.expectEqual(@as(usize, 0), differ);
+                equal += 1;
+            } else kept[R] += differ;
+            if (R == 3) {
+                const k3 = try sc.slice(kv[0][ek], 0, 0, 3);
+                const rot = try engramGate(&sc, m, e.qk, x, try sc.concat(&.{ try sc.slice(k3, 0, 1, 3), try sc.slice(k3, 0, 0, 1) }, 0));
+                const p = try hostF32(rot);
+                defer gpa.free(p);
+                var planted: usize = 0;
+                for (p, b) |u, v| planted += @intFromBool(@as(u32, @bitCast(u)) != @as(u32, @bitCast(v)));
+                try testing.expect(planted > b.len / 2);
+            }
+        };
+    }
+    std.debug.print("[engram-ahead pack] {d} served cases equal; the ahead rows at 1 row differ in {d} words, at 6 rows in {d} (those widths keep the served write)\n", .{ equal, kept[1], kept[6] });
+    try testing.expectEqual(@as(usize, 3 * (eng_ahead_rows - 1) * m.engrams.len), equal);
 }
 
 /// `DSV41_VERIFY_ROWS`' draft: `b` synthetic ids after the verify's first row.
