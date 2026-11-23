@@ -135,6 +135,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_llama_gguf.sh` **E**, `test_llama_concurrent.sh` **E**, `test_llama_multi_session.sh`, `test_llama_persistent_session.sh` llama.cpp · `test_llama_q2_0.sh` **E** a Q2_0 GGUF answers correctly
 - `test_ds4_serve.sh`, `test_ds4_smoke.sh`, `test_ds4_ssd_streaming.sh` ds4 · `test_mlx_gguf.sh` MLX GGUF · `test_qwen4exp_gguf_route.sh`
 - `test_ane_prefill.sh`, `test_ane_engine.sh` Neural Engine · `test_mlx_staged_nax.sh` **H** NAX-enabled mlx stage
+- `test_mlx_wide_reserve_inert.sh` the unarmed `mlx-metal-wide-reserve.patch` serves stock MLX's bytes and memory (stock vs patched libmlx, one binary)
 - `test_phase2_forward_equivalence.sh` forward pinned vs a baseline · `test_decode_graph_dump.sh` graph dump guard
 - `test_plugin_kit.sh` **H** the kit builds `_example` and `_example_engine` from itself; `plugin new|check|fixture|install`; a kit-built dylib serves its pack, the engine its named folder
 
