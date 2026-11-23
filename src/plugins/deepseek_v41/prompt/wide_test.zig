@@ -12,6 +12,7 @@ const dsv41 = @import("../deepseek_v41.zig");
 const mpair = @import("moe_pair.zig");
 const pfroute = @import("pf_route.zig");
 const fp4gemm = @import("fp4_gemm.zig");
+const gather_nax = @import("../../../sdk/blocks/moe/gather_qmm_nax.zig");
 const mtail = @import("moe_tail.zig");
 const hv2 = @import("hc_v2.zig");
 const fixture = @import("../decode/fixture.zig");
@@ -410,23 +411,29 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_FP4_GEMM is today's output
         if (nv) for (&ly.experts.scale, 0..) |*v, i| {
             v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x5CA1E + i);
         };
-        for ([_]usize{ 40, 777, 1254, 4097, 8192 }, 0..) |L, ci| {
+        for ([_]usize{ 40, 500, 777, 1254, 4097, 8192 }, 0..) |L, ci| {
             var csc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
             defer csc.deinit();
             const c = try call(&csc, L, @intCast(experts), 0x2100 + ci, false);
             const want = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
-            const on = env.override(.MLX_SERVE_DSV41_PF_FP4_GEMM, "1");
-            defer on.restore();
-            const before = fp4gemm.launches.load(.monotonic);
-            const got = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
-            const served = fp4gemm.launches.load(.monotonic) - before;
-            const eq = try sameWords(want.dn, got.dn) and try sameWords(want.inv, got.inv);
-            std.debug.print("pf fp4 gemm moePrefill {s} rows {d}: staged launches {d}, same words {}\n", .{ if (nv) "NVFP4" else "MXFP4", L, served, eq });
-            try testing.expectEqual(@as(u32, 2), served);
-            try testing.expect(eq);
-            // Planted: each row's weights on the wrong experts.
-            const bad = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, try rolled(&csc, c.wts), c.sh);
-            try testing.expect(!try sameWords(want.dn, bad.dn));
+            inline for (.{ false, true }) |seg| {
+                const gs = env.override(.MLX_SERVE_DSV41_PF_GU_SEG, if (seg) "1" else "0");
+                defer gs.restore();
+                const on = env.override(.MLX_SERVE_DSV41_PF_FP4_GEMM, "1");
+                defer on.restore();
+                const before = fp4gemm.launches.load(.monotonic);
+                const got = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+                const served = fp4gemm.launches.load(.monotonic) - before;
+                const eq = try sameWords(want.dn, got.dn) and try sameWords(want.inv, got.inv);
+                std.debug.print("pf fp4 gemm moePrefill {s} rows {d} gu_seg {}: staged launches {d}, same words {}\n", .{ if (nv) "NVFP4" else "MXFP4", L, seg, served, eq });
+                // Down always staged; under PF_GU_SEG gate/up only where the seg 128 schedule does not serve the call.
+                const launches: u32 = if (!seg or gather_nax.stagedServesGateUp(@intCast(L * top_k), experts, @intCast(hidden), @intCast(inter))) 2 else 1;
+                try testing.expectEqual(launches, served);
+                try testing.expect(eq);
+                // Planted: each row's weights on the wrong experts.
+                const bad = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, try rolled(&csc, c.wts), c.sh);
+                try testing.expect(!try sameWords(want.dn, bad.dn));
+            }
         }
     }
 }
