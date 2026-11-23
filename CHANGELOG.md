@@ -3,7 +3,7 @@
 ## v26.11.4 — Inkling 2 Mini
 
 - **Inkling 2 Mini.** Thinking Machines' looped 26B model runs straight from its released checkpoint, or from an mlx-lm pack: it reads images, drafts ahead with the head it ships, and serves several chats at once.
-- **Fixes.** On 16 and 32 GB Macs the prompt cache keeps room for a long conversation instead of re-reading it every turn. `--os-reserve-gib` takes effect again. `logprobs` stay valid JSON when a value is not a number. Inkling models follow the reasoning effort a client asks for instead of always thinking hard.
+- **Fixes.** On 16 and 32 GB Macs the prompt cache keeps room for a long conversation instead of re-reading it every turn. `--os-reserve-gib` takes effect again. `logprobs` stay valid JSON when a value is not a number. Inkling models follow the reasoning effort a client asks for instead of always thinking hard. A streamed Inkling reply keeps its thinking out of the answer.
 
 ---
 
