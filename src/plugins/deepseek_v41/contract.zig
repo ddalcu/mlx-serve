@@ -5180,6 +5180,8 @@ fn registerStreamed(set: *kc.Set) !void {
         .nax = true,
         .replaces = "astype f32, MLX's matmul a 256-row span (its split K): the same exact products, a blocked sum",
         .served = &.{ .{ .rows = 256, .n = 1024, .k = 1024 }, .{ .rows = 100, .n = 384, .k = 768 }, .{ .rows = 77, .n = 200, .k = 300 } },
+        // Another order of the same exact products than the chain it replaces: held to the float64 bound, not its bytes.
+        .sums = .{ .exact = false },
     });
     try kit.add(set, AttnQkT, &qk_t_l, .{}, .{
         .name = "dsv41 attn_qk_t (prompt width, the heads and their roped tail)",
