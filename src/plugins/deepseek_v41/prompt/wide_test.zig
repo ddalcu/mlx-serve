@@ -504,8 +504,8 @@ test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_TOKORD: the staged down's rows at thei
             const eq = [_]bool{ rows_eq, try sameWords(want_y, got_y), try sameWords(want_t, got_t), try sameWords(want_c[0], got_c[0]) and try sameWords(want_c[1], got_c[1]) and try sameWords(want_c[2], got_c[2]), try sameWords(want_o[0], got_o[0]) };
             std.debug.print("[down-tokord] {s} rows {d}: tok {} launches {d}; down rows {}, moePrefill {}, moe_tail {}, hc_v2 tail_c {}, tail_only_c {}\n", .{ if (nv) "NVFP4" else "MXFP4", L, got.tok, served, eq[0], eq[1], eq[2], eq[3], eq[4] });
             try testing.expect(got.tok);
-            // moePrefillParts, then moePrefill's own call.
-            try testing.expectEqual(@as(u32, 2), served);
+            // The one moePrefillParts call's down.
+            try testing.expectEqual(@as(u32, 1), served);
             for (eq) |v| try testing.expect(v);
             // Planted: every row one slot over (each token's picks rotated by one).
             fp4gemm.tok_plant = true;
