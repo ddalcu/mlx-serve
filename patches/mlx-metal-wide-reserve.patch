@@ -2,17 +2,18 @@ mlx_metal_wide_reserve (mlx-serve, off until a caller arms it): a reserve of lar
 The caller arms it with a byte floor and a list of sizes; the buffers are allocated and written once at the call (their
 pages mapped then). An allocation of at least the floor that MLX's cache cannot serve takes the smallest idle reserve
 buffer at least its size (the cache only serves within two pages of the size); its free puts it back. clear_cache and
-the cache limit never release the reserve; disarming (floor 0) releases its idle buffers. mlx_metal_wide_reserve_stats
-reads its floor, size and hit counts; mlx_metal_wide_reserve_plant is the tests' planted aliasing bug (every hit shares
-one buffer). MLX_METAL_WIDE_LOG (diagnostic) prints each armed miss. Unarmed, MLX's own paths are unchanged (one load
-and test per allocation and free).
+the cache limit never release the reserve; disarming (floor 0) releases its idle buffers. Its bytes count as MLX's
+active memory from the arming on, idle or in use, so a budget read from MLX's counters sees them.
+mlx_metal_wide_reserve_stats reads its floor, size and hit counts; mlx_metal_wide_reserve_plant is the tests' planted
+aliasing bug (every hit shares one buffer). MLX_METAL_WIDE_LOG (diagnostic) prints each armed miss. Unarmed, MLX's own
+paths are unchanged (one load and test per allocation and free).
 
 Used by mlx-serve's DeepSeek-V4.1 plugin (MLX_SERVE_DSV41_PF_KEEP_WIDE): a prompt pass's large intermediates, freshly
 allocated by every request's first layer (the engine clears MLX's cache at each request's end), come from the reserve.
 Not reported upstream.
 
 diff --git a/mlx/backend/metal/allocator.cpp b/mlx/backend/metal/allocator.cpp
-index ff12293..f8ce713 100644
+index ff12293..08d7484 100644
 --- a/mlx/backend/metal/allocator.cpp
 +++ b/mlx/backend/metal/allocator.cpp
 @@ -8,7 +8,10 @@
@@ -26,7 +27,7 @@ index ff12293..f8ce713 100644
  
  namespace mlx::core {
  
-@@ -42,6 +45,43 @@ bool can_reuse_alien_buffer(void* ptr) {
+@@ -42,6 +45,44 @@ bool can_reuse_alien_buffer(void* ptr) {
  
  namespace metal {
  
@@ -38,8 +39,9 @@ index ff12293..f8ce713 100644
 +// that MLX's own cache cannot serve takes the smallest idle reserve buffer at least its size (any larger one: the
 +// stock cache only hands out a buffer within two pages of the size); its free puts it back in the reserve. The
 +// reserve is outside MLX's cache: clear_cache and the cache limit never release it. Disarming (floor 0) releases
-+// the idle ones; one still in use leaves the reserve and is freed as any other buffer. State under the allocator's
-+// mutex; this file's own (the class layout stays the stock one).
++// the idle ones; one still in use leaves the reserve and is freed as any other buffer. Its bytes count as active
++// memory from the arming on, idle or in use (resident, as weights are), so a caller budgeting on MLX's active memory
++// sees them. State under the allocator's mutex; this file's own (the class layout stays the stock one).
 +struct WideReserve {
 +  size_t min_bytes{0}; // 0: disarmed
 +  std::multimap<size_t, MTL::Buffer*> idle;
@@ -70,12 +72,13 @@ index ff12293..f8ce713 100644
  MetalAllocator::MetalAllocator(Device& d)
      : device_(d.mtl_device()),
        residency_sets_(d.residency_sets()),
-@@ -128,8 +168,31 @@ Buffer MetalAllocator::malloc(size_t size) {
+@@ -128,6 +169,30 @@ Buffer MetalAllocator::malloc(size_t size) {
    // Try the cache
    std::unique_lock lk(mutex_);
    MTL::Buffer* buf = buffer_cache_.reuse_from_cache(size);
 +  // Then the wide reserve, when armed: the smallest idle buffer at least the size.
 +  auto& w = wide();
++  bool from_reserve = false;
 +  if (!buf && w.min_bytes && size >= w.min_bytes) {
 +    auto it = w.idle.lower_bound(size);
 +    if (w.plant_alias && it != w.idle.end()) {
@@ -88,6 +91,7 @@ index ff12293..f8ce713 100644
 +        w.idle.erase(it);
 +      }
 +      w.hits++;
++      from_reserve = true;
 +    } else {
 +      w.misses++;
 +      w.miss_bytes += size;
@@ -97,17 +101,25 @@ index ff12293..f8ce713 100644
 +    }
 +  }
    if (!buf) {
--    size_t mem_required = get_active_memory() + get_cache_memory() + size;
-+    size_t mem_required =
-+        get_active_memory() + get_cache_memory() + w.idle_bytes + size;
+     size_t mem_required = get_active_memory() + get_cache_memory() + size;
  
-     // If we have a lot of memory pressure try to reclaim memory from the cache
-     if (mem_required >= gc_limit_ || num_resources_ >= resource_limit_) {
-@@ -196,6 +259,15 @@ void MetalAllocator::free(Buffer buffer) {
+@@ -163,7 +228,10 @@ Buffer MetalAllocator::malloc(size_t size) {
+     }
+   }
+ 
+-  active_memory_ += buf->length();
++  // A reserve buffer's bytes are active since the arming.
++  if (!from_reserve) {
++    active_memory_ += buf->length();
++  }
+   peak_memory_ = std::max(peak_memory_, active_memory_);
+ 
+   // Maintain the cache below the requested limit
+@@ -195,6 +263,15 @@ void MetalAllocator::free(Buffer buffer) {
+ #endif
  
    std::unique_lock lk(mutex_);
-   active_memory_ -= buf->length();
-+  // A wide reserve buffer goes back to the reserve, never to the cache.
++  // A wide reserve buffer goes back to the reserve (its bytes still active), never to the cache.
 +  auto& w = wide();
 +  if (w.min_bytes && w.owned.count(buf)) {
 +    if (!w.plant_alias) {
@@ -116,10 +128,10 @@ index ff12293..f8ce713 100644
 +    }
 +    return;
 +  }
+   active_memory_ -= buf->length();
    if (get_cache_memory() < max_pool_size_) {
      buffer_cache_.recycle_to_cache(buf);
-   } else {
-@@ -209,6 +281,99 @@ void MetalAllocator::free(Buffer buffer) {
+@@ -209,6 +286,102 @@ void MetalAllocator::free(Buffer buffer) {
    }
  }
  
@@ -149,6 +161,7 @@ index ff12293..f8ce713 100644
 +    w.plant_alias = false;
 +    num_resources_ -= drop.size();
 +    for (auto* b : drop) {
++      active_memory_ -= b->length();
 +      if (!b->heap()) {
 +        residency_sets_.erase(b);
 +      }
@@ -189,6 +202,8 @@ index ff12293..f8ce713 100644
 +    w.idle.emplace(b->length(), b);
 +    w.idle_bytes += b->length();
 +    w.owned_bytes += b->length();
++    active_memory_ += b->length();
++    peak_memory_ = std::max(peak_memory_, active_memory_);
 +  }
 +  std::unique_lock lk(mutex_);
 +  w.min_bytes = min_bytes;
@@ -219,7 +234,7 @@ index ff12293..f8ce713 100644
  size_t MetalAllocator::size(Buffer buffer) const {
    return static_cast<MTL::Buffer*>(buffer.ptr())->length();
  }
-@@ -286,3 +451,27 @@ void clear_cache() {
+@@ -286,3 +459,27 @@ void clear_cache() {
  }
  
  } // namespace mlx::core

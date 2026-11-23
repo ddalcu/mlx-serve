@@ -20,8 +20,9 @@
 //! buffer of the output's size), so such an op takes another buffer: the same words.
 //!
 //! Memory: the reserve is a subset of the pinned pass's own working set, which the engine bills on every request
-//! (`prefillTransientReserve` at the pinned width) and left free at the load; armed only when it fits that bill. Between
-//! requests it is held (the admission's live reading counts it as in use). The load's line names its bytes.
+//! (`prefillTransientReserve` at the pinned width) and left free at the load; armed only when it fits that bill. MLX
+//! counts its bytes as active memory from the arming on (resident, as the weights are), so the engine's ceiling and
+//! admission, which read MLX's counters, see it. The load's line names its bytes.
 //!
 //! Without the patched libmlx (no `mlx_metal_wide_reserve` symbol) the switch is declined by name.
 
@@ -230,7 +231,7 @@ fn evalZeros(halves: usize) !mlx.mlx_array {
     return z;
 }
 
-test "dsv41 keep wide: MLX's reserve serves a narrower array from its wider buffer, keeps it through clear_cache, misses a wider one, and releases it on disarm" {
+test "dsv41 keep wide: MLX's reserve counts as active memory, serves a narrower array from its wider buffer, keeps it through clear_cache, misses a wider one, and releases it on disarm" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     if (!available()) {
         std.debug.print("keep wide: the loaded libmlx has no mlx_metal_wide_reserve: skipped\n", .{});
@@ -243,6 +244,10 @@ test "dsv41 keep wide: MLX's reserve serves a narrower array from its wider buff
     _ = mlx.mlx_get_active_memory(&active0);
     const wide: usize = 128 << 20;
     try testing.expectEqual(@as(c_int, 0), arm(&.{wide}));
+    // MLX counts the reserve as active memory from the arming on, idle or in use.
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    try testing.expect(active >= active0 + wide and active < active0 + wide + (1 << 20));
     var st = stats();
     try testing.expectEqual(@as(usize, 1), st.buffers);
     try testing.expectEqual(wide, st.bytes);
@@ -252,9 +257,13 @@ test "dsv41 keep wide: MLX's reserve serves a narrower array from its wider buff
     st = stats();
     try testing.expectEqual(@as(usize, 1), st.hits);
     try testing.expectEqual(@as(usize, 0), st.idle);
+    _ = mlx.mlx_get_active_memory(&active);
+    try testing.expect(active >= active0 + wide and active < active0 + wide + (1 << 20));
     _ = mlx.mlx_array_free(narrow);
     _ = mlx.mlx_synchronize(s);
     try testing.expectEqual(wide, stats().idle);
+    _ = mlx.mlx_get_active_memory(&active);
+    try testing.expect(active >= active0 + wide and active < active0 + wide + (1 << 20));
     // The engine's per-request clear, and a cache limit of 0, leave the reserve whole.
     try mlx.check(mlx.mlx_clear_cache());
     var prev: usize = 0;
