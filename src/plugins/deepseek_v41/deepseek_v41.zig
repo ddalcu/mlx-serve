@@ -8647,7 +8647,7 @@ var sync_plant: i32 = 0;
 /// split), a resident bank and embedding (the draft's rows gathered by GPU ids), and a context at least the sliding
 /// window long (the draft's window rows the same count whatever the round keeps).
 fn syncServes(m: *const Dsv41Model, st: *const State) bool {
-    if (!env.on(.MLX_SERVE_DSV41_SPEC_SYNC) or !draftAheadOk(m)) return false;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_SPEC_SYNC) or !draftAheadOk(m)) return false;
     if (m.pair != null or m.tp != null or m.streamed != null or m.embed_tab != null) return false;
     if (m.ds_block < 2 or m.ds_block > 16) return false;
     const v = st.verify orelse return false;
@@ -8674,7 +8674,7 @@ fn acceptGraph(sc: *Scope, vl_in: A, suppress: A, want: []const i32, cap: usize,
 /// the rows' positions, the block's ids) once on small rows of the served dtypes, so the first round compiles none of
 /// them (the drafting backoff would read that compile as the round's cost).
 pub fn syncWarm(m: *Dsv41Model) !void {
-    if (!env.on(.MLX_SERVE_DSV41_SPEC_SYNC) or m.dspark == null) return;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_SPEC_SYNC) or m.dspark == null) return;
     var sc = Scope.init(m.gpa, m.s);
     defer sc.deinit();
     const V = m.vocab;
