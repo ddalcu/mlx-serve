@@ -9,15 +9,22 @@ const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
 const qwen4 = @import("qwen4_exp.zig");
 const qwen4_ple = @import("ple_table.zig");
+const system = @import("../../sdk/util/system.zig");
 
 /// Why the loader picked its arm. Everything but `.gpu` serves the host gather.
-pub const Arm = enum { gpu, off, bits, misaligned, too_large, low_memory };
+pub const Arm = enum { gpu, off, bits, misaligned, too_large, low_memory, auto_tight };
+
+/// The launch's choice for the n-gram table read: `--ple-gpu`, `--no-ple-gpu`, or the auto default.
+pub const Mode = enum { auto, on, off };
+
+/// The context length the auto arm insists on leaving room for, on top of the table.
+pub const AUTO_CTX_TOKENS: u64 = 256 * 1024;
 
 /// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
 const PleGpuState = struct {
-    /// On unless `--no-ple-gpu`, set once in `main()`. The first GPU forward makes the whole
-    /// table resident beside the weights; the host gather faults in only the rows it reads.
-    enabled: bool = false,
+    /// Set once by `configure.apply`. Auto enables the GPU gather only when RAM covers the
+    /// weights, the table, headroom and the auto context; the first GPU forward makes it resident.
+    mode: Mode = .auto,
 };
 pub const pleGpu_shared = @import("../../sdk/util/shared.zig").Shared(PleGpuState, "ple_gpu", .{});
 pub inline fn pleGpu() *PleGpuState {
@@ -29,6 +36,10 @@ pub const Budget = struct {
     max_buffer: u64,
     working_set: u64,
     model_bytes: u64,
+    /// Physical RAM; the auto arm's room test reads it.
+    ram_total: u64,
+    /// KV bytes the auto arm must leave free for its context (`autoCtxRoom`).
+    ctx_room: u64,
 };
 
 /// Room the working set keeps past weights + table for KV, transients and the buffer pool.
@@ -39,15 +50,28 @@ pub var dispatches: u64 = 0;
 /// Mappings unmapped by MLX dropping their buffer (MLX may drop it off the inference thread).
 pub var unmaps = std.atomic.Value(u64).init(0);
 
-pub fn chooseArm(on: bool, bits: u32, base: usize, len: usize, b: Budget) Arm {
-    if (!on) return .off;
+pub fn chooseArm(mode: Mode, bits: u32, base: usize, len: usize, b: Budget) Arm {
+    if (mode == .off) return .off;
     if (!kernelBits(bits)) return .bits;
     // MLX falls back to a malloc + copy of the WHOLE table when Metal refuses the no-copy buffer.
     if (b.page == 0 or base % b.page != 0) return .misaligned;
     const bytes = std.mem.alignForward(u64, len, b.page);
     if (bytes > b.max_buffer) return .too_large;
     if (b.model_bytes +| bytes +| HEADROOM > b.working_set) return .low_memory;
+    if (mode == .auto and b.model_bytes +| bytes +| HEADROOM +| b.ctx_room > b.ram_total) return .auto_tight;
     return .gpu;
+}
+
+/// The KV bytes the auto arm must leave free: the model's own context, at most `AUTO_CTX_TOKENS`.
+pub fn autoCtxRoom(config: *const @import("../../sdk/config/model.zig").ModelConfig) u64 {
+    const ctx: u64 = @min(config.contextCap(), AUTO_CTX_TOKENS);
+    return config.kvBytesPerToken() *| ctx;
+}
+
+/// The auto arm's host-RAM room test alone (no GPU gates), so the load-time bill can predict
+/// what `load` will choose before the Metal numbers are in hand.
+pub fn autoWouldEnable(model_bytes: u64, table_bytes: u64, ctx_room: u64) bool {
+    return model_bytes +| table_bytes +| HEADROOM +| ctx_room <= system.getTotalMemBytes();
 }
 
 fn kernelBits(bits: u32) bool {
@@ -141,10 +165,11 @@ fn gb(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1073741824.0;
 }
 
-/// Load-time arm choice for `table`; logs one line naming the arm. The GPU arm is the default
-/// (`--no-ple-gpu` keeps the host read), `model_bytes` the weights already resident. Null = the host gather. An embedded pack's
+/// Load-time arm choice for `table`; logs one line naming the arm. `mode` is the launch's
+/// `--ple-gpu` choice; auto adds the host-RAM room test (`ctx_room` = KV to keep free).
+/// `model_bytes` the weights already resident. Null = the host gather. An embedded pack's
 /// shards are copied into one buffer, so the gate runs before anything is allocated.
-pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
+pub fn load(table: *qwen4.NgramTable, mode: Mode, model_bytes: u64, ctx_room: u64) ?Table {
     if (mlx.noGpuBackend() or !mlx.metalKernelsAvailable()) {
         log.info("[qwen4] ple gather: cpu (no Metal kernels: the GPU gather is one)\n", .{});
         return null;
@@ -154,6 +179,8 @@ pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
         .max_buffer = mlx.maxBufferLength(),
         .working_set = mlx.maxRecommendedWorkingSet(),
         .model_bytes = model_bytes,
+        .ram_total = system.getTotalMemBytes(),
+        .ctx_room = ctx_room,
     };
     // The GPU gather's kernel reads affine and bf16 rows, not trellis rings.
     if (table.fmt == .trellis) {
@@ -164,9 +191,13 @@ pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
     // A fresh anonymous mapping is page-aligned by construction.
     const base: usize = if (src != null) 0 else @intFromPtr(table.map.ptr);
     const len: usize = if (src) |e| @intCast(e.repackedLen()) else if (table.fmt == .ggml) table.rows * table.row_bytes else table.map.len;
-    const arm = chooseArm(on, table.bits, base, len, b);
+    const arm = chooseArm(mode, table.bits, base, len, b);
     if (arm == .off) {
         log.info("[qwen4] ple gather: cpu (--no-ple-gpu; the GPU gather keeps the {d:.1} GB table resident)\n", .{gb(len)});
+        return null;
+    }
+    if (arm == .auto_tight) {
+        log.info("[qwen4] ple gather: cpu (auto: weights {d:.1} GB + table {d:.1} GB + headroom {d:.0} GB + {d}k-token context {d:.1} GB vs RAM {d:.1} GB; --ple-gpu forces it)\n", .{ gb(model_bytes), gb(len), gb(HEADROOM), AUTO_CTX_TOKENS / 1024, gb(b.ctx_room), gb(b.ram_total) });
         return null;
     }
     if (arm != .gpu) {
@@ -180,7 +211,7 @@ pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
         return null;
     };
     if (src != null) log.info("[qwen4] ple gather: embedded shards repacked into one buffer in {d:.1} s\n", .{@as(f64, @floatFromInt(t0.untilNow(io, .boot).nanoseconds)) / 1e9});
-    log.info("[qwen4] ple gather: gpu (no-copy {d:.1} GB table buffer, weights {d:.1} GB, working set {d:.1} GB)\n", .{ gb(len), gb(model_bytes), gb(b.working_set) });
+    log.info("[qwen4] ple gather: gpu ({s}no-copy {d:.1} GB table buffer, weights {d:.1} GB, working set {d:.1} GB)\n", .{ if (mode == .auto) "auto, " else "", gb(len), gb(model_bytes), gb(b.working_set) });
     return tbl;
 }
 
@@ -534,29 +565,37 @@ test "ple gpu: a declined embedded table keeps the host gather" {
     defer td.cleanup();
     var table = try openEmbeddedFixture(&td, .valid);
     defer table.close();
-    try testing.expect(load(&table, false, 0) == null);
-    try testing.expect(load(&table, true, std.math.maxInt(u64)) == null);
+    try testing.expect(load(&table, .off, 0, 0) == null);
+    try testing.expect(load(&table, .on, std.math.maxInt(u64), 0) == null);
 }
 
 test "ple gpu arm gate: --no-ple-gpu, a width the kernel lacks, a misaligned base, an over-long buffer, a tight working set" {
     const GB: u64 = 1 << 30;
-    const b: Budget = .{ .page = 16384, .max_buffer = 64 * GB, .working_set = 200 * GB, .model_bytes = 70 * GB };
+    const b: Budget = .{ .page = 16384, .max_buffer = 64 * GB, .working_set = 200 * GB, .model_bytes = 70 * GB, .ram_total = 512 * GB, .ctx_room = 28 * GB };
     const len: usize = 32 * GB;
-    try testing.expectEqual(Arm.gpu, chooseArm(true, 4, 16384 * 7, len, b));
-    try testing.expectEqual(Arm.gpu, chooseArm(true, 16, 16384 * 7, len, b));
-    try testing.expectEqual(Arm.off, chooseArm(false, 4, 16384 * 7, len, b));
-    try testing.expectEqual(Arm.bits, chooseArm(true, 7, 16384 * 7, len, b));
-    try testing.expectEqual(Arm.misaligned, chooseArm(true, 4, 16384 * 7 + 4096, len, b));
-    try testing.expectEqual(Arm.too_large, chooseArm(true, 4, 16384 * 7, 65 * GB, b));
+    try testing.expectEqual(Arm.gpu, chooseArm(.on, 4, 16384 * 7, len, b));
+    try testing.expectEqual(Arm.gpu, chooseArm(.on, 16, 16384 * 7, len, b));
+    try testing.expectEqual(Arm.off, chooseArm(.off, 4, 16384 * 7, len, b));
+    try testing.expectEqual(Arm.bits, chooseArm(.on, 7, 16384 * 7, len, b));
+    try testing.expectEqual(Arm.misaligned, chooseArm(.on, 4, 16384 * 7 + 4096, len, b));
+    try testing.expectEqual(Arm.too_large, chooseArm(.on, 4, 16384 * 7, 65 * GB, b));
     // The length rounds up to the page before the maxBufferLength check.
-    try testing.expectEqual(Arm.too_large, chooseArm(true, 4, 16384 * 7, 64 * GB - 1, .{ .page = 16384, .max_buffer = 64 * GB - 1, .working_set = 200 * GB, .model_bytes = 0 }));
+    try testing.expectEqual(Arm.too_large, chooseArm(.on, 4, 16384 * 7, 64 * GB - 1, .{ .page = 16384, .max_buffer = 64 * GB - 1, .working_set = 200 * GB, .model_bytes = 0, .ram_total = 512 * GB, .ctx_room = 0 }));
     var tight = b;
     tight.working_set = 70 * GB + 32 * GB + HEADROOM - 1;
-    try testing.expectEqual(Arm.low_memory, chooseArm(true, 4, 16384 * 7, len, tight));
+    try testing.expectEqual(Arm.low_memory, chooseArm(.on, 4, 16384 * 7, len, tight));
     tight.working_set += 1;
-    try testing.expectEqual(Arm.gpu, chooseArm(true, 4, 16384 * 7, len, tight));
+    try testing.expectEqual(Arm.gpu, chooseArm(.on, 4, 16384 * 7, len, tight));
     tight.working_set = 0; // an unknown working set never pins 32 GB
-    try testing.expectEqual(Arm.low_memory, chooseArm(true, 4, 16384 * 7, len, tight));
+    try testing.expectEqual(Arm.low_memory, chooseArm(.on, 4, 16384 * 7, len, tight));
+    // Auto takes the table only when RAM also leaves the context room; on forces it.
+    try testing.expectEqual(Arm.gpu, chooseArm(.auto, 4, 16384 * 7, len, b));
+    var ram_tight = b;
+    ram_tight.ram_total = 70 * GB + 32 * GB + HEADROOM + 28 * GB - 1;
+    try testing.expectEqual(Arm.auto_tight, chooseArm(.auto, 4, 16384 * 7, len, ram_tight));
+    try testing.expectEqual(Arm.gpu, chooseArm(.on, 4, 16384 * 7, len, ram_tight));
+    ram_tight.ram_total += 1;
+    try testing.expectEqual(Arm.gpu, chooseArm(.auto, 4, 16384 * 7, len, ram_tight));
 }
 
 test "ple gpu wrap: the buffer IS the mapping, and a misaligned base never reaches MLX" {

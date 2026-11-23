@@ -255,10 +255,13 @@ fn printUsage(io: std.Io) void {
         \\  --no-mtp            Disable the Qwen native MTP head (auto-loaded
         \\                        when the model dir ships mtp/weights.safetensors;
         \\                        priority: MTP > drafter > PLD).
-        \\  --no-ple-gpu        Qwen3.8-Flash-Next: read the ~30 GB n-gram table's rows
-        \\                        from the mmapped file on demand instead of gathering
-        \\                        them on the GPU from a resident copy (the default;
-        \\                        unsuitable machines are declined by name at load).
+        \\  --ple-gpu           Qwen3.8-Flash-Next: force the n-gram table's GPU gather
+        \\                        (~30 GB resident copy beside the weights). The
+        \\                        default is auto: the GPU gather only when RAM
+        \\                        covers the table, headroom and a 256k-token
+        \\                        context; declines log the numbers by name.
+        \\  --no-ple-gpu        Qwen3.8-Flash-Next: read the n-gram table's rows from
+        \\                        the mmapped file on demand; never the resident copy.
         \\  --ane-prefill       Offload a share of each prefill chunk's dense
         \\                        MLP rows to the Neural Engine (qwen3_5-family
         \\                        only; int8/fp16, lossy; needs >= 96 GB RAM).
@@ -942,8 +945,10 @@ pub fn main(init: std.process.Init) !void {
             mtp_forced = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
             mtp_head_kv_quant = true;
+        } else if (std.mem.eql(u8, args[i], "--ple-gpu")) {
+            engine_flags.ple_gpu = .on;
         } else if (std.mem.eql(u8, args[i], "--no-ple-gpu")) {
-            engine_flags.ple_gpu = false;
+            engine_flags.ple_gpu = .off;
         } else if (std.mem.eql(u8, args[i], "--ane-prefill")) {
             // ANE prefill-MLP offload (perf-plan-aug-17 P5): opt-in, lossy
             // by design (int8 fp16 datapath). Eligibility + machine gates

@@ -7,6 +7,7 @@ const LoadedModel = @import("../../host/registry/registry.zig").LoadedModel;
 const decode_attn_quant = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
 const ane_mod = @import("../../sdk/ane/offload.zig");
 const qwen4_mod = @import("../../plugins/qwen4_exp/qwen4_exp.zig");
+const ple_gpu_mod = @import("../../plugins/qwen4_exp/ple_gpu.zig");
 const generate_mod = @import("generate.zig");
 const scheduler_mod = @import("scheduler.zig");
 const prefill_interleave = @import("prefill_interleave.zig");
@@ -77,7 +78,11 @@ pub fn apply(f: *const host.Flags) void {
     scheduler_mod.no_vision_global = f.no_vision;
     sleep_inhibit.setEnabled(f.prevent_sleep);
     scheduler_mod.skip_mem_preflight = f.skip_mem_preflight;
-    @import("../../plugins/qwen4_exp/ple_gpu.zig").pleGpu().enabled = f.ple_gpu;
+    ple_gpu_mod.pleGpu().mode = switch (f.ple_gpu) {
+        .auto => ple_gpu_mod.Mode.auto,
+        .on => ple_gpu_mod.Mode.on,
+        .off => ple_gpu_mod.Mode.off,
+    };
     depth_bounds.active = .{ .min = f.mtp_depth_min, .max = f.mtp_depth_max };
     generate_mod.mtp_greedy_tail_default = f.mtp_greedy_tail;
     generate_mod.max_mtp_ctx = f.max_mtp_ctx;
@@ -97,16 +102,19 @@ pub fn apply(f: *const host.Flags) void {
 
 const testing = std.testing;
 
-test "configure: the n-gram GPU gather follows the launch flag both ways, and the default flag set is on" {
-    const ple_gpu = @import("../../plugins/qwen4_exp/ple_gpu.zig");
-    try testing.expect((host.Flags{}).ple_gpu);
-    const was = ple_gpu.pleGpu().enabled;
-    defer ple_gpu.pleGpu().enabled = was;
-    ple_gpu.pleGpu().enabled = false;
+test "configure: the n-gram gather follows the launch choice both ways and defaults to auto" {
+    try testing.expectEqual(host.PleGpuChoice.auto, (host.Flags{}).ple_gpu);
+    const was = ple_gpu_mod.pleGpu().mode;
+    defer ple_gpu_mod.pleGpu().mode = was;
+    ple_gpu_mod.pleGpu().mode = .off;
     apply(&host.Flags{});
-    try testing.expect(ple_gpu.pleGpu().enabled);
+    try testing.expectEqual(ple_gpu_mod.Mode.auto, ple_gpu_mod.pleGpu().mode);
+    var forced = host.Flags{};
+    forced.ple_gpu = .on;
+    apply(&forced);
+    try testing.expectEqual(ple_gpu_mod.Mode.on, ple_gpu_mod.pleGpu().mode);
     var declined = host.Flags{};
-    declined.ple_gpu = false;
+    declined.ple_gpu = .off;
     apply(&declined);
-    try testing.expect(!ple_gpu.pleGpu().enabled);
+    try testing.expectEqual(ple_gpu_mod.Mode.off, ple_gpu_mod.pleGpu().mode);
 }

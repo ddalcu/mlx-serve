@@ -981,7 +981,7 @@ test "deferred PLE at N rows: every row's capacity is checked against its OWN wi
 // ── qwen4 PLE: the GPU arm against the host gather (synthetic table, no model) ──
 
 /// A zeroed Trunk carrying only what `pleEmbedding` reads, over a synthetic 4-bit table.
-/// With `gate` the table goes through `ple_gpu.load`, so the arm switch (`--no-ple-gpu`) is what is tested;
+/// With `gate` the table goes through `ple_gpu.load`, so the forced arm (`--ple-gpu` / `--no-ple-gpu`) is what is tested;
 /// without it the table is wrapped directly, because `load`'s working-set gate (table plus
 /// 16 GB headroom) rightly picks the host gather on a small CI runner, and these tests are
 /// about the arms, not the gate. `arm(false)` hides the table buffer to run the host gather.
@@ -996,7 +996,7 @@ pub const PleArmFixture = struct {
     pub fn init(self: *PleArmFixture, gate: ?bool) !void {
         const hash = try qwen4_mod.NgramHash.init(1000, 3, 8, 500, 1, 1234, 0, 999);
         self.fx = try ple_gpu.writeFixture(4, hash.total_rows, 64, 32, 21);
-        self.gpu = if (gate) |on| ple_gpu.load(&self.fx.table, on, 0) else try ple_gpu.wrap(&self.fx.table);
+        self.gpu = if (gate) |on| ple_gpu.load(&self.fx.table, if (on) .on else .off, 0, 0) else try ple_gpu.wrap(&self.fx.table);
         self.st = .{ .hash = hash, .table = self.fx.table, .gpu = self.gpu };
         self.xfm_bytes = @splat(0);
         self.cache_bytes = @splat(0);

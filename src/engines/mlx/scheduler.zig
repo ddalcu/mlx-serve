@@ -922,7 +922,7 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
         // Estimate post-load bytes (see `gateEstimateBytes` for why a media
         // entry cannot be billed by its directory's size).
         const estimated: u64 = gateEstimateBytes(media_peak, gate_model_bytes, owned.config.num_hidden_layers, owned.config.hidden_size) +
-            pleTableBill(self.io, owned.config);
+            pleTableBill(self.io, owned.config, gate_model_bytes orelse 0);
 
         // Reserve this load's estimate BEFORE planning eviction, so a
         // concurrent loader sees the pending allocation in its own gate.

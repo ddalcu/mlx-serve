@@ -174,7 +174,8 @@ struct ServerOptions: Codable, Equatable {
     /// (2GB, or one session at the working context on qwen4_exp when larger).
     var prefixCacheMem: String = ""
     /// `--no-ple-gpu`: Qwen3.8-Flash-Next reads its ~30 GB n-gram table's rows from the mmapped
-    /// file instead of gathering them on the GPU from a resident copy. OFF matches the server.
+    /// file. OFF matches the server default (auto: the GPU gather only when the Mac has room
+    /// for the table plus a 256k-token context).
     var pleGpuHostRead: Bool = false
     /// SSD tier for the prefix cache. OFF by default because it can persist
     /// gigabytes of KV under ~/.mlx-serve/kv-cache. When on, seen prefixes
@@ -1261,7 +1262,7 @@ extension ServerOptions {
             needsRestart: true),
         "pleGpuHostRead": .init(
             title: "Read n-gram table from disk (Qwen3.8-Flash-Next)",
-            explainer: "Saves about 30 GB while Qwen3.8 Flash Next is loaded, at slower long-context replies.",
+            explainer: "Saves about 30 GB while Qwen3.8 Flash Next is loaded. Off means automatic: the server keeps the table on the GPU only when your Mac has room for it and a full-length conversation.",
             needsRestart: true,
             cost: "Memory: about 30 GB more while Qwen3.8-Flash-Next is loaded."),
         "enablePrefixCacheDisk": .init(
