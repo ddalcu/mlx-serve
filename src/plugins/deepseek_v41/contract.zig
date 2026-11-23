@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
+const env = @import("../../env.zig");
 const kit = @import("../deepseek_v4/contract_kit.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const v41 = @import("deepseek_v41.zig");
@@ -2742,10 +2743,22 @@ const RopeTailOnly = struct {
 // ── the window row: rms norm, the tail rope at its position, the fp8 round trip ──
 
 const KvRow = struct {
-    pub const Params = struct { off: i32 = 3001 };
+    /// `rows`: the PF_KV_ROWS build (kernels/kv_rows.metal), one simdgroup a row, KV_ROWS_NSG rows a threadgroup.
+    pub const Params = struct { off: i32 = 3001, rows: bool = false };
 
-    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or s.k == 0 or s.k > 1024 or s.k % 32 != 0 or s.k < RD) return null;
+        if (p.rows) {
+            const nsg = v41.KV_ROWS_NSG;
+            var g = metal.Geometry{ .grid = .{ 32 * nsg, ci((s.rows + nsg - 1) / nsg), 1 }, .tg = .{ 32 * nsg, 1, 1 } };
+            g.out(&.{ ci(s.rows), ci(s.k) }, act);
+            g.int("D", s.k);
+            g.int("RD", RD);
+            g.int("NSG", nsg);
+            g.flag("QAT", true);
+            g.dtype("T", act);
+            return g;
+        }
         var g = metal.Geometry{ .grid = .{ ci(s.k), ci(s.rows), 1 }, .tg = .{ ci(s.k), 1, 1 } };
         g.out(&.{ ci(s.rows), ci(s.k) }, act);
         g.int("RD", RD);
@@ -4885,6 +4898,7 @@ const mix_norm8_l = metal.Launch{ .name = "dsv41_hc_mix_norm", .inputs = &.{ "x"
 const rope_only_l = launch("dsv41_rope_tail_only", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_only_source, "", 0, 1024, false);
 const rope_pairs_l = launch("dsv41_rope_tail_pairs", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_pairs_source, "", 0, 1024, false);
 const kv_l = launch("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, v41.KV_ROW_SOURCE, v41.FP8_HEADER, 4 * (32 + 1024), 1024, false);
+const kv_rows_l = launch("dsv41_kv_rows", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, v41.KV_ROWS_SOURCE, v41.FP8_HEADER, 0, 1024, false);
 const engram_l = launch("dsv41_engram", &.{ "x", "kv", "qk", "cst" }, &.{"out"}, v41.ENGRAM_SOURCE, "", 4 * (3 * 32 + 1), 928, false);
 const dec_l = launch("dsv41_attn_decode", attn_ins ++ &[_][*:0]const u8{"periods"}, &.{"out"}, v41.ATTN_DEC_SOURCE, v41.UNROPE_HEADER, 4 * (AttnDec.NSG * HD + 2 * AttnDec.NSG), 768, false);
 const split_attn_l = launch("dsv41_attn_split", attn_ins, &.{ "pacc", "pm", "pl" }, v41.ATTN_SPLIT_SOURCE, "", 4 * (AttnSplit.NSG * HD + 2 * AttnSplit.NSG), 768, false);
@@ -5127,6 +5141,16 @@ pub fn register(set: *kc.Set) !void {
         .nan = quant_nan,
         .known = nan_code,
         .served = &.{ .{ .rows = 1, .n = 1, .k = HD }, .{ .rows = 64, .n = 1, .k = HD } },
+        .sums = squares,
+    });
+    try kit.add(set, KvRow, &kv_rows_l, .{ .rows = true }, .{
+        .name = "dsv41 kv_rows (PF_KV_ROWS: kv_row a simdgroup a row)",
+        .accum = .f32,
+        .depth = depthK,
+        .out = .bf16,
+        .nan = quant_nan,
+        .known = nan_code,
+        .served = &.{ .{ .rows = 17, .n = 1, .k = HD }, .{ .rows = 64, .n = 1, .k = HD } },
         .sums = squares,
     });
     try kit.add(set, Engram, &engram_l, .{}, .{
@@ -5919,6 +5943,13 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
     }
     {
         const r = try ours(KvRow, a, &kv_l, .{}, .{ .rows = 3, .n = 1, .k = HD });
+        ly.kv_norm = r.c.args[1];
+        try Expect.same(r.c, r.bytes, &.{try v41.kvRow(&sc, m, &ly, r.c.args[2], r.c.args[0], r.c.args[3])});
+    }
+    {
+        const sw = env.override(.MLX_SERVE_DSV41_PF_KV_ROWS, "1");
+        defer sw.restore();
+        const r = try ours(KvRow, a, &kv_rows_l, .{ .rows = true }, .{ .rows = 40, .n = 1, .k = HD });
         ly.kv_norm = r.c.args[1];
         try Expect.same(r.c, r.bytes, &.{try v41.kvRow(&sc, m, &ly, r.c.args[2], r.c.args[0], r.c.args[3])});
     }
