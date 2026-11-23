@@ -4098,11 +4098,61 @@ pub fn ropeProj(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, rows: 
     return .{ .q = try ropeTail(sc, m, rows.q, periods, pos, 1.0), .kv = try kvRow(sc, m, ly, periods, rows.kv, pos), .qr = rows.qr };
 }
 
+/// `MLX_SERVE_DSV41_PF_KV_ROWS`: `kvRow` over a prompt's rows (more than `region_rows`) with one simdgroup a row
+/// (`kernels/kv_rows.metal`, the same words); built on first use.
+pub const KV_ROWS_SOURCE = kernelSource("plugins/deepseek_v41/kernels/kv_rows.metal");
+pub const KV_ROWS_NSG = 8;
+var kv_rows_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var kv_rows_logged = std.atomic.Value(bool).init(false);
+/// `kvRow`'s rows served by the kv_rows kernel (a test's proof the switch engaged).
+pub var kv_rows_calls = std.atomic.Value(usize).init(0);
+/// The kv_rows test's planted bug: each rope pair's halves swapped.
+pub var kv_rows_plant = false;
+
+fn kvRows(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, kv: A, pos: A, eps: A) !?A {
+    const L = dim(kv, 0);
+    const D = dim(kv, 1);
+    const RD: usize = @intCast(m.cfg.dsv4_rope_head_dim);
+    if (L <= region_rows or D % 32 != 0 or D > 1024 or RD % 2 != 0 or RD > D or (D - RD) % 32 != 0 or !mlx.streamIsGpu(sc.s)) return null;
+    if (kv_rows_kernel == null) kv_rows_kernel = try buildKernel("dsv41_kv_rows", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, KV_ROWS_SOURCE, FP8_HEADER);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(D) }, 2, mlx.mlx_array_dtype(kv)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32 * KV_ROWS_NSG, ci((L + KV_ROWS_NSG - 1) / KV_ROWS_NSG), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32 * KV_ROWS_NSG, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", ci(D)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RD", ci(RD)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NSG", KV_ROWS_NSG));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "QAT", !m.qat_off));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", mlx.mlx_array_dtype(kv)));
+    // The planted control: the rope's periods reversed, so each pair turns by another pair's angle.
+    const per = if (kv_rows_plant) try sc.keep(blk: {
+        var r = mlx.mlx_array_new();
+        const n = mlx.getShape(periods)[0];
+        var idx = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(idx);
+        try mlx.check(mlx.mlx_arange(&idx, @floatFromInt(n - 1), -1, -1, .int32, sc.s));
+        try mlx.check(mlx.mlx_take_axis(&r, periods, idx, 0, sc.s));
+        break :blk r;
+    }) else periods;
+    const iv = mlx.mlx_vector_array_new_data(&[_]A{ kv, ly.kv_norm, per, pos, eps }, 5);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kv_rows_kernel.?, iv, cfg, sc.s));
+    var o = mlx.mlx_array_new();
+    const y = try sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+    if (!kv_rows_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_KV_ROWS engaged (rows {d}, width {d})\n", .{ L, D });
+    _ = kv_rows_calls.fetchAdd(1, .monotonic);
+    return y;
+}
+
 /// The projected window row `kv` normed, roped and fp8 round-tripped.
 pub fn kvRow(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, kv: A, pos: A) !A {
     const L = dim(kv, 0);
     const D = dim(kv, 1);
     const eps = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.rms_norm_eps}, &[_]c_int{1}, 1, .float32));
+    if (env.on(.MLX_SERVE_DSV41_PF_KV_ROWS)) if (try kvRows(sc, m, ly, periods, kv, pos, eps)) |y| return y;
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(D) }, 2, mlx.mlx_array_dtype(kv)));
@@ -10582,6 +10632,68 @@ test "dsv41 kv row: a head-width row launches and is normed by its own rms on th
         for (xs[l * D ..][0..D]) |v| ss += v * v;
         const inv = 1.0 / @sqrt(ss / D + 1e-6);
         for (0..D - 64) |d| try testing.expectApproxEqAbs(xs[l * D + d] * inv, got[l * D + d], 1e-2 * @max(1.0, @abs(xs[l * D + d] * inv)));
+    }
+}
+
+test "dsv41 pf kv_rows: MLX_SERVE_DSV41_PF_KV_ROWS's one-simdgroup-a-row kv_row is kv_row's words, QAT on and off, the release width, prompt rows 17 to 17639 at nonzero positions; reversed rope periods fail" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    var m: Dsv41Model = undefined;
+    m.cfg = .{};
+    m.cfg.rms_norm_eps = 1e-6;
+    m.cfg.dsv4_rope_head_dim = 64;
+    m.kv_row_kernel = try buildKernel("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, KV_ROW_SOURCE, FP8_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.kv_row_kernel);
+    const D = 512;
+    const off = env.override(.MLX_SERVE_DSV41_PF_KV_ROWS, "0");
+    defer off.restore();
+    inline for (.{ false, true }) |qat_off| {
+        m.qat_off = qat_off;
+        for ([_]usize{ 17, 128, 1254, 4097, 17639 }, 0..) |L, ci_| {
+            var sc = Scope.init(gpa, mlx.gpuStream());
+            defer sc.deinit();
+            var key = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(key);
+            try mlx.check(mlx.mlx_random_key(&key, 0x4B5 + ci_));
+            var xr = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&xr, &[_]c_int{ ci(L), D }, 2, .bfloat16, 0, 2, key, sc.s));
+            const x = try sc.keep(xr);
+            var wr = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_uniform(&wr, try sc.f(0.5), try sc.f(1.5), &[_]c_int{D}, 1, .bfloat16, key, sc.s));
+            var ly: Layer = undefined;
+            ly.kv_norm = try sc.keep(wr);
+            var pv: [32]f32 = undefined;
+            for (&pv, 0..) |*v, i| v.* = std.math.pow(f32, 10000, @as(f32, @floatFromInt(i)) / 32.0);
+            const periods = try sc.keep(mlx.mlx_array_new_data(&pv, &[_]c_int{32}, 1, .float32));
+            const pos = try sc.i(@intCast(3001 + 7 * ci_));
+            const want = try kvRow(&sc, &m, &ly, periods, x, pos);
+            const on = env.override(.MLX_SERVE_DSV41_PF_KV_ROWS, "1");
+            defer on.restore();
+            const before = kv_rows_calls.load(.monotonic);
+            const got = try kvRow(&sc, &m, &ly, periods, x, pos);
+            const served = kv_rows_calls.load(.monotonic) - before;
+            var eq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(eq);
+            try mlx.check(mlx.mlx_array_equal(&eq, want, got, false, sc.s));
+            try evalAll(&.{eq});
+            var same = false;
+            try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+            std.debug.print("[kv_rows] QAT {s} rows {d}: served {d}, same words {}\n", .{ if (qat_off) "off" else "on", L, served, same });
+            try testing.expectEqual(@as(usize, 1), served);
+            try testing.expect(same);
+            // Planted: the rope's periods reversed.
+            kv_rows_plant = true;
+            defer kv_rows_plant = false;
+            const bad = try kvRow(&sc, &m, &ly, periods, x, pos);
+            var eb = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(eb);
+            try mlx.check(mlx.mlx_array_equal(&eb, want, bad, false, sc.s));
+            try evalAll(&.{eb});
+            var bsame = true;
+            try mlx.check(mlx.mlx_array_item_bool(&bsame, eb));
+            try testing.expect(!bsame);
+        }
     }
 }
 
