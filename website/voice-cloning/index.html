@@ -224,7 +224,12 @@ mlx-serve --model "$HOME/models/Breeze-TTS-2-mlx" \
         <div class="code-header"><span>Generate a designed voice</span></div>
         <div class="code-body"><pre>curl --fail-with-body http://localhost:11234/v1/audio/speech \
   -H 'Content-Type: application/json' \
-  -d '{"input":"Clear skies today.","voice":"S2","instruction":"A calm, warm voice.","seed":7}' \
+  -d '{
+    "input": "Clear skies today.",
+    "voice": "S2",
+    "instruction": "A calm, warm voice.",
+    "seed": 7
+  }' \
   --output breeze.wav</pre></div>
       </div>
       <p>This pinned-model example needs no <code>model</code> field. On a multi-model server, add the Breeze id from <code>GET /v1/models</code>. Success is raw 24 kHz mono, 16-bit PCM WAV, not JSON. The non-negative integer <code>seed</code> defaults to 42 and repeats a request with the same model/build.</p>

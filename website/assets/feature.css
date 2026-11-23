@@ -216,7 +216,7 @@ nav {
 .split h3 { font-size: clamp(22px, 2.8vw, 28px); font-weight: 700; letter-spacing: -0.02em; line-height: 1.15; margin-bottom: 12px; }
 .split p { font-size: 15px; color: var(--text-secondary); line-height: 1.62; margin-bottom: 12px; }
 .split p b { color: var(--text-primary); font-weight: 600; }
-.split p code, .ticks code, .mini-card code, .faq-item p code, .section-desc code {
+.split p code, .ticks code, .mini-card code, .faq-item p code, .section-desc code, .code-wrap p code {
   font-family: var(--mono); font-size: 0.86em; background: var(--bg-alt);
   color: var(--text-primary); padding: 1.5px 6px; border-radius: 5px;
 }
