@@ -6565,7 +6565,7 @@ fn cedCompress(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Sp
 /// `cedCompress` takes the whole stream: the switch on, several spans whose one MoE group left the pass's stream and
 /// mix whole (`Spans.whole`), on the GPU.
 fn cedHcWhole(m: *const Dsv41Model, sp: *const Spans) bool {
-    if (!env.on(.MLX_SERVE_DSV41_PF_CED_HC) or sp.xs.len < 2 or sp.whole.len != 2 or !mlx.streamIsGpu(m.s)) return false;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_CED_HC) or sp.xs.len < 2 or sp.whole.len != 2 or !mlx.streamIsGpu(m.s)) return false;
     return sp.whole[0].ctx != null and sp.whole[1].ctx != null and dim(sp.whole[0], 0) == sp.L and dim(sp.whole[1], 0) == sp.L;
 }
 var ced_hc_logged: std.atomic.Value(bool) = .init(false);
