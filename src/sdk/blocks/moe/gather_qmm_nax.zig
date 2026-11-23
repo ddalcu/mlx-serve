@@ -725,6 +725,35 @@ fn stagedKernel() !mlx.mlx_fast_metal_kernel {
     return value;
 }
 
+/// `sortedGatherPromptStagedTok`'s build: the same source with its rows scattered to their pairs' slots
+/// (`GQMM_SCAT`, `k` picks a row: one build per k), `ridx` the flat picks after the staged inputs.
+var staged_scat_kernel: [9]?mlx.mlx_fast_metal_kernel = @splat(null);
+pub const STAGED_SCAT_INPUTS = STAGED_INPUTS ++ [_][*:0]const u8{"ridx"};
+
+/// The scatter build's header at `k` picks a token.
+pub fn stagedScatHeader(comptime k: c_int) [:0]const u8 {
+    return std.fmt.comptimePrint("#define GQMM_SCAT 1\n#define GQMM_SCAT_K {d}\n", .{k}) ++ STAGED_HEADER;
+}
+
+fn stagedScatKernel(k: c_int) !mlx.mlx_fast_metal_kernel {
+    if (k < 1 or k > 8) return error.ScatPicks;
+    const i: usize = @intCast(k);
+    if (staged_scat_kernel[i]) |v| return v;
+    const ins = mlx.mlx_vector_string_new_data(&STAGED_SCAT_INPUTS, STAGED_SCAT_INPUTS.len);
+    defer _ = mlx.mlx_vector_string_free(ins);
+    const outs_names = [_][*:0]const u8{"y"};
+    const outs = mlx.mlx_vector_string_new_data(&outs_names, outs_names.len);
+    defer _ = mlx.mlx_vector_string_free(outs);
+    const header: [*:0]const u8 = switch (k) {
+        inline 1...8 => |kk| stagedScatHeader(kk),
+        else => unreachable,
+    };
+    const value = mlx.mlx_fast_metal_kernel_new("msv_gqmm_staged_scat", ins, outs, STAGED_SOURCE, header, true, false);
+    if (value.ctx == null) return error.MetalKernelCompileFailed;
+    staged_scat_kernel[i] = value;
+    return value;
+}
+
 /// The staged launch's configuration: `[rows, 1, out_n]` bf16 over the tiles of a `nw`-wide product (2 n for the pair).
 pub const StagedKey = struct { rows: c_int, out_n: c_int, nw: c_int, k: c_int, max_tiles: c_int, st: Staged, bits: u32, group: u32, mx: bool, epi: c_int, esc: u32, map: bool };
 
@@ -749,6 +778,14 @@ pub fn stagedConfig(key: StagedKey) !mlx.mlx_fast_metal_kernel_config {
 /// `launchMapped` on the staged schedule; `row_map` null reads x's rows in order. `scan_bm`: the tile height the
 /// scan cuts at (the plan's; a test plants another).
 fn launchStaged(x: mlx.mlx_array, row_map: ?mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, pair: ?Pair, bits: u32, group: u32, mx: bool, st: Staged, scan_bm: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    return launchStagedTo(x, row_map, w, sc, bi, idx, pair, bits, group, mx, st, scan_bm, null, s);
+}
+
+/// `sortedGatherPromptStagedTok`'s scatter: each sorted row's token `rows` `[m]` and the flat picks `ids` `[m]` (`k` a
+/// token).
+const Scat = struct { rows: mlx.mlx_array, ids: mlx.mlx_array, k: c_int };
+
+fn launchStagedTo(x: mlx.mlx_array, row_map: ?mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, pair: ?Pair, bits: u32, group: u32, mx: bool, st: Staged, scan_bm: c_int, scat: ?Scat, s: mlx.mlx_stream) !mlx.mlx_array {
     const ws = mlx.getShape(w);
     const m = mlx.getShape(idx)[0];
     const up_off: c_int = if (pair) |v| v.up_off else 0;
@@ -771,6 +808,13 @@ fn launchStaged(x: mlx.mlx_array, row_map: ?mlx.mlx_array, w: mlx.mlx_array, sc:
     const epi: c_int = if (pair) |v| (if (v.route != null) -1 else 1 + @as(c_int, @intCast(v.limit))) else 0;
     const cfg = try stagedConfig(.{ .rows = m, .out_n = n, .nw = nw, .k = k, .max_tiles = t.max_tiles, .st = st, .bits = bits, .group = group, .mx = mx, .epi = epi, .esc = esc.bits(), .map = row_map != null });
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    if (scat) |v| {
+        // The plain tile only (MAP and EPI unread there): `rmap` carries each sorted row's token.
+        if (pair != null or row_map != null) return error.ScatPlainOnly;
+        var si = inputs ++ [_]mlx.mlx_array{v.ids};
+        si[11] = v.rows;
+        return applyOne(try stagedScatKernel(v.k), &si, cfg, s);
+    }
     return applyOne(try stagedKernel(), &inputs, cfg, s);
 }
 
@@ -792,6 +836,22 @@ pub fn sortedGatherPromptStaged(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_
     if (!stagedFits(mlx.getShape(x)[2], ws[1], mx)) return null;
     const st = stagedPlan(mlx.getShape(idx)[0], ws[0]);
     return try launchStaged(x, null, w, sc, bi, idx, null, bits, group, mx, st, st.bm, s);
+}
+
+/// `sortedGatherPromptStaged` with each output row at its pair's slot: sorted row p (expert `idx[p]`, token `rows[p]`)
+/// lands at row `rows[p] * k + j`, where `ids[rows[p] * k + j]` is that expert (`ids` `[m]` the flat picks, `k` a
+/// token, each token's picks distinct). The output `[m, 1, n]` is in pair order, each row the same words as the
+/// sorted call's row p; null where the staged schedule does not serve.
+pub fn sortedGatherPromptStagedTok(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, rows: mlx.mlx_array, ids: mlx.mlx_array, k: c_int, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!nax_available or !mlx.streamIsGpu(s)) return null;
+    if (!supported(x, w, sc, bi, idx, bits, group, mx, null, true)) return null;
+    const ws = mlx.getShape(w);
+    if (!stagedFits(mlx.getShape(x)[2], ws[1], mx)) return null;
+    const m = mlx.getShape(idx)[0];
+    if (k < 1 or k > 8 or @rem(m, k) != 0) return null;
+    for ([_]mlx.mlx_array{ rows, ids }) |a| if (mlx.mlx_array_dtype(a) != .uint32 or mlx.mlx_array_size(a) != @as(usize, @intCast(m))) return null;
+    const st = stagedPlan(m, ws[0]);
+    return try launchStagedTo(x, null, w, sc, bi, idx, null, bits, group, mx, st, st.bm, .{ .rows = rows, .ids = ids, .k = k }, s);
 }
 
 fn requireNax() !void {
@@ -1589,6 +1649,11 @@ const staged_variants = [_]Staged{
     .{ .bm = 128, .wm = 8, .wn = 1, .gx = 32, .tg_a = true },
     .{ .bm = 128, .wm = 4, .wn = 1, .gx = 32, .tg_a = true },
     .{ .bm = 128, .wm = 4, .wn = 2, .gx = 32, .tg_a = true },
+    .{ .bm = 16, .wm = 1, .wn = 2, .gx = 0 },
+    .{ .bm = 16, .wm = 1, .wn = 2, .gx = 32 },
+    .{ .bm = 32, .wm = 1, .wn = 2, .gx = 32 },
+    .{ .bm = 32, .wm = 2, .wn = 1, .gx = 32 },
+    .{ .bm = 32, .wm = 2, .wn = 2, .gx = 32 },
 };
 
 const ds_experts: c_int = 384;
@@ -1875,4 +1940,199 @@ test "staged NAX sorted gather µbench at DeepSeek-V4.1's NVFP4 routed experts a
             }
         }
     }
+}
+
+/// A call over a served routing: the sorted pairs' experts and rows as `DSV41_ROUTE_DUMP` wrote them (`tokens` rows);
+/// the activations, routing weights and scales drawn as `dsCall` draws them.
+fn dsCallRouted(ids: []const u32, rows: []const u32, tokens: usize, seed: u64, s: mlx.mlx_stream) !DsCall {
+    const pairs: c_int = @intCast(ids.len);
+    var touched: usize = 0;
+    for (ids, 0..) |e, i| {
+        if (i == 0 or ids[i - 1] != e) touched += 1;
+    }
+    const rw = try std.testing.allocator.alloc(f32, ids.len);
+    defer std.testing.allocator.free(rw);
+    var prng = std.Random.DefaultPrng.init(seed);
+    for (rw) |*v| v.* = 0.05 + prng.random().float(f32);
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, seed));
+    var x = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_normal(&x, &[_]c_int{ @intCast(tokens), 1, ds_hidden }, 3, .bfloat16, 0, 0.5, key, s));
+    var akey = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(akey);
+    try mlx.check(mlx.mlx_random_key(&akey, seed + 1));
+    var act = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_normal(&act, &[_]c_int{ pairs, 1, ds_inter }, 3, .bfloat16, 0, 0.5, akey, s));
+    var esc: [2]mlx.mlx_array = undefined;
+    for (&esc, 0..) |*o, i| o.* = try randUniform(&[_]c_int{ds_experts}, 0.25, 4.0, seed + 2 + i, s);
+    const c: DsCall = .{
+        .x = x,
+        .map = mlx.mlx_array_new_data(rows.ptr, &[_]c_int{pairs}, 1, .uint32),
+        .ids = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{pairs}, 1, .uint32),
+        .route = mlx.mlx_array_new_data(rw.ptr, &[_]c_int{pairs}, 1, .float32),
+        .act = act,
+        .esc = esc,
+        .pairs = pairs,
+        .touched = touched,
+    };
+    for ([_]mlx.mlx_array{ c.x, c.act, c.esc[0], c.esc[1] }) |v| try mlx.check(mlx.mlx_array_eval(v));
+    return c;
+}
+
+/// Milliseconds a call of the public staged entries (`st` null: today's plan) or of tile `st`, four evaluated
+/// together, median of 7 after one warm round.
+fn dsRoutedMs(c: DsCall, b: DsBanks, down: bool, st: ?Staged, s: mlx.mlx_stream) !f64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var laps: [7]u64 = undefined;
+    for (0..laps.len + 1) |i| {
+        const mark = std.Io.Timestamp.now(io, .boot);
+        var outs: [4]mlx.mlx_array = undefined;
+        for (&outs) |*o| o.* = if (st) |v| try dsStaged(c, b, down, v, v.bm, s) else (if (down)
+            try sortedGatherPromptStaged(c.act, b.down.w, b.down.sc, b.down.bi, c.ids, 4, b.group, true, true, s)
+        else
+            try sortedGateUpRoutedStaged(c.x, c.map, b.gu.w, b.gu.sc, b.gu.bi, c.ids, c.route, ds_limit, .{ .gate = c.esc[0], .up = c.esc[1] }, 4, b.group, true, true, s)) orelse return error.KernelDeclinedTestShape;
+        defer for (outs) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        const vec = mlx.mlx_vector_array_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
+        if (i > 0) laps[i - 1] = @intCast(mark.untilNow(io, .boot).nanoseconds);
+    }
+    std.mem.sort(u64, &laps, {}, std.sort.asc(u64));
+    return @as(f64, @floatFromInt(laps[laps.len / 2])) / 4e6;
+}
+
+test "staged NAX sorted gather µbench on a served routing, today's plan against every staged tile (diag gqmm-ubench=route:<DSV41_ROUTE_DUMP file>)" {
+    const raw = std.mem.sliceTo(env.get(.GQMM_UBENCH) orelse return error.SkipZigTest, 0);
+    if (!std.mem.startsWith(u8, raw, "route:")) return error.SkipZigTest;
+    try requireNax();
+    errdefer dropOwnLatch();
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, raw["route:".len..], a, .limited(1 << 28));
+    defer a.free(bytes);
+    const words = std.mem.bytesAsSlice(u32, bytes[0 .. bytes.len / 4 * 4]);
+    const b = try DsBanks.init(16, s);
+    defer b.deinit();
+    // The tiles run on the calls of the dump's last row count only (the CED replay's); every call runs today's plan.
+    var sweep_rows: usize = 0;
+    {
+        var w: usize = 0;
+        while (w + 4 <= words.len) : (w += 4 + 2 * @as(usize, words[w + 3])) sweep_rows = words[w];
+    }
+    var tot: [2][1 + staged_variants.len]f64 = @splat(@splat(0));
+    var floor_tot: [2]f64 = .{ 0, 0 };
+    var calls: usize = 0;
+    var at: usize = 0;
+    var layer: usize = 0;
+    while (at + 4 <= words.len) : (layer += 1) {
+        const L: usize = words[at];
+        const n: usize = words[at + 3];
+        if (words[at + 2] != ds_experts or words[at + 1] != ds_top_k or at + 4 + 2 * n > words.len) return error.BadRouteDump;
+        const ids = words[at + 4 ..][0..n];
+        const rows = words[at + 4 + n ..][0..n];
+        at += 4 + 2 * n;
+        if (L != sweep_rows) continue;
+        calls += 1;
+        const c = try dsCallRouted(@alignCast(ids), @alignCast(rows), L, 0x6000 + layer, s);
+        defer c.deinit();
+        for ([_]bool{ false, true }, 0..) |down, di| {
+            const wb = @as(f64, @floatFromInt(c.touched)) * @as(f64, @floatFromInt(ds_hidden)) * @as(f64, @floatFromInt(if (down) ds_inter else 2 * ds_inter)) * (0.5 + 1.0 / 16.0);
+            floor_tot[di] += wb / 1.065e9;
+            const today = try dsRoutedMs(c, b, down, null, s);
+            tot[di][0] += today;
+            for (staged_variants, 0..) |st, vi| tot[di][1 + vi] += try dsRoutedMs(c, b, down, st, s);
+        }
+    }
+    const pick = stagedPlan(@intCast(6 * sweep_rows), ds_experts);
+    for (0..2) |di| {
+        std.debug.print("[gqmm-route] {d} calls of {d} rows {s}: today {d:.2} ms (plan bm={d} wm={d} wn={d} gx={d}), weight floor {d:.2} ms ({d:.0}%)\n", .{ calls, sweep_rows, if (di == 1) @as([]const u8, "down") else "gate+up+act", tot[di][0], pick.bm, pick.wm, pick.wn, pick.gx, floor_tot[di], 100 * floor_tot[di] / tot[di][0] });
+        for (staged_variants, 0..) |st, vi| std.debug.print("[gqmm-route]   staged bm={d} wm={d} wn={d} gx={d} {s}: {d:.2} ms ({d:.0}% of floor), {d:.2} ms saved\n", .{ st.bm, st.wm, st.wn, st.gx, if (st.tg_a) @as([]const u8, "tg-a") else "reg-a", tot[di][1 + vi], 100 * floor_tot[di] / tot[di][1 + vi], tot[di][0] - tot[di][1 + vi] });
+    }
+}
+
+/// Milliseconds a down call takes (four evaluated together, median of 7 after one warm round): today's staged entry, or
+/// with `ridx` the scatter (`sortedGatherPromptStagedTok`, each row at its pair's slot).
+fn dsDownMs(c: DsCall, b: DsBanks, ridx: ?mlx.mlx_array, s: mlx.mlx_stream) !f64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var laps: [7]u64 = undefined;
+    for (0..laps.len + 1) |i| {
+        const mark = std.Io.Timestamp.now(io, .boot);
+        var outs: [4]mlx.mlx_array = undefined;
+        for (&outs) |*o| o.* = (if (ridx) |r|
+            try sortedGatherPromptStagedTok(c.act, b.down.w, b.down.sc, b.down.bi, c.ids, c.map, r, @intCast(ds_top_k), 4, b.group, true, true, s)
+        else
+            try sortedGatherPromptStaged(c.act, b.down.w, b.down.sc, b.down.bi, c.ids, 4, b.group, true, true, s)) orelse return error.KernelDeclinedTestShape;
+        defer for (outs) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        const vec = mlx.mlx_vector_array_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
+        if (i > 0) laps[i - 1] = @intCast(mark.untilNow(io, .boot).nanoseconds);
+    }
+    std.mem.sort(u64, &laps, {}, std.sort.asc(u64));
+    return @as(f64, @floatFromInt(laps[laps.len / 2])) / 4e6;
+}
+
+test "staged NAX down scatter µbench on a served routing: PF_DOWN_TOKORD's scatter against today's staged down at every call of the dump (diag gqmm-ubench=route:<DSV41_ROUTE_DUMP file>)" {
+    const raw = std.mem.sliceTo(env.get(.GQMM_UBENCH) orelse return error.SkipZigTest, 0);
+    if (!std.mem.startsWith(u8, raw, "route:")) return error.SkipZigTest;
+    try requireNax();
+    errdefer dropOwnLatch();
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, raw["route:".len..], a, .limited(1 << 30));
+    defer a.free(bytes);
+    const words = std.mem.bytesAsSlice(u32, bytes[0 .. bytes.len / 4 * 4]);
+    const b = try DsBanks.init(16, s);
+    defer b.deinit();
+    // Totals by call width (rows), today's and the scatter's.
+    const W = struct { rows: usize, calls: usize = 0, today: f64 = 0, tok: f64 = 0, floor: f64 = 0 };
+    var ws: [16]W = undefined;
+    var nw: usize = 0;
+    var at: usize = 0;
+    var layer: usize = 0;
+    while (at + 4 <= words.len) : (layer += 1) {
+        const L: usize = words[at];
+        const n: usize = words[at + 3];
+        if (words[at + 2] != ds_experts or words[at + 1] != ds_top_k or at + 4 + 2 * n > words.len) return error.BadRouteDump;
+        const ids = words[at + 4 ..][0..n];
+        const rows = words[at + 4 + n ..][0..n];
+        at += 4 + 2 * n;
+        // The flat picks: each token's experts, slot j in the order its rows come (sorted by expert).
+        const flat = try a.alloc(u32, n);
+        defer a.free(flat);
+        const fill = try a.alloc(u8, L);
+        defer a.free(fill);
+        @memset(fill, 0);
+        for (ids, rows) |e, r| {
+            if (r >= L or fill[r] >= ds_top_k) return error.BadRouteDump;
+            flat[r * ds_top_k + fill[r]] = e;
+            fill[r] += 1;
+        }
+        const c = try dsCallRouted(@alignCast(ids), @alignCast(rows), L, 0x7000 + layer, s);
+        defer c.deinit();
+        const ridx = mlx.mlx_array_new_data(flat.ptr, &[_]c_int{@intCast(n)}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(ridx);
+        const wi = for (ws[0..nw], 0..) |w, i| {
+            if (w.rows == L) break i;
+        } else blk: {
+            if (nw == ws.len) return error.TooManyWidths;
+            ws[nw] = .{ .rows = L };
+            nw += 1;
+            break :blk nw - 1;
+        };
+        const today = try dsDownMs(c, b, null, s);
+        const tok = try dsDownMs(c, b, ridx, s);
+        ws[wi].calls += 1;
+        ws[wi].today += today;
+        ws[wi].tok += tok;
+        ws[wi].floor += @as(f64, @floatFromInt(c.touched)) * @as(f64, @floatFromInt(ds_hidden)) * @as(f64, @floatFromInt(ds_inter)) * (0.5 + 1.0 / 16.0) / 1.065e9;
+    }
+    for (ws[0..nw]) |w| std.debug.print("[gqmm-route] down {d} calls of {d} rows: today {d:.3} ms, scatter {d:.3} ms ({d:.3} ms, {d:.2}%), weight floor {d:.3} ms\n", .{ w.calls, w.rows, w.today, w.tok, w.tok - w.today, 100 * (w.tok - w.today) / w.today, w.floor });
 }

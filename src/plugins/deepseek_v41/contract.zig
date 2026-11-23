@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
+const env = @import("../../env.zig");
 const kit = @import("../deepseek_v4/contract_kit.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const v41 = @import("deepseek_v41.zig");
@@ -16,6 +17,7 @@ const inax = @import("prompt/idx_nax.zig");
 const mtail = @import("prompt/moe_tail.zig");
 const gtwin = @import("decode/gemv_twin.zig");
 const ggemm = @import("prompt/gate_gemm.zig");
+const pfroute = @import("prompt/pf_route.zig");
 const markov = @import("spec/markov.zig");
 const mplan = @import("spec/markov_plan.zig");
 const fa = @import("prompt/flash_attn.zig");
@@ -155,6 +157,12 @@ pub fn depthOne(_: Shape) usize {
 }
 fn rowsN(s: Shape) usize {
     return s.rows * s.n;
+}
+fn pairs3(s: Shape) usize {
+    return 3 * s.rows * s.k;
+}
+fn pairs1(s: Shape) usize {
+    return s.rows * s.k;
 }
 fn rowsMix(s: Shape) usize {
     return s.rows * MIX;
@@ -372,6 +380,210 @@ const Route = struct {
     }
 };
 
+/// `MLX_SERVE_DSV41_PF_ROUTE_PACK`'s top-6 (`pf_route_rows.metal`): route.metal's rule and outputs on a simdgroup a row.
+const RouteRows = struct {
+    pub const Params = Route.Params;
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        const E = s.k;
+        if (s.rows == 0 or E % 128 != 0 or E > 1024 or p.k == 0 or p.k > 16) return null;
+        const sg = pfroute.rows_sg;
+        var g = metal.Geometry{ .grid = .{ ci((s.rows + sg - 1) / sg * 32 * sg), 1, 1 }, .tg = .{ ci(32 * sg), 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(p.k) }, .uint32);
+        g.out(&.{ ci(s.rows), ci(p.k) }, .float32);
+        g.int("E", E);
+        g.int("K", p.k);
+        g.flag("NORM", p.norm);
+        g.int("SG", sg);
+        g.int("PLANT", 0);
+        g.int("DS", 0);
+        return g;
+    }
+
+    /// Route's inputs and the down scale it reads only with DS (bound, unread here).
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        try Route.fill(k, f, rng);
+        @memset(try k.add(.float32, &.{k.shape.k}), 1);
+    }
+
+    pub const count = Route.count;
+    pub const compute = Route.compute;
+    pub const check = Route.check;
+};
+
+/// `MLX_SERVE_DSV41_PF_ROUTE_PACK`'s scan (`pf_route_scan.metal`): `rows` 256-pair blocks' histograms over `n` experts
+/// in, each (block, expert)'s first sorted place out (expert-major, blocks in order).
+const RouteScan = struct {
+    pub const Params = struct {};
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n % 128 != 0 or s.n > 1024) return null;
+        var g = metal.Geometry{ .grid = .{ pfroute.scan_threads, 1, 1 }, .tg = .{ pfroute.scan_threads, 1, 1 } };
+        g.out(&.{ci(s.rows * s.n)}, .uint32);
+        g.int("E", s.n);
+        g.int("PLANT", 0);
+        return g;
+    }
+
+    /// Each block's 256 pairs (the last block part full) routed as prompts route: half on four hot experts.
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const nb = k.shape.rows;
+        const E = k.shape.n;
+        const c = try k.add(.uint32, &.{nb * E});
+        @memset(c, 0);
+        for (0..nb) |b| {
+            const pairs: usize = if (b + 1 == nb) 1 + rng.uintLessThan(usize, pfroute.block) else pfroute.block;
+            for (0..pairs) |_| {
+                // The extremes at the nonfinite gate (no float exists): every pair on the first or the last expert.
+                const e: usize = if (f == .nonfinite) (if (rng.boolean()) 0 else E - 1) else if (rng.boolean()) rng.uintLessThan(usize, 4) else rng.uintLessThan(usize, E);
+                c[b * E + e] += 1;
+            }
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n;
+    }
+
+    fn expected(k: anytype, want: []u32) void {
+        const nb = k.shape.rows;
+        const E = k.shape.n;
+        var at: u32 = 0;
+        for (0..E) |e| for (0..nb) |b| {
+            want[b * E + e] = at;
+            at += @intFromFloat(k.in(0)[b * E + e]);
+        };
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, _: Sum) !void {
+        const want = try k.scratch().alloc(u32, out.len);
+        defer k.scratch().free(want);
+        expected(k, want);
+        for (out, want) |*o, w| o.* = @floatFromInt(w);
+        @memset(mag, 0);
+    }
+
+    /// Exact: every offset is the counting sort's.
+    pub fn check(k: anytype, _: spec.Gate) !?[]const u8 {
+        const want = try k.scratch().alloc(u32, count(k.p, k.shape));
+        defer k.scratch().free(want);
+        expected(k, want);
+        const got = k.rig.outputBytes();
+        for (want, 0..) |w, i| {
+            const v = std.mem.readInt(u32, got[4 * i ..][0..4], .little);
+            if (v != w) return std.fmt.bufPrint(&k.msg, "offset {d} is {d} where the counting sort gives {d}", .{ i, v, w }) catch "offset";
+        }
+        return null;
+    }
+};
+
+/// `MLX_SERVE_DSV41_PF_ROUTE_PACK`'s scatter (`pf_route_scatter.metal`): the SDK's stable placement of `rows` x `k`
+/// routed pairs over `n` experts from the scan's offsets, each pair's weight moved to its place.
+const RouteScatter = struct {
+    pub const Params = struct {};
+
+    fn blocks(s: Shape) usize {
+        return (s.rows * s.k + pfroute.block - 1) / pfroute.block;
+    }
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        const n = s.rows * s.k;
+        if (n == 0 or s.n == 0 or s.n > 1024) return null;
+        var g = metal.Geometry{ .grid = .{ ci(blocks(s) * pfroute.block), 1, 1 }, .tg = .{ ci(pfroute.block), 1, 1 } };
+        for (0..3) |_| g.out(&.{ci(n)}, .uint32);
+        g.out(&.{ci(n)}, .float32);
+        g.int("E", s.n);
+        g.int("TOPK", s.k);
+        return g;
+    }
+
+    /// Distinct experts a row, half the pairs on four hot experts; the offsets the counting sort gives them.
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const s = k.shape;
+        const n = s.rows * s.k;
+        const E = s.n;
+        const ids = try k.add(.uint32, &.{n});
+        for (0..s.rows) |r| {
+            var j: usize = 0;
+            while (j < s.k) {
+                const e: f64 = @floatFromInt(if (rng.boolean()) rng.uintLessThan(usize, @min(4, E)) else rng.uintLessThan(usize, E));
+                if (std.mem.indexOfScalar(f64, ids[r * s.k ..][0..j], e) != null) continue;
+                ids[r * s.k + j] = e;
+                j += 1;
+            }
+        }
+        const nb = blocks(s);
+        const off = try k.add(.uint32, &.{nb * E});
+        @memset(off, 0);
+        for (ids, 0..) |v, i| off[(i / pfroute.block) * E + @as(usize, @intFromFloat(v))] += 1;
+        var at: f64 = 0;
+        for (0..E) |e| for (0..nb) |b| {
+            const c = off[b * E + e];
+            off[b * E + e] = at;
+            at += c;
+        };
+        const w = try k.add(.float32, &.{n});
+        kit.uniform(rng, w, 0.01, 2);
+        // Non-finite weights move as they are.
+        if (f == .nonfinite) {
+            w[0] = nan;
+            w[n / 2] = inf;
+            w[n - 1] = -inf;
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return 4 * s.rows * s.k;
+    }
+
+    /// Pair i's place: the pairs before it in (expert, pair) order.
+    fn places(k: anytype, inv: []u32) void {
+        const ids = k.in(0);
+        for (ids, 0..) |v, i| {
+            var p: u32 = 0;
+            for (ids, 0..) |o, j| if (o < v or (o == v and j < i)) {
+                p += 1;
+            };
+            inv[i] = p;
+        }
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, _: Sum) !void {
+        const n = k.shape.rows * k.shape.k;
+        const inv = try k.scratch().alloc(u32, n);
+        defer k.scratch().free(inv);
+        places(k, inv);
+        for (inv, 0..) |p, i| {
+            out[i] = @floatFromInt(p);
+            out[n + p] = k.in(0)[i];
+            out[2 * n + p] = @floatFromInt(i / k.shape.k);
+            out[3 * n + p] = k.in(2)[i];
+        }
+        @memset(mag, 0);
+    }
+
+    /// Exact: every place, expert and row the stable sort's, every weight moved bit for bit.
+    pub fn check(k: anytype, _: spec.Gate) !?[]const u8 {
+        const n = k.shape.rows * k.shape.k;
+        const inv = try k.scratch().alloc(u32, n);
+        defer k.scratch().free(inv);
+        places(k, inv);
+        const got = k.rig.outputBytes();
+        const word = struct {
+            fn at(b: []const u8, i: usize) u32 {
+                return std.mem.readInt(u32, b[4 * i ..][0..4], .little);
+            }
+        }.at;
+        for (inv, 0..) |p, i| {
+            const want = [4]u32{ p, @intFromFloat(k.in(0)[i]), @intCast(i / k.shape.k), @bitCast(@as(f32, @floatCast(k.in(2)[i]))) };
+            const at = [4]usize{ i, n + p, 2 * n + p, 3 * n + p };
+            for (want, at, 0..) |w, o, part| if (word(got, o) != w)
+                return std.fmt.bufPrint(&k.msg, "pair {d}'s output {d} (part {d}) is {d} where the stable sort gives {d}", .{ i, o, part, word(got, o), w }) catch "scatter";
+        }
+        return null;
+    }
+};
+
 // ── radix top-k: the K largest of each row by the float's order key, as ascending indices, ties to the lower index ──
 
 fn orderKey(v: f64) u32 {
@@ -544,7 +756,8 @@ const MoeWt = struct {
 };
 
 const MoeCombine = struct {
-    pub const Params = struct { k: usize = TOPK };
+    /// `tok` (`MoeParts.tok`, the `TOK` build): the down rows in pair order, read in place; `inv` the identity.
+    pub const Params = struct { k: usize = TOPK, tok: bool = false };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         const total = s.rows * s.n;
@@ -566,13 +779,16 @@ const MoeCombine = struct {
         const sh = try k.add(act, &.{ L, D });
         kit.uniform(rng, dn, -2, 2);
         kit.uniform(rng, sh, -2, 2);
-        // A permutation of the sorted rows, as argsort of the expert order gives.
+        // A permutation of the sorted rows, as argsort of the expert order gives (the TOK build: the rows in pair order,
+        // so the identity).
         for (inv, 0..) |*v, i| v.* = @floatFromInt(i);
-        const perm = try k.scratch().alloc(f64, inv.len);
-        defer k.scratch().free(perm);
-        @memcpy(perm, inv);
-        rng.shuffle(f64, perm);
-        @memcpy(inv, perm);
+        if (!k.p.tok) {
+            const perm = try k.scratch().alloc(f64, inv.len);
+            defer k.scratch().free(perm);
+            @memcpy(perm, inv);
+            rng.shuffle(f64, perm);
+            @memcpy(inv, perm);
+        }
         switch (f) {
             .random => {},
             .nonfinite => {
@@ -627,7 +843,7 @@ const MoeCombine = struct {
 
 /// kernels/moe_tail.metal (`MLX_SERVE_DSV41_MOE_TAIL`): moe_combine's rows (rounded to T), then the hc expand from them.
 const MoeTail = struct {
-    pub const Params = struct { k: usize = TOPK };
+    pub const Params = struct { k: usize = TOPK, tok: bool = false };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or s.n == 0 or s.n % 4 != 0 or s.k != p.k) return null;
@@ -1514,7 +1730,8 @@ const ExpandNorm = struct {
 
 /// kernels/hc_v2_mix.metal at `p.pro`: x2 (the tail), the raw collapse and each slice's partial dots and squares.
 const HcV2Mix = struct {
-    pub const Params = struct { pro: hv2.Pro };
+    /// `tok`: a combining tail's `TOK` build (`MoeParts.tok`), its down rows in pair order (`inv` the identity).
+    pub const Params = struct { pro: hv2.Pro, tok: bool = false };
 
     fn mixes(p: Params) bool {
         return hv2.mixes(p.pro);
@@ -1562,10 +1779,10 @@ const HcV2Mix = struct {
                 kit.uniform(rng, dn, -1, 1);
                 kit.uniform(rng, sh, -1, 1);
                 for (inv, 0..) |*v, q| v.* = @floatFromInt(q);
-                for (0..n) |q| {
+                if (!k.p.tok) for (0..n) |q| {
                     const j = q + rng.uintLessThan(usize, n - q);
                     std.mem.swap(f64, &inv[q], &inv[j]);
-                }
+                };
             } else {
                 const y = try k.add(act, &.{ L, D });
                 kit.uniform(rng, y, -3, 3);
@@ -2526,10 +2743,22 @@ const RopeTailOnly = struct {
 // ── the window row: rms norm, the tail rope at its position, the fp8 round trip ──
 
 const KvRow = struct {
-    pub const Params = struct { off: i32 = 3001 };
+    /// `rows`: the PF_KV_ROWS build (kernels/kv_rows.metal), one simdgroup a row, KV_ROWS_NSG rows a threadgroup.
+    pub const Params = struct { off: i32 = 3001, rows: bool = false };
 
-    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or s.k == 0 or s.k > 1024 or s.k % 32 != 0 or s.k < RD) return null;
+        if (p.rows) {
+            const nsg = v41.KV_ROWS_NSG;
+            var g = metal.Geometry{ .grid = .{ 32 * nsg, ci((s.rows + nsg - 1) / nsg), 1 }, .tg = .{ 32 * nsg, 1, 1 } };
+            g.out(&.{ ci(s.rows), ci(s.k) }, act);
+            g.int("D", s.k);
+            g.int("RD", RD);
+            g.int("NSG", nsg);
+            g.flag("QAT", true);
+            g.dtype("T", act);
+            return g;
+        }
         var g = metal.Geometry{ .grid = .{ ci(s.k), ci(s.rows), 1 }, .tg = .{ ci(s.k), 1, 1 } };
         g.out(&.{ ci(s.rows), ci(s.k) }, act);
         g.int("RD", RD);
@@ -4604,6 +4833,9 @@ const hc_stage_x_ins: []const [*:0]const u8 = &.{ "x", "y", "spost", "scomb", "c
 const gate_l = launch("dsv41_gate", &.{ "x", "w" }, &.{"logits"}, v41.GATE_SOURCE, "", 0, 1024, false);
 const dense_l = launch("dsv41_dense_f32x", &.{ "x", "w" }, &.{"out"}, v41.DENSE_F32X_SOURCE, "", 0, 928, false);
 const route_l = launch("dsv41_route", &.{ "logits", "bias", "scal" }, &.{ "idx", "wts" }, v41.ROUTE_SOURCE, "", 4 * (1024 + 32 + 32 + TOPK), 1024, false);
+const route_rows_l = launch("dsv41_pf_route_rows", &pfroute.ROWS_INS, &pfroute.ROWS_OUTS, pfroute.ROWS_SOURCE, "", 0, 32 * pfroute.rows_sg, false);
+const route_scatter_l = launch("dsv41_pf_route_scatter", &pfroute.SCATTER_INS, &pfroute.SCATTER_OUTS, pfroute.SCATTER_SOURCE, "", 4 * 256, 256, false);
+const route_scan_l = launch("dsv41_pf_route_scan", &pfroute.SCAN_INS, &pfroute.SCAN_OUTS, pfroute.SCAN_SOURCE, "", 16 * 1024 + 4 * (1024 + 32), pfroute.scan_threads, false);
 const topk_l = launch("dsv41_topk", &.{"x"}, &.{"out"}, v41.TOPK_SOURCE, v41.TOPK_HEADER, 4 * (256 + 2 + TopK.TG / 32), 1024, false);
 const split_l = launch("dsv41_hc_split", &.{ "z", "eps" }, &.{ "pre", "post", "comb" }, v41.HC_SPLIT_SOURCE, "", 0, 1024, false);
 const mix_l = launch("dsv41_hc_mix", &.{ "x", "fn", "scale", "base", "eps" }, &.{"z"}, v41.HC_MIX_SOURCE, "", 4 * (4 * 6 + 4) * 32, 1024, true);
@@ -4646,6 +4878,17 @@ const hc_v2_mix_l = blk: {
     for (hv2.all, 0..) |p, i| l[i] = hcV2MixLaunch(p);
     break :blk l;
 };
+/// The combining tails' `TOK` builds (`MoeParts.tok`: the down rows in pair order, read in place).
+const hc_v2_tok = [_]hv2.Pro{ .tail_c, .tail_only_c };
+const hc_v2_mix_tok_l = blk: {
+    var l: [hc_v2_tok.len]metal.Launch = undefined;
+    for (hc_v2_tok, 0..) |p, i| {
+        l[i] = hcV2MixLaunch(p);
+        l[i].name = hv2.name(p) ++ "_tok";
+        l[i].header = hv2.header(p) ++ "#define TOK 1\n";
+    }
+    break :blk l;
+};
 /// hc_v2's launches serve on NAX GPUs only (`hc_v2.serves`).
 const hc_v2_fin_l = metal.Launch{ .name = "dsv41_hc_v2_fin", .inputs = &hv2.fin_ins, .outputs = &hv2.fin_outs, .source = hv2.fin_source, .header = "", .tg_bytes = 0, .offline = false, .min_gen = 17 };
 const mix_norm_l = launch("dsv41_hc_mix_norm", &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, &.{ "z", "h_out", "h2" }, hcf.mix_norm_source, "", 4 * (4 * 6 + 4) * 32, 1024, true);
@@ -4655,6 +4898,7 @@ const mix_norm8_l = metal.Launch{ .name = "dsv41_hc_mix_norm", .inputs = &.{ "x"
 const rope_only_l = launch("dsv41_rope_tail_only", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_only_source, "", 0, 1024, false);
 const rope_pairs_l = launch("dsv41_rope_tail_pairs", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_pairs_source, "", 0, 1024, false);
 const kv_l = launch("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, v41.KV_ROW_SOURCE, v41.FP8_HEADER, 4 * (32 + 1024), 1024, false);
+const kv_rows_l = launch("dsv41_kv_rows", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, v41.KV_ROWS_SOURCE, v41.FP8_HEADER, 0, 1024, false);
 const engram_l = launch("dsv41_engram", &.{ "x", "kv", "qk", "cst" }, &.{"out"}, v41.ENGRAM_SOURCE, "", 4 * (3 * 32 + 1), 928, false);
 const dec_l = launch("dsv41_attn_decode", attn_ins ++ &[_][*:0]const u8{"periods"}, &.{"out"}, v41.ATTN_DEC_SOURCE, v41.UNROPE_HEADER, 4 * (AttnDec.NSG * HD + 2 * AttnDec.NSG), 768, false);
 const split_attn_l = launch("dsv41_attn_split", attn_ins, &.{ "pacc", "pm", "pl" }, v41.ATTN_SPLIT_SOURCE, "", 4 * (AttnSplit.NSG * HD + 2 * AttnSplit.NSG), 768, false);
@@ -4677,6 +4921,9 @@ const dn_l = launch("dsv41_moe_dn", moe_dn_ins, &.{"out"}, v41.MOE_DN_SOURCE, v4
 const act_l = launch("dsv41_moe_act", &.{ "y", "wts", "lim" }, &.{"out"}, v41.MOE_ACT_SOURCE, "", 0, 1024, false);
 const combine_l = launch("dsv41_moe_combine", &.{ "dn", "inv", "sh" }, &.{"out"}, v41.MOE_COMBINE_SOURCE, "", 0, 1024, false);
 const moe_tail_l = launch("dsv41_moe_tail", &mtail.ins, &.{"out"}, mtail.source, "", 0, 1024, false);
+/// `MLX_SERVE_DSV41_PF_DOWN_TOKORD`'s builds: the down rows in pair order, read in place.
+const combine_tok_l = launch("dsv41_moe_combine_tok", &.{ "dn", "inv", "sh" }, &.{"out"}, v41.MOE_COMBINE_SOURCE, "#define TOK 1\n", 0, 1024, false);
+const moe_tail_tok_l = launch("dsv41_moe_tail_tok", &mtail.ins, &.{"out"}, mtail.source, "#define TOK 1\n", 0, 1024, false);
 
 pub const relu_nan: spec.Known = .{ .gate = .nonfinite, .finding = "a NaN q . k dot scores as 0: metal::max(dot, 0) drops NaN where relu (the reference, torch) propagates it" };
 pub const quant_nan: spec.Nan = .{ .stated = "classes as float64 gives them; quantized entries within the quantizer's envelope of their bounds" };
@@ -4715,6 +4962,32 @@ pub fn register(set: *kc.Set) !void {
         .outs = &.{ .{ .elem = .u32, .count = rowsN }, .{ .elem = .f32, .count = rowsN } },
         .nan = .{ .stated = "a NaN score is never picked; weights classed as float64 gives them" },
         .served = &.{ .{ .rows = 1, .n = TOPK, .k = EXPERTS }, .{ .rows = REGION, .n = TOPK, .k = EXPERTS } },
+    });
+    try kit.add(set, RouteRows, &route_rows_l, .{}, .{
+        .name = "dsv41 pf route rows (PF_ROUTE_PACK: sqrt-softplus top-6 on a simdgroup a row)",
+        .accum = .none,
+        .depth = depthOne,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .u32, .count = rowsN }, .{ .elem = .f32, .count = rowsN } },
+        .nan = .{ .stated = "a NaN score is never picked; weights classed as float64 gives them" },
+        .served = &.{ .{ .rows = 128, .n = TOPK, .k = EXPERTS }, .{ .rows = 2048, .n = TOPK, .k = EXPERTS }, .{ .rows = 33, .n = TOPK, .k = EXPERTS } },
+    });
+    try kit.add(set, RouteScan, &route_scan_l, .{}, .{
+        .name = "dsv41 pf route scan (PF_ROUTE_PACK: the route pack's offsets on one 1024-thread threadgroup)",
+        .accum = .none,
+        .depth = depthOne,
+        .out = .u32,
+        .nan = .{ .stated = "integer counts in, integer offsets out: no non-finite value exists; the extremes (every pair on the first or the last expert) keep every offset exact" },
+        .served = &.{ .{ .rows = 414, .n = EXPERTS, .k = 1 }, .{ .rows = 3, .n = EXPERTS, .k = 1 }, .{ .rows = 1, .n = EXPERTS, .k = 1 } },
+    });
+    try kit.add(set, RouteScatter, &route_scatter_l, .{}, .{
+        .name = "dsv41 pf route scatter (PF_ROUTE_PACK: the stable placement with the weights put)",
+        .accum = .none,
+        .depth = depthOne,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .u32, .count = pairs3 }, .{ .elem = .f32, .count = pairs1 } },
+        .nan = .{ .stated = "a weight moves bit for bit, NaN and infinities included; ids and places are integers" },
+        .served = &.{ .{ .rows = 128, .n = EXPERTS, .k = TOPK }, .{ .rows = 700, .n = EXPERTS, .k = TOPK }, .{ .rows = 33, .n = EXPERTS, .k = TOPK } },
     });
     try kit.add(set, TopK, &topk_l, .{}, .{
         .name = "dsv41 topk (radix select)",
@@ -4868,6 +5141,16 @@ pub fn register(set: *kc.Set) !void {
         .nan = quant_nan,
         .known = nan_code,
         .served = &.{ .{ .rows = 1, .n = 1, .k = HD }, .{ .rows = 64, .n = 1, .k = HD } },
+        .sums = squares,
+    });
+    try kit.add(set, KvRow, &kv_rows_l, .{ .rows = true }, .{
+        .name = "dsv41 kv_rows (PF_KV_ROWS: kv_row a simdgroup a row)",
+        .accum = .f32,
+        .depth = depthK,
+        .out = .bf16,
+        .nan = quant_nan,
+        .known = nan_code,
+        .served = &.{ .{ .rows = 17, .n = 1, .k = HD }, .{ .rows = 64, .n = 1, .k = HD } },
         .sums = squares,
     });
     try kit.add(set, Engram, &engram_l, .{}, .{
@@ -5036,6 +5319,22 @@ pub fn register(set: *kc.Set) !void {
     });
     try kit.add(set, MoeTail, &moe_tail_l, .{}, .{
         .name = "dsv41 moe_tail (prefill combine + hc expand)",
+        .accum = .f32,
+        .depth = depthTail,
+        .ops = 2,
+        .mids = 1,
+        .out = .bf16,
+        .served = &.{ .{ .rows = 17, .n = DIM, .k = TOPK }, .{ .rows = 64, .n = 256, .k = TOPK } },
+    });
+    try kit.add(set, MoeCombine, &combine_tok_l, .{ .tok = true }, .{
+        .name = "dsv41 moe_combine tok (prefill K-sum + shared, the down rows in pair order)",
+        .accum = .f32,
+        .depth = depthK1,
+        .out = .bf16,
+        .served = &.{ .{ .rows = 17, .n = DIM, .k = TOPK }, .{ .rows = 64, .n = 256, .k = TOPK } },
+    });
+    try kit.add(set, MoeTail, &moe_tail_tok_l, .{ .tok = true }, .{
+        .name = "dsv41 moe_tail tok (prefill combine + hc expand, the down rows in pair order)",
         .accum = .f32,
         .depth = depthTail,
         .ops = 2,
@@ -5286,6 +5585,19 @@ fn registerStreamed(set: *kc.Set) !void {
         .mids = 3,
         .out = .bf16,
         .outs = if (hv2.isTail(p) and hv2.mixes(p)) v2_outs_tail else if (!hv2.mixes(p)) v2_outs_none else v2_outs_mix,
+        .tiles = .{ .{ .size = hv2.ROWS }, .{}, .{} },
+        .served = comptime v2Served(v2Slices(p)),
+        .sums = v2_sums,
+        .nax = true,
+    });
+    inline for (hc_v2_tok, 0..) |p, i| try kit.add(set, HcV2Mix, &hc_v2_mix_tok_l[i], .{ .pro = p, .tok = true }, .{
+        .name = "dsv41 hc_v2_mix (" ++ @tagName(p) ++ " tok: the down rows in pair order, read in place)",
+        .accum = .f32,
+        .depth = depthV2,
+        .ops = 4,
+        .mids = 3,
+        .out = .bf16,
+        .outs = if (hv2.mixes(p)) v2_outs_tail else v2_outs_none,
         .tiles = .{ .{ .size = hv2.ROWS }, .{}, .{} },
         .served = comptime v2Served(v2Slices(p)),
         .sums = v2_sums,
@@ -5577,6 +5889,11 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const o = try hv2.mixLaunch(&sc, p, r.c.args[0..r.c.n_in], 70, v2Slices(p));
         try Expect.same(r.c, r.bytes, o[0..hv2.nOuts(p)]);
     }
+    inline for (hc_v2_tok, 0..) |p, i| {
+        const r = try ours(HcV2Mix, a, &hc_v2_mix_tok_l[i], .{ .pro = p, .tok = true }, .{ .rows = 70, .n = DIM, .k = v2Slices(p) });
+        const o = try hv2.mixLaunchTo(&sc, p, r.c.args[0..r.c.n_in], 70, v2Slices(p), true);
+        try Expect.same(r.c, r.bytes, o[0..hv2.nOuts(p)]);
+    }
     {
         const r = try ours(HcV2Fin, a, &hc_v2_fin_l, .{}, .{ .rows = 70, .n = DIM, .k = 20 });
         const hc: v41.Hc = .{ .fn_w = none, .scale = r.c.args[2], .base = r.c.args[3] };
@@ -5626,6 +5943,13 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
     }
     {
         const r = try ours(KvRow, a, &kv_l, .{}, .{ .rows = 3, .n = 1, .k = HD });
+        ly.kv_norm = r.c.args[1];
+        try Expect.same(r.c, r.bytes, &.{try v41.kvRow(&sc, m, &ly, r.c.args[2], r.c.args[0], r.c.args[3])});
+    }
+    {
+        const sw = env.override(.MLX_SERVE_DSV41_PF_KV_ROWS, "1");
+        defer sw.restore();
+        const r = try ours(KvRow, a, &kv_rows_l, .{ .rows = true }, .{ .rows = 40, .n = 1, .k = HD });
         ly.kv_norm = r.c.args[1];
         try Expect.same(r.c, r.bytes, &.{try v41.kvRow(&sc, m, &ly, r.c.args[2], r.c.args[0], r.c.args[3])});
     }
@@ -5764,6 +6088,15 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const r = try ours(MoeTail, a, &moe_tail_l, .{}, .{ .rows = 3, .n = 256, .k = TOPK });
         const sp: v41.Split = .{ .pre = none, .post = r.c.args[4], .comb = r.c.args[5] };
         try Expect.same(r.c, r.bytes, &.{try mtail.launch(&sc, .{ .dn = r.c.args[0], .inv = r.c.args[1], .sh = r.c.args[2] }, r.c.args[3], &sp)});
+    }
+    {
+        const r = try ours(MoeCombine, a, &combine_tok_l, .{ .tok = true }, .{ .rows = 3, .n = 256, .k = TOPK });
+        try Expect.same(r.c, r.bytes, &.{try v41.flatKernel(&sc, try v41.moeCombineTok(), r.c.args[0..3], &.{ 3, 256 }, act, 3 * 256, &.{ .{ .name = "D", .v = 256 }, .{ .name = "K", .v = TOPK } })});
+    }
+    {
+        const r = try ours(MoeTail, a, &moe_tail_tok_l, .{ .tok = true }, .{ .rows = 3, .n = 256, .k = TOPK });
+        const sp: v41.Split = .{ .pre = none, .post = r.c.args[4], .comb = r.c.args[5] };
+        try Expect.same(r.c, r.bytes, &.{try mtail.launch(&sc, .{ .dn = r.c.args[0], .inv = r.c.args[1], .sh = r.c.args[2], .tok = true }, r.c.args[3], &sp)});
     }
 }
 
