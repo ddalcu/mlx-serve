@@ -71,6 +71,33 @@ fn streams() []const bool {
     return if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) &.{false} else &.{ false, true };
 }
 
+// Bar: a last-row prompt forward (`Caps.prompt_last_row`, its head over the last rows) serves the bytes of that row of
+// the all-rows forward, under the head's tail rows and past them, on each stream.
+test "inkling2 proof: a last-row prompt serves the last row of the all-rows forward, bit for bit" {
+    const a = testing.allocator;
+    var tokens: [300]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast((i * 37 + 11) % VOCAB);
+    for (streams()) |gpu| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var pack = try conformance.Loaded.openWith(testing.io, arena.allocator(), plugin.plugin.name, &plugin.table, try plugin.conformanceFixture(arena.allocator()), .{ .gpu = gpu });
+        defer pack.close();
+        for ([_]usize{ 1, 31, 33, 300 }) |n| {
+            var c_all = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
+            defer c_all.deinit();
+            var c_last = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
+            defer c_last.deinit();
+            const all = try step(a, &pack, &c_all, tokens[0..n], 0, .all_rows);
+            defer a.free(all);
+            const last = try step(a, &pack, &c_last, tokens[0..n], 0, .last_row);
+            defer a.free(last);
+            const want = all[(n - 1) * VOCAB .. n * VOCAB];
+            if (!std.mem.eql(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(last))) std.debug.print("[inkling2 proof] last row differs at {d} rows (gpu {})\n", .{ n, gpu });
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(last));
+        }
+    }
+}
+
 // On the CPU's stream, where the step's chain and the wide forward's are the same sums: the GPU's f32 matmul is good
 // to about 1e-3, and on this random pack one such bit flips an expert pick somewhere along twelve steps.
 test "inkling2 proof: a prompt in chunks and then token by token serves the rows of one forward" {

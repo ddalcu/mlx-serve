@@ -120,6 +120,7 @@ pub const Spec = struct {
 
 pub const Model = struct {
     pub const batches_decode = true;
+    pub const prompt_last_row = true;
 
     pub const Weights = struct {
         embed: b.embed.TableEmbed.Weights,

@@ -348,7 +348,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         c.draft = readDraft(mc.object, &c);
     };
 
-    var p: abi.Parsed = .{ .caps = .{ .moe = true, .images = c.vision != null, .batches_decode = fusedOn() } };
+    var p: abi.Parsed = .{ .caps = .{ .moe = true, .images = c.vision != null, .batches_decode = fusedOn(), .prompt_last_row = true } };
     if (c.draft) |d| if (!stub and dir.exists(dir.ctx, abi.Str.of(draft_file))) {
         p.spec.native_stages = d.layers;
         p.spec.native_block = d.block;
