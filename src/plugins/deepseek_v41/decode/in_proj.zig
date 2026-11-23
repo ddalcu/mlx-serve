@@ -1015,8 +1015,9 @@ test "dsv41 dec in_proj MIXR: the mixes a (mix, row) a threadgroup give every ou
     const gpa = testing.allocator;
     const k = try Kernels.build();
     defer k.deinit();
-    const needle = "const int r0 = MIXR ? tg0 % R : 0;";
-    const src = try std.mem.replaceOwned(u8, gpa, MAIN_SOURCE, needle, "const int r0 = MIXR ? (tg0 + 1) % R : 0;");
+    // A mix that reads the next row's stream (a permutation of the (mix, row) threadgroups alone would change nothing).
+    const needle = "const int r = r0 + rr;";
+    const src = try std.mem.replaceOwned(u8, gpa, MAIN_SOURCE, needle, "const int r = (r0 + rr + 1) % R;");
     defer gpa.free(src);
     try testing.expect(!std.mem.eql(u8, src, MAIN_SOURCE));
     const srcz = try gpa.dupeSentinel(u8, src, 0);
@@ -1050,7 +1051,10 @@ test "dsv41 dec in_proj MIXR: the mixes a (mix, row) a threadgroup give every ou
                 }
             };
             const bad = try launch(&sc, &planted, pm, a);
-            try testing.expect(!try sameWords(served.z, bad.z));
+            if (try sameWords(served.z, bad.z)) {
+                std.debug.print("[dec] in_proj MIXR layer {d} R={d}: the planted wrong-row mixes were not caught\n", .{ li, rows });
+                return error.PlantMissed;
+            }
         };
     }
 }
