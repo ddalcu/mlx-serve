@@ -444,7 +444,7 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_FP4_GEMM is today's output
     }
 }
 
-test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_TOKORD: the staged down's rows at their pairs' slots are the sorted rows unsorted, and moePrefill, MOE_TAIL and the hc_v2 combining tails reading them in place are today's output, word for word, NVFP4 with per-expert scales and MXFP4, prompt rows to 8192; every row one slot over fails" {
+test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_TOKORD: the staged down's rows at their pairs' slots are the sorted rows unsorted, and moePrefill, MOE_TAIL and the hc_v2 combining tails reading them in place are today's output, word for word, NVFP4 with per-expert scales and MXFP4, prompt rows to 8192; each row handed the next token fails" {
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
@@ -507,7 +507,7 @@ test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_TOKORD: the staged down's rows at thei
             // The one moePrefillParts call's down.
             try testing.expectEqual(@as(u32, 1), served);
             for (eq) |v| try testing.expect(v);
-            // Planted: every row one slot over (each token's picks rotated by one).
+            // Planted: each sorted row handed the next token (its value in another token's slots).
             fp4gemm.tok_plant = true;
             defer fp4gemm.tok_plant = false;
             const bad = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);

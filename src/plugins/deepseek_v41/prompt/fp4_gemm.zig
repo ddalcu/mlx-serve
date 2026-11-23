@@ -53,21 +53,20 @@ pub fn down(sc: *dsv41.Scope, b: *const dsv41.Bank, act: A, sidx: A) !?A {
 pub fn downTok(sc: *dsv41.Scope, b: *const dsv41.Bank, act: A, sidx: A, rows: A, flat: A, k: usize) !?A {
     const P = mlx.getShape(sidx)[0];
     if (b.s.ctx == null) return null;
-    var f = try sc.astype(flat, .uint32);
-    // The planted control: each token's picks rotated by one, so every row lands one slot over.
+    var r = try sc.astype(rows, .uint32);
+    // The planted control: each sorted row handed the next token, so its value lands in another token's slots.
     if (tok_plant) {
-        const n = mlx.getShape(f)[0];
-        const r = try sc.reshape(f, &.{ @divExact(n, @as(c_int, @intCast(k))), @intCast(k) });
-        f = try sc.reshape(try sc.concat(&.{ try sc.slice(r, 1, 1, k), try sc.slice(r, 1, 0, 1) }, 1), &.{n});
+        const tokens: u32 = @intCast(@divExact(mlx.getShape(flat)[0], @as(c_int, @intCast(k))));
+        r = try sc.op2(mlx.mlx_remainder, try sc.add(r, try sc.u(1)), try sc.u(tokens));
     }
-    const y = (try gather_nax.sortedGatherPromptStagedTok(act, b.w, b.s, b.b, sidx, try sc.astype(rows, .uint32), f, @intCast(k), b.qp.bits, b.qp.group_size, b.qp.mode.isFp4(), verify_qmm_nax.verifyQmmNaxAvailable(), sc.s)) orelse return null;
+    const y = (try gather_nax.sortedGatherPromptStagedTok(act, b.w, b.s, b.b, sidx, r, try sc.astype(flat, .uint32), @intCast(k), b.qp.bits, b.qp.group_size, b.qp.mode.isFp4(), verify_qmm_nax.verifyQmmNaxAvailable(), sc.s)) orelse return null;
     if (!tok_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_DOWN_TOKORD engaged (pairs {d}, {d} a row)\n", .{ P, k });
     _ = launches.fetchAdd(1, .monotonic);
     _ = tok_launches.fetchAdd(1, .monotonic);
     return try sc.keep(y);
 }
 
-/// `downTok`'s planted bug (its test): each token's picks rotated by one, every row one slot over.
+/// `downTok`'s planted bug (its test): each sorted row handed the next token.
 pub var tok_plant = false;
 
 /// `downTok` launches served (a test's proof `MLX_SERVE_DSV41_PF_DOWN_TOKORD` engaged).
