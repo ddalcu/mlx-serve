@@ -814,13 +814,15 @@ fn auxImportArrays(mp: *anyopaque, ids: abi.Span(u32), header: abi.Str, arrays: 
 
 /// The load reads its Engram tables from disk per lookup and drops the tensors it never loads
 /// (`dsv41.residentDiskBytes`); the `mtp` setting decides the DSpark stages; plus a bf16 prompt trunk
-/// (`bill.pfTrunkBytes`), and the Engram partials' cache at its bound (`engram_kvc.billBytes`).
+/// (`bill.pfTrunkBytes`), the Engram partials' cache at its bound (`engram_kvc.billBytes`), and a draft-only head
+/// (`dsv41.draftHeadBytes`).
 fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, settings_json: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
     const mtp = mtpSetting(settings_json.slice());
     out.* = dsv41.residentDiskBytes(gpa, model_dir.slice(), config.of(p), mtp, shards) catch |e| return Verdict.named(.failed, @errorName(e));
     if (mx_view.on()) out.* -|= mx_view.savedBytes(gpa, model_dir.slice(), dsv41.dsparkWanted(config.of(p), null, mtp)) catch |e| return Verdict.named(.failed, @errorName(e));
     out.* += bill_mod.pfTrunkBytes(config.of(p));
     out.* += engram_kvc.billBytes(config.of(p).dsv41_n_engram_layers);
+    out.* += dsv41.draftHeadBytes(config.of(p), dsv41.dsparkWanted(config.of(p), null, mtp));
     return .ok;
 }
 

@@ -1351,6 +1351,23 @@ test "deepseek_v41 served: a draft-only head (DRAFT_HEAD4, DRAFT_VOCAB) changes 
         defer alone.deinit(a);
         try testing.expectEqualSlices(u32, alone.ids, d.ids);
     }
+    // A request's prompt ids join its state's vocabulary: 7 and 31 (outside the file) become draftable; 5 (inside)
+    // adds nothing; an id the prompt repeats counts once. Off (MLX_SERVE_DSV41_DRAFT_VOCAB_PROMPT=0): the file's alone.
+    try dsv41.draftPromptVocab(m, &sts[0], &.{ 7, 5, 31, 7, 5 });
+    const ex = sts[0].draft_extra.?;
+    try testing.expectEqual(@as(usize, 2), ex.e);
+    try testing.expectEqual(@as(usize, 66), ex.k);
+    for ([_]u32{ 7, 31 }) |t1| {
+        var d = try dsv41.dsparkDraft(m, a, &sts[0], t1);
+        defer d.deinit(a);
+        for (d.ids[1..]) |id| try testing.expect(id % 3 != 1 or id == 7 or id == 31);
+    }
+    {
+        const off = env.override(.MLX_SERVE_DSV41_DRAFT_VOCAB_PROMPT, "0");
+        defer off.restore();
+        try dsv41.draftPromptVocab(m, &sts[0], &.{ 7, 31 });
+        try testing.expect(sts[0].draft_extra == null);
+    }
 }
 
 test "deepseek_v4 served: mlx-community's withdrawn preview pack is refused by the legacy parse and, at load, by name" {
