@@ -476,6 +476,9 @@ pub const Dsv41Model = struct {
     /// `MLX_SERVE_DSV41_SPEC_SYNC`: the next round's draft, queued behind the last verify (`syncRound`), until
     /// `dsparkDraft` collects it.
     ds_next: ?DraftAhead = null,
+    /// Host ns this round spent building the next round's draft (`syncRound`) less what the last round spent on this
+    /// round's (`dsparkDraft`'s collect): `takeRoundShiftMs` gives a round the time its own draft and verify took.
+    ds_shift_ns: i64 = 0,
     /// Rows per attention span (tests narrow it to drive several spans).
     span: usize = SPAN,
     /// Rows per MoE call: spans whose rows fit are routed and run together.
@@ -604,6 +607,8 @@ pub const Dsv41Model = struct {
     fn dropNext(self: *Dsv41Model) void {
         const a = &(self.ds_next orelse return);
         evalAll(&a.ev) catch {};
+        // its host time goes to the round that drops it (`takeRoundShiftMs`)
+        self.ds_shift_ns -= @intCast(a.launch_ns);
         a.deinit();
         self.ds_next = null;
     }
@@ -8047,6 +8052,7 @@ pub fn dsparkDraft(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32) 
                 m.ds_next = null;
             }
             _ = sync_collects.fetchAdd(1, .monotonic);
+            m.ds_shift_ns -= @intCast(a.launch_ns);
             return dsparkDraftCollect(m, gpa, a);
         }
         m.dropNext();
@@ -8648,6 +8654,54 @@ fn syncServes(m: *const Dsv41Model, st: *const State) bool {
     return v.mh.ctx != null and v.n0 + 1 >= m.cfg.sliding_window;
 }
 
+/// `syncRound`'s accept on the GPU: `greedyRows`' masked argmax of every row of `vl` `[b + 1, V]`, the count `acc` of
+/// leading rows whose id is the next draft's (`want`, `b` ids) capped at `cap`, the token after them `next` (`[1]`)
+/// and the position `n` = `acc + n1` (int32 scalars), all lazy.
+fn acceptGraph(sc: *Scope, vl_in: A, suppress: A, want: []const i32, cap: usize, n1: usize) !struct { acc: A, next: A, n: A } {
+    const b = want.len;
+    const vl = if (suppress.ctx != null) try sc.where(suppress, try sc.f(-std.math.inf(f32)), vl_in) else vl_in;
+    const am = try sc.astype(try sc.argmax(vl, -1), .int32); // [b + 1]
+    var acc = try sc.i(0);
+    if (b > 0 and cap > 0) {
+        const miss = try sc.op1(mlx.mlx_logical_not, try sc.op2(mlx.mlx_equal, try sc.slice(am, 0, 0, b), try sc.ints(want, &.{ci(b)})));
+        const first = try sc.reduce(mlx.mlx_min_axis, try sc.where(miss, try sc.arange(0, b), try sc.i(@intCast(b))), 0, false);
+        acc = try sc.op2(mlx.mlx_minimum, first, try sc.i(@intCast(cap)));
+    }
+    return .{ .acc = acc, .next = try sc.take(am, try sc.reshape(acc, &.{1}), 0), .n = try sc.add(acc, try sc.i(@intCast(n1))) };
+}
+
+/// Under `MLX_SERVE_DSV41_SPEC_SYNC`, at load: `syncRound`'s accept and its draft's GPU-position ops (the window read,
+/// the rows' positions, the block's ids) once on small rows of the served dtypes, so the first round compiles none of
+/// them (the drafting backoff would read that compile as the round's cost).
+pub fn syncWarm(m: *Dsv41Model) !void {
+    if (!env.on(.MLX_SERVE_DSV41_SPEC_SYNC) or m.dspark == null) return;
+    var sc = Scope.init(m.gpa, m.s);
+    defer sc.deinit();
+    const V = m.vocab;
+    const vl = try sc.zeros(&.{ 3, ci(V) }, .float32);
+    const mask = try sc.zeros(&.{ci(V)}, .bool_);
+    var out: std.ArrayList(A) = .empty;
+    defer out.deinit(m.gpa);
+    for ([_]A{ none, mask }) |sup| {
+        const ag = try acceptGraph(&sc, vl, sup, &.{ 1, 2 }, 2, m.cfg.sliding_window);
+        var ring = try Ring.init(m.cfg.sliding_window + RING_SLACK, m.cfg.head_dim, m.act, m.s);
+        defer ring.deinit();
+        const B = @max(m.ds_block, 2);
+        var noise: [16]i32 = @splat(@intCast(m.cfg.dsv4_dspark_noise_token_id));
+        try out.appendSlice(m.gpa, &.{ ag.acc, ag.next, ag.n, try ring.readAt(&sc, ag.n, m.cfg.sliding_window), try sc.add(try sc.arange(0, B), ag.n), try sc.concat(&.{ ag.next, try sc.ints(noise[0 .. B - 1], &.{ci(B - 1)}) }, 0) });
+        try evalAll(out.items);
+        out.clearRetainingCapacity();
+    }
+}
+
+/// The host ms the last round spent on the next round's draft less what an earlier round spent on this one's
+/// (`ds_shift_ns`), taken: the engine's round time less it is the round's own draft and verify, as without the switch.
+pub fn takeRoundShiftMs(m: *Dsv41Model) f32 {
+    const ns = m.ds_shift_ns;
+    m.ds_shift_ns = 0;
+    return @as(f32, @floatFromInt(ns)) / std.time.ns_per_ms;
+}
+
 /// `MLX_SERVE_DSV41_SPEC_SYNC`'s greedy round over the open verify `pending`: the accept on the GPU (the masked argmax
 /// of every row, the first row whose id is not the next draft's, capped), every verify row's main rows to the DSpark
 /// windows at the chunk's start, and the next round's draft from the GPU's next token and position, all handed to the
@@ -8662,21 +8716,12 @@ fn syncRound(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, pending: *Dspar
     m.dropNext();
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
-    // `greedyRows`' masked argmax, left on the GPU
-    const suppress = if (m.exact.argmax) m.suppress else none;
-    const vl = if (suppress.ctx != null) try sc.where(suppress, try sc.f(-std.math.inf(f32)), pending.vl_g) else pending.vl_g;
-    const am = try sc.astype(try sc.argmax(vl, -1), .int32); // [b + 1]
-    const cap: i32 = @intCast(@min(accepted_cap, b));
-    var acc = try sc.i(0);
-    if (b > 0 and cap > 0) {
-        var want: [16]i32 = undefined;
-        for (0..b) |k| want[k] = @intCast(d.ids[k + 1]);
-        const miss = try sc.op1(mlx.mlx_logical_not, try sc.op2(mlx.mlx_equal, try sc.slice(am, 0, 0, b), try sc.ints(want[0..b], &.{ci(b)})));
-        const first = try sc.reduce(mlx.mlx_min_axis, try sc.where(miss, try sc.arange(0, b), try sc.i(@intCast(b))), 0, false);
-        acc = try sc.op2(mlx.mlx_minimum, first, try sc.i(cap));
-    }
-    const next = try sc.take(am, try sc.reshape(acc, &.{1}), 0); // [1]
-    const n_gpu = try sc.add(acc, try sc.i(@intCast(n0 + 1 + @as(usize, @intCast(@max(sync_plant, 0))))));
+    var want: [16]i32 = undefined;
+    for (0..b) |k| want[k] = @intCast(d.ids[k + 1]);
+    const ag = try acceptGraph(&sc, pending.vl_g, if (m.exact.argmax) m.suppress else none, want[0..b], @min(accepted_cap, b), n0 + 1 + @as(usize, @intCast(@max(sync_plant, 0))));
+    const acc = ag.acc;
+    const next = ag.next;
+    const n_gpu = ag.n;
     try commitRows(&sc, m, st, v.mh, n0);
     const t_launch = monoUs();
     const g = try draftGraph(&sc, m, st, 0, false, .{ .t1 = next, .n = n_gpu, .window = m.cfg.sliding_window });
@@ -8693,6 +8738,7 @@ fn syncRound(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, pending: *Dspar
     ahead.t1 = next_token;
     ahead.n = n0 + accepted + 1;
     const r = try dsparkFinishWith(m, gpa, st, pending, accepted, next_token, true);
+    m.ds_shift_ns += @intCast(ahead.launch_ns);
     m.ds_next = ahead;
     _ = sync_rounds.fetchAdd(1, .monotonic);
     if (!sync_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_SPEC_SYNC engaged: the accept on the GPU, the next draft queued behind the verify\n", .{});
