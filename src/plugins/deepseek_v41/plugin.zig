@@ -23,6 +23,7 @@ const outside = @import("../../sdk/quant/outside.zig");
 const outside_model = @import("../../sdk/quant/outside_model.zig");
 const env = @import("../../env.zig");
 const engram_decode = @import("decode/engram_decode.zig");
+const engram_kvc = @import("decode/engram_kvc.zig");
 const mx_view = @import("mx_view.zig");
 const flash_attn = @import("prompt/flash_attn.zig");
 const scratch_attn = @import("prompt/scratch_attn.zig");
@@ -809,12 +810,13 @@ fn auxImportArrays(mp: *anyopaque, ids: abi.Span(u32), header: abi.Str, arrays: 
 
 /// The load reads its Engram tables from disk per lookup and drops the tensors it never loads
 /// (`dsv41.residentDiskBytes`); the `mtp` setting decides the DSpark stages; plus a bf16 prompt trunk
-/// (`bill.pfTrunkBytes`).
+/// (`bill.pfTrunkBytes`), and the Engram partials' cache at its bound (`engram_kvc.billBytes`).
 fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, settings_json: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
     const mtp = mtpSetting(settings_json.slice());
     out.* = dsv41.residentDiskBytes(gpa, model_dir.slice(), config.of(p), mtp, shards) catch |e| return Verdict.named(.failed, @errorName(e));
     if (mx_view.on()) out.* -|= mx_view.savedBytes(gpa, model_dir.slice(), dsv41.dsparkWanted(config.of(p), null, mtp)) catch |e| return Verdict.named(.failed, @errorName(e));
     out.* += bill_mod.pfTrunkBytes(config.of(p));
+    out.* += engram_kvc.billBytes(config.of(p).dsv41_n_engram_layers);
     return .ok;
 }
 
@@ -825,9 +827,9 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 // ── tests ──
 
-/// The Engram LRU every load of a pack with Engram layers bills.
+/// The Engram LRU every load of a pack with Engram layers bills, and its partials' cache where that is on.
 fn lru() u64 {
-    return @import("decode/engram_decode.zig").billBytes(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB));
+    return @import("decode/engram_decode.zig").billBytes(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB)) + engram_kvc.billBytes(1);
 }
 
 /// `residentBytes` over the Engram fixture (`engram.writeAffineFixture`) in `dir`, from `shards` bytes.
@@ -869,6 +871,21 @@ test "deepseek_v41 resident bill: Engram tables it preads bill their LRU, not th
     try std.testing.expectEqual(10_000 - 288 + lru(), try engramResident(dir, "", 10_000));
     env_mod.unset(.MLX_SERVE_DSV41_ENGRAM_RESIDENT);
     try std.testing.expectEqual(10_000 + lru(), try engramResident(dir, "", 10_000));
+}
+
+test "deepseek_v41 resident bill: MLX_SERVE_DSV41_ENGRAM_KV_CACHE bills the partials' cache at its bound" {
+    const env_mod = @import("../../env.zig");
+    var ov = env_mod.override(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE, "0");
+    defer ov.restore();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try @import("engram.zig").writeAffineFixture(io, td.dir, "");
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try td.dir.realPath(io, &buf)];
+    const off = try engramResident(dir, "", 10_000);
+    env_mod.set(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE, "1");
+    try std.testing.expectEqual(off + engram_kvc.cap_bytes, try engramResident(dir, "", 10_000));
 }
 
 test "deepseek_v41 resident bill: neither the vision tower nor DSpark stages that will not load" {
