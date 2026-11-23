@@ -40,6 +40,8 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **A one-row forward runs under a 200 MB command-buffer split** (`command_buffer_mb`, set per forward through
   `HostGpu.command_buffer_limits`): MLX counts a bound buffer's whole size, so at its 50 every expert launch (a whole
   bank) committed and the encode stalled on MLX's in-flight cap. A prompt or a verify keeps the host's split.
+  The split is process-wide: a second model in the server runs at 200 MB from inkling2's last step to its next wide
+  forward or unload (the step's encode runs after the forward returns, so the forward cannot restore it).
 - **Dense projections stay in the checkpoint's `[out, in]` layout** (`layers.projectRows`): MLX's one-row matmul over
   a pre-transposed `[in, out]` weight costs several times the latency of `x @ W.T`. The message gates' down
   projections are held `[4, rank, 2 D]` for the same reason.

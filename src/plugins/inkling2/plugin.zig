@@ -844,11 +844,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     return m;
 }
 
-/// MLX's command-buffer MB split for a one-row forward (a decode step, a slot of a batched one). An expert launch binds
-/// its whole bank, and MLX commits once the distinct buffers a command buffer binds pass the split: at the device's 50
-/// nearly every bank launch commits, and a step's encode waits on MLX's cap of in-flight buffers. A wider forward (a
-/// prompt, a verify) keeps the host's split: drafted decode keeps more tokens so, and a prompt chunk slows under a
-/// wider one. The op split stays the device's.
+/// MLX's command-buffer MB split for a one-row forward: an expert launch binds its whole bank, so at the device's split
+/// every bank launch commits and the step's encode stalls on MLX's cap of in-flight buffers.
 pub const command_buffer_mb: i32 = 200;
 
 /// The host's MB split as the load found it, which the plugin moves per forward (`follow`) and puts back at unload;
