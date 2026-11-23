@@ -932,3 +932,68 @@ test "dsv41 wide tol: MLX_SERVE_DSV41_PF_COMP_BF16 and MLX_SERVE_DSV41_PF_ROUTER
     }
     try testing.expect(ok);
 }
+
+/// `got` against float64 `ref` (both `n`): the error's norm over `ref`'s, its largest magnitude over `ref`'s largest.
+const F64Err = struct { l2: f64, max: f64 };
+fn f64Err(got: []const f32, ref: []const f64) F64Err {
+    var dd: f64 = 0;
+    var rr: f64 = 0;
+    var dm: f64 = 0;
+    var rm: f64 = 0;
+    for (got, ref) |g, r| {
+        const d = @as(f64, g) - r;
+        dd += d * d;
+        rr += r * r;
+        dm = @max(dm, @abs(d));
+        rm = @max(rm, @abs(r));
+    }
+    return .{ .l2 = @sqrt(dd / rr), .max = dm / rm };
+}
+
+test "dsv41 wide tol: PF_COMP_BF16's compressor projection over a 4,096-row layer is no farther from float64 than today's span-by-span TF32 chain (one 256-row span, the release's fused kv and gate rows)" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 8, .hi = 10, .ctx = 0, .experts_fp4 = true });
+    defer fx.deinit();
+    // The pair's KV source above ratio 1.
+    const li: usize = if (fx.layer(8).comp != null and fx.layer(8).ratio > 1) 8 else 9;
+    const cw = &fx.layer(li).comp.?;
+    try testing.expect(fx.layer(li).ratio > 1 and cw.wgate == null);
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const rows = 4096;
+    const span = 256;
+    const k0 = 5 * span;
+    const x = try normal(&sc, &.{ rows, @intCast(hidden) }, .bfloat16, 1, 0x6b);
+    try dsv41.evalAll(&.{x});
+    // Today's: the span's own call (`compProj`, MLX's f32 matmul at M = 256: its split K). The switch's: one launch over
+    // the layer's rows, the span's rows of it.
+    const old = try dsv41.hostF32(try dsv41.compProj(&sc, fx.m, li, cw, try sc.slice(x, 0, k0, k0 + span)));
+    defer gpa.free(old);
+    const all = (try ggemm.bf16F32(sc.s, x, cw.wkv.w, true)) orelse return error.Declined;
+    _ = try sc.keep(all);
+    const new = try dsv41.hostF32(try sc.slice(all, 0, k0, k0 + span));
+    defer gpa.free(new);
+    // float64: the bf16 operands widened exactly, each output summed in float64.
+    const xs = try dsv41.hostF32(try sc.slice(x, 0, k0, k0 + span));
+    defer gpa.free(xs);
+    const ws = try dsv41.hostF32(cw.wkv.w);
+    defer gpa.free(ws);
+    const N = ws.len / hidden;
+    const ref = try gpa.alloc(f64, span * N);
+    defer gpa.free(ref);
+    for (0..span) |r| for (0..N) |c| {
+        var acc: f64 = 0;
+        const xr = xs[r * hidden ..][0..hidden];
+        const wr = ws[c * hidden ..][0..hidden];
+        for (xr, wr) |a, b| acc += @as(f64, a) * @as(f64, b);
+        ref[r * N + c] = acc;
+    };
+    var differ: usize = 0;
+    for (old, new) |a, b| differ += @intFromBool(a != b);
+    const eo = f64Err(old, ref);
+    const en = f64Err(new, ref);
+    std.debug.print("compressor projection, {d} rows x {d}: {d} of {d} words differ between today's and PF_COMP_BF16; from float64: today l2 {e:.3} max {e:.3}, PF_COMP_BF16 l2 {e:.3} max {e:.3}\n", .{ span, N, differ, old.len, eo.l2, eo.max, en.l2, en.max });
+    try testing.expect(en.l2 <= eo.l2 * 1.05 and en.max <= eo.max * 1.5);
+}
