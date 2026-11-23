@@ -16,6 +16,7 @@ const inax = @import("prompt/idx_nax.zig");
 const mtail = @import("prompt/moe_tail.zig");
 const gtwin = @import("decode/gemv_twin.zig");
 const ggemm = @import("prompt/gate_gemm.zig");
+const pfroute = @import("prompt/pf_route.zig");
 const markov = @import("spec/markov.zig");
 const mplan = @import("spec/markov_plan.zig");
 const fa = @import("prompt/flash_attn.zig");
@@ -155,6 +156,12 @@ pub fn depthOne(_: Shape) usize {
 }
 fn rowsN(s: Shape) usize {
     return s.rows * s.n;
+}
+fn pairs3(s: Shape) usize {
+    return 3 * s.rows * s.k;
+}
+fn pairs1(s: Shape) usize {
+    return s.rows * s.k;
 }
 fn rowsMix(s: Shape) usize {
     return s.rows * MIX;
@@ -367,6 +374,210 @@ const Route = struct {
                 if (std.math.isFinite(w) and !(@abs(g - w) <= 32 * u * @abs(w) + 0x1p-140))
                     return std.fmt.bufPrint(&k.msg, "row {d} weight {d} is {e} where float64 gives {e}", .{ l, r, g, w }) catch "weight";
             }
+        }
+        return null;
+    }
+};
+
+/// `MLX_SERVE_DSV41_PF_ROUTE_PACK`'s top-6 (`pf_route_rows.metal`): route.metal's rule and outputs on a simdgroup a row.
+const RouteRows = struct {
+    pub const Params = Route.Params;
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        const E = s.k;
+        if (s.rows == 0 or E % 128 != 0 or E > 1024 or p.k == 0 or p.k > 16) return null;
+        const sg = pfroute.rows_sg;
+        var g = metal.Geometry{ .grid = .{ ci((s.rows + sg - 1) / sg * 32 * sg), 1, 1 }, .tg = .{ ci(32 * sg), 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(p.k) }, .uint32);
+        g.out(&.{ ci(s.rows), ci(p.k) }, .float32);
+        g.int("E", E);
+        g.int("K", p.k);
+        g.flag("NORM", p.norm);
+        g.int("SG", sg);
+        g.int("PLANT", 0);
+        g.int("DS", 0);
+        return g;
+    }
+
+    /// Route's inputs and the down scale it reads only with DS (bound, unread here).
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        try Route.fill(k, f, rng);
+        @memset(try k.add(.float32, &.{k.shape.k}), 1);
+    }
+
+    pub const count = Route.count;
+    pub const compute = Route.compute;
+    pub const check = Route.check;
+};
+
+/// `MLX_SERVE_DSV41_PF_ROUTE_PACK`'s scan (`pf_route_scan.metal`): `rows` 256-pair blocks' histograms over `n` experts
+/// in, each (block, expert)'s first sorted place out (expert-major, blocks in order).
+const RouteScan = struct {
+    pub const Params = struct {};
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n % 128 != 0 or s.n > 1024) return null;
+        var g = metal.Geometry{ .grid = .{ pfroute.scan_threads, 1, 1 }, .tg = .{ pfroute.scan_threads, 1, 1 } };
+        g.out(&.{ci(s.rows * s.n)}, .uint32);
+        g.int("E", s.n);
+        g.int("PLANT", 0);
+        return g;
+    }
+
+    /// Each block's 256 pairs (the last block part full) routed as prompts route: half on four hot experts.
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const nb = k.shape.rows;
+        const E = k.shape.n;
+        const c = try k.add(.uint32, &.{nb * E});
+        @memset(c, 0);
+        for (0..nb) |b| {
+            const pairs: usize = if (b + 1 == nb) 1 + rng.uintLessThan(usize, pfroute.block) else pfroute.block;
+            for (0..pairs) |_| {
+                // The extremes at the nonfinite gate (no float exists): every pair on the first or the last expert.
+                const e: usize = if (f == .nonfinite) (if (rng.boolean()) 0 else E - 1) else if (rng.boolean()) rng.uintLessThan(usize, 4) else rng.uintLessThan(usize, E);
+                c[b * E + e] += 1;
+            }
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n;
+    }
+
+    fn expected(k: anytype, want: []u32) void {
+        const nb = k.shape.rows;
+        const E = k.shape.n;
+        var at: u32 = 0;
+        for (0..E) |e| for (0..nb) |b| {
+            want[b * E + e] = at;
+            at += @intFromFloat(k.in(0)[b * E + e]);
+        };
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, _: Sum) !void {
+        const want = try k.scratch().alloc(u32, out.len);
+        defer k.scratch().free(want);
+        expected(k, want);
+        for (out, want) |*o, w| o.* = @floatFromInt(w);
+        @memset(mag, 0);
+    }
+
+    /// Exact: every offset is the counting sort's.
+    pub fn check(k: anytype, _: spec.Gate) !?[]const u8 {
+        const want = try k.scratch().alloc(u32, count(k.p, k.shape));
+        defer k.scratch().free(want);
+        expected(k, want);
+        const got = k.rig.outputBytes();
+        for (want, 0..) |w, i| {
+            const v = std.mem.readInt(u32, got[4 * i ..][0..4], .little);
+            if (v != w) return std.fmt.bufPrint(&k.msg, "offset {d} is {d} where the counting sort gives {d}", .{ i, v, w }) catch "offset";
+        }
+        return null;
+    }
+};
+
+/// `MLX_SERVE_DSV41_PF_ROUTE_PACK`'s scatter (`pf_route_scatter.metal`): the SDK's stable placement of `rows` x `k`
+/// routed pairs over `n` experts from the scan's offsets, each pair's weight moved to its place.
+const RouteScatter = struct {
+    pub const Params = struct {};
+
+    fn blocks(s: Shape) usize {
+        return (s.rows * s.k + pfroute.block - 1) / pfroute.block;
+    }
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        const n = s.rows * s.k;
+        if (n == 0 or s.n == 0 or s.n > 1024) return null;
+        var g = metal.Geometry{ .grid = .{ ci(blocks(s) * pfroute.block), 1, 1 }, .tg = .{ ci(pfroute.block), 1, 1 } };
+        for (0..3) |_| g.out(&.{ci(n)}, .uint32);
+        g.out(&.{ci(n)}, .float32);
+        g.int("E", s.n);
+        g.int("TOPK", s.k);
+        return g;
+    }
+
+    /// Distinct experts a row, half the pairs on four hot experts; the offsets the counting sort gives them.
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const s = k.shape;
+        const n = s.rows * s.k;
+        const E = s.n;
+        const ids = try k.add(.uint32, &.{n});
+        for (0..s.rows) |r| {
+            var j: usize = 0;
+            while (j < s.k) {
+                const e: f64 = @floatFromInt(if (rng.boolean()) rng.uintLessThan(usize, @min(4, E)) else rng.uintLessThan(usize, E));
+                if (std.mem.indexOfScalar(f64, ids[r * s.k ..][0..j], e) != null) continue;
+                ids[r * s.k + j] = e;
+                j += 1;
+            }
+        }
+        const nb = blocks(s);
+        const off = try k.add(.uint32, &.{nb * E});
+        @memset(off, 0);
+        for (ids, 0..) |v, i| off[(i / pfroute.block) * E + @as(usize, @intFromFloat(v))] += 1;
+        var at: f64 = 0;
+        for (0..E) |e| for (0..nb) |b| {
+            const c = off[b * E + e];
+            off[b * E + e] = at;
+            at += c;
+        };
+        const w = try k.add(.float32, &.{n});
+        kit.uniform(rng, w, 0.01, 2);
+        // Non-finite weights move as they are.
+        if (f == .nonfinite) {
+            w[0] = nan;
+            w[n / 2] = inf;
+            w[n - 1] = -inf;
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return 4 * s.rows * s.k;
+    }
+
+    /// Pair i's place: the pairs before it in (expert, pair) order.
+    fn places(k: anytype, inv: []u32) void {
+        const ids = k.in(0);
+        for (ids, 0..) |v, i| {
+            var p: u32 = 0;
+            for (ids, 0..) |o, j| if (o < v or (o == v and j < i)) {
+                p += 1;
+            };
+            inv[i] = p;
+        }
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, _: Sum) !void {
+        const n = k.shape.rows * k.shape.k;
+        const inv = try k.scratch().alloc(u32, n);
+        defer k.scratch().free(inv);
+        places(k, inv);
+        for (inv, 0..) |p, i| {
+            out[i] = @floatFromInt(p);
+            out[n + p] = k.in(0)[i];
+            out[2 * n + p] = @floatFromInt(i / k.shape.k);
+            out[3 * n + p] = k.in(2)[i];
+        }
+        @memset(mag, 0);
+    }
+
+    /// Exact: every place, expert and row the stable sort's, every weight moved bit for bit.
+    pub fn check(k: anytype, _: spec.Gate) !?[]const u8 {
+        const n = k.shape.rows * k.shape.k;
+        const inv = try k.scratch().alloc(u32, n);
+        defer k.scratch().free(inv);
+        places(k, inv);
+        const got = k.rig.outputBytes();
+        const word = struct {
+            fn at(b: []const u8, i: usize) u32 {
+                return std.mem.readInt(u32, b[4 * i ..][0..4], .little);
+            }
+        }.at;
+        for (inv, 0..) |p, i| {
+            const want = [4]u32{ p, @intFromFloat(k.in(0)[i]), @intCast(i / k.shape.k), @bitCast(@as(f32, @floatCast(k.in(2)[i]))) };
+            const at = [4]usize{ i, n + p, 2 * n + p, 3 * n + p };
+            for (want, at, 0..) |w, o, part| if (word(got, o) != w)
+                return std.fmt.bufPrint(&k.msg, "pair {d}'s output {d} (part {d}) is {d} where the stable sort gives {d}", .{ i, o, part, word(got, o), w }) catch "scatter";
         }
         return null;
     }
@@ -4604,6 +4815,9 @@ const hc_stage_x_ins: []const [*:0]const u8 = &.{ "x", "y", "spost", "scomb", "c
 const gate_l = launch("dsv41_gate", &.{ "x", "w" }, &.{"logits"}, v41.GATE_SOURCE, "", 0, 1024, false);
 const dense_l = launch("dsv41_dense_f32x", &.{ "x", "w" }, &.{"out"}, v41.DENSE_F32X_SOURCE, "", 0, 928, false);
 const route_l = launch("dsv41_route", &.{ "logits", "bias", "scal" }, &.{ "idx", "wts" }, v41.ROUTE_SOURCE, "", 4 * (1024 + 32 + 32 + TOPK), 1024, false);
+const route_rows_l = launch("dsv41_pf_route_rows", &pfroute.ROWS_INS, &pfroute.ROWS_OUTS, pfroute.ROWS_SOURCE, "", 0, 32 * pfroute.rows_sg, false);
+const route_scatter_l = launch("dsv41_pf_route_scatter", &pfroute.SCATTER_INS, &pfroute.SCATTER_OUTS, pfroute.SCATTER_SOURCE, "", 4 * 256, 256, false);
+const route_scan_l = launch("dsv41_pf_route_scan", &pfroute.SCAN_INS, &pfroute.SCAN_OUTS, pfroute.SCAN_SOURCE, "", 16 * 1024 + 4 * (1024 + 32), pfroute.scan_threads, false);
 const topk_l = launch("dsv41_topk", &.{"x"}, &.{"out"}, v41.TOPK_SOURCE, v41.TOPK_HEADER, 4 * (256 + 2 + TopK.TG / 32), 1024, false);
 const split_l = launch("dsv41_hc_split", &.{ "z", "eps" }, &.{ "pre", "post", "comb" }, v41.HC_SPLIT_SOURCE, "", 0, 1024, false);
 const mix_l = launch("dsv41_hc_mix", &.{ "x", "fn", "scale", "base", "eps" }, &.{"z"}, v41.HC_MIX_SOURCE, "", 4 * (4 * 6 + 4) * 32, 1024, true);
@@ -4715,6 +4929,32 @@ pub fn register(set: *kc.Set) !void {
         .outs = &.{ .{ .elem = .u32, .count = rowsN }, .{ .elem = .f32, .count = rowsN } },
         .nan = .{ .stated = "a NaN score is never picked; weights classed as float64 gives them" },
         .served = &.{ .{ .rows = 1, .n = TOPK, .k = EXPERTS }, .{ .rows = REGION, .n = TOPK, .k = EXPERTS } },
+    });
+    try kit.add(set, RouteRows, &route_rows_l, .{}, .{
+        .name = "dsv41 pf route rows (PF_ROUTE_PACK: sqrt-softplus top-6 on a simdgroup a row)",
+        .accum = .none,
+        .depth = depthOne,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .u32, .count = rowsN }, .{ .elem = .f32, .count = rowsN } },
+        .nan = .{ .stated = "a NaN score is never picked; weights classed as float64 gives them" },
+        .served = &.{ .{ .rows = 128, .n = TOPK, .k = EXPERTS }, .{ .rows = 2048, .n = TOPK, .k = EXPERTS }, .{ .rows = 33, .n = TOPK, .k = EXPERTS } },
+    });
+    try kit.add(set, RouteScan, &route_scan_l, .{}, .{
+        .name = "dsv41 pf route scan (PF_ROUTE_PACK: the route pack's offsets on one 1024-thread threadgroup)",
+        .accum = .none,
+        .depth = depthOne,
+        .out = .u32,
+        .nan = .{ .stated = "integer counts in, integer offsets out: no non-finite value exists; the extremes (every pair on the first or the last expert) keep every offset exact" },
+        .served = &.{ .{ .rows = 414, .n = EXPERTS, .k = 1 }, .{ .rows = 3, .n = EXPERTS, .k = 1 }, .{ .rows = 1, .n = EXPERTS, .k = 1 } },
+    });
+    try kit.add(set, RouteScatter, &route_scatter_l, .{}, .{
+        .name = "dsv41 pf route scatter (PF_ROUTE_PACK: the stable placement with the weights put)",
+        .accum = .none,
+        .depth = depthOne,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .u32, .count = pairs3 }, .{ .elem = .f32, .count = pairs1 } },
+        .nan = .{ .stated = "a weight moves bit for bit, NaN and infinities included; ids and places are integers" },
+        .served = &.{ .{ .rows = 128, .n = EXPERTS, .k = TOPK }, .{ .rows = 700, .n = EXPERTS, .k = TOPK }, .{ .rows = 33, .n = EXPERTS, .k = TOPK } },
     });
     try kit.add(set, TopK, &topk_l, .{}, .{
         .name = "dsv41 topk (radix select)",

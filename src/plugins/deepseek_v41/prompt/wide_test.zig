@@ -332,6 +332,133 @@ test "dsv41 wide: the counting-sort route pack gives the argsorts' pair order, r
     }
 }
 
+test "dsv41 wide: MLX_SERVE_DSV41_PF_ROUTE_PACK's route pack (its scan on one threadgroup) is today's pack word for word (pair order, rows, experts, weights) at 384 experts, top-6, replay to pass widths; a planted first offset differs" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const experts = 384;
+    for ([_]usize{ 33, 128, 500, 3072, 5001, 8192, 17_638 }, 0..) |L, ci| {
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const c = try call(&sc, L, experts, 0x5117 + ci, false);
+        const n: c_int = @intCast(L * top_k);
+        const flat = try sc.reshape(c.idx, &.{n});
+        const wf = try sc.reshape(c.wts, &.{n});
+        const want = (try pfroute.pack(&sc, flat, wf, top_k, experts)) orelse return error.PackDeclined;
+        const s0 = pfroute.served.load(.monotonic);
+        const got = (try pfroute.packFast(&sc, flat, wf, top_k, experts, false)) orelse return error.PackDeclined;
+        try testing.expect(pfroute.served.load(.monotonic) == s0 + 1);
+        const ok = [_]bool{ try sameWords(want.inv, got.inv), try sameWords(want.rows, got.rows), try sameWords(want.sidx, got.sidx), try sameWords(want.w, got.w) };
+        const bad = (try pfroute.packFast(&sc, flat, wf, top_k, experts, true)).?;
+        const caught = !try sameWords(want.inv, bad.inv);
+        std.debug.print("route pack fast rows {d}: inv {} rows {} experts {} weights {}; planted offset caught {}\n", .{ L, ok[0], ok[1], ok[2], ok[3], caught });
+        try testing.expect(ok[0] and ok[1] and ok[2] and ok[3] and caught);
+    }
+}
+
+test "dsv41 wide: MLX_SERVE_DSV41_PF_ROUTE_PACK keeps a pair worker's prefill streams and mixes word for word (128 experts, the top-6 and the pack's scan both served), MXFP4 and NVFP4 experts with per-expert scales" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    env.set(.MLX_SERVE_DSV41_PF_ROUTE_PACK, "0");
+    defer env.set(.MLX_SERVE_DSV41_PF_ROUTE_PACK, "0");
+    for ([_]bool{ false, true }) |nv| {
+        const rows = 4608;
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 22, .ctx = 0, .experts = 128, .experts_fp4 = !nv, .experts_nvfp4 = nv, .expert_scales = if (nv) .all else .none });
+        defer fx.deinit();
+        const x = try fx.stream(rows);
+        defer _ = mlx.mlx_array_free(x);
+        const pre = try fx.cpre(rows);
+        defer _ = mlx.mlx_array_free(pre);
+        var want_tap: dsv41.RouteTap = .{ .gpa = gpa };
+        defer freeTap(&want_tap);
+        const s0 = pfroute.served.load(.monotonic);
+        const want = try prefillTapped(fx, x, pre, &want_tap);
+        defer for (want) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        try testing.expectEqual(s0, pfroute.served.load(.monotonic));
+        env.set(.MLX_SERVE_DSV41_PF_ROUTE_PACK, "1");
+        var tap: dsv41.RouteTap = .{ .gpa = gpa };
+        defer freeTap(&tap);
+        const got = try prefillTapped(fx, x, pre, &tap);
+        defer for (got) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        env.set(.MLX_SERVE_DSV41_PF_ROUTE_PACK, "0");
+        // Two layers, each its top-6 and its pack.
+        const n = pfroute.served.load(.monotonic) - s0;
+        const same = [_]bool{ try sameWords(want[0], got[0]), try sameWords(want[1], got[1]) };
+        std.debug.print("wide layers 20-21 {s} at {d} rows, PF_ROUTE_PACK: served {d} calls, streams {} mixes {}\n", .{ if (nv) "NVFP4" else "MXFP4", rows, n, same[0], same[1] });
+        try testing.expect(n >= 4 and same[0] and same[1]);
+    }
+}
+
+/// route.metal as `routeFrom` launches it: today's prompt top-6.
+fn routeToday(sc: *dsv41.Scope, logits: A, bias: A, scal: A, k: usize, norm: bool) ![2]A {
+    const kern = try dsv41.buildKernel("dsv41_route", &.{ "logits", "bias", "scal" }, &.{ "idx", "wts" }, dsv41.ROUTE_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    const L: c_int = mlx.getShape(logits)[0];
+    const E: usize = @intCast(mlx.getShape(logits)[1]);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ L, @intCast(k) }, 2, .uint32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ L, @intCast(k) }, 2, .float32));
+    const tg: c_int = @intCast((E + 31) / 32 * 32);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, tg, L, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, tg, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", @intCast(k)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "NORM", norm));
+    const iv = mlx.mlx_vector_array_new_data(&[_]A{ logits, bias, scal }, 3);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, sc.s));
+    var out: [2]A = undefined;
+    for (&out, 0..) |*o, i| {
+        var a = mlx.mlx_array_new();
+        o.* = try sc.res(mlx.mlx_vector_array_get(&a, ov, i), &a);
+    }
+    return out;
+}
+
+test "dsv41 wide: MLX_SERVE_DSV41_PF_ROUTE_PACK's top-6 on a simdgroup a row is route.metal's picks and weights word for word at 384 experts, prompt rows 33 to 17,638, logits on a coarse grid (ties broken to the lower expert), one bias row and a bias a row (image spans), norm on and off, with and without NVFP4's per-expert down scale (routeScaled's take and multiply); the planted pick order differs" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const a = testing.allocator;
+    const E = 384;
+    for ([_]usize{ 33, 128, 2048, 17_638 }, 0..) |L, li| for ([_]bool{ false, true }) |per_row| for ([_]bool{ true, false }) |norm| for ([_]bool{ false, true }) |ds| {
+        var sc = dsv41.Scope.init(a, mlx.gpuStream());
+        defer sc.deinit();
+        var rng = std.Random.DefaultPrng.init(0x6017 + li);
+        const z = try a.alloc(f32, L * E);
+        defer a.free(z);
+        // Router logits spread as served (a few units), on a 1/8 grid so equal scores occur within a row.
+        for (z) |*v| v.* = @round(rng.random().floatNorm(f32) * 2.5 * 8) / 8;
+        const br: usize = if (per_row) L else 1;
+        const b = try a.alloc(f32, br * E);
+        defer a.free(b);
+        for (b) |*v| v.* = @round(rng.random().floatNorm(f32) * 0.3 * 16) / 16;
+        const logits = try sc.keep(mlx.mlx_array_new_data(z.ptr, &[_]c_int{ @intCast(L), E }, 2, .float32));
+        const bias = try sc.keep(mlx.mlx_array_new_data(b.ptr, &[_]c_int{ @intCast(br), E }, 2, .float32));
+        const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{1.5}, &[_]c_int{1}, 1, .float32));
+        var dsc: ?A = null;
+        if (ds) {
+            const d = try a.alloc(f32, E);
+            defer a.free(d);
+            for (d) |*v| v.* = 0.25 + rng.random().float(f32);
+            dsc = try sc.astype(try sc.keep(mlx.mlx_array_new_data(d.ptr, &[_]c_int{E}, 1, .float32)), .bfloat16);
+        }
+        var want = try routeToday(&sc, logits, bias, scal, top_k, norm);
+        if (dsc) |d| want[1] = try sc.mul(want[1], try sc.take(d, want[0], 0));
+        const got = (try pfroute.routeRows(&sc, logits, bias, scal, dsc, top_k, norm, false)) orelse return error.RouteDeclined;
+        const bad = (try pfroute.routeRows(&sc, logits, bias, scal, dsc, top_k, norm, true)).?;
+        const ok = [_]bool{ try sameWords(want[0], got[0]), try sameWords(want[1], got[1]) };
+        const caught = !try sameWords(want[0], bad[0]);
+        std.debug.print("route rows {d} (bias {s}, norm {}, down scale {}): picks {} weights {}; planted order caught {}\n", .{ L, if (per_row) "a row each" else "one row", norm, ds, ok[0], ok[1], caught });
+        try testing.expect(ok[0] and ok[1] and caught);
+    };
+}
+
 test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_MOE_EPI is the argsort path's output word for word, MXFP4 and NVFP4 with per-expert scales, paired and split gate/up, prompt rows to 8192" {
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
