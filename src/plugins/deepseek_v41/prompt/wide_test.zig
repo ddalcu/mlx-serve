@@ -359,8 +359,9 @@ test "dsv41 wide: MLX_SERVE_DSV41_PF_ROUTE_PACK keeps a pair worker's prefill st
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;
-    env.set(.MLX_SERVE_DSV41_PF_ROUTE_PACK, "0");
-    defer env.set(.MLX_SERVE_DSV41_PF_ROUTE_PACK, "0");
+    // The switch is on by default: the served arm needs the explicit 0, and the test leaves it as it found it.
+    const keep = env.override(.MLX_SERVE_DSV41_PF_ROUTE_PACK, "0");
+    defer keep.restore();
     for ([_]bool{ false, true }) |nv| {
         const rows = 4608;
         const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 22, .ctx = 0, .experts = 128, .experts_fp4 = !nv, .experts_nvfp4 = nv, .expert_scales = if (nv) .all else .none });
@@ -466,6 +467,9 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_MOE_EPI is the argsort pat
     // On by default: the argsort arm needs the explicit 0.
     const unset = env.override(.MLX_SERVE_DSV41_PF_MOE_EPI, "0");
     defer unset.restore();
+    // EPI's own pack (`pfroute.pack`), not PF_ROUTE_PACK's (on by default), is the path under test.
+    const own_pack = env.override(.MLX_SERVE_DSV41_PF_ROUTE_PACK, "0");
+    defer own_pack.restore();
     inline for (.{ false, true }) |nv| inline for (.{ false, true }) |paired| {
         const pk = if (nv) env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, if (paired) "1" else "0") else env.override(.MLX_SERVE_DSV41_MOE_PAIR, if (paired) "1" else null);
         defer pk.restore();

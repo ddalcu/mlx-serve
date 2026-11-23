@@ -3,7 +3,7 @@
 //! place, the sorted experts and their rows in three launches, and one scatter puts the routing weights in that order.
 //! `moePrefill` otherwise makes them with two argsorts (a merge sort of about a dozen narrow launches each), a divide
 //! and two takes. Ties keep pair order, as MLX's argsort does, so the outputs are the same words.
-//! `MLX_SERVE_DSV41_PF_ROUTE_PACK` (off): the router's top-6 on a simdgroup a row (`routeRows`) and the pack's scan on a
+//! `MLX_SERVE_DSV41_PF_ROUTE_PACK` (on by default): the router's top-6 on a simdgroup a row (`routeRows`) and the pack's scan on a
 //! whole threadgroup (`packFast`), the same words.
 
 const std = @import("std");
@@ -51,7 +51,7 @@ fn placed(sc: *dsv41.Scope, flat: A, wts: A, inv: A, rows: A, sidx: A, experts: 
 }
 
 pub fn on() bool {
-    return env.on(.MLX_SERVE_DSV41_PF_ROUTE_PACK);
+    return env.onUnlessZero(.MLX_SERVE_DSV41_PF_ROUTE_PACK);
 }
 
 var pack_logged: std.atomic.Value(bool) = .init(false);
