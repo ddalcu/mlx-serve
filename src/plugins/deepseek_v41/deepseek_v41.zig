@@ -1634,7 +1634,6 @@ pub const MOE_DN_GGUF_SOURCE = kernelSource("plugins/deepseek_v41/kernels/moe_dn
 /// gate+up gather `y` (`[n, 2N]`, gate then up) times its routing weight, the
 /// f32 math of `clampedSwiglu` in its order, rounded once to T.
 pub const MOE_ACT_SOURCE = kernelSource("plugins/deepseek_v41/kernels/moe_act.metal");
-pub const MOE_WT_SOURCE = kernelSource("plugins/deepseek_v41/kernels/moe_wt.metal");
 
 /// A prefill MoE call's combine, one element a thread: the row's K sorted down
 /// rows (`inv` names them) summed in f32 plus the shared expert, rounded once to
@@ -10729,33 +10728,6 @@ test "dsv41 clampedSwiglu: the SDK clamped SwiGLU in f32 gives the bytes the plu
         const gb = @as([*]const u8, @ptrCast(mlx.mlx_array_data_bfloat16(got).?))[0 .. 2 * 64 * 96];
         try std.testing.expectEqual(want, std.hash.Wyhash.hash(0, gb));
     }
-}
-
-test "dsv41 moe_wt: the weighted activation is the promoted multiply then cast, bit for bit" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    var sc = Scope.init(std.testing.allocator, mlx.gpuStream());
-    defer sc.deinit();
-    const kern = try buildKernel("dsv41_moe_wt", &.{ "a", "wts" }, &.{"out"}, MOE_WT_SOURCE, "");
-    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
-    var key = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(key);
-    try mlx.check(mlx.mlx_random_key(&key, 0x3017));
-    var r = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(r);
-    const n = 77;
-    const inter = 2304;
-    try mlx.check(mlx.mlx_random_normal(&r, &[_]c_int{ n, 1, inter }, 3, .float32, 0.0, 3.0, key, sc.s));
-    const a = try sc.astype(r, .bfloat16);
-    var wr = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(wr);
-    try mlx.check(mlx.mlx_random_uniform(&wr, try sc.f(0.01), try sc.f(2.5), &[_]c_int{n}, 1, .float32, key, sc.s));
-    const got = try flatKernel(&sc, kern, &.{ a, wr }, &.{ n, 1, inter }, .bfloat16, n * inter, &.{.{ .name = "N", .v = inter }});
-    const want = try sc.astype(try sc.mul(a, try sc.reshape(wr, &.{ n, 1, 1 })), .bfloat16);
-    try mlx.check(mlx.mlx_array_eval(got));
-    try mlx.check(mlx.mlx_array_eval(want));
-    const gb = @as([*]const u8, @ptrCast(mlx.mlx_array_data_bfloat16(got).?))[0 .. 2 * n * inter];
-    const wb = @as([*]const u8, @ptrCast(mlx.mlx_array_data_bfloat16(want).?))[0 .. 2 * n * inter];
-    try std.testing.expectEqualSlices(u8, wb, gb);
 }
 
 fn testConfig(io: std.Io, dir: []const u8) !Config {
