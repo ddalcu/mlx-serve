@@ -8213,7 +8213,7 @@ pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []cons
 pub fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize, x: A, pre: *A, B: usize) !A {
     const ly = &m.layers[li];
     const si = li - m.n_layers;
-    const fused = env.on(.MLX_SERVE_DSV41_DRAFT_FUSED);
+    const fused = env.onUnlessZero(.MLX_SERVE_DSV41_DRAFT_FUSED);
     if (fused and states.len == 1) if (try stageFused(sc, m, states[0], li, x, pre)) |y| {
         logOnce(&draft_fused_logged, "[dsv41] MLX_SERVE_DSV41_DRAFT_FUSED engaged: a DSpark stage on in_proj, wq_b, ffn_in and the fused MoE\n");
         return y;

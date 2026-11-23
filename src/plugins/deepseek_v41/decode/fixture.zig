@@ -870,7 +870,7 @@ fn expectSameArray(gpa: std.mem.Allocator, a: A, b: A) !void {
 
 /// One stage over `x` from the mix `pre`, the stream as host f32 (`MLX_SERVE_DSV41_DRAFT_FUSED` as `fused` sets it).
 fn stageOut(gpa: std.mem.Allocator, m: *dsv41.Dsv41Model, st: *dsv41.State, li: usize, x: A, pre: A, fused: bool) ![]f32 {
-    const o = env.override(.MLX_SERVE_DSV41_DRAFT_FUSED, if (fused) "1" else null);
+    const o = env.override(.MLX_SERVE_DSV41_DRAFT_FUSED, if (fused) "1" else "0");
     defer o.restore();
     var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
