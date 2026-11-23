@@ -119,9 +119,19 @@ fn ci(v: usize) c_int {
 /// reads outweigh the weights.
 const a_nsg: usize = 8;
 const a_unroll: usize = 2;
+/// `MLX_SERVE_DSV41_FFN_IN_R5_COLS1=1` (read each call) keeps 5 rows at one column: a column's sums are the same
+/// either way (each column's lanes, steps and simd sum do not depend on the plan), so the bytes are too.
 fn aCols(rows: usize) usize {
+    if (cols_test) |t| return t[rows];
+    if (rows == 5 and env.on(.MLX_SERVE_DSV41_FFN_IN_R5_COLS1)) {
+        if (!r5_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info("[dsv41] MLX_SERVE_DSV41_FFN_IN_R5_COLS1 engaged: ffn_in launch 1 at 5 rows on one column a simdgroup\n", .{});
+        return 1;
+    }
     return if (rows > 4) 2 else 1;
 }
+var r5_logged = std.atomic.Value(bool).init(false);
+/// The ubench's and tests' plan per row count (null: `aCols`'s).
+var cols_test: ?[decode.max_rows + 1]usize = null;
 /// Launch 2: columns a mix slice, experts a router threadgroup (two simdgroups an expert), threads a threadgroup.
 const slice_cols: usize = 128;
 const experts_tg: usize = 4;
@@ -1900,6 +1910,111 @@ test "dsv41 dec ffn_in: ubench, R = 1..6: launch 1 on the vector kernel against 
             t.* = (try b.us(nsets)).total;
         }
         std.debug.print("[dec-ubench] ffn_in R={d}: launch 1 vector {d:.1} us, matrix units {d:.1} us ({d:.0}% of the wo_b floor); pair {d:.1} us, fused {d:.1} us\n", .{ rows, us[0], us[1], 100 * 43.2e6 / decode.stream_bytes_per_us / us[1], us[2], us[3] });
+    }
+}
+
+test "dsv41 dec ffn_in: MLX_SERVE_DSV41_FFN_IN_R5_COLS1=1, launch 1 at 5 rows on one column a simdgroup writes the served two-column plan's bytes on layers 21 and 23 and random weights; another wo_b differs" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .ctx = 8 });
+    defer fx.deinit();
+    const ks = try build();
+    defer free(ks);
+    const rw = try randomWeights(80);
+    defer freeWeights(rw);
+    const other = try randomWeights(81);
+    defer freeWeights(other);
+    const rl = layerWith(fx.layer(21), rw);
+    const cases = [_]struct { ly: *const dsv41.Layer, w: Weights }{ .{ .ly = fx.layer(21), .w = weightsOf(fx.layer(21)) }, .{ .ly = fx.layer(23), .w = weightsOf(fx.layer(23)) }, .{ .ly = &rl, .w = rw } };
+    const rows = 5;
+    for (cases, 0..) |cs, ci_| {
+        var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const oa = try fx.normal(&.{ ci(rows), 8192 }, act, 0, 1);
+        defer _ = mlx.mlx_array_free(oa);
+        const x = try fx.stream(rows);
+        defer _ = mlx.mlx_array_free(x);
+        const cpre = try fx.cpre(rows);
+        defer _ = mlx.mlx_array_free(cpre);
+        const sa = (try dsv41.hcStage(&sc, fx.m, x, null, cpre, &cs.ly.hc_attn, cs.ly.attn_norm)).sp;
+        const p: Dims = .{ .rows = rows, .d = fx.m.cfg.hidden_size, .e = @intCast(mlx.getShape(cs.ly.gate_w)[0]), .top_k = cs.ly.top_k, .iters = fx.m.cfg.dsv4_hc_sinkhorn_iters, .norm = fx.m.cfg.moe_route_norm and cs.ly.top_k > 1 };
+        var ov = env.override(.MLX_SERVE_DSV41_GEMV_R26_FFN_IN, "0");
+        defer ov.restore();
+        const served = try launchA(&sc, ks, p, cs.w, oa, x, &sa);
+        const one = blk: {
+            var o1 = env.override(.MLX_SERVE_DSV41_FFN_IN_R5_COLS1, "1");
+            defer o1.restore();
+            try std.testing.expectEqual(@as(usize, 1), aCols(5));
+            break :blk try launchA(&sc, ks, p, cs.w, oa, x, &sa);
+        };
+        try std.testing.expectEqual(@as(usize, 2), aCols(5));
+        const dx = try wordsDiffer(served.x1, one.x1);
+        const dh = try wordsDiffer(served.hv, one.hv);
+        std.debug.print("[ffn_in r5 cols1] case {d}: x1 differs in {d} words, hv in {d}\n", .{ ci_, dx, dh });
+        try std.testing.expectEqual(@as(usize, 0), dx + dh);
+        if (ci_ == 2) {
+            // The planted bug: another wo_b under the one-column plan; the comparison sees it.
+            var bad = cs.w;
+            bad.wo_w = other.wo_w;
+            var o1 = env.override(.MLX_SERVE_DSV41_FFN_IN_R5_COLS1, "1");
+            defer o1.restore();
+            const pb = try launchA(&sc, ks, p, bad, oa, x, &sa);
+            try std.testing.expect(try wordsDiffer(served.x1, pb.x1) > 0);
+        }
+    }
+}
+
+/// The words of `a` and `b` (same shape and dtype) that differ, as bits.
+fn wordsDiffer(a: A, b: A) !usize {
+    const x = try dsv41.hostF32(a);
+    defer std.testing.allocator.free(x);
+    const y = try dsv41.hostF32(b);
+    defer std.testing.allocator.free(y);
+    var n: usize = 0;
+    for (x, y) |xa, ya| n += @intFromBool(@as(u32, @bitCast(xa)) != @as(u32, @bitCast(ya)));
+    return n;
+}
+
+test "dsv41 dec ffn_in: ubench, launch 1 on the vector kernel at R = 3..6 on one and two columns a simdgroup" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    if (!decode.ubenchOn()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .ctx = 8 });
+    defer fx.deinit();
+    const ks = try build();
+    defer free(ks);
+    const nsets = 48;
+    var sets: [nsets]Weights = undefined;
+    var layers: [nsets]dsv41.Layer = undefined;
+    for (&sets, &layers, 0..) |*w, *l, i| {
+        w.* = try randomWeights(1000 + 10 * i);
+        l.* = layerWith(fx.layer(21), w.*);
+    }
+    defer for (sets) |w| freeWeights(w);
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const eps = try dsv41.hcEps(&sc, fx.m);
+    const scal = mlx.mlx_array_new_data(&[_]f32{fx.m.cfg.router_scaling_factor}, &[_]c_int{1}, 1, .float32);
+    try sc.items.append(sc.a, scal);
+    var ov = env.override(.MLX_SERVE_DSV41_GEMV_R26_FFN_IN, "0");
+    defer ov.restore();
+    defer cols_test = null;
+    for (3..decode.max_rows + 1) |rows| {
+        const x = try fx.stream(rows);
+        defer _ = mlx.mlx_array_free(x);
+        const cpre = try fx.cpre(rows);
+        defer _ = mlx.mlx_array_free(cpre);
+        const sa0 = (try dsv41.hcStage(&sc, fx.m, x, null, cpre, &fx.layer(21).hc_attn, fx.layer(21).attn_norm)).sp;
+        var us: [2]f64 = undefined;
+        for (&us, [_]usize{ 1, 2 }) |*t, nr| {
+            var plan: [decode.max_rows + 1]usize = @splat(1);
+            plan[rows] = nr;
+            cols_test = plan;
+            var b = Bench{ .gpa = gpa, .rows = rows, .m = fx.m, .ks = ks, .sets = &sets, .layers = &layers, .x0 = x, .sa0 = sa0, .eps = eps, .scal = scal, .mode = .launch_1 };
+            defer b.deinit();
+            t.* = (try b.us(nsets)).total;
+        }
+        std.debug.print("[dec-ubench] ffn_in launch 1 R={d}: one column {d:.1} us ({d:.0}% of the wo_b floor), two columns {d:.1} us ({d:.0}%)\n", .{ rows, us[0], 100 * 43.2e6 / decode.stream_bytes_per_us / us[0], us[1], 100 * 43.2e6 / decode.stream_bytes_per_us / us[1] });
     }
 }
 
