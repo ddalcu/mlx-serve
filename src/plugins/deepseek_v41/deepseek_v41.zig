@@ -8139,7 +8139,7 @@ pub const EngNext = struct { kv: [engram.MAX_LAYERS]A, rows: usize, n: usize };
 pub const eng_ahead_rows = 5;
 
 pub fn engAheadOn() bool {
-    return env.on(.MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD);
+    return env.onUnlessZero(.MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD);
 }
 var eng_ahead_logged = std.atomic.Value(bool).init(false);
 /// `MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD`'s verifies served (the tests' engagement count).
