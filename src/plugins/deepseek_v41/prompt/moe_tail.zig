@@ -16,6 +16,8 @@ pub const source = kernelSource("plugins/deepseek_v41/kernels/moe_tail.metal");
 pub const ins = [_][*:0]const u8{ "dn", "inv", "sh", "res", "post", "comb" };
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
+/// The tail reading its down rows in pair order (`MoeParts.tok`).
+var kernel_tok: ?mlx.mlx_fast_metal_kernel = null;
 var engaged_logged: std.atomic.Value(bool) = .init(false);
 
 /// The new streams `[L, hc, d]` after layer `li`'s MoE over the normed rows `x` (`img` its image rows) on the streams
@@ -37,6 +39,7 @@ pub fn launch(sc: *dsv41.Scope, p: dsv41.MoeParts, x1: A, sf: *const dsv41.Split
     const d = sh[2];
     const k = @divExact(@as(c_int, @intCast(mlx.mlx_array_size(p.inv))), L);
     if (kernel == null) kernel = try dsv41.buildKernel("dsv41_moe_tail", &ins, &.{"out"}, source, "");
+    if (p.tok and kernel_tok == null) kernel_tok = try dsv41.buildKernel("dsv41_moe_tail_tok", &ins, &.{"out"}, source, "#define TOK 1\n");
     if (!engaged_logged.swap(true, .monotonic)) log.info("[dsv41] MOE_TAIL engaged (rows {d})\n", .{L});
     const dt = mlx.mlx_array_dtype(x1);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -52,7 +55,7 @@ pub fn launch(sc: *dsv41.Scope, p: dsv41.MoeParts, x1: A, sf: *const dsv41.Split
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernel.?, iv, cfg, sc.s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, if (p.tok) kernel_tok.? else kernel.?, iv, cfg, sc.s));
     var o = mlx.mlx_array_new();
     return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
 }

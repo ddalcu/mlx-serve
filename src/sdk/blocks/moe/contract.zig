@@ -2176,6 +2176,10 @@ const nax_launches = [3]metal.Launch{
 /// The staged schedule's threadgroup arrays at its largest tile: one 64 x (64 + 8) bf16 weight buffer and 128 x (64 + 8)
 /// bf16 activations (the register-prefetch tiles hold two weight buffers, 18 KiB).
 const staged_launch = metal.Launch{ .name = "msv_gqmm_staged", .inputs = &gqn.STAGED_INPUTS, .outputs = &.{"y"}, .source = gqn.STAGED_SOURCE, .header = gqn.STAGED_HEADER, .tg_bytes = 64 * 72 * 2 + 128 * 72 * 2, .m1 = 1024, .m2 = 1024, .offline = false, .min_gen = 17 };
+/// The staged plain tile with its rows scattered to their pairs' slots (`gqn.sortedGatherPromptStagedTok`, deepseek_v41's
+/// `MLX_SERVE_DSV41_PF_DOWN_TOKORD`), at the release's 6 picks a token.
+const SCAT_K = 6;
+const staged_scat_launch = metal.Launch{ .name = "msv_gqmm_staged_scat", .inputs = &gqn.STAGED_SCAT_INPUTS, .outputs = &.{"y"}, .source = gqn.STAGED_SOURCE, .header = gqn.stagedScatHeader(SCAT_K), .tg_bytes = 64 * 72 * 2 + 128 * 72 * 2, .m1 = 1024, .m2 = 1024, .offline = false, .min_gen = 17 };
 
 /// Sorted ragged expert runs over `ne` experts: one in sixteen empty, one in eight four times the mean, the
 /// remainder on the last.
@@ -2331,6 +2335,13 @@ const GqmmNax = struct {
     rlim: f32 = 0,
     rwv: []f64 = &.{},
     banks: [2]Bank,
+    /// The scatter (`initScat`): picks a token; 0 = the sorted output. The shape's rows are tokens, each picking `scat`
+    /// distinct experts (token t's pick j: expert (7 t + 5 j) mod ne); sorted row p (by expert, tokens in order) is
+    /// token `tokr[p]`'s pick, written at row `dest[p]` = t * scat + j; `ridx` the flat picks.
+    scat: usize = 0,
+    tokr: []f64 = &.{},
+    dest: []f64 = &.{},
+    ridx: []f64 = &.{},
     shape: Shape = undefined,
     m: usize = 0,
     x: []f64 = &.{},
@@ -2339,7 +2350,7 @@ const GqmmNax = struct {
     table: []f64 = &.{},
     dv: []f64 = &.{},
     dm: []f64 = &.{},
-    args: [15]mlx.mlx_array = undefined,
+    args: [16]mlx.mlx_array = undefined,
     n_args: usize = 0,
 
     fn init(a: std.mem.Allocator, kind: NaxKind, f: Fmt, b: u32, g: usize, ne: usize) GqmmNax {
@@ -2354,11 +2365,28 @@ const GqmmNax = struct {
         return t;
     }
 
+    fn initScat(a: std.mem.Allocator, f: Fmt, b: u32, g: usize, ne: usize) GqmmNax {
+        var t = initStaged(a, .mm, f, b, g, ne);
+        t.launch = &staged_scat_launch;
+        t.scat = SCAT_K;
+        return t;
+    }
+
     pub fn deinit(self: *GqmmNax) void {
         const a = self.rig.a;
         self.rig.deinit();
         for (&self.banks) |*b| b.deinit(a);
-        for ([_][]f64{ self.x, self.rmap, self.ids, self.table, self.dv, self.dm, self.escv[0], self.escv[1], self.rwv }) |s| a.free(s);
+        for ([_][]f64{ self.x, self.rmap, self.ids, self.table, self.dv, self.dm, self.escv[0], self.escv[1], self.rwv, self.tokr, self.dest, self.ridx }) |s| a.free(s);
+    }
+
+    /// The sorted rows' values `src` (`m` rows of n) at their output rows: the scatter's slots, else in order.
+    fn place(self: *const GqmmNax, src: []const f64, dst: []f64) void {
+        if (self.scat == 0) return @memcpy(dst, src[0..dst.len]);
+        const n = self.shape.n;
+        for (0..self.m) |r| {
+            const o: usize = @intFromFloat(self.dest[r]);
+            @memcpy(dst[o * n ..][0..n], src[r * n ..][0..n]);
+        }
     }
 
     fn mx(self: *const GqmmNax) bool {
@@ -2369,8 +2397,10 @@ const GqmmNax = struct {
         return if (self.kind == .paired) 2 else 1;
     }
 
-    /// Routed rows: the shape's rows, or four a token through the row map (a top-4 routing).
+    /// Routed rows: the shape's rows, or four a token through the row map (a top-4 routing), or the scatter's picks a
+    /// token.
     fn routed(self: *const GqmmNax, shape: Shape) usize {
+        if (self.scat > 0) return self.scat * shape.rows;
         return if (self.kind == .mm) shape.rows else 4 * shape.rows;
     }
 
@@ -2453,7 +2483,7 @@ const GqmmNax = struct {
         if (self.geometry(shape) == null) return false;
         const a = self.rig.a;
         self.shape = shape;
-        for ([_]*[]f64{ &self.x, &self.rmap, &self.ids, &self.dv, &self.dm, &self.escv[0], &self.escv[1], &self.rwv }) |p| {
+        for ([_]*[]f64{ &self.x, &self.rmap, &self.ids, &self.dv, &self.dm, &self.escv[0], &self.escv[1], &self.rwv, &self.tokr, &self.dest, &self.ridx }) |p| {
             a.free(p.*);
             p.* = &.{};
         }
@@ -2464,8 +2494,34 @@ const GqmmNax = struct {
         for (self.banks[0..self.nb()]) |*b| try b.fill(a, rng, self.ne * shape.n, shape.k, .bfloat16, stress);
         self.m = self.routed(shape);
         self.ids = try a.alloc(f64, self.m);
-        raggedIds(self.ids, self.ne);
-        const xr = shape.rows;
+        if (self.scat > 0) {
+            const K = self.scat;
+            const T = shape.rows;
+            if (K > self.ne) return false;
+            self.tokr = try a.alloc(f64, self.m);
+            self.dest = try a.alloc(f64, self.m);
+            self.ridx = try a.alloc(f64, self.m);
+            // The picks (distinct in a token: 5 j mod ne is), then a counting sort by expert, tokens in order.
+            const counts = try a.alloc(usize, self.ne + 1);
+            defer a.free(counts);
+            @memset(counts, 0);
+            for (0..T) |t| for (0..K) |j| {
+                const e = (7 * t + 5 * j) % self.ne;
+                self.ridx[t * K + j] = @floatFromInt(e);
+                counts[e + 1] += 1;
+            };
+            for (1..self.ne + 1) |e| counts[e] += counts[e - 1];
+            for (0..T) |t| for (0..K) |j| {
+                const e: usize = @intFromFloat(self.ridx[t * K + j]);
+                const p = counts[e];
+                counts[e] += 1;
+                self.ids[p] = @floatFromInt(e);
+                self.tokr[p] = @floatFromInt(t);
+                self.dest[p] = @floatFromInt(t * K + j);
+            };
+        } else raggedIds(self.ids, self.ne);
+        // The scatter's x rows are its sorted rows (a plain call over them).
+        const xr = if (self.scat > 0) self.m else shape.rows;
         self.x = try a.alloc(f64, xr * shape.k);
         if (stress) stressX(rng, self.x, shape.k) else host.uniformInto(rng, self.x, -1, 1, .bfloat16);
         if (fill == .nonfinite) plantRows(self.x, shape.k);
@@ -2502,7 +2558,7 @@ const GqmmNax = struct {
         for (tf, tiles) |*o, v| o.* = @floatFromInt(v);
         const t = try rig.input(.uint32, &.{@intCast(tf.len)}, tf);
         const count_ = try rig.input(.uint32, &.{1}, &.{@floatFromInt(tc)});
-        const x = try rig.input(.bfloat16, &.{ @intCast(shape.rows), 1, @intCast(shape.k) }, self.x);
+        const x = try rig.input(.bfloat16, &.{ @intCast(if (self.scat > 0) self.m else shape.rows), 1, @intCast(shape.k) }, self.x);
         var b: [2][3]mlx.mlx_array = undefined;
         for (&b, 0..) |*v, i| v.* = try self.banks[if (i < self.nb()) i else 0].bind(rig, .bfloat16, self.ne, shape.n, shape.k);
         // An FP4 bank has no biases; its slot binds 16 zeros, as the wrapper's does.
@@ -2529,8 +2585,13 @@ const GqmmNax = struct {
         // Without the routed epilogue its weights' slot binds 16 f32 zeros, as the wrapper's does.
         const zeros32: [16]f64 = @splat(0);
         const rw = if (self.moe_act) try rig.input(.float32, &.{rows}, self.rwv) else try rig.input(.float32, &.{16}, &zeros32);
-        self.args = .{ x, b[0][0], b[0][1], b[0][2], b[1][0], b[1][1], b[1][2], t, count_, params, sig, try rig.input(.uint32, &.{rows}, self.rmap), sc[0], sc[1], rw };
+        self.args[0..15].* = .{ x, b[0][0], b[0][1], b[0][2], b[1][0], b[1][1], b[1][2], t, count_, params, sig, try rig.input(.uint32, &.{rows}, if (self.scat > 0) self.tokr else self.rmap), sc[0], sc[1], rw };
         self.n_args = 15;
+        // The scatter: `rmap` carries each sorted row's token, `ridx` the flat picks.
+        if (self.scat > 0) {
+            self.args[15] = try rig.input(.uint32, &.{rows}, self.ridx);
+            self.n_args = 16;
+        }
     }
 
     pub fn run(self: *GqmmNax) !void {
@@ -2570,7 +2631,7 @@ const GqmmNax = struct {
     /// The bf16 product, or for the pair MLX's SwiGLU on the two rounded products (each first times its expert's
     /// scale, rounded again, then clamped under a limit).
     fn epilogue(self: *const GqmmNax, dv: []const f64, want: []f64) void {
-        if (self.kind != .paired) return @memcpy(want, dv[0..want.len]);
+        if (self.kind != .paired) return self.place(dv, want);
         const cnt = want.len;
         const lim: f64 = @floatFromInt(self.limit);
         for (want, 0..) |*y, i| {
@@ -2609,7 +2670,7 @@ const GqmmNax = struct {
             return @memset(mag, 0);
         }
         self.epilogue(self.dv, want);
-        if (self.kind == .paired) @memset(mag, 0) else @memcpy(mag, self.dm);
+        if (self.kind == .paired) @memset(mag, 0) else self.place(self.dm, mag);
     }
 
     /// The routed epilogue's inputs as the kernel holds them: MLX's gate and up gathers of the mapped rows (the NAX
@@ -2672,6 +2733,14 @@ const GqmmNax = struct {
         defer g.deinit();
         const x = if (self.kind == .mm) self.args[0] else try g.take(self.args[0], self.args[11], 0);
         var gate = try self.gatherQmm(&g, x, 0);
+        if (self.scat > 0) {
+            // The scatter: output row o is sorted row p where dest[p] = o.
+            const src = try self.rig.a.alloc(u32, self.m);
+            defer self.rig.a.free(src);
+            for (self.dest, 0..) |o, p| src[@intFromFloat(o)] = @intCast(p);
+            const at = try g.adopt(mlx.mlx_array_new_data(src.ptr, &[_]c_int{@intCast(self.m)}, 1, .uint32));
+            return self.rig.bytesOf(&.{try g.take(gate, at, 0)});
+        }
         if (self.kind != .paired) return self.rig.bytesOf(&.{gate});
         var up = try self.gatherQmm(&g, x, 1);
         // The split path's `scaleExperts`: each row times its expert's scale.
@@ -2692,7 +2761,10 @@ const GqmmNax = struct {
         var g = ops.Graph.init(self.rig.a, s);
         defer g.deinit();
         const y = switch (self.kind) {
-            .mm => try gqn.sortedGatherPromptStaged(x[0], x[1], x[2], .{ .ctx = null }, ids, bits, group, self.mx(), true, s),
+            .mm => if (self.scat > 0)
+                try gqn.sortedGatherPromptStagedTok(x[0], x[1], x[2], .{ .ctx = null }, ids, x[11], x[15], @intCast(self.scat), bits, group, self.mx(), true, s)
+            else
+                try gqn.sortedGatherPromptStaged(x[0], x[1], x[2], .{ .ctx = null }, ids, bits, group, self.mx(), true, s),
             .mapped => return error.Unregistered,
             // One bank of each expert's gate rows, then its up rows, as the routed wrapper reads.
             .paired => try gqn.sortedGateUpRoutedStaged(x[0], x[11], try g.concat(&.{ x[1], x[4] }, 1), try g.concat(&.{ x[2], x[5] }, 1), .{ .ctx = null }, ids, x[14], self.rlim, .{
@@ -2798,10 +2870,14 @@ fn registerStaged(set: *kc.Set) !void {
     const a = set.a;
     const gather = "MLX gather_qmm (sorted rhs indices)";
     const plain: []const Shape = &.{ .{ .rows = 512, .n = 128, .k = 256 }, .{ .rows = 2048, .n = 128, .k = 512 }, .{ .rows = 4096, .n = 192, .k = 256 } };
+    // The scatter's rows are tokens (6 routed rows each): 516, 2052 and 4098 routed rows.
+    const plain_scat: []const Shape = &.{ .{ .rows = 86, .n = 128, .k = 256 }, .{ .rows = 342, .n = 128, .k = 512 }, .{ .rows = 683, .n = 192, .k = 256 } };
     const paired: []const Shape = &.{ .{ .rows = 128, .n = 128, .k = 512 }, .{ .rows = 512, .n = 128, .k = 256 }, .{ .rows = 1024, .n = 96, .k = 512 } };
     for ([_]Fmt{ .nvfp4, .mxfp4 }) |f| {
         const gs: usize = if (f == .nvfp4) 16 else 32;
         try set.add(GqmmNax, .initStaged(a, .mm, f, 4, gs, 32), .{ .name = if (f == .nvfp4) "gather_qmm_nax staged bf16 (NVFP4)" else "gather_qmm_nax staged bf16 (MXFP4)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = gather, .served = plain }, null);
+        // The scatter (6 picks a token): the same tiles, each row at its pair's slot; MLX's gather in that order.
+        try set.add(GqmmNax, .initScat(a, f, 4, gs, 32), .{ .name = if (f == .nvfp4) "gather_qmm_nax staged scatter bf16 (NVFP4, rows to their pairs' slots)" else "gather_qmm_nax staged scatter bf16 (MXFP4, rows to their pairs' slots)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = gather ++ " -> take (each pair's sorted row)", .served = plain_scat }, null);
         var r = GqmmNax.initStaged(a, .paired, f, 4, gs, 32);
         r.moe_act = true;
         r.rlim = 10;
@@ -3243,7 +3319,7 @@ test "kernel contract moe: each verify launch is its wrapper's bytes, the prefil
 test "kernel contract moe: the NAX scan chained into each NAX gather launch is the wrapper's bytes" {
     if (mlx.noGpuBackend() or !device_mod.naxAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
-    const Case = struct { kind: NaxKind, f: Fmt = .affine, bits: u32 = 4, gs: usize = 64, moe_act: bool = false, staged: bool = false, shape: Shape };
+    const Case = struct { kind: NaxKind, f: Fmt = .affine, bits: u32 = 4, gs: usize = 64, moe_act: bool = false, staged: bool = false, scat: bool = false, shape: Shape };
     const cases = [_]Case{
         .{ .kind = .mm, .shape = .{ .rows = 1024, .n = 128, .k = 256 } },
         .{ .kind = .mm, .shape = .{ .rows = 2048, .n = 96, .k = 256 } },
@@ -3255,9 +3331,11 @@ test "kernel contract moe: the NAX scan chained into each NAX gather launch is t
         .{ .kind = .mm, .f = .nvfp4, .gs = 16, .staged = true, .shape = .{ .rows = 4096, .n = 128, .k = 512 } },
         .{ .kind = .mm, .f = .mxfp4, .gs = 32, .staged = true, .shape = .{ .rows = 512, .n = 128, .k = 256 } },
         .{ .kind = .paired, .f = .nvfp4, .gs = 16, .moe_act = true, .staged = true, .shape = .{ .rows = 512, .n = 128, .k = 256 } },
+        .{ .kind = .mm, .f = .nvfp4, .gs = 16, .staged = true, .scat = true, .shape = .{ .rows = 683, .n = 128, .k = 512 } },
+        .{ .kind = .mm, .f = .mxfp4, .gs = 32, .staged = true, .scat = true, .shape = .{ .rows = 86, .n = 128, .k = 256 } },
     };
     for (cases) |c| {
-        var t = if (c.staged) GqmmNax.initStaged(a, c.kind, c.f, c.bits, c.gs, 32) else GqmmNax.init(a, c.kind, c.f, c.bits, c.gs, 32);
+        var t = if (c.scat) GqmmNax.initScat(a, c.f, c.bits, c.gs, 32) else if (c.staged) GqmmNax.initStaged(a, c.kind, c.f, c.bits, c.gs, 32) else GqmmNax.init(a, c.kind, c.f, c.bits, c.gs, 32);
         defer t.deinit();
         if (c.moe_act) {
             t.moe_act = true;

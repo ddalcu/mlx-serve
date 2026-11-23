@@ -3,6 +3,52 @@
 // tiles, with K and the output width as compile-time constants.
 namespace omlx_gqmm {
 
+// GQMM_SCAT (PF_DOWN_TOKORD, the msv_gqmm_staged_scat build only): the plain (EPI 0) tile's rows go to their pairs'
+// slots instead of their sorted places. Sorted row p is token rmap[p]'s route j, where j is the slot of the tile's
+// expert among that token's GQMM_SCAT_K picks ridx[tok * K ..]; the row lands at y row tok * K + j, so the output is in
+// pair (token) order and a combine reads it in place. Each value is the same T(D) as D.store writes; only the row
+// address differs. A token's picks are distinct experts, so every slot is written once.
+#if GQMM_SCAT
+#define GQMM_SCAT_ARG , const device uint* ridx
+#define GQMM_SCAT_PASS , ridx
+template <typename T, short TM, short TN, int NW, int KR, typename RMap>
+METAL_FUNC void scat_store(
+    thread const NAXTile<float, TM, TN>& D,
+    device T* y,
+    RMap rmap,
+    const device uint* ridx,
+    const uint expert,
+    const int base,
+    const int rows,
+    const int col0) {
+  const short2 xy = BaseNAXFrag::get_coord();
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < TM; i++) {
+    STEEL_PRAGMA_UNROLL
+    for (short h = 0; h < 2; h++) {
+      const int r = i * 16 + h * 8 + int(xy.y);
+      if (r < rows) {
+        const uint tok = uint(rmap[base + r]);
+        uint j = 0;
+        STEEL_PRAGMA_UNROLL
+        for (int k = 0; k < KR; k++) {
+          if (ridx[tok * uint(KR) + uint(k)] == expert) j = uint(k);
+        }
+        device T* yr = y + size_t(tok * uint(KR) + j) * NW + col0 + xy.x;
+        STEEL_PRAGMA_UNROLL
+        for (short c = 0; c < TN; c++) {
+          STEEL_PRAGMA_UNROLL
+          for (short e = 0; e < 4; e++) yr[c * 16 + e] = T(D.data[i * TN + c][h * 4 + e]);
+        }
+      }
+    }
+  }
+}
+#else
+#define GQMM_SCAT_ARG
+#define GQMM_SCAT_PASS
+#endif
+
 // BM rows of one expert over WM x WN simdgroups; each simdgroup holds BM / WM rows by kBN / WN weight rows. Every
 // thread loads the kBN x 64 weight tile (kVPT values of one weight row each).
 template <int BM, int WM, int WN>
@@ -68,7 +114,7 @@ METAL_FUNC void gather_staged(
     const device T* gsc,
     const device T* usc,
     const device float* rw,
-    const float lim) {
+    const float lim GQMM_SCAT_ARG) {
   using WT = typename Q::WT;
   constexpr bool kPair = EPI != 0;
   constexpr int BK = G::kBK;
@@ -194,12 +240,16 @@ METAL_FUNC void gather_staged(
       store_act<T, EPI, ESC>(D, yb + 16 * p, half_n, rows, sigtab, gsc, usc, expert, rw + row_start + m0, lim, p);
     }
   } else {
+#if GQMM_SCAT
+    scat_store<T, TM, TN, NW, GQMM_SCAT_K>(D, y, rmap, ridx, expert, row_start + m0, rows, y_col + tn);
+#else
     device T* yb = y + size_t(row_start + m0) * NW + y_col + tn;
     if (rows >= SM) {
       D.store(yb, NW);
     } else {
       D.store_safe(yb, NW, short2(SN, short(rows)));
     }
+#endif
   }
 }
 
@@ -227,7 +277,7 @@ METAL_FUNC void gather_staged_tg(
     const device T* gsc,
     const device T* usc,
     const device float* rw,
-    const float lim) {
+    const float lim GQMM_SCAT_ARG) {
   using WT = typename Q::WT;
   constexpr bool kPair = EPI != 0;
   constexpr int BK = G::kBK;
@@ -369,12 +419,16 @@ METAL_FUNC void gather_staged_tg(
       store_act<T, EPI, ESC>(D, yb + 16 * p, half_n, rows, sigtab, gsc, usc, expert, rw + row_start + m0, lim, p);
     }
   } else {
+#if GQMM_SCAT
+    scat_store<T, TM, TN, NW, GQMM_SCAT_K>(D, y, rmap, ridx, expert, row_start + m0, rows, y_col + tn);
+#else
     device T* yb = y + size_t(row_start + m0) * NW + y_col + tn;
     if (rows >= SM) {
       D.store(yb, NW);
     } else {
       D.store_safe(yb, NW, short2(SN, short(rows)));
     }
+#endif
   }
 }
 } // namespace omlx_gqmm

@@ -4969,12 +4969,23 @@ pub fn moePrefill(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx:
     const p = try moePrefillParts(sc, m, ly, x, idx, wts, sh);
     const L = dim(x, 0);
     const d = dim(x, 1);
-    return flatKernel(sc, m.moe_combine_kernel, &.{ p.dn, p.inv, p.sh }, &.{ ci(L), ci(d) }, mlx.mlx_array_dtype(x), L * d, &.{ .{ .name = "D", .v = ci(d) }, .{ .name = "K", .v = ci(dim(idx, 1)) } });
+    return flatKernel(sc, if (p.tok) try moeCombineTok() else m.moe_combine_kernel, &.{ p.dn, p.inv, p.sh }, &.{ ci(L), ci(d) }, mlx.mlx_array_dtype(x), L * d, &.{ .{ .name = "D", .v = ci(d) }, .{ .name = "K", .v = ci(dim(idx, 1)) } });
+}
+
+/// `moe_combine.metal` reading its down rows in pair order (`TOK`: `MoeParts.tok`), built on first use.
+var moe_combine_tok: ?mlx.mlx_fast_metal_kernel = null;
+pub fn moeCombineTok() !mlx.mlx_fast_metal_kernel {
+    if (moe_combine_tok) |k| return k;
+    const k = try buildKernel("dsv41_moe_combine_tok", &MOE_COMBINE_INS, &.{"out"}, MOE_COMBINE_SOURCE, "#define TOK 1\n");
+    moe_combine_tok = k;
+    return k;
 }
 
 /// What `moePrefill`'s combine reads: the down rows `[n, d]` in expert order, each pair's place in it `inv` `[n]`
 /// (pair `l * k + j` at row `inv[l * k + j]`) and the shared expert `sh` in `x`'s dtype.
-pub const MoeParts = struct { dn: A, inv: A, sh: A };
+/// `tok` (`MLX_SERVE_DSV41_PF_DOWN_TOKORD`): `dn` is in pair order instead (pair `l * k + j` at row `l * k + j`), read
+/// in place; `inv` then goes unread.
+pub const MoeParts = struct { dn: A, inv: A, sh: A, tok: bool = false };
 
 /// `moePrefill` up to its combine.
 pub fn moePrefillParts(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, wts: A, sh: A) !MoeParts {
@@ -5006,6 +5017,7 @@ pub fn moePrefillParts(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A,
     const sidx = sp.sidx;
     const x3 = try sc.reshape(x, &.{ ci(L), 1, ci(d) });
     const w_sorted = sp.w;
+    if (env.get(.DSV41_ROUTE_DUMP)) |path| if (env.on(.DSV41_ROUTE_DUMP_WIDE) or n < 4 * dim(e.down.w, 0)) try dumpRoute(sc, path, L, k, dim(e.down.w, 0), sidx, rows);
     const act = if (try mpair.act(sc, m, e, x3, rows, sidx, w_sorted)) |a| a else if (try gateUpPaired(sc, m, e, x3, rows, sidx)) |a| blk: {
         // The routing weight on the activation, as the split path's kernel applies it.
         const inter = dim(a, -1);
@@ -5019,8 +5031,29 @@ pub fn moePrefillParts(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A,
         const lim = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.dsv4_swiglu_limit}, &[_]c_int{1}, 1, .float32));
         break :blk try flatKernel(sc, m.moe_act_kernel, &.{ try sc.reshape(y, &.{ ci(n), ci(2 * inter) }), w_sorted, lim }, &.{ ci(n), 1, ci(inter) }, dt, n * inter, &.{.{ .name = "N", .v = ci(inter) }});
     };
+    // MLX_SERVE_DSV41_PF_DOWN_TOKORD: the staged down writes each row to its pair's slot, so the combine reads in place.
+    if (fp4gemm.on() and env.on(.MLX_SERVE_DSV41_PF_DOWN_TOKORD)) if (try fp4gemm.downTok(sc, &e.down, act, sidx, rows, flat, k)) |tokdn| {
+        return .{ .dn = try sc.reshape(tokdn, &.{ ci(n), ci(d) }), .inv = inv, .sh = try sc.astype(sh, dt), .tok = true };
+    };
     const dn = (if (fp4gemm.on()) try fp4gemm.down(sc, &e.down, act, sidx) else null) orelse try sortedBank(sc, act, null, &e.down, sidx); // [n, 1, d]
     return .{ .dn = try sc.reshape(dn, &.{ ci(n), ci(d) }), .inv = inv, .sh = try sc.astype(sh, dt) };
+}
+
+/// `DSV41_ROUTE_DUMP` (diag): a call's sorted routing appended to the named file, one record a call: u32 rows, picks
+/// a row, experts, pairs, then the pairs' experts (sorted) and their rows, u32 each.
+fn dumpRoute(sc: *Scope, path: [*:0]const u8, L: usize, k: usize, E: usize, sidx: A, rows: A) !void {
+    const ids = try sc.astype(sidx, .uint32);
+    const rs = try sc.astype(rows, .uint32);
+    try evalAll(&.{ ids, rs });
+    const n = L * k;
+    const di = mlx.mlx_array_data_uint32(ids) orelse return;
+    const dr = mlx.mlx_array_data_uint32(rs) orelse return;
+    const f = std.c.fopen(path, "ab") orelse return;
+    defer _ = std.c.fclose(f);
+    const hdr = [4]u32{ @intCast(L), @intCast(k), @intCast(E), @intCast(n) };
+    _ = std.c.fwrite(@ptrCast(&hdr), 4, 4, f);
+    _ = std.c.fwrite(@ptrCast(di), 4, n, f);
+    _ = std.c.fwrite(@ptrCast(dr), 4, n, f);
 }
 
 pub const Routes = struct { idx: A, wts: A };

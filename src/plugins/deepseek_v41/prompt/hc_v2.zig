@@ -106,6 +106,8 @@ pub fn slicesFor(L: usize) usize {
 /// The kernels and the attention side handed to the next layer; one copy across `-Dunits` units.
 const State = struct {
     k: [all.len]?mlx.mlx_fast_metal_kernel = @splat(null),
+    /// The combining tails reading their down rows in pair order (`MoeParts.tok`).
+    k_tok: [all.len]?mlx.mlx_fast_metal_kernel = @splat(null),
     fin: ?mlx.mlx_fast_metal_kernel = null,
     logged: bool = false,
     slot: Slot = .{},
@@ -142,6 +144,18 @@ fn kernel(p: Pro) !mlx.mlx_fast_metal_kernel {
     return k;
 }
 
+/// `kernel(p)` for a combining tail whose down rows are in pair order (`TOK`, `MoeParts.tok`).
+fn kernelTok(p: Pro) !mlx.mlx_fast_metal_kernel {
+    const i = @intFromEnum(p);
+    if (ps().k_tok[i]) |k| return k;
+    const k = switch (p) {
+        inline .tail_c, .tail_only_c => |q| try dsv41.buildKernel(comptime (name(q) ++ "_tok"), ins(q), outs(q), mix_source, comptime (header(q) ++ "#define TOK 1\n")),
+        else => return error.HcV2TokNotCombining,
+    };
+    ps().k_tok[i] = k;
+    return k;
+}
+
 fn finKernel() !mlx.mlx_fast_metal_kernel {
     if (ps().fin) |k| return k;
     const k = try dsv41.buildKernel("dsv41_hc_v2_fin", &fin_ins, &fin_outs, fin_source, "");
@@ -175,6 +189,11 @@ fn rows(x: A) usize {
 
 /// One mix-kernel launch over `L` rows: its outputs (x2 for the tail, then hraw and part where it mixes).
 pub fn mixLaunch(sc: *dsv41.Scope, p: Pro, in: []const A, L: usize, S: usize) ![3]A {
+    return mixLaunchTo(sc, p, in, L, S, false);
+}
+
+/// `mixLaunch`; `tok`: a combining tail's down rows are in pair order (`kernelTok`).
+pub fn mixLaunchTo(sc: *dsv41.Scope, p: Pro, in: []const A, L: usize, S: usize, tok: bool) ![3]A {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     if (isTail(p)) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), HC, D }, 3, .bfloat16));
@@ -192,7 +211,7 @@ pub fn mixLaunch(sc: *dsv41.Scope, p: Pro, in: []const A, L: usize, S: usize) ![
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, try kernel(p), iv, cfg, sc.s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, if (tok) try kernelTok(p) else try kernel(p), iv, cfg, sc.s));
     var got: [3]A = .{ none, none, none };
     const n = nOuts(p);
     for (got[0..n], 0..) |*o, k| {
@@ -287,6 +306,7 @@ pub fn tail(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, y: A, sa: *const
         n_in += 1;
     }
     const c = y2 == .parts;
+    const tok = c and y2.parts.tok;
     switch (y2) {
         .rows => |r| {
             in[n_in] = try bf16(sc, r);
@@ -302,14 +322,14 @@ pub fn tail(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, y: A, sa: *const
         n_in += 1;
     }
     const n = nx orelse {
-        const o = try mixLaunch(sc, if (c) .tail_only_c else .tail_only, in[0..n_in], L, S);
+        const o = try mixLaunchTo(sc, if (c) .tail_only_c else .tail_only, in[0..n_in], L, S, tok);
         return .{ .x2 = o[0], .next = null };
     };
     in[n_in] = sf.pre;
     in[n_in + 1] = n.hc.fn_w;
     n_in += 2;
     const eps = try dsv41.hcEps(sc, m);
-    const o = try mixLaunch(sc, if (c) .tail_c else .tail, in[0..n_in], L, S);
+    const o = try mixLaunchTo(sc, if (c) .tail_c else .tail, in[0..n_in], L, S, tok);
     return .{ .x2 = o[0], .next = try finLaunch(sc, o[2], o[1], n.hc, n.norm_w, eps, S, m.cfg.dsv4_hc_sinkhorn_iters) };
 }
 
@@ -355,6 +375,106 @@ pub fn drop() void {
         _ = mlx.mlx_array_free(a);
     };
     s.* = .{};
+}
+
+test "hc_v2 bench: the combining tails at a prompt width over a served routing, the stock builds reading the served unsort against the TOK builds reading the down rows in pair order (DSV41_BENCH_HC = rows, DSV41_BENCH_HC_ROUTE = a DSV41_ROUTE_DUMP file)" {
+    const rows_s = std.mem.span(env.get(.DSV41_BENCH_HC) orelse return error.SkipZigTest);
+    const path = env.get(.DSV41_BENCH_HC_ROUTE) orelse return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    const L: usize = try std.fmt.parseInt(usize, rows_s, 10);
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 5));
+    const rnd = struct {
+        fn f(s: *dsv41.Scope, k: A, sh: []const c_int, dt: mlx.mlx_dtype, sd: f32) !A {
+            var r = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&r, sh.ptr, sh.len, dt, 0, sd, k, s.s));
+            return s.keep(r);
+        }
+    }.f;
+    const Li = ci(L);
+    const x = try rnd(&sc, key, &.{ Li, HC, D }, .bfloat16, 1);
+    const y = try rnd(&sc, key, &.{ Li, D }, .bfloat16, 1);
+    const dn = try rnd(&sc, key, &.{ ci(L * K), D }, .bfloat16, 1);
+    const sh = try rnd(&sc, key, &.{ Li, D }, .bfloat16, 1);
+    const post = try rnd(&sc, key, &.{ Li, HC }, .float32, 0.5);
+    const comb = try rnd(&sc, key, &.{ Li, HC, HC }, .float32, 0.25);
+    const cpre = try rnd(&sc, key, &.{ Li, HC }, .float32, 0.5);
+    const fnw = try rnd(&sc, key, &.{ MIX, N }, .float32, 0.01);
+    try dsv41.evalAll(&.{ x, y, dn, sh, post, comb, cpre, fnw });
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(path), gpa, .limited(1 << 30));
+    defer gpa.free(bytes);
+    const words = std.mem.bytesAsSlice(u32, bytes[0 .. bytes.len / 4 * 4]);
+    const S = slicesFor(L);
+    // One launch's time: a chain of `n` launches, each reading the one before's x2 as its stream, evaluated at once;
+    // the chain of 9 less the chain of 1, over 8, best of 4.
+    const Chain = struct {
+        fn run(p: Pro, in0: []const A, rows_: usize, S_: usize, n: usize, tok: bool) !f64 {
+            const g = std.testing.allocator;
+            const io2 = std.Io.Threaded.global_single_threaded.io();
+            const iou = @import("../../../sdk/util/io_util.zig");
+            var best: f64 = std.math.inf(f64);
+            for (0..4) |_| {
+                var it = dsv41.Scope.init(g, mlx.gpuStream());
+                defer it.deinit();
+                var in: [11]A = undefined;
+                @memcpy(in[0..in0.len], in0);
+                var last: A = none;
+                const t0 = iou.nowUsMonotonic(io2);
+                for (0..n) |_| {
+                    const o = try mixLaunchTo(&it, p, in[0..in0.len], rows_, S_, tok);
+                    in[0] = o[0];
+                    last = o[0];
+                }
+                try dsv41.evalAll(&.{last});
+                best = @min(best, @as(f64, @floatFromInt(iou.nowUsMonotonic(io2) - t0)));
+            }
+            return best;
+        }
+        fn per(p: Pro, in0: []const A, rows_: usize, S_: usize, tok: bool) !f64 {
+            return (try run(p, in0, rows_, S_, 9, tok) - try run(p, in0, rows_, S_, 1, tok)) / 8;
+        }
+    };
+    const iv = try gpa.alloc(u32, L * K);
+    defer gpa.free(iv);
+    const fill = try gpa.alloc(u8, L);
+    defer gpa.free(fill);
+    var tot: [2][2]f64 = .{ .{ 0, 0 }, .{ 0, 0 } };
+    var calls: usize = 0;
+    var at: usize = 0;
+    while (at + 4 <= words.len) {
+        const rl: usize = words[at];
+        const n: usize = words[at + 3];
+        if (words[at + 1] != K or at + 4 + 2 * n > words.len) return error.BadRouteDump;
+        const rows_ = words[at + 4 + n ..][0..n];
+        at += 4 + 2 * n;
+        if (rl != L) continue;
+        // The served unsort: pair (token r, slot j) at its sorted place, slot j in the order the token's rows come.
+        @memset(fill, 0);
+        for (rows_, 0..) |r, place| {
+            if (r >= L or fill[r] >= K) return error.BadRouteDump;
+            iv[r * K + fill[r]] = @intCast(place);
+            fill[r] += 1;
+        }
+        var isc = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer isc.deinit();
+        const inv = try isc.keep(mlx.mlx_array_new_data(iv.ptr, &[_]c_int{ Li, K }, 2, .uint32));
+        for ([_]Pro{ .tail_c, .tail_only_c }, 0..) |p, pi| {
+            const in: []const A = if (mixes(p)) &.{ x, y, post, comb, dn, inv, sh, post, comb, cpre, fnw } else &.{ x, y, post, comb, dn, inv, sh, post, comb };
+            const us = try Chain.per(p, in, L, S, false);
+            const ut = try Chain.per(p, in, L, S, true);
+            tot[pi][0] += us;
+            tot[pi][1] += ut;
+            std.debug.print("[hc_v2 tok] call {d} {s} {d} rows ({d} slices): served unsort {d:.0} us, pair order (TOK) {d:.0} us ({d:.0} us)\n", .{ calls, @tagName(p), L, S, us, ut, ut - us });
+        }
+        calls += 1;
+    }
+    if (calls == 0) return error.NoCallOfThisWidth;
+    for ([_]Pro{ .tail_c, .tail_only_c }, 0..) |p, pi| std.debug.print("[hc_v2 tok] {s} over {d} calls of {d} rows: served unsort {d:.2} ms, pair order (TOK) {d:.2} ms ({d:.2} ms)\n", .{ @tagName(p), calls, L, tot[pi][0] / 1e3, tot[pi][1] / 1e3, (tot[pi][1] - tot[pi][0]) / 1e3 });
 }
 
 test "hc_v2 packing: every element of fn lands once, each step's floats in its own 32 columns of every copy" {

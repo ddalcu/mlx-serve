@@ -75,7 +75,12 @@ for (int q = 0; q < HC * HC; ++q) ca[q] = comb[lr * HC * HC + q];
 #endif
 #if COMB
 uint iv[K];
+#if TOK
+// MoeParts.tok: the down rows in pair order, read in place (no unsort read).
+for (int j = 0; j < K; ++j) iv[j] = live ? uint(lr * K + j) : 0u;
+#else
 for (int j = 0; j < K; ++j) iv[j] = live ? inv[lr * K + j] : 0u;
+#endif
 #endif
 #if PRO == 2
 float pb[HC], cb[HC * HC];
