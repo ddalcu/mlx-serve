@@ -2134,5 +2134,5 @@ test "staged NAX down scatter µbench on a served routing: PF_DOWN_TOKORD's scat
         ws[wi].tok += tok;
         ws[wi].floor += @as(f64, @floatFromInt(c.touched)) * @as(f64, @floatFromInt(ds_hidden)) * @as(f64, @floatFromInt(ds_inter)) * (0.5 + 1.0 / 16.0) / 1.065e9;
     }
-    for (ws[0..nw]) |w| std.debug.print("[gqmm-route] down {d} calls of {d} rows: today {d:.3} ms, scatter {d:.3} ms ({d:+.3} ms, {d:+.2}%), weight floor {d:.3} ms\n", .{ w.calls, w.rows, w.today, w.tok, w.tok - w.today, 100 * (w.tok - w.today) / w.today, w.floor });
+    for (ws[0..nw]) |w| std.debug.print("[gqmm-route] down {d} calls of {d} rows: today {d:.3} ms, scatter {d:.3} ms ({d:.3} ms, {d:.2}%), weight floor {d:.3} ms\n", .{ w.calls, w.rows, w.today, w.tok, w.tok - w.today, 100 * (w.tok - w.today) / w.today, w.floor });
 }

@@ -469,12 +469,12 @@ test "hc_v2 bench: the combining tails at a prompt width over a served routing, 
             const ut = try Chain.per(p, in, L, S, true);
             tot[pi][0] += us;
             tot[pi][1] += ut;
-            std.debug.print("[hc_v2 tok] call {d} {s} {d} rows ({d} slices): served unsort {d:.0} us, pair order (TOK) {d:.0} us ({d:+.0} us)\n", .{ calls, @tagName(p), L, S, us, ut, ut - us });
+            std.debug.print("[hc_v2 tok] call {d} {s} {d} rows ({d} slices): served unsort {d:.0} us, pair order (TOK) {d:.0} us ({d:.0} us)\n", .{ calls, @tagName(p), L, S, us, ut, ut - us });
         }
         calls += 1;
     }
     if (calls == 0) return error.NoCallOfThisWidth;
-    for ([_]Pro{ .tail_c, .tail_only_c }, 0..) |p, pi| std.debug.print("[hc_v2 tok] {s} over {d} calls of {d} rows: served unsort {d:.2} ms, pair order (TOK) {d:.2} ms ({d:+.2} ms)\n", .{ @tagName(p), calls, L, tot[pi][0] / 1e3, tot[pi][1] / 1e3, (tot[pi][1] - tot[pi][0]) / 1e3 });
+    for ([_]Pro{ .tail_c, .tail_only_c }, 0..) |p, pi| std.debug.print("[hc_v2 tok] {s} over {d} calls of {d} rows: served unsort {d:.2} ms, pair order (TOK) {d:.2} ms ({d:.2} ms)\n", .{ @tagName(p), calls, L, tot[pi][0] / 1e3, tot[pi][1] / 1e3, (tot[pi][1] - tot[pi][0]) / 1e3 });
 }
 
 test "hc_v2 packing: every element of fn lands once, each step's floats in its own 32 columns of every copy" {
