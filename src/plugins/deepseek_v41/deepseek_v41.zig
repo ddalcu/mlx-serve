@@ -471,8 +471,6 @@ pub const Dsv41Model = struct {
     attn_softmax_kernel: mlx.mlx_fast_metal_kernel,
     /// The wide attention core on the matrix units (`attnGather`); null without them.
     attn_gather: ?GatherAttn = null,
-    /// The routing weight on a fused gate/up's activation (`MOE_WT_SOURCE`); null off the GPU.
-    moe_wt_kernel: ?mlx.mlx_fast_metal_kernel = null,
     /// Wide spans score and weight rows in f16 (`attnWide`); `MLX_SERVE_DSV41_ATTN_F16=0` keeps the f32 chain.
     attn_f16: bool = true,
     idx_score_kernel: mlx.mlx_fast_metal_kernel,
@@ -570,7 +568,6 @@ pub const Dsv41Model = struct {
         _ = mlx.mlx_fast_metal_kernel_free(self.attn_softmax_kernel);
         sat.releaseAll();
         if (self.attn_gather) |*g| g.deinit();
-        if (self.moe_wt_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
         _ = mlx.mlx_fast_metal_kernel_free(self.idx_score_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(self.idx_tile_kernel);
         if (self.idx_nax_kernel) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
@@ -1637,7 +1634,6 @@ pub const MOE_DN_GGUF_SOURCE = kernelSource("plugins/deepseek_v41/kernels/moe_dn
 /// gate+up gather `y` (`[n, 2N]`, gate then up) times its routing weight, the
 /// f32 math of `clampedSwiglu` in its order, rounded once to T.
 pub const MOE_ACT_SOURCE = kernelSource("plugins/deepseek_v41/kernels/moe_act.metal");
-pub const MOE_WT_SOURCE = kernelSource("plugins/deepseek_v41/kernels/moe_wt.metal");
 
 /// A prefill MoE call's combine, one element a thread: the row's K sorted down
 /// rows (`inv` names them) summed in f32 plus the shared expert, rounded once to
@@ -1893,7 +1889,6 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     m.quant = opts.quant;
     defer m.quant = null;
     if (device.naxAvailable()) m.attn_gather = try GatherAttn.init();
-    if (mlx.metalKernelsAvailable()) m.moe_wt_kernel = try buildKernel("dsv41_moe_wt", &.{ "a", "wts" }, &.{"out"}, MOE_WT_SOURCE, "");
     const tp_worker = if (opts.tp) |t| t.rank != 0 else false;
     const worker = if (opts.pair) |p| p.worker else false;
     if (opts.pair) |p| if (p.worker and engramIn(cfg, p.lo, p.hi)) return error.DsvPairEngram;
@@ -4354,14 +4349,14 @@ fn slotWide(sc: *Scope, m: *const Dsv41Model, src: streamed.Routed, li: usize, x
     return sc.astype(try sc.add(try sc.sum(try sc.astype(rows_k, .float32), 1, false), try sc.astype(sh, .float32)), dt);
 }
 
-/// The fused gate/up bank's products with the clamped SwiGLU in one NAX kernel (`[n, 1, inter]`), or null where it does
-/// not serve (no fused bank, a limit that is not a whole number).
-fn gateUpPaired(sc: *Scope, m: *const Dsv41Model, e: *const Experts, x3: A, rows: A, sidx: A) !?A {
+/// The fused gate/up bank's weighted products with clamped SwiGLU in one NAX kernel (`[n, 1, inter]`), or null
+/// where it does not serve (no fused bank, a limit that is not a whole number).
+fn gateUpPaired(sc: *Scope, m: *const Dsv41Model, e: *const Experts, x3: A, rows: A, sidx: A, w_sorted: A) !?A {
     const gu = e.gu orelse return null;
     const lim = m.cfg.dsv4_swiglu_limit;
     if (gu.qp.mode != .affine or gu.s.ctx == null or lim < 0 or lim != @floor(lim) or !verify_qmm_nax.verifyQmmNaxAvailable()) return null;
     const sigtab = try @import("../../sdk/blocks/hc/hc_prefill.zig").sigmoidTable(sc.s);
-    const y = (try gather_nax.sortedGateUpFused(x3, rows, gu.w, gu.s, gu.b, sidx, sigtab, @intFromFloat(lim), gu.qp.bits, gu.qp.group_size, false, true, sc.s)) orelse return null;
+    const y = (try gather_nax.sortedGateUpFusedWeighted(x3, rows, gu.w, gu.s, gu.b, sidx, sigtab, w_sorted, @intFromFloat(lim), gu.qp.bits, gu.qp.group_size, false, true, sc.s)) orelse return null;
     return try sc.keep(y);
 }
 
@@ -4429,12 +4424,7 @@ fn moePrefill(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, 
     const sidx = try sc.take(flat, order, 0);
     const x3 = try sc.reshape(x, &.{ ci(L), 1, ci(d) });
     const w_sorted = try sc.take(try sc.reshape(wts, &.{ci(n)}), order, 0);
-    const act = if (try gateUpPaired(sc, m, e, x3, rows, sidx)) |a| blk: {
-        // The routing weight on the activation, as the split path's kernel applies it.
-        const inter = dim(a, -1);
-        if (m.moe_wt_kernel) |kw| break :blk try flatKernel(sc, kw, &.{ a, w_sorted }, &.{ ci(n), 1, ci(inter) }, dt, n * inter, &.{.{ .name = "N", .v = ci(inter) }});
-        break :blk try sc.astype(try sc.mul(a, try sc.reshape(w_sorted, &.{ ci(n), 1, 1 })), dt);
-    } else blk: {
+    const act = (try gateUpPaired(sc, m, e, x3, rows, sidx, w_sorted)) orelse blk: {
         if (try ggufGateUp(sc, m, e, x3, rows, sidx, w_sorted)) |a| break :blk a;
         const y = if (e.gu) |*gu| try sortedBank(sc, x3, rows, gu, sidx) else try sc.concat(&.{ try sortedBank(sc, x3, rows, &e.gate, sidx), try sortedBank(sc, x3, rows, &e.up, sidx) }, -1); // [n, 1, 2 inter]
         const inter = dim(y, -1) / 2;
@@ -10738,33 +10728,6 @@ test "dsv41 clampedSwiglu: the SDK clamped SwiGLU in f32 gives the bytes the plu
         const gb = @as([*]const u8, @ptrCast(mlx.mlx_array_data_bfloat16(got).?))[0 .. 2 * 64 * 96];
         try std.testing.expectEqual(want, std.hash.Wyhash.hash(0, gb));
     }
-}
-
-test "dsv41 moe_wt: the weighted activation is the promoted multiply then cast, bit for bit" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    var sc = Scope.init(std.testing.allocator, mlx.gpuStream());
-    defer sc.deinit();
-    const kern = try buildKernel("dsv41_moe_wt", &.{ "a", "wts" }, &.{"out"}, MOE_WT_SOURCE, "");
-    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
-    var key = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(key);
-    try mlx.check(mlx.mlx_random_key(&key, 0x3017));
-    var r = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(r);
-    const n = 77;
-    const inter = 2304;
-    try mlx.check(mlx.mlx_random_normal(&r, &[_]c_int{ n, 1, inter }, 3, .float32, 0.0, 3.0, key, sc.s));
-    const a = try sc.astype(r, .bfloat16);
-    var wr = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(wr);
-    try mlx.check(mlx.mlx_random_uniform(&wr, try sc.f(0.01), try sc.f(2.5), &[_]c_int{n}, 1, .float32, key, sc.s));
-    const got = try flatKernel(&sc, kern, &.{ a, wr }, &.{ n, 1, inter }, .bfloat16, n * inter, &.{.{ .name = "N", .v = inter }});
-    const want = try sc.astype(try sc.mul(a, try sc.reshape(wr, &.{ n, 1, 1 })), .bfloat16);
-    try mlx.check(mlx.mlx_array_eval(got));
-    try mlx.check(mlx.mlx_array_eval(want));
-    const gb = @as([*]const u8, @ptrCast(mlx.mlx_array_data_bfloat16(got).?))[0 .. 2 * n * inter];
-    const wb = @as([*]const u8, @ptrCast(mlx.mlx_array_data_bfloat16(want).?))[0 .. 2 * n * inter];
-    try std.testing.expectEqualSlices(u8, wb, gb);
 }
 
 fn testConfig(io: std.Io, dir: []const u8) !Config {

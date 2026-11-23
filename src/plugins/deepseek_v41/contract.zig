@@ -509,38 +509,6 @@ const MoeAct = struct {
     }
 };
 
-/// A fused gate/up's activation `a` [rows, 1, n] times its routing weight, one rounding.
-const MoeWt = struct {
-    pub const Params = struct {};
-
-    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
-        const total = s.rows * s.n;
-        if (total == 0) return null;
-        var g = metal.Geometry{ .grid = .{ ci((total + 255) / 256 * 256), 1, 1 }, .tg = .{ 256, 1, 1 } };
-        g.out(&.{ ci(s.rows), 1, ci(s.n) }, act);
-        g.int("N", s.n);
-        g.dtype("T", act);
-        return g;
-    }
-
-    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
-        const a = try k.add(act, &.{ k.shape.rows, 1, k.shape.n });
-        const wts = try k.add(.float32, &.{k.shape.rows});
-        kit.uniform(rng, a, -8, 8);
-        kit.uniform(rng, wts, 0, 2.5);
-        if (f == .nonfinite) kit.plantRows(a, k.shape.rows, k.shape.n);
-    }
-
-    pub fn count(_: Params, s: Shape) usize {
-        return s.rows * s.n;
-    }
-
-    pub fn compute(k: anytype, out: []f64, mag: []f64, _: Sum) !void {
-        for (out, 0..) |*o, i| o.* = k.in(0)[i] * k.in(1)[i / k.shape.n];
-        @memset(mag, 0);
-    }
-};
-
 const MoeCombine = struct {
     pub const Params = struct { k: usize = TOPK };
 
@@ -4171,7 +4139,6 @@ const softmax_l = launch("dsv41_attn_softmax", &.{ "lw", "lc", "topk", "sink", "
 const qk_l = metal.Launch{ .name = "dsv41_attn_qk", .inputs = &.{ "q", "kw", "comp", "picks", "meta" }, .outputs = &.{"s"}, .source = v41.ATTN_QK_SOURCE, .header = v41.MPP_HEADER, .tg_bytes = 2 * 64 * 64 * 2, .offline = false, .min_gen = 17 };
 const sm_l = metal.Launch{ .name = "dsv41_attn_sm", .inputs = &.{ "s", "picks", "sink", "meta", "scal" }, .outputs = &.{"p"}, .source = v41.ATTN_SM_SOURCE, .tg_bytes = 0, .offline = false, .min_gen = 17 };
 const pv_l = metal.Launch{ .name = "dsv41_attn_pv", .inputs = &.{ "p", "kw", "comp", "picks", "meta", "periods" }, .outputs = &.{"o"}, .source = v41.ATTN_PV_SOURCE, .header = v41.MPP_HEADER, .tg_bytes = 2 * 32 * 128 * 2, .offline = false, .min_gen = 17 };
-const wt_l = launch("dsv41_moe_wt", &.{ "a", "wts" }, &.{"out"}, v41.MOE_WT_SOURCE, "", 0, 1024, false);
 const gu_l = launch("dsv41_moe_gu", moe_gu_ins, &.{"out"}, v41.MOE_GU_SOURCE, v41.MOE_HEADER, 0, 1024, false);
 
 /// The GGUF decode MoE kernels at a routed type, as `gguf.pluginKernel` builds them.
@@ -4453,13 +4420,6 @@ pub fn register(set: *kc.Set) !void {
         .nax = true,
         .served = gather_served,
         .sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "the rotation after the sums rounds in f32; the plain arm proves the sums" },
-    });
-    try kit.add(set, MoeWt, &wt_l, .{}, .{
-        .name = "dsv41 moe_wt (routing weight on a fused gate/up activation)",
-        .accum = .none,
-        .depth = depthOne,
-        .out = .bf16,
-        .served = &.{ .{ .rows = 102, .n = INTER, .k = 1 }, .{ .rows = 7, .n = 64, .k = 1 } },
     });
     inline for (.{ 2, 3, 4 }) |bits| {
         try kit.add(set, MoeGu, &gu_l, .{ .bits = bits }, .{
