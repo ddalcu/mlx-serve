@@ -1390,7 +1390,7 @@ fn draftLogits(sc: *Scope, m: *const Dsv41Model, ds: *const DsparkW, st: ?*const
 
 /// The bytes a load's draft-only head adds (`MLX_SERVE_DSV41_DRAFT_HEAD4`, `MLX_SERVE_DSV41_DRAFT_VOCAB` with a
 /// request's prompt ids at `draft_prompt_max`), for the bill; 0 without DSpark stages.
-pub fn draftHeadBytes(cfg: *const Config, dspark: bool) u64 {
+pub fn draftHeadBytes(cfg: *const Config, dspark: bool, pack_dir: ?[]const u8) u64 {
     if (!dspark) return 0;
     const V: u64 = cfg.vocab_size;
     const d: u64 = cfg.hidden_size;
@@ -1398,7 +1398,8 @@ pub fn draftHeadBytes(cfg: *const Config, dspark: bool) u64 {
     const row8: u64 = d + d / 64 * 4;
     const row4: u64 = d / 2 + d / draft_head4_group * 4;
     const head4 = draftHead4Wanted();
-    const path = env.span(.MLX_SERVE_DSV41_DRAFT_VOCAB) orelse return if (head4) V * row4 else 0;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = draftVocabPath(&buf, pack_dir) orelse return if (head4) V * row4 else 0;
     const k: u64 = draftVocabCount(path) orelse return if (head4) V * row4 else 0;
     var bytes: u64 = k * (if (head4) row4 else row8) + V * r * 2 + k * r * 2 + V * 4 + k * 4;
     if (draftPromptWanted()) {
@@ -1406,6 +1407,20 @@ pub fn draftHeadBytes(cfg: *const Config, dspark: bool) u64 {
         bytes += e * row8 + V * r * 2 + (k + e) * (r * 2 + 4) + V * 4;
     }
     return bytes;
+}
+
+/// A pack's own draft vocabulary, read where MLX_SERVE_DSV41_DRAFT_VOCAB is unset.
+pub const draft_vocab_file = "draft-vocab.txt";
+
+/// The draft vocabulary file a load reads: MLX_SERVE_DSV41_DRAFT_VOCAB's path (empty or 0: none), else the pack's
+/// `draft_vocab_file` where it has one; null: the drafts score every id.
+pub fn draftVocabPath(buf: []u8, pack_dir: ?[]const u8) ?[]const u8 {
+    if (env.span(.MLX_SERVE_DSV41_DRAFT_VOCAB)) |v| return if (v.len == 0 or std.mem.eql(u8, v, "0")) null else v;
+    const dir = pack_dir orelse return null;
+    const path = std.fmt.bufPrint(buf, "{s}/" ++ draft_vocab_file, .{dir}) catch return null;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.cwd().access(io, path, .{}) catch return null;
+    return path;
 }
 
 /// How many ids a draft vocabulary file holds, or null where it does not read.
@@ -1423,7 +1438,7 @@ fn draftVocabCount(path: []const u8) ?u64 {
 /// The drafts' own head and tables (`DsparkW.draft`): `head4` (`MLX_SERVE_DSV41_DRAFT_HEAD4`) over the whole vocabulary,
 /// and with a vocabulary file (`MLX_SERVE_DSV41_DRAFT_VOCAB`) the rows of its ids of that head (else of the trunk's)
 /// and of the Markov tables. Null: the drafts read the trunk's head.
-fn draftHeadFor(m: *Dsv41Model, w: *Weights, head4: ?Lin, vocab_path: ?[:0]const u8) !?DraftHead {
+fn draftHeadFor(m: *Dsv41Model, w: *Weights, head4: ?Lin, vocab_path: ?[]const u8) !?DraftHead {
     const path = vocab_path orelse return if (head4) |h| .{ .head = h, .head4 = true } else null;
     const V = m.vocab;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -2600,7 +2615,8 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
             .markov_head = if (getOpt(w, "mtp.{d}.markov_head.markov_w2.weight", .{last}) != null) try ownDense(m, w, rank, "mtp.{d}.markov_head.markov_w2", .{last}, m.act) else try ownDense(m, w, rank, "mtp.{d}.markov_head.head", .{last}, m.act),
             .conf = try ownDense(m, w, cfg.hidden_size + rank, "mtp.{d}.confidence_head.proj", .{last}, .float32),
         };
-        m.dspark.?.draft = try draftHeadFor(m, w, draft_head4, env.span(.MLX_SERVE_DSV41_DRAFT_VOCAB));
+        var vbuf: [std.fs.max_path_bytes]u8 = undefined;
+        m.dspark.?.draft = try draftHeadFor(m, w, draft_head4, draftVocabPath(&vbuf, opts.pack_dir));
         m.n_mtp = n_stages;
         if (env.get(.DSPARK_PROFILE) != null) m.ds_prof = .{};
         m.ds_block = cfg.dsv4_dspark_block_size;
@@ -13621,4 +13637,31 @@ test "dsv41 draft vocabulary: a vocabulary's rows widen to every id, -inf past t
     const ninf = -std.math.inf(f32);
     std.debug.print("[draft vocab] widened {any}\n", .{got});
     try std.testing.expectEqualSlices(f32, &.{ 10, ninf, 12, 13, ninf, 15, 20, ninf, 22, 23, ninf, 25 }, got);
+}
+
+test "dsv41 draft vocabulary: the env path, else the pack's draft-vocab.txt where it has one, else none" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dbuf: [512]u8 = undefined;
+    const dir = dbuf[0..try tmp.dir.realPath(io, &dbuf)];
+    var buf: [1024]u8 = undefined;
+    const unset = env.override(.MLX_SERVE_DSV41_DRAFT_VOCAB, null);
+    defer unset.restore();
+    try std.testing.expect(draftVocabPath(&buf, dir) == null);
+    try std.testing.expect(draftVocabPath(&buf, null) == null);
+    try tmp.dir.writeFile(io, .{ .sub_path = draft_vocab_file, .data = "1 2 3 4\n" });
+    const got = draftVocabPath(&buf, dir) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.endsWith(u8, got, "/" ++ draft_vocab_file));
+    try std.testing.expectEqual(@as(?u64, 4), draftVocabCount(got));
+    {
+        const off = env.override(.MLX_SERVE_DSV41_DRAFT_VOCAB, "0");
+        defer off.restore();
+        try std.testing.expect(draftVocabPath(&buf, dir) == null);
+    }
+    {
+        const other = env.override(.MLX_SERVE_DSV41_DRAFT_VOCAB, "/elsewhere/ids.txt");
+        defer other.restore();
+        try std.testing.expectEqualStrings("/elsewhere/ids.txt", draftVocabPath(&buf, dir).?);
+    }
 }

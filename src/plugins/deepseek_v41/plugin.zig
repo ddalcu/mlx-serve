@@ -822,7 +822,7 @@ fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, settings_json: abi.St
     if (mx_view.on()) out.* -|= mx_view.savedBytes(gpa, model_dir.slice(), dsv41.dsparkWanted(config.of(p), null, mtp)) catch |e| return Verdict.named(.failed, @errorName(e));
     out.* += bill_mod.pfTrunkBytes(config.of(p));
     out.* += engram_kvc.billBytes(config.of(p).dsv41_n_engram_layers);
-    out.* += dsv41.draftHeadBytes(config.of(p), dsv41.dsparkWanted(config.of(p), null, mtp));
+    out.* += dsv41.draftHeadBytes(config.of(p), dsv41.dsparkWanted(config.of(p), null, mtp), model_dir.slice());
     return .ok;
 }
 
