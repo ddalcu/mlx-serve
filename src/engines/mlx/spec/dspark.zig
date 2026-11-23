@@ -262,7 +262,8 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     else
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &d, cap);
     self.dspark_stats.record(@intCast(d.len), round.accepted);
-    const wall_ms = @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms);
+    // `MLX_SERVE_DSV41_SPEC_SYNC`: the round's own draft and verify (the next round's draft, built here, is its).
+    const wall_ms = @max(0, @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms) - dsv41_mod.takeRoundShiftMs(mdl));
     if (pol.p2) |*p| {
         p.learn(d.confidence[0..drafted], d.len, round.accepted, nextDecides(&d, drafted, round.accepted, round.next_token, self.dspark_stochastic));
         p.roundDone(pol.plain.ms, d.len + 1, round.tokens.len, wall_ms);
