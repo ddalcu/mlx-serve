@@ -102,6 +102,16 @@ fn launchRows(sc: *dsv41.Scope, t: Table, rows: usize, codes: A, tsc: A, ids: A,
 }
 
 pub const SLOTS_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_engram_kv_slots.metal");
+/// The reads, and the slot kernel's two-sum: `s` the rounded sum, `e` its exact error (MLX's Safe math mode keeps
+/// the operations as written).
+pub const SLOTS_HEADER = HEADER ++
+    \\inline float2 dsv41_two_sum(float a, float b) {
+    \\  const float s = a + b;
+    \\  const float bb = s - a;
+    \\  return float2(s, (a - (s - bb)) + (b - bb));
+    \\}
+    \\
+;
 /// The slot kernel reading and filling the contribution cache (`engram_kvc.zig`).
 pub const SLOTS_KVC_SOURCE = "#define KVC 1\n" ++ SLOTS_SOURCE;
 pub const SLOTS_KVC_INS = INS ++ [_][*:0]const u8{ "plan", "vals" };
@@ -129,9 +139,9 @@ pub fn launchSlots(sc: *dsv41.Scope, t: Table, codes: A, tsc: A, ids: A, geo: A,
     if (cache) |c| if (!is(c.plan, .uint32, &.{K / t.hd}) or mlx.mlx_array_dtype(c.vals) != .float32 or mlx.getShape(c.vals).len != 2 or dims(c.vals, 1) != N) return null;
     const v: usize = @intFromBool(cache != null);
     if (slots_kernel[v] == null) slots_kernel[v] = try if (cache != null)
-        dsv41.buildKernel("dsv41_dec_engram_kv_slots_kvc", &SLOTS_KVC_INS, &.{"kv"}, SLOTS_KVC_SOURCE, HEADER)
+        dsv41.buildKernel("dsv41_dec_engram_kv_slots_kvc", &SLOTS_KVC_INS, &.{"kv"}, SLOTS_KVC_SOURCE, SLOTS_HEADER)
     else
-        dsv41.buildKernel("dsv41_dec_engram_kv_slots", &INS, &.{"kv"}, SLOTS_SOURCE, HEADER);
+        dsv41.buildKernel("dsv41_dec_engram_kv_slots", &INS, &.{"kv"}, SLOTS_SOURCE, SLOTS_HEADER);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, ci(N) }, 2, .bfloat16));
@@ -222,18 +232,21 @@ fn e2m1Int(c: u32) u32 {
 const e4m3_int = [_]u8{ 0x00, 0x38, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58 };
 
 const K_ = struct {
-    pub const Params = struct { tb: usize = 4 };
+    /// `f32_out`: the sums as f32, not the served bf16; `spread`: random scales over the range real tables and wkv
+    /// span (the float64 distance test).
+    pub const Params = struct { tb: usize = 4, f32_out: bool = false, spread: bool = false };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows < 1 or s.rows > decode.max_rows or s.k == 0 or s.k % chunk != 0 or s.n == 0 or s.n % cols != 0) return null;
         var g = metal.Geometry{ .grid = .{ ci(threads * (s.n / cols)), 1, 1 }, .tg = .{ threads, 1, 1 } };
-        g.out(&.{ ci(s.rows), ci(s.n) }, .bfloat16);
+        const dt: mlx.mlx_dtype = if (p.f32_out) .float32 else .bfloat16;
+        g.out(&.{ ci(s.rows), ci(s.n) }, dt);
         g.int("R", s.rows);
         g.int("K", s.k);
         g.int("N", s.n);
         g.int("HD", HD);
         g.int("TB", p.tb);
-        g.dtype("T", .bfloat16);
+        g.dtype("T", dt);
         return g;
     }
 
@@ -283,6 +296,10 @@ const K_ = struct {
             .random, .nonfinite => {
                 for (0..R) |r| packRow(tb, codes, tsc, r, K, null, null, rng);
                 try moe_fp4.fillShared(rng, w, wsc, N, K, f, perm, k.scratch());
+                if (k.p.spread) {
+                    for (tsc) |*v| v.* = @floatFromInt(112 + rng.uintLessThan(u32, 24));
+                    for (wsc) |*v| v.* = @floatFromInt(112 + rng.uintLessThan(u32, 16));
+                }
                 // A NaN weight (e4m3 0x7f, MLX's NaN code) on every fifth output row: its outputs are NaN for every row of x.
                 if (f == .nonfinite) {
                     var n: usize = 1;
@@ -371,17 +388,18 @@ const K_ = struct {
 /// The slot kernel (`launchSlots`): one row of x (a gate's rows read as 1), K_'s values and reference; with `kvc`
 /// every slot a cache miss stored into its own entry of `vals` (bound, written in place), the cache's computing arm.
 const KS = struct {
-    pub const Params = struct { tb: usize = 4, kvc: bool = false };
+    pub const Params = struct { tb: usize = 4, kvc: bool = false, f32_out: bool = false, spread: bool = false };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or s.k == 0 or s.k % 512 != 0 or s.n == 0 or s.n % slot_cols != 0) return null;
         var g = metal.Geometry{ .grid = .{ ci(threads * (s.n / slot_cols)), 1, 1 }, .tg = .{ threads, 1, 1 } };
-        g.out(&.{ 1, ci(s.n) }, .bfloat16);
+        const dt: mlx.mlx_dtype = if (p.f32_out) .float32 else .bfloat16;
+        g.out(&.{ 1, ci(s.n) }, dt);
         g.int("K", s.k);
         g.int("N", s.n);
         g.int("HD", HD);
         g.int("TB", p.tb);
-        g.dtype("T", .bfloat16);
+        g.dtype("T", dt);
         return g;
     }
 
@@ -461,8 +479,8 @@ fn depth(s: Shape) usize {
 }
 
 const kv_l = cv.launch("dsv41_dec_engram_kv", &INS, &.{"kv"}, SOURCE, HEADER, 4 * decode.max_rows * chunk, threads, false);
-const slots_l = cv.launch("dsv41_dec_engram_kv_slots", &INS, &.{"kv"}, SLOTS_SOURCE, HEADER, 2 * 6144, threads, false);
-const slots_kvc_l = cv.launch("dsv41_dec_engram_kv_slots_kvc", &SLOTS_KVC_INS, &.{"kv"}, SLOTS_KVC_SOURCE, HEADER, 2 * 6144, threads, false);
+const slots_l = cv.launch("dsv41_dec_engram_kv_slots", &INS, &.{"kv"}, SLOTS_SOURCE, SLOTS_HEADER, 2 * 6144, threads, false);
+const slots_kvc_l = cv.launch("dsv41_dec_engram_kv_slots_kvc", &SLOTS_KVC_INS, &.{"kv"}, SLOTS_KVC_SOURCE, SLOTS_HEADER, 2 * 6144, threads, false);
 const rows_l = cv.launch("dsv41_engram_rows", &ROWS_INS, &.{"out"}, ROWS_SOURCE, HEADER, 0, rows_threads, false);
 
 /// Served shapes cut the output width to a few threadgroups (each runs the same code at its own rows); the reduction
@@ -549,4 +567,97 @@ test "dsv41 dec engram_kv slots: the contract's launch is the wrapper's, byte fo
         const theirs = try c.rig.bytesOf(&.{y});
         try std.testing.expectEqualSlices(u8, mine, theirs);
     };
+}
+
+/// Squared error, squared reference and largest absolute error of a launch's [1, N] output (f32 or bf16) against
+/// float64 `want`, added into `acc`.
+const Dist = struct {
+    se: f64 = 0,
+    ss: f64 = 0,
+    max: f64 = 0,
+
+    fn add(d: *Dist, got: []const u8, f32_out: bool, want: []const f64) void {
+        for (want, 0..) |w, n| {
+            const g: f64 = if (f32_out) @as(f32, @bitCast(std.mem.readInt(u32, got[4 * n ..][0..4], .little))) else @as(f32, @bitCast(@as(u32, std.mem.readInt(u16, got[2 * n ..][0..2], .little)) << 16));
+            d.se += (g - w) * (g - w);
+            d.ss += w * w;
+            d.max = @max(d.max, @abs(g - w));
+        }
+    }
+
+    fn l2(d: Dist) f64 {
+        return @sqrt(d.se / d.ss);
+    }
+
+    /// No farther from float64 than `o`, in both measures.
+    fn within(d: Dist, o: Dist) bool {
+        return d.se <= o.se and d.max <= o.max;
+    }
+};
+
+test "dsv41 dec engram_kv slots: no farther from float64 than the served rows kernel at the release's decode row (N 25600, K 6144, mxfp4 and mxfp8 table rows, narrow and spread scales), l2 and max, on the f32 sums and the served bf16 output; a planted coarser sum fails" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const shape: Shape = .{ .rows = 1, .n = 25600, .k = 6144 };
+    var e4m3: [256]f64 = undefined;
+    for (&e4m3, 0..) |*v, b| v.* = kc.host.e4m3(@intCast(b));
+    var near = true;
+    var plant_caught = true;
+    for ([_]bool{ false, true }) |spread| for ([_]usize{ 4, 8 }) |tb| {
+        // [out][kernel]: out 0 the f32 sums, 1 the bf16 output; kernel 0 rows, 1 slots, 2 the plant.
+        var d: [2][3]Dist = @splat(@splat(.{}));
+        for (0..2) |seed| {
+            var c = kit.Case(K_).init(a, &kv_l, .{ .tb = tb, .spread = spread });
+            defer c.deinit();
+            try std.testing.expect(try c.prepare(shape, .random, 0xF64 + seed));
+            const K = shape.k;
+            const x = try a.alloc(f64, K);
+            defer a.free(x);
+            for (x, 0..) |*v, i| v.* = K_.xAt(&c, 0, i);
+            const want = try a.alloc(f64, shape.n);
+            defer a.free(want);
+            const words = c.in(4);
+            const exps = c.in(5);
+            for (want, 0..) |*o, n| {
+                var acc: f64 = 0;
+                for (0..K / 32) |g| {
+                    const sc = std.math.ldexp(@as(f64, 1), @as(i32, @intFromFloat(exps[n * (K / 32) + g])) - 127);
+                    for (0..8) |q| {
+                        const wd: u32 = @intFromFloat(words[n * (K / 4) + g * 8 + q]);
+                        for (0..4) |b| acc += x[g * 32 + q * 4 + b] * e4m3[(wd >> @intCast(8 * b)) & 0xff] * sc;
+                    }
+                }
+                o.* = acc;
+            }
+            for ([_]bool{ true, false }, 0..) |f32_out, oi| {
+                try c.rig.launch(&kv_l, K_.geometry(.{ .tb = tb, .f32_out = f32_out }, shape).?, c.args[0..6]);
+                d[oi][0].add(c.rig.outputBytes(), f32_out, want);
+                try c.rig.launch(&slots_l, KS.geometry(.{ .tb = tb, .f32_out = f32_out }, shape).?, c.args[0..6]);
+                const got = try a.dupe(u8, c.rig.outputBytes());
+                defer a.free(got);
+                d[oi][1].add(got, f32_out, want);
+                // The plant: the slot kernel's sums kept to 15 mantissa bits (f32), or cut to bf16 toward zero.
+                if (f32_out) {
+                    for (0..shape.n) |n| std.mem.writeInt(u32, got[4 * n ..][0..4], std.mem.readInt(u32, got[4 * n ..][0..4], .little) & 0xFFFFFF00, .little);
+                    d[0][2].add(got, true, want);
+                } else {
+                    try c.rig.launch(&slots_l, KS.geometry(.{ .tb = tb, .f32_out = true }, shape).?, c.args[0..6]);
+                    const f = c.rig.outputBytes();
+                    const cut = try a.alloc(u8, 2 * shape.n);
+                    defer a.free(cut);
+                    for (0..shape.n) |n| std.mem.writeInt(u16, cut[2 * n ..][0..2], @truncate(std.mem.readInt(u32, f[4 * n ..][0..4], .little) >> 16), .little);
+                    d[1][2].add(cut, false, want);
+                }
+            }
+        }
+        const data = if (spread) "spread scales" else "narrow scales";
+        for ([_][]const u8{ "f32 sums", "bf16 output" }, d) |what, row| std.debug.print("[engram-kv f64] {s} tb {d} {s}: rows kernel l2 {e:.4} max {e:.4}; slot kernel l2 {e:.4} max {e:.4}; plant l2 {e:.4} max {e:.4}\n", .{ data, tb, what, row[0].l2(), row[0].max, row[1].l2(), row[1].max, row[2].l2(), row[2].max });
+        for (d) |row| {
+            near = near and row[1].within(row[0]);
+            // A plant on sums the rows kernel gets exact is caught by any error at all.
+            plant_caught = plant_caught and !row[2].within(row[0]);
+        }
+    };
+    try std.testing.expect(near);
+    try std.testing.expect(plant_caught);
 }
