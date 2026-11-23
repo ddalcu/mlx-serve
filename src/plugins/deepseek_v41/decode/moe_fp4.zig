@@ -32,15 +32,22 @@ pub const Kernels = struct {
     up: mlx.mlx_fast_metal_kernel,
     down: mlx.mlx_fast_metal_kernel,
     down_rows: mlx.mlx_fast_metal_kernel,
+    /// `down` on the column-major grid (`MLX_SERVE_DSV41_MOE_DOWN_ORDER`).
+    down_order: mlx.mlx_fast_metal_kernel,
     lim: A,
 
     pub fn deinit(self: Kernels) void {
         _ = mlx.mlx_fast_metal_kernel_free(self.up);
         _ = mlx.mlx_fast_metal_kernel_free(self.down);
         _ = mlx.mlx_fast_metal_kernel_free(self.down_rows);
+        _ = mlx.mlx_fast_metal_kernel_free(self.down_order);
         _ = mlx.mlx_array_free(self.lim);
     }
 };
+
+const ORDER_HEADER = "#define DSV41_DOWN_ORDER 1\n" ++ HEADER;
+/// The planted control: the row read off the row-major grid's index while the column block is column major's.
+const ORDER_PLANT_HEADER = "#define DSV41_DOWN_ORDER 1\n#define DSV41_DOWN_ORDER_PLANT 1\n" ++ HEADER;
 
 pub fn build(limit: f32) !Kernels {
     const up = try dsv41.buildKernel("dsv41_dec_moe_fp4_up", &UP_INS, &.{"out"}, UP_SOURCE, HEADER);
@@ -48,7 +55,21 @@ pub fn build(limit: f32) !Kernels {
     const down = try dsv41.buildKernel("dsv41_dec_moe_fp4_down", &DOWN_INS, &.{"out"}, DOWN_SOURCE, HEADER);
     errdefer _ = mlx.mlx_fast_metal_kernel_free(down);
     const down_rows = try dsv41.buildKernel("dsv41_dec_moe_fp4_down_rows", &DOWN_INS, &.{"out"}, DOWN_ROWS_SOURCE, ROWS_HEADER);
-    return .{ .up = up, .down = down, .down_rows = down_rows, .lim = mlx.mlx_array_new_data(&[_]f32{limit}, &[_]c_int{1}, 1, .float32) };
+    errdefer _ = mlx.mlx_fast_metal_kernel_free(down_rows);
+    const down_order = try dsv41.buildKernel("dsv41_dec_moe_fp4_down_order", &DOWN_INS, &.{"out"}, DOWN_SOURCE, ORDER_HEADER);
+    return .{ .up = up, .down = down, .down_rows = down_rows, .down_order = down_order, .lim = mlx.mlx_array_new_data(&[_]f32{limit}, &[_]c_int{1}, 1, .float32) };
+}
+
+/// `MLX_SERVE_DSV41_MOE_DOWN_ORDER` (read each call): =1 a verify's down launch of `order_min_rows` rows or more runs
+/// its threadgroups column block major, a block's rows adjacent; one row is the same launch either way.
+var order_logged: std.atomic.Value(bool) = .init(false);
+
+/// The layers ubench (nvfp4 with per-expert scales, against the control's levers): 2 rows +0.3% a layer, 3 rows -0.15%,
+/// 4..6 rows -0.8% to -2.1%.
+pub const order_min_rows = 3;
+
+pub fn orderOn() bool {
+    return env.on(.MLX_SERVE_DSV41_MOE_DOWN_ORDER);
 }
 
 /// ModelOpt's per-expert scales of an NVFP4 bank (`modelopt_pack.buildBanks`), each `[E]` in the stream's dtype: the
@@ -256,13 +277,21 @@ pub fn runDownRows(sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, f: fp4.For
 
 /// The down launch over arrays already checked.
 pub fn runDown(sc: *dsv41.Scope, kern: Kernels, f: fp4.Format, R: usize, K: usize, N: usize, topk: usize, hc: usize, nc: usize, act: A, w: A, scales: A, sw: A, sscales: A, idx: A, x1: A, post: A, comb: A) !A {
+    const order = R >= order_min_rows and orderOn();
+    if (order and !order_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info("[dsv41] MLX_SERVE_DSV41_MOE_DOWN_ORDER engaged\n", .{});
+    return launchDown(sc, if (order) kern.down_order else kern.down, order, f, R, K, N, topk, hc, nc, act, w, scales, sw, sscales, idx, x1, post, comb);
+}
+
+/// `runDown` on `down` (a down pipeline), its grid row major or (`order`, the `DSV41_DOWN_ORDER` pipelines) column
+/// block major.
+fn launchDown(sc: *dsv41.Scope, down: mlx.mlx_fast_metal_kernel, order: bool, f: fp4.Format, R: usize, K: usize, N: usize, topk: usize, hc: usize, nc: usize, act: A, w: A, scales: A, sw: A, sscales: A, idx: A, x1: A, post: A, comb: A) !A {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     const shape = [_]c_int{ ci(R), ci(hc), ci(N) };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, shape.len, .bfloat16));
     const lv = Levers.fromEnv();
     const tg = 32 * (topk + 1);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(N / nc * tg), ci(R), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(N / nc * tg * (if (order) R else 1)), if (order) 1 else ci(R), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
     inline for (.{ .{ "K", K }, .{ "N", N }, .{ "TOPK", topk }, .{ "HC", hc }, .{ "NC", nc }, .{ "GS", f.group() } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "FR", fp4Reads()));
@@ -273,7 +302,7 @@ pub fn runDown(sc: *dsv41.Scope, kern: Kernels, f: fp4.Format, R: usize, K: usiz
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern.down, iv, cfg, sc.s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, down, iv, cfg, sc.s));
     var o = mlx.mlx_array_new();
     return try sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
 }
@@ -1036,6 +1065,49 @@ test "dsv41 dec moe_fp4: down over mxfp4 experts, rows 1 2 4 6, against today's 
     };
 }
 
+test "dsv41 dec moe_fp4: the column-major down grid gives the row-major launch's bytes at R = 2..6; its planted column bug fails" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const fx = try fp4Fixture(gpa);
+    defer fx.deinit();
+    const m = fx.m;
+    const ly = fx.layer(20);
+    const kern = try build(m.cfg.dsv4_swiglu_limit);
+    defer kern.deinit();
+    const plant = try dsv41.buildKernel("dsv41_dec_moe_fp4_down_order_plant", &DOWN_INS, &.{"out"}, DOWN_SOURCE, ORDER_PLANT_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(plant);
+    var prng = std.Random.DefaultPrng.init(0xd05);
+    const topk = ly.top_k;
+    const inter = m.cfg.moe_intermediate_size;
+    const hc = m.cfg.dsv4_hc_mult;
+    const down = if (ly.experts.views) |v| v[1] else ly.experts.down;
+    const f = fp4.of(down.qp.mode, down.qp.group_size).?;
+    const K = inter;
+    const N: usize = m.cfg.hidden_size;
+    const nc = downCols(K, N, hc).?;
+    for (2..decode.max_rows + 1) |rows| for ([_]moe_up.Routing{ .random, .shared_all, .disjoint }) |how| {
+        var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const act = try sc.keep(try fx.normal(&.{ ci(rows), ci(topk + 1), ci(inter) }, .bfloat16, 0, 0.5));
+        var ids: [64]u32 = undefined;
+        var ws: [64]f32 = undefined;
+        moe_up.route(prng.random(), how, rows, topk, 16, &ids, &ws);
+        const idx = try sc.keep(mlx.mlx_array_new_data(&ids, &[_]c_int{ ci(rows), ci(topk) }, 2, .uint32));
+        const x1 = try sc.keep(try fx.stream(rows));
+        const post = try sc.keep(try fx.uniform(&.{ ci(rows), ci(hc) }, 0.05, 1.5));
+        const comb = try sc.keep(try fx.uniform(&.{ ci(rows), ci(hc), ci(hc) }, -0.5, 0.5));
+        const sh = &ly.shared[2];
+        const want = try moe_up.bitsOf(try launchDown(&sc, kern.down, false, f, rows, K, N, topk, hc, nc, act, down.w, down.s, sh.w, sh.s, idx, x1, post, comb));
+        defer gpa.free(want);
+        const got = try moe_up.bitsOf(try launchDown(&sc, kern.down_order, true, f, rows, K, N, topk, hc, nc, act, down.w, down.s, sh.w, sh.s, idx, x1, post, comb));
+        defer gpa.free(got);
+        try testing.expectEqualSlices(u16, want, got);
+        const bad = try moe_up.bitsOf(try launchDown(&sc, plant, true, f, rows, K, N, topk, hc, nc, act, down.w, down.s, sh.w, sh.s, idx, x1, post, comb));
+        defer gpa.free(bad);
+        try testing.expect(!std.mem.eql(u16, want, bad));
+    };
+}
+
 test "dsv41 dec moe_fp4: formats and shapes it does not serve are declined" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -1100,7 +1172,7 @@ test "dsv41 dec moe_fp4: the declared launches are the wrappers', byte for byte 
             var sc = dsv41.Scope.init(a, c.rig.stream());
             defer sc.deinit();
             const es: Scales = if (p.scaled) .{ .gate = c.args[8], .up = c.args[9], .down = c.args[10] } else .{};
-            const theirs = try runUp(&sc, .{ .up = kern.up, .down = kern.down, .down_rows = kern.down_rows, .lim = c.args[7] }, f, rows, 2048, 9, TOPK, c.args[0], c.args[1], c.args[2], c.args[3], c.args[4], c.args[5], c.args[6], es);
+            const theirs = try runUp(&sc, .{ .up = kern.up, .down = kern.down, .down_rows = kern.down_rows, .down_order = kern.down_order, .lim = c.args[7] }, f, rows, 2048, 9, TOPK, c.args[0], c.args[1], c.args[2], c.args[3], c.args[4], c.args[5], c.args[6], es);
             try testing.expectEqualSlices(u8, try c.rig.bytesOf(&.{theirs}), mine);
         }
         if (p.scaled) continue;
