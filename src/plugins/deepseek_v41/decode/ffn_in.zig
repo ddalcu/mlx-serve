@@ -2338,6 +2338,10 @@ test "dsv41 dec ffn_in: MLX_SERVE_DSV41_FFN_IN_R5_COLS1=1, launch 1 at 5 rows on
         const p: Dims = .{ .rows = rows, .d = fx.m.cfg.hidden_size, .e = @intCast(mlx.getShape(cs.ly.gate_w)[0]), .top_k = cs.ly.top_k, .iters = fx.m.cfg.dsv4_hc_sinkhorn_iters, .norm = fx.m.cfg.moe_route_norm and cs.ly.top_k > 1 };
         var ov = env.override(.MLX_SERVE_DSV41_GEMV_R26_FFN_IN, "0");
         defer ov.restore();
+        // The reference is the two-column plan (=0); the switch is on by default.
+        var o0 = env.override(.MLX_SERVE_DSV41_FFN_IN_R5_COLS1, "0");
+        defer o0.restore();
+        try std.testing.expectEqual(@as(usize, 2), aCols(5));
         const served = try launchA(&sc, ks, p, cs.w, oa, x, &sa);
         const one = blk: {
             var o1 = env.override(.MLX_SERVE_DSV41_FFN_IN_R5_COLS1, "1");

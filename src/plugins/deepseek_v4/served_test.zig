@@ -1060,6 +1060,9 @@ test "deepseek_v41 served: DSpark rounds (greedy, then seeded sampling) equal th
     defer arena.deinit();
     const files = try fixture.v41DsparkFiles(arena.allocator(), 7);
     try expectDspark(@import("../deepseek_v41/plugin.zig"), files, .{ .temperature = 0 }, 4, @embedFile("../deepseek_v41/fixtures/dspark-greedy.tape"));
+    // The sampled tape records the legacy shell's one-hot acceptance of argmax drafts (DRAFT_SAMPLE=0).
+    const one_hot = env.override(.MLX_SERVE_DSV41_DRAFT_SAMPLE, "0");
+    defer one_hot.restore();
     try expectDspark(@import("../deepseek_v41/plugin.zig"), files, .{ .temperature = 0.8, .top_p = 0.95, .seed = 4 }, 4, @embedFile("../deepseek_v41/fixtures/dspark-sampled.tape"));
 }
 

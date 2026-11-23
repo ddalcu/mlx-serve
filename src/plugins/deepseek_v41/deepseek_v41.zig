@@ -8330,7 +8330,7 @@ fn draftRows(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, keep_l
 /// softmax(biased row / T), the distribution its token was drawn from; the caller frees it).
 pub const SampledDraft = struct { d: DsparkDraft, q: A };
 
-/// `MLX_SERVE_DSV41_DRAFT_SAMPLE` (default off, read each round): a sampled request's DSpark rounds draw each draft
+/// `MLX_SERVE_DSV41_DRAFT_SAMPLE` (default on, read each round): a sampled request's DSpark rounds draw each draft
 /// token from the draft's own distribution and accept it with min(1, p / q).
 pub fn draftSampleOn() bool {
     return env.onUnlessZero(.MLX_SERVE_DSV41_DRAFT_SAMPLE);
