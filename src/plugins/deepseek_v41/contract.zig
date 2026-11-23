@@ -1960,20 +1960,22 @@ const GemvTwin = struct {
 // ── prompt/gate_gemm.zig: the wide router's f32 logits as MLX's fused NAX GEMM over the stored types ──
 
 const GateGemm = struct {
-    pub const Params = struct {};
-    const t = ggemm.tile;
+    /// `bf16`: `gate_gemm.bf16F32` (PF_COMP_BF16, PF_ROUTER_BF16): both operands bf16, the MMA in bf16, at any rows.
+    pub const Params = struct { bf16: bool = false, blocked: bool = false };
 
-    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
-        if (s.rows == 0 or s.n == 0 or s.k == 0 or !ggemm.mlxRegular(@intCast(s.rows), @intCast(s.n), @intCast(s.k))) return null;
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        const t: ggemm.Tile = if (p.bf16) ggemm.bf16_tile else ggemm.tile;
+        if (s.rows == 0 or s.n == 0 or s.k == 0 or (!p.bf16 and !ggemm.mlxRegular(@intCast(s.rows), @intCast(s.n), @intCast(s.k)))) return null;
         const swz: usize = @as(usize, 1) << @intCast(t.swz);
         const tiles_m = (s.rows + t.bm - 1) / t.bm;
         const tiles_n = (s.n + t.bn - 1) / t.bn;
         var g = metal.Geometry{ .grid = .{ ci(tiles_n * swz * 32), ci((tiles_m + swz - 1) / swz * t.wn), ci(t.wm) }, .tg = .{ 32, ci(t.wn), ci(t.wm) } };
         g.out(&.{ ci(s.rows), ci(s.n) }, .float32);
-        g.dtype("T", .float32);
+        g.dtype("T", if (p.bf16) .bfloat16 else .float32);
         g.dtype("TA", act);
-        g.dtype("TB", .float16);
+        g.dtype("TB", if (p.bf16) .bfloat16 else .float16);
         g.dtype("OUT_R", .float32);
+        g.int("KBLK", @intFromBool(p.blocked));
         g.int("BM", t.bm);
         g.int("BN", t.bn);
         g.int("BK", t.bk);
@@ -1990,7 +1992,7 @@ const GateGemm = struct {
         const M = k.shape.rows;
         const K = k.shape.k;
         const x = try k.add(act, &.{ M, K });
-        const w = try k.add(.float16, &.{ k.shape.n, K });
+        const w = try k.add(if (k.p.bf16) .bfloat16 else .float16, &.{ k.shape.n, K });
         kit.uniform(rng, x, -2, 2);
         kit.uniform(rng, w, -2, 2);
         switch (f) {
@@ -2429,6 +2431,28 @@ const MarkovFinal = struct {
 };
 
 // ── the query tail: rope_tail's roped channels alone, [L, H, RD] ──
+
+/// PF_ROPE_PAIRS (kernels/rope_tail_pairs.metal): rope_tail_only's words, a thread a (row, pair) over the heads.
+const RopeTailPairs = struct {
+    pub const Params = RopeTailOnly.Params;
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        const n = s.rows * RD / 2;
+        if (n == 0 or s.n == 0 or s.k < RD or s.k % 2 != 0) return null;
+        var g = metal.Geometry{ .grid = .{ ci(n), 1, 1 }, .tg = .{ ci(@min(n, 256)), 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(s.n), RD }, act);
+        g.int("RD", RD);
+        g.int("HH", s.n);
+        g.dtype("T", act);
+        g.dtype("OT", act);
+        return g;
+    }
+    pub const fill = RopeTailOnly.fill;
+    pub const count = RopeTailOnly.count;
+    pub const compute = RopeTailOnly.compute;
+    pub const check = RopeTailOnly.check;
+    pub const replaced = RopeTailOnly.replaced;
+};
 
 const RopeTailOnly = struct {
     /// `RopeTail`'s (its `fill` and `pre` read them).
@@ -4597,6 +4621,9 @@ const gate_gemm_l = metal.Launch{ .name = "dsv41_gate_gemm", .inputs = &.{ "a", 
 const markov_step_l = launch("dsv41_markov_step", &.{ "lg", "emb", "mh", "t1", "pin" }, &.{ "pout", "row" }, markov.step_source, markov.header, 4 * (2 * 8 + 1), 1024, false);
 const markov_final_l = launch("dsv41_markov_final", &.{ "parts", "t1", "hout", "emb", "cw" }, &.{ "toks", "conf" }, markov.final_source, markov.header, 4 * (3 * 16 + 1), 1024, false);
 const flash_l = metal.Launch{ .name = "dsv41_attn_flash", .inputs = &v41.GatherAttn.FLASH_INS, .outputs = &.{"o"}, .source = fa.source, .header = @import("decode/attn.zig").HEADER, .tg_bytes = 4 * 2 * 128 + 4 * 2 * 4 * 4 * 16 + 2 * 4 * 8 * 256, .offline = false, .min_gen = 17 };
+const flash_trim_l = metal.Launch{ .name = "dsv41_attn_flash_trim", .inputs = flash_l.inputs, .outputs = flash_l.outputs, .source = fa.source, .header = fa.header_trim, .tg_bytes = flash_l.tg_bytes, .offline = false, .min_gen = 17 };
+const flash_psum_l = metal.Launch{ .name = "dsv41_attn_flash_psum", .inputs = flash_l.inputs, .outputs = flash_l.outputs, .source = fa.source, .header = fa.header_psum, .tg_bytes = flash_l.tg_bytes, .offline = false, .min_gen = 17 };
+const flash_trim_psum_l = metal.Launch{ .name = "dsv41_attn_flash_trim_psum", .inputs = flash_l.inputs, .outputs = flash_l.outputs, .source = fa.source, .header = fa.header_trim_psum, .tg_bytes = flash_l.tg_bytes, .offline = false, .min_gen = 17 };
 const gather_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 } };
 const qk_t_l = metal.Launch{ .name = "dsv41_attn_qk_t", .inputs = &.{ "q", "kw", "comp", "picks", "meta", "qt" }, .outputs = &.{"s"}, .source = qtail.attn_qk_t_source, .header = v41.MPP_HEADER, .tg_bytes = 2 * 64 * 64 * 2, .offline = false, .min_gen = 17 };
 /// The slicing a variant's contract cases run at.
@@ -4626,6 +4653,7 @@ const mix_norm_l = launch("dsv41_hc_mix_norm", &.{ "x", "fn", "scale", "base", "
 const mix8_l = metal.Launch{ .name = "dsv41_hc_mix", .inputs = &.{ "x", "fn", "scale", "base", "eps" }, .outputs = &.{"z"}, .source = v41.HC_MIX_SOURCE, .header = "", .tg_bytes = 4 * (8 * 6 + 8) * 32, .adapts = true, .min_gen = 17 };
 const mix_norm8_l = metal.Launch{ .name = "dsv41_hc_mix_norm", .inputs = &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, .outputs = &.{ "z", "h_out", "h2" }, .source = hcf.mix_norm_source, .header = "", .tg_bytes = 4 * (8 * 6 + 8) * 32, .adapts = true, .min_gen = 17 };
 const rope_only_l = launch("dsv41_rope_tail_only", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_only_source, "", 0, 1024, false);
+const rope_pairs_l = launch("dsv41_rope_tail_pairs", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_pairs_source, "", 0, 1024, false);
 const kv_l = launch("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, v41.KV_ROW_SOURCE, v41.FP8_HEADER, 4 * (32 + 1024), 1024, false);
 const engram_l = launch("dsv41_engram", &.{ "x", "kv", "qk", "cst" }, &.{"out"}, v41.ENGRAM_SOURCE, "", 4 * (3 * 32 + 1), 928, false);
 const dec_l = launch("dsv41_attn_decode", attn_ins ++ &[_][*:0]const u8{"periods"}, &.{"out"}, v41.ATTN_DEC_SOURCE, v41.UNROPE_HEADER, 4 * (AttnDec.NSG * HD + 2 * AttnDec.NSG), 768, false);
@@ -5107,6 +5135,36 @@ fn registerStreamed(set: *kc.Set) !void {
         .served = gather_served,
         .sums = .{ .exact = false },
     });
+    // FLASH_TRIM's text (FLASH_ATTN's values): the same bound.
+    inline for (.{ true, false }) |qt| try kit.add(set, AttnFlash, &flash_trim_l, .{ .qt = qt }, .{
+        .name = if (qt) "dsv41 attn_flash trim (one launch, f16 weights, max over raw scores, 8-byte stores, the roped tail from qt)" else "dsv41 attn_flash trim (one launch, f16 weights, max over raw scores, 8-byte stores)",
+        .accum = .f32,
+        .depth = kc.host.depthOne,
+        .out = .bf16,
+        .nax = true,
+        .served = gather_served,
+        .sums = .{ .exact = false },
+    });
+    // FLASH_TRIM and FLASH_PSUM together: the same bound.
+    inline for (.{ true, false }) |qt| try kit.add(set, AttnFlash, &flash_trim_psum_l, .{ .qt = qt }, .{
+        .name = if (qt) "dsv41 attn_flash trim+psum (one launch, f16 weights, the roped tail from qt)" else "dsv41 attn_flash trim+psum (one launch, f16 weights)",
+        .accum = .f32,
+        .depth = kc.host.depthOne,
+        .out = .bf16,
+        .nax = true,
+        .served = gather_served,
+        .sums = .{ .exact = false },
+    });
+    // FLASH_PSUM's sums (l over the rounded P): the same bound.
+    inline for (.{ true, false }) |qt| try kit.add(set, AttnFlash, &flash_psum_l, .{ .qt = qt }, .{
+        .name = if (qt) "dsv41 attn_flash psum (one launch, f16 weights, l over the rounded P, the roped tail from qt)" else "dsv41 attn_flash psum (one launch, f16 weights, l over the rounded P)",
+        .accum = .f32,
+        .depth = kc.host.depthOne,
+        .out = .bf16,
+        .nax = true,
+        .served = gather_served,
+        .sums = .{ .exact = false },
+    });
     // The vocabulary cut to 40,000 (129,280 served): the step is vocabulary-generic, and this still gives a simdgroup
     // more quads than one turn.
     try kit.add(set, MarkovStep, &markov_step_l, .{}, .{
@@ -5160,6 +5218,25 @@ fn registerStreamed(set: *kc.Set) !void {
         .nax = true,
         .replaces = "astype f32, MLX's matmul (its regular NAX kernel)",
         .served = &.{ .{ .rows = 256, .n = 384, .k = 512 }, .{ .rows = 100, .n = 384, .k = 768 }, .{ .rows = 77, .n = 200, .k = 300 } },
+    });
+    try kit.add(set, GateGemm, &gate_gemm_l, .{ .bf16 = true }, .{
+        .name = "dsv41 gate_gemm bf16 (the MMA in bf16 over bf16 x and w, f32 out: PF_COMP_BF16's compressor, PF_ROUTER_BF16's router)",
+        .accum = .f32,
+        .depth = depthK,
+        .out = .f32,
+        .nax = true,
+        .replaces = "astype f32, MLX's matmul (TF32 or f32 MMA: the same exact products, reordered sums)",
+        .served = &.{ .{ .rows = 256, .n = 512, .k = 512 }, .{ .rows = 100, .n = 384, .k = 768 }, .{ .rows = 77, .n = 200, .k = 300 } },
+    });
+    try kit.add(set, GateGemm, &gate_gemm_l, .{ .bf16 = true, .blocked = true }, .{
+        .name = "dsv41 gate_gemm bf16 blocked (each BK block's sum apart, then added: PF_COMP_BF16's compressor)",
+        .accum = .f32,
+        .depth = depthK,
+        .out = .f32,
+        .nax = true,
+        // Another order of the same exact products than the split-K chain it replaces (not its bytes): held to the
+        // float64 bound of f32 sums, as an exact-sum kernel.
+        .served = &.{ .{ .rows = 256, .n = 1024, .k = 1024 }, .{ .rows = 100, .n = 384, .k = 768 }, .{ .rows = 77, .n = 200, .k = 300 } },
     });
     try kit.add(set, AttnQkT, &qk_t_l, .{}, .{
         .name = "dsv41 attn_qk_t (prompt width, the heads and their roped tail)",
@@ -5255,6 +5332,15 @@ fn registerStreamed(set: *kc.Set) !void {
     });
     try kit.add(set, RopeTailOnly, &rope_only_l, .{}, .{
         .name = "dsv41 rope_tail_only (the query tail)",
+        .accum = .none,
+        .depth = depthOne,
+        .out = .bf16,
+        .replaces = "rope_tail's roped channels",
+        .nan = quant_nan,
+        .served = &.{ .{ .rows = 1, .n = HEADS, .k = HD }, .{ .rows = REGION, .n = HEADS, .k = HD } },
+    });
+    try kit.add(set, RopeTailPairs, &rope_pairs_l, .{}, .{
+        .name = "dsv41 rope_tail_pairs (PF_ROPE_PAIRS: the query tail a pair a thread over the heads)",
         .accum = .none,
         .depth = depthOne,
         .out = .bf16,
@@ -5378,11 +5464,46 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const y = (try ggemm.router(m.s, r.c.args[0], r.c.args[1], true)).?;
         defer _ = mlx.mlx_array_free(y);
         try Expect.same(r.c, r.bytes, &.{y});
+        const rb = try ours(GateGemm, a, &gate_gemm_l, .{ .bf16 = true }, .{ .rows = 100, .n = 384, .k = 768 });
+        const yb = (try ggemm.bf16F32(m.s, rb.c.args[0], rb.c.args[1], true, .single)).?;
+        defer _ = mlx.mlx_array_free(yb);
+        try Expect.same(rb.c, rb.bytes, &.{yb});
+        const rk = try ours(GateGemm, a, &gate_gemm_l, .{ .bf16 = true, .blocked = true }, .{ .rows = 100, .n = 384, .k = 768 });
+        const yk = (try ggemm.bf16F32(m.s, rk.c.args[0], rk.c.args[1], true, .blocked)).?;
+        defer _ = mlx.mlx_array_free(yk);
+        try Expect.same(rk.c, rk.bytes, &.{yk});
     }
     // The flash kernel as the model launches it (`flashLaunch`, grouped).
     if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
         const r = try ours(AttnFlash, a, &flash_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
         const fk = try v41.buildKernel("dsv41_attn_flash", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, @import("decode/attn.zig").HEADER);
+        defer _ = mlx.mlx_fast_metal_kernel_free(fk);
+        var got: [1]A = .{none};
+        try v41.flashLaunch(&sc, fk, r.c.args[0..9], &.{.{ .shape = &.{ 8, 3, HEADS / 8 * HD }, .dt = act }}, 3, HEADS, qt, act, &got);
+        try Expect.same(r.c, r.bytes, &got);
+    };
+    // FLASH_TRIM's kernel as the model builds and launches it (`fa.header_trim`).
+    if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
+        const r = try ours(AttnFlash, a, &flash_trim_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
+        const fk = try v41.buildKernel("dsv41_attn_flash_trim", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, fa.header_trim);
+        defer _ = mlx.mlx_fast_metal_kernel_free(fk);
+        var got: [1]A = .{none};
+        try v41.flashLaunch(&sc, fk, r.c.args[0..9], &.{.{ .shape = &.{ 8, 3, HEADS / 8 * HD }, .dt = act }}, 3, HEADS, qt, act, &got);
+        try Expect.same(r.c, r.bytes, &got);
+    };
+    // Both switches' kernel as the model builds and launches it (`fa.header_trim_psum`).
+    if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
+        const r = try ours(AttnFlash, a, &flash_trim_psum_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
+        const fk = try v41.buildKernel("dsv41_attn_flash_trim_psum", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, fa.header_trim_psum);
+        defer _ = mlx.mlx_fast_metal_kernel_free(fk);
+        var got: [1]A = .{none};
+        try v41.flashLaunch(&sc, fk, r.c.args[0..9], &.{.{ .shape = &.{ 8, 3, HEADS / 8 * HD }, .dt = act }}, 3, HEADS, qt, act, &got);
+        try Expect.same(r.c, r.bytes, &got);
+    };
+    // FLASH_PSUM's kernel as the model builds and launches it (`fa.header_psum`).
+    if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
+        const r = try ours(AttnFlash, a, &flash_psum_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
+        const fk = try v41.buildKernel("dsv41_attn_flash_psum", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, fa.header_psum);
         defer _ = mlx.mlx_fast_metal_kernel_free(fk);
         var got: [1]A = .{none};
         try v41.flashLaunch(&sc, fk, r.c.args[0..9], &.{.{ .shape = &.{ 8, 3, HEADS / 8 * HD }, .dt = act }}, 3, HEADS, qt, act, &got);

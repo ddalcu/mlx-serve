@@ -1,0 +1,279 @@
+mlx_metal_wide_reserve (mlx-serve, off until a caller arms it): a reserve of large Metal buffers outside MLX's cache.
+The caller arms it with a byte floor and a list of sizes; the buffers are allocated and written once at the call (their
+pages mapped then). An allocation of at least the floor that MLX's cache cannot serve takes the smallest idle reserve
+buffer at least its size (the cache only serves within two pages of the size); its free puts it back. clear_cache and
+the cache limit never release the reserve; disarming (floor 0) releases its idle buffers. Its bytes count as MLX's
+active memory from the arming on, idle or in use, so a budget read from MLX's counters sees them.
+mlx_metal_wide_reserve_stats reads its floor, size and hit counts; mlx_metal_wide_reserve_plant is the tests' planted
+aliasing bug (every hit shares one buffer). MLX_METAL_WIDE_LOG (diagnostic) prints each armed miss. Unarmed, MLX's own
+paths are unchanged (one load and test per allocation and free).
+
+Used by mlx-serve's DeepSeek-V4.1 plugin (MLX_SERVE_DSV41_PF_KEEP_WIDE): a prompt pass's large intermediates, freshly
+allocated by every request's first layer (the engine clears MLX's cache at each request's end), come from the reserve.
+Not reported upstream.
+
+diff --git a/mlx/backend/metal/allocator.cpp b/mlx/backend/metal/allocator.cpp
+index ff12293..08d7484 100644
+--- a/mlx/backend/metal/allocator.cpp
++++ b/mlx/backend/metal/allocator.cpp
+@@ -8,7 +8,10 @@
+ #include <mach/vm_page_size.h>
+ #include <unistd.h>
+ #include <cassert>
++#include <cstdio>
+ #include <cstdlib>
++#include <cstring>
++#include <unordered_set>
+ 
+ namespace mlx::core {
+ 
+@@ -42,6 +45,44 @@ bool can_reuse_alien_buffer(void* ptr) {
+ 
+ namespace metal {
+ 
++namespace {
++
++// The wide reserve (mlx-serve patch mlx-metal-wide-reserve.patch; off until a caller arms it, stock MLX until then).
++// A caller arms it with a byte floor and a list of buffer sizes: those buffers are allocated at once, written once
++// (their pages mapped before the first kernel writes them), and kept in the reserve. A request of at least the floor
++// that MLX's own cache cannot serve takes the smallest idle reserve buffer at least its size (any larger one: the
++// stock cache only hands out a buffer within two pages of the size); its free puts it back in the reserve. The
++// reserve is outside MLX's cache: clear_cache and the cache limit never release it. Disarming (floor 0) releases
++// the idle ones; one still in use leaves the reserve and is freed as any other buffer. Its bytes count as active
++// memory from the arming on, idle or in use (resident, as weights are), so a caller budgeting on MLX's active memory
++// sees them. State under the allocator's mutex; this file's own (the class layout stays the stock one).
++struct WideReserve {
++  size_t min_bytes{0}; // 0: disarmed
++  std::multimap<size_t, MTL::Buffer*> idle;
++  std::unordered_set<MTL::Buffer*> owned;
++  size_t idle_bytes{0};
++  size_t owned_bytes{0};
++  size_t hits{0};
++  size_t misses{0};
++  size_t miss_bytes{0};
++  // The reserve tests' planted control: every hit takes the largest buffer and leaves it idle, so live arrays share it.
++  bool plant_alias{false};
++};
++
++WideReserve& wide() {
++  static WideReserve* w = new WideReserve; // never destroyed, as the allocator
++  return *w;
++}
++
++// MLX_METAL_WIDE_LOG (diagnostic, read once): each armed request of at least the floor that misses both the cache
++// and the reserve prints its size.
++bool wide_log() {
++  static const bool on = std::getenv("MLX_METAL_WIDE_LOG") != nullptr;
++  return on;
++}
++
++} // namespace
++
+ MetalAllocator::MetalAllocator(Device& d)
+     : device_(d.mtl_device()),
+       residency_sets_(d.residency_sets()),
+@@ -128,6 +169,30 @@ Buffer MetalAllocator::malloc(size_t size) {
+   // Try the cache
+   std::unique_lock lk(mutex_);
+   MTL::Buffer* buf = buffer_cache_.reuse_from_cache(size);
++  // Then the wide reserve, when armed: the smallest idle buffer at least the size.
++  auto& w = wide();
++  bool from_reserve = false;
++  if (!buf && w.min_bytes && size >= w.min_bytes) {
++    auto it = w.idle.lower_bound(size);
++    if (w.plant_alias && it != w.idle.end()) {
++      it = std::prev(w.idle.end()); // every hit the same, largest, buffer
++    }
++    if (it != w.idle.end()) {
++      buf = it->second;
++      if (!w.plant_alias) {
++        w.idle_bytes -= it->first;
++        w.idle.erase(it);
++      }
++      w.hits++;
++      from_reserve = true;
++    } else {
++      w.misses++;
++      w.miss_bytes += size;
++      if (wide_log()) {
++        std::fprintf(stderr, "[wide] miss %zu\n", size);
++      }
++    }
++  }
+   if (!buf) {
+     size_t mem_required = get_active_memory() + get_cache_memory() + size;
+ 
+@@ -163,7 +228,10 @@ Buffer MetalAllocator::malloc(size_t size) {
+     }
+   }
+ 
+-  active_memory_ += buf->length();
++  // A reserve buffer's bytes are active since the arming.
++  if (!from_reserve) {
++    active_memory_ += buf->length();
++  }
+   peak_memory_ = std::max(peak_memory_, active_memory_);
+ 
+   // Maintain the cache below the requested limit
+@@ -195,6 +263,15 @@ void MetalAllocator::free(Buffer buffer) {
+ #endif
+ 
+   std::unique_lock lk(mutex_);
++  // A wide reserve buffer goes back to the reserve (its bytes still active), never to the cache.
++  auto& w = wide();
++  if (w.min_bytes && w.owned.count(buf)) {
++    if (!w.plant_alias) {
++      w.idle.emplace(buf->length(), buf);
++      w.idle_bytes += buf->length();
++    }
++    return;
++  }
+   active_memory_ -= buf->length();
+   if (get_cache_memory() < max_pool_size_) {
+     buffer_cache_.recycle_to_cache(buf);
+@@ -209,6 +286,102 @@ void MetalAllocator::free(Buffer buffer) {
+   }
+ }
+ 
++int MetalAllocator::wide_reserve(
++    size_t min_bytes,
++    const size_t* sizes,
++    size_t n) {
++  // Re-arming starts from an empty reserve: the idle buffers released, the ones in use left to the stock free.
++  auto& w = wide();
++  std::vector<MTL::Buffer*> drop;
++  {
++    std::unique_lock lk(mutex_);
++    std::unordered_set<MTL::Buffer*> seen; // the planted mode may list one twice
++    for (auto& [s, b] : w.idle) {
++      if (seen.insert(b).second) {
++        drop.push_back(b);
++      }
++    }
++    w.idle.clear();
++    w.owned.clear();
++    w.idle_bytes = 0;
++    w.owned_bytes = 0;
++    w.hits = 0;
++    w.misses = 0;
++    w.miss_bytes = 0;
++    w.min_bytes = 0;
++    w.plant_alias = false;
++    num_resources_ -= drop.size();
++    for (auto* b : drop) {
++      active_memory_ -= b->length();
++      if (!b->heap()) {
++        residency_sets_.erase(b);
++      }
++    }
++  }
++  {
++    auto pool = metal::new_scoped_memory_pool();
++    for (auto* b : drop) {
++      b->release();
++    }
++  }
++  if (min_bytes == 0) {
++    return 0;
++  }
++  int rc = 0;
++  for (size_t i = 0; i < n; i++) {
++    size_t size = sizes[i];
++    if (size == 0 || size > device_->maxBufferLength()) {
++      rc = -1;
++      continue;
++    }
++    size = vm_page_size * ((size + vm_page_size - 1) / vm_page_size);
++    MTL::Buffer* b = nullptr;
++    {
++      auto pool = metal::new_scoped_memory_pool();
++      b = device_->newBuffer(size, resource_options);
++    }
++    if (!b) {
++      rc = -1;
++      continue;
++    }
++    // Written once: its pages mapped now, not by the first kernel that writes it.
++    std::memset(b->contents(), 0, size);
++    std::unique_lock lk(mutex_);
++    num_resources_++;
++    residency_sets_.insert(b);
++    w.owned.insert(b);
++    w.idle.emplace(b->length(), b);
++    w.idle_bytes += b->length();
++    w.owned_bytes += b->length();
++    active_memory_ += b->length();
++    peak_memory_ = std::max(peak_memory_, active_memory_);
++  }
++  std::unique_lock lk(mutex_);
++  w.min_bytes = min_bytes;
++  return rc;
++}
++
++void MetalAllocator::wide_plant(bool alias) {
++  std::unique_lock lk(mutex_);
++  wide().plant_alias = alias;
++}
++
++void MetalAllocator::wide_stats(size_t* out, size_t n) {
++  auto& w = wide();
++  std::unique_lock lk(mutex_);
++  const size_t v[7] = {
++      w.min_bytes,
++      w.owned.size(),
++      w.owned_bytes,
++      w.idle_bytes,
++      w.hits,
++      w.misses,
++      w.miss_bytes};
++  for (size_t i = 0; i < n && i < 7; i++) {
++    out[i] = v[i];
++  }
++}
++
+ size_t MetalAllocator::size(Buffer buffer) const {
+   return static_cast<MTL::Buffer*>(buffer.ptr())->length();
+ }
+@@ -286,3 +459,27 @@ void clear_cache() {
+ }
+ 
+ } // namespace mlx::core
++
++// The wide reserve's C entry points (mlx-serve looks them up by name: a libmlx without the patch has none).
++// mlx_metal_wide_reserve: arm with a byte floor and the reserve's buffer sizes (floor 0 disarms and releases the
++// idle buffers); 0, or -1 when a size could not be allocated (the others kept).
++// mlx_metal_wide_reserve_stats: floor, buffers, bytes, idle bytes, hits, misses, missed bytes (the first n).
++extern "C" __attribute__((visibility("default"))) int
++mlx_metal_wide_reserve(size_t min_bytes, const size_t* sizes, size_t n) {
++  try {
++    return mlx::core::metal::allocator().wide_reserve(min_bytes, sizes, n);
++  } catch (...) {
++    return -1;
++  }
++}
++
++extern "C" __attribute__((visibility("default"))) void
++mlx_metal_wide_reserve_stats(size_t* out, size_t n) {
++  mlx::core::metal::allocator().wide_stats(out, n);
++}
++
++// The reserve's tests only: every hit shares one buffer (a planted aliasing bug their checks must catch).
++extern "C" __attribute__((visibility("default"))) void
++mlx_metal_wide_reserve_plant(int alias) {
++  mlx::core::metal::allocator().wide_plant(alias != 0);
++}
+diff --git a/mlx/backend/metal/allocator.h b/mlx/backend/metal/allocator.h
+index 8859513..4bfb525 100644
+--- a/mlx/backend/metal/allocator.h
++++ b/mlx/backend/metal/allocator.h
+@@ -41,6 +41,10 @@ class MetalAllocator : public allocator::Allocator {
+   size_t get_memory_limit();
+   size_t set_wired_limit(size_t limit);
+   void clear_cache();
++  // The wide reserve (mlx-serve patch, off until armed): see allocator.cpp.
++  int wide_reserve(size_t min_bytes, const size_t* sizes, size_t n);
++  void wide_stats(size_t* out, size_t n);
++  void wide_plant(bool alias);
+ 
+  private:
+   MTL::Device* device_;
