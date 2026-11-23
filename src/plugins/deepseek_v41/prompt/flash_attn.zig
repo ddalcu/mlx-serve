@@ -49,12 +49,12 @@ pub inline fn ps() *State {
 }
 /// The setting named on itself (`=1`), not by default: a span the kernel cannot take is refused, not the gather's.
 
-pub fn configure(value: ?[]const u8, trim: bool, psum: bool) Error!void {
+pub fn configure(value: ?[]const u8, trim: plan.Trim, psum: bool) Error!void {
     ps().mode = try parse(value);
     ps().explicit = plan.explicitOn(value);
-    ps().trim = trim;
+    ps().trim = trim != .off and ps().mode != .off;
     ps().psum = psum;
-    if (trim and ps().mode == .off) return error.FlashTrimOff;
+    if (trim == .on and ps().mode == .off) return error.FlashTrimOff;
     if (psum and ps().mode == .off) return error.FlashPsumOff;
 }
 
