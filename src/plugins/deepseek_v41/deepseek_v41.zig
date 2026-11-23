@@ -4974,7 +4974,9 @@ pub fn moePrefillParts(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A,
     // The pack's expert count is the down bank's: every layout stacks its experts on axis 0 (a tensor rank holds half of
     // every expert), and a caller that builds the banks alone leaves the router's `gate_w` unset.
     const pack_on = env.onUnlessZero(.MLX_SERVE_DSV41_PF_MOE_EPI) and e.down.w.ctx != null;
-    const sp = (if (pack_on) try pfroute.pack(sc, flat, try sc.reshape(wts, &.{ci(n)}), k, dim(e.down.w, 0)) else null) orelse blk: {
+    const fast = pack_on and pfroute.on();
+    const sp = (if (fast) try pfroute.packFast(sc, flat, try sc.reshape(wts, &.{ci(n)}), k, dim(e.down.w, 0), false) else null) orelse
+        (if (pack_on) try pfroute.pack(sc, flat, try sc.reshape(wts, &.{ci(n)}), k, dim(e.down.w, 0)) else null) orelse blk: {
         var oo = mlx.mlx_array_new();
         const order = try sc.res(mlx.mlx_argsort_axis(&oo, flat, 0, sc.s), &oo);
         var oi = mlx.mlx_array_new();
@@ -5070,6 +5072,13 @@ pub fn routeFrom(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, logits: A, 
     const K = ly.top_k;
     const bias = if (img.ctx != null and ly.gate_bias_vl != null) try sc.where(try sc.expand(img, -1), ly.gate_bias_vl.?, ly.gate_bias) else ly.gate_bias;
     const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.router_scaling_factor}, &[_]c_int{1}, 1, .float32));
+    const norm = m.cfg.moe_route_norm and K > 1;
+    // MLX_SERVE_DSV41_PF_ROUTE_PACK: a prompt's top-6 on a simdgroup a row with `routeScaled`'s down scale
+    // (route.metal's words, then the same product).
+    if (pfroute.on()) if (try pfroute.routeRows(sc, logits, bias, scal, ly.experts.scale[2], K, norm, false)) |o| {
+        if (route_tap) |t| try t.ids.append(t.gpa, sc.out(o[0]));
+        return .{ .idx = o[0], .wts = o[1] };
+    };
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(K) }, 2, .uint32));
@@ -5078,7 +5087,7 @@ pub fn routeFrom(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, logits: A, 
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(tg), ci(L), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", ci(K)));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "NORM", m.cfg.moe_route_norm and K > 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "NORM", norm));
     const iv = mlx.mlx_vector_array_new_data(&[_]A{ logits, bias, scal }, 3);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -12695,6 +12704,45 @@ const CompBench = struct {
     }
 };
 
+/// The router's top-6 and the MoE's route pack as dependent chains (`decode.chainUs`): today's against
+/// MLX_SERVE_DSV41_PF_ROUTE_PACK's, each step held behind the last one's output as the profile's FIFO runs them.
+const RouteBench = struct {
+    const Arm = enum { route_today, route_pack, pack_today, pack_fast };
+    sc: *Scope,
+    m: *Dsv41Model,
+    ly: *const Layer,
+    logits: A,
+    flat: A,
+    wf: A,
+    arm: Arm,
+    last: A = none,
+
+    fn after(b: *RouteBench, x: A) !A {
+        if (b.last.ctx == null) return x;
+        const iv = mlx.mlx_vector_array_new_data(&[_]A{x}, 1);
+        defer _ = mlx.mlx_vector_array_free(iv);
+        const dv = mlx.mlx_vector_array_new_data(&[_]A{b.last}, 1);
+        defer _ = mlx.mlx_vector_array_free(dv);
+        var ov = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ov);
+        try mlx.check(mlx.mlx_depends(&ov, iv, dv));
+        var o = mlx.mlx_array_new();
+        return b.sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+    }
+
+    pub fn step(b: *RouteBench, i: usize) !A {
+        if (i == 0) b.last = none;
+        const k = b.ly.top_k;
+        const experts = dim(b.ly.gate_w, 0);
+        b.last = switch (b.arm) {
+            .route_today, .route_pack => (try routeFrom(b.sc, b.m, b.ly, try b.after(b.logits), none)).wts,
+            .pack_today => (try pfroute.pack(b.sc, try b.after(b.flat), b.wf, k, experts)).?.w,
+            .pack_fast => (try pfroute.packFast(b.sc, try b.after(b.flat), b.wf, k, experts, false)).?.w,
+        };
+        return b.last;
+    }
+};
+
 test "dsv41 pf comp and router bf16: ubench, a layer's compressor projection and router logits over 16,384 rows, the bf16-MMA launch against today's (MLX_SERVE_DSV41_PF_COMP_BF16, MLX_SERVE_DSV41_PF_ROUTER_BF16)" {
     if (!dkern.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
@@ -12728,6 +12776,30 @@ test "dsv41 pf comp and router bf16: ubench, a layer's compressor projection and
             const us = try dkern.idx_score.evalTotalUs(gpa, fx.m.s, b);
             const flop = if (arm == .router_bf16) router_flop else comp_flop;
             std.debug.print("[pf-ubench] {s} tile bm {d} bn {d} bk {d} wm {d} wn {d} swz {d}: {d:.0} us ({d:.1} TFLOPS)\n", .{ @tagName(arm), t.bm, t.bn, t.bk, t.wm, t.wn, t.swz, us, flop / us / 1e6 });
+        }
+    }
+    // The router's top-6 and the route pack at a 17,638-row pass (the profile's p01) and the 128-row replay, 384
+    // experts: today's against MLX_SERVE_DSV41_PF_ROUTE_PACK's. Floors: the top-6 reads the f32 logits (27 MB at
+    // 17,638 rows, 25 us at 1.065 TB/s); the scan reads its histograms twice and writes the offsets (1.9 MB, 2 us).
+    var ly2 = ly.*;
+    ly2.gate_w = gw;
+    ly2.gate_bias = try sc.keep(try fx.normal(&.{ 1, ci(E) }, .float32, 0, 0.3));
+    ly2.top_k = 6;
+    // NVFP4's per-expert down scale, as the served pack routes with it (`routeScaled`).
+    ly2.experts.scale[2] = try sc.astype(try sc.keep(try fx.normal(&.{ci(E)}, .float32, 1, 0.1)), .bfloat16);
+    for ([_]usize{ 17_638, 128 }) |L| {
+        const logits = try sc.keep(try fx.normal(&.{ ci(L), ci(E) }, .float32, 0, 2.5));
+        const r = try routeFrom(&sc, fx.m, &ly2, logits, none);
+        const flat = try sc.reshape(try sc.astype(r.idx, .uint32), &.{ci(L * 6)});
+        const wf = try sc.reshape(r.wts, &.{ci(L * 6)});
+        try evalAll(&.{ logits, flat, wf });
+        var rb: RouteBench = .{ .sc = &sc, .m = fx.m, .ly = &ly2, .logits = logits, .flat = flat, .wf = wf, .arm = .route_today };
+        inline for (.{ RouteBench.Arm.route_today, .route_pack, .pack_today, .pack_fast }) |arm| {
+            const sw = env.override(.MLX_SERVE_DSV41_PF_ROUTE_PACK, if (arm == .route_pack) "1" else "0");
+            defer sw.restore();
+            rb.arm = arm;
+            const us = try dkern.chainUs(&rb, 40);
+            std.debug.print("[pf-ubench] {s} ({d} rows, {d} experts, top-6): {d:.1} us a call\n", .{ @tagName(arm), L, E, us });
         }
     }
 }
