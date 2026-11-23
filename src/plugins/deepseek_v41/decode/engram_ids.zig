@@ -108,6 +108,52 @@ pub fn rows(sc: *Scope, hs: *const engram.Hash, ctx: *const Ctx, hist: []const u
     return sc.astype(row, .uint32);
 }
 
+/// `MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD`: `rows` of each token of `toks` (`[R]`, any integer dtype, on the GPU) after
+/// `hist`, as `Hash.rows` reads a run of R tokens: row j's earlier tokens are toks[j-1], toks[j-2], ... then the
+/// history's (`[R, n_layers * cols]` u32). The history's slots are the host's (pad before the start and at or past a
+/// DEAD one, as `partials`), the tokens' the GPU's; `plant` 1 reads each row's tokens one slot late (the tests').
+pub fn rowsMany(sc: *Scope, hs: *const engram.Hash, ctx: *const Ctx, hist: []const u32, toks: A, plant: u8) !A {
+    const R = mlx.mlx_array_size(toks);
+    const M: usize = hs.max_ngram;
+    if (R == 0 or R > 16) return error.Dsv41EngramRows;
+    // cv: the history's last M - 1 slots (earliest first), then the R tokens' compressed ids.
+    var cv: [engram.MAX_NGRAM]u64 = @splat(0);
+    var blocked = false;
+    for (1..M) |b| {
+        const t: u32 = if (hist.len < b) hs.pad else hist[hist.len - b];
+        blocked = blocked or t == engram.Hash.DEAD;
+        cv[M - 1 - b] = if (blocked) hs.pad else t;
+    }
+    const len: i32 = @intCast(mlx.mlx_array_size(ctx.map));
+    const t = try sc.reshape(try sc.astype(toks, .int32), &.{@intCast(R)});
+    const inside = try sc.op2(mlx.mlx_less, t, try sc.ints(&.{len}, &.{1}));
+    const at = try sc.op2(mlx.mlx_minimum, t, try sc.ints(&.{len - 1}, &.{1}));
+    const zero = try sc.keep(mlx.mlx_array_new_data(&[_]u32{0}, &[_]c_int{1}, 1, .uint32));
+    const comp = try sc.astype(try sc.where(inside, try sc.take(ctx.map, at, 0), zero), .uint64);
+    const all = try sc.concat(&.{ try sc.keep(mlx.mlx_array_new_data(&cv, &[_]c_int{@intCast(M - 1)}, 1, .uint64)), comp }, 0);
+    // Slot s of row j (s = 0: the row's own token) at cv index (M - 1) + j - s.
+    var idx: [16 * engram.MAX_NGRAM]i32 = undefined;
+    for (0..R) |j| for (0..M) |sl| {
+        const s_ = if (plant == 1 and sl > 0) @min(sl + 1, M - 1 + j) else sl;
+        idx[j * M + sl] = @intCast(M - 1 + j - s_);
+    };
+    const tk = try sc.take(all, try sc.keep(mlx.mlx_array_new_data(&idx, &[_]c_int{ @intCast(R), @intCast(M) }, 2, .int32)), 0);
+    // Column c (layer l, n-gram size k + 1, head) XORs slots 0..k, each times its layer's multiplier.
+    const nc = hs.cols();
+    var ms: [engram.MAX_NGRAM * engram.MAX_LAYERS * engram.MAX_COLS]u64 = @splat(0);
+    for (0..M) |sl| for (0..hs.n_layers) |l| for (1..M) |k| for (0..hs.heads) |hd| {
+        if (sl <= k) ms[sl * ctx.n + l * nc + (k - 1) * hs.heads + hd] = hs.mult[l][sl];
+    };
+    const mult = try sc.keep(mlx.mlx_array_new_data(&ms, &[_]c_int{ @intCast(M), @intCast(ctx.n) }, 2, .uint64));
+    var rolling: A = undefined;
+    for (0..M) |sl| {
+        const term = try sc.mul(try sc.slice(tk, 1, sl, sl + 1), try sc.slice(mult, 0, sl, sl + 1));
+        rolling = if (sl == 0) term else try sc.op2(mlx.mlx_bitwise_xor, rolling, term);
+    }
+    const row = try sc.add(try sc.op2(mlx.mlx_remainder, rolling, ctx.primes), ctx.offsets);
+    return sc.astype(row, .uint32);
+}
+
 /// The Engram write of one decode row `x` `[1, hc, dim]` at table `ek` (`e`, wrapped) from the GPU row ids `ids`
 /// (`rows`): the held-table gather and wkv in one launch (`dec_engram_kv`), then the gate. With the step's cache
 /// `plan` (`engram_kvc.Cache.plan`), the slot kernel through the cache. Null where the kernel declines the table.
@@ -314,4 +360,178 @@ test "dsv41 engram gpu ids (resident): the write from the GPU-hashed ids is the 
             try testing.expect(moved > a.len / 2);
         }
     }
+}
+
+test "dsv41 engram gpu ids rows: a run of R = 1..6 GPU tokens hashes to Hash.rows' ids of the run, every history length from 0 (the pad slots), a DEAD slot, a token past the map; a planted slot shift differs (SPEC_ENGRAM_AHEAD)" {
+    if (!gpuOk()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xE1D7);
+    const rng = prng.random();
+    const s = mlx.gpuStream();
+    const vocab = 4096;
+    const map = try gpa.alloc(u32, vocab);
+    defer gpa.free(map);
+    for (map) |*v| v.* = rng.uintLessThan(u32, 1 << 17);
+    var cases: usize = 0;
+    var differ_plant: usize = 0;
+    for (0..4) |round| {
+        var hs = testHash(rng, 1 << 20);
+        // The release hashes 2- to 4-grams: rounds 2 and 3 widen the test hash to it.
+        if (round >= 2) {
+            hs.max_ngram = 4;
+            for (0..hs.n_layers) |l| for (0..hs.max_ngram) |k| {
+                hs.mult[l][k] = rng.uintLessThan(u64, 1 << 47) * 2 + 1;
+            };
+            var p: u64 = (1 << 20) + rng.uintLessThan(u64, 1 << 20);
+            for (0..hs.n_layers) |l| {
+                var off: u64 = 0;
+                for (0..hs.cols()) |c| {
+                    p += 1 + rng.uintLessThan(u64, 1 << 14);
+                    hs.primes[l][c] = p;
+                    hs.offsets[l][c] = off;
+                    off += p;
+                }
+            }
+        }
+        var ctx = try ctxOf(&hs, map);
+        defer ctx.deinit();
+        for (0..10) |len| for (1..7) |R| {
+            const hist = try gpa.alloc(u32, len);
+            defer gpa.free(hist);
+            for (hist) |*v| v.* = rng.uintLessThan(u32, 1 << 17);
+            if (len > 2 and round % 2 == 1) hist[len - 1 - rng.uintLessThan(usize, 2)] = engram.Hash.DEAD;
+            var toks: [6]u32 = undefined;
+            var comp: [6]u32 = undefined;
+            for (toks[0..R], comp[0..R], 0..) |*t, *c, j| {
+                t.* = if (j == 1) vocab + 7 else rng.uintLessThan(u32, vocab);
+                c.* = if (t.* < vocab) map[t.*] else 0;
+            }
+            const want = try gpa.alloc(u32, R * ctx.n);
+            defer gpa.free(want);
+            hs.rows(hist, comp[0..R], want);
+            var sc = Scope.init(gpa, s);
+            defer sc.deinit();
+            const t = try sc.keep(mlx.mlx_array_new_data(&toks, &[_]c_int{@intCast(R)}, 1, .uint32));
+            for ([_]u8{ 0, 1 }) |plant| {
+                const got_a = try rowsMany(&sc, &hs, &ctx, hist, t, plant);
+                try mlx.check(mlx.mlx_array_eval(got_a));
+                try testing.expectEqualSlices(c_int, &.{ @intCast(R), @intCast(ctx.n) }, mlx.getShape(got_a));
+                const got = (mlx.mlx_array_data_uint32(got_a) orelse return error.NoData)[0 .. R * ctx.n];
+                if (plant == 0) {
+                    try testing.expectEqualSlices(u32, want, got);
+                    cases += 1;
+                } else if (!std.mem.eql(u32, want, got)) differ_plant += 1;
+            }
+        };
+    }
+    std.debug.print("[engram-ids] rows: {d} runs equal Hash.rows; the planted shift differs in {d}\n", .{ cases, differ_plant });
+    try testing.expect(differ_plant >= cases * 9 / 10);
+}
+
+test "dsv41 engram gpu ids (resident): a verify's Engram write from the kv made ahead (the GPU-hashed run of t1 and 4 drafts, the wrapped table's rows, wkv over those 5 rows, the first R taken) is the served verify write (host ids, the host-copied rows, wkv over R rows) bit for bit, R = 2..5, mxfp4 and mxfp8 tables; the kv rotated a row differs (SPEC_ENGRAM_AHEAD)" {
+    if (!gpuOk()) return error.SkipZigTest;
+    const fixture = @import("fixture.zig");
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 0, .hi = 1, .ctx = 8, .fused = true });
+    defer fx.deinit();
+    const m = fx.m;
+    const s = mlx.gpuStream();
+    const d = m.cfg.hidden_size;
+    const hc = m.cfg.dsv4_hc_mult;
+    var prng = std.Random.DefaultPrng.init(0xE1D8);
+    const rng = prng.random();
+    const hs = testHash(rng, 300);
+    const nc = hs.cols();
+    const hd: usize = 256;
+    const K = nc * hd;
+    const N = (hc + 1) * d;
+    const ew = try fx.normal(&.{ @intCast(N), @intCast(K) }, .bfloat16, 0, 0.02);
+    defer _ = mlx.mlx_array_free(ew);
+    const eq = try fixture.quantize(ew, 32, 8, "mxfp8");
+    defer for (eq) |q| if (q.ctx != null) {
+        _ = mlx.mlx_array_free(q);
+    };
+    const qk = try fx.normal(&.{ @intCast(hc), @intCast(d) }, .float32, 0.5, 0.2);
+    defer _ = mlx.mlx_array_free(qk);
+    const map = try gpa.alloc(u32, 512);
+    defer gpa.free(map);
+    for (map) |*v| v.* = rng.uintLessThan(u32, 1 << 17);
+    var ctx = try ctxOf(&hs, map);
+    defer ctx.deinit();
+    const n_rows: usize = @intCast(hs.offsets[1][nc - 1] + hs.primes[1][nc - 1]);
+    const B = dsv41.eng_ahead_rows;
+    var served: usize = 0;
+    for ([_]@import("../../../sdk/quant/params.zig").QuantMode{ .mxfp4, .mxfp8 }) |mode| {
+        const bits: u32 = if (mode == .mxfp4) 4 else 8;
+        const wlen = hd * bits / 8;
+        const slen = hd / 32;
+        var e: dsv41.EngramLayer = .{ .layer = 0, .wkv = .{ .w = eq[0], .s = eq[1], .b = eq[2], .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } }, .qk = qk, .table = .{ .fd = -1, .rows = n_rows, .head_dim = @intCast(hd), .mode = mode, .bits = bits, .group_size = 32, .w_off = 0, .w_stride = wlen, .wlen = wlen, .s_off = 0, .s_stride = slen, .slen = slen } };
+        try fusion.heldTable(&e.table, n_rows, if (bits == 4) 4096 + 952 else 4096 + 48, rng);
+        defer for (e.table.held[0..2]) |mem| std.posix.munmap(mem);
+        try testing.expect(fusion.wrapHeld(&e));
+        defer {
+            _ = mlx.mlx_synchronize(s);
+            fusion.unwrap(&e);
+        }
+        const g = e.gpu.?;
+        const page = std.heap.pageSize();
+        const geo: engram_kv.Geo = .{ .w_base = e.table.w_off % page, .w_stride = e.table.w_stride, .s_base = e.table.s_off % page, .s_stride = e.table.s_stride };
+        const gw = geo.words();
+        for (2..B + 1) |R| for (0..2) |ek| {
+            var sc = Scope.init(gpa, s);
+            defer sc.deinit();
+            const hist = try gpa.alloc(u32, 3 + R);
+            defer gpa.free(hist);
+            for (hist) |*v| v.* = rng.uintLessThan(u32, 1 << 17);
+            var toks: [B]u32 = undefined;
+            var comp: [B]u32 = undefined;
+            for (&toks, &comp) |*t, *c| {
+                t.* = rng.uintLessThan(u32, 512);
+                c.* = map[t.*];
+            }
+            // Ahead: the whole block's ids hashed on the GPU, its rows gathered from the wrapped table, wkv over B rows.
+            const ga = try sc.keep(mlx.mlx_array_new_data(&gw, &[_]c_int{6}, 1, .uint32));
+            const t = try sc.keep(mlx.mlx_array_new_data(&toks, &[_]c_int{B}, 1, .uint32));
+            const ids = try rowsMany(&sc, &hs, &ctx, hist, t, 0);
+            const mine = try sc.reshape(try sc.slice(ids, 1, ek * nc, (ek + 1) * nc), &.{@intCast(B * nc)});
+            const block = (try engram_kv.gatherRows(&sc, .{ .hd = hd, .tb = bits }, g[0], g[1], mine, ga)) orelse return error.Declined;
+            const kv = try dsv41.engramWkv(&sc, &e, try sc.reshape(block, &.{ B, -1 }));
+            const x = try sc.keep(try fx.normal(&.{ @intCast(R), @intCast(hc), @intCast(d) }, .bfloat16, 0, 1));
+            const got = try dsv41.engramGate(&sc, m, qk, x, try sc.slice(kv, 0, 0, R));
+            // Planted: the rows rotated one place (each row's kv another token's).
+            const plant = try dsv41.engramGate(&sc, m, qk, x, try sc.concat(&.{ try sc.slice(kv, 0, 1, R), try sc.slice(kv, 0, 0, 1) }, 0));
+            // Served: the verify's R tokens hashed on the host, their rows copied out of the table, dequantized to f32,
+            // engramApply over R rows.
+            const host = try gpa.alloc(u32, R * ctx.n);
+            defer gpa.free(host);
+            hs.rows(hist, comp[0..R], host);
+            const raw: engram.Table.Raw = .{ .w = try gpa.alignedAlloc(u8, .@"4", R * nc * wlen), .s = try gpa.alignedAlloc(u8, .@"4", R * nc * slen), .b = try gpa.alignedAlloc(u8, .@"4", 0) };
+            defer raw.deinit(gpa);
+            for (0..R) |r| for (0..nc) |j| {
+                const id = host[r * ctx.n + ek * nc + j];
+                const i = r * nc + j;
+                @memcpy(raw.w[i * wlen ..][0..wlen], e.table.held[0][e.table.w_off + id * wlen ..][0..wlen]);
+                @memcpy(raw.s[i * slen ..][0..slen], e.table.held[1][e.table.s_off + id * slen ..][0..slen]);
+            };
+            const hrows = try sc.keep(try e.table.dequantTo(raw, R * nc, .float32, s));
+            const want = try dsv41.engramApply(&sc, m, &e, x, try sc.reshape(hrows, &.{ @intCast(R), -1 }));
+            const a = try dsv41.hostF32(got);
+            defer gpa.free(a);
+            const b = try dsv41.hostF32(want);
+            defer gpa.free(b);
+            const p = try dsv41.hostF32(plant);
+            defer gpa.free(p);
+            var differ: usize = 0;
+            var planted: usize = 0;
+            for (a, b, p) |u, v, w| {
+                if (@as(u32, @bitCast(u)) != @as(u32, @bitCast(v))) differ += 1;
+                if (@as(u32, @bitCast(w)) != @as(u32, @bitCast(v))) planted += 1;
+            }
+            std.debug.print("[engram-ahead] {t} R {d} table {d}: {d} of {d} words differ from the served write; the kv rotated a row, {d}\n", .{ mode, R, ek, differ, b.len, planted });
+            try testing.expectEqual(@as(usize, 0), differ);
+            try testing.expect(planted > b.len / 2);
+            served += 1;
+        };
+    }
+    try testing.expectEqual(@as(usize, 2 * (B - 1) * 2), served);
 }
