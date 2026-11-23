@@ -983,3 +983,117 @@ test "dsv41 draft fused: an NVFP4 stage with ModelOpt's per-expert scales gives 
     std.mem.sort(f64, rel[0..n], {}, std.sort.asc(f64));
     if (rel[n / 2] > bar) return error.FurtherFromChain;
 }
+
+/// `Fixture.initStages` with `MLX_SERVE_DSV41_DRAFT_QKV=1` at load, as a server with the switch loads: the stages' wq_a
+/// and wkv rows fused into q_kv, which `dkern.in_proj` needs to take a stage.
+fn initStagesQkv(gpa: std.mem.Allocator, experts: u32, seed: u64) !*Fixture {
+    const o = env.override(.MLX_SERVE_DSV41_DRAFT_QKV, "1");
+    defer o.restore();
+    return Fixture.initStages(gpa, experts, seed);
+}
+
+test "dsv41 draft qkv: with the switch at load a stage's wkv is a view of its fused q_kv rows and projects what q_kv's wkv rows do at 1, 5 and 300 rows; a view one row early fails" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    mlx.installErrorHandler();
+    const fx = try initStagesQkv(gpa, 16, 31);
+    defer fx.deinit();
+    const m = fx.m;
+    const hd = m.cfg.head_dim;
+    const d: c_int = @intCast(m.cfg.hidden_size);
+    for (0..m.n_mtp) |si| {
+        const ly = &m.layers[m.n_layers + si];
+        const qkv = ly.q_kv orelse return error.NoStageQkv;
+        if (ly.wq_a.w.ctx != null or ly.wkv.w.ctx == null) return error.StageRowsNotFused;
+        const rows: usize = @intCast(mlx.getShape(qkv.w)[0]);
+        // The planted view: the wkv rows one row early (q_a's last row in, wkv's last row out).
+        const bad_view = try dsv41.rowView(m, qkv, rows - hd - 1, rows - 1);
+        // The main rows `kvRow` projects: a prompt's worth and a round's.
+        for ([_]c_int{ 1, 5, 300 }) |n| {
+            var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+            defer sc.deinit();
+            const x = try fx.normal(&.{ n, d }, .bfloat16, 0, 1);
+            defer _ = mlx.mlx_array_free(x);
+            const y = try qkv.apply(&sc, x);
+            const nq: usize = @intCast(mlx.getShape(y)[1]);
+            const want = try dsv41.hostF32(try sc.slice(y, -1, nq - hd, nq));
+            defer gpa.free(want);
+            const got = try dsv41.hostF32(try ly.wkv.apply(&sc, x));
+            defer gpa.free(got);
+            const bad = try dsv41.hostF32(try bad_view.apply(&sc, x));
+            defer gpa.free(bad);
+            const rel = decode.relRms(got, want);
+            const prel = decode.relRms(bad, want);
+            std.debug.print("[draft qkv] stage {d} n {d}: the wkv view {e:.2} from q_kv's rows, a view one row early {e:.2}\n", .{ si, n, rel, prel });
+            if (rel > 1e-3) return error.ViewFurther;
+            if (prel <= 1e-2) return error.PlantedPassed;
+        }
+    }
+}
+
+test "dsv41 draft qkv: a stage on the fused in_proj and wq_b (DRAFT_QKV at load, DRAFT_FUSED) is no further from the op chain than the served stage (DRAFT_FUSED's FFN half), median over seeds; a stream with its rows swapped fails" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    mlx.installErrorHandler();
+    // Reordered sums only: each stage's distance to the op chain against the served stage's, the median over seeds and
+    // stages within 1.15x of it, or within the fused stage test's 1% bar.
+    const bar = 1e-2;
+    var rel: [9]f64 = undefined;
+    var served_rel: [9]f64 = undefined;
+    var n: usize = 0;
+    for ([_]u64{ 5, 6, 7 }) |seed| {
+        const fx = try initStagesQkv(gpa, 16, seed);
+        defer fx.deinit();
+        const m = fx.m;
+        var st = try dsv41.initState(m, gpa);
+        defer st.deinit();
+        for (st.ds) |*ring| {
+            const rows = try fx.normal(&.{ @intCast(ring.cap), @intCast(ring.width) }, .bfloat16, 0, 1);
+            _ = mlx.mlx_array_free(ring.buf);
+            ring.buf = rows;
+        }
+        st.n = 300;
+        const B: c_int = @intCast(m.ds_block);
+        const hc: c_int = @intCast(m.cfg.dsv4_hc_mult);
+        const d: c_int = @intCast(m.cfg.hidden_size);
+        for (0..m.n_mtp) |si| {
+            const li = m.n_layers + si;
+            const ly = &m.layers[li];
+            const x = try fx.normal(&.{ B, hc, d }, .bfloat16, 0, 1);
+            defer _ = mlx.mlx_array_free(x);
+            var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+            defer sc.deinit();
+            const pre = try dsv41.onehotPre(&sc, m, @intCast(B));
+            const chain = try stageOut(gpa, m, &st, li, x, pre, false);
+            defer gpa.free(chain);
+            const runs0 = dsv41.stage_fused_runs.load(.monotonic);
+            const got = try stageOut(gpa, m, &st, li, x, pre, true);
+            defer gpa.free(got);
+            if (dsv41.stage_fused_runs.load(.monotonic) == runs0) return error.QkvNotEngaged;
+            // The served stage: the same weights with the rows apart (q_kv off the layer, wq_a a view of its rows), so
+            // in_proj declines and DRAFT_FUSED runs the FFN half alone, as without the switch.
+            const qkv = ly.q_kv.?;
+            const qa_rows: usize = @intCast(mlx.getShape(qkv.w)[0] - @as(c_int, @intCast(m.cfg.head_dim)));
+            ly.q_kv = null;
+            ly.wq_a = try dsv41.rowView(m, qkv, 0, qa_rows);
+            const served = stageOut(gpa, m, &st, li, x, pre, true);
+            ly.q_kv = qkv;
+            ly.wq_a = .{ .w = none };
+            const sv = try served;
+            defer gpa.free(sv);
+            for (got) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+            rel[n] = decode.relRms(got, chain);
+            served_rel[n] = decode.relRms(sv, chain);
+            std.debug.print("[draft qkv] seed {d} stage {d}: vs chain rel rms {e:.2}, the served stage {e:.2}\n", .{ seed, si, rel[n], served_rel[n] });
+            n += 1;
+            const swapped = try sc.concat(&.{ try sc.slice(x, 0, 1, 2), try sc.slice(x, 0, 0, 1), try sc.slice(x, 0, 2, m.ds_block) }, 0);
+            const bad = try stageOut(gpa, m, &st, li, swapped, pre, true);
+            defer gpa.free(bad);
+            if (decode.relRms(bad, chain) <= bar) return error.PlantedPassed;
+        }
+    }
+    std.mem.sort(f64, rel[0..n], {}, std.sort.asc(f64));
+    std.mem.sort(f64, served_rel[0..n], {}, std.sort.asc(f64));
+    std.debug.print("[draft qkv] median vs chain {e:.2}, the served stage's {e:.2}\n", .{ rel[n / 2], served_rel[n / 2] });
+    if (rel[n / 2] > @max(bar, 1.15 * served_rel[n / 2])) return error.FurtherFromChain;
+}

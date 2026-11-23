@@ -1521,7 +1521,43 @@ pub fn loadLayer(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usiz
         ly.wq_a = .{ .w = none };
         ly.wkv = .{ .w = none };
     };
+    // `MLX_SERVE_DSV41_DRAFT_QKV` (read at load): a stage's rows fused too, the q_kv `dkern.in_proj` reads (without it
+    // in_proj declines every stage, so `stageFused` never runs and DRAFT_FUSED fuses only the stage's FFN half), its wkv
+    // then a view of the fused rows for `kvRow`'s window rows: the same weights, no second copy.
+    if (trunk_li == null and env.on(.MLX_SERVE_DSV41_DRAFT_QKV) and ly.wq_a.s.ctx != null and ly.wkv.s.ctx != null) {
+        const qa_rows = dim(ly.wq_a.w, 0);
+        const kv_rows = dim(ly.wkv.w, 0);
+        if (try fuseRows(m, w, ly.wq_a, ly.wkv, 0)) |f| {
+            ly.q_kv = f;
+            ly.wq_a = .{ .w = none };
+            ly.wkv = try rowView(m, f, qa_rows, qa_rows + kv_rows);
+            if (!draft_qkv_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_DRAFT_QKV engaged: a DSpark stage's wq_a and wkv rows fused into q_kv at load\n", .{});
+        }
+    }
     return ly;
+}
+var draft_qkv_logged = std.atomic.Value(bool).init(false);
+
+/// Rows [lo, hi) of the quantized linear `l` as views of its arrays (no copy).
+pub fn rowView(m: *Dsv41Model, l: Lin, lo: usize, hi: usize) !Lin {
+    var out: Lin = .{ .w = none, .qp = l.qp };
+    inline for (.{ "w", "s", "b" }) |f| {
+        const x = @field(l, f);
+        if (x.ctx != null) {
+            const sh = mlx.getShape(x);
+            var start: [4]c_int = @splat(0);
+            var stop: [4]c_int = undefined;
+            const strides: [4]c_int = @splat(1);
+            @memcpy(stop[0..sh.len], sh);
+            start[0] = ci(lo);
+            stop[0] = ci(hi);
+            var o = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&o, x, &start, sh.len, &stop, sh.len, &strides, sh.len, m.s));
+            @field(out, f) = try m.own(o);
+            try mlx.check(mlx.mlx_array_eval(o));
+        }
+    }
+    return out;
 }
 
 /// `inference/model.py` `precompute_freqs_cis` as fast_rope periods: YaRN
@@ -8262,8 +8298,12 @@ fn stageFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A) 
     const keys = try st.ds[li - m.n_layers].read(sc, st.n - window, st.n);
     const f = try stageFfnFused(sc, m, ly, try dsparkHeadsAt(sc, m, ly, w.q, w.kv_row, keys, st.n), x, &w.sa) orelse return null;
     pre.* = f.pre;
+    _ = stage_fused_runs.fetchAdd(1, .monotonic);
     return f.x;
 }
+
+/// Stages `stageFused` served whole (in_proj and wq_b on the fused decode kernels), for the tests.
+pub var stage_fused_runs = std.atomic.Value(usize).init(0);
 
 /// A stage's attn_out and FFN over its draft rows `r` (`[L, H, hd]`, inverse-roped) on the fused decode kernels, as
 /// `blockTail` runs a trunk layer's: the grouped wo_a, then `ffn_in` (wo_b, the hc expand, the FFN norm and router) and
