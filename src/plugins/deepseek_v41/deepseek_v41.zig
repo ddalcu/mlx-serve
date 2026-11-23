@@ -8668,6 +8668,24 @@ fn expectRowsClose(label: []const u8, got: []const f32, want: []const f32, width
     try testing.expectEqual(@as(usize, 0), argmax_miss);
 }
 
+/// The confidence head's logits `got` against the reference's (`want`, blocks of `B`): the largest error within 1e-3
+/// of the reference's peak; the reference one position on in each block (each logit read with the Markov embedding
+/// of the wrong token) must miss by ten times that.
+fn expectConfClose(label: []const u8, got: []const f32, want: []const f32, B: usize) !void {
+    try testing.expectEqual(want.len, got.len);
+    var peak: f64 = 0;
+    for (want) |v| peak = @max(peak, @abs(v));
+    var err: f64 = 0;
+    var shifted: f64 = 0;
+    for (got, want, 0..) |g, w, i| {
+        err = @max(err, @abs(@as(f64, g) - w) / peak);
+        if (i % B + 1 < B) shifted = @max(shifted, @abs(@as(f64, g) - want[i + 1]) / peak);
+    }
+    std.debug.print("{s}: max err {e:.2} of the peak {d:.3}; shifted one position {e:.2}\n", .{ label, err, peak, shifted });
+    try testing.expect(err <= 1e-3);
+    try testing.expect(shifted > 1e-2);
+}
+
 fn logitsHost(m: *Dsv41Model, st: *State, ids: []const u32, want: Want) ![]f32 {
     const l = try extend(m, testing.allocator, st, ids, want);
     defer _ = mlx.mlx_array_free(l);
@@ -8740,8 +8758,13 @@ test "dsv41 fixture: prefill, chunked prefill, spans and decode match DeepSeek's
         const draft_ids = t.fx.get("draft_ids");
         const draft_ref = if (draft_ids != null) try t.host("draft_logits") else &.{};
         defer if (draft_ids != null) gpa.free(draft_ref);
+        const conf_ref = if (draft_ids != null) try t.host("draft_conf") else &.{};
+        defer if (draft_ids != null) gpa.free(conf_ref);
         var drafted: std.ArrayList(f32) = .empty;
         defer drafted.deinit(gpa);
+        var confs: std.ArrayList(f32) = .empty;
+        defer confs.deinit(gpa);
+        t.m.ds_want_conf = true;
         for (n_prompt..ids.len) |i| {
             const row = try logitsHost(t.m, &st, ids[i .. i + 1], .last);
             defer gpa.free(row);
@@ -8756,9 +8779,13 @@ test "dsv41 fixture: prefill, chunked prefill, spans and decode match DeepSeek's
             var d = try draftRows(t.m, gpa, &st, t1, true);
             defer d.deinit(gpa);
             try drafted.appendSlice(gpa, d.logits);
+            try confs.appendSlice(gpa, d.confidence);
         }
         try expectRowsClose(try std.fmt.bufPrint(&label, "{s} decode", .{pack}), dec.items, dec_ref, V);
-        if (draft_ids != null) try expectRowsClose(try std.fmt.bufPrint(&label, "{s} DSpark draft", .{pack}), drafted.items, draft_ref, V);
+        if (draft_ids != null) {
+            try expectRowsClose(try std.fmt.bufPrint(&label, "{s} DSpark draft", .{pack}), drafted.items, draft_ref, V);
+            try expectConfClose(try std.fmt.bufPrint(&label, "{s} DSpark confidence", .{pack}), confs.items, conf_ref, t.m.ds_block);
+        }
     }
 }
 
