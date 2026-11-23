@@ -14,6 +14,8 @@ const conformance = @import("../../sdk/testing/conformance.zig");
 const test_cache = @import("../../sdk/testing/cache_ops.zig");
 const fixture = @import("../../sdk/testing/fixture.zig");
 const parity = @import("../../sdk/testing/parity.zig");
+const run = @import("../../sdk/bases/run.zig");
+const head_block = @import("../../sdk/bases/blocks/head.zig");
 
 const testing = std.testing;
 const VOCAB = 60;
@@ -72,29 +74,83 @@ fn streams() []const bool {
 }
 
 // Bar: a last-row prompt forward (`Caps.prompt_last_row`, its head over the last rows) serves the bytes of that row of
-// the all-rows forward, under the head's tail rows and past them, on each stream.
+// the all-rows forward, under the head's tail rows and past them, on the GPU's stream, where the model is served.
 test "inkling2 proof: a last-row prompt serves the last row of the all-rows forward, bit for bit" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = testing.allocator;
     var tokens: [300]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast((i * 37 + 11) % VOCAB);
-    for (streams()) |gpu| {
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        var pack = try conformance.Loaded.openWith(testing.io, arena.allocator(), plugin.plugin.name, &plugin.table, try plugin.conformanceFixture(arena.allocator()), .{ .gpu = gpu });
-        defer pack.close();
-        for ([_]usize{ 1, 31, 33, 300 }) |n| {
-            var c_all = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
-            defer c_all.deinit();
-            var c_last = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
-            defer c_last.deinit();
-            const all = try step(a, &pack, &c_all, tokens[0..n], 0, .all_rows);
-            defer a.free(all);
-            const last = try step(a, &pack, &c_last, tokens[0..n], 0, .last_row);
-            defer a.free(last);
-            const want = all[(n - 1) * VOCAB .. n * VOCAB];
-            if (!std.mem.eql(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(last))) std.debug.print("[inkling2 proof] last row differs at {d} rows (gpu {})\n", .{ n, gpu });
-            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(last));
-        }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var pack = try conformance.Loaded.openWith(testing.io, arena.allocator(), plugin.plugin.name, &plugin.table, try plugin.conformanceFixture(arena.allocator()), .{ .gpu = true });
+    defer pack.close();
+    for ([_]usize{ 1, 31, 33, 300 }) |n| {
+        var c_all = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
+        defer c_all.deinit();
+        var c_last = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
+        defer c_last.deinit();
+        const all = try step(a, &pack, &c_all, tokens[0..n], 0, .all_rows);
+        defer a.free(all);
+        const last = try step(a, &pack, &c_last, tokens[0..n], 0, .last_row);
+        defer a.free(last);
+        const want = all[(n - 1) * VOCAB .. n * VOCAB];
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(last))) std.debug.print("[inkling2 proof] last row differs at {d} rows\n", .{n});
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(last));
+    }
+}
+
+// Bar: on the GPU, the pack's own lm_head over a prompt's last `head_tail_rows` rows gives that row the all-rows bits,
+// through the head's own matmul and this build's kernels.
+test "inkling2 pack: the lm_head over the last head_tail_rows rows serves the last row of all of them, bit for bit (INKLING2_PACK)" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const dir = std.mem.span(@import("../../env.zig").named("INKLING2_PACK") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    var pack_dir = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer pack_dir.close(io);
+    const Index = struct { weight_map: std.json.ArrayHashMap([]const u8) };
+    const index = try std.json.parseFromSliceLeaky(Index, ar, try pack_dir.readFileAlloc(io, "model.safetensors.index.json", ar, .limited(1 << 24)), .{ .ignore_unknown_fields = true });
+    const Quant = struct { group_size: u32, bits: u32 };
+    const Config = struct { quantization: Quant };
+    const q = (try std.json.parseFromSliceLeaky(Config, ar, try pack_dir.readFileAlloc(io, "config.json", ar, .limited(1 << 20)), .{ .ignore_unknown_fields = true })).quantization;
+    const shard = index.weight_map.map.get("lm_head.weight") orelse return error.SkipZigTest;
+
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    var map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(map);
+    var meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    try mlx.check(mlx.mlx_load_safetensors(&map, &meta, try std.fmt.allocPrintSentinel(ar, "{s}/{s}", .{ dir, shard }, 0), mlx.weightLoadStream()));
+    var lin: layers.Linear = .{ .bits = q.bits, .group_size = q.group_size };
+    for ([_]*ops.Array{ &lin.w, &lin.s, &lin.b }, [_][:0]const u8{ "lm_head.weight", "lm_head.scales", "lm_head.biases" }) |p, name| {
+        var x = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_map_string_to_array_get(&x, map, name));
+        p.* = try g.adopt(x);
+    }
+    const hidden: c_int = ops.shape(lin.s)[1] * @as(c_int, @intCast(q.group_size));
+
+    const most = 4100;
+    var prng = std.Random.DefaultPrng.init(7);
+    const buf = try a.alloc(f32, @intCast(most * hidden));
+    defer a.free(buf);
+    for (buf) |*x| x.* = prng.random().floatNorm(f32);
+    const rows = try g.astype(try g.adopt(mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ 1, most, hidden }, 3, .float32)), .bfloat16);
+    for ([_]c_int{ 33, 300, 1536, most }) |n| {
+        const x = try g.sliceAxis(rows, 1, 0, n);
+        const all = try g.contiguous(try g.astype(try g.sliceAxis(try head_block.project(&g, &lin, x), 1, n - 1, n), .float32));
+        const tail = try g.contiguous(try g.astype(try g.sliceAxis(try head_block.project(&g, &lin, try g.sliceAxis(x, 1, n - run.head_tail_rows, n)), 1, run.head_tail_rows - 1, run.head_tail_rows), .float32));
+        try ops.evalMany(&.{ all, tail });
+        const vocab: usize = @intCast(ops.shape(all)[2]);
+        const want = mlx.mlx_array_data_float32(all).?[0..vocab];
+        const got = mlx.mlx_array_data_float32(tail).?[0..vocab];
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got))) std.debug.print("[inkling2 pack] last row differs at {d} rows\n", .{n});
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got));
     }
 }
 
