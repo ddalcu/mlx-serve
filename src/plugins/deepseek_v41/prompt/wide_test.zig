@@ -1194,6 +1194,9 @@ test "dsv41 wide ubench: FLASH_ATTN and FLASH_TRIM at the release's spans (DSV41
             const us = times[times.len / 2];
             std.debug.print("[ftrim-ubench] round {d} L={d} keys={d} {s}: {d:.1} us (min {d:.1} max {d:.1}), {d:.1} TFLOPS useful, matrix floor {d:.1} us at 120\n", .{ round, c.L, WIN + c.K, a.name, us, times[0], times[times.len - 1], flops / us / 1e6, flops / 120e6 });
         };
+    }
+}
+
 fn freePair(xs: [2]A) void {
     for (xs) |o| _ = mlx.mlx_array_free(o);
 }
