@@ -7,8 +7,9 @@ PyTorch modeling code over the HF checkpoint (tencent/Hy4-flash) and writes byte
 tensors the tape tests compare the Zig port against (cos + rms_ratio per plugins/AGENTS.md),
 mirroring `tests/dump_dsv41_fixtures.py`.
 
-MEMORY: the trunk is 220B-A12B — run on the 128 GB Mac with `--device cpu` in bf16; the Engram
-tables alone are ~39.6 GB and the table provider keeps them on disk.
+MEMORY: the trunk is 220B-A12B; the HF bf16 checkpoint is ~440 GB (trunk ~313 GB + Engram tables
+~127 GB), so it needs the 512 GiB host with `--device cpu` in bf16 and nothing else resident; the Engram
+tables stream from disk in our 4-bit pack, not from the HF set.
 
 Oracle taps (env prefix HYV4_) land with the plans that read them:
 
