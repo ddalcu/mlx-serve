@@ -150,7 +150,7 @@ fn addState(r: *Run, m: *dsv41.Dsv41Model, st: *const dsv41.State) !void {
 }
 
 /// The switches an arm runs under.
-const Sw = struct { lazy: bool = false, async_end: bool = false };
+const Sw = struct { lazy: bool = false, async_end: bool = false, ced_hc: bool = false, rope_pairs: bool = false, rms_rows: bool = false };
 
 /// After each chunk of an arm: `State.ced_lazy`, and whether the first decoder layer's ring was ready once the GPU
 /// went idle (`ran`).
@@ -166,6 +166,12 @@ fn arm(fx: *fixture.Fixture, ids: []const u32, plan: []const isize, next: []cons
     defer lz.restore();
     const ae = env.override(.MLX_SERVE_DSV41_PROMPT_ASYNC_EVAL, if (sw.async_end) "1" else "0");
     defer ae.restore();
+    const ch = env.override(.MLX_SERVE_DSV41_PF_CED_HC, if (sw.ced_hc) "1" else "0");
+    defer ch.restore();
+    const rp = env.override(.MLX_SERVE_DSV41_PF_ROPE_PAIRS, if (sw.rope_pairs) "1" else "0");
+    defer rp.restore();
+    const rr = env.override(.MLX_SERVE_DSV41_PF_RMS_ROWS, if (sw.rms_rows) "1" else "0");
+    defer rr.restore();
     try dsv41.reset(m, gpa);
     try dsv41.armPrompt(m, ids, null, capture);
     const st = &m.dec_state.?;
@@ -308,5 +314,109 @@ test "dsv41 ced_lazy: deferred and dropped replays, alone and with an unwaited p
             // The full-forward chunk rewrote every slot before the last replay: nothing differs.
             try testing.expectEqual(@as(usize, 0), dead);
         }
+    }
+}
+
+test "dsv41 pf ced_hc: the CED compressor's hc pre-norm over the pass's whole stream leaves every cache, window row and logits row of the span-by-span path word for word, the 17.6K card's chunks, NVFP4 with per-expert scales and MXFP4 experts; spans read a row late fail" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var rng = std.Random.DefaultPrng.init(43);
+    for ([_]bool{ true, false }) |nv| {
+        const fx = try build(gpa, nv);
+        defer fx.deinit();
+        const w: usize = fx.m.cfg.sliding_window;
+        const next = [_]u32{ 7, 11, 13 };
+        const card = try gpa.alloc(u32, 17_639);
+        defer gpa.free(card);
+        for (card) |*t| t.* = 1 + rng.random().uintLessThan(u32, 3999);
+        const plan = [_]isize{ -4096, 4096, 8192, 1254 };
+        var off: Run = .{};
+        defer off.deinit();
+        var on: Run = .{};
+        defer on.deinit();
+        var planted: Run = .{};
+        defer planted.deinit();
+        var no_snap: Run = .{};
+        defer no_snap.deinit();
+        var obs: Obs = .{};
+        try arm(fx, card, &plan, &next, .{}, false, null, &off, &no_snap, &obs);
+        const before = dsv41.ced_hc_passes.load(.monotonic);
+        try arm(fx, card, &plan, &next, .{ .ced_hc = true }, false, null, &on, &no_snap, &obs);
+        // Every chunk is a CED pass of several spans: each took the whole stream.
+        try testing.expectEqual(before + plan.len, dsv41.ced_hc_passes.load(.monotonic));
+        var dead: usize = 0;
+        try expectSame("ced_hc", &on, &off, w, &dead);
+        try testing.expectEqual(@as(usize, 0), dead);
+        dsv41.ced_hc_plant.store(1, .monotonic);
+        defer dsv41.ced_hc_plant.store(0, .monotonic);
+        try arm(fx, card, &plan, &next, .{ .ced_hc = true }, false, null, &planted, &no_snap, &obs);
+        try testing.expectError(error.NotByteIdentical, expectSame("ced_hc planted", &planted, &off, w, &dead));
+        std.debug.print("[ced_hc] {s}: {d} passes on the whole stream, every part word for word; the planted late row differs\n", .{ if (nv) "nvfp4" else "mxfp4", plan.len });
+    }
+}
+
+test "dsv41 pf rope_pairs: the query tail's rope a pair a thread over the heads leaves every cache, window row and logits row word for word, the 17.6K card's chunks, NVFP4 with per-expert scales and MXFP4 experts" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var rng = std.Random.DefaultPrng.init(53);
+    for ([_]bool{ true, false }) |nv| {
+        const fx = try build(gpa, nv);
+        defer fx.deinit();
+        const w: usize = fx.m.cfg.sliding_window;
+        const next = [_]u32{ 7, 11, 13 };
+        const card = try gpa.alloc(u32, 17_639);
+        defer gpa.free(card);
+        for (card) |*t| t.* = 1 + rng.random().uintLessThan(u32, 3999);
+        const plan = [_]isize{ -4096, 4096, 8192, 1254 };
+        var off: Run = .{};
+        defer off.deinit();
+        var on: Run = .{};
+        defer on.deinit();
+        var no_snap: Run = .{};
+        defer no_snap.deinit();
+        var obs: Obs = .{};
+        const pin = env.override(.MLX_SERVE_DSV41_PF_ROPE_PAIRS, "0");
+        try arm(fx, card, &plan, &next, .{}, false, null, &off, &no_snap, &obs);
+        pin.restore();
+        const before = dsv41.rope_pairs_calls.load(.monotonic);
+        try arm(fx, card, &plan, &next, .{ .rope_pairs = true }, false, null, &on, &no_snap, &obs);
+        try testing.expect(dsv41.rope_pairs_calls.load(.monotonic) > before);
+        var dead: usize = 0;
+        try expectSame("rope_pairs", &on, &off, w, &dead);
+        try testing.expectEqual(@as(usize, 0), dead);
+        std.debug.print("[rope_pairs] {s}: {d} pair launches, every part word for word\n", .{ if (nv) "nvfp4" else "mxfp4", dsv41.rope_pairs_calls.load(.monotonic) - before });
+    }
+}
+
+test "dsv41 pf rms_rows: the query latent's rms read in place in q_kv's output leaves every cache, window row and logits row word for word, the 17.6K card's chunks, NVFP4 with per-expert scales and MXFP4 experts" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var rng = std.Random.DefaultPrng.init(59);
+    for ([_]bool{ true, false }) |nv| {
+        const fx = try build(gpa, nv);
+        defer fx.deinit();
+        const w: usize = fx.m.cfg.sliding_window;
+        const next = [_]u32{ 7, 11, 13 };
+        const card = try gpa.alloc(u32, 17_639);
+        defer gpa.free(card);
+        for (card) |*t| t.* = 1 + rng.random().uintLessThan(u32, 3999);
+        const plan = [_]isize{ -4096, 4096, 8192, 1254 };
+        var off: Run = .{};
+        defer off.deinit();
+        var on: Run = .{};
+        defer on.deinit();
+        var no_snap: Run = .{};
+        defer no_snap.deinit();
+        var obs: Obs = .{};
+        const pin = env.override(.MLX_SERVE_DSV41_PF_RMS_ROWS, "0");
+        try arm(fx, card, &plan, &next, .{}, false, null, &off, &no_snap, &obs);
+        pin.restore();
+        const before = dsv41.rms_rows_calls.load(.monotonic);
+        try arm(fx, card, &plan, &next, .{ .rms_rows = true }, false, null, &on, &no_snap, &obs);
+        try testing.expect(dsv41.rms_rows_calls.load(.monotonic) > before);
+        var dead: usize = 0;
+        try expectSame("rms_rows", &on, &off, w, &dead);
+        try testing.expectEqual(@as(usize, 0), dead);
+        std.debug.print("[rms_rows] {s}: {d} strided rms launches, every part word for word\n", .{ if (nv) "nvfp4" else "mxfp4", dsv41.rms_rows_calls.load(.monotonic) - before });
     }
 }

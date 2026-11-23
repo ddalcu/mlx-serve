@@ -1,3 +1,4 @@
+    // KBLK (MLX_SERVE_DSV41_PF_COMP_BF16): f3_gemm_loop's blocked sum over K; 0, MLX's single running sum.
     // MLX's fused NAX GEMM kernel (steel/gemm/kernels/steel_gemm_fused_nax.h `gemm`, MLX 0.32.3) at transpose_a
     // false and transpose_b true (a [M, K] and b [N, K], both row-major: MLX's `matmul(a, transpose(b))`), no batch and no
     // C, as one metal_kernel launch: y float [M, N] = a b^T, the accumulators rounded to OUT_R as MLX's store rounds them
@@ -76,7 +77,8 @@
               kAlignedM.value,
               kAlignedN.value,
               kAlignedK.value,
-              float>(
+              float,
+              KBLK != 0>(
               A,
               B,
               lda,

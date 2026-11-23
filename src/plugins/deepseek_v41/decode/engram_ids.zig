@@ -17,6 +17,7 @@ const engram = @import("../engram.zig");
 const fusion = @import("../fuse.zig");
 const decode = @import("decode.zig");
 const engram_kv = @import("engram_kv.zig");
+const engram_kvc = @import("engram_kvc.zig");
 
 const A = mlx.mlx_array;
 const Scope = dsv41.Scope;
@@ -108,9 +109,9 @@ pub fn rows(sc: *Scope, hs: *const engram.Hash, ctx: *const Ctx, hist: []const u
 }
 
 /// The Engram write of one decode row `x` `[1, hc, dim]` at table `ek` (`e`, wrapped) from the GPU row ids `ids`
-/// (`rows`): the held-table gather and wkv in one launch (`dec_engram_kv`), then the gate. Null where the kernel
-/// declines the table.
-pub fn write(sc: *Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.EngramLayer, ids: A, ek: usize, nc: usize, x: A) !?A {
+/// (`rows`): the held-table gather and wkv in one launch (`dec_engram_kv`), then the gate. With the step's cache
+/// `plan` (`engram_kvc.Cache.plan`), the slot kernel through the cache. Null where the kernel declines the table.
+pub fn write(sc: *Scope, m: *dsv41.Dsv41Model, e: *const dsv41.EngramLayer, ids: A, plan: A, ek: usize, nc: usize, x: A) !?A {
     const g = e.gpu orelse return null;
     if (mlx.getShape(x)[0] != 1 or !fusion.kvServes(m, e, 1)) return null;
     const t = &e.table;
@@ -119,7 +120,13 @@ pub fn write(sc: *Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.EngramLayer
     const gw = geo.words();
     const ga = try sc.keep(mlx.mlx_array_new_data(&gw, &[_]c_int{6}, 1, .uint32));
     const mine = try sc.slice(ids, 0, ek * nc, (ek + 1) * nc);
-    const kv = try engram_kv.launch(sc, .{ .hd = t.head_dim, .tb = t.bits }, 1, g[0], g[1], mine, ga, e.wkv.w, e.wkv.s) orelse return null;
+    const tab: engram_kv.Table = .{ .hd = t.head_dim, .tb = t.bits };
+    const kv = if (plan.ctx != null) blk: {
+        const c = &m.kvc.?;
+        const kv = try engram_kv.launchSlots(sc, tab, g[0], g[1], mine, ga, e.wkv.w, e.wkv.s, try c.of(sc, plan, ek, nc)) orelse return null;
+        c.after(kv);
+        break :blk kv;
+    } else try engram_kv.launch(sc, tab, 1, g[0], g[1], mine, ga, e.wkv.w, e.wkv.s) orelse return null;
     return try dsv41.engramGate(sc, m, e.qk, x, kv);
 }
 
@@ -144,6 +151,18 @@ pub fn settle(m: *dsv41.Dsv41Model) !void {
     }
     m.engram_ids = try ctxOf(hs, m.token_map);
     log.info("deepseek_v41: MLX_SERVE_DSV41_ENGRAM_GPU_IDS: a decode step's Engram ids hashed on the GPU ({d} tables)\n", .{m.engrams.len});
+    if (!engram_kvc.on()) return;
+    const e0 = &m.engrams[0];
+    const n: usize = @intCast(mlx.getShape(e0.wkv.w)[0]);
+    const k: usize = @as(usize, @intCast(mlx.getShape(e0.wkv.w)[1])) * 4;
+    const nc = hs.cols();
+    const serves = for (m.engrams) |*e| {
+        if (e.table.head_dim != engram_kv.slot_hd or @as(usize, @intCast(mlx.getShape(e.wkv.w)[0])) != n or k != nc * engram_kv.slot_hd or k % 512 != 0 or n % engram_kv.slot_cols != 0) break false;
+    } else true;
+    m.kvc = if (serves) try engram_kvc.Cache.init(m.s, m.engrams.len * nc, n) else null;
+    if (m.kvc) |*c| {
+        log.info("deepseek_v41: MLX_SERVE_DSV41_ENGRAM_KV_CACHE: {d} tables x {d} sets x {d} ways of {d}-wide partials, {d} MB\n", .{ c.nt, c.sets, engram_kvc.ways, n, c.bytes() >> 20 });
+    } else log.info("deepseek_v41: MLX_SERVE_DSV41_ENGRAM_KV_CACHE off: the slot kernel does not read these tables\n", .{});
 }
 
 // ── tests ──
@@ -273,11 +292,11 @@ test "dsv41 engram gpu ids (resident): the write from the GPU-hashed ids is the 
             const x = try sc.keep(try fx.normal(&.{ 1, @intCast(hc), @intCast(d) }, .bfloat16, 0, 1));
             const t = try sc.keep(mlx.mlx_array_new_data(&tok, &[_]c_int{1}, 1, .uint32));
             const ids = try rows(&sc, &hs, &ctx, hist, t, 0);
-            const got = (try write(&sc, m, &e, ids, 1, nc, x)) orelse return error.Declined;
+            const got = (try write(&sc, m, &e, ids, .{ .ctx = null }, 1, nc, x)) orelse return error.Declined;
             const want = (try fusion.engramHeld(&sc, m, &e, host[0..ctx.n], 2, 1, nc, 0, 1, x)) orelse return error.Declined;
             const other: u32 = (tok + 1) % 512;
             const ot = try sc.keep(mlx.mlx_array_new_data(&other, &[_]c_int{1}, 1, .uint32));
-            const plant = (try write(&sc, m, &e, try rows(&sc, &hs, &ctx, hist, ot, 0), 1, nc, x)) orelse return error.Declined;
+            const plant = (try write(&sc, m, &e, try rows(&sc, &hs, &ctx, hist, ot, 0), .{ .ctx = null }, 1, nc, x)) orelse return error.Declined;
             const a = try dsv41.hostF32(got);
             defer gpa.free(a);
             const b = try dsv41.hostF32(want);

@@ -12,4 +12,5 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 
 /// The kernels' text (the model builds them at load).
 pub const rope_tail_only_source = kernelSource("plugins/deepseek_v41/kernels/rope_tail_only.metal");
+pub const rope_tail_pairs_source = kernelSource("plugins/deepseek_v41/kernels/rope_tail_pairs.metal");
 pub const attn_qk_t_source = kernelSource("plugins/deepseek_v41/kernels/attn_qk_t.metal");
