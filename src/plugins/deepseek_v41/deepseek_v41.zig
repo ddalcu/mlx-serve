@@ -3595,7 +3595,7 @@ pub fn flashLaunch(sc: *Scope, k: mlx.mlx_fast_metal_kernel, ins: []const A, out
 /// launch over 64 and one over 65 rows of zeros (both row alignments), at the first compressor's and router's weights.
 fn warmGateGemmBf16(m: *Dsv41Model) !void {
     const comp = env.onUnlessZero(.MLX_SERVE_DSV41_PF_COMP_BF16);
-    const router = env.on(.MLX_SERVE_DSV41_PF_ROUTER_BF16);
+    const router = env.onUnlessZero(.MLX_SERVE_DSV41_PF_ROUTER_BF16);
     if ((!comp and !router) or !device.naxAvailable() or !mlx.streamIsGpu(m.s)) return;
     var sc = Scope.init(m.gpa, m.s);
     defer sc.deinit();
@@ -4882,7 +4882,7 @@ pub fn gateLogits(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !A {
     const E = dim(ly.gate_w, 0);
     if (L > region_rows) {
         // MLX_SERVE_DSV41_PF_ROUTER_BF16: x and gate_w both bf16, the MMA in bf16 (exact products; `routerSum`).
-        if (env.on(.MLX_SERVE_DSV41_PF_ROUTER_BF16)) if (routerSum(L, E, dim(x, 1))) |sum| if (try ggemm.bf16F32(sc.s, x, ly.gate_w, device.naxAvailable(), sum)) |y| {
+        if (env.onUnlessZero(.MLX_SERVE_DSV41_PF_ROUTER_BF16)) if (routerSum(L, E, dim(x, 1))) |sum| if (try ggemm.bf16F32(sc.s, x, ly.gate_w, device.naxAvailable(), sum)) |y| {
             if (!router_bf16_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_ROUTER_BF16 engaged ({d} rows)\n", .{L});
             _ = router_bf16_count.fetchAdd(1, .monotonic);
             if (router_bf16_plant) return sc.mul(try sc.keep(y), try sc.f(-1));
