@@ -1,17 +1,23 @@
 // dec_in_proj: the attention input of R rows of one layer in one launch. A threadgroup of D / 8 threads, a thread 8 positions of K.
 // Threadgroups in order: q_kv rows (mxfp8, RT each), weights_proj and compressor rows (bf16, RT each), one hc mix each.
-// h = rms(collapse(x, cpre), attn_norm) is made in every threadgroup from x (FUSE), else `hin` holds it.
+// h = rms(collapse(x, cpre), attn_norm) is made in every threadgroup from x (FUSE), else `hin` holds it. MIXR
+// (MLX_SERVE_DSV41_IN_PROJ_MIXR): the mixes first, a threadgroup a (mix, row), each row's sums as one mix
+// threadgroup sums them.
 static_assert(RT == 4, "a threadgroup's rows are the lanes of one float4 of dots");
 constexpr int HC = 4, NMIX = (2 + HC) * HC, NT = D / 8, NSG = NT / 32;
 constexpr int NGQ = NQ / RT, NGW = NW / RT, NGC = NC / RT;
+constexpr int NMT = MIXR ? NMIX * R : 0;
 const uint t = thread_position_in_threadgroup.x, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-const int tg = threadgroup_position_in_grid.x;
+const int tg0 = threadgroup_position_in_grid.x;
+const int tg = tg0 - NMT;
 threadgroup float part[(RT + 2) * R * NSG];
 threadgroup float* const pa = part;
 threadgroup float* const ps = part + RT * R * NSG;
 
-if (tg >= NGQ + NGW + NGC) {
-  const int m = tg - (NGQ + NGW + NGC);
+if (MIXR ? tg0 < NMT : tg >= NGQ + NGW + NGC) {
+  constexpr int NR = MIXR ? 1 : R;
+  const int m = MIXR ? tg0 / R : tg - (NGQ + NGW + NGC);
+  const int r0 = MIXR ? tg0 % R : 0;
   const device float* fr = fn_w + size_t(m) * (HC * D);
   float4 f[HC][2];
   #pragma unroll
@@ -19,9 +25,10 @@ if (tg >= NGQ + NGW + NGC) {
     f[j][0] = *(const device float4*)(fr + j * D + 8 * t);
     f[j][1] = *(const device float4*)(fr + j * D + 8 * t + 4);
   }
-  float dd[R], sq[R];
+  float dd[NR], sq[NR];
   #pragma unroll
-  for (int r = 0; r < R; ++r) {
+  for (int rr = 0; rr < NR; ++rr) {
+    const int r = r0 + rr;
     float a = 0.0f, b = 0.0f;
     #pragma unroll
     for (int j = 0; j < HC; ++j) {
@@ -37,23 +44,23 @@ if (tg >= NGQ + NGW + NGC) {
         b += u.y * u.y;
       }
     }
-    dd[r] = simd_sum(a);
-    sq[r] = simd_sum(b);
+    dd[rr] = simd_sum(a);
+    sq[rr] = simd_sum(b);
   }
   if (lane == 0) {
     #pragma unroll
-    for (int r = 0; r < R; ++r) {
-      ps[r * NSG + sg] = dd[r];
-      ps[(R + r) * NSG + sg] = sq[r];
+    for (int rr = 0; rr < NR; ++rr) {
+      ps[rr * NSG + sg] = dd[rr];
+      ps[(NR + rr) * NSG + sg] = sq[rr];
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (sg == 0) {
     #pragma unroll
-    for (int r = 0; r < R; ++r) {
-      const float a = simd_sum(lane < NSG ? ps[r * NSG + lane] : 0.0f);
-      const float b = simd_sum(lane < NSG ? ps[(R + r) * NSG + lane] : 0.0f);
-      if (lane == 0) z[r * NMIX + m] = a * metal::precise::rsqrt(b / float(HC * D) + eps[0]) * scale[m] + base[m];
+    for (int rr = 0; rr < NR; ++rr) {
+      const float a = simd_sum(lane < NSG ? ps[rr * NSG + lane] : 0.0f);
+      const float b = simd_sum(lane < NSG ? ps[(NR + rr) * NSG + lane] : 0.0f);
+      if (lane == 0) z[(r0 + rr) * NMIX + m] = a * metal::precise::rsqrt(b / float(HC * D) + eps[0]) * scale[m] + base[m];
     }
   }
   return;
