@@ -11242,7 +11242,7 @@ fn specSyncRun(m: *Dsv41Model, gpa: std.mem.Allocator, prompt: []const u32, out:
     }
 }
 
-test "dsv41 spec sync: GPU-accept rounds keep the host rounds' tokens, drafts and confidences bit for bit; a planted position fails (DSV41_SPEC_SYNC)" {
+test "dsv41 spec sync: GPU-accept rounds keep the host rounds' tokens, accepts and next tokens, and their drafts' bits but for DRAFT_QKV's row-count rounding; a planted position fails (DSV41_SPEC_SYNC)" {
     // DSV41_SPEC_SYNC = a pack dir; DSV41_STEP_CTX prompt tokens first (default 1024, at least the sliding window).
     const dir = std.mem.span(std.c.getenv("DSV41_SPEC_SYNC") orelse return error.SkipZigTest);
     const ctx = if (std.c.getenv("DSV41_STEP_CTX")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 1024;
@@ -11274,15 +11274,22 @@ test "dsv41 spec sync: GPU-accept rounds keep the host rounds' tokens, drafts an
     try specSyncRun(m, gpa, prompt, &gpu);
     const taken = sync_rounds.load(.monotonic);
     const collected = sync_collects.load(.monotonic);
+    // What a round keeps (its tokens, accepted drafts and next token, the draft's width) is exact. The drafts' ids and
+    // confidences are too, but under `MLX_SERVE_DSV41_DRAFT_QKV`: `syncRound` writes every verify row's window rows,
+    // and the stage's wkv (a row view of the fused q_kv) rounds a row differently at another row count, so a draft
+    // after a partial accept may differ in its last bits (rounding of proposals, never of what is kept).
     var bad: usize = 0;
+    var draft_bits: usize = 0;
     var accepted: usize = 0;
     for (host, gpu, 0..) |h, g, k| {
         accepted += h.accepted;
-        if (!std.meta.eql(h, g)) {
-            bad += 1;
-            if (bad <= 8) std.debug.print("[spec-sync] round {d} differs: host len {d} acc {d} next {d}, gpu len {d} acc {d} next {d}\n", .{ k, h.len, h.accepted, h.next, g.len, g.accepted, g.next });
-        }
+        const kept = h.len == g.len and h.accepted == g.accepted and h.next == g.next and h.n_tok == g.n_tok and std.mem.eql(u32, &h.tokens, &g.tokens);
+        const drafts = std.mem.eql(u32, &h.ids, &g.ids) and std.mem.eql(u32, &h.conf, &g.conf);
+        bad += @intFromBool(!kept);
+        draft_bits += @intFromBool(!drafts);
+        if (!kept or !drafts) std.debug.print("[spec-sync] round {d} differs ({s}): host len {d} acc {d} next {d}, gpu len {d} acc {d} next {d}\n", .{ k, if (!kept) "kept" else "draft bits", h.len, h.accepted, h.next, g.len, g.accepted, g.next });
     }
+    const qkv = env.onUnlessZero(.MLX_SERVE_DSV41_DRAFT_QKV);
     // Rounds 0..N less the plain ticks take the GPU accept; every stage draft after a GPU round is the queued one.
     var want_rounds: u64 = 0;
     var want_collects: u64 = 0;
@@ -11292,8 +11299,9 @@ test "dsv41 spec sync: GPU-accept rounds keep the host rounds' tokens, drafts an
         const prev_gpu = k > 0 and (k - 1) % 9 != 8;
         if (k % 7 != 6 and prev_gpu) want_collects += 1;
     }
-    std.debug.print("[spec-sync] ctx {d}: {d} rounds, {d} differ; GPU-accept rounds {d} (want {d}), queued drafts collected {d} (want {d}); {d} drafts accepted\n", .{ ctx, N, bad, taken, want_rounds, collected, want_collects, accepted });
+    std.debug.print("[spec-sync] ctx {d}: {d} rounds, {d} differ in what they keep, {d} in their drafts' bits (DRAFT_QKV {}); GPU-accept rounds {d} (want {d}), queued drafts collected {d} (want {d}); {d} drafts accepted\n", .{ ctx, N, bad, draft_bits, qkv, taken, want_rounds, collected, want_collects, accepted });
     try testing.expectEqual(@as(usize, 0), bad);
+    if (!qkv) try testing.expectEqual(@as(usize, 0), draft_bits);
     try testing.expectEqual(want_rounds, taken);
     try testing.expectEqual(want_collects, collected);
     try testing.expect(accepted > 0);
@@ -11303,8 +11311,8 @@ test "dsv41 spec sync: GPU-accept rounds keep the host rounds' tokens, drafts an
     try specSyncRun(m, gpa, prompt, &plant);
     var planted: usize = 0;
     for (host, plant) |h, p| planted += @intFromBool(!std.mem.eql(u32, &h.conf, &p.conf) or !std.mem.eql(u32, &h.ids, &p.ids));
-    std.debug.print("[spec-sync] planted position: {d} of {d} drafts differ\n", .{ planted, N });
-    try testing.expect(planted > 0);
+    std.debug.print("[spec-sync] planted position: {d} of {d} drafts differ (unplanted {d})\n", .{ planted, N, draft_bits });
+    try testing.expect(planted > 0 and planted > 4 * draft_bits);
 }
 
 /// `DSV41_VERIFY_ROWS`' draft: `b` synthetic ids after the verify's first row.
