@@ -1649,6 +1649,11 @@ const staged_variants = [_]Staged{
     .{ .bm = 128, .wm = 8, .wn = 1, .gx = 32, .tg_a = true },
     .{ .bm = 128, .wm = 4, .wn = 1, .gx = 32, .tg_a = true },
     .{ .bm = 128, .wm = 4, .wn = 2, .gx = 32, .tg_a = true },
+    .{ .bm = 16, .wm = 1, .wn = 2, .gx = 0 },
+    .{ .bm = 16, .wm = 1, .wn = 2, .gx = 32 },
+    .{ .bm = 32, .wm = 1, .wn = 2, .gx = 32 },
+    .{ .bm = 32, .wm = 2, .wn = 1, .gx = 32 },
+    .{ .bm = 32, .wm = 2, .wn = 2, .gx = 32 },
 };
 
 const ds_experts: c_int = 384;
@@ -1934,5 +1939,117 @@ test "staged NAX sorted gather µbench at DeepSeek-V4.1's NVFP4 routed experts a
                 std.debug.print("[gqmm-ubench]   staged bm={d} wm={d} wn={d} gx={d} {s}{s}: {d:.3} ms {d:.1} TFLOPS ({d:.0}% of 120), {d:.3}x today, {d:.0}% of floor\n", .{ st.bm, st.wm, st.wn, st.gx, if (st.tg_a) @as([]const u8, "tg-a") else "reg-a", if (std.meta.eql(st, pick)) @as([]const u8, " (plan)") else "", ms, flops / ms / 1e9, flops / ms / 1.2e9, today / ms, 100 * floor_ms / ms });
             }
         }
+    }
+}
+
+/// A call over a served routing: the sorted pairs' experts and rows as `DSV41_ROUTE_DUMP` wrote them (`tokens` rows);
+/// the activations, routing weights and scales drawn as `dsCall` draws them.
+fn dsCallRouted(ids: []const u32, rows: []const u32, tokens: usize, seed: u64, s: mlx.mlx_stream) !DsCall {
+    const pairs: c_int = @intCast(ids.len);
+    var touched: usize = 0;
+    for (ids, 0..) |e, i| {
+        if (i == 0 or ids[i - 1] != e) touched += 1;
+    }
+    const rw = try std.testing.allocator.alloc(f32, ids.len);
+    defer std.testing.allocator.free(rw);
+    var prng = std.Random.DefaultPrng.init(seed);
+    for (rw) |*v| v.* = 0.05 + prng.random().float(f32);
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, seed));
+    var x = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_normal(&x, &[_]c_int{ @intCast(tokens), 1, ds_hidden }, 3, .bfloat16, 0, 0.5, key, s));
+    var akey = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(akey);
+    try mlx.check(mlx.mlx_random_key(&akey, seed + 1));
+    var act = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_normal(&act, &[_]c_int{ pairs, 1, ds_inter }, 3, .bfloat16, 0, 0.5, akey, s));
+    var esc: [2]mlx.mlx_array = undefined;
+    for (&esc, 0..) |*o, i| o.* = try randUniform(&[_]c_int{ds_experts}, 0.25, 4.0, seed + 2 + i, s);
+    const c: DsCall = .{
+        .x = x,
+        .map = mlx.mlx_array_new_data(rows.ptr, &[_]c_int{pairs}, 1, .uint32),
+        .ids = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{pairs}, 1, .uint32),
+        .route = mlx.mlx_array_new_data(rw.ptr, &[_]c_int{pairs}, 1, .float32),
+        .act = act,
+        .esc = esc,
+        .pairs = pairs,
+        .touched = touched,
+    };
+    for ([_]mlx.mlx_array{ c.x, c.act, c.esc[0], c.esc[1] }) |v| try mlx.check(mlx.mlx_array_eval(v));
+    return c;
+}
+
+/// Milliseconds a call of the public staged entries (`st` null: today's plan) or of tile `st`, four evaluated
+/// together, median of 7 after one warm round.
+fn dsRoutedMs(c: DsCall, b: DsBanks, down: bool, st: ?Staged, s: mlx.mlx_stream) !f64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var laps: [7]u64 = undefined;
+    for (0..laps.len + 1) |i| {
+        const mark = std.Io.Timestamp.now(io, .boot);
+        var outs: [4]mlx.mlx_array = undefined;
+        for (&outs) |*o| o.* = if (st) |v| try dsStaged(c, b, down, v, v.bm, s) else (if (down)
+            try sortedGatherPromptStaged(c.act, b.down.w, b.down.sc, b.down.bi, c.ids, 4, b.group, true, true, s)
+        else
+            try sortedGateUpRoutedStaged(c.x, c.map, b.gu.w, b.gu.sc, b.gu.bi, c.ids, c.route, ds_limit, .{ .gate = c.esc[0], .up = c.esc[1] }, 4, b.group, true, true, s)) orelse return error.KernelDeclinedTestShape;
+        defer for (outs) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        const vec = mlx.mlx_vector_array_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
+        if (i > 0) laps[i - 1] = @intCast(mark.untilNow(io, .boot).nanoseconds);
+    }
+    std.mem.sort(u64, &laps, {}, std.sort.asc(u64));
+    return @as(f64, @floatFromInt(laps[laps.len / 2])) / 4e6;
+}
+
+test "staged NAX sorted gather µbench on a served routing, today's plan against every staged tile (diag gqmm-ubench=route:<DSV41_ROUTE_DUMP file>)" {
+    const raw = std.mem.sliceTo(env.get(.GQMM_UBENCH) orelse return error.SkipZigTest, 0);
+    if (!std.mem.startsWith(u8, raw, "route:")) return error.SkipZigTest;
+    try requireNax();
+    errdefer dropOwnLatch();
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, raw["route:".len..], a, .limited(1 << 28));
+    defer a.free(bytes);
+    const words = std.mem.bytesAsSlice(u32, bytes[0 .. bytes.len / 4 * 4]);
+    const b = try DsBanks.init(16, s);
+    defer b.deinit();
+    // The tiles run on the calls of the dump's last row count only (the CED replay's); every call runs today's plan.
+    var sweep_rows: usize = 0;
+    {
+        var w: usize = 0;
+        while (w + 4 <= words.len) : (w += 4 + 2 * @as(usize, words[w + 3])) sweep_rows = words[w];
+    }
+    var tot: [2][1 + staged_variants.len]f64 = @splat(@splat(0));
+    var floor_tot: [2]f64 = .{ 0, 0 };
+    var calls: usize = 0;
+    var at: usize = 0;
+    var layer: usize = 0;
+    while (at + 4 <= words.len) : (layer += 1) {
+        const L: usize = words[at];
+        const n: usize = words[at + 3];
+        if (words[at + 2] != ds_experts or words[at + 1] != ds_top_k or at + 4 + 2 * n > words.len) return error.BadRouteDump;
+        const ids = words[at + 4 ..][0..n];
+        const rows = words[at + 4 + n ..][0..n];
+        at += 4 + 2 * n;
+        if (L != sweep_rows) continue;
+        calls += 1;
+        const c = try dsCallRouted(@alignCast(ids), @alignCast(rows), L, 0x6000 + layer, s);
+        defer c.deinit();
+        for ([_]bool{ false, true }, 0..) |down, di| {
+            const wb = @as(f64, @floatFromInt(c.touched)) * @as(f64, @floatFromInt(ds_hidden)) * @as(f64, @floatFromInt(if (down) ds_inter else 2 * ds_inter)) * (0.5 + 1.0 / 16.0);
+            floor_tot[di] += wb / 1.065e9;
+            const today = try dsRoutedMs(c, b, down, null, s);
+            tot[di][0] += today;
+            for (staged_variants, 0..) |st, vi| tot[di][1 + vi] += try dsRoutedMs(c, b, down, st, s);
+        }
+    }
+    const pick = stagedPlan(@intCast(6 * sweep_rows), ds_experts);
+    for (0..2) |di| {
+        std.debug.print("[gqmm-route] {d} calls of {d} rows {s}: today {d:.2} ms (plan bm={d} wm={d} wn={d} gx={d}), weight floor {d:.2} ms ({d:.0}%)\n", .{ calls, sweep_rows, if (di == 1) @as([]const u8, "down") else "gate+up+act", tot[di][0], pick.bm, pick.wm, pick.wn, pick.gx, floor_tot[di], 100 * floor_tot[di] / tot[di][0] });
+        for (staged_variants, 0..) |st, vi| std.debug.print("[gqmm-route]   staged bm={d} wm={d} wn={d} gx={d} {s}: {d:.2} ms ({d:.0}% of floor), {d:.2} ms saved\n", .{ st.bm, st.wm, st.wn, st.gx, if (st.tg_a) @as([]const u8, "tg-a") else "reg-a", tot[di][1 + vi], 100 * floor_tot[di] / tot[di][1 + vi], tot[di][0] - tot[di][1 + vi] });
     }
 }
