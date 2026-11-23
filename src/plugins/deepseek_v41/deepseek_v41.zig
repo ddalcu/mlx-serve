@@ -8297,7 +8297,7 @@ pub fn dsparkDraftLaunch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1:
     const t0 = monoUs();
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
-    const g = try draftGraph(&sc, m, st, t1, false, null);
+    const g = try draftGraph(&sc, m, st, t1, false, null, null);
     var out: DraftAhead = .{ .t1 = t1, .n = st.n, .gen = m.state_gen, .want_conf = g.want_conf };
     errdefer out.deinit();
     for (&out.ev, g.ev) |*slot, x| hold(slot, x);
@@ -8321,11 +8321,39 @@ pub fn dsparkDraftCollect(m: *Dsv41Model, gpa: std.mem.Allocator, a: *DraftAhead
 fn draftRows(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, keep_logits: bool) !DsparkDraft {
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
-    const g = try draftGraph(&sc, m, st, t1, keep_logits, null);
+    const g = try draftGraph(&sc, m, st, t1, keep_logits, null, null);
     var ev = g.ev;
     try evalAll(&ev);
     return draftRead(&sc, m, gpa, t1, &ev, g.want_conf, keep_logits);
 }
+/// A sampled draft (`MLX_SERVE_DSV41_DRAFT_SAMPLE`): the draft and its proposal `q` (f32 [B, vocab], each row
+/// softmax(biased row / T), the distribution its token was drawn from; the caller frees it).
+pub const SampledDraft = struct { d: DsparkDraft, q: A };
+
+/// `MLX_SERVE_DSV41_DRAFT_SAMPLE` (default off, read each round): a sampled request's DSpark rounds draw each draft
+/// token from the draft's own distribution and accept it with min(1, p / q).
+pub fn draftSampleOn() bool {
+    return env.on(.MLX_SERVE_DSV41_DRAFT_SAMPLE);
+}
+
+/// The draft for the block at [n, n + B) as `dsparkDraft` makes it, each position's token drawn from softmax(row / T)
+/// of its Markov-biased row (`u` [B, vocab] uniforms in [0, 1), `inv_t` 1 / T) instead of its argmax.
+pub fn dsparkDraftSampled(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, u: A, inv_t: f32) !SampledDraft {
+    const t0 = monoUs();
+    defer m.ds_draft_ns = @intCast((monoUs() - t0) * 1000);
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const it = try sc.keep(mlx.mlx_array_new_data(&inv_t, &[_]c_int{1}, 1, .float32));
+    const g = try draftGraph(&sc, m, st, t1, true, null, .{ .u = u, .inv_t = it });
+    const q = try sc.softmax(try sc.mul(g.ev[2], it), -1);
+    var ev = [_]A{ g.ev[0], g.ev[1], q };
+    try evalAll(&ev);
+    const d = try draftRead(&sc, m, gpa, t1, &ev, g.want_conf, false);
+    logOnce(&draft_sample_logged, "[dsv41] MLX_SERVE_DSV41_DRAFT_SAMPLE engaged: a sampled DSpark round's drafts drawn from the draft's own distribution, kept at min(1, p / q)\n");
+    return .{ .d = d, .q = sc.out(q) };
+}
+var draft_sample_logged = std.atomic.Value(bool).init(false);
+
 /// `draftRows`' graph (its arrays `sc`'s): the ids, the confidences (the ids again without them) and the rows `keep_logits`
 /// reads (the ids again otherwise).
 const DraftGraph = struct { ev: [3]A, want_conf: bool };
@@ -8333,7 +8361,7 @@ const DraftGraph = struct { ev: [3]A, want_conf: bool };
 /// position `n` (an int32 scalar) are the verify's GPU arrays; `window` is the host's `min(sliding_window, n)`, the same
 /// for every outcome.
 pub const GpuAt = struct { t1: A, n: A, window: usize };
-fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool, at: ?GpuAt) !DraftGraph {
+fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool, at: ?GpuAt, sample: ?markov.Sample) !DraftGraph {
     const c = &m.cfg;
     const B = m.ds_block;
     const hc = c.dsv4_hc_mult;
@@ -8354,7 +8382,7 @@ fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool
     const want_conf = m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
     // The fused chain (`markov.chain`: the op chain's bytes in B + 1 launches), null for a draft it does not take (the op
     // chain below).
-    const fused: ?markov.Out = try markov.chain(sc.s, .{ .logits = logits, .hout = hout, .t1 = cur, .emb = ds.markov_embed, .mh = ds.markov_head, .cw = ds.conf, .want_conf = want_conf, .keep = keep_logits });
+    const fused: ?markov.Out = try markov.chain(sc.s, .{ .logits = logits, .hout = hout, .t1 = cur, .emb = ds.markov_embed, .mh = ds.markov_head, .cw = ds.conf, .want_conf = want_conf, .keep = keep_logits, .sample = sample });
     if (fused) |f| {
         _ = try sc.keep(f.toks);
         if (f.conf) |fc| _ = try sc.keep(fc);
@@ -8371,7 +8399,9 @@ fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool
         const row = try sc.add(try sc.slice(logits, 0, k, k + 1), bias);
         rows_k[k] = row;
         if (want_conf) confs[k] = try sc.matmul(try sc.concat(&.{ try sc.astype(try sc.slice(hout, 0, k, k + 1), .float32), me }, -1), try sc.t2(ds.conf));
-        cur = try sc.astype(try sc.argmax(row, -1), .int32);
+        // Sampled: Gumbel-max over row / T with position k's uniforms, as the fused step kernel draws.
+        const drawn = if (sample) |sm| try sc.sub(try sc.mul(row, sm.inv_t), try sc.op1(mlx.mlx_log, try sc.op1(mlx.mlx_negative, try sc.op1(mlx.mlx_log, try sc.slice(sm.u, 0, k, k + 1))))) else row;
+        cur = try sc.astype(try sc.argmax(drawn, -1), .int32);
         toks[k] = cur;
     };
     const all = if (ops) try sc.concat(toks[0..B], 0) else fused.?.toks;
@@ -8925,7 +8955,7 @@ fn syncRound(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, pending: *Dspar
     const n_gpu = ag.n;
     try commitRows(&sc, m, st, v.mh, n0);
     const t_launch = monoUs();
-    const g = try draftGraph(&sc, m, st, 0, false, .{ .t1 = next, .n = n_gpu, .window = m.cfg.sliding_window });
+    const g = try draftGraph(&sc, m, st, 0, false, .{ .t1 = next, .n = n_gpu, .window = m.cfg.sliding_window }, null);
     var ahead: DraftAhead = .{ .t1 = 0, .n = 0, .gen = m.state_gen, .want_conf = g.want_conf, .st = st };
     errdefer ahead.deinit();
     for (&ahead.ev, g.ev) |*slot, x| hold(slot, x);
@@ -9059,6 +9089,24 @@ fn expectRowsClose(label: []const u8, got: []const f32, want: []const f32, width
     try testing.expectEqual(@as(usize, 0), argmax_miss);
 }
 
+/// The confidence head's logits `got` against the reference's (`want`, blocks of `B`): the largest error within 1e-3
+/// of the reference's peak; the reference one position on in each block (each logit read with the Markov embedding
+/// of the wrong token) must miss by ten times that.
+fn expectConfClose(label: []const u8, got: []const f32, want: []const f32, B: usize) !void {
+    try testing.expectEqual(want.len, got.len);
+    var peak: f64 = 0;
+    for (want) |v| peak = @max(peak, @abs(v));
+    var err: f64 = 0;
+    var shifted: f64 = 0;
+    for (got, want, 0..) |g, w, i| {
+        err = @max(err, @abs(@as(f64, g) - w) / peak);
+        if (i % B + 1 < B) shifted = @max(shifted, @abs(@as(f64, g) - want[i + 1]) / peak);
+    }
+    std.debug.print("{s}: max err {e:.2} of the peak {d:.3}; shifted one position {e:.2}\n", .{ label, err, peak, shifted });
+    try testing.expect(err <= 1e-3);
+    try testing.expect(shifted > 1e-2);
+}
+
 fn logitsHost(m: *Dsv41Model, st: *State, ids: []const u32, want: Want) ![]f32 {
     const l = try extend(m, testing.allocator, st, ids, want);
     defer _ = mlx.mlx_array_free(l);
@@ -9131,8 +9179,13 @@ test "dsv41 fixture: prefill, chunked prefill, spans and decode match DeepSeek's
         const draft_ids = t.fx.get("draft_ids");
         const draft_ref = if (draft_ids != null) try t.host("draft_logits") else &.{};
         defer if (draft_ids != null) gpa.free(draft_ref);
+        const conf_ref = if (draft_ids != null) try t.host("draft_conf") else &.{};
+        defer if (draft_ids != null) gpa.free(conf_ref);
         var drafted: std.ArrayList(f32) = .empty;
         defer drafted.deinit(gpa);
+        var confs: std.ArrayList(f32) = .empty;
+        defer confs.deinit(gpa);
+        t.m.ds_want_conf = true;
         for (n_prompt..ids.len) |i| {
             const row = try logitsHost(t.m, &st, ids[i .. i + 1], .last);
             defer gpa.free(row);
@@ -9147,9 +9200,13 @@ test "dsv41 fixture: prefill, chunked prefill, spans and decode match DeepSeek's
             var d = try draftRows(t.m, gpa, &st, t1, true);
             defer d.deinit(gpa);
             try drafted.appendSlice(gpa, d.logits);
+            try confs.appendSlice(gpa, d.confidence);
         }
         try expectRowsClose(try std.fmt.bufPrint(&label, "{s} decode", .{pack}), dec.items, dec_ref, V);
-        if (draft_ids != null) try expectRowsClose(try std.fmt.bufPrint(&label, "{s} DSpark draft", .{pack}), drafted.items, draft_ref, V);
+        if (draft_ids != null) {
+            try expectRowsClose(try std.fmt.bufPrint(&label, "{s} DSpark draft", .{pack}), drafted.items, draft_ref, V);
+            try expectConfClose(try std.fmt.bufPrint(&label, "{s} DSpark confidence", .{pack}), confs.items, conf_ref, t.m.ds_block);
+        }
     }
 }
 
