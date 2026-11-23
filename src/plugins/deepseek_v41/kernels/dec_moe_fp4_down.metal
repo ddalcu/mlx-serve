@@ -3,8 +3,20 @@
 // is the row's j-th pick, simdgroup TOPK the shared expert; lane l sums column l % NC over units l / NC, + 32 / NC...
 // (the columns' rows are adjacent in the bank). The slot sums are added in that order and rounded to T where
 // `hcExpand` reads y. DW (`MLX_SERVE_DSV41_FP4_DEC_WORD`): the routed codes decoded a word at a time.
+#if DSV41_DOWN_ORDER
+// `MLX_SERVE_DSV41_MOE_DOWN_ORDER`: a 1-D grid whose adjacent threadgroups are one column block's rows, so the rows
+// read the shared expert's and any common pick's weight rows back to back.
+const uint rows_ = threadgroups_per_grid.x / uint(N / NC);
+const uint d0 = (threadgroup_position_in_grid.x / rows_) * NC;
+#if DSV41_DOWN_ORDER_PLANT
+const uint r = threadgroup_position_in_grid.x / uint(N / NC);
+#else
+const uint r = threadgroup_position_in_grid.x % rows_;
+#endif
+#else
 const uint d0 = threadgroup_position_in_grid.x * NC;
 const uint r = threadgroup_position_in_grid.y;
+#endif
 const uint sgi = simdgroup_index_in_threadgroup;
 const uint lane = thread_index_in_simdgroup;
 const uint c = lane % NC;
