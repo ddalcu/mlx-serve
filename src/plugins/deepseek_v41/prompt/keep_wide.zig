@@ -167,7 +167,7 @@ pub fn pinned(rows: usize, bill: u64) void {
     const t0 = crt.monotonicMs();
     const rc = arm(buf[0..n]);
     const st = ps().last;
-    log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE: a reserve of {d} buffers, {d} MB ({d:.2} GB) at {d} rows, inside the pass's {d} MB working set, made in {d} ms{s}\n", .{ st.buffers, st.bytes >> 20, @as(f64, @floatFromInt(st.bytes)) / 1e9, rows, bill >> 20, crt.monotonicMs() - t0, if (rc != 0) " (a buffer failed to allocate)" else "" });
+    log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE: a reserve of {d} buffers, {d} MB ({d:.2} GB) at {d} rows, inside the pass's {d} MB working set, MLX active memory from now on, made in {d} ms{s}\n", .{ st.buffers, st.bytes >> 20, @as(f64, @floatFromInt(st.bytes)) / 1e9, rows, bill >> 20, crt.monotonicMs() - t0, if (rc != 0) " (a buffer failed to allocate)" else "" });
 }
 
 /// MLX's reserve made anew: one buffer of each of `bytes` (`available` first).
