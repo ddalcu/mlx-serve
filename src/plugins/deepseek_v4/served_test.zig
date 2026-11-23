@@ -1243,6 +1243,163 @@ test "deepseek_v41 served: a slot's greedy DSpark group rounds emit the same tok
     try testing.expectEqualSlices(u32, &x[0], &y[1]);
 }
 
+/// The tokens a request's DSpark rounds emit (up to `out.len`) on a fresh load of `files`, with the draft-only head the
+/// environment asks for at that load, and the drafts it accepted.
+fn dsparkTokens(files: []const sdk.fixture.File, sampling: SamplingParams, out: []u32) !struct { n: usize, accepted: u64 } {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, files, "");
+    defer p.close();
+    var tok: Tokenizer = undefined;
+    const prompt = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60, 11, 2, 30, 31 };
+    var gen = try Generator.initWithOptions(io, a, &p.xfm, &tok, &prompt, @intCast(out.len), sampling, &.{}, .{
+        .pld_enabled = true,
+        .mtp_enabled = true,
+        .skip_lazy_preforward = true,
+        .lookup_prompt = &prompt,
+    });
+    defer gen.deinit(a);
+    try testing.expect(gen.dspark_enabled);
+    var n: usize = 0;
+    while (n < out.len) {
+        const r = (try gen.nextDspark(a)) orelse break;
+        defer a.free(r.tokens);
+        const k = @min(r.tokens.len, out.len - n);
+        @memcpy(out[n..][0..k], r.tokens[0..k]);
+        n += k;
+    }
+    return .{ .n = n, .accepted = gen.dspark_accepted_tokens };
+}
+
+test "deepseek_v41 served: a draft-only head (DRAFT_HEAD4, DRAFT_VOCAB) changes the drafts, never the tokens, greedy and seeded" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const dsv41 = @import("../deepseek_v41/deepseek_v41.zig");
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const files = try fixture.v41DsparkFiles(arena.allocator(), 7);
+    const ds = env.override(.MLX_SERVE_DSV4_DSPARK, "1");
+    defer ds.restore();
+    // A vocabulary of 64 of the fixture's 96 ids: every id but those one past a multiple of 3, so the peaked head's 7
+    // is never drafted while its 5 is.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(a);
+    for (0..96) |v| if (v % 3 != 1) try text.print(a, "{d}\n", .{v});
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "vocab.txt", .data = text.items });
+    var dbuf: [512]u8 = undefined;
+    const dir = dbuf[0..try tmp.dir.realPath(io, &dbuf)];
+    var pbuf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/vocab.txt", .{dir}, 0);
+    const Arm = struct { head4: ?[*:0]const u8, vocab: ?[*:0]const u8 };
+    const arms = [_]Arm{ .{ .head4 = null, .vocab = null }, .{ .head4 = "1", .vocab = null }, .{ .head4 = null, .vocab = path.ptr }, .{ .head4 = "1", .vocab = path.ptr } };
+    // A seeded request on the keyed sampler (MLX_SERVE_KEYED_SAMPLING: the draw at each generated index is fixed by the
+    // seed) emits serial decoding's tokens whatever the drafts; the one-hot acceptance gives the trunk's distribution
+    // either way (`dsparkStochasticRound`).
+    const keyed = env.override(.MLX_SERVE_KEYED_SAMPLING, "1");
+    defer keyed.restore();
+    const samplings = [_]SamplingParams{ .{ .temperature = 0 }, .{ .temperature = 0.8, .top_p = 0.95, .seed = 4 } };
+    for (samplings) |sampling| {
+        var want: [48]u32 = undefined;
+        var want_n: usize = 0;
+        for (arms, 0..) |arm, i| {
+            const arm_h4 = env.override(.MLX_SERVE_DSV41_DRAFT_HEAD4, arm.head4);
+            defer arm_h4.restore();
+            const arm_dv = env.override(.MLX_SERVE_DSV41_DRAFT_VOCAB, arm.vocab);
+            defer arm_dv.restore();
+            var got: [48]u32 = undefined;
+            const r = try dsparkTokens(files, sampling, &got);
+            std.debug.print("[draft head] temperature {d}: head4 {any} vocab {any}: {d} tokens, {d} drafts accepted\n", .{ sampling.temperature, arm.head4 != null, arm.vocab != null, r.n, r.accepted });
+            if (i == 0) {
+                want = got;
+                want_n = r.n;
+                continue;
+            }
+            // The verify decides every kept token (greedy) and the request's keyed draws every sampled one.
+            try testing.expectEqualSlices(u32, want[0..want_n], got[0..r.n]);
+        }
+    }
+    // The drafts themselves: a vocabulary's ids only, a batched draft each state's solo one, rows -inf past it.
+    const h4 = env.override(.MLX_SERVE_DSV41_DRAFT_HEAD4, "1");
+    defer h4.restore();
+    const dv = env.override(.MLX_SERVE_DSV41_DRAFT_VOCAB, path.ptr);
+    defer dv.restore();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, files, "");
+    defer p.close();
+    var g = ops.Graph.init(a, mlx.gpuStream());
+    defer g.deinit();
+    const m = intree.dsv41(&p.xfm).?;
+    const draft = m.dspark.?.draft.?;
+    try testing.expectEqual(@as(usize, 64), draft.k);
+    try testing.expectEqual(@as(u32, 4), draft.head.qp.bits);
+    try testing.expectEqual(@as(u32, 8), m.head.qp.bits);
+    const prompts = [_][]const u32{ &.{ 3, 17, 42, 9, 7, 25, 1, 60, 11, 2, 90 }, &.{ 5, 8, 13, 21, 34, 55, 89, 4, 6, 10, 12, 14, 16, 18 } };
+    var sts: [2]dsv41.State = undefined;
+    for (&sts, prompts) |*st, pr| {
+        st.* = try dsv41.initState(m, a);
+        _ = try g.adopt(try dsv41.extend(m, a, st, pr, .last));
+    }
+    defer for (&sts) |*st| st.deinit();
+    var drafts: [2]dsv41.DsparkDraft = undefined;
+    // t1 = 7, outside the vocabulary: it enters the chain all the same.
+    try dsv41.dsparkDraftBatched(m, a, &.{ &sts[0], &sts[1] }, &.{ 7, 5 }, true, &drafts);
+    defer for (&drafts) |*d| d.deinit(a);
+    for (&sts, &drafts) |*st, *d| {
+        for (d.ids[1..]) |id| try testing.expect(id < 96 and id % 3 != 1);
+        for (0..d.ids.len - 1) |k| for (d.logits[k * 96 ..][0..96], 0..) |x, id| try testing.expectEqual(id % 3 == 1, std.math.isNegativeInf(x));
+        var alone = try dsv41.dsparkDraft(m, a, st, d.ids[0]);
+        defer alone.deinit(a);
+        try testing.expectEqualSlices(u32, alone.ids, d.ids);
+    }
+    // A sampled draft (`MLX_SERVE_DSV41_DRAFT_SAMPLE`) over the vocabulary: its tokens are the vocabulary's, and its q, the
+    // proposal the verdict's min(1, p / q) and max(0, p - q) read, is 0 past it and sums to 1 over it.
+    {
+        var key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(key);
+        try mlx.check(mlx.mlx_random_key(&key, 5));
+        const lo = mlx.mlx_array_new_float(0);
+        defer _ = mlx.mlx_array_free(lo);
+        const hi = mlx.mlx_array_new_float(1);
+        defer _ = mlx.mlx_array_free(hi);
+        var u = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(u);
+        try mlx.check(mlx.mlx_random_uniform(&u, lo, hi, &[_]c_int{ @intCast(m.ds_block), 96 }, 2, .float32, key, mlx.gpuStream()));
+        var sd = try dsv41.dsparkDraftSampled(m, a, &sts[1], 7, u, 1.25);
+        defer sd.d.deinit(a);
+        defer _ = mlx.mlx_array_free(sd.q);
+        for (sd.d.ids[1..]) |id| try testing.expect(id % 3 != 1);
+        const qd = mlx.mlx_array_data_float32(sd.q) orelse return error.NoData;
+        for (0..m.ds_block) |k| {
+            var sum: f64 = 0;
+            for (qd[k * 96 ..][0..96], 0..) |x, id| {
+                if (id % 3 == 1) try testing.expectEqual(@as(f32, 0), x);
+                sum += x;
+            }
+            try testing.expectApproxEqAbs(@as(f64, 1), sum, 1e-4);
+        }
+    }
+    // A request's prompt ids join its state's vocabulary: 7 and 31 (outside the file) become draftable; 5 (inside)
+    // adds nothing; an id the prompt repeats counts once. Off (MLX_SERVE_DSV41_DRAFT_VOCAB_PROMPT=0): the file's alone.
+    try dsv41.draftPromptVocab(m, &sts[0], &.{ 7, 5, 31, 7, 5 });
+    const ex = sts[0].draft_extra.?;
+    try testing.expectEqual(@as(usize, 2), ex.e);
+    try testing.expectEqual(@as(usize, 66), ex.k);
+    for ([_]u32{ 7, 31 }) |t1| {
+        var d = try dsv41.dsparkDraft(m, a, &sts[0], t1);
+        defer d.deinit(a);
+        for (d.ids[1..]) |id| try testing.expect(id % 3 != 1 or id == 7 or id == 31);
+    }
+    {
+        const off = env.override(.MLX_SERVE_DSV41_DRAFT_VOCAB_PROMPT, "0");
+        defer off.restore();
+        try dsv41.draftPromptVocab(m, &sts[0], &.{ 7, 31 });
+        try testing.expect(sts[0].draft_extra == null);
+    }
+}
+
 test "deepseek_v4 served: mlx-community's withdrawn preview pack is refused by the legacy parse and, at load, by name" {
     const preview = @embedFile("fixtures/real/mlx-community_DeepSeek-V4-Flash-4bit.json");
     try testing.expectError(error.UnsupportedDsv4Config, model.parseConfigFromJson(testing.allocator, preview));

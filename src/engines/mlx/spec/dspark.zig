@@ -150,6 +150,11 @@ pub fn moduleRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStep
         try plugin_settle.activate(self.xfm, &self.ctx);
         // An exact greedy accept masks what the serial sampler masks.
         mdl.suppress = self.xfm.suppress_mask orelse .{ .ctx = null };
+        // A draft vocabulary takes the request's prompt ids before its first round.
+        if (!self.dspark_prompt_vocab) {
+            self.dspark_prompt_vocab = true;
+            try dsv41_mod.draftPromptVocab(mdl, &mdl.dec_state.?, self.prompt_ids_owned);
+        }
         if (try self.dsparkCopyStep(allocator, mdl)) |res| return res;
         return self.dsparkPolicyStep(allocator, mdl);
     }
@@ -1046,6 +1051,63 @@ test "dspark sampled verdict (GPU): drafts drawn from q, kept at min(1, p / q) a
     const planted = chiSquare(&got[1], &p, N);
     std.debug.print("[dspark sample] chi-square of the emitted token against p over {d} seeded rounds (5 dof): q in the ratio {d:.1}, a flat proposal {d:.1}\n", .{ N, exact, planted });
     // 5 degrees of freedom: 30 is past the 1e-5 tail; the flat proposal's bias is about 345 at this count.
+    try testing.expect(exact < 30);
+    try testing.expect(planted > 150);
+}
+
+test "dspark sampled verdict (GPU): a draft vocabulary's q (0 past it, renormalized over it) in the ratio and the residual emits p; the whole row's q for the same draws fails" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const V = 6;
+    const p = [_]f64{ 0.05, 0.10, 0.15, 0.20, 0.20, 0.30 };
+    // The draft's whole-row softmax, and its vocabulary {0, 2, 3, 5}: the drafts come from the row over those ids alone
+    // (`dsv41.draftChain` with `MLX_SERVE_DSV41_DRAFT_VOCAB`), the renormalized restriction, 0 at ids 1 and 4.
+    const whole = [_]f64{ 0.30, 0.25, 0.20, 0.10, 0.10, 0.05 };
+    const in_vocab = [_]bool{ true, false, true, true, false, true };
+    var z: f64 = 0;
+    for (whole, in_vocab) |w, in| z += if (in) w else 0;
+    var q: [V]f64 = undefined;
+    for (&q, whole, in_vocab) |*o, w, in| o.* = if (in) w / z else 0;
+    var pv: [2 * V]f32 = undefined;
+    for (0..V) |i| {
+        pv[i] = @floatCast(p[i]);
+        pv[V + i] = @floatCast(p[V - 1 - i]);
+    }
+    var qv: [V]f32 = undefined;
+    for (&qv, q) |*o, v| o.* = @floatCast(v);
+    var wv: [V]f32 = undefined;
+    for (&wv, whole) |*o, v| o.* = @floatCast(v);
+    const probs = mlx.mlx_array_new_data(&pv, &[_]c_int{ 1, 2, V }, 3, .float32);
+    defer _ = mlx.mlx_array_free(probs);
+    const qa = mlx.mlx_array_new_data(&qv, &[_]c_int{ 1, V }, 2, .float32);
+    defer _ = mlx.mlx_array_free(qa);
+    // planted: the ratio and the residual read the whole row's softmax, not the restricted q the drafts came from
+    const wa = mlx.mlx_array_new_data(&wv, &[_]c_int{ 1, V }, 2, .float32);
+    defer _ = mlx.mlx_array_free(wa);
+    const N = 4000;
+    var got: [2][V]u64 = .{ @splat(0), @splat(0) };
+    for (0..2) |arm| {
+        var prng = std.Random.DefaultPrng.init(0xD5A3);
+        const rnd = prng.random();
+        for (0..N) |trial| {
+            var u = rnd.float(f64);
+            var x: u32 = V - 1;
+            for (q, 0..) |qi, i| {
+                if (u < qi) {
+                    x = @intCast(i);
+                    break;
+                }
+                u -= qi;
+            }
+            try testing.expect(in_vocab[x]);
+            const v = try verdictOf(probs, &.{ 0, x }, if (arm == 0) qa else wa, 1, .{ .temperature = 1, .seed = 4321 + trial }, rnd, s);
+            got[arm][if (v.accepted == 1) x else v.next_token] += 1;
+        }
+    }
+    const exact = chiSquare(&got[0], &p, N);
+    const planted = chiSquare(&got[1], &p, N);
+    std.debug.print("[dspark sample] draft vocabulary: chi-square of the emitted token against p over {d} seeded rounds (5 dof): the restricted q {d:.1}, the whole row's {d:.1}\n", .{ N, exact, planted });
+    // The whole row's q never resamples id 1 (p 0.10 < q 0.25): its expected chi-square is about 900 at this count.
     try testing.expect(exact < 30);
     try testing.expect(planted > 150);
 }

@@ -303,7 +303,10 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice(), .quant = quant });
     errdefer m.mdl.deinit();
     // The fused Markov chain's kernels compiled now, not in the first draft.
-    if (m.mdl.dspark) |*w| try @import("spec/markov.zig").warm(m.mdl.s, w.markov_embed, w.markov_head, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true, dsv41.draftSampleOn());
+    if (m.mdl.dspark) |*w| {
+        const mk = w.markovFor();
+        try @import("spec/markov.zig").warm(m.mdl.s, mk.emb, mk.mh, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true, dsv41.draftSampleOn());
+    }
     try dsv41.syncWarm(m.mdl);
     m.bank = null;
     m.bank_streams = false;
@@ -811,13 +814,15 @@ fn auxImportArrays(mp: *anyopaque, ids: abi.Span(u32), header: abi.Str, arrays: 
 
 /// The load reads its Engram tables from disk per lookup and drops the tensors it never loads
 /// (`dsv41.residentDiskBytes`); the `mtp` setting decides the DSpark stages; plus a bf16 prompt trunk
-/// (`bill.pfTrunkBytes`), and the Engram partials' cache at its bound (`engram_kvc.billBytes`).
+/// (`bill.pfTrunkBytes`), the Engram partials' cache at its bound (`engram_kvc.billBytes`), and a draft-only head
+/// (`dsv41.draftHeadBytes`).
 fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, settings_json: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
     const mtp = mtpSetting(settings_json.slice());
     out.* = dsv41.residentDiskBytes(gpa, model_dir.slice(), config.of(p), mtp, shards) catch |e| return Verdict.named(.failed, @errorName(e));
     if (mx_view.on()) out.* -|= mx_view.savedBytes(gpa, model_dir.slice(), dsv41.dsparkWanted(config.of(p), null, mtp)) catch |e| return Verdict.named(.failed, @errorName(e));
     out.* += bill_mod.pfTrunkBytes(config.of(p));
     out.* += engram_kvc.billBytes(config.of(p).dsv41_n_engram_layers);
+    out.* += dsv41.draftHeadBytes(config.of(p), dsv41.dsparkWanted(config.of(p), null, mtp), model_dir.slice());
     return .ok;
 }
 
