@@ -155,7 +155,7 @@ pub fn prepare(cfg: anytype) void {
 pub fn pinned(rows: usize, bill: u64) void {
     ps().rows = rows;
     ps().bill = bill;
-    if (ps().decided or ps().n_per_row == 0 or !env.on(.MLX_SERVE_DSV41_PF_KEEP_WIDE)) return;
+    if (ps().decided or ps().n_per_row == 0 or !env.onUnlessZero(.MLX_SERVE_DSV41_PF_KEEP_WIDE)) return;
     ps().decided = true;
     if (!available()) return log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE declined: the loaded libmlx has no mlx_metal_wide_reserve (patches/mlx-metal-wide-reserve.patch)\n", .{});
     var buf: [max_buffers]usize = undefined;
