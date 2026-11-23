@@ -7976,10 +7976,16 @@ fn commitRows(sc: *Scope, m: *Dsv41Model, st: *State, mh: A, p0: usize) !void {
 /// state's rows), inverse-roped for `attnOutRoped`: every row sees the stage's window of committed main rows and every
 /// draft row.
 fn dsparkHeads(sc: *Scope, m: *Dsv41Model, ly: *const Layer, rows: Proj, main_keys: A, pos: A) !A {
-    const hd = m.cfg.head_dim;
     const pj = try ropeProj(sc, m, ly, m.rope_plain.fwd, rows, pos);
-    const keys = try sc.astype(try sc.concat(&.{ main_keys, pj.kv }, 0), .float32);
-    const qf = try sc.astype(pj.q, .float32);
+    return dsparkHeadsAt(sc, m, ly, pj.q, pj.kv, main_keys, pos);
+}
+
+/// `dsparkHeads` from the draft rows' roped heads `q` and their window rows `kv` (normed, roped, round-tripped); `pos`
+/// the first row's position (an int32 scalar).
+fn dsparkHeadsAt(sc: *Scope, m: *Dsv41Model, ly: *const Layer, q: A, kv: A, main_keys: A, pos: A) !A {
+    const hd = m.cfg.head_dim;
+    const keys = try sc.astype(try sc.concat(&.{ main_keys, kv }, 0), .float32);
+    const qf = try sc.astype(q, .float32);
     const logits = try sc.mul(try sc.matmul(qf, try sc.t2(keys)), try sc.f(1.0 / @sqrt(@as(f32, @floatFromInt(hd)))));
     const mx = try sc.op2(mlx.mlx_maximum, try sc.max(logits, -1, true), ly.sink);
     const p = try sc.op1(mlx.mlx_exp, try sc.sub(logits, mx));
@@ -8249,9 +8255,14 @@ pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []cons
 
 /// A DSpark stage over `B` draft rows a state: the mixes, norms and FFN over every row, each state's attention
 /// against its own window of committed main rows.
-fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize, x: A, pre: *A, B: usize, at: ?GpuAt) !A {
+pub fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize, x: A, pre: *A, B: usize, at: ?GpuAt) !A {
     const ly = &m.layers[li];
     const si = li - m.n_layers;
+    const fused = env.onUnlessZero(.MLX_SERVE_DSV41_DRAFT_FUSED);
+    if (fused and states.len == 1) if (try stageFused(sc, m, states[0], li, x, pre, at)) |y| {
+        logOnce(&draft_fused_logged, "[dsv41] MLX_SERVE_DSV41_DRAFT_FUSED engaged: a DSpark stage on in_proj, wq_b, ffn_in and the fused MoE\n");
+        return y;
+    };
     const pa = try hcPreNorm(sc, m, x, pre.*, &ly.hc_attn, ly.attn_norm);
     // The projections read their weights once for every state's rows; the rope and the attention are each state's.
     const rows = try qkvRows(sc, m, ly, pa.h);
@@ -8266,11 +8277,62 @@ fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize, x: 
         const keys = try st.ds[si].read(sc, st.n - window, st.n);
         o.* = try dsparkHeads(sc, m, ly, mine, keys, try sc.i(ci(st.n)));
     }
-    const h = try attnOutRoped(sc, m, ly, if (states.len == 1) heads[0] else try sc.concat(heads[0..states.len], 0));
+    const r = if (states.len == 1) heads[0] else try sc.concat(heads[0..states.len], 0);
+    if (fused) if (try stageFfnFused(sc, m, ly, r, x, &pa.sp)) |f| {
+        logOnce(&draft_ffn_logged, "[dsv41] MLX_SERVE_DSV41_DRAFT_FUSED engaged: a batched DSpark stage's FFN on ffn_in and the fused MoE\n");
+        pre.* = f.pre;
+        return f.x;
+    };
+    const h = try attnOutRoped(sc, m, ly, r);
     const pf = try hcExpandPreNorm(sc, m, x, h, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
     const y = try moe(sc, m, li, pf.h, none);
     pre.* = pf.sp.pre;
     return hcExpand(sc, pf.x1, y, &pf.sp);
+}
+
+/// One line the first time a default-off switch's path runs (a unit's copy each: `-Dunits` may print it once a unit).
+var draft_fused_logged = std.atomic.Value(bool).init(false);
+var draft_ffn_logged = std.atomic.Value(bool).init(false);
+fn logOnce(flag: *std.atomic.Value(bool), comptime msg: []const u8) void {
+    if (!flag.swap(true, .monotonic)) log.info(msg, .{});
+}
+
+/// One state's stage on the fused decode kernels a trunk layer's decode runs (`blockFused`): in_proj (the hc mixes, the
+/// norm, q_kv), wq_b (q_norm, wq_b, the rope, the window row and the hc split) at the draft rows' positions, the stage's
+/// attention, then `stageFfnFused`; null (nothing moved) where a kernel declines the stage.
+fn stageFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, at: ?GpuAt) !?A {
+    const kp = &(m.dec.in_proj orelse return null);
+    const kq = m.dec.wq_b orelse return null;
+    const ly = &m.layers[li];
+    const L = dim(x, 0);
+    const a = try dkern.in_proj.run(sc, kp, m, ly, x, pre.*) orelse return null;
+    // `GpuAt`: the rows' positions from the GPU's (the same values `rowsAt` lays out).
+    const rows_pos = if (at) |g| try sc.add(try sc.arange(0, L), g.n) else try dkern.wq_b.rowsAt(sc, st.n, L);
+    const w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, rows_pos) orelse return null;
+    const si = li - m.n_layers;
+    const keys = if (at) |g| try st.ds[si].readAt(sc, g.n, g.window) else blk: {
+        const window = @min(m.cfg.sliding_window, st.n);
+        break :blk try st.ds[si].read(sc, st.n - window, st.n);
+    };
+    const f = try stageFfnFused(sc, m, ly, try dsparkHeadsAt(sc, m, ly, w.q, w.kv_row, keys, if (at) |g| g.n else try sc.i(ci(st.n))), x, &w.sa) orelse return null;
+    pre.* = f.pre;
+    return f.x;
+}
+
+/// A stage's attn_out and FFN over its draft rows `r` (`[L, H, hd]`, inverse-roped) on the fused decode kernels, as
+/// `blockTail` runs a trunk layer's: the grouped wo_a, then `ffn_in` (wo_b, the hc expand, the FFN norm and router) and
+/// the fused MoE with the hc expand. The new stream and the FFN's mix; null (nothing moved) where `ffn_in` declines.
+pub fn stageFfnFused(sc: *Scope, m: *Dsv41Model, ly: *const Layer, r: A, x: A, sa: *const Split) !?struct { x: A, pre: A } {
+    const L = dim(r, 0);
+    if (L > dkern.max_rows or ly.wo_a.ext != null or m.dec.ffn_in == null) return null;
+    const oa = try attnOutA(sc, m, ly, try sc.transpose(try sc.reshape(r, &.{ ci(L), ci(dim(ly.wo_a.w, 0)), -1 }), &.{ 1, 0, 2 }), null);
+    const f = try ffnInFused(sc, m, ly, oa, x, sa) orelse return null;
+    // As `blockTail`: `ffnInFused`'s routes come without the layer's down scale, which the fused fp4 launches take inside
+    // under `fuse.down_scale`, else `routeScaled` puts on them (a bank without ModelOpt's per-expert scales: neither).
+    if (m.fuse.down_scale) if (try fusion.ffnDownScaled(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf)) |y| return .{ .x = y, .pre = f.sf.pre };
+    const wts = try routeScaled(sc, ly, f.idx, f.wts);
+    const y = try ffnDecode(sc, m, ly, f.h2, f.idx, wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, wts)), &f.sf);
+    return .{ .x = y, .pre = f.sf.pre };
 }
 
 pub const DsparkPending = struct {
