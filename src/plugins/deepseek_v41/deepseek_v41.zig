@@ -4857,6 +4857,16 @@ pub fn moePrefillParts(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A,
 }
 
 pub const Routes = struct { idx: A, wts: A };
+/// `MLX_SERVE_DSV41_PF_ROUTER_BF16`'s sum at `rows` x `e` experts x `k`: where today's chain runs MLX's regular kernel
+/// (`gate_gemm.router`, one running sum over K) the single sum, today's words; where MLX splits K (fewer rows) the
+/// blocked sum, which is no farther from float64 than that split (the wide test's bar).
+pub fn routerSum(rows: usize, e: usize, k: usize) ggemm.Sum {
+    const regular = ggemm.mlxRegular(@intCast(rows), @intCast(e), @intCast(k));
+    // The plant flips it: regular widths blocked, split-K widths single.
+    return if (regular != router_sum_plant) .single else .blocked;
+}
+/// The router float64 test's planted control: each width on the other sum.
+pub var router_sum_plant = false;
 var router_bf16_logged = std.atomic.Value(bool).init(false);
 /// `MLX_SERVE_DSV41_PF_ROUTER_BF16`'s calls served (the tests' engagement count).
 pub var router_bf16_count = std.atomic.Value(usize).init(0);
@@ -4870,8 +4880,8 @@ pub fn gateLogits(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !A {
     const L = dim(x, 0);
     const E = dim(ly.gate_w, 0);
     if (L > region_rows) {
-        // MLX_SERVE_DSV41_PF_ROUTER_BF16: x and gate_w both bf16, the MMA in bf16 (exact products, reordered sums).
-        if (env.on(.MLX_SERVE_DSV41_PF_ROUTER_BF16)) if (try ggemm.bf16F32(sc.s, x, ly.gate_w, device.naxAvailable(), .single)) |y| {
+        // MLX_SERVE_DSV41_PF_ROUTER_BF16: x and gate_w both bf16, the MMA in bf16 (exact products; `routerSum`).
+        if (env.on(.MLX_SERVE_DSV41_PF_ROUTER_BF16)) if (try ggemm.bf16F32(sc.s, x, ly.gate_w, device.naxAvailable(), routerSum(L, E, dim(x, 1)))) |y| {
             if (!router_bf16_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_ROUTER_BF16 engaged ({d} rows)\n", .{L});
             _ = router_bf16_count.fetchAdd(1, .monotonic);
             if (router_bf16_plant) return sc.mul(try sc.keep(y), try sc.f(-1));

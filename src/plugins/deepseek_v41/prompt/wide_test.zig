@@ -1014,44 +1014,58 @@ test "dsv41 wide tol: PF_COMP_BF16's compressor projection over a 4,096-row laye
     try testing.expect(!(ep.l2 <= eo.l2 and ep.max <= eo.max));
 }
 
-test "dsv41 wide tol: PF_ROUTER_BF16's logits at the served one-pass shape (17,638 rows, 384 experts, K 5,120) are today's gate_gemm router's words, and so as far from float64" {
+test "dsv41 wide tol: PF_ROUTER_BF16's logits at every served width (33 to 17,638 rows, 384 experts, K 5,120) are no farther from float64 than today's path in l2 and max, and today's words where today runs gate_gemm's single sum; each width on the other sum (planted) is farther somewhere" {
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;
     var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
-    const rows = 17_638;
     const E = 384;
-    const x = try normal(&sc, &.{ rows, @intCast(hidden) }, .bfloat16, 1, 0x71);
     const w = try normal(&sc, &.{ E, @intCast(hidden) }, .bfloat16, 1.0 / @sqrt(@as(f32, hidden)), 0x72);
-    try dsv41.evalAll(&.{ x, w });
-    // Today's served call (`gateLogits` past the decode width: gate_gemm's f32-MMA launch) and the switch's.
-    const today = (try ggemm.router(sc.s, x, w, true)) orelse return error.Declined;
-    _ = try sc.keep(today);
-    const got = (try ggemm.bf16F32(sc.s, x, w, true, .single)) orelse return error.Declined;
-    _ = try sc.keep(got);
-    const a = try dsv41.hostF32(today);
-    defer gpa.free(a);
-    const b = try dsv41.hostF32(got);
-    defer gpa.free(b);
-    var differ: usize = 0;
-    for (a, b) |p, q| differ += @intFromBool(p != q);
-    // float64 over 256 rows from the middle of the pass.
-    const r0 = 8704;
-    const n = 256;
-    const xs = try dsv41.hostF32(try sc.slice(x, 0, r0, r0 + n));
-    defer gpa.free(xs);
     const ws = try dsv41.hostF32(w);
     defer gpa.free(ws);
-    const ref = try gpa.alloc(f64, n * E);
-    defer gpa.free(ref);
-    for (0..n) |r| for (0..E) |c| {
-        var acc: f64 = 0;
-        for (xs[r * hidden ..][0..hidden], ws[c * hidden ..][0..hidden]) |p, q| acc += @as(f64, p) * @as(f64, q);
-        ref[r * E + c] = acc;
-    };
-    const et = f64Err(a[r0 * E ..][0 .. n * E], ref);
-    const eg = f64Err(b[r0 * E ..][0 .. n * E], ref);
-    std.debug.print("router logits, {d} rows x {d}: {d} of {d} words differ between today's and PF_ROUTER_BF16; from float64 (rows {d}..{d}): today l2 {e:.3} max {e:.3}, PF_ROUTER_BF16 l2 {e:.3} max {e:.3}\n", .{ rows, E, differ, a.len, r0, r0 + n, et.l2, et.max, eg.l2, eg.max });
-    try testing.expectEqual(@as(usize, 0), differ);
+    var planted_farther = false;
+    // The CED replay's 128, a verify block, a short prompt, the split-K edge each side, a chunk and the one-pass width.
+    for ([_]usize{ 33, 128, 1024, 1706, 1707, 4097, 17_638 }) |rows| {
+        const x = try normal(&sc, &.{ @intCast(rows), @intCast(hidden) }, .bfloat16, 1, 0x71 + rows);
+        try dsv41.evalAll(&.{ x, w });
+        // Today's served call: gate_gemm's launch where MLX runs its regular kernel, else MLX's f32 matmul.
+        const today = (try ggemm.router(sc.s, x, w, true)) orelse try sc.matmul(try sc.astype(x, .float32), try sc.transpose(try sc.astype(w, .float32), &.{ 1, 0 }));
+        _ = try sc.keep(today);
+        const got = (try ggemm.bf16F32(sc.s, x, w, true, dsv41.routerSum(rows, E, hidden))) orelse return error.Declined;
+        _ = try sc.keep(got);
+        dsv41.router_sum_plant = true;
+        const other = (try ggemm.bf16F32(sc.s, x, w, true, dsv41.routerSum(rows, E, hidden))) orelse return error.Declined;
+        dsv41.router_sum_plant = false;
+        _ = try sc.keep(other);
+        // float64 over (at most) 256 rows from the middle.
+        const n = @min(rows, 256);
+        const r0 = (rows - n) / 2;
+        const a = try dsv41.hostF32(try sc.slice(today, 0, r0, r0 + n));
+        defer gpa.free(a);
+        const b = try dsv41.hostF32(try sc.slice(got, 0, r0, r0 + n));
+        defer gpa.free(b);
+        const c = try dsv41.hostF32(try sc.slice(other, 0, r0, r0 + n));
+        defer gpa.free(c);
+        const xs = try dsv41.hostF32(try sc.slice(x, 0, r0, r0 + n));
+        defer gpa.free(xs);
+        const ref = try gpa.alloc(f64, n * E);
+        defer gpa.free(ref);
+        for (0..n) |r| for (0..E) |col| {
+            var acc: f64 = 0;
+            for (xs[r * hidden ..][0..hidden], ws[col * hidden ..][0..hidden]) |p, q| acc += @as(f64, p) * @as(f64, q);
+            ref[r * E + col] = acc;
+        };
+        var differ: usize = 0;
+        for (a, b) |p, q| differ += @intFromBool(p != q);
+        const et = f64Err(a, ref);
+        const eg = f64Err(b, ref);
+        const eo = f64Err(c, ref);
+        const regular = ggemm.mlxRegular(@intCast(rows), E, hidden);
+        std.debug.print("router logits, {d} rows ({s}; today {s}): {d} of {d} words differ; from float64: today l2 {e:.3} max {e:.3}, PF_ROUTER_BF16 ({s}) l2 {e:.3} max {e:.3}, the other sum l2 {e:.3} max {e:.3}\n", .{ rows, if (regular) "MLX's regular kernel" else "MLX's split K", if (regular) "gate_gemm" else "MLX matmul", differ, a.len, et.l2, et.max, @tagName(dsv41.routerSum(rows, E, hidden)), eg.l2, eg.max, eo.l2, eo.max });
+        try testing.expect(eg.l2 <= et.l2 and eg.max <= et.max);
+        if (regular) try testing.expectEqual(@as(usize, 0), differ);
+        if (!(eo.l2 <= et.l2 and eo.max <= et.max)) planted_farther = true;
+    }
+    try testing.expect(planted_farther);
 }
