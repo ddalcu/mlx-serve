@@ -1684,14 +1684,16 @@ pub const GatherAttn = struct {
         errdefer _ = mlx.mlx_fast_metal_kernel_free(pv);
         // MLX_SERVE_DSV41_FLASH_ATTN (flash_attn.zig): the flash kernel and its heads-region twin (a missed anchor
         // refuses the load by name).
-        const flash: ?mlx.mlx_fast_metal_kernel = if (fa.ps().mode == .on) try buildKernel("dsv41_attn_flash", &FLASH_INS, &.{"o"}, fa.source, dkern.attn.HEADER) else null;
+        // MLX_SERVE_DSV41_FLASH_TRIM / MLX_SERVE_DSV41_FLASH_PSUM: the same text under their defines (`fa.header`).
+        const fh = fa.header();
+        const flash: ?mlx.mlx_fast_metal_kernel = if (fa.ps().mode == .on) try buildKernel(fa.kernelName(false), &FLASH_INS, &.{"o"}, fa.source, fh) else null;
         errdefer if (flash) |k| {
             _ = mlx.mlx_fast_metal_kernel_free(k);
         };
         const flash_heads: ?mlx.mlx_fast_metal_kernel = if (fa.ps().mode == .on) blk: {
-            const t = try fa.regionTwin(std.heap.page_allocator, dkern.attn.HEADER);
+            const t = try fa.regionTwin(std.heap.page_allocator, std.mem.span(fh));
             defer std.heap.page_allocator.free(t);
-            break :blk try buildKernel("dsv41_attn_flash_heads", &(FLASH_INS ++ [_][*:0]const u8{ "dep", "soff", "o_dst", "dep2" }), &.{"carrier"}, t.ptr, dkern.attn.HEADER);
+            break :blk try buildKernel(fa.kernelName(true), &(FLASH_INS ++ [_][*:0]const u8{ "dep", "soff", "o_dst", "dep2" }), &.{"carrier"}, t.ptr, fh);
         } else null;
         errdefer if (flash_heads) |k| {
             _ = mlx.mlx_fast_metal_kernel_free(k);
@@ -3484,7 +3486,7 @@ fn attnGather(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, qt: A, keys_w: A,
     // default served by the gather's fresh launches below (never the ring).
     if (fa.ps().explicit and g.flash != null and grouped != null and !fa_shape) return error.FlashAttnShape;
     if (g.flash) |fk| if (fa_shape) {
-        if (!flash_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_FLASH_ATTN engaged: a wide prompt span on the flash kernel\n", .{});
+        if (!flash_logged.swap(true, .monotonic)) log.info("[dsv41] {s} engaged: a wide prompt span on the flash kernel\n", .{flashName()});
         const f_qt = if (qt.ctx != null) qt else q;
         const f_scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{scale}, &[_]c_int{1}, 1, .float32));
         const f_ins = [_]A{ q, keys_w, comp, picks, meta, f_qt, sink, f_scal, grouped.?.periods };
@@ -3653,8 +3655,13 @@ fn warmRing(m: *Dsv41Model) !void {
         var carriers: [2]A = undefined;
         for (&carriers, 0..) |*h, i| h.* = (try attnGather(&sc, m, sink, q, if (i == 0) qt else none, kw, W - 1, none, none, 1.0, .{ .periods = periods, .p0 = 0 })) orelse return;
         try evalAll(&carriers);
-        log.info("deepseek_v41: the flash kernel (MLX_SERVE_DSV41_FLASH_ATTN) and its heads-region twin compiled at load, both query-tail texts\n", .{});
-    } else if (fa.ps().mode == .on) log.info("deepseek_v41: the flash kernel (MLX_SERVE_DSV41_FLASH_ATTN) compiled at load, both query-tail texts; no heads regions\n", .{});
+        log.info("deepseek_v41: the flash kernel ({s}) and its heads-region twin compiled at load, both query-tail texts\n", .{flashName()});
+    } else if (fa.ps().mode == .on) log.info("deepseek_v41: the flash kernel ({s}) compiled at load, both query-tail texts; no heads regions\n", .{flashName()});
+}
+
+/// The flash kernel's switch as the log names it.
+fn flashName() []const u8 {
+    return if (fa.ps().trim and fa.ps().psum) "MLX_SERVE_DSV41_FLASH_TRIM + MLX_SERVE_DSV41_FLASH_PSUM" else if (fa.ps().trim) "MLX_SERVE_DSV41_FLASH_TRIM" else if (fa.ps().psum) "MLX_SERVE_DSV41_FLASH_PSUM" else "MLX_SERVE_DSV41_FLASH_ATTN";
 }
 
 /// `[L, wp + L]`: query i sees the window rows (wp + i - window, wp + i].
