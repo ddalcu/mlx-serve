@@ -11,6 +11,9 @@
 //!
 //! NOT exact: the probabilities round to f16 against the running max before the division (the gather's sm divides
 //! first), the accumulator is rescaled in f32, and the sum's order differs.
+//!
+//! `MLX_SERVE_DSV41_FLASH_PSUM` (read at load; =1 on, unset, empty or 0 off; refuses FLASH_ATTN=0 by name): the same
+//! kernel with l summing the f16 P the accumulator takes (`plan.definesPsum`): nearer float64, the same launches.
 
 pub const plan = @import("flash_plan.zig");
 pub const Mode = plan.Mode;
@@ -19,6 +22,8 @@ pub const parse = plan.parse;
 pub const hgn = plan.hgn;
 pub const source = plan.source;
 pub const regionTwin = plan.regionTwin;
+/// MLX_SERVE_DSV41_FLASH_PSUM's header: the attention header and `plan.definesPsum`.
+pub const header_psum = @import("../decode/attn.zig").HEADER ++ plan.definesPsum(0);
 
 /// Off until the plugin's load configures it (on unless the setting says otherwise): a harness that loads the model
 /// without the plugin's configure keeps the gather's words.
@@ -26,6 +31,8 @@ pub const regionTwin = plan.regionTwin;
 const State = struct {
     mode: Mode = .off,
     explicit: bool = false,
+    /// MLX_SERVE_DSV41_FLASH_PSUM: the kernel built with `header_psum`.
+    psum: bool = false,
 };
 pub const shared_state = @import("../../../sdk/util/shared.zig").Shared(State, "dsv41_flash_attn", .{});
 pub inline fn ps() *State {
@@ -33,8 +40,10 @@ pub inline fn ps() *State {
 }
 /// The setting named on itself (`=1`), not by default: a span the kernel cannot take is refused, not the gather's.
 
-pub fn configure(value: ?[]const u8) Error!void {
+pub fn configure(value: ?[]const u8, psum: bool) Error!void {
     ps().mode = try parse(value);
     ps().explicit = plan.explicitOn(value);
+    ps().psum = psum;
+    if (psum and ps().mode == .off) return error.FlashPsumOff;
 }
 

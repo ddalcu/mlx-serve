@@ -10,6 +10,15 @@
 // (m = sink, l = 1), so it joins the denominator only. Epilogue: O / l, the last RD dims inverse-roped at position
 // meta[6] + l (rope_tail's rotation on the f32 values), stored as attnOut's grouped projection reads them,
 // [G, L, H / G * D]. Nothing of the scores or probabilities leaves the threadgroup.
+// FA_PSUM 1 (MLX_SERVE_DSV41_FLASH_PSUM): l sums the f16 P the accumulator takes, not the f32 exps before their
+// rounding, so a key that carries the row has its rounding cancel in O / l; alpha is 1 where the max holds.
+// FA_PLANT 1 (tests only): the window's keys a row late.
+#ifndef FA_PSUM
+#define FA_PSUM 0
+#endif
+#ifndef FA_PLANT
+#define FA_PLANT 0
+#endif
 constexpr int D = 512;
 constexpr int BK = 128;
 constexpr int NSG = 4 * HGN;
@@ -82,7 +91,7 @@ for (int b = 0; b < nb; ++b) {
     const int c = b * BK + int(tid);
     int s = -1;
     if (c < W) {
-      const int r = wp + l - (W - 1) + c;
+      const int r = wp + l - (W - 1) + c - FA_PLANT;
       if (r >= 0 && r < Wk) s = RING | r;
     } else if (c < NK) {
       const int r = picks[size_t(l) * K + (c - W)];
@@ -146,7 +155,7 @@ for (int b = 0; b < nb; ++b) {
     const int s0 = hgl * 4;
     const float bm = metal::max(metal::max(red_max[s0][r], red_max[s0 + 1][r]), metal::max(red_max[s0 + 2][r], red_max[s0 + 3][r]));
     mnew[i] = metal::max(m_run[i], bm);
-    alpha[i] = metal::exp(m_run[i] - mnew[i]);
+    alpha[i] = FA_PSUM && mnew[i] == m_run[i] ? 1.0f : metal::exp(m_run[i] - mnew[i]);
     m_run[i] = mnew[i];
   }
 
@@ -158,7 +167,7 @@ for (int b = 0; b < nb; ++b) {
       for (short j = 0; j < 4; ++j) {
         const float e = ok[tn][j] ? metal::exp(scale * float(sc[tn * 8 + i * 4 + j]) - mnew[i]) : 0.0f;
         hv[i * 4 + j] = half(e);
-        rs[i] += e;
+        rs[i] += FA_PSUM ? float(hv[i * 4 + j]) : e;
       }
     *(threadgroup metal::vec<half, 8>*)(&p_tg[hgl][qq * 2 + tn][lane * 8]) = hv;
   }

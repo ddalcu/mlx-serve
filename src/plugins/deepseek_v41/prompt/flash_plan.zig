@@ -10,7 +10,24 @@ pub const Mode = enum { off, on };
 pub const Error = error{
     /// MLX_SERVE_DSV41_FLASH_ATTN is neither 0 nor 1 (unset or empty: on).
     FlashAttnSetting,
+    /// MLX_SERVE_DSV41_FLASH_PSUM is neither 0 nor 1 (unset or empty: off).
+    FlashPsumSetting,
+    /// MLX_SERVE_DSV41_FLASH_PSUM=1 beside MLX_SERVE_DSV41_FLASH_ATTN=0: the flash kernel asked for and turned off.
+    FlashPsumOff,
 };
+
+/// MLX_SERVE_DSV41_FLASH_PSUM: off unless `1` (the flash spans then run `source` under `definesPsum`).
+pub fn parsePsum(value: ?[]const u8) Error!bool {
+    const v = value orelse return false;
+    if (v.len == 0 or std.mem.eql(u8, v, "0")) return false;
+    if (std.mem.eql(u8, v, "1")) return true;
+    return error.FlashPsumSetting;
+}
+
+/// The defines MLX_SERVE_DSV41_FLASH_PSUM's header ends with (`plant`, tests only: 1 reads the window's keys a row late).
+pub fn definesPsum(comptime plant: u1) [:0]const u8 {
+    return std.fmt.comptimePrint("#define FA_PSUM 1\n#define FA_PLANT {d}\n", .{plant});
+}
 
 /// On unless the setting says otherwise (: flash attention judged on speed and quality, not words).
 pub fn parse(value: ?[]const u8) Error!Mode {
@@ -64,4 +81,10 @@ test "flash_attn region twin: the grouped store's address moved to the run regio
     try testing.expect(std.mem.indexOf(u8, t, region_store.new) != null);
     try testing.expect(std.mem.indexOf(u8, t, region_store.old) == null);
     try testing.expect(std.mem.startsWith(u8, t, "device OT* o = (device OT*) o_dst;\n"));
+}
+
+test "flash_psum setting: off unset, empty or 0; 1 on; anything else refused by name" {
+    for ([_]?[]const u8{ null, "", "0" }) |v| try testing.expect(!try parsePsum(v));
+    try testing.expect(try parsePsum("1"));
+    for ([_][]const u8{ "on", "2", "true", " 1" }) |v| try testing.expectError(error.FlashPsumSetting, parsePsum(v));
 }
