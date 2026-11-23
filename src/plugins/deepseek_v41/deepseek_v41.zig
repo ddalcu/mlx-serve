@@ -8053,7 +8053,7 @@ pub fn dsparkDraftLaunch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1:
     const t0 = monoUs();
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
-    const g = try draftGraph(&sc, m, st, t1, false);
+    const g = try draftGraph(&sc, m, st, t1, false, null);
     var out: DraftAhead = .{ .t1 = t1, .n = st.n, .gen = m.state_gen, .want_conf = g.want_conf };
     errdefer out.deinit();
     for (&out.ev, g.ev) |*slot, x| hold(slot, x);
@@ -8077,15 +8077,43 @@ pub fn dsparkDraftCollect(m: *Dsv41Model, gpa: std.mem.Allocator, a: *DraftAhead
 fn draftRows(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, keep_logits: bool) !DsparkDraft {
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
-    const g = try draftGraph(&sc, m, st, t1, keep_logits);
+    const g = try draftGraph(&sc, m, st, t1, keep_logits, null);
     var ev = g.ev;
     try evalAll(&ev);
     return draftRead(&sc, m, gpa, t1, &ev, g.want_conf, keep_logits);
 }
+/// A sampled draft (`MLX_SERVE_DSV41_DRAFT_SAMPLE`): the draft and its proposal `q` (f32 [B, vocab], each row
+/// softmax(biased row / T), the distribution its token was drawn from; the caller frees it).
+pub const SampledDraft = struct { d: DsparkDraft, q: A };
+
+/// `MLX_SERVE_DSV41_DRAFT_SAMPLE` (default off, read each round): a sampled request's DSpark rounds draw each draft
+/// token from the draft's own distribution and accept it with min(1, p / q).
+pub fn draftSampleOn() bool {
+    return env.on(.MLX_SERVE_DSV41_DRAFT_SAMPLE);
+}
+
+/// The draft for the block at [n, n + B) as `dsparkDraft` makes it, each position's token drawn from softmax(row / T)
+/// of its Markov-biased row (`u` [B, vocab] uniforms in [0, 1), `inv_t` 1 / T) instead of its argmax.
+pub fn dsparkDraftSampled(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, u: A, inv_t: f32) !SampledDraft {
+    const t0 = monoUs();
+    defer m.ds_draft_ns = @intCast((monoUs() - t0) * 1000);
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const it = try sc.keep(mlx.mlx_array_new_data(&inv_t, &[_]c_int{1}, 1, .float32));
+    const g = try draftGraph(&sc, m, st, t1, true, .{ .u = u, .inv_t = it });
+    const q = try sc.softmax(try sc.mul(g.ev[2], it), -1);
+    var ev = [_]A{ g.ev[0], g.ev[1], q };
+    try evalAll(&ev);
+    const d = try draftRead(&sc, m, gpa, t1, &ev, g.want_conf, false);
+    logOnce(&draft_sample_logged, "[dsv41] MLX_SERVE_DSV41_DRAFT_SAMPLE engaged: a sampled DSpark round's drafts drawn from the draft's own distribution, kept at min(1, p / q)\n");
+    return .{ .d = d, .q = sc.out(q) };
+}
+var draft_sample_logged = std.atomic.Value(bool).init(false);
+
 /// `draftRows`' graph (its arrays `sc`'s): the ids, the confidences (the ids again without them) and the rows `keep_logits`
 /// reads (the ids again otherwise).
 const DraftGraph = struct { ev: [3]A, want_conf: bool };
-fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool) !DraftGraph {
+fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool, sample: ?markov.Sample) !DraftGraph {
     const c = &m.cfg;
     const B = m.ds_block;
     const hc = c.dsv4_hc_mult;
@@ -8105,7 +8133,7 @@ fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool
     const want_conf = m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
     // The fused chain (`markov.chain`: the op chain's bytes in B + 1 launches), null for a draft it does not take (the op
     // chain below).
-    const fused: ?markov.Out = try markov.chain(sc.s, .{ .logits = logits, .hout = hout, .t1 = cur, .emb = ds.markov_embed, .mh = ds.markov_head, .cw = ds.conf, .want_conf = want_conf, .keep = keep_logits });
+    const fused: ?markov.Out = try markov.chain(sc.s, .{ .logits = logits, .hout = hout, .t1 = cur, .emb = ds.markov_embed, .mh = ds.markov_head, .cw = ds.conf, .want_conf = want_conf, .keep = keep_logits, .sample = sample });
     if (fused) |f| {
         _ = try sc.keep(f.toks);
         if (f.conf) |fc| _ = try sc.keep(fc);
@@ -8122,7 +8150,9 @@ fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool
         const row = try sc.add(try sc.slice(logits, 0, k, k + 1), bias);
         rows_k[k] = row;
         if (want_conf) confs[k] = try sc.matmul(try sc.concat(&.{ try sc.astype(try sc.slice(hout, 0, k, k + 1), .float32), me }, -1), try sc.t2(ds.conf));
-        cur = try sc.astype(try sc.argmax(row, -1), .int32);
+        // Sampled: Gumbel-max over row / T with position k's uniforms, as the fused step kernel draws.
+        const drawn = if (sample) |sm| try sc.sub(try sc.mul(row, sm.inv_t), try sc.op1(mlx.mlx_log, try sc.op1(mlx.mlx_negative, try sc.op1(mlx.mlx_log, try sc.slice(sm.u, 0, k, k + 1))))) else row;
+        cur = try sc.astype(try sc.argmax(drawn, -1), .int32);
         toks[k] = cur;
     };
     const all = if (ops) try sc.concat(toks[0..B], 0) else fused.?.toks;
