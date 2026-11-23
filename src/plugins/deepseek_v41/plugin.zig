@@ -303,7 +303,10 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice(), .quant = quant });
     errdefer m.mdl.deinit();
     // The fused Markov chain's kernels compiled now, not in the first draft.
-    if (m.mdl.dspark) |*w| try @import("spec/markov.zig").warm(m.mdl.s, w.markov_embed, w.markov_head, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true);
+    if (m.mdl.dspark) |*w| {
+        const mk = w.markovFor();
+        try @import("spec/markov.zig").warm(m.mdl.s, mk.emb, mk.mh, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true);
+    }
     try dsv41.syncWarm(m.mdl);
     m.bank = null;
     m.bank_streams = false;

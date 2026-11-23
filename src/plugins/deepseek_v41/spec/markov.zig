@@ -44,7 +44,8 @@ pub const In = struct {
     hout: A,
     /// int32 [1]: the token before position 0
     t1: A,
-    /// markov_embed [vocab, rank] and markov_head [vocab, rank] (the activation dtype)
+    /// markov_embed [rows, rank] (rows >= vocab: the row of every token a step can read) and markov_head [vocab, rank]
+    /// (the activation dtype)
     emb: A,
     mh: A,
     /// f32 [1, dim + rank]: the confidence head
@@ -139,7 +140,8 @@ pub fn chain(s: mlx.mlx_stream, in: In) !?Out {
         refusal_said = true;
         return null;
     }
-    if (dimOf(in.emb, 0) != sh.vocab or dimOf(in.emb, 1) != sh.rank or dimOf(in.logits, 1) != sh.vocab or dimOf(in.hout, 0) != sh.block) return error.MarkovShape;
+    // markov_embed may hold more rows than the chain scores (a draft vocabulary's: `t1` is any id's row).
+    if (dimOf(in.emb, 0) < sh.vocab or dimOf(in.emb, 1) != sh.rank or dimOf(in.logits, 1) != sh.vocab or dimOf(in.hout, 0) != sh.block) return error.MarkovShape;
     const k = try kernels();
     const conf = in.want_conf and plan.confFused(sh, try confExact(in.cw));
     const B = sh.block;
