@@ -71,7 +71,7 @@ pub fn launch(sc: *dsv41.Scope, t: Table, rows: usize, codes: A, tsc: A, ids: A,
 }
 
 pub fn slotsOn() bool {
-    return env.on(.MLX_SERVE_DSV41_ENGRAM_KV_SLOTS);
+    return env.onUnlessZero(.MLX_SERVE_DSV41_ENGRAM_KV_SLOTS);
 }
 
 fn launchRows(sc: *dsv41.Scope, t: Table, rows: usize, codes: A, tsc: A, ids: A, geo: A, w: A, wsc: A) !?A {

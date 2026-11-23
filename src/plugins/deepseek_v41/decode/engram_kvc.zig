@@ -35,7 +35,7 @@ pub const cap_bytes: u64 = 4_000_000_000;
 var plan_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 pub fn on() bool {
-    return env.on(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE);
+    return env.onUnlessZero(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE);
 }
 
 /// The load's bill for the cache: its bound, where the switch is on and the pack has Engram layers.
