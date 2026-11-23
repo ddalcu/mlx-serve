@@ -69,6 +69,8 @@ const State = struct {
     armed: bool = false,
     /// The counters at the last pass's end (`passEnd`).
     last: Stats = .{},
+    /// The engagement line printed (the load's first pass served from the reserve).
+    engaged: bool = false,
 };
 pub const shared_state = @import("../../../sdk/util/shared.zig").Shared(State, "dsv41_keep_wide", .{});
 pub inline fn ps() *State {
@@ -195,6 +197,10 @@ pub fn passEnd() void {
     const st = stats();
     const was = ps().last;
     ps().last = st;
+    if (!ps().engaged and st.hits > was.hits) {
+        ps().engaged = true;
+        log.info("[dsv41] MLX_SERVE_DSV41_PF_KEEP_WIDE engaged (a pass took {d} reserve buffers of {d}, {d} MB)\n", .{ st.hits - was.hits, st.buffers, st.bytes >> 20 });
+    }
     log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE: the pass took {d} reserve buffers, {d} allocations missed ({d} MB); reserve {d} MB, {d} MB idle\n", .{ st.hits -| was.hits, st.misses -| was.misses, (st.missed_bytes -| was.missed_bytes) >> 20, st.bytes >> 20, st.idle >> 20 });
 }
 
@@ -211,6 +217,7 @@ pub fn disarm() void {
     ps().bill = 0;
     ps().n_per_row = 0;
     ps().last = .{};
+    ps().engaged = false;
 }
 
 const testing = std.testing;
