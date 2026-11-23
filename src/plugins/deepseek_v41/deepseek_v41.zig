@@ -505,6 +505,8 @@ pub const Dsv41Model = struct {
     engrams: []EngramLayer = &.{},
     /// `MLX_SERVE_DSV41_ENGRAM_GPU_IDS`: the hash's constants on the GPU, where the switch serves (`engram_ids.settle`).
     engram_ids: ?dkern.engram_ids.Ctx = null,
+    /// `MLX_SERVE_DSV41_ENGRAM_KV_CACHE`: the decode row's Engram partials kept on the GPU (`engram_ids.settle`).
+    kvc: ?dkern.engram_kvc.Cache = null,
     /// The request's prompt, whose later chunks' Engram rows are read while an earlier one runs.
     prompt: []u32 = &.{},
     ahead: ?*engram.Prefetch = null,
@@ -607,6 +609,7 @@ pub const Dsv41Model = struct {
         }
         if (self.embed_tab) |*t| t.close();
         if (self.engram_ids) |*c| c.deinit();
+        if (self.kvc) |*c| c.deinit();
         self.gpa.free(self.engrams);
         self.gpa.free(self.token_map);
         for (self.owned.items) |x| _ = mlx.mlx_array_free(x);
@@ -2679,6 +2682,8 @@ pub const State = struct {
     snap_vision_key: u64 = 0,
     /// prompt/ced_lazy.zig: the decoder layers' window rings and the DSpark rows hold the last chunk's replay, unevaluated.
     ced_lazy: bool = false,
+    /// `MLX_SERVE_DSV41_ENGRAM_KV_CACHE`: this state's id as the cache's owner (0: none yet).
+    kvc_owner: u64 = 0,
 
     pub fn deinit(self: *State) void {
         if (self.snap) |*sn| sn.deinit(self.gpa);
@@ -5940,12 +5945,27 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     defer if (gpu_ids.ctx != null) {
         _ = mlx.mlx_array_free(gpu_ids);
     };
+    var kvc_plan: A = none;
+    defer if (kvc_plan.ctx != null) {
+        _ = mlx.mlx_array_free(kvc_plan);
+    };
+    // A step that fails after its look-up never writes the entries it took: the cache starts over.
+    errdefer if (kvc_plan.ctx != null) if (m.kvc) |*kc| {
+        kc.owner = std.math.maxInt(u64);
+    };
     if (ids == .gpu and !images and (want == .last or want == .all)) if (m.engram_ids) |*ctx| {
         var sc = Scope.init(gpa, m.s);
         defer sc.deinit();
         gpu_ids = sc.out(try dkern.engram_ids.rows(&sc, &m.hash.?, ctx, st.hist.items, ids.gpu, 0));
         sp.eng_gpu = gpu_ids;
         engaged(m, 6, "MLX_SERVE_DSV41_ENGRAM_GPU_IDS");
+        // `MLX_SERVE_DSV41_ENGRAM_KV_CACHE`: a one-row step looks its partials up first.
+        if (m.kvc) |*kc| if (L == 1 and want == .last) {
+            if (st.kvc_owner == 0) st.kvc_owner = kc.newOwner();
+            kvc_plan = sc.out(try kc.plan(&sc, st.kvc_owner, gpu_ids));
+            sp.eng_plan = kvc_plan;
+            engaged(m, 7, "MLX_SERVE_DSV41_ENGRAM_KV_CACHE");
+        };
     };
     if (ids == .gpu and m.engrams.len > 0 and gpu_ids.ctx == null) {
         var first = m.n_layers;
@@ -6700,6 +6720,8 @@ pub const Spans = struct {
     ncols: usize,
     /// `MLX_SERVE_DSV41_ENGRAM_GPU_IDS`: a decode row's Engram row ids hashed on the GPU, in place of `eng_ids`.
     eng_gpu: A = none,
+    /// `MLX_SERVE_DSV41_ENGRAM_KV_CACHE`: the step's cache plan for `eng_gpu` (`engram_kvc.Cache.plan`).
+    eng_plan: A = none,
     prefetch: ?*engram.Prefetch = null,
     /// A replay tail's first position (`Shared.floor`).
     floor: ?usize = null,
@@ -6803,7 +6825,7 @@ pub fn spanInAt(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const S
         const nc = sp.ncols;
         // `fuse.engram`: a decode-width span's write gathered from the resident table (`fusion.engramHeld`), else
         // from the rows read out of it (`fusion.engramWrite`).
-        var fused: ?A = if (sp.eng_gpu.ctx != null) try dkern.engram_ids.write(sc, m, e, sp.eng_gpu, ek, nc, x) orelse return error.Dsv41EngramGpuIdsDeclined else try fusion.engramHeld(sc, m, e, sp.eng_ids, m.engrams.len, ek, nc, lo, hi, x);
+        var fused: ?A = if (sp.eng_gpu.ctx != null) try dkern.engram_ids.write(sc, m, e, sp.eng_gpu, sp.eng_plan, ek, nc, x) orelse return error.Dsv41EngramGpuIdsDeclined else try fusion.engramHeld(sc, m, e, sp.eng_ids, m.engrams.len, ek, nc, lo, hi, x);
         const held_rows = if (fused == null) try fusion.engramRowsHeld(sc, m, e, sp.eng_ids, m.engrams.len, ek, nc, lo, hi) else null;
         const rows = if (fused != null) none else if (held_rows) |r| r else if (sp.prefetch) |pf| blk: {
             // A batch reads grid k, state k's rows, as one span.
@@ -10663,6 +10685,68 @@ test "dsv41 engram gpu ids: steps whose token stays on the GPU decode as with th
     // The one-launch wkv sums in another order than the host rows' chain: a reordering's distance, not a token's.
     try testing.expect(worst < 5e-2);
     try testing.expect(m.dec.engaged & (1 << 6) != 0);
+}
+
+test "dsv41 engram kv cache: GPU-id steps through the cache decode as the slot kernel without it bit for bit, the cache hitting, the switches engaged (DSV41_STEP pack)" {
+    const dir = std.mem.span(std.c.getenv("DSV41_STEP") orelse return error.SkipZigTest);
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var ov = env.override(.MLX_SERVE_DSV41_ENGRAM_GPU_IDS, "1");
+    defer ov.restore();
+    var ov_s = env.override(.MLX_SERVE_DSV41_ENGRAM_KV_SLOTS, "1");
+    defer ov_s.restore();
+    var ov_c = env.override(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE, "1");
+    defer ov_c.restore();
+    const cfg = try testConfig(io, dir);
+    var w = try loadPack(io, gpa, dir, false);
+    defer w.deinit();
+    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true });
+    defer m.deinit();
+    try testing.expect(m.engram_ids != null and m.kvc != null);
+    const prompt = try gpa.alloc(u32, 1024);
+    defer gpa.free(prompt);
+    // A prompt of one 37-token phrase over and over: greedy decode goes on repeating it, so its n-grams come back.
+    for (prompt, 0..) |*t, k| t.* = @intCast(((k % 37) * 7919 + 13) % @min(m.vocab, 100000));
+    // [0] steps without the cache (set aside for its steps), [1] through it; a third state between [1]'s steps
+    // empties it once (the owner changes), and [1] refills it.
+    var st: [3]State = .{ try initState(m, gpa), try initState(m, gpa), try initState(m, gpa) };
+    defer for (&st) |*x| x.deinit();
+    var l: [3]A = undefined;
+    for (&st, &l) |*x, *o| o.* = try extend(m, gpa, x, prompt[0 .. 1024 - 64 * @as(usize, @intFromBool(x == &st[2]))], .last);
+    defer for (l) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    var nh: usize = 0;
+    var differ: usize = 0;
+    const steps = 96;
+    for (0..steps) |i| {
+        const tok = try argmaxHost(l[0]);
+        for (0..3) |k| {
+            if (k == 2 and i != steps / 2) continue;
+            const g = mlx.mlx_array_new_data(&tok, &[_]c_int{1}, 1, .uint32);
+            defer _ = mlx.mlx_array_free(g);
+            // The cache moved out for [0]'s step and back after it.
+            const held = if (k == 0) m.kvc else null;
+            if (k == 0) m.kvc = null;
+            defer if (k == 0) {
+                m.kvc = held;
+            };
+            const n = try extendIds(m, gpa, &st[k], .{ .gpu = g }, .last, null);
+            _ = mlx.mlx_array_free(l[k]);
+            l[k] = n;
+            if (k == 1) nh += try dkern.engram_kvc.hits(m.kvc.?.last);
+        }
+        const a = try hostF32(l[0]);
+        defer gpa.free(a);
+        const b = try hostF32(l[1]);
+        defer gpa.free(b);
+        differ += @intFromBool(!std.mem.eql(u8, std.mem.sliceAsBytes(a), std.mem.sliceAsBytes(b)));
+    }
+    const slots = steps * m.kvc.?.nt;
+    std.debug.print("[engram-kvc] {d} steps after a 1024-token prompt: {d} of {d} slot partials read from the cache; logits differ from the uncached slot kernel's in {d} steps\n", .{ steps, nh, slots, differ });
+    try testing.expectEqual(@as(usize, 0), differ);
+    try testing.expect(nh > 0);
+    try testing.expect(m.dec.engaged & (1 << 7) != 0);
 }
 
 test "dsv41 decode step: serial one-token steps as the server pipelines them (DSV41_STEP)" {
