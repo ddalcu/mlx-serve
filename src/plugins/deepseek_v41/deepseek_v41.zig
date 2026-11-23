@@ -2841,6 +2841,7 @@ fn ropeTailPairs(sc: *Scope, m: *const Dsv41Model, x: A, periods: A, offset: A, 
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
     if (rope_pairs_k == null) rope_pairs_k = try buildKernel("dsv41_rope_tail_pairs", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_pairs_source, "");
+    _ = rope_pairs_calls.fetchAdd(1, .monotonic);
     if (!rope_pairs_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_ROPE_PAIRS engaged (rows {d}, heads {d})\n", .{ L, H });
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, rope_pairs_k.?, iv, cfg, sc.s));
     var o = mlx.mlx_array_new();
@@ -2848,6 +2849,8 @@ fn ropeTailPairs(sc: *Scope, m: *const Dsv41Model, x: A, periods: A, offset: A, 
 }
 var rope_pairs_k: ?mlx.mlx_fast_metal_kernel = null;
 var rope_pairs_logged = std.atomic.Value(bool).init(false);
+/// Pair launches taken (tests read it).
+pub var rope_pairs_calls = std.atomic.Value(usize).init(0);
 
 pub fn ropeFor(m: *const Dsv41Model, li: usize) *const Rope {
     return if (m.ratio(li) > 0) &m.rope_yarn else &m.rope_plain;
