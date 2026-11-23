@@ -5569,6 +5569,7 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     if (m.tp == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &sa)) |f| {
         if (f.fused) engaged(m, 2, "MLX_SERVE_DSV41_FUSE_FFN_IN");
         if (f.nax) engaged(m, 4, "MLX_SERVE_DSV41_GEMV_R26_FFN_IN");
+        if (f.sink) logOnce(&ffn_sink_logged, "[dsv41] MLX_SERVE_DSV41_FFN_IN_SINK engaged: ffn_in launch 2's mix tail in its own launch, beside the MoE up\n");
         pre.* = f.sf.pre;
         // `fuse.down_scale`: the fused fp4 launches put the down scale on the routes themselves.
         if (m.fuse.down_scale) if (try fusion.ffnDownScaled(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf)) |y| return y;
@@ -8481,6 +8482,7 @@ pub fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize,
 
 /// One line the first time a default-off switch's path runs (a unit's copy each: `-Dunits` may print it once a unit).
 var draft_fused_logged = std.atomic.Value(bool).init(false);
+var ffn_sink_logged = std.atomic.Value(bool).init(false);
 var draft_ffn_logged = std.atomic.Value(bool).init(false);
 fn logOnce(flag: *std.atomic.Value(bool), comptime msg: []const u8) void {
     if (!flag.swap(true, .monotonic)) log.info(msg, .{});

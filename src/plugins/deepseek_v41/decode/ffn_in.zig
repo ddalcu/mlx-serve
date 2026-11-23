@@ -25,6 +25,9 @@ const HEADER = decode.FP8_READ_HEADER;
 const NAX_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_nax.metal");
 const NAX_HEADER = HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_nax_header.metal");
 const TAIL_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_tail.metal");
+/// `MLX_SERVE_DSV41_FFN_IN_SINK`: launch 2 without its mix tail, and that tail as its own launch.
+const SINK_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_sink.metal");
+const B_APART_HEADER = "#define DSV41_FFN_SINK_APART 1\n";
 /// The one-launch variant (`MLX_SERVE_DSV41_FUSE_FFN_IN`): launch 1's body, then launch 2's work in its tail.
 const F_SOURCE = A_SOURCE ++ TAIL_SOURCE;
 const F_HEADER = HEADER ++ "#define DSV41_FFN_FUSED 1\n";
@@ -34,6 +37,9 @@ const A_INS = [_][*:0]const u8{ "oa", "w_q", "scales", "x", "spre", "spost", "sc
 const A_OUTS = [_][*:0]const u8{ "x1", "hv", "ctr", "parts", "logits" };
 const B_INS = [_][*:0]const u8{ "x1", "hv", "fn", "scale", "base", "w", "gate_w", "bias", "scal", "eps", "ctr", "parts", "logits" };
 const B_OUTS = [_][*:0]const u8{ "h2", "pre", "post", "comb", "idx", "wts" };
+const B_APART_OUTS = [_][*:0]const u8{ "h2", "idx", "wts" };
+const SINK_INS = [_][*:0]const u8{ "parts", "scale", "base", "eps", "order" };
+const SINK_OUTS = [_][*:0]const u8{ "pre", "post", "comb" };
 const F_INS = A_INS ++ [_][*:0]const u8{ "fn", "scale", "base", "w", "gate_w", "bias", "scal", "eps", "facc" };
 const F_OUTS = [_][*:0]const u8{ "x1", "hv", "h2", "pre", "post", "comb", "idx", "wts" };
 
@@ -41,6 +47,9 @@ pub const Kernels = struct {
     a: mlx.mlx_fast_metal_kernel,
     b: mlx.mlx_fast_metal_kernel,
     fused: mlx.mlx_fast_metal_kernel,
+    /// `MLX_SERVE_DSV41_FFN_IN_SINK`: launch 2 without its mix tail, and the tail's own launch.
+    b_apart: mlx.mlx_fast_metal_kernel,
+    sink: mlx.mlx_fast_metal_kernel,
     /// Launch 1 on the matrix units (`MLX_SERVE_DSV41_GEMV_R26_FFN_IN`), NAX GPUs only.
     nax: ?mlx.mlx_fast_metal_kernel,
     /// The fused launch's persistent scratch (`dec_ffn_in_tail.metal`), zero between its dispatches.
@@ -62,8 +71,12 @@ pub fn build() !Kernels {
     errdefer _ = mlx.mlx_fast_metal_kernel_free(b);
     const f = try dsv41.buildKernel("dsv41_dec_ffn_in_fused", &F_INS, &F_OUTS, F_SOURCE, F_HEADER);
     errdefer _ = mlx.mlx_fast_metal_kernel_free(f);
+    const ba = try dsv41.buildKernel("dsv41_dec_ffn_in_post_apart", &B_INS, &B_APART_OUTS, B_SOURCE, B_APART_HEADER);
+    errdefer _ = mlx.mlx_fast_metal_kernel_free(ba);
+    const sk = try dsv41.buildKernel("dsv41_dec_ffn_in_sink", &SINK_INS, &SINK_OUTS, SINK_SOURCE, "");
+    errdefer _ = mlx.mlx_fast_metal_kernel_free(sk);
     const n = if (device.naxAvailable()) try dsv41.buildKernel("dsv41_dec_ffn_in_nax", &A_INS, &A_OUTS, NAX_SOURCE, NAX_HEADER) else null;
-    return .{ .a = a, .b = b, .fused = f, .nax = n, .facc = try newScratch() };
+    return .{ .a = a, .b = b, .fused = f, .b_apart = ba, .sink = sk, .nax = n, .facc = try newScratch() };
 }
 
 fn newScratch() !A {
@@ -77,6 +90,8 @@ pub fn free(k: Kernels) void {
     _ = mlx.mlx_fast_metal_kernel_free(k.a);
     _ = mlx.mlx_fast_metal_kernel_free(k.b);
     _ = mlx.mlx_fast_metal_kernel_free(k.fused);
+    _ = mlx.mlx_fast_metal_kernel_free(k.b_apart);
+    _ = mlx.mlx_fast_metal_kernel_free(k.sink);
     if (k.nax) |n| _ = mlx.mlx_fast_metal_kernel_free(n);
     _ = mlx.mlx_array_free(k.facc);
 }
@@ -85,6 +100,12 @@ pub fn free(k: Kernels) void {
 pub fn fusedOn() bool {
     const v = env.get(.MLX_SERVE_DSV41_FUSE_FFN_IN) orelse return false;
     return v[0] == '1';
+}
+
+/// `MLX_SERVE_DSV41_FFN_IN_SINK` (read each call): =1 launch 2's mix tail (the slices' reduce and the Sinkhorn split)
+/// runs as its own one-threadgroup launch, read only by the MoE down, so the MoE up does not wait on it.
+pub fn sinkOn() bool {
+    return env.on(.MLX_SERVE_DSV41_FFN_IN_SINK);
 }
 
 /// `MLX_SERVE_DSV41_GEMV_R26_FFN_IN` (read each call): =1 launch 1 runs on the matrix units from `nax_min_rows` rows.
@@ -221,7 +242,7 @@ pub const Weights = struct {
     gate_bias: A,
 };
 
-pub const Out = struct { x1: A, h2: A, sf: dsv41.Split, idx: A, wts: A, fused: bool = false, nax: bool = false };
+pub const Out = struct { x1: A, h2: A, sf: dsv41.Split, idx: A, wts: A, fused: bool = false, nax: bool = false, sink: bool = false };
 pub const AOut = struct { x1: A, hv: A, ctr: A, parts: A, logits: A, nax: bool = false };
 pub const BOut = struct { h2: A, sf: dsv41.Split, idx: A, wts: A };
 
@@ -297,6 +318,27 @@ pub fn launchB(sc: *dsv41.Scope, ks: Kernels, p: Dims, w: Weights, a: AOut, eps:
     return .{ .h2 = b[0], .sf = .{ .pre = b[1], .post = b[2], .comb = b[3] }, .idx = b[4], .wts = b[5] };
 }
 
+/// `launchB` as two launches (`MLX_SERVE_DSV41_FFN_IN_SINK`): launch 2 without its mix tail (`DSV41_FFN_SINK_APART`:
+/// h2, the picks and weights), then the mix tail's own launch over the partials launch 2 left in `a.parts` (the split).
+/// The same words as `launchB`'s.
+pub fn launchBApart(sc: *dsv41.Scope, ks: Kernels, p: Dims, w: Weights, a: AOut, eps: A, scal: A) !BOut {
+    const b = try run(3, sc, ks.b_apart, &.{ a.x1, a.hv, w.fn_w, w.fn_scale, w.fn_base, w.norm_w, w.gate_w, w.gate_bias, scal, eps, a.ctr, a.parts, a.logits }, .{
+        .{ .shape = &.{ ci(p.rows), ci(p.d) }, .dt = act },
+        .{ .shape = &.{ ci(p.rows), ci(p.top_k) }, .dt = .uint32 },
+        .{ .shape = &.{ ci(p.rows), ci(p.top_k) }, .dt = .float32 },
+    }, gridB(p), b_threads, &bTargs(p));
+    const s = try run(3, sc, ks.sink, &.{ a.parts, w.fn_scale, w.fn_base, eps, b[0] }, .{
+        .{ .shape = &.{ ci(p.rows), hc }, .dt = .float32 },
+        .{ .shape = &.{ ci(p.rows), hc }, .dt = .float32 },
+        .{ .shape = &.{ ci(p.rows), hc, hc }, .dt = .float32 },
+    }, b_threads, b_threads, &sinkTargs(p));
+    return .{ .h2 = b[0], .sf = .{ .pre = s[0], .post = s[1], .comb = s[2] }, .idx = b[1], .wts = b[2] };
+}
+
+fn sinkTargs(p: Dims) [5]TArg {
+    return .{ .{ .name = "R", .v = p.rows }, .{ .name = "D", .v = p.d }, .{ .name = "P", .v = slices(p) }, .{ .name = "HC", .v = hc }, .{ .name = "ITERS", .v = p.iters } };
+}
+
 fn fTargs(p: Dims) [11]TArg {
     const a = aTargs(p);
     return a ++ [_]TArg{ .{ .name = "E", .v = p.e }, .{ .name = "TOPK", .v = p.top_k }, .{ .name = "ITERS", .v = p.iters }, .{ .name = "NORM", .v = @intFromBool(p.norm) } };
@@ -322,8 +364,9 @@ pub fn launch(sc: *dsv41.Scope, ks: Kernels, p: Dims, w: Weights, oa: A, x: A, s
     if (!serves(p)) return null;
     if (fusedOn() and servesFused(p)) return try launchFused(sc, ks.fused, ks.facc, p, w, oa, x, sa, eps, scal);
     const a = try launchA(sc, ks, p, w, oa, x, sa);
-    const b = try launchB(sc, ks, p, w, a, eps, scal);
-    return .{ .x1 = a.x1, .h2 = b.h2, .sf = b.sf, .idx = b.idx, .wts = b.wts, .nax = a.nax };
+    const apart = sinkOn();
+    const b = if (apart) try launchBApart(sc, ks, p, w, a, eps, scal) else try launchB(sc, ks, p, w, a, eps, scal);
+    return .{ .x1 = a.x1, .h2 = b.h2, .sf = b.sf, .idx = b.idx, .wts = b.wts, .nax = a.nax, .sink = apart };
 }
 
 // ── the kernel contract ──
@@ -1502,6 +1545,74 @@ test "dsv41 dec ffn_in nax: MLX_SERVE_DSV41_GEMV_R26_FFN_IN=1, rows 1..6 on laye
     var bad = w;
     bad.wo_w = other.wo_w;
     if (equivalence(gpa, fx, ks, &ly, bad, 4)) |_| return error.PlantedBugPassed else |_| {}
+}
+
+/// `launch` on one case with `MLX_SERVE_DSV41_FFN_IN_SINK` off, then on (or the planted sink at `plant_iters` Sinkhorn
+/// iterations): the number of output words that differ (x1, h2, pre, post, comb, the picks, their weights).
+fn sinkDiff(gpa: std.mem.Allocator, fx: *Fixture, ks: Kernels, ly: *const dsv41.Layer, w: Weights, rows: usize, plant_iters: ?usize) !usize {
+    const m = fx.m;
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const oa = try fx.normal(&.{ ci(rows), 8192 }, act, 0, 1);
+    defer _ = mlx.mlx_array_free(oa);
+    const x = try fx.stream(rows);
+    defer _ = mlx.mlx_array_free(x);
+    const cpre = try fx.cpre(rows);
+    defer _ = mlx.mlx_array_free(cpre);
+    const sa = (try dsv41.hcStage(&sc, m, x, null, cpre, &ly.hc_attn, ly.attn_norm)).sp;
+    const eps = try dsv41.hcEps(&sc, m);
+    const scal = mlx.mlx_array_new_data(&[_]f32{m.cfg.router_scaling_factor}, &[_]c_int{1}, 1, .float32);
+    try sc.items.append(sc.a, scal);
+    const p: Dims = .{ .rows = rows, .d = m.cfg.hidden_size, .e = @intCast(mlx.getShape(ly.gate_w)[0]), .top_k = ly.top_k, .iters = m.cfg.dsv4_hc_sinkhorn_iters, .norm = m.cfg.moe_route_norm and ly.top_k > 1 };
+    var outs: [2][7]A = undefined;
+    for (0..2) |k| {
+        var ov = env.override(.MLX_SERVE_DSV41_FFN_IN_SINK, if (k == 0) "0" else "1");
+        defer ov.restore();
+        var o = (try launch(&sc, ks, p, w, oa, x, &sa, eps, scal)) orelse return error.Declined;
+        if (k == 1) try std.testing.expect(o.sink);
+        if (k == 1) if (plant_iters) |it| {
+            var q = p;
+            q.iters = it;
+            const a = try launchA(&sc, ks, q, w, oa, x, &sa);
+            const b = try launchBApart(&sc, ks, q, w, a, eps, scal);
+            o.sf = b.sf;
+        };
+        outs[k] = .{ o.x1, o.h2, o.sf.pre, o.sf.post, o.sf.comb, o.idx, o.wts };
+        try dsv41.evalAll(&outs[k]);
+    }
+    var differ: usize = 0;
+    for (outs[0], outs[1]) |a, b| {
+        const n = mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a);
+        try std.testing.expectEqual(n, mlx.mlx_array_size(b) * mlx.mlx_array_itemsize(b));
+        const xa = mlx.mlx_array_data_uint8(a) orelse return error.NoData;
+        const xb = mlx.mlx_array_data_uint8(b) orelse return error.NoData;
+        var i: usize = 0;
+        while (i < n) : (i += 4) differ += @intFromBool(!std.mem.eql(u8, xa[i..][0..4], xb[i..][0..4]));
+    }
+    return differ;
+}
+
+test "dsv41 dec ffn_in sink: MLX_SERVE_DSV41_FFN_IN_SINK=1 gives launch 2's words, rows 1..6 on layers 21 and 23 and at 384 experts; a planted 1-iteration Sinkhorn fails" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .ctx = 8 });
+    defer fx.deinit();
+    const ks = try build();
+    defer free(ks);
+    const w = try randomWeights(86);
+    defer freeWeights(w);
+    const wide = layerWith(fx.layer(21), w);
+    var cases: usize = 0;
+    for ([_]usize{ 21, 23, 0 }) |li| for (1..decode.max_rows + 1) |rows| {
+        const ly = if (li == 0) &wide else fx.layer(li);
+        const wl = if (li == 0) w else weightsOf(ly);
+        try std.testing.expectEqual(@as(usize, 0), try sinkDiff(gpa, fx, ks, ly, wl, rows, null));
+        cases += 1;
+    };
+    // (the split converges within the served 20 iterations' f32 words well before the last: a short split is 1 iteration)
+    const planted = try sinkDiff(gpa, fx, ks, &wide, w, 3, 1);
+    std.debug.print("[dec] ffn_in sink: {d} cases word for word; the planted 1-iteration Sinkhorn moves {d} words\n", .{ cases, planted });
+    try std.testing.expect(planted > 0);
 }
 
 test "dsv41 dec ffn_in fused: the same inputs give the same bytes, launch after launch, at the release's shapes" {
