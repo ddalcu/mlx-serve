@@ -149,7 +149,7 @@ pub fn planRows(m: *const v41.Dsv41Model, ly: *const v41.Layer, rows: usize) ?Pl
 
 /// `MLX_SERVE_DSV41_IN_PROJ_MIXR`, read each call; its engaged line once.
 fn mixrOn() bool {
-    if (!env.on(.MLX_SERVE_DSV41_IN_PROJ_MIXR)) return false;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_IN_PROJ_MIXR)) return false;
     if (!mixr_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info("[dsv41] MLX_SERVE_DSV41_IN_PROJ_MIXR engaged: a verify's hc mixes a (mix, row) a threadgroup, first\n", .{});
     return true;
 }
@@ -1013,6 +1013,9 @@ test "dsv41 dec in_proj MIXR: the mixes a (mix, row) a threadgroup give every ou
     if (mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (device.deviceGeneration().gen < first_gen) return error.SkipZigTest;
     const gpa = testing.allocator;
+    // The staged plan without the switch (its default is on): MIXR is set on a copy of it below.
+    const mixr_off = env.override(.MLX_SERVE_DSV41_IN_PROJ_MIXR, "0");
+    defer mixr_off.restore();
     const k = try Kernels.build();
     defer k.deinit();
     // A mix that reads the next row's stream (a permutation of the (mix, row) threadgroups alone would change nothing).
@@ -1191,6 +1194,9 @@ fn layerBytes(p: Plan) usize {
 test "dsv41 dec in_proj: ubench against its byte floor and the chain it replaces (DSV41_DEC_UBENCH)" {
     if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
+    // The staged plan without the switch (its default is on): MIXR is set on a copy of it below.
+    const mixr_off = env.override(.MLX_SERVE_DSV41_IN_PROJ_MIXR, "0");
+    defer mixr_off.restore();
     const k = try Kernels.build();
     defer k.deinit();
     const kinds = [_]struct { lo: usize, hi: usize, li: usize, name: []const u8 }{
