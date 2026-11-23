@@ -1683,17 +1683,16 @@ pub const GatherAttn = struct {
         errdefer _ = mlx.mlx_fast_metal_kernel_free(pv);
         // MLX_SERVE_DSV41_FLASH_ATTN (flash_attn.zig): the flash kernel and its heads-region twin (a missed anchor
         // refuses the load by name).
-        // MLX_SERVE_DSV41_FLASH_TRIM: the same text under `fa.header_trim`.
-        const trim = fa.ps().trim;
-        const fh: [*:0]const u8 = if (trim) fa.header_trim else dkern.attn.HEADER;
-        const flash: ?mlx.mlx_fast_metal_kernel = if (fa.ps().mode == .on) try buildKernel(if (trim) "dsv41_attn_flash_trim" else "dsv41_attn_flash", &FLASH_INS, &.{"o"}, fa.source, fh) else null;
+        // MLX_SERVE_DSV41_FLASH_TRIM / MLX_SERVE_DSV41_FLASH_PSUM: the same text under their defines (`fa.header`).
+        const fh = fa.header();
+        const flash: ?mlx.mlx_fast_metal_kernel = if (fa.ps().mode == .on) try buildKernel(fa.kernelName(false), &FLASH_INS, &.{"o"}, fa.source, fh) else null;
         errdefer if (flash) |k| {
             _ = mlx.mlx_fast_metal_kernel_free(k);
         };
         const flash_heads: ?mlx.mlx_fast_metal_kernel = if (fa.ps().mode == .on) blk: {
             const t = try fa.regionTwin(std.heap.page_allocator, std.mem.span(fh));
             defer std.heap.page_allocator.free(t);
-            break :blk try buildKernel(if (trim) "dsv41_attn_flash_trim_heads" else "dsv41_attn_flash_heads", &(FLASH_INS ++ [_][*:0]const u8{ "dep", "soff", "o_dst", "dep2" }), &.{"carrier"}, t.ptr, fh);
+            break :blk try buildKernel(fa.kernelName(true), &(FLASH_INS ++ [_][*:0]const u8{ "dep", "soff", "o_dst", "dep2" }), &.{"carrier"}, t.ptr, fh);
         } else null;
         errdefer if (flash_heads) |k| {
             _ = mlx.mlx_fast_metal_kernel_free(k);
@@ -3627,7 +3626,7 @@ fn warmRing(m: *Dsv41Model) !void {
 
 /// The flash kernel's switch as the log names it.
 fn flashName() []const u8 {
-    return if (fa.ps().trim) "MLX_SERVE_DSV41_FLASH_TRIM" else "MLX_SERVE_DSV41_FLASH_ATTN";
+    return if (fa.ps().trim and fa.ps().psum) "MLX_SERVE_DSV41_FLASH_TRIM + MLX_SERVE_DSV41_FLASH_PSUM" else if (fa.ps().trim) "MLX_SERVE_DSV41_FLASH_TRIM" else if (fa.ps().psum) "MLX_SERVE_DSV41_FLASH_PSUM" else "MLX_SERVE_DSV41_FLASH_ATTN";
 }
 
 /// `[L, wp + L]`: query i sees the window rows (wp + i - window, wp + i].

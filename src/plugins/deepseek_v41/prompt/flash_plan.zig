@@ -14,6 +14,10 @@ pub const Error = error{
     FlashTrimSetting,
     /// MLX_SERVE_DSV41_FLASH_TRIM=1 beside MLX_SERVE_DSV41_FLASH_ATTN=0: the flash kernel asked for and turned off.
     FlashTrimOff,
+    /// MLX_SERVE_DSV41_FLASH_PSUM is neither 0 nor 1 (unset or empty: off).
+    FlashPsumSetting,
+    /// MLX_SERVE_DSV41_FLASH_PSUM=1 beside MLX_SERVE_DSV41_FLASH_ATTN=0: the flash kernel asked for and turned off.
+    FlashPsumOff,
 };
 
 /// MLX_SERVE_DSV41_FLASH_TRIM: off unless `1` (the flash spans then run `source` under `definesTrim`).
@@ -24,9 +28,24 @@ pub fn parseTrim(value: ?[]const u8) Error!bool {
     return error.FlashTrimSetting;
 }
 
-/// The defines MLX_SERVE_DSV41_FLASH_TRIM's header ends with (`plant`, tests only: 1 reads the window's keys a row late).
+/// MLX_SERVE_DSV41_FLASH_PSUM: off unless `1` (the flash spans then run `source` under `definesPsum`).
+pub fn parsePsum(value: ?[]const u8) Error!bool {
+    const v = value orelse return false;
+    if (v.len == 0 or std.mem.eql(u8, v, "0")) return false;
+    if (std.mem.eql(u8, v, "1")) return true;
+    return error.FlashPsumSetting;
+}
+
+/// The defines a flash text's header ends with: FA_TRIM (MLX_SERVE_DSV41_FLASH_TRIM), FA_PSUM
+/// (MLX_SERVE_DSV41_FLASH_PSUM) and `plant` (tests only: 1 reads the window's keys a row late).
+pub fn defines(comptime trim: bool, comptime psum: bool, comptime plant: u1) [:0]const u8 {
+    return std.fmt.comptimePrint("#define FA_TRIM {d}\n#define FA_PSUM {d}\n#define FA_PLANT {d}\n", .{ @intFromBool(trim), @intFromBool(psum), plant });
+}
 pub fn definesTrim(comptime plant: u1) [:0]const u8 {
-    return std.fmt.comptimePrint("#define FA_TRIM 1\n#define FA_PLANT {d}\n", .{plant});
+    return defines(true, false, plant);
+}
+pub fn definesPsum(comptime plant: u1) [:0]const u8 {
+    return defines(false, true, plant);
 }
 
 /// On unless the setting says otherwise (: flash attention judged on speed and quality, not words).
@@ -87,4 +106,10 @@ test "flash_trim setting: off unset, empty or 0; 1 on; anything else refused by 
     for ([_]?[]const u8{ null, "", "0" }) |v| try testing.expect(!try parseTrim(v));
     try testing.expect(try parseTrim("1"));
     for ([_][]const u8{ "on", "2", "true", " 1" }) |v| try testing.expectError(error.FlashTrimSetting, parseTrim(v));
+}
+
+test "flash_psum setting: off unset, empty or 0; 1 on; anything else refused by name" {
+    for ([_]?[]const u8{ null, "", "0" }) |v| try testing.expect(!try parsePsum(v));
+    try testing.expect(try parsePsum("1"));
+    for ([_][]const u8{ "on", "2", "true", " 1" }) |v| try testing.expectError(error.FlashPsumSetting, parsePsum(v));
 }

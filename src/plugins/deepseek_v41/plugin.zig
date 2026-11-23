@@ -253,7 +253,8 @@ fn configureLoad(c: *const config.Config) !void {
     flash_attn.ps().mode = .off;
     flash_attn.ps().explicit = false;
     flash_attn.ps().trim = false;
-    try flash_attn.configure(env.span(.MLX_SERVE_DSV41_FLASH_ATTN), try flash_attn.plan.parseTrim(env.span(.MLX_SERVE_DSV41_FLASH_TRIM)));
+    flash_attn.ps().psum = false;
+    try flash_attn.configure(env.span(.MLX_SERVE_DSV41_FLASH_ATTN), try flash_attn.plan.parseTrim(env.span(.MLX_SERVE_DSV41_FLASH_TRIM)), try flash_attn.plan.parsePsum(env.span(.MLX_SERVE_DSV41_FLASH_PSUM)));
     scratch_attn.ps().ring_regions = flash_attn.ps().mode != .on;
 }
 

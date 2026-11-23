@@ -704,11 +704,12 @@ test "dsv41 wide tol: hc_v2's combining tail is moe_tail's combine, glm5's expan
 const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2, .MLX_SERVE_DSV41_PF_MOE_EPI, .MLX_SERVE_DSV41_PF_IDX_NAX };
 
 /// The flash kernel on `fx`'s model as its load sets it (`plugin.configureLoad`): the gather's kernels rebuilt with
-/// MLX_SERVE_DSV41_FLASH_ATTN on (`trim`: and MLX_SERVE_DSV41_FLASH_TRIM) and the ring off; off puts the stock gather
-/// back.
-fn flashOn(fx: *fixture.Fixture, on: bool, trim: bool) !void {
+/// MLX_SERVE_DSV41_FLASH_ATTN on (and MLX_SERVE_DSV41_FLASH_TRIM, MLX_SERVE_DSV41_FLASH_PSUM as asked) and the ring
+/// off; off puts the stock gather back.
+fn flashOn(fx: *fixture.Fixture, on: bool, trim: bool, psum: bool) !void {
     fa.ps().mode = if (on) .on else .off;
     fa.ps().trim = on and trim;
+    fa.ps().psum = on and psum;
     fa.ps().explicit = false;
     sat.ps().ring_regions = !on;
     if (fx.m.attn_gather) |*g| g.deinit();
@@ -854,13 +855,13 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
         // FLASH_TRIM is FLASH_ATTN's values (on by default where the plugin loads): its prefill is FLASH_ATTN's, word
         // for word.
         {
-            try flashOn(fx, true, false);
-            defer flashOn(fx, false, false) catch {};
+            try flashOn(fx, true, false, false);
+            defer flashOn(fx, false, false, false) catch {};
             const want_fa = try prefill(fx, x, pre);
             defer for (want_fa) |o| {
                 _ = mlx.mlx_array_free(o);
             };
-            try flashOn(fx, true, true);
+            try flashOn(fx, true, true, false);
             const got = try prefill(fx, x, pre);
             defer for (got) |o| {
                 _ = mlx.mlx_array_free(o);
@@ -870,6 +871,27 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
                 std.debug.print("wide layer {s}, MLX_SERVE_DSV41_FLASH_TRIM against MLX_SERVE_DSV41_FLASH_ATTN, output {d}: word for word {}\n", .{ label, k, same });
                 if (!same) ok = false;
             }
+        }
+        // FLASH_PSUM replaces FLASH_ATTN's sums, alone and beside FLASH_TRIM, so it is held to FLASH_ATTN's prefill;
+        // FLASH_ATTN's own distance from the gather is printed beside it.
+        {
+            var fa_tap: dsv41.RouteTap = .{ .gpa = gpa };
+            defer freeTap(&fa_tap);
+            try flashOn(fx, true, false, false);
+            const want_fa = prefillTapped(fx, x, pre, &fa_tap) catch |e| {
+                std.debug.print("wide layer {s}: the FLASH_ATTN prefill failed: {s}\n", .{ label, @errorName(e) });
+                return e;
+            };
+            defer for (want_fa) |o| {
+                _ = mlx.mlx_array_free(o);
+            };
+            try flashOn(fx, false, false, false);
+            _ = try closeAs(fx, x, pre, want_fa, &fa_tap, label, "the gather against MLX_SERVE_DSV41_FLASH_ATTN (not gated)");
+            defer flashOn(fx, false, false, false) catch {};
+            try flashOn(fx, true, false, true);
+            if (!try closeAs(fx, x, pre, want_fa, &fa_tap, label, "MLX_SERVE_DSV41_FLASH_PSUM against MLX_SERVE_DSV41_FLASH_ATTN")) ok = false;
+            try flashOn(fx, true, true, true);
+            if (!try closeAs(fx, x, pre, want_fa, &fa_tap, label, "MLX_SERVE_DSV41_FLASH_TRIM + MLX_SERVE_DSV41_FLASH_PSUM against MLX_SERVE_DSV41_FLASH_ATTN")) ok = false;
         }
         inline for (switches) |n| env.set(n, "1");
         defer {
@@ -1002,10 +1024,13 @@ const Span = struct {
 fn flash1Kernel() !mlx.mlx_fast_metal_kernel {
     return dsv41.buildKernel("dsv41_attn_flash_t1", &dsv41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, dattn.HEADER);
 }
-/// FLASH_TRIM's kernel (`plant` 1: the window's keys a row late), under its own name.
+/// The flash kernel under FA_TRIM / FA_PSUM (`plant` 1: the window's keys a row late), under its own name.
+fn flashKernel(comptime trim: bool, comptime psum: bool, comptime plant: u1) !mlx.mlx_fast_metal_kernel {
+    const name = std.fmt.comptimePrint("dsv41_attn_flash_t_{d}{d}{d}", .{ @intFromBool(trim), @intFromBool(psum), plant });
+    return dsv41.buildKernel(name, &dsv41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, comptime dattn.HEADER ++ fa.plan.defines(trim, psum, plant));
+}
 fn flashTrimKernel(comptime plant: u1) !mlx.mlx_fast_metal_kernel {
-    const name = std.fmt.comptimePrint("dsv41_attn_flash_trim_t_{d}", .{plant});
-    return dsv41.buildKernel(name, &dsv41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, comptime dattn.HEADER ++ fa.plan.definesTrim(plant));
+    return flashKernel(true, false, plant);
 }
 
 /// `got` (grouped [OG, L, H / OG * D]) against the float64 heads at rows `rows`, unroped dims: the error's norm over the
@@ -1087,6 +1112,49 @@ test "dsv41 wide: FLASH_TRIM's heads are FLASH_ATTN's word for word at the relea
     try testing.expect(ok);
 }
 
+test "dsv41 wide tol: FLASH_PSUM's heads, alone and beside FLASH_TRIM, are no further from float64 than FLASH_ATTN's (norm and worst element) and within its own error of it, at the release's spans, both query tails, f32 and bf16 out; window keys a row late fail" {
+    if (skip()) return error.SkipZigTest;
+    var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const k1 = try flash1Kernel();
+    defer _ = mlx.mlx_fast_metal_kernel_free(k1);
+    const Cand = struct { name: []const u8, k: mlx.mlx_fast_metal_kernel, kp: mlx.mlx_fast_metal_kernel };
+    const cands = [_]Cand{
+        .{ .name = "FLASH_PSUM", .k = try flashKernel(false, true, 0), .kp = try flashKernel(false, true, 1) },
+        .{ .name = "FLASH_TRIM + FLASH_PSUM", .k = try flashKernel(true, true, 0), .kp = try flashKernel(true, true, 1) },
+    };
+    defer for (cands) |c| {
+        _ = mlx.mlx_fast_metal_kernel_free(c.k);
+        _ = mlx.mlx_fast_metal_kernel_free(c.kp);
+    };
+    var ok = true;
+    for (span_cases, 0..) |c, ci_| {
+        var s = try Span.init(&sc, c, 40 + 10 * ci_);
+        defer s.deinit();
+        const rows = [_]usize{ 0, 1, 2, c.L / 3, c.L / 2, c.L - 2, c.L - 1 };
+        // the float64 reference reads q's own last 64 dims: the unroped dims compared are the same either way
+        const e1 = try spanErr(&s, try s.flash(&sc, k1, false, .float32), &rows);
+        const b1 = try spanErr(&s, try s.flash(&sc, k1, false, .bfloat16), &rows);
+        for (cands) |cd| {
+            const e2 = try spanErr(&s, try s.flash(&sc, cd.k, false, .float32), &rows);
+            const ep = try spanErr(&s, try s.flash(&sc, cd.kp, false, .float32), &rows);
+            var dist: [2]f64 = undefined;
+            for ([_]bool{ false, true }, 0..) |qt_on, i| {
+                dist[i] = try spanDist(try s.flash(&sc, cd.k, qt_on, .float32), try s.flash(&sc, k1, qt_on, .float32));
+            }
+            const b2 = try spanErr(&s, try s.flash(&sc, cd.k, false, .bfloat16), &rows);
+            std.debug.print("[fpsum] L={d} wp={d} K={d}: rel l2 / max vs float64, f32 out: FLASH_ATTN {e:.3}/{e:.3} {s} {e:.3}/{e:.3} planted {e:.3}/{e:.3}; bf16 out: {e:.3}/{e:.3} vs {e:.3}/{e:.3}; to FLASH_ATTN (all dims, f32): {e:.3}, qt tail {e:.3}\n", .{ c.L, c.wp, c.K, e1.l2, e1.max, cd.name, e2.l2, e2.max, ep.l2, ep.max, b1.l2, b1.max, b2.l2, b2.max, dist[0], dist[1] });
+            // no further from float64 than FLASH_ATTN in norm and at its worst element, within two of its errors of
+            // it, the served bf16 error kept
+            ok = ok and e2.l2 <= e1.l2 and e2.max <= e1.max and dist[0] <= 2 * e1.l2 and dist[1] <= 2 * e1.l2;
+            ok = ok and b2.l2 <= b1.l2 * 1.02;
+            // planted: window keys a row late leave FLASH_ATTN's own error far behind
+            ok = ok and ep.l2 > 10 * e1.l2;
+        }
+    }
+    try testing.expect(ok);
+}
+
 test "dsv41 wide ubench: FLASH_ATTN and FLASH_TRIM at the release's spans (DSV41_DEC_UBENCH)" {
     if (!ddec.ubenchOn() or skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
@@ -1098,6 +1166,7 @@ test "dsv41 wide ubench: FLASH_ATTN and FLASH_TRIM at the release's spans (DSV41
     var arms = [_]Arm{
         .{ .name = "FLASH_ATTN", .k = try flash1Kernel() },
         .{ .name = "FLASH_TRIM", .k = try flashTrimKernel(0) },
+        .{ .name = "FLASH_TRIM + FLASH_PSUM", .k = try flashKernel(true, true, 0) },
     };
     defer for (arms) |a| {
         _ = mlx.mlx_fast_metal_kernel_free(a.k);

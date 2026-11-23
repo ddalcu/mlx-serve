@@ -12,9 +12,14 @@
 // [G, L, H / G * D]. Nothing of the scores or probabilities leaves the threadgroup.
 // FA_TRIM 1 (MLX_SERVE_DSV41_FLASH_TRIM), the same values: the block's max is taken over the raw scores and scaled once
 // (scale > 0, so max and the scaling commute exactly), and the epilogue stores each lane's 4 adjacent dims as one
-// 8-byte store. FA_PLANT 1 (tests only): the window's keys a row late.
+// 8-byte store. FA_PSUM 1 (MLX_SERVE_DSV41_FLASH_PSUM): l sums the f16 P the accumulator takes, not the f32 exps
+// before their rounding, so a key that carries the row has its rounding cancel in O / l; alpha is 1 where the max
+// holds. FA_PLANT 1 (tests only): the window's keys a row late.
 #ifndef FA_TRIM
 #define FA_TRIM 0
+#endif
+#ifndef FA_PSUM
+#define FA_PSUM 0
 #endif
 #ifndef FA_PLANT
 #define FA_PLANT 0
@@ -166,7 +171,11 @@ for (int b = 0; b < nb; ++b) {
     const int s0 = hgl * 4;
     const float bm = metal::max(metal::max(red_max[s0][r], red_max[s0 + 1][r]), metal::max(red_max[s0 + 2][r], red_max[s0 + 3][r]));
     mnew[i] = metal::max(m_run[i], bm);
+#if FA_PSUM
+    alpha[i] = mnew[i] == m_run[i] ? 1.0f : metal::exp(m_run[i] - mnew[i]);
+#else
     alpha[i] = metal::exp(m_run[i] - mnew[i]);
+#endif
     m_run[i] = mnew[i];
   }
 
@@ -178,7 +187,11 @@ for (int b = 0; b < nb; ++b) {
       for (short j = 0; j < 4; ++j) {
         const float e = ok[tn][j] ? metal::exp(scale * float(sc[tn * 8 + i * 4 + j]) - mnew[i]) : 0.0f;
         hv[i * 4 + j] = half(e);
+#if FA_PSUM
+        rs[i] += float(hv[i * 4 + j]);
+#else
         rs[i] += e;
+#endif
       }
     *(threadgroup metal::vec<half, 8>*)(&p_tg[hgl][qq * 2 + tn][lane * 8]) = hv;
   }
