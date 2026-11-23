@@ -51,7 +51,7 @@ pub const Moe = struct {
 
     pub fn forward(m: *const Moe, g: *Graph, x: Array) !Array {
         var t = g.scope();
-        errdefer t.deinit();
+        defer t.deinit();
         const sh = ops.shape(x);
         const n = sh[0];
         const s = sh[1];
@@ -241,8 +241,7 @@ test "hy_v4 moe: the latent expert path, the shared expert and the combine norm 
 
     // A dense MoE (no quantized banks): the component's dense arm gathers with gather_mm.
     const moe = Moe{
-        .router = .{ .gate_t = gate_arr, .bias = bias_arr, .experts = experts, .hidden = hidden, .top_k = top_k,
-            .norm = true, .scale = scale, .n_group = 1, .topk_group = 1 },
+        .router = .{ .gate_t = gate_arr, .bias = bias_arr, .experts = experts, .hidden = hidden, .top_k = top_k, .norm = true, .scale = scale, .n_group = 1, .topk_group = 1 },
         .routed_down = .{ .w = rd_arr },
         .routed_up = .{ .w = ru_arr },
         .gate_up = .{ .w = gu_arr },

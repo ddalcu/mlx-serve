@@ -1,12 +1,10 @@
 # hy_v4 — Tencent Hy4-flash (220B-A12B multimodal MoE)
 
 `model_type: hy_v4_flash`. The trunk is a DeepSeek-family MLA + compressed-DSA MoE with iHC streams, an Engram
-n-gram PLE on 4 layers, and a DFly2 draft stack in `model.dfly_layers.*`. Plans done: 01 claim/parse/bill/cache
-layout, 02 loader + Engram stream tables, 03 text forward (iHC, MLA with sinks, SWA, latent MoE, dense L0),
-04 compressed indexer (recall beyond the budget), 05 Engram (hash + streamed gather + injection),
-07 vision (SigLIP tower + projector + image/newline rows + Hy4 M-RoPE).
-Pending: 06 DFly2 (layers/fusion/correction scaffolded in `blocks/dfly.zig`, DISARMED until the target KV
-view + rollback round is proven), 08 proofs/docs.
+n-gram PLE on 4 layers, and a DFly2 draft stack in `model.dfly_layers.*` (a later PR). Done: claim/parse/bill/cache
+layout, loader + Engram stream tables, text forward (iHC, MLA with sinks, SWA, latent MoE, dense L0), compressed
+indexer (recall beyond the budget), Engram (hash + streamed gather + injection), vision (SigLIP tower + projector +
+image/newline rows + Hy4 M-RoPE), and the numeric oracle for every block.
 
 ## Rules
 
@@ -48,9 +46,9 @@ view + rollback round is proven), 08 proofs/docs.
   multiply and XOR (order 2 then 3), and each of the 16 heads (`(max_ngram-1) * n_head_per_ngram`) reduces
   modulo its own vocab size. Row = head offset (cumsum of the 16 sizes) + id.
 - **Every Engram norm is torch's DEFAULT eps, not the config's**: the per-head 96-wide norms, the signal's
-  unweighted norm and the key/query norms are plain `nn.RMSNorm` over bf16 activations, so all take
-  `finfo(bf16).eps` (2^-7). Only the layer norms outside Engram read `rms_norm_eps`. The independent MLX port
-  (omlx) used f32 eps — we follow HF.
+  unweighted norm and the key/query norms are plain `nn.RMSNorm`, whose kernel normalizes in f32 and takes
+  `finfo(float32).eps` (1.19e-7), NOT bf16's 2^-7. Only the layer norms outside Engram read `rms_norm_eps`.
+  The numeric oracle pins it (`defaultEps`).
 - **fp8 is a HOST round trip**: the pinned MLX FFI has no float8 dtype, so each gathered 96-vector is scaled by
   `max|x|/448`, clamped, snapped to the e4m3fn grid (ties to even) and rescaled in Zig before upload.
 - **The n-gram is the CURRENT call's tokens**: HF's `build_ngram_tokens` pads positions before the call, so a
@@ -65,9 +63,9 @@ view + rollback round is proven), 08 proofs/docs.
   densely, exactly as the reference does. A pack with the fine stage on is refused by name.
 - **Attention reads the recall set as an additive mask over the slot axis** (dense masked attention — the
   reference's own arm). A gather kernel that reads only the recalled rows is a perf step, not a correctness one.
-- The DFly2 draft reads the target's indexer top-2048 snapshot at the last-accepted row ∪ its own causal block;
-  its KV aliases target layers 25/29/33/37/41; fusion happens on slot 0 only. HF transformers does NOT implement
-  DFly2 — the semantics live in SGLang #51159 / vLLM #68296 (see `~/claude-tmp/hy4-port/SEMANTICS.md`).
+- DFly2 (the pack's 5 draft layers, fusion and hidden correction) is NOT served by this PR: its semantics live
+  in SGLang #51159 / vLLM #68296, not HF transformers, and the round + rollback land with the PR that proves
+  them. The pack's tensors are still validated at load.
 - `confidence_head` ships in the pack; Tencent's engines skip it — load it, do not wire it.
 - **The tower has NO RoPE**: the learned 128x128 position grid (row 0 is an unused cls row) is bilinearly
   resampled to the request's patch grid with Torch's `(size+0.1)/edge` scale_factor; attention is full and
@@ -88,9 +86,6 @@ view + rollback round is proven), 08 proofs/docs.
 - **Prefix cache is OFF**: a restored prefix may hold image placeholder rows, and the splice resumes only
   inside a chunked prefill (`vision_splice_offset`); a cache restore across an image run would splice tower rows
   at the wrong offset. Re-enable only once the cache carries that offset.
-- **DFly2 is scaffolded, not armed**: `blocks/dfly.zig` loads the 5 draft layers, fusion and hidden correction;
-  `trunk.zig` has the round, but `p.spec.native_stages` stays 0. The target KV view through `CacheOps` crashes
-  in `mlx_astype` (alignment) and the host cache rollback is unproven — the round must be re-run before arming.
 
 ## Packs & fixtures
 
@@ -99,6 +94,9 @@ view + rollback round is proven), 08 proofs/docs.
   synthetic. Fixture config: `src/fixtures/model-configs/hy_v4-flash.json`. Conformance + loader fixtures:
   `src/plugins/hy_v4/fixture.zig` (a tiny 2-layer pack: DSA layer 0 dense, SWA layer 1 with Engram + latent MoE;
   the conformance suite loads it and forwards prefill/decode/verify).
+- Numeric oracle: `tests/dump_hyv4_fixtures.py` builds tiny random modules with the HF modeling code and writes
+  `src/plugins/hy_v4/fixtures/num/` (weights, inputs, outputs); `blocks/oracle_test.zig` pins iHC, gated MLA with
+  sinks, the compressed indexer's recall mask, the latent MoE and the Engram gate at cos >= 0.999, rms +-0.02.
 - Quant census: trunk linears/embed/lm_head at g64 4-bit, MoE experts at g64 (24 groups over the 1536 latent) and
   Engram embeddings at g32 (per-tensor overrides in `quantization`), iHC f32, DFly bf16. `enable_lm_head_fp32`
   lies — the lm_head IS quantized.
@@ -109,5 +107,6 @@ view + rollback round is proven), 08 proofs/docs.
 ## Files
 
 `config.zig` claim/parse, `weights.zig` load + validate + Engram tables, `trunk.zig` per-layer build + forward,
-`vision.zig` tower + processor + media hooks, `blocks/{ihc,mla,proj,moe,router,indexer,engram,numpy_rng,dfly}.zig`
-the math, `fixture.zig` the tiny pack, `loader_test.zig` census + load, `vision_test.zig` tower parity dump.
+`vision.zig` tower + processor + media hooks, `mrope.zig` the newline-row position table,
+`blocks/{ihc,mla,proj,moe,router,indexer,engram,numpy_rng}.zig` the math, `blocks/oracle_test.zig` the numeric
+oracle, `fixture.zig` the tiny pack, `loader_test.zig` census + load, `vision_test.zig` tower parity dump.

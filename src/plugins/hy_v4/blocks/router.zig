@@ -40,7 +40,7 @@ pub const Choice = struct {
 /// The router's choice for `x` `[slots, rows, hidden]`.
 pub fn route(g: *Graph, x: Array, p: *const Params) !Choice {
     var t = g.scope();
-    errdefer t.deinit();
+    defer t.deinit();
     const sh = ops.shape(x);
     const n = sh[0];
     const s = sh[1];
@@ -143,8 +143,7 @@ test "hy_v4 router: sigmoid scores, unbiased weights, ascending ids, normalizati
     const x_arr = try g.fromSlice(f32, &x, &.{ 1, @intCast(rows), @intCast(hidden) });
     defer g.drop(x_arr);
 
-    const p: Params = .{ .gate_t = gate_arr, .bias = bias_arr, .experts = experts, .hidden = hidden,
-        .top_k = top_k, .norm = true, .scale = 3.998, .n_group = 1, .topk_group = 1 };
+    const p: Params = .{ .gate_t = gate_arr, .bias = bias_arr, .experts = experts, .hidden = hidden, .top_k = top_k, .norm = true, .scale = 3.998, .n_group = 1, .topk_group = 1 };
     const r = try route(&g, x_arr, &p);
     defer g.drop(r.ids);
     defer g.drop(r.weights);

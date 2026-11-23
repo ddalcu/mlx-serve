@@ -61,6 +61,48 @@ pub const Engram = struct {
     hc_mult: u32,
     hidden: u32,
 
+    /// The memory math over the normalized `emb` `[rows, emb_width]`: `signal = pre_gamma * rms(value_proj(emb))`,
+    /// a per-lane gate against the stream row, then `gate * signal + hc_scale * signal`. The caller applies the
+    /// pad/visual mask.
+    pub fn gateResidual(e: *Engram, g: *Graph, emb: Array, streams: Array) !Array {
+        const rows: c_int = ops.shape(emb)[0];
+        const hidden: c_int = @intCast(e.hidden);
+        const lanes: c_int = @intCast(e.hc_mult);
+
+        var t = g.scope();
+        defer t.deinit();
+        const vp = try e.value_proj.forward(&t, emb);
+        const value = try t.add(vp, e.value_bias);
+        const vf = try t.astype(value, .float32);
+        const vms = try t.mean(try t.square(vf), -1, true);
+        const vinv = try t.rsqrt(try t.addScalar(vms, defaultEps));
+        // The reference multiplies the bf16-rmsnormed signal by the bf16 pre_gamma: keep the lane dtype.
+        const signal = try t.astype(try t.mul(try t.mul(vf, vinv), e.pre_gamma), .bfloat16);
+
+        var sums: [4]Array = undefined;
+        for (0..@as(usize, @intCast(lanes))) |k| {
+            // Every norm in the Engram layer is a plain `nn.RMSNorm`: torch's default eps (float32's, it
+            // normalizes in f32), not the config's `rms_norm_eps`.
+            const key = try t.rmsNorm(try t.add(try e.key_proj[k].forward(&t, emb), e.key_bias[k]), e.norm_key[k], defaultEps);
+            const query = try t.slice(streams, &.{ 0, 0, @intCast(k), 0 }, &.{ 1, @intCast(rows), @as(c_int, @intCast(k)) + 1, hidden });
+            const q = try t.rmsNorm(try t.reshape(query, &.{ rows, hidden }), e.norm_query[k], defaultEps);
+            const dot = try t.mulScalar(try t.sum(try t.mul(key, q), -1, false), 1.0 / @sqrt(@as(f32, @floatFromInt(e.hidden))));
+            const mag = try t.sqrt(try t.maximum(try t.abs(dot), try t.scalarLike(dot, 1e-6)));
+            const signed = try t.where(try t.less(dot, try t.scalarLike(dot, 0)), try t.neg(mag), mag);
+            sums[k] = try t.sigmoid(signed); // [rows]
+        }
+
+        // residual[k] = gate[k] * signal + hc_scale[k] * signal
+        var out_parts: [4]Array = undefined;
+        for (0..@as(usize, @intCast(lanes))) |k| {
+            const gate = try t.expandDims(sums[k], -1); // [rows, 1]
+            const branch = try t.mul(signal, e.hc_scales[k]);
+            out_parts[k] = try t.add(try t.mul(gate, signal), branch);
+        }
+        const out = try t.concat(&.{ out_parts[0], out_parts[1], out_parts[2], out_parts[3] }, -1); // [rows, lanes*hidden]
+        return g.adopt(t.escape(try t.reshape(out, &.{ rows, lanes, hidden })));
+    }
+
     /// The residual `[rows, lanes, hidden]` the streams add, `streams` `[slots, rows, lanes, hidden]`,
     /// `ids` `[slots, rows]` int32. A single slot (the engine's text forwards) is required.
     pub fn forward(e: *Engram, g: *Graph, streams: Array, ids: Array) !Array {
@@ -68,8 +110,6 @@ pub const Engram = struct {
         const n = sh[0];
         const rows: usize = @intCast(sh[1]);
         if (n != 1) return error.EngramBatchedUnsupported;
-        const hidden: c_int = @intCast(e.hidden);
-        const lanes: c_int = @intCast(e.hc_mult);
 
         try ops.eval(ids);
         const tok = mlx.mlx_array_data_int32(ids) orelse return error.NoData;
@@ -105,47 +145,16 @@ pub const Engram = struct {
         defer t.deinit();
         const emb0 = try t.fromSlice(f32, vec, &.{ @intCast(rows), @intCast(e.heads), @intCast(e.head_dim) });
         const normed_heads = blk: {
-            // Per-head RMSNorm with torch's default eps for the activation dtype (bf16's finfo eps).
+            // Per-head RMSNorm with torch's default eps (float32's; `nn.RMSNorm` normalizes in f32).
             const x = try t.astype(emb0, .float32);
             const sq = try t.square(x);
             const ms = try t.mean(sq, -1, true);
-            const inv = try t.rsqrt(try t.addScalar(ms, bf16Eps));
+            const inv = try t.rsqrt(try t.addScalar(ms, defaultEps));
             const nrm = try t.astype(try t.mul(x, inv), .bfloat16);
             break :blk try t.mul(nrm, e.head_norm_w);
         };
         const emb = try t.reshape(normed_heads, &.{ @intCast(rows), @intCast(e.emb_width) });
-
-        // The shared signal and its per-lane gates.
-        const vp = try e.value_proj.forward(&t, emb);
-        const value = try t.add(vp, e.value_bias);
-        const vf = try t.astype(value, .float32);
-        const vms = try t.mean(try t.square(vf), -1, true);
-        const vinv = try t.rsqrt(try t.addScalar(vms, bf16Eps));
-        // The reference multiplies the bf16-rmsnormed signal by the bf16 pre_gamma: keep the lane dtype.
-        const signal = try t.astype(try t.mul(try t.mul(vf, vinv), e.pre_gamma), .bfloat16);
-
-        var sums: [4]Array = undefined;
-        for (0..@as(usize, @intCast(lanes))) |k| {
-            // Every norm in the Engram layer is a plain `nn.RMSNorm` over bf16 activations: torch's default
-            // eps (finfo of the activation dtype), not the config's `rms_norm_eps`.
-            const key = try t.rmsNorm(try t.add(try e.key_proj[k].forward(&t, emb), e.key_bias[k]), e.norm_key[k], bf16Eps);
-            const query = try t.slice(streams, &.{ 0, 0, @intCast(k), 0 }, &.{ 1, @intCast(rows), @as(c_int, @intCast(k)) + 1, hidden });
-            const q = try t.rmsNorm(try t.reshape(query, &.{ @intCast(rows), hidden }), e.norm_query[k], bf16Eps);
-            const dot = try t.mulScalar(try t.sum(try t.mul(key, q), -1, false), 1.0 / @sqrt(@as(f32, @floatFromInt(e.hidden))));
-            const mag = try t.sqrt(try t.maximum(try t.abs(dot), try t.scalarLike(dot, 1e-6)));
-            const signed = try t.where(try t.less(dot, try t.scalarLike(dot, 0)), try t.neg(mag), mag);
-            sums[k] = try t.sigmoid(signed); // [rows]
-        }
-
-        // residual[k] = gate[k] * signal + hc_scale[k] * signal
-        var out_parts: [4]Array = undefined;
-        for (0..@as(usize, @intCast(lanes))) |k| {
-            const gate = try t.expandDims(sums[k], -1); // [rows, 1]
-            const branch = try t.mul(signal, e.hc_scales[k]);
-            out_parts[k] = try t.add(try t.mul(gate, signal), branch);
-        }
-        const out = try t.concat(&.{ out_parts[0], out_parts[1], out_parts[2], out_parts[3] }, -1); // [rows, lanes*hidden]
-        const shaped = try t.reshape(out, &.{ @intCast(rows), lanes, hidden });
+        const shaped = try gateResidual(e, g, emb, streams); // [rows, lanes, hidden]
 
         // Zero the rows whose current token owns no n-gram (pad / visual) and hand back the stream dtype.
         var pad_flags = try gpa.alloc(i32, rows);
@@ -176,9 +185,7 @@ pub const Engram = struct {
             out[h] = e.head_off[h] + @as(u32, @intCast(@mod(@as(u64, @bitCast(mix)), m)));
         }
     }
-
 };
-
 
 /// Read each row's packed codes, scales and biases off the streamed table and dequantize to f32 (then the
 /// reference's bf16 cast, the fp8 round trip and a bf16 rounding again) into `out` `[rows*heads*head_dim]`.
@@ -206,8 +213,8 @@ fn gatherRows(e: *Engram, row_ids: []const u32, out: []f32) !void {
             const nib = (word >> @intCast((d % 8) * 4)) & 0xf;
             const grp = (d / 32) * 2;
             _ = groups;
-            const sc: f32 = @floatCast(readBf16(sbuf[grp ..][0..2]));
-            const bi: f32 = @floatCast(readBf16(bbuf[grp ..][0..2]));
+            const sc: f32 = @floatCast(readBf16(sbuf[grp..][0..2]));
+            const bi: f32 = @floatCast(readBf16(bbuf[grp..][0..2]));
             // The reference casts the gathered rows to the hidden dtype first: bf16 of the dequantized value.
             out[base + d] = roundBf16(@as(f32, @floatFromInt(nib)) * sc + bi);
         }
@@ -230,8 +237,8 @@ fn roundBf16(v: f32) f32 {
     return @bitCast(rounded & 0xffff0000);
 }
 
-/// torch's bf16 finfo epsilon: `nn.RMSNorm`'s default eps at the activation dtype.
-const bf16Eps: f32 = 0.0078125;
+/// torch's `nn.RMSNorm` default eps: its kernel normalizes in float32, so `eps=None` is float32's epsilon.
+const defaultEps: f32 = std.math.floatEps(f32);
 
 /// The e4m3fn grid (positive codes 1..126), ascending: exponent bias 7, 3 mantissa bits, subnormals to 2^-9.
 const e4m3_table: [126]f32 = blk: {
@@ -355,10 +362,9 @@ test "hy_v4 engram: the hash mixes lookup ids, multipliers and per-head moduli" 
     try testing.expectEqual(@as(i32, 3), @as(i32, @intCast(e.pad_id)));
 }
 
-test "hy_v4 engram: torch's bf16 RMSNorm eps is what the head norms use" {
-    try testing.expectEqual(@as(f32, 0.0078125), bf16Eps);
-    // finfo(bf16).eps = 2^-7.
-    try testing.expectEqual(@as(f32, 1.0 / 128.0), bf16Eps);
+test "hy_v4 engram: torch's nn.RMSNorm default eps is float32's, not bf16's" {
+    try testing.expectEqual(std.math.floatEps(f32), defaultEps);
+    try testing.expectEqual(@as(f32, 1.1920929e-7), defaultEps);
 }
 
 test "hy_v4 engram probe: concat sixteen bf16 head norms stacks to [1536]" {

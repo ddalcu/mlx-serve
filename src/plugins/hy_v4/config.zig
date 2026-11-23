@@ -209,8 +209,8 @@ fn want(cond: bool) ParseError!void {
 
 /// Keys another family's parser reads that this pack must not carry (a mislabel or a forked release).
 const foreign_keys = [_][]const u8{
-    "vision_config", "audio_config", "audio_token_id", "llm_config", "thinker_config",
-    "layer_types",     "mlp_layer_types", "indexer_types", "engram_layer_ids", "expert_streaming",
+    "vision_config", "audio_config",    "audio_token_id", "llm_config",       "thinker_config",
+    "layer_types",   "mlp_layer_types", "indexer_types",  "engram_layer_ids", "expert_streaming",
 };
 
 pub const Objects = struct {
@@ -511,7 +511,6 @@ fn readDfly(c: *Config, o: Objects) ParseError!void {
     if (find(root, cfg, "dfly_context_local_window") != null) return error.Unsupported;
 }
 
-
 fn readQuant(c: *Config, root: std.json.ObjectMap) ParseError!void {
     const q = field(root, "quantization") orelse field(root, "quantization_config") orelse return;
     const qo = try value(.object, q);
@@ -656,13 +655,8 @@ pub fn parse(
         .sections = c.mrope_section,
         .rope_dims = c.qk_rope_head_dim,
         .inv_freq = .of(c.mrope_inv[0..c.mrope_inv_len]),
-        .hy4_layout = c.has_vision,
+        .mrope_newline_rows = c.has_vision,
     };
-    // DFly2's draft layers load and the round is scaffolded (`blocks/dfly.zig`), but the engine arms it
-    // only through the native-drafter hooks: keep stages 0 until the target KV view + rollback path is
-    // proven (plan 06 pending).
-    p.spec.native_stages = 0;
-    p.spec.native_block = 0;
     p.cache.layout_namespace = abi.Str.of("hy4-mla-latent-v1");
     p.placeholder_ids.image = c.image_token_id;
     p.weights.prefix = abi.Str.of(c.weight_prefix);
@@ -821,7 +815,6 @@ test "hy_v4_flash config: shapes the plugin does not serve are refused by name" 
     try refuseContains(tiny_config, "\"dfly_mtp_fusion\":\"slot0\"", "\"dfly_mtp_fusion\":\"all\"");
 }
 
-
 fn replaceOne(arena: *std.heap.ArenaAllocator, hay: []const u8, needle: []const u8, sub: []const u8) ![]const u8 {
     const at = std.mem.indexOf(u8, hay, needle) orelse return error.NeedleMissing;
     const out = try arena.allocator().alloc(u8, hay.len - needle.len + sub.len);
@@ -839,11 +832,4 @@ fn refuseContains(base: []const u8, needle: []const u8, sub: []const u8) !void {
     const v = parseJson(mutated, true, &p);
     if (v.isOk() or p.private != null) return error.NotRefused;
     if (v.why.len == 0) return error.NoReason;
-}
-
-test "hy_v4 spec: DFly2 stays disarmed until the draft round is proven" {
-    var p: abi.Parsed = .{};
-    try testing.expect(parseJson(@embedFile("../../fixtures/model-configs/hy_v4-flash.json"), true, &p).isOk());
-    defer freeParsed(&p);
-    try testing.expectEqual(@as(u32, 0), p.spec.native_stages);
 }

@@ -65,7 +65,7 @@ pub fn pre(g: *Graph, streams: Array, p: *const Params) !Pre {
     const flat_width: c_int = @intCast(p.lanes * p.hidden);
 
     var t = g.scope();
-    errdefer t.deinit();
+    defer t.deinit();
     const streams_f = try t.astype(streams, .float32);
     const flat = try t.reshape(streams_f, &.{ n, s, flat_width });
     const mixes = try t.matmul(flat, p.fn_t);
@@ -136,8 +136,7 @@ fn readF32(a: Array) ![]const f32 {
 }
 
 /// The reference's f64 form of one sublayer mix, per row: no MLX, just the formula.
-fn refPre(flat: []const f64, streams: []const f64, fn_rows: []const f64, base: []const f64, scale: []const f64,
-    lanes: usize, hidden: usize, magnitude: f64, eps: f64, rms_eps: f64, mixed: []f64, post: []f64) void {
+fn refPre(flat: []const f64, streams: []const f64, fn_rows: []const f64, base: []const f64, scale: []const f64, lanes: usize, hidden: usize, magnitude: f64, eps: f64, rms_eps: f64, mixed: []f64, post: []f64) void {
     const width = lanes * hidden;
     var mean_sq: f64 = 0;
     for (flat[0..width]) |v| mean_sq += v * v;
@@ -197,8 +196,7 @@ test "hy_v4 ihc: the sublayer mix and post gate match the reference f64 form" {
     const scale_arr = try g.fromSlice(f32, &[_]f32{ @floatCast(scale[0]), @floatCast(scale[1]) }, &.{2});
     defer g.drop(scale_arr);
 
-    const p: Params = .{ .fn_t = fn_arr, .base = base_arr, .scale = scale_arr, .lanes = lanes, .hidden = hidden,
-        .magnitude = 2.0, .eps = 1e-6, .rms_eps = 1e-5 };
+    const p: Params = .{ .fn_t = fn_arr, .base = base_arr, .scale = scale_arr, .lanes = lanes, .hidden = hidden, .magnitude = 2.0, .eps = 1e-6, .rms_eps = 1e-5 };
     const r = try pre(&g, s_arr, &p);
     defer r.deinit();
     const got_mixed = try readF32(r.mixed);
@@ -206,9 +204,7 @@ test "hy_v4 ihc: the sublayer mix and post gate match the reference f64 form" {
 
     var want_mixed: [rows * hidden]f64 = @splat(0);
     var want_post: [rows * lanes]f64 = @splat(0);
-    for (0..rows) |row| refPre(streams[row * width ..][0..width], streams[row * width ..][0..width],
-        fn_data[0..], base[0..], scale[0..], lanes, hidden, 2.0, 1e-6, 1e-5,
-        want_mixed[row * hidden ..][0..hidden], want_post[row * lanes ..][0..lanes]);
+    for (0..rows) |row| refPre(streams[row * width ..][0..width], streams[row * width ..][0..width], fn_data[0..], base[0..], scale[0..], lanes, hidden, 2.0, 1e-6, 1e-5, want_mixed[row * hidden ..][0..hidden], want_post[row * lanes ..][0..lanes]);
     for (got_mixed, want_mixed) |v, w| try testing.expectApproxEqAbs(@as(f32, @floatCast(w)), v, 2e-5);
     for (got_post, want_post) |v, w| try testing.expectApproxEqAbs(@as(f32, @floatCast(w)), v, 2e-5);
 }
@@ -282,8 +278,7 @@ test "hy_v4 ihc: the head collapses the lanes by its own gates" {
     const scale_arr = try g.fromSlice(f32, &[_]f32{@floatCast(scale[0])}, &.{1});
     defer g.drop(scale_arr);
 
-    const hp: HeadParams = .{ .fn_t = fn_arr, .base = base_arr, .scale = scale_arr, .lanes = lanes, .hidden = hidden,
-        .eps = 1e-6, .rms_eps = 1e-5 };
+    const hp: HeadParams = .{ .fn_t = fn_arr, .base = base_arr, .scale = scale_arr, .lanes = lanes, .hidden = hidden, .eps = 1e-6, .rms_eps = 1e-5 };
     const out = try head(&g, s_arr, &hp);
     defer _ = mlx.mlx_array_free(out);
     const got = try readF32(out);

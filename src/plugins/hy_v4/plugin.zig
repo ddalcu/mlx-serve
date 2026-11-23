@@ -110,8 +110,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         log.err("hy_v4: load failed: {t}\n", .{e});
         out.* = switch (e) {
             error.MissingWeight, error.WrongShape => weights.failureVerdict(e),
-            error.TableMissing, error.TableSplit, error.TableHeader, error.TableRows,
-            error.TableGeometry, error.TableOpen, error.IndexMissing, error.EngramCount => weights.failureVerdict(e),
+            error.TableMissing, error.TableSplit, error.TableHeader, error.TableRows, error.TableGeometry, error.TableOpen, error.IndexMissing, error.EngramCount => weights.failureVerdict(e),
             error.UnsupportedWeightSource => Verdict.refuse(.unsupported, "hy_v4_flash: a weight source other than the resident map"),
             else => Verdict.named(.failed, @errorName(e)),
         };
@@ -165,7 +164,6 @@ test "hy_v4 conformance: the tiny pack claims, loads and forwards in every decla
     try @import("../../sdk/testing/conformance.zig").expectPlugin(@This());
 }
 
-
 const testing = std.testing;
 
 test "hy_v4_flash table: the bill covers shards without the Engram and names the KV row" {
@@ -196,6 +194,5 @@ test "hy_v4 table: the Engram stream's packed bytes match the pack's table censu
     bill(&p, &.{}, &b);
     var resident: u64 = 0;
     try testing.expect(residentBytes(&p, .{}, .{}, 129_900_000_000, &resident).isOk());
-    try testing.expectApproxEqRel(@as(f64, @floatFromInt(129_900_000_000 - want)),
-        @as(f64, @floatFromInt(resident)), 0.001);
+    try testing.expectApproxEqRel(@as(f64, @floatFromInt(129_900_000_000 - want)), @as(f64, @floatFromInt(resident)), 0.001);
 }

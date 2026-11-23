@@ -172,15 +172,13 @@ fn quantizeHead(w: *model.Weights, b: *const plugin_config.Binding, config: *con
 
 /// A streamed bank shares the ceiling with one prompt at 16K + 1K and the wired margin.
 fn streamRoom(config: *const ModelConfig) u64 {
-    return streamRoomAt(config, @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling(),
-        @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes);
+    return streamRoomAt(config, @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling(), @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes);
 }
 
 /// The decode phase's room (`LoadCtx.stream_room_decode`): a built-in GLM's or Ling's decode bill in place of its prompt
 /// bill; 0 for every other model, whose decode room stays its prompt room (`LoadCtx.decodeRoom`).
 fn streamRoomDecode(config: *const ModelConfig) u64 {
-    return streamRoomDecodeAt(config, @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling(),
-        @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes);
+    return streamRoomDecodeAt(config, @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling(), @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes);
 }
 
 fn streamRoomDecodeAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
@@ -874,11 +872,11 @@ const FlagProbe = struct {
     }
     /// The unnamed value 2.
     fn unnamed2(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
-        out.* = .{ .flags = .{ .decode_room = @enumFromInt(2) } };
+        out.* = .{ .flags = .{ .decode_room = @fromBackingInt(@intCast(2)) } };
     }
     /// The unnamed value 3.
     fn unnamed(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
-        out.* = .{ .flags = .{ .decode_room = @enumFromInt(3) } };
+        out.* = .{ .flags = .{ .decode_room = @fromBackingInt(@intCast(3)) } };
     }
     fn olderTerms(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
         out.* = .{ .size = @offsetOf(abi.Bill, "flags") };
@@ -1330,16 +1328,16 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         _ = mlx.mlx_array_free(mrope_pos);
     };
     if (xfm.config.plugin) |pb| {
-        if (pb.parsed.mrope.hy4_layout and ctx.mrope_pos != null and rows > 1) {
-        const total = ctx.mrope_total;
-        const rr: usize = rows;
-        if (base + rr <= total) {
-            const buf = try xfm.allocator.alloc(i32, 3 * rr);
-            defer xfm.allocator.free(buf);
-            for (0..3) |ax| @memcpy(buf[ax * rr ..][0..rr], ctx.mrope_pos.?[ax * total + base ..][0..rr]);
-            mrope_pos = mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ 3, @intCast(rows) }, 2, .int32);
-            mrope_pos_owned = true;
-        }
+        if (pb.parsed.mrope.mrope_newline_rows and ctx.mrope_pos != null and rows > 1) {
+            const total = ctx.mrope_total;
+            const rr: usize = rows;
+            if (base + rr <= total) {
+                const buf = try xfm.allocator.alloc(i32, 3 * rr);
+                defer xfm.allocator.free(buf);
+                for (0..3) |ax| @memcpy(buf[ax * rr ..][0..rr], ctx.mrope_pos.?[ax * total + base ..][0..rr]);
+                mrope_pos = mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ 3, @intCast(rows) }, 2, .int32);
+                mrope_pos_owned = true;
+            }
         }
     }
     // A capturing forward leaves each recurrent row's state for the partial-accept rollback (`Ctx.capture_spec`).

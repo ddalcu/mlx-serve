@@ -20,7 +20,8 @@ test {
     _ = @import("sdk/blocks/hc/hc_cuda_test.zig");
     _ = @import("plugins/stable_audio3/plugin.zig");
     _ = @import("host/media_jobs/plugin/served.zig");
-    _ = @import("host/media/hy4_mrope.zig");    _ = @import("host/media_jobs/plugin/flip_test.zig");
+    _ = @import("host/media_jobs/plugin/flip_test.zig");
+    _ = @import("plugins/hy_v4/mrope.zig");
     _ = @import("host/media_jobs/plugin/flip_image_test.zig");
     _ = @import("plugins/gemma4/gelu_ple_test.zig");
     _ = @import("sdk/quant/gguf/claim_test.zig");
@@ -261,6 +262,7 @@ test {
     _ = @import("plugins/hy_v4/blocks/indexer.zig");
     _ = @import("plugins/hy_v4/blocks/numpy_rng.zig");
     _ = @import("plugins/hy_v4/blocks/engram.zig");
+    _ = @import("plugins/hy_v4/blocks/oracle_test.zig");
     _ = @import("plugins/glm5_next/served_test.zig");
     _ = @import("sdk/bases/kda_hybrid/cuts_test.zig");
     _ = @import("plugins/bailing_hybrid/bill_test.zig");

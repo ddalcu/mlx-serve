@@ -77,7 +77,10 @@ const Block = struct {
     fc2_b: Array,
 };
 
-fn own(owned: *std.ArrayList(Array), a: Array) !Array { try owned.append(gpa, a); return a; }
+fn own(owned: *std.ArrayList(Array), a: Array) !Array {
+    try owned.append(gpa, a);
+    return a;
+}
 
 fn transposeTo(x: Array, perm: []const c_int) !Array {
     var out = mlx.mlx_array_new();
@@ -157,14 +160,20 @@ pub fn load(c: *const config.Config, w: *const weights_load.Weights) !*Vision {
         b.* = .{
             .norm1_w = try get(w, "vit.layers.{d}.input_layernorm.weight", .{n}),
             .norm1_b = try get(w, "vit.layers.{d}.input_layernorm.bias", .{n}),
-            .q_w = q[0], .q_b = q[1],
-            .k_w = k[0], .k_b = k[1],
-            .v_w = vv[0], .v_b = vv[1],
-            .o_w = o[0], .o_b = o[1],
+            .q_w = q[0],
+            .q_b = q[1],
+            .k_w = k[0],
+            .k_b = k[1],
+            .v_w = vv[0],
+            .v_b = vv[1],
+            .o_w = o[0],
+            .o_b = o[1],
             .norm2_w = try get(w, "vit.layers.{d}.post_attention_layernorm.weight", .{n}),
             .norm2_b = try get(w, "vit.layers.{d}.post_attention_layernorm.bias", .{n}),
-            .fc1_w = fc1[0], .fc1_b = fc1[1],
-            .fc2_w = fc2[0], .fc2_b = fc2[1],
+            .fc1_w = fc1[0],
+            .fc1_b = fc1[1],
+            .fc2_w = fc2[0],
+            .fc2_b = fc2[1],
         };
     }
 
@@ -327,7 +336,9 @@ pub fn forward(v: *Vision, patches: Array, gh: u32, gw: u32) !Array {
 
 const C = config.Config;
 
-fn cfgOf(p: *const abi.Parsed) *const C { return config.of(p); }
+fn cfgOf(p: *const abi.Parsed) *const C {
+    return config.of(p);
+}
 
 /// `HYV4VLImageProcessor`: smart resize factor patch*merge within the pixel bounds, Torch antialiased
 /// bicubic, rescale 1/255, mean/std 0.5, merge-major patchify (standard row-major patches, channel-major
