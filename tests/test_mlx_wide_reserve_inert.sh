@@ -38,18 +38,32 @@ text = json.load(open(wl))["messages"][0]["content"] if wl else "Write a Zig fun
 json.dump({"messages": [{"role": "user", "content": text}], "max_tokens": n, "temperature": 0, "seed": 1234, "logprobs": True, "top_logprobs": 2, "stream": False}, open(out, "w"))
 P
 
+# free_gb: the memory a load can take now (free + inactive + speculative + purgeable pages), GB
+free_gb() {
+  vm_stat | awk '/page size of/{pg=$8} /^Pages free/{f=$3} /^Pages inactive/{i=$3} /^Pages speculative/{s=$3} /^Pages purgeable/{p=$3} END{print int((f+i+s+p)*pg/1e9)}'
+}
+FREE0=$(free_gb)
+
 # serve <tag> <lib dir> <model>: one server, one request; $W/<tag>.answer (the choices) and $W/<tag>.mem
 serve() {
   local tag=$1 lib=$2 model=$3 h=$W/home-$1
   mkdir -p "$h/.mlx-serve"
+  # the last server's memory back first (macOS returns a large wired set seconds after the exit)
+  for _ in $(seq 1 300); do [ "$(free_gb)" -ge $((FREE0 - 20)) ] && break; sleep 1; done
   env HOME="$h" DYLD_LIBRARY_PATH="$lib" DYLD_PRINT_LIBRARIES=1 MLX_SERVE_DSV41_PF_KEEP_WIDE=0 MLX_SERVE_DSV4_DSPARK=0 \
     "$SERVER" --model "$model" --serve --host 127.0.0.1 --port $PORT --ctx-size "${CTX:-32768}" > "$W/$tag.log" 2>&1 < /dev/null &
   local pid=$!
   srv_wait_health "$U" 600 1 $pid || { echo "server $tag did not start"; tail -5 "$W/$tag.log"; srv_stop $pid; return 1; }
   curl -s -m 900 -H 'Content-Type: application/json' -d @"$W/body.json" "$U/v1/chat/completions" |
     /usr/bin/python3 -I -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["choices"], sort_keys=True))' > "$W/$tag.answer"
-  local rss; rss=$(ps -o rss= -p $pid | tr -d ' ')
-  curl -s "$U/props" | /usr/bin/python3 -I -c 'import json,sys; m=json.load(sys.stdin)["memory"]; print(m["active_bytes"], m["peak_bytes"], m["cache_bytes"], int(sys.argv[1]) * 1024)' "$rss" > "$W/$tag.mem"
+  # the counters once the server is quiet (its idle warm-up forwards done): two reads 2 s apart agree
+  local m="" prev="" rss
+  for _ in $(seq 1 60); do
+    m=$(curl -s "$U/props" | /usr/bin/python3 -I -c 'import json,sys; m=json.load(sys.stdin)["memory"]; print(m["active_bytes"], m["peak_bytes"], m["cache_bytes"])')
+    [ -n "$m" ] && [ "$m" = "$prev" ] && break; prev=$m; sleep 2
+  done
+  rss=$(ps -o rss= -p $pid | tr -d ' ')
+  echo "$m $((rss * 1024))" > "$W/$tag.mem"
   srv_stop $pid
   # which libmlx the process loaded (dyld's list)
   grep -a "libmlx.dylib" "$W/$tag.log" | head -1 | sed "s|^|    $tag loaded: |"
