@@ -1039,7 +1039,7 @@ test "dsv41 wide tol: PF_ROUTER_BF16's logits at every served width (33 to 17,63
         dsv41.router_sum_plant = false;
         _ = try sc.keep(other);
         // float64 over (at most) 256 rows from the middle.
-        const n = @min(rows, 256);
+        const n: usize = @min(rows, 256);
         const r0 = (rows - n) / 2;
         const a = try dsv41.hostF32(try sc.slice(today, 0, r0, r0 + n));
         defer gpa.free(a);
