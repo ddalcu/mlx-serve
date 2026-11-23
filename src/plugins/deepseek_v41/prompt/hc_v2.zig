@@ -377,6 +377,106 @@ pub fn drop() void {
     s.* = .{};
 }
 
+test "hc_v2 bench: the combining tails at a prompt width over a served routing, the stock builds reading the served unsort against the TOK builds reading the down rows in pair order (DSV41_BENCH_HC = rows, DSV41_BENCH_HC_ROUTE = a DSV41_ROUTE_DUMP file)" {
+    const rows_s = std.mem.span(env.get(.DSV41_BENCH_HC) orelse return error.SkipZigTest);
+    const path = env.get(.DSV41_BENCH_HC_ROUTE) orelse return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    const L: usize = try std.fmt.parseInt(usize, rows_s, 10);
+    const gpa = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 5));
+    const rnd = struct {
+        fn f(s: *dsv41.Scope, k: A, sh: []const c_int, dt: mlx.mlx_dtype, sd: f32) !A {
+            var r = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&r, sh.ptr, sh.len, dt, 0, sd, k, s.s));
+            return s.keep(r);
+        }
+    }.f;
+    const Li = ci(L);
+    const x = try rnd(&sc, key, &.{ Li, HC, D }, .bfloat16, 1);
+    const y = try rnd(&sc, key, &.{ Li, D }, .bfloat16, 1);
+    const dn = try rnd(&sc, key, &.{ ci(L * K), D }, .bfloat16, 1);
+    const sh = try rnd(&sc, key, &.{ Li, D }, .bfloat16, 1);
+    const post = try rnd(&sc, key, &.{ Li, HC }, .float32, 0.5);
+    const comb = try rnd(&sc, key, &.{ Li, HC, HC }, .float32, 0.25);
+    const cpre = try rnd(&sc, key, &.{ Li, HC }, .float32, 0.5);
+    const fnw = try rnd(&sc, key, &.{ MIX, N }, .float32, 0.01);
+    try dsv41.evalAll(&.{ x, y, dn, sh, post, comb, cpre, fnw });
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(path), gpa, .limited(1 << 30));
+    defer gpa.free(bytes);
+    const words = std.mem.bytesAsSlice(u32, bytes[0 .. bytes.len / 4 * 4]);
+    const S = slicesFor(L);
+    // One launch's time: a chain of `n` launches, each reading the one before's x2 as its stream, evaluated at once;
+    // the chain of 9 less the chain of 1, over 8, best of 6.
+    const Chain = struct {
+        fn run(p: Pro, in0: []const A, rows_: usize, S_: usize, n: usize, tok: bool) !f64 {
+            const g = std.testing.allocator;
+            const io2 = std.Io.Threaded.global_single_threaded.io();
+            const iou = @import("../../../sdk/util/io_util.zig");
+            var best: f64 = std.math.inf(f64);
+            for (0..6) |_| {
+                var it = dsv41.Scope.init(g, mlx.gpuStream());
+                defer it.deinit();
+                var in: [11]A = undefined;
+                @memcpy(in[0..in0.len], in0);
+                var last: A = none;
+                const t0 = iou.nowUsMonotonic(io2);
+                for (0..n) |_| {
+                    const o = try mixLaunchTo(&it, p, in[0..in0.len], rows_, S_, tok);
+                    in[0] = o[0];
+                    last = o[0];
+                }
+                try dsv41.evalAll(&.{last});
+                best = @min(best, @as(f64, @floatFromInt(iou.nowUsMonotonic(io2) - t0)));
+            }
+            return best;
+        }
+        fn per(p: Pro, in0: []const A, rows_: usize, S_: usize, tok: bool) !f64 {
+            return (try run(p, in0, rows_, S_, 9, tok) - try run(p, in0, rows_, S_, 1, tok)) / 8;
+        }
+    };
+    const iv = try gpa.alloc(u32, L * K);
+    defer gpa.free(iv);
+    const fill = try gpa.alloc(u8, L);
+    defer gpa.free(fill);
+    var tot: [2][2]f64 = .{ .{ 0, 0 }, .{ 0, 0 } };
+    var calls: usize = 0;
+    var at: usize = 0;
+    while (at + 4 <= words.len) {
+        const rl: usize = words[at];
+        const n: usize = words[at + 3];
+        if (words[at + 1] != K or at + 4 + 2 * n > words.len) return error.BadRouteDump;
+        const rows_ = words[at + 4 + n ..][0..n];
+        at += 4 + 2 * n;
+        if (rl != L) continue;
+        // The served unsort: pair (token r, slot j) at its sorted place, slot j in the order the token's rows come.
+        @memset(fill, 0);
+        for (rows_, 0..) |r, place| {
+            if (r >= L or fill[r] >= K) return error.BadRouteDump;
+            iv[r * K + fill[r]] = @intCast(place);
+            fill[r] += 1;
+        }
+        var isc = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer isc.deinit();
+        const inv = try isc.keep(mlx.mlx_array_new_data(iv.ptr, &[_]c_int{ Li, K }, 2, .uint32));
+        for ([_]Pro{ .tail_c, .tail_only_c }, 0..) |p, pi| {
+            const in: []const A = if (mixes(p)) &.{ x, y, post, comb, dn, inv, sh, post, comb, cpre, fnw } else &.{ x, y, post, comb, dn, inv, sh, post, comb };
+            const us = try Chain.per(p, in, L, S, false);
+            const ut = try Chain.per(p, in, L, S, true);
+            tot[pi][0] += us;
+            tot[pi][1] += ut;
+            std.debug.print("[hc_v2 tok] call {d} {s} {d} rows ({d} slices): served unsort {d:.0} us, pair order (TOK) {d:.0} us ({d:+.0} us)\n", .{ calls, @tagName(p), L, S, us, ut, ut - us });
+        }
+        calls += 1;
+    }
+    if (calls == 0) return error.NoCallOfThisWidth;
+    for ([_]Pro{ .tail_c, .tail_only_c }, 0..) |p, pi| std.debug.print("[hc_v2 tok] {s} over {d} calls of {d} rows: served unsort {d:.2} ms, pair order (TOK) {d:.2} ms ({d:+.2} ms)\n", .{ @tagName(p), calls, L, tot[pi][0] / 1e3, tot[pi][1] / 1e3, (tot[pi][1] - tot[pi][0]) / 1e3 });
+}
+
 test "hc_v2 packing: every element of fn lands once, each step's floats in its own 32 columns of every copy" {
     const seen = try std.testing.allocator.alloc(bool, N * MIX);
     defer std.testing.allocator.free(seen);

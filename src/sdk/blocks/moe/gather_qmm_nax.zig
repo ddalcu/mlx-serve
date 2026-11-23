@@ -2053,3 +2053,86 @@ test "staged NAX sorted gather µbench on a served routing, today's plan against
         for (staged_variants, 0..) |st, vi| std.debug.print("[gqmm-route]   staged bm={d} wm={d} wn={d} gx={d} {s}: {d:.2} ms ({d:.0}% of floor), {d:.2} ms saved\n", .{ st.bm, st.wm, st.wn, st.gx, if (st.tg_a) @as([]const u8, "tg-a") else "reg-a", tot[di][1 + vi], 100 * floor_tot[di] / tot[di][1 + vi], tot[di][0] - tot[di][1 + vi] });
     }
 }
+
+/// Milliseconds a down call takes (four evaluated together, median of 7 after one warm round): today's staged entry, or
+/// with `ridx` the scatter (`sortedGatherPromptStagedTok`, each row at its pair's slot).
+fn dsDownMs(c: DsCall, b: DsBanks, ridx: ?mlx.mlx_array, s: mlx.mlx_stream) !f64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var laps: [7]u64 = undefined;
+    for (0..laps.len + 1) |i| {
+        const mark = std.Io.Timestamp.now(io, .boot);
+        var outs: [4]mlx.mlx_array = undefined;
+        for (&outs) |*o| o.* = (if (ridx) |r|
+            try sortedGatherPromptStagedTok(c.act, b.down.w, b.down.sc, b.down.bi, c.ids, c.map, r, @intCast(ds_top_k), 4, b.group, true, true, s)
+        else
+            try sortedGatherPromptStaged(c.act, b.down.w, b.down.sc, b.down.bi, c.ids, 4, b.group, true, true, s)) orelse return error.KernelDeclinedTestShape;
+        defer for (outs) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        const vec = mlx.mlx_vector_array_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
+        if (i > 0) laps[i - 1] = @intCast(mark.untilNow(io, .boot).nanoseconds);
+    }
+    std.mem.sort(u64, &laps, {}, std.sort.asc(u64));
+    return @as(f64, @floatFromInt(laps[laps.len / 2])) / 4e6;
+}
+
+test "staged NAX down scatter µbench on a served routing: PF_DOWN_TOKORD's scatter against today's staged down at every call of the dump (diag gqmm-ubench=route:<DSV41_ROUTE_DUMP file>)" {
+    const raw = std.mem.sliceTo(env.get(.GQMM_UBENCH) orelse return error.SkipZigTest, 0);
+    if (!std.mem.startsWith(u8, raw, "route:")) return error.SkipZigTest;
+    try requireNax();
+    errdefer dropOwnLatch();
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, raw["route:".len..], a, .limited(1 << 30));
+    defer a.free(bytes);
+    const words = std.mem.bytesAsSlice(u32, bytes[0 .. bytes.len / 4 * 4]);
+    const b = try DsBanks.init(16, s);
+    defer b.deinit();
+    // Totals by call width (rows), today's and the scatter's.
+    const W = struct { rows: usize, calls: usize = 0, today: f64 = 0, tok: f64 = 0, floor: f64 = 0 };
+    var ws: [16]W = undefined;
+    var nw: usize = 0;
+    var at: usize = 0;
+    var layer: usize = 0;
+    while (at + 4 <= words.len) : (layer += 1) {
+        const L: usize = words[at];
+        const n: usize = words[at + 3];
+        if (words[at + 2] != ds_experts or words[at + 1] != ds_top_k or at + 4 + 2 * n > words.len) return error.BadRouteDump;
+        const ids = words[at + 4 ..][0..n];
+        const rows = words[at + 4 + n ..][0..n];
+        at += 4 + 2 * n;
+        // The flat picks: each token's experts, slot j in the order its rows come (sorted by expert).
+        const flat = try a.alloc(u32, n);
+        defer a.free(flat);
+        const fill = try a.alloc(u8, L);
+        defer a.free(fill);
+        @memset(fill, 0);
+        for (ids, rows) |e, r| {
+            if (r >= L or fill[r] >= ds_top_k) return error.BadRouteDump;
+            flat[r * ds_top_k + fill[r]] = e;
+            fill[r] += 1;
+        }
+        const c = try dsCallRouted(@alignCast(ids), @alignCast(rows), L, 0x7000 + layer, s);
+        defer c.deinit();
+        const ridx = mlx.mlx_array_new_data(flat.ptr, &[_]c_int{@intCast(n)}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(ridx);
+        const wi = for (ws[0..nw], 0..) |w, i| {
+            if (w.rows == L) break i;
+        } else blk: {
+            if (nw == ws.len) return error.TooManyWidths;
+            ws[nw] = .{ .rows = L };
+            nw += 1;
+            break :blk nw - 1;
+        };
+        const today = try dsDownMs(c, b, null, s);
+        const tok = try dsDownMs(c, b, ridx, s);
+        ws[wi].calls += 1;
+        ws[wi].today += today;
+        ws[wi].tok += tok;
+        ws[wi].floor += @as(f64, @floatFromInt(c.touched)) * @as(f64, @floatFromInt(ds_hidden)) * @as(f64, @floatFromInt(ds_inter)) * (0.5 + 1.0 / 16.0) / 1.065e9;
+    }
+    for (ws[0..nw]) |w| std.debug.print("[gqmm-route] down {d} calls of {d} rows: today {d:.3} ms, scatter {d:.3} ms ({d:+.3} ms, {d:+.2}%), weight floor {d:.3} ms\n", .{ w.calls, w.rows, w.today, w.tok, w.tok - w.today, 100 * (w.tok - w.today) / w.today, w.floor });
+}
