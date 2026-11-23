@@ -37,9 +37,9 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **A one-row visit is bound by the dependent launches on its critical path (5-7 us each, any size) and its bytes,
   not by its node count.** Independent launches overlap. A kernel that recomputes to save a launch loses unless the
   recompute is a few hundred thread steps (the router rows inside `mid.metal`).
-- **A step runs under a 200 MB command-buffer split** (`command_buffer_mb`, set per forward through
+- **A one-row forward runs under a 200 MB command-buffer split** (`command_buffer_mb`, set per forward through
   `HostGpu.command_buffer_limits`): MLX counts a bound buffer's whole size, so at its 50 every expert launch (a whole
-  bank) committed and the encode stalled on MLX's in-flight cap. A prompt keeps the host's split: a wider one slows it.
+  bank) committed and the encode stalled on MLX's in-flight cap. A prompt or a verify keeps the host's split.
 - **Dense projections stay in the checkpoint's `[out, in]` layout** (`layers.projectRows`): MLX's one-row matmul over
   a pre-transposed `[in, out]` weight costs several times the latency of `x @ W.T`. The message gates' down
   projections are held `[4, rank, 2 D]` for the same reason.

@@ -1429,7 +1429,7 @@ const Limits = struct {
     }
 };
 
-// Bar: a step (one row) runs under the plugin's command-buffer MB split and a prompt under the host's, the op split
+// Bar: a one-row forward runs under the plugin's command-buffer MB split and a wider one under the host's, the op split
 // is never moved, the unload puts the host's pair back, and a load that fails never moves it.
 test "inkling2 load: decode steps lift the command-buffer MB split, prompts and the unload restore the host's" {
     const a = testing.allocator;

@@ -557,7 +557,7 @@ fn unload(mp: *anyopaque) callconv(.c) void {
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
     const m: *Loaded = @ptrCast(@alignCast(mp));
     if (f.slots.len == 1) m.spec.select(f.slots.slice()[0]);
-    m.split.follow(f.rows == 1 or f.mode == .verify);
+    m.split.follow(f.rows == 1);
     return run_mod.tableForward(Model, &m.base, f, out);
 }
 
@@ -844,10 +844,11 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     return m;
 }
 
-/// MLX's command-buffer MB split for a decode step or a verify. An expert launch binds its whole bank, and MLX commits
-/// once the distinct buffers a command buffer binds pass the split: at the device's 50 nearly every bank launch
-/// commits, and a step's encode waits on MLX's cap of in-flight buffers. A prompt forward keeps the host's split (a
-/// wider one slows a chunk), and the op split stays the device's.
+/// MLX's command-buffer MB split for a one-row forward (a decode step, a slot of a batched one). An expert launch binds
+/// its whole bank, and MLX commits once the distinct buffers a command buffer binds pass the split: at the device's 50
+/// nearly every bank launch commits, and a step's encode waits on MLX's cap of in-flight buffers. A wider forward (a
+/// prompt, a verify) keeps the host's split: drafted decode keeps more tokens so, and a prompt chunk slows under a
+/// wider one. The op split stays the device's.
 pub const command_buffer_mb: i32 = 200;
 
 /// The host's MB split as the load found it, which the plugin moves per forward (`follow`) and puts back at unload;
@@ -867,7 +868,7 @@ const BufferSplit = struct {
         return .{ .gpu = h.gpu(), .prev_mb = prev_mb };
     }
 
-    /// The lifted split for a step (one row a slot, or a verify), the host's for a prompt.
+    /// The lifted split for a one-row forward, the host's for a wider one.
     fn follow(sp: *BufferSplit, step: bool) void {
         const g = sp.gpu orelse return;
         if (step == sp.lifted) return;
