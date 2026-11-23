@@ -8360,7 +8360,12 @@ const DraftGraph = struct { ev: [3]A, want_conf: bool };
 /// `MLX_SERVE_DSV41_SPEC_SYNC`: a draft built before the host knows its round's outcome. `t1` (`[1]` int32) and the
 /// position `n` (an int32 scalar) are the verify's GPU arrays; `window` is the host's `min(sliding_window, n)`, the same
 /// for every outcome.
-pub const GpuAt = struct { t1: A, n: A, window: usize };
+/// `slots` / `rows_pos` (`MLX_SERVE_DSV41_DRAFT_POS_ONCE`): the window's ring slots and the draft rows' positions, made
+/// once a draft for every stage (their rings share one cap), none where each stage makes its own.
+pub const GpuAt = struct { t1: A, n: A, window: usize, slots: A = none, rows_pos: A = none };
+/// `MLX_SERVE_DSV41_DRAFT_POS_ONCE`'s drafts (the tests' engagement count).
+pub var draft_pos_once_runs = std.atomic.Value(usize).init(0);
+var draft_pos_once_logged = std.atomic.Value(bool).init(false);
 fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool, at: ?GpuAt, sample: ?markov.Sample) !DraftGraph {
     const c = &m.cfg;
     const B = m.ds_block;
@@ -8375,7 +8380,21 @@ fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool
     const emb = if (at) |g| try m.embed.rows(sc, try sc.concat(&.{ g.t1, try sc.ints(ids[1..B], &.{ci(B - 1)}) }, 0), m.act) else try embedIds(m, sc, uids[0..B], m.act);
     var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(B), ci(hc), ci(d) });
     var pre = try onehotPre(sc, m, B);
-    for (0..m.n_mtp) |si| x = try stageBlock(sc, m, &.{st}, m.n_layers + si, x, &pre, B, at);
+    var at1 = at;
+    if (at1) |*g| if (env.on(.MLX_SERVE_DSV41_DRAFT_POS_ONCE) and st.ds.len > 0) {
+        const cap = st.ds[0].cap;
+        const one_cap = for (st.ds) |r| {
+            if (r.cap != cap) break false;
+        } else true;
+        if (one_cap and g.window <= cap) {
+            const pos = try sc.add(try sc.sub(g.n, try sc.i(@intCast(g.window))), try sc.arange(0, g.window));
+            g.slots = try sc.op2(mlx.mlx_remainder, pos, try sc.i(@intCast(cap)));
+            g.rows_pos = try sc.add(try sc.arange(0, B), g.n);
+            _ = draft_pos_once_runs.fetchAdd(1, .monotonic);
+            logOnce(&draft_pos_once_logged, "[dsv41] MLX_SERVE_DSV41_DRAFT_POS_ONCE engaged: a draft's ring slots and row positions made once for every stage\n");
+        }
+    };
+    for (0..m.n_mtp) |si| x = try stageBlock(sc, m, &.{st}, m.n_layers + si, x, &pre, B, at1);
     const hout = try hcCollapse(sc, x, pre);
     const logits = try sc.astype(try m.head.apply(sc, try sc.rms(hout, ds.norm, c.rms_norm_eps)), .float32);
     var cur = if (at) |g| g.t1 else try sc.ints(ids[0..1], &.{1});
@@ -8540,7 +8559,7 @@ pub fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize,
     for (states, heads[0..states.len], 0..) |st, *o, k| {
         const mine: Proj = if (states.len == 1) rows else .{ .q = try sc.slice(rows.q, 0, k * B, (k + 1) * B), .kv = try sc.slice(rows.kv, 0, k * B, (k + 1) * B), .qr = rows.qr };
         if (at) |g| {
-            o.* = try dsparkHeads(sc, m, ly, mine, try st.ds[si].readAt(sc, g.n, g.window), g.n);
+            o.* = try dsparkHeads(sc, m, ly, mine, if (g.slots.ctx != null) try sc.take(st.ds[si].buf, g.slots, 0) else try st.ds[si].readAt(sc, g.n, g.window), g.n);
             continue;
         }
         const window = @min(m.cfg.sliding_window, st.n);
@@ -8578,10 +8597,10 @@ fn stageFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     const L = dim(x, 0);
     const a = try dkern.in_proj.run(sc, kp, m, ly, x, pre.*) orelse return null;
     // `GpuAt`: the rows' positions from the GPU's (the same values `rowsAt` lays out).
-    const rows_pos = if (at) |g| try sc.add(try sc.arange(0, L), g.n) else try dkern.wq_b.rowsAt(sc, st.n, L);
+    const rows_pos = if (at) |g| (if (g.rows_pos.ctx != null and L == dim(g.rows_pos, 0)) g.rows_pos else try sc.add(try sc.arange(0, L), g.n)) else try dkern.wq_b.rowsAt(sc, st.n, L);
     const w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, rows_pos) orelse return null;
     const si = li - m.n_layers;
-    const keys = if (at) |g| try st.ds[si].readAt(sc, g.n, g.window) else blk: {
+    const keys = if (at) |g| (if (g.slots.ctx != null) try sc.take(st.ds[si].buf, g.slots, 0) else try st.ds[si].readAt(sc, g.n, g.window)) else blk: {
         const window = @min(m.cfg.sliding_window, st.n);
         break :blk try st.ds[si].read(sc, st.n - window, st.n);
     };
@@ -11596,6 +11615,8 @@ test "dsv41 spec sync: GPU-accept rounds keep the host rounds' tokens, accepts a
     const taken = sync_rounds.load(.monotonic);
     const collected = sync_collects.load(.monotonic);
     // `MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD` on: the GPU rounds' verifies gate the kv made behind their drafts.
+    std.debug.print("[spec-sync] MLX_SERVE_DSV41_DRAFT_POS_ONCE {}: {d} drafts made their slots and positions once\n", .{ env.on(.MLX_SERVE_DSV41_DRAFT_POS_ONCE), draft_pos_once_runs.load(.monotonic) });
+    if (env.on(.MLX_SERVE_DSV41_DRAFT_POS_ONCE)) try testing.expect(draft_pos_once_runs.load(.monotonic) > 0);
     const ahead = eng_ahead_served.load(.monotonic);
     std.debug.print("[spec-sync] SPEC_ENGRAM_AHEAD {} ({s}): kv launched behind {d} drafts, taken up with {d}; {d} verify Engram writes took it\n", .{ engAheadOn(), engAheadWhyNot(m) orelse "serves", eng_ahead_launched.load(.monotonic), eng_ahead_taken.load(.monotonic), ahead });
     if (engAheadOn()) try testing.expect(ahead > 0);
