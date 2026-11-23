@@ -457,7 +457,9 @@ pub const DsparkW = struct {
 
     /// The head the drafts read.
     pub fn headFor(self: *const DsparkW, m: *const Dsv41Model) *const Lin {
-        return if (self.draft) |*d| &d.head else &m.head;
+        const d = if (self.draft) |*x| x else return &m.head;
+        if (d.head4) logOnce(&draft_head4_logged, "[dsv41] MLX_SERVE_DSV41_DRAFT_HEAD4 engaged: the DSpark drafts read their own 4-bit head\n");
+        return &d.head;
     }
     /// The Markov tables a draft's chain reads: markov_embed (indexed by a draft token) and markov_head (a row a scored
     /// id).
@@ -475,6 +477,8 @@ pub const DsparkW = struct {
 /// nothing here.
 pub const DraftHead = struct {
     head: Lin,
+    /// `head` is `MLX_SERVE_DSV41_DRAFT_HEAD4`'s (or its rows)
+    head4: bool = false,
     k: usize = 0,
     /// int32 [k]: the vocabulary, ascending
     ids: A = none,
@@ -1247,7 +1251,7 @@ pub fn draftOrder(ids: []const i32, to_draft: []i32, perm: []i32) void {
 /// and with a vocabulary file (`MLX_SERVE_DSV41_DRAFT_VOCAB`) the rows of its ids of that head (else of the trunk's)
 /// and of the Markov tables. Null: the drafts read the trunk's head.
 fn draftHeadFor(m: *Dsv41Model, w: *Weights, head4: ?Lin, vocab_path: ?[:0]const u8) !?DraftHead {
-    const path = vocab_path orelse return if (head4) |h| .{ .head = h } else null;
+    const path = vocab_path orelse return if (head4) |h| .{ .head = h, .head4 = true } else null;
     const V = m.vocab;
     const io = std.Io.Threaded.global_single_threaded.io();
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, m.gpa, .limited(64 << 20)) catch |e| {
@@ -1261,7 +1265,7 @@ fn draftHeadFor(m: *Dsv41Model, w: *Weights, head4: ?Lin, vocab_path: ?[:0]const
     const why: ?[]const u8 = if (ids.len == 0 or ids.len >= V) "no ids, or every id" else if (base.ext != null or base.w.ctx == null) "the head is an outside quant plugin's" else null;
     if (why) |r| {
         log.warn("deepseek_v41: MLX_SERVE_DSV41_DRAFT_VOCAB {s} declined ({s}): the drafts score the whole vocabulary\n", .{ path, r });
-        return if (head4) |h| .{ .head = h } else null;
+        return if (head4) |h| .{ .head = h, .head4 = true } else null;
     }
     const ds = &m.dspark.?;
     const k = ids.len;
@@ -1273,14 +1277,14 @@ fn draftHeadFor(m: *Dsv41Model, w: *Weights, head4: ?Lin, vocab_path: ?[:0]const
     var sc = Scope.init(m.gpa, m.s);
     defer sc.deinit();
     const idx = try sc.ints(ids, &.{ci(k)});
-    var d: DraftHead = .{ .head = .{ .w = none, .qp = base.qp }, .k = k };
+    var d: DraftHead = .{ .head = .{ .w = none, .qp = base.qp }, .head4 = head4 != null, .k = k };
     d.ids = try m.own(sc.out(idx));
     d.to_draft = try m.own(sc.out(try sc.ints(to_draft, &.{ci(V)})));
-    d.markov_embed = try m.own(sc.out(try sc.take(ds.markov_embed, try sc.ints(perm, &.{ci(V)}), 0)));
-    d.markov_head = try m.own(sc.out(try sc.take(ds.markov_head, idx, 0)));
-    d.head.w = try m.own(sc.out(try sc.take(base.w, idx, 0)));
-    if (base.s.ctx != null) d.head.s = try m.own(sc.out(try sc.take(base.s, idx, 0)));
-    if (base.b.ctx != null) d.head.b = try m.own(sc.out(try sc.take(base.b, idx, 0)));
+    d.markov_embed = try m.own(sc.out(try rowMajor(&sc, try sc.take(ds.markov_embed, try sc.ints(perm, &.{ci(V)}), 0))));
+    d.markov_head = try m.own(sc.out(try rowMajor(&sc, try sc.take(ds.markov_head, idx, 0))));
+    d.head.w = try m.own(sc.out(try rowMajor(&sc, try sc.take(base.w, idx, 0))));
+    if (base.s.ctx != null) d.head.s = try m.own(sc.out(try rowMajor(&sc, try sc.take(base.s, idx, 0))));
+    if (base.b.ctx != null) d.head.b = try m.own(sc.out(try rowMajor(&sc, try sc.take(base.b, idx, 0))));
     var ev = [_]A{ d.ids, d.to_draft, d.markov_embed, d.markov_head, d.head.w, d.head.s, d.head.b };
     var n_ev: usize = 0;
     for (ev) |x| if (x.ctx != null) {
@@ -8524,6 +8528,7 @@ fn draftVocabOf(ds: *const DsparkW) ?*const DraftHead {
     return dv;
 }
 var draft_vocab_logged = std.atomic.Value(bool).init(false);
+var draft_head4_logged = std.atomic.Value(bool).init(false);
 
 /// A draft's Markov-biased rows `rows` [.., k] over a vocabulary `sub` as rows over every id (-inf at an id outside
 /// it: the drafts never propose one); as they are without one.
@@ -8536,7 +8541,14 @@ fn draftRowsWhole(sc: *Scope, sub: ?*const DraftHead, rows: A) !A {
     const ninf = try sc.broadcast(try sc.f(-std.math.inf(f32)), lead[0..sh.len]);
     const padded = try sc.concat(&.{ rows, try sc.astype(ninf, mlx.mlx_array_dtype(rows)) }, @intCast(sh.len - 1));
     const at = try sc.op2(mlx.mlx_minimum, dv.to_draft, try sc.i(@intCast(dv.k)));
-    return sc.take(padded, at, @intCast(sh.len - 1));
+    // A gather on the last axis can come back in another layout: the host reads the rows in row order.
+    return rowMajor(sc, try sc.take(padded, at, @intCast(sh.len - 1)));
+}
+
+/// `x` row-contiguous (a copy only where it is not).
+fn rowMajor(sc: *Scope, x: A) !A {
+    var o = mlx.mlx_array_new();
+    return sc.res(mlx.mlx_contiguous(&o, x, false, sc.s), &o);
 }
 /// `draftRows`' read of its evaluated outputs `ev` (`draftGraph`'s): the ids after `t1`, the confidences and the block's
 /// length by the threshold, and the rows with `keep_logits`.
@@ -8616,7 +8628,7 @@ pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []cons
         cur = try sc.astype(try sc.argmax(row, -1), .int32);
         toks[k] = cur;
     }
-    const all = if (sub) |dv| try sc.take(dv.ids, try sc.stack(toks[0..B], 1), 0) else try sc.stack(toks[0..B], 1); // [N, B]
+    const all = if (sub) |dv| try rowMajor(&sc, try sc.take(dv.ids, try sc.stack(toks[0..B], 1), 0)) else try sc.stack(toks[0..B], 1); // [N, B]
     const rows_all = if (keep_logits) try draftRowsWhole(&sc, sub, try sc.stack(rows_k[0..B], 1)) else all;
     var ev = [_]A{ all, if (want_conf) try sc.astype(try sc.concat(confs[0..B], -1), .float32) else all, rows_all };
     try evalAll(&ev);
@@ -13354,7 +13366,7 @@ test "dsv41 draft vocabulary: the chain over a vocabulary's rows picks, scores a
         const mask = try a.alloc(i32, V);
         defer a.free(mask);
         for (mask, 0..) |*x, v| x.* = if (v % 4 != 1) 1 else 0;
-        const in_set = try sc.astype(try sc.ints(mask, &.{ci(V)}), .bool);
+        const in_set = try sc.astype(try sc.ints(mask, &.{ci(V)}), .bool_);
         const masked = try sc.where(in_set, lg, try sc.f(-std.math.inf(f32)));
         const lin_none: Lin = .{ .w = none };
         const whole: DsparkW = .{ .main_proj = lin_none, .main_norm = none, .norm = none, .markov_embed = emb, .markov_head = mh, .conf = cw };
@@ -13373,10 +13385,51 @@ test "dsv41 draft vocabulary: the chain over a vocabulary's rows picks, scores a
                 return (mlx.mlx_array_data_uint8(x) orelse unreachable)[0 .. mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x)];
             }
         };
-        for (want, got) |w, g| try std.testing.expectEqualSlices(u8, bytes.of(w), bytes.of(g));
+        for (want, got, 0..) |w, g, j| if (!std.mem.eql(u8, bytes.of(w), bytes.of(g))) {
+            std.debug.print("[draft vocab] R {d}: output {d} differs ({d} vs {d} bytes)\n", .{ R, j, bytes.of(w).len, bytes.of(g).len });
+            if (j == 0) std.debug.print("  want {any}\n  got  {any}\n", .{ (mlx.mlx_array_data_int32(w) orelse return error.NoData)[0..B], (mlx.mlx_array_data_int32(g) orelse return error.NoData)[0..B] });
+            if (j == 1) std.debug.print("  want {any}\n  got  {any}\n", .{ (mlx.mlx_array_data_float32(w) orelse return error.NoData)[0..B], (mlx.mlx_array_data_float32(g) orelse return error.NoData)[0..B] });
+            if (j == 2) {
+                const wf = (mlx.mlx_array_data_float32(w) orelse return error.NoData)[0 .. B * V];
+                const gf = (mlx.mlx_array_data_float32(g) orelse return error.NoData)[0 .. B * V];
+                var nd: usize = 0;
+                for (wf, gf, 0..) |x, y, q| if (@as(u32, @bitCast(x)) != @as(u32, @bitCast(y))) {
+                    if (nd < 6) {
+                        var at: ?usize = null;
+                        for (wf[(q / V) * V ..][0..V], 0..) |z, zi| if (@as(u32, @bitCast(z)) == @as(u32, @bitCast(y))) {
+                            at = zi;
+                        };
+                        std.debug.print("  row {d} id {d}: want {d} got {d} (got's value is want's at id {any})\n", .{ q / V, q % V, x, y, at });
+                    }
+                    nd += 1;
+                };
+                std.debug.print("  {d} of {d} values differ\n", .{ nd, B * V });
+            }
+            return error.TestUnexpectedResult;
+        };
         try std.testing.expect(!std.mem.eql(u8, bytes.of(want[0]), bytes.of(bad[0])));
         // Every drafted id is the vocabulary's.
         const toks = (mlx.mlx_array_data_int32(got[0]) orelse return error.NoData)[0..B];
         for (toks) |t| try std.testing.expect(@mod(t, 4) != 1);
     }
+}
+
+test "dsv41 draft vocabulary: a vocabulary's rows widen to every id, -inf past the vocabulary" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var sc = Scope.init(a, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = [_]i32{ 0, 2, 3, 5 };
+    var to: [6]i32 = undefined;
+    var perm: [6]i32 = undefined;
+    draftOrder(&ids, &to, &perm);
+    const vals = [_]f32{ 10, 12, 13, 15, 20, 22, 23, 25 };
+    const rows = try sc.keep(mlx.mlx_array_new_data(&vals, &[_]c_int{ 2, 4 }, 2, .float32));
+    const dv: DraftHead = .{ .head = .{ .w = none }, .k = 4, .ids = try sc.ints(&ids, &.{4}), .to_draft = try sc.ints(&to, &.{6}) };
+    const whole = try draftRowsWhole(&sc, &dv, rows);
+    try evalAll(&.{whole});
+    const got = (mlx.mlx_array_data_float32(whole) orelse return error.NoData)[0..12];
+    const ninf = -std.math.inf(f32);
+    std.debug.print("[draft vocab] widened {any}\n", .{got});
+    try std.testing.expectEqualSlices(f32, &.{ 10, ninf, 12, 13, ninf, 15, 20, ninf, 22, 23, ninf, 25 }, got);
 }

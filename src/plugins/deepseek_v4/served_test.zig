@@ -1290,9 +1290,14 @@ test "deepseek_v41 served: a draft-only head (DRAFT_HEAD4, DRAFT_VOCAB) changes 
     var dbuf: [512]u8 = undefined;
     const dir = dbuf[0..try tmp.dir.realPath(io, &dbuf)];
     var pbuf: [600]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&pbuf, "{s}/vocab.txt", .{dir});
+    const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/vocab.txt", .{dir}, 0);
     const Arm = struct { head4: ?[*:0]const u8, vocab: ?[*:0]const u8 };
     const arms = [_]Arm{ .{ .head4 = null, .vocab = null }, .{ .head4 = "1", .vocab = null }, .{ .head4 = null, .vocab = path.ptr }, .{ .head4 = "1", .vocab = path.ptr } };
+    // A seeded request on the keyed sampler (MLX_SERVE_KEYED_SAMPLING: the draw at each generated index is fixed by the
+    // seed) emits serial decoding's tokens whatever the drafts; the one-hot acceptance gives the trunk's distribution
+    // either way (`dsparkStochasticRound`).
+    const keyed = env.override(.MLX_SERVE_KEYED_SAMPLING, "1");
+    defer keyed.restore();
     const samplings = [_]SamplingParams{ .{ .temperature = 0 }, .{ .temperature = 0.8, .top_p = 0.95, .seed = 4 } };
     for (samplings) |sampling| {
         var want: [48]u32 = undefined;
