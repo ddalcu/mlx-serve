@@ -1068,6 +1068,8 @@ test "dsv41 wide tol: PF_ROUTER_BF16 serves only where today runs gate_gemm's si
         if (!(ep.l2 <= et.l2 and ep.max <= et.max)) planted_farther = true;
     }
     try testing.expect(planted_farther);
+}
+
 fn freePair(xs: [2]A) void {
     for (xs) |o| _ = mlx.mlx_array_free(o);
 }
