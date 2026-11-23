@@ -8,6 +8,7 @@ const device = @import("../../../mlx/device.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 const decode = @import("decode.zig");
+const env = @import("../../../env.zig");
 const v41 = @import("../deepseek_v41.zig");
 
 const A = mlx.mlx_array;
@@ -62,6 +63,8 @@ pub const Plan = struct {
     comp_f32: bool = false,
     /// Every threadgroup collapses the stream itself (up to `fuse_rows` rows); else `dec_in_proj_stage.metal` makes h first.
     fuse: bool = true,
+    /// `MLX_SERVE_DSV41_IN_PROJ_MIXR` (staged plans): the hc mixes a threadgroup a (mix, row), first in the grid.
+    mixr: bool = false,
 
     fn compDtype(p: Plan) mlx.mlx_dtype {
         return if (p.comp_f32) .float32 else .bfloat16;
@@ -71,9 +74,9 @@ pub const Plan = struct {
         return p.dim / 8;
     }
 
-    /// q_kv, weights_proj and compressor threadgroups, then one per hc mix.
+    /// q_kv, weights_proj and compressor threadgroups, then one per hc mix (`mixr`: one per mix and row, first).
     fn groups(p: Plan) usize {
-        return (p.nq + p.nw + p.nc) / rt + n_mix;
+        return (p.nq + p.nw + p.nc) / rt + (if (p.mixr) n_mix * p.rows else n_mix);
     }
 };
 
@@ -140,8 +143,17 @@ pub fn planRows(m: *const v41.Dsv41Model, ly: *const v41.Layer, rows: usize) ?Pl
         p.nc = bf16Rows(&cw.wkv, d) orelse return null;
         p.comp_f32 = ly.ratio > 1;
     }
+    p.mixr = !p.fuse and mixrOn();
     return p;
 }
+
+/// `MLX_SERVE_DSV41_IN_PROJ_MIXR`, read each call; its engaged line once.
+fn mixrOn() bool {
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_IN_PROJ_MIXR)) return false;
+    if (!mixr_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info("[dsv41] MLX_SERVE_DSV41_IN_PROJ_MIXR engaged: a verify's hc mixes a (mix, row) a threadgroup, first\n", .{});
+    return true;
+}
+var mixr_logged = std.atomic.Value(bool).init(false);
 
 /// `plan`'s arrays from the layer.
 pub fn argsOf(ly: *const v41.Layer, x: A, cpre: A, eps: A) Args {
@@ -201,6 +213,7 @@ fn launchGeometry(p: Plan, fold: c_int) kc.metal.Geometry {
     g.out(&.{ r, n_mix }, .float32);
     inline for (.{ .{ "R", p.rows }, .{ "RT", rt }, .{ "NQ", p.nq }, .{ "QA", p.qa }, .{ "NW", p.nw }, .{ "NC", p.nc }, .{ "D", p.dim } }) |t| g.int(t[0], t[1]);
     g.flag("FUSE", p.fuse);
+    g.flag("MIXR", p.mixr);
     g.dtype("CT", p.compDtype());
     g.int("FOLD", fold);
     // The outputs the plan does not make are never written.
@@ -427,12 +440,17 @@ fn depthNorm(s: Shape) usize {
 /// The main kernel with `fuse` (every threadgroup collapses the stream; else `hin` holds the normed collapse), `nw`
 /// weights_proj rows and `nc` compressor rows (f32 when `cf32`).
 fn Main(comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf32: bool) type {
+    return MainM(fuse, nw, nc, cf32, false);
+}
+
+/// `Main` with `Plan.mixr` (staged plans).
+fn MainM(comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf32: bool, comptime mixr: bool) type {
     return struct {
         pub const Params = struct {};
         const comp_elem: spec.Elem = if (cf32) .f32 else .bf16;
 
         fn planOf(s: Shape) Plan {
-            return .{ .rows = s.rows, .dim = s.k, .nq = NQ, .qa = QA, .nw = nw, .nc = nc, .comp_f32 = cf32, .fuse = fuse };
+            return .{ .rows = s.rows, .dim = s.k, .nq = NQ, .qa = QA, .nw = nw, .nc = nc, .comp_f32 = cf32, .fuse = fuse, .mixr = mixr };
         }
 
         pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
@@ -693,7 +711,11 @@ const fused_shapes: []const Shape = &.{ .{ .rows = 1, .n = NQ, .k = DIM }, .{ .r
 const staged_shapes: []const Shape = &.{ .{ .rows = fuse_rows + 1, .n = NQ, .k = DIM }, .{ .rows = decode.max_rows, .n = NQ, .k = DIM } };
 
 fn addMain(set: *kc.Set, comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf32: bool, comptime name: []const u8) !void {
-    const T = Main(fuse, nw, nc, cf32);
+    return addMainM(set, fuse, nw, nc, cf32, false, name);
+}
+
+fn addMainM(set: *kc.Set, comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf32: bool, comptime mixr: bool, comptime name: []const u8) !void {
+    const T = MainM(fuse, nw, nc, cf32, mixr);
     try kit.add(set, T, &main_l, .{}, .{
         .name = name,
         .accum = .f32,
@@ -714,6 +736,8 @@ pub fn register(set: *kc.Set) !void {
     try addMain(set, false, 0, 0, false, "dsv41 dec in_proj, 3..6 rows (q_kv, hc mixes)");
     try addMain(set, false, 8, 16, true, "dsv41 dec in_proj, 3..6 rows (+ weights_proj, f32 compressor)");
     try addMain(set, false, 8, 16, false, "dsv41 dec in_proj, 3..6 rows (+ weights_proj, bf16 compressor)");
+    try addMainM(set, false, 0, 0, false, true, "dsv41 dec in_proj, 3..6 rows, MIXR (q_kv, hc mixes a (mix, row) a threadgroup)");
+    try addMainM(set, false, 8, 16, true, true, "dsv41 dec in_proj, 3..6 rows, MIXR (+ weights_proj, f32 compressor)");
     try kit.add(set, Stage, &stage_l, .{}, .{
         .name = "dsv41 dec in_proj_stage (normed collapse)",
         .accum = .f32,
@@ -975,6 +999,69 @@ test "dsv41 dec in_proj: layers 20..25 and 2..4 (KV sources, index sources, plai
     }
 }
 
+/// The words of two arrays are equal.
+fn sameWords(a: A, b: A) !bool {
+    const x = try host(a);
+    defer testing.allocator.free(x);
+    const y = try host(b);
+    defer testing.allocator.free(y);
+    for (x, y) |p, q| if (@as(u32, @bitCast(p)) != @as(u32, @bitCast(q))) return false;
+    return true;
+}
+
+test "dsv41 dec in_proj MIXR: the mixes a (mix, row) a threadgroup give every output of the staged launch word for word at R = 3..6, layers 20..25 and 2..4; mixes on the wrong row differ" {
+    if (mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (device.deviceGeneration().gen < first_gen) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // The staged plan without the switch (its default is on): MIXR is set on a copy of it below.
+    const mixr_off = env.override(.MLX_SERVE_DSV41_IN_PROJ_MIXR, "0");
+    defer mixr_off.restore();
+    const k = try Kernels.build();
+    defer k.deinit();
+    // A mix that reads the next row's stream (a permutation of the (mix, row) threadgroups alone would change nothing).
+    const needle = "const int r = r0 + rr;";
+    const src = try std.mem.replaceOwned(u8, gpa, MAIN_SOURCE, needle, "const int r = (r0 + rr + 1) % R;");
+    defer gpa.free(src);
+    try testing.expect(!std.mem.eql(u8, src, MAIN_SOURCE));
+    const srcz = try gpa.dupeSentinel(u8, src, 0);
+    defer gpa.free(srcz);
+    var planted = k;
+    planted.main = try v41.buildKernel("dsv41_dec_in_proj_planted", &MAIN_INS, &MAIN_OUTS, srcz, HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(planted.main);
+    for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 } }) |rg| {
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = rg[0], .hi = rg[1], .ctx = 0 });
+        defer fx.deinit();
+        const m = fx.m;
+        for (rg[0]..rg[1]) |li| for (fuse_rows + 1..decode.max_rows + 1) |rows| {
+            const ly = fx.layer(li);
+            const x = try fx.stream(rows);
+            defer _ = mlx.mlx_array_free(x);
+            const cpre = try fx.cpre(rows);
+            defer _ = mlx.mlx_array_free(cpre);
+            var sc = v41.Scope.init(gpa, m.s);
+            defer sc.deinit();
+            const p = plan(m, ly, x) orelse return error.Declined;
+            try testing.expect(!p.fuse and !p.mixr);
+            const a = argsOf(ly, x, cpre, try v41.hcEps(&sc, m));
+            const served = try launch(&sc, &k, p, a);
+            var pm = p;
+            pm.mixr = true;
+            const got = try launch(&sc, &k, pm, a);
+            for ([_][2]?A{ .{ served.qa, got.qa }, .{ served.kv, got.kv }, .{ served.z, got.z }, .{ served.iw, got.iw }, .{ served.comp, got.comp } }) |pair| if (pair[0]) |w| {
+                if (!try sameWords(w, pair[1].?)) {
+                    std.debug.print("[dec] in_proj MIXR layer {d} R={d}: words differ\n", .{ li, rows });
+                    return error.MixrDiffers;
+                }
+            };
+            const bad = try launch(&sc, &planted, pm, a);
+            if (try sameWords(served.z, bad.z)) {
+                std.debug.print("[dec] in_proj MIXR layer {d} R={d}: the planted wrong-row mixes were not caught\n", .{ li, rows });
+                return error.PlantMissed;
+            }
+        };
+    }
+}
+
 // ── ubench ────────────────────────────────────────────────────────────────
 
 /// `a` in new memory (an add of zero), evaluated.
@@ -1107,6 +1194,9 @@ fn layerBytes(p: Plan) usize {
 test "dsv41 dec in_proj: ubench against its byte floor and the chain it replaces (DSV41_DEC_UBENCH)" {
     if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
+    // The staged plan without the switch (its default is on): MIXR is set on a copy of it below.
+    const mixr_off = env.override(.MLX_SERVE_DSV41_IN_PROJ_MIXR, "0");
+    defer mixr_off.restore();
     const k = try Kernels.build();
     defer k.deinit();
     const kinds = [_]struct { lo: usize, hi: usize, li: usize, name: []const u8 }{
@@ -1126,7 +1216,7 @@ test "dsv41 dec in_proj: ubench against its byte floor and the chain it replaces
         }
         const m = fx.?.m;
         const ly = fx.?.layer(kind.li);
-        for ([_]usize{ 1, 2, 4, 6 }) |rows| {
+        for ([_]usize{ 1, 2, 3, 4, 5, 6 }) |rows| {
             const x = try fx.?.stream(rows);
             defer _ = mlx.mlx_array_free(x);
             const cpre = try fx.?.cpre(rows);
@@ -1149,6 +1239,20 @@ test "dsv41 dec in_proj: ubench against its byte floor and the chain it replaces
             const chain_us = try decode.chainUs(&old, cyc.n);
             var name_buf: [64]u8 = undefined;
             decode.report(try std.fmt.bufPrint(&name_buf, "in_proj ({s}, {d} copies)", .{ kind.name, cyc.n }), rows, us, @as(f64, @floatFromInt(bytes)), chain_us);
+            // `Plan.mixr` between two runs of the served plan.
+            if (!p.fuse) {
+                var own = v41.Scope.init(gpa, m.s);
+                defer own.deinit();
+                var pm = p;
+                pm.mixr = true;
+                var ch: Chain = .{ .sc = &own, .k = &k, .p = pm, .cyc = &cyc, .base = base };
+                const a0 = try decode.chainUs(&fresh, cyc.n);
+                _ = try decode.chainUs(&ch, cyc.n);
+                const v = try decode.chainUs(&ch, cyc.n);
+                const a1 = try decode.chainUs(&fresh, cyc.n);
+                const a = (a0 + a1) / 2;
+                std.debug.print("[dec-ubench] in_proj ({s}) R={d} MIXR: {d:.1} us against the served {d:.1} (runs {d:.1}, {d:.1}): {d:.1} us, {d:.2}%\n", .{ kind.name, rows, v, a, a0, a1, v - a, 100 * (v - a) / a });
+            }
         }
     }
 }
