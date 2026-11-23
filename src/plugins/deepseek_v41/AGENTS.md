@@ -27,7 +27,8 @@ serves either from the pack, with no flag.
   equivalence tests and the `DSV41_DEC_UBENCH` meters.
 - `prompt/`: the wide prompt layers' exact rewrites (each file's header names its change and gain): the gather's
   kernels (`attn_core`, `q_tail`, `scratch_attn` regions and ring), the hc and router fusions (`hc_fuse`, `gate_gemm`),
-  span grouping (`idx_group`), buffers kept or reused (`transient_keep`, `scratch_x1` on `scratch`),
+  span grouping (`idx_group`), buffers kept or reused (`transient_keep`, `scratch_x1` on `scratch`, `keep_wide`: MLX's
+  reserve from `patches/mlx-metal-wide-reserve.patch`),
   Engram's direct read (`engram_direct`), the embedding pread and a plugin bank's own pieces (`wide_early`, `woa_rows`,
   `flash_attn`: the lossy flash kernel, default on beside a plugin bank only), an fp4 bank's gate and up with `moe_act`
   in one paired launch (`moe_pair`); `wide_test.zig` holds each default-off rewrite to a tolerance of the stock path,

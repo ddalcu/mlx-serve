@@ -48,6 +48,7 @@ const wearly = @import("prompt/wide_early.zig");
 /// A wide layer's attention projections' large outputs kept past its teardown, for the next wide layer's to take their
 /// buffers back from MLX's cache.
 const tkeep = @import("prompt/transient_keep.zig");
+const keep_wide = @import("prompt/keep_wide.zig");
 /// A wide layer's heads left unroped, their roped last channels apart, read together by the gather's scores
 /// .
 const qtail = @import("prompt/q_tail.zig");
@@ -5914,6 +5915,7 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
     // The kept projection outputs: a kept set no wide layer of this pass took is let go at its end.
     defer tkeep.drop();
     defer hv2.drop();
+    defer if (wide) keep_wide.passEnd();
     for (lo..hi) |li| {
         if (wide) try wideLayer(m, gpa, st, sp, li, li + 1 < hi, li > lo) else for (0..n_spans) |k| {
             // A span's intermediates are dropped as soon as it is built, so the
