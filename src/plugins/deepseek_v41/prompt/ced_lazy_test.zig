@@ -168,10 +168,10 @@ fn arm(fx: *fixture.Fixture, ids: []const u32, plan: []const isize, next: []cons
     defer ae.restore();
     const ch = env.override(.MLX_SERVE_DSV41_PF_CED_HC, if (sw.ced_hc) "1" else "0");
     defer ch.restore();
-    const rp = if (sw.rope_pairs) env.override(.MLX_SERVE_DSV41_PF_ROPE_PAIRS, "1") else null;
-    defer if (rp) |o| o.restore();
-    const rr = if (sw.rms_rows) env.override(.MLX_SERVE_DSV41_PF_RMS_ROWS, "1") else null;
-    defer if (rr) |o| o.restore();
+    const rp = env.override(.MLX_SERVE_DSV41_PF_ROPE_PAIRS, if (sw.rope_pairs) "1" else "0");
+    defer rp.restore();
+    const rr = env.override(.MLX_SERVE_DSV41_PF_RMS_ROWS, if (sw.rms_rows) "1" else "0");
+    defer rr.restore();
     try dsv41.reset(m, gpa);
     try dsv41.armPrompt(m, ids, null, capture);
     const st = &m.dec_state.?;

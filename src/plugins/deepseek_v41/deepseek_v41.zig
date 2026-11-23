@@ -2806,7 +2806,7 @@ pub fn ropeTailOnly(sc: *Scope, m: *const Dsv41Model, x: A, periods: A, offset: 
     const L = dim(x, 0);
     const H = dim(x, 1);
     const rd: usize = @intCast(m.cfg.dsv4_rope_head_dim);
-    if (env.on(.MLX_SERVE_DSV41_PF_ROPE_PAIRS) and rd % 2 == 0 and rd > 0) return ropeTailPairs(sc, m, x, periods, offset, L, H, rd);
+    if (env.onUnlessZero(.MLX_SERVE_DSV41_PF_ROPE_PAIRS) and rd % 2 == 0 and rd > 0) return ropeTailPairs(sc, m, x, periods, offset, L, H, rd);
     const n = L * H * rd;
     const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{1.0}, &[_]c_int{1}, 1, .float32));
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -3979,7 +3979,7 @@ pub fn qkvRows(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !Proj {
 /// first; the same words. Null where it declines (the switch off, decode widths, another dtype or rank, rows wider
 /// than MLX's single-row kernel takes).
 pub fn rmsRows(sc: *Scope, x: A, w: A, eps: f32) !?A {
-    if (!env.on(.MLX_SERVE_DSV41_PF_RMS_ROWS) or !mlx.streamIsGpu(sc.s)) return null;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_RMS_ROWS) or !mlx.streamIsGpu(sc.s)) return null;
     const sh = mlx.getShape(x);
     if (sh.len != 2 or sh[0] < 64 or sh[1] < 4 or sh[1] > 4096) return null;
     const dt = mlx.mlx_array_dtype(x);
