@@ -16,6 +16,7 @@ const gather_nax = @import("../../../sdk/blocks/moe/gather_qmm_nax.zig");
 const mtail = @import("moe_tail.zig");
 const hv2 = @import("hc_v2.zig");
 const fixture = @import("../decode/fixture.zig");
+const kw = @import("keep_wide.zig");
 
 const testing = std.testing;
 const A = mlx.mlx_array;
@@ -850,4 +851,72 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
         try testing.expect(!try closeAs(fx, x, pre, want, &want_tap, label, "planted: the routed term at half its scale"));
     };
     try testing.expect(ok);
+}
+
+fn freePair(xs: [2]A) void {
+    for (xs) |o| _ = mlx.mlx_array_free(o);
+}
+
+/// Whether the pair worker's prefill over `x` / `pre` is `want` word for word, from an empty MLX cache (as the engine
+/// leaves it at each request's end).
+fn sameAs(fx: *fixture.Fixture, x: A, pre: A, want: [2]A) !bool {
+    _ = mlx.mlx_synchronize(mlx.gpuStream());
+    try mlx.check(mlx.mlx_clear_cache());
+    const got = try prefill(fx, x, pre);
+    defer freePair(got);
+    return try sameWords(want[0], got[0]) and try sameWords(want[1], got[1]);
+}
+
+test "dsv41 wide: under MLX_SERVE_DSV41_PF_KEEP_WIDE's reserve a release-shape pair worker's prefill is the same words at the pinned width and narrower, its buffers holding the last pass's words, MXFP4 and NVFP4 experts; a planted aliasing reserve fails" {
+    if (skip()) return error.SkipZigTest;
+    if (!kw.available()) {
+        std.debug.print("keep wide: the loaded libmlx has no mlx_metal_wide_reserve: skipped\n", .{});
+        return error.SkipZigTest;
+    }
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    kw.disarm();
+    defer kw.disarm();
+    // The fixture's widest prompt pass is the pinned width; a narrower one takes the same buffers.
+    const pinned_rows: usize = 8192;
+    const narrow_rows: usize = 5000;
+    inline for (.{ false, true }) |nv| {
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = 8, .hi = 10, .ctx = 0, .experts_fp4 = !nv, .experts_nvfp4 = nv, .expert_scales = if (nv) .all else .none });
+        defer fx.deinit();
+        const xw = try fx.stream(pinned_rows);
+        defer _ = mlx.mlx_array_free(xw);
+        const pw = try fx.cpre(pinned_rows);
+        defer _ = mlx.mlx_array_free(pw);
+        const xn = try fx.stream(narrow_rows);
+        defer _ = mlx.mlx_array_free(xn);
+        const pn = try fx.cpre(narrow_rows);
+        defer _ = mlx.mlx_array_free(pn);
+        const want_w = try prefill(fx, xw, pw);
+        defer freePair(want_w);
+        const want_n = try prefill(fx, xn, pn);
+        defer freePair(want_n);
+        var bytes: [kw.max_buffers]usize = undefined;
+        const n = kw.sizes(&fx.m.cfg, pinned_rows, &bytes);
+        try testing.expect(n > 0);
+        try testing.expectEqual(@as(c_int, 0), kw.arm(bytes[0..n]));
+        defer kw.disarm();
+        const label = if (nv) "NVFP4" else "MXFP4";
+        // The pinned width, a narrower pass, then the pinned width over buffers that hold the last passes' words.
+        const h0 = kw.stats().hits;
+        try testing.expect(try sameAs(fx, xw, pw, want_w));
+        const h1 = kw.stats().hits;
+        try testing.expect(try sameAs(fx, xn, pn, want_n));
+        const h2 = kw.stats().hits;
+        try testing.expect(try sameAs(fx, xw, pw, want_w));
+        const st = kw.stats();
+        std.debug.print("keep wide {s}: {d} buffers {d} MB; hits {d} at {d} rows, {d} at {d} rows; misses {d} ({d} MB)\n", .{ label, st.buffers, st.bytes >> 20, h1 - h0, pinned_rows, h2 - h1, narrow_rows, st.misses, st.missed_bytes >> 20 });
+        // Every reserve buffer serves the pinned width's pass.
+        try testing.expect(h1 - h0 >= n and h2 > h1);
+        // Planted: the reserve hands out buffers it keeps idle, so live arrays share them.
+        kw.plant(true);
+        const bad = sameAs(fx, xw, pw, want_w);
+        kw.plant(false);
+        _ = mlx.mlx_synchronize(mlx.gpuStream());
+        try testing.expect(!(try bad));
+    }
 }

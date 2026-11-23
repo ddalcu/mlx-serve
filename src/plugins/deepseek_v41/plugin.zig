@@ -26,6 +26,7 @@ const engram_decode = @import("decode/engram_decode.zig");
 const mx_view = @import("mx_view.zig");
 const flash_attn = @import("prompt/flash_attn.zig");
 const scratch_attn = @import("prompt/scratch_attn.zig");
+const keep_wide = @import("prompt/keep_wide.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -314,6 +315,8 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     errdefer if (m.vision_dir) |d| gpa.free(d);
     m.tower = if (c.dsv41_vision and taken == null and !lazy_tower) try vision.Dsv41Vision.init(gpa, m.cfg, &m.weights) else null;
     if (lazy_tower) std.log.info("deepseek_v41: the vision tower is read from the pack for each image, not resident", .{});
+    // keep_wide.zig: the reserve's buffers a row, made at the engine's pin of the pass width.
+    keep_wide.prepare(&m.cfg);
     return m;
 }
 
@@ -397,6 +400,7 @@ fn ctxSetting(settings_json: []const u8) ?u64 {
 
 fn unload(mp: *anyopaque) callconv(.c) void {
     const m: *Model = @ptrCast(@alignCast(mp));
+    keep_wide.disarm();
     closeBank(m);
     if (m.tower) |*t| t.deinit();
     if (m.vision_dir) |d| gpa.free(d);
