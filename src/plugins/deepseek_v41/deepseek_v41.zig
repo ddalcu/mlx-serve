@@ -3594,7 +3594,7 @@ pub fn flashLaunch(sc: *Scope, k: mlx.mlx_fast_metal_kernel, ins: []const A, out
 /// compiled now, not on a first prompt (each a fresh Metal compile of MLX's NAX GEMM headers, about a second): one
 /// launch over 64 and one over 65 rows of zeros (both row alignments), at the first compressor's and router's weights.
 fn warmGateGemmBf16(m: *Dsv41Model) !void {
-    const comp = env.on(.MLX_SERVE_DSV41_PF_COMP_BF16);
+    const comp = env.onUnlessZero(.MLX_SERVE_DSV41_PF_COMP_BF16);
     const router = env.on(.MLX_SERVE_DSV41_PF_ROUTER_BF16);
     if ((!comp and !router) or !device.naxAvailable() or !mlx.streamIsGpu(m.s)) return;
     var sc = Scope.init(m.gpa, m.s);
@@ -4037,7 +4037,7 @@ pub fn compProj(sc: *Scope, m: *Dsv41Model, li: usize, cw: *const Comp, x: A) !A
 /// null where it declines (the switch off, ratio 1, a weight not dense bf16, x not bf16, no NAX). A resident pack's kv
 /// and gate rows are one fused weight (`poolLin`): one launch; an outside plugin's two apart: one each, joined.
 fn compProjBf16(sc: *Scope, m: *const Dsv41Model, li: usize, cw: *const Comp, x: A) !?A {
-    if (!env.on(.MLX_SERVE_DSV41_PF_COMP_BF16) or m.layers[li].ratio <= 1 or m.trace != null) return null;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_COMP_BF16) or m.layers[li].ratio <= 1 or m.trace != null) return null;
     const dense = struct {
         fn bf16(l: *const Lin) bool {
             return l.ext == null and l.s.ctx == null and mlx.mlx_array_dtype(l.w) == .bfloat16;
