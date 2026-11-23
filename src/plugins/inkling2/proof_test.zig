@@ -836,6 +836,40 @@ test "inkling2 kernels: the prep kernel serves the values of the chain it replac
     };
 }
 
+// Bar: at its narrowest group (32 threads) the mid kernel folds every one of its sums: forty open blocks give it more
+// sums than threads, plain and on a looped pass; the chain's values as above (f32, 1e-4; the MLP input 2e-2).
+test "inkling2 kernels: at its narrowest group the mid kernel folds every sum" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Stage.init(a);
+    defer s.deinit();
+    const body = s.body;
+    const cfg = &body.cfg;
+    const hidden: c_int = @intCast(cfg.hidden_size);
+    const taps: c_int = @intCast(cfg.sconv_kernel);
+    const q_dim: c_int = @intCast(cfg.num_attention_heads * cfg.head_dim);
+    const saved = kernels.stream_threads;
+    defer kernels.stream_threads = saved;
+    kernels.stream_threads = 32;
+    var seed: u64 = 16000;
+    for ([_]StageCase{ .{ .layer = 1, .blocks = 40, .messages = false }, .{ .layer = 3, .blocks = 40, .messages = true } }) |case| {
+        const L = &body.layers[case.layer];
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 10;
+        const attn = try randomRow(&g, a, seed, &.{ 1, 1, q_dim }, 1.0, .float32);
+        const h = try randomRow(&g, a, seed + 1, &.{ 1, 1, hidden }, 1.0, .float32);
+        const normed = try randomRow(&g, a, seed + 2, &.{ 1, 1, hidden }, 1.0, .float32);
+        const blocks = try randomRow(&g, a, seed + 3, &.{ 1, 1, case.blocks, hidden }, 1.0, .float32);
+        const messages: ?ops.Array = if (case.messages) try randomRow(&g, a, seed + 4, &.{ 4, 1, hidden }, 1.0, .float32) else null;
+        const st = try randomRow(&g, a, seed + 5, &.{ 1, taps - 1, 2 * @as(c_int, @intCast(cfg.kvDim())) + 2 * hidden }, 1.0, .float32);
+        const got = try kernels.mid(&g, L, body, attn, null, h, normed, blocks, st, messages);
+        const want = try layers.mid(&g, L, body, attn, h, normed, blocks, st, if (messages) |m| try g.contiguous(try g.transpose(try g.reshape(m, &.{ 4, 1, 1, hidden }), &.{ 2, 1, 0, 3 })) else null);
+        try expectClose(got.residual, want.residual, 1e-4, "residual at 32 threads");
+        try expectClose(got.x, want.x, 2e-2, "mlp input at 32 threads");
+    }
+}
+
 // Bar: as above; the picks are the chain's experts, each at its chain weight.
 test "inkling2 kernels: the mid kernels serve the values of the chain they replace" {
     if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
