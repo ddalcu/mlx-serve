@@ -2208,6 +2208,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     // The ring twins compiled now, not in a prompt's first wide layer (FLASH_ATTN on: the flash kernel and its heads
     // twin in their place).
     if (m.attn_gather != null) try warmRing(m);
+    try warmGateGemmBf16(m);
     log.info("deepseek_v41: {d} layers, engram {d} layers, DSpark {d} stages{s}{s}\n", .{ n_layers, m.engrams.len, n_stages, if (opts.quant != null) ", weights on " else "", if (opts.quant) |q| q.name() else "" });
     if (fp4Decode(m) != null) log.info("deepseek_v41: fused fp4 MoE decode kernels on\n", .{});
     if (dkern.fp8Fold() == 1) log.info("deepseek_v41: decode mxfp8 reads folded (MLX_SERVE_DSV41_FP8_FOLD)\n", .{});
@@ -3588,6 +3589,39 @@ pub fn flashLaunch(sc: *Scope, k: mlx.mlx_fast_metal_kernel, ins: []const A, out
         x.* = try sc.res(mlx.mlx_vector_array_get(&o, ov, i), &o);
     }
 }
+/// MLX_SERVE_DSV41_PF_COMP_BF16 / MLX_SERVE_DSV41_PF_ROUTER_BF16 on at load: their gate_gemm bf16 instantiations
+/// compiled now, not on a first prompt (each a fresh Metal compile of MLX's NAX GEMM headers, about a second): one
+/// launch over 64 and one over 65 rows of zeros (both row alignments), at the first compressor's and router's weights.
+fn warmGateGemmBf16(m: *Dsv41Model) !void {
+    const comp = env.on(.MLX_SERVE_DSV41_PF_COMP_BF16);
+    const router = env.on(.MLX_SERVE_DSV41_PF_ROUTER_BF16);
+    if ((!comp and !router) or !device.naxAvailable() or !mlx.streamIsGpu(m.s)) return;
+    var sc = Scope.init(m.gpa, m.s);
+    defer sc.deinit();
+    var ys: [4]A = @splat(none);
+    var n: usize = 0;
+    const W = struct { w: A, sum: ggemm.Sum };
+    var ws: [2]?W = .{ null, null };
+    if (comp) for (m.layers[0..m.n_layers]) |*ly| if (ly.ratio > 1) if (ly.comp) |*cw| if (cw.wgate == null and cw.wkv.ext == null and cw.wkv.s.ctx == null and cw.wkv.w.ctx != null) {
+        ws[0] = .{ .w = cw.wkv.w, .sum = .blocked };
+        break;
+    };
+    if (router) for (m.layers[0..m.n_layers]) |*ly| if (ly.gate_w.ctx != null) {
+        ws[1] = .{ .w = ly.gate_w, .sum = .single };
+        break;
+    };
+    for (ws) |o| if (o) |wv| for ([_]c_int{ 64, 65 }) |rows| {
+        const x = try sc.zeros(&.{ rows, ci(dim(wv.w, 1)) }, .bfloat16);
+        if (try ggemm.bf16F32(sc.s, x, wv.w, true, wv.sum)) |y| {
+            ys[n] = try sc.keep(y);
+            n += 1;
+        }
+    };
+    if (n == 0) return;
+    try evalAll(ys[0..n]);
+    log.info("deepseek_v41: gate_gemm's bf16 launches (PF_COMP_BF16 {}, PF_ROUTER_BF16 {}) compiled at load\n", .{ comp, router });
+}
+
 /// scratch_attn.zig: each ring twin compiled at load by one launch over a one-row span of zeros (both qk
 /// twins: Q_TAIL's and the plain one), evaluated; the regions it made then let go.
 fn warmRing(m: *Dsv41Model) !void {
@@ -4014,11 +4048,11 @@ fn compProjBf16(sc: *Scope, m: *const Dsv41Model, li: usize, cw: *const Comp, x:
     var gt = none;
     if (cw.wgate) |*g| {
         if (!dense(&cw.wkv) or !dense(g)) return null;
-        kv = try sc.keep((try ggemm.bf16F32(sc.s, x, cw.wkv.w, nax)) orelse return null);
-        gt = try sc.keep((try ggemm.bf16F32(sc.s, x, g.w, nax)) orelse return null);
+        kv = try sc.keep((try ggemm.bf16F32(sc.s, x, cw.wkv.w, nax, .blocked)) orelse return null);
+        gt = try sc.keep((try ggemm.bf16F32(sc.s, x, g.w, nax, .blocked)) orelse return null);
     } else {
         if (!dense(&cw.wkv) or dim(cw.wkv.w, 0) != 2 * hd) return null;
-        const y = try sc.keep((try ggemm.bf16F32(sc.s, x, cw.wkv.w, nax)) orelse return null);
+        const y = try sc.keep((try ggemm.bf16F32(sc.s, x, cw.wkv.w, nax, .blocked)) orelse return null);
         if (!comp_bf16_plant) {
             kv = y;
         } else {
@@ -4837,7 +4871,7 @@ pub fn gateLogits(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !A {
     const E = dim(ly.gate_w, 0);
     if (L > region_rows) {
         // MLX_SERVE_DSV41_PF_ROUTER_BF16: x and gate_w both bf16, the MMA in bf16 (exact products, reordered sums).
-        if (env.on(.MLX_SERVE_DSV41_PF_ROUTER_BF16)) if (try ggemm.bf16F32(sc.s, x, ly.gate_w, device.naxAvailable())) |y| {
+        if (env.on(.MLX_SERVE_DSV41_PF_ROUTER_BF16)) if (try ggemm.bf16F32(sc.s, x, ly.gate_w, device.naxAvailable(), .single)) |y| {
             if (!router_bf16_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_ROUTER_BF16 engaged ({d} rows)\n", .{L});
             _ = router_bf16_count.fetchAdd(1, .monotonic);
             if (router_bf16_plant) return sc.mul(try sc.keep(y), try sc.f(-1));
@@ -11995,9 +12029,9 @@ const CompBench = struct {
             },
             .whole => outs[i] = try compProj(sc, b.m, b.li, cw, b.x),
             // A resident pack's fused kv and gate rows: one launch.
-            .bf16 => outs[i] = try sc.keep((try ggemm.bf16F32At(sc.s, b.x, cw.wkv.w, true, b.tile)).?),
+            .bf16 => outs[i] = try sc.keep((try ggemm.bf16F32At(sc.s, b.x, cw.wkv.w, true, b.tile, .blocked)).?),
             .router_f32 => outs[i] = try sc.keep((try ggemm.router(sc.s, b.x, b.gw, true)).?),
-            .router_bf16 => outs[i] = try sc.keep((try ggemm.bf16F32At(sc.s, b.x, b.gw, true, b.tile)).?),
+            .router_bf16 => outs[i] = try sc.keep((try ggemm.bf16F32At(sc.s, b.x, b.gw, true, b.tile, .single)).?),
         };
         return outs;
     }

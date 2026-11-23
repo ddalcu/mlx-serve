@@ -1961,7 +1961,7 @@ const GemvTwin = struct {
 
 const GateGemm = struct {
     /// `bf16`: `gate_gemm.bf16F32` (PF_COMP_BF16, PF_ROUTER_BF16): both operands bf16, the MMA in bf16, at any rows.
-    pub const Params = struct { bf16: bool = false };
+    pub const Params = struct { bf16: bool = false, blocked: bool = false };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         const t: ggemm.Tile = if (p.bf16) ggemm.bf16_tile else ggemm.tile;
@@ -1975,6 +1975,7 @@ const GateGemm = struct {
         g.dtype("TA", act);
         g.dtype("TB", if (p.bf16) .bfloat16 else .float16);
         g.dtype("OUT_R", .float32);
+        g.int("KBLK", @intFromBool(p.blocked));
         g.int("BM", t.bm);
         g.int("BN", t.bn);
         g.int("BK", t.bk);
@@ -5171,6 +5172,15 @@ fn registerStreamed(set: *kc.Set) !void {
         .replaces = "astype f32, MLX's matmul (TF32 or f32 MMA: the same exact products, reordered sums)",
         .served = &.{ .{ .rows = 256, .n = 512, .k = 512 }, .{ .rows = 100, .n = 384, .k = 768 }, .{ .rows = 77, .n = 200, .k = 300 } },
     });
+    try kit.add(set, GateGemm, &gate_gemm_l, .{ .bf16 = true, .blocked = true }, .{
+        .name = "dsv41 gate_gemm bf16 blocked (each BK block's sum apart, then added: PF_COMP_BF16's compressor)",
+        .accum = .f32,
+        .depth = depthK,
+        .out = .f32,
+        .nax = true,
+        .replaces = "astype f32, MLX's matmul a 256-row span (its split K): the same exact products, a blocked sum",
+        .served = &.{ .{ .rows = 256, .n = 1024, .k = 1024 }, .{ .rows = 100, .n = 384, .k = 768 }, .{ .rows = 77, .n = 200, .k = 300 } },
+    });
     try kit.add(set, AttnQkT, &qk_t_l, .{}, .{
         .name = "dsv41 attn_qk_t (prompt width, the heads and their roped tail)",
         .accum = .f32,
@@ -5389,9 +5399,13 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         defer _ = mlx.mlx_array_free(y);
         try Expect.same(r.c, r.bytes, &.{y});
         const rb = try ours(GateGemm, a, &gate_gemm_l, .{ .bf16 = true }, .{ .rows = 100, .n = 384, .k = 768 });
-        const yb = (try ggemm.bf16F32(m.s, rb.c.args[0], rb.c.args[1], true)).?;
+        const yb = (try ggemm.bf16F32(m.s, rb.c.args[0], rb.c.args[1], true, .single)).?;
         defer _ = mlx.mlx_array_free(yb);
         try Expect.same(rb.c, rb.bytes, &.{yb});
+        const rk = try ours(GateGemm, a, &gate_gemm_l, .{ .bf16 = true, .blocked = true }, .{ .rows = 100, .n = 384, .k = 768 });
+        const yk = (try ggemm.bf16F32(m.s, rk.c.args[0], rk.c.args[1], true, .blocked)).?;
+        defer _ = mlx.mlx_array_free(yk);
+        try Expect.same(rk.c, rk.bytes, &.{yk});
     }
     // The flash kernel as the model launches it (`flashLaunch`, grouped).
     if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
