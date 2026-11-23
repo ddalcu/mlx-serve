@@ -19,6 +19,10 @@ const indexer_mod = @import("blocks/indexer.zig");
 const engram_mod = @import("blocks/engram.zig");
 const numpy_rng = @import("blocks/numpy_rng.zig");
 const vision_mod = @import("vision.zig");
+const dfly_mod = @import("blocks/dfly.zig");
+const sliding = @import("../../sdk/bases/blocks/sliding.zig");
+const Verdict = abi.Verdict;
+const TargetLayers = dfly_mod.TargetLayers;
 const config = @import("config.zig");
 const weights_load = @import("../../sdk/weights/load.zig");
 const weights = @import("weights.zig");
@@ -41,6 +45,20 @@ pub const Layer = struct {
     ffn: union(enum) { dense: moe.Dense, sparse: moe.Moe },
 };
 
+pub const SlotState = struct {
+    /// The last row's target hidden (post final norm), `[1, hidden]`.
+    hidden: Array = .{},
+    /// A verify's rows' hidden `[rows, hidden]`, for the accepted row's rollback.
+    verify_hidden: Array = .{},
+    verify_tokens: [abi.max_round_tokens]u32 = @splat(0),
+    verify_n: u32 = 0,
+    verify_open: bool = false,
+    cache: abi.Handle = null,
+    cache_ops: ?*const abi.CacheOps = null,
+    anchor: u64 = 0,
+    active: bool = false,
+};
+
 pub const Model = struct {
     c: *const C,
     layers: []Layer,
@@ -51,6 +69,12 @@ pub const Model = struct {
     head: ihc.HeadParams,
     /// The SigLIP-style tower (null = no vision weights in the map / --no-vision).
     vision: ?*vision_mod.Vision = null,
+    /// The DFly2 drafter (null = no draft weights).
+    dfly: ?*dfly_mod.Drafter = null,
+    /// Per-slot drafter state: the last target hidden (post final norm), the cache handle and an open verify.
+    slot_state: [64]SlotState = @splat(.{}),
+    /// The slot the most recent forward ran on (`slotCacheHandle`/`slotCacheOps`).
+    active_slot: u32 = 0,
     /// The table's declared caps (what the forward serves).
     caps: abi.Caps,
     shared: block.Shared,
@@ -59,6 +83,11 @@ pub const Model = struct {
 
     pub fn deinit(m: *Model) void {
         if (m.vision) |v| v.deinit();
+        if (m.dfly) |df| df.deinit();
+        for (&m.slot_state) |*st| {
+            if (st.hidden.ctx != null) _ = mlx.mlx_array_free(st.hidden);
+            if (st.verify_hidden.ctx != null) _ = mlx.mlx_array_free(st.verify_hidden);
+        }
         for (m.layers) |*l| if (l.engram) |en| {
             gpa.free(en.lookup_host);
             gpa.destroy(en);
@@ -180,13 +209,36 @@ pub const Model = struct {
             .all_rows => out.logits = .{ .ctx = g.escape(try g.reshape(logits, &.{ slots * rows, vocab })).ctx },
             .none => {},
         }
-        if (f.want_hidden) out.hidden = .{ .ctx = g.escape(collapsed).ctx };
+        // The drafter fuses the last accepted token's POST-norm hidden (HF returns `norm(self.hc_head(...))`).
+        const hidden_rows = try g.reshape(normed_f, &.{ slots, rows, hidden });
+        if (f.want_hidden) out.hidden = .{ .ctx = g.escape(hidden_rows).ctx };
+        // Keep the slot state the native drafter reads: hidden last row, the verify rows, and the cache.
+        {
+            const sid: usize = if (f.slots.len > 0) f.slots.slice()[0] else 0;
+            if (sid < m.slot_state.len) {
+                const st = &m.slot_state[sid];
+                if (st.hidden.ctx != null) _ = mlx.mlx_array_free(st.hidden);
+                if (st.verify_hidden.ctx != null) _ = mlx.mlx_array_free(st.verify_hidden);
+                st.hidden = .{};
+                st.verify_hidden = .{};
+                st.cache = if (f.caches.len > 0) f.caches.slice()[0] else null;
+                st.cache_ops = f.cache_ops;
+                st.anchor = if (f.positions.len > 0) @as(u64, @intCast(f.positions.slice()[0])) + @as(u64, @intCast(rows)) else @as(u64, @intCast(rows));
+                st.active = true;
+                if (f.logits == .all_rows) {
+                    st.verify_hidden = .{ .ctx = g.escape(try g.reshape(normed_f, &.{ slots * rows, hidden })).ctx };
+                }
+                const lr = try g.slice(normed_f, &.{ 0, rows - 1, 0 }, &.{ slots, rows, hidden });
+                st.hidden = .{ .ctx = g.escape(try g.reshape(lr, &.{ slots, hidden })).ctx };
+                m.active_slot = @intCast(sid);
+            }
+        }
         return out;
     }
 
     /// Embedding rows for `ids` `[slots, rows]`: a quantized table gathers its rows (never dequantized whole), a
     /// dense one takes them (both stored `[vocab, in]`).
-    fn embedRows(m: *Model, g: *Graph, ids: Array) !Array {
+    pub fn embedRows(m: *Model, g: *Graph, ids: Array) !Array {
         if (m.embed.s.ctx != null) {
             const rows = embedding.gatherQuantizedRows(g.s, m.embed.w, m.embed.s, m.embed.b, ids,
                 m.embed.gs, m.embed.bits, .affine, .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }) catch |e| {
@@ -196,6 +248,20 @@ pub const Model = struct {
             return g.adopt(rows);
         }
         return g.take(m.embed.w, ids, 0);
+    }
+    /// One row's logits through the head.
+    pub fn lm_head_row(m: *Model, g: *Graph, x: Array) !Array {
+        return m.lm_head.forward(g, x);
+    }
+
+    pub fn slotCacheHandle(m: *const Model) ?abi.Handle {
+        if (m.active_slot >= m.slot_state.len) return null;
+        return m.slot_state[m.active_slot].cache;
+    }
+
+    pub fn slotCacheOps(m: *const Model) ?*const abi.CacheOps {
+        if (m.active_slot >= m.slot_state.len) return null;
+        return m.slot_state[m.active_slot].cache_ops;
     }
 };
 
@@ -282,6 +348,9 @@ pub fn build(c: *const C, w: *const weights_load.Weights, tables: []const weight
     errdefer m.deinit();
     if (c.has_vision and w.get("vit.embeddings.patch_embedding.weight") != null) {
         m.vision = try vision_mod.load(c, w);
+    }
+    if (c.dfly_layers > 0 and w.get("model.dfly_layers.final_norm.weight") != null) {
+        m.dfly = try dfly_mod.load(c, w);
     }
     return m;
 }
@@ -596,4 +665,346 @@ fn require(w: *const weights_load.Weights, comptime fmt: []const u8, args: anyty
     const name = try std.fmt.allocPrint(gpa, fmt, args);
     defer gpa.free(name);
     return w.get(name) orelse error.MissingWeight;
+}
+
+/// The block's draft tokens (the round's slots 1..): ids `[1,B]` (slot 0 is `t1`), `target_hidden` `[hidden]`.
+pub fn dflyDraft(m: *Model, d: *dfly_mod.Drafter, ids: Array, positions: []const u32, target_hidden: Array) ![]u32 {
+    const B: usize = @intCast(@as(c_int, @intCast(ops.shape(ids)[1])));
+    const hidden: c_int = @intCast(d.hidden);
+    var g = Graph.init(gpa, d.s);
+    defer g.deinit();
+
+    const embeds = try m.embedRows(&g, ids); // [1,B,hidden]
+    var x = try g.reshape(embeds, &.{ @intCast(B), hidden });
+    // mtp_fusion on slot 0 only: anchors + gate * eh_proj(cat(enorm(anchors), hnorm(target_hidden))).
+    {
+        const anchor = try g.slice(x, &.{ 0, 0 }, &.{ 1, hidden });
+        const e_n = try g.rmsNorm(anchor, d.enorm, d.rms_eps);
+        const h_n = try g.rmsNorm(target_hidden, d.hnorm, d.rms_eps);
+        const cat = try g.concat(&.{ e_n, h_n }, -1);
+        const fused = try d.eh_proj.forward(&g, cat);
+        const gated = try g.mul(fused, d.fusion_gate);
+        const slot0 = try g.add(anchor, gated);
+        const rest = try g.slice(x, &.{ 1, 0 }, &.{ @intCast(B), hidden });
+        x = try g.concat(&.{ slot0, rest }, 0);
+    }
+
+    for (d.layers, 0..) |*l, n| {
+        const target = if (n < TargetLayers.len) dfly_mod.TargetLayers[n] else 1;
+        const normed = try g.rmsNorm(x, l.input_norm, d.rms_eps);
+        const attn = try dflyAttn(&g, m, d, l, normed, target, positions);
+        x = try g.add(x, attn);
+        const normed2 = try g.rmsNorm(x, l.post_attn_norm, d.rms_eps);
+        const gg = try l.gate.forward(&g, normed2);
+        const uu = try l.up.forward(&g, normed2);
+        const act = try g.mul(try g.silu(gg), uu);
+        const dn = try l.down.forward(&g, act);
+        x = try g.add(x, dn);
+    }
+
+    var z = try g.rmsNorm(x, d.final_norm, d.rms_eps); // [B,hidden]
+    if (d.c.dfly_layers == 0) return error.NoDrafter;
+
+    var tokens: [abi.max_round_tokens]u32 = @splat(0);
+    if (B > abi.max_round_tokens) return error.TooManyRows;
+    try ops.eval(ids);
+    const idp = mlx.mlx_array_data_int32(ids) orelse return error.NoData;
+    var prev: u32 = @intCast(idp[0]);
+    for (1..B) |i| {
+        const row = try g.slice(z, &.{ @intCast(i), 0 }, &.{ @intCast(i + 1), hidden });
+        const h_n = try g.rmsNorm(row, d.hc_hidden_norm, d.rms_eps);
+        const prev_arr = try g.fromSlice(i32, &[_]i32{@intCast(prev)}, &.{ 1, 1 });
+        const prev_e_raw = try m.embedRows(&g, prev_arr);
+        const prev_e = try g.reshape(prev_e_raw, &.{ 1, hidden });
+        const e_n = try g.rmsNorm(prev_e, d.hc_embed_norm, d.rms_eps);
+        const cat = try g.concat(&.{ h_n, e_n }, -1);
+        const gg = try d.hc_gate.forward(&g, cat);
+        const uu = try d.hc_up.forward(&g, cat);
+        const act = try g.mul(try g.silu(gg), uu);
+        const dn = try d.hc_down.forward(&g, act);
+        const corrected = try g.add(row, dn);
+        const logits = try m.lm_head_row(&g, corrected); // [1,vocab]
+        const tok = try argmaxMasked(&g, logits, null);
+        tokens[i - 1] = tok;
+        prev = tok;
+        // Build the corrected row back into z (only this row is used next).
+        const before = try g.slice(z, &.{ 0, 0 }, &.{ @intCast(i), hidden });
+        z = try g.concat(&.{ before, corrected, try g.slice(z, &.{ @intCast(i + 1), 0 }, &.{ @intCast(B), hidden }) }, 0);
+    }
+    return tokens[0 .. B - 1];
+}
+
+fn dflyAttn(g: *Graph, m: *Model, d: *dfly_mod.Drafter, l: *const dfly_mod.Layer, x: Array, target: u32, positions: []const u32) !Array {
+    const B: c_int = @intCast(ops.shape(x)[0]);
+    const heads: c_int = @intCast(l.heads);
+    const nope: c_int = @intCast(l.nope);
+    const rope_dim: c_int = @intCast(l.rope_dim);
+    const vd: c_int = @intCast(l.v_dim);
+    const rank: c_int = @intCast(l.rank);
+    const qk = nope + rope_dim;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(qk)));
+    var t = g.scope();
+    defer t.deinit();
+
+    const q_resid = try t.rmsNorm(try l.q_a.forward(&t, x), l.q_a_norm, d.rms_eps);
+    const q_flat = try l.q_b.forward(&t, q_resid);
+    const q4 = try t.transpose(try t.reshape(q_flat, &.{ 1, B, heads, qk }), &.{ 0, 2, 1, 3 });
+    const q_nope = try t.slice(q4, &.{ 0, 0, 0, 0 }, &.{ 1, heads, B, nope });
+    const q_rot = try t.slice(q4, &.{ 0, 0, 0, nope }, &.{ 1, heads, B, qk });
+    const kv_a = try l.kv_a.forward(&t, x);
+    const lat_raw = try t.slice(kv_a, &.{ 0, 0 }, &.{ B, rank });
+    const k_rot = try t.slice(kv_a, &.{ 0, rank }, &.{ B, rank + rope_dim });
+    const latent = try t.rmsNorm(lat_raw, l.kv_a_norm, d.rms_eps);
+    const off: c_int = @intCast(positions[0]);
+    const q_rot_r = try t.call(mlx.mlx_fast_rope, .{ q_rot, rope_dim, true, mlx.mlx_optional_float.some(l.theta), 1.0, off, Array{} });
+    const k_rot3 = try t.reshape(k_rot, &.{ 1, B, rope_dim });
+    const k_rot_r3 = try t.call(mlx.mlx_fast_rope, .{ k_rot3, rope_dim, true, mlx.mlx_optional_float.some(l.theta), 1.0, off, Array{} });
+    const k_rot_r = try t.reshape(k_rot_r3, &.{ B, rope_dim });
+    const q_abs = try t.matmul(q_nope, l.wk); // [1,heads,B,rank]
+    const q_cat = try t.concat(&.{ q_abs, q_rot_r }, -1);
+
+    // Target KV history for this draft layer's target, then the block's own rows.
+    var view: abi.KvView = .{};
+    const vop = m.slotCacheOps() orelse return error.NoCacheOps;
+    const v = vop.view(m.slotCacheHandle() orelse return error.NoCache, target, .{ .ctx = d.s.ctx }, &view);
+    if (!v.isOk()) return error.KvViewFailed;
+    defer vop.release(&view);
+    if (view.k.ctx == null or view.v.ctx == null) return error.EmptyKvView;
+    const hk = try t.astype(.{ .ctx = view.k.ctx }, ops.dtype(x));
+    const hv = try t.astype(.{ .ctx = view.v.ctx }, ops.dtype(x));
+    const hlen = ops.shape(hk)[2];
+    const keys_h = try t.slice(hk, &.{ 0, 0, 0, 0 }, &.{ 1, 1, hlen, rank + rope_dim });
+    const own_k = try t.reshape(try t.concat(&.{ latent, k_rot_r }, -1), &.{ 1, 1, B, rank + rope_dim });
+    const own_v = try t.reshape(latent, &.{ 1, 1, B, rank });
+    const all_k = try t.concat(&.{ keys_h, own_k }, 2);
+    const all_v = try t.concat(&.{ hv, own_v }, 2);
+    const kv_len: c_int = hlen + B;
+    const mask = try sliding.causalMask(g, B, kv_len);
+    const sinks = try t.astype(l.sink, ops.dtype(x));
+    var o_lat = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o_lat, q_cat, all_k, all_v, scale, "array", mask, sinks, false, t.s));
+    const o_arr = try t.adopt(o_lat);
+    const wv_t = try t.transpose(l.wv, &.{ 0, 2, 1 });
+    const values = try t.matmul(o_arr, wv_t);
+    const flat = try t.reshape(try t.transpose(values, &.{ 0, 2, 1, 3 }), &.{ 1, B, heads * vd });
+    const gate = try t.sigmoid(try l.linear_gate.forward(&t, x));
+    const out = try t.rmsNorm(try l.o_proj.forward(&t, try t.mul(flat, gate)), l.post_proj_norm, d.rms_eps);
+    return g.adopt(t.escape(out));
+}
+
+fn argmaxMasked(g: *Graph, logits: Array, mask: ?Array) !u32 {
+    var l = logits;
+    if (mask) |m| {
+        const neg = try g.scalarLike(logits, -std.math.inf(f32));
+        l = try g.where(m, neg, logits);
+    }
+    const idx = try g.argmax(l, -1, false);
+    try ops.eval(idx);
+    const p = mlx.mlx_array_data_int32(idx) orelse return error.NoData;
+    return @intCast(p[0]);
+}
+
+pub const hooks: abi.NativeDrafter = .{ .step = &stepHook, .verify = &verifyHook, .finish = &finishHook };
+
+
+fn dflyModelOf(m: *anyopaque) *Model {
+    const wm: *weights.Model = @ptrCast(@alignCast(m));
+    return wm.trunk;
+}
+
+fn dflySlotState(m: *Model, f: *const abi.Forward) !*SlotState {
+    if (f.slots.len == 0) return error.NoSlot;
+    const sid: usize = f.slots.slice()[0];
+    if (sid >= m.slot_state.len) return error.NoSlot;
+    const st = &m.slot_state[sid];
+    if (!st.active or st.hidden.ctx == null or st.cache == null or st.cache_ops == null) return error.NoDrafterState;
+    return st;
+}
+
+fn stepHook(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
+    const mdl = dflyModelOf(m);
+    const d = mdl.dfly orelse return Verdict.refuse(.unsupported, "hy_v4_flash: no DFly2 drafter loaded");
+    const st = dflySlotState(mdl, f) catch return Verdict.refuse(.failed, "hy_v4_flash: no target state for the draft round");
+    const t1: u32 = if (f.tokens.len > 0) f.tokens.slice()[0] else return Verdict.refuse(.failed, "hy_v4_flash: a round needs t1");
+    const anchor: u32 = if (f.positions.len > 0) f.positions.slice()[0] else return Verdict.refuse(.failed, "hy_v4_flash: a round needs a position");
+    const cap: usize = @min(@as(usize, f.accept_cap), 5);
+    if (cap == 0) return Verdict.refuse(.failed, "hy_v4_flash: no draft budget");
+    const B: usize = cap + 1;
+    const ids = gpa.alloc(i32, B) catch return Verdict.refuse(.failed, "hy_v4_flash: out of memory");
+    defer gpa.free(ids);
+    ids[0] = @intCast(t1);
+    for (1..B) |i| ids[i] = @intCast(d.mask_id);
+    const ids_arr = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ 1, @intCast(B) }, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids_arr);
+    const positions = gpa.alloc(u32, B) catch return Verdict.refuse(.failed, "hy_v4_flash: out of memory");
+    defer gpa.free(positions);
+    for (positions, 0..) |*p, i| p.* = anchor + @as(u32, @intCast(i));
+    const drafts = dflyDraft(mdl, d, .{ .ctx = ids_arr.ctx }, positions, .{ .ctx = st.hidden.ctx }) catch |e| {
+        log.err("hy_v4 dfly: draft failed: {t}\n", .{e});
+        return Verdict.named(.failed, @errorName(e));
+    };
+    defer gpa.free(drafts);
+
+    var verify_ids = gpa.alloc(u32, B) catch return Verdict.refuse(.failed, "hy_v4_flash: out of memory");
+    defer gpa.free(verify_ids);
+    verify_ids[0] = t1;
+    for (drafts, 0..) |tok, i| verify_ids[i + 1] = tok;
+    const slot_ids = [_]u32{@intCast(f.slots.slice()[0])};
+    var vf: abi.Forward = .{
+        .mode = .verify,
+        .rows = @intCast(B),
+        .tokens = .of(verify_ids),
+        .slots = .of(&slot_ids),
+        .positions = .of(positions),
+        .caches = .of(&[_]abi.Handle{st.cache.?}),
+        .cache_ops = st.cache_ops,
+        .logits = .all_rows,
+        .want_hidden = true,
+    };
+    const vout = mdl.forward(&vf) catch |e| {
+        log.err("hy_v4 dfly: verify failed: {t}\n", .{e});
+        return Verdict.named(.failed, @errorName(e));
+    };
+    defer _ = mlx.mlx_array_free(.{ .ctx = vout.logits.ctx });
+    defer _ = mlx.mlx_array_free(.{ .ctx = vout.hidden.ctx });
+
+    // Accept the drafts the target's argmax agrees with, in order.
+    const logits0: mlx.mlx_array = .{ .ctx = vout.logits.ctx };
+    var logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logits);
+    if (mlx.mlx_astype(&logits, logits0, .float32, d.s) != 0) return Verdict.refuse(.failed, "hy_v4_flash: logits cast failed");
+    if (mlx.mlx_array_eval(logits) != 0) return Verdict.refuse(.failed, "hy_v4_flash: logits eval failed");
+    const lp = mlx.mlx_array_data_float32(logits) orelse return Verdict.refuse(.failed, "hy_v4_flash: no logits");
+    var accepted: u32 = 0;
+    for (0..B - 1) |i| {
+        const row_argmax = argmaxRow32(lp, i, @intCast(d.c.vocab_size), f.suppress_mask);
+        if (row_argmax != verify_ids[i + 1]) break;
+        accepted += 1;
+    }
+    const next_token = argmaxRow32(lp, accepted, @intCast(d.c.vocab_size), f.suppress_mask);
+
+    const keep = anchor + 1 + accepted;
+    const trunc = st.cache_ops.?.truncateOp() orelse return Verdict.refuse(.unsupported, "hy_v4_flash: the host cache has no truncate");
+    if (!trunc(st.cache.?, keep, .{ .ctx = d.s.ctx }).isOk()) return Verdict.refuse(.failed, "hy_v4_flash: cache rollback failed");
+    dflySettle(mdl, st, vout.hidden, accepted, anchor, verify_ids, B);
+
+    out.round = .{ .n = accepted + 1, .accepted = accepted, .next_token = next_token, .rows = @intCast(B), .position = keep };
+    for (verify_ids[0..accepted + 1], 0..) |tok, i| out.round.tokens[i] = tok;
+    return .ok;
+}
+
+fn verifyHook(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
+    const mdl = dflyModelOf(m);
+    const d = mdl.dfly orelse return Verdict.refuse(.unsupported, "hy_v4_flash: no DFly2 drafter loaded");
+    const st = dflySlotState(mdl, f) catch return Verdict.refuse(.failed, "hy_v4_flash: no target state for the draft round");
+    const t1: u32 = if (f.tokens.len > 0) f.tokens.slice()[0] else return Verdict.refuse(.failed, "hy_v4_flash: a round needs t1");
+    const anchor: u32 = if (f.positions.len > 0) f.positions.slice()[0] else return Verdict.refuse(.failed, "hy_v4_flash: a round needs a position");
+    const cap: usize = @min(@as(usize, f.accept_cap), 5);
+    if (cap == 0) return Verdict.refuse(.failed, "hy_v4_flash: no draft budget");
+    const B: usize = cap + 1;
+    const ids = gpa.alloc(i32, B) catch return Verdict.refuse(.failed, "hy_v4_flash: out of memory");
+    defer gpa.free(ids);
+    ids[0] = @intCast(t1);
+    for (1..B) |i| ids[i] = @intCast(d.mask_id);
+    const ids_arr = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ 1, @intCast(B) }, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids_arr);
+    const positions = gpa.alloc(u32, B) catch return Verdict.refuse(.failed, "hy_v4_flash: out of memory");
+    defer gpa.free(positions);
+    for (positions, 0..) |*p, i| p.* = anchor + @as(u32, @intCast(i));
+    const drafts = dflyDraft(mdl, d, .{ .ctx = ids_arr.ctx }, positions, .{ .ctx = st.hidden.ctx }) catch |e| {
+        log.err("hy_v4 dfly: draft failed: {t}\n", .{e});
+        return Verdict.named(.failed, @errorName(e));
+    };
+    defer gpa.free(drafts);
+    var verify_ids = gpa.alloc(u32, B) catch return Verdict.refuse(.failed, "hy_v4_flash: out of memory");
+    defer gpa.free(verify_ids);
+    verify_ids[0] = t1;
+    for (drafts, 0..) |tok, i| verify_ids[i + 1] = tok;
+    const slot_ids = [_]u32{@intCast(f.slots.slice()[0])};
+    var vf: abi.Forward = .{
+        .mode = .verify,
+        .rows = @intCast(B),
+        .tokens = .of(verify_ids),
+        .slots = .of(&slot_ids),
+        .positions = .of(positions),
+        .caches = .of(&[_]abi.Handle{st.cache.?}),
+        .cache_ops = st.cache_ops,
+        .logits = .all_rows,
+        .want_hidden = true,
+    };
+    const vout = mdl.forward(&vf) catch |e| {
+        log.err("hy_v4 dfly: verify failed: {t}\n", .{e});
+        return Verdict.named(.failed, @errorName(e));
+    };
+    if (st.verify_hidden.ctx != null) _ = mlx.mlx_array_free(st.verify_hidden);
+    st.verify_hidden = .{ .ctx = vout.hidden.ctx };
+    st.verify_n = @intCast(B);
+    st.verify_open = true;
+    st.anchor = anchor;
+    for (verify_ids, 0..) |tok, i| st.verify_tokens[i] = tok;
+    out.logits = vout.logits;
+    out.round = .{ .n = @intCast(B), .accepted = 0, .next_token = verify_ids[B - 1], .rows = @intCast(B), .position = anchor + @as(u64, B) };
+    for (verify_ids, 0..) |tok, i| out.round.tokens[i] = tok;
+    return .ok;
+}
+
+fn finishHook(m: *anyopaque, accepted: u32, out: *abi.ForwardOut) callconv(.c) Verdict {
+    const mdl = dflyModelOf(m);
+    const st = if (mdl.active_slot < mdl.slot_state.len) &mdl.slot_state[mdl.active_slot] else return Verdict.refuse(.failed, "hy_v4_flash: no slot");
+    if (!st.verify_open or st.cache == null or st.cache_ops == null) return Verdict.refuse(.failed, "hy_v4_flash: no open verify");
+    const keep = st.anchor + 1 + accepted;
+    const trunc = st.cache_ops.?.truncateOp() orelse return Verdict.refuse(.unsupported, "hy_v4_flash: the host cache has no truncate");
+    if (!trunc(st.cache.?, keep, .{ .ctx = mlx.gpuStream().ctx }).isOk()) return Verdict.refuse(.failed, "hy_v4_flash: cache rollback failed");
+    const hidden: mlx.mlx_array = .{ .ctx = st.verify_hidden.ctx };
+    const rows = @as(c_int, @intCast(st.verify_n));
+    const hdim: c_int = @intCast(mdl.c.hidden_size);
+    if (st.hidden.ctx != null) _ = mlx.mlx_array_free(st.hidden);
+    var sl = mlx.mlx_array_new();
+    if (mlx.mlx_slice(&sl, hidden, &[_]c_int{ 0, @intCast(@min(accepted, st.verify_n - 1)), 0 }, 3, &[_]c_int{ 1, @intCast(@min(accepted, st.verify_n - 1) + 1), hdim }, 3, &[_]c_int{ 1, 1, 1 }, 3, mlx.gpuStream()) != 0) return Verdict.refuse(.failed, "hy_v4_flash: hidden slice failed");
+    st.hidden = .{ .ctx = sl.ctx };
+    _ = rows;
+    st.verify_open = false;
+    out.round = .{ .position = keep };
+    return .ok;
+}
+
+fn argmaxRow32(lp: [*]const f32, row: usize, vocab: usize, suppress: abi.Array) u32 {
+    const base = row * vocab;
+    var best: u32 = 0;
+    var bestv: f32 = -std.math.inf(f32);
+    if (suppress.ctx != null) {
+        const sm = mlx.mlx_array_data_uint8(.{ .ctx = suppress.ctx }) orelse {
+            for (0..vocab) |i| if (lp[base + i] > bestv) {
+                bestv = lp[base + i];
+                best = @intCast(i);
+            };
+            return best;
+        };
+        for (0..vocab) |i| {
+            if (sm[i] != 0) continue;
+            if (lp[base + i] > bestv) {
+                bestv = lp[base + i];
+                best = @intCast(i);
+            }
+        }
+        return best;
+    }
+    for (0..vocab) |i| if (lp[base + i] > bestv) {
+        bestv = lp[base + i];
+        best = @intCast(i);
+    };
+    return best;
+}
+
+fn dflySettle(mdl: *Model, st: *SlotState, hidden_out: abi.Array, accepted: u32, anchor: u32, tokens: []const u32, n: usize) void {
+    const hidden: mlx.mlx_array = .{ .ctx = hidden_out.ctx };
+    const hdim: c_int = @intCast(mdl.c.hidden_size);
+    if (st.hidden.ctx != null) _ = mlx.mlx_array_free(st.hidden);
+    var sl = mlx.mlx_array_new();
+    if (mlx.mlx_slice(&sl, hidden, &[_]c_int{ 0, @intCast(@min(accepted, n - 1)), 0 }, 3, &[_]c_int{ 1, @intCast(@min(accepted, n - 1) + 1), hdim }, 3, &[_]c_int{ 1, 1, 1 }, 3, mlx.gpuStream()) != 0) return;
+    _ = mlx.mlx_array_eval(sl);
+    st.hidden = .{ .ctx = sl.ctx };
+    _ = anchor;
+    _ = tokens;
+    st.verify_open = false;
 }

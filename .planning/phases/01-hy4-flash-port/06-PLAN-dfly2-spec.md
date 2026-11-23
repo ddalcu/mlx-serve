@@ -32,3 +32,17 @@ The built-in DFly2 drafter runs: 5 sequential draft steps, each conditioning on 
 
 ## Verification (plan-level)
 ON/OFF parity script green; spec gates honest before engagement; lint 0.
+
+## Execution notes (plan 06, WIP)
+
+- `blocks/dfly.zig` loads the pack's 5 dense draft layers (own MLA, dense FFN 9216), `mtp_fusion`
+  (enorm/hnorm/eh_proj/gate), `hidden_correction` (3072 inter) and `final_norm`; `trunk.zig` carries the round:
+  fusion on slot 0, target KV history read through `CacheOps.view` at layers 25/29/33/37/41 plus the block's
+  local rows, target verify in one forward, argmax accept, cache rollback through a new `CacheOps.truncate`
+  hook, and a sampled `verify`/`finish` split.
+- DISARMED: `p.spec.native_stages` stays 0 and the table exposes no native_drafter. The round loaded and ran
+  to the draft attention, where `mlx_astype` on the cache view faults with `EXC_ARM_DA_ALIGN` (SIGBUS); the
+  view handle needs a dense/quantized-aware arm (or `kv.dense`) before the round is safe. The host cache
+  `truncate` hook landed but has no live test.
+- No acceptance/pacing number is claimed; HF transformers omits DFly2, so parity is SGLang/vLLM-only and the
+  full-pack greedy ON/OFF script is deferred until the view path works.

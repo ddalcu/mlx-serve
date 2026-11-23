@@ -7,6 +7,7 @@ const sdk = @import("../../sdk/root.zig");
 pub const config = @import("config.zig");
 pub const weights = @import("weights.zig");
 pub const vision_mod = @import("vision.zig");
+const trunk_mod = @import("trunk.zig");
 const log = @import("../../sdk/util/log.zig");
 const mlx = @import("../../mlx/ffi.zig");
 

@@ -292,15 +292,20 @@ pub fn forward(v: *Vision, patches: Array, gh: u32, gw: u32) !Array {
     const pos_arr = try g.fromSlice(f32, pos, &.{ n, hidden });
     x = try g.add(x, try g.astype(pos_arr, ops.dtype(x)));
 
+    // One scope per block: a large image's attention scores are hundreds of MB, and 27 blocks held together
+    // (the parent graph) blew Metal's resource limit. Each block's intermediates die at its own scope end.
     for (v.blocks) |*b| {
-        const normed = try g.layerNorm(x, b.norm1_w, b.norm1_b, v.eps);
-        const att = try attention(v, &g, normed, b, n);
-        x = try g.add(x, att);
-        const normed2 = try g.layerNorm(x, b.norm2_w, b.norm2_b, v.eps);
-        const h = try linear(&g, normed2, b.fc1_w, b.fc1_b);
-        const act = try gelu(&g, h);
-        const y = try linear(&g, act, b.fc2_w, b.fc2_b);
-        x = try g.add(x, y);
+        var t = g.scope();
+        defer t.deinit();
+        const normed = try t.layerNorm(x, b.norm1_w, b.norm1_b, v.eps);
+        const att = try attention(v, &t, normed, b, n);
+        const h1 = try t.add(x, att);
+        const normed2 = try t.layerNorm(h1, b.norm2_w, b.norm2_b, v.eps);
+        const hh = try linear(&t, normed2, b.fc1_w, b.fc1_b);
+        const act = try gelu(&t, hh);
+        const y = try linear(&t, act, b.fc2_w, b.fc2_b);
+        const next = try t.add(h1, y);
+        x = try g.adopt(t.escape(next));
     }
 
     // Projector: RMSNorm -> 2x2 conv -> gelu -> 1x1 conv -> one newline row appended per merged row.

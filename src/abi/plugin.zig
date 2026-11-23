@@ -730,6 +730,8 @@ pub const CacheOps = extern struct {
     /// A whole-prompt prefill's checkpoint: the named layers' states after `pos` tokens, `pos` the next position of
     /// `Forward.ssm_checkpoints`. The engine files its own copies; a layer not named keeps none. Null = not served.
     checkpoint: ?*const fn (cache: Handle, pos: u64, states: Span(LayerState)) callconv(.c) Verdict = null,
+    /// Truncates every layer's KV to `len` rows (a spec round's rollback of rejected verify rows).
+    truncate: ?*const fn (cache: Handle, len: u64, s: Stream) callconv(.c) Verdict = null,
 
     pub fn sdkSlots(self: *const CacheOps) bool {
         return self.size >= @sizeOf(CacheOps) and self.sdk_slots;
@@ -738,6 +740,12 @@ pub const CacheOps = extern struct {
     /// `checkpoint`, or null from a host whose table ends before it.
     pub fn checkpointOp(self: *const CacheOps) @FieldType(CacheOps, "checkpoint") {
         return if (self.size >= @offsetOf(CacheOps, "checkpoint") + @sizeOf(@FieldType(CacheOps, "checkpoint"))) self.checkpoint else null;
+    }
+
+    /// `truncate`, or null from a host whose table ends before it.
+    pub fn truncateOp(self: *const CacheOps) ?*const fn (cache: Handle, len: u64, s: Stream) callconv(.c) Verdict {
+        if (self.size < @offsetOf(CacheOps, "truncate") + @sizeOf(@FieldType(CacheOps, "truncate"))) return null;
+        return self.truncate;
     }
 };
 

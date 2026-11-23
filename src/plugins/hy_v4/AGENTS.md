@@ -5,7 +5,8 @@ n-gram PLE on 4 layers, and a DFly2 draft stack in `model.dfly_layers.*`. Plans 
 layout, 02 loader + Engram stream tables, 03 text forward (iHC, MLA with sinks, SWA, latent MoE, dense L0),
 04 compressed indexer (recall beyond the budget), 05 Engram (hash + streamed gather + injection),
 07 vision (SigLIP tower + projector + image/newline rows + Hy4 M-RoPE).
-Pending: 06 DFly2, 08 proofs/docs.
+Pending: 06 DFly2 (layers/fusion/correction scaffolded in `blocks/dfly.zig`, DISARMED until the target KV
+view + rollback round is proven), 08 proofs/docs.
 
 ## Rules
 
@@ -82,6 +83,14 @@ Pending: 06 DFly2, 08 proofs/docs.
   resumes at `max+1`; every layer ropes with its own theta (DSA 1e7, SWA 1e4). The raw 3-D table rides
   `Forward.mrope_positions` — the engine's one-theta `Forward.mrope` angles are not used.
 - Video ids exist in the pack but video is refused by name (`prepare` refuses a non-image input).
+- **A block scope per ViT layer**: a large image's attention scores are hundreds of MB; 27 blocks held in one
+  graph blew Metal's resource limit. Free each block's intermediates at its scope end.
+- **Prefix cache is OFF**: a restored prefix may hold image placeholder rows, and the splice resumes only
+  inside a chunked prefill (`vision_splice_offset`); a cache restore across an image run would splice tower rows
+  at the wrong offset. Re-enable only once the cache carries that offset.
+- **DFly2 is scaffolded, not armed**: `blocks/dfly.zig` loads the 5 draft layers, fusion and hidden correction;
+  `trunk.zig` has the round, but `p.spec.native_stages` stays 0. The target KV view through `CacheOps` crashes
+  in `mlx_astype` (alignment) and the host cache rollback is unproven — the round must be re-run before arming.
 
 ## Packs & fixtures
 
@@ -100,5 +109,5 @@ Pending: 06 DFly2, 08 proofs/docs.
 ## Files
 
 `config.zig` claim/parse, `weights.zig` load + validate + Engram tables, `trunk.zig` per-layer build + forward,
-`vision.zig` tower + processor + media hooks, `blocks/{ihc,mla,proj,moe,router,indexer,engram,numpy_rng}.zig` the
-math, `fixture.zig` the tiny pack, `loader_test.zig` census + load, `vision_test.zig` tower parity dump.
+`vision.zig` tower + processor + media hooks, `blocks/{ihc,mla,proj,moe,router,indexer,engram,numpy_rng,dfly}.zig`
+the math, `fixture.zig` the tiny pack, `loader_test.zig` census + load, `vision_test.zig` tower parity dump.

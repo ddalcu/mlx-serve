@@ -640,6 +640,10 @@ pub fn parse(
         .batch_pads_kv = false,
         .moe = c.n_routed_experts > 0,
         .images = c.has_vision,
+        // A restored prefix may hold image placeholder rows; the splice resumes by row index only inside a
+        // chunked prefill, so a cache restore across an image run would splice the tower rows at the wrong
+        // offset. Keep KV reuse off until the cache carries the spliced rows' offset.
+        .prefix_cache = false,
     };
     // The driver builds `Forward.mrope` off this (its angles are unused by Hy4, which ropes per layer
     // kind from the raw table); the raw positions ride `Forward.mrope_positions`.
@@ -654,6 +658,11 @@ pub fn parse(
         .inv_freq = .of(c.mrope_inv[0..c.mrope_inv_len]),
         .hy4_layout = c.has_vision,
     };
+    // DFly2's draft layers load and the round is scaffolded (`blocks/dfly.zig`), but the engine arms it
+    // only through the native-drafter hooks: keep stages 0 until the target KV view + rollback path is
+    // proven (plan 06 pending).
+    p.spec.native_stages = 0;
+    p.spec.native_block = 0;
     p.cache.layout_namespace = abi.Str.of("hy4-mla-latent-v1");
     p.placeholder_ids.image = c.image_token_id;
     p.weights.prefix = abi.Str.of(c.weight_prefix);
@@ -830,4 +839,11 @@ fn refuseContains(base: []const u8, needle: []const u8, sub: []const u8) !void {
     const v = parseJson(mutated, true, &p);
     if (v.isOk() or p.private != null) return error.NotRefused;
     if (v.why.len == 0) return error.NoReason;
+}
+
+test "hy_v4 spec: DFly2 stays disarmed until the draft round is proven" {
+    var p: abi.Parsed = .{};
+    try testing.expect(parseJson(@embedFile("../../fixtures/model-configs/hy_v4-flash.json"), true, &p).isOk());
+    defer freeParsed(&p);
+    try testing.expectEqual(@as(u32, 0), p.spec.native_stages);
 }

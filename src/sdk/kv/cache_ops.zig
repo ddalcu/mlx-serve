@@ -62,6 +62,7 @@ pub fn For(comptime E: type) type {
             .set_state_rows = setStateRows,
             .sdk_slots = true,
             .checkpoint = checkpoint,
+            .truncate = truncate,
         };
 
         const Rows = @import("../util/state_rows.zig").Rows(state, setState);
@@ -131,6 +132,11 @@ pub fn For(comptime E: type) type {
                 _ = mlx.mlx_array_free(mx(v.v));
             }
             v.* = .{};
+        }
+
+        fn truncate(h: abi.Handle, to_len: u64, s: abi.Stream) callconv(.c) abi.Verdict {
+            slotOf(h).kv.truncate(@intCast(to_len), .{ .ctx = s.ctx }) catch |e| return failed(e);
+            return .ok;
         }
 
         fn appendRows(caches: [*]const abi.Handle, n: u32, layer: u32, k: abi.Array, v: abi.Array, keep: u32, s: abi.Stream) callconv(.c) abi.Verdict {
