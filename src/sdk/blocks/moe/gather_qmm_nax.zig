@@ -725,6 +725,35 @@ fn stagedKernel() !mlx.mlx_fast_metal_kernel {
     return value;
 }
 
+/// `sortedGatherPromptStagedTok`'s build: the same source with its rows scattered to their pairs' slots
+/// (`GQMM_SCAT`, `k` picks a row: one build per k), `ridx` the flat picks after the staged inputs.
+var staged_scat_kernel: [9]?mlx.mlx_fast_metal_kernel = @splat(null);
+pub const STAGED_SCAT_INPUTS = STAGED_INPUTS ++ [_][*:0]const u8{"ridx"};
+
+/// The scatter build's header at `k` picks a token.
+pub fn stagedScatHeader(comptime k: c_int) [:0]const u8 {
+    return std.fmt.comptimePrint("#define GQMM_SCAT 1\n#define GQMM_SCAT_K {d}\n", .{k}) ++ STAGED_HEADER;
+}
+
+fn stagedScatKernel(k: c_int) !mlx.mlx_fast_metal_kernel {
+    if (k < 1 or k > 8) return error.ScatPicks;
+    const i: usize = @intCast(k);
+    if (staged_scat_kernel[i]) |v| return v;
+    const ins = mlx.mlx_vector_string_new_data(&STAGED_SCAT_INPUTS, STAGED_SCAT_INPUTS.len);
+    defer _ = mlx.mlx_vector_string_free(ins);
+    const outs_names = [_][*:0]const u8{"y"};
+    const outs = mlx.mlx_vector_string_new_data(&outs_names, outs_names.len);
+    defer _ = mlx.mlx_vector_string_free(outs);
+    const header: [*:0]const u8 = switch (k) {
+        inline 1...8 => |kk| stagedScatHeader(kk),
+        else => unreachable,
+    };
+    const value = mlx.mlx_fast_metal_kernel_new("msv_gqmm_staged_scat", ins, outs, STAGED_SOURCE, header, true, false);
+    if (value.ctx == null) return error.MetalKernelCompileFailed;
+    staged_scat_kernel[i] = value;
+    return value;
+}
+
 /// The staged launch's configuration: `[rows, 1, out_n]` bf16 over the tiles of a `nw`-wide product (2 n for the pair).
 pub const StagedKey = struct { rows: c_int, out_n: c_int, nw: c_int, k: c_int, max_tiles: c_int, st: Staged, bits: u32, group: u32, mx: bool, epi: c_int, esc: u32, map: bool };
 
@@ -749,6 +778,14 @@ pub fn stagedConfig(key: StagedKey) !mlx.mlx_fast_metal_kernel_config {
 /// `launchMapped` on the staged schedule; `row_map` null reads x's rows in order. `scan_bm`: the tile height the
 /// scan cuts at (the plan's; a test plants another).
 fn launchStaged(x: mlx.mlx_array, row_map: ?mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, pair: ?Pair, bits: u32, group: u32, mx: bool, st: Staged, scan_bm: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    return launchStagedTo(x, row_map, w, sc, bi, idx, pair, bits, group, mx, st, scan_bm, null, s);
+}
+
+/// `sortedGatherPromptStagedTok`'s scatter: each sorted row's token `rows` `[m]` and the flat picks `ids` `[m]` (`k` a
+/// token).
+const Scat = struct { rows: mlx.mlx_array, ids: mlx.mlx_array, k: c_int };
+
+fn launchStagedTo(x: mlx.mlx_array, row_map: ?mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, pair: ?Pair, bits: u32, group: u32, mx: bool, st: Staged, scan_bm: c_int, scat: ?Scat, s: mlx.mlx_stream) !mlx.mlx_array {
     const ws = mlx.getShape(w);
     const m = mlx.getShape(idx)[0];
     const up_off: c_int = if (pair) |v| v.up_off else 0;
@@ -771,6 +808,13 @@ fn launchStaged(x: mlx.mlx_array, row_map: ?mlx.mlx_array, w: mlx.mlx_array, sc:
     const epi: c_int = if (pair) |v| (if (v.route != null) -1 else 1 + @as(c_int, @intCast(v.limit))) else 0;
     const cfg = try stagedConfig(.{ .rows = m, .out_n = n, .nw = nw, .k = k, .max_tiles = t.max_tiles, .st = st, .bits = bits, .group = group, .mx = mx, .epi = epi, .esc = esc.bits(), .map = row_map != null });
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    if (scat) |v| {
+        // The plain tile only (MAP and EPI unread there): `rmap` carries each sorted row's token.
+        if (pair != null or row_map != null) return error.ScatPlainOnly;
+        var si = inputs ++ [_]mlx.mlx_array{v.ids};
+        si[11] = v.rows;
+        return applyOne(try stagedScatKernel(v.k), &si, cfg, s);
+    }
     return applyOne(try stagedKernel(), &inputs, cfg, s);
 }
 
@@ -792,6 +836,22 @@ pub fn sortedGatherPromptStaged(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_
     if (!stagedFits(mlx.getShape(x)[2], ws[1], mx)) return null;
     const st = stagedPlan(mlx.getShape(idx)[0], ws[0]);
     return try launchStaged(x, null, w, sc, bi, idx, null, bits, group, mx, st, st.bm, s);
+}
+
+/// `sortedGatherPromptStaged` with each output row at its pair's slot: sorted row p (expert `idx[p]`, token `rows[p]`)
+/// lands at row `rows[p] * k + j`, where `ids[rows[p] * k + j]` is that expert (`ids` `[m]` the flat picks, `k` a
+/// token, each token's picks distinct). The output `[m, 1, n]` is in pair order, each row the same words as the
+/// sorted call's row p; null where the staged schedule does not serve.
+pub fn sortedGatherPromptStagedTok(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, rows: mlx.mlx_array, ids: mlx.mlx_array, k: c_int, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!nax_available or !mlx.streamIsGpu(s)) return null;
+    if (!supported(x, w, sc, bi, idx, bits, group, mx, null, true)) return null;
+    const ws = mlx.getShape(w);
+    if (!stagedFits(mlx.getShape(x)[2], ws[1], mx)) return null;
+    const m = mlx.getShape(idx)[0];
+    if (k < 1 or k > 8 or @rem(m, k) != 0) return null;
+    for ([_]mlx.mlx_array{ rows, ids }) |a| if (mlx.mlx_array_dtype(a) != .uint32 or mlx.mlx_array_size(a) != @as(usize, @intCast(m))) return null;
+    const st = stagedPlan(m, ws[0]);
+    return try launchStagedTo(x, null, w, sc, bi, idx, null, bits, group, mx, st, st.bm, .{ .rows = rows, .ids = ids, .k = k }, s);
 }
 
 fn requireNax() !void {

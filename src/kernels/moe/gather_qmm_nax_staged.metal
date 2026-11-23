@@ -12,10 +12,10 @@ Q uq{up_scales, up_biases};
 if constexpr (AS == 1) {
   omlx_gqmm::gather_staged_tg<T, Q, G, NW, KD, EPI, MAP, ESC>(x, rmap, (const device uint8_t*)w,
       (const device uint8_t*)up_w, q, uq, desc, y_col, y, Ws, As, simdgroup_index_in_threadgroup,
-      thread_index_in_simdgroup, sigtab, params[2], gsc, usc, rw, as_type<float>(params[3]));
+      thread_index_in_simdgroup, sigtab, params[2], gsc, usc, rw, as_type<float>(params[3]) GQMM_SCAT_PASS);
 } else {
   (void)As;
   omlx_gqmm::gather_staged<T, Q, G, NW, KD, EPI, MAP, ESC>(x, rmap, (const device uint8_t*)w,
       (const device uint8_t*)up_w, q, uq, desc, y_col, y, Ws, simdgroup_index_in_threadgroup,
-      thread_index_in_simdgroup, sigtab, params[2], gsc, usc, rw, as_type<float>(params[3]));
+      thread_index_in_simdgroup, sigtab, params[2], gsc, usc, rw, as_type<float>(params[3]) GQMM_SCAT_PASS);
 }

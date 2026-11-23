@@ -106,6 +106,8 @@ pub fn slicesFor(L: usize) usize {
 /// The kernels and the attention side handed to the next layer; one copy across `-Dunits` units.
 const State = struct {
     k: [all.len]?mlx.mlx_fast_metal_kernel = @splat(null),
+    /// The combining tails reading their down rows in pair order (`MoeParts.tok`).
+    k_tok: [all.len]?mlx.mlx_fast_metal_kernel = @splat(null),
     fin: ?mlx.mlx_fast_metal_kernel = null,
     logged: bool = false,
     slot: Slot = .{},
@@ -142,6 +144,18 @@ fn kernel(p: Pro) !mlx.mlx_fast_metal_kernel {
     return k;
 }
 
+/// `kernel(p)` for a combining tail whose down rows are in pair order (`TOK`, `MoeParts.tok`).
+fn kernelTok(p: Pro) !mlx.mlx_fast_metal_kernel {
+    const i = @intFromEnum(p);
+    if (ps().k_tok[i]) |k| return k;
+    const k = switch (p) {
+        inline .tail_c, .tail_only_c => |q| try dsv41.buildKernel(name(q) ++ "_tok", ins(q), outs(q), mix_source, header(q) ++ "#define TOK 1\n"),
+        else => return error.HcV2TokNotCombining,
+    };
+    ps().k_tok[i] = k;
+    return k;
+}
+
 fn finKernel() !mlx.mlx_fast_metal_kernel {
     if (ps().fin) |k| return k;
     const k = try dsv41.buildKernel("dsv41_hc_v2_fin", &fin_ins, &fin_outs, fin_source, "");
@@ -175,6 +189,11 @@ fn rows(x: A) usize {
 
 /// One mix-kernel launch over `L` rows: its outputs (x2 for the tail, then hraw and part where it mixes).
 pub fn mixLaunch(sc: *dsv41.Scope, p: Pro, in: []const A, L: usize, S: usize) ![3]A {
+    return mixLaunchTo(sc, p, in, L, S, false);
+}
+
+/// `mixLaunch`; `tok`: a combining tail's down rows are in pair order (`kernelTok`).
+pub fn mixLaunchTo(sc: *dsv41.Scope, p: Pro, in: []const A, L: usize, S: usize, tok: bool) ![3]A {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     if (isTail(p)) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), HC, D }, 3, .bfloat16));
@@ -192,7 +211,7 @@ pub fn mixLaunch(sc: *dsv41.Scope, p: Pro, in: []const A, L: usize, S: usize) ![
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, try kernel(p), iv, cfg, sc.s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, if (tok) try kernelTok(p) else try kernel(p), iv, cfg, sc.s));
     var got: [3]A = .{ none, none, none };
     const n = nOuts(p);
     for (got[0..n], 0..) |*o, k| {
@@ -287,6 +306,7 @@ pub fn tail(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, y: A, sa: *const
         n_in += 1;
     }
     const c = y2 == .parts;
+    const tok = c and y2.parts.tok;
     switch (y2) {
         .rows => |r| {
             in[n_in] = try bf16(sc, r);
@@ -302,14 +322,14 @@ pub fn tail(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, x: A, y: A, sa: *const
         n_in += 1;
     }
     const n = nx orelse {
-        const o = try mixLaunch(sc, if (c) .tail_only_c else .tail_only, in[0..n_in], L, S);
+        const o = try mixLaunchTo(sc, if (c) .tail_only_c else .tail_only, in[0..n_in], L, S, tok);
         return .{ .x2 = o[0], .next = null };
     };
     in[n_in] = sf.pre;
     in[n_in + 1] = n.hc.fn_w;
     n_in += 2;
     const eps = try dsv41.hcEps(sc, m);
-    const o = try mixLaunch(sc, if (c) .tail_c else .tail, in[0..n_in], L, S);
+    const o = try mixLaunchTo(sc, if (c) .tail_c else .tail, in[0..n_in], L, S, tok);
     return .{ .x2 = o[0], .next = try finLaunch(sc, o[2], o[1], n.hc, n.norm_w, eps, S, m.cfg.dsv4_hc_sinkhorn_iters) };
 }
 

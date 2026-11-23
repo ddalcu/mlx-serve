@@ -47,6 +47,33 @@ pub fn down(sc: *dsv41.Scope, b: *const dsv41.Bank, act: A, sidx: A) !?A {
     return try sc.keep(y);
 }
 
+/// `down` with each row at its pair's slot (`MLX_SERVE_DSV41_PF_DOWN_TOKORD`): `[n, 1, d]` in pair (token) order, sorted
+/// row p at `rows[p] * k + j` where `flat[rows[p] * k + j]` is its expert; the same words as `down`'s row p. Null where
+/// it declines (the caller then runs `down`).
+pub fn downTok(sc: *dsv41.Scope, b: *const dsv41.Bank, act: A, sidx: A, rows: A, flat: A, k: usize) !?A {
+    const P = mlx.getShape(sidx)[0];
+    if (b.s.ctx == null) return null;
+    var f = try sc.astype(flat, .uint32);
+    // The planted control: each token's picks rotated by one, so every row lands one slot over.
+    if (tok_plant) {
+        const n = mlx.getShape(f)[0];
+        const r = try sc.reshape(f, &.{ @divExact(n, @as(c_int, @intCast(k))), @intCast(k) });
+        f = try sc.reshape(try sc.concat(&.{ try sc.slice(r, 1, 1, k), try sc.slice(r, 1, 0, 1) }, 1), &.{n});
+    }
+    const y = (try gather_nax.sortedGatherPromptStagedTok(act, b.w, b.s, b.b, sidx, try sc.astype(rows, .uint32), f, @intCast(k), b.qp.bits, b.qp.group_size, b.qp.mode.isFp4(), verify_qmm_nax.verifyQmmNaxAvailable(), sc.s)) orelse return null;
+    if (!tok_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_DOWN_TOKORD engaged (pairs {d}, {d} a row)\n", .{ P, k });
+    _ = launches.fetchAdd(1, .monotonic);
+    _ = tok_launches.fetchAdd(1, .monotonic);
+    return try sc.keep(y);
+}
+
+/// `downTok`'s planted bug (its test): each token's picks rotated by one, every row one slot over.
+pub var tok_plant = false;
+
+/// `downTok` launches served (a test's proof `MLX_SERVE_DSV41_PF_DOWN_TOKORD` engaged).
+pub var tok_launches: std.atomic.Value(u32) = .init(0);
+var tok_logged: std.atomic.Value(bool) = .init(false);
+
 /// Staged launches served, gate+up and down each one (a test's proof the switch engaged).
 pub var launches: std.atomic.Value(u32) = .init(0);
 

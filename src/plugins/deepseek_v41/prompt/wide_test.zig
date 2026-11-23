@@ -439,6 +439,79 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_FP4_GEMM is today's output
     }
 }
 
+test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_TOKORD: the staged down's rows at their pairs' slots are the sorted rows unsorted, and moePrefill, MOE_TAIL and the hc_v2 combining tails reading them in place are today's output, word for word, NVFP4 with per-expert scales and MXFP4, prompt rows to 8192; every row one slot over fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
+    const off = env.override(.MLX_SERVE_DSV41_PF_DOWN_TOKORD, "0");
+    defer off.restore();
+    inline for (.{ true, false }) |nv| {
+        const pk = if (nv) env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1") else env.override(.MLX_SERVE_DSV41_MOE_PAIR, "1");
+        defer pk.restore();
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        var m: dsv41.Dsv41Model = undefined;
+        m.cfg = .{};
+        m.cfg.dsv4_swiglu_limit = 10;
+        m.act = .bfloat16;
+        m.moe_wt_kernel = null;
+        m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
+        m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
+        var ly: dsv41.Layer = undefined;
+        ly.gate_w = try sc.zeros(&.{ experts, 8 }, .bfloat16);
+        ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .gu = try fp4Bank(&sc, 0x6A7E, experts, 2 * inter, hidden, nv), .down = try fp4Bank(&sc, 0xD0E1, experts, hidden, inter, nv) };
+        if (nv) for (&ly.experts.scale, 0..) |*v, i| {
+            v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x5CA1E + i);
+        };
+        for ([_]usize{ 40, 500, 777, 1254, 4097, 8192 }, 0..) |L, ci| {
+            var csc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+            defer csc.deinit();
+            const c = try call(&csc, L, @intCast(experts), 0x2400 + ci, false);
+            const Lc: c_int = @intCast(L);
+            const x1 = try normal(&csc, &.{ Lc, 4, @intCast(hidden) }, .bfloat16, 1, 0x2500 + ci);
+            const sp: dsv41.Split = .{ .pre = none, .post = try uniform(&csc, &.{ Lc, 4 }, .float32, 0.1, 2, 0x2600 + ci), .comb = try uniform(&csc, &.{ Lc, 4, 4 }, .float32, 0, 1, 0x2700 + ci) };
+            const y = try normal(&csc, &.{ Lc, @intCast(hidden) }, .bfloat16, 1, 0x2800 + ci);
+            const cpre = try uniform(&csc, &.{ Lc, 4 }, .float32, 0.1, 1, 0x2900 + ci);
+            const fnw = try normal(&csc, &.{ @intCast(hv2.MIX), @intCast(hv2.N) }, .float32, 0.01, 0x2A00 + ci);
+            const S = hv2.slicesFor(L);
+            // Today's: the sorted down rows, their unsort, and every reader of them.
+            const want = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const want_y = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const want_t = try mtail.launch(&csc, want, x1, &sp);
+            const tin = [_]A{ x1, y, sp.post, sp.comb, want.dn, want.inv, try csc.astype(want.sh, .bfloat16), sp.post, sp.comb, cpre, fnw };
+            const want_c = try hv2.mixLaunch(&csc, .tail_c, &tin, L, S);
+            const want_o = try hv2.mixLaunch(&csc, .tail_only_c, tin[0..9], L, S);
+            const on = env.override(.MLX_SERVE_DSV41_PF_DOWN_TOKORD, "1");
+            defer on.restore();
+            const before = fp4gemm.tok_launches.load(.monotonic);
+            const got = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const served = fp4gemm.tok_launches.load(.monotonic) - before;
+            const got_y = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const got_t = try mtail.launch(&csc, got, x1, &sp);
+            var gin = tin;
+            gin[4] = got.dn;
+            gin[5] = got.inv;
+            const got_c = try hv2.mixLaunchTo(&csc, .tail_c, &gin, L, S, true);
+            const got_o = try hv2.mixLaunchTo(&csc, .tail_only_c, gin[0..9], L, S, true);
+            const rows_eq = try sameWords(try csc.take(want.dn, want.inv, 0), got.dn);
+            const eq = [_]bool{ rows_eq, try sameWords(want_y, got_y), try sameWords(want_t, got_t), try sameWords(want_c[0], got_c[0]) and try sameWords(want_c[1], got_c[1]) and try sameWords(want_c[2], got_c[2]), try sameWords(want_o[0], got_o[0]) };
+            std.debug.print("[down-tokord] {s} rows {d}: tok {} launches {d}; down rows {}, moePrefill {}, moe_tail {}, hc_v2 tail_c {}, tail_only_c {}\n", .{ if (nv) "NVFP4" else "MXFP4", L, got.tok, served, eq[0], eq[1], eq[2], eq[3], eq[4] });
+            try testing.expect(got.tok);
+            // moePrefillParts, then moePrefill's own call.
+            try testing.expectEqual(@as(u32, 2), served);
+            for (eq) |v| try testing.expect(v);
+            // Planted: every row one slot over (each token's picks rotated by one).
+            fp4gemm.tok_plant = true;
+            defer fp4gemm.tok_plant = false;
+            const bad = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            try testing.expect(!try sameWords(try csc.take(want.dn, want.inv, 0), bad.dn));
+            try testing.expect(!try sameWords(want_y, try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh)));
+        }
+    }
+}
+
 // ── the hc stages ──
 
 /// A model holding only the hc kernels, at the release's widths, the fused ones built and probed.
