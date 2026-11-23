@@ -16,6 +16,7 @@ const gather_nax = @import("../../../sdk/blocks/moe/gather_qmm_nax.zig");
 const mtail = @import("moe_tail.zig");
 const hv2 = @import("hc_v2.zig");
 const fixture = @import("../decode/fixture.zig");
+const ggemm = @import("gate_gemm.zig");
 const kw = @import("keep_wide.zig");
 
 const testing = std.testing;
@@ -851,6 +852,222 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
         try testing.expect(!try closeAs(fx, x, pre, want, &want_tap, label, "planted: the routed term at half its scale"));
     };
     try testing.expect(ok);
+}
+
+test "dsv41 wide tol: gate_gemm's bf16 MMA (PF_COMP_BF16, PF_ROUTER_BF16) is the f32 chain within f32 reordering at the compressor's and router's shapes, K 5,120, prompt rows 257 to 17,639; a weight row moved fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    var ok = true;
+    for ([_]usize{ 512, 384 }) |n| for ([_]usize{ 257, 4097, 17_639 }) |rows| {
+        const x = try normal(&sc, &.{ @intCast(rows), @intCast(hidden) }, .bfloat16, 1, 0x51 + rows);
+        const w = try normal(&sc, &.{ @intCast(n), @intCast(hidden) }, .bfloat16, 1.0 / @sqrt(@as(f32, hidden)), 0x52 + n);
+        const want = try sc.matmul(try sc.astype(x, .float32), try sc.transpose(try sc.astype(w, .float32), &.{ 1, 0 }));
+        const got = (try ggemm.bf16F32(sc.s, x, w, true, .single)) orelse return error.Declined;
+        _ = try sc.keep(got);
+        var lb: [96]u8 = undefined;
+        if (!try close(try std.fmt.bufPrint(&lb, "bf16 MMA, f32 out: {d} rows x {d}", .{ rows, n }), want, got, null, 1e-5)) ok = false;
+        // Planted: weight row 0 replaced by row 1.
+        const wp = try sc.concat(&.{ try sc.slice(w, 0, 1, 2), try sc.slice(w, 0, 1, n) }, 0);
+        const bad = (try ggemm.bf16F32(sc.s, x, wp, true, .single)) orelse return error.Declined;
+        _ = try sc.keep(bad);
+        try testing.expect(!try close(try std.fmt.bufPrint(&lb, "planted: row 0 moved, {d} rows x {d}", .{ rows, n }), want, bad, null, 1e-5));
+    };
+    // Declines: another type, no NAX.
+    const xf = try normal(&sc, &.{ 300, @intCast(hidden) }, .float32, 1, 9);
+    const wb = try normal(&sc, &.{ 384, @intCast(hidden) }, .bfloat16, 1, 10);
+    try testing.expect((try ggemm.bf16F32(sc.s, xf, wb, true, .single)) == null);
+    try testing.expect((try ggemm.bf16F32(sc.s, try sc.astype(xf, .bfloat16), wb, false, .single)) == null);
+    try testing.expect(ok);
+}
+
+test "dsv41 wide tol: MLX_SERVE_DSV41_PF_COMP_BF16 and MLX_SERVE_DSV41_PF_ROUTER_BF16, each and both, keep a pair worker's prefill within 5% of the stock path's, MXFP4 and NVFP4 experts with per-expert scales, a ratio-2 and a ratio-1 pair; the compressor's kv and gate swapped and the logits negated fail" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    const sw = .{ .MLX_SERVE_DSV41_PF_COMP_BF16, .MLX_SERVE_DSV41_PF_ROUTER_BF16 };
+    inline for (sw) |n| env.set(n, "0");
+    defer {
+        inline for (sw) |n| env.set(n, "0");
+    }
+    const Case = struct { lo: usize, rows: usize, nv: bool };
+    var ok = true;
+    for ([_]Case{ .{ .lo = 8, .rows = 5000, .nv = false }, .{ .lo = 20, .rows = 4608, .nv = true } }) |c| {
+        var lb: [64]u8 = undefined;
+        const label = try std.fmt.bufPrint(&lb, "{d}-{d} {s} at {d} rows", .{ c.lo, c.lo + 1, if (c.nv) "NVFP4" else "MXFP4", c.rows });
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = c.lo, .hi = c.lo + 2, .ctx = 0, .experts_fp4 = !c.nv, .experts_nvfp4 = c.nv, .expert_scales = if (c.nv) .all else .none });
+        defer fx.deinit();
+        const x = try fx.stream(c.rows);
+        defer _ = mlx.mlx_array_free(x);
+        const pre = try fx.cpre(c.rows);
+        defer _ = mlx.mlx_array_free(pre);
+        var want_tap: dsv41.RouteTap = .{ .gpa = gpa };
+        defer freeTap(&want_tap);
+        const c0 = dsv41.comp_bf16_count.load(.monotonic);
+        const r0 = dsv41.router_bf16_count.load(.monotonic);
+        const want = try prefillTapped(fx, x, pre, &want_tap);
+        defer for (want) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        try testing.expectEqual(c0, dsv41.comp_bf16_count.load(.monotonic));
+        try testing.expectEqual(r0, dsv41.router_bf16_count.load(.monotonic));
+        const has_comp = fx.m.layers[c.lo].ratio > 1 or fx.m.layers[c.lo + 1].ratio > 1;
+        // Each alone, engaged: the compressor on a ratio-2 KV source's layers, the router on both layers.
+        env.set(.MLX_SERVE_DSV41_PF_COMP_BF16, "1");
+        if (!try closeAs(fx, x, pre, want, &want_tap, label, "PF_COMP_BF16")) ok = false;
+        std.debug.print("wide layer {s}: PF_COMP_BF16 served {d} layers\n", .{ label, dsv41.comp_bf16_count.load(.monotonic) - c0 });
+        if (has_comp) try testing.expect(dsv41.comp_bf16_count.load(.monotonic) > c0);
+        env.set(.MLX_SERVE_DSV41_PF_COMP_BF16, "0");
+        env.set(.MLX_SERVE_DSV41_PF_ROUTER_BF16, "1");
+        if (!try closeAs(fx, x, pre, want, &want_tap, label, "PF_ROUTER_BF16")) ok = false;
+        std.debug.print("wide layer {s}: PF_ROUTER_BF16 served {d} calls\n", .{ label, dsv41.router_bf16_count.load(.monotonic) - r0 });
+        try testing.expect(dsv41.router_bf16_count.load(.monotonic) > r0);
+        env.set(.MLX_SERVE_DSV41_PF_COMP_BF16, "1");
+        if (!try closeAs(fx, x, pre, want, &want_tap, label, "both")) ok = false;
+        // Planted: the logits negated; the compressor's kv and gate swapped (where it serves).
+        {
+            dsv41.router_bf16_plant = true;
+            defer dsv41.router_bf16_plant = false;
+            try testing.expect(!try closeAs(fx, x, pre, want, &want_tap, label, "planted: the logits negated"));
+        }
+        if (has_comp) {
+            dsv41.comp_bf16_plant = true;
+            defer dsv41.comp_bf16_plant = false;
+            try testing.expect(!try closeAs(fx, x, pre, want, &want_tap, label, "planted: the compressor's kv and gate swapped"));
+        }
+        inline for (sw) |n| env.set(n, "0");
+    }
+    try testing.expect(ok);
+}
+
+/// `got` against float64 `ref` (both `n`): the error's norm over `ref`'s, its largest magnitude over `ref`'s largest.
+const F64Err = struct { l2: f64, max: f64 };
+fn f64Err(got: []const f32, ref: []const f64) F64Err {
+    var dd: f64 = 0;
+    var rr: f64 = 0;
+    var dm: f64 = 0;
+    var rm: f64 = 0;
+    for (got, ref) |g, r| {
+        const d = @as(f64, g) - r;
+        dd += d * d;
+        rr += r * r;
+        dm = @max(dm, @abs(d));
+        rm = @max(rm, @abs(r));
+    }
+    return .{ .l2 = @sqrt(dd / rr), .max = dm / rm };
+}
+
+test "dsv41 wide tol: PF_COMP_BF16's compressor projection over a 4,096-row layer is no farther from float64 than today's span-by-span TF32 chain in l2 and max (one 256-row span, the release's fused kv and gate rows); the single running sum (planted) is" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 8, .hi = 10, .ctx = 0, .experts_fp4 = true });
+    defer fx.deinit();
+    // The pair's KV source above ratio 1.
+    const li: usize = if (fx.layer(8).comp != null and fx.layer(8).ratio > 1) 8 else 9;
+    const cw = &fx.layer(li).comp.?;
+    try testing.expect(fx.layer(li).ratio > 1 and cw.wgate == null);
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const rows = 4096;
+    const span = 256;
+    const k0 = 5 * span;
+    const x = try normal(&sc, &.{ rows, @intCast(hidden) }, .bfloat16, 1, 0x6b);
+    try dsv41.evalAll(&.{x});
+    // Today's: the span's own call (`compProj`, MLX's f32 matmul at M = 256: its split K). The switch's: one launch over
+    // the layer's rows, the span's rows of it.
+    const old = try dsv41.hostF32(try dsv41.compProj(&sc, fx.m, li, cw, try sc.slice(x, 0, k0, k0 + span)));
+    defer gpa.free(old);
+    const all = (try ggemm.bf16F32(sc.s, x, cw.wkv.w, true, .blocked)) orelse return error.Declined;
+    _ = try sc.keep(all);
+    const new = try dsv41.hostF32(try sc.slice(all, 0, k0, k0 + span));
+    defer gpa.free(new);
+    // Planted: the blocked sum's control, one running sum over K.
+    ggemm.blocked_plant = true;
+    const single = (try ggemm.bf16F32(sc.s, x, cw.wkv.w, true, .blocked)) orelse return error.Declined;
+    ggemm.blocked_plant = false;
+    _ = try sc.keep(single);
+    const one = try dsv41.hostF32(try sc.slice(single, 0, k0, k0 + span));
+    defer gpa.free(one);
+    // float64: the bf16 operands widened exactly, each output summed in float64.
+    const xs = try dsv41.hostF32(try sc.slice(x, 0, k0, k0 + span));
+    defer gpa.free(xs);
+    const ws = try dsv41.hostF32(cw.wkv.w);
+    defer gpa.free(ws);
+    const N = ws.len / hidden;
+    const ref = try gpa.alloc(f64, span * N);
+    defer gpa.free(ref);
+    for (0..span) |r| for (0..N) |c| {
+        var acc: f64 = 0;
+        const xr = xs[r * hidden ..][0..hidden];
+        const wr = ws[c * hidden ..][0..hidden];
+        for (xr, wr) |a, b| acc += @as(f64, a) * @as(f64, b);
+        ref[r * N + c] = acc;
+    };
+    var differ: usize = 0;
+    for (old, new) |a, b| differ += @intFromBool(a != b);
+    const eo = f64Err(old, ref);
+    const en = f64Err(new, ref);
+    const ep = f64Err(one, ref);
+    std.debug.print("compressor projection, {d} rows x {d}: {d} of {d} words differ between today's and PF_COMP_BF16; from float64: today l2 {e:.3} max {e:.3}, PF_COMP_BF16 (blocked) l2 {e:.3} max {e:.3}, planted single sum l2 {e:.3} max {e:.3}\n", .{ span, N, differ, old.len, eo.l2, eo.max, en.l2, en.max, ep.l2, ep.max });
+    try testing.expect(en.l2 <= eo.l2 and en.max <= eo.max);
+    try testing.expect(!(ep.l2 <= eo.l2 and ep.max <= eo.max));
+}
+
+test "dsv41 wide tol: PF_ROUTER_BF16 serves only where today runs gate_gemm's single sum (1,707 rows and up at 384 experts, K 5,120), today's words there; below it today's split-K path, which the single sum (planted) is farther from float64 than" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const E = 384;
+    const w = try normal(&sc, &.{ E, @intCast(hidden) }, .bfloat16, 1.0 / @sqrt(@as(f32, hidden)), 0x72);
+    try dsv41.evalAll(&.{w});
+    const ws = try dsv41.hostF32(w);
+    defer gpa.free(ws);
+    var planted_farther = false;
+    // The CED replay's 128, a verify block, a short prompt, the split-K edge each side, a chunk and the one-pass width.
+    for ([_]usize{ 33, 128, 1024, 1706, 1707, 4097, 17_638 }) |rows| {
+        const x = try normal(&sc, &.{ @intCast(rows), @intCast(hidden) }, .bfloat16, 1, 0x71 + rows);
+        try dsv41.evalAll(&.{x});
+        // Today's served call: gate_gemm's launch where MLX runs its regular kernel, else MLX's f32 matmul (split K).
+        const today = if (try ggemm.router(sc.s, x, w, true)) |y| try sc.keep(y) else try sc.matmul(try sc.astype(x, .float32), try sc.transpose(try sc.astype(w, .float32), &.{ 1, 0 }));
+        const sum = dsv41.routerSum(rows, E, hidden);
+        const got = if (sum) |sm| try sc.keep((try ggemm.bf16F32(sc.s, x, w, true, sm)) orelse return error.Declined) else today;
+        dsv41.router_sum_plant = true;
+        const planted = try sc.keep((try ggemm.bf16F32(sc.s, x, w, true, dsv41.routerSum(rows, E, hidden).?)) orelse return error.Declined);
+        dsv41.router_sum_plant = false;
+        // float64 over (at most) 256 rows from the middle.
+        const n: usize = @min(rows, 256);
+        const r0 = (rows - n) / 2;
+        const a = try dsv41.hostF32(try sc.slice(today, 0, r0, r0 + n));
+        defer gpa.free(a);
+        const b = try dsv41.hostF32(try sc.slice(got, 0, r0, r0 + n));
+        defer gpa.free(b);
+        const c = try dsv41.hostF32(try sc.slice(planted, 0, r0, r0 + n));
+        defer gpa.free(c);
+        const xs = try dsv41.hostF32(try sc.slice(x, 0, r0, r0 + n));
+        defer gpa.free(xs);
+        const ref = try gpa.alloc(f64, n * E);
+        defer gpa.free(ref);
+        for (0..n) |r| for (0..E) |col| {
+            var acc: f64 = 0;
+            for (xs[r * hidden ..][0..hidden], ws[col * hidden ..][0..hidden]) |p, q| acc += @as(f64, p) * @as(f64, q);
+            ref[r * E + col] = acc;
+        };
+        var differ: usize = 0;
+        for (a, b) |p, q| differ += @intFromBool(p != q);
+        const et = f64Err(a, ref);
+        const eg = f64Err(b, ref);
+        const ep = f64Err(c, ref);
+        const regular = ggemm.mlxRegular(@intCast(rows), E, hidden);
+        std.debug.print("router logits, {d} rows (today {s}): PF_ROUTER_BF16 {s}, {d} of {d} words differ from today's; from float64: today l2 {e:.3} max {e:.3}, served l2 {e:.3} max {e:.3}, the single sum here l2 {e:.3} max {e:.3}\n", .{ rows, if (regular) "gate_gemm's single sum" else "MLX's split K", if (sum != null) "serves" else "declines", differ, a.len, et.l2, et.max, eg.l2, eg.max, ep.l2, ep.max });
+        try testing.expectEqual(regular, sum != null);
+        try testing.expectEqual(@as(usize, 0), differ);
+        if (!(ep.l2 <= et.l2 and ep.max <= et.max)) planted_farther = true;
+    }
+    try testing.expect(planted_farther);
 }
 
 fn freePair(xs: [2]A) void {

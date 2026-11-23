@@ -1,7 +1,9 @@
 // MLX steel's gemm_loop (mlx/backend/metal/kernels/steel/gemm/gemm_nax.h, MLX 0.32.3; turboexl3's pg2 copy,
 // kernels/pg2/gemm_loop.metal) verbatim but for its name (f3_gemm_loop) and A's and B's memory types (TA, TB): the A and
 // B tiles in the MMA's type T, each element static_cast to T as it loads (NAXFrag::load), SK 32, the 16 x 32 x 16 MMA,
-// k in MLX's order.
+// k in MLX's order. `kBlocked` (MLX_SERVE_DSV41_PF_COMP_BF16): each BK block's products summed into a tile of its own
+// and that block's sum added to the output's (a blocked sum: about as close to float64 as MLX's split K, where one
+// running sum over all of K drifts further); off, MLX's single running sum.
 template <
     typename T,
     typename TA,
@@ -15,7 +17,8 @@ template <
     bool kAlignedM,
     bool kAlignedN,
     bool kAlignedK,
-    typename AccumType = float>
+    typename AccumType = float,
+    bool kBlocked = false>
 auto f3_gemm_loop(
     const device TA* A,
     const device TB* B,
@@ -37,6 +40,7 @@ auto f3_gemm_loop(
 
   NAXTile<AccumType, TM, TN> Dtile;
   Dtile.clear();
+  NAXTile<AccumType, TM, TN> Ctile;
 
   const bool has_output = sgp_sm > 0 && sgp_sn > 0;
 
@@ -48,6 +52,9 @@ auto f3_gemm_loop(
     if constexpr (!kAlignedM || !kAlignedN) {
       if (!has_output)
         continue;
+    }
+    if constexpr (kBlocked) {
+      Ctile.clear();
     }
 
     STEEL_PRAGMA_NO_UNROLL
@@ -77,14 +84,32 @@ auto f3_gemm_loop(
         Btile.load_safe(B + B_offset, ldb, short2(cmax, rmax));
       }
 
-      tile_matmad_nax(
-          Dtile,
-          Atile,
-          metal::bool_constant<transpose_a>{},
-          Btile,
-          metal::bool_constant<transpose_b>{});
+      if constexpr (kBlocked) {
+        tile_matmad_nax(
+            Ctile,
+            Atile,
+            metal::bool_constant<transpose_a>{},
+            Btile,
+            metal::bool_constant<transpose_b>{});
+      } else {
+        tile_matmad_nax(
+            Dtile,
+            Atile,
+            metal::bool_constant<transpose_a>{},
+            Btile,
+            metal::bool_constant<transpose_b>{});
+      }
 
       (void)compiler_barrier;
+    }
+    if constexpr (kBlocked) {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < NAXTile<AccumType, TM, TN>::kNumFrags; ++i) {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < NAXTile<AccumType, TM, TN>::kElemsPerFrag; ++j) {
+          Dtile.val_frags[i][j] += Ctile.val_frags[i][j];
+        }
+      }
     }
 
     A += transpose_a ? (BK * lda) : BK;
