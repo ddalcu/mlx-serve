@@ -2799,6 +2799,7 @@ pub fn ropeTailOnly(sc: *Scope, m: *const Dsv41Model, x: A, periods: A, offset: 
     const L = dim(x, 0);
     const H = dim(x, 1);
     const rd: usize = @intCast(m.cfg.dsv4_rope_head_dim);
+    if (env.on(.MLX_SERVE_DSV41_PF_ROPE_PAIRS) and rd % 2 == 0 and rd > 0) return ropeTailPairs(sc, m, x, periods, offset, L, H, rd);
     const n = L * H * rd;
     const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{1.0}, &[_]c_int{1}, 1, .float32));
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -2819,6 +2820,35 @@ pub fn ropeTailOnly(sc: *Scope, m: *const Dsv41Model, x: A, periods: A, offset: 
     var o = mlx.mlx_array_new();
     return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
 }
+/// `MLX_SERVE_DSV41_PF_ROPE_PAIRS`: `ropeTailOnly` a thread a (row, pair) over the row's heads
+/// (kernels/rope_tail_pairs.metal): each pair's angle, cosine and sine once a row, the stock kernel's words.
+fn ropeTailPairs(sc: *Scope, m: *const Dsv41Model, x: A, periods: A, offset: A, L: usize, H: usize, rd: usize) !A {
+    _ = m;
+    const n = L * rd / 2;
+    const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{1.0}, &[_]c_int{1}, 1, .float32));
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const dt = mlx.mlx_array_dtype(x);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(H), ci(rd) }, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(n), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @intCast(@min(n, 256)), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RD", ci(rd)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HH", ci(H)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OT", dt));
+    const iv = mlx.mlx_vector_array_new_data(&[_]A{ x, periods, offset, scal }, 4);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    if (rope_pairs_k == null) rope_pairs_k = try buildKernel("dsv41_rope_tail_pairs", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_pairs_source, "");
+    if (!rope_pairs_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_ROPE_PAIRS engaged (rows {d}, heads {d})\n", .{ L, H });
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, rope_pairs_k.?, iv, cfg, sc.s));
+    var o = mlx.mlx_array_new();
+    return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+}
+var rope_pairs_k: ?mlx.mlx_fast_metal_kernel = null;
+var rope_pairs_logged = std.atomic.Value(bool).init(false);
+
 pub fn ropeFor(m: *const Dsv41Model, li: usize) *const Rope {
     return if (m.ratio(li) > 0) &m.rope_yarn else &m.rope_plain;
 }

@@ -2432,6 +2432,28 @@ const MarkovFinal = struct {
 
 // ── the query tail: rope_tail's roped channels alone, [L, H, RD] ──
 
+/// PF_ROPE_PAIRS (kernels/rope_tail_pairs.metal): rope_tail_only's words, a thread a (row, pair) over the heads.
+const RopeTailPairs = struct {
+    pub const Params = RopeTailOnly.Params;
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        const n = s.rows * RD / 2;
+        if (n == 0 or s.n == 0 or s.k < RD or s.k % 2 != 0) return null;
+        var g = metal.Geometry{ .grid = .{ ci(n), 1, 1 }, .tg = .{ ci(@min(n, 256)), 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(s.n), RD }, act);
+        g.int("RD", RD);
+        g.int("HH", s.n);
+        g.dtype("T", act);
+        g.dtype("OT", act);
+        return g;
+    }
+    pub const fill = RopeTailOnly.fill;
+    pub const count = RopeTailOnly.count;
+    pub const compute = RopeTailOnly.compute;
+    pub const check = RopeTailOnly.check;
+    pub const replaced = RopeTailOnly.replaced;
+};
+
 const RopeTailOnly = struct {
     /// `RopeTail`'s (its `fill` and `pre` read them).
     pub const Params = struct { scal: f64 = 1, off: i32 = 3001, sign: f64 = 1 };
@@ -4628,6 +4650,7 @@ const mix_norm_l = launch("dsv41_hc_mix_norm", &.{ "x", "fn", "scale", "base", "
 const mix8_l = metal.Launch{ .name = "dsv41_hc_mix", .inputs = &.{ "x", "fn", "scale", "base", "eps" }, .outputs = &.{"z"}, .source = v41.HC_MIX_SOURCE, .header = "", .tg_bytes = 4 * (8 * 6 + 8) * 32, .adapts = true, .min_gen = 17 };
 const mix_norm8_l = metal.Launch{ .name = "dsv41_hc_mix_norm", .inputs = &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, .outputs = &.{ "z", "h_out", "h2" }, .source = hcf.mix_norm_source, .header = "", .tg_bytes = 4 * (8 * 6 + 8) * 32, .adapts = true, .min_gen = 17 };
 const rope_only_l = launch("dsv41_rope_tail_only", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_only_source, "", 0, 1024, false);
+const rope_pairs_l = launch("dsv41_rope_tail_pairs", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_pairs_source, "", 0, 1024, false);
 const kv_l = launch("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, v41.KV_ROW_SOURCE, v41.FP8_HEADER, 4 * (32 + 1024), 1024, false);
 const engram_l = launch("dsv41_engram", &.{ "x", "kv", "qk", "cst" }, &.{"out"}, v41.ENGRAM_SOURCE, "", 4 * (3 * 32 + 1), 928, false);
 const dec_l = launch("dsv41_attn_decode", attn_ins ++ &[_][*:0]const u8{"periods"}, &.{"out"}, v41.ATTN_DEC_SOURCE, v41.UNROPE_HEADER, 4 * (AttnDec.NSG * HD + 2 * AttnDec.NSG), 768, false);
@@ -5276,6 +5299,15 @@ fn registerStreamed(set: *kc.Set) !void {
     });
     try kit.add(set, RopeTailOnly, &rope_only_l, .{}, .{
         .name = "dsv41 rope_tail_only (the query tail)",
+        .accum = .none,
+        .depth = depthOne,
+        .out = .bf16,
+        .replaces = "rope_tail's roped channels",
+        .nan = quant_nan,
+        .served = &.{ .{ .rows = 1, .n = HEADS, .k = HD }, .{ .rows = REGION, .n = HEADS, .k = HD } },
+    });
+    try kit.add(set, RopeTailPairs, &rope_pairs_l, .{}, .{
+        .name = "dsv41 rope_tail_pairs (PF_ROPE_PAIRS: the query tail a pair a thread over the heads)",
         .accum = .none,
         .depth = depthOne,
         .out = .bf16,
