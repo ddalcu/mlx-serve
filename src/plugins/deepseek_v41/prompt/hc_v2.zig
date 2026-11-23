@@ -411,14 +411,14 @@ test "hc_v2 bench: the combining tails at a prompt width over a served routing, 
     const words = std.mem.bytesAsSlice(u32, bytes[0 .. bytes.len / 4 * 4]);
     const S = slicesFor(L);
     // One launch's time: a chain of `n` launches, each reading the one before's x2 as its stream, evaluated at once;
-    // the chain of 9 less the chain of 1, over 8, best of 6.
+    // the chain of 9 less the chain of 1, over 8, best of 4.
     const Chain = struct {
         fn run(p: Pro, in0: []const A, rows_: usize, S_: usize, n: usize, tok: bool) !f64 {
             const g = std.testing.allocator;
             const io2 = std.Io.Threaded.global_single_threaded.io();
             const iou = @import("../../../sdk/util/io_util.zig");
             var best: f64 = std.math.inf(f64);
-            for (0..6) |_| {
+            for (0..4) |_| {
                 var it = dsv41.Scope.init(g, mlx.gpuStream());
                 defer it.deinit();
                 var in: [11]A = undefined;
