@@ -144,7 +144,7 @@ const a_unroll: usize = 2;
 /// either way (each column's lanes, steps and simd sum do not depend on the plan), so the bytes are too.
 fn aCols(rows: usize) usize {
     if (cols_test) |t| return t[rows];
-    if (rows == 5 and env.on(.MLX_SERVE_DSV41_FFN_IN_R5_COLS1)) {
+    if (rows == 5 and env.onUnlessZero(.MLX_SERVE_DSV41_FFN_IN_R5_COLS1)) {
         if (!r5_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info("[dsv41] MLX_SERVE_DSV41_FFN_IN_R5_COLS1 engaged: ffn_in launch 1 at 5 rows on one column a simdgroup\n", .{});
         return 1;
     }
