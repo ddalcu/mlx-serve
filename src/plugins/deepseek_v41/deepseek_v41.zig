@@ -1303,6 +1303,23 @@ pub fn draftPromptWanted() bool {
 
 /// The most prompt ids a request adds to a draft vocabulary (its most frequent; billed at this bound).
 pub const draft_prompt_max: usize = 16384;
+/// A request's prompt ids come in whole buckets of this many (the rest the lowest ids outside the vocabulary): the fused
+/// Markov chain compiles one kernel set per vocabulary size (`markov.warm`, at load for the first `draft_prompt_warm`
+/// buckets), and takes a size that is a multiple of 4 only.
+pub const draft_prompt_bucket: usize = 512;
+pub const draft_prompt_warm: usize = 2;
+
+/// `ids` (distinct, under `vocab`) grown to a multiple of `quantum` ids, the lowest ids outside them first (at most
+/// `vocab` in all); `taken` (vocab long) marks `ids` and is updated.
+fn padIds(gpa: std.mem.Allocator, ids: *std.ArrayList(i32), taken: []bool, quantum: usize) !void {
+    const want = @min(taken.len, std.mem.alignForward(usize, ids.items.len, quantum));
+    var v: usize = 0;
+    while (ids.items.len < want and v < taken.len) : (v += 1) {
+        if (taken[v]) continue;
+        taken[v] = true;
+        try ids.append(gpa, @intCast(v));
+    }
+}
 
 /// `MLX_SERVE_DSV41_DRAFT_VOCAB`: `st`'s draft vocabulary for a request whose prompt is `prompt`, the file's ids then
 /// the prompt's other ids (its `draft_prompt_max` most frequent), made before the request's first round; a draft queued
@@ -1341,8 +1358,17 @@ pub fn draftPromptVocab(m: *Dsv41Model, st: *State, prompt: []const u32) !void {
         };
         std.mem.sort(i32, extra.items, ByCount{ .c = counts }, ByCount.more);
         extra.shrinkRetainingCapacity(draft_prompt_max);
-        std.mem.sort(i32, extra.items, {}, std.sort.asc(i32));
     }
+    // Whole buckets (`draft_prompt_bucket`), so the fused chain takes the size and has compiled it.
+    {
+        const taken = try gpa.alloc(bool, V);
+        defer gpa.free(taken);
+        @memset(taken, false);
+        for (in_set) |v| taken[@intCast(v)] = true;
+        for (extra.items) |v| taken[@intCast(v)] = true;
+        try padIds(gpa, &extra, taken, draft_prompt_bucket);
+    }
+    std.mem.sort(i32, extra.items, {}, std.sort.asc(i32));
     const e = extra.items.len;
     const k = dv.k + e;
     const list = try gpa.alloc(i32, k);
@@ -1377,6 +1403,21 @@ pub fn draftPromptVocab(m: *Dsv41Model, st: *State, prompt: []const u32) !void {
     if (!draft_prompt_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_DRAFT_VOCAB prompt ids engaged: a request's {d} prompt ids outside the file join the drafts' vocabulary ({d} ids)\n", .{ e, k });
 }
 var draft_prompt_logged = std.atomic.Value(bool).init(false);
+
+/// The fused Markov chain's kernels for a request's draft vocabulary sizes (the file's ids and its first
+/// `draft_prompt_warm` buckets of prompt ids), built at load so no request's first draft compiles them.
+pub fn warmDraftVocab(m: *Dsv41Model, sampled: bool) !void {
+    const ds = &(m.dspark orelse return);
+    const dv = &(ds.draft orelse return);
+    if (dv.k == 0 or !draftPromptWanted()) return;
+    for (1..draft_prompt_warm + 1) |b| {
+        const k = @min(m.vocab, dv.k + b * draft_prompt_bucket);
+        var mh = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mh);
+        try mlx.check(mlx.mlx_zeros(&mh, &[_]c_int{ ci(k), ci(dim(dv.markov_head, 1)) }, 2, mlx.mlx_array_dtype(dv.markov_head), m.s));
+        try markov.warm(m.s, dv.markov_embed, mh, ds.conf, m.act, m.ds_block, m.cfg.hidden_size, true, sampled);
+    }
+}
 
 /// The draft head's f32 logits over a draft's vocabulary (`draftSetOf`) from the normed rows `x`: the file's ids
 /// through `ds.headFor`, a request's prompt ids after them through their rows of the trunk's head.
@@ -1447,8 +1488,18 @@ fn draftHeadFor(m: *Dsv41Model, w: *Weights, head4: ?Lin, vocab_path: ?[]const u
         return e;
     };
     defer m.gpa.free(text);
-    const ids = try parseDraftVocab(m.gpa, text, V);
-    defer m.gpa.free(ids);
+    var ids_list: std.ArrayList(i32) = .fromOwnedSlice(try parseDraftVocab(m.gpa, text, V));
+    defer ids_list.deinit(m.gpa);
+    // A multiple of 4 ids (the lowest outside the file), the sizes the fused Markov chain takes.
+    if (ids_list.items.len % 4 != 0 and ids_list.items.len < V) {
+        const taken = try m.gpa.alloc(bool, V);
+        defer m.gpa.free(taken);
+        @memset(taken, false);
+        for (ids_list.items) |v| taken[@intCast(v)] = true;
+        try padIds(m.gpa, &ids_list, taken, 4);
+        std.mem.sort(i32, ids_list.items, {}, std.sort.asc(i32));
+    }
+    const ids = ids_list.items;
     const base = head4 orelse m.head;
     const why: ?[]const u8 = if (ids.len == 0 or ids.len >= V) "no ids, or every id" else if (base.ext != null or base.w.ctx == null) "the head is an outside quant plugin's" else null;
     if (why) |r| {
@@ -13879,4 +13930,20 @@ test "dsv41 draft vocabulary: the env path, else the pack's draft-vocab.txt wher
         defer other.restore();
         try std.testing.expectEqualStrings("/elsewhere/ids.txt", draftVocabPath(&buf, dir).?);
     }
+}
+
+test "dsv41 draft vocabulary: ids grow to whole buckets with the lowest ids outside them, never past the vocabulary" {
+    const a = std.testing.allocator;
+    var ids: std.ArrayList(i32) = .empty;
+    defer ids.deinit(a);
+    try ids.appendSlice(a, &.{ 9, 2, 5 });
+    var taken: [12]bool = @splat(false);
+    for (ids.items) |v| taken[@intCast(v)] = true;
+    try padIds(a, &ids, &taken, 4);
+    try std.testing.expectEqualSlices(i32, &.{ 9, 2, 5, 0 }, ids.items);
+    try padIds(a, &ids, &taken, 8);
+    try std.testing.expectEqualSlices(i32, &.{ 9, 2, 5, 0, 1, 3, 4, 6 }, ids.items);
+    // A bucket past the vocabulary stops at every id.
+    try padIds(a, &ids, &taken, 64);
+    try std.testing.expectEqual(@as(usize, 12), ids.items.len);
 }

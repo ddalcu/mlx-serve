@@ -1382,15 +1382,18 @@ test "deepseek_v41 served: a draft-only head (DRAFT_HEAD4, DRAFT_VOCAB) changes 
         }
     }
     // A request's prompt ids join its state's vocabulary: 7 and 31 (outside the file) become draftable; 5 (inside)
-    // adds nothing; an id the prompt repeats counts once. Off (MLX_SERVE_DSV41_DRAFT_VOCAB_PROMPT=0): the file's alone.
+    // adds nothing; an id the prompt repeats counts once; the bucket fills with the lowest ids outside (1 and 4 here,
+    // to the fixture's 96 ids). Off (MLX_SERVE_DSV41_DRAFT_VOCAB_PROMPT=0): the file's alone.
     try dsv41.draftPromptVocab(m, &sts[0], &.{ 7, 5, 31, 7, 5 });
     const ex = sts[0].draft_extra.?;
-    try testing.expectEqual(@as(usize, 2), ex.e);
-    try testing.expectEqual(@as(usize, 66), ex.k);
+    try testing.expectEqual(@as(usize, 32), ex.e);
+    try testing.expectEqual(@as(usize, 96), ex.k);
+    const xids = (mlx.mlx_array_data_int32(ex.ids) orelse return error.NoData)[0..ex.k];
+    for ([_]i32{ 7, 31 }) |id| try testing.expect(std.mem.indexOfScalar(i32, xids, id) != null);
     for ([_]u32{ 7, 31 }) |t1| {
         var d = try dsv41.dsparkDraft(m, a, &sts[0], t1);
         defer d.deinit(a);
-        for (d.ids[1..]) |id| try testing.expect(id % 3 != 1 or id == 7 or id == 31);
+        for (d.ids[1..]) |id| try testing.expect(id < 96);
     }
     {
         const off = env.override(.MLX_SERVE_DSV41_DRAFT_VOCAB_PROMPT, "0");

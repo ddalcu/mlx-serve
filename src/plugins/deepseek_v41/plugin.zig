@@ -306,6 +306,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     if (m.mdl.dspark) |*w| {
         const mk = w.markovFor();
         try @import("spec/markov.zig").warm(m.mdl.s, mk.emb, mk.mh, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true, dsv41.draftSampleOn());
+        try dsv41.warmDraftVocab(m.mdl, dsv41.draftSampleOn());
     }
     try dsv41.syncWarm(m.mdl);
     m.bank = null;
