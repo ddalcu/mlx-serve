@@ -1415,3 +1415,63 @@ test "inkling2 kernels: the gated kernel is the attention read times its gate, r
         try expectClose(try kernels.gated(&g, x, gate, 1), want, 0, "gated rows");
     }
 }
+
+/// The command-buffer pair a fake host holds.
+const Limits = struct {
+    var op_split: i32 = 50;
+    var mb_split: i32 = 50;
+    fn set(_: ?*anyopaque, o: i32, m: i32, prev_ops: *i32, prev_mb: *i32) callconv(.c) @import("../../abi/host.zig").Verdict {
+        prev_ops.* = op_split;
+        prev_mb.* = mb_split;
+        if (o > 0) op_split = o;
+        if (m > 0) mb_split = m;
+        return .ok;
+    }
+};
+
+// Bar: a step (one row) runs under the plugin's command-buffer MB split and a prompt under the host's, the op split
+// is never moved, the unload puts the host's pair back, and a load that fails never moves it.
+test "inkling2 load: decode steps lift the command-buffer MB split, prompts and the unload restore the host's" {
+    const a = testing.allocator;
+    var fake: @import("../../sdk/testing/fake_host.zig").FakeHost = undefined;
+    fake.init(.{});
+    fake.gpu_table.command_buffer_limits = Limits.set;
+    Limits.op_split = 50;
+    Limits.mb_split = 50;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const fx = try plugin.conformanceFixture(arena.allocator());
+
+    var pack = try conformance.Loaded.openWith(testing.io, arena.allocator(), plugin.plugin.name, &plugin.table, fx, .{ .host = fake.host() });
+    try testing.expectEqual(@as(i32, 50), Limits.mb_split);
+    var cache = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
+    defer cache.deinit();
+    a.free(try step(a, &pack, &cache, prompt[0..8], 0, .last_row));
+    try testing.expectEqual(@as(i32, 50), Limits.mb_split);
+    a.free(try step(a, &pack, &cache, prompt[8..9], 8, .last_row));
+    try testing.expectEqual(@as(i32, plugin.command_buffer_mb), Limits.mb_split);
+    a.free(try step(a, &pack, &cache, prompt[9..13], 9, .last_row));
+    try testing.expectEqual(@as(i32, 50), Limits.mb_split);
+    a.free(try step(a, &pack, &cache, prompt[13..14], 13, .last_row));
+    try testing.expectEqual(@as(i32, plugin.command_buffer_mb), Limits.mb_split);
+    pack.close();
+    try testing.expectEqual(@as(i32, 50), Limits.mb_split);
+    try testing.expectEqual(@as(i32, 50), Limits.op_split);
+
+    // The embedding renamed in the header: the parse passes and the plugin's own load fails.
+    const files = try arena.allocator().dupe(fixture.File, fx.files);
+    for (files) |*f| if (std.mem.endsWith(u8, f.name, ".safetensors")) {
+        const bytes = try arena.allocator().dupe(u8, f.bytes);
+        const at = std.mem.indexOf(u8, bytes, "embed_tokens.weight") orelse continue;
+        bytes[at] = 'X';
+        f.bytes = bytes;
+    };
+    Limits.mb_split = 77;
+    if (conformance.Loaded.openWith(testing.io, arena.allocator(), plugin.plugin.name, &plugin.table, .{ .files = files }, .{ .host = fake.host() })) |loaded| {
+        var p = loaded;
+        p.close();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try testing.expectEqual(@as(i32, 77), Limits.mb_split);
+    try testing.expectEqual(@as(i32, 50), Limits.op_split);
+}

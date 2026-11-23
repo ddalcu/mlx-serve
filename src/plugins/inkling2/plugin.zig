@@ -20,6 +20,7 @@ const vision = @import("vision.zig");
 const media = @import("media.zig");
 const draft = @import("draft.zig");
 const kv = @import("../../sdk/bases/kv.zig");
+const sdk_host = @import("../../sdk/host.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -529,6 +530,8 @@ pub const Loaded = struct {
     opened: ?*Opened = null,
     spec: Spec = .{ .visits = &.{}, .keep = 0 },
     tap_visits: [config.max_taps]u32 = @splat(0),
+    /// The host's command-buffer split, moved per forward (`BufferSplit`).
+    split: BufferSplit = .{},
 
     fn release(m: *Loaded) void {
         if (m.tower) |*t| t.deinit();
@@ -546,6 +549,7 @@ pub const Loaded = struct {
 
 fn unload(mp: *anyopaque) callconv(.c) void {
     const m: *Loaded = @ptrCast(@alignCast(mp));
+    m.split.follow(false);
     m.release();
     gpa.destroy(m);
 }
@@ -553,6 +557,7 @@ fn unload(mp: *anyopaque) callconv(.c) void {
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
     const m: *Loaded = @ptrCast(@alignCast(mp));
     if (f.slots.len == 1) m.spec.select(f.slots.slice()[0]);
+    m.split.follow(f.rows == 1 or f.mode == .verify);
     return run_mod.tableForward(Model, &m.base, f, out);
 }
 
@@ -834,9 +839,43 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     };
     // The parse's quant block is freed with it; the forward reads none of it.
     m.base.weights.body.cfg.block_json = "{}";
+    m.split = BufferSplit.of(ctx.host);
 
     return m;
 }
+
+/// MLX's command-buffer MB split for a decode step or a verify. An expert launch binds its whole bank, and MLX commits
+/// once the distinct buffers a command buffer binds pass the split: at the device's 50 nearly every bank launch
+/// commits, and a step's encode waits on MLX's cap of in-flight buffers. A prompt forward keeps the host's split (a
+/// wider one slows a chunk), and the op split stays the device's.
+pub const command_buffer_mb: i32 = 200;
+
+/// The host's MB split as the load found it, which the plugin moves per forward (`follow`) and puts back at unload;
+/// nothing to do on a host without the member.
+const BufferSplit = struct {
+    gpu: ?*const sdk_host.abi.HostGpu = null,
+    prev_mb: i32 = 0,
+    lifted: bool = false,
+
+    fn of(raw: ?*const anyopaque) BufferSplit {
+        const h = sdk_host.Host.of(raw) catch return .{};
+        const set = h.commandBufferLimits() orelse return .{};
+        var prev_ops: i32 = 0;
+        var prev_mb: i32 = 0;
+        // Below 1 keeps a value: this reads the pair.
+        if (!set(h.gpu().ctx, 0, 0, &prev_ops, &prev_mb).isOk()) return .{};
+        return .{ .gpu = h.gpu(), .prev_mb = prev_mb };
+    }
+
+    /// The lifted split for a step (one row a slot, or a verify), the host's for a prompt.
+    fn follow(sp: *BufferSplit, step: bool) void {
+        const g = sp.gpu orelse return;
+        if (step == sp.lifted) return;
+        var ops_now: i32 = 0;
+        var mb_now: i32 = 0;
+        if (g.command_buffer_limits(g.ctx, 0, if (step) command_buffer_mb else sp.prev_mb, &ops_now, &mb_now).isOk()) sp.lifted = step;
+    }
+};
 
 /// Whether the bundled drafter loads: with the kernels on (only they serve a verify) and on an Apple9+ GPU (M3 on) or
 /// an unknown one. On an M1 a few-row verify costs so much more than a step that drafted decode ran under serial.
