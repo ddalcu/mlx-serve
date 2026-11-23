@@ -875,7 +875,7 @@ fn stageOut(gpa: std.mem.Allocator, m: *dsv41.Dsv41Model, st: *dsv41.State, li: 
     var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
     var p = pre;
-    return dsv41.hostF32(try dsv41.stageBlock(&sc, m, &.{st}, li, x, &p, m.ds_block));
+    return dsv41.hostF32(try dsv41.stageBlock(&sc, m, &.{st}, li, x, &p, m.ds_block, null));
 }
 
 test "dsv41 draft fused: a stage's attn_out and FFN on the fused decode kernels (MLX_SERVE_DSV41_DRAFT_FUSED) give the op chain's stream; a stream with its rows swapped fails" {

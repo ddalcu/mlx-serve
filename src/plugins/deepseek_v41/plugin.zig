@@ -304,6 +304,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     errdefer m.mdl.deinit();
     // The fused Markov chain's kernels compiled now, not in the first draft.
     if (m.mdl.dspark) |*w| try @import("spec/markov.zig").warm(m.mdl.s, w.markov_embed, w.markov_head, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true);
+    try dsv41.syncWarm(m.mdl);
     m.bank = null;
     m.bank_streams = false;
     m.owner = 0;

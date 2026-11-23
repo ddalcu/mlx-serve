@@ -473,6 +473,12 @@ pub const Dsv41Model = struct {
     vocab: usize,
     n_mtp: usize = 0,
     ds_block: usize = 0,
+    /// `MLX_SERVE_DSV41_SPEC_SYNC`: the next round's draft, queued behind the last verify (`syncRound`), until
+    /// `dsparkDraft` collects it.
+    ds_next: ?DraftAhead = null,
+    /// Host ns this round spent building the next round's draft (`syncRound`) less what the last round spent on this
+    /// round's (`dsparkDraft`'s collect): `takeRoundShiftMs` gives a round the time its own draft and verify took.
+    ds_shift_ns: i64 = 0,
     /// Rows per attention span (tests narrow it to drive several spans).
     span: usize = SPAN,
     /// Rows per MoE call: spans whose rows fit are routed and run together.
@@ -597,9 +603,20 @@ pub const Dsv41Model = struct {
         self.ahead = null;
     }
 
+    /// A queued draft (`ds_next`) no round collected: waited for, so nothing queued after it runs beside it, and let go.
+    fn dropNext(self: *Dsv41Model) void {
+        const a = &(self.ds_next orelse return);
+        evalAll(&a.ev) catch {};
+        // its host time goes to the round that drops it (`takeRoundShiftMs`)
+        self.ds_shift_ns -= @intCast(a.launch_ns);
+        a.deinit();
+        self.ds_next = null;
+    }
+
     pub fn deinit(self: *Dsv41Model) void {
         // scratch_x1.zig: the prompt's regions let go with the model.
         sx1.releaseAll();
+        self.dropNext();
         if (self.dec_state) |*st| st.deinit();
         self.dropAhead();
         self.gpa.free(self.prompt);
@@ -2668,6 +2685,13 @@ pub const Ring = struct {
         var idx: [512]i32 = undefined;
         for (lo..hi, 0..) |p, k| idx[k] = @intCast(p % self.cap);
         return sc.take(self.buf, try sc.ints(idx[0 .. hi - lo], &.{ci(hi - lo)}), 0);
+    }
+
+    /// `read(hi - len, hi)` where `hi` is a GPU int32 scalar (at least `len`): the same slots, the same take.
+    fn readAt(self: *const Ring, sc: *Scope, hi: A, len: usize) !A {
+        std.debug.assert(len <= self.cap);
+        const pos = try sc.add(try sc.sub(hi, try sc.i(@intCast(len))), try sc.arange(0, len));
+        return sc.take(self.buf, try sc.op2(mlx.mlx_remainder, pos, try sc.i(@intCast(self.cap))), 0);
     }
 };
 
@@ -5878,6 +5902,7 @@ pub fn spliceImages(sc: *Scope, m: *const Dsv41Model, emb: A, id_arr: A, ids: []
 }
 
 fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want: Want, vision: ?VisionRows) !A {
+    m.dropNext();
     const c = &m.cfg;
     const L = switch (ids) {
         .host => |h| h.len,
@@ -8003,10 +8028,16 @@ fn batchedFused(sc: *Scope, m: *Dsv41Model, states: []const *State, sp: *const S
 /// Each stage's window rows for committed positions [p0, p0 + n): the main
 /// stream `main_norm(main_proj(hidden))` through the stage's own kv path.
 fn commitMain(sc: *Scope, m: *Dsv41Model, st: *State, mh: A, p0: usize) !void {
-    const ds = &(m.dspark orelse return);
+    if (m.dspark == null) return;
     const n = dim(mh, 0);
     if (st.mh.ctx != null) _ = mlx.mlx_array_free(st.mh);
     st.mh = sc.out(try sc.slice(mh, 0, n - 1, n));
+    try commitRows(sc, m, st, mh, p0);
+}
+
+/// `commitMain`'s window rows alone: `st.mh` is left as it is.
+fn commitRows(sc: *Scope, m: *Dsv41Model, st: *State, mh: A, p0: usize) !void {
+    const ds = &(m.dspark orelse return);
     const main_x = try sc.rms(try ds.main_proj.apply(sc, mh), ds.main_norm, m.cfg.rms_norm_eps);
     for (st.ds, 0..) |*ring, si| {
         const st_ly = &m.layers[m.n_layers + si];
@@ -8018,15 +8049,15 @@ fn commitMain(sc: *Scope, m: *Dsv41Model, st: *State, mh: A, p0: usize) !void {
 /// A stage's attention heads for one state's draft rows at [p0, p0 + B) from their projections `rows` (made over every
 /// state's rows), inverse-roped for `attnOutRoped`: every row sees the stage's window of committed main rows and every
 /// draft row.
-fn dsparkHeads(sc: *Scope, m: *Dsv41Model, ly: *const Layer, rows: Proj, main_keys: A, p0: usize) !A {
-    const pj = try ropeProj(sc, m, ly, m.rope_plain.fwd, rows, try sc.i(ci(p0)));
-    return dsparkHeadsAt(sc, m, ly, pj.q, pj.kv, main_keys, p0);
+fn dsparkHeads(sc: *Scope, m: *Dsv41Model, ly: *const Layer, rows: Proj, main_keys: A, pos: A) !A {
+    const pj = try ropeProj(sc, m, ly, m.rope_plain.fwd, rows, pos);
+    return dsparkHeadsAt(sc, m, ly, pj.q, pj.kv, main_keys, pos);
 }
 
-/// `dsparkHeads` from the draft rows' roped heads `q` and their window rows `kv` (normed, roped, round-tripped).
-fn dsparkHeadsAt(sc: *Scope, m: *Dsv41Model, ly: *const Layer, q: A, kv: A, main_keys: A, p0: usize) !A {
+/// `dsparkHeads` from the draft rows' roped heads `q` and their window rows `kv` (normed, roped, round-tripped); `pos`
+/// the first row's position (an int32 scalar).
+fn dsparkHeadsAt(sc: *Scope, m: *Dsv41Model, ly: *const Layer, q: A, kv: A, main_keys: A, pos: A) !A {
     const hd = m.cfg.head_dim;
-    const pos = try sc.i(ci(p0));
     const keys = try sc.astype(try sc.concat(&.{ main_keys, kv }, 0), .float32);
     const qf = try sc.astype(q, .float32);
     const logits = try sc.mul(try sc.matmul(qf, try sc.t2(keys)), try sc.f(1.0 / @sqrt(@as(f32, @floatFromInt(hd)))));
@@ -8046,6 +8077,19 @@ pub const DsparkPhases = dsv4.DsparkPhases;
 /// bigram bias chained position by position on the GPU (greedy), and the
 /// confidence head's logit per position; it truncates the block only when a threshold is set.
 pub fn dsparkDraft(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32) !DsparkDraft {
+    // `MLX_SERVE_DSV41_SPEC_SYNC`: the draft the last round queued, when it is this one.
+    if (m.ds_next) |*a| {
+        if (a.st == st and draftAheadFits(m, st, a, t1)) {
+            defer {
+                a.deinit();
+                m.ds_next = null;
+            }
+            _ = sync_collects.fetchAdd(1, .monotonic);
+            m.ds_shift_ns -= @intCast(a.launch_ns);
+            return dsparkDraftCollect(m, gpa, a);
+        }
+        m.dropNext();
+    }
     const t0 = monoUs();
     defer m.ds_draft_ns = @intCast((monoUs() - t0) * 1000);
     return draftRows(m, gpa, st, t1, false);
@@ -8062,6 +8106,8 @@ pub const DraftAhead = struct {
     want_conf: bool,
     ev: [3]A = .{ none, none, none },
     launch_ns: u64 = 0,
+    /// The state it drafts on (`ds_next`'s; null: any).
+    st: ?*const State = null,
     pub fn deinit(self: *DraftAhead) void {
         for (&self.ev) |*x| if (x.ctx != null) {
             _ = mlx.mlx_array_free(x.*);
@@ -8086,7 +8132,7 @@ pub fn dsparkDraftLaunch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1:
     const t0 = monoUs();
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
-    const g = try draftGraph(&sc, m, st, t1, false);
+    const g = try draftGraph(&sc, m, st, t1, false, null);
     var out: DraftAhead = .{ .t1 = t1, .n = st.n, .gen = m.state_gen, .want_conf = g.want_conf };
     errdefer out.deinit();
     for (&out.ev, g.ev) |*slot, x| hold(slot, x);
@@ -8110,7 +8156,7 @@ pub fn dsparkDraftCollect(m: *Dsv41Model, gpa: std.mem.Allocator, a: *DraftAhead
 fn draftRows(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, keep_logits: bool) !DsparkDraft {
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
-    const g = try draftGraph(&sc, m, st, t1, keep_logits);
+    const g = try draftGraph(&sc, m, st, t1, keep_logits, null);
     var ev = g.ev;
     try evalAll(&ev);
     return draftRead(&sc, m, gpa, t1, &ev, g.want_conf, keep_logits);
@@ -8118,7 +8164,11 @@ fn draftRows(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, keep_l
 /// `draftRows`' graph (its arrays `sc`'s): the ids, the confidences (the ids again without them) and the rows `keep_logits`
 /// reads (the ids again otherwise).
 const DraftGraph = struct { ev: [3]A, want_conf: bool };
-fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool) !DraftGraph {
+/// `MLX_SERVE_DSV41_SPEC_SYNC`: a draft built before the host knows its round's outcome. `t1` (`[1]` int32) and the
+/// position `n` (an int32 scalar) are the verify's GPU arrays; `window` is the host's `min(sliding_window, n)`, the same
+/// for every outcome.
+pub const GpuAt = struct { t1: A, n: A, window: usize };
+fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool, at: ?GpuAt) !DraftGraph {
     const c = &m.cfg;
     const B = m.ds_block;
     const hc = c.dsv4_hc_mult;
@@ -8128,13 +8178,14 @@ fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool
     for (0..B) |k| ids[k] = @intCast(if (k == 0) t1 else c.dsv4_dspark_noise_token_id);
     var uids: [16]u32 = undefined;
     for (uids[0..B], ids[0..B]) |*u, v| u.* = @intCast(v);
-    const emb = try embedIds(m, sc, uids[0..B], m.act);
+    // A GPU token: the rows by their ids on the GPU, as `embedIds` takes them without the pack's table.
+    const emb = if (at) |g| try m.embed.rows(sc, try sc.concat(&.{ g.t1, try sc.ints(ids[1..B], &.{ci(B - 1)}) }, 0), m.act) else try embedIds(m, sc, uids[0..B], m.act);
     var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(B), ci(hc), ci(d) });
     var pre = try onehotPre(sc, m, B);
-    for (0..m.n_mtp) |si| x = try stageBlock(sc, m, &.{st}, m.n_layers + si, x, &pre, B);
+    for (0..m.n_mtp) |si| x = try stageBlock(sc, m, &.{st}, m.n_layers + si, x, &pre, B, at);
     const hout = try hcCollapse(sc, x, pre);
     const logits = try sc.astype(try m.head.apply(sc, try sc.rms(hout, ds.norm, c.rms_norm_eps)), .float32);
-    var cur = try sc.ints(ids[0..1], &.{1});
+    var cur = if (at) |g| g.t1 else try sc.ints(ids[0..1], &.{1});
     const want_conf = m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
     // The fused chain (`markov.chain`: the op chain's bytes in B + 1 launches), null for a draft it does not take (the op
     // chain below).
@@ -8222,7 +8273,7 @@ pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []cons
     const emb = try embedIds(m, &sc, uids, m.act);
     var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(N * B), ci(hc), ci(d) });
     var pre = try onehotPre(&sc, m, N * B);
-    for (0..m.n_mtp) |si| x = try stageBlock(&sc, m, states, m.n_layers + si, x, &pre, B);
+    for (0..m.n_mtp) |si| x = try stageBlock(&sc, m, states, m.n_layers + si, x, &pre, B, null);
     const flat = try hcCollapse(&sc, x, pre);
     const hout = try sc.reshape(flat, &.{ ci(N), ci(B), ci(d) });
     const logits = try sc.reshape(try sc.astype(try m.head.apply(&sc, try sc.rms(flat, ds.norm, c.rms_norm_eps)), .float32), &.{ ci(N), ci(B), -1 });
@@ -8279,11 +8330,11 @@ pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []cons
 
 /// A DSpark stage over `B` draft rows a state: the mixes, norms and FFN over every row, each state's attention
 /// against its own window of committed main rows.
-pub fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize, x: A, pre: *A, B: usize) !A {
+pub fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize, x: A, pre: *A, B: usize, at: ?GpuAt) !A {
     const ly = &m.layers[li];
     const si = li - m.n_layers;
     const fused = env.onUnlessZero(.MLX_SERVE_DSV41_DRAFT_FUSED);
-    if (fused and states.len == 1) if (try stageFused(sc, m, states[0], li, x, pre)) |y| {
+    if (fused and states.len == 1) if (try stageFused(sc, m, states[0], li, x, pre, at)) |y| {
         logOnce(&draft_fused_logged, "[dsv41] MLX_SERVE_DSV41_DRAFT_FUSED engaged: a DSpark stage on in_proj, wq_b, ffn_in and the fused MoE\n");
         return y;
     };
@@ -8292,10 +8343,14 @@ pub fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize,
     const rows = try qkvRows(sc, m, ly, pa.h);
     var heads: [region_rows]A = undefined;
     for (states, heads[0..states.len], 0..) |st, *o, k| {
+        const mine: Proj = if (states.len == 1) rows else .{ .q = try sc.slice(rows.q, 0, k * B, (k + 1) * B), .kv = try sc.slice(rows.kv, 0, k * B, (k + 1) * B), .qr = rows.qr };
+        if (at) |g| {
+            o.* = try dsparkHeads(sc, m, ly, mine, try st.ds[si].readAt(sc, g.n, g.window), g.n);
+            continue;
+        }
         const window = @min(m.cfg.sliding_window, st.n);
         const keys = try st.ds[si].read(sc, st.n - window, st.n);
-        const mine: Proj = if (states.len == 1) rows else .{ .q = try sc.slice(rows.q, 0, k * B, (k + 1) * B), .kv = try sc.slice(rows.kv, 0, k * B, (k + 1) * B), .qr = rows.qr };
-        o.* = try dsparkHeads(sc, m, ly, mine, keys, st.n);
+        o.* = try dsparkHeads(sc, m, ly, mine, keys, try sc.i(ci(st.n)));
     }
     const r = if (states.len == 1) heads[0] else try sc.concat(heads[0..states.len], 0);
     if (fused) if (try stageFfnFused(sc, m, ly, r, x, &pa.sp)) |f| {
@@ -8320,16 +8375,21 @@ fn logOnce(flag: *std.atomic.Value(bool), comptime msg: []const u8) void {
 /// One state's stage on the fused decode kernels a trunk layer's decode runs (`blockFused`): in_proj (the hc mixes, the
 /// norm, q_kv), wq_b (q_norm, wq_b, the rope, the window row and the hc split) at the draft rows' positions, the stage's
 /// attention, then `stageFfnFused`; null (nothing moved) where a kernel declines the stage.
-fn stageFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A) !?A {
+fn stageFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, at: ?GpuAt) !?A {
     const kp = &(m.dec.in_proj orelse return null);
     const kq = m.dec.wq_b orelse return null;
     const ly = &m.layers[li];
     const L = dim(x, 0);
     const a = try dkern.in_proj.run(sc, kp, m, ly, x, pre.*) orelse return null;
-    const w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, try dkern.wq_b.rowsAt(sc, st.n, L)) orelse return null;
-    const window = @min(m.cfg.sliding_window, st.n);
-    const keys = try st.ds[li - m.n_layers].read(sc, st.n - window, st.n);
-    const f = try stageFfnFused(sc, m, ly, try dsparkHeadsAt(sc, m, ly, w.q, w.kv_row, keys, st.n), x, &w.sa) orelse return null;
+    // `GpuAt`: the rows' positions from the GPU's (the same values `rowsAt` lays out).
+    const rows_pos = if (at) |g| try sc.add(try sc.arange(0, L), g.n) else try dkern.wq_b.rowsAt(sc, st.n, L);
+    const w = try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, rows_pos) orelse return null;
+    const si = li - m.n_layers;
+    const keys = if (at) |g| try st.ds[si].readAt(sc, g.n, g.window) else blk: {
+        const window = @min(m.cfg.sliding_window, st.n);
+        break :blk try st.ds[si].read(sc, st.n - window, st.n);
+    };
+    const f = try stageFfnFused(sc, m, ly, try dsparkHeadsAt(sc, m, ly, w.q, w.kv_row, keys, if (at) |g| g.n else try sc.i(ci(st.n))), x, &w.sa) orelse return null;
     pre.* = f.pre;
     _ = stage_fused_runs.fetchAdd(1, .monotonic);
     return f.x;
@@ -8496,9 +8556,13 @@ fn rollbackVerify(m: *Dsv41Model, st: *State, keep_n: usize) !void {
 /// each pooling compressor's open group is re-cut from the chunk's rows, and
 /// the kept positions' main rows go to the DSpark windows.
 pub fn dsparkFinish(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, pending: *DsparkPending, accepted: usize, next_token: u32) !DsparkRound {
+    return dsparkFinishWith(m, gpa, st, pending, accepted, next_token, false);
+}
+
+fn dsparkFinishWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, pending: *DsparkPending, accepted: usize, next_token: u32, committed: bool) !DsparkRound {
     const keep_n = accepted + 1;
     const t0 = monoUs();
-    try finishVerify(m, gpa, st, keep_n);
+    try finishVerifyWith(m, gpa, st, keep_n, committed);
     const t1 = monoUs();
     const tokens = try gpa.alloc(u32, keep_n);
     @memcpy(tokens, pending.verify[0..keep_n]);
@@ -8515,12 +8579,21 @@ pub fn dsparkFinish(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, pending:
 /// Keep the first `keep_n` positions of `st`'s open verify chunk (`extendBatched` with `verify`, or
 /// `dsparkBeginWith`): the rest rolls back and the kept positions' main rows go to the DSpark windows.
 pub fn finishVerify(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, keep_n: usize) !void {
+    return finishVerifyWith(m, gpa, st, keep_n, false);
+}
+
+/// `finishVerify`; `committed`: the chunk's main rows are in the DSpark windows already (`syncRound` wrote every row),
+/// so only `st.mh` takes the last kept one.
+fn finishVerifyWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, keep_n: usize, committed: bool) !void {
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
     defer st.dropVerify();
     const v = &st.verify.?;
     if (v.n0 + keep_n < st.n) try rollbackVerify(m, st, keep_n);
-    if (v.mh.ctx != null) try commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep_n), v.n0);
+    if (v.mh.ctx == null) return;
+    if (!committed) return commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep_n), v.n0);
+    if (st.mh.ctx != null) _ = mlx.mlx_array_free(st.mh);
+    st.mh = sc.out(try sc.slice(v.mh, 0, keep_n - 1, keep_n));
 }
 
 pub fn dsparkObserve(m: *Dsv41Model, ph: DsparkPhases) void {
@@ -8577,6 +8650,12 @@ test "dsv41 dspark: a greedy round's ids skip the ids the serial sampler masks" 
 pub fn dsparkRoundWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, d: *const DsparkDraft, accepted_cap: usize) !DsparkRound {
     var pending = try dsparkBeginWith(m, gpa, st, t1, d);
     defer pending.deinit();
+    if (syncServes(m, st)) {
+        var r = try syncRound(m, gpa, st, &pending, d, accepted_cap);
+        r.phases.draft_ns = m.ds_draft_ns;
+        dsparkObserve(m, r.phases);
+        return r;
+    }
     const am32 = try greedyRows(pending.vl_g, if (m.exact.argmax) m.suppress else none, m.s);
     defer _ = mlx.mlx_array_free(am32);
     const best = mlx.mlx_array_data_int32(am32) orelse return error.NoData;
@@ -8586,6 +8665,116 @@ pub fn dsparkRoundWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u
     var r = try dsparkFinish(m, gpa, st, &pending, accepted, @intCast(best[accepted]));
     r.phases.draft_ns = m.ds_draft_ns;
     dsparkObserve(m, r.phases);
+    return r;
+}
+
+/// `MLX_SERVE_DSV41_SPEC_SYNC` rounds taken (`syncRound`), for the tests and the engaged check.
+pub var sync_rounds = std.atomic.Value(u64).init(0);
+/// Queued drafts a round collected (`dsparkDraft`).
+pub var sync_collects = std.atomic.Value(u64).init(0);
+var sync_logged = std.atomic.Value(bool).init(false);
+/// Test plant: `syncRound`'s next draft drafts from this many positions further on (0 served).
+var sync_plant: i32 = 0;
+
+/// Whether `st`'s open verify takes `syncRound`: the switch on, the stages loaded, one process (no pair, no tensor
+/// split), a resident bank and embedding (the draft's rows gathered by GPU ids), and a context at least the sliding
+/// window long (the draft's window rows the same count whatever the round keeps).
+fn syncServes(m: *const Dsv41Model, st: *const State) bool {
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_SPEC_SYNC) or !draftAheadOk(m)) return false;
+    if (m.pair != null or m.tp != null or m.streamed != null or m.embed_tab != null) return false;
+    if (m.ds_block < 2 or m.ds_block > 16) return false;
+    const v = st.verify orelse return false;
+    return v.mh.ctx != null and v.n0 + 1 >= m.cfg.sliding_window;
+}
+
+/// `syncRound`'s accept on the GPU: `greedyRows`' masked argmax of every row of `vl` `[b + 1, V]`, the count `acc` of
+/// leading rows whose id is the next draft's (`want`, `b` ids) capped at `cap`, the token after them `next` (`[1]`)
+/// and the position `n` = `acc + n1` (int32 scalars), all lazy.
+fn acceptGraph(sc: *Scope, vl_in: A, suppress: A, want: []const i32, cap: usize, n1: usize) !struct { acc: A, next: A, n: A } {
+    const b = want.len;
+    const vl = if (suppress.ctx != null) try sc.where(suppress, try sc.f(-std.math.inf(f32)), vl_in) else vl_in;
+    const am = try sc.astype(try sc.argmax(vl, -1), .int32); // [b + 1]
+    var acc = try sc.i(0);
+    if (b > 0 and cap > 0) {
+        const miss = try sc.op1(mlx.mlx_logical_not, try sc.op2(mlx.mlx_equal, try sc.slice(am, 0, 0, b), try sc.ints(want, &.{ci(b)})));
+        const first = try sc.reduce(mlx.mlx_min_axis, try sc.where(miss, try sc.arange(0, b), try sc.i(@intCast(b))), 0, false);
+        acc = try sc.op2(mlx.mlx_minimum, first, try sc.i(@intCast(cap)));
+    }
+    return .{ .acc = acc, .next = try sc.take(am, try sc.reshape(acc, &.{1}), 0), .n = try sc.add(acc, try sc.i(@intCast(n1))) };
+}
+
+/// Under `MLX_SERVE_DSV41_SPEC_SYNC`, at load: `syncRound`'s accept and its draft's GPU-position ops (the window read,
+/// the rows' positions, the block's ids) once on small rows of the served dtypes, so the first round compiles none of
+/// them (the drafting backoff would read that compile as the round's cost).
+pub fn syncWarm(m: *Dsv41Model) !void {
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_SPEC_SYNC) or m.dspark == null) return;
+    var sc = Scope.init(m.gpa, m.s);
+    defer sc.deinit();
+    const V = m.vocab;
+    const vl = try sc.zeros(&.{ 3, ci(V) }, .float32);
+    const mask = try sc.zeros(&.{ci(V)}, .bool_);
+    var out: std.ArrayList(A) = .empty;
+    defer out.deinit(m.gpa);
+    for ([_]A{ none, mask }) |sup| {
+        const ag = try acceptGraph(&sc, vl, sup, &.{ 1, 2 }, 2, m.cfg.sliding_window);
+        var ring = try Ring.init(m.cfg.sliding_window + RING_SLACK, m.cfg.head_dim, m.act, m.s);
+        defer ring.deinit();
+        const B = @max(m.ds_block, 2);
+        var noise: [16]i32 = @splat(@intCast(m.cfg.dsv4_dspark_noise_token_id));
+        try out.appendSlice(m.gpa, &.{ ag.acc, ag.next, ag.n, try ring.readAt(&sc, ag.n, m.cfg.sliding_window), try sc.add(try sc.arange(0, B), ag.n), try sc.concat(&.{ ag.next, try sc.ints(noise[0 .. B - 1], &.{ci(B - 1)}) }, 0) });
+        try evalAll(out.items);
+        out.clearRetainingCapacity();
+    }
+}
+
+/// The host ms the last round spent on the next round's draft less what an earlier round spent on this one's
+/// (`ds_shift_ns`), taken: the engine's round time less it is the round's own draft and verify, as without the switch.
+pub fn takeRoundShiftMs(m: *Dsv41Model) f32 {
+    const ns = m.ds_shift_ns;
+    m.ds_shift_ns = 0;
+    return @as(f32, @floatFromInt(ns)) / std.time.ns_per_ms;
+}
+
+/// `MLX_SERVE_DSV41_SPEC_SYNC`'s greedy round over the open verify `pending`: the accept on the GPU (the masked argmax
+/// of every row, the first row whose id is not the next draft's, capped), every verify row's main rows to the DSpark
+/// windows at the chunk's start, and the next round's draft from the GPU's next token and position, all handed to the
+/// GPU before the host reads the count. The host then rolls back what the count drops and keeps the queued draft
+/// (`ds_next`) for `dsparkDraft`. The verify, the accept rule and the draft are the host round's ops; the windows'
+/// rows past the kept positions are written too, ahead of every read of them (a round's window read ends at its
+/// position, and the next verify writes from there).
+fn syncRound(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, pending: *DsparkPending, d: *const DsparkDraft, accepted_cap: usize) !DsparkRound {
+    const b = pending.b;
+    const v = &st.verify.?;
+    const n0 = v.n0;
+    m.dropNext();
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    var want: [16]i32 = undefined;
+    for (0..b) |k| want[k] = @intCast(d.ids[k + 1]);
+    const ag = try acceptGraph(&sc, pending.vl_g, if (m.exact.argmax) m.suppress else none, want[0..b], @min(accepted_cap, b), n0 + 1 + @as(usize, @intCast(@max(sync_plant, 0))));
+    const acc = ag.acc;
+    const next = ag.next;
+    const n_gpu = ag.n;
+    try commitRows(&sc, m, st, v.mh, n0);
+    const t_launch = monoUs();
+    const g = try draftGraph(&sc, m, st, 0, false, .{ .t1 = next, .n = n_gpu, .window = m.cfg.sliding_window });
+    var ahead: DraftAhead = .{ .t1 = 0, .n = 0, .gen = m.state_gen, .want_conf = g.want_conf, .st = st };
+    errdefer ahead.deinit();
+    for (&ahead.ev, g.ev) |*slot, x| hold(slot, x);
+    // the count and the token as their own buffer, the draft behind them: the host's wait ends with the accept
+    try asyncEvalAll(&.{ acc, next });
+    try asyncEvalAll(&ahead.ev);
+    ahead.launch_ns = @intCast((monoUs() - t_launch) * 1000);
+    try evalAll(&.{ acc, next });
+    const accepted: usize = @intCast((mlx.mlx_array_data_int32(acc) orelse return error.NoData)[0]);
+    const next_token: u32 = @intCast((mlx.mlx_array_data_int32(next) orelse return error.NoData)[0]);
+    ahead.t1 = next_token;
+    ahead.n = n0 + accepted + 1;
+    const r = try dsparkFinishWith(m, gpa, st, pending, accepted, next_token, true);
+    m.ds_shift_ns += @intCast(ahead.launch_ns);
+    m.ds_next = ahead;
+    _ = sync_rounds.fetchAdd(1, .monotonic);
+    if (!sync_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_SPEC_SYNC engaged: the accept on the GPU, the next draft queued behind the verify\n", .{});
     return r;
 }
 
@@ -10992,6 +11181,171 @@ test "dsv41 DSpark round: draft, verify and finish timed apart, greedy (DSV41_RO
     std.debug.print("[round] ctx {d}: draft {d:.2} ms, verify {d:.2} ms, finish {d:.2} ms, {d:.2} accepted/round -> {d:.1} tok/s\n", .{
         ctx, ms[0], ms[1], ms[2], @as(f64, @floatFromInt(accepted)) / rounds, (@as(f64, @floatFromInt(accepted)) / rounds + 1) * 1000 / (ms[0] + ms[1] + ms[2]),
     });
+}
+
+/// Prints, for each piece of `commitRows` (main_proj, its norm, each stage's wkv and window row), whether the first `k`
+/// rows of a 6-row call are the bits of a `k`-row call: what `syncRound`'s all-rows commit needs to equal the host's.
+fn commitRowsInvariance(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
+    const ds = &(m.dspark orelse return);
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const R = 6;
+    const width = m.cfg.hidden_size * m.cfg.dsv4_n_dspark_target_layers;
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 7));
+    var mh = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mh);
+    try mlx.check(mlx.mlx_random_normal(&mh, &[_]c_int{ R, ci(width) }, 2, .float32, 0, 1, key, m.s));
+    const x = try sc.astype(mh, m.act);
+    for (1..R) |k| {
+        const part = try sc.slice(x, 0, 0, k);
+        const full_p = try sc.astype(try ds.main_proj.apply(&sc, x), .float32);
+        const part_p = try sc.astype(try ds.main_proj.apply(&sc, part), .float32);
+        const full_x = try sc.rms(try ds.main_proj.apply(&sc, x), ds.main_norm, m.cfg.rms_norm_eps);
+        const part_x = try sc.slice(full_x, 0, 0, k);
+        var same: [8]bool = @splat(true);
+        same[0] = try bitsEq(&sc, try sc.slice(full_p, 0, 0, k), part_p);
+        same[1] = try bitsEq(&sc, part_x, try sc.rms(try ds.main_proj.apply(&sc, part), ds.main_norm, m.cfg.rms_norm_eps));
+        for (0..@min(m.n_mtp, 3)) |si| {
+            const ly = &m.layers[m.n_layers + si];
+            const wf = try ly.wkv.apply(&sc, full_x);
+            const wp = try ly.wkv.apply(&sc, part_x);
+            same[2 + si] = try bitsEq(&sc, try sc.slice(wf, 0, 0, k), wp);
+            const kf = try kvRow(&sc, m, ly, m.rope_plain.fwd, wf, try sc.i(100));
+            const kp = try kvRow(&sc, m, ly, m.rope_plain.fwd, try sc.slice(wf, 0, 0, k), try sc.i(100));
+            same[5 + si] = try bitsEq(&sc, try sc.slice(kf, 0, 0, k), kp);
+        }
+        std.debug.print("[spec-sync] commit rows: the first {d} of 6 rows equal a {d}-row call: main_proj {}, norm {}, wkv {} {} {}, window row {} {} {}\n", .{ k, k, same[0], same[1], same[2], same[3], same[4], same[5], same[6], same[7] });
+    }
+}
+
+fn bitsEq(sc: *Scope, a: A, b: A) !bool {
+    const xa32 = try sc.astype(a, .float32);
+    const xb32 = try sc.astype(b, .float32);
+    try evalAll(&.{ xa32, xb32 });
+    const n = mlx.mlx_array_size(xa32);
+    if (n != mlx.mlx_array_size(xb32)) return false;
+    const contig_a = try sc.op1(mlx.mlx_copy, xa32);
+    const contig_b = try sc.op1(mlx.mlx_copy, xb32);
+    try evalAll(&.{ contig_a, contig_b });
+    const xa = mlx.mlx_array_data_float32(contig_a).?[0..n];
+    const xb = mlx.mlx_array_data_float32(contig_b).?[0..n];
+    return std.mem.eql(u32, @ptrCast(xa), @ptrCast(xb));
+}
+
+/// One `specSyncRun` round's record: the draft's ids and confidence bits, then what the round kept.
+const SyncRec = struct { ids: [17]u32 = @splat(0), conf: [16]u32 = @splat(0), len: usize = 0, tokens: [17]u32 = @splat(0), n_tok: usize = 0, accepted: u32 = 0, next: u32 = 0 };
+
+/// `rounds` greedy rounds from `prompt` on a new state as the engine's policy step runs them, into `out`: the stages'
+/// draft cut to a width that cycles 0..B, every fifth round capped at one accept, every seventh a synthetic draft
+/// (a copy round: no stage draft) and every ninth a plain tick between rounds.
+fn specSyncRun(m: *Dsv41Model, gpa: std.mem.Allocator, prompt: []const u32, out: []SyncRec) !void {
+    var st = try initState(m, gpa);
+    defer st.deinit();
+    var t1: u32 = blk: {
+        const l = try meterPrefill(m, gpa, &st, prompt);
+        defer _ = mlx.mlx_array_free(l);
+        break :blk try argmaxHost(l);
+    };
+    const B = m.ds_block;
+    for (out, 0..) |*rec, k| {
+        if (k % 9 == 8) {
+            const l = try extend(m, gpa, &st, &.{t1}, .last);
+            defer _ = mlx.mlx_array_free(l);
+            rec.tokens[0] = t1;
+            rec.n_tok = 1;
+            t1 = try argmaxHost(l);
+            rec.next = t1;
+            continue;
+        }
+        var d = if (k % 7 == 6) try verifyRowsDraft(gpa, m, 3) else try dsparkDraft(m, gpa, &st, t1);
+        defer d.deinit(gpa);
+        if (k % 7 == 6) d.ids[0] = t1 else d.len = @min(d.len, k % (B + 1));
+        rec.len = d.len;
+        @memcpy(rec.ids[0 .. d.len + 1], d.ids[0 .. d.len + 1]);
+        for (d.confidence, 0..) |c, j| rec.conf[j] = @bitCast(c);
+        var r = try dsparkRoundWith(m, gpa, &st, t1, &d, if (k % 5 == 4) 1 else std.math.maxInt(usize));
+        defer r.deinit(gpa);
+        @memcpy(rec.tokens[0..r.tokens.len], r.tokens);
+        rec.n_tok = r.tokens.len;
+        rec.accepted = r.accepted;
+        rec.next = r.next_token;
+        t1 = r.next_token;
+    }
+}
+
+test "dsv41 spec sync: GPU-accept rounds keep the host rounds' tokens, accepts and next tokens, and their drafts' bits but for DRAFT_QKV's row-count rounding; a planted position fails (DSV41_SPEC_SYNC)" {
+    // DSV41_SPEC_SYNC = a pack dir; DSV41_STEP_CTX prompt tokens first (default 1024, at least the sliding window).
+    const dir = std.mem.span(std.c.getenv("DSV41_SPEC_SYNC") orelse return error.SkipZigTest);
+    const ctx = if (std.c.getenv("DSV41_STEP_CTX")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 1024;
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cfg = try testConfig(io, dir);
+    var w = try loadPack(io, gpa, dir, false);
+    defer w.deinit();
+    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true, .dspark = true });
+    defer m.deinit();
+    try testing.expect(ctx + 1 >= m.cfg.sliding_window);
+    try commitRowsInvariance(m, gpa);
+    const prompt = try gpa.alloc(u32, ctx);
+    defer gpa.free(prompt);
+    // a repeated run of 61 ids: the stages draft its continuation, so rounds keep drafts and roll others back
+    for (prompt, 0..) |*t, k| t.* = @intCast(((k % 61) * 7919 + 13) % @min(m.vocab, 100000));
+    const N = 40;
+    var host: [N]SyncRec = @splat(.{});
+    var gpu: [N]SyncRec = @splat(.{});
+    var plant: [N]SyncRec = @splat(.{});
+    {
+        const off = env.override(.MLX_SERVE_DSV41_SPEC_SYNC, "0");
+        defer off.restore();
+        try specSyncRun(m, gpa, prompt, &host);
+    }
+    try testing.expectEqual(@as(u64, 0), sync_rounds.load(.monotonic));
+    const on = env.override(.MLX_SERVE_DSV41_SPEC_SYNC, "1");
+    defer on.restore();
+    try specSyncRun(m, gpa, prompt, &gpu);
+    const taken = sync_rounds.load(.monotonic);
+    const collected = sync_collects.load(.monotonic);
+    // What a round keeps (its tokens, accepted drafts and next token, the draft's width) is exact. The drafts' ids and
+    // confidences are too, but under `MLX_SERVE_DSV41_DRAFT_QKV`: `syncRound` writes every verify row's window rows,
+    // and the stage's wkv (a row view of the fused q_kv) rounds a row differently at another row count, so a draft
+    // after a partial accept may differ in its last bits (rounding of proposals, never of what is kept).
+    var bad: usize = 0;
+    var draft_bits: usize = 0;
+    var accepted: usize = 0;
+    for (host, gpu, 0..) |h, g, k| {
+        accepted += h.accepted;
+        const kept = h.len == g.len and h.accepted == g.accepted and h.next == g.next and h.n_tok == g.n_tok and std.mem.eql(u32, &h.tokens, &g.tokens);
+        const drafts = std.mem.eql(u32, &h.ids, &g.ids) and std.mem.eql(u32, &h.conf, &g.conf);
+        bad += @intFromBool(!kept);
+        draft_bits += @intFromBool(!drafts);
+        if (!kept or !drafts) std.debug.print("[spec-sync] round {d} differs ({s}): host len {d} acc {d} next {d}, gpu len {d} acc {d} next {d}\n", .{ k, if (!kept) "kept" else "draft bits", h.len, h.accepted, h.next, g.len, g.accepted, g.next });
+    }
+    const qkv = env.onUnlessZero(.MLX_SERVE_DSV41_DRAFT_QKV);
+    // Rounds 0..N less the plain ticks take the GPU accept; every stage draft after a GPU round is the queued one.
+    var want_rounds: u64 = 0;
+    var want_collects: u64 = 0;
+    for (0..N) |k| {
+        if (k % 9 == 8) continue;
+        want_rounds += 1;
+        const prev_gpu = k > 0 and (k - 1) % 9 != 8;
+        if (k % 7 != 6 and prev_gpu) want_collects += 1;
+    }
+    std.debug.print("[spec-sync] ctx {d}: {d} rounds, {d} differ in what they keep, {d} in their drafts' bits (DRAFT_QKV {}); GPU-accept rounds {d} (want {d}), queued drafts collected {d} (want {d}); {d} drafts accepted\n", .{ ctx, N, bad, draft_bits, qkv, taken, want_rounds, collected, want_collects, accepted });
+    try testing.expectEqual(@as(usize, 0), bad);
+    if (!qkv) try testing.expectEqual(@as(usize, 0), draft_bits);
+    try testing.expectEqual(want_rounds, taken);
+    try testing.expectEqual(want_collects, collected);
+    try testing.expect(accepted > 0);
+    // The plant: the queued draft one position on. Its drafts must differ from the host rounds'.
+    sync_plant = 1;
+    defer sync_plant = 0;
+    try specSyncRun(m, gpa, prompt, &plant);
+    var planted: usize = 0;
+    for (host, plant) |h, p| planted += @intFromBool(!std.mem.eql(u32, &h.conf, &p.conf) or !std.mem.eql(u32, &h.ids, &p.ids));
+    std.debug.print("[spec-sync] planted position: {d} of {d} drafts differ (unplanted {d})\n", .{ planted, N, draft_bits });
+    try testing.expect(planted > 0 and planted > 4 * draft_bits);
 }
 
 /// `DSV41_VERIFY_ROWS`' draft: `b` synthetic ids after the verify's first row.
