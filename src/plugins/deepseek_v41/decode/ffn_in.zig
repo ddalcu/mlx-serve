@@ -105,7 +105,7 @@ pub fn fusedOn() bool {
 /// `MLX_SERVE_DSV41_FFN_IN_SINK` (read each call): =1 launch 2's mix tail (the slices' reduce and the Sinkhorn split)
 /// runs as its own one-threadgroup launch, read only by the MoE down, so the MoE up does not wait on it.
 pub fn sinkOn() bool {
-    return env.on(.MLX_SERVE_DSV41_FFN_IN_SINK);
+    return env.onUnlessZero(.MLX_SERVE_DSV41_FFN_IN_SINK);
 }
 
 /// `MLX_SERVE_DSV41_GEMV_R26_FFN_IN` (read each call): =1 launch 1 runs on the matrix units from `nax_min_rows` rows.
