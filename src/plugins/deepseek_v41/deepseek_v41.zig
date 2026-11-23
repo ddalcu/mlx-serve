@@ -2209,6 +2209,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     // The ring twins compiled now, not in a prompt's first wide layer (FLASH_ATTN on: the flash kernel and its heads
     // twin in their place).
     if (m.attn_gather != null) try warmRing(m);
+    try warmGateGemmBf16(m);
     log.info("deepseek_v41: {d} layers, engram {d} layers, DSpark {d} stages{s}{s}\n", .{ n_layers, m.engrams.len, n_stages, if (opts.quant != null) ", weights on " else "", if (opts.quant) |q| q.name() else "" });
     if (fp4Decode(m) != null) log.info("deepseek_v41: fused fp4 MoE decode kernels on\n", .{});
     if (dkern.fp8Fold() == 1) log.info("deepseek_v41: decode mxfp8 reads folded (MLX_SERVE_DSV41_FP8_FOLD)\n", .{});
@@ -3589,6 +3590,39 @@ pub fn flashLaunch(sc: *Scope, k: mlx.mlx_fast_metal_kernel, ins: []const A, out
         x.* = try sc.res(mlx.mlx_vector_array_get(&o, ov, i), &o);
     }
 }
+/// MLX_SERVE_DSV41_PF_COMP_BF16 / MLX_SERVE_DSV41_PF_ROUTER_BF16 on at load: their gate_gemm bf16 instantiations
+/// compiled now, not on a first prompt (each a fresh Metal compile of MLX's NAX GEMM headers, about a second): one
+/// launch over 64 and one over 65 rows of zeros (both row alignments), at the first compressor's and router's weights.
+fn warmGateGemmBf16(m: *Dsv41Model) !void {
+    const comp = env.on(.MLX_SERVE_DSV41_PF_COMP_BF16);
+    const router = env.on(.MLX_SERVE_DSV41_PF_ROUTER_BF16);
+    if ((!comp and !router) or !device.naxAvailable() or !mlx.streamIsGpu(m.s)) return;
+    var sc = Scope.init(m.gpa, m.s);
+    defer sc.deinit();
+    var ys: [4]A = @splat(none);
+    var n: usize = 0;
+    const W = struct { w: A, sum: ggemm.Sum };
+    var ws: [2]?W = .{ null, null };
+    if (comp) for (m.layers[0..m.n_layers]) |*ly| if (ly.ratio > 1) if (ly.comp) |*cw| if (cw.wgate == null and cw.wkv.ext == null and cw.wkv.s.ctx == null and cw.wkv.w.ctx != null) {
+        ws[0] = .{ .w = cw.wkv.w, .sum = .blocked };
+        break;
+    };
+    if (router) for (m.layers[0..m.n_layers]) |*ly| if (ly.gate_w.ctx != null) {
+        ws[1] = .{ .w = ly.gate_w, .sum = .single };
+        break;
+    };
+    for (ws) |o| if (o) |wv| for ([_]c_int{ 64, 65 }) |rows| {
+        const x = try sc.zeros(&.{ rows, ci(dim(wv.w, 1)) }, .bfloat16);
+        if (try ggemm.bf16F32(sc.s, x, wv.w, true, wv.sum)) |y| {
+            ys[n] = try sc.keep(y);
+            n += 1;
+        }
+    };
+    if (n == 0) return;
+    try evalAll(ys[0..n]);
+    log.info("deepseek_v41: gate_gemm's bf16 launches (PF_COMP_BF16 {}, PF_ROUTER_BF16 {}) compiled at load\n", .{ comp, router });
+}
+
 /// scratch_attn.zig: each ring twin compiled at load by one launch over a one-row span of zeros (both qk
 /// twins: Q_TAIL's and the plain one), evaluated; the regions it made then let go.
 fn warmRing(m: *Dsv41Model) !void {
@@ -3985,13 +4019,58 @@ pub fn denseF32x(sc: *Scope, m: *const Dsv41Model, l: *const Lin, x: A) !A {
 /// from the latent before rope when this layer owns them, then ropes the
 /// latent at its group's first position and stores it fp4-simulated.
 pub fn compress(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, cw: *const Comp, x: A, p0: usize) !void {
-    // Pooling runs in f32, weights included (the reference promotes them).
-    const proj = if (m.layers[li].ratio == 1) try cw.wkv.apply(sc, x) else if (cw.wgate) |*g| blk: {
+    return compressFrom(sc, m, st, li, cw, try compProj(sc, m, li, cw, x), p0);
+}
+
+/// The compressor's projection of `x` (`compress`'s): pooling runs in f32, weights included (the reference promotes
+/// them).
+pub fn compProj(sc: *Scope, m: *Dsv41Model, li: usize, cw: *const Comp, x: A) !A {
+    return if (m.layers[li].ratio == 1) try cw.wkv.apply(sc, x) else if (cw.wgate) |*g| blk: {
         const xf = try sc.astype(x, .float32);
         break :blk try sc.concat(&.{ try cw.wkv.apply(sc, xf), try g.apply(sc, xf) }, -1);
     } else try denseF32x(sc, m, &cw.wkv, try sc.astype(x, .float32));
-    return compressFrom(sc, m, st, li, cw, proj, p0);
 }
+
+/// `MLX_SERVE_DSV41_PF_COMP_BF16`: a wide prompt layer's compressor projection (wkv and wgate, f32 out) over all of its
+/// rows `x` at once, each GEMM one launch with its MMA in bf16 (`gate_gemm.bf16F32`: x and the weights stored bf16, so
+/// each product is exact in its f32 accumulator as in the TF32 chain's; the sums reordered), not a TF32 GEMM a span;
+/// null where it declines (the switch off, ratio 1, a weight not dense bf16, x not bf16, no NAX). A resident pack's kv
+/// and gate rows are one fused weight (`poolLin`): one launch; an outside plugin's two apart: one each, joined.
+fn compProjBf16(sc: *Scope, m: *const Dsv41Model, li: usize, cw: *const Comp, x: A) !?A {
+    if (!env.on(.MLX_SERVE_DSV41_PF_COMP_BF16) or m.layers[li].ratio <= 1 or m.trace != null) return null;
+    const dense = struct {
+        fn bf16(l: *const Lin) bool {
+            return l.ext == null and l.s.ctx == null and mlx.mlx_array_dtype(l.w) == .bfloat16;
+        }
+    }.bf16;
+    const nax = device.naxAvailable();
+    const hd: usize = m.cfg.head_dim;
+    var kv = none;
+    var gt = none;
+    if (cw.wgate) |*g| {
+        if (!dense(&cw.wkv) or !dense(g)) return null;
+        kv = try sc.keep((try ggemm.bf16F32(sc.s, x, cw.wkv.w, nax, .blocked)) orelse return null);
+        gt = try sc.keep((try ggemm.bf16F32(sc.s, x, g.w, nax, .blocked)) orelse return null);
+    } else {
+        if (!dense(&cw.wkv) or dim(cw.wkv.w, 0) != 2 * hd) return null;
+        const y = try sc.keep((try ggemm.bf16F32(sc.s, x, cw.wkv.w, nax, .blocked)) orelse return null);
+        if (!comp_bf16_plant) {
+            kv = y;
+        } else {
+            kv = try sc.slice(y, -1, 0, hd);
+            gt = try sc.slice(y, -1, hd, 2 * hd);
+        }
+    }
+    if (!comp_bf16_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_COMP_BF16 engaged (layer {d}, {d} rows)\n", .{ li, dim(x, 0) });
+    _ = comp_bf16_count.fetchAdd(1, .monotonic);
+    if (gt.ctx == null) return kv;
+    return try sc.concat(if (comp_bf16_plant) &.{ gt, kv } else &.{ kv, gt }, -1);
+}
+/// `MLX_SERVE_DSV41_PF_COMP_BF16`'s planted bug (its test): the gate's columns where the kv's go.
+pub var comp_bf16_plant = false;
+var comp_bf16_logged = std.atomic.Value(bool).init(false);
+/// `MLX_SERVE_DSV41_PF_COMP_BF16`'s layers served (the tests' engagement count).
+pub var comp_bf16_count = std.atomic.Value(usize).init(0);
 
 /// `compressFrom` on the fused pool step (`decode/idx_score.zig`); false (nothing moved) where it declines.
 fn compressFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, proj: A, p0: usize) !bool {
@@ -4779,6 +4858,21 @@ pub fn moePrefillParts(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A,
 }
 
 pub const Routes = struct { idx: A, wts: A };
+/// `MLX_SERVE_DSV41_PF_ROUTER_BF16`'s sum at `rows` x `e` experts x `k`: only where today's chain runs MLX's regular
+/// kernel (`gate_gemm.router`, one running sum over K), the single sum: today's words. Where MLX splits K (fewer rows,
+/// the narrow calls) null: today's path (the single sum there is farther from float64 than MLX's split, the wide test's
+/// planted control).
+pub fn routerSum(rows: usize, e: usize, k: usize) ?ggemm.Sum {
+    if (ggemm.mlxRegular(@intCast(rows), @intCast(e), @intCast(k))) return .single;
+    return if (router_sum_plant) .single else null;
+}
+/// The router float64 test's planted control: the single sum at the split-K widths too.
+pub var router_sum_plant = false;
+var router_bf16_logged = std.atomic.Value(bool).init(false);
+/// `MLX_SERVE_DSV41_PF_ROUTER_BF16`'s calls served (the tests' engagement count).
+pub var router_bf16_count = std.atomic.Value(usize).init(0);
+/// `MLX_SERVE_DSV41_PF_ROUTER_BF16`'s planted bug (its test): the logits negated.
+pub var router_bf16_plant = false;
 
 /// sqrt-softplus scores; the bias picks the top-k, the unbiased scores
 /// (normalized, times the routed scale) weigh them.
@@ -4787,6 +4881,13 @@ pub fn gateLogits(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !A {
     const L = dim(x, 0);
     const E = dim(ly.gate_w, 0);
     if (L > region_rows) {
+        // MLX_SERVE_DSV41_PF_ROUTER_BF16: x and gate_w both bf16, the MMA in bf16 (exact products; `routerSum`).
+        if (env.on(.MLX_SERVE_DSV41_PF_ROUTER_BF16)) if (routerSum(L, E, dim(x, 1))) |sum| if (try ggemm.bf16F32(sc.s, x, ly.gate_w, device.naxAvailable(), sum)) |y| {
+            if (!router_bf16_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_ROUTER_BF16 engaged ({d} rows)\n", .{L});
+            _ = router_bf16_count.fetchAdd(1, .monotonic);
+            if (router_bf16_plant) return sc.mul(try sc.keep(y), try sc.f(-1));
+            return sc.keep(y);
+        };
         // the chain as one launch where MLX runs its regular NAX kernel (the same words).
         if (try ggemm.router(sc.s, x, ly.gate_w, device.naxAvailable())) |y| return sc.keep(y);
         const w = try sc.astype(ly.gate_w, .float32);
@@ -6300,11 +6401,16 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     // span kept alive by the spans' pending views, and each span's attention and indexer read their own causal prefix
     // (clen) of that one buffer: the same rows from the same compressor calls.
     const comp_first = ly.comp != null and sp.floor == null;
+    // MLX_SERVE_DSV41_PF_COMP_BF16: the projection over every row first, each span's pooling on its rows of it.
+    const comp_all: ?A = if (comp_first) try compProjBf16(&sc, m, li, &ly.comp.?, pa.h) else null;
     if (comp_first) for (0..n_spans) |k| {
         const lo, const hi = sp.bounds(k);
         var csc = Scope.init(gpa, m.s);
         defer csc.deinit();
-        try compress(&csc, m, st, li, &ly.comp.?, try csc.slice(pa.h, 0, lo, hi), sp.p0 + lo);
+        if (comp_all) |cpj|
+            try compressFrom(&csc, m, st, li, &ly.comp.?, try csc.slice(cpj, 0, lo, hi), sp.p0 + lo)
+        else
+            try compress(&csc, m, st, li, &ly.comp.?, try csc.slice(pa.h, 0, lo, hi), sp.p0 + lo);
     };
     // scratch_attn.zig: a full run's grouped heads straight into a run region (`[rows, og, in]`), its `wo_a` reading
     // the region: no join, no transpose (with an EXL3 `wo_a`).
@@ -11936,4 +12042,73 @@ test "dsv41 pf engram pass: ubench, a 4096-row run's wkv and gates against 16 sp
     const chain = try dkern.idx_score.evalTotalUs(gpa, fx.m.s, b) / 4;
     const flop: f64 = 2.0 * 4096 * 25600 * 6144;
     std.debug.print("[pf-ubench] engram pass 4096 rows: {d:.0} us ({d:.1} TFLOPS of wkv, {d:.0}% of the 120 TFLOPS floor {d:.0} us), span by span {d:.0} us ({d:.1} TFLOPS)\n", .{ us, flop / us / 1e6, 100 * flop / 120e6 / us, flop / 120e6, chain, flop / chain / 1e6 });
+}
+
+/// `n` copies (`.spans`: one) of a layer's compressor projection over `x` (`MLX_SERVE_DSV41_PF_COMP_BF16`'s `ubench`):
+/// `.spans`, today's TF32 chain a 256-row span (`compProj`); `.whole`, that chain once over every row; `.bf16`, the
+/// bf16-MMA launch over every row at `tile` (the fused kv and gate rows). Or the router's logits (`.router_*`).
+const CompBench = struct {
+    const Arm = enum { spans, whole, bf16, router_f32, router_bf16 };
+    m: *Dsv41Model,
+    li: usize,
+    x: A,
+    /// The router's weight at the release's 384 experts (the fixture's layers hold fewer).
+    gw: A,
+    arm: Arm,
+    tile: ggemm.Tile = ggemm.bf16_tile,
+    n: usize,
+    pub fn build(b: @This(), sc: *Scope) ![64]A {
+        var outs: [64]A = @splat(none);
+        const cw = &b.m.layers[b.li].comp.?;
+        const rows = dim(b.x, 0);
+        for (0..b.n) |i| switch (b.arm) {
+            // One copy: each of the (at most 64) spans' outputs its own slot, as the layer leaves them.
+            .spans => for (outs[0..@min(64, rows / 256)], 0..) |*y, k| {
+                y.* = try compProj(sc, b.m, b.li, cw, try sc.slice(b.x, 0, 256 * k, 256 * (k + 1)));
+            },
+            .whole => outs[i] = try compProj(sc, b.m, b.li, cw, b.x),
+            // A resident pack's fused kv and gate rows: one launch.
+            .bf16 => outs[i] = try sc.keep((try ggemm.bf16F32At(sc.s, b.x, cw.wkv.w, true, b.tile, .blocked)).?),
+            .router_f32 => outs[i] = try sc.keep((try ggemm.router(sc.s, b.x, b.gw, true)).?),
+            .router_bf16 => outs[i] = try sc.keep((try ggemm.bf16F32At(sc.s, b.x, b.gw, true, b.tile, .single)).?),
+        };
+        return outs;
+    }
+};
+
+test "dsv41 pf comp and router bf16: ubench, a layer's compressor projection and router logits over 16,384 rows, the bf16-MMA launch against today's (MLX_SERVE_DSV41_PF_COMP_BF16, MLX_SERVE_DSV41_PF_ROUTER_BF16)" {
+    if (!dkern.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try dkern.fixture.Fixture.init(gpa, .{ .lo = 2, .hi = 3, .ctx = 0 });
+    defer fx.deinit();
+    var sc = Scope.init(gpa, fx.m.s);
+    defer sc.deinit();
+    const ly = fx.layer(2);
+    try std.testing.expect(ly.ratio > 1 and ly.comp != null and ly.comp.?.wgate == null and mlx.mlx_array_dtype(ly.comp.?.wkv.w) == .bfloat16 and mlx.mlx_array_dtype(ly.gate_w) == .bfloat16);
+    const rows: usize = 16_384;
+    const K: usize = fx.m.cfg.hidden_size;
+    const x = try sc.keep(try fx.normal(&.{ ci(rows), ci(K) }, .bfloat16, 0, 1));
+    try evalAll(&.{x});
+    const E: usize = 384;
+    const gw = try sc.keep(try fx.normal(&.{ ci(E), ci(K) }, .bfloat16, 0, 1.0 / @sqrt(@as(f32, @floatFromInt(K)))));
+    try evalAll(&.{gw});
+    var b: CompBench = .{ .m = fx.m, .li = 2, .x = x, .gw = gw, .arm = .spans, .n = 1 };
+    const comp_flop: f64 = 2.0 * @as(f64, @floatFromInt(rows * K * 2 * fx.m.cfg.head_dim));
+    const router_flop: f64 = 2.0 * @as(f64, @floatFromInt(rows * K * E));
+    inline for (.{ CompBench.Arm.spans, .whole, .router_f32 }) |arm| {
+        b.arm = arm;
+        const us = try dkern.idx_score.evalTotalUs(gpa, fx.m.s, b);
+        const flop = if (arm == .router_f32) router_flop else comp_flop;
+        std.debug.print("[pf-ubench] {s} today ({d} rows): {d:.0} us ({d:.1} TFLOPS, floor {d:.0} us at 120)\n", .{ @tagName(arm), rows, us, flop / us / 1e6, flop / 120e6 });
+    }
+    const tiles = [_]ggemm.Tile{ ggemm.bf16_tile, ggemm.tile, .{ .bm = 64, .bn = 128, .bk = 512, .wm = 2, .wn = 4, .swz = 1 }, .{ .bm = 64, .bn = 128, .bk = 512, .wm = 2, .wn = 4, .swz = 2 }, .{ .bm = 64, .bn = 128, .bk = 1024, .wm = 2, .wn = 4, .swz = 2 }, .{ .bm = 128, .bn = 128, .bk = 512, .wm = 4, .wn = 4, .swz = 2 }, .{ .bm = 64, .bn = 128, .bk = 256, .wm = 2, .wn = 4, .swz = 2 }, .{ .bm = 32, .bn = 128, .bk = 512, .wm = 1, .wn = 4, .swz = 2 }, .{ .bm = 32, .bn = 384, .bk = 256, .wm = 1, .wn = 6, .swz = 1 }, .{ .bm = 64, .bn = 192, .bk = 512, .wm = 2, .wn = 6, .swz = 1 } };
+    for (tiles) |t| {
+        b.tile = t;
+        inline for (.{ CompBench.Arm.bf16, .router_bf16 }) |arm| {
+            b.arm = arm;
+            const us = try dkern.idx_score.evalTotalUs(gpa, fx.m.s, b);
+            const flop = if (arm == .router_bf16) router_flop else comp_flop;
+            std.debug.print("[pf-ubench] {s} tile bm {d} bn {d} bk {d} wm {d} wn {d} swz {d}: {d:.0} us ({d:.1} TFLOPS)\n", .{ @tagName(arm), t.bm, t.bn, t.bk, t.wm, t.wn, t.swz, us, flop / us / 1e6 });
+        }
+    }
 }
