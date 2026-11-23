@@ -8,6 +8,8 @@ const mlx = @import("../../../mlx/ffi.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
+const env = @import("../../../env.zig");
+const log = @import("../../../sdk/util/log.zig");
 
 const A = mlx.mlx_array;
 
@@ -58,8 +60,21 @@ fn is(a: A, dt: mlx.mlx_dtype, want: []const usize) bool {
 /// byte buffers `codes` and `tsc` where `geo` (`Geo.words`, u32 [6]) puts it; W mxfp8 `w` `[N, K / 4]` u32 with e8m0
 /// `wsc` `[N, K / 32]`. The caller vouches that every id's bytes lie inside the buffers (4-aligned rows of codes).
 /// Null where the kernel does not serve: not a GPU stream, more rows than a decode step, K off the stage width or the
-/// table rows, N off the threadgroup's.
+/// table rows, N off the threadgroup's. One row runs slot-blocked under `MLX_SERVE_DSV41_ENGRAM_KV_SLOTS` where that
+/// kernel serves (`launchSlots`).
 pub fn launch(sc: *dsv41.Scope, t: Table, rows: usize, codes: A, tsc: A, ids: A, geo: A, w: A, wsc: A) !?A {
+    if (rows == 1 and slotsOn()) if (try launchSlots(sc, t, codes, tsc, ids, geo, w, wsc, null)) |kv| {
+        if (!slots_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_ENGRAM_KV_SLOTS engaged: a decode row's Engram wkv slot-blocked\n", .{});
+        return kv;
+    };
+    return launchRows(sc, t, rows, codes, tsc, ids, geo, w, wsc);
+}
+
+pub fn slotsOn() bool {
+    return env.on(.MLX_SERVE_DSV41_ENGRAM_KV_SLOTS);
+}
+
+fn launchRows(sc: *dsv41.Scope, t: Table, rows: usize, codes: A, tsc: A, ids: A, geo: A, w: A, wsc: A) !?A {
     if (!mlx.streamIsGpu(sc.s) or rows < 1 or rows > decode.max_rows) return null;
     if (!(t.tb == 4 or t.tb == 8) or t.hd == 0 or t.hd % 32 != 0) return null;
     if (mlx.getShape(w).len != 2 or codes.ctx == null or tsc.ctx == null) return null;
@@ -82,6 +97,58 @@ pub fn launch(sc: *dsv41.Scope, t: Table, rows: usize, codes: A, tsc: A, ids: A,
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernel.?, iv, cfg, sc.s));
+    var o = mlx.mlx_array_new();
+    return try sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+}
+
+pub const SLOTS_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_engram_kv_slots.metal");
+/// The slot kernel reading and filling the contribution cache (`engram_kvc.zig`).
+pub const SLOTS_KVC_SOURCE = "#define KVC 1\n" ++ SLOTS_SOURCE;
+pub const SLOTS_KVC_INS = INS ++ [_][*:0]const u8{ "plan", "vals" };
+/// The slot kernel's output rows a threadgroup (SG x RT) and the table row it reads a half simdgroup at a time.
+pub const slot_cols = 32;
+pub const slot_hd = 256;
+var slots_kernel: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
+var slots_logged = std.atomic.Value(bool).init(false);
+
+/// The contribution cache's part of one launch: `plan` u32 `[K / 256]`, each slot's entry of `vals` f32
+/// `[entries, N]` (bit 31: read it, else compute and store it).
+pub const Kvc = struct { plan: A, vals: A };
+
+/// `launch` of one row, slot-blocked (`dec_engram_kv_slots.metal`): each 256-input table row's partial sum reduced on
+/// its own and the partials added in slot order, so a partial read from `cache` gives the same bits as computing it.
+/// Null where it does not serve: not a GPU stream, table rows other than 256 inputs, K off 512, N off 32.
+pub fn launchSlots(sc: *dsv41.Scope, t: Table, codes: A, tsc: A, ids: A, geo: A, w: A, wsc: A, cache: ?Kvc) !?A {
+    if (!mlx.streamIsGpu(sc.s) or !(t.tb == 4 or t.tb == 8) or t.hd != slot_hd) return null;
+    if (mlx.getShape(w).len != 2 or codes.ctx == null or tsc.ctx == null) return null;
+    const N = dims(w, 0);
+    const K = dims(w, 1) * 4;
+    if (K == 0 or K % 512 != 0 or N == 0 or N % slot_cols != 0) return null;
+    if (!is(ids, .uint32, &.{K / t.hd}) or !is(geo, .uint32, &.{6})) return null;
+    if (!is(w, .uint32, &.{ N, K / 4 }) or !is(wsc, .uint8, &.{ N, K / 32 })) return null;
+    if (cache) |c| if (!is(c.plan, .uint32, &.{K / t.hd}) or mlx.mlx_array_dtype(c.vals) != .float32 or mlx.getShape(c.vals).len != 2 or dims(c.vals, 1) != N) return null;
+    const v: usize = @intFromBool(cache != null);
+    if (slots_kernel[v] == null) slots_kernel[v] = try if (cache != null)
+        dsv41.buildKernel("dsv41_dec_engram_kv_slots_kvc", &SLOTS_KVC_INS, &.{"kv"}, SLOTS_KVC_SOURCE, HEADER)
+    else
+        dsv41.buildKernel("dsv41_dec_engram_kv_slots", &INS, &.{"kv"}, SLOTS_SOURCE, HEADER);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, ci(N) }, 2, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(threads * (N / slot_cols)), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, threads, 1, 1));
+    inline for (.{ .{ "K", K }, .{ "N", N }, .{ "HD", t.hd }, .{ "TB", t.tb } }) |a| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, a[0], ci(a[1])));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+    var ins: [8]A = .{ codes, tsc, ids, geo, w, wsc, undefined, undefined };
+    if (cache) |c| {
+        ins[6] = c.plan;
+        ins[7] = c.vals;
+    }
+    const iv = mlx.mlx_vector_array_new_data(&ins, if (cache != null) 8 else 6);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, slots_kernel[v].?, iv, cfg, sc.s));
     var o = mlx.mlx_array_new();
     return try sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
 }
@@ -301,6 +368,40 @@ const K_ = struct {
     }
 };
 
+/// The slot kernel (`launchSlots`): one row of x (a gate's rows read as 1), K_'s values and reference; with `kvc`
+/// every slot a cache miss stored into its own entry of `vals` (bound, written in place), the cache's computing arm.
+const KS = struct {
+    pub const Params = struct { tb: usize = 4, kvc: bool = false };
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.k == 0 or s.k % 512 != 0 or s.n == 0 or s.n % slot_cols != 0) return null;
+        var g = metal.Geometry{ .grid = .{ ci(threads * (s.n / slot_cols)), 1, 1 }, .tg = .{ threads, 1, 1 } };
+        g.out(&.{ 1, ci(s.n) }, .bfloat16);
+        g.int("K", s.k);
+        g.int("N", s.n);
+        g.int("HD", HD);
+        g.int("TB", p.tb);
+        g.dtype("T", .bfloat16);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        k.shape.rows = 1;
+        try K_.fill(k, f, rng);
+        if (!k.p.kvc) return;
+        const ns = k.shape.k / HD;
+        const plan = try k.add(.uint32, &.{ns});
+        for (plan, 0..) |*v, j| v.* = @floatFromInt(j);
+        @memset(try k.add(.float32, &.{ ns, k.shape.n }), kit.nan);
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.n;
+    }
+
+    pub const compute = K_.compute;
+};
+
 /// The rows' gather: `s.rows` x `s.n` table rows of 256 (rows of x by n-gram rows) through shuffled ids, dequantized.
 const RowsK = struct {
     pub const Params = struct { tb: usize = 4 };
@@ -360,6 +461,8 @@ fn depth(s: Shape) usize {
 }
 
 const kv_l = cv.launch("dsv41_dec_engram_kv", &INS, &.{"kv"}, SOURCE, HEADER, 4 * decode.max_rows * chunk, threads, false);
+const slots_l = cv.launch("dsv41_dec_engram_kv_slots", &INS, &.{"kv"}, SLOTS_SOURCE, HEADER, 2 * 6144, threads, false);
+const slots_kvc_l = cv.launch("dsv41_dec_engram_kv_slots_kvc", &SLOTS_KVC_INS, &.{"kv"}, SLOTS_KVC_SOURCE, HEADER, 2 * 6144, threads, false);
 const rows_l = cv.launch("dsv41_engram_rows", &ROWS_INS, &.{"out"}, ROWS_SOURCE, HEADER, 0, rows_threads, false);
 
 /// Served shapes cut the output width to a few threadgroups (each runs the same code at its own rows); the reduction
@@ -376,6 +479,22 @@ pub fn register(set: *kc.Set) !void {
         .out = .bf16,
         .tiles = .{ .{}, .{ .size = cols, .step = cols, .min = cols }, .{ .size = chunk, .step = chunk, .min = chunk } },
         .served = &.{ .{ .rows = 1, .n = 64, .k = 6144 }, .{ .rows = 3, .n = 16, .k = 6144 }, .{ .rows = decode.max_rows, .n = 32, .k = 6144 } },
+        .sums = .{ .f16 = 30, .bf16 = 30, .why = "mirrored halves: an exact sum of -8 behind partial sums near 10^5" },
+    });
+    const slot_cases = [_]struct { [:0]const u8, KS.Params }{
+        .{ "dsv41 dec engram_kv slots (mxfp4 table rows, mxfp8 wkv)", .{ .tb = 4 } },
+        .{ "dsv41 dec engram_kv slots (mxfp8 table rows, mxfp8 wkv)", .{ .tb = 8 } },
+        .{ "dsv41 dec engram_kv slots, cache misses stored (mxfp4 table rows)", .{ .tb = 4, .kvc = true } },
+        .{ "dsv41 dec engram_kv slots, cache misses stored (mxfp8 table rows)", .{ .tb = 8, .kvc = true } },
+    };
+    for (slot_cases) |c| try kit.add(set, KS, if (c[1].kvc) &slots_kvc_l else &slots_l, c[1], .{
+        .name = c[0],
+        .accum = .f32,
+        .depth = depth,
+        .out = .bf16,
+        .in_place = c[1].kvc,
+        .tiles = .{ .{}, .{ .size = slot_cols, .step = slot_cols, .min = slot_cols }, .{ .size = 512, .step = 512, .min = 512 } },
+        .served = &.{ .{ .rows = 1, .n = 64, .k = 6144 }, .{ .rows = 1, .n = 32, .k = 4096 } },
         .sums = .{ .f16 = 30, .bf16 = 30, .why = "mirrored halves: an exact sum of -8 behind partial sums near 10^5" },
     });
     const rows = [_]struct { [:0]const u8, RowsK.Params }{
@@ -407,7 +526,26 @@ test "dsv41 dec engram_kv: the contract's launch is the wrapper's, byte for byte
         defer a.free(mine);
         var sc = dsv41.Scope.init(a, c.rig.stream());
         defer sc.deinit();
-        const y = (try launch(&sc, .{ .hd = HD, .tb = tb }, R, c.args[0], c.args[1], c.args[2], c.args[3], c.args[4], c.args[5])) orelse return error.Declined;
+        const y = (try launchRows(&sc, .{ .hd = HD, .tb = tb }, R, c.args[0], c.args[1], c.args[2], c.args[3], c.args[4], c.args[5])) orelse return error.Declined;
+        const theirs = try c.rig.bytesOf(&.{y});
+        try std.testing.expectEqualSlices(u8, mine, theirs);
+    };
+}
+
+test "dsv41 dec engram_kv slots: the contract's launch is the wrapper's, byte for byte (mxfp4 and mxfp8 table rows, with and without the cache's stores)" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for ([_]usize{ 4, 8 }) |tb| for ([_]bool{ false, true }) |kvc| {
+        var c = kit.Case(KS).init(a, if (kvc) &slots_kvc_l else &slots_l, .{ .tb = tb, .kvc = kvc });
+        defer c.deinit();
+        try std.testing.expect(try c.prepare(.{ .rows = 1, .n = 64, .k = 6144 }, .random, 13));
+        try c.run();
+        const mine = try a.dupe(u8, c.outBytes());
+        defer a.free(mine);
+        var sc = dsv41.Scope.init(a, c.rig.stream());
+        defer sc.deinit();
+        const cache: ?Kvc = if (kvc) .{ .plan = c.args[6], .vals = c.args[7] } else null;
+        const y = (try launchSlots(&sc, .{ .hd = HD, .tb = tb }, c.args[0], c.args[1], c.args[2], c.args[3], c.args[4], c.args[5], cache)) orelse return error.Declined;
         const theirs = try c.rig.bytesOf(&.{y});
         try std.testing.expectEqualSlices(u8, mine, theirs);
     };
