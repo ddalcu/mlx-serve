@@ -324,7 +324,7 @@ test "run: a head_tail last-row head reads the final's last rows only" {
             return x;
         }
     };
-    var g = Graph.init(std.testing.allocator, @import("proof/fixture.zig").stream());
+    var g = Graph.init(std.testing.allocator, mlx.mlx_default_cpu_stream_new());
     defer g.deinit();
     var c: Ctx = undefined;
     const cases = [_]struct { n: c_int, tail: bool, logits: abi.Logits, slots: c_int, reads: c_int }{
