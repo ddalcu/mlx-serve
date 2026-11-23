@@ -6647,11 +6647,38 @@ fn cedCompress(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Sp
     const ly = &m.layers[li];
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
+    if (cedHcWhole(m, sp)) {
+        // `MLX_SERVE_DSV41_PF_CED_HC`: the hc pre-norm once over the pass's whole stream (a row's mixes and norm are
+        // its own words whatever rows share the launch); the compressor still a span at a time (its linear's kernel
+        // moves with M below `DENSE_ROWS`).
+        if (!ced_hc_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_CED_HC engaged (layer {d}, rows {d}, spans {d})\n", .{ li, sp.L, sp.xs.len });
+        _ = ced_hc_passes.fetchAdd(1, .monotonic);
+        const pa = try hcPreNormWide(&sc, m, sp.whole[0], sp.whole[1], &ly.hc_attn, ly.attn_norm);
+        const shift = ced_hc_plant.load(.monotonic);
+        for (0..sp.xs.len) |k| {
+            const lo, const hi = sp.bounds(k);
+            const a = @min(lo + shift, sp.L - (hi - lo));
+            try compress(&sc, m, st, li, &ly.comp.?, try sc.slice(pa.h, 0, a, a + hi - lo), sp.p0 + k * sp.span);
+        }
+        return;
+    }
     for (sp.xs, sp.pres, 0..) |x, pre, k| {
         const pa = try hcPreNormWide(&sc, m, x, pre, &ly.hc_attn, ly.attn_norm);
         try compress(&sc, m, st, li, &ly.comp.?, pa.h, sp.p0 + k * sp.span);
     }
 }
+
+/// `cedCompress` takes the whole stream: the switch on, several spans whose one MoE group left the pass's stream and
+/// mix whole (`Spans.whole`), on the GPU.
+fn cedHcWhole(m: *const Dsv41Model, sp: *const Spans) bool {
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_CED_HC) or sp.xs.len < 2 or sp.whole.len != 2 or !mlx.streamIsGpu(m.s)) return false;
+    return sp.whole[0].ctx != null and sp.whole[1].ctx != null and dim(sp.whole[0], 0) == sp.L and dim(sp.whole[1], 0) == sp.L;
+}
+var ced_hc_logged: std.atomic.Value(bool) = .init(false);
+/// Passes whose compressor took the whole stream (a test's proof the switch engaged).
+pub var ced_hc_passes: std.atomic.Value(u32) = .init(0);
+/// The planted control (tests only): each span's compressor reads the whole stream's rows this many rows late.
+pub var ced_hc_plant: std.atomic.Value(usize) = .init(0);
 
 /// CED: `cedCompress`, then `sp`'s last rows become `tsp`'s spans, the decoder's input; `sp`'s streams are released.
 /// The rows before the tail get no decoder window KV, which no tail query reaches: the tail's band stops at its first
