@@ -124,11 +124,16 @@ pub const Run = struct {
     }
 };
 
+/// The rows a `head_tail` last-row head reads: at or past `qmm_rows_min`, so its last row keeps the all-rows bits.
+pub const head_tail_rows: c_int = 32;
+/// Rows from which MLX's quantized matmul runs its prompt kernel, each row's sums independent of the row count.
+const qmm_rows_min: c_int = 16;
+comptime {
+    if (head_tail_rows < qmm_rows_min) @compileError("head_tail_rows under qmm_rows_min: the last row's bits would move");
+}
+
 /// A forward's results, owned by its graph: logits `[slots, vocab]` (last row) or `[slots * rows, vocab]`, and the
 /// final-normed hidden `[slots, rows, hidden]` when asked.
-/// The rows a `head_tail` last-row head reads: past the rows a decode-sized matmul takes.
-pub const head_tail_rows: c_int = 32;
-
 pub const Out = struct {
     logits: Array = .{},
     hidden: Array = .{},
