@@ -8381,7 +8381,7 @@ fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool
     var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(B), ci(hc), ci(d) });
     var pre = try onehotPre(sc, m, B);
     var at1 = at;
-    if (at1) |*g| if (env.on(.MLX_SERVE_DSV41_DRAFT_POS_ONCE) and st.ds.len > 0) {
+    if (at1) |*g| if (env.onUnlessZero(.MLX_SERVE_DSV41_DRAFT_POS_ONCE) and st.ds.len > 0) {
         const cap = st.ds[0].cap;
         const one_cap = for (st.ds) |r| {
             if (r.cap != cap) break false;
@@ -11615,8 +11615,8 @@ test "dsv41 spec sync: GPU-accept rounds keep the host rounds' tokens, accepts a
     const taken = sync_rounds.load(.monotonic);
     const collected = sync_collects.load(.monotonic);
     // `MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD` on: the GPU rounds' verifies gate the kv made behind their drafts.
-    std.debug.print("[spec-sync] MLX_SERVE_DSV41_DRAFT_POS_ONCE {}: {d} drafts made their slots and positions once\n", .{ env.on(.MLX_SERVE_DSV41_DRAFT_POS_ONCE), draft_pos_once_runs.load(.monotonic) });
-    if (env.on(.MLX_SERVE_DSV41_DRAFT_POS_ONCE)) try testing.expect(draft_pos_once_runs.load(.monotonic) > 0);
+    std.debug.print("[spec-sync] MLX_SERVE_DSV41_DRAFT_POS_ONCE {}: {d} drafts made their slots and positions once\n", .{ env.onUnlessZero(.MLX_SERVE_DSV41_DRAFT_POS_ONCE), draft_pos_once_runs.load(.monotonic) });
+    if (env.onUnlessZero(.MLX_SERVE_DSV41_DRAFT_POS_ONCE)) try testing.expect(draft_pos_once_runs.load(.monotonic) > 0);
     const ahead = eng_ahead_served.load(.monotonic);
     std.debug.print("[spec-sync] SPEC_ENGRAM_AHEAD {} ({s}): kv launched behind {d} drafts, taken up with {d}; {d} verify Engram writes took it\n", .{ engAheadOn(), engAheadWhyNot(m) orelse "serves", eng_ahead_launched.load(.monotonic), eng_ahead_taken.load(.monotonic), ahead });
     if (engAheadOn()) try testing.expect(ahead > 0);
