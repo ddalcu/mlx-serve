@@ -147,6 +147,19 @@ if (is_mix) {
     atomic_store_explicit(scorea + (size_t)(r0 + rr) * E + e, metal::sqrt(metal::max(z, 0.0f) + lp), metal::memory_order_relaxed);
   }
 }
+#if DSV41_FFN_NOTAIL
+// ubench bound only (never served): no counters and no tails; the outputs the tails write get fixed valid values.
+if (tg == 0 && tid < R * HC) {
+  pre[tid] = 1.0f;
+  post[tid] = 1.0f;
+  *(device float4*)(comb + tid * HC) = float4(0.25f);
+}
+if (tg == P && tid < R * TOPK) {
+  idx[tid] = uint(tid % TOPK);
+  wts[tid] = 0.25f;
+}
+return;
+#endif
 atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, metal::thread_scope_device);
 threadgroup_barrier(metal::mem_flags::mem_device);
 if (tid == 0) {

@@ -1727,6 +1727,8 @@ const Bench = struct {
     eps: A,
     scal: A,
     mode: enum { new, chain, launch_1 },
+    /// The ubench's bound: launch 2 without its counters and tails (`DSV41_FFN_NOTAIL`), in place of the served one.
+    notail: ?mlx.mlx_fast_metal_kernel = null,
     prev: A = undefined,
     sa: dsv41.Split = undefined,
     sc: ?dsv41.Scope = null,
@@ -1772,7 +1774,9 @@ const Bench = struct {
                 return a.x1;
             },
             .new => {
-                const out = (try launch(sc, b.ks, p, set, oa, b.prev, &b.sa, b.eps, b.scal)).?;
+                var ks = b.ks;
+                if (b.notail) |k| ks.b = k;
+                const out = (try launch(sc, ks, p, set, oa, b.prev, &b.sa, b.eps, b.scal)).?;
                 try b.extra.appendSlice(b.gpa, &.{ out.idx, out.wts });
                 b.prev = out.x1;
                 b.sa = out.sf;
@@ -1865,6 +1869,8 @@ test "dsv41 dec ffn_in: ubench, R = 1..6: launch 1 on the vector kernel against 
     defer fx.deinit();
     const ks = try build();
     defer free(ks);
+    const notail = try dsv41.buildKernel("dsv41_dec_ffn_in_post_notail", &B_INS, &B_OUTS, B_SOURCE, "#define DSV41_FFN_NOTAIL 1\n");
+    defer _ = mlx.mlx_fast_metal_kernel_free(notail);
     const nsets = 48;
     var sets: [nsets]Weights = undefined;
     var layers: [nsets]dsv41.Layer = undefined;
@@ -1884,22 +1890,23 @@ test "dsv41 dec ffn_in: ubench, R = 1..6: launch 1 on the vector kernel against 
         const cpre = try fx.cpre(rows);
         defer _ = mlx.mlx_array_free(cpre);
         const sa0 = (try dsv41.hcStage(&sc, fx.m, x, null, cpre, &fx.layer(21).hc_attn, fx.layer(21).attn_norm)).sp;
-        var us: [4]f64 = undefined;
-        // Launch 1 vector, launch 1 matrix units, the pair, the fused launch.
-        const arms = [_]struct { mode: @TypeOf(@as(Bench, undefined).mode), nax: [*:0]const u8, fused: [*:0]const u8 }{
+        var us: [5]f64 = undefined;
+        // Launch 1 vector, launch 1 matrix units, the pair, the fused launch, the pair without launch 2's tails.
+        const arms = [_]struct { mode: @TypeOf(@as(Bench, undefined).mode), nax: [*:0]const u8, fused: [*:0]const u8, notail: bool = false }{
             .{ .mode = .launch_1, .nax = "0", .fused = "0" }, .{ .mode = .launch_1, .nax = "1", .fused = "0" },
             .{ .mode = .new, .nax = "0", .fused = "0" },      .{ .mode = .new, .nax = "0", .fused = "1" },
+            .{ .mode = .new, .nax = "0", .fused = "0", .notail = true },
         };
         for (&us, arms) |*t, arm| {
             var o1 = env.override(.MLX_SERVE_DSV41_GEMV_R26_FFN_IN, arm.nax);
             defer o1.restore();
             var o2 = env.override(.MLX_SERVE_DSV41_FUSE_FFN_IN, arm.fused);
             defer o2.restore();
-            var b = Bench{ .gpa = gpa, .rows = rows, .m = fx.m, .ks = ks, .sets = &sets, .layers = &layers, .x0 = x, .sa0 = sa0, .eps = eps, .scal = scal, .mode = arm.mode };
+            var b = Bench{ .gpa = gpa, .rows = rows, .m = fx.m, .ks = ks, .sets = &sets, .layers = &layers, .x0 = x, .sa0 = sa0, .eps = eps, .scal = scal, .mode = arm.mode, .notail = if (arm.notail) notail else null };
             defer b.deinit();
             t.* = (try b.us(nsets)).total;
         }
-        std.debug.print("[dec-ubench] ffn_in R={d}: launch 1 vector {d:.1} us, matrix units {d:.1} us ({d:.0}% of the wo_b floor); pair {d:.1} us, fused {d:.1} us\n", .{ rows, us[0], us[1], 100 * 43.2e6 / decode.stream_bytes_per_us / us[1], us[2], us[3] });
+        std.debug.print("[dec-ubench] ffn_in R={d}: launch 1 vector {d:.1} us, matrix units {d:.1} us ({d:.0}% of the wo_b floor); pair {d:.1} us, fused {d:.1} us; pair without launch 2's tails {d:.1} us (launch 2 {d:.1} us, its tails {d:.1} us)\n", .{ rows, us[0], us[1], 100 * 43.2e6 / decode.stream_bytes_per_us / us[1], us[2], us[3], us[4], us[2] - us[0], us[2] - us[4] });
     }
 }
 
