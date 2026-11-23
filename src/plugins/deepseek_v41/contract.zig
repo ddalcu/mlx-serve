@@ -4621,6 +4621,9 @@ const gate_gemm_l = metal.Launch{ .name = "dsv41_gate_gemm", .inputs = &.{ "a", 
 const markov_step_l = launch("dsv41_markov_step", &.{ "lg", "emb", "mh", "t1", "pin" }, &.{ "pout", "row" }, markov.step_source, markov.header, 4 * (2 * 8 + 1), 1024, false);
 const markov_final_l = launch("dsv41_markov_final", &.{ "parts", "t1", "hout", "emb", "cw" }, &.{ "toks", "conf" }, markov.final_source, markov.header, 4 * (3 * 16 + 1), 1024, false);
 const flash_l = metal.Launch{ .name = "dsv41_attn_flash", .inputs = &v41.GatherAttn.FLASH_INS, .outputs = &.{"o"}, .source = fa.source, .header = @import("decode/attn.zig").HEADER, .tg_bytes = 4 * 2 * 128 + 4 * 2 * 4 * 4 * 16 + 2 * 4 * 8 * 256, .offline = false, .min_gen = 17 };
+const flash_trim_l = metal.Launch{ .name = "dsv41_attn_flash_trim", .inputs = flash_l.inputs, .outputs = flash_l.outputs, .source = fa.source, .header = fa.header_trim, .tg_bytes = flash_l.tg_bytes, .offline = false, .min_gen = 17 };
+const flash_psum_l = metal.Launch{ .name = "dsv41_attn_flash_psum", .inputs = flash_l.inputs, .outputs = flash_l.outputs, .source = fa.source, .header = fa.header_psum, .tg_bytes = flash_l.tg_bytes, .offline = false, .min_gen = 17 };
+const flash_trim_psum_l = metal.Launch{ .name = "dsv41_attn_flash_trim_psum", .inputs = flash_l.inputs, .outputs = flash_l.outputs, .source = fa.source, .header = fa.header_trim_psum, .tg_bytes = flash_l.tg_bytes, .offline = false, .min_gen = 17 };
 const gather_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 } };
 const qk_t_l = metal.Launch{ .name = "dsv41_attn_qk_t", .inputs = &.{ "q", "kw", "comp", "picks", "meta", "qt" }, .outputs = &.{"s"}, .source = qtail.attn_qk_t_source, .header = v41.MPP_HEADER, .tg_bytes = 2 * 64 * 64 * 2, .offline = false, .min_gen = 17 };
 /// The slicing a variant's contract cases run at.
@@ -5132,6 +5135,36 @@ fn registerStreamed(set: *kc.Set) !void {
         .served = gather_served,
         .sums = .{ .exact = false },
     });
+    // FLASH_TRIM's text (FLASH_ATTN's values): the same bound.
+    inline for (.{ true, false }) |qt| try kit.add(set, AttnFlash, &flash_trim_l, .{ .qt = qt }, .{
+        .name = if (qt) "dsv41 attn_flash trim (one launch, f16 weights, max over raw scores, 8-byte stores, the roped tail from qt)" else "dsv41 attn_flash trim (one launch, f16 weights, max over raw scores, 8-byte stores)",
+        .accum = .f32,
+        .depth = kc.host.depthOne,
+        .out = .bf16,
+        .nax = true,
+        .served = gather_served,
+        .sums = .{ .exact = false },
+    });
+    // FLASH_TRIM and FLASH_PSUM together: the same bound.
+    inline for (.{ true, false }) |qt| try kit.add(set, AttnFlash, &flash_trim_psum_l, .{ .qt = qt }, .{
+        .name = if (qt) "dsv41 attn_flash trim+psum (one launch, f16 weights, the roped tail from qt)" else "dsv41 attn_flash trim+psum (one launch, f16 weights)",
+        .accum = .f32,
+        .depth = kc.host.depthOne,
+        .out = .bf16,
+        .nax = true,
+        .served = gather_served,
+        .sums = .{ .exact = false },
+    });
+    // FLASH_PSUM's sums (l over the rounded P): the same bound.
+    inline for (.{ true, false }) |qt| try kit.add(set, AttnFlash, &flash_psum_l, .{ .qt = qt }, .{
+        .name = if (qt) "dsv41 attn_flash psum (one launch, f16 weights, l over the rounded P, the roped tail from qt)" else "dsv41 attn_flash psum (one launch, f16 weights, l over the rounded P)",
+        .accum = .f32,
+        .depth = kc.host.depthOne,
+        .out = .bf16,
+        .nax = true,
+        .served = gather_served,
+        .sums = .{ .exact = false },
+    });
     // The vocabulary cut to 40,000 (129,280 served): the step is vocabulary-generic, and this still gives a simdgroup
     // more quads than one turn.
     try kit.add(set, MarkovStep, &markov_step_l, .{}, .{
@@ -5444,6 +5477,33 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
     if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
         const r = try ours(AttnFlash, a, &flash_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
         const fk = try v41.buildKernel("dsv41_attn_flash", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, @import("decode/attn.zig").HEADER);
+        defer _ = mlx.mlx_fast_metal_kernel_free(fk);
+        var got: [1]A = .{none};
+        try v41.flashLaunch(&sc, fk, r.c.args[0..9], &.{.{ .shape = &.{ 8, 3, HEADS / 8 * HD }, .dt = act }}, 3, HEADS, qt, act, &got);
+        try Expect.same(r.c, r.bytes, &got);
+    };
+    // FLASH_TRIM's kernel as the model builds and launches it (`fa.header_trim`).
+    if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
+        const r = try ours(AttnFlash, a, &flash_trim_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
+        const fk = try v41.buildKernel("dsv41_attn_flash_trim", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, fa.header_trim);
+        defer _ = mlx.mlx_fast_metal_kernel_free(fk);
+        var got: [1]A = .{none};
+        try v41.flashLaunch(&sc, fk, r.c.args[0..9], &.{.{ .shape = &.{ 8, 3, HEADS / 8 * HD }, .dt = act }}, 3, HEADS, qt, act, &got);
+        try Expect.same(r.c, r.bytes, &got);
+    };
+    // Both switches' kernel as the model builds and launches it (`fa.header_trim_psum`).
+    if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
+        const r = try ours(AttnFlash, a, &flash_trim_psum_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
+        const fk = try v41.buildKernel("dsv41_attn_flash_trim_psum", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, fa.header_trim_psum);
+        defer _ = mlx.mlx_fast_metal_kernel_free(fk);
+        var got: [1]A = .{none};
+        try v41.flashLaunch(&sc, fk, r.c.args[0..9], &.{.{ .shape = &.{ 8, 3, HEADS / 8 * HD }, .dt = act }}, 3, HEADS, qt, act, &got);
+        try Expect.same(r.c, r.bytes, &got);
+    };
+    // FLASH_PSUM's kernel as the model builds and launches it (`fa.header_psum`).
+    if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
+        const r = try ours(AttnFlash, a, &flash_psum_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
+        const fk = try v41.buildKernel("dsv41_attn_flash_psum", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, fa.header_psum);
         defer _ = mlx.mlx_fast_metal_kernel_free(fk);
         var got: [1]A = .{none};
         try v41.flashLaunch(&sc, fk, r.c.args[0..9], &.{.{ .shape = &.{ 8, 3, HEADS / 8 * HD }, .dt = act }}, 3, HEADS, qt, act, &got);
