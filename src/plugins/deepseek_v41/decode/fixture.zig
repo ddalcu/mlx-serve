@@ -886,7 +886,7 @@ test "dsv41 draft fused: a stage's attn_out and FFN on the fused decode kernels 
     var rel: [9]f64 = undefined;
     var n: usize = 0;
     for ([_]u64{ 5, 6, 7 }) |seed| {
-        const fx = try Fixture.initStages(gpa, 16, seed);
+        const fx = try initStagesNoQkv(gpa, 16, seed);
         defer fx.deinit();
         const m = fx.m;
         var st = try dsv41.initState(m, gpa);
@@ -982,6 +982,14 @@ test "dsv41 draft fused: an NVFP4 stage with ModelOpt's per-expert scales gives 
     }
     std.mem.sort(f64, rel[0..n], {}, std.sort.asc(f64));
     if (rel[n / 2] > bar) return error.FurtherFromChain;
+}
+
+/// `Fixture.initStages` with `MLX_SERVE_DSV41_DRAFT_QKV=0` at load: the stages' wq_a and wkv rows apart, so `dkern.in_proj`
+/// declines a stage and DRAFT_FUSED fuses only its attn_out and FFN.
+fn initStagesNoQkv(gpa: std.mem.Allocator, experts: u32, seed: u64) !*Fixture {
+    const o = env.override(.MLX_SERVE_DSV41_DRAFT_QKV, "0");
+    defer o.restore();
+    return Fixture.initStages(gpa, experts, seed);
 }
 
 /// `Fixture.initStages` with `MLX_SERVE_DSV41_DRAFT_QKV=1` at load, as a server with the switch loads: the stages' wq_a

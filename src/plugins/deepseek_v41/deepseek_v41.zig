@@ -1524,7 +1524,7 @@ pub fn loadLayer(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usiz
     // `MLX_SERVE_DSV41_DRAFT_QKV` (read at load): a stage's rows fused too, the q_kv `dkern.in_proj` reads (without it
     // in_proj declines every stage, so `stageFused` never runs and DRAFT_FUSED fuses only the stage's FFN half), its wkv
     // then a view of the fused rows for `kvRow`'s window rows: the same weights, no second copy.
-    if (trunk_li == null and env.on(.MLX_SERVE_DSV41_DRAFT_QKV) and ly.wq_a.s.ctx != null and ly.wkv.s.ctx != null) {
+    if (trunk_li == null and env.onUnlessZero(.MLX_SERVE_DSV41_DRAFT_QKV) and ly.wq_a.s.ctx != null and ly.wkv.s.ctx != null) {
         const qa_rows = dim(ly.wq_a.w, 0);
         const kv_rows = dim(ly.wkv.w, 0);
         if (try fuseRows(m, w, ly.wq_a, ly.wkv, 0)) |f| {
