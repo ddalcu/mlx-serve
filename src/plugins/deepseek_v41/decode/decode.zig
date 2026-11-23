@@ -236,17 +236,19 @@ fn layersFp4Levers(gpa: std.mem.Allocator, nv: bool, spec_: []const u8) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     const iou = @import("../../../sdk/util/io_util.zig");
     const L = moe_fp4.Levers;
-    // The third field: `MLX_SERVE_DSV41_MOE_DOWN_ORDER` (the down launch's column block major grid at 2 rows and up).
-    const Arm = struct { []const u8, L, bool };
+    // The third field: `MLX_SERVE_DSV41_MOE_DOWN_ORDER` (the down launch's column block major grid at 2 rows and up); the
+    // fourth `MLX_SERVE_DSV41_FFN_IN_SINK` (ffn_in launch 2's mix tail in its own launch).
+    const Arm = struct { []const u8, L, bool, bool };
     const named = [_]Arm{
-        .{ "dw", .{ .dec_word = true }, false },
-        .{ "us", .{ .up_split = true }, false },
-        .{ "all", .{ .dec_word = true, .up_split = true }, false },
-        .{ "ctl", .{ .dec_word = true }, false },
-        .{ "order", .{ .dec_word = true }, true },
+        .{ "dw", .{ .dec_word = true }, false, false },
+        .{ "us", .{ .up_split = true }, false, false },
+        .{ "all", .{ .dec_word = true, .up_split = true }, false, false },
+        .{ "ctl", .{ .dec_word = true }, moe_fp4.orderOn(), false },
+        .{ "order", .{ .dec_word = true }, true, false },
+        .{ "sink", .{ .dec_word = true }, moe_fp4.orderOn(), true },
     };
     var arms: [1 + named.len]Arm = undefined;
-    arms[0] = .{ "A (off)", .{}, false };
+    arms[0] = .{ "A (off)", .{}, false, false };
     var n: usize = 1;
     var it = std.mem.tokenizeAny(u8, spec_, " ,:");
     while (it.next()) |w| for (named) |c| if (std.mem.eql(u8, w, c[0])) {
@@ -254,7 +256,7 @@ fn layersFp4Levers(gpa: std.mem.Allocator, nv: bool, spec_: []const u8) !void {
         n += 1;
     };
     if (n == 1) {
-        arms[1] = .{ "as set", L.fromEnv(), moe_fp4.orderOn() };
+        arms[1] = .{ "as set", L.fromEnv(), moe_fp4.orderOn(), ffn_in.sinkOn() };
         n = 2;
     }
     std.debug.print("[dec-ubench] layers 20..40 {s} experts, {d} arms, two rounds\n", .{ if (nv) "nvfp4 + per-expert scales" else "mxfp4", n });
@@ -269,6 +271,8 @@ fn layersFp4Levers(gpa: std.mem.Allocator, nv: bool, spec_: []const u8) !void {
         defer o1.restore();
         const o2 = env.override(.MLX_SERVE_DSV41_MOE_DOWN_ORDER, if (arm[2]) "1" else "0");
         defer o2.restore();
+        const o3 = env.override(.MLX_SERVE_DSV41_FFN_IN_SINK, if (arm[3]) "1" else "0");
+        defer o3.restore();
         const t_fx = iou.nowUsMonotonic(io);
         // 64 experts a layer: 20 layers hold ~30 GB, so a step's weights come from DRAM, not the SLC.
         const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 40, .experts = 64, .ctx = 4096, .fused = true, .experts_fp4 = !nv, .experts_nvfp4 = nv, .expert_scales = if (nv) .all else .none });

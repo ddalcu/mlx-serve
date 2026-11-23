@@ -25,6 +25,9 @@ const HEADER = decode.FP8_READ_HEADER;
 const NAX_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_nax.metal");
 const NAX_HEADER = HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_nax_header.metal");
 const TAIL_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_tail.metal");
+/// `MLX_SERVE_DSV41_FFN_IN_SINK`: launch 2 without its mix tail, and that tail as its own launch.
+const SINK_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_sink.metal");
+const B_APART_HEADER = "#define DSV41_FFN_SINK_APART 1\n";
 /// The one-launch variant (`MLX_SERVE_DSV41_FUSE_FFN_IN`): launch 1's body, then launch 2's work in its tail.
 const F_SOURCE = A_SOURCE ++ TAIL_SOURCE;
 const F_HEADER = HEADER ++ "#define DSV41_FFN_FUSED 1\n";
@@ -34,6 +37,9 @@ const A_INS = [_][*:0]const u8{ "oa", "w_q", "scales", "x", "spre", "spost", "sc
 const A_OUTS = [_][*:0]const u8{ "x1", "hv", "ctr", "parts", "logits" };
 const B_INS = [_][*:0]const u8{ "x1", "hv", "fn", "scale", "base", "w", "gate_w", "bias", "scal", "eps", "ctr", "parts", "logits" };
 const B_OUTS = [_][*:0]const u8{ "h2", "pre", "post", "comb", "idx", "wts" };
+const B_APART_OUTS = [_][*:0]const u8{ "h2", "idx", "wts" };
+const SINK_INS = [_][*:0]const u8{ "parts", "scale", "base", "eps", "order" };
+const SINK_OUTS = [_][*:0]const u8{ "pre", "post", "comb" };
 const F_INS = A_INS ++ [_][*:0]const u8{ "fn", "scale", "base", "w", "gate_w", "bias", "scal", "eps", "facc" };
 const F_OUTS = [_][*:0]const u8{ "x1", "hv", "h2", "pre", "post", "comb", "idx", "wts" };
 
@@ -41,6 +47,9 @@ pub const Kernels = struct {
     a: mlx.mlx_fast_metal_kernel,
     b: mlx.mlx_fast_metal_kernel,
     fused: mlx.mlx_fast_metal_kernel,
+    /// `MLX_SERVE_DSV41_FFN_IN_SINK`: launch 2 without its mix tail, and the tail's own launch.
+    b_apart: mlx.mlx_fast_metal_kernel,
+    sink: mlx.mlx_fast_metal_kernel,
     /// Launch 1 on the matrix units (`MLX_SERVE_DSV41_GEMV_R26_FFN_IN`), NAX GPUs only.
     nax: ?mlx.mlx_fast_metal_kernel,
     /// The fused launch's persistent scratch (`dec_ffn_in_tail.metal`), zero between its dispatches.
@@ -62,8 +71,12 @@ pub fn build() !Kernels {
     errdefer _ = mlx.mlx_fast_metal_kernel_free(b);
     const f = try dsv41.buildKernel("dsv41_dec_ffn_in_fused", &F_INS, &F_OUTS, F_SOURCE, F_HEADER);
     errdefer _ = mlx.mlx_fast_metal_kernel_free(f);
+    const ba = try dsv41.buildKernel("dsv41_dec_ffn_in_post_apart", &B_INS, &B_APART_OUTS, B_SOURCE, B_APART_HEADER);
+    errdefer _ = mlx.mlx_fast_metal_kernel_free(ba);
+    const sk = try dsv41.buildKernel("dsv41_dec_ffn_in_sink", &SINK_INS, &SINK_OUTS, SINK_SOURCE, "");
+    errdefer _ = mlx.mlx_fast_metal_kernel_free(sk);
     const n = if (device.naxAvailable()) try dsv41.buildKernel("dsv41_dec_ffn_in_nax", &A_INS, &A_OUTS, NAX_SOURCE, NAX_HEADER) else null;
-    return .{ .a = a, .b = b, .fused = f, .nax = n, .facc = try newScratch() };
+    return .{ .a = a, .b = b, .fused = f, .b_apart = ba, .sink = sk, .nax = n, .facc = try newScratch() };
 }
 
 fn newScratch() !A {
@@ -77,6 +90,8 @@ pub fn free(k: Kernels) void {
     _ = mlx.mlx_fast_metal_kernel_free(k.a);
     _ = mlx.mlx_fast_metal_kernel_free(k.b);
     _ = mlx.mlx_fast_metal_kernel_free(k.fused);
+    _ = mlx.mlx_fast_metal_kernel_free(k.b_apart);
+    _ = mlx.mlx_fast_metal_kernel_free(k.sink);
     if (k.nax) |n| _ = mlx.mlx_fast_metal_kernel_free(n);
     _ = mlx.mlx_array_free(k.facc);
 }
@@ -85,6 +100,12 @@ pub fn free(k: Kernels) void {
 pub fn fusedOn() bool {
     const v = env.get(.MLX_SERVE_DSV41_FUSE_FFN_IN) orelse return false;
     return v[0] == '1';
+}
+
+/// `MLX_SERVE_DSV41_FFN_IN_SINK` (read each call): =1 launch 2's mix tail (the slices' reduce and the Sinkhorn split)
+/// runs as its own one-threadgroup launch, read only by the MoE down, so the MoE up does not wait on it.
+pub fn sinkOn() bool {
+    return env.on(.MLX_SERVE_DSV41_FFN_IN_SINK);
 }
 
 /// `MLX_SERVE_DSV41_GEMV_R26_FFN_IN` (read each call): =1 launch 1 runs on the matrix units from `nax_min_rows` rows.
@@ -221,7 +242,7 @@ pub const Weights = struct {
     gate_bias: A,
 };
 
-pub const Out = struct { x1: A, h2: A, sf: dsv41.Split, idx: A, wts: A, fused: bool = false, nax: bool = false };
+pub const Out = struct { x1: A, h2: A, sf: dsv41.Split, idx: A, wts: A, fused: bool = false, nax: bool = false, sink: bool = false };
 pub const AOut = struct { x1: A, hv: A, ctr: A, parts: A, logits: A, nax: bool = false };
 pub const BOut = struct { h2: A, sf: dsv41.Split, idx: A, wts: A };
 
@@ -297,6 +318,38 @@ pub fn launchB(sc: *dsv41.Scope, ks: Kernels, p: Dims, w: Weights, a: AOut, eps:
     return .{ .h2 = b[0], .sf = .{ .pre = b[1], .post = b[2], .comb = b[3] }, .idx = b[4], .wts = b[5] };
 }
 
+/// `launchB` as two launches (`MLX_SERVE_DSV41_FFN_IN_SINK`): launch 2 without its mix tail (`DSV41_FFN_SINK_APART`:
+/// h2, the picks and weights), then the mix tail's own launch over the partials launch 2 left in `a.parts` (the split).
+/// The same words as `launchB`'s.
+pub fn launchBApart(sc: *dsv41.Scope, ks: Kernels, p: Dims, w: Weights, a: AOut, eps: A, scal: A) !BOut {
+    const b = try run(3, sc, ks.b_apart, &.{ a.x1, a.hv, w.fn_w, w.fn_scale, w.fn_base, w.norm_w, w.gate_w, w.gate_bias, scal, eps, a.ctr, a.parts, a.logits }, .{
+        .{ .shape = &.{ ci(p.rows), ci(p.d) }, .dt = act },
+        .{ .shape = &.{ ci(p.rows), ci(p.top_k) }, .dt = .uint32 },
+        .{ .shape = &.{ ci(p.rows), ci(p.top_k) }, .dt = .float32 },
+    }, gridB(p), b_threads, &bTargs(p));
+    return .{ .h2 = b[0], .sf = try launchSink(sc, ks, p, a.parts, w.fn_scale, w.fn_base, eps, b[0]), .idx = b[1], .wts = b[2] };
+}
+
+/// The sink launch: the partials `parts` reduced over the slices, then the split (`dec_ffn_in_sink.metal`); `order` is
+/// launch 2's h2, read only so the launch follows launch 2.
+pub fn launchSink(sc: *dsv41.Scope, ks: Kernels, p: Dims, parts: A, scale: A, base: A, eps: A, order: A) !dsv41.Split {
+    const s = try run(3, sc, ks.sink, &.{ parts, scale, base, eps, order }, .{
+        .{ .shape = &.{ ci(p.rows), hc }, .dt = .float32 },
+        .{ .shape = &.{ ci(p.rows), hc }, .dt = .float32 },
+        .{ .shape = &.{ ci(p.rows), hc, hc }, .dt = .float32 },
+    }, b_threads, b_threads, &sinkTargs(p));
+    return .{ .pre = s[0], .post = s[1], .comb = s[2] };
+}
+
+/// Whether the sink launch takes `p`: whole 128-column slices, decode rows, its threadgroup memory.
+fn servesSink(p: Dims) bool {
+    return p.rows >= 1 and p.rows <= decode.max_rows and p.d % slice_cols == 0 and p.d >= slice_cols and 4 * p.rows * (slices(p) + 1) * (mixes + 1) <= 32768;
+}
+
+fn sinkTargs(p: Dims) [5]TArg {
+    return .{ .{ .name = "R", .v = p.rows }, .{ .name = "D", .v = p.d }, .{ .name = "P", .v = slices(p) }, .{ .name = "HC", .v = hc }, .{ .name = "ITERS", .v = p.iters } };
+}
+
 fn fTargs(p: Dims) [11]TArg {
     const a = aTargs(p);
     return a ++ [_]TArg{ .{ .name = "E", .v = p.e }, .{ .name = "TOPK", .v = p.top_k }, .{ .name = "ITERS", .v = p.iters }, .{ .name = "NORM", .v = @intFromBool(p.norm) } };
@@ -322,8 +375,9 @@ pub fn launch(sc: *dsv41.Scope, ks: Kernels, p: Dims, w: Weights, oa: A, x: A, s
     if (!serves(p)) return null;
     if (fusedOn() and servesFused(p)) return try launchFused(sc, ks.fused, ks.facc, p, w, oa, x, sa, eps, scal);
     const a = try launchA(sc, ks, p, w, oa, x, sa);
-    const b = try launchB(sc, ks, p, w, a, eps, scal);
-    return .{ .x1 = a.x1, .h2 = b.h2, .sf = b.sf, .idx = b.idx, .wts = b.wts, .nax = a.nax };
+    const apart = sinkOn();
+    const b = if (apart) try launchBApart(sc, ks, p, w, a, eps, scal) else try launchB(sc, ks, p, w, a, eps, scal);
+    return .{ .x1 = a.x1, .h2 = b.h2, .sf = b.sf, .idx = b.idx, .wts = b.wts, .nax = a.nax, .sink = apart };
 }
 
 // ── the kernel contract ──
@@ -388,6 +442,10 @@ fn depthNax(s: Shape) usize {
 /// The mixes' dot over the stream (4 D terms).
 fn depthB(s: Shape) usize {
     return hc * s.n;
+}
+/// The sink's sums: a lane's slices, then the simdgroup's tree.
+fn depthSink(s: Shape) usize {
+    return s.n / slice_cols / 32 + 1 + 5;
 }
 
 /// wo_b over the attention output, then each column's expand and collapse. Shape: rows, D columns, K.
@@ -641,20 +699,23 @@ fn pickKey(v: f64) f64 {
 
 /// The FFN's mixes and split, the rms-normed collapse and the router. Shape: rows, D, E.
 const FfnB = struct {
-    pub const Params = struct {};
+    /// `apart`: launch 2 without its mix tail (`MLX_SERVE_DSV41_FFN_IN_SINK`): h2 and the picks, no split.
+    pub const Params = struct { apart: bool = false };
 
     fn dims(s: Shape) Dims {
         return .{ .rows = s.rows, .d = s.n, .e = s.k };
     }
 
-    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+    pub fn geometry(prm: Params, s: Shape) ?metal.Geometry {
         const p = dims(s);
         if (!servesB(p)) return null;
         var g = metal.Geometry{ .grid = .{ ci(gridB(p)), 1, 1 }, .tg = .{ ci(b_threads), 1, 1 } };
         g.out(&.{ ci(p.rows), ci(p.d) }, act);
-        g.out(&.{ ci(p.rows), hc }, .float32);
-        g.out(&.{ ci(p.rows), hc }, .float32);
-        g.out(&.{ ci(p.rows), hc, hc }, .float32);
+        if (!prm.apart) {
+            g.out(&.{ ci(p.rows), hc }, .float32);
+            g.out(&.{ ci(p.rows), hc }, .float32);
+            g.out(&.{ ci(p.rows), hc, hc }, .float32);
+        }
         g.out(&.{ ci(p.rows), ci(p.top_k) }, .uint32);
         g.out(&.{ ci(p.rows), ci(p.top_k) }, .float32);
         for (bTargs(p)) |t| g.int(t.name, t.v);
@@ -724,9 +785,9 @@ const FfnB = struct {
         }
     }
 
-    /// h2, pre, post, comb, then the picks and their weights.
-    pub fn count(_: Params, s: Shape) usize {
-        return s.rows * (s.n + 2 * hc + hc * hc + 2 * 6);
+    /// h2, pre, post, comb (not `apart`), then the picks and their weights.
+    pub fn count(prm: Params, s: Shape) usize {
+        return s.rows * (s.n + (if (prm.apart) 0 else 2 * hc + hc * hc) + 2 * 6);
     }
 
     /// The router's picks by the stated rule (the biased scores, a NaN lowest, ties to the lower index) and its weights.
@@ -748,6 +809,23 @@ const FfnB = struct {
     }
 
     pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        if (!k.p.apart) return computeFull(k, out, mag, sum);
+        // `apart`: the full outputs, then h2 and the picks moved up over the split's.
+        const R = k.shape.rows;
+        const D = k.shape.n;
+        const a = k.scratch();
+        const full = try a.alloc(f64, count(.{}, k.shape));
+        defer a.free(full);
+        const fmag = try a.alloc(f64, full.len);
+        defer a.free(fmag);
+        try computeFull(k, full, fmag, sum);
+        const o_idx = R * D + R * (2 * hc + hc * hc);
+        @memcpy(out[0 .. R * D], full[0 .. R * D]);
+        @memcpy(out[R * D ..], full[o_idx..]);
+        for (mag, out) |*m, w| m.* = @abs(w);
+    }
+
+    fn computeFull(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
         const p = dims(k.shape);
         const R = p.rows;
         const D = p.d;
@@ -837,10 +915,11 @@ const FfnB = struct {
         defer a.free(tol);
         const eps0 = spec.roundTo(.f32, k.in(9)[0]);
         const eps1 = spec.roundTo(.f32, k.in(9)[1]);
+        const apart = k.p.apart;
         const o_pre = 2 * R * D;
         const o_post = o_pre + 4 * R * hc;
         const o_comb = o_post + 4 * R * hc;
-        const o_idx = o_comb + 4 * R * hc * hc;
+        const o_idx = if (apart) o_pre else o_comb + 4 * R * hc * hc;
         const o_wts = o_idx + 4 * R * p.top_k;
         for (0..R) |r| {
             contract.collapseNorm(k.in(1)[r * D ..][0..D], zeros, k.in(5), eps0, point, iv);
@@ -849,26 +928,29 @@ const FfnB = struct {
                 const ok = if (point) spec.classOf(o.*) == spec.classOf(q.lo) else q.has(o.*);
                 if (!ok) return std.fmt.bufPrint(&k.msg, "row {d} h2 {d} is {e} outside [{e}, {e}]", .{ r, d, o.*, q.lo, q.hi }) catch "h2";
             }
-            var z: [mixes]f64 = undefined;
-            var allow: [mixes]f64 = undefined;
-            mixZ(k.in(0)[r * N ..][0..N], k.in(2), k.in(3), k.in(4), eps0, &z, &allow);
-            var want: [mixes]f64 = undefined;
-            refSplit(&z, eps1, p.iters, &want);
-            var slack: [mixes]f64 = undefined;
-            for (&slack, want) |*s, v| s.* = split_ops * u * @abs(v) + 0x1p-140;
-            if (!point) for (0..mixes) |m| {
-                // First order: each mix's own allowance moved through the split.
-                const step = @max(allow[m], 1e-9);
-                var zz = z;
-                zz[m] += step;
-                var alt: [mixes]f64 = undefined;
-                refSplit(&zz, eps1, p.iters, &alt);
-                for (&slack, alt, want) |*s, v, w| s.* += 2 * @abs(v - w) * allow[m] / step;
-            };
-            for (want, slack, 0..) |w, s, o| {
-                const g = if (o < hc) outAt(k, .f32, o_pre, r * hc + o) else if (o < 2 * hc) outAt(k, .f32, o_post, r * hc + o - hc) else outAt(k, .f32, o_comb, r * hc * hc + o - 2 * hc);
-                const ok = if (point) spec.classOf(g) == spec.classOf(w) else @abs(g - w) <= s;
-                if (!ok) return std.fmt.bufPrint(&k.msg, "row {d} split output {d} is {e} where float64 gives {e}", .{ r, o, g, w }) catch "split";
+            // `apart`: the split is the sink launch's (`FfnSink`).
+            if (!apart) {
+                var z: [mixes]f64 = undefined;
+                var allow: [mixes]f64 = undefined;
+                mixZ(k.in(0)[r * N ..][0..N], k.in(2), k.in(3), k.in(4), eps0, &z, &allow);
+                var want: [mixes]f64 = undefined;
+                refSplit(&z, eps1, p.iters, &want);
+                var slack: [mixes]f64 = undefined;
+                for (&slack, want) |*s, v| s.* = split_ops * u * @abs(v) + 0x1p-140;
+                if (!point) for (0..mixes) |m| {
+                    // First order: each mix's own allowance moved through the split.
+                    const step = @max(allow[m], 1e-9);
+                    var zz = z;
+                    zz[m] += step;
+                    var alt: [mixes]f64 = undefined;
+                    refSplit(&zz, eps1, p.iters, &alt);
+                    for (&slack, alt, want) |*s, v, w| s.* += 2 * @abs(v - w) * allow[m] / step;
+                };
+                for (want, slack, 0..) |w, s, o| {
+                    const g = if (o < hc) outAt(k, .f32, o_pre, r * hc + o) else if (o < 2 * hc) outAt(k, .f32, o_post, r * hc + o - hc) else outAt(k, .f32, o_comb, r * hc * hc + o - 2 * hc);
+                    const ok = if (point) spec.classOf(g) == spec.classOf(w) else @abs(g - w) <= s;
+                    if (!ok) return std.fmt.bufPrint(&k.msg, "row {d} split output {d} is {e} where float64 gives {e}", .{ r, o, g, w }) catch "split";
+                }
             }
             // The router: logits from the h2 the kernel wrote; a score's error is the dot's, carried by the score's slope (<= 0.6).
             if (exact_router) {
@@ -922,6 +1004,162 @@ const FfnB = struct {
         return null;
     }
 };
+
+/// `MLX_SERVE_DSV41_FFN_IN_SINK`'s second launch: launch 2's mix partials (`D / 128` slices of each row's 24 dots and
+/// its sum of squares) reduced over the slices, then the split. Shape: rows, D; k unused.
+const FfnSink = struct {
+    pub const Params = struct {};
+
+    fn dims(s: Shape) Dims {
+        return .{ .rows = s.rows, .d = s.n };
+    }
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        const p = dims(s);
+        if (!servesSink(p)) return null;
+        var g = metal.Geometry{ .grid = .{ ci(b_threads), 1, 1 }, .tg = .{ ci(b_threads), 1, 1 } };
+        g.out(&.{ ci(p.rows), hc }, .float32);
+        g.out(&.{ ci(p.rows), hc }, .float32);
+        g.out(&.{ ci(p.rows), hc, hc }, .float32);
+        g.dtype("T", act);
+        for (sinkTargs(p)) |t| g.int(t.name, t.v);
+        return g;
+    }
+
+    /// The partials as launch 2's slices leave them (a slice's 4 x 128 terms of each dot, its 512 squares), the mixes'
+    /// scales and bases, the eps pair, and launch 2's h2 (read for order only).
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const p = dims(k.shape);
+        const R = p.rows;
+        const P = slices(p);
+        const PL = mixes + 1;
+        const parts = try k.add(.float32, &.{R * P * PL});
+        const scale = try k.add(.float32, &.{mixes});
+        const base = try k.add(.float32, &.{mixes});
+        const eps = try k.add(.float32, &.{2});
+        _ = try k.add(act, &.{ R, p.d });
+        kit.uniform(rng, scale, 0.5, 1.5);
+        kit.uniform(rng, base, -0.5, 0.5);
+        eps[0] = eps_rms;
+        eps[1] = eps_hc;
+        for (0..R * P) |q| {
+            const row = parts[q * PL ..][0..PL];
+            kit.uniform(rng, row[0..mixes], -0.4, 0.4);
+            kit.uniform(rng, row[mixes..], 400, 600);
+        }
+        switch (f) {
+            .random => {},
+            .nonfinite => kit.plantRows(parts, R, P * PL),
+            .stress => {
+                // Mirrored integers: each dot's even slices +(2^12 + a), its odd ones -(2^12 + b) (a, b below 2^10),
+                // the squares integers, eps 0. Every partial sum is an integer below 2^18, exact in fp32 in any order;
+                // fp16 and bf16 round the terms themselves (2^12 + a needs 13 bits) and miss the small total.
+                eps[0] = 0;
+                @memset(scale, 1);
+                @memset(base, 0);
+                for (0..R) |r| for (0..PL) |m| for (0..P) |sl| {
+                    const c: f64 = @floatFromInt(rng.uintLessThan(u32, 1024));
+                    const v: *f64 = &parts[(r * P + sl) * PL + m];
+                    v.* = if (m == mixes) 512 + @as(f64, @floatFromInt(rng.uintLessThan(u32, 64))) else if (sl % 2 == 0) 0x1p12 + c else -(0x1p12 + c);
+                };
+            },
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * (2 * hc + hc * hc);
+    }
+
+    /// One row's 24 mixes from its slices in float64, and each one's allowance: the slices' sum (lanes, then the tree)
+    /// on its terms, the rms's half on the product, the f32 tail.
+    /// `sum` (the gates' summation, the reference's when null) adds each sum's slices.
+    fn rowZ(k: anytype, r: usize, z: *[mixes]f64, allow: *[mixes]f64, sum: ?Sum) void {
+        const p = dims(k.shape);
+        const P = slices(p);
+        const PL = mixes + 1;
+        const parts = k.in(0);
+        const eps0 = spec.roundTo(.f32, k.in(3)[0]);
+        var col: [256]f64 = undefined;
+        for (0..P) |sl| col[sl] = parts[(r * P + sl) * PL + mixes];
+        var ss: f64 = 0;
+        var ssm: f64 = 0;
+        for (col[0..P]) |v| {
+            ss += v;
+            ssm += @abs(v);
+        }
+        if (sum) |sm| ss = sm.of(col[0..P]);
+        const g = spec.gamma(@as(f64, @floatFromInt(P / 32 + 1)) + 5, u);
+        const rs = 1 / @sqrt(ss / @as(f64, @floatFromInt(hc * p.d)) + eps0);
+        const rs_rel = g * ssm / @max(@abs(ss), 0x1p-140) / 2 + 3 * u;
+        for (z, allow, 0..) |*o, *al, m| {
+            var d: f64 = 0;
+            var mg: f64 = 0;
+            for (0..P) |sl| {
+                const v = parts[(r * P + sl) * PL + m];
+                col[sl] = v;
+                d += v;
+                mg += @abs(v);
+            }
+            if (sum) |sm| d = sm.of(col[0..P]);
+            const y = d * rs * k.in(1)[m];
+            o.* = y + k.in(2)[m];
+            al.* = g * mg * @abs(rs * k.in(1)[m]) + (rs_rel + 3 * u) * @abs(y) + 2 * u * @abs(o.*) + 0x1p-140;
+        }
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const R = k.shape.rows;
+        const eps1 = spec.roundTo(.f32, k.in(3)[1]);
+        for (0..R) |r| {
+            var z: [mixes]f64 = undefined;
+            var allow: [mixes]f64 = undefined;
+            rowZ(k, r, &z, &allow, sum);
+            var sp: [mixes]f64 = undefined;
+            refSplit(&z, eps1, sinkIters(), &sp);
+            @memcpy(out[r * hc ..][0..hc], sp[0..hc]);
+            @memcpy(out[R * hc + r * hc ..][0..hc], sp[hc .. 2 * hc]);
+            @memcpy(out[2 * R * hc + r * hc * hc ..][0 .. hc * hc], sp[2 * hc ..]);
+        }
+        for (mag, out) |*m, w| m.* = @abs(w);
+    }
+
+    /// The split within the mixes' propagated allowance, as `FfnB` checks it.
+    pub fn check(k: anytype, at: spec.Gate) !?[]const u8 {
+        const R = k.shape.rows;
+        const point = at == .nonfinite;
+        const eps1 = spec.roundTo(.f32, k.in(3)[1]);
+        const o_post = 4 * R * hc;
+        const o_comb = o_post + 4 * R * hc;
+        for (0..R) |r| {
+            var z: [mixes]f64 = undefined;
+            var allow: [mixes]f64 = undefined;
+            rowZ(k, r, &z, &allow, null);
+            var want: [mixes]f64 = undefined;
+            refSplit(&z, eps1, sinkIters(), &want);
+            var slack: [mixes]f64 = undefined;
+            for (&slack, want) |*sl, v| sl.* = split_ops * u * @abs(v) + 0x1p-140;
+            if (!point) for (0..mixes) |m| {
+                const step = @max(allow[m], 1e-9);
+                var zz = z;
+                zz[m] += step;
+                var alt: [mixes]f64 = undefined;
+                refSplit(&zz, eps1, sinkIters(), &alt);
+                for (&slack, alt, want) |*sl, v, w| sl.* += 2 * @abs(v - w) * allow[m] / step;
+            };
+            for (want, slack, 0..) |w, sl, o| {
+                const g = if (o < hc) outAt(k, .f32, 0, r * hc + o) else if (o < 2 * hc) outAt(k, .f32, o_post, r * hc + o - hc) else outAt(k, .f32, o_comb, r * hc * hc + o - 2 * hc);
+                const ok = if (point) spec.classOf(g) == spec.classOf(w) else @abs(g - w) <= sl;
+                if (!ok) return std.fmt.bufPrint(&k.msg, "row {d} split output {d} is {e} where float64 gives {e}", .{ r, o, g, w }) catch "split";
+            }
+        }
+        return null;
+    }
+};
+
+/// The Sinkhorn iterations the contract's sink launches run (the release's).
+fn sinkIters() usize {
+    return (Dims{ .rows = 1 }).iters;
+}
 
 /// The fused launch: `FfnA`'s outputs then `FfnB`'s, judged by their rules: launch 1's by `FfnA.check`, launch 2's by
 /// `FfnB`'s on the x1 and hv the launch wrote, its router from the unrounded normed collapse. Shape: rows, D, K; `e`
@@ -1058,6 +1296,29 @@ const launch_b = metal.Launch{
     .m2 = 704,
 };
 
+const launch_b_apart = metal.Launch{
+    .name = "dsv41_dec_ffn_in_post_apart",
+    .inputs = &B_INS,
+    .outputs = &B_APART_OUTS,
+    .source = B_SOURCE,
+    .header = B_APART_HEADER,
+    .tg_bytes = 4 * 7728 + 4,
+    // `launch_b`'s records: the same source less the mix tail (a lower bound on its own limits).
+    .m1 = 704,
+    .m2 = 704,
+};
+
+const launch_sink = metal.Launch{
+    .name = "dsv41_dec_ffn_in_sink",
+    .inputs = &SINK_INS,
+    .outputs = &SINK_OUTS,
+    .source = SINK_SOURCE,
+    .tg_bytes = 4 * decode.max_rows * (40 + 1) * (mixes + 1),
+    // its own 256-thread launch (a lower bound; no `kernel contract offline` record yet).
+    .m1 = 256,
+    .m2 = 256,
+};
+
 const launch_nax = metal.Launch{
     .name = "dsv41_dec_ffn_in_nax",
     .inputs = &A_INS,
@@ -1112,6 +1373,38 @@ pub fn register(set: *kc.Set) !void {
         .nan = nan_rule,
         .tiles = .{ .{ .size = 3 }, .{}, .{ .size = 16, .step = 8, .min = 8 } },
         .served = &.{ .{ .rows = 1, .n = 5120, .k = 384 }, .{ .rows = 6, .n = 5120, .k = 384 } },
+    });
+    try kit.add(set, FfnB, &launch_b_apart, .{ .apart = true }, .{
+        .name = "dsv41 dec ffn_in B apart (the mixes' partials, norm, router; the split in the sink launch)",
+        .accum = .f32,
+        .depth = depthB,
+        .mids = 1,
+        .out = .bf16,
+        .outs = &.{
+            .{ .elem = .bf16, .count = perD },
+            .{ .elem = .u32, .count = perPick },
+            .{ .elem = .f32, .count = perPick },
+        },
+        .in_place = true,
+        .nan = nan_rule,
+        .tiles = .{ .{ .size = 3 }, .{}, .{ .size = 16, .step = 8, .min = 8 } },
+        .served = &.{ .{ .rows = 1, .n = 5120, .k = 384 }, .{ .rows = 6, .n = 5120, .k = 384 } },
+    });
+    try kit.add(set, FfnSink, &launch_sink, .{}, .{
+        .name = "dsv41 dec ffn_in sink (the mixes' slices reduced, the split)",
+        .accum = .f32,
+        .depth = depthSink,
+        .ops = split_ops,
+        .mids = 1,
+        .out = .f32,
+        .outs = &.{
+            .{ .elem = .f32, .count = perHc },
+            .{ .elem = .f32, .count = perHc },
+            .{ .elem = .f32, .count = perComb },
+        },
+        .nan = nan_rule,
+        .tiles = .{ .{ .size = 3 }, .{ .size = 128, .step = 128, .min = 128 }, .{} },
+        .served = &.{ .{ .rows = 1, .n = 5120, .k = 1 }, .{ .rows = 6, .n = 5120, .k = 1 } },
     });
     try kit.add(set, FfnA, &launch_nax, .{ .nax = true }, .{
         .name = "dsv41 dec ffn_in A on the matrix units (wo_b, expand, collapse)",
@@ -1504,6 +1797,74 @@ test "dsv41 dec ffn_in nax: MLX_SERVE_DSV41_GEMV_R26_FFN_IN=1, rows 1..6 on laye
     if (equivalence(gpa, fx, ks, &ly, bad, 4)) |_| return error.PlantedBugPassed else |_| {}
 }
 
+/// `launch` on one case with `MLX_SERVE_DSV41_FFN_IN_SINK` off, then on (or the planted sink at `plant_iters` Sinkhorn
+/// iterations): the number of output words that differ (x1, h2, pre, post, comb, the picks, their weights).
+fn sinkDiff(gpa: std.mem.Allocator, fx: *Fixture, ks: Kernels, ly: *const dsv41.Layer, w: Weights, rows: usize, plant_iters: ?usize) !usize {
+    const m = fx.m;
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const oa = try fx.normal(&.{ ci(rows), 8192 }, act, 0, 1);
+    defer _ = mlx.mlx_array_free(oa);
+    const x = try fx.stream(rows);
+    defer _ = mlx.mlx_array_free(x);
+    const cpre = try fx.cpre(rows);
+    defer _ = mlx.mlx_array_free(cpre);
+    const sa = (try dsv41.hcStage(&sc, m, x, null, cpre, &ly.hc_attn, ly.attn_norm)).sp;
+    const eps = try dsv41.hcEps(&sc, m);
+    const scal = mlx.mlx_array_new_data(&[_]f32{m.cfg.router_scaling_factor}, &[_]c_int{1}, 1, .float32);
+    try sc.items.append(sc.a, scal);
+    const p: Dims = .{ .rows = rows, .d = m.cfg.hidden_size, .e = @intCast(mlx.getShape(ly.gate_w)[0]), .top_k = ly.top_k, .iters = m.cfg.dsv4_hc_sinkhorn_iters, .norm = m.cfg.moe_route_norm and ly.top_k > 1 };
+    var outs: [2][7]A = undefined;
+    for (0..2) |k| {
+        var ov = env.override(.MLX_SERVE_DSV41_FFN_IN_SINK, if (k == 0) "0" else "1");
+        defer ov.restore();
+        var o = (try launch(&sc, ks, p, w, oa, x, &sa, eps, scal)) orelse return error.Declined;
+        if (k == 1) try std.testing.expect(o.sink);
+        if (k == 1) if (plant_iters) |it| {
+            var q = p;
+            q.iters = it;
+            const a = try launchA(&sc, ks, q, w, oa, x, &sa);
+            const b = try launchBApart(&sc, ks, q, w, a, eps, scal);
+            o.sf = b.sf;
+        };
+        outs[k] = .{ o.x1, o.h2, o.sf.pre, o.sf.post, o.sf.comb, o.idx, o.wts };
+        try dsv41.evalAll(&outs[k]);
+    }
+    var differ: usize = 0;
+    for (outs[0], outs[1]) |a, b| {
+        const n = mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a);
+        try std.testing.expectEqual(n, mlx.mlx_array_size(b) * mlx.mlx_array_itemsize(b));
+        const xa = mlx.mlx_array_data_uint8(a) orelse return error.NoData;
+        const xb = mlx.mlx_array_data_uint8(b) orelse return error.NoData;
+        var i: usize = 0;
+        while (i < n) : (i += 4) differ += @intFromBool(!std.mem.eql(u8, xa[i..][0..4], xb[i..][0..4]));
+    }
+    return differ;
+}
+
+test "dsv41 dec ffn_in sink: MLX_SERVE_DSV41_FFN_IN_SINK=1 gives launch 2's words, rows 1..6 on layers 21 and 23 and at 384 experts; a planted 1-iteration Sinkhorn fails" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .ctx = 8 });
+    defer fx.deinit();
+    const ks = try build();
+    defer free(ks);
+    const w = try randomWeights(86);
+    defer freeWeights(w);
+    const wide = layerWith(fx.layer(21), w);
+    var cases: usize = 0;
+    for ([_]usize{ 21, 23, 0 }) |li| for (1..decode.max_rows + 1) |rows| {
+        const ly = if (li == 0) &wide else fx.layer(li);
+        const wl = if (li == 0) w else weightsOf(ly);
+        try std.testing.expectEqual(@as(usize, 0), try sinkDiff(gpa, fx, ks, ly, wl, rows, null));
+        cases += 1;
+    };
+    // (the split converges within the served 20 iterations' f32 words well before the last: a short split is 1 iteration)
+    const planted = try sinkDiff(gpa, fx, ks, &wide, w, 3, 1);
+    std.debug.print("[dec] ffn_in sink: {d} cases word for word; the planted 1-iteration Sinkhorn moves {d} words\n", .{ cases, planted });
+    try std.testing.expect(planted > 0);
+}
+
 test "dsv41 dec ffn_in fused: the same inputs give the same bytes, launch after launch, at the release's shapes" {
     if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
@@ -1600,6 +1961,21 @@ test "dsv41 dec ffn_in: the contract's launches write the shipped wrapper's byte
     const b = try launchB(&sc, ks, pb, wb, ab, cb.args[9], cb.args[8]);
     const got = [_]A{ b.h2, b.sf.pre, b.sf.post, b.sf.comb, b.idx, b.wts };
     for (got, 0..) |g, i| try std.testing.expect(try sameBytes(&cb.rig, g, cb.rig.output(i)));
+    // `MLX_SERVE_DSV41_FFN_IN_SINK`'s two launches.
+    var cp = kit.Case(FfnB).init(gpa, &launch_b_apart, .{ .apart = true });
+    defer cp.deinit();
+    try std.testing.expect(try cp.prepare(.{ .rows = 3, .n = 5120, .k = 384 }, .random, 9));
+    try cp.run();
+    const wp: Weights = .{ .wo_w = none, .wo_s = none, .fn_w = cp.args[2], .fn_scale = cp.args[3], .fn_base = cp.args[4], .norm_w = cp.args[5], .gate_w = cp.args[6], .gate_bias = cp.args[7] };
+    const ap: AOut = .{ .x1 = cp.args[0], .hv = cp.args[1], .ctr = cp.args[10], .parts = cp.args[11], .logits = cp.args[12] };
+    const bp = try launchBApart(&sc, ks, pb, wp, ap, cp.args[9], cp.args[8]);
+    for ([_]A{ bp.h2, bp.idx, bp.wts }, 0..) |g, i| try std.testing.expect(try sameBytes(&cp.rig, g, cp.rig.output(i)));
+    var cs = kit.Case(FfnSink).init(gpa, &launch_sink, .{});
+    defer cs.deinit();
+    try std.testing.expect(try cs.prepare(.{ .rows = 3, .n = 5120, .k = 1 }, .random, 11));
+    try cs.run();
+    const sp = try launchSink(&sc, ks, pb, cs.args[0], cs.args[1], cs.args[2], cs.args[3], cs.args[4]);
+    for ([_]A{ sp.pre, sp.post, sp.comb }, 0..) |g, i| try std.testing.expect(try sameBytes(&cs.rig, g, cs.rig.output(i)));
 }
 
 /// A `[n]` f32 array of `v`, as `dt`.
@@ -1701,13 +2077,28 @@ test "dsv41 dec ffn_in: launch 2 and the fused launch pass the contract's gates 
     try register(&set);
     var pick: std.ArrayList(kit.gates.Kernel) = .empty;
     defer pick.deinit(gpa);
-    for (set.kernels.items) |k| if (std.mem.indexOf(u8, k.spec.name, "ffn_in B ") != null or std.mem.indexOf(u8, k.spec.name, "ffn_in fused ") != null) try pick.append(gpa, k);
+    for (set.kernels.items) |k| if (std.mem.indexOf(u8, k.spec.name, "ffn_in B (") != null or std.mem.indexOf(u8, k.spec.name, "ffn_in fused ") != null) try pick.append(gpa, k);
     try std.testing.expectEqual(@as(usize, 2), pick.items.len);
     var t: kit.gates.Tally = .{};
     try kit.gates.runAll(gpa, pick.items, 0xc0de, &t);
     try std.testing.expectEqual(@as(usize, 0), t.problems());
     // The stress inputs where f32 log(1 + y) put the routed weights 6.5x past the exact-sum bound.
     try std.testing.expectEqual(kit.gates.Verdict.pass, try kit.gates.sums(gpa, pick.items[0], 0xc0de));
+}
+
+test "dsv41 dec ffn_in sink: launch 2 apart and the sink launch pass the contract's gates 1-4" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var set = kc.Set.init(gpa);
+    defer set.deinit();
+    try register(&set);
+    var pick: std.ArrayList(kit.gates.Kernel) = .empty;
+    defer pick.deinit(gpa);
+    for (set.kernels.items) |k| if (std.mem.indexOf(u8, k.spec.name, "ffn_in B apart") != null or std.mem.indexOf(u8, k.spec.name, "ffn_in sink") != null) try pick.append(gpa, k);
+    try std.testing.expectEqual(@as(usize, 2), pick.items.len);
+    var t: kit.gates.Tally = .{};
+    try kit.gates.runAll(gpa, pick.items, 0xc0de, &t);
+    try std.testing.expectEqual(@as(usize, 0), t.problems());
 }
 
 // ── ubench ──
@@ -1727,6 +2118,8 @@ const Bench = struct {
     eps: A,
     scal: A,
     mode: enum { new, chain, launch_1 },
+    /// The ubench's bound: launch 2 without its counters and tails (`DSV41_FFN_NOTAIL`), in place of the served one.
+    notail: ?mlx.mlx_fast_metal_kernel = null,
     prev: A = undefined,
     sa: dsv41.Split = undefined,
     sc: ?dsv41.Scope = null,
@@ -1772,7 +2165,9 @@ const Bench = struct {
                 return a.x1;
             },
             .new => {
-                const out = (try launch(sc, b.ks, p, set, oa, b.prev, &b.sa, b.eps, b.scal)).?;
+                var ks = b.ks;
+                if (b.notail) |k| ks.b = k;
+                const out = (try launch(sc, ks, p, set, oa, b.prev, &b.sa, b.eps, b.scal)).?;
                 try b.extra.appendSlice(b.gpa, &.{ out.idx, out.wts });
                 b.prev = out.x1;
                 b.sa = out.sf;
@@ -1865,6 +2260,8 @@ test "dsv41 dec ffn_in: ubench, R = 1..6: launch 1 on the vector kernel against 
     defer fx.deinit();
     const ks = try build();
     defer free(ks);
+    const notail = try dsv41.buildKernel("dsv41_dec_ffn_in_post_notail", &B_INS, &B_OUTS, B_SOURCE, "#define DSV41_FFN_NOTAIL 1\n");
+    defer _ = mlx.mlx_fast_metal_kernel_free(notail);
     const nsets = 48;
     var sets: [nsets]Weights = undefined;
     var layers: [nsets]dsv41.Layer = undefined;
@@ -1884,22 +2281,23 @@ test "dsv41 dec ffn_in: ubench, R = 1..6: launch 1 on the vector kernel against 
         const cpre = try fx.cpre(rows);
         defer _ = mlx.mlx_array_free(cpre);
         const sa0 = (try dsv41.hcStage(&sc, fx.m, x, null, cpre, &fx.layer(21).hc_attn, fx.layer(21).attn_norm)).sp;
-        var us: [4]f64 = undefined;
-        // Launch 1 vector, launch 1 matrix units, the pair, the fused launch.
-        const arms = [_]struct { mode: @TypeOf(@as(Bench, undefined).mode), nax: [*:0]const u8, fused: [*:0]const u8 }{
+        var us: [5]f64 = undefined;
+        // Launch 1 vector, launch 1 matrix units, the pair, the fused launch, the pair without launch 2's tails.
+        const arms = [_]struct { mode: @TypeOf(@as(Bench, undefined).mode), nax: [*:0]const u8, fused: [*:0]const u8, notail: bool = false }{
             .{ .mode = .launch_1, .nax = "0", .fused = "0" }, .{ .mode = .launch_1, .nax = "1", .fused = "0" },
             .{ .mode = .new, .nax = "0", .fused = "0" },      .{ .mode = .new, .nax = "0", .fused = "1" },
+            .{ .mode = .new, .nax = "0", .fused = "0", .notail = true },
         };
         for (&us, arms) |*t, arm| {
             var o1 = env.override(.MLX_SERVE_DSV41_GEMV_R26_FFN_IN, arm.nax);
             defer o1.restore();
             var o2 = env.override(.MLX_SERVE_DSV41_FUSE_FFN_IN, arm.fused);
             defer o2.restore();
-            var b = Bench{ .gpa = gpa, .rows = rows, .m = fx.m, .ks = ks, .sets = &sets, .layers = &layers, .x0 = x, .sa0 = sa0, .eps = eps, .scal = scal, .mode = arm.mode };
+            var b = Bench{ .gpa = gpa, .rows = rows, .m = fx.m, .ks = ks, .sets = &sets, .layers = &layers, .x0 = x, .sa0 = sa0, .eps = eps, .scal = scal, .mode = arm.mode, .notail = if (arm.notail) notail else null };
             defer b.deinit();
             t.* = (try b.us(nsets)).total;
         }
-        std.debug.print("[dec-ubench] ffn_in R={d}: launch 1 vector {d:.1} us, matrix units {d:.1} us ({d:.0}% of the wo_b floor); pair {d:.1} us, fused {d:.1} us\n", .{ rows, us[0], us[1], 100 * 43.2e6 / decode.stream_bytes_per_us / us[1], us[2], us[3] });
+        std.debug.print("[dec-ubench] ffn_in R={d}: launch 1 vector {d:.1} us, matrix units {d:.1} us ({d:.0}% of the wo_b floor); pair {d:.1} us, fused {d:.1} us; pair without launch 2's tails {d:.1} us (launch 2 {d:.1} us, its tails {d:.1} us)\n", .{ rows, us[0], us[1], 100 * 43.2e6 / decode.stream_bytes_per_us / us[1], us[2], us[3], us[4], us[2] - us[0], us[2] - us[4] });
     }
 }
 
