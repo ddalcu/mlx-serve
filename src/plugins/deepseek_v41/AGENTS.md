@@ -9,7 +9,8 @@ load as MLX nvfp4 banks with ModelOpt's per-expert globals (`Experts.scale`), it
 converter's `--experts-mxfp4` writes the experts as mxfp4 g32 instead: value-identical to NVIDIA's NVFP4 pack
 (16,986,931,200 groups checked) only because this release's scales are powers of two (NVFP4 is in general the more
 accurate format: 16-value groups and e4m3 scales capture spiky weights); faster prefill and 18 GB smaller. The core
-serves either from the pack, with no flag.
+serves either from the pack, with no flag. Users' docs (the NVFP4 release: pack, defaults, M5 Ultra 512 GB setup,
+DSpark, lossless classes): `README.md`.
 
 ## Files
 - `plugin.zig`: the table; `CacheHooks.aux` / live `state_bytes`; streamed/paired legacy `resume_prompt`;
@@ -34,8 +35,8 @@ serves either from the pack, with no flag.
   reserve from `patches/mlx-metal-wide-reserve.patch`),
   Engram's direct read (`engram_direct`), the embedding pread and a plugin bank's own pieces (`wide_early`, `woa_rows`),
   `flash_attn` (the flash kernel, not exact, on by default for every pack), an fp4 bank's gate and up with `moe_act`
-  in one paired launch (`moe_pair`); `wide_test.zig` holds each default-off rewrite to a tolerance of the stock path,
-  with a planted bug each.
+  in one paired launch (`moe_pair`); `wide_test.zig` holds each default-on rewrite to its `=0` path: word for word,
+  or no farther from float64 (`MOE_PAIR_SCALED` and `PF_HC_V2` to reorder bounds), with a planted bug each.
 - `fuse.zig`: launch fusions, each behind its own switch (`Dsv41Model.fuse`; `FUSE_DOWN_SCALE` and `FUSE_MXFP8_QMM` on
   by default), served only on the resident weight path
   (`MLX_SERVE_DSV41_WEIGHT_PATH`, `settle`); `ssd` keeps today's kernels.
@@ -102,8 +103,8 @@ serves either from the pack, with no flag.
   (`Hash.DEAD`).
 - The resume key includes the image rows: a different image at the same tokens is a cold prompt.
 - DSpark = DFlash + Markov head: `block_size` at ROOT; `rope_is_neox_style:false` = MLX `traditional=true`; `w1`
-  DENSE; sampled requests via one-hot acceptance. Per-model `mtp:false` keeps the
-  stages off (`mtpSetting`).
+  DENSE; sampled requests draw drafts from q and keep them at min(1, p / q) (`MLX_SERVE_DSV41_DRAFT_SAMPLE`; `=0`
+  one-hot acceptance). Per-model `mtp:false` keeps the stages off (`mtpSetting`).
 - The confidence head is calibrated: a draft is accepted at about the sigmoid of its logit, at every block position.
   The policy's bins start from it (`Calibration.head`); the GLM-fitted prior read 0.93 as 0.65 and starved rows.
 - Engine code that drives the module directly (a DSpark round) activates its slot first (`activate_slot`); a
@@ -138,6 +139,8 @@ serves either from the pack, with no flag.
 - A prompt chunk of 4096 rows or more that nothing read ahead runs as its first half, then the rest (`extendCold`,
   `leadRows`; the lead is `Want.encode`: no decoder replay, which the rest makes): the drive reads the rest's Engram
   rows behind the lead. The log's `waited ... ms` is the meter.
+- Every default-on switch is EXACT, REORDER, DRAFT-ONLY or TF32 (`README.md` "Lossless classes"); `HEAD8` is the one
+  requantization. A new default-on switch owes a standing word or float64 test against its `=0` path, a plant failing.
 - Construct each MPP cooperative tensor from its owning op; copying one invokes incompatible Metal layout
   interfaces on some SDKs. Fill each operand's independent storage before running the matmul.
 
@@ -185,7 +188,7 @@ serves either from the pack, with no flag.
   The hot cache snapshots at chunk ends, so fewer passes leave fewer reuse points.
 - A load that Metal's working-set limit refuses but RAM holds names `iogpu.wired_limit_mb` and logs the
   `sudo sysctl iogpu.wired_limit_mb=<N>` that admits it (`wiredLimitAdviceMb`: the load's bill plus the 8 GiB wired
-  margin), never paging: the NVFP4 pack's ~400 GB needs it raised on a 512 GB Mac.
+  margin), never paging. The NVFP4 release runs raise it on a 512 GB Mac (`README.md` has the value).
 - On NAX a resident pack's greedy DSpark text is plain decode's under `MLX_SERVE_DSV41_EXACT_VERIFY=1` with the fused
   fp4 decode on: a verify row's head, Engram wkv and wo_a run as its plain step's, every verify keeps to `max_rows`.
   Off (default) the multi-row kernels serve: the same math in another order. The greedy accept's mask is always on.
