@@ -202,8 +202,13 @@ pub fn settle(m: *dsv41.Dsv41Model) !void {
     const n: usize = @intCast(mlx.getShape(e0.wkv.w)[0]);
     const k: usize = @as(usize, @intCast(mlx.getShape(e0.wkv.w)[1])) * 4;
     const nc = hs.cols();
-    const serves = for (m.engrams) |*e| {
-        if (e.table.head_dim != engram_kv.slot_hd or @as(usize, @intCast(mlx.getShape(e.wkv.w)[0])) != n or k != nc * engram_kv.slot_hd or k % 512 != 0 or n % engram_kv.slot_cols != 0) break false;
+    var facts: engram_kvc.Facts = .{ .layers = m.engrams.len, .held = true, .streamed = m.cfg.dsv41_streamed, .reads = true };
+    for (m.engrams) |*e| {
+        facts.held = facts.held and e.table.isHeld();
+        facts.reads = facts.reads and engram_kvc.tableReads(&e.table);
+    }
+    const serves = engram_kvc.allocates(facts) and for (m.engrams) |*e| {
+        if (@as(usize, @intCast(mlx.getShape(e.wkv.w)[0])) != n or k != nc * engram_kv.slot_hd or k % 512 != 0 or n % engram_kv.slot_cols != 0) break false;
     } else true;
     m.kvc = if (serves) try engram_kvc.Cache.init(m.s, m.engrams.len * nc, n) else null;
     if (m.kvc) |*c| {

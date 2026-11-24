@@ -20,6 +20,8 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const env = @import("../../../env.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const engram_kv = @import("engram_kv.zig");
+const engram_ids = @import("engram_ids.zig");
+const engram = @import("../engram.zig");
 
 const A = mlx.mlx_array;
 const Scope = dsv41.Scope;
@@ -38,9 +40,36 @@ pub fn on() bool {
     return env.onUnlessZero(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE);
 }
 
-/// The load's bill for the cache: its bound, where the switch is on and the pack has Engram layers.
-pub fn billBytes(n_engram_layers: usize) u64 {
-    return if (on() and n_engram_layers > 0) cap_bytes else 0;
+/// What decides the cache, known alike before the load (the bill, `residentDiskBytes`) and at it (`engram_ids.settle`).
+pub const Facts = struct {
+    layers: usize,
+    /// Every Engram table held in memory: as the bill bills them, as the load holds them.
+    held: bool,
+    /// The routed experts stream (`Config.dsv41_streamed`).
+    streamed: bool,
+    /// Every table `tableReads`.
+    reads: bool,
+};
+
+/// Whether a load allocates the cache: this switch and `MLX_SERVE_DSV41_ENGRAM_GPU_IDS` on, every Engram table held
+/// in the form the slot kernel reads, resident experts. The load may still decline on what only it sees (a pair, a
+/// Metal buffer refused, the wkv's layout); the bill then counts a cap that is not used.
+pub fn allocates(f: Facts) bool {
+    return on() and engram_ids.on() and f.layers > 0 and f.held and f.reads and !f.streamed;
+}
+
+/// The load's bill for the cache: its bound where the load allocates it.
+pub fn billBytes(f: Facts) u64 {
+    return if (allocates(f)) cap_bytes else 0;
+}
+
+/// Whether the GPU ids path and the slot kernel read table `t`: separate mxfp4 or mxfp8 code and scale regions,
+/// `slot_hd` wide, the codes aligned to the kernels' loads (`fuse.wrapHeld`, `fuse.kvServes`, `engram_kv.launchSlots`).
+pub fn tableReads(t: *const engram.Table) bool {
+    if (!((t.mode == .mxfp4 and t.bits == 4) or (t.mode == .mxfp8 and t.bits == 8)) or t.group_size != 32) return false;
+    if (t.records() or t.head_dim != engram_kv.slot_hd or t.wlen != t.head_dim * t.bits / 8 or t.slen != t.head_dim / 32) return false;
+    const al: u64 = if (t.bits == 4) 8 else 16;
+    return (t.w_off % std.heap.pageSize()) % al == 0 and t.w_stride % al == 0;
 }
 
 /// Sets a table for `nt` tables of `n`-wide partials within `cap_bytes`, at most `max_sets` (each step's look-up

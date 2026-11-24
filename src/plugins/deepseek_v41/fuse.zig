@@ -1,7 +1,8 @@
-//! Launch fusions for a resident model, each off by default behind its own switch, all of them behind the weight
-//! path (`MLX_SERVE_DSV41_WEIGHT_PATH`, `settle`, read at load): `resident` serves them, `ssd` the streamed and staged
-//! kernels as before (no fusion engages), `auto` resident when no bank streams and every Engram table is held. A
-//! forced `resident` on a streamed or partly held pack is refused by name.
+//! Launch fusions for a resident model, each behind its own switch (`down_scale` and `mxfp8_qmm` on by default, `engram`
+//! and `pf_bf16_trunk` off), all of them behind the weight path (`MLX_SERVE_DSV41_WEIGHT_PATH`, `settle`, read at
+//! load): `resident` serves them, `ssd` the streamed and staged kernels as before (no fusion engages), `auto` resident
+//! when no bank streams and every Engram table is held. A forced `resident` on a streamed or partly held pack is
+//! refused by name.
 //! - `down_scale`: a decode step or verify puts an NVFP4 bank's per-expert down scale on the routing weights inside the
 //!   fused fp4 gate/up launch (`DSCALE`: `wts * dsc[e]`, the f32 product `routeScaled`'s take, cast and multiply make).
 //! - `mxfp8_qmm`: an mxfp8 linear over a prompt chunk's rows runs MLX's quantized matmul (its NAX qmm dequantizes the

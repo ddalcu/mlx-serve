@@ -22,6 +22,7 @@ pub const moe_down = @import("moe_down.zig");
 pub const engram_kv = @import("engram_kv.zig");
 pub const engram_ids = @import("engram_ids.zig");
 pub const engram_kvc = @import("engram_kvc.zig");
+pub const fp8_codes = @import("fp8_codes.zig");
 
 const dsv41 = @import("../deepseek_v41.zig");
 
@@ -62,9 +63,10 @@ pub fn expectNoWorse(label: []const u8, new: []const f32, chain: []const f32, tr
 pub const FP8_READ_HEADER = @import("../../../sdk/quant/fp4.zig").SCALE_HEADER ++ @import("../../../mlx/kernels.zig").source("plugins/deepseek_v41/kernels/fp8_read_header.metal");
 
 /// The mxfp8 reads' template int `FOLD` (`MLX_SERVE_DSV41_FP8_FOLD`, read every call): 1 the 2^8 fold (the default:
-/// the same product on every finite code under 247, fewer operations), 0 MLX's reads (=0).
+/// the same product on every finite code under 247, fewer operations), 0 MLX's reads (=0, or where the load found a
+/// code the fold reads apart from MLX, `fp8_codes.settle`).
 pub fn fp8Fold() c_int {
-    return @intFromBool(env.onUnlessZero(.MLX_SERVE_DSV41_FP8_FOLD));
+    return @intFromBool(env.onUnlessZero(.MLX_SERVE_DSV41_FP8_FOLD) and fp8_codes.ps().fold);
 }
 
 /// A contract kernel at `FOLD` 0 (MLX's mxfp8 reads) and 1 (the fold) on the same inputs, each served shape over three
@@ -313,7 +315,7 @@ fn layersFp4Levers(gpa: std.mem.Allocator, nv: bool, spec_: []const u8) !void {
 test {
     _ = fixture;
     _ = @import("exact_test.zig");
-    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, woa_plain, ffn_in, moe_up, moe_down, engram_kv, engram_ids, engram_kvc }) |k| _ = k;
+    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, woa_plain, ffn_in, moe_up, moe_down, engram_kv, engram_ids, engram_kvc, fp8_codes }) |k| _ = k;
 }
 
 test "dsv41 dec fp8 reads: every e4m3 code at every byte reads as MLX's from_fp8, every e8m0 code as MLX's fp8.h; FOLD differs only where it overflows or misses a NaN" {

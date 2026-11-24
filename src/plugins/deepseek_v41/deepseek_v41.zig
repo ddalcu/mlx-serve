@@ -2645,6 +2645,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         m.lhs_gu = try m.own(mlx.mlx_array_new_data(&ks, &[_]c_int{ 1, ci(k) }, 2, .uint32));
     }
     try evalWeights(m);
+    try dkern.fp8_codes.settle(m);
     try holdEngram(m);
     passSettle(m);
     try fusion.settle(m);
@@ -2871,21 +2872,25 @@ pub fn dsparkWanted(cfg: *const Config, pair: ?Pair, mtp: ?bool) bool {
 
 /// What a load holds of the pack: its safetensors bytes less the Engram tables it preads and the tensors it
 /// drops (the vision tower on a text load; the DSpark stages when they do not load; a tensor's copy in a shard the
-/// index does not name for it).
+/// index does not name for it), plus the Engram LRU and the partials' cache where the load allocates it.
 pub fn residentDiskBytes(gpa: std.mem.Allocator, dir: []const u8, cfg: *const Config, mtp: ?bool, shards: u64) !u64 {
     var total = shards -| try droppedBytes(gpa, dir, dsparkWanted(cfg, null, mtp), cfg.has_vision);
     var tables: u64 = 0;
+    var reads = true;
     for (cfg.dsv41_engram_layers[0..cfg.dsv41_n_engram_layers], 0..) |l, k| {
         var t = try engram.Table.open(gpa, dir, k, l, cfg.dsv41_engram_rows[k], cfg.dsv41_engram_head_dim);
         defer t.close();
         total -|= t.shardBytes();
         tables += t.tableBytes();
+        reads = reads and dkern.engram_kvc.tableReads(&t);
     }
     // Tables the load will hold in memory (`holdEngram`) are resident.
-    if (tables > 0 and try engram.residentSetting(env.span(.MLX_SERVE_DSV41_ENGRAM_RESIDENT)) != .off and
-        engram.residentFits(total, tables, system.getTotalMemBytes(), mlx.maxRecommendedWorkingSet())) total +|= tables;
+    const held = tables > 0 and try engram.residentSetting(env.span(.MLX_SERVE_DSV41_ENGRAM_RESIDENT)) != .off and
+        engram.residentFits(total, tables, system.getTotalMemBytes(), mlx.maxRecommendedWorkingSet());
+    if (held) total +|= tables;
     // Its rows' LRU (`MLX_SERVE_DSV41_ENGRAM_LRU_MB`) fills on every load.
     if (cfg.dsv41_n_engram_layers > 0) total +|= edec.billBytes(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB));
+    total +|= dkern.engram_kvc.billBytes(.{ .layers = cfg.dsv41_n_engram_layers, .held = held, .streamed = cfg.dsv41_streamed, .reads = reads });
     return total;
 }
 
