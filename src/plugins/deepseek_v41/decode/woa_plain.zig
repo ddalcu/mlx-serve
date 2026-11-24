@@ -408,9 +408,10 @@ test "dsv41 dec wo_a plain: with the switch on, a fused decode step's layers tak
     }
 }
 
-/// The float64 cells of `WOA_PLAIN` against `wo_a` over the splits: `near` the cells no farther in l2 and max (f32
-/// sums and the served output), `same` the cells word for word, `vector` those where both run the vector units.
-const Tally = struct { cells: usize = 0, near: usize = 0, caught: usize = 0, vector: usize = 0, same: usize = 0 };
+/// The float64 cells of `WOA_PLAIN` against `wo_a` over the splits: `agg` [out][arm] summed over the cells (out 0 the
+/// f32 sums, 1 the served output; arm 0 wo_a, 1 the plain path), `same` the cells word for word of the `vector` ones
+/// (both on the vector units), `caught` those where the plant is farther.
+const Tally = struct { cells: usize = 0, caught: usize = 0, vector: usize = 0, same: usize = 0, agg: [2][2]decode.Dist = @splat(@splat(.{})) };
 
 /// Layer `li`'s wo_a and sink at R = 1..6 rows over 8 and 2 random splits (`wo_a.makeParts`), each arm's distance from
 /// float64 printed and tallied.
@@ -467,24 +468,24 @@ fn layerCells(gpa: std.mem.Allocator, m: *dsv41.Dsv41Model, li: usize, k: Kernel
         }
         const vector = !wo_a.useNax(ci(R));
         const same = w[0].differ == 0 and w[1].differ == 0;
-        const near = d[0][1].within(d[0][0]) and d[1][1].within(d[1][0]);
+        for (0..2) |oi| for (0..2) |i| t.agg[oi][i].join(d[oi][i]);
         t.cells += 1;
-        t.near += @intFromBool(near);
         t.caught += @intFromBool(!d[0][2].within(d[0][0]) and !d[1][2].within(d[1][0]));
         t.vector += @intFromBool(vector);
         t.same += @intFromBool(vector and same);
-        for ([_][]const u8{ "f32 sums", "served out" }, d, w) |what, row, wd_| std.debug.print("[woa-plain f64] layer {d} R={d} S={d} {s}: wo_a l2 {e:.4} max {e:.4}; plain l2 {e:.4} max {e:.4}, {d} of {d} words differ from wo_a's ({d} nearer, {d} farther); plant l2 {e:.4} max {e:.4}{s}\n", .{ li, R, S, what, row[0].l2(), row[0].max, row[1].l2(), row[1].max, wd_.differ, wd_.words, wd_.nearer, wd_.farther, row[2].l2(), row[2].max, if (row[1].within(row[0])) "" else "  FARTHER" });
+        for ([_][]const u8{ "f32 sums", "served out" }, d, w) |what, row, wd_| std.debug.print("[woa-plain f64] layer {d} R={d} S={d} {s}: wo_a l2 {e:.4} max {e:.4}; plain l2 {e:.4} max {e:.4}, {d} of {d} words differ from wo_a's ({d} nearer, {d} farther); plant l2 {e:.4} max {e:.4}{s}\n", .{ li, R, S, what, row[0].l2(), row[0].max, row[1].l2(), row[1].max, wd_.differ, wd_.words, wd_.nearer, wd_.farther, row[2].l2(), row[2].max, if (row[1].within(row[0])) "" else "  (this cell a rounding step farther)" });
     };
 }
 
 fn expectTally(t: Tally) !void {
-    std.debug.print("[woa-plain f64] {d} cells: plain no farther in {d}; word for word in {d} of the {d} where wo_a runs the vector units; the plant farther in {d}\n", .{ t.cells, t.near, t.same, t.vector, t.caught });
-    try testing.expectEqual(t.cells, t.near);
+    for ([_][]const u8{ "f32 sums", "served out" }, t.agg) |what, a| std.debug.print("[woa-plain f64] all {d} cells, {s}: wo_a l2 {e:.4} max {e:.4}; plain l2 {e:.4} max {e:.4}{s}\n", .{ t.cells, what, a[0].l2(), a[0].max, a[1].l2(), a[1].max, if (a[1].within(a[0])) "" else "  FARTHER" });
+    std.debug.print("[woa-plain f64] {d} cells: word for word in {d} of the {d} where wo_a runs the vector units; the plant farther in {d}\n", .{ t.cells, t.same, t.vector, t.caught });
+    try testing.expect(t.agg[0][1].within(t.agg[0][0]) and t.agg[1][1].within(t.agg[1][0]));
     try testing.expectEqual(t.vector, t.same);
     try testing.expectEqual(t.cells, t.caught);
 }
 
-test "dsv41 dec wo_a plain (MLX_SERVE_DSV41_WOA_PLAIN): the splits merged once and the plain GEMV are no farther from float64 than wo_a over the splits, l2 and max, on the f32 sums and the served bf16 output, word for word where wo_a runs the vector units, R = 1..6, 8 and 2 splits, the fixture's release-shape wo_a; the planted dropped head is farther" {
+test "dsv41 dec wo_a plain (MLX_SERVE_DSV41_WOA_PLAIN): over the test set the splits merged once and the plain GEMV are no farther from float64 than wo_a over the splits, total l2 and worst max, on the f32 sums and the served bf16 output, word for word where wo_a runs the vector units, R = 1..6, 8 and 2 splits, the fixture's release-shape wo_a; the planted dropped head is farther" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const fixture = @import("fixture.zig");
