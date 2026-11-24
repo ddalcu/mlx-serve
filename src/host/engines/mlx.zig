@@ -66,6 +66,8 @@ pub const Api = struct {
     /// The model's `/props` fragments the engine owns (Neural Engine prefill, n-gram warm), then the cluster's.
     model_props_json: *const fn (*const LoadedModel, std.mem.Allocator) ?[]u8,
     cluster_json: *const fn (std.mem.Allocator) ?[]u8,
+    /// Whether this server is configured for or joined to an active JACCL distributed cluster (`--dist`).
+    cluster_active: *const fn () bool,
     /// The serving plugin's stub parse of the pack at a dir (discovery); null when no plugin serves it.
     plugin_stub: *const fn (std.Io, std.mem.Allocator, []const u8, []const u8) ?PluginStub,
     gauges: *const fn (*Gauges) void,

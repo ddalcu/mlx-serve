@@ -145,6 +145,7 @@ const Shared = struct {
         // returns unavailable on machines/OSes without it) + the per-layer MLP
         // MIL program builder. See lib/ane/ + src/sdk/ane/offload.zig; provenance in NOTICE.
         libs.addAneSources(b, mod);
+        libs.addRdmaShimSources(b, mod);
 
         // llama.cpp libllama for generic GGUF models (Metal backend, macOS only).
         // Staged by `scripts/fetch-llama.sh` into lib/llama/ (a single self-contained

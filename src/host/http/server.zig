@@ -678,7 +678,15 @@ pub fn serve(
         });
     }
 
+    var last_rdma_sweep_ms: i64 = 0;
     while (!shutdown_requested.load(.acquire)) {
+        if (g_cache_transfer.enabled()) {
+            const sweep_now_ms = nowMsMonotonic(io);
+            if (sweep_now_ms - last_rdma_sweep_ms >= 1_000) {
+                last_rdma_sweep_ms = sweep_now_ms;
+                @import("../api/cache_rdma.zig").sweepExpiredNonBlocking(io);
+            }
+        }
         // Poll with 1-second timeout so we can check shutdown flag
         const ready = socketReadable(server.socket.handle, 1000) catch |err| {
             if (shutdown_requested.load(.acquire)) break;
@@ -739,6 +747,7 @@ pub fn serve(
         armShutdownDeadline(&sch.shutdown_deadline_ms, nowMsMonotonic(io), shutdown_persist_secs);
         sch.cancelAllInFlight();
     }
+    @import("../api/cache_rdma.zig").quiesceGlobal(io);
     {
         var waited_ms: u64 = 0;
         while (active_conn_threads.load(.acquire) > 0 and waited_ms < 30_000) {
@@ -749,6 +758,7 @@ pub fn serve(
         if (remaining > 0)
             log.warn("shutdown: {d} connection thread(s) still active after {d}ms — proceeding\n", .{ remaining, waited_ms });
     }
+    @import("../api/cache_rdma.zig").quiesceGlobal(io);
 
     deinitGlobalResponseStore();
 
@@ -947,6 +957,7 @@ test {
     _ = @import("../api/audio.zig");
     _ = @import("../api/chat_completions.zig");
     _ = @import("../api/cache_transfer.zig");
+    _ = @import("../api/cache_rdma.zig");
     _ = @import("../api/chat_stream.zig");
     _ = @import("../api/completions.zig");
     _ = @import("../api/embeddings.zig");

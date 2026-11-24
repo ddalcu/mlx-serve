@@ -157,6 +157,7 @@ test {
     _ = @import("engines/mlx/spec/mtp_replay_test.zig");
     _ = @import("engines/mlx/spec/mtp_lookup.zig");
     _ = @import("host/http/server.zig");
+    _ = @import("host/api/cache_rdma.zig");
     _ = @import("engines/mlx/admission/admit.zig");
     _ = @import("engines/mlx/admission/bills.zig");
     _ = @import("engines/mlx/admission/bills_test.zig");

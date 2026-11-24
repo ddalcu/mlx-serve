@@ -187,12 +187,13 @@ pub fn readBody(allocator: std.mem.Allocator, stream: *Conn, head: *RequestHead,
     const req_path = req_line.path;
     const max_request_size = maxRequestBytesFor(req_path);
     const cache_import = isCacheImportPath(req_path);
+    const cache_rdma_req = @import("../api/cache_rdma.zig").isRdmaPath(req_path);
     const headers = head.buf[0 .. header_end_pos - 4];
     const cache_export = if (findHeaderValue(headers, "x-cache-export")) |value| std.mem.eql(u8, value, "1") else false;
-    if (cache_import or cache_export) {
+    if (cache_import or cache_export or cache_rdma_req) {
         const verdict = auth.checkCacheTransferAuth(http_server.g_cache_transfer, stream.stream.socket.address, headers, req_path);
         if (verdict != .allowed) {
-            try auth.sendCacheTransferDenial(allocator, stream, verdict, cache_import);
+            try auth.sendCacheTransferDenial(allocator, stream, verdict, cache_import or cache_rdma_req);
             return null;
         }
         if (cache_import and !std.mem.eql(u8, req_method, "POST")) {
