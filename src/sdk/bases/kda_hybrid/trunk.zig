@@ -1108,8 +1108,8 @@ pub fn load(ctx: *const abi.LoadCtx, hooks: Hooks) !*Model {
         log.warn("GLM MTP head: {s} — MTP off\n", .{@errorName(e)});
         break :blk null;
     };
-    // Ling's NextN head on the streaming pack only: an MLX Ling pack loads as before.
-    if (!c.isGlm5() and c.streamed_bank and c.nextn_layers > 0) m.ling_mtp = l.lingHead() catch |e| blk: {
+    // Ling's NextN head, streaming or MLX pack: one whose pack ships no `eh_proj` binds null and loads as before.
+    if (!c.isGlm5() and c.nextn_layers > 0) m.ling_mtp = l.lingHead() catch |e| blk: {
         log.warn("Ling MTP head: {s} — MTP off\n", .{@errorName(e)});
         break :blk null;
     };
