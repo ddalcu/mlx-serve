@@ -137,17 +137,13 @@ test "dsv41 dec layers: the fused kernels over mxfp4 experts decode no further f
     try layersAgree(std.testing.allocator, 20, 23, true);
 }
 
-test "dsv41 dec layers: under each MLX_SERVE_DSV41_FUSE_* switch and all three, the fused kernels decode no further from an f32 model than today's chain" {
+test "dsv41 dec layers: under MLX_SERVE_DSV41_FUSE_WQB_RING on and off, the fused kernels decode no further from an f32 model than today's chain" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    inline for (.{ .{ "1", "0", "0" }, .{ "0", "1", "0" }, .{ "0", "0", "1" }, .{ "1", "1", "1" } }) |arm| {
-        var o0 = env.override(.MLX_SERVE_DSV41_FUSE_WQB_RING, arm[0]);
+    inline for (.{ "1", "0" }) |arm| {
+        var o0 = env.override(.MLX_SERVE_DSV41_FUSE_WQB_RING, arm);
         defer o0.restore();
-        var o1 = env.override(.MLX_SERVE_DSV41_FUSE_ATTN_MERGE, arm[1]);
-        defer o1.restore();
-        var o2 = env.override(.MLX_SERVE_DSV41_FUSE_FFN_IN, arm[2]);
-        defer o2.restore();
-        std.debug.print("[dec] switches ring={s} merge={s} ffn_in={s}\n", .{ arm[0], arm[1], arm[2] });
+        std.debug.print("[dec] switches ring={s}\n", .{arm});
         for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 } }) |range| try layersAgree(gpa, range[0], range[1], false);
     }
 }

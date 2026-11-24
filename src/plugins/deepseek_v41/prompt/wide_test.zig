@@ -710,40 +710,6 @@ test "dsv41 wide tol: the FFN-side hc expand and norm in one launch are the stoc
     try testing.expect(ok);
 }
 
-test "dsv41 wide tol: the hc mixes at 8 rows a threadgroup are the 4-row launches' mixes, split and norms within 1% at prompt widths; a dropped mix scale fails" {
-    if (skip()) return error.SkipZigTest;
-    mlx.installErrorHandler();
-    var m: dsv41.Dsv41Model = undefined;
-    try hcModel(&m);
-    defer hcModelFree(&m);
-    const unset = env.override(.MLX_SERVE_DSV41_HC_MIX8, null);
-    defer unset.restore();
-    var ok = true;
-    for ([_]c_int{ 17, 1027, 5001, 8192 }, 0..) |L, i| {
-        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
-        defer sc.deinit();
-        const r = try hcRows(&sc, L, 0x8800 + 16 * @as(u64, i));
-        const eps = try dsv41.hcEps(&sc, &m);
-        const z4 = try dsv41.hcMixWide(&sc, &m, r.x, &r.hc, eps);
-        const f4 = try dsv41.hcMixNormFused(&sc, &m, r.x, r.cpre, &r.hc, r.w, r.w, eps);
-        const on = env.override(.MLX_SERVE_DSV41_HC_MIX8, "1");
-        defer on.restore();
-        const z8 = try dsv41.hcMixWide(&sc, &m, r.x, &r.hc, eps);
-        const f8 = try dsv41.hcMixNormFused(&sc, &m, r.x, r.cpre, &r.hc, r.w, r.w, eps);
-        const names = [_][]const u8{ "z", "fused z", "h", "h2", "comb" };
-        for ([_][2]A{ .{ z4, z8 }, .{ f4.z, f8.z }, .{ f4.n.h, f8.n.h }, .{ f4.h2, f8.h2 }, .{ f4.n.sp.comb, f8.n.sp.comb } }, names) |pr, nm| {
-            var lb: [64]u8 = undefined;
-            if (!try close(try std.fmt.bufPrint(&lb, "hc mix8 rows {d} {s}", .{ L, nm }), pr[0], pr[1], null, tol_kernel)) ok = false;
-        }
-        // Planted: 8 rows a threadgroup with the mixes' scale dropped (ones in its place).
-        var hc_bad = r.hc;
-        hc_bad.scale = try sc.ones(mlx.getShape(r.hc.scale), .float32);
-        const bad = try dsv41.hcMixWide(&sc, &m, r.x, &hc_bad, eps);
-        try testing.expect(!try close("  planted: mix scale dropped", z4, bad, null, tol_kernel));
-    }
-    try testing.expect(ok);
-}
-
 /// hc_v2's prompt widths: below a threadgroup's 64 rows, the chunk tail, a lead half, an odd width, a full chunk.
 const v2_widths = [_]c_int{ 37, 1254, 4096, 5001, 8192 };
 
@@ -907,7 +873,7 @@ test "dsv41 wide tol: hc_v2's combining tail is moe_tail's combine, glm5's expan
 
 // ── a release-shape pair worker's prefill ──
 
-const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_HC_MIX8, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2, .MLX_SERVE_DSV41_PF_MOE_EPI, .MLX_SERVE_DSV41_PF_IDX_NAX };
+const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2, .MLX_SERVE_DSV41_PF_MOE_EPI, .MLX_SERVE_DSV41_PF_IDX_NAX };
 
 /// The flash kernel on `fx`'s model as its load sets it (`plugin.configureLoad`): the gather's kernels rebuilt with
 /// MLX_SERVE_DSV41_FLASH_ATTN on (and MLX_SERVE_DSV41_FLASH_TRIM, MLX_SERVE_DSV41_FLASH_PSUM as asked) and the ring

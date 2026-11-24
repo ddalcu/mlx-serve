@@ -336,10 +336,6 @@ pub const Lin = struct {
     s: A = none,
     b: A = none,
     qp: QuantParams = .{ .bits = 0, .group_size = 0 },
-    /// The weight in bf16, made once at load for the prompt's dense GEMMs (`fuse.pf_bf16_trunk`), which `dense` hands
-    /// out in place of a dequantize; the quantized weight stays for decode.
-    pf: A = none,
-
     /// A weight an outside quant plugin loaded (`w` unset): its table runs the matmul. A grouped one (`wo_a`, the
     /// pack's slices) multiplies `[rows, groups, in]`.
     ext: ?outside.Weight = null,
@@ -362,11 +358,6 @@ pub const Lin = struct {
     /// The weight dequantized to `dt` (lossless for the packs' fp8 and affine codes in bf16).
     pub fn dense(self: *const Lin, sc: *Scope, dt: mlx.mlx_dtype) !A {
         if (self.ext != null) return error.Dsv41OutsideDense;
-        if (self.pf.ctx != null and mlx.mlx_array_dtype(self.pf) == dt) {
-            var o = mlx.mlx_array_new();
-            _ = mlx.mlx_array_set(&o, self.pf);
-            return sc.keep(o);
-        }
         var d = mlx.mlx_array_new();
         return sc.res(mlx.mlx_dequantize(&d, self.w, self.s, self.b, mlx.mlx_optional_int.some(@intCast(self.qp.group_size)), mlx.mlx_optional_int.some(@intCast(self.qp.bits)), self.qp.mode.cstr(), .{ .ctx = null }, .{ .value = dt, .has_value = true }, sc.s), &d);
     }
@@ -452,14 +443,13 @@ pub const DsparkW = struct {
     markov_embed: A, // [vocab, rank]
     markov_head: A, // [vocab, rank] in the activation dtype: a draft step reads all of it
     conf: A, // f32 [1, dim + rank]
-    /// `MLX_SERVE_DSV41_DRAFT_HEAD4` / `MLX_SERVE_DSV41_DRAFT_VOCAB`: what the drafts read in place of the trunk's head
-    /// and the whole Markov tables; null: the trunk's head over the whole vocabulary.
+    /// `MLX_SERVE_DSV41_DRAFT_VOCAB`: what the drafts read in place of the trunk's head and the whole Markov tables;
+    /// null: the trunk's head over the whole vocabulary.
     draft: ?DraftHead = null,
 
     /// The head the drafts read.
     pub fn headFor(self: *const DsparkW, m: *const Dsv41Model) *const Lin {
         const d = if (self.draft) |*x| x else return &m.head;
-        if (d.head4) logOnce(&draft_head4_logged, "[dsv41] MLX_SERVE_DSV41_DRAFT_HEAD4 engaged: the DSpark drafts read their own 4-bit head\n");
         return &d.head;
     }
     /// The Markov tables a draft's chain reads: markov_embed (indexed by a draft token) and markov_head (a row a scored
@@ -470,16 +460,13 @@ pub const DsparkW = struct {
     }
 };
 
-/// A draft-only head (`DsparkW.draft`): `head` the drafts' LM head (`MLX_SERVE_DSV41_DRAFT_HEAD4`: 4-bit). With a
-/// vocabulary (`MLX_SERVE_DSV41_DRAFT_VOCAB`, `k` ids) the drafts score only its ids: `head` and `markov_head` hold their
-/// rows, and a draft token is an id's index in `ids` (ascending, so MLX's argmax keeps the lower id on a tie, as over
-/// the whole vocabulary). `markov_embed` is reordered to match: the vocabulary's rows first, then every other id's, so
-/// `t1` (any id) enters through `to_draft` and the drafted tokens leave through `ids`. The trunk and the verify read
-/// nothing here.
+/// A draft-only head (`DsparkW.draft`): with a vocabulary (`MLX_SERVE_DSV41_DRAFT_VOCAB`, `k` ids) the drafts score
+/// only its ids: `head` (the trunk's head's rows) and `markov_head` hold their rows, and a draft token is an id's index
+/// in `ids` (ascending, so MLX's argmax keeps the lower id on a tie, as over the whole vocabulary). `markov_embed` is
+/// reordered to match: the vocabulary's rows first, then every other id's, so `t1` (any id) enters through `to_draft`
+/// and the drafted tokens leave through `ids`. The trunk and the verify read nothing here.
 pub const DraftHead = struct {
     head: Lin,
-    /// `head` is `MLX_SERVE_DSV41_DRAFT_HEAD4`'s (or its rows)
-    head4: bool = false,
     k: usize = 0,
     /// int32 [k]: the vocabulary, ascending
     ids: A = none,
@@ -832,9 +819,6 @@ pub const Dec = struct {
     wq_b: ?mlx.mlx_fast_metal_kernel = null,
     /// `wq_b` that also writes the window ring (`MLX_SERVE_DSV41_FUSE_WQB_RING`).
     wq_b_ring: ?mlx.mlx_fast_metal_kernel = null,
-    /// `wq_b` and `wq_b_ring` on the matrix units (`MLX_SERVE_DSV41_GEMV_R26_WQB`), NAX only.
-    wq_b_nax: ?mlx.mlx_fast_metal_kernel = null,
-    wq_b_ring_nax: ?mlx.mlx_fast_metal_kernel = null,
     attn: ?mlx.mlx_fast_metal_kernel = null,
     /// `attn` on its shape-cut kernel (`MLX_SERVE_DSV41_ATTN_DEC`), NAX only; `attn_tile_logged` once it served.
     attn_tile: ?mlx.mlx_fast_metal_kernel = null,
@@ -842,10 +826,6 @@ pub const Dec = struct {
     /// The splits' merge and wo_a's plain GEMV (`MLX_SERVE_DSV41_WOA_PLAIN`); `woa_plain_logged` once it served.
     woa_plain: ?dkern.woa_plain.Kernels = null,
     woa_plain_logged: bool = false,
-    /// `attn` that merges its splits (`MLX_SERVE_DSV41_FUSE_ATTN_MERGE`), its arrival counter and wo_a's sink then.
-    attn_merge: ?mlx.mlx_fast_metal_kernel = null,
-    attn_counter: A = none,
-    attn_nosink: A = none,
     wo_a: ?mlx.mlx_fast_metal_kernel = null,
     /// `wo_a`'s arrival counter, zeroed once and shared by every layer's launch.
     wo_a_counter: A = none,
@@ -861,7 +841,7 @@ pub const Dec = struct {
     fn init(gpa: std.mem.Allocator, cfg: *const Config) !Dec {
         const nax = device.naxAvailable();
         // Without NAX the affine moe_up / moe_down lose to today's MoE kernels at every row count.
-        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .wq_b_ring = try dkern.wq_b.buildRing(), .wq_b_nax = if (nax) try dkern.wq_b.buildNax(false) else null, .wq_b_ring_nax = if (nax) try dkern.wq_b.buildNax(true) else null, .attn = if (nax) try dkern.attn.build() else null, .attn_tile = if (nax) try dkern.attn.buildTile() else null, .woa_plain = try dkern.woa_plain.build(),.attn_merge = if (nax) try dkern.attn.buildMerge() else null, .attn_counter = dkern.attn.newCounter(), .attn_nosink = dkern.attn.noSink(cfg.num_attention_heads), .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
+        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .wq_b_ring = try dkern.wq_b.buildRing(), .attn = if (nax) try dkern.attn.build() else null, .attn_tile = if (nax) try dkern.attn.buildTile() else null, .woa_plain = try dkern.woa_plain.build(), .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
         errdefer d.deinit();
         try dkern.topk.probe(gpa, &d.topk.?, mlx.gpuStream());
         if (d.moe_down) |kd| d.moe_down_rb = dkern.moe_down.probe(gpa, kd, cfg.moe_intermediate_size, cfg.hidden_size) catch |e| blk: {
@@ -881,11 +861,8 @@ pub const Dec = struct {
         if (d.moe_fp4) |k| k.deinit();
         if (d.woa_plain) |k| k.deinit();
         if (d.ffn_in) |k| dkern.ffn_in.free(k);
-        inline for (.{ d.wq_b, d.wq_b_ring, d.wq_b_nax, d.wq_b_ring_nax, d.attn, d.attn_tile, d.attn_merge, d.wo_a, d.moe_down }) |k| if (k) |kern| {
+        inline for (.{ d.wq_b, d.wq_b_ring, d.attn, d.attn_tile, d.wo_a, d.moe_down }) |k| if (k) |kern| {
             _ = mlx.mlx_fast_metal_kernel_free(kern);
-        };
-        inline for (.{ d.attn_counter, d.attn_nosink }) |a| if (a.ctx != null) {
-            _ = mlx.mlx_array_free(a);
         };
         if (d.wo_a_counter.ctx != null) _ = mlx.mlx_array_free(d.wo_a_counter);
         d.* = .{};
@@ -1201,16 +1178,9 @@ fn exactMxfp8(s: S, w: A) !?[2]A {
 
 /// `l` (dense) as affine `bits` over groups of `gs`, the dense weight released.
 fn quantizeLin(m: *Dsv41Model, w: *Weights, l: Lin, bits: u32, gs: u32) !Lin {
-    const q = try quantizeOwn(m, l.w, bits, gs);
-    release(m, w, l.w);
-    return q;
-}
-
-/// `x` [out, in] quantized to `bits`-bit affine at group `gs`, owned by the model and evaluated.
-fn quantizeOwn(m: *Dsv41Model, x: A, bits: u32, gs: u32) !Lin {
     var qv = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(qv);
-    try mlx.check(mlx.mlx_quantize(&qv, x, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", none, m.s));
+    try mlx.check(mlx.mlx_quantize(&qv, l.w, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", none, m.s));
     var t: [3]A = undefined;
     for (&t, 0..) |*a, i| {
         var o = mlx.mlx_array_new();
@@ -1218,39 +1188,8 @@ fn quantizeOwn(m: *Dsv41Model, x: A, bits: u32, gs: u32) !Lin {
         a.* = try m.own(o);
     }
     try evalAll(&t);
+    release(m, w, l.w);
     return .{ .w = t[0], .s = t[1], .b = t[2], .qp = .{ .bits = bits, .group_size = gs } };
-}
-
-/// `MLX_SERVE_DSV41_DRAFT_HEAD4`, read at load.
-pub fn draftHead4Wanted() bool {
-    return env.on(.MLX_SERVE_DSV41_DRAFT_HEAD4);
-}
-
-pub const draft_head4_group: u32 = 64;
-
-/// The drafts' 4-bit affine head (`MLX_SERVE_DSV41_DRAFT_HEAD4`) from `head` as the pack loaded it: its dense weights,
-/// else its quantized ones dequantized (the served values, all the pack has); null where it would read no fewer bytes
-/// or an outside quant plugin holds the head.
-fn draftHead4(m: *Dsv41Model, head: Lin) !?Lin {
-    const why: ?[]const u8 = if (head.ext != null or head.w.ctx == null) "the head is an outside quant plugin's" else if (head.s.ctx != null and head.qp.bits <= 4) "the pack's head is 4-bit or narrower" else if (m.cfg.hidden_size % draft_head4_group != 0) "the hidden size is no multiple of the group" else null;
-    if (why) |r| {
-        log.warn("deepseek_v41: MLX_SERVE_DSV41_DRAFT_HEAD4 declined ({s}): the drafts read the trunk's head\n", .{r});
-        return null;
-    }
-    var src = head.w;
-    var deq = none;
-    defer if (deq.ctx != null) {
-        _ = mlx.mlx_array_free(deq);
-    };
-    if (head.s.ctx != null) {
-        try mlx.check(mlx.mlx_dequantize(&deq, head.w, head.s, head.b, mlx.mlx_optional_int.some(@intCast(head.qp.group_size)), mlx.mlx_optional_int.some(@intCast(head.qp.bits)), head.qp.mode.cstr(), none, .{ .value = .bfloat16, .has_value = true }, m.s));
-        src = deq;
-    }
-    const q = try quantizeOwn(m, src, 4, draft_head4_group);
-    if (head.s.ctx == null) {
-        log.info("deepseek_v41: DSpark draft head 4-bit affine g{d}, from the pack's dense {s} head; the trunk keeps its own\n", .{ draft_head4_group, @tagName(mlx.mlx_array_dtype(head.w)) });
-    } else log.info("deepseek_v41: DSpark draft head 4-bit affine g{d}, from the pack's {d}-bit {s} head (no dense head shipped: the requantization adds its error to the served one); the trunk keeps its own\n", .{ draft_head4_group, head.qp.bits, std.mem.span(head.qp.mode.cstr()) });
-    return q;
 }
 
 /// The token ids of a draft vocabulary file (decimal, whitespace or comma separated), ascending and unique, each under
@@ -1459,20 +1398,18 @@ fn draftLogits(sc: *Scope, m: *const Dsv41Model, ds: *const DsparkW, st: ?*const
     return sc.concat(&.{ lg, try sc.astype(try ex.head.apply(sc, x), .float32) }, -1);
 }
 
-/// The bytes a load's draft-only head adds (`MLX_SERVE_DSV41_DRAFT_HEAD4`, `MLX_SERVE_DSV41_DRAFT_VOCAB` with a
-/// request's prompt ids at `draft_prompt_max`), for the bill; 0 without DSpark stages.
+/// The bytes a load's draft-only head adds (`MLX_SERVE_DSV41_DRAFT_VOCAB` with a request's prompt ids at
+/// `draft_prompt_max`), for the bill; 0 without DSpark stages.
 pub fn draftHeadBytes(cfg: *const Config, dspark: bool, pack_dir: ?[]const u8) u64 {
     if (!dspark) return 0;
     const V: u64 = cfg.vocab_size;
     const d: u64 = cfg.hidden_size;
     const r: u64 = cfg.dsv4_dspark_markov_rank;
     const row8: u64 = d + d / 64 * 4;
-    const row4: u64 = d / 2 + d / draft_head4_group * 4;
-    const head4 = draftHead4Wanted();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = draftVocabPath(&buf, pack_dir) orelse return if (head4) V * row4 else 0;
-    const k: u64 = draftVocabCount(path) orelse return if (head4) V * row4 else 0;
-    var bytes: u64 = k * (if (head4) row4 else row8) + V * r * 2 + k * r * 2 + V * 4 + k * 4;
+    const path = draftVocabPath(&buf, pack_dir) orelse return 0;
+    const k: u64 = draftVocabCount(path) orelse return 0;
+    var bytes: u64 = k * row8 + V * r * 2 + k * r * 2 + V * 4 + k * 4;
     if (draftPromptWanted()) {
         const e: u64 = @min(draft_prompt_max, V -| k);
         bytes += e * row8 + V * r * 2 + (k + e) * (r * 2 + 4) + V * 4;
@@ -1506,11 +1443,10 @@ fn draftVocabCount(path: []const u8) ?u64 {
     return n;
 }
 
-/// The drafts' own head and tables (`DsparkW.draft`): `head4` (`MLX_SERVE_DSV41_DRAFT_HEAD4`) over the whole vocabulary,
-/// and with a vocabulary file (`MLX_SERVE_DSV41_DRAFT_VOCAB`) the rows of its ids of that head (else of the trunk's)
-/// and of the Markov tables. Null: the drafts read the trunk's head.
-fn draftHeadFor(m: *Dsv41Model, w: *Weights, head4: ?Lin, vocab_path: ?[]const u8) !?DraftHead {
-    const path = vocab_path orelse return if (head4) |h| .{ .head = h, .head4 = true } else null;
+/// The drafts' own head and tables (`DsparkW.draft`): with a vocabulary file (`MLX_SERVE_DSV41_DRAFT_VOCAB`) the rows
+/// of its ids of the trunk's head and of the Markov tables. Null: the drafts read the trunk's head.
+fn draftHeadFor(m: *Dsv41Model, vocab_path: ?[]const u8) !?DraftHead {
+    const path = vocab_path orelse return null;
     const V = m.vocab;
     const io = std.Io.Threaded.global_single_threaded.io();
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, m.gpa, .limited(64 << 20)) catch |e| {
@@ -1530,11 +1466,11 @@ fn draftHeadFor(m: *Dsv41Model, w: *Weights, head4: ?Lin, vocab_path: ?[]const u
         std.mem.sort(i32, ids_list.items, {}, std.sort.asc(i32));
     }
     const ids = ids_list.items;
-    const base = head4 orelse m.head;
+    const base = m.head;
     const why: ?[]const u8 = if (ids.len == 0 or ids.len >= V) "no ids, or every id" else if (base.ext != null or base.w.ctx == null) "the head is an outside quant plugin's" else null;
     if (why) |r| {
         log.warn("deepseek_v41: MLX_SERVE_DSV41_DRAFT_VOCAB {s} declined ({s}): the drafts score the whole vocabulary\n", .{ path, r });
-        return if (head4) |h| .{ .head = h, .head4 = true } else null;
+        return null;
     }
     const ds = &m.dspark.?;
     const k = ids.len;
@@ -1546,7 +1482,7 @@ fn draftHeadFor(m: *Dsv41Model, w: *Weights, head4: ?Lin, vocab_path: ?[]const u
     var sc = Scope.init(m.gpa, m.s);
     defer sc.deinit();
     const idx = try sc.ints(ids, &.{ci(k)});
-    var d: DraftHead = .{ .head = .{ .w = none, .qp = base.qp }, .head4 = head4 != null, .k = k };
+    var d: DraftHead = .{ .head = .{ .w = none, .qp = base.qp }, .k = k };
     d.ids = try m.own(sc.out(idx));
     d.to_draft = try m.own(sc.out(try sc.ints(to_draft, &.{ci(V)})));
     d.markov_embed = try m.own(sc.out(try rowMajor(&sc, try sc.take(ds.markov_embed, try sc.ints(perm, &.{ci(V)}), 0))));
@@ -1561,12 +1497,11 @@ fn draftHeadFor(m: *Dsv41Model, w: *Weights, head4: ?Lin, vocab_path: ?[]const u
         n_ev += 1;
     };
     try evalAll(ev[0..n_ev]);
-    if (head4) |h| for ([_]A{ h.w, h.s, h.b }) |x| release(m, w, x);
     var bytes: usize = 0;
     for ([_]A{ d.head.w, d.head.s, d.head.b }) |x| if (x.ctx != null) {
         bytes += mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
     };
-    log.info("deepseek_v41: DSpark draft vocabulary {d} of {d} ids ({s}): the drafts' head reads {d:.1} MB ({s}), their Markov chain {d} rows; the trunk and the verify keep the whole vocabulary\n", .{ k, V, path, @as(f64, @floatFromInt(bytes)) / 1e6, if (head4 != null) "4-bit" else if (base.s.ctx != null) "the trunk's quantized rows" else "dense", k });
+    log.info("deepseek_v41: DSpark draft vocabulary {d} of {d} ids ({s}): the drafts' head reads {d:.1} MB ({s}), their Markov chain {d} rows; the trunk and the verify keep the whole vocabulary\n", .{ k, V, path, @as(f64, @floatFromInt(bytes)) / 1e6, if (base.s.ctx != null) "the trunk's quantized rows" else "dense", k });
     return d;
 }
 
@@ -2268,15 +2203,7 @@ pub const HC_MIX_SOURCE = kernelSource("plugins/deepseek_v41/kernels/hc_mix.meta
 /// `HC_MIX_SOURCE`'s tile: rows a threadgroup, and the mixes a threadgroup
 /// (the largest of these that divides the mix count).
 const hc_mix_rows = 4;
-/// `MLX_SERVE_DSV41_HC_MIX8`: a wide mix threadgroup takes 8 rows on a NAX GPU, so a row group reads the mix weights
-/// once for twice the rows; each mix's sums are the same threads' in the same order at any row count.
-fn hcMixRows() usize {
-    if (!(device.naxAvailable() and env.on(.MLX_SERVE_DSV41_HC_MIX8))) return hc_mix_rows;
-    if (!hc_mix8_logged.swap(true, .monotonic)) log.info("[dsv41] HC_MIX8 engaged (8 rows a threadgroup)\n", .{});
-    return 8;
-}
 // The pfkern switches' one-time engagement lines (first use a process; no per-call output).
-var hc_mix8_logged: std.atomic.Value(bool) = .init(false);
 var ced_lazy_logged: std.atomic.Value(bool) = .init(false);
 var hc_expand_norm_logged: std.atomic.Value(bool) = .init(false);
 var woa_join_logged: std.atomic.Value(bool) = .init(false);
@@ -2635,7 +2562,6 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
     }
-    var draft_head4: ?Lin = null;
     if (device.naxAvailable() and mlx.metalKernelsAvailable()) {
         m.idx_nax_kernel = try buildIdxNaxKernel();
     }
@@ -2653,9 +2579,6 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
             log.info("deepseek_v41: embedding rows read from the pack at each lookup, not resident\n", .{});
         } else m.embed = try getLin(m, w, cfg.hidden_size, "embed", .{});
         m.head = if (tp_worker) .{ .w = none } else try getLin(m, w, cfg.hidden_size, "head", .{});
-        // `MLX_SERVE_DSV41_DRAFT_HEAD4`: the drafts' 4-bit head, from the pack's dense head before the trunk's
-        // requantization below releases it.
-        if (n_stages > 0 and !tp_worker and draftHead4Wanted()) draft_head4 = try draftHead4(m, m.head);
         if (m.head.ext != null) log.info("deepseek_v41: lm head on {s}, as shipped\n", .{opts.quant.?.name()}) else if (!tp_worker and m.head.s.ctx == null) {
             if (opts.head_8bit) m.head = try quantizeLin(m, w, m.head, 8, 64);
             log.info("deepseek_v41: lm head {s}\n", .{if (opts.head_8bit) "requantized to 8-bit (MLX_SERVE_DSV41_HEAD8=0 keeps it dense)" else "dense, as shipped"});
@@ -2707,7 +2630,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
             .conf = try ownDense(m, w, cfg.hidden_size + rank, "mtp.{d}.confidence_head.proj", .{last}, .float32),
         };
         var vbuf: [std.fs.max_path_bytes]u8 = undefined;
-        m.dspark.?.draft = try draftHeadFor(m, w, draft_head4, draftVocabPath(&vbuf, opts.pack_dir));
+        m.dspark.?.draft = try draftHeadFor(m, draftVocabPath(&vbuf, opts.pack_dir));
         m.n_mtp = n_stages;
         if (env.get(.DSPARK_PROFILE) != null) m.ds_prof = .{};
         m.ds_block = cfg.dsv4_dspark_block_size;
@@ -3439,7 +3362,7 @@ pub fn hcMixWide(sc: *Scope, m: *const Dsv41Model, x: A, hc: *const Hc, eps: A) 
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
         defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(mix) }, 2, .float32));
-        const rows = hcMixRows();
+        const rows = hc_mix_rows;
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(mix / cols * tg), ci((L + rows - 1) / rows), 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TG", ci(tg)));
@@ -3743,7 +3666,7 @@ pub fn hcMixNormFused(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *cons
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(mix) }, 2, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(D) }, 2, dt));
     if (w2 != null) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(D) }, 2, dt)) else try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{1}, 1, dt));
-    const rows = hcMixRows();
+    const rows = hc_mix_rows;
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci((mix / cols + 1) * tg), ci((L + rows - 1) / rows), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TG", ci(tg)));
@@ -6077,14 +6000,10 @@ fn blockFused(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, 
     const L = dim(x, 0);
     const a = try dkern.in_proj.run(sc, kp, m, ly, x, pre.*) orelse return null;
     const pos = try dkern.wq_b.rowsAt(sc, p0, L);
-    // `MLX_SERVE_DSV41_GEMV_R26_WQB=1`: a verify block's wq_b on the matrix units.
-    const nax = m.dec.wq_b_nax != null and dkern.wq_b.naxOn(L);
-    if (nax) engaged(m, 3, "MLX_SERVE_DSV41_GEMV_R26_WQB");
-    const kqn = if (nax) m.dec.wq_b_nax.? else kq;
     // `MLX_SERVE_DSV41_FUSE_WQB_RING=1`: wq_b returns the window ring with these rows written (no slice_update launch).
-    const kr = if (nax) m.dec.wq_b_ring_nax else m.dec.wq_b_ring;
-    const wr = if (kr != null and dkern.wq_b.ringOn()) try dkern.wq_b.runRing(sc, m, kqn, ly, li, a.qa, a.kv, a.z, pos, .{ .kern = kr.?, .buf = ls.win.buf }) else null;
-    const w = wr orelse try dkern.wq_b.run(sc, m, kqn, ly, li, a.qa, a.kv, a.z, pos) orelse return null;
+    const kr = m.dec.wq_b_ring;
+    const wr = if (kr != null and dkern.wq_b.ringOn()) try dkern.wq_b.runRing(sc, m, kq, ly, li, a.qa, a.kv, a.z, pos, .{ .kern = kr.?, .buf = ls.win.buf }) else null;
+    const w = wr orelse try dkern.wq_b.run(sc, m, kq, ly, li, a.qa, a.kv, a.z, pos) orelse return null;
     if (w.ring.ctx != null) {
         engaged(m, 0, "MLX_SERVE_DSV41_FUSE_WQB_RING");
         _ = mlx.mlx_array_free(ls.win.buf);
@@ -6111,13 +6030,7 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(m.cfg.head_dim)));
     const inv = ropeFor(m, li).inv;
     var oa: ?A = null;
-    // `MLX_SERVE_DSV41_FUSE_ATTN_MERGE=1`: the attention's last split merges the splits once and wo_a reads that one
-    // merged split (against a sink that weighs nothing) instead of each of its tiles re-merging them.
-    const merged = if (m.dec.attn_merge != null and m.dec.wo_a != null and dkern.attn.mergeOn()) try dkern.attn.partialsMerged(sc, m.dec.attn_merge.?, m, q, ls.win, comp_rows, topk, p0, scale, ly.sink, m.dec.attn_counter) else null;
-    if (merged) |p| {
-        engaged(m, 1, "MLX_SERVE_DSV41_FUSE_ATTN_MERGE");
-        oa = try dkern.wo_a.applySink(sc, m, ly, m.dec.wo_a.?, m.dec.wo_a_counter, inv, try attnMeta(sc, m, q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l, m.dec.attn_nosink);
-    } else if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try attnPartials(sc, m, ka, q, ls.win, comp_rows, topk, p0, scale)) |p| {
+    if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try attnPartials(sc, m, ka, q, ls.win, comp_rows, topk, p0, scale)) |p| {
         const meta = try attnMeta(sc, m, q, ls.win, comp_rows, topk, p0);
         // `MLX_SERVE_DSV41_WOA_PLAIN=1`: the splits merged once, wo_a a plain grouped GEMV over the merged heads.
         if (m.dec.woa_plain) |kp| if (dkern.woa_plain.on()) if (try dkern.woa_plain.apply(sc, kp, m, ly, inv, meta, p.acc, p.m, p.l)) |v| {
@@ -6129,8 +6042,6 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     };
     // `ffn_in` routes off wo_b's output, which a tensor split sums first and an ablation ablates before its expand.
     if (m.tp == null and m.ablation == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &sa)) |f| {
-        if (f.fused) engaged(m, 2, "MLX_SERVE_DSV41_FUSE_FFN_IN");
-        if (f.nax) engaged(m, 4, "MLX_SERVE_DSV41_GEMV_R26_FFN_IN");
         if (f.sink) logOnce(&ffn_sink_logged, "[dsv41] MLX_SERVE_DSV41_FFN_IN_SINK engaged: ffn_in launch 2's mix tail in its own launch, beside the MoE up\n");
         pre.* = f.sf.pre;
         // `fuse.down_scale`: the fused fp4 launches put the down scale on the routes themselves.
@@ -7550,17 +7461,13 @@ pub fn spanInAt(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const S
             if (m.trace) |tr| try tr.put("engram_{d}", .{li}, x);
             continue;
         };
-        // `fuse.engram`: a decode-width span's write gathered from the resident table (`fusion.engramHeld`), else
-        // from the rows read out of it (`fusion.engramWrite`).
-        var fused: ?A = if (sp.eng_gpu.ctx != null) try dkern.engram_ids.write(sc, m, e, sp.eng_gpu, sp.eng_plan, ek, nc, x) orelse return error.Dsv41EngramGpuIdsDeclined else try fusion.engramHeld(sc, m, e, sp.eng_ids, m.engrams.len, ek, nc, lo, hi, x);
-        const held_rows = if (fused == null) try fusion.engramRowsHeld(sc, m, e, sp.eng_ids, m.engrams.len, ek, nc, lo, hi) else null;
-        const rows = if (fused != null) none else if (held_rows) |r| r else if (sp.prefetch) |pf| blk: {
+        // `MLX_SERVE_DSV41_ENGRAM_GPU_IDS`: a decode step's write gathered from the wrapped table by the GPU's ids.
+        const fused: ?A = if (sp.eng_gpu.ctx != null) try dkern.engram_ids.write(sc, m, e, sp.eng_gpu, sp.eng_plan, ek, nc, x) orelse return error.Dsv41EngramGpuIdsDeclined else null;
+        const rows = if (fused != null) none else if (sp.prefetch) |pf| blk: {
             // A batch reads grid k, state k's rows, as one span.
             const raw = if (sp.offs.len > 0) try pf.take(k, ek, 0) else try pf.take(sp.p0, ek, k);
             defer raw.deinit(gpa);
-            fused = try fusion.engramWrite(sc, m, e, raw, x);
-            if (fused != null) break :blk none;
-            break :blk try sc.keep(try e.table.dequantTo(raw, (hi - lo) * nc, fusion.engramRowsDtype(m, &e.table), sc.s));
+            break :blk try sc.keep(try e.table.dequantTo(raw, (hi - lo) * nc, .float32, sc.s));
         } else try engramGathered(sc, m, gpa, sp, e, ek, lo, hi);
         const y = fused orelse try engramWrite(sc, m, e, x, try sc.reshape(rows, &.{ ci(hi - lo), -1 }), verify);
         // An image span's rows get no Engram write (the reference shuts their gate).
@@ -7585,9 +7492,9 @@ fn engramGathered(sc: *Scope, m: *const Dsv41Model, gpa: std.mem.Allocator, sp: 
 /// `MLX_SERVE_DSV41_PF_ENGRAM_PASS`: every span's stream entering Engram layer `li` (`spanIn`'s words but for the
 /// sums' order) into `parts`, the layer's `wkv` run once over each run of `woa.spansPer` spans' rows (M = the run's
 /// rows, not a span's 256) and the gate span by span on its slice; false (nothing taken) where it declines: the
-/// switch off, a fused Engram read, a batch, a trace, a DSpark target, a CPU stream, not one Engram table a layer.
+/// switch off, a batch, a trace, a DSpark target, a CPU stream, not one Engram table a layer.
 fn engramPass(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, li: usize, parts: []A) !bool {
-    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_ENGRAM_PASS) or !mlx.streamIsGpu(sc.s) or m.fuse.engram or m.trace != null) return false;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_ENGRAM_PASS) or !mlx.streamIsGpu(sc.s) or m.trace != null) return false;
     if (sp.eng_gpu.ctx != null or sp.offs.len > 0 or (m.n_mtp > 0 and m.dsparkTarget(li) != null)) return false;
     var found: ?usize = null;
     for (m.engrams, 0..) |*e, ek| if (e.layer == li) {
@@ -7608,7 +7515,7 @@ fn engramPass(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spa
             const raw_rows = if (sp.prefetch) |pf| blk: {
                 const raw = try pf.take(sp.p0, ek, k);
                 defer raw.deinit(gpa);
-                break :blk try sc.keep(try e.table.dequantTo(raw, (hi - lo) * sp.ncols, fusion.engramRowsDtype(m, &e.table), sc.s));
+                break :blk try sc.keep(try e.table.dequantTo(raw, (hi - lo) * sp.ncols, .float32, sc.s));
             } else try engramGathered(sc, m, gpa, sp, e, ek, lo, hi);
             r.* = try sc.astype(try sc.reshape(raw_rows, &.{ ci(hi - lo), -1 }), m.act);
         }
@@ -8873,7 +8780,6 @@ fn engAheadWhyNot(m: *const Dsv41Model) ?[]const u8 {
     if (m.engrams.len == 0) return "no Engram layer";
     if (m.hash == null) return "no Engram hash";
     if (m.engram_ids == null) return "no GPU hash constants (MLX_SERVE_DSV41_ENGRAM_GPU_IDS off at load)";
-    if (m.fuse.engram) return "the fused Engram write";
     if (exactPart(m, true, 2, "engram")) return "the exact verify (each row's own Engram wkv)";
     if (m.act != .bfloat16 or !mlx.streamIsGpu(m.s)) return "not bf16 on the GPU";
     for (m.engrams) |*e| if (e.gpu == null or e.wkv.ext != null or (e.table.bits != 4 and e.table.bits != 8)) return "an Engram table not wrapped on the GPU, or its wkv not resident";
@@ -9086,7 +8992,6 @@ pub fn draftChain(sc: *Scope, ds: *const DsparkW, sub: ?DraftSet, act: mlx.mlx_d
 }
 
 var draft_vocab_logged = std.atomic.Value(bool).init(false);
-var draft_head4_logged = std.atomic.Value(bool).init(false);
 
 /// A draft's Markov-biased rows `rows` [.., k] over a vocabulary `sub` as rows over every id (-inf at an id outside
 /// it: the drafts never propose one); as they are without one.

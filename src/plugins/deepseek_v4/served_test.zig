@@ -1271,7 +1271,7 @@ fn dsparkTokens(files: []const sdk.fixture.File, sampling: SamplingParams, out: 
     return .{ .n = n, .accepted = gen.dspark_accepted_tokens, .rounds = gen.dspark_attempted };
 }
 
-test "deepseek_v41 served: a draft-only head (DRAFT_HEAD4, DRAFT_VOCAB) changes the drafts, never the tokens, greedy and seeded" {
+test "deepseek_v41 served: a draft-only head (DRAFT_VOCAB) changes the drafts, never the tokens, greedy and seeded" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const dsv41 = @import("../deepseek_v41/deepseek_v41.zig");
@@ -1294,8 +1294,7 @@ test "deepseek_v41 served: a draft-only head (DRAFT_HEAD4, DRAFT_VOCAB) changes 
     const dir = dbuf[0..try tmp.dir.realPath(io, &dbuf)];
     var pbuf: [600]u8 = undefined;
     const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/vocab.txt", .{dir}, 0);
-    const Arm = struct { head4: ?[*:0]const u8, vocab: ?[*:0]const u8 };
-    const arms = [_]Arm{ .{ .head4 = null, .vocab = null }, .{ .head4 = "1", .vocab = null }, .{ .head4 = null, .vocab = path.ptr }, .{ .head4 = "1", .vocab = path.ptr } };
+    const arms = [_]?[*:0]const u8{ null, path.ptr };
     // A seeded request on the keyed sampler (MLX_SERVE_KEYED_SAMPLING: the draw at each generated index is fixed by the
     // seed) emits serial decoding's tokens whatever the drafts; the one-hot acceptance gives the trunk's distribution
     // either way (`dsparkStochasticRound`).
@@ -1307,14 +1306,12 @@ test "deepseek_v41 served: a draft-only head (DRAFT_HEAD4, DRAFT_VOCAB) changes 
         var want_n: usize = 0;
         var want_acc: u64 = 0;
         var want_rounds: u64 = 0;
-        for (arms, 0..) |arm, i| {
-            const arm_h4 = env.override(.MLX_SERVE_DSV41_DRAFT_HEAD4, arm.head4);
-            defer arm_h4.restore();
-            const arm_dv = env.override(.MLX_SERVE_DSV41_DRAFT_VOCAB, arm.vocab);
+        for (arms, 0..) |vocab, i| {
+            const arm_dv = env.override(.MLX_SERVE_DSV41_DRAFT_VOCAB, vocab);
             defer arm_dv.restore();
             var got: [48]u32 = undefined;
             const r = try dsparkTokens(files, sampling, &got);
-            std.debug.print("[draft head] temperature {d}: head4 {any} vocab {any}: {d} tokens, {d} drafts accepted\n", .{ sampling.temperature, arm.head4 != null, arm.vocab != null, r.n, r.accepted });
+            std.debug.print("[draft head] temperature {d}: vocab {any}: {d} tokens, {d} drafts accepted\n", .{ sampling.temperature, vocab != null, r.n, r.accepted });
             if (i == 0) {
                 want = got;
                 want_n = r.n;
@@ -1324,16 +1321,14 @@ test "deepseek_v41 served: a draft-only head (DRAFT_HEAD4, DRAFT_VOCAB) changes 
             }
             // The verify decides every kept token (greedy) and the request's keyed draws every sampled one.
             try testing.expectEqualSlices(u32, want[0..want_n], got[0..r.n]);
-            // A sampled request drafts every id under DRAFT_VOCAB (its 4-bit head aside): its rounds are control's.
-            if (sampling.temperature > 0 and arm.head4 == null) {
+            // A sampled request drafts every id under DRAFT_VOCAB: its rounds are control's.
+            if (sampling.temperature > 0) {
                 try testing.expectEqual(want_acc, r.accepted);
                 try testing.expectEqual(want_rounds, r.rounds);
             }
         }
     }
     // The drafts themselves: a vocabulary's ids only, a batched draft each state's solo one, rows -inf past it.
-    const h4 = env.override(.MLX_SERVE_DSV41_DRAFT_HEAD4, "1");
-    defer h4.restore();
     const dv = env.override(.MLX_SERVE_DSV41_DRAFT_VOCAB, path.ptr);
     defer dv.restore();
     const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, files, "");
@@ -1343,7 +1338,7 @@ test "deepseek_v41 served: a draft-only head (DRAFT_HEAD4, DRAFT_VOCAB) changes 
     const m = intree.dsv41(&p.xfm).?;
     const draft = m.dspark.?.draft.?;
     try testing.expectEqual(@as(usize, 64), draft.k);
-    try testing.expectEqual(@as(u32, 4), draft.head.qp.bits);
+    try testing.expectEqual(@as(u32, 8), draft.head.qp.bits);
     try testing.expectEqual(@as(u32, 8), m.head.qp.bits);
     const prompts = [_][]const u32{ &.{ 3, 17, 42, 9, 7, 25, 1, 60, 11, 2, 90 }, &.{ 5, 8, 13, 21, 34, 55, 89, 4, 6, 10, 12, 14, 16, 18 } };
     var sts: [2]dsv41.State = undefined;
