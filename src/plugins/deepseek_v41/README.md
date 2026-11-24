@@ -229,14 +229,14 @@ gather's. `ATTN_F16` fails, because its f16 scores and probabilities are 10% to 
 | Class | What it means | Default-on switches |
 |---|---|---|
 | EXACT | Bit-identical to the `=0` path | 30 |
-| REORDER | Not bit-identical: another sum order or tie-break, measured no farther from float64 than the `=0` path, or within a stated bound | 15: 8 measured no farther, 3 held to stated bounds, 3 resting on the commit's reasoning, 1 (`HC_EXPAND_NORM`) resting on its A/B's same text, unbounded, until a word-for-word test exists |
+| REORDER | Not bit-identical: another sum order or tie-break, measured no farther from float64 than the `=0` path, or within a stated bound | 16: 9 measured no farther, 3 held to stated bounds, 3 resting on the commit's reasoning, 1 (`HC_EXPAND_NORM`) resting on its A/B's same text, unbounded, until a word-for-word test exists |
 | DRAFT-ONLY | Changes what the drafter proposes or how many rows a verify checks. A greedy verify still keeps only tokens that the model agrees with, and a sampled verify keeps the model's distribution. Greedy text can still change by rounding, because the verify kernels' sum order depends on the verify width | 6, including `DRAFT_VOCAB` |
 | TF32 | MLX's TF32 matmul (`MLX_ENABLE_TF32`, on) | 1 (engine) |
 
 At the defaults on M5, TF32 rounds no input of the model's own matmuls. It rounds only the drafter's P·V, which
 changes the drafts, not the tokens that the model accepts. So TF32 passes for the same reason as DRAFT-ONLY.
 
-We class 51 plugin switches and 4 engine variables. Of the 51, 29 have a standing test or a kernel contract case, 11
+We class 52 plugin switches and 4 engine variables. Of the 52, 30 have a standing test or a kernel contract case, 11
 rest on their A/B giving the same text, and 11 on the commit's reasoning (see "Gaps").
 
 There are two exceptions, and both were defaults before this PR. This PR measures and documents them. The first is
@@ -367,6 +367,7 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | PF_PASS_SIZE | Near-equal memory-sized prompt passes | REORDER (partition) | commit |
 | PF_IDX_NAX | Indexer scores on the matrix units | REORDER | commit |
 | PF_COMP_BF16 | Compressor projection on a bf16 MMA, K blocks summed apart | REORDER | test |
+| PF_IDX_PASS | Indexer queries and head weights once over the pass, the head weights on a shape-cut kernel (16 partial sums) | REORDER | test |
 | FLASH_ATTN | Every prompt-attention call on one flash kernel where it fits | REORDER | test |
 | ENGRAM_GPU_IDS | Engram ids hashed on the GPU; fused wkv | REORDER (bounded) | test |
 | ENGRAM_KV_SLOTS | Slot-blocked Engram wkv | REORDER | test |
