@@ -22,7 +22,8 @@ Do these steps in this order.
 
 1. Build the server from this branch, as "Server only" in [docs/building.md](../../../docs/building.md) says. Its
    `./scripts/build-mlx.sh` step also applies the MLX patch that this release needs.
-2. Get NVIDIA's `DeepSeek-V4.1-Flash-1017-NVFP4` checkpoint, and convert it on the machine that holds it:
+2. Download NVIDIA's checkpoint from https://huggingface.co/nvidia/DeepSeek-V4.1-Flash-1017-NVFP4, and convert it on
+   the machine that holds it:
    `python3 -I scripts/dsv41_nvfp4_pack.py SRC_DIR DST_DIR --check`. Put DST_DIR on the same APFS volume as
    SRC_DIR, and keep SRC_DIR. The converter clones the shards, and a shard with no change is a symlink to the source.
 3. Optional: put a `draft-vocab.txt` file in the pack directory (see "Speculative decoding"). This release does not
@@ -32,7 +33,13 @@ Do these steps in this order.
 6. Send a first request:
    `curl -s 127.0.0.1:11234/v1/chat/completions -H 'Content-Type: application/json' -d '{"model": "<id from /v1/models>", "messages": [{"role": "user", "content": "Hello"}]}'`.
 
-`sysctl` sets the wired limit for the running system only, so set it again after each restart. Every run in this
+`sysctl` sets the wired limit for the running system only, so set it again after each restart. With `--warmup-full`,
+the server compiles its Metal kernels before it reports ready, so no request waits for a first compile.
+
+<details>
+<summary>The wired limit, memory and warm-up, in detail</summary>
+
+Every run in this
 release's A/Bs and cells used 512000. If Metal's working-set limit refuses a load, the engine's error names the
 `sudo sysctl` command that admits it. We have not tried this release at macOS's default limit. The build that PR 1256
 showed before this release (`58279979`) loaded at the default limit and peaked at 438.6 GB.
@@ -43,6 +50,8 @@ The loaded model holds about 429 GB (build `c59b60c6`, idle). On the standard te
 Metal compiles each kernel at its first use. With `--warmup-full`, the server sends itself a ladder of prompt sizes
 before it reports ready, so no user request waits for a first compile. This takes from seconds to a minute, on a
 build's first load of the model only.
+
+</details>
 
 ## What the pack holds
 
