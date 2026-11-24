@@ -422,8 +422,9 @@ Each of these is off by default. Names omit `MLX_SERVE_DSV41_` except where show
   decode alone, and it is served only without NAX. We have not measured its speed cost.
 - `FLASH_PSUM=1` (REORDER) is a flash-attention variant that is nearer to float64. It measured no faster.
 - `MXFP4_VIEW=1` (REORDER) loads an NVFP4 bank whose every 32-value span is one power of two as MXFP4. On the
-  release build it cut the standard-test peak by 16.8 GB (452.3 to 435.5 GB) and lost 1.6% to 1.7% prefill; decode
-  moved -0.33% greedy and +3.85% with the card's settings.
+  release build the greedy A/B decides: the view is -1.70% prefill and -0.33% decode there, and its use is the
+  16.8 GB of peak it saves (452.3 to 435.5 GB). With the card's settings, for the record: -1.62% prefill, +3.85%
+  decode.
 
 Three value switches set memory and kernel choices. `ENGRAM_LRU_MB` (256) sets memory only. `ENGRAM_RESIDENT` (`auto`)
 and `WEIGHT_PATH` (`auto`) can turn off the resident fusions. The `ssd` path turns off `FUSE_MXFP8_QMM`. Tables not
