@@ -5968,7 +5968,6 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     };
     // `ffn_in` routes off wo_b's output, which a tensor split sums first.
     if (m.tp == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &sa)) |f| {
-        if (f.fused) engaged(m, 2, "MLX_SERVE_DSV41_FUSE_FFN_IN");
         if (f.sink) logOnce(&ffn_sink_logged, "[dsv41] MLX_SERVE_DSV41_FFN_IN_SINK engaged: ffn_in launch 2's mix tail in its own launch, beside the MoE up\n");
         pre.* = f.sf.pre;
         // `fuse.down_scale`: the fused fp4 launches put the down scale on the routes themselves.

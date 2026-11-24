@@ -67,10 +67,8 @@ for (int j = 0; j < NR; ++j) for (int r = 0; r < R; ++r) {
   if (lane == 0) ys[r * (NSG * NR) + int(sg) * NR + j] = v;
 }
 threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-#if !DSV41_FFN_FUSED
 // The arrival counters of launch 2.
 if (tg == 0 && tid < 16) ctr[tid] = 0u;
-#endif
 if (tid < R * NSG * NR) {
   const int r = tid / (NSG * NR), c = tid % (NSG * NR);
   const int n = tg * (NSG * NR) + c;
@@ -83,19 +81,8 @@ if (tid < R * NSG * NR) {
     float a = 0.0f;
     for (int j = 0; j < HC; ++j) a = metal::fma(cb[j * HC + i], sv[j], a);
     const T o = T(metal::fma(po[i], yv, a));
-#if DSV41_FFN_FUSED
-    // The fused tail reads x1 and hv from other cores: a column pair's word as one atomic store reaches L2.
-    const uint ob = uint(as_type<ushort>(o)), op = metal::simd_shuffle_xor(ob, ushort(1));
-    if ((n & 1) == 0) metal::atomic_store_explicit((device metal::atomic_uint*)x1 + (((size_t)r * HC + i) * D + n) / 2, ob | (op << 16), metal::memory_order_relaxed);
-#else
     x1[((size_t)r * HC + i) * D + n] = o;
-#endif
     h = metal::fma(pr[i], float(o), h);
   }
-#if DSV41_FFN_FUSED
-  const uint hb = uint(as_type<ushort>(T(h))), hp = metal::simd_shuffle_xor(hb, ushort(1));
-  if ((n & 1) == 0) metal::atomic_store_explicit((device metal::atomic_uint*)hv + ((size_t)r * D + n) / 2, hb | (hp << 16), metal::memory_order_relaxed);
-#else
   hv[(size_t)r * D + n] = T(h);
-#endif
 }
