@@ -341,7 +341,6 @@ test "dsv41 wide tol: MLX_SERVE_DSV41_MOE_PAIR_SCALED's paired NVFP4 gate+up wit
     m.cfg = .{};
     m.cfg.dsv4_swiglu_limit = 10;
     m.act = .bfloat16;
-    m.moe_wt_kernel = null;
     m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
     defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
     m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
@@ -602,7 +601,6 @@ test "dsv41 wide: MLX_SERVE_DSV41_MOE_TAIL's one launch is the two launches' wor
     m.cfg = .{};
     m.cfg.dsv4_swiglu_limit = 10;
     m.act = .bfloat16;
-    m.moe_wt_kernel = null;
     m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
     defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
     m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
