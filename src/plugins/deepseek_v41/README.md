@@ -112,7 +112,7 @@ to a value that does not start with 0. `MLX_SERVE_DSV4_DSPARK=0` turns drafting 
 
 For a greedy request, the drafter proposes its argmax tokens, and the verify keeps the longest prefix that the model
 agrees with. The verify rows run multi-row kernels, which do the math of a plain decode step in another sum order. So
-greedy text with DSpark on can differ from plain decode by rounding. `MLX_SERVE_DSV41_EXACT_VERIFY=1` makes each verify
+greedy text with DSpark on can differ from plain decode by rounding. `MLX_SERVE_DSV41_EXACT=1` makes each verify
 row run its plain step's kernels, and greedy DSpark text is then plain decode's bytes, at some speed cost.
 
 For a sampled request (`MLX_SERVE_DSV41_DRAFT_SAMPLE`, on), the drafter draws each token from its own distribution q.
@@ -379,7 +379,7 @@ Six switches stay off by default, and three value switches set memory and kernel
 
 Each of these is off by default. Names omit `MLX_SERVE_DSV41_` except where shown.
 
-- `EXACT_VERIFY=1` (EXACT) makes greedy DSpark text equal plain decode's bytes on M5.
+- `EXACT=1` (EXACT) makes greedy DSpark text equal plain decode's bytes, on M5 through its NAX path.
 - `EXACT=1|solo` (EXACT) does the same on M3-generation or later Apple GPUs without NAX. Any value other than unset,
   empty or `0` turns it on. `solo` also makes every request decode alone. On a GPU with NAX, the load leaves it off and logs why.
 - `FLASH_PSUM=1` (REORDER) is a flash-attention variant that is nearer to float64. It measured no faster.

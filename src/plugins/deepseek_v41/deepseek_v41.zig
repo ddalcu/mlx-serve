@@ -892,10 +892,12 @@ fn head8From(v: ?[*:0]const u8) bool {
 
 /// `MLX_SERVE_DSV41_EXACT=1`: a DSpark verify row runs the kernels a plain step runs, so a greedy drafted request emits
 /// plain decode's tokens bit for bit, whatever the round schedule; plain decode itself is untouched. Copy verifies are
-/// cut to the decode-width rows (`maxVerifyDrafts`). The parts below are all on when exact is; only the gate
+/// cut to the decode-width rows (`maxVerifyDrafts`). Two paths serve the one guarantee: without NAX the whole verify
+/// row (`exactServes`, all the parts below); on a NAX GPU the verify path (`exactVerify`): the head and Engram wkv a
+/// row at a time, wo_a on the vector kernel, every resident verify within the decode-width rows, where the fused
+/// decode kernels already give a verify row its plain step's bits. The parts are all on when exact is; only the gate
 /// (`decode/exact_test.zig`, `DSV41_EXACT_GATE_BATCHED`) leaves some on the batched kernels, to measure each one.
-/// `engram` and `head` also serve every decode-width verify under `MLX_SERVE_DSV41_EXACT_VERIFY` (`exactPart`);
-/// `argmax` serves every greedy accept; `tail` needs exact.
+/// `argmax` serves every greedy accept; `tail` needs the non-NAX path.
 pub const Exact = struct {
     on: bool = false,
     /// Each verify row's attention, attn_out and FFN as the plain step at its position runs them (`blockFusedRows`).
@@ -991,18 +993,17 @@ pub fn exactSolo(m: *const Dsv41Model) bool {
     return exactServes(m) and m.exact.solo;
 }
 
-/// Whether an armed verify of `rows` rows takes exact part `part` (`Exact`). The Engram projection and the head do
-/// under `MLX_SERVE_DSV41_EXACT_VERIFY` too: MLX's quantized_matmul takes other kernels at 2..16 rows than at one
-/// (qmv_wide, qmv_mma), the same math in another order.
+/// Whether an armed verify of `rows` rows takes exact part `part` (`Exact`). The Engram projection and the head do on
+/// the NAX path too (`exactVerify`): MLX's quantized_matmul takes other kernels at 2..16 rows than at one (qmv_wide,
+/// qmv_mma), the same math in another order.
 fn exactPart(m: *const Dsv41Model, verify: bool, rows: usize, comptime part: []const u8) bool {
     if (!verify or rows <= 1 or rows > dkern.max_rows or !@field(m.exact, part)) return false;
     return exactServes(m) or (exactVerify() and !std.mem.eql(u8, part, "tail"));
 }
 
-/// `MLX_SERVE_DSV41_EXACT_VERIFY`: a verify row runs its plain step's kernels, so greedy DSpark text is plain decode's
-/// bytes. Read each call.
+/// `MLX_SERVE_DSV41_EXACT` on a NAX GPU: exact's verify path (`Exact`). Read each call.
 pub fn exactVerify() bool {
-    return env.on(.MLX_SERVE_DSV41_EXACT_VERIFY);
+    return exactWanted().on and device.naxAvailable();
 }
 
 /// The reason a held trunk layer's formats keep it off the fused decode kernels at verify width (q_kv, wq_b, the
@@ -2600,6 +2601,12 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     };
     try compileRegions(m);
     m.exact = exactWanted();
+    if (m.exact.on and mlx.streamIsGpu(s) and device.naxAvailable()) {
+        // A NAX GPU serves exact through its verify path (`exactVerify`): the fused NAX indexer and attention give a
+        // verify row other picks than the plain step's, so the whole-row path stays off, and `solo` with it.
+        log.info("deepseek_v41: exact DSpark verify (MLX_SERVE_DSV41_EXACT) on a NAX GPU: the verify path (head, Engram wkv and wo_a as the plain step's, verifies within {d} drafts on a resident bank){s}\n", .{ dkern.max_rows - 1, if (m.exact.solo) "; solo is not served here" else "" });
+        m.exact.on = false;
+    }
     if (m.exact.on) {
         // Proven (decode/exact_test.zig, the live corpus) only where every verify row takes the fused decode kernels'
         // rows (`blockFusedRows`): an Apple GPU without NAX (the fused NAX indexer and attention give a verify row other
@@ -9323,7 +9330,7 @@ pub fn maxVerifyDrafts(m: *const Dsv41Model) usize {
 }
 
 /// Whether `m`'s verifies keep to the decode-width kernels' rows, as a plain step's bits need: exact, or a resident
-/// bank under `MLX_SERVE_DSV41_EXACT_VERIFY`, where a copy round's wider verify would run the prompt kernels.
+/// bank on exact's NAX path (`exactVerify`), where a copy round's wider verify would run the prompt kernels.
 fn decodeWidthVerify(m: *const Dsv41Model) bool {
     return exactServes(m) or (m.streamed == null and exactVerify());
 }
@@ -12650,7 +12657,7 @@ test "dsv41 verify exact: on a real pack, every verify row's logits are its plai
     // logits hash; DSV41_VERIFY_EXACT_NODSPARK the stages left unloaded, plain steps only (two runs' dumps compare).
     const dir = std.mem.span(std.c.getenv("DSV41_VERIFY_EXACT") orelse return error.SkipZigTest);
     const stages = std.c.getenv("DSV41_VERIFY_EXACT_NODSPARK") == null;
-    const xv = env.override(.MLX_SERVE_DSV41_EXACT_VERIFY, "1");
+    const xv = env.override(.MLX_SERVE_DSV41_EXACT, "1");
     defer xv.restore();
     const ctx = if (std.c.getenv("DSV41_STEP_CTX")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 17639;
     const gpa = testing.allocator;

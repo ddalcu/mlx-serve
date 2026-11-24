@@ -248,7 +248,7 @@ test "dsv41 exact: verify rows and the state they leave equal plain steps bit fo
 test "dsv41 exact: verify rows against plain steps with fp4 experts, the fused fp4 MoE on and off, exact off (DSV41_EXACT_GATE)" {
     if (env.get(.DSV41_EXACT_GATE) == null) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    const xv = env.override(.MLX_SERVE_DSV41_EXACT_VERIFY, "1");
+    const xv = env.override(.MLX_SERVE_DSV41_EXACT, "1");
     defer xv.restore();
     for ([_]?[*:0]const u8{ "1", "0" }) |fused| {
         const sw = env.override(.MLX_SERVE_DSV41_MOE_FP4_NAX, fused);
@@ -268,9 +268,10 @@ test "dsv41 exact: verify rows against plain steps with fp4 experts, the fused f
     }
 }
 
-test "dsv41 verify: under MLX_SERVE_DSV41_EXACT_VERIFY the head and the Engram write give each verify row its plain step's bits" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    const xv = env.override(.MLX_SERVE_DSV41_EXACT_VERIFY, "1");
+test "dsv41 verify: on exact's NAX path (MLX_SERVE_DSV41_EXACT) the head and the Engram write give each verify row its plain step's bits" {
+    // Without NAX exact runs the whole verify row (the gate above); this is the NAX path's per-row head and Engram.
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    const xv = env.override(.MLX_SERVE_DSV41_EXACT, "1");
     defer xv.restore();
     const gpa = std.testing.allocator;
     const s = mlx.gpuStream();
