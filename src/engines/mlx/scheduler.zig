@@ -147,6 +147,8 @@ test {
     _ = @import("batching/tick.zig");
     _ = @import("batching/verdict.zig");
     _ = @import("cache/budget.zig");
+    _ = @import("cache/peer_wire.zig");
+    _ = @import("cache/peer_transfer.zig");
     _ = @import("commit.zig");
     _ = @import("decode.zig");
     _ = @import("finish.zig");
@@ -417,6 +419,22 @@ pub fn deinit(self: *Scheduler) void {
         req.done_mu.unlock(self.io);
     }
     self.embed_queue.deinit(self.allocator);
+    for (self.cache_export_queue.items) |req| {
+        req.done_mu.lockUncancelable(self.io);
+        if (req.error_name == null) req.error_name = "Shutdown";
+        req.done = true;
+        req.done_cond.broadcast(self.io);
+        req.done_mu.unlock(self.io);
+    }
+    self.cache_export_queue.deinit(self.allocator);
+    for (self.cache_import_queue.items) |req| {
+        req.done_mu.lockUncancelable(self.io);
+        if (req.error_name == null) req.error_name = "Shutdown";
+        req.done = true;
+        req.done_cond.broadcast(self.io);
+        req.done_mu.unlock(self.io);
+    }
+    self.cache_import_queue.deinit(self.allocator);
     // Phase D: signal any pending cold-load requesters that the
     // server is shutting down. They roll back their entry state and
     // free pre-loaded CPU resources.

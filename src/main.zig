@@ -368,6 +368,12 @@ fn printUsage(io: std.Io) void {
         \\  --ablation-profiles <dir> --ablation-key-file <path>
         \\                      Per-request directional ablation (docs/api.md);
         \\                        the key file is 0600, at least 32 bytes.
+        \\  --cache-transfer    Enable HTTP KV-cache transfer (`X-Cache-Export: 1`
+        \\                        and `POST /v1/cache/import`) for loopback peers.
+        \\  --cache-transfer-key-file <path>
+        \\                      Enable HTTP KV-cache transfer from any peer with
+        \\                        `Authorization: Bearer <key>` (0600 file, at least
+        \\                        32 bytes, distinct from `--api-key`).
         \\  --kv-attn-mode {{auto|dense|fused}}
         \\                      Decode read path for quantized KV. `dense`
         \\                        dequantizes K/V before SDPA; `fused` reads
@@ -737,6 +743,8 @@ pub fn main(init: std.process.Init) !void {
     var kv_attn_mode: server_mod.KvAttnMode = .auto;
     var ablation_profiles: ?[]const u8 = null;
     var ablation_key_file: ?[]const u8 = null;
+    var cache_transfer_loopback = false;
+    var cache_transfer_key_file: ?[]const u8 = null;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
@@ -1216,6 +1224,11 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--ablation-key-file") and i + 1 < args.len) {
             i += 1;
             ablation_key_file = args[i];
+        } else if (std.mem.eql(u8, args[i], "--cache-transfer")) {
+            cache_transfer_loopback = true;
+        } else if (std.mem.eql(u8, args[i], "--cache-transfer-key-file") and i + 1 < args.len) {
+            i += 1;
+            cache_transfer_key_file = args[i];
         } else if (std.mem.eql(u8, args[i], "--kv-attn-mode") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "dense")) {
@@ -1404,6 +1417,8 @@ pub fn main(init: std.process.Init) !void {
         server_mod.g_metrics = m;
     }
     defer server_mod.g_metrics = null;
+    server_mod.g_cache_transfer = @import("host/http/auth.zig").launchCacheTransfer(allocator, cache_transfer_loopback, cache_transfer_key_file, server_mod.g_api_key) catch std.process.exit(1);
+    defer server_mod.g_cache_transfer = .disabled;
 
     // ── GGUF early-branch: route to an embedded engine ──
     //

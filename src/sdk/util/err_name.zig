@@ -33,6 +33,8 @@ pub const Known = error{
     Timeout,
     EmbedFailed,
     VisionEncodeFailed,
+    CacheExportFailed,
+    CacheImportFailed,
     ModelNotReady,
     SlotFailed,
     Open,

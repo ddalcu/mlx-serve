@@ -358,6 +358,8 @@ pub extern "c" fn mlx_array_data_float16(arr: mlx_array) ?[*]const f16;
 pub extern "c" fn mlx_array_data_bfloat16(arr: mlx_array) ?[*]const u16;
 pub extern "c" fn mlx_array_data_int32(arr: mlx_array) ?[*]const i32;
 pub extern "c" fn mlx_array_data_uint32(arr: mlx_array) ?[*]const u32;
+pub extern "c" fn mlx_array_data_uint16(arr: mlx_array) ?[*]const u16;
+pub extern "c" fn mlx_array_data_uint64(arr: mlx_array) ?[*]const u64;
 pub extern "c" fn mlx_array_data_uint8(arr: mlx_array) ?[*]const u8;
 
 // Distributed (mlx-c distributed.h / distributed_group.h); JACCL = RDMA over Thunderbolt 5

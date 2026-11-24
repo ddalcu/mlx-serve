@@ -1861,7 +1861,7 @@ pub fn auxBinding(xfm: *const Transformer) ?AuxBinding {
     const cache = b.table.cache;
     if (cache.size < @sizeOf(abi.CacheHooks)) return null;
     const hooks = cache.aux orelse return null;
-    if (hooks.size < @sizeOf(abi.AuxHooks)) return null;
+    if (hooks.size < abi.AuxHooks.min_size) return null;
     return .{ .model = b.model, .hooks = hooks };
 }
 
@@ -1899,6 +1899,25 @@ pub fn auxImportPlan(xfm: *const Transformer, header: []const u8, out_peak_bytes
     out_peak_bytes.* = 0;
     const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
     return b.hooks.import_plan(b.model, .of(header), out_peak_bytes);
+}
+
+pub fn auxImportPlanDetails(xfm: *const Transformer, header: []const u8, out: *abi.AuxImportPlan) abi.Verdict {
+    out.* = .{};
+    const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
+    const details_end = @offsetOf(abi.AuxHooks, "import_plan_details") + @sizeOf(@FieldType(abi.AuxHooks, "import_plan_details"));
+    if (b.hooks.size >= details_end) {
+        if (b.hooks.import_plan_details) |f| return f(b.model, .of(header), out);
+    }
+    return b.hooks.import_plan(b.model, .of(header), &out.peak);
+}
+
+/// The plugin's contribution to the peer settings key (`AuxHooks.settings_key`); null when it makes none.
+pub fn auxSettingsKey(xfm: *const Transformer) ?u64 {
+    const b = auxBinding(xfm) orelse return null;
+    const end = @offsetOf(abi.AuxHooks, "settings_key") + @sizeOf(@FieldType(abi.AuxHooks, "settings_key"));
+    if (b.hooks.size < end) return null;
+    const f = b.hooks.settings_key orelse return null;
+    return f(b.model);
 }
 
 pub fn auxExportArrays(xfm: *const Transformer, snap: abi.Handle, out: *abi.AuxExport) abi.Verdict {
@@ -2328,6 +2347,10 @@ const AuxFake = struct {
         out.* = m;
         return .ok;
     }
+    fn importPlanDetails(_: *anyopaque, _: abi.Str, out: *abi.AuxImportPlan) callconv(.c) abi.Verdict {
+        out.* = .{ .peak = 7, .loaded = 11, .destination = 22 };
+        return .ok;
+    }
     const hooks: abi.AuxHooks = .{
         .reserve = undefined,
         .commit = undefined,
@@ -2384,7 +2407,7 @@ test "absent and short auxiliary tables refuse without calling hooks" {
             7 => hooks.size = @offsetOf(abi.AuxHooks, "import_plan"),
             8 => hooks.size = @offsetOf(abi.AuxHooks, "export_arrays"),
             9 => hooks.size = @offsetOf(abi.AuxHooks, "import_arrays"),
-            10 => hooks.size = @sizeOf(abi.AuxHooks) - 1,
+            10 => hooks.size = abi.AuxHooks.min_size - 1,
             11 => {
                 hooks.size = @sizeOf(abi.AuxHooks);
                 cache.size = @offsetOf(abi.CacheHooks, "aux");
@@ -2406,6 +2429,57 @@ test "absent and short auxiliary tables refuse without calling hooks" {
         auxFree(&x, &fake);
         try t.expectEqual(@as(usize, 0), fake.calls);
     }
+}
+
+test "a table that ends before the optional import_plan_details plans through import_plan" {
+    const t = std.testing;
+    var fake: AuxFake = .{ .disk = true };
+    var hooks = AuxFake.hooks;
+    hooks.import_plan_details = &AuxFake.importPlanDetails;
+    const cache: abi.CacheHooks = .{ .aux = &hooks };
+    const table = AuxFake.table(&cache);
+    var bound: Bound = .{ .table = &table, .model = &fake };
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    const tail = @offsetOf(abi.AuxHooks, "import_plan_details");
+    // The field's own end, not the table's: later optional hooks (settings_key) follow it.
+    const details_end = tail + @sizeOf(@FieldType(abi.AuxHooks, "import_plan_details"));
+    const sizes = [_]u32{ tail, details_end - 1, details_end, @sizeOf(abi.AuxHooks) };
+    const peaks = [_]u64{ 6144, 6144, 7, 7 };
+    for (sizes, peaks) |size, peak| {
+        hooks.size = size;
+        try t.expect(auxEnabled(&x));
+        var plan: abi.AuxImportPlan = .{};
+        try t.expect(auxImportPlanDetails(&x, "codec", &plan).isOk());
+        try t.expectEqual(peak, plan.peak);
+        try t.expectEqual(if (peak == 7) @as(u64, 11) else 0, plan.loaded);
+        try t.expectEqual(if (peak == 7) @as(u64, 22) else 0, plan.destination);
+    }
+}
+
+test "plugin aux: a table that ends at import_plan_details binds and contributes no settings key" {
+    const t = std.testing;
+    const Key = struct {
+        fn settingsKey(_: *anyopaque) callconv(.c) u64 {
+            return 99;
+        }
+    };
+    var fake: AuxFake = .{ .on = true };
+    var hooks = AuxFake.hooks;
+    hooks.settings_key = &Key.settingsKey;
+    const cache: abi.CacheHooks = .{ .aux = &hooks };
+    const table = AuxFake.table(&cache);
+    var bound: Bound = .{ .table = &table, .model = &fake };
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    try t.expectEqual(@as(?u64, 99), auxSettingsKey(&x));
+    hooks.size = @offsetOf(abi.AuxHooks, "settings_key");
+    try t.expect(auxBinding(&x) != null);
+    try t.expect(auxEnabled(&x));
+    try t.expectEqual(@as(?u64, null), auxSettingsKey(&x));
+    hooks.size = abi.AuxHooks.min_size;
+    try t.expect(auxBinding(&x) != null);
+    try t.expectEqual(@as(?u64, null), auxSettingsKey(&x));
 }
 
 test "plugin aux: eligibility is per instance" {

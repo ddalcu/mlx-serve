@@ -30,6 +30,9 @@ const GenRequest = @import("../../../host/gpu_thread/requests.zig").GenRequest;
 const MAX_MERGED_WEIGHT = @import("../../../host/gpu_thread/requests.zig").MAX_MERGED_WEIGHT;
 const takeMergeable = @import("../../../host/gpu_thread/requests.zig").takeMergeable;
 const UnloadRequest = @import("../../../host/gpu_thread/requests.zig").UnloadRequest;
+const CacheExportRequest = @import("../../../host/gpu_thread/requests.zig").CacheExportRequest;
+const CacheImportRequest = @import("../../../host/gpu_thread/requests.zig").CacheImportRequest;
+const peer_transfer = @import("../cache/peer_transfer.zig");
 const ThreadCtx = @import("thread.zig").ThreadCtx;
 const signalStarted = @import("thread.zig").signalStarted;
 const recordLoadError = @import("thread.zig").recordLoadError;
@@ -44,6 +47,8 @@ pub fn hasWorkPendingLocked(sch: *const Scheduler) bool {
         sch.load_queue.items.len > 0 or
         sch.gen_queue.items.len > 0 or
         sch.unload_queue.items.len > 0 or
+        sch.cache_export_queue.items.len > 0 or
+        sch.cache_import_queue.items.len > 0 or
         warm_requests.owesStepLocked(sch);
 }
 
@@ -159,6 +164,10 @@ pub fn drainSideQueues(sch: *Scheduler) bool {
     var vision_n: usize = 0;
     var embed_batch: [4]*EmbedRequest = undefined;
     var embed_n: usize = 0;
+    var export_batch: [4]*CacheExportRequest = undefined;
+    var export_n: usize = 0;
+    var import_batch: [4]*CacheImportRequest = undefined;
+    var import_n: usize = 0;
     {
         sch.queue_mu.lockUncancelable(sch.io);
         defer sch.queue_mu.unlock(sch.io);
@@ -173,6 +182,14 @@ pub fn drainSideQueues(sch: *Scheduler) bool {
         while (embed_n < embed_batch.len and sch.embed_queue.items.len > 0) {
             embed_batch[embed_n] = sch.embed_queue.orderedRemove(0);
             embed_n += 1;
+        }
+        while (export_n < export_batch.len and sch.cache_export_queue.items.len > 0) {
+            export_batch[export_n] = sch.cache_export_queue.orderedRemove(0);
+            export_n += 1;
+        }
+        while (import_n < import_batch.len and sch.cache_import_queue.items.len > 0) {
+            import_batch[import_n] = sch.cache_import_queue.orderedRemove(0);
+            import_n += 1;
         }
     }
     for (cleanup_batch[0..cleanup_n]) |s| {
@@ -208,7 +225,9 @@ pub fn drainSideQueues(sch: *Scheduler) bool {
     }
     for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
     for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
-    return cleanup_n + vision_n + embed_n > 0;
+    for (export_batch[0..export_n]) |req| peer_transfer.runCacheExportRequest(sch, req);
+    for (import_batch[0..import_n]) |req| peer_transfer.runCacheImportRequest(sch, req);
+    return cleanup_n + vision_n + embed_n + export_n + import_n > 0;
 }
 
 // ── tests ──

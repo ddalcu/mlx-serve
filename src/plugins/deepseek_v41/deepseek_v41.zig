@@ -6794,9 +6794,8 @@ fn cacheLayout(m: *const Dsv41Model) !cache_codec.Layout {
     return l;
 }
 
-pub fn snapshotImportPlan(m: *const Dsv41Model, header: []const u8) !u64 {
-    const p = try cache_codec.Plan.decode(try cacheLayout(m), header);
-    return p.peak;
+pub fn snapshotImportPlan(m: *const Dsv41Model, header: []const u8) !cache_codec.Plan {
+    return cache_codec.Plan.decode(try cacheLayout(m), header);
 }
 
 fn checkSnapshotRows(r: ?Rows, expected: bool, used: usize, width: usize, dt: mlx.mlx_dtype) !void {

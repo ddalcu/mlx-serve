@@ -46,6 +46,8 @@ pub const Api = struct {
     run_generation: *const fn (*Scheduler, *requests.GenRequest) Err,
     compute_embeddings: *const fn (*Scheduler, *requests.EmbedRequest, *[][]f32) Err,
     encode_vision: *const fn (*Scheduler, *requests.VisionEncodeRequest, *mlx.mlx_array) Err,
+    export_cache: *const fn (*Scheduler, *requests.CacheExportRequest) Err,
+    import_cache: *const fn (*Scheduler, *requests.CacheImportRequest) Err,
     /// Qwen3-ForcedAligner: the 80 ms step each `<timestamp>` in `ids` lands on, run on the inference thread.
     timestamp_classes: *const fn (std.mem.Allocator, *LoadedModel, []const u32, mlx.mlx_array, u32, *[]u32) Err,
     /// A speech plugin's own timing (`MediaHooks.word_times`): a start and an end in ms per unit, inference thread.
@@ -211,6 +213,16 @@ pub fn encodeVision(sch: *Scheduler, req: *requests.VisionEncodeRequest) !mlx.ml
     var out: mlx.mlx_array = .{ .ctx = null };
     try err_name.check(api().encode_vision(sch, req, &out));
     return out;
+}
+
+pub fn exportCache(sch: *Scheduler, req: *requests.CacheExportRequest) !requests.CacheExportOutcome {
+    try err_name.check(api().export_cache(sch, req));
+    return req.outcome;
+}
+
+pub fn importCache(sch: *Scheduler, req: *requests.CacheImportRequest) !requests.CacheImportOutcome {
+    try err_name.check(api().import_cache(sch, req));
+    return req.outcome;
 }
 
 pub fn timestampClasses(gpa: std.mem.Allocator, lm: *LoadedModel, ids: []const u32, rows: mlx.mlx_array, timestamp_token: u32) ![]u32 {
