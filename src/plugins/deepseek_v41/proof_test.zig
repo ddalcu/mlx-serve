@@ -810,6 +810,10 @@ fn attachTinyEngramForTest(mdl: *dsv41.Dsv41Model, dir: []const u8) !void {
 
 test "deepseek_v41 CED encode interior: cold Engram chunk splits leadRows and matches cold bit for bit" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    // The lead split this test counts is the off arm of `MLX_SERVE_DSV41_PF_PASS_SIZE` (on, a chunk whose Engram
+    // tables are all held runs as one pass, no lead).
+    const pass_off = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, "0");
+    defer pass_off.restore();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const files = try fixture.v41Files(arena.allocator(), 7);

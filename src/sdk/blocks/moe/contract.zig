@@ -22,7 +22,7 @@
 //! held exact. A mapped launch under 8 routed rows does not compile (MLX binds the row map in `constant`); the wrapper
 //! takes 16 rows or more, so the registration's mapped rows are tokens of four routed rows.
 //! `ubench_stream_wide` (a read-ceiling probe, not served) is held exact as integers.
-//! Known issues: limit_drops_nan (moe_fp4's and the NAX pair's clamps), routed_nan (the routed epilogue's clamp).
+//! Known issues: routed_nan (the routed epilogue's clamp).
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -748,8 +748,6 @@ const Gather = struct {
 fn depthK(shape: Shape) usize {
     return shape.k + 4; // a row's sum, behind the dequant (q * s + b) and the product
 }
-
-const limit_drops_nan: spec.Known = .{ .gate = .nonfinite, .finding = "metal::min / max return the other operand for a NaN, where MLX's Minimum and Clip (the clampedSwiGLU chain it replaces) keep the NaN: a NaN gate or up gives a finite output" };
 
 fn gatherSpec(comptime name: []const u8, g: Gather, served: []const Shape, replaces: ?[]const u8, known: ?spec.Known) spec.Spec {
     const vpw: usize = @intCast(@divExact(@as(c_int, 32 * 8), gq.affineQmvPackUnits(32 * 8, g.bits())));
@@ -2868,7 +2866,7 @@ fn registerNax(set: *kc.Set) !void {
     var wt3 = GqmmNax.init(a, .paired, .affine, 3, 64, 32);
     wt3.limit = 10;
     wt3.weighted = true;
-    try set.add(GqmmNax, wt3, .{ .name = "gather_qmm_nax paired weighted bf16 (3-bit g64, limit 10)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = "take (the row map) -> " ++ gather ++ " for gate and up -> clampedSwiGLU -> weight multiply", .served = paired[0..1], .known = limit_drops_nan }, null);
+    try set.add(GqmmNax, wt3, .{ .name = "gather_qmm_nax paired weighted bf16 (3-bit g64, limit 10)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = "take (the row map) -> " ++ gather ++ " for gate and up -> clampedSwiGLU -> weight multiply", .served = paired[0..1] }, null);
     // Per-expert scales (ModelOpt NVFP4's global scales) in the pair's epilogue, both fp4 formats: the gate's alone
     // (an unclamped SwiGLU, the up x down scales riding the scores), and gate and up before a clamp.
     try set.add(GqmmNax, .init(a, .paired, .nvfp4, 4, 16, 32), .{ .name = "gather_qmm_nax paired bf16 (NVFP4)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = chain, .served = paired[0..1] }, null);

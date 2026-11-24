@@ -10993,6 +10993,9 @@ fn expectF32Eq(gpa: std.mem.Allocator, want_a: A, got_a: A) !void {
 }
 
 test "dsv41 index_nax: NAX multi-row scorer matches idx_tile scores and top-K picks across shapes, causal edges, and dtypes" {
+    // `indexScores` dispatches to the matmul2d scorer only with `MLX_SERVE_DSV41_PF_IDX_NAX` off (on, its scorer first).
+    const idx_nax_off = env.override(.MLX_SERVE_DSV41_PF_IDX_NAX, "0");
+    defer idx_nax_off.restore();
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;
