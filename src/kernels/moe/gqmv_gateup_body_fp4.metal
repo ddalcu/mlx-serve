@@ -12,7 +12,7 @@
   }
   float dg0 = dg[0], dg1 = dg[1], dg2 = dg[2], dg3 = dg[3];
   float du0 = du[0], du1 = du[1], du2 = du[2], du3 = du[3];
-  g0 += mlxserve_gqmv_term<FOLD>(dg0, sjg); g1 += mlxserve_gqmv_term<FOLD>(dg1, sjg);
-  g2 += mlxserve_gqmv_term<FOLD>(dg2, sjg); g3 += mlxserve_gqmv_term<FOLD>(dg3, sjg);
-  u0 += mlxserve_gqmv_term<FOLD>(du0, sju); u1 += mlxserve_gqmv_term<FOLD>(du1, sju);
-  u2 += mlxserve_gqmv_term<FOLD>(du2, sju); u3 += mlxserve_gqmv_term<FOLD>(du3, sju);
+  g0 += mlxserve_gqmv_term(dg0, sjg); g1 += mlxserve_gqmv_term(dg1, sjg);
+  g2 += mlxserve_gqmv_term(dg2, sjg); g3 += mlxserve_gqmv_term(dg3, sjg);
+  u0 += mlxserve_gqmv_term(du0, sju); u1 += mlxserve_gqmv_term(du1, sju);
+  u2 += mlxserve_gqmv_term(du2, sju); u3 += mlxserve_gqmv_term(du3, sju);

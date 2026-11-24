@@ -351,8 +351,6 @@ const Gather = struct {
                         g.int("USCALE", @intFromBool(self.uscale));
                     },
                 }
-                // The wrapper's `MLX_SERVE_FP4_FOLD22` arm, off as shipped.
-                g.int("FOLD", 0);
             },
             .down, .down_rows => {
                 const rows = self.rowsPerSg();
@@ -371,7 +369,6 @@ const Gather = struct {
                 g.int("LPR", self.lpr);
                 g.int("KP", kp);
                 g.flag("ONE_ROW", self.kind == .down);
-                g.int("FOLD", 0);
             },
         }
         return g;

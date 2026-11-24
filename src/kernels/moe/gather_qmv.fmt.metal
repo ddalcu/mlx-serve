@@ -25,7 +25,6 @@ for (int pack = int(lane); pack < K_by_p; pack += 32) {{
 {s}
 }}
 float acc = simd_sum((a0 + a1) + (a2 + a3));
-if (FOLD != 0) acc *= 4194304.0f;
 if (lane == 0) {{
   float o = float(T(acc));
   // MLX's maximum keeps a NaN; metal::max would return the 0.
