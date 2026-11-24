@@ -2,7 +2,7 @@
 //! Max).
 //!
 //! The model's `gateLogits` past the decode width runs `matmul(astype(x, f32), transpose(astype(gate_w, f32)))`,
-//! x bf16 [rows, 5,120] and gate_w [384, 5,120] (F16 on the pack): two casts and MLX's NAX matmul (MLX_ENABLE_TF32
+//! x bf16 [rows, 5,120] and gate_w [384, 5,120] (bf16 on the NVFP4 pack): two casts and MLX's NAX matmul (MLX_ENABLE_TF32
 //! unset: 1), its regular fused kernel from 1,707 rows (K < 3 max(M, N)), its split K below. This runs the chain as
 //! one launch: MLX's fused NAX GEMM kernel at nt (steel/gemm/kernels/steel_gemm_fused_nax.h `gemm`, MLX 0.32.3:
 //! kernels/gate_gemm_nt.metal) and its gemm_loop (kernels/gate_gemm_loop.metal: verbatim but A's and B's memory

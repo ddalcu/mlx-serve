@@ -140,8 +140,9 @@ DSpark, lossless classes): `README.md`.
 - A prompt chunk of 4096 rows or more that nothing read ahead runs as its first half, then the rest (`extendCold`,
   `leadRows`; the lead is `Want.encode`: no decoder replay, which the rest makes): the drive reads the rest's Engram
   rows behind the lead. The log's `waited ... ms` is the meter.
-- Every default-on switch is EXACT, REORDER, DRAFT-ONLY or TF32 (`README.md` "Lossless classes") except two: `HEAD8`,
-  the one requantization, and `ATTN_F16`, not classed (`README.md` "Gaps"). A new default-on switch owes a standing word or float64 test against its `=0` path, a plant failing.
+- Every default-on switch is EXACT, REORDER, DRAFT-ONLY or TF32 except `HEAD8` (the one requantization) and `ATTN_F16`
+  (an f16 attention core, LOSSY): `README.md` "Accuracy". A new default-on switch owes a standing word or float64 test
+  against its `=0` path, a plant failing.
 - Construct each MPP cooperative tensor from its owning op; copying one invokes incompatible Metal layout
   interfaces on some SDKs. Fill each operand's independent storage before running the matmul.
 
