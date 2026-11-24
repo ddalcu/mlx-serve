@@ -12,9 +12,9 @@
 //! NOT exact: the probabilities round to f16 against the running max before the division (the gather's sm divides
 //! first), the accumulator is rescaled in f32, and the sum's order differs.
 //!
-//! `MLX_SERVE_DSV41_FLASH_TRIM` (read at load; =1 on, unset, empty or 0 off; refuses FLASH_ATTN=0 by name): the same
-//! kernel's FA_TRIM text (`plan.definesTrim`): the block max over the raw scores, scaled once, and 8-byte output
-//! stores; FLASH_ATTN's values word for word, the same launches.
+//! `MLX_SERVE_DSV41_FLASH_TRIM` (read at load; unset or empty: on with FLASH_ATTN; 0 off; =1 refuses FLASH_ATTN=0 by
+//! name): the same kernel's FA_TRIM text (`plan.definesTrim`): the block max over the raw scores, scaled once, and
+//! 8-byte output stores; FLASH_ATTN's values word for word, the same launches.
 //! `MLX_SERVE_DSV41_FLASH_PSUM` (read at load; =1 on, unset, empty or 0 off; refuses FLASH_ATTN=0 by name): the same
 //! kernel with l summing the f16 P the accumulator takes (`plan.definesPsum`): nearer float64, the same launches.
 
