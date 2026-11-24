@@ -5459,17 +5459,6 @@ fn slotWide(sc: *Scope, m: *const Dsv41Model, src: streamed.Routed, li: usize, x
     return sc.astype(try sc.add(try sc.sum(try sc.astype(rows_k, .float32), 1, false), try sc.astype(sh, .float32)), dt);
 }
 
-/// The fused gate/up bank's weighted products with clamped SwiGLU in one NAX kernel (`[n, 1, inter]`), or null
-/// where it does not serve (no fused bank, a limit that is not a whole number).
-fn gateUpPaired(sc: *Scope, m: *const Dsv41Model, e: *const Experts, x3: A, rows: A, sidx: A, w_sorted: A) !?A {
-    const gu = e.gu orelse return null;
-    const lim = m.cfg.dsv4_swiglu_limit;
-    if (gu.qp.mode != .affine or gu.s.ctx == null or lim < 0 or lim != @floor(lim) or !verify_qmm_nax.verifyQmmNaxAvailable()) return null;
-    const sigtab = try @import("../../sdk/blocks/hc/hc_prefill.zig").sigmoidTable(sc.s);
-    const y = (try gather_nax.sortedGateUpFusedWeighted(x3, rows, gu.w, gu.s, gu.b, sidx, sigtab, w_sorted, @intFromFloat(lim), gu.qp.bits, gu.qp.group_size, false, true, sc.s)) orelse return null;
-    return try sc.keep(y);
-}
-
 /// A sorted gather of `b` for rows `idx` (one run per expert) on the NAX port where it serves the bank
 /// (affine 2..8-bit, bf16 rows), else MLX's; `row_map` reads `x`'s rows in place instead of a `take`.
 /// GGUF gate and up banks through one matrix-unit gather with the clipped SwiGLU and the routing weight fused:
@@ -5571,8 +5560,8 @@ pub fn moePrefillParts(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A,
     const x3 = try sc.reshape(x, &.{ ci(L), 1, ci(d) });
     const w_sorted = sp.w;
     if (env.get(.DSV41_ROUTE_DUMP)) |path| if (env.on(.DSV41_ROUTE_DUMP_WIDE) or n < 4 * dim(e.down.w, 0)) try dumpRoute(sc, path, L, k, dim(e.down.w, 0), sidx, rows);
-    // gateUpPaired: the routing weight rides the paired kernel's epilogue (`sortedGateUpWeighted`).
-    const act = if (try mpair.act(sc, m, e, x3, rows, sidx, w_sorted)) |a| a else if (try gateUpPaired(sc, m, e, x3, rows, sidx, w_sorted)) |a| a else blk: {
+    // The paired gate/up (`mpair.act`, the one owner): the routing weight rides the paired kernel's epilogue.
+    const act = if (try mpair.act(sc, m, e, x3, rows, sidx, w_sorted)) |a| a else blk: {
         if (try ggufGateUp(sc, m, e, x3, rows, sidx, w_sorted)) |a| break :blk a;
         var y = if (e.gu) |*gu| try sortedBank(sc, x3, rows, gu, sidx) else try sc.concat(&.{ try sortedBank(sc, x3, rows, &e.gate, sidx), try sortedBank(sc, x3, rows, &e.up, sidx) }, -1); // [n, 1, 2 inter]
         const inter = dim(y, -1) / 2;
