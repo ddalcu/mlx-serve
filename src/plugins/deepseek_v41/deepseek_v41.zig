@@ -2253,15 +2253,7 @@ pub const HC_MIX_SOURCE = kernelSource("plugins/deepseek_v41/kernels/hc_mix.meta
 /// `HC_MIX_SOURCE`'s tile: rows a threadgroup, and the mixes a threadgroup
 /// (the largest of these that divides the mix count).
 const hc_mix_rows = 4;
-/// `MLX_SERVE_DSV41_HC_MIX8`: a wide mix threadgroup takes 8 rows on a NAX GPU, so a row group reads the mix weights
-/// once for twice the rows; each mix's sums are the same threads' in the same order at any row count.
-fn hcMixRows() usize {
-    if (!(device.naxAvailable() and env.on(.MLX_SERVE_DSV41_HC_MIX8))) return hc_mix_rows;
-    if (!hc_mix8_logged.swap(true, .monotonic)) log.info("[dsv41] HC_MIX8 engaged (8 rows a threadgroup)\n", .{});
-    return 8;
-}
 // The pfkern switches' one-time engagement lines (first use a process; no per-call output).
-var hc_mix8_logged: std.atomic.Value(bool) = .init(false);
 var ced_lazy_logged: std.atomic.Value(bool) = .init(false);
 var hc_expand_norm_logged: std.atomic.Value(bool) = .init(false);
 var woa_join_logged: std.atomic.Value(bool) = .init(false);
@@ -3408,7 +3400,7 @@ pub fn hcMixWide(sc: *Scope, m: *const Dsv41Model, x: A, hc: *const Hc, eps: A) 
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
         defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(mix) }, 2, .float32));
-        const rows = hcMixRows();
+        const rows = hc_mix_rows;
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(mix / cols * tg), ci((L + rows - 1) / rows), 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TG", ci(tg)));
@@ -3712,7 +3704,7 @@ pub fn hcMixNormFused(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *cons
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(mix) }, 2, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(D) }, 2, dt));
     if (w2 != null) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), ci(D) }, 2, dt)) else try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{1}, 1, dt));
-    const rows = hcMixRows();
+    const rows = hc_mix_rows;
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci((mix / cols + 1) * tg), ci((L + rows - 1) / rows), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TG", ci(tg)));
