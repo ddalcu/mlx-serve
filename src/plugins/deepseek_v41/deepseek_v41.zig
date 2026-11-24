@@ -513,11 +513,12 @@ pub const DraftExtra = struct {
 /// The ids a draft scores and the tables its chain reads them through (`draftSetOf`).
 pub const DraftSet = struct { k: usize, ids: A, to_draft: A, emb: A, mh: A };
 
-/// The draft vocabulary of a draft on `st` (its request's, else the file's; null: every id). A batched draft passes
-/// no state: the file's.
+/// The draft vocabulary of a draft on `st` (its request's, else the file's; null: every id, as for a sampled request's
+/// state). A batched draft passes no state: the file's.
 pub fn draftSetOf(ds: *const DsparkW, st: ?*const State) ?DraftSet {
     const dv = if (ds.draft) |*d| d else return null;
     if (dv.k == 0) return null;
+    if (st) |s| if (s.draft_whole) return null;
     logOnce(&draft_vocab_logged, "[dsv41] MLX_SERVE_DSV41_DRAFT_VOCAB engaged: the DSpark drafts score their vocabulary's ids alone\n");
     if (st) |s| if (s.draft_extra) |*x| return .{ .k = x.k, .ids = x.ids, .to_draft = x.to_draft, .emb = x.markov_embed, .mh = x.markov_head };
     return .{ .k = dv.k, .ids = dv.ids, .to_draft = dv.to_draft, .emb = dv.markov_embed, .mh = dv.markov_head };
@@ -1324,13 +1325,20 @@ fn padIds(gpa: std.mem.Allocator, ids: *std.ArrayList(i32), taken: []bool, quant
 /// `MLX_SERVE_DSV41_DRAFT_VOCAB`: `st`'s draft vocabulary for a request whose prompt is `prompt`, the file's ids then
 /// the prompt's other ids (its `draft_prompt_max` most frequent), made before the request's first round; a draft queued
 /// on `st` from the tables before is dropped. Without a vocabulary file, or with the prompt ids off, the file's alone.
-pub fn draftPromptVocab(m: *Dsv41Model, st: *State, prompt: []const u32) !void {
+/// A sampled request (`greedy` false) drafts over every id (`State.draft_whole`): a vocabulary's q drafted p21 worse
+/// at card sampling (2.57 against 2.68 tokens a round) while the greedy rounds gained.
+pub fn draftPromptVocab(m: *Dsv41Model, st: *State, prompt: []const u32, greedy: bool) !void {
     if (st.draft_extra) |*x| {
         x.deinit();
         st.draft_extra = null;
     }
     if (m.ds_next) |*a| if (a.st == st) m.dropNext();
+    st.draft_whole = !greedy;
     const ds = &(m.dspark orelse return);
+    if (!greedy) {
+        if (ds.draft) |*d| if (d.k > 0) logOnce(&draft_whole_logged, "[dsv41] MLX_SERVE_DSV41_DRAFT_VOCAB: a sampled request drafts every id (the draft vocabulary serves greedy requests)\n");
+        return;
+    }
     const dv = &(ds.draft orelse return);
     if (dv.k == 0 or !draftPromptWanted() or m.head.ext != null or m.head.w.ctx == null) return;
     const V = m.vocab;
@@ -1403,6 +1411,7 @@ pub fn draftPromptVocab(m: *Dsv41Model, st: *State, prompt: []const u32) !void {
     if (!draft_prompt_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_DRAFT_VOCAB prompt ids engaged: a request's {d} prompt ids outside the file join the drafts' vocabulary ({d} ids)\n", .{ e, k });
 }
 var draft_prompt_logged = std.atomic.Value(bool).init(false);
+var draft_whole_logged = std.atomic.Value(bool).init(false);
 
 /// The fused Markov chain's kernels for a request's draft vocabulary sizes (the file's ids and its first
 /// `draft_prompt_warm` buckets of prompt ids), built at load so no request's first draft compiles them.
@@ -1422,6 +1431,8 @@ pub fn warmDraftVocab(m: *Dsv41Model, sampled: bool) !void {
 /// The draft head's f32 logits over a draft's vocabulary (`draftSetOf`) from the normed rows `x`: the file's ids
 /// through `ds.headFor`, a request's prompt ids after them through their rows of the trunk's head.
 fn draftLogits(sc: *Scope, m: *const Dsv41Model, ds: *const DsparkW, st: ?*const State, x: A) !A {
+    // A sampled request's state drafts every id through the trunk's head.
+    if (st) |s| if (s.draft_whole) if (ds.draft) |*d| if (d.k > 0) return sc.astype(try m.head.apply(sc, x), .float32);
     const lg = try sc.astype(try ds.headFor(m).apply(sc, x), .float32);
     const s = st orelse return lg;
     const ex = if (s.draft_extra) |*e| e else return lg;
@@ -3173,6 +3184,9 @@ pub const State = struct {
     kvc_owner: u64 = 0,
     /// `MLX_SERVE_DSV41_DRAFT_VOCAB`: the draft vocabulary with this request's prompt ids added (`draftPromptVocab`).
     draft_extra: ?DraftExtra = null,
+    /// A sampled request's drafts score every id, as without `MLX_SERVE_DSV41_DRAFT_VOCAB` (`draftPromptVocab`): its
+    /// proposal q is then the whole row's, and a sampled round's drafts and tokens are the whole vocabulary's.
+    draft_whole: bool = false,
 
     pub fn deinit(self: *State) void {
         if (self.draft_extra) |*x| x.deinit();

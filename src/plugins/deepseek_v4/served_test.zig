@@ -1245,7 +1245,7 @@ test "deepseek_v41 served: a slot's greedy DSpark group rounds emit the same tok
 
 /// The tokens a request's DSpark rounds emit (up to `out.len`) on a fresh load of `files`, with the draft-only head the
 /// environment asks for at that load, and the drafts it accepted.
-fn dsparkTokens(files: []const sdk.fixture.File, sampling: SamplingParams, out: []u32) !struct { n: usize, accepted: u64 } {
+fn dsparkTokens(files: []const sdk.fixture.File, sampling: SamplingParams, out: []u32) !struct { n: usize, accepted: u64, rounds: u64 } {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, files, "");
@@ -1268,7 +1268,7 @@ fn dsparkTokens(files: []const sdk.fixture.File, sampling: SamplingParams, out: 
         @memcpy(out[n..][0..k], r.tokens[0..k]);
         n += k;
     }
-    return .{ .n = n, .accepted = gen.dspark_accepted_tokens };
+    return .{ .n = n, .accepted = gen.dspark_accepted_tokens, .rounds = gen.dspark_attempted };
 }
 
 test "deepseek_v41 served: a draft-only head (DRAFT_HEAD4, DRAFT_VOCAB) changes the drafts, never the tokens, greedy and seeded" {
@@ -1305,6 +1305,8 @@ test "deepseek_v41 served: a draft-only head (DRAFT_HEAD4, DRAFT_VOCAB) changes 
     for (samplings) |sampling| {
         var want: [48]u32 = undefined;
         var want_n: usize = 0;
+        var want_acc: u64 = 0;
+        var want_rounds: u64 = 0;
         for (arms, 0..) |arm, i| {
             const arm_h4 = env.override(.MLX_SERVE_DSV41_DRAFT_HEAD4, arm.head4);
             defer arm_h4.restore();
@@ -1316,10 +1318,17 @@ test "deepseek_v41 served: a draft-only head (DRAFT_HEAD4, DRAFT_VOCAB) changes 
             if (i == 0) {
                 want = got;
                 want_n = r.n;
+                want_acc = r.accepted;
+                want_rounds = r.rounds;
                 continue;
             }
             // The verify decides every kept token (greedy) and the request's keyed draws every sampled one.
             try testing.expectEqualSlices(u32, want[0..want_n], got[0..r.n]);
+            // A sampled request drafts every id under DRAFT_VOCAB (its 4-bit head aside): its rounds are control's.
+            if (sampling.temperature > 0 and arm.head4 == null) {
+                try testing.expectEqual(want_acc, r.accepted);
+                try testing.expectEqual(want_rounds, r.rounds);
+            }
         }
     }
     // The drafts themselves: a vocabulary's ids only, a batched draft each state's solo one, rows -inf past it.
@@ -1381,10 +1390,41 @@ test "deepseek_v41 served: a draft-only head (DRAFT_HEAD4, DRAFT_VOCAB) changes 
             try testing.expectApproxEqAbs(@as(f64, 1), sum, 1e-4);
         }
     }
+    // A sampled request's state (`draftPromptVocab` with greedy false) drafts as without the vocabulary at all: the same
+    // tokens and the same whole-row q, bit for bit, as the model with its draft head taken away.
+    {
+        var key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(key);
+        try mlx.check(mlx.mlx_random_key(&key, 9));
+        const lo = mlx.mlx_array_new_float(0);
+        defer _ = mlx.mlx_array_free(lo);
+        const hi = mlx.mlx_array_new_float(1);
+        defer _ = mlx.mlx_array_free(hi);
+        var u = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(u);
+        try mlx.check(mlx.mlx_random_uniform(&u, lo, hi, &[_]c_int{ @intCast(m.ds_block), 96 }, 2, .float32, key, mlx.gpuStream()));
+        try dsv41.draftPromptVocab(m, &sts[1], &.{ 7, 31 }, false);
+        try testing.expect(sts[1].draft_whole and sts[1].draft_extra == null);
+        var whole = try dsv41.dsparkDraftSampled(m, a, &sts[1], 7, u, 1.25);
+        defer whole.d.deinit(a);
+        defer _ = mlx.mlx_array_free(whole.q);
+        const kept = m.dspark.?.draft;
+        m.dspark.?.draft = null;
+        const plain = dsv41.dsparkDraftSampled(m, a, &sts[1], 7, u, 1.25);
+        m.dspark.?.draft = kept;
+        var ctl = try plain;
+        defer ctl.d.deinit(a);
+        defer _ = mlx.mlx_array_free(ctl.q);
+        try testing.expectEqualSlices(u32, ctl.d.ids, whole.d.ids);
+        const nq = @as(usize, m.ds_block) * 96 * 4;
+        try testing.expectEqualSlices(u8, (mlx.mlx_array_data_uint8(ctl.q) orelse return error.NoData)[0..nq], (mlx.mlx_array_data_uint8(whole.q) orelse return error.NoData)[0..nq]);
+        try dsv41.draftPromptVocab(m, &sts[1], &.{}, true);
+        try testing.expect(!sts[1].draft_whole);
+    }
     // A request's prompt ids join its state's vocabulary: 7 and 31 (outside the file) become draftable; 5 (inside)
     // adds nothing; an id the prompt repeats counts once; the bucket fills with the lowest ids outside (1 and 4 here,
     // to the fixture's 96 ids). Off (MLX_SERVE_DSV41_DRAFT_VOCAB_PROMPT=0): the file's alone.
-    try dsv41.draftPromptVocab(m, &sts[0], &.{ 7, 5, 31, 7, 5 });
+    try dsv41.draftPromptVocab(m, &sts[0], &.{ 7, 5, 31, 7, 5 }, true);
     const ex = sts[0].draft_extra.?;
     try testing.expectEqual(@as(usize, 32), ex.e);
     try testing.expectEqual(@as(usize, 96), ex.k);
@@ -1398,7 +1438,7 @@ test "deepseek_v41 served: a draft-only head (DRAFT_HEAD4, DRAFT_VOCAB) changes 
     {
         const off = env.override(.MLX_SERVE_DSV41_DRAFT_VOCAB_PROMPT, "0");
         defer off.restore();
-        try dsv41.draftPromptVocab(m, &sts[0], &.{ 7, 31 });
+        try dsv41.draftPromptVocab(m, &sts[0], &.{ 7, 31 }, true);
         try testing.expect(sts[0].draft_extra == null);
     }
 }
