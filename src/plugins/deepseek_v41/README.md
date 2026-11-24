@@ -13,8 +13,9 @@ and the routed experts stay in NVFP4. DeepSeek's own drafter, DSpark, proposes t
 step, and this makes decode faster. The defaults are the release configuration, and you set no switch to get them. On
 an M5 Ultra with 512 GB, the release build decoded 97.98 tok/s greedy and prefilled 5,526 tok/s on our standard test.
 On M5 every default-on switch is in a lossless class (see "Accuracy") except one, an 8-bit LM head whose KLD
-measured equal to the bf16 head's. Macs without neural accelerators also serve a lossy f16 attention core by default. The HumanEval re-run
-and the long-context sweep on the release build are not done yet.
+measured equal to the bf16 head's. Macs without neural accelerators also serve a lossy f16 attention core by default. On EvalPlus the release build
+scored 161/164 on HumanEval and 366/378 on MBPP (base tests); the long-context sweep is
+not done yet.
 
 ## Serve the model on an M5 Ultra with 512 GB
 
@@ -381,7 +382,7 @@ the new text (2.94 tokens per round), not from round time. The PR body holds eve
 
 | Gap | What the release needs |
 |---|---|
-| The HumanEval re-run and the 1K to 1M context sweep have not run on the release build | Those runs, posted in the PR |
+| The 1K to 1M context sweep has not run on the release build | That run, posted in the PR |
 | The plugin does not stream experts with per-expert scales, so a Mac that cannot hold the NVFP4 pack cannot serve it | The `--experts-mxfp4` pack for those Macs, or streamed per-expert scales |
 | Without NAX, the lossy f16 attention core (`ATTN_F16`) is on by default, and we have not measured it on those Macs | A float64 test on those Macs, or `ATTN_F16` off there |
 | On the f32 attention chain's routes, attention's output depends on the chunk width | A test that holds each chunk width no farther from float64 |
