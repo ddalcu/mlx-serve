@@ -20,8 +20,8 @@ the pack gives none of the gain; the runs also differ in setup.
 The plugin has 52 default-on switches (51 on M5, where `ATTN_F16` is off). We count 50 of them as lossless.
 "Lossless" here means each switch's output is bit-identical to its `=0` path (EXACT), no farther from a float64
 computation of the same op than the `=0` path or within a stated bound (REORDER), or changes only drafts and verify
-widths (DRAFT-ONLY), or rounds only the drafter's operands, so only drafts change (TF32, one engine variable,
-`MLX_ENABLE_TF32`). Greedy text can still change. No test compares the whole model with a reference implementation
+widths (DRAFT-ONLY). One engine variable, `MLX_ENABLE_TF32`, has its own class (TF32): on M5 at the defaults it rounds
+only the drafter's P·V. Greedy text can still change. No test compares the whole model with a reference implementation
 (see "Accuracy"). The two outside are an 8-bit LM
 head, whose KLD was within one standard error of the bf16 head's, and a lossy f16 attention core. That core is on by
 default only without NAX. NAX is the M5 GPU's matrix units; M4 and older Macs have none. On EvalPlus the release
@@ -45,7 +45,7 @@ build scored 161/164 on HumanEval and 366/378 on MBPP (base tests).
 8. Send a first request:
    `curl -s 127.0.0.1:11234/v1/chat/completions -H 'Content-Type: application/json' -d '{"model": "<id>", "messages": [{"role": "user", "content": "Hello"}]}'`.
 
-The loaded model needs about 429 GB, and a 17,600-token request peaks at about 452 GB (at `--ctx-size 32768`; at the
+The loaded model needs about 433 GB, and a 17,600-token request peaks at about 452 GB (at `--ctx-size 32768`; at the
 default 1M context the prompt reserve is 4.9 GB larger, and we have not measured it), so a Mac needs 512 GiB to hold
 the NVFP4 pack. `sysctl` sets the wired limit for the running system only, so set it again after each restart.
 `--warmup-full` compiles the Metal kernels before the server reports ready.
@@ -60,7 +60,7 @@ release's A/Bs and cells used 512000 MiB; the first NVFP4 build's A/B used 44032
 `sudo sysctl` command that admits it. We have not tried this release at macOS's default limit. The build that PR 1256
 showed before this release reported one load at the default limit; its record names no build.
 
-The 429 GB is the idle load of build `c59b60c6`, before the 4 GB Engram partials cache. On the standard test the release build peaked at 452.3 GB.
+The 433 GB is the idle load of build `c59b60c6` (429 GB), measured before the 4 GB Engram partials cache, plus that cache. On the standard test the release build peaked at 452.3 GB.
 
 Metal compiles each kernel at its first use. With `--warmup-full`, the server sends itself a ladder of prompt sizes
 before it reports ready, so no user request waits for a first compile. This takes from seconds to a minute, on a
@@ -230,17 +230,16 @@ declines the switch by name and logs why.
 ## Accuracy: what "lossless" means here
 
 50 plugin switches fall in three classes, and a fourth class, TF32, covers one engine variable:
-- EXACT: the same output values as the `=0` path, bit for bit. A test shows it, or (4 switches) it is classed without
-  a measurement: by the commit's reasoning or because its A/B kept the same text.
-- REORDER: not bit-identical. A test shows it no farther from float64 or within a stated bound, or (4 switches) it is
-  classed without a measurement: by the commit's reasoning (3) or because its A/B kept the same text (1).
+- EXACT: the same output values as the `=0` path, bit for bit. A test shows it, or (2 switches) it is classed without
+  a measurement, by the commit's reasoning.
+- REORDER: not bit-identical. A test shows it no farther from float64 or within a stated bound, or (3 switches) it is
+  classed without a measurement: by the commit's reasoning (2) or because its A/B kept the same text (1).
 - DRAFT-ONLY: changes only the drafts, or how many rows a verify checks (1 switch classed without a measurement).
-- TF32: MLX's TF32 matmuls, which on M5 at the defaults round only the drafter's P·V. Without NAX, MLX does not use
-  TF32.
+- TF32 (one engine variable): MLX's TF32 matmuls. On M5 at the defaults they round only the drafter's P·V; on
+  off-default routes, also the f32 chain's P·V (the block below). Without NAX, MLX does not use TF32.
 
-41 of the 50 have a standing test or a kernel contract case. 9 do not: `PF_GU_SEG`, `WOA_JOIN`, `DRAFT_POS_ONCE`,
-`MOE_DOWN_ORDER`, `CED`, `PF_PASS_SIZE`, `HC_EXPAND_NORM` (a 1% tolerance test), `PF_IDX_NAX` (an f32-reassociation
-test) and `SPEC_SYNC` (its test needs a pack).
+44 of the 50 have a standing test or a kernel contract case. 6 do not: `WOA_JOIN`, `DRAFT_POS_ONCE` (EXACT); `CED`,
+`PF_PASS_SIZE`, `HC_EXPAND_NORM` (REORDER); and `SPEC_SYNC` (DRAFT-ONLY). The table below says why for each.
 
 | Class | Plugin switches | Engine variables |
 |---|---|---|
@@ -258,9 +257,9 @@ prompt-attention call (the block below).
 
 | REORDER switches | How many |
 |---|---|
-| Measured no farther from float64 than the `=0` path | 8 |
-| Held to a stated bound (`MOE_PAIR_SCALED`, `PF_HC_V2`, `ENGRAM_GPU_IDS`) | 3 |
-| Resting on the commit's reasoning (`CED`, the chunked prompt path; `PF_PASS_SIZE`; `PF_IDX_NAX`) | 3 |
+| Measured no farther from float64 than the `=0` path (`PF_COMP_BF16`, `FLASH_ATTN`, `ENGRAM_KV_SLOTS`, `ATTN_DEC`, `WOA_PLAIN`) | 5 |
+| Held to a stated bound: `MOE_PAIR_SCALED`, `PF_HC_V2`, `ENGRAM_GPU_IDS` (each below); `PF_IDX_NAX` (each score within 2·γ(34) of `idx_tile`'s, the same top-K picks); `MOE_FP4_NAX`, `FP4_READS`, `FUSE_MXFP8_QMM` (rel-rms against f32 within 1.25 times the `=0` path's, plus 1e-4) | 7 |
+| Resting on the commit's reasoning (`CED`, the chunked prompt path; `PF_PASS_SIZE`) | 2 |
 | Resting on its A/B's same text (`HC_EXPAND_NORM`: its test allows 1% relative error, far looser than bf16 rounding, so we do not count it as a bound) | 1 |
 
 A DRAFT-ONLY switch keeps the verify's rule: a greedy verify keeps only tokens that the model agrees with, and a
@@ -342,7 +341,7 @@ tests of `attnCore` count each core's calls; on NAX they count 0 f16 calls.
 <details>
 <summary>Every default-on switch and its class</summary>
 
-Names omit `MLX_SERVE_DSV41_`. "Evidence" names the evidence kind: a standing test in the plugin, the kernel contract,
+Names omit `MLX_SERVE_DSV41_`. "Evidence" names the evidence kind: a standing test (in the plugin unless named), the kernel contract,
 or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit").
 
 | Switch | What it does | Class | Evidence |
@@ -355,7 +354,7 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | IN_PROJ_MIXR | Verify in_proj hc mixes as one threadgroup per (mix, row) | EXACT | test (word for word; M3 or later) |
 | HC_EXPAND_NORM | FFN-side hc expand and norm in one launch | REORDER | A/B text (its test allows 1% relative error, not counted as a bound) |
 | PF_MOE_EPI | Counting-sort route pack in place of two argsorts | EXACT | test |
-| PF_GU_SEG | 128 x 128 paired gate/up where the planner picks it | EXACT | A/B text |
+| PF_GU_SEG | 128 x 128 paired gate/up where the planner picks it | EXACT | test (word for word, to 8,192 rows, NVFP4 with per-expert scales; NAX) |
 | PF_KV_ROWS | Window kv rows on one simdgroup per row | EXACT | test (word for word) |
 | PF_DOWN_TOKORD | Staged down writes rows in token order | EXACT | test |
 | PF_FP4_GEMM | Staged matrix-unit gather for routed gate/up and down | EXACT | test |
@@ -375,24 +374,24 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | FP4_DEC_WORD | Decodes e2m1 codes a word at a time | EXACT | test |
 | FP4_UP_SPLIT | Shared gate and up rows on separate simdgroups | EXACT | test |
 | FP8_FOLD | Folds 2^8 into the e8m0 scale in mxfp8 reads | EXACT (declines on rare codes) | test (word for word on finite codes), load scan |
-| MOE_DOWN_ORDER | Verify down launch in column-block order | EXACT | A/B text |
+| MOE_DOWN_ORDER | Verify down launch in column-block order | EXACT | test (bit for bit, R = 2 to 6) |
 | FUSE_DOWN_SCALE | NVFP4 down scale inside the gate/up launch | EXACT | test (word for word) |
-| CED | The chunked prompt path: the decoder layers run again over a chunk's last window rows only | REORDER (row count) | commit (by construction) |
-| MOE_FP4_NAX | Fused fp4 MoE decode kernels on the matrix units | REORDER | test |
+| CED | The chunked prompt path: the decoder layers run again over a chunk's last window rows only | REORDER (row count) | commit (its fixture test is bit for bit only at 16-row chunks) |
+| MOE_FP4_NAX | Fused fp4 MoE decode kernels on the matrix units | REORDER (bounded) | test (within 1.25x of the `=0` path's rel-rms against f32, + 1e-4) |
 | MOE_PAIR_SCALED | NVFP4 prompt gate/up, scales and activation in one launch | REORDER (bounded) | test |
 | PF_HC_V2 | Wide-layer hc in three passes, not five | REORDER (bounded) | test |
 | PF_PASS_SIZE | Near-equal memory-sized prompt passes | REORDER (partition) | commit |
-| PF_IDX_NAX | Indexer scores on the matrix units | REORDER | commit (its NAX test allows f32 reassociation, not counted) |
+| PF_IDX_NAX | Indexer scores on the matrix units | REORDER (bounded) | test (within 2·γ(34) of `idx_tile`, the same top-K picks; NAX) |
 | PF_COMP_BF16 | Compressor projection on a bf16 MMA, K blocks summed apart | REORDER | test |
 | FLASH_ATTN | Every prompt-attention call on one flash kernel where it fits | REORDER | test |
 | ENGRAM_GPU_IDS | Engram ids hashed on the GPU; fused wkv | REORDER (bounded) | test |
 | ENGRAM_KV_SLOTS | Slot-blocked Engram wkv | REORDER | test |
-| FP4_READS | Bit-placement fp4 reads; each 16-group summed apart | REORDER (declines on rare codes) | test |
+| FP4_READS | Bit-placement fp4 reads; each 16-group summed apart | REORDER (bounded; declines on rare codes) | test (within 1.25x of the `=0` path's rel-rms against f32, + 1e-4) |
 | ATTN_DEC | Decode attention on a shape-cut tile kernel | REORDER | test |
 | WOA_PLAIN | Splits merged once; wo_a as a plain grouped GEMV | REORDER | test |
-| FUSE_MXFP8_QMM | Prompt mxfp8 linears on MLX's quantized matmul | REORDER | test |
+| FUSE_MXFP8_QMM | Prompt mxfp8 linears on MLX's quantized matmul | REORDER (bounded) | test (within 1.25x of the `=0` path's rel-rms against f32, + 1e-4) |
 | DRAFT_FUSED | DSpark stages on the fused decode kernels | DRAFT-ONLY | test (within 1% relative rms of the op chain) |
-| DRAFT_SAMPLE | Sampled drafts from q, kept at min(1, p / q) | DRAFT-ONLY | test |
+| DRAFT_SAMPLE | Sampled drafts from q, kept at min(1, p / q) | DRAFT-ONLY | test (engine: `spec/dspark.zig`, "dspark sampled verdict") |
 | DRAFT_QKV | Fuses a stage's wq_a and wkv at load | DRAFT-ONLY | test (within 1e-3 relative rms, no farther from the op chain) |
 | SPEC_SYNC | Greedy accept on the GPU; next draft queued behind the verify | DRAFT-ONLY | A/B text (its test needs a pack) |
 | DRAFT_VOCAB | Greedy drafts score only the pack's `draft-vocab.txt` ids (default: the pack's file, shipped as the plugin's `draft-vocab.txt`) | DRAFT-ONLY | test |
@@ -451,13 +450,15 @@ release's runs about 0.8% slower per round). On `f7e4da9e` the MXFP4-experts pac
 pre-warm requests. The release cells used 512000 MiB, `--ctx-size 32768` and `--warmup-full`. p01 is the best of the
 three prompts; the release's three-prompt mean is 97.98 tok/s.
 
-The ds41nv sweep build (see "Terms"), the only stack swept before the 47 changes, ran on the MXFP4-experts pack. Greedy prefill / decode tok/s:
+The ds41nv sweep build (see "Terms") ran the same sweep on the MXFP4-experts pack on 2026-11-24. Greedy prefill /
+decode tok/s:
 
-| Context | The ds41nv sweep build, MXFP4 | Release, NVFP4 |
-|---|---|---|
-| 128K | 3,915.8 / 103.05 | 5,508.9 / 128.45 |
-| 256K | 3,452.2 / 101.05 | 5,206.5 / 121.65 |
-| 1M | Not measured | 3,912.9 / 110.70 |
+| Context | The ds41nv sweep build, MXFP4 | Release, NVFP4 | Prefill, release / before |
+|---|---|---|---|
+| 16K | 4,248.0 / 102.65 | 5,524.1 / 132.80 | x1.30 |
+| 128K | 3,915.8 / 103.05 | 5,508.9 / 128.45 | x1.41 |
+| 512K | 2,728.6 / 102.30 | 4,707.5 / 119.00 | x1.73 |
+| 1M | 1,889.5 / 99.75 | 3,912.9 / 110.70 | x2.07 |
 
 The sweep's code-context prompts reach 4.4 to 4.9 tokens per round, against 2.99 on the standard test, so do not
 compare sweep decode with standard-test decode.
@@ -494,8 +495,7 @@ of about 44,500 rows), but we have not measured the cells at the 1M default.
 | The plugin does not stream experts with per-expert scales, so a Mac that cannot hold the NVFP4 pack cannot serve it | The `--experts-mxfp4` pack for those Macs, or streamed per-expert scales |
 | Without NAX, the lossy f16 attention core (`ATTN_F16`) is on by default, and we have not measured it on those Macs | A float64 test on those Macs, or `ATTN_F16` off there |
 | On the f32 attention chain's routes, attention's output depends on the prompt pass width | A test that holds each pass width no farther from float64 |
-| 9 classed switches have no standing test against their `=0` path (listed in "Accuracy") | A standing word or float64 test for each |
-| The ds41nv sweep build's sweep stops at 256K | Its full sweep |
+| 6 classed switches have no standing test against their `=0` path (listed in "Accuracy") | A standing word or float64 test for each |
 | TF32's float64 test needs a fixture that no tool in this repo writes | A fixture writer, or the fixture in the repo |
 | `HEAD8` is a quantization change. Its KLD is within one standard error of the bf16 head's on our set, but it is not bit-identical | A ruling to keep it, or `=0` by default |
 | We tuned and measured only on M5 Ultra Macs with 512 GiB | Runs on smaller Macs and older GPUs |
