@@ -37,7 +37,7 @@ const Kernel = struct {
 };
 
 /// The SDK's fp4 and fp8 decodes under the packed expert kernels' chunk reader.
-pub const bank_header = moe_fp4.NV_SCALE ++ moe_fp4.DOT16 ++ mxfp8.HEADER ++ kernelSource("plugins/inkling2/kernels/bank_header.metal");
+pub const bank_header = moe_fp4.SCALE ++ moe_fp4.DOT16 ++ mxfp8.HEADER ++ kernelSource("plugins/inkling2/kernels/bank_header.metal");
 /// Output rows a SIMD group of a packed expert kernel owns (one: a lane's loop sets the launch's latency, and here
 /// that beats keeping x in registers across rows), and the up kernel's SIMD groups per threadgroup.
 const bank_rows: c_int = 1;

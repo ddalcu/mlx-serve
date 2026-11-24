@@ -1594,7 +1594,6 @@ fn sliceMatchesCold(files: []const sdk.fixture.File, wide: WideTwin, sn: abi.Han
 
 test "deepseek_v41 aux: under MLX_SERVE_DSV41_PF_PASS_SIZE a snapshot at the end of a pass past 8192 rows, sliced to a shorter prefix, restores there as a cold prefill of that prefix and continues as the default plan's snapshot sliced there; a slice to the wrong cut fails" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    const env = @import("../../env.zig");
     const was = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, "1");
     defer was.restore();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
