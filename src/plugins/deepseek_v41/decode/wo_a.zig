@@ -57,7 +57,7 @@ const NAX_NR = 32;
 /// another order, so a verify block's rows would not carry the plain step's bytes.
 const nax_rows = 4;
 
-fn useNax(rows: c_int) bool {
+pub fn useNax(rows: c_int) bool {
     return rows >= nax_rows and device.naxAvailable() and !dsv41.exactVerify();
 }
 
@@ -457,11 +457,11 @@ fn chainWoA(sc: *Scope, r: A, w: A, s: A) !A {
     return sc.astype(try sc.reshape(try sc.transpose(oa, &.{ 1, 0, 2 }), &.{ L, -1 }), act);
 }
 
-const Parts = struct { pacc: []f32, pm: []f32, pl: []f32 };
+pub const Parts = struct { pacc: []f32, pm: []f32, pl: []f32 };
 
 /// Split partials with the structure the split kernel writes: each split's max `pm`, its weights' sum `pl` (>= 1),
 /// its output `pacc` = the weighted rows (so about `pl` times a row); some splits empty (max -inf, sum 0).
-fn makeParts(a: std.mem.Allocator, seed: u64, R: usize, H: usize, S: usize, D: usize) !Parts {
+pub fn makeParts(a: std.mem.Allocator, seed: u64, R: usize, H: usize, S: usize, D: usize) !Parts {
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
     const pm = try a.alloc(f32, R * H * S);
@@ -487,6 +487,11 @@ fn upload(data: []const f32, shape: []const c_int) A {
 /// The float64 truth: merge of the partials with the sink, the inverse rope, then wo_a over the dequantized `wd`
 /// [groups, o_lora, K] (f32 values, exact for the release's fp8), no rounding anywhere: [R, groups * o_lora].
 fn truth(a: std.mem.Allocator, parts: Parts, sink: []const f32, periods: []const f32, wd: []const f32, p0: usize, R: usize, S: usize) ![]f32 {
+    return truthAs(f32, a, parts, sink, periods, wd, p0, R, S);
+}
+
+/// `truth` kept in `T`.
+pub fn truthAs(comptime T: type, a: std.mem.Allocator, parts: Parts, sink: []const f32, periods: []const f32, wd: []const f32, p0: usize, R: usize, S: usize) ![]T {
     const H = 64;
     const G = 8;
     const K = H / G * HD;
@@ -516,13 +521,13 @@ fn truth(a: std.mem.Allocator, parts: Parts, sink: []const f32, periods: []const
             o[HD - RD + 2 * p + 1] = x1 * @sin(th) + x2 * @cos(th);
         }
     };
-    const out = try a.alloc(f32, R * G * OL);
+    const out = try a.alloc(T, R * G * OL);
     for (0..R) |m| for (0..G) |g| for (0..OL) |n| {
         const wr = wd[(g * OL + n) * K ..][0..K];
         const xr = x[m * H * HD + g * K ..][0..K];
         var s: f64 = 0;
         for (wr, xr) |wv, xv| s += @as(f64, wv) * xv;
-        out[m * G * OL + g * OL + n] = @floatCast(s);
+        out[m * G * OL + g * OL + n] = if (T == f64) s else @floatCast(s);
     };
     return out;
 }

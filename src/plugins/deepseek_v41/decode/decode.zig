@@ -50,6 +50,66 @@ pub fn relRms(got: []const f32, want: []const f32) f64 {
     return @sqrt(e / @max(t, 1e-300));
 }
 
+/// An output's distance from its float64 truth, summed over calls: squared error, the truth's square, the largest
+/// absolute error, and the non-finite values (each one farther than anything).
+pub const Dist = struct {
+    se: f64 = 0,
+    ss: f64 = 0,
+    max: f64 = 0,
+    bad: usize = 0,
+
+    /// `got` f32 or f64 values against `truth`.
+    pub fn add(d: *Dist, got: anytype, truth: []const f64) void {
+        std.debug.assert(got.len == truth.len);
+        for (got, truth) |g, t| {
+            const v: f64 = g;
+            if (!std.math.isFinite(v)) {
+                d.bad += 1;
+                continue;
+            }
+            d.se += (v - t) * (v - t);
+            d.ss += t * t;
+            d.max = @max(d.max, @abs(v - t));
+        }
+    }
+
+    pub fn l2(d: Dist) f64 {
+        return @sqrt(d.se / @max(d.ss, 1e-300));
+    }
+
+    /// No farther from float64 than `o` in l2 and in max.
+    pub fn within(d: Dist, o: Dist) bool {
+        return d.bad == 0 and d.se <= o.se and d.max <= o.max;
+    }
+
+    pub fn join(d: *Dist, o: Dist) void {
+        d.se += o.se;
+        d.ss += o.ss;
+        d.max = @max(d.max, o.max);
+        d.bad += o.bad;
+    }
+};
+
+/// The words where `a` and `b` differ, and of those how many `a` holds nearer to `truth` and how many farther.
+pub const WordDiff = struct {
+    differ: usize = 0,
+    nearer: usize = 0,
+    farther: usize = 0,
+    words: usize = 0,
+
+    pub fn add(w: *WordDiff, a: []const f32, b: []const f32, truth: []const f64) void {
+        for (a, b, truth) |x, y, t| {
+            w.words += 1;
+            if (@as(u32, @bitCast(x)) == @as(u32, @bitCast(y))) continue;
+            w.differ += 1;
+            const ex = @abs(@as(f64, x) - t);
+            const ey = @abs(@as(f64, y) - t);
+            w.nearer += @intFromBool(ex < ey);
+            w.farther += @intFromBool(ex > ey);
+        }
+    }
+};
+
 /// The fusion bar: `new` is no further from `truth` than today's `chain` (1.25x, plus 1e-4 of truth's scale).
 pub fn expectNoWorse(label: []const u8, new: []const f32, chain: []const f32, truth: []const f32) !void {
     const en = relRms(new, truth);

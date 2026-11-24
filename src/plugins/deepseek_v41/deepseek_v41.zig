@@ -13585,7 +13585,7 @@ test "dsv41 clampedSwiglu: the SDK clamped SwiGLU in f32 gives the bytes the plu
     }
 }
 
-fn testConfig(io: std.Io, dir: []const u8) !Config {
+pub fn testConfig(io: std.Io, dir: []const u8) !Config {
     return @import("../../sdk/testing/pack_config.zig").packConfig(@import("config.zig"), io, dir);
 }
 
