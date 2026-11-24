@@ -61,7 +61,7 @@ def parse(route, line, out):
     text = None
     if route == "generate":
         obj = json.loads(line)
-        text = obj.get("response")
+        text = obj.get("response") or obj.get("thinking")
         if obj.get("done"):
             out["finish"] = obj.get("done_reason") or "stop"
             out["prompt_tokens"] = obj.get("prompt_eval_count")
@@ -72,14 +72,16 @@ def parse(route, line, out):
             if kind == "message_start":
                 out["prompt_tokens"] = obj["message"]["usage"]["input_tokens"]
             elif kind == "content_block_delta":
-                text = obj["delta"].get("text")
+                text = obj["delta"].get("text") or obj["delta"].get("thinking")
             elif kind == "message_delta" and obj["delta"].get("stop_reason"):
                 out["finish"] = obj["delta"]["stop_reason"]
         else:
             if obj.get("usage"):
                 out["prompt_tokens"] = obj["usage"].get("prompt_tokens")
             for ch in obj.get("choices", []):
-                text = ch.get("delta", {}).get("content") or text
+                # A thinking model streams its reply as reasoning first: either field is decoded text.
+                delta = ch.get("delta", {})
+                text = delta.get("content") or delta.get("reasoning_content") or text
                 if ch.get("finish_reason"):
                     out["finish"] = ch["finish_reason"]
     if text:
