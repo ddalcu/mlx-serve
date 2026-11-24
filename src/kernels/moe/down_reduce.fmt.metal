@@ -36,7 +36,6 @@ for (int i = 0; i < IT; ++i) {{
 }}
 float acc = (a0 + a1) + (a2 + a3);
 for (uint d = uint(LPR) / 2u; d >= 1u; d >>= 1u) acc += simd_shuffle_xor(acc, ushort(d));
-if (FOLD != 0) acc *= 4194304.0f;
 if (sub == 0u) {{
   slot_vals[slot * uint(ROWS) + r] = T(acc);
 }}

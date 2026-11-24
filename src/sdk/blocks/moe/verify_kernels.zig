@@ -86,7 +86,7 @@ pub fn verifyExpertReduce(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.m
     if (!verifySharedHardware() or scores.ctx == null) return null;
     const ss = mlx.getShape(scores);
     if (ss.len != 3 or ss[0] != 1 or ss[1] > 32) return null;
-    return expertReduceApply(s, down, inverse, scores, &verify_expert_reduce_cfgs, false);
+    return expertReduceApply(s, down, inverse, scores, &verify_expert_reduce_cfgs);
 }
 
 /// The verify reduction at prefill widths, on every GPU: it only removes the
@@ -97,17 +97,10 @@ pub fn moePrefillExpertReduce(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: m
     // Verify widths (<= 32 tokens) keep verifyExpertReduce's own gates.
     if (ss.len != 3 or ss[0] * ss[1] <= 32) return null;
     if (mlx.cudaAvailable()) return @import("moe_prefill_cuda.zig").weightedSum(s, down, inverse, scores);
-    // Hidden 6144 (top-k 8) behind `MLX_SERVE_MOE_PREFILL_WSUM_6144`: prompt widths only (verify keeps its own list).
-    return expertReduceApply(s, down, inverse, scores, &prefill_expert_reduce_cfgs, wsum6144Enabled());
+    return expertReduceApply(s, down, inverse, scores, &prefill_expert_reduce_cfgs);
 }
 
-/// `MLX_SERVE_MOE_PREFILL_WSUM_6144`, read on every call (a kill switch); unset = off.
-pub fn wsum6144Enabled() bool {
-    return if (@import("../../../env.zig").get(.MLX_SERVE_MOE_PREFILL_WSUM_6144)) |v| v[0] != '0' else false;
-}
-
-/// `wide`: also hidden 6144 at top-k 8.
-fn expertReduceApply(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_array, scores: mlx.mlx_array, cfgs: *ExpertReduceCfgs, wide: bool) !?mlx.mlx_array {
+fn expertReduceApply(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_array, scores: mlx.mlx_array, cfgs: *ExpertReduceCfgs) !?mlx.mlx_array {
     if (!mlx.streamIsGpu(s)) return null;
     if (down.ctx == null or inverse.ctx == null or scores.ctx == null) return null;
     if (mlx.mlx_array_dtype(down) != .bfloat16 or mlx.mlx_array_dtype(scores) != .bfloat16 or mlx.mlx_array_dtype(inverse) != .uint32) return null;
@@ -118,7 +111,7 @@ fn expertReduceApply(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_ar
     if (ds.len != 2 or ss.len != 3 or ix.len != 1) return null;
     const topk = ss[2];
     const hidden = ds[1];
-    if (!((topk == 10 and hidden == 2560) or (topk == 8 and (hidden == 2048 or hidden == 4096)) or (topk == 8 and hidden == 6144 and wide))) return null;
+    if (!((topk == 10 and hidden == 2560) or (topk == 8 and (hidden == 2048 or hidden == 4096)))) return null;
     const batch = ss[0];
     const tokens = ss[1];
     if (batch < 1 or tokens < 1 or batch * tokens < 2 or ds[0] != batch * tokens * topk or ix[0] != ds[0]) return null;

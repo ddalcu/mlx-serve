@@ -43,7 +43,7 @@ const moeCudaFormat = @import("gather_qmv_rows.zig").moeCudaFormat;
 //
 // The bank's `Dequant` picks the arithmetic: affine (q * scale + bias, the
 // mlx-quantized checkpoints) or fp4 (e2m1 nibbles + one uint8 group scale, no
-// biases: NVFP4's e4m3 per 16 or MXFP4's e8m0 per 32, the GS template).
+// biases: NVFP4's e4m3 per 16, the GS template; MXFP4 banks decline, `modeDequant`).
 fn gatherQmvSource(comptime d: Dequant, comptime x_per_expert: bool) [:0]const u8 {
     // Everything is indexed off the raw buffer names rather than through
     // explicitly address-spaced pointers: MLX generates the signature from each
@@ -86,22 +86,12 @@ pub fn header(d: Dequant) [:0]const u8 {
 /// format is the group size).
 pub const Dequant = enum { affine, fp4 };
 
-/// `MLX_SERVE_FP4_FOLD22` (read every call) for a bank at `mode`: NVFP4's old fold on these kernels (`FOLD`).
-pub fn fold22(mode: QuantMode) bool {
-    return mode == .nvfp4 and env.on(.MLX_SERVE_FP4_FOLD22);
-}
-
-/// MXFP4 banks on the gather_qmv kernels (`MLX_SERVE_MOE_GQMV_MXFP4`, read every call).
-pub fn mxfp4Enabled() bool {
-    return env.on(.MLX_SERVE_MOE_GQMV_MXFP4);
-}
-
-/// Whether these kernels read a bank at (mode, bits, group): affine at a width `affineQmvUnitOk` takes; 4-bit
-/// NVFP4 (g16) or MXFP4 (g32, behind `mxfp4Enabled`). Any other mode or group has no dequant here.
+/// Whether these kernels read a bank at (mode, bits, group): affine at a width `affineQmvUnitOk` takes; 4-bit NVFP4
+/// (g16). MXFP4 and any other mode or group have no dequant here: the sorted or composed path serves them.
 pub fn modeDequant(mode: QuantMode, bits: u32, group_size: u32) ?Dequant {
     if (mode == .affine) return if (affineQmvUnitOk(bits, group_size)) .affine else null;
     const f = fp4.of(mode, group_size) orelse return null;
-    if (bits != 4 or (f == .mxfp4 and !mxfp4Enabled())) return null;
+    if (bits != 4 or f != .nvfp4) return null;
     return .fp4;
 }
 
@@ -194,7 +184,7 @@ pub fn affineQmvPackUnits(K: c_int, bits: u32) c_int {
 /// before the SiLU, the up scale before the clamp (without a clamp, up rides the routing weight), down on the route.
 pub const Scales = moe_fp4.Scales;
 
-const GateUpCfgKey = struct { rows: c_int, topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, one_row: bool, limit: u32, gscale: bool, uscale: bool, fold: bool };
+const GateUpCfgKey = struct { rows: c_int, topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, one_row: bool, limit: u32, gscale: bool, uscale: bool };
 const GateUpCfgSlot = struct {
     cfg: ?mlx.mlx_fast_metal_kernel_config = null,
     key: GateUpCfgKey = std.mem.zeroes(GateUpCfgKey),
@@ -316,7 +306,7 @@ pub fn gateUpLaunch(
     const sgs_per_tg: c_int = 8;
     if (@rem(N, sgs_per_tg) != 0) return null;
 
-    const key = GateUpCfgKey{ .rows = rows, .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd, .one_row = one_row, .limit = scales.clamp, .gscale = scales.gate != null, .uscale = scales.up != null, .fold = fold22(mode) };
+    const key = GateUpCfgKey{ .rows = rows, .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd, .one_row = one_row, .limit = scales.clamp, .gscale = scales.gate != null, .uscale = scales.up != null };
     const slot = &gateup_cfg[@intFromBool(one_row)];
     if (slot.cfg == null or !std.meta.eql(slot.key, key)) {
         if (slot.cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
@@ -339,7 +329,6 @@ pub fn gateUpLaunch(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "LIMIT", @intCast(scales.clamp)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GSCALE", @intFromBool(scales.gate != null)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "USCALE", @intFromBool(scales.up != null)));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "FOLD", @intFromBool(key.fold)));
         slot.* = .{ .cfg = config, .key = key };
     }
 
@@ -416,7 +405,6 @@ const GqmvCfgKey = struct {
     dtype: mlx.mlx_dtype,
     x_per_expert: bool,
     act2: bool = false,
-    fold: bool = false,
 };
 const GqmvCfgSlot = struct {
     cfg: ?mlx.mlx_fast_metal_kernel_config = null,
@@ -492,7 +480,7 @@ pub fn gatherQmvAct(
     // fresh config is ~10 FFI calls: measured `ops/forward` 3226 vs 2329 and
     // +0.4 ms of CPU graph build per token on Laguna XS, which is roughly 60%
     // of the margin this path was being charged against stock `gather_qmm`.
-    const key = GqmvCfgKey{ .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd, .x_per_expert = x_per_expert, .act2 = act_relu2, .fold = fold22(mode) };
+    const key = GqmvCfgKey{ .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd, .x_per_expert = x_per_expert, .act2 = act_relu2 };
     const slot = &gqmv_cfg_cache[@intFromBool(x_per_expert)];
     if (slot.cfg == null or !std.meta.eql(slot.key, key)) {
         if (slot.cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
@@ -505,7 +493,6 @@ pub fn gatherQmvAct(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GS", @intCast(group_size)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BITS", @intCast(bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "ACT2", act_relu2));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "FOLD", @intFromBool(key.fold)));
         slot.* = .{ .cfg = cfg, .key = key };
     }
     const config = slot.cfg.?;

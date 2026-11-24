@@ -65,12 +65,10 @@ pub const MoeDecodeDispatchArm = enum { rows, sorted, gather_qmv };
 /// 2 <= B <= 8, or B == 1 and 2 <= S <= 8 (verify), without expert bias or a clamp; the
 /// single-row gatherQmv at B == 1; the sorted chain otherwise, and whenever a
 /// stand-in diagnostic wants the stock path.
-/// Whether a layer's SwiGLU clamp keeps a decode off the rows kernels (`moeDecodeDispatchArm`'s `clamped`): a clamp no
-/// kernel serves (null) always; a whole-number one unless `MLX_SERVE_MOE_ROWS_CLAMP` (the rows gate+up applies it).
+/// Whether a layer's SwiGLU clamp keeps a decode off the rows kernels (`moeDecodeDispatchArm`'s `clamped`): any clamp
+/// (a whole-number one, or one no kernel serves, null); an unclamped layer (0) takes them.
 pub fn rowsDeclineClamp(clamp: ?u32) bool {
-    const c = clamp orelse return true;
-    if (c == 0) return false;
-    return if (@import("../../../env.zig").get(.MLX_SERVE_MOE_ROWS_CLAMP)) |v| v[0] == '0' else true;
+    return (clamp orelse 1) != 0;
 }
 
 pub fn moeDecodeDispatchArm(B: c_int, S: c_int, K: c_int, has_expert_bias: bool, clamped: bool) MoeDecodeDispatchArm {
