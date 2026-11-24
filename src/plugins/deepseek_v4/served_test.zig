@@ -1434,6 +1434,14 @@ test "deepseek_v41 served: a draft-only head (DRAFT_HEAD4, DRAFT_VOCAB) changes 
         }
         try dsv41.draftPromptVocab(m, &sts[1], &.{}, true);
         try testing.expect(!sts[1].draft_whole);
+        // A group round's mode alone: no prompt-id gather, an earlier request's set dropped, the mode set.
+        try dsv41.draftPromptVocab(m, &sts[1], &.{ 7, 31 }, true);
+        try testing.expect(sts[1].draft_extra != null);
+        dsv41.draftVocabMode(m, &sts[1], true);
+        try testing.expect(sts[1].draft_extra == null and !sts[1].draft_whole);
+        dsv41.draftVocabMode(m, &sts[1], false);
+        try testing.expect(sts[1].draft_extra == null and sts[1].draft_whole);
+        dsv41.draftVocabMode(m, &sts[1], true);
     }
     // A request's prompt ids join its state's vocabulary: 7 and 31 (outside the file) become draftable; 5 (inside)
     // adds nothing; an id the prompt repeats counts once; the bucket fills with the lowest ids outside (1 and 4 here,

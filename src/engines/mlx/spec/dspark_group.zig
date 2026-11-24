@@ -166,11 +166,11 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
     var staged: [MAX_SLOTS]usize = undefined;
     var n_stage: usize = 0;
     for (gens, 0..) |gen, k| {
-        // A draft vocabulary takes the request's prompt ids before its first round; a sampled request drafts every id
-        // (`dsv41.draftPromptVocab`, as a solo round's).
-        if (!gen.dspark_prompt_vocab) {
-            gen.dspark_prompt_vocab = true;
-            try dsv41_mod.draftPromptVocab(mdl, states[k], gen.prompt_ids_owned, !gen.dspark_stochastic);
+        // The request's draft vocabulary mode before its first round (a sampled request drafts every id); the batched
+        // draft reads no prompt ids, so a later solo round makes them (`dsv41.draftPromptVocab`).
+        if (!gen.dspark_vocab_mode) {
+            gen.dspark_vocab_mode = true;
+            dsv41_mod.draftVocabMode(mdl, states[k], !gen.dspark_stochastic);
         }
         const t1 = gen.next_token_id;
         caps[k] = capAcceptedForTokenBudget(std.math.maxInt(u32), gen.completion_tokens, gen.max_tokens);

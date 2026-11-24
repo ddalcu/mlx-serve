@@ -153,6 +153,7 @@ pub fn moduleRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStep
         // A draft vocabulary takes the request's prompt ids before its first round; a sampled request drafts every id.
         if (!self.dspark_prompt_vocab) {
             self.dspark_prompt_vocab = true;
+            self.dspark_vocab_mode = true;
             try dsv41_mod.draftPromptVocab(mdl, &mdl.dec_state.?, self.prompt_ids_owned, !self.dspark_stochastic);
         }
         if (try self.dsparkCopyStep(allocator, mdl)) |res| return res;

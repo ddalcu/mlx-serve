@@ -167,8 +167,10 @@ pub const Generator = struct {
     dspark_accepted_tokens: u64 = 0,
     /// Rounds whose drafts were copied from the context (`dsparkCopyStep`), included in `dspark_attempted`.
     dspark_copies: u64 = 0,
-    /// The module's draft vocabulary took this request's prompt (`dsv41.draftPromptVocab`, its first round).
+    /// The module's draft vocabulary took this request's prompt (`dsv41.draftPromptVocab`, its first solo round).
     dspark_prompt_vocab: bool = false,
+    /// The module's draft vocabulary mode is this request's (`dsv41.draftVocabMode`, its first round, solo or group).
+    dspark_vocab_mode: bool = false,
     dspark_copy_drafted: u64 = 0,
     dspark_copy_accepted: u64 = 0,
     /// DeepSeek-V4.1's stage rounds under `dflash_policy` (verify rows by the confidence head, plain ticks

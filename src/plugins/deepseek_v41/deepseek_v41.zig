@@ -1328,12 +1328,7 @@ fn padIds(gpa: std.mem.Allocator, ids: *std.ArrayList(i32), taken: []bool, quant
 /// A sampled request (`greedy` false) drafts over every id (`State.draft_whole`), so its drafts, q and tokens are
 /// those of the model without the vocabulary.
 pub fn draftPromptVocab(m: *Dsv41Model, st: *State, prompt: []const u32, greedy: bool) !void {
-    if (st.draft_extra) |*x| {
-        x.deinit();
-        st.draft_extra = null;
-    }
-    if (m.ds_next) |*a| if (a.st == st) m.dropNext();
-    st.draft_whole = !greedy;
+    draftVocabMode(m, st, greedy);
     const ds = &(m.dspark orelse return);
     if (!greedy) {
         if (ds.draft) |*d| if (d.k > 0) logOnce(&draft_whole_logged, "[dsv41] MLX_SERVE_DSV41_DRAFT_VOCAB: a sampled request drafts every id (the draft vocabulary serves greedy requests)\n");
@@ -1412,6 +1407,19 @@ pub fn draftPromptVocab(m: *Dsv41Model, st: *State, prompt: []const u32, greedy:
 }
 var draft_prompt_logged = std.atomic.Value(bool).init(false);
 var draft_whole_logged = std.atomic.Value(bool).init(false);
+
+/// `st`'s draft vocabulary mode for a new request, without its prompt ids: a sampled request drafts every id
+/// (`State.draft_whole`), a greedy one the file's ids; what the state held for an earlier request (its prompt ids, a
+/// draft queued from them) is dropped. A group round's batched draft reads no more (`dsparkDraftBatched`), so it needs
+/// no prompt-id gather; `draftPromptVocab` makes them where a solo round drafts.
+pub fn draftVocabMode(m: *Dsv41Model, st: *State, greedy: bool) void {
+    if (st.draft_extra) |*x| {
+        x.deinit();
+        st.draft_extra = null;
+    }
+    if (m.ds_next) |*a| if (a.st == st) m.dropNext();
+    st.draft_whole = !greedy;
+}
 
 /// The fused Markov chain's kernels for a request's draft vocabulary sizes (the file's ids and its first
 /// `draft_prompt_warm` buckets of prompt ids), built at load so no request's first draft compiles them.
