@@ -1,7 +1,9 @@
 //! A prompt call's routed gate and up over an fp4 bank (MXFP4; NVFP4 with ModelOpt's per-expert scales) as one paired
 //! NAX launch with `moe_act` in its epilogue (`gather_qmm_nax.sortedGateUpRouted`): `moePrefill`'s fused-bank gather,
-//! its scale multiplies and their join, and `moe_act` in one dispatch (the epilogue in f32, one rounding fewer), so the
-//! `[n, 2 inter]` products never go to memory. `MLX_SERVE_DSV41_MOE_PAIR` serves banks without per-expert scales,
+//! its scale multiplies and their join, and `moe_act` in one dispatch, so the `[n, 2 inter]` products never go to
+//! memory. A reorder: the split path's roundings with the sums in another order, so about 0.2% of the words differ,
+//! each within one bf16 step of its row's scale (a word the split path gives as zero keeps a tiny value here, many
+//! ulps away), and the float64 l2 is the split path's. `MLX_SERVE_DSV41_MOE_PAIR` serves banks without per-expert scales,
 //! `MLX_SERVE_DSV41_MOE_PAIR_SCALED` banks with them.
 
 const std = @import("std");
