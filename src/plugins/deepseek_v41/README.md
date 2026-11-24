@@ -27,9 +27,9 @@ Do these steps in this order.
 3. Convert it on the same machine: `python3 -I scripts/dsv41_nvfp4_pack.py SRC_DIR DST_DIR`. The converter checks
    the result when it finishes. Put DST_DIR on the same APFS volume as SRC_DIR. Keep SRC_DIR, because a shard with
    no change is a symlink to it.
-4. Put a `draft-vocab.txt` file in the pack directory (see "Speculative decoding"). **TODO: how users get this file
-   is not decided yet.** Every result in this README used a 65,536-id file. Without it, expect about 1.46% less
-   decode.
+4. Copy the plugin's draft-vocab.txt into the pack folder: `cp src/plugins/deepseek_v41/draft-vocab.txt DST_DIR/`.
+   It narrows DSpark's greedy drafts to 65,536 common token ids, which gave +1.46% decode; the verify and sampled
+   requests still use the whole vocabulary. For another workload, rebuild it with `scripts/dsv41_draft_vocab.py`.
 5. Raise Metal's wired-memory limit to 512000 MB (500 GiB): `sudo sysctl iogpu.wired_limit_mb=512000`.
 6. Start the server: `mlx-serve --model DST_DIR --serve --warmup-full`. It listens on port 11234 by default.
 7. Get the model's id: `curl -s 127.0.0.1:11234/v1/models`.
@@ -119,8 +119,8 @@ For a sampled request (`MLX_SERVE_DSV41_DRAFT_SAMPLE`, on), the drafter draws ea
 The verify keeps it with probability min(1, p / q), where p is the model's distribution, and resamples a rejected token
 from max(0, p - q). This is standard speculative sampling, so the output keeps the model's distribution.
 
-An optional draft vocabulary (`MLX_SERVE_DSV41_DRAFT_VOCAB`, a `draft-vocab.txt` file in the pack directory) narrows
-the greedy drafts and gave +1.46% decode.
+The draft vocabulary (`MLX_SERVE_DSV41_DRAFT_VOCAB`, the `draft-vocab.txt` file of step 4) narrows the greedy drafts
+and gave +1.46% decode.
 
 <details>
 <summary>The draft vocabulary</summary>
@@ -129,7 +129,14 @@ The draft vocabulary (`MLX_SERVE_DSV41_DRAFT_VOCAB`) is a `draft-vocab.txt` file
 decimal token ids separated by whitespace; our runs used 65,536 ids. Greedy drafts then score only those ids, plus up
 to 16,384 of the request's own most frequent prompt ids (`DRAFT_VOCAB_PROMPT`, on). The trunk and every verify keep the
 whole vocabulary, so only the drafts change. A sampled request always drafts over the whole vocabulary. The file gave
-+1.46% decode on the standard test. Neither the converter nor any script in this repo writes it.
++1.46% decode on the standard test. Each draft then reads about half of the LM head and Markov-head bytes.
+
+The shipped file (`src/plugins/deepseek_v41/draft-vocab.txt`) holds the 65,536 ids that a general corpus uses most,
+tokenized with this pack's tokenizer: the CPython standard library, the Zig standard library, the MLX C++ sources and
+docs, the macOS SDK C headers and one prose set. The ids for end-of-sequence, `<think>`, `</think>` and the DSML tool
+marker are always in it. The source files that the benchmark prompts are built from were left out of the corpus. On
+held-out code and prose the list covers 98.4% to 99.6% of tokens. `scripts/dsv41_draft_vocab.py` rebuilds a list
+from another corpus. Delete the file, or set `MLX_SERVE_DSV41_DRAFT_VOCAB=0`, to draft over the whole vocabulary.
 
 </details>
 
@@ -342,7 +349,7 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | DRAFT_SAMPLE | Sampled drafts from q, kept at min(1, p / q) | DRAFT-ONLY | test |
 | DRAFT_QKV | Fuses a stage's wq_a and wkv at load | DRAFT-ONLY | commit |
 | SPEC_SYNC | Greedy accept on the GPU; next draft queued behind the verify | DRAFT-ONLY | A/B text |
-| DRAFT_VOCAB | Greedy drafts score only the pack's `draft-vocab.txt` ids (default: the pack's file; none shipped yet) | DRAFT-ONLY | test |
+| DRAFT_VOCAB | Greedy drafts score only the pack's `draft-vocab.txt` ids (default: the pack's file, shipped as the plugin's `draft-vocab.txt`) | DRAFT-ONLY | test |
 | DRAFT_VOCAB_PROMPT | A request's prompt ids join the draft vocabulary | DRAFT-ONLY | test |
 | HEAD8 | LM head requantized to 8-bit g64 | Requantized (KLD within one standard error) | KLD measurement |
 | ATTN_F16 | f16 attention core; on by default only without NAX | LOSSY (measured, not gated) | printed float64 measurement, served-route tests |
@@ -380,7 +387,7 @@ held in memory turn off `ENGRAM_GPU_IDS` and the Engram KV cache.
 
 The standard test is three coding prompts of about 17,600 tokens each, with 1,024 completion tokens and a fresh server
 for each run. Each cell ran 6 runs (p10: 2) on the release build `a99fc4f6`, started with `--ctx-size 32768 --warmup-full`. The
-pack held the 65,536-id `draft-vocab.txt`. A 17,600-token prompt runs as one prompt pass at that context and at the
+pack held the plugin's 65,536-id `draft-vocab.txt`. A 17,600-token prompt runs as one prompt pass at that context and at the
 1M default (the 1M load cuts passes of about 44,500 rows), but we have not measured the cells at the 1M default. The card's sampling settings are temperature 1.0 and top_p 0.95.
 
 | Cell | Prefill tok/s | Decode tok/s | TTFT s | Peak GB | Tokens per round |
@@ -404,7 +411,6 @@ the new text (2.94 tokens per round), not from round time. The PR body holds eve
 | On the f32 attention chain's routes, attention's output depends on the chunk width | A test that holds each chunk width no farther from float64 |
 | 12 classed switches rest on the commit's reasoning, and 10 on their A/B giving the same text | A standing word or float64 test for each |
 | `HEAD8` is a quantization change. Its KLD is within one standard error of the bf16 head's on our set, but it is not bit-identical | A ruling to keep it, or `=0` by default |
-| The release does not ship `draft-vocab.txt`, and no tool in this repo makes it | The file shipped with the pack |
 | We tuned and measured only on M5 Ultra Macs with 512 GB | Runs on smaller Macs and older GPUs |
 | A real 1M-token prompt has not run on the release build, and the release has not loaded at the default wired limit | The 1M point of the sweep; one load at the default limit |
 | We have no PPL or KLD of the whole stack; the KLD above is of the head alone | A whole-stack KLD against the same reference |
