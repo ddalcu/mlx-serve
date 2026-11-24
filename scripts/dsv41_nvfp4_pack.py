@@ -18,10 +18,11 @@ Each shard is an APFS clone of NVIDIA's (`cp -c`: no data copied) whose header i
 length (padded with spaces), so every tensor keeps its offsets; a shard with no change is a symlink. The index is
 written new. Runs on the box that holds the pack, never on a laptop:
 
-    python3 -I dsv41_nvfp4_pack.py SRC_DIR DST_DIR [--check] [--experts-mxfp4]
+    python3 -I dsv41_nvfp4_pack.py SRC_DIR DST_DIR [--experts-mxfp4]      # convert, then check
+    python3 -I dsv41_nvfp4_pack.py SRC_DIR DST_DIR --check [--experts-mxfp4]  # check an existing DST only
 
-`--check` re-reads DST and proves each converted tensor against SRC (codes byte for byte, every row scale against its
-block).
+The check re-reads DST and proves each converted tensor against SRC (codes byte for byte, every row scale against its
+block). It runs after every conversion; `--check` runs it alone and converts nothing.
 
 By default the NVFP4 routed experts stay MLX nvfp4 at group 16 in place (headers only, like the rest): the
 codes as U32 [out, in/8], `weight_scale` renamed `<base>.scales` (U8 e4m3 bytes, [out, in/16]). ModelOpt's per-expert
@@ -31,7 +32,7 @@ global (`weight_scale_2`, F32, one an expert and projection) leaves the shard he
 (before the SiLU), w3's `layers.L.ffn.experts.up_proj.expert_scale` (before the swiglu clamp) and w2's
 `layers.L.ffn.experts.expert_scale` (on the routing weight). A global that is not finite and positive, or that BF16
 does not hold exactly, stops the conversion by name. `input_scale` (activations; MLX's nvfp4 reads bf16 inputs) leaves
-the header. Removed tensors stay as unnamed bytes in the clone. `--check` proves the codes and scales kept their
+the header. Removed tensors stay as unnamed bytes in the clone. The check proves the codes and scales kept their
 bytes and every side global equals its source.
 
 `--experts-mxfp4` (numpy) writes the NVFP4 routed experts as MLX mxfp4 at group 32 instead. NVFP4 is in general the
@@ -40,7 +41,7 @@ value-identical to NVIDIA's NVFP4 only because its scales are powers of two: in 
 a nonzero code has e4m3 scale x `weight_scale_2` = the same power of two 2^k, so the codes stay as stored
 (U32 [out, in/8]) and `<base>.scales` is k + 127 (e8m0, U8 [out, in/32]). A group that breaks this stops the
 conversion by name. A shard that holds experts is written whole rather than cloned: `weight_scale`, `weight_scale_2`
-and `input_scale` leave it and the e8m0 scales join it, so its size is what the load holds. `--check` then
+and `input_scale` leave it and the e8m0 scales join it, so its size is what the load holds. The check then
 dequantizes every expert both ways and requires every value equal, and compares every other tensor of those shards
 byte for byte.
 """
