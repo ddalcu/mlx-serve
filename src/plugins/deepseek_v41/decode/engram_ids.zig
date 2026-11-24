@@ -633,7 +633,7 @@ test "dsv41 engram gpu ids (MLX_SERVE_DSV41_ENGRAM_GPU_IDS): the served fused wk
                 @memcpy(raw.w[j * wlen ..][0..wlen], e.table.held[0][e.table.w_off + id * wlen ..][0..wlen]);
                 @memcpy(raw.s[j * slen ..][0..slen], e.table.held[1][e.table.s_off + id * slen ..][0..slen]);
             }
-            const xr = try sc.keep(try e.table.dequantTo(raw, nc, fusion.engramRowsDtype(m, &e.table), s));
+            const xr = try sc.keep(try e.table.dequantTo(raw, nc, .float32, s));
             kv[0] = try dsv41.engramWkv(&sc, &e, try sc.astype(try sc.reshape(xr, &.{ 1, @intCast(K) }), m.act));
             const x = try dsv41.hostF32(xr);
             defer gpa.free(x);
