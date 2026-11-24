@@ -177,7 +177,7 @@ pub fn write(sc: *Scope, m: *dsv41.Dsv41Model, e: *const dsv41.EngramLayer, ids:
 }
 
 /// At load, after `fuse.settle`: the switch serves only where every Engram table is wrapped as GPU buffers (wrapped
-/// here if `fuse.engram` did not) and the fused wkv reads it; one line says which.
+/// here) and the fused wkv reads it; one line says which.
 pub fn settle(m: *dsv41.Dsv41Model) !void {
     if (!on() or m.engrams.len == 0) return;
     const hs = &(m.hash orelse return);
@@ -287,8 +287,6 @@ test "dsv41 engram gpu ids (resident): the write from the GPU-hashed ids is the 
     const fx = try fixture.Fixture.init(gpa, .{ .lo = 0, .hi = 1, .ctx = 8, .fused = true });
     defer fx.deinit();
     const m = fx.m;
-    m.fuse.engram = true;
-    defer m.fuse.engram = false;
     const s = mlx.gpuStream();
     const d = m.cfg.hidden_size;
     const hc = m.cfg.dsv4_hc_mult;
@@ -339,7 +337,7 @@ test "dsv41 engram gpu ids (resident): the write from the GPU-hashed ids is the 
             const t = try sc.keep(mlx.mlx_array_new_data(&tok, &[_]c_int{1}, 1, .uint32));
             const ids = try rows(&sc, &hs, &ctx, hist, t, 0);
             const got = (try write(&sc, m, &e, ids, .{ .ctx = null }, 1, nc, x)) orelse return error.Declined;
-            const want = (try fusion.engramHeld(&sc, m, &e, host[0..ctx.n], 2, 1, nc, 0, 1, x)) orelse return error.Declined;
+            const want = (try fusion.heldWrite(&sc, m, &e, host[0..ctx.n], 2, 1, nc, 0, 1, x)) orelse return error.Declined;
             const other: u32 = (tok + 1) % 512;
             const ot = try sc.keep(mlx.mlx_array_new_data(&other, &[_]c_int{1}, 1, .uint32));
             const plant = (try write(&sc, m, &e, try rows(&sc, &hs, &ctx, hist, ot, 0), .{ .ctx = null }, 1, nc, x)) orelse return error.Declined;

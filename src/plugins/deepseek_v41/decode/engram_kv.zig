@@ -1,7 +1,7 @@
-//! An Engram layer's wkv over its decode rows straight from the table's codes (`dec_engram_kv.metal`, `fuse.engram`):
+//! An Engram layer's wkv over its decode rows straight from the table's codes (`dec_engram_kv.metal`, `engram_ids`):
 //! the rows' dequant, their cast and the mxfp8 projection in one launch, the rows never in memory. The rows are
 //! picked by id out of any byte buffer (`Geo`): the rows copied out of the table, or the whole resident table
-//! wrapped as one GPU buffer (`fuse.engram_gather`), so the gather is the kernel's own load.
+//! wrapped as one GPU buffer (`fuse.wrapHeld`), so the gather is the kernel's own load.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");

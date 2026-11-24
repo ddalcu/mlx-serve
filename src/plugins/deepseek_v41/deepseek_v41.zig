@@ -7421,17 +7421,13 @@ pub fn spanInAt(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const S
             if (m.trace) |tr| try tr.put("engram_{d}", .{li}, x);
             continue;
         };
-        // `fuse.engram`: a decode-width span's write gathered from the resident table (`fusion.engramHeld`), else
-        // from the rows read out of it (`fusion.engramWrite`).
-        var fused: ?A = if (sp.eng_gpu.ctx != null) try dkern.engram_ids.write(sc, m, e, sp.eng_gpu, sp.eng_plan, ek, nc, x) orelse return error.Dsv41EngramGpuIdsDeclined else try fusion.engramHeld(sc, m, e, sp.eng_ids, m.engrams.len, ek, nc, lo, hi, x);
-        const held_rows = if (fused == null) try fusion.engramRowsHeld(sc, m, e, sp.eng_ids, m.engrams.len, ek, nc, lo, hi) else null;
-        const rows = if (fused != null) none else if (held_rows) |r| r else if (sp.prefetch) |pf| blk: {
+        // `MLX_SERVE_DSV41_ENGRAM_GPU_IDS`: a decode step's write gathered from the wrapped table by the GPU's ids.
+        const fused: ?A = if (sp.eng_gpu.ctx != null) try dkern.engram_ids.write(sc, m, e, sp.eng_gpu, sp.eng_plan, ek, nc, x) orelse return error.Dsv41EngramGpuIdsDeclined else null;
+        const rows = if (fused != null) none else if (sp.prefetch) |pf| blk: {
             // A batch reads grid k, state k's rows, as one span.
             const raw = if (sp.offs.len > 0) try pf.take(k, ek, 0) else try pf.take(sp.p0, ek, k);
             defer raw.deinit(gpa);
-            fused = try fusion.engramWrite(sc, m, e, raw, x);
-            if (fused != null) break :blk none;
-            break :blk try sc.keep(try e.table.dequantTo(raw, (hi - lo) * nc, fusion.engramRowsDtype(m, &e.table), sc.s));
+            break :blk try sc.keep(try e.table.dequantTo(raw, (hi - lo) * nc, .float32, sc.s));
         } else try engramGathered(sc, m, gpa, sp, e, ek, lo, hi);
         const y = fused orelse try engramWrite(sc, m, e, x, try sc.reshape(rows, &.{ ci(hi - lo), -1 }), verify);
         // An image span's rows get no Engram write (the reference shuts their gate).
@@ -7456,9 +7452,9 @@ fn engramGathered(sc: *Scope, m: *const Dsv41Model, gpa: std.mem.Allocator, sp: 
 /// `MLX_SERVE_DSV41_PF_ENGRAM_PASS`: every span's stream entering Engram layer `li` (`spanIn`'s words but for the
 /// sums' order) into `parts`, the layer's `wkv` run once over each run of `woa.spansPer` spans' rows (M = the run's
 /// rows, not a span's 256) and the gate span by span on its slice; false (nothing taken) where it declines: the
-/// switch off, a fused Engram read, a batch, a trace, a DSpark target, a CPU stream, not one Engram table a layer.
+/// switch off, a batch, a trace, a DSpark target, a CPU stream, not one Engram table a layer.
 fn engramPass(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, li: usize, parts: []A) !bool {
-    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_ENGRAM_PASS) or !mlx.streamIsGpu(sc.s) or m.fuse.engram or m.trace != null) return false;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_ENGRAM_PASS) or !mlx.streamIsGpu(sc.s) or m.trace != null) return false;
     if (sp.eng_gpu.ctx != null or sp.offs.len > 0 or (m.n_mtp > 0 and m.dsparkTarget(li) != null)) return false;
     var found: ?usize = null;
     for (m.engrams, 0..) |*e, ek| if (e.layer == li) {
@@ -7479,7 +7475,7 @@ fn engramPass(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spa
             const raw_rows = if (sp.prefetch) |pf| blk: {
                 const raw = try pf.take(sp.p0, ek, k);
                 defer raw.deinit(gpa);
-                break :blk try sc.keep(try e.table.dequantTo(raw, (hi - lo) * sp.ncols, fusion.engramRowsDtype(m, &e.table), sc.s));
+                break :blk try sc.keep(try e.table.dequantTo(raw, (hi - lo) * sp.ncols, .float32, sc.s));
             } else try engramGathered(sc, m, gpa, sp, e, ek, lo, hi);
             r.* = try sc.astype(try sc.reshape(raw_rows, &.{ ci(hi - lo), -1 }), m.act);
         }
@@ -8665,7 +8661,6 @@ fn engAheadWhyNot(m: *const Dsv41Model) ?[]const u8 {
     if (m.engrams.len == 0) return "no Engram layer";
     if (m.hash == null) return "no Engram hash";
     if (m.engram_ids == null) return "no GPU hash constants (MLX_SERVE_DSV41_ENGRAM_GPU_IDS off at load)";
-    if (m.fuse.engram) return "the fused Engram write";
     if (exactPart(m, true, 2, "engram")) return "the exact verify (each row's own Engram wkv)";
     if (m.act != .bfloat16 or !mlx.streamIsGpu(m.s)) return "not bf16 on the GPU";
     for (m.engrams) |*e| if (e.gpu == null or e.wkv.ext != null or (e.table.bits != 4 and e.table.bits != 8)) return "an Engram table not wrapped on the GPU, or its wkv not resident";

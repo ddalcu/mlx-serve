@@ -4,11 +4,6 @@
 //! forced `resident` on a streamed or partly held pack is refused by name.
 //! - `down_scale`: a decode step or verify puts an NVFP4 bank's per-expert down scale on the routing weights inside the
 //!   fused fp4 gate/up launch (`DSCALE`: `wts * dsc[e]`, the f32 product `routeScaled`'s take, cast and multiply make).
-//! - `engram`: a decode step's or verify's Engram write takes its wkv projection straight from the table's codes in one
-//!   launch (`decode/engram_kv.zig`), then the gate: the held table is one GPU buffer (`wrapHeld`) the kernel gathers
-//!   its rows from by id (no host copy, dequant, cast or rows in memory; the rows copied out of the table where the
-//!   wrap declines); a prompt chunk's rows dequantize straight to the activation dtype (`Table.dequantTo`), not to f32
-//!   and a cast. Not bit-equal: the projection sums in another order.
 //! - `mxfp8_qmm`: an mxfp8 linear over a prompt chunk's rows runs MLX's quantized matmul (its NAX qmm dequantizes the
 //!   codes in the GEMM's tile loads) instead of dequantizing the whole weight to bf16 and the dense GEMM
 //!   (`Lin.denseAt`, through `ps()`: `Lin` has no model).
@@ -30,14 +25,12 @@ const none: A = .{ .ctx = null };
 
 pub const Fuse = struct {
     down_scale: bool = false,
-    engram: bool = false,
     mxfp8_qmm: bool = false,
     pf_bf16_trunk: bool = false,
 
     pub fn wanted() Fuse {
         return .{
             .down_scale = env.onUnlessZero(.MLX_SERVE_DSV41_FUSE_DOWN_SCALE),
-            .engram = env.on(.MLX_SERVE_DSV41_FUSE_ENGRAM),
             .mxfp8_qmm = env.onUnlessZero(.MLX_SERVE_DSV41_FUSE_MXFP8_QMM),
             .pf_bf16_trunk = env.on(.MLX_SERVE_DSV41_PF_BF16_TRUNK),
         };
@@ -81,8 +74,8 @@ pub fn choose(p: Path, streamed: bool, held: bool) error{ Dsv41WeightPathResiden
     }
 }
 
-/// At load, once the Engram tables are held or not (`holdEngram`): the weight path, the fusions it lets serve, and
-/// under `engram` each held table wrapped as a GPU buffer; one line names them.
+/// At load, once the Engram tables are held or not (`holdEngram`): the weight path and the fusions it lets serve; one
+/// line names them.
 pub fn settle(m: *dsv41.Dsv41Model) !void {
     const p = try pathOf(env.span(.MLX_SERVE_DSV41_WEIGHT_PATH));
     var held = true;
@@ -90,24 +83,10 @@ pub fn settle(m: *dsv41.Dsv41Model) !void {
     const mode = try choose(p, m.cfg.dsv41_streamed, held);
     m.fuse = if (mode.resident) Fuse.wanted() else .{};
     ps().mxfp8_qmm = m.fuse.mxfp8_qmm;
-    var wrapped: usize = 0;
-    var bytes: u64 = 0;
-    if (m.fuse.engram) for (m.engrams) |*e| {
-        if (!wrapHeld(e)) continue;
-        wrapped += 1;
-        bytes += e.table.held[0].len + e.table.held[1].len;
-    };
-    log.info("deepseek_v41: weight path {s} ({s}); fusions down_scale={} engram={} ({d} of {d} tables gathered on the GPU) mxfp8_qmm={}\n", .{ if (mode.resident) "resident" else "ssd", mode.why, m.fuse.down_scale, m.fuse.engram, wrapped, m.engrams.len, m.fuse.mxfp8_qmm });
+    log.info("deepseek_v41: weight path {s} ({s}); fusions down_scale={} mxfp8_qmm={}\n", .{ if (mode.resident) "resident" else "ssd", mode.why, m.fuse.down_scale, m.fuse.mxfp8_qmm });
     if (m.fuse.pf_bf16_trunk) {
         const n = try bf16Trunk(m);
         log.info("deepseek_v41: pf bf16 trunk: {d:.1} GB, {d} mxfp8 linears dequantized once for the prompt's GEMMs (billed {d:.1} GB)\n", .{ gbOf(n.bytes), n.linears, gbOf(trunkBytes(&m.cfg)) });
-    }
-    if (wrapped > 0) {
-        var active: usize = 0;
-        _ = mlx.mlx_get_active_memory(&active);
-        const ws = mlx.maxRecommendedWorkingSet();
-        const room = evictRoom(active, ws);
-        log.info("deepseek_v41: engram: {d:.1} GB wrapped no-copy (pages already held, no new memory) now count in MLX's active memory, {d:.1} GB with them; MLX evicts its buffer cache on each miss past 0.95 x the working set, {d:.1} GB: {d:.1} GB of room{s}\n", .{ gbOf(bytes), gbOf(active), gbOf(evictLine(ws)), gbOf(room), if (room == 0) " (none: expect slower allocations)" else "" });
     }
 }
 
@@ -196,17 +175,6 @@ pub fn layerWeights(c: anytype, li: usize) u64 {
     return w;
 }
 
-/// MLX's line (`gc_limit_`, min(1.5 x, 0.95 x) the recommended working set `ws`): past it every new buffer first evicts
-/// cached ones. Its memory limit cannot move it higher, so wrapped bytes are only room taken.
-pub fn evictLine(ws: u64) u64 {
-    return ws / 20 * 19;
-}
-
-/// What is left under `evictLine` with `active` bytes counted.
-pub fn evictRoom(active: u64, ws: u64) u64 {
-    return evictLine(ws) -| active;
-}
-
 fn gbOf(b: u64) f64 {
     return @as(f64, @floatFromInt(b)) / 1e9;
 }
@@ -273,7 +241,7 @@ pub fn unwrap(e: *dsv41.EngramLayer) void {
 }
 
 /// The fusions that have served, each logged the first time (an A/B arm's engagement lines).
-pub var engaged: struct { down_scale: bool = false, engram: bool = false, engram_held: bool = false, engram_rows: bool = false, engram_rows_held: bool = false, mxfp8_qmm: bool = false } = .{};
+pub var engaged: struct { down_scale: bool = false, mxfp8_qmm: bool = false } = .{};
 
 fn engage(comptime which: []const u8, comptime what: []const u8) void {
     if (@field(engaged, which)) return;
@@ -293,35 +261,7 @@ pub fn ffnDownScaled(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, ly: *const ds
     return y;
 }
 
-/// An Engram layer's kv `[rows, (hc + 1) * dim]` from the table's raw rows `raw` (`rows * K / head_dim` of them, a
-/// row's n-gram rows in order) on the one-launch kernel. Null where it does not serve: the table not mxfp4 or mxfp8 at
-/// group 32, wkv not mxfp8 group 32 in MLX arrays, activations not bf16, more rows than a decode step.
-pub fn engramKv(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.EngramLayer, raw: engram.Table.Raw, rows: usize) !?A {
-    if (!kvServes(m, e, rows)) return null;
-    const t = &e.table;
-    const K: usize = @intCast(mlx.getShape(e.wkv.w)[1] * 4);
-    if (K % t.head_dim != 0) return null;
-    const n = rows * K / t.head_dim;
-    if (raw.w.len < n * t.wlen or raw.s.len < n * t.slen) return null;
-    const codes = try sc.keep(mlx.mlx_array_new_data(raw.w.ptr, &[_]c_int{ ci(n), ci(t.wlen / 4) }, 2, .uint32));
-    const tsc = try sc.keep(mlx.mlx_array_new_data(raw.s.ptr, &[_]c_int{ ci(n), ci(t.slen) }, 2, .uint8));
-    var seq: [dkern.max_rows * engram.MAX_COLS]u32 = undefined;
-    if (n > seq.len) return null;
-    for (seq[0..n], 0..) |*v, i| v.* = @intCast(i);
-    const geo: dkern.engram_kv.Geo = .{ .w_base = 0, .w_stride = t.wlen, .s_base = 0, .s_stride = t.slen };
-    return kvLaunch(sc, e, rows, codes, tsc, seq[0..n], geo);
-}
-
-/// The kernel over `ids` (`rows * K / head_dim` table rows) in the byte buffers `codes` and `tsc` at `geo`.
-fn kvLaunch(sc: *dsv41.Scope, e: *const dsv41.EngramLayer, rows: usize, codes: A, tsc: A, ids: []const u32, geo: dkern.engram_kv.Geo) !?A {
-    const t = &e.table;
-    const ia = try sc.keep(mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ci(ids.len)}, 1, .uint32));
-    const gw = geo.words();
-    const ga = try sc.keep(mlx.mlx_array_new_data(&gw, &[_]c_int{6}, 1, .uint32));
-    return dkern.engram_kv.launch(sc, .{ .hd = t.head_dim, .tb = t.bits }, rows, codes, tsc, ia, ga, e.wkv.w, e.wkv.s);
-}
-
-/// Whether `engramKv`'s kernel reads `e`'s table and projection.
+/// Whether the one-launch Engram wkv (`dec_engram_kv`, `engram_ids.write`) reads `e`'s table and projection.
 pub fn kvServes(m: *const dsv41.Dsv41Model, e: *const dsv41.EngramLayer, rows: usize) bool {
     const t = &e.table;
     const l = &e.wkv;
@@ -329,74 +269,6 @@ pub fn kvServes(m: *const dsv41.Dsv41Model, e: *const dsv41.EngramLayer, rows: u
     if (!((t.mode == .mxfp4 and t.bits == 4) or (t.mode == .mxfp8 and t.bits == 8)) or t.group_size != 32) return false;
     if (l.ext != null or l.s.ctx == null or l.b.ctx != null or l.qp.mode != .mxfp8 or l.qp.bits != 8 or l.qp.group_size != 32) return false;
     return mlx.getShape(l.w).len == 2 and t.head_dim > 0 and t.wlen == t.head_dim * t.bits / 8 and t.slen == t.head_dim / 32;
-}
-
-/// Under `engram` with the table on the GPU (`wrapHeld`): the Engram write of span rows [lo, hi) (`x`
-/// `[hi - lo, hc, dim]`) gathered by id straight out of the resident table, `ids` the chunk's row ids
-/// (`[rows][tables][nc]`, `Hash.rows`), this table the `ek`-th. Null where it does not serve (an id past the table:
-/// an image row's), and the caller reads the rows as before.
-pub fn engramHeld(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.EngramLayer, ids: []const u32, tables: usize, ek: usize, nc: usize, lo: usize, hi: usize, x: A) !?A {
-    if (!m.fuse.engram) return null;
-    const g = e.gpu orelse return null;
-    const rows = hi - lo;
-    if (!kvServes(m, e, rows)) return null;
-    const t = &e.table;
-    const K: usize = @intCast(mlx.getShape(e.wkv.w)[1] * 4);
-    if (K != nc * t.head_dim or hi * tables * nc > ids.len) return null;
-    var mine: [dkern.max_rows * engram.MAX_COLS]u32 = undefined;
-    if (rows * nc > mine.len) return null;
-    for (lo..hi) |r| for (0..nc) |j| {
-        const id = ids[(r * tables + ek) * nc + j];
-        if (id >= t.rows) return null;
-        mine[(r - lo) * nc + j] = id;
-    };
-    const page = std.heap.pageSize();
-    const geo: dkern.engram_kv.Geo = .{ .w_base = t.w_off % page, .w_stride = t.w_stride, .s_base = t.s_off % page, .s_stride = t.s_stride };
-    const kv = try kvLaunch(sc, e, rows, g[0], g[1], mine[0 .. rows * nc], geo) orelse return null;
-    engage("engram_held", "Engram write (the wkv projection gathering its rows from the resident table in one launch)");
-    return try dsv41.engramGate(sc, m, e.qk, x, kv);
-}
-
-/// Under `engram`: the Engram write of the stream `x` `[rows, hc, dim]` from the table's raw rows (`engramKv`, then the
-/// gate). Null where the switch is off or the kernel declines; the caller then dequantizes the rows.
-pub fn engramWrite(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.EngramLayer, raw: engram.Table.Raw, x: A) !?A {
-    if (!m.fuse.engram) return null;
-    const kv = try engramKv(sc, m, e, raw, @intCast(mlx.getShape(x)[0])) orelse return null;
-    engage("engram", "Engram write (the wkv projection from the table's codes in one launch)");
-    return try dsv41.engramGate(sc, m, e.qk, x, kv);
-}
-
-/// Under `engram` with the table on the GPU (`wrapHeld`): a prompt span's Engram rows [lo, hi) `[(hi - lo) * nc, hd]`
-/// bf16, gathered by id out of the resident table and dequantized in one launch (`engram_kv.gatherRows`), the wkv
-/// GEMM's input with no host read, copy or upload. Null where it does not serve (an id past the table).
-pub fn engramRowsHeld(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.EngramLayer, ids: []const u32, tables: usize, ek: usize, nc: usize, lo: usize, hi: usize) !?A {
-    if (!m.fuse.engram or m.act != .bfloat16) return null;
-    const g = e.gpu orelse return null;
-    const t = &e.table;
-    if (hi <= lo or hi * tables * nc > ids.len) return null;
-    const n = (hi - lo) * nc;
-    const mine = try sc.a.alloc(u32, n);
-    defer sc.a.free(mine);
-    for (lo..hi) |r| for (0..nc) |j| {
-        const id = ids[(r * tables + ek) * nc + j];
-        if (id >= t.rows) return null;
-        mine[(r - lo) * nc + j] = id;
-    };
-    const page = std.heap.pageSize();
-    const geo: dkern.engram_kv.Geo = .{ .w_base = t.w_off % page, .w_stride = t.w_stride, .s_base = t.s_off % page, .s_stride = t.s_stride };
-    const ia = try sc.keep(mlx.mlx_array_new_data(mine.ptr, &[_]c_int{ci(n)}, 1, .uint32));
-    const gw = geo.words();
-    const ga = try sc.keep(mlx.mlx_array_new_data(&gw, &[_]c_int{6}, 1, .uint32));
-    const rows = try dkern.engram_kv.gatherRows(sc, .{ .hd = t.head_dim, .tb = t.bits }, g[0], g[1], ia, ga) orelse return null;
-    engage("engram_rows_held", "Engram rows (a prompt span's rows gathered from the resident table on the GPU)");
-    return rows;
-}
-
-/// The dtype the table `t`'s rows dequantize into: the activations' under `engram` where the codes allow it.
-pub fn engramRowsDtype(m: *const dsv41.Dsv41Model, t: *const engram.Table) mlx.mlx_dtype {
-    if (!m.fuse.engram or !t.dequantsTo()) return .float32;
-    engage("engram_rows", "Engram rows (a prompt chunk's rows straight to the activation dtype)");
-    return m.act;
 }
 
 /// Whether an `mode` linear over a prompt chunk's rows stays on MLX's quantized matmul (`Lin.denseAt`): mxfp8 under
@@ -533,14 +405,90 @@ fn hostOf(a: A) ![]f32 {
     return dsv41.hostF32(a);
 }
 
-test "dsv41 fuse engram: the one-launch wkv from the table's codes is no further from f32 truth than the dequant, cast and quantized_matmul chain, and the gated write within 0.1 rel rms of the chain's, R = 1..6, mxfp4 and mxfp8 tables at the release's shape; a scale a code up, two rows swapped differ" {
+/// The one-launch kernel over `ids` (`rows * K / head_dim` table rows) in the byte buffers `codes` and `tsc` at `geo`.
+fn kvLaunch(sc: *dsv41.Scope, e: *const dsv41.EngramLayer, rows: usize, codes: A, tsc: A, ids: []const u32, geo: dkern.engram_kv.Geo) !?A {
+    const t = &e.table;
+    const ia = try sc.keep(mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ci(ids.len)}, 1, .uint32));
+    const gw = geo.words();
+    const ga = try sc.keep(mlx.mlx_array_new_data(&gw, &[_]c_int{6}, 1, .uint32));
+    return dkern.engram_kv.launch(sc, .{ .hd = t.head_dim, .tb = t.bits }, rows, codes, tsc, ia, ga, e.wkv.w, e.wkv.s);
+}
+
+/// An Engram layer's kv `[rows, (hc + 1) * dim]` on the one-launch kernel from rows copied out of the table, `raw`
+/// (`rows * K / head_dim` of them, a row's n-gram rows in order): the reference the wrapped table's gather must equal.
+fn copiedKv(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.EngramLayer, raw: engram.Table.Raw, rows: usize) !?A {
+    if (!kvServes(m, e, rows)) return null;
+    const t = &e.table;
+    const K: usize = @intCast(mlx.getShape(e.wkv.w)[1] * 4);
+    if (K % t.head_dim != 0) return null;
+    const n = rows * K / t.head_dim;
+    if (raw.w.len < n * t.wlen or raw.s.len < n * t.slen) return null;
+    const codes = try sc.keep(mlx.mlx_array_new_data(raw.w.ptr, &[_]c_int{ ci(n), ci(t.wlen / 4) }, 2, .uint32));
+    const tsc = try sc.keep(mlx.mlx_array_new_data(raw.s.ptr, &[_]c_int{ ci(n), ci(t.slen) }, 2, .uint8));
+    var seq: [dkern.max_rows * engram.MAX_COLS]u32 = undefined;
+    if (n > seq.len) return null;
+    for (seq[0..n], 0..) |*v, i| v.* = @intCast(i);
+    const geo: dkern.engram_kv.Geo = .{ .w_base = 0, .w_stride = t.wlen, .s_base = 0, .s_stride = t.slen };
+    return kvLaunch(sc, e, rows, codes, tsc, seq[0..n], geo);
+}
+
+/// `copiedKv`, then the gate: the Engram write of `x` `[rows, hc, dim]` from rows copied out of the table.
+fn copiedWrite(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.EngramLayer, raw: engram.Table.Raw, x: A) !?A {
+    const kv = try copiedKv(sc, m, e, raw, @intCast(mlx.getShape(x)[0])) orelse return null;
+    return try dsv41.engramGate(sc, m, e.qk, x, kv);
+}
+
+/// The Engram write of span rows [lo, hi) (`x` `[hi - lo, hc, dim]`) gathered by host id out of the table wrapped as
+/// GPU buffers (`wrapHeld`), the geometry `engram_ids.write` reads it at; `ids` `[rows][tables][nc]` (`Hash.rows`),
+/// this table the `ek`-th. Null where an id passes the table.
+pub fn heldWrite(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.EngramLayer, ids: []const u32, tables: usize, ek: usize, nc: usize, lo: usize, hi: usize, x: A) !?A {
+    const g = e.gpu orelse return null;
+    const rows = hi - lo;
+    if (!kvServes(m, e, rows)) return null;
+    const t = &e.table;
+    const K: usize = @intCast(mlx.getShape(e.wkv.w)[1] * 4);
+    if (K != nc * t.head_dim or hi * tables * nc > ids.len) return null;
+    var mine: [dkern.max_rows * engram.MAX_COLS]u32 = undefined;
+    if (rows * nc > mine.len) return null;
+    for (lo..hi) |r| for (0..nc) |j| {
+        const id = ids[(r * tables + ek) * nc + j];
+        if (id >= t.rows) return null;
+        mine[(r - lo) * nc + j] = id;
+    };
+    const page = std.heap.pageSize();
+    const geo: dkern.engram_kv.Geo = .{ .w_base = t.w_off % page, .w_stride = t.w_stride, .s_base = t.s_off % page, .s_stride = t.s_stride };
+    const kv = try kvLaunch(sc, e, rows, g[0], g[1], mine[0 .. rows * nc], geo) orelse return null;
+    return try dsv41.engramGate(sc, m, e.qk, x, kv);
+}
+
+/// Span rows [lo, hi)'s Engram rows `[(hi - lo) * nc, hd]` bf16 gathered by host id out of the wrapped table and
+/// dequantized in one launch (`engram_kv.gatherRows`, the geometry the verify's kv made ahead reads it at).
+fn heldRows(sc: *dsv41.Scope, e: *const dsv41.EngramLayer, ids: []const u32, tables: usize, ek: usize, nc: usize, lo: usize, hi: usize) !?A {
+    const g = e.gpu orelse return null;
+    const t = &e.table;
+    if (hi <= lo or hi * tables * nc > ids.len) return null;
+    const n = (hi - lo) * nc;
+    const mine = try sc.a.alloc(u32, n);
+    defer sc.a.free(mine);
+    for (lo..hi) |r| for (0..nc) |j| {
+        const id = ids[(r * tables + ek) * nc + j];
+        if (id >= t.rows) return null;
+        mine[(r - lo) * nc + j] = id;
+    };
+    const page = std.heap.pageSize();
+    const geo: dkern.engram_kv.Geo = .{ .w_base = t.w_off % page, .w_stride = t.w_stride, .s_base = t.s_off % page, .s_stride = t.s_stride };
+    const ia = try sc.keep(mlx.mlx_array_new_data(mine.ptr, &[_]c_int{ci(n)}, 1, .uint32));
+    const gw = geo.words();
+    const ga = try sc.keep(mlx.mlx_array_new_data(&gw, &[_]c_int{6}, 1, .uint32));
+    return dkern.engram_kv.gatherRows(sc, .{ .hd = t.head_dim, .tb = t.bits }, g[0], g[1], ia, ga);
+}
+
+test "dsv41 engram kv: the one-launch wkv from the table's codes is no further from f32 truth than the dequant, cast and quantized_matmul chain, and the gated write within 0.1 rel rms of the chain's, R = 1..6, mxfp4 and mxfp8 tables at the release's shape; a scale a code up, two rows swapped differ" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const fx = try fixture.Fixture.init(gpa, .{ .lo = 0, .hi = 1, .ctx = 8, .fused = true });
     defer fx.deinit();
     const m = fx.m;
-    m.fuse.engram = true;
-    defer m.fuse.engram = false;
     const s = mlx.gpuStream();
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
@@ -577,7 +525,7 @@ test "dsv41 fuse engram: the one-launch wkv from the table's codes is no further
             defer raw.deinit(gpa);
             const rows = try sc.keep(try t.dequant(raw, n, s));
             const r2 = try sc.reshape(rows, &.{ ci(R), ci(K) });
-            const got = (try engramKv(&sc, m, &e, raw, R)) orelse return error.Declined;
+            const got = (try copiedKv(&sc, m, &e, raw, R)) orelse return error.Declined;
             const chain = try e.wkv.apply(&sc, try sc.astype(r2, .bfloat16));
             var truth = mlx.mlx_array_new();
             defer free(truth);
@@ -594,7 +542,7 @@ test "dsv41 fuse engram: the one-launch wkv from the table's codes is no further
             const up = try dupRaw(gpa, raw);
             defer up.deinit(gpa);
             for (up.s) |*b| b.* += 1;
-            const pu = try hostOf((try engramKv(&sc, m, &e, up, R)).?);
+            const pu = try hostOf((try copiedKv(&sc, m, &e, up, R)).?);
             defer gpa.free(pu);
             const eu = dkern.relRms(pu, c);
             var es: f64 = 1;
@@ -606,15 +554,13 @@ test "dsv41 fuse engram: the one-launch wkv from the table's codes is no further
                 @memcpy(sw.w[per * wlen ..][0 .. per * wlen], raw.w[0 .. per * wlen]);
                 @memcpy(sw.s[0 .. per * slen], raw.s[per * slen ..][0 .. per * slen]);
                 @memcpy(sw.s[per * slen ..][0 .. per * slen], raw.s[0 .. per * slen]);
-                const pw = try hostOf((try engramKv(&sc, m, &e, sw, R)).?);
+                const pw = try hostOf((try copiedKv(&sc, m, &e, sw, R)).?);
                 defer gpa.free(pw);
                 es = dkern.relRms(pw, c);
             }
             // The gated write against the chain's (`engramApply` over the dequantized rows), on the increment.
             const x = try sc.keep(try fx.normal(&.{ ci(R), ci(hc), ci(d) }, .bfloat16, 0, 1));
-            engaged.engram = false;
-            const yg = (try engramWrite(&sc, m, &e, raw, x)) orelse return error.Declined;
-            try testing.expect(engaged.engram);
+            const yg = (try copiedWrite(&sc, m, &e, raw, x)) orelse return error.Declined;
             const yw = try dsv41.engramApply(&sc, m, &e, x, r2);
             const xh = try hostOf(x);
             defer gpa.free(xh);
@@ -634,7 +580,7 @@ test "dsv41 fuse engram: the one-launch wkv from the table's codes is no further
     }
 }
 
-test "dsv41 fuse engram: a prompt chunk's mxfp4 and mxfp8 rows dequantize straight to bf16 as the f32 rows cast to bf16, every code under every e8m0 scale; the scales a code up differ" {
+test "dsv41 engram table: mxfp4 and mxfp8 rows dequantize straight to bf16 as the f32 rows cast to bf16, every code under every e8m0 scale; the scales a code up differ" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const s = mlx.gpuStream();
@@ -778,13 +724,6 @@ test "dsv41 fuse mxfp8_qmm: a prompt chunk's mxfp8 linears (q_kv, wo_b, the grou
     }
 }
 
-test "dsv41 fuse engram: the wrapped tables' bytes against MLX's eviction line: the release's 104.5 GB over a 325 GB decode leaves room under a 500 GiB working set; past it, none" {
-    const ws: u64 = 500 << 30;
-    try testing.expectEqual(@as(u64, ws / 20 * 19), evictLine(ws));
-    try testing.expect(evictRoom(325_000_000_000 + 104_500_000_000, ws) > 70_000_000_000);
-    try testing.expectEqual(@as(u64, 0), evictRoom(evictLine(ws) + 1, ws));
-}
-
 test "dsv41 fuse weight path: auto is resident only when nothing streams and every Engram table is held; resident is refused by name on a streamed or partly held pack; ssd never fuses" {
     try testing.expectEqual(Path.auto, try pathOf(null));
     try testing.expectEqual(Path.auto, try pathOf(""));
@@ -810,18 +749,16 @@ test "dsv41 fuse weight path: a fixture model on the ssd path serves no fusion w
     defer ps().mxfp8_qmm = false;
     const ds = env.override(.MLX_SERVE_DSV41_FUSE_DOWN_SCALE, "1");
     defer ds.restore();
-    const eg = env.override(.MLX_SERVE_DSV41_FUSE_ENGRAM, "1");
-    defer eg.restore();
     const mq = env.override(.MLX_SERVE_DSV41_FUSE_MXFP8_QMM, "1");
     defer mq.restore();
     {
         const p = env.override(.MLX_SERVE_DSV41_WEIGHT_PATH, "ssd");
         defer p.restore();
         try settle(m);
-        try testing.expect(!m.fuse.down_scale and !m.fuse.engram and !m.fuse.mxfp8_qmm and !ps().mxfp8_qmm);
+        try testing.expect(!m.fuse.down_scale and !m.fuse.mxfp8_qmm and !ps().mxfp8_qmm);
     }
     try settle(m);
-    try testing.expect(m.fuse.down_scale and m.fuse.engram and m.fuse.mxfp8_qmm and ps().mxfp8_qmm);
+    try testing.expect(m.fuse.down_scale and m.fuse.mxfp8_qmm and ps().mxfp8_qmm);
 }
 
 /// A held table for the gather tests: `n` random rows (`rawRows`' codes and scales) in two page-aligned anonymous
@@ -840,14 +777,12 @@ pub fn heldTable(t: *engram.Table, n: usize, base: usize, rng: std.Random) !void
     t.s_off = base;
 }
 
-test "dsv41 fuse engram (resident): the wkv gathered by id out of the held table wrapped as GPU buffers equals the kernel over the rows copied out of it, and the gated write is the chain's within 0.1 rel rms, R = 1..6, mxfp4 and mxfp8 tables; ids one row off differ" {
+test "dsv41 engram wrapped (resident): the wkv gathered by id out of the held table wrapped as GPU buffers equals the kernel over the rows copied out of it, and the gated write is the chain's within 0.1 rel rms, R = 1..6, mxfp4 and mxfp8 tables; ids one row off differ" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const fx = try fixture.Fixture.init(gpa, .{ .lo = 0, .hi = 1, .ctx = 8, .fused = true });
     defer fx.deinit();
     const m = fx.m;
-    m.fuse.engram = true;
-    defer m.fuse.engram = false;
     const s = mlx.gpuStream();
     const d = m.cfg.hidden_size;
     const hc = m.cfg.dsv4_hc_mult;
@@ -893,17 +828,15 @@ test "dsv41 fuse engram (resident): the wkv gathered by id out of the held table
                 @memcpy(raw.w[(r * nc + j) * wlen ..][0..wlen], e.table.held[0][e.table.w_off + id * wlen ..][0..wlen]);
                 @memcpy(raw.s[(r * nc + j) * slen ..][0..slen], e.table.held[1][e.table.s_off + id * slen ..][0..slen]);
             };
-            engaged.engram_held = false;
-            const got = (try engramHeld(&sc, m, &e, ids, 2, 1, nc, 0, R, x)) orelse return error.Declined;
-            try testing.expect(engaged.engram_held);
-            const copied = (try engramWrite(&sc, m, &e, raw, x)) orelse return error.Declined;
+            const got = (try heldWrite(&sc, m, &e, ids, 2, 1, nc, 0, R, x)) orelse return error.Declined;
+            const copied = (try copiedWrite(&sc, m, &e, raw, x)) orelse return error.Declined;
             const rows = try sc.reshape(try sc.keep(try e.table.dequant(raw, R * nc, s)), &.{ ci(R), ci(K) });
             const chain = try dsv41.engramApply(&sc, m, &e, x, rows);
             // The plant: every id one row on.
             const off = try gpa.dupe(u32, ids);
             defer gpa.free(off);
             for (off) |*v| v.* = (v.* + 1) % @as(u32, @intCast(n_rows));
-            const plant = (try engramHeld(&sc, m, &e, off, 2, 1, nc, 0, R, x)) orelse return error.Declined;
+            const plant = (try heldWrite(&sc, m, &e, off, 2, 1, nc, 0, R, x)) orelse return error.Declined;
             const xh = try dsv41.hostF32(x);
             defer gpa.free(xh);
             var inc: [4][]f32 = undefined;
@@ -922,14 +855,11 @@ test "dsv41 fuse engram (resident): the wkv gathered by id out of the held table
     }
 }
 
-test "dsv41 fuse engram (resident): a prompt span's rows gathered by id on the GPU from the held table are the host-copied rows dequantized to bf16, bit for bit, 64 rows of 24 x 256, mxfp4 and mxfp8; ids one row off differ" {
+test "dsv41 engram wrapped (resident): a span's rows gathered by id on the GPU from the held table are the host-copied rows dequantized to bf16, bit for bit, 64 rows of 24 x 256, mxfp4 and mxfp8; ids one row off differ" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const fx = try fixture.Fixture.init(gpa, .{ .lo = 0, .hi = 1, .ctx = 8, .fused = true });
     defer fx.deinit();
-    const m = fx.m;
-    m.fuse.engram = true;
-    defer m.fuse.engram = false;
     const s = mlx.gpuStream();
     const hd: usize = 256;
     const nc: usize = 24;
@@ -960,12 +890,10 @@ test "dsv41 fuse engram (resident): a prompt span's rows gathered by id on the G
             @memcpy(raw.w[i * wlen ..][0..wlen], e.table.held[0][e.table.w_off + id * wlen ..][0..wlen]);
             @memcpy(raw.s[i * slen ..][0..slen], e.table.held[1][e.table.s_off + id * slen ..][0..slen]);
         }
-        engaged.engram_rows_held = false;
-        const got = (try engramRowsHeld(&sc, m, &e, ids, 1, 0, nc, 0, L)) orelse return error.Declined;
-        try testing.expect(engaged.engram_rows_held);
+        const got = (try heldRows(&sc, &e, ids, 1, 0, nc, 0, L)) orelse return error.Declined;
         const want = try sc.keep(try e.table.dequantTo(raw, L * nc, .bfloat16, s));
         for (ids) |*v| v.* = (v.* + 1) % @as(u32, @intCast(n_rows));
-        const plant = (try engramRowsHeld(&sc, m, &e, ids, 1, 0, nc, 0, L)) orelse return error.Declined;
+        const plant = (try heldRows(&sc, &e, ids, 1, 0, nc, 0, L)) orelse return error.Declined;
         const gb = try dkern.moe_up.bitsOf(got);
         defer gpa.free(gb);
         const wb = try dkern.moe_up.bitsOf(want);
