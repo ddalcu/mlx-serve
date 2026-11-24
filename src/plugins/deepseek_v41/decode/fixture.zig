@@ -39,6 +39,8 @@ pub const Opts = struct {
     experts_nvfp4: bool = false,
     /// ModelOpt's per-expert globals beside the routed experts, under the converter's names.
     expert_scales: ExpertScales = .none,
+    /// An mxfp8 linear's base name whose first row's first 32-group is zeroed under e8m0 scale code 250 (`plantCode`).
+    plant: ?[]const u8 = null,
 };
 
 /// The per-expert global tensors a fixture writes: none, all three in (0.5, 2), or a set the load refuses.
@@ -68,6 +70,7 @@ pub const Fixture = struct {
             try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4, opts.experts_affine);
             try fx.putExpertScales("layers.{d}.", li, opts.experts, opts.expert_scales);
         }
+        if (opts.plant) |base| try fx.plantCode(base);
         if (opts.tp) |t| try fx.sliceShard(t);
         fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = .{ .lo = opts.lo, .hi = opts.hi, .worker = true }, .act = opts.act, .tp = opts.tp });
         errdefer fx.m.deinit();
@@ -149,6 +152,31 @@ pub const Fixture = struct {
             try mlx.check(mlx.mlx_array_eval(copy));
             _ = mlx.mlx_array_free(kv.value_ptr.*);
             kv.value_ptr.* = copy;
+        }
+    }
+
+    /// `Opts.plant`: MLX reads the group as 0 x 2^123 = 0, an e8m0 read as a float exponent times 2^8 as 0 x +Inf.
+    fn plantCode(fx: *Fixture, base: []const u8) !void {
+        var nb: [160]u8 = undefined;
+        for ([_][]const u8{ ".weight", ".scales" }, 0..) |part, k| {
+            const p = fx.w.map.getPtr(try std.fmt.bufPrint(&nb, "{s}{s}", .{ base, part })) orelse return error.PlantMissing;
+            try mlx.check(mlx.mlx_array_eval(p.*));
+            const shape = mlx.getShape(p.*);
+            const n = mlx.mlx_array_size(p.*);
+            var b: A = undefined;
+            if (k == 0) {
+                const words = try fx.gpa.dupe(u32, (mlx.mlx_array_data_uint32(p.*) orelse return error.NoData)[0..n]);
+                defer fx.gpa.free(words);
+                @memset(words[0..8], 0);
+                b = mlx.mlx_array_new_data(words.ptr, shape.ptr, @intCast(shape.len), .uint32);
+            } else {
+                const codes = try fx.gpa.dupe(u8, (mlx.mlx_array_data_uint8(p.*) orelse return error.NoData)[0..n]);
+                defer fx.gpa.free(codes);
+                codes[0] = 250;
+                b = mlx.mlx_array_new_data(codes.ptr, shape.ptr, @intCast(shape.len), .uint8);
+            }
+            _ = mlx.mlx_array_free(p.*);
+            p.* = b;
         }
     }
 

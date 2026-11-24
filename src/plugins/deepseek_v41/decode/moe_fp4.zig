@@ -129,8 +129,9 @@ pub fn moeUpScaled(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernels, 
 
 /// `MLX_SERVE_DSV41_FP4_READS` (on by default, read every call) as the kernels' template int `FR`: 0 MLX's shared-down reads and an
 /// equal-scale NVFP4 span in MXFP4's order, 1 the bit-placement reads and each 16-group apart. Logged once when on.
+/// Off where the load found a shared down code these reads take apart from MLX's (`fp8_codes.settle`).
 pub fn fp4Reads() c_int {
-    if (!env.onUnlessZero(.MLX_SERVE_DSV41_FP4_READS)) return 0;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_FP4_READS) or !decode.fp8_codes.ps().reads) return 0;
     if (!fp4_reads_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info("[dsv41] MLX_SERVE_DSV41_FP4_READS engaged\n", .{});
     return 1;
 }

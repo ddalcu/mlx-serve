@@ -2701,6 +2701,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         m.lhs_gu = try m.own(mlx.mlx_array_new_data(&ks, &[_]c_int{ 1, ci(k) }, 2, .uint32));
     }
     try evalWeights(m);
+    try dkern.fp8_codes.settle(m);
     try holdEngram(m);
     passSettle(m);
     try fusion.settle(m);
