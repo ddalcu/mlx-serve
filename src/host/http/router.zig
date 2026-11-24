@@ -47,6 +47,7 @@ const handleDetokenize = @import("../api/tokenize.zig").handleDetokenize;
 const handleChatCompletions = @import("../api/chat_completions.zig").handleChatCompletions;
 const handleCompletions = @import("../api/completions.zig").handleCompletions;
 const handleCacheImport = @import("../api/cache_transfer.zig").handleCacheImport;
+const cache_rdma = @import("../api/cache_rdma.zig");
 const sendResponse = @import("respond.zig").sendResponse;
 const sendResponseQuiet = @import("respond.zig").sendResponseQuiet;
 const logHttpRequest = @import("respond.zig").logHttpRequest;
@@ -171,6 +172,7 @@ pub const max_cache_export_bytes: usize = max_cache_transfer_body_bytes;
 pub fn maxRequestBytesFor(target: []const u8) usize {
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
     if (isRoute(path, "/v1/cache/import")) return max_cache_transfer_body_bytes + 16 * 1024;
+    if (cache_rdma.isRdmaPath(path)) return 1024 * 1024;
     for ([_][]const u8{ "/v1/images/", "/v1/video/", "/v1/audio/", "/v1/3d/" }) |p|
         if (std.mem.startsWith(u8, path, p)) return max_media_request_bytes;
     if (isRoute(path, "/v1/decisions") or isRoute(path, "/v1/systemone")) return max_decision_request_bytes;
@@ -225,6 +227,10 @@ pub fn handleConnection(
         return;
     }
     stream.noteRequestHeadersAt(request[0..header_end_pos], raw.header_read_ms);
+    if (cache_rdma.isRdmaPath(path)) {
+        try cache_rdma.handleRequest(allocator, stream, method, raw_path, path, request[0..header_end_pos], request_body);
+        return;
+    }
     const cache_import = isRoute(path, "/v1/cache/import");
     const cache_internal = stream.cache_export or cache_import;
     if (cache_internal) {

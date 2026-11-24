@@ -16,6 +16,7 @@ const testing = std.testing;
 const http_server = @import("../http/server.zig");
 const plugin_loader = @import("../plugins/loader.zig");
 const auth = @import("../http/auth.zig");
+const cache_rdma = @import("cache_rdma.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
 const KvAttnMode = @import("request_options.zig").KvAttnMode;
@@ -105,9 +106,9 @@ pub fn ngramWarmPropsJson(allocator: std.mem.Allocator, bytes: u64, total: u64) 
     return std.fmt.allocPrint(allocator, ",\"ngram_warm\":{{\"bytes\":{d},\"total\":{d}}}", .{ bytes, total });
 }
 
-/// The /props "cache_transfer" object: advertises whether HTTP (and later RDMA) KV-cache transfer is enabled.
-pub fn cacheTransferPropsJson(allocator: std.mem.Allocator, enabled: bool) ![]u8 {
-    return std.fmt.allocPrint(allocator, ",\"cache_transfer\":{{\"enabled\":{},\"http\":{},\"rdma\":false}}", .{ enabled, enabled });
+/// The /props "cache_transfer" object: advertises whether HTTP and RDMA KV-cache transfer are enabled.
+pub fn cacheTransferPropsJson(allocator: std.mem.Allocator, enabled: bool, rdma: bool) ![]u8 {
+    return std.fmt.allocPrint(allocator, ",\"cache_transfer\":{{\"enabled\":{},\"http\":{},\"rdma\":{}}}", .{ enabled, enabled, enabled and rdma });
 }
 
 /// Effective per-model serving settings, resolved the way a request that sends no overrides sees them.
@@ -292,7 +293,8 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
     defer allocator.free(cluster_json);
     const plugins_json = try plugin_loader.processStatusJson(allocator, auth.peerIsLoopback(stream));
     defer allocator.free(plugins_json);
-    const cache_transfer_json = try cacheTransferPropsJson(allocator, http_server.g_cache_transfer.enabled());
+    const ct_enabled = http_server.g_cache_transfer.enabled();
+    const cache_transfer_json = try cacheTransferPropsJson(allocator, ct_enabled, ct_enabled and cache_rdma.isAvailable());
     defer allocator.free(cache_transfer_json);
     const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s},\"plugins\":{s},\"registry_generation\":{d}", .{ engine_json, batching_json, settings_json, cluster_json, cache_transfer_json, plugins_json, registryGeneration() });
     defer allocator.free(extra_json);
@@ -337,7 +339,8 @@ pub fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     defer allocator.free(cluster_json);
     const plugins_json = try plugin_loader.processStatusJson(allocator, auth.peerIsLoopback(stream));
     defer allocator.free(plugins_json);
-    const cache_transfer_json = try cacheTransferPropsJson(allocator, http_server.g_cache_transfer.enabled());
+    const ct_enabled = http_server.g_cache_transfer.enabled();
+    const cache_transfer_json = try cacheTransferPropsJson(allocator, ct_enabled, ct_enabled and cache_rdma.isAvailable());
     defer allocator.free(cache_transfer_json);
     const body = try std.fmt.allocPrint(allocator,
         \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s}{s},"plugins":{s},"registry_generation":{d}}}
@@ -604,15 +607,17 @@ test "cacheTransferPropsJson advertises cache_transfer capability" {
     var config = model_mod.ModelConfig{};
     config.model_type = "deepseek_v41";
     for ([_]bool{ false, true }) |enabled| {
-        const frag = try cacheTransferPropsJson(testing.allocator, enabled);
-        defer testing.allocator.free(frag);
-        const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, frag);
-        defer testing.allocator.free(body);
-        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
-        defer parsed.deinit();
-        const ct = (parsed.value.object.get("cache_transfer") orelse return error.MissingCacheTransfer).object;
-        try testing.expectEqual(enabled, ct.get("enabled").?.bool);
-        try testing.expectEqual(enabled, ct.get("http").?.bool);
-        try testing.expectEqual(false, ct.get("rdma").?.bool);
+        for ([_]bool{ false, true }) |rdma| {
+            const frag = try cacheTransferPropsJson(testing.allocator, enabled, rdma);
+            defer testing.allocator.free(frag);
+            const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, frag);
+            defer testing.allocator.free(body);
+            var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+            defer parsed.deinit();
+            const ct = (parsed.value.object.get("cache_transfer") orelse return error.MissingCacheTransfer).object;
+            try testing.expectEqual(enabled, ct.get("enabled").?.bool);
+            try testing.expectEqual(enabled, ct.get("http").?.bool);
+            try testing.expectEqual(enabled and rdma, ct.get("rdma").?.bool);
+        }
     }
 }

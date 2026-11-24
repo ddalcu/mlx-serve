@@ -55,6 +55,7 @@ pub const table: host.Api = .{
     .model_props = configure_mod.modelProps,
     .model_props_json = configure_mod.modelPropsJson,
     .cluster_json = configure_mod.clusterJson,
+    .cluster_active = distributed.isActive,
     .plugin_stub = pluginStub,
     .gauges = configure_mod.gauges,
     .run_offline = @import("offline.zig").run,

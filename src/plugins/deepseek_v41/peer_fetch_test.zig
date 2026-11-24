@@ -8,6 +8,7 @@ const model = @import("../../sdk/config/model.zig");
 const driver = @import("../../engines/mlx/plugin/driver.zig");
 const fixture = @import("../deepseek_v4/fixture.zig");
 const cache_transfer = @import("../../host/api/cache_transfer.zig");
+const cache_rdma = @import("../../host/api/cache_rdma.zig");
 const prefix_cache = @import("../../engines/mlx/cache/prefix_cache.zig");
 const peer_wire = @import("../../engines/mlx/cache/peer_wire.zig");
 const peer_transfer = @import("../../engines/mlx/cache/peer_transfer.zig");
@@ -2274,4 +2275,181 @@ test "dsv41 peer fetch: HTTP cache import accepts a body above 512 MiB when slow
     try expectStatus("import_over_512m_reaches_transfer_decoder", 400, reply);
     try testing.expect(std.mem.indexOf(u8, reply.raw, "cache_transfer_too_large") == null);
     try testing.expectEqual(@as(u64, 0), http_server.cacheTransferReservedBytes());
+}
+
+fn sendRdmaHttp(
+    io: std.Io,
+    node: *LiveNode,
+    mgr: *cache_rdma.Manager,
+    method: []const u8,
+    raw_path: []const u8,
+    auth_hdr: []const u8,
+    body: []const u8,
+) !HttpReply {
+    const prev_reg = http_server.global_registry;
+    const prev_sch = http_server.launch().global_scheduler;
+    http_server.global_registry = node.reg;
+    http_server.launch().global_scheduler = node.sch;
+    defer {
+        http_server.global_registry = prev_reg;
+        http_server.launch().global_scheduler = prev_sch;
+    }
+
+    var sockets: [2]std.posix.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), std.c.socketpair(1, 1, 0, &sockets));
+    defer _ = std.c.close(sockets[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sockets[0], .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 50000 } } } }, io);
+    defer conn.close();
+
+    var hdr_buf: [512]u8 = undefined;
+    const hdrs = try std.fmt.bufPrint(&hdr_buf, "{s} {s} HTTP/1.1\r\nAuthorization: {s}\r\n", .{ method, raw_path, auth_hdr });
+    const path = if (std.mem.indexOfScalar(u8, raw_path, '?')) |q| raw_path[0..q] else raw_path;
+    try cache_rdma.handleRequestOn(mgr, testing.allocator, &conn, method, raw_path, path, hdrs, body);
+    try conn.flush();
+    try testing.expectEqual(@as(c_int, 0), std.c.shutdown(sockets[0], 1));
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.recv(sockets[1], &tmp, tmp.len, 0);
+        if (n <= 0) break;
+        try out.appendSlice(testing.allocator, tmp[0..@intCast(n)]);
+    }
+    const raw = try out.toOwnedSlice(testing.allocator);
+    errdefer testing.allocator.free(raw);
+    const sp = std.mem.indexOfScalar(u8, raw, ' ') orelse return error.MalformedResponse;
+    const status = try std.fmt.parseInt(u16, raw[sp + 1 .. sp + 4], 10);
+    const body_part = (std.mem.cut(u8, raw, "\r\n\r\n") orelse return error.MalformedResponse)[1];
+    return .{ .status = status, .raw = raw, .body = body_part };
+}
+
+test "dsv41 peer fetch: RDMA offer -> accept -> pull -> delete transfers live KV cache and hits warm B turn" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try testing.expectEqual(@as(u64, 0), http_server.cacheTransferReservedBytes());
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const prev_ct = http_server.g_cache_transfer;
+    defer http_server.g_cache_transfer = prev_ct;
+    const transfer_key = "rdma-transfer-key-0123456789abcdef0123";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(transfer_key, &digest, .{});
+    http_server.g_cache_transfer = .{ .key = digest };
+    const auth_hdr = "Bearer " ++ transfer_key;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41ServableFiles(arena.allocator(), 7);
+    const loopback: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 50000 } };
+
+    const turn1_body = "{\"messages\":[{\"role\":\"user\",\"content\":\"Explain cache locality in systems programming.\"}],\"temperature\":0,\"max_tokens\":4,\"stream\":false}";
+    const turn2_body = "{\"messages\":[{\"role\":\"user\",\"content\":\"Explain cache locality in systems programming.\"},{\"role\":\"assistant\",\"content\":\"hi\"},{\"role\":\"user\",\"content\":\"Now add one example.\"}],\"temperature\":0,\"max_tokens\":6,\"stream\":false}";
+
+    var fabric = cache_rdma.LoopbackFabric.init(testing.allocator);
+    defer fabric.deinit();
+    var src_mgr: cache_rdma.Manager = .{ .transport = fabric.transport() };
+    defer src_mgr.deinitAll(io);
+    var dst_mgr: cache_rdma.Manager = .{ .transport = fabric.transport() };
+    defer dst_mgr.deinitAll(io);
+
+    const node_a = try LiveNode.open(io, files);
+    defer node_a.close();
+    const node_b = try LiveNode.open(io, files);
+    defer node_b.close();
+
+    // Seed session on node A with X-Session-Key.
+    {
+        var t1 = try sendHttp(io, node_a, loopback, "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nX-Session-Key: rdma-live-sess\r\n", turn1_body);
+        defer t1.deinit(testing.allocator);
+        try expectStatus("rdma_seed_turn1_200", 200, t1);
+    }
+
+    // Step 1: Offer Turn-1 session KV on node A BEFORE running reference Turn 2 on node A.
+    var offer_rep = try sendRdmaHttp(io, node_a, &src_mgr, "POST", "/v1/cache/rdma/offer", auth_hdr, "{\"session_key\":\"rdma-live-sess\",\"peer_id\":\"peer-b\",\"rdma_dev\":\"rdma_en2\",\"expires_ms\":30000}");
+    defer offer_rep.deinit(testing.allocator);
+    try expectStatus("rdma_offer_200", 200, offer_rep);
+    const offer_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, offer_rep.body, .{});
+    defer offer_parsed.deinit();
+    const o = offer_parsed.value.object;
+    const tid = o.get("transfer_id").?.string;
+    const byte_len: u64 = @intCast(o.get("byte_len").?.integer);
+    try testing.expect(byte_len > peer_wire.FIXED_HEADER_BYTES);
+    try testing.expectEqual(byte_len, http_server.cacheTransferReservedBytes());
+
+    // Reference Turn 2 on node A (restores Turn-1 KV).
+    var a_turn2 = try sendHttp(io, node_a, loopback, "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nX-Session-Key: rdma-live-sess\r\n", turn2_body);
+    defer a_turn2.deinit(testing.allocator);
+    try expectStatus("rdma_node_a_turn2_200", 200, a_turn2);
+
+    // Step 1.5: Out-of-band QP accept (dst with reset=true, then src with transfer_id).
+    const dst_acc_body = try std.fmt.allocPrint(testing.allocator, "{{\"peer_id\":\"peer-a\",\"rdma_dev\":\"rdma_en2\",\"peer_gid\":\"{s}\",\"peer_qpn\":{d},\"peer_psn\":{d},\"reset\":true}}", .{
+        o.get("gid").?.string, o.get("qpn").?.integer, o.get("psn").?.integer,
+    });
+    defer testing.allocator.free(dst_acc_body);
+    var dst_acc = try sendRdmaHttp(io, node_b, &dst_mgr, "POST", "/v1/cache/rdma/accept", auth_hdr, dst_acc_body);
+    defer dst_acc.deinit(testing.allocator);
+    try expectStatus("rdma_dst_accept_200", 200, dst_acc);
+    const dst_acc_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, dst_acc.body, .{});
+    defer dst_acc_parsed.deinit();
+
+    const src_acc_body = try std.fmt.allocPrint(testing.allocator, "{{\"transfer_id\":\"{s}\",\"peer_id\":\"peer-b\",\"rdma_dev\":\"rdma_en2\",\"peer_gid\":\"{s}\",\"peer_qpn\":{d},\"peer_psn\":{d}}}", .{
+        tid,
+        dst_acc_parsed.value.object.get("gid").?.string,
+        dst_acc_parsed.value.object.get("qpn").?.integer,
+        dst_acc_parsed.value.object.get("psn").?.integer,
+    });
+    defer testing.allocator.free(src_acc_body);
+    var src_acc = try sendRdmaHttp(io, node_a, &src_mgr, "POST", "/v1/cache/rdma/accept", auth_hdr, src_acc_body);
+    defer src_acc.deinit(testing.allocator);
+    try expectStatus("rdma_src_accept_200", 200, src_acc);
+
+    // Step 2: Pull on node B -> RDMA transfer + peer_wire decode + HotPrefixCache commit.
+    const pull_body = try std.fmt.allocPrint(testing.allocator, "{{\"transfer_id\":\"{s}\",\"session_key\":\"rdma-live-sess\",\"peer_id\":\"peer-a\",\"rdma_dev\":\"rdma_en2\",\"deadline_ms\":30000,\"offer\":{s}}}", .{ tid, offer_rep.body });
+    defer testing.allocator.free(pull_body);
+    var pull_rep = try sendRdmaHttp(io, node_b, &dst_mgr, "POST", "/v1/cache/rdma/pull", auth_hdr, pull_body);
+    defer pull_rep.deinit(testing.allocator);
+    try expectStatus("rdma_pull_200", 200, pull_rep);
+    try testing.expectEqual(@as(usize, 1), fabric.reads_completed);
+    try testing.expectEqual(byte_len, fabric.bytes_transferred);
+
+    // Step 3: Clean unpin on node A releases pinned buffer & export byte budget.
+    const del_path = try std.fmt.allocPrint(testing.allocator, "/v1/cache/rdma/offer/{s}?clean=1", .{tid});
+    defer testing.allocator.free(del_path);
+    var del_rep = try sendRdmaHttp(io, node_a, &src_mgr, "DELETE", del_path, auth_hdr, "");
+    defer del_rep.deinit(testing.allocator);
+    try expectStatus("rdma_delete_200", 200, del_rep);
+    try testing.expectEqual(@as(u64, 0), http_server.cacheTransferReservedBytes());
+
+    // Turn 2 on node B hits the RDMA-imported prefix cache with bit-exact greedy output.
+    var b_turn2 = try sendHttp(io, node_b, loopback, "POST /v1/chat/completions HTTP/1.1\r\nContent-Type: application/json\r\nX-Session-Key: rdma-live-sess\r\n", turn2_body);
+    defer b_turn2.deinit(testing.allocator);
+    try expectStatus("rdma_node_b_turn2_200", 200, b_turn2);
+
+    const a_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, a_turn2.body, .{});
+    defer a_parsed.deinit();
+    const b_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, b_turn2.body, .{});
+    defer b_parsed.deinit();
+    const a_cached = a_parsed.value.object.get("usage").?.object.get("prompt_tokens_details").?.object.get("cached_tokens").?.integer;
+    const b_cached = b_parsed.value.object.get("usage").?.object.get("prompt_tokens_details").?.object.get("cached_tokens").?.integer;
+    try testing.expect(a_cached > 0);
+    try testing.expectEqual(a_cached, b_cached);
+
+    const a_msg = a_parsed.value.object.get("choices").?.array.items[0].object.get("message").?.object;
+    const b_msg = b_parsed.value.object.get("choices").?.array.items[0].object.get("message").?.object;
+    const a_content = if (a_msg.get("content")) |v| (if (v == .string) v.string else "") else "";
+    const b_content = if (b_msg.get("content")) |v| (if (v == .string) v.string else "") else "";
+    try testing.expectEqualStrings(a_content, b_content);
+
+    // Quiesce tears down all QPs cleanly on both nodes.
+    var qa = try sendRdmaHttp(io, node_a, &src_mgr, "POST", "/v1/cache/rdma/quiesce", auth_hdr, "{}");
+    defer qa.deinit(testing.allocator);
+    try expectStatus("rdma_quiesce_a_200", 200, qa);
+    var qb = try sendRdmaHttp(io, node_b, &dst_mgr, "POST", "/v1/cache/rdma/quiesce", auth_hdr, "{}");
+    defer qb.deinit(testing.allocator);
+    try expectStatus("rdma_quiesce_b_200", 200, qb);
+    try testing.expectEqual(@as(usize, 0), src_mgr.activeQpCount(io));
+    try testing.expectEqual(@as(usize, 0), dst_mgr.activeQpCount(io));
 }
