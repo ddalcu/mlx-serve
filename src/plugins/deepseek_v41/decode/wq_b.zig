@@ -1004,7 +1004,7 @@ test "dsv41 dec wq_b: the declared launch is the wrapper's dispatch, with and wi
     var set = kc.Set.init(testing.allocator);
     defer set.deinit();
     try register(&set);
-    try testing.expectEqual(@as(usize, 3), set.kernels.items.len);
+    try testing.expectEqual(@as(usize, 2), set.kernels.items.len);
     const fx = try fixture.Fixture.init(testing.allocator, .{ .lo = 20, .hi = 21, .experts = 2, .ctx = 0 });
     defer fx.deinit();
     var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
