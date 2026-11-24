@@ -1150,4 +1150,5 @@ test {
     _ = @import("contract.zig");
     _ = @import("decode/decode.zig");
     _ = @import("ablation_test.zig");
+    _ = @import("tf32_test.zig");
 }
