@@ -1943,10 +1943,7 @@ test "dsv41 wide tol: MLX_SERVE_DSV41_FLASH_ATTN's heads, alone and beside FLASH
     const kp = try flashKernel(false, false, 1);
     defer _ = mlx.mlx_fast_metal_kernel_free(kp);
     var m: dsv41.Dsv41Model = undefined;
-    m.cfg = .{};
-    m.cfg.sliding_window = WIN;
-    m.cfg.dsv4_o_groups = OG;
-    m.cfg.dsv4_rope_head_dim = 64;
+    attnModel(&m, .bfloat16);
     var ok = true;
     for (span_cases, 0..) |c, ci_| {
         var s = try Span.init(&sc, c, 40 + 10 * ci_);
@@ -2000,6 +1997,22 @@ const odd_spans = [_]SpanCase{
     span_cases[3],
 };
 
+/// Spans a call outside a wide layer hands the flash kernel (`attnCore`): first turns of 18, 100 and 200 tokens on a
+/// ratio-2 and a ratio-1 layer (no window rows before the call, so fewer keys than the window), rewinds of 7 and 12
+/// rows, a 450-token prompt's CED replay, a 600-token rewind's replay, a 150-row turn on a 549-token cached prefix.
+const served_spans = [_]SpanCase{
+    .{ .L = 17, .wp = 0, .nc = 8, .K = 8 },
+    .{ .L = 17, .wp = 0, .nc = 17, .K = 17 },
+    .{ .L = 99, .wp = 0, .nc = 49, .K = 49 },
+    .{ .L = 199, .wp = 0, .nc = 99, .K = 99 },
+    .{ .L = 199, .wp = 0, .nc = 199, .K = 199 },
+    .{ .L = 7, .wp = 0, .nc = 3, .K = 3 },
+    .{ .L = 12, .wp = 0, .nc = 12, .K = 12 },
+    .{ .L = 128, .wp = 0, .nc = 449, .K = 449 },
+    .{ .L = 128, .wp = 0, .nc = 300, .K = 300 },
+    .{ .L = 150, .wp = 127, .nc = 349, .K = 349 },
+};
+
 /// `attnGather`'s kernels as the load builds them: with `flash` the flash kernel under FLASH_ATTN and FLASH_TRIM (the
 /// release's defaults), else the gather alone (FLASH_ATTN=0).
 fn gatherAttn(flash: bool) !dsv41.GatherAttn {
@@ -2016,6 +2029,8 @@ fn attnModel(m: *dsv41.Dsv41Model, act: mlx.mlx_dtype) void {
     m.cfg.dsv4_o_groups = OG;
     m.cfg.dsv4_rope_head_dim = 64;
     m.act = act;
+    m.trace = null;
+    m.attn_f16 = false;
 }
 
 /// `[L, H, D]` heads laid out as the grouped kernels store them (`spanErrTo` reads that layout).
@@ -2055,7 +2070,188 @@ test "dsv41 wide: at the release's defaults on NAX a span whose picks are not a 
     }
 }
 
-test "dsv41 wide tol: FLASH_ATTN's heads at a pick count not a multiple of 64 (a short prompt's last span) are no farther from float64 than the f32 chain (=0) in l2 at f32 and bf16 out and in max at f32 out, under M5's TF32 (TF32 off printed); window keys a row late fail" {
+/// Each core's prompt-attention calls so far (`dsv41.core_calls`).
+fn coreCounts() [4]usize {
+    var o: [4]usize = undefined;
+    for (&o, &dsv41.core_calls) |*v, *c| v.* = c.load(.monotonic);
+    return o;
+}
+fn coresSince(from: [4]usize) [4]usize {
+    var o = coreCounts();
+    for (&o, from) |*v, f| v.* -= f;
+    return o;
+}
+fn core(d: [4]usize, c: dsv41.Core) usize {
+    return d[@intFromEnum(c)];
+}
+
+/// `n` prompt tokens of a request (`salt` keeps two requests' prefixes apart); the caller frees.
+fn tokens(n: usize, salt: usize, vocab: usize) ![]u32 {
+    const p = try testing.allocator.alloc(u32, n);
+    for (p, 0..) |*t, i| t.* = @intCast((i * 7919 + salt * 104729 + 11) % vocab);
+    return p;
+}
+
+/// The plugin's prompt calls on its live state as the engine makes them for a resident pack: `resumePrompt`, the rows
+/// past what it restored but the last token as one call, then the last token alone.
+const Served = struct {
+    m: *dsv41.Dsv41Model,
+
+    fn call(sv: Served, ids: []const u32) !void {
+        const out = try dsv41.extendResumable(sv.m, testing.allocator, ids, null);
+        defer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_array_eval(out));
+    }
+    fn turn(sv: Served, prompt: []const u32) !usize {
+        const n = try dsv41.resumePrompt(sv.m, prompt, null);
+        if (prompt.len - 1 > n) try sv.call(prompt[n .. prompt.len - 1]);
+        try sv.call(prompt[prompt.len - 1 ..]);
+        return n;
+    }
+};
+
+const Route = enum { first18, first100, first200, first450, follow700, rewind600, rewind12, chunks200, logprobs200, flash_named200 };
+
+/// `r` on the served model: each core's prompt-attention calls it made.
+fn servedRoute(sv: Served, r: Route, salt: usize) ![4]usize {
+    const V = sv.m.vocab;
+    const before = coreCounts();
+    switch (r) {
+        .first18, .first100, .first200, .first450, .flash_named200 => {
+            const n: usize = switch (r) {
+                .first18 => 18,
+                .first100 => 100,
+                .first450 => 450,
+                else => 200,
+            };
+            const p = try tokens(n, salt, V);
+            defer testing.allocator.free(p);
+            const explicit = fa.ps().explicit;
+            defer fa.ps().explicit = explicit;
+            fa.ps().explicit = r == .flash_named200;
+            try testing.expectEqual(@as(usize, 0), try sv.turn(p));
+        },
+        .follow700 => {
+            const p = try tokens(700, salt, V);
+            defer testing.allocator.free(p);
+            try testing.expectEqual(@as(usize, 0), try sv.turn(p[0..550]));
+            try testing.expectEqual(@as(usize, 549), try sv.turn(p));
+        },
+        .rewind600, .rewind12 => {
+            const p = try tokens(if (r == .rewind600) 600 else 12, salt, V);
+            defer testing.allocator.free(p);
+            _ = try sv.turn(p);
+            try dsv41.rewind(sv.m, testing.allocator, &sv.m.dec_state.?, p);
+            try sv.call(p[0..1]);
+        },
+        .chunks200 => {
+            const p = try tokens(601, salt, V);
+            defer testing.allocator.free(p);
+            _ = try dsv41.resumePrompt(sv.m, p, null);
+            var at: usize = 0;
+            while (at < 600) : (at += 200) try sv.call(p[at .. at + 200]);
+            try sv.call(p[600..]);
+        },
+        .logprobs200 => {
+            const p = try tokens(200, salt, V);
+            defer testing.allocator.free(p);
+            _ = try dsv41.resumePrompt(sv.m, p, null);
+            const out = try dsv41.extendAllResumable(sv.m, testing.allocator, p);
+            defer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_array_eval(out));
+        },
+    }
+    return coresSince(before);
+}
+
+test "dsv41 wide: on NAX at the release's defaults every prompt-attention call of a served request takes a lossless core (flash, the gather or the f32 chain), never the f16 core: first turns of 18, 100, 200 and 450 tokens (the CED replay), a cached-prefix turn to 700, rewinds of 600 and 12 rows, 200-row chunks, prompt logprobs, FLASH_ATTN=1 named; the fall-through before attnCore (planted) takes the f16 core" {
+    if (skip()) return error.SkipZigTest;
+    const saved = fa.ps().*;
+    defer fa.ps().* = saved;
+    fa.ps().* = .{ .mode = .on, .trim = true };
+    const fx = try fixture.Fixture.initFull(testing.allocator, 8, 1024, 1);
+    defer fx.deinit();
+    try testing.expect(fx.m.ced_split == 3 and !fx.m.attn_f16);
+    const sv: Served = .{ .m = fx.m };
+    for (std.enums.values(Route), 0..) |r, ri| {
+        const d = try servedRoute(sv, r, ri);
+        std.debug.print("[attn-core] {s}: flash {d}, gather {d}, f32 chain {d}, f16 core {d}\n", .{ @tagName(r), core(d, .flash), core(d, .gather), core(d, .f32), core(d, .f16) });
+        try testing.expectEqual(@as(usize, 0), core(d, .f16));
+        try testing.expect(core(d, .flash) > 0);
+    }
+    dsv41.core_plant = true;
+    defer dsv41.core_plant = false;
+    const d = try servedRoute(sv, .first200, 100);
+    std.debug.print("[attn-core] planted first200: gather {d}, f16 core {d}\n", .{ core(d, .gather), core(d, .f16) });
+    try testing.expect(core(d, .f16) > 0);
+}
+
+test "dsv41 wide: under FLASH_ATTN=0 a served 300-token prompt's spans whose picks are not a multiple of 64 take the f32 chain on NAX, never the f16 core; the fall-through before attnCore (planted) takes the f16 core" {
+    if (skip()) return error.SkipZigTest;
+    const saved = fa.ps().*;
+    defer fa.ps().* = saved;
+    fa.ps().* = .{};
+    const fx = try fixture.Fixture.initFull(testing.allocator, 8, 1024, 2);
+    defer fx.deinit();
+    const sv: Served = .{ .m = fx.m };
+    for ([_]bool{ false, true }) |plant| {
+        dsv41.core_plant = plant;
+        defer dsv41.core_plant = false;
+        const p = try tokens(300, @intFromBool(plant), fx.m.vocab);
+        defer testing.allocator.free(p);
+        const before = coreCounts();
+        _ = try sv.turn(p);
+        const d = coresSince(before);
+        std.debug.print("[attn-core] FLASH_ATTN=0 first300 (planted {}): gather {d}, f32 chain {d}, f16 core {d}\n", .{ plant, core(d, .gather), core(d, .f32), core(d, .f16) });
+        try testing.expectEqual(@as(usize, 0), core(d, .flash));
+        try testing.expect(core(d, .gather) > 0);
+        if (plant) try testing.expect(core(d, .f16) > 0) else try testing.expect(core(d, .f16) == 0 and core(d, .f32) > 0);
+    }
+}
+
+test "dsv41 wide: a tensor split's prompt-attention calls (32 heads a rank: no gather or flash shape) take the f32 chain on NAX, never the f16 core, one span and wide; the fall-through before attnCore (planted) takes the f16 core" {
+    if (skip()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const saved = fa.ps().*;
+    defer fa.ps().* = saved;
+    fa.ps().* = .{ .mode = .on, .trim = true };
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 22, .experts = 8, .ctx = 0, .experts_fp4 = true, .tp = .{ .rank = 1, .size = 2 } });
+    defer fx.deinit();
+    // The other rank's halves are not summed in: the cores, not the values, are under test.
+    const own = struct {
+        fn sum(x: A) anyerror!A {
+            var o = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&o, x);
+            return o;
+        }
+    }.sum;
+    dsv41.clusterHooks().tp_sum = &own;
+    defer dsv41.clusterHooks().tp_sum = null;
+    var p0: usize = 0;
+    for ([_]bool{ false, true }) |plant| {
+        dsv41.core_plant = plant;
+        defer dsv41.core_plant = false;
+        const before = coreCounts();
+        for ([_]usize{ 100, 2 * dsv41.SPAN + 8 }) |rows| {
+            const x = try fx.stream(rows);
+            defer _ = mlx.mlx_array_free(x);
+            const pre = try fx.cpre(rows);
+            defer _ = mlx.mlx_array_free(pre);
+            const out = try dsv41.workerStep(fx.m, gpa, x, pre, p0, false, false);
+            defer for (out) |o| {
+                _ = mlx.mlx_array_free(o);
+            };
+            try mlx.check(mlx.mlx_array_eval(out[0]));
+            p0 += rows;
+        }
+        const d = coresSince(before);
+        std.debug.print("[attn-core] tensor split (planted {}): flash {d}, gather {d}, f32 chain {d}, f16 core {d}\n", .{ plant, core(d, .flash), core(d, .gather), core(d, .f32), core(d, .f16) });
+        try testing.expect(core(d, .flash) == 0 and core(d, .gather) == 0);
+        if (plant) try testing.expect(core(d, .f16) > 0) else try testing.expect(core(d, .f16) == 0 and core(d, .f32) > 0);
+    }
+}
+
+test "dsv41 wide tol: FLASH_ATTN's heads at a pick count not a multiple of 64 (a short prompt's last span, and the calls outside a wide layer it serves: no window rows before the call, 7 to 199 rows, picks 3 to 449) are no farther from float64 than the f32 chain (=0) in l2 at f32 and bf16 out and in max at f32 out, under M5's TF32 (TF32 off printed); window keys a row late fail" {
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;
@@ -2072,7 +2268,7 @@ test "dsv41 wide tol: FLASH_ATTN's heads at a pick count not a multiple of 64 (a
     // The f32 chain's GEMMs are TF32 on NAX unless MLX_ENABLE_TF32=0 (read at the process's first matmul): M5's =0.
     const tf32 = device.tf32Matmul();
     var ok = true;
-    for (odd_spans, 0..) |c, ci_| {
+    for (odd_spans ++ served_spans, 0..) |c, ci_| {
         var s = try Span.init(&sc, c, 80 + 10 * ci_);
         defer s.deinit();
         const rows = [_]usize{ 0, 1, 2, c.L / 3, c.L / 2, c.L - 2, c.L - 1 };
@@ -2099,7 +2295,72 @@ test "dsv41 wide tol: FLASH_ATTN's heads at a pick count not a multiple of 64 (a
     try testing.expect(ok);
 }
 
-test "dsv41 wide meas: MLX_SERVE_DSV41_ATTN_F16's f16 core (LOSSY; it serves without NAX, or on NAX under FLASH_ATTN=0 at a pick count not a multiple of 64) against float64 beside the f32 chain (=0), printed, not gated, at the release's spans; keys a row late fail" {
+/// `got`, plain heads `[L, nh, HD]` (the f32 chain's), against the float64 heads `ref` (`spanRefs`) of its first `nh`
+/// heads at `rows`, unroped dims.
+fn plainErrTo(got: A, nh: usize, rows: []const usize, ref: []const f64) !FErr {
+    const g = try dsv41.hostF32(got);
+    defer testing.allocator.free(g);
+    var dd: f64 = 0;
+    var rr: f64 = 0;
+    var dm: f64 = 0;
+    var rm: f64 = 0;
+    for (rows, 0..) |l, i| for (0..nh) |h| for (0..PLAIN) |d| {
+        const w = ref[(i * HEADS + h) * PLAIN + d];
+        const x: f64 = g[(l * nh + h) * HD + d];
+        dd += (x - w) * (x - w);
+        rr += w * w;
+        dm = @max(dm, @abs(x - w));
+        rm = @max(rm, @abs(w));
+    };
+    return .{ .l2 = @sqrt(dd / rr), .max = dm / rm };
+}
+
+test "dsv41 wide tol: the f32 chain where attnCore's lossless cores end on NAX (a tensor split's 32 heads, f16 and f32 activations) is as close to float64 as at the release's 64 bf16 heads (=0 of FLASH_ATTN and ATTN_F16) on the same heads, within 1.1x in l2 at f32 and bf16 out and in max at f32 out; keys a row late fail" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const roll = struct {
+        fn of(sc_: *dsv41.Scope, x: A) !A {
+            const n: usize = @intCast(mlx.getShape(x)[0]);
+            return sc_.concat(&.{ try sc_.slice(x, 0, 1, n), try sc_.slice(x, 0, 0, 1) }, 0);
+        }
+    }.of;
+    const Arm = struct { name: []const u8, nh: usize, in: mlx.mlx_dtype };
+    const arms = [_]Arm{ .{ .name = "tensor split, 32 heads", .nh = 32, .in = .bfloat16 }, .{ .name = "f16 activations", .nh = HEADS, .in = .float16 }, .{ .name = "f32 activations", .nh = HEADS, .in = .float32 } };
+    const tf32 = device.tf32Matmul();
+    var ok = true;
+    for ([_]SpanCase{ span_cases[0], span_cases[1], odd_spans[0], odd_spans[4], served_spans[0], served_spans[7] }, 0..) |c, ci_| {
+        var s = try Span.init(&sc, c, 140 + 10 * ci_);
+        defer s.deinit();
+        const rows = [_]usize{ 0, 1, 2, c.L / 3, c.L / 2, c.L - 2, c.L - 1 };
+        const ref = try spanRefs(&s, &rows);
+        defer gpa.free(ref);
+        const band = try dsv41.windowBand(&sc, c.wp, c.L, WIN);
+        const topk = if (c.K > 0) s.picks else none;
+        for (arms) |arm| {
+            const q = try sc.astype(try sc.slice(s.q, 1, 0, arm.nh), arm.in);
+            const sink = try sc.slice(s.sink, 1, 0, arm.nh);
+            const keys = try sc.astype(s.keys_w, arm.in);
+            const comp = if (c.K > 0) try sc.astype(s.comp, arm.in) else none;
+            // [out: bf16, f32][the release's chain, this arm]
+            var e: [2][2]FErr = undefined;
+            for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }, 0..) |ot, oi| {
+                e[oi][0] = try plainErrTo(try sc.slice(try dsv41.attnWideF32(&sc, s.sink, s.q, s.keys_w, band, if (c.K > 0) s.comp else none, topk, Span.scale, ot), 1, 0, arm.nh), arm.nh, &rows, ref);
+                e[oi][1] = try plainErrTo(try dsv41.attnWideF32(&sc, sink, q, keys, band, comp, topk, Span.scale, ot), arm.nh, &rows, ref);
+            }
+            const bad = try plainErrTo(try dsv41.attnWideF32(&sc, sink, q, try roll(&sc, keys), band, if (c.K > 0) try roll(&sc, comp) else none, topk, Span.scale, .float32), arm.nh, &rows, ref);
+            const near = e[0][1].l2 <= 1.1 * e[0][0].l2 and e[1][1].l2 <= 1.1 * e[1][0].l2 and e[1][1].max <= 1.1 * e[1][0].max;
+            std.debug.print("[f32-chain] L={d} wp={d} K={d} {s} (TF32 {}): rel l2 / max vs float64, bf16 out: 64 bf16 heads {e:.4}/{e:.4}, this {e:.4}/{e:.4}; f32 out: 64 bf16 heads {e:.3}/{e:.3}, this {e:.3}/{e:.3}; within 1.1x {}; planted (keys a row late) {e:.3}/{e:.3}\n", .{ c.L, c.wp, c.K, arm.name, tf32, e[0][0].l2, e[0][0].max, e[0][1].l2, e[0][1].max, e[1][0].l2, e[1][0].max, e[1][1].l2, e[1][1].max, near, bad.l2, bad.max });
+            if (!near) ok = false;
+            try testing.expect(!(bad.l2 <= 1.1 * e[1][0].l2 and bad.max <= 1.1 * e[1][0].max));
+        }
+    }
+    try testing.expect(ok);
+}
+
+test "dsv41 wide meas: MLX_SERVE_DSV41_ATTN_F16's f16 core (LOSSY; it serves without NAX, on NAX only where ATTN_F16 is named on) against float64 beside the f32 chain (=0), printed, not gated, at the release's spans; keys a row late fail" {
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;

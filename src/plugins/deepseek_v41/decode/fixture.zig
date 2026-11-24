@@ -129,6 +129,28 @@ pub const Fixture = struct {
         return fx;
     }
 
+    /// A whole model (embedding, head and trunk; no pair, Engram or DSpark) over `full_ratios`' layers at the release's
+    /// attention shapes: ratio 0, then ratio 2 with a KV and index source and a layer reading it, then the CED decoder
+    /// at ratio 1 from its own source (the split), an index source and a reader. `vocab` rows of embedding and head.
+    /// Its state is `m.dec_state`, as the plugin serves it.
+    pub fn initFull(gpa: std.mem.Allocator, experts: u32, vocab: u32, seed: u64) !*Fixture {
+        mlx.installErrorHandler();
+        const fx = try gpa.create(Fixture);
+        errdefer gpa.destroy(fx);
+        const cfg = try fullConfig(experts, vocab);
+        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = seed };
+        errdefer fx.w.deinit();
+        const d: c_int = @intCast(cfg.hidden_size);
+        try fx.putLin("embed", .{}, &.{ @intCast(vocab), d }, .bf16);
+        try fx.putLin("head", .{}, &.{ @intCast(vocab), d }, .bf16);
+        try fx.putVec("norm.weight", .{}, &.{d}, .bfloat16, 1, 0.1);
+        for (0..full_ratios.len) |li| try fx.putLayer(&cfg, "layers.{d}.", li, experts, true, null);
+        fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{});
+        errdefer fx.m.deinit();
+        if (fx.m.dec_state == null) fx.m.dec_state = try dsv41.initState(fx.m, gpa);
+        return fx;
+    }
+
     /// Every tensor `Shard.axis` names cut to `t`'s part of its axis, in a buffer of its own.
     fn sliceShard(fx: *Fixture, t: Shard) !void {
         const s = mlx.gpuStream();
@@ -393,6 +415,28 @@ pub fn quantize(w: A, gs: c_int, bits: c_int, mode: [*:0]const u8) ![3]A {
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_eval(vec));
     return out;
+}
+
+/// `Fixture.initFull`'s layers' compress ratios.
+pub const full_ratios = [_]u8{ 0, 2, 2, 1, 1, 1 };
+
+/// The release's config cut to `full_ratios`' layers: KV sources 1 and 3 (3 the CED split, as 20 is the release's),
+/// index sources 1, 3 and 4, the candidate blocks from 3; no Engram, DSpark targets or vision.
+pub fn fullConfig(experts: u32, vocab: u32) !config.Config {
+    var cfg = try releaseConfig();
+    cfg.num_experts = experts;
+    cfg.vocab_size = vocab;
+    cfg.num_hidden_layers = full_ratios.len;
+    cfg.dsv4_n_compress_ratios = full_ratios.len;
+    @memset(&cfg.dsv4_compress_ratios, 0);
+    @memcpy(cfg.dsv4_compress_ratios[0..full_ratios.len], &full_ratios);
+    cfg.dsv41_kv_sources = (1 << 1) | (1 << 3);
+    cfg.dsv41_index_sources = (1 << 1) | (1 << 3) | (1 << 4);
+    cfg.dsv41_candidate_source = 3;
+    cfg.dsv41_n_engram_layers = 0;
+    cfg.dsv4_n_dspark_target_layers = 0;
+    cfg.dsv41_vision = false;
+    return cfg;
 }
 
 /// The release pack's config (`src/fixtures/model-configs`), parsed by the plugin.

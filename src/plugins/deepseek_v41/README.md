@@ -12,7 +12,7 @@ This plugin serves NVIDIA's `DeepSeek-V4.1-Flash-1017-NVFP4` checkpoint on Apple
 only the checkpoint's file headers, so the weights keep NVIDIA's bytes. The routed experts stay in NVFP4. The
 default configuration is lossless against the pack as shipped, with one stated exception: the plugin requantizes
 the LM head to 8 bits, and that head measured the same KLD as the bf16 head. Every other default-on switch except
-`ATTN_F16` (see "Gaps") is in one of four classes: EXACT, REORDER, DRAFT-ONLY or TF32. We tuned the defaults on an M5 Ultra with 512 GB. Other Macs get
+`ATTN_F16` (on only without neural accelerators, see "Gaps") is in one of four classes: EXACT, REORDER, DRAFT-ONLY or TF32. We tuned the defaults on an M5 Ultra with 512 GB. Other Macs get
 the same defaults, and a Mac that cannot hold the pack refuses the load. On that machine the full 1,048,576-token
 context fits. DeepSeek's own drafter (DSpark) speeds up decode. HumanEval, the long-context sweep and the final
 numbers on the release head are not done yet.
@@ -312,7 +312,7 @@ and the commit that added the switch.
 | SPEC_SYNC | Greedy accept on the GPU; next draft queued behind the verify | DRAFT-ONLY | A/B text |
 | DRAFT_VOCAB_PROMPT | A request's prompt ids join the draft vocabulary | DRAFT-ONLY | test |
 | HEAD8 | LM head requantized to 8-bit g64 | Requantized (KLD equal) | KLD measurement |
-| ATTN_F16 | f16 attention core | Not classed; does not serve on M5 (see "Gaps") | none |
+| ATTN_F16 | f16 attention core | Not classed; off on M5, where a call that flash and the gather do not take runs the f32 chain (see "Gaps") | float64 measurement, printed |
 
 Engine variables on the DeepSeek path: `MLX_SERVE_DSV4_DSPARK` (REORDER: the verify's multi-row kernels),
 `MLX_SERVE_DSPARK_POLICY2` and `MLX_SERVE_DSPARK_POLICY2_MODELED` (DRAFT-ONLY: they pick verify widths) and
@@ -376,7 +376,7 @@ numbers on the release head are not done yet.
   that differ, its float64 l2 was 7.5 times the split path's, against a bound of 4. The release needs a ruling on
   that test before it ships.
 
-<!-- src: deepseek_v41.zig:3876-3887 (f16 core only where the gather does not serve; the gather serves on NAX);
+<!-- src: deepseek_v41.zig attnCore and attnF16At (on NAX the f16 core only when ATTN_F16 is named on);
      audit.md table C (ATTN_F16, HEAD8) -->
 
 ## Terms

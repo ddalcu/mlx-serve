@@ -4846,7 +4846,9 @@ const flash_trim_psum_l = metal.Launch{ .name = "dsv41_attn_flash_trim_psum", .i
 const gather_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 } };
 /// The flash kernel's: the gather's, and pick counts not a multiple of 64 (a short prompt's last span, which the gather
 /// declines).
-const flash_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 }, .{ .rows = 3, .n = HEADS, .k = 150 }, .{ .rows = 4, .n = HEADS, .k = 200 }, .{ .rows = 5, .n = HEADS, .k = 500 }, .{ .rows = 3, .n = HEADS, .k = 511 } };
+const flash_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 }, .{ .rows = 3, .n = HEADS, .k = 150 }, .{ .rows = 4, .n = HEADS, .k = 200 }, .{ .rows = 5, .n = HEADS, .k = 500 }, .{ .rows = 3, .n = HEADS, .k = 511 }, .{ .rows = 2, .n = HEADS, .k = 8 }, .{ .rows = 3, .n = HEADS, .k = 17 }, .{ .rows = 4, .n = HEADS, .k = 99 } };
+/// A call with no window rows before it (a replay tail, a short first turn: fewer keys than the window), `wp = 0`.
+const flash_first_served: []const Shape = &.{ .{ .rows = 7, .n = HEADS, .k = 3 }, .{ .rows = 12, .n = HEADS, .k = 12 }, .{ .rows = 17, .n = HEADS, .k = 8 }, .{ .rows = 5, .n = HEADS, .k = 99 }, .{ .rows = 3, .n = HEADS, .k = 449 } };
 const qk_t_l = metal.Launch{ .name = "dsv41_attn_qk_t", .inputs = &.{ "q", "kw", "comp", "picks", "meta", "qt" }, .outputs = &.{"s"}, .source = qtail.attn_qk_t_source, .header = v41.MPP_HEADER, .tg_bytes = 2 * 64 * 64 * 2, .offline = false, .min_gen = 17 };
 /// The slicing a variant's contract cases run at.
 fn v2Slices(p: hv2.Pro) usize {
@@ -5422,6 +5424,15 @@ fn registerStreamed(set: *kc.Set) !void {
         .out = .bf16,
         .nax = true,
         .served = flash_served,
+        .sums = .{ .exact = false },
+    });
+    inline for (.{ true, false }) |qt| try kit.add(set, AttnFlash, &flash_trim_l, .{ .qt = qt, .wp = 0, .nc = 500 }, .{
+        .name = if (qt) "dsv41 attn_flash trim (no window rows before the call, the roped tail from qt)" else "dsv41 attn_flash trim (no window rows before the call)",
+        .accum = .f32,
+        .depth = kc.host.depthOne,
+        .out = .bf16,
+        .nax = true,
+        .served = flash_first_served,
         .sums = .{ .exact = false },
     });
     // FLASH_TRIM and FLASH_PSUM together: the same bound.
