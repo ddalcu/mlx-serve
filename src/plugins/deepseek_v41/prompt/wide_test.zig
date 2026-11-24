@@ -262,13 +262,11 @@ fn rolled(sc: *dsv41.Scope, wts: A) !A {
     return sc.concat(&.{ try sc.slice(wts, 1, 1, top_k), try sc.slice(wts, 1, 0, 1) }, 1);
 }
 
-test "dsv41 wide tol: the paired fp4 gate+up with moe_act in its epilogue is the split path's MoE within 1% at the release widths, MXFP4 and NVFP4 with per-expert scales, prompt row counts to 8192; a weight on the wrong expert or swapped scales fail" {
+test "dsv41 wide tol: the paired NVFP4 gate+up (per-expert scales) with moe_act in its epilogue is the split path's MoE within 1% at the release widths, prompt row counts to 8192, and an MXFP4 bank stays on the split path; a weight on the wrong expert or swapped scales fail" {
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
     // The release's 384 experts under `-Dslow-tests` (7 GB of banks); else 48, whose rows an expert reach every plan.
     const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
-    const unset = env.override(.MLX_SERVE_DSV41_MOE_PAIR, null);
-    defer unset.restore();
     const unset_scaled = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "0");
     defer unset_scaled.restore();
     // Every format and row count runs; each out of tolerance is reported.
@@ -294,16 +292,19 @@ test "dsv41 wide tol: the paired fp4 gate+up with moe_act in its epilogue is the
             var csc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
             defer csc.deinit();
             const c = try call(&csc, L, @intCast(experts), 0x1000 + ci, L == 500);
+            // An MXFP4 bank (no per-expert scales) has no paired arm: the split path serves it at either setting.
+            if (!nv) {
+                const on = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
+                defer on.restore();
+                try testing.expect(try actOf(&csc, &m, &ly.experts, c.x, c.idx, c.wts) == null);
+                continue;
+            }
             // No shared expert, so the routed sum is all the output holds.
             const sh = try csc.zeros(&.{ @intCast(L), @intCast(hidden) }, .bfloat16);
             const want = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, sh);
-            // The other kind's switch leaves this bank on the split path.
-            {
-                const other = if (nv) env.override(.MLX_SERVE_DSV41_MOE_PAIR, "1") else env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
-                defer other.restore();
-                try testing.expect(try actOf(&csc, &m, &ly.experts, c.x, c.idx, c.wts) == null);
-            }
-            const sw = if (nv) env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1") else env.override(.MLX_SERVE_DSV41_MOE_PAIR, "1");
+            // MOE_PAIR_SCALED=0 leaves the bank on the split path.
+            try testing.expect(try actOf(&csc, &m, &ly.experts, c.x, c.idx, c.wts) == null);
+            const sw = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
             defer sw.restore();
             // Served: the paired kernel takes this call.
             try testing.expect(try actOf(&csc, &m, &ly.experts, c.x, c.idx, c.wts) != null);

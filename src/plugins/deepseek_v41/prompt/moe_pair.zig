@@ -2,11 +2,11 @@
 //! launch, so the `[n, 2 inter]` products never go to memory. Two arms by the bank's mode:
 //! - affine: the clamped SwiGLU, then the routing weight on the rounded activation (`sortedGateUpFusedWeighted`,
 //!   main's routing-weight epilogue); no switch.
-//! - fp4 (MXFP4; NVFP4 with ModelOpt's per-expert scales): the fused-bank gather, its scale multiplies and `moe_act`
-//!   in the epilogue (`sortedGateUpRouted`). A reorder: the split path's roundings with the sums in another order, so
-//!   about 0.2% of the words differ, each within one bf16 step of its row's scale (a word the split path gives as zero
-//!   keeps a tiny value here, many ulps away), and the float64 l2 is the split path's. `MLX_SERVE_DSV41_MOE_PAIR`
-//!   serves banks without per-expert scales, `MLX_SERVE_DSV41_MOE_PAIR_SCALED` banks with them.
+//! - NVFP4 with ModelOpt's per-expert scales (`MLX_SERVE_DSV41_MOE_PAIR_SCALED`, on): the fused-bank gather, its scale
+//!   multiplies and `moe_act` in the epilogue (`sortedGateUpRouted`). A reorder: the split path's roundings with the
+//!   sums in another order, so about 0.2% of the words differ, each within one bf16 step of its row's scale (a word the
+//!   split path gives as zero keeps a tiny value here, many ulps away), and the float64 l2 is the split path's.
+//! An fp4 bank without per-expert scales (MXFP4, an MXFP4 view of NVFP4) takes the split path.
 
 const std = @import("std");
 const env = @import("../../../env.zig");
@@ -20,13 +20,13 @@ const fp4_gemm = @import("fp4_gemm.zig");
 const A = mlx.mlx_array;
 
 /// `moePrefill`'s activation `[n, 1, inter]` of the sorted pairs (`x3` `[L, 1, d]` read through `rows`, experts
-/// `sidx`, f32 routing weights `w_sorted`) on a fused gate/up bank; null where it does not serve: no fused bank, the
-/// fp4 arm's switch off, or the kernel declines.
+/// `sidx`, f32 routing weights `w_sorted`) on a fused gate/up bank; null where it does not serve: no fused bank, an fp4
+/// bank without per-expert scales, `MOE_PAIR_SCALED` off, or the kernel declines.
 pub fn act(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.Experts, x3: A, rows: A, sidx: A, w_sorted: A) !?A {
     if (e.gu) |*gu| if (gu.qp.mode == .affine) return affine(sc, m, gu, x3, rows, sidx, w_sorted);
-    const scaled = e.scale[0] != null or e.scale[1] != null;
-    if (!(if (scaled) scaledOn(env.get(.MLX_SERVE_DSV41_MOE_PAIR_SCALED)) else env.on(.MLX_SERVE_DSV41_MOE_PAIR))) return null;
-    const name: []const u8 = if (scaled) "MOE_PAIR_SCALED" else "MOE_PAIR";
+    if (e.scale[0] == null and e.scale[1] == null) return null;
+    if (!scaledOn(env.get(.MLX_SERVE_DSV41_MOE_PAIR_SCALED))) return null;
+    const name: []const u8 = "MOE_PAIR_SCALED";
     const L = mlx.getShape(x3)[0];
     const P = mlx.getShape(sidx)[0];
     const gu = e.gu orelse return decline(name, L, P, "the bank has no fused gate/up");
