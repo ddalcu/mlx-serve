@@ -249,11 +249,15 @@ fn diagToken(comptime n: []const u8) []const u8 {
     return &final;
 }
 
+/// The longest value a diag token carries (`DiagValue.buf` less its NUL): a longer one is cut, so a consumer that turns
+/// a diag value into a path must refuse a value this long rather than use a truncated one.
+pub const diag_value_max = 255;
+
 /// A diag's value, NUL-terminated for `get`: one buffer per registration.
 fn DiagValue(comptime n: []const u8) type {
     return struct {
         const of = &@field(vars, n);
-        var buf: [256]u8 = undefined;
+        var buf: [diag_value_max + 1]u8 = undefined;
     };
 }
 
@@ -265,7 +269,10 @@ fn diagFind(list: []const u8, token: []const u8, out: []u8) ?[*:0]const u8 {
         if (std.mem.eql(u8, item, token)) return "1";
         if (item.len > token.len and item[token.len] == '=' and std.mem.startsWith(u8, item, token)) {
             const v = item[token.len + 1 ..];
-            const len = @min(v.len, out.len - 1);
+            if (out.len == 0) return null;
+            // `out` is the caller's buffer: a value wider than it is cut to what it holds, and to what a diag token
+            // promises to carry.
+            const len = @min(v.len, @min(diag_value_max, out.len - 1));
             @memcpy(out[0..len], v[0..len]);
             out[len] = 0;
             return out[0..len :0].ptr;
@@ -317,6 +324,7 @@ pub const vars = struct {
     pub const MINIMAX_H3_GLUE_FUSED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 fused glue kernels (=0: the op chain)" };
     pub const MINIMAX_H3_VSA: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.3", .doc = "H3 trained VSA sparse attention (=0: dense attention, no gate branch)" };
     pub const MLX_SERVE_MING_FUSED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/ming_tts", .since = "26.11.3", .doc = "Ming-3.0-tts fused DiT and LM kernels (=0: the op chain)" };
+    pub const MLX_SERVE_INKLING2_FUSED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/inkling2", .since = "26.11.4", .doc = "Inkling 2 one-row step kernels (=0: the op chain)" };
     pub const MLX_SERVE_CUDA_QMV_TC: Var = .{ .kind = .kill, .type = .flag, .default = "on where measured (sm_120)", .owner = "sdk/blocks/qmm", .since = "26.10.3", .doc = "CUDA tensor-core 4-bit GEMV for 2..8 rows" };
     pub const MLX_SERVE_DSV41_ATTN_F16: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 f16 attention (=0: f32)" };
     pub const MLX_SERVE_DSV41_CED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 CED prefill chunks (=0: full forward)" };
@@ -345,6 +353,7 @@ pub const vars = struct {
     pub const DISPATCH_PROBE: Var = .{ .kind = .diag, .type = .int, .default = "0", .owner = "engines/mlx/diag", .since = "26.7.12", .doc = "count the dispatches of N decode steps" };
     pub const DSPARK_PROFILE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v4", .since = "26.7.12", .doc = "DeepSeek-V4 DSpark per-round profile" };
     pub const DSPARK_TRACE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v4", .since = "26.7.12", .doc = "DeepSeek-V4 DSpark draft trace" };
+    pub const DSV41_TAP_DIR: Var = .{ .kind = .diag, .type = .text, .default = "unset (no tap)", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "calibration tap directory for the built-in DeepSeek-V4.1 ablation stream tap: each prompt forward's per-layer stream means (its last rows) as tap-<stamp>.npy beside its .json sidecar, the dir 0700, the files 0600; a bare token or =0 leaves it off" };
     pub const DSV4_SKIP_MOE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v4", .since = "26.8.1", .doc = "set: DeepSeek-V4 decode skips the MoE (timing only, garbage output)" };
     pub const DSV4_TRACE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v4", .since = "26.8.1", .doc = "DeepSeek-V4 decode trace (exactly 1)" };
     pub const DUMP_RESTORE: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "engines/mlx/cache", .since = "26.9.3", .doc = "dir: dump restored prefix-cache state" };
@@ -538,6 +547,7 @@ pub const vars = struct {
     pub const HY3D_VEL_LAT: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/hunyuan3d", .since = "26.7.2", .doc = "hy3d oracle: DiT velocity matches reference" };
     pub const HY3D_VEL_SIGMA: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/hunyuan3d", .since = "26.7.2", .doc = "hy3d oracle: DiT velocity matches reference" };
     pub const HY3_MODEL_DIR: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "host/chat", .since = "26.7.8", .doc = "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback (HY3_MODEL_DIR)" };
+    pub const INKLING2_RELEASE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/inkling2", .since = "26.11.4", .doc = "the Inkling 2 Mini release's directory, for the tests that load it" };
     pub const INKLING_FIXTURES: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/inkling", .since = "26.7.12", .doc = "test input read by `loadInklingFixtures`" };
     pub const KEV_FIXTURES: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/kev", .since = "26.10.1", .doc = "kev: oracle against kev's MLX backend (KEV_TEST_MODEL + KEV_FIXTURES)" };
     pub const KEV_TEST_MODEL: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/kev", .since = "26.10.1", .doc = "kev: oracle against kev's MLX backend (KEV_TEST_MODEL + KEV_FIXTURES)" };
@@ -849,6 +859,9 @@ test "MLX_SERVE_DIAG: a bare token reads 1, token=value reads the value, a prefi
     try testing.expectEqualStrings("1", std.mem.span(diagFind(list, "step-trace", &buf).?));
     try testing.expectEqualStrings("/tmp/g", std.mem.span(diagFind(list, "decode-graph-dump", &buf).?));
     try testing.expectEqualStrings("", std.mem.span(diagFind(list, "empty", &buf).?));
+    // A value wider than the caller's buffer is cut to what it holds, never written past it.
+    var small: [4]u8 = undefined;
+    try testing.expectEqualStrings("/tm", std.mem.span(diagFind(list, "decode-graph-dump", &small).?));
     try testing.expect(diagFind(list, "step", &buf) == null);
     try testing.expect(diagFind(list, "decode-graph", &buf) == null);
     try testing.expect(diagFind("", "step-trace", &buf) == null);

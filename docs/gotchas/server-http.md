@@ -878,3 +878,9 @@ by id only, so the nested root registered the same folder under its bare name. F
 entry per folder by real path, under the `org/name` id, and `rescan` compares real paths. Guard:
 `tests/test_multi_model_dir.sh` [5][6], `discoverModelsMany lists a folder two roots reach once…`,
 `ModelRegistry: rescan adds no second entry…`.
+
+### `/v1/completions` echo logprobs came back as invalid JSON
+
+A logprob that is NaN (a forward that overflowed) or -inf was printed with `{d:.6}`, which writes `nan` / `-inf`: JSON
+has neither, so the client's parser died instead of reading a value. Fix: every logprob float goes through
+`logprobs.jsonLogprob` (NaN `null`, -inf OpenAI's -9999). Guard: `logprobs: a non-finite value is valid JSON ...`.

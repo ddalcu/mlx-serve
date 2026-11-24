@@ -11,6 +11,7 @@ const QsaArmCounts = @import("../../plugins/qwen4_exp/qsa/arms.zig").QsaArmCount
 const KVCache = @import("kv/cache.zig").KVCache;
 const SSMCacheEntry = @import("ssm/entry.zig").SSMCacheEntry;
 const CheckpointSink = @import("kv/cache_ops.zig").CheckpointSink;
+const CacheSlot = @import("kv/cache_ops.zig").Slot;
 const Transformer = @import("transformer.zig").Transformer;
 
 /// A draft tree's verify rows: row w sits at position offset + depth[w], and
@@ -103,6 +104,13 @@ pub const ForwardCtx = struct {
     /// A prompt forward read at most at its last row's logits (no prompt logprobs): a model declaring
     /// `Caps.prompt_last_row` is asked for that row alone.
     last_row_logits: bool = false,
+    /// An interior prefill chunk whose logits and hidden rows are discarded: `owns_decode_state` plugins receive
+    /// `abi.Logits.none` with `want_hidden = false`.
+    no_logits: bool = false,
+    /// The engine's prompt forwarding: a prompt chunk, or the split prefill's final-token span, which is one row and so
+    /// reaches the plugin as `Mode.decode`. False from the first decode step on. Reaches plugins as `Forward.prefill`,
+    /// which the calibration tap gates on: by mode alone, the last prompt token is dropped.
+    prefill: bool = false,
     /// Hand the graph built so far to the GPU every this many layers (0 =
     /// build it whole): a spec round's verify waits on the host otherwise.
     pipeline_build: u32 = 0,
@@ -120,6 +128,8 @@ pub const ForwardCtx = struct {
     prompt_spans: []const u64 = &.{},
     ssm_cp_positions: []const u64 = &.{},
     cp_sink: ?*const CheckpointSink = null,
+    /// The caches a native drafter's open verify commits through at its finish (`NativeDrafter.verify`).
+    native_slot: CacheSlot = undefined,
     /// Qwen3-VL interleaved M-RoPE. `mrope_pos` is the server-computed flat
     /// [3 × mrope_total] i32 position-id table (axis-major: t,h,w rows), borrowed
     /// from the slot. `mrope_delta` shifts the scalar decode RoPE (decode tokens

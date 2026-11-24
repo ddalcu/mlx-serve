@@ -159,6 +159,9 @@ pub fn initWithOptions(
     var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
     // Only an echo of prompt logprobs reads a prompt forward's logits before its last row.
     ctx.last_row_logits = options.prompt_logprobs == null;
+    // What plugins read as `Forward.prefill`: the chunk loop and the final-token span are prompt forwards, the decode
+    // steps after them are not (the span is one row, so the host calls it `Mode.decode`).
+    ctx.prefill = true;
     // A grow allocates no slack past the context and the rows a verify writes past its last token.
     ctx.cache.limitGrowth(@as(usize, context.getEffectiveContextLength(&xfm.config)) + verify_rows_max);
 
@@ -465,11 +468,14 @@ pub fn initWithOptions(
             errdefer if (dflash_active) {
                 for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
             };
+            errdefer ctx.no_logits = false;
+            ctx.no_logits = options.prompt_logprobs == null and !mtp_capture and !dflash_active and end < loop_end;
             const chunk_logits = if (mtp_capture) blk: {
                 var last_unused = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(last_unused);
                 break :blk try xfm.forwardWithCaptureAll(&ctx, chunk_input, &last_unused, &chunk_hidden_all);
             } else try xfm.forwardWith(&ctx, chunk_input);
+            ctx.no_logits = false;
             if (options.prompt_logprobs) |out| promptLogprobs(allocator, chunk_logits, prompt_ids[pos + 1 .. end + 1], options.logprobs_n, xfm.s, out) catch |err| {
                 _ = mlx.mlx_array_free(chunk_logits);
                 return err;
@@ -793,6 +799,10 @@ pub fn initWithOptions(
     ctx.ssm_cp_positions = &.{};
     ctx.cp_sink = null;
     ctx.last_row_logits = false;
+    ctx.no_logits = false;
+    // The prompt is forwarded: from here on the generator's forwards are decode steps, and a plugin's prompt tap must
+    // not dump one per token.
+    ctx.prefill = false;
     // History entries for the held-back span: (hidden[j], token[j+1]) for
     // j in [final_start, prefix_len) — same pairing as the chunk loop.
     // The last row's pair (hidden[last], t1) is appended by the first
@@ -1009,7 +1019,8 @@ pub fn initWithOptions(
             .dspark_enabled = dspark_active,
             .dspark_stochastic = dspark_stochastic,
             // A streamed EXL3 bank verifies the whole block on a greedy request: its verify costs about a plain tick.
-            .dspark_pol = if (dspark_active) if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else null else null,
+            // A plugin's drafter opens with the plain rounds that time one, then drafts while its rounds pay.
+            .dspark_pol = if (!dspark_active) null else if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else if (plugin_driver.nativeDrafter(xfm) != null) .{ .plain = .unmeasured, .drafting = .{ .owed = 4 } } else null,
             .drafter = if (drafter_active) options.drafter else null,
             .drafter_block_size = options.drafter_block_size,
             .dflash = if (dflash_active) options.dflash else null,

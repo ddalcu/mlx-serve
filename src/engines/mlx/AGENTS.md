@@ -54,6 +54,8 @@ Memory bills + admission:
 Prefix cache (RAM + SSD):
 - Disabled prefix retention reserves zero bytes in context sizing, chunk sizing and reported cache budgets; the configured byte cap is not proof that the cache exists.
 - **The hot-cache budget is CLAMPED at load, a HARD cap, and FOLLOWS residency** (#364, `clampedPrefixCacheMem`, `reviseHotCacheBudgets`). Guard: `tests/test_prefix_cache_budget_revisit.sh`.
+- **An auto context leaves the hot cache the share it was sized beside** (`ctxCacheShare` of the idle figure): the clamp took the whole context's
+  KV, not yet allocated, out of what was free after the load, and a 32 GB Mac's cache held no long turn.
 - **A streamed bank's hot cache stays in the term its decode room holds** (`GLM5_HOT_CACHE_BYTES`, `streamedHotCacheCapped`;
   a module-path plugin keeps its own): admission bills a streamed pack at 0, so nothing evicts beside the next request.
   Its oversized commit evicts before `trimmedCopy` (`evict_before_copy`): copying first held the old entry beside the copy.
@@ -128,6 +130,8 @@ Spec decode:
 - **A capture gate is a promise the forward must keep**: `supportsLayerCapture` said yes while `forwardGlm5With` ignored `capture_layers`, and the first DFlash prefill crashed on an unfilled slot. An arch that passes the gate fills every slot (GLM taps the MEAN of its hyper-connection streams); `dflash.encodeContext` names an unfilled one (`DflashCaptureMissing`). Guard: `glm5_next DFlash capture`.
 - **A stalled round is not what a round costs** (`Drafting.record` bounds a round at twice the rounds before it): one round that waited on a kernel's first compile owed hundreds of plain ticks, and DeepSeek-V4.1's first request after an install wrote code at serial speed.
 - **A sparse target's DFlash is policy-driven** (`engines/mlx/spec/dflash/policy.zig`, GLM): rows follow the selector's calibrated confidence, plain ticks ride the serial pipeline with their taps parked (`dflash_pending`), and the plain cost is the REQUEST's own tick interval — the shared round-cost table's plain cell ran stale-high and the policy never stepped back.
+- **A native drafter's round is handed the request's stop ids and never verifies one** (`Forward.stop_ids`): the trunk's own
+  token carries the stop, as in serial decode; a kept stop row left no decode-end entry, and an agent re-prefilled its context.
 - **A block decoder checks its ENTRY token first** (`generate.tokenStops`, all five); only an ALL-pad generation declines commit (`commitDeclinesPadOnly`); a cancel mid batched tick still RECORDS the row (`batchedTickAction`).
 - **The token budget is a PRE-COMMIT invariant in every block decoder**; blocks publish through ONE `+= 1` loop.
 - **A spec path that refuses a KV scheme must be gated at LOAD, or implemented**: `compactRows` refused quantized KV mid-decode, so a draft tree under `--kv-quant 8` 500'd the second request. Guard: smoke `drafter_kv8`.
@@ -187,6 +191,8 @@ Kernels + numerics:
 - **Every forward path carries a `[dtype-trace]`**; 1-D f16 tables narrowed at load (`narrowsLoadedF16`); a kernel's dtype and threadgroup BLOCK SIZE are ONE decision (`gdnBlockTFor`); signatures come from each input's ACTUAL dtype, <8-element arrays land in `constant`.
 - **A decode kernel can be LATENCY-bound** (qwen4 `hcReadFused`): split-K + unrolled loads beat the op chain; redistributing a reduction into every threadgroup LOSES. Meter: `MLX_SERVE_DIAG=decode-fwd-ubench=N`.
 - **A prefill-tiled kernel at decode width is ONE threadgroup's work**: gate by rows (`MIXES_KERNEL_MIN_ROWS`, `decodeSelect`).
+- **A one-row dense matmul wants the checkpoint's `[out, in]` weight** (`x @ W.T`, MLX's `gemv`): over a pre-transposed `[in, out]` one it is `gemv_t`, several times the latency; prompt-width GEMM is the same either way.
+- **A few-row f32 product (a router, a gate) wants its own kernel or the one-row path**: on NAX, MLX's f32 matmul past one row is TF32 (~1e-3 relative) at ~7x a row's latency; its one-row `gemv` is exact.
 - **Partials crossing threadgroups in ONE dispatch go by atomic store/load** (`hcPre`): plain loads read a stale L1 even after a device fence.
 - **A cache row no op in this forward reads is never computed** (decode evals token + logits only): tie it to the output (`mlx_depends`; GLM's indexer below its budget).
 - **An ablation that leaves an output unwritten measures NaN ROUTING, not cost** (garbage activations send every MoE layer to the same cached experts): ablate with sane values.

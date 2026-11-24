@@ -50,6 +50,8 @@ fn inklingTrimContentTail(content_in: []const u8) []const u8 {
 /// channel markers (every other family falls through).
 pub fn splitInklingChannels(text: []const u8) ?ThinkSplit {
     const t = inklingStripMessageHead(text);
+    // A reply cut right after its message opener has no channel yet: nothing to deliver, never the marker.
+    if (std.mem.trim(u8, t, "\n ").len == 0 and std.mem.trim(u8, text, "\n ").len > 0) return .{ .reasoning_content = null, .content = "" };
     if (std.mem.startsWith(u8, t, INKLING_THINKING_TAG)) {
         const body = t[INKLING_THINKING_TAG.len..];
         if (std.mem.indexOf(u8, body, INKLING_END_TAG)) |em| {

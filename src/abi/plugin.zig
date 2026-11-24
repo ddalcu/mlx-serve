@@ -373,7 +373,7 @@ pub const Shape = extern struct {
 };
 
 /// The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout.
-/// `flags` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
+/// `flags`, `state_per_token` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
 pub const Bill = extern struct {
     size: u32 = @sizeOf(Bill),
     kv_per_token: u64 = 0,
@@ -601,6 +601,14 @@ pub const Forward = extern struct {
     /// The absolute positions after which the engine files recurrent-state checkpoints for its prefix cache, ascending,
     /// each one of `prompt_spans` (`CacheOps.checkpoint`); empty = none wanted. Read it only when `size` reaches it.
     ssm_checkpoints: Span(u64) = .{},
+    /// The engine's prompt forwarding, whatever `mode` says: the split prefill's final-token span is one row and so
+    /// arrives as `Mode.decode`. False on decode steps and verify blocks. Read it only when `size` reaches it: an older
+    /// host's `Forward` ends before it.
+    prefill: bool = false,
+    /// A native drafter's round (`NativeDrafter.step`, `verify`): the request's stop ids. A round that verifies one
+    /// leaves the state past what the request commits, which the prefix cache cannot restore. Read it only when
+    /// `size` reaches it.
+    stop_ids: Span(u32) = .{},
 };
 
 /// Directional ablation (Arditi et al. 2024): slot i's forward removes `strengths[i]` times the component along its
@@ -911,6 +919,9 @@ pub const NativeDrafter = extern struct {
     /// The second half: keeps `t1` and the first `accepted` drafts of the open verify, rewinds the state to them and
     /// writes the model's position into `out.round.position`.
     finish: ?*const fn (m: *anyopaque, accepted: u32, out: *ForwardOut) callconv(.c) Verdict = null,
+    /// Whether this load drafts: a load may leave its drafter out (a GPU it loses on), and then the model has no
+    /// stages. Null = always. Read it only when `size` reaches it.
+    active: ?*const fn (m: *anyopaque) callconv(.c) bool = null,
 };
 
 /// A trunk tensor a drafter reads beside the trunk's forward.

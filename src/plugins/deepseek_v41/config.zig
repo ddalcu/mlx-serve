@@ -30,7 +30,12 @@ const ParseError = v4.ParseError;
 pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.Str, span: ?*const abi.LayerSpan, stub: bool, out: *abi.Parsed) callconv(.c) abi.Verdict {
     _ = span;
     const result = v4.parseInto(dir, config_json, stub, true, streamsPack(settings_json.slice()), out, &extend);
-    if (result.isOk()) out.caps.prefix_cache = !of(out).dsv41_streamed;
+    if (result.isOk()) {
+        out.caps.prefix_cache = !of(out).dsv41_streamed;
+        // Every pass that writes the residual stream ablates under its state's direction, the DSpark rounds included
+        // (plugin.zig, ablation.zig); a model split across two Macs refuses an ablated forward by name.
+        out.caps.ablation = true;
+    }
     return result;
 }
 
@@ -185,6 +190,8 @@ test "deepseek_v41 config: the release pack parses with its sources, Engram, DSp
     try testing.expect(c.dsv41_vision and p.caps.images and !p.caps.spec_rollback);
     try testing.expect(p.caps.slot_state and p.caps.batches_decode and p.caps.owns_decode_state);
     try testing.expect(p.caps.prefix_cache);
+    // Every pass that writes the residual stream ablates (plugin.zig, ablation.zig).
+    try testing.expect(p.caps.ablation);
     try testing.expectEqual(@as(u32, 129264), p.placeholder_ids.image);
     try testing.expectEqual(abi.ThinkingDefault.on, p.chat.thinking_default);
     try testing.expectEqual(abi.EffortVocab.dsv41, p.chat.effort_vocab);

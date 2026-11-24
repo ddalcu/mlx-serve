@@ -301,13 +301,17 @@ fn hostTotalMemBytes() u64 {
 /// `device_pool`: the memory is a GPU's own (`mlx.weightsInDeviceMemory`), whose free reading
 /// already counts every process, so no OS share is held back.
 pub fn osReserveBytes(total_ram: u64, device_pool: bool) u64 {
-    if (os_reserve_override) |v| return v;
+    if (osReserveOverride().*) |v| return v;
     if (device_pool) return 0;
     return std.math.clamp(total_ram / 8, 2 << 30, 8 << 30);
 }
 
 /// `--os-reserve-gib N` in bytes; 0 turns the reserve off. Null = the automatic eighth.
-pub var os_reserve_override: ?u64 = null;
+/// Shared: the host parses the flag, the engine's admission reads it.
+pub const os_reserve_shared = @import("shared.zig").Shared(?u64, "os_reserve_override", null);
+pub inline fn osReserveOverride() *?u64 {
+    return os_reserve_shared.get();
+}
 
 pub fn parseOsReserveGib(raw: []const u8) error{InvalidOsReserve}!u64 {
     const n = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidOsReserve;
@@ -534,8 +538,8 @@ test "osReserveBytes: an eighth of RAM, never under 2 GB or over 8 GB; none of a
     try std.testing.expectEqual(4 * gb, osReserveBytes(32 * gb, false));
     try std.testing.expectEqual(8 * gb, osReserveBytes(128 * gb, false));
     try std.testing.expectEqual(@as(u64, 0), osReserveBytes(16 * gb, true)); // free VRAM already counts every process
-    os_reserve_override = try parseOsReserveGib("0");
-    defer os_reserve_override = null;
+    osReserveOverride().* = try parseOsReserveGib("0");
+    defer osReserveOverride().* = null;
     try std.testing.expectEqual(@as(u64, 0), osReserveBytes(16 * gb, false));
     try std.testing.expectError(error.InvalidOsReserve, parseOsReserveGib("lots"));
 }
