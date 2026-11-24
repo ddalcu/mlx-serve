@@ -7,15 +7,15 @@ notes for this folder are in [AGENTS.md](AGENTS.md).
 
 ## Summary
 
-This plugin serves NVIDIA's `DeepSeek-V4.1-Flash-1017-NVFP4` checkpoint on Apple GPUs. It is configured for the
-1,048,576-token context, though a 1M-token prompt has not run yet. A converter rewrites only the checkpoint's file headers, so the weights keep NVIDIA's bytes
+This plugin serves NVIDIA's `DeepSeek-V4.1-Flash-1017-NVFP4` checkpoint on Apple GPUs. It serves the full
+1,048,576-token context: a 1,032,192-token prompt ran at 3,913 tok/s prefill and 110.7 tok/s greedy decode. A converter rewrites only the checkpoint's file headers, so the weights keep NVIDIA's bytes
 and the routed experts stay in NVFP4. DeepSeek's own drafter, DSpark, proposes tokens that the model checks in one
 step, and this makes decode faster. The defaults are the release configuration, and you set no switch to get them. On
 an M5 Ultra with 512 GB, the release build decoded 97.98 tok/s greedy and prefilled 5,526 tok/s on our standard test.
 On M5 every default-on switch is in a lossless class (see "Accuracy") except one, an 8-bit LM head whose KLD was
 within one standard error of the bf16 head's. On Macs without neural accelerators (M4 and older), the default
 attention core is a lossy f16 core. On EvalPlus the release build scored 161/164 on HumanEval and 366/378 on MBPP
-(base tests). The long-context sweep is not done yet.
+(base tests).
 
 ## Serve the model on an M5 Ultra with 512 GB
 
@@ -162,12 +162,18 @@ We did not tune or measure any machine other than the M5 Ultra with 512 GB.
 
 ## Memory and the 1M-token context
 
-The plugin bills memory in four parts: the resident load, the compressed KV cache, the window rings, and the prompt
-pass. The engine admits a load or a request only when the sum fits (its admission check). The KV cache costs only
-3,200 bytes per token (3.36 GB at 1,048,576 tokens). Four layers (2, 8, 14 and 20) store compressed KV. Every
-layer keeps a 128-row window and reads the compressed rows of the source layer at or before it.
+The engine admits a load or a request only when the plugin's memory bill fits (its admission check). The KV cache
+costs only 3,200 bytes per token (3.36 GB at 1,048,576 tokens); the block below has the bill's four parts.
 
-The admission check accepted a 1M-token request on an earlier build; the block below has the numbers.
+On the release build, a 1,032,192-token prompt (the 1M window less a 16,384-token output budget) peaked at
+480.5 GB, and the whole machine stayed at or below 502 GB, against the 536.9 GB wired limit, with 0 pageouts.
+
+The release uses more memory than the stock runner. The NVFP4 pack's weights bill is 404.33 GB, against 384.16 GB for
+the MXFP4-experts form (+20.2 GB), because NVFP4's 16-value groups carry more scale bytes. The Engram partials cache
+(`ENGRAM_KV_CACHE`) adds 3.8 GB. Wider prompt passes (`PF_PASS_SIZE`) and the `PF_KEEP_WIDE` buffer reserve (13.7 GB at
+32,768 rows, 18.6 GB at the widest pass) raise each request's working set: admission at 256K needs 25.2 GB, against
+6.9 GB on the stock runner. These trade memory for speed (+7.96% and +2.19% prefill), and we kept them because the full 1M context still
+fits.
 
 <details>
 <summary>The four parts of the memory bill, and the 1M admission</summary>
@@ -185,7 +191,8 @@ request.
 | Window rings | the rings part of `prefillBytes`'s `state` term (`deepseek_v41.zig`) | 40 layers x (128 + 16) rows x 512 x 2 bytes, about 5.9 MB |
 | Prompt pass | `prefillBytes` (`deepseek_v41.zig`), plus the `PF_KEEP_WIDE` reserve | Grows with the pass width. `PF_PASS_SIZE` picks the widest pass that fits the memory share; a set `--prefill-chunk` narrows it |
 
-Layers 2, 8, 14 and 20 are the KV sources. Each stores a 512-wide latent and a 128-wide index key per token in bf16,
+Layers 2, 8, 14 and 20 are the KV sources. Every layer keeps a 128-row window and reads the compressed rows of the
+source layer at or before it. Each source stores a 512-wide latent and a 128-wide index key per token in bf16,
 compressed 2:1 in the first three and 1:1 in layer 20.
 
 The 1M admission ran on build `c59b60c6`. The admission check needed 38,246 MB and had 78,476 MB available, with a
@@ -229,16 +236,19 @@ device and the load's switches only, never from the caller. On NAX it takes the 
 2. the gather (the plugin's exact three-launch matrix-unit core), where the pick count is a multiple of 64;
 3. the f32 chain (MLX's matmuls and softmax in f32).
 
-Without NAX the plugin has no flash kernel and no gather, because both need the matrix units. Every prompt-attention
-call there takes the f16 core, or the f32 chain under `ATTN_F16=0`. The f16 core was mlx-serve's default there before
-this release. We kept it, because we have not measured the speed or the error of the f32 chain (`=0`) on those Macs. On NAX the f16 core serves only under an
-explicit `ATTN_F16=1`. The load fixes the switch's value, and the prompt cache's layout hash includes it.
+Without NAX the f16 core serves every prompt-attention call by default, as before this release; on NAX it serves only
+under an explicit `ATTN_F16=1` (the block below says why).
 
 Two fixes in a row each left a path to the f16 core on M5. The root-cause fix gives the choice one owner, `attnCore`,
 with tests on the served routes of a full-model fixture.
 
 <details>
 <summary>The tests, and their results</summary>
+
+Without NAX the plugin has no flash kernel and no gather, because both need the matrix units. Every prompt-attention
+call there takes the f16 core, or the f32 chain under `ATTN_F16=0`. The f16 core was mlx-serve's default there before
+this release. We kept it, because we have not measured the speed or the error of the f32 chain (`=0`) on those Macs. On NAX the f16 core serves only under an
+explicit `ATTN_F16=1`. The load fixes the switch's value, and the prompt cache's layout hash includes it.
 
 The three bounded switches are `MOE_PAIR_SCALED`, `PF_HC_V2` and `ENGRAM_GPU_IDS`. The three that rest on reasoning
 are `CED` (the chunked prompt path), `PF_PASS_SIZE` and `PF_IDX_NAX`. Of the 49 classed switches, 27 have a standing test or a kernel contract
@@ -405,14 +415,13 @@ the new text (2.94 tokens per round), not from round time. The PR body holds eve
 
 | Gap | What the release needs |
 |---|---|
-| The 1K to 1M context sweep has not run on the release build | That run, posted in the PR |
 | The plugin does not stream experts with per-expert scales, so a Mac that cannot hold the NVFP4 pack cannot serve it | The `--experts-mxfp4` pack for those Macs, or streamed per-expert scales |
 | Without NAX, the lossy f16 attention core (`ATTN_F16`) is on by default, and we have not measured it on those Macs | A float64 test on those Macs, or `ATTN_F16` off there |
 | On the f32 attention chain's routes, attention's output depends on the chunk width | A test that holds each chunk width no farther from float64 |
 | 12 classed switches rest on the commit's reasoning, and 10 on their A/B giving the same text | A standing word or float64 test for each |
 | `HEAD8` is a quantization change. Its KLD is within one standard error of the bf16 head's on our set, but it is not bit-identical | A ruling to keep it, or `=0` by default |
 | We tuned and measured only on M5 Ultra Macs with 512 GB | Runs on smaller Macs and older GPUs |
-| A real 1M-token prompt has not run on the release build, and the release has not loaded at the default wired limit | The 1M point of the sweep; one load at the default limit |
+| The release has not loaded at the default wired limit | One load at the default limit |
 | We have no PPL or KLD of the whole stack; the KLD above is of the head alone | A whole-stack KLD against the same reference |
 
 ## Terms
