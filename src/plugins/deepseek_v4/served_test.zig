@@ -1418,6 +1418,20 @@ test "deepseek_v41 served: a draft-only head (DRAFT_HEAD4, DRAFT_VOCAB) changes 
         try testing.expectEqualSlices(u32, ctl.d.ids, whole.d.ids);
         const nq = @as(usize, m.ds_block) * 96 * 4;
         try testing.expectEqualSlices(u8, (mlx.mlx_array_data_uint8(ctl.q) orelse return error.NoData)[0..nq], (mlx.mlx_array_data_uint8(whole.q) orelse return error.NoData)[0..nq]);
+        // A batch holding that state drafts every id for both states, as the model without the vocabulary does.
+        var bw: [2]dsv41.DsparkDraft = undefined;
+        try dsv41.dsparkDraftBatched(m, a, &.{ &sts[0], &sts[1] }, &.{ 7, 5 }, true, &bw);
+        defer for (&bw) |*d| d.deinit(a);
+        m.dspark.?.draft = null;
+        var bc: [2]dsv41.DsparkDraft = undefined;
+        const plain_b = dsv41.dsparkDraftBatched(m, a, &.{ &sts[0], &sts[1] }, &.{ 7, 5 }, true, &bc);
+        m.dspark.?.draft = kept;
+        try plain_b;
+        defer for (&bc) |*d| d.deinit(a);
+        for (bw, bc) |w, cd| {
+            try testing.expectEqualSlices(u32, cd.ids, w.ids);
+            try testing.expectEqualSlices(f32, cd.logits, w.logits);
+        }
         try dsv41.draftPromptVocab(m, &sts[1], &.{}, true);
         try testing.expect(!sts[1].draft_whole);
     }

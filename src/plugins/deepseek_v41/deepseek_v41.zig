@@ -1325,8 +1325,8 @@ fn padIds(gpa: std.mem.Allocator, ids: *std.ArrayList(i32), taken: []bool, quant
 /// `MLX_SERVE_DSV41_DRAFT_VOCAB`: `st`'s draft vocabulary for a request whose prompt is `prompt`, the file's ids then
 /// the prompt's other ids (its `draft_prompt_max` most frequent), made before the request's first round; a draft queued
 /// on `st` from the tables before is dropped. Without a vocabulary file, or with the prompt ids off, the file's alone.
-/// A sampled request (`greedy` false) drafts over every id (`State.draft_whole`): a vocabulary's q drafted p21 worse
-/// at card sampling (2.57 against 2.68 tokens a round) while the greedy rounds gained.
+/// A sampled request (`greedy` false) drafts over every id (`State.draft_whole`), so its drafts, q and tokens are
+/// those of the model without the vocabulary.
 pub fn draftPromptVocab(m: *Dsv41Model, st: *State, prompt: []const u32, greedy: bool) !void {
     if (st.draft_extra) |*x| {
         x.deinit();
@@ -8958,13 +8958,17 @@ pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []cons
     for (0..m.n_mtp) |si| x = try stageBlock(&sc, m, states, m.n_layers + si, x, &pre, B, null);
     const flat = try hcCollapse(&sc, x, pre);
     const hout = try sc.reshape(flat, &.{ ci(N), ci(B), ci(d) });
-    const logits = try sc.reshape(try sc.astype(try ds.headFor(m).apply(&sc, try sc.rms(flat, ds.norm, c.rms_norm_eps)), .float32), &.{ ci(N), ci(B), -1 });
+    // A draft vocabulary: the chain on its tokens, as `draftGraph`'s; the file's ids (a request's prompt ids are a solo
+    // draft's). A batch holding a sampled request's state drafts every id for every state, as without the vocabulary.
+    var whole = false;
+    for (states) |s| whole = whole or s.draft_whole;
+    const vocab_head = if (ds.draft) |*dh| dh.k > 0 else false;
+    const head = if (whole and vocab_head) &m.head else ds.headFor(m);
+    const logits = try sc.reshape(try sc.astype(try head.apply(&sc, try sc.rms(flat, ds.norm, c.rms_norm_eps)), .float32), &.{ ci(N), ci(B), -1 });
     const firsts = try gpa.alloc(i32, N);
     defer gpa.free(firsts);
     for (firsts, t1s) |*f, t| f.* = @intCast(t);
-    // A draft vocabulary: the chain on its tokens, as `draftGraph`'s; the file's ids (a request's prompt ids are a solo
-    // draft's).
-    const sub = draftSetOf(ds, null);
+    const sub = if (whole) null else draftSetOf(ds, null);
     const mk: struct { emb: A, mh: A } = if (sub) |v| .{ .emb = v.emb, .mh = v.mh } else .{ .emb = ds.markov_embed, .mh = ds.markov_head };
     var cur = try sc.ints(firsts, &.{ci(N)});
     if (sub) |dv| cur = try sc.take(dv.to_draft, cur, 0);
