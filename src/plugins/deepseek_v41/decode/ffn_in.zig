@@ -22,8 +22,6 @@ const mixes = (2 + hc) * hc;
 const A_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in.metal");
 const B_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_post.metal");
 const HEADER = decode.FP8_READ_HEADER;
-const NAX_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_nax.metal");
-const NAX_HEADER = HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_nax_header.metal");
 const TAIL_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_tail.metal");
 /// `MLX_SERVE_DSV41_FFN_IN_SINK`: launch 2 without its mix tail, and that tail as its own launch.
 const SINK_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_ffn_in_sink.metal");
@@ -50,8 +48,6 @@ pub const Kernels = struct {
     /// `MLX_SERVE_DSV41_FFN_IN_SINK`: launch 2 without its mix tail, and the tail's own launch.
     b_apart: mlx.mlx_fast_metal_kernel,
     sink: mlx.mlx_fast_metal_kernel,
-    /// Launch 1 on the matrix units (`MLX_SERVE_DSV41_GEMV_R26_FFN_IN`), NAX GPUs only.
-    nax: ?mlx.mlx_fast_metal_kernel,
     /// The fused launch's persistent scratch (`dec_ffn_in_tail.metal`), zero between its dispatches.
     facc: A,
 };
@@ -75,8 +71,7 @@ pub fn build() !Kernels {
     errdefer _ = mlx.mlx_fast_metal_kernel_free(ba);
     const sk = try dsv41.buildKernel("dsv41_dec_ffn_in_sink", &SINK_INS, &SINK_OUTS, SINK_SOURCE, "");
     errdefer _ = mlx.mlx_fast_metal_kernel_free(sk);
-    const n = if (device.naxAvailable()) try dsv41.buildKernel("dsv41_dec_ffn_in_nax", &A_INS, &A_OUTS, NAX_SOURCE, NAX_HEADER) else null;
-    return .{ .a = a, .b = b, .fused = f, .b_apart = ba, .sink = sk, .nax = n, .facc = try newScratch() };
+    return .{ .a = a, .b = b, .fused = f, .b_apart = ba, .sink = sk, .facc = try newScratch() };
 }
 
 fn newScratch() !A {
@@ -92,7 +87,6 @@ pub fn free(k: Kernels) void {
     _ = mlx.mlx_fast_metal_kernel_free(k.fused);
     _ = mlx.mlx_fast_metal_kernel_free(k.b_apart);
     _ = mlx.mlx_fast_metal_kernel_free(k.sink);
-    if (k.nax) |n| _ = mlx.mlx_fast_metal_kernel_free(n);
     _ = mlx.mlx_array_free(k.facc);
 }
 
@@ -106,23 +100,6 @@ pub fn fusedOn() bool {
 /// runs as its own one-threadgroup launch, read only by the MoE down, so the MoE up does not wait on it.
 pub fn sinkOn() bool {
     return env.onUnlessZero(.MLX_SERVE_DSV41_FFN_IN_SINK);
-}
-
-/// `MLX_SERVE_DSV41_GEMV_R26_FFN_IN` (read each call): =1 launch 1 runs on the matrix units from `nax_min_rows` rows.
-pub fn naxOn() bool {
-    return env.on(.MLX_SERVE_DSV41_GEMV_R26_FFN_IN);
-}
-
-/// The matrix-unit launch 1: simdgroups splitting K, 32 columns a threadgroup, from this many rows.
-const nax_nsg: usize = 4;
-pub const nax_min_rows: usize = 5;
-
-fn servesNax(p: Dims) bool {
-    return p.rows >= 1 and p.rows <= decode.max_rows and p.d % 32 == 0 and p.k % (64 * nax_nsg) == 0;
-}
-
-fn naxTargs(p: Dims) [6]TArg {
-    return .{ .{ .name = "R", .v = p.rows }, .{ .name = "NSG", .v = nax_nsg }, .{ .name = "K", .v = p.k }, .{ .name = "D", .v = p.d }, .{ .name = "HC", .v = hc }, .{ .name = "FOLD", .v = 0 } };
 }
 
 /// Whether the one launch takes `p`: launch 1's shapes, whole 128-column slices, and its scratch and top K.
@@ -252,8 +229,8 @@ pub const Weights = struct {
     gate_bias: A,
 };
 
-pub const Out = struct { x1: A, h2: A, sf: dsv41.Split, idx: A, wts: A, fused: bool = false, nax: bool = false, sink: bool = false };
-pub const AOut = struct { x1: A, hv: A, ctr: A, parts: A, logits: A, nax: bool = false };
+pub const Out = struct { x1: A, h2: A, sf: dsv41.Split, idx: A, wts: A, fused: bool = false, sink: bool = false };
+pub const AOut = struct { x1: A, hv: A, ctr: A, parts: A, logits: A };
 pub const BOut = struct { h2: A, sf: dsv41.Split, idx: A, wts: A };
 
 const OutSpec = struct { shape: []const c_int, dt: mlx.mlx_dtype };
@@ -289,7 +266,6 @@ fn run(comptime n: usize, sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, ins
 /// Launch 1 for `p.rows` rows: wo_b over `oa` `[R, K]`, then each output column's hc expand with `x` `[R, 4, D]` and `sa`
 /// (the attention's split), and the collapse; it also zeroes launch 2's counters and sizes its scratch.
 pub fn launchA(sc: *dsv41.Scope, ks: Kernels, p: Dims, w: Weights, oa: A, x: A, sa: *const dsv41.Split) !AOut {
-    if (ks.nax) |kn| if (naxOn() and p.rows >= nax_min_rows and servesNax(p)) return launchNax(sc, kn, p, w, oa, x, sa);
     const a = try run(5, sc, ks.a, &.{ oa, w.wo_w, w.wo_s, x, sa.pre, sa.post, sa.comb }, .{
         .{ .shape = &.{ ci(p.rows), hc, ci(p.d) }, .dt = act },
         .{ .shape = &.{ ci(p.rows), ci(p.d) }, .dt = act },
@@ -298,20 +274,6 @@ pub fn launchA(sc: *dsv41.Scope, ks: Kernels, p: Dims, w: Weights, oa: A, x: A, 
         .{ .shape = &.{ ci(p.rows), ci(p.e) }, .dt = .float32 },
     }, gridA(p), a_nsg * 32, &(aTargs(p) ++ [_]TArg{.{ .name = "FOLD", .v = @intCast(decode.fp8Fold()) }}));
     return .{ .x1 = a[0], .hv = a[1], .ctr = a[2], .parts = a[3], .logits = a[4] };
-}
-
-/// `launchA` on the matrix units (`dec_ffn_in_nax.metal`): the same outputs.
-pub fn launchNax(sc: *dsv41.Scope, kern: mlx.mlx_fast_metal_kernel, p: Dims, w: Weights, oa: A, x: A, sa: *const dsv41.Split) !AOut {
-    var t = naxTargs(p);
-    t[5].v = @intCast(decode.fp8Fold());
-    const a = try run(5, sc, kern, &.{ oa, w.wo_w, w.wo_s, x, sa.pre, sa.post, sa.comb }, .{
-        .{ .shape = &.{ ci(p.rows), hc, ci(p.d) }, .dt = act },
-        .{ .shape = &.{ ci(p.rows), ci(p.d) }, .dt = act },
-        .{ .shape = &.{16}, .dt = .uint32 },
-        .{ .shape = &.{ci(partsLen(p))}, .dt = .float32 },
-        .{ .shape = &.{ ci(p.rows), ci(p.e) }, .dt = .float32 },
-    }, p.d / 32 * nax_nsg * 32, nax_nsg * 32, &t);
-    return .{ .x1 = a[0], .hv = a[1], .ctr = a[2], .parts = a[3], .logits = a[4], .nax = true };
 }
 
 /// Launch 2: the FFN's 24 hc mixes and their split, the rms-normed collapse `h2`, the router's scores and each row's top K.
@@ -387,7 +349,7 @@ pub fn launch(sc: *dsv41.Scope, ks: Kernels, p: Dims, w: Weights, oa: A, x: A, s
     const a = try launchA(sc, ks, p, w, oa, x, sa);
     const apart = sinkOn();
     const b = if (apart) try launchBApart(sc, ks, p, w, a, eps, scal) else try launchB(sc, ks, p, w, a, eps, scal);
-    return .{ .x1 = a.x1, .h2 = b.h2, .sf = b.sf, .idx = b.idx, .wts = b.wts, .nax = a.nax, .sink = apart };
+    return .{ .x1 = a.x1, .h2 = b.h2, .sf = b.sf, .idx = b.idx, .wts = b.wts, .sink = apart };
 }
 
 // ── the kernel contract ──
@@ -446,9 +408,6 @@ fn depthA(s: Shape) usize {
     return s.k / 512 + 32;
 }
 /// The matrix units' depth: a simdgroup's K / (16 NSG) tile steps of 16 products, then the simdgroups' sum.
-fn depthNax(s: Shape) usize {
-    return s.k / (16 * nax_nsg) + 16 + nax_nsg;
-}
 /// The mixes' dot over the stream (4 D terms).
 fn depthB(s: Shape) usize {
     return hc * s.n;
@@ -460,27 +419,14 @@ fn depthSink(s: Shape) usize {
 
 /// wo_b over the attention output, then each column's expand and collapse. Shape: rows, D columns, K.
 const FfnA = struct {
-    /// `nax`: the matrix-unit launch (`launchNax`).
-    pub const Params = struct { nax: bool = false };
+    pub const Params = struct {};
 
     fn dims(s: Shape) Dims {
         return .{ .rows = s.rows, .d = s.n, .k = s.k };
     }
 
-    pub fn geometry(pa: Params, s: Shape) ?metal.Geometry {
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
         const p = dims(s);
-        if (pa.nax) {
-            if (!servesNax(p)) return null;
-            var g = metal.Geometry{ .grid = .{ ci(p.d / 32 * nax_nsg * 32), 1, 1 }, .tg = .{ ci(nax_nsg * 32), 1, 1 }, .unread = 0b11100 };
-            g.out(&.{ ci(p.rows), hc, ci(p.d) }, act);
-            g.out(&.{ ci(p.rows), ci(p.d) }, act);
-            g.out(&.{16}, .uint32);
-            g.out(&.{ci(partsLen(p))}, .float32);
-            g.out(&.{ ci(p.rows), ci(p.e) }, .float32);
-            for (naxTargs(p)) |t| g.int(t.name, t.v);
-            g.dtype("T", act);
-            return g;
-        }
         if (!servesA(p)) return null;
         // The counters, partials and scores are launch 2's scratch (launch 1 writes only the counters).
         var g = metal.Geometry{ .grid = .{ ci(gridA(p)), 1, 1 }, .tg = .{ ci(a_nsg * 32), 1, 1 }, .unread = 0b11100 };
@@ -1329,17 +1275,6 @@ const launch_sink = metal.Launch{
     .m2 = 256,
 };
 
-const launch_nax = metal.Launch{
-    .name = "dsv41_dec_ffn_in_nax",
-    .inputs = &A_INS,
-    .outputs = &A_OUTS,
-    .source = NAX_SOURCE,
-    .header = NAX_HEADER,
-    .tg_bytes = 4 * nax_nsg * 8 * 32,
-    .offline = false,
-    .min_gen = 17,
-};
-
 const launch_f = metal.Launch{
     .name = "dsv41_dec_ffn_in_fused",
     .inputs = &F_INS,
@@ -1415,17 +1350,6 @@ pub fn register(set: *kc.Set) !void {
         .nan = nan_rule,
         .tiles = .{ .{ .size = 3 }, .{ .size = 128, .step = 128, .min = 128 }, .{} },
         .served = &.{ .{ .rows = 1, .n = 5120, .k = 1 }, .{ .rows = 6, .n = 5120, .k = 1 } },
-    });
-    try kit.add(set, FfnA, &launch_nax, .{ .nax = true }, .{
-        .name = "dsv41 dec ffn_in A on the matrix units (wo_b, expand, collapse)",
-        .accum = .f32,
-        .depth = depthNax,
-        .mids = 1,
-        .out = .bf16,
-        .nan = nan_rule,
-        .nax = true,
-        .tiles = .{ .{ .size = 3 }, .{ .size = 32, .step = 32, .min = 128 }, .{ .size = 1024, .step = 1024, .min = 1024 } },
-        .served = &.{ .{ .rows = 2, .n = 256, .k = 8192 }, .{ .rows = 6, .n = 256, .k = 8192 }, .{ .rows = 4, .n = 5120, .k = 8192 } },
     });
     try kit.add(set, FfnFused, &launch_f, .{}, .{
         .name = "dsv41 dec ffn_in fused (wo_b, expand, collapse; mixes, split, norm, router in the tails)",
@@ -1779,32 +1703,6 @@ test "dsv41 dec ffn_in fused: MLX_SERVE_DSV41_FUSE_FFN_IN=1, rows 1..6 on layers
     // The scratch is all zeros after the dispatches.
     const left = mlx.mlx_array_data_uint32(ks.facc) orelse return error.NoData;
     for (left[0..facc_words]) |v| try std.testing.expectEqual(@as(u32, 0), v);
-}
-
-test "dsv41 dec ffn_in nax: MLX_SERVE_DSV41_GEMV_R26_FFN_IN=1, rows 1..6 on layers 21 and 23 and at 384 experts, match today's chain, no further from float64; another wo_b fails" {
-    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
-    var ov = env.override(.MLX_SERVE_DSV41_GEMV_R26_FFN_IN, "1");
-    defer ov.restore();
-    const gpa = std.testing.allocator;
-    const fx = try Fixture.init(gpa, .{ .ctx = 8 });
-    defer fx.deinit();
-    const ks = try build();
-    defer free(ks);
-    for ([_]usize{ 21, 23 }) |li| for (1..decode.max_rows + 1) |rows| {
-        const ly = fx.layer(li);
-        try equivalence(gpa, fx, ks, ly, weightsOf(ly), rows);
-    };
-    const w = try randomWeights(80);
-    defer freeWeights(w);
-    const ly = layerWith(fx.layer(21), w);
-    for (1..decode.max_rows + 1) |rows| try equivalence(gpa, fx, ks, &ly, w, rows);
-    // The planted bug: the launch reads another wo_b than the chain (the truth follows the launch's weights, so the
-    // chain's distance or the routes give it away).
-    const other = try randomWeights(81);
-    defer freeWeights(other);
-    var bad = w;
-    bad.wo_w = other.wo_w;
-    if (equivalence(gpa, fx, ks, &ly, bad, 4)) |_| return error.PlantedBugPassed else |_| {}
 }
 
 /// `launch` on one case with `MLX_SERVE_DSV41_FFN_IN_SINK` off, then on (or the planted sink at `plant_iters` Sinkhorn
@@ -2262,7 +2160,7 @@ test "dsv41 dec ffn_in: ubench, R = 1 and 6 against today's chain over 2.3 GB of
     }
 }
 
-test "dsv41 dec ffn_in: ubench, R = 1..6: launch 1 on the vector kernel against the matrix units, and the pair against the fused launch" {
+test "dsv41 dec ffn_in: ubench, R = 1..6: launch 1, and the pair against the fused launch" {
     if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     if (!decode.ubenchOn()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
@@ -2291,23 +2189,21 @@ test "dsv41 dec ffn_in: ubench, R = 1..6: launch 1 on the vector kernel against 
         const cpre = try fx.cpre(rows);
         defer _ = mlx.mlx_array_free(cpre);
         const sa0 = (try dsv41.hcStage(&sc, fx.m, x, null, cpre, &fx.layer(21).hc_attn, fx.layer(21).attn_norm)).sp;
-        var us: [5]f64 = undefined;
-        // Launch 1 vector, launch 1 matrix units, the pair, the fused launch, the pair without launch 2's tails.
-        const arms = [_]struct { mode: @TypeOf(@as(Bench, undefined).mode), nax: [*:0]const u8, fused: [*:0]const u8, notail: bool = false }{
-            .{ .mode = .launch_1, .nax = "0", .fused = "0" }, .{ .mode = .launch_1, .nax = "1", .fused = "0" },
-            .{ .mode = .new, .nax = "0", .fused = "0" },      .{ .mode = .new, .nax = "0", .fused = "1" },
-            .{ .mode = .new, .nax = "0", .fused = "0", .notail = true },
+        var us: [4]f64 = undefined;
+        // Launch 1, the pair, the fused launch, the pair without launch 2's tails.
+        const arms = [_]struct { mode: @TypeOf(@as(Bench, undefined).mode), fused: [*:0]const u8, notail: bool = false }{
+            .{ .mode = .launch_1, .fused = "0" },
+            .{ .mode = .new, .fused = "0" },      .{ .mode = .new, .fused = "1" },
+            .{ .mode = .new, .fused = "0", .notail = true },
         };
         for (&us, arms) |*t, arm| {
-            var o1 = env.override(.MLX_SERVE_DSV41_GEMV_R26_FFN_IN, arm.nax);
-            defer o1.restore();
             var o2 = env.override(.MLX_SERVE_DSV41_FUSE_FFN_IN, arm.fused);
             defer o2.restore();
             var b = Bench{ .gpa = gpa, .rows = rows, .m = fx.m, .ks = ks, .sets = &sets, .layers = &layers, .x0 = x, .sa0 = sa0, .eps = eps, .scal = scal, .mode = arm.mode, .notail = if (arm.notail) notail else null };
             defer b.deinit();
             t.* = (try b.us(nsets)).total;
         }
-        std.debug.print("[dec-ubench] ffn_in R={d}: launch 1 vector {d:.1} us, matrix units {d:.1} us ({d:.0}% of the wo_b floor); pair {d:.1} us, fused {d:.1} us; pair without launch 2's tails {d:.1} us (launch 2 {d:.1} us, its tails {d:.1} us)\n", .{ rows, us[0], us[1], 100 * 43.2e6 / decode.stream_bytes_per_us / us[1], us[2], us[3], us[4], us[2] - us[0], us[2] - us[4] });
+        std.debug.print("[dec-ubench] ffn_in R={d}: launch 1 {d:.1} us; pair {d:.1} us, fused {d:.1} us; pair without launch 2's tails {d:.1} us (launch 2 {d:.1} us, its tails {d:.1} us)\n", .{ rows, us[0], us[1], us[2], us[3], us[1] - us[0], us[1] - us[3] });
     }
 }
 
@@ -2336,8 +2232,6 @@ test "dsv41 dec ffn_in: MLX_SERVE_DSV41_FFN_IN_R5_COLS1=1, launch 1 at 5 rows on
         defer _ = mlx.mlx_array_free(cpre);
         const sa = (try dsv41.hcStage(&sc, fx.m, x, null, cpre, &cs.ly.hc_attn, cs.ly.attn_norm)).sp;
         const p: Dims = .{ .rows = rows, .d = fx.m.cfg.hidden_size, .e = @intCast(mlx.getShape(cs.ly.gate_w)[0]), .top_k = cs.ly.top_k, .iters = fx.m.cfg.dsv4_hc_sinkhorn_iters, .norm = fx.m.cfg.moe_route_norm and cs.ly.top_k > 1 };
-        var ov = env.override(.MLX_SERVE_DSV41_GEMV_R26_FFN_IN, "0");
-        defer ov.restore();
         // The reference is the two-column plan (=0); the switch is on by default.
         var o0 = env.override(.MLX_SERVE_DSV41_FFN_IN_R5_COLS1, "0");
         defer o0.restore();
@@ -2398,8 +2292,6 @@ test "dsv41 dec ffn_in: ubench, launch 1 on the vector kernel at R = 3..6 on one
     const eps = try dsv41.hcEps(&sc, fx.m);
     const scal = mlx.mlx_array_new_data(&[_]f32{fx.m.cfg.router_scaling_factor}, &[_]c_int{1}, 1, .float32);
     try sc.items.append(sc.a, scal);
-    var ov = env.override(.MLX_SERVE_DSV41_GEMV_R26_FFN_IN, "0");
-    defer ov.restore();
     defer cols_test = null;
     for (3..decode.max_rows + 1) |rows| {
         const x = try fx.stream(rows);
