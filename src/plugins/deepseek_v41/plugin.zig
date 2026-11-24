@@ -814,15 +814,13 @@ fn auxImportArrays(mp: *anyopaque, ids: abi.Span(u32), header: abi.Str, arrays: 
 }
 
 /// The load reads its Engram tables from disk per lookup and drops the tensors it never loads
-/// (`dsv41.residentDiskBytes`); the `mtp` setting decides the DSpark stages; plus a bf16 prompt trunk
-/// (`bill.pfTrunkBytes`), the Engram partials' cache at its bound (`engram_kvc.billBytes`), and a draft-only head
-/// (`dsv41.draftHeadBytes`).
+/// (`dsv41.residentDiskBytes`, with the Engram partials' cache where the load allocates it); the `mtp` setting decides
+/// the DSpark stages; plus a bf16 prompt trunk (`bill.pfTrunkBytes`) and a draft-only head (`dsv41.draftHeadBytes`).
 fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, settings_json: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
     const mtp = mtpSetting(settings_json.slice());
     out.* = dsv41.residentDiskBytes(gpa, model_dir.slice(), config.of(p), mtp, shards) catch |e| return Verdict.named(.failed, @errorName(e));
     if (mx_view.on()) out.* -|= mx_view.savedBytes(gpa, model_dir.slice(), dsv41.dsparkWanted(config.of(p), null, mtp)) catch |e| return Verdict.named(.failed, @errorName(e));
     out.* += bill_mod.pfTrunkBytes(config.of(p));
-    out.* += engram_kvc.billBytes(config.of(p).dsv41_n_engram_layers);
     out.* += dsv41.draftHeadBytes(config.of(p), dsv41.dsparkWanted(config.of(p), null, mtp), model_dir.slice());
     return .ok;
 }
@@ -834,14 +832,19 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 // ── tests ──
 
-/// The Engram LRU every load of a pack with Engram layers bills, and its partials' cache where that is on.
+/// The Engram LRU every load of a pack with Engram layers bills (the affine fixture's table allocates no partials' cache).
 fn lru() u64 {
-    return @import("decode/engram_decode.zig").billBytes(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB)) + engram_kvc.billBytes(1);
+    return @import("decode/engram_decode.zig").billBytes(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB));
 }
 
 /// `residentBytes` over the Engram fixture (`engram.writeAffineFixture`) in `dir`, from `shards` bytes.
 fn engramResident(dir: []const u8, settings_json: []const u8, shards: u64) !u64 {
-    var c: config.Config = .{ .model_type = "deepseek_v41", .dsv41_n_engram_layers = 1, .dsv41_engram_head_dim = 64 };
+    return engramResidentAt(dir, settings_json, shards, 64, false);
+}
+
+/// `engramResident` over a table `head_dim` wide, the experts streamed or not.
+fn engramResidentAt(dir: []const u8, settings_json: []const u8, shards: u64, head_dim: u32, streams: bool) !u64 {
+    var c: config.Config = .{ .model_type = "deepseek_v41", .dsv41_n_engram_layers = 1, .dsv41_engram_head_dim = head_dim, .dsv41_streamed = streams };
     c.dsv41_engram_layers[0] = 1;
     c.dsv41_engram_rows[0] = 4;
     var out: u64 = 0;
@@ -880,19 +883,43 @@ test "deepseek_v41 resident bill: Engram tables it preads bill their LRU, not th
     try std.testing.expectEqual(10_000 + lru(), try engramResident(dir, "", 10_000));
 }
 
-test "deepseek_v41 resident bill: MLX_SERVE_DSV41_ENGRAM_KV_CACHE bills the partials' cache at its bound" {
+test "deepseek_v41 resident bill: MLX_SERVE_DSV41_ENGRAM_KV_CACHE bills the partials' cache at its bound only where the load allocates it: held mxfp4 tables 256 wide, ENGRAM_GPU_IDS on, resident experts" {
     const env_mod = @import("../../env.zig");
-    var ov = env_mod.override(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE, "0");
-    defer ov.restore();
+    const o1 = env_mod.override(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE, null);
+    defer o1.restore();
+    const o2 = env_mod.override(.MLX_SERVE_DSV41_ENGRAM_GPU_IDS, null);
+    defer o2.restore();
+    const o3 = env_mod.override(.MLX_SERVE_DSV41_ENGRAM_RESIDENT, null);
+    defer o3.restore();
     const io = std.Io.Threaded.global_single_threaded.io();
-    var td = std.testing.tmpDir(.{});
-    defer td.cleanup();
-    try @import("engram.zig").writeAffineFixture(io, td.dir, "");
-    var buf: [512]u8 = undefined;
-    const dir = buf[0..try td.dir.realPath(io, &buf)];
-    const off = try engramResident(dir, "", 10_000);
-    env_mod.set(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE, "1");
-    try std.testing.expectEqual(off + engram_kvc.cap_bytes, try engramResident(dir, "", 10_000));
+    var ta = std.testing.tmpDir(.{});
+    defer ta.cleanup();
+    try @import("engram.zig").writeAffineFixture(io, ta.dir, "");
+    var tm = std.testing.tmpDir(.{});
+    defer tm.cleanup();
+    try @import("engram.zig").writeMxfp4SlotFixture(io, tm.dir);
+    var ab: [512]u8 = undefined;
+    const affine = ab[0..try ta.dir.realPath(io, &ab)];
+    var mb: [512]u8 = undefined;
+    const mx = mb[0..try tm.dir.realPath(io, &mb)];
+    const Arm = struct { cache: ?[*:0]const u8 = null, ids: ?[*:0]const u8 = null, resident: ?[*:0]const u8 = null, streamed: bool = false };
+    const at = struct {
+        fn bill(dir: []const u8, hd: u32, a: Arm) !u64 {
+            env.set(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE, "0");
+            if (a.ids) |v| env.set(.MLX_SERVE_DSV41_ENGRAM_GPU_IDS, v) else env.unset(.MLX_SERVE_DSV41_ENGRAM_GPU_IDS);
+            if (a.resident) |v| env.set(.MLX_SERVE_DSV41_ENGRAM_RESIDENT, v) else env.unset(.MLX_SERVE_DSV41_ENGRAM_RESIDENT);
+            const off = try engramResidentAt(dir, "", 10_000, hd, a.streamed);
+            if (a.cache) |v| env.set(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE, v) else env.unset(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE);
+            return try engramResidentAt(dir, "", 10_000, hd, a.streamed) - off;
+        }
+    };
+    try std.testing.expectEqual(engram_kvc.cap_bytes, try at.bill(mx, 256, .{}));
+    // The switch off, ENGRAM_GPU_IDS off, the tables read from disk, the experts streamed, an affine table.
+    try std.testing.expectEqual(@as(u64, 0), try at.bill(mx, 256, .{ .cache = "0" }));
+    try std.testing.expectEqual(@as(u64, 0), try at.bill(mx, 256, .{ .ids = "0" }));
+    try std.testing.expectEqual(@as(u64, 0), try at.bill(mx, 256, .{ .resident = "0" }));
+    try std.testing.expectEqual(@as(u64, 0), try at.bill(mx, 256, .{ .streamed = true }));
+    try std.testing.expectEqual(@as(u64, 0), try at.bill(affine, 64, .{}));
 }
 
 test "deepseek_v41 resident bill: neither the vision tower nor DSpark stages that will not load" {

@@ -1314,6 +1314,23 @@ test "dsv41 engram: a dead token (an image span's) makes every n-gram across it 
     try testing.expectEqualSlices(u32, want[0..48], got[0..48]);
 }
 
+/// NVIDIA's mxfp4 table layout (`openMxfp4Table`) at 4 rows of 256: e2m1 pairs [4, 128] then e8m0 scales [4, 8],
+/// the codes 16-byte aligned in the file.
+pub fn writeMxfp4SlotFixture(io: std.Io, dir: std.Io.Dir) !void {
+    const n = "layers.1.engram.embed.";
+    const raw = "{\"" ++ n ++ "weight\":{\"dtype\":\"U8\",\"shape\":[4,128],\"data_offsets\":[0,512]}," ++
+        "\"" ++ n ++ "scale\":{\"dtype\":\"U8\",\"shape\":[4,8],\"data_offsets\":[512,544]}}";
+    const pad: [(16 - (8 + raw.len) % 16) % 16]u8 = @splat(' ');
+    const hdr = raw ++ &pad;
+    var shard: [8 + hdr.len + 544]u8 = @splat(0);
+    std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
+    @memcpy(shard[8..][0..hdr.len], hdr);
+    @memset(shard[8 + hdr.len + 512 ..], 127);
+    try dir.writeFile(io, .{ .sub_path = "model-00001.safetensors", .data = &shard });
+    try dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{" ++
+        "\"" ++ n ++ "weight\":\"model-00001.safetensors\",\"" ++ n ++ "scale\":\"model-00001.safetensors\"}}" });
+}
+
 /// An MLX pack's layer-1 table in one shard: 4 rows, head_dim 64, 8-bit g32
 /// (weight [4, 16] U32, scales/biases [4, 2] BF16 = 288 bytes); `prefix` nests
 /// its names (oMLX's packs: `language_model.`).
