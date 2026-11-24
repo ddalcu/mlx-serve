@@ -3950,7 +3950,7 @@ var flash_logged = std.atomic.Value(bool).init(false);
 /// scores against its own window and selected rows, read in place, never gathered.
 /// The heads `[L, H, D]`, or with `grouped` already inverse-roped and grouped.
 /// `qt` (q_tail.zig): the heads' roped last 64 channels, `q` the unroped heads.
-fn attnGather(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, qt: A, keys_w: A, wp: usize, comp_rows: A, topk: A, scale: f32, grouped: ?Grouped) !?A {
+pub fn attnGather(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, qt: A, keys_w: A, wp: usize, comp_rows: A, topk: A, scale: f32, grouped: ?Grouped) !?A {
     const g = m.attn_gather orelse return null;
     const L = dim(q, 0);
     const H = dim(q, 1);

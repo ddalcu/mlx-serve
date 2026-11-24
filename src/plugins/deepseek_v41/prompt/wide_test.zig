@@ -13,6 +13,7 @@ const mpair = @import("moe_pair.zig");
 const pfroute = @import("pf_route.zig");
 const fp4gemm = @import("fp4_gemm.zig");
 const gather_nax = @import("../../../sdk/blocks/moe/gather_qmm_nax.zig");
+const verify_qmm_nax = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig");
 const mtail = @import("moe_tail.zig");
 const hv2 = @import("hc_v2.zig");
 const fixture = @import("../decode/fixture.zig");
@@ -165,16 +166,95 @@ fn call(sc: *dsv41.Scope, L: usize, experts: usize, seed: u64, nan: bool) !Call 
     return .{ .x = x, .idx = idx, .wts = wts, .sh = try normal(sc, &shape, .bfloat16, 1, seed + 1) };
 }
 
-/// `mpair.act` on `c` as `moePrefill` calls it (its pairs sorted by expert).
-fn actOf(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.Experts, x: A, idx: A, wts: A) !?A {
-    const L: usize = @intCast(mlx.getShape(x)[0]);
-    const n: c_int = @intCast(L * top_k);
+/// `moePrefill`'s pairs sorted by expert: the flat experts, each sorted pair's row, expert and routing weight, and each
+/// pair's place among them.
+const Pairs = struct { flat: A, rows: A, sidx: A, w: A, inv: A };
+fn pairsOf(sc: *dsv41.Scope, idx: A, wts: A) !Pairs {
+    const n: c_int = @intCast(mlx.mlx_array_size(idx));
     const flat = try sc.reshape(try sc.astype(idx, .uint32), &.{n});
     var o = mlx.mlx_array_new();
     const order = try sc.res(mlx.mlx_argsort_axis(&o, flat, 0, sc.s), &o);
-    const rows = try sc.op2(mlx.mlx_floor_divide, order, try sc.u(top_k));
-    const w_sorted = try sc.take(try sc.reshape(wts, &.{n}), order, 0);
-    return mpair.act(sc, m, e, try sc.reshape(x, &.{ @intCast(L), 1, @intCast(hidden) }), rows, try sc.take(flat, order, 0), w_sorted);
+    var oi = mlx.mlx_array_new();
+    const inv = try sc.res(mlx.mlx_argsort_axis(&oi, order, 0, sc.s), &oi);
+    return .{ .flat = flat, .rows = try sc.op2(mlx.mlx_floor_divide, order, try sc.u(top_k)), .sidx = try sc.take(flat, order, 0), .w = try sc.take(try sc.reshape(wts, &.{n}), order, 0), .inv = inv };
+}
+
+/// `mpair.act` on `c` as `moePrefill` calls it (its pairs sorted by expert).
+fn actOf(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.Experts, x: A, idx: A, wts: A) !?A {
+    const L: usize = @intCast(mlx.getShape(x)[0]);
+    const p = try pairsOf(sc, idx, wts);
+    return mpair.act(sc, m, e, try sc.reshape(x, &.{ @intCast(L), 1, @intCast(hidden) }), p.rows, p.sidx, p.w);
+}
+
+/// `moePrefill`'s activation on the split path (`MLX_SERVE_DSV41_MOE_PAIR_SCALED=0`): the fused bank's sorted gather,
+/// each half times its expert's scale (`expertScaled`, both rounded), then moe_act.
+fn splitAct(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.Experts, x3: A, p: Pairs) !A {
+    const gu = &e.gu.?;
+    const n = mlx.getShape(p.sidx)[0];
+    const mapped = if (verify_qmm_nax.verifyQmmNaxAvailable()) try gather_nax.sortedGatherMappedPrompt(x3, p.rows, gu.w, gu.s, gu.b, p.sidx, gu.qp.bits, gu.qp.group_size, gu.qp.mode.isFp4(), true, sc.s) else null;
+    const y = if (mapped) |v| try sc.keep(v) else try dsv41.gatherMm(sc, try sc.take(x3, p.rows, 0), gu, none, p.sidx, true);
+    const ni = @divExact(mlx.getShape(y)[2], 2);
+    const nu: usize = @intCast(ni);
+    var halves: [2]A = undefined;
+    for (&halves, 0..) |*hf, i| hf.* = try sc.mul(try sc.slice(y, -1, i * nu, (i + 1) * nu), try sc.reshape(try sc.take(e.scale[i].?, p.sidx, 0), &.{ n, 1, 1 }));
+    const lim = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.dsv4_swiglu_limit}, &[_]c_int{1}, 1, .float32));
+    const yy = try sc.reshape(try sc.concat(&halves, -1), &.{ n, 2 * ni });
+    return dsv41.flatKernel(sc, m.moe_act_kernel, &.{ yy, p.w, lim }, &.{ n, 1, ni }, .bfloat16, @intCast(n * ni), &.{.{ .name = "N", .v = ni }});
+}
+
+/// `moePrefillParts`' down and combine (PF_FP4_GEMM's down in pair order, served by default) over the activation `act`.
+fn moeFromAct(sc: *dsv41.Scope, ly: *const dsv41.Layer, act: A, p: Pairs, sh: A) !A {
+    const n = mlx.getShape(p.sidx)[0];
+    const L = @divExact(n, top_k);
+    const dn = (try fp4gemm.downTok(sc, &ly.experts.down, act, p.sidx, p.rows, p.flat, top_k)) orelse return error.DownTokDeclined;
+    return dsv41.flatKernel(sc, try dsv41.moeCombineTok(), &.{ try sc.reshape(dn, &.{ n, @intCast(hidden) }), p.inv, sh }, &.{ L, @intCast(hidden) }, .bfloat16, @intCast(L * @as(c_int, @intCast(hidden))), &.{ .{ .name = "D", .v = @intCast(hidden) }, .{ .name = "K", .v = top_k } });
+}
+
+/// How far bf16 `a`'s words are from `b`'s, a row of the last axis at a time: the largest difference over one bf16
+/// step at its row's largest `b` magnitude (`worst`), the largest distance between words as integers (1: neighbouring
+/// values of one sign), and the words more than one step apart: their count and their largest `b` magnitude over
+/// their row's.
+const Steps = struct { worst: f64, max: usize, far: usize, far_mag: f64 };
+fn rowSteps(sc: *dsv41.Scope, a: A, b: A) !Steps {
+    const sh = mlx.getShape(a);
+    const w = sh[sh.len - 1];
+    const af = try sc.reshape(try sc.astype(a, .float32), &.{ -1, w });
+    const bf = try sc.reshape(try sc.astype(b, .float32), &.{ -1, w });
+    const d = try sc.reshape(try sc.op1(mlx.mlx_abs, try sc.sub(try sc.astype(try sc.view(a, .uint16), .int32), try sc.astype(try sc.view(b, .uint16), .int32))), &.{ -1, w });
+    const far = try sc.op2(mlx.mlx_greater, d, try sc.i(1));
+    const bm = try sc.op1(mlx.mlx_abs, bf);
+    var o = mlx.mlx_array_new();
+    const dmax = try sc.res(mlx.mlx_max(&o, d, false, sc.s), &o);
+    try dsv41.evalAll(&.{dmax});
+    var mx: i32 = 0;
+    try mlx.check(mlx.mlx_array_item_int32(&mx, dmax));
+    var rows: [4][]f32 = undefined;
+    for (rows[0..3], [_]A{ bm, try sc.op1(mlx.mlx_abs, try sc.sub(af, bf)), try sc.where(far, bm, try sc.f(0)) }) |*r, x| {
+        r.* = try dsv41.hostF32(try sc.reduce(mlx.mlx_max_axis, x, 1, false));
+    }
+    rows[3] = try dsv41.hostF32(try sc.reduce(mlx.mlx_sum_axis, try sc.astype(far, .float32), 1, false));
+    defer for (rows) |r| testing.allocator.free(r);
+    var st: Steps = .{ .worst = 0, .max = @intCast(mx), .far = 0, .far_mag = 0 };
+    for (rows[0], rows[1], rows[2], rows[3]) |peak, dv, fm, fc| {
+        st.far += @intFromFloat(fc);
+        if (dv == 0) continue;
+        const step = if (peak > 0) std.math.ldexp(@as(f64, 1), std.math.ilogb(@as(f64, peak)) - 7) else 0;
+        st.worst = @max(st.worst, if (step > 0) @as(f64, dv) / step else std.math.inf(f64));
+        if (fc > 0) st.far_mag = @max(st.far_mag, @as(f64, fm) / @as(f64, peak));
+    }
+    return st;
+}
+
+/// The words `a` and `b` (the same dtype and shape, bf16 or f32) differ in.
+fn wordsDiffer(sc: *dsv41.Scope, a: A, b: A) !usize {
+    const wt: mlx.mlx_dtype = if (mlx.mlx_array_dtype(a) == .float32) .uint32 else .uint16;
+    const ne = try sc.astype(try sc.op1(mlx.mlx_logical_not, try sc.op2(mlx.mlx_equal, try sc.view(a, wt), try sc.view(b, wt))), .int32);
+    var o = mlx.mlx_array_new();
+    const s = try sc.res(mlx.mlx_sum(&o, ne, false, sc.s), &o);
+    try dsv41.evalAll(&.{s});
+    var v: i32 = 0;
+    try mlx.check(mlx.mlx_array_item_int32(&v, s));
+    return @intCast(v);
 }
 
 /// Each row's routing weights rotated by one (a weight on the wrong expert): the planted MoE bug.
@@ -250,6 +330,224 @@ test "dsv41 wide tol: the paired fp4 gate+up with moe_act in its epilogue is the
     try testing.expect(ok);
 }
 
+test "dsv41 wide tol: MLX_SERVE_DSV41_MOE_PAIR_SCALED's paired NVFP4 gate+up with moe_act in its epilogue is a reorder of the split path's activation (=0): each differing word within one bf16 step of its row's largest value, under 1% of the words differing, float64 l2 within 1.05x of =0's (4x over the differing words), at the release widths, prompt rows to 8192, each arm's activation its moePrefill's; the gate and up scales swapped fail" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m: dsv41.Dsv41Model = undefined;
+    m.cfg = .{};
+    m.cfg.dsv4_swiglu_limit = 10;
+    m.act = .bfloat16;
+    m.moe_wt_kernel = null;
+    m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
+    m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
+    var ly: dsv41.Layer = undefined;
+    ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .gu = try fp4Bank(&sc, 0x6A7E, experts, 2 * inter, hidden, true), .down = try fp4Bank(&sc, 0xD0E1, experts, hidden, inter, true) };
+    for (&ly.experts.scale, 0..) |*v, i| v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x5CA1E + i);
+    const gu = &ly.experts.gu.?;
+    var es: [2][]f32 = undefined;
+    for (&es, 0..) |*v, i| v.* = try dsv41.hostF32(ly.experts.scale[i].?);
+    defer for (es) |v| gpa.free(v);
+    // The float64 check's 256 gate columns (every ninth) and their up columns.
+    const NC = 256;
+    var sel_h: [2 * NC]i32 = undefined;
+    for (0..NC) |j| {
+        sel_h[j] = @intCast(9 * j);
+        sel_h[NC + j] = @intCast(inter + 9 * j);
+    }
+    const sel = try sc.ints(&sel_h, &.{2 * NC});
+    const P = 32;
+    var ok = true;
+    for ([_]usize{ 17, 256, 500, 3072, 5001, 8064, 8192 }, 0..) |L, ci| {
+        var csc = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer csc.deinit();
+        const c = try call(&csc, L, @intCast(experts), 0x3100 + ci, false);
+        const sh = try csc.zeros(&.{ @intCast(L), @intCast(hidden) }, .bfloat16);
+        const p = try pairsOf(&csc, c.idx, c.wts);
+        const x3 = try csc.reshape(c.x, &.{ @intCast(L), 1, @intCast(hidden) });
+        const paired = blk: {
+            const on = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, null);
+            defer on.restore();
+            break :blk (try mpair.act(&csc, &m, &ly.experts, x3, p.rows, p.sidx, p.w)) orelse return error.PairDeclined;
+        };
+        const split = try splitAct(&csc, &m, &ly.experts, x3, p);
+        // Each arm's activation is its served one: through the down and combine, its moePrefill's words.
+        for ([_]?[*:0]const u8{ null, "0" }, [_]A{ paired, split }) |v, a| {
+            const o = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, v);
+            defer o.restore();
+            try testing.expect(try sameWords(try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, sh), try moeFromAct(&csc, &ly, a, p, sh)));
+        }
+        // Planted: the gate's per-expert scale on up and up's on the gate.
+        const bad = blk: {
+            const s = ly.experts.scale;
+            ly.experts.scale = .{ s[1], s[0], s[2] };
+            defer ly.experts.scale = s;
+            break :blk (try mpair.act(&csc, &m, &ly.experts, x3, p.rows, p.sidx, p.w)) orelse return error.PairDeclined;
+        };
+        const differ = try wordsDiffer(&csc, paired, split);
+        // float64 at P pairs spread over the sorted order and the checked columns.
+        const n = L * top_k;
+        const sidx = try dsv41.hostF32(p.sidx);
+        defer gpa.free(sidx);
+        const prow = try dsv41.hostF32(p.rows);
+        defer gpa.free(prow);
+        const pw = try dsv41.hostF32(p.w);
+        defer gpa.free(pw);
+        var q_h: [P]i32 = undefined;
+        var r_h: [P]i32 = undefined;
+        for (&q_h, &r_h, 0..) |*q, *r, i| {
+            q.* = @intCast(i * (n - 1) / (P - 1));
+            r.* = @intFromFloat(prow[@intCast(q.*)]);
+        }
+        const xs = try dsv41.hostF32(try csc.take(c.x, try csc.ints(&r_h, &.{P}), 0));
+        defer gpa.free(xs);
+        const q_at = try csc.ints(&q_h, &.{P});
+        var got: [3][]f32 = undefined;
+        for (&got, [_]A{ paired, split, bad }) |*g, a| g.* = try dsv41.hostF32(try csc.take(try csc.reshape(a, &.{ @intCast(n), @intCast(inter) }), q_at, 0));
+        defer for (got) |g| gpa.free(g);
+        const ref = try gpa.alloc(f64, P * NC);
+        defer gpa.free(ref);
+        var at: [3][]f32 = undefined;
+        for (&at) |*v| v.* = try gpa.alloc(f32, P * NC);
+        defer for (at) |v| gpa.free(v);
+        var i: usize = 0;
+        while (i < P) {
+            const e: usize = @intFromFloat(sidx[@intCast(q_h[i])]);
+            // The expert's checked rows, dequantized (e2m1 times e4m3 is exact in f32).
+            var esc = dsv41.Scope.init(gpa, mlx.gpuStream());
+            defer esc.deinit();
+            const wsel = try esc.reshape(try esc.take(try esc.slice(gu.w, 0, e, e + 1), sel, 1), &.{ 2 * NC, -1 });
+            const ssel = try esc.reshape(try esc.take(try esc.slice(gu.s, 0, e, e + 1), sel, 1), &.{ 2 * NC, -1 });
+            var o = mlx.mlx_array_new();
+            const wd = try dsv41.hostF32(try esc.res(mlx.mlx_dequantize(&o, wsel, ssel, none, mlx.mlx_optional_int.some(@intCast(gu.qp.group_size)), mlx.mlx_optional_int.some(@intCast(gu.qp.bits)), gu.qp.mode.cstr(), none, .{ .value = .float32, .has_value = true }, esc.s), &o));
+            defer gpa.free(wd);
+            while (i < P and @as(usize, @intFromFloat(sidx[@intCast(q_h[i])])) == e) : (i += 1) {
+                const xr = xs[i * hidden ..][0..hidden];
+                const lim: f64 = m.cfg.dsv4_swiglu_limit;
+                for (0..NC) |j| {
+                    var g: f64 = 0;
+                    var u: f64 = 0;
+                    for (xr, wd[j * hidden ..][0..hidden], wd[(NC + j) * hidden ..][0..hidden]) |xv, wg, wu| {
+                        g += @as(f64, xv) * @as(f64, wg);
+                        u += @as(f64, xv) * @as(f64, wu);
+                    }
+                    g = @min(g * @as(f64, es[0][e]), lim);
+                    u = std.math.clamp(u * @as(f64, es[1][e]), -lim, lim);
+                    ref[i * NC + j] = g / (1 + @exp(-g)) * u * @as(f64, pw[@intCast(q_h[i])]);
+                    for (at, got) |v, gv| v[i * NC + j] = gv[i * inter + 9 * j];
+                }
+            }
+        }
+        const ep = f64Err(at[0], ref);
+        const es_ = f64Err(at[1], ref);
+        const eb = f64Err(at[2], ref);
+        // Where the two arms' words differ: an equal word adds the same error to both, so over every differing word the
+        // two arms' l2 and max order as over the whole activation (here up to DS of them, spread over it).
+        const DS = 4096;
+        var el: [DS]usize = undefined;
+        var nd: usize = 0;
+        {
+            const ne = try csc.astype(try csc.op1(mlx.mlx_logical_not, try csc.op2(mlx.mlx_equal, try csc.view(paired, .uint16), try csc.view(split, .uint16))), .uint8);
+            var cm = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cm);
+            try mlx.check(mlx.mlx_contiguous(&cm, try csc.reshape(ne, &.{-1}), false, csc.s));
+            try mlx.check(mlx.mlx_array_eval(cm));
+            const mask = (mlx.mlx_array_data_uint8(cm) orelse return error.NoData)[0 .. n * inter];
+            const stride = @max(1, (differ + DS - 1) / DS);
+            var seen: usize = 0;
+            for (mask, 0..) |b, k| if (b != 0) {
+                if (seen % stride == 0 and nd < DS) {
+                    el[nd] = k;
+                    nd += 1;
+                }
+                seen += 1;
+            };
+        }
+        var nearer = [2]usize{ 0, 0 };
+        var dp: F64Err = .{ .l2 = 0, .max = 0 };
+        var ds: F64Err = .{ .l2 = 0, .max = 0 };
+        if (nd > 0) {
+            var dsc = dsv41.Scope.init(gpa, mlx.gpuStream());
+            defer dsc.deinit();
+            const wr = try gpa.alloc(i32, 2 * nd);
+            defer gpa.free(wr);
+            const xr = try gpa.alloc(i32, nd);
+            defer gpa.free(xr);
+            const ar = try gpa.alloc(i32, nd);
+            defer gpa.free(ar);
+            for (el[0..nd], 0..) |k, t| {
+                const q = k / inter;
+                const e: usize = @intFromFloat(sidx[q]);
+                wr[t] = @intCast(e * 2 * inter + k % inter);
+                wr[nd + t] = @intCast(e * 2 * inter + inter + k % inter);
+                xr[t] = @intFromFloat(prow[q]);
+                ar[t] = @intCast(k);
+            }
+            const wa = try dsc.ints(wr, &.{@intCast(2 * nd)});
+            const wsel = try dsc.take(try dsc.reshape(gu.w, &.{ experts * @as(c_int, @intCast(2 * inter)), -1 }), wa, 0);
+            const ssel = try dsc.take(try dsc.reshape(gu.s, &.{ experts * @as(c_int, @intCast(2 * inter)), -1 }), wa, 0);
+            var o = mlx.mlx_array_new();
+            const wd = try dsv41.hostF32(try dsc.res(mlx.mlx_dequantize(&o, wsel, ssel, none, mlx.mlx_optional_int.some(@intCast(gu.qp.group_size)), mlx.mlx_optional_int.some(@intCast(gu.qp.bits)), gu.qp.mode.cstr(), none, .{ .value = .float32, .has_value = true }, dsc.s), &o));
+            defer gpa.free(wd);
+            const xd = try dsv41.hostF32(try dsc.take(c.x, try dsc.ints(xr, &.{@intCast(nd)}), 0));
+            defer gpa.free(xd);
+            const aa = try dsc.ints(ar, &.{@intCast(nd)});
+            var dg: [2][]f32 = undefined;
+            for (&dg, [_]A{ paired, split }) |*g, a| g.* = try dsv41.hostF32(try dsc.take(try dsc.reshape(a, &.{-1}), aa, 0));
+            defer for (dg) |g| gpa.free(g);
+            const dref = try gpa.alloc(f64, nd);
+            defer gpa.free(dref);
+            const lim: f64 = m.cfg.dsv4_swiglu_limit;
+            for (el[0..nd], 0..) |k, t| {
+                const q = k / inter;
+                const e: usize = @intFromFloat(sidx[q]);
+                var g: f64 = 0;
+                var u: f64 = 0;
+                for (xd[t * hidden ..][0..hidden], wd[t * hidden ..][0..hidden], wd[(nd + t) * hidden ..][0..hidden]) |xv, wg, wu| {
+                    g += @as(f64, xv) * @as(f64, wg);
+                    u += @as(f64, xv) * @as(f64, wu);
+                }
+                g = @min(g * @as(f64, es[0][e]), lim);
+                u = std.math.clamp(u * @as(f64, es[1][e]), -lim, lim);
+                dref[t] = g / (1 + @exp(-g)) * u * @as(f64, pw[q]);
+            }
+            dp = f64Err(dg[0], dref);
+            ds = f64Err(dg[1], dref);
+            for (dg[0], dg[1], dref) |a, b, t| {
+                const ua = @abs(@as(f64, a) - t);
+                const ub = @abs(@as(f64, b) - t);
+                if (ua < ub) nearer[0] += 1 else if (ub < ua) nearer[1] += 1;
+            }
+            // The largest error of each arm (the words l2 and max weigh most).
+            var big: [2]usize = .{ 0, 0 };
+            for (dg[0], dg[1], dref, 0..) |a, b, t, q| {
+                if (@abs(@as(f64, a) - t) > @abs(@as(f64, dg[0][big[0]]) - dref[big[0]])) big[0] = q;
+                if (@abs(@as(f64, b) - t) > @abs(@as(f64, dg[1][big[1]]) - dref[big[1]])) big[1] = q;
+            }
+            for (big, 0..) |q, w| std.debug.print("[moe-pair-diag] rows {d} worst {s}: float64 {e:.6}, MOE_PAIR_SCALED {e:.6}, =0 {e:.6}\n", .{ L, if (w == 0) "MOE_PAIR_SCALED" else "=0", dref[q], dg[0][q], dg[1][q] });
+        }
+        std.debug.print("[moe-pair-f64] NVFP4 rows {d}: {d} of {d} activation words differ between MOE_PAIR_SCALED and =0; from float64 at {d} pairs x {d} columns: MOE_PAIR_SCALED l2 {e:.6} max {e:.6}, =0 (split) l2 {e:.6} max {e:.6}, planted (scales swapped) l2 {e:.3} max {e:.3}; at {d} of the differing words: MOE_PAIR_SCALED l2 {e:.6} max {e:.6}, =0 l2 {e:.6} max {e:.6}; nearer at {d} vs {d} of them\n", .{ L, differ, n * inter, P, NC, ep.l2, ep.max, es_.l2, es_.max, eb.l2, eb.max, nd, dp.l2, dp.max, ds.l2, ds.max, nearer[0], nearer[1] });
+        const total = n * inter;
+        const st = try rowSteps(&csc, paired, split);
+        const differ_b = try wordsDiffer(&csc, bad, split);
+        const st_b = try rowSteps(&csc, bad, split);
+        std.debug.print("[moe-pair-f64] NVFP4 rows {d}: {d:.4}% of words differ from =0 (planted {d:.2}%); the largest difference {d:.3} bf16 steps at its row's largest value (planted {d:.3}); the largest word step {d} (planted {d}); {d} words more than one bf16 step apart, their largest =0 word {e:.3} of its row's largest; float64 l2 ratio to =0 {d:.4} over the sample (planted {d:.1}), {d:.3} over the differing words\n", .{ L, 100 * @as(f64, @floatFromInt(differ)) / @as(f64, @floatFromInt(total)), 100 * @as(f64, @floatFromInt(differ_b)) / @as(f64, @floatFromInt(total)), st.worst, st_b.worst, st.max, st_b.max, st.far, st.far_mag, ep.l2 / es_.l2, eb.l2 / es_.l2, if (ds.l2 > 0) dp.l2 / ds.l2 else 0 });
+        const in_bound = struct {
+            fn of(sv: Steps, nw: usize, na: usize, ev: F64Err, bv: F64Err) bool {
+                return sv.worst <= 1 and nw * 100 < na and ev.l2 <= 1.05 * bv.l2;
+            }
+        }.of;
+        if (!(in_bound(st, differ, total, ep, es_) and dp.l2 <= 4 * ds.l2)) ok = false;
+        try testing.expect(!in_bound(st_b, differ_b, total, eb, es_));
+    }
+    try testing.expect(ok);
+}
+
 test "dsv41 wide tol: the MoE combine and hc expand in one launch are moePrefill then hcExpand within 1% at the release widths, NVFP4 with per-expert scales, prompt row counts to 8192; an unsort off by a row or swapped post fails" {
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
@@ -291,6 +589,59 @@ test "dsv41 wide tol: the MoE combine and hc expand in one launch are moePrefill
         const rolled_post: dsv41.Split = .{ .pre = none, .post = try csc.concat(&.{ try csc.slice(sp.post, 1, 1, 4), try csc.slice(sp.post, 1, 0, 1) }, 1), .comb = sp.comb };
         try testing.expect(!try close("  planted: post on the wrong copies", want, try mtail.launch(&csc, p, x1, &rolled_post), x1, tol_kernel));
     }
+    try testing.expect(ok);
+}
+
+test "dsv41 wide: MLX_SERVE_DSV41_MOE_TAIL's one launch is the two launches' words (moePrefill's combine, then hcExpand) at the release widths, NVFP4 with per-expert scales, the down rows in pair order (PF_DOWN_TOKORD, served) and sorted, prompt rows to 8192; an unsort off by a row fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const experts: c_int = 48;
+    var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    var m: dsv41.Dsv41Model = undefined;
+    m.cfg = .{};
+    m.cfg.dsv4_swiglu_limit = 10;
+    m.act = .bfloat16;
+    m.moe_wt_kernel = null;
+    m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
+    m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
+    var ly: dsv41.Layer = undefined;
+    ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .gu = try fp4Bank(&sc, 0x7A11, experts, 2 * inter, hidden, true), .down = try fp4Bank(&sc, 0x7A12, experts, hidden, inter, true) };
+    for (&ly.experts.scale, 0..) |*v, i| v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x7A13 + i);
+    var ok = true;
+    for ([_]usize{ 17, 500, 3072, 8192 }, 0..) |L, ci| for ([_]bool{ true, false }) |tok| {
+        var csc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer csc.deinit();
+        const tk = env.override(.MLX_SERVE_DSV41_PF_DOWN_TOKORD, if (tok) null else "0");
+        defer tk.restore();
+        const c = try call(&csc, L, @intCast(experts), 0x2B00 + ci, L == 500);
+        const Lc: c_int = @intCast(L);
+        const x1 = try normal(&csc, &.{ Lc, 4, @intCast(hidden) }, .bfloat16, 1, 0x2C00 + ci);
+        const sp: dsv41.Split = .{ .pre = none, .post = try uniform(&csc, &.{ Lc, 4 }, .float32, 0.1, 2, 0x2D00 + ci), .comb = try uniform(&csc, &.{ Lc, 4, 4 }, .float32, 0, 1, 0x2E00 + ci) };
+        const p = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+        try testing.expectEqual(tok, p.tok);
+        const combine = struct {
+            fn of(s: *dsv41.Scope, mm: *const dsv41.Dsv41Model, q: dsv41.MoeParts, rows: c_int) !A {
+                const tmpl = [_]dsv41.Tmpl{ .{ .name = "D", .v = @intCast(hidden) }, .{ .name = "K", .v = top_k } };
+                return dsv41.flatKernel(s, if (q.tok) try dsv41.moeCombineTok() else mm.moe_combine_kernel, &.{ q.dn, q.inv, q.sh }, &.{ rows, @intCast(hidden) }, .bfloat16, @intCast(rows * @as(c_int, @intCast(hidden))), &tmpl);
+            }
+        }.of;
+        const want = try dsv41.hcExpand(&csc, x1, try combine(&csc, &m, p, Lc), &sp);
+        const got = try mtail.launch(&csc, p, x1, &sp);
+        const differ = try wordsDiffer(&csc, want, got);
+        // Planted: each row combining the next row's pairs.
+        const n: usize = L * top_k;
+        const off_row: dsv41.MoeParts = if (p.tok)
+            .{ .dn = try csc.concat(&.{ try csc.slice(p.dn, 0, top_k, n), try csc.slice(p.dn, 0, 0, top_k) }, 0), .inv = p.inv, .sh = p.sh, .tok = true }
+        else
+            .{ .dn = p.dn, .inv = try csc.concat(&.{ try csc.slice(p.inv, 0, top_k, n), try csc.slice(p.inv, 0, 0, top_k) }, 0), .sh = p.sh };
+        const differ_p = try wordsDiffer(&csc, want, try mtail.launch(&csc, off_row, x1, &sp));
+        std.debug.print("[moe-tail-words] rows {d}, down rows {s}: {d} of {d} words differ from the two launches; planted (unsort off by a row) {d}\n", .{ L, if (tok) "in pair order" else "sorted", differ, mlx.mlx_array_size(want), differ_p });
+        if (differ != 0) ok = false;
+        try testing.expect(differ_p > 0);
+    };
     try testing.expect(ok);
 }
 
@@ -871,6 +1222,244 @@ test "dsv41 wide tol: hc_v2's combining tail is moe_tail's combine, glm5's expan
     try testing.expect(ok);
 }
 
+/// hc's float64 math over one row's stream `s` [HC * D]: its mixes under `fnw`, `scale` and `base` (`z`), their split,
+/// and the collapse with `cpre` rms-normed by `w` (`h`); `eps` the rms's and the split's.
+const HcRef = struct { z: [hv2.MIX]f64, pre: [hv2.HC]f64, post: [hv2.HC]f64, comb: [hv2.HC * hv2.HC]f64 };
+fn hcRef(s: []const f64, fnw: []const f32, scale: []const f32, base: []const f32, cpre: []const f32, w: []const f32, eps: []const f32, iters: usize, o: *HcRef, h: []f64) void {
+    const HC = hv2.HC;
+    const D = hv2.D;
+    const N = hv2.N;
+    var sq: f64 = 0;
+    for (s) |sv| sq += sv * sv;
+    const rr = 1 / @sqrt(sq / @as(f64, @floatFromInt(N)) + @as(f64, eps[0]));
+    for (0..hv2.MIX) |mi| {
+        var d: f64 = 0;
+        for (s, fnw[mi * N ..][0..N]) |sv, fv| d += sv * @as(f64, fv);
+        o.z[mi] = d * rr * @as(f64, scale[mi]) + @as(f64, base[mi]);
+    }
+    const e: f64 = eps[1];
+    for (0..HC) |j| {
+        o.pre[j] = 1 / (1 + @exp(-o.z[j])) + e;
+        o.post[j] = 2 / (1 + @exp(-o.z[HC + j]));
+    }
+    const v = &o.comb;
+    for (0..HC) |a| {
+        const zr = o.z[2 * HC + a * HC ..][0..HC];
+        const mx = @max(@max(zr[0], zr[1]), @max(zr[2], zr[3]));
+        var t: f64 = 0;
+        for (0..HC) |b| {
+            v[a * HC + b] = @exp(zr[b] - mx);
+            t += v[a * HC + b];
+        }
+        for (0..HC) |b| v[a * HC + b] = v[a * HC + b] / t + e;
+    }
+    // Sinkhorn: 2 iters - 1 normalizations, columns first.
+    for (0..2 * iters - 1) |it| {
+        const by_row = it % 2 == 1;
+        var sums: [HC]f64 = @splat(0);
+        for (0..HC) |a| for (0..HC) |b| {
+            sums[if (by_row) a else b] += v[a * HC + b];
+        };
+        for (0..HC) |a| for (0..HC) |b| {
+            v[a * HC + b] /= sums[if (by_row) a else b] + e;
+        };
+    }
+    var hs: f64 = 0;
+    for (0..D) |d| {
+        var x: f64 = 0;
+        for (0..HC) |i| x += @as(f64, cpre[i]) * s[i * D + d];
+        h[d] = x;
+        hs += x * x;
+    }
+    const inv = 1 / @sqrt(hs / @as(f64, @floatFromInt(D)) + @as(f64, eps[0]));
+    for (h, w) |*x, wv| x.* *= inv * @as(f64, wv);
+}
+
+/// `out` = post y + comb^T x over one row in float64 (`x`, `out` [HC * D]; comb [j][i] row-major).
+fn expandRef(post: []const f32, comb: []const f32, y: []const f64, x: []const f64, out: []f64) void {
+    const HC = hv2.HC;
+    const D = hv2.D;
+    for (0..HC) |i| for (0..D) |d| {
+        var acc = @as(f64, post[i]) * y[d];
+        for (0..HC) |j| acc += @as(f64, comb[j * HC + i]) * x[j * D + d];
+        out[i * D + d] = acc;
+    };
+}
+
+/// PF_HC_V2's reorder bound on output `k` (`names` order) of side `si` (`sides` order), from float64 (`e`) against the
+/// five passes' (`ref`): the attention side's f32 mixes and split within 1e-5, x2 the five passes' words (`differ`
+/// none), every other output's l2 within 1.01x of theirs.
+fn v2Bound(si: usize, k: usize, e: F64Err, ref: F64Err, differ: usize) bool {
+    if (k == 5) return differ == 0;
+    if (si == 0 and k < 4) return e.l2 < 1e-5 and e.max < 1e-5;
+    return e.l2 <= 1.01 * ref.l2;
+}
+
+/// The rows a float64 check reads at `L` rows: the ends, a threadgroup's edge and 14 evenly between (ascending, distinct).
+fn checkRows(buf: *[32]i32, L: usize) []i32 {
+    var n: usize = 0;
+    const edge = [_]usize{ 0, 1, 2, 63, 64, 65, L - 2, L - 1 };
+    for (edge) |r| if (r < L) {
+        buf[n] = @intCast(r);
+        n += 1;
+    };
+    for (0..14) |i| {
+        buf[n] = @intCast(i * (L - 1) / 13);
+        n += 1;
+    }
+    std.mem.sort(i32, buf[0..n], {}, std.sort.asc(i32));
+    var k: usize = 0;
+    for (buf[0..n]) |r| if (k == 0 or buf[k - 1] != r) {
+        buf[k] = r;
+        k += 1;
+    };
+    return buf[0..k];
+}
+
+test "dsv41 wide tol: MLX_SERVE_DSV41_PF_HC_V2's three passes (the attention side, the FFN side, the combining tail with the next layer's attention side) are a reorder of the five passes (=0): the attention side's f32 mixes and split within 1e-5 of float64 in l2 and max, every other output within 1.01x of the five passes' float64 l2, the tail's x2 their words, at prompt widths; the wrong previous mix, a dropped norm weight and a transposed comb fail" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    var m: dsv41.Dsv41Model = undefined;
+    try hcModel(&m);
+    defer hcModelFree(&m);
+    const HC = hv2.HC;
+    const D = hv2.D;
+    const K = hv2.K;
+    const iters: usize = m.cfg.dsv4_hc_sinkhorn_iters;
+    // Each side's outputs: the mixes, the split, the normed collapse, and the tail's x2.
+    const names = [_][]const u8{ "z", "pre", "post", "comb", "h", "x2" };
+    const width = [_]usize{ hv2.MIX, HC, HC, HC * HC, D, HC * D };
+    const sides = [_][]const u8{ "attention side", "FFN side", "combining tail" };
+    var ok = true;
+    for (v2_widths, 0..) |Lc, wi| {
+        const L: usize = @intCast(Lc);
+        var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const r = try hcRows(&sc, Lc, 0xB000 + 16 * @as(u64, wi));
+        const f = try hcRows(&sc, Lc, 0xB100 + 16 * @as(u64, wi));
+        const mp = try moeParts(&sc, Lc, 0xB200 + 16 * @as(u64, wi));
+        const eps = try dsv41.hcEps(&sc, &m);
+        const sa: dsv41.Split = .{ .pre = r.cpre, .post = r.sp.post, .comb = r.sp.comb };
+        const sf: dsv41.Split = .{ .pre = f.cpre, .post = f.sp.post, .comb = f.sp.comb };
+        const nx: hv2.Next = .{ .hc = &f.hc, .norm_w = f.w };
+        // The switch's passes, the five passes as a wide layer serves them at =0, and a planted bug in each side.
+        const n_a = try hv2.attn(&sc, &m, r.x, r.cpre, &r.hc, r.w);
+        const n_f = try hv2.ffn(&sc, &m, r.x, r.y, &sa, &r.hc, r.w);
+        const n_t = try hv2.tail(&sc, &m, r.x, r.y, &sa, .{ .parts = mp.p }, &sf, nx);
+        const o_a = try dsv41.hcMixNormFused(&sc, &m, r.x, r.cpre, &r.hc, r.w, null, eps);
+        const o_f = try dsv41.hcExpandPreNorm(&sc, &m, r.x, r.y, &sa, sa.pre, &r.hc, r.w);
+        const o_fz = try dsv41.hcMixWide(&sc, &m, o_f.x1, &r.hc, eps);
+        const o_x2 = try mtail.launch(&sc, mp.p, o_f.x1, &sf);
+        const o_n = try dsv41.hcMixNormFused(&sc, &m, o_x2, f.cpre, &f.hc, f.w, null, eps);
+        const p_a = try hv2.attn(&sc, &m, r.x, try sc.add(r.cpre, try sc.f(0.5)), &r.hc, r.w);
+        const p_f = try hv2.ffn(&sc, &m, r.x, r.y, &sa, &r.hc, try sc.ones(&.{@intCast(hidden)}, .bfloat16));
+        const sf_t: dsv41.Split = .{ .pre = f.cpre, .post = f.sp.post, .comb = try sc.transpose(f.sp.comb, &.{ 0, 2, 1 }) };
+        const p_t = try hv2.tail(&sc, &m, r.x, r.y, &sa, .{ .parts = mp.p }, &sf_t, nx);
+        const nt = n_t.next.?;
+        const pt = p_t.next.?;
+        // [side][arm: switch, =0, planted][output]; the attention and FFN sides hold no x2.
+        const outs = [3][3][6]A{
+            .{ .{ n_a.z, n_a.n.sp.pre, n_a.n.sp.post, n_a.n.sp.comb, n_a.n.h, none }, .{ o_a.z, o_a.n.sp.pre, o_a.n.sp.post, o_a.n.sp.comb, o_a.n.h, none }, .{ p_a.z, p_a.n.sp.pre, p_a.n.sp.post, p_a.n.sp.comb, p_a.n.h, none } },
+            .{ .{ n_f.z, n_f.n.sp.pre, n_f.n.sp.post, n_f.n.sp.comb, n_f.n.h, none }, .{ o_fz, o_f.sp.pre, o_f.sp.post, o_f.sp.comb, o_f.h, none }, .{ p_f.z, p_f.n.sp.pre, p_f.n.sp.post, p_f.n.sp.comb, p_f.n.h, none } },
+            .{ .{ nt.z, nt.n.sp.pre, nt.n.sp.post, nt.n.sp.comb, nt.n.h, n_t.x2 }, .{ o_n.z, o_n.n.sp.pre, o_n.n.sp.post, o_n.n.sp.comb, o_n.n.h, o_x2 }, .{ pt.z, pt.n.sp.pre, pt.n.sp.post, pt.n.sp.comb, pt.n.h, p_t.x2 } },
+        };
+        var rb: [32]i32 = undefined;
+        const rows = checkRows(&rb, L);
+        const R = rows.len;
+        const at = try sc.ints(rows, &.{@intCast(R)});
+        const H = struct {
+            fn rowsOf(s: *dsv41.Scope, x: A, a: A) ![]f32 {
+                return dsv41.hostF32(try s.take(x, a, 0));
+            }
+        };
+        // The inputs at the check rows.
+        const xs = try H.rowsOf(&sc, r.x, at);
+        defer gpa.free(xs);
+        const ys = try H.rowsOf(&sc, r.y, at);
+        defer gpa.free(ys);
+        const sa_post = try H.rowsOf(&sc, r.sp.post, at);
+        defer gpa.free(sa_post);
+        const sa_comb = try H.rowsOf(&sc, r.sp.comb, at);
+        defer gpa.free(sa_comb);
+        const sa_pre = try H.rowsOf(&sc, r.cpre, at);
+        defer gpa.free(sa_pre);
+        const sf_post = try H.rowsOf(&sc, f.sp.post, at);
+        defer gpa.free(sf_post);
+        const sf_comb = try H.rowsOf(&sc, f.sp.comb, at);
+        defer gpa.free(sf_comb);
+        const sf_pre = try H.rowsOf(&sc, f.cpre, at);
+        defer gpa.free(sf_pre);
+        const inv_at = try sc.reshape(try sc.take(try sc.reshape(mp.p.inv, &.{ Lc, @intCast(K) }), at, 0), &.{@intCast(R * K)});
+        const dns = try H.rowsOf(&sc, mp.p.dn, inv_at);
+        defer gpa.free(dns);
+        const shs = try H.rowsOf(&sc, mp.p.sh, at);
+        defer gpa.free(shs);
+        var hw: [2][4][]f32 = undefined;
+        for ([_]*const HcRows{ &r, &f }, &hw) |src, *dst| for ([_]A{ src.hc.fn_w, src.hc.scale, src.hc.base, src.w }, dst) |a, *d| {
+            d.* = try dsv41.hostF32(a);
+        };
+        defer for (hw) |q| for (q) |d| gpa.free(d);
+        const epsh = try dsv41.hostF32(eps);
+        defer gpa.free(epsh);
+        // float64 at the check rows, [side][output].
+        var want: [3][6][]f64 = undefined;
+        for (&want) |*sd| for (sd, width) |*w, wd| {
+            w.* = try gpa.alloc(f64, R * wd);
+        };
+        defer for (want) |sd| for (sd) |w| gpa.free(w);
+        const buf = try gpa.alloc(f64, 4 * HC * D + D);
+        defer gpa.free(buf);
+        const s0 = buf[0 .. HC * D];
+        const s1 = buf[HC * D ..][0 .. HC * D];
+        const s2 = buf[2 * HC * D ..][0 .. HC * D];
+        const yv = buf[3 * HC * D ..][0..D];
+        for (0..R) |ri| {
+            for (s0, xs[ri * HC * D ..][0 .. HC * D]) |*d, v| d.* = v;
+            for (yv, ys[ri * D ..][0..D]) |*d, v| d.* = v;
+            expandRef(sa_post[ri * HC ..][0..HC], sa_comb[ri * HC * HC ..][0 .. HC * HC], yv, s0, s1);
+            for (yv, 0..) |*d, c| {
+                var acc: f64 = shs[ri * D + c];
+                for (0..K) |k| acc += dns[(ri * K + k) * D + c];
+                d.* = acc;
+            }
+            expandRef(sf_post[ri * HC ..][0..HC], sf_comb[ri * HC * HC ..][0 .. HC * HC], yv, s1, s2);
+            @memcpy(want[2][5][ri * HC * D ..][0 .. HC * D], s2);
+            for ([_][]const f64{ s0, s1, s2 }, [_][]const f32{ sa_pre, sa_pre, sf_pre }, [_]usize{ 0, 0, 1 }, 0..) |st, cp, wsrc, si| {
+                var o: HcRef = undefined;
+                const hw_ = hw[wsrc];
+                hcRef(st, hw_[0], hw_[1], hw_[2], cp[ri * HC ..][0..HC], hw_[3], epsh, iters, &o, want[si][4][ri * D ..][0..D]);
+                @memcpy(want[si][0][ri * hv2.MIX ..][0..hv2.MIX], &o.z);
+                @memcpy(want[si][1][ri * HC ..][0..HC], &o.pre);
+                @memcpy(want[si][2][ri * HC ..][0..HC], &o.post);
+                @memcpy(want[si][3][ri * HC * HC ..][0 .. HC * HC], &o.comb);
+            }
+        }
+        for (0..3) |si| {
+            var side_ok = true;
+            var planted_ok = true;
+            for (0..6) |k| {
+                if (outs[si][0][k].ctx == null) continue;
+                var g: [3][]f32 = undefined;
+                for (&g, 0..) |*v, ai| v.* = try H.rowsOf(&sc, outs[si][ai][k], at);
+                defer for (g) |v| gpa.free(v);
+                const en = f64Err(g[0], want[si][k]);
+                const er = f64Err(g[1], want[si][k]);
+                const ep = f64Err(g[2], want[si][k]);
+                const differ = try wordsDiffer(&sc, outs[si][0][k], outs[si][1][k]);
+                const differ_p = if (k == 5) try wordsDiffer(&sc, outs[si][2][k], outs[si][1][k]) else 0;
+                const in_bound = v2Bound(si, k, en, er, differ);
+                std.debug.print("[hcv2-f64] rows {d} {s} {s}: from float64 ({d} rows) PF_HC_V2 l2 {e:.4} max {e:.4}, =0 l2 {e:.4} max {e:.4}, planted l2 {e:.3} max {e:.3}; {d} of {d} words differ from =0{s}\n", .{ L, sides[si], names[k], R, en.l2, en.max, er.l2, er.max, ep.l2, ep.max, differ, mlx.mlx_array_size(outs[si][0][k]), if (in_bound) "" else "; PF_HC_V2 OUTSIDE ITS REORDER BOUND" });
+                if (!in_bound) side_ok = false;
+                if (!v2Bound(si, k, ep, er, differ_p)) planted_ok = false;
+            }
+            if (!side_ok) ok = false;
+            try testing.expect(!planted_ok);
+        }
+    }
+    try testing.expect(ok);
+}
+
 // ── a release-shape pair worker's prefill ──
 
 const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2, .MLX_SERVE_DSV41_PF_MOE_EPI, .MLX_SERVE_DSV41_PF_IDX_NAX };
@@ -1209,19 +1798,30 @@ fn flashTrimKernel(comptime plant: u1) !mlx.mlx_fast_metal_kernel {
 /// reference's and its largest element over the reference's largest.
 const FErr = struct { l2: f64, max: f64 };
 fn spanErr(s: *const Span, got: A, rows: []const usize) !FErr {
+    const ref = try spanRefs(s, rows);
+    defer testing.allocator.free(ref);
+    return spanErrTo(s, got, rows, ref);
+}
+
+/// The float64 heads at `rows` (`Span.reference`), [rows, HEADS, PLAIN]; the caller frees.
+fn spanRefs(s: *const Span, rows: []const usize) ![]f64 {
+    const ref = try testing.allocator.alloc(f64, rows.len * HEADS * PLAIN);
+    for (rows, 0..) |l, i| s.reference(l, ref[i * HEADS * PLAIN ..][0 .. HEADS * PLAIN]);
+    return ref;
+}
+
+/// `spanErr` against the float64 heads `ref` (`spanRefs`).
+fn spanErrTo(s: *const Span, got: A, rows: []const usize, ref: []const f64) !FErr {
     const g = try dsv41.hostF32(got);
     defer testing.allocator.free(g);
-    const ref = try testing.allocator.alloc(f64, HEADS * PLAIN);
-    defer testing.allocator.free(ref);
     var dd: f64 = 0;
     var rr: f64 = 0;
     var dm: f64 = 0;
     var rm: f64 = 0;
     const hg = HEADS / OG;
-    for (rows) |l| {
-        s.reference(l, ref);
+    for (rows, 0..) |l, i| {
         for (0..HEADS) |h| for (0..PLAIN) |d| {
-            const w = ref[h * PLAIN + d];
+            const w = ref[(i * HEADS + h) * PLAIN + d];
             const x: f64 = g[((h / hg) * s.c.L + l) * hg * HD + (h % hg) * HD + d];
             dd += (x - w) * (x - w);
             rr += w * w;
@@ -1323,6 +1923,68 @@ test "dsv41 wide tol: FLASH_PSUM's heads, alone and beside FLASH_TRIM, are no fu
             // planted: window keys a row late leave FLASH_ATTN's own error far behind
             ok = ok and ep.l2 > 10 * e1.l2;
         }
+    }
+    try testing.expect(ok);
+}
+
+test "dsv41 wide tol: MLX_SERVE_DSV41_FLASH_ATTN's heads, alone and beside FLASH_TRIM (served), are no farther from float64 than the gather's (=0) in l2 and max, f32 and bf16 out, at the release's spans the gather serves, through attnGather as the load builds it; window keys a row late fail" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const saved = fa.ps().*;
+    defer fa.ps().* = saved;
+    const arms = [_][]const u8{ "the gather (=0)", "FLASH_ATTN", "FLASH_ATTN + FLASH_TRIM" };
+    var g: [3]dsv41.GatherAttn = undefined;
+    for (&g, [_]fa.Mode{ .off, .on, .on }, [_]bool{ false, false, true }) |*a, mode, trim| {
+        fa.ps().* = .{ .mode = mode, .trim = trim };
+        a.* = try dsv41.GatherAttn.init();
+    }
+    defer for (&g) |*a| a.deinit();
+    const kp = try flashKernel(false, false, 1);
+    defer _ = mlx.mlx_fast_metal_kernel_free(kp);
+    var m: dsv41.Dsv41Model = undefined;
+    m.cfg = .{};
+    m.cfg.sliding_window = WIN;
+    m.cfg.dsv4_o_groups = OG;
+    m.cfg.dsv4_rope_head_dim = 64;
+    var ok = true;
+    for (span_cases, 0..) |c, ci_| {
+        var s = try Span.init(&sc, c, 40 + 10 * ci_);
+        defer s.deinit();
+        const rows = [_]usize{ 0, 1, 2, c.L / 3, c.L / 2, c.L - 2, c.L - 1 };
+        const ref = try spanRefs(&s, &rows);
+        defer gpa.free(ref);
+        const comp = if (c.K > 0) s.comp else none;
+        const topk = if (c.K > 0) s.picks else none;
+        var e: [2][3]FErr = undefined;
+        var o: [2][3]A = undefined;
+        var served: usize = 0;
+        for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }, 0..) |ot, oi| for (&g, 0..) |*a, ai| {
+            m.attn_gather = a.*;
+            m.act = ot;
+            o[oi][ai] = (try dsv41.attnGather(&sc, &m, s.sink, s.q, none, s.keys_w, c.wp, comp, topk, Span.scale, .{ .periods = s.periods, .p0 = Span.p0 })) orelse continue;
+            e[oi][ai] = try spanErrTo(&s, o[oi][ai], &rows, ref);
+            served += 1;
+        };
+        // A span the gather declines (picks not a multiple of 64) declines the flash kernel too: both take the f16 core.
+        if (served == 0) {
+            std.debug.print("[fa-gather] L={d} wp={d} K={d}: neither arm serves (both the f16 core)\n", .{ c.L, c.wp, c.K });
+            continue;
+        }
+        try testing.expectEqual(@as(usize, 6), served);
+        const ep = try spanErrTo(&s, try s.flash(&sc, kp, false, .float32), &rows, ref);
+        for (0..2) |oi| {
+            const dt = if (oi == 0) "f32" else "bf16";
+            for (1..3) |ai| {
+                const near = e[oi][ai].l2 <= e[oi][0].l2 and e[oi][ai].max <= e[oi][0].max;
+                std.debug.print("[fa-gather] L={d} wp={d} K={d} {s} out: rel l2 / max vs float64: {s} {e:.3}/{e:.3}, {s} {e:.3}/{e:.3}; {d} of {d} words differ from the gather; no farther {}\n", .{ c.L, c.wp, c.K, dt, arms[0], e[oi][0].l2, e[oi][0].max, arms[ai], e[oi][ai].l2, e[oi][ai].max, try wordsDiffer(&sc, o[oi][ai], o[oi][0]), mlx.mlx_array_size(o[oi][0]), near });
+                if (!near) ok = false;
+            }
+        }
+        std.debug.print("[fa-gather] L={d} wp={d} K={d}: planted (window keys a row late) f32 {e:.3}/{e:.3}\n", .{ c.L, c.wp, c.K, ep.l2, ep.max });
+        try testing.expect(!(ep.l2 <= e[0][0].l2 and ep.max <= e[0][0].max));
     }
     try testing.expect(ok);
 }
