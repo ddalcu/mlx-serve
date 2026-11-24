@@ -1,23 +1,27 @@
 # DeepSeek-V4.1-Flash-1017 NVFP4 in mlx-serve
 
 Status: production guide for the `deepseek_v41` runner in mlx-serve core, PR 1256, 2026-11-24. We measured build
-`a99fc4f6`. Later commits change no served code: docs and comments, tests, the shipped draft vocabulary and its builder. "We" are the PR 1256 authors,
-who tuned and measured on M5 Ultra Macs with 512 GB of memory. The PR body holds the A/B evidence. Agent and code
+`a99fc4f6`. Later commits remove off-by-default arms and restructure two paths; the defaults' kernels do not change
+(the PR's reply comments list the commits and their checks). "We" are the PR 1256 authors, who tuned and measured on
+M5 Ultra Macs with 512 GB of memory. The PR body holds the A/B evidence. Agent and code
 notes for this folder are in [AGENTS.md](AGENTS.md).
 
 ## Summary
 
-This plugin serves NVIDIA's `DeepSeek-V4.1-Flash-1017-NVFP4` checkpoint on Apple GPUs. It serves the full
-1,048,576-token context: a 1,032,192-token prompt ran at 3,913 tok/s prefill and 110.7 tok/s greedy decode. A converter rewrites the checkpoint's file headers and adds two side shards for scales, so the weight
-codes keep NVIDIA's bytes and the routed experts stay in NVFP4. DeepSeek's own drafter, DSpark, proposes tokens that the model checks in one
-step, and this makes decode faster. The defaults are the release configuration: you set no switch. On
-an M5 Ultra with 512 GB, the release build decoded 98.80 tok/s greedy and prefilled 5,551 tok/s on the standard
-test's p01 prompt, against 73.83 and 4,108 tok/s for the stock runner on the MXFP4 pack (see "Results"). Part is the pack: on the
-NVFP4 pack the code took decode from 71.77 to 98.80 and prefill from 3,994 to 5,551. The plugin has 52 default-on
-switches (51 on M5, where `ATTN_F16` is off). We count 50 of them as lossless against the plugin's own `=0` path, not
-against a reference implementation (see "Accuracy"). The two outside are an 8-bit LM head, whose KLD was within one
-standard error of the bf16 head's, and, on Macs without neural accelerators (M4 and older), a lossy f16 attention core. On EvalPlus the release build scored 161/164 on HumanEval and 366/378 on MBPP
-(base tests).
+This plugin serves NVIDIA's `DeepSeek-V4.1-Flash-1017-NVFP4` checkpoint on Apple GPUs, up to the full
+1,048,576-token context. A converter rewrites the checkpoint's file headers and adds two side shards for scales. The
+weight codes keep NVIDIA's bytes, and the routed experts stay in NVFP4. DeepSeek's own drafter, DSpark, proposes
+tokens that the model checks in one step, which makes decode faster. The defaults are the release configuration.
+
+On an M5 Ultra with 512 GB, the release build decoded 98.80 tok/s greedy and prefilled 5,551 tok/s on the standard
+test's p01 prompt. The stock runner gave 71.77 and 3,994 tok/s on the same NVFP4 pack (see "Results"). The NVFP4 pack
+is 2.8% slower than the MXFP4 pack on the stock build, so the whole gain comes from the code.
+
+The plugin has 52 default-on switches (51 on M5, where `ATTN_F16` is off). We count 50 of them as lossless against
+the plugin's own `=0` path, not against a reference implementation (see "Accuracy"). The two outside are an 8-bit LM
+head, whose KLD was within one standard error of the bf16 head's, and a lossy f16 attention core. That core is on by
+default only without NAX. NAX is the M5 GPU's matrix units; M4 and older Macs have none. On EvalPlus the release
+build scored 161/164 on HumanEval and 366/378 on MBPP (base tests).
 
 ## Serve the model on an M5 Ultra with 512 GB
 
@@ -28,9 +32,10 @@ standard error of the bf16 head's, and, on Macs without neural accelerators (M4 
    the result when it finishes. Put DST_DIR on the same APFS volume as SRC_DIR. Keep SRC_DIR, because a shard with
    no change is a symlink to it.
 4. Copy the plugin's draft-vocab.txt into the pack folder: `cp src/plugins/deepseek_v41/draft-vocab.txt DST_DIR/`.
-   It narrows DSpark's greedy drafts to 65,536 common token ids, which gave +1.46% decode; the verify and sampled
-   requests still use the whole vocabulary. For another workload, rebuild it with `scripts/dsv41_draft_vocab.py`.
-5. Raise Metal's wired-memory limit to 512000 MB (500 GiB): `sudo sysctl iogpu.wired_limit_mb=512000`.
+   The converter does not write it, and without it DSpark drafts over the whole vocabulary. It narrows the greedy
+   drafts to 65,536 common token ids, which gave +1.46% decode. For another workload, rebuild it with
+   `scripts/dsv41_draft_vocab.py`.
+5. Raise Metal's wired-memory limit to 512000 MiB (500 GiB, 536.9 GB): `sudo sysctl iogpu.wired_limit_mb=512000`.
 6. Start the server: `mlx-serve --model DST_DIR --serve --warmup-full`. It listens on port 11234 by default.
 7. Get the model's id: `curl -s 127.0.0.1:11234/v1/models`.
 8. Send a first request:
@@ -46,7 +51,7 @@ the NVFP4 pack. `sysctl` sets the wired limit for the running system only, so se
 To check a converted pack again later, run the converter with `--check`; it then checks and does not convert.
 
 Every run in this
-release's A/Bs and cells used 512000. If Metal's working-set limit refuses a load, the engine's error names the
+release's A/Bs and cells used 512000 MiB; the stock A/B used 440320 MiB. If Metal's working-set limit refuses a load, the engine's error names the
 `sudo sysctl` command that admits it. We have not tried this release at macOS's default limit. The build that PR 1256
 showed before this release (`58279979`) loaded at the default limit and peaked at 438.6 GB.
 
@@ -75,10 +80,10 @@ general it is the more accurate format. `--experts-mxfp4` writes the experts as 
 
 The pack ships the LM head in bf16. At load, the plugin requantizes it to 8-bit affine at group 64
 (`MLX_SERVE_DSV41_HEAD8`, on). The trunk and the drafter share this head. Its KLD was within one standard error of the bf16 head's
-(the block below has the numbers), and the bf16 head (`=0`) cost 4.95% of decode speed with DSpark on.
+(the block below has the numbers). The bf16 head (`=0`) cost 4.95% of decode speed with DSpark on.
 
 <details>
-<summary>The MXFP4 form, the head's KLD and the expert scales</summary>
+<summary>The MXFP4 form, the LM head's KLD and the expert scales</summary>
 
 On 50 prompts and 1,600 positions, the 8-bit head's mean KLD was 0.1020 and the bf16 head's was 0.1021. The paired
 difference, bf16 minus 8-bit, was +0.00007 ± 0.00025 (one standard error), and top-1 agreement was 92.6% for both. The
@@ -114,8 +119,9 @@ to a value that does not start with 0; then the stages load, and drafting stays 
 
 For a greedy request, the drafter proposes its argmax tokens, and the verify keeps the longest prefix that the model
 agrees with. The verify rows run multi-row kernels, which do the math of a plain decode step in another sum order. So
-greedy text with DSpark on can differ from plain decode by rounding. `MLX_SERVE_DSV41_EXACT=1` makes each verify
-row run its plain step's kernels, and greedy DSpark text is then plain decode's bytes, at some speed cost.
+greedy text with DSpark on can differ from plain decode by rounding. Under `MLX_SERVE_DSV41_EXACT=1`, greedy DSpark
+text is plain decode's bytes, one request at a time. We have not measured its speed cost (see "Switches that stay
+opt-in").
 
 Sampled requests use standard speculative sampling (`MLX_SERVE_DSV41_DRAFT_SAMPLE`), so the output keeps the model's
 distribution (the block below has the rule).
@@ -166,8 +172,7 @@ release won its A/B on an M5 Ultra with 512 GB, except three washes kept because
 - The prompt pass width scales with memory (`PF_PASS_SIZE`).
 - Where the Engram tables do not fit in memory, the plugin reads them from disk at each lookup. The switches that need
   every table in memory then turn off, and the kernel family falls back to the `ssd` path (`WEIGHT_PATH`).
-- GPUs without neural accelerators (NAX, the M5 GPU's matrix units) do not run the matrix-unit kernels. This covers
-  M4 and older.
+- GPUs without NAX (M4 and older) do not run the matrix-unit kernels.
 
 </details>
 
@@ -178,25 +183,28 @@ We did not tune or measure any machine other than the M5 Ultra with 512 GB.
 The engine admits a load or a request only when the plugin's memory bill fits (its admission check). The KV cache
 costs only 3,200 bytes per token (3.36 GB at 1,048,576 tokens); the block below has the bill's four parts.
 
-On the release build, a 1,032,192-token prompt (the 1M window less a 16,384-token output budget) peaked at
-480.5 GB, and the whole machine's non-file memory peaked at 489.7 GB (502.0 GB at most over the sweep), against the
-536.9 GB wired limit (512000 MB), with 0 pageouts. At macOS's default limit (480 GB available on this Mac) the 1M point
-probably does not fit; we have not tried it.
+A 1,032,192-token prompt (the 1M window less a 16,384-token output budget) ran to the end at a 480.5 GB peak, with
+the wired limit at 512000 MiB (536.9 GB). At macOS's default limit it probably does not fit (the block below).
 
-The memory cost has two parts. The pack: NVFP4's 16-value groups carry more scale bytes, so its weights bill is
-404.33 GB against 384.16 GB for the MXFP4-experts pack (+20.2 GB), and its standard-test peak was 17.9 GB higher.
-This PR, on the same NVFP4 pack: the standard-test peak went from 438.6 GB at the last reviewed head to 452.3 GB.
-`PF_KEEP_WIDE` adds 7.3 GB, the Engram partials cache (`ENGRAM_KV_CACHE`) 4.0 GB, and `PF_PASS_SIZE` 3.9 GB;
-`MOE_PAIR_SCALED` (-1.4 GB) and `PF_COMP_BF16` (-0.7 GB) bring the net to 13.7 GB. These trade memory for speed
-(`PF_PASS_SIZE` +7.96% prefill, `PF_KEEP_WIDE` +2.19%). We kept them because the full 1M context still fits. Against the
-stock runner the release peaks 31.6 GB higher (420.7 to 452.3 GB).
+On the standard test the release peaks 31.6 GB higher than the stock runner on the MXFP4 pack (420.7 to 452.3 GB).
+The NVFP4 pack adds 17.9 GB, because its 16-value groups carry more scale bytes. The code adds 13.7 GB (438.6 GB at
+the last reviewed head; the stock runner also peaked at 438.6 GB on NVFP4). Six changes moved the peak by more than
+0.5 GB: `PF_KEEP_WIDE` +7.3 GB, the Engram partials cache (`ENGRAM_KV_CACHE`) +4.0, `PF_PASS_SIZE` +3.9,
+`MOE_PAIR_SCALED` -1.4, `PF_COMP_BF16` -0.7 and `FLASH_ATTN` -0.7. The other +1.3 GB is drift between A/B bases. These
+trade memory for speed (`PF_PASS_SIZE` +7.96% prefill, `PF_KEEP_WIDE` +2.19%). We kept them because the full 1M
+context still fits.
 
 <details>
-<summary>The four parts of the memory bill, and the 1M admission</summary>
+<summary>The four parts of the memory bill, the 1M fit and its admission</summary>
+
+At 1M the whole machine's non-file memory peaked at 489.7 GB (502.0 GB at most over the sweep), against the 536.9 GB
+wired limit, with 0 pageouts. At macOS's default limit (480 GB available on this Mac) the 1M point probably does not
+fit; we have not tried it. The weights bill is 404.33 GB for the NVFP4 pack against 384.16 GB for the MXFP4-experts
+pack (+20.2 GB).
 
 | Part | Where the code computes it | Size for this model |
 |---|---|---|
-| Resident load | `residentBytes` (`plugin.zig`) calls `residentDiskBytes` (`deepseek_v41.zig`) | The pack's shards less the tensors it drops, plus the Engram tables it holds, the Engram LRU (256 MiB), the Engram partials' cache (4 GB) and the draft-only head |
+| Resident load | `residentBytes` (`plugin.zig`) calls `residentDiskBytes` (`deepseek_v41.zig`) | The pack's shards less the tensors it drops, plus the Engram tables it holds, the Engram LRU (256 MiB), the Engram partials cache (`ENGRAM_KV_CACHE`, 4 GB) and the draft-only head |
 | Compressed KV per token | `kvPerToken` (`bill.zig`) | 3,200 bytes per token |
 | Window rings | the rings part of `prefillBytes`'s `state` term (`deepseek_v41.zig`) | 40 layers x (128 + 16) rows x 512 x 2 bytes, about 5.9 MB |
 | Prompt pass | `prefillBytes` (`deepseek_v41.zig`), plus the `PF_KEEP_WIDE` reserve | Grows with the pass width. `PF_PASS_SIZE` picks the widest pass that fits the memory share; a set `--prefill-chunk` narrows it |
@@ -207,7 +215,8 @@ compressed 2:1 in the first three and 1:1 in layer 20.
 
 On the release build, the 1,032,192-token prompt passed the admission check with 36,087 MB needed and about
 73,320 MB available, with an 18.6 GB `PF_KEEP_WIDE` reserve at 44,544-row passes. The Engram partials cache (`ENGRAM_KV_CACHE`) allocates
-3,787 MiB (3.97 GB) of its 4.0 GB cap on this pack.
+3,787 MiB (3.97 GB) of its 4.0 GB cap on this pack. The reserve replaces allocations that the pass made anyway, so the
+peak rises by 7.3 GB, not by the reserve's size.
 
 `PF_KEEP_WIDE`'s reserve needs `patches/mlx-metal-wide-reserve.patch`, which adds a reserve of large Metal buffers to
 MLX's allocator. A prompt pass then does not map fresh pages in every request. Without the patched libmlx, the plugin
@@ -217,44 +226,50 @@ declines the switch by name and logs why.
 
 ## Accuracy: what "lossless" means here
 
-A default-on switch counts as lossless when its error against float64, over its test set, is no larger than its `=0`
-path's, or, for three named switches, within a stated bound. A bit-identical switch passes this test. Each class below compares a switch with the plugin's own
-`=0` path. No test compares the whole stack with a reference implementation (see "Gaps").
+Each class compares a switch with the plugin's own `=0` path. No test compares the whole stack with a reference
+implementation (see "Gaps"). 50 plugin switches fall in three classes, and a fourth class, TF32, covers one engine
+variable:
+- EXACT: the same bits as the `=0` path.
+- REORDER: not bit-identical, but measured no farther from float64 than the `=0` path, or within a stated bound.
+- DRAFT-ONLY: changes only the drafts, or how many rows a verify checks.
+- TF32: MLX's TF32 matmuls, which on M5 at the defaults round only the drafter's P·V.
 
-The test measures error, not formats. The flash kernel, the gather (the plugin's three-launch attention core on the
+28 of the 50 have a standing test or a kernel contract case. 22 we class by the commit's reasoning (11) or by their
+A/B giving the same text (11), not by a measurement.
+
+| Class | Default-on switches |
+|---|---|
+| EXACT | 29 |
+| REORDER | 15 |
+| DRAFT-ONLY | 6, including `DRAFT_VOCAB` |
+| TF32 | 1 (engine) |
+
+The two exceptions, both defaults before this PR, are `HEAD8` (the 8-bit LM head in "What the pack holds") and
+`ATTN_F16`, an attention core with f16 scores and probabilities. One function, `attnCore`, picks the core for every
+prompt-attention call (the block below).
+
+<details>
+<summary>The classes, the attention core, the tests and their results</summary>
+
+| REORDER switches | How many |
+|---|---|
+| Measured no farther from float64 than the `=0` path | 8 |
+| Held to a stated bound (`MOE_PAIR_SCALED`, `PF_HC_V2`, `ENGRAM_GPU_IDS`) | 3 |
+| Resting on the commit's reasoning (`CED`, the chunked prompt path; `PF_PASS_SIZE`; `PF_IDX_NAX`) | 3 |
+| Resting on its A/B's same text, unbounded, until a word-for-word test exists (`HC_EXPAND_NORM`) | 1 |
+
+A DRAFT-ONLY switch keeps the verify's rule: a greedy verify keeps only tokens that the model agrees with, and a
+sampled verify keeps the model's distribution. Greedy text can still change by rounding, because the verify kernels'
+sum order depends on the verify width. At the defaults on M5, TF32 rounds no input of the model's own matmuls, only
+the drafter's P·V, so it passes for the same reason as DRAFT-ONLY. We have not checked TF32 without NAX.
+
+The tests measure error, not formats. The flash kernel, the gather (the plugin's three-launch attention core on the
 matrix units, `FLASH_ATTN`'s `=0` path) and the f32 chain (MLX's matmuls and softmax in f32) under TF32 all round the
 attention probabilities to a 10-bit mantissa. `FLASH_ATTN` passes, because its output is nearer to float64 than the
 gather's. `ATTN_F16` fails, because its f16 scores and probabilities are 10% to 37% farther.
 
-| Class | What it means | Default-on switches |
-|---|---|---|
-| EXACT | Bit-identical to the `=0` path | 29 |
-| REORDER | Not bit-identical: another sum order or tie-break, measured no farther from float64 than the `=0` path, or within a stated bound | 15: 8 measured no farther, 3 held to stated bounds, 3 resting on the commit's reasoning, 1 (`HC_EXPAND_NORM`) resting on its A/B's same text, unbounded, until a word-for-word test exists |
-| DRAFT-ONLY | Changes what the drafter proposes or how many rows a verify checks. A greedy verify still keeps only tokens that the model agrees with, and a sampled verify keeps the model's distribution. Greedy text can still change by rounding, because the verify kernels' sum order depends on the verify width | 6, including `DRAFT_VOCAB` |
-| TF32 | MLX's TF32 matmul (`MLX_ENABLE_TF32`, on) | 1 (engine) |
-
-At the defaults on M5, TF32 rounds no input of the model's own matmuls. It rounds only the drafter's P·V, which
-changes the drafts, not the tokens that the model accepts. So TF32 passes for the same reason as DRAFT-ONLY.
-
-We class 50 plugin switches and 4 engine variables. Of the 50, 28 have a standing test or a kernel contract case, 11
-rest on their A/B giving the same text, and 11 on the commit's reasoning (see "Gaps").
-
-There are two exceptions, and both were defaults before this PR. This PR measures and documents them. The first is
-`HEAD8`, the 8-bit LM head described in "What the pack holds". The second is `ATTN_F16`, an attention core with f16
-scores and probabilities.
-
-One function, `attnCore`, picks the core for every prompt-attention call: on NAX the flash kernel where it fits, then
-the gather, then the f32 chain (the block below has the limits).
-
-Without NAX the f16 core serves, by default as before this release, every prompt-attention call that fits its
-1,024-column softmax, and the f32 chain takes the rest; on NAX it serves only
-under an explicit `ATTN_F16=1` (the block below says why).
-
-Two earlier fixes left paths to the f16 core on M5. `rel-harden-f` gives the choice one owner, `attnCore`, with tests
-on the served routes of a full-model fixture.
-
-<details>
-<summary>The tests, and their results</summary>
+Two earlier fixes left paths to the f16 core on M5. `4452a4bd` gives the choice one owner, `attnCore`, with tests on
+the served routes of a full-model fixture.
 
 One function, `attnCore`, picks the core for every prompt-attention call. It decides from the call's shape, dtypes and
 device and the load's switches only, never from the caller (a debug trace also turns off flash). On NAX it takes the first core that fits:
@@ -264,13 +279,10 @@ device and the load's switches only, never from the caller (a debug trace also t
 2. the gather, where the pick count (the compressed rows that the indexer picks) is a multiple of 64;
 3. the f32 chain (MLX's matmuls and softmax in f32).
 
-Without NAX the plugin has no flash kernel and no gather, because both need the matrix units. Every prompt-attention
-call there takes the f16 core, or the f32 chain under `ATTN_F16=0`. The f16 core was mlx-serve's default there before
-this release. We kept it, because we have not measured the speed or the error of the f32 chain (`=0`) on those Macs. On NAX the f16 core serves only under an
+Without NAX the plugin has no flash kernel and no gather, because both need the matrix units. A call that fits the
+f16 core's 1,024-column softmax takes the f16 core, or the f32 chain under `ATTN_F16=0`; the f32 chain takes the rest.
+The f16 core was mlx-serve's default there before this release. We kept it, because we have not measured the speed or the error of the f32 chain (`=0`) on those Macs. On NAX the f16 core serves only under an
 explicit `ATTN_F16=1`. The load fixes the switch's value, and the prompt cache's layout hash includes it.
-
-The three bounded switches are `MOE_PAIR_SCALED`, `PF_HC_V2` and `ENGRAM_GPU_IDS`. The three that rest on reasoning
-are `CED` (the chunked prompt path), `PF_PASS_SIZE` and `PF_IDX_NAX`. The classed-switch counts are in the main text above.
 
 TF32 rounds an f32 matmul's operands to a 10-bit mantissa. On M5 at the defaults, every prompt-attention call takes
 the flash kernel or the gather, and the trunk's f32 matmuls read bf16 values held in f32 or run on MLX's gemv kernel.
@@ -390,17 +402,18 @@ Engine variables on the DeepSeek path: `MLX_SERVE_DSV4_DSPARK` (REORDER: the ver
 
 ## Switches that stay opt-in
 
-Four switches stay off by default, and three value switches set memory and kernel choices.
+Four switches stay off by default (`EXACT`, `FLASH_PSUM`, `MXFP4_VIEW`, `MOE_PAIR`), and three value switches set
+memory and kernel choices. `MLX_SERVE_DSV41_EXACT_VERIFY=1` is gone; set `MLX_SERVE_DSV41_EXACT=1`.
 
 <details>
 <summary>The opt-in and value switches</summary>
 
 Each of these is off by default. Names omit `MLX_SERVE_DSV41_` except where shown.
 
-- `EXACT=1|solo` (EXACT) makes greedy DSpark text equal plain decode's bytes. Any value other than unset, empty or `0`
-  turns it on. On a GPU with NAX (M5) it takes the verify path: each verify row's head, Engram wkv and wo_a run as its
-  plain step's. On M3-generation or later Apple GPUs without NAX the whole verify row does, and `solo` also makes every
-  request decode alone.
+- `EXACT=1|solo` (EXACT) makes greedy DSpark text equal plain decode's bytes, one request at a time. Any value other
+  than unset, empty or `0` turns it on. On NAX, it runs each verify row's head, Engram wkv and wo_a as the plain step
+  does. On M3-generation or later Apple GPUs without NAX the whole verify row does. `solo` also makes every request
+  decode alone, and it is served only without NAX. We have not measured its speed cost.
 - `FLASH_PSUM=1` (REORDER) is a flash-attention variant that is nearer to float64. It measured no faster.
 - `MXFP4_VIEW=1` (REORDER) loads an NVFP4 bank whose every 32-value span is one power of two as MXFP4.
 - `MOE_PAIR=1` (REORDER) is the paired prompt gate/up for MXFP4 banks without per-expert scales.
@@ -413,22 +426,36 @@ held in memory turn off `ENGRAM_GPU_IDS` and the Engram partials cache (`ENGRAM_
 
 ## Results
 
-The stock runner is the core `deepseek_v41` plugin at the start of this work (2026-11-20, standard test on build
-`f7e4da9e`), on the `--experts-mxfp4` pack, with fused fp4 decode off, its default at `f7e4da9e`. Greedy, DSpark on:
+The stock runner is `f7e4da9e`, an early build of this PR's branch (2026-11-20), before the fused fp4 decode was on
+by default. `main` cannot convert or serve this checkpoint: it has neither the converter nor the experts' per-expert
+scales. Standard test, p01, greedy, DSpark on, NVFP4 pack:
 
-| Run | Stock prefill tok/s | Stock decode tok/s | Release prefill tok/s | Release decode tok/s |
-|---|---|---|---|---|
-| Standard test, p01 | 4,108.3 | 73.83 | 5,551.3 | 98.80 |
-| Sweep, 128K (stock: interim re-sweep) | 3,915.8 | 103.05 | 5,508.9 | 128.45 |
-| Sweep, 256K | 3,452.2 | 101.05 | 5,206.5 | 121.65 |
-| Sweep, 1M | Not measured | Not measured | 3,912.9 | 110.70 |
+| Build | Prefill tok/s | Decode tok/s |
+|---|---|---|
+| `f7e4da9e`, the stock runner | 3,994.1 | 71.77 |
+| `58279979`, the last reviewed head | 4,009.6 | 82.93 |
+| `a99fc4f6`, the release | 5,551.3 | 98.80 |
 
-The sweep's code-context prompts stop after 517 to 828 output tokens and reach 4.4 to 4.9 tokens per round, against
-2.99 on the standard test, so do not compare sweep decode with standard-test decode.
+The 47 changes since `58279979` give +38.4% prefill and +19.1% decode. On `f7e4da9e` the MXFP4-experts pack ran
+4,108.3 / 73.83 tok/s, 2.8% faster than NVFP4. The runs differ. The stock A/B used a 440320 MiB wired limit and plain
+pre-warm requests. The release cells used 512000 MiB, `--ctx-size 32768` and `--warmup-full`. p01 is the best of the
+three prompts; the release's three-prompt mean is 97.98 tok/s.
+
+The stock sweep ran the `ds41nv` bundle (mlx-serve binary `534d15b3`) on the MXFP4-experts pack; no record names its
+commit. Greedy prefill / decode tok/s:
+
+| Context | Stock runner, MXFP4 | Release, NVFP4 |
+|---|---|---|
+| 128K (stock: interim re-sweep) | 3,915.8 / 103.05 | 5,508.9 / 128.45 |
+| 256K | 3,452.2 / 101.05 | 5,206.5 / 121.65 |
+| 1M | Not measured | 3,912.9 / 110.70 |
+
+The sweep's code-context prompts reach 4.4 to 4.9 tokens per round, against 2.99 on the standard test, so do not
+compare sweep decode with standard-test decode.
 
 The standard test is three coding prompts of about 17,600 tokens each, with 1,024 completion tokens and a fresh server
-for each run. Each cell ran 6 runs (p10: 2) on the release build `a99fc4f6`, started with `--ctx-size 32768 --warmup-full`. The
-pack held the plugin's 65,536-id `draft-vocab.txt`. The card's sampling settings are temperature 1.0 and top_p 0.95.
+for each run. Each cell ran 6 runs (p10: 2) on the release build `a99fc4f6`, started with `--ctx-size 32768
+--warmup-full`. The card's sampling settings are temperature 1.0 and top_p 0.95.
 
 | Cell | Prefill tok/s | Decode tok/s | TTFT s | Peak GB | Tokens per round |
 |---|---|---|---|---|---|
@@ -462,7 +489,10 @@ of about 44,500 rows), but we have not measured the cells at the 1M default.
 | `HEAD8` is a quantization change. Its KLD is within one standard error of the bf16 head's on our set, but it is not bit-identical | A ruling to keep it, or `=0` by default |
 | We tuned and measured only on M5 Ultra Macs with 512 GB | Runs on smaller Macs and older GPUs |
 | The release has not loaded at the default wired limit | One load at the default limit |
-| We have no PPL or KLD of the whole stack; the KLD above is of the head alone | A whole-stack KLD against the same reference |
+| We have no PPL or KLD of the whole stack; the KLD above is of the LM head alone | A whole-stack KLD against the same reference |
+| We have not measured `EXACT=1`'s speed cost | An A/B with `EXACT=1` |
+| The converter does not place `draft-vocab.txt` in the pack | The converter copies it, or step 4 stays |
+| No speed run on the PR head: its later commits are checked by tests and a text check only | The standard test on the PR head |
 
 ## Terms
 
@@ -475,7 +505,7 @@ of about 44,500 rows), but we have not measured the cells at the 1M default.
 | Engram | DeepSeek-V4.1's hashed n-gram embedding tables |
 | hc | DeepSeek-V4.1's hyper-connections, the multi-stream residual |
 | CED | The plugin's chunked prompt path: the decoder layers run again over a chunk's last window rows only (the CED replay) |
-| NAX | The M5 GPU's neural accelerators (matrix units) |
+| NAX | The M5 GPU's matrix units; M4 and older Macs have none |
 | Span | The 256-row unit that a wide prompt layer's attention takes |
 | The gather | The plugin's three-launch attention core on the matrix units, `FLASH_ATTN`'s `=0` path |
 | The f32 chain | MLX's matmuls and softmax in f32, the attention fallback |
@@ -485,7 +515,7 @@ of about 44,500 rows), but we have not measured the cells at the 1M default.
 | KLD | Kullback-Leibler divergence of the served distribution from a reference |
 | `=0` path | The path a default-on switch serves when it is set to 0: the path before the change |
 | Standard test | Three coding prompts of about 17,600 tokens, 1,024 greedy tokens, a fresh server per run, 6 runs |
-| p10 | A prompt from our library; it drafted best on the control |
-| Stock runner | The core `deepseek_v41` plugin at the start of this work (2026-11-20; build `f7e4da9e` for the standard test; the sweep's build did not record its commit), on the `--experts-mxfp4` pack, fused fp4 decode off |
+| p10 | A fourth library prompt, not part of the standard test; it drafted best on the control |
+| Stock runner | `f7e4da9e`, an early build of this PR's branch (2026-11-20), before the fused fp4 decode was on by default; the stock sweep ran the `ds41nv` bundle, whose commit no record names |
 | Word | The bits of one output element (one bf16 or f32 value) |
-| Last reviewed head | `58279979`, the PR 1256 head that reviewers saw before this release |
+| Last reviewed head | `58279979`, the PR 1256 head that reviewers saw before this release. The PR head is `354e3fca` |

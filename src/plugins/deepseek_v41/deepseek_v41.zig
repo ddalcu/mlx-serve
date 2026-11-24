@@ -3923,10 +3923,10 @@ pub fn attnF16At(raw: ?[*:0]const u8, nax: bool) bool {
 }
 
 /// The one owner of a prompt-attention call's core (every call past `attnDecode`), from its shape, dtypes, device and
-/// the load's switches alone, never from its caller. On NAX: the flash kernel where it is on and takes the call (any
-/// pick count), else the gather (picks in tiles of 64), else the f32 chain; the f16 core only where ATTN_F16 is named
-/// on. Without NAX: the f16 core, or the f32 chain under ATTN_F16=0. FLASH_ATTN=1 refuses by name a call the flash
-/// kernel cannot take.
+/// the load's switches alone, never from its caller. On NAX: the flash kernel where it is on and takes the call (64
+/// heads, window plus picks within 1,024), else the gather (picks in tiles of 64), else the f32 chain; the f16 core
+/// only where ATTN_F16 is named on. Without NAX: the f16 core where the call fits its 1,024-column softmax, else (or
+/// under ATTN_F16=0) the f32 chain. FLASH_ATTN=1 refuses by name a call the flash kernel cannot take.
 pub fn attnCore(m: *const Dsv41Model, s: mlx.mlx_stream, q: A, keys_w: A, comp_rows: A, K: usize) error{FlashAttnShape}!Core {
     const H = dim(q, 1);
     const D = dim(q, 2);
