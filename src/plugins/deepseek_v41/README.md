@@ -371,6 +371,9 @@ numbers on the release head are not done yet.
 - We tuned and measured only on M5 Ultra Macs with 512 GB. Smaller Macs and older GPUs get the same defaults, untested.
 - On Macs without neural accelerators, `ATTN_F16` (on) serves an f16 attention core that has no float64 test. A
   release for those Macs needs that test, or `ATTN_F16` off.
+- On the routes the f32 attention chain serves (a tensor split, `FLASH_ATTN=0` at a pick count that is not a multiple
+  of 64, and f16 or f32 activations), the attention words depend on the chunk width. MLX picks its GEMM by row count,
+  so the sums run in another order (a reorder). Flash and the gather do not have this dependence.
 - `HEAD8` is a quantization change. Its KLD equals the bf16 head's on our set, but it is not bit-identical.
 - At the release head, the full test suite failed the `MOE_PAIR_SCALED` bounds test once: at 17 rows, over the words
   that differ, its float64 l2 was 7.5 times the split path's, against a bound of 4. The release needs a ruling on

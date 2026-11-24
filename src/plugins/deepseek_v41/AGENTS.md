@@ -144,6 +144,7 @@ DSpark, lossless classes): `README.md`.
   the one requantization, and `ATTN_F16` (on without NAX only), not classed (`README.md` "Gaps"). A new default-on switch owes a standing word or float64 test against its `=0` path, a plant failing.
 - One function picks every prompt-attention call's core (`attnCore`), from the call's shape and the load alone: on NAX
   flash, else the gather, else the f32 chain; never the f16 core unless `ATTN_F16` is named on. Its meter is `core_calls`.
+  On the f32 chain's routes (tp, FLASH_ATTN=0 at odd K, non-bf16) attention's words depend on chunk width (a reorder).
 - Construct each MPP cooperative tensor from its owning op; copying one invokes incompatible Metal layout
   interfaces on some SDKs. Fill each operand's independent storage before running the matmul.
 
