@@ -4865,6 +4865,73 @@ fn compressFrom(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, cw: *const Co
     try ls.comp.?.append(rot, sc.s);
 }
 
+/// MLX_SERVE_DSV41_PF_COMP_PASS: `compressFrom` once over the whole pass's projection `proj` (`[L, 2 head_dim]`, or
+/// `[L, head_dim]` at ratio 1) for spans `sp`: every op but the index keys' linear works per element, group or row, so
+/// it gives the span-by-span calls' words over all rows at once; that linear runs on each span's own groups, as the
+/// span-by-span calls run it (MLX picks its kernel by row count).
+fn compressPass(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, cw: *const Comp, proj: A, sp: *const Spans) !void {
+    const c = &m.cfg;
+    const ly = &m.layers[li];
+    const ls = &st.layers[li];
+    const r: usize = ly.ratio;
+    const pend0: usize = if (ls.pend_kv.ctx != null) dim(ls.pend_kv, 0) else 0;
+    var latent = none;
+    if (r == 1) {
+        latent = try sc.rms(proj, cw.norm, c.rms_norm_eps);
+    } else {
+        const hd = c.head_dim;
+        var kv = try sc.slice(proj, -1, 0, hd);
+        var gate = try sc.slice(proj, -1, hd, 2 * hd);
+        if (ls.pend_kv.ctx != null) {
+            kv = try sc.concat(&.{ ls.pend_kv, kv }, 0);
+            gate = try sc.concat(&.{ ls.pend_gate, gate }, 0);
+        }
+        const total = dim(kv, 0);
+        const g = total / r;
+        const full = g * r;
+        const new_kv = if (full < total) sc.out(try sc.slice(kv, 0, full, total)) else none;
+        const new_gate = if (full < total) sc.out(try sc.slice(gate, 0, full, total)) else none;
+        if (ls.pend_kv.ctx != null) _ = mlx.mlx_array_free(ls.pend_kv);
+        if (ls.pend_gate.ctx != null) _ = mlx.mlx_array_free(ls.pend_gate);
+        ls.pend_kv = new_kv;
+        ls.pend_gate = new_gate;
+        if (g == 0) return;
+        const kg = try sc.reshape(try sc.slice(kv, 0, 0, full), &.{ ci(g), ci(r), ci(hd) });
+        const gg = try sc.reshape(try sc.slice(gate, 0, 0, full), &.{ ci(g), ci(r), ci(hd) });
+        const pooled = try sc.sum(try sc.mul(kg, try sc.softmax(gg, 1)), 1, false);
+        latent = try sc.rms(try sc.astype(pooled, m.act), cw.norm, c.rms_norm_eps);
+    }
+    const g0 = sp.p0 / r + @intFromBool(comp_pass_plant);
+    if (ly.idx) |*iw| if (iw.wk) |*wk| {
+        // span k's groups: those its rows complete, after the rows pending before it
+        const parts = try sc.a.alloc(A, sp.xs.len);
+        defer sc.a.free(parts);
+        var n: usize = 0;
+        for (0..sp.xs.len) |k| {
+            const lo, const hi = sp.bounds(k);
+            const a = (pend0 + lo) / r;
+            const b = (pend0 + hi) / r;
+            if (b > a) {
+                parts[n] = try rowLinear(sc, wk, try sc.slice(latent, 0, a, b));
+                n += 1;
+            }
+        }
+        if (n > 0) {
+            var k = try sc.rms(if (n == 1) parts[0] else try sc.concat(parts[0..n], 0), iw.k_norm, c.rms_norm_eps);
+            k = try ropeQat(sc, m, k, m.rope_yarn.fwd, try sc.i(ci(g0)), @floatFromInt(r), .fp4_ue8m0, null);
+            try ls.idx_k.?.append(k, sc.s);
+        }
+    };
+    const rot = try ropeQat(sc, m, latent, m.rope_yarn.fwd, try sc.i(ci(g0)), @floatFromInt(r), .fp4_e4m3, null);
+    try ls.comp.?.append(rot, sc.s);
+    _ = comp_pass_count.fetchAdd(1, .monotonic);
+    if (!comp_pass_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_COMP_PASS engaged (layer {d}, {d} rows)\n", .{ li, dim(proj, 0) });
+}
+var comp_pass_logged = std.atomic.Value(bool).init(false);
+/// `MLX_SERVE_DSV41_PF_COMP_PASS`'s layers served (its test's meter) and its planted bug (the groups' rope a row late).
+pub var comp_pass_count = std.atomic.Value(usize).init(0);
+pub var comp_pass_plant = false;
+
 /// The `k` largest scores of each row as int32 indices (ascending, ties to
 /// the lower index); `Scope.topk` off the GPU.
 pub fn topkRows(sc: *Scope, m: *const Dsv41Model, x: A, k: usize) !A {
@@ -7190,7 +7257,10 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     const comp_first = ly.comp != null and sp.floor == null;
     // MLX_SERVE_DSV41_PF_COMP_BF16: the projection over every row first, each span's pooling on its rows of it.
     const comp_all: ?A = if (comp_first) try compProjBf16(&sc, m, li, &ly.comp.?, pa.h) else null;
-    if (comp_first) for (0..n_spans) |k| {
+    // MLX_SERVE_DSV41_PF_COMP_PASS: the spans' pooling in one pass of the same ops.
+    const comp_pass = comp_first and comp_all != null and env.onUnlessZero(.MLX_SERVE_DSV41_PF_COMP_PASS);
+    if (comp_pass) try compressPass(&sc, m, st, li, &ly.comp.?, comp_all.?, sp);
+    if (comp_first and !comp_pass) for (0..n_spans) |k| {
         const lo, const hi = sp.bounds(k);
         var csc = Scope.init(gpa, m.s);
         defer csc.deinit();

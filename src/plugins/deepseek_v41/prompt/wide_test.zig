@@ -2723,3 +2723,43 @@ test "dsv41 wide: under MLX_SERVE_DSV41_PF_KEEP_WIDE's reserve a release-shape p
         try testing.expect(!(try bad));
     }
 }
+
+// ── MLX_SERVE_DSV41_PF_COMP_PASS: the compressor once over the pass ──
+
+test "dsv41 wide: MLX_SERVE_DSV41_PF_COMP_PASS keeps a release-shape KV source and index layer's prefill streams and mixes word for word (layers 8-9, an odd row count's pending row), NVFP4 experts with per-expert scales; the groups' rope a row late fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    const keep = env.override(.MLX_SERVE_DSV41_PF_COMP_PASS, "0");
+    defer keep.restore();
+    const rows = 4999;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 8, .hi = 10, .ctx = 0, .experts_nvfp4 = true, .expert_scales = .all });
+    defer fx.deinit();
+    const x = try fx.stream(rows);
+    defer _ = mlx.mlx_array_free(x);
+    const pre = try fx.cpre(rows);
+    defer _ = mlx.mlx_array_free(pre);
+    const c0 = dsv41.comp_pass_count.load(.monotonic);
+    const want = try prefill(fx, x, pre);
+    defer for (want) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    try testing.expectEqual(c0, dsv41.comp_pass_count.load(.monotonic));
+    env.set(.MLX_SERVE_DSV41_PF_COMP_PASS, "1");
+    const got = try prefill(fx, x, pre);
+    defer for (got) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    const n = dsv41.comp_pass_count.load(.monotonic) - c0;
+    dsv41.comp_pass_plant = true;
+    const bad = try prefill(fx, x, pre);
+    dsv41.comp_pass_plant = false;
+    defer for (bad) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    env.set(.MLX_SERVE_DSV41_PF_COMP_PASS, "0");
+    const same = [_]bool{ try sameWords(want[0], got[0]), try sameWords(want[1], got[1]) };
+    const planted = try sameWords(want[0], bad[0]);
+    std.debug.print("wide layers 8-9 at {d} rows, PF_COMP_PASS: served {d} layers, streams {} mixes {}; planted streams the same {}\n", .{ rows, n, same[0], same[1], planted });
+    try testing.expect(n >= 1 and same[0] and same[1] and !planted);
+}
