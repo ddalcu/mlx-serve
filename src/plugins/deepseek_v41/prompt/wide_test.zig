@@ -823,7 +823,9 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_MOE_EPI is the argsort pat
     const own_pack = env.override(.MLX_SERVE_DSV41_PF_ROUTE_PACK, "0");
     defer own_pack.restore();
     inline for (.{ false, true }) |nv| inline for (.{ false, true }) |paired| {
-        const pk = if (nv) env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, if (paired) "1" else "0") else env.override(.MLX_SERVE_DSV41_MOE_PAIR, if (paired) "1" else null);
+        // An MXFP4 bank has no paired arm (it takes the split path), so it runs split only.
+        if (!nv and paired) continue;
+        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, if (paired) "1" else "0");
         defer pk.restore();
         var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
         defer sc.deinit();
@@ -866,7 +868,7 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_MOE_EPI is the argsort pat
     };
 }
 
-test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_FP4_GEMM is today's output word for word, NVFP4 with per-expert scales and MXFP4, paired gate/up, odd prompt rows to 8192" {
+test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_FP4_GEMM is today's output word for word, NVFP4 with per-expert scales, paired gate/up, odd prompt rows to 8192" {
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
@@ -874,8 +876,9 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_FP4_GEMM is today's output
     // std's lazy environ scan then reads past.
     const unset = env.override(.MLX_SERVE_DSV41_PF_FP4_GEMM, "0");
     defer unset.restore();
-    inline for (.{ true, false }) |nv| {
-        const pk = if (nv) env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1") else env.override(.MLX_SERVE_DSV41_MOE_PAIR, "1");
+    // The paired gate/up is NVFP4's alone: an MXFP4 bank takes the split path, which stages no gate/up.
+    inline for (.{true}) |nv| {
+        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
         defer pk.restore();
         var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
         defer sc.deinit();
@@ -928,7 +931,8 @@ test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_TOKORD: the staged down's rows at thei
     const off = env.override(.MLX_SERVE_DSV41_PF_DOWN_TOKORD, "0");
     defer off.restore();
     inline for (.{ true, false }) |nv| {
-        const pk = if (nv) env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1") else env.override(.MLX_SERVE_DSV41_MOE_PAIR, "1");
+        // The NVFP4 bank's gate/up on the paired kernel; an MXFP4 bank's on the split path.
+        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
         defer pk.restore();
         var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
         defer sc.deinit();
@@ -1461,7 +1465,7 @@ test "dsv41 wide tol: MLX_SERVE_DSV41_PF_HC_V2's three passes (the attention sid
 
 // ── a release-shape pair worker's prefill ──
 
-const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR, .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2, .MLX_SERVE_DSV41_PF_MOE_EPI, .MLX_SERVE_DSV41_PF_IDX_NAX };
+const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2, .MLX_SERVE_DSV41_PF_MOE_EPI, .MLX_SERVE_DSV41_PF_IDX_NAX };
 
 /// The flash kernel on `fx`'s model as its load sets it (`plugin.configureLoad`): the gather's kernels rebuilt with
 /// MLX_SERVE_DSV41_FLASH_ATTN on (and MLX_SERVE_DSV41_FLASH_TRIM, MLX_SERVE_DSV41_FLASH_PSUM as asked) and the ring
@@ -1587,7 +1591,7 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
         defer for (want) |o| {
             _ = mlx.mlx_array_free(o);
         };
-        // The layer's loaded experts take the paired kernel under their kind's switch.
+        // The layer's loaded NVFP4 experts take the paired kernel under MOE_PAIR_SCALED; MXFP4 experts decline it.
         {
             var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
             defer sc.deinit();
@@ -1597,14 +1601,14 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
                 std.debug.print("wide layer {s}: the route failed: {s}\n", .{ label, @errorName(e) });
                 return e;
             };
-            env.set(if (nv) .MLX_SERVE_DSV41_MOE_PAIR_SCALED else .MLX_SERVE_DSV41_MOE_PAIR, "1");
-            defer env.set(if (nv) .MLX_SERVE_DSV41_MOE_PAIR_SCALED else .MLX_SERVE_DSV41_MOE_PAIR, "0");
+            env.set(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
+            defer env.set(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "0");
             const served = (actOf(&sc, fx.m, &ly.experts, h, r.idx, r.wts) catch |e| {
                 std.debug.print("wide layer {s}: the paired kernel failed: {s}\n", .{ label, @errorName(e) });
                 return e;
             }) != null;
-            if (!served) std.debug.print("wide layer {s}: the paired kernel declines the loaded experts (gu {}, mode {s})\n", .{ label, ly.experts.gu != null, if (ly.experts.gu) |g| @tagName(g.qp.mode) else "-" });
-            try testing.expect(served);
+            if (served != nv) std.debug.print("wide layer {s}: the paired kernel {s} the loaded experts (gu {}, mode {s})\n", .{ label, if (served) "takes" else "declines", ly.experts.gu != null, if (ly.experts.gu) |g| @tagName(g.qp.mode) else "-" });
+            try testing.expectEqual(nv, served);
         }
         if (!try closeAs(fx, x, pre, want, &want_tap, label, "the stock path again")) ok = false;
         inline for (switches) |n| {
