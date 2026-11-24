@@ -987,4 +987,5 @@ test {
     _ = media;
     _ = @import("contract.zig");
     _ = @import("decode/decode.zig");
+    _ = @import("tf32_test.zig");
 }
