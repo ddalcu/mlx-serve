@@ -1,4 +1,4 @@
-//! `MLX_SERVE_DSV41_PF_KEEP_WIDE` (default off): a prompt pass's large intermediates come from a reserve of Metal
+//! `MLX_SERVE_DSV41_PF_KEEP_WIDE` (on by default): a prompt pass's large intermediates come from a reserve of Metal
 //! buffers MLX keeps outside its cache (`patches/mlx-metal-wide-reserve.patch`), allocated and written once at load at
 //! the pinned pass width, not fresh in every request's first layer.
 //!
