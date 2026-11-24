@@ -43,7 +43,7 @@ const moeCudaFormat = @import("gather_qmv_rows.zig").moeCudaFormat;
 //
 // The bank's `Dequant` picks the arithmetic: affine (q * scale + bias, the
 // mlx-quantized checkpoints) or fp4 (e2m1 nibbles + one uint8 group scale, no
-// biases: NVFP4's e4m3 per 16 or MXFP4's e8m0 per 32, the GS template).
+// biases: NVFP4's e4m3 per 16, the GS template; MXFP4 banks decline, `modeDequant`).
 fn gatherQmvSource(comptime d: Dequant, comptime x_per_expert: bool) [:0]const u8 {
     // Everything is indexed off the raw buffer names rather than through
     // explicitly address-spaced pointers: MLX generates the signature from each
@@ -86,17 +86,12 @@ pub fn header(d: Dequant) [:0]const u8 {
 /// format is the group size).
 pub const Dequant = enum { affine, fp4 };
 
-/// MXFP4 banks on the gather_qmv kernels (`MLX_SERVE_MOE_GQMV_MXFP4`, read every call).
-pub fn mxfp4Enabled() bool {
-    return env.on(.MLX_SERVE_MOE_GQMV_MXFP4);
-}
-
-/// Whether these kernels read a bank at (mode, bits, group): affine at a width `affineQmvUnitOk` takes; 4-bit
-/// NVFP4 (g16) or MXFP4 (g32, behind `mxfp4Enabled`). Any other mode or group has no dequant here.
+/// Whether these kernels read a bank at (mode, bits, group): affine at a width `affineQmvUnitOk` takes; 4-bit NVFP4
+/// (g16). MXFP4 and any other mode or group have no dequant here: the sorted or composed path serves them.
 pub fn modeDequant(mode: QuantMode, bits: u32, group_size: u32) ?Dequant {
     if (mode == .affine) return if (affineQmvUnitOk(bits, group_size)) .affine else null;
     const f = fp4.of(mode, group_size) orelse return null;
-    if (bits != 4 or (f == .mxfp4 and !mxfp4Enabled())) return null;
+    if (bits != 4 or f != .nvfp4) return null;
     return .fp4;
 }
 

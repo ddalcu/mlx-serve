@@ -658,8 +658,6 @@ const Gather = struct {
         const s = self.rig.stream();
         var g = ops.Graph.init(self.rig.a, s);
         defer g.deinit();
-        const mx = env.override(.MLX_SERVE_MOE_GQMV_MXFP4, "1");
-        defer mx.restore();
         const x = self.args[0];
         const inds = self.indsArg();
         const rows: usize = if (self.rowsKind()) self.shape.rows else 1;
@@ -711,8 +709,6 @@ const Gather = struct {
     /// The shipped wrapper on the same inputs.
     fn wrapper(self: *Gather) ![]const u8 {
         const s = self.rig.stream();
-        const mx = env.override(.MLX_SERVE_MOE_GQMV_MXFP4, "1");
-        defer mx.restore();
         const x = self.args[0];
         const inds = self.indsArg();
         const b0 = self.bankArgs(0);
@@ -2795,19 +2791,14 @@ fn registerGathers(set: *kc.Set) !void {
         g.ne = 16;
         try add(set, g, "gather_qmv bf16 (4-bit g64, ReLU^2, x per pair)", &.{.{ .rows = 12, .n = 256, .k = 2688 }}, null, null);
     }
-    // fp4: NVFP4 (e4m3 per 16) and MXFP4 (e8m0 per 32), one kernel by the group.
-    inline for (.{ .{ Fmt.nvfp4, 16, "NVFP4" }, .{ Fmt.mxfp4, 32, "MXFP4" } }) |f| {
-        var g = Gather.init(a, .qmv, f[0], 4, f[1]);
-        try add(set, g, "gather_qmv bf16 (" ++ f[2] ++ ")", up_served, null, null);
-        g = Gather.init(a, .qmv, f[0], 4, f[1]);
+    // fp4: NVFP4 (e4m3 per 16).
+    {
+        var g = Gather.init(a, .qmv, .nvfp4, 4, 16);
+        try add(set, g, "gather_qmv bf16 (NVFP4)", up_served, null, null);
+        g = Gather.init(a, .qmv, .nvfp4, 4, 16);
         g.launch = &qmv_launches[1][1];
         g.px = true;
-        try add(set, g, "gather_qmv bf16 (" ++ f[2] ++ ", x per expert)", down_served, null, null);
-    }
-    {
-        var g = Gather.init(a, .qmv, .mxfp4, 4, 32);
-        g.dt = .float16;
-        try add(set, g, "gather_qmv f16 (MXFP4)", up_served, null, null);
+        try add(set, g, "gather_qmv bf16 (NVFP4, x per expert)", down_served, null, null);
     }
     const chain = "gather_qmv gate and up -> sigmoid -> multiply -> multiply";
     const clamp_chain = "gather_qmv gate and up -> minimum, clip -> sigmoid -> multiply -> multiply";
@@ -2839,7 +2830,7 @@ fn registerGathers(set: *kc.Set) !void {
     }
     // fp4 one row and rows: plain, ModelOpt's gate scale, gate and up scales with GLM's clamp.
     inline for (.{ .{ Kind.gateup, up_served, "gather_qmv_gateup" }, .{ Kind.gateup_rows, rows_served, "gather_qmv_gateup_rows" } }) |kk| {
-        inline for (.{ .{ Fmt.nvfp4, 16, "NVFP4" }, .{ Fmt.mxfp4, 32, "MXFP4" } }) |f| {
+        inline for (.{.{ Fmt.nvfp4, 16, "NVFP4" }}) |f| {
             try add(set, .init(a, kk[0], f[0], 4, f[1]), kk[2] ++ " bf16 (" ++ f[2] ++ ")", kk[1], chain, null);
             var g = Gather.init(a, kk[0], f[0], 4, f[1]);
             g.gscale = true;
@@ -2850,17 +2841,13 @@ fn registerGathers(set: *kc.Set) !void {
             g.limit = LIMIT;
             try add(set, g, kk[2] ++ " bf16 (" ++ f[2] ++ ", gate and up scales, limit 10)", kk[1], scaled_chain, null);
         }
-        var g = Gather.init(a, kk[0], .mxfp4, 4, 32);
-        g.dt = .float16;
-        g.limit = LIMIT;
-        try add(set, g, kk[2] ++ " f16 (MXFP4, limit 10)", kk[1], clamp_chain, null);
     }
     // Down + score weighting + top-k sum, at 8 lanes a row (every GPU but M5) and 16 (M5).
     inline for (.{ 8, 16 }) |lpr| {
         var g = Gather.init(a, .down, .affine, 4, 64);
         g.lpr = lpr;
         try add(set, g, std.fmt.comptimePrint("down_reduce bf16 (4-bit g64, {d} lanes)", .{lpr}), down_served, null, null);
-        inline for (.{ .{ Fmt.nvfp4, 16, "NVFP4" }, .{ Fmt.mxfp4, 32, "MXFP4" } }) |f| {
+        inline for (.{.{ Fmt.nvfp4, 16, "NVFP4" }}) |f| {
             g = Gather.init(a, .down, f[0], 4, f[1]);
             g.lpr = lpr;
             try add(set, g, std.fmt.comptimePrint("down_reduce bf16 ({s}, {d} lanes)", .{ f[2], lpr }), down_served, null, null);
@@ -2896,10 +2883,6 @@ fn registerGathers(set: *kc.Set) !void {
         g = Gather.init(a, .down, .affine, 6, 64);
         g.lpr = 8;
         try add(set, g, "down_reduce bf16 (6-bit g64, 8 lanes)", down_served, null, null);
-        g = Gather.init(a, .down, .mxfp4, 4, 32);
-        g.dt = .float16;
-        g.lpr = 8;
-        try add(set, g, "down_reduce f16 (MXFP4, 8 lanes)", down_served, null, null);
     }
 }
 
