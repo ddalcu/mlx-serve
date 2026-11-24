@@ -1089,7 +1089,7 @@ pub fn main(init: std.process.Init) !void {
             server_mod.launch().ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 16;
         } else if (std.mem.eql(u8, args[i], "--os-reserve-gib") and i + 1 < args.len) {
             i += 1;
-            @import("sdk/util/system.zig").os_reserve_override = status.parseOsReserveGib(args[i]) catch {
+            @import("sdk/util/system.zig").osReserveOverride().* = status.parseOsReserveGib(args[i]) catch {
                 log.err("--os-reserve-gib: expected an integer 0..64, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };

@@ -200,7 +200,6 @@ test "dsv41 wide tol: the paired fp4 gate+up with moe_act in its epilogue is the
         m.cfg = .{};
         m.cfg.dsv4_swiglu_limit = 10;
         m.act = .bfloat16;
-        m.moe_wt_kernel = null;
         m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
         defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
         m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
@@ -261,7 +260,6 @@ test "dsv41 wide tol: the MoE combine and hc expand in one launch are moePrefill
     m.cfg = .{};
     m.cfg.dsv4_swiglu_limit = 10;
     m.act = .bfloat16;
-    m.moe_wt_kernel = null;
     m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
     defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
     m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
@@ -483,7 +481,6 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_MOE_EPI is the argsort pat
         m.cfg = .{};
         m.cfg.dsv4_swiglu_limit = 10;
         m.act = .bfloat16;
-        m.moe_wt_kernel = null;
         m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
         defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
         m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
@@ -536,7 +533,6 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_FP4_GEMM is today's output
         m.cfg = .{};
         m.cfg.dsv4_swiglu_limit = 10;
         m.act = .bfloat16;
-        m.moe_wt_kernel = null;
         m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
         defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
         m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
@@ -590,7 +586,6 @@ test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_TOKORD: the staged down's rows at thei
         m.cfg = .{};
         m.cfg.dsv4_swiglu_limit = 10;
         m.act = .bfloat16;
-        m.moe_wt_kernel = null;
         m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
         defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
         m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");

@@ -1592,3 +1592,40 @@ oversized commit evicts before it copies (`evict_before_copy`), a streamed bank 
 bank's GLM or Ling asks no more than the hot-cache term its decode room holds`, `HotPrefixCache: a capped streamed
 bank's oversized commit evicts before it copies`, `outside model: a fitted base carries the hot cache's resident entry`,
 `a streamed bank's slot is exclusive on GLM and Ling`, `outside model: a bills-only fit gives each phase's bills' growth`.
+
+### A one-row matmul over a pre-transposed weight cost five launches
+Defect: Inkling 2's one-row decode sat at 72 tok/s with its glue already in kernels; the dense attention projections
+(bf16, loaded pre-transposed `[in, out]`, the loader's convention) were the top entry of the profile. Cause: MLX runs
+`x @ W` for one row as `gemv_t`, about 43 us of latency at a 2304-wide input whatever the output width, where
+`x @ W.T` over the checkpoint's `[out, in]` weight is its `gemv`, 9 us and bandwidth-bound; prompt-width GEMM is as
+fast either way. A one-row step is bound by the dependent launches on its critical path (5-7 us each) plus bytes,
+not by node count. Fix: `layers.projectRows` keeps dense projections `[out, in]`, the gates' down projections too.
+Guard: `inkling2 kernels: the stream kernels serve the projections of the chain they replace`.
+
+### A few-row f32 matmul is TF32, and the slow one
+Defect: Inkling 2's draft verify and batched decode (2-8 rows) ran each visit's router, an f32 product, as MLX's f32
+GEMM; a 3-row GPU proof flipped an expert pick against one-row steps, and every visit paid the GEMM's latency. Cause:
+on a NAX GPU MLX runs an f32 matmul past one row as TF32 (see "An f32 reference on M5 is a TF32 reference"), ~7x the
+one-row `gemv`'s latency and ~1e-3 relative where the `gemv` is exact. Fix: `kernels.routerRows` and `kernels.gate`
+keep these dots in a kernel up to `small_rows`; the batched proof's GPU arm compares forwards of the same width.
+Guard: `inkling2 kernels: the router kernel's rows are the matmul's`.
+
+### An auto context left its own prompt cache nothing
+Defect: Inkling 2's 8-bit pack on a 32 GB M1 Pro re-prefilled every long turn (16.8k tokens, 99 s each): the hot cache
+was clamped 3280 -> 116 MB, and a 16.8k entry is 1.2 GB. Cause: the auto context is sized against the request figure
+(what macOS can move) beside a cache share (`ctxCacheShare`), but the clamp reads the idle figure (what nobody holds)
+and subtracts the whole context's KV, which no idle server holds; after 17 GB of weights the two left nothing. An
+emulated ceiling (`MLX_SERVE_GPU_CEILING_MB`) on a big Mac hid it: its idle figure stays huge. Fix: an auto context's
+cache keeps `ctxCacheShare` of the idle figure. Guard: `an auto context leaves its hot cache the share it was sized
+beside`.
+
+### A drafted round kept the turn's end and the token after it
+Defect: Inkling 2's agent run on an M5 re-prefilled its whole ~100k-token context on many turns:
+`sliding ring holds rows from ...; match ... falls behind them`. Cause: the native drafter's round kept every draft
+the trunk agreed with, a stop token and a draft after it included; the decode-end entry then held tokens the
+conversation never contains, the next prompt matched one or two short of its end, and the nearest checkpoint below
+that sat behind the sliding ring. A kept stop alone still left the live state one row past the committed length,
+which `rollbackSsmTo` cannot undo after a drafted round, so no decode-end entry was written. Fix: the engine hands a
+round the request's stop ids (`Forward.stop_ids`) and the drafter never verifies one (`draftsToVerify`): the trunk's
+token carries the stop. Guards: `plugin native drafter: a round is handed the request's stop ids`, `inkling2 draft: a
+round never verifies a stop`.

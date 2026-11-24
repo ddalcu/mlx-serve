@@ -120,9 +120,19 @@ pub const Calibration = struct {
 /// most a quarter per sample, so a stall or a foreign GPU job cannot pose as the machine's speed.
 pub const PlainCost = struct {
     ms: f32 = PRIOR_PLAIN_MS,
+    /// Samples still taken whole, the least of them kept: a model the prior was not measured on (`unmeasured`).
+    seed: u8 = 0,
+
+    /// No prior: the request's first plain rounds are the cost.
+    pub const unmeasured: PlainCost = .{ .ms = std.math.inf(f32), .seed = 3 };
 
     pub fn sample(self: *PlainCost, ms: f32) void {
         if (!std.math.isFinite(ms) or ms <= 0) return;
+        if (self.seed > 0) {
+            self.seed -= 1;
+            self.ms = @min(self.ms, ms);
+            return;
+        }
         const bounded = std.math.clamp(ms, self.ms * 0.8, self.ms * 1.25);
         self.ms += 0.1 * (bounded - self.ms);
     }
@@ -428,6 +438,14 @@ test "Calibration: an old regime fades" {
 
 // A drafted round is judged by `record(gain, wall)`: the plain-round ms its tokens would have cost, against
 // the ms it took. Ten against ten is break-even.
+
+test "PlainCost: an unmeasured cost is the least of its first samples, then moves slowly" {
+    var c = PlainCost.unmeasured;
+    for ([_]f32{ 400, 9.9, 10.4 }) |ms| c.sample(ms);
+    try testing.expectEqual(@as(f32, 9.9), c.ms);
+    c.sample(400);
+    try testing.expect(c.ms > 9.9 and c.ms < 10.2);
+}
 
 test "PlainCost: a stall moves it little, a steady new speed is reached" {
     var c = PlainCost{};

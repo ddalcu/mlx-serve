@@ -61,6 +61,7 @@ struct PromptRewriteSheet: View {
     @State private var progress = RewriteProgress()
     /// Set when there is a first frame the chat model cannot see.
     @State private var blindToFirstFrame = false
+    @State private var blindToSource = false
     @State private var blindToReferences = false
     @State private var startedAt = Date()
     @State private var error: String? = nil
@@ -112,6 +113,9 @@ struct PromptRewriteSheet: View {
                     .font(.app(.caption2)).foregroundStyle(.secondary)
             } else if let error = error ?? (isWriting ? nil : applyError?(text, writtenSeconds)) {
                 Text(error).font(.app(.caption)).foregroundStyle(.red)
+            } else if blindToSource {
+                Text("Your chat model can't see images, so this was written without your picture and may get what's in it wrong. A vision chat model fixes that.")
+                    .font(.app(.caption)).foregroundStyle(.orange)
             } else if blindToFirstFrame {
                 Text("Your chat model can't see images, so this was written without your first frame and the video may cut away from it. A vision chat model fixes that.")
                     .font(.app(.caption)).foregroundStyle(.orange)
@@ -182,7 +186,8 @@ struct PromptRewriteSheet: View {
             writtenSeconds = clipSeconds
             let req = request(clipSeconds)
             let sees = !req.images.isEmpty && AgentComposer.seesImages(appState: appState)
-            blindToFirstFrame = req.firstFrame != nil && !sees
+            blindToFirstFrame = req.firstFrame != nil && !req.editsFirstFrame && !sees
+            blindToSource = req.editsFirstFrame && !sees
             blindToReferences = !req.references.isEmpty && !sees
             do {
                 for try await event in AgentComposer.events(userText: req.user(seeingImage: sees), systemPrompt: req.system,

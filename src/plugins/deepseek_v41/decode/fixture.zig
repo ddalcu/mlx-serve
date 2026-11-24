@@ -58,6 +58,7 @@ pub const Fixture = struct {
     nvfp4_stages: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, opts: Opts) !*Fixture {
+        mlx.installErrorHandler(); // the model's threadgroup probes raise on M1/M2: latch it, never exit
         const fx = try gpa.create(Fixture);
         errdefer gpa.destroy(fx);
         var cfg = try releaseConfig();
