@@ -99,14 +99,15 @@ fn restoreModuleMatch(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.Mo
     return if (restored) match.n else 0;
 }
 
-const ModuleImportProbe = struct {
+pub const ModuleImportProbe = struct {
     sch: *Scheduler,
     cfg: *const model_mod.ModelConfig,
     peak: u64,
+    body_bytes: u64 = 0,
 
-    fn fits(ctx: ?*anyopaque) bool {
+    pub fn fits(ctx: ?*anyopaque) bool {
         const self: *@This() = @ptrCast(@alignCast(ctx.?));
-        const staged = @import("cache/budget.zig").stagedHostBytes(self.sch);
+        const staged = @import("cache/budget.zig").stagedHostBytes(self.sch) -| self.body_bytes;
         return self.peak <= @import("admission/prefill_chunk.zig").prefillHeadroomNow(self.cfg, staged);
     }
 };
@@ -137,7 +138,7 @@ fn restoreDiskModule(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.Mod
 
 /// A matching inventory uses the planner's full peak; a mismatching one must be rejected
 /// before destination allocation. Bound its loader overlap, maps and header/name copies too.
-fn moduleImportPeak(planned: u64, inventory: []const kv_disk_cache.module_record.Tensor) !u64 {
+pub fn moduleImportPeak(planned: u64, inventory: []const kv_disk_cache.module_record.Tensor) !u64 {
     var loaded: u64 = 0;
     for (inventory) |tensor| loaded = try std.math.add(u64, loaded, tensor.bytes);
     const host = try std.math.add(u64, 4 * kv_disk_cache.module_record.MAX_ENVELOPE_BYTES, try std.math.mul(u64, inventory.len, 4096));

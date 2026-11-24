@@ -63,8 +63,9 @@ pub fn logSafePath(raw_path: []const u8) []const u8 {
     return raw_path[0 .. std.mem.indexOfScalar(u8, raw_path, '?') orelse raw_path.len];
 }
 
-/// The body as logged: the login form's POST carries the API key.
+/// The body as logged: the login form's POST carries the API key; cache imports carry raw tensor bytes.
 pub fn logSafeBody(method: []const u8, path: []const u8, content_type: []const u8, body: []const u8) []const u8 {
+    if (std.mem.eql(u8, path, "/v1/cache/import")) return "";
     return if (loginFormKey(method, path, content_type, body) != null) "" else body;
 }
 

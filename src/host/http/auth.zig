@@ -2,6 +2,8 @@
 
 const std = @import("std");
 const http_server = @import("server.zig");
+const log = @import("../../sdk/util/log.zig");
+const ablation = @import("../api/ablation.zig");
 
 const Conn = @import("conn.zig").Conn;
 const isRoute = @import("router.zig").isRoute;
@@ -9,6 +11,7 @@ const queryDecoded = @import("../api/request_model.zig").queryDecoded;
 const pairValue = @import("../api/request_model.zig").pairValue;
 const percentDecoded = @import("../api/request_model.zig").percentDecoded;
 const logHttpResponse = @import("respond.zig").logHttpResponse;
+const sendErrorResponse = @import("errors.zig").sendErrorResponse;
 const UNAUTHORIZED_ALLOW_HEADERS = @import("respond.zig").UNAUTHORIZED_ALLOW_HEADERS;
 
 /// True if the connection's peer is a loopback address (127.0.0.0/8, ::1, or an
@@ -39,6 +42,136 @@ pub fn apiKeyGateApplies(key_set: bool, strict: bool, peer_loopback: bool) bool 
 
 pub fn peerIsLoopback(conn: *const Conn) bool {
     return ipIsLoopback(conn.stream.socket.address);
+}
+
+/// Whether this connection is trusted to tag committed KV-cache entries with `X-Session-Key`.
+pub fn sessionTagAllowed(conn: *const Conn) bool {
+    return switch (http_server.g_cache_transfer) {
+        .disabled => false,
+        .loopback => peerIsLoopback(conn),
+        .key => !@import("../lan/http.zig").lanGateApplies(conn),
+    };
+}
+
+/// Access policy for KV-cache transfer endpoints (`POST /v1/cache/import`, `X-Cache-Export: 1`).
+pub const CacheTransferConfig = union(enum) {
+    /// Default: cache transfer endpoints are disabled.
+    disabled,
+    /// `--cache-transfer`: enabled for loopback peers only (`127.0.0.0/8`, `::1`, `::ffff:127.0.0.0/104`).
+    loopback,
+    /// `--cache-transfer-key-file <path>`: enabled from any peer presenting `Authorization: Bearer <key>`
+    /// matching this SHA-256 digest (0600 file, >= 32 bytes, distinct from `--api-key`, never loopback-exempt).
+    key: [32]u8,
+
+    pub fn enabled(self: CacheTransferConfig) bool {
+        return self != .disabled;
+    }
+};
+
+pub const CacheTransferVerdict = enum {
+    allowed,
+    disabled,
+    forbidden_peer,
+    unauthorized,
+};
+
+pub const CacheTransferLaunchError = error{
+    CacheTransferKeyRefused,
+    CacheTransferKeyIsServingKey,
+};
+
+/// Resolves `--cache-transfer` / `--cache-transfer-key-file` at launch. A key file follows the same
+/// ownership and 0600 mode rules as `--ablation-key-file` and must not reuse `--api-key`.
+pub fn launchCacheTransfer(
+    gpa: std.mem.Allocator,
+    loopback_flag: bool,
+    key_file: ?[]const u8,
+    serving_key: ?[]const u8,
+) CacheTransferLaunchError!CacheTransferConfig {
+    if (key_file) |path| {
+        const digest = ablation.readKey(gpa, path) catch |e| {
+            log.err("[cache-transfer] key file {s} refused: {s}\n", .{ path, switch (e) {
+                error.NotRegular => "not a regular file",
+                error.NotOwner => "not owned by the server's user",
+                error.GroupOrOtherAccess => "mode must be 0600 (no group or other access)",
+                error.TooShort => "the key must be at least 32 bytes",
+                error.Unreadable, error.OutOfMemory => "unreadable",
+                error.Unsupported => "--cache-transfer-key-file needs a POSIX host",
+            } });
+            return error.CacheTransferKeyRefused;
+        };
+        if (serving_key) |s| if (ablation.Set.digestMatches(digest, s)) {
+            log.err("[cache-transfer] --cache-transfer-key-file holds the serving key; cache transfer needs a key of its own\n", .{});
+            return error.CacheTransferKeyIsServingKey;
+        };
+        log.info("[cache-transfer] enabled: authenticated peers with key from {s}\n", .{path});
+        return .{ .key = digest };
+    }
+    if (loopback_flag) {
+        log.info("[cache-transfer] enabled: loopback peers only\n", .{});
+        return .loopback;
+    }
+    return .disabled;
+}
+
+/// Evaluates whether a peer + request headers are allowed to invoke a cache-transfer operation.
+pub fn checkCacheTransferAuth(
+    cfg: CacheTransferConfig,
+    peer: std.Io.net.IpAddress,
+    raw_headers: []const u8,
+    raw_path: []const u8,
+) CacheTransferVerdict {
+    switch (cfg) {
+        .disabled => return .disabled,
+        .loopback => {
+            if (!ipIsLoopback(peer)) return .forbidden_peer;
+            if (apiKeyGateApplies(http_server.g_api_key != null, http_server.g_api_key_strict, true) and
+                !apiKeyAuthorized(raw_headers, raw_path))
+            {
+                return .unauthorized;
+            }
+            return .allowed;
+        },
+        .key => |digest| {
+            const auth_hdr = findHeaderValueCI(raw_headers, "authorization") orelse return .unauthorized;
+            if (!std.mem.startsWith(u8, auth_hdr, "Bearer ")) return .unauthorized;
+            const presented = std.mem.trim(u8, auth_hdr["Bearer ".len..], " \t");
+            if (!ablation.Set.digestMatches(digest, presented)) return .unauthorized;
+            return .allowed;
+        },
+    }
+}
+
+/// Sends the HTTP refusal for a non-`.allowed` `CacheTransferVerdict`.
+/// `is_dedicated_route` distinguishes dedicated cache-transfer routes (`/v1/cache/import`, which 404
+/// when disabled) from overloaded inference routes (`X-Cache-Export: 1` on `/v1/chat/completions`,
+/// which 403 when disabled).
+pub fn sendCacheTransferDenial(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    verdict: CacheTransferVerdict,
+    is_dedicated_route: bool,
+) !void {
+    switch (verdict) {
+        .allowed => {},
+        .disabled => {
+            if (is_dedicated_route) {
+                try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Cache transfer is disabled; pass --cache-transfer or --cache-transfer-key-file", 404);
+            } else {
+                try sendErrorResponse(allocator, stream, "403 Forbidden", "forbidden", "Cache transfer is disabled; pass --cache-transfer or --cache-transfer-key-file", 403);
+            }
+        },
+        .forbidden_peer => {
+            try sendErrorResponse(allocator, stream, "403 Forbidden", "forbidden", "Cache transfer requires loopback peer or --cache-transfer-key-file", 403);
+        },
+        .unauthorized => {
+            if (http_server.g_cache_transfer == .key) {
+                try sendErrorResponse(allocator, stream, "401 Unauthorized", "authentication_error", "missing or invalid cache transfer key", 401);
+            } else {
+                try sendUnauthorized(stream);
+            }
+        },
+    }
 }
 
 /// Case-insensitive HTTP header lookup in the raw header block. `name_lower`
@@ -306,4 +439,73 @@ test "ipIsLoopback exempts local addresses only" {
     // IPv4-mapped loopback ::ffff:127.0.0.1
     try std.testing.expect(ipIsLoopback(.{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 }, .port = 0 } }));
     try std.testing.expect(!ipIsLoopback(.{ .ip6 = .{ .bytes = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = 0 } }));
+}
+
+test "checkCacheTransferAuth: disabled, loopback-only, and key-file policies" {
+    const prev_key = http_server.g_api_key;
+    const prev_strict = http_server.g_api_key_strict;
+    defer {
+        http_server.g_api_key = prev_key;
+        http_server.g_api_key_strict = prev_strict;
+    }
+    http_server.g_api_key = null;
+    http_server.g_api_key_strict = false;
+
+    const lo4: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    const lo6: std.Io.net.IpAddress = .{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = 0 } };
+    const lan: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 168, 1, 10 }, .port = 0 } };
+    const private10: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 2 }, .port = 0 } };
+
+    // Disabled rejects every peer.
+    try std.testing.expectEqual(CacheTransferVerdict.disabled, checkCacheTransferAuth(.disabled, lo4, "", "/v1/cache/import"));
+    try std.testing.expectEqual(CacheTransferVerdict.disabled, checkCacheTransferAuth(.disabled, lan, "", "/v1/cache/import"));
+
+    // Loopback mode admits only loopback peers (no private-subnet exemption).
+    try std.testing.expectEqual(CacheTransferVerdict.allowed, checkCacheTransferAuth(.loopback, lo4, "", "/v1/cache/import"));
+    try std.testing.expectEqual(CacheTransferVerdict.allowed, checkCacheTransferAuth(.loopback, lo6, "", "/v1/cache/import"));
+    try std.testing.expectEqual(CacheTransferVerdict.forbidden_peer, checkCacheTransferAuth(.loopback, lan, "", "/v1/cache/import"));
+    try std.testing.expectEqual(CacheTransferVerdict.forbidden_peer, checkCacheTransferAuth(.loopback, private10, "", "/v1/cache/import"));
+
+    // Loopback mode respects --api-key-strict when --api-key is set.
+    http_server.g_api_key = "serving-secret";
+    http_server.g_api_key_strict = false;
+    try std.testing.expectEqual(CacheTransferVerdict.allowed, checkCacheTransferAuth(.loopback, lo4, "", "/v1/cache/import"));
+    http_server.g_api_key_strict = true;
+    try std.testing.expectEqual(CacheTransferVerdict.unauthorized, checkCacheTransferAuth(.loopback, lo4, "", "/v1/cache/import"));
+    try std.testing.expectEqual(CacheTransferVerdict.allowed, checkCacheTransferAuth(.loopback, lo4, "Authorization: Bearer serving-secret\r\n", "/v1/cache/import"));
+
+    // Key mode requires Bearer matching its own SHA-256 digest from any IP (including loopback) and rejects the serving key.
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("transfer-secret-0123456789abcdef0123", &digest, .{});
+    const keyed: CacheTransferConfig = .{ .key = digest };
+    try std.testing.expectEqual(CacheTransferVerdict.unauthorized, checkCacheTransferAuth(keyed, lo4, "", "/v1/cache/import"));
+    try std.testing.expectEqual(CacheTransferVerdict.unauthorized, checkCacheTransferAuth(keyed, lan, "Authorization: Bearer serving-secret\r\n", "/v1/cache/import"));
+    try std.testing.expectEqual(CacheTransferVerdict.unauthorized, checkCacheTransferAuth(keyed, lan, "x-api-key: transfer-secret-0123456789abcdef0123\r\n", "/v1/cache/import"));
+    try std.testing.expectEqual(CacheTransferVerdict.allowed, checkCacheTransferAuth(keyed, lo4, "Authorization: Bearer transfer-secret-0123456789abcdef0123\r\n", "/v1/cache/import"));
+    try std.testing.expectEqual(CacheTransferVerdict.allowed, checkCacheTransferAuth(keyed, lan, "Authorization: Bearer transfer-secret-0123456789abcdef0123\r\n", "/v1/cache/import"));
+    try std.testing.expectEqual(CacheTransferVerdict.allowed, checkCacheTransferAuth(keyed, private10, "Authorization: Bearer transfer-secret-0123456789abcdef0123\r\n", "/v1/cache/import"));
+}
+
+test "launchCacheTransfer rejects a key file that reuses --api-key and accepts a distinct 0600 key file" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    const a = std.testing.allocator;
+    const path = try std.fs.path.join(a, &.{ root, "transfer.key" });
+    defer a.free(path);
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    const key = "cache-transfer-key-0123456789-0123456789";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "transfer.key", .data = key ++ "\n" });
+    _ = std.c.chmod(path_z, 0o600);
+
+    try std.testing.expectEqual(CacheTransferConfig.disabled, try launchCacheTransfer(a, false, null, null));
+    try std.testing.expectEqual(CacheTransferConfig.loopback, try launchCacheTransfer(a, true, null, null));
+    try std.testing.expectError(error.CacheTransferKeyIsServingKey, launchCacheTransfer(a, false, path, key));
+
+    const cfg = try launchCacheTransfer(a, false, path, "different-serving-key");
+    try std.testing.expect(cfg == .key);
+    try std.testing.expect(ablation.Set.digestMatches(cfg.key, key));
 }

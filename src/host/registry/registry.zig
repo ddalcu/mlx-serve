@@ -171,6 +171,8 @@ pub const LoadedModel = struct {
     /// once, by the first ablated request. `config_digest_state` 0 = not taken, 1 = being taken, 2 = ready.
     config_digest: [64]u8 = undefined,
     config_digest_state: std.atomic.Value(u8) = .init(0),
+    /// This load's `cache/pack_identity.zig` job, started when the load completes (`doLoadOnInferenceThread`).
+    pack_identity: ?*@import("../../engines/mlx/cache/pack_identity.zig").Job = null,
     /// Approximate weight bytes on disk (sum of *.safetensors). Used for
     /// pre-load eviction estimates so we don't oversubscribe wired memory.
     bytes_on_disk: ?u64,

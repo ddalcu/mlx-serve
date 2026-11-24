@@ -93,6 +93,7 @@ pub fn nonStreamingViaScheduler(
         .vision_embeddings = vision_embeddings,
         .media = media,
         .cache_key = cache_key,
+        .session = if (conn) |c| (if (@import("../http/auth.zig").sessionTagAllowed(c)) c.session_key else 0) else 0,
         .client = if (conn) |c| c.client else .other,
         .priority = if (conn) |c| c.priority else false,
         .ablation = if (conn) |c| c.ablation else null,

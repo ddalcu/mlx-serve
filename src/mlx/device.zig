@@ -132,12 +132,13 @@ pub fn gpuArchitecture(buf: []u8) ?[]const u8 {
     return buf[0..arch.len];
 }
 
+pub fn forceGpuFamilyFallback() bool {
+    const v = env.span(.FORCE_GPU_FAMILY_FALLBACK) orelse return false;
+    return v.len > 0 and v[0] == '1';
+}
+
 pub fn computeNaxAvailable() bool {
-    var force = false;
-    if (env.get(.FORCE_GPU_FAMILY_FALLBACK)) |p| {
-        const v = std.mem.span(p);
-        force = v.len > 0 and v[0] == '1';
-    }
+    const force = forceGpuFamilyFallback();
     var arch_buf: [128]u8 = undefined;
     const arch = gpuArchitecture(&arch_buf) orelse "";
     var ver_buf: [64]u8 = undefined;

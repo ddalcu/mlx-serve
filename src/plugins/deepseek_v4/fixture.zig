@@ -330,21 +330,21 @@ const v41_vocab = 96;
 
 /// The V4.1 pipe layout with `stages` DSpark stages (`v41_dspark_keys`): stage layers and the drafter's head.
 pub fn v41WeightsWith(a: std.mem.Allocator, seed: u64, stages: usize) ![]u8 {
-    return v41Pack(a, seed, stages, false);
+    return v41Pack(a, seed, v41_vocab, stages, false);
 }
 
 /// The Markov rank of a pack whose drafter heads are quantized: a whole group.
 const quant_rank = 64;
 
-fn v41Pack(a: std.mem.Allocator, seed: u64, stages: usize, quant_heads: bool) ![]u8 {
+fn v41Pack(a: std.mem.Allocator, seed: u64, vocab: u64, stages: usize, quant_heads: bool) ![]u8 {
     const r41 = [_]u8{ 0, 0, 2, 2, 2, 1, 1, 1 };
     const kv_sources = [_]usize{ 2, 5 };
     const index_sources = [_]usize{ 2, 5, 7 };
     var p = Pack.init(a, seed);
     var buf: [160]u8 = undefined;
-    try p.affine("embed", &.{v41_vocab}, v41_d, 8, 64);
+    try p.affine("embed", &.{vocab}, v41_d, 8, 64);
     // With stages the head is peaked (token 5 or 7): drafts that can agree with the trunk, so rounds accept.
-    if (stages > 0) try p.peaked("head", v41_vocab, v41_d, 8, 64, 5, 7, 1.0) else try p.affine("head", &.{v41_vocab}, v41_d, 8, 64);
+    if (stages > 0) try p.peaked("head", vocab, v41_d, 8, 64, 5, 7, 1.0) else try p.affine("head", &.{vocab}, v41_d, 8, 64);
     try p.norm("norm.weight", v41_d);
     for (r41, 0..) |ratio, li| {
         var pfx_buf: [32]u8 = undefined;
@@ -362,13 +362,13 @@ fn v41Pack(a: std.mem.Allocator, seed: u64, stages: usize, quant_heads: bool) ![
         try p.norm("mtp.0.main_norm.weight", v41_d);
         try p.norm(try std.fmt.bufPrint(&buf, "mtp.{d}.norm.weight", .{last}), v41_d);
         if (quant_heads) {
-            try p.affine(try std.fmt.bufPrint(&buf, "mtp.{d}.markov_head.embed", .{last}), &.{v41_vocab}, quant_rank, 8, 64);
-            try p.affine(try std.fmt.bufPrint(&buf, "mtp.{d}.markov_head.head", .{last}), &.{v41_vocab}, quant_rank, 8, 64);
+            try p.affine(try std.fmt.bufPrint(&buf, "mtp.{d}.markov_head.embed", .{last}), &.{vocab}, quant_rank, 8, 64);
+            try p.affine(try std.fmt.bufPrint(&buf, "mtp.{d}.markov_head.head", .{last}), &.{vocab}, quant_rank, 8, 64);
             try p.affine(try std.fmt.bufPrint(&buf, "mtp.{d}.confidence_head.proj", .{last}), &.{1}, v41_d + quant_rank, 8, 64);
             return p.bytes();
         }
-        try p.dense(try std.fmt.bufPrint(&buf, "mtp.{d}.markov_head.embed.weight", .{last}), &.{ v41_vocab, ds_rank }, 0.01, 0, true);
-        try p.dense(try std.fmt.bufPrint(&buf, "mtp.{d}.markov_head.head.weight", .{last}), &.{ v41_vocab, ds_rank }, 0.01, 0, true);
+        try p.dense(try std.fmt.bufPrint(&buf, "mtp.{d}.markov_head.embed.weight", .{last}), &.{ vocab, ds_rank }, 0.01, 0, true);
+        try p.dense(try std.fmt.bufPrint(&buf, "mtp.{d}.markov_head.head.weight", .{last}), &.{ vocab, ds_rank }, 0.01, 0, true);
         try p.dense(try std.fmt.bufPrint(&buf, "mtp.{d}.confidence_head.proj.weight", .{last}), &.{ 1, v41_d + ds_rank }, 0.1, 0, true);
     }
     return p.bytes();
@@ -453,7 +453,45 @@ pub fn v41DsparkQuantHeadFiles(a: std.mem.Allocator, seed: u64) ![]const File {
     const cfg = try std.mem.replaceOwned(u8, a, v41_config, "\"compress_ratios\": [0, 0, 2, 2, 2, 1, 1, 1]", keys);
     return a.dupe(File, &.{
         .{ .name = "config.json", .bytes = cfg },
-        .{ .name = "model.safetensors", .bytes = try v41Pack(a, seed, 2, true) },
+        .{ .name = "model.safetensors", .bytes = try v41Pack(a, seed, v41_vocab, 2, true) },
+    });
+}
+
+pub const v41_servable_vocab = 320;
+
+pub const v41_servable_specials = [_]sdk.byte_tokenizer.Special{
+    .{ .id = 256, .content = "<｜begin▁of▁sentence｜>" },
+    .{ .id = 257, .content = "<｜end▁of▁sentence｜>" },
+    .{ .id = 258, .content = "<｜System｜>" },
+    .{ .id = 259, .content = "<｜User｜>" },
+    .{ .id = 260, .content = "<｜Assistant｜>" },
+    .{ .id = 261, .content = "<think>" },
+    .{ .id = 262, .content = "</think>" },
+    .{ .id = 263, .content = "<｜pad▁of▁sentence｜>" },
+};
+
+pub const v41_servable_config =
+    \\{"architectures": ["DeepseekV41ForCausalLM"], "model_type": "deepseek_v41", "bos_token_id": 256, "eos_token_id": 257, "pad_token_id": 263,
+    \\ "quantization": {"group_size": 64, "bits": 8},
+    \\ "text_config": {"model_type": "deepseek_v41_text", "vocab_size": 320, "hidden_size": 128,
+    \\  "moe_intermediate_size": 128, "num_hidden_layers": 8, "num_attention_heads": 4, "num_key_value_heads": 1,
+    \\  "head_dim": 64, "qk_rope_head_dim": 16, "q_lora_rank": 64, "o_lora_rank": 32, "o_groups": 2, "swiglu_limit": 1.0,
+    \\  "rms_norm_eps": 1e-20, "max_position_embeddings": 4096, "rope_theta": 10000.0,
+    \\  "rope_scaling": {"rope_type": "yarn", "factor": 4, "beta_fast": 32, "beta_slow": 1, "original_max_position_embeddings": 64},
+    \\  "n_routed_experts": 8, "n_shared_experts": 1, "num_experts_per_tok": 3, "scoring_func": "sqrtsoftplus",
+    \\  "topk_method": "noaux_tc", "norm_topk_prob": true, "routed_scaling_factor": 1.5, "sliding_window": 8,
+    \\  "compress_ratios": [0, 0, 2, 2, 2, 1, 1, 1], "compress_rope_theta": 40000.0, "kv_source_layer_ids": [2, 5],
+    \\  "index_source_layer_ids": [2, 5, 7], "index_n_heads": 8, "index_head_dim": 32, "index_topk": 4,
+    \\  "candidate_source_layer_id": 5, "candidate_topk_blocks": 3, "candidate_block_size": 2, "hc_mult": 4,
+    \\  "hc_sinkhorn_iters": 20, "hc_eps": 1e-6}}
+;
+
+pub fn v41ServableFiles(a: std.mem.Allocator, seed: u64) ![]const File {
+    return a.dupe(File, &.{
+        .{ .name = "config.json", .bytes = v41_servable_config },
+        .{ .name = "tokenizer.json", .bytes = try sdk.byte_tokenizer.json(a, &v41_servable_specials) },
+        .{ .name = "tokenizer_config.json", .bytes = "{\"bos_token\":\"<｜begin▁of▁sentence｜>\",\"eos_token\":\"<｜end▁of▁sentence｜>\"}" },
+        .{ .name = "model.safetensors", .bytes = try v41Pack(a, seed, v41_servable_vocab, 0, false) },
     });
 }
 

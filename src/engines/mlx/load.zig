@@ -14,6 +14,7 @@ const ane_mod = @import("../../sdk/ane/offload.zig");
 const model_mod = @import("../../sdk/config/model.zig");
 const vision_mod = @import("vision_encoder.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
+const pack_identity = @import("cache/pack_identity.zig");
 const warm_requests = @import("warm_requests.zig");
 const kv_disk_cache = @import("cache/ssd/disk_tier.zig");
 const tokenize_cache_mod = @import("../../host/tokenizer/cache.zig");
@@ -966,6 +967,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.registry.mutex.unlock(sch.io);
     if (warm_marker) |marker| warm_requests.owe(sch, entry, marker, verify_rows, chat);
     publishHotCacheResidency(sch);
+    if (entry.prefix_cache != null and module_binding != null) {
+        pack_identity.start(sch.io, entry.allocator, &entry.pack_identity, entry.path) catch |err| {
+            log.warn("[hot-cache] pack identity not started: {s}\n", .{@errorName(err)});
+        };
+    }
 }
 
 /// A module tier borrows its loaded transformer and keeps its compatibility identity in its own root.

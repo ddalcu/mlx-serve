@@ -47,9 +47,13 @@ pub const Set = struct {
     /// Both sides are trimmed on purpose: a header value excludes surrounding whitespace (RFC 9110 section 5.5) and the
     /// key file's trailing newline is dropped at load, so `key` and `key\n` are one key.
     pub fn keyMatches(self: *const Set, presented: []const u8) bool {
+        return digestMatches(self.key_digest, presented);
+    }
+
+    pub fn digestMatches(digest: [32]u8, presented: []const u8) bool {
         var d: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(trim(presented), &d, .{});
-        return std.crypto.timing_safe.eql([32]u8, d, self.key_digest);
+        return std.crypto.timing_safe.eql([32]u8, d, digest);
     }
 };
 
@@ -88,11 +92,11 @@ pub fn launch(gpa: std.mem.Allocator, io: std.Io, profiles_dir: ?[]const u8, key
     return set;
 }
 
-const KeyError = error{ NotRegular, NotOwner, GroupOrOtherAccess, TooShort, Unreadable, Unsupported, OutOfMemory };
+pub const KeyError = error{ NotRegular, NotOwner, GroupOrOtherAccess, TooShort, Unreadable, Unsupported, OutOfMemory };
 
 /// The key file's sha256: a regular file the server's user owns, no group or other bits, at least 32 bytes trimmed.
 /// POSIX hosts only (the owner and mode rules have no Windows form).
-fn readKey(a: std.mem.Allocator, path: []const u8) KeyError![32]u8 {
+pub fn readKey(a: std.mem.Allocator, path: []const u8) KeyError![32]u8 {
     return if (builtin.os.tag == .windows) error.Unsupported else readKeyPosix(a, path);
 }
 
