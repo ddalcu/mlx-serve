@@ -20,7 +20,8 @@ the pack gives none of the gain; the runs also differ in setup.
 The plugin has 52 default-on switches (51 on M5, where `ATTN_F16` is off). We count 50 of them as lossless.
 "Lossless" here means each switch's output is bit-identical to its `=0` path (EXACT), no farther from a float64
 computation of the same op than the `=0` path or within a stated bound (REORDER), or changes only drafts and verify
-widths (DRAFT-ONLY). Greedy text can still change. No test compares the whole model with a reference implementation
+widths (DRAFT-ONLY), or rounds only the drafter's operands, so only drafts change (TF32, one engine variable,
+`MLX_ENABLE_TF32`). Greedy text can still change. No test compares the whole model with a reference implementation
 (see "Accuracy"). The two outside are an 8-bit LM
 head, whose KLD was within one standard error of the bf16 head's, and a lossy f16 attention core. That core is on by
 default only without NAX. NAX is the M5 GPU's matrix units; M4 and older Macs have none. On EvalPlus the release
