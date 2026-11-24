@@ -12,7 +12,7 @@ const log = @import("../../sdk/util/log.zig");
 const MropeData = @import("../../host/media/encode.zig").MropeData;
 const MediaItem = @import("../../host/media/placeholders.zig").MediaItem;
 
-pub fn computeHy4Mrope(
+pub fn computeNewlineMrope(
     allocator: std.mem.Allocator,
     prompt_ids: []const u32,
     items: []const MediaItem,
@@ -106,7 +106,7 @@ test "hy4 mrope: one image row block carries a newline column and text resumes a
     try ids.appendSlice(testing.allocator, &.{ 1, 2, 3 });
     try ids.appendNTimes(testing.allocator, 120120, 272);
     try ids.appendSlice(testing.allocator, &.{ 4, 5 });
-    const m = try computeHy4Mrope(testing.allocator, ids.items, &items, &cfg);
+    const m = try computeNewlineMrope(testing.allocator, ids.items, &items, &cfg);
     defer testing.allocator.free(m.pos.?);
     const p = m.pos.?;
     try testing.expectEqual(@as(usize, ids.items.len), m.total);
@@ -132,5 +132,5 @@ test "hy4 mrope: a placeholder run of the wrong width is refused" {
     const cfg = model_mod.ModelConfig{ .image_token_id = 120120, .qv_merge = 2 };
     const pieces = [_]chat.ImageData{.{ .pixels = "", .width = 512, .height = 512, .grid_h = 32, .grid_w = 32 }};
     const items = [_]MediaItem{.{ .image = &pieces }};
-    try testing.expectError(error.MediaPlaceholderMismatch, computeHy4Mrope(testing.allocator, &.{ 120120, 120120 }, &items, &cfg));
+    try testing.expectError(error.MediaPlaceholderMismatch, computeNewlineMrope(testing.allocator, &.{ 120120, 120120 }, &items, &cfg));
 }

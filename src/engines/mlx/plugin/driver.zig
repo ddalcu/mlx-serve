@@ -172,13 +172,15 @@ fn quantizeHead(w: *model.Weights, b: *const plugin_config.Binding, config: *con
 
 /// A streamed bank shares the ceiling with one prompt at 16K + 1K and the wired margin.
 fn streamRoom(config: *const ModelConfig) u64 {
-    return streamRoomAt(config, @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling(), @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes);
+    return streamRoomAt(config, @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling(),
+        @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes);
 }
 
 /// The decode phase's room (`LoadCtx.stream_room_decode`): a built-in GLM's or Ling's decode bill in place of its prompt
 /// bill; 0 for every other model, whose decode room stays its prompt room (`LoadCtx.decodeRoom`).
 fn streamRoomDecode(config: *const ModelConfig) u64 {
-    return streamRoomDecodeAt(config, @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling(), @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes);
+    return streamRoomDecodeAt(config, @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling(),
+        @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes);
 }
 
 fn streamRoomDecodeAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
@@ -872,11 +874,11 @@ const FlagProbe = struct {
     }
     /// The unnamed value 2.
     fn unnamed2(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
-        out.* = .{ .flags = .{ .decode_room = @fromBackingInt(@intCast(2)) } };
+        out.* = .{ .flags = .{ .decode_room = @enumFromInt(2) } };
     }
     /// The unnamed value 3.
     fn unnamed(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
-        out.* = .{ .flags = .{ .decode_room = @fromBackingInt(@intCast(3)) } };
+        out.* = .{ .flags = .{ .decode_room = @enumFromInt(3) } };
     }
     fn olderTerms(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
         out.* = .{ .size = @offsetOf(abi.Bill, "flags") };

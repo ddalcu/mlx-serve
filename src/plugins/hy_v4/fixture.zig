@@ -4,8 +4,7 @@
 //! line rewrites the quant triples into dense rows, so the pack reaches the map half-dense — the fixture
 //! exercises both arms of every shape check.
 //!
-//! The suite runs `forward` on this pack; Plan 03 lands the forward, until then `forward` refuses by name
-//! and the plugin rides the claim sweep with `fixtureMayBeAbsent`.
+//! The suite loads this pack and runs `forward` in every declared mode.
 
 const std = @import("std");
 const File = @import("../../sdk/testing/fixture.zig").File;

@@ -1,7 +1,7 @@
-//! hy_v4_flash's weight placement (Plan 02 Task 1): every tensor the SDK loader reads lands validated against
+//! hy_v4_flash's weight placement: every tensor the SDK loader reads lands validated against
 //! the config, and the 4 Engram tables open as streamed tables — read by pread at their row offsets, never
 //! resident. The name map keeps the pack's `model.*` prefixes verbatim; the pack's layer index IS the internal
-//! index (Plan 01: kinds come from weight presence, and the pack ships its indexer/engram arms at the pack
+//! index (kinds come from weight presence, and the pack ships its indexer/engram arms at the pack
 //! layers). The quant dispatch needs no per-tensor plumbing: the pack stores affine triples (U32 codes + bf16
 //! scales/biases) and the SDK reader hands them back at their stored group sizes.
 
@@ -285,7 +285,7 @@ fn validateMlp(V: *Check, li: u32) !void {
         .{ n, @as(usize, hi) }, &.{c.engram_head_dim});
 }
 
-/// The SigLIP-style tower (loaded here, used by Plan 07): bf16 weights with f32 biases.
+/// The SigLIP-style tower (loaded here, used by the tower forward): bf16 weights with f32 biases.
 fn validateVision(V: *Check) !void {
     const c = V.c;
     const h: u64 = c.vision_hidden_size;

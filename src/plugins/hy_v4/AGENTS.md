@@ -1,7 +1,8 @@
 # hy_v4 — Tencent Hy4-flash (220B-A12B multimodal MoE)
 
 `model_type: hy_v4_flash`. The trunk is a DeepSeek-family MLA + compressed-DSA MoE with iHC streams, an Engram
-n-gram PLE on 4 layers, and a DFly2 draft stack in `model.dfly_layers.*` (a later PR). Done: claim/parse/bill/cache
+n-gram PLE on 4 layers, and a DFly2 draft stack in `model.dfly_layers.*` (config parsed and validated; the
+drafter is not served by this plugin). Done: claim/parse/bill/cache
 layout, loader + Engram stream tables, text forward (iHC, MLA with sinks, SWA, latent MoE, dense L0), compressed
 indexer (recall beyond the budget), Engram (hash + streamed gather + injection), vision (SigLIP tower + projector +
 image/newline rows + Hy4 M-RoPE), and the numeric oracle for every block.
@@ -22,7 +23,7 @@ image/newline rows + Hy4 M-RoPE), and the numeric oracle for every block.
   Both halves are dense bf16 copies made at load (billed).
 - **Text M-RoPE reduces to plain rope**: all three axes share the position, so the interleave selection is a
   no-op; the rotation is adjacent pairs (`traditional=true`) over the trailing 64 rope channels, theta 1e7 on
-  DSA layers and 1e4 on SWA. Vision (Plan 07) is where the [12,10,10] interleave actually matters.
+  DSA layers and 1e4 on SWA. Vision is where the [12,10,10] interleave actually matters.
 - **iHC is the DeepSeek-V4 form WITHOUT Sinkhorn** (`comb`, GLM's arm, not needed): `hc_fn` `[2*lanes,
   lanes*hidden]` mixes the flattened lanes, `pre = sigmoid(logits*scale[0]+base[:N]) + hc_eps`,
   `post = hc_magnitude*sigmoid(logits*scale[1]+base[N:]) + hc_eps`, the sublayer's update is spread over lanes

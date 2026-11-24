@@ -1,4 +1,4 @@
-//! Plan 02: the hy_v4_flash load. The census test runs against the real pack when it is on disk and skips
+//! The hy_v4_flash load. The census test runs against the real pack when it is on disk and skips
 //! hermetically when it is not; the tiny-pack tests run everywhere on a synthetic safetensors file.
 
 const std = @import("std");
@@ -390,7 +390,7 @@ test "hy_v4 loader: the tiny pack's expected tensors load by name with the quant
 
 /// Stages the tiny pack on disk, opens it through the SDK weight loader and the plugin's load arm, and checks
 /// what the load placed: every name the config asks for, the quant layout the config names, and the Engram
-/// tables NOT resident (the stream bank owns them — Plan 02's second task).
+/// tables NOT resident (the stream bank owns them).
 fn expectTinyLoad(st: []const u8, cfg_json: []const u8) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     const tmp = std.mem.span(std.c.getenv("TMPDIR") orelse "/tmp");

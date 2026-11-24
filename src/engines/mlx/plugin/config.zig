@@ -252,8 +252,6 @@ pub fn modelConfig(p: *const abi.Parsed) ModelConfig {
         .video_token_id = p.placeholder_ids.video,
         .audio_token_id = p.placeholder_ids.audio,
         .mrope_newline_rows = p.mrope.mrope_newline_rows,
-        .mrope_section = p.mrope.sections,
-        .mrope_interleaved = p.mrope.sections[0] + p.mrope.sections[1] + p.mrope.sections[2] > 0,
         // Recurrent layers: the slots get SSM entries, the prefix cache keeps checkpoints.
         .has_hybrid_layers = p.cache.ssm_state.entries > 0,
         .ssm_state_f32 = p.cache.ssm_state.dtype == .f32,

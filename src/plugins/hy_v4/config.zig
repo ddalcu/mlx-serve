@@ -7,7 +7,7 @@
 //! - Layer kinds are decided by the WEIGHTS (which layers carry `compressed_indexer`/`engram_layer`), not by
 //!   `layer_types`: this config's list is one off from what HF ships. The plan keeps a `layer_types` shape
 //!   check but the engine trusts weight presence; a pack that violates both is refused at load.
-//! - `enable_ihc` is the iHC gate; the exact per-module mixing shape is Plan 03's, pinned here by dims.
+//! - `enable_ihc` is the iHC gate; the per-module mixing shape is pinned here by dims.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
@@ -84,7 +84,7 @@ pub const Config = struct {
     hc_magnitude: f32 = 2.0,
     hc_eps: f32 = 1e-6,
 
-    // Engram: n-gram embedding injection on `engram_layers`; tables stream from disk (Plan 02).
+    // Engram: n-gram embedding injection on `engram_layers`; tables stream from disk.
     engram_layers: [64]bool = @splat(false),
     engram_layer_count: u32 = 0,
     /// The table rows each engram layer carries (the head-vocab lists' sums; HF-keyed, summed here). The
@@ -103,7 +103,7 @@ pub const Config = struct {
     engram_max_ngram: u32 = 3,
     engram_pad_id: u32 = 120002,
 
-    // DFly2 drafter (Plan 06): 5 draft layers over target KV/index layers 25/29/33/37/41.
+    // DFly2 drafter config: 5 draft layers over target KV/index layers 25/29/33/37/41 (validated, not served).
     dfly_layers: u32 = 0,
     dfly_mask_token_id: u32 = 0,
     dfly_target_kv_layers: [8]u32 = @splat(0),
@@ -111,7 +111,7 @@ pub const Config = struct {
     dfly_index_topk: u32 = 0,
     dfly_mtp_fusion_slot0: bool = false,
 
-    // Vision (Plan 07): SigLIP2-shaped tower + rmsnorm_mlp projector; video refused until implemented.
+    // Vision: SigLIP2-shaped tower + rmsnorm_mlp projector; video refused by name.
     has_vision: bool = false,
     vision_depth: u32 = 27,
     vision_hidden_size: u32 = 1152,

@@ -5,8 +5,8 @@
 //!
 //! Reference (`HYV4FlashAttention`): keys are `[latent | k_rot]`, values are the latent, the sinks are ONE extra
 //! per-head logit with a zero value, and V is lifted from the attended latent by `kv_b`'s V half AFTER the
-//! reduction. Sliding layers attend their last `sliding_window` keys; sparse layers (Plan 03 placeholder) attend
-//! the full causal history until the compressed indexer lands (Plan 04).
+//! reduction. Sliding layers attend their last `sliding_window` keys; sparse layers attend the full causal
+//! history below the recall budget and the compressed indexer's mask beyond it.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");

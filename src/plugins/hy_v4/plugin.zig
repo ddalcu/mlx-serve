@@ -1,5 +1,4 @@
-//! hy_v4_flash's model table. Plan 01 lands the claim, the parse and the bill; the load arms are stubs that
-//! refuse with the plan that fills them, so a load fails by name instead of pretending.
+//! hy_v4_flash's model table: the claim, the parse, the bill, the load and the forward.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");

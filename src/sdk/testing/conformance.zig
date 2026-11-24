@@ -49,19 +49,13 @@ pub const Subject = struct {
     };
 };
 
-/// Plugin root `M` as a subject; its fixture is built in `a`. A plugin mid-port may set
-/// `conformanceFixtureOptional = true` and return `null` until its loader lands: it stays in the suite's claim
-/// sweep and skips the load and forward checks.
+/// Plugin root `M` as a subject; its fixture is built in `a`.
 pub fn subjectOf(comptime M: type, a: Allocator) !Subject {
-    const fx = if (@hasDecl(M, "fixtureMayBeAbsent"))
-        (try M.conformanceFixture(a)) orelse return error.NoFixtureYet
-    else
-        try M.conformanceFixture(a);
     return .{
         .name = M.plugin.name,
         .claims = M.plugin.claims,
         .table = @unionInit(Subject.Table, @tagName(M.plugin.kind), &M.table),
-        .fixture = fx,
+        .fixture = try M.conformanceFixture(a),
     };
 }
 
@@ -69,11 +63,7 @@ pub fn expectPlugin(comptime M: type) !void {
     if (@import("media_pack.zig").ramShort(M)) return;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const s = subjectOf(M, arena.allocator()) catch |e| {
-        if (e == error.NoFixtureYet) return; // said, not skipped: a registry test ends at the first skip
-        return e;
-    };
-    try expectSubject(testing.io, arena.allocator(), s);
+    try expectSubject(testing.io, arena.allocator(), try subjectOf(M, arena.allocator()));
 }
 
 /// The suite on one subject; `a` should be an arena (the suite frees nothing it allocates in it).
