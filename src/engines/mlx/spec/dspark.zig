@@ -226,11 +226,15 @@ pub fn dsparkPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?Dr
     return try mtpSerialOneToken(allocator, tok);
 }
 
+/// A test hook, never set by serving: N > 0 pins every DSpark round at N verify rows (t1 and N - 1 drafts), the
+/// width sweep's arm. 0 leaves the adaptive policy.
+pub var test_pin_rows: u32 = 0;
+
 /// The DSpark policy's pinned verify rows: a streamed EXL3 bank's greedy request verifies the whole block (`whole`);
-/// else MLX_SERVE_DSPARK_PIN_ROWS=N (`raw`) pins N rows, and unset, 0 or not a number is the adaptive policy (0).
-pub fn dsparkPinRows(whole: bool, raw: ?[*:0]const u8) u32 {
+/// else `test_pin_rows`, which serving leaves at 0 (the adaptive policy).
+pub fn dsparkPinRows(whole: bool) u32 {
     if (whole) return std.math.maxInt(u32);
-    return env.intValue(u32, raw, 0);
+    return test_pin_rows;
 }
 
 /// Drafts a pinned round verifies: `pin_rows` rows are t1 and `pin_rows - 1` drafts, at most the `len` drafted.
@@ -238,13 +242,14 @@ pub fn pinnedDrafts(len: usize, pin_rows: u32) usize {
     return @min(len, pin_rows - 1);
 }
 
-test "dspark pin rows: MLX_SERVE_DSPARK_PIN_ROWS=N verifies N rows a round, unset is adaptive, an EXL3 bank the block" {
-    try testing.expectEqual(@as(u32, 0), dsparkPinRows(false, null));
-    try testing.expectEqual(@as(u32, 0), dsparkPinRows(false, "0"));
-    try testing.expectEqual(@as(u32, 0), dsparkPinRows(false, "x"));
-    try testing.expectEqual(std.math.maxInt(u32), dsparkPinRows(true, "3"));
-    for ([_][:0]const u8{ "2", "3", "4", "5", "6" }, 2..) |raw, n| {
-        const pin = dsparkPinRows(false, raw.ptr);
+test "dspark pin rows: test_pin_rows = N verifies N rows a round, 0 is adaptive, an EXL3 bank the block" {
+    defer test_pin_rows = 0;
+    try testing.expectEqual(@as(u32, 0), dsparkPinRows(false));
+    test_pin_rows = 3;
+    try testing.expectEqual(std.math.maxInt(u32), dsparkPinRows(true));
+    for (2..7) |n| {
+        test_pin_rows = @intCast(n);
+        const pin = dsparkPinRows(false);
         try testing.expectEqual(@as(u32, @intCast(n)), pin);
         // A 5-draft block: N rows are t1 and N - 1 drafts.
         try testing.expectEqual(n - 1, pinnedDrafts(5, pin));

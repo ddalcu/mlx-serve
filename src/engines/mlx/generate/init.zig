@@ -1023,9 +1023,9 @@ pub fn initWithOptions(
             .dspark_enabled = dspark_active,
             .dspark_stochastic = dspark_stochastic,
             // A streamed EXL3 bank verifies the whole block on a greedy request: its verify costs about a plain tick.
-            // MLX_SERVE_DSPARK_PIN_ROWS=N pins every round at N rows (the width sweep). A plugin's drafter opens with the
-            // plain rounds that time one, then drafts while its rounds pay.
-            .dspark_pol = if (!dspark_active) null else if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = dsparkPinRows(!dspark_stochastic and dm.cfg.dsv41_exl3_bank, env.get(.MLX_SERVE_DSPARK_PIN_ROWS)), .p2 = if (env.onUnlessZero(.MLX_SERVE_DSPARK_POLICY2)) .{ .modeled = env.onUnlessZero(.MLX_SERVE_DSPARK_POLICY2_MODELED) } else null } else if (plugin_driver.nativeDrafter(xfm) != null) .{ .plain = .unmeasured, .drafting = .{ .owed = 4 } } else null,
+            // `dspark.test_pin_rows` (a test hook) pins every round at N rows. A plugin's drafter opens with the plain
+            // rounds that time one, then drafts while its rounds pay.
+            .dspark_pol = if (!dspark_active) null else if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = dsparkPinRows(!dspark_stochastic and dm.cfg.dsv41_exl3_bank), .p2 = if (env.onUnlessZero(.MLX_SERVE_DSPARK_POLICY2)) .{ .modeled = env.onUnlessZero(.MLX_SERVE_DSPARK_POLICY2_MODELED) } else null } else if (plugin_driver.nativeDrafter(xfm) != null) .{ .plain = .unmeasured, .drafting = .{ .owed = 4 } } else null,
             .drafter = if (drafter_active) options.drafter else null,
             .drafter_block_size = options.drafter_block_size,
             .dflash = if (dflash_active) options.dflash else null,

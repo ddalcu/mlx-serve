@@ -379,13 +379,13 @@ Six switches stay off by default, and three value switches set memory and kernel
 
 Each of these is off by default. Names omit `MLX_SERVE_DSV41_` except where shown.
 
-- `EXACT=1` (EXACT) makes greedy DSpark text equal plain decode's bytes, on M5 through its NAX path.
-- `EXACT=1|solo` (EXACT) does the same on M3-generation or later Apple GPUs without NAX. Any value other than unset,
-  empty or `0` turns it on. `solo` also makes every request decode alone. On a GPU with NAX, the load leaves it off and logs why.
+- `EXACT=1|solo` (EXACT) makes greedy DSpark text equal plain decode's bytes. Any value other than unset, empty or `0`
+  turns it on. On a GPU with NAX (M5) it takes the verify path: each verify row's head, Engram wkv and wo_a run as its
+  plain step's. On M3-generation or later Apple GPUs without NAX the whole verify row does, and `solo` also makes every
+  request decode alone.
 - `FLASH_PSUM=1` (REORDER) is a flash-attention variant that is nearer to float64. It measured no faster.
 - `MXFP4_VIEW=1` (REORDER) loads an NVFP4 bank whose every 32-value span is one power of two as MXFP4.
 - `MOE_PAIR=1` (REORDER) is the paired prompt gate/up for MXFP4 banks without per-expert scales.
-- `MLX_SERVE_DSPARK_PIN_ROWS=N` (for tests) makes every DSpark round verify N rows, for width sweeps.
 
 Three value switches set memory and kernel choices. `ENGRAM_LRU_MB` (256) sets memory only. `ENGRAM_RESIDENT` (`auto`)
 and `WEIGHT_PATH` (`auto`) can turn off the resident fusions. The `ssd` path turns off `FUSE_MXFP8_QMM`. Tables not
