@@ -1966,9 +1966,11 @@ test "dsv41 wide tol: MLX_SERVE_DSV41_FLASH_ATTN's heads, alone and beside FLASH
             e[oi][ai] = try spanErrTo(&s, o[oi][ai], &rows, ref);
             served += 1;
         };
-        // A span the gather declines (picks not a multiple of 64) declines the flash kernel too: both take the f16 core.
-        if (served == 0) {
-            std.debug.print("[fa-gather] L={d} wp={d} K={d}: neither arm serves (both the f16 core)\n", .{ c.L, c.wp, c.K });
+        // Picks not a multiple of 64: the gather declines and only the flash arms serve (held against the f32 chain by
+        // the odd-span test).
+        if (c.K % 64 != 0) {
+            std.debug.print("[fa-gather] L={d} wp={d} K={d}: the gather declines, the flash arms serve\n", .{ c.L, c.wp, c.K });
+            try testing.expectEqual(@as(usize, 4), served);
             continue;
         }
         try testing.expectEqual(@as(usize, 6), served);
@@ -1985,6 +1987,155 @@ test "dsv41 wide tol: MLX_SERVE_DSV41_FLASH_ATTN's heads, alone and beside FLASH
         try testing.expect(!(ep.l2 <= e[0][0].l2 and ep.max <= e[0][0].max));
     }
     try testing.expect(ok);
+}
+
+/// Spans whose picks are not a multiple of 64: a short prompt's last span on a ratio-2 layer (its compressed rows all
+/// picked, nc = K) at 300, 500, 700, 1,000 and 1,023 rows, and `span_cases`' part-filled block.
+const odd_spans = [_]SpanCase{
+    .{ .L = 44, .wp = 127, .nc = 150, .K = 150 },
+    .{ .L = 244, .wp = 127, .nc = 250, .K = 250 },
+    .{ .L = 188, .wp = 127, .nc = 350, .K = 350 },
+    .{ .L = 232, .wp = 127, .nc = 500, .K = 500 },
+    .{ .L = 255, .wp = 127, .nc = 511, .K = 511 },
+    span_cases[3],
+};
+
+/// `attnGather`'s kernels as the load builds them: with `flash` the flash kernel under FLASH_ATTN and FLASH_TRIM (the
+/// release's defaults), else the gather alone (FLASH_ATTN=0).
+fn gatherAttn(flash: bool) !dsv41.GatherAttn {
+    const saved = fa.ps().*;
+    defer fa.ps().* = saved;
+    fa.ps().* = .{ .mode = if (flash) .on else .off, .trim = flash };
+    return dsv41.GatherAttn.init();
+}
+
+/// A model holding what the wide attention cores read: the release's window, groups and rope, `act` out.
+fn attnModel(m: *dsv41.Dsv41Model, act: mlx.mlx_dtype) void {
+    m.cfg = .{};
+    m.cfg.sliding_window = WIN;
+    m.cfg.dsv4_o_groups = OG;
+    m.cfg.dsv4_rope_head_dim = 64;
+    m.act = act;
+}
+
+/// `[L, H, D]` heads laid out as the grouped kernels store them (`spanErrTo` reads that layout).
+fn groupedOf(sc: *dsv41.Scope, o: A, L: usize) !A {
+    return sc.transpose(try sc.reshape(o, &.{ @intCast(L), @intCast(OG), @intCast(HEADS / OG * HD) }), &.{ 1, 0, 2 });
+}
+
+/// The span's grouped heads through attnGather on `g` in `ot`, or null where it declines (the caller's core serves).
+fn spanGather(sc: *dsv41.Scope, m: *dsv41.Dsv41Model, g: *const dsv41.GatherAttn, s: *const Span, ot: mlx.mlx_dtype) !?A {
+    m.attn_gather = g.*;
+    m.act = ot;
+    return dsv41.attnGather(sc, m, s.sink, s.q, none, s.keys_w, s.c.wp, if (s.c.K > 0) s.comp else none, if (s.c.K > 0) s.picks else none, Span.scale, .{ .periods = s.periods, .p0 = Span.p0 });
+}
+
+test "dsv41 wide: at the release's defaults on NAX a span whose picks are not a multiple of 64 takes the flash kernel (FLASH_TRIM's words), never the f16 core; under FLASH_ATTN=0 the gather declines it" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    var on = try gatherAttn(true);
+    defer on.deinit();
+    var off = try gatherAttn(false);
+    defer off.deinit();
+    const kt = try flashTrimKernel(0);
+    defer _ = mlx.mlx_fast_metal_kernel_free(kt);
+    var m: dsv41.Dsv41Model = undefined;
+    attnModel(&m, .bfloat16);
+    for (odd_spans ++ [_]SpanCase{span_cases[0]}, 0..) |c, ci_| {
+        var s = try Span.init(&sc, c, 60 + 10 * ci_);
+        defer s.deinit();
+        const got = (try spanGather(&sc, &m, &on, &s, .bfloat16)) orelse return error.FlashDeclined;
+        const same = try sameWords(got, try s.flash(&sc, kt, false, .bfloat16));
+        const off_serves = (try spanGather(&sc, &m, &off, &s, .bfloat16)) != null;
+        std.debug.print("[fa-route] L={d} wp={d} K={d}: flash serves, FLASH_TRIM's words {}; under FLASH_ATTN=0 the gather serves {}\n", .{ c.L, c.wp, c.K, same, off_serves });
+        try testing.expect(same);
+        try testing.expectEqual(c.K % 64 == 0, off_serves);
+    }
+}
+
+test "dsv41 wide tol: FLASH_ATTN's heads at a pick count not a multiple of 64 (a short prompt's last span) are no farther from float64 than the f32 chain (=0) in l2 at f32 and bf16 out and in max at f32 out, under M5's TF32 (TF32 off printed); window keys a row late fail" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var on = try gatherAttn(true);
+    defer on.deinit();
+    const kp = try flashKernel(true, false, 1);
+    defer _ = mlx.mlx_fast_metal_kernel_free(kp);
+    var m: dsv41.Dsv41Model = undefined;
+    attnModel(&m, .bfloat16);
+    m.attn_softmax_kernel = try dsv41.buildKernel("dsv41_attn_softmax", &dsv41.ATTN_SOFTMAX_INS, &.{ "pw", "pc" }, dsv41.ATTN_SOFTMAX_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.attn_softmax_kernel);
+    // The f32 chain's GEMMs are TF32 on NAX unless MLX_ENABLE_TF32=0 (read at the process's first matmul): M5's =0.
+    const tf32 = device.tf32Matmul();
+    var ok = true;
+    for (odd_spans, 0..) |c, ci_| {
+        var s = try Span.init(&sc, c, 80 + 10 * ci_);
+        defer s.deinit();
+        const rows = [_]usize{ 0, 1, 2, c.L / 3, c.L / 2, c.L - 2, c.L - 1 };
+        const ref = try spanRefs(&s, &rows);
+        defer gpa.free(ref);
+        const comp = if (c.K > 0) s.comp else none;
+        const topk = if (c.K > 0) s.picks else none;
+        const band = try dsv41.windowBand(&sc, c.wp, c.L, WIN);
+        // [out: bf16, f32][arm: the f32 chain, flash, the f16 core]
+        var e: [2][3]FErr = undefined;
+        for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }, 0..) |ot, oi| {
+            e[oi][0] = try spanErrTo(&s, try groupedOf(&sc, try dsv41.attnWideF32(&sc, s.sink, s.q, s.keys_w, band, comp, topk, Span.scale, ot), c.L), &rows, ref);
+            e[oi][1] = try spanErrTo(&s, (try spanGather(&sc, &m, &on, &s, ot)) orelse return error.FlashDeclined, &rows, ref);
+            e[oi][2] = try spanErrTo(&s, try groupedOf(&sc, try dsv41.attnWide(&sc, &m, s.sink, s.q, s.keys_w, c.wp, comp, topk, Span.scale, ot), c.L), &rows, ref);
+        }
+        const ep = try spanErrTo(&s, try s.flash(&sc, kp, false, .bfloat16), &rows, ref);
+        // Max is held at f32 out, where the kernel's own error shows: a bf16-out max is one element at the output
+        // rounding both arms share, and which side of a bf16 boundary it lands on is a rounding flip (printed).
+        const near = e[0][1].l2 <= e[0][0].l2 and e[1][1].l2 <= e[1][0].l2 and e[1][1].max <= e[1][0].max;
+        std.debug.print("[fa-odd] L={d} wp={d} K={d} (f32 chain TF32 {}): rel l2 / max vs float64, bf16 out: =0 {e:.4}/{e:.4}, flash {e:.4}/{e:.4}, f16 core {e:.4}/{e:.4}; f32 out: =0 {e:.3}/{e:.3}, flash {e:.3}/{e:.3}, f16 core {e:.3}/{e:.3}; flash no farther {}; planted (keys a row late) {e:.3}/{e:.3}\n", .{ c.L, c.wp, c.K, tf32, e[0][0].l2, e[0][0].max, e[0][1].l2, e[0][1].max, e[0][2].l2, e[0][2].max, e[1][0].l2, e[1][0].max, e[1][1].l2, e[1][1].max, e[1][2].l2, e[1][2].max, near, ep.l2, ep.max });
+        if (tf32 and !near) ok = false;
+        try testing.expect(!(ep.l2 <= e[0][0].l2 and ep.max <= e[0][0].max));
+    }
+    try testing.expect(ok);
+}
+
+test "dsv41 wide meas: MLX_SERVE_DSV41_ATTN_F16's f16 core (LOSSY; it serves without NAX, or on NAX under FLASH_ATTN=0 at a pick count not a multiple of 64) against float64 beside the f32 chain (=0), printed, not gated, at the release's spans; keys a row late fail" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var m: dsv41.Dsv41Model = undefined;
+    attnModel(&m, .bfloat16);
+    m.attn_softmax_kernel = try dsv41.buildKernel("dsv41_attn_softmax", &dsv41.ATTN_SOFTMAX_INS, &.{ "pw", "pc" }, dsv41.ATTN_SOFTMAX_SOURCE, "");
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.attn_softmax_kernel);
+    const tf32 = device.tf32Matmul();
+    for (span_cases ++ odd_spans[0..5].*, 0..) |c, ci_| {
+        var s = try Span.init(&sc, c, 40 + 10 * ci_);
+        defer s.deinit();
+        const rows = [_]usize{ 0, 1, 2, c.L / 3, c.L / 2, c.L - 2, c.L - 1 };
+        const ref = try spanRefs(&s, &rows);
+        defer gpa.free(ref);
+        const comp = if (c.K > 0) s.comp else none;
+        const topk = if (c.K > 0) s.picks else none;
+        const band = try dsv41.windowBand(&sc, c.wp, c.L, WIN);
+        var e: [2][2]FErr = undefined;
+        for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }, 0..) |ot, oi| {
+            e[oi][0] = try spanErrTo(&s, try groupedOf(&sc, try dsv41.attnWideF32(&sc, s.sink, s.q, s.keys_w, band, comp, topk, Span.scale, ot), c.L), &rows, ref);
+            e[oi][1] = try spanErrTo(&s, try groupedOf(&sc, try dsv41.attnWide(&sc, &m, s.sink, s.q, s.keys_w, c.wp, comp, topk, Span.scale, ot), c.L), &rows, ref);
+        }
+        // Planted: the f16 core over the keys a row late (each window and compressed row the next one's).
+        const roll = struct {
+            fn of(sc_: *dsv41.Scope, x: A) !A {
+                const n: usize = @intCast(mlx.getShape(x)[0]);
+                return sc_.concat(&.{ try sc_.slice(x, 0, 1, n), try sc_.slice(x, 0, 0, 1) }, 0);
+            }
+        }.of;
+        const bad = try dsv41.attnWide(&sc, &m, s.sink, s.q, try roll(&sc, s.keys_w), c.wp, if (c.K > 0) try roll(&sc, s.comp) else none, topk, Span.scale, .bfloat16);
+        const ep = try spanErrTo(&s, try groupedOf(&sc, bad, c.L), &rows, ref);
+        std.debug.print("[attn-f16] L={d} wp={d} K={d} (f32 chain TF32 {}): rel l2 / max vs float64, bf16 out: =0 {e:.4}/{e:.4}, ATTN_F16 {e:.4}/{e:.4}; f32 out: =0 {e:.3}/{e:.3}, ATTN_F16 {e:.3}/{e:.3}; planted (keys a row late) {e:.3}/{e:.3}\n", .{ c.L, c.wp, c.K, tf32, e[0][0].l2, e[0][0].max, e[0][1].l2, e[0][1].max, e[1][0].l2, e[1][0].max, e[1][1].l2, e[1][1].max, ep.l2, ep.max });
+        try testing.expect(!(ep.l2 <= e[0][0].l2 and ep.max <= e[0][0].max));
+    }
 }
 
 test "dsv41 wide ubench: FLASH_ATTN and FLASH_TRIM at the release's spans (DSV41_DEC_UBENCH)" {

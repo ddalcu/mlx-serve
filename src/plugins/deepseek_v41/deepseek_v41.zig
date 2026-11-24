@@ -3918,9 +3918,13 @@ fn attentionHeads(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, p0: u
     return attnDecode(sc, m, &m.layers[li], pj.q, ls.win, comp_rows, topk, p0, scale, ropeFor(m, li).inv);
 }
 
-/// The shapes `attnGather`'s kernels take: `H` heads of `D`, a window of `W` and `K` compressed picks.
+/// The shapes `attnGather` takes: `H` heads of `D`, a window of `W` and `K` compressed picks; the flash kernel any `K`.
+fn gatherShape(W: usize, H: usize, D: usize, K: usize) bool {
+    return H == 64 and D % 128 == 0 and W % 64 == 0 and W + K <= 32 * 32;
+}
+/// `gatherShape` for the gather's own launches (qk, sm, pv), which take `K` in tiles of 64.
 fn gatherServes(W: usize, H: usize, D: usize, K: usize) bool {
-    return H == 64 and D % 128 == 0 and W % 64 == 0 and K % 64 == 0 and W + K <= 32 * 32;
+    return gatherShape(W, H, D, K) and K % 64 == 0;
 }
 
 /// The compressed picks a span ending at position `end` reads where its layer's index source compresses at `ratio`
@@ -3958,7 +3962,7 @@ pub fn attnGather(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, qt: A, keys_w
     const W = m.cfg.sliding_window;
     const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
     const NK = W + K;
-    if (!gatherServes(W, H, D, K) or !mlx.streamIsGpu(sc.s)) return null;
+    if (!gatherShape(W, H, D, K) or !mlx.streamIsGpu(sc.s)) return null;
     if (mlx.mlx_array_dtype(q) != .bfloat16 or mlx.mlx_array_dtype(keys_w) != .bfloat16 or (K > 0 and mlx.mlx_array_dtype(comp_rows) != .bfloat16)) return null;
     const og = m.cfg.dsv4_o_groups;
     if (grouped != null and (og == 0 or H % og != 0)) return null;
@@ -4011,6 +4015,8 @@ pub fn attnGather(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, qt: A, keys_w
         try flashLaunch(sc, fk, &f_ins, &.{.{ .shape = &f_osh, .dt = m.act }}, L, H, qt.ctx != null, m.act, &f_o);
         return f_o[0];
     };
+    // The gather's own launches take the picks in tiles of 64: another count goes to the caller's core.
+    if (K % 64 != 0) return null;
     // scratch_attn.zig: a wide span's scores and probabilities in the ring's slot j, each launch its stock text's
     // twin (qk writes s into S's slot, sm reads it and writes p into P's, pv reads p; each binds the one before's
     // carrier, and qk the carrier of the slot's last pv).
@@ -4183,7 +4189,7 @@ pub fn windowBand(sc: *Scope, wp: usize, L: usize, window: usize) !A {
 /// A span's scores, softmax and weighted rows as the f32 op chain: the window
 /// band `band` [L, Wk], then the selected compressed rows (`topk` < 0 = none);
 /// the per-head sink joins the softmax denominator only.
-fn attnWideF32(sc: *Scope, sink: A, q: A, keys_w: A, band: A, comp_rows: A, topk: A, scale: f32, out_dt: mlx.mlx_dtype) !A {
+pub fn attnWideF32(sc: *Scope, sink: A, q: A, keys_w: A, band: A, comp_rows: A, topk: A, scale: f32, out_dt: mlx.mlx_dtype) !A {
     const qf = try sc.astype(q, .float32);
     const kw = try sc.astype(keys_w, .float32);
     var logits = try sc.matmul(qf, try sc.t2(kw)); // [L, H, Wk]
