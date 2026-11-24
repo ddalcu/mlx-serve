@@ -1,7 +1,7 @@
 # DeepSeek-V4.1-Flash-1017 NVFP4 in mlx-serve
 
 Status: production guide for the `deepseek_v41` runner in mlx-serve core, PR 1256, 2026-11-24. We measured build
-`a99fc4f6`. Later commits remove off-by-default code paths and restructure three others; the defaults' kernels compute the same values
+`a99fc4f6`. Six later commits remove off-by-default code paths, restructure opt-in and test paths, and fix tests; the defaults' kernels compute the same values
 (the PR's reply comments list the commits and their checks). "We" are the PR 1256 authors, who tuned and measured on
 M5 Ultra Macs with 512 GiB (549.8 GB) of memory; GB here means 1e9 bytes. The PR body holds the A/B evidence. Agent and code
 notes for this folder are in [AGENTS.md](AGENTS.md).
@@ -18,11 +18,11 @@ test's p01 prompt. The first NVFP4 build gave 71.77 and 3,994 tok/s (see "Result
 the pack gives none of the gain; the runs also differ in setup.
 
 The plugin has 52 default-on switches (51 on M5, where `ATTN_F16` is off). We count 50 of them as lossless.
-"Lossless" here means each switch's output is bit-identical to its `=0` path (EXACT), no farther from a float64
-computation of the same op than the `=0` path or within a stated bound (REORDER), or changes only drafts and verify
-widths (DRAFT-ONLY). One engine variable, `MLX_ENABLE_TF32`, has its own class (TF32): on M5 at the defaults it rounds
-only the drafter's P·V. Greedy text can still change. No test compares the whole model with a reference implementation
-(see "Accuracy"). The two outside are an 8-bit LM
+"Lossless" here means each switch's output is bit-identical to its `=0` path (EXACT); or (REORDER) not
+bit-identical but measured no farther from float64 (5 switches), held to a stated bound that can allow somewhat more
+error than `=0` (7), or classed by reasoning or A/B text alone (3); or changes only drafts and verify widths
+(DRAFT-ONLY). `MLX_ENABLE_TF32` has its own class (TF32): on M5 at the defaults it rounds only the drafter's P·V.
+Greedy text can still change. No test compares the whole model with a reference implementation (see "Accuracy"). The two outside are an 8-bit LM
 head, whose KLD was within one standard error of the bf16 head's, and a lossy f16 attention core. That core is on by
 default only without NAX. NAX is the M5 GPU's matrix units; M4 and older Macs have none. On EvalPlus the release
 build scored 161/164 on HumanEval and 366/378 on MBPP (base tests).
@@ -166,7 +166,7 @@ Some parts scale or turn off by themselves (listed below).
 
 Four variables use other prefixes: `MLX_SERVE_DSV4_DSPARK` (DSV4, not DSV41), the engine's
 `MLX_SERVE_DSPARK_*`, and MLX's `MLX_ENABLE_TF32`. A default-on switch turns off with `=0`. Each speed change in this
-release won its A/B on an M5 Ultra with 512 GiB, except three washes kept because they remove work.
+release won its A/B on an M5 Ultra with 512 GiB, except `DRAFT_POS_ONCE`, a wash kept because it removes work.
 
 - A Mac that cannot hold the pack refuses the load. The plugin does not stream experts that carry per-expert scales,
   so a smaller Mac cannot serve the NVFP4 pack. It needs the `--experts-mxfp4` pack, whose experts can stream from
@@ -232,11 +232,10 @@ declines the switch by name and logs why.
 50 plugin switches fall in three classes, and a fourth class, TF32, covers one engine variable:
 - EXACT: the same output values as the `=0` path, bit for bit. A test shows it, or (2 switches) it is classed without
   a measurement, by the commit's reasoning.
-- REORDER: not bit-identical. A test shows it no farther from float64 or within a stated bound, or (3 switches) it is
-  classed without a measurement: by the commit's reasoning (2) or because its A/B kept the same text (1).
+- REORDER: not bit-identical; the table below splits the 15 by their evidence.
 - DRAFT-ONLY: changes only the drafts, or how many rows a verify checks (1 switch classed without a measurement).
-- TF32 (one engine variable): MLX's TF32 matmuls. On M5 at the defaults they round only the drafter's P·V; on
-  off-default routes, also the f32 chain's P·V (the block below). Without NAX, MLX does not use TF32.
+- TF32 (one engine variable): MLX's TF32 matmuls; on off-default routes they also round the f32 chain's P·V (the
+  block below). Without NAX, MLX does not use TF32.
 
 44 of the 50 have a standing test or a kernel contract case. 6 do not: `WOA_JOIN`, `DRAFT_POS_ONCE` (EXACT); `CED`,
 `PF_PASS_SIZE`, `HC_EXPAND_NORM` (REORDER); and `SPEC_SYNC` (DRAFT-ONLY). The table below says why for each.
@@ -258,7 +257,7 @@ prompt-attention call (the block below).
 | REORDER switches | How many |
 |---|---|
 | Measured no farther from float64 than the `=0` path (`PF_COMP_BF16`, `FLASH_ATTN`, `ENGRAM_KV_SLOTS`, `ATTN_DEC`, `WOA_PLAIN`) | 5 |
-| Held to a stated bound: `MOE_PAIR_SCALED`, `PF_HC_V2`, `ENGRAM_GPU_IDS` (each below); `PF_IDX_NAX` (each score within 2·γ(34) of `idx_tile`'s, the same top-K picks); `MOE_FP4_NAX`, `FP4_READS`, `FUSE_MXFP8_QMM` (rel-rms against f32 within 1.25 times the `=0` path's, plus 1e-4) | 7 |
+| Held to a stated bound that can allow more error than `=0`: `MOE_FP4_NAX`, `FP4_READS`, `FUSE_MXFP8_QMM` (rel-rms against f32 up to 1.25 times the `=0` path's, plus 1e-4); `PF_HC_V2` (mixes and split 2.0 to 5.9 times farther from float64, within 1e-5 of it); `ENGRAM_GPU_IDS` (4 of 409,600 words farther, worst element no farther); `MOE_PAIR_SCALED` (each differing word within one bf16 step of its row's peak, under 1% differing, sample l2 within 1.05 times); `PF_IDX_NAX` (each score within 2·γ(34) of `idx_tile`'s, the same top-half picks except near-ties) | 7 |
 | Resting on the commit's reasoning (`CED`, the chunked prompt path; `PF_PASS_SIZE`) | 2 |
 | Resting on its A/B's same text (`HC_EXPAND_NORM`: its test allows 1% relative error, far looser than bf16 rounding, so we do not count it as a bound) | 1 |
 
@@ -291,11 +290,13 @@ explicit `ATTN_F16=1`. The load fixes the switch's value, and the prompt cache's
 TF32 rounds an f32 matmul's operands to a 10-bit mantissa. On M5 at the defaults, every prompt-attention call takes
 the flash kernel or the gather, and the trunk's f32 matmuls read bf16 values held in f32 or run on MLX's gemv kernel.
 So TF32 rounds no operand that the model verifies. The f32 chain serves only off-default routes, and there TF32
-rounds its P·V; its float64 error measured equal to the 64-head bf16 chain's at those shapes. At the defaults TF32's
+rounds its P·V; its float64 error measured equal to the bf16 chain's (the same f32 chain at the release's 64 heads and
+bf16 activations) at those shapes. γ(n) = n·u / (1 - n·u), with u = 2⁻²⁴, bounds the rounding of an n-term f32 sum. At the defaults TF32's
 only rounding is the drafter's P·V, so its class passes for the same reason as DRAFT-ONLY.
 
-The class tests are in the plugin. Each test also runs a planted fault as a control, and the control must fail.
-`prompt/wide_test.zig` holds the prompt switches. `decode/attn.zig`, `decode/woa_plain.zig` and
+The class tests are in the plugin unless named. Most also run a planted fault as a control, which must fail.
+`zig build test -Dslow-tests -Dtest-filter="dsv41" -Dtest-filter="deepseek_v41" -Dtest-filter="dspark sampled verdict"`
+runs them all; `prompt/wide_test.zig` holds most prompt switches. `decode/attn.zig`, `decode/woa_plain.zig` and
 `decode/engram_ids.zig` hold `ATTN_DEC`, `WOA_PLAIN` and `ENGRAM_GPU_IDS` against float64. `tf32_test.zig` runs the
 served f32 matmuls against float64, over operands saved from a served run (`DSV41_TF32_FIXTURE`). The served-route
 tests of `attnCore` count each core's calls; on NAX they count 0 f16 calls.
@@ -381,7 +382,7 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | MOE_PAIR_SCALED | NVFP4 prompt gate/up, scales and activation in one launch | REORDER (bounded) | test |
 | PF_HC_V2 | Wide-layer hc in three passes, not five | REORDER (bounded) | test |
 | PF_PASS_SIZE | Near-equal memory-sized prompt passes | REORDER (partition) | commit |
-| PF_IDX_NAX | Indexer scores on the matrix units | REORDER (bounded) | test (within 2·γ(34) of `idx_tile`, the same top-K picks; NAX) |
+| PF_IDX_NAX | Indexer scores on the matrix units | REORDER (bounded) | test (within 2·γ(34) of `idx_tile`, the same top-half picks except near-ties; NAX) |
 | PF_COMP_BF16 | Compressor projection on a bf16 MMA, K blocks summed apart | REORDER | test |
 | FLASH_ATTN | Every prompt-attention call on one flash kernel where it fits | REORDER | test |
 | ENGRAM_GPU_IDS | Engram ids hashed on the GPU; fused wkv | REORDER (bounded) | test |
@@ -394,8 +395,8 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | DRAFT_SAMPLE | Sampled drafts from q, kept at min(1, p / q) | DRAFT-ONLY | test (engine: `spec/dspark.zig`, "dspark sampled verdict") |
 | DRAFT_QKV | Fuses a stage's wq_a and wkv at load | DRAFT-ONLY | test (within 1e-3 relative rms, no farther from the op chain) |
 | SPEC_SYNC | Greedy accept on the GPU; next draft queued behind the verify | DRAFT-ONLY | A/B text (its test needs a pack) |
-| DRAFT_VOCAB | Greedy drafts score only the pack's `draft-vocab.txt` ids (default: the pack's file, shipped as the plugin's `draft-vocab.txt`) | DRAFT-ONLY | test |
-| DRAFT_VOCAB_PROMPT | A request's prompt ids join the draft vocabulary | DRAFT-ONLY | test |
+| DRAFT_VOCAB | Greedy drafts score only the pack's `draft-vocab.txt` ids (default: the pack's file, shipped as the plugin's `draft-vocab.txt`) | DRAFT-ONLY | test (and `deepseek_v4/served_test.zig`) |
+| DRAFT_VOCAB_PROMPT | A request's prompt ids join the draft vocabulary | DRAFT-ONLY | test (`deepseek_v4/served_test.zig`) |
 | HEAD8 | LM head requantized to 8-bit g64 | Requantized (KLD within one standard error) | KLD measurement |
 | ATTN_F16 | f16 attention core; on by default only without NAX | LOSSY (measured, not gated) | printed float64 measurement, served-route tests |
 
@@ -435,7 +436,8 @@ held in memory turn off `ENGRAM_GPU_IDS` and the Engram partials cache (`ENGRAM_
 ## Results
 
 The first NVFP4 build is `f7e4da9e`, an early build of this PR's branch (2026-11-20), before the fused fp4 decode was
-on by default. `main` cannot serve this pack: it has neither the converter nor the experts' per-expert scales.
+on by default. `main` cannot serve this pack: it has neither the converter nor a `deepseek_v41` runner that reads the experts'
+per-expert scales.
 Standard test, p01, greedy, DSpark on, NVFP4 pack:
 
 | Build | Prefill tok/s | Decode tok/s |
@@ -453,12 +455,12 @@ three prompts; the release's three-prompt mean is 97.98 tok/s.
 The ds41nv sweep build (see "Terms") ran the same sweep on the MXFP4-experts pack on 2026-11-24. Greedy prefill /
 decode tok/s:
 
-| Context | The ds41nv sweep build, MXFP4 | Release, NVFP4 | Prefill, release / before |
-|---|---|---|---|
-| 16K | 4,248.0 / 102.65 | 5,524.1 / 132.80 | x1.30 |
-| 128K | 3,915.8 / 103.05 | 5,508.9 / 128.45 | x1.41 |
-| 512K | 2,728.6 / 102.30 | 4,707.5 / 119.00 | x1.73 |
-| 1M | 1,889.5 / 99.75 | 3,912.9 / 110.70 | x2.07 |
+| Context | The ds41nv sweep build, MXFP4 | Release, NVFP4 | Prefill, release / before | Decode, release / before |
+|---|---|---|---|---|
+| 16K | 4,248.0 / 102.65 | 5,524.1 / 132.80 | x1.30 | x1.29 |
+| 128K | 3,915.8 / 103.05 | 5,508.9 / 128.45 | x1.41 | x1.25 |
+| 512K | 2,728.6 / 102.30 | 4,707.5 / 119.00 | x1.73 | x1.16 |
+| 1M | 1,889.5 / 99.75 | 3,912.9 / 110.70 | x2.07 | x1.11 |
 
 The sweep's code-context prompts reach 4.4 to 4.9 tokens per round, against 2.99 on the standard test, so do not
 compare sweep decode with standard-test decode.
