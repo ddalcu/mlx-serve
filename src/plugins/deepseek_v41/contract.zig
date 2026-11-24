@@ -2233,8 +2233,9 @@ const AttnFlash = struct {
     const HGN: usize = @intCast(fa.hgn);
     const BK = 128;
 
+    /// Any pick count (the gather's own kernels take multiples of 64).
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
-        if (!Gathered.ok(s) or s.n % (16 * HGN) != 0 or s.n % p.og != 0) return null;
+        if (s.rows == 0 or s.n != HEADS or WINDOW + s.k > 1024 or s.n % (16 * HGN) != 0 or s.n % p.og != 0) return null;
         var g = metal.Geometry{ .grid = .{ ci(32 * s.n / (16 * HGN)), ci(s.rows), ci(4 * HGN) }, .tg = .{ 32, 1, ci(4 * HGN) } };
         g.out(&.{ ci(p.og), ci(s.rows), ci(s.n / p.og * HD) }, act);
         g.int("HGN", HGN);
@@ -4843,6 +4844,9 @@ const flash_trim_l = metal.Launch{ .name = "dsv41_attn_flash_trim", .inputs = fl
 const flash_psum_l = metal.Launch{ .name = "dsv41_attn_flash_psum", .inputs = flash_l.inputs, .outputs = flash_l.outputs, .source = fa.source, .header = fa.header_psum, .tg_bytes = flash_l.tg_bytes, .offline = false, .min_gen = 17 };
 const flash_trim_psum_l = metal.Launch{ .name = "dsv41_attn_flash_trim_psum", .inputs = flash_l.inputs, .outputs = flash_l.outputs, .source = fa.source, .header = fa.header_trim_psum, .tg_bytes = flash_l.tg_bytes, .offline = false, .min_gen = 17 };
 const gather_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 } };
+/// The flash kernel's: the gather's, and pick counts not a multiple of 64 (a short prompt's last span, which the gather
+/// declines).
+const flash_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 }, .{ .rows = 3, .n = HEADS, .k = 150 }, .{ .rows = 4, .n = HEADS, .k = 200 }, .{ .rows = 5, .n = HEADS, .k = 500 }, .{ .rows = 3, .n = HEADS, .k = 511 } };
 const qk_t_l = metal.Launch{ .name = "dsv41_attn_qk_t", .inputs = &.{ "q", "kw", "comp", "picks", "meta", "qt" }, .outputs = &.{"s"}, .source = qtail.attn_qk_t_source, .header = v41.MPP_HEADER, .tg_bytes = 2 * 64 * 64 * 2, .offline = false, .min_gen = 17 };
 /// The slicing a variant's contract cases run at.
 fn v2Slices(p: hv2.Pro) usize {
@@ -5407,7 +5411,7 @@ fn registerStreamed(set: *kc.Set) !void {
         .depth = kc.host.depthOne,
         .out = .bf16,
         .nax = true,
-        .served = gather_served,
+        .served = flash_served,
         .sums = .{ .exact = false },
     });
     // FLASH_TRIM's text (FLASH_ATTN's values): the same bound.
@@ -5417,7 +5421,7 @@ fn registerStreamed(set: *kc.Set) !void {
         .depth = kc.host.depthOne,
         .out = .bf16,
         .nax = true,
-        .served = gather_served,
+        .served = flash_served,
         .sums = .{ .exact = false },
     });
     // FLASH_TRIM and FLASH_PSUM together: the same bound.
@@ -5427,7 +5431,7 @@ fn registerStreamed(set: *kc.Set) !void {
         .depth = kc.host.depthOne,
         .out = .bf16,
         .nax = true,
-        .served = gather_served,
+        .served = flash_served,
         .sums = .{ .exact = false },
     });
     // FLASH_PSUM's sums (l over the rounded P): the same bound.
@@ -5437,7 +5441,7 @@ fn registerStreamed(set: *kc.Set) !void {
         .depth = kc.host.depthOne,
         .out = .bf16,
         .nax = true,
-        .served = gather_served,
+        .served = flash_served,
         .sums = .{ .exact = false },
     });
     // The vocabulary cut to 40,000 (129,280 served): the step is vocabulary-generic, and this still gives a simdgroup
