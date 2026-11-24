@@ -13363,7 +13363,7 @@ test "dsv41 moe_wt: the weighted activation is the promoted multiply then cast, 
     try std.testing.expectEqualSlices(u8, wb, gb);
 }
 
-fn testConfig(io: std.Io, dir: []const u8) !Config {
+pub fn testConfig(io: std.Io, dir: []const u8) !Config {
     return @import("../../sdk/testing/pack_config.zig").packConfig(@import("config.zig"), io, dir);
 }
 

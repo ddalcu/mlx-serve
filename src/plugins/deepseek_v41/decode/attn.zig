@@ -734,7 +734,12 @@ test "dsv41 dec attn: matches today's split and merge" {
 /// f64 attention of each (row, head) over its window rows and picked rows, the sink in the denominator only: heads
 /// [R, H, 512].
 fn truthHeads(gpa: std.mem.Allocator, q: []const f32, ring: []const f32, comp: []const f32, picks: []const i32, sink: []const f32, rows: usize, k: usize, nc: usize, p0: usize) ![]f32 {
-    const out = try gpa.alloc(f32, rows * HEADS * HD);
+    return truthHeadsAs(f32, gpa, q, ring, comp, picks, sink, rows, k, nc, p0);
+}
+
+/// `truthHeads` kept in `T`.
+fn truthHeadsAs(comptime T: type, gpa: std.mem.Allocator, q: []const f32, ring: []const f32, comp: []const f32, picks: []const i32, sink: []const f32, rows: usize, k: usize, nc: usize, p0: usize) ![]T {
+    const out = try gpa.alloc(T, rows * HEADS * HD);
     const s = try gpa.alloc(f64, WINDOW + k);
     defer gpa.free(s);
     const keys = try gpa.alloc(?[]const f32, WINDOW + k);
@@ -773,7 +778,7 @@ fn truthHeads(gpa: std.mem.Allocator, q: []const f32, ring: []const f32, comp: [
                     for (acc, kr) |*a, b| a.* += w * @as(f64, b);
                 }
             }
-            for (acc, 0..) |a, d| out[(i * HEADS + h) * HD + d] = @floatCast(a / denom);
+            for (acc, 0..) |a, d| out[(i * HEADS + h) * HD + d] = if (T == f64) a / denom else @floatCast(a / denom);
         }
     }
     return out;
@@ -1405,4 +1410,131 @@ test "dsv41 dec attn merge: ubench, attention then wo_a, R = 1..6, the merge var
             std.debug.print("[dec-ubench] attn+wo_a R={d}: the merged split at S={d} {d:.1} us a step\n", .{ R, sp, try decode.chainUs(&c, 200) });
         }
     }
+}
+
+/// Each (row, head)'s split partials merged with the sink in float64: heads [R, H, 512].
+fn mergeF64(gpa: std.mem.Allocator, p: Partials, sink: []const f32) ![]f64 {
+    const acc = try dsv41.hostF32(p.acc);
+    defer gpa.free(acc);
+    const pm = try dsv41.hostF32(p.m);
+    defer gpa.free(pm);
+    const pl = try dsv41.hostF32(p.l);
+    defer gpa.free(pl);
+    const R: usize = @intCast(dimOf(p.acc, 0));
+    const H: usize = @intCast(dimOf(p.acc, 1));
+    const S: usize = @intCast(p.splits);
+    const out = try gpa.alloc(f64, R * H * HD);
+    for (0..R * H) |rh| {
+        const base = rh * S;
+        var mx: f64 = sink[rh % H];
+        for (0..S) |j| {
+            if (pl[base + j] > 0) mx = @max(mx, pm[base + j]);
+        }
+        var total = @exp(@as(f64, sink[rh % H]) - mx);
+        var w: [MAX_SPLITS]f64 = undefined;
+        for (0..S) |j| {
+            w[j] = if (pl[base + j] > 0) @exp(@as(f64, pm[base + j]) - mx) else 0;
+            total += @as(f64, pl[base + j]) * w[j];
+        }
+        for (out[rh * HD ..][0..HD], 0..) |*o, d| {
+            var s: f64 = 0;
+            for (0..S) |j| s += @as(f64, acc[(base + j) * HD + d]) * w[j];
+            o.* = s / total;
+        }
+    }
+    return out;
+}
+
+test "dsv41 dec attn tile (MLX_SERVE_DSV41_ATTN_DEC): the tile kernel's partials are no farther from float64 than dec_attn's, l2 and max, merged in float64 and through the served f32 merge, R = 1..6, the release's lists on the fixture's rings and compressed rows; the planted missing rescale is farther" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const kern = try build();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    const tile = try buildTile();
+    defer _ = mlx.mlx_fast_metal_kernel_free(tile);
+    const plant = try buildTilePlant();
+    defer _ = mlx.mlx_fast_metal_kernel_free(plant);
+    const wp = try decode.woa_plain.build();
+    defer wp.deinit();
+    var cells: usize = 0;
+    var farther: usize = 0;
+    var caught: usize = 0;
+    // [list][merge][arm]: list 0 the picks', 1 the window alone.
+    var agg: [2][2][3]decode.Dist = @splat(@splat(@splat(.{})));
+    const Case = struct { lo: usize, hi: usize, ctx: usize };
+    for ([_]Case{ .{ .lo = 20, .hi = 25, .ctx = 4200 }, .{ .lo = 20, .hi = 25, .ctx = 300 }, .{ .lo = 0, .hi = 1, .ctx = 4200 } }) |c| {
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = c.lo, .hi = c.hi, .experts = 16, .ctx = c.ctx });
+        defer fx.deinit();
+        const m = fx.m;
+        var sc = Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const st = fx.state();
+        const p0 = st.n;
+        const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{SCALE}, &[_]c_int{1}, 1, .float32));
+        // The served merge (`woa_plain.merge`) with no rope tail: the rope rotates both arms' heads alike.
+        const meta = try sc.ints(&[_]i32{ @intCast(p0), 0, 0, 0, 0, 0 }, &.{6});
+        const periods = try sc.zeros(&.{1}, .float32);
+        for (c.lo..c.hi) |li| {
+            const ly = &m.layers[li];
+            var src: ?usize = null;
+            if (ly.ratio > 0) for (c.lo..li + 1) |l| {
+                if (st.layers[l].comp != null) src = l;
+            };
+            const comp_rows = if (src) |l| try sliceRows(&sc, st.layers[l].comp.?.buf, 0, st.layers[l].comp.?.used) else none;
+            const nc: usize = if (src) |l| st.layers[l].comp.?.used else 0;
+            const k: usize = if (src != null) 512 else 0;
+            const hs = try dsv41.hostF32(ly.sink);
+            defer gpa.free(hs);
+            const hc = if (k > 0) try dsv41.hostF32(comp_rows) else try gpa.alloc(f32, 0);
+            defer gpa.free(hc);
+            for (1..decode.max_rows + 1) |R| {
+                const q = try Rig.randn(&sc, &.{ @intCast(R), HEADS, HD }, 300 + R + 10 * li);
+                const kv = try Rig.randn(&sc, &.{ @intCast(R), HD }, 400 + R + 10 * li);
+                const ring: dsv41.Ring = .{ .buf = try ringWith(&sc, st.layers[li].win.buf, kv, p0), .cap = 144, .width = HD };
+                const picks = try gpa.alloc(i32, R * k);
+                defer gpa.free(picks);
+                for (0..R) |r| for (0..k) |j| {
+                    picks[r * k + j] = if (j < nc and !(r % 2 == 1 and j % 7 == 3)) @intCast((j * 7919 + r * 131) % nc) else -1;
+                };
+                const topk = if (k > 0) try sc.ints(picks, &.{ @intCast(R), @intCast(k) }) else none;
+                const hq = try dsv41.hostF32(q);
+                defer gpa.free(hq);
+                const hr = try dsv41.hostF32(ring.buf);
+                defer gpa.free(hr);
+                const truth = try truthHeadsAs(f64, gpa, hq, hr, hc, picks, hs, R, k, nc, p0);
+                defer gpa.free(truth);
+                // [0] dec_attn (=0), [1] the tile kernel, [2] the plant; d64 merged in float64, d32 the served merge.
+                const ps = [3]Partials{
+                    (try partials(&sc, kern, m, q, ring, comp_rows, topk, p0, SCALE)) orelse return error.Declined,
+                    (try partialsTile(&sc, tile, m, q, ring, comp_rows, topk, p0, SCALE)) orelse return error.Declined,
+                    (try runTile(&sc, plant, m, q, ring, comp_rows, topk, p0, scal, null)) orelse return error.Declined,
+                };
+                var d64: [3]decode.Dist = @splat(.{});
+                var d32: [3]decode.Dist = @splat(.{});
+                for (ps, 0..) |p, i| {
+                    const h64 = try mergeF64(gpa, p, hs);
+                    defer gpa.free(h64);
+                    d64[i].add(h64, truth);
+                    const h32 = try dsv41.hostF32(try decode.woa_plain.merge(&sc, wp.merge, 0, p.acc, p.m, p.l, ly.sink, meta, periods));
+                    defer gpa.free(h32);
+                    d32[i].add(h32, truth);
+                }
+                for (0..3) |i| {
+                    agg[@intFromBool(k == 0)][0][i].join(d64[i]);
+                    agg[@intFromBool(k == 0)][1][i].join(d32[i]);
+                }
+                const near = d64[1].within(d64[0]) and d32[1].within(d32[0]);
+                const bad = !d64[2].within(d64[0]) and !d32[2].within(d32[0]);
+                cells += 1;
+                farther += @intFromBool(!near);
+                caught += @intFromBool(bad);
+                std.debug.print("[attn-dec f64] ctx {d} layer {d} K={d} R={d} splits {d}/{d}: f64 merge dec_attn l2 {e:.4} max {e:.4}, tile l2 {e:.4} max {e:.4}, plant l2 {e:.4} max {e:.4}; f32 merge dec_attn l2 {e:.4} max {e:.4}, tile l2 {e:.4} max {e:.4}{s}\n", .{ c.ctx, li, k, R, ps[0].splits, ps[1].splits, d64[0].l2(), d64[0].max, d64[1].l2(), d64[1].max, d64[2].l2(), d64[2].max, d32[0].l2(), d32[0].max, d32[1].l2(), d32[1].max, if (near) "" else "  FARTHER" });
+            }
+        }
+    }
+    for ([_][]const u8{ "128 + 512 picks", "window alone" }, agg) |list, a| for ([_][]const u8{ "f64 merge", "f32 merge" }, a) |mg, x|
+        std.debug.print("[attn-dec f64] all cells, {s}, {s}: dec_attn l2 {e:.4} max {e:.4}; tile l2 {e:.4} max {e:.4}; plant l2 {e:.4} max {e:.4}{s}\n", .{ list, mg, x[0].l2(), x[0].max, x[1].l2(), x[1].max, x[2].l2(), x[2].max, if (x[1].within(x[0])) "" else "  FARTHER" });
+    std.debug.print("[attn-dec f64] {d} cells: tile farther in {d}; the plant farther in {d}\n", .{ cells, farther, caught });
+    try testing.expectEqual(@as(usize, 0), farther);
+    try testing.expectEqual(cells, caught);
 }

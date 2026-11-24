@@ -217,7 +217,12 @@ const testing = std.testing;
 
 /// A hash with the release's geometry (2 tables, 3-grams, 8 heads) on random odd multipliers and buckets from `base`.
 fn testHash(rng: std.Random, base: u64) engram.Hash {
-    var h: engram.Hash = .{ .n_layers = 2, .max_ngram = 3, .heads = 8, .pad = 2 };
+    return testHashOf(rng, base, 3);
+}
+
+/// `testHash` over 2- to `ngram`-grams.
+fn testHashOf(rng: std.Random, base: u64, ngram: u32) engram.Hash {
+    var h: engram.Hash = .{ .n_layers = 2, .max_ngram = ngram, .heads = 8, .pad = 2 };
     var p: u64 = base + rng.uintLessThan(u64, base);
     for (0..h.n_layers) |l| {
         for (0..h.max_ngram) |k| h.mult[l][k] = rng.uintLessThan(u64, 1 << 47) * 2 + 1;
@@ -534,4 +539,133 @@ test "dsv41 engram gpu ids (resident): a verify's Engram write from the kv made 
         };
     }
     try testing.expectEqual(@as(usize, 2 * (B - 1) * 2), served);
+}
+
+test "dsv41 engram gpu ids (MLX_SERVE_DSV41_ENGRAM_GPU_IDS): the served fused wkv over the GPU-hashed ids' rows of the held table is no farther from float64 than MLX's chain over the host ids' rows (dequantized, cast to bf16, the mxfp8 wkv), l2 and max, at the release's Engram row (24 rows of 256 into (hc + 1) x hidden), both tables, mxfp4 and mxfp8 rows; one slot's row one off is farther" {
+    if (!gpuOk()) return error.SkipZigTest;
+    const fixture = @import("fixture.zig");
+    const gpa = testing.allocator;
+    const none: A = .{ .ctx = null };
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 0, .hi = 1, .ctx = 8, .fused = true });
+    defer fx.deinit();
+    const m = fx.m;
+    const s = mlx.gpuStream();
+    const d = m.cfg.hidden_size;
+    const hc = m.cfg.dsv4_hc_mult;
+    var prng = std.Random.DefaultPrng.init(0xE1F6);
+    const rng = prng.random();
+    const hs = testHashOf(rng, 300, 4);
+    const nc = hs.cols();
+    const hd: usize = 256;
+    const K = nc * hd;
+    const N = (hc + 1) * d;
+    const ew = try fx.normal(&.{ @intCast(N), @intCast(K) }, .bfloat16, 0, 0.02);
+    defer _ = mlx.mlx_array_free(ew);
+    const eq = try fixture.quantize(ew, 32, 8, "mxfp8");
+    defer for (eq) |q| if (q.ctx != null) {
+        _ = mlx.mlx_array_free(q);
+    };
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    try mlx.check(mlx.mlx_dequantize(&deq, eq[0], eq[1], none, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", none, .{ .value = .float32, .has_value = true }, s));
+    const wd = try dsv41.hostF32(deq);
+    defer gpa.free(wd);
+    const map = try gpa.alloc(u32, 512);
+    defer gpa.free(map);
+    for (map) |*v| v.* = rng.uintLessThan(u32, 1 << 17);
+    var ctx = try ctxOf(&hs, map);
+    defer ctx.deinit();
+    const n_rows: usize = @intCast(hs.offsets[1][nc - 1] + hs.primes[1][nc - 1]);
+    const truth = try gpa.alloc(f64, N);
+    defer gpa.free(truth);
+    var cells: usize = 0;
+    var farther: usize = 0;
+    var caught: usize = 0;
+    var agg: [4]decode.Dist = @splat(.{});
+    var awf: decode.WordDiff = .{};
+    for ([_]@import("../../../sdk/quant/params.zig").QuantMode{ .mxfp4, .mxfp8 }) |mode| {
+        const bits: u32 = if (mode == .mxfp4) 4 else 8;
+        const wlen = hd * bits / 8;
+        const slen = hd / 32;
+        var e: dsv41.EngramLayer = .{ .layer = 0, .wkv = .{ .w = eq[0], .s = eq[1], .b = eq[2], .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } }, .qk = none, .table = .{ .fd = -1, .rows = n_rows, .head_dim = @intCast(hd), .mode = mode, .bits = bits, .group_size = 32, .w_off = 0, .w_stride = wlen, .wlen = wlen, .s_off = 0, .s_stride = slen, .slen = slen } };
+        try fusion.heldTable(&e.table, n_rows, if (bits == 4) 4096 + 952 else 4096 + 48, rng);
+        defer for (e.table.held[0..2]) |mem| std.posix.munmap(mem);
+        try testing.expect(fusion.wrapHeld(&e));
+        defer {
+            _ = mlx.mlx_synchronize(s);
+            fusion.unwrap(&e);
+        }
+        const g = e.gpu.?;
+        const page = std.heap.pageSize();
+        const gw = (engram_kv.Geo{ .w_base = e.table.w_off % page, .w_stride = e.table.w_stride, .s_base = e.table.s_off % page, .s_stride = e.table.s_stride }).words();
+        const tab: engram_kv.Table = .{ .hd = hd, .tb = bits };
+        for (0..4) |case| for (0..2) |ek| {
+            var sc = Scope.init(gpa, s);
+            defer sc.deinit();
+            const ga = try sc.keep(mlx.mlx_array_new_data(&gw, &[_]c_int{6}, 1, .uint32));
+            const hist = try gpa.alloc(u32, 3 + case);
+            defer gpa.free(hist);
+            for (hist) |*v| v.* = rng.uintLessThan(u32, 1 << 17);
+            const tok = rng.uintLessThan(u32, 512);
+            var host: [engram.MAX_LAYERS * engram.MAX_COLS]u32 = undefined;
+            hs.rows(hist, &.{map[tok]}, host[0..ctx.n]);
+            const mine_host = host[ek * nc ..][0..nc];
+            const t = try sc.keep(mlx.mlx_array_new_data(&tok, &[_]c_int{1}, 1, .uint32));
+            const mine = try sc.slice(try rows(&sc, &hs, &ctx, hist, t, 0), 0, ek * nc, (ek + 1) * nc);
+            // [0] MLX's chain (=0), [1] the served fused wkv, [2] the plant, [3] the rows kernel (ENGRAM_KV_SLOTS=0).
+            var kv: [4]A = undefined;
+            kv[1] = (try engram_kv.launch(&sc, tab, 1, g[0], g[1], mine, ga, e.wkv.w, e.wkv.s)) orelse return error.Declined;
+            {
+                const off = env.override(.MLX_SERVE_DSV41_ENGRAM_KV_SLOTS, "0");
+                defer off.restore();
+                kv[3] = (try engram_kv.launch(&sc, tab, 1, g[0], g[1], mine, ga, e.wkv.w, e.wkv.s)) orelse return error.Declined;
+            }
+            var moved: [engram.MAX_COLS]u32 = undefined;
+            @memcpy(moved[0..nc], mine_host);
+            moved[nc - 1] = @intCast((moved[nc - 1] + 1) % n_rows);
+            const pa = try sc.keep(mlx.mlx_array_new_data(&moved, &[_]c_int{@intCast(nc)}, 1, .uint32));
+            kv[2] = (try engram_kv.launch(&sc, tab, 1, g[0], g[1], pa, ga, e.wkv.w, e.wkv.s)) orelse return error.Declined;
+            const raw: engram.Table.Raw = .{ .w = try gpa.alignedAlloc(u8, .@"4", nc * wlen), .s = try gpa.alignedAlloc(u8, .@"4", nc * slen), .b = try gpa.alignedAlloc(u8, .@"4", 0) };
+            defer raw.deinit(gpa);
+            for (mine_host, 0..) |id, j| {
+                @memcpy(raw.w[j * wlen ..][0..wlen], e.table.held[0][e.table.w_off + id * wlen ..][0..wlen]);
+                @memcpy(raw.s[j * slen ..][0..slen], e.table.held[1][e.table.s_off + id * slen ..][0..slen]);
+            }
+            const xr = try sc.keep(try e.table.dequantTo(raw, nc, fusion.engramRowsDtype(m, &e.table), s));
+            kv[0] = try dsv41.engramWkv(&sc, &e, try sc.astype(try sc.reshape(xr, &.{ 1, @intCast(K) }), m.act));
+            const x = try dsv41.hostF32(xr);
+            defer gpa.free(x);
+            for (truth, 0..) |*o, n| {
+                var acc: f64 = 0;
+                for (x, wd[n * K ..][0..K]) |a, b| acc += @as(f64, a) * @as(f64, b);
+                o.* = acc;
+            }
+            var dist: [4]decode.Dist = @splat(.{});
+            var hk: [4][]f32 = undefined;
+            for (kv, &dist, &hk) |a, *dd, *h| {
+                h.* = try dsv41.hostF32(a);
+                dd.add(h.*, truth);
+            }
+            defer for (hk) |h| gpa.free(h);
+            var wf: decode.WordDiff = .{};
+            wf.add(hk[1], hk[0], truth);
+            var wr: decode.WordDiff = .{};
+            wr.add(hk[3], hk[0], truth);
+            for (&agg, dist) |*a, dd| a.join(dd);
+            awf.differ += wf.differ;
+            awf.nearer += wf.nearer;
+            awf.farther += wf.farther;
+            awf.words += wf.words;
+            const near = dist[1].within(dist[0]);
+            const bad = !dist[2].within(dist[0]);
+            cells += 1;
+            farther += @intFromBool(!near);
+            caught += @intFromBool(bad);
+            std.debug.print("[engram-gpu-ids f64] {t} case {d} table {d}: MLX chain l2 {e:.6} max {e:.6}; fused (slots) l2 {e:.6} max {e:.6}, {d} of {d} words differ from the chain's ({d} nearer, {d} farther); rows kernel l2 {e:.6} max {e:.6} ({d} differ, {d} nearer, {d} farther); plant l2 {e:.4} max {e:.4}{s}\n", .{ mode, case, ek, dist[0].l2(), dist[0].max, dist[1].l2(), dist[1].max, wf.differ, wf.words, wf.nearer, wf.farther, dist[3].l2(), dist[3].max, wr.differ, wr.nearer, wr.farther, dist[2].l2(), dist[2].max, if (near) "" else "  FARTHER" });
+        };
+    }
+    std.debug.print("[engram-gpu-ids f64] all {d} cells: MLX chain l2 {e:.6} max {e:.6}; fused l2 {e:.6} max {e:.6}, {d} of {d} words differ ({d} nearer, {d} farther); rows kernel l2 {e:.6} max {e:.6}; squared error fused / chain - 1 = {e:.3}; the fused wkv {s} in all\n", .{ cells, agg[0].l2(), agg[0].max, agg[1].l2(), agg[1].max, awf.differ, awf.words, awf.nearer, awf.farther, agg[3].l2(), agg[3].max, agg[1].se / agg[0].se - 1, if (agg[1].within(agg[0])) "no farther" else "FARTHER" });
+    std.debug.print("[engram-gpu-ids f64] {d} cells: the fused wkv farther in {d}; the plant farther in {d}\n", .{ cells, farther, caught });
+    try testing.expectEqual(@as(usize, 0), farther);
+    try testing.expectEqual(cells, caught);
 }
