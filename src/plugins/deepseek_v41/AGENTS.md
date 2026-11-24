@@ -35,8 +35,9 @@ DSpark, lossless classes): `README.md`.
   reserve from `patches/mlx-metal-wide-reserve.patch`),
   Engram's direct read (`engram_direct`), the embedding pread and a plugin bank's own pieces (`wide_early`, `woa_rows`),
   `flash_attn` (the flash kernel, not exact, on by default for every pack), an fp4 bank's gate and up with `moe_act`
-  in one paired launch (`moe_pair`); `wide_test.zig` holds each default-on rewrite to its `=0` path: word for word,
-  or no farther from float64 (`MOE_PAIR_SCALED` and `PF_HC_V2` to reorder bounds), with a planted bug each.
+  in one paired launch (`moe_pair`); `wide_test.zig` holds the default-on prompt rewrites to their `=0` paths, most
+  word for word or no farther from float64 (`MOE_PAIR_SCALED` and `PF_HC_V2` to reorder bounds), some only to a
+  tolerance (`HC_EXPAND_NORM`, the opt-in `MOE_PAIR`, the pair-worker cases), with a planted bug each.
 - `fuse.zig`: launch fusions, each behind its own switch (`Dsv41Model.fuse`; `FUSE_DOWN_SCALE` and `FUSE_MXFP8_QMM` on
   by default), served only on the resident weight path
   (`MLX_SERVE_DSV41_WEIGHT_PATH`, `settle`); `ssd` keeps today's kernels.
@@ -139,8 +140,8 @@ DSpark, lossless classes): `README.md`.
 - A prompt chunk of 4096 rows or more that nothing read ahead runs as its first half, then the rest (`extendCold`,
   `leadRows`; the lead is `Want.encode`: no decoder replay, which the rest makes): the drive reads the rest's Engram
   rows behind the lead. The log's `waited ... ms` is the meter.
-- Every default-on switch is EXACT, REORDER, DRAFT-ONLY or TF32 (`README.md` "Lossless classes"); `HEAD8` is the one
-  requantization. A new default-on switch owes a standing word or float64 test against its `=0` path, a plant failing.
+- Every default-on switch is EXACT, REORDER, DRAFT-ONLY or TF32 (`README.md` "Lossless classes") except two: `HEAD8`,
+  the one requantization, and `ATTN_F16`, not classed (`README.md` "Gaps"). A new default-on switch owes a standing word or float64 test against its `=0` path, a plant failing.
 - Construct each MPP cooperative tensor from its owning op; copying one invokes incompatible Metal layout
   interfaces on some SDKs. Fill each operand's independent storage before running the matmul.
 

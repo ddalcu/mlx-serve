@@ -11,8 +11,8 @@ notes for this folder are in [AGENTS.md](AGENTS.md).
 This plugin serves NVIDIA's `DeepSeek-V4.1-Flash-1017-NVFP4` checkpoint on Apple GPUs. A converter script rewrites
 only the checkpoint's file headers, so the weights keep NVIDIA's bytes. The routed experts stay in NVFP4. The
 default configuration is lossless against the pack as shipped, with one stated exception: the plugin requantizes
-the LM head to 8 bits, and that head measured the same KLD as the bf16 head. Every other default-on switch is in one
-of four classes: EXACT, REORDER, DRAFT-ONLY or TF32. We tuned the defaults on an M5 Ultra with 512 GB. Other Macs get
+the LM head to 8 bits, and that head measured the same KLD as the bf16 head. Every other default-on switch except
+`ATTN_F16` (see "Gaps") is in one of four classes: EXACT, REORDER, DRAFT-ONLY or TF32. We tuned the defaults on an M5 Ultra with 512 GB. Other Macs get
 the same defaults, and a Mac that cannot hold the pack refuses the load. On that machine the full 1,048,576-token
 context fits. DeepSeek's own drafter (DSpark) speeds up decode. HumanEval, the long-context sweep and the final
 numbers on the release head are not done yet.
@@ -49,14 +49,19 @@ The plugin reads either form from the pack, with no flag.
 
 **The LM head (`MLX_SERVE_DSV41_HEAD8`, on).** The pack ships the LM head in bf16. At load the plugin requantizes it
 to 8-bit affine at group 64. The trunk and the drafter share this head. This is the one quantization change in the
-release defaults. We measured it against reference distributions from DeepSeek's hosted model, on 50 prompts and
-1,600 positions. The 8-bit head's mean KLD was 0.1020 and the bf16 head's was 0.1021. The paired difference was
+release defaults. The reference is the top-20 log-probabilities that DeepSeek's API returned on 2026-09-10 for
+`deepseek-flash` (the ds4 repo's `deepseek-v4.1-flash-20260910-general` set; its README names weights revision
+`df42c109`). That reference can differ from the 1017 checkpoint, so the absolute KLD includes any difference between
+the two models, and the paired difference measures the head. On 50 prompts and 1,600 positions, the 8-bit head's
+mean KLD was 0.1020 and the bf16 head's was 0.1021. The paired difference was
 +0.00007 ± 0.00025 (one standard error), and top-1 agreement was 92.6% for both. The bf16 head (`=0`) cost 4.95% of
 spec-on decode speed and used 0.63 GB more memory.
 
 <!-- src: src/plugins/deepseek_v41/deepseek_v41.zig:2583-2584 (quantizeLin(m, w, m.head, 8, 64)), :883-890;
-     /tmp/ds41sweep/lanes.txt 2026-11-23T20:32:26Z (KLD diag: ds4 20260910-general cases 0-49, 1600 positions)
-     and 2026-11-23T20:27:24Z (sp-head16: 94.33 -> 89.67 tok/s, peak +0.63 GB) -->
+     m1:~/glmx/abba/ds41-diag-kld-head16/a.summary.txt, b.summary.txt (build 2b0bba65, 1600 positions, paired
+     +0.00007 +/- 0.00025); m1:~/github/ds4 git show HEAD:gguf-tools/quality-testing/
+     deepseek-v4.1-flash-20260910-general/README.md (API 2026-09-10, top-20 logprobs, revision df42c109);
+     m1:~/glmx/abba/ds41-ab-sp-head16/summary.txt:22-25 (94.33 -> 89.67 tok/s, -4.95%, peak +0.63 GB) -->
 
 **The MLX patch.** `MLX_SERVE_DSV41_PF_KEEP_WIDE` needs `patches/mlx-metal-wide-reserve.patch`. The patch adds a
 reserve of large Metal buffers to MLX's allocator, so a prompt pass does not map fresh pages in every request. Without
@@ -71,26 +76,30 @@ Do these steps in this order.
 1. Convert the checkpoint with the converter above.
 2. Put `draft-vocab.txt` in the pack directory (see "Speculative decoding"). Without it, the drafts score the whole
    vocabulary and decode is slower.
-3. Raise Metal's wired-memory limit. We used 512000 MB (500 GiB) for every measured run:
-   `sudo sysctl iogpu.wired_limit_mb=512000`. macOS does not keep this value after a restart.
+3. Raise Metal's wired-memory limit to 512000 MB (500 GiB): `sudo sysctl iogpu.wired_limit_mb=512000`. Every run
+   on this release's stack used it, the A/Bs and the final cells. The value does not survive a restart: `sysctl`
+   sets it for the running system only, so set it again after each restart.
 4. Start the server with `--warmup-full`, for example
    `mlx-serve --model <pack> --serve --warmup-full`.
 
-<!-- src: /tmp/ds41sweep/lanes.txt 2026-11-24T03:02:45Z ("Wired: every final job 512000");
-     memory note mac512-nvfp4-lanes.md (with_wired.sh forces 512000 MB; resets to 0 on reboot);
+<!-- src: box-*.txt in every ~/glmx/abba/ds41-ab-* and ds41-final-* result directory on m1 and m2
+     (iogpu.wired_limit_mb: 512000; the last push's nvpf-dsproof-ab used 440320); neither box has /etc/sysctl.conf
+     or a launch daemon that sets it;
      docs/cli.md:115 (--warmup-full); docs/cli.md:31 (--model --serve) -->
 
-**Why the wired limit.** Metal's working-set limit can refuse a load that RAM holds. The plugin then names
+**Why the wired limit.** Metal's working-set limit can refuse a load that RAM holds. The engine then names
 `iogpu.wired_limit_mb` in the error and logs the `sudo sysctl iogpu.wired_limit_mb=<N>` that admits the load. N is
-the load's bill plus an 8 GiB margin. An earlier build loaded at macOS's default limit and peaked at 438.6 GB. The
-release head peaks at about 452 GB on our standard test, and we have not tried it at the default limit.
+the load's need (the weights plus warm-up headroom) plus an 8 GiB margin. The last push's build loaded at macOS's
+default limit and peaked at 438.6 GB (from that push's PR body). Control `04b8f7d0` peaks at about 452.3 GB on our
+standard test, and we have not tried this release at the default limit.
 
 <!-- src: src/engines/mlx/load.zig:149-153; src/engines/mlx/runtime/preflight.zig:326 (wiredLimitAdviceMb);
      /tmp/ds41sweep/pr/1256-body.md "Basic config on a 512 GB M5 Ultra" and "Not measured, and open" -->
 
 **Why `--warmup-full`.** Metal compiles a kernel at its first use. With `--warmup-full`, the server serves itself a
 ladder of prompt sizes before it reports ready, so no user request pays a first compile. This takes from seconds to
-a minute, on a build's first load of the model only. All our measurements use it.
+a minute, on a build's first load of the model only. The final cells and the last A/Bs used it; the earlier A/Bs
+relied on unmeasured pre-warm requests instead.
 
 <!-- src: docs/cli.md:115; src/engines/mlx/load.zig:968-971; /tmp/ds41sweep/lanes.txt 2026-11-23T20:12:23Z -->
 
@@ -102,28 +111,34 @@ The plugin bills memory in four parts. The engine admits a load or a request onl
 |---|---|---|
 | Resident load | `residentBytes` (`plugin.zig`) calls `residentDiskBytes` (`deepseek_v41.zig`) | The pack's shards less the tensors it drops, plus the Engram tables it holds, the Engram LRU (256 MiB), the Engram partials' cache (4 GB) and the draft-only head |
 | Compressed KV per token | `kvPerToken` (`bill.zig`) | 3,200 bytes a token, so 3.36 GB at 1,048,576 tokens |
-| Window rings | the `state` term of `prefillBytes` (`deepseek_v41.zig`) | 40 layers x (128 + 16) rows x 512 x 2 bytes, about 5.9 MB |
-| Prompt pass | `prefillBytes` (`deepseek_v41.zig`), plus the `PF_KEEP_WIDE` reserve | Grows with the pass width. `PF_PASS_SIZE` picks the widest pass that fits the memory share |
+| Window rings | the rings part of `prefillBytes`'s `state` term (`deepseek_v41.zig`) | 40 layers x (128 + 16) rows x 512 x 2 bytes, about 5.9 MB |
+| Prompt pass | `prefillBytes` (`deepseek_v41.zig`), plus the `PF_KEEP_WIDE` reserve | Grows with the pass width. `PF_PASS_SIZE` picks the widest pass that fits the memory share; a set `--prefill-chunk` narrows it |
 
 The KV term is small because only four layers (2, 8, 14 and 20) are KV sources. Each stores a 512-wide latent and a
-128-wide index key per token, compressed 2:1 in three layers and 1:1 in one.
+128-wide index key per token in bf16, compressed 2:1 in three layers and 1:1 in layer 20.
 
-On an earlier build, the admission check at a 1,048,576-token context needed 38,246 MB and had 78,476 MB available,
-with a 20.03 GB reserve armed. The Engram partials' cache (3,795 MiB) fits in the 40,230 MB margin, which leaves about
-36 GB. On control `04b8f7d0`, a load at a 1,064,960-token context was admitted, with a 17,769 MB reserve at
-44,544-row passes. A real 1M-token prompt has not run on the release head yet (see "Gaps").
+On build `c59b60c6` (spec off), a 1,038,931-token request at a 1,048,576-token context was admitted: the admission
+check needed 38,246 MB and had 78,476 MB available, with a 20.03 GB reserve armed. That build had no Engram partials'
+cache. The cache bills 4 GB and allocates 3,787 MiB on this pack, so by arithmetic it leaves about 36 GB of the
+40,230 MB margin. On control `04b8f7d0`, a load at a 1,064,960-token context succeeded, with a 17,769 MB reserve at
+44,544-row passes, and admitted a 4-token request. A real 1M-token prompt has not run on the release head yet (see
+"Gaps").
 
 <!-- src: src/plugins/deepseek_v41/plugin.zig:937-946 (residentBytes); deepseek_v41.zig:2873-2899
      (residentDiskBytes), :2821-2845 (prefillBytes); bill.zig kvPerToken; decode/engram_kvc.zig:33 (cap 4 GB);
-     env.zig:346 (LRU 256); config values from src/fixtures/model-configs/deepseek_v41-iq-mlx-3.0bpw.json
-     (kv_source_layer_ids [2,8,14,20], compress_ratios, head_dim 512, index_head_dim 128, sliding_window 128,
-     40 layers). 3,200 = 2 x (256+256+256+512 + 64+64+64+128).
-     /tmp/ds41sweep/lanes.txt 2026-11-23T02:05:57Z and 02:06:24Z (1M admission); 2026-11-24T06:29:24Z (admit 04b8f7d0) -->
+     env.zig:346 (LRU 256); config values from the NVFP4 pack's config.json on m1
+     (~/nvpf/packs/DeepSeek-V4.1-Flash-1017-NVFP4-mlx-nvfp4: kv_source_layer_ids [2,8,14,20], compress_ratios 2 at
+     2-19 and 1 at 20-39, head_dim 512, index_head_dim 128, sliding_window 128, 40 layers).
+     3,200 = 2 x (256+256+256+512 + 64+64+64+128).
+     m2:~/lev/pfkeep/mem1.out (c59b60c6 1M admission: needed 38246, available 78476, reserve 20.03 GB, 1038931 tokens);
+     m1:~/glmx/abba/ds41-admit-1064960/run/serve.log:78 (KV cache 3787 MB), :171 (reserve 17769 MB at 44544 rows),
+     :202 (admission of the 4-token request) -->
 
 ## The default configuration
 
-The defaults are the release configuration. Each one is an A/B winner on an M5 Ultra with 512 GB, measured on our
-standard test: three coding prompts of about 17,600 tokens and 1,024 greedy completion tokens. Every switch is an
+The defaults are the release configuration. Each speed change in this release won its A/B on an M5 Ultra with
+512 GB, except three washes kept because they remove work (the PR body has the A/Bs). The standard test is three
+coding prompts of about 17,600 tokens and 1,024 greedy completion tokens. Every switch is an
 environment variable `MLX_SERVE_DSV41_<NAME>`, registered with its default and one line of doc in `src/env.zig`.
 A default-on switch turns off with `=0`. You do not need to set any switch to get the release configuration.
 
@@ -134,7 +149,7 @@ Other Macs get the same defaults. Some parts scale or turn off by themselves:
 - The prompt pass width scales with memory (`PF_PASS_SIZE`).
 - Where the Engram tables do not fit in memory, the plugin reads them from disk per lookup. The switches that need
   every table held then decline, and the kernel family falls back to the `ssd` path (`WEIGHT_PATH`).
-- On GPUs without neural accelerators (M4 and older), the matrix-unit kernels stay off.
+- On GPUs without neural accelerators (M4 and older, or an M5 on macOS before 26.2), the matrix-unit kernels stay off.
 
 We did not tune or measure any machine other than the M5 Ultra with 512 GB.
 
@@ -189,7 +204,7 @@ is in one class. The HEAD8 head above is the one stated exception.
 | TF32 | MLX's TF32 matmul switch (`MLX_ENABLE_TF32`, on). Exact on the verified path; only the drafter's P·V rounds | 1 (engine) |
 
 <!-- src: /tmp/ds41sweep/release/audit.md (definition, class key, 1a); git show ae57f5b4 (REORDER ruling text);
-     counts: env.zig:339-398 has 51 default-on flags = 30 EXACT + 14 REORDER + 5 DRAFT-ONLY + HEAD8 + ATTN_F16 -->
+     counts: env.zig:339-397 has 51 default-on switches (FLASH_ATTN a text switch) = 30 EXACT + 14 REORDER + 5 DRAFT-ONLY + HEAD8 + ATTN_F16 -->
 
 The tests that hold these classes are in the plugin. Each test runs a planted fault as a control, and the control
 must fail.
@@ -211,21 +226,28 @@ must fail.
 - `MOE_PAIR_SCALED` (REORDER, bounded): about 0.2% of the activation words differ from the split path. Each one is
   within one bf16 step of its row's largest value. Where the split path gives exactly zero, the paired kernel keeps a
   tiny value, about 1e-35. The whole-sample l2 error against float64 measured equal to the split path's. The test
-  holds it to under 1% of words differing and an l2 within 1.05 times the split path's.
-- `PF_HC_V2` (REORDER, bounded): an f32 reorder of the five-pass hyper-connections. Its f32 mixes and split are 3 to 6
+  holds it to under 1% of words differing, an l2 within 1.05 times the split path's over the sample, and within 4 times
+  over the differing words. The release head's full suite failed that last bound once (see "Gaps").
+- `PF_HC_V2` (REORDER, bounded): an f32 reorder of the five-pass hyper-connections. Its f32 mixes and split are 2 to 6
   times farther from float64 than the five passes', at the 1e-7 level. That is below the bf16 rounding that follows,
   and the tail's output words are the five passes' words. The test holds the mixes and split within 1e-5 of float64
   and every other output within 1.01 times the five passes' l2.
 - `ATTN_DEC` and `WOA_PLAIN` (REORDER): nearer to float64 than their `=0` paths in total l2 and worst element.
 - `ENGRAM_GPU_IDS` (REORDER): 30 of 409,600 bf16 words differ from MLX's chain (25 nearer, 4 farther). The worst
-  element is equal, and the total squared error is 4.5e-9 larger.
-- TF32: the router, the compressor projection and the DSpark q·k read 0 operand elements that TF32 rounds. The only
-  TF32 loss is the drafter's P·V, at a relative l2 of 2.9e-4, and it changes only the drafts.
+  element is equal, and the total squared error is larger by a factor of 1 + 4.5e-9.
+- TF32: the router, the compressor projection and the DSpark q·k read 0 operand elements that TF32 rounds. The hc
+  collapse has operands that TF32 would round, but MLX serves it on its gemv kernel (one row a product), which does
+  not use TF32, so its error is the same with TF32 on and off. The only TF32 loss is the drafter's P·V, at a relative
+  l2 of 2.8e-4 to 2.9e-4, and it changes only the drafts.
 
 <!-- src: git show abf5a292 (MOE_TAIL 0 words; FLASH_ATTN 6.4e-5 vs 1.8e-4; PF_HC_V2 3-6x, z l2 8.8e-7 vs 1.5e-7);
      git show d62ac3e4 (MOE_PAIR_SCALED 0.196-0.214%, <= 1.000 bf16 step, l2 1.0000x; PF_HC_V2 bounds, tail x2 same
-     words); git show ae57f5b4 (ATTN_DEC, WOA_PLAIN, ENGRAM_GPU_IDS numbers); ~1e-35 and TF32 2.9e-4 from the brief
-     (box log tf32-8.log not read) -->
+     words); git show ae57f5b4 (ATTN_DEC, WOA_PLAIN, ENGRAM_GPU_IDS numbers). Checked against the release head's
+     m2:~/lev/pr1256/bdw-10.log (moe-tail-words, fa-gather, hcv2-f64 2.0-5.9x, attn-dec f64 72 cells, woa-plain f64
+     24 cells, engram-gpu-ids f64 :885) and m2:~/lev/rhbwide/t6.log, t8.log, t11.log (MOE_PAIR_SCALED largest word
+     step 1343-1347 from a zero word: bf16 word 1347 = 9.2e-36); m2:~/lev/pr1256/full10.log:3083 (the 4x bound failed
+     at 17 rows); TF32: m2:~/lev/tf32/m-on.log and m-off.log lines 26-40 (router, lin_f32, dspark_qk 0 rounded;
+     hc_collapse gemv, same error on and off; dspark_pv 2.84e-4 to 2.91e-4) -->
 
 `FP8_FOLD` and `FP4_READS` read three rare scale codes differently from MLX. At load, the plugin scans each layer for
 those codes and declines both switches by name where it finds one. The shipped NVFP4 pack holds none of them.
@@ -307,17 +329,19 @@ Engine variables on the DeepSeek path: `MLX_SERVE_DSV4_DSPARK` (REORDER: the ver
 Each one is off by default. Names omit `MLX_SERVE_DSV41_` except where shown.
 
 - `EXACT_VERIFY=1` (EXACT): greedy DSpark text equals plain decode's bytes on M5.
-- `EXACT=1|solo` (EXACT): the same on M3-generation or later Apple GPUs without neural accelerators; on M5 the load
-  leaves it off and logs why.
+- `EXACT=1|solo` (EXACT; any value other than unset, empty or `0` turns it on): the same on M3-generation or later
+  Apple GPUs without neural accelerators; on a GPU with them the load leaves it off and logs why.
 - `FLASH_PSUM=1` (REORDER): a flash-attention variant that is nearer to float64; it measured no faster.
 - `MXFP4_VIEW=1` (REORDER): loads an NVFP4 bank whose every 32-value span is one power of two as MXFP4.
 - `MOE_PAIR=1` (REORDER): the paired prompt gate/up for MXFP4 banks without per-expert scales.
 - `MLX_SERVE_DSPARK_PIN_ROWS=N` (test only): every DSpark round, greedy or sampled, verifies N rows, for width
   sweeps.
 
-Three value switches tune memory and do not change results: `ENGRAM_LRU_MB` (256), `ENGRAM_RESIDENT` (`auto`) and
-`WEIGHT_PATH` (`auto`). The dead-code pass removed nine switches that lost their A/Bs (`rel-deadcode` `41be1c30`,
-merged in `b7b267fd`).
+Three value switches set memory and kernel choices: `ENGRAM_LRU_MB` (256) tunes memory only. `ENGRAM_RESIDENT`
+(`auto`) and `WEIGHT_PATH` (`auto`) can drop the resident fusions: the `ssd` path turns off `FUSE_MXFP8_QMM` (a
+REORDER switch), and tables not held turn off `ENGRAM_GPU_IDS` and the Engram KV cache. `DRAFT_VOCAB` (above) is a
+value switch too. The dead-code pass removed nine switches that lost their A/Bs or never ran one
+(`rel-deadcode` `41be1c30`, merged in `b7b267fd`).
 
 <!-- src: src/env.zig:338, :346-348, :350, :372, :376, :379, :398; deepseek_v41.zig:2601-2613 (EXACT left off on NAX);
      audit.md section 2 (FLASH_PSUM -0.07%, KEEP-OPTIN list); git log 049b7d2a..230412b7 (9 removals), b7b267fd -->
@@ -330,14 +354,15 @@ test gave these decode speeds:
 | Cell | Decode tok/s |
 |---|---|
 | Greedy, DSpark on | 97.43 |
-| The model card's sampling settings, DSpark on | 88.07 |
+| The model card's sampling settings, DSpark on | 88.06 |
 | Greedy, DSpark off | 61.48 |
 | Prompt p10, greedy, DSpark on | 106.45 |
 
-Prefill was about 5,549 tok/s. The final numbers on the release head are not done yet.
+Prefill was 5,548.7 tok/s in the greedy DSpark-on cell and 5,530 to 5,535 tok/s in the other three. The final
+numbers on the release head are not done yet.
 
-<!-- src: the brief (final control numbers on 04b8f7d0); result files ~/glmx/abba/ds41-final-<cell>/ on the boxes,
-     not read (lanes.txt 2026-11-24T02:19:41Z, 03:02:45Z) -->
+<!-- src: m1:~/glmx/abba/ds41-final-std-greedy/summary.txt:19, ds41-final-p10-greedy/summary.txt:15;
+     m2:~/glmx/abba/ds41-final-std-card/summary.txt:19, ds41-final-std-specoff/summary.txt:19 -->
 
 ## Gaps
 
@@ -347,6 +372,9 @@ Prefill was about 5,549 tok/s. The final numbers on the release head are not don
 - On Macs without neural accelerators, `ATTN_F16` (on) serves an f16 attention core that has no float64 test. A
   release for those Macs needs that test, or `ATTN_F16` off.
 - `HEAD8` is a quantization change. Its KLD equals the bf16 head's on our set, but it is not bit-identical.
+- At the release head, the full test suite failed the `MOE_PAIR_SCALED` bounds test once: at 17 rows, over the words
+  that differ, its float64 l2 was 7.5 times the split path's, against a bound of 4. The release needs a ruling on
+  that test before it ships.
 
 <!-- src: deepseek_v41.zig:3876-3887 (f16 core only where the gather does not serve; the gather serves on NAX);
      audit.md table C (ATTN_F16, HEAD8) -->
