@@ -13,7 +13,7 @@ This plugin serves NVIDIA's `DeepSeek-V4.1-Flash-1017-NVFP4` checkpoint on Apple
 weight codes keep NVIDIA's bytes, and the routed experts stay in NVFP4. DeepSeek's own drafter, DSpark, proposes
 tokens that the model checks in one step, which makes decode faster. The defaults are the release configuration.
 
-On an M5 Ultra, the release build decoded 98.80 tok/s greedy and prefilled 5,551 tok/s on the standard
+On an M5 Ultra, the release build decoded 98.80 tok/s greedy with DSpark on and prefilled 5,551 tok/s on the standard
 test's p01 prompt. The first NVFP4 build gave 71.77 and 3,994 tok/s (see "Results"). Both runs used the NVFP4 pack, so
 the pack gives none of the gain; the runs also differ in setup.
 
@@ -45,7 +45,8 @@ build scored 161/164 on HumanEval and 366/378 on MBPP (base tests).
 8. Send a first request:
    `curl -s 127.0.0.1:11234/v1/chat/completions -H 'Content-Type: application/json' -d '{"model": "<id>", "messages": [{"role": "user", "content": "Hello"}]}'`.
 
-The loaded model needs about 429 GB, and a 17,600-token request peaks at about 452 GB, so a Mac needs 512 GiB to hold
+The loaded model needs about 429 GB, and a 17,600-token request peaks at about 452 GB (at `--ctx-size 32768`; at the
+default 1M context the prompt reserve is 4.9 GB larger, and we have not measured it), so a Mac needs 512 GiB to hold
 the NVFP4 pack. `sysctl` sets the wired limit for the running system only, so set it again after each restart.
 `--warmup-full` compiles the Metal kernels before the server reports ready.
 
@@ -116,8 +117,8 @@ routing weight.
 ## Speculative decoding (DSpark)
 
 The pack ships DeepSeek's DSpark stages, a small drafter that proposes a block of tokens. The model then checks the
-block in one wide step, the verify, which accepts or replaces every proposed token. The plugin loads the stages
-whenever the pack ships them. `--no-mtp` keeps them off and frees their memory, unless `MLX_SERVE_DSV4_DSPARK` is set
+block in one wide step, the verify, which accepts or replaces every proposed token.
+`--no-mtp` keeps them off and frees their memory, unless `MLX_SERVE_DSV4_DSPARK` is set
 to a value that does not start with 0; then the stages load, and drafting stays off. `MLX_SERVE_DSV4_DSPARK=0` turns drafting off, but the stages stay loaded. A policy picks how many rows each verify checks
 (`MLX_SERVE_DSPARK_POLICY2`).
 
@@ -129,9 +130,6 @@ opt-in").
 
 Sampled requests use standard speculative sampling (`MLX_SERVE_DSV41_DRAFT_SAMPLE`), so the output keeps the model's
 distribution (the block below has the rule).
-
-The draft vocabulary (`MLX_SERVE_DSV41_DRAFT_VOCAB`, the `draft-vocab.txt` file of step 4) narrows the greedy drafts
-and gave +1.46% decode.
 
 <details>
 <summary>Sampled drafts and the draft vocabulary</summary>
@@ -160,8 +158,8 @@ from another corpus. Delete the file, or set `MLX_SERVE_DSV41_DRAFT_VOCAB=0`, to
 The plugin's switches are environment variables `MLX_SERVE_DSV41_<NAME>`, registered in `src/env.zig`; a default-on
 switch turns off with `=0`. The block below has the other prefixes.
 
-Other Macs get the same defaults, and some parts scale or turn off by themselves (the block below lists them). A Mac
-that cannot hold the NVFP4 pack needs the `--experts-mxfp4` pack, whose experts can stream from disk.
+Other Macs get the same defaults except `ATTN_F16`, the lossy f16 attention core, which is on by default without NAX.
+Some parts scale or turn off by themselves (listed below).
 
 <details>
 <summary>Switch prefixes, and what changes on other Macs</summary>
@@ -186,24 +184,25 @@ The engine admits a load or a request only when the plugin's memory bill fits (i
 costs only 3,200 bytes per token (3.36 GB at 1,048,576 tokens); the block below has the bill's four parts.
 
 A 1,032,192-token prompt (the 1M window less a 16,384-token output budget) ran to the end at a 480.5 GB peak, with
-the wired limit at 512000 MiB (536.9 GB), and admission billed the whole output budget. At macOS's default limit it
-probably does not fit: the 480.5 GB server peak is above the 480 GB available there (the block below).
+the wired limit at 512000 MiB (536.9 GB), and admission billed the whole output budget. At macOS's default limit it is
+untested: the memory share is smaller there, so the load picks narrower passes (the block below).
 
-On p01 the release peaks 31.3 GB higher than the first NVFP4 build on the MXFP4 pack (420.7 to 452.0 GB). The NVFP4
-pack adds 17.9 GB, because its 16-value groups carry more scale bytes. The code adds 13.4 GB (438.6 GB at the last
-reviewed head; the first NVFP4 build also peaked at 438.6 GB on NVFP4). Six changes moved the peak by more than
+The release's p01 peak is 452.0 GB: 13.4 GB above the first NVFP4 build on the same NVFP4 pack (438.6 GB), and
+31.3 GB above it on the MXFP4-experts pack (420.7 GB). The NVFP4 pack adds 17.9 GB, because its 16-value groups carry
+more scale bytes. The last reviewed head peaked at 438.6 GB too. Six changes moved the peak by more than
 0.5 GB: `PF_KEEP_WIDE` +7.3 GB, the Engram partials cache (`ENGRAM_KV_CACHE`) +4.0, `PF_PASS_SIZE` +3.9,
 `MOE_PAIR_SCALED` -1.4, `PF_COMP_BF16` -0.7 and `FLASH_ATTN` -0.7. The other +1.0 GB is drift between A/B bases. The
 three that add memory trade it for speed (`PF_PASS_SIZE` +7.96% prefill, `PF_KEEP_WIDE` +2.19% prefill, the Engram
-partials cache +0.28% decode). We kept them because
+slot kernel and partials cache, one A/B, +0.28% decode). We kept them because
 the 1M prompt still fits.
 
 <details>
 <summary>The four parts of the memory bill, the 1M fit and its admission</summary>
 
 At 1M the whole machine's non-file memory peaked at 489.7 GB (502.0 GB at most over the sweep), against the 536.9 GB
-wired limit, with 0 pageouts. At macOS's default limit (480 GB available on this Mac) the 1M point probably does not
-fit; we have not tried it. The weights bill is 404.33 GB for the NVFP4 pack against 384.16 GB for the MXFP4-experts
+wired limit, with 0 pageouts. At macOS's default limit the 1M point is untested: the memory share is smaller, so
+`PF_PASS_SIZE` picks narrower passes than the 44,544 rows it picked at 512000 MiB. At 1M, admission had a 37 GB
+margin (36,087 MB needed, 73,320 MB available) at 512000 MiB. The weights bill is 404.33 GB for the NVFP4 pack against 384.16 GB for the MXFP4-experts
 pack (+20.2 GB).
 
 | Part | Where the code computes it | Size for this model |
@@ -218,7 +217,7 @@ source layer at or before it. Each source stores a 512-wide latent and a 128-wid
 compressed 2:1 in the first three and 1:1 in layer 20.
 
 On the release build, the 1,032,192-token prompt passed the admission check with 36,087 MB needed and about
-73,320 MB available, with an 18.6 GB `PF_KEEP_WIDE` reserve at 44,544-row passes. The Engram partials cache (`ENGRAM_KV_CACHE`) allocates
+73,320 MB available, with an 18.6 GB `PF_KEEP_WIDE` reserve at 44,544-row passes (the widest pass that fits at 512000 MiB). The Engram partials cache (`ENGRAM_KV_CACHE`) allocates
 3,787 MiB (3.97 GB) of its 4.0 GB cap on this pack. The reserve replaces allocations that the pass made anyway, so the
 peak rises by 7.3 GB, not by the reserve's size.
 
@@ -231,16 +230,17 @@ declines the switch by name and logs why.
 ## Accuracy: what "lossless" means here
 
 50 plugin switches fall in three classes, and a fourth class, TF32, covers one engine variable:
-- EXACT: the same output values as the `=0` path, bit for bit. A test shows it, or (15 switches) it is classed
-  without a measurement: by the commit's reasoning or because its A/B kept the same text.
+- EXACT: the same output values as the `=0` path, bit for bit. A test shows it, or (4 switches) it is classed without
+  a measurement: by the commit's reasoning or because its A/B kept the same text.
 - REORDER: not bit-identical. A test shows it no farther from float64 or within a stated bound, or (4 switches) it is
   classed without a measurement: by the commit's reasoning (3) or because its A/B kept the same text (1).
-- DRAFT-ONLY: changes only the drafts, or how many rows a verify checks.
+- DRAFT-ONLY: changes only the drafts, or how many rows a verify checks (1 switch classed without a measurement).
 - TF32: MLX's TF32 matmuls, which on M5 at the defaults round only the drafter's P·V. Without NAX, MLX does not use
   TF32.
 
-28 of the 50 have a standing test or a kernel contract case. 22 we class by the commit's reasoning (11) or by their
-A/B giving the same text (11), not by a measurement.
+41 of the 50 have a standing test or a kernel contract case. 9 do not: `PF_GU_SEG`, `WOA_JOIN`, `DRAFT_POS_ONCE`,
+`MOE_DOWN_ORDER`, `CED`, `PF_PASS_SIZE`, `HC_EXPAND_NORM` (a 1% tolerance test), `PF_IDX_NAX` (an f32-reassociation
+test) and `SPEC_SYNC` (its test needs a pack).
 
 | Class | Plugin switches | Engine variables |
 |---|---|---|
@@ -329,7 +329,8 @@ tests of `attnCore` count each core's calls; on NAX they count 0 f16 calls.
 - `ENGRAM_GPU_IDS` (REORDER, bounded): 30 of 409,600 bf16 words differ from MLX's chain: 25 nearer, 4 farther and
   1 at the same distance. The worst element is equal, and the total squared error is larger by a factor of
   1 + 4.5e-9. The test requires a worst element no farther and at most 1e-4 of the words differing.
-- `FP8_FOLD` and `FP4_READS` read three rare scale codes differently from MLX. At load, the plugin scans each layer:
+- `FP8_FOLD` and `FP4_READS` read three rare mxfp8 code kinds (e8m0 scale 0xFF, e8m0 scales 247 to 254, and the e4m3
+  NaN) differently from MLX. At load, the plugin scans each layer:
   it declines `FP8_FOLD` by name where any mxfp8 linear holds one, and `FP4_READS` where a shared down does. The shipped NVFP4 pack holds none of them.
 - TF32: the router, the compressor projection and the DSpark q·k read 0 operand elements that TF32 rounds. The hc
   collapse has operands that TF32 would round, but MLX serves it on its gemv kernel, which does not use TF32, so its
@@ -346,16 +347,16 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 
 | Switch | What it does | Class | Evidence |
 |---|---|---|---|
-| PROMPT_ASYNC_EVAL | Commits the last wide prompt layer without a wait | EXACT | commit |
-| PF_CED_HC | CED compressor hc pre-norm once over the pass | EXACT | A/B text |
-| PF_ROPE_PAIRS | Query-tail rope computes each angle once per pair | EXACT | A/B text |
-| PF_RMS_ROWS | Query-latent rms reads its rows in place | EXACT | A/B text |
-| CED_LAZY | Runs a CED replay once, for its first reader | EXACT | commit |
-| IN_PROJ_MIXR | Verify in_proj hc mixes as one threadgroup per (mix, row) | EXACT | A/B text |
+| PROMPT_ASYNC_EVAL | Commits the last wide prompt layer without a wait | EXACT | test (word for word) |
+| PF_CED_HC | CED compressor hc pre-norm once over the pass | EXACT | test (word for word) |
+| PF_ROPE_PAIRS | Query-tail rope computes each angle once per pair | EXACT | test (word for word) |
+| PF_RMS_ROWS | Query-latent rms reads its rows in place | EXACT | test (word for word) |
+| CED_LAZY | Runs a CED replay once, for its first reader | EXACT | test (word for word) |
+| IN_PROJ_MIXR | Verify in_proj hc mixes as one threadgroup per (mix, row) | EXACT | test (word for word; M3 or later) |
 | HC_EXPAND_NORM | FFN-side hc expand and norm in one launch | REORDER | A/B text (its test allows 1% relative error, not counted as a bound) |
 | PF_MOE_EPI | Counting-sort route pack in place of two argsorts | EXACT | test |
 | PF_GU_SEG | 128 x 128 paired gate/up where the planner picks it | EXACT | A/B text |
-| PF_KV_ROWS | Window kv rows on one simdgroup per row | EXACT | A/B text |
+| PF_KV_ROWS | Window kv rows on one simdgroup per row | EXACT | test (word for word) |
 | PF_DOWN_TOKORD | Staged down writes rows in token order | EXACT | test |
 | PF_FP4_GEMM | Staged matrix-unit gather for routed gate/up and down | EXACT | test |
 | WOA_JOIN | Joins the spans' wo_a rows in one copy | EXACT | commit |
@@ -365,23 +366,23 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | PF_ENGRAM_PASS | Engram wkv once per 16 spans | EXACT | test |
 | MOE_TAIL | MoE combine and hc expand in one launch | EXACT | test |
 | FLASH_TRIM | FLASH_ATTN with a raw-score block max and 8-byte stores | EXACT (to FLASH_ATTN) | test |
-| FFN_IN_SINK | ffn_in mix tail in its own launch | EXACT | A/B text |
+| FFN_IN_SINK | ffn_in mix tail in its own launch | EXACT | test (word for word) |
 | SPEC_ENGRAM_AHEAD | Queues the next verify's Engram kv behind the draft | EXACT | test |
-| FFN_IN_R5_COLS1 | 5-row ffn_in launch 1 with one column per simdgroup | EXACT | A/B text |
+| FFN_IN_R5_COLS1 | 5-row ffn_in launch 1 with one column per simdgroup | EXACT | test (word for word) |
 | DRAFT_POS_ONCE | Makes draft ring slots and positions once | EXACT | commit |
 | FUSE_WQB_RING | The wq_b launch writes the window ring | EXACT | contract |
 | ENGRAM_KV_CACHE | GPU cache of Engram slot partials, at most 4 GB | EXACT (to ENGRAM_KV_SLOTS) | test |
 | FP4_DEC_WORD | Decodes e2m1 codes a word at a time | EXACT | test |
 | FP4_UP_SPLIT | Shared gate and up rows on separate simdgroups | EXACT | test |
-| FP8_FOLD | Folds 2^8 into the e8m0 scale in mxfp8 reads | EXACT (declines on rare codes) | commit, load scan |
+| FP8_FOLD | Folds 2^8 into the e8m0 scale in mxfp8 reads | EXACT (declines on rare codes) | test (word for word on finite codes), load scan |
 | MOE_DOWN_ORDER | Verify down launch in column-block order | EXACT | A/B text |
-| FUSE_DOWN_SCALE | NVFP4 down scale inside the gate/up launch | EXACT | commit |
+| FUSE_DOWN_SCALE | NVFP4 down scale inside the gate/up launch | EXACT | test (word for word) |
 | CED | The chunked prompt path: the decoder layers run again over a chunk's last window rows only | REORDER (row count) | commit (by construction) |
 | MOE_FP4_NAX | Fused fp4 MoE decode kernels on the matrix units | REORDER | test |
 | MOE_PAIR_SCALED | NVFP4 prompt gate/up, scales and activation in one launch | REORDER (bounded) | test |
 | PF_HC_V2 | Wide-layer hc in three passes, not five | REORDER (bounded) | test |
 | PF_PASS_SIZE | Near-equal memory-sized prompt passes | REORDER (partition) | commit |
-| PF_IDX_NAX | Indexer scores on the matrix units | REORDER | commit |
+| PF_IDX_NAX | Indexer scores on the matrix units | REORDER | commit (its NAX test allows f32 reassociation, not counted) |
 | PF_COMP_BF16 | Compressor projection on a bf16 MMA, K blocks summed apart | REORDER | test |
 | FLASH_ATTN | Every prompt-attention call on one flash kernel where it fits | REORDER | test |
 | ENGRAM_GPU_IDS | Engram ids hashed on the GPU; fused wkv | REORDER (bounded) | test |
@@ -390,10 +391,10 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | ATTN_DEC | Decode attention on a shape-cut tile kernel | REORDER | test |
 | WOA_PLAIN | Splits merged once; wo_a as a plain grouped GEMV | REORDER | test |
 | FUSE_MXFP8_QMM | Prompt mxfp8 linears on MLX's quantized matmul | REORDER | test |
-| DRAFT_FUSED | DSpark stages on the fused decode kernels | DRAFT-ONLY | commit |
+| DRAFT_FUSED | DSpark stages on the fused decode kernels | DRAFT-ONLY | test (within 1% relative rms of the op chain) |
 | DRAFT_SAMPLE | Sampled drafts from q, kept at min(1, p / q) | DRAFT-ONLY | test |
-| DRAFT_QKV | Fuses a stage's wq_a and wkv at load | DRAFT-ONLY | commit |
-| SPEC_SYNC | Greedy accept on the GPU; next draft queued behind the verify | DRAFT-ONLY | A/B text |
+| DRAFT_QKV | Fuses a stage's wq_a and wkv at load | DRAFT-ONLY | test (within 1e-3 relative rms, no farther from the op chain) |
+| SPEC_SYNC | Greedy accept on the GPU; next draft queued behind the verify | DRAFT-ONLY | A/B text (its test needs a pack) |
 | DRAFT_VOCAB | Greedy drafts score only the pack's `draft-vocab.txt` ids (default: the pack's file, shipped as the plugin's `draft-vocab.txt`) | DRAFT-ONLY | test |
 | DRAFT_VOCAB_PROMPT | A request's prompt ids join the draft vocabulary | DRAFT-ONLY | test |
 | HEAD8 | LM head requantized to 8-bit g64 | Requantized (KLD within one standard error) | KLD measurement |
@@ -427,7 +428,7 @@ Each of these is off by default. Names omit `MLX_SERVE_DSV41_` except where show
   decode.
 
 Three value switches set memory and kernel choices. `ENGRAM_LRU_MB` (256) sets memory only. `ENGRAM_RESIDENT` (`auto`)
-and `WEIGHT_PATH` (`auto`) can turn off the resident fusions. The `ssd` path turns off `FUSE_MXFP8_QMM`. Tables not
+and `WEIGHT_PATH` (`auto`) can turn off the resident fusions. The `ssd` path turns off `FUSE_DOWN_SCALE` and `FUSE_MXFP8_QMM`. Tables not
 held in memory turn off `ENGRAM_GPU_IDS` and the Engram partials cache (`ENGRAM_KV_CACHE`).
 
 </details>
@@ -444,7 +445,7 @@ Standard test, p01, greedy, DSpark on, NVFP4 pack:
 | `58279979`, the last reviewed head | 4,009.6 | 82.93 |
 | `a99fc4f6`, the release | 5,551.3 | 98.80 |
 
-The 47 changes since `58279979` give +38.4% prefill and +19.1% decode (on two Macs; the
+From `58279979` to the release (the 47 changes, the upstream merge and the audit fixes): +38.4% prefill and +19.1% decode (on two Macs; the
 release's runs about 0.8% slower per round). On `f7e4da9e` the MXFP4-experts pack ran
 4,108.3 / 73.83 tok/s; NVFP4 was 2.8% slower. The runs differ. The first NVFP4 build's A/B used a 440320 MiB wired limit and plain
 pre-warm requests. The release cells used 512000 MiB, `--ctx-size 32768` and `--warmup-full`. p01 is the best of the
@@ -477,7 +478,9 @@ for each run. Each cell ran 6 runs (p10: 2) on the release build `a99fc4f6`, sta
 
 The release's attention fix sends the CED replay of a long prompt to the flash kernel, so greedy texts differ from the
 control's (`04b8f7d0`). On p10 the release decodes 7.5% slower than the control (98.50 against 106.45 tok/s): acceptance fell from
-3.51 to 2.94 tokens per round on the new text, and round time did not rise. The PR's reply comments hold every run and each switch's A/B.
+3.51 to 2.94 tokens per round on the new text, and round time did not rise. p10 is the only cell whose mean decode fell
+more than 1%. Per prompt, greedy p21 fell 3.1% and p14 with the card's settings 3.9%, while greedy p14 rose 4.1% and
+card p01 2.9%; every one of these texts changed. The PR's reply comments hold every run and each switch's A/B.
 
 A 17,600-token prompt runs as one prompt pass at the cells' context and at the 1M default (the 1M load cuts passes
 of about 44,500 rows), but we have not measured the cells at the 1M default.
@@ -491,7 +494,7 @@ of about 44,500 rows), but we have not measured the cells at the 1M default.
 | The plugin does not stream experts with per-expert scales, so a Mac that cannot hold the NVFP4 pack cannot serve it | The `--experts-mxfp4` pack for those Macs, or streamed per-expert scales |
 | Without NAX, the lossy f16 attention core (`ATTN_F16`) is on by default, and we have not measured it on those Macs | A float64 test on those Macs, or `ATTN_F16` off there |
 | On the f32 attention chain's routes, attention's output depends on the prompt pass width | A test that holds each pass width no farther from float64 |
-| 11 classed switches rest on the commit's reasoning, and 11 on their A/B giving the same text, among them `HC_EXPAND_NORM`, whose test holds it only within 1% | A standing word or float64 test for each |
+| 9 classed switches have no standing test against their `=0` path (listed in "Accuracy") | A standing word or float64 test for each |
 | The ds41nv sweep build's sweep stops at 256K | Its full sweep |
 | TF32's float64 test needs a fixture that no tool in this repo writes | A fixture writer, or the fixture in the repo |
 | `HEAD8` is a quantization change. Its KLD is within one standard error of the bf16 head's on our set, but it is not bit-identical | A ruling to keep it, or `=0` by default |
@@ -522,7 +525,7 @@ of about 44,500 rows), but we have not measured the cells at the 1M default.
 | Pick count | The number of compressed rows that the indexer picks for a span's attention |
 | KLD | Kullback-Leibler divergence of the served distribution from a reference |
 | `=0` path | The path a default-on switch serves when it is set to 0: the path before the change |
-| Standard test | Three coding prompts of about 17,600 tokens, 1,024 greedy tokens, a fresh server per run, 6 runs |
+| Standard test | Three coding prompts of about 17,600 tokens, 1,024 completion tokens (greedy, or the card's sampling settings), a fresh server per run, 6 runs |
 | p10 | A fourth library prompt, not part of the standard test; it drafted best on the control |
 | The first NVFP4 build | `f7e4da9e`, an early build of this PR's branch (2026-11-20), before the fused fp4 decode was on by default |
 | The ds41nv sweep build | The stack at the start of this work: `main` `9e3311c2` plus the Engram mxfp4 path and its residency, MXFP4-experts pack; binary sha256 `534d15b3`, no commit recorded |
