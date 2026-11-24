@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash-1017 NVFP4 in mlx-serve
 
-Status: production guide for the `deepseek_v41` runner in mlx-serve core, release head `12eeb3f4` (PR 1256),
+Status: production guide for the `deepseek_v41` runner in mlx-serve core, release head `a99fc4f6` (PR 1256),
 2026-11-24. "We" are the PR 1256 authors, who tuned and measured on M5 Ultra Macs with 512 GB of memory. The PR body
 holds the A/B evidence. Agent and code notes for this folder are in [AGENTS.md](AGENTS.md).
 
@@ -11,9 +11,9 @@ This plugin serves NVIDIA's `DeepSeek-V4.1-Flash-1017-NVFP4` checkpoint on Apple
 and the routed experts stay in NVFP4. DeepSeek's own drafter, DSpark, proposes tokens that the model checks in one
 step, and this makes decode faster. The defaults are the release configuration, and you set no switch to get them.
 On an M5 Ultra with 512 GB, the control build of this release decoded 97.43 tok/s greedy and prefilled 5,549 tok/s on
-our standard test. Against the pack as shipped, the defaults have two known losses. One is an 8-bit LM head, whose
-KLD measured equal to the bf16 head's. The other is an f16 attention core that serves some prompt calls. Every other default-on
-switch is exact, a reordered sum no farther from float64, a change to the drafts only, or MLX's TF32 matmul. HumanEval,
+our standard test. Against the pack as shipped, the defaults on M5 have one known loss: an 8-bit LM head, whose
+KLD measured equal to the bf16 head's. Macs without neural accelerators also serve a lossy f16 attention core by
+default. Every other default-on switch is exact, a reordered sum no farther from float64, a change to the drafts only, or MLX's TF32 matmul. HumanEval,
 the long-context sweep and the final numbers on the release head are not done yet.
 
 ## Serve the model on an M5 Ultra with 512 GB
@@ -153,18 +153,30 @@ in one of four classes, with two exceptions.
 
 The first exception is `HEAD8`, the 8-bit LM head described in "What the pack holds".
 
-The second exception is `ATTN_F16` (on), an attention core with f16 scores and probabilities. It is lossy. On M5, at
-the release's prompt spans, its bf16-out l2 against float64 was 1.80e-3 to 2.31e-3, against 1.63e-3 to 1.68e-3 for the
-f32 chain (`=0`). That is 10% to 37% farther. Where it serves depends on the GPU:
+The second exception is `ATTN_F16`, an attention core with f16 scores and probabilities. It is lossy. On M5, at the
+release's prompt spans, its bf16-out l2 against float64 was 1.80e-3 to 2.31e-3, against 1.63e-3 to 1.68e-3 for the f32
+chain (`=0`). That is 10% to 37% farther.
 
-- On Macs without NAX, it serves every wide prompt span. It is the fast path there, and its default stays on, as
-  upstream set it. `=0` gives the f32 chain. We have not measured it on those Macs.
-- On M5, a prompt call of more than one 256-row span takes the flash kernel (`FLASH_ATTN`) at any pick count, so the f16
-  core never serves it. The flash kernel is nearer to float64 than the f32 chain there: bf16-out l2 1.660e-3 to
-  1.670e-3 against 1.667e-3 to 1.677e-3, and f32-out l2 6.2e-5 to 6.6e-5 against 1.52e-4 to 1.67e-4.
-- On M5, a prompt call of one span (17 to 256 rows) does not take the flash kernel. The f16 core serves its layers
-  whose pick count (the compressed rows that the indexer picks) is not a multiple of 64. This happens below about
-  1,024 positions. We read this from the code; no test covers this path.
+One function, `attnCore`, picks the core for every prompt-attention call. It decides from the call's shape, dtypes and
+device and the load's switches only, never from the caller. On NAX it takes the first core that fits, in this order:
+
+1. the flash kernel (`FLASH_ATTN`), at any pick count;
+2. the gather, where the pick count (the compressed rows that the indexer picks) is a multiple of 64;
+3. the f32 chain.
+
+The f16 core serves only on Macs without NAX, where it is the fast path and on by default as upstream set it, or under
+an explicit `ATTN_F16=1`. On those Macs `=0` gives the f32 chain, and we have not measured them. The load fixes the
+switch's effective value, and the prompt cache's layout hash includes it. On M5 the flash kernel is nearer to float64
+than the f32 chain: at the release's prompt spans, bf16-out l2 1.660e-3 to 1.670e-3 against 1.667e-3 to 1.677e-3, and
+f32-out l2 6.2e-5 to 6.6e-5 against 1.52e-4 to 1.67e-4.
+
+A tensor split (32 heads a rank) takes the f32 chain. On the f32 chain's routes (a tensor split, `FLASH_ATTN=0` at a
+pick count that is not a multiple of 64, and f16 or f32 activations), attention's output depends on the chunk width.
+MLX picks its GEMM by row count, so the sums run in another order: a reorder. Flash and the gather do not depend on it.
+
+Two fixes in a row each left a path to the f16 core on M5, because each caller chose its own core. The root-cause fix
+gives the choice one owner, `attnCore`. Tests drive the served routes through the plugin's entry points on a
+full-model fixture and count each core's calls; on NAX they count 0 f16 calls.
 
 The class tests are in the plugin. Each test also runs a planted fault as a control, and the control must fail.
 `prompt/wide_test.zig` holds the prompt switches. `decode/attn.zig`, `decode/woa_plain.zig` and
@@ -246,7 +258,7 @@ or the text of the A/B and the commit that added the switch.
 | PF_PASS_SIZE | Near-equal memory-sized prompt passes | REORDER (partition) | commit |
 | PF_IDX_NAX | Indexer scores on the matrix units | REORDER | commit |
 | PF_COMP_BF16 | Compressor projection on a bf16 MMA, K blocks summed apart | REORDER | test |
-| FLASH_ATTN | Multi-span prompt attention on one flash kernel | REORDER | test |
+| FLASH_ATTN | Every prompt-attention call on one flash kernel where it fits | REORDER | test |
 | ENGRAM_GPU_IDS | Engram ids hashed on the GPU; fused wkv | REORDER | test |
 | ENGRAM_KV_SLOTS | Slot-blocked Engram wkv | REORDER | test |
 | FP4_READS | Bit-placement fp4 reads; each 16-group summed apart | REORDER (declines on rare codes) | test |
@@ -259,7 +271,7 @@ or the text of the A/B and the commit that added the switch.
 | SPEC_SYNC | Greedy accept on the GPU; next draft queued behind the verify | DRAFT-ONLY | A/B text |
 | DRAFT_VOCAB_PROMPT | A request's prompt ids join the draft vocabulary | DRAFT-ONLY | test |
 | HEAD8 | LM head requantized to 8-bit g64 | Requantized (KLD equal) | KLD measurement |
-| ATTN_F16 | f16 attention core | LOSSY (measured, not gated) | printed float64 measurement |
+| ATTN_F16 | f16 attention core; on by default only without NAX | LOSSY (measured, not gated) | printed float64 measurement, served-route tests |
 
 Engine variables on the DeepSeek path: `MLX_SERVE_DSV4_DSPARK` (REORDER: the verify's multi-row kernels),
 `MLX_SERVE_DSPARK_POLICY2` and `MLX_SERVE_DSPARK_POLICY2_MODELED` (DRAFT-ONLY: they pick verify widths) and
@@ -268,6 +280,11 @@ Engine variables on the DeepSeek path: `MLX_SERVE_DSV4_DSPARK` (REORDER: the ver
 </details>
 
 ## Switches that stay opt-in
+
+Six switches stay off by default, and three value switches set memory and kernel choices.
+
+<details>
+<summary>The opt-in and value switches</summary>
 
 Each of these is off by default. Names omit `MLX_SERVE_DSV41_` except where shown.
 
@@ -283,6 +300,8 @@ Three value switches set memory and kernel choices. `ENGRAM_LRU_MB` (256) sets m
 and `WEIGHT_PATH` (`auto`) can turn off the resident fusions. The `ssd` path turns off `FUSE_MXFP8_QMM`. Tables not
 held in memory turn off `ENGRAM_GPU_IDS` and the Engram KV cache.
 
+</details>
+
 ## Results
 
 The standard test is three coding prompts of about 17,600 tokens each, with 1,024 greedy completion tokens and a fresh
@@ -295,15 +314,17 @@ server per run. On control `04b8f7d0` it gave these speeds:
 | Greedy, DSpark off | 5,534.1 | 61.48 |
 | Prompt p10, greedy, DSpark on | 5,530.0 | 106.45 |
 
-The control is the stack before the upstream merge and the release fixes. The PR body holds every run and the A/B of
-each switch. The final numbers on the release head are not done yet.
+The control is the stack before the upstream merge and the release fixes. The release's attention fix sends the CED
+replay of a long prompt to the flash kernel, so greedy texts on the release head differ from the control's. The PR
+body holds every run and the A/B of each switch. The final numbers on the release head are not done yet.
 
 ## Gaps
 
 | Gap | What the release needs |
 |---|---|
 | HumanEval, the 1K to 1M context sweep and the final standard test have not run on the release head | Those runs, posted in the PR |
-| The f16 attention core (`ATTN_F16`) is lossy and on by default. On M5 it still serves one-span prompt calls below about 1,024 positions; without NAX it serves every wide span | Those calls on the flash kernel or the f32 chain, or a ruling that keeps the f16 core |
+| Without NAX, the lossy f16 attention core (`ATTN_F16`) is on by default, and we have not measured it on those Macs | A float64 test on those Macs, or `ATTN_F16` off there |
+| On the f32 attention chain's routes, attention's output depends on the chunk width | A test that holds each chunk width no farther from float64 |
 | `HEAD8` is a quantization change. Its KLD equals the bf16 head's on our set, but it is not bit-identical | A ruling to keep it, or `=0` by default |
 | No tool in this repo makes `draft-vocab.txt` | The release ships the file with the pack |
 | We tuned and measured only on M5 Ultra Macs with 512 GB | Runs on smaller Macs and older GPUs |

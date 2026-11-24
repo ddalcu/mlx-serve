@@ -589,7 +589,8 @@ pub const Dsv41Model = struct {
     attn_softmax_kernel: mlx.mlx_fast_metal_kernel,
     /// The wide attention core on the matrix units (`attnGather`); null without them.
     attn_gather: ?GatherAttn = null,
-    /// Wide spans score and weight rows in f16 (`attnWide`); `MLX_SERVE_DSV41_ATTN_F16=0` keeps the f32 chain.
+    /// The f16 core (`attnWide`) may take a prompt-attention call no lossless core takes (`attnCore`); set at load
+    /// from MLX_SERVE_DSV41_ATTN_F16 (`attnF16At`): on NAX only when named on.
     attn_f16: bool = true,
     idx_score_kernel: mlx.mlx_fast_metal_kernel,
     idx_tile_kernel: mlx.mlx_fast_metal_kernel,
@@ -2494,7 +2495,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         .attn_split_kernel = try buildKernel("dsv41_attn_split", &ATTN_INS, &.{ "pacc", "pm", "pl" }, ATTN_SPLIT_SOURCE, ""),
         .attn_merge_kernel = try buildKernel("dsv41_attn_merge", &ATTN_MERGE_INS, &.{"out"}, ATTN_MERGE_SOURCE, UNROPE_HEADER),
         .attn_softmax_kernel = try buildKernel("dsv41_attn_softmax", &ATTN_SOFTMAX_INS, &.{ "pw", "pc" }, ATTN_SOFTMAX_SOURCE, ""),
-        .attn_f16 = if (env.get(.MLX_SERVE_DSV41_ATTN_F16)) |v| v[0] != '0' else true,
+        .attn_f16 = attnF16At(env.get(.MLX_SERVE_DSV41_ATTN_F16), device.naxAvailable()),
         .idx_score_kernel = try buildIdxScoreKernel(),
         .idx_tile_kernel = try buildKernel("dsv41_index_tile", &IDX_INS, &.{"scores"}, IDX_TILE_SOURCE, ""),
         .gate_kernel = try buildKernel("dsv41_gate", &.{ "x", "w" }, &.{"logits"}, GATE_SOURCE, ""),
@@ -3873,27 +3874,69 @@ pub fn attention(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, p0: us
         return if (m.tp != null) tpSum(sc, m, y[0]) else y[0];
     }
     const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
-    const f16_core = m.attn_f16 and (m.act == .bfloat16 or m.act == .float16) and dim(keys_w, 0) + K <= ATTN_SOFTMAX_MAX_COLS and mlx.streamIsGpu(sc.s);
-    const want_grouped: ?Grouped = if (pre != null) .{ .periods = ropeFor(m, li).inv, .p0 = p0 } else null;
-    const gathered = try attnGather(sc, m, ly.sink, q, pj.qt, keys_w, wp, comp_rows, topk, scale, want_grouped);
-    // The heads unroped (`qt` set): a core other than the gather reads the whole roped heads.
-    if (gathered == null and pj.qt.ctx != null) q = try ropeTail(sc, m, q, ropeFor(m, li).fwd, pos, 1.0);
-    const o = if (gathered) |g| blk: {
-        sh.grouped = want_grouped != null;
-        break :blk g;
-    } else if (f16_core)
-        try attnWide(sc, m, ly.sink, q, keys_w, wp, comp_rows, topk, scale, m.act)
-    else
-        try attnWideF32(sc, ly.sink, q, keys_w, try windowBand(sc, wp, L, window), comp_rows, topk, scale, m.act);
+    const core = try attnCore(m, sc.s, q, keys_w, comp_rows, K);
+    _ = core_calls[@intFromEnum(core)].fetchAdd(1, .monotonic);
+    // The flash kernel stores its heads grouped and inverse-roped only, so a call outside a wide layer takes them so too
+    // and skips attnOut's rope; a wide layer's run region only where the wide layer opened one.
+    const grouped = core == .flash or (core == .gather and pre != null);
+    const gr: ?Grouped = if (grouped) .{ .periods = ropeFor(m, li).inv, .p0 = p0, .region = pre != null } else null;
+    // The heads unroped (`qt` set): a core other than the gather and flash reads the whole roped heads.
+    if ((core == .f16 or core == .f32) and pj.qt.ctx != null) q = try ropeTail(sc, m, q, ropeFor(m, li).fwd, pos, 1.0);
+    const o = switch (core) {
+        .gather, .flash => try attnGatherRun(sc, m, core, ly.sink, q, pj.qt, keys_w, wp, comp_rows, topk, scale, gr),
+        .f16 => try attnWide(sc, m, ly.sink, q, keys_w, wp, comp_rows, topk, scale, m.act),
+        .f32 => try attnWideF32(sc, ly.sink, q, keys_w, try windowBand(sc, wp, L, window), comp_rows, topk, scale, m.act),
+    };
     if (m.trace) |t| {
         try t.put("sa_q_{d}", .{li}, q);
         try t.put("sa_kv_{d}", .{li}, keys_w);
         try t.put("sa_o_{d}", .{li}, o);
     }
 
-    if (pre != null) return o;
-    const y = try attnOut(sc, m, ly, ropeFor(m, li).inv, o, pos);
+    if (pre != null) {
+        sh.grouped = grouped;
+        return o;
+    }
+    const y = if (grouped) try ly.wo_b.apply(sc, try attnOutA(sc, m, ly, o, null)) else try attnOut(sc, m, ly, ropeFor(m, li).inv, o, pos);
     return if (m.tp != null) tpSum(sc, m, y) else y;
+}
+
+/// A prompt-attention call's core (`attnCore`).
+pub const Core = enum { gather, flash, f16, f32 };
+
+/// Each core's prompt-attention calls served in this process (the served-route tests' meter).
+pub var core_calls: [4]std.atomic.Value(usize) = @splat(.init(0));
+/// The route tests' planted control: the old fall-through, without the flash kernel (which served only a wide layer):
+/// the gather at picks in tiles of 64, else the f16 core wherever it fits.
+pub var core_plant = false;
+
+/// MLX_SERVE_DSV41_ATTN_F16 at load: the f16 core may serve without NAX unless =0; on NAX only when named on.
+pub fn attnF16At(raw: ?[*:0]const u8, nax: bool) bool {
+    return if (raw == null) !nax else env.onValue(raw);
+}
+
+/// The one owner of a prompt-attention call's core (every call past `attnDecode`), from its shape, dtypes, device and
+/// the load's switches alone, never from its caller. On NAX: the flash kernel where it is on and takes the call (any
+/// pick count), else the gather (picks in tiles of 64), else the f32 chain; the f16 core only where ATTN_F16 is named
+/// on. Without NAX: the f16 core, or the f32 chain under ATTN_F16=0. FLASH_ATTN=1 refuses by name a call the flash
+/// kernel cannot take.
+pub fn attnCore(m: *const Dsv41Model, s: mlx.mlx_stream, q: A, keys_w: A, comp_rows: A, K: usize) error{FlashAttnShape}!Core {
+    const H = dim(q, 1);
+    const D = dim(q, 2);
+    const W = m.cfg.sliding_window;
+    const gpu = mlx.streamIsGpu(s);
+    const f16_ok = (m.act == .bfloat16 or m.act == .float16) and dim(keys_w, 0) + K <= ATTN_SOFTMAX_MAX_COLS and gpu;
+    const g = m.attn_gather orelse return if (m.attn_f16 and f16_ok) .f16 else .f32;
+    const og = m.cfg.dsv4_o_groups;
+    const bf = mlx.mlx_array_dtype(q) == .bfloat16 and mlx.mlx_array_dtype(keys_w) == .bfloat16 and (K == 0 or mlx.mlx_array_dtype(comp_rows) == .bfloat16);
+    const shape = gpu and bf and gatherShape(W, H, D, K) and og > 0 and H % og == 0;
+    if (core_plant) return if (shape and K % 64 == 0) .gather else if (f16_ok) .f16 else .f32;
+    // A trace records the plain heads, which the flash kernel does not store.
+    const flash = shape and g.flash != null and m.trace == null and D == 512 and m.cfg.dsv4_rope_head_dim == 64 and H % (16 * @as(usize, @intCast(fa.hgn))) == 0;
+    if (fa.ps().explicit and g.flash != null and !flash) return error.FlashAttnShape;
+    if (flash) return .flash;
+    if (shape and K % 64 == 0) return .gather;
+    return if (m.attn_f16 and f16_ok) .f16 else .f32;
 }
 
 /// The compressed rows the rows at [p0, p0 + L) attend and the indexer's picks among them (none at ratio 0): the
@@ -3944,28 +3987,34 @@ fn runGathers(c: *const Config, ratio: usize, start: usize, span: usize, run: us
 }
 
 /// `attnGather`'s heads as `attnOut`'s grouped projection reads them: inverse-roped with `periods` at `p0` on, laid out
-/// [o_groups, L, H / o_groups * D].
-pub const Grouped = struct { periods: A, p0: usize };
+/// [o_groups, L, H / o_groups * D]; `region`: a wide layer's call, which may take its run region or ring slot.
+pub const Grouped = struct { periods: A, p0: usize, region: bool = false };
 
 /// One line the first time a wide prompt span runs on the flash kernel (`MLX_SERVE_DSV41_FLASH_ATTN`).
 var flash_logged = std.atomic.Value(bool).init(false);
 
-/// The wide core on the matrix units, null where it does not serve (no NAX, not bf16, another head geometry): each row's
-/// scores against its own window and selected rows, read in place, never gathered.
-/// The heads `[L, H, D]`, or with `grouped` already inverse-roped and grouped.
-/// `qt` (q_tail.zig): the heads' roped last 64 channels, `q` the unroped heads.
+/// `attnGatherRun` where `attnCore` picks the gather or the flash kernel, else null (the f16 core or the f32 chain).
 pub fn attnGather(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, qt: A, keys_w: A, wp: usize, comp_rows: A, topk: A, scale: f32, grouped: ?Grouped) !?A {
-    const g = m.attn_gather orelse return null;
+    const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
+    const core = try attnCore(m, sc.s, q, keys_w, comp_rows, K);
+    if (core != .gather and core != .flash) return null;
+    if (core == .flash and grouped == null) return error.FlashNeedsGrouped;
+    return try attnGatherRun(sc, m, core, sink, q, qt, keys_w, wp, comp_rows, topk, scale, grouped);
+}
+
+/// The wide core on the matrix units `core` (`attnCore`'s gather or flash pick, which this runs as given): each row's
+/// scores against its own window and selected rows, read in place, never gathered.
+/// The heads `[L, H, D]`, or with `grouped` (the flash kernel always) already inverse-roped and grouped.
+/// `qt` (q_tail.zig): the heads' roped last 64 channels, `q` the unroped heads.
+pub fn attnGatherRun(sc: *Scope, m: *const Dsv41Model, core: Core, sink: A, q: A, qt: A, keys_w: A, wp: usize, comp_rows: A, topk: A, scale: f32, grouped: ?Grouped) !A {
+    const g = m.attn_gather orelse return error.GatherAbsent;
     const L = dim(q, 0);
     const H = dim(q, 1);
     const D = dim(q, 2);
     const W = m.cfg.sliding_window;
     const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
     const NK = W + K;
-    if (!gatherShape(W, H, D, K) or !mlx.streamIsGpu(sc.s)) return null;
-    if (mlx.mlx_array_dtype(q) != .bfloat16 or mlx.mlx_array_dtype(keys_w) != .bfloat16 or (K > 0 and mlx.mlx_array_dtype(comp_rows) != .bfloat16)) return null;
     const og = m.cfg.dsv4_o_groups;
-    if (grouped != null and (og == 0 or H % og != 0)) return null;
     const p0: usize = if (grouped) |gr| gr.p0 else 0;
     const meta = try sc.ints(&.{ @intCast(wp), @intCast(W), @intCast(dim(keys_w, 0)), @intCast(K), @intCast(H), @intCast(D), @intCast(p0), @intCast(L), @intCast(og) }, &.{9});
     const picks = if (K > 0) try sc.astype(topk, .int32) else meta;
@@ -3992,19 +4041,17 @@ pub fn attnGather(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, qt: A, keys_w
         }
     }.one;
     // MLX_SERVE_DSV41_FLASH_ATTN (flash_attn.zig): the span as one flash kernel (keys in blocks of 128, an online
-    // softmax; the scores and probabilities never leave a threadgroup), its heads into the run region where the run
-    // takes one (no S or P, so no ring order: every span's carrier gates the run's publish), else grouped.
-    const fa_shape = grouped != null and D == 512 and m.cfg.dsv4_rope_head_dim == 64 and H % (16 * @as(usize, @intCast(fa.hgn))) == 0;
-    // On, the ring holds no regions: a wide span the kernel cannot take is refused under an explicit =1, and on by
-    // default served by the gather's fresh launches below (never the ring).
-    if (fa.ps().explicit and g.flash != null and grouped != null and !fa_shape) return error.FlashAttnShape;
-    if (g.flash) |fk| if (fa_shape) {
+    // softmax; the scores and probabilities never leave a threadgroup), its heads into the run region where a wide
+    // layer's run takes one (no S or P, so no ring order: every span's carrier gates the run's publish), else grouped.
+    if (core == .flash) {
+        const fk = g.flash orelse return error.FlashAbsent;
+        const fg = grouped orelse return error.FlashNeedsGrouped;
         if (!flash_logged.swap(true, .monotonic)) log.info("[dsv41] {s} engaged: a wide prompt span on the flash kernel\n", .{flashName()});
         const f_qt = if (qt.ctx != null) qt else q;
         const f_scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{scale}, &[_]c_int{1}, 1, .float32));
-        const f_ins = [_]A{ q, keys_w, comp, picks, meta, f_qt, sink, f_scal, grouped.?.periods };
+        const f_ins = [_]A{ q, keys_w, comp, picks, meta, f_qt, sink, f_scal, fg.periods };
         const f_osh = [_]c_int{ ci(og), ci(L), ci(H / og * D) };
-        if (g.flash_heads) |fkh| if (sat.headsTarget()) |r_hb| {
+        if (fg.region) if (g.flash_heads) |fkh| if (sat.headsTarget()) |r_hb| {
             const f_hoff = try sc.keep(mlx.mlx_array_new_data(&[_]u32{ 0, r_hb.row }, &[_]c_int{2}, 1, .uint32));
             var f_c: [1]A = .{none};
             try flashLaunch(sc, fkh, &(f_ins ++ [_]A{ sat.noDep(), f_hoff, r_hb.region, r_hb.dep2 }), &.{.{ .shape = &.{1}, .dt = .uint32 }}, L, H, qt.ctx != null, m.act, &f_c);
@@ -4014,13 +4061,12 @@ pub fn attnGather(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, qt: A, keys_w
         var f_o: [1]A = .{none};
         try flashLaunch(sc, fk, &f_ins, &.{.{ .shape = &f_osh, .dt = m.act }}, L, H, qt.ctx != null, m.act, &f_o);
         return f_o[0];
-    };
-    // The gather's own launches take the picks in tiles of 64: another count goes to the caller's core.
-    if (K % 64 != 0) return null;
+    }
+    if (K % 64 != 0) return error.GatherPicks;
     // scratch_attn.zig: a wide span's scores and probabilities in the ring's slot j, each launch its stock text's
     // twin (qk writes s into S's slot, sm reads it and writes p into P's, pv reads p; each binds the one before's
     // carrier, and qk the carrier of the slot's last pv).
-    const ring_slot: ?u1 = if (grouped != null) sat.take(L, H, NK) else null;
+    const ring_slot: ?u1 = if (grouped) |gr| (if (gr.region) sat.take(L, H, NK) else null) else null;
     if (ring_slot) |j| {
         var r_carrier: [2]A = .{ none, none };
         const r_k = &g.ring;
@@ -4159,7 +4205,7 @@ fn warmRing(m: *Dsv41Model) !void {
     const sink = try sc.zeros(&.{ 1, ci(H), 1 }, .float32);
     const periods = try sc.ones(&.{ci(c.dsv4_rope_head_dim / 2)}, .float32);
     var heads: [2]A = undefined;
-    for (&heads, 0..) |*h, i| h.* = (try attnGather(&sc, m, sink, q, if (i == 0) qt else none, kw, W - 1, none, none, 1.0, .{ .periods = periods, .p0 = 0 })) orelse return;
+    for (&heads, 0..) |*h, i| h.* = (try attnGather(&sc, m, sink, q, if (i == 0) qt else none, kw, W - 1, none, none, 1.0, .{ .periods = periods, .p0 = 0, .region = true })) orelse return;
     try evalAll(&heads);
     // MLX_SERVE_DSV41_FLASH_ATTN on: the flash kernel's heads-region twin compiled at load too, by the same spans into a
     // one-row run region (the served layers' full runs launch it; a first prompt compiles nothing).
@@ -4168,7 +4214,7 @@ fn warmRing(m: *Dsv41Model) !void {
         defer sat.headsLayerEnd();
         sat.headsSpan(true, true, 0);
         var carriers: [2]A = undefined;
-        for (&carriers, 0..) |*h, i| h.* = (try attnGather(&sc, m, sink, q, if (i == 0) qt else none, kw, W - 1, none, none, 1.0, .{ .periods = periods, .p0 = 0 })) orelse return;
+        for (&carriers, 0..) |*h, i| h.* = (try attnGather(&sc, m, sink, q, if (i == 0) qt else none, kw, W - 1, none, none, 1.0, .{ .periods = periods, .p0 = 0, .region = true })) orelse return;
         try evalAll(&carriers);
         log.info("deepseek_v41: the flash kernel ({s}) and its heads-region twin compiled at load, both query-tail texts\n", .{flashName()});
     } else if (fa.ps().mode == .on) log.info("deepseek_v41: the flash kernel ({s}) compiled at load, both query-tail texts; no heads regions\n", .{flashName()});
@@ -11121,6 +11167,13 @@ test "dsv41 engram: the kernel writes the op chain's stream bit for bit, decode 
     };
 }
 
+test "dsv41 ATTN_F16: on NAX the f16 core may serve only where MLX_SERVE_DSV41_ATTN_F16 is named on; without NAX unless =0" {
+    for ([_]?[*:0]const u8{ null, "1", "", "0" }, [_]bool{ false, true, true, false }, [_]bool{ true, true, true, false }) |raw, nax, plain| {
+        try testing.expectEqual(nax, attnF16At(raw, true));
+        try testing.expectEqual(plain, attnF16At(raw, false));
+    }
+}
+
 test "dsv41 wide attention: the f16 core and the matrix-unit core give the f32 chain's heads at the release's span shape" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     // Bar: per (row, head) cosine, norm ratio and peak error against the f32 chain, both read in f32.
@@ -11134,10 +11187,16 @@ test "dsv41 wide attention: the f16 core and the matrix-unit core give the f32 c
     m.cfg.dsv4_rope_head_dim = 64;
     m.qat_off = false;
     m.act = .bfloat16;
+    m.trace = null;
+    m.attn_f16 = false;
     m.attn_softmax_kernel = try buildKernel("dsv41_attn_softmax", &ATTN_SOFTMAX_INS, &.{ "pw", "pc" }, ATTN_SOFTMAX_SOURCE, "");
     defer _ = mlx.mlx_fast_metal_kernel_free(m.attn_softmax_kernel);
     m.rope_kernel = try buildKernel("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, ROPE_TAIL_SOURCE, FP8_HEADER);
     defer _ = mlx.mlx_fast_metal_kernel_free(m.rope_kernel);
+    // The gather's own kernels: a plugin load earlier in the process leaves FLASH_ATTN on.
+    const fa_was = fa.ps().*;
+    defer fa.ps().* = fa_was;
+    fa.ps().* = .{};
     m.attn_gather = if (device.naxAvailable()) try GatherAttn.init() else null;
     defer if (m.attn_gather) |*g| g.deinit();
     var key = mlx.mlx_array_new();
@@ -13611,9 +13670,10 @@ test "dsv41 prefill quality: the prompt pass's next-token distributions against 
     const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true });
     defer m.deinit();
     const gather = m.attn_gather;
+    const f16_at = m.attn_f16;
     defer {
         m.attn_gather = gather;
-        m.attn_f16 = true;
+        m.attn_f16 = f16_at;
     }
     const n_win = std.mem.readInt(u32, raw[0..4], .little);
     var off: usize = 4;
@@ -13634,7 +13694,7 @@ test "dsv41 prefill quality: the prompt pass's next-token distributions against 
         };
         for (&arms, 0..) |*o, arm| {
             m.attn_gather = if (arm == 0) null else gather;
-            m.attn_f16 = arm != 0;
+            m.attn_f16 = arm != 0 and f16_at;
             var st = try initState(m, gpa);
             defer st.deinit();
             o.* = try extend(m, gpa, &st, ids, .all);

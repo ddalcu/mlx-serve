@@ -1600,6 +1600,10 @@ test "deepseek_v41 aux: under MLX_SERVE_DSV41_PF_PASS_SIZE a snapshot at the end
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const was = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, "1");
     defer was.restore();
+    // The tiny pack's 4 heads take neither the flash kernel nor the gather. The f32 chain's GEMMs round a 160-row last
+    // span's rows otherwise than a 256-row span's, and the f16 core's here do not.
+    const f16_on = env.override(.MLX_SERVE_DSV41_ATTN_F16, "1");
+    defer f16_on.restore();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const files = try longFiles(arena.allocator());
