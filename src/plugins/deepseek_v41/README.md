@@ -210,10 +210,12 @@ must fail.
 - `FLASH_ATTN` (REORDER): its f32 output is nearer to float64 than the gather's, 6.4e-5 against 1.8e-4 relative.
 - `MOE_PAIR_SCALED` (REORDER, bounded): about 0.2% of the activation words differ from the split path. Each one is
   within one bf16 step of its row's largest value. Where the split path gives exactly zero, the paired kernel keeps a
-  tiny value, about 1e-35. The whole-sample l2 error against float64 equals the split path's.
+  tiny value, about 1e-35. The whole-sample l2 error against float64 measured equal to the split path's. The test
+  holds it to under 1% of words differing and an l2 within 1.05 times the split path's.
 - `PF_HC_V2` (REORDER, bounded): an f32 reorder of the five-pass hyper-connections. Its f32 mixes and split are 3 to 6
   times farther from float64 than the five passes', at the 1e-7 level. That is below the bf16 rounding that follows,
-  and the tail's output words are the five passes' words.
+  and the tail's output words are the five passes' words. The test holds the mixes and split within 1e-5 of float64
+  and every other output within 1.01 times the five passes' l2.
 - `ATTN_DEC` and `WOA_PLAIN` (REORDER): nearer to float64 than their `=0` paths in total l2 and worst element.
 - `ENGRAM_GPU_IDS` (REORDER): 30 of 409,600 bf16 words differ from MLX's chain (25 nearer, 4 farther). The worst
   element is equal, and the total squared error is 4.5e-9 larger.
@@ -305,12 +307,13 @@ Engine variables on the DeepSeek path: `MLX_SERVE_DSV4_DSPARK` (REORDER: the ver
 Each one is off by default. Names omit `MLX_SERVE_DSV41_` except where shown.
 
 - `EXACT_VERIFY=1` (EXACT): greedy DSpark text equals plain decode's bytes on M5.
-- `EXACT=1|solo` (EXACT): the same on Apple GPUs without neural accelerators; on M5 the load leaves it off and logs
-  why.
+- `EXACT=1|solo` (EXACT): the same on M3-generation or later Apple GPUs without neural accelerators; on M5 the load
+  leaves it off and logs why.
 - `FLASH_PSUM=1` (REORDER): a flash-attention variant that is nearer to float64; it measured no faster.
 - `MXFP4_VIEW=1` (REORDER): loads an NVFP4 bank whose every 32-value span is one power of two as MXFP4.
 - `MOE_PAIR=1` (REORDER): the paired prompt gate/up for MXFP4 banks without per-expert scales.
-- `MLX_SERVE_DSPARK_PIN_ROWS=N` (test only): every greedy round verifies N rows, for width sweeps.
+- `MLX_SERVE_DSPARK_PIN_ROWS=N` (test only): every DSpark round, greedy or sampled, verifies N rows, for width
+  sweeps.
 
 Three value switches tune memory and do not change results: `ENGRAM_LRU_MB` (256), `ENGRAM_RESIDENT` (`auto`) and
 `WEIGHT_PATH` (`auto`). The dead-code pass removed nine switches that lost their A/Bs (`rel-deadcode` `41be1c30`,

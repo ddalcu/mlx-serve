@@ -1,5 +1,5 @@
-//! Launch fusions for a resident model, each behind its own switch (`down_scale` and `mxfp8_qmm` on by default, `engram`
-//! and `pf_bf16_trunk` off), all of them behind the weight path (`MLX_SERVE_DSV41_WEIGHT_PATH`, `settle`, read at
+//! Launch fusions for a resident model, each behind its own switch (`down_scale` and `mxfp8_qmm`, both on by default),
+//! all of them behind the weight path (`MLX_SERVE_DSV41_WEIGHT_PATH`, `settle`, read at
 //! load): `resident` serves them, `ssd` the streamed and staged kernels as before (no fusion engages), `auto` resident
 //! when no bank streams and every Engram table is held. A forced `resident` on a streamed or partly held pack is
 //! refused by name.

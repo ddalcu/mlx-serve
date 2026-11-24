@@ -10,7 +10,7 @@ pub const Mode = enum { off, on };
 pub const Error = error{
     /// MLX_SERVE_DSV41_FLASH_ATTN is neither 0 nor 1 (unset or empty: on).
     FlashAttnSetting,
-    /// MLX_SERVE_DSV41_FLASH_TRIM is neither 0 nor 1 (unset or empty: off).
+    /// MLX_SERVE_DSV41_FLASH_TRIM is neither 0 nor 1 (unset or empty: FLASH_ATTN's setting).
     FlashTrimSetting,
     /// MLX_SERVE_DSV41_FLASH_TRIM=1 beside MLX_SERVE_DSV41_FLASH_ATTN=0: the flash kernel asked for and turned off.
     FlashTrimOff,
