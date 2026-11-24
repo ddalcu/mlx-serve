@@ -34,10 +34,10 @@ DSpark, lossless classes): `README.md`.
   span grouping (`idx_group`), buffers kept or reused (`transient_keep`, `scratch_x1` on `scratch`, `keep_wide`: MLX's
   reserve from `patches/mlx-metal-wide-reserve.patch`),
   Engram's direct read (`engram_direct`), the embedding pread and a plugin bank's own pieces (`wide_early`, `woa_rows`),
-  `flash_attn` (the flash kernel, not exact, on by default for every pack), an fp4 bank's gate and up with `moe_act`
-  in one paired launch (`moe_pair`); `wide_test.zig` holds the default-on prompt rewrites to their `=0` paths, most
+  `flash_attn` (the flash kernel, not exact, on by default for every pack), an NVFP4 bank's gate and up with its scales and `moe_act`
+  in one paired launch, and main's affine pair (`moe_pair`, one owner); `wide_test.zig` holds the default-on prompt rewrites to their `=0` paths, most
   word for word or no farther from float64 (`MOE_PAIR_SCALED` and `PF_HC_V2` to reorder bounds), some only to a
-  tolerance (`HC_EXPAND_NORM`, the opt-in `MOE_PAIR`, the pair-worker cases), with a planted bug each.
+  tolerance (`HC_EXPAND_NORM`, the pair-worker cases), with a planted bug each.
 - `fuse.zig`: launch fusions, each behind its own switch (`Dsv41Model.fuse`; `FUSE_DOWN_SCALE` and `FUSE_MXFP8_QMM` on
   by default), served only on the resident weight path
   (`MLX_SERVE_DSV41_WEIGHT_PATH`, `settle`); `ssd` keeps today's kernels.

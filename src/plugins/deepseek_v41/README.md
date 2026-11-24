@@ -407,7 +407,7 @@ Engine variables on the DeepSeek path: `MLX_SERVE_DSV4_DSPARK` (REORDER, by reas
 
 ## Switches that stay opt-in
 
-Four switches stay off by default (`EXACT`, `FLASH_PSUM`, `MXFP4_VIEW`, `MOE_PAIR`), and three value switches set
+Three switches stay off by default (`EXACT`, `FLASH_PSUM`, `MXFP4_VIEW`), and three value switches set
 memory and kernel choices. `MLX_SERVE_DSV41_EXACT=1` now also serves NAX; `MLX_SERVE_DSV41_EXACT_VERIFY`, which only
 earlier heads of PR 1256 had, is gone.
 
@@ -421,8 +421,9 @@ Each of these is off by default. Names omit `MLX_SERVE_DSV41_` except where show
   does. On M3-generation or later Apple GPUs without NAX the whole verify row does. `solo` also makes every request
   decode alone, and it is served only without NAX. We have not measured its speed cost.
 - `FLASH_PSUM=1` (REORDER) is a flash-attention variant that is nearer to float64. It measured no faster.
-- `MXFP4_VIEW=1` (REORDER) loads an NVFP4 bank whose every 32-value span is one power of two as MXFP4.
-- `MOE_PAIR=1` (REORDER) is the paired prompt gate/up for MXFP4 banks without per-expert scales.
+- `MXFP4_VIEW=1` (REORDER) loads an NVFP4 bank whose every 32-value span is one power of two as MXFP4. On the
+  release build it cut the standard-test peak by 16.8 GB (452.3 to 435.5 GB) and lost 1.6% to 1.7% prefill; decode
+  moved -0.33% greedy and +3.85% with the card's settings.
 
 Three value switches set memory and kernel choices. `ENGRAM_LRU_MB` (256) sets memory only. `ENGRAM_RESIDENT` (`auto`)
 and `WEIGHT_PATH` (`auto`) can turn off the resident fusions. The `ssd` path turns off `FUSE_MXFP8_QMM`. Tables not
