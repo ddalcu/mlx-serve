@@ -442,14 +442,13 @@ pub const DsparkW = struct {
     markov_embed: A, // [vocab, rank]
     markov_head: A, // [vocab, rank] in the activation dtype: a draft step reads all of it
     conf: A, // f32 [1, dim + rank]
-    /// `MLX_SERVE_DSV41_DRAFT_HEAD4` / `MLX_SERVE_DSV41_DRAFT_VOCAB`: what the drafts read in place of the trunk's head
-    /// and the whole Markov tables; null: the trunk's head over the whole vocabulary.
+    /// `MLX_SERVE_DSV41_DRAFT_VOCAB`: what the drafts read in place of the trunk's head and the whole Markov tables;
+    /// null: the trunk's head over the whole vocabulary.
     draft: ?DraftHead = null,
 
     /// The head the drafts read.
     pub fn headFor(self: *const DsparkW, m: *const Dsv41Model) *const Lin {
         const d = if (self.draft) |*x| x else return &m.head;
-        if (d.head4) logOnce(&draft_head4_logged, "[dsv41] MLX_SERVE_DSV41_DRAFT_HEAD4 engaged: the DSpark drafts read their own 4-bit head\n");
         return &d.head;
     }
     /// The Markov tables a draft's chain reads: markov_embed (indexed by a draft token) and markov_head (a row a scored
@@ -460,16 +459,13 @@ pub const DsparkW = struct {
     }
 };
 
-/// A draft-only head (`DsparkW.draft`): `head` the drafts' LM head (`MLX_SERVE_DSV41_DRAFT_HEAD4`: 4-bit). With a
-/// vocabulary (`MLX_SERVE_DSV41_DRAFT_VOCAB`, `k` ids) the drafts score only its ids: `head` and `markov_head` hold their
-/// rows, and a draft token is an id's index in `ids` (ascending, so MLX's argmax keeps the lower id on a tie, as over
-/// the whole vocabulary). `markov_embed` is reordered to match: the vocabulary's rows first, then every other id's, so
-/// `t1` (any id) enters through `to_draft` and the drafted tokens leave through `ids`. The trunk and the verify read
-/// nothing here.
+/// A draft-only head (`DsparkW.draft`): with a vocabulary (`MLX_SERVE_DSV41_DRAFT_VOCAB`, `k` ids) the drafts score
+/// only its ids: `head` (the trunk's head's rows) and `markov_head` hold their rows, and a draft token is an id's index
+/// in `ids` (ascending, so MLX's argmax keeps the lower id on a tie, as over the whole vocabulary). `markov_embed` is
+/// reordered to match: the vocabulary's rows first, then every other id's, so `t1` (any id) enters through `to_draft`
+/// and the drafted tokens leave through `ids`. The trunk and the verify read nothing here.
 pub const DraftHead = struct {
     head: Lin,
-    /// `head` is `MLX_SERVE_DSV41_DRAFT_HEAD4`'s (or its rows)
-    head4: bool = false,
     k: usize = 0,
     /// int32 [k]: the vocabulary, ascending
     ids: A = none,
@@ -1178,16 +1174,9 @@ fn exactMxfp8(s: S, w: A) !?[2]A {
 
 /// `l` (dense) as affine `bits` over groups of `gs`, the dense weight released.
 fn quantizeLin(m: *Dsv41Model, w: *Weights, l: Lin, bits: u32, gs: u32) !Lin {
-    const q = try quantizeOwn(m, l.w, bits, gs);
-    release(m, w, l.w);
-    return q;
-}
-
-/// `x` [out, in] quantized to `bits`-bit affine at group `gs`, owned by the model and evaluated.
-fn quantizeOwn(m: *Dsv41Model, x: A, bits: u32, gs: u32) !Lin {
     var qv = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(qv);
-    try mlx.check(mlx.mlx_quantize(&qv, x, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", none, m.s));
+    try mlx.check(mlx.mlx_quantize(&qv, l.w, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", none, m.s));
     var t: [3]A = undefined;
     for (&t, 0..) |*a, i| {
         var o = mlx.mlx_array_new();
@@ -1195,39 +1184,8 @@ fn quantizeOwn(m: *Dsv41Model, x: A, bits: u32, gs: u32) !Lin {
         a.* = try m.own(o);
     }
     try evalAll(&t);
+    release(m, w, l.w);
     return .{ .w = t[0], .s = t[1], .b = t[2], .qp = .{ .bits = bits, .group_size = gs } };
-}
-
-/// `MLX_SERVE_DSV41_DRAFT_HEAD4`, read at load.
-pub fn draftHead4Wanted() bool {
-    return env.on(.MLX_SERVE_DSV41_DRAFT_HEAD4);
-}
-
-pub const draft_head4_group: u32 = 64;
-
-/// The drafts' 4-bit affine head (`MLX_SERVE_DSV41_DRAFT_HEAD4`) from `head` as the pack loaded it: its dense weights,
-/// else its quantized ones dequantized (the served values, all the pack has); null where it would read no fewer bytes
-/// or an outside quant plugin holds the head.
-fn draftHead4(m: *Dsv41Model, head: Lin) !?Lin {
-    const why: ?[]const u8 = if (head.ext != null or head.w.ctx == null) "the head is an outside quant plugin's" else if (head.s.ctx != null and head.qp.bits <= 4) "the pack's head is 4-bit or narrower" else if (m.cfg.hidden_size % draft_head4_group != 0) "the hidden size is no multiple of the group" else null;
-    if (why) |r| {
-        log.warn("deepseek_v41: MLX_SERVE_DSV41_DRAFT_HEAD4 declined ({s}): the drafts read the trunk's head\n", .{r});
-        return null;
-    }
-    var src = head.w;
-    var deq = none;
-    defer if (deq.ctx != null) {
-        _ = mlx.mlx_array_free(deq);
-    };
-    if (head.s.ctx != null) {
-        try mlx.check(mlx.mlx_dequantize(&deq, head.w, head.s, head.b, mlx.mlx_optional_int.some(@intCast(head.qp.group_size)), mlx.mlx_optional_int.some(@intCast(head.qp.bits)), head.qp.mode.cstr(), none, .{ .value = .bfloat16, .has_value = true }, m.s));
-        src = deq;
-    }
-    const q = try quantizeOwn(m, src, 4, draft_head4_group);
-    if (head.s.ctx == null) {
-        log.info("deepseek_v41: DSpark draft head 4-bit affine g{d}, from the pack's dense {s} head; the trunk keeps its own\n", .{ draft_head4_group, @tagName(mlx.mlx_array_dtype(head.w)) });
-    } else log.info("deepseek_v41: DSpark draft head 4-bit affine g{d}, from the pack's {d}-bit {s} head (no dense head shipped: the requantization adds its error to the served one); the trunk keeps its own\n", .{ draft_head4_group, head.qp.bits, std.mem.span(head.qp.mode.cstr()) });
-    return q;
 }
 
 /// The token ids of a draft vocabulary file (decimal, whitespace or comma separated), ascending and unique, each under
@@ -1436,20 +1394,18 @@ fn draftLogits(sc: *Scope, m: *const Dsv41Model, ds: *const DsparkW, st: ?*const
     return sc.concat(&.{ lg, try sc.astype(try ex.head.apply(sc, x), .float32) }, -1);
 }
 
-/// The bytes a load's draft-only head adds (`MLX_SERVE_DSV41_DRAFT_HEAD4`, `MLX_SERVE_DSV41_DRAFT_VOCAB` with a
-/// request's prompt ids at `draft_prompt_max`), for the bill; 0 without DSpark stages.
+/// The bytes a load's draft-only head adds (`MLX_SERVE_DSV41_DRAFT_VOCAB` with a request's prompt ids at
+/// `draft_prompt_max`), for the bill; 0 without DSpark stages.
 pub fn draftHeadBytes(cfg: *const Config, dspark: bool, pack_dir: ?[]const u8) u64 {
     if (!dspark) return 0;
     const V: u64 = cfg.vocab_size;
     const d: u64 = cfg.hidden_size;
     const r: u64 = cfg.dsv4_dspark_markov_rank;
     const row8: u64 = d + d / 64 * 4;
-    const row4: u64 = d / 2 + d / draft_head4_group * 4;
-    const head4 = draftHead4Wanted();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = draftVocabPath(&buf, pack_dir) orelse return if (head4) V * row4 else 0;
-    const k: u64 = draftVocabCount(path) orelse return if (head4) V * row4 else 0;
-    var bytes: u64 = k * (if (head4) row4 else row8) + V * r * 2 + k * r * 2 + V * 4 + k * 4;
+    const path = draftVocabPath(&buf, pack_dir) orelse return 0;
+    const k: u64 = draftVocabCount(path) orelse return 0;
+    var bytes: u64 = k * row8 + V * r * 2 + k * r * 2 + V * 4 + k * 4;
     if (draftPromptWanted()) {
         const e: u64 = @min(draft_prompt_max, V -| k);
         bytes += e * row8 + V * r * 2 + (k + e) * (r * 2 + 4) + V * 4;
@@ -1483,11 +1439,10 @@ fn draftVocabCount(path: []const u8) ?u64 {
     return n;
 }
 
-/// The drafts' own head and tables (`DsparkW.draft`): `head4` (`MLX_SERVE_DSV41_DRAFT_HEAD4`) over the whole vocabulary,
-/// and with a vocabulary file (`MLX_SERVE_DSV41_DRAFT_VOCAB`) the rows of its ids of that head (else of the trunk's)
-/// and of the Markov tables. Null: the drafts read the trunk's head.
-fn draftHeadFor(m: *Dsv41Model, w: *Weights, head4: ?Lin, vocab_path: ?[]const u8) !?DraftHead {
-    const path = vocab_path orelse return if (head4) |h| .{ .head = h, .head4 = true } else null;
+/// The drafts' own head and tables (`DsparkW.draft`): with a vocabulary file (`MLX_SERVE_DSV41_DRAFT_VOCAB`) the rows
+/// of its ids of the trunk's head and of the Markov tables. Null: the drafts read the trunk's head.
+fn draftHeadFor(m: *Dsv41Model, vocab_path: ?[]const u8) !?DraftHead {
+    const path = vocab_path orelse return null;
     const V = m.vocab;
     const io = std.Io.Threaded.global_single_threaded.io();
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, m.gpa, .limited(64 << 20)) catch |e| {
@@ -1507,11 +1462,11 @@ fn draftHeadFor(m: *Dsv41Model, w: *Weights, head4: ?Lin, vocab_path: ?[]const u
         std.mem.sort(i32, ids_list.items, {}, std.sort.asc(i32));
     }
     const ids = ids_list.items;
-    const base = head4 orelse m.head;
+    const base = m.head;
     const why: ?[]const u8 = if (ids.len == 0 or ids.len >= V) "no ids, or every id" else if (base.ext != null or base.w.ctx == null) "the head is an outside quant plugin's" else null;
     if (why) |r| {
         log.warn("deepseek_v41: MLX_SERVE_DSV41_DRAFT_VOCAB {s} declined ({s}): the drafts score the whole vocabulary\n", .{ path, r });
-        return if (head4) |h| .{ .head = h, .head4 = true } else null;
+        return null;
     }
     const ds = &m.dspark.?;
     const k = ids.len;
@@ -1523,7 +1478,7 @@ fn draftHeadFor(m: *Dsv41Model, w: *Weights, head4: ?Lin, vocab_path: ?[]const u
     var sc = Scope.init(m.gpa, m.s);
     defer sc.deinit();
     const idx = try sc.ints(ids, &.{ci(k)});
-    var d: DraftHead = .{ .head = .{ .w = none, .qp = base.qp }, .head4 = head4 != null, .k = k };
+    var d: DraftHead = .{ .head = .{ .w = none, .qp = base.qp }, .k = k };
     d.ids = try m.own(sc.out(idx));
     d.to_draft = try m.own(sc.out(try sc.ints(to_draft, &.{ci(V)})));
     d.markov_embed = try m.own(sc.out(try rowMajor(&sc, try sc.take(ds.markov_embed, try sc.ints(perm, &.{ci(V)}), 0))));
@@ -1538,12 +1493,11 @@ fn draftHeadFor(m: *Dsv41Model, w: *Weights, head4: ?Lin, vocab_path: ?[]const u
         n_ev += 1;
     };
     try evalAll(ev[0..n_ev]);
-    if (head4) |h| for ([_]A{ h.w, h.s, h.b }) |x| release(m, w, x);
     var bytes: usize = 0;
     for ([_]A{ d.head.w, d.head.s, d.head.b }) |x| if (x.ctx != null) {
         bytes += mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x);
     };
-    log.info("deepseek_v41: DSpark draft vocabulary {d} of {d} ids ({s}): the drafts' head reads {d:.1} MB ({s}), their Markov chain {d} rows; the trunk and the verify keep the whole vocabulary\n", .{ k, V, path, @as(f64, @floatFromInt(bytes)) / 1e6, if (head4 != null) "4-bit" else if (base.s.ctx != null) "the trunk's quantized rows" else "dense", k });
+    log.info("deepseek_v41: DSpark draft vocabulary {d} of {d} ids ({s}): the drafts' head reads {d:.1} MB ({s}), their Markov chain {d} rows; the trunk and the verify keep the whole vocabulary\n", .{ k, V, path, @as(f64, @floatFromInt(bytes)) / 1e6, if (base.s.ctx != null) "the trunk's quantized rows" else "dense", k });
     return d;
 }
 
@@ -2597,7 +2551,6 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
         _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
     }
-    var draft_head4: ?Lin = null;
     if (worker) {
         m.embed = .{ .w = none };
         m.head = .{ .w = none };
@@ -2612,9 +2565,6 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
             log.info("deepseek_v41: embedding rows read from the pack at each lookup, not resident\n", .{});
         } else m.embed = try getLin(m, w, cfg.hidden_size, "embed", .{});
         m.head = if (tp_worker) .{ .w = none } else try getLin(m, w, cfg.hidden_size, "head", .{});
-        // `MLX_SERVE_DSV41_DRAFT_HEAD4`: the drafts' 4-bit head, from the pack's dense head before the trunk's
-        // requantization below releases it.
-        if (n_stages > 0 and !tp_worker and draftHead4Wanted()) draft_head4 = try draftHead4(m, m.head);
         if (m.head.ext != null) log.info("deepseek_v41: lm head on {s}, as shipped\n", .{opts.quant.?.name()}) else if (!tp_worker and m.head.s.ctx == null) {
             if (opts.head_8bit) m.head = try quantizeLin(m, w, m.head, 8, 64);
             log.info("deepseek_v41: lm head {s}\n", .{if (opts.head_8bit) "requantized to 8-bit (MLX_SERVE_DSV41_HEAD8=0 keeps it dense)" else "dense, as shipped"});
@@ -2666,7 +2616,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
             .conf = try ownDense(m, w, cfg.hidden_size + rank, "mtp.{d}.confidence_head.proj", .{last}, .float32),
         };
         var vbuf: [std.fs.max_path_bytes]u8 = undefined;
-        m.dspark.?.draft = try draftHeadFor(m, w, draft_head4, draftVocabPath(&vbuf, opts.pack_dir));
+        m.dspark.?.draft = try draftHeadFor(m, draftVocabPath(&vbuf, opts.pack_dir));
         m.n_mtp = n_stages;
         if (env.get(.DSPARK_PROFILE) != null) m.ds_prof = .{};
         m.ds_block = cfg.dsv4_dspark_block_size;
@@ -8859,7 +8809,6 @@ pub fn draftChain(sc: *Scope, ds: *const DsparkW, sub: ?DraftSet, act: mlx.mlx_d
 }
 
 var draft_vocab_logged = std.atomic.Value(bool).init(false);
-var draft_head4_logged = std.atomic.Value(bool).init(false);
 
 /// A draft's Markov-biased rows `rows` [.., k] over a vocabulary `sub` as rows over every id (-inf at an id outside
 /// it: the drafts never propose one); as they are without one.
