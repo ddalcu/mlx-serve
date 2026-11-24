@@ -2,11 +2,7 @@ constexpr int K = 1280, D = 512, IHD = 128, NT = SGS * 32, PI = 16 / SGS, RQ = S
 const uint tg = threadgroup_position_in_grid.x;
 const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
 const uint h = lane >> 4, j = lane & 15;
-#if DSV41_WQB_NAX
-threadgroup uint4 xs4[R * (K / 8)]; // the normed rows, row-major bf16, as the matrix units' operand reads them
-#else
 threadgroup ushort4 xs[R * 320]; // bf16 bits: half the bytes, so two threadgroups fit a core at R = 6
-#endif
 threadgroup float ps[R * SGS];
 threadgroup float t_s[16];
 
@@ -86,29 +82,6 @@ if (int(tg) == G - 1) {
   }
 }
 
-#if DSV41_WQB_NAX
-// The first unit's weights are in flight before the norm: a simdgroup a unit of 32 weight rows, the indexer's first.
-constexpr int NUI = NI / 32, NU = NUI + NQ / 32;
-const short qid = short(lane >> 2);
-const short fm = (qid & 4) | short((lane >> 1) & 3);
-const short f4 = (qid & 2) | short(lane & 1);
-auto unit_rows = [&](int un) {
-  const bool iu = un < NUI;
-  const int n_base = (iu ? un : un - NUI) * 32;
-  const device uint4* wb = (const device uint4*)(iu ? w_i : w_q);
-  const device uchar* sb = (const device uchar*)(iu ? s_i : s_q);
-  dsv41_nax_rows rows;
-  for (int j = 0; j < 4; ++j) {
-    const uint row = uint(n_base + fm + 8 * j);
-    rows.w[j] = wb + row * (K / 16) + f4;
-    rows.s[j] = sb + row * (K / 32) + (f4 >> 1);
-  }
-  return rows;
-};
-const int un0 = int(tg) * SGS + int(sg);
-const dsv41_nax_rows rows0 = unit_rows(un0 < NU ? un0 : 0);
-const dsv41_nax_first first0 = dsv41_nax_head(rows0);
-#endif
 
 // qr = rms(qa, q_norm) of the R rows into xs (each value a bf16 already): a thread takes 8 consecutive k of each row.
 float inv[R];
@@ -144,72 +117,13 @@ for (int v = int(tid); v < K / 8; v += NT) {
       y[2 * i] = float(T(as_type<float>(nw[i] << 16) * float(T(as_type<float>(bw[i] << 16) * inv[r]))));
       y[2 * i + 1] = float(T(as_type<float>(nw[i] & 0xFFFF0000u) * float(T(as_type<float>(bw[i] & 0xFFFF0000u) * inv[r]))));
     }
-#if DSV41_WQB_NAX
-    uint pk[4];
-    for (int i = 0; i < 4; ++i) pk[i] = uint(dsv41_wqb_bf(y[2 * i])) | (uint(dsv41_wqb_bf(y[2 * i + 1])) << 16);
-    xs4[r * (K / 8) + v] = uint4(pk[0], pk[1], pk[2], pk[3]);
-    (void)s;
-    (void)u;
-    (void)jj;
-#else
     threadgroup ushort4* xd = xs + ((r * 5 + s) * 4 + 2 * u) * 16 + jj;
     xd[0] = ushort4(dsv41_wqb_bf(y[0]), dsv41_wqb_bf(y[1]), dsv41_wqb_bf(y[2]), dsv41_wqb_bf(y[3]));
     xd[16] = ushort4(dsv41_wqb_bf(y[4]), dsv41_wqb_bf(y[5]), dsv41_wqb_bf(y[6]), dsv41_wqb_bf(y[7]));
-#endif
   }
 }
 threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 
-#if DSV41_WQB_NAX
-// The matrix-unit variant (`MLX_SERVE_DSV41_GEMV_R26_WQB`): a simdgroup a unit of 32 weight rows, the indexer's first,
-// against every row at once (`dsv41_nax_mxfp8`); a lane holds row fm's columns 4 f4 .. + 3 and 16 + 4 f4 .. + 3, so a
-// rope pair is in one lane and a 32-column fp4 block is the four lanes that share fm.
-{
-  const bool live = int(fm) < R;
-  const threadgroup uint4* xp = xs4 + (live ? int(fm) : 0) * (K / 8) + f4 * 2;
-  const float pos_r = float(pos[live ? int(fm) : 0]);
-  for (int un = un0; un < NU; un += G * SGS) {
-    const bool iu = un < NUI;
-    const int n_base = (iu ? un : un - NUI) * 32;
-    const dsv41_nax_rows rows = un == un0 ? rows0 : unit_rows(un);
-    const dsv41_nax_first first = un == un0 ? first0 : dsv41_nax_head(rows);
-    float acc[16];
-    for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
-    dsv41_nax_mxfp8<K / 64, 4, 2, 8, FOLD>(acc, rows, first, xp, live);
-    float v[8];
-    int cn[8];
-    for (int i = 0; i < 4; ++i) {
-      v[i] = float(T(acc[i]));
-      v[4 + i] = float(T(acc[8 + i]));
-      cn[i] = n_base + 4 * f4 + i;
-      cn[4 + i] = n_base + 16 + 4 * f4 + i;
-    }
-    const int hd = iu ? IHD : D;
-    const device float* per = iu ? periods_i : periods;
-    for (int q2 = 0; q2 < 8; q2 += 2) {
-      const int c = cn[q2] % hd;
-      if (c >= hd - RD) {
-        const float theta = pos_r * (1.0f / per[(c - (hd - RD)) / 2]);
-        const float cs = metal::fast::cos(theta), sn = metal::fast::sin(theta);
-        const float x1 = v[q2], x2 = v[q2 + 1];
-        v[q2] = float(T(x1 * cs - x2 * sn));
-        v[q2 + 1] = float(T(x1 * sn + x2 * cs));
-      }
-    }
-    if (iu) {
-      // The fp4 / 32 / ue8m0 round trip over the block of 32 columns.
-      float amax = 0.0f;
-      for (int i = 0; i < 8; ++i) amax = metal::max(amax, metal::abs(v[i]));
-      amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(1)));
-      amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(8)));
-      const float scale = dsv41_pow2ceil(metal::max(amax, 6.0f * 1.17549435e-38f) * (1.0f / 6.0f));
-      if (live) for (int i = 0; i < 8; ++i) q_idx[int(fm) * NI + cn[i]] = float(T(dsv41_e2m1(metal::clamp(v[i] / scale, -6.0f, 6.0f)) * scale));
-    } else if (live) {
-      for (int i = 0; i < 8; ++i) q[int(fm) * NQ + cn[i]] = T(v[i]);
-    }
-  }
-}
-#else
 // The units, indexer rows first: unit i of this threadgroup is i = tg, tg + G, ...
 if constexpr (UI > 0) {
   for (int i = int(tg); i < UI; i += G) {
@@ -285,4 +199,3 @@ if (i_q < UI + UQ) {
     if (more) wq = nx;
   }
 }
-#endif

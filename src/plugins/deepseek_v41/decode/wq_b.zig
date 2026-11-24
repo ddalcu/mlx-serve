@@ -36,22 +36,6 @@ pub fn buildRing() !mlx.mlx_fast_metal_kernel {
     return dsv41.buildKernel("dsv41_dec_wq_b_ring", &RING_INS, &RING_OUTS, SOURCE, RING_HEADER);
 }
 
-/// The matrix-unit variants (`MLX_SERVE_DSV41_GEMV_R26_WQB`), plain and ring: a simdgroup contracts 32 weight rows
-/// against every row at once (`dec_nax_header.metal`). NAX GPUs only.
-pub const NAX_HEADER = HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_nax_header.metal") ++ "#define DSV41_WQB_NAX 1\n";
-pub const RING_NAX_HEADER = NAX_HEADER ++ "#define DSV41_WQB_RING 1\n";
-
-pub fn buildNax(ring: bool) !mlx.mlx_fast_metal_kernel {
-    return if (ring) dsv41.buildKernel("dsv41_dec_wq_b_ring_nax", &RING_INS, &RING_OUTS, SOURCE, RING_NAX_HEADER) else dsv41.buildKernel("dsv41_dec_wq_b_nax", &INS, &OUTS, SOURCE, NAX_HEADER);
-}
-
-/// `MLX_SERVE_DSV41_GEMV_R26_WQB` (read each call): =1 wq_b runs on the matrix units from `nax_min_rows` rows.
-pub fn naxOn(rows: usize) bool {
-    const v = env.get(.MLX_SERVE_DSV41_GEMV_R26_WQB) orelse return false;
-    return v[0] == '1' and rows >= nax_min_rows;
-}
-pub const nax_min_rows: usize = 4;
-
 /// `MLX_SERVE_DSV41_FUSE_WQB_RING` (read each call): =1 the plain step and verify write the window ring in wq_b.
 pub fn ringOn() bool {
     return env.onUnlessZero(.MLX_SERVE_DSV41_FUSE_WQB_RING);
@@ -215,17 +199,6 @@ const wq_b_l = metal.Launch{
     .tg_bytes = 8 * decode.max_rows * 320 + 4 * (decode.max_rows * SGS + 16),
     .m1 = 512,
     .m2 = 512,
-};
-
-const wq_b_nax_l = metal.Launch{
-    .name = "dsv41_dec_wq_b_nax",
-    .inputs = &INS,
-    .outputs = &OUTS,
-    .source = SOURCE,
-    .header = NAX_HEADER,
-    .tg_bytes = wq_b_l.tg_bytes,
-    .offline = false,
-    .min_gen = 17,
 };
 
 const wq_b_ring_l = metal.Launch{
@@ -411,7 +384,7 @@ fn ringN(_: Shape) usize {
 /// latent is always K = 1280 wide. `g`: threadgroups that walk the units.
 const Wqb = struct {
     /// `ring`: the ring variant (`RING_INS`), its ring `[RING_CAP, 512]` the last input and output.
-    pub const Params = struct { g: usize, ring: bool = false, nax: bool = false };
+    pub const Params = struct { g: usize, ring: bool = false };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows < 1 or s.rows > decode.max_rows or s.n == 0 or s.n % KV != 0 or s.k % cx.IHD != 0 or p.g < s.rows + 1) return null;
@@ -680,19 +653,6 @@ pub fn register(set: *kc.Set) !void {
         .known = cx.nan_code,
         .tiles = .{ .{ .size = 4 }, .{}, .{ .size = cx.IHD, .step = cx.IHD, .min = cx.IHD } },
         .served = &.{ .{ .rows = 1, .n = 2 * KV, .k = 2 * cx.IHD }, .{ .rows = 6, .n = KV, .k = cx.IHD }, .{ .rows = 1, .n = KV, .k = 0 }, .{ .rows = 6, .n = 2 * KV, .k = 0 } },
-    });
-    try kit.add(set, Wqb, &wq_b_nax_l, .{ .g = 9, .nax = true }, .{
-        .name = "dsv41 dec wq_b on the matrix units (rms, wq_b + rope, indexer q fp4, window row fp8, attention split)",
-        .accum = .f32,
-        .depth = depthWqb,
-        .ops = cx.sinkhorn_ops,
-        .out = .bf16,
-        .outs = &.{ .{ .elem = .bf16, .count = qN }, .{ .elem = .f32, .count = idxN }, .{ .elem = .bf16, .count = kvN }, .{ .elem = .f32, .count = preN }, .{ .elem = .f32, .count = preN }, .{ .elem = .f32, .count = combN } },
-        .nan = cx.quant_nan,
-        .known = cx.nan_code,
-        .nax = true,
-        .tiles = .{ .{ .size = 4 }, .{}, .{ .size = cx.IHD, .step = cx.IHD, .min = cx.IHD } },
-        .served = &.{ .{ .rows = 2, .n = 2 * KV, .k = 2 * cx.IHD }, .{ .rows = 6, .n = KV, .k = cx.IHD }, .{ .rows = 4, .n = 2 * KV, .k = 0 } },
     });
     try kit.add(set, Wqb, &wq_b_ring_l, .{ .g = 9, .ring = true }, .{
         .name = "dsv41 dec wq_b ring (wq_b, and the window ring with the rows at their slots)",
@@ -1039,45 +999,6 @@ test "dsv41 dec wq_b: no further from f32 truth than the chain on the fixture's 
     }
 }
 
-test "dsv41 dec wq_b nax: the matrix-unit launch, rows 2..6 on the fixture's layers, no further from f32 truth than the chain; kv row and split equal; another layer's wq_b fails" {
-    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu() or !@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
-    const kn = try buildNax(false);
-    defer _ = mlx.mlx_fast_metal_kernel_free(kn);
-    for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 } }) |range| {
-        const fx = try fixture.Fixture.init(testing.allocator, .{ .lo = range[0], .hi = range[1], .experts = 2, .ctx = 0 });
-        defer fx.deinit();
-        for (range[0]..range[1]) |li| {
-            if (li == 22 or li == 23) continue;
-            const ly = fx.layer(li);
-            for (2..decode.max_rows + 1) |rows| {
-                var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
-                defer sc.deinit();
-                const qa = try randn(&sc, 41 + rows, &.{ ci(rows), K }, .bfloat16, 2);
-                const kv = try randn(&sc, 51 + rows, &.{ ci(rows), KV }, .bfloat16, 2);
-                const z = try randn(&sc, 61 + rows, &.{ ci(rows), 24 }, .float32, 1.5);
-                const pos = try scalar(&sc, @intCast(3001 + 13 * rows));
-                const want = try chain(&sc, fx.m, ly, li, qa, kv, z, pos);
-                const tr = try truth(&sc, fx.m, ly, li, qa, pos);
-                const got = (try run(&sc, fx.m, kn, ly, li, qa, kv, z, try rowsAt(&sc, 3001 + 13 * rows, rows))) orelse return error.Declined;
-                var label_buf: [64]u8 = undefined;
-                try noWorse(try std.fmt.bufPrint(&label_buf, "nax layer {d} rows {d} q", .{ li, rows }), got.q, want.q, tr.q);
-                if (ly.idx != null) {
-                    try noWorse(try std.fmt.bufPrint(&label_buf, "nax layer {d} rows {d} q_idx", .{ li, rows }), got.q_idx.?, want.q_idx.?, tr.q_idx.?);
-                } else try testing.expect(got.q_idx == null);
-                try testing.expectEqual(@as(usize, 0), try differing(got.kv_row, want.kv_row));
-                try testing.expectEqual(@as(usize, 0), try differing(got.sa.pre, want.sa.pre) + try differing(got.sa.post, want.sa.post) + try differing(got.sa.comb, want.sa.comb));
-                if (li == 20 and rows == 4) {
-                    // The planted bug: another layer's wq_b.
-                    var bad = ly.*;
-                    bad.wq_b = fx.layer(21).wq_b;
-                    const g2 = (try run(&sc, fx.m, kn, &bad, li, qa, kv, z, try rowsAt(&sc, 3001 + 13 * rows, rows))) orelse return error.Declined;
-                    try testing.expectError(error.FurtherFromTruth, noWorse("nax planted", g2.q, want.q, tr.q));
-                }
-            }
-        }
-    }
-}
-
 test "dsv41 dec wq_b: the declared launch is the wrapper's dispatch, with and without the indexer; it registers" {
     if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     var set = kc.Set.init(testing.allocator);
@@ -1283,19 +1204,3 @@ test "dsv41 dec wq_b: MLX's mxfp8 reads give the FOLD form's bytes on finite cod
     try decode.expectFoldSame(Wqb, &wq_b_l, .{ .g = 9 }, &.{ .{ .rows = 1, .n = 2 * KV, .k = 2 * cx.IHD }, .{ .rows = 6, .n = KV, .k = cx.IHD } });
 }
 
-test "dsv41 dec wq_b nax: ubench, R = 1..6, the vector kernel against the matrix units" {
-    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.virtualGpu() or !@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
-    const b = try Bench.init(49);
-    defer b.deinit();
-    const kern = try build();
-    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
-    const kn = try buildNax(false);
-    defer _ = mlx.mlx_fast_metal_kernel_free(kn);
-    for (0..4) |_| _ = try chainTime(b, kern, groups(), 1, true, false);
-    for ([_]bool{ false, true }) |with_idx| for (1..decode.max_rows + 1) |rows| {
-        const bytes: f64 = if (with_idx) 48_660_480 else 43_253_760;
-        const v = try chainTime(b, kern, groups(), rows, with_idx, false);
-        const n = try chainTime(b, kn, groups(), rows, with_idx, false);
-        std.debug.print("[dec-ubench] {s} R={d}: vector {d:.1} us ({d:.0}% of floor), matrix units {d:.1} us ({d:.0}% of floor)\n", .{ if (with_idx) "wq_b+idx" else "wq_b", rows, v, 100 * bytes / decode.stream_bytes_per_us / v, n, 100 * bytes / decode.stream_bytes_per_us / n });
-    };
-}
