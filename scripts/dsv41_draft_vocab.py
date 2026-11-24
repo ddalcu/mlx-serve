@@ -4,9 +4,9 @@ able to end on (end of sequence, <think>, </think> and the DSML tool marker).
 
     python3 -I dsv41_draft_vocab.py <tokenizer.json> <out_prefix> <ks> <train files> -- <eval files>
 
-<ks> is a comma-separated list of sizes K. For each K it writes <out_prefix>-<K>.txt (the ids ascending, one per line)
-and prints each eval file's coverage by that set against a prefix cut of K ids. It tokenizes with the pack's
-byte-level BPE (its merges and its three split regexes, \p classes approximated for Python's re).
+<ks> is a comma-separated list of sizes K. For each K it writes <out_prefix>-<K>.txt (the ids ascending, 16 per
+line, space-separated) and prints each eval file's coverage by that set against a prefix cut of K ids. It tokenizes
+with the pack's byte-level BPE (its merges and its three split regexes, \p classes approximated for Python's re).
 
 The shipped src/plugins/deepseek_v41/draft-vocab.txt is K = 65536 over about 5.3M training tokens: the CPython
 standard library, the Zig standard library, the MLX C++ sources and docs, the macOS SDK C headers and one prose set.
@@ -108,8 +108,9 @@ for k in ks:
             break
         s.add(t)
     subsets[k] = s
+    ids = sorted(s)
     with open(f"{out_prefix}-{k}.txt", "w") as f:
-        f.write("\n".join(str(t) for t in sorted(s)) + "\n")
+        f.write("".join(" ".join(str(t) for t in ids[i:i + 16]) + "\n" for i in range(0, len(ids), 16)))
 for path in evals:
     ids = list(encode(path))
     n = max(len(ids), 1)
