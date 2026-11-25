@@ -188,12 +188,13 @@ them to it. Each switch's own variable, `MLX_SERVE_DSV41_<NAME>`, stays its A/B 
 below.
 
 - `--precision lossless|lossy` (or `MLX_SERVE_DSV41_PRECISION`): lossless is the default. Another value refuses the
-  load by name. Under lossy, a sampled DSpark request takes typical acceptance at δ 0.2, ε 0.04 (Medusa's form:
+  load by name. Under lossy, a sampled DSpark request takes typical acceptance at δ 0.3, ε 0.09 (Medusa's standard pair:
   a draft is kept when p > min(ε, δ·e^-H)) unless `--mtp-typical`, `--mtp-tokenv3` or a model `mtp_acceptance`
   setting chooses its acceptance. On the 16K standard cells with the card's sampling (Mac 2, build `4daa4a3a`, 6 runs
-  an arm) it decoded 99.92 tok/s against 88.25 with exact acceptance. On HumanEval+ (Mac 1, the same build, card
-  sampling, seed 1234) it scored 160/164 base and 152/164 plus, against 161/164 and 155/164 with exact acceptance,
-  and decoded 108.26 tok/s against 96.72.
+  an arm) it decoded 96.05 tok/s (sd 4.74) against 88.25 (sd 4.35) with exact acceptance, +8.8%, at 3.002 tokens a
+  round against 2.797; prefill was unchanged. On HumanEval+ (Mac 1, the same build, card sampling, seed 1234) it
+  scored 162/164 base and 155/164 plus, against 161/164 and 155/164 with exact acceptance, and decoded 105.27 tok/s
+  against 96.72.
 - `MLX_SERVE_DSV41_STACK_<STACK>=0` turns one stack's default-on switches to their `=0` paths. A switch whose own
   variable is set keeps that value, so one switch can stay on in a stack that is off.
 - Each load logs one line: `[dsv41] settings: precision=... stacks_off=... changed=...`, where `changed` lists every
@@ -206,7 +207,7 @@ below.
 |---|---|---|---|
 | ATTN_F16 | `0` | the switch's own default | f16 attention core: under precision=lossy on without NAX, off on NAX; off under lossless |
 | PF_INT8 | `0` | `4` | A resident wide pass's trunk projections on w8a8's rotated int8 GEMM (3: wq_b, wo_b; 4: also the shared expert and wq_a+wkv) |
-| typical acceptance (the engine's DSpark rule) | exact | typical at delta 0.2, eps 0.04 (`levers.lossy_typical`), unless `--mtp-typical`, `--mtp-tokenv3` or a model `mtp_acceptance` sets it | a sampled request's drafts kept iff p > min(eps, delta e^-H) |
+| typical acceptance (the engine's DSpark rule) | exact | typical at delta 0.3, eps 0.09 (`levers.lossy_typical`), unless `--mtp-typical`, `--mtp-tokenv3` or a model `mtp_acceptance` sets it | a sampled request's drafts kept iff p > min(eps, delta e^-H) |
 <!-- /levers:lossy -->
 
 <!-- levers:stacks -->

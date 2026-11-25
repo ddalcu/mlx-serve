@@ -52,9 +52,10 @@ pub const Row = struct {
 pub const prefix = "MLX_SERVE_DSV41_";
 
 /// The DSpark typical rule a sampled request takes under `precision=lossy` when nothing else sets its acceptance:
-/// Medusa's form, a draft kept iff p > min(eps, delta e^-H) (the 16K standard cells: +13.2% decode against exact;
-/// HumanEval+ 160/164 base and 152/164 plus against exact's 161/164 and 155/164, at 108.26 against 96.72 tok/s).
-pub const lossy_typical: acceptance.Typical = .{ .delta = 0.2, .eps = 0.04 };
+/// Medusa's standard pair, a draft kept iff p > min(eps, delta e^-H) (`--mtp-typical 0.3 --mtp-typical-eps 0.09`).
+/// The 16K standard cells with card sampling: decode 96.05 tok/s against exact's 88.25 (+8.8%), 3.002 tokens a round
+/// against 2.797, prefill unchanged; HumanEval+ 162/164 base and 155/164 plus against exact's 161/164 and 155/164.
+pub const lossy_typical: acceptance.Typical = .{ .delta = 0.3, .eps = 0.09 };
 
 /// The typical pair a DeepSeek-V4.1 sampled request takes by default: `lossy_typical` under `precision=lossy`, else
 /// null (exact). An explicit `--mtp-typical`, `--mtp-tokenv3` or model `mtp_acceptance` setting wins (the engine's).
@@ -616,8 +617,8 @@ test "deepseek_v41 levers: precision lossy picks PF_INT8=4 and the site's ATTN_F
     try check();
     try testing.expectEqual(@as(u32, 4), int(.PF_INT8, u32, 0));
     try testing.expect(get(.ATTN_F16) == null);
-    try testing.expectEqual(@as(f32, 0.2), lossyTypical().?.delta);
-    try testing.expectEqual(@as(f32, 0.04), lossyTypical().?.eps);
+    try testing.expectEqual(@as(f32, 0.3), lossyTypical().?.delta);
+    try testing.expectEqual(@as(f32, 0.09), lossyTypical().?.eps);
     try testing.expect(lossyKey() != null);
     _ = env.setForeign("MLX_SERVE_DSV41_STACK_PREFILL", "0");
     refresh();
