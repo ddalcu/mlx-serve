@@ -1703,6 +1703,7 @@ What the host shows while it waits on an engine, reported as deltas from any of 
 | `eos` | `Span(u32)` |  | the engine's stop set; the host merges generation_config's |
 | `startup` | `Str` |  | one line the host logs at load (the memory plan, the cluster) |
 | `vocab_size` | `u32` | `0` | Caps.owns_tokenizer: the ids a prompt may carry |
+| `image_placeholder` | `Str` | `.{}` | The image atom a host-rendered template writes for an image; borrowed until close. Empty uses typed content parts. An engine that expands images itself declares `Caps.images`, announces its atom here and serves the host's tokenizer (`tokenize` and `token_bytes`); it needs no `media_rows`. |
 
 ### `Sampling` (extern struct)
 

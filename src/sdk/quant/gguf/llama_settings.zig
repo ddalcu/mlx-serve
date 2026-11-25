@@ -7,6 +7,7 @@ pub const Settings = struct {
     /// Sequences per model: requests decoded together in one batch, each
     /// keeping its own prompt KV for prefix reuse.
     seqs: u32 = 4,
+    vision: bool = true,
     kv_quant: LlamaKvQuant = .off,
     /// Physical prefill batch; 0 = libllama's default.
     ubatch: u32 = 0,

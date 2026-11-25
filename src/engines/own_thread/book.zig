@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const abi = @import("../../abi/engine.zig");
+const media_owned = @import("../../sdk/media/engine_media.zig");
 
 /// The adapters' Io: the C ABI hands an engine none, and mutexes, conditions and clocks need no more than this.
 pub const io = std.Io.Threaded.global_single_threaded.io();
@@ -19,6 +20,12 @@ pub const Req = struct {
     id: u64,
     sink: abi.Sink,
     prompt: []u32,
+    /// An engine may expand image placeholders after submit.
+    prompt_tokens: ?u32 = null,
+    cache: abi.CacheHint = .{},
+    no_drafts: bool = false,
+    /// The prompt's images (`Caps.images`), pixels copied with them.
+    media: []abi.Media = &.{},
     eos: []u32,
     bias: []abi.Bias,
     sampling: abi.Sampling, // `logit_bias` points into `bias`
@@ -49,7 +56,8 @@ pub const Req = struct {
     pub fn prefilled(r: *Req, cached: u32) ?Reason {
         if (r.isCancelled()) return .cancelled;
         r.stats.prefill_ns = nowNs() - r.t0;
-        const ev: abi.Event = .{ .kind = .prefilled, .cached = @min(cached, @as(u32, @intCast(r.prompt.len))) };
+        const n = r.prompt_tokens orelse @as(u32, @intCast(r.prompt.len));
+        const ev: abi.Event = .{ .kind = .prefilled, .cached = @min(cached, n), .prompt_tokens = n };
         if (r.sink.event(r.sink.ctx, r.id, &ev) == .stop) return .stop;
         return if (r.max_tokens == 0) .length else null;
     }
@@ -150,12 +158,17 @@ pub const Book = struct {
         const eos = try b.gpa.dupe(u32, abi.items(u32, r.eos));
         errdefer b.gpa.free(eos);
         const bias = try b.gpa.dupe(abi.Bias, abi.items(abi.Bias, r.sampling.logit_bias));
+        errdefer b.gpa.free(bias);
+        const media = try media_owned.dupe(b.gpa, abi.items(abi.Media, r.media));
         var sampling = r.sampling;
         sampling.logit_bias = abi.span(abi.Bias, bias);
         req.* = .{
             .id = id,
             .sink = sink,
             .prompt = prompt,
+            .cache = r.cache,
+            .no_drafts = r.no_drafts,
+            .media = media,
             .eos = eos,
             .bias = bias,
             .sampling = sampling,
@@ -167,6 +180,7 @@ pub const Book = struct {
     }
 
     fn free(b: *Book, r: *Req) void {
+        media_owned.deinit(b.gpa, r.media);
         b.gpa.free(r.prompt);
         b.gpa.free(r.eos);
         b.gpa.free(r.bias);
@@ -212,7 +226,7 @@ pub const Book = struct {
         r.finish(reason, why);
         b.mu.lockUncancelable(io);
         defer b.mu.unlock(io);
-        if (r.stats.prefill_ns > 0) b.prefill_tps = tps(r.prompt.len, r.stats.prefill_ns);
+        if (r.stats.prefill_ns > 0) b.prefill_tps = tps(r.prompt_tokens orelse r.prompt.len, r.stats.prefill_ns);
         if (r.stats.decode_ns > 0 and r.emitted > 0) b.decode_tps = tps(r.emitted, r.stats.decode_ns);
         if (std.mem.indexOfScalar(*Req, b.reqs.items, r)) |i| _ = b.reqs.orderedRemove(i);
         b.free(r);

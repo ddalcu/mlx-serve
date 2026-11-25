@@ -38,9 +38,11 @@ pub fn draw(session: anytype, d: Draw) i32 {
 
 /// Commits the drawn `first` and the drafts ds4 accepts after it, at most `remaining` tokens, advancing the
 /// session's KV itself (no separate eval). The committed ids, `first` first, in `out`.
-pub fn speculate(engine: anytype, session: anytype, first: i32, d: Draw, remaining: u32, out: *[max_round_tokens]i32) ![]const i32 {
+pub fn speculate(engine: anytype, session: anytype, first: i32, d: Draw, remaining: u32, ignore_eos: bool, out: *[max_round_tokens]i32) ![]const i32 {
     const cap: i32 = @intCast(@max(@as(u32, 1), @min(remaining, std.math.maxInt(i32))));
-    const n = if (d.temperature <= 0.0)
+    const n = if (ignore_eos and d.temperature <= 0.0)
+        try session.evalSpeculativeIgnoringEos(first, cap, engine.eosToken(), out[0..])
+    else if (d.temperature <= 0.0)
         try session.evalSpeculative(first, cap, engine.eosToken(), out[0..])
     else
         try session.evalSpeculativeSampled(first, cap, engine.eosToken(), d.temperature, d.topK(), d.top_p, d.min_p, d.rng, out[0..]);
