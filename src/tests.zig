@@ -270,6 +270,7 @@ test {
     _ = @import("plugins/deepseek_v41/prompt/ced_lazy_test.zig");
     _ = @import("plugins/deepseek_v41/prompt/wide_test.zig");
     _ = @import("plugins/deepseek_v41/prompt/trunk_q_test.zig");
+    _ = @import("plugins/deepseek_v41/prompt/pf_int8_plan_test.zig");
     _ = @import("plugins/deepseek_v41/fuse.zig");
     _ = @import("plugins/qwen4_exp/qwen4_exp.zig");
     _ = @import("plugins/qwen4_exp/ple_gpu.zig");

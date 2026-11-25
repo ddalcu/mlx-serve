@@ -235,7 +235,6 @@ test "dsv41 pf int8=3 (not lossless): wq_b's and wo_b's shapes (level 4: the sha
     // level 4's: wq_a+wkv 5120 -> 1792, the shared gate+up 5120 -> 4608 (a quarter here) and down 2304 -> 5120 (a quarter)
     const shapes = [_]struct { name: []const u8, k: c_int, n: c_int }{ .{ .name = "wq_b", .k = 1280, .n = 8192 }, .{ .name = "wo_b", .k = 8192, .n = 1024 }, .{ .name = "wq_a+wkv", .k = 5120, .n = 1792 }, .{ .name = "shared gate+up", .k = 5120, .n = 1152 }, .{ .name = "shared down", .k = 2304, .n = 1280 } };
     for (shapes, 0..) |shp, si| for ([_]c_int{ 1024, 1500 }) |rows| {
-        defer pfint8.trunkForget();
         var sc = Scope.init(a, gs);
         defer sc.deinit();
         var cs = Scope.init(a, cpu);
@@ -249,28 +248,30 @@ test "dsv41 pf int8=3 (not lossless): wq_b's and wo_b's shapes (level 4: the sha
         const wsub = try sc.take(wd, cols, 0);
         try dsv41.evalAll(&.{wsub});
         const t = try cs.matmul(try onCpu(&sc, &cs, x, try sc.arange(0, @intCast(shp.k))), try cs.t2(try cs.astype(wsub, .float64)));
+        var wt = (try pfint8.weightOf(&sc, &l)) orelse return error.TestDeclined;
+        defer wt.deinit();
         pfint8.trunk_plant = false;
-        const y = (try pfint8.trunkMatmul(&sc, &l, x, .bfloat16, shp.name)) orelse return error.TestDeclined;
+        const y = (try pfint8.apply(&sc, 4, &wt, x, .bfloat16, shp.name)) orelse return error.TestDeclined;
         const e = try errOf(&cs, try onCpu(&sc, &cs, y, cols), t);
         var qo = mlx.mlx_array_new();
         const ye = try sc.res(mlx.mlx_quantized_matmul(&qo, x, l.w, l.s, .{ .ctx = null }, true, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", gs), &qo);
         const ee = try errOf(&cs, try onCpu(&sc, &cs, ye, cols), t);
         pfint8.trunk_plant = true;
-        const yp = (try pfint8.trunkMatmul(&sc, &l, x, .bfloat16, shp.name)) orelse return error.TestDeclined;
+        const yp = (try pfint8.apply(&sc, 4, &wt, x, .bfloat16, shp.name)) orelse return error.TestDeclined;
         pfint8.trunk_plant = false;
         const ep = try errOf(&cs, try onCpu(&sc, &cs, yp, cols), t);
         std.debug.print("[trunk-i8] {s} rows {d} (K {d}, {d} of {d} columns): float64 l2 / max, int8 {d:.5} / {d:.5}, exact mxfp8 path {d:.5} / {d:.5}; planted (a row late) {d:.4}\n", .{ shp.name, rows, shp.k, (N + 15) / 16, N, e.l2, e.max, ee.l2, ee.max, ep.l2 });
         try std.testing.expect(e.l2 < 0.03 and e.l2 > ee.l2);
         try std.testing.expect(ep.l2 > 0.3);
         // declines: a narrow call, an f32 input, a linear with no mxfp8 scales
-        try std.testing.expect((try pfint8.trunkMatmul(&sc, &l, try sc.slice(x, 0, 0, pfint8.TRUNK_ROWS - 1), .bfloat16, shp.name)) == null);
-        try std.testing.expect((try pfint8.trunkMatmul(&sc, &l, try sc.astype(x, .float32), .bfloat16, shp.name)) == null);
+        try std.testing.expect((try pfint8.apply(&sc, 4, &wt, try sc.slice(x, 0, 0, pfint8.TRUNK_ROWS - 1), .bfloat16, shp.name)) == null);
+        try std.testing.expect((try pfint8.apply(&sc, 4, &wt, try sc.astype(x, .float32), .bfloat16, shp.name)) == null);
         const plain = dsv41.Lin{ .w = try l.dense(&sc, .bfloat16) };
-        try std.testing.expect((try pfint8.trunkMatmul(&sc, &plain, x, .bfloat16, shp.name)) == null);
+        try std.testing.expect((try pfint8.weightOf(&sc, &plain)) == null);
     };
 }
 
-test "dsv41 pf int8 bill: levels 3 and 4 add their int8 inputs and bf16 outputs a row to a wide pass's working set (DeepSeek-V4.1's shapes: 85,256 and 120,852 bytes a row), none at level 0 or for a call no wider than a span" {
+test "dsv41 pf int8 bill: levels 3 and 4 add their int8 inputs and bf16 outputs a row to a wide pass's working set (DeepSeek-V4.1's shapes: 85,256 and 120,852 bytes a row) where the plan serves (NAX), none at level 0, without NAX or for a call no wider than a span" {
     const C = struct {
         hidden_size: u32 = 5120,
         dsv4_q_lora_rank: u32 = 1280,
@@ -290,12 +291,14 @@ test "dsv41 pf int8 bill: levels 3 and 4 add their int8 inputs and bf16 outputs 
     {
         const pin = env.override(.MLX_SERVE_DSV41_PF_INT8, "3");
         defer pin.restore();
-        try std.testing.expectEqual(rows * 85_256, pfint8.transientBytes(&c, rows, 2048));
+        // Without NAX the plan is inert and reserves nothing.
+        const nax = @import("../../../mlx/device.zig").naxAvailable();
+        try std.testing.expectEqual(if (nax) rows * 85_256 else 0, pfint8.transientBytes(&c, rows, 2048));
         try std.testing.expectEqual(@as(u64, 0), pfint8.transientBytes(&c, 2048, 2048));
     }
     {
         const pin = env.override(.MLX_SERVE_DSV41_PF_INT8, "4");
         defer pin.restore();
-        try std.testing.expectEqual(rows * 120_852, pfint8.transientBytes(&c, rows, 2048));
+        try std.testing.expectEqual(if (@import("../../../mlx/device.zig").naxAvailable()) rows * 120_852 else 0, pfint8.transientBytes(&c, rows, 2048));
     }
 }
