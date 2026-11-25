@@ -2852,7 +2852,7 @@ pub fn prefillBytes(config: anytype, kv_per_token: u64, seq: u64, chunk: u64, fl
     // (`passPlanned`) one call takes the chunk's every row.
     const moe_rows: u64 = if (passPlanned(config)) c else @min(c, MOE_ROWS);
     const moe_bytes = moe_rows * config.num_experts_per_tok * (3 * config.moe_intermediate_size + d) * 2;
-    return (state + held + attn + idx_bytes + moe_bytes + wideEarlyBytes(config, c) + woaJoinBytes(config, c) + idxPassBytes(config, c) + floor) * 5 / 4;
+    return (state + held + attn + idx_bytes + moe_bytes + wideEarlyBytes(config, c) + woaJoinBytes(config, c) + idxPassBytes(config, c) + pfint8.transientBytes(config, c, SPAN) + floor) * 5 / 4;
 }
 /// MLX_SERVE_DSV41_PF_IDX_PASS: an index layer's queries over the whole call (`wq_b`'s bf16 rows, the roped f32 queries
 /// and their fp4 round trip's f32 copy) and its bf16 head weights, held through the layer's span loop; 0 off or for a

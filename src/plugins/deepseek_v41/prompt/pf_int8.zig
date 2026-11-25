@@ -45,6 +45,27 @@ pub fn residentBytes(c: anytype) u64 {
 /// The fewest rows a level-3 call takes: a wide pass's (the replay's 128 rows and decode stay on the mxfp8 weight).
 pub const TRUNK_ROWS: usize = 1024;
 
+/// The level's per-row working set in a wide pass of `rows` rows (0 off, or for a call no wider than `span`): each
+/// linear it takes adds its int8 input (K bytes a row, an f32 scale) and its bf16 output (2 N bytes a row) beside the
+/// exact path's arrays, which the pass's reserve does not hold (measured at 1M: +7.57 GB of MLX peak against the 2.57 GB
+/// of resident weights, at 38,656-row passes). Level 3: wq_b and wo_b; level 4 also wq_a+wkv and the shared expert.
+pub fn transientBytes(c: anytype, rows: u64, span: u64) u64 {
+    const lv = level();
+    if ((lv != 3 and lv != 4) or rows <= span) return 0;
+    const h: u64 = c.hidden_size;
+    const ql: u64 = c.dsv4_q_lora_rank;
+    const qn: u64 = @as(u64, c.num_attention_heads) * c.head_dim;
+    const on: u64 = @as(u64, c.dsv4_o_groups) * c.dsv4_o_lora_rank;
+    // (K, N) of each linear the level takes
+    var per_row: u64 = (ql + 4 + 2 * qn) + (on + 4 + 2 * h);
+    if (lv == 4) {
+        const si: u64 = c.moe_intermediate_size;
+        const qk: u64 = ql + c.head_dim;
+        per_row += (h + 4 + 2 * qk) + (h + 4 + 2 * 2 * si) + (si + 4 + 2 * h);
+    }
+    return rows * per_row;
+}
+
 /// Whether level 3 or 4 serves this model: resident, one GPU with NAX.
 pub fn trunkOn(m: *const dsv41.Dsv41Model) bool {
     return (level() == 3 or level() == 4) and m.streamed == null and m.tp == null and device.naxAvailable() and mlx.streamIsGpu(m.s);

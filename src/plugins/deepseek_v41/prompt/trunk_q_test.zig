@@ -269,3 +269,33 @@ test "dsv41 pf int8=3 (not lossless): wq_b's and wo_b's shapes (level 4: the sha
         try std.testing.expect((try pfint8.trunkMatmul(&sc, &plain, x, .bfloat16, shp.name)) == null);
     };
 }
+
+test "dsv41 pf int8 bill: levels 3 and 4 add their int8 inputs and bf16 outputs a row to a wide pass's working set (DeepSeek-V4.1's shapes: 85,256 and 120,852 bytes a row), none at level 0 or for a call no wider than a span" {
+    const C = struct {
+        hidden_size: u32 = 5120,
+        dsv4_q_lora_rank: u32 = 1280,
+        num_attention_heads: u32 = 64,
+        head_dim: u32 = 512,
+        dsv4_o_groups: u32 = 8,
+        dsv4_o_lora_rank: u32 = 1024,
+        moe_intermediate_size: u32 = 2304,
+    };
+    const c = C{};
+    const rows: u64 = 38656;
+    {
+        const pin = env.override(.MLX_SERVE_DSV41_PF_INT8, "0");
+        defer pin.restore();
+        try std.testing.expectEqual(@as(u64, 0), pfint8.transientBytes(&c, rows, 2048));
+    }
+    {
+        const pin = env.override(.MLX_SERVE_DSV41_PF_INT8, "3");
+        defer pin.restore();
+        try std.testing.expectEqual(rows * 85_256, pfint8.transientBytes(&c, rows, 2048));
+        try std.testing.expectEqual(@as(u64, 0), pfint8.transientBytes(&c, 2048, 2048));
+    }
+    {
+        const pin = env.override(.MLX_SERVE_DSV41_PF_INT8, "4");
+        defer pin.restore();
+        try std.testing.expectEqual(rows * 120_852, pfint8.transientBytes(&c, rows, 2048));
+    }
+}
