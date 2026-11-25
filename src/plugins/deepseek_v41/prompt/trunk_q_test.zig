@@ -327,7 +327,7 @@ test "dsv41 pf int8 bill: precision lossy bills level 4 with no model and no PF_
     }
     lev.refresh();
     // Without NAX the plan is inert and reserves nothing.
-    const nax = @import("../../../mlx/device.zig").naxAvailable();
+    const nax = world.nax();
     try std.testing.expectEqual(if (nax) rows * 120_852 else 0, pfint8.transientBytes(&c, rows, 2048));
     {
         const pin = env.override(.MLX_SERVE_DSV41_PF_INT8, "3");
