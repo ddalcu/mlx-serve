@@ -1,0 +1,70 @@
+[
+ {
+  "label": "ggml.h (llama.cpp's ggml, mlx-serve's lib/llama)",
+  "lang": "c",
+  "root": "/Users/davidtai/src/mlx-serve/lib/llama/include/ggml.h"
+ },
+ {
+  "label": "MLX mlx/ops.cpp",
+  "lang": "cpp",
+  "root": "/Users/davidtai/src/mlx-serve/lib/mlx-src/mlx/ops.cpp"
+ },
+ {
+  "label": "MLX mlx/backend/metal/matmul.cpp",
+  "lang": "cpp",
+  "root": "/Users/davidtai/src/mlx-serve/lib/mlx-src/mlx/backend/metal/matmul.cpp"
+ },
+ {
+  "label": "MLX Metal kernels/steel/gemm headers",
+  "lang": "metal",
+  "root": "/Users/davidtai/src/mlx-serve/lib/mlx-src/mlx/backend/metal/kernels/steel/gemm",
+  "ext": [".h", ".metal"]
+ },
+ {
+  "label": "MLX Metal kernels/quantized.h",
+  "lang": "metal",
+  "root": "/Users/davidtai/src/mlx-serve/lib/mlx-src/mlx/backend/metal/kernels/quantized.h"
+ },
+ {
+  "label": "Zig 0.17 std hash_map.zig (mlx-serve's pinned toolchain)",
+  "lang": "zig",
+  "root": "/Users/davidtai/src/mlx-serve/.zig-toolchain/lib/std/hash_map.zig"
+ },
+ {
+  "label": "Zig 0.17 std json/ (mlx-serve's pinned toolchain)",
+  "lang": "zig",
+  "root": "/Users/davidtai/src/mlx-serve/.zig-toolchain/lib/std/json",
+  "ext": [".zig"],
+  "skip": ["_test.zig", "test.zig"]
+ },
+ {
+  "label": "stb_image.h (mlx-serve's lib)",
+  "lang": "c",
+  "root": "/Users/davidtai/src/mlx-serve/lib/stb_image.h"
+ },
+ {
+  "label": "ds4 ds4_metal.m (Objective-C, mlx-serve's lib/ds4)",
+  "lang": "objc",
+  "root": "/Users/davidtai/src/mlx-serve/lib/ds4/ds4_metal.m"
+ },
+ {
+  "label": "Python mlx.nn layers/ (MLX's python package, not CPython)",
+  "lang": "python",
+  "root": "/Users/davidtai/src/mlx-serve/lib/mlx-src/python/mlx/nn/layers",
+  "ext": [".py"]
+ },
+ {
+  "label": "Swift mlx-serve app Sources/MLXServe",
+  "lang": "swift",
+  "root": "/Users/davidtai/src/mlx-serve/app/Sources/MLXServe",
+  "ext": [".swift"],
+  "recursive": true
+ },
+ {
+  "label": "TypeScript/Svelte mlx-serve web console app-web/src",
+  "lang": "typescript",
+  "root": "/Users/davidtai/src/mlx-serve/app-web/src",
+  "ext": [".ts", ".svelte"],
+  "recursive": true
+ }
+]

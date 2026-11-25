@@ -96,6 +96,8 @@ const pfroute = @import("prompt/pf_route.zig");
 const idx_nax = @import("prompt/idx_nax.zig");
 /// fp4_gemm.zig: a prompt call's fp4 routed experts on the staged NAX gather (`MLX_SERVE_DSV41_PF_FP4_GEMM`).
 const fp4gemm = @import("prompt/fp4_gemm.zig");
+/// pf_int8.zig: a wide pass's trunk projections on int8 tensor ops (`MLX_SERVE_DSV41_PF_INT8`, not lossless).
+const pfint8 = @import("prompt/pf_int8.zig");
 /// launch fusions, each behind its own default-off switch (`Dsv41Model.fuse`).
 const fusion = @import("fuse.zig");
 /// Directional ablation (ablation.zig): every write to the residual stream loses the direction of the pass's state.
@@ -2676,6 +2678,8 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         if (b.w.ctx != null) log.info("deepseek_v41: routed experts {t} bits={d} group={d}, per-expert scales gate={} up={} down={}\n", .{ b.qp.mode, b.qp.bits, b.qp.group_size, ex.scale[0] != null, ex.scale[1] != null, ex.scale[2] != null });
     }
     m.view.report();
+    // MLX_SERVE_DSV41_PF_INT8: the wide layers' int8 trunk weights now, not inside a prompt
+    try pfint8.trunkLoad(gpa, m, cedSplit(&m.cfg) orelse m.n_layers);
     return m;
 }
 
@@ -4556,12 +4560,14 @@ pub fn qkvProjWith(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, x: 
 pub fn qkvRows(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !Proj {
     const c = &m.cfg;
     const qa, const kv = if (ly.q_kv) |*f| blk: {
-        const y = try f.apply(sc, x);
+        const y = (try pfint8.trunk4(sc, m, f, x, "wq_a+wkv")) orelse try f.apply(sc, x);
         const n = dim(y, -1);
         break :blk .{ try sc.slice(y, -1, 0, n - c.head_dim), try sc.slice(y, -1, n - c.head_dim, n) };
     } else .{ try ly.wq_a.apply(sc, x), try ly.wkv.apply(sc, x) };
     const qr = (try rmsRows(sc, qa, ly.q_norm, c.rms_norm_eps)) orelse try sc.rms(qa, ly.q_norm, c.rms_norm_eps);
-    const qb = try ly.wq_b.apply(sc, qr);
+    try trunkDump(sc, "qkv_in", x);
+    try trunkDump(sc, "wq_b_in", qr);
+    const qb = (try pfint8.trunk(sc, m, &ly.wq_b, qr, "wq_b")) orelse try ly.wq_b.apply(sc, qr);
     return .{ .q = try sc.reshape(qb, &.{ ci(dim(x, 0)), -1, ci(c.head_dim) }), .kv = kv, .qr = qr };
 }
 
@@ -5713,6 +5719,41 @@ fn dumpRoute(sc: *Scope, path: [*:0]const u8, L: usize, k: usize, E: usize, sidx
     _ = std.c.fwrite(@ptrCast(dr), 4, n, f);
 }
 
+/// `DSV41_TRUNK_DUMP` (diag): the wide prompt layer whose trunk inputs are written, set by `wideLayer`.
+var trunk_dump_li: ?usize = null;
+/// The layers `DSV41_TRUNK_DUMP` writes: an early, a middle and a late encoder layer.
+pub const trunk_dump_layers = [_]usize{ 3, 10, 17 };
+
+/// `DSV41_TRUNK_DUMP` (diag): input `x` `[L, K]` of trunk projection `name` in wide layer `trunk_dump_li` (a pass of
+/// 4,096 rows or more), every `stride`-th row (at most 1,024 rows), written raw to `<dir>/L<layer>_<name>.bin`: u32 rows, u32 columns, then the
+/// rows' bf16 words. The PF_INT8=3 quality test reads them.
+fn trunkDump(sc: *Scope, name: []const u8, x: A) !void {
+    const li = trunk_dump_li orelse return;
+    const dir = env.get(.DSV41_TRUNK_DUMP) orelse return;
+    if (mlx.mlx_array_ndim(x) != 2 or dim(x, 0) < 4096) return;
+    const L = dim(x, 0);
+    const K = dim(x, 1);
+    const stride = (L + 1023) / 1024;
+    var v = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v);
+    try mlx.check(mlx.mlx_slice(&v, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(L), ci(K) }, 2, &[_]c_int{ ci(stride), 1 }, 2, sc.s));
+    const xb = try sc.astype(v, .bfloat16);
+    var cb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cb);
+    try mlx.check(mlx.mlx_contiguous(&cb, xb, false, sc.s));
+    try mlx.check(mlx.mlx_array_eval(cb));
+    const n = dim(cb, 0);
+    const d = mlx.mlx_array_data_bfloat16(cb) orelse return;
+    var buf: [1024]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&buf, "{s}/L{d}_{s}.bin", .{ std.mem.sliceTo(dir, 0), li, name }, 0);
+    const f = std.c.fopen(path.ptr, "wb") orelse return;
+    defer _ = std.c.fclose(f);
+    const hdr = [2]u32{ @intCast(n), @intCast(K) };
+    _ = std.c.fwrite(@ptrCast(&hdr), 4, 2, f);
+    _ = std.c.fwrite(@ptrCast(d), 2, n * K, f);
+    log.info("[dsv41] DSV41_TRUNK_DUMP: layer {d} {s} {d} of {d} rows x {d}\n", .{ li, name, n, L, K });
+}
+
 pub const Routes = struct { idx: A, wts: A };
 /// `MLX_SERVE_DSV41_PF_ROUTER_BF16`'s sum at `rows` x `e` experts x `k`: only where today's chain runs MLX's regular
 /// kernel (`gate_gemm.router`, one running sum over K), the single sum: today's words. Where MLX splits K (fewer rows,
@@ -5818,12 +5859,14 @@ pub fn withShared(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, y: A
 pub fn shared(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !A {
     // A prompt's rows take the routed experts' activation kernel (weight 1): one pass, not the f32 op chain's five.
     if (ly.shared_gu) |*gu| if (dim(x, 0) > region_rows and mlx.streamIsGpu(sc.s)) {
-        const y = try gu.apply(sc, x);
+        const y = (try pfint8.trunk4(sc, m, gu, x, "shared gate+up")) orelse try gu.apply(sc, x);
         const L = dim(y, 0);
         const n = dim(y, -1) / 2;
         const lim = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.dsv4_swiglu_limit}, &[_]c_int{1}, 1, .float32));
         const act = try flatKernel(sc, m.moe_act_kernel, &.{ y, try sc.ones(&.{ci(L)}, .float32), lim }, &.{ ci(L), ci(n) }, m.act, L * n, &.{.{ .name = "N", .v = ci(n) }});
-        return ly.shared[2].apply(sc, act);
+        try trunkDump(sc, "shared_in", x);
+        try trunkDump(sc, "shared_down_in", act);
+        return (try pfint8.trunk4(sc, m, &ly.shared[2], act, "shared down")) orelse ly.shared[2].apply(sc, act);
     };
     // An outside plugin's shared expert in one dispatch where it takes the call.
     if (ly.shared_gu == null) if (ly.shared[0].ext) |*w1| if (ly.shared[1].ext) |*w3| if (ly.shared[2].ext) |*w2| if (try outside.denseSwiglu(w1, w3, w2, x, @intFromFloat(m.cfg.dsv4_swiglu_limit), sc.s)) |fy| {
@@ -7239,6 +7282,8 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     defer sat.layerEnd();
     const n_spans = sp.xs.len;
     const ly = &m.layers[li];
+    trunk_dump_li = if (env.get(.DSV41_TRUNK_DUMP) != null and std.mem.indexOfScalar(usize, &trunk_dump_layers, li) != null) li else null;
+    defer trunk_dump_li = null;
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
     const parts = try gpa.alloc(A, n_spans);
@@ -7400,7 +7445,9 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         }
     }
     const joined = try sc.concat(heads[0..n_heads], 0);
-    const y = try abl.ablate(&sc, m, if (m.tp != null) joined else try ly.wo_b.apply(&sc, if (woa_join) try sc.reshape(joined, &.{ ci(sp.L), -1 }) else joined));
+    const wo_in = if (woa_join) try sc.reshape(joined, &.{ ci(sp.L), -1 }) else joined;
+    if (m.tp == null) try trunkDump(&sc, "wo_b_in", wo_in);
+    const y = try abl.ablate(&sc, m, if (m.tp != null) joined else (try pfint8.trunk(&sc, m, &ly.wo_b, wo_in, "wo_b")) orelse try ly.wo_b.apply(&sc, wo_in));
     // scratch_x1.zig: the streams after the attention into the prompt's x1 region (a streamed bank runs one MoE
     // group, so that group's output is the region's last reader's). Not under an ablation: the FFN's output is then
     // ablated against x1 after the call that would end the region's reads.
