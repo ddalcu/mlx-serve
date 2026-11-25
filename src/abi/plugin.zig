@@ -618,6 +618,11 @@ pub const Forward = extern struct {
     /// leaves the state past what the request commits, which the prefix cache cannot restore. Read it only when
     /// `size` reaches it.
     stop_ids: Span(u32) = .{},
+    /// A native drafter's round (`NativeDrafter.step`, `verify`): the host settles the slot's caches after the round
+    /// (`NativeDrafter`'s rows rule), so a verify may leave its rejected rows behind. Read it only when `size` reaches
+    /// it: a host whose `Forward` ends before it does not settle, and a model that appends every verified row must
+    /// not draft there.
+    settles_round: bool = false,
 };
 
 /// Directional ablation (Arditi et al. 2024): slot i's forward removes `strengths[i]` times the component along its
@@ -915,6 +920,12 @@ pub const HeadHooks = extern struct {
 };
 
 /// A drafter the model carries in its own forward (DSpark); stages and block are `SpecFacts`.
+/// The rows rule, on the engine's caches (`Forward.caches`): a round that starts at `p0` and commits `n` tokens (`step`:
+/// `out.round.n`; `finish`: `1 + accepted`) reports `position == p0 + n`. Every cache layer that held `p0` rows when the
+/// round began must hold at least that many after it; the host then drops the rows past it (a verify's rejected
+/// drafts) and moves its position to it. A model may append every verified row or only the kept ones, never fewer.
+/// It rewinds only its own state (recurrent state, histories, the drafter's source row). A round that breaks the rule
+/// fails the request.
 pub const NativeDrafter = extern struct {
     size: u32 = @sizeOf(NativeDrafter),
     /// One greedy round on the model's own state: `f.tokens` is the committed token `t1` (not yet in the state, which

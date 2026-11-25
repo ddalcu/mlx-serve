@@ -786,8 +786,13 @@ test "plugin forward: an ablated request hands every forward and draft round its
             note(f);
             return llama.table.forward(m, f, out);
         }
-        fn step(_: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+        fn step(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
             note(f);
+            // `t1` alone, forwarded on the slot's cache: the round commits the one row it appended.
+            var o: abi.ForwardOut = .{};
+            const v = llama.table.forward(m, f, &o);
+            if (o.logits.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = o.logits.ctx });
+            if (!v.isOk()) return v;
             out.round = .{ .n = 1, .rows = 1, .position = f.positions.slice()[0] + 1 };
             out.round.tokens[0] = f.tokens.slice()[0];
             return .ok;

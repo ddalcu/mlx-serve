@@ -1470,6 +1470,7 @@ pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32, stop_
         .suppress_mask = .{ .ctx = if (xfm.suppress_mask) |m| m.ctx else null },
         .ablation = try ablated.init(&.{ctx}),
         .stop_ids = .of(stop_ids),
+        .settles_round = true,
     };
     var out: abi.ForwardOut = .{};
     intree.enter(ctx);
@@ -1480,10 +1481,35 @@ pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32, stop_
         return error.PluginForwardFailed;
     }
     if (out.round.n == 0 or out.round.n > abi.max_round_tokens) return error.PluginForwardFailed;
-    ctx.cache.step = @intCast(out.round.position);
-    // A recurrent model's next forward is positioned from it (`Positions`): the round's rows ran inside the plugin.
-    ctx.moe_seq_offset.* = @intCast(out.round.position);
+    try settleNativeRound(xfm, ctx, pos[0], out.round.n, out.round.position);
     return out.round;
+}
+
+/// The one owner of a slot's caches and position after a native round (`NativeDrafter`'s rows rule): the round
+/// started at `p0` and committed `committed` tokens, so the model stands at `p0 + committed`. Every layer that holds at
+/// least `p0` rows (the layers the round could append to; one that reads another layer's KV, or was never written,
+/// holds fewer) must hold at least that many; the rows past it, a verify's rejected drafts, leave the cache. Then
+/// `cache.step` and `moe_seq_offset` (a recurrent model's next forward is positioned from it) move to it. A round that
+/// breaks the rule fails the request: a cache that disagrees with its position reads the wrong history.
+fn settleNativeRound(xfm: *Transformer, ctx: *ForwardCtx, p0: u64, committed: u64, position: u64) !void {
+    const name = xfm.plugin.?.table.name.slice();
+    if (position != p0 + committed) {
+        log.err("[plugin] {s}: draft round reported position {d}, not {d} + {d} committed\n", .{ name, position, p0, committed });
+        return error.PluginForwardFailed;
+    }
+    var over = false;
+    for (ctx.cache.entries) |*e| {
+        if (!e.initialized or e.offset < p0) continue;
+        if (e.offset < position) {
+            log.err("[plugin] {s}: draft round left a layer at {d} rows, short of position {d}\n", .{ name, e.offset, position });
+            return error.PluginForwardFailed;
+        }
+        if (e.offset > position) over = true;
+    }
+    // A failure inside the truncate fails the request, whose commit then files nothing.
+    if (over) try ctx.cache.truncate(@intCast(position), xfm.s);
+    ctx.cache.step = @intCast(position);
+    ctx.moe_seq_offset.* = @intCast(position);
 }
 
 /// Whether the served drafter lets the engine accept a block itself (`NativeDrafter.verify` and `finish`): a sampled request.
@@ -1507,6 +1533,7 @@ pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32, stop
     defer ablated.deinit();
     // A drafter on the engine's caches commits through them at the finish: the slot outlives this call.
     ctx.native_slot = slotFor(xfm, ctx);
+    ctx.native_p0 = pos[0];
     const handles = [_]abi.Handle{ctx.native_slot.handle()};
     const f: abi.Forward = .{
         .mode = .verify,
@@ -1520,6 +1547,7 @@ pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32, stop
         .suppress_mask = .{ .ctx = if (xfm.suppress_mask) |m| m.ctx else null },
         .ablation = try ablated.init(&.{ctx}),
         .stop_ids = .of(stop_ids),
+        .settles_round = true,
     };
     var out: abi.ForwardOut = .{};
     intree.enter(ctx);
@@ -1537,8 +1565,7 @@ pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32, stop
     return .{ .round = out.round, .logits = .{ .ctx = out.logits.ctx } };
 }
 
-/// The second half (`NativeDrafter.finish`): keeps `accepted` drafts and moves `ctx.cache.step` and
-/// `ctx.moe_seq_offset` to the model's position.
+/// The second half (`NativeDrafter.finish`): keeps `accepted` drafts; the caches settle from the verify's start.
 pub fn nativeFinish(xfm: *Transformer, ctx: *ForwardCtx, accepted: u32) !u64 {
     const b = xfm.plugin.?;
     const nd = nativeDrafter(xfm).?;
@@ -1548,8 +1575,7 @@ pub fn nativeFinish(xfm: *Transformer, ctx: *ForwardCtx, accepted: u32) !u64 {
         log.err("[plugin] {s}: draft finish failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
         return error.PluginForwardFailed;
     }
-    ctx.cache.step = @intCast(out.round.position);
-    ctx.moe_seq_offset.* = @intCast(out.round.position);
+    try settleNativeRound(xfm, ctx, ctx.native_p0, 1 + @as(u64, accepted), out.round.position);
     return out.round.position;
 }
 
@@ -2363,7 +2389,8 @@ test "unsupported disk hooks preserve RAM auxiliary snapshots" {
 }
 
 // Bar: a sampled round's verify hands the drafter the slot's caches, their ops and the suppress mask (a drafter on
-// the engine's caches commits through them at its finish), the slot living in the request's context past the call.
+// the engine's caches commits through them at its finish), the slot living in the request's context past the call,
+// says the host settles the caches after it, and leaves its start for the finish.
 test "plugin driver: a native verify carries the slot's cache, its ops and the suppress mask" {
     const t = std.testing;
     const Fake = struct {
@@ -2371,8 +2398,10 @@ test "plugin driver: a native verify carries the slot's cache, its ops and the s
         var handle: ?abi.Handle = null;
         var ops_given = false;
         var mask: ?*anyopaque = null;
+        var settles = false;
         fn verify(_: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
             caches = f.caches.len;
+            settles = f.settles_round;
             handle = if (f.caches.len == 1) f.caches.slice()[0] else null;
             ops_given = f.cache_ops != null;
             mask = f.suppress_mask.ctx;
@@ -2413,6 +2442,9 @@ test "plugin driver: a native verify carries the slot's cache, its ops and the s
     try t.expectEqual(@intFromPtr(&ctx.native_slot), @intFromPtr(Fake.handle.?));
     try t.expect(Fake.ops_given);
     try t.expectEqual(suppress.ctx, Fake.mask);
+    // The host settles after the round, from the position the verify started at.
+    try t.expect(Fake.settles);
+    try t.expectEqual(@as(u64, 12), ctx.native_p0);
 }
 
 test "plugin driver: a native round and a finish move moe_seq_offset with cache.step" {
@@ -2423,7 +2455,8 @@ test "plugin driver: a native round and a finish move moe_seq_offset with cache.
             return .ok;
         }
         fn finish(_: *anyopaque, accepted: u32, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
-            out.round = .{ .position = 20 + accepted };
+            // `t1` and the kept drafts after the verify that started at 15
+            out.round = .{ .position = 15 + 1 + accepted };
             return .ok;
         }
         const drafter: abi.NativeDrafter = .{ .step = &step, .finish = &finish };
@@ -2438,7 +2471,9 @@ test "plugin driver: a native round and a finish move moe_seq_offset with cache.
     var x: Transformer = undefined;
     x.plugin = &bound;
     x.suppress_mask = null;
+    // A model whose layers the engine's cache does not hold (no entries): the settle checks positions only.
     var kv: KVCache = undefined;
+    kv.entries = &.{};
     kv.step = 12;
     var off: usize = 12;
     var ctx: ForwardCtx = .{ .cache = &kv, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
@@ -2446,7 +2481,53 @@ test "plugin driver: a native round and a finish move moe_seq_offset with cache.
     try t.expectEqual(@as(u64, 15), r.position);
     try t.expectEqual(@as(usize, 15), kv.step);
     try t.expectEqual(kv.step, off);
-    try t.expectEqual(@as(u64, 21), try nativeFinish(&x, &ctx, 1));
-    try t.expectEqual(@as(usize, 21), kv.step);
+    // The finish settles from where its verify started, which `nativeVerify` leaves in the context.
+    ctx.native_p0 = 15;
+    try t.expectEqual(@as(u64, 17), try nativeFinish(&x, &ctx, 1));
+    try t.expectEqual(@as(usize, 17), kv.step);
     try t.expectEqual(kv.step, off);
+}
+
+// Bar: a round's reported position is the start plus the tokens it committed, exactly: one reaching past it (the
+// verify's rejected rows counted as kept) fails the request, and the position stays where it was.
+test "plugin driver: a native round that reports a position other than its start plus its tokens fails" {
+    const t = std.testing;
+    const Fake = struct {
+        var extra: u64 = 0;
+        fn step(_: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            out.round = .{ .n = 2, .accepted = 1, .next_token = 9, .rows = 4, .position = f.positions.slice()[0] + 2 + extra };
+            return .ok;
+        }
+        fn finish(_: *anyopaque, accepted: u32, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            out.round = .{ .position = 12 + 1 + accepted + extra };
+            return .ok;
+        }
+        const drafter: abi.NativeDrafter = .{ .step = &step, .finish = &finish };
+        const spec: abi.SpecHooks = .{ .native_drafter = &drafter };
+        const cache: abi.CacheHooks = .{};
+        const weights: abi.WeightHooks = .{};
+        const table: abi.ModelTable = .{ .name = .of("native_fixture"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &cache, .spec = &spec, .weights = &weights };
+    };
+    var m: u8 = 0;
+    var bound: Bound = .{ .table = &Fake.table, .model = &m, .positions = .hybrid };
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    x.suppress_mask = null;
+    var kv: KVCache = undefined;
+    kv.entries = &.{};
+    var off: usize = 12;
+    var ctx: ForwardCtx = .{ .cache = &kv, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    ctx.native_p0 = 12;
+    for ([_]u64{ 2, 1 }) |extra| {
+        Fake.extra = extra;
+        kv.step = 12;
+        off = 12;
+        try t.expectError(error.PluginForwardFailed, nativeRound(&x, &ctx, 5, 4, &.{}));
+        try t.expectError(error.PluginForwardFailed, nativeFinish(&x, &ctx, 1));
+        try t.expectEqual(@as(usize, 12), kv.step);
+        try t.expectEqual(@as(usize, 12), off);
+    }
+    Fake.extra = 0;
+    _ = try nativeRound(&x, &ctx, 5, 4, &.{});
+    try t.expectEqual(@as(usize, 14), kv.step);
 }

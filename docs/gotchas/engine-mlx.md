@@ -1629,3 +1629,17 @@ which `rollbackSsmTo` cannot undo after a drafted round, so no decode-end entry 
 round the request's stop ids (`Forward.stop_ids`) and the drafter never verifies one (`draftsToVerify`): the trunk's
 token carries the stop. Guards: `plugin native drafter: a round is handed the request's stop ids`, `inkling2 draft: a
 round never verifies a stop`.
+
+### A drafter's rejected rows stayed in the engine's cache
+Defect: a plugin drafter that verifies on the engine's cache (Hy4's DFly2) failed its second round
+(`Hy4fDflyHistoryLength`); plain ticks after a round read the rejected drafts as context, and a reply that ended there
+stored a shifted prefix entry. Cause: two rules for one fact. The drafter appended every verified row and expected the
+host to drop the rejected ones; the host had moved to "the plugin commits through the caches" (Inkling 2 appends only
+the kept rows) and only copied the round's position into `cache.step` and `moe_seq_offset`. `CacheOps` has no truncate,
+and nothing told the plugin which rule held. Fix: one owner, `settleNativeRound`, ends every greedy and sampled round:
+the position must be the start plus the tokens committed, no layer may hold fewer rows, the rows past it are dropped,
+and both counters follow. The rule is on `NativeDrafter`; `Forward.settles_round` says the host keeps it. Guards: `plugin
+native drafter: a drafter on the engine's cache verifies several rows and the rejected ones leave the cache`, `... the
+cache a drafted request leaves restores to the plain stream`, `... a sampled round's finish leaves the committed rows
+only`, `... a round that appends less than it commits fails`, `plugin driver: a native round that reports a position
+other than its start plus its tokens fails`.
