@@ -212,7 +212,7 @@ jobs:
 
       - name: Test Swift app
         working-directory: app
-        run: bash test.sh
+        run: bash test.sh --skip-build
 
       - name: Save SwiftPM build
         if: ${{ !cancelled() && steps.compile.outcome == 'success' && github.ref == 'refs/heads/main' && steps.swiftpm.outputs.cache-hit != 'true' }}

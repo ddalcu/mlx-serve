@@ -186,7 +186,7 @@ jobs:
           fi
           echo "warm build: CUDA $minor runtime libraries only"
           sudo apt-get install -y --no-install-recommends "${apt[@]}" libcudnn9-dev-cuda-13 cuda-toolkit-config-common \
-            "cuda-nvcc-$minor" "cuda-cudart-$minor" "libcublas-$minor" "libcufft-$minor" "libcusolver-$minor" "cuda-nvrtc-$minor"
+            "cuda-nvcc-$minor" "cuda-cudart-$minor" "libcublas-$minor" "libcufft-$minor" "libcusolver-$minor" "libcusparse-$minor" "libnvjitlink-$minor" "cuda-nvrtc-$minor"
           dirname "$(dpkg -L "cuda-nvcc-$minor" | grep -m1 '/bin/nvcc$')" >> "$GITHUB_PATH"
 
       - name: Build
