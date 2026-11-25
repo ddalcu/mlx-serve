@@ -30,8 +30,8 @@ extern "C" {
 #define Q3LD_MAX_SPEC 16
 #define Q3LD_MAX_SPEC_THREADS 3
 #define Q3LD_MAX_PRE 32
-#define Q3LD_MAX_GATES 256
-#define Q3LD_MAX_GATE_TICKETS 256
+#define Q3LD_MAX_GATES 512
+#define Q3LD_MAX_GATE_TICKETS 768
 #define Q3LD_ST_PENDING (-1)
 #define Q3LD_ST_OK 0
 #define Q3LD_ST_SHORT 1
@@ -71,6 +71,8 @@ int q3ld_withdraw(int64_t first);
  * cur + 1 (len = their payload bytes). Queued count, -1 off / not running. */
 int32_t q3ld_spec_step(int32_t fd, int64_t file_size, int64_t cur, int32_t n, const int64_t *bases);
 int32_t q3ld_spec_step_len(int32_t fd, int64_t file_size, int64_t cur, int32_t n, const int64_t *bases, int64_t len);
+int32_t q3ld_spec_step_lens(int32_t fd, int64_t file_size, int64_t cur, int32_t n, const int64_t *bases,
+                             const int64_t *lens);
 int32_t q3ld_spec_stepn(int32_t fd, int64_t file_size, int64_t cur, int32_t nh, const int32_t *nval,
                         const int64_t *val, const int32_t *nissue, const int64_t *iss);
 int32_t q3ld_spec_state(int64_t *out);      /* 11 words per slot x MAX_SPEC; returns the slot count */
@@ -95,13 +97,16 @@ int q3ld_ev_config(int32_t kind, uint64_t obj, int64_t timeout_ns, uint64_t star
 int32_t q3ld_ev_gates(int32_t n, const uint64_t *values, const int32_t *counts, const int64_t *tickets);
 int32_t q3ld_ev_release(uint64_t value);    /* force every live gate <= value; forced count, -1 off */
 int32_t q3ld_ev_state(int64_t *out);        /* 10 words; returns the live gate count */
+int q3ld_direct_config(int32_t on);
 /* PARTS (ABI 2026110101), on a stopped pool: block 0 (off) or a power of two >= 512, the file's block; each demand
  * range part whose file offset, length and row address are multiples of it is read straight into its row, the others
  * staged and copied.  0 or -1. */
 int q3ld_parts_config(int64_t block);
 /* PARTS' phase switch, at any time: 1 (the default) the route as configured, 0 every range staged.  0. */
 int q3ld_parts_live(int32_t on);
-int32_t q3ld_abi(void);                     /* 2026110202 */
+int q3ld_demand_first(int32_t mode);
+int32_t q3ld_df_stats(int64_t *out, int32_t n);
+int32_t q3ld_abi(void);                     /* 2026110203 */
 int32_t q3ld_max_gates(void);
 int32_t q3ld_max_gate_tickets(void);
 int32_t q3ld_max_pre(void);
