@@ -21,6 +21,9 @@ written new. Runs on the box that holds the pack, never on a laptop:
     python3 -I dsv41_nvfp4_pack.py SRC_DIR DST_DIR [--experts-mxfp4]      # convert, then check
     python3 -I dsv41_nvfp4_pack.py SRC_DIR DST_DIR --check [--experts-mxfp4]  # check an existing DST only
 
+The converter also writes DSpark's draft vocabulary, this directory's dsv41_draft_vocab.txt, as DST/draft-vocab.txt
+(the plugin reads it from the pack; dsv41_draft_vocab.py builds it from a corpus, not from the checkpoint).
+
 The check re-reads DST and proves each converted tensor against SRC (codes byte for byte, every row scale against its
 block). It runs after every conversion; `--check` runs it alone and converts nothing.
 
@@ -55,6 +58,9 @@ import subprocess
 import sys
 
 SIDE = "model-mxfp8-scales.safetensors"
+# DSpark's draft vocabulary: the shipped list beside this script, written into the pack under the name the plugin reads.
+DRAFT_VOCAB_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dsv41_draft_vocab.txt")
+DRAFT_VOCAB = "draft-vocab.txt"
 EXPERT_SIDE = "model-expert-scales.safetensors"
 # ModelOpt's per-projection global -> the side tensor's name under `layers.L.ffn.experts.` (DeepSeek clamps its SwiGLU:
 # the up scale stays apart, the down scale alone rides the routing weight).
@@ -419,6 +425,11 @@ def convert(src, dst, mx=False, nv=False):
     meta["total_size"] = total
     meta["converted_by"] = "mlx-serve scripts/dsv41_nvfp4_pack.py"
     json.dump({"metadata": meta, "weight_map": dict(sorted(weight_map.items()))}, open(os.path.join(dst, "model.safetensors.index.json"), "w"), indent=2)
+    dv = os.path.join(dst, DRAFT_VOCAB)
+    if os.path.lexists(dv):
+        os.remove(dv)
+    shutil.copyfile(DRAFT_VOCAB_SRC, dv)
+    print(f"{DRAFT_VOCAB}: DSpark's draft vocabulary, {len(open(dv).read().split())} ids", flush=True)
     # Everything else (config, tokenizer, the reference code) as links.
     for e in os.listdir(src):
         if e in shards or e == "model.safetensors.index.json" or e.startswith("."):
@@ -564,6 +575,11 @@ def check(src, dst, mx=False, nv=False):
             if idx["weight_map"].get(name) != EXPERT_SIDE:
                 raise SystemExit(f"{name}: the index does not name {EXPERT_SIDE}")
         print(f"check: {n_nv} NVFP4 projections kept as MLX nvfp4 in place, {len(found)} global vectors equal their sources")
+    dv = os.path.join(dst, DRAFT_VOCAB)
+    if not os.path.isfile(dv) or not all(t.isdigit() for t in open(dv).read().split()):
+        raise SystemExit(f"{DRAFT_VOCAB}: missing in {dst} or not decimal token ids")
+    same = open(dv, "rb").read() == open(DRAFT_VOCAB_SRC, "rb").read()
+    print(f"check: {DRAFT_VOCAB} present, {'the shipped list' if same else 'not the shipped list (a rebuilt one?)'}")
     print(f"check: {n_fp8} fp8 grids expanded exactly, {n_fp4} fp4 scales renamed, {n_relabel} tensors relabelled, "
           f"{len(mx_jobs)} NVFP4 experts equal as mxfp4 value for value, offsets all kept")
 

@@ -8,7 +8,7 @@ able to end on (end of sequence, <think>, </think> and the DSML tool marker).
 line, space-separated) and prints each eval file's coverage by that set against a prefix cut of K ids. It tokenizes
 with the pack's byte-level BPE (its merges and its three split regexes, \p classes approximated for Python's re).
 
-The shipped src/plugins/deepseek_v41/draft-vocab.txt is K = 65536 over about 5.3M training tokens: the CPython
+The shipped scripts/dsv41_draft_vocab.txt, which dsv41_nvfp4_pack.py writes into every pack as draft-vocab.txt, is K = 65536 over about 5.3M training tokens: the CPython
 standard library, the Zig standard library, the MLX C++ sources and docs, the macOS SDK C headers and one prose set.
 Every source file that the benchmark prompts are built from, and every file that shares a line with one, was left
 out of the corpus.

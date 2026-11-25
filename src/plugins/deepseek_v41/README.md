@@ -35,15 +35,12 @@ build scored 161/164 on HumanEval and 366/378 on MBPP (base tests).
 2. Download NVIDIA's checkpoint from https://huggingface.co/nvidia/DeepSeek-V4.1-Flash-1017-NVFP4 to SRC_DIR.
 3. Convert it on the same machine: `python3 -I scripts/dsv41_nvfp4_pack.py SRC_DIR DST_DIR`. The converter checks
    the result when it finishes. Put DST_DIR on the same APFS volume as SRC_DIR. Keep SRC_DIR, because a shard with
-   no change is a symlink to it.
-4. Copy the plugin's draft-vocab.txt into the pack folder: `cp src/plugins/deepseek_v41/draft-vocab.txt DST_DIR/`.
-   The converter does not write it, and without it DSpark drafts over the whole vocabulary. It narrows the greedy
-   drafts to 65,536 common token ids, which gave +1.46% decode. For another workload, rebuild it with
-   `scripts/dsv41_draft_vocab.py`.
-5. Raise Metal's wired-memory limit to 512000 MiB (500 GiB, 536.9 GB): `sudo sysctl iogpu.wired_limit_mb=512000`.
-6. Start the server: `./zig-out/bin/mlx-serve --model DST_DIR --serve --warmup-full`. It listens on port 11234 by default.
-7. Get the model's id: `curl -s 127.0.0.1:11234/v1/models`.
-8. Send a first request:
+   no change is a symlink to it. The converter also writes the draft vocabulary, `DST_DIR/draft-vocab.txt` (see
+   "The draft vocabulary" below).
+4. Raise Metal's wired-memory limit to 512000 MiB (500 GiB, 536.9 GB): `sudo sysctl iogpu.wired_limit_mb=512000`.
+5. Start the server: `./zig-out/bin/mlx-serve --model DST_DIR --serve --warmup-full`. It listens on port 11234 by default.
+6. Get the model's id: `curl -s 127.0.0.1:11234/v1/models`.
+7. Send a first request:
    `curl -s 127.0.0.1:11234/v1/chat/completions -H 'Content-Type: application/json' -d '{"model": "<id>", "messages": [{"role": "user", "content": "Hello"}]}'`.
 
 The loaded model needs about 433 GB, and a 17,600-token request peaks at about 452 GB (at `--ctx-size 32768`; at the
@@ -145,12 +142,13 @@ to 16,384 of the request's own most frequent prompt ids (`DRAFT_VOCAB_PROMPT`, o
 whole vocabulary, so only the drafts change. A sampled request always drafts over the whole vocabulary. The file gave
 +1.46% decode on the standard test. Each draft then reads about half of the LM head and Markov-head bytes.
 
-The shipped file (`src/plugins/deepseek_v41/draft-vocab.txt`) holds the 65,536 ids that a general corpus uses most,
-tokenized with this pack's tokenizer: the CPython standard library, the Zig standard library, the MLX C++ sources and
-docs, the macOS SDK C headers and one prose set. The ids for end-of-sequence, `<think>`, `</think>` and the DSML tool
-marker are always in it. The source files that the benchmark prompts are built from were left out of the corpus. On
-held-out code and prose the list covers 98.4% to 99.6% of tokens. `scripts/dsv41_draft_vocab.py` rebuilds a list
-from another corpus. Delete the file, or set `MLX_SERVE_DSV41_DRAFT_VOCAB=0`, to draft over the whole vocabulary.
+The converter writes it from `scripts/dsv41_draft_vocab.txt`, beside its builder. That list holds the 65,536 ids that
+a general corpus uses most, tokenized with this pack's tokenizer: the CPython standard library, the Zig standard
+library, the MLX C++ sources and docs, the macOS SDK C headers and one prose set. The ids for end-of-sequence,
+`<think>`, `</think>` and the DSML tool marker are always in it. The source files that the benchmark prompts are built
+from were left out of the corpus. On held-out code and prose the list covers 98.4% to 99.6% of tokens.
+`scripts/dsv41_draft_vocab.py` rebuilds a list from another corpus. Delete the pack's `draft-vocab.txt`, or
+set `MLX_SERVE_DSV41_DRAFT_VOCAB=0`, to draft over the whole vocabulary.
 
 </details>
 
@@ -403,7 +401,7 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | DRAFT_SAMPLE | Sampled drafts from q, kept at min(1, p / q) | DRAFT-ONLY | test (engine: `spec/dspark.zig`, "dspark sampled verdict") |
 | DRAFT_QKV | Fuses a stage's wq_a and wkv at load | DRAFT-ONLY | test (within 1e-3 relative rms, no farther from the op chain) |
 | SPEC_SYNC | Greedy accept on the GPU; next draft queued behind the verify | DRAFT-ONLY | A/B text (its test needs a pack) |
-| DRAFT_VOCAB | Greedy drafts score only the pack's `draft-vocab.txt` ids (default: the pack's file, shipped as the plugin's `draft-vocab.txt`) | DRAFT-ONLY | test (and `deepseek_v4/served_test.zig`) |
+| DRAFT_VOCAB | Greedy drafts score only the pack's `draft-vocab.txt` ids (default: the pack's file, which the converter writes) | DRAFT-ONLY | test (and `deepseek_v4/served_test.zig`) |
 | DRAFT_VOCAB_PROMPT | A request's prompt ids join the draft vocabulary | DRAFT-ONLY | test (`deepseek_v4/served_test.zig`) |
 | HEAD8 | LM head requantized to 8-bit g64 | Requantized (KLD within one standard error) | KLD measurement |
 | ATTN_F16 | f16 attention core; on by default only without NAX | LOSSY (measured, not gated) | printed float64 measurement, served-route tests |
@@ -517,7 +515,6 @@ of about 44,500 rows), but we have not measured the cells at the 1M default.
 | The release has not loaded at the default wired limit | One load at the default limit |
 | We have no PPL or KLD of the whole stack; the KLD above is of the LM head alone | A whole-stack KLD against the same reference |
 | We have not measured `EXACT=1`'s speed cost | An A/B with `EXACT=1` |
-| The converter does not place `draft-vocab.txt` in the pack | The converter copies it, or step 4 stays |
 | No speed run on the PR head: its later commits are checked by tests and a text check only | The standard test on the PR head |
 
 ## Terms
