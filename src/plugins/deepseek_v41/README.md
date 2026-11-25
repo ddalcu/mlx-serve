@@ -323,11 +323,15 @@ tests of `attnCore` count each core's calls; on NAX they count 0 f16 calls.
 - `FLASH_ATTN` (REORDER): its f32-out l2 is 6.4e-5, against 1.8e-4 for the gather.
 - `MOE_PAIR_FP4` (REORDER, bounded): one switch for both fp4 formats. NVFP4 brings ModelOpt's per-expert scales into
   the epilogue; MXFP4 (or the MXFP4 view) runs the same kernel with that step compiled out. It replaces
-  `MOE_PAIR_SCALED` (NVFP4 only), which no release on main carried. NVFP4, at 384 experts: 0.223% to 0.237% of the
-  activation words differ from the split path. MXFP4: MXFP4_BOUNDS. The whole-sample float64 l2 is 1.0000 times the split path's. The test requires each differing word within one
+  `MOE_PAIR_SCALED` (NVFP4 only), which no release on main carried. The test requires each differing word within one
   bf16 step of its row's largest value, under 1% of words differing, and a sample l2 within 1.05 times the split
-  path's. The words more than one step apart in bf16 code are words that the split path gives as exactly 0.0, where
-  the paired kernel keeps a tiny value, about 1e-35.
+  path's. At 384 experts:
+  - NVFP4: 0.223% to 0.237% of the activation words differ from the split path, and the whole-sample float64 l2 is
+    1.0000 times the split path's. The words more than one step apart in bf16 code are words that the split path
+    gives as exactly 0.0, where the paired kernel keeps a tiny value, about 1e-35.
+  - MXFP4: 0.0014% to 0.0017% of the words differ, none more than one bf16 code step apart, and the whole-sample
+    float64 l2 is 1.0000 to 1.0008 times the split path's. The planted control (each pair's routing weight on the
+    next pair) is 233 to 325 times farther.
 - `PF_HC_V2` (REORDER, bounded): an f32 reorder of the five-pass hyper-connections. Its f32 mixes and split are 2 to 6
   times farther from float64 than the five passes', at the 1e-7 level. That is below the bf16 rounding that follows,
   and the tail's output words are the five passes' words. The test holds the mixes and split within 1e-5 of float64,
