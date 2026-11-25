@@ -330,15 +330,15 @@ fn printUsage(io: std.Io) void {
         \\                        verify-width cliff). A --mtp-min-depth above that default
         \\                        lifts it. --mtp-depth is the old spelling.
         \\                        Each machine finds its own range.
-        \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance in Medusa's
-        \\                        form: a draft is kept iff p > min(e, d * e^-H).
-        \\                        d > 0 (Medusa's posterior_alpha).
-        \\  --mtp-typical-eps <e> The floor's cap e, 0 < e <= 1 (Medusa's
-        \\                        posterior_threshold; 1 = no cap). Either flag
-        \\                        alone turns typical on: e alone takes
-        \\                        d = sqrt(e), d alone takes e = 0.09. Default
-        \\                        pair (model-settings "typical"): e 0.09, d 0.3.
-        \\                        The Qwen3.8 matched comparison: d 0.2, e 1.
+        \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance (d > 0): a
+        \\                        draft is kept iff p > min(e, d * e^-H), uncapped
+        \\                        (e = 1) unless --mtp-typical-eps sets e.
+        \\                        Use 0.2 for the Qwen3.8 matched comparison.
+        \\  --mtp-typical-eps <e> Opt-in cap on the typical floor, 0 < e <= 1
+        \\                        (Medusa's posterior_threshold). Alone it turns
+        \\                        typical on with d = sqrt(e) (Medusa's coupling);
+        \\                        with --mtp-typical both apply as given.
+        \\                        Medusa's standard pair: e 0.09, d 0.3.
         \\  --mtp-tokenv3 <a>  Opt-in lossy TokenV3 cascade (0 <= a <= 1).
         \\                        Alias: --mtp-cascade. Use 0.95 for the
         \\                        Qwen3.8 matched comparison. Exclusive with

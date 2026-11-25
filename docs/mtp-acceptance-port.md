@@ -7,11 +7,13 @@ distribution-exact relative to the target model.
 
 * **Typical** (`--mtp-typical <delta>`, `--mtp-typical-eps <eps>`): for each
   drafted token `x`, compute the target-row entropy `H(p)` and accept iff
-  `p(x) > min(eps, delta*exp(-H(p)))`. This is Medusa's typical acceptance:
-  `eps` is its posterior_threshold (the floor's cap) and `delta` its
-  posterior_alpha. The default pair is Medusa's, eps 0.09 and delta 0.3; eps
-  alone takes delta = sqrt(eps), delta alone takes eps 0.09, and eps 1 is no
-  cap (the Qwen3.8 matched comparison ran delta 0.2 with eps 1). This is deterministic and consumes no acceptance uniform. On
+  `p(x) > min(eps, delta*exp(-H(p)))`. The default `eps` is 1, no cap (the
+  rule Qwen and MiMo were measured on; `--mtp-typical 0.2` for the Qwen3.8
+  matched comparison, and the model setting `typical` is delta 0.2 uncapped).
+  The cap is opt-in: `--mtp-typical-eps` sets eps, which is Medusa's
+  posterior_threshold (`delta` is its posterior_alpha). Alone it takes
+  delta = sqrt(eps), Medusa's coupling; with `--mtp-typical` both apply as
+  given. Medusa's standard pair is eps 0.09, delta 0.3. This is deterministic and consumes no acceptance uniform. On
   the first rejection, sample directly from `p` at that position. The full
   accept bonus samples from the final target row.
 * **TokenV3** (`--mtp-tokenv3 0.95`): let
