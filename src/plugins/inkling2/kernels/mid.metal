@@ -18,6 +18,9 @@ constexpr uint NSG = TG / 32;
 constexpr uint NS = NB + BOUND + 1;
 constexpr uint R1 = 1 + NS + MSG;
 const uint SW = ST_shape[2];
+const uint RPS = OP_shape[1] / ST_shape[0];
+const uint slot = row / RPS;
+const uint pos = row % RPS;
 threadgroup float red1[NSG * R1];
 threadgroup float red2[NSG];
 // The folds of the SIMD groups' partial sums, each by one thread in the order every thread used to run it.
@@ -29,10 +32,17 @@ for (uint r = 0; r < R1; r++) acc[r] = 0.0f;
 for (uint i = t, k = 0; i < D; i += TG, k++) {
     const float x = float(OP[ro + i]);
     float y = 0.0f;
-    // Tap j reads row `row + j` of [ST | the rows]; SEQ 0: tap j of [the row's own ST | the row].
+    // Tap j reads row `pos + j` of [the slot's ST | its rows], or walks PARENT on a tree.
     for (uint j = 0; j < KT; j++) {
-        const bool old = SEQ ? row + j < KT - 1 : j + 1 < KT;
-        y += (old ? ST[(SEQ ? row + j : row * (KT - 1) + j) * SW + OFF + i] : float(OP[(SEQ ? row + j - (KT - 1) : row) * D + i])) * float(AW[i * KT + j]);
+        int p;
+        if constexpr (TREE) {
+            p = int(pos);
+            for (uint stp = 0; stp < KT - 1 - j; ++stp) p = (p >= 0) ? PARENT[slot * RPS + uint(p)] : (p - 1);
+        } else {
+            p = int(pos) + int(j) - int(KT - 1);
+        }
+        const float wv = (p < 0) ? ST[(slot * (KT - 1) + uint(int(KT - 1) + p)) * SW + OFF + i] : float(OP[(slot * RPS + uint(p)) * D + i]);
+        y += wv * float(AW[i * KT + j]);
     }
     y = float(WT(y));
     float r = float(T((y + x) * PR[0]));

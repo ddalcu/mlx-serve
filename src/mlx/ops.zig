@@ -191,6 +191,8 @@ pub const Graph = struct {
     pub fn layerNorm(g: *Graph, x: Array, w: Array, b: Array, eps: f32) !Array { return g.call(mlx.mlx_fast_layer_norm, .{ x, w, b, eps }); }
     /// Rotate-half RoPE over the last `dims` at positions offset.. (scale 1, no freqs table).
     pub fn rope(g: *Graph, x: Array, dims: c_int, base: f32, offset: c_int) !Array { return g.call(mlx.mlx_fast_rope, .{ x, dims, false, mlx.mlx_optional_float.some(base), 1.0, offset, Array{} }); }
+    /// `rope` with an offset per batch row: `offsets` `[B]` int32 for `x` `[B, ...]`.
+    pub fn ropeEach(g: *Graph, x: Array, dims: c_int, base: f32, offsets: Array) !Array { return g.call(mlx.mlx_fast_rope_dynamic, .{ x, dims, false, mlx.mlx_optional_float.some(base), 1.0, offsets, Array{} }); }
     pub fn sdpa(g: *Graph, q: Array, k: Array, v: Array, scale: f32, mask: Mask) !Array {
         const mode: [*:0]const u8 = switch (mask) { .none => "", .causal => "causal", .array => "array" };
         return g.call(mlx.mlx_fast_scaled_dot_product_attention, .{ q, k, v, scale, mode, if (mask == .array) mask.array else Array{}, Array{}, false });
@@ -337,6 +339,13 @@ pub fn evalMany(xs: []const Array) !void {
     const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
     defer _ = mlx.mlx_vector_array_free(v);
     try mlx.check(mlx.mlx_eval(v));
+}
+
+/// `evalMany` handed to the GPU without the wait: the host builds on behind it.
+pub fn asyncMany(xs: []const Array) !void {
+    const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_async_eval(v));
 }
 
 // ── tests ──

@@ -828,7 +828,7 @@ test "plugin forward: an ablated request hands every forward and draft round its
     try testing.expectEqual(@as(u64, 0x5eed), seen.key);
     try testing.expectEqual(@as(f32, 1), seen.first);
     T.seen = null;
-    _ = try driver.nativeRound(&b.xfm, &s.ctx, 9, 4, &.{});
+    _ = try driver.nativeRound(&b.xfm, &s.ctx, 9, .{ .cap = 4 });
     try testing.expect(T.seen != null);
     s.ctx.ablation = null;
     _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, &.{10})));

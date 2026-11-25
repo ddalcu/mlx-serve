@@ -2,8 +2,9 @@
 // tail, S), threadgroup (HD, 1): one thread per output element of a row, a head of q, k or v one threadgroup whose
 // threads each square their own element into BUF for the group to sum, so no thread loops over a head's inputs.
 // QP, GP [1, S, H * HD], RP [1, S, H * DREL], KP, VP [1, S, HKV * HD] are the q, gate, relative, k and v projections
-// (T); the k and v convs run over the rows behind the windows before them (ST [1, KT - 1, >= 2 * HKV * HD] f32, k
-// then v), or with SEQ 0 each row behind its own window (ST [S, KT - 1, .]: the rows are sequences of their own). Static convs take KW, VW [C, KT, 1] (WT) and round their sum to WT as the conv op does; dynamic ones (DYN)
+// (T); the k and v convs run over the rows behind the windows before them (ST [NSLOT, KT - 1, >= 2 * HKV * HD] f32, k
+// then v): RPS rows of ROWS make a slot, each slot behind its own window (RPS == ROWS: one sequence; 1: every row a sequence of
+// its own). Static convs take KW, VW [C, KT, 1] (WT) and round their sum to WT as the conv op does; dynamic ones (DYN)
 // take KW, VW [KT, C] (WT) plus each head's projected taps KDY, VDY [1, S, HKV * KT] (T), tap `lag` on the input
 // `lag` rows back. QS [H, HD] and RS [H, DREL] (S) scale q and the relative states before their L2 clips.
 // PR = { qk clip, rel clip, eps, tau, conv scale, KV }.
@@ -13,8 +14,10 @@
 // RJ [DREL, R] f32, distance 0 last, times tau; zero for a key past the extent R).
 const uint i = thread_position_in_grid.x;
 const uint row = thread_position_in_grid.y;
-const uint t = thread_position_in_threadgroup.x;
 const uint ROWS = QP_shape[1];
+const uint RPS = ROWS / ST_shape[0];
+const uint pos = row % RPS;
+const uint t = thread_position_in_threadgroup.x;
 const uint QD = H * HD;
 const uint C = HKV * HD;
 const uint R = RJ_shape[1];
@@ -42,12 +45,20 @@ if (r < 2 * C) {
     const uint h = c / HD;
     const uint off = is_v ? C : 0u;
     const float x = float(is_v ? VP[row * C + c] : KP[row * C + c]);
+    const uint slot = row / RPS;
     float y = 0.0f;
     for (uint j = 0; j < KT; j++) {
-        // Tap j reads row `row + j` of [ST | the rows]; SEQ 0: tap j of [the row's own ST | the row].
+        // Tap j reads row `pos + j` of [the slot's ST | its rows], or walks PARENT on a tree.
+        int p;
+        if constexpr (TREE) {
+            p = int(pos);
+            for (uint stp = 0; stp < KT - 1 - j; ++stp) p = (p >= 0) ? PARENT[slot * RPS + uint(p)] : (p - 1);
+        } else {
+            p = int(pos) + int(j) - int(KT - 1);
+        }
         float wv = x;
-        if (SEQ ? row + j < KT - 1 : j + 1 < KT) wv = ST[(SEQ ? row + j : row * (KT - 1) + j) * SW + off + c];
-        else if (j + 1 < KT) wv = float(is_v ? VP[(row + j - (KT - 1)) * C + c] : KP[(row + j - (KT - 1)) * C + c]);
+        if (p < 0) wv = ST[(slot * (KT - 1) + uint(int(KT - 1) + p)) * SW + off + c];
+        else if (j + 1 < KT) wv = float(is_v ? VP[(slot * RPS + uint(p)) * C + c] : KP[(slot * RPS + uint(p)) * C + c]);
         float wt;
         if (DYN) {
             const uint lag = KT - 1 - j;

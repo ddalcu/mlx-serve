@@ -8,6 +8,7 @@ const model_mod = @import("../../../sdk/config/model.zig");
 const log = @import("../../../sdk/util/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const pld_index = @import("../../../sdk/spec/pld_index.zig");
+const spec_rounds = @import("../../../sdk/spec/rounds.zig");
 const mtp_lookup = @import("mtp_lookup.zig");
 const round_cost = @import("round_cost.zig");
 const dflash_policy = @import("dflash/policy.zig");
@@ -64,6 +65,11 @@ pub const DflashPol = struct {
     copy: dflash_policy.CopyStats = .{},
     /// Since the last pipelined plain tick ended; null once any other kind of round has run.
     plain_watch: ?io_util.Stopwatch = null,
+    /// A served drafter's rounds are chosen here, on the ladder its load timed; null = no ladder yet: plain steps.
+    rounds: ?spec_rounds.Controller = null,
+    /// Set on the request a load times its ladder with: the rounds it runs, and when the last one ended.
+    timing: ?spec_rounds.Timing = null,
+    timing_watch: ?io_util.Stopwatch = null,
 };
 
 /// DFlash block-drafter step. ONE assistant forward proposes

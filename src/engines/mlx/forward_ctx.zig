@@ -212,6 +212,9 @@ pub const ForwardCtx = struct {
     /// A served model's id for this slot (`Forward.slots`), 0 until its first forward, and what its last `defer_host`
     /// forward left owed (`plugin/settle.zig`).
     plugin_slot: u32 = 0,
+    /// The request's first prompt forward names this earlier slot (`Forward.adopt_slot`); cleared once handed over.
+    adopt_slot: u32 = 0,
+    adopt_len: u64 = 0,
     plugin_owed: abi.Owed = .none,
 
     /// The shell's own sequence (`defaultCtx`, rebuilt per call): one id across its forwards.

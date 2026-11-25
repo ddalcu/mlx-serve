@@ -1629,3 +1629,62 @@ which `rollbackSsmTo` cannot undo after a drafted round, so no decode-end entry 
 round the request's stop ids (`Forward.stop_ids`) and the drafter never verifies one (`draftsToVerify`): the trunk's
 token carries the stop. Guards: `plugin native drafter: a round is handed the request's stop ids`, `inkling2 draft: a
 round never verifies a stop`.
+
+### A round priced on a clock inside the request read 93 or 208 tok/s by seed
+Defect: Inkling 2's sampled requests ran at plain-decode speed or at twice it depending on the seed and the boot,
+and five separate pieces of code priced a round (the plugin's own row costs and widths, the engine's doubling
+backoff, a plain-step average, a copy-landing average). Cause: each fed wall-clock samples of live rounds back into
+the next decision, so one slow round, or a warm-up's compile, moved a request onto another path, and what it then
+measured kept it there. Fix: `sdk/spec/rounds.zig`. A load times the model's rounds once, by draft count, with a
+request of its own (`rounds.Timing`, `warm_requests.timeRounds`); a request counts what its own rounds kept
+(`Acceptance`, `CopyStats`) and runs the copy, the drafter's block or the plain step with the most expected tokens
+per ms (`Controller.choose`). Nothing reads a clock inside a request, so with one ladder a seeded request makes the
+same choices again; boots time their own ladders (within 1%), so a choice near a tie can still differ across boots.
+A plain step is timed as the mean of a run of pipelined ticks, never the least one. Guards: `Timing: a cell keeps
+the least of its timed rounds`, `Controller: plain when no round pays`, `plugin native drafter: no rounds before the
+load's timing request`.
+
+### A drawn draft block cut before its stop id ended sampled turns less often than the model does
+Defect: a native drafter's sampled round dropped a drafted stop id and everything after it before the verify, as a
+greedy round does. Cause: a greedy block is a function of the context, so cutting it changes nothing; a drawn block
+is a sample, and the accept rule (keep with min(1, p/q), else draw the residual) is exact only if every drawn draft
+is tested. A dropped stop was replaced by a fresh draw from the trunk, so the stop needed two draws to land: where
+drafter and trunk both gave it 0.5, the turn ended a quarter of the time. Fix: a drawn block ends ON its stop
+(`draftsToVerify` in the plugin), the engine tests it like any draft, and an accepted stop becomes the pending token
+(`stopPending`), so its row is never committed. Rule: no cut of a drawn block may depend on what was drawn. Guards:
+`an accepted stop id is the pending token`, `inkling2 draft: only a drawn block verifies a stop`.
+
+### A prompt's rate fell by a third by 64K because its attention kernel did not use the tensor units
+Defect: Inkling 2's prompt processing read 4,900 tok/s at 4K and 3,200 at 64K on an M5 Ultra.
+Cause: the 8 global visits cost time per (row, key) pair, so a prompt's total grows with its square, and their read was
+an 8x8-SIMD-matrix flash kernel (`relattn.metal`); fitting
+tokens/s against length (time a token = a + c x length) showed the same `a` and a `c` 4x larger. Fix:
+`relattn_nax.metal`, the same read as `matmul2d` ops on the tensor unit (7.2K 5,130 -> 5,840 tok/s, 28.7K 4,275 -> 5,648,
+57K 3,414 -> 5,110), the old kernel kept where there is no NAX. Rule: a prompt rate that falls with length is the attention
+kernel; fit `a + c x length` before looking anywhere else. Guards: `a prompt's rows read on the tensor unit are the masked
+chain's`, the `relattn_nax` contract cases.
+
+### A default-on switch read with `env.on` was off in every server that did not set it
+Defect: the batched group rounds of a served drafter (`MLX_SERVE_NATIVE_GROUPS`, registered default `on`) never ran in a plain
+`mlx-serve --serve`: eight simultaneous requests all yielded speculation to plain batched decode after two ticks. Cause:
+`env.on` is "set and not 0", so an unset variable reads off, and every A/B passed `=1` explicitly. Fix: `env.notOff` reads a
+default-on switch (on unless `0`). Rule: a switch whose registered default is on is read with `notOff`, and a bench boots the
+default arm without the variable. Guard: `notOff: a default-on switch is off only at 0, where on reads unset as off`.
+
+### The same greedy request answered differently the second time
+Defect: on Inkling 2 a repeated temperature-0 request changed its text within 200 tokens for 10 of 12 prompts (3 of 12
+before the drafter's state carried over), and a seeded sampled one never repeated. Cause: a request that repeats a
+finished one adopted its drafter state (context rows, calibration) and copied its answer as drafts, so its rounds
+lined up differently; a verify row's logits differ from another alignment's in the low bits (bf16), and a near-tie
+token flips. Fix: a greedy or seeded request (`SamplingParams.repeats`) adopts nothing and copies no earlier answer;
+an unseeded sampled one keeps both. Rule: state carried between requests may speed a request up, never change what
+a request that asks to repeat reads. Beside other requests a group still follows arrival order. Guard: `plugin native
+drafter: only an unseeded sampled request continues an earlier one`.
+
+### A kernel template argument that carried a launch's rows filled the proof table, and every launch then paid an evaluation
+Defect: Inkling 2's decode ran 10 ms a round slower for the life of a process, from the first boot of a build (its warm
+requests) or after a few dozen distinct prompt lengths: an 18 ms verify took 28. Cause: the conv kernels took the rows
+a slot (`RPS`) as a template argument, so every prompt length was a new instantiation; `kernels.zig` proves a wide
+threadgroup once per instantiation in a 256-entry table, and a full table re-proves, one synchronous evaluation a launch.
+Fix: the kernels read the count from their inputs' shapes, and the table holds 2048. Rule: a template argument never
+carries a launch's shape. Guard: `inkling2 kernels: a forward of another length instantiates no kernel anew`.

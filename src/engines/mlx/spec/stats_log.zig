@@ -61,7 +61,10 @@ pub fn logSpecStats(self: *const Generator) void {
             "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2} stage_rounds={d} copy_rounds={d} copy_drafted={d} copy_accepted={d} group_rounds={d}\n",
             .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round, self.dspark_attempted - self.dspark_copies, self.dspark_copies, self.dspark_copy_drafted, self.dspark_copy_accepted, self.dspark_group_rounds },
         );
-        if (self.dspark_pol) |pol| log.info(
+        if (self.dspark_pol) |pol| if (pol.rounds) |ctl| log.info(
+            "  [spec-stats] dspark rounds: plain_ticks={d} plain_ms={d:.2} acc={d:.2} acc_pos={s} rows_hist={s}\n",
+            .{ self.dspark_plain, ctl.ladder.plain, ctl.acc.overall(), self.dspark_stats.formatAcc(&acc_buf), self.dspark_stats.formatRows(&rows_buf) },
+        ) else log.info(
             "  [spec-stats] dspark policy: plain_ticks={d} skipped={d} probes={d} plain_ms={d:.2} acc_pos={s} rows_hist={s}\n",
             .{ self.dspark_plain, pol.drafting.skipped, pol.drafting.probes, pol.plain.ms, self.dspark_stats.formatAcc(&acc_buf), self.dspark_stats.formatRows(&rows_buf) },
         );

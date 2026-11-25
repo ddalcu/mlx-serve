@@ -450,7 +450,7 @@ The load-time shape `bill` prices.
 
 ### `Bill` (extern struct)
 
-The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout. `flags` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
+The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout. `flags`, `state_per_token` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
 
 | Field | Type | Default | |
 |---|---|---|---|
@@ -566,6 +566,17 @@ One forward. `tokens` holds `rows` tokens per slot, slot after slot; `slots`, `p
 | `ablation` | `?*const Ablation` | `null` | Directional ablation for this forward's slots (`Caps.ablation`); null = none, the forward unchanged. |
 | `prompt_spans` | `Span(u64)` | `.{}` | A prompt forward the engine does not chunk: a whole-prompt prefill (`Caps.whole_prompt_prefill`), or a hybrid's restored tail inside the snapshot backoff. The absolute positions where the engine's chunk loop would end its spans, ascending, the last `positions[0] + rows`; empty = the model chunks as it likes. Read it only when `size` reaches it: an older host's `Forward` ends before it. |
 | `ssm_checkpoints` | `Span(u64)` | `.{}` | The absolute positions after which the engine files recurrent-state checkpoints for its prefix cache, ascending, each one of `prompt_spans` (`CacheOps.checkpoint`); empty = none wanted. Read it only when `size` reaches it. |
+| `prefill` | `bool` | `false` | The engine's prompt forwarding, whatever `mode` says: the split prefill's final-token span is one row and so arrives as `Mode.decode`. False on decode steps and verify blocks. Read it only when `size` reaches it: an older host's `Forward` ends before it. |
+| `stop_ids` | `Span(u32)` | `.{}` | A native drafter's round (`NativeDrafter.step`, `verify`): the request's stop ids. A round that commits one leaves the state past what the request commits, which the prefix cache cannot restore: `step` verifies none, and a block `verify` drew (`draft_probs`) ends on its stop, which the engine tests and never asks `finish` to keep. Read it only when `size` reaches it. |
+| `draft_ids` | `Span(u32)` | `.{}` | A native drafter's round: the drafts to verify after `t1` (a copy of the context), in place of the drafter's. Empty = the drafter drafts. Read it only when `size` reaches it. |
+| `draft_temperature` | `f32` | `0` | A sampled native round (`NativeDrafter.verify`): the drafter draws its drafts from its own law at this temperature, keyed by `draft_seed`, and returns that law (`ForwardOut.draft_probs`); 0 = its argmax drafts. Read it only when `size` reaches it. |
+| `draft_seed` | `u64` | `0` |  |
+| `adopt_slot` | `u32` | `0` | A request's first prompt forward: the slot (`slots`' id of an earlier request) whose sequence this one repeats for its first `adopt_len` positions, by the engine's record. State the model keeps per slot beside its caches (a native drafter's) may move to this slot, valid up to there. 0 = none. Read it only when `size` reaches it. |
+| `adopt_len` | `u64` | `0` |  |
+| `round_ms` | `Span(f32)` | `.{}` | A native drafter's round: what the round costs on this machine by the drafts it verifies, in ms and timed at load (`[0]` = it drafted and verified none), for the drafter's choice of how many to verify. Empty = not timed: it verifies every draft. Read it only when `size` reaches it. |
+| `top_k` | `u32` | `0` | A native drafter's `step_group`: the request's sampling filter (`top_k` 0 = disabled, `top_p` 1 = off, `min_p` 0 = off). Read them only when `size` reaches them. |
+| `top_p` | `f32` | `1.0` |  |
+| `min_p` | `f32` | `0.0` |  |
 
 ### `Ablation` (extern struct)
 
@@ -709,6 +720,7 @@ The forward's results: every array is a new reference the host owns. `logits` is
 | `captured` | `?[*]Array` | `null` | Host-allocated, `capture_layers.len` entries. |
 | `owed` | `Owed` | `.none` | What each slot of a `defer_host` forward left owed (one value for every slot of the forward). |
 | `round` | `Round` | `.{}` | `NativeDrafter.step`'s result. |
+| `draft_probs` | `Array` | `.{}` | A sampled native round's drafter law `[drafts, vocab]` f32, a row per verified draft (`Forward.draft_temperature`); null = the drafts are point masses. Read it only when `size` reaches it. |
 
 ### `LayerKind` (enum(u8))
 
@@ -836,6 +848,11 @@ A drafter the model carries in its own forward (DSpark); stages and block are `S
 | `step` | `*const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict` |  | One greedy round on the model's own state: `f.tokens` is the committed token `t1` (not yet in the state, which stands at `f.positions[0]`), `f.accept_cap` the most drafts to keep. The model drafts, verifies, keeps the drafts its own argmax agrees with (under `f.suppress_mask`), rewinds its state to them and writes `out.round`. |
 | `verify` | `?*const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict` | `null` | The first half of a round the engine accepts itself (a sampled request): the model drafts from `t1` and verifies the block, leaving the verify open. A `verify` while one is open discards the open one. `out.round.tokens[0..n]` are the verified rows' ids (`t1` first) and `out.logits` their logits `[n, vocab]` (f32). Needs `finish`. |
 | `finish` | `?*const fn (m: *anyopaque, accepted: u32, out: *ForwardOut) callconv(.c) Verdict` | `null` | The second half: keeps `t1` and the first `accepted` drafts of the open verify, rewinds the state to them and writes the model's position into `out.round.position`. |
+| `active` | `?*const fn (m: *anyopaque) callconv(.c) bool` | `null` | Whether this load drafts: a load may leave its drafter out (a GPU it loses on), and then the model has no stages. Null = always. Read it only when `size` reaches it. |
+| `verify_group` | `?*const fn (m: *anyopaque, fs: [*]const Forward, outs: [*]ForwardOut, n: u32) callconv(.c) Verdict` | `null` | `verify` for `n` requests at once, one slot each (`fs[k]` is the one-slot `Forward` `verify` takes, `outs[k]` its out): their blocks are read as the rows of one forward and stay open together until `finish_group`. Null = one open verify at a time. |
+| `finish_group` | `?*const fn (m: *anyopaque, slots: [*]const u32, accepted: [*]const u32, outs: [*]ForwardOut, n: u32) callconv(.c) Verdict` | `null` | `finish` for the group `verify_group` left open: `accepted[k]` drafts kept of the request of slot `slots[k]`, in the order the verify took them; `outs[k].round.position` the model's position after its round. |
+| `group_width` | `?*const fn (m: *anyopaque) callconv(.c) u32` | `null` | The most slots whose rounds verify as one forward to the benefit of each on this GPU (where more slots decode, they decode plain in the batched group). Null = no limit past the plugin's own. |
+| `step_group` | `?*const fn (m: *anyopaque, fs: [*]const Forward, outs: [*]ForwardOut, n: u32) callconv(.c) Verdict` | `null` | One complete round (draft, verify, accept and commit) for `n` requests at once, greedy or sampled (each lane reads its own sampling params and seed from `fs[k]`), writing each lane's committed block into `outs[k].round`. Null = use `step` / `verify_group` + `finish_group`. Read only when `size` reaches it. |
 
 ### `TrunkWeight` (enum(u8))
 

@@ -180,6 +180,8 @@ pub const Slot = struct {
     metrics_recorded: bool = false,
     /// A kernel warm-up the server serves itself (`warm_requests`): its stats are no client's, so they stay out of the log.
     warm: bool = false,
+    /// The request its model's load times a native drafter's rounds with (`warm_requests.timeRounds`).
+    times_rounds: bool = false,
     /// Inference-thread passes (a prefill, a decode tick) holding this slot, taken
     /// under `queue_mu`. `complete` waits it out: the handler owns sampling state
     /// the pass reads (`think_bound`, `constraint`) and frees it once `complete` returns.

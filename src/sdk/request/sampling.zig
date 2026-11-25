@@ -63,4 +63,11 @@ pub const SamplingParams = struct {
     pub fn shapesLogits(self: SamplingParams) bool {
         return self.constraint != null or self.penalized();
     }
+
+    /// Whether the same request must answer the same twice: greedy, or sampled under a seed. Such a request takes
+    /// nothing an earlier request left (a drafter's state, its answer): rounds that line up otherwise verify rows
+    /// whose logits part in the low bits, and a near-tie token flips.
+    pub fn repeats(self: SamplingParams) bool {
+        return self.seed != null or self.temperature < 0.01 or self.top_k == 1;
+    }
 };

@@ -641,6 +641,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     gen.timeout_ns = slot.timeout_ns;
     gen.logprobs_n = slot.logprobs_n;
     gen.warm = slot.warm;
+    if (slot.times_rounds) gen.timeRounds();
 
     slot.legacy_gen = gen;
     // The last chunks' transient is freed AFTER the loop's own per-chunk clear, so it

@@ -8,12 +8,15 @@
 //! When drafts keep failing to pay for their own forward, drafting is skipped with a probe backoff.
 const std = @import("std");
 
-/// t1 plus up to 15 drafts.
-pub const MAX_ROWS: u32 = 16;
-pub const MAX_DRAFTS: u32 = MAX_ROWS - 1;
+const spec_rounds = @import("../../../../sdk/spec/rounds.zig");
 
-/// Round ms by verify rows; index = rows, 0 unused.
-pub const Costs = [MAX_ROWS + 1]f32;
+pub const MAX_ROWS = spec_rounds.MAX_ROWS;
+pub const MAX_DRAFTS = spec_rounds.MAX_DRAFTS;
+pub const Costs = spec_rounds.Costs;
+pub const Choice = spec_rounds.Choice;
+pub const chooseRows = spec_rounds.chooseRows;
+pub const Calibration = spec_rounds.Calibration;
+pub const CopyStats = spec_rounds.CopyStats;
 
 /// GLM-5.3-Flash verify ladder on an M5 Ultra at 1k context (ms by rows, linear between).
 const LADDER = [_][2]f32{ .{ 1, 17.7 }, .{ 2, 25.5 }, .{ 3, 29.6 }, .{ 4, 33.6 }, .{ 5, 36.8 }, .{ 6, 42.4 }, .{ 7, 44.8 }, .{ 8, 47.9 }, .{ 9, 51.1 }, .{ 12, 60.5 }, .{ 16, 69.1 } };
@@ -40,129 +43,15 @@ pub fn priorCosts(plain_ms: f32) Costs {
 /// A plain round's ms when nothing has been measured yet.
 pub const PRIOR_PLAIN_MS: f32 = LADDER[0][1];
 
-pub const Choice = struct {
-    /// Rows to verify, t1 included (1 = a plain round).
-    rows: u32,
-    /// Expected tokens the round emits.
-    tokens: f32,
-    /// Verify cost of `rows`.
-    ms: f32,
-};
-
-/// A row count within this fraction of the best rate loses to the cheaper one: the model is not
-/// that exact, and a verify's cost is certain where its tokens are not.
-const ROW_TIE: f32 = 0.02;
-
-/// The row count with the best expected tokens per ms. `p[k]` is the probability that draft k is
-/// accepted given drafts 0..k-1 were; `costs` are the verify ms by rows.
-pub fn chooseRows(p: []const f32, costs: *const Costs) Choice {
-    const n: usize = @min(p.len, MAX_DRAFTS); // typed: a bare @min narrows to u4 and n + 2 overflows at 15
-    var tokens: [MAX_ROWS + 1]f32 = undefined;
-    tokens[1] = 1;
-    var alive: f32 = 1;
-    for (p[0..n], 0..) |pk, k| {
-        alive *= if (pk >= 0) @min(pk, 1) else 0; // a NaN is no acceptance
-        tokens[k + 2] = tokens[k + 1] + alive;
-    }
-    var best: f32 = 0;
-    for (1..n + 2) |r| best = @max(best, tokens[r] / costs[r]);
-    for (1..n + 2) |r| {
-        if (tokens[r] / costs[r] >= best * (1 - ROW_TIE)) return .{ .rows = @intCast(r), .tokens = tokens[r], .ms = costs[r] };
-    }
-    return .{ .rows = 1, .tokens = 1, .ms = costs[1] };
-}
-
-/// Probability that a draft is accepted given its predecessors were, by the drafter's confidence in
-/// it: online bins over `-log10(1 - conf)` (the selector's shares crowd 0.9..1, where a linear axis has one
-/// bin), each pulled toward a logistic prior fitted on recorded rounds by a few pseudo-counts and forgetting
-/// its old rounds, so a change of content class re-calibrates in a few rounds.
-pub const Calibration = struct {
-    const BINS = 12;
-    const PER_UNIT: f32 = 4;
-    /// Pseudo-observations the prior is worth.
-    const PRIOR_WEIGHT: f32 = 3;
-    /// A bin forgets this share of its history per observation it takes.
-    const KEEP: f32 = 0.97;
-
-    hit: [BINS]f32 = @splat(0),
-    seen: [BINS]f32 = @splat(0),
-    /// The drafter's confidence is its own acceptance estimate (DSpark's confidence head), the prior the bins start
-    /// from; else the logistic fit.
-    head: bool = false,
-
-    /// 0 at a coin flip's confidence, 1 at 0.9, 2 at 0.99, capped at 3.
-    fn axis(conf: f32) f32 {
-        return -std.math.log10(@max(1 - std.math.clamp(conf, 0, 1), 1e-3));
-    }
-
-    fn bin(conf: f32) usize {
-        return @min(BINS - 1, @as(usize, @intFromFloat(axis(conf) * PER_UNIT)));
-    }
-
-    fn prior(self: *const Calibration, conf: f32) f32 {
-        if (self.head) return std.math.clamp(conf, 0, 1);
-        return 1 / (1 + @exp(-(-1.15 + 1.58 * axis(conf))));
-    }
-
-    pub fn probability(self: *const Calibration, conf: f32) f32 {
-        const b = bin(conf);
-        return (self.hit[b] + PRIOR_WEIGHT * self.prior(conf)) / (self.seen[b] + PRIOR_WEIGHT);
-    }
-
-    pub fn observe(self: *Calibration, conf: f32, accepted: bool) void {
-        const b = bin(conf);
-        self.hit[b] = self.hit[b] * KEEP + @as(f32, if (accepted) 1 else 0);
-        self.seen[b] = self.seen[b] * KEEP + 1;
-    }
-};
-
 /// What a plain round costs, learned from the plain rounds themselves and nothing else: slowly, and by at
 /// most a quarter per sample, so a stall or a foreign GPU job cannot pose as the machine's speed.
 pub const PlainCost = struct {
     ms: f32 = PRIOR_PLAIN_MS,
-    /// Samples still taken whole, the least of them kept: a model the prior was not measured on (`unmeasured`).
-    seed: u8 = 0,
-
-    /// No prior: the request's first plain rounds are the cost.
-    pub const unmeasured: PlainCost = .{ .ms = std.math.inf(f32), .seed = 3 };
 
     pub fn sample(self: *PlainCost, ms: f32) void {
         if (!std.math.isFinite(ms) or ms <= 0) return;
-        if (self.seed > 0) {
-            self.seed -= 1;
-            self.ms = @min(self.ms, ms);
-            return;
-        }
         const bounded = std.math.clamp(ms, self.ms * 0.8, self.ms * 1.25);
         self.ms += 0.1 * (bounded - self.ms);
-    }
-};
-
-/// How often a copied continuation survives verify, by how far back it agreed with the context (under or
-/// over `STRONG`): the share of positions reached that were kept, forgetting old rounds.
-pub const CopyStats = struct {
-    pub const STRONG: u32 = 16;
-    const PRIOR = [2]f32{ 0.7, 0.9 };
-    const PRIOR_WEIGHT: f32 = 3;
-    const KEEP: f32 = 0.95;
-
-    hit: [2]f32 = .{ PRIOR[0] * PRIOR_WEIGHT, PRIOR[1] * PRIOR_WEIGHT },
-    tries: [2]f32 = .{ PRIOR_WEIGHT, PRIOR_WEIGHT },
-
-    fn class(suffix: u32) usize {
-        return @intFromBool(suffix >= STRONG);
-    }
-
-    pub fn probability(self: *const CopyStats, suffix: u32) f32 {
-        const c = class(suffix);
-        return self.hit[c] / self.tries[c];
-    }
-
-    /// A round that verified `drafts` copied tokens and kept `accepted` of them.
-    pub fn observe(self: *CopyStats, suffix: u32, drafts: u32, accepted: u32) void {
-        const c = class(suffix);
-        self.hit[c] = self.hit[c] * KEEP + @as(f32, @floatFromInt(accepted));
-        self.tries[c] = self.tries[c] * KEEP + @as(f32, @floatFromInt(@min(accepted + 1, drafts)));
     }
 };
 
@@ -263,7 +152,7 @@ pub fn chooseGroupRows(p: []const []const f32, costs: *const GroupCosts, drafts:
     var best: f32 = 0;
     for (n..r + 1) |rr| best = @max(best, tokens[rr] / costs[rr]);
     var chosen = n;
-    for (n..r + 1) |rr| if (tokens[rr] / costs[rr] >= best * (1 - ROW_TIE)) {
+    for (n..r + 1) |rr| if (tokens[rr] / costs[rr] >= best * (1 - spec_rounds.ROW_TIE)) {
         chosen = rr;
         break;
     };
@@ -417,35 +306,8 @@ test "chooseRows: within 2% of the best rate the cheaper verify wins" {
     try testing.expectEqual(@as(u32, 3), chooseRows(&[_]f32{ 0.5, 0.5 }, &costs).rows);
 }
 
-test "Calibration: no data answers the prior, then the data takes over, bin by bin" {
-    var c = Calibration{};
-    try approx(c.probability(0.9), 0.606);
-    try approx(c.probability(0.2), 0.269);
-    for (0..40) |_| c.observe(0.9, false);
-    try testing.expect(c.probability(0.9) < 0.3);
-    try approx(c.probability(0.2), 0.269);
-    // The bin is a confidence range: 0.88 shares 0.9's evidence.
-    try testing.expect(c.probability(0.88) < 0.3);
-}
-
-test "Calibration: an old regime fades" {
-    var c = Calibration{};
-    for (0..80) |_| c.observe(0.7, true);
-    try testing.expect(c.probability(0.7) > 0.9);
-    for (0..80) |_| c.observe(0.7, false);
-    try testing.expect(c.probability(0.7) < 0.2);
-}
-
 // A drafted round is judged by `record(gain, wall)`: the plain-round ms its tokens would have cost, against
 // the ms it took. Ten against ten is break-even.
-
-test "PlainCost: an unmeasured cost is the least of its first samples, then moves slowly" {
-    var c = PlainCost.unmeasured;
-    for ([_]f32{ 400, 9.9, 10.4 }) |ms| c.sample(ms);
-    try testing.expectEqual(@as(f32, 9.9), c.ms);
-    c.sample(400);
-    try testing.expect(c.ms > 9.9 and c.ms < 10.2);
-}
 
 test "PlainCost: a stall moves it little, a steady new speed is reached" {
     var c = PlainCost{};
@@ -457,17 +319,6 @@ test "PlainCost: a stall moves it little, a steady new speed is reached" {
     var slower = PlainCost{};
     for (0..80) |_| slower.sample(22.0);
     try testing.expect(slower.ms > 21.0 and slower.ms <= 22.0);
-}
-
-test "CopyStats: a strong match starts trusted, and misses teach it otherwise" {
-    var c = CopyStats{};
-    try testing.expect(c.probability(20) > c.probability(8));
-    for (0..12) |_| c.observe(20, 14, 0);
-    try testing.expect(c.probability(20) < 0.3);
-    try approx(c.probability(8), 0.7); // the other class is untouched
-    var d = CopyStats{};
-    for (0..12) |_| d.observe(20, 14, 14);
-    try testing.expect(d.probability(20) > 0.9);
 }
 
 test "Drafting: a losing draft owes plain rounds, doubling to a cap; a winning probe resets" {
@@ -615,11 +466,3 @@ test "GroupCost: rows and states cost more, and a slower machine's rounds scale 
     try testing.expect(cost.scale <= 2.5);
 }
 
-test "Calibration: a head prior reads the drafter's confidence as its acceptance until verifies say otherwise" {
-    var head: Calibration = .{ .head = true };
-    const fitted: Calibration = .{};
-    try testing.expectApproxEqAbs(@as(f32, 0.93), head.probability(0.93), 1e-4);
-    try testing.expect(fitted.probability(0.93) < 0.7);
-    for (0..60) |_| head.observe(0.93, false);
-    try testing.expect(head.probability(0.93) < 0.2);
-}
