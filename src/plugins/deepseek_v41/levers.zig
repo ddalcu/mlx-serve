@@ -514,6 +514,7 @@ test "deepseek_v41 levers: every row is a registered switch, and every DSV41 swi
 }
 
 test "deepseek_v41 levers: with no precision or stack set, a lever reads as its own variable alone (ATTN_F16 and PF_INT8 resolve to 0)" {
+    @setEvalBranchQuota(200_000);
     clearControls();
     defer clearControls();
     inline for (rows) |r| {
@@ -542,6 +543,7 @@ test "deepseek_v41 levers: with no precision or stack set, a lever reads as its 
 test "deepseek_v41 levers: lossless purity holds, and a planted LOSSY default fails the same check" {
     try testing.expect(comptime pure(&rows));
     const planted = comptime blk: {
+        @setEvalBranchQuota(200_000);
         var t = rows;
         for (&t) |*r| {
             if (std.mem.eql(u8, r.name, "PF_INT8")) r.lossless = .{ .value = "4" };
@@ -550,6 +552,7 @@ test "deepseek_v41 levers: lossless purity holds, and a planted LOSSY default fa
     };
     try testing.expect(!comptime pure(&planted));
     const planted_on = comptime blk: {
+        @setEvalBranchQuota(200_000);
         var t = rows;
         for (&t) |*r| {
             if (std.mem.eql(u8, r.name, "ATTN_F16")) r.kind = .on;
