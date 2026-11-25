@@ -838,8 +838,7 @@ fn sortedDown(w: *const Moe.Weights, g: *Graph, x_flat: Array, lhs: Array, gate:
     if (blocked and nax and gq.mode == uq.mode and (gq.mode == .affine or gq.mode.isFp4())) {
         const x_tok = try g.reshape(x_flat, &.{ ops.shape(x_flat)[0], 1, D });
         const row_map = try g.astype(lhs, .uint32);
-        const scaled = gate.expert_scale.ctx != null or up.expert_scale.ctx != null;
-        if (fused_act.swigluFusedEnabled() and w.clamp != null and (!scaled or gather_qmm_nax.scaledPrefillEnabled()) and
+        if (fused_act.swigluFusedEnabled() and w.clamp != null and
             gq.bits == uq.bits and gq.group_size == uq.group_size)
         {
             const sigtab = try sigmoidTable(g.s);
