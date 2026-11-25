@@ -992,6 +992,53 @@ test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_TOKORD: the staged down's rows at thei
     }
 }
 
+test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_BK32: the down on the 32-deep tile gives moePrefill's words at every prompt width, NVFP4 with per-expert scales and MXFP4; the calls of 96 rows an expert and more only; each down row handed the next token fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
+    inline for (.{ true, false }) |nv| {
+        const pk = if (nv) env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1") else env.override(.MLX_SERVE_DSV41_MOE_PAIR, "1");
+        defer pk.restore();
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        var m: dsv41.Dsv41Model = undefined;
+        m.cfg = .{};
+        m.cfg.dsv4_swiglu_limit = 10;
+        m.act = .bfloat16;
+        m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
+        m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
+        var ly: dsv41.Layer = undefined;
+        ly.gate_w = try sc.zeros(&.{ experts, 8 }, .bfloat16);
+        ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .gu = try fp4Bank(&sc, 0x6A7E, experts, 2 * inter, hidden, nv), .down = try fp4Bank(&sc, 0xD0E1, experts, hidden, inter, nv) };
+        if (nv) for (&ly.experts.scale, 0..) |*v, i| {
+            v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x5CA1E + i);
+        };
+        for ([_]usize{ 40, 777, 4097, 8192 }, 0..) |L, ci| {
+            var csc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+            defer csc.deinit();
+            const c = try call(&csc, L, @intCast(experts), 0x3400 + ci, false);
+            const wide = @divTrunc(@as(c_int, @intCast(L * top_k)), experts) >= 96;
+            const want = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const on = env.override(.MLX_SERVE_DSV41_PF_DOWN_BK32, "1");
+            defer on.restore();
+            const before = fp4gemm.bk32_launches.load(.monotonic);
+            const got = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const served = fp4gemm.bk32_launches.load(.monotonic) - before;
+            const eq = try sameWords(want, got);
+            std.debug.print("[down-bk32] {s} rows {d}: launches {d}, moePrefill {}\n", .{ if (nv) "NVFP4" else "MXFP4", L, served, eq });
+            try testing.expect(eq);
+            // The down, at the wide calls only.
+            try testing.expectEqual(@as(u32, if (wide) 1 else 0), served);
+            if (!wide) continue;
+            fp4gemm.bk32_plant = true;
+            defer fp4gemm.bk32_plant = false;
+            try testing.expect(!try sameWords(want, try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh)));
+        }
+    }
+}
+
 // ── the hc stages ──
 
 /// A model holding only the hc kernels, at the release's widths, the fused ones built and probed.

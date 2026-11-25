@@ -751,6 +751,14 @@ pub fn stagedPlan(rows: c_int, experts: c_int) Staged {
     return .{ .bm = 64, .wm = 4, .wn = 1, .gx = 32 };
 }
 
+/// The down's tile under deepseek_v41's `MLX_SERVE_DSV41_PF_DOWN_BK32`: the planner's 64 x 64 tile, 32 deep a step,
+/// where a call has 96 routed rows an expert and more; null below.
+pub fn stagedDownWide(rows: c_int, experts: c_int) ?Staged {
+    if (@divTrunc(rows, @max(experts, 1)) < 96) return null;
+    return wide_down;
+}
+pub const wide_down: Staged = .{ .bm = 64, .wm = 4, .wn = 1, .gx = 32, .bk = 32 };
+
 /// Whether the staged schedule serves a routed gate/up call (`rows` routed rows over `experts`, K `k`, `n` a product):
 /// not where `plan` picks the seg 128 x 128 schedule (96 rows an expert and more), which runs the pair faster there.
 pub fn stagedServesGateUp(rows: c_int, experts: c_int, k: c_int, n: c_int) bool {
