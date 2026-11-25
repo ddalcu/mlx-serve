@@ -37,10 +37,11 @@ const areas = .{
     @import("../../blocks/linear/contract.zig"),
     @import("../../blocks/moe/contract.zig"),
     @import("../../../plugins/deepseek_v4/contract.zig"),
-    @import("../../../plugins/deepseek_v41/contract.zig"),
+} ++ (if (dsv41_link.on) .{dsv41_link.contract} else .{}) ++ .{
     @import("../../../plugins/idol/contract.zig"),
     @import("../../../plugins/inkling2/contract.zig"),
 };
+const dsv41_link = @import("../../../engines/mlx/plugin/dsv41_link.zig");
 
 pub const Set = @import("set.zig").Set;
 

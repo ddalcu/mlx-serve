@@ -7,6 +7,7 @@ const log = @import("../../../sdk/util/log.zig");
 const prefix_cache_mod = @import("../cache/prefix_cache.zig");
 const scheduler_mod = @import("../scheduler.zig");
 const testing = std.testing;
+const dsv41_link = @import("../plugin/dsv41_link.zig");
 const http_server = @import("../../../host/http/server.zig");
 
 const manualContext = @import("../../../host/http/server.zig").manualContext;
@@ -759,7 +760,11 @@ test "ungatedHotCacheAsk: a streamed plugin that prices its own prompt is held t
     try t.expect(oneSessionEntryBytes(&other, 16, 262_144, 8192) > term);
     try t.expectEqual(term, ungatedHotCacheAsk(&other, PREFIX_CACHE_MEM_DEFAULT, false, 16, 262_144, 8192));
     try t.expectEqual(term, ungatedHotCacheAsk(&other, 0, true, 16, 262_144, 8192));
+}
 
+test "ungatedHotCacheAsk: DeepSeek-V4.1's module-path ask stands" {
+    const t = std.testing;
+    if (!dsv41_link.on) return error.SkipZigTest;
     // DeepSeek-V4.1 streams too and prices its prompt, but commits through its module (`CacheHooks.aux`): it sizes its
     // own bank and makes its cache's room before it appends, so its ask stands. Its real table over its real parse (its
     // bill reads the parse), with a streamed pack's caps.
@@ -769,11 +774,11 @@ test "ungatedHotCacheAsk: a streamed plugin that prices its own prompt is held t
         ds.plugin = own;
         ds.deinit(t.allocator);
     }
-    const v41_config = @import("../../../plugins/deepseek_v41/config.zig");
+    const v41_config = dsv41_link.config;
     const ds_json = model_mod.dsv41_release_config;
     const ds_mem: @import("../../../sdk/testing/fixture.zig").MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = ds_json }} };
     const ds_dir = ds_mem.packDir();
-    var streamed_ds: @import("../plugin/config.zig").Binding = .{ .table = &@import("../../../plugins/deepseek_v41/plugin.zig").table };
+    var streamed_ds: @import("../plugin/config.zig").Binding = .{ .table = &dsv41_link.plugin.table };
     try t.expect(v41_config.parse(&ds_dir, StreamedProbe.abi.Str.of(ds_json), .{}, null, true, &streamed_ds.parsed).isOk());
     defer v41_config.freeParsed(&streamed_ds.parsed);
     streamed_ds.parsed.caps.streamed_weights = true;

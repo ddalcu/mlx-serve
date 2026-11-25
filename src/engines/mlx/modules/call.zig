@@ -32,7 +32,7 @@ pub const fns = struct {
     pub const qwen4_warmup_spec_verify = Trunk.warmupSpecVerify;
 };
 
-const Dsv41Vision = @import("../../../plugins/deepseek_v41/vision.zig").Dsv41Vision;
+const Dsv41Vision = @import("../plugin/dsv41_link.zig").vision.Dsv41Vision;
 const Trunk = @import("../../../plugins/qwen4_exp/trunk.zig").Trunk;
 
 const Entry = *const fn (args: *const anyopaque, out: *anyopaque, err: *[]const u8) callconv(.c) bool;

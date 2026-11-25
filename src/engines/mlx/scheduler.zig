@@ -69,7 +69,6 @@ const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
 const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const status = @import("../../host/status.zig");
-const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
 const sleep_inhibit = @import("runtime/sleep_inhibit.zig");
 
 const Transformer = transformer_mod.Transformer;
