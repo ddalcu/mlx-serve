@@ -163,6 +163,9 @@ pub const Generator = struct {
     /// chokepoint when the request samples (temp ≥ 0.01, top_k ≠ 1) and the
     /// stochastic arm isn't env-killed; meaningless unless `dspark_enabled`.
     dspark_stochastic: bool = false,
+    /// The stochastic arm's typical delta (`dspark.Rule.typical`, LOSSY; the request's `mtp_acceptance`), 0 for the exact
+    /// rule. Copied drafts keep the exact rule whatever it is (`dspark.draftRule`).
+    dspark_typical: f32 = 0,
     dspark_attempted: u64 = 0,
     dspark_accepted_tokens: u64 = 0,
     /// Rounds whose drafts were copied from the context (`dsparkCopyStep`), included in `dspark_attempted`.

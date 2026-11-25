@@ -272,7 +272,7 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
         } else if (gen.dspark_stochastic) {
             const rows_l = try rowsOf(logits, off, ch.len, mdl.vocab, mdl.s);
             defer _ = mlx.mlx_array_free(rows_l);
-            const v = try dspark.stochasticVerdict(gen, rows_l, ch, mdl.vocab, caps[k], null);
+            const v = try dspark.stochasticVerdict(gen, rows_l, ch, mdl.vocab, caps[k], null, dspark.draftRule(gen.dspark_typical, kinds[k] == .copy));
             accepted[k] = v.accepted;
             next[k] = v.next_token;
         } else {
