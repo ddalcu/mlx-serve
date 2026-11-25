@@ -2755,9 +2755,9 @@ pub fn passCeilFor(chip: []const u8, mem: u64) usize {
     return 0;
 }
 
-/// `passCeilFor` this machine under `MLX_SERVE_DSV41_PF_PASS_CEIL` (default off): 0 off, or where no knee is measured.
+/// `passCeilFor` this machine under `MLX_SERVE_DSV41_PF_PASS_CEIL` (default on): 0 at `=0`, or where no knee is measured.
 pub fn passCeil() usize {
-    if (!env.on(.MLX_SERVE_DSV41_PF_PASS_CEIL)) return 0;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_PASS_CEIL)) return 0;
     const c = if (pass_ceil_machine) |m| passCeilFor(m.chip, m.mem) else passCeilFor(@import("../../sdk/ane/offload.zig").chipBrand(), device.totalMemBytes());
     return if (pass_ceil_plant and c > 0) c + 4 * SPAN else c;
 }

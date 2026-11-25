@@ -197,6 +197,17 @@ test "dsv41 prefill chunk: PF_PASS_CEIL keeps a memory-sized pass at or under th
     defer pin.restore();
     ds.pass_ceil_machine = .{ .chip = "Apple M5 Ultra", .mem = 512 * gib };
     try t.expectEqual(@as(usize, 17_638), ds.passRows(17_638, pc.dsv41PassRows(&cfg, 16, 21_099 * mb, 0, 8192)));
+    // On by default: unset takes the ceiling, =0 the memory-sized width.
+    {
+        const unset = env.override(.MLX_SERVE_DSV41_PF_PASS_CEIL, null);
+        defer unset.restore();
+        try t.expectEqual(@as(usize, 39_680), ds.passCeil());
+    }
+    {
+        const zero = env.override(.MLX_SERVE_DSV41_PF_PASS_CEIL, "0");
+        defer zero.restore();
+        try t.expectEqual(@as(usize, 0), ds.passCeil());
+    }
 }
 
 test "dsv41 prefill chunk: under the pass plan the chunk loop cuts a prompt into near-equal chunks no wider than the pinned pass; off, 8192-row chunks and the rest" {
