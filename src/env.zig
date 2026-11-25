@@ -168,26 +168,6 @@ pub fn unsetForeign(name: [*:0]const u8) void {
     _ = if (is_windows) c._putenv_s(name, "") else c.unsetenv(name);
 }
 
-/// A hash of every set `kill` and `tuning` variable, name and value: the switches that pick a kernel arm, read at load or
-/// on a call (the MXFP4 view, a lever's `=0`, a tile). Two processes with equal keys compile the same arms; a warm-up
-/// marker keyed on it (`warm_requests.Subject.kernels`) is owed again when any of them changes.
-pub fn armsKey() u64 {
-    @setEvalBranchQuota(20_000);
-    var h = std.hash.Fnv1a_64.init();
-    inline for (comptime std.meta.declarations(vars)) |n| {
-        switch (comptime @field(vars, n).kind) {
-            .kill, .tuning => if (named(n)) |v| {
-                h.update(n);
-                h.update("=");
-                h.update(std.mem.span(v));
-                h.update("\x00");
-            },
-            else => {},
-        }
-    }
-    return h.final();
-}
-
 /// Whether `name` is one of `vars` (a plugin option may not reuse it).
 pub fn registered(name: []const u8) bool {
     inline for (comptime std.meta.declarations(vars)) |n| if (std.mem.eql(u8, n, name)) return true;
@@ -376,7 +356,7 @@ pub const vars = struct {
     pub const MLX_SERVE_DSV41_PF_KV_ROWS: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 kv_row, one 512-thread threadgroup a row): a DeepSeek-V4.1 prompt call's window kv rows (more than 16) get kv_row's rms, rope and fp8 round trip from one simdgroup a row, the row width compiled in, no threadgroup memory or barrier; the same words; read each call" };
     pub const MLX_SERVE_DSV41_PF_DOWN_TOKORD: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 the down rows in expert order, unsorted by the combine): a DeepSeek-V4.1 prompt MoE call's staged fp4 down (PF_FP4_GEMM) writes each expert row straight to its pair's slot (token order), and the combine, MOE_TAIL and the hc_v2 tail read the rows in place with no unsort gather; the same words; read each call" };
     pub const MLX_SERVE_DSV41_PF_DOWN_BK32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "on (default; =0 the 64-deep step): under PF_FP4_GEMM a DeepSeek-V4.1 prompt MoE call of 96 routed rows an expert and more runs its staged fp4 down (and PF_DOWN_TOKORD's scatter) on the 64 x 64 tile 32 deep a step (gather_qmm_nax.wide_down) instead of 64; the k16 blocks sum in the same order, so the same words; read each call" };
-    pub const MLX_SERVE_DSV41_PF_INT8: Var = .{ .kind = .kill, .type = .int, .default = "0", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "NOT LOSSLESS. 3: a resident DeepSeek-V4.1 wide prompt pass runs wq_b and wo_b on w8a8's int8 GEMM (input and weight rotated by a 256-point Hadamard transform, one scale a row each; the int8 weights made from the mxfp8 weights at load for the wide layers, billed); 4: level 3, and the shared expert's gate/up and down and the fused wq_a+wkv on the same GEMM; the served text can change; 0 (default; lossless): the exact path; --precision lossy picks 4; read each call" };
+    pub const MLX_SERVE_DSV41_PF_INT8: Var = .{ .kind = .kill, .type = .int, .default = "0", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "NOT LOSSLESS; a single-Mac (M5 Ultra 512 GB) feature. 3: a resident DeepSeek-V4.1 wide prompt pass runs wq_b and wo_b of the CED encoder's layers on w8a8's int8 GEMM (input and weight rotated by a signed 256-point Hadamard transform, an f32 scale a row each over int8 values; the int8 weights made from the mxfp8 weights at load, billed); 4: level 3, and the shared expert's gate/up and down and the fused wq_a+wkv on the same GEMM; the decoder layers stay exact on every call; inert (a load line names why) on a two-Mac pair, a tensor split, streamed weights or without NAX; the served text can change; 0 and every other value (default 0; lossless): the exact path; --precision lossy picks 4; read at load" };
     pub const MLX_SERVE_DSV41_PF_FP4_GEMM: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 MLX's gather_qmm): a DeepSeek-V4.1 prompt MoE call runs an fp4 bank's routed gate/up (with moe_act) and down on the staged NAX gather (activations and weight words a 64-deep step ahead, one barrier a step, K and N compiled in), the same words; read each call" };
     pub const MLX_SERVE_DSV41_WOA_JOIN: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "on (default; =0 two copies): a wide prompt layer joins its spans' wo_a rows from their groups' views (one copy where each span's reshape and the join made two), the same math; read each call" };
     pub const MLX_SERVE_DSV41_PF_HC_V2: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 the five passes): a resident DeepSeek-V4.1 wide prompt layer on a NAX GPU (bf16, the release's hc shapes) runs its hyper-connections in three passes over the stream (the FFN side's expand, norm and mixes; the tail's expand with the next layer's attention-side norm and mixes), 64 rows a threadgroup sharing the mix weights; an f32 reorder held to bounds: the attention side's mixes and split within 1e-5 of float64 in l2 and max (measured 2-6x farther than the five passes, at the 1e-7 level, below the bf16 rounding that follows), every other output within 1.01x of the five passes' float64 l2, the stream the same words; read each call" };

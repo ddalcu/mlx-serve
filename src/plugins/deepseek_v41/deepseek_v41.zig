@@ -630,6 +630,8 @@ pub const Dsv41Model = struct {
     owned: std.ArrayList(A) = .empty,
     /// The NVFP4 banks the load served as MXFP4 (`mxView`).
     view: mx_view.Tally = .{},
+    /// `MLX_SERVE_DSV41_PF_INT8`'s int8 trunk weights, made at load from its plan (`pfint8.trunkLoad`); freed in `deinit`.
+    trunk8: pfint8.Table = .{},
     /// The outside quant plugin that reads the pack's weights (`InitOpts.quant`), while `init` runs.
     quant: ?*const outside.Format = null,
     /// Every weight it loaded, released in `deinit`.
@@ -697,6 +699,7 @@ pub const Dsv41Model = struct {
     pub fn deinit(self: *Dsv41Model) void {
         // scratch_x1.zig: the prompt's regions let go with the model.
         sx1.releaseAll();
+        self.trunk8.deinit(self.gpa);
         self.dropNext();
         self.dropEngNext();
         if (self.dec_state) |*st| st.deinit();
@@ -1039,7 +1042,7 @@ fn exactMiss(m: *Dsv41Model, li: usize) void {
 
 var ced_env: ?bool = null;
 /// `MLX_SERVE_DSV41_CED=0` keeps every prefill chunk on the full forward.
-fn cedEnabled() bool {
+pub fn cedEnabled() bool {
     if (ced_env == null) {
         const v = lev.get(.CED);
         ced_env = v == null or v.?[0] != '0';
@@ -2680,8 +2683,8 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         if (b.w.ctx != null) log.info("deepseek_v41: routed experts {t} bits={d} group={d}, per-expert scales gate={} up={} down={}\n", .{ b.qp.mode, b.qp.bits, b.qp.group_size, ex.scale[0] != null, ex.scale[1] != null, ex.scale[2] != null });
     }
     m.view.report();
-    // MLX_SERVE_DSV41_PF_INT8: the wide layers' int8 trunk weights now, not inside a prompt
-    try pfint8.trunkLoad(gpa, m, cedSplit(&m.cfg) orelse m.n_layers);
+    // MLX_SERVE_DSV41_PF_INT8: its plan's int8 trunk weights now; no prompt makes one
+    try pfint8.trunkLoad(gpa, m);
     return m;
 }
 
@@ -4566,14 +4569,14 @@ pub fn qkvProjWith(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, x: 
 pub fn qkvRows(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !Proj {
     const c = &m.cfg;
     const qa, const kv = if (ly.q_kv) |*f| blk: {
-        const y = (try pfint8.trunk4(sc, m, f, x, "wq_a+wkv")) orelse try f.apply(sc, x);
+        const y = (try pfint8.trunk(sc, m, ly, .q_kv, x, "wq_a+wkv")) orelse try f.apply(sc, x);
         const n = dim(y, -1);
         break :blk .{ try sc.slice(y, -1, 0, n - c.head_dim), try sc.slice(y, -1, n - c.head_dim, n) };
     } else .{ try ly.wq_a.apply(sc, x), try ly.wkv.apply(sc, x) };
     const qr = (try rmsRows(sc, qa, ly.q_norm, c.rms_norm_eps)) orelse try sc.rms(qa, ly.q_norm, c.rms_norm_eps);
     try trunkDump(sc, "qkv_in", x);
     try trunkDump(sc, "wq_b_in", qr);
-    const qb = (try pfint8.trunk(sc, m, &ly.wq_b, qr, "wq_b")) orelse try ly.wq_b.apply(sc, qr);
+    const qb = (try pfint8.trunk(sc, m, ly, .wq_b, qr, "wq_b")) orelse try ly.wq_b.apply(sc, qr);
     return .{ .q = try sc.reshape(qb, &.{ ci(dim(x, 0)), -1, ci(c.head_dim) }), .kv = kv, .qr = qr };
 }
 
@@ -5865,14 +5868,14 @@ pub fn withShared(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, y: A
 pub fn shared(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !A {
     // A prompt's rows take the routed experts' activation kernel (weight 1): one pass, not the f32 op chain's five.
     if (ly.shared_gu) |*gu| if (dim(x, 0) > region_rows and mlx.streamIsGpu(sc.s)) {
-        const y = (try pfint8.trunk4(sc, m, gu, x, "shared gate+up")) orelse try gu.apply(sc, x);
+        const y = (try pfint8.trunk(sc, m, ly, .shared_gu, x, "shared gate+up")) orelse try gu.apply(sc, x);
         const L = dim(y, 0);
         const n = dim(y, -1) / 2;
         const lim = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.dsv4_swiglu_limit}, &[_]c_int{1}, 1, .float32));
         const act = try flatKernel(sc, m.moe_act_kernel, &.{ y, try sc.ones(&.{ci(L)}, .float32), lim }, &.{ ci(L), ci(n) }, m.act, L * n, &.{.{ .name = "N", .v = ci(n) }});
         try trunkDump(sc, "shared_in", x);
         try trunkDump(sc, "shared_down_in", act);
-        return (try pfint8.trunk4(sc, m, &ly.shared[2], act, "shared down")) orelse ly.shared[2].apply(sc, act);
+        return (try pfint8.trunk(sc, m, ly, .shared_down, act, "shared down")) orelse ly.shared[2].apply(sc, act);
     };
     // An outside plugin's shared expert in one dispatch where it takes the call.
     if (ly.shared_gu == null) if (ly.shared[0].ext) |*w1| if (ly.shared[1].ext) |*w3| if (ly.shared[2].ext) |*w2| if (try outside.denseSwiglu(w1, w3, w2, x, @intFromFloat(m.cfg.dsv4_swiglu_limit), sc.s)) |fy| {
@@ -7453,7 +7456,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     const joined = try sc.concat(heads[0..n_heads], 0);
     const wo_in = if (woa_join) try sc.reshape(joined, &.{ ci(sp.L), -1 }) else joined;
     if (m.tp == null) try trunkDump(&sc, "wo_b_in", wo_in);
-    const y = try abl.ablate(&sc, m, if (m.tp != null) joined else (try pfint8.trunk(&sc, m, &ly.wo_b, wo_in, "wo_b")) orelse try ly.wo_b.apply(&sc, wo_in));
+    const y = try abl.ablate(&sc, m, if (m.tp != null) joined else (try pfint8.trunk(&sc, m, ly, .wo_b, wo_in, "wo_b")) orelse try ly.wo_b.apply(&sc, wo_in));
     // scratch_x1.zig: the streams after the attention into the prompt's x1 region (a streamed bank runs one MoE
     // group, so that group's output is the region's last reader's). Not under an ablation: the FFN's output is then
     // ablated against x1 after the call that would end the region's reads.
