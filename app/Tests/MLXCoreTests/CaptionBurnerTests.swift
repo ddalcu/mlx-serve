@@ -1,5 +1,6 @@
 import AVFoundation
 import ImageIO
+import UniformTypeIdentifiers
 import XCTest
 @testable import MLXCore
 
@@ -44,21 +45,47 @@ final class CaptionBurnerTests: XCTestCase {
         XCTAssertEqual(states[1].end, 0.9, accuracy: 1e-9)
     }
 
+    /// The brightest sampled pixel, by `level` of its 8-bit r, g, b, in a band of rows, read from an sRGB copy
+    /// of the image: `NSBitmapImageRep.colorAt` on an untagged video frame logs a colorspace error per pixel.
+    private func brightest(_ image: CGImage, rows: ClosedRange<Double>, level: (Int, Int, Int) -> Int) -> Int {
+        let (w, h) = (image.width, image.height)
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        let drawn = px.withUnsafeMutableBytes { buf -> Bool in
+            guard let ctx = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        XCTAssertTrue(drawn, "no bitmap to read")
+        var best = 0
+        for y in Int(rows.lowerBound * Double(h))..<Int(rows.upperBound * Double(h)) {
+            for x in stride(from: 0, to: w, by: 2) {
+                let i = (y * w + x) * 4
+                best = max(best, level(Int(px[i]), Int(px[i + 1]), Int(px[i + 2])))
+            }
+        }
+        return best
+    }
+
     /// The brightest pixel (red + green) in a band of rows, half a second in.
     private func brightest(_ url: URL, rows: ClosedRange<Double>) async throws -> Int {
         let gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
         gen.requestedTimeToleranceBefore = .zero
         gen.requestedTimeToleranceAfter = .zero
         let (image, _) = try await gen.image(at: CMTime(seconds: 0.5, preferredTimescale: 600))
-        let rep = NSBitmapImageRep(cgImage: image)
-        var best = 0
-        for y in Int(rows.lowerBound * Double(rep.pixelsHigh))..<Int(rows.upperBound * Double(rep.pixelsHigh)) {
-            for x in stride(from: 0, to: rep.pixelsWide, by: 2) {
-                guard let c = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
-                best = max(best, Int((c.redComponent + c.greenComponent) * 127.5))
-            }
-        }
-        return best
+        return brightest(image, rows: rows) { r, g, _ in (r + g) / 2 }
+    }
+
+    private func writeGreyPNG(_ white: CGFloat, width: Int, height: Int, to url: URL) throws {
+        let ctx = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                          space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        ctx.setFillColor(gray: white, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let dest = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(dest, try XCTUnwrap(ctx.makeImage()), nil)
+        XCTAssertTrue(CGImageDestinationFinalize(dest))
     }
 
     /// A two-second grey clip with a silent soundtrack, in a folder removed at teardown.
@@ -119,22 +146,10 @@ final class CaptionBurnerTests: XCTestCase {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let src = dir.appendingPathComponent("p.png"), out = dir.appendingPathComponent("m.png")
-        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 512, pixelsHigh: 768, bitsPerSample: 8, samplesPerPixel: 4,
-                                   hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
-        for y in 0..<768 { for x in 0..<512 { rep.setColor(NSColor(white: 0.16, alpha: 1), atX: x, y: y) } }
-        try rep.representation(using: .png, properties: [:])!.write(to: src)
+        try writeGreyPNG(0.16, width: 512, height: 768, to: src)
         try CaptionBurner.burn(image: src, top: "his royal highness", bottom: "duke of the couch", to: out)
-        let img = try XCTUnwrap(NSBitmapImageRep(data: try Data(contentsOf: out)))
-        func brightest(_ rows: ClosedRange<Double>) -> Int {
-            var best = 0
-            for y in Int(rows.lowerBound * 768)..<Int(rows.upperBound * 768) {
-                for x in stride(from: 0, to: 512, by: 2) {
-                    let c = img.colorAt(x: x, y: y)!.usingColorSpace(.deviceRGB)!
-                    best = max(best, Int(c.redComponent * 255))
-                }
-            }
-            return best
-        }
+        let burned = try XCTUnwrap(CGImageSourceCreateImageAtIndex(try XCTUnwrap(CGImageSourceCreateWithURL(out as CFURL, nil)), 0, nil))
+        func brightest(_ rows: ClosedRange<Double>) -> Int { self.brightest(burned, rows: rows) { r, _, _ in r } }
         XCTAssertGreaterThan(brightest(0.0...0.2), 200, "no top text")
         XCTAssertGreaterThan(brightest(0.8...0.99), 200, "no bottom text")
         XCTAssertLessThan(brightest(0.4...0.6), 60, "the middle of the picture changed")
