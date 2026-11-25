@@ -1546,10 +1546,28 @@ cache and outside every metric. Serving them all before ready made that load sev
 the model is ready first and serves a short plan when the server is idle (a forward at every verify width, a short
 chat, a long prompt, that prompt with other endings), each request admitted alone so a real one never decodes
 beside it, the model never held so it stays evictable (an unload drops the warm-up first); `--warmup-full` serves
-that and a ladder of prompt sizes before ready, which a benchmark needs. A marker per plan beside Metal's cache,
-keyed on the build, the OS build and the pack, makes every later load owe nothing. macOS only. Guards:
+that and a ladder of prompt sizes before ready, which a benchmark needs. macOS only. Guards:
 `tests/test_first_request_compiles.sh` (a copy of the binary under another bundle id starts with an empty cache),
-`owed`, `nextStep`, `forget`, `an idle warm-up waits beside a real request without holding its model`.
+`nextStep`, `forget`, `an idle warm-up waits beside a real request without holding its model`.
+
+### A warm-up marker keyed on the load's inputs skipped the warm-up of loads that compile other kernels
+Defect: after an NVFP4 load of a DeepSeek-V4.1 pack, a load of the same build and pack under
+`MLX_SERVE_DSV41_MXFP4_VIEW=1` skipped its warm requests and compiled its MXFP4 kernels inside its first prompt (a
+p01 at 4,312 prefill tok/s against about 5,600). A first fix added the kill switches and the pack's top-level
+quantization to the marker's key; a review then found a DSpark-on load after a DSpark-off one skipping the same way,
+and a map of the class (65 inputs) found 38 that pick kernels outside the key: public and diag variables, foreign MLX
+variables, outside-plugin options, CLI arms, per-model settings, memory at load (pass rows), pack bytes replaced
+under the same path, outside dylib versions, and a marker written after a partial plan; Metal's own cache can also
+be cleared under a marker. Pattern: a copied proxy fact. The marker was an allow-list of inputs its owner chose,
+standing in for "these pipelines are compiled", which every other part of the program decides. Fix: no marker.
+Invariant: a load serves its first request only after its own warm plan ran in this process; Metal's shader cache is
+the one record of what is compiled, so on a matching load the plan costs only its forwards. `--warmup-full` also
+serves a prompt at the load's widest pass (`pinned_prefill_chunk`: the ladder stopped at 10,248 rows, so a wider
+pass compiled in the first long prompt) and drops the ladder's 10 s time budget (a slow machine dropped the widest
+rung). The benchmark harness's unmeasured pre-warm masked the class; a test of it measures the first request after a
+load with no pre-warm. Guards: `tests/test_first_request_compiles.sh` (a load after another under DSpark, the MXFP4
+view, `PF_GU_SEG`, `--no-mtp` or a replaced pack compiles nothing; the widest pass compiles nothing),
+`widestRung`, `the full plan`, `stop: a warm-up still owed at shutdown is dropped, cut short`.
 
 ### A fresh build's warm-up taught the round-cost table its shader compiles
 Defect: on a build's first load of Flash Next, the first requests drafted 2 wide where 3 to 5 pay, and a release
