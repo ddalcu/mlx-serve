@@ -5,9 +5,9 @@
 //! - fp4, either format (`MLX_SERVE_DSV41_MOE_PAIR_FP4`, on): the fused-bank gather and `moe_act` in the epilogue
 //!   (`sortedGateUpRouted`). NVFP4 brings ModelOpt's per-expert scales, multiplied in the epilogue; MXFP4 (or the MXFP4
 //!   view of NVFP4) has none, so the same kernel runs with that step compiled out (the scales' presence is part of its
-//!   key). A reorder: the split path's roundings with the sums in another order, so about 0.2% of the words differ,
-//!   each within one bf16 step of its row's scale (a word the split path gives as zero keeps a tiny value here, many
-//!   ulps away), and the float64 l2 is the split path's.
+//!   key). A reorder: the split path's roundings with the sums in another order, so about 0.2% of the words differ on
+//!   NVFP4 (0.0015% on MXFP4), each within one bf16 step of its row's scale (a word the split path gives as zero keeps
+//!   a tiny value here, many ulps away), and the float64 l2 is the split path's.
 
 const std = @import("std");
 const env = @import("../../../env.zig");
