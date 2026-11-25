@@ -253,6 +253,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
 /// The settings a load reads, each refused by name at a bad value: the precision and the stack switches
 /// (`levers.check`, then the load's settings line), the Engram LRU, flash attention. Flash attention is on for every pack by default
 /// (`MLX_SERVE_DSV41_FLASH_ATTN`: unset, empty or 1 on, =0 the exact gather; its f32 output sits closer to float64 than
+/// The DSpark typical pair a sampled request takes by default (`levers.lossyTypical`: under `--precision lossy`).
+pub fn lossyTypical() ?@import("../../sdk/spec/mtp_acceptance.zig").Typical {
+    return lev.lossyTypical();
+}
+
 /// the gather's).
 fn configureLoad(c: *const config.Config) !void {
     _ = c;

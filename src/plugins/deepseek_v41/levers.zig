@@ -16,6 +16,7 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const shared = @import("../../sdk/util/shared.zig");
 const log = @import("../../sdk/util/log.zig");
+const acceptance = @import("../../sdk/spec/mtp_acceptance.zig");
 
 pub const Stack = enum { prefill, attention, decode, spec, memory, loader };
 /// The README's classes. `requant` is HEAD8 alone, the one accepted requantization that lossless keeps.
@@ -50,8 +51,15 @@ pub const Row = struct {
 
 pub const prefix = "MLX_SERVE_DSV41_";
 
-/// Typical acceptance's delta under `precision=lossy` (the decode agent's sweep picks it); null: exact acceptance.
-pub const lossy_typical_delta: ?f32 = null;
+/// The DSpark typical rule a sampled request takes under `precision=lossy` when nothing else sets its acceptance:
+/// Medusa's form, a draft kept iff p > min(eps, delta e^-H) (the 16K standard cells: +13.2% decode against exact).
+pub const lossy_typical: acceptance.Typical = .{ .delta = 0.2, .eps = 0.04 };
+
+/// The typical pair a DeepSeek-V4.1 sampled request takes by default: `lossy_typical` under `precision=lossy`, else
+/// null (exact). An explicit `--mtp-typical`, `--mtp-tokenv3` or model `mtp_acceptance` setting wins (the engine's).
+pub fn lossyTypical() ?acceptance.Typical {
+    return if (precision() == .lossy) lossy_typical else null;
+}
 
 pub const rows = [_]Row{
     .{ .name = "PROMPT_ASYNC_EVAL", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Commits the last wide prompt layer without a wait", .evidence = "test (word for word)" },
@@ -327,8 +335,7 @@ pub fn settingsLine(buf: []u8) []const u8 {
     };
     if (n == 0) w.writeAll("-") catch {};
     if (precision() == .lossy) {
-        if (lossy_typical_delta) |d| w.print(" accept=typical:{d}", .{d}) catch {} else w.writeAll(" accept=exact (no typical delta yet)") catch {};
-        w.writeAll(" NOT lossless") catch {};
+        w.print(" accept=typical:delta={d},eps={d} (sampled; unless the engine's acceptance is set) NOT lossless", .{ lossy_typical.delta, lossy_typical.eps }) catch {};
     } else w.writeAll(" accept=exact") catch {};
     return w.buffered();
 }
@@ -402,7 +409,7 @@ pub fn renderLossy(w: *std.Io.Writer) !void {
     inline for (rows) |r| if (comptime r.lossy != null) {
         try w.print("| {s} | {s} | {s} | {s} |\n", .{ r.name, comptime pickText(r.lossless), comptime pickText(r.lossy.?), r.what });
     };
-    try w.writeAll("| typical acceptance (the engine's DSpark rule) | exact | typical at `levers.lossy_typical_delta`; exact while it is unset | sampled drafts kept by the typical rule |\n");
+    try w.print("| typical acceptance (the engine's DSpark rule) | exact | typical at delta {d}, eps {d} (`levers.lossy_typical`), unless `--mtp-typical`, `--mtp-tokenv3` or a model `mtp_acceptance` sets it | a sampled request's drafts kept iff p > min(eps, delta e^-H) |\n", .{ lossy_typical.delta, lossy_typical.eps });
 }
 
 fn pickText(comptime p: Pick) []const u8 {
@@ -607,6 +614,8 @@ test "deepseek_v41 levers: precision lossy picks PF_INT8=4 and the site's ATTN_F
     try check();
     try testing.expectEqual(@as(u32, 4), int(.PF_INT8, u32, 0));
     try testing.expect(get(.ATTN_F16) == null);
+    try testing.expectEqual(@as(f32, 0.2), lossyTypical().?.delta);
+    try testing.expectEqual(@as(f32, 0.04), lossyTypical().?.eps);
     try testing.expect(lossyKey() != null);
     _ = env.setForeign("MLX_SERVE_DSV41_STACK_PREFILL", "0");
     refresh();
@@ -615,6 +624,7 @@ test "deepseek_v41 levers: precision lossy picks PF_INT8=4 and the site's ATTN_F
     try testing.expectError(error.Dsv41Precision, check());
     clearControls();
     try testing.expect(lossyKey() == null);
+    try testing.expect(lossyTypical() == null);
     try check();
 }
 

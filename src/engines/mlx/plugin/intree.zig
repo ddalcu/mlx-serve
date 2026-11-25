@@ -47,6 +47,13 @@ pub fn dsv41(xfm: *const Transformer) ?*v41plugin.Module {
     return if (served(b.table, @import("../../../plugins/deepseek_v41/config.zig").plugin.name)) v41plugin.moduleOf(b.model) else null;
 }
 
+/// The typical pair a DeepSeek-V4.1 model's sampled DSpark request takes by default (its plugin's precision); null
+/// for another model or under lossless.
+pub fn dsv41LossyTypical(xfm: *const Transformer) ?@import("../../../sdk/spec/mtp_acceptance.zig").Typical {
+    if (dsv41(xfm) == null) return null;
+    return v41plugin.lossyTypical();
+}
+
 /// The DeepSeek-V4.1 live state of each slot behind `ctxs` and its identity, for a DSpark group round
 /// (`spec/dspark_group.zig`); false where the module runs no batch or a slot has none.
 pub fn dsv41States(xfm: *const Transformer, ctxs: []const *ForwardCtx, states: []*v41plugin.State, gens: []u64) bool {

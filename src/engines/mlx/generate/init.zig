@@ -136,6 +136,13 @@ pub fn initWithOptions(
         if (xfm.dsparkStages() > 0 and !dspark_env_off and arm != .off) {
             dspark_active = true;
             dspark_stochastic = arm == .stochastic;
+            // DeepSeek-V4.1 under --precision lossy: a sampled request whose acceptance nothing set (exact, no model
+            // setting, no process flag) takes its plugin's typical pair.
+            if (dspark_stochastic and std.meta.activeTag(options.mtp_acceptance) == .exact and xfm.config.mtp_acceptance_override == null and
+                std.meta.activeTag(generate_mod.mtp_acceptance_default) == .exact)
+                if (intree.dsv41LossyTypical(xfm)) |t| {
+                    options.mtp_acceptance = .{ .typical = t };
+                };
             // The sampled arm takes the request's acceptance mode: typical (LOSSY) where it asks for it, else exact.
             if (dspark_stochastic) switch (options.mtp_acceptance) {
                 .typical => |cfg| {

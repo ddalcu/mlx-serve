@@ -311,7 +311,10 @@ fn printUsage(io: std.Io) void {
         \\                        lossless lever and the 8-bit LM head; lossy
         \\                        adds the LOSSY ones (int8 prompt trunk
         \\                        projections, the f16 attention core without
-        \\                        NAX). MLX_SERVE_DSV41_STACK_<STACK>=0 turns a
+        \\                        NAX, DSpark typical acceptance at delta 0.2,
+        \\                        eps 0.04 for sampled requests unless an
+        \\                        --mtp-typical or --mtp-tokenv3 flag or a model
+        \\                        setting sets it). MLX_SERVE_DSV41_STACK_<STACK>=0 turns a
         \\                        stack off (src/plugins/deepseek_v41/README.md).
         \\  --decode-attn-quant / --no-decode-attn-quant
         \\                      Serve decode from quantized side copies of
