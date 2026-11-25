@@ -429,7 +429,7 @@ fn driftRun(comptime T: type, a: std.mem.Allocator, k: kc.gates.Kernel, shape: S
 }
 
 test "kernel contract exl3: each declared launch is the shipped wrapper's, byte for byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var set = kc.Set.init(a);
     defer set.deinit();

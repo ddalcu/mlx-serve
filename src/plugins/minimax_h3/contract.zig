@@ -861,7 +861,7 @@ pub fn register(set: *kc.Set) !void {
 // ── tests ──
 
 test "kernel contract h3: each declared launch is the shipped wrapper's, byte for byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var q = QkvPrep.init(a, &qkv_bf16, .bfloat16, 48);
     defer q.deinit();

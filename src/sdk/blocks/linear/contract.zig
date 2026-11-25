@@ -522,7 +522,7 @@ pub fn register(set: *kc.Set) !void {
 // ── tests ──
 
 test "kernel contract linear: each declared launch is the shipped wrapper's, byte for byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var set = kc.Set.init(a);
     defer set.deinit();
