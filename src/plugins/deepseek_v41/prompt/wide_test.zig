@@ -2857,7 +2857,7 @@ test "dsv41 wide tol: MLX_SERVE_DSV41_PF_IDX_PASS keeps a release-shape index la
     env.set(.MLX_SERVE_DSV41_PF_IDX_PASS, "0");
     const same = [_]bool{ try sameWords(want[0], exact[0]), try sameWords(want[1], exact[1]) };
     std.debug.print("wide layers {s}, PF_IDX_PASS: served {d} layers, within tolerance {}; queries over the pass with per-span head weights: streams {} mixes {}; planted within tolerance {}\n", .{ label, n, ok, same[0], same[1], planted });
-    try testing.expect(n >= 1 and ok and same[0] and same[1]);
+    try testing.expect(n >= 1 and ok and same[0] and same[1] and !planted);
 }
 
 test "dsv41 wide tol: PF_IDX_PASS's head weights (kernels/idx_wproj.metal) are no farther from float64 than MLX's GEMM per 256-row span (the served call) in l2 and max over every output, 32 heads x 5,120, bf16 out, 257 to 17,639 rows; a weight row moved fails" {
