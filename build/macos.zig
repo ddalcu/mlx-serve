@@ -206,8 +206,10 @@ pub fn addServer(g: *const Graph, plugin_names: []const []const u8) void {
         }
         mod.root_source_file = b.path("src/exe.zig");
         // Plugins dealt round-robin into `unit-groups` objects: each compiles the shared code it reaches once, so fewer
-        // groups cost less CPU, more groups more parallelism.
-        const n_groups = @min(plugin_names.len, b.option(usize, "unit-groups", "Plugin objects under -Dunits (default 8)") orelse 8);
+        // groups cost less CPU, more groups more parallelism. The default is one group per core, 2 to 8.
+        const cores = std.Thread.getCpuCount() catch 8;
+        const default_groups = std.math.clamp(cores, 2, 8);
+        const n_groups = @min(plugin_names.len, b.option(usize, "unit-groups", "Plugin objects under -Dunits (default: one per core, 2 to 8)") orelse default_groups);
         const groups = b.allocator.alloc([]const []const u8, n_groups) catch @panic("OOM");
         for (groups, 0..) |*names, gi| {
             var list: std.ArrayList([]const u8) = .empty;
@@ -241,7 +243,7 @@ pub fn addServer(g: *const Graph, plugin_names: []const []const u8) void {
 /// modules (they import their host root), and no C sources (the exe links those once).
 fn unitModule(g: *const Graph, includes: []const std.Build.Module.IncludeDir, root: []const u8) *std.Build.Module {
     const b = g.b;
-    const m = b.createModule(.{ .root_source_file = b.path(root), .target = g.target, .optimize = g.optimize, .link_libcpp = true });
+    const m = b.createModule(.{ .root_source_file = b.path(root), .target = g.target, .optimize = g.optimize, .link_libcpp = true, .strip = g.exe_mod.strip });
     var it = g.exe_mod.import_table.iterator();
     while (it.next()) |e| if (!std.mem.eql(u8, e.key_ptr.*, "sushi_exl3")) m.addImport(e.key_ptr.*, e.value_ptr.*);
     m.include_dirs.appendSlice(b.allocator, includes) catch @panic("OOM");
