@@ -10,6 +10,8 @@ const uint lane = thread_index_in_simdgroup;
 const uint sg = t / 32;
 constexpr uint NSG = TG / 32;
 threadgroup float red[NSG * J];
+// The streams' folds of the SIMD groups' partial sums, each by one thread in the order every thread used to run it.
+threadgroup float fold[J];
 float ss[J], mine[J];
 for (uint j = 0; j < J; j++) ss[j] = 0.0f;
 for (uint i = t; i < D; i += TG) for (uint j = 0; j < J; j++) {
@@ -22,11 +24,13 @@ for (uint j = 0; j < J; j++) {
     if (lane == 0) red[sg * J + j] = ss[j];
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
-for (uint j = 0; j < J; j++) {
+for (uint j = t; j < J; j += TG) {
     float s = 0.0f;
     for (uint g = 0; g < NSG; g++) s += red[g * J + j];
-    ss[j] = metal::precise::rsqrt(s / float(D) + PR[0]);
+    fold[j] = s;
 }
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (uint j = 0; j < J; j++) ss[j] = metal::precise::rsqrt(fold[j] / float(D) + PR[0]);
 if (e >= D) {
     const uint ex = (e - D) / 32;
     float dot = 0.0f;

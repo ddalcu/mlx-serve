@@ -38,6 +38,9 @@ pub const Run = struct {
     eval_every: u32 = 0,
     /// `Ctx.capture_spec`.
     capture_spec: bool = false,
+    /// `Caps.prompt_last_row` (the base's `prompt_last_row`): a one-slot `.last_row` head reads the final's last
+    /// `head_tail_rows` rows only.
+    head_tail: bool = false,
     /// `Ctx.row_exact`.
     row_exact: row_exact.Lane = .off,
     /// `Ctx.mrope`: the chunk's M-RoPE cos/sin (`Forward.mrope`).
@@ -102,12 +105,15 @@ pub const Run = struct {
         try mlx.check(mlx.mlx_eval(vec));
     }
 
-    /// The head over every row (a row's logits must not depend on how many rows ride with it), then the rows asked for.
+    /// The head over every row (a row's logits must not depend on how many rows ride with it), then the rows asked for;
+    /// under `head_tail` a last-row head over the last `head_tail_rows` rows, still a prompt-sized matmul.
     pub fn finish(r: *const Run, g: *Graph, c: *Ctx, final: Array, comptime Head: type, head: *const Head.Weights) !Out {
         var out: Out = .{};
         if (r.want_hidden) out.hidden = final;
         if (r.logits == .none) return out;
-        const logits = try Head.forward(head, c, final);
+        const n = ops.shape(final)[1];
+        const tail = r.head_tail and r.logits == .last_row and r.slots == 1 and n > head_tail_rows;
+        const logits = try Head.forward(head, c, if (tail) try g.sliceAxis(final, 1, n - head_tail_rows, n) else final);
         const sh = ops.shape(logits);
         out.logits = switch (r.logits) {
             .last_row => try g.reshape(try g.sliceAxis(logits, 1, sh[1] - 1, sh[1]), &.{ sh[0], sh[2] }),
@@ -117,6 +123,14 @@ pub const Run = struct {
         return out;
     }
 };
+
+/// The rows a `head_tail` last-row head reads: at or past `qmm_rows_min`, so its last row keeps the all-rows bits.
+pub const head_tail_rows: c_int = 32;
+/// Rows from which MLX's quantized matmul runs its prompt kernel, each row's sums independent of the row count.
+const qmm_rows_min: c_int = 16;
+comptime {
+    if (head_tail_rows < qmm_rows_min) @compileError("head_tail_rows under qmm_rows_min: the last row's bits would move");
+}
 
 /// A forward's results, owned by its graph: logits `[slots, vocab]` (last row) or `[slots * rows, vocab]`, and the
 /// final-normed hidden `[slots, rows, hidden]` when asked.
@@ -210,6 +224,7 @@ fn run(comptime Base: type, m: *Model(Base), f: *const abi.Forward, out: *abi.Fo
         .captured = captured,
         .eval_every = if (f.rows > 1) f.eval_every else 0,
         // Verify rows roll back on a partial accept; a batched decode step (one row) never does.
+        .head_tail = @hasDecl(Base, "prompt_last_row") and Base.prompt_last_row,
         .capture_spec = f.mode == .verify or (f.mode == .batched_rows and f.rows > 1),
         .mrope = if (f.mrope.ctx != null) .{ try mropeHalf(&g, .{ .ctx = f.mrope.ctx }, 0), try mropeHalf(&g, .{ .ctx = f.mrope.ctx }, 1) } else null,
         .media = .{ .ctx = f.media.ctx },
@@ -302,3 +317,34 @@ pub const TAIL_MERGE_MAX: usize = 512;
 
 /// Slots one batched forward carries (twin of `scheduler.MAX_BATCH_GROUP`).
 pub const MAX_BATCH_ROWS = 32;
+
+// Bar: a head_tail last-row head reads the last head_tail_rows rows; at or under them, an all-rows ask, several slots
+// or no head_tail, every row.
+test "run: a head_tail last-row head reads the final's last rows only" {
+    const H = struct {
+        var rows: c_int = 0;
+        const Weights = struct {};
+        fn forward(_: *const Weights, _: *Ctx, x: Array) !Array {
+            rows = ops.shape(x)[1];
+            return x;
+        }
+    };
+    var g = Graph.init(std.testing.allocator, mlx.mlx_default_cpu_stream_new());
+    defer g.deinit();
+    var c: Ctx = undefined;
+    const cases = [_]struct { n: c_int, tail: bool, logits: abi.Logits, slots: c_int, reads: c_int }{
+        .{ .n = 300, .tail = true, .logits = .last_row, .slots = 1, .reads = head_tail_rows },
+        .{ .n = 33, .tail = true, .logits = .last_row, .slots = 1, .reads = head_tail_rows },
+        .{ .n = 32, .tail = true, .logits = .last_row, .slots = 1, .reads = 32 },
+        .{ .n = 31, .tail = true, .logits = .last_row, .slots = 1, .reads = 31 },
+        .{ .n = 300, .tail = true, .logits = .all_rows, .slots = 1, .reads = 300 },
+        .{ .n = 300, .tail = true, .logits = .last_row, .slots = 2, .reads = 300 },
+        .{ .n = 300, .tail = false, .logits = .last_row, .slots = 1, .reads = 300 },
+    };
+    for (cases) |k| {
+        const r: Run = .{ .mode = .prefill, .rows = k.n, .slots = k.slots, .positions = &.{0}, .logits = k.logits, .head_tail = k.tail };
+        const out = try r.finish(&g, &c, try g.zeros(&.{ 1, k.n, 4 }, .float32), H, &.{});
+        try std.testing.expectEqual(k.reads, H.rows);
+        if (k.logits == .last_row) try std.testing.expectEqual(@as(c_int, 1), ops.shape(out.logits)[0]);
+    }
+}
