@@ -54,26 +54,21 @@ pub fn scanLlmGguf(io: std.Io, allocator: std.mem.Allocator, dir: *std.Io.Dir, o
         scan.pick_bytes = setBytes(io, dir.*, p);
     };
     if (opts.shard_folders) {
-        var subs = dir.iterate();
-        while (subs.next(io) catch null) |entry| {
-            if (entry.kind != .directory and entry.kind != .sym_link) continue;
-            if (entry.name.len == 0 or entry.name[0] == '.') continue;
-            var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
-            defer sub.close(io);
-            var first_buf: [std.fs.max_name_bytes]u8 = undefined;
-            const first = shardFolderFirst(io, sub, &first_buf) orelse continue;
-            if (gguf_meta.fileDeclaresPooling(io, sub, first)) {
+        var folders: ShardFolders = .{ .dir = dir.*, .it = dir.iterate() };
+        defer folders.deinit(io);
+        while (folders.next(io)) |f| {
+            if (gguf_meta.fileDeclaresPooling(io, f.sub, f.first)) {
                 scan.saw_embedding = true;
                 continue;
             }
-            const rel = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry.name, first });
+            const rel = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ f.name, f.first });
             if (scan.pick != null and !std.mem.lessThan(u8, rel, scan.pick.?)) {
                 allocator.free(rel);
                 continue;
             }
             if (scan.pick) |p| allocator.free(p);
             scan.pick = rel;
-            scan.pick_bytes = setBytes(io, sub, first);
+            scan.pick_bytes = setBytes(io, f.sub, f.first);
         }
     }
     return scan;
@@ -182,17 +177,41 @@ pub fn isGgufModelPath(io: std.Io, path: []const u8) bool {
 
 /// Does `dir` hold a quant folder (`shardFolderFirst`)?
 pub fn hasShardFolder(io: std.Io, dir: std.Io.Dir) bool {
-    var subs = dir.iterate();
-    while (subs.next(io) catch null) |entry| {
-        if (entry.kind != .directory and entry.kind != .sym_link) continue;
-        if (entry.name.len == 0 or entry.name[0] == '.') continue;
-        var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
-        defer sub.close(io);
-        var buf: [std.fs.max_name_bytes]u8 = undefined;
-        if (shardFolderFirst(io, sub, &buf) != null) return true;
-    }
-    return false;
+    var folders: ShardFolders = .{ .dir = dir, .it = dir.iterate() };
+    defer folders.deinit(io);
+    return folders.next(io) != null;
 }
+
+/// The quant folders (`shardFolderFirst`) in `dir`. A result lives until the next `next` call.
+const ShardFolders = struct {
+    dir: std.Io.Dir,
+    it: std.Io.Dir.Iterator,
+    sub: ?std.Io.Dir = null,
+    buf: [std.fs.max_name_bytes]u8 = undefined,
+
+    const Folder = struct { name: []const u8, sub: std.Io.Dir, first: []const u8 };
+
+    fn next(self: *ShardFolders, io: std.Io) ?Folder {
+        self.deinit(io);
+        while (self.it.next(io) catch null) |entry| {
+            if (entry.kind != .directory and entry.kind != .sym_link) continue;
+            if (entry.name.len == 0 or entry.name[0] == '.') continue;
+            var sub = self.dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+            const first = shardFolderFirst(io, sub, &self.buf) orelse {
+                sub.close(io);
+                continue;
+            };
+            self.sub = sub;
+            return .{ .name = entry.name, .sub = sub, .first = first };
+        }
+        return null;
+    }
+
+    fn deinit(self: *ShardFolders, io: std.Io) void {
+        if (self.sub) |*s| s.close(io);
+        self.sub = null;
+    }
+};
 
 /// Resolve the actual .gguf file path. When `path` is a directory, return
 /// the alphabetically-smallest non-mmproj `.gguf` entry within it (caller
