@@ -1063,6 +1063,8 @@ pub fn testReset() void {
     sync_rounds.store(0, .monotonic);
     sync_collects.store(0, .monotonic);
     fusion.engaged = .{};
+    // The precision and stack switches the levers latch, read again from the restored variables.
+    lev.refresh();
 }
 
 pub fn resetCedEnvForTest() void {
@@ -14514,8 +14516,12 @@ test "dsv41 draft vocabulary: ids grow to whole buckets with the lowest ids outs
 
 // One test's state must not reach the next. Each pair runs in every shard ("sharded:"), the leak first, in file order.
 var world_comp_bf16_at_start: ?[]u8 = null;
+var world_precision_at_start: lev.Precision = .lossless;
 
-test "sharded: dsv41 test world: a test that sets a lever and leaves it (the PF_COMP_BF16 leak)" {
+test "sharded: dsv41 test world: a test that sets a lever and leaves it (the PF_COMP_BF16 leak), and latches precision lossy" {
+    world_precision_at_start = lev.precision();
+    env.set(.MLX_SERVE_DSV41_PRECISION, "lossy");
+    lev.refresh();
     world_comp_bf16_at_start = if (env.get(.MLX_SERVE_DSV41_PF_COMP_BF16)) |v| try std.heap.page_allocator.dupe(u8, std.mem.span(v)) else null;
     env.set(.MLX_SERVE_DSV41_PF_COMP_BF16, "0");
     _ = cedEnabled();
@@ -14523,7 +14529,8 @@ test "sharded: dsv41 test world: a test that sets a lever and leaves it (the PF_
     sync_rounds.store(3, .monotonic);
 }
 
-test "sharded: dsv41 test world: the next test starts from the process's levers, an unlatched CED read, the fuse latch at rest and zero sync rounds" {
+test "sharded: dsv41 test world: the next test starts from the process's levers and precision, an unlatched CED read, the fuse latch at rest and zero sync rounds" {
+    try testing.expectEqual(world_precision_at_start, lev.precision());
     const now = env.get(.MLX_SERVE_DSV41_PF_COMP_BF16);
     if (world_comp_bf16_at_start) |w| try testing.expectEqualStrings(w, std.mem.span(now.?)) else try testing.expect(now == null);
     try testing.expect(ced_env == null);
