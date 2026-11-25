@@ -2418,10 +2418,10 @@ const GqmmNax = struct {
     fn stagedGeometry(self: *const GqmmNax, shape: Shape) ?metal.Geometry {
         const n: c_int = @intCast(shape.n);
         const width = if (self.kind == .paired) 2 * n else n;
-        if (@rem(width, 64) != 0 or shape.k % 64 != 0 or !self.mx()) return null;
         const st = self.stagedAt(shape);
+        if (@rem(width, 64) != 0 or shape.k % 64 != 0 or !self.mx() or @rem(width, st.bn) != 0 or @rem(@as(c_int, @intCast(shape.k)), st.bk) != 0) return null;
         const mt: c_int = @intCast(naxMaxTiles(self.routed(shape), self.ne, @intCast(st.bm)));
-        const cols = @divExact(width, 64);
+        const cols = @divExact(width, st.bn);
         const gx = if (st.gx > 0) st.gx else cols;
         const gy = if (st.gx > 0) @divTrunc(mt + st.gx - 1, st.gx) * cols else mt;
         var g = metal.Geometry{ .grid = .{ @intCast(gx * 32), @intCast(gy * st.wn), @intCast(st.wm) }, .tg = .{ 32, @intCast(st.wn), @intCast(st.wm) } };
@@ -2439,6 +2439,8 @@ const GqmmNax = struct {
         g.int("EPI", if (self.moe_act) -1 else if (self.kind == .paired) 1 + @as(c_int, @intCast(self.limit)) else 0);
         g.int("ESC", @as(c_int, @intCast(self.esc)));
         g.int("AS", @as(c_int, @intFromBool(st.tg_a)));
+        g.int("BN", st.bn);
+        g.int("BK", st.bk);
         g.flag("MAP", self.kind != .mm);
         return g;
     }
