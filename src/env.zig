@@ -168,6 +168,26 @@ pub fn unsetForeign(name: [*:0]const u8) void {
     _ = if (is_windows) c._putenv_s(name, "") else c.unsetenv(name);
 }
 
+/// A hash of every set `kill` and `tuning` variable, name and value: the switches that pick a kernel arm, read at load or
+/// on a call (the MXFP4 view, a lever's `=0`, a tile). Two processes with equal keys compile the same arms; a warm-up
+/// marker keyed on it (`warm_requests.Subject.kernels`) is owed again when any of them changes.
+pub fn armsKey() u64 {
+    @setEvalBranchQuota(20_000);
+    var h = std.hash.Fnv1a_64.init();
+    inline for (comptime std.meta.declarations(vars)) |n| {
+        switch (comptime @field(vars, n).kind) {
+            .kill, .tuning => if (named(n)) |v| {
+                h.update(n);
+                h.update("=");
+                h.update(std.mem.span(v));
+                h.update("\x00");
+            },
+            else => {},
+        }
+    }
+    return h.final();
+}
+
 /// Whether `name` is one of `vars` (a plugin option may not reuse it).
 pub fn registered(name: []const u8) bool {
     inline for (comptime std.meta.declarations(vars)) |n| if (std.mem.eql(u8, n, name)) return true;
