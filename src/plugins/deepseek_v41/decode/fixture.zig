@@ -11,6 +11,7 @@ const config = @import("../config.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
 const device = @import("../../../mlx/device.zig");
+const world = @import("../../../sdk/testing/world.zig");
 const Shard = @import("../../../sdk/weights/shard.zig").Shard;
 
 const A = mlx.mlx_array;
@@ -524,7 +525,7 @@ test "dsv41 tensor parallel: two ranks on half the heads and experts, summing ea
     try std.testing.expectEqual(whole.m.cfg.num_attention_heads / 2, rank1.m.cfg.num_attention_heads);
     // On a NAX GPU MLX runs these f32 GEMMs as TF32 (`MLX_ENABLE_TF32`, on by default): a 10-bit mantissa. A wrong
     // shard sum is off by the summand, far above either bound.
-    const tol: f32 = if (device.naxAvailable()) 1e-2 else 1e-3;
+    const tol: f32 = if (world.nax()) 1e-2 else 1e-3;
     // Two spans and a tail: a wide chunk, whose spans each sum their attention.
     for ([_]usize{ 1, 6, dsv41.region_rows + 9, 2 * dsv41.SPAN + 8 }) |rows| {
         const in = try Input.of(whole, rows);
@@ -1113,7 +1114,18 @@ test "dsv41 draft qkv: with the switch at load a stage's wkv is a view of its fu
 }
 
 test "dsv41 draft qkv: a stage on the fused in_proj and wq_b (DRAFT_QKV at load, DRAFT_FUSED) is no further from the op chain than the served stage (DRAFT_FUSED's FFN half), median over seeds; a stream with its rows swapped fails" {
+    try draftQkvFusedStage();
+}
+
+test "dsv41 draft qkv: on a GPU before in_proj's first generation (M1, M2) the fused-stage check skips, as in_proj's own tests do" {
+    device.device_gen_override = .{ .gen = 13, .phone = false };
+    defer device.device_gen_override = null;
+    try std.testing.expectError(error.SkipZigTest, draftQkvFusedStage());
+}
+
+fn draftQkvFusedStage() !void {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    if (world.gpuGen() < @import("in_proj.zig").first_gen) return error.SkipZigTest; // in_proj declines there
     const gpa = std.testing.allocator;
     mlx.installErrorHandler();
     // Reordered sums only: each stage's distance to the op chain against the served stage's, the median over seeds and

@@ -224,6 +224,104 @@ pub fn floatValue(raw: ?[*:0]const u8, default: f32) f32 {
     return if (std.math.isFinite(v) and v >= 0) v else default;
 }
 
+// ── the test world's environment (`src/sdk/testing/world.zig` drives these) ──
+
+/// The variables the test world puts back before each test: every registered one but a `diag` (a token of
+/// `MLX_SERVE_DIAG`, itself registered) and `MLX_ENABLE_TF32`, which MLX reads once, at the process's first matmul.
+fn worldVar(comptime n: []const u8) bool {
+    return @field(vars, n).kind != .diag and !std.mem.eql(u8, n, "MLX_ENABLE_TF32");
+}
+
+/// One slot per world variable: its value when the test process started (null: unset).
+fn WorldSlot(comptime n: []const u8) type {
+    return SlotOfWorld(&@field(vars, n));
+}
+
+fn SlotOfWorld(comptime v: *const Var) type {
+    return struct {
+        const of = v;
+        var value: ?[:0]u8 = null;
+    };
+}
+
+/// Records every world variable's value as the reference each test starts from. The test process calls it once,
+/// before the first test (after it sets `MLX_SERVE_TEST_FLIP`'s arm).
+pub fn worldSnapshot() void {
+    @setEvalBranchQuota(200_000);
+    inline for (comptime std.meta.declarations(vars)) |n| {
+        if (comptime worldVar(n)) {
+            const z = comptime std.fmt.comptimePrint("{s}", .{n});
+            WorldSlot(n).value = if (std.c.getenv(z)) |v| std.heap.page_allocator.dupeSentinel(u8, std.mem.span(v), 0) catch @panic("env: out of memory") else null;
+        }
+    }
+}
+
+/// Puts back every world variable that differs from `worldSnapshot`'s value (setting only those, so a leftover
+/// thread's read races nothing else) and forgets `init`'s snapshot. Returns how many it put back.
+pub fn worldRestore() usize {
+    @setEvalBranchQuota(200_000);
+    var n_changed: usize = 0;
+    inline for (comptime std.meta.declarations(vars)) |n| {
+        if (comptime worldVar(n)) {
+            const z = comptime std.fmt.comptimePrint("{s}", .{n});
+            const want = WorldSlot(n).value;
+            const same = if (std.c.getenv(z)) |cur| want != null and std.mem.eql(u8, std.mem.span(cur), want.?) else want == null;
+            if (!same) {
+                n_changed += 1;
+                if (want) |w| _ = setForeign(z, w.ptr) else unsetForeign(z);
+            }
+        }
+    }
+    snapshot_taken = false;
+    return n_changed;
+}
+
+/// The `kill` variables `worldSnapshot`'s reference holds, `NAME=value` each, for the test world's start line.
+pub fn worldLevers(out: []u8) []const u8 {
+    @setEvalBranchQuota(200_000);
+    var w: std.Io.Writer = .fixed(out);
+    inline for (comptime std.meta.declarations(vars)) |n| {
+        if (comptime @field(vars, n).kind == .kill) {
+            if (WorldSlot(n).value) |v| w.print("{s}{s}={s}", .{ if (w.buffered().len > 0) " " else "", n, v }) catch {};
+        }
+    }
+    return w.buffered();
+}
+
+/// `MLX_SERVE_TEST_FLIP`'s lever and the arm it names.
+pub const Flip = struct { name: [:0]const u8, value: [:0]const u8 };
+
+pub const FlipError = error{ UnknownFlip, NoFlipArm };
+
+/// The flip proof's lever: `spec` is a registered name, or one without its `MLX_SERVE_DSV41_`, `MLX_SERVE_DSV4_` or
+/// `MLX_SERVE_` prefix, optionally `=value`. Without a value a flag takes its other arm: `0` where its registered
+/// default starts with "on", `1` where it starts with "off"; any other variable needs the value.
+pub fn flipArm(spec: []const u8) FlipError!Flip {
+    @setEvalBranchQuota(400_000);
+    const eq = std.mem.indexOfScalar(u8, spec, '=');
+    const name = spec[0 .. eq orelse spec.len];
+    inline for (comptime std.meta.declarations(vars)) |n| {
+        if (comptime @field(vars, n).kind != .diag) {
+            var hit = std.mem.eql(u8, name, n);
+            inline for (.{ "MLX_SERVE_DSV41_", "MLX_SERVE_DSV4_", "MLX_SERVE_" }) |p| {
+                if (comptime std.mem.startsWith(u8, n, p)) {
+                    if (std.mem.eql(u8, name, n[p.len..])) hit = true;
+                }
+            }
+            if (hit) {
+                const v = @field(vars, n);
+                const z = comptime std.fmt.comptimePrint("{s}", .{n});
+                if (eq) |e| return .{ .name = z, .value = std.heap.page_allocator.dupeSentinel(u8, spec[e + 1 ..], 0) catch @panic("env: out of memory") };
+                if (v.type != .flag) return error.NoFlipArm;
+                if (std.mem.startsWith(u8, v.default, "on")) return .{ .name = z, .value = "0" };
+                if (std.mem.startsWith(u8, v.default, "off")) return .{ .name = z, .value = "1" };
+                return error.NoFlipArm;
+            }
+        }
+    }
+    return error.UnknownFlip;
+}
+
 const c = struct {
     extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
     extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -796,6 +894,7 @@ pub const vars = struct {
     pub const MLX_SERVE_TAPE_RECORD: Var = .{ .kind = .fixture, .type = .text, .default = "unset: tapes are compared", .owner = "sdk/testing", .since = "26.11.2", .doc = "dir: proof tapes record this run as <sha256 of the played tape>.tape instead of comparing (re-baseline after an MLX bump)" };
     pub const MLX_SERVE_TEST_ANE_MODEL: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "engines/ane", .since = "unreleased", .doc = "test input read by `realPack`" };
     pub const MLX_SERVE_TEST_DS4_GGUF: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "engines/ds4", .since = "unreleased", .doc = "test input read by `realGguf`" };
+    pub const MLX_SERVE_TEST_FLIP: Var = .{ .kind = .fixture, .type = .text, .default = "unset: every lever at its default", .owner = "sdk/testing", .since = "unreleased", .doc = "the flip proof: a lever (NAME, or NAME=value) every test starts at its other arm (`sdk/testing/world.zig`, `scripts/flip_proof.py`)" };
     pub const MLX_SERVE_TEST_LLAMA_GGUF: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "engines/llama", .since = "unreleased", .doc = "test input read by `realGguf`" };
     pub const MLX_SERVE_TEST_SHARD: Var = .{ .kind = .fixture, .type = .text, .default = "unset: every test", .owner = "build/test_runner.zig", .since = "unreleased", .doc = "k/n: this test process runs every n-th test from k; a `sharded:` test splits its own work the same way" };
     pub const MOE_UBENCH: Var = .{ .kind = .fixture, .type = .flag, .default = "off", .owner = "sdk/blocks/moe", .since = "26.10.2", .doc = "moe gather kernels: microbench (MOE_UBENCH=1)" };

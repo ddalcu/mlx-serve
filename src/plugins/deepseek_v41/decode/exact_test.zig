@@ -18,6 +18,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const fixture = @import("fixture.zig");
 const device = @import("../../../mlx/device.zig");
+const world = @import("../../../sdk/testing/world.zig");
 
 const A = mlx.mlx_array;
 
@@ -230,7 +231,7 @@ test "dsv41 exact: verify rows and the state they leave equal plain steps bit fo
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     // Exact is the non-NAX kernels' (`Dsv41Model.exact` stays off on NAX): on an M5, run it with
     // MLX_SERVE_DIAG=force-gpu-family-fallback=1, which takes this plugin's non-NAX kernels (MLX's own stay NAX's).
-    if (device.naxAvailable()) {
+    if (world.nax()) {
         std.debug.print("[exact-gate] skipped: NAX GPU (set MLX_SERVE_DIAG=force-gpu-family-fallback=1)\n", .{});
         return error.SkipZigTest;
     }
@@ -255,7 +256,7 @@ test "dsv41 exact: verify rows against plain steps with fp4 experts, the fused f
         defer sw.restore();
         std.debug.print("[exact-gate] MLX_SERVE_DSV41_MOE_FP4_NAX={s}\n", .{fused.?});
         for ([_]Experts{ .mxfp4, .nvfp4 }) |e| {
-            const bar = fused.?[0] == '1' and device.naxAvailable();
+            const bar = fused.?[0] == '1' and world.nax();
             // The served default (NVFP4, fused on) at every position, the long contexts' index picks included.
             const t = try runGateWith(false, e, !(bar and e == .nvfp4));
             // On NAX the fused fp4 decode serves every verify row on its plain step's kernels: the bar is every byte.
