@@ -37,23 +37,25 @@ jobs:
       zig: ${{ steps.scope.outputs.zig }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
+      # The PR's own files: a pull_request checkout is the merge commit, whose first
+      # parent is the base it was merged onto. Anything else runs everything.
       - name: Which jobs does this change need
         id: scope
         env:
           EVENT: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          if [ "$EVENT" != "pull_request" ]; then
+          if [ "$EVENT" != "pull_request" ] || ! git rev-parse --verify -q HEAD^2 > /dev/null; then
             echo "zig=true" | tee -a "$GITHUB_OUTPUT"
             exit 0
           fi
-          git fetch --no-tags --depth=1 origin "$BASE_SHA"
-          git diff --name-only "$BASE_SHA" HEAD | tee /dev/stderr | bash scripts/ci-changes.sh | tee -a "$GITHUB_OUTPUT"
+          git diff --name-only HEAD^1 HEAD | tee /dev/stderr | bash scripts/ci-changes.sh | tee -a "$GITHUB_OUTPUT"
 
   cuda:
     needs: changes
-    if: needs.changes.outputs.zig == 'true'
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.zig == 'true') }}
     name: cuda (x64)
     runs-on: windows-2022
     timeout-minutes: 360
