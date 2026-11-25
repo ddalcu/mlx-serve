@@ -228,7 +228,7 @@ gather's. `ATTN_F16` fails, because its f16 scores and probabilities are 10% to 
 
 | Class | What it means | Default-on switches |
 |---|---|---|
-| EXACT | Bit-identical to the `=0` path | 30 |
+| EXACT | Bit-identical to the `=0` path | 31 |
 | REORDER | Not bit-identical: another sum order or tie-break, measured no farther from float64 than the `=0` path, or within a stated bound | 16: 9 measured no farther, 3 held to stated bounds, 3 resting on the commit's reasoning, 1 (`HC_EXPAND_NORM`) resting on its A/B's same text, unbounded, until a word-for-word test exists |
 | DRAFT-ONLY | Changes what the drafter proposes or how many rows a verify checks. A greedy verify still keeps only tokens that the model agrees with, and a sampled verify keeps the model's distribution. Greedy text can still change by rounding, because the verify kernels' sum order depends on the verify width | 6, including `DRAFT_VOCAB` |
 | TF32 | MLX's TF32 matmul (`MLX_ENABLE_TF32`, on) | 1 (engine) |
@@ -236,7 +236,7 @@ gather's. `ATTN_F16` fails, because its f16 scores and probabilities are 10% to 
 At the defaults on M5, TF32 rounds no input of the model's own matmuls. It rounds only the drafter's P·V, which
 changes the drafts, not the tokens that the model accepts. So TF32 passes for the same reason as DRAFT-ONLY.
 
-We class 52 plugin switches and 4 engine variables. Of the 52, 30 have a standing test or a kernel contract case, 11
+We class 53 plugin switches and 4 engine variables. Of the 53, 31 have a standing test or a kernel contract case, 11
 rest on their A/B giving the same text, and 11 on the commit's reasoning (see "Gaps").
 
 There are two exceptions, and both were defaults before this PR. This PR measures and documents them. The first is
@@ -341,6 +341,7 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | PF_KV_ROWS | Window kv rows on one simdgroup per row | EXACT | A/B text |
 | PF_COMP_PASS | Compressor pooling once over the pass, each span's index-key linear on its own groups | EXACT | test |
 | PF_DOWN_TOKORD | Staged down writes rows in token order | EXACT | test |
+| PF_DOWN_BK32 | Staged down on the 64 x 64 tile, 32 deep a step, at 96 routed rows an expert and more | EXACT | test |
 | PF_FP4_GEMM | Staged matrix-unit gather for routed gate/up and down | EXACT | test |
 | WOA_JOIN | Joins the spans' wo_a rows in one copy | EXACT | commit |
 | PF_ROUTE_PACK | Router top-6 on a simdgroup per row; one-threadgroup scan | EXACT | test |

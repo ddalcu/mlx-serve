@@ -996,6 +996,8 @@ test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_BK32: the down on the 32-deep tile giv
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
+    const off = env.override(.MLX_SERVE_DSV41_PF_DOWN_BK32, "0");
+    defer off.restore();
     inline for (.{ true, false }) |nv| {
         const pk = if (nv) env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1") else env.override(.MLX_SERVE_DSV41_MOE_PAIR, "1");
         defer pk.restore();

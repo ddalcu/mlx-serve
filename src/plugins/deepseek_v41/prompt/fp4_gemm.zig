@@ -20,7 +20,7 @@ pub fn on() bool {
 /// `MLX_SERVE_DSV41_PF_DOWN_BK32`: the down's tile for a call of `rows` routed rows over `experts`
 /// (`gather_nax.stagedDownWide`), or null (the planner's).
 fn downTile(rows: c_int, experts: c_int) ?gather_nax.Staged {
-    if (!env.on(.MLX_SERVE_DSV41_PF_DOWN_BK32)) return null;
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_DOWN_BK32)) return null;
     const st = gather_nax.stagedDownWide(rows, experts) orelse return null;
     if (!bk32_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_DOWN_BK32 engaged (pairs {d}; down tile bm={d} bn={d} bk={d})\n", .{ rows, st.bm, st.bn, st.bk });
     _ = bk32_launches.fetchAdd(1, .monotonic);
