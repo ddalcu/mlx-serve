@@ -72,13 +72,14 @@ jobs:
         id: stage
         uses: ./.github/actions/zig-stage
 
-      # Bounded: the key is written once per toolchain/build/submodule set, by
-      # main only, and no restore-keys fallback: a zig cache only grows. Xcode is
-      # in the key because zig caches configure-time SDK paths. One key per job,
-      # or the two jobs race to save one.
+      # Bounded: one entry per job per ISO week and toolchain/build/submodule set,
+      # saved by main's first good build of the week, no restore-keys fallback: a
+      # zig cache only grows, so the week is the restart. Xcode is in the key
+      # because zig caches configure-time SDK paths. One key per job, or the two
+      # jobs race to save one.
       - name: Zig cache key
         id: zigkey
-        run: echo "key=zig-cache-build-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.stage.outputs.submodules }}-${{ steps.stage.outputs.xcode }}" >> "$GITHUB_OUTPUT"
+        run: echo "key=zig-cache-build-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.stage.outputs.submodules }}-${{ steps.stage.outputs.xcode }}-$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
 
       - name: Restore Zig build artifacts
         id: zigcache
@@ -136,7 +137,7 @@ jobs:
 
       - name: Zig cache key
         id: zigkey
-        run: echo "key=zig-cache-test-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.stage.outputs.submodules }}-${{ steps.stage.outputs.xcode }}" >> "$GITHUB_OUTPUT"
+        run: echo "key=zig-cache-test-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.stage.outputs.submodules }}-${{ steps.stage.outputs.xcode }}-$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
 
       - name: Restore Zig build artifacts
         id: zigcache
