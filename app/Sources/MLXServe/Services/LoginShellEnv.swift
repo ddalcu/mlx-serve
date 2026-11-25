@@ -83,15 +83,18 @@ enum LoginShellEnv {
     nonisolated(unsafe) private static var cachedHF: [String: String] = [:]
 
     /// The HF variables, process environment first and the login shell filling
-    /// the gaps. Cheap and non-blocking: it returns the process environment
-    /// until `primeHuggingFace()` has run.
+    /// the gaps; a valid hub in Settings (`HubEndpointSetting`) wins for `HF_ENDPOINT`.
+    /// Cheap and non-blocking: it returns the process environment until `primeHuggingFace()` has run.
     static func huggingFaceEnvironment(
-        process: [String: String] = ProcessInfo.processInfo.environment
+        process: [String: String] = ProcessInfo.processInfo.environment,
+        hubSetting: String = HubEndpointSetting.current
     ) -> [String: String] {
         lock.lock()
         let shellValues = cachedHF
         lock.unlock()
-        return merge(shell: shellValues, into: process)
+        var env = merge(shell: shellValues, into: process)
+        if let hub = DownloadManager.validHub(hubSetting) { env["HF_ENDPOINT"] = hub }
+        return env
     }
 
     /// Spawn the shell once and cache what it says. Blocking — off-main only.
@@ -106,5 +109,20 @@ enum LoginShellEnv {
         lock.lock()
         cachedHF = found
         lock.unlock()
+    }
+}
+
+/// Settings ▸ Server ▸ Download models from (#1306): the hub every download uses, for users whose network allows
+/// only a mirror. Empty = unset, so the shell's `HF_ENDPOINT` or huggingface.co applies.
+enum HubEndpointSetting {
+    static let key = "hubEndpoint"
+
+    static var current: String { UserDefaults.standard.string(forKey: key) ?? "" }
+
+    static let notUsed = "Not an http:// or https:// address, so it is not used."
+
+    /// True when `value` is empty or names a hub; otherwise the field shows `notUsed`.
+    static func isUsable(_ value: String) -> Bool {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || DownloadManager.validHub(value) != nil
     }
 }
