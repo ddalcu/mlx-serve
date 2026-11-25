@@ -186,8 +186,8 @@ fn actOf(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.Experts, 
     return mpair.act(sc, m, e, try sc.reshape(x, &.{ @intCast(L), 1, @intCast(hidden) }), p.rows, p.sidx, p.w);
 }
 
-/// `moePrefill`'s activation on the split path (`MLX_SERVE_DSV41_MOE_PAIR_SCALED=0`): the fused bank's sorted gather,
-/// each half times its expert's scale (`expertScaled`, both rounded), then moe_act.
+/// `moePrefill`'s activation on the split path (`MLX_SERVE_DSV41_MOE_PAIR_FP4=0`): the fused bank's sorted gather,
+/// each half times its expert's scale where the bank has them (NVFP4: `expertScaled`, both rounded), then moe_act.
 fn splitAct(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.Experts, x3: A, p: Pairs) !A {
     const gu = &e.gu.?;
     const n = mlx.getShape(p.sidx)[0];
@@ -196,7 +196,10 @@ fn splitAct(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.Expert
     const ni = @divExact(mlx.getShape(y)[2], 2);
     const nu: usize = @intCast(ni);
     var halves: [2]A = undefined;
-    for (&halves, 0..) |*hf, i| hf.* = try sc.mul(try sc.slice(y, -1, i * nu, (i + 1) * nu), try sc.reshape(try sc.take(e.scale[i].?, p.sidx, 0), &.{ n, 1, 1 }));
+    for (&halves, 0..) |*hf, i| {
+        const half = try sc.slice(y, -1, i * nu, (i + 1) * nu);
+        hf.* = if (e.scale[i]) |s| try sc.mul(half, try sc.reshape(try sc.take(s, p.sidx, 0), &.{ n, 1, 1 })) else half;
+    }
     const lim = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.dsv4_swiglu_limit}, &[_]c_int{1}, 1, .float32));
     const yy = try sc.reshape(try sc.concat(&halves, -1), &.{ n, 2 * ni });
     return dsv41.flatKernel(sc, m.moe_act_kernel, &.{ yy, p.w, lim }, &.{ n, 1, ni }, .bfloat16, @intCast(n * ni), &.{.{ .name = "N", .v = ni }});
@@ -262,12 +265,12 @@ fn rolled(sc: *dsv41.Scope, wts: A) !A {
     return sc.concat(&.{ try sc.slice(wts, 1, 1, top_k), try sc.slice(wts, 1, 0, 1) }, 1);
 }
 
-test "dsv41 wide tol: the paired NVFP4 gate+up (per-expert scales) with moe_act in its epilogue is the split path's MoE within 1% at the release widths, prompt row counts to 8192, and an MXFP4 bank stays on the split path; a weight on the wrong expert or swapped scales fail" {
+test "dsv41 wide tol: the paired fp4 gate+up with moe_act in its epilogue is the split path's MoE within 1% at the release widths, prompt row counts to 8192, NVFP4 (per-expert scales) and MXFP4 (none); a weight on the wrong expert or swapped scales fail" {
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
     // The release's 384 experts under `-Dslow-tests` (7 GB of banks); else 48, whose rows an expert reach every plan.
     const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
-    const unset_scaled = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "0");
+    const unset_scaled = env.override(.MLX_SERVE_DSV41_MOE_PAIR_FP4, "0");
     defer unset_scaled.restore();
     // Every format and row count runs; each out of tolerance is reported.
     var ok = true;
@@ -292,19 +295,12 @@ test "dsv41 wide tol: the paired NVFP4 gate+up (per-expert scales) with moe_act 
             var csc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
             defer csc.deinit();
             const c = try call(&csc, L, @intCast(experts), 0x1000 + ci, L == 500);
-            // An MXFP4 bank (no per-expert scales) has no paired arm: the split path serves it at either setting.
-            if (!nv) {
-                const on = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
-                defer on.restore();
-                try testing.expect(try actOf(&csc, &m, &ly.experts, c.x, c.idx, c.wts) == null);
-                continue;
-            }
             // No shared expert, so the routed sum is all the output holds.
             const sh = try csc.zeros(&.{ @intCast(L), @intCast(hidden) }, .bfloat16);
             const want = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, sh);
-            // MOE_PAIR_SCALED=0 leaves the bank on the split path.
+            // MOE_PAIR_FP4=0 leaves the bank on the split path.
             try testing.expect(try actOf(&csc, &m, &ly.experts, c.x, c.idx, c.wts) == null);
-            const sw = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
+            const sw = env.override(.MLX_SERVE_DSV41_MOE_PAIR_FP4, "1");
             defer sw.restore();
             // Served: the paired kernel takes this call.
             try testing.expect(try actOf(&csc, &m, &ly.experts, c.x, c.idx, c.wts) != null);
@@ -331,9 +327,16 @@ test "dsv41 wide tol: the paired NVFP4 gate+up (per-expert scales) with moe_act 
     try testing.expect(ok);
 }
 
-test "dsv41 wide tol: MLX_SERVE_DSV41_MOE_PAIR_SCALED's paired NVFP4 gate+up with moe_act in its epilogue is a reorder of the split path's activation (=0): each differing word within one bf16 step of its row's largest value, under 1% of the words differing, float64 l2 within 1.05x of =0's, at the release widths, prompt rows to 8192, each arm's activation its moePrefill's; the gate and up scales swapped fail" {
+test "dsv41 wide tol: MLX_SERVE_DSV41_MOE_PAIR_FP4's paired fp4 gate+up with moe_act in its epilogue is a reorder of the split path's activation (=0), NVFP4 with per-expert scales and MXFP4 without: each differing word within one bf16 step of its row's largest value, under 1% of the words differing, float64 l2 within 1.05x of =0's, at the release widths, prompt rows to 8192, each arm's activation its moePrefill's; the gate and up scales swapped (NVFP4) or each pair's weight on the next pair (MXFP4) fail" {
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
+    try pairReorder(true);
+    try pairReorder(false);
+}
+
+/// The reorder bounds of `MOE_PAIR_FP4` on an NVFP4 bank with per-expert scales (`nv`) or an MXFP4 bank without.
+fn pairReorder(comptime nv: bool) !void {
+    const fmt = if (nv) "NVFP4" else "MXFP4";
     const gpa = testing.allocator;
     const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
     var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
@@ -347,11 +350,18 @@ test "dsv41 wide tol: MLX_SERVE_DSV41_MOE_PAIR_SCALED's paired NVFP4 gate+up wit
     m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
     defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
     var ly: dsv41.Layer = undefined;
-    ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .gu = try fp4Bank(&sc, 0x6A7E, experts, 2 * inter, hidden, true), .down = try fp4Bank(&sc, 0xD0E1, experts, hidden, inter, true) };
-    for (&ly.experts.scale, 0..) |*v, i| v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x5CA1E + i);
+    ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .gu = try fp4Bank(&sc, 0x6A7E, experts, 2 * inter, hidden, nv), .down = try fp4Bank(&sc, 0xD0E1, experts, hidden, inter, nv) };
+    if (nv) for (&ly.experts.scale, 0..) |*v, i| {
+        v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x5CA1E + i);
+    };
     const gu = &ly.experts.gu.?;
+    // The float64 reference's per-expert scales: the bank's, or 1 (MXFP4 has none).
     var es: [2][]f32 = undefined;
-    for (&es, 0..) |*v, i| v.* = try dsv41.hostF32(ly.experts.scale[i].?);
+    for (&es, 0..) |*v, i| v.* = if (nv) try dsv41.hostF32(ly.experts.scale[i].?) else blk: {
+        const ones = try gpa.alloc(f32, @intCast(experts));
+        @memset(ones, 1);
+        break :blk ones;
+    };
     defer for (es) |v| gpa.free(v);
     // The float64 check's 256 gate columns (every ninth) and their up columns.
     const NC = 256;
@@ -371,19 +381,25 @@ test "dsv41 wide tol: MLX_SERVE_DSV41_MOE_PAIR_SCALED's paired NVFP4 gate+up wit
         const p = try pairsOf(&csc, c.idx, c.wts);
         const x3 = try csc.reshape(c.x, &.{ @intCast(L), 1, @intCast(hidden) });
         const paired = blk: {
-            const on = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, null);
+            const on = env.override(.MLX_SERVE_DSV41_MOE_PAIR_FP4, null);
             defer on.restore();
             break :blk (try mpair.act(&csc, &m, &ly.experts, x3, p.rows, p.sidx, p.w)) orelse return error.PairDeclined;
         };
         const split = try splitAct(&csc, &m, &ly.experts, x3, p);
         // Each arm's activation is its served one: through the down and combine, its moePrefill's words.
         for ([_]?[*:0]const u8{ null, "0" }, [_]A{ paired, split }) |v, a| {
-            const o = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, v);
+            const o = env.override(.MLX_SERVE_DSV41_MOE_PAIR_FP4, v);
             defer o.restore();
             try testing.expect(try sameWords(try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, sh), try moeFromAct(&csc, &ly, a, p, sh)));
         }
-        // Planted: the gate's per-expert scale on up and up's on the gate.
+        // Planted: the gate's per-expert scale on up and up's on the gate (NVFP4), or each sorted pair's routing weight
+        // on the next pair (MXFP4, which has no scales to swap).
         const bad = blk: {
+            if (!nv) {
+                const nw = mlx.getShape(p.w)[0];
+                const w_next = try csc.concat(&.{ try csc.slice(p.w, 0, 1, @intCast(nw)), try csc.slice(p.w, 0, 0, 1) }, 0);
+                break :blk (try mpair.act(&csc, &m, &ly.experts, x3, p.rows, p.sidx, w_next)) orelse return error.PairDeclined;
+            }
             const s = ly.experts.scale;
             ly.experts.scale = .{ s[1], s[0], s[2] };
             defer ly.experts.scale = s;
@@ -529,14 +545,14 @@ test "dsv41 wide tol: MLX_SERVE_DSV41_MOE_PAIR_SCALED's paired NVFP4 gate+up wit
                 if (@abs(@as(f64, a) - t) > @abs(@as(f64, dg[0][big[0]]) - dref[big[0]])) big[0] = q;
                 if (@abs(@as(f64, b) - t) > @abs(@as(f64, dg[1][big[1]]) - dref[big[1]])) big[1] = q;
             }
-            for (big, 0..) |q, w| std.debug.print("[moe-pair-diag] rows {d} worst {s}: float64 {e:.6}, MOE_PAIR_SCALED {e:.6}, =0 {e:.6}\n", .{ L, if (w == 0) "MOE_PAIR_SCALED" else "=0", dref[q], dg[0][q], dg[1][q] });
+            for (big, 0..) |q, w| std.debug.print("[moe-pair-diag] rows {d} worst {s}: float64 {e:.6}, MOE_PAIR_FP4 {e:.6}, =0 {e:.6}\n", .{ L, if (w == 0) "MOE_PAIR_FP4" else "=0", dref[q], dg[0][q], dg[1][q] });
         }
-        std.debug.print("[moe-pair-f64] NVFP4 rows {d}: {d} of {d} activation words differ between MOE_PAIR_SCALED and =0; from float64 at {d} pairs x {d} columns: MOE_PAIR_SCALED l2 {e:.6} max {e:.6}, =0 (split) l2 {e:.6} max {e:.6}, planted (scales swapped) l2 {e:.3} max {e:.3}; at {d} of the differing words: MOE_PAIR_SCALED l2 {e:.6} max {e:.6}, =0 l2 {e:.6} max {e:.6}; nearer at {d} vs {d} of them\n", .{ L, differ, n * inter, P, NC, ep.l2, ep.max, es_.l2, es_.max, eb.l2, eb.max, nd, dp.l2, dp.max, ds.l2, ds.max, nearer[0], nearer[1] });
+        std.debug.print("[moe-pair-f64] " ++ fmt ++ " rows {d}: {d} of {d} activation words differ between MOE_PAIR_FP4 and =0; from float64 at {d} pairs x {d} columns: MOE_PAIR_FP4 l2 {e:.6} max {e:.6}, =0 (split) l2 {e:.6} max {e:.6}, planted ({s}) l2 {e:.3} max {e:.3}; at {d} of the differing words: MOE_PAIR_FP4 l2 {e:.6} max {e:.6}, =0 l2 {e:.6} max {e:.6}; nearer at {d} vs {d} of them\n", .{ L, differ, n * inter, P, NC, ep.l2, ep.max, es_.l2, es_.max, if (nv) @as([]const u8, "scales swapped") else "weights on the next pair", eb.l2, eb.max, nd, dp.l2, dp.max, ds.l2, ds.max, nearer[0], nearer[1] });
         const total = n * inter;
         const st = try rowSteps(&csc, paired, split);
         const differ_b = try wordsDiffer(&csc, bad, split);
         const st_b = try rowSteps(&csc, bad, split);
-        std.debug.print("[moe-pair-f64] NVFP4 rows {d}: {d:.4}% of words differ from =0 (planted {d:.2}%); the largest difference {d:.3} bf16 steps at its row's largest value (planted {d:.3}); the largest word step {d} (planted {d}); {d} words more than one bf16 step apart, their largest =0 word {e:.3} of its row's largest; float64 l2 ratio to =0 {d:.4} over the sample (planted {d:.1}), {d:.3} over the differing words\n", .{ L, 100 * @as(f64, @floatFromInt(differ)) / @as(f64, @floatFromInt(total)), 100 * @as(f64, @floatFromInt(differ_b)) / @as(f64, @floatFromInt(total)), st.worst, st_b.worst, st.max, st_b.max, st.far, st.far_mag, ep.l2 / es_.l2, eb.l2 / es_.l2, if (ds.l2 > 0) dp.l2 / ds.l2 else 0 });
+        std.debug.print("[moe-pair-f64] " ++ fmt ++ " rows {d}: {d:.4}% of words differ from =0 (planted {d:.2}%); the largest difference {d:.3} bf16 steps at its row's largest value (planted {d:.3}); the largest word step {d} (planted {d}); {d} words more than one bf16 step apart, their largest =0 word {e:.3} of its row's largest; float64 l2 ratio to =0 {d:.4} over the sample (planted {d:.1}), {d:.3} over the differing words\n", .{ L, 100 * @as(f64, @floatFromInt(differ)) / @as(f64, @floatFromInt(total)), 100 * @as(f64, @floatFromInt(differ_b)) / @as(f64, @floatFromInt(total)), st.worst, st_b.worst, st.max, st_b.max, st.far, st.far_mag, ep.l2 / es_.l2, eb.l2 / es_.l2, if (ds.l2 > 0) dp.l2 / ds.l2 else 0 });
         const in_bound = struct {
             fn of(sv: Steps, nw: usize, na: usize, ev: F64Err, bv: F64Err) bool {
                 return sv.worst <= 1 and nw * 100 < na and ev.l2 <= 1.05 * bv.l2;
@@ -823,9 +839,7 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_MOE_EPI is the argsort pat
     const own_pack = env.override(.MLX_SERVE_DSV41_PF_ROUTE_PACK, "0");
     defer own_pack.restore();
     inline for (.{ false, true }) |nv| inline for (.{ false, true }) |paired| {
-        // An MXFP4 bank has no paired arm (it takes the split path), so it runs split only.
-        if (!nv and paired) continue;
-        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, if (paired) "1" else "0");
+        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_FP4, if (paired) "1" else "0");
         defer pk.restore();
         var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
         defer sc.deinit();
@@ -878,7 +892,7 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_FP4_GEMM is today's output
     defer unset.restore();
     // The paired gate/up is NVFP4's alone: an MXFP4 bank takes the split path, which stages no gate/up.
     inline for (.{true}) |nv| {
-        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
+        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_FP4, "1");
         defer pk.restore();
         var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
         defer sc.deinit();
@@ -932,7 +946,7 @@ test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_TOKORD: the staged down's rows at thei
     defer off.restore();
     inline for (.{ true, false }) |nv| {
         // The NVFP4 bank's gate/up on the paired kernel; an MXFP4 bank's on the split path.
-        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
+        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_FP4, "1");
         defer pk.restore();
         var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
         defer sc.deinit();
@@ -1005,7 +1019,7 @@ test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_BK32: the down on the 32-deep tile giv
     defer off.restore();
     inline for (.{ true, false }) |nv| {
         // The NVFP4 bank's gate/up on the paired kernel; an MXFP4 bank's on the split path. The staged down serves both.
-        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
+        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_FP4, "1");
         defer pk.restore();
         var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
         defer sc.deinit();
@@ -1515,7 +1529,7 @@ test "dsv41 wide tol: MLX_SERVE_DSV41_PF_HC_V2's three passes (the attention sid
 
 // ── a release-shape pair worker's prefill ──
 
-const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2, .MLX_SERVE_DSV41_PF_MOE_EPI, .MLX_SERVE_DSV41_PF_IDX_NAX };
+const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR_FP4, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2, .MLX_SERVE_DSV41_PF_MOE_EPI, .MLX_SERVE_DSV41_PF_IDX_NAX };
 
 /// The flash kernel on `fx`'s model as its load sets it (`plugin.configureLoad`): the gather's kernels rebuilt with
 /// MLX_SERVE_DSV41_FLASH_ATTN on (and MLX_SERVE_DSV41_FLASH_TRIM, MLX_SERVE_DSV41_FLASH_PSUM as asked) and the ring
@@ -1641,7 +1655,7 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
         defer for (want) |o| {
             _ = mlx.mlx_array_free(o);
         };
-        // The layer's loaded NVFP4 experts take the paired kernel under MOE_PAIR_SCALED; MXFP4 experts decline it.
+        // The layer's loaded fp4 experts, NVFP4 or MXFP4, take the paired kernel under MOE_PAIR_FP4.
         {
             var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
             defer sc.deinit();
@@ -1651,14 +1665,14 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
                 std.debug.print("wide layer {s}: the route failed: {s}\n", .{ label, @errorName(e) });
                 return e;
             };
-            env.set(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
-            defer env.set(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "0");
+            env.set(.MLX_SERVE_DSV41_MOE_PAIR_FP4, "1");
+            defer env.set(.MLX_SERVE_DSV41_MOE_PAIR_FP4, "0");
             const served = (actOf(&sc, fx.m, &ly.experts, h, r.idx, r.wts) catch |e| {
                 std.debug.print("wide layer {s}: the paired kernel failed: {s}\n", .{ label, @errorName(e) });
                 return e;
             }) != null;
-            if (served != nv) std.debug.print("wide layer {s}: the paired kernel {s} the loaded experts (gu {}, mode {s})\n", .{ label, if (served) "takes" else "declines", ly.experts.gu != null, if (ly.experts.gu) |g| @tagName(g.qp.mode) else "-" });
-            try testing.expectEqual(nv, served);
+            if (!served) std.debug.print("wide layer {s}: the paired kernel {s} the loaded experts (gu {}, mode {s})\n", .{ label, if (served) "takes" else "declines", ly.experts.gu != null, if (ly.experts.gu) |g| @tagName(g.qp.mode) else "-" });
+            try testing.expect(served);
         }
         if (!try closeAs(fx, x, pre, want, &want_tap, label, "the stock path again")) ok = false;
         inline for (switches) |n| {
