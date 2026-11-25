@@ -11,6 +11,10 @@ const registry_path = "src/plugins/registry.zig";
 /// What a `config.zig` may never reach: the MLX layer and everything built on it. Anything outside `src/` too.
 const denied = [_][]const u8{ "src/mlx/", "src/engines/", "src/host/", "src/kernels/" };
 
+/// A plugin no non-macOS build can serve says so in its `config.zig`: the registry leaves it out of iOS, Linux and
+/// Windows builds (`render`).
+const macos_only_line = "\npub const macos_only = true;";
+
 /// Zig caches the configure phase: every input the scan reads is declared, so a new plugin folder, a changed
 /// `config.zig` closure, a new fixture or a deleted registry re-runs it. Returns the registered plugins' names.
 pub fn generate(b: *std.Build) []const []const u8 {
@@ -38,11 +42,13 @@ pub fn generate(b: *std.Build) []const []const u8 {
     for (configs) |c| if (std.mem.endsWith(u8, c, ".json")) jsons.append(a, c) catch @panic("OOM");
     const split = splitTemplates(a, names.items) catch @panic("OOM");
     const in_config = a.alloc(bool, split.plugins.len) catch @panic("OOM");
-    for (split.plugins, in_config) |n, *f| {
+    const macos_only = a.alloc(bool, split.plugins.len) catch @panic("OOM");
+    for (split.plugins, in_config, macos_only) |n, *f, *m| {
         const text = root.readFileAlloc(io, b.fmt("{s}/{s}/config.zig", .{ plugins_dir, n }), a, .limited(1 << 20)) catch "";
         f.* = std.mem.indexOf(u8, text, "\npub const plugin = ") != null;
+        m.* = std.mem.indexOf(u8, text, macos_only_line) != null;
     }
-    const src = render(a, split.plugins, in_config, split.templates, jsons.items) catch @panic("OOM");
+    const src = render(a, split.plugins, in_config, macos_only, split.templates, jsons.items) catch @panic("OOM");
     writeIfChanged(io, root, registry_path, src) catch |e| std.process.fatal("plugins: cannot write {s}: {t}", .{ registry_path, e });
     b.dependOnFileContents(b.path(registry_path));
     return split.plugins;
@@ -200,29 +206,44 @@ fn chain(a: std.mem.Allocator, parent: *const std.StringHashMapUnmanaged([]const
     return std.mem.join(a, " -> ", hops.items);
 }
 
-/// `in_config[i]`: plugin i declares its metadata (`plugin`) in its `config.zig`.
+/// `in_config[i]`: plugin i declares its metadata (`plugin`) in its `config.zig`; `macos_only[i]`: it is macOS only.
 /// `units`: the `-Dunits` form, metadata only (each `config.zig`) and the extern tables the unit objects export, so the
 /// host's closure holds no plugin's code and a plugin edit rebuilds its unit alone. Tests need the full form.
-fn render(a: std.mem.Allocator, plugins: []const []const u8, in_config: []const bool, templates: []const []const u8, configs: []const []const u8) ![]u8 {
+/// The source is target-independent: a macOS-only plugin's entries sit behind `if (macos)`, so off macOS they are left
+/// out at comptime (never evaluated) and the rest keep their order.
+fn render(a: std.mem.Allocator, plugins: []const []const u8, in_config: []const bool, macos_only: []const bool, templates: []const []const u8, configs: []const []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(a,
         \\//! GENERATED at configure time by build/plugins.zig from src/plugins/*/plugin.zig: never edit, never commit.
         \\//! Folders starting with `_` are templates: compiled and tested, never registered.
         \\
+        \\const std = @import("std");
         \\const sdk = @import("../sdk/plugin.zig");
         \\const File = @import("../sdk/testing/fixture.zig").File;
         \\
+        \\/// A macOS-only plugin (its config.zig: `pub const macos_only = true;`) is in no other build: iOS, Linux, Windows.
+        \\const macos = @import("builtin").os.tag == .macos;
+        \\
         \\
     );
-    inline for (.{ .{ "plugins", plugins }, .{ "templates", templates } }) |list| {
-        try out.print(a, "pub const {s} = [_]type{{\n", .{list[0]});
-        for (list[1]) |n| try out.print(a, "    @import(\"{s}/plugin.zig\"),\n", .{n});
-        try out.print(a, "}};\npub const {s}_names = [_][]const u8{{\n", .{list[0]});
-        for (list[1]) |n| try out.print(a, "    \"{s}\",\n", .{n});
-        try out.appendSlice(a, "};\n");
+    try out.appendSlice(a, "/// Every plugin folder and whether it is macOS only, in this build or not.\npub const folders = [_]struct { name: []const u8, macos_only: bool }{\n");
+    for (plugins, macos_only) |n, m| try out.print(a, "    .{{ .name = \"{s}\", .macos_only = {s} }},\n", .{ n, if (m) "true" else "false" });
+    try out.appendSlice(a, "};\n\n");
+    const none = try a.alloc(bool, templates.len);
+    @memset(none, false);
+    inline for (.{ .{ "plugins", plugins, macos_only }, .{ "templates", templates, none } }) |list| {
+        try renderList(a, &out, try std.fmt.allocPrint(a, "pub const {s}", .{list[0]}), "type", list[1], list[2], "@import(\"{s}/plugin.zig\")");
+        try renderList(a, &out, try std.fmt.allocPrint(a, "pub const {s}_names", .{list[0]}), "[]const u8", list[1], list[2], "\"{s}\"");
     }
-    try renderMetas(a, &out, plugins, in_config, configs);
+    try renderMetas(a, &out, plugins, in_config, macos_only, configs);
     try out.appendSlice(a,
+        \\
+        \\/// Whether this build registers the plugin `name` (false off macOS for a macOS-only one).
+        \\pub fn has(comptime name: []const u8) bool {
+        \\    return comptime for (plugins_names) |n| {
+        \\        if (std.mem.eql(u8, n, name)) break true;
+        \\    } else false;
+        \\}
         \\
         \\/// `-Dunits`: every plugin is its own compile unit (`src/unit.zig`) exporting its table; the host links them by name.
         \\const units = @import("build_options").units and !@import("builtin").is_test;
@@ -242,10 +263,23 @@ fn render(a: std.mem.Allocator, plugins: []const []const u8, in_config: []const 
     return out.items;
 }
 
-fn renderMetas(a: std.mem.Allocator, out: *std.ArrayList(u8), plugins: []const []const u8, in_config: []const bool, configs: []const []const u8) !void {
-    try out.appendSlice(a, "\n/// Each plugin's metadata as `-Dunits` reads it: from its `config.zig` (no plugin code), else its `plugin.zig`.\nconst unit_metas = [_]sdk.Plugin{\n");
-    for (plugins, in_config) |n, c| try out.print(a, "    @import(\"{s}/{s}.zig\").plugin,\n", .{ n, if (c) "config" else "plugin" });
+/// `decl = [_]elem{ ... };` over `names`, each entry `fmt` of its name; a macOS-only entry is its own one-element array
+/// behind `if (macos)`, joined with `++`.
+fn renderList(a: std.mem.Allocator, out: *std.ArrayList(u8), decl: []const u8, elem: []const u8, names: []const []const u8, macos_only: []const bool, comptime fmt: []const u8) !void {
+    try out.print(a, "{s} = [_]{s}{{\n", .{ decl, elem });
+    for (names, macos_only) |n, m| {
+        if (m) {
+            try out.print(a, "}} ++ (if (macos) [_]{s}{{" ++ fmt ++ "}} else [_]{s}{{}}) ++ [_]{s}{{\n", .{ elem, n, elem, elem });
+        } else try out.print(a, "    " ++ fmt ++ ",\n", .{n});
+    }
     try out.appendSlice(a, "};\n");
+}
+
+fn renderMetas(a: std.mem.Allocator, out: *std.ArrayList(u8), plugins: []const []const u8, in_config: []const bool, macos_only: []const bool, configs: []const []const u8) !void {
+    try out.appendSlice(a, "\n/// Each plugin's metadata as `-Dunits` reads it: from its `config.zig` (no plugin code), else its `plugin.zig`.\n");
+    const roots = try a.alloc([]const u8, plugins.len);
+    for (plugins, in_config, roots) |n, c, *r| r.* = try std.fmt.allocPrint(a, "{s}/{s}", .{ n, if (c) "config" else "plugin" });
+    try renderList(a, out, "const unit_metas", "sdk.Plugin", roots, macos_only, "@import(\"{s}.zig\").plugin");
     try out.appendSlice(a, "\n/// Every fixture config.json: the packs the claims test runs through every plugin.\npub const model_configs = [_]File{\n");
     for (configs) |c| try out.print(a, "    .{{ .name = \"{s}\", .bytes = @embedFile(\"../fixtures/model-configs/{s}\") }},\n", .{ c, c });
     try out.appendSlice(a, "};\n");
@@ -341,13 +375,13 @@ test "build plugins: templates compile beside the registry but are never registe
     try testing.expectEqualStrings("laguna", split.plugins[1]);
     const in_config = try a.alloc(bool, split.plugins.len);
     @memset(in_config, false);
-    const src = try render(a, split.plugins, in_config, split.templates, &.{"laguna.json"});
+    const src = try render(a, split.plugins, in_config, in_config, split.templates, &.{"laguna.json"});
     try testing.expect(std.mem.indexOf(u8, src, "pub const plugins = [_]type{\n    @import(\"flint/plugin.zig\"),\n    @import(\"laguna/plugin.zig\"),\n};") != null);
     try testing.expect(std.mem.indexOf(u8, src, "pub const templates = [_]type{\n    @import(\"_template/plugin.zig\"),\n    @import(\"_template_media/plugin.zig\"),\n};") != null);
     try testing.expect(std.mem.indexOf(u8, src, "@embedFile(\"../fixtures/model-configs/laguna.json\")") != null);
     try testing.expect(std.mem.indexOf(u8, src, "sdk.exportAll(&plugins);") != null);
     // An empty registry still renders valid arrays.
-    const none = try render(a, &.{}, &.{}, &.{}, &.{});
+    const none = try render(a, &.{}, &.{}, &.{}, &.{}, &.{});
     try testing.expect(std.mem.indexOf(u8, none, "pub const plugins = [_]type{\n};") != null);
 }
 
@@ -355,8 +389,24 @@ test "build plugins: the -Dunits metadata reads each plugin's config.zig where i
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const src = try render(a, &.{ "flint", "laguna" }, &.{ true, false }, &.{"_template"}, &.{"laguna.json"});
+    const src = try render(a, &.{ "flint", "laguna" }, &.{ true, false }, &.{ false, false }, &.{"_template"}, &.{"laguna.json"});
     try testing.expect(std.mem.indexOf(u8, src, "@import(\"flint/config.zig\").plugin,") != null);
     try testing.expect(std.mem.indexOf(u8, src, "@import(\"laguna/plugin.zig\").plugin,") != null);
     try testing.expect(std.mem.indexOf(u8, src, "sdk.externEntries(&unit_metas)") != null);
+}
+
+test "build plugins: a macOS-only plugin is listed with its flag and kept, in order, only behind `if (macos)`" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = try render(a, &.{ "flint", "deepseek_v41", "laguna" }, &.{ true, true, false }, &.{ false, true, false }, &.{"_template"}, &.{});
+    try testing.expect(std.mem.indexOf(u8, src, ".{ .name = \"deepseek_v41\", .macos_only = true },") != null);
+    try testing.expect(std.mem.indexOf(u8, src, ".{ .name = \"laguna\", .macos_only = false },") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "pub const plugins = [_]type{\n    @import(\"flint/plugin.zig\"),\n} ++ (if (macos) [_]type{@import(\"deepseek_v41/plugin.zig\")} else [_]type{}) ++ [_]type{\n    @import(\"laguna/plugin.zig\"),\n};") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "(if (macos) [_][]const u8{\"deepseek_v41\"} else [_][]const u8{})") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "(if (macos) [_]sdk.Plugin{@import(\"deepseek_v41/config.zig\").plugin} else [_]sdk.Plugin{})") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "const macos = @import(\"builtin\").os.tag == .macos;") != null);
+    // The scan reads the flag from the config's own line, never from a comment.
+    try testing.expect(std.mem.indexOf(u8, "//! x\npub const macos_only = true;\n", macos_only_line) != null);
+    try testing.expect(std.mem.indexOf(u8, "//! x\n// pub const macos_only = true;\n", macos_only_line) == null);
 }
