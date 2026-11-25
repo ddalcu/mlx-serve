@@ -1113,6 +1113,16 @@ test "dsv41 draft qkv: with the switch at load a stage's wkv is a view of its fu
 }
 
 test "dsv41 draft qkv: a stage on the fused in_proj and wq_b (DRAFT_QKV at load, DRAFT_FUSED) is no further from the op chain than the served stage (DRAFT_FUSED's FFN half), median over seeds; a stream with its rows swapped fails" {
+    try draftQkvFusedStage();
+}
+
+test "dsv41 draft qkv: on a GPU before in_proj's first generation (M1, M2) the fused-stage check skips, as in_proj's own tests do" {
+    device.device_gen_override = .{ .gen = 13, .phone = false };
+    defer device.device_gen_override = null;
+    try std.testing.expectError(error.SkipZigTest, draftQkvFusedStage());
+}
+
+fn draftQkvFusedStage() !void {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     mlx.installErrorHandler();
