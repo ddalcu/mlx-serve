@@ -92,9 +92,18 @@ compiled() {
     local bin="$1" model="$2" log="$3" cache="$4" start="$5" kind="$6" envw="$7"; shift 7
     [ "$cache" = empty ] && away "$CACHE"
     away "$SCRATCH/home"; mkdir -p "$SCRATCH/home"
-    env HOME="$SCRATCH/home" $envw "$bin" --serve --model "$model" --port "$PORT" --host 127.0.0.1 "$@" >"$log" 2>&1 &
-    SRV=$!
-    srv_wait_health "$BASE" 2400 0.5 "$SRV" || { echo -e "${RED}FAIL${NC} the server never came up" >&2; tail -5 "$log" >&2; srv_stop "$SRV"; exit 1; }
+    # A big pack's last server can still be giving its memory back when the next one loads: a load refused for memory
+    # (`InsufficientMemory`) is started again after a pause, up to 20 times; any other failure ends the test.
+    local try
+    for try in $(seq 1 20); do
+        env HOME="$SCRATCH/home" $envw "$bin" --serve --model "$model" --port "$PORT" --host 127.0.0.1 "$@" >"$log" 2>&1 &
+        SRV=$!
+        srv_wait_health "$BASE" 2400 0.5 "$SRV" && break
+        srv_stop "$SRV"; SRV=""
+        grep -a -q "InsufficientMemory" "$log" || { echo -e "${RED}FAIL${NC} the server never came up" >&2; tail -5 "$log" >&2; exit 1; }
+        [ "$try" = 20 ] && { echo -e "${RED}FAIL${NC} the server never came up: refused for memory 20 times" >&2; tail -5 "$log" >&2; exit 1; }
+        sleep 15
+    done
     if [ "$start" = idle ]; then
         for _ in $(seq 1 1200); do grep -a -q -F "$DONE" "$log" && break; sleep 0.5; done
         grep -a -q -F "$DONE" "$log" || { echo -e "${RED}FAIL${NC} the idle warm-up never ended" >&2; tail -5 "$log" >&2; srv_stop "$SRV"; exit 1; }
