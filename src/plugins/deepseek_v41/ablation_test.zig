@@ -882,11 +882,11 @@ test "deepseek_v41 ablation forward: a DSpark draft of an ablated state leaves i
         try expectProbe(mdl, d, k == 0);
     }
     var both: [2]dsv41.DsparkDraft = undefined;
-    try dsv41.dsparkDraftBatched(mdl, testing.allocator, &sts, &t1s, false, &both);
+    try dsv41.dsparkDraftBatched(mdl, testing.allocator, &sts, &gens, &t1s, false, &both);
     defer for (&both) |*d| d.deinit(testing.allocator);
     for (both, 0..) |d, k| try expectProbe(mdl, d, k == 0);
     var own: [1]dsv41.DsparkDraft = undefined;
-    try dsv41.dsparkDraftBatched(mdl, testing.allocator, sts[0..1], t1s[0..1], false, &own);
+    try dsv41.dsparkDraftBatched(mdl, testing.allocator, sts[0..1], gens[0..1], t1s[0..1], false, &own);
     defer own[0].deinit(testing.allocator);
     try expectProbe(mdl, own[0], true);
 }
