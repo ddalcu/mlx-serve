@@ -1,8 +1,8 @@
 // Inkling 2, a few rows: the router's picks, the picked experts' gate and up projections and the soft-capped SwiGLU
-// in one launch, the packed bank read in place. grid (32, I / ROWS, S * KSEL), threadgroup (32, SGS, 1): a SIMD group
-// owns ROWS intermediate rows of one pick (their gate rows 2r and up rows 2r + 1 of WQ [E, 2 I, K * bits / 32] u32,
-// scales WS [E, 2 I, K / GS] u8) and a lane 16 values of its row's x per sweep, kept in registers across the rows.
-// FMT 3 is an affine bank (BITS bits, scales WS and biases WB [E, 2 I, K / GS] of S).
+// in one launch, the packed bank read in place via 128-bit uint4 loads. grid (32, I / ROWS, S * KSEL), threadgroup
+// (32, SGS, 1): a SIMD group owns ROWS intermediate rows of one pick (their gate rows 2r and up rows 2r + 1 of WQ
+// [E, 2 I, K * bits / 32] u32, scales WS [E, 2 I, K / GS] u8) and a lane 16 values of its row's x per sweep, kept in
+// registers across the rows. FMT 3 is an affine bank (BITS bits, scales WS and biases WB [E, 2 I, K / GS] of S).
 // With ROUTE each threadgroup ranks its row's picks as topk.metal does: SCR [S, E] f32 are the router's logits, RB [E]
 // f32 the selection bias, RS [1] the route scale; a pick's threadgroup of the first rows writes its PIDX and PWTS [1,
 // S, KSEL] (u32, f32), topk.metal's IDX and WTS, the pairs in (row, pick) order. Without, the picks are IDX [S * KSEL]
@@ -56,12 +56,22 @@ const device S* sa = (const device S*)WS + base * SPR;
 const device S* ba = (const device S*)WB + base * SPR;
 float acc[2 * ROWS];
 for (uint r = 0; r < 2 * ROWS; r++) acc[r] = 0.0f;
-for (uint k = lane * 16; k < K; k += 512) {
-    float xr[16];
-    for (uint i = 0; i < 16; i++) xr[i] = float(x[k + i]);
-    for (uint r = 0; r < 2 * ROWS; r++)
-        acc[r] += FMT == 3 ? msv_ink2_affine_chunk<S, BITS, GS>(arow + r * WBR, sa + r * SPR, ba + r * SPR, k / 16, xr)
-                           : msv_ink2_chunk(FMT, wrow + r * WPR, srow + r * SPR, k / 16, xr);
+if (FMT == 3) {
+    for (uint c = lane; c < K / 16u; c += 32u) {
+        const device vec<T, 4>* xp = (const device vec<T, 4>*)(x + c * 16u);
+        const float4 x0 = float4(xp[0]), x1 = float4(xp[1]), x2 = float4(xp[2]), x3 = float4(xp[3]);
+        const float4 s4 = x0 + x1 + x2 + x3;
+        const float sx = (s4.x + s4.y) + (s4.z + s4.w);
+        for (uint r = 0; r < 2 * ROWS; r++)
+            acc[r] += msv_ink2_affine_chunk_f4<S, BITS, GS>(arow + r * WBR, sa + r * SPR, ba + r * SPR, c, x0, x1, x2, x3, sx);
+    }
+} else {
+    for (uint k = lane * 16; k < K; k += 512) {
+        float xr[16];
+        for (uint i = 0; i < 16; i++) xr[i] = float(x[k + i]);
+        for (uint r = 0; r < 2 * ROWS; r++)
+            acc[r] += msv_ink2_chunk(FMT, wrow + r * WPR, srow + r * SPR, k / 16, xr);
+    }
 }
 const float sc = SCALED ? SC[ex] : 1.0f;
 for (uint r = 0; r < ROWS; r++) {

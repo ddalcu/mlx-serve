@@ -48,8 +48,11 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **Reads of at most `small_rows` rows build a mask (`relmask.metal`) and use MLX's attention**: the flash kernel
   (`relattn.metal`, mlx-lm's, MIT) walks the keys 16 at a time on one threadgroup, a prompt's throughput and a few
   rows' latency.
-- **2 to `packed_rows` rows read the packed expert banks in place** (`ups`, `downs`, then `sum` over one pick a
-  row); past that MLX's gather, which reads a bank once for all its picks, wins.
+- **2 to `packed_rows` (16) rows compact unique active experts on GPU** (`group_experts`, `ups_grouped`, `downs_grouped`,
+  then `sum`) so each expert's weights are read once across all rows in the block; past that, NAX uses
+  `gather_qmm_nax.sortedGatherMappedPrompt` (no `top_k`× copy) and `sortedGatherPrompt`, else MLX's gather.
+- **Quantized `join_q` / `join_qkv` pad to 64-row multiples at load** (`joinQuantAligned`, `joinSlidingSix`): `sink`
+  has 24 heads, which otherwise misses `vqmm_nax`, MLX `qmv_nax`, and `qmm_t_nax_staged` on all 48 visits.
 - **A threadgroup past 256 threads is proven per instantiation** (`unproven`): an M1/M2 compiles `pre` and `mid` for
   384 to 576 threads, under the 768 an M3+ runs. The first dispatch is evaluated and a refusal narrows
   `stream_threads` for the process; every other kernel's group is at most 256.
@@ -69,7 +72,7 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **One row's output gate rides the output projection** (`oGated`, `oproj.metal`): the launch it saves beats MLX's
   one-row qmv on this shape too. Affine at every width or dense (`oFormat`); anything else keeps `gated` + `projectRows`.
 - **The draft head** (`mtp.safetensors`, greedy and sampled requests): a round drafts 7 tokens,
-  verifies the prefix the drafter is sure of (`min_sure`, never a stop id: `draftsToVerify`) as ONE forward that appends nothing (`kernels.Open`), and
+  verifies the prefix maximizing expected tokens/ms (`RowCost.chooseDrafts`, never a stop id) as ONE open forward (`relsplit_open`, `kernels.Open`), and
   commits the rows the trunk agrees with (`kernels.commit`): no rollback. Its taps are per engine slot (`Spec.select`).
 - **A drafter layer `local_layer_ids` leaves out reads every committed position** (`appendFull`, billed as `Bill.state_per_token`),
   the others the ring's newest window - 1: read as a sliding layer, the release's layer 1 drafted blind past 1K tokens.
@@ -99,7 +102,7 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - `proof_test.zig`: whole == chunked == stepwise on the tiny looped fixture (CPU), planted state mutations, the media
   splice, a verified block's commit, batched slots against each slot alone (CPU) or reordered and re-neighboured
   (GPU), and each kernel against its chain.
-- `contract.zig`: `gated`, `state`, `relmask`, `act`, `sum`, `topk`, `gate` (its one-row arm), `relsplit`, `relcomb`,
-  `relslots`, `markov_rnn`, `markov_fold`, `markov_pick`, `oproj`, `router`, `norm`.
-  Owed: `pre`, `prep`, `mid`, `ups`, `downs`, `relattn`, and `gate`'s prompt arm.
+- `contract.zig`: `gated`, `state`, `relmask`, `act`, `sum`, `topk`, `gate` (its one-row arm), `relsplit`, `relsplit_open`,
+  `relcomb`, `relslots`, `markov_rnn`, `markov_step_rnn`, `markov_fold`, `markov_fold_q8`, `markov_pick`, `oproj`, `router`,
+  `norm`, `group_experts`, `ups_grouped`, `downs_grouped`. Owed: `pre`, `prep`, `mid`, `ups`, `downs`, `relattn`, and `gate`'s prompt arm.
 - Not verified: an image against mlx-lm's tower, the drafter's tokens against oMLX's.

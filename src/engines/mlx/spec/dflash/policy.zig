@@ -182,11 +182,15 @@ pub const Drafting = struct {
     owed: u32 = 0,
     /// Plain rounds the next losing round will owe.
     period: u32 = 1,
+    /// Upper bound on backoff period (lower for cheap native drafters so recovery after prose stretches is rapid).
+    max_period: u32 = MAX_PERIOD,
     /// Rounds skipped, for stats.
     skipped: u64 = 0,
     /// Drafted rounds that followed a skip stretch.
     probes: u64 = 0,
     after_skip: bool = false,
+    /// True while the current round is a probe following a skip stretch.
+    probing: bool = false,
 
     pub fn shouldDraft(self: *Drafting) bool {
         if (self.owed > 0) {
@@ -195,6 +199,7 @@ pub const Drafting = struct {
             self.after_skip = true;
             return false;
         }
+        self.probing = self.after_skip;
         if (self.after_skip) self.probes += 1;
         self.after_skip = false;
         return true;
@@ -206,8 +211,10 @@ pub const Drafting = struct {
     /// A drafted round: `gain` = the ms of plain rounds its tokens would have cost, `took` = what it took. A stall (a
     /// kernel's first compile, a foreign GPU job) is not what a round costs, as for `PlainCost`.
     pub fn record(self: *Drafting, gain: f32, took: f32) void {
+        const was_probe = self.probing;
+        self.probing = false;
         const wall = @min(took, STALL * if (self.wall > 0) self.wall else gain);
-        if (self.wall <= 0) {
+        if (self.wall <= 0 or (was_probe and gain >= wall)) {
             self.gain = gain;
             self.wall = wall;
         } else {
@@ -216,10 +223,10 @@ pub const Drafting = struct {
         }
         if (self.gain >= self.wall) {
             self.owed = 0;
-            self.period = @max(1, self.period / 2);
+            self.period = if (was_probe) 1 else @max(1, self.period / 2);
         } else {
             self.owed = self.period;
-            self.period = @min(self.period * 2, MAX_PERIOD);
+            self.period = @min(self.period * 2, self.max_period);
         }
     }
 };
@@ -496,6 +503,32 @@ test "Drafting: a losing draft owes plain rounds, doubling to a cap; a winning p
     d.record(60, 10);
     try testing.expect(d.shouldDraft());
     try testing.expect(d.probes > 0 and d.skipped > 0);
+}
+
+test "Drafting: a moderately winning probe clears the debt even after a deep losing streak" {
+    var d = Drafting{};
+    for (0..8) |_| {
+        while (!d.shouldDraft()) {}
+        d.record(10, 22);
+    }
+    var skipped: u32 = 0;
+    while (!d.shouldDraft()) skipped += 1;
+    try testing.expect(skipped >= 16);
+    // A 1.5x winning probe clears the debt and resets the backoff period to 1.
+    d.record(42, 28);
+    try testing.expect(d.shouldDraft());
+    try testing.expectEqual(@as(u32, 1), d.period);
+}
+
+test "Drafting: custom max_period bounds backoff wait for cheap native drafters" {
+    var d = Drafting{ .max_period = 8 };
+    for (0..8) |_| {
+        while (!d.shouldDraft()) {}
+        d.record(5, 10);
+    }
+    var owed: u32 = 0;
+    while (!d.shouldDraft()) owed += 1;
+    try testing.expectEqual(@as(u32, 8), owed);
 }
 
 test "Drafting: a thin win with scattered misses keeps drafting, because the rounds are weighed by their time" {

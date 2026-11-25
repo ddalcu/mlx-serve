@@ -28,17 +28,15 @@ pub const Layer = struct {
     post_norm: Array,
     /// The tap mix's norm (`dflare_norm`), f32.
     mix_norm: Array,
-    q: Linear,
-    k: Linear,
-    v: Linear,
+    /// Joined `q | k | v` `[q_dim + 2 * kv_dim, hidden]` and `k_ctx | v_ctx` `[2 * kv_dim, hidden]`.
+    qkv: Linear,
+    kv_ctx: Linear,
     o: Linear,
-    k_ctx: Linear,
-    v_ctx: Linear,
     q_norm: Array,
     k_norm: Array,
     k_norm_ctx: Array,
-    gate: Linear,
-    up: Linear,
+    /// Joined `gate | up` `[2 * intermediate, hidden]`.
+    gate_up: Linear,
     down: Linear,
 };
 
@@ -87,7 +85,13 @@ pub const Drafter = struct {
     rnn: Linear = .{},
     rnn_bias: Array = .{},
     rnn_norm: Array = .{},
+    /// Pre-split RNN weights for fast Markov steps: `rnn_step` `[3R, 2R]` and `rnn_ctx` `[3R, 2H]`.
+    rnn_step: Array = .{},
+    rnn_ctx: Array = .{},
     fold: Array = .{},
+    /// Per-vocab-row Q8 folded Markov matrix `[V, R]` int8 + `[V]` f32 scales for fast GPU drafting.
+    fold_q: Array = .{},
+    fold_sc: Array = .{},
     fold_bias: Array = .{},
 
     /// The drafter beside the pack, its Markov head folded over the trunk's `head`; null when the pack ships none.
@@ -112,17 +116,13 @@ pub const Drafter = struct {
                 .in_norm = try at.need("input_layernorm.weight"),
                 .post_norm = try at.need("post_attention_layernorm.weight"),
                 .mix_norm = try at.float("dflare_norm.weight"),
-                .q = try at.linear("self_attn.q_proj"),
-                .k = try at.linear("self_attn.k_proj"),
-                .v = try at.linear("self_attn.v_proj"),
+                .qkv = try at.joined(&.{ "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj" }),
+                .kv_ctx = try at.joined(&.{ "self_attn.k_proj_ctx", "self_attn.v_proj_ctx" }),
                 .o = try at.linear("self_attn.o_proj"),
-                .k_ctx = try at.linear("self_attn.k_proj_ctx"),
-                .v_ctx = try at.linear("self_attn.v_proj_ctx"),
                 .q_norm = try at.need("self_attn.q_norm.weight"),
                 .k_norm = try at.need("self_attn.k_norm.weight"),
                 .k_norm_ctx = try at.need("self_attn.k_norm_ctx.weight"),
-                .gate = try at.linear("mlp.gate_proj"),
-                .up = try at.linear("mlp.up_proj"),
+                .gate_up = try at.joined(&.{ "mlp.gate_proj", "mlp.up_proj" }),
                 .down = try at.linear("mlp.down_proj"),
             };
         }
@@ -143,9 +143,34 @@ pub const Drafter = struct {
         // `head(hidden_out(latent))` = latent over `head(hidden_out's columns)` plus `head(hidden_out's bias)`.
         const out_w = try at.raw("markov_head.hidden_out.weight");
         const out_b = try at.raw("markov_head.hidden_out.bias");
-        d.fold = try at.keep(try g.reshape(try project(&g, head, try g.reshape(try g.transpose(out_w, &.{ 1, 0 }), &.{ 1, rank, @intCast(hidden) })), &.{ rank, -1 }));
+        const fold_raw = try g.reshape(try project(&g, head, try g.reshape(try g.transpose(out_w, &.{ 1, 0 }), &.{ 1, rank, @intCast(hidden) })), &.{ rank, -1 });
         d.fold_bias = try at.keep(try project(&g, head, try g.reshape(out_b, &.{ 1, 1, @intCast(hidden) })));
+        const rdt = ops.dtype(d.rnn.w);
+        if (mlx.streamIsGpu(s) and (rdt == .bfloat16 or rdt == .float16) and @rem(rank, 4) == 0) {
+            const h_int: c_int = @intCast(hidden);
+            d.rnn_step = try at.keep(try g.contiguous(try g.sliceAxis(d.rnn.w, 1, 0, 2 * rank)));
+            d.rnn_ctx = try at.keep(try g.contiguous(try g.sliceAxis(d.rnn.w, 1, 2 * rank, 2 * rank + 2 * h_int)));
+            const qf = try quantizeFold(&g, fold_raw);
+            d.fold_q = try at.keep(qf[0]);
+            d.fold_sc = try at.keep(qf[1]);
+        } else {
+            d.fold = try at.keep(fold_raw);
+        }
         return d;
+    }
+
+    /// Quantizes `fold_src` `[R, V]` into per-vocab-row int8 `[V, R]` and f32 scales `[V]`.
+    pub fn quantizeFold(g: *Graph, fold_src: Array) ![2]Array {
+        const ft = try g.astype(try g.transpose(fold_src, &.{ 1, 0 }), .float32);
+        const mx = try g.max(try g.abs(ft), 1, true);
+        const zero = try g.scalar(0.0, .float32);
+        const pos = try g.greater(mx, zero);
+        const sc = try g.where(pos, try g.mulScalar(mx, 1.0 / 127.0), try g.scalar(1.0, .float32));
+        const inv = try g.where(pos, try g.div(try g.scalar(127.0, .float32), mx), zero);
+        const clamped = try g.minimum(try g.maximum(try g.mul(ft, inv), try g.scalar(-127.0, .float32)), try g.scalar(127.0, .float32));
+        const fq = try g.contiguous(try g.astype(try g.call(mlx.mlx_round, .{ clamped, @as(c_int, 0) }), .int8));
+        const fsc = try g.contiguous(try g.reshape(sc, &.{ops.shape(ft)[0]}));
+        return .{ fq, fsc };
     }
 
     fn release(d: *Drafter) void {
@@ -207,12 +232,14 @@ pub const Drafter = struct {
             }
             // A prompt's rows a slice at a time, so the f32 tap mix stays small.
             var r0: c_int = 0;
+            const kv_dim = kv * hd;
             while (r0 < n) : (r0 += 1024) {
                 const r1 = @min(n, r0 + 1024);
                 const rows32 = try lg.astype(try lg.reshape(try lg.sliceAxis(taps, 1, r0, r1), &.{ 1, r1 - r0, @intCast(d.cfg.tap_count), @intCast(d.hidden) }), .float32);
                 const context = try d.mix(&lg, rows32, @intCast(i), L.mix_norm);
-                const k = try d.heads(&lg, try project(&lg, &L.k_ctx, context), d.cfg.kv_heads, L.k_norm_ctx, @as(c_int, @intCast(first)) + r0);
-                const v = try d.heads(&lg, try project(&lg, &L.v_ctx, context), d.cfg.kv_heads, null, null);
+                const kvc = try project(&lg, &L.kv_ctx, context);
+                const k = try d.heads(&lg, try lg.sliceAxis(kvc, 2, 0, kv_dim), d.cfg.kv_heads, L.k_norm_ctx, @as(c_int, @intCast(first)) + r0);
+                const v = try d.heads(&lg, try lg.sliceAxis(kvc, 2, kv_dim, 2 * kv_dim), d.cfg.kv_heads, null, null);
                 for ([2]Array{ k, v }, &bufs) |x, *buf| buf.* = try lg.sliceUpdate(buf.*, try lg.astype(x, ops.dtype(d.norm)), &.{ 0, 0, at + r0, 0 }, &.{ 1, kv, at + r1, hd });
             }
             for (bufs, [2]*Array{ &cc.fk[i], &cc.fv[i] }) |buf, dst| {
@@ -235,12 +262,11 @@ pub const Drafter = struct {
 
     /// The `block - 1` tokens drafted after the committed token `t1` (`[1]` int32) at position `position`. `anchor` `[1, 1, hidden]` is `t1`'s normed embedding, `taps` `[1, n, taps * hidden]` the trunk's
     /// taps at the `n >= 1` positions before `position`, `head` the trunk's LM head, `vocab` its real rows and `softcap` its
-/// logit soft cap. `cache` carries the context's keys and values over the slot's rounds (null: projected afresh).
+    /// logit soft cap. `cache` carries the context's keys and values over the slot's rounds (null: projected afresh).
     pub fn draft(d: *const Drafter, g: *Graph, t1: Array, anchor: Array, taps: Array, position: c_int, head: *const Linear, vocab: c_int, softcap: f32, cache: ?*ContextKv) !Block {
         const cfg = &d.cfg;
         const hidden: c_int = @intCast(d.hidden);
         const block: c_int = @intCast(cfg.block);
-        const rank: c_int = @intCast(cfg.rank);
         const n = ops.shape(taps)[1];
         const dt = ops.dtype(d.norm);
         const at: u64 = @intCast(position);
@@ -259,6 +285,9 @@ pub const Drafter = struct {
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
         const back = [_]c_int{ 0, 2, 1, 3 };
 
+        const q_dim: c_int = @intCast(cfg.heads * cfg.head_dim);
+        const kv_dim: c_int = @intCast(cfg.kv_heads * cfg.head_dim);
+        const inter: c_int = @intCast(cfg.intermediate);
         var h = try g.concat(&.{ try g.astype(anchor, dt), try g.broadcast(try g.astype(d.mask, dt), &.{ 1, block - 1, hidden }) }, 1);
         for (d.layers, 0..) |*L, i| {
             var lg = g.scope();
@@ -277,8 +306,9 @@ pub const Drafter = struct {
             if (full_read) {} else if (own > 0) {
                 const rows32 = if (own == fresh) new32.? else try tapsOf(&lg, taps, 0, n, cfg.tap_count, hidden);
                 const context = try d.mix(&lg, rows32, @intCast(i), L.mix_norm);
-                kc = try d.heads(&lg, try project(&lg, &L.k_ctx, context), cfg.kv_heads, L.k_norm_ctx, position - own);
-                vc = try d.heads(&lg, try project(&lg, &L.v_ctx, context), cfg.kv_heads, null, null);
+                const kvc = try project(&lg, &L.kv_ctx, context);
+                kc = try d.heads(&lg, try lg.sliceAxis(kvc, 2, 0, kv_dim), cfg.kv_heads, L.k_norm_ctx, position - own);
+                vc = try d.heads(&lg, try lg.sliceAxis(kvc, 2, kv_dim, 2 * kv_dim), cfg.kv_heads, null, null);
             }
             if (!full_read and own < n) {
                 const cc = cache.?;
@@ -302,9 +332,10 @@ pub const Drafter = struct {
                 cc.v[i] = v_held;
             };
             const x = try lg.rmsNorm(h, L.in_norm, cfg.eps);
-            const q = try d.heads(&lg, try project(&lg, &L.q, x), cfg.heads, L.q_norm, position);
-            const kb = try d.heads(&lg, try project(&lg, &L.k, x), cfg.kv_heads, L.k_norm, position);
-            const vb = try d.heads(&lg, try project(&lg, &L.v, x), cfg.kv_heads, null, null);
+            const qkv = try project(&lg, &L.qkv, x);
+            const q = try d.heads(&lg, try lg.sliceAxis(qkv, 2, 0, q_dim), cfg.heads, L.q_norm, position);
+            const kb = try d.heads(&lg, try lg.sliceAxis(qkv, 2, q_dim, q_dim + kv_dim), cfg.kv_heads, L.k_norm, position);
+            const vb = try d.heads(&lg, try lg.sliceAxis(qkv, 2, q_dim + kv_dim, q_dim + 2 * kv_dim), cfg.kv_heads, null, null);
             var keys: Array = .{};
             var values: Array = .{};
             if (full_read) {
@@ -330,7 +361,8 @@ pub const Drafter = struct {
             const read = try lg.reshape(try lg.transpose(try lg.sdpa(q, keys, values, scale, .none), &back), &.{ 1, block, -1 });
             const mid = try lg.add(h, try project(&lg, &L.o, read));
             const y = try lg.rmsNorm(mid, L.post_norm, cfg.eps);
-            const mlp = try project(&lg, &L.down, try lg.mul(try lg.silu(try project(&lg, &L.gate, y)), try project(&lg, &L.up, y)));
+            const gu = try project(&lg, &L.gate_up, y);
+            const mlp = try project(&lg, &L.down, try lg.mul(try lg.silu(try lg.sliceAxis(gu, 2, 0, inter)), try lg.sliceAxis(gu, 2, inter, 2 * inter)));
             h = try g.keep(try lg.add(mid, mlp));
         }
         const rows = try g.sliceAxis(try g.rmsNorm(h, d.norm, cfg.eps), 1, 1, block);
@@ -339,12 +371,14 @@ pub const Drafter = struct {
         if (cache) |cc| cc.end = at;
         // The RNN restarts each block from the newest committed position's mix.
         const newest = try d.mix(g, try tapsOf(g, taps, n - 1, n, cfg.tap_count, hidden), @intCast(d.layers.len), d.rnn_norm);
-        return d.markov(g, t1, rows, newest, base, vocab, softcap, kernels.markovRuns(g, d.rnn.w, d.fold, rank));
+        const rank: c_int = @intCast(cfg.rank);
+        const use_fused = if (d.fold_q.ctx != null) kernels.markovQ8Runs(g, d.rnn_step, d.fold_q, rank) else kernels.markovRuns(g, d.rnn.w, d.fold, rank);
+        return d.markov(g, t1, rows, newest, base, vocab, softcap, use_fused);
     }
 
     /// The Markov head's chain over the block rows `rows` `[1, block - 1, hidden]` and their head logits `base` f32,
     /// from the committed token `t1` and the newest mix `newest` `[1, 1, hidden]`: each step's token and probability.
-    /// `fused` runs a step as `kernels.markovStep`'s three launches, else as the op chain.
+    /// `fused` runs a step as `kernels.markovStep`'s three launches (or Q8 `markovStepQ8` when quantized), else as the op chain.
     pub fn markov(d: *const Drafter, g: *Graph, t1: Array, rows: Array, newest: Array, base: Array, vocab: c_int, softcap: f32, fused: bool) !Block {
         const rank: c_int = @intCast(d.cfg.rank);
         const steps: usize = @intCast(ops.shape(rows)[1]);
@@ -354,8 +388,28 @@ pub const Drafter = struct {
         var drafted: [abi.max_round_tokens]Array = undefined;
         var sure: [abi.max_round_tokens]Array = undefined;
         const dense_rows = try g.contiguous(rows);
+        const use_q8 = fused and d.fold_q.ctx != null and d.rnn_step.ctx != null and d.rnn_ctx.ctx != null;
+        var kappa: Array = .{};
+        var base_b: Array = .{};
+        if (use_q8) {
+            const st_c: c_int = @intCast(steps);
+            const h_c: c_int = @intCast(d.hidden);
+            const new_b = try g.broadcast(newest, &.{ 1, st_c, h_c });
+            const ctx_in = try g.concat(&.{ dense_rows, new_b }, 2);
+            const k3 = try g.add(try g.matmul(ctx_in, try g.transpose(d.rnn_ctx, &.{ 1, 0 })), d.rnn_bias);
+            kappa = try g.contiguous(try g.reshape(try g.astype(k3, .float32), &.{ st_c, 3 * rank }));
+            base_b = try g.contiguous(try g.add(base, try g.astype(d.fold_bias, .float32)));
+        }
         for (0..steps) |i| {
             const at: c_int = @intCast(i);
+            if (use_q8) {
+                const st = try kernels.markovStepQ8(g, d.rnn_step, kappa, state, d.prev_rows, prev, d.fold_q, d.fold_sc, base_b, at, vocab, softcap);
+                state = st.state;
+                prev = st.token;
+                drafted[i] = st.token;
+                sure[i] = st.confidence;
+                continue;
+            }
             if (fused) {
                 const st = try kernels.markovStep(g, d.rnn.w, d.rnn_bias, state, d.prev_rows, dense_rows, newest, prev, d.fold, d.fold_bias, base, at, vocab, softcap);
                 state = st.state;
@@ -417,5 +471,15 @@ const At = struct {
     fn linear(a: At, base: []const u8) !Linear {
         var buf: [160]u8 = undefined;
         return .{ .w = try a.need(try std.fmt.bufPrint(&buf, "{s}.weight", .{base})) };
+    }
+
+    /// Dense projections off one input joined along their output rows so one matmul serves all of them.
+    fn joined(a: At, comptime bases: []const []const u8) !Linear {
+        var ws: [bases.len]Array = undefined;
+        inline for (bases, 0..) |base, idx| {
+            var buf: [160]u8 = undefined;
+            ws[idx] = try a.raw(try std.fmt.bufPrint(&buf, "{s}.weight", .{base}));
+        }
+        return .{ .w = try a.keep(try a.g.contiguous(try a.g.concat(&ws, 0))) };
     }
 };

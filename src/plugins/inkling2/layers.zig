@@ -63,8 +63,9 @@ pub const Layer = struct {
     /// `[heads, head_dim]` and `[heads, d_rel]`.
     q_scale: Array,
     rel_scale: Array,
-    /// `[d_rel, extent]`, and the same f32 with its columns reversed (the one-row step's bias, newest key last).
+    /// `[d_rel, extent]`, pre-cast bf16 copy (avoids per-visit astype), and f32 with reversed columns.
     rel_proj: Array,
+    rel_proj_bf16: Array = .{},
     rel_proj_rev: Array,
     k_conv: Conv,
     v_conv: Conv,
@@ -74,9 +75,11 @@ pub const Layer = struct {
     /// `[experts, hidden]` and `[experts]`, f32.
     router: Array,
     router_bias: Array,
-    /// q | gate | r | sink, and a sliding layer's k | v, as one projection each (the parts are its row views).
+    /// q | gate | r | sink, a sliding layer's k | v, and all 6 joined for pass-0 sliding visits (row views of one buffer).
     join_q: linear.Joined = .{},
     join_kv: linear.Joined = .{},
+    join_qkv: Linear = .{},
+    join_qkv_split: c_int = 0,
     /// Rows alternate gate, up.
     gate_up: Bank,
     down: Bank,
@@ -88,6 +91,20 @@ pub const Layer = struct {
     message_query: Array = .{},
 };
 
+/// Pre-evaluated GPU constants shared across all 48 visits (avoids hundreds of per-step host->GPU allocations).
+pub const Consts = struct {
+    eps: Array = .{},
+    caps: Array = .{},
+    conv_scale: Array = .{},
+    mid_pr: Array = .{},
+    prep_pr_static: Array = .{},
+    prep_pr_dynamic: Array = .{},
+    prep_pr_sliding_full: Array = .{},
+    route_scale: Array = .{},
+    attn_scale: Array = .{},
+    ident: Array = .{},
+};
+
 pub const Body = struct {
     cfg: Config,
     layers: []const Layer,
@@ -95,6 +112,7 @@ pub const Body = struct {
     /// Ones `[hidden]` and `[head_dim]` f32: the unweighted norms' weight.
     ones: Array,
     ones_head: Array,
+    consts: Consts = .{},
 };
 
 pub const projectRows = head_block.project;
@@ -269,6 +287,14 @@ pub const Projections = struct { proj: [6]Array, dyn: ?[2]Array };
 /// are one array; then a global layer's projected k and v conv taps.
 pub fn projections(g: *Graph, L: *const Layer, qkv: [3]Array) !Projections {
     var proj: [6]Array = undefined;
+    if (L.join_qkv.w.ctx != null and L.join_q.built() and L.join_kv.built() and qkv[1].ctx == qkv[0].ctx and qkv[2].ctx == qkv[0].ctx) {
+        const all = try projectRows(g, &L.join_qkv, qkv[0]);
+        const yq = try g.sliceAxis(all, 2, 0, L.join_qkv_split);
+        const ykv = try g.sliceAxis(all, 2, L.join_qkv_split, ops.shape(all)[2]);
+        for (proj[0..4], 0..) |*x, i| x.* = try L.join_q.part(g, yq, i);
+        for (proj[4..6], 0..) |*x, i| x.* = try L.join_kv.part(g, ykv, i);
+        return .{ .proj = proj, .dyn = null };
+    }
     if (L.join_q.built()) {
         const y = try projectRows(g, &L.join_q.lin, qkv[0]);
         for (proj[0..4], 0..) |*x, i| x.* = try L.join_q.part(g, y, i);

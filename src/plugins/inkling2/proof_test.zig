@@ -1326,10 +1326,9 @@ test "inkling2 draft: rounds that carry the context keys and values draft what f
     const one = try g.ones(&.{H}, dt);
     var layer: draft.Layer = .{
         .in_norm = one, .post_norm = one, .mix_norm = one,
-        .q = try lin.of(&g, a, &seed, 2 * HD, H), .k = try lin.of(&g, a, &seed, HD, H), .v = try lin.of(&g, a, &seed, HD, H), .o = try lin.of(&g, a, &seed, H, 2 * HD),
-        .k_ctx = try lin.of(&g, a, &seed, HD, H), .v_ctx = try lin.of(&g, a, &seed, HD, H),
+        .qkv = try lin.of(&g, a, &seed, 4 * HD, H), .kv_ctx = try lin.of(&g, a, &seed, 2 * HD, H), .o = try lin.of(&g, a, &seed, H, 2 * HD),
         .q_norm = try g.ones(&.{HD}, dt), .k_norm = try g.ones(&.{HD}, dt), .k_norm_ctx = try g.ones(&.{HD}, dt),
-        .gate = try lin.of(&g, a, &seed, 48, H), .up = try lin.of(&g, a, &seed, 48, H), .down = try lin.of(&g, a, &seed, H, 48),
+        .gate_up = try lin.of(&g, a, &seed, 96, H), .down = try lin.of(&g, a, &seed, H, 48),
     };
     var d: draft.Drafter = .{
         .cfg = .{ .layers = 1, .heads = 2, .kv_heads = 1, .head_dim = HD, .intermediate = 48, .window = 13, .block = 4, .rank = R, .tap_count = 2 },
@@ -1391,10 +1390,9 @@ test "inkling2 draft: a layer outside local_layer_ids reads every committed posi
         fn layer(gr: *ops.Graph, al: std.mem.Allocator, sd: *u64, one: ops.Array, ones_hd: ops.Array) !draft.Layer {
             return .{
                 .in_norm = one, .post_norm = one, .mix_norm = one,
-                .q = try lin(gr, al, sd, 2 * HD, H), .k = try lin(gr, al, sd, HD, H), .v = try lin(gr, al, sd, HD, H), .o = try lin(gr, al, sd, H, 2 * HD),
-                .k_ctx = try lin(gr, al, sd, HD, H), .v_ctx = try lin(gr, al, sd, HD, H),
+                .qkv = try lin(gr, al, sd, 4 * HD, H), .kv_ctx = try lin(gr, al, sd, 2 * HD, H), .o = try lin(gr, al, sd, H, 2 * HD),
                 .q_norm = ones_hd, .k_norm = ones_hd, .k_norm_ctx = ones_hd,
-                .gate = try lin(gr, al, sd, 48, H), .up = try lin(gr, al, sd, 48, H), .down = try lin(gr, al, sd, H, 48),
+                .gate_up = try lin(gr, al, sd, 96, H), .down = try lin(gr, al, sd, H, 48),
             };
         }
     };
@@ -1572,4 +1570,73 @@ test "inkling2 load: decode steps lift the command-buffer MB split, prompts and 
     } else |_| {}
     try testing.expectEqual(@as(i32, 77), Limits.mb_split);
     try testing.expectEqual(@as(i32, 50), Limits.op_split);
+}
+
+// Bar: zero-copy `splitPartsOpen` matches `splitParts` on concatenated KV bit-for-bit across sliding & global windows.
+test "inkling2 kernels: relsplit_open matches concatenated relsplit bit-for-bit" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    fx_stream = mlx.gpuStream();
+    const HQ: c_int = 24;
+    const HKV: c_int = 8;
+    const HD: c_int = 128;
+    const R: c_int = 32;
+    var seed: u64 = 51000;
+    for ([_]c_int{ 0, 16 }) |window| for ([_]c_int{ 2, 4, 8 }) |L| for ([_]c_int{ 10, 40 }) |C| {
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 10;
+        const q = try randomRow(&g, a, seed + 0, &.{ 1, HQ, L, HD }, 0.3, .bfloat16);
+        const kc = try randomRow(&g, a, seed + 1, &.{ 1, HKV, C, HD }, 0.3, .bfloat16);
+        const vc = try randomRow(&g, a, seed + 2, &.{ 1, HKV, C, HD }, 0.3, .bfloat16);
+        const kn = try randomRow(&g, a, seed + 3, &.{ 1, HKV, L, HD }, 0.3, .bfloat16);
+        const vn = try randomRow(&g, a, seed + 4, &.{ 1, HKV, L, HD }, 0.3, .bfloat16);
+        const bias = try randomRow(&g, a, seed + 5, &.{ 1, L, HQ, R }, 0.5, .bfloat16);
+        const sinks = try randomRow(&g, a, seed + 6, &.{ 1, L, HQ }, 0.5, .float32);
+        const gate = try g.sigmoid(try randomRow(&g, a, seed + 7, &.{L * HQ * HD}, 1.0, .float32));
+        const from: c_int = if (window > 0) @max(0, C - (window - 1)) else 0;
+        const k_cat = try g.concat(&.{ try g.sliceAxis(kc, 2, from, C), kn }, 2);
+        const v_cat = try g.concat(&.{ try g.sliceAxis(vc, 2, from, C), vn }, 2);
+        const want = try kernels.splitJoin(&g, try kernels.splitParts(&g, q, k_cat, v_cat, bias, sinks, window), gate, L, .bfloat16);
+        const got = try kernels.splitJoin(&g, try kernels.splitPartsOpen(&g, q, kc, vc, kn, vn, bias, sinks, window), gate, L, .bfloat16);
+        try ops.expectBitEqual(got, want);
+    };
+}
+
+// Bar: precomputed-kappa + coalesced Q8 Markov kernels pick the exact same tokens and close probabilities as the op chain.
+test "inkling2 draft: Q8 Markov kernels match op chain tokens and probabilities" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    fx_stream = mlx.gpuStream();
+    var g = ops.Graph.init(a, fx_stream);
+    defer g.deinit();
+    const H: c_int = 64;
+    const R: c_int = 32;
+    const V: c_int = 256;
+    const vocab: c_int = 250;
+    var d: draft.Drafter = .{
+        .cfg = .{ .layers = 1, .heads = 2, .kv_heads = 1, .head_dim = 16, .intermediate = 48, .window = 16, .block = 5, .rank = @intCast(R), .tap_count = 2 },
+        .hidden = @intCast(H),
+        .s = fx_stream,
+    };
+    d.norm = try g.ones(&.{H}, .bfloat16);
+    d.prev_rows = try randomRow(&g, a, 61001, &.{ V, R }, 0.3, .bfloat16);
+    d.rnn = .{ .w = try randomRow(&g, a, 61002, &.{ 3 * R, 2 * R + 2 * H }, 0.15, .bfloat16) };
+    d.rnn_bias = try randomRow(&g, a, 61003, &.{3 * R}, 0.1, .bfloat16);
+    d.rnn_step = try g.contiguous(try g.sliceAxis(d.rnn.w, 1, 0, 2 * R));
+    d.rnn_ctx = try g.contiguous(try g.sliceAxis(d.rnn.w, 1, 2 * R, 2 * R + 2 * H));
+    d.fold = try randomRow(&g, a, 61004, &.{ R, V }, 0.25, .bfloat16);
+    const qf = try draft.Drafter.quantizeFold(&g, d.fold);
+    d.fold_q = qf[0];
+    d.fold_sc = qf[1];
+    d.fold_bias = try randomRow(&g, a, 61005, &.{ 1, 1, V }, 0.2, .bfloat16);
+    const rows = try randomRow(&g, a, 61006, &.{ 1, 4, H }, 0.8, .bfloat16);
+    const newest = try randomRow(&g, a, 61007, &.{ 1, 1, H }, 0.8, .bfloat16);
+    // Clear margins so Q8 quantization (~0.5%) never flips an arbitrary near-tie.
+    const base = try randomRow(&g, a, 61008, &.{ 1, 4, V }, 4.0, .float32);
+    const t1 = try g.fromSlice(i32, &.{17}, &.{1});
+    const want = try d.markov(&g, t1, rows, newest, base, vocab, 30.0, false);
+    const got = try d.markov(&g, t1, rows, newest, base, vocab, 30.0, true);
+    try expectClose(got.tokens, want.tokens, 0, "q8 drafted tokens");
+    try expectClose(got.confidence, want.confidence, 2e-2, "q8 draft probabilities");
 }

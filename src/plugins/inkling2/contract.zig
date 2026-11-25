@@ -862,11 +862,13 @@ const Gate = struct {
 
     pub fn geometry(_: *const Gate, shape: Shape) ?metal.Geometry {
         if (shape.rows == 0 or shape.n != 1 or shape.k == 0 or shape.rows * shape.k % 64 != 0) return null;
-        var geo = metal.Geometry{ .grid = .{ @intCast(shape.rows * shape.k), 1, 1 }, .tg = .{ 64, 1, 1 } };
+        const coop = (RANK % 8) == 0;
+        var geo = metal.Geometry{ .grid = .{ @intCast(shape.rows * shape.k * (if (coop) @as(usize, 8) else 1)), 1, 1 }, .tg = .{ 64, 1, 1 } };
         geo.out(&.{ @intCast(shape.rows), 1, @intCast(shape.k) }, .float32);
         geo.int("D", shape.k);
         geo.int("RANK", @as(c_int, RANK));
         geo.int("PROJ", @as(c_int, 0));
+        geo.int("COOP", @as(c_int, @intFromBool(coop)));
         return geo;
     }
 
@@ -2584,6 +2586,956 @@ fn rowLength(shape: Shape) usize {
     return shape.k;
 }
 
+const split_open_launch = metal.Launch{ .name = "msv_inkling2_relsplit_open", .inputs = &.{ "q", "kc", "vc", "kn", "vn", "rel", "sinks", "sizes", "scale" }, .outputs = &.{ "PART", "ML" }, .source = source("plugins/inkling2/kernels/relsplit_open.metal"), .contiguous = false, .tg_bytes = 2 * (SD * (SBK + 8) + SBK * (SD + 8)), .m1 = 1024, .m2 = 1024 };
+
+/// Zero-copy open verify split read (`relsplit_open.metal`): rows = KV heads, n = verify rows L (1..8), k = total keys C + L.
+const RelSplitOpen = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch = &split_open_launch,
+    arena: std.heap.ArenaAllocator,
+    window: usize,
+    shape: Shape = undefined,
+    q: []f64 = &.{},
+    k: []f64 = &.{},
+    v: []f64 = &.{},
+    rel: []f64 = &.{},
+    sinks: []f64 = &.{},
+    scale: f64 = @as(f32, 1.0 / @sqrt(@as(f32, SD))),
+    args: [9]mlx.mlx_array = undefined,
+
+    const Self = @This();
+
+    fn init(a: std.mem.Allocator, window: usize) Self {
+        return .{ .rig = metal.Rig.init(a), .arena = .init(a), .window = window };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    fn cached(shape: Shape) usize {
+        return shape.k - shape.n;
+    }
+
+    fn first(self: *const Self, shape: Shape) usize {
+        const c = cached(shape);
+        return if (self.window > 0 and c + 1 > self.window) c + 1 - self.window else 0;
+    }
+
+    fn splits(self: *const Self, shape: Shape) usize {
+        return (shape.k - self.first(shape) + SKPS - 1) / SKPS;
+    }
+
+    pub fn geometry(self: *const Self, shape: Shape) ?metal.Geometry {
+        if (shape.rows == 0 or shape.n < 1 or shape.n > kernels.split_rows or shape.k <= shape.n) return null;
+        const ns: c_int = @intCast(self.splits(shape));
+        const lh: c_int = @intCast(shape.n * shape.rows * SG);
+        var g = metal.Geometry{ .grid = .{ ns * 32 * SG, @intCast(shape.rows), 1 }, .tg = .{ 32 * SG, 1, 1 } };
+        g.out(&.{ ns, lh, SD }, .float32);
+        g.out(&.{ ns, lh, 2 }, .float32);
+        g.dtype("T", .bfloat16);
+        g.int("D", @as(c_int, SD));
+        g.int("HQ", @as(c_int, @intCast(shape.rows * SG)));
+        g.int("HKV", @as(c_int, @intCast(shape.rows)));
+        g.int("R", @as(c_int, R));
+        g.int("WINDOW", @as(c_int, @intCast(self.window)));
+        g.int("KPS", @as(c_int, SKPS));
+        return g;
+    }
+
+    pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const hq = shape.rows * SG;
+        const c = cached(shape);
+        const l = shape.n;
+        self.q = try host.uniform(a, rng, hq * l * SD, -2, 2, .bfloat16);
+        self.k = try host.uniform(a, rng, shape.rows * shape.k * SD, -2, 2, .bfloat16);
+        self.v = try host.uniform(a, rng, shape.rows * shape.k * SD, -2, 2, .bfloat16);
+        self.rel = try host.uniform(a, rng, l * hq * R, -2, 2, .bfloat16);
+        self.sinks = try host.uniform(a, rng, l * hq, -3, 3, .float32);
+        if (fill == .nonfinite) {
+            host.plant(self.q, hq * l, SD);
+            host.plant(self.v, shape.rows * shape.k, SD);
+        }
+        const kc_buf = try a.alloc(f64, shape.rows * c * SD);
+        const vc_buf = try a.alloc(f64, shape.rows * c * SD);
+        const kn_buf = try a.alloc(f64, shape.rows * l * SD);
+        const vn_buf = try a.alloc(f64, shape.rows * l * SD);
+        for (0..shape.rows) |h| {
+            @memcpy(kc_buf[h * c * SD ..][0 .. c * SD], self.k[h * shape.k * SD ..][0 .. c * SD]);
+            @memcpy(vc_buf[h * c * SD ..][0 .. c * SD], self.v[h * shape.k * SD ..][0 .. c * SD]);
+            @memcpy(kn_buf[h * l * SD ..][0 .. l * SD], self.k[(h * shape.k + c) * SD ..][0 .. l * SD]);
+            @memcpy(vn_buf[h * l * SD ..][0 .. l * SD], self.v[(h * shape.k + c) * SD ..][0 .. l * SD]);
+        }
+        self.rig.reset();
+        self.args = .{
+            try self.rig.input(.bfloat16, &.{ 1, cint(hq), cint(l), SD }, self.q),
+            try self.rig.input(.bfloat16, &.{ 1, cint(shape.rows), cint(c), SD }, kc_buf),
+            try self.rig.input(.bfloat16, &.{ 1, cint(shape.rows), cint(c), SD }, vc_buf),
+            try self.rig.input(.bfloat16, &.{ 1, cint(shape.rows), cint(l), SD }, kn_buf),
+            try self.rig.input(.bfloat16, &.{ 1, cint(shape.rows), cint(l), SD }, vn_buf),
+            try self.rig.input(.bfloat16, &.{ 1, cint(l), cint(hq), R }, self.rel),
+            try self.rig.input(.float32, &.{ 1, cint(l), cint(hq) }, self.sinks),
+            try self.rig.input(.int32, &.{3}, &.{ @floatFromInt(l), @floatFromInt(c), @floatFromInt(self.first(shape)) }),
+            try self.rig.scalar(@floatCast(self.scale)),
+        };
+        return true;
+    }
+
+    pub fn run(self: *Self) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Self) usize {
+        return self.splits(self.shape) * self.shape.n * self.shape.rows * SG * (SD + 2);
+    }
+
+    fn emit(self: *const Self, want: []f64, mag: ?[]f64, sim: attn.Sim) !void {
+        const a = self.rig.a;
+        const l = self.shape.n;
+        const keys_n = self.shape.k;
+        const hq = self.shape.rows * SG;
+        const ns = self.splits(self.shape);
+        const keys = try a.alloc(attn.Key, SKPS);
+        defer a.free(keys);
+        const ends = try a.alloc(usize, SKPS);
+        defer a.free(ends);
+        const terms = try a.alloc(f64, SD);
+        defer a.free(terms);
+        const eo = try a.alloc(f64, SD);
+        defer a.free(eo);
+        const qs: f64 = @as(f32, @floatCast(self.scale * LOG2E));
+        const parts = ns * l * hq;
+        for (0..ns) |s| for (0..l) |r| for (0..hq) |h| {
+            const kv = h / SG;
+            const kbeg = self.first(self.shape) + s * SKPS;
+            const kend = @min(keys_n, kbeg + SKPS);
+            const q = self.q[(h * l + r) * SD ..][0..SD];
+            var n: usize = 0;
+            var nb: usize = 0;
+            var t0 = kbeg;
+            while (t0 < kend) : (t0 += SBK) {
+                for (t0..@min(t0 + SBK, kend)) |j| {
+                    const at = keys_n - l + r;
+                    const vrow = self.v[(kv * keys_n + j) * SD ..][0..SD];
+                    if (j > at or (self.window > 0 and at - j >= self.window)) {
+                        keys[n] = .{ .s = -std.math.inf(f64), .on = false, .v = vrow, .ve = &half_sub_row };
+                        n += 1;
+                        continue;
+                    }
+                    const k = self.k[(kv * keys_n + j) * SD ..][0..SD];
+                    const d = attn.dot(q, k, qs, SD, 1, sim, terms);
+                    var under: f64 = 0;
+                    for (q, k) |x, y| under += @abs(x) + @abs(y);
+                    const b: f64 = if (at - j < R) @as(f64, @as(f32, @floatCast(self.rel[(r * hq + h) * R + at - j] * LOG2E))) else 0;
+                    const sv = d.v + b;
+                    keys[n] = .{ .s = sv, .e = d.e + qs * HALF_SUB * under + host.U * (@abs(b) + @abs(sv)), .v = vrow, .ve = &half_sub_row };
+                    n += 1;
+                }
+                ends[nb] = n;
+                nb += 1;
+            }
+            const start: attn.Init = if (s == 0)
+                .{ .m = @as(f32, @floatCast(self.sinks[r * hq + h] * LOG2E)), .l = 1 }
+            else
+                .{ .m = @as(f32, -1e30) };
+            const at = (s * l + r) * hq + h;
+            const o = want[at * SD ..][0..SD];
+            const st = attn.online(split_soft, start, keys[0..n], ends[0..nb], o, eo);
+            want[parts * SD + 2 * at] = st.m;
+            want[parts * SD + 2 * at + 1] = st.l;
+            if (mag) |m| {
+                for (m[at * SD ..][0..SD], eo) |*x, e| x.* = host.allowance(e);
+                m[parts * SD + 2 * at] = host.allowance(st.em);
+                m[parts * SD + 2 * at + 1] = host.allowance(st.el);
+            }
+        };
+    }
+
+    pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+        try self.emit(want, mag, null);
+    }
+
+    pub fn simulate(self: *const Self, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+        try self.emit(out, null, .{ .acc = acc, .order = order });
+    }
+
+    fn wrapper(self: *Self) ![]const u8 {
+        var g = ops.Graph.init(self.rig.a, self.rig.stream());
+        defer g.deinit();
+        const x = self.args;
+        const parts = try kernels.splitPartsOpen(&g, x[0], x[1], x[2], x[3], x[4], x[5], x[6], @intCast(self.window));
+        return self.rig.bytesOf(&parts);
+    }
+};
+
+const mk_step_rnn_launch = markovLaunch("markov_step_rnn", &.{ "W", "KAPPA", "ST", "PREV", "TOK", "AT" }, &.{"P"}, false, 0);
+const mk_fold_q8_launch = markovLaunch("markov_fold_q8", &.{ "P", "FQ", "FSC", "BASE", "AT", "CAP" }, &.{ "PM", "PI", "PS" }, true, 4 * (256 + 64 + 8 + 8 + 2));
+
+/// Precomputed-kappa Markov RNN step (`markov_step_rnn.metal`): n = rank.
+const MarkovStepRnn = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch = &mk_step_rnn_launch,
+    arena: std.heap.ArenaAllocator,
+    shape: Shape = undefined,
+    w: []f64 = &.{},
+    kappa: []f64 = &.{},
+    st: []f64 = &.{},
+    prev: []f64 = &.{},
+    tok: usize = 0,
+    at: usize = 0,
+    args: [6]mlx.mlx_array = undefined,
+
+    const Self = @This();
+
+    fn init(a: std.mem.Allocator) Self {
+        return .{ .rig = metal.Rig.init(a), .arena = .init(a) };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    pub fn geometry(_: *const Self, shape: Shape) ?metal.Geometry {
+        if (shape.n == 0 or 3 * shape.n * 32 % 256 != 0) return null;
+        var g = metal.Geometry{ .grid = .{ cint(32 * 3 * shape.n), 1, 1 }, .tg = .{ 256, 1, 1 } };
+        g.out(&.{cint(3 * shape.n)}, .float32);
+        g.dtype("T", .bfloat16);
+        g.int("R", cint(shape.n));
+        return g;
+    }
+
+    pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const r = shape.n;
+        self.w = try host.uniform(a, rng, 3 * r * (2 * r), -0.05, 0.05, .bfloat16);
+        self.kappa = try host.uniform(a, rng, MSTEPS * 3 * r, -0.5, 0.5, .float32);
+        self.st = try host.uniform(a, rng, r, -1, 1, .bfloat16);
+        self.prev = try host.uniform(a, rng, MPREV * r, -0.5, 0.5, .bfloat16);
+        self.tok = rng.uintLessThan(usize, MPREV);
+        self.at = rng.uintLessThan(usize, MSTEPS);
+        if (fill == .nonfinite) host.plant(self.w, 3 * r, 2 * r);
+        self.rig.reset();
+        self.args = .{
+            try self.rig.input(.bfloat16, &.{ cint(3 * r), cint(2 * r) }, self.w),
+            try self.rig.input(.float32, &.{ MSTEPS, cint(3 * r) }, self.kappa),
+            try self.rig.input(.bfloat16, &.{ 1, 1, cint(r) }, self.st),
+            try self.rig.input(.bfloat16, &.{ MPREV, cint(r) }, self.prev),
+            try self.rig.input(.int32, &.{1}, &.{@floatFromInt(self.tok)}),
+            try self.rig.input(.int32, &.{1}, &.{@floatFromInt(self.at)}),
+        };
+        return true;
+    }
+
+    pub fn run(self: *Self) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Self) usize {
+        return 3 * self.shape.n;
+    }
+
+    fn emit(self: *const Self, want: []f64, mag: ?[]f64, sim: attn.Sim) !void {
+        const r = self.shape.n;
+        const n = 2 * r;
+        const t = try self.rig.a.alloc(f64, n);
+        defer self.rig.a.free(t);
+        for (want, 0..) |*w, row| {
+            var abs: f64 = 0;
+            for (t, 0..) |*x, c| {
+                const fv = if (c < r) self.st[c] else self.prev[self.tok * r + (c - r)];
+                x.* = self.w[row * n + c] * fv;
+                abs += @abs(x.*);
+            }
+            const s = if (sim) |x| spec.sumIn(x.acc, x.order, t) else host.sum(t);
+            const k = self.kappa[self.at * 3 * r + row];
+            const res = bf(.{ .v = s + k, .e = spec.gamma(@floatFromInt(n + 1), host.U) * (abs + @abs(k)) });
+            w.* = res.v;
+            if (mag) |m| m[row] = if (std.math.isFinite(res.e)) host.allowance(res.e) else 0;
+        }
+    }
+
+    pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+        try self.emit(want, mag, null);
+    }
+
+    pub fn simulate(self: *const Self, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+        try self.emit(out, null, .{ .acc = acc, .order = order });
+    }
+
+    fn wrapper(self: *Self) ![]const u8 {
+        var g = ops.Graph.init(self.rig.a, self.rig.stream());
+        defer g.deinit();
+        const x = self.args;
+        return self.rig.bytesOf(&.{try kernels.markovStepRnn(&g, x[0], x[1], x[2], x[3], x[4], x[5])});
+    }
+};
+
+fn foldQ8Groups(shape: Shape) usize {
+    return (shape.k + 63) / 64;
+}
+
+/// Coalesced per-vocab-row Q8 Markov fold (`markov_fold_q8.metal`): rows = rank, n = padded V, k = real vocab.
+const MarkovFoldQ8 = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch = &mk_fold_q8_launch,
+    arena: std.heap.ArenaAllocator,
+    shape: Shape = undefined,
+    p: []f64 = &.{},
+    fq: []f64 = &.{},
+    fsc: []f64 = &.{},
+    base: []f64 = &.{},
+    at: usize = 0,
+    logit: []host.Val = &.{},
+    note: [200]u8 = undefined,
+    args: [6]mlx.mlx_array = undefined,
+
+    const Self = @This();
+
+    fn init(a: std.mem.Allocator) Self {
+        return .{ .rig = metal.Rig.init(a), .arena = .init(a) };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    pub fn geometry(_: *const Self, shape: Shape) ?metal.Geometry {
+        if (shape.rows == 0 or shape.rows % 4 != 0 or shape.k == 0 or shape.k > shape.n) return null;
+        const ng = cint(foldQ8Groups(shape));
+        var g = metal.Geometry{ .grid = .{ ng * 256, 1, 1 }, .tg = .{ 256, 1, 1 } };
+        g.out(&.{ng}, .float32);
+        g.out(&.{ng}, .uint32);
+        g.out(&.{ng}, .float32);
+        g.dtype("T", .bfloat16);
+        g.int("R", cint(shape.rows));
+        g.int("VOCAB", cint(shape.k));
+        return g;
+    }
+
+    pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const r = shape.rows;
+        const v = shape.n;
+        self.p = try host.uniform(a, rng, 3 * r, -2, 2, .float32);
+        self.fq = try a.alloc(f64, v * r);
+        for (self.fq) |*x| x.* = @floatFromInt(rng.intRangeAtMost(i8, -127, 127));
+        self.fsc = try host.uniform(a, rng, v, 0.0005, 0.003, .float32);
+        self.base = try host.uniform(a, rng, MSTEPS * v, -8, 8, .float32);
+        self.at = rng.uintLessThan(usize, MSTEPS);
+        const row = self.base[self.at * v ..][0..v];
+        switch (fill) {
+            .random => {},
+            .nonfinite => for ([_]usize{ 5, 64 + 9, 128 + 1 }, [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |c, x| {
+                if (c < shape.k) row[c] = x;
+            },
+            .stress => for (0..foldQ8Groups(shape)) |g| {
+                row[@min(shape.k - 1, g * 64 + rng.uintLessThan(usize, 64))] = 48;
+            },
+        }
+        self.logit = try a.alloc(host.Val, shape.k);
+        self.rig.reset();
+        self.args = .{
+            try self.rig.input(.float32, &.{cint(3 * r)}, self.p),
+            try self.rig.input(.int8, &.{ cint(v), cint(r) }, self.fq),
+            try self.rig.input(.float32, &.{cint(v)}, self.fsc),
+            try self.rig.input(.float32, &.{ 1, MSTEPS, cint(v) }, self.base),
+            try self.rig.input(.int32, &.{1}, &.{@floatFromInt(self.at)}),
+            try self.rig.input(.float32, &.{1}, &.{MCAP}),
+        };
+        return true;
+    }
+
+    pub fn run(self: *Self) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Self) usize {
+        return 3 * foldQ8Groups(self.shape);
+    }
+
+    fn logits(self: *Self, sim: attn.Sim) !void {
+        const r = self.shape.rows;
+        const v = self.shape.n;
+        const a = self.rig.a;
+        const lat = try a.alloc(host.Val, r);
+        defer a.free(lat);
+        for (lat, 0..) |*l, i| {
+            const t = std.math.tanh(self.p[2 * r + i]);
+            l.* = bf(.{ .v = t, .e = PRECISE * @abs(t) });
+        }
+        const t = try a.alloc(f64, r);
+        defer a.free(t);
+        for (self.logit, 0..) |*o, c| {
+            var abs: f64 = 0;
+            var flips: f64 = 0;
+            for (t, lat, 0..) |*x, l, i| {
+                x.* = l.v * self.fq[c * r + i];
+                abs += @abs(x.*);
+                flips += l.e * @abs(self.fq[c * r + i]);
+            }
+            const s = if (sim) |x| spec.sumIn(x.acc, x.order, t) else host.sum(t);
+            const scaled = s * self.fsc[c];
+            const se = (spec.gamma(@floatFromInt(r), host.U) * abs + flips) * @abs(self.fsc[c]) + host.U * @abs(scaled);
+            const x = self.base[self.at * v + c] + scaled;
+            o.* = .{ .v = x, .e = se + host.U * @abs(x) };
+        }
+    }
+
+    fn group(self: *const Self, g: usize) struct { at: usize, e: f64, sum: f64 } {
+        const lo = g * 64;
+        const hi = @min(self.shape.k, lo + 64);
+        var best = lo;
+        var e: f64 = 0;
+        for (lo..hi) |c| {
+            if (better(self.logit[c].v, c, self.logit[best].v, best)) best = c;
+            if (std.math.isFinite(self.logit[c].e)) e = @max(e, self.logit[c].e);
+        }
+        var sum: f64 = 0;
+        for (lo..hi) |c| sum += @exp(capped(self.logit[c].v) - capped(self.logit[best].v));
+        return .{ .at = best, .e = e, .sum = sum };
+    }
+
+    fn emit(self: *Self, want: []f64, mag: ?[]f64, sim: attn.Sim) !void {
+        try self.logits(sim);
+        const ng = foldQ8Groups(self.shape);
+        for (0..ng) |g| {
+            const x = self.group(g);
+            want[g] = self.logit[x.at].v;
+            want[ng + g] = @floatFromInt(x.at);
+            want[2 * ng + g] = x.sum;
+            if (mag) |m| {
+                m[g] = host.allowance(x.e);
+                m[ng + g] = 0;
+                m[2 * ng + g] = host.allowance(x.sum * (2 * x.e + PRECISE + spec.gamma(64, host.U)));
+            }
+        }
+    }
+
+    pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+        try @constCast(self).emit(want, mag, null);
+    }
+
+    pub fn simulate(self: *const Self, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+        try @constCast(self).emit(out, null, .{ .acc = acc, .order = order });
+    }
+
+    fn fail(self: *Self, comptime fmt: []const u8, args: anytype) []const u8 {
+        return std.fmt.bufPrint(&self.note, fmt, args) catch "a group breaks the rule";
+    }
+
+    pub fn check(self: *Self, _: spec.Gate) !?[]const u8 {
+        try self.logits(null);
+        const bytes = self.rig.outputBytes();
+        const ng = foldQ8Groups(self.shape);
+        for (0..ng) |g| {
+            const x = self.group(g);
+            const pm = spec.read(.f32, bytes, g);
+            const pi: usize = @intFromFloat(spec.read(.u32, bytes[4 * ng ..], g));
+            const ps = spec.read(.f32, bytes[8 * ng ..], g);
+            const top = self.logit[x.at];
+            if (!std.math.isFinite(top.v)) {
+                if (pi != x.at) return self.fail("group {d}: column {d} where {d} leads", .{ g, pi, x.at });
+                if (std.math.isNan(top.v) != std.math.isNan(pm) or (!std.math.isNan(top.v) and pm != top.v)) return self.fail("group {d}: max {d} where float64 gives {d}", .{ g, pm, top.v });
+                if (std.math.isNan(x.sum) != std.math.isNan(ps)) return self.fail("group {d}: sum {d} where float64 gives {d}", .{ g, ps, x.sum });
+                continue;
+            }
+            if (pi < g * 64 or pi >= @min(self.shape.k, (g + 1) * 64)) return self.fail("group {d}: column {d} outside it", .{ g, pi });
+            const mine = self.logit[pi];
+            if (!(mine.v + mine.e + x.e >= top.v)) return self.fail("group {d}: column {d} ({d}) where {d} leads ({d})", .{ g, pi, mine.v, x.at, top.v });
+            if (!(@abs(pm - mine.v) <= mine.e + 0x1p-24 * @abs(mine.v))) return self.fail("group {d}: max {d} where its column's logit is {d}", .{ g, pm, mine.v });
+            var sum: f64 = 0;
+            for (g * 64..@min(self.shape.k, (g + 1) * 64)) |c| sum += @exp(capped(self.logit[c].v) - capped(mine.v));
+            if (!(@abs(ps - sum) <= sum * (2 * x.e + PRECISE + spec.gamma(64, host.U)))) return self.fail("group {d}: sum {d} where float64 gives {d}", .{ g, ps, sum });
+        }
+        return null;
+    }
+
+    fn wrapper(self: *Self) ![]const u8 {
+        var g = ops.Graph.init(self.rig.a, self.rig.stream());
+        defer g.deinit();
+        const x = self.args;
+        return self.rig.bytesOf(&(try kernels.markovFoldQ8(&g, x[0], x[1], x[2], x[3], x[4], @intCast(self.shape.k), x[5], .bfloat16)));
+    }
+};
+
+const group_exp_launch = metal.Launch{ .name = "msv_inkling2_group_experts", .inputs = &.{"IDX"}, .outputs = &.{ "ACT_E", "ACT_CNT", "ACT_PAIR" }, .source = source("plugins/inkling2/kernels/group_experts.metal"), .tg_bytes = 4 * (16 * PICKS + 8), .m1 = 1024, .m2 = 1024 };
+
+fn groupS_cap(shape: Shape) usize {
+    return if (shape.rows <= 8) 8 else 16;
+}
+fn groupNmax(shape: Shape) usize {
+    return @min(shape.rows * shape.n, shape.k);
+}
+fn groupECount(shape: Shape) usize {
+    return groupNmax(shape);
+}
+fn groupPairCount(shape: Shape) usize {
+    return groupNmax(shape) * groupS_cap(shape);
+}
+
+/// Unique-expert compactor (`group_experts.metal`): rows = S (2..16), n = top_k (8), k = experts (128).
+const GroupExperts = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch = &group_exp_launch,
+    arena: std.heap.ArenaAllocator,
+    shape: Shape = undefined,
+    idx: []u32 = &.{},
+    args: [1]mlx.mlx_array = undefined,
+
+    const Self = @This();
+
+    fn init(a: std.mem.Allocator) Self {
+        return .{ .rig = metal.Rig.init(a), .arena = .init(a) };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    pub fn geometry(_: *const Self, shape: Shape) ?metal.Geometry {
+        if (shape.rows < 2 or shape.rows > kernels.packed_rows or shape.n != PICKS or shape.k == 0 or shape.k > 256) return null;
+        const tg = cint((shape.k + 31) / 32 * 32);
+        const s_cap = cint(groupS_cap(shape));
+        const nmax = cint(groupNmax(shape));
+        var g = metal.Geometry{ .grid = .{ tg, 1, 1 }, .tg = .{ tg, 1, 1 } };
+        g.out(&.{nmax}, .uint32);
+        g.out(&.{nmax}, .uint32);
+        g.out(&.{ nmax, s_cap }, .uint32);
+        g.int("E", cint(shape.k));
+        g.int("TG", tg);
+        g.int("KSEL", cint(shape.n));
+        g.int("S_CAP", s_cap);
+        g.int("NMAX", nmax);
+        return g;
+    }
+
+    pub fn prepare(self: *Self, shape: Shape, _: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const total = shape.rows * shape.n;
+        self.idx = try a.alloc(u32, total);
+        const idx_f = try a.alloc(f64, total);
+        // Distinct experts within each row (as top-k produces), shared across rows so cnt = 1..S all appear.
+        const pool = @min(shape.k, 24);
+        for (0..shape.rows) |r| {
+            var used: [256]bool = @splat(false);
+            for (0..shape.n) |k| {
+                var e = rng.uintLessThan(u32, @intCast(pool));
+                while (used[e]) e = (e + 1) % @as(u32, @intCast(shape.k));
+                used[e] = true;
+                self.idx[r * shape.n + k] = e;
+                idx_f[r * shape.n + k] = @floatFromInt(e);
+            }
+        }
+        self.rig.reset();
+        self.args = .{try self.rig.input(.uint32, &.{ 1, cint(shape.rows), cint(shape.n) }, idx_f)};
+        return true;
+    }
+
+    pub fn run(self: *Self) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Self) usize {
+        const nmax = groupNmax(self.shape);
+        return nmax * (2 + groupS_cap(self.shape));
+    }
+
+    pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+        const nmax = groupNmax(self.shape);
+        const s_cap = groupS_cap(self.shape);
+        @memset(want, 0);
+        @memset(mag, 0);
+        var slot: usize = 0;
+        for (0..self.shape.k) |e| {
+            var cnt: usize = 0;
+            for (self.idx, 0..) |v, p| if (v == e and cnt < s_cap) {
+                want[2 * nmax + slot * s_cap + cnt] = @floatFromInt(p);
+                cnt += 1;
+            };
+            if (cnt > 0) {
+                want[slot] = @floatFromInt(e);
+                want[nmax + slot] = @floatFromInt(cnt);
+                slot += 1;
+            }
+        }
+        for (slot..nmax) |u| {
+            want[u] = NONE_IDX;
+            want[nmax + u] = 0;
+        }
+    }
+
+    pub fn check(self: *Self, _: spec.Gate) !?[]const u8 {
+        const n = self.count();
+        const want = try self.rig.a.alloc(f64, n);
+        defer self.rig.a.free(want);
+        const mag = try self.rig.a.alloc(f64, n);
+        defer self.rig.a.free(mag);
+        try self.reference(want, mag);
+        const bytes = self.rig.outputBytes();
+        for (want, 0..) |w, i| {
+            if (spec.read(.u32, bytes, i) != w) return "compacted expert table differs from host reference";
+        }
+        return null;
+    }
+
+    fn wrapper(self: *Self) ![]const u8 {
+        var g = ops.Graph.init(self.rig.a, self.rig.stream());
+        defer g.deinit();
+        var cfg: config.Config = undefined;
+        cfg.num_experts = @intCast(self.shape.k);
+        cfg.top_k = @intCast(self.shape.n);
+        const o = try kernels.groupExperts(&g, self.args[0], &cfg, cint(groupS_cap(self.shape)), cint(groupNmax(self.shape)));
+        return self.rig.bytesOf(&o);
+    }
+};
+
+const ups_grouped_launch = metal.Launch{ .name = "msv_inkling2_ups_grouped", .inputs = &.{ "X", "WQ", "WS", "WB", "ACT_E", "ACT_CNT", "ACT_PAIR", "SC", "PR" }, .outputs = &.{"ACT"}, .source = source("plugins/inkling2/kernels/ups_grouped.metal"), .header = kernels.bank_grouped_header, .tg_bytes = 4 * 2 * 16, .m1 = 1024, .m2 = 1024 };
+const downs_grouped_launch = metal.Launch{ .name = "msv_inkling2_downs_grouped", .inputs = &.{ "ACT", "WQ", "WS", "WB", "ACT_E", "ACT_CNT", "ACT_PAIR" }, .outputs = &.{"DN"}, .source = source("plugins/inkling2/kernels/downs_grouped.metal"), .header = kernels.bank_grouped_header, .tg_bytes = 4 * 16, .m1 = 1024, .m2 = 1024 };
+
+const GRP_EXPERTS = 16;
+const GRP_KSEL = 4;
+
+/// Builds a deterministic valid compaction covering cnt = 1, 2, 3, 4 and 5+ across S rows (KSEL picks/row).
+fn buildGrouping(a: std.mem.Allocator, s: usize, s_cap: usize, nmax: usize, out_e: *[]u32, out_cnt: *[]u32, out_pair: *[]u32) !void {
+    const n = s * GRP_KSEL;
+    const idx = try a.alloc(u32, n);
+    defer a.free(idx);
+    // Deterministic routing hitting cnt=S (expert 0), cnt=4 (expert 1), cnt=3 (expert 2), cnt=2 (expert 3), and cnt=1 (rest).
+    for (0..s) |r| {
+        idx[r * GRP_KSEL + 0] = 0;
+        idx[r * GRP_KSEL + 1] = if (r < 4) 1 else @intCast(4 + (r - 4));
+        idx[r * GRP_KSEL + 2] = if (r < 3) 2 else @intCast(8 + (r - 3));
+        idx[r * GRP_KSEL + 3] = if (r < 2) 3 else @intCast(13 + (r - 2) % 3);
+    }
+    out_e.* = try a.alloc(u32, nmax);
+    out_cnt.* = try a.alloc(u32, nmax);
+    out_pair.* = try a.alloc(u32, nmax * s_cap);
+    @memset(out_e.*, 0xffffffff);
+    @memset(out_cnt.*, 0);
+    @memset(out_pair.*, 0);
+    var slot: usize = 0;
+    for (0..GRP_EXPERTS) |e| {
+        var cnt: usize = 0;
+        for (idx, 0..) |v, p| if (v == e and cnt < s_cap) {
+            out_pair.*[slot * s_cap + cnt] = @intCast(p);
+            cnt += 1;
+        };
+        if (cnt > 0) {
+            out_e.*[slot] = @intCast(e);
+            out_cnt.*[slot] = @intCast(cnt);
+            slot += 1;
+        }
+    }
+}
+
+/// Grouped multi-row gate+up+SwiGLU (`ups_grouped.metal`): rows = S (2..8), n = I (intermediate), k = hidden.
+const UpsGrouped = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch = &ups_grouped_launch,
+    arena: std.heap.ArenaAllocator,
+    bits: u32,
+    gs: usize,
+    shape: Shape = undefined,
+    x: []f64 = &.{},
+    w: host.Affine,
+    act_e: []u32 = &.{},
+    act_cnt: []u32 = &.{},
+    act_pair: []u32 = &.{},
+    args: [9]mlx.mlx_array = undefined,
+
+    const Self = @This();
+
+    fn init(a: std.mem.Allocator, bits: u32, gs: usize) Self {
+        return .{ .rig = metal.Rig.init(a), .arena = .init(a), .bits = bits, .gs = gs, .w = .{ .bits = bits, .gs = gs, .n = 0, .k = 0 } };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.rig.deinit();
+        self.w.deinit(self.rig.a);
+        self.arena.deinit();
+    }
+
+    pub fn geometry(self: *const Self, shape: Shape) ?metal.Geometry {
+        if (shape.rows < 2 or shape.rows > 8 or shape.n == 0 or shape.n % 2 != 0 or shape.k == 0 or shape.k % 32 != 0 or shape.k % self.gs != 0) return null;
+        const n = shape.rows * GRP_KSEL;
+        const nmax: usize = @min(n, GRP_EXPERTS);
+        const tg_y: c_int = if (shape.n % 4 == 0) 4 else 2;
+        var g = metal.Geometry{ .grid = .{ 32, cint(shape.n), cint(nmax) }, .tg = .{ 32, tg_y, 1 } };
+        g.out(&.{ cint(n), 1, cint(shape.n) }, .bfloat16);
+        g.dtype("T", .bfloat16);
+        g.int("K", cint(shape.k));
+        g.int("I", cint(shape.n));
+        g.int("GS", cint(self.gs));
+        g.int("FMT", @as(c_int, 3));
+        g.int("BITS", cint(self.bits));
+        g.dtype("S", .bfloat16);
+        g.int("SCALED", @as(c_int, 0));
+        g.int("KSEL", @as(c_int, GRP_KSEL));
+        g.int("S_CAP", @as(c_int, 8));
+        return g;
+    }
+
+    pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const s = shape.rows;
+        const inter = shape.n;
+        const k = shape.k;
+        const nmax: usize = @min(s * GRP_KSEL, GRP_EXPERTS);
+        self.x = try host.uniform(a, rng, s * k, -1, 1, .bfloat16);
+        try self.w.fill(self.rig.a, rng, GRP_EXPERTS * 2 * inter, k, .bfloat16, false);
+        if (fill == .nonfinite) host.plant(self.x, s, k);
+        try buildGrouping(a, s, 8, nmax, &self.act_e, &self.act_cnt, &self.act_pair);
+        const ef = try a.alloc(f64, nmax);
+        const cf = try a.alloc(f64, nmax);
+        const pf = try a.alloc(f64, nmax * 8);
+        for (ef, self.act_e) |*d, v| d.* = @floatFromInt(v);
+        for (cf, self.act_cnt) |*d, v| d.* = @floatFromInt(v);
+        for (pf, self.act_pair) |*d, v| d.* = @floatFromInt(v);
+        self.rig.reset();
+        const caps_arr = try self.rig.input(.float32, &.{4}, &caps);
+        self.args = .{
+            try self.rig.input(.bfloat16, &.{ 1, cint(s), cint(k) }, self.x),
+            try self.rig.input(.uint32, &.{ GRP_EXPERTS, cint(2 * inter), cint(k * self.bits / 32) }, self.w.words),
+            try self.rig.input(.bfloat16, &.{ GRP_EXPERTS, cint(2 * inter), cint(k / self.gs) }, self.w.scales),
+            try self.rig.input(.bfloat16, &.{ GRP_EXPERTS, cint(2 * inter), cint(k / self.gs) }, self.w.biases),
+            try self.rig.input(.uint32, &.{cint(nmax)}, ef),
+            try self.rig.input(.uint32, &.{cint(nmax)}, cf),
+            try self.rig.input(.uint32, &.{ cint(nmax), 8 }, pf),
+            caps_arr,
+            caps_arr,
+        };
+        return true;
+    }
+
+    pub fn run(self: *Self) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Self) usize {
+        return self.shape.rows * GRP_KSEL * self.shape.n;
+    }
+
+    fn dotAffine(self: *const Self, row_idx: usize, xrow: []const f64) [2]f64 {
+        const k = self.shape.k;
+        var y: f64 = 0;
+        var mag: f64 = 0;
+        var g: usize = 0;
+        while (g < k) : (g += self.gs) {
+            const sc = self.w.scales[(row_idx * k + g) / self.gs];
+            const bi = self.w.biases[(row_idx * k + g) / self.gs];
+            for (g..g + self.gs) |i| {
+                const wv = sc * @as(f64, @floatFromInt(self.w.codes[row_idx * k + i])) + bi;
+                const prod = wv * xrow[i];
+                y += prod;
+                mag += @abs(prod);
+            }
+        }
+        return .{ y, mag };
+    }
+
+    pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+        const inter = self.shape.n;
+        const k = self.shape.k;
+        for (self.act_e, self.act_cnt, 0..) |ex, cnt, u| {
+            if (ex == 0xffffffff) continue;
+            for (0..cnt) |m| {
+                const p = self.act_pair[u * 8 + m];
+                const r = p / GRP_KSEL;
+                const xrow = self.x[r * k ..][0..k];
+                for (0..inter) |i| {
+                    const gr = self.dotAffine(ex * 2 * inter + 2 * i, xrow);
+                    const ur = self.dotAffine(ex * 2 * inter + 2 * i + 1, xrow);
+                    const gv = spec.roundTo(.bf16, gr[0]);
+                    const uv = spec.roundTo(.bf16, ur[0]);
+                    const out = (std.math.tanh(gv * caps[0]) * caps[1]) * (std.math.tanh(uv * caps[2]) * caps[3]) / (1 + @exp(-gv));
+                    want[p * inter + i] = out;
+                    mag[p * inter + i] = @abs(out) + 0.05;
+                }
+            }
+        }
+    }
+
+    pub fn simulate(self: *const Self, _: spec.Accum, _: spec.Order, out: []f64) !void {
+        const mag = try self.rig.a.alloc(f64, out.len);
+        defer self.rig.a.free(mag);
+        try self.reference(out, mag);
+    }
+
+    fn wrapper(self: *Self) ![]const u8 {
+        var g = ops.Graph.init(self.rig.a, self.rig.stream());
+        defer g.deinit();
+        const x = self.args;
+        const n = cint(self.shape.rows * GRP_KSEL);
+        const nmax = cint(@min(self.shape.rows * GRP_KSEL, GRP_EXPERTS));
+        return self.rig.bytesOf(&.{try kernels.upsGrouped(&g, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8], n, cint(self.shape.n), cint(self.shape.k), @intCast(self.gs), 3, self.bits, false, GRP_KSEL, 8, nmax)});
+    }
+};
+
+/// Grouped multi-row down projection (`downs_grouped.metal`): rows = S (2..8), n = D (hidden), k = I (intermediate).
+const DownsGrouped = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch = &downs_grouped_launch,
+    arena: std.heap.ArenaAllocator,
+    bits: u32,
+    gs: usize,
+    shape: Shape = undefined,
+    act: []f64 = &.{},
+    w: host.Affine,
+    act_e: []u32 = &.{},
+    act_cnt: []u32 = &.{},
+    act_pair: []u32 = &.{},
+    args: [7]mlx.mlx_array = undefined,
+
+    const Self = @This();
+
+    fn init(a: std.mem.Allocator, bits: u32, gs: usize) Self {
+        return .{ .rig = metal.Rig.init(a), .arena = .init(a), .bits = bits, .gs = gs, .w = .{ .bits = bits, .gs = gs, .n = 0, .k = 0 } };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.rig.deinit();
+        self.w.deinit(self.rig.a);
+        self.arena.deinit();
+    }
+
+    pub fn geometry(self: *const Self, shape: Shape) ?metal.Geometry {
+        if (shape.rows < 2 or shape.rows > 8 or shape.n == 0 or shape.n % 2 != 0 or shape.k == 0 or shape.k % 32 != 0 or shape.k % self.gs != 0) return null;
+        const n = shape.rows * GRP_KSEL;
+        const nmax: usize = @min(n, GRP_EXPERTS);
+        const half_d = shape.n / 2;
+        const tg_y: c_int = if (half_d % 4 == 0) 4 else if (half_d % 2 == 0) 2 else 1;
+        var g = metal.Geometry{ .grid = .{ 32, cint(half_d), cint(nmax) }, .tg = .{ 32, tg_y, 1 } };
+        g.out(&.{ cint(n), 1, cint(shape.n) }, .bfloat16);
+        g.dtype("T", .bfloat16);
+        g.int("I", cint(shape.k));
+        g.int("D", cint(shape.n));
+        g.int("GS", cint(self.gs));
+        g.int("FMT", @as(c_int, 3));
+        g.int("BITS", cint(self.bits));
+        g.dtype("S", .bfloat16);
+        g.int("S_CAP", @as(c_int, 8));
+        return g;
+    }
+
+    pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const s = shape.rows;
+        const d = shape.n;
+        const inter = shape.k;
+        const n = s * GRP_KSEL;
+        const nmax: usize = @min(n, GRP_EXPERTS);
+        self.act = try host.uniform(a, rng, n * inter, -1, 1, .bfloat16);
+        try self.w.fill(self.rig.a, rng, GRP_EXPERTS * d, inter, .bfloat16, false);
+        if (fill == .nonfinite) host.plant(self.act, n, inter);
+        try buildGrouping(a, s, 8, nmax, &self.act_e, &self.act_cnt, &self.act_pair);
+        const ef = try a.alloc(f64, nmax);
+        const cf = try a.alloc(f64, nmax);
+        const pf = try a.alloc(f64, nmax * 8);
+        for (ef, self.act_e) |*dst, v| dst.* = @floatFromInt(v);
+        for (cf, self.act_cnt) |*dst, v| dst.* = @floatFromInt(v);
+        for (pf, self.act_pair) |*dst, v| dst.* = @floatFromInt(v);
+        self.rig.reset();
+        self.args = .{
+            try self.rig.input(.bfloat16, &.{ cint(n), 1, cint(inter) }, self.act),
+            try self.rig.input(.uint32, &.{ GRP_EXPERTS, cint(d), cint(inter * self.bits / 32) }, self.w.words),
+            try self.rig.input(.bfloat16, &.{ GRP_EXPERTS, cint(d), cint(inter / self.gs) }, self.w.scales),
+            try self.rig.input(.bfloat16, &.{ GRP_EXPERTS, cint(d), cint(inter / self.gs) }, self.w.biases),
+            try self.rig.input(.uint32, &.{cint(nmax)}, ef),
+            try self.rig.input(.uint32, &.{cint(nmax)}, cf),
+            try self.rig.input(.uint32, &.{ cint(nmax), 8 }, pf),
+        };
+        return true;
+    }
+
+    pub fn run(self: *Self) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Self) usize {
+        return self.shape.rows * GRP_KSEL * self.shape.n;
+    }
+
+    pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+        const d = self.shape.n;
+        const inter = self.shape.k;
+        for (self.act_e, self.act_cnt, 0..) |ex, cnt, u| {
+            if (ex == 0xffffffff) continue;
+            for (0..cnt) |m| {
+                const p = self.act_pair[u * 8 + m];
+                const arow = self.act[p * inter ..][0..inter];
+                for (0..d) |col| {
+                    const ridx = ex * d + col;
+                    var y: f64 = 0;
+                    var am: f64 = 0;
+                    var g: usize = 0;
+                    while (g < inter) : (g += self.gs) {
+                        const sc = self.w.scales[(ridx * inter + g) / self.gs];
+                        const bi = self.w.biases[(ridx * inter + g) / self.gs];
+                        for (g..g + self.gs) |i| {
+                            const wv = sc * @as(f64, @floatFromInt(self.w.codes[ridx * inter + i])) + bi;
+                            const prod = wv * arow[i];
+                            y += prod;
+                            am += @abs(prod);
+                        }
+                    }
+                    want[p * d + col] = y;
+                    mag[p * d + col] = am;
+                }
+            }
+        }
+    }
+
+    pub fn simulate(self: *const Self, _: spec.Accum, _: spec.Order, out: []f64) !void {
+        const mag = try self.rig.a.alloc(f64, out.len);
+        defer self.rig.a.free(mag);
+        try self.reference(out, mag);
+    }
+
+    fn wrapper(self: *Self) ![]const u8 {
+        var g = ops.Graph.init(self.rig.a, self.rig.stream());
+        defer g.deinit();
+        const x = self.args;
+        const n = cint(self.shape.rows * GRP_KSEL);
+        const nmax = cint(@min(self.shape.rows * GRP_KSEL, GRP_EXPERTS));
+        return self.rig.bytesOf(&.{try kernels.downsGrouped(&g, x[0], x[1], x[2], x[3], x[4], x[5], x[6], n, cint(self.shape.k), cint(self.shape.n), @intCast(self.gs), 3, self.bits, 8, nmax)});
+    }
+};
+
 const dtypes = [_]mlx.mlx_dtype{ .bfloat16, .float32 };
 
 fn name(comptime what: []const u8, comptime dt: mlx.mlx_dtype) []const u8 {
@@ -2793,6 +3745,74 @@ pub fn register(set: *kc.Set) !void {
     try set.add(OProj, .init(set.a, 4, 32), oprojSpec("inkling2 oproj bf16 (4-bit g32)", 32, .{ .f16 = 40, .why = "stress codes under 16 in groups of 32: an fp16 sum misses by ~45x, short of 100x but far past fp32's exact sums" }), null);
     try set.add(OProj, .init(set.a, 4, 128), oprojSpec("inkling2 oproj bf16 (4-bit g128)", 128, .{}), null);
     try set.add(OProj, .init(set.a, 0, 16), oprojSpec("inkling2 oproj bf16 (dense)", 16, .{}), null);
+    try set.add(RelSplitOpen, .init(set.a, 1024), .{
+        .name = "inkling2 relsplit_open bf16 (sliding 1024)",
+        .accum = .f32,
+        .depth = host.depthOne,
+        .out = .f32,
+        .tiles = .{ .{}, .{}, .{ .size = SKPS, .min = kernels.split_rows + 1 } },
+        .served = &.{ .{ .rows = 8, .n = kernels.split_rows, .k = 1031 }, .{ .rows = 8, .n = 4, .k = 1027 } },
+        .sums = split_sums,
+    }, null);
+    try set.add(RelSplitOpen, .init(set.a, 0), .{
+        .name = "inkling2 relsplit_open bf16 (global)",
+        .accum = .f32,
+        .depth = host.depthOne,
+        .out = .f32,
+        .tiles = .{ .{}, .{}, .{ .size = SKPS, .min = kernels.split_rows + 1 } },
+        .served = &.{ .{ .rows = 8, .n = kernels.split_rows, .k = 2056 }, .{ .rows = 8, .n = 2, .k = 300 } },
+        .sums = split_sums,
+    }, null);
+    try set.add(MarkovStepRnn, .init(set.a), .{
+        .name = "inkling2 markov_step_rnn bf16",
+        .accum = .f32,
+        .depth = host.depthOne,
+        .out = .f32,
+        .served = &.{.{ .rows = 1, .n = 256, .k = 1 }},
+        .sums = markov_sums,
+    }, null);
+    try set.add(MarkovFoldQ8, .init(set.a), .{
+        .name = "inkling2 markov_fold_q8 bf16",
+        .accum = .f32,
+        .depth = host.depthOne,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .f32, .count = foldQ8Groups }, .{ .elem = .u32, .count = foldQ8Groups }, .{ .elem = .f32, .count = foldQ8Groups } },
+        .nan = .{ .stated = "MLX's argmax order: a NaN logit is a group's pick, its max and sum NaN" },
+        .served = &.{ .{ .rows = 256, .n = 4096, .k = 4000 }, .{ .rows = 256, .n = 512, .k = 512 } },
+        .sums = markov_sums,
+    }, null);
+    try set.add(GroupExperts, .init(set.a), .{
+        .name = "inkling2 group_experts",
+        .accum = .none,
+        .depth = none,
+        .out = .u32,
+        .outs = &.{ .{ .elem = .u32, .count = groupECount }, .{ .elem = .u32, .count = groupECount }, .{ .elem = .u32, .count = groupPairCount } },
+        .nan = .{ .stated = "u32 expert indices hold no non-finite values; every slot matches exact compaction" },
+        .served = &.{ .{ .rows = 4, .n = PICKS, .k = EXPERTS }, .{ .rows = 8, .n = PICKS, .k = EXPERTS }, .{ .rows = 16, .n = PICKS, .k = EXPERTS } },
+    }, null);
+    const grp_sums: spec.Sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "bf16 output rounding masks fp16/bf16 inner accumulation differences on grouped MoE" };
+    // Every affine width a pack's experts may carry at g64, plus 4-bit at g32 and g128.
+    inline for (.{ .{ 2, 64 }, .{ 3, 64 }, .{ 4, 64 }, .{ 5, 64 }, .{ 6, 64 }, .{ 8, 64 }, .{ 4, 32 }, .{ 4, 128 } }) |w| {
+        try set.add(UpsGrouped, .init(set.a, w[0], w[1]), .{
+            .name = std.fmt.comptimePrint("inkling2 ups_grouped bf16 ({d}-bit g{d})", .{ w[0], w[1] }),
+            .accum = .f32,
+            .depth = rowLength,
+            .ops = 12,
+            .mids = 1,
+            .out = .bf16,
+            .served = &.{ .{ .rows = 4, .n = 64, .k = 256 }, .{ .rows = 8, .n = 64, .k = 256 } },
+            .sums = grp_sums,
+        }, null);
+        try set.add(DownsGrouped, .init(set.a, w[0], w[1]), .{
+            .name = std.fmt.comptimePrint("inkling2 downs_grouped bf16 ({d}-bit g{d})", .{ w[0], w[1] }),
+            .accum = .f32,
+            .depth = rowLength,
+            .ops = 2,
+            .out = .bf16,
+            .served = &.{ .{ .rows = 4, .n = 64, .k = 256 }, .{ .rows = 8, .n = 64, .k = 256 } },
+            .sums = grp_sums,
+        }, null);
+    }
 }
 
 // ── tests ──
@@ -2839,7 +3859,7 @@ test "kernel contract inkling2: each declared launch is the shipped wrapper's, b
             try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
         }
     }
-    for (set.kernels.items[at..]) |k| {
+    for (set.kernels.items[at .. at + 9]) |k| {
         const p: *OProj = @ptrCast(@alignCast(k.ctx));
         for (k.spec.served) |shape| {
             try std.testing.expect(try p.prepare(shape, .random, 7));
@@ -2847,6 +3867,33 @@ test "kernel contract inkling2: each declared launch is the shipped wrapper's, b
             const ours = try a.dupe(u8, p.rig.outputBytes());
             defer a.free(ours);
             try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
+        }
+    }
+    at += 9;
+    inline for (.{ RelSplitOpen, RelSplitOpen, MarkovStepRnn, MarkovFoldQ8, GroupExperts }) |T| {
+        const k = set.kernels.items[at];
+        at += 1;
+        const p: *T = @ptrCast(@alignCast(k.ctx));
+        for (k.spec.served) |shape| {
+            try std.testing.expect(try p.prepare(shape, .random, 7));
+            try p.run();
+            const ours = try a.dupe(u8, p.rig.outputBytes());
+            defer a.free(ours);
+            try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
+        }
+    }
+    for (0..8) |_| {
+        inline for (.{ UpsGrouped, DownsGrouped }) |T| {
+            const k = set.kernels.items[at];
+            at += 1;
+            const p: *T = @ptrCast(@alignCast(k.ctx));
+            for (k.spec.served) |shape| {
+                try std.testing.expect(try p.prepare(shape, .random, 7));
+                try p.run();
+                const ours = try a.dupe(u8, p.rig.outputBytes());
+                defer a.free(ours);
+                try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
+            }
         }
     }
 }

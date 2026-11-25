@@ -22,24 +22,55 @@ inline float msv_ink2_chunk(int fmt, const device uint* row, const device uchar*
   return d * s * 4194304.0f;
 }
 
-// Chunk `c` (16 values) of one affine row against x: scale * sum(q x) + bias * sum(x) over the chunk's group. The row's
-// BITS-bit values are one little-endian bit stream (MLX's packing at every width), so a chunk is BITS ushorts; `srow`
-// and `brow` hold its group scales and biases (S).
+// Fast 16-value affine chunk using pre-loaded float4 x0..x3 and pre-summed sx.
+template <typename S, int BITS, int GS>
+inline float msv_ink2_affine_chunk_f4(const device uchar* row, const device S* srow, const device S* brow, uint c, float4 x0, float4 x1, float4 x2, float4 x3, float sx) {
+  const uint g = (c * 16u) / GS;
+  float qx = 0.0f;
+  if (BITS == 8) {
+    const uint4 q = ((const device uint4*)row)[c];
+    qx = dot(float4(as_type<uchar4>(q.x)), x0) + dot(float4(as_type<uchar4>(q.y)), x1) +
+         dot(float4(as_type<uchar4>(q.z)), x2) + dot(float4(as_type<uchar4>(q.w)), x3);
+  } else if (BITS == 4) {
+    const uint2 q = ((const device uint2*)row)[c];
+    const float4 w0 = float4(q.x & 15u, (q.x >> 4) & 15u, (q.x >> 8) & 15u, (q.x >> 12) & 15u);
+    const float4 w1 = float4((q.x >> 16) & 15u, (q.x >> 20) & 15u, (q.x >> 24) & 15u, q.x >> 28);
+    const float4 w2 = float4(q.y & 15u, (q.y >> 4) & 15u, (q.y >> 8) & 15u, (q.y >> 12) & 15u);
+    const float4 w3 = float4((q.y >> 16) & 15u, (q.y >> 20) & 15u, (q.y >> 24) & 15u, q.y >> 28);
+    qx = dot(w0, x0) + dot(w1, x1) + dot(w2, x2) + dot(w3, x3);
+  } else if (BITS == 2) {
+    const uint q = ((const device uint*)row)[c];
+    const float4 w0 = float4(q & 3u, (q >> 2) & 3u, (q >> 4) & 3u, (q >> 6) & 3u);
+    const float4 w1 = float4((q >> 8) & 3u, (q >> 10) & 3u, (q >> 12) & 3u, (q >> 14) & 3u);
+    const float4 w2 = float4((q >> 16) & 3u, (q >> 18) & 3u, (q >> 20) & 3u, (q >> 22) & 3u);
+    const float4 w3 = float4((q >> 24) & 3u, (q >> 26) & 3u, (q >> 28) & 3u, q >> 30);
+    qx = dot(w0, x0) + dot(w1, x1) + dot(w2, x2) + dot(w3, x3);
+  } else {
+    const device ushort* p = (const device ushort*)(row + c * 2u * BITS);
+    ulong lo = 0, hi = 0;
+    for (int i = 0; i < BITS; ++i) {
+      const ulong v = ulong(p[i]);
+      if (16 * i < 64) lo |= v << (16 * i); else hi |= v << (16 * i - 64);
+    }
+    const float xs[16] = { x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w, x2.x, x2.y, x2.z, x2.w, x3.x, x3.y, x3.z, x3.w };
+    constexpr ulong mask = (1ul << BITS) - 1ul;
+    for (int i = 0; i < 16; ++i) {
+      const int off = i * BITS;
+      const ulong w = off + BITS <= 64 ? lo >> off : (off >= 64 ? hi >> (off - 64) : ((lo >> off) | (hi << (64 - off))));
+      qx += float(w & mask) * xs[i];
+    }
+  }
+  return float(srow[g]) * qx + float(brow[g]) * sx;
+}
+
+// Chunk `c` (16 values) of one affine row against x: scale * sum(q x) + bias * sum(x) over the chunk's group.
 template <typename S, int BITS, int GS>
 inline float msv_ink2_affine_chunk(const device uchar* row, const device S* srow, const device S* brow, uint c, thread const float* x) {
-  const device ushort* p = (const device ushort*)(row + c * 2 * BITS);
-  ulong lo = 0, hi = 0;
-  for (int i = 0; i < BITS; ++i) {
-    const ulong v = ulong(p[i]);
-    if (16 * i < 64) lo |= v << (16 * i); else hi |= v << (16 * i - 64);
-  }
-  float qx = 0.0f, sx = 0.0f;
-  for (int i = 0; i < 16; ++i) {
-    const int off = i * BITS;
-    const ulong w = off + BITS <= 64 ? lo >> off : (off >= 64 ? hi >> (off - 64) : ((lo >> off) | (hi << (64 - off))));
-    qx += float(w & ((1ul << BITS) - 1ul)) * x[i];
-    sx += x[i];
-  }
-  const uint g = (c * 16) / GS;
-  return float(srow[g]) * qx + float(brow[g]) * sx;
+  const float4 x0 = float4(x[0], x[1], x[2], x[3]);
+  const float4 x1 = float4(x[4], x[5], x[6], x[7]);
+  const float4 x2 = float4(x[8], x[9], x[10], x[11]);
+  const float4 x3 = float4(x[12], x[13], x[14], x[15]);
+  const float4 s4 = x0 + x1 + x2 + x3;
+  const float sx = (s4.x + s4.y) + (s4.z + s4.w);
+  return msv_ink2_affine_chunk_f4<S, BITS, GS>(row, srow, brow, c, x0, x1, x2, x3, sx);
 }

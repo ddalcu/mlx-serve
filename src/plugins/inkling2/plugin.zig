@@ -289,12 +289,13 @@ fn picks(g: *ops.Graph, logits: ops.Array, suppress: abi.Array) !ops.Array {
     return g.astype(try g.argmax(masked, -1, false), .int32);
 }
 
-/// What a verified row costs against a plain step on this machine, from the rounds' own timings (ms): the drafts a
-/// round verifies end where the drafter's probability of the run so far falls under `cut` (a cheaper row is worth a
-/// less sure draft).
+/// What a verified row costs against a plain step on this machine, from the rounds' own timings (ms): chooses the
+/// draft prefix maximizing expected emitted tokens per ms of `draft + verify(d)` (never past a stop id).
 pub const RowCost = struct {
     /// The least of eight samples: a plain step's spread from boot to boot moved the cut by a few hundredths.
     plain: Cost = .{ .seeds = 8 },
+    /// The drafter's own forward ms (block + head + Markov chain).
+    draft: Cost = .{ .seeds = 5 },
     /// Logged once the cut is first measured.
     told: bool = false,
     /// Each draft count's verify, 1 to `max_round_tokens - 1`.
@@ -344,6 +345,55 @@ pub const RowCost = struct {
         const r = self.ratio() orelse return 0.5;
         return std.math.clamp(1.34 * @sqrt(@max(r, 0)), 0.3, 0.8);
     }
+
+    /// Estimated verify ms for `d` drafts (1..max): exact measured cost when seen, else interpolated from nearest
+    /// measured points or a conservative linear ladder over `plain.ms`.
+    fn verifyMs(self: *const RowCost, d: usize) f32 {
+        if (d == 0) return if (self.plain.seen > 0) self.plain.ms else 11.0;
+        if (d < self.verify.len and self.verify[d].seen > 0) return self.verify[d].ms;
+        var lo: usize = 0;
+        var hi: usize = 0;
+        for (1..self.verify.len) |k| if (self.verify[k].seen > 0) {
+            if (k < d) lo = k else if (hi == 0) hi = k;
+        };
+        const base_plain: f32 = if (self.plain.seen > 0) self.plain.ms else 11.0;
+        if (lo > 0 and hi > 0) {
+            const t = @as(f32, @floatFromInt(d - lo)) / @as(f32, @floatFromInt(hi - lo));
+            return self.verify[lo].ms + t * (self.verify[hi].ms - self.verify[lo].ms);
+        }
+        const slope: f32 = (self.ratio() orelse 0.20) * base_plain;
+        if (lo > 0) return self.verify[lo].ms + slope * @as(f32, @floatFromInt(d - lo));
+        if (hi > 0) return @max(base_plain, self.verify[hi].ms - slope * @as(f32, @floatFromInt(hi - d)));
+        return base_plain * (1.20 + 0.20 * @as(f32, @floatFromInt(d)));
+    }
+
+    /// Optimal draft count `0..sure.len` maximizing expected emitted tokens per ms of `draft + verify(d)`, never
+    /// verifying a stop token or anything past it. A 1% near-tie prefers fewer rows.
+    pub fn chooseDrafts(self: *const RowCost, sure: []const f32, tokens: []const i32, stops: []const u32) u32 {
+        var max_d: usize = 0;
+        while (max_d < sure.len) : (max_d += 1) {
+            if (std.mem.indexOfScalar(u32, stops, @intCast(tokens[max_d])) != null) break;
+        }
+        if (max_d == 0) return 0;
+        const d_ms: f32 = if (self.draft.seen > 0) self.draft.ms else 3.5;
+        var exp_tok: [abi.max_round_tokens]f32 = undefined;
+        var rate: [abi.max_round_tokens]f32 = undefined;
+        exp_tok[0] = 1.0;
+        rate[0] = 1.0 / (d_ms + self.verifyMs(0));
+        var alive: f32 = 1.0;
+        var best: f32 = rate[0];
+        for (0..max_d) |k| {
+            const p = sure[k];
+            alive *= if (std.math.isFinite(p) and p >= 0) @min(p, 1.0) else 0.0;
+            exp_tok[k + 1] = exp_tok[k] + alive;
+            rate[k + 1] = exp_tok[k + 1] / (d_ms + self.verifyMs(k + 1));
+            if (rate[k + 1] > best) best = rate[k + 1];
+        }
+        for (0..max_d + 1) |d| {
+            if (rate[d] >= best * 0.99) return @intCast(d);
+        }
+        return 0;
+    }
 };
 
 /// A round's open verify (or its plain step): the drafter proposed after the committed token `t1` and the trunk read `t1`
@@ -356,7 +406,7 @@ const Opened = struct {
     opens: []kernels.Open = &.{},
     drafts: u32 = 0,
     /// `t1`, then the drafts.
-    ids: [abi.max_round_tokens]u32 = undefined,
+    ids: [abi.max_round_tokens]u32 = @splat(0),
     position: [1]u32,
     cache: ?abi.Handle = null,
     cache_ops: ?*const abi.CacheOps = null,
@@ -390,14 +440,16 @@ fn openRound(m: *Loaded, f: *const abi.Forward) !Opened {
     if (sp) |x| if (f.slots.len == 1) x.select(f.slots.slice()[0]);
     const context: c_int = if (sp) |x| x.rows(position) else 0;
     const cap: u32 = if (m.drafter) |d| @min(f.accept_cap, d.cfg.block - 1) else 0;
-    var proposed: ops.Array = .{};
+    var verify_ids: ops.Array = .{};
     const first = try g.fromSlice(i32, &.{@intCast(t1)}, &.{1});
     if (cap > 0 and context > 0 and f.cache_ops != null and f.caches.len == 1) {
         const r: run_mod.Run = .{ .mode = .verify, .rows = 1, .positions = &o.position, .caches = f.caches.slice(), .cache_ops = f.cache_ops };
         var c = r.ctx(g, &m.base.shared);
+        const t_draft0 = nowUs();
         const anchor = try g.rmsNorm(try b.embed.TableEmbed.forward(&w.embed, &c, try g.reshape(first, &.{ 1, 1 })), w.embed_norm, cfg.rms_norm_eps);
         const drafted = try m.drafter.?.draft(g, first, anchor, sp.?.ring, @intCast(position), &w.head.lin, w.head.vocab, w.head.softcap, &sp.?.context);
         try ops.evalMany(&.{ drafted.tokens, drafted.confidence });
+        m.row_cost.draft.add(msSince(t_draft0));
         const sure = mlx.mlx_array_data_float32(drafted.confidence) orelse return error.Inkling2DraftRound;
         const tokens = mlx.mlx_array_data_int32(drafted.tokens) orelse return error.Inkling2DraftRound;
         const min_sure = m.row_cost.cut();
@@ -406,9 +458,9 @@ fn openRound(m: *Loaded, f: *const abi.Forward) !Opened {
             log.info("[inkling2] draft verify cut {d:.2} (a verified row {d:.2} of a plain step)\n", .{ min_sure, ratio });
         };
         const stops: []const u32 = if (f.size >= @offsetOf(abi.Forward, "stop_ids") + @sizeOf(abi.Span(u32))) f.stop_ids.slice() else &.{};
-        o.drafts = draftsToVerify(sure[0..cap], tokens[0..cap], min_sure, stops);
+        o.drafts = m.row_cost.chooseDrafts(sure[0..cap], tokens[0..cap], stops);
         for (0..o.drafts) |k| o.ids[1 + k] = @intCast(tokens[k]);
-        proposed = try g.sliceAxis(drafted.tokens, 0, 0, @intCast(o.drafts));
+        if (o.drafts > 0) verify_ids = try g.concat(&.{ first, try g.sliceAxis(drafted.tokens, 0, 0, @intCast(o.drafts)) }, 0);
     }
 
     o.started = nowUs();
@@ -421,21 +473,9 @@ fn openRound(m: *Loaded, f: *const abi.Forward) !Opened {
     @memset(o.opens, .{ .g = g });
     sp.?.opens = o.opens;
     defer sp.?.opens = null;
-    const v = run_mod.tableForward(Model, &m.base, &.{ .mode = .verify, .logits = .all_rows, .rows = 1 + o.drafts, .tokens = .{}, .ids = .{ .ctx = (try g.concat(&.{ first, proposed }, 0)).ctx }, .slots = f.slots, .positions = f.positions, .caches = f.caches, .cache_ops = f.cache_ops }, &o.fo);
+    const v = run_mod.tableForward(Model, &m.base, &.{ .mode = .verify, .logits = .all_rows, .rows = 1 + o.drafts, .tokens = .{}, .ids = .{ .ctx = verify_ids.ctx }, .slots = f.slots, .positions = f.positions, .caches = f.caches, .cache_ops = f.cache_ops }, &o.fo);
     if (!v.isOk()) return error.Inkling2DraftRound;
     return o;
-}
-
-/// The drafts a round verifies: while their running probability stays at `min_sure` or above, and none after a stop
-/// id (`Forward.stop_ids`), which ends the turn.
-fn draftsToVerify(sure: []const f32, tokens: []const i32, min_sure: f32, stops: []const u32) u32 {
-    var run: f32 = 1;
-    var n: u32 = 0;
-    while (n < sure.len) : (n += 1) {
-        run *= sure[n];
-        if (run < min_sure or std.mem.indexOfScalar(u32, stops, @intCast(tokens[n])) != null) break;
-    }
-    return n;
 }
 
 /// Keeps `t1` and the first `accepted` drafts of `o`: their keys, values and conv windows committed, as the serial
@@ -454,15 +494,15 @@ fn commitOpen(m: *Loaded, o: *Opened, accepted: u32) !u64 {
     return position + @as(u64, @intCast(kept));
 }
 
-/// One greedy draft round on the committed token `t1` (`NativeDrafter.step`): the rows whose pick is the next draft
-/// are kept. With no context yet, or no draft worth a row, it is a plain step.
+/// One greedy draft round on the committed token `t1` (`NativeDrafter.step`): verifies the drafts and keeps the
+/// prefix the trunk's picks match.
 fn round(m: *Loaded, f: *const abi.Forward, out: *abi.ForwardOut) !void {
     var o = try openRound(m, f);
     defer o.deinit();
     const picked = try picks(o.g, .{ .ctx = o.fo.logits.ctx }, f.suppress_mask);
     try ops.eval(picked);
     const want = mlx.mlx_array_data_int32(picked) orelse return error.Inkling2DraftRound;
-    if (o.drafts == 0) m.row_cost.plain.add(msSince(o.started)) else m.row_cost.verify[o.drafts].add(msSince(o.started));
+    if (o.drafts == 0) m.row_cost.plain.add(msSince(o.started)) else if (o.drafts < abi.max_round_tokens) m.row_cost.verify[o.drafts].add(msSince(o.started));
     var accepted: u32 = 0;
     while (accepted < o.drafts and want[accepted] == @as(i32, @intCast(o.ids[1 + accepted]))) accepted += 1;
     const position = try commitOpen(m, &o, accepted);
@@ -687,6 +727,156 @@ const At = struct {
         return j;
     }
 
+    /// Joins quantized projections along output rows, padding the tail to a multiple of 64 rows so NAX matmul kernels
+    /// (`vqmm_nax`, MLX `qmv_nax`, `qmm_t_nax_staged`) see an aligned N; callers slice only `widths`, ignoring the pad.
+    fn joinQuantAligned(a: At, parts: []const *Linear) !b.linear.Joined {
+        if (parts.len == 0 or parts[0].s.ctx == null) return .{};
+        const q0 = parts[0].*;
+        for (parts[1..]) |p| if (p.s.ctx == null or p.bits != q0.bits or p.group_size != q0.group_size or p.mode != q0.mode or (p.b.ctx == null) != (q0.b.ctx == null) or ops.dtype(p.w) != ops.dtype(q0.w) or ops.dtype(p.s) != ops.dtype(q0.s)) {
+            return loader.join(a.o, parts, a.r.s);
+        };
+        var g = ops.Graph.init(gpa, a.r.s);
+        defer g.deinit();
+        var ws: [5]Array = undefined;
+        var ss: [5]Array = undefined;
+        var bs: [5]Array = undefined;
+        var widths: [4]c_int = @splat(0);
+        var sum: c_int = 0;
+        for (parts, 0..) |p, i| {
+            ws[i] = p.w;
+            ss[i] = p.s;
+            bs[i] = p.b;
+            widths[i] = ops.shape(p.w)[0];
+            sum += widths[i];
+        }
+        const pad = @rem(64 - @rem(sum, 64), 64);
+        var count = parts.len;
+        if (pad > 0) {
+            ws[count] = try g.zeros(&.{ pad, ops.shape(q0.w)[1] }, ops.dtype(q0.w));
+            ss[count] = try g.zeros(&.{ pad, ops.shape(q0.s)[1] }, ops.dtype(q0.s));
+            if (q0.b.ctx != null) bs[count] = try g.zeros(&.{ pad, ops.shape(q0.b)[1] }, ops.dtype(q0.b));
+            count += 1;
+        }
+        const fw = try a.keep(&g, try g.contiguous(try g.concat(ws[0..count], 0)));
+        const fs = try a.keep(&g, try g.contiguous(try g.concat(ss[0..count], 0)));
+        const fb = if (q0.b.ctx != null) try a.keep(&g, try g.contiguous(try g.concat(bs[0..count], 0))) else Array{};
+        var start: c_int = 0;
+        for (parts, widths[0..parts.len]) |p, n| {
+            _ = mlx.mlx_array_free(p.w);
+            p.w = g.escape(try g.sliceAxis(fw, 0, start, start + n));
+            _ = mlx.mlx_array_free(p.s);
+            p.s = g.escape(try g.sliceAxis(fs, 0, start, start + n));
+            if (fb.ctx != null) {
+                _ = mlx.mlx_array_free(p.b);
+                p.b = g.escape(try g.sliceAxis(fb, 0, start, start + n));
+            }
+            start += n;
+        }
+        return .{ .lin = .{ .w = fw, .s = fs, .b = fb, .bits = q0.bits, .group_size = q0.group_size, .mode = q0.mode }, .widths = widths };
+    }
+
+    /// Sliding-layer 6-way join (`q|gate|r|sink|[pad]|k|v`) into ONE buffer owned by `at.o`: rewrites `lins[0..6]` and
+    /// returns `join_q`, `join_kv` (row views of the single joined weight, so zero extra RAM), and `join_qkv` + split.
+    /// Quantized joins pad `q|gate|r|sink` to a multiple of 64 rows so `join_q`, `join_kv`, and `join_qkv` stay NAX-aligned.
+    fn joinSlidingSix(a: At, lins: *[6]Linear) !struct { q: b.linear.Joined, kv: b.linear.Joined, all: Linear, split: c_int } {
+        const quantized = lins[0].s.ctx != null;
+        if (quantized) {
+            for (lins[1..]) |l| if (l.s.ctx == null or l.bits != lins[0].bits or l.group_size != lins[0].group_size or l.mode != lins[0].mode or (l.b.ctx == null) != (lins[0].b.ctx == null) or ops.dtype(l.w) != ops.dtype(lins[0].w) or ops.dtype(l.s) != ops.dtype(lins[0].s)) {
+                const jq = try a.joinQuantAligned(&.{ &lins[0], &lins[1], &lins[2], &lins[3] });
+                const jkv = try a.joinQuantAligned(&.{ &lins[4], &lins[5] });
+                return .{ .q = jq, .kv = jkv, .all = .{}, .split = 0 };
+            };
+        } else {
+            for (lins[1..]) |l| if (l.s.ctx != null or ops.dtype(l.w) != ops.dtype(lins[0].w)) {
+                const jq = try a.joinRows(&.{ &lins[0], &lins[1], &lins[2], &lins[3] });
+                const jkv = try a.joinRows(&.{ &lins[4], &lins[5] });
+                return .{ .q = jq, .kv = jkv, .all = .{}, .split = 0 };
+            };
+        }
+        var g = ops.Graph.init(gpa, a.r.s);
+        defer g.deinit();
+        var rows: [6]c_int = undefined;
+        for (lins, 0..) |l, i| rows[i] = ops.shape(l.w)[0];
+        const raw_split = rows[0] + rows[1] + rows[2] + rows[3];
+        const pad: c_int = if (quantized) @rem(64 - @rem(raw_split, 64), 64) else 0;
+        const split = raw_split + pad;
+        const kv_rows = rows[4] + rows[5];
+        const tail_pad: c_int = if (quantized) @rem(64 - @rem(kv_rows, 64), 64) else 0;
+        var ws: [8]Array = undefined;
+        var ss: [8]Array = undefined;
+        var bs: [8]Array = undefined;
+        var count: usize = 0;
+        for (0..4) |i| {
+            ws[count] = lins[i].w;
+            ss[count] = lins[i].s;
+            bs[count] = lins[i].b;
+            count += 1;
+        }
+        const q0 = lins[0];
+        if (pad > 0) {
+            ws[count] = try g.zeros(&.{ pad, ops.shape(q0.w)[1] }, ops.dtype(q0.w));
+            ss[count] = try g.zeros(&.{ pad, ops.shape(q0.s)[1] }, ops.dtype(q0.s));
+            if (q0.b.ctx != null) bs[count] = try g.zeros(&.{ pad, ops.shape(q0.b)[1] }, ops.dtype(q0.b));
+            count += 1;
+        }
+        for (4..6) |i| {
+            ws[count] = lins[i].w;
+            ss[count] = lins[i].s;
+            bs[count] = lins[i].b;
+            count += 1;
+        }
+        if (tail_pad > 0) {
+            ws[count] = try g.zeros(&.{ tail_pad, ops.shape(q0.w)[1] }, ops.dtype(q0.w));
+            ss[count] = try g.zeros(&.{ tail_pad, ops.shape(q0.s)[1] }, ops.dtype(q0.s));
+            if (q0.b.ctx != null) bs[count] = try g.zeros(&.{ tail_pad, ops.shape(q0.b)[1] }, ops.dtype(q0.b));
+            count += 1;
+        }
+        const fw = try a.keep(&g, try g.contiguous(try g.concat(ws[0..count], 0)));
+        const fs = if (quantized) try a.keep(&g, try g.contiguous(try g.concat(ss[0..count], 0))) else Array{};
+        const fb = if (quantized and q0.b.ctx != null) try a.keep(&g, try g.contiguous(try g.concat(bs[0..count], 0))) else Array{};
+        const all: Linear = .{ .w = fw, .s = fs, .b = fb, .bits = q0.bits, .group_size = q0.group_size, .mode = q0.mode };
+        var start: c_int = 0;
+        for (lins, rows, 0..) |*l, n, i| {
+            if (i == 4) start = split;
+            _ = mlx.mlx_array_free(l.w);
+            l.w = g.escape(try g.sliceAxis(fw, 0, start, start + n));
+            if (quantized) {
+                _ = mlx.mlx_array_free(l.s);
+                l.s = g.escape(try g.sliceAxis(fs, 0, start, start + n));
+                if (fb.ctx != null) {
+                    _ = mlx.mlx_array_free(l.b);
+                    l.b = g.escape(try g.sliceAxis(fb, 0, start, start + n));
+                }
+            }
+            start += n;
+        }
+        const total = split + kv_rows + tail_pad;
+        const q_lin: Linear = .{
+            .w = g.escape(try g.sliceAxis(fw, 0, 0, split)),
+            .s = if (quantized) g.escape(try g.sliceAxis(fs, 0, 0, split)) else .{},
+            .b = if (fb.ctx != null) g.escape(try g.sliceAxis(fb, 0, 0, split)) else .{},
+            .bits = q0.bits,
+            .group_size = q0.group_size,
+            .mode = q0.mode,
+        };
+        const kv_lin: Linear = .{
+            .w = g.escape(try g.sliceAxis(fw, 0, split, total)),
+            .s = if (quantized) g.escape(try g.sliceAxis(fs, 0, split, total)) else .{},
+            .b = if (fb.ctx != null) g.escape(try g.sliceAxis(fb, 0, split, total)) else .{},
+            .bits = q0.bits,
+            .group_size = q0.group_size,
+            .mode = q0.mode,
+        };
+        try a.o.linear(q_lin);
+        try a.o.linear(kv_lin);
+        return .{
+            .q = .{ .lin = q_lin, .widths = .{ rows[0], rows[1], rows[2], rows[3] } },
+            .kv = .{ .lin = kv_lin, .widths = .{ rows[4], rows[5], 0, 0 } },
+            .all = all,
+            .split = split,
+        };
+    }
+
     fn conv(a: At, comptime x: []const u8, global: bool, hidden: u32) !layers.Conv {
         const leaf = "self_attn." ++ x ++ "_sconv";
         const rel = "attn." ++ x ++ "_sconv";
@@ -816,6 +1006,23 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         try mlx.check(mlx.mlx_ones(x, &[_]c_int{n}, 1, .float32, r.s));
         try m.owned.own(x.*);
     }
+    var cg = ops.Graph.init(gpa, r.s);
+    defer cg.deinit();
+    const conv_sc: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(c.sconv_kernel + 1)));
+    const dyn_sc: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(2 * c.sconv_kernel + 1)));
+    const ident_n: c_int = kernels.packed_rows * @as(c_int, @intCast(c.top_k));
+    const consts: layers.Consts = .{
+        .eps = try at.keep(&cg, try cg.fromSlice(f32, &.{c.rms_norm_eps}, &.{1})),
+        .caps = try at.keep(&cg, try cg.fromSlice(f32, &.{ 1.0 / c.gate_softcap, c.gate_softcap, 1.0 / c.up_softcap, c.up_softcap }, &.{4})),
+        .conv_scale = try at.keep(&cg, try cg.fromSlice(f32, &.{conv_sc}, &.{1})),
+        .mid_pr = try at.keep(&cg, try cg.fromSlice(f32, &.{ conv_sc, c.rms_norm_eps }, &.{2})),
+        .prep_pr_static = try at.keep(&cg, try cg.fromSlice(f32, &.{ c.qk_clip, c.rel_clip, c.rms_norm_eps, 1.0, conv_sc, 0.0 }, &.{6})),
+        .prep_pr_dynamic = try at.keep(&cg, try cg.fromSlice(f32, &.{ c.qk_clip, c.rel_clip, c.rms_norm_eps, 1.0, dyn_sc, 0.0 }, &.{6})),
+        .prep_pr_sliding_full = try at.keep(&cg, try cg.fromSlice(f32, &.{ c.qk_clip, c.rel_clip, c.rms_norm_eps, 1.0, conv_sc, @floatFromInt(c.sliding_window) }, &.{6})),
+        .route_scale = try at.keep(&cg, try cg.fromSlice(f32, &.{c.route_scale}, &.{1})),
+        .attn_scale = try at.keep(&cg, try cg.scalar(1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim))), .float32)),
+        .ident = try at.keep(&cg, try cg.arange(0, @floatFromInt(ident_n), 1, .uint32)),
+    };
     m.base.weights = .{
         .embed = .{ .table = embed, .hidden = hidden, .act = .bfloat16 },
         .embed_norm = try at.need("embed_norm.weight", "embed_norm.weight"),
@@ -827,6 +1034,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
             .final_query = try at.query("final_input.query", "output_query", null, 1, hidden),
             .ones = ones[0],
             .ones_head = ones[1],
+            .consts = consts,
         },
     };
     if (c.vision) |v| m.tower = try vision.Tower.load(ctx, v, c.block_json);
@@ -895,16 +1103,28 @@ fn loadLayer(at: At, c: *const config.Config, i: u32) !layers.Layer {
     var lins: [6]Linear = undefined;
     inline for (&lins, .{ "q_proj", "gate_proj", "r_proj", "sink_proj", "k_proj", "v_proj" }, .{ "wq_du", "gate_attn", "wr_du", "attn_sink_proj", "wk_dv", "wv_dv" }) |*l, leaf, rel|
         l.* = try at.projRaw("self_attn." ++ leaf, "attn." ++ rel, hidden);
-    // Projections off one input join into one matmul; a sliding layer's k and v read the q input too.
+    // Projections off one input join into one matmul; a sliding layer joins all six into one buffer (q|gate|r|sink|k|v).
     const quantized = lins[0].s.ctx != null;
-    const join_q = if (quantized) try loader.join(at.o, &.{ &lins[0], &lins[1], &lins[2], &lins[3] }, at.r.s) else try at.joinRows(&.{ &lins[0], &lins[1], &lins[2], &lins[3] });
-    const join_kv = if (global) b.linear.Joined{} else if (quantized) try loader.join(at.o, &.{ &lins[4], &lins[5] }, at.r.s) else try at.joinRows(&.{ &lins[4], &lins[5] });
+    var join_q: b.linear.Joined = .{};
+    var join_kv: b.linear.Joined = .{};
+    var join_qkv: Linear = .{};
+    var join_qkv_split: c_int = 0;
+    if (global) {
+        join_q = if (quantized) try at.joinQuantAligned(&.{ &lins[0], &lins[1], &lins[2], &lins[3] }) else try at.joinRows(&.{ &lins[0], &lins[1], &lins[2], &lins[3] });
+    } else {
+        const j6 = try at.joinSlidingSix(&lins);
+        join_q = j6.q;
+        join_kv = j6.kv;
+        join_qkv = j6.all;
+        join_qkv_split = j6.split;
+    }
     for (lins) |l| try at.o.linear(l);
 
     const rel_proj = try at.need("self_attn.rel_logits_proj.proj", "attn.rel_logits_proj.proj");
     var g = ops.Graph.init(gpa, at.r.s);
     defer g.deinit();
     const extent = ops.shape(rel_proj)[1];
+    const rel_proj_bf16 = try at.keep(&g, try g.astype(rel_proj, .bfloat16));
     const rel_proj_rev = try at.keep(&g, try g.take(try g.astype(rel_proj, .float32), try g.arange(@floatFromInt(extent - 1), -1, -1, .int32), 1));
     var L: layers.Layer = .{
         .global = global,
@@ -923,6 +1143,7 @@ fn loadLayer(at: At, c: *const config.Config, i: u32) !layers.Layer {
         .q_scale = try at.need("self_attn.q_l2_clip.scale", "attn.q_l2_clip.scale"),
         .rel_scale = try at.need("self_attn.rel_l2_clip.scale", "attn.rel_l2_clip.scale"),
         .rel_proj = rel_proj,
+        .rel_proj_bf16 = rel_proj_bf16,
         .rel_proj_rev = rel_proj_rev,
         .k_conv = try at.conv("k", global, hidden),
         .v_conv = try at.conv("v", global, hidden),
@@ -933,6 +1154,8 @@ fn loadLayer(at: At, c: *const config.Config, i: u32) !layers.Layer {
         .router_bias = try at.float("mlp.gate.e_score_correction_bias", "mlp.gate.bias", null),
         .join_q = join_q,
         .join_kv = join_kv,
+        .join_qkv = join_qkv,
+        .join_qkv_split = join_qkv_split,
         .gate_up = undefined,
         .down = undefined,
     };
@@ -1082,12 +1305,76 @@ test "inkling2: the bundled drafter loads on Apple9 and later only" {
     try std.testing.expect(!draftsOn(17, false));
 }
 
-// Bar: a round verifies drafts while their running probability clears the cut, never a stop: the trunk's token carries it.
-test "inkling2 draft: a round never verifies a stop" {
-    const sure = [_]f32{ 0.99, 0.99, 0.99, 0.99 };
-    const tokens = [_]i32{ 5, 9, 2, 8 };
-    try std.testing.expectEqual(@as(u32, 4), draftsToVerify(&sure, &tokens, 0.5, &.{}));
-    try std.testing.expectEqual(@as(u32, 1), draftsToVerify(&sure, &tokens, 0.5, &.{ 70, 9 }));
-    try std.testing.expectEqual(@as(u32, 0), draftsToVerify(&sure, &tokens, 0.5, &.{5}));
-    try std.testing.expectEqual(@as(u32, 2), draftsToVerify(&.{ 0.9, 0.6, 0.8, 0.9 }, &tokens, 0.5, &.{}));
+// Bar: a round picks the prefix maximizing expected tokens/ms over its measured ladder, never a stop or NaN.
+test "inkling2 draft: chooseDrafts maximizes expected rate and never verifies a stop" {
+    var rc: RowCost = .{};
+    rc.plain.add(11.0);
+    rc.draft.add(3.5);
+    for (1..8) |k| rc.verify[k].add(13.5 + 2.1 * @as(f32, @floatFromInt(k)));
+    const toks7 = [_]i32{ 5, 9, 2, 8, 3, 4, 6 };
+    try std.testing.expectEqual(@as(u32, 7), rc.chooseDrafts(&.{ 0.95, 0.95, 0.95, 0.95, 0.95, 0.95, 0.95 }, &toks7, &.{}));
+    try std.testing.expectEqual(@as(u32, 1), rc.chooseDrafts(&.{ 0.95, 0.95, 0.95, 0.95, 0.95, 0.95, 0.95 }, &toks7, &.{ 70, 9 }));
+    try std.testing.expectEqual(@as(u32, 0), rc.chooseDrafts(&.{ 0.95, 0.95, 0.95, 0.95, 0.95, 0.95, 0.95 }, &toks7, &.{5}));
+    try std.testing.expectEqual(@as(u32, 0), rc.chooseDrafts(&.{ 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1 }, &toks7, &.{}));
+    try std.testing.expectEqual(@as(u32, 7), rc.chooseDrafts(&.{ 0.45, 0.95, 0.95, 0.95, 0.95, 0.95, 0.95 }, &toks7, &.{}));
+    try std.testing.expectEqual(@as(u32, 0), rc.chooseDrafts(&.{ std.math.nan(f32), 0.99, 0.99 }, toks7[0..3], &.{}));
+}
+
+// Bar: quantized joins pad unaligned row sums (e.g. 24-head sink) to a multiple of 64 so NAX matmuls align,
+// while every part slice keeps its exact original rows and values.
+test "inkling2: quantized joins align row count to 64 while preserving every part" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var g = ops.Graph.init(gpa, s);
+    defer g.deinit();
+    var r = loader.Reader{ .src = undefined, .fmt = undefined, .qctx = undefined, .prefix = "", .s = s };
+    var o = loader.Owned{};
+    defer o.release();
+    const at: At = .{ .r = &r, .o = &o, .release = false };
+    const widths = [_]c_int{ 64, 64, 32, 24, 32, 32 };
+    var orig: [6]Linear = undefined;
+    var lins: [6]Linear = undefined;
+    for (widths, 0..) |rows, i| {
+        const dense = try g.astype(try g.full(&.{ rows, 128 }, try g.scalar(@as(f32, @floatFromInt(i + 1)) * 0.25, .float32), .float32), .bfloat16);
+        var q = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(q);
+        try mlx.check(mlx.mlx_quantize(&q, dense, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{ .ctx = null }, s));
+        var parts: [3]Array = undefined;
+        for (&parts, 0..) |*p, j| {
+            var t = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&t, q, j));
+            p.* = t;
+        }
+        orig[i] = .{ .w = parts[0], .s = parts[1], .b = parts[2], .bits = 8, .group_size = 64 };
+        // Separate copy for joinSlidingSix to free/replace.
+        var dup: [3]Array = undefined;
+        for (&dup, parts) |*d, src| {
+            d.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(d, src));
+        }
+        lins[i] = .{ .w = dup[0], .s = dup[1], .b = dup[2], .bits = 8, .group_size = 64 };
+    }
+    defer for (orig) |l| {
+        _ = mlx.mlx_array_free(l.w);
+        _ = mlx.mlx_array_free(l.s);
+        _ = mlx.mlx_array_free(l.b);
+    };
+    const j6 = try at.joinSlidingSix(&lins);
+    for (lins) |l| try o.linear(l);
+    // 64+64+32+24 = 184 -> padded to 192 (multiple of 64); 192+64 = 256 (multiple of 64).
+    try std.testing.expectEqual(@as(c_int, 192), j6.split);
+    try std.testing.expectEqual(@as(c_int, 192), ops.shape(j6.q.lin.w)[0]);
+    try std.testing.expectEqual(@as(c_int, 64), ops.shape(j6.kv.lin.w)[0]);
+    try std.testing.expectEqual(@as(c_int, 256), ops.shape(j6.all.w)[0]);
+    for (0..6) |i| {
+        try ops.expectBitEqual(orig[i].w, lins[i].w);
+        try ops.expectBitEqual(orig[i].s, lins[i].s);
+        try ops.expectBitEqual(orig[i].b, lins[i].b);
+    }
+    const x = try g.astype(try g.ones(&.{ 1, 8, 128 }, .float32), .bfloat16);
+    const all_y = try j6.all.forward(&g, x);
+    const yq = try g.sliceAxis(all_y, 2, 0, j6.split);
+    const ykv = try g.sliceAxis(all_y, 2, j6.split, ops.shape(all_y)[2]);
+    for (0..4) |i| try ops.expectBitEqual(try orig[i].forward(&g, x), try j6.q.part(&g, yq, i));
+    for (0..2) |i| try ops.expectBitEqual(try orig[4 + i].forward(&g, x), try j6.kv.part(&g, ykv, i));
 }

@@ -33,10 +33,24 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
 for (uint j = 0; j < J; j++) ss[j] = metal::precise::rsqrt(fold[j] / float(D) + PR[0]);
 if (e >= D) {
     const uint ex = (e - D) / 32;
-    float dot = 0.0f;
-    if (ex < E) for (uint i = lane; i < D; i += 32) dot += float(T(Y[row * D + i] * ss[0] * float(NW0[i]))) * float(RT[ex * D + i]);
-    dot = simd_sum(dot);
-    if (lane == 0 && ex < E) SCORES[row * E + ex] = dot;
+    float dot_v = 0.0f;
+    if (ex < E) {
+        if (D % 4 == 0) {
+            const device float4* yp = (const device float4*)(Y + row * D);
+            const device float4* rp = (const device float4*)(RT + ex * D);
+            const float s0 = ss[0];
+            for (uint i = lane; i < D / 4u; i += 32u) {
+                const float4 y4 = yp[i];
+                const uint k = i * 4u;
+                const float4 n4 = float4(float(NW0[k]), float(NW0[k + 1u]), float(NW0[k + 2u]), float(NW0[k + 3u]));
+                dot_v += dot(float4(vec<T, 4>(y4 * s0 * n4)), rp[i]);
+            }
+        } else {
+            for (uint i = lane; i < D; i += 32) dot_v += float(T(Y[row * D + i] * ss[0] * float(NW0[i]))) * float(RT[ex * D + i]);
+        }
+    }
+    dot_v = simd_sum(dot_v);
+    if (lane == 0 && ex < E) SCORES[row * E + ex] = dot_v;
     return;
 }
 for (uint j = 0; j < J; j++) {

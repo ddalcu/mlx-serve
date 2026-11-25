@@ -1,11 +1,12 @@
 // Inkling 2: what the attention read needs from a visit's projections for S rows. grid (H * HD + 2 * HKV * HD + the
 // tail, S), threadgroup (HD, 1): one thread per output element of a row, a head of q, k or v one threadgroup whose
-// threads each square their own element into BUF for the group to sum, so no thread loops over a head's inputs.
+// threads each square their own element for simd_sum + threadgroup reduction.
 // QP, GP [1, S, H * HD], RP [1, S, H * DREL], KP, VP [1, S, HKV * HD] are the q, gate, relative, k and v projections
 // (T); the k and v convs run over the rows behind the windows before them (ST [1, KT - 1, >= 2 * HKV * HD] f32, k
-// then v), or with SEQ 0 each row behind its own window (ST [S, KT - 1, .]: the rows are sequences of their own). Static convs take KW, VW [C, KT, 1] (WT) and round their sum to WT as the conv op does; dynamic ones (DYN)
-// take KW, VW [KT, C] (WT) plus each head's projected taps KDY, VDY [1, S, HKV * KT] (T), tap `lag` on the input
-// `lag` rows back. QS [H, HD] and RS [H, DREL] (S) scale q and the relative states before their L2 clips.
+// then v), or with SEQ 0 each row behind its own window (ST [S, KT - 1, .]: the rows are sequences of their own).
+// Static convs take KW, VW [C, KT, 1] (WT) and round their sum to WT as the conv op does; dynamic ones (DYN) take
+// KW, VW [KT, C] (WT) plus each head's projected taps KDY, VDY [1, S, HKV * KT] (T), tap `lag` on the input `lag`
+// rows back. QS [H, HD] and RS [H, DREL] (S) scale q and the relative states before their L2 clips.
 // PR = { qk clip, rel clip, eps, tau, conv scale, KV }.
 // Q [1, S, H, HD] T (clipped, times tau), GATE [S * H * HD] f32 (sigmoid), K, V [1, HKV, S, HD] T (conv, then the L2
 // clip or the unweighted RMS norm). The tail is, WIDE: REL [1, S, H, DREL] T, the clipped relative states; else (one
@@ -13,21 +14,24 @@
 // RJ [DREL, R] f32, distance 0 last, times tau; zero for a key past the extent R).
 const uint i = thread_position_in_grid.x;
 const uint row = thread_position_in_grid.y;
-const uint t = thread_position_in_threadgroup.x;
 const uint ROWS = QP_shape[1];
 const uint QD = H * HD;
 const uint C = HKV * HD;
 const uint R = RJ_shape[1];
 const uint SW = ST_shape[2];
 const float qk_thr = PR[0], rel_thr = PR[1], eps = PR[2], tau = PR[3], cs = PR[4];
-threadgroup float buf[HD];
+constexpr uint NSG = (HD + 31u) / 32u;
+const uint lane = thread_index_in_simdgroup;
+const uint sg = simdgroup_index_in_threadgroup;
+threadgroup float sg_sum[NSG];
 if (i < QD) {
     const uint at = row * QD + i;
     const float mine = float(QP[at]) * float(QS[i]);
-    buf[t] = mine * mine;
+    const float s2 = simd_sum(mine * mine);
+    if (lane == 0u) sg_sum[sg] = s2;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float n2 = 0.0f;
-    for (uint j = 0; j < HD; j++) n2 += buf[j];
+    for (uint g = 0u; g < NSG; g++) n2 += sg_sum[g];
     const float f = min(qk_thr / (sqrt(n2) + 1e-6f), 1.0f);
     T q = T(mine * f);
     if (tau != 1.0f) q = T(float(q) * tau);
@@ -60,38 +64,65 @@ if (r < 2 * C) {
     }
     if (!DYN) y = float(WT(y));
     const float mine = float(T((y + x) * cs));
-    buf[t] = mine * mine;
+    const float s2 = simd_sum(mine * mine);
+    if (lane == 0u) sg_sum[sg] = s2;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float n2 = 0.0f;
-    for (uint j = 0; j < HD; j++) n2 += buf[j];
+    for (uint g = 0u; g < NSG; g++) n2 += sg_sum[g];
     const uint at = (h * ROWS + row) * HD + c % HD;
     if (is_v) V[at] = T(mine * rsqrt(n2 / float(HD) + eps));
     else K[at] = T(mine * min(qk_thr / (sqrt(n2) + 1e-6f), 1.0f));
     return;
 }
 r -= 2 * C;
-// A head's relative states, clipped.
-const uint h = WIDE ? r / DREL : r / uint(PR[5]);
-const uint rp = row * H * DREL + h * DREL;
-float n2 = 0.0f;
-for (uint j = 0; j < DREL; j++) {
-    const float v = float(RP[rp + j]) * float(RS[h * DREL + j]);
-    n2 += v * v;
-}
-const float f = min(rel_thr / (sqrt(n2) + 1e-6f), 1.0f);
 if (WIDE) {
-    const uint j = r % DREL;
-    REL[rp + j] = T(float(RP[rp + j]) * float(RS[h * DREL + j]) * f);
+    const uint h = r / DREL;
+    const uint j_out = r % DREL;
+    const uint rp = row * H * DREL + h * DREL;
+    float n2 = 0.0f;
+    float mine = 0.0f;
+    for (uint j = 0; j < DREL; j++) {
+        const float v = float(RP[rp + j]) * float(RS[h * DREL + j]);
+        n2 += v * v;
+        if (j == j_out) mine = v;
+    }
+    const float f = min(rel_thr / (sqrt(n2) + 1e-6f), 1.0f);
+    REL[rp + j_out] = T(mine * f);
     return;
 }
 const uint KV = uint(PR[5]);
+const uint h = r / KV;
 const uint col = r % KV;
 // Key `col` sits R - KV + col columns into the logits.
-if (col + R < KV) {
+const bool in_range = (col + R >= KV);
+if (simd_all(!in_range)) {
+    BIAS[r] = T(0.0f);
+    return;
+}
+const bool uniform_simd = (DREL <= 32u) && simd_all(in_range) && simd_all(h == simd_broadcast_first(h));
+if (!in_range) {
     BIAS[r] = T(0.0f);
     return;
 }
 const uint d = col + R - KV;
+const uint rp = row * H * DREL + h * DREL;
+float rv[DREL];
+if (uniform_simd) {
+    const float my_v = (lane < DREL) ? float(RP[rp + lane]) * float(RS[h * DREL + lane]) : 0.0f;
+    const float n2 = simd_sum(my_v * my_v);
+    const float f = min(rel_thr / (sqrt(n2) + 1e-6f), 1.0f);
+    const float clipped = float(T(my_v * f));
+    for (uint j = 0; j < DREL; j++) rv[j] = simd_shuffle(clipped, j);
+} else {
+    float n2 = 0.0f;
+    for (uint j = 0; j < DREL; j++) {
+        const float v = float(RP[rp + j]) * float(RS[h * DREL + j]);
+        rv[j] = v;
+        n2 += v * v;
+    }
+    const float f = min(rel_thr / (sqrt(n2) + 1e-6f), 1.0f);
+    for (uint j = 0; j < DREL; j++) rv[j] = float(T(rv[j] * f));
+}
 float acc = 0.0f;
-for (uint j = 0; j < DREL; j++) acc += float(T(float(RP[rp + j]) * float(RS[h * DREL + j]) * f)) * RJ[j * R + d];
+for (uint j = 0; j < DREL; j++) acc += rv[j] * RJ[j * R + d];
 BIAS[r] = T(acc * tau);
