@@ -728,7 +728,7 @@ fn listTree(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *s
             if (!treeEntryDescends(sub_entry.kind)) continue;
             var leaf = sub.openDir(io, sub_entry.name, .{ .iterate = true }) catch continue;
             defer leaf.close(io);
-            if (!isModelDir(io, &leaf)) continue;
+            if (!isModelDir(io, &leaf) and !model_discovery.hasShardFolder(io, leaf)) continue;
             var name_buf: [512]u8 = undefined;
             const full = std.fmt.bufPrint(&name_buf, "{s}/{s}", .{ entry.name, sub_entry.name }) catch continue;
             try printModelRow(io, allocator, w, &leaf, full, root);
@@ -1428,6 +1428,27 @@ test "cli: list walks symlinked model dirs at the top, org and leaf level" {
     var w = std.Io.Writer.fixed(&buf);
     try testing.expectEqual(@as(usize, 3), try listTree(io, testing.allocator, &w, &root, "/nonexistent"));
     for ([_][]const u8{ "top ", "org/leaf ", "linked_org/m " }) |name| {
+        try testing.expect(std.mem.indexOf(u8, w.buffered(), name) != null);
+    }
+}
+
+test "cli: list shows a split quant in its quant folder, and an org of split repos stays an org" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "root/huihui-ai/X-GGUF/Q6_K_XL");
+    try tmp.dir.writeFile(io, .{ .sub_path = "root/huihui-ai/X-GGUF/Q6_K_XL/X-00001-of-00002.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "root/huihui-ai/X-GGUF/Q6_K_XL/X-00002-of-00002.gguf", .data = "x" });
+    try tmp.dir.createDirPath(io, "root/org2/flat-GGUF");
+    try tmp.dir.writeFile(io, .{ .sub_path = "root/org2/flat-GGUF/M-00001-of-00002.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "root/org2/flat-GGUF/M-00002-of-00002.gguf", .data = "x" });
+    var root = try tmp.dir.openDir(io, "root", .{ .iterate = true });
+    defer root.close(io);
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try testing.expectEqual(@as(usize, 2), try listTree(io, testing.allocator, &w, &root, "/nonexistent"));
+    for ([_][]const u8{ "huihui-ai/X-GGUF ", "org2/flat-GGUF " }) |name| {
         try testing.expect(std.mem.indexOf(u8, w.buffered(), name) != null);
     }
 }

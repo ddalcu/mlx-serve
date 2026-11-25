@@ -170,6 +170,7 @@ const GgufScan = gguf_files.GgufScan;
 const scanLlmGguf = gguf_files.scanLlmGguf;
 
 pub const isGgufModelPath = gguf_files.isGgufModelPath;
+pub const hasShardFolder = gguf_files.hasShardFolder;
 
 pub const resolveGgufFile = gguf_files.resolveGgufFile;
 
@@ -584,7 +585,7 @@ fn tryAddModel(
     // all, and the ones that do (unsloth) ship the ORIGINAL model's — an
     // MLX classification would cold-load into a missing-safetensors failure.
     const model_type: []const u8 = blk: {
-        const scan = scanLlmGguf(io, allocator, &sub) catch GgufScan{};
+        const scan = scanLlmGguf(io, allocator, &sub, .{ .shard_folders = id_prefix.len > 0 }) catch GgufScan{};
         if (scan.pick) |p| {
             allocator.free(p);
             bytes = scan.pick_bytes;
@@ -749,7 +750,7 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
     gguf: {
         var sub = dir.openDir(io, base, .{ .iterate = true }) catch break :gguf;
         defer sub.close(io);
-        const scan = scanLlmGguf(io, allocator, &sub) catch break :gguf;
+        const scan = scanLlmGguf(io, allocator, &sub, .{ .shard_folders = true }) catch break :gguf;
         if (scan.pick) |p| {
             allocator.free(p);
             return .{
@@ -2396,4 +2397,28 @@ test "resolveGgufFile: an embedding GGUF is never the chat model, and says so by
     defer res.deinit();
     try testing.expectEqual(@as(usize, 1), res.models.len);
     try testing.expectEqualStrings("mixed", res.models[0].id);
+}
+
+test "discoverModels finds a split quant in its quant folder, and an org folder is never a model" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "huihui-ai/X-GGUF/Q6_K_XL");
+    try tmp.dir.writeFile(io, .{ .sub_path = "huihui-ai/X-GGUF/Q6_K_XL/X-00001-of-00002.gguf", .data = "0123" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "huihui-ai/X-GGUF/Q6_K_XL/X-00002-of-00002.gguf", .data = "012345" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "huihui-ai/X-GGUF/README.md", .data = "x" });
+    // org2/flat-GGUF is itself a folder of shards: org2 must stay an org.
+    try tmp.dir.createDirPath(io, "org2/flat-GGUF");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org2/flat-GGUF/M-00001-of-00002.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org2/flat-GGUF/M-00002-of-00002.gguf", .data = "x" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 2), result.models.len);
+    try testing.expectEqualStrings("huihui-ai/X-GGUF", result.models[0].id);
+    try testing.expectEqualStrings("/root/huihui-ai/X-GGUF", result.models[0].path);
+    try testing.expectEqualStrings("gguf", result.models[0].model_type);
+    try testing.expectEqual(@as(?u64, 10), result.models[0].bytes_on_disk);
+    try testing.expectEqualStrings("org2/flat-GGUF", result.models[1].id);
 }
