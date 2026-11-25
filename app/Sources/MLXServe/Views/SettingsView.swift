@@ -779,11 +779,6 @@ fileprivate struct ServerLaunchDirty {
 
 // MARK: - Model folders section
 
-/// One row showing the user-configured extra discovery root. The path is
-/// rendered verbatim (raw, not standardized) so the user sees exactly what
-/// they picked; discovery silently skips it when it doesn't resolve to an
-/// existing directory. Picking a folder triggers an immediate refresh so the
-/// menu-bar picker updates without a server restart.
 /// Where downloads come from (`HubEndpointSetting`): the app reads it per request, the server at its next start.
 private struct HubEndpointRow: View {
     @AppStorage(HubEndpointSetting.key) private var hub = ""
@@ -811,6 +806,11 @@ private struct HubEndpointRow: View {
     }
 }
 
+/// One row showing the user-configured extra discovery root. The path is
+/// rendered verbatim (raw, not standardized) so the user sees exactly what
+/// they picked; discovery silently skips it when it doesn't resolve to an
+/// existing directory. Picking a folder triggers an immediate refresh so the
+/// menu-bar picker updates without a server restart.
 private struct ModelFoldersSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var downloads: DownloadManager
