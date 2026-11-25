@@ -4,8 +4,7 @@
 # under other switches, flags or pack contents serves its own warm requests and compiles its own kernels before
 # (--warmup-full) or after (default, when idle) it reports ready. The server runs as a copy of the binary under its
 # own bundle id, so its shader cache starts EMPTY. The reading is time: each prompt shape is sent twice, two texts of
-# the same size and no shared prefix, and a kernel compiled inside the first makes it slower than the second (Metal
-# writes its cache index lazily, so the index's growth over a request says when it flushed, not what compiled). A copy
+# the same size and no shared prefix, and a kernel compiled inside the first makes it slower than the second. A copy
 # with --no-warmup-eager is the control: there the first prompts compile what the load did not, and the test must see
 # it.
 #
