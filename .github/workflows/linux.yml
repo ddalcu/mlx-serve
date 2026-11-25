@@ -93,7 +93,7 @@ jobs:
       CUDA_ARCH: ${{ matrix.cuda_arch }}
       ZIG_CPU: ${{ matrix.zig_cpu }}
       NATIVE_CPU_FLAG: ${{ matrix.cpu_flag }}
-      ZIG_BUILD_ARGS: ${{ github.event_name == 'pull_request' && '-Dunits=true -Dstrip=true' || '' }}
+      ZIG_BUILD_ARGS: ${{ github.event_name == 'pull_request' && '-Dunits=true -Dunit-groups=4 -Dstrip=true' || '' }}
     steps:
       - uses: actions/checkout@v4
 
