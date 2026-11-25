@@ -131,8 +131,9 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **The DFlash2 draft batches across slots** (`draftBatch`, `pickBatch`): dense work over every lane's rows, attention
   per lane over its own context; it differs from a lane alone by matmul tiling (cosine 0.95+) and accepts the same.
   The bundled head drafts a slot at a time.
-- **A group's width is the GPU's** (`draftGroupWidth`, `NativeDrafter.group_width`): 16 with NAX, 8 elsewhere (past it the
-  slots decode plain in the batched group).
+- **A DFlash2 group's width is the GPU's, the bundled head's 2** (`groupWidth`, `NativeDrafter.group_width`): 16 with NAX,
+  8 elsewhere; past it the slots decode plain in the batched group. The head keeps too few drafts a grouped round for a
+  wider group to beat the plain batched steps it replaces.
 - **A quantized pack's joined projections are whole 64-row tiles** (`At.joinQuant`: zero rows behind the parts, `widths`
   the parts alone): the tensor unit's quantized matmul takes no other output width, and a verify's rows fell to a slow lane.
 - **The q, k and v gates' down projections are a matmul a gate from 16 rows** (`gateDowns`): MLX's batched matmul leaves

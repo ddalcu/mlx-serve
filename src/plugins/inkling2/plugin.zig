@@ -339,10 +339,17 @@ fn draftVerifyGroup(mp: *anyopaque, fs: [*]const abi.Forward, outs: [*]abi.Forwa
     return .ok;
 }
 
-/// Slots whose rounds pay as one verify: the tensor unit reads a block's keys for four slots a launch and serves
-/// `max_open`; elsewhere 8, where a verify of more lanes costs more than the plain batched steps it replaces.
-fn draftGroupWidth(_: *anyopaque) callconv(.c) u32 {
-    return if (device.naxAvailable()) max_open else 8;
+/// Slots whose rounds pay as one verify. The DFlash2 draft's: `max_open` on the tensor unit (it reads a block's keys for
+/// four slots a launch), else 8. The bundled head's: 2, since it keeps too few drafts a round for a wider group to beat
+/// the plain batched steps it replaces.
+pub fn groupWidth(dflash2_draft: bool, nax: bool) u32 {
+    if (!dflash2_draft) return 2;
+    return if (nax) max_open else 8;
+}
+
+fn draftGroupWidth(mp: *anyopaque) callconv(.c) u32 {
+    const m: *Loaded = @ptrCast(@alignCast(mp));
+    return groupWidth(m.drafter2 != null, device.naxAvailable());
 }
 
 fn draftActive(mp: *anyopaque) callconv(.c) bool {

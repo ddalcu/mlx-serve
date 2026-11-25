@@ -2701,6 +2701,15 @@ test "inkling2 kernels: sampleAndAcceptTree greedy, filtering, and exact multi-c
     }
 }
 
+// Bar: the bundled head keeps too few drafts a round for a group past two slots to beat plain batched decode; the
+// DFlash2 draft's groups pay to the GPU's width.
+test "inkling2 plugin: a group of the bundled head's slots is two wide, of DFlash2's the GPU's" {
+    try testing.expectEqual(@as(u32, 2), plugin.groupWidth(false, true));
+    try testing.expectEqual(@as(u32, 2), plugin.groupWidth(false, false));
+    try testing.expectEqual(@as(u32, 16), plugin.groupWidth(true, true));
+    try testing.expectEqual(@as(u32, 8), plugin.groupWidth(true, false));
+}
+
 test "inkling2 plugin: a lane's tree rows follow the device, the lanes and the sampling" {
     const nax = @import("../../mlx/device.zig").naxAvailable();
     try testing.expectEqual(@as(u32, 8), plugin.treeWidth(1, false));
