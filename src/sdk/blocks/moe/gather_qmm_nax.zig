@@ -612,15 +612,6 @@ pub fn sortedGateUp(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, 
 
 var scaled_engaged_logged = false;
 
-/// `MLX_SERVE_MOE_SCALED_PREFILL`: the paired kernel on banks with per-expert scales; read on every call (a kill
-/// switch), unset = off.
-pub fn scaledPrefillEnabled() bool {
-    return if (env.get(.MLX_SERVE_MOE_SCALED_PREFILL)) |v| v[0] != '0' else scaled_prefill_default;
-}
-
-/// The arm an unset `MLX_SERVE_MOE_SCALED_PREFILL` takes.
-const scaled_prefill_default = true;
-
 /// `sortedGateUp` with each expert's own gate / up scale in the epilogue (`ExpertScales`): the two gathers, the
 /// `scaleExperts` multiplies and the SwiGLU (clamped under `limit`) of the split path in one dispatch, bit for bit.
 pub fn sortedGateUpScaled(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, up_w: mlx.mlx_array, up_sc: mlx.mlx_array, up_bi: mlx.mlx_array, idx: mlx.mlx_array, sigtab: mlx.mlx_array, limit: u32, scales: ExpertScales, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {

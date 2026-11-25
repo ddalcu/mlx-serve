@@ -577,9 +577,7 @@ pub fn moeMLP2WithRouter(self: *Trunk, router_x: mlx.mlx_array, expert_x_in: mlx
             defer _ = mlx.mlx_array_free(row_map);
             try mlx.check(mlx.mlx_astype(&row_map, lhs_idx, .uint32, self.s));
             const clamp = swigluClampLimit(cfg.swiglu_limit, cfg.swiglu_clamp);
-            const scaled = mw.gate_expert_scale.ctx != null or mw.up_expert_scale.ctx != null;
             if (swigluFusedEnabled() and cfg.hidden_act == .silu and clamp != null and
-                (!scaled or gather_qmm_nax.scaledPrefillEnabled()) and
                 gate_qp.bits == up_qp.bits and gate_qp.group_size == up_qp.group_size)
             {
                 const sigtab = try @import("../../../sdk/blocks/hc/hc_prefill.zig").sigmoidTable(self.s);
