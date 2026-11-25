@@ -10,6 +10,12 @@ name: Windows
 # scripts stamp their outputs with the inputs the cache keys hash, so a hit skips
 # the stage, and CUDA is only installed when the MLX stage has to be rebuilt.
 #
+# A PR runs only when its files reach the Zig graph (`changes`, scripts/ci-changes.sh; a
+# skipped job counts as passing) and builds the fast variant: `-Dstrip`, no zip. push to
+# main and workflow_dispatch build what release.yml attaches to a release. Only main saves
+# the cheap caches: a PR's copy is unreadable to every other PR and pushed the repo over
+# the 10 GB cap.
+#
 # Running the zip needs an NVIDIA driver >= 580, the CUDA 13 toolkit (CUDA_PATH)
 # and cuDNN 9 for CUDA 13 (CUDNN_PATH): both engines load those, none ship in it.
 
@@ -24,13 +30,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      zig: ${{ steps.scope.outputs.zig }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Which jobs does this change need
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "zig=true" | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          git diff --name-only "$BASE_SHA" HEAD | tee /dev/stderr | bash scripts/ci-changes.sh | tee -a "$GITHUB_OUTPUT"
+
   cuda:
+    needs: changes
+    if: needs.changes.outputs.zig == 'true'
     name: cuda (x64)
     runs-on: windows-2022
     timeout-minutes: 360
     env:
       MLX_CUDA_ARCHITECTURES: "75;86;120"
       ZIG_CPU: x86_64_v3
+      ZIG_BUILD_ARGS: ${{ github.event_name == 'pull_request' && '-Dstrip=true' || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -46,8 +76,9 @@ jobs:
           echo "mlx=$(pin lib/mlx-src)-$(pin lib/mlxc-src)" >> "$GITHUB_OUTPUT"
           echo "arch=$(echo "$MLX_CUDA_ARCHITECTURES" | tr ';' '-')" >> "$GITHUB_OUTPUT"
 
-      - name: Cache submodules
-        uses: actions/cache@v4
+      - name: Restore submodules cache
+        id: submodules
+        uses: actions/cache/restore@v4
         with:
           path: .git/modules
           key: submodules-windows-${{ steps.pins.outputs.submodules }}
@@ -56,7 +87,8 @@ jobs:
       - name: Check out submodules
         run: git submodule update --init --depth 1 --jobs 8
 
-      # Restored and saved as two steps, so a later failure still keeps the hour-long MLX build.
+      # Restored and saved as two steps, so a later failure still keeps the hour-long MLX build; a PR that
+      # changes its inputs saves its own copy too.
       - name: Restore MLX stage
         id: mlx
         uses: actions/cache/restore@v4
@@ -64,14 +96,16 @@ jobs:
           path: lib/mlx-win
           key: mlx-windows-${{ steps.pins.outputs.mlx }}-${{ steps.pins.outputs.arch }}-${{ hashFiles('patches/mlx*.patch', 'scripts/build-mlx-windows.ps1') }}
 
-      - name: Cache llama.cpp stage
-        uses: actions/cache@v4
+      - name: Restore llama.cpp stage
+        id: llama
+        uses: actions/cache/restore@v4
         with:
           path: lib/llama-win
           key: llama-windows-${{ hashFiles('scripts/fetch-llama.sh') }}
 
-      - name: Cache Zig toolchain
-        uses: actions/cache@v4
+      - name: Restore Zig toolchain
+        id: zig
+        uses: actions/cache/restore@v4
         with:
           path: .zig-toolchain
           key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}
@@ -86,8 +120,9 @@ jobs:
           "CUDA_PATH=C:\cuda" >> $env:GITHUB_ENV
           "CUDNN_PATH=C:\cuda\cudnn" >> $env:GITHUB_ENV
 
+      # A PR's build is never attached to a release, so it skips the zip.
       - name: Build
-        run: powershell -File scripts\build-windows.ps1
+        run: powershell -File scripts\build-windows.ps1 ${{ github.event_name == 'pull_request' && '-NoZip' || '' }}
 
       - name: Save MLX stage
         if: always() && steps.mlx.outputs.cache-hit != 'true' && hashFiles('lib/mlx-win/.version') != ''
@@ -100,6 +135,28 @@ jobs:
         run: dist\mlx-serve-windows-x64\mlx-serve.exe --version
 
       - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
         with:
           name: mlx-serve-windows-x64-cuda13
           path: dist/mlx-serve-windows-x64.zip
+
+      - name: Save submodules cache
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.submodules.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .git/modules
+          key: submodules-windows-${{ steps.pins.outputs.submodules }}
+
+      - name: Save llama.cpp stage
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.llama.outputs.cache-hit != 'true' && hashFiles('lib/llama-win/.version') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: lib/llama-win
+          key: llama-windows-${{ hashFiles('scripts/fetch-llama.sh') }}
+
+      - name: Save Zig toolchain
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.zig.outputs.cache-hit != 'true' && hashFiles('.zig-toolchain/.version') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .zig-toolchain
+          key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}

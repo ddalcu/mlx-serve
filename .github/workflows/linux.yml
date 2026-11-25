@@ -10,8 +10,16 @@ name: Linux
 # Every slow input is cached by what produced it: the stage scripts stamp their
 # outputs with the same inputs the cache keys hash, so a hit skips the stage
 # (checkout gives sources fresh mtimes, so object-file caches would rebuild
-# anyway). A warm run compiles only mlx-serve itself: one LLVM module, so Zig's
-# cache cannot carry it across commits, and restored libraries are new files to it.
+# anyway). A warm run compiles only mlx-serve itself, and installs only what a
+# build against staged libraries needs: nvcc and cuDNN headers for the stage scripts'
+# checks, and the CUDA runtime libraries the ldd gate resolves, not the 4 GB toolkit.
+#
+# A PR runs only when its files reach the Zig graph (`changes`, scripts/ci-changes.sh;
+# a skipped job counts as passing) and builds the fast variant: `-Dunits` (the host,
+# the engine and the plugin groups compile as parallel objects) and `-Dstrip`. push to
+# main and workflow_dispatch build and package what release.yml attaches to a release,
+# as one unit with debug info. Only main saves the cheap caches: a PR's copy is
+# unreadable to every other PR and pushed the repo over the 10 GB cap.
 #
 # The tarball keeps the repo layout the binary's $ORIGIN rpaths expect
 # (zig-out/bin/mlx-serve next to lib/mlx/lib, lib/llama/lib, lib/ds4-linux; lib/mlx/include holds the
@@ -31,10 +39,34 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  APT_PACKAGES: cuda-toolkit-13 cudnn9-cuda-13 cmake liblapacke-dev libopenblas-dev libwebp-dev libavahi-compat-libdnssd-dev
+  APT_PACKAGES: cmake liblapacke-dev libopenblas-dev libwebp-dev libavahi-compat-libdnssd-dev
+  CUDA_PACKAGES: cuda-toolkit-13 cudnn9-cuda-13
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      zig: ${{ steps.scope.outputs.zig }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Which jobs does this change need
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "zig=true" | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          git diff --name-only "$BASE_SHA" HEAD | tee /dev/stderr | bash scripts/ci-changes.sh | tee -a "$GITHUB_OUTPUT"
+
   cuda:
+    needs: changes
+    if: needs.changes.outputs.zig == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -59,6 +91,7 @@ jobs:
       CUDA_ARCH: ${{ matrix.cuda_arch }}
       ZIG_CPU: ${{ matrix.zig_cpu }}
       NATIVE_CPU_FLAG: ${{ matrix.cpu_flag }}
+      ZIG_BUILD_ARGS: ${{ github.event_name == 'pull_request' && '-Dunits=true -Dstrip=true' || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -72,8 +105,9 @@ jobs:
           echo "ds4=$(pin lib/ds4)" >> "$GITHUB_OUTPUT"
           echo "arch=$(echo "$CUDA_ARCH" | tr ';' '-')" >> "$GITHUB_OUTPUT"
 
-      - name: Cache submodules
-        uses: actions/cache@v4
+      - name: Restore submodules cache
+        id: submodules
+        uses: actions/cache/restore@v4
         with:
           path: .git/modules
           key: submodules-${{ steps.pins.outputs.submodules }}
@@ -82,45 +116,76 @@ jobs:
       - name: Check out submodules
         run: git submodule update --init --depth 1 --jobs 8
 
+      # The MLX and ds4 stages take an hour to rebuild, so a PR that changes their inputs saves its own copy.
       - name: Cache MLX stage
+        id: mlx
         uses: actions/cache@v4
         with:
           path: lib/mlx
           key: mlx-linux-${{ matrix.name }}-${{ steps.pins.outputs.mlx }}-${{ steps.pins.outputs.arch }}-${{ hashFiles('patches/mlx*.patch', 'scripts/build-mlx-linux.sh') }}
 
       - name: Cache ds4 stage
+        id: ds4
         uses: actions/cache@v4
         with:
           path: lib/ds4-linux
           key: ds4-linux-${{ matrix.name }}-${{ steps.pins.outputs.ds4 }}-${{ steps.pins.outputs.arch }}-${{ env.NATIVE_CPU_FLAG }}-${{ hashFiles('scripts/build-ds4-linux.sh') }}
 
-      - name: Cache llama.cpp stage
-        uses: actions/cache@v4
+      - name: Restore llama.cpp stage
+        id: llama
+        uses: actions/cache/restore@v4
         with:
           path: lib/llama
           key: llama-linux-${{ matrix.name }}-${{ hashFiles('scripts/fetch-llama.sh') }}
 
-      - name: Cache Zig toolchain
-        uses: actions/cache@v4
+      - name: Restore Zig toolchain
+        id: zig
+        uses: actions/cache/restore@v4
         with:
           path: .zig-toolchain
           key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}
 
-      # CUDA and the build do not fit the runner's default free space.
+      # With both stages cached the build compiles only mlx-serve, which needs no toolkit.
+      - name: Is the build only mlx-serve
+        id: warm
+        env:
+          WARM: ${{ steps.mlx.outputs.cache-hit == 'true' && steps.ds4.outputs.cache-hit == 'true' }}
+        run: echo "warm=$WARM" >> "$GITHUB_OUTPUT"
+
+      # CUDA and a stage build do not fit the runner's default free space.
       - name: Free disk space
+        if: steps.warm.outputs.warm != 'true'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
 
       # Not cached: the .debs are ~4 GB per arch, and two of them pushed the repo past
       # GitHub's 10 GB cache limit, evicting the MLX stage (an hour to rebuild).
+      # Warm: the stage scripts still check for nvcc, cmake, LAPACKE and the cuDNN header
+      # before they find the stamp, and the ldd gate below needs the runtime libraries
+      # libmlx.so (cublasLt, cufft, cusolver, nvrtc, cudnn) and libds4.so (cudart, cublas) link.
       - name: Install CUDA 13, cuDNN and build dependencies
+        env:
+          WARM: ${{ steps.warm.outputs.warm }}
         run: |
           curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${{ matrix.cuda_repo }}/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends $APT_PACKAGES
-          echo /usr/local/cuda/bin >> "$GITHUB_PATH"
+          read -ra apt <<< "$APT_PACKAGES"
+          minor=
+          if [ "$WARM" = true ]; then
+            minor=$(apt-cache depends cuda-toolkit-13 | sed -n 's/^ *Depends: cuda-toolkit-\(13-[0-9]*\)$/\1/p' | head -1)
+          fi
+          if [ -z "$minor" ]; then
+            read -ra cuda <<< "$CUDA_PACKAGES"
+            sudo apt-get install -y --no-install-recommends "${cuda[@]}" "${apt[@]}"
+            echo /usr/local/cuda/bin >> "$GITHUB_PATH"
+            exit 0
+          fi
+          echo "warm build: CUDA $minor runtime libraries only"
+          sudo apt-get install -y --no-install-recommends "${apt[@]}" libcudnn9-dev-cuda-13 \
+            "cuda-nvcc-$minor" "cuda-cudart-$minor" "libcublas-$minor" "libcufft-$minor" "libcusolver-$minor" "cuda-nvrtc-$minor"
+          dirname "$(dpkg -L "cuda-nvcc-$minor" | grep -m1 '/bin/nvcc$')" >> "$GITHUB_PATH"
 
       - name: Build
         run: ./scripts/build-linux.sh
@@ -129,11 +194,35 @@ jobs:
         run: |
           ! ldd zig-out/bin/mlx-serve | grep 'not found' | grep -v 'libcuda.so.1'
 
+      # A PR's build is never attached to a release, so it skips the tarball.
       - name: Package
+        if: github.event_name != 'pull_request'
         run: |
           tar czf mlx-serve-linux-${{ matrix.name }}-cuda13.tar.gz zig-out/bin/mlx-serve lib/mlx/lib lib/mlx/include lib/llama/lib lib/ds4-linux/libds4.so LICENSE LICENSE-APACHE-2.0 NOTICE
 
       - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
         with:
           name: mlx-serve-linux-${{ matrix.name }}-cuda13
           path: mlx-serve-linux-${{ matrix.name }}-cuda13.tar.gz
+
+      - name: Save submodules cache
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.submodules.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .git/modules
+          key: submodules-${{ steps.pins.outputs.submodules }}
+
+      - name: Save llama.cpp stage
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.llama.outputs.cache-hit != 'true' && hashFiles('lib/llama/.version') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: lib/llama
+          key: llama-linux-${{ matrix.name }}-${{ hashFiles('scripts/fetch-llama.sh') }}
+
+      - name: Save Zig toolchain
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.zig.outputs.cache-hit != 'true' && hashFiles('.zig-toolchain/.version') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .zig-toolchain
+          key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}
