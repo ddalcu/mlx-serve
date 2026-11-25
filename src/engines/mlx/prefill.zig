@@ -33,6 +33,7 @@ const writeThroughArmed = @import("prefill_interleave.zig").writeThroughArmed;
 const ChunkWidthCtx = @import("prefill_interleave.zig").ChunkWidthCtx;
 const chunkWidenConfirmCb = @import("prefill_interleave.zig").chunkWidenConfirmCb;
 const chunkWidthCb = @import("prefill_interleave.zig").chunkWidthCb;
+const interleaveIdleCb = @import("prefill_interleave.zig").interleaveIdleCb;
 const interleaveDecodeTickCb = @import("prefill_interleave.zig").interleaveDecodeTickCb;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const postEvictionPrefillChunk = @import("scheduler/params.zig").postEvictionPrefillChunk;
@@ -615,7 +616,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .cancelled_checkpoint_sink = &slot.cancelled_prefill,
             .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
             .prefill_expected = if (observe) &sch.inflight_prefill_expected else null,
-            .interleave_hook = .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb },
+            .interleave_hook = .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb, .idle = interleaveIdleCb },
             .write_through_hook = if (writeThroughArmed(slot, prefill_tokens.len))
                 .{ .ctx = &write_through_ctx, .call = prefillWriteThroughCb }
             else

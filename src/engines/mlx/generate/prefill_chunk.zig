@@ -367,6 +367,48 @@ pub fn ssmStrideOnChunk() bool {
     return env.one(.MLX_SERVE_CP_STRIDE_ON_CHUNK);
 }
 
+/// The switch `ChunkPool` reads (default off).
+pub fn prefillKeepCache() bool {
+    return env.one(.MLX_SERVE_PREFILL_KEEP_CACHE);
+}
+
+/// Where the prefill chunk loop returns MLX's buffer pool (`mlx_clear_cache`). Off (`MLX_SERVE_PREFILL_KEEP_CACHE`
+/// unset): after every chunk, as before (dfd66c49 put the clear in the loop to bound a long prefill's memory). On:
+/// the pool stays between two chunks of the same width, so the next chunk's layers take back the buffers the last one
+/// freed (MLX reuses a pooled buffer only within two pages of the size asked) instead of allocating and first-touching
+/// them afresh. It is kept only where nothing else can need the memory or read it: another chunk of the same width
+/// follows, the width is not adaptive (its headroom reading, `currentGpuMemoryCeiling`, counts the pool), and no other
+/// request runs at the boundary (`InterleaveHook.idle`). Everywhere else it clears as before: after the last chunk
+/// (the next width is 0), before a chunk of another width, before a boundary tick that runs other requests
+/// (`beforeTick`), and at a cancel or an error (`atExit`). What the pool may hold stays bounded by MLX's cache limit.
+pub const ChunkPool = struct {
+    on: bool,
+    /// The pool was left in place at the last boundary.
+    kept: bool = false,
+
+    /// At a chunk boundary, the chunk's state evaluated: clear the pool (true) or keep it. `this_len` the chunk's
+    /// width, `next_len` the next chunk's (0: no chunk follows), `adaptive` the width may move at this boundary, `idle`
+    /// no other request runs at it.
+    pub fn atBoundary(p: *ChunkPool, this_len: usize, next_len: usize, adaptive: bool, idle: bool) bool {
+        p.kept = p.on and next_len != 0 and next_len == this_len and !adaptive and idle;
+        return !p.kept;
+    }
+
+    /// Before the boundary's interleave tick: a kept pool is cleared if other requests run at it now (true).
+    pub fn beforeTick(p: *ChunkPool, idle: bool) bool {
+        if (!p.kept or idle) return false;
+        p.kept = false;
+        return true;
+    }
+
+    /// The loop's exit (its end, a cancel, an error): a kept pool is cleared (true).
+    pub fn atExit(p: *ChunkPool) bool {
+        const k = p.kept;
+        p.kept = false;
+        return k;
+    }
+};
+
 /// Tokens of KV capacity this prefill reserves up front (#353). A multi-chunk prompt reserves
 /// itself plus one chunk of slack on every arch, since each chunk-by-chunk grow copies the whole
 /// cache; generation headroom is pre-bought only under `longCtxGated`. A request whose bill reserves it
@@ -1077,6 +1119,43 @@ test "chunkAlignedSsmCheckpointStride: off keeps the stride; on, a narrowed chun
     try testing.expectEqual(@as(usize, 16_384), chunkAlignedSsmCheckpointStride(16_384, 8192, true));
     try testing.expectEqual(@as(usize, 0), chunkAlignedSsmCheckpointStride(0, 3584, true));
     try testing.expectEqual(@as(usize, 8192), chunkAlignedSsmCheckpointStride(8192, 0, true));
+}
+
+test "ChunkPool: off clears at every boundary; on keeps it between same-width chunks with no company, and clears after the last chunk, before another width, before a busy tick, on cancel and on error" {
+    // Off (the default): every boundary clears, whatever the widths, as before.
+    var off: ChunkPool = .{ .on = false };
+    for ([_][2]usize{ .{ 3584, 3584 }, .{ 3584, 3584 }, .{ 3584, 3125 }, .{ 3125, 0 } }) |w| {
+        try testing.expect(off.atBoundary(w[0], w[1], false, true));
+        try testing.expect(!off.beforeTick(false));
+    }
+    try testing.expect(!off.atExit());
+    // On, over Hy4-flash's 17,492-token prompt (3584 x 4, then 3125): kept after chunks 1-3, cleared after chunk 4
+    // (the next width differs) and after chunk 5 (none follows).
+    var on: ChunkPool = .{ .on = true };
+    const widths = [_]usize{ 3584, 3584, 3584, 3584, 3125 };
+    var cleared: [5]bool = undefined;
+    for (widths, 0..) |w, i| {
+        const next: usize = if (i + 1 < widths.len) widths[i + 1] else 0;
+        cleared[i] = on.atBoundary(w, next, false, true);
+        try testing.expect(!on.beforeTick(true));
+    }
+    try testing.expectEqualSlices(bool, &.{ false, false, false, true, true }, &cleared);
+    try testing.expect(!on.atExit());
+    // A single-chunk prompt clears at its only boundary.
+    try testing.expect(on.atBoundary(3584, 0, false, true));
+    // An adaptive width and a boundary with company clear.
+    try testing.expect(on.atBoundary(3584, 3584, true, true));
+    try testing.expect(on.atBoundary(3584, 3584, false, false));
+    try testing.expect(!on.atExit());
+    // Kept, then company arrives before the tick: cleared there, once.
+    try testing.expect(!on.atBoundary(3584, 3584, false, true));
+    try testing.expect(on.beforeTick(false));
+    try testing.expect(!on.beforeTick(false));
+    try testing.expect(!on.atExit());
+    // Kept, then the request is cancelled or fails before the next chunk: the exit clears, once.
+    try testing.expect(!on.atBoundary(3584, 3584, false, true));
+    try testing.expect(on.atExit());
+    try testing.expect(!on.atExit());
 }
 
 test "a vision prefill checkpoints SSM state like text" {
