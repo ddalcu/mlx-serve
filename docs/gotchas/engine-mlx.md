@@ -1540,11 +1540,12 @@ prompt and a first chat at a fraction of their rates), and the second pass did n
 at its first evaluation, and each wrapper builds one variant per row count, prompt size class, cache state and
 speculative mode. The load's warmup ran three bare forwards and reached a fraction of them; the rest compiled
 inside whichever request selected them first. Metal keeps what it compiled per bundle
-id, so only a build's first run on a machine paid, and paid again after every rebuild. Fix: the first time a build
-loads a model it serves requests of its own through the scheduler (`warm_requests.zig`), on a RAM twin of the prefix
+id, so only a build's first run on a machine paid, and paid again after every rebuild. Fix: every load serves
+requests of its own through the scheduler (`warm_requests.zig`; a marker once kept this to a build's first load, see
+the next entry), on a RAM twin of the prefix
 cache and outside every metric. Serving them all before ready made that load several times longer, so by default
 the model is ready first and serves a short plan when the server is idle (a forward at every verify width, a short
-chat, a long prompt, that prompt with other endings), each request admitted alone so a real one never decodes
+chat, a 256-token prompt, that prompt with other endings), each request admitted alone so a real one never decodes
 beside it, the model never held so it stays evictable (an unload drops the warm-up first); `--warmup-full` serves
 that and a ladder of prompt sizes before ready, which a benchmark needs. macOS only. Guards:
 `tests/test_first_request_compiles.sh` (a copy of the binary under another bundle id starts with an empty cache),
@@ -1553,7 +1554,7 @@ that and a ladder of prompt sizes before ready, which a benchmark needs. macOS o
 ### A warm-up marker keyed on the load's inputs skipped the warm-up of loads that compile other kernels
 Defect: after an NVFP4 load of a DeepSeek-V4.1 pack, a load of the same build and pack under
 `MLX_SERVE_DSV41_MXFP4_VIEW=1` skipped its warm requests and compiled its MXFP4 kernels inside its first prompt (a
-p01 at 4,312 prefill tok/s against about 5,600). A first fix added the kill switches and the pack's top-level
+p01 at 4,312 prefill tok/s against 5,554). A first fix added the kill switches and the pack's top-level
 quantization to the marker's key; a review then found a DSpark-on load after a DSpark-off one skipping the same way,
 and a map of the class (65 inputs) found 38 that pick kernels outside the key: public and diag variables, foreign MLX
 variables, outside-plugin options, CLI arms, per-model settings, memory at load (pass rows), pack bytes replaced
