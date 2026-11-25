@@ -526,6 +526,8 @@ test "a busy disk retry parks until its bounded timeout or pending work" {
     sch.gen_queue = .empty;
     sch.unload_queue = .empty;
     sch.warm_queue = .empty;
+    sch.cache_export_queue = .empty;
+    sch.cache_import_queue = .empty;
     sch.queue_mu.lockUncancelable(sch.io);
     defer sch.queue_mu.unlock(sch.io);
     const before = io_util.Stopwatch.init(sch.io);
