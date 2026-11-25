@@ -2316,6 +2316,8 @@ const GqmmNax = struct {
     ne: usize,
     /// The staged schedule (`gqn.launchStaged`) at the planner's tile, in place of the seg/db plan.
     staged: bool = false,
+    /// The staged tile in place of the planner's (`gqn.sortedGateUpRoutedTile`, `gqn.sortedGatherPromptTokTile`).
+    tile: ?gqn.Staged = null,
     limit: u32 = 0,
     /// The pair's per-expert scales (`gqn.ExpertScales`): bit 0 the gate's, bit 1 the up's, `[ne]` bf16 each.
     esc: u32 = 0,
@@ -2402,7 +2404,7 @@ const GqmmNax = struct {
     }
 
     fn stagedAt(self: *const GqmmNax, shape: Shape) gqn.Staged {
-        return gqn.stagedPlan(@intCast(self.routed(shape)), @intCast(self.ne));
+        return self.tile orelse gqn.stagedPlan(@intCast(self.routed(shape)), @intCast(self.ne));
     }
 
     /// The rows a tile holds: what the scan cuts at.
@@ -2418,10 +2420,10 @@ const GqmmNax = struct {
     fn stagedGeometry(self: *const GqmmNax, shape: Shape) ?metal.Geometry {
         const n: c_int = @intCast(shape.n);
         const width = if (self.kind == .paired) 2 * n else n;
-        if (@rem(width, 64) != 0 or shape.k % 64 != 0 or !self.mx()) return null;
         const st = self.stagedAt(shape);
+        if (@rem(width, 64) != 0 or shape.k % 64 != 0 or !self.mx() or @rem(width, st.bn) != 0 or @rem(@as(c_int, @intCast(shape.k)), st.bk) != 0) return null;
         const mt: c_int = @intCast(naxMaxTiles(self.routed(shape), self.ne, @intCast(st.bm)));
-        const cols = @divExact(width, 64);
+        const cols = @divExact(width, st.bn);
         const gx = if (st.gx > 0) st.gx else cols;
         const gy = if (st.gx > 0) @divTrunc(mt + st.gx - 1, st.gx) * cols else mt;
         var g = metal.Geometry{ .grid = .{ @intCast(gx * 32), @intCast(gy * st.wn), @intCast(st.wm) }, .tg = .{ 32, @intCast(st.wn), @intCast(st.wm) } };
@@ -2439,6 +2441,8 @@ const GqmmNax = struct {
         g.int("EPI", if (self.moe_act) -1 else if (self.kind == .paired) 1 + @as(c_int, @intCast(self.limit)) else 0);
         g.int("ESC", @as(c_int, @intCast(self.esc)));
         g.int("AS", @as(c_int, @intFromBool(st.tg_a)));
+        g.int("BN", st.bn);
+        g.int("BK", st.bk);
         g.flag("MAP", self.kind != .mm);
         return g;
     }
@@ -2772,15 +2776,17 @@ const GqmmNax = struct {
         defer g.deinit();
         const y = switch (self.kind) {
             .mm => if (self.scat > 0)
-                try gqn.sortedGatherPromptStagedTok(x[0], x[1], x[2], .{ .ctx = null }, ids, x[11], x[15], @intCast(self.scat), bits, group, self.mx(), true, s)
+                try gqn.sortedGatherPromptTokTile(x[0], x[1], x[2], .{ .ctx = null }, ids, x[11], x[15], @intCast(self.scat), bits, group, self.mx(), true, self.tile, s)
+            else if (self.tile != null)
+                return error.Unregistered
             else
                 try gqn.sortedGatherPromptStaged(x[0], x[1], x[2], .{ .ctx = null }, ids, bits, group, self.mx(), true, s),
             .mapped => return error.Unregistered,
             // One bank of each expert's gate rows, then its up rows, as the routed wrapper reads.
-            .paired => try gqn.sortedGateUpRoutedStaged(x[0], x[11], try g.concat(&.{ x[1], x[4] }, 1), try g.concat(&.{ x[2], x[5] }, 1), .{ .ctx = null }, ids, x[14], self.rlim, .{
+            .paired => try gqn.sortedGateUpRoutedTile(x[0], x[11], try g.concat(&.{ x[1], x[4] }, 1), try g.concat(&.{ x[2], x[5] }, 1), .{ .ctx = null }, ids, x[14], self.rlim, .{
                 .gate = if (self.escv[0].len > 0) x[12] else null,
                 .up = if (self.escv[1].len > 0) x[13] else null,
-            }, bits, group, self.mx(), true, s),
+            }, bits, group, self.mx(), true, self.tile, s),
         } orelse return error.Declined;
         defer _ = mlx.mlx_array_free(y);
         return self.rig.bytesOf(&.{y});
@@ -2893,6 +2899,8 @@ fn registerStaged(set: *kc.Set) !void {
     // The scatter's rows are tokens (6 routed rows each): 516, 2052 and 4098 routed rows.
     const plain_scat: []const Shape = &.{ .{ .rows = 86, .n = 128, .k = 256 }, .{ .rows = 342, .n = 128, .k = 512 }, .{ .rows = 683, .n = 192, .k = 256 } };
     const paired: []const Shape = &.{ .{ .rows = 128, .n = 128, .k = 512 }, .{ .rows = 512, .n = 128, .k = 256 }, .{ .rows = 1024, .n = 96, .k = 512 } };
+    // The 32-deep down tile's calls: 96 routed rows an expert (512 tokens of 6 picks).
+    const wide_scat: []const Shape = &.{.{ .rows = 512, .n = 128, .k = 256 }};
     for ([_]Fmt{ .nvfp4, .mxfp4 }) |f| {
         const gs: usize = if (f == .nvfp4) 16 else 32;
         try set.add(GqmmNax, .initStaged(a, .mm, f, 4, gs, 32), .{ .name = if (f == .nvfp4) "gather_qmm_nax staged bf16 (NVFP4)" else "gather_qmm_nax staged bf16 (MXFP4)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = gather, .served = plain }, null);
@@ -2903,6 +2911,10 @@ fn registerStaged(set: *kc.Set) !void {
         r.rlim = 10;
         if (f == .nvfp4) r.esc = 3;
         try set.add(GqmmNax, r, .{ .name = if (f == .nvfp4) "gather_qmm_nax staged paired bf16 (NVFP4, gate and up scales, routed moe_act, limit 10)" else "gather_qmm_nax staged paired bf16 (MXFP4, routed moe_act, limit 10)", .accum = .f32, .depth = gqDepth, .ops = 12, .out = .bf16, .served = paired, .known = routed_nan }, null);
+        // deepseek_v41's MLX_SERVE_DSV41_PF_DOWN_BK32 tile: the down's scatter, 32 deep a step.
+        var wd = GqmmNax.initScat(a, f, 4, gs, 32);
+        wd.tile = gqn.wide_down;
+        try set.add(GqmmNax, wd, .{ .name = if (f == .nvfp4) "gather_qmm_nax staged scatter bf16 (NVFP4, PF_DOWN_BK32 tile)" else "gather_qmm_nax staged scatter bf16 (MXFP4, PF_DOWN_BK32 tile)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = gather ++ " -> take (each pair's sorted row)", .served = wide_scat }, null);
     }
 }
 
@@ -3326,7 +3338,7 @@ test "kernel contract moe: each verify launch is its wrapper's bytes, the prefil
 test "kernel contract moe: the NAX scan chained into each NAX gather launch is the wrapper's bytes" {
     if (mlx.noGpuBackend() or !device_mod.naxAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
-    const Case = struct { kind: NaxKind, f: Fmt = .affine, bits: u32 = 4, gs: usize = 64, moe_act: bool = false, staged: bool = false, scat: bool = false, shape: Shape };
+    const Case = struct { kind: NaxKind, f: Fmt = .affine, bits: u32 = 4, gs: usize = 64, moe_act: bool = false, staged: bool = false, scat: bool = false, tile: ?gqn.Staged = null, shape: Shape };
     const cases = [_]Case{
         .{ .kind = .mm, .shape = .{ .rows = 1024, .n = 128, .k = 256 } },
         .{ .kind = .mm, .shape = .{ .rows = 2048, .n = 96, .k = 256 } },
@@ -3338,16 +3350,22 @@ test "kernel contract moe: the NAX scan chained into each NAX gather launch is t
         .{ .kind = .mm, .f = .nvfp4, .gs = 16, .staged = true, .shape = .{ .rows = 4096, .n = 128, .k = 512 } },
         .{ .kind = .mm, .f = .mxfp4, .gs = 32, .staged = true, .shape = .{ .rows = 512, .n = 128, .k = 256 } },
         .{ .kind = .paired, .f = .nvfp4, .gs = 16, .moe_act = true, .staged = true, .shape = .{ .rows = 512, .n = 128, .k = 256 } },
+        // deepseek_v41's MOE_PAIR_FP4 on an MXFP4 bank: the routed pair without per-expert scales, seg and staged.
+        .{ .kind = .paired, .f = .mxfp4, .gs = 32, .moe_act = true, .shape = .{ .rows = 512, .n = 128, .k = 512 } },
+        .{ .kind = .paired, .f = .mxfp4, .gs = 32, .moe_act = true, .staged = true, .shape = .{ .rows = 512, .n = 128, .k = 256 } },
         .{ .kind = .mm, .f = .nvfp4, .gs = 16, .staged = true, .scat = true, .shape = .{ .rows = 683, .n = 128, .k = 512 } },
         .{ .kind = .mm, .f = .mxfp4, .gs = 32, .staged = true, .scat = true, .shape = .{ .rows = 86, .n = 128, .k = 256 } },
+        .{ .kind = .mm, .f = .nvfp4, .gs = 16, .staged = true, .scat = true, .tile = gqn.wide_down, .shape = .{ .rows = 512, .n = 128, .k = 256 } },
     };
     for (cases) |c| {
         var t = if (c.scat) GqmmNax.initScat(a, c.f, c.bits, c.gs, 32) else if (c.staged) GqmmNax.initStaged(a, c.kind, c.f, c.bits, c.gs, 32) else GqmmNax.init(a, c.kind, c.f, c.bits, c.gs, 32);
         defer t.deinit();
+        t.tile = c.tile;
         if (c.moe_act) {
             t.moe_act = true;
             t.rlim = 10;
-            t.esc = 3;
+            // NVFP4 brings both per-expert scales; MXFP4 has none (the step compiled out).
+            t.esc = if (c.f == .nvfp4) 3 else 0;
         }
         try std.testing.expect(try t.prepare(c.shape, .random, 7));
         const scan = NaxScan.init(a, 32);

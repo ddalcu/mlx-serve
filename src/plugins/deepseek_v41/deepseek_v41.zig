@@ -36,6 +36,7 @@ const dsv4 = @import("../deepseek_v4/deepseek_v4.zig");
 const streamed = @import("../../sdk/weights/streamed.zig");
 const dkern = @import("decode/decode.zig");
 const device = @import("../../mlx/device.zig");
+const world = @import("../../sdk/testing/world.zig");
 /// A pack an outside quant plugin reads: its linears and resident banks run on the plugin.
 const outside = @import("../../sdk/quant/outside.zig");
 /// the embed_pread.zig (the embedding pread): the embedding table read from the pack per lookup.
@@ -96,6 +97,8 @@ const pfroute = @import("prompt/pf_route.zig");
 const idx_nax = @import("prompt/idx_nax.zig");
 /// fp4_gemm.zig: a prompt call's fp4 routed experts on the staged NAX gather (`MLX_SERVE_DSV41_PF_FP4_GEMM`).
 const fp4gemm = @import("prompt/fp4_gemm.zig");
+/// pf_int8.zig: a wide pass's trunk projections on int8 tensor ops (`MLX_SERVE_DSV41_PF_INT8`, not lossless).
+const pfint8 = @import("prompt/pf_int8.zig");
 /// launch fusions, each behind its own default-off switch (`Dsv41Model.fuse`).
 const fusion = @import("fuse.zig");
 /// Directional ablation (ablation.zig): every write to the residual stream loses the direction of the pass's state.
@@ -627,6 +630,8 @@ pub const Dsv41Model = struct {
     owned: std.ArrayList(A) = .empty,
     /// The NVFP4 banks the load served as MXFP4 (`mxView`).
     view: mx_view.Tally = .{},
+    /// `MLX_SERVE_DSV41_PF_INT8`'s int8 trunk weights, made at load from its plan (`pfint8.trunkLoad`); freed in `deinit`.
+    trunk8: pfint8.Table = .{},
     /// The outside quant plugin that reads the pack's weights (`InitOpts.quant`), while `init` runs.
     quant: ?*const outside.Format = null,
     /// Every weight it loaded, released in `deinit`.
@@ -694,6 +699,7 @@ pub const Dsv41Model = struct {
     pub fn deinit(self: *Dsv41Model) void {
         // scratch_x1.zig: the prompt's regions let go with the model.
         sx1.releaseAll();
+        self.trunk8.deinit(self.gpa);
         self.dropNext();
         self.dropEngNext();
         if (self.dec_state) |*st| st.deinit();
@@ -1035,12 +1041,26 @@ fn exactMiss(m: *Dsv41Model, li: usize) void {
 
 var ced_env: ?bool = null;
 /// `MLX_SERVE_DSV41_CED=0` keeps every prefill chunk on the full forward.
-fn cedEnabled() bool {
+pub fn cedEnabled() bool {
     if (ced_env == null) {
         const v = env.get(.MLX_SERVE_DSV41_CED);
         ced_env = v == null or v.?[0] != '0';
     }
     return ced_env.?;
+}
+
+/// The test world's reset (`src/tests.zig` calls it before every test): the latched CED read and the engagement
+/// counters tests read, as a fresh process holds them.
+pub fn testReset() void {
+    ced_env = null;
+    inline for (.{ &rope_pairs_calls, &rms_rows_calls, &kv_rows_calls, &comp_bf16_count, &comp_pass_count, &idx_pass_count, &router_bf16_count, &eng_ahead_served, &eng_ahead_launched, &eng_ahead_taken, &draft_pos_once_runs, &stage_fused_runs, &fp4gemm.launches, &pfroute.served }) |a| a.store(0, .monotonic);
+    for (&core_calls) |*a| a.store(0, .monotonic);
+    ced_hc_passes.store(0, .monotonic);
+    fp4gemm.bk32_launches.store(0, .monotonic);
+    fp4gemm.tok_launches.store(0, .monotonic);
+    sync_rounds.store(0, .monotonic);
+    sync_collects.store(0, .monotonic);
+    fusion.engaged = .{};
 }
 
 pub fn resetCedEnvForTest() void {
@@ -2676,6 +2696,8 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         if (b.w.ctx != null) log.info("deepseek_v41: routed experts {t} bits={d} group={d}, per-expert scales gate={} up={} down={}\n", .{ b.qp.mode, b.qp.bits, b.qp.group_size, ex.scale[0] != null, ex.scale[1] != null, ex.scale[2] != null });
     }
     m.view.report();
+    // MLX_SERVE_DSV41_PF_INT8: its plan's int8 trunk weights now; no prompt makes one
+    try pfint8.trunkLoad(gpa, m);
     return m;
 }
 
@@ -2739,6 +2761,32 @@ pub fn passRowsLimit(config: anytype) u64 {
     const per_row: u64 = @max(@as(u64, config.num_attention_heads) * config.head_dim, 1);
     return ((@as(u64, 1) << 31) - 1) / per_row / SPAN * SPAN;
 }
+
+/// `MLX_SERVE_DSV41_PF_PASS_CEIL`'s ceiling on the M5 Ultra with 512 GiB, a machine constant: the knee measured there
+/// at 1M prompt rows on both fp4 formats. At 1M, NVFP4 prefilled the same at 30,720, 34,816 and 39,680 rows a pass;
+/// the MXFP4 view lost 2.97% at its memory-sized 47,360 rows and 2.4% at 44,032 against 39,680 (its fresh allocations,
+/// the per-span context-prefix arrays the pass's reserve does not hold, rose from about 780 to 1,370 and 1,490 GiB).
+/// 155 spans; under it a prompt of 128K, 256K or 512K rows runs in 4, 7 or 14 passes (32,768, 37,632 and 37,632 rows).
+pub const PASS_CEIL_M5_ULTRA_512: usize = 155 * SPAN;
+
+/// The ceiling `MLX_SERVE_DSV41_PF_PASS_CEIL` puts on a memory-sized prompt pass for `chip` (the CPU brand) with `mem`
+/// bytes of memory; 0 where none is measured. Only the M5 Ultra with 512 GiB has a measured knee; every other machine
+/// keeps the memory-sized width until its own is measured.
+pub fn passCeilFor(chip: []const u8, mem: u64) usize {
+    if (std.mem.indexOf(u8, chip, "M5 Ultra") != null and mem >= @as(u64, 512) << 30) return PASS_CEIL_M5_ULTRA_512;
+    return 0;
+}
+
+/// `passCeilFor` this machine under `MLX_SERVE_DSV41_PF_PASS_CEIL` (default on): 0 at `=0`, or where no knee is measured.
+pub fn passCeil() usize {
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_PASS_CEIL)) return 0;
+    const id = device.machineId();
+    const c = passCeilFor(id.chip, id.mem);
+    return if (pass_ceil_plant and c > 0) c + 4 * SPAN else c;
+}
+
+/// `MLX_SERVE_DSV41_PF_PASS_CEIL`'s planted bug (its test): the ceiling 1,024 rows too high.
+pub var pass_ceil_plant = false;
 
 /// Whether `MLX_SERVE_DSV41_PF_PASS_SIZE` serves a load, for its prompt bill (`prefillBytes`): `passSettle`'s
 /// conditions as the engine's `ModelConfig` sees them (a resident bank, no layer pair, span or shard), or the plugin's
@@ -2848,7 +2896,17 @@ pub fn prefillBytes(config: anytype, kv_per_token: u64, seq: u64, chunk: u64, fl
     // (`passPlanned`) one call takes the chunk's every row.
     const moe_rows: u64 = if (passPlanned(config)) c else @min(c, MOE_ROWS);
     const moe_bytes = moe_rows * config.num_experts_per_tok * (3 * config.moe_intermediate_size + d) * 2;
-    return (state + held + attn + idx_bytes + moe_bytes + wideEarlyBytes(config, c) + woaJoinBytes(config, c) + floor) * 5 / 4;
+    return (state + held + attn + idx_bytes + moe_bytes + wideEarlyBytes(config, c) + woaJoinBytes(config, c) + idxPassBytes(config, c) + pfint8.transientBytes(config, c, SPAN) + floor) * 5 / 4;
+}
+/// MLX_SERVE_DSV41_PF_IDX_PASS: an index layer's queries over the whole call (`wq_b`'s bf16 rows, the roped f32 queries
+/// and their fp4 round trip's f32 copy) and its bf16 head weights, held through the layer's span loop; 0 off or for a
+/// call no wider than a span.
+fn idxPassBytes(config: anytype, rows: u64) u64 {
+    const T = @TypeOf(config.*);
+    if (comptime !@hasField(T, "dsv4_index_n_heads") or !@hasField(T, "dsv4_index_head_dim")) return 0;
+    if (rows <= SPAN or !env.onUnlessZero(.MLX_SERVE_DSV41_PF_IDX_PASS)) return 0;
+    const ih: u64 = config.dsv4_index_n_heads;
+    return rows * ih * (@as(u64, config.dsv4_index_head_dim) * (2 + 4 + 4) + 2);
 }
 /// a streamed bank's wide call of `rows` rows holds its early shared expert's evaluation through the MoE
 /// stage (`wide_early.bytes`); 0 with no streamed bank or a call no wider than a span (the decode phase's bill: only wide
@@ -3837,6 +3895,10 @@ pub const Shared = struct {
     /// A replaying chunk's last decoder layer on its last span: nothing but the chunk's logits reads its output rows,
     /// so its MoE routes the last row only (`moeLast`).
     last_row: bool = false,
+    /// MLX_SERVE_DSV41_PF_IDX_PASS: this span's rows of the indexer's queries and head weights, made once over the
+    /// pass by `wideLayer`; `compressed` then scores them (`indexerQ`) instead of projecting the span itself.
+    idx_q: A = none,
+    idx_w: A = none,
 };
 
 /// `x` normed attention input `[L, dim]` at positions [p0, p0 + L). With `pre` (the rows' projections,
@@ -3953,7 +4015,7 @@ fn compressed(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, qr: A, p0
     if (ly.ratio == 0) return .{ none, none };
     const clen = (p0 + dim(x, 0)) / ly.ratio;
     if (ly.comp) |*cw| if (sh.floor == null and !sh.compressed) try compress(sc, m, st, li, cw, x, p0);
-    if (ly.idx) |*iw| sh.topk = if (clen == 0) none else try indexer(sc, m, st, li, iw, x, qr, p0, sh);
+    if (ly.idx) |*iw| sh.topk = if (clen == 0) none else if (sh.idx_q.ctx != null) try indexerQ(sc, m, st, li, sh.idx_w, sh.idx_q, p0, sh) else try indexer(sc, m, st, li, iw, x, qr, p0, sh);
     if (clen == 0 or sh.topk.ctx == null) return .{ none, sh.topk };
     return .{ try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view(clen, sc.s)), sh.topk };
 }
@@ -4542,12 +4604,14 @@ pub fn qkvProjWith(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, x: 
 pub fn qkvRows(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !Proj {
     const c = &m.cfg;
     const qa, const kv = if (ly.q_kv) |*f| blk: {
-        const y = try f.apply(sc, x);
+        const y = (try pfint8.trunk(sc, m, ly, .q_kv, x, "wq_a+wkv")) orelse try f.apply(sc, x);
         const n = dim(y, -1);
         break :blk .{ try sc.slice(y, -1, 0, n - c.head_dim), try sc.slice(y, -1, n - c.head_dim, n) };
     } else .{ try ly.wq_a.apply(sc, x), try ly.wkv.apply(sc, x) };
     const qr = (try rmsRows(sc, qa, ly.q_norm, c.rms_norm_eps)) orelse try sc.rms(qa, ly.q_norm, c.rms_norm_eps);
-    const qb = try ly.wq_b.apply(sc, qr);
+    try trunkDump(sc, "qkv_in", x);
+    try trunkDump(sc, "wq_b_in", qr);
+    const qb = (try pfint8.trunk(sc, m, ly, .wq_b, qr, "wq_b")) orelse try ly.wq_b.apply(sc, qr);
     return .{ .q = try sc.reshape(qb, &.{ ci(dim(x, 0)), -1, ci(c.head_dim) }), .kv = kv, .qr = qr };
 }
 
@@ -4864,6 +4928,111 @@ fn compressFrom(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, cw: *const Co
     const rot = try ropeQat(sc, m, latent, m.rope_yarn.fwd, try sc.i(ci(g0)), @floatFromInt(r), .fp4_e4m3, null);
     try ls.comp.?.append(rot, sc.s);
 }
+
+/// MLX_SERVE_DSV41_PF_COMP_PASS: `compressFrom` once over the whole pass's projection `proj` (`[L, 2 head_dim]`, or
+/// `[L, head_dim]` at ratio 1) for spans `sp`: every op but the index keys' linear works per element, group or row, so
+/// it gives the span-by-span calls' words over all rows at once; that linear runs on each span's own groups, as the
+/// span-by-span calls run it (MLX picks its kernel by row count).
+fn compressPass(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, cw: *const Comp, proj: A, sp: *const Spans) !void {
+    const c = &m.cfg;
+    const ly = &m.layers[li];
+    const ls = &st.layers[li];
+    const r: usize = ly.ratio;
+    const pend0: usize = if (ls.pend_kv.ctx != null) dim(ls.pend_kv, 0) else 0;
+    var latent = none;
+    if (r == 1) {
+        latent = try sc.rms(proj, cw.norm, c.rms_norm_eps);
+    } else {
+        const hd = c.head_dim;
+        var kv = try sc.slice(proj, -1, 0, hd);
+        var gate = try sc.slice(proj, -1, hd, 2 * hd);
+        if (ls.pend_kv.ctx != null) {
+            kv = try sc.concat(&.{ ls.pend_kv, kv }, 0);
+            gate = try sc.concat(&.{ ls.pend_gate, gate }, 0);
+        }
+        const total = dim(kv, 0);
+        const g = total / r;
+        const full = g * r;
+        const new_kv = if (full < total) sc.out(try sc.slice(kv, 0, full, total)) else none;
+        const new_gate = if (full < total) sc.out(try sc.slice(gate, 0, full, total)) else none;
+        if (ls.pend_kv.ctx != null) _ = mlx.mlx_array_free(ls.pend_kv);
+        if (ls.pend_gate.ctx != null) _ = mlx.mlx_array_free(ls.pend_gate);
+        ls.pend_kv = new_kv;
+        ls.pend_gate = new_gate;
+        if (g == 0) return;
+        const kg = try sc.reshape(try sc.slice(kv, 0, 0, full), &.{ ci(g), ci(r), ci(hd) });
+        const gg = try sc.reshape(try sc.slice(gate, 0, 0, full), &.{ ci(g), ci(r), ci(hd) });
+        const pooled = try sc.sum(try sc.mul(kg, try sc.softmax(gg, 1)), 1, false);
+        latent = try sc.rms(try sc.astype(pooled, m.act), cw.norm, c.rms_norm_eps);
+    }
+    const g0 = sp.p0 / r + @intFromBool(comp_pass_plant);
+    if (ly.idx) |*iw| if (iw.wk) |*wk| {
+        // span k's groups: those its rows complete, after the rows pending before it
+        const parts = try sc.a.alloc(A, sp.xs.len);
+        defer sc.a.free(parts);
+        var n: usize = 0;
+        for (0..sp.xs.len) |k| {
+            const lo, const hi = sp.bounds(k);
+            const a = (pend0 + lo) / r;
+            const b = (pend0 + hi) / r;
+            if (b > a) {
+                parts[n] = try rowLinear(sc, wk, try sc.slice(latent, 0, a, b));
+                n += 1;
+            }
+        }
+        if (n > 0) {
+            var k = try sc.rms(if (n == 1) parts[0] else try sc.concat(parts[0..n], 0), iw.k_norm, c.rms_norm_eps);
+            k = try ropeQat(sc, m, k, m.rope_yarn.fwd, try sc.i(ci(g0)), @floatFromInt(r), .fp4_ue8m0, null);
+            try ls.idx_k.?.append(k, sc.s);
+        }
+    };
+    const rot = try ropeQat(sc, m, latent, m.rope_yarn.fwd, try sc.i(ci(g0)), @floatFromInt(r), .fp4_e4m3, null);
+    try ls.comp.?.append(rot, sc.s);
+    _ = comp_pass_count.fetchAdd(1, .monotonic);
+    if (!comp_pass_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_COMP_PASS engaged (layer {d}, {d} rows)\n", .{ li, dim(proj, 0) });
+}
+var comp_pass_logged = std.atomic.Value(bool).init(false);
+/// `MLX_SERVE_DSV41_PF_COMP_PASS`'s layers served (its test's meter) and its planted bug (the groups' rope a row late).
+pub var comp_pass_count = std.atomic.Value(usize).init(0);
+pub var comp_pass_plant = false;
+
+/// MLX_SERVE_DSV41_PF_IDX_PASS: the indexer's head weights `x . l^T` over a whole pass on kernels/idx_wproj.metal
+/// (the model's 32 heads and 5,120 hidden compiled in), null where it does not serve (another shape or dtype, a
+/// quantized or outside linear, decode widths, no GPU or NAX).
+pub fn idxHeadWeights(sc: *Scope, l: *const Lin, x: A) !?A {
+    if (l.ext != null or l.s.ctx != null or !mlx.streamIsGpu(sc.s) or !device.naxAvailable()) return null;
+    if (mlx.mlx_array_dtype(l.w) != .bfloat16 or mlx.mlx_array_dtype(x) != .bfloat16) return null;
+    const ws = mlx.getShape(l.w);
+    const xs = mlx.getShape(x);
+    if (ws.len != 2 or ws[0] != idx_wproj_n or ws[1] != idx_wproj_k or xs.len != 2 or xs[1] != idx_wproj_k or xs[0] <= region_rows) return null;
+    if (idx_wproj_kernel == null) idx_wproj_kernel = try buildKernel("dsv41_idx_wproj", &.{ "x", "w" }, &.{"y"}, IDX_WPROJ_SOURCE, IDX_WPROJ_HEADER);
+    const L: usize = @intCast(xs[0]);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), idx_wproj_n }, 2, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 256, ci((L + 15) / 16), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OT", .bfloat16));
+    const iv = mlx.mlx_vector_array_new_data(&[_]A{ x, l.w }, 2);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, idx_wproj_kernel.?, iv, cfg, sc.s));
+    var o = mlx.mlx_array_new();
+    return try sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+}
+pub const IDX_WPROJ_SOURCE = kernelSource("plugins/deepseek_v41/kernels/idx_wproj.metal");
+pub const IDX_WPROJ_HEADER = @import("decode/attn.zig").HEADER;
+pub const idx_wproj_n: c_int = 32;
+pub const idx_wproj_k: c_int = 5120;
+var idx_wproj_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var idx_pass_logged = std.atomic.Value(bool).init(false);
+/// `MLX_SERVE_DSV41_PF_IDX_PASS`'s layers served (its test's meter) and its planted bug (the queries' rope a row late).
+pub var idx_pass_count = std.atomic.Value(usize).init(0);
+pub var idx_pass_plant = false;
+/// Its test's exact half: the queries over the pass, the head weights still MLX's GEMM per span.
+pub var idx_pass_mlx_w = false;
 
 /// The `k` largest scores of each row as int32 indices (ascending, ties to
 /// the lower index); `Scope.topk` off the GPU.
@@ -5594,6 +5763,41 @@ fn dumpRoute(sc: *Scope, path: [*:0]const u8, L: usize, k: usize, E: usize, sidx
     _ = std.c.fwrite(@ptrCast(dr), 4, n, f);
 }
 
+/// `DSV41_TRUNK_DUMP` (diag): the wide prompt layer whose trunk inputs are written, set by `wideLayer`.
+var trunk_dump_li: ?usize = null;
+/// The layers `DSV41_TRUNK_DUMP` writes: an early, a middle and a late encoder layer.
+pub const trunk_dump_layers = [_]usize{ 3, 10, 17 };
+
+/// `DSV41_TRUNK_DUMP` (diag): input `x` `[L, K]` of trunk projection `name` in wide layer `trunk_dump_li` (a pass of
+/// 4,096 rows or more), every `stride`-th row (at most 1,024 rows), written raw to `<dir>/L<layer>_<name>.bin`: u32 rows, u32 columns, then the
+/// rows' bf16 words. The PF_INT8=3 quality test reads them.
+fn trunkDump(sc: *Scope, name: []const u8, x: A) !void {
+    const li = trunk_dump_li orelse return;
+    const dir = env.get(.DSV41_TRUNK_DUMP) orelse return;
+    if (mlx.mlx_array_ndim(x) != 2 or dim(x, 0) < 4096) return;
+    const L = dim(x, 0);
+    const K = dim(x, 1);
+    const stride = (L + 1023) / 1024;
+    var v = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v);
+    try mlx.check(mlx.mlx_slice(&v, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(L), ci(K) }, 2, &[_]c_int{ ci(stride), 1 }, 2, sc.s));
+    const xb = try sc.astype(v, .bfloat16);
+    var cb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cb);
+    try mlx.check(mlx.mlx_contiguous(&cb, xb, false, sc.s));
+    try mlx.check(mlx.mlx_array_eval(cb));
+    const n = dim(cb, 0);
+    const d = mlx.mlx_array_data_bfloat16(cb) orelse return;
+    var buf: [1024]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&buf, "{s}/L{d}_{s}.bin", .{ std.mem.sliceTo(dir, 0), li, name }, 0);
+    const f = std.c.fopen(path.ptr, "wb") orelse return;
+    defer _ = std.c.fclose(f);
+    const hdr = [2]u32{ @intCast(n), @intCast(K) };
+    _ = std.c.fwrite(@ptrCast(&hdr), 4, 2, f);
+    _ = std.c.fwrite(@ptrCast(d), 2, n * K, f);
+    log.info("[dsv41] DSV41_TRUNK_DUMP: layer {d} {s} {d} of {d} rows x {d}\n", .{ li, name, n, L, K });
+}
+
 pub const Routes = struct { idx: A, wts: A };
 /// `MLX_SERVE_DSV41_PF_ROUTER_BF16`'s sum at `rows` x `e` experts x `k`: only where today's chain runs MLX's regular
 /// kernel (`gate_gemm.router`, one running sum over K), the single sum: today's words. Where MLX splits K (fewer rows,
@@ -5699,12 +5903,14 @@ pub fn withShared(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, y: A
 pub fn shared(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !A {
     // A prompt's rows take the routed experts' activation kernel (weight 1): one pass, not the f32 op chain's five.
     if (ly.shared_gu) |*gu| if (dim(x, 0) > region_rows and mlx.streamIsGpu(sc.s)) {
-        const y = try gu.apply(sc, x);
+        const y = (try pfint8.trunk(sc, m, ly, .shared_gu, x, "shared gate+up")) orelse try gu.apply(sc, x);
         const L = dim(y, 0);
         const n = dim(y, -1) / 2;
         const lim = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.dsv4_swiglu_limit}, &[_]c_int{1}, 1, .float32));
         const act = try flatKernel(sc, m.moe_act_kernel, &.{ y, try sc.ones(&.{ci(L)}, .float32), lim }, &.{ ci(L), ci(n) }, m.act, L * n, &.{.{ .name = "N", .v = ci(n) }});
-        return ly.shared[2].apply(sc, act);
+        try trunkDump(sc, "shared_in", x);
+        try trunkDump(sc, "shared_down_in", act);
+        return (try pfint8.trunk(sc, m, ly, .shared_down, act, "shared down")) orelse ly.shared[2].apply(sc, act);
     };
     // An outside plugin's shared expert in one dispatch where it takes the call.
     if (ly.shared_gu == null) if (ly.shared[0].ext) |*w1| if (ly.shared[1].ext) |*w3| if (ly.shared[2].ext) |*w2| if (try outside.denseSwiglu(w1, w3, w2, x, @intFromFloat(m.cfg.dsv4_swiglu_limit), sc.s)) |fy| {
@@ -7120,6 +7326,8 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     defer sat.layerEnd();
     const n_spans = sp.xs.len;
     const ly = &m.layers[li];
+    trunk_dump_li = if (env.get(.DSV41_TRUNK_DUMP) != null and std.mem.indexOfScalar(usize, &trunk_dump_layers, li) != null) li else null;
+    defer trunk_dump_li = null;
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
     const parts = try gpa.alloc(A, n_spans);
@@ -7190,7 +7398,10 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     const comp_first = ly.comp != null and sp.floor == null;
     // MLX_SERVE_DSV41_PF_COMP_BF16: the projection over every row first, each span's pooling on its rows of it.
     const comp_all: ?A = if (comp_first) try compProjBf16(&sc, m, li, &ly.comp.?, pa.h) else null;
-    if (comp_first) for (0..n_spans) |k| {
+    // MLX_SERVE_DSV41_PF_COMP_PASS: the spans' pooling in one pass of the same ops.
+    const comp_pass = comp_first and comp_all != null and env.onUnlessZero(.MLX_SERVE_DSV41_PF_COMP_PASS);
+    if (comp_pass) try compressPass(&sc, m, st, li, &ly.comp.?, comp_all.?, sp);
+    if (comp_first and !comp_pass) for (0..n_spans) |k| {
         const lo, const hi = sp.bounds(k);
         var csc = Scope.init(gpa, m.s);
         defer csc.deinit();
@@ -7204,12 +7415,26 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     const heads_b = run > 1 and m.act == .bfloat16 and try sat.headsLayerBegin(ly.wo_a.ext != null, run * sp.span, m.cfg.dsv4_o_groups, @as(usize, m.cfg.num_attention_heads) / m.cfg.dsv4_o_groups * m.cfg.head_dim, m.act);
     defer sat.headsLayerEnd();
     const src_ratio = if (m.ratio(li) == 0) 0 else m.ratio(m.latest(li, Dsv41Model.isIndexSource));
+    // MLX_SERVE_DSV41_PF_IDX_PASS: the indexer's queries and head weights over the pass, each span slicing its rows.
+    var idx_q = none;
+    var idx_w = none;
+    if (ly.idx) |*iw| if (ig_r > 0 and sp.floor == null and m.trace == null and env.onUnlessZero(.MLX_SERVE_DSV41_PF_IDX_PASS)) if (try idxHeadWeights(&sc, &iw.weights_proj, pa.h)) |w| {
+        const c = &m.cfg;
+        idx_w = w;
+        idx_q = try ropeQat(&sc, m, try sc.reshape(try iw.wq_b.apply(&sc, pj.qr), &.{ ci(sp.L), ci(c.dsv4_index_n_heads), ci(c.dsv4_index_head_dim) }), m.rope_yarn.fwd, try sc.i(ci(sp.p0 + @intFromBool(idx_pass_plant))), 1.0, .fp4_ue8m0, .float32);
+        _ = idx_pass_count.fetchAdd(1, .monotonic);
+        if (!idx_pass_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_IDX_PASS engaged (layer {d}, {d} rows)\n", .{ li, sp.L });
+    };
     for (0..n_spans) |k| {
         const lo, const hi = sp.bounds(k);
         // A span's core intermediates are dropped once built, as in the per-span path.
         var ssc = Scope.init(gpa, m.s);
         defer ssc.deinit();
         var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor, .compressed = comp_first };
+        if (idx_q.ctx != null) {
+            sh.idx_q = try ssc.slice(idx_q, 0, lo, hi);
+            sh.idx_w = if (idx_pass_mlx_w) try rowLinear(&ssc, &ly.idx.?.weights_proj, try ssc.slice(pa.h, 0, lo, hi)) else try ssc.slice(idx_w, 0, lo, hi);
+        }
         var span_pj: Proj = .{ .q = try ssc.slice(pj.q, 0, lo, hi), .kv = try ssc.slice(pj.kv, 0, lo, hi), .qr = try ssc.slice(pj.qr, 0, lo, hi) };
         if (pj.qt.ctx != null) span_pj.qt = try ssc.slice(pj.qt, 0, lo, hi);
         // Whether this span's run takes a region (its `run` spans all of `sp.span` rows).
@@ -7264,7 +7489,9 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         }
     }
     const joined = try sc.concat(heads[0..n_heads], 0);
-    const y = try abl.ablate(&sc, m, if (m.tp != null) joined else try ly.wo_b.apply(&sc, if (woa_join) try sc.reshape(joined, &.{ ci(sp.L), -1 }) else joined));
+    const wo_in = if (woa_join) try sc.reshape(joined, &.{ ci(sp.L), -1 }) else joined;
+    if (m.tp == null) try trunkDump(&sc, "wo_b_in", wo_in);
+    const y = try abl.ablate(&sc, m, if (m.tp != null) joined else (try pfint8.trunk(&sc, m, ly, .wo_b, wo_in, "wo_b")) orelse try ly.wo_b.apply(&sc, wo_in));
     // scratch_x1.zig: the streams after the attention into the prompt's x1 region (a streamed bank runs one MoE
     // group, so that group's output is the region's last reader's). Not under an ablation: the FFN's output is then
     // ablated against x1 after the call that would end the region's reads.
@@ -7447,6 +7674,21 @@ fn cedCompress(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Sp
         _ = ced_hc_passes.fetchAdd(1, .monotonic);
         const pa = try hcPreNormWide(&sc, m, sp.whole[0], sp.whole[1], &ly.hc_attn, ly.attn_norm);
         const shift = ced_hc_plant.load(.monotonic);
+        // `MLX_SERVE_DSV41_PF_CED_COMP`: each span's projection as today (its kernel moves with M), then one
+        // `compressPass` over all of them: its rms, index keys a span's groups at a time and rope work per row.
+        if (env.onUnlessZero(.MLX_SERVE_DSV41_PF_CED_COMP) and shift == 0) {
+            const cw = &ly.comp.?;
+            const projs = try gpa.alloc(A, sp.xs.len);
+            defer gpa.free(projs);
+            for (0..sp.xs.len) |k| {
+                const lo, const hi = sp.bounds(k);
+                projs[k] = try compProj(&sc, m, li, cw, try sc.slice(pa.h, 0, lo, hi));
+            }
+            try compressPass(&sc, m, st, li, cw, try sc.concat(projs, 0), sp);
+            if (!ced_comp_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_CED_COMP engaged (layer {d}, rows {d}, spans {d})\n", .{ li, sp.L, sp.xs.len });
+            _ = ced_comp_passes.fetchAdd(1, .monotonic);
+            return;
+        }
         for (0..sp.xs.len) |k| {
             const lo, const hi = sp.bounds(k);
             const a = @min(lo + shift, sp.L - (hi - lo));
@@ -7467,6 +7709,9 @@ fn cedHcWhole(m: *const Dsv41Model, sp: *const Spans) bool {
     return sp.whole[0].ctx != null and sp.whole[1].ctx != null and dim(sp.whole[0], 0) == sp.L and dim(sp.whole[1], 0) == sp.L;
 }
 var ced_hc_logged: std.atomic.Value(bool) = .init(false);
+var ced_comp_logged: std.atomic.Value(bool) = .init(false);
+/// Passes whose CED compressor ran as one `compressPass` (`MLX_SERVE_DSV41_PF_CED_COMP`; a test's proof it engaged).
+pub var ced_comp_passes: std.atomic.Value(u32) = .init(0);
 /// Passes whose compressor took the whole stream (a test's proof the switch engaged).
 pub var ced_hc_passes: std.atomic.Value(u32) = .init(0);
 /// The planted control (tests only): each span's compressor reads the whole stream's rows this many rows late.
@@ -11193,7 +11438,7 @@ test "dsv41 wide attention: the f16 core and the matrix-unit core give the f32 c
     const fa_was = fa.ps().*;
     defer fa.ps().* = fa_was;
     fa.ps().* = .{};
-    m.attn_gather = if (device.naxAvailable()) try GatherAttn.init() else null;
+    m.attn_gather = if (world.nax()) try GatherAttn.init() else null;
     defer if (m.attn_gather) |*g| g.deinit();
     var key = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(key);
@@ -14256,4 +14501,23 @@ test "dsv41 draft vocabulary: ids grow to whole buckets with the lowest ids outs
     // A bucket past the vocabulary stops at every id.
     try padIds(a, &ids, &taken, 64);
     try std.testing.expectEqual(@as(usize, 12), ids.items.len);
+}
+
+// One test's state must not reach the next. Each pair runs in every shard ("sharded:"), the leak first, in file order.
+var world_comp_bf16_at_start: ?[]u8 = null;
+
+test "sharded: dsv41 test world: a test that sets a lever and leaves it (the PF_COMP_BF16 leak)" {
+    world_comp_bf16_at_start = if (env.get(.MLX_SERVE_DSV41_PF_COMP_BF16)) |v| try std.heap.page_allocator.dupe(u8, std.mem.span(v)) else null;
+    env.set(.MLX_SERVE_DSV41_PF_COMP_BF16, "0");
+    _ = cedEnabled();
+    fusion.ps().mxfp8_qmm = true;
+    sync_rounds.store(3, .monotonic);
+}
+
+test "sharded: dsv41 test world: the next test starts from the process's levers, an unlatched CED read, the fuse latch at rest and zero sync rounds" {
+    const now = env.get(.MLX_SERVE_DSV41_PF_COMP_BF16);
+    if (world_comp_bf16_at_start) |w| try testing.expectEqualStrings(w, std.mem.span(now.?)) else try testing.expect(now == null);
+    try testing.expect(ced_env == null);
+    try testing.expect(!fusion.ps().mxfp8_qmm);
+    try testing.expectEqual(@as(u64, 0), sync_rounds.load(.monotonic));
 }

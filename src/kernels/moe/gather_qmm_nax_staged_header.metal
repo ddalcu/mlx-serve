@@ -49,29 +49,32 @@ METAL_FUNC void scat_store(
 #define GQMM_SCAT_PASS
 #endif
 
-// BM rows of one expert over WM x WN simdgroups; each simdgroup holds BM / WM rows by kBN / WN weight rows. Every
-// thread loads the kBN x 64 weight tile (kVPT values of one weight row each).
-template <int BM, int WM, int WN>
+// BM rows of one expert by BN weight rows over WM x WN simdgroups; each simdgroup holds BM / WM rows by BN / WN weight
+// rows. Every thread loads its share of the BN x BK weight tile (kVPT values of one weight row each).
+template <int BM, int WM, int WN, int BN = kBN, int BK = 64>
 struct GeoS {
   STEEL_CONST int kBM = BM;
-  STEEL_CONST int kBK = 64;
+  STEEL_CONST int kBN = BN;
+  STEEL_CONST int kBK = BK;
+  STEEL_CONST int kKS = BK / 16;
   STEEL_CONST int kWM = WM;
   STEEL_CONST int kWN = WN;
   STEEL_CONST int kSM = BM / WM;
-  STEEL_CONST int kSN = kBN / WN;
+  STEEL_CONST int kSN = BN / WN;
   STEEL_CONST int kThreads = WM * WN * 32;
   STEEL_CONST int kLT = kThreads;
-  STEEL_CONST int kVPT = kBN * kBK / kLT;
-  STEEL_CONST int kTPR = kBK / kVPT;
+  STEEL_CONST int kVPT = BN * BK / kLT;
+  STEEL_CONST int kTPR = BK / kVPT;
   static_assert((kThreads & (kThreads - 1)) == 0 && kThreads >= 64 && kThreads <= 512, "64..512 loader threads, a power of two");
   static_assert(BM % WM == 0 && kSM % 16 == 0 && kSN % 32 == 0, "whole 16-row fragments, column pairs");
+  static_assert(BK % 16 == 0 && kVPT >= 8 && kTPR * kVPT == BK, "whole k16 blocks, whole packed words a loader thread");
 };
 
-// The activation fragments of one 64-deep step: a[s][i][h] holds the 4 values of k16 block s a lane feeds row
+// The activation fragments of one KS x 16-deep step: a[s][i][h] holds the 4 values of k16 block s a lane feeds row
 // fragment i's half h. Fragments without rows of the tile are not read.
-template <typename T, short TM>
+template <typename T, short TM, short KS>
 METAL_FUNC void load_a_staged(
-    thread vec<T, 4> (&a)[4][TM][2],
+    thread vec<T, 4> (&a)[KS][TM][2],
     const device T* x,
     const thread uint (&off)[TM][2],
     const int k,
@@ -82,7 +85,7 @@ METAL_FUNC void load_a_staged(
       STEEL_PRAGMA_UNROLL
       for (short h = 0; h < 2; h++) {
         STEEL_PRAGMA_UNROLL
-        for (short s = 0; s < 4; s++) {
+        for (short s = 0; s < KS; s++) {
           a[s][i][h] = *(const device vec<T, 4>*)(x + off[i][h] + k + s * 16);
         }
       }
@@ -119,7 +122,8 @@ METAL_FUNC void gather_staged(
   constexpr bool kPair = EPI != 0;
   constexpr int BK = G::kBK;
   constexpr int BKP = BK + 16 / sizeof(WT);
-  constexpr int kTile = kBN * BKP;
+  constexpr int kTile = G::kBN * BKP;
+  constexpr int KS = G::kKS;
   constexpr int SM = G::kSM;
   constexpr int SN = G::kSN;
   constexpr short TM = SM / 16;
@@ -128,7 +132,7 @@ METAL_FUNC void gather_staged(
   constexpr int K_w = KD * Q::kBits / 8;
   constexpr int K_g = KD / Q::kGroup;
   constexpr int half_n = NW / 2;
-  static_assert(KD % BK == 0 && NW % kBN == 0, "whole 64-deep steps over whole 64-column tiles");
+  static_assert(KD % BK == 0 && NW % G::kBN == 0, "whole BK-deep steps over whole BN-column tiles");
   const int row_start = int(desc.x);
   const uint32_t expert = desc.y;
   const int tile_rows = int(desc.z);
@@ -158,10 +162,10 @@ METAL_FUNC void gather_staged(
 
   NAXTile<float, TM, TN> D;
   D.clear();
-  vec<T, 4> a_cur[4][TM][2];
+  vec<T, 4> a_cur[KS][TM][2];
   loader.fetch(0);
   loader.store(Ws);
-  load_a_staged<T, TM>(a_cur, x, a_off, 0, m_frags);
+  load_a_staged<T, TM, KS>(a_cur, x, a_off, 0, m_frags);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const threadgroup WT* wsg = Ws + (tn + sc.y) * BKP + sc.x;
 
@@ -170,9 +174,9 @@ METAL_FUNC void gather_staged(
     if (more) {
       loader.fetch(kb + 1);
     }
-    vec<T, 4> a_next[4][TM][2];
+    vec<T, 4> a_next[KS][TM][2];
     if (more) {
-      load_a_staged<T, TM>(a_next, x, a_off, (kb + 1) * BK, m_frags);
+      load_a_staged<T, TM, KS>(a_next, x, a_off, (kb + 1) * BK, m_frags);
     }
     if (m_frags > 0) {
       const threadgroup WT* ws = wsg + (kb & 1) * kTile;
@@ -218,7 +222,7 @@ METAL_FUNC void gather_staged(
     }
     if (more) {
       STEEL_PRAGMA_UNROLL
-      for (short s = 0; s < 4; s++) {
+      for (short s = 0; s < KS; s++) {
         STEEL_PRAGMA_UNROLL
         for (short i = 0; i < TM; i++) {
           a_cur[s][i][0] = a_next[s][i][0];
@@ -293,8 +297,9 @@ METAL_FUNC void gather_staged_tg(
   constexpr int half_n = NW / 2;
   // Each thread's 8-value chunks of the BM x 64 activation tile.
   constexpr int kAL = G::kBM * (BK / 8) / G::kThreads;
-  static_assert(KD % BK == 0 && NW % kBN == 0, "whole 64-deep steps over whole 64-column tiles");
+  static_assert(KD % BK == 0 && NW % G::kBN == 0, "whole BK-deep steps over whole BN-column tiles");
   static_assert(kAL >= 1 && kAL * G::kThreads == G::kBM * (BK / 8), "whole activation chunks per thread");
+  static_assert(BK == 64, "the activation chunks are 8 a 64-deep row");
   const int row_start = int(desc.x);
   const uint32_t expert = desc.y;
   const int tile_rows = int(desc.z);

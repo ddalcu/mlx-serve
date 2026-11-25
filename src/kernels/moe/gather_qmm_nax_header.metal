@@ -646,8 +646,8 @@ METAL_FUNC void gather_db(
 // The row tile and output column of this threadgroup. GX == 0: grid
 // (columns, tiles) as mlx lays it out. GX > 0: tile t on grid x t % GX and
 // (t / GX, column) on y, so all threadgroups of a row tile share one x
-// coordinate and a tile's columns run GX threadgroups apart.
-template <int GX>
+// coordinate and a tile's columns run GX threadgroups apart. BN: the columns a threadgroup holds.
+template <int GX, int BN = kBN>
 METAL_FUNC bool tile_of(
     const device uint32_t* tiles,
     const uint tile_count,
@@ -658,7 +658,7 @@ METAL_FUNC bool tile_of(
   uint t;
   uint c;
   if constexpr (GX > 0) {
-    const uint n_cols = uint((N + kBN - 1) / kBN);
+    const uint n_cols = uint((N + BN - 1) / BN);
     t = (tid.y / n_cols) * GX + tid.x;
     c = tid.y % n_cols;
   } else {
@@ -669,7 +669,7 @@ METAL_FUNC bool tile_of(
     return false;
   }
   desc = *((const device uint4*)tiles + t);
-  y_col = int(c) * kBN;
+  y_col = int(c) * BN;
   return true;
 }
 

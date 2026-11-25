@@ -749,7 +749,7 @@ test "dsv41 mxfp4 view: a bank with one span or one global off a power of two st
             try testing.expect(view.w.get(try globalName(&nb, li, p)) != null);
         }
     }
-    // Each layer alone on one input, the view's mixed formats against the NVFP4 load at the defaults (MOE_PAIR_SCALED
+    // Each layer alone on one input, the view's mixed formats against the NVFP4 load at the defaults (MOE_PAIR_FP4
     // on): the prompt's MoE and decode's at 1 and 2 rows. One layer's routes are the same in both, so its reordered
     // scale sums stay at their own size; chained, top-k picks amplify them.
     var worst: f32 = 0;

@@ -8,6 +8,7 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
+const world = @import("../../../sdk/testing/world.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const mpair = @import("moe_pair.zig");
 const pfroute = @import("pf_route.zig");
@@ -186,8 +187,8 @@ fn actOf(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.Experts, 
     return mpair.act(sc, m, e, try sc.reshape(x, &.{ @intCast(L), 1, @intCast(hidden) }), p.rows, p.sidx, p.w);
 }
 
-/// `moePrefill`'s activation on the split path (`MLX_SERVE_DSV41_MOE_PAIR_SCALED=0`): the fused bank's sorted gather,
-/// each half times its expert's scale (`expertScaled`, both rounded), then moe_act.
+/// `moePrefill`'s activation on the split path (`MLX_SERVE_DSV41_MOE_PAIR_FP4=0`): the fused bank's sorted gather,
+/// each half times its expert's scale where the bank has them (NVFP4: `expertScaled`, both rounded), then moe_act.
 fn splitAct(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.Experts, x3: A, p: Pairs) !A {
     const gu = &e.gu.?;
     const n = mlx.getShape(p.sidx)[0];
@@ -196,7 +197,10 @@ fn splitAct(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.Expert
     const ni = @divExact(mlx.getShape(y)[2], 2);
     const nu: usize = @intCast(ni);
     var halves: [2]A = undefined;
-    for (&halves, 0..) |*hf, i| hf.* = try sc.mul(try sc.slice(y, -1, i * nu, (i + 1) * nu), try sc.reshape(try sc.take(e.scale[i].?, p.sidx, 0), &.{ n, 1, 1 }));
+    for (&halves, 0..) |*hf, i| {
+        const half = try sc.slice(y, -1, i * nu, (i + 1) * nu);
+        hf.* = if (e.scale[i]) |s| try sc.mul(half, try sc.reshape(try sc.take(s, p.sidx, 0), &.{ n, 1, 1 })) else half;
+    }
     const lim = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.dsv4_swiglu_limit}, &[_]c_int{1}, 1, .float32));
     const yy = try sc.reshape(try sc.concat(&halves, -1), &.{ n, 2 * ni });
     return dsv41.flatKernel(sc, m.moe_act_kernel, &.{ yy, p.w, lim }, &.{ n, 1, ni }, .bfloat16, @intCast(n * ni), &.{.{ .name = "N", .v = ni }});
@@ -262,12 +266,12 @@ fn rolled(sc: *dsv41.Scope, wts: A) !A {
     return sc.concat(&.{ try sc.slice(wts, 1, 1, top_k), try sc.slice(wts, 1, 0, 1) }, 1);
 }
 
-test "dsv41 wide tol: the paired NVFP4 gate+up (per-expert scales) with moe_act in its epilogue is the split path's MoE within 1% at the release widths, prompt row counts to 8192, and an MXFP4 bank stays on the split path; a weight on the wrong expert or swapped scales fail" {
+test "dsv41 wide tol: the paired fp4 gate+up with moe_act in its epilogue is the split path's MoE within 1% at the release widths, prompt row counts to 8192, NVFP4 (per-expert scales) and MXFP4 (none); a weight on the wrong expert or swapped scales fail" {
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
     // The release's 384 experts under `-Dslow-tests` (7 GB of banks); else 48, whose rows an expert reach every plan.
     const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
-    const unset_scaled = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "0");
+    const unset_scaled = env.override(.MLX_SERVE_DSV41_MOE_PAIR_FP4, "0");
     defer unset_scaled.restore();
     // Every format and row count runs; each out of tolerance is reported.
     var ok = true;
@@ -292,19 +296,12 @@ test "dsv41 wide tol: the paired NVFP4 gate+up (per-expert scales) with moe_act 
             var csc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
             defer csc.deinit();
             const c = try call(&csc, L, @intCast(experts), 0x1000 + ci, L == 500);
-            // An MXFP4 bank (no per-expert scales) has no paired arm: the split path serves it at either setting.
-            if (!nv) {
-                const on = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
-                defer on.restore();
-                try testing.expect(try actOf(&csc, &m, &ly.experts, c.x, c.idx, c.wts) == null);
-                continue;
-            }
             // No shared expert, so the routed sum is all the output holds.
             const sh = try csc.zeros(&.{ @intCast(L), @intCast(hidden) }, .bfloat16);
             const want = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, sh);
-            // MOE_PAIR_SCALED=0 leaves the bank on the split path.
+            // MOE_PAIR_FP4=0 leaves the bank on the split path.
             try testing.expect(try actOf(&csc, &m, &ly.experts, c.x, c.idx, c.wts) == null);
-            const sw = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
+            const sw = env.override(.MLX_SERVE_DSV41_MOE_PAIR_FP4, "1");
             defer sw.restore();
             // Served: the paired kernel takes this call.
             try testing.expect(try actOf(&csc, &m, &ly.experts, c.x, c.idx, c.wts) != null);
@@ -331,9 +328,16 @@ test "dsv41 wide tol: the paired NVFP4 gate+up (per-expert scales) with moe_act 
     try testing.expect(ok);
 }
 
-test "dsv41 wide tol: MLX_SERVE_DSV41_MOE_PAIR_SCALED's paired NVFP4 gate+up with moe_act in its epilogue is a reorder of the split path's activation (=0): each differing word within one bf16 step of its row's largest value, under 1% of the words differing, float64 l2 within 1.05x of =0's, at the release widths, prompt rows to 8192, each arm's activation its moePrefill's; the gate and up scales swapped fail" {
+test "dsv41 wide tol: MLX_SERVE_DSV41_MOE_PAIR_FP4's paired fp4 gate+up with moe_act in its epilogue is a reorder of the split path's activation (=0), NVFP4 with per-expert scales and MXFP4 without: each differing word within one bf16 step of its row's largest value, under 1% of the words differing, float64 l2 within 1.05x of =0's, at the release widths, prompt rows to 8192, each arm's activation its moePrefill's; the gate and up scales swapped (NVFP4) or each pair's weight on the next pair (MXFP4) fail" {
     if (skip()) return error.SkipZigTest;
     mlx.installErrorHandler();
+    try pairReorder(true);
+    try pairReorder(false);
+}
+
+/// The reorder bounds of `MOE_PAIR_FP4` on an NVFP4 bank with per-expert scales (`nv`) or an MXFP4 bank without.
+fn pairReorder(comptime nv: bool) !void {
+    const fmt = if (nv) "NVFP4" else "MXFP4";
     const gpa = testing.allocator;
     const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
     var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
@@ -347,11 +351,18 @@ test "dsv41 wide tol: MLX_SERVE_DSV41_MOE_PAIR_SCALED's paired NVFP4 gate+up wit
     m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
     defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
     var ly: dsv41.Layer = undefined;
-    ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .gu = try fp4Bank(&sc, 0x6A7E, experts, 2 * inter, hidden, true), .down = try fp4Bank(&sc, 0xD0E1, experts, hidden, inter, true) };
-    for (&ly.experts.scale, 0..) |*v, i| v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x5CA1E + i);
+    ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .gu = try fp4Bank(&sc, 0x6A7E, experts, 2 * inter, hidden, nv), .down = try fp4Bank(&sc, 0xD0E1, experts, hidden, inter, nv) };
+    if (nv) for (&ly.experts.scale, 0..) |*v, i| {
+        v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x5CA1E + i);
+    };
     const gu = &ly.experts.gu.?;
+    // The float64 reference's per-expert scales: the bank's, or 1 (MXFP4 has none).
     var es: [2][]f32 = undefined;
-    for (&es, 0..) |*v, i| v.* = try dsv41.hostF32(ly.experts.scale[i].?);
+    for (&es, 0..) |*v, i| v.* = if (nv) try dsv41.hostF32(ly.experts.scale[i].?) else blk: {
+        const ones = try gpa.alloc(f32, @intCast(experts));
+        @memset(ones, 1);
+        break :blk ones;
+    };
     defer for (es) |v| gpa.free(v);
     // The float64 check's 256 gate columns (every ninth) and their up columns.
     const NC = 256;
@@ -371,19 +382,25 @@ test "dsv41 wide tol: MLX_SERVE_DSV41_MOE_PAIR_SCALED's paired NVFP4 gate+up wit
         const p = try pairsOf(&csc, c.idx, c.wts);
         const x3 = try csc.reshape(c.x, &.{ @intCast(L), 1, @intCast(hidden) });
         const paired = blk: {
-            const on = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, null);
+            const on = env.override(.MLX_SERVE_DSV41_MOE_PAIR_FP4, null);
             defer on.restore();
             break :blk (try mpair.act(&csc, &m, &ly.experts, x3, p.rows, p.sidx, p.w)) orelse return error.PairDeclined;
         };
         const split = try splitAct(&csc, &m, &ly.experts, x3, p);
         // Each arm's activation is its served one: through the down and combine, its moePrefill's words.
         for ([_]?[*:0]const u8{ null, "0" }, [_]A{ paired, split }) |v, a| {
-            const o = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, v);
+            const o = env.override(.MLX_SERVE_DSV41_MOE_PAIR_FP4, v);
             defer o.restore();
             try testing.expect(try sameWords(try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, sh), try moeFromAct(&csc, &ly, a, p, sh)));
         }
-        // Planted: the gate's per-expert scale on up and up's on the gate.
+        // Planted: the gate's per-expert scale on up and up's on the gate (NVFP4), or each sorted pair's routing weight
+        // on the next pair (MXFP4, which has no scales to swap).
         const bad = blk: {
+            if (!nv) {
+                const nw = mlx.getShape(p.w)[0];
+                const w_next = try csc.concat(&.{ try csc.slice(p.w, 0, 1, @intCast(nw)), try csc.slice(p.w, 0, 0, 1) }, 0);
+                break :blk (try mpair.act(&csc, &m, &ly.experts, x3, p.rows, p.sidx, w_next)) orelse return error.PairDeclined;
+            }
             const s = ly.experts.scale;
             ly.experts.scale = .{ s[1], s[0], s[2] };
             defer ly.experts.scale = s;
@@ -529,14 +546,14 @@ test "dsv41 wide tol: MLX_SERVE_DSV41_MOE_PAIR_SCALED's paired NVFP4 gate+up wit
                 if (@abs(@as(f64, a) - t) > @abs(@as(f64, dg[0][big[0]]) - dref[big[0]])) big[0] = q;
                 if (@abs(@as(f64, b) - t) > @abs(@as(f64, dg[1][big[1]]) - dref[big[1]])) big[1] = q;
             }
-            for (big, 0..) |q, w| std.debug.print("[moe-pair-diag] rows {d} worst {s}: float64 {e:.6}, MOE_PAIR_SCALED {e:.6}, =0 {e:.6}\n", .{ L, if (w == 0) "MOE_PAIR_SCALED" else "=0", dref[q], dg[0][q], dg[1][q] });
+            for (big, 0..) |q, w| std.debug.print("[moe-pair-diag] rows {d} worst {s}: float64 {e:.6}, MOE_PAIR_FP4 {e:.6}, =0 {e:.6}\n", .{ L, if (w == 0) "MOE_PAIR_FP4" else "=0", dref[q], dg[0][q], dg[1][q] });
         }
-        std.debug.print("[moe-pair-f64] NVFP4 rows {d}: {d} of {d} activation words differ between MOE_PAIR_SCALED and =0; from float64 at {d} pairs x {d} columns: MOE_PAIR_SCALED l2 {e:.6} max {e:.6}, =0 (split) l2 {e:.6} max {e:.6}, planted (scales swapped) l2 {e:.3} max {e:.3}; at {d} of the differing words: MOE_PAIR_SCALED l2 {e:.6} max {e:.6}, =0 l2 {e:.6} max {e:.6}; nearer at {d} vs {d} of them\n", .{ L, differ, n * inter, P, NC, ep.l2, ep.max, es_.l2, es_.max, eb.l2, eb.max, nd, dp.l2, dp.max, ds.l2, ds.max, nearer[0], nearer[1] });
+        std.debug.print("[moe-pair-f64] " ++ fmt ++ " rows {d}: {d} of {d} activation words differ between MOE_PAIR_FP4 and =0; from float64 at {d} pairs x {d} columns: MOE_PAIR_FP4 l2 {e:.6} max {e:.6}, =0 (split) l2 {e:.6} max {e:.6}, planted ({s}) l2 {e:.3} max {e:.3}; at {d} of the differing words: MOE_PAIR_FP4 l2 {e:.6} max {e:.6}, =0 l2 {e:.6} max {e:.6}; nearer at {d} vs {d} of them\n", .{ L, differ, n * inter, P, NC, ep.l2, ep.max, es_.l2, es_.max, if (nv) @as([]const u8, "scales swapped") else "weights on the next pair", eb.l2, eb.max, nd, dp.l2, dp.max, ds.l2, ds.max, nearer[0], nearer[1] });
         const total = n * inter;
         const st = try rowSteps(&csc, paired, split);
         const differ_b = try wordsDiffer(&csc, bad, split);
         const st_b = try rowSteps(&csc, bad, split);
-        std.debug.print("[moe-pair-f64] NVFP4 rows {d}: {d:.4}% of words differ from =0 (planted {d:.2}%); the largest difference {d:.3} bf16 steps at its row's largest value (planted {d:.3}); the largest word step {d} (planted {d}); {d} words more than one bf16 step apart, their largest =0 word {e:.3} of its row's largest; float64 l2 ratio to =0 {d:.4} over the sample (planted {d:.1}), {d:.3} over the differing words\n", .{ L, 100 * @as(f64, @floatFromInt(differ)) / @as(f64, @floatFromInt(total)), 100 * @as(f64, @floatFromInt(differ_b)) / @as(f64, @floatFromInt(total)), st.worst, st_b.worst, st.max, st_b.max, st.far, st.far_mag, ep.l2 / es_.l2, eb.l2 / es_.l2, if (ds.l2 > 0) dp.l2 / ds.l2 else 0 });
+        std.debug.print("[moe-pair-f64] " ++ fmt ++ " rows {d}: {d:.4}% of words differ from =0 (planted {d:.2}%); the largest difference {d:.3} bf16 steps at its row's largest value (planted {d:.3}); the largest word step {d} (planted {d}); {d} words more than one bf16 step apart, their largest =0 word {e:.3} of its row's largest; float64 l2 ratio to =0 {d:.4} over the sample (planted {d:.1}), {d:.3} over the differing words\n", .{ L, 100 * @as(f64, @floatFromInt(differ)) / @as(f64, @floatFromInt(total)), 100 * @as(f64, @floatFromInt(differ_b)) / @as(f64, @floatFromInt(total)), st.worst, st_b.worst, st.max, st_b.max, st.far, st.far_mag, ep.l2 / es_.l2, eb.l2 / es_.l2, if (ds.l2 > 0) dp.l2 / ds.l2 else 0 });
         const in_bound = struct {
             fn of(sv: Steps, nw: usize, na: usize, ev: F64Err, bv: F64Err) bool {
                 return sv.worst <= 1 and nw * 100 < na and ev.l2 <= 1.05 * bv.l2;
@@ -823,9 +840,7 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_MOE_EPI is the argsort pat
     const own_pack = env.override(.MLX_SERVE_DSV41_PF_ROUTE_PACK, "0");
     defer own_pack.restore();
     inline for (.{ false, true }) |nv| inline for (.{ false, true }) |paired| {
-        // An MXFP4 bank has no paired arm (it takes the split path), so it runs split only.
-        if (!nv and paired) continue;
-        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, if (paired) "1" else "0");
+        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_FP4, if (paired) "1" else "0");
         defer pk.restore();
         var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
         defer sc.deinit();
@@ -878,7 +893,7 @@ test "dsv41 wide: moePrefill under MLX_SERVE_DSV41_PF_FP4_GEMM is today's output
     defer unset.restore();
     // The paired gate/up is NVFP4's alone: an MXFP4 bank takes the split path, which stages no gate/up.
     inline for (.{true}) |nv| {
-        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
+        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_FP4, "1");
         defer pk.restore();
         var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
         defer sc.deinit();
@@ -932,7 +947,7 @@ test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_TOKORD: the staged down's rows at thei
     defer off.restore();
     inline for (.{ true, false }) |nv| {
         // The NVFP4 bank's gate/up on the paired kernel; an MXFP4 bank's on the split path.
-        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
+        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_FP4, "1");
         defer pk.restore();
         var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
         defer sc.deinit();
@@ -993,6 +1008,56 @@ test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_TOKORD: the staged down's rows at thei
             const bad = try dsv41.moePrefillParts(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
             try testing.expect(!try sameWords(try csc.take(want.dn, want.inv, 0), bad.dn));
             try testing.expect(!try sameWords(want_y, try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh)));
+        }
+    }
+}
+
+test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_BK32: the down on the 32-deep tile gives moePrefill's words at every prompt width, NVFP4 with per-expert scales and MXFP4; the calls of 96 rows an expert and more only; each down row handed the next token fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
+    const off = env.override(.MLX_SERVE_DSV41_PF_DOWN_BK32, "0");
+    defer off.restore();
+    inline for (.{ true, false }) |nv| {
+        // The NVFP4 bank's gate/up on the paired kernel; an MXFP4 bank's on the split path. The staged down serves both.
+        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_FP4, "1");
+        defer pk.restore();
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        var m: dsv41.Dsv41Model = undefined;
+        m.cfg = .{};
+        m.cfg.dsv4_swiglu_limit = 10;
+        m.act = .bfloat16;
+        m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
+        m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
+        var ly: dsv41.Layer = undefined;
+        ly.gate_w = try sc.zeros(&.{ experts, 8 }, .bfloat16);
+        ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .gu = try fp4Bank(&sc, 0x6A7E, experts, 2 * inter, hidden, nv), .down = try fp4Bank(&sc, 0xD0E1, experts, hidden, inter, nv) };
+        if (nv) for (&ly.experts.scale, 0..) |*v, i| {
+            v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x5CA1E + i);
+        };
+        for ([_]usize{ 40, 777, 4097, 8192 }, 0..) |L, ci| {
+            var csc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+            defer csc.deinit();
+            const c = try call(&csc, L, @intCast(experts), 0x3400 + ci, false);
+            const wide = @divTrunc(@as(c_int, @intCast(L * top_k)), experts) >= 96;
+            const want = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const on = env.override(.MLX_SERVE_DSV41_PF_DOWN_BK32, "1");
+            defer on.restore();
+            const before = fp4gemm.bk32_launches.load(.monotonic);
+            const got = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const served = fp4gemm.bk32_launches.load(.monotonic) - before;
+            const eq = try sameWords(want, got);
+            std.debug.print("[down-bk32] {s} rows {d}: launches {d}, moePrefill {}\n", .{ if (nv) "NVFP4" else "MXFP4", L, served, eq });
+            try testing.expect(eq);
+            // The down, at the wide calls only.
+            try testing.expectEqual(@as(u32, if (wide) 1 else 0), served);
+            if (!wide) continue;
+            fp4gemm.bk32_plant = true;
+            defer fp4gemm.bk32_plant = false;
+            try testing.expect(!try sameWords(want, try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh)));
         }
     }
 }
@@ -1465,7 +1530,7 @@ test "dsv41 wide tol: MLX_SERVE_DSV41_PF_HC_V2's three passes (the attention sid
 
 // ── a release-shape pair worker's prefill ──
 
-const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR_SCALED, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2, .MLX_SERVE_DSV41_PF_MOE_EPI, .MLX_SERVE_DSV41_PF_IDX_NAX };
+const switches = .{ .MLX_SERVE_DSV41_MOE_PAIR_FP4, .MLX_SERVE_DSV41_HC_EXPAND_NORM, .MLX_SERVE_DSV41_WOA_JOIN, .MLX_SERVE_DSV41_MOE_TAIL, .MLX_SERVE_DSV41_PF_HC_V2, .MLX_SERVE_DSV41_PF_MOE_EPI, .MLX_SERVE_DSV41_PF_IDX_NAX };
 
 /// The flash kernel on `fx`'s model as its load sets it (`plugin.configureLoad`): the gather's kernels rebuilt with
 /// MLX_SERVE_DSV41_FLASH_ATTN on (and MLX_SERVE_DSV41_FLASH_TRIM, MLX_SERVE_DSV41_FLASH_PSUM as asked) and the ring
@@ -1591,7 +1656,7 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
         defer for (want) |o| {
             _ = mlx.mlx_array_free(o);
         };
-        // The layer's loaded NVFP4 experts take the paired kernel under MOE_PAIR_SCALED; MXFP4 experts decline it.
+        // The layer's loaded fp4 experts, NVFP4 or MXFP4, take the paired kernel under MOE_PAIR_FP4.
         {
             var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
             defer sc.deinit();
@@ -1601,14 +1666,14 @@ test "dsv41 wide tol: each switch, and all of them, keep a release-shape pair wo
                 std.debug.print("wide layer {s}: the route failed: {s}\n", .{ label, @errorName(e) });
                 return e;
             };
-            env.set(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
-            defer env.set(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "0");
+            env.set(.MLX_SERVE_DSV41_MOE_PAIR_FP4, "1");
+            defer env.set(.MLX_SERVE_DSV41_MOE_PAIR_FP4, "0");
             const served = (actOf(&sc, fx.m, &ly.experts, h, r.idx, r.wts) catch |e| {
                 std.debug.print("wide layer {s}: the paired kernel failed: {s}\n", .{ label, @errorName(e) });
                 return e;
             }) != null;
-            if (served != nv) std.debug.print("wide layer {s}: the paired kernel {s} the loaded experts (gu {}, mode {s})\n", .{ label, if (served) "takes" else "declines", ly.experts.gu != null, if (ly.experts.gu) |g| @tagName(g.qp.mode) else "-" });
-            try testing.expectEqual(nv, served);
+            if (!served) std.debug.print("wide layer {s}: the paired kernel {s} the loaded experts (gu {}, mode {s})\n", .{ label, if (served) "takes" else "declines", ly.experts.gu != null, if (ly.experts.gu) |g| @tagName(g.qp.mode) else "-" });
+            try testing.expect(served);
         }
         if (!try closeAs(fx, x, pre, want, &want_tap, label, "the stock path again")) ok = false;
         inline for (switches) |n| {
@@ -2271,7 +2336,7 @@ test "dsv41 wide tol: FLASH_ATTN's heads at a pick count not a multiple of 64 (a
     m.attn_softmax_kernel = try dsv41.buildKernel("dsv41_attn_softmax", &dsv41.ATTN_SOFTMAX_INS, &.{ "pw", "pc" }, dsv41.ATTN_SOFTMAX_SOURCE, "");
     defer _ = mlx.mlx_fast_metal_kernel_free(m.attn_softmax_kernel);
     // The f32 chain's GEMMs are TF32 on NAX unless MLX_ENABLE_TF32=0 (read at the process's first matmul): M5's =0.
-    const tf32 = device.tf32Matmul();
+    const tf32 = world.tf32();
     var ok = true;
     for (odd_spans ++ served_spans, 0..) |c, ci_| {
         var s = try Span.init(&sc, c, 80 + 10 * ci_);
@@ -2334,7 +2399,7 @@ test "dsv41 wide tol: the f32 chain where attnCore's lossless cores end on NAX (
     }.of;
     const Arm = struct { name: []const u8, nh: usize, in: mlx.mlx_dtype };
     const arms = [_]Arm{ .{ .name = "tensor split, 32 heads", .nh = 32, .in = .bfloat16 }, .{ .name = "f16 activations", .nh = HEADS, .in = .float16 }, .{ .name = "f32 activations", .nh = HEADS, .in = .float32 } };
-    const tf32 = device.tf32Matmul();
+    const tf32 = world.tf32();
     var ok = true;
     for ([_]SpanCase{ span_cases[0], span_cases[1], odd_spans[0], odd_spans[4], served_spans[0], served_spans[7] }, 0..) |c, ci_| {
         var s = try Span.init(&sc, c, 140 + 10 * ci_);
@@ -2375,7 +2440,7 @@ test "dsv41 wide meas: MLX_SERVE_DSV41_ATTN_F16's f16 core (LOSSY; it serves wit
     attnModel(&m, .bfloat16);
     m.attn_softmax_kernel = try dsv41.buildKernel("dsv41_attn_softmax", &dsv41.ATTN_SOFTMAX_INS, &.{ "pw", "pc" }, dsv41.ATTN_SOFTMAX_SOURCE, "");
     defer _ = mlx.mlx_fast_metal_kernel_free(m.attn_softmax_kernel);
-    const tf32 = device.tf32Matmul();
+    const tf32 = world.tf32();
     for (span_cases ++ odd_spans[0..5].*, 0..) |c, ci_| {
         var s = try Span.init(&sc, c, 40 + 10 * ci_);
         defer s.deinit();
@@ -2727,4 +2792,169 @@ test "dsv41 wide: under MLX_SERVE_DSV41_PF_KEEP_WIDE's reserve a release-shape p
         _ = mlx.mlx_synchronize(mlx.gpuStream());
         try testing.expect(!(try bad));
     }
+}
+
+// ── MLX_SERVE_DSV41_PF_COMP_PASS and MLX_SERVE_DSV41_PF_IDX_PASS: the compressor and the indexer once over the pass ──
+
+test "dsv41 wide: MLX_SERVE_DSV41_PF_COMP_PASS keeps a release-shape KV source and index layer's prefill streams and mixes word for word (layers 8-9, an odd row count's pending row), NVFP4 experts with per-expert scales; the groups' rope a row late fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    const keep = env.override(.MLX_SERVE_DSV41_PF_COMP_PASS, "0");
+    defer keep.restore();
+    const rows = 4999;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 8, .hi = 10, .ctx = 0, .experts_nvfp4 = true, .expert_scales = .all });
+    defer fx.deinit();
+    const x = try fx.stream(rows);
+    defer _ = mlx.mlx_array_free(x);
+    const pre = try fx.cpre(rows);
+    defer _ = mlx.mlx_array_free(pre);
+    const c0 = dsv41.comp_pass_count.load(.monotonic);
+    const want = try prefill(fx, x, pre);
+    defer for (want) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    try testing.expectEqual(c0, dsv41.comp_pass_count.load(.monotonic));
+    env.set(.MLX_SERVE_DSV41_PF_COMP_PASS, "1");
+    const got = try prefill(fx, x, pre);
+    defer for (got) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    const n = dsv41.comp_pass_count.load(.monotonic) - c0;
+    dsv41.comp_pass_plant = true;
+    const bad = try prefill(fx, x, pre);
+    dsv41.comp_pass_plant = false;
+    defer for (bad) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    env.set(.MLX_SERVE_DSV41_PF_COMP_PASS, "0");
+    const same = [_]bool{ try sameWords(want[0], got[0]), try sameWords(want[1], got[1]) };
+    const planted = try sameWords(want[0], bad[0]);
+    std.debug.print("wide layers 8-9 at {d} rows, PF_COMP_PASS: served {d} layers, streams {} mixes {}; planted streams the same {}\n", .{ rows, n, same[0], same[1], planted });
+    try testing.expect(n >= 1 and same[0] and same[1] and !planted);
+}
+
+test "dsv41 wide tol: MLX_SERVE_DSV41_PF_IDX_PASS keeps a release-shape index layer's prefill streams and mixes within the pair worker's tolerance (layers 8-9), and its queries' word-for-word half (the pass's wq_b, rope and fp4 round trip, the head weights per span) gives the same words; the queries' rope a row late fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    const keep = env.override(.MLX_SERVE_DSV41_PF_IDX_PASS, "0");
+    defer keep.restore();
+    const rows = 4999;
+    const label = "8-9 NVFP4 at 4999 rows";
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 8, .hi = 10, .ctx = 0, .experts_nvfp4 = true, .expert_scales = .all });
+    defer fx.deinit();
+    const x = try fx.stream(rows);
+    defer _ = mlx.mlx_array_free(x);
+    const pre = try fx.cpre(rows);
+    defer _ = mlx.mlx_array_free(pre);
+    var want_tap: dsv41.RouteTap = .{ .gpa = gpa };
+    defer freeTap(&want_tap);
+    const c0 = dsv41.idx_pass_count.load(.monotonic);
+    const want = try prefillTapped(fx, x, pre, &want_tap);
+    defer for (want) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    try testing.expectEqual(c0, dsv41.idx_pass_count.load(.monotonic));
+    env.set(.MLX_SERVE_DSV41_PF_IDX_PASS, "1");
+    const ok = try closeAs(fx, x, pre, want, &want_tap, label, "PF_IDX_PASS");
+    const n = dsv41.idx_pass_count.load(.monotonic) - c0;
+    // the head weights from MLX's split GEMM per span, the rest over the pass: the same words as span by span
+    dsv41.idx_pass_mlx_w = true;
+    const exact = try prefill(fx, x, pre);
+    defer for (exact) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    dsv41.idx_pass_mlx_w = false;
+    dsv41.idx_pass_plant = true;
+    const planted = try closeAs(fx, x, pre, want, &want_tap, label, "PF_IDX_PASS planted");
+    dsv41.idx_pass_plant = false;
+    env.set(.MLX_SERVE_DSV41_PF_IDX_PASS, "0");
+    const same = [_]bool{ try sameWords(want[0], exact[0]), try sameWords(want[1], exact[1]) };
+    std.debug.print("wide layers {s}, PF_IDX_PASS: served {d} layers, within tolerance {}; queries over the pass with per-span head weights: streams {} mixes {}; planted within tolerance {}\n", .{ label, n, ok, same[0], same[1], planted });
+    try testing.expect(n >= 1 and ok and same[0] and same[1] and !planted);
+}
+
+test "dsv41 wide tol: PF_IDX_PASS's head weights (kernels/idx_wproj.metal) are no farther from float64 than MLX's GEMM per 256-row span (the served call) in l2 and max over every output, 32 heads x 5,120, bf16 out, 257 to 17,639 rows; a weight row moved fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var ok = true;
+    for ([_]usize{ 257, 4097, 17_639 }, 0..) |rows, ci_| {
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const x = try normal(&sc, &.{ @intCast(rows), 5120 }, .bfloat16, 1, 0x91 + ci_);
+        const w = try normal(&sc, &.{ 32, 5120 }, .bfloat16, 1.0 / @sqrt(5120.0), 0x92 + ci_);
+        const lin: dsv41.Lin = .{ .w = w };
+        // served: MLX's matmul on each 256-row span, as `rowLinear` runs the span's rows
+        var parts: std.ArrayList(A) = .empty;
+        defer parts.deinit(testing.allocator);
+        var lo: usize = 0;
+        while (lo < rows) : (lo += 256) try parts.append(testing.allocator, try lin.apply(&sc, try sc.slice(x, 0, lo, @min(rows, lo + 256))));
+        const served = try sc.concat(parts.items, 0);
+        const got = (try dsv41.idxHeadWeights(&sc, &lin, x)) orelse return error.Declined;
+        const wp = try sc.concat(&.{ try sc.slice(w, 0, 1, 2), try sc.slice(w, 0, 1, 32) }, 0);
+        const bad = (try dsv41.idxHeadWeights(&sc, &.{ .w = wp }, x)) orelse return error.Declined;
+        try dsv41.evalAll(&.{ served, got, bad });
+        const hx = try dsv41.hostF32(x);
+        defer testing.allocator.free(hx);
+        const hw = try dsv41.hostF32(w);
+        defer testing.allocator.free(hw);
+        // every 7th row and the last, all 32 heads, in float64
+        var idx: std.ArrayList(usize) = .empty;
+        defer idx.deinit(testing.allocator);
+        var r: usize = 0;
+        while (r < rows) : (r += 7) try idx.append(testing.allocator, r);
+        try idx.append(testing.allocator, rows - 1);
+        const ref = try testing.allocator.alloc(f64, idx.items.len * 32);
+        defer testing.allocator.free(ref);
+        for (idx.items, 0..) |row, i| for (0..32) |h| {
+            var d: f64 = 0;
+            for (hx[row * 5120 ..][0..5120], hw[h * 5120 ..][0..5120]) |a, b| d += @as(f64, a) * b;
+            ref[i * 32 + h] = d;
+        };
+        var e: [3]F64Err = undefined;
+        var differ: usize = 0;
+        // Where the two bf16 words are equal their errors are equal, so l2 and max over every output compare on the
+        // words that differ: each one's float64 value, both errors.
+        var sq = [2]f64{ 0, 0 };
+        var mx = [2]f64{ 0, 0 };
+        var nearer: usize = 0;
+        for ([_]A{ served, got, bad }, 0..) |o, k| {
+            const ho = try dsv41.hostF32(o);
+            defer testing.allocator.free(ho);
+            const sel = try testing.allocator.alloc(f32, idx.items.len * 32);
+            defer testing.allocator.free(sel);
+            for (idx.items, 0..) |row, i| @memcpy(sel[i * 32 ..][0..32], ho[row * 32 ..][0..32]);
+            e[k] = f64Err(sel, ref);
+        }
+        {
+            const hs = try dsv41.hostF32(served);
+            defer testing.allocator.free(hs);
+            const hg = try dsv41.hostF32(got);
+            defer testing.allocator.free(hg);
+            for (hs, hg, 0..) |a, b, i| if (a != b) {
+                differ += 1;
+                const row = i / 32;
+                const h = i % 32;
+                var d: f64 = 0;
+                for (hx[row * 5120 ..][0..5120], hw[h * 5120 ..][0..5120]) |u, v| d += @as(f64, u) * v;
+                const es = @abs(@as(f64, a) - d);
+                const em = @abs(@as(f64, b) - d);
+                sq[0] += es * es;
+                sq[1] += em * em;
+                mx[0] = @max(mx[0], es);
+                mx[1] = @max(mx[1], em);
+                nearer += @intFromBool(em < es);
+            };
+        }
+        std.debug.print("[idx-wproj] {d} rows: rel l2 / max vs float64 over sampled rows (bf16 out): served per-span GEMM {e:.4}/{e:.4}, idx_wproj {e:.4}/{e:.4}; {d} of {d} words differ, {d} of them nearer float64 in idx_wproj; over them squared error served {e:.6} idx_wproj {e:.6}, worst served {e:.6} idx_wproj {e:.6}; planted {e:.3}/{e:.3}\n", .{ rows, e[0].l2, e[0].max, e[1].l2, e[1].max, differ, rows * 32, nearer, sq[0], sq[1], mx[0], mx[1], e[2].l2, e[2].max });
+        // the worst element over the same words for both: the sampled rows (f64Err's max is over their largest
+        // reference) and every word that differs
+        var rm: f64 = 0;
+        for (ref) |v| rm = @max(rm, @abs(v));
+        const worst = [2]f64{ @max(e[0].max * rm, mx[0]), @max(e[1].max * rm, mx[1]) };
+        std.debug.print("[idx-wproj] {d} rows: worst element over the sampled rows and the differing words: served {e:.6} idx_wproj {e:.6}\n", .{ rows, worst[0], worst[1] });
+        ok = ok and sq[1] <= sq[0] and worst[1] <= worst[0] and e[2].l2 > 10 * e[0].l2;
+    }
+    try testing.expect(ok);
 }

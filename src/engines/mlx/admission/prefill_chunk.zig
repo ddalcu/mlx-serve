@@ -217,7 +217,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
             config.dsv41_pass_rows = rows;
             config.pinned_prefill_chunk = rows;
             @import("../../../plugins/deepseek_v41/prompt/keep_wide.zig").pinned(rows, prefillTransientReserve(config, kv_bits, rows));
-            log.info("[prefill] DeepSeek-V4.1 passes of up to {d} rows, cut near-equal (MLX_SERVE_DSV41_PF_PASS_SIZE; {s}, reserve {d} MB of {d} MB)\n", .{ rows, if (explicitPrefillChunk() > 0) "--prefill-chunk" else "memory-sized", prefillTransientReserve(config, kv_bits, rows) >> 20, cap >> 20 });
+            log.info("[prefill] DeepSeek-V4.1 passes of up to {d} rows, cut near-equal (MLX_SERVE_DSV41_PF_PASS_SIZE; {s}, reserve {d} MB of {d} MB)\n", .{ rows, if (explicitPrefillChunk() > 0) "--prefill-chunk" else if (rows == dsv41_mod.passCeil()) "memory-sized, under MLX_SERVE_DSV41_PF_PASS_CEIL's machine ceiling" else "memory-sized", prefillTransientReserve(config, kv_bits, rows) >> 20, cap >> 20 });
         }
         // Say when the ctx bar is the binding one.
         if (config.longCtxGated() and explicitPrefillChunk() == 0) {
@@ -243,7 +243,8 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
 /// (`prefillTransientReserve`, its one MoE call over every row included) fits `cap`, the share the ladder sizes
 /// against; `ladder`, the ladder's pin, where not even the old 8192-row cap fits. The machine and its memory decide it,
 /// never a prompt. Never past `dsv41_mod.passRowsLimit` (a pass's widest tensor indexable in 32 bits), the explicit
-/// width included.
+/// width included. Under `MLX_SERVE_DSV41_PF_PASS_CEIL`, the memory-sized width is never past this machine's measured
+/// ceiling (`dsv41_mod.passCeil`).
 pub fn dsv41PassRows(config: *const model_mod.ModelConfig, kv_bits: u64, cap: u64, explicit: u32, ladder: u32) u32 {
     const span: u64 = dsv41_mod.SPAN;
     const limit: u64 = dsv41_mod.passRowsLimit(config);
@@ -253,13 +254,20 @@ pub fn dsv41PassRows(config: *const model_mod.ModelConfig, kv_bits: u64, cap: u6
     const ctx: u64 = if (manualContext(config) > 0) manualContext(config) else config.contextCap();
     var lo = floor;
     var hi = @max(@min(ctx, limit) / span, floor);
-    if (prefillTransientReserve(config, kv_bits, hi * span) <= cap) return @intCast(hi * span);
+    const ceil: u64 = dsv41_mod.passCeil();
+    if (prefillTransientReserve(config, kv_bits, hi * span) <= cap) return @intCast(passCeiled(hi * span, ceil));
     // The bill grows with the width: the widest that fits lies in [lo, hi).
     while (hi - lo > 1) {
         const mid = lo + (hi - lo) / 2;
         if (prefillTransientReserve(config, kv_bits, mid * span) <= cap) lo = mid else hi = mid;
     }
-    return @intCast(lo * span);
+    return @intCast(passCeiled(lo * span, ceil));
+}
+
+/// A memory-sized pass under `MLX_SERVE_DSV41_PF_PASS_CEIL`'s machine ceiling (`dsv41_mod.passCeil`; 0: none): the
+/// narrower of the two. The explicit width and the ladder's pin are never ceiled.
+fn passCeiled(rows: u64, ceil: u64) u64 {
+    return if (ceil > 0) @min(rows, ceil) else rows;
 }
 
 /// The width a ladder rung actually forwards at for this prompt.

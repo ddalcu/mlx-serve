@@ -942,6 +942,8 @@ fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, settings_json: abi.St
     out.* = dsv41.residentDiskBytes(gpa, model_dir.slice(), config.of(p), mtp, shards) catch |e| return Verdict.named(.failed, @errorName(e));
     if (mx_view.on()) out.* -|= mx_view.savedBytes(gpa, model_dir.slice(), dsv41.dsparkWanted(config.of(p), null, mtp)) catch |e| return Verdict.named(.failed, @errorName(e));
     out.* += dsv41.draftHeadBytes(config.of(p), dsv41.dsparkWanted(config.of(p), null, mtp), model_dir.slice());
+    // MLX_SERVE_DSV41_PF_INT8's int8 trunk weights.
+    out.* += @import("prompt/pf_int8.zig").residentBytes(config.of(p));
     return .ok;
 }
 

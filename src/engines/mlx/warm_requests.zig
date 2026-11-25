@@ -1,15 +1,17 @@
-//! The requests a model serves itself the first time a build loads it on a machine. A kernel compiles at its first
-//! use, and the variant a forward selects follows the prompt's size class, the cache it lands on and the speculative
-//! mode: the bare forwards of `warmup.zig` reach a fraction of them, and the rest compiled inside the first prompts
-//! someone sent. Metal keeps what it compiled, so later loads owe nothing. By default the model reports ready first
-//! and serves a few short ones while nothing else is asked of the server (`tick`); under `--warmup-full` it serves
-//! them and a ladder of prompt sizes before it reports ready (`run`), which is what a benchmark wants.
+//! The requests a model serves itself on every load. A kernel compiles at its first use, and the variant a forward
+//! selects follows the prompt's size class, the cache it lands on, the speculative mode and every switch, flag,
+//! setting and pack format the load read: the bare forwards of `warmup.zig` reach a fraction of them, and the rest
+//! would compile inside the first prompts someone sends. Metal's shader cache is the one record of what is compiled:
+//! a request whose kernels it holds compiles nothing, so the plan costs only its own forwards on a load that matches an
+//! earlier one, and nothing else is kept to decide whether a load owes it (no marker: a key of the load's inputs is a
+//! copy of the deciders, and it missed them). By default the model reports ready first and serves the width sweep and
+//! a few short requests while nothing else is asked of the server (`tick`); under `--warmup-full` it serves them, a
+//! ladder of prompt sizes and a prompt at its widest pass before it reports ready (`run`), which is what a benchmark
+//! wants. macOS only (`wanted`).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
-const crt = @import("../../sdk/util/crt.zig");
-const round_cost = @import("spec/round_cost.zig");
 const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
@@ -72,10 +74,8 @@ fn forks(base: u32, len: u32) [FORK_GROWTH.len]Request {
         r.* = .{ .base = base, .len = len + grow, .own = drop + grow, .gen = if (i == 0) GEN else 1, .sampled = i == 0 };
     return out;
 }
-/// A rung starts only inside this much of the ladder's time: a slow machine stops short of the widest prompts.
-const LADDER_BUDGET_NS: u64 = 10 * std.time.ns_per_s;
-
-/// Longer than any of them takes with every kernel still to compile; past it the load goes on without the rest.
+/// Longer than any one request takes with every kernel still to compile; past it the load goes on without the rest.
+/// The plan has no time budget of its own: a slower or hotter machine serves every rung, the widest last.
 const LIMIT_NS: u64 = 120 * std.time.ns_per_s;
 /// How long a real request waits behind an idle warm request before the warm-up gives way for good.
 const WAITED_ON_NS: u64 = 15 * std.time.ns_per_s;
@@ -97,111 +97,70 @@ fn fill(buf: []u32, vocab: u32, r: Request) []const u32 {
     return ids;
 }
 
-/// What a load's kernels depend on beside the build: the pack, and what speculates on it.
-pub const Subject = struct {
-    model_path: []const u8,
-    model_type: []const u8,
-    /// The widest block a speculative round verifies (`warmup.zig`).
-    verify_rows: u32,
-    kv_bits: u32,
-};
-
-extern "c" fn confstr(name: c_int, buf: ?[*]u8, len: usize) usize;
-const CS_DARWIN_USER_CACHE_DIR: c_int = 65538;
-
-/// The per-user cache directory, where Metal keeps its compiled shaders: a marker there lives as long as they do.
-/// macOS only: a phone's first load cannot afford the ladder, and no other backend keeps what it compiles here.
-fn cacheDir(buf: []u8) ?[]const u8 {
-    if (comptime builtin.os.tag != .macos) return null;
-    const n = confstr(CS_DARWIN_USER_CACHE_DIR, buf.ptr, buf.len);
-    return if (n > 1 and n <= buf.len) buf[0 .. n - 1] else null;
+/// Whether this load serves warm requests: on macOS, where Metal compiles a kernel at its first use and keeps it in the
+/// per-user shader cache. A phone's first load cannot afford the ladder, and no other backend compiles this way.
+pub fn wanted() bool {
+    return comptime builtin.os.tag == .macos;
 }
 
-/// The marker of one build having served one plan to one subject under one OS build, in `dir` (which ends in a
-/// slash).
-pub fn markerPath(buf: []u8, dir: []const u8, build: []const u8, os: []const u8, s: Subject, kind: Kind) ?[:0]const u8 {
-    var h = std.hash.Fnv1a_64.init();
-    for ([_][]const u8{ build, os, s.model_path, s.model_type }) |part| {
-        h.update(part);
-        h.update("\x00");
-    }
-    h.update(std.mem.asBytes(&[_]u32{ s.verify_rows, s.kv_bits, FULL.len, LONGEST }));
-    return std.fmt.bufPrintSentinel(buf, "{s}mlx-serve-warm/{x:0>16}.{s}", .{ dir, h.final(), @tagName(kind) }, 0) catch null;
+/// The prompt at the load's widest pass (`ModelConfig.pinned_prefill_chunk`, the width the load pinned from memory, or
+/// the explicit `--prefill-chunk`), one row short of the context `cap` leaves (0 = no limit): its pass's kernels are
+/// built for that width, and no ladder rung reaches it on a load that pins wider than the ladder. Null where the pin is
+/// no wider than the ladder's widest prompt.
+fn widestRung(pinned: u32, cap: u32) ?Request {
+    const len = if (cap != 0) @min(pinned, cap -| 1) else pinned;
+    if (len <= LONGEST) return null;
+    return .{ .base = len, .len = len, .gen = 1 };
 }
 
-/// The marker to write once this load has served the warm requests of `kind`, or null when it owes none: this build
-/// already served them for this subject on this machine, or nothing here compiles Metal kernels.
-pub fn owed(buf: []u8, kind: Kind, s: Subject) ?[:0]const u8 {
-    if (comptime builtin.os.tag != .macos) return null;
-    var dir_buf: [1024]u8 = undefined;
-    const dir = cacheDir(&dir_buf) orelse return null;
-    var os_buf: [64]u8 = undefined;
-    var os_len: usize = os_buf.len;
-    const os = if (std.c.sysctlbyname("kern.osversion", &os_buf, &os_len, null, 0) == 0) os_buf[0..os_len] else "";
-    var exe_buf: [4096]u8 = undefined;
-    var exe_len: u32 = exe_buf.len;
-    const exe = if (std.c._NSGetExecutablePath(&exe_buf, &exe_len) == 0) std.mem.sliceTo(&exe_buf, 0) else "";
-    // A build is its id and where it runs from: a copy under another bundle id has another shader cache.
-    var build_buf: [4096 + 64]u8 = undefined;
-    const build = std.fmt.bufPrint(&build_buf, "{s}\x00{s}", .{ round_cost.engineBuildId(), exe }) catch return null;
-    return owedIn(buf, dir, build, os, kind, s);
-}
-
-/// The full plan holds the minimal one, so its marker answers for both.
-fn owedIn(buf: []u8, dir: []const u8, build: []const u8, os: []const u8, kind: Kind, s: Subject) ?[:0]const u8 {
-    const full = markerPath(buf, dir, build, os, s, .full) orelse return null;
-    if (served(full)) return null;
-    if (kind == .full) return full;
-    const path = markerPath(buf, dir, build, os, s, .minimal) orelse return null;
-    return if (served(path)) null else path;
-}
-
-fn served(path: [:0]const u8) bool {
-    const fd = crt.openRead(path.ptr);
-    if (fd < 0) return false;
-    crt.close(fd);
-    return true;
-}
-
-/// This build has served its warm requests for the marker's subject.
-pub fn remember(path: [:0]const u8) void {
-    var dir_buf: [1100]u8 = undefined;
-    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}", .{std.fs.path.dirname(path) orelse return}, 0) catch return;
-    crt.mkdir(dir.ptr);
-    const fd = crt.openWrite(path.ptr, true);
-    if (fd >= 0) crt.close(fd);
-}
-
-/// Serve the full plan on the inference thread, inside the load. The requests run against a RAM twin of the model's
-/// prefix cache and count in no metric, so the model comes up as if nothing had been asked of it. False when a
-/// shutdown cut the plan short: the next load still owes it.
-pub fn run(sch: *Scheduler, entry: *LoadedModel) bool {
-    const cfg = entry.config orelse return true;
-    log.info("First load of this build with this model: compiling its kernels before it reports ready.\n", .{});
+/// Serve the full plan on the inference thread, inside the load: `FULL`, then the prompt at the load's widest pass
+/// (`widestRung`). The requests run against a RAM twin of the model's prefix cache and count in no metric, so the model
+/// comes up as if nothing had been asked of it. A shutdown, a failed request or the context cap stops it; nothing is
+/// kept either way, so the next load serves the whole plan again.
+pub fn run(sch: *Scheduler, entry: *LoadedModel) void {
+    const cfg = entry.config orelse return;
+    const cap = promptLimit(cfg.contextCap(), cfg.ctx_override, sch.gguf_ctx_size);
+    const widest = widestRung(cfg.pinned_prefill_chunk, cap);
+    const n = FULL.len + @intFromBool(widest != null);
+    // A rung past the context is no part of this load's plan: no request can reach it.
+    var total: usize = 0;
+    for (0..n) |i| total += @intFromBool(fits(planAt(i, widest), cap));
+    log.info("Warm requests: compiling this load's kernels before it reports ready ({d} requests, widest pass {d} rows).\n", .{ total, if (widest) |w| w.len else 0 });
     const sw = io_util.Stopwatch.init(sch.io);
     var twin = twinOf(entry);
     defer if (twin) |*t| t.deinit();
 
-    var buf: [LONGEST]u32 = undefined;
+    const buf = sch.allocator.alloc(u32, @max(LONGEST, if (widest) |w| w.len else 0)) catch {
+        log.warn("Warm requests: no memory for their prompts; the first prompts compile the kernels.\n", .{});
+        return;
+    };
+    defer sch.allocator.free(buf);
     var done: usize = 0;
-    var ladder_sw: ?io_util.Stopwatch = null;
-    const cap = promptLimit(cfg.contextCap(), cfg.ctx_override, sch.gguf_ctx_size);
-    for (FULL, 0..) |r, i| {
-        // A fork runs if its rung did; the budget is asked before a rung.
-        if (i >= MINIMAL.len and r.own == 0) {
-            if (ladder_sw == null) ladder_sw = io_util.Stopwatch.init(sch.io);
-            if (ladder_sw.?.read() > LADDER_BUDGET_NS) break;
-        }
-        if (cap != 0 and r.len + r.gen > cap) break;
-        serve(sch, entry, if (twin) |*t| t else null, fill(&buf, cfg.vocab_size, r), r) catch |err| {
-            if (err == error.Shutdown) return false;
-            log.warn("Warm request {d} of {d} failed ({s}); the first prompts compile what is left.\n", .{ done + 1, FULL.len, @errorName(err) });
+    for (0..n) |i| {
+        const r = planAt(i, widest);
+        if (!fits(r, cap)) continue;
+        serve(sch, entry, if (twin) |*t| t else null, fill(buf, cfg.vocab_size, r), r) catch |err| {
+            if (err == error.Shutdown) return;
+            log.warn("Warm request {d} of {d} failed ({s}); the first prompts compile what is left.\n", .{ done + 1, total, @errorName(err) });
             break;
         };
         done += 1;
     }
-    log.info("Warm requests complete ({d} of {d}, {d} ms).\n", .{ done, FULL.len, sw.read() / std.time.ns_per_ms });
-    return true;
+    if (done == total) {
+        log.info("Warm requests complete ({d} of {d}, {d} ms).\n", .{ done, total, sw.read() / std.time.ns_per_ms });
+    } else {
+        log.warn("Warm requests stopped at {d} of {d} ({d} ms).\n", .{ done, total, sw.read() / std.time.ns_per_ms });
+    }
+}
+
+/// Request `i` of the full plan: `FULL`, then the widest pass's prompt.
+fn planAt(i: usize, widest: ?Request) Request {
+    return if (i < FULL.len) FULL[i] else widest.?;
+}
+
+/// Whether `r` fits the context `cap` leaves (0 = no limit).
+fn fits(r: Request, cap: u32) bool {
+    return cap == 0 or r.len + r.gen <= cap;
 }
 
 /// An empty cache with the retention rules of the model's own, for its warm requests.
@@ -283,8 +242,6 @@ fn serve(sch: *Scheduler, entry: *LoadedModel, cache: ?*prefix_cache_mod.HotPref
 /// idle one: whoever unloads it drops the warm-up first (`forget`).
 pub const Idle = struct {
     entry: *LoadedModel,
-    marker_buf: [1280]u8 = undefined,
-    marker_len: usize,
     verify_rows: u32,
     /// How many of `MINIMAL` it serves: none on a model that cannot chat.
     requests: u32,
@@ -298,14 +255,17 @@ pub const Idle = struct {
     spent_ns: u64 = 0,
 };
 
-/// `entry`, just loaded, owes the minimal warm-up; `marker` is written once it has served it. Inference thread.
-pub fn owe(sch: *Scheduler, entry: *LoadedModel, marker: []const u8, verify_rows: u32, chat: bool) void {
+/// `entry`, just loaded, owes the minimal warm-up: every load does, whatever an earlier one served. Inference thread.
+pub fn owe(sch: *Scheduler, entry: *LoadedModel, verify_rows: u32, chat: bool) void {
     const w = sch.allocator.create(Idle) catch return;
     sch.warm_queue.append(sch.allocator, w) catch return sch.allocator.destroy(w);
-    w.* = .{ .entry = entry, .marker_len = marker.len, .verify_rows = verify_rows, .requests = if (chat) MINIMAL.len else 0, .twin = twinOf(entry) };
-    @memcpy(w.marker_buf[0..marker.len], marker);
-    w.marker_buf[marker.len] = 0;
+    w.* = .{ .entry = entry, .verify_rows = verify_rows, .requests = if (chat) MINIMAL.len else 0, .twin = twinOf(entry) };
 }
+
+/// Idle warm-ups that served their whole plan, and those cut short (a failed or slow request, a request given way to,
+/// the context cap, the model leaving, shutdown): a test's view of how they ended. Neither is read by any load.
+pub var completed: std.atomic.Value(u32) = .init(0);
+pub var cut: std.atomic.Value(u32) = .init(0);
 
 /// Requests in flight beside the warm one, on this thread's engine. Caller holds `queue_mu`.
 fn othersLocked(sch: *const Scheduler) usize {
@@ -366,7 +326,7 @@ pub fn tick(sch: *Scheduler) void {
         },
         .failed, .timed_out => |why| {
             log.warn("Warm request {d} of {d} {s}; the first prompts compile what is left.\n", .{ w.step - w.verify_rows + 1, w.requests, if (why == .failed) "failed" else "took too long" });
-            end(sch, w, true);
+            end(sch, w, false);
         },
     }
 }
@@ -390,14 +350,18 @@ fn start(sch: *Scheduler, w: *Idle) void {
             const cfg = w.entry.config.?;
             const r = MINIMAL[i];
             const cap = promptLimit(cfg.contextCap(), cfg.ctx_override, sch.gguf_ctx_size);
-            if (cap != 0 and r.len + r.gen > cap) return end(sch, w, true);
+            // Past the context: no request can reach it, so it is no part of this load's plan.
+            if (!fits(r, cap)) {
+                w.step += 1;
+                return;
+            }
             var buf: [LONG + FORK_GROWTH[0]]u32 = undefined;
             sch.queue_mu.lockUncancelable(sch.io);
             sch.warm_in_flight = 1;
             sch.queue_mu.unlock(sch.io);
             w.slot = submit(sch, w.entry, if (w.twin) |*t| t else null, fill(&buf, cfg.vocab_size, r), r) catch |err| {
                 log.warn("Warm request {d} of {d} failed ({s}); the first prompts compile what is left.\n", .{ i + 1, w.requests, @errorName(err) });
-                return end(sch, w, true);
+                return end(sch, w, false);
             };
             w.asked = io_util.Stopwatch.init(sch.io);
             w.waited_on = null;
@@ -417,13 +381,18 @@ fn endRequest(sch: *Scheduler, w: *Idle) void {
     sch.queue_mu.unlock(sch.io);
 }
 
-/// A warm-up is over: served (`mark` it, so no later load owes it) or cut short by its model leaving.
-fn end(sch: *Scheduler, w: *Idle, mark: bool) void {
+/// A warm-up is over: its whole plan served (`complete`), or cut short. Nothing is kept either way: the next load owes
+/// its own.
+fn end(sch: *Scheduler, w: *Idle, complete: bool) void {
     endRequest(sch, w);
     if (w.twin) |*t| t.deinit();
-    if (mark) {
-        remember(w.marker_buf[0..w.marker_len :0]);
-        log.info("Warm requests complete ({d} of {d}, {d} ms).\n", .{ @min(w.step -| w.verify_rows, w.requests), w.requests, w.spent_ns / std.time.ns_per_ms });
+    const served = @min(w.step -| w.verify_rows, w.requests);
+    if (complete) {
+        _ = completed.fetchAdd(1, .monotonic);
+        log.info("Warm requests complete ({d} of {d}, {d} ms).\n", .{ served, w.requests, w.spent_ns / std.time.ns_per_ms });
+    } else {
+        _ = cut.fetchAdd(1, .monotonic);
+        if (w.step > 0) log.warn("Warm requests stopped at {d} of {d} ({d} ms).\n", .{ served, w.requests, w.spent_ns / std.time.ns_per_ms });
     }
     _ = sch.warm_queue.orderedRemove(std.mem.indexOfScalar(*Idle, sch.warm_queue.items, w).?);
     sch.allocator.destroy(w);
@@ -519,51 +488,31 @@ test "promptLimit: the ladder stops at the context the operator set, the model's
     try testing.expectEqual(@as(u32, 4096), promptLimit(0, 0, 4096));
 }
 
-test "markerPath: one marker a build, an OS build and a subject" {
-    const s: Subject = .{ .model_path = "/models/a", .model_type = "qwen3_5", .verify_rows = 17, .kv_bits = 0 };
-    var bufs: [6][256]u8 = undefined;
-    const base = markerPath(&bufs[0], "/cache/", "build-1", "27A1", s, .full).?;
-    try testing.expect(std.mem.startsWith(u8, base, "/cache/mlx-serve-warm/"));
-    try testing.expectEqualStrings(base, markerPath(&bufs[1], "/cache/", "build-1", "27A1", s, .full).?);
-    var other = s;
-    other.model_path = "/models/b";
-    try testing.expect(!std.mem.eql(u8, base, markerPath(&bufs[2], "/cache/", "build-1", "27A1", other, .full).?));
-    other = s;
-    other.verify_rows = 9;
-    try testing.expect(!std.mem.eql(u8, base, markerPath(&bufs[3], "/cache/", "build-1", "27A1", other, .full).?));
-    try testing.expect(!std.mem.eql(u8, base, markerPath(&bufs[4], "/cache/", "build-2", "27A1", s, .full).?));
-    try testing.expect(!std.mem.eql(u8, base, markerPath(&bufs[5], "/cache/", "build-1", "27B2", s, .full).?));
-    try testing.expect(!std.mem.eql(u8, base, markerPath(&bufs[5], "/cache/", "build-1", "27A1", s, .minimal).?));
+test "widestRung: a load that pins a pass wider than the ladder serves a prompt at that pass, one row short of the context" {
+    // DeepSeek-V4.1 on a 512 GB machine at --ctx-size 32768 pins a 32,768-row pass: the prompt is 32,767 rows.
+    try testing.expectEqual(@as(u32, 32_767), widestRung(32_768, 32_768).?.len);
+    // A 1M context pins its pass from memory (44,544 rows), well inside the context.
+    try testing.expectEqual(@as(u32, 44_544), widestRung(44_544, 1_048_576).?.len);
+    try testing.expectEqual(@as(u32, 44_544), widestRung(44_544, 0).?.len);
+    // The rung fits the context the plan checks.
+    try testing.expect(fits(widestRung(32_768, 32_768).?, 32_768));
+    // No rung where the ladder already reaches the pin, or no pin was made.
+    try testing.expect(widestRung(8192, 32_768) == null);
+    try testing.expect(widestRung(LONGEST, 0) == null);
+    try testing.expect(widestRung(0, 0) == null);
+    try testing.expectEqual(@as(u32, LONGEST + 1), widestRung(LONGEST + 1, 0).?.len);
 }
 
-test "remember: a marker written is a load that owes nothing" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dir_buf: [512]u8 = undefined;
-    const n = try tmp.dir.realPathFile(testing.io, ".", &dir_buf);
-    dir_buf[n] = '/';
-    var buf: [1024]u8 = undefined;
-    const path = markerPath(&buf, dir_buf[0 .. n + 1], "build", "os", .{ .model_path = "/m", .model_type = "t", .verify_rows = 9, .kv_bits = 0 }, .full).?;
-    try testing.expect(!served(path));
-    remember(path);
-    try testing.expect(served(path));
-}
-
-test "owed: the full plan's marker answers for the minimal one, the minimal one's for itself alone" {
-    var tmps: [2]testing.TmpDir = .{ testing.tmpDir(.{}), testing.tmpDir(.{}) };
-    defer for (&tmps) |*t| t.cleanup();
-    const s: Subject = .{ .model_path = "/m", .model_type = "t", .verify_rows = 9, .kv_bits = 0 };
-    var buf: [1024]u8 = undefined;
-    for (tmps, [_]Kind{ .minimal, .full }) |tmp, first| {
-        var dir_buf: [512]u8 = undefined;
-        const n = try tmp.dir.realPathFile(testing.io, ".", &dir_buf);
-        dir_buf[n] = '/';
-        const dir = dir_buf[0 .. n + 1];
-        try testing.expect(owedIn(&buf, dir, "build", "os", .full, s) != null);
-        remember(owedIn(&buf, dir, "build", "os", first, s).?);
-        try testing.expect(owedIn(&buf, dir, "build", "os", .minimal, s) == null);
-        try testing.expectEqual(first == .minimal, owedIn(&buf, dir, "build", "os", .full, s) != null);
-    }
+test "the full plan: FULL, then the widest pass's prompt last; a rung past the context is skipped, never a stop" {
+    const w = widestRung(32_768, 32_768).?;
+    for (FULL, 0..) |r, i| try testing.expectEqual(r, planAt(i, w));
+    try testing.expectEqual(w, planAt(FULL.len, w));
+    try testing.expect(fits(planAt(FULL.len, w), 32_768));
+    // Under a 4,096-token context the 5,120 and 10,240 rungs and their forks cannot be asked for; what fits still runs.
+    var fit: usize = 0;
+    for (FULL) |r| fit += @intFromBool(fits(r, 4096));
+    try testing.expect(fit > MINIMAL.len and fit < FULL.len);
+    try testing.expect(fits(.{ .base = 3072, .len = 3072, .gen = 1 }, 4096));
 }
 
 test "the minimal plan is short prompts only, and the full plan starts with it" {
@@ -589,23 +538,20 @@ test "nextStep: the sweep's widths, then the requests, one at a time and only wh
 
 /// A scheduler with one ready model that owes an idle warm-up of no widths and no requests.
 const IdleFixture = struct {
-    tmp: testing.TmpDir,
     reg: *@import("../../host/registry/registry.zig").ModelRegistry,
     sch: Scheduler = undefined,
     entry: *LoadedModel = undefined,
-    marker_buf: [1024]u8 = undefined,
-    marker: [:0]const u8 = undefined,
+    /// `completed` and `cut` when the fixture began.
+    done0: u32 = 0,
+    cut0: u32 = 0,
 
     fn init(f: *IdleFixture) !void {
-        f.tmp = testing.tmpDir(.{});
         f.reg = try .init(testing.allocator, testing.io, null, 4, 0, null);
         f.entry = try f.reg.registerStub("a", "/a", 1);
         f.entry.state = .ready;
         f.entry.prefix_cache = null;
-        var dir_buf: [512]u8 = undefined;
-        const n = try f.tmp.dir.realPathFile(testing.io, ".", &dir_buf);
-        dir_buf[n] = '/';
-        f.marker = markerPath(&f.marker_buf, dir_buf[0 .. n + 1], "build", "os", .{ .model_path = "/a", .model_type = "t", .verify_rows = 0, .kv_bits = 0 }, .minimal).?;
+        f.done0 = completed.load(.monotonic);
+        f.cut0 = cut.load(.monotonic);
         f.sch.allocator = testing.allocator;
         f.sch.io = testing.io;
         f.sch.registry = f.reg;
@@ -614,18 +560,22 @@ const IdleFixture = struct {
         f.sch.warm_in_flight = 0;
         f.sch.in_flight = 0;
         inline for (.{ "offloaded", "load_queue", "unload_queue", "gen_queue" }) |name| @field(f.sch, name) = .empty;
-        owe(&f.sch, f.entry, f.marker, 0, false);
+        owe(&f.sch, f.entry, 0, false);
     }
 
     fn deinit(f: *IdleFixture) void {
         stop(&f.sch);
         f.reg.deinit();
-        f.tmp.cleanup();
+    }
+
+    /// Warm-ups this fixture saw complete, and cut short.
+    fn ended(f: *const IdleFixture) [2]u32 {
+        return .{ completed.load(.monotonic) - f.done0, cut.load(.monotonic) - f.cut0 };
     }
 };
 
-test "an idle warm-up waits beside a real request without holding its model, then marks the build" {
-    var f: IdleFixture = .{ .tmp = undefined, .reg = undefined };
+test "an idle warm-up waits beside a real request without holding its model, then completes" {
+    var f: IdleFixture = .{ .reg = undefined };
     try f.init();
     defer f.deinit();
     // Beside a real request it waits, and the thread may park: that request's end wakes it.
@@ -633,7 +583,7 @@ test "an idle warm-up waits beside a real request without holding its model, the
     try testing.expect(!owesStepLocked(&f.sch));
     tick(&f.sch);
     try testing.expectEqual(@as(usize, 1), f.sch.warm_queue.items.len);
-    try testing.expect(!served(f.marker));
+    try testing.expectEqual([2]u32{ 0, 0 }, f.ended());
     // Waiting, it pins nothing: a load that needs the room, or the idle sweep, can still unload the model.
     try testing.expectEqual(@as(u32, 0), f.entry.refcount.load(.acquire));
     try testing.expect(f.reg.pickLruEvictable("", false) == f.entry);
@@ -641,40 +591,49 @@ test "an idle warm-up waits beside a real request without holding its model, the
     try testing.expect(owesStepLocked(&f.sch));
     tick(&f.sch);
     try testing.expectEqual(@as(usize, 0), f.sch.warm_queue.items.len);
-    try testing.expect(served(f.marker));
+    try testing.expectEqual([2]u32{ 1, 0 }, f.ended());
     try testing.expect(!owesStepLocked(&f.sch));
+    // Every load owes its own warm-up: the same model loaded again queues the whole plan, whatever this one served.
+    owe(&f.sch, f.entry, 9, true);
+    try testing.expectEqual(@as(usize, 1), f.sch.warm_queue.items.len);
+    try testing.expectEqual(@as(u32, 9), f.sch.warm_queue.items[0].verify_rows);
+    try testing.expectEqual(@as(u32, MINIMAL.len), f.sch.warm_queue.items[0].requests);
 }
 
-test "forget: a model being unloaded takes its warm-up with it, unmarked, wherever it stands in the queue" {
-    var f: IdleFixture = .{ .tmp = undefined, .reg = undefined };
+test "forget: a model being unloaded takes its warm-up with it, cut short, wherever it stands in the queue" {
+    var f: IdleFixture = .{ .reg = undefined };
     try f.init();
     defer f.deinit();
     const other = try f.reg.registerStub("b", "/b", 1);
     other.state = .ready;
-    owe(&f.sch, other, f.marker, 0, false);
+    owe(&f.sch, other, 0, false);
     forget(&f.sch, other);
     try testing.expectEqual(@as(usize, 1), f.sch.warm_queue.items.len);
     try testing.expect(f.sch.warm_queue.items[0].entry == f.entry);
     forget(&f.sch, f.entry);
     try testing.expectEqual(@as(usize, 0), f.sch.warm_queue.items.len);
-    try testing.expect(!served(f.marker));
+    try testing.expectEqual([2]u32{ 0, 2 }, f.ended());
 }
 
-test "an idle warm-up starts nothing on a model that is leaving" {
-    var f: IdleFixture = .{ .tmp = undefined, .reg = undefined };
+test "an idle warm-up starts nothing on a model that is leaving, and claims nothing" {
+    var f: IdleFixture = .{ .reg = undefined };
     try f.init();
     defer f.deinit();
     f.entry.state = .evicting;
     tick(&f.sch);
     try testing.expectEqual(@as(usize, 0), f.sch.warm_queue.items.len);
-    try testing.expect(!served(f.marker));
+    try testing.expectEqual([2]u32{ 0, 1 }, f.ended());
 }
 
-test "stop: a warm-up still owed at shutdown is dropped unmarked" {
-    var f: IdleFixture = .{ .tmp = undefined, .reg = undefined };
+test "stop: a warm-up still owed at shutdown is dropped, cut short; the partial plan claims nothing a later load reads" {
+    var f: IdleFixture = .{ .reg = undefined };
     try f.init();
     defer f.deinit();
     stop(&f.sch);
     f.sch.warm_queue = .empty;
-    try testing.expect(!served(f.marker));
+    try testing.expectEqual([2]u32{ 0, 1 }, f.ended());
+    // The next load of the same model owes the whole plan again: nothing of the cut warm-up survives it.
+    owe(&f.sch, f.entry, 0, true);
+    try testing.expectEqual(@as(u32, MINIMAL.len), f.sch.warm_queue.items[0].requests);
+    try testing.expectEqual(@as(u32, 0), f.sch.warm_queue.items[0].step);
 }

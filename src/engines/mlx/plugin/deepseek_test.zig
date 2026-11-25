@@ -13,6 +13,7 @@ const resolvePrefillChunk = @import("../admission/prefill_chunk.zig").resolvePre
 const effectivePrefillChunk = @import("../generate/prefill_chunk.zig").effectivePrefillChunk;
 const prefillAdmissionBill = @import("../admission/admit.zig").prefillAdmissionBill;
 const generate_mod = @import("../generate.zig");
+const world = @import("../../../sdk/testing/world.zig");
 
 test "deepseek_v4 bill: the plugin's terms equal the engine's on the release config" {
     const t = std.testing;
@@ -93,7 +94,7 @@ test "dsv41 prefill chunk: pinned at 8192 on a big machine, and kept there howev
         try t.expectEqual(@as(usize, 8192), effectivePrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, ctx, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), cfg.pinned_prefill_chunk));
 }
 
-test "dsv41 prefill chunk: the pass plan pins the widest whole-span pass the ladder's share bills, up to the context, the explicit width over it, and the ladder's pin where not even 8192 rows fit" {
+test "dsv41 prefill chunk: the pass plan pins the widest whole-span pass the ladder's share bills (PF_IDX_PASS's queries included), up to the context, the explicit width over it, and the ladder's pin where not even 8192 rows fit" {
     const t = std.testing;
     const env = @import("../../../env.zig");
     const pc = @import("../admission/prefill_chunk.zig");
@@ -101,6 +102,10 @@ test "dsv41 prefill chunk: the pass plan pins the widest whole-span pass the lad
     var cfg = try model.parseConfigFromJson(t.allocator, model.dsv41_release_config);
     const was = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, "1");
     defer was.restore();
+    const was_idx = env.override(.MLX_SERVE_DSV41_PF_IDX_PASS, "1");
+    defer was_idx.restore();
+    // The memory-sized width: a machine with no measured knee (PF_PASS_CEIL's test holds the ceiling).
+    world.with(.{ .machine = world.no_knee });
     const gb: u64 = 1 << 30;
     // The share bounds it on a long context: the widest whole span that fits, the next one past the cap.
     cfg.ctx_override = 1 << 20;
@@ -114,6 +119,11 @@ test "dsv41 prefill chunk: the pass plan pins the widest whole-span pass the lad
     const off = dsv41PrefillMemoryNeeded(&cfg, wide, wide);
     env.set(.MLX_SERVE_DSV41_PF_PASS_SIZE, "1");
     try t.expect(dsv41PrefillMemoryNeeded(&cfg, wide, wide) > off);
+    // PF_IDX_PASS's whole-pass index queries are billed too, and the pinned pass above fits with them.
+    env.set(.MLX_SERVE_DSV41_PF_IDX_PASS, "0");
+    const no_idx = dsv41PrefillMemoryNeeded(&cfg, wide, wide);
+    env.set(.MLX_SERVE_DSV41_PF_IDX_PASS, "1");
+    try t.expect(dsv41PrefillMemoryNeeded(&cfg, wide, wide) > no_idx);
     // A wider share never pins a narrower pass; the context bounds it.
     try t.expect(pc.dsv41PassRows(&cfg, 16, 2 * cap, 0, 8192) >= wide);
     cfg.ctx_override = 32768;
@@ -127,6 +137,79 @@ test "dsv41 prefill chunk: the pass plan pins the widest whole-span pass the lad
     try t.expectEqual(@as(u64, 65_280), limit);
     try t.expectEqual(@as(u32, 65_280), pc.dsv41PassRows(&cfg, 16, 4096 * gb, 0, 8192));
     try t.expectEqual(@as(u32, 65_280), pc.dsv41PassRows(&cfg, 16, cap, 1 << 20, 8192));
+}
+
+test "dsv41 prefill chunk: PF_PASS_CEIL keeps a memory-sized pass at or under the M5 Ultra 512 GiB's measured ceiling (39,680 rows, its 1M knee on both fp4 formats), cuts 128K, 256K and 512K prompts in 4, 7 and 14 passes, leaves other machines and the explicit width alone; the ceiling 1,024 rows high fails" {
+    const t = std.testing;
+    const env = @import("../../../env.zig");
+    const pc = @import("../admission/prefill_chunk.zig");
+    const ds = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
+    var cfg = try model.parseConfigFromJson(t.allocator, model.dsv41_release_config);
+    const was = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, "1");
+    defer was.restore();
+    const gib: u64 = 1 << 30;
+    const mb: u64 = 1 << 20;
+    // The machine constant: the M5 Ultra with 512 GiB only; every other machine keeps the memory-sized width.
+    try t.expectEqual(@as(usize, 39_680), ds.PASS_CEIL_M5_ULTRA_512);
+    try t.expectEqual(@as(usize, 0), ds.PASS_CEIL_M5_ULTRA_512 % ds.SPAN);
+    try t.expectEqual(@as(usize, 39_680), ds.passCeilFor("Apple M5 Ultra", 512 * gib));
+    try t.expectEqual(@as(usize, 0), ds.passCeilFor("Apple M5 Ultra", 256 * gib));
+    try t.expectEqual(@as(usize, 0), ds.passCeilFor("Apple M3 Ultra", 512 * gib));
+    try t.expectEqual(@as(usize, 0), ds.passCeilFor("Apple M5 Max", 128 * gib));
+    try t.expectEqual(@as(usize, 0), ds.passCeilFor("", 0));
+    // Under the ceiling a 128K, 256K or 512K prompt runs in 4, 7 or 14 passes, where the formats' memory-sized widths
+    // (NVFP4 44,544 and the MXFP4 view 47,616 at 512000 MiB) cut 3, 6 and 12 passes of 43,776 rows.
+    for ([_]usize{ 131_072, 262_144, 524_288 }, [_]usize{ 32_768, 37_632, 37_632 }) |rows, want| {
+        try t.expectEqual(want, ds.passRows(rows, ds.PASS_CEIL_M5_ULTRA_512));
+        try t.expectEqual(@as(usize, 43_776), ds.passRows(rows, 47_616));
+    }
+    // The planner, for both formats' shares (the MXFP4 view's bills less, so its share is wider) at 16K, 256K and 1M.
+    const Case = struct { ctx: u32, cap: u64 };
+    const cases = [_]Case{ .{ .ctx = 32_768, .cap = 21_099 * mb }, .{ .ctx = 1 << 18, .cap = 25_869 * mb }, .{ .ctx = 1 << 20, .cap = 21_728 * mb }, .{ .ctx = 1 << 20, .cap = 25_869 * mb }, .{ .ctx = 1 << 20, .cap = 30 * gib } };
+    for ([_]bool{ false, true }) |plant| {
+        ds.pass_ceil_plant = plant;
+        defer ds.pass_ceil_plant = false;
+        var held = true;
+        var above = false;
+        for (cases) |cs| {
+            cfg.ctx_override = cs.ctx;
+            const off = blk: {
+                const pin = env.override(.MLX_SERVE_DSV41_PF_PASS_CEIL, "0");
+                defer pin.restore();
+                break :blk pc.dsv41PassRows(&cfg, 16, cs.cap, 0, 8192);
+            };
+            above = above or off > ds.PASS_CEIL_M5_ULTRA_512 + 4 * ds.SPAN;
+            const pin = env.override(.MLX_SERVE_DSV41_PF_PASS_CEIL, "1");
+            defer pin.restore();
+            world.with(.{ .machine = .{ .chip = "Apple M5 Ultra", .mem = 512 * gib } });
+            const on = pc.dsv41PassRows(&cfg, 16, cs.cap, 0, 8192);
+            held = held and on <= ds.PASS_CEIL_M5_ULTRA_512 and on == @min(off, ds.PASS_CEIL_M5_ULTRA_512) and on % ds.SPAN == 0;
+            // The explicit width is never ceiled; another machine keeps the memory-sized width.
+            try t.expectEqual(@as(u32, 47_360), pc.dsv41PassRows(&cfg, 16, cs.cap, 47_360, 8192));
+            world.with(.{ .machine = .{ .chip = "Apple M5 Max", .mem = 128 * gib } });
+            try t.expectEqual(off, pc.dsv41PassRows(&cfg, 16, cs.cap, 0, 8192));
+        }
+        // Off, the wide 1M shares pass the ceiling (and its plant), so the ceiling is at work in the cases.
+        try t.expect(above);
+        try t.expect(held != plant);
+    }
+    // The 16K standard test is one pass either way.
+    cfg.ctx_override = 32_768;
+    const pin = env.override(.MLX_SERVE_DSV41_PF_PASS_CEIL, "1");
+    defer pin.restore();
+    world.with(.{ .machine = .{ .chip = "Apple M5 Ultra", .mem = 512 * gib } });
+    try t.expectEqual(@as(usize, 17_638), ds.passRows(17_638, pc.dsv41PassRows(&cfg, 16, 21_099 * mb, 0, 8192)));
+    // On by default: unset takes the ceiling, =0 the memory-sized width.
+    {
+        const unset = env.override(.MLX_SERVE_DSV41_PF_PASS_CEIL, null);
+        defer unset.restore();
+        try t.expectEqual(@as(usize, 39_680), ds.passCeil());
+    }
+    {
+        const zero = env.override(.MLX_SERVE_DSV41_PF_PASS_CEIL, "0");
+        defer zero.restore();
+        try t.expectEqual(@as(usize, 0), ds.passCeil());
+    }
 }
 
 test "dsv41 prefill chunk: under the pass plan the chunk loop cuts a prompt into near-equal chunks no wider than the pinned pass; off, 8192-row chunks and the rest" {

@@ -80,6 +80,8 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 
 **Green CI does not run a kernel or the proofs of a plugin that owns one** (#1027: they skip on the runner). Before merging a change to a kernel, a quant path or a model plugin, run its tests on a real Mac (`zig build test -Dtest-filter=<plugin>`, or the full suite): a parity test merged green and failed on the first M5 run.
 
+**A unit test starts in the test world** (`sdk/testing/world.zig`, entered before every test): the variables the process started with, MLX's limits, the M5 Ultra 512 GiB for machine-keyed tables. Declare another machine with `world.with`; read NAX/TF32/generation through `world.*` (lint `machine-read-in-test`). Before a default flip: `scripts/flip_proof.py run LEVER`.
+
 ## Releases & benchmarking
 
 - Process/CalVer/CHANGELOG: `/release`. Per-release perf gate = `./tests/bench.sh` on the FINAL tree vs the previous column in `benchmarks.md` (ONE new column per release).

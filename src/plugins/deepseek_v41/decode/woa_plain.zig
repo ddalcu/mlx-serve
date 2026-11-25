@@ -268,6 +268,7 @@ pub fn gemv(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, odt: mlx.mlx_dtype, x: 
 
 const testing = std.testing;
 const device = @import("../../../mlx/device.zig");
+const world = @import("../../../sdk/testing/world.zig");
 
 test "dsv41 dec wo_a plain: the registered kernel passes the contract's gates 1-4" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
@@ -365,7 +366,7 @@ test "dsv41 dec wo_a plain: the merged heads through the plain GEMV equal wo_a o
         defer gpa.free(want);
         const x = try merge(&sc, k.merge, 64, in.pacc, in.pm, in.pl, in.sink, in.meta, in.periods);
         // wo_a's matrix units (4 rows on) take the heads rounded to bf16; the plain GEMV keeps them f32.
-        const bar: f64 = if (R >= 4 and device.naxAvailable()) 5e-3 else 1e-4;
+        const bar: f64 = if (R >= 4 and world.nax()) 5e-3 else 1e-4;
         for ([_]Plan{ planFor(R), .{ .tr = 64, .nb = 4 }, .{ .tr = 32, .nb = 2 }, .{ .tr = 16, .nb = 8 } }) |p| {
             const got = try dsv41.hostF32((try gemv(&sc, k.gemv, .bfloat16, x, in.w, in.s, p)) orelse return error.Declined);
             defer gpa.free(got);

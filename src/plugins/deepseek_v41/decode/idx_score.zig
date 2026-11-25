@@ -4,6 +4,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const nax = @import("../../../mlx/device.zig");
+const world = @import("../../../sdk/testing/world.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 const kit = @import("../../deepseek_v4/contract_kit.zig");
@@ -826,7 +827,7 @@ test "dsv41 dec idx_score: the declared launches are the shipped wrappers', byte
     defer k.deinit();
     var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
-    if (nax.naxAvailable()) for ([_]bool{ false, true }) |gather| {
+    if (world.nax()) for ([_]bool{ false, true }) |gather| {
         var c = kit.Case(ScoreCase).init(gpa, if (gather) &gather_l else &score_l, .{ .gather = gather });
         defer c.deinit();
         try testing.expect(try c.prepare(.{ .rows = 3, .n = 600, .k = channels }, .random, 7));
