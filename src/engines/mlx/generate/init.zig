@@ -110,6 +110,7 @@ pub fn initWithOptions(
     var options = options_in;
     var dspark_active = false;
     var dspark_stochastic = false;
+    var dspark_typical: f32 = 0;
     if ((intree.dsv4(xfm) != null or intree.dsv41(xfm) != null or plugin_driver.nativeDrafter(xfm) != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
         // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
         // snapshot rollback inside deepseek_v4.zig) may engage when the
@@ -135,6 +136,14 @@ pub fn initWithOptions(
         if (xfm.dsparkStages() > 0 and !dspark_env_off and arm != .off) {
             dspark_active = true;
             dspark_stochastic = arm == .stochastic;
+            // The sampled arm takes the request's acceptance mode: typical (LOSSY) where it asks for it, else exact.
+            if (dspark_stochastic) switch (options.mtp_acceptance) {
+                .typical => |cfg| {
+                    dspark_typical = cfg.delta;
+                    log.info("  [dspark-accept] typical delta={d:.3} eps={d:.3} NOT distribution-exact (copied drafts exact)\n", .{ cfg.delta, cfg.eps });
+                },
+                .exact, .tokenv3 => {},
+            };
             if (dspark_stochastic) {
                 log.info("  spec=dspark (stochastic; {s} native draft stages, block={d})\n", .{ xfm.config.model_type, ds_block });
             } else {
@@ -1022,6 +1031,7 @@ pub fn initWithOptions(
             .pld_enabled = pld_active,
             .dspark_enabled = dspark_active,
             .dspark_stochastic = dspark_stochastic,
+            .dspark_typical = dspark_typical,
             // A streamed EXL3 bank verifies the whole block on a greedy request: its verify costs about a plain tick.
             // `dspark.test_pin_rows` (a test hook) pins every round at N rows. A plugin's drafter opens with the plain
             // rounds that time one, then drafts while its rounds pay.

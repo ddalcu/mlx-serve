@@ -66,3 +66,31 @@ Vontra Flash-Next 4-bit pack, T=1.0, code and prose at 1K/4K/16K, two seeds,
 A B B A on one binary: typical 0.2 decoded 86.7 tok/s, typical 0.2 plus the tail
 99.4 tok/s (2.96 to 3.36 tokens per round). Greedy output is byte-identical with
 the tail on.
+
+## Lossless and lossy acceptance
+
+Every speculative mode is one of two classes, and a lossy one is never on by default.
+
+* **Lossless** (the default everywhere): the output distribution is the serial decoder's. Greedy requests accept a
+  draft only where it equals the target's argmax (the same tokens as serial greedy decoding). Sampled requests accept
+  draft k with probability min(1, p_k / q_k) and draw the first reject from max(0, p - q): the MTP exact verifier, and
+  DSpark's stochastic arm.
+* **Lossy** (opt-in, each logs `NOT distribution-exact`): Typical (`--mtp-typical <delta>`, or a model's
+  `mtp_acceptance` setting) and TokenV3 (`--mtp-tokenv3 <alpha>`, MTP only). They apply to sampled requests only;
+  greedy requests keep the argmax verifier.
+
+## DSpark typical acceptance
+
+DeepSeek-V4/V4.1's DSpark stochastic arm reads the same mode. Under `--mtp-typical <delta>` a sampled round keeps
+draft k iff `p(x) > min(1, delta*exp(-H(p)))`, with no acceptance uniform, and draws the first reject from p
+(`mtpBatchedTypicalGraph`, the MTP head's graph; `dspark.verdictOf`). The server logs
+`[dspark-accept] typical delta=… NOT distribution-exact (copied drafts exact)`.
+
+Drafts copied from the context (DSpark's copy rounds, as a prompt lookup's) keep the exact rule (`dspark.draftRule`).
+Such a draft is a point mass the model did not propose. Typical acceptance would keep it whenever the target clears
+its floor, so an echo of the context would feed itself and self-echo would become certain. A plugin's native drafter,
+whose round does not say which drafts it copied, keeps the exact rule too. TokenV3 is not applied to DSpark.
+
+A smaller delta lowers the floor and accepts more: delta near 0 keeps any draft with mass, the lossy end. A delta
+large enough that the floor reaches 1 keeps nothing, so every token is a draw from p (serial sampling's distribution,
+with no speedup).
