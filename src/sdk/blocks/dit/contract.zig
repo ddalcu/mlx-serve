@@ -1144,9 +1144,9 @@ pub fn register(set: *kc.Set) !void {
     try set.add(Gemm, .init(a, true), gemmSpec("w8a8 gemm + swiglu bf16 (NAX; BM 128)", true, &.{ .{ .rows = 129, .n = 256, .k = 3072 }, .{ .rows = 300, .n = 320, .k = 512 } }), null);
     // deepseek_v41's MLX_SERVE_DSV41_PF_INT8=3/4 (the trunk): the reduction lengths it serves (wq_b 1280, the shared
     // down 2304, the q/kv and shared gate/up 5120, wo_b 8192), at the BM 64 tile its wide passes take (past 8192
-    // rows) and at the BM 128 one, the outputs cut to a few column tiles.
+    // rows: every length, as the 16K pass runs them) and at the BM 128 one, the outputs cut to a few column tiles.
     try set.add(Rq, .init(a), rqSpecServed("w8a8_rq bf16 (deepseek_v41 PF_INT8=3/4: K 1280, 2304, 5120, 8192)", scale_drops_nan, &.{ .{ .rows = 300, .n = 1, .k = 1280 }, .{ .rows = 129, .n = 1, .k = 2304 }, .{ .rows = 64, .n = 1, .k = 5120 }, .{ .rows = 64, .n = 1, .k = 8192 } }), null);
-    try set.add(Gemm, .init(a, false), gemmSpec("w8a8 gemm bf16 (NAX; deepseek_v41 PF_INT8=3/4, BM 64 past 8192 rows: K 1280, 2304)", false, &.{ .{ .rows = 8200, .n = 128, .k = 1280 }, .{ .rows = 8200, .n = 64, .k = 2304 } }), null);
+    try set.add(Gemm, .init(a, false), gemmSpec("w8a8 gemm bf16 (NAX; deepseek_v41 PF_INT8=3/4, BM 64 past 8192 rows: K 1280, 2304, 5120, 8192)", false, &.{ .{ .rows = 8200, .n = 128, .k = 1280 }, .{ .rows = 8200, .n = 64, .k = 2304 }, .{ .rows = 8200, .n = 64, .k = 5120 }, .{ .rows = 8200, .n = 64, .k = 8192 } }), null);
     try set.add(Gemm, .init(a, false), gemmSpec("w8a8 gemm bf16 (NAX; deepseek_v41 PF_INT8=3/4, BM 128: K 5120, 8192)", false, &.{ .{ .rows = 129, .n = 256, .k = 5120 }, .{ .rows = 300, .n = 192, .k = 8192 } }), null);
 }
 
