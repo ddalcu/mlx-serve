@@ -92,3 +92,41 @@ test "dsv41 prefill chunk: pinned at 8192 on a big machine, and kept there howev
     for ([_]usize{ 8192, 65536, 131_072, 1 << 20 }) |ctx|
         try t.expectEqual(@as(usize, 8192), effectivePrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, ctx, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), cfg.pinned_prefill_chunk));
 }
+
+test "plugin bill parity: all five built-ins with non-zero bill terms match legacy ModelConfig" {
+    const t = std.testing;
+    const sdk = @import("../../../sdk/root.zig");
+    const Binding = @import("config.zig").Binding;
+    const slotFixedKvBytes = @import("../admission/bills.zig").slotFixedKvBytes;
+
+    const cases = [_]struct { table: *const abi.ModelTable, json: []const u8 }{
+        .{ .table = &@import("../../../plugins/deepseek_v4/plugin.zig").table, .json = config.release_config },
+        .{ .table = &@import("../../../plugins/deepseek_v41/plugin.zig").table, .json = model.dsv41_release_config },
+        .{ .table = &@import("../../../plugins/glm5_next/plugin.zig").table, .json = @embedFile("../../../fixtures/model-configs/glm5_next-mlx-community-4bit.json") },
+        .{ .table = &@import("../../../plugins/bailing_hybrid/plugin.zig").table, .json = @embedFile("../../../fixtures/model-configs/bailing_hybrid-ling-3.0-flash-oq4e-mtp.json") },
+        .{ .table = &@import("../../../plugins/qwen4_exp/plugin.zig").table, .json = @embedFile("../../../fixtures/model-configs/qwen4_exp-iq-mlx-4.7bpw.json") },
+    };
+
+    for (cases) |tc| {
+        var legacy = try model.parseConfigFromJson(t.allocator, tc.json);
+        defer legacy.deinit(t.allocator);
+        const mem: sdk.fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = tc.json }} };
+        const dir = mem.packDir();
+        var binding: Binding = .{ .table = tc.table };
+        try t.expect(tc.table.parse(&dir, .of(tc.json), .{}, null, true, &binding.parsed).isOk());
+        defer tc.table.free_parsed(&binding.parsed);
+        binding.readBillTerms();
+
+        var bound = legacy;
+        bound.plugin = &binding;
+        try t.expectEqual(legacy.kvBytesPerToken(), bound.kvBytesPerToken());
+        for ([_]u64{ 16, 8 }) |kv_bits| {
+            for ([_]u64{ 4096, 8192 }) |chunk| {
+                try t.expectEqual(slotFixedKvBytes(&legacy, kv_bits, chunk), slotFixedKvBytes(&bound, kv_bits, chunk));
+            }
+        }
+        for ([_]u64{ 1, 100, 641, 4096, 65536, 1 << 20 }) |seq| {
+            try t.expectEqual(legacy.prefillAttnKeys(seq), bound.prefillAttnKeys(seq));
+        }
+    }
+}
