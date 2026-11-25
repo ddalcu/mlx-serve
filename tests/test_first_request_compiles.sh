@@ -51,16 +51,17 @@ SCRATCH="$HOME/claude-tmp/test-first-request-$$"
 SRV=""
 mkdir -p "$SCRATCH"
 [ -n "$HOLD" ] && mkdir -p "$HOLD"
-# away <path>: the test's own file gone, moved into WARM_TEST_HOLD when it is set.
-N_AWAY=0
+# away <path>: the test's own file gone, moved into WARM_TEST_HOLD when it is set. Each move gets a new directory
+# (mktemp), not a counter: away runs inside command substitutions, whose variable changes the caller never sees.
 away() {
     [ -e "$1" ] || [ -L "$1" ] || return 0
-    if [ -n "$HOLD" ]; then N_AWAY=$((N_AWAY + 1)); mv "$1" "$HOLD/$(basename "$1").$$.$N_AWAY"; else rm -rf "$1"; fi
+    if [ -n "$HOLD" ]; then mv "$1" "$(mktemp -d "$HOLD/$(basename "$1").XXXXXX")/"; else rm -rf "$1"; fi
 }
-COPIES=()
+# The binary copies, one a line: a file, since copy_of also runs inside command substitutions.
+COPIES="$SCRATCH/copies.list"
 cleanup() {
     srv_stop "$SRV"
-    for c in "${COPIES[@]}"; do away "$c"; done
+    if [ -f "$COPIES" ]; then while read -r c; do away "$c"; done < "$COPIES"; fi
     away "$CACHE"; away "$SCRATCH"
 }
 trap cleanup EXIT
@@ -77,7 +78,7 @@ open(dst, "wb").write(data.replace(old, new))
 os.chmod(dst, 0o755)
 PY
     codesign -f -s - "$dst" 2>/dev/null
-    COPIES+=("$dst")
+    echo "$dst" >> "$COPIES"
     echo "$dst"
 }
 
@@ -121,16 +122,16 @@ def ask(text, n):
     # Twins share no prefix past the chat template's few tokens: a cache hit would hide the forward the reading times.
     assert (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0) < 32, u
     return time.monotonic() - t0, u
-# Two fillers of the same size, each text opened by its own words so no two share a prefix; zero-padded numbers keep
-# every line the same tokens.
-FILL = ("The archive records the following entry.", "A ledger notes one more item here.")
+# Twins: one filler, opened by different words of the same size, so they are the same size and share no prefix.
+# Zero-padded numbers keep every line the same tokens, so two short probes (their own openers) size a long text.
+FILL = "The archive records the following entry."
 OPEN = ("Archive copy.", "Ledger copy.", "Sizing probe one.", "Sizing probe two.")
-def doc(lines, k, o=None):
-    return OPEN[k if o is None else o] + " " + " ".join(f"[{i:05d}] {FILL[k]}" for i in range(lines)) + "\n\nReply with just the word: OK."
+def doc(lines, k):
+    return OPEN[k] + " " + " ".join(f"[{i:05d}] {FILL}" for i in range(lines)) + "\n\nReply with just the word: OK."
 if sys.argv[2] == "wide":
     # The tokens a line from two short probes (before the pair), then the pair at 98% of the target.
-    _, a = ask(doc(100, 0, 2), 1)
-    _, b = ask(doc(300, 0, 3), 1)
+    _, a = ask(doc(100, 2), 1)
+    _, b = ask(doc(300, 3), 1)
     per = max(1.0, (b["prompt_tokens"] - a["prompt_tokens"]) / 200)
     lines = max(1, int(0.98 * (int(sys.argv[3]) - (a["prompt_tokens"] - 100 * per)) / per))
     w1, u = ask(doc(lines, 0), 16)
