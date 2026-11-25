@@ -365,9 +365,9 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | PF_MOE_EPI | Counting-sort route pack in place of two argsorts | EXACT | test |
 | PF_GU_SEG | 128 x 128 paired gate/up where the planner picks it | EXACT | test (word for word, to 8,192 rows, NVFP4 with per-expert scales; NAX) |
 | PF_KV_ROWS | Window kv rows on one simdgroup per row | EXACT | test (word for word) |
-| PF_COMP_PASS | Compressor pooling once over the pass, each span's index-key linear on its own groups | EXACT | test |
+| PF_COMP_PASS | Compressor pooling once over the pass, each span's index-key linear on its own groups | EXACT | test (word for word) |
 | PF_DOWN_TOKORD | Staged down writes rows in token order | EXACT | test |
-| PF_DOWN_BK32 | Staged down on the 64 x 64 tile, 32 deep a step, at 96 routed rows an expert and more | EXACT | test |
+| PF_DOWN_BK32 | Staged down on the 64 x 64 tile, 32 deep a step, at 96 routed rows an expert and more | EXACT | test (word for word) |
 | PF_FP4_GEMM | Staged matrix-unit gather for routed gate/up and down | EXACT | test |
 | WOA_JOIN | Joins the spans' wo_a rows in one copy | EXACT | commit |
 | PF_ROUTE_PACK | Router top-6 on a simdgroup per row; one-threadgroup scan | EXACT | test |
@@ -394,7 +394,7 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | PF_PASS_SIZE | Near-equal memory-sized prompt passes | REORDER (partition) | commit |
 | PF_IDX_NAX | Indexer scores on the matrix units | REORDER (bounded) | test (within 2·γ(34) of `idx_tile`, the same top-half picks except near-ties; NAX) |
 | PF_COMP_BF16 | Compressor projection on a bf16 MMA, K blocks summed apart | REORDER | test |
-| PF_IDX_PASS | Indexer queries and head weights once over the pass, the head weights on a shape-cut kernel (16 partial sums) | REORDER | test |
+| PF_IDX_PASS | Indexer queries and head weights once over the pass, the head weights on a shape-cut kernel (16 partial sums) | REORDER | test (head weights no farther from float64 than MLX's GEMM per span; +0.8 GB peak, billed) |
 | FLASH_ATTN | Every prompt-attention call on one flash kernel where it fits | REORDER | test |
 | ENGRAM_GPU_IDS | Engram ids hashed on the GPU; fused wkv | REORDER (bounded) | test |
 | ENGRAM_KV_SLOTS | Slot-blocked Engram wkv | REORDER | test |
@@ -457,7 +457,8 @@ Standard test, p01, greedy, DSpark on, NVFP4 pack:
 | `58279979`, the last reviewed head | 4,009.6 | 82.93 |
 | `a99fc4f6`, the release | 5,551.3 | 98.80 |
 
-From `58279979` to the release (the 47 changes, the upstream merge and the audit fixes): +38.4% prefill and +19.1% decode (`58279979` on
+Three later prompt levers (`PF_COMP_PASS`, `PF_IDX_PASS`, `PF_DOWN_BK32`) are on by default and not in these cells;
+their gains are measured per A/B (+0.27%, +0.26% and +0.08% prefill). From `58279979` to the release (the 47 changes, the upstream merge and the audit fixes): +38.4% prefill and +19.1% decode (`58279979` on
 Mac 1, the release on Mac 2, which runs about 0.8% slower per round). On `f7e4da9e` the MXFP4-experts pack ran
 4,108.3 / 73.83 tok/s; NVFP4 was 2.8% slower.
 
