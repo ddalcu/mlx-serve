@@ -111,7 +111,9 @@ compiled() {
     python3 - "$BASE" "$CACHE" "$kind" "${WIDE_TOKENS:-0}" <<'PY' || { echo -e "${RED}FAIL${NC} a request failed, or the first one found a prompt cached" >&2; srv_stop "$SRV"; exit 1; }
 import glob, json, os, sys, urllib.request
 def index():
-    return sum(os.path.getsize(p) for p in glob.glob(sys.argv[2] + "/**/libraries.list", recursive=True))
+    # Metal's index of what it compiled: libraries.list, or functions.list on newer macOS (beside functions.data).
+    return sum(os.path.getsize(p) for name in ("libraries.list", "functions.list")
+               for p in glob.glob(sys.argv[2] + "/**/" + name, recursive=True))
 def ask(text, n):
     body = dict(model="x", messages=[{"role": "user", "content": text}], max_tokens=n, temperature=0)
     req = urllib.request.Request(sys.argv[1] + "/v1/chat/completions", data=json.dumps(body).encode(),
@@ -119,14 +121,17 @@ def ask(text, n):
     return json.load(urllib.request.urlopen(req, timeout=1800))["usage"]
 def doc(lines):
     return " ".join(f"[{i}] The archive records the following entry." for i in range(lines))
+def wide_doc(lines):
+    # Zero-padded line numbers: every line the same tokens, so two short probes size a long prompt.
+    return " ".join(f"[{i:05d}] The archive records the following entry." for i in range(lines))
 if sys.argv[3] == "wide":
     # The tokens a line, from two short prompts before the reading starts; then one prompt just under the widest pass.
-    a = ask(doc(50) + "\n\nReply with just the word: OK.", 1)["prompt_tokens"]
-    b = ask(doc(150) + "\n\nReply with just the word: OK.", 1)["prompt_tokens"]
-    per = max(1.0, (b - a) / 100)
-    lines = max(1, int((int(sys.argv[4]) - (a - 50 * per)) / per))
+    a = ask(wide_doc(100) + "\n\nReply with just the word: OK.", 1)["prompt_tokens"]
+    b = ask(wide_doc(300) + "\n\nReply with just the word: OK.", 1)["prompt_tokens"]
+    per = max(1.0, (b - a) / 200)
+    lines = max(1, int(0.98 * (int(sys.argv[4]) - (a - 100 * per)) / per))
     start = index()
-    u = ask(doc(lines) + "\n\nReply with just the word: OK.", 1)
+    u = ask(wide_doc(lines) + "\n\nReply with just the word: OK.", 1)
     print(index() - start, u.get("prompt_tokens", 0))
     sys.exit(0)
 start = index()
@@ -217,6 +222,7 @@ ds_cases() {
     v=$(case_xy "$bin" "$tag-guseg" "MLX_SERVE_DSV41_PF_GU_SEG=0" "$DSV41" "" "$DSV41"); [ "$v" = PASS ] || DS_FAILED+=("$tag pf_gu_seg")
     v=$(XFLAGS=--no-mtp case_xy "$bin" "$tag-nomtp" "" "$DSV41" "" "$DSV41"); [ "$v" = PASS ] || DS_FAILED+=("$tag no-mtp")
     if [ -n "${WARM_TEST_DSV41_ALT:-}" ]; then
+        [ -f "$WARM_TEST_DSV41_ALT/config.json" ] || { fail "WARM_TEST_DSV41_ALT $WARM_TEST_DSV41_ALT holds no pack"; return; }
         v=$(PACK_X="$DSV41" PACK_Y="$WARM_TEST_DSV41_ALT" case_xy "$bin" "$tag-pack" "" "$SAMEPATH" "" "$SAMEPATH"); [ "$v" = PASS ] || DS_FAILED+=("$tag replaced-pack")
     fi
 }
