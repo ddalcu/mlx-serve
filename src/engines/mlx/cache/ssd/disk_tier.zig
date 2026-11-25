@@ -7578,9 +7578,15 @@ test "volumeSpace: free is what the OS grants, never less than statfs' f_bavail"
     try testing.expect(statfs("/", &st) == 0);
     const vs = volumeSpace("/") orelse return error.VolumeSpaceProbeFailed;
     const granted = msv_volume_free_for_use("/");
-    try testing.expect(granted > 0);
-    try testing.expect(vs.free + slack >= @as(u64, @intCast(@max(st.f_bsize, 0))) * st.f_bavail);
-    if (granted <= vs.total) try testing.expect(@max(granted, vs.free) - @min(granted, vs.free) < slack);
+    const bavail = @as(u64, @intCast(@max(st.f_bsize, 0))) * st.f_bavail;
+    try testing.expect(vs.free + slack >= bavail);
+    if (granted > 0 and granted <= vs.total) {
+        try testing.expect(@max(granted, vs.free) - @min(granted, vs.free) < slack);
+    } else {
+        // macOS can answer 0 for important usage, for example to a process outside a login
+        // session (a headless box over ssh). volumeSpace then reports statfs' f_bavail.
+        try testing.expect(@max(bavail, vs.free) - @min(bavail, vs.free) < slack);
+    }
 }
 
 test "DiskTier: SSD-first declines to store when the VOLUME is short, and says so" {

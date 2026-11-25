@@ -1,5 +1,5 @@
 //! sdk/blocks/moe/gather_qmv.
-//! Owns gatherQmvSource, GQMV_BODY_AFFINE, GQMV_BODY_NVFP4, GQMV_AFFINE_HEADER, GQMV_NVFP4_HEADER, gatherQmvGateUpSource, and 28 more.
+//! Owns gatherQmv(Act), gatherQmvGateUp(Scaled), gateUpLaunch, bankDequant, the bodies and headers, and their tests.
 
 const std = @import("std");
 const env = @import("../../../env.zig");
@@ -7,6 +7,7 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../util/log.zig");
 const QuantMode = @import("../../quant/params.zig").QuantMode;
+const fp4 = @import("../../quant/fp4.zig");
 const moe_fp4 = @import("moe_fp4.zig");
 const fused_activations = @import("../mlp/fused_activations.zig");
 const testing = std.testing;
@@ -40,10 +41,10 @@ const moeCudaFormat = @import("gather_qmv_rows.zig").moeCudaFormat;
 // projections, every expert sees the same token), 1 = x [TOPK, K] (the down
 // projection, where each expert consumes its own activation).
 //
-// `NVFP4` picks the dequant arithmetic: false = affine (q * scale + bias, the
-// mlx-quantized checkpoints), true = NVFP4 (e2m1 nibbles + uint8 e4m3 group
-// scales, no biases — poolside's Laguna checkpoints).
-fn gatherQmvSource(comptime nvfp4: bool, comptime x_per_expert: bool) [:0]const u8 {
+// The bank's `Dequant` picks the arithmetic: affine (q * scale + bias, the
+// mlx-quantized checkpoints) or fp4 (e2m1 nibbles + one uint8 group scale, no
+// biases: NVFP4's e4m3 per 16, the GS template; MXFP4 banks decline, `modeDequant`).
+fn gatherQmvSource(comptime d: Dequant, comptime x_per_expert: bool) [:0]const u8 {
     // Everything is indexed off the raw buffer names rather than through
     // explicitly address-spaced pointers: MLX generates the signature from each
     // input's ACTUAL dtype and puts arrays with fewer than 8 elements in
@@ -56,36 +57,53 @@ fn gatherQmvSource(comptime nvfp4: bool, comptime x_per_expert: bool) [:0]const 
     // is ALU-bound, not load-width bound, so widening the loads only adds code.
     return std.fmt.comptimePrint(kernelSource("kernels/moe/gather_qmv.fmt.metal"), .{
         if (x_per_expert) "(size_t)e * (size_t)K" else "0",
-        if (nvfp4) GQMV_BODY_NVFP4 else GQMV_BODY_AFFINE,
-        // NVFP4 decodes both halves scaled down by a power of two (2^14 for the
-        // e2m1 nibble, 2^8 for the e4m3 scale). Multiplying by a power of two is
-        // exact in float, so the two constants fold into ONE 2^22 multiply on
-        // the finished dot product instead of two per value.
-        if (nvfp4) " * 4194304.0f" else "",
+        if (d == .fp4) GQMV_BODY_FP4 else GQMV_BODY_AFFINE,
     });
 }
 
 pub const GQMV_BODY_AFFINE = kernelSource("kernels/moe/gqmv_body_affine.metal");
 
-// The group scale is constant across a whole packed word (GS 16 >= VPW 8), so
+// The group scale is constant across a whole packed word (GS 16 or 32 >= VPW 8), so
 // the word's four partial dot products are summed unscaled and the scale is
 // applied once per word rather than once per value.
-pub const GQMV_BODY_NVFP4 = kernelSource("kernels/moe/gqmv_body_nvfp4.metal");
+pub const GQMV_BODY_FP4 = kernelSource("kernels/moe/gqmv_body_fp4.metal");
 
-// An e2m1 nibble and an e4m3 byte each become a `half` by shifting their bits
-// straight into the half exponent/mantissa/sign fields — no LUT, no branches,
-// exact for all codes including zero, subnormals and negative zero. The e2m1
-// field layout (2-bit exp, 1-bit mantissa) lands in half's low exponent bits
-// and top mantissa bit, which yields the true value scaled by 2^-14; e4m3's
-// (4-bit exp, 3-bit mantissa) yields it scaled by 2^-8. Callers fold both back
-// in with one multiply. Matches MLX's own `fp4.h` / `fp8.h` conversions, whose
-// sign handling is a branch instead of a shift.
 // One packed unit of quantized values: a word for 2/4/8-bit; mx.quantize packs
 // 8 values into 3 bytes at 3-bit, 5 bytes at 5-bit (a 64-bit unit) and 4 into
 // 3 at 6-bit (value i at bit i * bits), so the body's `>> (i * BITS)` walk is unchanged.
 pub const GQMV_AFFINE_HEADER = kernelSource("kernels/moe/gqmv_affine_header.metal");
 
-pub const GQMV_NVFP4_HEADER = GQMV_AFFINE_HEADER ++ moe_fp4.E2M1_HEADER ++ moe_fp4.E2M1X2_HEADER ++ kernelSource("kernels/moe/gqmv_nvfp4_header.metal");
+// An e2m1 nibble becomes a `half` by shifting its bits straight into the half's
+// exponent/mantissa/sign fields (exact for all 16 codes, -0 kept), the true value
+// times 2^-14; the group scale is `fp4.SCALE_HEADER`'s (MLX's fp8.h read, both formats).
+pub const GQMV_FP4_HEADER = GQMV_AFFINE_HEADER ++ fp4.SCALE_HEADER ++ kernelSource("kernels/moe/gqmv_fp4_header.metal");
+
+pub fn header(d: Dequant) [:0]const u8 {
+    return if (d == .fp4) GQMV_FP4_HEADER else GQMV_AFFINE_HEADER;
+}
+
+/// A bank's arithmetic on these kernels: affine (q * scale + bias) or fp4 (e2m1 and one uint8 group scale; the
+/// format is the group size).
+pub const Dequant = enum { affine, fp4 };
+
+/// Whether these kernels read a bank at (mode, bits, group): affine at a width `affineQmvUnitOk` takes; 4-bit NVFP4
+/// (g16). MXFP4 and any other mode or group have no dequant here: the sorted or composed path serves them.
+pub fn modeDequant(mode: QuantMode, bits: u32, group_size: u32) ?Dequant {
+    if (mode == .affine) return if (affineQmvUnitOk(bits, group_size)) .affine else null;
+    const f = fp4.of(mode, group_size) orelse return null;
+    if (bits != 4 or f != .nvfp4) return null;
+    return .fp4;
+}
+
+/// `modeDequant` with the bank's arrays: affine needs its biases; fp4 reads uint8 scale codes and has no biases.
+pub fn bankDequant(mode: QuantMode, bits: u32, group_size: u32, sc: mlx.mlx_array, bi: mlx.mlx_array) ?Dequant {
+    if (sc.ctx == null) return null;
+    const d = modeDequant(mode, bits, group_size) orelse return null;
+    return switch (d) {
+        .affine => if (bi.ctx != null) d else null,
+        .fp4 => if (bi.ctx == null and mlx.mlx_array_dtype(sc) == .uint8) d else null,
+    };
+}
 
 // ── Fused routed gate+up+SwiGLU (one kernel for what was three) ──
 //
@@ -100,41 +118,42 @@ pub const GQMV_NVFP4_HEADER = GQMV_AFFINE_HEADER ++ moe_fp4.E2M1_HEADER ++ moe_f
 // per core, so there is occupancy to spend on instruction-level parallelism.
 //
 // Bit-exactness comes from rounding each accumulator to T FIRST — exactly where
-// `gatherQmv` writes `T(acc)` — and then running the same table-lookup SwiGLU
-// `fusedSwiGLU` does. No f32 shortcut through the activation.
-fn gatherQmvGateUpSource(comptime nvfp4: bool) [:0]const u8 {
+// `gatherQmv` writes `T(acc)` — then each expert's scale as the split path's
+// rounded multiply, the clamp, and the same table-lookup SwiGLU `fusedSwiGLU`
+// does. One source serves the single-row decode (ONE_ROW: z is the slot) and
+// 2..8 rows (z is (row, slot)); at one row the two compile to the same code.
+fn gatherQmvGateUpSource(comptime d: Dequant) [:0]const u8 {
     return std.fmt.comptimePrint(kernelSource("kernels/moe/gather_qmv_gateup.fmt.metal"), .{
-        if (nvfp4) GQMV_GATEUP_BODY_NVFP4 else GQMV_GATEUP_BODY_AFFINE,
-        if (nvfp4) " * 4194304.0f" else "",
-        if (nvfp4) " * 4194304.0f" else "",
+        if (d == .fp4) GQMV_GATEUP_BODY_FP4 else GQMV_GATEUP_BODY_AFFINE,
     });
 }
 
 pub const GQMV_GATEUP_BODY_AFFINE = kernelSource("kernels/moe/gqmv_gateup_body_affine.metal");
 
-pub const GQMV_GATEUP_BODY_NVFP4 = kernelSource("kernels/moe/gqmv_gateup_body_nvfp4.metal");
+pub const GQMV_GATEUP_BODY_FP4 = kernelSource("kernels/moe/gqmv_gateup_body_fp4.metal");
 
-pub const GQMV_GATEUP_SOURCES = [2][:0]const u8{ gatherQmvGateUpSource(false), gatherQmvGateUpSource(true) };
-const GQMV_GATEUP_NAMES = [2][*:0]const u8{ "mlxserve_moe_gather_qmv_gateup", "mlxserve_moe_gather_qmv_gateup_nvfp4" };
+/// Indexed by `Dequant`.
+pub const GQMV_GATEUP_SOURCES = [2][:0]const u8{ gatherQmvGateUpSource(.affine), gatherQmvGateUpSource(.fp4) };
+pub const GQMV_GATEUP_NAMES = [2][:0]const u8{ "mlxserve_moe_gather_qmv_gateup", "mlxserve_moe_gather_qmv_gateup_fp4" };
+pub const GQMV_GATEUP_INPUTS_AFFINE = [_][*:0]const u8{ "x", "wg_q", "g_scales", "g_biases", "wu_q", "u_scales", "u_biases", "inds", "sigtab", "K_size", "N_size", "gsc", "usc" };
+pub const GQMV_GATEUP_INPUTS_FP4 = [_][*:0]const u8{ "x", "wg_q", "g_scales", "wu_q", "u_scales", "inds", "sigtab", "K_size", "N_size", "gsc", "usc" };
 var gqmv_gateup_kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
 
-fn getGatherQmvGateUpKernel(nvfp4: bool) !mlx.mlx_fast_metal_kernel {
-    const mi: usize = @intFromBool(nvfp4);
+fn getGatherQmvGateUpKernel(d: Dequant) !mlx.mlx_fast_metal_kernel {
+    const mi: usize = @intFromEnum(d);
     if (gqmv_gateup_kernels[mi]) |k| return k;
-    const affine_inputs = [_][*:0]const u8{ "x", "wg_q", "g_scales", "g_biases", "wu_q", "u_scales", "u_biases", "inds", "sigtab", "K_size", "N_size" };
-    const nvfp4_inputs = [_][*:0]const u8{ "x", "wg_q", "g_scales", "wu_q", "u_scales", "inds", "sigtab", "K_size", "N_size" };
-    const input_names: []const [*:0]const u8 = if (nvfp4) &nvfp4_inputs else &affine_inputs;
+    const input_names: []const [*:0]const u8 = if (d == .fp4) &GQMV_GATEUP_INPUTS_FP4 else &GQMV_GATEUP_INPUTS_AFFINE;
     const output_names = [_][*:0]const u8{"y"};
     const in_vec = mlx.mlx_vector_string_new_data(input_names.ptr, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
     const kernel = mlx.mlx_fast_metal_kernel_new(
-        GQMV_GATEUP_NAMES[mi],
+        GQMV_GATEUP_NAMES[mi].ptr,
         in_vec,
         out_vec,
         GQMV_GATEUP_SOURCES[mi],
-        if (nvfp4) GQMV_NVFP4_HEADER else GQMV_AFFINE_HEADER,
+        header(d),
         true,
         false,
     );
@@ -161,9 +180,17 @@ pub fn affineQmvPackUnits(K: c_int, bits: u32) c_int {
     };
 }
 
-const GateUpCfgKey = struct { topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, limit: u32 };
-var gateup_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var gateup_cfg_key: GateUpCfgKey = std.mem.zeroes(GateUpCfgKey);
+/// Per-expert scales ([E] in x's dtype) and a whole-number SwiGLU clamp, `moe_fp4`'s convention: the gate scale
+/// before the SiLU, the up scale before the clamp (without a clamp, up rides the routing weight), down on the route.
+pub const Scales = moe_fp4.Scales;
+
+const GateUpCfgKey = struct { rows: c_int, topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, one_row: bool, limit: u32, gscale: bool, uscale: bool };
+const GateUpCfgSlot = struct {
+    cfg: ?mlx.mlx_fast_metal_kernel_config = null,
+    key: GateUpCfgKey = std.mem.zeroes(GateUpCfgKey),
+};
+/// One slot per layout: the single-row decode and the rows tick alternate in a batched server.
+var gateup_cfg: [2]GateUpCfgSlot = .{ .{}, .{} };
 var gqmv_gateup_engaged: bool = false;
 
 pub fn gatherQmvGateUpEnabled() bool {
@@ -189,22 +216,57 @@ pub fn gatherQmvGateUp(
     /// A whole-number `swiglu_limit` the activation clamps at (0 = none).
     limit: u32,
 ) !?mlx.mlx_array {
+    return gatherQmvGateUpScaled(s, x, gw, gs_arr, gb, uw, us_arr, ub, inds, bits, group_size, mode, .{ .clamp = limit });
+}
+
+/// `gatherQmvGateUp` with each expert's gate / up scale (`Scales`).
+pub fn gatherQmvGateUpScaled(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    gw: mlx.mlx_array,
+    gs_arr: mlx.mlx_array,
+    gb: mlx.mlx_array,
+    uw: mlx.mlx_array,
+    us_arr: mlx.mlx_array,
+    ub: mlx.mlx_array,
+    inds: mlx.mlx_array,
+    bits: u32,
+    group_size: u32,
+    mode: QuantMode,
+    scales: Scales,
+) !?mlx.mlx_array {
     if (!gatherQmvGateUpEnabled()) return null;
-    if (!mlx.streamIsGpu(s)) return null;
-    const nvfp4 = switch (mode) {
-        .affine => false,
-        .nvfp4 => true,
-        else => return null,
-    };
-    if (nvfp4) {
-        if (bits != 4 or group_size != 16) return null;
-        if (mlx.mlx_array_dtype(gs_arr) != .uint8 or mlx.mlx_array_dtype(us_arr) != .uint8) return null;
-        if (gb.ctx != null or ub.ctx != null) return null;
-    } else {
-        if (!affineQmvUnitOk(bits, group_size)) return null;
-        if (gb.ctx == null or ub.ctx == null) return null;
+    const y = (try gateUpLaunch(s, x, gw, gs_arr, gb, uw, us_arr, ub, inds, bits, group_size, mode, scales, true)) orelse return null;
+    if (!gqmv_gateup_engaged) {
+        gqmv_gateup_engaged = true;
+        log.info("[moe] fused gate+up+SwiGLU kernel engaged: E_topk={d} inter={d} bits={d} gs={d}\n", .{ mlx.getShape(inds)[0], mlx.getShape(y)[1], bits, group_size });
     }
-    if (gs_arr.ctx == null or us_arr.ctx == null) return null;
+    return y;
+}
+
+/// The gate+up+SwiGLU kernel. `one_row`: x [K] (any shape of K elements), inds [TOPK], y [TOPK, N]; else x [R, K],
+/// inds [R, TOPK] (1 <= R <= 8, TOPK <= 16), y [R, TOPK, N]. Refuses: a bank no dequant reads (`bankDequant`), gate
+/// and up of different geometry, f32 x (the SwiGLU is a 16-bit table), N off the 8-simdgroup tile, a per-expert
+/// scale not [E] in x's dtype.
+pub fn gateUpLaunch(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    gw: mlx.mlx_array,
+    gs_arr: mlx.mlx_array,
+    gb: mlx.mlx_array,
+    uw: mlx.mlx_array,
+    us_arr: mlx.mlx_array,
+    ub: mlx.mlx_array,
+    inds: mlx.mlx_array,
+    bits: u32,
+    group_size: u32,
+    mode: QuantMode,
+    scales: Scales,
+    one_row: bool,
+) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
+    const d = bankDequant(mode, bits, group_size, gs_arr, gb) orelse return null;
+    if (bankDequant(mode, bits, group_size, us_arr, ub) != d) return null;
     // The activation is a 16-bit table lookup, exactly as `fusedSwiGLU` gates
     // it; f32 activations keep the unfused path so the two can never disagree.
     const xd = mlx.mlx_array_dtype(x);
@@ -220,78 +282,100 @@ pub fn gatherQmvGateUp(
     const N: c_int = wsh[1];
     const K: c_int = @intCast(@divExact(@as(u32, @intCast(wsh[2])) * 32, bits));
     if (@rem(K, @as(c_int, @intCast(group_size))) != 0) return null;
+    inline for (.{ scales.gate, scales.up }) |sc| if (sc) |a| {
+        if (mlx.mlx_array_dtype(a) != xd or mlx.mlx_array_size(a) != @as(usize, @intCast(wsh[0]))) return null;
+    };
     const ish = mlx.getShape(inds);
-    if (ish.len != 1) return null;
-    const topk: c_int = ish[0];
-    const xsh = mlx.getShape(x);
-    var xelems: i64 = 1;
-    for (xsh) |d| xelems *= d;
-    if (xelems != K) return null;
+    var rows: c_int = 1;
+    var topk: c_int = undefined;
+    if (one_row) {
+        if (ish.len != 1) return null;
+        topk = ish[0];
+        const xsh = mlx.getShape(x);
+        var xelems: i64 = 1;
+        for (xsh) |v| xelems *= v;
+        if (xelems != K) return null;
+    } else {
+        if (ish.len != 2) return null;
+        rows = ish[0];
+        topk = ish[1];
+        if (rows < 1 or rows > 8 or topk < 1 or topk > 16) return null;
+        const xsh = mlx.getShape(x);
+        if (xsh.len != 2 or xsh[0] != rows or xsh[1] != K) return null;
+    }
     const sgs_per_tg: c_int = 8;
     if (@rem(N, sgs_per_tg) != 0) return null;
 
-    const key = GateUpCfgKey{ .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd, .limit = limit };
-    if (gateup_cfg == null or !std.meta.eql(gateup_cfg_key, key)) {
-        if (gateup_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    const key = GateUpCfgKey{ .rows = rows, .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd, .one_row = one_row, .limit = scales.clamp, .gscale = scales.gate != null, .uscale = scales.up != null };
+    const slot = &gateup_cfg[@intFromBool(one_row)];
+    if (slot.cfg == null or !std.meta.eql(slot.key, key)) {
+        if (slot.cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
-        const y_shape = [_]c_int{ topk, N };
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 2, xd));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, N, topk));
+        if (one_row) {
+            const y_shape = [_]c_int{ topk, N };
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 2, xd));
+        } else {
+            const y_shape = [_]c_int{ rows, topk, N };
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 3, xd));
+        }
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, N, rows * topk));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, sgs_per_tg, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KP", affineQmvPackUnits(K, bits)));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "LIMIT", @intCast(limit)));
-        gateup_cfg = config;
-        gateup_cfg_key = key;
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TOPK", topk));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(config, "ONE_ROW", one_row));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "LIMIT", @intCast(scales.clamp)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GSCALE", @intFromBool(scales.gate != null)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "USCALE", @intFromBool(scales.up != null)));
+        slot.* = .{ .cfg = config, .key = key };
     }
 
     const sigtab = try swigluSigTable(s, xd, std.heap.c_allocator);
     const K_arr = cachedScalarInt(K);
     const N_arr = cachedScalarInt(N);
-    const affine_inputs = [_]mlx.mlx_array{ x, gw, gs_arr, gb, uw, us_arr, ub, inds, sigtab, K_arr, N_arr };
-    const nvfp4_inputs = [_]mlx.mlx_array{ x, gw, gs_arr, uw, us_arr, inds, sigtab, K_arr, N_arr };
-    const inputs_arr: []const mlx.mlx_array = if (nvfp4) &nvfp4_inputs else &affine_inputs;
+    // An absent scale is never read (its template flag is off); any array binds.
+    const gsc = scales.gate orelse sigtab;
+    const usc = scales.up orelse sigtab;
+    const affine_inputs = [_]mlx.mlx_array{ x, gw, gs_arr, gb, uw, us_arr, ub, inds, sigtab, K_arr, N_arr, gsc, usc };
+    const fp4_inputs = [_]mlx.mlx_array{ x, gw, gs_arr, uw, us_arr, inds, sigtab, K_arr, N_arr, gsc, usc };
+    const inputs_arr: []const mlx.mlx_array = if (d == .fp4) &fp4_inputs else &affine_inputs;
     const inputs_vec = mlx.mlx_vector_array_new_data(inputs_arr.ptr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
 
-    const kernel = try getGatherQmvGateUpKernel(nvfp4);
+    const kernel = try getGatherQmvGateUpKernel(d);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, gateup_cfg.?, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, slot.cfg.?, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var y = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(y);
     try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0));
-    if (!gqmv_gateup_engaged) {
-        gqmv_gateup_engaged = true;
-        log.info("[moe] fused gate+up+SwiGLU kernel engaged: E_topk={d} inter={d} bits={d} gs={d}\n", .{ topk, N, bits, group_size });
-    }
     return y;
 }
 
-// Indexed [nvfp4][x_per_expert].
+// Indexed [Dequant][x_per_expert].
 pub const GQMV_SOURCES = [2][2][:0]const u8{
-    .{ gatherQmvSource(false, false), gatherQmvSource(false, true) },
-    .{ gatherQmvSource(true, false), gatherQmvSource(true, true) },
+    .{ gatherQmvSource(.affine, false), gatherQmvSource(.affine, true) },
+    .{ gatherQmvSource(.fp4, false), gatherQmvSource(.fp4, true) },
 };
 const GQMV_NAMES = [2][2][*:0]const u8{
     .{ "mlxserve_moe_gather_qmv", "mlxserve_moe_gather_qmv_px" },
-    .{ "mlxserve_moe_gather_qmv_nvfp4", "mlxserve_moe_gather_qmv_nvfp4_px" },
+    .{ "mlxserve_moe_gather_qmv_fp4", "mlxserve_moe_gather_qmv_fp4_px" },
 };
 var gqmv_kernels: [2][2]?mlx.mlx_fast_metal_kernel = @splat(@splat(null));
 
-fn getGatherQmvKernel(nvfp4: bool, x_per_expert: bool) !mlx.mlx_fast_metal_kernel {
-    const mi: usize = @intFromBool(nvfp4);
+fn getGatherQmvKernel(d: Dequant, x_per_expert: bool) !mlx.mlx_fast_metal_kernel {
+    const mi: usize = @intFromEnum(d);
     const xi: usize = @intFromBool(x_per_expert);
     if (gqmv_kernels[mi][xi]) |k| return k;
-    // NVFP4 carries no biases, so that input is absent from its signature
+    // fp4 carries no biases, so that input is absent from its signature
     // rather than passed as a dummy — MLX builds the signature from the input
     // list, and a phantom array would be one more buffer bound per dispatch.
     const affine_inputs = [_][*:0]const u8{ "x", "w_q", "scales", "biases", "inds", "K_size", "N_size" };
-    const nvfp4_inputs = [_][*:0]const u8{ "x", "w_q", "scales", "inds", "K_size", "N_size" };
-    const input_names: []const [*:0]const u8 = if (nvfp4) &nvfp4_inputs else &affine_inputs;
+    const fp4_inputs = [_][*:0]const u8{ "x", "w_q", "scales", "inds", "K_size", "N_size" };
+    const input_names: []const [*:0]const u8 = if (d == .fp4) &fp4_inputs else &affine_inputs;
     const output_names = [_][*:0]const u8{"y"};
     const in_vec = mlx.mlx_vector_string_new_data(input_names.ptr, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
@@ -302,7 +386,7 @@ fn getGatherQmvKernel(nvfp4: bool, x_per_expert: bool) !mlx.mlx_fast_metal_kerne
         in_vec,
         out_vec,
         GQMV_SOURCES[mi][xi],
-        if (nvfp4) GQMV_NVFP4_HEADER else GQMV_AFFINE_HEADER,
+        header(d),
         true,
         false,
     );
@@ -333,7 +417,7 @@ pub var decode_ladder_engaged: bool = false;
 
 /// Decode-width gathered qmv over an expert bank, read in place.
 /// `x`: [K] shared (x_per_expert=false) or [TOPK, K] (true), bf16/fp16.
-/// `w`/`sc`/`bi`: the affine bank, [E, N, K*BITS/32] / [E, N, K/GS].
+/// `w`/`sc`/`bi`: the bank, [E, N, K*BITS/32] / [E, N, K/GS] (affine with biases, or fp4 with uint8 scales).
 /// `inds`: [TOPK] uint32 bank rows. Returns [TOPK, N], or null when the shape
 /// or quant geometry is outside the supported set (caller falls back).
 pub fn gatherQmv(
@@ -367,27 +451,9 @@ pub fn gatherQmvAct(
     act_relu2: bool,
 ) !?mlx.mlx_array {
     if (!mlx.streamIsGpu(s)) return null;
-    // Two dequant arithmetics, one kernel shape. Any other mode (mxfp4/mxfp8,
-    // whose scales are e8m0 over different group sizes) falls back — running a
-    // bank through the wrong dequant is silently wrong, not a crash.
-    const nvfp4 = switch (mode) {
-        .affine => false,
-        .nvfp4 => true,
-        else => return null,
-    };
-    if (nvfp4) {
-        // NVFP4 is bits 4 / group 16 by definition, with uint8 e4m3 scales and
-        // no biases; anything else claiming the mode is not a bank we can read.
-        if (bits != 4 or group_size != 16) return null;
-        if (mlx.mlx_array_dtype(sc) != .uint8) return null;
-        if (bi.ctx != null) return null;
-    } else {
-        // Only widths where one uint32 holds a whole number of values (5/6-bit
-        // affine is byte-packed differently — those fall back).
-        if (!affineQmvUnitOk(bits, group_size)) return null;
-        if (bi.ctx == null) return null;
-    }
-    if (sc.ctx == null) return null;
+    // A bank read through the wrong dequant is silently wrong, not a crash: any
+    // bank `bankDequant` does not name falls back.
+    const d = bankDequant(mode, bits, group_size, sc, bi) orelse return null;
     const xd = mlx.mlx_array_dtype(x);
     if (xd != .bfloat16 and xd != .float16 and xd != .float32) return null;
     if (mlx.mlx_array_dtype(inds) != .uint32) return null;
@@ -402,7 +468,7 @@ pub fn gatherQmvAct(
     const topk: c_int = ish[0];
     const xsh = mlx.getShape(x);
     var xelems: i64 = 1;
-    for (xsh) |d| xelems *= d;
+    for (xsh) |v| xelems *= v;
     const want: i64 = if (x_per_expert) @as(i64, topk) * K else K;
     if (xelems != want) return null;
 
@@ -434,12 +500,12 @@ pub fn gatherQmvAct(
     const K_arr = cachedScalarInt(K);
     const N_arr = cachedScalarInt(N);
     const affine_inputs = [_]mlx.mlx_array{ x, w, sc, bi, inds, K_arr, N_arr };
-    const nvfp4_inputs = [_]mlx.mlx_array{ x, w, sc, inds, K_arr, N_arr };
-    const inputs_arr: []const mlx.mlx_array = if (nvfp4) &nvfp4_inputs else &affine_inputs;
+    const fp4_inputs = [_]mlx.mlx_array{ x, w, sc, inds, K_arr, N_arr };
+    const inputs_arr: []const mlx.mlx_array = if (d == .fp4) &fp4_inputs else &affine_inputs;
     const inputs_vec = mlx.mlx_vector_array_new_data(inputs_arr.ptr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
 
-    const kernel = try getGatherQmvKernel(nvfp4, x_per_expert);
+    const kernel = try getGatherQmvKernel(d, x_per_expert);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));

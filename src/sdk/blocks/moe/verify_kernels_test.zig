@@ -218,7 +218,7 @@ test "prefill expert reduction is bit-identical to unsort multiply and sum" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x5EED_3A11);
-    // (top_k, hidden): Qwen3-30B-A3B (8, 2048), Qwen3.6-35B (10, 2560), and MiMo-V2.6 (8, 4096) geometries.
+    // (top_k, hidden): Qwen3-30B-A3B (8, 2048), Qwen3.6-35B (10, 2560) and MiMo-V2.6 (8, 4096) geometries.
     for ([_][2]c_int{ .{ 8, 2048 }, .{ 10, 2560 }, .{ 8, 4096 } }) |kh| for ([_][2]c_int{ .{ 1, 33 }, .{ 1, 2048 }, .{ 2, 1024 }, .{ 1, 8192 } }) |shape| {
         const count = shape[0] * shape[1] * kh[0];
         const down = try testRandWeightBf16(prng.random(), &.{ count, kh[1] }, s);

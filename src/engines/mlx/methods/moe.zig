@@ -30,6 +30,7 @@ const useGatherQmvDecode = @import("moe_decode.zig").useGatherQmvDecode;
 const gatherExpertMm = @import("../../../sdk/blocks/moe/experts.zig").gatherExpertMm;
 const moeCudaFormat = @import("../../../sdk/blocks/moe/gather_qmv_rows.zig").moeCudaFormat;
 const moeDecodeDispatchArm = @import("../../../sdk/blocks/moe/gather_qmv_rows.zig").moeDecodeDispatchArm;
+const rowsDeclineClamp = @import("../../../sdk/blocks/moe/gather_qmv_rows.zig").rowsDeclineClamp;
 const RouterGate = @import("../../../sdk/blocks/moe/router_kernel.zig").RouterGate;
 const moeRouterFusedEnabled = @import("../../../sdk/blocks/moe/router_kernel.zig").moeRouterFusedEnabled;
 const moePrefillExpertReduce = @import("../../../sdk/blocks/moe/verify_kernels.zig").moePrefillExpertReduce;
@@ -380,7 +381,7 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
         moe_reduced = true;
         shared_fused = shared_down != null or ungated_a4 != null;
         cost_arm = 1;
-    } else if (moeDecodeDispatchArm(B, S, K, false, (swigluClampLimit(self.config.swiglu_limit, self.config.swiglu_clamp) orelse 1) != 0) == .rows and
+    } else if (moeDecodeDispatchArm(B, S, K, false, rowsDeclineClamp(swigluClampLimit(self.config.swiglu_limit, self.config.swiglu_clamp))) == .rows and
         useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
         try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B, S))
     {
@@ -475,11 +476,14 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
             try mlx.check(mlx.mlx_astype(&row_map, lhs_idx, .uint32, self.s));
             const clamp = swigluClampLimit(cfg.swiglu_limit, cfg.swiglu_clamp);
             if (self.compiled_geglu == null and swigluFusedEnabled() and cfg.hidden_act == .silu and clamp != null and
-                mw.gate_expert_scale.ctx == null and mw.up_expert_scale.ctx == null and
                 gate_qp.bits == up_qp.bits and gate_qp.group_size == up_qp.group_size)
             {
                 const sigtab = try @import("../../../sdk/blocks/hc/hc_prefill.zig").sigmoidTable(self.s);
-                if (try gather_qmm_nax.sortedGateUp(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, sigtab, clamp.?, gate_qp.bits, gate_qp.group_size, gate_qp.mode.isFp4(), nax_available, self.s)) |act3| {
+                const esc: gather_qmm_nax.ExpertScales = .{
+                    .gate = if (mw.gate_expert_scale.ctx != null) mw.gate_expert_scale else null,
+                    .up = if (mw.up_expert_scale.ctx != null) mw.up_expert_scale else null,
+                };
+                if (try gather_qmm_nax.sortedGateUpScaled(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, sigtab, clamp.?, esc, gate_qp.bits, gate_qp.group_size, gate_qp.mode.isFp4(), nax_available, self.s)) |act3| {
                     // The kernel writes [M, 1, n]; the down gather below takes [M, n] like the squeezed stock path.
                     defer _ = mlx.mlx_array_free(act3);
                     var act = mlx.mlx_array_new();

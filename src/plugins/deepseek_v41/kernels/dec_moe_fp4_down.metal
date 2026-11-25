@@ -1,7 +1,8 @@
-// dec_moe_fp4_down: the routed (mxfp4) and shared (mxfp8) down projections of one decode row, the combine and the hc
-// expand into the next stream. A threadgroup is NC adjacent output columns of one row r: simdgroup j < TOPK is the row's
-// j-th pick, simdgroup TOPK the shared expert; lane l sums column l % NC over units l / NC, + 32 / NC... (the columns'
-// rows are adjacent in the bank). The slot sums are added in that order and rounded to T where `hcExpand` reads y.
+// dec_moe_fp4_down: the routed (fp4, groups of GS) and shared (mxfp8) down projections of one decode row, the combine
+// and the hc expand into the next stream. A threadgroup is NC adjacent output columns of one row r: simdgroup j < TOPK
+// is the row's j-th pick, simdgroup TOPK the shared expert; lane l sums column l % NC over units l / NC, + 32 / NC...
+// (the columns' rows are adjacent in the bank). The slot sums are added in that order and rounded to T where
+// `hcExpand` reads y.
 const uint d0 = threadgroup_position_in_grid.x * NC;
 const uint r = threadgroup_position_in_grid.y;
 const uint sgi = simdgroup_index_in_threadgroup;
@@ -12,7 +13,7 @@ float acc;
 if (sgi == uint(TOPK)) {
   acc = dec_fp4_down_shared<K, T>(sw, sscales, d0 + c, x + size_t(r * (TOPK + 1) + TOPK) * K, lane / NC, 32 / NC);
 } else {
-  acc = dec_fp4_down_routed<K, T>(w, scales, size_t(inds[r * TOPK + sgi]) * N + d0 + c, x + size_t(r * (TOPK + 1) + sgi) * K, lane / NC, 32 / NC);
+  acc = dec_fp4_down_routed<K, GS, T>(w, scales, size_t(inds[r * TOPK + sgi]) * N + d0 + c, x + size_t(r * (TOPK + 1) + sgi) * K, lane / NC, 32 / NC);
 }
 #pragma unroll
 for (uint o = 16; o >= uint(NC); o >>= 1) acc += simd_shuffle_xor(acc, o);

@@ -203,17 +203,10 @@ struct Fp4Q {
     scales += n;
   }
   METAL_FUNC P params(const int g) const thread {
-    const uint b = scales[g];
-    if constexpr (GS == 16) {
-      const uint v = b & 0x7Fu;
-      const ushort u = ushort((v << 7) | (((v + 1u) >> 7) << 14) | ((b & 0x80u) << 8));
-      return P{float(as_type<half>(u)) * 256.0f};
-    }
-    return P{as_type<float>(b == 0u ? 0x400000u : (b << 23))};
+    return P{mlxserve_fp4_scale_of<GS>(uint(scales[g]))};
   }
   METAL_FUNC static WT dq(thread const P& p, const uint32_t q) {
-    const float v = float(as_type<half>(ushort((q & 0x7u) << 9))) * 16384.0f;
-    return static_cast<WT>(p.s * ((q & 0x8u) ? -v : v));
+    return static_cast<WT>(p.s * mlxserve_fp4_e2m1_value(q));
   }
 };
 

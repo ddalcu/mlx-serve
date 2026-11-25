@@ -105,10 +105,12 @@ METAL_FUNC void map_rows(
   }
 }
 
-template <typename T, int EPI, bool WEIGHTED = false, typename DTile>
+template <typename T, int EPI, int ESC, bool WEIGHTED = false, typename DTile>
 METAL_FUNC void store_act(thread DTile& D, device T* y, const int ld,
                           const int rows, const device T* sigtab,
-                          const device float* row_wt);
+                          const device T* gsc, const device T* usc,
+                          const uint expert,
+                          const device float* row_wt = nullptr);
 
 template <
     typename T,
@@ -118,6 +120,7 @@ template <
     bool ALIGN_K,
     int EPI = 0,
     bool MAP = false,
+    int ESC = 0,
     bool WEIGHTED = false>
 METAL_FUNC void gather_mapped_seg(
     const device T* x,
@@ -135,8 +138,10 @@ METAL_FUNC void gather_mapped_seg(
     const uint sgid,
     const uint lane,
     const device T* sigtab,
-    const device float* row_wt = nullptr,
-    const int up_off = 0) {
+    const int up_off = 0,
+    const device T* gsc = nullptr,
+    const device T* usc = nullptr,
+    const device float* row_wt = nullptr) {
   using WT = typename Q::WT;
   constexpr bool kPair = EPI != 0;
   static_assert(!kPair || ALIGN_N, "paired gate/up tiles are full");
@@ -240,9 +245,9 @@ METAL_FUNC void gather_mapped_seg(
 
     if constexpr (kPair) {
       if (sg_active) {
-        store_act<T, EPI, WEIGHTED>(
-            Dtile, y + tm * ldy + tn / 2, ldy, int(sgp_sm), sigtab,
-            WEIGHTED ? (row_wt + row_start + tm) : row_wt);
+        store_act<T, EPI, ESC, WEIGHTED>(
+            Dtile, y + tm * ldy + tn / 2, ldy, int(sgp_sm), sigtab, gsc, usc,
+            expert, WEIGHTED ? (row_wt + row_start + tm) : row_wt);
       }
     } else if (kAlignedM.value && sgp_sn == kSN) {
       Dtile.store(y + tm * N + tn, N);
@@ -252,7 +257,7 @@ METAL_FUNC void gather_mapped_seg(
   });
 }
 
-template <typename T, typename Q, typename G, int EPI = 0, bool MAP = false, bool WEIGHTED = false>
+template <typename T, typename Q, typename G, int EPI = 0, bool MAP = false, int ESC = 0, bool WEIGHTED = false>
 METAL_FUNC void gather_mapped_db(
     const device T* x,
     const device uint32_t* rmap,
@@ -269,8 +274,10 @@ METAL_FUNC void gather_mapped_db(
     const uint sgid,
     const uint lane,
     const device T* sigtab,
-    const device float* row_wt = nullptr,
-    const int up_off = 0) {
+    const int up_off = 0,
+    const device T* gsc = nullptr,
+    const device T* usc = nullptr,
+    const device float* row_wt = nullptr) {
   using WT = typename Q::WT;
   static_assert(G::kBK == 64, "db runs 64-deep K steps");
   constexpr bool kPair = EPI != 0;
@@ -377,12 +384,15 @@ METAL_FUNC void gather_mapped_db(
 
   if constexpr (kPair) {
     if (rows > 0) {
-      store_act<T, EPI, WEIGHTED>(
+      store_act<T, EPI, ESC, WEIGHTED>(
           D,
           y + size_t(row_start + m0) * half_n + w_col + (kSN / 2) * (sgid % kWN),
           half_n,
           rows,
           sigtab,
+          gsc,
+          usc,
+          expert,
           WEIGHTED ? (row_wt + row_start + m0) : row_wt);
     }
   } else {
@@ -397,12 +407,25 @@ METAL_FUNC void gather_mapped_db(
 
 
 // EPI 1: silu(g) * u. EPI = 1 + L: the gate clamped above at L and u to [-L, L] first
-// (a `swiglu_limit`), on the rounded values like the split path's ops; WEIGHTED adds the
-// per-row routing weight on the rounded activation, bit-identical to a separate pass.
-template <typename T, int EPI, bool WEIGHTED, typename DTile>
+// (a `swiglu_limit`), on the rounded values like the split path's ops. ESC bit 0 / bit 1:
+// the expert's own gate / up scale (ModelOpt's per-expert global scale, `gsc` / `usc`
+// [E] in T) multiplies the rounded product before the clamp and the SiLU, rounded again,
+// as the split path's multiply does (and the fp4 decode kernel's GSCALE / USCALE). WEIGHTED
+// adds the per-row routing weight `row_wt[r]` on the rounded activation, bit-identical to
+// a separate pass.
+template <typename T, int EPI, int ESC, bool WEIGHTED, typename DTile>
 METAL_FUNC void store_act(
     thread DTile& D, device T* y, const int ld, const int rows,
-    const device T* sigtab, const device float* row_wt) {
+    const device T* sigtab, const device T* gsc, const device T* usc,
+    const uint expert, const device float* row_wt) {
+  T gs = T(1);
+  T us = T(1);
+  if constexpr ((ESC & 1) != 0) {
+    gs = gsc[expert];
+  }
+  if constexpr ((ESC & 2) != 0) {
+    us = usc[expert];
+  }
   const short2 sc = BaseNAXFrag::get_coord();
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < DTile::kTileRows; i++) {
@@ -418,9 +441,17 @@ METAL_FUNC void store_act(
           const short e = h * 4 + j;
           T g = T(D.frag_at(i, 0)[e]);
           T u = T(D.frag_at(i, 1)[e]);
+          if constexpr ((ESC & 1) != 0) {
+            g = T(g * gs);
+          }
+          if constexpr ((ESC & 2) != 0) {
+            u = T(u * us);
+          }
           if constexpr (EPI > 1) {
-            g = metal::min(g, T(EPI - 1));
-            u = metal::max(metal::min(u, T(EPI - 1)), T(1 - EPI));
+            // MLX's Minimum / Clip: a NaN stays NaN (metal::min / max return the other operand).
+            g = g > T(EPI - 1) ? T(EPI - 1) : g;
+            u = u < T(1 - EPI) ? T(1 - EPI) : u;
+            u = u > T(EPI - 1) ? T(EPI - 1) : u;
           }
           const T a = T(g * sigtab[as_type<ushort>(g)]);
           if constexpr (WEIGHTED) {

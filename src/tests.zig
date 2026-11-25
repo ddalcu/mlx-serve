@@ -37,7 +37,10 @@ test {
     _ = @import("sdk/blocks/mlp/fused_activations_test.zig");
     _ = @import("sdk/blocks/moe/decode_test.zig");
     _ = @import("sdk/blocks/moe/verify_kernels_test.zig");
+    _ = @import("sdk/blocks/moe/gqmv_fp4_test.zig");
     _ = @import("sdk/quant/block_test.zig");
+    _ = @import("sdk/quant/fp4.zig");
+    _ = @import("sdk/quant/fp_encode.zig");
     _ = @import("sdk/quant/hadamard/format_test.zig");
     _ = @import("sdk/vision/splice_test.zig");
     _ = @import("sdk/blocks/kda/gate_test.zig");
@@ -260,6 +263,7 @@ test {
     _ = @import("plugins/deepseek_v41/engram.zig");
     _ = @import("sdk/weights/nocache_reader.zig");
     _ = @import("plugins/deepseek_v41/deepseek_v41.zig");
+    _ = @import("plugins/deepseek_v41/decode/moe_fp4_test.zig");
     _ = @import("plugins/qwen4_exp/qwen4_exp.zig");
     _ = @import("plugins/qwen4_exp/ple_gpu.zig");
     _ = @import("plugins/kokoro/kokoro.zig");
