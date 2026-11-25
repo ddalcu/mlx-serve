@@ -9,7 +9,8 @@ name: CI
 # the 26.x SDK the runner provides (build.zig targets os_version_min 26.2).
 #
 # A PR runs only the jobs its files reach (`changes`, scripts/ci-changes.sh; a
-# skipped job counts as passing). push to main and workflow_dispatch run all of
+# skipped job counts as passing; if `changes` itself fails every job runs).
+# push to main and workflow_dispatch run all of
 # them. Caches are saved from main only: a PR restores them and never writes its
 # own copy, which no other PR can read and which pushed the repo over the 10 GB
 # cap (evicting the Linux and Windows MLX stages).
@@ -58,7 +59,7 @@ jobs:
   # they are two jobs too.
   zig:
     needs: changes
-    if: needs.changes.outputs.zig == 'true'
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.zig == 'true') }}
     runs-on: macos-26
     timeout-minutes: 60
     steps:
@@ -88,6 +89,7 @@ jobs:
           key: ${{ steps.zigkey.outputs.key }}
 
       - name: Build mlx-serve (Zig, ReleaseFast)
+        id: build
         run: zig build -Doptimize=ReleaseFast -Dstrip
 
       - name: Build vz-agent guest binary
@@ -109,7 +111,7 @@ jobs:
         run: bash tests/test_plugin_kit.sh
 
       - name: Save Zig build artifacts
-        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.zigcache.outputs.cache-hit != 'true' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && github.ref == 'refs/heads/main' && steps.zigcache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: |
@@ -119,7 +121,7 @@ jobs:
 
   zig-test:
     needs: changes
-    if: needs.changes.outputs.zig == 'true'
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.zig == 'true') }}
     runs-on: macos-26
     timeout-minutes: 75
     steps:
@@ -151,10 +153,10 @@ jobs:
       - name: Run Zig tests
         # 4 shards: the default sizes them by RAM. Not every GPU test skips on this virtual GPU, and at 8 they ran it
         # out of memory (a different kernel test exited 255 on each run).
-        run: zig build test --summary all -Dtest-shards=4 ${{ needs.changes.outputs.slow == 'true' && '-Dslow-tests' || '' }}
+        run: zig build test --summary all -Dtest-shards=4 ${{ (needs.changes.result != 'success' || needs.changes.outputs.slow == 'true') && '-Dslow-tests' || '' }}
 
       - name: Save Zig build artifacts
-        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.zigcache.outputs.cache-hit != 'true' }}
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.zigcache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: |
@@ -164,7 +166,7 @@ jobs:
 
   swift-app:
     needs: changes
-    if: needs.changes.outputs.swift == 'true'
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.swift == 'true') }}
     runs-on: macos-26
     timeout-minutes: 45
     steps:
@@ -196,7 +198,8 @@ jobs:
       # Do not force one Swift language mode through the dependency graph.
       # Each package's manifest owns its mode (SwaTex requires Swift 6.1).
       # Debug build only; the release build is release.yml's.
-      - name: Build and test Swift app
+      - name: Build Swift app and tests
+        id: compile
         working-directory: app
         run: |
           # Catch a drifted SwaTex font-lookup patch here rather than at release
@@ -204,10 +207,13 @@ jobs:
           swift package resolve
           bash ../scripts/patch-swatex-font-lookup.sh .build/checkouts/SwaTex
           swift build --build-tests
-          bash test.sh
+
+      - name: Test Swift app
+        working-directory: app
+        run: bash test.sh
 
       - name: Save SwiftPM build
-        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.swiftpm.outputs.cache-hit != 'true' }}
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' && github.ref == 'refs/heads/main' && steps.swiftpm.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: app/.build
