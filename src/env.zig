@@ -332,6 +332,7 @@ pub const vars = struct {
     pub const XDG_CONFIG_HOME: Var = .{ .kind = .public, .type = .text, .default = "~/.config", .owner = "host/launch", .since = "26.9.3", .doc = "opencode CLI config root for `launch`" };
 
     // ── kill switches and opt-in arms ──
+    pub const DSV41_COPY_SIZE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx/spec", .since = "26.11.3", .doc = "DeepSeek-V4.1 single-stream copy rounds verify the drafts their measured survival pays for (=0: every copied draft, as many as the match holds)" };
     pub const DSV41_TP_SUM: Var = .{ .kind = .kill, .type = .text, .default = "auto", .owner = "plugins/deepseek_v41", .since = "26.11.3", .doc = "DeepSeek-V4.1 tensor group sums: auto (activation dtype past a pair, a pair's rule otherwise), bf16 (at any size), f32 (a wider payload past a pair); any other value refuses the load; rank 0's value reaches the workers in its plan" };
     pub const MINIMAX_H3_GLUE_FUSED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 fused glue kernels (=0: the op chain)" };
     pub const MINIMAX_H3_VSA: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.3", .doc = "H3 trained VSA sparse attention (=0: dense attention, no gate branch)" };

@@ -118,6 +118,14 @@ pub const CopyStats = struct {
     }
 };
 
+/// The copy round that pays most, of a copy `len` tokens long that agreed `suffix` tokens back, under `costs`.
+pub fn copyChoice(copy: *const CopyStats, suffix: u32, len: usize, costs: *const Costs) Choice {
+    var p: [MAX_DRAFTS]f32 = undefined;
+    const n = @min(len, MAX_DRAFTS);
+    @memset(p[0..n], copy.probability(suffix));
+    return chooseRows(p[0..n], costs);
+}
+
 /// How often a drafter's draft is kept, by its place in the block and given the drafts before it were: counts of this
 /// request's own rounds, forgetting old ones. A place few rounds reached leans on the rate over all places, and that on
 /// `prior`. Plain steps fade the counts, so a request that stopped drafting returns to the prior and drafts again.
@@ -289,10 +297,7 @@ pub const Controller = struct {
 
     /// The copy round that pays most, of a copy `len` tokens long that agreed `suffix` tokens back.
     pub fn copied(c: *const Controller, suffix: u32, len: u32) Choice {
-        var p: [MAX_DRAFTS]f32 = undefined;
-        const n = @min(len, MAX_DRAFTS);
-        @memset(p[0..n], c.copy.probability(suffix));
-        return chooseRows(p[0..n], &c.ladder.copyCosts());
+        return copyChoice(&c.copy, suffix, len, &c.ladder.copyCosts());
     }
 
     /// The round to run: a copy (`copy_len` > 0 tokens that agreed `suffix` back), the drafter's block of at most
