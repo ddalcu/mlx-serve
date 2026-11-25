@@ -180,7 +180,8 @@ fn stackBit(comptime s: Stack) u8 {
     };
 }
 
-const state = shared.Shared(std.atomic.Value(u8), "dsv41_levers", .init(0));
+/// Listed in `src/shared_all.zig`, so the host unit exports it under `-Dunits` (the server build).
+pub const shared_state = shared.Shared(std.atomic.Value(u8), "dsv41_levers", .init(0));
 
 fn read() u8 {
     var b: u8 = READY;
@@ -199,14 +200,14 @@ fn read() u8 {
 /// Reads precision and the stack switches again (a model's load calls it, through `check`; a test that sets them,
 /// too). Before the first load, the first read takes them: the bill and admission read the same values as the load.
 pub fn refresh() void {
-    state.get().store(read(), .monotonic);
+    shared_state.get().store(read(), .monotonic);
 }
 
 fn bits() u8 {
-    const b = state.get().load(.monotonic);
+    const b = shared_state.get().load(.monotonic);
     if (b & READY != 0) return b;
     const r = read();
-    state.get().store(r, .monotonic);
+    shared_state.get().store(r, .monotonic);
     return r;
 }
 
