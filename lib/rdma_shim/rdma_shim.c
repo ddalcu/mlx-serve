@@ -2,18 +2,17 @@
  * Uses dlopen("librdma.dylib") so mlx-serve has zero dyld load-time dependency
  * and degrades cleanly to cache_transfer.rdma=false on hosts without TB5 RDMA.
  *
- * Transport design (verified on Apple Silicon Thunderbolt 5 rdma_en* hardware):
+ * Transport constraints and design:
  * - macOS librdma.dylib supports IBV_QPT_UC (Unreliable Connected) two-sided
  *   SEND/RECV only (IBV_QPT_RC returns EOPNOTSUPP and ibv_reg_mr rkey is 0).
  * - Each HCA enforces max_mr_size (~15.6 MiB), max_mr (100), and < 4 MiB of
  *   simultaneously posted IBV_WR_RECV bytes per QP.
  * - Each QP owns one pre-registered ~4 MiB staging ring MR (8 x 512 KiB data
- *   slots + 16 KiB control region) created once at QP setup. Per-transfer
- *   ibv_reg_mr latency is 0 ms, arbitrary KV cache sizes (1 B to 100+ GiB) are
- *   supported, and credit-paced 512 KiB x 4 (2 MiB window) streaming saturates
- *   the Thunderbolt 5 link (~8.71 GiB/s) while remaining well below the 4 MiB
- *   posted-recv ceiling. End-to-end integrity is verified by mlx-serve's 64-bit
- *   peer_wire Wyhash checksum on import. */
+ *   slots + 16 KiB control region) created once at QP setup, avoiding
+ *   per-transfer ibv_reg_mr calls and streaming arbitrary payload sizes with a
+ *   credit-paced 512 KiB x 4 (2 MiB) window below the 4 MiB posted-recv
+ *   ceiling. End-to-end integrity is checked by mlx-serve's 64-bit peer_wire
+ *   Wyhash checksum on import. */
 
 #include "rdma_shim.h"
 
