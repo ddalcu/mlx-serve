@@ -366,6 +366,7 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | PF_GU_SEG | 128 x 128 paired gate/up where the planner picks it | EXACT | test (word for word, to 8,192 rows, NVFP4 with per-expert scales; NAX) |
 | PF_KV_ROWS | Window kv rows on one simdgroup per row | EXACT | test (word for word) |
 | PF_COMP_PASS | Compressor pooling once over the pass, each span's index-key linear on its own groups | EXACT | test (word for word) |
+| PF_CED_COMP | The CED compressor at the split layer: each span's projection as before, then its norm, index keys and rope over the pass in one compressPass | EXACT | test (word for word) |
 | PF_DOWN_TOKORD | Staged down writes rows in token order | EXACT | test |
 | PF_DOWN_BK32 | Staged down on the 64 x 64 tile, 32 deep a step, at 96 routed rows an expert and more | EXACT | test (word for word) |
 | PF_FP4_GEMM | Staged matrix-unit gather for routed gate/up and down | EXACT | test |
@@ -457,8 +458,9 @@ Standard test, p01, greedy, DSpark on, NVFP4 pack:
 | `58279979`, the last reviewed head | 4,009.6 | 82.93 |
 | `a99fc4f6`, the release | 5,551.3 | 98.80 |
 
-Three later prompt levers (`PF_COMP_PASS`, `PF_IDX_PASS`, `PF_DOWN_BK32`) are on by default and not in these cells;
-their gains are measured per A/B (+0.27%, +0.26% and +0.08% prefill). From `58279979` to the release (the 47 changes, the upstream merge and the audit fixes): +38.4% prefill and +19.1% decode (`58279979` on
+Four later prompt levers (`PF_COMP_PASS`, `PF_IDX_PASS`, `PF_DOWN_BK32`, `PF_CED_COMP`) are on by default and not in
+these cells; their gains are measured per A/B (+0.27%, +0.26%, +0.08% and +0.02% prefill; `PF_CED_COMP`'s A/B gave
+the same text in both arms and is kept for the about 50 launches a span it removes). From `58279979` to the release (the 47 changes, the upstream merge and the audit fixes): +38.4% prefill and +19.1% decode (`58279979` on
 Mac 1, the release on Mac 2, which runs about 0.8% slower per round). On `f7e4da9e` the MXFP4-experts pack ran
 4,108.3 / 73.83 tok/s; NVFP4 was 2.8% slower.
 
