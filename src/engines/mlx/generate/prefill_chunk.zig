@@ -1,5 +1,6 @@
 //! Prefill chunking: chunk width, tail merge, SSM checkpoint cadence, vision chunking and allocator-cache clears.
 const std = @import("std");
+const abi = @import("../../../abi/plugin.zig");
 const env = @import("../../../env.zig");
 const transformer_mod = @import("../transformer.zig");
 const model_mod = @import("../../../sdk/config/model.zig");
@@ -352,8 +353,8 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
     return @max(base, prefill_chunk);
 }
 
-/// `stride` rounded up to a multiple of `chunk`, the width the prefill runs, under `MLX_SERVE_CP_STRIDE_ON_CHUNK=1`
-/// (`on`); off, `stride` as is. The stride coarsens against the launch chunk (`effectiveSsmCheckpointStride`), so a
+/// `stride` rounded up to a multiple of `chunk`, the width the prefill runs, when `on` (`ssmStrideOnChunk`); off,
+/// `stride` as is. The stride coarsens against the launch chunk (`effectiveSsmCheckpointStride`), so a
 /// chunk the score budget narrowed to a width that does not divide it (3584 against 8192) runs a short piece before
 /// every boundary (3584 + 3584 + 1024). Rounded up, every boundary is a chunk end and the spacing only gets coarser.
 /// 0 (no checkpoints) stays 0.
@@ -362,18 +363,26 @@ pub fn chunkAlignedSsmCheckpointStride(stride: usize, chunk: usize, on: bool) us
     return (stride + chunk - 1) / chunk * chunk;
 }
 
-/// The switch `chunkAlignedSsmCheckpointStride` reads at its call sites (default off).
-pub fn ssmStrideOnChunk() bool {
-    return env.one(.MLX_SERVE_CP_STRIDE_ON_CHUNK);
+/// The switch `chunkAlignedSsmCheckpointStride` reads at its call sites: `MLX_SERVE_CP_STRIDE_ON_CHUNK=1`, or a model
+/// plugin whose bill sets `BillFlags.cp_stride_on_chunk`. Off for every other model.
+pub fn ssmStrideOnChunk(config: *const model_mod.ModelConfig) bool {
+    return env.one(.MLX_SERVE_CP_STRIDE_ON_CHUNK) or billFlagsOf(config).cp_stride_on_chunk;
 }
 
-/// The switch `ChunkPool` reads (default off).
-pub fn prefillKeepCache() bool {
-    return env.one(.MLX_SERVE_PREFILL_KEEP_CACHE);
+/// The switch `ChunkPool` reads: `MLX_SERVE_PREFILL_KEEP_CACHE=1`, or a model plugin whose bill sets
+/// `BillFlags.prefill_keep_cache`. Off for every other model.
+pub fn prefillKeepCache(config: *const model_mod.ModelConfig) bool {
+    return env.one(.MLX_SERVE_PREFILL_KEEP_CACHE) or billFlagsOf(config).prefill_keep_cache;
 }
 
-/// Where the prefill chunk loop returns MLX's buffer pool (`mlx_clear_cache`). Off (`MLX_SERVE_PREFILL_KEEP_CACHE`
-/// unset): after every chunk, as before (dfd66c49 put the clear in the loop to bound a long prefill's memory). On:
+/// The model plugin's bill flags: all clear for a model without a plugin and for a plugin whose Bill predates them.
+fn billFlagsOf(config: *const model_mod.ModelConfig) abi.BillFlags {
+    const b = config.plugin orelse return .{};
+    return b.billTerms().flags orelse .{};
+}
+
+/// Where the prefill chunk loop returns MLX's buffer pool (`mlx_clear_cache`). Off (`prefillKeepCache`
+/// false): after every chunk, as before (dfd66c49 put the clear in the loop to bound a long prefill's memory). On:
 /// the pool stays between two chunks of the same width, so the next chunk's layers take back the buffers the last one
 /// freed (MLX reuses a pooled buffer only within two pages of the size asked) instead of allocating and first-touching
 /// them afresh. It is kept only where nothing else can need the memory or read it: another chunk of the same width
@@ -1158,6 +1167,53 @@ test "ChunkPool: off clears at every boundary; on keeps it between same-width ch
     try testing.expect(!on.atExit());
 }
 
+test "BillFlags.cp_stride_on_chunk and prefill_keep_cache: a plugin's bill turns each switch on for its model; a model without a plugin, a clear flag and an older Bill keep it off" {
+    const plugin_config = @import("../plugin/config.zig");
+    const Probe = struct {
+        fn clear(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{};
+        }
+        fn older(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .flags = .{ .cp_stride_on_chunk = true, .prefill_keep_cache = true } };
+            out.size = @offsetOf(abi.Bill, "flags");
+        }
+        fn stride(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .flags = .{ .cp_stride_on_chunk = true } };
+        }
+        fn keep(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .flags = .{ .prefill_keep_cache = true } };
+        }
+    };
+    const saved_stride = env.override(.MLX_SERVE_CP_STRIDE_ON_CHUNK, null);
+    defer saved_stride.restore();
+    const saved_keep = env.override(.MLX_SERVE_PREFILL_KEEP_CACHE, null);
+    defer saved_keep.restore();
+    var cfg: model_mod.ModelConfig = .{};
+    // No plugin: both off.
+    try testing.expect(!ssmStrideOnChunk(&cfg) and !prefillKeepCache(&cfg));
+    var table: abi.ModelTable = undefined;
+    var binding: plugin_config.Binding = .{ .table = &table };
+    cfg.plugin = &binding;
+    // A clear flag, and a Bill that ends before the flag word (its flags read as absent): both off.
+    for ([_]*const fn (*const abi.Parsed, *const abi.Shape, *abi.Bill) callconv(.c) void{ &Probe.clear, &Probe.older }) |bill| {
+        table.bill = bill;
+        try testing.expect(!ssmStrideOnChunk(&cfg) and !prefillKeepCache(&cfg));
+    }
+    // Each flag turns on its own switch only.
+    table.bill = &Probe.stride;
+    try testing.expect(ssmStrideOnChunk(&cfg) and !prefillKeepCache(&cfg));
+    table.bill = &Probe.keep;
+    try testing.expect(!ssmStrideOnChunk(&cfg) and prefillKeepCache(&cfg));
+    // The env words turn each on for a model without a plugin, as before.
+    cfg.plugin = null;
+    const on_stride = env.override(.MLX_SERVE_CP_STRIDE_ON_CHUNK, "1");
+    defer on_stride.restore();
+    try testing.expect(ssmStrideOnChunk(&cfg) and !prefillKeepCache(&cfg));
+    const on_keep = env.override(.MLX_SERVE_PREFILL_KEEP_CACHE, "1");
+    defer on_keep.restore();
+    try testing.expect(prefillKeepCache(&cfg));
+}
+
 test "a vision prefill checkpoints SSM state like text" {
     const prefix_len: usize = 1587;
     const checkpoint_stride: u32 = 256;
@@ -1372,7 +1428,6 @@ test "wholePromptCheckpointBound: no width, offset or cap plans more checkpoints
 // rows, a reply past 8,192 and a prompt under 32,768 included; a model without it keeps the prompt and a chunk.
 test "reservedPrefillTokens: a reserving model reserves its whole request to the context; the others as before" {
     const t = std.testing;
-    const abi = @import("../../../abi/plugin.zig");
     const plugin_config = @import("../plugin/config.zig");
     const verify_rows = @import("init.zig").verify_rows_max;
     const Probe = struct {

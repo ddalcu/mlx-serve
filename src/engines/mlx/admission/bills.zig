@@ -366,7 +366,7 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
     const stride: u64 = generate_mod.chunkAlignedSsmCheckpointStride(generate_mod.effectiveSsmCheckpointStride(
         http_server.launch().ssm_checkpoint_stride,
         @max(@as(usize, @intCast(chunk)), generate_mod.prefillCli().override),
-    ), @intCast(chunk), generate_mod.ssmStrideOnChunk());
+    ), @intCast(chunk), generate_mod.ssmStrideOnChunk(config));
     if (stride == 0) return 0;
     // Stride-aligned capture positions in `(matched, seq]` plus the always-on end-of-prompt
     // snapshot, the only capture a warm append shorter than one stride makes.

@@ -261,11 +261,11 @@ pub fn initWithOptions(
     // above must not densify checkpoint spacing (16× more captures at
     // 255K ctx otherwise). nextChunkEnd already shortens a chunk to land
     // on stride boundaries, so a capped chunk stays compatible.
-    // `MLX_SERVE_CP_STRIDE_ON_CHUNK=1` rounds that stride up to a multiple of
-    // the capped chunk, so the cut lands on a chunk end instead of a short
-    // piece before it (chunkAlignedSsmCheckpointStride).
+    // `MLX_SERVE_CP_STRIDE_ON_CHUNK=1` (or the plugin's bill flag) rounds that
+    // stride up to a multiple of the capped chunk, so the cut lands on a chunk
+    // end instead of a short piece before it (chunkAlignedSsmCheckpointStride).
     const ssm_cp_stride: usize = if (want_ssm_cp)
-        chunkAlignedSsmCheckpointStride(effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, generate_mod.prefillCli().override)), PREFILL_CHUNK, ssmStrideOnChunk())
+        chunkAlignedSsmCheckpointStride(effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, generate_mod.prefillCli().override)), PREFILL_CHUNK, ssmStrideOnChunk(&xfm.config))
     else
         0;
     // Absolute KV position of `prompt_ids[0]`. Warm-path callers (the
@@ -413,9 +413,10 @@ pub fn initWithOptions(
 
         var pos: usize = 0;
         if (options.prefill_expected) |e| e.store(@intCast(loop_end), .monotonic);
-        // Where the loop returns MLX's buffer pool: after every chunk, or under MLX_SERVE_PREFILL_KEEP_CACHE=1 kept
-        // between same-width chunks while no other request runs (`ChunkPool`); a cancel or an error clears a kept one.
-        var pool: ChunkPool = .{ .on = prefillKeepCache() };
+        // Where the loop returns MLX's buffer pool: after every chunk, or under MLX_SERVE_PREFILL_KEEP_CACHE=1 (or the
+        // plugin's bill flag) kept between same-width chunks while no other request runs (`ChunkPool`); a cancel or an
+        // error clears a kept one.
+        var pool: ChunkPool = .{ .on = prefillKeepCache(&xfm.config) };
         errdefer {
             if (pool.atExit()) _ = mlx.mlx_clear_cache();
         }

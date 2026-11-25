@@ -241,7 +241,7 @@ pub const InitOptions = struct {
 pub const InterleaveHook = struct {
     ctx: *anyopaque,
     call: *const fn (ctx: *anyopaque) void,
-    /// No other request runs at this boundary (none decoding, none pending): `MLX_SERVE_PREFILL_KEEP_CACHE` keeps the
+    /// No other request runs at this boundary (none decoding, none pending): `prefillKeepCache` keeps the
     /// buffer pool only then (`ChunkPool`). Null: never idle.
     idle: ?*const fn (ctx: *anyopaque) bool = null,
 };

@@ -473,7 +473,9 @@ The plugin's memory terms. A zero or null term is the engine's default arithmeti
 |---|---|---|---|
 | `decode_room` | `DecodeRoom` | `.by_name` |  |
 | `reserves_request` | `bool` | `false` | A decode-billed request reserves its whole KV (prompt, reply to the context, verify rows) at its prompt and its decode bill prices that KV once (`reservedPrefillTokens`, `glm5DecodeMemoryNeeded`). |
-| `_` | `u29` | `0` |  |
+| `cp_stride_on_chunk` | `bool` | `false` | The prompt's SSM checkpoint stride rounds up to a multiple of the chunk the prefill runs, so every checkpoint lands on a chunk end (`chunkAlignedSsmCheckpointStride`), as `MLX_SERVE_CP_STRIDE_ON_CHUNK=1` does for any model. |
+| `prefill_keep_cache` | `bool` | `false` | The prefill loop keeps MLX's buffer pool between two chunks of the same width while no other request runs (`ChunkPool`), as `MLX_SERVE_PREFILL_KEEP_CACHE=1` does for any model. |
+| `_` | `u27` | `0` |  |
 
 ### `DecodeRoom` (enum(u2))
 
