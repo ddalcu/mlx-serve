@@ -153,6 +153,10 @@ pub fn slotFixedKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64, chun
 /// Counts rows held, not the buffer planGrow allocates (KVCache.nextCapacity rounds up in 256-row steps);
 /// full-attention layers round the same way, and the flat runtime floor (KVCache.RESERVE_MIN_TOKENS) covers it.
 fn slotFixedKvBytesUpTo(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64, rows: u64) u64 {
+    if (config.plugin) |b| {
+        const fixed = b.billTerms().fixed_slot_bytes;
+        if (fixed > 0) return fixed;
+    }
     const ring_rows: u64 = @min(@as(u64, config.slidingKeepRows()) +| chunk, rows);
     return config.qsaRingBytes() +| kvBytesPerTokenAtBits(config.slidingRowBytes(), kv_bits) *| ring_rows;
 }

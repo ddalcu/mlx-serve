@@ -837,3 +837,58 @@ test "a streamed GLM's load-time hot-cache budget fits the bill's hot-cache term
     binding.parsed.caps.streamed_weights = false;
     try t.expectEqual(session, prefixCacheMemForLoad(&glm, PREFIX_CACHE_MEM_DEFAULT, .{ .quiet = true }, &idle));
 }
+
+test "hot-cache plan: outside plugin bill kv_per_token, fixed_slot_bytes, and prefill_attn_keys govern admission" {
+    const t = std.testing;
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    const Outside = struct {
+        fn attnKeys(_: *const StreamedProbe.abi.Parsed, seq: u64) callconv(.c) u64 {
+            return @min(seq, 512 + 128 + 1);
+        }
+        fn bill(_: *const StreamedProbe.abi.Parsed, _: *const StreamedProbe.abi.Shape, out: *StreamedProbe.abi.Bill) callconv(.c) void {
+            out.* = .{
+                .kv_per_token = 890,
+                .fixed_slot_bytes = 24 * MiB,
+                .prefill_attn_keys = &attnKeys,
+                .prefill_bytes = &StreamedProbe.prefill,
+            };
+        }
+    };
+    var table: StreamedProbe.abi.ModelTable = undefined;
+    table.bill = &Outside.bill;
+    table.cache = @import("../../../plugins/deepseek_v41/plugin.zig").table.cache;
+    var binding: @import("../plugin/config.zig").Binding = .{
+        .table = &table,
+        .outside = true,
+        .parsed = .{ .caps = .{ .streamed_weights = true, .owns_decode_state = true } },
+    };
+    binding.readBillTerms();
+
+    var cfg: model_mod.ModelConfig = .{
+        .model_type = "sushi_deepseek_v41",
+        .num_hidden_layers = 40,
+        .num_attention_heads = 64,
+        .num_key_value_heads = 1,
+        .head_dim = 512,
+        .max_position_embeddings = 1_048_576,
+    };
+    cfg.plugin = &binding;
+
+    try t.expectEqual(@as(u64, 890), cfg.kvBytesPerToken());
+    try t.expectEqual(@as(u64, 641), cfg.prefillAttnKeys(262_144));
+    try t.expectEqual(@as(u64, 24 * MiB), slotFixedKvBytes(&cfg, 16, 8192));
+    try t.expectEqual(@as(u64, 890 * 262_144 + 24 * MiB), oneSessionEntryBytes(&cfg, 16, 262_144, 8192));
+
+    // At 256k context on a 225 GiB ceiling with ~147 GiB resident, 890 B/tok (~246 MiB)
+    // keeps the full 8 GiB hot-cache budget instead of clamping to 0 MB under the 81,920 B/tok fallback.
+    const memory_ceiling = @import("../../../host/registry/memory_ceiling.zig");
+    const saved = memory_ceiling.overrides().*;
+    defer memory_ceiling.overrides().* = saved;
+    defer clearResolvedPrefixCacheMem();
+    memory_ceiling.overrides().static_ceiling = 225 * GiB;
+    memory_ceiling.overrides().machine_free = .{ .idle = 78 * GiB, .request = 78 * GiB };
+    cfg.ctx_override = 262_144;
+    var idle: u64 = 0;
+    try t.expectEqual(8 * GiB, prefixCacheMemForLoad(&cfg, 8 * GiB, .{ .quiet = true }, &idle));
+}

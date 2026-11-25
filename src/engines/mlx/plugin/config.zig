@@ -33,14 +33,24 @@ pub const Binding = struct {
         /// null from a plugin whose Bill predates them.
         flags: ?abi.BillFlags,
         prices_prompt: bool,
+        kv_per_token: u64 = 0,
+        fixed_slot_bytes: u64 = 0,
         state_per_token: u64 = 0,
+        prefill_attn_keys: ?*const fn (p: *const abi.Parsed, seq: u64) callconv(.c) u64 = null,
     };
 
     pub fn billTerms(b: *const Binding) BillTerms {
         if (b.bill_terms) |t| return t;
         var bill: abi.Bill = .{};
         b.table.bill(&b.parsed, &.{ .context = abi.stream_room_cell }, &bill);
-        return .{ .flags = bill.billFlags(), .prices_prompt = bill.prefill_bytes != null, .state_per_token = bill.state_per_token };
+        return .{
+            .flags = bill.billFlags(),
+            .prices_prompt = bill.prefill_bytes != null,
+            .kv_per_token = bill.kv_per_token,
+            .fixed_slot_bytes = bill.fixed_slot_bytes,
+            .state_per_token = bill.state_per_token,
+            .prefill_attn_keys = bill.prefill_attn_keys,
+        };
     }
 
     /// Called once, after the parse and before any other thread reads the binding.
