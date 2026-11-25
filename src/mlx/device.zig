@@ -192,6 +192,17 @@ pub fn totalMemBytes() u64 {
 /// Test seam: pin the GPU generation every generation-keyed plan reads (null = the device's).
 pub var device_gen_override: ?DeviceGen = null;
 
+/// What a machine-keyed table (a measured knee) looks the machine up by: the CPU brand and the RAM.
+pub const MachineId = struct { chip: []const u8, mem: u64 };
+
+/// This machine's `MachineId`; the test world pins it (`sdk/testing/world.zig`), so a unit test never reads the box.
+pub fn machineId() MachineId {
+    return machine_id_override orelse .{ .chip = ane_offload.chipBrand(), .mem = totalMemBytes() };
+}
+
+/// Set by the test world only (null = this machine).
+pub var machine_id_override: ?MachineId = null;
+
 // ── tests ──
 
 test "NAX availability rejects compiler versions and malformed GPU identifiers" {

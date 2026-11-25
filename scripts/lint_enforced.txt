@@ -3,3 +3,4 @@
 pin-unmatched
 source-scan-test
 history-comment
+machine-read-in-test

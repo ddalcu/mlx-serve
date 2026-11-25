@@ -14,6 +14,20 @@ comptime {
 /// The test process caps MLX's buffer pool as the server's `main` does; `build/test_runner.zig` calls it first.
 export fn msv_test_process_init() void {
     @import("mlx/state.zig").applyMlxCacheLimit();
+    @import("sdk/testing/world.zig").processInit();
+}
+
+/// Before every test (`build/test_runner.zig`): the test world, then the latched state it resets, listed here because
+/// only the test root reaches every module.
+export fn msv_test_enter() void {
+    @import("sdk/testing/world.zig").enter();
+    @import("engines/mlx/generate.zig").prefillCli().* = .{};
+    @import("host/registry/memory_ceiling.zig").overrides().* = .{};
+    @import("plugins/deepseek_v41/fuse.zig").shared_state.get().* = .{};
+    @import("plugins/deepseek_v41/decode/fp8_codes.zig").shared_state.get().* = .{};
+    @import("plugins/deepseek_v41/prompt/flash_attn.zig").shared_state.get().* = .{};
+    @import("plugins/deepseek_v41/deepseek_v41.zig").testReset();
+    @import("plugins/deepseek_v4/deepseek_v4.zig").testReset();
 }
 
 test {

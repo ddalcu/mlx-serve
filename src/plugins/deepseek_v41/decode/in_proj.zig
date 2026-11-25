@@ -25,7 +25,7 @@ const STAGE_OUTS = [_][*:0]const u8{"h"};
 
 /// The first Apple GPU family (M3) that runs its 640-thread groups at every row count: M1 and M2 cap a pipeline's
 /// threads by its registers, and R = 6 with bf16 rows compiles for fewer.
-const first_gen = 15;
+pub const first_gen = 15;
 /// The most rows whose stream every threadgroup re-reads and collapses: past two the re-reads cost more than the stage launch.
 const fuse_rows = 2;
 /// Output rows a threadgroup: q_kv's mxfp8 rows, and the bf16 rows of weights_proj and the compressor.

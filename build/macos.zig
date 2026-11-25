@@ -284,6 +284,8 @@ pub fn addUnitTests(g: *const Graph) Tests {
     // filtered or not: a `sharded:` test (the kernel contract's gates 1-4) splits its own work across them, so a
     // filtered contract run takes a shard's time, not the whole registry's on one core. `-Dtest-shards=1`: one process.
     const shards: u32 = b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse defaultShards();
+    // The flip proof (`scripts/flip_proof.py`): every test starts with this lever at its other arm (sdk/testing/world.zig).
+    const test_flip = b.option([]const u8, "test-flip", "Run every test with this lever (NAME or NAME=value) at its other arm: the flip proof");
     const test_runs = b.allocator.alloc(*std.Build.Step.Run, shards) catch @panic("OOM");
     const test_step = b.step("test", "Run unit tests");
     // A Run step given an env var copies the WHOLE configure-time environment into the cached configuration, so the
@@ -298,6 +300,10 @@ pub fn addUnitTests(g: *const Graph) Tests {
         // A filtered run is a targeted one, often gated on an env var (ANE_TEST_PACK, QWEN4_TEST_MODEL)
         // that the run's cache key does not see: it reruns every time.
         if (test_filters.len != 0) run.*.has_side_effects = true;
+        if (test_flip) |f| {
+            run.*.setEnvironmentVariable("MLX_SERVE_TEST_FLIP", f);
+            run.*.has_side_effects = true;
+        }
         if (qwen_preprocess_fixture) |fixture| {
             run.*.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
             run.*.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });

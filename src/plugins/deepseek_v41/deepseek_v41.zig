@@ -36,6 +36,7 @@ const dsv4 = @import("../deepseek_v4/deepseek_v4.zig");
 const streamed = @import("../../sdk/weights/streamed.zig");
 const dkern = @import("decode/decode.zig");
 const device = @import("../../mlx/device.zig");
+const world = @import("../../sdk/testing/world.zig");
 /// A pack an outside quant plugin reads: its linears and resident banks run on the plugin.
 const outside = @import("../../sdk/quant/outside.zig");
 /// the embed_pread.zig (the embedding pread): the embedding table read from the pack per lookup.
@@ -1041,6 +1042,20 @@ fn cedEnabled() bool {
         ced_env = v == null or v.?[0] != '0';
     }
     return ced_env.?;
+}
+
+/// The test world's reset (`src/tests.zig` calls it before every test): the latched CED read and the engagement
+/// counters tests read, as a fresh process holds them.
+pub fn testReset() void {
+    ced_env = null;
+    inline for (.{ &rope_pairs_calls, &rms_rows_calls, &kv_rows_calls, &comp_bf16_count, &comp_pass_count, &idx_pass_count, &router_bf16_count, &eng_ahead_served, &eng_ahead_launched, &eng_ahead_taken, &draft_pos_once_runs, &stage_fused_runs, &fp4gemm.launches, &pfroute.served }) |a| a.store(0, .monotonic);
+    for (&core_calls) |*a| a.store(0, .monotonic);
+    ced_hc_passes.store(0, .monotonic);
+    fp4gemm.bk32_launches.store(0, .monotonic);
+    fp4gemm.tok_launches.store(0, .monotonic);
+    sync_rounds.store(0, .monotonic);
+    sync_collects.store(0, .monotonic);
+    fusion.engaged = .{};
 }
 
 pub fn resetCedEnvForTest() void {
@@ -2758,12 +2773,11 @@ pub fn passCeilFor(chip: []const u8, mem: u64) usize {
 /// `passCeilFor` this machine under `MLX_SERVE_DSV41_PF_PASS_CEIL` (default on): 0 at `=0`, or where no knee is measured.
 pub fn passCeil() usize {
     if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_PASS_CEIL)) return 0;
-    const c = if (pass_ceil_machine) |m| passCeilFor(m.chip, m.mem) else passCeilFor(@import("../../sdk/ane/offload.zig").chipBrand(), device.totalMemBytes());
+    const id = device.machineId();
+    const c = passCeilFor(id.chip, id.mem);
     return if (pass_ceil_plant and c > 0) c + 4 * SPAN else c;
 }
 
-/// Test seam: the machine `passCeil` reads (null: this one's CPU brand and memory).
-pub var pass_ceil_machine: ?struct { chip: []const u8, mem: u64 } = null;
 /// `MLX_SERVE_DSV41_PF_PASS_CEIL`'s planted bug (its test): the ceiling 1,024 rows too high.
 pub var pass_ceil_plant = false;
 
@@ -11356,7 +11370,7 @@ test "dsv41 wide attention: the f16 core and the matrix-unit core give the f32 c
     const fa_was = fa.ps().*;
     defer fa.ps().* = fa_was;
     fa.ps().* = .{};
-    m.attn_gather = if (device.naxAvailable()) try GatherAttn.init() else null;
+    m.attn_gather = if (world.nax()) try GatherAttn.init() else null;
     defer if (m.attn_gather) |*g| g.deinit();
     var key = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(key);

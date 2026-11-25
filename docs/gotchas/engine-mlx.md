@@ -1648,3 +1648,14 @@ which `rollbackSsmTo` cannot undo after a drafted round, so no decode-end entry 
 round the request's stop ids (`Forward.stop_ids`) and the drafter never verifies one (`draftsToVerify`): the trunk's
 token carries the stop. Guards: `plugin native drafter: a round is handed the request's stop ids`, `inkling2 draft: a
 round never verifies a stop`.
+
+### A default flip broke tests that leaned on the old default or on the machine
+Defect: five times a lever's default flipped, or the suite ran on the M5 Ultra 512 GiB instead of another Mac, and a
+DeepSeek test that leaned on the old setting failed or checked nothing: PF_PASS_CEIL on by default made `dsv41
+prefill chunk: the pass plan pins the widest...` fail on the M5 Ultra only (`passCeil` read the real chip and RAM),
+and a test that left PF_COMP_BF16=0 behind made a later PF_COMP_PASS test fail in file order. Cause: tests read
+lever defaults, the real machine and process-global latches that no test owned; each test pinned what its author
+remembered. Fix: the test world (`sdk/testing/world.zig`) puts every test back at the process's variables, MLX's
+limits, the reference machine and the latched state `src/tests.zig` lists; machine-keyed tables read
+`device.machineId`; the flip proof (`scripts/flip_proof.py`, `-Dtest-flip`) lists the tests a flip changes. Guards:
+`sharded: dsv41 test world: ...` (a leak, then the next test), `test world: ...`, lint `machine-read-in-test`.

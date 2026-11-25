@@ -111,6 +111,12 @@ jobs:
         # out of memory (a different kernel test exited 255 on each run).
         run: zig build test --summary all -Dtest-shards=4 ${{ steps.slowtests.outputs.needed == '1' && '-Dslow-tests' || '' }}
 
+      # The flip proof: a PR that flips a lever's default lists the tests that hold only at the new default
+      # (scripts/flip_proof.py). GPU tests skip on this runner; the box job runs them for the lever being flipped.
+      - name: Flip proof (CPU, the levers this PR flips)
+        if: github.event_name == 'pull_request'
+        run: python3 scripts/flip_proof.py ci "origin/${{ github.base_ref }}" -Dtest-shards=4 -Dtest-filter=deepseek -Dtest-filter=dsv4
+
   swift-app:
     runs-on: macos-26
     timeout-minutes: 45

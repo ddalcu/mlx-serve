@@ -8,6 +8,7 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
+const world = @import("../../../sdk/testing/world.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const mpair = @import("moe_pair.zig");
 const pfroute = @import("pf_route.zig");
@@ -2335,7 +2336,7 @@ test "dsv41 wide tol: FLASH_ATTN's heads at a pick count not a multiple of 64 (a
     m.attn_softmax_kernel = try dsv41.buildKernel("dsv41_attn_softmax", &dsv41.ATTN_SOFTMAX_INS, &.{ "pw", "pc" }, dsv41.ATTN_SOFTMAX_SOURCE, "");
     defer _ = mlx.mlx_fast_metal_kernel_free(m.attn_softmax_kernel);
     // The f32 chain's GEMMs are TF32 on NAX unless MLX_ENABLE_TF32=0 (read at the process's first matmul): M5's =0.
-    const tf32 = device.tf32Matmul();
+    const tf32 = world.tf32();
     var ok = true;
     for (odd_spans ++ served_spans, 0..) |c, ci_| {
         var s = try Span.init(&sc, c, 80 + 10 * ci_);
@@ -2398,7 +2399,7 @@ test "dsv41 wide tol: the f32 chain where attnCore's lossless cores end on NAX (
     }.of;
     const Arm = struct { name: []const u8, nh: usize, in: mlx.mlx_dtype };
     const arms = [_]Arm{ .{ .name = "tensor split, 32 heads", .nh = 32, .in = .bfloat16 }, .{ .name = "f16 activations", .nh = HEADS, .in = .float16 }, .{ .name = "f32 activations", .nh = HEADS, .in = .float32 } };
-    const tf32 = device.tf32Matmul();
+    const tf32 = world.tf32();
     var ok = true;
     for ([_]SpanCase{ span_cases[0], span_cases[1], odd_spans[0], odd_spans[4], served_spans[0], served_spans[7] }, 0..) |c, ci_| {
         var s = try Span.init(&sc, c, 140 + 10 * ci_);
@@ -2439,7 +2440,7 @@ test "dsv41 wide meas: MLX_SERVE_DSV41_ATTN_F16's f16 core (LOSSY; it serves wit
     attnModel(&m, .bfloat16);
     m.attn_softmax_kernel = try dsv41.buildKernel("dsv41_attn_softmax", &dsv41.ATTN_SOFTMAX_INS, &.{ "pw", "pc" }, dsv41.ATTN_SOFTMAX_SOURCE, "");
     defer _ = mlx.mlx_fast_metal_kernel_free(m.attn_softmax_kernel);
-    const tf32 = device.tf32Matmul();
+    const tf32 = world.tf32();
     for (span_cases ++ odd_spans[0..5].*, 0..) |c, ci_| {
         var s = try Span.init(&sc, c, 40 + 10 * ci_);
         defer s.deinit();
