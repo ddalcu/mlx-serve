@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
 const dsv41 = @import("../deepseek_v41.zig");
@@ -88,8 +89,8 @@ fn scan(gpa: std.mem.Allocator, s: mlx.mlx_stream, lins: []const *const dsv41.Li
 pub fn settle(m: *const dsv41.Dsv41Model) !void {
     const st = ps();
     st.* = .{};
-    const fold = env.onUnlessZero(.MLX_SERVE_DSV41_FP8_FOLD);
-    const reads = env.onUnlessZero(.MLX_SERVE_DSV41_FP4_READS);
+    const fold = lev.onUnlessZero(.FP8_FOLD);
+    const reads = lev.onUnlessZero(.FP4_READS);
     if (!fold and !reads) return;
     for (m.layers, 0..) |*ly, li| {
         if (!(fold and st.fold) and !(reads and st.reads)) return;

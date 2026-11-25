@@ -5,6 +5,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const device = @import("../../../mlx/device.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
@@ -116,7 +117,7 @@ fn buildTilePlant() !mlx.mlx_fast_metal_kernel {
 
 /// `MLX_SERVE_DSV41_ATTN_DEC` (on by default, read each call; =0 `dec_attn`): the fused decode attention takes `partialsTile`.
 pub fn tileOn() bool {
-    return env.onUnlessZero(.MLX_SERVE_DSV41_ATTN_DEC);
+    return lev.onUnlessZero(.ATTN_DEC);
 }
 
 /// A launch of the shape-cut kernel: `s` splits of at most `tk` keys (a multiple of 32, at most 128), `nsg`

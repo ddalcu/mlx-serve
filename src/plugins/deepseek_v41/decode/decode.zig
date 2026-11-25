@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
@@ -126,7 +127,7 @@ pub const FP8_READ_HEADER = @import("../../../sdk/quant/fp4.zig").SCALE_HEADER +
 /// the same product on every finite code under 247, fewer operations), 0 MLX's reads (=0, or where the load found a
 /// code the fold reads apart from MLX, `fp8_codes.settle`).
 pub fn fp8Fold() c_int {
-    return @intFromBool(env.onUnlessZero(.MLX_SERVE_DSV41_FP8_FOLD) and fp8_codes.ps().fold);
+    return @intFromBool(lev.onUnlessZero(.FP8_FOLD) and fp8_codes.ps().fold);
 }
 
 /// A contract kernel at `FOLD` 0 (MLX's mxfp8 reads) and 1 (the fold) on the same inputs, each served shape over three

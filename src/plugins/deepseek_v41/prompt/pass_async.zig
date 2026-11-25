@@ -7,6 +7,7 @@
 //! tensor split keep the wait.
 
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const log = @import("../../../sdk/util/log.zig");
 
 /// The passes that left their last wide layer unwaited, one count across `-Dunits` units (pass_async_test.zig reads it).
@@ -14,8 +15,8 @@ pub const shared_state = @import("../../../sdk/util/shared.zig").Shared(usize, "
 
 /// Whether a wide pass over `rows` rows leaves its last layer unwaited; each such pass is counted and logged.
 pub fn on(rows: usize) bool {
-    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PROMPT_ASYNC_EVAL)) return false;
+    if (!lev.onUnlessZero(.PROMPT_ASYNC_EVAL)) return false;
     shared_state.get().* += 1;
-    log.info("[dsv41] prompt async eval: a {d}-row pass's last wide layer goes to the GPU without the host's wait\n", .{rows});
+    log.info(lev.line(.PROMPT_ASYNC_EVAL) ++ ": a {d}-row pass's last wide layer goes to the GPU without the host's wait\n", .{rows});
     return true;
 }

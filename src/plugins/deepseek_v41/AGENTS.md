@@ -140,9 +140,12 @@ DSpark, lossless classes): `README.md`.
 - A prompt chunk of 4096 rows or more that nothing read ahead runs as its first half, then the rest (`extendCold`,
   `leadRows`; the lead is `Want.encode`: no decoder replay, which the rest makes): the drive reads the rest's Engram
   rows behind the lead. The log's `waited ... ms` is the meter.
-- Every default-on switch is EXACT, REORDER, DRAFT-ONLY or TF32 except `HEAD8` (the one requantization) and `ATTN_F16`
-  (an f16 attention core, LOSSY; on by default only without NAX): `README.md` "Accuracy". A new default-on switch owes
-  a standing word or float64 test against its `=0` path, a plant failing.
+- Every switch is a row of `levers.zig` (its stack, class, picks and README row), read through `lev.*` and logged
+  through `lev.line`; the README's `levers:` blocks and `accepted-lines.txt` are rendered from the table and tested
+  against it (rerun the levers tests after any row change and paste what they print). Every default-on switch is
+  EXACT, REORDER, DRAFT-ONLY or TF32 except `HEAD8` (REQUANT, the one accepted requantization). A LOSSY switch
+  (`PF_INT8`, `ATTN_F16`) is off under lossless and gets a lossy pick: `README.md` "Accuracy". A new default-on switch
+  owes a standing word or float64 test against its `=0` path, a plant failing.
 - One function picks every prompt-attention call's core (`attnCore`), from the call's shape and the load alone: on NAX
   flash, else the gather, else the f32 chain; never the f16 core unless `ATTN_F16` is named on. Its meter is `core_calls`.
   On the f32 chain's routes (tp, FLASH_ATTN=0 at odd K, non-bf16) attention's words depend on chunk width (a reorder).

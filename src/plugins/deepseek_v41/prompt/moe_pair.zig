@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const log = @import("../../../sdk/util/log.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const gather_nax = @import("../../../sdk/blocks/moe/gather_qmm_nax.zig");
@@ -25,7 +26,7 @@ const A = mlx.mlx_array;
 /// `MOE_PAIR_FP4` off, or the kernel declines.
 pub fn act(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.Experts, x3: A, rows: A, sidx: A, w_sorted: A) !?A {
     if (e.gu) |*gu| if (gu.qp.mode == .affine) return affine(sc, m, gu, x3, rows, sidx, w_sorted);
-    if (!pairOn(env.get(.MLX_SERVE_DSV41_MOE_PAIR_FP4))) return null;
+    if (!pairOn(lev.get(.MOE_PAIR_FP4))) return null;
     const name: []const u8 = "MOE_PAIR_FP4";
     const L = mlx.getShape(x3)[0];
     const P = mlx.getShape(sidx)[0];
@@ -35,7 +36,7 @@ pub fn act(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, e: *const dsv41.Experts
     const scales: gather_nax.ExpertScales = .{ .gate = e.scale[0], .up = e.scale[1] };
     const staged = if (fp4_gemm.on()) try fp4_gemm.gateUp(&gu, x3, rows, sidx, w_sorted, m.cfg.dsv4_swiglu_limit, scales, sc.s) else null;
     const y = staged orelse (try gather_nax.sortedGateUpRouted(x3, rows, gu.w, gu.s, gu.b, sidx, w_sorted, m.cfg.dsv4_swiglu_limit, scales, gu.qp.bits, gu.qp.group_size, true, verify_qmm_nax.verifyQmmNaxAvailable(), sc.s)) orelse return decline(name, L, P, gather_nax.routed_decline);
-    if (!engaged_logged.swap(true, .monotonic)) log.info("[dsv41] {s} engaged ({s}, rows {d}, pairs {d})\n", .{ name, @tagName(gu.qp.mode), L, P });
+    if (!engaged_logged.swap(true, .monotonic)) log.info(lev.line(.MOE_PAIR_FP4) ++ " ({s}, rows {d}, pairs {d})\n", .{ @tagName(gu.qp.mode), L, P });
     return try sc.keep(y);
 }
 

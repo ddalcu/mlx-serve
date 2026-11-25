@@ -5,6 +5,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
@@ -43,7 +44,7 @@ pub fn buildPlant() !mlx.mlx_fast_metal_kernel {
 
 /// `MLX_SERVE_DSV41_WOA_PLAIN` (on by default, read each call; =0 `dec_wo_a`): the decode attention's output takes `apply`.
 pub fn on() bool {
-    return env.onUnlessZero(.MLX_SERVE_DSV41_WOA_PLAIN);
+    return lev.onUnlessZero(.WOA_PLAIN);
 }
 
 fn ci(v: usize) c_int {

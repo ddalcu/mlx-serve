@@ -6,6 +6,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
@@ -62,7 +63,7 @@ var order_logged: std.atomic.Value(bool) = .init(false);
 pub const order_min_rows = 3;
 
 pub fn orderOn() bool {
-    return env.onUnlessZero(.MLX_SERVE_DSV41_MOE_DOWN_ORDER);
+    return lev.onUnlessZero(.MOE_DOWN_ORDER);
 }
 
 /// ModelOpt's per-expert scales of an NVFP4 bank (`modelopt_pack.buildBanks`), each `[E]` in the stream's dtype: the
@@ -124,8 +125,8 @@ pub fn moeUpScaled(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernels, 
 /// equal-scale NVFP4 span in MXFP4's order, 1 the bit-placement reads and each 16-group apart. Logged once when on.
 /// Off where the load found a shared down code these reads take apart from MLX's (`fp8_codes.settle`).
 pub fn fp4Reads() c_int {
-    if (!env.onUnlessZero(.MLX_SERVE_DSV41_FP4_READS) or !decode.fp8_codes.ps().reads) return 0;
-    if (!fp4_reads_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info("[dsv41] MLX_SERVE_DSV41_FP4_READS engaged\n", .{});
+    if (!lev.onUnlessZero(.FP4_READS) or !decode.fp8_codes.ps().reads) return 0;
+    if (!fp4_reads_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info(lev.line(.FP4_READS) ++ "\n", .{});
     return 1;
 }
 var fp4_reads_logged = std.atomic.Value(bool).init(false);
@@ -140,9 +141,9 @@ pub const Levers = struct {
 
     pub fn fromEnv() Levers {
         const log = @import("../../../sdk/util/log.zig");
-        const l: Levers = .{ .dec_word = env.onUnlessZero(.MLX_SERVE_DSV41_FP4_DEC_WORD), .up_split = env.onUnlessZero(.MLX_SERVE_DSV41_FP4_UP_SPLIT) };
-        if (l.dec_word and !dec_word_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_FP4_DEC_WORD engaged\n", .{});
-        if (l.up_split and !up_split_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_FP4_UP_SPLIT engaged\n", .{});
+        const l: Levers = .{ .dec_word = lev.onUnlessZero(.FP4_DEC_WORD), .up_split = lev.onUnlessZero(.FP4_UP_SPLIT) };
+        if (l.dec_word and !dec_word_logged.swap(true, .monotonic)) log.info(lev.line(.FP4_DEC_WORD) ++ "\n", .{});
+        if (l.up_split and !up_split_logged.swap(true, .monotonic)) log.info(lev.line(.FP4_UP_SPLIT) ++ "\n", .{});
         return l;
     }
 
@@ -228,7 +229,7 @@ pub fn moeDown(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A, 
 /// The down launch over arrays already checked.
 pub fn runDown(sc: *dsv41.Scope, kern: Kernels, f: fp4.Format, R: usize, K: usize, N: usize, topk: usize, hc: usize, nc: usize, act: A, w: A, scales: A, sw: A, sscales: A, idx: A, x1: A, post: A, comb: A) !A {
     const order = R >= order_min_rows and orderOn();
-    if (order and !order_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info("[dsv41] MLX_SERVE_DSV41_MOE_DOWN_ORDER engaged\n", .{});
+    if (order and !order_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info(lev.line(.MOE_DOWN_ORDER) ++ "\n", .{});
     return launchDown(sc, if (order) kern.down_order else kern.down, order, f, R, K, N, topk, hc, nc, act, w, scales, sw, sscales, idx, x1, post, comb);
 }
 

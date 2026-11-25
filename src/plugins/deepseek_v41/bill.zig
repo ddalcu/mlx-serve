@@ -4,6 +4,7 @@
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const env = @import("../../env.zig");
+const lev = @import("levers.zig");
 const cfg_mod = @import("config.zig");
 const dsv41_mod = @import("deepseek_v41.zig");
 const mlx = @import("../../mlx/ffi.zig");
@@ -35,7 +36,7 @@ pub const stream_host_bytes: u64 = 2_000_000_000 + (1 << 30);
 
 /// The Engram LRU beside the host's bytes: it fills on every load of a pack with Engram layers.
 fn engramStore(config: *const cfg_mod.Config) u64 {
-    return if (config.dsv41_n_engram_layers > 0) @import("decode/engram_decode.zig").billBytes(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB)) else 0;
+    return if (config.dsv41_n_engram_layers > 0) @import("decode/engram_decode.zig").billBytes(lev.span(.ENGRAM_LRU_MB)) else 0;
 }
 
 /// The memory a bank's budget reads: `total - available` and the server's footprint.

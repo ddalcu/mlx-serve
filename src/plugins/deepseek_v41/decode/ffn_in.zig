@@ -5,6 +5,7 @@
 const std = @import("std");
 const device = @import("../../../mlx/device.zig");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
@@ -66,7 +67,7 @@ pub fn free(k: Kernels) void {
 /// `MLX_SERVE_DSV41_FFN_IN_SINK` (read each call): =1 launch 2's mix tail (the slices' reduce and the Sinkhorn split)
 /// runs as its own one-threadgroup launch, read only by the MoE down, so the MoE up does not wait on it.
 pub fn sinkOn() bool {
-    return env.onUnlessZero(.MLX_SERVE_DSV41_FFN_IN_SINK);
+    return lev.onUnlessZero(.FFN_IN_SINK);
 }
 
 fn ci(v: usize) c_int {
@@ -83,8 +84,8 @@ const a_unroll: usize = 2;
 /// either way (each column's lanes, steps and simd sum do not depend on the plan), so the bytes are too.
 fn aCols(rows: usize) usize {
     if (cols_test) |t| return t[rows];
-    if (rows == 5 and env.onUnlessZero(.MLX_SERVE_DSV41_FFN_IN_R5_COLS1)) {
-        if (!r5_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info("[dsv41] MLX_SERVE_DSV41_FFN_IN_R5_COLS1 engaged: ffn_in launch 1 at 5 rows on one column a simdgroup\n", .{});
+    if (rows == 5 and lev.onUnlessZero(.FFN_IN_R5_COLS1)) {
+        if (!r5_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info(lev.line(.FFN_IN_R5_COLS1) ++ ": ffn_in launch 1 at 5 rows on one column a simdgroup\n", .{});
         return 1;
     }
     return if (rows > 4) 2 else 1;

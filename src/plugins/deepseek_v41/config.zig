@@ -29,6 +29,8 @@ const ParseError = v4.ParseError;
 
 pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.Str, span: ?*const abi.LayerSpan, stub: bool, out: *abi.Parsed) callconv(.c) abi.Verdict {
     _ = span;
+    // The precision and the stack switches as this load sees them, before the bill reads any lever.
+    if (!stub) @import("levers.zig").refresh();
     const result = v4.parseInto(dir, config_json, stub, true, streamsPack(settings_json.slice()), out, &extend);
     if (result.isOk()) {
         out.caps.prefix_cache = !of(out).dsv41_streamed;

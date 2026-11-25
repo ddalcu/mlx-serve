@@ -306,6 +306,12 @@ fn printUsage(io: std.Io) void {
         \\                        so --no-ds4-mtp disables it too).
         \\                        DeepSeek-V4.1 runs the stages its pack ships
         \\                        unless --no-mtp.
+        \\  --precision <p>     DeepSeek-V4.1: lossless (default) serves every
+        \\                        lossless lever and the 8-bit LM head; lossy
+        \\                        adds the LOSSY ones (int8 prompt trunk
+        \\                        projections, the f16 attention core without
+        \\                        NAX). MLX_SERVE_DSV41_STACK_<STACK>=0 turns a
+        \\                        stack off (src/plugins/deepseek_v41/README.md).
         \\  --decode-attn-quant / --no-decode-attn-quant
         \\                      Serve decode from quantized side copies of
         \\                      DENSE (bf16/f16) attention projection weights:
@@ -962,6 +968,13 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             ane_media.share = v;
+        } else if (std.mem.eql(u8, args[i], "--precision") and i + 1 < args.len) {
+            // DeepSeek-V4.1's precision (src/plugins/deepseek_v41/levers.zig): the plugin reads the variable at load.
+            i += 1;
+            if (std.mem.eql(u8, args[i], "lossless")) env.set(.MLX_SERVE_DSV41_PRECISION, "lossless") else if (std.mem.eql(u8, args[i], "lossy")) env.set(.MLX_SERVE_DSV41_PRECISION, "lossy") else {
+                log.err("--precision takes lossless or lossy; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
         } else if (std.mem.eql(u8, args[i], "--dspark")) {
             // DSpark (DeepSeek-V4 draft stages) is OPT-IN: the stages cost
             // ~11 GB resident, so the default leaves them lazy and serves

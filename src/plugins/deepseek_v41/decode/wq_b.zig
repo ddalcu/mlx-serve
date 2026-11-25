@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
@@ -38,7 +39,7 @@ pub fn buildRing() !mlx.mlx_fast_metal_kernel {
 
 /// `MLX_SERVE_DSV41_FUSE_WQB_RING` (read each call): =1 the plain step and verify write the window ring in wq_b.
 pub fn ringOn() bool {
-    return env.onUnlessZero(.MLX_SERVE_DSV41_FUSE_WQB_RING);
+    return lev.onUnlessZero(.FUSE_WQB_RING);
 }
 
 /// The ring a launch writes into: the layer's ring buffer `[cap, 512]` (the window's dtype, the rows'), `plant` 0

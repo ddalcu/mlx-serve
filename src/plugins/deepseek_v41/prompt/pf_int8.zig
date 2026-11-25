@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const log = @import("../../../sdk/util/log.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
@@ -20,7 +21,7 @@ const w8a8 = @import("../../../sdk/blocks/dit/w8a8.zig");
 const A = mlx.mlx_array;
 
 pub fn level() u32 {
-    return env.int(.MLX_SERVE_DSV41_PF_INT8, u32, 0);
+    return lev.int(.PF_INT8, u32, 0);
 }
 
 /// The bytes the level adds (billed at load when it is on): the wide layers' (the CED encoder's, or every layer's)
@@ -150,7 +151,7 @@ pub fn trunkMatmul(sc: *dsv41.Scope, l: *const dsv41.Lin, x: A, out_dt: mlx.mlx_
     var x8 = try w8a8.quantize(xin, sc.s);
     defer x8.deinit();
     const y = try sc.keep(try w8a8.gemm(x8, w, out_dt, false, sc.s));
-    if (!trunk_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_INT8={d} engaged (not lossless): trunk {s} on int8 (w8a8: rotated, a scale a row), first {s} over {d} rows\n", .{ level(), if (level() == 4) @as([]const u8, "wq_b, wo_b, the shared expert and wq_a+wkv") else "wq_b and wo_b", name, L });
+    if (!trunk_logged.swap(true, .monotonic)) log.info(lev.line(.PF_INT8) ++ " (level {d}, not lossless): trunk {s} on int8 (w8a8: rotated, a scale a row), first {s} over {d} rows\n", .{ level(), if (level() == 4) @as([]const u8, "wq_b, wo_b, the shared expert and wq_a+wkv") else "wq_b and wo_b", name, L });
     _ = trunk_calls.fetchAdd(1, .monotonic);
     return y;
 }
