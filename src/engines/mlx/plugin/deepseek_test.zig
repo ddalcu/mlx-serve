@@ -93,7 +93,7 @@ test "dsv41 prefill chunk: pinned at 8192 on a big machine, and kept there howev
         try t.expectEqual(@as(usize, 8192), effectivePrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, ctx, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), cfg.pinned_prefill_chunk));
 }
 
-test "dsv41 prefill chunk: the pass plan pins the widest whole-span pass the ladder's share bills, up to the context, the explicit width over it, and the ladder's pin where not even 8192 rows fit" {
+test "dsv41 prefill chunk: the pass plan pins the widest whole-span pass the ladder's share bills (PF_IDX_PASS's queries included), up to the context, the explicit width over it, and the ladder's pin where not even 8192 rows fit" {
     const t = std.testing;
     const env = @import("../../../env.zig");
     const pc = @import("../admission/prefill_chunk.zig");
@@ -101,6 +101,8 @@ test "dsv41 prefill chunk: the pass plan pins the widest whole-span pass the lad
     var cfg = try model.parseConfigFromJson(t.allocator, model.dsv41_release_config);
     const was = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, "1");
     defer was.restore();
+    const was_idx = env.override(.MLX_SERVE_DSV41_PF_IDX_PASS, "1");
+    defer was_idx.restore();
     const gb: u64 = 1 << 30;
     // The share bounds it on a long context: the widest whole span that fits, the next one past the cap.
     cfg.ctx_override = 1 << 20;
@@ -114,6 +116,11 @@ test "dsv41 prefill chunk: the pass plan pins the widest whole-span pass the lad
     const off = dsv41PrefillMemoryNeeded(&cfg, wide, wide);
     env.set(.MLX_SERVE_DSV41_PF_PASS_SIZE, "1");
     try t.expect(dsv41PrefillMemoryNeeded(&cfg, wide, wide) > off);
+    // PF_IDX_PASS's whole-pass index queries are billed too, and the pinned pass above fits with them.
+    env.set(.MLX_SERVE_DSV41_PF_IDX_PASS, "0");
+    const no_idx = dsv41PrefillMemoryNeeded(&cfg, wide, wide);
+    env.set(.MLX_SERVE_DSV41_PF_IDX_PASS, "1");
+    try t.expect(dsv41PrefillMemoryNeeded(&cfg, wide, wide) > no_idx);
     // A wider share never pins a narrower pass; the context bounds it.
     try t.expect(pc.dsv41PassRows(&cfg, 16, 2 * cap, 0, 8192) >= wide);
     cfg.ctx_override = 32768;

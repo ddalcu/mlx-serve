@@ -2848,7 +2848,17 @@ pub fn prefillBytes(config: anytype, kv_per_token: u64, seq: u64, chunk: u64, fl
     // (`passPlanned`) one call takes the chunk's every row.
     const moe_rows: u64 = if (passPlanned(config)) c else @min(c, MOE_ROWS);
     const moe_bytes = moe_rows * config.num_experts_per_tok * (3 * config.moe_intermediate_size + d) * 2;
-    return (state + held + attn + idx_bytes + moe_bytes + wideEarlyBytes(config, c) + woaJoinBytes(config, c) + floor) * 5 / 4;
+    return (state + held + attn + idx_bytes + moe_bytes + wideEarlyBytes(config, c) + woaJoinBytes(config, c) + idxPassBytes(config, c) + floor) * 5 / 4;
+}
+/// MLX_SERVE_DSV41_PF_IDX_PASS: an index layer's queries over the whole call (`wq_b`'s bf16 rows, the roped f32 queries
+/// and their fp4 round trip's f32 copy) and its bf16 head weights, held through the layer's span loop; 0 off or for a
+/// call no wider than a span.
+fn idxPassBytes(config: anytype, rows: u64) u64 {
+    const T = @TypeOf(config.*);
+    if (comptime !@hasField(T, "dsv4_index_n_heads") or !@hasField(T, "dsv4_index_head_dim")) return 0;
+    if (rows <= SPAN or !env.onUnlessZero(.MLX_SERVE_DSV41_PF_IDX_PASS)) return 0;
+    const ih: u64 = config.dsv4_index_n_heads;
+    return rows * ih * (@as(u64, config.dsv4_index_head_dim) * (2 + 4 + 4) + 2);
 }
 /// a streamed bank's wide call of `rows` rows holds its early shared expert's evaluation through the MoE
 /// stage (`wide_early.bytes`); 0 with no streamed bank or a call no wider than a span (the decode phase's bill: only wide
@@ -3837,6 +3847,10 @@ pub const Shared = struct {
     /// A replaying chunk's last decoder layer on its last span: nothing but the chunk's logits reads its output rows,
     /// so its MoE routes the last row only (`moeLast`).
     last_row: bool = false,
+    /// MLX_SERVE_DSV41_PF_IDX_PASS: this span's rows of the indexer's queries and head weights, made once over the
+    /// pass by `wideLayer`; `compressed` then scores them (`indexerQ`) instead of projecting the span itself.
+    idx_q: A = none,
+    idx_w: A = none,
 };
 
 /// `x` normed attention input `[L, dim]` at positions [p0, p0 + L). With `pre` (the rows' projections,
@@ -3953,7 +3967,7 @@ fn compressed(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, qr: A, p0
     if (ly.ratio == 0) return .{ none, none };
     const clen = (p0 + dim(x, 0)) / ly.ratio;
     if (ly.comp) |*cw| if (sh.floor == null and !sh.compressed) try compress(sc, m, st, li, cw, x, p0);
-    if (ly.idx) |*iw| sh.topk = if (clen == 0) none else try indexer(sc, m, st, li, iw, x, qr, p0, sh);
+    if (ly.idx) |*iw| sh.topk = if (clen == 0) none else if (sh.idx_q.ctx != null) try indexerQ(sc, m, st, li, sh.idx_w, sh.idx_q, p0, sh) else try indexer(sc, m, st, li, iw, x, qr, p0, sh);
     if (clen == 0 or sh.topk.ctx == null) return .{ none, sh.topk };
     return .{ try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view(clen, sc.s)), sh.topk };
 }
@@ -4864,6 +4878,111 @@ fn compressFrom(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, cw: *const Co
     const rot = try ropeQat(sc, m, latent, m.rope_yarn.fwd, try sc.i(ci(g0)), @floatFromInt(r), .fp4_e4m3, null);
     try ls.comp.?.append(rot, sc.s);
 }
+
+/// MLX_SERVE_DSV41_PF_COMP_PASS: `compressFrom` once over the whole pass's projection `proj` (`[L, 2 head_dim]`, or
+/// `[L, head_dim]` at ratio 1) for spans `sp`: every op but the index keys' linear works per element, group or row, so
+/// it gives the span-by-span calls' words over all rows at once; that linear runs on each span's own groups, as the
+/// span-by-span calls run it (MLX picks its kernel by row count).
+fn compressPass(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, cw: *const Comp, proj: A, sp: *const Spans) !void {
+    const c = &m.cfg;
+    const ly = &m.layers[li];
+    const ls = &st.layers[li];
+    const r: usize = ly.ratio;
+    const pend0: usize = if (ls.pend_kv.ctx != null) dim(ls.pend_kv, 0) else 0;
+    var latent = none;
+    if (r == 1) {
+        latent = try sc.rms(proj, cw.norm, c.rms_norm_eps);
+    } else {
+        const hd = c.head_dim;
+        var kv = try sc.slice(proj, -1, 0, hd);
+        var gate = try sc.slice(proj, -1, hd, 2 * hd);
+        if (ls.pend_kv.ctx != null) {
+            kv = try sc.concat(&.{ ls.pend_kv, kv }, 0);
+            gate = try sc.concat(&.{ ls.pend_gate, gate }, 0);
+        }
+        const total = dim(kv, 0);
+        const g = total / r;
+        const full = g * r;
+        const new_kv = if (full < total) sc.out(try sc.slice(kv, 0, full, total)) else none;
+        const new_gate = if (full < total) sc.out(try sc.slice(gate, 0, full, total)) else none;
+        if (ls.pend_kv.ctx != null) _ = mlx.mlx_array_free(ls.pend_kv);
+        if (ls.pend_gate.ctx != null) _ = mlx.mlx_array_free(ls.pend_gate);
+        ls.pend_kv = new_kv;
+        ls.pend_gate = new_gate;
+        if (g == 0) return;
+        const kg = try sc.reshape(try sc.slice(kv, 0, 0, full), &.{ ci(g), ci(r), ci(hd) });
+        const gg = try sc.reshape(try sc.slice(gate, 0, 0, full), &.{ ci(g), ci(r), ci(hd) });
+        const pooled = try sc.sum(try sc.mul(kg, try sc.softmax(gg, 1)), 1, false);
+        latent = try sc.rms(try sc.astype(pooled, m.act), cw.norm, c.rms_norm_eps);
+    }
+    const g0 = sp.p0 / r + @intFromBool(comp_pass_plant);
+    if (ly.idx) |*iw| if (iw.wk) |*wk| {
+        // span k's groups: those its rows complete, after the rows pending before it
+        const parts = try sc.a.alloc(A, sp.xs.len);
+        defer sc.a.free(parts);
+        var n: usize = 0;
+        for (0..sp.xs.len) |k| {
+            const lo, const hi = sp.bounds(k);
+            const a = (pend0 + lo) / r;
+            const b = (pend0 + hi) / r;
+            if (b > a) {
+                parts[n] = try rowLinear(sc, wk, try sc.slice(latent, 0, a, b));
+                n += 1;
+            }
+        }
+        if (n > 0) {
+            var k = try sc.rms(if (n == 1) parts[0] else try sc.concat(parts[0..n], 0), iw.k_norm, c.rms_norm_eps);
+            k = try ropeQat(sc, m, k, m.rope_yarn.fwd, try sc.i(ci(g0)), @floatFromInt(r), .fp4_ue8m0, null);
+            try ls.idx_k.?.append(k, sc.s);
+        }
+    };
+    const rot = try ropeQat(sc, m, latent, m.rope_yarn.fwd, try sc.i(ci(g0)), @floatFromInt(r), .fp4_e4m3, null);
+    try ls.comp.?.append(rot, sc.s);
+    _ = comp_pass_count.fetchAdd(1, .monotonic);
+    if (!comp_pass_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_COMP_PASS engaged (layer {d}, {d} rows)\n", .{ li, dim(proj, 0) });
+}
+var comp_pass_logged = std.atomic.Value(bool).init(false);
+/// `MLX_SERVE_DSV41_PF_COMP_PASS`'s layers served (its test's meter) and its planted bug (the groups' rope a row late).
+pub var comp_pass_count = std.atomic.Value(usize).init(0);
+pub var comp_pass_plant = false;
+
+/// MLX_SERVE_DSV41_PF_IDX_PASS: the indexer's head weights `x . l^T` over a whole pass on kernels/idx_wproj.metal
+/// (the model's 32 heads and 5,120 hidden compiled in), null where it does not serve (another shape or dtype, a
+/// quantized or outside linear, decode widths, no GPU or NAX).
+pub fn idxHeadWeights(sc: *Scope, l: *const Lin, x: A) !?A {
+    if (l.ext != null or l.s.ctx != null or !mlx.streamIsGpu(sc.s) or !device.naxAvailable()) return null;
+    if (mlx.mlx_array_dtype(l.w) != .bfloat16 or mlx.mlx_array_dtype(x) != .bfloat16) return null;
+    const ws = mlx.getShape(l.w);
+    const xs = mlx.getShape(x);
+    if (ws.len != 2 or ws[0] != idx_wproj_n or ws[1] != idx_wproj_k or xs.len != 2 or xs[1] != idx_wproj_k or xs[0] <= region_rows) return null;
+    if (idx_wproj_kernel == null) idx_wproj_kernel = try buildKernel("dsv41_idx_wproj", &.{ "x", "w" }, &.{"y"}, IDX_WPROJ_SOURCE, IDX_WPROJ_HEADER);
+    const L: usize = @intCast(xs[0]);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(L), idx_wproj_n }, 2, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 256, ci((L + 15) / 16), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OT", .bfloat16));
+    const iv = mlx.mlx_vector_array_new_data(&[_]A{ x, l.w }, 2);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, idx_wproj_kernel.?, iv, cfg, sc.s));
+    var o = mlx.mlx_array_new();
+    return try sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+}
+pub const IDX_WPROJ_SOURCE = kernelSource("plugins/deepseek_v41/kernels/idx_wproj.metal");
+pub const IDX_WPROJ_HEADER = @import("decode/attn.zig").HEADER;
+pub const idx_wproj_n: c_int = 32;
+pub const idx_wproj_k: c_int = 5120;
+var idx_wproj_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var idx_pass_logged = std.atomic.Value(bool).init(false);
+/// `MLX_SERVE_DSV41_PF_IDX_PASS`'s layers served (its test's meter) and its planted bug (the queries' rope a row late).
+pub var idx_pass_count = std.atomic.Value(usize).init(0);
+pub var idx_pass_plant = false;
+/// Its test's exact half: the queries over the pass, the head weights still MLX's GEMM per span.
+pub var idx_pass_mlx_w = false;
 
 /// The `k` largest scores of each row as int32 indices (ascending, ties to
 /// the lower index); `Scope.topk` off the GPU.
@@ -7190,7 +7309,10 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     const comp_first = ly.comp != null and sp.floor == null;
     // MLX_SERVE_DSV41_PF_COMP_BF16: the projection over every row first, each span's pooling on its rows of it.
     const comp_all: ?A = if (comp_first) try compProjBf16(&sc, m, li, &ly.comp.?, pa.h) else null;
-    if (comp_first) for (0..n_spans) |k| {
+    // MLX_SERVE_DSV41_PF_COMP_PASS: the spans' pooling in one pass of the same ops.
+    const comp_pass = comp_first and comp_all != null and env.onUnlessZero(.MLX_SERVE_DSV41_PF_COMP_PASS);
+    if (comp_pass) try compressPass(&sc, m, st, li, &ly.comp.?, comp_all.?, sp);
+    if (comp_first and !comp_pass) for (0..n_spans) |k| {
         const lo, const hi = sp.bounds(k);
         var csc = Scope.init(gpa, m.s);
         defer csc.deinit();
@@ -7204,12 +7326,26 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     const heads_b = run > 1 and m.act == .bfloat16 and try sat.headsLayerBegin(ly.wo_a.ext != null, run * sp.span, m.cfg.dsv4_o_groups, @as(usize, m.cfg.num_attention_heads) / m.cfg.dsv4_o_groups * m.cfg.head_dim, m.act);
     defer sat.headsLayerEnd();
     const src_ratio = if (m.ratio(li) == 0) 0 else m.ratio(m.latest(li, Dsv41Model.isIndexSource));
+    // MLX_SERVE_DSV41_PF_IDX_PASS: the indexer's queries and head weights over the pass, each span slicing its rows.
+    var idx_q = none;
+    var idx_w = none;
+    if (ly.idx) |*iw| if (ig_r > 0 and sp.floor == null and m.trace == null and env.onUnlessZero(.MLX_SERVE_DSV41_PF_IDX_PASS)) if (try idxHeadWeights(&sc, &iw.weights_proj, pa.h)) |w| {
+        const c = &m.cfg;
+        idx_w = w;
+        idx_q = try ropeQat(&sc, m, try sc.reshape(try iw.wq_b.apply(&sc, pj.qr), &.{ ci(sp.L), ci(c.dsv4_index_n_heads), ci(c.dsv4_index_head_dim) }), m.rope_yarn.fwd, try sc.i(ci(sp.p0 + @intFromBool(idx_pass_plant))), 1.0, .fp4_ue8m0, .float32);
+        _ = idx_pass_count.fetchAdd(1, .monotonic);
+        if (!idx_pass_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_IDX_PASS engaged (layer {d}, {d} rows)\n", .{ li, sp.L });
+    };
     for (0..n_spans) |k| {
         const lo, const hi = sp.bounds(k);
         // A span's core intermediates are dropped once built, as in the per-span path.
         var ssc = Scope.init(gpa, m.s);
         defer ssc.deinit();
         var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor, .compressed = comp_first };
+        if (idx_q.ctx != null) {
+            sh.idx_q = try ssc.slice(idx_q, 0, lo, hi);
+            sh.idx_w = if (idx_pass_mlx_w) try rowLinear(&ssc, &ly.idx.?.weights_proj, try ssc.slice(pa.h, 0, lo, hi)) else try ssc.slice(idx_w, 0, lo, hi);
+        }
         var span_pj: Proj = .{ .q = try ssc.slice(pj.q, 0, lo, hi), .kv = try ssc.slice(pj.kv, 0, lo, hi), .qr = try ssc.slice(pj.qr, 0, lo, hi) };
         if (pj.qt.ctx != null) span_pj.qt = try ssc.slice(pj.qt, 0, lo, hi);
         // Whether this span's run takes a region (its `run` spans all of `sp.span` rows).

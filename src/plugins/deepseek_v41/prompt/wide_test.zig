@@ -997,6 +997,56 @@ test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_TOKORD: the staged down's rows at thei
     }
 }
 
+test "dsv41 wide: MLX_SERVE_DSV41_PF_DOWN_BK32: the down on the 32-deep tile gives moePrefill's words at every prompt width, NVFP4 with per-expert scales and MXFP4; the calls of 96 rows an expert and more only; each down row handed the next token fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const experts: c_int = if (@import("build_options").slow_tests) 384 else 48;
+    const off = env.override(.MLX_SERVE_DSV41_PF_DOWN_BK32, "0");
+    defer off.restore();
+    inline for (.{ true, false }) |nv| {
+        // The NVFP4 bank's gate/up on the paired kernel; an MXFP4 bank's on the split path. The staged down serves both.
+        const pk = env.override(.MLX_SERVE_DSV41_MOE_PAIR_SCALED, "1");
+        defer pk.restore();
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        var m: dsv41.Dsv41Model = undefined;
+        m.cfg = .{};
+        m.cfg.dsv4_swiglu_limit = 10;
+        m.act = .bfloat16;
+        m.moe_act_kernel = try dsv41.buildKernel("dsv41_moe_act", &dsv41.MOE_ACT_INS, &.{"out"}, dsv41.MOE_ACT_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_act_kernel);
+        m.moe_combine_kernel = try dsv41.buildKernel("dsv41_moe_combine", &dsv41.MOE_COMBINE_INS, &.{"out"}, dsv41.MOE_COMBINE_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.moe_combine_kernel);
+        var ly: dsv41.Layer = undefined;
+        ly.gate_w = try sc.zeros(&.{ experts, 8 }, .bfloat16);
+        ly.experts = .{ .gate = .{ .w = none }, .up = .{ .w = none }, .gu = try fp4Bank(&sc, 0x6A7E, experts, 2 * inter, hidden, nv), .down = try fp4Bank(&sc, 0xD0E1, experts, hidden, inter, nv) };
+        if (nv) for (&ly.experts.scale, 0..) |*v, i| {
+            v.* = try uniform(&sc, &.{experts}, .bfloat16, 0.25, 4.0, 0x5CA1E + i);
+        };
+        for ([_]usize{ 40, 777, 4097, 8192 }, 0..) |L, ci| {
+            var csc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+            defer csc.deinit();
+            const c = try call(&csc, L, @intCast(experts), 0x3400 + ci, false);
+            const wide = @divTrunc(@as(c_int, @intCast(L * top_k)), experts) >= 96;
+            const want = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const on = env.override(.MLX_SERVE_DSV41_PF_DOWN_BK32, "1");
+            defer on.restore();
+            const before = fp4gemm.bk32_launches.load(.monotonic);
+            const got = try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh);
+            const served = fp4gemm.bk32_launches.load(.monotonic) - before;
+            const eq = try sameWords(want, got);
+            std.debug.print("[down-bk32] {s} rows {d}: launches {d}, moePrefill {}\n", .{ if (nv) "NVFP4" else "MXFP4", L, served, eq });
+            try testing.expect(eq);
+            // The down, at the wide calls only.
+            try testing.expectEqual(@as(u32, if (wide) 1 else 0), served);
+            if (!wide) continue;
+            fp4gemm.bk32_plant = true;
+            defer fp4gemm.bk32_plant = false;
+            try testing.expect(!try sameWords(want, try dsv41.moePrefill(&csc, &m, &ly, c.x, c.idx, c.wts, c.sh)));
+        }
+    }
+}
+
 // ── the hc stages ──
 
 /// A model holding only the hc kernels, at the release's widths, the fused ones built and probed.
@@ -2727,4 +2777,169 @@ test "dsv41 wide: under MLX_SERVE_DSV41_PF_KEEP_WIDE's reserve a release-shape p
         _ = mlx.mlx_synchronize(mlx.gpuStream());
         try testing.expect(!(try bad));
     }
+}
+
+// ── MLX_SERVE_DSV41_PF_COMP_PASS and MLX_SERVE_DSV41_PF_IDX_PASS: the compressor and the indexer once over the pass ──
+
+test "dsv41 wide: MLX_SERVE_DSV41_PF_COMP_PASS keeps a release-shape KV source and index layer's prefill streams and mixes word for word (layers 8-9, an odd row count's pending row), NVFP4 experts with per-expert scales; the groups' rope a row late fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    const keep = env.override(.MLX_SERVE_DSV41_PF_COMP_PASS, "0");
+    defer keep.restore();
+    const rows = 4999;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 8, .hi = 10, .ctx = 0, .experts_nvfp4 = true, .expert_scales = .all });
+    defer fx.deinit();
+    const x = try fx.stream(rows);
+    defer _ = mlx.mlx_array_free(x);
+    const pre = try fx.cpre(rows);
+    defer _ = mlx.mlx_array_free(pre);
+    const c0 = dsv41.comp_pass_count.load(.monotonic);
+    const want = try prefill(fx, x, pre);
+    defer for (want) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    try testing.expectEqual(c0, dsv41.comp_pass_count.load(.monotonic));
+    env.set(.MLX_SERVE_DSV41_PF_COMP_PASS, "1");
+    const got = try prefill(fx, x, pre);
+    defer for (got) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    const n = dsv41.comp_pass_count.load(.monotonic) - c0;
+    dsv41.comp_pass_plant = true;
+    const bad = try prefill(fx, x, pre);
+    dsv41.comp_pass_plant = false;
+    defer for (bad) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    env.set(.MLX_SERVE_DSV41_PF_COMP_PASS, "0");
+    const same = [_]bool{ try sameWords(want[0], got[0]), try sameWords(want[1], got[1]) };
+    const planted = try sameWords(want[0], bad[0]);
+    std.debug.print("wide layers 8-9 at {d} rows, PF_COMP_PASS: served {d} layers, streams {} mixes {}; planted streams the same {}\n", .{ rows, n, same[0], same[1], planted });
+    try testing.expect(n >= 1 and same[0] and same[1] and !planted);
+}
+
+test "dsv41 wide tol: MLX_SERVE_DSV41_PF_IDX_PASS keeps a release-shape index layer's prefill streams and mixes within the pair worker's tolerance (layers 8-9), and its queries' word-for-word half (the pass's wq_b, rope and fp4 round trip, the head weights per span) gives the same words; the queries' rope a row late fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const gpa = testing.allocator;
+    const keep = env.override(.MLX_SERVE_DSV41_PF_IDX_PASS, "0");
+    defer keep.restore();
+    const rows = 4999;
+    const label = "8-9 NVFP4 at 4999 rows";
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 8, .hi = 10, .ctx = 0, .experts_nvfp4 = true, .expert_scales = .all });
+    defer fx.deinit();
+    const x = try fx.stream(rows);
+    defer _ = mlx.mlx_array_free(x);
+    const pre = try fx.cpre(rows);
+    defer _ = mlx.mlx_array_free(pre);
+    var want_tap: dsv41.RouteTap = .{ .gpa = gpa };
+    defer freeTap(&want_tap);
+    const c0 = dsv41.idx_pass_count.load(.monotonic);
+    const want = try prefillTapped(fx, x, pre, &want_tap);
+    defer for (want) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    try testing.expectEqual(c0, dsv41.idx_pass_count.load(.monotonic));
+    env.set(.MLX_SERVE_DSV41_PF_IDX_PASS, "1");
+    const ok = try closeAs(fx, x, pre, want, &want_tap, label, "PF_IDX_PASS");
+    const n = dsv41.idx_pass_count.load(.monotonic) - c0;
+    // the head weights from MLX's split GEMM per span, the rest over the pass: the same words as span by span
+    dsv41.idx_pass_mlx_w = true;
+    const exact = try prefill(fx, x, pre);
+    defer for (exact) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    dsv41.idx_pass_mlx_w = false;
+    dsv41.idx_pass_plant = true;
+    const planted = try closeAs(fx, x, pre, want, &want_tap, label, "PF_IDX_PASS planted");
+    dsv41.idx_pass_plant = false;
+    env.set(.MLX_SERVE_DSV41_PF_IDX_PASS, "0");
+    const same = [_]bool{ try sameWords(want[0], exact[0]), try sameWords(want[1], exact[1]) };
+    std.debug.print("wide layers {s}, PF_IDX_PASS: served {d} layers, within tolerance {}; queries over the pass with per-span head weights: streams {} mixes {}; planted within tolerance {}\n", .{ label, n, ok, same[0], same[1], planted });
+    try testing.expect(n >= 1 and ok and same[0] and same[1]);
+}
+
+test "dsv41 wide tol: PF_IDX_PASS's head weights (kernels/idx_wproj.metal) are no farther from float64 than MLX's GEMM per 256-row span (the served call) in l2 and max over every output, 32 heads x 5,120, bf16 out, 257 to 17,639 rows; a weight row moved fails" {
+    if (skip()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var ok = true;
+    for ([_]usize{ 257, 4097, 17_639 }, 0..) |rows, ci_| {
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const x = try normal(&sc, &.{ @intCast(rows), 5120 }, .bfloat16, 1, 0x91 + ci_);
+        const w = try normal(&sc, &.{ 32, 5120 }, .bfloat16, 1.0 / @sqrt(5120.0), 0x92 + ci_);
+        const lin: dsv41.Lin = .{ .w = w };
+        // served: MLX's matmul on each 256-row span, as `rowLinear` runs the span's rows
+        var parts: std.ArrayList(A) = .empty;
+        defer parts.deinit(testing.allocator);
+        var lo: usize = 0;
+        while (lo < rows) : (lo += 256) try parts.append(testing.allocator, try lin.apply(&sc, try sc.slice(x, 0, lo, @min(rows, lo + 256))));
+        const served = try sc.concat(parts.items, 0);
+        const got = (try dsv41.idxHeadWeights(&sc, &lin, x)) orelse return error.Declined;
+        const wp = try sc.concat(&.{ try sc.slice(w, 0, 1, 2), try sc.slice(w, 0, 1, 32) }, 0);
+        const bad = (try dsv41.idxHeadWeights(&sc, &.{ .w = wp }, x)) orelse return error.Declined;
+        try dsv41.evalAll(&.{ served, got, bad });
+        const hx = try dsv41.hostF32(x);
+        defer testing.allocator.free(hx);
+        const hw = try dsv41.hostF32(w);
+        defer testing.allocator.free(hw);
+        // every 7th row and the last, all 32 heads, in float64
+        var idx: std.ArrayList(usize) = .empty;
+        defer idx.deinit(testing.allocator);
+        var r: usize = 0;
+        while (r < rows) : (r += 7) try idx.append(testing.allocator, r);
+        try idx.append(testing.allocator, rows - 1);
+        const ref = try testing.allocator.alloc(f64, idx.items.len * 32);
+        defer testing.allocator.free(ref);
+        for (idx.items, 0..) |row, i| for (0..32) |h| {
+            var d: f64 = 0;
+            for (hx[row * 5120 ..][0..5120], hw[h * 5120 ..][0..5120]) |a, b| d += @as(f64, a) * b;
+            ref[i * 32 + h] = d;
+        };
+        var e: [3]F64Err = undefined;
+        var differ: usize = 0;
+        // Where the two bf16 words are equal their errors are equal, so l2 and max over every output compare on the
+        // words that differ: each one's float64 value, both errors.
+        var sq = [2]f64{ 0, 0 };
+        var mx = [2]f64{ 0, 0 };
+        var nearer: usize = 0;
+        for ([_]A{ served, got, bad }, 0..) |o, k| {
+            const ho = try dsv41.hostF32(o);
+            defer testing.allocator.free(ho);
+            const sel = try testing.allocator.alloc(f32, idx.items.len * 32);
+            defer testing.allocator.free(sel);
+            for (idx.items, 0..) |row, i| @memcpy(sel[i * 32 ..][0..32], ho[row * 32 ..][0..32]);
+            e[k] = f64Err(sel, ref);
+        }
+        {
+            const hs = try dsv41.hostF32(served);
+            defer testing.allocator.free(hs);
+            const hg = try dsv41.hostF32(got);
+            defer testing.allocator.free(hg);
+            for (hs, hg, 0..) |a, b, i| if (a != b) {
+                differ += 1;
+                const row = i / 32;
+                const h = i % 32;
+                var d: f64 = 0;
+                for (hx[row * 5120 ..][0..5120], hw[h * 5120 ..][0..5120]) |u, v| d += @as(f64, u) * v;
+                const es = @abs(@as(f64, a) - d);
+                const em = @abs(@as(f64, b) - d);
+                sq[0] += es * es;
+                sq[1] += em * em;
+                mx[0] = @max(mx[0], es);
+                mx[1] = @max(mx[1], em);
+                nearer += @intFromBool(em < es);
+            };
+        }
+        std.debug.print("[idx-wproj] {d} rows: rel l2 / max vs float64 over sampled rows (bf16 out): served per-span GEMM {e:.4}/{e:.4}, idx_wproj {e:.4}/{e:.4}; {d} of {d} words differ, {d} of them nearer float64 in idx_wproj; over them squared error served {e:.6} idx_wproj {e:.6}, worst served {e:.6} idx_wproj {e:.6}; planted {e:.3}/{e:.3}\n", .{ rows, e[0].l2, e[0].max, e[1].l2, e[1].max, differ, rows * 32, nearer, sq[0], sq[1], mx[0], mx[1], e[2].l2, e[2].max });
+        // the worst element over the same words for both: the sampled rows (f64Err's max is over their largest
+        // reference) and every word that differs
+        var rm: f64 = 0;
+        for (ref) |v| rm = @max(rm, @abs(v));
+        const worst = [2]f64{ @max(e[0].max * rm, mx[0]), @max(e[1].max * rm, mx[1]) };
+        std.debug.print("[idx-wproj] {d} rows: worst element over the sampled rows and the differing words: served {e:.6} idx_wproj {e:.6}\n", .{ rows, worst[0], worst[1] });
+        ok = ok and sq[1] <= sq[0] and worst[1] <= worst[0] and e[2].l2 > 10 * e[0].l2;
+    }
+    try testing.expect(ok);
 }

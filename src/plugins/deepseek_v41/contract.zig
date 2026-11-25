@@ -2223,6 +2223,35 @@ const GateGemm = struct {
     }
 };
 
+// ── MLX_SERVE_DSV41_PF_IDX_PASS: the indexer's head weights over a pass (kernels/idx_wproj.metal) ──
+
+/// x [rows, 5120] . W [32, 5120]^T in f32, bf16 out: the model's shape compiled in (any rows), 16 partial sums of
+/// 320 products added as a tree, so an f32 sum in another order than MLX's split GEMM.
+const IdxWproj = struct {
+    pub const Params = struct {};
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n != @as(usize, @intCast(v41.idx_wproj_n)) or s.k != @as(usize, @intCast(v41.idx_wproj_k))) return null;
+        var g = metal.Geometry{ .grid = .{ 256, ci((s.rows + 15) / 16), 1 }, .tg = .{ 256, 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(s.n) }, act);
+        g.dtype("T", act);
+        g.dtype("OT", act);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        return GemvTwin.fill(k, f, rng);
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        return GemvTwin.compute(k, out, mag, sum);
+    }
+};
+
 // ── prompt/flash_attn.zig: a wide span's attention as one kernel, an online softmax over blocks of 128 keys ──
 
 /// Lossy (P rounds to f16 against the running max), so within the float64 online softmax's bound (the SDK attention
@@ -4839,6 +4868,7 @@ const expand_norm_into_l = launch("dsv41_hc_expand_norm_into", &.{ "y", "res", "
 const gate_gemm_l = metal.Launch{ .name = "dsv41_gate_gemm", .inputs = &.{ "a", "b" }, .outputs = &.{"y"}, .source = ggemm.body, .header = ggemm.header, .tg_bytes = 0, .offline = false, .min_gen = 17 };
 const markov_step_l = launch("dsv41_markov_step", &.{ "lg", "emb", "mh", "t1", "pin" }, &.{ "pout", "row" }, markov.step_source, markov.header, 4 * (2 * 8 + 1), 1024, false);
 const markov_final_l = launch("dsv41_markov_final", &.{ "parts", "t1", "hout", "emb", "cw" }, &.{ "toks", "conf" }, markov.final_source, markov.header, 4 * (3 * 16 + 1), 1024, false);
+const idx_wproj_l = metal.Launch{ .name = "dsv41_idx_wproj", .inputs = &.{ "x", "w" }, .outputs = &.{"y"}, .source = v41.IDX_WPROJ_SOURCE, .header = v41.IDX_WPROJ_HEADER, .tg_bytes = 4 * 8 * 16 * 32, .offline = false, .min_gen = 17 };
 const flash_l = metal.Launch{ .name = "dsv41_attn_flash", .inputs = &v41.GatherAttn.FLASH_INS, .outputs = &.{"o"}, .source = fa.source, .header = @import("decode/attn.zig").HEADER, .tg_bytes = 4 * 2 * 128 + 4 * 2 * 4 * 4 * 16 + 2 * 4 * 8 * 256, .offline = false, .min_gen = 17 };
 const flash_trim_l = metal.Launch{ .name = "dsv41_attn_flash_trim", .inputs = flash_l.inputs, .outputs = flash_l.outputs, .source = fa.source, .header = fa.header_trim, .tg_bytes = flash_l.tg_bytes, .offline = false, .min_gen = 17 };
 const flash_psum_l = metal.Launch{ .name = "dsv41_attn_flash_psum", .inputs = flash_l.inputs, .outputs = flash_l.outputs, .source = fa.source, .header = fa.header_psum, .tg_bytes = flash_l.tg_bytes, .offline = false, .min_gen = 17 };
@@ -5434,6 +5464,14 @@ fn registerStreamed(set: *kc.Set) !void {
         .nax = true,
         .served = flash_first_served,
         .sums = .{ .exact = false },
+    });
+    try kit.add(set, IdxWproj, &idx_wproj_l, .{}, .{
+        .name = "dsv41 idx_wproj (PF_IDX_PASS: the indexer's head weights over a pass, 32 x 5,120 compiled in, bf16 out)",
+        .accum = .f32,
+        .depth = depthK,
+        .out = .bf16,
+        .nax = true,
+        .served = &.{ .{ .rows = 33, .n = 32, .k = 5120 }, .{ .rows = 256, .n = 32, .k = 5120 }, .{ .rows = 1000, .n = 32, .k = 5120 } },
     });
     // FLASH_TRIM and FLASH_PSUM together: the same bound.
     inline for (.{ true, false }) |qt| try kit.add(set, AttnFlash, &flash_trim_psum_l, .{ .qt = qt }, .{

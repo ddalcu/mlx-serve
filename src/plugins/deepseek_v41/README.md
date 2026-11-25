@@ -17,9 +17,9 @@ On an M5 Ultra, the release build decoded 98.80 tok/s greedy with DSpark on and 
 test's p01 prompt. The first NVFP4 build gave 71.77 and 3,994 tok/s (see "Results"). Both runs used the NVFP4 pack, so
 the pack gives none of the gain; the runs also differ in setup.
 
-The plugin has 52 default-on switches (51 on M5, where `ATTN_F16` is off). We count 50 of them as lossless.
+The plugin has 55 default-on switches (54 on M5, where `ATTN_F16` is off). We count 53 of them as lossless.
 "Lossless" here means each switch's output is bit-identical to its `=0` path (EXACT); or (REORDER) not
-bit-identical but measured no farther from float64 (5 switches), held to a stated bound that can allow somewhat more
+bit-identical but measured no farther from float64 (6 switches), held to a stated bound that can allow somewhat more
 error than `=0` (7), or classed by reasoning or A/B text alone (3); or changes only drafts and verify widths, or how a sampled verify accepts drafts while keeping the model's
 distribution
 (DRAFT-ONLY). `MLX_ENABLE_TF32` has its own class (TF32): on M5 at the defaults it rounds only the drafter's P·V.
@@ -237,21 +237,21 @@ declines the switch by name and logs why.
 
 ## Accuracy: what "lossless" means here
 
-50 plugin switches fall in three classes, and a fourth class, TF32, covers one engine variable:
+53 plugin switches fall in three classes, and a fourth class, TF32, covers one engine variable:
 - EXACT: the same output values as the `=0` path, bit for bit. A test shows it, or (2 switches) it is classed without
   a measurement, by the commit's reasoning.
-- REORDER: not bit-identical; the table below splits the 15 by their evidence.
+- REORDER: not bit-identical; the table below splits the 16 by their evidence.
 - DRAFT-ONLY: changes only the drafts, or how many rows a verify checks (1 switch classed without a measurement).
 - TF32 (one engine variable): MLX's TF32 matmuls; on off-default routes they also round the f32 chain's P·V (the
   block below). Without NAX, MLX does not use TF32.
 
-44 of the 50 have a standing test or a kernel contract case. 6 do not: `WOA_JOIN`, `DRAFT_POS_ONCE` (EXACT); `CED`,
+47 of the 53 have a standing test or a kernel contract case. 6 do not: `WOA_JOIN`, `DRAFT_POS_ONCE` (EXACT); `CED`,
 `PF_PASS_SIZE`, `HC_EXPAND_NORM` (REORDER); and `SPEC_SYNC` (DRAFT-ONLY). The table below says why for each.
 
 | Class | Plugin switches | Engine variables |
 |---|---|---|
-| EXACT | 29 | 0 |
-| REORDER | 15 | 1: `MLX_SERVE_DSV4_DSPARK` (the verify's multi-row kernels, by reasoning) |
+| EXACT | 31 | 0 |
+| REORDER | 16 | 1: `MLX_SERVE_DSV4_DSPARK` (the verify's multi-row kernels, by reasoning) |
 | DRAFT-ONLY | 6, including `DRAFT_VOCAB` | 2: `MLX_SERVE_DSPARK_POLICY2`, `MLX_SERVE_DSPARK_POLICY2_MODELED` |
 | TF32 | 0 | 1: `MLX_ENABLE_TF32` |
 
@@ -264,7 +264,7 @@ prompt-attention call (the block below).
 
 | REORDER switches | How many |
 |---|---|
-| Measured no farther from float64 than the `=0` path (`PF_COMP_BF16`, `FLASH_ATTN`, `ENGRAM_KV_SLOTS`, `ATTN_DEC`, `WOA_PLAIN`) | 5 |
+| Measured no farther from float64 than the `=0` path (`PF_COMP_BF16`, `FLASH_ATTN`, `ENGRAM_KV_SLOTS`, `ATTN_DEC`, `WOA_PLAIN`, `PF_IDX_PASS`) | 6 |
 | Held to a stated bound that can allow more error than `=0`: `MOE_FP4_NAX`, `FP4_READS`, `FUSE_MXFP8_QMM` (rel-rms against f32 up to 1.25 times the `=0` path's, plus 1e-4); `PF_HC_V2` (mixes and split 2.0 to 5.9 times farther from float64, within 1e-5 of it); `ENGRAM_GPU_IDS` (4 of 409,600 words farther, worst element no farther); `MOE_PAIR_SCALED` (each differing word within one bf16 step of its row's peak, under 1% differing, sample l2 within 1.05 times); `PF_IDX_NAX` (each score within 2·γ(34) of `idx_tile`'s, the same top-half picks except near-ties) | 7 |
 | Resting on the commit's reasoning (`CED`, the chunked prompt path; `PF_PASS_SIZE`) | 2 |
 | Resting on its A/B's same text (`HC_EXPAND_NORM`: its test allows 1% relative error, far looser than bf16 rounding, so we do not count it as a bound) | 1 |
@@ -365,7 +365,9 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | PF_MOE_EPI | Counting-sort route pack in place of two argsorts | EXACT | test |
 | PF_GU_SEG | 128 x 128 paired gate/up where the planner picks it | EXACT | test (word for word, to 8,192 rows, NVFP4 with per-expert scales; NAX) |
 | PF_KV_ROWS | Window kv rows on one simdgroup per row | EXACT | test (word for word) |
+| PF_COMP_PASS | Compressor pooling once over the pass, each span's index-key linear on its own groups | EXACT | test |
 | PF_DOWN_TOKORD | Staged down writes rows in token order | EXACT | test |
+| PF_DOWN_BK32 | Staged down on the 64 x 64 tile, 32 deep a step, at 96 routed rows an expert and more | EXACT | test |
 | PF_FP4_GEMM | Staged matrix-unit gather for routed gate/up and down | EXACT | test |
 | WOA_JOIN | Joins the spans' wo_a rows in one copy | EXACT | commit |
 | PF_ROUTE_PACK | Router top-6 on a simdgroup per row; one-threadgroup scan | EXACT | test |
@@ -392,6 +394,7 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | PF_PASS_SIZE | Near-equal memory-sized prompt passes | REORDER (partition) | commit |
 | PF_IDX_NAX | Indexer scores on the matrix units | REORDER (bounded) | test (within 2·γ(34) of `idx_tile`, the same top-half picks except near-ties; NAX) |
 | PF_COMP_BF16 | Compressor projection on a bf16 MMA, K blocks summed apart | REORDER | test |
+| PF_IDX_PASS | Indexer queries and head weights once over the pass, the head weights on a shape-cut kernel (16 partial sums) | REORDER | test |
 | FLASH_ATTN | Every prompt-attention call on one flash kernel where it fits | REORDER | test |
 | ENGRAM_GPU_IDS | Engram ids hashed on the GPU; fused wkv | REORDER (bounded) | test |
 | ENGRAM_KV_SLOTS | Slot-blocked Engram wkv | REORDER | test |
