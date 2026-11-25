@@ -19,6 +19,7 @@ const gatherExpertMm = @import("../../sdk/blocks/moe/experts.zig").gatherExpertM
 const device = @import("../../mlx/device.zig");
 const QuantMode = @import("../../sdk/quant/params.zig").QuantMode;
 const rel = @import("../inkling/attention.zig");
+const kernels = @import("kernels.zig");
 const Config = @import("config.zig").Config;
 
 const Graph = ops.Graph;
@@ -115,7 +116,10 @@ pub const Body = struct {
     consts: Consts = .{},
 };
 
-pub const projectRows = head_block.project;
+pub fn projectRows(g: *Graph, w: *const Linear, x: Array) !Array {
+    if (try kernels.fastProjectRows(g, w, x)) |y| return y;
+    return head_block.project(g, w, x);
+}
 
 fn plainNorm(g: *Graph, x: Array, ones: Array) !Array {
     return g.rmsNorm(x, ones, plain_eps);
@@ -583,7 +587,7 @@ pub const Head = struct {
     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
         const g = c.g;
         // Trimmed before the cap: the cap's result is then a dense array, not a strided view of the padded rows.
-        const logits = try g.astype(try g.sliceAxis(try head_block.project(g, &w.lin, x), 2, 0, w.vocab), .float32);
+        const logits = try g.astype(try g.sliceAxis(try projectRows(g, &w.lin, x), 2, 0, w.vocab), .float32);
         return g.mulScalar(try g.tanh(try g.mulScalar(logits, 1.0 / w.softcap)), w.softcap);
     }
 };

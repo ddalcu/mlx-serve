@@ -3536,6 +3536,301 @@ const DownsGrouped = struct {
     }
 };
 
+const relattn_nax_launch = metal.Launch{
+    .name = "msv_inkling2_relattn_nax",
+    .inputs = &.{ "q", "k", "v", "rel", "sinks", "key_start", "sizes", "scale" },
+    .outputs = &.{"out"},
+    .source = source("plugins/inkling2/kernels/relattn_nax.metal"),
+    .header = source("kernels/common/mpp_tensor_ops.metal"),
+    .contiguous = false,
+    .tg_bytes = 2 * 2 * 32 * SD,
+    .m1 = 1024,
+    .m2 = 1024,
+};
+
+/// Metal 4 NAX prompt flash attention: rows = KV heads, n = queries L, k = keys S; `window` 0 on a global layer.
+const RelAttnNax = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch = &relattn_nax_launch,
+    arena: std.heap.ArenaAllocator,
+    window: usize,
+    shape: Shape = undefined,
+    q: []f64 = &.{},
+    k: []f64 = &.{},
+    v: []f64 = &.{},
+    rel: []f64 = &.{},
+    sinks: []f64 = &.{},
+    scale: f64 = @as(f32, 1.0 / @sqrt(@as(f32, SD))),
+    args: [8]mlx.mlx_array = undefined,
+
+    const Self = @This();
+    const BK: usize = 32;
+
+    fn init(a: std.mem.Allocator, window: usize) Self {
+        return .{ .rig = metal.Rig.init(a), .arena = .init(a), .window = window };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    pub fn geometry(self: *const Self, shape: Shape) ?metal.Geometry {
+        if (shape.rows == 0 or shape.n == 0 or shape.k < shape.n) return null;
+        const hq: c_int = @intCast(shape.rows * SG);
+        const l: c_int = @intCast(shape.n);
+        var g = metal.Geometry{ .grid = .{ @divTrunc(l + 63, 64) * 128, hq, 1 }, .tg = .{ 128, 1, 1 } };
+        g.out(&.{ 1, l, hq, SD }, .bfloat16);
+        g.dtype("T", .bfloat16);
+        g.int("D", @as(c_int, SD));
+        g.int("HQ", hq);
+        g.int("HKV", @as(c_int, @intCast(shape.rows)));
+        g.int("R", @as(c_int, R));
+        g.int("WINDOW", @as(c_int, @intCast(self.window)));
+        g.int("BQ", @as(c_int, 64));
+        g.int("TG", @as(c_int, 128));
+        return g;
+    }
+
+    pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const hq = shape.rows * SG;
+        self.q = try host.uniform(a, rng, hq * shape.n * SD, -2, 2, .bfloat16);
+        self.k = try host.uniform(a, rng, shape.rows * shape.k * SD, -2, 2, .bfloat16);
+        self.v = try host.uniform(a, rng, shape.rows * shape.k * SD, -2, 2, .bfloat16);
+        self.rel = try host.uniform(a, rng, shape.n * hq * R, -2, 2, .bfloat16);
+        self.sinks = try host.uniform(a, rng, shape.n * hq, -3, 3, .float32);
+        if (fill == .nonfinite) {
+            host.plant(self.q, hq * shape.n, SD);
+            host.plant(self.v, shape.rows * shape.k, SD);
+        }
+        self.rig.reset();
+        self.args = .{
+            try self.rig.input(.bfloat16, &.{ 1, cint(hq), cint(shape.n), SD }, self.q),
+            try self.rig.input(.bfloat16, &.{ 1, cint(shape.rows), cint(shape.k), SD }, self.k),
+            try self.rig.input(.bfloat16, &.{ 1, cint(shape.rows), cint(shape.k), SD }, self.v),
+            try self.rig.input(.bfloat16, &.{ 1, cint(shape.n), cint(hq), R }, self.rel),
+            try self.rig.input(.float32, &.{ 1, cint(shape.n), cint(hq) }, self.sinks),
+            try self.rig.input(.int32, &.{1}, &.{0}),
+            try self.rig.input(.int32, &.{2}, &.{ @floatFromInt(shape.n), @floatFromInt(shape.k) }),
+            try self.rig.scalar(@floatCast(self.scale)),
+        };
+        return true;
+    }
+
+    pub fn run(self: *Self) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Self) usize {
+        return self.shape.n * self.shape.rows * SG * SD;
+    }
+
+    fn emit(self: *const Self, want: []f64, mag: ?[]f64, sim: attn.Sim) !void {
+        const a = self.rig.a;
+        const l = self.shape.n;
+        const keys_n = self.shape.k;
+        const hq = self.shape.rows * SG;
+        const keys = try a.alloc(attn.Key, keys_n);
+        defer a.free(keys);
+        const ends = try a.alloc(usize, (keys_n + BK - 1) / BK + 1);
+        defer a.free(ends);
+        const terms = try a.alloc(f64, SD);
+        defer a.free(terms);
+        const eo = try a.alloc(f64, SD);
+        defer a.free(eo);
+        const zero_err: [SD]f64 = @splat(0);
+        const qs: f64 = @as(f32, @floatCast(self.scale * LOG2E));
+        for (0..l) |r| for (0..hq) |h| {
+            const kv = h / SG;
+            const q = self.q[(h * l + r) * SD ..][0..SD];
+            const at = keys_n - l + r;
+            const q0 = (r / 64) * 64;
+            const first_diag = keys_n - l + q0;
+            const first_key = if (self.window > 0 and first_diag + 1 > self.window) first_diag + 1 - self.window else 0;
+            const k_start = (first_key / BK) * BK;
+            var n: usize = 0;
+            var nb: usize = 0;
+            var t0 = k_start;
+            while (t0 <= at) : (t0 += BK) {
+                for (t0..@min(t0 + BK, keys_n)) |j| {
+                    const vrow = self.v[(kv * keys_n + j) * SD ..][0..SD];
+                    if (j > at or (self.window > 0 and at - j >= self.window)) {
+                        keys[n] = .{ .s = -std.math.inf(f64), .on = false, .v = vrow, .ve = &zero_err };
+                        n += 1;
+                        continue;
+                    }
+                    const k = self.k[(kv * keys_n + j) * SD ..][0..SD];
+                    const d = attn.dot(q, k, qs, SD, 1, sim, terms);
+                    const b: f64 = if (at - j < R) @as(f64, @as(f32, @floatCast(self.rel[(r * hq + h) * R + at - j] * LOG2E))) else 0;
+                    const sv = d.v + b;
+                    keys[n] = .{ .s = sv, .e = d.e + host.U * (@abs(b) + @abs(sv)), .v = vrow, .ve = &zero_err };
+                    n += 1;
+                }
+                ends[nb] = n;
+                nb += 1;
+            }
+            const start: attn.Init = .{ .m = @as(f32, @floatCast(self.sinks[r * hq + h] * LOG2E)), .l = 1 };
+            const dst = (r * hq + h) * SD;
+            const o = want[dst..][0..SD];
+            const st = attn.online(split_soft, start, keys[0..n], ends[0..nb], o, eo);
+            const inv = 1.0 / st.l;
+            for (o, eo, 0..) |*v, e, d_i| {
+                const val = v.* * inv;
+                const err = (e + @abs(val) * st.el) * @abs(inv) + 2.0 * host.U * @abs(val);
+                v.* = val;
+                if (mag) |m| m[dst + d_i] = host.allowance(err);
+            }
+        };
+    }
+
+    pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+        try self.emit(want, mag, null);
+    }
+
+    pub fn simulate(self: *const Self, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+        try self.emit(out, null, .{ .acc = acc, .order = order });
+    }
+
+    fn wrapper(self: *Self) ![]const u8 {
+        var g = ops.Graph.init(self.rig.a, self.rig.stream());
+        defer g.deinit();
+        const x = self.args;
+        return self.rig.bytesOf(&.{try kernels.relAttnNax(&g, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7], @intCast(self.window))});
+    }
+};
+
+const proj_rows_launch = metal.Launch{
+    .name = "msv_inkling2_proj_rows",
+    .inputs = &.{ "X", "WQ", "WS", "WB" },
+    .outputs = &.{"Y"},
+    .source = source("plugins/inkling2/kernels/proj_rows.metal"),
+    .header = kernels.bank_grouped_header,
+    .tg_bytes = 0,
+    .m1 = 1024,
+    .m2 = 1024,
+};
+
+/// Multi-row quantized projection: rows = M (2..8), n = output rows N, k = hidden K.
+const ProjRows = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch = &proj_rows_launch,
+    arena: std.heap.ArenaAllocator,
+    bits: u32,
+    gs: usize,
+    shape: Shape = undefined,
+    x: []f64 = &.{},
+    w: host.Affine,
+    args: [4]mlx.mlx_array = undefined,
+
+    const Self = @This();
+
+    fn init(a: std.mem.Allocator, bits: u32, gs: usize) Self {
+        return .{ .rig = metal.Rig.init(a), .arena = .init(a), .bits = bits, .gs = gs, .w = .{ .bits = bits, .gs = gs, .n = 0, .k = 0 } };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.rig.deinit();
+        self.arena.deinit();
+        self.w.deinit(self.rig.a);
+    }
+
+    pub fn geometry(self: *const Self, shape: Shape) ?metal.Geometry {
+        if (shape.rows < 2 or shape.rows > 8 or shape.n == 0 or shape.k == 0 or shape.n % 2 != 0 or shape.k % 32 != 0 or shape.k % self.gs != 0) return null;
+        const half_n: c_int = @intCast(shape.n / 2);
+        const sgs: c_int = if (@rem(half_n, 4) == 0) 4 else if (@rem(half_n, 2) == 0) 2 else 1;
+        var g = metal.Geometry{ .grid = .{ 32, half_n, 1 }, .tg = .{ 32, sgs, 1 } };
+        g.out(&.{ 1, @intCast(shape.rows), @intCast(shape.n) }, .bfloat16);
+        g.dtype("T", .bfloat16);
+        g.dtype("S", .bfloat16);
+        g.int("K", shape.k);
+        g.int("N", shape.n);
+        g.int("GS", self.gs);
+        g.int("BITS", self.bits);
+        g.int("FMT", @as(c_int, 3));
+        g.int("M", shape.rows);
+        return g;
+    }
+
+    pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        self.x = try host.uniform(a, rng, shape.rows * shape.k, -1, 1, .bfloat16);
+        try self.w.fill(self.rig.a, rng, shape.n, shape.k, .bfloat16, false);
+        if (fill == .nonfinite) host.plant(self.x, shape.rows, shape.k);
+        self.rig.reset();
+        self.args = .{
+            try self.rig.input(.bfloat16, &.{ 1, cint(shape.rows), cint(shape.k) }, self.x),
+            try self.rig.input(.uint32, &.{ cint(shape.n), cint(shape.k * self.bits / 32) }, self.w.words),
+            try self.rig.input(.bfloat16, &.{ cint(shape.n), cint(shape.k / self.gs) }, self.w.scales),
+            try self.rig.input(.bfloat16, &.{ cint(shape.n), cint(shape.k / self.gs) }, self.w.biases),
+        };
+        return true;
+    }
+
+    pub fn run(self: *Self) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Self) usize {
+        return self.shape.rows * self.shape.n;
+    }
+
+    pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+        const n = self.shape.n;
+        const k = self.shape.k;
+        for (0..self.shape.rows) |r| {
+            const xrow = self.x[r * k ..][0..k];
+            for (0..n) |col| {
+                var y: f64 = 0;
+                var am: f64 = 0;
+                var g: usize = 0;
+                while (g < k) : (g += self.gs) {
+                    const sc = self.w.scales[(col * k + g) / self.gs];
+                    const bi = self.w.biases[(col * k + g) / self.gs];
+                    for (g..g + self.gs) |i| {
+                        const wv = sc * @as(f64, @floatFromInt(self.w.codes[col * k + i])) + bi;
+                        const prod = wv * xrow[i];
+                        y += prod;
+                        am += @abs(prod);
+                    }
+                }
+                want[r * n + col] = y;
+                mag[r * n + col] = am;
+            }
+        }
+    }
+
+    pub fn simulate(self: *const Self, _: spec.Accum, _: spec.Order, out: []f64) !void {
+        const mag = try self.rig.a.alloc(f64, out.len);
+        defer self.rig.a.free(mag);
+        try self.reference(out, mag);
+    }
+
+    fn wrapper(self: *Self) ![]const u8 {
+        var g = ops.Graph.init(self.rig.a, self.rig.stream());
+        defer g.deinit();
+        const lin = layers.Linear{
+            .w = self.args[1],
+            .s = self.args[2],
+            .b = self.args[3],
+            .bits = self.bits,
+            .group_size = @intCast(self.gs),
+            .mode = .affine,
+        };
+        return self.rig.bytesOf(&.{(try kernels.projRows(&g, &lin, self.args[0])).?});
+    }
+};
+
 const dtypes = [_]mlx.mlx_dtype{ .bfloat16, .float32 };
 
 fn name(comptime what: []const u8, comptime dt: mlx.mlx_dtype) []const u8 {
@@ -3813,6 +4108,37 @@ pub fn register(set: *kc.Set) !void {
             .sums = grp_sums,
         }, null);
     }
+    try set.add(RelAttnNax, .init(set.a, 1024), .{
+        .name = "inkling2 relattn_nax bf16 (sliding 1024)",
+        .accum = .f32,
+        .depth = host.depthOne,
+        .out = .bf16,
+        .tiles = .{ .{}, .{ .size = 64, .min = 33 }, .{ .size = 32, .min = 64 } },
+        .served = &.{ .{ .rows = 2, .n = 64, .k = 128 }, .{ .rows = 2, .n = 70, .k = 1100 } },
+        .sums = split_sums,
+        .nax = true,
+    }, null);
+    try set.add(RelAttnNax, .init(set.a, 0), .{
+        .name = "inkling2 relattn_nax bf16 (global)",
+        .accum = .f32,
+        .depth = host.depthOne,
+        .out = .bf16,
+        .tiles = .{ .{}, .{ .size = 64, .min = 33 }, .{ .size = 32, .min = 64 } },
+        .served = &.{ .{ .rows = 2, .n = 64, .k = 128 }, .{ .rows = 2, .n = 70, .k = 200 } },
+        .sums = split_sums,
+        .nax = true,
+    }, null);
+    inline for (.{ .{ 2, 64 }, .{ 3, 64 }, .{ 4, 64 }, .{ 5, 64 }, .{ 6, 64 }, .{ 8, 64 }, .{ 4, 32 }, .{ 4, 128 } }) |w| {
+        try set.add(ProjRows, .init(set.a, w[0], w[1]), .{
+            .name = std.fmt.comptimePrint("inkling2 proj_rows bf16 ({d}-bit g{d})", .{ w[0], w[1] }),
+            .accum = .f32,
+            .depth = rowLength,
+            .ops = 2,
+            .out = .bf16,
+            .served = &.{ .{ .rows = 2, .n = 64, .k = 256 }, .{ .rows = 4, .n = 64, .k = 256 }, .{ .rows = 5, .n = 64, .k = 256 } },
+            .sums = grp_sums,
+        }, null);
+    }
 }
 
 // ── tests ──
@@ -3894,6 +4220,33 @@ test "kernel contract inkling2: each declared launch is the shipped wrapper's, b
                 defer a.free(ours);
                 try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
             }
+        }
+    }
+    const has_nax = @import("../../mlx/device.zig").naxAvailable();
+    if (has_nax) {
+        for (0..2) |_| {
+            const k = set.kernels.items[at];
+            at += 1;
+            const p: *RelAttnNax = @ptrCast(@alignCast(k.ctx));
+            for (k.spec.served) |shape| {
+                try std.testing.expect(try p.prepare(shape, .random, 7));
+                try p.run();
+                const ours = try a.dupe(u8, p.rig.outputBytes());
+                defer a.free(ours);
+                try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
+            }
+        }
+    } else at += 2;
+    for (0..8) |_| {
+        const k = set.kernels.items[at];
+        at += 1;
+        const p: *ProjRows = @ptrCast(@alignCast(k.ctx));
+        for (k.spec.served) |shape| {
+            try std.testing.expect(try p.prepare(shape, .random, 7));
+            try p.run();
+            const ours = try a.dupe(u8, p.rig.outputBytes());
+            defer a.free(ours);
+            try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
         }
     }
 }

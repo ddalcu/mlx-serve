@@ -184,6 +184,8 @@ pub const Drafting = struct {
     period: u32 = 1,
     /// Upper bound on backoff period (lower for cheap native drafters so recovery after prose stretches is rapid).
     max_period: u32 = MAX_PERIOD,
+    /// Reset EMA and backoff immediately when a probe round wins (opted in per drafter).
+    reset_on_win: bool = false,
     /// Rounds skipped, for stats.
     skipped: u64 = 0,
     /// Drafted rounds that followed a skip stretch.
@@ -214,7 +216,8 @@ pub const Drafting = struct {
         const was_probe = self.probing;
         self.probing = false;
         const wall = @min(took, STALL * if (self.wall > 0) self.wall else gain);
-        if (self.wall <= 0 or (was_probe and gain >= wall)) {
+        const reset = self.reset_on_win and was_probe and gain >= wall;
+        if (self.wall <= 0 or reset) {
             self.gain = gain;
             self.wall = wall;
         } else {
@@ -223,7 +226,7 @@ pub const Drafting = struct {
         }
         if (self.gain >= self.wall) {
             self.owed = 0;
-            self.period = if (was_probe) 1 else @max(1, self.period / 2);
+            self.period = if (self.reset_on_win and was_probe) 1 else @max(1, self.period / 2);
         } else {
             self.owed = self.period;
             self.period = @min(self.period * 2, self.max_period);
@@ -506,7 +509,7 @@ test "Drafting: a losing draft owes plain rounds, doubling to a cap; a winning p
 }
 
 test "Drafting: a moderately winning probe clears the debt even after a deep losing streak" {
-    var d = Drafting{};
+    var d = Drafting{ .reset_on_win = true };
     for (0..8) |_| {
         while (!d.shouldDraft()) {}
         d.record(10, 22);
@@ -636,6 +639,33 @@ test "Drafting: a stalled round is not what a round costs" {
     }
     try testing.expect(cold.skipped < 20);
     try testing.expect(cold.shouldDraft());
+}
+
+test "Drafting: reset_on_win is opt-in and leaves default backoff untouched" {
+    // Default (reset_on_win = false): winning a single probe after a deep losing streak keeps EMA smoothing.
+    var def: Drafting = .{};
+    for (0..4) |_| {
+        while (!def.shouldDraft()) {}
+        def.record(10, 40);
+    }
+    while (!def.shouldDraft()) {}
+    const prev_period = def.period;
+    def.record(50, 35);
+    try testing.expect(def.gain < 50);
+    try testing.expect(def.period >= prev_period / 2);
+
+    // Opt-in (reset_on_win = true): winning a probe resets EMA and clears period back to 1.
+    var opt: Drafting = .{ .max_period = 8, .reset_on_win = true };
+    for (0..4) |_| {
+        while (!opt.shouldDraft()) {}
+        opt.record(10, 40);
+    }
+    while (!opt.shouldDraft()) {}
+    opt.record(50, 35);
+    try testing.expectApproxEqAbs(@as(f32, 50), opt.gain, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 35), opt.wall, 1e-4);
+    try testing.expectEqual(@as(u32, 1), opt.period);
+    try testing.expectEqual(@as(u32, 0), opt.owed);
 }
 
 test "GroupCost: rows and states cost more, and a slower machine's rounds scale the prior within bounds" {

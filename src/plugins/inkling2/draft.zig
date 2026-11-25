@@ -12,16 +12,16 @@ const abi = @import("../../abi/plugin.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const reader = @import("../../sdk/bases/reader.zig");
-const head_block = @import("../../sdk/bases/blocks/head.zig");
 const Linear = @import("../../sdk/bases/blocks/linear.zig").Linear;
 const Weights = @import("../../sdk/weights/resident.zig").Weights;
 const config = @import("config.zig");
 const kernels = @import("kernels.zig");
+const layers = @import("layers.zig");
 
 const Array = ops.Array;
 const Graph = ops.Graph;
 const gpa = std.heap.c_allocator;
-const project = head_block.project;
+const project = layers.projectRows;
 
 pub const Layer = struct {
     in_norm: Array,

@@ -1020,7 +1020,7 @@ pub fn initWithOptions(
             .dspark_stochastic = dspark_stochastic,
             // A streamed EXL3 bank verifies the whole block on a greedy request: its verify costs about a plain tick.
             // A plugin's drafter opens with the plain rounds that time one, then drafts while its rounds pay.
-            .dspark_pol = if (!dspark_active) null else if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else if (plugin_driver.nativeDrafter(xfm) != null) .{ .plain = .unmeasured, .drafting = .{ .owed = 4, .max_period = 8 } } else null,
+            .dspark_pol = if (!dspark_active) null else if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else if (plugin_driver.nativeDrafter(xfm) != null) .{ .plain = .unmeasured, .drafting = .{ .owed = 4, .max_period = nativeDrafterMaxPeriod(dspark_stochastic), .reset_on_win = true } } else null,
             .drafter = if (drafter_active) options.drafter else null,
             .drafter_block_size = options.drafter_block_size,
             .dflash = if (dflash_active) options.dflash else null,
@@ -1198,6 +1198,12 @@ pub fn initWithOptions(
     return gen;
 }
 
+/// Backoff ceiling for a plugin's native drafter: greedy recovers quickly on predictable transitions (8),
+/// while stochastic sampling backs off to 32 to avoid probing through long high-entropy prose spans.
+pub fn nativeDrafterMaxPeriod(stochastic: bool) u32 {
+    return if (stochastic) 32 else 8;
+}
+
 // ── tests ──
 
 const testing = std.testing;
@@ -1228,4 +1234,9 @@ test "initWithOptions: suppress_cjk wires the CJK mask and fails without one" {
     var gen = try initWithOptions(io, a, &xfm, &tok, &prompt, 4, cjk, &.{}, .{ .skip_lazy_preforward = true });
     defer gen.deinit(a);
     try testing.expectEqual(xfm.suppress_mask_cjk.?.ctx, gen.sampling.suppress_mask.?.ctx);
+}
+
+test "nativeDrafterMaxPeriod: greedy stays short while stochastic backs off further" {
+    try testing.expectEqual(@as(u32, 8), nativeDrafterMaxPeriod(false));
+    try testing.expectEqual(@as(u32, 32), nativeDrafterMaxPeriod(true));
 }

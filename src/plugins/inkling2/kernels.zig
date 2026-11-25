@@ -50,6 +50,7 @@ const bank_groups: c_int = 8;
 pub var pre_kernel: Kernel = .{ .name = "msv_inkling2_pre", .ins = &.{ "HIN", "BLK", "QY", "NW0", "NW1", "NW2", "BANK", "BPART", "MQ", "PR" }, .outs = &.{ "X", "NORMED", "A", "MSGO", "BOTH" }, .source = kernelSource("plugins/inkling2/kernels/pre.metal") };
 pub var prep_kernel: Kernel = .{ .name = "msv_inkling2_prep", .ins = &.{ "QP", "GP", "RP", "KP", "VP", "KDY", "VDY", "ST", "KW", "VW", "QS", "RS", "RJ", "PR" }, .outs = &.{ "Q", "GATE", "K", "V", "BIAS", "REL" }, .source = kernelSource("plugins/inkling2/kernels/prep.metal") };
 pub var oproj_kernel: Kernel = .{ .name = "msv_inkling2_oproj", .ins = &.{ "ATT", "GATE", "WQ", "WS", "WB" }, .outs = &.{"Y"}, .source = kernelSource("plugins/inkling2/kernels/oproj.metal"), .header = bank_header };
+pub var proj_rows_kernel: Kernel = .{ .name = "msv_inkling2_proj_rows", .ins = &.{ "X", "WQ", "WS", "WB" }, .outs = &.{"Y"}, .source = kernelSource("plugins/inkling2/kernels/proj_rows.metal"), .header = bank_grouped_header };
 pub var gated_kernel: Kernel = .{ .name = "msv_inkling2_gated", .ins = &.{ "ATT", "GATE" }, .outs = &.{"OUT"}, .source = kernelSource("plugins/inkling2/kernels/gated.metal") };
 pub var mid_kernel: Kernel = .{ .name = "msv_inkling2_mid", .ins = &.{ "OP", "ST", "AW", "HIN", "NORMED", "BLK", "QY", "PN", "MSG3", "PR" }, .outs = &.{ "RES", "X", "X32", "M", "BOTH" }, .source = kernelSource("plugins/inkling2/kernels/mid.metal") };
 pub var gate_kernel: Kernel = .{ .name = "msv_inkling2_gate", .ins = &.{ "A", "MS", "ST", "F", "G" }, .outs = &.{"Y"}, .source = kernelSource("plugins/inkling2/kernels/gate.metal") };
@@ -62,6 +63,7 @@ pub var group_experts_kernel: Kernel = .{ .name = "msv_inkling2_group_experts", 
 pub var ups_grouped_kernel: Kernel = .{ .name = "msv_inkling2_ups_grouped", .ins = &.{ "X", "WQ", "WS", "WB", "ACT_E", "ACT_CNT", "ACT_PAIR", "SC", "PR" }, .outs = &.{"ACT"}, .source = kernelSource("plugins/inkling2/kernels/ups_grouped.metal"), .header = bank_grouped_header };
 pub var downs_grouped_kernel: Kernel = .{ .name = "msv_inkling2_downs_grouped", .ins = &.{ "ACT", "WQ", "WS", "WB", "ACT_E", "ACT_CNT", "ACT_PAIR" }, .outs = &.{"DN"}, .source = kernelSource("plugins/inkling2/kernels/downs_grouped.metal"), .header = bank_grouped_header };
 pub var relattn_kernel: Kernel = .{ .name = "msv_inkling2_relattn", .ins = &.{ "q", "k", "v", "rel", "sinks", "key_start", "sizes", "scale" }, .outs = &.{"out"}, .source = kernelSource("plugins/inkling2/kernels/relattn.metal"), .contiguous = false };
+pub var relattn_nax_kernel: Kernel = .{ .name = "msv_inkling2_relattn_nax", .ins = &.{ "q", "k", "v", "rel", "sinks", "key_start", "sizes", "scale" }, .outs = &.{"out"}, .source = kernelSource("plugins/inkling2/kernels/relattn_nax.metal"), .header = kernelSource("kernels/common/mpp_tensor_ops.metal"), .contiguous = false };
 pub var router_kernel: Kernel = .{ .name = "msv_inkling2_router", .ins = &.{ "X", "RT" }, .outs = &.{"SC"}, .source = kernelSource("plugins/inkling2/kernels/router.metal") };
 pub var relsplit_kernel: Kernel = .{ .name = "msv_inkling2_relsplit", .ins = &.{ "q", "k", "v", "rel", "sinks", "sizes", "scale" }, .outs = &.{ "PART", "ML" }, .source = kernelSource("plugins/inkling2/kernels/relsplit.metal"), .contiguous = false };
 pub var relsplit_open_kernel: Kernel = .{ .name = "msv_inkling2_relsplit_open", .ins = &.{ "q", "kc", "vc", "kn", "vn", "rel", "sinks", "sizes", "scale" }, .outs = &.{ "PART", "ML" }, .source = kernelSource("plugins/inkling2/kernels/relsplit_open.metal"), .contiguous = false };
@@ -406,6 +408,80 @@ pub fn oGated(g: *Graph, o: *const layers.Linear, att: Array, gate_sigmoid: Arra
     return y[0];
 }
 
+/// `proj_rows.metal`: multi-row quantized projection for `2..8` rows (2 output rows per SIMD group).
+pub fn projRows(g: *Graph, w: *const layers.Linear, x: Array) !?Array {
+    const dt = ops.dtype(x);
+    if (!mlx.streamIsGpu(g.s) or !enabled() or (dt != .bfloat16 and dt != .float16)) return null;
+    if (w.s.ctx == null or w.bias.ctx != null or w.rht != null or w.ext != null or w.ternary or ops.dtype(w.w) != .uint32) return null;
+    const xsh = ops.shape(x);
+    if (xsh.len != 3 or (xsh[0] != 1 and xsh[1] != 1)) return null;
+    const m = xsh[0] * xsh[1];
+    const k = xsh[2];
+    if (m < 2 or m > 8 or @rem(k, 32) != 0) return null;
+    const wsh = ops.shape(w.w);
+    if (wsh.len != 2) return null;
+    const n = wsh[0];
+    if (@rem(n, 2) != 0) return null;
+    const fp = ops.dtype(w.s) == .uint8;
+    const fmt: c_int = switch (w.mode) {
+        .nvfp4 => if (fp and w.bits == 4 and w.group_size == 16) 0 else return null,
+        .mxfp4 => if (fp and w.bits == 4 and w.group_size == 32) 1 else return null,
+        .mxfp8 => if (fp and w.bits == 8 and w.group_size == 32) 2 else return null,
+        .affine => if (!fp and w.b.ctx != null and ops.dtype(w.b) == ops.dtype(w.s) and floating(ops.dtype(w.s)) and affineWidth(w.bits, w.group_size)) 3 else return null,
+        else => return null,
+    };
+    const half_n = @divExact(n, 2);
+    const sgs: c_int = if (@rem(half_n, 4) == 0) 4 else if (@rem(half_n, 2) == 0) 2 else 1;
+    const y = try launchGrid(g, &proj_rows_kernel, &.{ x, w.w, w.s, if (w.b.ctx != null) w.b else w.s }, 1, .{.{ .shape = &.{ xsh[0], xsh[1], n }, .dtype = dt }}, .{ 32, half_n, 1 }, .{ 32, sgs, 1 }, &.{
+        .{ "T", .{ .dtype = dt } },
+        .{ "S", .{ .dtype = if (fmt == 3) ops.dtype(w.s) else dt } },
+        .{ "K", .{ .int = k } },
+        .{ "N", .{ .int = n } },
+        .{ "GS", .{ .int = @intCast(w.group_size) } },
+        .{ "BITS", .{ .int = @intCast(w.bits) } },
+        .{ "FMT", .{ .int = fmt } },
+        .{ "M", .{ .int = m } },
+    });
+    return y[0];
+}
+
+/// Fast multi-row dispatch for Inkling 2's 8-bit affine projections:
+/// - `M = 2..5`: register-only `proj_rows.metal` (2 rows/SG, coalesced uint4 loads, zero barriers).
+/// - `M = 6..16` on NAX hardware: direct `mlx_quantized_matmul` (MLX 0.32.5 `qmv_nax` beats `vqmm_nax` at 8-bit).
+pub fn fastProjectRows(g: *Graph, w: *const layers.Linear, x: Array) !?Array {
+    if (w.s.ctx == null or w.b.ctx == null or w.bias.ctx != null or w.rht != null or w.ext != null or w.ternary) return null;
+    if (w.mode != .affine or w.bits != 8 or !mlx.streamIsGpu(g.s) or !enabled()) return null;
+    const dt = ops.dtype(x);
+    if (dt != .bfloat16 and dt != .float16) return null;
+    const xsh = ops.shape(x);
+    if (xsh.len != 3 or (xsh[0] != 1 and xsh[1] != 1)) return null;
+    const m = xsh[0] * xsh[1];
+    if (m < 2 or m > 16) return null;
+    if (m <= 5) return projRows(g, w, x);
+    const wsh = ops.shape(w.w);
+    if (wsh.len != 2) return null;
+    const n = wsh[0];
+    const k = xsh[2];
+    if (verifyQmmNaxAvailable() and n >= 512 and k >= 1024 and @rem(n, 32) == 0 and @rem(k, 128) == 0) {
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_quantized_matmul(
+            &out,
+            x,
+            w.w,
+            w.s,
+            w.b,
+            true,
+            mlx.mlx_optional_int.some(@intCast(w.group_size)),
+            mlx.mlx_optional_int.some(@intCast(w.bits)),
+            "affine",
+            g.s,
+        ));
+        return try g.adopt(out);
+    }
+    return null;
+}
+
 pub fn gated(g: *Graph, x: Array, gate_sigmoid: Array, rows: c_int) !Array {
     const n: c_int = @intCast(mlx.mlx_array_size(gate_sigmoid));
     const o = try launch(g, &gated_kernel, &.{ x, gate_sigmoid }, 1, .{.{ .shape = &.{ 1, rows, @divExact(n, rows) }, .dtype = ops.dtype(x) }}, n, 64, &.{.{ "T", .{ .dtype = ops.dtype(x) } }});
@@ -429,6 +505,21 @@ pub fn relMask(g: *Graph, bias: Array, sinks: Array, keys: c_int, window: c_int,
 /// threadgroup, which is a prompt's throughput and a draft verify's latency.
 pub const small_rows = 32;
 
+/// `relattn_nax.metal`: Metal 4 NAX 16x32x16 flash attention over `[1, H, L, 128]` queries and `[1, HKV, S, 128]` keys/values.
+pub fn relAttnNax(g: *Graph, q: Array, k: Array, v: Array, bias: Array, sinks: Array, key_start: Array, sizes: Array, scale: Array, window: c_int) !Array {
+    const dt = ops.dtype(q);
+    const heads = ops.shape(q)[1];
+    const s = ops.shape(q)[2];
+    const hd = ops.shape(q)[3];
+    const o = try launchGrid(g, &relattn_nax_kernel, &.{ q, k, v, bias, sinks, key_start, sizes, scale }, 1, .{.{ .shape = &.{ 1, s, heads, hd }, .dtype = dt }}, .{ @divTrunc(s + 63, 64) * 128, heads, 1 }, .{ 128, 1, 1 }, &.{
+        .{ "T", .{ .dtype = dt } },              .{ "D", .{ .int = hd } },
+        .{ "HQ", .{ .int = heads } },            .{ "HKV", .{ .int = ops.shape(k)[1] } },
+        .{ "R", .{ .int = ops.shape(bias)[3] } }, .{ "WINDOW", .{ .int = window } },
+        .{ "BQ", .{ .int = 64 } },               .{ "TG", .{ .int = 128 } },
+    });
+    return o[0];
+}
+
 /// `layers.wideRead`: the rows `q` `[1, S, H, hd]` read `k` and `v` (the view after the append, the rows at its last
 /// S keys) under the bias of their clipped relative `states` `[1, S, H, d_rel]` and their `sinks` `[1, S, H]`:
 /// `[1, S, H, hd]`. `offset` is the first row's position. One flash launch with no mask built, or (at most
@@ -451,9 +542,13 @@ pub fn relative(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, r
         const read = try g.sdpa(q, try g.concat(&.{ k, zero }, 2), try g.concat(&.{ v, zero }, 2), scale, .{ .array = try relMask(g, bias, sink_rows, keys, window, true) });
         return g.transpose(read, &.{ 0, 2, 1, 3 });
     }
-    const o = try launchGrid(g, &relattn_kernel, &.{
-        q, k, v, bias, sink_rows, try g.zeros(&.{1}, .int32), try g.fromSlice(i32, &.{ s, keys }, &.{2}), try g.scalar(scale, .float32),
-    }, 1, .{.{ .shape = &.{ 1, s, heads, hd }, .dtype = dt }}, .{ @divTrunc(s + 31, 32) * 128, heads, 1 }, .{ 128, 1, 1 }, &.{
+    const key_start = try g.zeros(&.{1}, .int32);
+    const sizes = try g.fromSlice(i32, &.{ s, keys }, &.{2});
+    const sc = try g.scalar(scale, .float32);
+    if (verifyQmmNaxAvailable() and (dt == .bfloat16 or dt == .float16) and hd == 128) {
+        return relAttnNax(g, q, k, v, bias, sink_rows, key_start, sizes, sc, window);
+    }
+    const o = try launchGrid(g, &relattn_kernel, &.{ q, k, v, bias, sink_rows, key_start, sizes, sc }, 1, .{.{ .shape = &.{ 1, s, heads, hd }, .dtype = dt }}, .{ @divTrunc(s + 31, 32) * 128, heads, 1 }, .{ 128, 1, 1 }, &.{
         .{ "T", .{ .dtype = dt } },                     .{ "D", .{ .int = hd } },
         .{ "HQ", .{ .int = heads } },                   .{ "HKV", .{ .int = @intCast(cfg.num_key_value_heads) } },
         .{ "R", .{ .int = ops.shape(L.rel_proj)[1] } }, .{ "WINDOW", .{ .int = window } },
