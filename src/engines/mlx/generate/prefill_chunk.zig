@@ -1,5 +1,6 @@
 //! Prefill chunking: chunk width, tail merge, SSM checkpoint cadence, vision chunking and allocator-cache clears.
 const std = @import("std");
+const abi = @import("../../../abi/plugin.zig");
 const env = @import("../../../env.zig");
 const transformer_mod = @import("../transformer.zig");
 const model_mod = @import("../../../sdk/config/model.zig");
@@ -351,6 +352,71 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
     if (base == 0) return 0;
     return @max(base, prefill_chunk);
 }
+
+/// `stride` rounded up to a multiple of `chunk`, the width the prefill runs, when `on` (`ssmStrideOnChunk`); off,
+/// `stride` as is. The stride coarsens against the launch chunk (`effectiveSsmCheckpointStride`), so a
+/// chunk the score budget narrowed to a width that does not divide it (3584 against 8192) runs a short piece before
+/// every boundary (3584 + 3584 + 1024). Rounded up, every boundary is a chunk end and the spacing only gets coarser.
+/// 0 (no checkpoints) stays 0.
+pub fn chunkAlignedSsmCheckpointStride(stride: usize, chunk: usize, on: bool) usize {
+    if (!on or stride == 0 or chunk == 0) return stride;
+    return (stride + chunk - 1) / chunk * chunk;
+}
+
+/// The switch `chunkAlignedSsmCheckpointStride` reads at its call sites: `MLX_SERVE_CP_STRIDE_ON_CHUNK=1`, or a model
+/// plugin whose bill sets `BillFlags.cp_stride_on_chunk`. Off for every other model.
+pub fn ssmStrideOnChunk(config: *const model_mod.ModelConfig) bool {
+    return env.one(.MLX_SERVE_CP_STRIDE_ON_CHUNK) or billFlagsOf(config).cp_stride_on_chunk;
+}
+
+/// The switch `ChunkPool` reads: `MLX_SERVE_PREFILL_KEEP_CACHE=1`, or a model plugin whose bill sets
+/// `BillFlags.prefill_keep_cache`. Off for every other model.
+pub fn prefillKeepCache(config: *const model_mod.ModelConfig) bool {
+    return env.one(.MLX_SERVE_PREFILL_KEEP_CACHE) or billFlagsOf(config).prefill_keep_cache;
+}
+
+/// The model plugin's bill flags: all clear for a model without a plugin and for a plugin whose Bill predates them.
+fn billFlagsOf(config: *const model_mod.ModelConfig) abi.BillFlags {
+    const b = config.plugin orelse return .{};
+    return b.billTerms().flags orelse .{};
+}
+
+/// Where the prefill chunk loop returns MLX's buffer pool (`mlx_clear_cache`). Off (`prefillKeepCache`
+/// false): after every chunk, as before (dfd66c49 put the clear in the loop to bound a long prefill's memory). On:
+/// the pool stays between two chunks of the same width, so the next chunk's layers take back the buffers the last one
+/// freed (MLX reuses a pooled buffer only within two pages of the size asked) instead of allocating and first-touching
+/// them afresh. It is kept only where nothing else can need the memory or read it: another chunk of the same width
+/// follows, the width is not adaptive (its headroom reading, `currentGpuMemoryCeiling`, counts the pool), and no other
+/// request runs at the boundary (`InterleaveHook.idle`). Everywhere else it clears as before: after the last chunk
+/// (the next width is 0), before a chunk of another width, before a boundary tick that runs other requests
+/// (`beforeTick`), and at a cancel or an error (`atExit`). What the pool may hold stays bounded by MLX's cache limit.
+pub const ChunkPool = struct {
+    on: bool,
+    /// The pool was left in place at the last boundary.
+    kept: bool = false,
+
+    /// At a chunk boundary, the chunk's state evaluated: clear the pool (true) or keep it. `this_len` the chunk's
+    /// width, `next_len` the next chunk's (0: no chunk follows), `adaptive` the width may move at this boundary, `idle`
+    /// no other request runs at it.
+    pub fn atBoundary(p: *ChunkPool, this_len: usize, next_len: usize, adaptive: bool, idle: bool) bool {
+        p.kept = p.on and next_len != 0 and next_len == this_len and !adaptive and idle;
+        return !p.kept;
+    }
+
+    /// Before the boundary's interleave tick: a kept pool is cleared if other requests run at it now (true).
+    pub fn beforeTick(p: *ChunkPool, idle: bool) bool {
+        if (!p.kept or idle) return false;
+        p.kept = false;
+        return true;
+    }
+
+    /// The loop's exit (its end, a cancel, an error): a kept pool is cleared (true).
+    pub fn atExit(p: *ChunkPool) bool {
+        const k = p.kept;
+        p.kept = false;
+        return k;
+    }
+};
 
 /// Tokens of KV capacity this prefill reserves up front (#353). A multi-chunk prompt reserves
 /// itself plus one chunk of slack on every arch, since each chunk-by-chunk grow copies the whole
@@ -1047,6 +1113,107 @@ test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill 
     try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false, false));
 }
 
+test "chunkAlignedSsmCheckpointStride: off keeps the stride; on, a narrowed chunk ends on every boundary" {
+    // Off (the default): Hy4-flash's 17,492-token prompt (loop end 17,461) at the score budget's 3584 rows against the
+    // 8192 stride runs 3584, 3584, 1024, 3584, 3584, 1024, 1077.
+    try testing.expectEqual(@as(usize, 8192), chunkAlignedSsmCheckpointStride(8192, 3584, false));
+    try testing.expectEqual(@as(usize, 7), prefillChunkCount(17_461, 3584, true, chunkAlignedSsmCheckpointStride(8192, 3584, false), 0, false, false));
+    // On: the next multiple of the chunk (never finer), so 3584 x 4 and 3125.
+    try testing.expectEqual(@as(usize, 10_752), chunkAlignedSsmCheckpointStride(8192, 3584, true));
+    try testing.expectEqual(@as(usize, 5), prefillChunkCount(17_461, 3584, true, chunkAlignedSsmCheckpointStride(8192, 3584, true), 0, false, false));
+    try testing.expectEqual(@as(usize, 3584), nextChunkEnd(0, 17_461, 3584, true, chunkAlignedSsmCheckpointStride(8192, 3584, true), 0, false, false));
+    try testing.expectEqual(@as(usize, 10_752), nextChunkEnd(7168, 17_461, 3584, true, chunkAlignedSsmCheckpointStride(8192, 3584, true), 0, false, false));
+    // A chunk that divides the stride, a stride already a multiple, and no checkpoints are unchanged.
+    try testing.expectEqual(@as(usize, 8192), chunkAlignedSsmCheckpointStride(8192, 4096, true));
+    try testing.expectEqual(@as(usize, 16_384), chunkAlignedSsmCheckpointStride(16_384, 8192, true));
+    try testing.expectEqual(@as(usize, 0), chunkAlignedSsmCheckpointStride(0, 3584, true));
+    try testing.expectEqual(@as(usize, 8192), chunkAlignedSsmCheckpointStride(8192, 0, true));
+}
+
+test "ChunkPool: off clears at every boundary; on keeps it between same-width chunks with no company, and clears after the last chunk, before another width, before a busy tick, on cancel and on error" {
+    // Off (the default): every boundary clears, whatever the widths, as before.
+    var off: ChunkPool = .{ .on = false };
+    for ([_][2]usize{ .{ 3584, 3584 }, .{ 3584, 3584 }, .{ 3584, 3125 }, .{ 3125, 0 } }) |w| {
+        try testing.expect(off.atBoundary(w[0], w[1], false, true));
+        try testing.expect(!off.beforeTick(false));
+    }
+    try testing.expect(!off.atExit());
+    // On, over Hy4-flash's 17,492-token prompt (3584 x 4, then 3125): kept after chunks 1-3, cleared after chunk 4
+    // (the next width differs) and after chunk 5 (none follows).
+    var on: ChunkPool = .{ .on = true };
+    const widths = [_]usize{ 3584, 3584, 3584, 3584, 3125 };
+    var cleared: [5]bool = undefined;
+    for (widths, 0..) |w, i| {
+        const next: usize = if (i + 1 < widths.len) widths[i + 1] else 0;
+        cleared[i] = on.atBoundary(w, next, false, true);
+        try testing.expect(!on.beforeTick(true));
+    }
+    try testing.expectEqualSlices(bool, &.{ false, false, false, true, true }, &cleared);
+    try testing.expect(!on.atExit());
+    // A single-chunk prompt clears at its only boundary.
+    try testing.expect(on.atBoundary(3584, 0, false, true));
+    // An adaptive width and a boundary with company clear.
+    try testing.expect(on.atBoundary(3584, 3584, true, true));
+    try testing.expect(on.atBoundary(3584, 3584, false, false));
+    try testing.expect(!on.atExit());
+    // Kept, then company arrives before the tick: cleared there, once.
+    try testing.expect(!on.atBoundary(3584, 3584, false, true));
+    try testing.expect(on.beforeTick(false));
+    try testing.expect(!on.beforeTick(false));
+    try testing.expect(!on.atExit());
+    // Kept, then the request is cancelled or fails before the next chunk: the exit clears, once.
+    try testing.expect(!on.atBoundary(3584, 3584, false, true));
+    try testing.expect(on.atExit());
+    try testing.expect(!on.atExit());
+}
+
+test "BillFlags.cp_stride_on_chunk and prefill_keep_cache: a plugin's bill turns each switch on for its model; a model without a plugin, a clear flag and an older Bill keep it off" {
+    const plugin_config = @import("../plugin/config.zig");
+    const Probe = struct {
+        fn clear(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{};
+        }
+        fn older(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .flags = .{ .cp_stride_on_chunk = true, .prefill_keep_cache = true } };
+            out.size = @offsetOf(abi.Bill, "flags");
+        }
+        fn stride(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .flags = .{ .cp_stride_on_chunk = true } };
+        }
+        fn keep(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .flags = .{ .prefill_keep_cache = true } };
+        }
+    };
+    const saved_stride = env.override(.MLX_SERVE_CP_STRIDE_ON_CHUNK, null);
+    defer saved_stride.restore();
+    const saved_keep = env.override(.MLX_SERVE_PREFILL_KEEP_CACHE, null);
+    defer saved_keep.restore();
+    var cfg: model_mod.ModelConfig = .{};
+    // No plugin: both off.
+    try testing.expect(!ssmStrideOnChunk(&cfg) and !prefillKeepCache(&cfg));
+    var table: abi.ModelTable = undefined;
+    var binding: plugin_config.Binding = .{ .table = &table };
+    cfg.plugin = &binding;
+    // A clear flag, and a Bill that ends before the flag word (its flags read as absent): both off.
+    for ([_]*const fn (*const abi.Parsed, *const abi.Shape, *abi.Bill) callconv(.c) void{ &Probe.clear, &Probe.older }) |bill| {
+        table.bill = bill;
+        try testing.expect(!ssmStrideOnChunk(&cfg) and !prefillKeepCache(&cfg));
+    }
+    // Each flag turns on its own switch only.
+    table.bill = &Probe.stride;
+    try testing.expect(ssmStrideOnChunk(&cfg) and !prefillKeepCache(&cfg));
+    table.bill = &Probe.keep;
+    try testing.expect(!ssmStrideOnChunk(&cfg) and prefillKeepCache(&cfg));
+    // The env words turn each on for a model without a plugin, as before.
+    cfg.plugin = null;
+    const on_stride = env.override(.MLX_SERVE_CP_STRIDE_ON_CHUNK, "1");
+    defer on_stride.restore();
+    try testing.expect(ssmStrideOnChunk(&cfg) and !prefillKeepCache(&cfg));
+    const on_keep = env.override(.MLX_SERVE_PREFILL_KEEP_CACHE, "1");
+    defer on_keep.restore();
+    try testing.expect(prefillKeepCache(&cfg));
+}
+
 test "a vision prefill checkpoints SSM state like text" {
     const prefix_len: usize = 1587;
     const checkpoint_stride: u32 = 256;
@@ -1261,7 +1428,6 @@ test "wholePromptCheckpointBound: no width, offset or cap plans more checkpoints
 // rows, a reply past 8,192 and a prompt under 32,768 included; a model without it keeps the prompt and a chunk.
 test "reservedPrefillTokens: a reserving model reserves its whole request to the context; the others as before" {
     const t = std.testing;
-    const abi = @import("../../../abi/plugin.zig");
     const plugin_config = @import("../plugin/config.zig");
     const verify_rows = @import("init.zig").verify_rows_max;
     const Probe = struct {

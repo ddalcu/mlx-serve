@@ -450,7 +450,7 @@ The load-time shape `bill` prices.
 
 ### `Bill` (extern struct)
 
-The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout. `flags` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
+The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout. `flags`, `state_per_token` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
 
 | Field | Type | Default | |
 |---|---|---|---|
@@ -473,7 +473,9 @@ The plugin's memory terms. A zero or null term is the engine's default arithmeti
 |---|---|---|---|
 | `decode_room` | `DecodeRoom` | `.by_name` |  |
 | `reserves_request` | `bool` | `false` | A decode-billed request reserves its whole KV (prompt, reply to the context, verify rows) at its prompt and its decode bill prices that KV once (`reservedPrefillTokens`, `glm5DecodeMemoryNeeded`). |
-| `_` | `u29` | `0` |  |
+| `cp_stride_on_chunk` | `bool` | `false` | The prompt's SSM checkpoint stride rounds up to a multiple of the chunk the prefill runs, so every checkpoint lands on a chunk end (`chunkAlignedSsmCheckpointStride`), as `MLX_SERVE_CP_STRIDE_ON_CHUNK=1` does for any model. |
+| `prefill_keep_cache` | `bool` | `false` | The prefill loop keeps MLX's buffer pool between two chunks of the same width while no other request runs (`ChunkPool`), as `MLX_SERVE_PREFILL_KEEP_CACHE=1` does for any model. |
+| `_` | `u27` | `0` |  |
 
 ### `DecodeRoom` (enum(u2))
 
@@ -566,6 +568,8 @@ One forward. `tokens` holds `rows` tokens per slot, slot after slot; `slots`, `p
 | `ablation` | `?*const Ablation` | `null` | Directional ablation for this forward's slots (`Caps.ablation`); null = none, the forward unchanged. |
 | `prompt_spans` | `Span(u64)` | `.{}` | A prompt forward the engine does not chunk: a whole-prompt prefill (`Caps.whole_prompt_prefill`), or a hybrid's restored tail inside the snapshot backoff. The absolute positions where the engine's chunk loop would end its spans, ascending, the last `positions[0] + rows`; empty = the model chunks as it likes. Read it only when `size` reaches it: an older host's `Forward` ends before it. |
 | `ssm_checkpoints` | `Span(u64)` | `.{}` | The absolute positions after which the engine files recurrent-state checkpoints for its prefix cache, ascending, each one of `prompt_spans` (`CacheOps.checkpoint`); empty = none wanted. Read it only when `size` reaches it. |
+| `prefill` | `bool` | `false` | The engine's prompt forwarding, whatever `mode` says: the split prefill's final-token span is one row and so arrives as `Mode.decode`. False on decode steps and verify blocks. Read it only when `size` reaches it: an older host's `Forward` ends before it. |
+| `stop_ids` | `Span(u32)` | `.{}` | A native drafter's round (`NativeDrafter.step`, `verify`): the request's stop ids. A round that verifies one leaves the state past what the request commits, which the prefix cache cannot restore. Read it only when `size` reaches it. |
 
 ### `Ablation` (extern struct)
 
@@ -836,6 +840,7 @@ A drafter the model carries in its own forward (DSpark); stages and block are `S
 | `step` | `*const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict` |  | One greedy round on the model's own state: `f.tokens` is the committed token `t1` (not yet in the state, which stands at `f.positions[0]`), `f.accept_cap` the most drafts to keep. The model drafts, verifies, keeps the drafts its own argmax agrees with (under `f.suppress_mask`), rewinds its state to them and writes `out.round`. |
 | `verify` | `?*const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict` | `null` | The first half of a round the engine accepts itself (a sampled request): the model drafts from `t1` and verifies the block, leaving the verify open. A `verify` while one is open discards the open one. `out.round.tokens[0..n]` are the verified rows' ids (`t1` first) and `out.logits` their logits `[n, vocab]` (f32). Needs `finish`. |
 | `finish` | `?*const fn (m: *anyopaque, accepted: u32, out: *ForwardOut) callconv(.c) Verdict` | `null` | The second half: keeps `t1` and the first `accepted` drafts of the open verify, rewinds the state to them and writes the model's position into `out.round.position`. |
+| `active` | `?*const fn (m: *anyopaque) callconv(.c) bool` | `null` | Whether this load drafts: a load may leave its drafter out (a GPU it loses on), and then the model has no stages. Null = always. Read it only when `size` reaches it. |
 
 ### `TrunkWeight` (enum(u8))
 

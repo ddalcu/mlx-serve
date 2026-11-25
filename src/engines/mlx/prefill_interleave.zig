@@ -541,6 +541,16 @@ fn admitThenTick(opaque_ctx: *anyopaque) u64 {
     return interleaveDecodeTick(t.ic.sch) +| nested;
 }
 
+/// `InterleaveHook.idle`: no other request runs at this boundary: none decoding, none pending (so none admitted here),
+/// and this prefill is not itself nested in another's boundary.
+pub fn interleaveIdleCb(opaque_ctx: *anyopaque) bool {
+    const ic: *InterleaveCtx = @ptrCast(@alignCast(opaque_ctx));
+    const sch = ic.sch;
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    return sch.decoding.items.len == 0 and sch.pending.items.len == 0 and sch.boundary_depth == 0;
+}
+
 pub fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     const ic: *InterleaveCtx = @ptrCast(@alignCast(opaque_ctx));
     if (ic.ticks == 0) {

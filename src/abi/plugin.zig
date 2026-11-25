@@ -401,7 +401,13 @@ pub const BillFlags = packed struct(u32) {
     /// A decode-billed request reserves its whole KV (prompt, reply to the context, verify rows) at its prompt and
     /// its decode bill prices that KV once (`reservedPrefillTokens`, `glm5DecodeMemoryNeeded`).
     reserves_request: bool = false,
-    _: u29 = 0,
+    /// The prompt's SSM checkpoint stride rounds up to a multiple of the chunk the prefill runs, so every checkpoint
+    /// lands on a chunk end (`chunkAlignedSsmCheckpointStride`), as `MLX_SERVE_CP_STRIDE_ON_CHUNK=1` does for any model.
+    cp_stride_on_chunk: bool = false,
+    /// The prefill loop keeps MLX's buffer pool between two chunks of the same width while no other request runs
+    /// (`ChunkPool`), as `MLX_SERVE_PREFILL_KEEP_CACHE=1` does for any model.
+    prefill_keep_cache: bool = false,
+    _: u27 = 0,
 };
 
 /// Whether a streamed model's decode phase gets a room of its own (`LoadCtx.stream_room_decode`, `stream_grow_decode`).
@@ -507,6 +513,9 @@ test "abi plugin: a Bill's flag word is one u32 at its offset, read past an olde
     b.size = @offsetOf(Bill, "flags");
     try testing.expect(b.billFlags() == null);
     try testing.expect((BillFlags{}).decode_room == .by_name and @as(u32, @bitCast(BillFlags{})) == 0);
+    // The prefill switches are bits 3 and 4 of the word, after `decode_room` (0-1) and `reserves_request` (2).
+    try testing.expectEqual(@as(u32, 1 << 3), @as(u32, @bitCast(BillFlags{ .cp_stride_on_chunk = true })));
+    try testing.expectEqual(@as(u32, 1 << 4), @as(u32, @bitCast(BillFlags{ .prefill_keep_cache = true })));
 }
 
 test "abi plugin: a decode room is named by_name or billed; every other value is the host's rule" {

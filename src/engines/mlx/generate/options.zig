@@ -221,7 +221,7 @@ pub const InitOptions = struct {
     prefill_expected: ?*std.atomic.Value(u64) = null,
 
     /// Called once per completed prefill chunk boundary (chunk state
-    /// evaluated, allocator cache cleared), except the final one. The
+    /// evaluated, allocator cache cleared unless `ChunkPool` kept it), except the final one. The
     /// scheduler runs decode ticks for the streams already decoding at
     /// this seam, so a long cold prefill stalls them for at most one
     /// chunk-forward instead of its whole duration. Null = the prefill
@@ -241,6 +241,9 @@ pub const InitOptions = struct {
 pub const InterleaveHook = struct {
     ctx: *anyopaque,
     call: *const fn (ctx: *anyopaque) void,
+    /// No other request runs at this boundary (none decoding, none pending): `prefillKeepCache` keeps the
+    /// buffer pool only then (`ChunkPool`). Null: never idle.
+    idle: ?*const fn (ctx: *anyopaque) bool = null,
 };
 
 /// SSD-first write-through: called at every completed prefill chunk with the absolute KV

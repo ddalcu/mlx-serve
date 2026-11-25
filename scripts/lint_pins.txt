@@ -28,7 +28,7 @@ src/sdk/bases/hybrid.zig	DtypeTrace.begin(	every forward path arms a dtype trace
 src/sdk/bases/encoder.zig	DtypeTrace.begin(	every forward path arms a dtype trace
 src/sdk/bases/decoder.zig	DtypeTrace.begin(	every forward path arms a dtype trace
 src/plugins/qwen4_exp/forward.zig	DtypeTrace.begin(	every forward path arms a dtype trace
-src/engines/mlx/prefill.zig	.interleave_hook = .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }	the one Generator construction site wires the prefill interleave hook
+src/engines/mlx/prefill.zig	.interleave_hook = .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb, .idle = interleaveIdleCb }	the one Generator construction site wires the prefill interleave hook (and its idle predicate, MLX_SERVE_PREFILL_KEEP_CACHE)
 src/engines/mlx/step.zig	slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;	interleaved decode time is billed to the decoding slots, never the prefilling slot
 src/engines/mlx/generate/init.zig	if (options.interleave_hook) |hk| hk.call(hk.ctx);	the prefill chunk loop yields to the interleave hook between chunks (inside `if (pos < loop_end)`, never after the last)
 src/engines/mlx/generate/init.zig	ctx.vision_splice_offset = vision_rows_consumed;	every prefill forward (chunk loop and final span) splices vision rows from the consumed-row offset

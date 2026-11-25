@@ -28,7 +28,9 @@ const InitOptions = @import("options.zig").InitOptions;
 const MtpCacheRef = @import("../spec/mtp_head_ref.zig").MtpCacheRef;
 const MtpGraphFn = @import("../spec/tree.zig").MtpGraphFn;
 const SamplingParams = @import("../sampling/params.zig").SamplingParams;
+const chunkAlignedSsmCheckpointStride = @import("prefill_chunk.zig").chunkAlignedSsmCheckpointStride;
 const chunkNeedsMtpHistory = @import("prefill_chunk.zig").chunkNeedsMtpHistory;
+const ChunkPool = @import("prefill_chunk.zig").ChunkPool;
 const commitAdaptiveWidth = @import("prefill_chunk.zig").commitAdaptiveWidth;
 const countSpliceRows = @import("prefill_chunk.zig").countSpliceRows;
 const decodeShareCapped = @import("prefill_chunk.zig").decodeShareCapped;
@@ -54,6 +56,8 @@ const sampleTokenLazy = @import("../sampling/lazy.zig").sampleTokenLazy;
 const shouldCheckpointSsmPrefill = @import("prefill_chunk.zig").shouldCheckpointSsmPrefill;
 const ssmCapturePos = @import("prefill_chunk.zig").ssmCapturePos;
 const ssmSnapshotBackoff = @import("prefill_chunk.zig").ssmSnapshotBackoff;
+const ssmStrideOnChunk = @import("prefill_chunk.zig").ssmStrideOnChunk;
+const prefillKeepCache = @import("prefill_chunk.zig").prefillKeepCache;
 const WholePromptPlan = @import("prefill_chunk.zig").WholePromptPlan;
 const wholePromptPlan = @import("prefill_chunk.zig").wholePromptPlan;
 const PromptCheckpoints = @import("../ssm/checkpoint.zig").PromptCheckpoints;
@@ -257,8 +261,11 @@ pub fn initWithOptions(
     // above must not densify checkpoint spacing (16× more captures at
     // 255K ctx otherwise). nextChunkEnd already shortens a chunk to land
     // on stride boundaries, so a capped chunk stays compatible.
+    // `MLX_SERVE_CP_STRIDE_ON_CHUNK=1` (or the plugin's bill flag) rounds that
+    // stride up to a multiple of the capped chunk, so the cut lands on a chunk
+    // end instead of a short piece before it (chunkAlignedSsmCheckpointStride).
     const ssm_cp_stride: usize = if (want_ssm_cp)
-        effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, generate_mod.prefillCli().override))
+        chunkAlignedSsmCheckpointStride(effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, generate_mod.prefillCli().override)), PREFILL_CHUNK, ssmStrideOnChunk(&xfm.config))
     else
         0;
     // Absolute KV position of `prompt_ids[0]`. Warm-path callers (the
@@ -406,6 +413,13 @@ pub fn initWithOptions(
 
         var pos: usize = 0;
         if (options.prefill_expected) |e| e.store(@intCast(loop_end), .monotonic);
+        // Where the loop returns MLX's buffer pool: after every chunk, or under MLX_SERVE_PREFILL_KEEP_CACHE=1 (or the
+        // plugin's bill flag) kept between same-width chunks while no other request runs (`ChunkPool`); a cancel or an
+        // error clears a kept one.
+        var pool: ChunkPool = .{ .on = prefillKeepCache(&xfm.config) };
+        errdefer {
+            if (pool.atExit()) _ = mlx.mlx_clear_cache();
+        }
         while (pos < loop_end) {
             // Abandoned-request abort: the client disconnected and the
             // conn thread flagged the slot. Bail before the next chunk —
@@ -558,7 +572,9 @@ pub fn initWithOptions(
                 }
                 _ = mlx.mlx_eval(eval_vec);
             }
-            _ = mlx.mlx_clear_cache();
+            // The next chunk's width as the next iteration computes it (a width that can move is never kept).
+            const next_len: usize = if (end < loop_end) nextChunkEnd(end, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive, dense_low_grid) - end else 0;
+            if (pool.atBoundary(end - pos, next_len, width_is_adaptive, boundaryIdle(options))) _ = mlx.mlx_clear_cache();
             if (trace_enabled) eval_ns += prefill_sw.read() - eval_start_ns;
 
             // This chunk's latch, read before anything persists it, snapshots it or yields
@@ -628,6 +644,7 @@ pub fn initWithOptions(
             // Yield to the scheduler between chunks — never after the
             // last (the post-prefill decode tick covers that boundary).
             if (pos < loop_end) {
+                if (pool.beforeTick(boundaryIdle(options))) _ = mlx.mlx_clear_cache();
                 if (options.interleave_hook) |hk| hk.call(hk.ctx);
             }
             // The tick allocated for co-tenant slots; re-price the widen against what is left.
@@ -641,6 +658,7 @@ pub fn initWithOptions(
                 }
             }
         }
+        if (pool.atExit()) _ = mlx.mlx_clear_cache();
         try mlx.checkError();
         // One line per request when the width moved.
         if (adapt_state.transitions > 0) {
@@ -1196,6 +1214,14 @@ pub fn initWithOptions(
 
     attachCp(&gen, &ssm_checkpoints, allocator);
     return gen;
+}
+
+/// No other request runs at a prefill chunk boundary (`InterleaveHook.idle`): an atomic prefill (no hook) has none;
+/// a hook without the predicate counts as busy.
+fn boundaryIdle(options: InitOptions) bool {
+    const hk = options.interleave_hook orelse return true;
+    const f = hk.idle orelse return false;
+    return f(hk.ctx);
 }
 
 // ── tests ──
