@@ -11,9 +11,9 @@ name: CI
 # A PR runs only the jobs its files reach (`changes`, scripts/ci-changes.sh; a
 # skipped job counts as passing; if `changes` itself fails every job runs).
 # push to main and workflow_dispatch run all of
-# them. Caches are saved from main only: a PR restores them and never writes its
-# own copy, which no other PR can read and which pushed the repo over the 10 GB
-# cap (evicting the Linux and Windows MLX stages).
+# them. The Zig and SwiftPM caches are saved from main only: a PR restores them
+# and never writes its own 250-550 MB copy, which no other PR can read and which
+# pushed the repo over the 10 GB cap (evicting the Linux and Windows MLX stages).
 
 on:
   push:
@@ -35,20 +35,21 @@ jobs:
       slow: ${{ steps.scope.outputs.slow }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
-      # The PR's own files: the merge commit against the base it was merged onto.
+      # The PR's own files: a pull_request checkout is the merge commit, whose first
+      # parent is the base it was merged onto. Anything else runs everything.
       - name: Which jobs does this change need
         id: scope
         env:
           EVENT: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          if [ "$EVENT" != "pull_request" ]; then
+          if [ "$EVENT" != "pull_request" ] || ! git rev-parse --verify -q HEAD^2 > /dev/null; then
             printf 'zig=true\nswift=true\nslow=true\n' | tee -a "$GITHUB_OUTPUT"
             exit 0
           fi
-          git fetch --no-tags --depth=1 origin "$BASE_SHA"
-          git diff --name-only "$BASE_SHA" HEAD | tee /dev/stderr | bash scripts/ci-changes.sh | tee -a "$GITHUB_OUTPUT"
+          git diff --name-only HEAD^1 HEAD | tee /dev/stderr | bash scripts/ci-changes.sh | tee -a "$GITHUB_OUTPUT"
 
       - name: Scope rules still cover what the Swift tests read
         run: bash tests/test_ci_changes.sh
