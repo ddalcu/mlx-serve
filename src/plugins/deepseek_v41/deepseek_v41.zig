@@ -7583,6 +7583,21 @@ fn cedCompress(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Sp
         _ = ced_hc_passes.fetchAdd(1, .monotonic);
         const pa = try hcPreNormWide(&sc, m, sp.whole[0], sp.whole[1], &ly.hc_attn, ly.attn_norm);
         const shift = ced_hc_plant.load(.monotonic);
+        // `MLX_SERVE_DSV41_PF_CED_COMP`: each span's projection as today (its kernel moves with M), then one
+        // `compressPass` over all of them: its rms, index keys a span's groups at a time and rope work per row.
+        if (env.onUnlessZero(.MLX_SERVE_DSV41_PF_CED_COMP) and shift == 0) {
+            const cw = &ly.comp.?;
+            const projs = try gpa.alloc(A, sp.xs.len);
+            defer gpa.free(projs);
+            for (0..sp.xs.len) |k| {
+                const lo, const hi = sp.bounds(k);
+                projs[k] = try compProj(&sc, m, li, cw, try sc.slice(pa.h, 0, lo, hi));
+            }
+            try compressPass(&sc, m, st, li, cw, try sc.concat(projs, 0), sp);
+            if (!ced_comp_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_CED_COMP engaged (layer {d}, rows {d}, spans {d})\n", .{ li, sp.L, sp.xs.len });
+            _ = ced_comp_passes.fetchAdd(1, .monotonic);
+            return;
+        }
         for (0..sp.xs.len) |k| {
             const lo, const hi = sp.bounds(k);
             const a = @min(lo + shift, sp.L - (hi - lo));
@@ -7603,6 +7618,9 @@ fn cedHcWhole(m: *const Dsv41Model, sp: *const Spans) bool {
     return sp.whole[0].ctx != null and sp.whole[1].ctx != null and dim(sp.whole[0], 0) == sp.L and dim(sp.whole[1], 0) == sp.L;
 }
 var ced_hc_logged: std.atomic.Value(bool) = .init(false);
+var ced_comp_logged: std.atomic.Value(bool) = .init(false);
+/// Passes whose CED compressor ran as one `compressPass` (`MLX_SERVE_DSV41_PF_CED_COMP`; a test's proof it engaged).
+pub var ced_comp_passes: std.atomic.Value(u32) = .init(0);
 /// Passes whose compressor took the whole stream (a test's proof the switch engaged).
 pub var ced_hc_passes: std.atomic.Value(u32) = .init(0);
 /// The planted control (tests only): each span's compressor reads the whole stream's rows this many rows late.
