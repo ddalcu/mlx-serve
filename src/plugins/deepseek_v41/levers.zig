@@ -9,7 +9,8 @@
 //! 2. `MLX_SERVE_DSV41_PRECISION=lossy` (`--precision lossy`): the row's lossy pick, where it has one;
 //! 3. else the row's lossless pick; for most rows unset, so the read site's own default serves.
 //! The bill, admission and the forward read the same functions, so a load's memory plan sees the lossy levers before a
-//! model exists. Precision and the stack switches are read once per load (`refresh`), kept in one `Shared` state.
+//! model exists. Precision and the stack switches are read once (the first read, then each load's `check`), kept in
+//! one `Shared` state.
 
 const std = @import("std");
 const env = @import("../../env.zig");
@@ -184,7 +185,8 @@ fn read() u8 {
     return b;
 }
 
-/// Reads precision and the stack switches again (a model's parse and load call it; a test that sets them, too).
+/// Reads precision and the stack switches again (a model's load calls it, through `check`; a test that sets them,
+/// too). Before the first load, the first read takes them: the bill and admission read the same values as the load.
 pub fn refresh() void {
     state.get().store(read(), .monotonic);
 }
