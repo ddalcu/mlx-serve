@@ -110,7 +110,7 @@ pub fn initWithOptions(
     var options = options_in;
     var dspark_active = false;
     var dspark_stochastic = false;
-    var dspark_typical: f32 = 0;
+    var dspark_typical: ?mtp_acceptance.Typical = null;
     if ((intree.dsv4(xfm) != null or intree.dsv41(xfm) != null or plugin_driver.nativeDrafter(xfm) != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
         // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
         // snapshot rollback inside deepseek_v4.zig) may engage when the
@@ -139,7 +139,7 @@ pub fn initWithOptions(
             // The sampled arm takes the request's acceptance mode: typical (LOSSY) where it asks for it, else exact.
             if (dspark_stochastic) switch (options.mtp_acceptance) {
                 .typical => |cfg| {
-                    dspark_typical = cfg.delta;
+                    dspark_typical = cfg;
                     log.info("  [dspark-accept] typical delta={d:.3} eps={d:.3} NOT distribution-exact (copied drafts exact)\n", .{ cfg.delta, cfg.eps });
                 },
                 .exact, .tokenv3 => {},
@@ -296,12 +296,12 @@ pub fn initWithOptions(
     const AcceptRoute = struct {
         graph: MtpGraphFn,
         prefix: mtp_acceptance.PrefixFn,
-        param: f32,
+        param: mtp_acceptance.Param,
     };
     const accept_route: AcceptRoute = switch (options.mtp_acceptance) {
-        .exact => .{ .graph = mtpBatchedExactGraph, .prefix = mtp_acceptance.exactPrefix, .param = 0 },
-        .typical => |cfg| .{ .graph = mtpBatchedTypicalGraph, .prefix = mtp_acceptance.typicalPrefix, .param = cfg.delta },
-        .tokenv3 => |alpha| .{ .graph = mtpBatchedTokenV3Graph, .prefix = mtp_acceptance.tokenV3Prefix, .param = alpha },
+        .exact => .{ .graph = mtpBatchedExactGraph, .prefix = mtp_acceptance.exactPrefix, .param = mtp_acceptance.param(options.mtp_acceptance) },
+        .typical => .{ .graph = mtpBatchedTypicalGraph, .prefix = mtp_acceptance.typicalPrefix, .param = mtp_acceptance.param(options.mtp_acceptance) },
+        .tokenv3 => .{ .graph = mtpBatchedTokenV3Graph, .prefix = mtp_acceptance.tokenV3Prefix, .param = mtp_acceptance.param(options.mtp_acceptance) },
     };
     if (mtp_active and std.meta.activeTag(options.mtp_acceptance) != .exact) {
         switch (options.mtp_acceptance) {

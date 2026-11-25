@@ -1,19 +1,42 @@
 const std = @import("std");
 const testing = std.testing;
 
+/// Typical acceptance: draft x is kept iff p(x) > min(eps, delta * e^-H(p)). The default eps 1 is no
+/// cap (the rule Qwen and MiMo were measured on). An eps below 1 is Medusa's form, opt-in: eps is its
+/// posterior_threshold (the floor's cap), delta its posterior_alpha; Medusa's standard pair is
+/// eps 0.09, delta sqrt(eps) = 0.3.
+pub const Typical = struct { delta: f32, eps: f32 = 1.0 };
+
 /// Installed once before generation. Exact remains the default route.
 pub const Mode = union(enum) {
     exact,
-    typical: struct { delta: f32, eps: f32 = 1.0 },
+    typical: Typical,
     tokenv3: f32,
 };
 
-pub fn parse(typical_raw: ?[]const u8, tokenv3_raw: ?[]const u8) !Mode {
-    if (typical_raw != null and tokenv3_raw != null) return error.ConflictingAcceptanceModes;
-    if (typical_raw) |raw| {
-        const delta = std.fmt.parseFloat(f32, raw) catch return error.InvalidAcceptanceValue;
+/// What an acceptance graph reads: `value` is typical's delta or TokenV3's alpha (exact reads
+/// nothing), `eps` typical's cap. Built from the Mode by `param`, the one place the pair is read.
+pub const Param = struct { value: f32 = 0, eps: f32 = 1.0 };
+
+pub fn param(mode: Mode) Param {
+    return switch (mode) {
+        .exact => .{},
+        .typical => |t| .{ .value = t.delta, .eps = t.eps },
+        .tokenv3 => |alpha| .{ .value = alpha },
+    };
+}
+
+/// `--mtp-typical <delta>`, `--mtp-typical-eps <eps>`, `--mtp-tokenv3 <alpha>`. Either typical value
+/// alone turns typical on: delta alone is uncapped (eps 1); eps alone takes Medusa's coupling,
+/// delta = sqrt(eps); both apply as given. delta > 0; 0 < eps <= 1 (1 = no cap).
+pub fn parse(typical_raw: ?[]const u8, typical_eps_raw: ?[]const u8, tokenv3_raw: ?[]const u8) !Mode {
+    if ((typical_raw != null or typical_eps_raw != null) and tokenv3_raw != null) return error.ConflictingAcceptanceModes;
+    if (typical_raw != null or typical_eps_raw != null) {
+        const eps: f32 = if (typical_eps_raw) |raw| std.fmt.parseFloat(f32, raw) catch return error.InvalidAcceptanceValue else 1.0;
+        if (!std.math.isFinite(eps) or eps <= 0 or eps > 1) return error.InvalidAcceptanceValue;
+        const delta: f32 = if (typical_raw) |raw| std.fmt.parseFloat(f32, raw) catch return error.InvalidAcceptanceValue else @sqrt(eps);
         if (!std.math.isFinite(delta) or delta <= 0) return error.InvalidAcceptanceValue;
-        return .{ .typical = .{ .delta = delta } };
+        return .{ .typical = .{ .delta = delta, .eps = eps } };
     }
     if (tokenv3_raw) |raw| {
         const alpha = std.fmt.parseFloat(f32, raw) catch return error.InvalidAcceptanceValue;
@@ -139,13 +162,46 @@ test "TokenV3 0.95 uses the full effective target for sampled q" {
 }
 
 test "acceptance launch settings are exclusive and bounded" {
-    try testing.expectEqual(Mode.exact, try parse(null, null));
-    try testing.expectEqual(Mode{ .typical = .{ .delta = 0.2, .eps = 1.0 } }, try parse("0.2", null));
-    try testing.expectEqual(Mode{ .typical = .{ .delta = 1.5, .eps = 1.0 } }, try parse("1.5", null));
-    try testing.expectEqual(Mode{ .tokenv3 = 0.95 }, try parse(null, "0.95"));
-    try testing.expectError(error.ConflictingAcceptanceModes, parse("0.2", "0.95"));
-    try testing.expectError(error.InvalidAcceptanceValue, parse("0", null));
-    try testing.expectError(error.InvalidAcceptanceValue, parse(null, "1.1"));
+    try testing.expectEqual(Mode.exact, try parse(null, null, null));
+    try testing.expectEqual(Mode{ .typical = .{ .delta = 0.2, .eps = 1.0 } }, try parse("0.2", "1", null));
+    try testing.expectEqual(Mode{ .typical = .{ .delta = 1.5, .eps = 1.0 } }, try parse("1.5", null, null));
+    try testing.expectEqual(Mode{ .typical = .{ .delta = 0.3, .eps = 0.09 } }, try parse("0.3", "0.09", null));
+    try testing.expectEqual(Mode{ .tokenv3 = 0.95 }, try parse(null, null, "0.95"));
+    try testing.expectError(error.ConflictingAcceptanceModes, parse("0.2", null, "0.95"));
+    try testing.expectError(error.ConflictingAcceptanceModes, parse(null, "0.09", "0.95"));
+    try testing.expectError(error.InvalidAcceptanceValue, parse("0", null, null));
+    try testing.expectError(error.InvalidAcceptanceValue, parse("0.3", "0", null));
+    try testing.expectError(error.InvalidAcceptanceValue, parse("0.3", "1.01", null));
+    try testing.expectError(error.InvalidAcceptanceValue, parse(null, null, "1.1"));
+}
+
+test "typical stays uncapped unless eps is given; eps alone takes Medusa's coupling, delta = sqrt(eps)" {
+    // The model setting and delta alone keep today's uncapped rule.
+    try testing.expectEqual(Mode{ .typical = .{ .delta = 0.2, .eps = 1.0 } }, fromName("typical").?);
+    try testing.expectEqual(Mode{ .typical = .{ .delta = 0.2, .eps = 1.0 } }, try parse("0.2", null, null));
+    // eps alone takes delta = sqrt(eps).
+    for ([_][]const u8{ "0.01", "0.04", "0.09", "0.16", "0.25" }, [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5 }) |eps, delta| {
+        const m = try parse(null, eps, null);
+        try testing.expectApproxEqAbs(delta, m.typical.delta, 1e-6);
+        try testing.expectEqual(try std.fmt.parseFloat(f32, eps), m.typical.eps);
+    }
+    // The graph reads the pair from the mode, and nothing for exact.
+    try testing.expectEqual(Param{ .value = 0.3, .eps = 0.09 }, param(try parse(null, "0.09", null)));
+    try testing.expectEqual(Param{ .value = 0.2, .eps = 1.0 }, param(fromName("typical").?));
+    try testing.expectEqual(Param{ .value = 0.95, .eps = 1.0 }, param(.{ .tokenv3 = 0.95 }));
+    try testing.expectEqual(Param{}, param(.exact));
+}
+
+test "typical's eps caps the floor: a confident row's floor is eps, not delta" {
+    // H = 0: delta * e^0 = 0.3, capped at 0.09, so p 0.2 is kept under the cap and rejected without it.
+    const confident = [_]f64{ 1.0, 0.0 };
+    try testing.expectApproxEqAbs(@as(f64, 0.09), typicalThreshold(&confident, 0.3, 0.09), 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 0.3), typicalThreshold(&confident, 0.3, 1.0), 1e-12);
+    try testing.expect(typicalAccept(0.2, @floatCast(typicalThreshold(&confident, 0.3, 0.09))));
+    try testing.expect(!typicalAccept(0.2, @floatCast(typicalThreshold(&confident, 0.3, 1.0))));
+    // A flat row (H = log 4): delta * e^-H = 0.075 sits under the cap, which then does nothing.
+    const flat = [_]f64{ 0.25, 0.25, 0.25, 0.25 };
+    try testing.expectApproxEqAbs(@as(f64, 0.075), typicalThreshold(&flat, 0.3, 0.09), 1e-12);
 }
 
 test "typical and TokenV3 keep-path decisions consume no acceptance coin" {

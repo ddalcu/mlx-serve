@@ -46,7 +46,7 @@ pub fn mtpBatchedExactGraph(
     draft_arrs: []const mlx.mlx_array,
     q_probs: ?[]const mlx.mlx_array,
     m: u32,
-    _: f32,
+    _: mtp_acceptance.Param,
     sampling: SamplingParams,
     s: mlx.mlx_stream,
 ) !MtpBatchedGraph {
@@ -186,11 +186,11 @@ pub fn mtpBatchedTypicalGraph(
     draft_arrs: []const mlx.mlx_array,
     q_probs: ?[]const mlx.mlx_array,
     m: u32,
-    delta: f32,
+    pair: mtp_acceptance.Param,
     sampling: SamplingParams,
     s: mlx.mlx_stream,
 ) !MtpBatchedGraph {
-    return mtpBatchedLossyGraph(.typical, probs_all, draft_arrs, q_probs, m, delta, sampling, s);
+    return mtpBatchedLossyGraph(.typical, probs_all, draft_arrs, q_probs, m, pair, sampling, s);
 }
 
 pub fn mtpBatchedTokenV3Graph(
@@ -198,7 +198,7 @@ pub fn mtpBatchedTokenV3Graph(
     draft_arrs: []const mlx.mlx_array,
     q_probs: ?[]const mlx.mlx_array,
     m: u32,
-    alpha: f32,
+    alpha: mtp_acceptance.Param,
     sampling: SamplingParams,
     s: mlx.mlx_stream,
 ) !MtpBatchedGraph {
@@ -213,7 +213,7 @@ pub fn mtpBatchedLossyGraph(
     draft_arrs: []const mlx.mlx_array,
     q_probs: ?[]const mlx.mlx_array,
     m: u32,
-    param: f32,
+    pair: mtp_acceptance.Param,
     sampling: SamplingParams,
     s: mlx.mlx_stream,
 ) !MtpBatchedGraph {
@@ -289,7 +289,7 @@ pub fn mtpBatchedLossyGraph(
         var peak = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(peak);
         try mlx.check(mlx.mlx_max_axis(&peak, p_rows, 1, true, s));
-        const complement = mlx.mlx_array_new_float(1.0 - param);
+        const complement = mlx.mlx_array_new_float(1.0 - pair.value);
         defer _ = mlx.mlx_array_free(complement);
         var cutoff = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(cutoff);
@@ -389,12 +389,13 @@ pub fn mtpBatchedLossyGraph(
         var scaled = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(scaled);
         try mlx.check(mlx.mlx_exp(&scaled, sum, s)); // exp(-H)
-        const delta = mlx.mlx_array_new_float(param);
+        const delta = mlx.mlx_array_new_float(pair.value);
         defer _ = mlx.mlx_array_free(delta);
         var raw_floor = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(raw_floor);
         try mlx.check(mlx.mlx_multiply(&raw_floor, scaled, delta, s));
-        const eps = mlx.mlx_array_new_float(1.0);
+        // Medusa's cap (posterior_threshold): the floor is min(eps, delta * e^-H).
+        const eps = mlx.mlx_array_new_float(pair.eps);
         defer _ = mlx.mlx_array_free(eps);
         accept_q = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_minimum(&accept_q, raw_floor, eps, s));
@@ -521,7 +522,7 @@ test "MTP typical batched graph uses entropy floor and target-row correction" {
     const draft = mlx.mlx_array_new_data(&id, &id_shape, 1, .int32);
     defer _ = mlx.mlx_array_free(draft);
     const drafts = [_]mlx.mlx_array{draft};
-    var g = try Generator.mtpBatchedTypicalGraph(probs, &drafts, null, 1, 0.2, .{}, s);
+    var g = try Generator.mtpBatchedTypicalGraph(probs, &drafts, null, 1, .{ .value = 0.2 }, .{}, s);
     defer g.deinit();
     try mlx.check(mlx.mlx_array_eval(g.accept_p));
     try mlx.check(mlx.mlx_array_eval(g.accept_q));
@@ -534,6 +535,30 @@ test "MTP typical batched graph uses entropy floor and target-row correction" {
     const corr = mlx.mlx_array_data_int32(g.corr_samples) orelse return error.InvalidDtype;
     try testing.expect(corr[0] == 0 or corr[0] == 1);
     try testing.expectEqual(@as(i32, 3), corr[1]);
+}
+
+test "typical graph (GPU): eps caps the floor, min(eps, delta * e^-H), as the CPU oracle has it" {
+    const s = mlx.gpuStream();
+    // Row 0 confident (H = 0), row 1 flat over 4 (H = log 4); the second row is the bonus row.
+    const p_data = [_]f32{ 1, 0, 0, 0, 0.25, 0.25, 0.25, 0.25 };
+    const p_shape = [_]c_int{ 1, 2, 4 };
+    const probs = mlx.mlx_array_new_data(&p_data, &p_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(probs);
+    const id: i32 = 0;
+    const id_shape = [_]c_int{1};
+    const draft = mlx.mlx_array_new_data(&id, &id_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(draft);
+    const drafts = [_]mlx.mlx_array{draft};
+    const Case = struct { pair: mtp_acceptance.Param, want: f32 };
+    // Medusa's default pair caps the confident row's 0.3 at 0.09; eps 1 leaves it at delta.
+    for ([_]Case{ .{ .pair = .{ .value = 0.3, .eps = 0.09 }, .want = 0.09 }, .{ .pair = .{ .value = 0.3, .eps = 1.0 }, .want = 0.3 } }) |c| {
+        var g = try Generator.mtpBatchedTypicalGraph(probs, &drafts, null, 1, c.pair, .{}, s);
+        defer g.deinit();
+        try mlx.check(mlx.mlx_array_eval(g.accept_q));
+        const floor = mlx.mlx_array_data_float32(g.accept_q) orelse return error.InvalidDtype;
+        try testing.expectApproxEqAbs(c.want, floor[0], 1e-6);
+        try testing.expectApproxEqAbs(@as(f32, @floatCast(mtp_acceptance.typicalThreshold(&.{ 1, 0, 0, 0 }, c.pair.value, c.pair.eps))), floor[0], 1e-6);
+    }
 }
 
 test "a prompt-lookup draft is kept only as often as sampling would keep it under typical acceptance" {
@@ -557,7 +582,7 @@ test "a prompt-lookup draft is kept only as often as sampling would keep it unde
     var g: Generator = undefined;
     g.mtp_accept_graph = Generator.mtpBatchedTypicalGraph;
     g.mtp_accept_prefix = mtp_acceptance.typicalPrefix;
-    g.mtp_accept_param = 0.2;
+    g.mtp_accept_param = .{ .value = 0.2 };
     var prng = std.Random.DefaultPrng.init(0x100C);
     var kept: [2]u32 = .{ 0, 0 };
     for ([_]bool{ false, true }, 0..) |lookup, arm| {
@@ -593,7 +618,7 @@ test "MTP TokenV3 batched graph uses full pi for sampled and one-hot drafts" {
     defer _ = mlx.mlx_array_free(q);
     const qs = [_]mlx.mlx_array{q};
 
-    var sampled = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, &qs, 1, 0.95, .{}, s);
+    var sampled = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, &qs, 1, .{ .value = 0.95 }, .{}, s);
     defer sampled.deinit();
     try mlx.check(mlx.mlx_array_eval(sampled.accept_p));
     try mlx.check(mlx.mlx_array_eval(sampled.accept_q));
@@ -609,7 +634,7 @@ test "MTP TokenV3 batched graph uses full pi for sampled and one-hot drafts" {
     try testing.expect(corr[0] == 0 or corr[0] == 1);
     try testing.expectEqual(@as(i32, 3), corr[1]);
 
-    var onehot = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, null, 1, 0.95, .{}, s);
+    var onehot = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, null, 1, .{ .value = 0.95 }, .{}, s);
     defer onehot.deinit();
     try mlx.check(mlx.mlx_array_eval(onehot.accept_p));
     const onehot_pi = mlx.mlx_array_data_float32(onehot.accept_p) orelse return error.InvalidDtype;
@@ -647,7 +672,7 @@ test "MTP TokenV3 full Qwen3.8 vocabulary graph stays finite at depth three" {
     defer _ = mlx.mlx_array_free(draft);
     const drafts = [_]mlx.mlx_array{ draft, draft, draft };
     const qs = [_]mlx.mlx_array{ q, q, q };
-    var g = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, &qs, 3, 0.95, .{}, s);
+    var g = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, &qs, 3, .{ .value = 0.95 }, .{}, s);
     defer g.deinit();
     try mlx.check(mlx.mlx_array_eval(g.accept_p));
     try mlx.check(mlx.mlx_array_eval(g.accept_defer));
