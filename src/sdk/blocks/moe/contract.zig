@@ -3350,6 +3350,9 @@ test "kernel contract moe: the NAX scan chained into each NAX gather launch is t
         .{ .kind = .mm, .f = .nvfp4, .gs = 16, .staged = true, .shape = .{ .rows = 4096, .n = 128, .k = 512 } },
         .{ .kind = .mm, .f = .mxfp4, .gs = 32, .staged = true, .shape = .{ .rows = 512, .n = 128, .k = 256 } },
         .{ .kind = .paired, .f = .nvfp4, .gs = 16, .moe_act = true, .staged = true, .shape = .{ .rows = 512, .n = 128, .k = 256 } },
+        // deepseek_v41's MOE_PAIR_FP4 on an MXFP4 bank: the routed pair without per-expert scales, seg and staged.
+        .{ .kind = .paired, .f = .mxfp4, .gs = 32, .moe_act = true, .shape = .{ .rows = 512, .n = 128, .k = 512 } },
+        .{ .kind = .paired, .f = .mxfp4, .gs = 32, .moe_act = true, .staged = true, .shape = .{ .rows = 512, .n = 128, .k = 256 } },
         .{ .kind = .mm, .f = .nvfp4, .gs = 16, .staged = true, .scat = true, .shape = .{ .rows = 683, .n = 128, .k = 512 } },
         .{ .kind = .mm, .f = .mxfp4, .gs = 32, .staged = true, .scat = true, .shape = .{ .rows = 86, .n = 128, .k = 256 } },
         .{ .kind = .mm, .f = .nvfp4, .gs = 16, .staged = true, .scat = true, .tile = gqn.wide_down, .shape = .{ .rows = 512, .n = 128, .k = 256 } },
@@ -3361,7 +3364,8 @@ test "kernel contract moe: the NAX scan chained into each NAX gather launch is t
         if (c.moe_act) {
             t.moe_act = true;
             t.rlim = 10;
-            t.esc = 3;
+            // NVFP4 brings both per-expert scales; MXFP4 has none (the step compiled out).
+            t.esc = if (c.f == .nvfp4) 3 else 0;
         }
         try std.testing.expect(try t.prepare(c.shape, .random, 7));
         const scan = NaxScan.init(a, 32);

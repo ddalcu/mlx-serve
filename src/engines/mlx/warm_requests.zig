@@ -11,6 +11,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const crt = @import("../../sdk/util/crt.zig");
 const round_cost = @import("spec/round_cost.zig");
 const log = @import("../../sdk/util/log.zig");
+const env = @import("../../env.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
 const LoadedModel = @import("../../host/registry/registry.zig").LoadedModel;
@@ -97,14 +98,25 @@ fn fill(buf: []u32, vocab: u32, r: Request) []const u32 {
     return ids;
 }
 
-/// What a load's kernels depend on beside the build: the pack, and what speculates on it.
+/// What a load's kernels depend on beside the build: the pack, what speculates on it, and the arms its switches pick.
 pub const Subject = struct {
     model_path: []const u8,
     model_type: []const u8,
     /// The widest block a speculative round verifies (`warmup.zig`).
     verify_rows: u32,
     kv_bits: u32,
+    /// The switches and pack format that pick which kernels compile (`kernelsKey`): the same build and pack under the
+    /// MXFP4 view, or another lever arm, compiles other kernels, so it owes its own warm-up.
+    kernels: u64 = 0,
 };
+
+/// `Subject.kernels` for a load: every set kernel-arm switch (`env.armsKey`) and the pack's quantization.
+pub fn kernelsKey(quant_bits: u32, quant_group_size: u32, quant_mode: []const u8) u64 {
+    var h = std.hash.Fnv1a_64.init();
+    h.update(std.mem.asBytes(&[_]u64{ env.armsKey(), quant_bits, quant_group_size }));
+    h.update(quant_mode);
+    return h.final();
+}
 
 extern "c" fn confstr(name: c_int, buf: ?[*]u8, len: usize) usize;
 const CS_DARWIN_USER_CACHE_DIR: c_int = 65538;
@@ -126,6 +138,7 @@ pub fn markerPath(buf: []u8, dir: []const u8, build: []const u8, os: []const u8,
         h.update("\x00");
     }
     h.update(std.mem.asBytes(&[_]u32{ s.verify_rows, s.kv_bits, FULL.len, LONGEST }));
+    h.update(std.mem.asBytes(&s.kernels));
     return std.fmt.bufPrintSentinel(buf, "{s}mlx-serve-warm/{x:0>16}.{s}", .{ dir, h.final(), @tagName(kind) }, 0) catch null;
 }
 
@@ -534,6 +547,26 @@ test "markerPath: one marker a build, an OS build and a subject" {
     try testing.expect(!std.mem.eql(u8, base, markerPath(&bufs[4], "/cache/", "build-2", "27A1", s, .full).?));
     try testing.expect(!std.mem.eql(u8, base, markerPath(&bufs[5], "/cache/", "build-1", "27B2", s, .full).?));
     try testing.expect(!std.mem.eql(u8, base, markerPath(&bufs[5], "/cache/", "build-1", "27A1", s, .minimal).?));
+    // Another kernel set on the same build and pack (the MXFP4 view, a lever's arm) owes its own marker.
+    other = s;
+    other.kernels = 1;
+    try testing.expect(!std.mem.eql(u8, base, markerPath(&bufs[2], "/cache/", "build-1", "27A1", other, .full).?));
+}
+
+test "kernelsKey: a kernel-arm switch or the pack's format changes it, an unrelated variable does not" {
+    const base = kernelsKey(4, 16, "nvfp4");
+    try testing.expectEqual(base, kernelsKey(4, 16, "nvfp4"));
+    try testing.expect(base != kernelsKey(4, 32, "mxfp4"));
+    {
+        const view = env.override(.MLX_SERVE_DSV41_MXFP4_VIEW, "1");
+        defer view.restore();
+        try testing.expect(base != kernelsKey(4, 16, "nvfp4"));
+    }
+    try testing.expectEqual(base, kernelsKey(4, 16, "nvfp4"));
+    // A fixture (test input) is no kernel arm.
+    const fx = env.override(.MLX_SERVE_TEST_SHARD, "0/1");
+    defer fx.restore();
+    try testing.expectEqual(base, kernelsKey(4, 16, "nvfp4"));
 }
 
 test "remember: a marker written is a load that owes nothing" {

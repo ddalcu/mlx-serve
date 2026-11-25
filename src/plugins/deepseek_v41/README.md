@@ -192,7 +192,7 @@ The release's p01 peak is 452.0 GB: 13.4 GB above the first NVFP4 build on the s
 31.3 GB above it on the MXFP4-experts pack (420.7 GB). The NVFP4 pack adds 17.9 GB, because its 16-value groups carry
 more scale bytes. The last reviewed head peaked at 438.6 GB too. Six changes moved the peak by more than
 0.5 GB: `PF_KEEP_WIDE` +7.3 GB, the Engram partials cache (`ENGRAM_KV_CACHE`) +4.0, `PF_PASS_SIZE` +3.9,
-`MOE_PAIR_SCALED` -1.4, `PF_COMP_BF16` -0.7 and `FLASH_ATTN` -0.7. Changes under 0.5 GB each add about +0.7 GB
+`MOE_PAIR_FP4` -1.4, `PF_COMP_BF16` -0.7 and `FLASH_ATTN` -0.7. Changes under 0.5 GB each add about +0.7 GB
 (`PF_ENGRAM_PASS` +0.4, `DRAFT_VOCAB` +0.4), and drift between A/B bases the last +0.3 GB. The
 three that add memory trade it for speed (`PF_PASS_SIZE` +7.96% prefill, `PF_KEEP_WIDE` +2.19% prefill, the Engram
 slot kernel and partials cache, one A/B, +0.28% decode). We kept them because
@@ -265,7 +265,7 @@ prompt-attention call (the block below).
 | REORDER switches | How many |
 |---|---|
 | Measured no farther from float64 than the `=0` path (`PF_COMP_BF16`, `FLASH_ATTN`, `ENGRAM_KV_SLOTS`, `ATTN_DEC`, `WOA_PLAIN`, `PF_IDX_PASS`) | 6 |
-| Held to a stated bound that can allow more error than `=0`: `MOE_FP4_NAX`, `FP4_READS`, `FUSE_MXFP8_QMM` (rel-rms against f32 up to 1.25 times the `=0` path's, plus 1e-4); `PF_HC_V2` (mixes and split 2.0 to 5.9 times farther from float64, within 1e-5 of it); `ENGRAM_GPU_IDS` (4 of 409,600 words farther, worst element no farther); `MOE_PAIR_SCALED` (each differing word within one bf16 step of its row's peak, under 1% differing, sample l2 within 1.05 times); `PF_IDX_NAX` (each score within 2·γ(34) of `idx_tile`'s, the same top-half picks except near-ties) | 7 |
+| Held to a stated bound that can allow more error than `=0`: `MOE_FP4_NAX`, `FP4_READS`, `FUSE_MXFP8_QMM` (rel-rms against f32 up to 1.25 times the `=0` path's, plus 1e-4); `PF_HC_V2` (mixes and split 2.0 to 5.9 times farther from float64, within 1e-5 of it); `ENGRAM_GPU_IDS` (4 of 409,600 words farther, worst element no farther); `MOE_PAIR_FP4` (each differing word within one bf16 step of its row's peak, under 1% differing, sample l2 within 1.05 times); `PF_IDX_NAX` (each score within 2·γ(34) of `idx_tile`'s, the same top-half picks except near-ties) | 7 |
 | Resting on the commit's reasoning (`CED`, the chunked prompt path; `PF_PASS_SIZE`) | 2 |
 | Resting on its A/B's same text (`HC_EXPAND_NORM`: its test allows 1% relative error, far looser than bf16 rounding, so we do not count it as a bound) | 1 |
 
@@ -321,11 +321,17 @@ tests of `attnCore` count each core's calls; on NAX they count 0 f16 calls.
   and f32-out l2 6.2e-5 to 6.6e-5 against 1.52e-4 to 1.67e-4.
 - `MOE_TAIL` (EXACT): one launch gives the two launches' words, with 0 differing words at 17 to 8,192 rows.
 - `FLASH_ATTN` (REORDER): its f32-out l2 is 6.4e-5, against 1.8e-4 for the gather.
-- `MOE_PAIR_SCALED` (REORDER, bounded): at 384 experts, 0.223% to 0.237% of the activation words differ from the split
-  path. The whole-sample float64 l2 is 1.0000 times the split path's. The test requires each differing word within one
+- `MOE_PAIR_FP4` (REORDER, bounded): one switch for both fp4 formats. NVFP4 brings ModelOpt's per-expert scales into
+  the epilogue; MXFP4 (or the MXFP4 view) runs the same kernel with that step compiled out. It replaces
+  `MOE_PAIR_SCALED` (NVFP4 only), which no release on main carried. The test requires each differing word within one
   bf16 step of its row's largest value, under 1% of words differing, and a sample l2 within 1.05 times the split
-  path's. The words more than one step apart in bf16 code are words that the split path gives as exactly 0.0, where
-  the paired kernel keeps a tiny value, about 1e-35.
+  path's. At 384 experts:
+  - NVFP4: 0.223% to 0.237% of the activation words differ from the split path, and the whole-sample float64 l2 is
+    1.0000 times the split path's. The words more than one step apart in bf16 code are words that the split path
+    gives as exactly 0.0, where the paired kernel keeps a tiny value, about 1e-35.
+  - MXFP4: 0.0014% to 0.0017% of the words differ, none more than one bf16 code step apart, and the whole-sample
+    float64 l2 is 1.0000 to 1.0008 times the split path's. The planted control (each pair's routing weight on the
+    next pair) is 233 to 325 times farther.
 - `PF_HC_V2` (REORDER, bounded): an f32 reorder of the five-pass hyper-connections. Its f32 mixes and split are 2 to 6
   times farther from float64 than the five passes', at the 1e-7 level. That is below the bf16 rounding that follows,
   and the tail's output words are the five passes' words. The test holds the mixes and split within 1e-5 of float64,
@@ -390,7 +396,7 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | FUSE_DOWN_SCALE | NVFP4 down scale inside the gate/up launch | EXACT | test (word for word) |
 | CED | The chunked prompt path: the decoder layers run again over a chunk's last window rows only | REORDER (row count) | commit (its fixture test is bit for bit only at 16-row chunks) |
 | MOE_FP4_NAX | Fused fp4 MoE decode kernels on the matrix units | REORDER (bounded) | test (within 1.25x of the `=0` path's rel-rms against f32, + 1e-4) |
-| MOE_PAIR_SCALED | NVFP4 prompt gate/up, scales and activation in one launch | REORDER (bounded) | test |
+| MOE_PAIR_FP4 | fp4 prompt gate/up (NVFP4 and MXFP4), the scales (NVFP4) and activation in one launch | REORDER (bounded) | test |
 | PF_HC_V2 | Wide-layer hc in three passes, not five | REORDER (bounded) | test |
 | PF_PASS_SIZE | Near-equal memory-sized prompt passes | REORDER (partition) | commit |
 | PF_IDX_NAX | Indexer scores on the matrix units | REORDER (bounded) | test (within 2·γ(34) of `idx_tile`, the same top-half picks except near-ties; NAX) |

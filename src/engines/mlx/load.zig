@@ -758,6 +758,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             .model_type = params.config.model_type,
             .verify_rows = verify_rows,
             .kv_bits = kv_quant_config.bits,
+            .kernels = warm_requests.kernelsKey(params.config.quant_bits, params.config.quant_group_size, @tagName(params.config.quant_mode)),
         });
         // The sweep runs here only ahead of the full plan; the minimal one runs it once the model is ready.
         xfm_ptr.warmup(if (params.warmup_full and warm_marker != null) verify_rows else 0) catch |err| {

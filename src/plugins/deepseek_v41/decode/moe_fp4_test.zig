@@ -1406,7 +1406,7 @@ test "dsv41 fp4 nvfp4 as mxfp4: decode's routed gathers (the fused fp4 kernels o
 }
 
 /// The prefill half's bar: the NVFP4 arm applies its globals in its paired epilogue in another order than the MXFP4
-/// arm's scale codes (MOE_PAIR_SCALED), so the two round apart now and then; 1e-3 relative rms holds that and fails a
+/// arm's scale codes (MOE_PAIR_FP4), so the two round apart now and then; 1e-3 relative rms holds that and fails a
 /// global on the wrong projection by orders of magnitude.
 const nv_as_mx_prefill_bar = 1e-3;
 
