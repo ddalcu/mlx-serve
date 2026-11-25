@@ -171,12 +171,15 @@ struct MLXCoreApp: App {
         // (transcript, model browser, media generators) and the two it gained
         // were 960pt-wide windows in their own right.
         .defaultSize(width: 1160, height: 780)
+        // Principal, or an LSUIElement app's scene is an auxiliary window that cannot go full screen.
+        .windowManagerRole(.principal)
 
         Window("Browser", id: "browser") {
             BrowserView()
                 .appAppearance()
         }
         .defaultSize(width: 1024, height: 768)
+        .windowManagerRole(.principal)
 
         // Dedicated terminal-style window for the server's live stderr.
         // The inline log on the tray popover is still there for a glance;
@@ -188,6 +191,7 @@ struct MLXCoreApp: App {
                 .appAppearance()
         }
         .defaultSize(width: 900, height: 560)
+        .windowManagerRole(.principal)
 
         // Benchmarks: run a pinned suite against the loaded model, keep the
         // history locally, and compare against what other people measured.
@@ -200,6 +204,7 @@ struct MLXCoreApp: App {
                 .appAppearance()
         }
         .defaultSize(width: 1040, height: 680)
+        .windowManagerRole(.principal)
 
         Window("Decisions", id: "decisions") {
             DecisionsWindow()
@@ -208,6 +213,7 @@ struct MLXCoreApp: App {
                 .appAppearance()
         }
         .defaultSize(width: 980, height: 720)
+        .windowManagerRole(.principal)
 
         // Per-model settings for the tray's selected model. A window, not a
         // sheet: the MenuBarExtra popover cannot host one.
@@ -232,6 +238,7 @@ struct MLXCoreApp: App {
             }
         }
         .defaultSize(width: 900, height: 600)
+        .windowManagerRole(.principal)
 
         // Agents (personas): who you're talking to, and the settings that
         // conversation runs under. Configuration only — chatting with an agent
@@ -245,6 +252,7 @@ struct MLXCoreApp: App {
                 .appAppearance()
         }
         .defaultSize(width: 900, height: 640)
+        .windowManagerRole(.principal)
 
         .commands {
             CommandGroup(replacing: .appTermination) {

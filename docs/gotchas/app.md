@@ -38,6 +38,11 @@ has no key window, and the policy flipped on `didBecomeKey`, which cannot fire. 
 then activates, synchronously; every window and panel goes through it (a cancelled picker falls back to `.accessory`).
 Guard: `AppActivationTests` (ordering + source audits for raw `openWindow(id:` / `panel.runModal()`).
 
+### An LSUIElement app's windows could not go full screen
+Defect: the green button offered no Full Screen and ⌃⌘F did nothing. Cause: SwiftUI gives an LSUIElement app's
+scenes `.auxiliary` + `.fullScreenAuxiliary`, and AppKit refuses those full screen even once the app is `.regular`.
+Fix: `.windowManagerRole(.principal)` on every resizable scene. Guard: a pin in `scripts/lint_pins.txt`.
+
 ### Two binaries in the app bundle
 Defect: "still doesn't work" after a rebuild. Cause: `MLXCore` and `mlx-serve` both live in the bundle. Fix: update
 them together.
