@@ -88,7 +88,7 @@ pub const LoadParams = struct {
     warmup_eager: bool = true,
     /// `--no-warmup-eager` as launched, for the models loaded after startup (this load's own is `warmup_eager`).
     launch_warmup_eager: bool = true,
-    /// `--warmup-full`: a build's first load of a model serves its whole warm plan before it reports ready
+    /// `--warmup-full`: every load of a model serves its whole warm plan before it reports ready
     /// (`warm_requests.zig`), where the default leaves a short one for when the server is idle.
     warmup_full: bool = false,
     /// Drafter block size (caller computed via `drafter.recommendedBlockSize`).
