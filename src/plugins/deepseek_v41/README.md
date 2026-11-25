@@ -190,8 +190,8 @@ below.
 - `--precision lossless|lossy` (or `MLX_SERVE_DSV41_PRECISION`): lossless is the default. Another value refuses the
   load by name. Under lossy, a sampled DSpark request takes typical acceptance at δ 0.2, ε 0.04 (Medusa's form:
   a draft is kept when p > min(ε, δ·e^-H)) unless `--mtp-typical`, `--mtp-tokenv3` or a model `mtp_acceptance`
-  setting chooses its acceptance. On the 16K standard cells with the card's sampling it decoded 99.92 tok/s against
-  88.25 exact.
+  setting chooses its acceptance. On the 16K standard cells with the card's sampling (Mac 2, build `4daa4a3a`, 6 runs
+  an arm) it decoded 99.92 tok/s against 88.25 with exact acceptance.
 - `MLX_SERVE_DSV41_STACK_<STACK>=0` turns one stack's default-on switches to their `=0` paths. A switch whose own
   variable is set keeps that value, so one switch can stay on in a stack that is off.
 - Each load logs one line: `[dsv41] settings: precision=... stacks_off=... changed=...`, where `changed` lists every
@@ -214,7 +214,7 @@ below.
 | `MLX_SERVE_DSV41_STACK_ATTENTION` | FLASH_TRIM, FLASH_ATTN, ATTN_F16 |
 | `MLX_SERVE_DSV41_STACK_DECODE` | IN_PROJ_MIXR, FFN_IN_SINK, FFN_IN_R5_COLS1, FUSE_WQB_RING, FP4_DEC_WORD, FP4_UP_SPLIT, FP8_FOLD, MOE_DOWN_ORDER, FUSE_DOWN_SCALE, MOE_FP4_NAX, ENGRAM_GPU_IDS, ENGRAM_KV_SLOTS, FP4_READS, ATTN_DEC, WOA_PLAIN, HEAD8 |
 | `MLX_SERVE_DSV41_STACK_SPEC` | SPEC_ENGRAM_AHEAD, DRAFT_POS_ONCE, DRAFT_FUSED, DRAFT_SAMPLE, DRAFT_QKV, SPEC_SYNC, DRAFT_VOCAB, DRAFT_VOCAB_PROMPT |
-| `MLX_SERVE_DSV41_STACK_MEMORY` | PF_KEEP_WIDE, ENGRAM_KV_CACHE, PF_PASS_SIZE |
+| `MLX_SERVE_DSV41_STACK_MEMORY` | PF_KEEP_WIDE, ENGRAM_KV_CACHE, PF_PASS_SIZE, PF_PASS_CEIL |
 <!-- /levers:stacks -->
 
 ## Memory and the 1M-token context
@@ -276,7 +276,7 @@ declines the switch by name and logs why.
 ## Accuracy: what "lossless" means here
 
 <!-- levers:counts -->
-Under `precision=lossless` (the default) the plugin has 55 default-on switches: 32 EXACT, 16 REORDER, 6 DRAFT-ONLY and `HEAD8`, the 8-bit LM head, the one accepted requantization (REQUANT). `precision=lossy` adds the LOSSY picks below. `src/plugins/deepseek_v41/levers.zig` holds every switch; this block and the tables marked `levers:` are rendered from it.
+Under `precision=lossless` (the default) the plugin has 56 default-on switches: 32 EXACT, 17 REORDER, 6 DRAFT-ONLY and `HEAD8`, the 8-bit LM head, the one accepted requantization (REQUANT). `precision=lossy` adds the LOSSY picks below. `src/plugins/deepseek_v41/levers.zig` holds every switch; this block and the tables marked `levers:` are rendered from it.
 <!-- /levers:counts -->
 
 The classes:
@@ -294,7 +294,7 @@ Every default-on switch but 6 has a standing test or a kernel contract case. The
 | Class | Plugin switches (default-on) | Engine variables |
 |---|---|---|
 | EXACT | 32 | 0 |
-| REORDER | 16 | `MLX_SERVE_DSV4_DSPARK` (the verify's multi-row kernels, by reasoning) |
+| REORDER | 17 | `MLX_SERVE_DSV4_DSPARK` (the verify's multi-row kernels, by reasoning) |
 | DRAFT-ONLY | 6 | `MLX_SERVE_DSPARK_POLICY2` (picks verify widths); `MLX_SERVE_DSPARK_POLICY2_MODELED` (picks verify widths) |
 | TF32 | 0 | `MLX_ENABLE_TF32` (MLX's TF32 matmuls; on M5 at the defaults only the drafter's P·V) |
 | REQUANT | 1 | 0 |
@@ -313,7 +313,7 @@ prompt-attention call (the block below).
 | Measured no farther from float64 than the `=0` path (`PF_COMP_BF16`, `FLASH_ATTN`, `ENGRAM_KV_SLOTS`, `ATTN_DEC`, `WOA_PLAIN`, `PF_IDX_PASS`) | 6 |
 | Held to a stated bound that can allow more error than `=0`: `MOE_FP4_NAX`, `FP4_READS`, `FUSE_MXFP8_QMM` (rel-rms against f32 up to 1.25 times the `=0` path's, plus 1e-4); `PF_HC_V2` (mixes and split 2.0 to 5.9 times farther from float64, within 1e-5 of it); `ENGRAM_GPU_IDS` (4 of 409,600 words farther, worst element no farther); `MOE_PAIR_FP4` (each differing word within one bf16 step of its row's peak, under 1% differing, sample l2 within 1.05 times); `PF_IDX_NAX` (each score within 2·γ(34) of `idx_tile`'s, the same top-half picks except near-ties) | 7 |
 | Resting on the commit's reasoning (`CED`, the chunked prompt path; `PF_PASS_SIZE`) | 2 |
-| Resting on its A/B's same text (`HC_EXPAND_NORM`: its test allows 1% relative error, far looser than bf16 rounding, so we do not count it as a bound) | 1 |
+| Resting on its A/B's same text (`HC_EXPAND_NORM`: its test allows 1% relative error, far looser than bf16 rounding, so we do not count it as a bound; `PF_PASS_CEIL`, a different partition into passes: 28 of 28 sweep pairs from 128K to 1M gave the same text) | 2 |
 
 A DRAFT-ONLY switch keeps the verify's rule: a greedy verify keeps only tokens that the model agrees with, and a
 sampled verify keeps the model's distribution. Greedy text can still change by rounding, because the verify kernels'
@@ -447,6 +447,7 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | MOE_PAIR_FP4 | fp4 prompt gate/up (NVFP4 and MXFP4), the scales (NVFP4) and activation in one launch | REORDER (bounded) | test |
 | PF_HC_V2 | Wide-layer hc in three passes, not five | REORDER (bounded) | test |
 | PF_PASS_SIZE | Near-equal memory-sized prompt passes | REORDER (partition) | commit |
+| PF_PASS_CEIL | Prompt passes no wider than the machine's measured knee (39,680 rows on the M5 Ultra 512 GiB; other machines keep the memory-sized width) | REORDER (partition) | test (the plan) and A/B text (the view at 1M +3.27%, 512K +0.84%; NVFP4 already plans under it) |
 | PF_IDX_NAX | Indexer scores on the matrix units | REORDER (bounded) | test (within 2·γ(34) of `idx_tile`, the same top-half picks except near-ties; NAX) |
 | PF_COMP_BF16 | Compressor projection on a bf16 MMA, K blocks summed apart | REORDER | test |
 | PF_IDX_PASS | Indexer queries and head weights once over the pass, the head weights on a shape-cut kernel (16 partial sums) | REORDER | test (head weights no farther from float64 than MLX's GEMM per span; +0.8 GB peak, billed) |

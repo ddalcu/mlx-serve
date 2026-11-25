@@ -2749,6 +2749,33 @@ pub fn passRowsLimit(config: anytype) u64 {
     return ((@as(u64, 1) << 31) - 1) / per_row / SPAN * SPAN;
 }
 
+/// `MLX_SERVE_DSV41_PF_PASS_CEIL`'s ceiling on the M5 Ultra with 512 GiB, a machine constant: the knee measured there
+/// at 1M prompt rows on both fp4 formats. At 1M, NVFP4 prefilled the same at 30,720, 34,816 and 39,680 rows a pass;
+/// the MXFP4 view lost 2.97% at its memory-sized 47,360 rows and 2.4% at 44,032 against 39,680 (its fresh allocations,
+/// the per-span context-prefix arrays the pass's reserve does not hold, rose from about 780 to 1,370 and 1,490 GiB).
+/// 155 spans; under it a prompt of 128K, 256K or 512K rows runs in 4, 7 or 14 passes (32,768, 37,632 and 37,632 rows).
+pub const PASS_CEIL_M5_ULTRA_512: usize = 155 * SPAN;
+
+/// The ceiling `MLX_SERVE_DSV41_PF_PASS_CEIL` puts on a memory-sized prompt pass for `chip` (the CPU brand) with `mem`
+/// bytes of memory; 0 where none is measured. Only the M5 Ultra with 512 GiB has a measured knee; every other machine
+/// keeps the memory-sized width until its own is measured.
+pub fn passCeilFor(chip: []const u8, mem: u64) usize {
+    if (std.mem.indexOf(u8, chip, "M5 Ultra") != null and mem >= @as(u64, 512) << 30) return PASS_CEIL_M5_ULTRA_512;
+    return 0;
+}
+
+/// `passCeilFor` this machine under `MLX_SERVE_DSV41_PF_PASS_CEIL` (default on): 0 at `=0`, or where no knee is measured.
+pub fn passCeil() usize {
+    if (!lev.onUnlessZero(.PF_PASS_CEIL)) return 0;
+    const c = if (pass_ceil_machine) |m| passCeilFor(m.chip, m.mem) else passCeilFor(@import("../../sdk/ane/offload.zig").chipBrand(), device.totalMemBytes());
+    return if (pass_ceil_plant and c > 0) c + 4 * SPAN else c;
+}
+
+/// Test seam: the machine `passCeil` reads (null: this one's CPU brand and memory).
+pub var pass_ceil_machine: ?struct { chip: []const u8, mem: u64 } = null;
+/// `MLX_SERVE_DSV41_PF_PASS_CEIL`'s planted bug (its test): the ceiling 1,024 rows too high.
+pub var pass_ceil_plant = false;
+
 /// Whether `MLX_SERVE_DSV41_PF_PASS_SIZE` serves a load, for its prompt bill (`prefillBytes`): `passSettle`'s
 /// conditions as the engine's `ModelConfig` sees them (a resident bank, no layer pair, span or shard), or the plugin's
 /// own `Config` (a resident bank), so the two bills stay one.
