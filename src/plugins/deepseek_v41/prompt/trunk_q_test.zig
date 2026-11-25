@@ -15,6 +15,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const w8a8 = @import("../../../sdk/blocks/dit/w8a8.zig");
 const pfint8 = @import("pf_int8.zig");
+const world = @import("../../../sdk/testing/world.zig");
 
 const A = mlx.mlx_array;
 const Scope = dsv41.Scope;
@@ -292,13 +293,13 @@ test "dsv41 pf int8 bill: levels 3 and 4 add their int8 inputs and bf16 outputs 
         const pin = env.override(.MLX_SERVE_DSV41_PF_INT8, "3");
         defer pin.restore();
         // Without NAX the plan is inert and reserves nothing.
-        const nax = @import("../../../mlx/device.zig").naxAvailable();
+        const nax = world.nax();
         try std.testing.expectEqual(if (nax) rows * 85_256 else 0, pfint8.transientBytes(&c, rows, 2048));
         try std.testing.expectEqual(@as(u64, 0), pfint8.transientBytes(&c, 2048, 2048));
     }
     {
         const pin = env.override(.MLX_SERVE_DSV41_PF_INT8, "4");
         defer pin.restore();
-        try std.testing.expectEqual(if (@import("../../../mlx/device.zig").naxAvailable()) rows * 120_852 else 0, pfint8.transientBytes(&c, rows, 2048));
+        try std.testing.expectEqual(if (world.nax()) rows * 120_852 else 0, pfint8.transientBytes(&c, rows, 2048));
     }
 }
