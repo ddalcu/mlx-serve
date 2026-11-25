@@ -323,6 +323,7 @@ fn relErr(got: mlx.mlx_array, x: mlx.mlx_array, q: Quant, gs: c_int, bits: c_int
 }
 
 test "rowqmv.qmv: every row of an R-row call equals its one-row call bit for bit, and matches f32 truth" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const a = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x7f);
@@ -362,6 +363,7 @@ test "rowqmv.qmv: every row of an R-row call equals its one-row call bit for bit
 }
 
 test "rowqmv.qmv: a one-row call is bit-equal to stock quantized_matmul at 4, 6 and 8 bits" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const a = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x27b);
@@ -466,6 +468,7 @@ fn dequantF32(q: [3]mlx.mlx_array, gs: c_int, bits: c_int, s: mlx.mlx_stream) !m
 }
 
 test "rowqmv.experts: rows are width-invariant bit for bit and match the f32 SwitchMLP" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const a = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xE1);

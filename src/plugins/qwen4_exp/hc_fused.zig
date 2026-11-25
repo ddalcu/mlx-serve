@@ -562,7 +562,7 @@ fn hcFusedReadParity(bits: u32, gs: u32) !void {
 }
 
 test "hc prefill: pending write, normalized streams, native inject reduction and BF16 mix across shapes" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const hp = @import("../../sdk/blocks/hc/hc_prefill.zig");
     const s = mlx.gpuStream();
     var xfm = std.mem.zeroInit(Trunk, .{ .s = s, .allocator = testing.allocator });

@@ -534,7 +534,7 @@ test "qsa select kernel: the fused radix-select IS the exact top-k, and so is th
     // query widths it runs at and three visibility regimes. Scores are exact binary fractions
     // k/16 in [0, 0.5] plus forced zeros: the regime where the chain's bias is also exact, so
     // both arms can be held to the same bar.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const prev_split = qsa_select_split_override;
     defer qsa_select_split_override = prev_split;
     qsa_select_split_override = false;
@@ -836,7 +836,7 @@ fn qsaSelectMakeSheet(kind: u8, buf: []f32, rnd: std.Random) void {
 }
 
 test "qsa select split: ids are identical to the single-threadgroup kernel" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = testing.allocator;
     const k: c_int = 512;
@@ -957,7 +957,7 @@ test "qsa select split: declines above the width floor and below the nb floor" {
 }
 
 test "qsa select split: the fused radix-select IS the exact top-k" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = testing.allocator;
     const ratio: c_int = 4;
@@ -1149,7 +1149,7 @@ test "qsa select: the digit scheme is a pure function of rows" {
 }
 
 test "qsa select: 8-bit digits are the exact top-k" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = testing.allocator;
     const saved_digits = qsa_select_digits_override;

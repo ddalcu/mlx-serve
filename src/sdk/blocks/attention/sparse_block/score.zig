@@ -436,7 +436,7 @@ test "qsa score sheet budget: the row chunk it buys at nb 95k" {
 }
 
 test "qsa score kernel: fused score sheet is bit-identical to the composed chain" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     qsa_score_fused_override = true;
