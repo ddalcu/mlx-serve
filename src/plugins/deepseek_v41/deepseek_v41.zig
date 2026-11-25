@@ -36,6 +36,7 @@ const dsv4 = @import("../deepseek_v4/deepseek_v4.zig");
 const streamed = @import("../../sdk/weights/streamed.zig");
 const dkern = @import("decode/decode.zig");
 const device = @import("../../mlx/device.zig");
+const world = @import("../../sdk/testing/world.zig");
 /// A pack an outside quant plugin reads: its linears and resident banks run on the plugin.
 const outside = @import("../../sdk/quant/outside.zig");
 /// the embed_pread.zig (the embedding pread): the embedding table read from the pack per lookup.
@@ -1046,6 +1047,20 @@ pub fn cedEnabled() bool {
         ced_env = v == null or v.?[0] != '0';
     }
     return ced_env.?;
+}
+
+/// The test world's reset (`src/tests.zig` calls it before every test): the latched CED read and the engagement
+/// counters tests read, as a fresh process holds them.
+pub fn testReset() void {
+    ced_env = null;
+    inline for (.{ &rope_pairs_calls, &rms_rows_calls, &kv_rows_calls, &comp_bf16_count, &comp_pass_count, &idx_pass_count, &router_bf16_count, &eng_ahead_served, &eng_ahead_launched, &eng_ahead_taken, &draft_pos_once_runs, &stage_fused_runs, &fp4gemm.launches, &pfroute.served }) |a| a.store(0, .monotonic);
+    for (&core_calls) |*a| a.store(0, .monotonic);
+    ced_hc_passes.store(0, .monotonic);
+    fp4gemm.bk32_launches.store(0, .monotonic);
+    fp4gemm.tok_launches.store(0, .monotonic);
+    sync_rounds.store(0, .monotonic);
+    sync_collects.store(0, .monotonic);
+    fusion.engaged = .{};
 }
 
 pub fn resetCedEnvForTest() void {
@@ -2746,6 +2761,32 @@ pub fn passRowsLimit(config: anytype) u64 {
     const per_row: u64 = @max(@as(u64, config.num_attention_heads) * config.head_dim, 1);
     return ((@as(u64, 1) << 31) - 1) / per_row / SPAN * SPAN;
 }
+
+/// `MLX_SERVE_DSV41_PF_PASS_CEIL`'s ceiling on the M5 Ultra with 512 GiB, a machine constant: the knee measured there
+/// at 1M prompt rows on both fp4 formats. At 1M, NVFP4 prefilled the same at 30,720, 34,816 and 39,680 rows a pass;
+/// the MXFP4 view lost 2.97% at its memory-sized 47,360 rows and 2.4% at 44,032 against 39,680 (its fresh allocations,
+/// the per-span context-prefix arrays the pass's reserve does not hold, rose from about 780 to 1,370 and 1,490 GiB).
+/// 155 spans; under it a prompt of 128K, 256K or 512K rows runs in 4, 7 or 14 passes (32,768, 37,632 and 37,632 rows).
+pub const PASS_CEIL_M5_ULTRA_512: usize = 155 * SPAN;
+
+/// The ceiling `MLX_SERVE_DSV41_PF_PASS_CEIL` puts on a memory-sized prompt pass for `chip` (the CPU brand) with `mem`
+/// bytes of memory; 0 where none is measured. Only the M5 Ultra with 512 GiB has a measured knee; every other machine
+/// keeps the memory-sized width until its own is measured.
+pub fn passCeilFor(chip: []const u8, mem: u64) usize {
+    if (std.mem.indexOf(u8, chip, "M5 Ultra") != null and mem >= @as(u64, 512) << 30) return PASS_CEIL_M5_ULTRA_512;
+    return 0;
+}
+
+/// `passCeilFor` this machine under `MLX_SERVE_DSV41_PF_PASS_CEIL` (default on): 0 at `=0`, or where no knee is measured.
+pub fn passCeil() usize {
+    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_PASS_CEIL)) return 0;
+    const id = device.machineId();
+    const c = passCeilFor(id.chip, id.mem);
+    return if (pass_ceil_plant and c > 0) c + 4 * SPAN else c;
+}
+
+/// `MLX_SERVE_DSV41_PF_PASS_CEIL`'s planted bug (its test): the ceiling 1,024 rows too high.
+pub var pass_ceil_plant = false;
 
 /// Whether `MLX_SERVE_DSV41_PF_PASS_SIZE` serves a load, for its prompt bill (`prefillBytes`): `passSettle`'s
 /// conditions as the engine's `ModelConfig` sees them (a resident bank, no layer pair, span or shard), or the plugin's
@@ -11397,7 +11438,7 @@ test "dsv41 wide attention: the f16 core and the matrix-unit core give the f32 c
     const fa_was = fa.ps().*;
     defer fa.ps().* = fa_was;
     fa.ps().* = .{};
-    m.attn_gather = if (device.naxAvailable()) try GatherAttn.init() else null;
+    m.attn_gather = if (world.nax()) try GatherAttn.init() else null;
     defer if (m.attn_gather) |*g| g.deinit();
     var key = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(key);
@@ -14460,4 +14501,23 @@ test "dsv41 draft vocabulary: ids grow to whole buckets with the lowest ids outs
     // A bucket past the vocabulary stops at every id.
     try padIds(a, &ids, &taken, 64);
     try std.testing.expectEqual(@as(usize, 12), ids.items.len);
+}
+
+// One test's state must not reach the next. Each pair runs in every shard ("sharded:"), the leak first, in file order.
+var world_comp_bf16_at_start: ?[]u8 = null;
+
+test "sharded: dsv41 test world: a test that sets a lever and leaves it (the PF_COMP_BF16 leak)" {
+    world_comp_bf16_at_start = if (env.get(.MLX_SERVE_DSV41_PF_COMP_BF16)) |v| try std.heap.page_allocator.dupe(u8, std.mem.span(v)) else null;
+    env.set(.MLX_SERVE_DSV41_PF_COMP_BF16, "0");
+    _ = cedEnabled();
+    fusion.ps().mxfp8_qmm = true;
+    sync_rounds.store(3, .monotonic);
+}
+
+test "sharded: dsv41 test world: the next test starts from the process's levers, an unlatched CED read, the fuse latch at rest and zero sync rounds" {
+    const now = env.get(.MLX_SERVE_DSV41_PF_COMP_BF16);
+    if (world_comp_bf16_at_start) |w| try testing.expectEqualStrings(w, std.mem.span(now.?)) else try testing.expect(now == null);
+    try testing.expect(ced_env == null);
+    try testing.expect(!fusion.ps().mxfp8_qmm);
+    try testing.expectEqual(@as(u64, 0), sync_rounds.load(.monotonic));
 }

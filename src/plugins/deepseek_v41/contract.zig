@@ -7,6 +7,7 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const env = @import("../../env.zig");
 const device = @import("../../mlx/device.zig");
+const world = @import("../../sdk/testing/world.zig");
 const kit = @import("../deepseek_v4/contract_kit.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const v41 = @import("deepseek_v41.zig");
@@ -5410,7 +5411,7 @@ const Shell = struct {
         m.moe_dn_kernel = try b("dsv41_moe_dn", &v41.MOE_DN_INS, &.{"out"}, v41.MOE_DN_SOURCE, v41.MOE_HEADER);
         m.moe_act_kernel = try b("dsv41_moe_act", &v41.MOE_ACT_INS, &.{"out"}, v41.MOE_ACT_SOURCE, "");
         m.moe_combine_kernel = try b("dsv41_moe_combine", &v41.MOE_COMBINE_INS, &.{"out"}, v41.MOE_COMBINE_SOURCE, "");
-        const use_nax = device.naxAvailable();
+        const use_nax = world.nax();
         m.idx_nax_kernel = if (use_nax) try v41.buildIdxNaxKernel() else null;
         return .{ .m = m };
     }
@@ -5786,7 +5787,7 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         defer _ = mlx.mlx_array_free(y);
         try Expect.same(r.c, r.bytes, &.{y});
     }
-    if (@import("../../mlx/device.zig").naxAvailable()) {
+    if (world.nax()) {
         const r = try ours(GateGemm, a, &gate_gemm_l, .{}, .{ .rows = 100, .n = 384, .k = 768 });
         const y = (try ggemm.router(m.s, r.c.args[0], r.c.args[1], true)).?;
         defer _ = mlx.mlx_array_free(y);
@@ -5801,7 +5802,7 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         try Expect.same(rk.c, rk.bytes, &.{yk});
     }
     // The flash kernel as the model launches it (`flashLaunch`, grouped).
-    if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
+    if (world.nax()) inline for (.{ true, false }) |qt| {
         const r = try ours(AttnFlash, a, &flash_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
         const fk = try v41.buildKernel("dsv41_attn_flash", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, @import("decode/attn.zig").HEADER);
         defer _ = mlx.mlx_fast_metal_kernel_free(fk);
@@ -5810,7 +5811,7 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         try Expect.same(r.c, r.bytes, &got);
     };
     // FLASH_TRIM's kernel as the model builds and launches it (`fa.header_trim`).
-    if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
+    if (world.nax()) inline for (.{ true, false }) |qt| {
         const r = try ours(AttnFlash, a, &flash_trim_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
         const fk = try v41.buildKernel("dsv41_attn_flash_trim", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, fa.header_trim);
         defer _ = mlx.mlx_fast_metal_kernel_free(fk);
@@ -5819,7 +5820,7 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         try Expect.same(r.c, r.bytes, &got);
     };
     // Both switches' kernel as the model builds and launches it (`fa.header_trim_psum`).
-    if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
+    if (world.nax()) inline for (.{ true, false }) |qt| {
         const r = try ours(AttnFlash, a, &flash_trim_psum_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
         const fk = try v41.buildKernel("dsv41_attn_flash_trim_psum", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, fa.header_trim_psum);
         defer _ = mlx.mlx_fast_metal_kernel_free(fk);
@@ -5828,7 +5829,7 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         try Expect.same(r.c, r.bytes, &got);
     };
     // FLASH_PSUM's kernel as the model builds and launches it (`fa.header_psum`).
-    if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
+    if (world.nax()) inline for (.{ true, false }) |qt| {
         const r = try ours(AttnFlash, a, &flash_psum_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
         const fk = try v41.buildKernel("dsv41_attn_flash_psum", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, fa.header_psum);
         defer _ = mlx.mlx_fast_metal_kernel_free(fk);
@@ -6015,7 +6016,7 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const r = try ours(IdxTile, a, &tile_l, .{}, .{ .rows = 18, .n = 200, .k = IHD });
         try Expect.same(r.c, r.bytes, &.{try v41.indexScoresTiled(&sc, m, r.c.args[0], r.c.args[1], r.c.args[2], @floatCast(r.c.in(4)[0]), @intFromFloat(r.c.in(3)[0]), @intFromFloat(r.c.in(3)[1]))});
     }
-    if (@import("../../mlx/device.zig").naxAvailable()) {
+    if (world.nax()) {
         const r = try ours(IdxNax, a, &idx_nax_l, .{}, .{ .rows = 18, .n = 200, .k = IHD });
         try Expect.same(r.c, r.bytes, &.{try inax.launch(&sc, try inax.kernel(), r.c.args[0..5])});
     }

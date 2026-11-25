@@ -49,6 +49,8 @@ RULES = [
     ("history-comment", "a comment carrying \"PR #\", an ISO date, a P1 move marker or \"this/it/we/code used to\""),
     ("source-scan-test", "a test that @embedFile's a .zig file, directly or through a const"),
     ("graph-scope", "a fn taking *Graph and returning an Array without a scope()"),
+    ("machine-read-in-test", "a DeepSeek test reading the machine (NAX, GPU generation, TF32, chip, RAM) but to skip, "
+     "not through the test world (sdk/testing/world.zig)"),
     ("pin-unmatched", "a scripts/lint_pins.txt line no file matches (a `!` line: one some file holds)"),
     ("file-over-cap", f"a file over {SOFT_CAP} production lines"),
 ]
@@ -377,6 +379,20 @@ def r_graph_scope(f, ctx):
             yield i, f"fn {m.group(2)}"
 
 
+# A test decides from the machine only where it says so: a skip, or the test world's accessors (`world.nax()`), whose
+# reads the world owns; everything else plans for the world's reference machine.
+MACHINE_READ = re.compile(r'\b(naxAvailable|deviceGeneration|tf32Matmul|chipBrand|totalMemBytes|machineId)\s*\(')
+MACHINE_READ_SCOPE = ("src/plugins/deepseek_v41", "src/plugins/deepseek_v4", "src/engines/mlx/plugin/deepseek_test.zig")
+
+
+def r_machine_read_in_test(f, ctx):
+    if not under(f.path, *MACHINE_READ_SCOPE):
+        return
+    for i, c in enumerate(f.code):
+        if f.is_test[i] and MACHINE_READ.search(c) and "SkipZigTest" not in c:
+            yield i, f.lines[i].strip()[:120]
+
+
 def r_file_over_cap(f, ctx):
     if f.prod_lines > SOFT_CAP:
         yield 0, f"{f.prod_lines} production lines"
@@ -399,6 +415,7 @@ FILE_RULES = {
     "history-comment": r_history_comment,
     "source-scan-test": r_source_scan_test,
     "graph-scope": r_graph_scope,
+    "machine-read-in-test": r_machine_read_in_test,
     "file-over-cap": r_file_over_cap,
 }
 

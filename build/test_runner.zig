@@ -1,7 +1,7 @@
 //! Zig 0.17's test runner (lib/compiler/test_runner.zig) with one change: `MLX_SERVE_TEST_SHARD=k/n` keeps every
 //! n-th test from index k, and every test named `sharded: …` (which splits its own work by the same variable), so
 //! `zig build test` runs n copies of one binary in parallel. Unset = every test, as std's runner. And it runs the
-//! test root's process setup (`msv_test_process_init`) before the first test.
+//! test root's process setup (`msv_test_process_init`) before the first test and `msv_test_enter` before each.
 const builtin = @import("builtin");
 
 const std = @import("std");
@@ -60,6 +60,8 @@ fn shardTests() void {
 
 /// The test root's process setup (`src/tests.zig`).
 extern fn msv_test_process_init() void;
+/// The test root's per-test setup (`src/tests.zig`): every test starts in the test world (`src/sdk/testing/world.zig`).
+extern fn msv_test_enter() void;
 
 pub fn main(init: std.process.Init.Minimal) void {
     msv_test_process_init();
@@ -170,6 +172,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 try server.serveStringMessage(.test_started, &.{});
 
                 const TestResults = std.zig.Server.Message.TestResults;
+                msv_test_enter();
                 const status: TestResults.Status = if (test_fn.func()) |v| s: {
                     v;
                     break :s .pass;
@@ -322,6 +325,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
             std.debug.print("{d}/{d} {s}...", .{ i + 1, test_fn_list.len, test_fn.name });
         }
         is_fuzz_test = false;
+        msv_test_enter();
         if (test_fn.func()) |_| {
             ok_count += 1;
             test_node.end();
@@ -421,6 +425,7 @@ pub fn mainSimple() anyerror!void {
             stdout.writeStreamingAll(runner_threaded_io, test_fn.name) catch {};
             stdout.writeStreamingAll(runner_threaded_io, "... ") catch {};
         }
+        msv_test_enter();
         if (test_fn.func()) |_| {
             if (enable_write) stdout.writeStreamingAll(runner_threaded_io, "PASS\n") catch {};
         } else |err| {
@@ -478,6 +483,7 @@ var fuzz_runner: if (builtin.fuzz) struct {
         });
         defer testing.io_instance.deinit();
 
+        msv_test_enter();
         tests[fuzz_runner.indexes[i]].func() catch |err| switch (err) {
             error.SkipZigTest => return,
             else => {

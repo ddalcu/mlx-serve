@@ -224,6 +224,104 @@ pub fn floatValue(raw: ?[*:0]const u8, default: f32) f32 {
     return if (std.math.isFinite(v) and v >= 0) v else default;
 }
 
+// ── the test world's environment (`src/sdk/testing/world.zig` drives these) ──
+
+/// The variables the test world puts back before each test: every registered one but a `diag` (a token of
+/// `MLX_SERVE_DIAG`, itself registered) and `MLX_ENABLE_TF32`, which MLX reads once, at the process's first matmul.
+fn worldVar(comptime n: []const u8) bool {
+    return @field(vars, n).kind != .diag and !std.mem.eql(u8, n, "MLX_ENABLE_TF32");
+}
+
+/// One slot per world variable: its value when the test process started (null: unset).
+fn WorldSlot(comptime n: []const u8) type {
+    return SlotOfWorld(&@field(vars, n));
+}
+
+fn SlotOfWorld(comptime v: *const Var) type {
+    return struct {
+        const of = v;
+        var value: ?[:0]u8 = null;
+    };
+}
+
+/// Records every world variable's value as the reference each test starts from. The test process calls it once,
+/// before the first test (after it sets `MLX_SERVE_TEST_FLIP`'s arm).
+pub fn worldSnapshot() void {
+    @setEvalBranchQuota(200_000);
+    inline for (comptime std.meta.declarations(vars)) |n| {
+        if (comptime worldVar(n)) {
+            const z = comptime std.fmt.comptimePrint("{s}", .{n});
+            WorldSlot(n).value = if (std.c.getenv(z)) |v| std.heap.page_allocator.dupeSentinel(u8, std.mem.span(v), 0) catch @panic("env: out of memory") else null;
+        }
+    }
+}
+
+/// Puts back every world variable that differs from `worldSnapshot`'s value (setting only those, so a leftover
+/// thread's read races nothing else) and forgets `init`'s snapshot. Returns how many it put back.
+pub fn worldRestore() usize {
+    @setEvalBranchQuota(200_000);
+    var n_changed: usize = 0;
+    inline for (comptime std.meta.declarations(vars)) |n| {
+        if (comptime worldVar(n)) {
+            const z = comptime std.fmt.comptimePrint("{s}", .{n});
+            const want = WorldSlot(n).value;
+            const same = if (std.c.getenv(z)) |cur| want != null and std.mem.eql(u8, std.mem.span(cur), want.?) else want == null;
+            if (!same) {
+                n_changed += 1;
+                if (want) |w| _ = setForeign(z, w.ptr) else unsetForeign(z);
+            }
+        }
+    }
+    snapshot_taken = false;
+    return n_changed;
+}
+
+/// The `kill` variables `worldSnapshot`'s reference holds, `NAME=value` each, for the test world's start line.
+pub fn worldLevers(out: []u8) []const u8 {
+    @setEvalBranchQuota(200_000);
+    var w: std.Io.Writer = .fixed(out);
+    inline for (comptime std.meta.declarations(vars)) |n| {
+        if (comptime @field(vars, n).kind == .kill) {
+            if (WorldSlot(n).value) |v| w.print("{s}{s}={s}", .{ if (w.buffered().len > 0) " " else "", n, v }) catch {};
+        }
+    }
+    return w.buffered();
+}
+
+/// `MLX_SERVE_TEST_FLIP`'s lever and the arm it names.
+pub const Flip = struct { name: [:0]const u8, value: [:0]const u8 };
+
+pub const FlipError = error{ UnknownFlip, NoFlipArm };
+
+/// The flip proof's lever: `spec` is a registered name, or one without its `MLX_SERVE_DSV41_`, `MLX_SERVE_DSV4_` or
+/// `MLX_SERVE_` prefix, optionally `=value`. Without a value a flag takes its other arm: `0` where its registered
+/// default starts with "on", `1` where it starts with "off"; any other variable needs the value.
+pub fn flipArm(spec: []const u8) FlipError!Flip {
+    @setEvalBranchQuota(400_000);
+    const eq = std.mem.indexOfScalar(u8, spec, '=');
+    const name = spec[0 .. eq orelse spec.len];
+    inline for (comptime std.meta.declarations(vars)) |n| {
+        if (comptime @field(vars, n).kind != .diag) {
+            var hit = std.mem.eql(u8, name, n);
+            inline for (.{ "MLX_SERVE_DSV41_", "MLX_SERVE_DSV4_", "MLX_SERVE_" }) |p| {
+                if (comptime std.mem.startsWith(u8, n, p)) {
+                    if (std.mem.eql(u8, name, n[p.len..])) hit = true;
+                }
+            }
+            if (hit) {
+                const v = @field(vars, n);
+                const z = comptime std.fmt.comptimePrint("{s}", .{n});
+                if (eq) |e| return .{ .name = z, .value = std.heap.page_allocator.dupeSentinel(u8, spec[e + 1 ..], 0) catch @panic("env: out of memory") };
+                if (v.type != .flag) return error.NoFlipArm;
+                if (std.mem.startsWith(u8, v.default, "on")) return .{ .name = z, .value = "0" };
+                if (std.mem.startsWith(u8, v.default, "off")) return .{ .name = z, .value = "1" };
+                return error.NoFlipArm;
+            }
+        }
+    }
+    return error.UnknownFlip;
+}
+
 const c = struct {
     extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
     extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -361,6 +459,7 @@ pub const vars = struct {
     pub const MLX_SERVE_DSV41_WOA_JOIN: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "on (default; =0 two copies): a wide prompt layer joins its spans' wo_a rows from their groups' views (one copy where each span's reshape and the join made two), the same math; read each call" };
     pub const MLX_SERVE_DSV41_PF_HC_V2: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 the five passes): a resident DeepSeek-V4.1 wide prompt layer on a NAX GPU (bf16, the release's hc shapes) runs its hyper-connections in three passes over the stream (the FFN side's expand, norm and mixes; the tail's expand with the next layer's attention-side norm and mixes), 64 rows a threadgroup sharing the mix weights; an f32 reorder held to bounds: the attention side's mixes and split within 1e-5 of float64 in l2 and max (measured 2-6x farther than the five passes, at the 1e-7 level, below the bf16 rounding that follows), every other output within 1.01x of the five passes' float64 l2, the stream the same words; read each call" };
     pub const MLX_SERVE_DSV41_PF_PASS_SIZE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 8192-row chunks and a tail): a resident DeepSeek-V4.1 prompt runs in near-equal passes no wider than the widest pass the load-time memory share bills (`--prefill-chunk` narrows it), not 8192-row chunks and a short tail; each pass runs its MoE over all of its rows in one call, and with every Engram table held a chunk sends no lead pass ahead; no layer pair or tensor split; read at load" };
+    pub const MLX_SERVE_DSV41_PF_PASS_CEIL: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "on (default; =0 the memory-sized width): under PF_PASS_SIZE a DeepSeek-V4.1 prompt pass is no wider than this machine's measured ceiling, a machine constant: on the M5 Ultra with 512 GiB, 39,680 rows (155 spans), the knee measured there at 1M prompt rows on both fp4 formats (wider passes' fresh allocations cost more than their fewer passes save); every other machine keeps the memory-sized width until its knee is measured; --prefill-chunk is never ceiled; a reorder (a different partition into passes); read at load" };
     pub const MLX_SERVE_DSV41_PF_IDX_NAX: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 idx_tile): a DeepSeek-V4.1 wide prompt span's indexer scores run on the matrix units (pf_idx_score: 8 rows a threadgroup over a range of 16-key tiles, the 32 heads' queries in registers), not idx_tile's 8x8 simdgroup matrices; f32 sums in another order; read each call" };
     pub const MLX_SERVE_DSV41_PF_CED_COMP: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "on (default; =0 span by span): under MLX_SERVE_DSV41_PF_CED_HC, a DeepSeek-V4.1 CED prompt pass's compressor at the split layer (ratio 1) projects each span as today, then norms, makes the index keys (a span's groups at a time) and ropes every span's rows in one pass of its ops: the same words in a few launches, not about 50 a span; read each call" };
     pub const MLX_SERVE_DSV41_PF_COMP_PASS: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "on (default; =0 span by span): a DeepSeek-V4.1 wide prompt layer's compressor (under MLX_SERVE_DSV41_PF_COMP_BF16) pools, norms and ropes every span's rows in one pass of its ops instead of span by span, each span's index-key linear still over its own groups: the same words in about 15 launches a layer, not about 1,000" };
@@ -790,6 +889,7 @@ pub const vars = struct {
     pub const MLX_SERVE_TAPE_RECORD: Var = .{ .kind = .fixture, .type = .text, .default = "unset: tapes are compared", .owner = "sdk/testing", .since = "26.11.2", .doc = "dir: proof tapes record this run as <sha256 of the played tape>.tape instead of comparing (re-baseline after an MLX bump)" };
     pub const MLX_SERVE_TEST_ANE_MODEL: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "engines/ane", .since = "unreleased", .doc = "test input read by `realPack`" };
     pub const MLX_SERVE_TEST_DS4_GGUF: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "engines/ds4", .since = "unreleased", .doc = "test input read by `realGguf`" };
+    pub const MLX_SERVE_TEST_FLIP: Var = .{ .kind = .fixture, .type = .text, .default = "unset: every lever at its default", .owner = "sdk/testing", .since = "unreleased", .doc = "the flip proof: a lever (NAME, or NAME=value) every test starts at its other arm (`sdk/testing/world.zig`, `scripts/flip_proof.py`)" };
     pub const MLX_SERVE_TEST_LLAMA_GGUF: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "engines/llama", .since = "unreleased", .doc = "test input read by `realGguf`" };
     pub const MLX_SERVE_TEST_SHARD: Var = .{ .kind = .fixture, .type = .text, .default = "unset: every test", .owner = "build/test_runner.zig", .since = "unreleased", .doc = "k/n: this test process runs every n-th test from k; a `sharded:` test splits its own work the same way" };
     pub const MOE_UBENCH: Var = .{ .kind = .fixture, .type = .flag, .default = "off", .owner = "sdk/blocks/moe", .since = "26.10.2", .doc = "moe gather kernels: microbench (MOE_UBENCH=1)" };

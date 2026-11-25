@@ -9,6 +9,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
+const world = @import("../../../sdk/testing/world.zig");
 const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
@@ -613,7 +614,7 @@ test "dsv41 dec wo_a: the declared launches are the wrapper's, byte for byte" {
     // vector launch at every row count a verify block has (`useNax`).
     const Arm = struct { rows: usize, nax: bool, exact: bool };
     for ([_]Arm{ .{ .rows = 3, .nax = false, .exact = false }, .{ .rows = decode.max_rows, .nax = true, .exact = false }, .{ .rows = decode.max_rows, .nax = false, .exact = true } }) |arm| {
-        if (arm.nax and !device.naxAvailable()) continue;
+        if (arm.nax and !world.nax()) continue;
         const sw = env.override(.MLX_SERVE_DSV41_EXACT, if (arm.exact) "1" else null);
         defer sw.restore();
         const c = try a.create(kit.Case(WoA));
@@ -754,11 +755,11 @@ test "dsv41 wo_a: without MLX_SERVE_DSV41_EXACT a NAX GPU's verify takes the mat
     const sw = env.override(.MLX_SERVE_DSV41_EXACT, null);
     defer sw.restore();
     try testing.expect(!useNax(3));
-    try testing.expectEqual(device.naxAvailable(), useNax(4));
+    try testing.expectEqual(world.nax(), useNax(4));
 }
 
 test "dsv41 dec wo_a: MLX's mxfp8 reads give the FOLD form's bytes on finite codes, vector and matrix units" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     try decode.expectFoldSame(WoA, &decl, .{}, &served);
-    if (device.naxAvailable()) try decode.expectFoldSame(WoA, &decl_nax, .{ .nax = true }, &served_nax);
+    if (world.nax()) try decode.expectFoldSame(WoA, &decl_nax, .{ .nax = true }, &served_nax);
 }
