@@ -1,18 +1,20 @@
 #!/bin/bash
 # test_first_request_compiles.sh — every load of a model warms its Metal kernels with requests of its own, so the
-# prompts someone sends add next to nothing to Metal's shader cache. Nothing kept from an earlier load decides it:
-# a load after another under other switches, flags or pack contents serves its own warm requests and compiles its own
-# kernels before (--warmup-full) or after (default, when idle) it reports ready. The server runs as a copy of the
-# binary under its own bundle id, so its shader cache starts EMPTY, and the cache index (`libraries.list`) is sized
-# around the test's requests. A copy with --no-warmup-eager is the control: there the first prompts compile what the
-# load did not, and the test must see it.
+# first prompts someone sends compile nothing. Nothing kept from an earlier load decides it: a load after another
+# under other switches, flags or pack contents serves its own warm requests and compiles its own kernels before
+# (--warmup-full) or after (default, when idle) it reports ready. The server runs as a copy of the binary under its
+# own bundle id, so its shader cache starts EMPTY. The reading is time: each prompt shape is sent twice, two texts of
+# the same size and no shared prefix, and a kernel compiled inside the first makes it slower than the second (Metal
+# writes its cache index lazily, so the index's growth over a request says when it flushed, not what compiled). A copy
+# with --no-warmup-eager is the control: there the first prompts compile what the load did not, and the test must see
+# it.
 #
 #   ./tests/test_first_request_compiles.sh [port]   # macOS only. BINARY, WARM_TEST_MODEL=<org>/<repo> or <pack dir>
-#   WARM_TEST_DSV41=<pack>        also the DeepSeek-V4.1 cases: load X, then load Y with --warmup-full; Y's requests
-#                                 compile no more than they do on Y's own first load, for X -> Y = DSpark off -> on,
-#                                 NVFP4 -> the MXFP4 view, PF_GU_SEG=0 -> on, --no-mtp -> MTP, and the pack replaced
-#                                 under the same path (WARM_TEST_DSV41_ALT=<another pack>); and a prompt at the load's
-#                                 widest pass compiles next to nothing after --warmup-full
+#   WARM_TEST_DSV41=<pack>        also the DeepSeek-V4.1 cases: load X, then load Y with --warmup-full; Y serves its warm
+#                                 requests and its first requests are no slower than their twins, for X -> Y = DSpark
+#                                 off -> on, NVFP4 -> the MXFP4 view, PF_GU_SEG=0 -> on, --no-mtp -> MTP, and the pack
+#                                 replaced under the same path (WARM_TEST_DSV41_ALT=<another pack>); and a prompt at the
+#                                 load's widest pass is no slower than its twin after --warmup-full
 #   WARM_TEST_DSV41_FLAGS         the DeepSeek server's flags (default --ctx-size 32768)
 #   WARM_TEST_OLD_BINARY=<bin>    also runs the DeepSeek cases on another build and reports which ones it fails
 #   WARM_TEST_HOLD=<dir>          move the test's scratch, copies and shader caches there instead of deleting them
@@ -83,12 +85,12 @@ READY="Model ready (loaded on inference thread)"
 DONE="Warm requests complete"
 line_of() { grep -a -n -m1 -F "$1" "$2" | cut -d: -f1; }
 
-# compiled <binary> <model> <log> <keep|empty> <idle|ready> <short|wide> <env words> [flag ...]: bytes the shader
-# library index gained over the test's requests, the shader cache emptied first or kept as the last boot left it.
-# `idle` waits for the idle warm-up to end before the first prompt; `ready` sends it as soon as /health answers.
-# `short`: a short chat, a short prompt and another question under it, then a long prompt and another question under
-# that (two numbers: short + long). `wide`: one prompt at WIDE_TOKENS (one number).
-compiled() {
+# timed <binary> <model> <log> <keep|empty> <idle|ready> <short|wide> <env words> [flag ...]: the wall seconds of each
+# request of a twin pair, first then second, the shader cache emptied first or kept as the last boot left it. `idle`
+# waits for the idle warm-up to end before the first prompt; `ready` sends it as soon as /health answers. `short`:
+# a short chat pair, then a long prompt pair (four numbers: short 1, short 2, long 1, long 2); `wide`: a pair just under
+# WIDE_TOKENS (three numbers: 1, 2, the prompt's tokens). Each request generates 16 tokens, so decode's kernels run too.
+timed() {
     local bin="$1" model="$2" log="$3" cache="$4" start="$5" kind="$6" envw="$7"; shift 7
     [ "$cache" = empty ] && away "$CACHE"
     away "$SCRATCH/home"; mkdir -p "$SCRATCH/home"
@@ -108,45 +110,46 @@ compiled() {
         for _ in $(seq 1 1200); do grep -a -q -F "$DONE" "$log" && break; sleep 0.5; done
         grep -a -q -F "$DONE" "$log" || { echo -e "${RED}FAIL${NC} the idle warm-up never ended" >&2; tail -5 "$log" >&2; srv_stop "$SRV"; exit 1; }
     fi
-    python3 - "$BASE" "$CACHE" "$kind" "${WIDE_TOKENS:-0}" <<'PY' || { echo -e "${RED}FAIL${NC} a request failed, or the first one found a prompt cached" >&2; srv_stop "$SRV"; exit 1; }
-import glob, json, os, sys, urllib.request
-def index():
-    # Metal's index of what it compiled: libraries.list, or functions.list on newer macOS (beside functions.data).
-    return sum(os.path.getsize(p) for name in ("libraries.list", "functions.list")
-               for p in glob.glob(sys.argv[2] + "/**/" + name, recursive=True))
+    python3 - "$BASE" "$kind" "${WIDE_TOKENS:-0}" <<'PY' || { echo -e "${RED}FAIL${NC} a request failed, or one found a prompt cached" >&2; srv_stop "$SRV"; exit 1; }
+import json, sys, time, urllib.request
 def ask(text, n):
     body = dict(model="x", messages=[{"role": "user", "content": text}], max_tokens=n, temperature=0)
     req = urllib.request.Request(sys.argv[1] + "/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    return json.load(urllib.request.urlopen(req, timeout=1800))["usage"]
-def doc(lines):
-    return " ".join(f"[{i}] The archive records the following entry." for i in range(lines))
-def wide_doc(lines):
-    # Zero-padded line numbers: every line the same tokens, so two short probes size a long prompt.
-    return " ".join(f"[{i:05d}] The archive records the following entry." for i in range(lines))
-if sys.argv[3] == "wide":
-    # The tokens a line, from two short prompts before the reading starts; then one prompt just under the widest pass.
-    a = ask(wide_doc(100) + "\n\nReply with just the word: OK.", 1)["prompt_tokens"]
-    b = ask(wide_doc(300) + "\n\nReply with just the word: OK.", 1)["prompt_tokens"]
-    per = max(1.0, (b - a) / 200)
-    lines = max(1, int(0.98 * (int(sys.argv[4]) - (a - 100 * per)) / per))
-    start = index()
-    u = ask(wide_doc(lines) + "\n\nReply with just the word: OK.", 1)
-    print(index() - start, u.get("prompt_tokens", 0))
+    t0 = time.monotonic()
+    u = json.load(urllib.request.urlopen(req, timeout=1800))["usage"]
+    # Twins share no prefix past the chat template's few tokens: a cache hit would hide the forward the reading times.
+    assert (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0) < 32, u
+    return time.monotonic() - t0, u
+# Two fillers of the same size, each text opened by its own words so no two share a prefix; zero-padded numbers keep
+# every line the same tokens.
+FILL = ("The archive records the following entry.", "A ledger notes one more item here.")
+OPEN = ("Archive copy.", "Ledger copy.", "Sizing probe one.", "Sizing probe two.")
+def doc(lines, k, o=None):
+    return OPEN[k if o is None else o] + " " + " ".join(f"[{i:05d}] {FILL[k]}" for i in range(lines)) + "\n\nReply with just the word: OK."
+if sys.argv[2] == "wide":
+    # The tokens a line from two short probes (before the pair), then the pair at 98% of the target.
+    _, a = ask(doc(100, 0, 2), 1)
+    _, b = ask(doc(300, 0, 3), 1)
+    per = max(1.0, (b["prompt_tokens"] - a["prompt_tokens"]) / 200)
+    lines = max(1, int(0.98 * (int(sys.argv[3]) - (a["prompt_tokens"] - 100 * per)) / per))
+    w1, u = ask(doc(lines, 0), 16)
+    w2, _ = ask(doc(lines, 1), 16)
+    print(f"{w1:.3f} {w2:.3f} {u.get('prompt_tokens', 0)}")
     sys.exit(0)
-start = index()
-first = ask("Write a Python function that reverses a linked list, with comments.", 64)
-# The warm requests left nothing behind in the model's prefix cache.
-assert (first.get("prompt_tokens_details") or {}).get("cached_tokens", 0) == 0, first
-ask(doc(20) + "\n\nReply with just the word: OK.", 8)
-ask(doc(20) + "\n\nIn two sentences, say what the text above consists of.", 64)
-short = index()
-ask(doc(180) + "\n\nReply with just the word: OK.", 8)
-ask(doc(180) + "\n\nIn two sentences, say what the text above consists of.", 64)
-print(short - start, index() - short)
+s1, _ = ask("Write a Python function that reverses a linked list, with comments.", 16)
+s2, _ = ask("Explain in Go how a ring buffer wraps its write index, with a short example.", 16)
+l1, _ = ask(doc(180, 0), 16)
+l2, _ = ask(doc(180, 1), 16)
+print(f"{s1:.3f} {s2:.3f} {l1:.3f} {l2:.3f}")
 PY
     srv_stop "$SRV"; SRV=""
 }
+
+# slower <first> <second>: the first of a twin pair took longer than its twin allows (x1.25 + 0.25 s): it compiled.
+slower() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a > 1.25 * b + 0.25) }'; }
+# penalty <first> <second>: how much longer the first took (s).
+penalty() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.2f", a - b }'; }
 
 FAIL=0
 fail() { echo -e "${RED}FAIL${NC} $1"; FAIL=1; }
@@ -155,16 +158,15 @@ fail() { echo -e "${RED}FAIL${NC} $1"; FAIL=1; }
 if [ -n "$MODEL" ]; then
     echo "  part 1 on $MODEL"
     COPY=$(copy_of "$BINARY" idle); FULL=$(copy_of "$BINARY" full); CONTROL=$(copy_of "$BINARY" control)
-    read -r IDLE_S IDLE_L <<< "$(compiled "$COPY" "$MODEL" "$SCRATCH/idle.log" empty idle short "" $P1_FLAGS)"
-    read -r AGAIN_S AGAIN_L <<< "$(compiled "$COPY" "$MODEL" "$SCRATCH/idle2.log" keep idle short "" $P1_FLAGS)"
-    read -r FULL_S FULL_L <<< "$(compiled "$FULL" "$MODEL" "$SCRATCH/full.log" empty ready short "" --warmup-full $P1_FLAGS)"
-    read -r FULL2_S FULL2_L <<< "$(compiled "$FULL" "$MODEL" "$SCRATCH/full2.log" keep ready short "" --warmup-full $P1_FLAGS)"
-    read -r COLD_S COLD_L <<< "$(compiled "$CONTROL" "$MODEL" "$SCRATCH/cold.log" empty ready short "" --no-warmup-eager $P1_FLAGS)"
-    [ -n "$IDLE_L" ] && [ -n "$AGAIN_L" ] && [ -n "$FULL_L" ] && [ -n "$FULL2_L" ] && [ -n "$COLD_L" ] || { echo -e "${RED}FAIL${NC} an arm gave no reading"; exit 1; }
-    echo "  shader-library index bytes gained, short prompts + long prompts:"
-    echo "    default, after its idle warm-up $IDLE_S + $IDLE_L; its second load $AGAIN_S + $AGAIN_L"
-    echo "    --warmup-full $FULL_S + $FULL_L; its second load $FULL2_S + $FULL2_L; --no-warmup-eager $COLD_S + $COLD_L"
-    # Default: ready first, the warm requests after it. --warmup-full: the warm requests first. Every load serves them.
+    read -r I1 I2 IL1 IL2 <<< "$(timed "$COPY" "$MODEL" "$SCRATCH/idle.log" empty idle short "" $P1_FLAGS)"
+    read -r A1 A2 AL1 AL2 <<< "$(timed "$COPY" "$MODEL" "$SCRATCH/idle2.log" keep idle short "" $P1_FLAGS)"
+    read -r F1 F2 FL1 FL2 <<< "$(timed "$FULL" "$MODEL" "$SCRATCH/full.log" empty ready short "" --warmup-full $P1_FLAGS)"
+    read -r G1 G2 GL1 GL2 <<< "$(timed "$FULL" "$MODEL" "$SCRATCH/full2.log" keep ready short "" --warmup-full $P1_FLAGS)"
+    read -r C1 C2 CL1 CL2 <<< "$(timed "$CONTROL" "$MODEL" "$SCRATCH/cold.log" empty ready short "" --no-warmup-eager $P1_FLAGS)"
+    [ -n "$IL2" ] && [ -n "$AL2" ] && [ -n "$FL2" ] && [ -n "$GL2" ] && [ -n "$CL2" ] || { echo -e "${RED}FAIL${NC} an arm gave no reading"; exit 1; }
+    echo "  twin pairs, wall s (first second), short then long:"
+    echo "    default, after its idle warm-up $I1 $I2 / $IL1 $IL2; its second load $A1 $A2 / $AL1 $AL2"
+    echo "    --warmup-full $F1 $F2 / $FL1 $FL2; its second load $G1 $G2 / $GL1 $GL2; --no-warmup-eager $C1 $C2 / $CL1 $CL2"
     for log in idle idle2; do
         [ "$(line_of "$READY" "$SCRATCH/$log.log")" -lt "$(line_of "$DONE" "$SCRATCH/$log.log")" ] || fail "$log: the default load did not serve its warm requests after it reported ready"
     done
@@ -173,38 +175,36 @@ if [ -n "$MODEL" ]; then
         [ -n "$d" ] && [ "$d" -lt "$(line_of "$READY" "$SCRATCH/$log.log")" ] || fail "$log: --warmup-full reported ready before it had served its warm requests"
     done
     grep -a -q -F "$DONE" "$SCRATCH/cold.log" && fail "cold: --no-warmup-eager served warm requests"
-    # The control proves the reading: without the warm requests these prompts compile shaders, and plenty of them.
-    COLD=$(( COLD_S + COLD_L ))
-    [ "$COLD_S" -ge 500 ] && [ "$COLD" -ge 1000 ] || fail "the control compiled nearly nothing ($COLD_S + $COLD_L bytes): the reading is blind"
-    [ $(( IDLE_S * 3 )) -le "$COLD_S" ] || fail "after the idle warm-up the short prompts compiled $IDLE_S bytes of index, more than a third of the unwarmed $COLD_S"
-    [ $(( AGAIN_S * 3 )) -le "$COLD_S" ] || fail "the default's second load compiled $AGAIN_S bytes of index on the short prompts"
-    [ $(( (FULL_S + FULL_L) * 3 )) -le "$COLD" ] || fail "after --warmup-full the prompts compiled $(( FULL_S + FULL_L )) bytes of index, more than a third of the unwarmed $COLD"
-    [ $(( (FULL2_S + FULL2_L) * 3 )) -le "$COLD" ] || fail "the second load after --warmup-full compiled $(( FULL2_S + FULL2_L )) bytes of index"
+    # The control proves the reading: unwarmed, the first of a pair compiles and takes visibly longer.
+    awk -v a="$C1" -v b="$C2" -v c="$CL1" -v d="$CL2" 'BEGIN { exit !((a - b) + (c - d) >= 0.5) }' || fail "the control's first requests took no longer than their twins ($C1 $C2 / $CL1 $CL2): the reading is blind"
+    # Default: the idle plan is short prompts, so its short pair is held to it; --warmup-full: both pairs.
+    slower "$I1" "$I2" && fail "after the idle warm-up the first short request took $I1 s against its twin's $I2"
+    slower "$A1" "$A2" && fail "the default's second load: the first short request took $A1 s against its twin's $A2"
+    for x in "F1 F2 FL1 FL2:$F1 $F2 $FL1 $FL2" "full2:$G1 $G2 $GL1 $GL2"; do
+        read -r a b c d <<< "${x#*:}"
+        { slower "$a" "$b" || slower "$c" "$d"; } && fail "a --warmup-full load's first requests took longer than their twins ($a $b / $c $d)"
+    done
 fi
 
 # ── part 2: DeepSeek-V4.1, a load after another under other kernel arms; the widest pass ──
-# case_xy <bin> <name> <X env> <X pack> <Y env> <Y pack> [Y flag ...]: R = what Y's requests compile on Y's own
-# first load (an empty cache, then Y's full warm-up); G = what they compile when Y loads after X (X's warm-up and
-# requests first). Y's warm-up compiles Y's kernels whatever X left, so G <= R. A load that skipped its warm-up because
-# of X compiles Y's plan kernels inside its requests: G > R.
+# case_xy <bin> <name> <X env> <X pack> <Y env> <Y pack> [Y flag ...]: load X (--warmup-full, its requests), then Y.
+# Y passes when it served its own warm requests and its first requests are no slower than their twins. A load that
+# skipped its warm-up because of X compiles its own kernels inside its first requests: they are slower.
 DS_FLAGS=${WARM_TEST_DSV41_FLAGS:---ctx-size 32768}
 DS_RESULTS="$SCRATCH/ds-results.txt"
 : > "$DS_RESULTS"
-# PACK_X / PACK_Y: the pack `repoint` puts under one path before X's load and before Y's (Y's reference included).
+# PACK_X / PACK_Y: the pack `repoint` puts under one path before X's load and before Y's.
 case_xy() {
     local bin="$1" name="$2" xenv="$3" xpack="$4" yenv="$5" ypack="$6"; shift 6
-    local yflags="$*" s l r g
-    [ -n "${PACK_Y:-}" ] && repoint "$PACK_Y"
-    read -r s l <<< "$(compiled "$bin" "$ypack" "$SCRATCH/$name-ref.log" empty ready short "$yenv" $DS_FLAGS --warmup-full $yflags)"
-    r=$(( s + l ))
+    local yflags="$*" s1 s2 l1 l2
     [ -n "${PACK_X:-}" ] && repoint "$PACK_X"
-    compiled "$bin" "$xpack" "$SCRATCH/$name-x.log" empty ready short "$xenv" $DS_FLAGS --warmup-full ${XFLAGS:-} >/dev/null
+    timed "$bin" "$xpack" "$SCRATCH/$name-x.log" empty ready short "$xenv" $DS_FLAGS --warmup-full ${XFLAGS:-} >/dev/null
     [ -n "${PACK_Y:-}" ] && repoint "$PACK_Y"
-    read -r s l <<< "$(compiled "$bin" "$ypack" "$SCRATCH/$name-y.log" keep ready short "$yenv" $DS_FLAGS --warmup-full $yflags)"
-    g=$(( s + l ))
+    read -r s1 s2 l1 l2 <<< "$(timed "$bin" "$ypack" "$SCRATCH/$name-y.log" keep ready short "$yenv" $DS_FLAGS --warmup-full $yflags)"
     local served=no; grep -a -q -F "$DONE" "$SCRATCH/$name-y.log" && served=yes
-    local verdict=PASS; { [ "$served" = yes ] && [ "$g" -le "$r" ]; } || verdict=FAIL
-    echo "$name: Y served its warm requests $served; Y's requests compiled $g bytes after X, $r on Y's own first load: $verdict" >> "$DS_RESULTS"
+    local verdict=PASS
+    { [ "$served" = yes ] && [ -n "$l2" ] && ! slower "$s1" "$s2" && ! slower "$l1" "$l2"; } || verdict=FAIL
+    echo "$name: Y served its warm requests $served; Y's twin pairs (s) $s1 $s2 / $l1 $l2, first-request penalty $(penalty "$s1" "$s2") / $(penalty "$l1" "$l2"): $verdict" >> "$DS_RESULTS"
     echo "$verdict"
 }
 
@@ -233,24 +233,22 @@ if [ -n "$DSV41" ]; then
     NEW=$(copy_of "$BINARY" ds41)
     ds_cases "$NEW" new
     NEW_FAILED=("${DS_FAILED[@]+"${DS_FAILED[@]}"}")
-    # The widest pass: after --warmup-full, one prompt just under the load's widest pass compiles next to nothing
-    # against the same prompt on an unwarmed load.
-    # The width the cases' --warmup-full loads named (the same flags and pack).
-    PASS_ROWS=$(grep -a -o "widest pass [0-9]* rows" "$SCRATCH/new-dspark-ref.log" | head -1 | grep -o "[0-9]*")
+    # The widest pass: after --warmup-full a pair just under the load's widest pass (the width its loads named).
+    PASS_ROWS=$(grep -a -o "widest pass [0-9]* rows" "$SCRATCH/new-dspark-y.log" | head -1 | grep -o "[0-9]*")
     [ -n "$PASS_ROWS" ] && [ "$PASS_ROWS" -gt 0 ] || fail "the --warmup-full load named no widest pass"
     WIDE_TOKENS=$(( ${PASS_ROWS:-0} - 600 ))
-    read -r W_WARM W_TOK <<< "$(WIDE_TOKENS=$WIDE_TOKENS compiled "$NEW" "$DSV41" "$SCRATCH/wide.log" empty ready wide "" $DS_FLAGS --warmup-full)"
-    read -r W_COLD _ <<< "$(WIDE_TOKENS=$WIDE_TOKENS compiled "$NEW" "$DSV41" "$SCRATCH/wide-cold.log" empty ready wide "" $DS_FLAGS --no-warmup-eager)"
-    echo "    widest pass $PASS_ROWS rows: a $W_TOK-token prompt compiled $W_WARM bytes after --warmup-full, $W_COLD unwarmed"
-    [ "${W_COLD:-0}" -ge 500 ] || fail "the unwarmed widest prompt compiled nearly nothing ($W_COLD bytes): the reading is blind"
-    [ $(( ${W_WARM:-0} * 3 )) -le "${W_COLD:-0}" ] || fail "after --warmup-full the widest-pass prompt compiled $W_WARM bytes, more than a third of the unwarmed $W_COLD"
-    for f in "${NEW_FAILED[@]+"${NEW_FAILED[@]}"}"; do fail "a DeepSeek-V4.1 load after another compiled its own kernels in its requests: $f"; done
+    read -r W1 W2 WT <<< "$(WIDE_TOKENS=$WIDE_TOKENS timed "$NEW" "$DSV41" "$SCRATCH/wide.log" empty ready wide "" $DS_FLAGS --warmup-full)"
+    read -r WC1 WC2 _ <<< "$(WIDE_TOKENS=$WIDE_TOKENS timed "$NEW" "$DSV41" "$SCRATCH/wide-cold.log" empty ready wide "" $DS_FLAGS --no-warmup-eager)"
+    echo "    widest pass $PASS_ROWS rows, a $WT-token twin pair (s): after --warmup-full $W1 $W2, unwarmed $WC1 $WC2"
+    awk -v a="$WC1" -v b="$WC2" 'BEGIN { exit !(a - b >= 0.5) }' || fail "the unwarmed widest prompt took no longer than its twin ($WC1 $WC2): the reading is blind"
+    slower "${W1:-0}" "${W2:-0}" && fail "after --warmup-full the widest-pass prompt took $W1 s against its twin's $W2"
+    for f in "${NEW_FAILED[@]+"${NEW_FAILED[@]}"}"; do fail "a DeepSeek-V4.1 load after another compiled its own kernels in its first requests: $f"; done
     if [ -n "${WARM_TEST_OLD_BINARY:-}" ]; then
         DS_FAILED=()
         OLD=$(copy_of "$WARM_TEST_OLD_BINARY" old)
         ds_cases "$OLD" old
-        read -r OW _ <<< "$(WIDE_TOKENS=$WIDE_TOKENS compiled "$OLD" "$DSV41" "$SCRATCH/old-wide.log" empty ready wide "" $DS_FLAGS --warmup-full)"
-        echo "    the other build ($WARM_TEST_OLD_BINARY): fails ${DS_FAILED[*]:-none}; its widest-pass prompt compiled $OW bytes after --warmup-full"
+        read -r OW1 OW2 _ <<< "$(WIDE_TOKENS=$WIDE_TOKENS timed "$OLD" "$DSV41" "$SCRATCH/old-wide.log" empty ready wide "" $DS_FLAGS --warmup-full)"
+        echo "    the other build ($WARM_TEST_OLD_BINARY): fails ${DS_FAILED[*]:-none}; its widest-pass pair after --warmup-full $OW1 $OW2"
     fi
     sed 's/^/    /' "$DS_RESULTS"
 fi
