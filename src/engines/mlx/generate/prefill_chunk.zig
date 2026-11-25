@@ -352,6 +352,21 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
     return @max(base, prefill_chunk);
 }
 
+/// `stride` rounded up to a multiple of `chunk`, the width the prefill runs, under `MLX_SERVE_CP_STRIDE_ON_CHUNK=1`
+/// (`on`); off, `stride` as is. The stride coarsens against the launch chunk (`effectiveSsmCheckpointStride`), so a
+/// chunk the score budget narrowed to a width that does not divide it (3584 against 8192) runs a short piece before
+/// every boundary (3584 + 3584 + 1024). Rounded up, every boundary is a chunk end and the spacing only gets coarser.
+/// 0 (no checkpoints) stays 0.
+pub fn chunkAlignedSsmCheckpointStride(stride: usize, chunk: usize, on: bool) usize {
+    if (!on or stride == 0 or chunk == 0) return stride;
+    return (stride + chunk - 1) / chunk * chunk;
+}
+
+/// The switch `chunkAlignedSsmCheckpointStride` reads at its call sites (default off).
+pub fn ssmStrideOnChunk() bool {
+    return env.one(.MLX_SERVE_CP_STRIDE_ON_CHUNK);
+}
+
 /// Tokens of KV capacity this prefill reserves up front (#353). A multi-chunk prompt reserves
 /// itself plus one chunk of slack on every arch, since each chunk-by-chunk grow copies the whole
 /// cache; generation headroom is pre-bought only under `longCtxGated`. A request whose bill reserves it
@@ -1045,6 +1060,23 @@ test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill 
     // An 8K prefill splits only at the (memory-bound) chunk size, never
     // finer: 2 chunks at chunk 4096, not 33.
     try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false, false));
+}
+
+test "chunkAlignedSsmCheckpointStride: off keeps the stride; on, a narrowed chunk ends on every boundary" {
+    // Off (the default): Hy4-flash's 17,492-token prompt (loop end 17,461) at the score budget's 3584 rows against the
+    // 8192 stride runs 3584, 3584, 1024, 3584, 3584, 1024, 1077.
+    try testing.expectEqual(@as(usize, 8192), chunkAlignedSsmCheckpointStride(8192, 3584, false));
+    try testing.expectEqual(@as(usize, 7), prefillChunkCount(17_461, 3584, true, chunkAlignedSsmCheckpointStride(8192, 3584, false), 0, false, false));
+    // On: the next multiple of the chunk (never finer), so 3584 x 4 and 3125.
+    try testing.expectEqual(@as(usize, 10_752), chunkAlignedSsmCheckpointStride(8192, 3584, true));
+    try testing.expectEqual(@as(usize, 5), prefillChunkCount(17_461, 3584, true, chunkAlignedSsmCheckpointStride(8192, 3584, true), 0, false, false));
+    try testing.expectEqual(@as(usize, 3584), nextChunkEnd(0, 17_461, 3584, true, chunkAlignedSsmCheckpointStride(8192, 3584, true), 0, false, false));
+    try testing.expectEqual(@as(usize, 10_752), nextChunkEnd(7168, 17_461, 3584, true, chunkAlignedSsmCheckpointStride(8192, 3584, true), 0, false, false));
+    // A chunk that divides the stride, a stride already a multiple, and no checkpoints are unchanged.
+    try testing.expectEqual(@as(usize, 8192), chunkAlignedSsmCheckpointStride(8192, 4096, true));
+    try testing.expectEqual(@as(usize, 16_384), chunkAlignedSsmCheckpointStride(16_384, 8192, true));
+    try testing.expectEqual(@as(usize, 0), chunkAlignedSsmCheckpointStride(0, 3584, true));
+    try testing.expectEqual(@as(usize, 8192), chunkAlignedSsmCheckpointStride(8192, 0, true));
 }
 
 test "a vision prefill checkpoints SSM state like text" {

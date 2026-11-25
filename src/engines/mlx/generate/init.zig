@@ -28,6 +28,7 @@ const InitOptions = @import("options.zig").InitOptions;
 const MtpCacheRef = @import("../spec/mtp_head_ref.zig").MtpCacheRef;
 const MtpGraphFn = @import("../spec/tree.zig").MtpGraphFn;
 const SamplingParams = @import("../sampling/params.zig").SamplingParams;
+const chunkAlignedSsmCheckpointStride = @import("prefill_chunk.zig").chunkAlignedSsmCheckpointStride;
 const chunkNeedsMtpHistory = @import("prefill_chunk.zig").chunkNeedsMtpHistory;
 const commitAdaptiveWidth = @import("prefill_chunk.zig").commitAdaptiveWidth;
 const countSpliceRows = @import("prefill_chunk.zig").countSpliceRows;
@@ -54,6 +55,7 @@ const sampleTokenLazy = @import("../sampling/lazy.zig").sampleTokenLazy;
 const shouldCheckpointSsmPrefill = @import("prefill_chunk.zig").shouldCheckpointSsmPrefill;
 const ssmCapturePos = @import("prefill_chunk.zig").ssmCapturePos;
 const ssmSnapshotBackoff = @import("prefill_chunk.zig").ssmSnapshotBackoff;
+const ssmStrideOnChunk = @import("prefill_chunk.zig").ssmStrideOnChunk;
 const WholePromptPlan = @import("prefill_chunk.zig").WholePromptPlan;
 const wholePromptPlan = @import("prefill_chunk.zig").wholePromptPlan;
 const PromptCheckpoints = @import("../ssm/checkpoint.zig").PromptCheckpoints;
@@ -257,8 +259,11 @@ pub fn initWithOptions(
     // above must not densify checkpoint spacing (16× more captures at
     // 255K ctx otherwise). nextChunkEnd already shortens a chunk to land
     // on stride boundaries, so a capped chunk stays compatible.
+    // `MLX_SERVE_CP_STRIDE_ON_CHUNK=1` rounds that stride up to a multiple of
+    // the capped chunk, so the cut lands on a chunk end instead of a short
+    // piece before it (chunkAlignedSsmCheckpointStride).
     const ssm_cp_stride: usize = if (want_ssm_cp)
-        effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, generate_mod.prefillCli().override))
+        chunkAlignedSsmCheckpointStride(effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, generate_mod.prefillCli().override)), PREFILL_CHUNK, ssmStrideOnChunk())
     else
         0;
     // Absolute KV position of `prompt_ids[0]`. Warm-path callers (the
