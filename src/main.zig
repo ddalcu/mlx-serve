@@ -330,8 +330,15 @@ fn printUsage(io: std.Io) void {
         \\                        verify-width cliff). A --mtp-min-depth above that default
         \\                        lifts it. --mtp-depth is the old spelling.
         \\                        Each machine finds its own range.
-        \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance (d > 0).
-        \\                        Use 0.2 for the Qwen3.8 matched comparison.
+        \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance in Medusa's
+        \\                        form: a draft is kept iff p > min(e, d * e^-H).
+        \\                        d > 0 (Medusa's posterior_alpha).
+        \\  --mtp-typical-eps <e> The floor's cap e, 0 < e <= 1 (Medusa's
+        \\                        posterior_threshold; 1 = no cap). Either flag
+        \\                        alone turns typical on: e alone takes
+        \\                        d = sqrt(e), d alone takes e = 0.09. Default
+        \\                        pair (model-settings "typical"): e 0.09, d 0.3.
+        \\                        The Qwen3.8 matched comparison: d 0.2, e 1.
         \\  --mtp-tokenv3 <a>  Opt-in lossy TokenV3 cascade (0 <= a <= 1).
         \\                        Alias: --mtp-cascade. Use 0.95 for the
         \\                        Qwen3.8 matched comparison. Exclusive with
@@ -716,6 +723,7 @@ pub fn main(init: std.process.Init) !void {
     var mtp_forced = false;
     var mtp_head_kv_quant = false;
     var mtp_typical_raw: ?[]const u8 = null;
+    var mtp_typical_eps_raw: ?[]const u8 = null;
     var mtp_tokenv3_raw: ?[]const u8 = null;
     var kv_quant_config: KVQuantConfig = KVQuantConfig.dense;
     // Phase 2 (Plan ricky): fused attention reads K/V triples directly via
@@ -988,6 +996,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--mtp-typical") and i + 1 < args.len) {
             i += 1;
             mtp_typical_raw = args[i];
+        } else if (std.mem.eql(u8, args[i], "--mtp-typical-eps") and i + 1 < args.len) {
+            i += 1;
+            mtp_typical_eps_raw = args[i];
         } else if ((std.mem.eql(u8, args[i], "--mtp-tokenv3") or std.mem.eql(u8, args[i], "--mtp-cascade")) and i + 1 < args.len) {
             i += 1;
             mtp_tokenv3_raw = args[i];
@@ -1233,8 +1244,8 @@ pub fn main(init: std.process.Init) !void {
     };
 
     engine_flags.mtp_head_kv_quant = mtp_head_kv_quant;
-    engine_flags.mtp_acceptance = mtp_acceptance.parse(mtp_typical_raw, mtp_tokenv3_raw) catch |err| {
-        log.err("MTP acceptance settings: {s} (--mtp-typical needs d > 0; --mtp-tokenv3 needs 0 <= a <= 1; choose one)\n", .{@errorName(err)});
+    engine_flags.mtp_acceptance = mtp_acceptance.parse(mtp_typical_raw, mtp_typical_eps_raw, mtp_tokenv3_raw) catch |err| {
+        log.err("MTP acceptance settings: {s} (--mtp-typical needs d > 0; --mtp-typical-eps needs 0 < e <= 1; --mtp-tokenv3 needs 0 <= a <= 1; typical or tokenv3, not both)\n", .{@errorName(err)});
         std.process.exit(1);
     };
 

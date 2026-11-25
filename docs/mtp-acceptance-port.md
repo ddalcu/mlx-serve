@@ -5,9 +5,13 @@ sampled-decode modes use the same sampler-filtered target rows and the same
 sampled draft distribution as the existing batched verifier. Neither mode is
 distribution-exact relative to the target model.
 
-* **Typical** (`--mtp-typical 0.2`): for each drafted token `x`, compute the
-  target-row entropy `H(p)` and accept iff `p(x) > min(eps, delta*exp(-H(p)))`,
-  with `eps=1`. This is deterministic and consumes no acceptance uniform. On
+* **Typical** (`--mtp-typical <delta>`, `--mtp-typical-eps <eps>`): for each
+  drafted token `x`, compute the target-row entropy `H(p)` and accept iff
+  `p(x) > min(eps, delta*exp(-H(p)))`. This is Medusa's typical acceptance:
+  `eps` is its posterior_threshold (the floor's cap) and `delta` its
+  posterior_alpha. The default pair is Medusa's, eps 0.09 and delta 0.3; eps
+  alone takes delta = sqrt(eps), delta alone takes eps 0.09, and eps 1 is no
+  cap (the Qwen3.8 matched comparison ran delta 0.2 with eps 1). This is deterministic and consumes no acceptance uniform. On
   the first rejection, sample directly from `p` at that position. The full
   accept bonus samples from the final target row.
 * **TokenV3** (`--mtp-tokenv3 0.95`): let
@@ -75,22 +79,24 @@ Every speculative mode is one of two classes, and a lossy one is never on by def
   draft only where it equals the target's argmax (the same tokens as serial greedy decoding). Sampled requests accept
   draft k with probability min(1, p_k / q_k) and draw the first reject from max(0, p - q): the MTP exact verifier, and
   DSpark's stochastic arm.
-* **Lossy** (opt-in, each logs `NOT distribution-exact`): Typical (`--mtp-typical <delta>`, or a model's
+* **Lossy** (opt-in, each logs `NOT distribution-exact`): Typical (`--mtp-typical <delta>` / `--mtp-typical-eps <eps>`, or a model's
   `mtp_acceptance` setting) and TokenV3 (`--mtp-tokenv3 <alpha>`, MTP only). They apply to sampled requests only;
   greedy requests keep the argmax verifier.
 
 ## DSpark typical acceptance
 
-DeepSeek-V4/V4.1's DSpark stochastic arm reads the same mode. Under `--mtp-typical <delta>` a sampled round keeps
-draft k iff `p(x) > min(1, delta*exp(-H(p)))`, with no acceptance uniform, and draws the first reject from p
+DeepSeek-V4/V4.1's DSpark stochastic arm reads the same mode. Under typical a sampled round keeps draft k iff
+`p(x) > min(eps, delta*exp(-H(p)))`, with no acceptance uniform, and draws the first reject from p
 (`mtpBatchedTypicalGraph`, the MTP head's graph; `dspark.verdictOf`). The server logs
-`[dspark-accept] typical delta=… NOT distribution-exact (copied drafts exact)`.
+`[dspark-accept] typical delta=… eps=… NOT distribution-exact (copied drafts exact)`, and `[spec-stats] dspark typical`
+counts the rounds the rule decided.
 
 Drafts copied from the context (DSpark's copy rounds, as a prompt lookup's) keep the exact rule (`dspark.draftRule`).
 Such a draft is a point mass the model did not propose. Typical acceptance would keep it whenever the target clears
 its floor, so an echo of the context would feed itself and self-echo would become certain. A plugin's native drafter,
 whose round does not say which drafts it copied, keeps the exact rule too. TokenV3 is not applied to DSpark.
 
-A smaller delta lowers the floor and accepts more: delta near 0 keeps any draft with mass, the lossy end. A delta
-large enough that the floor reaches 1 keeps nothing, so every token is a draw from p (serial sampling's distribution,
+A smaller delta or eps lowers the floor and accepts more: near 0 it keeps any draft with mass, the lossy end. The cap
+eps bounds the floor on confident rows (low entropy), where delta * e^-H is near delta. With eps 1 and a delta large
+enough that the floor reaches 1, nothing is kept, so every token is a draw from p (serial sampling's distribution,
 with no speedup).

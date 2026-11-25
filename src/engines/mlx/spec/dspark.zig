@@ -58,16 +58,18 @@ pub fn dsparkArmFor(sampling: SamplingParams, logprobs_n: u32) DsparkArm {
 
 /// A sampled round's accept rule. `exact` (the default, lossless): draft k kept with probability min(1, p_k / q_k), the
 /// output distribution serial sampling's. `typical` (opt-in, LOSSY: the request's `mtp_acceptance`, `--mtp-typical
-/// <delta>`): draft k kept iff p_k > min(1, delta * e^-H(p)), deterministic, the first reject resampled from p
-/// (`mtpBatchedTypicalGraph`, the MTP head's graph). Greedy requests never reach either (argmax equality).
-pub const Rule = union(enum) { exact, typical: f32 };
+/// <delta>` / `--mtp-typical-eps <eps>`): draft k kept iff p_k > min(eps, delta * e^-H(p)), Medusa's form, deterministic,
+/// the first reject resampled from p (`mtpBatchedTypicalGraph`, the MTP head's graph). Greedy requests never reach
+/// either (argmax equality).
+pub const Rule = union(enum) { exact, typical: mtp_acceptance.Typical };
 
-/// The one owner of a sampled round's rule: typical only where the request asked for it (`delta` > 0) and the drafts
+/// The one owner of a sampled round's rule: typical only where the request asked for it (`typical` set) and the drafts
 /// are the model's own proposals. A draft copied from the context (DSpark's copy round, as a prompt lookup's) is a point
 /// mass the model did not propose: typical acceptance keeps it whenever the target clears its floor, so an echo of the
 /// context would feed itself; it keeps the exact rule.
-pub fn draftRule(delta: f32, context_draft: bool) Rule {
-    return if (delta > 0 and !context_draft) .{ .typical = delta } else .exact;
+pub fn draftRule(typical: ?mtp_acceptance.Typical, context_draft: bool) Rule {
+    if (context_draft) return .exact;
+    return if (typical) |t| .{ .typical = t } else .exact;
 }
 
 /// The planted bug of the typical verdict's test: the floor's comparison inverted.
@@ -449,7 +451,7 @@ fn draftSampled(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv41_mod.
 /// draft k kept with probability min(1, p_k / q_k), q the drafts' proposal rows ([drafts, V], drawn from them) or a
 /// point mass on each draft (null: an argmax or copy draft); the token after the kept prefix is the residual sample
 /// max(0, p - q) at the first reject, or the bonus row's draw on a full accept. Under `rule` `.typical` draft k is kept
-/// iff p_k clears min(1, delta * e^-H(p_k's row)), no uniform drawn, and the first reject is a draw from p itself.
+/// iff p_k clears min(eps, delta * e^-H(p_k's row)), no uniform drawn, and the first reject is a draw from p itself.
 pub fn verdictOf(probs_all: mlx.mlx_array, verify: []const u32, q: ?mlx.mlx_array, accepted_cap: u32, sp: SamplingParams, rnd: std.Random, s: mlx.mlx_stream, rule: Rule) !Verdict {
     const b: u32 = @intCast(verify.len - 1);
     var accepted: u32 = 0;
@@ -501,8 +503,8 @@ pub fn verdictOf(probs_all: mlx.mlx_array, verify: []const u32, q: ?mlx.mlx_arra
         const q_in: ?[]const mlx.mlx_array = if (q != null) q_rows[0..b] else null;
         var bg = switch (rule) {
             .exact => try mtpBatchedAcceptGraph(probs_all, draft_arrs[0..b], q_in, b, sp, s),
-            // accept_p = p(draft), accept_q = the row's floor min(1, delta * e^-H); the corrections draw from p.
-            .typical => |delta| try mtpBatchedTypicalGraph(probs_all, draft_arrs[0..b], q_in, b, delta, sp, s),
+            // accept_p = p(draft), accept_q = the row's floor min(eps, delta * e^-H); the corrections draw from p.
+            .typical => |t| try mtpBatchedTypicalGraph(probs_all, draft_arrs[0..b], q_in, b, mtp_acceptance.param(.{ .typical = t }), sp, s),
         };
         defer bg.deinit();
 
@@ -1166,13 +1168,14 @@ test "dspark sampled verdict (GPU): a draft vocabulary's q (0 past it, renormali
 }
 
 test "draftRule: typical only where the request asked for it and the drafts are the model's; a copied draft stays exact" {
-    try testing.expectEqual(Rule.exact, draftRule(0, false));
-    try testing.expectEqual(Rule.exact, draftRule(0, true));
-    try testing.expectEqual(Rule{ .typical = 0.2 }, draftRule(0.2, false));
-    try testing.expectEqual(Rule.exact, draftRule(0.2, true));
+    const t: mtp_acceptance.Typical = .{ .delta = 0.3, .eps = 0.09 };
+    try testing.expectEqual(Rule.exact, draftRule(null, false));
+    try testing.expectEqual(Rule.exact, draftRule(null, true));
+    try testing.expectEqual(Rule{ .typical = t }, draftRule(t, false));
+    try testing.expectEqual(Rule.exact, draftRule(t, true));
 }
 
-test "dspark typical verdict (GPU): p(draft) against min(1, delta * e^-H) decides with no uniform, the reject draws from p; a floor of 1 keeps nothing (serial sampling), a floor near 0 keeps any draft; an inverted floor fails" {
+test "dspark typical verdict (GPU): p(draft) against min(eps, delta * e^-H) at eps 1 decides with no uniform, the reject draws from p; a floor of 1 keeps nothing (serial sampling), a floor near 0 keeps any draft; an inverted floor fails" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const V = 4;
@@ -1196,7 +1199,7 @@ test "dspark typical verdict (GPU): p(draft) against min(1, delta * e^-H) decide
     var drawn: [cases.len][V]u64 = @splat(@as([V]u64, @splat(0)));
     var prng = std.Random.DefaultPrng.init(0x7E51);
     for (cases, 0..) |c, ci| for (0..N) |trial| {
-        const v = try verdictOf(probs, &.{ 0, c.x }, null, 1, .{ .temperature = 1, .seed = 1234 + trial }, prng.random(), s, .{ .typical = c.delta });
+        const v = try verdictOf(probs, &.{ 0, c.x }, null, 1, .{ .temperature = 1, .seed = 1234 + trial }, prng.random(), s, .{ .typical = .{ .delta = c.delta, .eps = 1.0 } });
         if (v.accepted == 1) kept[ci] += 1 else drawn[ci][v.next_token] += 1;
     };
     std.debug.print("[dspark typical] kept of {d}: p 0.7 at delta 0.2 {d}, p 0.05 at 0.2 {d}, p 0.7 at a floor of 1 {d}, p 0.05 at a floor near 0 {d}\n", .{ N, kept[0], kept[1], kept[2], kept[3] });
@@ -1215,7 +1218,7 @@ test "dspark typical verdict (GPU): p(draft) against min(1, delta * e^-H) decide
     defer typical_plant = false;
     var planted: [2]u64 = .{ 0, 0 };
     for (0..2) |ci| for (0..N) |trial| {
-        const v = try verdictOf(probs, &.{ 0, cases[ci].x }, null, 1, .{ .temperature = 1, .seed = 1234 + trial }, prng.random(), s, .{ .typical = 0.2 });
+        const v = try verdictOf(probs, &.{ 0, cases[ci].x }, null, 1, .{ .temperature = 1, .seed = 1234 + trial }, prng.random(), s, .{ .typical = .{ .delta = 0.2, .eps = 1.0 } });
         planted[ci] += v.accepted;
     };
     try testing.expect(planted[0] != N or planted[1] != 0);

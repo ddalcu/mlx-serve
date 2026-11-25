@@ -739,7 +739,7 @@ test "a sampled chain whose coarse head retires mid-chain verifies: the argmax f
         _ = mlx.mlx_array_free(fallback.q);
     }
     for ([_]Generator.MtpGraphFn{ Generator.mtpBatchedExactGraph, Generator.mtpBatchedTypicalGraph }) |graph| {
-        var g = try graph(probs, &.{ d0, fallback.id }, &.{ q0, fallback.q }, 2, 0.2, .{}, s);
+        var g = try graph(probs, &.{ d0, fallback.id }, &.{ q0, fallback.q }, 2, .{ .value = 0.2 }, .{}, s);
         defer g.deinit();
         try mlx.check(mlx.mlx_array_eval(g.accept_p));
         const p = mlx.mlx_array_data_float32(g.accept_p) orelse return error.InvalidDtype;
