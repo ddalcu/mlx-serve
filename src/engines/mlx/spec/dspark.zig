@@ -207,7 +207,7 @@ pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4
     const st = &mdl.dec_state.?;
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
     const round = if (self.dspark_stochastic)
-        try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &copy, null)
+        try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &copy, null, .context)
     else
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &copy, cap);
     self.dspark_copies += 1;
@@ -226,7 +226,7 @@ pub fn dsparkStep(self: *Generator, allocator: std.mem.Allocator, comptime mod: 
         self.max_tokens,
     );
     const round = if (self.dspark_stochastic)
-        try self.dsparkStochasticRound(allocator, mod, mdl, t1, accepted_cap, null, null)
+        try self.dsparkStochasticRound(allocator, mod, mdl, t1, accepted_cap, null, null, .model)
     else
         try mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1, accepted_cap);
     return self.commitDsparkRound(allocator, round, mdl.dec_state.?.n);
@@ -307,7 +307,7 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     d.len = @min(d.len, dsv41_mod.maxVerifyDrafts(mdl));
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
     const round = if (self.dspark_stochastic)
-        try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &d, if (q.ctx != null) q else null)
+        try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &d, if (q.ctx != null) q else null, .model)
     else
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &d, cap);
     self.dspark_stats.record(@intCast(d.len), round.accepted);
@@ -377,6 +377,9 @@ pub fn nextDraw(self: *Generator) SamplingParams {
     return sp;
 }
 
+/// Where a sampled round's drafts came from: the model's stages (`model`), or the context (`context`, a copy round).
+pub const DraftSource = enum { model, context };
+
 /// One stochastic DSpark round: dsv4's own greedy stage draft (a one-hot
 /// proposal) verified with the MTP acceptance machinery — filtered target
 /// probs at EVERY verify position (`probsAllPositions`, the request's own
@@ -388,11 +391,13 @@ pub fn nextDraw(self: *Generator) SamplingParams {
 /// (the toy-vocab exactness test's invariant), and the correction always
 /// derives from the ORIGINAL verify logits at the acceptance point — the
 /// house partial-accept invariant in sampled form.
-/// `copy`, when set, is the draft instead of the stages' (a one-hot proposal too).
-pub fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, comptime mod: type, mdl: anytype, t1: u32, accepted_cap: u32, copy: ?*const mod.DsparkDraft, q: ?mlx.mlx_array) !mod.DsparkRound {
+/// `copy`, when set, is the draft instead of the stages' (a one-hot proposal too): the policy step's own stage draft, or
+/// the copy step's draft from the context. `source` says which, for the accept rule (`draftRule`): a draft the caller
+/// passes is not by itself a copy.
+pub fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, comptime mod: type, mdl: anytype, t1: u32, accepted_cap: u32, copy: ?*const mod.DsparkDraft, q: ?mlx.mlx_array, source: DraftSource) !mod.DsparkRound {
     var pending = if (copy) |d| try mod.dsparkBeginWith(mdl, allocator, &mdl.dec_state.?, t1, d) else try mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
     defer pending.deinit();
-    const verdict = try stochasticVerdict(self, pending.vl_g, pending.verify[0 .. pending.b + 1], mdl.vocab, accepted_cap, q, draftRule(self.dspark_typical, copy != null));
+    const verdict = try stochasticVerdict(self, pending.vl_g, pending.verify[0 .. pending.b + 1], mdl.vocab, accepted_cap, q, draftRule(self.dspark_typical, source == .context));
     pending.lapVerify(mdl);
 
     const round = try mod.dsparkFinish(mdl, allocator, &mdl.dec_state.?, &pending, verdict.accepted, verdict.next_token);
@@ -408,6 +413,8 @@ pub const Verdict = struct { accepted: u32, next_token: u32 };
 /// density. With MLX_SERVE_KEYED_SAMPLING a keyed request takes the serial verdict instead.
 pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const u32, vocab: usize, accepted_cap: u32, q: ?mlx.mlx_array, rule: Rule) !Verdict {
     if (env.on(.MLX_SERVE_KEYED_SAMPLING) and keyedSerial(self.sampling)) return serialVerdict(self, vl_g, verify, vocab, accepted_cap);
+    // The rounds the typical rule decided (`[spec-stats] dspark typical`): the proof it engaged, not only its setting.
+    if (rule == .typical) self.dspark_typical_rounds += 1;
     const s = self.xfm.s;
 
     // Filtered target probs over every verify row: [b+1, V] → [1, b+1, V].

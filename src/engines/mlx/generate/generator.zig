@@ -166,6 +166,8 @@ pub const Generator = struct {
     /// The stochastic arm's typical delta (`dspark.Rule.typical`, LOSSY; the request's `mtp_acceptance`), 0 for the exact
     /// rule. Copied drafts keep the exact rule whatever it is (`dspark.draftRule`).
     dspark_typical: f32 = 0,
+    /// Sampled rounds the typical rule decided (`dspark.stochasticVerdict`), for `[spec-stats] dspark typical`.
+    dspark_typical_rounds: u64 = 0,
     dspark_attempted: u64 = 0,
     dspark_accepted_tokens: u64 = 0,
     /// Rounds whose drafts were copied from the context (`dsparkCopyStep`), included in `dspark_attempted`.
