@@ -52,7 +52,8 @@ pub const Row = struct {
 pub const prefix = "MLX_SERVE_DSV41_";
 
 /// The DSpark typical rule a sampled request takes under `precision=lossy` when nothing else sets its acceptance:
-/// Medusa's form, a draft kept iff p > min(eps, delta e^-H) (the 16K standard cells: +13.2% decode against exact).
+/// Medusa's form, a draft kept iff p > min(eps, delta e^-H) (the 16K standard cells: +13.2% decode against exact;
+/// HumanEval+ 160/164 base and 152/164 plus against exact's 161/164 and 155/164, at 108.26 against 96.72 tok/s).
 pub const lossy_typical: acceptance.Typical = .{ .delta = 0.2, .eps = 0.04 };
 
 /// The typical pair a DeepSeek-V4.1 sampled request takes by default: `lossy_typical` under `precision=lossy`, else
