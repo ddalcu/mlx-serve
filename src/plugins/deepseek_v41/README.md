@@ -426,7 +426,7 @@ Engine variables on the DeepSeek path: `MLX_SERVE_DSV4_DSPARK` (REORDER, by reas
 
 ## Switches that stay opt-in
 
-Three switches stay off by default (`EXACT`, `FLASH_PSUM`, `MXFP4_VIEW`), and three value switches set
+Four switches stay off by default (`EXACT`, `FLASH_PSUM`, `MXFP4_VIEW`, `PF_INT8`), and three value switches set
 memory and kernel choices. `MLX_SERVE_DSV41_EXACT=1` now also serves NAX; `MLX_SERVE_DSV41_EXACT_VERIFY`, which only
 earlier heads of PR 1256 had, is gone.
 
@@ -444,6 +444,11 @@ Each of these is off by default. Names omit `MLX_SERVE_DSV41_` except where show
   release build the greedy A/B decides: the view is -1.70% prefill and -0.33% decode there, and its use is the
   16.8 GB of peak it saves (452.3 to 435.5 GB). With the card's settings, for the record: -1.62% prefill, +3.85%
   decode.
+- `PF_INT8=3|4` (LOSSY) runs a wide prompt pass's trunk projections on w8a8's rotated int8 GEMM (one scale a row on
+  each side). Level 3 takes `wq_b` and `wo_b`. Level 4 also takes the shared expert and the fused `wq_a`+`wkv`. The
+  int8 weights are made at load for the 20 wide layers and billed (1.68 GB at level 3, 2.57 GB at level 4). On the
+  16K standard test, level 4 is +11.48% prefill (5,591.8 to 6,233.9 tok/s) with the same decode. Its 16K continuation
+  KLD against the exact path is 0.00834, and the `FLASH_ATTN=0` path's is 0.00829 (a difference of z +0.12).
 
 Three value switches set memory and kernel choices. `ENGRAM_LRU_MB` (256) sets memory only. `ENGRAM_RESIDENT` (`auto`)
 and `WEIGHT_PATH` (`auto`) can turn off the resident fusions. The `ssd` path turns off `FUSE_DOWN_SCALE` and `FUSE_MXFP8_QMM`. Tables not
