@@ -42,6 +42,9 @@ print("Continue the story in exactly 4 sentences.\n\nBackground:\n" + para * 50)
 PY
 )"
 
+# A thinking model's reply is its reasoning plus its content: both are the decode under test.
+REPLY_TEXT='(.choices[0].message.reasoning_content // "") + (.choices[0].message.content // "")'
+
 req_one() {
     curl -sf --max-time 60 -X POST "$BASE/v1/chat/completions" \
         -H 'Content-Type: application/json' \
@@ -51,7 +54,7 @@ req_one() {
 echo "--- cold ---"
 COLD_RESP=$(req_one)
 [ -n "$COLD_RESP" ] || { echo "fail: cold request returned nothing"; tail -20 "$LOG"; exit 1; }
-COLD_TEXT=$(echo "$COLD_RESP" | jq -r '.choices[0].message.content')
+COLD_TEXT=$(echo "$COLD_RESP" | jq -r "$REPLY_TEXT")
 COLD_MS=$(echo "$COLD_RESP" | jq -r '.timings.prompt_ms')
 COLD_CACHED=$(echo "$COLD_RESP" | jq -r '.timings.cached_n')
 echo "  prompt_ms=$COLD_MS cached_n=$COLD_CACHED"
@@ -59,14 +62,14 @@ echo "  text=$(echo "$COLD_TEXT" | head -c 100)..."
 
 echo "--- warm (identical prompt) ---"
 WARM_RESP=$(req_one)
-WARM_TEXT=$(echo "$WARM_RESP" | jq -r '.choices[0].message.content')
+WARM_TEXT=$(echo "$WARM_RESP" | jq -r "$REPLY_TEXT")
 WARM_MS=$(echo "$WARM_RESP" | jq -r '.timings.prompt_ms')
 WARM_CACHED=$(echo "$WARM_RESP" | jq -r '.timings.cached_n')
 echo "  prompt_ms=$WARM_MS cached_n=$WARM_CACHED"
 echo "  text=$(echo "$WARM_TEXT" | head -c 100)..."
 
 EC=0
-if [ "$COLD_TEXT" != "$WARM_TEXT" ]; then
+if [ -z "$COLD_TEXT" ] || [ "$COLD_TEXT" != "$WARM_TEXT" ]; then
     echo "❌ FAIL: warm output diverged from cold"
     diff <(printf "%s" "$COLD_TEXT") <(printf "%s" "$WARM_TEXT") | head -20
     EC=1
@@ -76,8 +79,8 @@ fi
 
 echo "--- seeded temperature=1, cold then warm ---"
 PROMPT="Seeded. $PROMPT"
-SEED_COLD=$(req_one 1 | jq -r '.choices[0].message.content')
-SEED_WARM=$(req_one 1 | jq -r '.choices[0].message.content')
+SEED_COLD=$(req_one 1 | jq -r "$REPLY_TEXT")
+SEED_WARM=$(req_one 1 | jq -r "$REPLY_TEXT")
 if [ -z "$SEED_COLD" ] || [ "$SEED_COLD" != "$SEED_WARM" ]; then
     echo "❌ FAIL: seeded warm output diverged from cold"
     diff <(printf "%s" "$SEED_COLD") <(printf "%s" "$SEED_WARM") | head -20

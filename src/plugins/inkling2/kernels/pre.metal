@@ -1,7 +1,7 @@
 // Inkling 2: a visit's stream to its attention inputs for S rows. grid (D, S), threadgroup (TG, 1), TG a multiple of
 // 32 that divides D: one thread per stream element of a row. A sum over a row's stream is redone by each of its
-// threadgroups: each thread takes the elements TG apart, simd_sum folds a SIMD group and RED folds the groups, so no
-// thread loops long.
+// threadgroups: each thread takes the elements TG apart, simd_sum folds a SIMD group, and thread r folds sum r over
+// the groups once (in group order) for the rest to read, so no thread folds every sum.
 // HIN [1, S, D] is the stream; BLK [1, S, NB, D] f32 the open depth blocks; QY [D, Q] f32 the layer's depth queries
 // (Q 0 = the input is the stream itself); NW0..NW2 [D] the J input norms' weights. Input j of a row is the softmax
 // of query min(j, Q - 1) over the row's blocks and its stream's unweighted norm, mixing them.
@@ -27,6 +27,8 @@ constexpr uint R2 = QC + MSG * 4;
 constexpr uint MB = 1 + Q * NS;
 threadgroup float red1[NSG * R1];
 threadgroup float red2[NSG * R2];
+threadgroup float fold1[R1];
+threadgroup float fold2[R2];
 float acc[R1];
 for (uint r = 0; r < R1; r++) acc[r] = 0.0f;
 for (uint i = t; i < D; i += TG) {
@@ -48,11 +50,13 @@ for (uint r = 0; r < R1; r++) {
     if (lane == 0) red1[sg * R1 + r] = acc[r];
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
-for (uint r = 0; r < R1; r++) {
+for (uint r = t; r < R1; r += TG) {
     float s = 0.0f;
     for (uint g = 0; g < NSG; g++) s += red1[g * R1 + r];
-    acc[r] = s;
+    fold1[r] = s;
 }
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (uint r = 0; r < R1; r++) acc[r] = fold1[r];
 const float hs = metal::precise::rsqrt(acc[0] / float(D) + 1e-6f);
 // Each query's softmax over its sources, the live one last.
 float w[QC * NS];
@@ -99,11 +103,13 @@ for (uint r = 0; r < R2; r++) {
     if (lane == 0) red2[sg * R2 + r] = ss[r];
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
-for (uint r = 0; r < R2; r++) {
+for (uint r = t; r < R2; r += TG) {
     float s = 0.0f;
     for (uint g = 0; g < NSG; g++) s += red2[g * R2 + r];
-    ss[r] = s / float(D);
+    fold2[r] = s;
 }
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (uint r = 0; r < R2; r++) ss[r] = fold2[r] / float(D);
 NORMED[ro + e] = float(HIN[ro + e]) * hs;
 if (MSG) {
     for (uint j = 0; j < 3; j++) {

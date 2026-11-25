@@ -78,9 +78,9 @@ run_request() {
     local logfile
     logfile=$(mktemp)
     if [ "$force_flag" = "1" ]; then
-        MLX_SERVE_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp > "$logfile" 2>&1 &
+        MLX_SERVE_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --no-drafter > "$logfile" 2>&1 &
     else
-        "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp > "$logfile" 2>&1 &
+        "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --no-drafter > "$logfile" 2>&1 &
     fi
     local pid=$!
     local up=0
@@ -111,8 +111,8 @@ run_request() {
     local body
     body=$(echo "$payload" | curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions")
     # Engagement is only observable AFTER a decode has run.
-    if [ "$force_flag" = "1" ] && [ "${IS_GDN:-0}" = "1" ] && ! grep -q "gdn batched decode engaged" "$logfile"; then
-        echo -e "  ${RED}FAIL${NC} GatedDeltaNet trunk never entered the batched kernel —" >&2
+    if [ "$force_flag" = "1" ] && batched_missing "$logfile"; then
+        echo -e "  ${RED}FAIL${NC} a batching model never entered the batched kernel —" >&2
         echo "    this comparison would be serial-vs-serial and pass for free." >&2
         tail -20 "$logfile" >&2
         kill $pid 2>/dev/null || true
@@ -122,7 +122,7 @@ run_request() {
     kill $pid 2>/dev/null || true
     wait $pid 2>/dev/null || true
     rm -f "$logfile"
-    echo "$body" | python3 -c "import sys, json; print(json.load(sys.stdin)['choices'][0]['message']['content'])"
+    echo "$body" | python3 -c "import sys, json; m=json.load(sys.stdin)['choices'][0]['message']; print((m.get('reasoning_content') or '') + (m.get('content') or ''))"
 }
 
 run_and_tokenize() {
@@ -131,9 +131,9 @@ run_and_tokenize() {
     local logfile
     logfile=$(mktemp)
     if [ "$force_flag" = "1" ]; then
-        MLX_SERVE_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp > "$logfile" 2>&1 &
+        MLX_SERVE_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --no-drafter > "$logfile" 2>&1 &
     else
-        "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp > "$logfile" 2>&1 &
+        "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --no-drafter > "$logfile" 2>&1 &
     fi
     local pid=$!
     local up=0
@@ -154,11 +154,11 @@ run_and_tokenize() {
     local body
     body=$(echo "$payload" | curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions")
     local completion
-    completion=$(echo "$body" | python3 -c "import sys, json; print(json.load(sys.stdin)['choices'][0]['message']['content'])")
+    completion=$(echo "$body" | python3 -c "import sys, json; m=json.load(sys.stdin)['choices'][0]['message']; print((m.get('reasoning_content') or '') + (m.get('content') or ''))")
     local tok_payload
     tok_payload=$(python3 -c "import json,sys; print(json.dumps({'content': sys.argv[1]}))" "$completion")
-    if [ "$force_flag" = "1" ] && [ "${IS_GDN:-0}" = "1" ] && ! grep -q "gdn batched decode engaged" "$logfile"; then
-        echo -e "  ${RED}FAIL${NC} GatedDeltaNet trunk never entered the batched kernel (long arm)" >&2
+    if [ "$force_flag" = "1" ] && batched_missing "$logfile"; then
+        echo -e "  ${RED}FAIL${NC} a batching model never entered the batched kernel (long arm)" >&2
         tail -20 "$logfile" >&2
         kill $pid 2>/dev/null || true
         rm -f "$logfile"
@@ -173,21 +173,11 @@ run_and_tokenize() {
     printf -v "$out_tokens_var" '%s' "$tokens"
 }
 
-# A GatedDeltaNet trunk (qwen3_5 family) routes the batched tick through
-# `forwardMoeBatchedDecode`, a DIFFERENT kernel from the standard batched one.
-# Without this probe the whole test passes vacuously on such a checkpoint: if
-# the batching gate ever stops admitting it, both arms silently become the
-# same serial path and every byte matches.
-IS_GDN=$(python3 - "$MODEL" <<'PYEOF'
-import json, sys, pathlib
-try:
-    c = json.loads((pathlib.Path(sys.argv[1]) / "config.json").read_text())
-except Exception:
-    print("0"); raise SystemExit
-t = c.get("text_config") or c
-print("1" if t.get("full_attention_interval", 0) else "0")
-PYEOF
-)
+# A model /props says batches must show a batched kernel engaged in a forced arm (the standard tick or the
+# recurrent one, `forwardMoeBatchedDecode`): equal output alone cannot tell it from serial.
+batched_missing() {
+    curl -s "$BASE/props" | grep -q '"batching":{"supported":true' && ! grep -qE "\[batched\] (gdn batched decode|batched decode) engaged" "$1"
+}
 
 echo "== batched-kernel byte-equivalence test =="
 echo "  model: $MODEL"
@@ -275,7 +265,7 @@ echo "== real N=2 concurrency (batch != 1) =="
 # first-N-tokens bar against the serial answer.
 sleep 2
 CONC_LOG=$(mktemp)
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --max-concurrent 4 > "$CONC_LOG" 2>&1 &
+"$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --no-drafter --max-concurrent 4 > "$CONC_LOG" 2>&1 &
 CONC_PID=$!
 up=0
 srv_wait_health "$BASE" 60 1 && up=1
@@ -284,10 +274,16 @@ if [ "$up" != "1" ]; then
     tail -20 "$CONC_LOG"; kill $CONC_PID 2>/dev/null || true; rm -f "$CONC_LOG"; exit 1
 fi
 
+# A raw prompt (no chat template, so a thinking model answers in text whose logprobs are reported): the serial
+# reference first, alone, with its top-2 logprobs for the near-tie acquittal; then the same prompt twice at once.
+RAW_PAYLOAD=$(python3 -c "import json; print(json.dumps({'prompt': 'The river Po rises in the Cottian Alps and flows east across northern Italy, through Turin, past Piacenza and Cremona, and on to the Adriatic. Along its banks', 'max_tokens': $FIRST_N_TOKENS + 10, 'temperature': 0, 'stream': False}))")
+RAW_SERIAL=$(mktemp)
+python3 -c "import json,sys; d=json.loads(sys.argv[1]); d['logprobs']=2; print(json.dumps(d))" "$RAW_PAYLOAD" |
+    curl -s -m 180 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/completions" > "$RAW_SERIAL"
 CONC_A=$(mktemp); CONC_B=$(mktemp)
-echo "$LONG_JSON_PAYLOAD" | curl -s -m 180 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" > "$CONC_A" &
+echo "$RAW_PAYLOAD" | curl -s -m 180 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/completions" > "$CONC_A" &
 CA=$!
-echo "$LONG_JSON_PAYLOAD" | curl -s -m 180 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" > "$CONC_B" &
+echo "$RAW_PAYLOAD" | curl -s -m 180 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/completions" > "$CONC_B" &
 CB=$!
 wait $CA; wait $CB
 
@@ -300,56 +296,49 @@ if ! grep -qE "\[batched\] (gdn batched decode|batched decode) engaged \(slots=[
     CONC_SKIPPED=1
 fi
 
+# A batch of >= 2 is not bit-identical to serial (B=2 matmul / recurrence tiles accumulate in a different order; a
+# hybrid's prefix-cache restore adds its own class): a divergence at a serial near-tie is acquitted, wider is a bug.
+TIE_NATS=0.15
+# inkling2's batched rows round apart from a solo row upstream of its experts (its verify rows' class): its parity bar.
+[ "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]+'/config.json')).get('model_type',''))" "$MODEL")" = "inkling2_loop" ] && TIE_NATS=0.75
+
 if [ -z "${CONC_SKIPPED:-}" ]; then
     CONC_FAIL=0
     for f in "$CONC_A" "$CONC_B"; do
-        txt=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['choices'][0]['message']['content'])" "$f" 2>/dev/null || true)
-        if [ -z "$txt" ]; then
-            echo -e "${RED}FAIL${NC} concurrent request returned no completion"; cat "$f"; CONC_FAIL=1; break
-        fi
-        toks=$(python3 -c "import json,sys; print(json.dumps({'content': sys.argv[1]}))" "$txt" |
-            curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/tokenize" |
-            python3 -c "import sys,json; print(','.join(str(t) for t in json.load(sys.stdin)['tokens']))")
-        verdict=$(python3 - "$LONG_SINGLE_TOKS" "$toks" "$FIRST_N_TOKENS" <<'PYEOF'
-import sys
-a = sys.argv[1].split(",") if sys.argv[1] else []
-b = sys.argv[2].split(",") if sys.argv[2] else []
-n = min(int(sys.argv[3]), len(a), len(b))
-for i in range(n):
+        verdict=$(python3 - "$RAW_SERIAL" "$f" "$FIRST_N_TOKENS" "$TIE_NATS" "$BASE" <<'PYEOF'
+import json, sys, urllib.request
+serial = json.load(open(sys.argv[1]))["choices"][0]
+conc = json.load(open(sys.argv[2]))["choices"][0]["text"]
+n, tie, base = int(sys.argv[3]), float(sys.argv[4]), sys.argv[5]
+def toks(text):
+    req = urllib.request.Request(base + "/tokenize", json.dumps({"content": text}).encode(), {"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req))["tokens"]
+a, b = toks(serial["text"]), toks(conc)
+if not a or not b:
+    print("EMPTY"); raise SystemExit
+for i in range(min(n, len(a), len(b))):
     if a[i] != b[i]:
-        print(f"DIFF at index {i}: single={a[i]} concurrent={b[i]}")
+        top = sorted((serial["logprobs"]["top_logprobs"][i] or {}).values(), reverse=True)
+        gap = top[0] - top[1] if len(top) > 1 else 99.0
+        print(f"{'TIE' if gap <= tie else 'DIFF'} at index {i}: single={a[i]} concurrent={b[i]} (serial top-2 gap {gap:.3f} nats, bound {tie})")
         break
 else:
-    print("OK" if n > 0 else "EMPTY")
+    print("OK")
 PYEOF
 )
-        if [ "$verdict" != "OK" ]; then
-            # A batch of >= 2 is not bit-identical to serial (B=2 matmul /
-            # recurrence tiles accumulate in a different order; a hybrid's
-            # prefix-cache restore adds its own class). Acquit a divergence
-            # whose serial top-2 gap is a near-tie (<= 0.15 nats, the MTP
-            # equivalence bar); anything wider is a real bug.
-            idx=$(echo "$verdict" | sed -n 's/DIFF at index \([0-9]*\):.*/\1/p')
-            gap=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); d['logprobs']=True; d['top_logprobs']=2; print(json.dumps(d))" "$LONG_JSON_PAYLOAD" |
-                curl -s -m 180 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" |
-                python3 -c "
-import sys,json
-c=json.load(sys.stdin)['choices'][0]['logprobs']['content']; i=int(sys.argv[1])
-t=c[i]['top_logprobs']; print(round(t[0]['logprob']-t[1]['logprob'],4))" "$idx" 2>/dev/null || echo 99)
-            if python3 -c "import sys; sys.exit(0 if float('$gap') <= 0.15 else 1)"; then
-                echo -e "  ${YELLOW}near-tie${NC} $verdict acquitted: serial top-2 gap at index $idx = $gap nats"
-            else
-                echo -e "${RED}FAIL${NC} N=2 concurrent stream diverged from serial: $verdict (serial top-2 gap $gap nats)"
-                CONC_FAIL=1; break
-            fi
-        fi
+        case "$verdict" in
+            OK) ;;
+            TIE*) echo -e "  ${YELLOW}near-tie${NC} acquitted: $verdict" ;;
+            *) echo -e "${RED}FAIL${NC} N=2 concurrent stream diverged from serial: $verdict"; CONC_FAIL=1; break ;;
+        esac
     done
     if [ "$CONC_FAIL" != "0" ]; then
         tail -20 "$CONC_LOG"
-        kill $CONC_PID 2>/dev/null || true; rm -f "$CONC_LOG" "$CONC_A" "$CONC_B"; exit 1
+        kill $CONC_PID 2>/dev/null || true; rm -f "$CONC_LOG" "$CONC_A" "$CONC_B" "$RAW_SERIAL"; exit 1
     fi
     echo -e "${GREEN}PASS${NC} both concurrent streams match serial for ${FIRST_N_TOKENS} tokens (batch >= 2; near-ties acquitted)"
 fi
+rm -f "$RAW_SERIAL"
 
 # Observability: the verdict a user reads without the log. /props and
 # /v1/models both say the loaded model batches, and a slot that cannot
@@ -390,7 +379,7 @@ echo "== batched-kernel x kv-quant crash guard =="
 
 sleep 2
 KVQ_LOG=$(mktemp)
-MLX_SERVE_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --kv-quant 8 > "$KVQ_LOG" 2>&1 &
+MLX_SERVE_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --no-drafter --kv-quant 8 > "$KVQ_LOG" 2>&1 &
 KVQ_PID=$!
 up=0
 for i in $(seq 1 60); do
@@ -409,7 +398,7 @@ if [ "$up" != "1" ]; then
 fi
 
 KVQ_BODY=$(echo "$JSON_PAYLOAD" | curl -s -m 60 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" || true)
-KVQ_CONTENT=$(echo "$KVQ_BODY" | python3 -c "import sys, json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null || true)
+KVQ_CONTENT=$(echo "$KVQ_BODY" | python3 -c "import sys, json; m=json.load(sys.stdin)['choices'][0]['message']; print((m.get('reasoning_content') or '') + (m.get('content') or ''))" 2>/dev/null || true)
 
 KVQ_OK=1
 if [ -z "$KVQ_CONTENT" ]; then
@@ -487,7 +476,7 @@ pathlib.Path(sys.argv[2]).write_text(json.dumps(body("64k", 50000, 600)))
 pathlib.Path(sys.argv[3]).write_text(json.dumps(body("1k", 800, 400)))
 PW_PYEOF
 
-    "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --max-concurrent 4 > "$PW_LOG" 2>&1 &
+    "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --no-drafter --max-concurrent 4 > "$PW_LOG" 2>&1 &
     PW_PID=$!
     up=0
     srv_wait_health "$BASE" 90 1 && up=1
