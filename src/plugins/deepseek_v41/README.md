@@ -1,9 +1,9 @@
 # DeepSeek-V4.1-Flash-1017 NVFP4 in mlx-serve
 
 Status: production guide for the `deepseek_v41` runner in mlx-serve core, PR 1256, 2026-11-24. We measured build
-`a99fc4f6`. Six later commits remove off-by-default code paths, restructure opt-in and test paths, and fix tests; the defaults' kernels compute the same values
-(the PR's reply comments list the commits and their checks). "We" are the PR 1256 authors, who tuned and measured on
-M5 Ultra Macs with 512 GiB (549.8 GB) of memory; GB here means 1e9 bytes. The PR body holds the A/B evidence. Agent and code
+`a99fc4f6`. Six later commits change product or test code paths, and the defaults' kernels compute the same values (the PR's
+reply comment 4 lists them and their checks). "We" are the PR 1256 authors, who tuned and measured on
+M5 Ultra Macs with 512 GiB (549.8 GB) of memory; GB here means 1e9 bytes. The PR's reply comment 1 holds every A/B. Agent and code
 notes for this folder are in [AGENTS.md](AGENTS.md).
 
 ## Summary
@@ -20,7 +20,8 @@ the pack gives none of the gain; the runs also differ in setup.
 The plugin has 52 default-on switches (51 on M5, where `ATTN_F16` is off). We count 50 of them as lossless.
 "Lossless" here means each switch's output is bit-identical to its `=0` path (EXACT); or (REORDER) not
 bit-identical but measured no farther from float64 (5 switches), held to a stated bound that can allow somewhat more
-error than `=0` (7), or classed by reasoning or A/B text alone (3); or changes only drafts and verify widths
+error than `=0` (7), or classed by reasoning or A/B text alone (3); or changes only drafts and verify widths, or how a sampled verify accepts drafts while keeping the model's
+distribution
 (DRAFT-ONLY). `MLX_ENABLE_TF32` has its own class (TF32): on M5 at the defaults it rounds only the drafter's P·V.
 Greedy text can still change. No test compares the whole model with a reference implementation (see "Accuracy"). The two outside are an 8-bit LM
 head, whose KLD was within one standard error of the bf16 head's, and a lossy f16 attention core. That core is on by
@@ -40,7 +41,7 @@ build scored 161/164 on HumanEval and 366/378 on MBPP (base tests).
    drafts to 65,536 common token ids, which gave +1.46% decode. For another workload, rebuild it with
    `scripts/dsv41_draft_vocab.py`.
 5. Raise Metal's wired-memory limit to 512000 MiB (500 GiB, 536.9 GB): `sudo sysctl iogpu.wired_limit_mb=512000`.
-6. Start the server: `mlx-serve --model DST_DIR --serve --warmup-full`. It listens on port 11234 by default.
+6. Start the server: `./zig-out/bin/mlx-serve --model DST_DIR --serve --warmup-full`. It listens on port 11234 by default.
 7. Get the model's id: `curl -s 127.0.0.1:11234/v1/models`.
 8. Send a first request:
    `curl -s 127.0.0.1:11234/v1/chat/completions -H 'Content-Type: application/json' -d '{"model": "<id>", "messages": [{"role": "user", "content": "Hello"}]}'`.
@@ -60,7 +61,7 @@ release's A/Bs and cells used 512000 MiB; the first NVFP4 build's A/B used 44032
 `sudo sysctl` command that admits it. We have not tried this release at macOS's default limit. The build that PR 1256
 showed before this release reported one load at the default limit; its record names no build.
 
-The 433 GB is the idle load of build `c59b60c6` (429 GB), measured before the 4 GB Engram partials cache, plus that cache. On the standard test the release build peaked at 452.3 GB.
+The 433 GB is the idle load of build `c59b60c6` (429 GB), measured before the 4 GB Engram partials cache, plus that cache. On the standard test the release build peaked at 452.3 GB (three-prompt mean; 452.9 GB at most, on p14).
 
 Metal compiles each kernel at its first use. With `--warmup-full`, the server sends itself a ladder of prompt sizes
 before it reports ready, so no user request waits for a first compile. This takes from seconds to a minute, on a
@@ -191,7 +192,8 @@ The release's p01 peak is 452.0 GB: 13.4 GB above the first NVFP4 build on the s
 31.3 GB above it on the MXFP4-experts pack (420.7 GB). The NVFP4 pack adds 17.9 GB, because its 16-value groups carry
 more scale bytes. The last reviewed head peaked at 438.6 GB too. Six changes moved the peak by more than
 0.5 GB: `PF_KEEP_WIDE` +7.3 GB, the Engram partials cache (`ENGRAM_KV_CACHE`) +4.0, `PF_PASS_SIZE` +3.9,
-`MOE_PAIR_SCALED` -1.4, `PF_COMP_BF16` -0.7 and `FLASH_ATTN` -0.7. The other +1.0 GB is drift between A/B bases. The
+`MOE_PAIR_SCALED` -1.4, `PF_COMP_BF16` -0.7 and `FLASH_ATTN` -0.7. Changes under 0.5 GB each add about +0.7 GB
+(`PF_ENGRAM_PASS` +0.4, `DRAFT_VOCAB` +0.4), and drift between A/B bases the last +0.3 GB. The
 three that add memory trade it for speed (`PF_PASS_SIZE` +7.96% prefill, `PF_KEEP_WIDE` +2.19% prefill, the Engram
 slot kernel and partials cache, one A/B, +0.28% decode). We kept them because
 the 1M prompt still fits.
@@ -199,10 +201,16 @@ the 1M prompt still fits.
 <details>
 <summary>The four parts of the memory bill, the 1M fit and its admission</summary>
 
+
+In the sweep the release peaks 23.7 GB above the ds41nv sweep build at 1K (442.6 against 418.9 GB) and 51.2 GB at
+1M (480.5 against 429.3 GB). 20.2 GB is the NVFP4 weights bill. The rest grows with the prompt: the before build's
+admission bill grows from 4,683 MiB at 8K to 13,589 MiB at 1M on 8,192-row chunks, while `PF_PASS_SIZE` widens the
+release's passes to 44,544 rows (36,087 MiB billed at 1M, with the 18.6 GB `PF_KEEP_WIDE` reserve).
+
 At 1M the whole machine's non-file memory peaked at 489.7 GB (502.0 GB at most over the sweep), against the 536.9 GB
 wired limit, with 0 pageouts. At macOS's default limit the 1M point is untested: the memory share is smaller, so
-`PF_PASS_SIZE` picks narrower passes than the 44,544 rows it picked at 512000 MiB. At 1M, admission had a 37 GB
-margin (36,087 MB needed, 73,320 MB available) at 512000 MiB. The weights bill is 404.33 GB for the NVFP4 pack against 384.16 GB for the MXFP4-experts
+`PF_PASS_SIZE` picks narrower passes than the 44,544 rows it picked at 512000 MiB. At 1M, admission had a 39.0 GB
+margin (36,087 MiB needed, 73,320 MiB available) at 512000 MiB. The weights bill is 404.33 GB for the NVFP4 pack against 384.16 GB for the MXFP4-experts
 pack (+20.2 GB).
 
 | Part | Where the code computes it | Size for this model |
@@ -216,8 +224,8 @@ Layers 2, 8, 14 and 20 are the KV sources. Every layer keeps a 128-row window an
 source layer at or before it. Each source stores a 512-wide latent and a 128-wide index key per token in bf16,
 compressed 2:1 in the first three and 1:1 in layer 20.
 
-On the release build, the 1,032,192-token prompt passed the admission check with 36,087 MB needed and about
-73,320 MB available, with an 18.6 GB `PF_KEEP_WIDE` reserve at 44,544-row passes (the widest pass that fits at 512000 MiB). The Engram partials cache (`ENGRAM_KV_CACHE`) allocates
+On the release build, the 1,032,192-token prompt passed the admission check with 36,087 MiB needed and about
+73,320 MiB available, with an 18.6 GB `PF_KEEP_WIDE` reserve at 44,544-row passes (the widest pass that fits at 512000 MiB). The Engram partials cache (`ENGRAM_KV_CACHE`) allocates
 3,787 MiB (3.97 GB) of its 4.0 GB cap on this pack. The reserve replaces allocations that the pass made anyway, so the
 peak rises by 7.3 GB, not by the reserve's size.
 
@@ -290,8 +298,8 @@ explicit `ATTN_F16=1`. The load fixes the switch's value, and the prompt cache's
 TF32 rounds an f32 matmul's operands to a 10-bit mantissa. On M5 at the defaults, every prompt-attention call takes
 the flash kernel or the gather, and the trunk's f32 matmuls read bf16 values held in f32 or run on MLX's gemv kernel.
 So TF32 rounds no operand that the model verifies. The f32 chain serves only off-default routes, and there TF32
-rounds its P·V; its float64 error measured equal to the bf16 chain's (the same f32 chain at the release's 64 heads and
-bf16 activations) at those shapes. γ(n) = n·u / (1 - n·u), with u = 2⁻²⁴, bounds the rounding of an n-term f32 sum. At the defaults TF32's
+rounds its P·V; its float64 error measured equal to the f32 chain's own error on the default bf16 route at 64
+heads, at those shapes. γ(n) = n·u / (1 - n·u), with u = 2⁻²⁴, bounds the rounding of an n-term f32 sum. At the defaults TF32's
 only rounding is the drafter's P·V, so its class passes for the same reason as DRAFT-ONLY.
 
 The class tests are in the plugin unless named. Most also run a planted fault as a control, which must fail.
@@ -446,18 +454,16 @@ Standard test, p01, greedy, DSpark on, NVFP4 pack:
 | `58279979`, the last reviewed head | 4,009.6 | 82.93 |
 | `a99fc4f6`, the release | 5,551.3 | 98.80 |
 
-From `58279979` to the release (the 47 changes, the upstream merge and the audit fixes): +38.4% prefill and +19.1% decode (on two Macs; the
-release's runs about 0.8% slower per round). On `f7e4da9e` the MXFP4-experts pack ran
-4,108.3 / 73.83 tok/s; NVFP4 was 2.8% slower. The runs differ. The first NVFP4 build's A/B used a 440320 MiB wired limit and plain
-pre-warm requests. The release cells used 512000 MiB, `--ctx-size 32768` and `--warmup-full`. p01 is the best of the
-three prompts; the release's three-prompt mean is 97.98 tok/s.
+From `58279979` to the release (the 47 changes, the upstream merge and the audit fixes): +38.4% prefill and +19.1% decode (`58279979` on
+Mac 1, the release on Mac 2, which runs about 0.8% slower per round). On `f7e4da9e` the MXFP4-experts pack ran
+4,108.3 / 73.83 tok/s; NVFP4 was 2.8% slower.
 
 The ds41nv sweep build (see "Terms") ran the same sweep on the MXFP4-experts pack on 2026-11-24. Greedy prefill /
 decode tok/s:
 
 | Context | The ds41nv sweep build, MXFP4 | Release, NVFP4 | Prefill, release / before | Decode, release / before |
 |---|---|---|---|---|
-| 16K | 4,248.0 / 102.65 | 5,524.1 / 132.80 | x1.30 | x1.29 |
+| 16K | 4,248.0 / 102.65 | 5,524.1 / 132.80 | x1.30 (x1.27 against seed 4321 alone) | x1.29 (x1.26) |
 | 128K | 3,915.8 / 103.05 | 5,508.9 / 128.45 | x1.41 | x1.25 |
 | 512K | 2,728.6 / 102.30 | 4,707.5 / 119.00 | x1.73 | x1.16 |
 | 1M | 1,889.5 / 99.75 | 3,912.9 / 110.70 | x2.07 | x1.11 |
@@ -479,6 +485,13 @@ for each run. Each cell ran 6 runs (p10: 2) on the release build `a99fc4f6`, sta
 <details>
 <summary>Notes on the cells</summary>
 
+The runs differ. The first NVFP4 build's A/B used a 440320 MiB wired limit and plain pre-warm requests. The release
+cells used 512000 MiB, `--ctx-size 32768` and `--warmup-full`. p01 decodes fastest of the three prompts; the
+release's three-prompt mean is 97.98 tok/s.
+
+The before build's 16K greedy seed-1234 run was low (4,149.4 / 99.8 against 4,346.7 / 105.5 for seed 4321), as was its
+1K card seed-1234 run; the means include them.
+
 The release's attention fix sends the CED replay of a long prompt to the flash kernel, so greedy texts differ from the
 control's (`04b8f7d0`). On p10 the release decodes 7.5% slower than the control (98.50 against 106.45 tok/s): acceptance fell from
 3.51 to 2.94 tokens per round on the new text, and round time did not rise. p10 is the only cell whose mean decode fell
@@ -498,7 +511,7 @@ of about 44,500 rows), but we have not measured the cells at the 1M default.
 | Without NAX, the lossy f16 attention core (`ATTN_F16`) is on by default, and we have not measured it on those Macs | A float64 test on those Macs, or `ATTN_F16` off there |
 | On the f32 attention chain's routes, attention's output depends on the prompt pass width | A test that holds each pass width no farther from float64 |
 | 6 classed switches have no standing test against their `=0` path (listed in "Accuracy") | A standing word or float64 test for each |
-| TF32's float64 test needs a fixture that no tool in this repo writes | A fixture writer, or the fixture in the repo |
+| TF32's float64 test needs a fixture that no tool in this PR writes; ours came from the `DSV41_TF32_AUDIT` dump on branch `rel-harden-tf32` (`6965929b`), not in this PR | A fixture writer, or the fixture in the repo |
 | `HEAD8` is a quantization change. Its KLD is within one standard error of the bf16 head's on our set, but it is not bit-identical | A ruling to keep it, or `=0` by default |
 | We tuned and measured only on M5 Ultra Macs with 512 GiB | Runs on smaller Macs and older GPUs |
 | The release has not loaded at the default wired limit | One load at the default limit |
