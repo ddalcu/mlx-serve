@@ -13,6 +13,7 @@ const ops = @import("../../mlx/ops.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const source = @import("../../mlx/kernels.zig").source;
 const kernels = @import("kernels.zig");
+const vision_contract = @import("vision_contract.zig");
 const layers = @import("layers.zig");
 const config = @import("config.zig");
 const attn = @import("../../sdk/blocks/attention/contract.zig");
@@ -4139,6 +4140,7 @@ pub fn register(set: *kc.Set) !void {
             .sums = grp_sums,
         }, null);
     }
+    try vision_contract.register(set);
 }
 
 // ── tests ──
@@ -4249,6 +4251,7 @@ test "kernel contract inkling2: each declared launch is the shipped wrapper's, b
             try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
         }
     }
+    try vision_contract.checkWrappers(a, set.kernels.items[at..]);
 }
 
 // Bar: gates 1-4 on this area alone (the registry's sharded test runs them with every other area).
