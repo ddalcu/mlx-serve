@@ -334,13 +334,23 @@ pub fn appendKv(c: *const Ctx, cache: abi.Handle, global: bool, cfg: *const Conf
 
 /// One row's read `[1, H, 1, hd]` of a cache the engine keeps quantized, off its packed words under `bias` `[1, H, 1, keys]`
 /// and `sinks` `[H]`: the dense keys and values (a dequantize of every key each token) never exist. Null where the packed
-/// kernel does not serve the view (dense storage, a request that reads dense, under `KV_ATTN_FUSED_MIN_TK` keys).
+/// kernel does not serve the view (dense storage, a request that reads dense, under `KV_ATTN_FUSED_MIN_TK` keys, or
+/// under `nax_packed_min_keys` on NAX).
 pub fn packedRead(g: *Graph, view: abi.KvView, q: Array, bias: Array, sinks: Array, scale: f32) !?Array {
     var dv = kv.dense(view);
     if (!view.packed_reads or !kvq.kvAttnFusedEligible(&dv, 1)) return null;
+    if (!packedReadKeys(mlx.getShape(dv.k_triple_q)[2], device.naxAvailable())) return null;
     const out = try kvq.qkvAttnDecodeBiased(g.s, q, &dv, scale, bias, sinks) orelse return null;
     kvq.logKvAttnFusedEngaged(&dv, q, 1);
     return try g.adopt(out);
+}
+
+/// On NAX the biased read runs the SDK's plain block kernel (its matmul2d kernel declines an array mask): slower than
+/// MLX's dense read below about 16K keys, faster past it.
+pub const nax_packed_min_keys: c_int = 16384;
+
+fn packedReadKeys(keys: c_int, nax: bool) bool {
+    return !nax or keys >= nax_packed_min_keys;
 }
 
 /// The attention read: appends the visit's k and v, then attends under the relative bias, the sink and the output
@@ -594,4 +604,11 @@ pub fn messagesFor(g: *Graph, L: *const Layer, bank: Array, partial: Array) !Arr
 
 pub fn passOutput(g: *Graph, w: *const Body, h: Array) !Array {
     return plainNorm(g, try g.astype(h, .float32), w.ones);
+}
+
+test "packedReadKeys: a NAX GPU reads a quantized cache dense below nax_packed_min_keys" {
+    // Bar: on NAX the packed read starts at 16K keys; elsewhere where the SDK's fused gate does.
+    try std.testing.expect(!packedReadKeys(8192, true));
+    try std.testing.expect(packedReadKeys(16384, true));
+    try std.testing.expect(packedReadKeys(2048, false));
 }
