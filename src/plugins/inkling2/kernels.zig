@@ -88,7 +88,9 @@ pub var downs_kernel: Kernel = .{ .name = "msv_inkling2_downs", .ins = &.{ "ACT"
 pub var group_kernel: Kernel = .{ .name = "msv_inkling2_group", .ins = &.{"IDX"}, .outs = &.{ "TEXP", "TCNT", "TPICK" }, .source = kernelSource("plugins/inkling2/kernels/group.metal") };
 pub var ups_grp_kernel: Kernel = .{ .name = "msv_inkling2_ups_grp", .ins = &.{ "X", "WQ", "WS", "WB", "TEXP", "TCNT", "TPICK", "SC", "PR" }, .outs = &.{"ACT"}, .source = kernelSource("plugins/inkling2/kernels/ups_grp.metal"), .header = bank_header };
 pub var downs_grp_kernel: Kernel = .{ .name = "msv_inkling2_downs_grp", .ins = &.{ "ACT", "WQ", "WS", "WB", "TEXP", "TCNT", "TPICK" }, .outs = &.{"DN"}, .source = kernelSource("plugins/inkling2/kernels/downs_grp.metal"), .header = bank_header };
-pub var relattn_kernel: Kernel = .{ .name = "msv_inkling2_relattn", .ins = &.{ "q", "k", "v", "rel", "sinks", "key_start", "sizes", "scale" }, .outs = &.{"out"}, .source = kernelSource("plugins/inkling2/kernels/relattn.metal"), .contiguous = false };
+pub var relattn_kernel: Kernel = .{ .name = "msv_inkling2_relattn", .ins = &.{ "q", "k", "v", "rel", "sinks", "key_start", "sizes", "scale", "GATE" }, .outs = &.{"out"}, .source = kernelSource("plugins/inkling2/kernels/relattn.metal"), .contiguous = false };
+pub var tile_scan_kernel: Kernel = .{ .name = "msv_inkling2_tile_scan", .ins = &.{ "idx", "params" }, .outs = &.{ "tiles", "tile_count" }, .source = kernelSource("plugins/inkling2/kernels/tile_scan.metal") };
+pub var moe_wide_kernel: Kernel = .{ .name = "msv_inkling2_moe_wide", .ins = &.{ "X", "W", "WS", "WB", "tiles", "tile_count", "SC", "PR", "RMAP" }, .outs = &.{"Y"}, .source = kernelSource("plugins/inkling2/kernels/moe_wide.metal"), .header = bank_header };
 pub var router_kernel: Kernel = .{ .name = "msv_inkling2_router", .ins = &.{ "X", "RT" }, .outs = &.{"SC"}, .source = kernelSource("plugins/inkling2/kernels/router.metal") };
 pub var relattn_nax_kernel: Kernel = .{ .name = "msv_inkling2_relattn_nax", .ins = &.{ "q", "k", "v", "rel", "rproj", "sinks", "sizes", "scale" }, .outs = &.{"out"}, .source = kernelSource("plugins/inkling2/kernels/relattn_nax.metal"), .header = kernelSource("kernels/common/mpp_tensor_ops.metal"), .contiguous = false };
 pub var relsplit_nax_kernel: Kernel = .{ .name = "msv_inkling2_relsplit_nax", .ins = &.{ "q", "k0", "k1", "k2", "k3", "v0", "v1", "v2", "v3", "kb", "vb", "rel", "sinks", "GATE", "TMETA", "sizes", "params" }, .outs = &.{ "PART", "ML", "OUT" }, .source = kernelSource("plugins/inkling2/kernels/relsplit_nax.metal"), .header = kernelSource("kernels/common/mpp_tensor_ops.metal"), .contiguous = false };
@@ -522,12 +524,20 @@ pub const small_rows = 32;
 /// `[1, S, H, hd]`. `offset` is the first row's position. One flash launch with no mask built, or (at most
 /// `small_rows` rows, unless `flash`) a mask launch and MLX's attention.
 pub fn relative(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, rel_states: Array, sinks: Array, k: Array, v: Array, offset: c_int, flash: bool) !Array {
-    if (ops.shape(q_rows)[1] > small_rows) if (try relativeNax(g, L, cfg, q_rows, rel_states, sinks, k, v, offset)) |o| return o;
+    return relativeWith(g, L, cfg, q_rows, rel_states, sinks, k, v, offset, flash, null);
+}
+
+/// `relative` with an optional fused output gate `out_gate` `[S * H * hd]` f32: when given, returns the gated output
+/// `[1, S, H * hd]` directly (fused into `relattn.metal` on non-NAX GPUs, or via `gated` on NAX / small-row paths).
+pub fn relativeWith(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, rel_states: Array, sinks: Array, k: Array, v: Array, offset: c_int, flash: bool, out_gate: ?Array) !Array {
+    const s = ops.shape(q_rows)[1];
+    if (s > small_rows) if (try relativeNax(g, L, cfg, q_rows, rel_states, sinks, k, v, offset)) |o| {
+        return if (out_gate) |gt| gated(g, o, gt, s) else o;
+    };
     const dt = ops.dtype(q_rows);
     const hd: c_int = @intCast(cfg.head_dim);
     if (ops.dtype(k) != dt or ops.dtype(v) != dt or @rem(hd, 8) != 0) return error.Inkling2StepDtype;
     const heads: c_int = @intCast(cfg.num_attention_heads);
-    const s = ops.shape(q_rows)[1];
     const keys = ops.shape(k)[2];
     const in = try readInputs(g, L, cfg, q_rows, rel_states, sinks, offset);
     const q = in.q;
@@ -538,15 +548,21 @@ pub fn relative(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, r
     if (s <= small_rows and !flash) {
         const zero = try g.zeros(&.{ 1, @intCast(cfg.num_key_value_heads), 1, hd }, dt);
         const read = try g.sdpa(q, try g.concat(&.{ k, zero }, 2), try g.concat(&.{ v, zero }, 2), scale, .{ .array = try relMask(g, bias, sink_rows, keys, window, true) });
-        return g.transpose(read, &.{ 0, 2, 1, 3 });
+        const out = try g.transpose(read, &.{ 0, 2, 1, 3 });
+        return if (out_gate) |gt| gated(g, out, gt, s) else out;
     }
+    const fused_gate = out_gate != null;
+    const bq: c_int = 64;
+    const bk: c_int = 32;
+    const tg: c_int = 256;
     const o = try launchGrid(g, &relattn_kernel, &.{
-        q, k, v, bias, sink_rows, try g.zeros(&.{1}, .int32), try g.fromSlice(i32, &.{ s, keys }, &.{2}), try g.scalar(scale, .float32),
-    }, 1, .{.{ .shape = &.{ 1, s, heads, hd }, .dtype = dt }}, .{ @divTrunc(s + 31, 32) * 128, heads, 1 }, .{ 128, 1, 1 }, &.{
+        q, k, v, bias, sink_rows, try g.zeros(&.{1}, .int32), try g.fromSlice(i32, &.{ s, keys }, &.{2}), try g.scalar(scale, .float32), out_gate orelse sink_rows,
+    }, 1, .{.{ .shape = if (fused_gate) &.{ 1, s, heads * hd } else &.{ 1, s, heads, hd }, .dtype = dt }}, .{ @divTrunc(s + bq - 1, bq) * tg, heads, 1 }, .{ tg, 1, 1 }, &.{
         .{ "T", .{ .dtype = dt } },                     .{ "D", .{ .int = hd } },
         .{ "HQ", .{ .int = heads } },                   .{ "HKV", .{ .int = @intCast(cfg.num_key_value_heads) } },
         .{ "R", .{ .int = ops.shape(L.rel_proj)[1] } }, .{ "WINDOW", .{ .int = window } },
-        .{ "BQ", .{ .int = 32 } },                      .{ "TG", .{ .int = 128 } },
+        .{ "BQ", .{ .int = bq } },                      .{ "BK", .{ .int = bk } },
+        .{ "TG", .{ .int = tg } },                      .{ "GATED", .{ .int = @intFromBool(fused_gate) } },
     });
     return o[0];
 }
@@ -931,10 +947,10 @@ pub fn splitReadLanesM4(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: 
 }
 
 /// A few or a prompt's rows read behind the keys `k`, `v` (the rows at their last S), gated.
-fn readRows(g: *Graph, L: *const Layer, cfg: *const Config, p: *const Prep, sinks: Array, k: Array, v: Array, offset: c_int, s: c_int) !Array {
+fn readRows(g: *Graph, L: *const Layer, cfg: *const Config, p: *const Prep, sinks: Array, k: Array, v: Array, offset: c_int, _: c_int) !Array {
     if (try splitReadNax(g, L, cfg, p.q, p.rel, sinks, k, v, null, offset, p.gate)) |o| return o;
     if (try splitRead(g, L, cfg, p.q, p.rel, sinks, k, v, null, offset, p.gate)) |o| return o;
-    return gated(g, try relative(g, L, cfg, p.q, p.rel, sinks, k, v, offset, false), p.gate, s);
+    return relativeWith(g, L, cfg, p.q, p.rel, sinks, k, v, offset, false, p.gate);
 }
 
 /// A draft verify's visit: its rows read the cache without appending and leave here, kept by `g`, what a commit
@@ -1313,7 +1329,11 @@ pub const Tail = struct { h: Array, state: Array };
 pub fn activation(g: *Graph, gu: Array, sel: Array, scale: Array, caps: Array, scaled: bool) !Array {
     const sh = ops.shape(gu);
     const inter = @divExact(sh[2], 2);
-    const o = try launch(g, &act_kernel, &.{ gu, sel, scale, caps }, 1, .{.{ .shape = &.{ sh[0], 1, inter }, .dtype = ops.dtype(gu) }}, sh[0] * inter, 64, &.{ .{ "T", .{ .dtype = ops.dtype(gu) } }, .{ "SCALED", .{ .int = @intFromBool(scaled) } } });
+    const vec4 = @rem(inter, 256) == 0;
+    const grid = if (vec4) sh[0] * @divExact(inter, 4) else sh[0] * inter;
+    const o = try launch(g, &act_kernel, &.{ gu, sel, scale, caps }, 1, .{.{ .shape = &.{ sh[0], 1, inter }, .dtype = ops.dtype(gu) }}, grid, 64, &.{
+        .{ "T", .{ .dtype = ops.dtype(gu) } }, .{ "SCALED", .{ .int = @intFromBool(scaled) } }, .{ "VEC4", .{ .int = @intFromBool(vec4) } },
+    });
     return o[0];
 }
 
@@ -1330,8 +1350,10 @@ pub fn pickSumWith(g: *Graph, dn: Array, sel: Array, inverse: Array, scale: Arra
     const dt = ops.dtype(dn);
     const par = parent orelse try g.zeros(&.{1}, .int32);
     const out: Out = .{ .shape = &.{ 1, s, d }, .dtype = dt };
-    return launch(g, &sum_kernel, &.{ dn, sel, inverse, scale, weights, residual, st, taps, conv_scale, par }, 2, .{ out, out }, s * d, 64, &.{
-        .{ "T", .{ .dtype = dt } }, .{ "WT", .{ .dtype = ops.dtype(taps) } }, .{ "K", .{ .int = k } }, .{ "KT", .{ .int = ops.shape(st)[1] + 1 } }, .{ "SCALED", .{ .int = @intFromBool(scaled) } }, .{ "TREE", .{ .int = @intFromBool(parent != null) } },
+    const vec4 = @rem(d, 256) == 0;
+    const grid = if (vec4) s * @divExact(d, 4) else s * d;
+    return launch(g, &sum_kernel, &.{ dn, sel, inverse, scale, weights, residual, st, taps, conv_scale, par }, 2, .{ out, out }, grid, 64, &.{
+        .{ "T", .{ .dtype = dt } }, .{ "WT", .{ .dtype = ops.dtype(taps) } }, .{ "K", .{ .int = k } }, .{ "KT", .{ .int = ops.shape(st)[1] + 1 } }, .{ "SCALED", .{ .int = @intFromBool(scaled) } }, .{ "TREE", .{ .int = @intFromBool(parent != null) } }, .{ "VEC4", .{ .int = @intFromBool(vec4) } },
     });
 }
 
@@ -1410,6 +1432,60 @@ pub fn ups(g: *Graph, L: *const Layer, cfg: *const Config, x: Array, route: UpsR
     });
 }
 
+/// Sorted expert tile descriptors produced by `tile_scan.metal`, shared across a visit's `gate_up` and `down`.
+pub const ExpertTiles = struct { tiles: Array, count: Array, max_tiles: c_int, bm: c_int, m: c_int };
+
+/// Cuts sorted expert indices `sel` `[M]` u32 into `(row_start, expert, rows, 0)` tiles of at most `bm` rows.
+pub fn tileScan(g: *Graph, sel: Array, num_experts: u32, bm: c_int) !ExpertTiles {
+    const m = ops.shape(sel)[0];
+    const e: c_int = @intCast(num_experts);
+    const max_tiles = @divTrunc(m + bm - 1, bm) + @min(e, m);
+    const params = try g.fromSlice(i32, &.{ m, e, max_tiles }, &.{3});
+    const o = try launch(g, &tile_scan_kernel, &.{ sel, params }, 2, .{
+        .{ .shape = &.{max_tiles * 4}, .dtype = .uint32 },
+        .{ .shape = &.{1}, .dtype = .uint32 },
+    }, 256, 256, &.{ .{ "BM", .{ .int = bm } }, .{ "MAXE", .{ .int = 2048 } } });
+    return .{ .tiles = o[0], .count = o[1], .max_tiles = max_tiles, .bm = bm, .m = m };
+}
+
+/// Whether `moeWide` serves a prompt's sorted experts on this GPU: non-NAX Apple9+ (native `simdgroup_matrix<bfloat>`),
+/// packed banks over multiples of 32, and rows past `packed_rows`.
+pub fn moeWideRuns(g: *const Graph, dt: Dtype, s: c_int, cfg: *const Config, L: *const Layer) bool {
+    if (!mlx.streamIsGpu(g.s) or !enabled()) return false;
+    const dev = @import("../../mlx/device.zig");
+    if (dev.naxAvailable() or dev.deviceGeneration().gen < 15) return false;
+    if (dt != .bfloat16 and dt != .float16) return false;
+    if (s <= packed_rows or cfg.num_experts > 2048) return false;
+    const hidden: c_int = @intCast(cfg.hidden_size);
+    const inter: c_int = @intCast(cfg.moe_intermediate_size);
+    if (@rem(hidden, 32) != 0 or @rem(inter, 32) != 0) return false;
+    return packedFormat(&L.gate_up, hidden) != null and packedFormat(&L.down, inter) != null;
+}
+
+/// Wide-tile sorted MoE GEMM (`moe_wide.metal`) over `tiles`: with `swiglu`, fuses `scale` + soft-capped SwiGLU over
+/// adjacent `(gate, up)` columns; with `rmap`, reads rows directly from `x` `[1, S, K]` without a scatter copy.
+pub fn moeWide(g: *Graph, x: Array, bank: anytype, scale: Array, tiles: ExpertTiles, rmap: ?Array, caps: Array, swiglu: bool) !Array {
+    const dt = ops.dtype(x);
+    const xsh = ops.shape(x);
+    const k = xsh[xsh.len - 1];
+    const n = ops.shape(bank.w)[1];
+    const fmt = packedFormat(bank, k) orelse return error.Inkling2ExpertLayout;
+    const scaled = swiglu and scale.ctx != null;
+    const out_n = if (swiglu) @divExact(n, 2) else n;
+    const n_blks = @divTrunc(n + 63, 64);
+    const o = try launchGrid(g, &moe_wide_kernel, &.{
+        x, bank.w, bank.s, biasesOf(bank), tiles.tiles, tiles.count, if (scaled) scale else caps, caps, rmap orelse tiles.count,
+    }, 1, .{.{ .shape = &.{ tiles.m, 1, out_n }, .dtype = dt }}, .{ tiles.max_tiles * 128, n_blks, 1 }, .{ 128, 1, 1 }, &.{
+        .{ "T", .{ .dtype = dt } },                     .{ "S", .{ .dtype = if (fmt == 3) ops.dtype(bank.s) else dt } },
+        .{ "K", .{ .int = k } },                         .{ "N", .{ .int = n } },
+        .{ "BM", .{ .int = tiles.bm } },                 .{ "FMT", .{ .int = fmt } },
+        .{ "GS", .{ .int = @intCast(bank.qp.group_size) } }, .{ "BITS", .{ .int = @intCast(bank.qp.bits) } },
+        .{ "SWIGLU", .{ .int = @intFromBool(swiglu) } }, .{ "SCALED", .{ .int = @intFromBool(scaled) } },
+        .{ "USE_RMAP", .{ .int = @intFromBool(rmap != null) } },
+    });
+    return o[0];
+}
+
 /// `layers.tail`. The visit's new conv state (off the next visit's path) is `st` behind the rows' k and v projections
 /// `kp`, `vp`, their output projection and the MLP's output.
 /// One row, a packed bank read in place: the router's picks, their gate_up and the soft-capped SwiGLU as one launch,
@@ -1485,6 +1561,28 @@ pub fn experts(g: *Graph, L: *const Layer, cfg: *const Config, m: *const Middle,
             return .{ .h = ft[0], .state = st };
         }
         return .{ .h = ft[0], .state = try convState(g, st, kp, vp, m.op, ft[1]) };
+    }
+
+    if (moeWideRuns(g, dt, s, cfg, L)) {
+        const flat = try g.reshape(picks[0], &.{n});
+        const order = try g.argsort(flat, 0);
+        const token = try g.call(mlx.mlx_floor_divide, .{ order, try g.astype(try g.scalar(@floatFromInt(top_k), .float32), ops.dtype(order)) });
+        const sel = try g.take(flat, order, 0);
+        const inverse = try g.argsort(order, 0);
+        const rmap = try g.astype(token, .uint32);
+        const bm: c_int = if (@divTrunc(n, @as(c_int, @intCast(cfg.num_experts))) < 48) 32 else 64;
+        const tiles = try tileScan(g, sel, cfg.num_experts, bm);
+        const act_wide = try moeWide(g, m.x, &L.gate_up, L.gate_up_scale, tiles, rmap, caps, true);
+        const dn_wide = try moeWide(g, act_wide, &L.down, .{}, tiles, null, caps, false);
+        const tree_parent: ?Array = if (open) |v| (if (v.tree) |tr| tr.parent else null) else null;
+        const o = try pickSumWith(g, dn_wide, sel, inverse, dn_scale, weights, m.residual, st, L.mlp_conv, conv_scale, top_k, L.down_scale.ctx != null, tree_parent);
+        if (open) |v| {
+            const nslot = ops.shape(st)[0];
+            const rows = try g.astype(try g.concat(&.{ kp, vp, m.op, o[1] }, 2), .float32);
+            v.window = try v.g.keep(try g.concat(&.{ st, try g.reshape(rows, &.{ nslot, @divExact(s, nslot), -1 }) }, 1));
+            return .{ .h = o[0], .state = st };
+        }
+        return .{ .h = o[0], .state = try convState(g, st, kp, vp, m.op, o[1]) };
     }
 
     const pairs = try layers.pairs(g, cfg, m.x, picks[0]);

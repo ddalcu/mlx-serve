@@ -2950,3 +2950,103 @@ test "inkling2 kernels: HostGpu.launch cache dispatches bit-identically and fall
     defer a.free(fb);
     try testing.expectEqualSlices(f32, direct, fb);
 }
+
+// Bar: non-NAX wide-tile sorted MoE (`tileScan` + `moeWide`) serves NVFP4, MXFP4, MXFP8 and affine banks across BM=32
+// and BM=64, with fused soft-capped SwiGLU + RMAP gather and non-multiple-of-64 N tails, matching MLX's gather chain.
+test "inkling2 kernels: moeWide serves NVFP4, MXFP4, MXFP8 and affine banks with fused SwiGLU and rmap" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable() or device.deviceGeneration().gen < 15) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+
+    const E: c_int = 8;
+    const S: c_int = 96;
+    const top_k: c_int = 4;
+    const M: c_int = S * top_k;
+    const K: c_int = 128;
+    const I: c_int = 64;
+    const DN_OUT: c_int = 96; // non-multiple of 64 to exercise N-tail guard
+    const x = try randomRow(&g, a, 7200, &.{ 1, S, K }, 0.5, .bfloat16);
+    var prng = std.Random.DefaultPrng.init(7201);
+    const rng = prng.random();
+    const picks_host = try a.alloc(u32, @intCast(M));
+    defer a.free(picks_host);
+    for (picks_host) |*p| p.* = rng.uintLessThan(u32, @intCast(E));
+    const flat = try g.fromSlice(u32, picks_host, &.{M});
+    const order = try g.argsort(flat, 0);
+    const token = try g.call(mlx.mlx_floor_divide, .{ order, try g.astype(try g.scalar(@floatFromInt(top_k), .float32), ops.dtype(order)) });
+    const sel = try g.take(flat, order, 0);
+    const rmap = try g.astype(token, .uint32);
+    const x_sorted = try g.reshape(try g.take(try g.reshape(x, &.{ S, K }), token, 0), &.{ M, 1, K });
+    const caps = try g.fromSlice(f32, &.{ 1.0 / 30.0, 30.0, 1.0 / 30.0, 30.0 }, &.{4});
+    const gu_scale = try randomRow(&g, a, 7202, &.{E}, 0.5, .float32);
+
+    const formats = [_]struct { mode: QuantMode, bits: u32, group: u32, scaled: bool }{
+        .{ .mode = .nvfp4, .bits = 4, .group = 16, .scaled = true },
+        .{ .mode = .mxfp4, .bits = 4, .group = 32, .scaled = false },
+        .{ .mode = .mxfp8, .bits = 8, .group = 32, .scaled = false },
+        .{ .mode = .affine, .bits = 4, .group = 64, .scaled = false },
+        .{ .mode = .affine, .bits = 8, .group = 64, .scaled = true },
+    };
+    for (formats, 0..) |f, fi| {
+        const gu = try packedBank(&g, a, 7210 + fi * 2, &.{ E, 2 * I, K }, f.bits, f.group, f.mode);
+        const dn = try packedBank(&g, a, 7211 + fi * 2, &.{ E, DN_OUT, I }, f.bits, f.group, f.mode);
+        const sc: ops.Array = if (f.scaled) gu_scale else .{};
+
+        const gu_ref = try layers.gather(&g, x_sorted, &gu, sel, true);
+        const act_ref = try kernels.activation(&g, gu_ref, sel, if (f.scaled) gu_scale else caps, caps, f.scaled);
+        const dn_ref = try layers.gather(&g, act_ref, &dn, sel, true);
+
+        for ([_]c_int{ 32, 64 }) |bm| {
+            const tiles = try kernels.tileScan(&g, sel, @intCast(E), bm);
+            const act_got = try kernels.moeWide(&g, x, &gu, sc, tiles, rmap, caps, true);
+            const dn_got = try kernels.moeWide(&g, act_got, &dn, .{}, tiles, null, caps, false);
+            try testing.expect((try parity.maxAbsDiffF32(act_got, act_ref, s)) <= 5e-2);
+            try testing.expect((try parity.maxAbsDiffF32(dn_got, dn_ref, s)) <= 5e-2);
+        }
+    }
+}
+
+// Bar: `relativeWith` with a fused output gate matches `gated(relative(...))` bit-for-bit on both global layers past
+// distance R (exercising the plain tile loop) and sliding-window layers.
+test "inkling2 kernels: relativeWith fuses output gate and runs global plain loop past R" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+
+    var cfg = std.mem.zeroes(@import("config.zig").Config);
+    cfg.vocab_size = 64;
+    cfg.hidden_size = 256;
+    cfg.num_hidden_layers = 2;
+    cfg.num_attention_heads = 4;
+    cfg.num_key_value_heads = 2;
+    cfg.head_dim = 64;
+    cfg.sliding_window = 128;
+    cfg.log_n_floor = 256;
+    cfg.log_alpha = 0.0;
+    const S: c_int = 192;
+    const q = try randomRow(&g, a, 7300, &.{ 1, S, 4, 64 }, 0.3, .bfloat16);
+    const k = try randomRow(&g, a, 7301, &.{ 1, 2, S, 64 }, 0.3, .bfloat16);
+    const v = try randomRow(&g, a, 7302, &.{ 1, 2, S, 64 }, 0.3, .bfloat16);
+    const rel_states = try randomRow(&g, a, 7303, &.{ 1, S, 4, 16 }, 0.2, .bfloat16);
+    const sinks = try randomRow(&g, a, 7304, &.{ 1, S, 4 }, 0.2, .bfloat16);
+    const gate = try g.sigmoid(try randomRow(&g, a, 7305, &.{S * 4 * 64}, 1.0, .float32));
+    var L: layers.Layer = undefined;
+    L.rel_proj = try randomRow(&g, a, 7306, &.{ 16, 64 }, 0.1, .float32);
+    L.rel_proj_t = .{};
+
+    for ([_]bool{ true, false }) |is_global| {
+        L.global = is_global;
+        const raw = try kernels.relative(&g, &L, &cfg, q, rel_states, sinks, k, v, 0, true);
+        const ref = try hostValues(a, &g, try kernels.gated(&g, raw, gate, S));
+        defer a.free(ref);
+        const got = try hostValues(a, &g, try kernels.relativeWith(&g, &L, &cfg, q, rel_states, sinks, k, v, 0, true, gate));
+        defer a.free(got);
+        try testing.expectEqualSlices(f32, ref, got);
+    }
+}
