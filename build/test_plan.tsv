@@ -480,6 +480,7 @@ gpu	1352	plugins.deepseek_v41.deepseek_v41.test.dsv41 index scores: the matrix k
 gpu	3526	plugins.deepseek_v41.deepseek_v41.test.dsv41 index_nax: NAX multi-row scorer matches idx_tile scores and top-K picks across shapes, causal edges, and dtypes
 gpu	42	plugins.deepseek_v41.deepseek_v41.test.dsv41 kv row: a head-width row launches and is normed by its own rms on this GPU
 cpu	647	plugins.deepseek_v41.deepseek_v41.test.dsv41 pass size: any prompt length gets the fewest near-equal passes no wider than the widest pass; a planted cut of full passes and a short tail fails
+serial	0	plugins.deepseek_v41.deepseek_v41.test.dsv41 perplexity: non-overlapping windows of a token corpus through extend (DSV41_PPL)
 gpu	1310	plugins.deepseek_v41.deepseek_v41.test.dsv41 pf engram pass: a run of 16 spans' wkv in one call and each span's gate on its slice are the span-by-span engramApply's words at the release's shapes; rows handed to the wrong span fail
 gpu	164	plugins.deepseek_v41.deepseek_v41.test.dsv41 pf kv_rows: MLX_SERVE_DSV41_PF_KV_ROWS's one-simdgroup-a-row kv_row is kv_row's words, QAT on and off, the release width, prompt rows 17 to 17639 at nonzero positions; reversed rope periods fail
 gpu	273	plugins.deepseek_v41.deepseek_v41.test.dsv41 pf rms_rows (PF_RMS_ROWS): the query latent's rms read in place in q_kv's output is MLX's rms of its contiguous copy word for word, at the release's 1,280 of 1,792 and at other widths and row counts; a planted eps (1 for 1e-6) differs

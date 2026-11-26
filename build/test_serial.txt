@@ -14,3 +14,4 @@ fake engine: the contract catches every planted flaw, by name, in both threading
 llama adapter: the contract holds over a model-free bridge, batched and with MTP rounds	# 500 ms status gate
 ds4 adapter: the contract holds over a model-free bridge, speculative rounds and the plain path	# 500 ms status gate
 ane adapter: the contract holds over a model-free lm, several slots, and DFlash cycles	# 500 ms status gate
+dsv41 perplexity: non-overlapping windows of a token corpus through extend	# the whole pack resident (400+ GB)
