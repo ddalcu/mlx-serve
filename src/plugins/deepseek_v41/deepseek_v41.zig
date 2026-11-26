@@ -2766,17 +2766,9 @@ pub fn passRowsLimit(config: anytype) u64 {
     return ((@as(u64, 1) << 31) - 1) / per_row / SPAN * SPAN;
 }
 
-/// `MLX_SERVE_DSV41_PF_PASS_CEIL`'s cap on a memory-sized prompt pass's working set, in bytes of its bill
-/// (`prefillBytes` at a context as long as the pass, as `dsv41PassRows` prices a width): the fresh-allocation knee,
-/// measured on an M5 Ultra with 512 GiB at 1M prompt rows. There the MXFP4 view's memory-sized 47,360-row passes
-/// prefilled 3,963.6 tok/s, 44,032 rows 3,985.1 and 39,680 rows 4,081.2 (A B B A each), and NVFP4, whose share
-/// already sizes 39,680-row passes, was flat from 30,720 rows up. The cause is fresh allocations (about 15 ms/GB) that
-/// miss the pass's reserve (`MLX_SERVE_DSV41_PF_KEEP_WIDE`): the per-span context-prefix arrays, which grow faster
-/// than the width, took about 780 GiB at 39,680 rows and 1,370 and 1,490 GiB at 44,032 and 47,360. The cap is the
-/// bill of those 39,680 rows (155 spans) on the release config with the matrix units and the default levers
-/// (22,784,030,720 bytes), rounded up to whole MiB and short of the next span's (22,927,196,160), so that machine plans
-/// as measured; a machine whose share sizes a narrower pass keeps it, and one with more memory stops at these bytes.
-/// Under it a 128K, 256K or 512K prompt runs in 4, 7 or 14 passes (32,768, 37,632 and 37,632 rows).
+/// `MLX_SERVE_DSV41_PF_PASS_CEIL`'s cap on a memory-sized prompt pass's working set (its `prefillBytes` bill): past
+/// it fresh allocations miss the pass's reserve and prefill slows. Measured A B B A on an M5 Ultra 512 GiB at 1M prompt
+/// rows (the bill of its 39,680-row pass); the numbers are in the PF_PASS_CEIL section of the pull request adding it.
 pub const PASS_KNEE_BYTES: u64 = 21_729 << 20;
 
 /// `PASS_KNEE_BYTES` under `MLX_SERVE_DSV41_PF_PASS_CEIL` (default on); 0 (no cap, the memory-sized width) at `=0`.
