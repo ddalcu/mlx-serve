@@ -12,6 +12,9 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"ddalcu/Kokoro-82M-MLX-Serve"},
 };
 
+pub const modality: abi.Modality = .audio;
+pub const required_file = "";
+
 pub const model_types = [_][]const u8{"kokoro"};
 
 pub const claims = sdk.mediaClaimsByType(&model_types);

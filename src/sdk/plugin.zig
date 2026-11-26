@@ -171,6 +171,75 @@ pub fn exportAll(comptime mods: []const type) void {
     inline for (mods) |M| @export(&M.table, .{ .name = common.exportName(M.plugin.name, tableVersion(M.plugin.kind)) });
 }
 
+fn stubMediaLoad(_: *const media_abi.LoadCtx, out: *common.Verdict) callconv(.c) ?*anyopaque {
+    out.* = common.Verdict.refuse(.unsupported, "config-only test stub");
+    return null;
+}
+fn stubMediaUnload(_: *anyopaque) callconv(.c) void {}
+fn stubMediaStep(_: *anyopaque, _: *const media_abi.Request, _: *const media_abi.Progress) callconv(.c) common.Verdict {
+    return common.Verdict.refuse(.unsupported, "config-only test stub");
+}
+fn stubMediaEncode(_: *anyopaque, _: *common.Str) callconv(.c) common.Verdict {
+    return common.Verdict.refuse(.unsupported, "config-only test stub");
+}
+
+/// Exports config-only `MediaTable`s (`claims`, `caps`, `bill_*`, `modality`, `required_file` from `config.zig`;
+/// load/step/encode stubbed) so a split test binary resolves `externEntries` without compiling those plugins' bodies.
+pub fn exportMediaConfigStubs(comptime configs: []const type) void {
+    inline for (configs) |C| {
+        const S = struct {
+            const table: media_abi.MediaTable = .{
+                .name = common.Str.of(C.plugin.name),
+                .claims = C.claims,
+                .required_file = common.Str.of(C.required_file),
+                .modality = C.modality,
+                .caps = &C.caps,
+                .bill_load = &C.billLoad,
+                .bill_request = &C.billRequest,
+                .load = &stubMediaLoad,
+                .unload = &stubMediaUnload,
+                .step = &stubMediaStep,
+                .encode = &stubMediaEncode,
+            };
+        };
+        @export(&S.table, .{ .name = common.exportName(C.plugin.name, media_abi.version) });
+    }
+}
+
+fn stubModelBill(_: *const model_abi.Parsed, _: *const model_abi.Shape, out: *model_abi.Bill) callconv(.c) void {
+    out.* = .{};
+}
+fn stubModelLoad(_: *const model_abi.LoadCtx, out: *common.Verdict) callconv(.c) ?*anyopaque {
+    out.* = common.Verdict.refuse(.unsupported, "config-only test stub");
+    return null;
+}
+fn stubModelUnload(_: *anyopaque) callconv(.c) void {}
+fn stubModelForward(_: *anyopaque, _: *const model_abi.Forward, _: *model_abi.ForwardOut) callconv(.c) common.Verdict {
+    return common.Verdict.refuse(.unsupported, "config-only test stub");
+}
+
+/// Exports config-only `ModelTable`s (`claims`, `parse`, `free_parsed` from `config.zig`; load/forward stubbed)
+/// so a media-only split test binary resolves `externEntries` without compiling LLM plugin bodies.
+pub fn exportModelConfigStubs(comptime configs: []const type) void {
+    inline for (configs) |C| {
+        const S = struct {
+            const table: model_abi.ModelTable = .{
+                .name = common.Str.of(C.plugin.name),
+                .claims = C.claims,
+                .parse = &C.parse,
+                .free_parsed = &C.freeParsed,
+                .bill = &stubModelBill,
+                .load = &stubModelLoad,
+                .unload = &stubModelUnload,
+                .forward = &stubModelForward,
+                .cache = &.{},
+                .weights = &.{},
+            };
+        };
+        @export(&S.table, .{ .name = common.exportName(C.plugin.name, model_abi.version) });
+    }
+}
+
 /// Each entry's claim on one pack, into `out` (one per entry). Quant plugins claim no packs.
 pub fn claimsOf(list: []const Entry, model_type: []const u8, config_json: []const u8, dir: *const PackDir, out: []Claim) []Claim {
     for (list, out[0..list.len]) |e, *c| c.* = if (e.model) |t|

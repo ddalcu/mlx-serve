@@ -16,6 +16,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"ddalcu/MiniMax-H3-MLX-Serve-4bit"},
 };
 
+pub const modality: abi.Modality = .video;
+
 pub const model_types = [_][]const u8{"minimax_h3"};
 
 pub const claims = sdk.mediaClaimsByType(&model_types);

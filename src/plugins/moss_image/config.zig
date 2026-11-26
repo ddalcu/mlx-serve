@@ -14,6 +14,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"mlx-community/MOSS-Image-SFT-bf16"},
 };
 
+pub const modality: abi.Modality = .image;
+
 pub const model_types = [_][]const u8{"moss_image"};
 
 /// Every pack names its VAE weights so; `model_index.json` lands first in a pull.

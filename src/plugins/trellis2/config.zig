@@ -13,6 +13,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"microsoft/TRELLIS.2-4B"},
 };
 
+pub const modality: abi.Modality = .mesh;
+
 pub const model_types = [_][]const u8{"trellis2"};
 
 /// The SS decoder sorts last of the weights a pull lands (`pipeline.json` comes first).

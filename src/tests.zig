@@ -23,6 +23,7 @@ test {
     _ = @import("plugins/stable_audio3/plugin.zig");
     _ = @import("host/media_jobs/plugin/served.zig");
     _ = @import("host/media_jobs/plugin/flip_test.zig");
+    _ = @import("host/media_jobs/plugin/clef_flip_test.zig");
     _ = @import("host/media_jobs/plugin/flip_image_test.zig");
     _ = @import("plugins/gemma4/gelu_ple_test.zig");
     _ = @import("sdk/quant/gguf/claim_test.zig");

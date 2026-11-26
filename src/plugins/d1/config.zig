@@ -13,6 +13,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"LiquidAI/d1-3B"},
 };
 
+pub const modality: abi.Modality = .decision;
+
 pub const model_types = [_][]const u8{"d1"};
 
 pub fn claims(model_type: abi.Str, dir: *const abi.PackDir) callconv(.c) abi.Claim {

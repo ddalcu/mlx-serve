@@ -13,6 +13,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"mlx-community/Ming-3.0-tts-0.5B-8bit"},
 };
 
+pub const modality: abi.Modality = .audio;
+
 pub const model_types = [_][]const u8{"dense"};
 
 pub const required_file = "model.safetensors";

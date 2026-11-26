@@ -12,6 +12,10 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"TencentARC/Pixal3D"},
 };
 
+pub const modality: abi.Modality = .mesh;
+pub const billLoad = t2_config.billLoad;
+pub const billRequest = t2_config.billRequest;
+
 pub const model_types = [_][]const u8{"pixal3d"};
 
 /// Pixal3D ships its decoders in its own ckpts/; the texture decoder sorts last.

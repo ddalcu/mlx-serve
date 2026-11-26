@@ -12,6 +12,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"mlx-community/Nemotron-3-Diarization-8bit"},
 };
 
+pub const modality: abi.Modality = .diarization;
+
 pub const model_types = [_][]const u8{"nemotron_diarization"};
 
 pub const claims = sdk.mediaClaimsByType(&model_types);

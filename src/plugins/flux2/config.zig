@@ -15,6 +15,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"mlx-community/flux2-klein-4b-4bit"},
 };
 
+pub const modality: abi.Modality = .image;
+
 pub const model_types = [_][]const u8{ "flux2-klein", "flux2" };
 
 /// No marker (as discovery has always treated these packs).

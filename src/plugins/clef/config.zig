@@ -11,6 +11,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{},
 };
 
+pub const modality: abi.Modality = .decision;
+
 pub const model_types = [_][]const u8{"clef"};
 
 pub fn claims(model_type: abi.Str, dir: *const abi.PackDir) callconv(.c) abi.Claim {

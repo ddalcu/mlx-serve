@@ -13,6 +13,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"ddalcu/YuE2-3B-MLX-Serve-8bit"},
 };
 
+pub const modality: abi.Modality = .audio;
+
 pub const model_types = [_][]const u8{"yue2"};
 
 pub const claims = sdk.mediaClaimsByType(&model_types);
