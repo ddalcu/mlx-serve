@@ -1142,6 +1142,28 @@ test "ByteFallback decoder: <0xNN> runs decode as bytes, invalid runs as U+FFFD 
     try testing.expectEqual(@as(?u8, null), byteTokenValue("\xe2\x96\x81a"));
 }
 
+// Bar: a `<0xNN>` byte token and an added token have no spelling, so `respell` never swaps one for plain text.
+test "tokenSpelling: plain text spells itself; a byte token and an added token spell nothing" {
+    const allocator = testing.allocator;
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    try id_to_token.put(1, "<0x");
+    try id_to_token.put(10, "<0x41>");
+    try id_to_token.put(30, "<|end|>");
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+    try special_tokens.put("<|end|>", 30);
+    var tok = makeBpeTestTokenizer(allocator, &vocab, &merge_ranks, &id_to_token, &special_tokens);
+    defer tok.unicode_to_byte.deinit();
+    try testing.expectEqualStrings("<0x", tok.tokenSpelling(1).?);
+    try testing.expectEqual(@as(?[]const u8, null), tok.tokenSpelling(10));
+    try testing.expectEqual(@as(?[]const u8, null), tok.tokenSpelling(30));
+}
+
 test "decoderHasByteFallback: Sequence containing ByteFallback, bare ByteFallback, others" {
     const allocator = testing.allocator;
     const seq = try std.json.parseFromSlice(std.json.Value, allocator,

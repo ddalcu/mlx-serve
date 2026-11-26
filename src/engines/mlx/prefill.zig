@@ -168,13 +168,20 @@ fn importModuleSnapshot(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, ma
 fn respellPrompt(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache, xfm: *Transformer) bool {
     const tok = slot.model.tokenizer orelse return false;
     const p = (hc.respellPrompt(slot.allocator, slot.full_prompt, slot.media, slot.has_tools, slot.cache.config, tok) catch null) orelse return false;
+    // Admission billed the prompt as sent plus `max_tokens` and checked the context: the respelling stays inside both.
+    const billed = slot.full_prompt.len + slot.max_tokens;
+    const context: usize = @import("admission/context.zig").getEffectiveContextLength(&xfm.config);
+    if (p.ids.len >= @min(billed, context)) {
+        slot.allocator.free(p.ids);
+        slot.allocator.free(p.media);
+        return false;
+    }
     log.info("  [hot-cache] respelled the prompt as the cache spells its answers ({d} -> {d} tokens)\n", .{ slot.full_prompt.len, p.ids.len });
     slot.allocator.free(slot.full_prompt);
     slot.allocator.free(slot.media);
     slot.full_prompt = p.ids;
     slot.media = p.media;
-    const room = @as(usize, @import("admission/context.zig").getEffectiveContextLength(&xfm.config)) -| p.ids.len;
-    slot.max_tokens = @intCast(@max(1, @min(slot.max_tokens, room)));
+    slot.max_tokens = @intCast(@min(slot.max_tokens, billed - p.ids.len, context - p.ids.len));
     return true;
 }
 
