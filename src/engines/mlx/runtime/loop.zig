@@ -1,6 +1,7 @@
 //! The inference loop: work-pending checks, side-queue drains, the main loop.
 
 const std = @import("std");
+const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const sleep_inhibit = @import("sleep_inhibit.zig");
@@ -200,7 +201,11 @@ pub fn drainSideQueues(sch: *Scheduler) bool {
         if (s.model.transformer) |xfm| if (xfm.qwen4Trunk()) |t| t.resetQsaPooledRope();
         s.deinit();
     }
-    if (cleanup_n > 0) publishHotCacheResidency(sch);
+    if (cleanup_n > 0) {
+        publishHotCacheResidency(sch);
+        // finishSlot's clear ran before these slots were freed, and a decode-phase cancel never reached it.
+        _ = mlx.mlx_clear_cache();
+    }
     for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
     for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
     return cleanup_n + vision_n + embed_n > 0;

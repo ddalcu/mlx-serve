@@ -762,6 +762,37 @@ test "deepseek_v41 served: cancel, pad-only, failed forward and mismatched snaps
     try testing.expectEqual(@as(u64, 0), driver.stateBytes(&p.xfm));
 }
 
+test "deepseek_v41 served: a cancelled slot drained from the cleanup queue returns its buffers to the OS" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    const abandoned = try h.newSlot(&.{ 3, 17, 42, 9, 7, 25, 1, 60 });
+    const id = @import("../../engines/mlx/plugin/settle.zig").slotId(p.xfm.plugin.?, &abandoned.ctx);
+    try testing.expect(driver.auxBeginPrompt(&p.xfm, id, abandoned.full_prompt, null, 0, true).isOk());
+    {
+        var g = ops.Graph.init(testing.allocator, mlx.gpuStream());
+        defer g.deinit();
+        try ops.eval(try g.adopt(try p.xfm.forwardWith(&abandoned.ctx, try g.fromSlice(i32, &.{ 3, 17, 42, 9, 7, 25, 1 }, &.{ 1, 7 }))));
+    }
+    abandoned.cancelled.store(true, .release);
+    try h.sch.cleanup_queue.append(testing.allocator, abandoned);
+    _ = mlx.mlx_synchronize(mlx.gpuStream());
+    _ = mlx.mlx_clear_cache();
+    var held: usize = 0;
+    _ = mlx.mlx_get_active_memory(&held);
+    try testing.expect(@import("../../engines/mlx/runtime/loop.zig").drainSideQueues(&h.sch));
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    try testing.expect(active < held);
+    var pooled: usize = 0;
+    _ = mlx.mlx_get_cache_memory(&pooled);
+    try testing.expectEqual(@as(usize, 0), pooled);
+}
+
 test "deepseek_v41 served: a prefill cancelled past the commit floor is committed where it stopped, and the same prompt resumes there" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
