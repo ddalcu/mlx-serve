@@ -843,17 +843,22 @@ test "ThinkScan: per-token work is FLAT in buffer size, not linear" {
     var scan: ThinkScan = .{};
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(testing.allocator);
-    var max_span: usize = 0;
-    var i: usize = 0;
-    while (i < 4000) : (i += 1) {
-        // A think block that never closes — the expensive arm of the bench.
-        try buf.appendSlice(testing.allocator, if (i == 0) "<think>" else "token words and more ");
+    // A think block that never closes — the expensive arm of the bench. Measured on a short buffer, then past 60 KB:
+    // the gate's other checks read the whole buffer, so growing it token by token costs a Debug build seconds.
+    try buf.appendSlice(testing.allocator, "<think>");
+    _ = streamThinkGateScan(buf.items, true, false, false, &scan);
+    for ([_]usize{ 0, 60_000 }) |grow_to| {
+        while (buf.items.len < grow_to) try buf.appendSlice(testing.allocator, "token words and more ");
         _ = streamThinkGateScan(buf.items, true, false, false, &scan);
-        if (i > 0 and scan.last_scan_span > max_span) max_span = scan.last_scan_span;
+        var i: usize = 0;
+        while (i < 100) : (i += 1) {
+            try buf.appendSlice(testing.allocator, "token words and more ");
+            _ = streamThinkGateScan(buf.items, true, false, false, &scan);
+            // Bounded by one token's bytes plus the trailing partial-marker candidate.
+            try testing.expect(scan.last_scan_span <= 64);
+        }
     }
     try testing.expect(buf.items.len > 60_000);
-    // Bounded by one token's bytes plus the trailing partial-marker candidate.
-    try testing.expect(max_span <= 64);
 
     // A growing partial marker at the tail is re-examined, and only it.
     var scan2: ThinkScan = .{};
@@ -888,7 +893,7 @@ test "bench: streaming think gate scans BYTES, memoized vs fresh" {
     // not merely smaller. Wall clock is unavailable in a hermetic test under
     // Zig 0.17 (clocks live under std.Io) and would be noise anyway — bytes
     // examined is the thing that was quadratic, and it is deterministic.
-    // Mirrors the 4b.4 harness: 4000 tokens growing to ~104 KB.
+    // 1000 tokens growing to ~26 KB: the gate's other checks read the whole buffer on every token.
     const a = testing.allocator;
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(a);
@@ -897,7 +902,8 @@ test "bench: streaming think gate scans BYTES, memoized vs fresh" {
     var memo_bytes: u64 = 0;
     var fresh_bytes: u64 = 0;
     var i: usize = 0;
-    while (i < 4000) : (i += 1) {
+    const tokens = 1000;
+    while (i < tokens) : (i += 1) {
         try buf.appendSlice(a, "some reasoning words here ");
         const g = streamThinkGateScan(buf.items, true, false, false, &scan);
         try testing.expectEqual(StreamThinkGate.hold_thinking, g);
@@ -908,7 +914,7 @@ test "bench: streaming think gate scans BYTES, memoized vs fresh" {
     }
     std.debug.print(
         "[think-gate] {d} tokens to {d} KB: fresh >= {d} KB scanned, memoized {d} KB ({d}x)\n",
-        .{ 4000, buf.items.len / 1024, fresh_bytes / 1024, memo_bytes / 1024, fresh_bytes / @max(memo_bytes, 1) },
+        .{ tokens, buf.items.len / 1024, fresh_bytes / 1024, memo_bytes / 1024, fresh_bytes / @max(memo_bytes, 1) },
     );
     // Linear-in-total, not quadratic: the memoized scan reads each byte a
     // bounded number of times.
