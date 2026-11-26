@@ -114,6 +114,15 @@ pub fn indexOfThinkCloseTag(text: []const u8, from: usize) ?TagAt {
     return null;
 }
 
+pub fn indexOfChannelCloseTag(text: []const u8, from: usize) ?usize {
+    var i = from;
+    while (std.mem.indexOfPos(u8, text, i, "<channel|>")) |p| {
+        if (!thinkCloseIsToolCallPayload(text, p)) return p;
+        i = p + "<channel|>".len;
+    }
+    return null;
+}
+
 /// Whether a `</think>` at `pos` is an ARGUMENT VALUE rather than a block close.
 ///
 /// The think split runs before tool parse, and this is the shared close-tag

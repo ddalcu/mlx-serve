@@ -7,6 +7,7 @@ const lastUnclosedThinkOpen = @import("think_tags.zig").lastUnclosedThinkOpen;
 const thinkOpenTagLenAt = @import("think_tags.zig").thinkOpenTagLenAt;
 const indexOfThinkOpenTag = @import("think_tags.zig").indexOfThinkOpenTag;
 const indexOfThinkCloseTag = @import("think_tags.zig").indexOfThinkCloseTag;
+const indexOfChannelCloseTag = @import("think_tags.zig").indexOfChannelCloseTag;
 const trimLeakedToolMarkup = @import("../tools/markup_trim.zig").trimLeakedToolMarkup;
 const trimTrailingThinkClosers = @import("think_tags.zig").trimTrailingThinkClosers;
 const stripTrailingThinkOpen = @import("think_tags.zig").stripTrailingThinkOpen;
@@ -67,7 +68,7 @@ pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_
     // `thinking` flag because the content marker needs stripping either way.
     if (splitInklingChannels(text)) |split| return split;
     // Gemma 4 style: <|channel>thought\n...<channel|>\n<|channel>\ncontent
-    if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
+    if (indexOfChannelCloseTag(text, 0)) |end| {
         const think_tag = "<|channel>thought\n";
         const reasoning_start: usize = if (std.mem.startsWith(u8, text, think_tag)) think_tag.len else if (std.mem.startsWith(u8, text, "<|channel>thought")) "<|channel>thought".len else 0;
         const reasoning = std.mem.trim(u8, text[reasoning_start..end], "\n ");
@@ -713,4 +714,11 @@ test "answerStopIndex: a stop after trailing whitespace in the answer still cuts
     try t.expectEqual(@as(?usize, std.mem.indexOf(u8, hard_break, "  \n").? + 2), answerStopIndex(hard_break, 0, "\n", true));
     // Whitespace leading the answer is never delivered, so it never matches.
     try t.expectEqual(@as(?usize, null), answerStopIndex("</think>\n\nHi", 0, "\n\n", true));
+}
+
+test "splitThinkBlock: a Gemma <channel|> inside a tool argument does not close the thought" {
+    const text = "Reasoning.\n</think>\n\n<tool_call>\n<function=Edit>\n<parameter=old_string>\nif (std.mem.indexOf(u8, text, \"<channel|>\")) |end| {\n</parameter>\n</function>\n</tool_call>";
+    const split = splitThinkBlockKeepingMarkup(text, true, true);
+    try testing.expectEqualStrings("Reasoning.", split.reasoning_content.?);
+    try testing.expect(std.mem.startsWith(u8, split.content, "<tool_call>\n<function=Edit>"));
 }
