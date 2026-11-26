@@ -249,6 +249,10 @@ pub const plugin = struct {
     pub fn slotStates(_: *anyopaque, _: []const u32, _: []*State, _: []u64) bool {
         return false;
     }
+
+    pub fn lossyTypical() ?@import("../../../sdk/spec/mtp_acceptance.zig").Typical {
+        return null;
+    }
 };
 
 /// `plugins/deepseek_v41/config.zig`.
