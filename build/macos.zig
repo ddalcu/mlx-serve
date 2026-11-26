@@ -253,6 +253,8 @@ fn unitModule(g: *const Graph, includes: []const std.Build.Module.IncludeDir, ro
 pub const Tests = struct {
     /// `zig build test`.
     step: *std.Build.Step,
+    /// `zig build test-aux`: what `test` runs besides the unit-test binary (a gate that runs the binary itself runs this).
+    aux: *std.Build.Step,
     /// `zig build test-build`.
     build: *std.Build.Step,
     /// The unit-test binary's shard runs.
@@ -280,9 +282,8 @@ pub fn addUnitTests(g: *const Graph) Tests {
     const test_build = b.step("test-build", "Compile unit tests without running them");
     test_build.dependOn(&b.addInstallArtifact(unit_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
 
-    // The one test binary runs as `test-shards` processes in parallel, each every n-th test (build/test_runner.zig),
-    // filtered or not: a `sharded:` test (the kernel contract's gates 1-4) splits its own work across them, so a
-    // filtered contract run takes a shard's time, not the whole registry's on one core. `-Dtest-shards=1`: one process.
+    // The one test binary runs as `test-shards` processes in parallel, each a time-balanced share of the tests
+    // (build/test_runner.zig), filtered or not; a `sharded:` test runs in every one. `-Dtest-shards=1`: one process.
     const shards: u32 = b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse defaultShards();
     // The flip proof (`scripts/flip_proof.py`): every test starts with this lever at its other arm (sdk/testing/world.zig).
     const test_flip = b.option([]const u8, "test-flip", "Run every test with this lever (NAME or NAME=value) at its other arm: the flip proof");
@@ -296,6 +297,8 @@ pub fn addUnitTests(g: *const Graph) Tests {
         if (shards > 1) {
             run.*.setEnvironmentVariable("MLX_SERVE_TEST_SHARD", b.fmt("{d}/{d}", .{ k, shards }));
             run.*.setName(b.fmt("run test shard {d}/{d}", .{ k, shards }));
+            // Shards balanced by each test's measured time (`scripts/test_plan.py` writes the plan).
+            run.*.addPrefixedFileArg("--plan=", b.path("build/test_plan.tsv"));
         }
         // A filtered run is a targeted one, often gated on an env var (ANE_TEST_PACK, QWEN4_TEST_MODEL)
         // that the run's cache key does not see: it reruns every time.
@@ -312,11 +315,13 @@ pub fn addUnitTests(g: *const Graph) Tests {
         }
         test_step.dependOn(&run.*.step);
     }
-    plugins.addTests(b, test_step);
-    config.addTests(b, test_step);
-    test_step.dependOn(&b.top_level_steps.get("lint-test").?.step);
-    test_step.dependOn(&b.top_level_steps.get("unit-closure").?.step);
-    return .{ .step = test_step, .build = test_build, .runs = test_runs, .filters = test_filters };
+    const aux = b.step("test-aux", "Run the build's, the lint's and the vz agent's own tests and the import closure check");
+    plugins.addTests(b, aux);
+    config.addTests(b, aux);
+    aux.dependOn(&b.top_level_steps.get("lint-test").?.step);
+    aux.dependOn(&b.top_level_steps.get("unit-closure").?.step);
+    test_step.dependOn(aux);
+    return .{ .step = test_step, .aux = aux, .build = test_build, .runs = test_runs, .filters = test_filters };
 }
 
 /// `test-compile`: what the unit-test runs need (the binary, the kit plugins they load), built with no test run. A gate
