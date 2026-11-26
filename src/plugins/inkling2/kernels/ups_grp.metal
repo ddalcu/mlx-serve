@@ -33,6 +33,43 @@ const device S* sa_u = sa_g + SPR;
 const device S* ba_g = (const device S*)WB + base * SPR;
 const device S* ba_u = ba_g + SPR;
 
+#define SUM16(v) do { \
+    v += simd_shuffle_xor(v, 8); \
+    v += simd_shuffle_xor(v, 4); \
+    v += simd_shuffle_xor(v, 2); \
+    v += simd_shuffle_xor(v, 1); \
+} while (0)
+
+if (cnt == 1u) {
+    float ag0 = 0.0f, au0 = 0.0f;
+    const device T* x0p = X + size_t(r0) * K;
+    for (uint k = sub * 16u; k < K; k += 256u) {
+        const device vec<T, 4>* xp = (const device vec<T, 4>*)(x0p + k);
+        const float4 v0 = float4(xp[0]), v1 = float4(xp[1]), v2 = float4(xp[2]), v3 = float4(xp[3]);
+        float xr[16] = {
+            v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w,
+            v2.x, v2.y, v2.z, v2.w, v3.x, v3.y, v3.z, v3.w,
+        };
+        const uint c = k >> 4;
+        if constexpr (FMT == 3) {
+            ag0 += msv_ink2_affine_chunk<S, BITS, GS>(arow_g, sa_g, ba_g, c, xr);
+            au0 += msv_ink2_affine_chunk<S, BITS, GS>(arow_u, sa_u, ba_u, c, xr);
+        } else {
+            ag0 += msv_ink2_chunk(FMT, wrow_g, srow_g, c, xr);
+            au0 += msv_ink2_chunk(FMT, wrow_u, srow_u, c, xr);
+        }
+    }
+    SUM16(ag0); SUM16(au0);
+    if (sub == 0u) {
+        const float sc = SCALED ? SC[exp_id] : 1.0f;
+        const float g = float(T(ag0)) * sc;
+        const float u = float(T(au0)) * sc;
+        const float capped = (precise::tanh(g * PR[0]) * PR[1]) * (precise::tanh(u * PR[2]) * PR[3]);
+        ACT[size_t(p0) * I + row0] = T(capped / (1.0f + precise::exp(-g)));
+    }
+    return;
+}
+
 float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
 float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
 
@@ -71,13 +108,6 @@ for (uint k = sub * 16u; k < K; k += 256u) {
     if (cnt > 3u) ACC_UP(r3, ag3, au3);
     #undef ACC_UP
 }
-
-#define SUM16(v) do { \
-    v += simd_shuffle_xor(v, 8); \
-    v += simd_shuffle_xor(v, 4); \
-    v += simd_shuffle_xor(v, 2); \
-    v += simd_shuffle_xor(v, 1); \
-} while (0)
 
 SUM16(ag0); SUM16(au0);
 if (cnt > 1u) { SUM16(ag1); SUM16(au1); }

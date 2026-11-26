@@ -53,6 +53,9 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **2 to `packed_rows` rows (63) read the packed expert banks in place, their picks GROUPED by expert** (`group`: tiles
   of up to 4 picks; `ups_grp`, `downs_grp`, then `few_tail`): an expert's bytes are decoded once a tile. One row reads
   `ups`/`downs`; MLX's gather wins only from 64 rows (its sorted tiles start there; under it, it reads a bank a pick).
+- **Non-NAX wide-tile sorted MoE prefill (`moeWide`, `tile_scan.metal` + `moe_wide.metal`)**: serves non-NAX Apple9+
+  from `moe_wide_min_rows` (1536, covering 2048/4096 chunks) with fused soft-capped SwiGLU and direct `rmap` reads;
+  below 1536 per-expert tiles underfill and stock sorted `gather_qmm` is faster.
 - **2 to 16 rows read the keys on the NAX tensor unit in one pass** (`relsplit_nax.metal`, `splitReadNax`; up to four
   slots' blocks a launch, `splitReadNaxLanes`: a kernel takes 31 buffers). `relsplit.metal` serves a GPU without NAX, its
   splits joined in `relcomb` (normalised after the sum: contract gate 4). Under 4 KB of keys MLX binds them `constant`: old path.
@@ -121,9 +124,9 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **A sliding visit keeps a ring of window + 2048 rows** (`Config.ring`, declared as `CacheFacts.sliding_ring`;
   `layers.appendKv` at every append): kept whole, the 40 sliding visits held several times the KV a long prompt needs, and every
   prefix-cache entry with it. A match more than the slack behind an entry's end then misses.
-- **The draft head's Markov chain runs three launches a step** (`markovStep`: `markov_rnn`, `markov_fold`,
-  `markov_pick`) and picks in MLX's argmax order (a NaN first, the lower index on ties); `draft.markov`'s op chain
-  serves any other stream or dtype and is the proof's reference.
+- **The draft head's 3 layers and Markov chain**: `draft_bits = 8` joins `q|k|v`, `k_ctx|v_ctx`, `gate|up` and quantizes
+  the layers to affine 8-bit g64; `fold` is group-64 uint8+f16 (`markov_fold_q8.metal`, `~55 MB < 96 MB` SLC) and
+  `markov_pick_rnn.metal` fuses pick + next-step RNN (`LAW=0` greedy, `LAW=1` Gumbel-max + parallel law probs). `draft.markov`'s op chain is the proof reference.
 - **Batched decode**: slots are rows with their own cache and conv state (`attendSlots`, `state.get`/`put`); their
   reads run as one `relslots` launch per 8 slots (each slot's K, V and K's strides a buffer: a kernel takes 31) into
   `relcomb`. A CPU stream or several rows a slot run a slot at a time.
@@ -167,6 +170,7 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - `contract.zig`: `gated`, `state`, `relmask`, `act`, `sum`, `topk`, `gate` (its one-row arm), `relsplit`, `relattn_nax`,
   `relcomb`, `relslots`, `markov_rnn`, `markov_fold`, `markov_pick`, `oproj`, `router`, `norm`.
 - Contract entries owed (GPU proofs in `proof_test.zig` cover each): `pre`, `prep`, `mid`, `ups`, `downs`, `relattn`,
-  `gate`'s prompt arm, `group`, `ups_grp`, `downs_grp`, `few_tail`, `relsplit_nax`, `relsplit_lanes`, `commit_conv`,
+  `gate`'s prompt arm, `group`, `ups_grp`, `downs_grp`, `few_tail`, `topk_group`, `tile_scan`, `moe_wide`,
+  `markov_fold_q8`, `markov_pick_rnn`, `relsplit_nax`, `relsplit_lanes`, `commit_conv`,
   `accept_tree`, `sample_tree_draw`/`_mass`/`_search`, `dflash_conv`/`_edges`/`_top16_shard`/`_top16_merge`/`_tree`.
 - Not verified: an image against mlx-lm's tower, the drafter's tokens against oMLX's.

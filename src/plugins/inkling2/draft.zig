@@ -28,17 +28,20 @@ pub const Layer = struct {
     post_norm: Array,
     /// The tap mix's norm (`dflare_norm`), f32.
     mix_norm: Array,
-    q: Linear,
-    k: Linear,
-    v: Linear,
+    q: Linear = .{},
+    k: Linear = .{},
+    v: Linear = .{},
+    qkv: Linear = .{},
     o: Linear,
-    k_ctx: Linear,
-    v_ctx: Linear,
+    k_ctx: Linear = .{},
+    v_ctx: Linear = .{},
+    kv_ctx: Linear = .{},
     q_norm: Array,
     k_norm: Array,
     k_norm_ctx: Array,
-    gate: Linear,
-    up: Linear,
+    gate: Linear = .{},
+    up: Linear = .{},
+    gate_up: Linear = .{},
     down: Linear,
 };
 
@@ -112,11 +115,17 @@ pub const Drafter = struct {
     rnn_norm: Array = .{},
     fold: Array = .{},
     fold_bias: Array = .{},
+    /// Group-64 affine 8-bit copy of `fold` (`[rank, V]` uint8 + `[rank/64, V]` f16 scale/bias) so the 7-step Markov
+    /// chain fits in SLC (~55 MB vs 103 MB). `fold` stays for the CPU/op-chain fallback.
+    fold_q: Array = .{},
+    fold_s: Array = .{},
+    fold_qb: Array = .{},
     /// An 8-bit copy of a dense trunk head, which the block rows are read through (`draftHead`); null = the trunk's.
     head: ?Linear = null,
 
     /// The drafter beside the pack, its Markov head folded over the trunk's `head`; null when the pack ships none.
-    pub fn load(ctx: *const abi.LoadCtx, cfg: config.Draft, hidden: u32, head: *const Linear, s: mlx.mlx_stream) !?*Drafter {
+    /// `bits` quantizes the layer projections (affine g64) and `fold` (group-64 uint8); 0 keeps BF16 as shipped.
+    pub fn load(ctx: *const abi.LoadCtx, cfg: config.Draft, hidden: u32, head: *const Linear, s: mlx.mlx_stream, bits: u32) !?*Drafter {
         if (!ctx.dir.exists(ctx.dir.ctx, abi.Str.of(config.draft_file))) return null;
         var w = try reader.headWeights(ctx, &.{config.draft_file}, "fuse_weight", "\x00");
         defer w.deinit();
@@ -137,18 +146,14 @@ pub const Drafter = struct {
                 .in_norm = try at.need("input_layernorm.weight"),
                 .post_norm = try at.need("post_attention_layernorm.weight"),
                 .mix_norm = try at.float("dflare_norm.weight"),
-                .q = try at.linear("self_attn.q_proj"),
-                .k = try at.linear("self_attn.k_proj"),
-                .v = try at.linear("self_attn.v_proj"),
-                .o = try at.linear("self_attn.o_proj"),
-                .k_ctx = try at.linear("self_attn.k_proj_ctx"),
-                .v_ctx = try at.linear("self_attn.v_proj_ctx"),
+                .qkv = try at.narrowedJoined(&.{ "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj" }, bits),
+                .o = try at.narrowed("self_attn.o_proj", bits),
+                .kv_ctx = try at.narrowedJoined(&.{ "self_attn.k_proj_ctx", "self_attn.v_proj_ctx" }, bits),
                 .q_norm = try at.need("self_attn.q_norm.weight"),
                 .k_norm = try at.need("self_attn.k_norm.weight"),
                 .k_norm_ctx = try at.need("self_attn.k_norm_ctx.weight"),
-                .gate = try at.linear("mlp.gate_proj"),
-                .up = try at.linear("mlp.up_proj"),
-                .down = try at.linear("mlp.down_proj"),
+                .gate_up = try at.narrowedJoined(&.{ "mlp.gate_proj", "mlp.up_proj" }, bits),
+                .down = try at.narrowed("mlp.down_proj", bits),
             };
         }
         at.layer = null;
@@ -170,6 +175,12 @@ pub const Drafter = struct {
         const out_b = try at.raw("markov_head.hidden_out.bias");
         d.fold = try at.keep(try g.reshape(try project(&g, head, try g.reshape(try g.transpose(out_w, &.{ 1, 0 }), &.{ 1, rank, @intCast(hidden) })), &.{ rank, -1 }));
         d.fold_bias = try at.keep(try project(&g, head, try g.reshape(out_b, &.{ 1, 1, @intCast(hidden) })));
+        if (bits > 0 and @rem(rank, 64) == 0 and @rem(ops.shape(d.fold)[1], 8) == 0 and (ops.dtype(d.fold) == .bfloat16 or ops.dtype(d.fold) == .float16)) {
+            const qf = try quantizeFold(&g, d.fold, 64);
+            d.fold_q = try at.keep(qf[0]);
+            d.fold_s = try at.keep(qf[1]);
+            d.fold_qb = try at.keep(qf[2]);
+        }
         d.head = try at.draftHead(head);
         return d;
     }
@@ -233,13 +244,22 @@ pub const Drafter = struct {
                 }
             }
             // A prompt's rows a slice at a time, so the f32 tap mix stays small.
+            const kv_dim: c_int = @intCast(d.cfg.kv_heads * d.cfg.head_dim);
             var r0: c_int = 0;
             while (r0 < n) : (r0 += 1024) {
                 const r1 = @min(n, r0 + 1024);
                 const rows32 = try lg.astype(try lg.reshape(try sideBySide(&lg, parts, r0, r1), &.{ 1, r1 - r0, @intCast(d.cfg.tap_count), @intCast(d.hidden) }), .float32);
                 const context = try d.mix(&lg, rows32, @intCast(i), L.mix_norm);
-                const k = try d.heads(&lg, try project(&lg, &L.k_ctx, context), d.cfg.kv_heads, L.k_norm_ctx, @as(c_int, @intCast(first)) + r0);
-                const v = try d.heads(&lg, try project(&lg, &L.v_ctx, context), d.cfg.kv_heads, null, null);
+                const k, const v = if (L.kv_ctx.w.ctx != null) blk: {
+                    const kv_c = try project(&lg, &L.kv_ctx, context);
+                    break :blk .{
+                        try d.heads(&lg, try lg.sliceAxis(kv_c, 2, 0, kv_dim), d.cfg.kv_heads, L.k_norm_ctx, @as(c_int, @intCast(first)) + r0),
+                        try d.heads(&lg, try lg.sliceAxis(kv_c, 2, kv_dim, 2 * kv_dim), d.cfg.kv_heads, null, null),
+                    };
+                } else .{
+                    try d.heads(&lg, try project(&lg, &L.k_ctx, context), d.cfg.kv_heads, L.k_norm_ctx, @as(c_int, @intCast(first)) + r0),
+                    try d.heads(&lg, try project(&lg, &L.v_ctx, context), d.cfg.kv_heads, null, null),
+                };
                 for ([2]Array{ k, v }, &bufs) |x, *buf| buf.* = try lg.sliceUpdate(buf.*, try lg.astype(x, ops.dtype(d.norm)), &.{ 0, 0, at + r0, 0 }, &.{ 1, kv, at + r1, hd });
             }
             for (bufs, [2]*Array{ &cc.fk[i], &cc.fv[i] }) |buf, dst| {
@@ -297,6 +317,9 @@ pub const Drafter = struct {
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
         const back = [_]c_int{ 0, 2, 1, 3 };
 
+        const q_dim: c_int = @intCast(cfg.heads * cfg.head_dim);
+        const kv_dim: c_int = @intCast(cfg.kv_heads * cfg.head_dim);
+        const inter_dim: c_int = @intCast(cfg.intermediate);
         var h = try g.concat(&.{ try g.astype(anchor, dt), try g.broadcast(try g.astype(d.mask, dt), &.{ 1, block - 1, hidden }) }, 1);
         for (d.layers, 0..) |*L, i| {
             var lg = g.scope();
@@ -315,8 +338,14 @@ pub const Drafter = struct {
             if (full_read) {} else if (own > 0) {
                 const rows32 = if (own == fresh) new32.? else try tapsOf(&lg, taps, 0, n, cfg.tap_count, hidden);
                 const context = try d.mix(&lg, rows32, @intCast(i), L.mix_norm);
-                kc = try d.heads(&lg, try project(&lg, &L.k_ctx, context), cfg.kv_heads, L.k_norm_ctx, position - own);
-                vc = try d.heads(&lg, try project(&lg, &L.v_ctx, context), cfg.kv_heads, null, null);
+                if (L.kv_ctx.w.ctx != null) {
+                    const kv_c = try project(&lg, &L.kv_ctx, context);
+                    kc = try d.heads(&lg, try lg.sliceAxis(kv_c, 2, 0, kv_dim), cfg.kv_heads, L.k_norm_ctx, position - own);
+                    vc = try d.heads(&lg, try lg.sliceAxis(kv_c, 2, kv_dim, 2 * kv_dim), cfg.kv_heads, null, null);
+                } else {
+                    kc = try d.heads(&lg, try project(&lg, &L.k_ctx, context), cfg.kv_heads, L.k_norm_ctx, position - own);
+                    vc = try d.heads(&lg, try project(&lg, &L.v_ctx, context), cfg.kv_heads, null, null);
+                }
             }
             if (!full_read and own < n) {
                 const cc = cache.?;
@@ -340,9 +369,18 @@ pub const Drafter = struct {
                 cc.v[i] = v_held;
             };
             const x = try lg.rmsNorm(h, L.in_norm, cfg.eps);
-            const q = try d.heads(&lg, try project(&lg, &L.q, x), cfg.heads, L.q_norm, position);
-            const kb = try d.heads(&lg, try project(&lg, &L.k, x), cfg.kv_heads, L.k_norm, position);
-            const vb = try d.heads(&lg, try project(&lg, &L.v, x), cfg.kv_heads, null, null);
+            const q, const kb, const vb = if (L.qkv.w.ctx != null) blk: {
+                const qkv = try project(&lg, &L.qkv, x);
+                break :blk .{
+                    try d.heads(&lg, try lg.sliceAxis(qkv, 2, 0, q_dim), cfg.heads, L.q_norm, position),
+                    try d.heads(&lg, try lg.sliceAxis(qkv, 2, q_dim, q_dim + kv_dim), cfg.kv_heads, L.k_norm, position),
+                    try d.heads(&lg, try lg.sliceAxis(qkv, 2, q_dim + kv_dim, q_dim + 2 * kv_dim), cfg.kv_heads, null, null),
+                };
+            } else .{
+                try d.heads(&lg, try project(&lg, &L.q, x), cfg.heads, L.q_norm, position),
+                try d.heads(&lg, try project(&lg, &L.k, x), cfg.kv_heads, L.k_norm, position),
+                try d.heads(&lg, try project(&lg, &L.v, x), cfg.kv_heads, null, null),
+            };
             var keys: Array = .{};
             var values: Array = .{};
             if (full_read) {
@@ -368,7 +406,11 @@ pub const Drafter = struct {
             const read = try lg.reshape(try lg.transpose(try lg.sdpa(q, keys, values, scale, .none), &back), &.{ 1, block, -1 });
             const mid = try lg.add(h, try project(&lg, &L.o, read));
             const y = try lg.rmsNorm(mid, L.post_norm, cfg.eps);
-            const mlp = try project(&lg, &L.down, try lg.mul(try lg.silu(try project(&lg, &L.gate, y)), try project(&lg, &L.up, y)));
+            const gated_mlp = if (L.gate_up.w.ctx != null) blk: {
+                const gu = try project(&lg, &L.gate_up, y);
+                break :blk try lg.mul(try lg.silu(try lg.sliceAxis(gu, 2, 0, inter_dim)), try lg.sliceAxis(gu, 2, inter_dim, 2 * inter_dim));
+            } else try lg.mul(try lg.silu(try project(&lg, &L.gate, y)), try project(&lg, &L.up, y));
+            const mlp = try project(&lg, &L.down, gated_mlp);
             h = try g.keep(try lg.add(mid, mlp));
         }
         const drafts: c_int = if (law) |l| @min(block - 1, @as(c_int, @intCast(@min(l.steps, block - 1)))) else block - 1;
@@ -395,16 +437,72 @@ pub const Drafter = struct {
         var sure: [abi.max_round_tokens]Array = undefined;
         var probs: [abi.max_round_tokens]Array = undefined;
         const dense_rows = try g.contiguous(rows);
+        if (fused and steps > 0) {
+            const cap = try g.fromSlice(f32, &.{softcap}, &.{1});
+            const q8 = d.fold_q.ctx != null;
+            if (law) |l| if (q8) {
+                const inv_t: u32 = @bitCast(@as(f32, 1.0 / l.temperature));
+                const lparams = try g.fromSlice(u32, &.{ inv_t, @truncate(l.seed), @truncate(l.seed >> 32), 0 }, &.{4});
+                var scaled_rows: [abi.max_round_tokens]Array = undefined;
+                var lse_rows: [abi.max_round_tokens]Array = undefined;
+                const step0 = try g.fromSlice(i32, &.{0}, &.{1});
+                var p = try kernels.markovRnn(g, d.rnn.w, d.rnn_bias, state, d.prev_rows, dense_rows, newest, prev, step0);
+                var f = try kernels.markovFoldQ8Law(g, p, d.fold_q, d.fold_s, d.fold_qb, d.fold_bias, base, step0, vocab, cap, lparams, dt);
+                scaled_rows[0] = f[4];
+                for (1..steps) |i| {
+                    const step = try g.fromSlice(i32, &.{@intCast(i)}, &.{1});
+                    const pr = try kernels.markovPickRnnLaw(g, .{ f[0], f[1], f[2], f[3] }, p, state, cap, d.rnn.w, d.rnn_bias, d.prev_rows, dense_rows, newest, step, true);
+                    drafted[i - 1] = pr[0];
+                    sure[i - 1] = pr[1];
+                    state = pr[2];
+                    p = pr[3];
+                    lse_rows[i - 1] = pr[4];
+                    f = try kernels.markovFoldQ8Law(g, p, d.fold_q, d.fold_s, d.fold_qb, d.fold_bias, base, step, vocab, cap, lparams, dt);
+                    scaled_rows[i] = f[4];
+                }
+                const last = try kernels.markovPickRnnLaw(g, .{ f[0], f[1], f[2], f[3] }, p, state, cap, d.rnn.w, d.rnn_bias, d.prev_rows, dense_rows, newest, step0, false);
+                drafted[steps - 1] = last[0];
+                sure[steps - 1] = last[1];
+                lse_rows[steps - 1] = last[4];
+                const scaled_all = if (steps == 1) scaled_rows[0] else try g.concat(scaled_rows[0..steps], 0);
+                const lse_all = try g.reshape(if (steps == 1) lse_rows[0] else try g.concat(lse_rows[0..steps], 0), &.{ @intCast(steps), 1 });
+                return .{
+                    .tokens = try g.concat(drafted[0..steps], 0),
+                    .confidence = try g.concat(sure[0..steps], 0),
+                    .probs = try g.exp(try g.sub(scaled_all, lse_all)),
+                };
+            };
+            if (law == null) {
+                const step0 = try g.fromSlice(i32, &.{0}, &.{1});
+                var p = try kernels.markovRnn(g, d.rnn.w, d.rnn_bias, state, d.prev_rows, dense_rows, newest, prev, step0);
+                var part = if (q8)
+                    try kernels.markovFoldQ8(g, p, d.fold_q, d.fold_s, d.fold_qb, d.fold_bias, base, step0, vocab, cap, dt)
+                else
+                    try kernels.markovFold(g, p, d.fold, d.fold_bias, base, step0, vocab, cap);
+                for (1..steps) |i| {
+                    const step = try g.fromSlice(i32, &.{@intCast(i)}, &.{1});
+                    const pr = try kernels.markovPickRnn(g, part, p, state, cap, d.rnn.w, d.rnn_bias, d.prev_rows, dense_rows, newest, step);
+                    drafted[i - 1] = pr[0];
+                    sure[i - 1] = pr[1];
+                    state = pr[2];
+                    p = pr[3];
+                    part = if (q8)
+                        try kernels.markovFoldQ8(g, p, d.fold_q, d.fold_s, d.fold_qb, d.fold_bias, base, step, vocab, cap, dt)
+                    else
+                        try kernels.markovFold(g, p, d.fold, d.fold_bias, base, step, vocab, cap);
+                }
+                const last = try kernels.markovPick(g, part, p, state, cap);
+                drafted[steps - 1] = last[0];
+                sure[steps - 1] = last[1];
+                return .{
+                    .tokens = try g.concat(drafted[0..steps], 0),
+                    .confidence = try g.concat(sure[0..steps], 0),
+                    .probs = .{},
+                };
+            }
+        }
         for (0..steps) |i| {
             const at: c_int = @intCast(i);
-            if (fused and law == null) {
-                const st = try kernels.markovStep(g, d.rnn.w, d.rnn_bias, state, d.prev_rows, dense_rows, newest, prev, d.fold, d.fold_bias, base, at, vocab, softcap);
-                state = st.state;
-                prev = st.token;
-                drafted[i] = st.token;
-                sure[i] = st.confidence;
-                continue;
-            }
             const last = try g.astype(try g.reshape(try g.take(d.prev_rows, prev, 0), &.{ 1, 1, rank }), dt);
             const fed = try g.concat(&.{ state, last, try g.sliceAxis(rows, 1, at, at + 1), newest }, 2);
             const p = try g.astype(try g.add(try project(g, &d.rnn, fed), d.rnn_bias), .float32);
@@ -437,6 +535,38 @@ pub const Drafter = struct {
     }
 };
 
+/// Quantize `fold` `[rank, V]` along `rank` in groups of `gs` into `{ uint8 [rank, V], f16 [rank/gs, V], f16 [rank/gs, V] }`.
+pub fn quantizeFold(g: *Graph, fold: Array, gs: c_int) ![3]Array {
+    const sh = ops.shape(fold);
+    const rank = sh[0];
+    const vpad = sh[1];
+    const f32_fold = try g.astype(fold, .float32);
+    const f_grp = try g.reshape(f32_fold, &.{ @divExact(rank, gs), gs, vpad });
+    var mn_a = mlx.mlx_array_new();
+    var mx_a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_min_axis(&mn_a, f_grp, 1, false, g.s));
+    try mlx.check(mlx.mlx_max_axis(&mx_a, f_grp, 1, false, g.s));
+    const mn = try g.adopt(mn_a);
+    const mx = try g.adopt(mx_a);
+    const fs = try g.astype(try g.mulScalar(try g.sub(mx, mn), 1.0 / 255.0), .float16);
+    const fqb = try g.astype(mn, .float16);
+    const sc_h = try g.astype(fs, .float32);
+    const mn_h = try g.astype(fqb, .float32);
+    const zero_f = try g.scalar(0.0, .float32);
+    const one_f = try g.scalar(1.0, .float32);
+    const pos = try g.greater(sc_h, zero_f);
+    const safe_sc = try g.where(pos, sc_h, one_f);
+    const inv_sc = try g.where(pos, try g.div(one_f, safe_sc), zero_f);
+    const scaled = try g.mul(try g.sub(f_grp, try g.expandDims(mn_h, 1)), try g.expandDims(inv_sc, 1));
+    var rnd_a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_round(&rnd_a, scaled, 0, g.s));
+    const rnd = try g.adopt(rnd_a);
+    var clp_a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_clip(&clp_a, rnd, zero_f, try g.scalar(255.0, .float32), g.s));
+    const fq = try g.reshape(try g.astype(try g.adopt(clp_a), .uint8), &.{ rank, vpad });
+    return .{ fq, fs, fqb };
+}
+
 /// A dense `head` as the affine 8-bit weight the drafter reads (owned by `g`); null for a quantized one.
 pub fn headCopy(g: *Graph, head: *const Linear) !?Linear {
     if (head.s.ctx != null) return null;
@@ -444,6 +574,20 @@ pub fn headCopy(g: *Graph, head: *const Linear) !?Linear {
     defer _ = mlx.mlx_vector_array_free(parts);
     try mlx.check(mlx.mlx_quantize(&parts, head.w, mlx.mlx_optional_int.some(draft_head_group), mlx.mlx_optional_int.some(draft_head_bits), "affine", .{}, g.s));
     var own: Linear = .{ .bits = draft_head_bits, .group_size = draft_head_group };
+    inline for (.{ &own.w, &own.s, &own.b }, 0..) |dst, i| {
+        var x = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&x, parts, i));
+        dst.* = try g.adopt(x);
+    }
+    return own;
+}
+
+/// Quantize a dense matrix `w` `[out, in]` as affine `bits` in groups of 64, owned by `g`.
+fn quantizeDense(g: *Graph, w: Array, bits: u32) !Linear {
+    var parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts);
+    try mlx.check(mlx.mlx_quantize(&parts, w, mlx.mlx_optional_int.some(draft_head_group), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, g.s));
+    var own: Linear = .{ .bits = @intCast(bits), .group_size = draft_head_group };
     inline for (.{ &own.w, &own.s, &own.b }, 0..) |dst, i| {
         var x = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_vector_array_get(&x, parts, i));
@@ -495,5 +639,27 @@ pub const At = struct {
     pub fn linear(a: At, base: []const u8) !Linear {
         var buf: [160]u8 = undefined;
         return .{ .w = try a.need(try std.fmt.bufPrint(&buf, "{s}.weight", .{base})) };
+    }
+
+    /// A dense projection, quantized to affine `bits` (g64) when `bits > 0` and `in_dim % 64 == 0`.
+    pub fn narrowed(a: At, base: []const u8, bits: u32) !Linear {
+        var buf: [160]u8 = undefined;
+        const w = try a.raw(try std.fmt.bufPrint(&buf, "{s}.weight", .{base}));
+        if (bits == 0 or @rem(ops.shape(w)[1], draft_head_group) != 0) return .{ .w = try a.keep(w) };
+        var own = try quantizeDense(a.g, w, bits);
+        for ([_]*Array{ &own.w, &own.s, &own.b }) |x| x.* = try a.keep(x.*);
+        return own;
+    }
+
+    /// Several dense projections stacked along axis 0, quantized once to affine `bits` (g64) when eligible.
+    pub fn narrowedJoined(a: At, bases: []const []const u8, bits: u32) !Linear {
+        var ws: [3]Array = undefined;
+        var buf: [160]u8 = undefined;
+        for (bases, 0..) |base, i| ws[i] = try a.raw(try std.fmt.bufPrint(&buf, "{s}.weight", .{base}));
+        const joined = try a.g.concat(ws[0..bases.len], 0);
+        if (bits == 0 or @rem(ops.shape(joined)[1], draft_head_group) != 0) return .{ .w = try a.keep(joined) };
+        var own = try quantizeDense(a.g, joined, bits);
+        for ([_]*Array{ &own.w, &own.s, &own.b }) |x| x.* = try a.keep(x.*);
+        return own;
     }
 };

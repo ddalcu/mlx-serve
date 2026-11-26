@@ -106,18 +106,23 @@ for (int k0 = kbeg; k0 < kend; k0 += BK) {
         const int r = c / (D / 8);
         const int col = (c % (D / 8)) * 8;
         const int key = k0 + r;
-        vec<T, 4> kv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
-        vec<T, 4> vv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
+        vec<E, 4> ke0 = vec<E, 4>(E(0)), ke1 = vec<E, 4>(E(0));
+        vec<E, 4> ve0 = vec<E, 4>(E(0)), ve1 = vec<E, 4>(E(0));
         if (key < kend) {
             const bool own = key >= SC;
             auto kptr = (const device vec<T, 4>*)((own ? kb_head_p + (key - SC) * kb_strides[2] : k_head_p + key * k_row[zl]) + col);
             auto vptr = (const device vec<T, 4>*)((own ? vb_head_p + (key - SC) * vb_strides[2] : v_head_p + key * k_row[zl]) + col);
-            kv[0] = kptr[0]; kv[1] = kptr[1]; vv[0] = vptr[0]; vv[1] = vptr[1];
+            ke0 = vec<E, 4>(float4(kptr[0]));
+            ke1 = vec<E, 4>(float4(kptr[1]));
+            ve0 = vec<E, 4>(float4(vptr[0]));
+            ve1 = vec<E, 4>(float4(vptr[1]));
         }
-        for (int j = 0; j < 8; ++j) {
-            Ks[(col + j) * LDK + r] = E(float(kv[j / 4][j % 4]));
-            Vs[r * LDV + col + j] = E(float(vv[j / 4][j % 4]));
-        }
+        Ks[(col + 0) * LDK + r] = ke0.x; Ks[(col + 1) * LDK + r] = ke0.y;
+        Ks[(col + 2) * LDK + r] = ke0.z; Ks[(col + 3) * LDK + r] = ke0.w;
+        Ks[(col + 4) * LDK + r] = ke1.x; Ks[(col + 5) * LDK + r] = ke1.y;
+        Ks[(col + 6) * LDK + r] = ke1.z; Ks[(col + 7) * LDK + r] = ke1.w;
+        *((threadgroup vec<E, 4>*)(Vs + r * LDV + col)) = ve0;
+        *((threadgroup vec<E, 4>*)(Vs + r * LDV + col + 4)) = ve1;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const bool plain_tile = WINDOW == 0 && (k0 + BK <= min(kend, SC)) && (k0 + BK - 1 <= (S - L) - R);
