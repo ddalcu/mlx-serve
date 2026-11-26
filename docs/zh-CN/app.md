@@ -9,7 +9,7 @@
 - **聊天界面** —— 多会话聊天，带 markdown 渲染。可以随文本一起放入 PDF（由 PDFKit 提取）或图像。
 - **Agent 模式** —— 10 个内置工具（shell、cwd、readFile、writeFile、editFile、searchFiles、listFiles、browse、webSearch、saveMemory），带自动工具调用循环和逐工具审批对话框（**允许** / **拒绝** / **本次会话始终允许**）。
 - **Agents** —— 具名助手，各自拥有性格、音色、模型、工具、工作区和唤醒词，以及各自固定的采样参数（temperature、top-p、top-k、惩罚项、推理预算）。应用会替你写好人设提示词，而且每一种发起对话的方式都能以某个 Agent 运行：聊天标签页、免手操作语音、定时任务、Telegram、快速启动器。
-- **MCP 客户端** —— 精选的 stdio + HTTP MCP 服务器市场（GitHub、Azure DevOps、DBHub、Docker、Kubernetes、Playwright、Slack、Notion、Filesystem、Shell），另外你还可以通过 `~/.mlx-serve/mcp.json` 添加自己的服务器。
+- **MCP 客户端** —— 精选的 stdio + HTTP MCP 服务器市场（GitHub、Azure DevOps、DBHub、Docker、Kubernetes、Playwright、Slack、Notion、Filesystem、Shell），另外你还可以通过 `~/.mlx-serve/mcp.json` 添加自己的服务器。`~/.agents`（或 `AGENT_SYNC_HOME`）里的 `mcp.json`、`.mcp.json` 和 `mcp_config.json` 会并入且只读；同名时以 `~/.mlx-serve/mcp.json` 为准。未在该文件里启用的导入服务器保持关闭。
 - **Agent 沙盒** —— 打开一个开关，此后每条 Agent shell 命令都在基于 Apple Virtualization 框架构建的隔离 Linux VM 中运行：不到一秒即可启动，客户机服务器实时映射到 `localhost`（客户机 8080 端口上的 Express 应用就是你 Mac 上的 `http://localhost:8080`），命令隔离运行时工具栏会显示一枚绿色盾牌。这是一个正常的 Linux，`apt-get install` 可用，最多惰性提交 4 GB 内存。放手让 Agent 折腾 —— 你的 Mac 毫发无损。
 - **⌃Space 快速启动器** —— 一个 Spotlight 风格的提示词面板，浮在任何应用之上：按 ⌃Space，提问，答案就从你的本地模型流式返回。追问会保留上下文；⌘↩ 把对话交接给完整的聊天窗口。
 - **免手操作语音模式** —— 说一句“Hey Loki”然后直接开口就行：端上语音识别（音频从不离开这台 Mac）、可打断的语音回复，以及语音驱动的 Agent 工具 —— 全部来自菜单栏，无需打开窗口。回复会用你挑选的 54 种内置 Kokoro 音色说话（完全本地，约 17× 实时，一次 345 MB 的下载，可混合），或者用 Qwen3-TTS 克隆你自己的音色。

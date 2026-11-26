@@ -261,6 +261,230 @@ final class MCPTests: XCTestCase {
         XCTAssertEqual(github["args"] as? [String], ["-y", "@modelcontextprotocol/server-github"])
     }
 
+    // MARK: - ~/.agents merge
+
+    /// Point load/save at temp files and restore the process env afterward.
+    /// `MCP_CONFIG_PATH` alone suppresses the real ~/.agents read.
+    private func withMCPFiles(
+        owned: String = "{ \"mcpServers\": {} }\n",
+        agents: [String: String] = [:],
+        body: (_ ownedPath: String, _ agentsDir: String) throws -> Void
+    ) throws {
+        let root = NSTemporaryDirectory().appending("mcp-agents-\(UUID().uuidString)")
+        let agentsDir = (root as NSString).appendingPathComponent("agents")
+        let ownedPath = (root as NSString).appendingPathComponent("mcp.json")
+        try FileManager.default.createDirectory(atPath: agentsDir, withIntermediateDirectories: true)
+        try owned.write(toFile: ownedPath, atomically: true, encoding: .utf8)
+        for (name, text) in agents {
+            let parent = (agentsDir as NSString).appendingPathComponent((name as NSString).deletingLastPathComponent)
+            if parent != agentsDir && parent != "." {
+                try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
+            }
+            try text.write(toFile: (agentsDir as NSString).appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        let savedConfig = getenv("MCP_CONFIG_PATH").map { String(cString: $0) }
+        let savedAgents = getenv("MCP_AGENTS_DIR").map { String(cString: $0) }
+        setenv("MCP_CONFIG_PATH", ownedPath, 1)
+        setenv("MCP_AGENTS_DIR", agentsDir, 1)
+        defer {
+            if let savedConfig { setenv("MCP_CONFIG_PATH", savedConfig, 1) } else { unsetenv("MCP_CONFIG_PATH") }
+            if let savedAgents { setenv("MCP_AGENTS_DIR", savedAgents, 1) } else { unsetenv("MCP_AGENTS_DIR") }
+            try? FileManager.default.removeItem(atPath: root)
+        }
+        try body(ownedPath, agentsDir)
+    }
+
+    func testAgentsMCPServersMergeAheadOfTheOwnedFile() throws {
+        try withMCPFiles(
+            owned: #"""
+            { "mcpServers": { "shell": { "command": "owned-shell" } } }
+            """#,
+            agents: [
+                "mcp.json": #"""
+                { "mcpServers": {
+                    "filesystem": { "command": "npx", "args": ["-y", "fs"] },
+                    "shell": { "command": "agents-shell" }
+                } }
+                """#,
+            ]
+        ) { _, _ in
+            let loaded = MCPConfigStore.load()
+            XCTAssertEqual(Array(loaded.mcpServers.keys), ["filesystem", "shell"])
+            XCTAssertEqual(loaded.mcpServers["filesystem"]?.command, "npx")
+            XCTAssertEqual(loaded.mcpServers["shell"]?.command, "owned-shell",
+                           "the app file wins when both name the same server")
+            XCTAssertEqual(loaded.mcpServers["shell"]?.isEnabled, true)
+            XCTAssertEqual(loaded.mcpServers["filesystem"]?.isEnabled, false,
+                           "an import with no owned enable stays off")
+            XCTAssertEqual(MCPConfigStore.agentsImport().origins["filesystem"], "mcp.json")
+            XCTAssertEqual(MCPConfigStore.agentsImport().origins["shell"], "mcp.json")
+        }
+    }
+
+    func testAgentsMCPSaveDoesNotCopyOrRewriteTheCommons() throws {
+        let agentsJSON = #"""
+        {
+          "mcpServers": {
+            "filesystem": { "command": "npx", "args": ["-y", "fs"] }
+          }
+        }
+        """#
+        try withMCPFiles(
+            owned: #"""
+            { "mcpServers": { "shell": { "command": "owned-shell" } } }
+            """#,
+            agents: ["mcp.json": agentsJSON]
+        ) { ownedPath, agentsDir in
+            let loaded = MCPConfigStore.load()
+            try MCPConfigStore.save(loaded)
+
+            let agentsAfter = try String(contentsOfFile: (agentsDir as NSString).appendingPathComponent("mcp.json"), encoding: .utf8)
+            XCTAssertEqual(agentsAfter, agentsJSON)
+
+            let ownedRaw = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: Data(contentsOf: URL(fileURLWithPath: ownedPath))) as? [String: Any])
+            let servers = try XCTUnwrap(ownedRaw["mcpServers"] as? [String: Any])
+            XCTAssertEqual(Array(servers.keys), ["shell"],
+                           "an unchanged import must not be snapshotted into mcp.json")
+        }
+    }
+
+    func testEnablingAnAgentsServerWritesOnlyTheOptIn() throws {
+        try withMCPFiles(
+            agents: [
+                "mcp.json": #"""
+                { "mcpServers": { "filesystem": { "command": "npx", "args": ["-y", "fs"] } } }
+                """#,
+            ]
+        ) { _, _ in
+            let loaded = MCPConfigStore.load()
+            XCTAssertEqual(loaded.mcpServers["filesystem"]?.isEnabled, false)
+            try MCPConfigStore.save(loaded)
+            XCTAssertNil(MCPConfigStore.loadOwned().mcpServers["filesystem"],
+                         "the shown-off import is not copied")
+
+            var opted = loaded
+            var on = try XCTUnwrap(opted.mcpServers["filesystem"])
+            on.disabled = false
+            opted.mcpServers["filesystem"] = on
+            try MCPConfigStore.save(opted)
+            let owned = MCPConfigStore.loadOwned()
+            XCTAssertEqual(owned.mcpServers["filesystem"]?.isEnabled, true)
+            XCTAssertEqual(owned.mcpServers["filesystem"]?.command, "npx")
+            XCTAssertEqual(MCPConfigStore.load().mcpServers["filesystem"]?.isEnabled, true)
+
+            var off = MCPConfigStore.load()
+            var disabled = try XCTUnwrap(off.mcpServers["filesystem"])
+            disabled.disabled = true
+            off.mcpServers["filesystem"] = disabled
+            try MCPConfigStore.save(off)
+            XCTAssertNil(MCPConfigStore.loadOwned().mcpServers["filesystem"])
+            XCTAssertEqual(MCPConfigStore.load().mcpServers["filesystem"]?.isEnabled, false)
+        }
+    }
+
+    func testAgentsMCPLaterFileWinsAndNestedSkillFilesAreIgnored() throws {
+        try withMCPFiles(
+            agents: [
+                "mcp_config.json": #"""
+                { "mcpServers": { "github": { "command": "from-config" } } }
+                """#,
+                ".mcp.json": "{",
+                "mcp.json": #"""
+                { "mcpServers": { "github": { "command": "from-commons" } } }
+                """#,
+                "skills/demo/mcp.json": #"""
+                { "mcpServers": { "skillserver": { "command": "should-not-load" } } }
+                """#,
+            ]
+        ) { _, _ in
+            let loaded = MCPConfigStore.load()
+            XCTAssertEqual(loaded.mcpServers["github"]?.command, "from-commons")
+            XCTAssertEqual(loaded.mcpServers["github"]?.isEnabled, false)
+            XCTAssertNil(loaded.mcpServers["skillserver"])
+            XCTAssertEqual(MCPConfigStore.agentsImport().origins["github"], "mcp.json")
+        }
+    }
+
+    /// A commons `github` whose command is not the catalog's `npx` stays that
+    /// command through Save, and a missing catalog token does not block it.
+    func testAgentsGitHubThatIsNotTheCatalogServerSurvivesMarketplaceSave() throws {
+        let agentsJSON = #"""
+        { "mcpServers": { "github": { "command": "/bin/sh", "args": ["-c", "echo github"] } } }
+        """#
+        try withMCPFiles(
+            owned: #"""
+            { "mcpServers": { "shell": { "command": "owned-shell" } } }
+            """#,
+            agents: ["mcp.json": agentsJSON]
+        ) { ownedPath, agentsDir in
+            let loaded = MCPConfigStore.load()
+            XCTAssertEqual(loaded.mcpServers["github"]?.isEnabled, false)
+            let applied = MCPMarketplaceView.applyingCatalogForm(
+                to: loaded,
+                enabled: ["github": true],
+                values: ["github": [:]]
+            )
+            XCTAssertNil(applied.error)
+            XCTAssertEqual(applied.config.mcpServers["github"]?.command, "/bin/sh")
+            try MCPConfigStore.save(applied.config)
+
+            let agentsAfter = try String(contentsOfFile: (agentsDir as NSString).appendingPathComponent("mcp.json"), encoding: .utf8)
+            XCTAssertEqual(agentsAfter, agentsJSON)
+            let ownedRaw = try XCTUnwrap(JSONSerialization.jsonObject(
+                with: Data(contentsOf: URL(fileURLWithPath: ownedPath))) as? [String: Any])
+            let servers = try XCTUnwrap(ownedRaw["mcpServers"] as? [String: Any])
+            XCTAssertNil(servers["github"])
+            XCTAssertNotNil(servers["shell"])
+            XCTAssertEqual(MCPConfigStore.load().mcpServers["github"]?.command, "/bin/sh")
+        }
+    }
+
+    func testMalformedAgentsFileDoesNotHideTheOwnedConfig() throws {
+        try withMCPFiles(
+            owned: #"""
+            { "mcpServers": { "shell": { "command": "owned-shell" } } }
+            """#,
+            agents: ["mcp.json": "{ \"mcpServers\": "]
+        ) { _, _ in
+            let loaded = MCPConfigStore.load()
+            XCTAssertEqual(Array(loaded.mcpServers.keys), ["shell"])
+            XCTAssertEqual(loaded.mcpServers["shell"]?.command, "owned-shell")
+        }
+    }
+
+    func testSandboxedMCPConfigDoesNotReadTheRealAgentsDirectory() {
+        let savedConfig = getenv("MCP_CONFIG_PATH").map { String(cString: $0) }
+        let savedAgents = getenv("MCP_AGENTS_DIR").map { String(cString: $0) }
+        let savedHome = getenv("AGENT_SYNC_HOME").map { String(cString: $0) }
+        defer {
+            if let savedConfig { setenv("MCP_CONFIG_PATH", savedConfig, 1) } else { unsetenv("MCP_CONFIG_PATH") }
+            if let savedAgents { setenv("MCP_AGENTS_DIR", savedAgents, 1) } else { unsetenv("MCP_AGENTS_DIR") }
+            if let savedHome { setenv("AGENT_SYNC_HOME", savedHome, 1) } else { unsetenv("AGENT_SYNC_HOME") }
+        }
+
+        unsetenv("MCP_CONFIG_PATH")
+        unsetenv("MCP_AGENTS_DIR")
+        unsetenv("AGENT_SYNC_HOME")
+        XCTAssertEqual(
+            MCPConfigStore.agentsDirectory(),
+            NSString(string: "~/.agents").expandingTildeInPath)
+
+        setenv("AGENT_SYNC_HOME", "/tmp/agent-sync-home", 1)
+        XCTAssertEqual(MCPConfigStore.agentsDirectory(), "/tmp/agent-sync-home")
+
+        setenv("MCP_AGENTS_DIR", "", 1)
+        XCTAssertNil(MCPConfigStore.agentsDirectory())
+
+        unsetenv("MCP_AGENTS_DIR")
+        setenv("MCP_CONFIG_PATH", "/tmp/mlx-serve-mcp-sandbox.json", 1)
+        XCTAssertNil(MCPConfigStore.agentsDirectory(),
+                     "a sandboxed owned file must not merge the developer's ~/.agents")
+
+        setenv("MCP_AGENTS_DIR", "/tmp/explicit-agents", 1)
+        XCTAssertEqual(MCPConfigStore.agentsDirectory(), "/tmp/explicit-agents")
+    }
+
     /// The parsed headers must actually ride every HTTP request the transport makes —
     /// `connectHTTP` passes them through the SDK's `requestModifier` via this helper.
     /// A header the transport already set (Accept, Mcp-Session-Id) wins over the user's:

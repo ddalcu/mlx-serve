@@ -3,6 +3,8 @@ import OrderedCollections
 
 /// Claude Desktop-compatible mcp.json: {"mcpServers": { "<id>": { command, args, env, disabled? } }}.
 /// Stored at ~/.mlx-serve/mcp.json. The schema matches Claude Desktop so users can paste configs across apps.
+/// Load also reads ~/.agents (mcp.json, .mcp.json, mcp_config.json). That directory is never written.
+/// An imported server stays off until ~/.mlx-serve/mcp.json enables it.
 ///
 /// Uses `OrderedDictionary` so the order users hand-edit in mcp.json round-trips through save/load
 /// (a regular Swift Dictionary would shuffle keys, and `JSONEncoder.outputFormatting.sortedKeys`
@@ -136,7 +138,19 @@ struct MCPServerEntry: Codable, Equatable {
     }
 }
 
+/// Servers read from the agents directory. `origins` names the file each id came from.
+struct AgentsMCPImport {
+    var servers: OrderedDictionary<String, MCPServerEntry> = [:]
+    var origins: [String: String] = [:]
+}
+
 enum MCPConfigStore {
+    /// Files in the agents directory that use the `mcpServers` shape, applied in
+    /// this order so `mcp.json` (the commons file) wins among them. The app's own
+    /// mcp.json wins over all three. Subdirectories are not scanned: `skills/`
+    /// holds skill packages, not server definitions.
+    static let agentsConfigFileNames = ["mcp_config.json", ".mcp.json", "mcp.json"]
+
     /// Default path is `~/.mlx-serve/mcp.json`. Tests override via `MCP_CONFIG_PATH` env var to avoid
     /// clobbering the user's real config — discovered the hard way after a test run littered the user's
     /// mcp.json with `bogus` and `nopkg` entries.
@@ -149,16 +163,98 @@ enum MCPConfigStore {
         return (dir as NSString).appendingPathComponent("mcp.json")
     }
 
+    /// Where shared agent MCP configs live. `MCP_AGENTS_DIR` relocates or, when
+    /// empty, turns the merge off. `AGENT_SYNC_HOME` is the commons relocation.
+    /// A sandboxed owned file (`MCP_CONFIG_PATH`, set by tests) does not also
+    /// read the developer's real directory unless `MCP_AGENTS_DIR` is set.
+    static func agentsDirectory() -> String? {
+        if let override = ProcessInfo.processInfo.environment["MCP_AGENTS_DIR"] {
+            if override.isEmpty { return nil }
+            return (override as NSString).expandingTildeInPath
+        }
+        if let sandbox = ProcessInfo.processInfo.environment["MCP_CONFIG_PATH"], !sandbox.isEmpty {
+            return nil
+        }
+        if let home = ProcessInfo.processInfo.environment["AGENT_SYNC_HOME"], !home.isEmpty {
+            return (home as NSString).expandingTildeInPath
+        }
+        return NSString(string: "~/.agents").expandingTildeInPath
+    }
+
+    static func agentsOriginLabel(_ fileName: String) -> String {
+        let dir = agentsDirectory() ?? NSString(string: "~/.agents").expandingTildeInPath
+        return "\((dir as NSString).abbreviatingWithTildeInPath)/\(fileName)"
+    }
+
+    /// The owned file alone. Save compares against this so an unchanged import
+    /// is not copied into ~/.mlx-serve/mcp.json.
+    static func loadOwned() -> MCPConfig {
+        loadFile(at: path) ?? MCPConfig()
+    }
+
     static func load() -> MCPConfig {
+        let imported = agentsImport().servers
+        var owned = loadOwned()
+        var merged = imported
+        // No owned row means this app has not opted in. The commons file's missing
+        // `disabled` flag would otherwise spawn the server on the next MCP turn.
+        for (id, entry) in merged where owned.mcpServers[id] == nil && entry.isEnabled {
+            var shown = entry
+            shown.disabled = true
+            merged[id] = shown
+        }
+        for (id, entry) in owned.mcpServers {
+            merged[id] = entry
+        }
+        owned.mcpServers = merged
+        return owned
+    }
+
+    static func agentsImport() -> AgentsMCPImport {
+        guard let dir = agentsDirectory() else { return AgentsMCPImport() }
+        var imported = AgentsMCPImport()
+        for name in agentsConfigFileNames {
+            let file = (dir as NSString).appendingPathComponent(name)
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: file, isDirectory: &isDir), !isDir.boolValue,
+                  let cfg = loadFile(at: file) else { continue }
+            for (id, entry) in cfg.mcpServers {
+                imported.servers[id] = entry
+                imported.origins[id] = name
+            }
+        }
+        return imported
+    }
+
+    private static func loadFile(at path: String) -> MCPConfig? {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let cfg = try? JSONDecoder().decode(MCPConfig.self, from: data) else {
-            return MCPConfig()
+            return nil
         }
         // JSONDecoder doesn't preserve JSON object key order — it parses into a hash-backed
         // store. We re-derive the user's hand-edited order by scanning the raw text and
         // reordering the OrderedDictionary to match.
         let order = extractMcpServersKeyOrder(from: data)
         return MCPConfig(mcpServers: reorder(cfg.mcpServers, by: order), extra: cfg.extra)
+    }
+
+    /// `disabled: false` and a missing flag are the same enabled state, so
+    /// flipping a toggle back on does not snapshot the commons entry.
+    static func effectivelySame(_ a: MCPServerEntry, _ b: MCPServerEntry) -> Bool {
+        var x = a
+        var y = b
+        if x.disabled == false { x.disabled = nil }
+        if y.disabled == false { y.disabled = nil }
+        return x == y
+    }
+
+    /// The shown-but-not-opted-in view of a commons server. Saving it must not
+    /// copy the server into ~/.mlx-serve/mcp.json. An enabled entry is an opt-in.
+    static func isUnchangedImport(_ saved: MCPServerEntry, _ foreign: MCPServerEntry) -> Bool {
+        guard !saved.isEnabled else { return false }
+        var shown = saved
+        shown.disabled = foreign.disabled
+        return effectivelySame(shown, foreign)
     }
 
     /// Reorder an OrderedDictionary so its keys appear in the given source-order list. Keys present
@@ -255,6 +351,30 @@ enum MCPConfigStore {
     }
 
     static func save(_ config: MCPConfig) throws {
+        try write(ownedSnapshot(of: config))
+    }
+
+    /// Drop servers that still match the agents directory. An owned id, or an
+    /// imported one the user changed (usually `disabled`), stays in the app file.
+    static func ownedSnapshot(of config: MCPConfig) -> MCPConfig {
+        let imported = agentsImport().servers
+        let previous = loadOwned()
+        var kept: OrderedDictionary<String, MCPServerEntry> = [:]
+        for id in previous.mcpServers.keys {
+            guard let entry = config.mcpServers[id] else { continue }
+            if let foreign = imported[id], isUnchangedImport(entry, foreign) { continue }
+            kept[id] = entry
+        }
+        for (id, entry) in config.mcpServers where previous.mcpServers[id] == nil {
+            if let foreign = imported[id], isUnchangedImport(entry, foreign) { continue }
+            kept[id] = entry
+        }
+        var out = config
+        out.mcpServers = kept
+        return out
+    }
+
+    private static func write(_ config: MCPConfig) throws {
         // Foundation's JSONEncoder shuffles top-level KeyedContainer keys (it uses a hash-backed
         // store and ignores the encode call order). To actually preserve the user's hand-edited
         // mcp.json order, encode each server's value individually and stitch the outer object
