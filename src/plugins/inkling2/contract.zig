@@ -2019,6 +2019,9 @@ fn markovLaunch(comptime file: [:0]const u8, comptime ins: []const [*:0]const u8
 const mk_rnn_launch = markovLaunch("markov_rnn", &.{ "W", "B", "ST", "PREV", "ROWS", "NEW", "TOK", "AT" }, &.{"P"}, false, 0);
 const mk_fold_launch = markovLaunch("markov_fold", &.{ "P", "FOLD", "FB", "BASE", "AT", "CAP" }, &.{ "PM", "PI", "PS" }, true, 4 * (256 + 3 * 8));
 const mk_pick_launch = markovLaunch("markov_pick", &.{ "PM", "PI", "PS", "P", "ST", "CAP" }, &.{ "TOKN", "CONF", "NST" }, true, 4 * 3 * 8);
+const mk_fold_batch_launch = markovLaunch("markov_fold_batch", &.{ "P", "FOLD", "FB", "BASE", "AT", "CAP" }, &.{ "PM", "PI", "PS" }, true, 4 * (8 * 256 + 3 * 8));
+const mk_pick_batch_launch = markovLaunch("markov_pick_batch", &.{ "PM", "PI", "PS", "P", "ST", "CAP" }, &.{ "TOKN", "CONF", "NST" }, true, 4 * 3 * 8);
+const mk_pick_sample_launch = markovLaunch("markov_pick_sample", &.{ "PM", "PI", "P", "ST", "CAP", "LPARAMS", "SEEDS", "AT" }, &.{ "TOKN", "CANDS", "PROBS", "DRAW", "NST" }, true, 4 * (2 * 8 + 2 * 16 + 2));
 
 fn cint(x: usize) c_int {
     return @intCast(x);
@@ -2501,6 +2504,661 @@ const MarkovPick = struct {
         return self.rig.bytesOf(&(try kernels.markovPick(&g, .{ x[0], x[1], x[2] }, x[3], x[4], x[5])));
     }
 };
+
+fn foldBatchVpt(comptime B: usize) usize {
+    return if (B <= 4) 4 else 2;
+}
+
+fn foldBatchNb(comptime B: usize) usize {
+    return if (B <= 2) 2 else if (B <= 4) 4 else 8;
+}
+
+fn foldBatchCols(comptime B: usize) usize {
+    return 256 * foldBatchVpt(B);
+}
+
+fn foldBatchGroups(comptime B: usize, shape: Shape) usize {
+    const cols = foldBatchCols(B);
+    return (shape.k + cols - 1) / cols;
+}
+
+fn foldBatchCount(comptime B: usize) fn (Shape) usize {
+    return struct {
+        fn f(shape: Shape) usize {
+            return B * foldBatchGroups(B, shape);
+        }
+    }.f;
+}
+
+/// Batched Markov fold over `B` lanes: rows = rank, n = fold columns, k = real vocab. PM, PI, PS [B, groups].
+fn MarkovFoldBatch(comptime B: usize) type {
+    return struct {
+        const VPT_B = foldBatchVpt(B);
+        const NB_B = foldBatchNb(B);
+        const MCOLS_B = foldBatchCols(B);
+        rig: metal.Rig,
+        launch: *const metal.Launch = &mk_fold_batch_launch,
+        arena: std.heap.ArenaAllocator,
+        shape: Shape = undefined,
+        p: []f64 = &.{},
+        fold: []f64 = &.{},
+        fb: []f64 = &.{},
+        base: []f64 = &.{},
+        at: usize = 0,
+        logit: []host.Val = &.{},
+        note: [200]u8 = undefined,
+        args: [6]mlx.mlx_array = undefined,
+
+        const Self = @This();
+
+        fn init(a: std.mem.Allocator) Self {
+            return .{ .rig = metal.Rig.init(a), .arena = .init(a) };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.rig.deinit();
+            self.arena.deinit();
+        }
+
+        pub fn geometry(_: *const Self, shape: Shape) ?metal.Geometry {
+            if (shape.rows == 0 or shape.k == 0 or shape.k > shape.n or shape.n % 8 != 0) return null;
+            const ng = cint(foldBatchGroups(B, shape));
+            const bg: c_int = @intCast((B + NB_B - 1) / NB_B);
+            var g = metal.Geometry{ .grid = .{ ng * 256, bg, 1 }, .tg = .{ 256, 1, 1 } };
+            g.out(&.{ cint(B), ng }, .float32);
+            g.out(&.{ cint(B), ng }, .uint32);
+            g.out(&.{ cint(B), ng }, .float32);
+            g.dtype("T", .bfloat16);
+            g.int("R", cint(shape.rows));
+            g.int("TG", @as(c_int, 256));
+            g.int("VPT", cint(VPT_B));
+            g.int("VOCAB", cint(shape.k));
+            g.int("NB", cint(NB_B));
+            g.int("SG_OUT", @as(c_int, 0));
+            return g;
+        }
+
+        pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+            if (self.geometry(shape) == null) return false;
+            self.shape = shape;
+            _ = self.arena.reset(.retain_capacity);
+            const a = self.arena.allocator();
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rng = prng.random();
+            const r = shape.rows;
+            const v = shape.n;
+            self.p = try host.uniform(a, rng, B * 3 * r, -2, 2, .float32);
+            self.fold = try host.uniform(a, rng, r * v, -0.3, 0.3, .bfloat16);
+            self.fb = try host.uniform(a, rng, v, -0.5, 0.5, .bfloat16);
+            self.base = try host.uniform(a, rng, B * MSTEPS * v, -8, 8, .float32);
+            self.at = rng.uintLessThan(usize, MSTEPS);
+            switch (fill) {
+                .random => {},
+                .nonfinite => for (0..B) |b| {
+                    const row = self.base[(b * MSTEPS + self.at) * v ..][0..v];
+                    for ([_]usize{ 5, MCOLS_B + 9, 2 * MCOLS_B + 1 }, [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |c, x| {
+                        if (c < shape.k) row[c] = x;
+                    }
+                },
+                .stress => for (0..B) |b| {
+                    const row = self.base[(b * MSTEPS + self.at) * v ..][0..v];
+                    for (0..foldBatchGroups(B, shape)) |g| {
+                        row[@min(shape.k - 1, g * MCOLS_B + rng.uintLessThan(usize, MCOLS_B))] = 48;
+                    }
+                },
+            }
+            self.logit = try a.alloc(host.Val, B * shape.k);
+            self.rig.reset();
+            self.args = .{
+                try self.rig.input(.float32, &.{ cint(B), cint(3 * r) }, self.p),
+                try self.rig.input(.bfloat16, &.{ cint(r), cint(v) }, self.fold),
+                try self.rig.input(.bfloat16, &.{ 1, 1, cint(v) }, self.fb),
+                try self.rig.input(.float32, &.{ cint(B), MSTEPS, cint(v) }, self.base),
+                try self.rig.input(.int32, &.{1}, &.{@floatFromInt(self.at)}),
+                try self.rig.input(.float32, &.{1}, &.{MCAP}),
+            };
+            return true;
+        }
+
+        pub fn run(self: *Self) !void {
+            try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+        }
+
+        pub fn count(self: *const Self) usize {
+            return 3 * B * foldBatchGroups(B, self.shape);
+        }
+
+        fn logits(self: *Self, sim: attn.Sim) !void {
+            const r = self.shape.rows;
+            const v = self.shape.n;
+            const k = self.shape.k;
+            const a = self.rig.a;
+            const lat = try a.alloc(host.Val, r);
+            defer a.free(lat);
+            const t = try a.alloc(f64, r);
+            defer a.free(t);
+            for (0..B) |b| {
+                for (lat, 0..) |*l, i| {
+                    const th = std.math.tanh(self.p[b * 3 * r + 2 * r + i]);
+                    l.* = bf(.{ .v = th, .e = PRECISE * @abs(th) });
+                }
+                for (self.logit[b * k ..][0..k], 0..) |*o, c| {
+                    var abs: f64 = 0;
+                    var flips: f64 = 0;
+                    for (t, lat, 0..) |*x, l, i| {
+                        x.* = l.v * self.fold[i * v + c];
+                        abs += @abs(x.*);
+                        flips += l.e * @abs(self.fold[i * v + c]);
+                    }
+                    const s = if (sim) |x| spec.sumIn(x.acc, x.order, t) else host.sum(t);
+                    const r1 = bf(.{ .v = s, .e = spec.gamma(@floatFromInt(r), host.U) * abs + flips });
+                    const r2 = bf(.{ .v = r1.v + self.fb[c], .e = r1.e });
+                    const x = self.base[(b * MSTEPS + self.at) * v + c] + r2.v;
+                    o.* = .{ .v = x, .e = r2.e + host.U * @abs(x) };
+                }
+            }
+        }
+
+        fn group(self: *const Self, b: usize, g: usize) struct { at: usize, e: f64, sum: f64 } {
+            const k = self.shape.k;
+            const lane_l = self.logit[b * k ..][0..k];
+            const lo = g * MCOLS_B;
+            const hi = @min(k, lo + MCOLS_B);
+            var best = lo;
+            var e: f64 = 0;
+            for (lo..hi) |c| {
+                if (better(lane_l[c].v, c, lane_l[best].v, best)) best = c;
+                if (std.math.isFinite(lane_l[c].e)) e = @max(e, lane_l[c].e);
+            }
+            var sum: f64 = 0;
+            for (lo..hi) |c| sum += @exp(capped(lane_l[c].v) - capped(lane_l[best].v));
+            return .{ .at = best, .e = e, .sum = sum };
+        }
+
+        fn emit(self: *Self, want: []f64, mag: ?[]f64, sim: attn.Sim) !void {
+            try self.logits(sim);
+            const ng = foldBatchGroups(B, self.shape);
+            const tot = B * ng;
+            const k = self.shape.k;
+            for (0..B) |b| for (0..ng) |g| {
+                const idx = b * ng + g;
+                const x = self.group(b, g);
+                want[idx] = self.logit[b * k + x.at].v;
+                want[tot + idx] = @floatFromInt(x.at);
+                want[2 * tot + idx] = x.sum;
+                if (mag) |m| {
+                    m[idx] = host.allowance(x.e);
+                    m[tot + idx] = 0;
+                    m[2 * tot + idx] = host.allowance(x.sum * (2 * x.e + PRECISE + spec.gamma(@floatFromInt(MCOLS_B), host.U)));
+                }
+            };
+        }
+
+        pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+            try @constCast(self).emit(want, mag, null);
+        }
+
+        pub fn simulate(self: *const Self, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+            try @constCast(self).emit(out, null, .{ .acc = acc, .order = order });
+        }
+
+        fn fail(self: *Self, comptime fmt: []const u8, args: anytype) []const u8 {
+            return std.fmt.bufPrint(&self.note, fmt, args) catch "a group breaks the rule";
+        }
+
+        pub fn check(self: *Self, _: spec.Gate) !?[]const u8 {
+            try self.logits(null);
+            const bytes = self.rig.outputBytes();
+            const ng = foldBatchGroups(B, self.shape);
+            const tot = B * ng;
+            const k = self.shape.k;
+            for (0..B) |b| {
+                const lane_l = self.logit[b * k ..][0..k];
+                for (0..ng) |g| {
+                    const idx = b * ng + g;
+                    const x = self.group(b, g);
+                    const pm = spec.read(.f32, bytes, idx);
+                    const pi: usize = @intFromFloat(spec.read(.u32, bytes[4 * tot ..], idx));
+                    const ps = spec.read(.f32, bytes[8 * tot ..], idx);
+                    const top = lane_l[x.at];
+                    if (!std.math.isFinite(top.v)) {
+                        if (pi != x.at) return self.fail("lane {d} group {d}: column {d} where {d} leads", .{ b, g, pi, x.at });
+                        if (std.math.isNan(top.v) != std.math.isNan(pm) or (!std.math.isNan(top.v) and pm != top.v)) return self.fail("lane {d} group {d}: max {d} != {d}", .{ b, g, pm, top.v });
+                        if (std.math.isNan(x.sum) != std.math.isNan(ps)) return self.fail("lane {d} group {d}: sum {d} != {d}", .{ b, g, ps, x.sum });
+                        continue;
+                    }
+                    if (pi < g * MCOLS_B or pi >= @min(k, (g + 1) * MCOLS_B)) return self.fail("lane {d} group {d}: column {d} outside", .{ b, g, pi });
+                    const mine = lane_l[pi];
+                    if (!(mine.v + mine.e + x.e >= top.v)) return self.fail("lane {d} group {d}: column {d} behind {d}", .{ b, g, pi, x.at });
+                    if (!(@abs(pm - mine.v) <= mine.e + 0x1p-24 * @abs(mine.v))) return self.fail("lane {d} group {d}: max mismatch", .{ b, g });
+                    var sum: f64 = 0;
+                    for (g * MCOLS_B..@min(k, (g + 1) * MCOLS_B)) |c| sum += @exp(capped(lane_l[c].v) - capped(mine.v));
+                    if (!(@abs(ps - sum) <= sum * (2 * x.e + PRECISE + spec.gamma(@floatFromInt(MCOLS_B), host.U)))) return self.fail("lane {d} group {d}: sum mismatch", .{ b, g });
+                }
+            }
+            return null;
+        }
+
+        fn wrapper(self: *Self) ![]const u8 {
+            var g = ops.Graph.init(self.rig.a, self.rig.stream());
+            defer g.deinit();
+            const x = self.args;
+            return self.rig.bytesOf(&(try kernels.markovFoldBatch(&g, x[0], x[1], x[2], x[3], x[4], @intCast(self.shape.k), x[5])));
+        }
+    };
+}
+
+fn batchLanes(comptime B: usize) fn (Shape) usize {
+    return struct {
+        fn f(_: Shape) usize {
+            return B;
+        }
+    }.f;
+}
+
+fn batchState(comptime B: usize) fn (Shape) usize {
+    return struct {
+        fn f(shape: Shape) usize {
+            return B * shape.rows;
+        }
+    }.f;
+}
+
+/// Batched Markov pick over `B` lanes: rows = rank, n = fold threadgroups. TOKN [B], CONF [B], NST [B, 1, R].
+fn MarkovPickBatch(comptime B: usize) type {
+    return struct {
+        rig: metal.Rig,
+        launch: *const metal.Launch = &mk_pick_batch_launch,
+        arena: std.heap.ArenaAllocator,
+        shape: Shape = undefined,
+        pm: []f64 = &.{},
+        pi: []f64 = &.{},
+        ps: []f64 = &.{},
+        p: []f64 = &.{},
+        st: []f64 = &.{},
+        args: [6]mlx.mlx_array = undefined,
+
+        const Self = @This();
+
+        fn init(a: std.mem.Allocator) Self {
+            return .{ .rig = metal.Rig.init(a), .arena = .init(a) };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.rig.deinit();
+            self.arena.deinit();
+        }
+
+        pub fn geometry(_: *const Self, shape: Shape) ?metal.Geometry {
+            if (shape.rows == 0 or shape.n == 0) return null;
+            var g = metal.Geometry{ .grid = .{ 256, cint(B), 1 }, .tg = .{ 256, 1, 1 } };
+            g.out(&.{cint(B)}, .int32);
+            g.out(&.{cint(B)}, .float32);
+            g.out(&.{ cint(B), 1, cint(shape.rows) }, .bfloat16);
+            g.dtype("T", .bfloat16);
+            g.int("R", cint(shape.rows));
+            return g;
+        }
+
+        pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+            if (self.geometry(shape) == null) return false;
+            self.shape = shape;
+            _ = self.arena.reset(.retain_capacity);
+            const a = self.arena.allocator();
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rng = prng.random();
+            const n = shape.n;
+            const r = shape.rows;
+            self.pm = try host.uniform(a, rng, B * n, -8, 8, .float32);
+            self.ps = try host.uniform(a, rng, B * n, 1, 300, .float32);
+            self.pi = try a.alloc(f64, B * n);
+            for (0..B) |b| {
+                for (0..n) |g| self.pi[b * n + g] = @floatFromInt(g * 512 + rng.uintLessThan(usize, 512));
+                if (n > 2) self.pi[b * n + n - 1] = NONE_IDX;
+            }
+            self.p = try host.uniform(a, rng, B * 3 * r, -3, 3, .float32);
+            self.st = try host.uniform(a, rng, B * r, -1, 1, .bfloat16);
+            switch (fill) {
+                .random => {},
+                .nonfinite => for (0..B) |b| {
+                    if (n > 3) self.pm[b * n + 3] = std.math.nan(f64);
+                    host.plant(self.p[b * 3 * r ..][0 .. 3 * r], 3, r);
+                },
+                .stress => {
+                    @memset(self.pm, 0);
+                    for (self.ps) |*x| x.* = @floatFromInt(rng.intRangeAtMost(i32, 20000, 40000));
+                },
+            }
+            self.rig.reset();
+            self.args = .{
+                try self.rig.input(.float32, &.{ cint(B), cint(n) }, self.pm),
+                try self.rig.input(.uint32, &.{ cint(B), cint(n) }, self.pi),
+                try self.rig.input(.float32, &.{ cint(B), cint(n) }, self.ps),
+                try self.rig.input(.float32, &.{ cint(B), cint(3 * r) }, self.p),
+                try self.rig.input(.bfloat16, &.{ cint(B), 1, cint(r) }, self.st),
+                try self.rig.input(.float32, &.{1}, &.{MCAP}),
+            };
+            return true;
+        }
+
+        pub fn run(self: *Self) !void {
+            try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+        }
+
+        pub fn count(self: *const Self) usize {
+            return B * (2 + self.shape.rows);
+        }
+
+        fn emit(self: *const Self, want: []f64, mag: ?[]f64, sim: attn.Sim) !void {
+            const n = self.shape.n;
+            const r = self.shape.rows;
+            const t = try self.rig.a.alloc(f64, n);
+            defer self.rig.a.free(t);
+            for (0..B) |b| {
+                const pm = self.pm[b * n ..][0..n];
+                const pi = self.pi[b * n ..][0..n];
+                const ps = self.ps[b * n ..][0..n];
+                var best: ?usize = null;
+                for (0..n) |g| if (pi[g] != NONE_IDX) {
+                    if (best == null or better(pm[g], @intFromFloat(pi[g]), pm[best.?], @intFromFloat(pi[best.?]))) best = g;
+                };
+                const top = pm[best.?];
+                var k: usize = 0;
+                for (0..n) |g| if (pi[g] != NONE_IDX) {
+                    t[k] = ps[g] * @exp(capped(pm[g]) - capped(top));
+                    k += 1;
+                };
+                const tot = if (sim) |x| spec.sumIn(x.acc, x.order, t[0..k]) else host.sum(t[0..k]);
+                want[b] = pi[best.?];
+                want[B + b] = 1 / tot;
+                if (mag) |m| {
+                    m[b] = 0;
+                    m[B + b] = host.allowance(@abs(want[B + b]) * (PRECISE + spec.gamma(@floatFromInt(k + 8), host.U)));
+                }
+                const pb = self.p[b * 3 * r ..][0 .. 3 * r];
+                const stb = self.st[b * r ..][0..r];
+                for (0..r) |i| {
+                    const keep = host.mlxSig(.bfloat16, .{ .v = pb[i] });
+                    const th = std.math.tanh(pb[r + i]);
+                    const cand = bf(.{ .v = th, .e = PRECISE * @abs(th) });
+                    const kept = bf(.{ .v = keep.v * stb[i], .e = keep.e * @abs(stb[i]) });
+                    const left = bf(.{ .v = 1 - keep.v, .e = keep.e });
+                    const blend = bf(.{ .v = left.v * cand.v, .e = left.e * @abs(cand.v) + cand.e * @abs(left.v) });
+                    const out = bf(.{ .v = kept.v + blend.v, .e = kept.e + blend.e });
+                    want[2 * B + b * r + i] = out.v;
+                    if (mag) |m| m[2 * B + b * r + i] = if (std.math.isFinite(out.e)) host.allowance(out.e) else 0;
+                }
+            }
+        }
+
+        pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+            try self.emit(want, mag, null);
+        }
+
+        pub fn simulate(self: *const Self, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+            try self.emit(out, null, .{ .acc = acc, .order = order });
+        }
+
+        fn wrapper(self: *Self) ![]const u8 {
+            var g = ops.Graph.init(self.rig.a, self.rig.stream());
+            defer g.deinit();
+            const x = self.args;
+            return self.rig.bytesOf(&(try kernels.markovPickBatch(&g, .{ x[0], x[1], x[2] }, x[3], x[4], x[5])));
+        }
+    };
+}
+
+fn batchCand(comptime B: usize) fn (Shape) usize {
+    return struct {
+        fn f(_: Shape) usize {
+            return B * @as(usize, @intCast(kernels.markov_sample_k));
+        }
+    }.f;
+}
+
+/// Batched sampled Markov pick over `B` lanes: rows = rank, n = fold simdgroups.
+/// Outputs: TOKN [B] i32, CANDS [B, K] i32, PROBS [B, K] f32, DRAW [B] u8, NST [B, 1, R] bf16.
+fn MarkovPickSample(comptime B: usize) type {
+    return struct {
+        const K: usize = @intCast(kernels.markov_sample_k);
+        rig: metal.Rig,
+        launch: *const metal.Launch = &mk_pick_sample_launch,
+        arena: std.heap.ArenaAllocator,
+        shape: Shape = undefined,
+        pm: []f64 = &.{},
+        pi: []f64 = &.{},
+        p: []f64 = &.{},
+        st: []f64 = &.{},
+        lparams: [B * 4]f64 = undefined,
+        seeds: [B]u64 = undefined,
+        step: u32 = 0,
+        note: [200]u8 = undefined,
+        args: [8]mlx.mlx_array = undefined,
+
+        const Self = @This();
+
+        fn init(a: std.mem.Allocator) Self {
+            return .{ .rig = metal.Rig.init(a), .arena = .init(a) };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.rig.deinit();
+            self.arena.deinit();
+        }
+
+        pub fn geometry(_: *const Self, shape: Shape) ?metal.Geometry {
+            if (shape.rows == 0 or shape.n == 0) return null;
+            var g = metal.Geometry{ .grid = .{ 256, cint(B), 1 }, .tg = .{ 256, 1, 1 } };
+            g.out(&.{cint(B)}, .int32);
+            g.out(&.{ cint(B), cint(K) }, .int32);
+            g.out(&.{ cint(B), cint(K) }, .float32);
+            g.out(&.{cint(B)}, .uint8);
+            g.out(&.{ cint(B), 1, cint(shape.rows) }, .bfloat16);
+            g.dtype("T", .bfloat16);
+            g.int("R", cint(shape.rows));
+            g.int("K", cint(K));
+            return g;
+        }
+
+        pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+            if (self.geometry(shape) == null) return false;
+            self.shape = shape;
+            _ = self.arena.reset(.retain_capacity);
+            const a = self.arena.allocator();
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rng = prng.random();
+            const n = shape.n;
+            const r = shape.rows;
+            self.pm = try host.uniform(a, rng, B * n, -8, 8, .float32);
+            self.pi = try a.alloc(f64, B * n);
+            for (0..B) |b| {
+                for (0..n) |g| self.pi[b * n + g] = @floatFromInt(g * 64 + rng.uintLessThan(usize, 64));
+                if (n > 2) self.pi[b * n + n - 1] = NONE_IDX;
+            }
+            self.p = try host.uniform(a, rng, B * 3 * r, -3, 3, .float32);
+            self.st = try host.uniform(a, rng, B * r, -1, 1, .bfloat16);
+            self.step = rng.uintLessThan(u32, MSTEPS);
+            var seed_u32: [B * 2]f64 = undefined;
+            for (0..B) |b| {
+                self.lparams[b * 4 + 0] = if (b == 0) 0.0 else 0.7 + 0.25 * @as(f64, @floatFromInt(b));
+                self.lparams[b * 4 + 1] = if (b == 2) 8.0 else 0.0;
+                self.lparams[b * 4 + 2] = if (b == 1) 0.95 else 1.0;
+                self.lparams[b * 4 + 3] = if (b == 3) 0.05 else 0.0;
+                self.seeds[b] = rng.int(u64);
+                seed_u32[b * 2 + 0] = @floatFromInt(@as(u32, @truncate(self.seeds[b])));
+                seed_u32[b * 2 + 1] = @floatFromInt(@as(u32, @truncate(self.seeds[b] >> 32)));
+            }
+            if (fill == .nonfinite) {
+                for (0..B) |b| {
+                    if (n > 3) self.pm[b * n + 3] = std.math.nan(f64);
+                    host.plant(self.p[b * 3 * r ..][0 .. 3 * r], 3, r);
+                }
+            }
+            self.rig.reset();
+            self.args = .{
+                try self.rig.input(.float32, &.{ cint(B), cint(n) }, self.pm),
+                try self.rig.input(.uint32, &.{ cint(B), cint(n) }, self.pi),
+                try self.rig.input(.float32, &.{ cint(B), cint(3 * r) }, self.p),
+                try self.rig.input(.bfloat16, &.{ cint(B), 1, cint(r) }, self.st),
+                try self.rig.input(.float32, &.{1}, &.{MCAP}),
+                try self.rig.input(.float32, &.{ cint(B), 4 }, &self.lparams),
+                try self.rig.input(.uint32, &.{ cint(B), 2 }, &seed_u32),
+                try self.rig.input(.int32, &.{1}, &.{@floatFromInt(self.step)}),
+            };
+            return true;
+        }
+
+        pub fn run(self: *Self) !void {
+            try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+        }
+
+        pub fn count(self: *const Self) usize {
+            return B * (2 + 2 * K + self.shape.rows);
+        }
+
+        fn fail(self: *Self, comptime fmt: []const u8, args: anytype) []const u8 {
+            return std.fmt.bufPrint(&self.note, fmt, args) catch "mismatch";
+        }
+
+        pub fn reference(_: *const Self, want: []f64, mag: []f64) !void {
+            @memset(want, 0);
+            @memset(mag, 0);
+        }
+
+        pub fn check(self: *Self, _: spec.Gate) !?[]const u8 {
+            const bytes = self.rig.outputBytes();
+            const n = self.shape.n;
+            const r = self.shape.rows;
+            const off_tok: usize = 0;
+            const off_cands: usize = off_tok + 4 * B;
+            const off_probs: usize = off_cands + 4 * B * K;
+            const off_draw: usize = off_probs + 4 * B * K;
+            const off_nst: usize = off_draw + B;
+            for (0..B) |b| {
+                const pm = self.pm[b * n ..][0..n];
+                const pi = self.pi[b * n ..][0..n];
+                var top_v: [K]f64 = @splat(-std.math.inf(f64));
+                var top_i: [K]usize = @splat(0xffffffff);
+                var nv: usize = 0;
+                for (0..K) |k| {
+                    var best: ?usize = null;
+                    for (0..n) |g| if (pi[g] != NONE_IDX) {
+                        const gid: usize = @intFromFloat(pi[g]);
+                        if (k > 0 and !better(top_v[k - 1], top_i[k - 1], pm[g], gid)) continue;
+                        if (best == null or better(pm[g], gid, pm[best.?], @intFromFloat(pi[best.?]))) best = g;
+                    };
+                    if (best == null) break;
+                    top_v[k] = pm[best.?];
+                    top_i[k] = @intFromFloat(pi[best.?]);
+                    nv = k + 1;
+                }
+                const got_tok = std.mem.readInt(i32, bytes[off_tok + 4 * b ..][0..4], .little);
+                const got_draw = bytes[off_draw + b];
+                var want_probs: [K]f64 = @splat(0);
+                var want_draw: usize = 0;
+                const temp = self.lparams[b * 4 + 0];
+                const top_k: usize = @intFromFloat(self.lparams[b * 4 + 1]);
+                const top_p = self.lparams[b * 4 + 2];
+                const min_p = self.lparams[b * 4 + 3];
+                if (nv > 0) {
+                    if (temp <= 0 or top_k == 1) {
+                        want_probs[0] = 1.0;
+                        want_draw = 0;
+                    } else {
+                        var c: [K]f64 = undefined;
+                        var max_s: f64 = -std.math.inf(f64);
+                        const inv_t = 1.0 / temp;
+                        for (0..nv) |k| {
+                            c[k] = capped(top_v[k]);
+                            max_s = @max(max_s, c[k] * inv_t);
+                        }
+                        var sum_w: f64 = 0;
+                        for (0..nv) |k| {
+                            want_probs[k] = @exp(c[k] * inv_t - max_s);
+                            sum_w += want_probs[k];
+                        }
+                        for (0..nv) |k| want_probs[k] /= sum_w;
+                        var keep: usize = nv;
+                        if (top_k > 0 and top_k < keep) keep = top_k;
+                        if (min_p > 0) {
+                            const cut = min_p * want_probs[0];
+                            var mkeep: usize = 1;
+                            while (mkeep < keep and want_probs[mkeep] >= cut) : (mkeep += 1) {}
+                            keep = mkeep;
+                        }
+                        if (top_p > 0 and top_p < 1.0) {
+                            var cum: f64 = 0;
+                            var pkeep: usize = 0;
+                            while (pkeep < keep) {
+                                cum += want_probs[pkeep];
+                                pkeep += 1;
+                                if (cum >= top_p) break;
+                            }
+                            keep = @max(@as(usize, 1), pkeep);
+                        }
+                        var kept_sum: f64 = 0;
+                        for (0..keep) |k| kept_sum += want_probs[k];
+                        for (0..nv) |k| want_probs[k] = if (k < keep) want_probs[k] / kept_sum else 0.0;
+                        var h = self.seeds[b] ^ (0x9e3779b97f4a7c15 *% (@as(u64, self.step) + 1));
+                        h = (h ^ (h >> 30)) *% 0xbf58476d1ce4e5b9;
+                        h = (h ^ (h >> 27)) *% 0x94d049bb133111eb;
+                        h = h ^ (h >> 31);
+                        const u: f64 = (@as(f64, @floatFromInt(h >> 41)) + 0.5) * 0x1p-23;
+                        var acc: f64 = 0;
+                        want_draw = keep - 1;
+                        for (0..keep) |k| {
+                            acc += want_probs[k];
+                            if (acc >= u) {
+                                want_draw = k;
+                                break;
+                            }
+                        }
+                    }
+                }
+                for (0..K) |k| {
+                    const gc = std.mem.readInt(i32, bytes[off_cands + 4 * (b * K + k) ..][0..4], .little);
+                    const wc: i32 = if (k < nv) @intCast(top_i[k]) else -1;
+                    if (gc != wc) return self.fail("lane {d} cand {d}: got {d} want {d}", .{ b, k, gc, wc });
+                    const gp = spec.read(.f32, bytes[off_probs..], b * K + k);
+                    if (std.math.isNan(want_probs[k])) {
+                        if (!std.math.isNan(gp)) return self.fail("lane {d} prob {d}: expected NaN", .{ b, k });
+                    } else if (!(@abs(gp - want_probs[k]) <= 2e-5)) {
+                        return self.fail("lane {d} prob {d}: got {d} want {d}", .{ b, k, gp, want_probs[k] });
+                    }
+                }
+                if (nv > 0 and !std.math.isNan(want_probs[0])) {
+                    if (got_draw != want_draw) return self.fail("lane {d}: draw {d} want {d}", .{ b, got_draw, want_draw });
+                    if (got_tok != @as(i32, @intCast(top_i[want_draw]))) return self.fail("lane {d}: tok {d} want {d}", .{ b, got_tok, top_i[want_draw] });
+                }
+                const p_row = self.p[b * 3 * r ..][0 .. 3 * r];
+                const st_row = self.st[b * r ..][0..r];
+                for (0..r) |i| {
+                    const keep = host.mlxSig(.bfloat16, .{ .v = p_row[i] });
+                    const th = std.math.tanh(p_row[r + i]);
+                    const cand = bf(.{ .v = th, .e = PRECISE * @abs(th) });
+                    const kept = bf(.{ .v = keep.v * st_row[i], .e = keep.e * @abs(st_row[i]) });
+                    const left = bf(.{ .v = 1 - keep.v, .e = keep.e });
+                    const blend = bf(.{ .v = left.v * cand.v, .e = left.e * @abs(cand.v) + cand.e * @abs(left.v) });
+                    const out = bf(.{ .v = kept.v + blend.v, .e = kept.e + blend.e });
+                    const gn = spec.read(.bf16, bytes[off_nst..], b * r + i);
+                    if (std.math.isNan(out.v) != std.math.isNan(gn)) return self.fail("lane {d} state {d}: NaN mismatch", .{ b, i });
+                    if (std.math.isFinite(out.v) and !(@abs(gn - out.v) <= host.allowance(out.e) + 1e-2 * @abs(out.v) + 1e-3)) {
+                        return self.fail("lane {d} state {d}: got {d} want {d}", .{ b, i, gn, out.v });
+                    }
+                }
+            }
+            return null;
+        }
+
+        fn wrapper(self: *Self) ![]const u8 {
+            var g = ops.Graph.init(self.rig.a, self.rig.stream());
+            defer g.deinit();
+            const x = self.args;
+            const o = try kernels.markovPickSample(&g, x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7], @intCast(K));
+            return self.rig.bytesOf(&.{ o.token, o.cands, o.probs, o.draw, o.state });
+        }
+    };
+}
 
 fn one(_: Shape) usize {
     return 1;
@@ -3000,6 +3658,56 @@ pub fn register(set: *kc.Set) !void {
         .served = &.{ .{ .rows = 256, .n = 98, .k = 1 }, .{ .rows = 256, .n = 8, .k = 1 } },
         .sums = markov_sums,
     }, null);
+    try set.add(MarkovFoldBatch(2), .init(set.a), .{
+        .name = "inkling2 markov_fold_batch bf16 (2 lanes)",
+        .accum = .f32,
+        .depth = host.depthOne,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .f32, .count = foldBatchCount(2) }, .{ .elem = .u32, .count = foldBatchCount(2) }, .{ .elem = .f32, .count = foldBatchCount(2) } },
+        .nan = .{ .stated = "MLX's argmax order: a NaN logit is a group's pick, its max and sum NaN" },
+        .served = &.{ .{ .rows = 256, .n = 4096, .k = 4000 }, .{ .rows = 256, .n = 2048, .k = 2048 } },
+        .sums = markov_sums,
+    }, null);
+    try set.add(MarkovFoldBatch(4), .init(set.a), .{
+        .name = "inkling2 markov_fold_batch bf16 (4 lanes)",
+        .accum = .f32,
+        .depth = host.depthOne,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .f32, .count = foldBatchCount(4) }, .{ .elem = .u32, .count = foldBatchCount(4) }, .{ .elem = .f32, .count = foldBatchCount(4) } },
+        .nan = .{ .stated = "MLX's argmax order: a NaN logit is a group's pick, its max and sum NaN" },
+        .served = &.{ .{ .rows = 256, .n = 4096, .k = 4000 }, .{ .rows = 256, .n = 1024, .k = 1024 } },
+        .sums = markov_sums,
+    }, null);
+    try set.add(MarkovFoldBatch(9), .init(set.a), .{
+        .name = "inkling2 markov_fold_batch bf16 (9 lanes)",
+        .accum = .f32,
+        .depth = host.depthOne,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .f32, .count = foldBatchCount(9) }, .{ .elem = .u32, .count = foldBatchCount(9) }, .{ .elem = .f32, .count = foldBatchCount(9) } },
+        .nan = .{ .stated = "MLX's argmax order: a NaN logit is a group's pick, its max and sum NaN" },
+        .served = &.{.{ .rows = 256, .n = 1024, .k = 1000 }},
+        .sums = markov_sums,
+    }, null);
+    try set.add(MarkovPickBatch(4), .init(set.a), .{
+        .name = "inkling2 markov_pick_batch bf16 (4 lanes)",
+        .accum = .f32,
+        .depth = host.depthOne,
+        .ops = 2,
+        .mids = 4,
+        .out = .bf16,
+        .outs = &.{ .{ .elem = .u32, .count = batchLanes(4) }, .{ .elem = .f32, .count = batchLanes(4) }, .{ .elem = .bf16, .count = batchState(4) } },
+        .served = &.{ .{ .rows = 256, .n = 98, .k = 1 }, .{ .rows = 256, .n = 8, .k = 1 } },
+        .sums = markov_sums,
+    }, null);
+    try set.add(MarkovPickSample(4), .init(set.a), .{
+        .name = "inkling2 markov_pick_sample bf16 (4 lanes)",
+        .accum = .none,
+        .depth = host.depthOne,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .u32, .count = batchLanes(4) }, .{ .elem = .u32, .count = batchCand(4) }, .{ .elem = .f32, .count = batchCand(4) }, .{ .elem = .i8, .count = batchLanes(4) }, .{ .elem = .bf16, .count = batchState(4) } },
+        .nan = .{ .stated = "MLX's argmax order: a NaN logit leads top-K and turns sampled softmax probabilities NaN" },
+        .served = &.{ .{ .rows = 256, .n = 128, .k = 1 }, .{ .rows = 256, .n = 16, .k = 1 } },
+    }, null);
     try set.add(Gate, .init(set.a, .bfloat16), .{
         .name = "inkling2 gate (one row, bf16 projections)",
         .accum = .f32,
@@ -3085,7 +3793,7 @@ test "kernel contract inkling2: each declared launch is the shipped wrapper's, b
             try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
         }
     };
-    inline for (.{ RelSplit, RelSplit, RelSplit, RelSplit, RelNax, RelNax, RelNax, RelNax, RelComb, RelSlots, MarkovRnn, MarkovFold, MarkovPick, Gate, Router, Norm(.bfloat16, false), Norm(.bfloat16, true), Norm(.float32, false), Norm(.float32, true) }) |T| {
+    inline for (.{ RelSplit, RelSplit, RelSplit, RelSplit, RelNax, RelNax, RelNax, RelNax, RelComb, RelSlots, MarkovRnn, MarkovFold, MarkovPick, MarkovFoldBatch(2), MarkovFoldBatch(4), MarkovFoldBatch(9), MarkovPickBatch(4), MarkovPickSample(4), Gate, Router, Norm(.bfloat16, false), Norm(.bfloat16, true), Norm(.float32, false), Norm(.float32, true) }) |T| {
         const k = set.kernels.items[at];
         at += 1;
         // Off NAX the tensor-unit read is not dispatched.

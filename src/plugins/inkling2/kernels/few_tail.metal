@@ -1,11 +1,11 @@
 // Inkling 2, a few rows: reduce grouped DN [S * KSEL, 1, D] (T) into XM [1, S, D], run the MLP short conv + residual
-// RES into HOUT [1, S, D] (T), and with OPEN write the verify conv windows WIN [NSLOT, KT - 1 + RPS, SW] f32: the S rows are
-// NSLOT slots of RPS rows, each behind its own window ST [NSLOT, KT - 1, SW].
-// One thread per column c < D handles ALL S rows (reading each DN element exactly once),
-// while threads >= D (when OPEN) copy ST and [KP | VP | OP] into WIN.
+// RES into HOUT [1, S, D] (T), and either write verify conv windows WIN [NSLOT, KT - 1 + RPS, SW] f32 (OPEN) or
+// write the updated conv state WIN [NSLOT, KT - 1, SW] f32 directly (STATE): the S rows are NSLOT slots of RPS rows,
+// each behind its own window ST [NSLOT, KT - 1, SW].
 const uint e = thread_position_in_grid.x;
 const uint S = RES_shape[1];
-const uint RPS = S / ST_shape[0];
+const uint NSLOT = ST_shape[0];
+const uint RPS = S / NSLOT;
 const uint D = RES_shape[2];
 const uint SW = ST_shape[2];
 const uint OFF = SW - D;
@@ -52,11 +52,22 @@ if (e < D) {
         y = float(WT(y));
         HOUT[s * D + c] = T(RES[s * D + c] + float(T((y + last_x) * PR[0])));
     }
+    if constexpr (STATE) {
+        for (uint slot = 0; slot < NSLOT; ++slot) {
+            for (uint j = 0; j < KT - 1; ++j) {
+                const uint at = RPS + j;
+                float val;
+                if (at < KT - 1) val = ST[(slot * (KT - 1) + at) * SW + OFF + c];
+                else val = float(XM[(slot * RPS + at - (KT - 1)) * D + c]);
+                WIN[(slot * (KT - 1) + j) * SW + OFF + c] = val;
+            }
+        }
+    }
     return;
 }
 if constexpr (OPEN) {
     const uint we = e - D;
-    const uint st_elems = ST_shape[0] * (KT - 1) * SW;
+    const uint st_elems = NSLOT * (KT - 1) * SW;
     if (we < st_elems) {
         const uint slot = we / ((KT - 1) * SW);
         WIN[slot * (KT - 1 + RPS) * SW + we % ((KT - 1) * SW)] = ST[we];
@@ -71,4 +82,22 @@ if constexpr (OPEN) {
     else if (col < 2 * C) val = float(VP[r * C + col - C]);
     else val = float(OP[r * D + col - 2 * C]);
     WIN[((r / RPS) * (KT - 1 + RPS) + KT - 1 + r % RPS) * SW + col] = val;
+} else if constexpr (STATE) {
+    const uint we = e - D;
+    if (we >= NSLOT * (KT - 1) * OFF) return;
+    const uint col = we % OFF;
+    const uint slot = we / ((KT - 1) * OFF);
+    const uint j = (we / OFF) % (KT - 1);
+    const uint at = RPS + j;
+    float val;
+    if (at < KT - 1) {
+        val = ST[(slot * (KT - 1) + at) * SW + col];
+    } else {
+        const uint r = slot * RPS + at - (KT - 1);
+        const uint C = KP_shape[2];
+        if (col < C) val = float(KP[r * C + col]);
+        else if (col < 2 * C) val = float(VP[r * C + col - C]);
+        else val = float(OP[r * D + col - 2 * C]);
+    }
+    WIN[(slot * (KT - 1) + j) * SW + col] = val;
 }

@@ -291,136 +291,379 @@ pub const Drafter = struct {
     /// `steps` drafts drawn from the drafter's soft-capped softmax at `temperature`, each keyed by `seed` and its index.
     pub const Law = struct { temperature: f32, seed: u64, steps: u32 = std.math.maxInt(u32) };
 
-    /// The `block - 1` tokens drafted after the committed token `t1` (`[1]` int32) at position `position`. `anchor` `[1, 1, hidden]` is `t1`'s normed embedding, `taps` `[1, n, taps * hidden]` the trunk's
-    /// taps at the `n >= 1` positions before `position`, `head` the trunk's LM head, `vocab` its real rows and `softcap` its
-/// logit soft cap. `cache` carries the context's keys and values over the slot's rounds (null: projected afresh).
-    pub fn draft(d: *const Drafter, g: *Graph, t1: Array, anchor: Array, taps: Array, position: c_int, head: *const Linear, vocab: c_int, softcap: f32, cache: ?*ContextKv, law: ?Law) !Block {
+    /// One lane of a batched draft call (`draftBatch`, `draftBatchPacked`).
+    pub const DraftLane = struct {
+        t1: Array,
+        anchor: Array,
+        taps: Array,
+        position: c_int,
+        cache: ?*ContextKv,
+        steps: u32,
+    };
+
+    /// Sampled batch draw parameters: per-lane temperature and a shared base seed.
+    pub const Draws = struct { temperatures: []const f32, seed: u64 };
+
+    /// Packed output of `draftBatchPacked`: `[B, drafts]` tokens & confidence, plus optional `[B, drafts, vocab]` probs.
+    pub const BatchBlock = struct { tokens: Array, confidence: Array, probs: Array = .{} };
+    pub const SampledBlock = struct { tokens: Array, cands: Array, probs: Array, draws: Array, k: c_int };
+
+    const BatchBase = struct { rows: Array, newest: Array, base: Array, t1s: Array, drafts: c_int };
+
+    const max_lanes = 16;
+
+    const Rope = union(enum) { none, at: c_int, each: Array };
+
+    fn headsRope(d: *const Drafter, g: *Graph, x: Array, count: u32, norm_weight: ?Array, rope: Rope) !Array {
+        const lanes = ops.shape(x)[0];
+        const n = ops.shape(x)[1];
+        const hd: c_int = @intCast(d.cfg.head_dim);
+        var h = try g.reshape(x, &.{ lanes, n, @intCast(count), hd });
+        if (norm_weight) |w| h = try g.rmsNorm(h, w, d.cfg.eps);
+        h = try g.transpose(h, &.{ 0, 2, 1, 3 });
+        return switch (rope) {
+            .none => h,
+            .at => |p| g.rope(h, hd, d.cfg.theta, p),
+            .each => |p| g.ropeEach(h, hd, d.cfg.theta, p),
+        };
+    }
+
+    /// Shared 3-layer drafter forward + `lm_head` over `lanes.len` (1..16) slots.
+    fn draftBatchBase(d: *const Drafter, g: *Graph, lanes: []const DraftLane, head: *const Linear) !BatchBase {
         const cfg = &d.cfg;
+        const count = lanes.len;
+        if (count == 0 or count > max_lanes) return error.Inkling2DraftRound;
         const hidden: c_int = @intCast(d.hidden);
         const block: c_int = @intCast(cfg.block);
-        const rank: c_int = @intCast(cfg.rank);
-        const n = ops.shape(taps)[1];
-        const dt = ops.dtype(d.norm);
-        const at: u64 = @intCast(position);
-        // The rows the cache lacks: those committed since its end, when it still reaches back to the ring's first.
-        var fresh: c_int = n;
-        if (cache) |cc| if (cc.k[0].ctx != null and cc.end <= at and at - cc.end <= @as(u64, @intCast(n))) {
-            const since: c_int = @intCast(at - cc.end);
-            if (since + ops.shape(cc.k[0])[2] >= n) fresh = since;
-        };
-        const tapsOf = struct {
-            fn f(gr: *Graph, x: Array, from: c_int, to: c_int, count: u32, width: c_int) !Array {
-                return gr.astype(try gr.reshape(try gr.sliceAxis(x, 1, from, to), &.{ 1, to - from, @intCast(count), width }), .float32);
-            }
-        }.f;
-        const new32 = if (fresh > 0) try tapsOf(g, taps, n - fresh, n, cfg.tap_count, hidden) else null;
-        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
-        const back = [_]c_int{ 0, 2, 1, 3 };
-
         const q_dim: c_int = @intCast(cfg.heads * cfg.head_dim);
         const kv_dim: c_int = @intCast(cfg.kv_heads * cfg.head_dim);
         const inter_dim: c_int = @intCast(cfg.intermediate);
-        var h = try g.concat(&.{ try g.astype(anchor, dt), try g.broadcast(try g.astype(d.mask, dt), &.{ 1, block - 1, hidden }) }, 1);
+        const dt = ops.dtype(d.norm);
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
+        const back = [_]c_int{ 0, 2, 1, 3 };
+
+        var max_steps: u32 = 1;
+        for (lanes) |l| max_steps = @max(max_steps, @min(l.steps, @as(u32, @intCast(block - 1))));
+        const drafts: c_int = @intCast(max_steps);
+
+        const mask_b = try g.broadcast(try g.astype(d.mask, dt), &.{ 1, block - 1, hidden });
+        var h_parts: [max_lanes]Array = undefined;
+        var fresh: [max_lanes]c_int = undefined;
+        var n_taps: [max_lanes]c_int = undefined;
+        var rope_at: [max_lanes]i32 = undefined;
+        var new32: [max_lanes]?Array = @splat(null);
+        var last_taps: [max_lanes]Array = undefined;
+        var t1_parts: [max_lanes]Array = undefined;
+        const tapsOf = struct {
+            fn f(gr: *Graph, x: Array, from: c_int, to: c_int, tap_count: u32, width: c_int) !Array {
+                return gr.astype(try gr.reshape(try gr.sliceAxis(x, 1, from, to), &.{ 1, to - from, @intCast(tap_count), width }), .float32);
+            }
+        }.f;
+        for (lanes, 0..) |lane, j| {
+            const n = ops.shape(lane.taps)[1];
+            n_taps[j] = n;
+            rope_at[j] = lane.position;
+            const at: u64 = @intCast(lane.position);
+            fresh[j] = n;
+            if (lane.cache) |cc| if (cc.k[0].ctx != null and cc.end <= at and at - cc.end <= @as(u64, @intCast(n))) {
+                const since: c_int = @intCast(at - cc.end);
+                if (since + ops.shape(cc.k[0])[2] >= n) fresh[j] = since;
+            };
+            if (fresh[j] > 0) new32[j] = try tapsOf(g, lane.taps, n - fresh[j], n, cfg.tap_count, hidden);
+            last_taps[j] = try tapsOf(g, lane.taps, n - 1, n, cfg.tap_count, hidden);
+            h_parts[j] = try g.concat(&.{ try g.astype(lane.anchor, dt), mask_b }, 1);
+            t1_parts[j] = lane.t1;
+        }
+        var h = if (count == 1) h_parts[0] else try g.concat(h_parts[0..count], 0);
+        const rope: Rope = if (count == 1) .{ .at = rope_at[0] } else .{ .each = try g.fromSlice(i32, rope_at[0..count], &.{@intCast(count)}) };
+
         for (d.layers, 0..) |*L, i| {
             var lg = g.scope();
             defer lg.deinit();
-            var kc: Array = .{};
-            var vc: Array = .{};
-            // A full layer reads every committed position (kept by `appendFull`), not the ring's newest.
-            if (cache) |cc| if (cfg.full(i) and cc.fk[i].ctx != null and cc.full_end == at) {
-                const n_full: c_int = @intCast(cc.full_end - cc.full_from);
-                kc = try lg.sliceAxis(cc.fk[i], 2, 0, n_full);
-                vc = try lg.sliceAxis(cc.fv[i], 2, 0, n_full);
-            };
-            const full_read = kc.ctx != null;
-            // A layer with no ring copy (a full one whose buffers end elsewhere) projects the whole ring.
-            const own: c_int = if (fresh < n and cache.?.k[i].ctx == null) n else fresh;
-            if (full_read) {} else if (own > 0) {
-                const rows32 = if (own == fresh) new32.? else try tapsOf(&lg, taps, 0, n, cfg.tap_count, hidden);
-                const context = try d.mix(&lg, rows32, @intCast(i), L.mix_norm);
-                if (L.kv_ctx.w.ctx != null) {
-                    const kv_c = try project(&lg, &L.kv_ctx, context);
-                    kc = try d.heads(&lg, try lg.sliceAxis(kv_c, 2, 0, kv_dim), cfg.kv_heads, L.k_norm_ctx, position - own);
-                    vc = try d.heads(&lg, try lg.sliceAxis(kv_c, 2, kv_dim, 2 * kv_dim), cfg.kv_heads, null, null);
-                } else {
-                    kc = try d.heads(&lg, try project(&lg, &L.k_ctx, context), cfg.kv_heads, L.k_norm_ctx, position - own);
-                    vc = try d.heads(&lg, try project(&lg, &L.v_ctx, context), cfg.kv_heads, null, null);
-                }
-            }
-            if (!full_read and own < n) {
-                const cc = cache.?;
-                if (own > 0) {
-                    kc = try lg.concat(&.{ cc.k[i], kc }, 2);
-                    vc = try lg.concat(&.{ cc.v[i], vc }, 2);
-                } else {
-                    kc = cc.k[i];
-                    vc = cc.v[i];
-                }
-                const total = ops.shape(kc)[2];
-                kc = try lg.sliceAxis(kc, 2, total - n, total);
-                vc = try lg.sliceAxis(vc, 2, total - n, total);
-            }
-            if (cache) |cc| if (!full_read) {
-                const k_held = lg.escape(kc);
-                const v_held = lg.escape(vc);
-                if (cc.k[i].ctx != null) _ = mlx.mlx_array_free(cc.k[i]);
-                if (cc.v[i].ctx != null) _ = mlx.mlx_array_free(cc.v[i]);
-                cc.k[i] = k_held;
-                cc.v[i] = v_held;
-            };
-            const x = try lg.rmsNorm(h, L.in_norm, cfg.eps);
-            const q, const kb, const vb = if (L.qkv.w.ctx != null) blk: {
-                const qkv = try project(&lg, &L.qkv, x);
-                break :blk .{
-                    try d.heads(&lg, try lg.sliceAxis(qkv, 2, 0, q_dim), cfg.heads, L.q_norm, position),
-                    try d.heads(&lg, try lg.sliceAxis(qkv, 2, q_dim, q_dim + kv_dim), cfg.kv_heads, L.k_norm, position),
-                    try d.heads(&lg, try lg.sliceAxis(qkv, 2, q_dim + kv_dim, q_dim + 2 * kv_dim), cfg.kv_heads, null, null),
+            var kc: [max_lanes]Array = @splat(.{});
+            var vc: [max_lanes]Array = @splat(.{});
+            var full_read: [max_lanes]bool = @splat(false);
+            var own_rows: [max_lanes]c_int = @splat(0);
+            var ctx_parts: [max_lanes]Array = undefined;
+            var ctx_lanes: [max_lanes]usize = undefined;
+            var need_kv: usize = 0;
+            for (lanes, 0..) |lane, j| {
+                const n = n_taps[j];
+                const at: u64 = @intCast(lane.position);
+                if (lane.cache) |cc| if (cfg.full(i) and cc.fk[i].ctx != null and cc.full_end == at) {
+                    const n_full: c_int = @intCast(cc.full_end - cc.full_from);
+                    kc[j] = try lg.sliceAxis(cc.fk[i], 2, 0, n_full);
+                    vc[j] = try lg.sliceAxis(cc.fv[i], 2, 0, n_full);
+                    full_read[j] = true;
                 };
-            } else .{
-                try d.heads(&lg, try project(&lg, &L.q, x), cfg.heads, L.q_norm, position),
-                try d.heads(&lg, try project(&lg, &L.k, x), cfg.kv_heads, L.k_norm, position),
-                try d.heads(&lg, try project(&lg, &L.v, x), cfg.kv_heads, null, null),
-            };
-            var keys: Array = .{};
-            var values: Array = .{};
-            if (full_read) {
-                // The block's keys go in place after the context, as one view: no copy of the whole context. The next
-                // push overwrites them.
-                const cc = cache.?;
-                const n_full: c_int = @intCast(cc.full_end - cc.full_from);
-                const sh = ops.shape(cc.fk[i]);
-                const end = n_full + block;
-                if (end <= sh[2]) {
-                    for ([2]Array{ kb, vb }, [2]*Array{ &cc.fk[i], &cc.fv[i] }, [2]*Array{ &keys, &values }) |x_new, dst, out| {
-                        const next = lg.escape(try lg.sliceUpdate(dst.*, try lg.astype(x_new, ops.dtype(dst.*)), &.{ 0, 0, n_full, 0 }, &.{ 1, sh[1], end, sh[3] }));
-                        _ = mlx.mlx_array_free(dst.*);
-                        dst.* = next;
-                        out.* = try lg.sliceAxis(next, 2, 0, end);
+                if (!full_read[j]) {
+                    const own: c_int = if (fresh[j] < n and lane.cache.?.k[i].ctx == null) n else fresh[j];
+                    own_rows[j] = own;
+                    if (own > 0) {
+                        const rows32 = if (own == fresh[j]) new32[j].? else try tapsOf(&lg, lane.taps, 0, n, cfg.tap_count, hidden);
+                        ctx_parts[need_kv] = try d.mix(&lg, rows32, @intCast(i), L.mix_norm);
+                        ctx_lanes[need_kv] = j;
+                        need_kv += 1;
                     }
                 }
             }
-            if (keys.ctx == null) {
-                keys = try lg.concat(&.{ kc, kb }, 2);
-                values = try lg.concat(&.{ vc, vb }, 2);
+            if (need_kv > 0) {
+                const all_ctx = if (need_kv == 1) ctx_parts[0] else try lg.concat(ctx_parts[0..need_kv], 1);
+                var k_all: Array = undefined;
+                var v_all: Array = undefined;
+                if (L.kv_ctx.w.ctx != null) {
+                    const kvp = try project(&lg, &L.kv_ctx, all_ctx);
+                    k_all = try lg.sliceAxis(kvp, 2, 0, kv_dim);
+                    v_all = try lg.sliceAxis(kvp, 2, kv_dim, 2 * kv_dim);
+                } else {
+                    k_all = try project(&lg, &L.k_ctx, all_ctx);
+                    v_all = try project(&lg, &L.v_ctx, all_ctx);
+                }
+                var off: c_int = 0;
+                for (ctx_lanes[0..need_kv]) |j| {
+                    const own = own_rows[j];
+                    const kj = if (need_kv == 1) k_all else try lg.sliceAxis(k_all, 1, off, off + own);
+                    const vj = if (need_kv == 1) v_all else try lg.sliceAxis(v_all, 1, off, off + own);
+                    kc[j] = try d.heads(&lg, kj, cfg.kv_heads, L.k_norm_ctx, lanes[j].position - own);
+                    vc[j] = try d.heads(&lg, vj, cfg.kv_heads, null, null);
+                    off += own;
+                }
             }
-            const read = try lg.reshape(try lg.transpose(try lg.sdpa(q, keys, values, scale, .none), &back), &.{ 1, block, -1 });
+            for (lanes, 0..) |lane, j| {
+                if (full_read[j]) continue;
+                const n = n_taps[j];
+                const own = own_rows[j];
+                if (own < n) {
+                    const cc = lane.cache.?;
+                    if (own > 0) {
+                        kc[j] = try lg.concat(&.{ cc.k[i], kc[j] }, 2);
+                        vc[j] = try lg.concat(&.{ cc.v[i], vc[j] }, 2);
+                    } else {
+                        kc[j] = cc.k[i];
+                        vc[j] = cc.v[i];
+                    }
+                    const total = ops.shape(kc[j])[2];
+                    kc[j] = try lg.sliceAxis(kc[j], 2, total - n, total);
+                    vc[j] = try lg.sliceAxis(vc[j], 2, total - n, total);
+                }
+                if (lane.cache) |cc| {
+                    const k_held = lg.escape(kc[j]);
+                    const v_held = lg.escape(vc[j]);
+                    if (cc.k[i].ctx != null) _ = mlx.mlx_array_free(cc.k[i]);
+                    if (cc.v[i].ctx != null) _ = mlx.mlx_array_free(cc.v[i]);
+                    cc.k[i] = k_held;
+                    cc.v[i] = v_held;
+                }
+            }
+            const x = try lg.rmsNorm(h, L.in_norm, cfg.eps);
+            var q: Array = undefined;
+            var kb: Array = undefined;
+            var vb: Array = undefined;
+            if (L.qkv.w.ctx != null) {
+                const qkv = try project(&lg, &L.qkv, x);
+                q = try d.headsRope(&lg, try lg.sliceAxis(qkv, 2, 0, q_dim), cfg.heads, L.q_norm, rope);
+                kb = try d.headsRope(&lg, try lg.sliceAxis(qkv, 2, q_dim, q_dim + kv_dim), cfg.kv_heads, L.k_norm, rope);
+                vb = try d.headsRope(&lg, try lg.sliceAxis(qkv, 2, q_dim + kv_dim, q_dim + 2 * kv_dim), cfg.kv_heads, null, .none);
+            } else {
+                q = try d.headsRope(&lg, try project(&lg, &L.q, x), cfg.heads, L.q_norm, rope);
+                kb = try d.headsRope(&lg, try project(&lg, &L.k, x), cfg.kv_heads, L.k_norm, rope);
+                vb = try d.headsRope(&lg, try project(&lg, &L.v, x), cfg.kv_heads, null, .none);
+            }
+            var reads: [max_lanes]Array = undefined;
+            for (lanes, 0..) |lane, j| {
+                const at_j: c_int = @intCast(j);
+                const solo = count == 1;
+                const qj = if (solo) q else try lg.sliceAxis(q, 0, at_j, at_j + 1);
+                const kbj = if (solo) kb else try lg.sliceAxis(kb, 0, at_j, at_j + 1);
+                const vbj = if (solo) vb else try lg.sliceAxis(vb, 0, at_j, at_j + 1);
+                var keys: Array = .{};
+                var values: Array = .{};
+                if (full_read[j]) {
+                    const cc = lane.cache.?;
+                    const n_full: c_int = @intCast(cc.full_end - cc.full_from);
+                    const sh = ops.shape(cc.fk[i]);
+                    const end = n_full + block;
+                    if (end <= sh[2]) {
+                        for ([2]Array{ kbj, vbj }, [2]*Array{ &cc.fk[i], &cc.fv[i] }, [2]*Array{ &keys, &values }) |x_new, dst, out_kv| {
+                            const next = lg.escape(try lg.sliceUpdate(dst.*, try lg.astype(x_new, ops.dtype(dst.*)), &.{ 0, 0, n_full, 0 }, &.{ 1, sh[1], end, sh[3] }));
+                            _ = mlx.mlx_array_free(dst.*);
+                            dst.* = next;
+                            out_kv.* = try lg.sliceAxis(next, 2, 0, end);
+                        }
+                    }
+                }
+                if (keys.ctx == null) {
+                    keys = try lg.concat(&.{ kc[j], kbj }, 2);
+                    values = try lg.concat(&.{ vc[j], vbj }, 2);
+                }
+                reads[j] = try lg.sdpa(qj, keys, values, scale, .none);
+            }
+            const attn = if (count == 1) reads[0] else try lg.concat(reads[0..count], 0);
+            const read = try lg.reshape(try lg.transpose(attn, &back), &.{ @intCast(count), block, -1 });
             const mid = try lg.add(h, try project(&lg, &L.o, read));
             const y = try lg.rmsNorm(mid, L.post_norm, cfg.eps);
-            const gated_mlp = if (L.gate_up.w.ctx != null) blk: {
+            const mlp = if (L.gate_up.w.ctx != null) blk: {
                 const gu = try project(&lg, &L.gate_up, y);
-                break :blk try lg.mul(try lg.silu(try lg.sliceAxis(gu, 2, 0, inter_dim)), try lg.sliceAxis(gu, 2, inter_dim, 2 * inter_dim));
-            } else try lg.mul(try lg.silu(try project(&lg, &L.gate, y)), try project(&lg, &L.up, y));
-            const mlp = try project(&lg, &L.down, gated_mlp);
+                break :blk try project(&lg, &L.down, try lg.mul(try lg.silu(try lg.sliceAxis(gu, 2, 0, inter_dim)), try lg.sliceAxis(gu, 2, inter_dim, 2 * inter_dim)));
+            } else try project(&lg, &L.down, try lg.mul(try lg.silu(try project(&lg, &L.gate, y)), try project(&lg, &L.up, y)));
             h = try g.keep(try lg.add(mid, mlp));
         }
-        const drafts: c_int = if (law) |l| @min(block - 1, @as(c_int, @intCast(@min(l.steps, block - 1)))) else block - 1;
-        const rows = try g.sliceAxis(try g.rmsNorm(h, d.norm, cfg.eps), 1, 1, 1 + drafts);
-        const base = try g.astype(try project(g, if (d.head) |*own| own else head, rows), .float32);
 
-        if (cache) |cc| cc.end = at;
-        // The RNN restarts each block from the newest committed position's mix.
-        const newest = try d.mix(g, try tapsOf(g, taps, n - 1, n, cfg.tap_count, hidden), @intCast(d.layers.len), d.rnn_norm);
-        return d.markov(g, t1, rows, newest, base, vocab, softcap, kernels.markovRuns(g, d.rnn.w, d.fold, rank), law);
+        for (lanes) |lane| if (lane.cache) |cc| {
+            cc.end = @intCast(lane.position);
+        };
+        const rows = try g.sliceAxis(try g.rmsNorm(h, d.norm, cfg.eps), 1, 1, 1 + drafts);
+        const flat_rows = try g.reshape(rows, &.{ 1, @as(c_int, @intCast(count)) * drafts, hidden });
+        const base_flat = try g.astype(try project(g, if (d.head) |*own| own else head, flat_rows), .float32);
+        const base = try g.reshape(base_flat, &.{ @intCast(count), drafts, -1 });
+
+        const newest_in = if (count == 1) last_taps[0] else try g.concat(last_taps[0..count], 0);
+        const newest = try d.mix(g, newest_in, @intCast(d.layers.len), d.rnn_norm);
+        const t1s = if (count == 1) t1_parts[0] else try g.concat(t1_parts[0..count], 0);
+        return .{ .rows = rows, .newest = newest, .base = base, .t1s = t1s, .drafts = drafts };
+    }
+
+    /// Batched draft across `lanes.len` (1..16) slots: shares all 3 drafter layer projections, `lm_head` and the
+    /// Markov `fold` read across lanes while each lane attends its own context KV.
+    pub fn draftBatchPacked(d: *const Drafter, g: *Graph, lanes: []const DraftLane, head: *const Linear, vocab: c_int, softcap: f32, draws: ?Draws) !BatchBlock {
+        const b = try d.draftBatchBase(g, lanes, head);
+        return d.markovBatch(g, b.t1s, b.rows, b.newest, b.base, vocab, softcap, kernels.markovRuns(g, d.rnn.w, d.fold, @intCast(d.cfg.rank)), draws);
+    }
+
+    /// GPU-fused batched sampled/mixed draft across `lanes.len` (1..16) slots: shares one `fold` read per tile and
+    /// emits sparse top-K (`K = markov_sample_k`) proposal tables filtered to match each lane's `SampleLane` params.
+    pub fn draftBatchSampled(d: *const Drafter, g: *Graph, lanes: []const DraftLane, sample_lanes: []const kernels.SampleLane, seeds: []const u64, head: *const Linear, vocab: c_int, softcap: f32) !SampledBlock {
+        const b = try d.draftBatchBase(g, lanes, head);
+        const rank: c_int = @intCast(d.cfg.rank);
+        const count: c_int = @intCast(lanes.len);
+        const steps: usize = @intCast(b.drafts);
+        const dt = ops.dtype(d.norm);
+        var state = try g.zeros(&.{ count, 1, rank }, dt);
+        var prev = b.t1s;
+        const dense_rows = try g.contiguous(b.rows);
+        const dense_new = try g.contiguous(b.newest);
+        const dense_base = try g.contiguous(b.base);
+        const cap = try g.fromSlice(f32, &.{softcap}, &.{1});
+        var lp_buf: [max_lanes * 4]f32 = undefined;
+        var seed_buf: [max_lanes * 2]u32 = undefined;
+        for (sample_lanes[0..lanes.len], seeds[0..lanes.len], 0..) |sl, sd, i| {
+            lp_buf[i * 4 + 0] = sl.temperature;
+            lp_buf[i * 4 + 1] = @floatFromInt(sl.top_k);
+            lp_buf[i * 4 + 2] = sl.top_p;
+            lp_buf[i * 4 + 3] = sl.min_p;
+            seed_buf[i * 2 + 0] = @truncate(sd);
+            seed_buf[i * 2 + 1] = @truncate(sd >> 32);
+        }
+        const lparams = try g.fromSlice(f32, lp_buf[0 .. lanes.len * 4], &.{ count, 4 });
+        const seeds_arr = try g.fromSlice(u32, seed_buf[0 .. lanes.len * 2], &.{ count, 2 });
+        var toks: [abi.max_round_tokens]Array = undefined;
+        var cands: [abi.max_round_tokens]Array = undefined;
+        var probs: [abi.max_round_tokens]Array = undefined;
+        var draws: [abi.max_round_tokens]Array = undefined;
+        for (0..steps) |i| {
+            const st = try kernels.markovStepBatchSampled(g, d.rnn.w, d.rnn_bias, state, d.prev_rows, dense_rows, dense_new, prev, d.fold, d.fold_bias, dense_base, @intCast(i), vocab, cap, lparams, seeds_arr);
+            state = st.state;
+            prev = st.token;
+            toks[i] = try g.expandDims(st.token, 1);
+            cands[i] = try g.expandDims(st.cands, 1);
+            probs[i] = try g.expandDims(st.probs, 1);
+            draws[i] = try g.expandDims(st.draw, 1);
+        }
+        return .{
+            .tokens = try g.concat(toks[0..steps], 1),
+            .cands = try g.concat(cands[0..steps], 1),
+            .probs = try g.concat(probs[0..steps], 1),
+            .draws = try g.concat(draws[0..steps], 1),
+            .k = kernels.markov_sample_k,
+        };
+    }
+
+    pub fn draftBatch(d: *const Drafter, g: *Graph, lanes: []const DraftLane, head: *const Linear, vocab: c_int, softcap: f32, draws: ?Draws, out: []Block) !void {
+        const packed_b = try d.draftBatchPacked(g, lanes, head, vocab, softcap, draws);
+        for (lanes, out[0..lanes.len], 0..) |lane, *dst, j| {
+            const at: c_int = @intCast(j);
+            const steps: c_int = @intCast(@min(lane.steps, d.cfg.block - 1));
+            const tok_row = try g.reshape(try g.sliceAxis(packed_b.tokens, 0, at, at + 1), &.{ops.shape(packed_b.tokens)[1]});
+            const conf_row = try g.reshape(try g.sliceAxis(packed_b.confidence, 0, at, at + 1), &.{ops.shape(packed_b.confidence)[1]});
+            dst.* = .{
+                .tokens = if (ops.shape(tok_row)[0] == steps) tok_row else try g.sliceAxis(tok_row, 0, 0, steps),
+                .confidence = if (ops.shape(conf_row)[0] == steps) conf_row else try g.sliceAxis(conf_row, 0, 0, steps),
+                .probs = if (packed_b.probs.ctx != null) blk: {
+                    const pr = try g.reshape(try g.sliceAxis(packed_b.probs, 0, at, at + 1), &.{ ops.shape(packed_b.probs)[1], vocab });
+                    break :blk if (ops.shape(pr)[0] == steps) pr else try g.sliceAxis(pr, 0, 0, steps);
+                } else .{},
+            };
+        }
+    }
+
+    /// Batched Markov chain over `B` lanes: `t1` `[B]` int32, `rows` `[B, drafts, hidden]`, `newest` `[B, 1, hidden]`,
+    /// `base` `[B, drafts, V_pad]` f32.
+    pub fn markovBatch(d: *const Drafter, g: *Graph, t1: Array, rows: Array, newest: Array, base: Array, vocab: c_int, softcap: f32, fused: bool, draws: ?Draws) !BatchBlock {
+        const rank: c_int = @intCast(d.cfg.rank);
+        const count = ops.shape(rows)[0];
+        const steps: usize = @intCast(ops.shape(rows)[1]);
+        const dt = ops.dtype(d.norm);
+        var state = try g.zeros(&.{ count, 1, rank }, dt);
+        var prev = t1;
+        var drafted: [abi.max_round_tokens]Array = undefined;
+        var sure: [abi.max_round_tokens]Array = undefined;
+        var probs: [abi.max_round_tokens]Array = undefined;
+        const dense_rows = try g.contiguous(rows);
+        const dense_new = try g.contiguous(newest);
+        const dense_base = try g.contiguous(base);
+        var inv_temp: Array = .{};
+        if (draws) |dr| {
+            var inv: [max_lanes]f32 = undefined;
+            for (dr.temperatures, inv[0..dr.temperatures.len]) |temp, *dst| dst.* = 1.0 / temp;
+            inv_temp = try g.fromSlice(f32, inv[0..dr.temperatures.len], &.{ count, 1, 1 });
+        }
+        for (0..steps) |i| {
+            const at: c_int = @intCast(i);
+            if (fused and draws == null) {
+                const st = try kernels.markovStepBatch(g, d.rnn.w, d.rnn_bias, state, d.prev_rows, dense_rows, dense_new, prev, d.fold, d.fold_bias, dense_base, at, vocab, softcap);
+                state = st.state;
+                prev = st.token;
+                drafted[i] = try g.expandDims(st.token, 1);
+                sure[i] = try g.expandDims(st.confidence, 1);
+                continue;
+            }
+            const last = try g.astype(try g.reshape(try g.take(d.prev_rows, prev, 0), &.{ count, 1, rank }), dt);
+            const fed = try g.concat(&.{ state, last, try g.sliceAxis(rows, 1, at, at + 1), newest }, 2);
+            const p = try g.astype(try g.add(try project(g, &d.rnn, fed), d.rnn_bias), .float32);
+            const keep = try g.astype(try g.sigmoid(try g.sliceAxis(p, 2, 0, rank)), dt);
+            const blend = try g.mul(try g.sub(try g.scalar(1, dt), keep), try g.astype(try g.tanh(try g.sliceAxis(p, 2, rank, 2 * rank)), dt));
+            state = try g.add(try g.mul(keep, state), blend);
+            const latent = try g.astype(try g.tanh(try g.sliceAxis(p, 2, 2 * rank, 3 * rank)), dt);
+            const bias = try g.astype(try g.add(try g.matmul(latent, d.fold), d.fold_bias), .float32);
+            const logits = try g.sliceAxis(try g.add(try g.sliceAxis(base, 1, at, at + 1), bias), 2, 0, vocab);
+            const capped = if (softcap > 0) try g.mulScalar(try g.tanh(try g.mulScalar(logits, 1.0 / softcap)), softcap) else logits;
+            if (draws) |dr| {
+                const scaled = try g.mul(capped, inv_temp);
+                const key = try g.call(mlx.mlx_random_key, .{dr.seed +% @as(u64, i) *% 0x9E3779B97F4A7C15});
+                prev = try g.astype(try g.reshape(try g.call(mlx.mlx_random_categorical, .{ scaled, @as(c_int, -1), key }), &.{count}), .int32);
+                const pr = try g.softmax(scaled, -1, true);
+                probs[i] = pr;
+                sure[i] = try g.reshape(try g.max(pr, -1, false), &.{ count, 1 });
+            } else {
+                prev = try g.astype(try g.reshape(try g.argmax(logits, -1, false), &.{count}), .int32);
+                sure[i] = try g.reshape(try g.exp(try g.sub(try g.max(capped, -1, false), try g.call(mlx.mlx_logsumexp_axis, .{ capped, -1, false }))), &.{ count, 1 });
+            }
+            drafted[i] = try g.expandDims(prev, 1);
+        }
+        return .{
+            .tokens = try g.concat(drafted[0..steps], 1),
+            .confidence = try g.concat(sure[0..steps], 1),
+            .probs = if (draws != null) try g.concat(probs[0..steps], 1) else .{},
+        };
+    }
+
+    /// The `block - 1` tokens drafted after the committed token `t1` (`[1]` int32) at position `position`. `anchor` `[1, 1, hidden]` is `t1`'s normed embedding, `taps` `[1, n, taps * hidden]` the trunk's
+    /// taps at the `n >= 1` positions before `position`, `head` the trunk's LM head, `vocab` its real rows and `softcap` its
+    /// logit soft cap. `cache` carries the context's keys and values over the slot's rounds (null: projected afresh).
+    pub fn draft(d: *const Drafter, g: *Graph, t1: Array, anchor: Array, taps: Array, position: c_int, head: *const Linear, vocab: c_int, softcap: f32, cache: ?*ContextKv, law: ?Law) !Block {
+        const lane = [_]DraftLane{.{ .t1 = t1, .anchor = anchor, .taps = taps, .position = position, .cache = cache, .steps = if (law) |l| l.steps else d.cfg.block - 1 }};
+        const b = try d.draftBatchBase(g, &lane, head);
+        return d.markov(g, t1, b.rows, b.newest, b.base, vocab, softcap, kernels.markovRuns(g, d.rnn.w, d.fold, @intCast(d.cfg.rank)), law);
     }
 
     /// The Markov head's chain over the block rows `rows` `[1, block - 1, hidden]` and their head logits `base` f32,
