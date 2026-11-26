@@ -1092,19 +1092,7 @@ pub const HotPrefixCache = struct {
     /// their shape + dtype so this is exact, not a heuristic. Quant schemes
     /// account for q, scales, biases together.
     fn snapshotBytes(snap: *const KVCacheSnapshot) u64 {
-        var total: u64 = 0;
-        for (snap.entries) |e| {
-            if (!e.initialized) continue;
-            total += @as(u64, mlx.mlx_array_size(e.keys)) * @as(u64, mlx.mlx_array_itemsize(e.keys));
-            total += @as(u64, mlx.mlx_array_size(e.values)) * @as(u64, mlx.mlx_array_itemsize(e.values));
-            if (snap.config.scheme != .off) {
-                total += @as(u64, mlx.mlx_array_size(e.keys_scales)) * @as(u64, mlx.mlx_array_itemsize(e.keys_scales));
-                total += @as(u64, mlx.mlx_array_size(e.keys_biases)) * @as(u64, mlx.mlx_array_itemsize(e.keys_biases));
-                total += @as(u64, mlx.mlx_array_size(e.values_scales)) * @as(u64, mlx.mlx_array_itemsize(e.values_scales));
-                total += @as(u64, mlx.mlx_array_size(e.values_biases)) * @as(u64, mlx.mlx_array_itemsize(e.values_biases));
-            }
-        }
-        return total;
+        return snap.bytes();
     }
 
     /// Resident bytes of a speculative-side snap: the KV plus (qwen4_exp) the head's QSA aux half.
@@ -1437,12 +1425,12 @@ pub const HotPrefixCache = struct {
                 continue;
             }
             if (module_request != null) continue;
-            if (!ringRestores(&e.snapshot, shared, prompt_ids.len)) continue;
             const effective = if (require_ssm_checkpoint) blk: {
                 const cps = e.ssm_checkpoints orelse continue;
                 const cp = highestCheckpointAtOrBelow(cps, shared) orelse continue;
+                if (cp.ring == null and !ringRestores(&e.snapshot, cp.pos, prompt_ids.len)) continue;
                 break :blk cp.pos;
-            } else shared;
+            } else if (ringRestores(&e.snapshot, shared, prompt_ids.len)) shared else continue;
             if (effective > best_effective or
                 (effective == best_effective and shared > best_shared))
             {
@@ -1901,11 +1889,16 @@ pub const HotPrefixCache = struct {
         // The two MUST stay in sync, so we rewind KV further too.
         var dump = restore_dump.RestoreDumpMeta{ .kind = "restore", .pos = 0 };
         var effective_matched: usize = restore_cap;
+        var ring_from_cp = false;
         if (target_ssm_entries) |entries| {
             if (e.ssm_checkpoints) |cps| {
                 if (highestCoveringCheckpoint(cps, restore_cap)) |cp| {
                     try restoreSsmCheckpoint(entries, cp);
                     effective_matched = cp.pos;
+                    if (cp.ring) |*tail| if (!ringRestores(&e.snapshot, cp.pos, prompt_ids.len)) {
+                        try target_cache.restoreRingTail(tail);
+                        ring_from_cp = true;
+                    };
                     const bank = qsaHistorySource(cps, cp);
                     if (bank) |src| {
                         try applyQsaHistoryAt(entries, src, cp.pos, s, false);
@@ -1948,7 +1941,7 @@ pub const HotPrefixCache = struct {
                 effective_matched = 0;
             }
         }
-        if (effective_matched > 0 and !ringRestores(&e.snapshot, effective_matched, prompt_ids.len)) {
+        if (effective_matched > 0 and !ring_from_cp and !ringRestores(&e.snapshot, effective_matched, prompt_ids.len)) {
             log.info("  [hot-cache] sliding ring holds rows from {d}; match {d} falls behind them\n", .{ e.snapshot.ringFloor(), effective_matched });
             effective_matched = 0;
         }
@@ -2636,6 +2629,7 @@ pub const HotPrefixCache = struct {
         var new_kv_bytes = snapshotBytes(&new_snap);
         var new_ssm_bytes: u64 = 0;
         if (ssm_cps) |cps| {
+            keepNeededRingTail(cps, new_snap.ringFloor());
             for (cps) |*cp| new_ssm_bytes += ssmCheckpointBytes(cp);
         }
         var new_bytes = new_kv_bytes + new_ssm_bytes + new_dflash_bytes + new_mtp_bytes;
@@ -3677,12 +3671,13 @@ pub const HotPrefixCache = struct {
         self.allocator.free(old);
         self.allocator.free(new);
         sources_freed = true;
-        // The entry's sliding ring restores nothing below its floor (`ringRestores`): the cap
-        // must not thin away the checkpoints it can still reach to keep ones it never will.
+        // The entry's sliding ring restores nothing below its floor (`ringRestores`) but a checkpoint with its own
+        // ring rows: the cap must not thin away the checkpoints it can still reach to keep ones it never will.
+        keepNeededRingTail(merged.items, ring_floor);
         var reachable: usize = 0;
         for (merged.items) |c| {
             var cp = c;
-            if (cp.pos < ring_floor) cp.deinit(self.allocator) else {
+            if (cp.pos < ring_floor and cp.ring == null) cp.deinit(self.allocator) else {
                 merged.items[reachable] = cp;
                 reachable += 1;
             }
@@ -3711,6 +3706,18 @@ pub const HotPrefixCache = struct {
         // history: keep one.
         keepOnlyLatestQsaHistory(owned);
         return self.takeCpsIfQsaBank(owned);
+    }
+
+    /// Ring rows are worth their bytes on one checkpoint, the newest below the entry's ring floor; above it the
+    /// entry's own rings restore it.
+    fn keepNeededRingTail(cps: []SSMCheckpoint, ring_floor: usize) void {
+        var kept = false;
+        var i = cps.len;
+        while (i > 0) {
+            i -= 1;
+            if (cps[i].ring == null) continue;
+            if (kept or cps[i].pos >= ring_floor) cps[i].dropRing() else kept = true;
+        }
     }
 
     fn takeCpsIfQsaBank(self: *HotPrefixCache, cps: []SSMCheckpoint) ?[]SSMCheckpoint {
@@ -6400,6 +6407,71 @@ test "HotPrefixCache: a sliding entry's checkpoint cap keeps what its ring can r
     var moe_off: usize = 0;
     const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target_ssm, s, &next, false, &.{}, null, null);
     try testing.expectEqual(@as(usize, 390), r.matched);
+}
+
+test "HotPrefixCache: a prompt that leaves a long answer early restores the rings' rows kept at its prompt end" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var toks: [1000]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 11);
+    var srcs: [2][3]SSMCacheEntry = .{ pcBuildHybrid(s, 100.0, 500.0), pcBuildHybrid(s, 200.0, 900.0) };
+    defer for (&srcs) |*e| pcFreeHybrid(e);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+
+    // An 8-row window over a ring that keeps 64 rows, written 50 rows at a time; a row holds its own position.
+    const Fill = struct {
+        fn blocks(c: *KVCache, st: mlx.mlx_stream, from: usize, n: usize) !void {
+            for (0..n) |b| {
+                var flat = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(flat);
+                const lo: f64 = @floatFromInt(from + b * 50);
+                try mlx.check(mlx.mlx_arange(&flat, lo, lo + 50, 1.0, .float32, st));
+                var k = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(k);
+                try mlx.check(mlx.mlx_reshape(&k, flat, &[_]c_int{ 1, 1, 50, 1 }, 4, st));
+                var view = try c.updateSliding(0, k, k, st, 8 + 50 - 1, 8, 64);
+                view.deinit();
+            }
+        }
+    };
+    // A 200-token prompt whose last checkpoint sits at 190, then an 800-token answer that moves the ring past it.
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try Fill.blocks(&cache, s, 0, 4);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[0], 190, s);
+    cps[0].ring = try cache.ringTail(190, s);
+    try testing.expect(cps[0].ring != null);
+    try Fill.blocks(&cache, s, 200, 16);
+    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[1], 998, s);
+    var snap = try cache.snapshot();
+    const floor = snap.ringFloor();
+    snap.deinit();
+    try testing.expect(floor > 250);
+    _ = try hc.commitWithSsm(&cache, &toks, false, cps, null, null);
+
+    // The next prompt leaves the answer at 250, under the entry's ring floor: it resumes at the prompt's checkpoint.
+    var next = toks;
+    for (next[250..]) |*t| t.* = 7;
+    var target_cache = try KVCache.init(testing.allocator, 1);
+    defer target_cache.deinit();
+    var target_ssm = pcEmptySsm();
+    defer pcFreeHybrid(&target_ssm);
+    var moe_off: usize = 0;
+    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target_ssm, s, &next, false, &.{}, null, null);
+    try testing.expectEqual(@as(usize, 190), r.matched);
+    const ring = &target_cache.entries[0];
+    try testing.expectEqual(@as(usize, 190), ring.offset);
+    // The window behind 190 is rows 160..189 (from a 32-row boundary): their positions sum to 5235.
+    var sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sum);
+    try mlx.check(mlx.mlx_sum(&sum, ring.keys, false, s));
+    _ = mlx.mlx_array_eval(sum);
+    var got: f32 = 0;
+    _ = mlx.mlx_array_item_float32(&got, sum);
+    try testing.expectEqual(@as(usize, 160), ring.base);
+    try testing.expectApproxEqAbs(@as(f32, 5235), got, 1e-3);
 }
 
 test "HotPrefixCache: a revised budget evicts down to fit and a raised one keeps everything" {

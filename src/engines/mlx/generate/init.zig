@@ -914,6 +914,15 @@ pub fn initWithOptions(
         _ = mlx.mlx_array_free(captured_hidden);
     };
 
+    // The prompt's last checkpoint keeps the rows its sliding rings hold now: decode moves the rings past it.
+    if (ssm_checkpoints.items.len > 0) {
+        const last = &ssm_checkpoints.items[ssm_checkpoints.items.len - 1];
+        last.ring = ctx.cache.ringTail(last.pos, xfm.s) catch |e| blk: {
+            log.debug("[hot-cache] no ring tail at {d}: {s}\n", .{ last.pos, @errorName(e) });
+            break :blk null;
+        };
+    }
+
     // Attach the SSM-checkpoint buffer to whichever Generator variant
     // we're about to return. Clears the local list so the errdefer above
     // doesn't double-free. All four init paths below call this once
