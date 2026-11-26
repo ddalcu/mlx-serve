@@ -20,6 +20,8 @@ const Slot = @import("slot.zig").Slot;
 const mtpCrowdThresholdFor = @import("spec/mtp_groups.zig").mtpCrowdThresholdFor;
 const SpecTickMode = @import("spec/wiring.zig").SpecTickMode;
 const dspark_group = @import("spec/dspark_group.zig");
+const native_group = @import("spec/native_group.zig");
+const plugin_driver = @import("plugin/driver.zig");
 const slotSpecMode = @import("spec/wiring.zig").slotSpecMode;
 const prefillAdmitted = @import("step.zig").prefillAdmitted;
 const AdmitOutcome = @import("step.zig").AdmitOutcome;
@@ -74,6 +76,11 @@ fn modelCompany(active: anytype, s: anytype, groupable: anytype) Company {
     return c;
 }
 
+/// Whether `slot` ticks speculative rounds as part of a group round (DSpark's module groups, a served drafter's).
+fn groupRoundSlot(slot: *const Slot) bool {
+    return dspark_group.slotGroupable(slot) or native_group.slotGroupable(slot);
+}
+
 /// The first request of a burst was admitted alone, so it armed speculation and ticks
 /// serial beside the group; once company is steady it yields.
 pub fn specYieldTick(active: []const *Slot) void {
@@ -86,7 +93,11 @@ pub fn specYieldTick(active: []const *Slot) void {
             s.company_ticks = 0;
             continue;
         };
-        const company = modelCompany(active, s, dspark_group.slotGroupable);
+        var company = modelCompany(active, s, groupRoundSlot);
+        // More slots than a served drafter's group carries to each one's benefit decode plain in the batched group.
+        if (s.model.transformer) |t| if (native_group.slotGroupable(s) and company.others + 1 > plugin_driver.nativeGroupWidth(t)) {
+            company.dspark = false;
+        };
         if (!yieldsToCompany(mode, mlx.cudaAvailable(), s.model.config.?.isMoe(), company.others, mtpCrowdThresholdFor(s), company.dspark)) {
             s.company_ticks = 0;
             continue;

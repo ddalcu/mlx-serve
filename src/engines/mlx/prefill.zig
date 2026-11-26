@@ -162,6 +162,29 @@ fn importModuleSnapshot(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, ma
     if (!plugin_driver.auxRestoreAt(binding.xfm, id, snapshot, match.n).isOk()) return error.ModuleRestoreFailed;
 }
 
+/// The prompt takes the hot cache's spelling of its earlier answers (`HotPrefixCache.respellPrompt`); a prompt that
+/// grows gives the growth back from `max_tokens` at the context's edge. Never for a greedy or seeded request, which
+/// takes nothing an earlier request left.
+fn respellPrompt(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache, xfm: *Transformer) bool {
+    const tok = slot.model.tokenizer orelse return false;
+    const p = (hc.respellPrompt(slot.allocator, slot.full_prompt, slot.media, slot.has_tools, slot.cache.config, tok) catch null) orelse return false;
+    // Admission billed the prompt as sent plus `max_tokens` and checked the context: the respelling stays inside both.
+    const billed = slot.full_prompt.len + slot.max_tokens;
+    const context: usize = @import("admission/context.zig").getEffectiveContextLength(&xfm.config);
+    if (p.ids.len >= @min(billed, context)) {
+        slot.allocator.free(p.ids);
+        slot.allocator.free(p.media);
+        return false;
+    }
+    log.info("  [hot-cache] respelled the prompt as the cache spells its answers ({d} -> {d} tokens)\n", .{ slot.full_prompt.len, p.ids.len });
+    slot.allocator.free(slot.full_prompt);
+    slot.allocator.free(slot.media);
+    slot.full_prompt = p.ids;
+    slot.media = p.media;
+    slot.max_tokens = @intCast(@min(slot.max_tokens, billed - p.ids.len, context - p.ids.len));
+    return true;
+}
+
 pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
     // exit path (success, cancel, error). `requests_prefilling` flips at entry
@@ -297,6 +320,8 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         }
     }
     if (module_binding == null) if (slot.prefix_cache) |hc| {
+        if (hot_matched == 0 and !slot.sampling.repeats() and !slot.skip_prefix_cache and slot.cache_variant == 0 and slot.mrope_pos == null and respellPrompt(slot, hc, xfm_ptr))
+            prefill_tokens = slot.full_prompt;
         {
             // Only build a restore target when this request will actually
             // draft — a non-dflash turn leaves the payload in the entry for
@@ -641,6 +666,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     gen.timeout_ns = slot.timeout_ns;
     gen.logprobs_n = slot.logprobs_n;
     gen.warm = slot.warm;
+    if (slot.times_rounds) gen.timeRounds();
 
     slot.legacy_gen = gen;
     // The last chunks' transient is freed AFTER the loop's own per-chunk clear, so it

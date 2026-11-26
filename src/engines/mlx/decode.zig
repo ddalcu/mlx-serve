@@ -30,6 +30,7 @@ const tryPlannerTick = @import("spec/mtp_groups.zig").tryPlannerTick;
 const mtpCrowdThresholdFor = @import("spec/mtp_groups.zig").mtpCrowdThresholdFor;
 const runMtpGroups = @import("spec/mtp_groups.zig").runMtpGroups;
 const dspark_group = @import("spec/dspark_group.zig");
+const native_group = @import("spec/native_group.zig");
 const SpecTickMode = @import("spec/wiring.zig").SpecTickMode;
 const specTickMode = @import("spec/wiring.zig").specTickMode;
 const plannerOutputClock = @import("spec/wiring.zig").plannerOutputClock;
@@ -98,6 +99,8 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     var mtp_n: usize = 0;
     var ds_buf: [MAX_BATCH_GROUP]*Slot = undefined;
     var ds_n: usize = 0;
+    var nat_buf: [MAX_BATCH_GROUP]*Slot = undefined;
+    var nat_n: usize = 0;
     for (active) |s| {
         const why = @import("scheduler.zig").batchVerdict(sch, s);
         if (why == .ok and batchable_n < batchable_buf.len) {
@@ -109,6 +112,9 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         } else if (why == .spec_active and dspark_group.slotGroupable(s) and ds_n < ds_buf.len) {
             ds_buf[ds_n] = s;
             ds_n += 1;
+        } else if (why == .spec_active and native_group.slotGroupable(s) and nat_n < nat_buf.len) {
+            nat_buf[nat_n] = s;
+            nat_n += 1;
         } else {
             // legacy single-slot for spec / grammar / overflow
             noteSerial(sch, s, why);
@@ -152,6 +158,7 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     }
     try runMtpGroups(sch, mtp_buf[0..mtp_group_n]);
     try dspark_group.runDsparkGroups(sch, ds_buf[0..ds_n]);
+    try native_group.runNativeGroups(sch, nat_buf[0..nat_n]);
     if (batchable_n == 0) {
         if (sch.metrics) |m| m.batched_group_size.set(0);
         return;

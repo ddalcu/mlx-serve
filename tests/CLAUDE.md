@@ -190,7 +190,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 
 **Reference oracles** (write fixtures for env-gated Zig parity tests; each header names its test)
 - `dump_*_fixtures.py` / `dump_*_fixture.py`, one per port: acestep, csf32, d1, dflash, dflash2, dsv41 (+ token map, vision),
-  embeddinggemma (+ 2, 2 media), flint, glm5_next (+ vision), h3_vsa, hunyuan3d (+ paint), idol, inkling, kev, kokoro, krea,
+  embeddinggemma (+ 2, 2 media), flint, glm5_next (+ vision), h3_vsa, hunyuan3d (+ paint), idol, inkling, inkling2_dflash2, kev, kokoro, krea,
   laguna, latent_rgb_factors, laya (+ numeric), lfm2_vision, lilicorr, ltx (audio, audio encoder, diffvae, upsampler, vae
   encoder), mageflow (dit, e2e, edit e2e, te, te edit, vae, vae encoder, vit), mimo_v2, minicpmv4_7_vision, minimax_h3
   (+ layout, vision, vision tower, vae encoder, audio encoder, flash), moss_image, muse_vision, music3, nemotron_diarization,

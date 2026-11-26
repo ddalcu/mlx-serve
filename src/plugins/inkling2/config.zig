@@ -91,6 +91,36 @@ pub const Draft = struct {
     }
 };
 pub const max_taps = 8;
+/// The most layers a drafter's per-slot context cache holds.
+pub const max_draft_layers = 8;
+
+/// The DFlash2 block drafter beside the pack (`drafter/`, `incoai/Inkling-2-Mini-DFlash2`): sliding layers with grouped
+/// dynamic convolutions around attention and the MLP, over a block of an anchor and masks, attending the taps through
+/// `fc`; a selector then chains one path through the top `top_k` candidates of each block row.
+pub const Dflash2 = struct {
+    layers: u32,
+    heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    intermediate: u32,
+    eps: f32 = 1e-6,
+    theta: f32 = 1e4,
+    window: u32,
+    /// The anchor and `block - 1` masks; every mask proposes a token.
+    block: u32,
+    mask_id: u32,
+    /// The trunk's hiddens it reads: the stream entering these visits, the last one (`visits`) the final-normed output.
+    taps: [max_taps]u32 = @splat(0),
+    tap_count: u32,
+    conv_kernel: u32,
+    conv_group: u32,
+    rank: u32,
+    top_k: u32,
+    /// The trunk head's soft cap, applied to the selector's scores after the edges are added.
+    softcap: f32,
+};
+pub const dflash2_dir = "drafter";
+pub const dflash2_config = dflash2_dir ++ "/config.json";
 
 pub const Config = struct {
     vocab_size: u32,
@@ -133,6 +163,8 @@ pub const Config = struct {
     block_json: []const u8 = "{}",
     vision: ?Vision = null,
     draft: ?Draft = null,
+    /// The DFlash2 drafter beside the pack; it serves in place of the bundled one.
+    dflash2: ?Dflash2 = null,
 
     pub fn core(c: *const Config) u32 {
         return c.core_end - c.core_start;
@@ -225,6 +257,76 @@ fn readDraft(o: std.json.ObjectMap, c: *const Config) ?Draft {
     return d;
 }
 
+/// `drafter/config.json` as the DFlash2 port runs it: every layer sliding, blocks attending themselves in both
+/// directions, the selector's soft cap after the correction (the one placement ported), the trunk's width and taps.
+pub fn readDflash2(json: []const u8, hidden: u32, visits_n: u32) ?Dflash2 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const doc = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch return null;
+    if (doc != .object) return null;
+    const o = doc.object;
+    const df = field(o, "dflash_config") orelse return null;
+    if (df != .object) return null;
+    const dc = df.object;
+    if ((int(field(o, "hidden_size")) orelse return null) != hidden) return null;
+    var d: Dflash2 = .{
+        .layers = int(field(o, "num_hidden_layers")) orelse return null,
+        .heads = int(field(o, "num_attention_heads")) orelse return null,
+        .kv_heads = int(field(o, "num_key_value_heads")) orelse return null,
+        .head_dim = int(field(o, "head_dim")) orelse return null,
+        .intermediate = int(field(o, "intermediate_size")) orelse return null,
+        .window = int(field(o, "sliding_window")) orelse return null,
+        .block = int(field(dc, "block_size")) orelse return null,
+        .mask_id = int(field(dc, "mask_token_id")) orelse return null,
+        .conv_kernel = int(field(dc, "conv_kernel_size")) orelse return null,
+        .conv_group = int(field(dc, "conv_group_size")) orelse return null,
+        .rank = int(field(dc, "selector_rank")) orelse return null,
+        .top_k = int(field(dc, "selector_top_k")) orelse return null,
+        .softcap = @floatCast(float(field(dc, "final_logit_softcapping")) orelse return null),
+        .tap_count = 0,
+    };
+    if (field(o, "rms_norm_eps")) |v| d.eps = @floatCast(float(v) orelse return null);
+    if (field(o, "rope_parameters")) |rp| {
+        if (rp != .object) return null;
+        if (field(rp.object, "rope_theta")) |v| d.theta = @floatCast(float(v) orelse return null);
+    } else if (field(o, "rope_theta")) |v| d.theta = @floatCast(float(v) orelse return null);
+    // Without `is_causal` a sliding layer's block reads causally; the port reads it in both directions.
+    const causal = field(o, "is_causal") orelse return null;
+    if (causal != .bool or causal.bool) return null;
+    const types = field(o, "layer_types") orelse return null;
+    if (types != .array or types.array.items.len != d.layers) return null;
+    for (types.array.items) |t| if (t != .string or !std.mem.eql(u8, t.string, "sliding_attention")) return null;
+    const mode = field(dc, "selector_softcap_mode") orelse return null;
+    if (mode != .string or !std.mem.eql(u8, mode.string, "after_correction")) return null;
+    if (field(dc, "output_multiplier")) |v| if ((float(v) orelse return null) != 1.0) return null;
+    const ids = field(dc, "target_layer_ids") orelse return null;
+    if (ids != .array or ids.array.items.len < 2 or ids.array.items.len > max_taps) return null;
+    for (ids.array.items, 0..) |item, i| {
+        d.taps[i] = int(item) orelse return null;
+        const last = i + 1 == ids.array.items.len;
+        if (if (last) d.taps[i] != visits_n else d.taps[i] >= visits_n) return null;
+    }
+    d.tap_count = @intCast(ids.array.items.len);
+    if (d.layers == 0 or d.layers > max_draft_layers or d.heads == 0 or d.kv_heads == 0 or d.heads % d.kv_heads != 0 or d.head_dim == 0 or d.head_dim % 2 != 0 or
+        d.intermediate == 0 or d.window < d.block + 1 or d.block < 2 or d.block > abi.max_round_tokens or d.rank == 0 or d.top_k == 0 or d.top_k > 64 or
+        d.conv_kernel == 0 or d.conv_kernel > 4 or d.conv_group == 0 or hidden % d.conv_group != 0 or
+        !(d.eps > 0) or !(d.theta > 1) or !(d.softcap > 0)) return null;
+    return d;
+}
+
+/// `drafter/config.json` of the pack, read through `dir`; null when it is missing or the port does not run it.
+fn readDflash2File(dir: *const abi.PackDir, hidden: u32, visits_n: u32) ?Dflash2 {
+    const name = abi.Str.of(dflash2_config);
+    if (!dir.exists(dir.ctx, name)) return null;
+    const cap: usize = @intCast(dir.file_bytes(dir.ctx, name));
+    if (cap == 0 or cap > 1 << 20) return null;
+    const buf = gpa.alloc(u8, cap) catch return null;
+    defer gpa.free(buf);
+    var len: usize = 0;
+    if (!dir.read(dir.ctx, name, buf.ptr, cap, &len).isOk()) return null;
+    return readDflash2(buf[0..len], hidden, visits_n);
+}
+
 fn readVision(o: std.json.ObjectMap) ?Vision {
     var v: Vision = .{};
     inline for (.{
@@ -266,6 +368,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     if (tc != .object) return unsupported("text_config");
     const cfg = tc.object;
 
+    // Undefined, not defaulted: a field a parse leaves out (`draft`, `dflash2`) is reset below with the others.
     var c: Config = undefined;
     inline for (.{
         .{ "vocab_size", &c.vocab_size },                         .{ "unpadded_vocab_size", &c.unpadded_vocab_size },
@@ -293,6 +396,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     c.block_json = "{}";
     c.vision = null;
     c.draft = null;
+    c.dflash2 = null;
 
     // What the forward runs unconditionally, as mlx-lm's.
     if (field(cfg, "n_shared_experts")) |v| if ((int(v) orelse return unsupported("n_shared_experts")) != 0) return unsupported("shared experts");
@@ -349,7 +453,12 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     };
 
     var p: abi.Parsed = .{ .caps = .{ .moe = true, .images = c.vision != null, .batches_decode = fusedOn(), .prompt_last_row = true } };
-    if (c.draft) |d| if (!stub and dir.exists(dir.ctx, abi.Str.of(draft_file))) {
+    // A DFlash2 draft in `drafter/` serves in place of the bundled head, when the port runs it.
+    if (!stub and dir.exists(dir.ctx, abi.Str.of(dflash2_dir ++ "/model.safetensors"))) c.dflash2 = readDflash2File(dir, c.hidden_size, c.visits());
+    if (c.dflash2) |d| {
+        p.spec.native_stages = d.layers;
+        p.spec.native_block = d.block;
+    } else if (c.draft) |d| if (!stub and dir.exists(dir.ctx, abi.Str.of(draft_file))) {
         p.spec.native_stages = d.layers;
         p.spec.native_block = d.block;
     };
@@ -415,7 +524,7 @@ pub fn layout(p: *const abi.Parsed, span: ?*const abi.LayerSpan, out: [*]abi.Lay
 /// wherever the head ships and the kernels are on, Apple9+ (`draftsOn`) or not.
 pub fn draftStatePerToken(p: *const abi.Parsed) u64 {
     const d = of(p).draft orelse return 0;
-    return if (p.spec.native_stages > 0 and fusedOn()) d.fullBytesPerToken() else 0;
+    return if (of(p).dflash2 == null and p.spec.native_stages > 0 and fusedOn()) d.fullBytesPerToken() else 0;
 }
 
 pub fn freeParsed(p: *abi.Parsed) callconv(.c) void {
@@ -601,4 +710,97 @@ test "inkling2 config: the step kernels serve a Metal build unless switched off"
     try testing.expect(kernelsServe(true, null) and kernelsServe(true, "1"));
     try testing.expect(!kernelsServe(true, "0"));
     try testing.expect(!kernelsServe(false, null) and !kernelsServe(false, "1"));
+}
+
+/// `incoai/Inkling-2-Mini-DFlash2`'s config.json, as published.
+const dflash2_release =
+    \\{"architectures":["DFlash2DraftModel"],"head_dim":128,"hidden_size":2304,"intermediate_size":6912,"is_causal":false,
+    \\"layer_types":["sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention"],
+    \\"num_attention_heads":32,"num_hidden_layers":5,"num_key_value_heads":8,"rms_norm_eps":1e-06,
+    \\"rope_parameters":{"rope_theta":10000.0,"rope_type":"default"},"sliding_window":2048,"vocab_size":201024,
+    \\"dflash_config":{"block_size":8,"conv_group_size":16,"conv_kernel_size":2,"final_logit_softcapping":30.0,
+    \\"mask_token_id":200056,"selector_rank":256,"selector_softcap_mode":"after_correction","selector_top_k":16,
+    \\"target_layer_ids":[5,23,41,48]}}
+;
+
+// Bar: the published DFlash2 draft's config reads to the geometry its weights have, its taps ending at the final norm;
+// a draft this port does not run (a full-attention layer, causal blocks, another selector softcap, another width, taps
+// past the visits) is refused rather than drafted wrongly.
+test "inkling2 config: a DFlash2 draft reads to its geometry; one the port does not run is refused" {
+    const d = readDflash2(dflash2_release, 2304, 48) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 5), d.layers);
+    try testing.expect(d.heads == 32 and d.kv_heads == 8 and d.head_dim == 128 and d.intermediate == 6912);
+    try testing.expect(d.window == 2048 and d.block == 8 and d.mask_id == 200056);
+    try testing.expect(d.conv_kernel == 2 and d.conv_group == 16 and d.rank == 256 and d.top_k == 16);
+    try testing.expectEqual(@as(f32, 30), d.softcap);
+    try testing.expectEqual(@as(f32, 10000), d.theta);
+    try testing.expectEqualSlices(u32, &.{ 5, 23, 41, 48 }, d.taps[0..d.tap_count]);
+    const refused = [_][2][]const u8{
+        .{ "\"sliding_attention\",\"sliding_attention\",\"sliding_attention\",\"sliding_attention\",\"sliding_attention\"", "\"sliding_attention\",\"sliding_attention\",\"full_attention\",\"sliding_attention\",\"sliding_attention\"" },
+        .{ "\"is_causal\":false", "\"is_causal\":true" },
+        .{ "after_correction", "before_correction" },
+        .{ "\"hidden_size\":2304", "\"hidden_size\":2048" },
+        .{ "[5,23,41,48]", "[5,23,41,47]" },
+        .{ "[5,23,41,48]", "[5,23,49,48]" },
+        .{ "\"conv_group_size\":16", "\"conv_group_size\":17" },
+    };
+    for (refused) |r| {
+        const bad = try std.mem.replaceOwned(u8, testing.allocator, dflash2_release, r[0], r[1]);
+        defer testing.allocator.free(bad);
+        try testing.expect(readDflash2(bad, 2304, 48) == null);
+    }
+    try testing.expect(readDflash2("{}", 2304, 48) == null);
+}
+
+// Bar: a `drafter/` folder holding a DFlash2 draft this port runs declares its stages and block and serves in place of
+// the bundled head; one it does not run leaves the bundled head (or serial decode) as it was, and it bills no state per
+// token (every layer slides).
+test "inkling2 config: a DFlash2 drafter beside the pack serves in place of the bundled head" {
+    const mtp = "\"mtp_config\":{\"hidden_size\":64,\"num_hidden_layers\":3,\"num_attention_heads\":4,\"num_key_value_heads\":2,\"head_dim\":16,\"intermediate_size\":128," ++
+        "\"q_bias\":false,\"o_bias\":false,\"rms_norm_eps\":1e-06,\"rope_theta\":1000000.0,\"sliding_window_size\":6,\"block_size\":8,\"markov_rank\":8," ++
+        "\"markov_head_type\":\"rnn_hidden\",\"local_layer_ids\":[0,2],\"target_layer_ids\":[2,5,10,16]},";
+    const with = "{\"model_type\":\"inkling2_loop\",\"eos_token_id\":2," ++ mtp ++ fixture_text ++ "}";
+    const df2 =
+        \\{"head_dim":16,"hidden_size":64,"intermediate_size":128,"is_causal":false,"layer_types":["sliding_attention","sliding_attention"],
+        \\"num_attention_heads":4,"num_hidden_layers":2,"num_key_value_heads":2,"rms_norm_eps":1e-06,"rope_parameters":{"rope_theta":10000.0},
+        \\"sliding_window":32,"dflash_config":{"block_size":8,"conv_group_size":16,"conv_kernel_size":2,"final_logit_softcapping":30.0,
+        \\"mask_token_id":50,"selector_rank":8,"selector_softcap_mode":"after_correction","selector_top_k":4,"target_layer_ids":[2,5,10,16]}}
+    ;
+    const unmodelled = try std.mem.replaceOwned(u8, testing.allocator, df2, "after_correction", "before_correction");
+    defer testing.allocator.free(unmodelled);
+    const Case = struct { draft: ?[]const u8, weights: bool, bundled: bool, stages: u32, df2: bool };
+    for ([_]Case{
+        .{ .draft = df2, .weights = true, .bundled = true, .stages = 2, .df2 = true },
+        .{ .draft = df2, .weights = true, .bundled = false, .stages = 2, .df2 = true },
+        .{ .draft = df2, .weights = false, .bundled = true, .stages = 3, .df2 = false },
+        .{ .draft = unmodelled, .weights = true, .bundled = true, .stages = 3, .df2 = false },
+        .{ .draft = unmodelled, .weights = true, .bundled = false, .stages = 0, .df2 = false },
+        .{ .draft = null, .weights = false, .bundled = true, .stages = 3, .df2 = false },
+    }) |k| {
+        var files: [4]fixture.File = undefined;
+        var n: usize = 0;
+        files[n] = .{ .name = "config.json", .bytes = with };
+        n += 1;
+        if (k.bundled) {
+            files[n] = .{ .name = draft_file, .bytes = "x" };
+            n += 1;
+        }
+        if (k.draft) |j| {
+            files[n] = .{ .name = dflash2_config, .bytes = j };
+            n += 1;
+        }
+        if (k.weights) {
+            files[n] = .{ .name = dflash2_dir ++ "/model.safetensors", .bytes = "x" };
+            n += 1;
+        }
+        const mem: fixture.MemDir = .{ .files = files[0..n] };
+        const dir = mem.packDir();
+        var p: abi.Parsed = .{};
+        try testing.expect(parse(&dir, abi.Str.of(with), .{}, null, false, &p).isOk());
+        defer freeParsed(&p);
+        try testing.expectEqual(k.stages, p.spec.native_stages);
+        try testing.expectEqual(@as(u32, if (k.stages > 0) 8 else 0), p.spec.native_block);
+        try testing.expectEqual(k.df2, of(&p).dflash2 != null);
+        if (k.df2) try testing.expectEqual(@as(u64, 0), draftStatePerToken(&p));
+    }
 }

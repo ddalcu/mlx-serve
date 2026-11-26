@@ -23,6 +23,7 @@ final class RecommendedModelsTests: XCTestCase {
         let union = RecommendedModelPick.gemmaCatalog
             + RecommendedModelPick.qwenCatalog
             + RecommendedModelPick.liquidCatalog
+            + RecommendedModelPick.inklingCatalog
             + RecommendedModelPick.largestCatalog
         XCTAssertEqual(RecommendedModelPick.allCatalogs, union)
     }
@@ -32,7 +33,7 @@ final class RecommendedModelsTests: XCTestCase {
     /// The pane draws one section per family (Gemma 4, Qwen, Liquid LFM3, Largest).
     func testEveryFamilyIsPresent() {
         let families = Set(allRecommended.map(\.family))
-        XCTAssertEqual(families, [.gemma, .qwen, .liquid, .largest])
+        XCTAssertEqual(families, [.gemma, .qwen, .liquid, .inkling, .largest])
     }
 
     /// A family catalog can't be empty — a section with zero rows would be a
@@ -40,6 +41,7 @@ final class RecommendedModelsTests: XCTestCase {
     func testNoFamilyCatalogIsEmpty() {
         XCTAssertFalse(RecommendedModelPick.gemmaCatalog.isEmpty)
         XCTAssertFalse(RecommendedModelPick.qwenCatalog.isEmpty)
+        XCTAssertFalse(RecommendedModelPick.inklingCatalog.isEmpty)
         XCTAssertFalse(RecommendedModelPick.largestCatalog.isEmpty)
     }
 
@@ -51,6 +53,9 @@ final class RecommendedModelsTests: XCTestCase {
         }
         for p in RecommendedModelPick.qwenCatalog {
             XCTAssertEqual(p.family, .qwen, p.id)
+        }
+        for p in RecommendedModelPick.inklingCatalog {
+            XCTAssertEqual(p.family, .inkling, p.id)
         }
         for p in RecommendedModelPick.largestCatalog {
             XCTAssertEqual(p.family, .largest, p.id)
@@ -136,7 +141,8 @@ final class RecommendedModelsTests: XCTestCase {
     func testMtpScoredPicksAreTheOnesShippingADraftHead() {
         let mtp = Set(allRecommended.filter(\.speedIsWithMtp).map(\.id))
         XCTAssertEqual(mtp, ["qwen38-27b", "bonsai2-27b", "qwen36-35b-a3b", "qwen38-flash-next",
-                             "sushi-2bpw", "deepseek-v41-flash", "deepseek-v41-flash-pruned192"])
+                             "sushi-2bpw", "deepseek-v41-flash", "deepseek-v41-flash-pruned192",
+                             "inkling-2-mini-8bit"])
         XCTAssertEqual(RecommendedModelPick.qwen36_35bA3b.speed, allRecommended.map(\.speed).max())
         XCTAssertGreaterThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen38_27b.speed)
         XCTAssertLessThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen36_35bA3b.speed)
@@ -177,7 +183,7 @@ final class RecommendedModelsTests: XCTestCase {
         let estimated = Set(allRecommended.filter(\.intelligenceIsEstimated).map(\.id))
         XCTAssertEqual(estimated, ["qwen38-27b", "bonsai2-27b", "qwen38-flash-next", "mimo-9b",
                                    "sushi-2bpw", "lfm3-1.7b", "lfm3-omni-2b", "deepseek-v41-flash",
-                                   "deepseek-v41-flash-pruned192"])
+                                   "deepseek-v41-flash-pruned192", "inkling-2-mini-8bit"])
     }
 
     /// The bar fractions the pane draws stay inside the track, and context —
@@ -205,6 +211,7 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(RecommendedModelPick.qwen38_27b.contextTokens, 262_144)
         XCTAssertEqual(RecommendedModelPick.qwen38FlashNext.contextTokens, 262_144)
         XCTAssertEqual(RecommendedModelPick.deepseekV41Pruned.contextTokens, 1_048_576)
+        XCTAssertEqual(RecommendedModelPick.inkling2Mini8bit.contextTokens, 1_048_576)
     }
 
     /// `activeParamsB` is a fact per checkpoint, not a restatement of the
@@ -215,6 +222,15 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(RecommendedModelPick.deepseekV41Pruned.activeParamsB, 16.0) // 6 of 192 kept experts + shared
         XCTAssertEqual(RecommendedModelPick.mimo9b.activeParamsB, 9.7) // dense
         XCTAssertEqual(RecommendedModelPick.gemma31B.activeParamsB, 31.0)      // dense
+        XCTAssertEqual(RecommendedModelPick.inkling2Mini8bit.activeParamsB, 3.4) // 26.4B total
+    }
+
+    /// Our Inkling 2 Mini 8-bit pack, with its DFlash2 draft, fits a 32 GB Mac and not a 24 GB one.
+    func testInkling8bitFitsA32GBMac() {
+        let p = RecommendedModelPick.inkling2Mini8bit
+        XCTAssertEqual(p.repoId, "ddalcu/Inkling-2-Mini-MLX-8bit")
+        XCTAssertTrue(p.meetsSystemRequirements(memory: mac(32)))
+        XCTAssertFalse(p.meetsSystemRequirements(memory: mac(24)))
     }
 
     // MARK: - Starter recommendation (RAM tiers)

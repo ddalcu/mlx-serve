@@ -13,6 +13,7 @@ const Scheduler = @import("scheduler.zig").Scheduler;
 const Slot = @import("slot.zig").Slot;
 const specTickMode = @import("spec/wiring.zig").specTickMode;
 const plugin_settle = @import("plugin/settle.zig");
+const plugin_driver = @import("plugin/driver.zig");
 
 /// Both contexts name the same plugin slot. Clear them together before either can be destroyed.
 pub fn releasePluginSlot(slot: *Slot) void {
@@ -178,6 +179,9 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
             g.logQsaArms();
         }
         g.persistRoundCost();
+        // A request the server served itself is nobody's conversation.
+        if (!slot.warm) plugin_driver.noteSequence(g.xfm, g.ctx.plugin_slot, slot.full_prompt, g.generated_ids.items);
+        g.keepLadder();
         // The cache commit below snapshots the n-gram history: settle the pipelined step's owed advance first.
         g.xfm.flushDeferredPle(&g.ctx) catch g.xfm.discardDeferredPle(&g.ctx);
     }

@@ -8,6 +8,7 @@
 const std = @import("std");
 const plugin = @import("plugin.zig");
 const draft = @import("draft.zig");
+const dflash2 = @import("dflash2.zig");
 const abi = @import("../../abi/plugin.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const conformance = @import("../../sdk/testing/conformance.zig");
@@ -176,6 +177,36 @@ test "inkling2 proof: a prompt in chunks and then token by token serves the rows
     }
 }
 
+// Bar: a quantized pack's joined projections are whole 64-row tiles (the tensor unit's quantized kernels take no other
+// width), and a part read through the padded join is the part's own projection.
+test "inkling2 pack: a quantized joined projection is whole tiles and serves each part (INKLING2_PACK)" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const dir = std.mem.span(@import("../../env.zig").named("INKLING2_PACK") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var rel = try Release.open(a, dir);
+    defer rel.close();
+    fx_stream = rel.m.base.s;
+    var g = ops.Graph.init(a, rel.m.base.s);
+    defer g.deinit();
+    var joins: usize = 0;
+    for (rel.m.layers) |*L| for ([_]*const @TypeOf(L.join_q){ &L.join_q, &L.join_kv }) |j| {
+        if (!j.built() or j.lin.s.ctx == null) continue;
+        joins += 1;
+        try testing.expectEqual(@as(c_int, 0), @rem(ops.shape(j.lin.w)[0], 64));
+    };
+    try testing.expect(joins > 0);
+    const L = &rel.m.layers[0];
+    for ([_]c_int{ 1, 12 }) |rows| {
+        const x = try randomRow(&g, a, 500 + @as(u64, @intCast(rows)), &.{ 1, rows, 2304 }, 0.5, .bfloat16);
+        const y = try layers.projectRows(&g, &L.join_q.lin, x);
+        for ([_]*const layers.Linear{ &L.q, &L.gate, &L.r, &L.sink }, 0..) |part, i| {
+            try expectClose(try L.join_q.part(&g, y, i), try layers.projectRows(&g, part, x), 2e-2, "joined part");
+        }
+    }
+}
+
 /// The release parsed and loaded through the plugin table (its defaults), for the tests that run it.
 const Release = struct {
     weights: @import("../../sdk/weights/resident.zig").Resident,
@@ -219,6 +250,12 @@ fn argmaxOf(row: []const f32) u32 {
     return @intCast(best);
 }
 
+/// The release tokenizer's ids of "def scale_quokka_ledger(entries, factor):\n    total = ...\n\n", of a filler sentence, and of
+/// the function's first line again.
+const quokka_def = [_]u32{ 1719, 152369, 62, 369, 140073, 62, 46025, 7, 80425, 11, 150935, 8, 25, 198, 149862, 150269, 196977, 150811, 7, 68, 13, 4605, 149887, 149888, 149881, 157358, 8, 198, 149862, 150583, 196989, 68, 13, 4605, 196987, 150935, 196990, 150269, 196986, 220, 15, 13, 80940, 149887, 149888, 149881, 157358, 60, 68014 };
+const quokka_filler = [_]u32{ 371, 158897, 155511, 151470, 149876, 151346, 153194, 149880, 149876, 152504, 3661, 149894, 149876, 159167, 13, 220 };
+const quokka_again = [_]u32{ 1719, 152369, 62, 369, 140073, 62, 46025, 7, 80425, 11, 150935, 8, 25, 198 };
+
 // Bar: on the release (`INKLING2_RELEASE`), a function defined further back than the drafter's window and then named
 // again: the first round's draft is not the one a read of only the newest window - 1 positions gives, and greedy
 // rounds (a verify, then its finish) commit the plain greedy decode's tokens up to the first difference, and there a
@@ -240,13 +277,10 @@ test "inkling2 release: the drafter's full layer reads the prompt past its windo
     const n_layers = rel.parsed.shell.num_hidden_layers;
     // The release tokenizer's ids of "def scale_quokka_ledger(entries, factor):\n    total = ...\n\n", of a filler
     // sentence, and of the function's first line again.
-    const def = [_]u32{ 1719, 152369, 62, 369, 140073, 62, 46025, 7, 80425, 11, 150935, 8, 25, 198, 149862, 150269, 196977, 150811, 7, 68, 13, 4605, 149887, 149888, 149881, 157358, 8, 198, 149862, 150583, 196989, 68, 13, 4605, 196987, 150935, 196990, 150269, 196986, 220, 15, 13, 80940, 149887, 149888, 149881, 157358, 60, 68014 };
-    const filler = [_]u32{ 371, 158897, 155511, 151470, 149876, 151346, 153194, 149880, 149876, 152504, 3661, 149894, 149876, 159167, 13, 220 };
-    const again = [_]u32{ 1719, 152369, 62, 369, 140073, 62, 46025, 7, 80425, 11, 150935, 8, 25, 198 };
     var ids: std.ArrayList(u32) = .empty;
-    try ids.appendSlice(a, &def);
-    while (ids.items.len < def.len + d.cfg.window) try ids.appendSlice(a, &filler);
-    try ids.appendSlice(a, &again);
+    try ids.appendSlice(a, &quokka_def);
+    while (ids.items.len < quokka_def.len + d.cfg.window) try ids.appendSlice(a, &quokka_filler);
+    try ids.appendSlice(a, &quokka_again);
     const n: u32 = @intCast(ids.items.len);
     const prefill = struct {
         fn run(m: *plugin.Loaded, al: std.mem.Allocator, cache: *test_cache.TestCache, tokens: []const u32, slot: u32) !u32 {
@@ -274,8 +308,6 @@ test "inkling2 release: the drafter's full layer reads the prompt past its windo
         const name = if (full) "full read" else "newest window only";
         rel.m.spec.full = if (full) d else null;
         defer rel.m.spec.full = d;
-        // The verify cut at its unmeasured 0.5 on both arms' first round.
-        rel.m.row_cost = .{};
         const slot: u32 = @intCast(1 + arm);
         var cache = try test_cache.TestCache.init(std.heap.c_allocator, n_layers);
         defer cache.deinit();
@@ -316,6 +348,160 @@ test "inkling2 release: the drafter's full layer reads the prompt past its windo
         }
     }
     try testing.expect(!std.mem.eql(u32, first_draft[0], first_draft[1]));
+
+    // A copy round (`Forward.draft_ids`) verifies the given drafts in place of the drafter's: handed the plain decode's
+    // own continuation, it keeps it, up to a near tie of the plain step's logits as above.
+    {
+        var cache = try test_cache.TestCache.init(std.heap.c_allocator, n_layers);
+        defer cache.deinit();
+        const t1 = try prefill.run(rel.m, a, &cache, ids.items, 3);
+        try testing.expectEqual(want[0], t1);
+        var h = [_]abi.Handle{cache.handle()};
+        var out: abi.ForwardOut = .{};
+        try testing.expect(nd.step(rel.m, &.{ .mode = .decode, .rows = 1, .tokens = .of(&[_]u32{t1}), .slots = .of(&[_]u32{3}), .positions = .of(&[_]u32{n}), .caches = .of(&h), .cache_ops = &test_cache.ops, .accept_cap = 15, .draft_ids = .of(want[1..16]) }, &out).isOk());
+        try testing.expectEqual(@as(u32, 16), out.round.rows);
+        const kept = out.round.accepted;
+        std.debug.print("inkling2 release: a copy of the plain continuation keeps {d} of 15\n", .{kept});
+        try testing.expectEqualSlices(u32, want[0 .. 1 + kept], out.round.tokens[0 .. 1 + kept]);
+        if (kept < 15) {
+            const lg = step_logits[kept + 1];
+            try testing.expect(lg[want[kept + 1]] - lg[out.round.next_token] <= 0.01 * @abs(lg[want[kept + 1]]));
+        }
+    }
+    // A sampled round's verify draws its drafts from the drafter's law and hands that law back, a row a draft.
+    {
+        var cache = try test_cache.TestCache.init(std.heap.c_allocator, n_layers);
+        defer cache.deinit();
+        const t1 = try prefill.run(rel.m, a, &cache, ids.items, 4);
+        var h = [_]abi.Handle{cache.handle()};
+        var out: abi.ForwardOut = .{};
+        try testing.expect(nd.verify.?(rel.m, &.{ .mode = .decode, .rows = 1, .tokens = .of(&[_]u32{t1}), .slots = .of(&[_]u32{4}), .positions = .of(&[_]u32{n}), .caches = .of(&h), .cache_ops = &test_cache.ops, .accept_cap = 7, .draft_temperature = 1.0, .draft_seed = 11 }, &out).isOk());
+        const drafts = out.round.n - 1;
+        a.free(try conformance.consumeF32(a, out.logits));
+        if (drafts > 0) {
+            const law = try conformance.consumeF32(a, out.draft_probs);
+            const vocab = law.len / drafts;
+            for (0..drafts) |i| {
+                const row = law[i * vocab ..][0..vocab];
+                var sum: f32 = 0;
+                for (row) |x| sum += x;
+                try testing.expectApproxEqAbs(@as(f32, 1), sum, 1e-3);
+                try testing.expect(row[out.round.tokens[1 + i]] > 0);
+            }
+        }
+        var fin: abi.ForwardOut = .{};
+        try testing.expect(nd.finish.?(rel.m, 0, &fin).isOk());
+    }
+}
+
+// Bar: on the release beside its DFlash2 draft (`INKLING2_DFLASH2_PACK`: the release's files and `drafter/`), greedy
+// rounds (a verify, then its finish) commit the plain greedy decode's tokens up to the first difference, and there a
+// near-tie of the plain step's logits; and a sampled round hands back a law of the selector's candidates, each row
+// summing to one.
+test "inkling2 release: a DFlash2 draft's greedy rounds commit the plain decode and a sampled round hands back its law" {
+    const env = @import("../../env.zig");
+    const pack_dir = std.mem.span(env.get(.INKLING2_DFLASH2_PACK) orelse return error.SkipZigTest);
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var rel = try Release.open(a, pack_dir);
+    defer rel.close();
+    // Apple9+ only (`draftsOn`).
+    const d = rel.m.drafter2 orelse return error.SkipZigTest;
+    const t = &plugin.table;
+    const nd = t.spec.?.native_drafter.?;
+    const n_layers = rel.parsed.shell.num_hidden_layers;
+    var ids: std.ArrayList(u32) = .empty;
+    try ids.appendSlice(a, &quokka_def);
+    try ids.appendSlice(a, &quokka_filler);
+    try ids.appendSlice(a, &quokka_again);
+    const n: u32 = @intCast(ids.items.len);
+    const prefill = struct {
+        fn run(m: *plugin.Loaded, al: std.mem.Allocator, cache: *test_cache.TestCache, tokens: []const u32, slot: u32) !u32 {
+            var h = [_]abi.Handle{cache.handle()};
+            var out: abi.ForwardOut = .{};
+            try testing.expect(plugin.table.forward(m, &.{ .mode = .prefill, .logits = .last_row, .rows = @intCast(tokens.len), .tokens = .of(tokens), .slots = .of(&[_]u32{slot}), .positions = .of(&[_]u32{0}), .caches = .of(&h), .cache_ops = &test_cache.ops }, &out).isOk());
+            return argmaxOf(try conformance.consumeF32(al, out.logits));
+        }
+    };
+    var plain = try test_cache.TestCache.init(std.heap.c_allocator, n_layers);
+    defer plain.deinit();
+    var want: [48]u32 = undefined;
+    var step_logits: [want.len][]f32 = undefined;
+    want[0] = try prefill.run(rel.m, a, &plain, ids.items, 0);
+    for (1..want.len) |i| {
+        var h = [_]abi.Handle{plain.handle()};
+        var out: abi.ForwardOut = .{};
+        try testing.expect(t.forward(rel.m, &.{ .mode = .decode, .logits = .last_row, .rows = 1, .tokens = .of(want[i - 1 .. i]), .slots = .of(&[_]u32{0}), .positions = .of(&[_]u32{n + @as(u32, @intCast(i)) - 1}), .caches = .of(&h), .cache_ops = &test_cache.ops }, &out).isOk());
+        step_logits[i] = try conformance.consumeF32(a, out.logits);
+        want[i] = argmaxOf(step_logits[i]);
+    }
+    var cache = try test_cache.TestCache.init(std.heap.c_allocator, n_layers);
+    defer cache.deinit();
+    var t1 = try prefill.run(rel.m, a, &cache, ids.items, 1);
+    var got: std.ArrayList(u32) = .empty;
+    var pos: u32 = n;
+    var verified: [abi.max_round_tokens]u32 = @splat(0);
+    var kept: [abi.max_round_tokens]u32 = @splat(0);
+    var first_draft: []const u32 = &.{};
+    for (0..8) |r| {
+        var h = [_]abi.Handle{cache.handle()};
+        var out: abi.ForwardOut = .{};
+        try testing.expect(nd.verify.?(rel.m, &.{ .mode = .decode, .rows = 1, .tokens = .of(&[_]u32{t1}), .slots = .of(&[_]u32{1}), .positions = .of(&[_]u32{pos}), .caches = .of(&h), .cache_ops = &test_cache.ops, .accept_cap = 7 }, &out).isOk());
+        const rows: usize = out.round.n;
+        const logits = try conformance.consumeF32(a, out.logits);
+        const vocab = logits.len / rows;
+        var accepted: usize = 0;
+        while (accepted + 1 < rows and argmaxOf(logits[accepted * vocab ..][0..vocab]) == out.round.tokens[accepted + 1]) accepted += 1;
+        for (1..rows) |k| verified[k] += 1;
+        for (1..accepted + 1) |k| kept[k] += 1;
+        if (r == 0) first_draft = try a.dupe(u32, out.round.tokens[1..rows]);
+        try got.appendSlice(a, out.round.tokens[0 .. 1 + accepted]);
+        t1 = argmaxOf(logits[accepted * vocab ..][0..vocab]);
+        var fin: abi.ForwardOut = .{};
+        try testing.expect(nd.finish.?(rel.m, @intCast(accepted), &fin).isOk());
+        pos = @intCast(fin.round.position);
+    }
+    std.debug.print("inkling2 release: DFlash2, a prompt of {d}: first draft {any}; draft positions 1 to {d} verified {any}, accepted {any}\n", .{ n, first_draft, d.cfg.block - 1, verified[1..d.cfg.block], kept[1..d.cfg.block] });
+    try testing.expect(got.items.len > 8);
+    const m = @min(got.items.len, want.len);
+    var same: usize = 0;
+    while (same < m and want[same] == got.items[same]) same += 1;
+    if (same < m) {
+        try testing.expect(same >= 1);
+        const lg = step_logits[same];
+        const gap = lg[want[same]] - lg[got.items[same]];
+        std.debug.print("inkling2 release: DFlash2 rounds and plain decode part at token {d} ({d} vs {d}): the plain step's logit gap {d:.4}\n", .{ same, want[same], got.items[same], gap });
+        try testing.expect(gap <= 0.01 * @abs(lg[want[same]]));
+    }
+
+    // A sampled round's verify draws its drafts from the selector's law and hands that law back, a row a draft.
+    var sampled = try test_cache.TestCache.init(std.heap.c_allocator, n_layers);
+    defer sampled.deinit();
+    const s1 = try prefill.run(rel.m, a, &sampled, ids.items, 2);
+    var h = [_]abi.Handle{sampled.handle()};
+    var out: abi.ForwardOut = .{};
+    try testing.expect(nd.verify.?(rel.m, &.{ .mode = .decode, .rows = 1, .tokens = .of(&[_]u32{s1}), .slots = .of(&[_]u32{2}), .positions = .of(&[_]u32{n}), .caches = .of(&h), .cache_ops = &test_cache.ops, .accept_cap = 7, .draft_temperature = 1.0, .draft_seed = 7 }, &out).isOk());
+    const drafts = out.round.n - 1;
+    a.free(try conformance.consumeF32(a, out.logits));
+    try testing.expect(drafts > 0);
+    const law = try conformance.consumeF32(a, out.draft_probs);
+    const vocab = law.len / drafts;
+    for (0..drafts) |i| {
+        const row = law[i * vocab ..][0..vocab];
+        var sum: f32 = 0;
+        var support: u32 = 0;
+        for (row) |x| {
+            sum += x;
+            support += @intFromBool(x > 0);
+        }
+        try testing.expectApproxEqAbs(@as(f32, 1), sum, 1e-3);
+        try testing.expect(support <= d.cfg.top_k);
+        try testing.expect(row[out.round.tokens[1 + i]] > 0);
+    }
+    var fin: abi.ForwardOut = .{};
+    try testing.expect(nd.finish.?(rel.m, 0, &fin).isOk());
 }
 
 test "inkling2 proof: a step reads every visit's conv windows and each loop pass's own KV" {
@@ -435,11 +621,108 @@ test "inkling2 proof: a verified block's kept rows leave the state a forward of 
         const pos = [_]u32{split};
         const r: run_mod.Run = .{ .mode = .verify, .rows = @intCast(kept), .positions = &pos, .caches = &h, .cache_ops = &test_cache.ops };
         var c = r.ctx(&g, &m.base.shared);
-        try kernels.commit(&c, &m.base.weights.body.cfg, opens, @intCast(kept));
+        try kernels.commit(&c, &m.base.weights.body.cfg, opens, @intCast(kept), 0, 1);
         try testing.expectEqual(@as(u64, split + kept), test_cache.ops.len(cache.handle(), 0));
         const got = try step(a, &s.pack, &cache, prompt[split + kept .. split + kept + 1], split + kept, .last_row);
         defer a.free(got);
         try testing.expect(parity.qwen4CompareRows(got, want, 1, VOCAB).min_cos > 0.999);
+    }
+}
+
+/// One verify forward of `width` rows for each of several slots (`.batched_rows`): slot i's `tokens[i * width ..]` at
+/// `positions[i]` on `caches[i]`; every row's logits.
+fn groupStep(a: std.mem.Allocator, pack: *conformance.Loaded, caches: []test_cache.TestCache, tokens: []const u32, positions: []const u32, width: usize) ![]f32 {
+    var handles: [8]abi.Handle = undefined;
+    var slots: [8]u32 = undefined;
+    for (caches, 0..) |*c, i| {
+        handles[i] = c.handle();
+        slots[i] = @intCast(i);
+    }
+    var out: abi.ForwardOut = .{};
+    const v = pack.table.forward(pack.model, &.{ .mode = .batched_rows, .logits = .all_rows, .rows = @intCast(width), .tokens = .of(tokens), .slots = .of(slots[0..caches.len]), .positions = .of(positions), .caches = .of(handles[0..caches.len]), .cache_ops = &test_cache.ops }, &out);
+    try testing.expect(v.isOk());
+    if (out.hidden.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = out.hidden.ctx });
+    return conformance.consumeF32(a, out.logits);
+}
+
+// Bar: the blocks of several slots verified as one forward read what each block's own verify reads (to the rows' cosine, at a
+// width the packed expert kernels serve and one they do not), and kept to different lengths leave each slot's caches and conv
+// states as a forward of its kept rows leaves them.
+test "inkling2 proof: a verify of several slots' blocks serves what each slot's verify serves alone" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Setup.init(a, true);
+    defer s.deinit(a);
+    const m: *plugin.Loaded = @ptrCast(@alignCast(s.pack.model));
+    const run_mod = @import("../../sdk/bases/run.zig");
+    const visits = s.pack.parsed.shell.num_hidden_layers;
+    const splits = [_]usize{ 9, 12, 5 };
+    const kept = [_]usize{ 3, 1, 4 };
+    for ([_]usize{ 4, 6 }) |width| {
+        var caches: [3]test_cache.TestCache = undefined;
+        var alone: [3]test_cache.TestCache = undefined;
+        for (&caches, &alone, splits) |*c, *l, split| {
+            c.* = try test_cache.TestCache.init(a, visits);
+            l.* = try test_cache.TestCache.init(a, visits);
+            a.free(try step(a, &s.pack, c, prompt[0..split], 0, .last_row));
+            a.free(try step(a, &s.pack, l, prompt[0..split], 0, .last_row));
+        }
+        defer for (&caches, &alone) |*c, *l| {
+            c.deinit();
+            l.deinit();
+        };
+        var g = ops.Graph.init(a, m.base.s);
+        defer g.deinit();
+        const opens = try a.alloc(kernels.Open, visits);
+        defer a.free(opens);
+        @memset(opens, .{ .g = &g });
+        var sp: plugin.Spec = .{ .visits = &.{}, .keep = 4 };
+        defer {
+            m.base.weights.spec = null;
+            for ([_]mlx.mlx_array{ sp.ring, sp.held }) |x| if (x.ctx != null) {
+                _ = mlx.mlx_array_free(x);
+            };
+        }
+        m.base.weights.spec = &sp;
+        var tokens: [3 * 6]u32 = undefined;
+        var positions: [3]u32 = undefined;
+        for (splits, 0..) |split, i| {
+            @memcpy(tokens[i * width ..][0..width], prompt[split .. split + width]);
+            positions[i] = @intCast(split);
+        }
+        sp.opens = opens;
+        const rows = try groupStep(a, &s.pack, &caches, tokens[0 .. 3 * width], &positions, width);
+        defer a.free(rows);
+        sp.opens = null;
+        for (splits, 0..) |split, i| {
+            // Nothing of the block reached the cache, and the block reads what it reads alone.
+            try testing.expectEqual(@as(u64, split), test_cache.ops.len(caches[i].handle(), 0));
+            const opens_alone = try a.alloc(kernels.Open, visits);
+            defer a.free(opens_alone);
+            @memset(opens_alone, .{ .g = &g });
+            sp.opens = opens_alone;
+            const want_rows = try step(a, &s.pack, &alone[i], prompt[split .. split + width], split, .all_rows);
+            defer a.free(want_rows);
+            sp.opens = null;
+            try testing.expect(parity.qwen4CompareRows(rows[i * width * VOCAB ..][0 .. width * VOCAB], want_rows, width, VOCAB).min_cos > 0.999);
+        }
+        for (splits, kept, 0..) |split, keep, i| {
+            var serial = try test_cache.TestCache.init(a, visits);
+            defer serial.deinit();
+            a.free(try step(a, &s.pack, &serial, prompt[0..split], 0, .last_row));
+            a.free(try step(a, &s.pack, &serial, prompt[split .. split + keep], split, .last_row));
+            const want = try step(a, &s.pack, &serial, prompt[split + keep .. split + keep + 1], split + keep, .last_row);
+            defer a.free(want);
+            var h = [_]abi.Handle{caches[i].handle()};
+            const pos = [_]u32{@intCast(split)};
+            const r: run_mod.Run = .{ .mode = .verify, .rows = @intCast(keep), .positions = &pos, .caches = &h, .cache_ops = &test_cache.ops };
+            var c = r.ctx(&g, &m.base.shared);
+            try kernels.commit(&c, &m.base.weights.body.cfg, opens, @intCast(keep), i, 3);
+            try testing.expectEqual(@as(u64, split + keep), test_cache.ops.len(caches[i].handle(), 0));
+            const got = try step(a, &s.pack, &caches[i], prompt[split + keep .. split + keep + 1], split + keep, .last_row);
+            defer a.free(got);
+            try testing.expect(parity.qwen4CompareRows(got, want, 1, VOCAB).min_cos > 0.999);
+        }
     }
 }
 
@@ -1004,19 +1287,22 @@ test "inkling2 kernels: the expert tail kernels serve the stream and the conv st
     const kv_dim: c_int = @intCast(body.cfg.kvDim());
     const taps: c_int = @intCast(body.cfg.sconv_kernel);
     var seed: u64 = 9000;
-    for ([_]ExpertFormat{ .{ .mode = null }, .{ .mode = .nvfp4, .bits = 4, .group = 16 }, .{ .mode = .mxfp4, .bits = 4, .group = 32 }, .{ .mode = .mxfp8, .bits = 8, .group = 32 } } ++ affine_formats) |f| for ([_]c_int{ 1, 7, 43 }) |rows| for ([_]ops.Dtype{ .float32, .bfloat16 }) |dt| for ([_]bool{ true, false }) |scaled| {
+    for ([_]ExpertFormat{ .{ .mode = null }, .{ .mode = .nvfp4, .bits = 4, .group = 16 }, .{ .mode = .mxfp4, .bits = 4, .group = 32 }, .{ .mode = .mxfp8, .bits = 8, .group = 32 } } ++ affine_formats) |f| for ([_]c_int{ 1, 2, 7, 15, 16, 43 }) |rows| for ([_]ops.Dtype{ .float32, .bfloat16 }) |dt| for ([_]bool{ true, false }) |scaled| for ([_]c_int{ 64, 1152 }) |inter_w| {
         // MLX's fp matmuls take bf16 rows; one row reads a packed bank in place at either.
         if (f.mode != null and dt == .float32 and rows > 1) continue;
+        // 1152 is the release's width (4.5 sweeps of the down kernel), run for its format.
+        if (inter_w == 1152 and (f.mode != .nvfp4 or dt == .float32)) continue;
+        if (f.mode == null and inter_w != 64) continue;
         var g = ops.Graph.init(a, fx_stream);
         defer g.deinit();
         seed += 20;
         var L = body.layers[3];
         body.cfg.moe_intermediate_size = s.body.cfg.moe_intermediate_size;
         if (f.mode) |mode| {
-            // Two scale groups wide: MLX's sorted MXFP8 gather is not finite on a bank one group (32) wide.
-            body.cfg.moe_intermediate_size = 64;
-            L.gate_up = try packedBank(&g, a, seed, &.{ experts, 128, hidden }, f.bits, f.group, mode);
-            L.down = try packedBank(&g, a, seed + 1, &.{ experts, hidden, 64 }, f.bits, f.group, mode);
+            // 64 is two scale groups wide: MLX's sorted MXFP8 gather is not finite on a bank one group (32) wide.
+            body.cfg.moe_intermediate_size = @intCast(inter_w);
+            L.gate_up = try packedBank(&g, a, seed, &.{ experts, 2 * inter_w, hidden }, f.bits, f.group, mode);
+            L.down = try packedBank(&g, a, seed + 1, &.{ experts, hidden, inter_w }, f.bits, f.group, mode);
         }
         if (scaled) {
             L.gate_up_scale = try g.addScalar(try randomRow(&g, a, seed + 2, &.{experts}, 0.3, .float32), 1.5);
@@ -1082,6 +1368,51 @@ test "inkling2 kernels: the gate_up launch ranks the router's picks as the top-k
 }
 
 // Bar: the packed kernels take an affine bank at every width a pack may be re-quantized to, read in place.
+// Bar: the pick grouping tiles every pick once, each tile holding at most four picks of one expert, the used tiles first.
+test "inkling2 kernels: the pick grouping tiles each pick once, an expert at a time" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    fx_stream = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x6d1);
+    const rng = prng.random();
+    const experts = 128;
+    for ([_]usize{ 16, 40, 64, 128 }) |n| for ([_]u32{ 1, 3, 9, experts }) |pool| {
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        var picks: [128]i32 = undefined;
+        for (picks[0..n]) |*p| p.* = @intCast(rng.uintLessThan(u32, pool));
+        const sel = try g.astype(try g.fromSlice(i32, picks[0..n], &.{@intCast(n)}), .uint32);
+        const grp = try kernels.groupPicks(&g, sel, experts);
+        try ops.evalMany(&grp);
+        const tile_expert = mlx.mlx_array_data_uint32(grp[0]).?[0..n];
+        const tile_picks = mlx.mlx_array_data_uint32(grp[1]).?[0..n];
+        const pick_at = mlx.mlx_array_data_uint32(grp[2]).?[0 .. 4 * n];
+        var seen: [128]bool = @splat(false);
+        var tiles: usize = 0;
+        for (0..n) |t| {
+            if (tile_expert[t] == 0xFFFFFFFF) {
+                try testing.expectEqual(@as(u32, 0), tile_picks[t]);
+                continue;
+            }
+            // The used tiles come first.
+            try testing.expectEqual(t, tiles);
+            tiles += 1;
+            try testing.expect(tile_picks[t] >= 1 and tile_picks[t] <= 4);
+            for (pick_at[4 * t ..][0..tile_picks[t]]) |p| {
+                try testing.expect(p < n and !seen[p]);
+                seen[p] = true;
+                try testing.expectEqual(tile_expert[t], @as(u32, @intCast(picks[p])));
+            }
+        }
+        for (seen[0..n]) |x| try testing.expect(x);
+        var count: [experts]usize = @splat(0);
+        for (picks[0..n]) |p| count[@intCast(p)] += 1;
+        var want: usize = 0;
+        for (count) |c| want += (c + 3) / 4;
+        try testing.expectEqual(want, tiles);
+    };
+}
+
 test "inkling2 kernels: an affine bank is a packed format at every width" {
     if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const a = testing.allocator;
@@ -1204,6 +1535,48 @@ test "inkling2 kernels: the relative attention kernel reads a prompt's rows as t
     };
 }
 
+// Bar: a prompt's rows read on the tensor unit against the masked chain, on a sliding and a global layer, at row counts
+// that leave a partial 16-row tile and a partial 64-row group, from the start and behind earlier keys (past the window,
+// the 1024-key bias extent, the 32-key tile and the log-scaling floor): 5e-2 of unit-RMS values in half dtypes.
+test "inkling2 kernels: a prompt's rows read on the tensor unit are the masked chain's" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Stage.init(a);
+    defer s.deinit();
+    const cfg = &s.body.cfg;
+    const heads: c_int = @intCast(cfg.num_attention_heads);
+    const kv_heads: c_int = @intCast(cfg.num_key_value_heads);
+    const hd: c_int = @intCast(cfg.head_dim);
+    var seed: u64 = 13000;
+    for ([_]usize{ 0, 1 }) |li| for ([_]c_int{ 33, 70, 200 }) |rows| for ([_]c_int{ 0, 5, 1100, 2500 }) |offset| for ([_]ops.Dtype{ .float16, .bfloat16 }) |dt| {
+        const L = &s.body.layers[li];
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 10;
+        const total = offset + rows;
+        const keys = if (L.global) total else @min(total, @as(c_int, @intCast(cfg.sliding_window)) + rows - 1);
+        const q = try randomRow(&g, a, seed, &.{ 1, rows, heads, hd }, 0.6, dt);
+        const p: layers.Pre = .{
+            .q = q,
+            .k = q,
+            .v = q,
+            .rel = try randomRow(&g, a, seed + 1, &.{ 1, rows, heads, @intCast(cfg.d_rel) }, 0.5, dt),
+            .gate = q,
+            .sinks = try randomRow(&g, a, seed + 2, &.{ 1, rows, heads }, 1.0, dt),
+            .k_state = q,
+            .v_state = q,
+            .stream = q,
+            .normed = q,
+        };
+        const k = try randomRow(&g, a, seed + 3, &.{ 1, kv_heads, keys, hd }, 0.6, dt);
+        const v = try randomRow(&g, a, seed + 4, &.{ 1, kv_heads, keys, hd }, 1.0, dt);
+        const want = try g.contiguous(try layers.wideRead(&g, L, cfg, &p, k, v, offset));
+        const got = (try kernels.relativeNax(&g, L, cfg, p.q, p.rel, p.sinks, k, v, offset)) orelse return error.TestUnexpectedResult;
+        try expectClose(try g.contiguous(got), want, 5e-2, "tensor-unit read");
+    };
+}
+
 // Bar: the split read (keys split over threadgroups, combined under the gate) against the masked chain times its
 // gate, on a sliding and a global layer, from the start and behind earlier keys (past the window, the extent and the
 // log-scaling floor), at the fewest rows it takes, an odd count and the most: 5e-2 of unit-RMS values in half dtypes.
@@ -1241,8 +1614,214 @@ test "inkling2 kernels: the split read is the masked chain's, gated" {
         const v = try randomRow(&g, a, seed + 4, &.{ 1, kv_heads, keys, hd }, 1.0, dt);
         const gate = try g.sigmoid(try randomRow(&g, a, seed + 5, &.{rows * heads * hd}, 2.0, .float32));
         const want = try kernels.gated(&g, try g.contiguous(try layers.wideRead(&g, L, cfg, &p, k, v, offset)), gate, rows);
-        const got = (try kernels.splitRead(&g, L, cfg, p.q, p.rel, p.sinks, k, v, offset, gate)) orelse return error.TestUnexpectedResult;
+        const got = (try kernels.splitRead(&g, L, cfg, p.q, p.rel, p.sinks, k, v, null, offset, gate)) orelse return error.TestUnexpectedResult;
         try expectClose(got, want, 5e-2, "split read");
+    };
+}
+
+// Bar: a verify's rows read the cache in place with their own keys behind it (two sources, no copy) as the masked
+// chain reads the joined keys: from 2 rows to 16 (two fragments), on a sliding and a global layer, to 5e-2.
+test "inkling2 kernels: a verify's split read of the cache and its own rows is the masked chain's over both" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Stage.init(a);
+    defer s.deinit();
+    const cfg = &s.body.cfg;
+    const heads: c_int = @intCast(cfg.num_attention_heads);
+    const kv_heads: c_int = @intCast(cfg.num_key_value_heads);
+    const hd: c_int = @intCast(cfg.head_dim);
+    var seed: u64 = 23000;
+    for ([_]usize{ 0, 1 }) |li| for ([_]c_int{ 2, 3, kernels.split_rows, 9, 13, kernels.open_rows }) |rows| for ([_]c_int{ 1, 300 }) |offset| {
+        const L = &s.body.layers[li];
+        const dt: ops.Dtype = .bfloat16;
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 10;
+        const total = offset + rows;
+        const keys = if (L.global) total else @min(total, @as(c_int, @intCast(cfg.sliding_window)) + rows - 1);
+        const q = try randomRow(&g, a, seed, &.{ 1, rows, heads, hd }, 0.6, dt);
+        const p: layers.Pre = .{
+            .q = q,
+            .k = q,
+            .v = q,
+            .rel = try randomRow(&g, a, seed + 1, &.{ 1, rows, heads, @intCast(cfg.d_rel) }, 0.5, dt),
+            .gate = q,
+            .sinks = try randomRow(&g, a, seed + 2, &.{ 1, rows, heads }, 1.0, dt),
+            .k_state = q,
+            .v_state = q,
+            .stream = q,
+            .normed = q,
+        };
+        const k = try randomRow(&g, a, seed + 3, &.{ 1, kv_heads, keys, hd }, 0.6, dt);
+        const v = try randomRow(&g, a, seed + 4, &.{ 1, kv_heads, keys, hd }, 1.0, dt);
+        const gate = try g.sigmoid(try randomRow(&g, a, seed + 5, &.{rows * heads * hd}, 2.0, .float32));
+        const want = try kernels.gated(&g, try g.contiguous(try layers.wideRead(&g, L, cfg, &p, k, v, offset)), gate, rows);
+        const own = [2]ops.Array{ try g.sliceAxis(k, 2, keys - rows, keys), try g.sliceAxis(v, 2, keys - rows, keys) };
+        const got = (try kernels.splitRead(&g, L, cfg, p.q, p.rel, p.sinks, try g.sliceAxis(k, 2, 0, keys - rows), try g.sliceAxis(v, 2, 0, keys - rows), own, offset, gate)) orelse return error.TestUnexpectedResult;
+        try expectClose(got, want, 5e-2, "split read in place");
+    };
+}
+
+// Bar: `relsplit_nax.metal` (single-pass 2..16-row NAX split-K read) matches `splitRead` on real geometry (hd=128,
+// 24Q/8KV) across sliding and global layers, direct (1 split) and multi-split, up to 16 rows.
+test "inkling2 kernels: relsplit_nax matches splitRead" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    fx_stream = mlx.gpuStream();
+    const heads: c_int = 24;
+    const kv_heads: c_int = 8;
+    const hd: c_int = 128;
+    const d_rel: c_int = 16;
+    const r_ext: c_int = 1024;
+    var cfg: plugin.config.Config = undefined;
+    cfg.hidden_size = 2304;
+    cfg.num_attention_heads = @intCast(heads);
+    cfg.num_key_value_heads = @intCast(kv_heads);
+    cfg.head_dim = @intCast(hd);
+    cfg.d_rel = @intCast(d_rel);
+    cfg.sliding_window = 1024;
+    cfg.log_n_floor = 256;
+    cfg.log_alpha = 0.2;
+    var seed: u64 = 51000;
+    for ([_]bool{ false, true }) |global| for ([_]c_int{ 2, 5, 8, 12, 15, 16 }) |rows| for ([_]c_int{ 4, 50, 600, 1200 }) |offset| {
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 20;
+        const dt: ops.Dtype = .bfloat16;
+        const rel_proj = try randomRow(&g, a, seed, &.{ d_rel, r_ext }, 0.3, dt);
+        var L: layers.Layer = undefined;
+        L.global = global;
+        L.rel_proj = rel_proj;
+        const cached = if (global) offset else @min(offset, 1023);
+        const q = try randomRow(&g, a, seed + 1, &.{ 1, rows, heads, hd }, 0.6, dt);
+        const rel_st = try randomRow(&g, a, seed + 2, &.{ 1, rows, heads, d_rel }, 0.5, dt);
+        const sinks = try randomRow(&g, a, seed + 3, &.{ 1, rows, heads }, 1.0, dt);
+        const k = try randomRow(&g, a, seed + 4, &.{ 1, kv_heads, cached, hd }, 0.6, dt);
+        const v = try randomRow(&g, a, seed + 5, &.{ 1, kv_heads, cached, hd }, 1.0, dt);
+        const kb = try randomRow(&g, a, seed + 6, &.{ 1, kv_heads, rows, hd }, 0.6, dt);
+        const vb = try randomRow(&g, a, seed + 7, &.{ 1, kv_heads, rows, hd }, 1.0, dt);
+        const gate = try g.sigmoid(try randomRow(&g, a, seed + 8, &.{rows * heads * hd}, 2.0, .float32));
+
+        const want = (try kernels.splitRead(&g, &L, &cfg, q, rel_st, sinks, k, v, .{ kb, vb }, offset, gate)) orelse return error.TestUnexpectedResult;
+        const got = (try kernels.splitReadNax(&g, &L, &cfg, q, rel_st, sinks, k, v, .{ kb, vb }, offset, gate)) orelse return error.TestUnexpectedResult;
+        try expectClose(got, want, 5e-2, "relsplit_nax chain");
+    };
+}
+
+// Bar: `relsplit_nax` with `TREE = 1` matches `relsplit_lanes` with `TREE = 1` on real geometry (hd=128, 24Q/8KV)
+// across sliding and global layers, direct (1 split) and multi-split, 2 and 16 rows on a branching tree.
+test "inkling2 kernels: relsplit_nax TREE=1 matches relsplit_lanes TREE=1" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    fx_stream = mlx.gpuStream();
+    const heads: c_int = 24;
+    const kv_heads: c_int = 8;
+    const hd: c_int = 128;
+    const d_rel: c_int = 16;
+    const r_ext: c_int = 1024;
+    var cfg: plugin.config.Config = undefined;
+    cfg.hidden_size = 2304;
+    cfg.num_attention_heads = @intCast(heads);
+    cfg.num_key_value_heads = @intCast(kv_heads);
+    cfg.head_dim = @intCast(hd);
+    cfg.d_rel = @intCast(d_rel);
+    cfg.sliding_window = 1024;
+    cfg.log_n_floor = 256;
+    cfg.log_alpha = 0.2;
+    // Branching 16-node tree parent array (0 root; branches at 0, 1, 2, 4, 5).
+    const par16 = [16]i32{ -1, 0, 0, 1, 1, 2, 2, 3, 4, 4, 5, 6, 7, 8, 10, 12 };
+    var meta16: [32]i32 = undefined;
+    for (0..16) |r| {
+        if (r == 0) {
+            meta16[0] = 0;
+            meta16[1] = 1;
+        } else {
+            const p: usize = @intCast(par16[r]);
+            meta16[r * 2 + 0] = meta16[p * 2 + 0] + 1;
+            meta16[r * 2 + 1] = meta16[p * 2 + 1] | (@as(i32, 1) << @intCast(r));
+        }
+    }
+    var seed: u64 = 91000;
+    for ([_]bool{ false, true }) |global| for ([_]c_int{ 2, 16 }) |rows| for ([_]c_int{ 4, 1200 }) |offset| {
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 20;
+        const dt: ops.Dtype = .bfloat16;
+        var L: layers.Layer = undefined;
+        L.global = global;
+        L.rel_proj = try randomRow(&g, a, seed, &.{ d_rel, r_ext }, 0.3, dt);
+        const cached = if (global) offset else @min(offset, 1023);
+        const q = try randomRow(&g, a, seed + 1, &.{ 1, rows, heads, hd }, 0.6, dt);
+        const rel_st = try randomRow(&g, a, seed + 2, &.{ 1, rows, heads, d_rel }, 0.5, dt);
+        const sinks = try randomRow(&g, a, seed + 3, &.{ 1, rows, heads }, 1.0, dt);
+        const k = try randomRow(&g, a, seed + 4, &.{ 1, kv_heads, cached, hd }, 0.6, dt);
+        const v = try randomRow(&g, a, seed + 5, &.{ 1, kv_heads, cached, hd }, 1.0, dt);
+        const kb = try randomRow(&g, a, seed + 6, &.{ 1, kv_heads, rows, hd }, 0.6, dt);
+        const vb = try randomRow(&g, a, seed + 7, &.{ 1, kv_heads, rows, hd }, 1.0, dt);
+        const gate = try g.sigmoid(try randomRow(&g, a, seed + 8, &.{rows * heads * hd}, 2.0, .float32));
+        const tmeta = try g.fromSlice(i32, meta16[0 .. @as(usize, @intCast(rows)) * 2], &.{ rows, 2 });
+        const want = (try kernels.splitReadLanesM4(&g, &L, &cfg, q, rel_st, sinks, &.{k}, &.{v}, .{ kb, vb }, &.{offset}, gate, rows, tmeta)) orelse return error.TestUnexpectedResult;
+        const got = (try kernels.splitReadNaxLanesTree(&g, &L, &cfg, q, rel_st, sinks, &.{k}, &.{v}, .{ kb, vb }, &.{offset}, gate, rows, tmeta)) orelse return error.TestUnexpectedResult;
+        try expectClose(got, want, 6e-2, "relsplit_nax TREE=1");
+    };
+}
+
+// Bar: the NAX read of several slots' blocks in launches four slots wide is each slot's block read alone (`splitRead` over the
+// window the slot's rows reach), sliding and global, with slots whose caches differ in length and span one split or several.
+test "inkling2 kernels: relsplit_nax reads several slots' blocks as each slot alone" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    fx_stream = mlx.gpuStream();
+    const heads: c_int = 24;
+    const kv_heads: c_int = 8;
+    const hd: c_int = 128;
+    const d_rel: c_int = 16;
+    const r_ext: c_int = 1024;
+    var cfg: plugin.config.Config = undefined;
+    cfg.hidden_size = 2304;
+    cfg.num_attention_heads = @intCast(heads);
+    cfg.num_key_value_heads = @intCast(kv_heads);
+    cfg.head_dim = @intCast(hd);
+    cfg.d_rel = @intCast(d_rel);
+    cfg.sliding_window = 1024;
+    cfg.log_n_floor = 256;
+    cfg.log_alpha = 0.2;
+    const cached_at = [_]c_int{ 40, 700, 1500, 130, 2100, 900 };
+    var seed: u64 = 73000;
+    for ([_]bool{ false, true }) |global| for ([_]c_int{ 3, 8 }) |rows| for ([_]usize{ 3, 6 }) |n| {
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 20;
+        const dt: ops.Dtype = .bfloat16;
+        var L: layers.Layer = undefined;
+        L.global = global;
+        L.rel_proj = try randomRow(&g, a, seed, &.{ d_rel, r_ext }, 0.3, dt);
+        const total: c_int = rows * @as(c_int, @intCast(n));
+        const q = try randomRow(&g, a, seed + 1, &.{ 1, total, heads, hd }, 0.6, dt);
+        const rel_st = try randomRow(&g, a, seed + 2, &.{ 1, total, heads, d_rel }, 0.5, dt);
+        const sinks = try randomRow(&g, a, seed + 3, &.{ 1, total, heads }, 1.0, dt);
+        const kb = try randomRow(&g, a, seed + 6, &.{ 1, kv_heads, total, hd }, 0.6, dt);
+        const vb = try randomRow(&g, a, seed + 7, &.{ 1, kv_heads, total, hd }, 1.0, dt);
+        const gate = try g.sigmoid(try randomRow(&g, a, seed + 8, &.{total * heads * hd}, 2.0, .float32));
+        var ks: [6]ops.Array = undefined;
+        var vs: [6]ops.Array = undefined;
+        var offsets: [6]c_int = undefined;
+        var want: [6]ops.Array = undefined;
+        for (0..n) |i| {
+            const cached = cached_at[i];
+            ks[i] = try randomRow(&g, a, seed + 30 + i, &.{ 1, kv_heads, cached, hd }, 0.6, dt);
+            vs[i] = try randomRow(&g, a, seed + 40 + i, &.{ 1, kv_heads, cached, hd }, 1.0, dt);
+            offsets[i] = cached;
+            const at: c_int = @as(c_int, @intCast(i)) * rows;
+            // A sliding slot's rows reach at most `window - 1` keys before the block.
+            const from: c_int = if (global) 0 else @max(0, cached - 1023);
+            want[i] = (try kernels.splitRead(&g, &L, &cfg, try g.sliceAxis(q, 1, at, at + rows), try g.sliceAxis(rel_st, 1, at, at + rows), try g.sliceAxis(sinks, 1, at, at + rows), try g.sliceAxis(ks[i], 2, from, cached), try g.sliceAxis(vs[i], 2, from, cached), .{ try g.sliceAxis(kb, 2, at, at + rows), try g.sliceAxis(vb, 2, at, at + rows) }, cached, try g.sliceAxis(gate, 0, at * heads * hd, (at + rows) * heads * hd))) orelse return error.TestUnexpectedResult;
+        }
+        const got = (try kernels.splitReadNaxLanes(&g, &L, &cfg, q, rel_st, sinks, ks[0..n], vs[0..n], .{ kb, vb }, offsets[0..n], gate, rows)) orelse return error.TestUnexpectedResult;
+        try expectClose(got, try g.concat(want[0..n], 1), 5e-2, "relsplit_nax lanes");
     };
 }
 
@@ -1278,20 +1857,88 @@ test "inkling2 kernels: the fused Markov chain drafts the op chain's tokens" {
         const base = try g.astype(try randomRow(&g, a, seed + 7, &.{ 1, steps, vpad }, 4.0, dt), .float32);
         const t1 = try g.fromSlice(i32, &.{first}, &.{1});
         try testing.expect(kernels.markovRuns(&g, d.rnn.w, d.fold, rank));
-        const want = try d.markov(&g, t1, rows, newest, base, vocab, 30, false);
-        const got = try d.markov(&g, t1, rows, newest, base, vocab, 30, true);
+        const want = try d.markov(&g, t1, rows, newest, base, vocab, 30, false, null);
+        const got = try d.markov(&g, t1, rows, newest, base, vocab, 30, true, null);
         try expectClose(got.tokens, want.tokens, 0, "drafted tokens");
         try expectClose(got.confidence, want.confidence, 1e-2, "draft probabilities");
         // Logits far apart: their own top is all but sure, their capped top is not (the head caps at 30).
         const far = try g.mulScalar(base, 25);
         for ([_]bool{ false, true }) |fused| {
-            const raw = try hostValues(a, &g, (try d.markov(&g, t1, rows, newest, far, vocab, 0, fused)).confidence);
+            const raw = try hostValues(a, &g, (try d.markov(&g, t1, rows, newest, far, vocab, 0, fused, null)).confidence);
             defer a.free(raw);
-            const cap = try hostValues(a, &g, (try d.markov(&g, t1, rows, newest, far, vocab, 30, fused)).confidence);
+            const cap = try hostValues(a, &g, (try d.markov(&g, t1, rows, newest, far, vocab, 30, fused, null)).confidence);
             defer a.free(cap);
             try testing.expect(raw[0] > 0.5 and cap[0] < 0.1);
         }
     };
+}
+
+// Bar: drafts drawn under a law come from the drafter's soft-capped softmax at that temperature (the CPU stream, f32):
+// each law row sums to one, its token has mass, a draft's confidence is its row's peak, and near zero temperature the
+// draws are the argmax drafts.
+// Bar: the drafter's 8-bit copy of a dense head reads f32 rows as the head does, to 2.5e-2 where the logits spread
+// 0.6 (256 levels over each group of 64 weights); a head that ships quantized is read as it is (no copy).
+test "inkling2 draft: the drafter's 8-bit head reads rows as the dense head does" {
+    const a = testing.allocator;
+    fx_stream = mlx.mlx_default_cpu_stream_new();
+    var g = ops.Graph.init(a, fx_stream);
+    defer g.deinit();
+    const Linear = @import("../../sdk/bases/blocks/linear.zig").Linear;
+    const dense: Linear = .{ .w = try randomRow(&g, a, 4100, &.{ 512, 128 }, 0.05, .bfloat16) };
+    const copy = (try draft.headCopy(&g, &dense)).?;
+    const rows = try randomRow(&g, a, 4101, &.{ 1, 5, 128 }, 1.0, .float32);
+    try expectClose(try layers.projectRows(&g, &copy, rows), try layers.projectRows(&g, &dense, rows), 2.5e-2, "8-bit head rows");
+    try testing.expect((try draft.headCopy(&g, &copy)) == null);
+}
+
+test "inkling2 draft: a sampled chain draws from the law it returns" {
+    const a = testing.allocator;
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const saved = fx_stream;
+    fx_stream = cpu;
+    defer fx_stream = saved;
+    var g = ops.Graph.init(a, cpu);
+    defer g.deinit();
+    const rank = 8;
+    const hidden = 32;
+    const vocab = 64;
+    const steps = 5;
+    const dt: ops.Dtype = .float32;
+    var d: draft.Drafter = .{
+        .cfg = .{ .layers = 0, .heads = 1, .kv_heads = 1, .head_dim = 16, .intermediate = 1, .window = 2, .block = steps + 1, .rank = rank, .tap_count = 1 },
+        .hidden = hidden,
+        .s = cpu,
+    };
+    d.norm = try g.ones(&.{hidden}, dt);
+    d.prev_rows = try randomRow(&g, a, 19001, &.{ vocab, rank }, 0.5, dt);
+    d.rnn = .{ .w = try randomRow(&g, a, 19002, &.{ 3 * rank, 2 * rank + 2 * hidden }, 0.1, dt) };
+    d.rnn_bias = try randomRow(&g, a, 19003, &.{3 * rank}, 0.2, dt);
+    d.fold = try randomRow(&g, a, 19004, &.{ rank, vocab }, 0.3, dt);
+    d.fold_bias = try randomRow(&g, a, 19005, &.{ 1, 1, vocab }, 0.3, dt);
+    const rows = try randomRow(&g, a, 19006, &.{ 1, steps, hidden }, 1.0, dt);
+    const newest = try randomRow(&g, a, 19007, &.{ 1, 1, hidden }, 1.0, dt);
+    const base = try randomRow(&g, a, 19008, &.{ 1, steps, vocab }, 2.0, dt);
+    const t1 = try g.fromSlice(i32, &.{3}, &.{1});
+    const argmax = try d.markov(&g, t1, rows, newest, base, vocab, 30, false, null);
+    const cold = try d.markov(&g, t1, rows, newest, base, vocab, 30, false, .{ .temperature = 1e-4, .seed = 7 });
+    try expectClose(cold.tokens, argmax.tokens, 0, "near-greedy draws");
+    const warm = try d.markov(&g, t1, rows, newest, base, vocab, 30, false, .{ .temperature = 1.0, .seed = 7 });
+    const law = try hostValues(a, &g, warm.probs);
+    defer a.free(law);
+    const sure = try hostValues(a, &g, warm.confidence);
+    defer a.free(sure);
+    const ids = try hostValues(a, &g, try g.astype(warm.tokens, .float32));
+    defer a.free(ids);
+    try testing.expectEqual(@as(usize, steps * vocab), law.len);
+    for (0..steps) |i| {
+        const row = law[i * vocab ..][0..vocab];
+        var sum: f32 = 0;
+        for (row) |x| sum += x;
+        try testing.expectApproxEqAbs(@as(f32, 1), sum, 1e-5);
+        try testing.expect(row[@intFromFloat(ids[i])] > 0);
+        try testing.expectEqual(std.mem.max(f32, row), sure[i]);
+    }
 }
 
 // Bar: a slot's rounds with the drafter's context keys and values carried over draft what rounds projecting the
@@ -1355,8 +2002,8 @@ test "inkling2 draft: rounds that carry the context keys and values draft what f
     // The ring's rows [lo, hi), ending at the round's position: grows, slides past 12 rows, holds, jumps.
     for ([_][2]c_int{ .{ 0, 5 }, .{ 0, 9 }, .{ 2, 14 }, .{ 6, 18 }, .{ 6, 18 }, .{ 28, 40 } }) |span| {
         const ring = try g.sliceAxis(full, 1, span[0], span[1]);
-        const got = try d.draft(&g, t1, anchor, ring, span[1], &head, V - 4, 30, &cache);
-        const want = try d.draft(&g, t1, anchor, ring, span[1], &head, V - 4, 30, null);
+        const got = try d.draft(&g, t1, anchor, ring, span[1], &head, V - 4, 30, &cache, null);
+        const want = try d.draft(&g, t1, anchor, ring, span[1], &head, V - 4, 30, null, null);
         try expectClose(got.tokens, want.tokens, 0, "drafted tokens");
         try expectClose(got.confidence, want.confidence, 1e-5, "draft probabilities");
     }
@@ -1429,54 +2076,58 @@ test "inkling2 draft: a layer outside local_layer_ids reads every committed posi
         var carried: draft.ContextKv = .{ .chunk = 8 };
         defer carried.release();
         for (pushes) |p| {
-            if (p[1] > p[0]) try d.appendFull(&g, &carried, try g.sliceAxis(all, 1, p[0], p[1]), @intCast(p[0]));
+            if (p[1] > p[0]) try d.appendFull(&g, &carried, &.{try g.sliceAxis(all, 1, p[0], p[1])}, @intCast(p[0]));
             const ring = try g.sliceAxis(all, 1, @max(0, p[1] - keep), p[1]);
-            const got = try d.draft(&g, t1, anchor, ring, p[1], &head, V - 4, 30, &carried);
+            const got = try d.draft(&g, t1, anchor, ring, p[1], &head, V - 4, 30, &carried, null);
             var want: draft.Drafter.Block = undefined;
             var fresh: draft.ContextKv = .{};
             defer fresh.release();
             if (local.? == 0) {
                 // Every layer full: the draft over the whole context as its ring.
-                want = try d.draft(&g, t1, anchor, try g.sliceAxis(all, 1, 0, p[1]), p[1], &head, V - 4, 30, null);
+                want = try d.draft(&g, t1, anchor, try g.sliceAxis(all, 1, 0, p[1]), p[1], &head, V - 4, 30, null, null);
             } else {
-                try d.appendFull(&g, &fresh, try g.sliceAxis(all, 1, 0, p[1]), 0);
-                want = try d.draft(&g, t1, anchor, ring, p[1], &head, V - 4, 30, &fresh);
+                // The taps as two parts side by side (a forward's per-tap slices), joined by the append.
+                const rows = try g.sliceAxis(all, 1, 0, p[1]);
+                try d.appendFull(&g, &fresh, &.{ try g.sliceAxis(rows, 2, 0, H), try g.sliceAxis(rows, 2, H, 2 * H) }, 0);
+                want = try d.draft(&g, t1, anchor, ring, p[1], &head, V - 4, 30, &fresh, null);
             }
             try expectClose(got.tokens, want.tokens, 0, "drafted tokens");
             try expectClose(got.confidence, want.confidence, 1e-5, "draft probabilities");
         }
         // Past the ring the full layer changes the draft: the ring-only read differs.
         const newest = try g.sliceAxis(all, 1, 40 - keep, 40);
-        const full_read = try d.draft(&g, t1, anchor, newest, 40, &head, V - 4, 30, &carried);
-        const ring_only = try d.draft(&g, t1, anchor, newest, 40, &head, V - 4, 30, null);
+        const full_read = try d.draft(&g, t1, anchor, newest, 40, &head, V - 4, 30, &carried, null);
+        const ring_only = try d.draft(&g, t1, anchor, newest, 40, &head, V - 4, 30, null, null);
         try testing.expect(try parity.maxAbsDiffF32(full_read.confidence, ring_only.confidence, fx_stream) > 1e-4);
     }
     // Full buffers that end before the draft (no push since): the full layer reads the ring, as a fresh context does.
     d.cfg.local = 1;
     var behind: draft.ContextKv = .{ .chunk = 8 };
     defer behind.release();
-    try d.appendFull(&g, &behind, try g.sliceAxis(all, 1, 0, 18), 0);
-    _ = try d.draft(&g, t1, anchor, try g.sliceAxis(all, 1, 18 - keep, 18), 18, &head, V - 4, 30, &behind);
+    try d.appendFull(&g, &behind, &.{try g.sliceAxis(all, 1, 0, 18)}, 0);
+    _ = try d.draft(&g, t1, anchor, try g.sliceAxis(all, 1, 18 - keep, 18), 18, &head, V - 4, 30, &behind, null);
     const ring = try g.sliceAxis(all, 1, 22 - keep, 22);
-    const got = try d.draft(&g, t1, anchor, ring, 22, &head, V - 4, 30, &behind);
-    const want = try d.draft(&g, t1, anchor, ring, 22, &head, V - 4, 30, null);
+    const got = try d.draft(&g, t1, anchor, ring, 22, &head, V - 4, 30, &behind, null);
+    const want = try d.draft(&g, t1, anchor, ring, 22, &head, V - 4, 30, null, null);
     try expectClose(got.tokens, want.tokens, 0, "drafted tokens");
     try expectClose(got.confidence, want.confidence, 1e-5, "draft probabilities");
-}
-
-// Bar: the cut a round verifies drafts down to follows what a verified row costs against a plain step, as measured
-// on the two machines it was tuned on (M4 Max: a 17.5 ms plain step, 3.5 ms a row, best cut 0.6; M5 Ultra: 11.3 ms,
-// 1.35 ms, 0.45), to 0.02; 0.5 before a plain step and two draft counts are timed.
-test "inkling2 draft: the verify cut follows the cost a row adds on each machine" {
-    for ([_][3]f32{ .{ 17.5, 3.5, 0.6 }, .{ 11.3, 1.35, 0.45 } }) |m| {
-        var c: plugin.RowCost = .{};
-        try testing.expectEqual(@as(f32, 0.5), c.cut());
-        for (0..6) |_| {
-            c.plain.add(m[0]);
-            for (1..8) |k| c.verify[k].add(m[0] + 5 + m[1] * @as(f32, @floatFromInt(k - 1)));
-        }
-        try testing.expectApproxEqAbs(m[2], c.cut(), 0.02);
-    }
+    // A context cut back to position 30 and extended by other rows drafts what one built from those rows does.
+    const other = try W.of(&g, a, &seed, &.{ 1, 10, 2 * H }, 1.0);
+    const redone = try g.concat(&.{ try g.sliceAxis(all, 1, 0, 30), other }, 1);
+    var cut: draft.ContextKv = .{ .chunk = 8 };
+    defer cut.release();
+    try d.appendFull(&g, &cut, &.{all}, 0);
+    _ = try d.draft(&g, t1, anchor, try g.sliceAxis(all, 1, 40 - keep, 40), 40, &head, V - 4, 30, &cut, null);
+    cut.cut(30);
+    try d.appendFull(&g, &cut, &.{other}, 30);
+    var built: draft.ContextKv = .{ .chunk = 8 };
+    defer built.release();
+    try d.appendFull(&g, &built, &.{redone}, 0);
+    const tail = try g.sliceAxis(redone, 1, 40 - keep, 40);
+    const after_cut = try d.draft(&g, t1, anchor, tail, 40, &head, V - 4, 30, &cut, null);
+    const from_built = try d.draft(&g, t1, anchor, tail, 40, &head, V - 4, 30, &built, null);
+    try expectClose(after_cut.tokens, from_built.tokens, 0, "drafted tokens after a cut");
+    try expectClose(after_cut.confidence, from_built.confidence, 1e-5, "draft probabilities after a cut");
 }
 
 // Bar: the few-row router kernel's logits are each row's one-row matmul (exact f32; the matmul over all the rows
@@ -1512,6 +2163,562 @@ test "inkling2 kernels: the gated kernel is the attention read times its gate, r
         const want = try g.astype(try g.mul(try g.astype(try g.reshape(x, &.{ 1, 1, 64 }), .float32), gate), dt);
         try expectClose(try kernels.gated(&g, x, gate, 1), want, 0, "gated rows");
     }
+}
+
+// Bar: a batched block pass is what each lane's pass alone is (cosine and scale of the block rows, a lane's rows unmoved by
+// its neighbours) over rings of different lengths, on a round that projects its whole context and on the next, which projects only the rows committed since; a batched
+// draft's law, per lane, is a distribution over its candidates that holds the token it drew.
+test "inkling2 dflash2: a batched draft drafts what each lane drafts alone" {
+    const env = @import("../../env.zig");
+    const pack_dir = std.mem.span(env.get(.INKLING2_DFLASH2_PACK) orelse return error.SkipZigTest);
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var rel = try Release.open(a, pack_dir);
+    defer rel.close();
+    const d = rel.m.drafter2 orelse return error.SkipZigTest;
+    const w = &rel.m.base.weights;
+    const taps: c_int = @intCast(d.cfg.tap_count);
+    const lens = [_]c_int{ 300, 2047, 1200 };
+    const starts = [_]c_int{ 5300, 9000, 4000 };
+    const firsts = [_]i32{ 11, 4242, 90000 };
+    var g = ops.Graph.init(a, rel.m.base.s);
+    defer g.deinit();
+    var prng = std.Random.DefaultPrng.init(99);
+    var rings: [3]ops.Array = undefined;
+    var anchors: [3]ops.Array = undefined;
+    var t1: [3]ops.Array = undefined;
+    for (&rings, &anchors, &t1, lens, firsts) |*ring, *anchor, *first, len, id| {
+        const host = try a.alloc(f32, @as(usize, @intCast(len * taps * 2304)));
+        for (host) |*x| x.* = prng.random().floatNorm(f32) * 0.5;
+        ring.* = try g.astype(try g.fromSlice(f32, host, &.{ 1, len, taps * 2304 }), .bfloat16);
+        const row = try a.alloc(f32, 2304);
+        for (row) |*x| x.* = prng.random().floatNorm(f32) * 0.3;
+        anchor.* = try g.astype(try g.fromSlice(f32, row, &.{ 1, 1, 2304 }), .bfloat16);
+        first.* = try g.fromSlice(i32, &.{id}, &.{1});
+    }
+    var alone: [3]draft.ContextKv = @splat(.{});
+    var batch: [3]draft.ContextKv = @splat(.{});
+    // A lane's rows do not move with its neighbours: the same lane beside itself and beside another lane's ring and position.
+    {
+        var rows: [2]ops.Array = undefined;
+        for ([_]usize{ 1, 2 }, &rows) |other, *out| {
+            var c0: draft.ContextKv = .{};
+            var c1: draft.ContextKv = .{};
+            defer c0.release();
+            defer c1.release();
+            const nz0 = try g.concat(&.{ anchors[0], try g.broadcast(d.mask, &.{ 1, 7, 2304 }) }, 1);
+            const nz1 = try g.concat(&.{ anchors[other], try g.broadcast(d.mask, &.{ 1, 7, 2304 }) }, 1);
+            const got = try d.blockRowsBatch(&g, try g.concat(&.{ nz0, nz1 }, 0), &.{ .{ .taps = rings[0], .position = starts[0], .cache = &c0 }, .{ .taps = rings[other], .position = starts[other], .cache = &c1 } });
+            const y = try g.astype(try g.sliceAxis(got, 0, 0, 1), .float32);
+            try ops.eval(y);
+            out.* = y;
+        }
+        const x = mlx.mlx_array_data_float32(rows[0]).?[0 .. 8 * 2304];
+        const y = mlx.mlx_array_data_float32(rows[1]).?[0 .. 8 * 2304];
+        for (x, y) |u, v| try testing.expectApproxEqAbs(u, v, 1e-4 * @max(1, @abs(u)));
+    }
+    for (0..2) |round| {
+        var noise: [3]ops.Array = undefined;
+        var lane_in: [3]dflash2.Drafter.BlockLane = undefined;
+        var want: [3]ops.Array = undefined;
+        for (&noise, &lane_in, &want, 0..) |*nz, *lane, *row, j| {
+            const position = starts[j] + @as(c_int, @intCast(round)) * 3;
+            nz.* = try g.concat(&.{ anchors[j], try g.broadcast(d.mask, &.{ 1, 7, 2304 }) }, 1);
+            lane.* = .{ .taps = rings[j], .position = position, .cache = &batch[j] };
+            row.* = try d.blockRows(&g, nz.*, rings[j], position, &alone[j]);
+        }
+        const got = try d.blockRowsBatch(&g, try g.concat(&noise, 0), &lane_in);
+        for (want, 0..) |x, j| {
+            const at: c_int = @intCast(j);
+            const y = try g.sliceAxis(got, 0, at, at + 1);
+            const xf = try g.astype(x, .float32);
+            const yf = try g.astype(y, .float32);
+            try ops.evalMany(&.{ xf, yf });
+            const xs = mlx.mlx_array_data_float32(xf).?[0 .. 8 * 2304];
+            const ys = mlx.mlx_array_data_float32(yf).?[0 .. 8 * 2304];
+            var dot: f64 = 0;
+            var xx: f64 = 0;
+            var yy: f64 = 0;
+            for (xs, ys) |u, v| {
+                dot += @as(f64, u) * v;
+                xx += @as(f64, u) * u;
+                yy += @as(f64, v) * v;
+            }
+            // Other matmul tiles round differently (cos 0.996+ on NAX, 0.96+ on the M4 Max): a lane is its own, not its alone's bytes.
+            try testing.expect(dot / @sqrt(xx * yy) > 0.95);
+            try testing.expect(@sqrt(xx / yy) > 0.95 and @sqrt(xx / yy) < 1.05);
+        }
+    }
+    // Drawn: each lane's law sums to one over its candidates and holds the token drawn from it.
+    var lanes: [3]dflash2.Drafter.DraftLane = undefined;
+    for (&lanes, 0..) |*lane, j| lane.* = .{ .t1 = t1[j], .anchor = anchors[j], .taps = rings[j], .position = starts[j] + 6, .cache = &batch[j], .steps = @intCast(3 + 2 * j) };
+    var got: [3]draft.Drafter.Block = undefined;
+    try d.draftBatch(&g, &lanes, .{ .temperatures = &.{ 1.0, 0.8, 1.0 }, .seed = 5 }, &w.head.lin, w.head.vocab, &got);
+    for (got, 0..) |blk, j| {
+        const steps: usize = 3 + 2 * j;
+        try ops.evalMany(&.{ blk.tokens, blk.probs });
+        const toks = mlx.mlx_array_data_int32(blk.tokens).?[0..steps];
+        const law = mlx.mlx_array_data_float32(blk.probs).?;
+        const vocab: usize = @intCast(w.head.vocab);
+        for (0..steps) |r| {
+            var sum: f32 = 0;
+            for (law[r * vocab ..][0..vocab]) |x| sum += x;
+            try testing.expectApproxEqAbs(@as(f32, 1), sum, 1e-3);
+            try testing.expect(law[r * vocab + @as(usize, @intCast(toks[r]))] > 0);
+        }
+    }
+    for (&alone, &batch) |*x, *y| {
+        x.release();
+        y.release();
+    }
+}
+
+// Bar: `relsplit_lanes.metal` (non-NAX M3/M4 4-lane, 2..16-row single-pass kernel) matches `splitRead` across
+// sliding & global layers, direct & multi-split, 1..4 lanes, and 2..16 rows (both NR=1 and NR=2).
+test "inkling2 kernels: relsplit_lanes (M4) matches splitRead across lanes and rows" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    fx_stream = mlx.gpuStream();
+    const heads: c_int = 24;
+    const kv_heads: c_int = 8;
+    const hd: c_int = 128;
+    const d_rel: c_int = 16;
+    const r_ext: c_int = 1024;
+    var cfg: plugin.config.Config = undefined;
+    cfg.hidden_size = 2304;
+    cfg.num_attention_heads = @intCast(heads);
+    cfg.num_key_value_heads = @intCast(kv_heads);
+    cfg.head_dim = @intCast(hd);
+    cfg.d_rel = @intCast(d_rel);
+    cfg.sliding_window = 1024;
+    cfg.log_n_floor = 256;
+    cfg.log_alpha = 0.2;
+    const cached_at = [_]c_int{ 40, 700, 1500, 130 };
+    var seed: u64 = 81000;
+    for ([_]bool{ false, true }) |global| for ([_]c_int{ 2, 8, 12, 16 }) |rows| for ([_]usize{ 1, 4 }) |n| {
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 20;
+        const dt: ops.Dtype = .bfloat16;
+        var L: layers.Layer = undefined;
+        L.global = global;
+        L.rel_proj = try randomRow(&g, a, seed, &.{ d_rel, r_ext }, 0.3, dt);
+        const total: c_int = rows * @as(c_int, @intCast(n));
+        const q = try randomRow(&g, a, seed + 1, &.{ 1, total, heads, hd }, 0.6, dt);
+        const rel_st = try randomRow(&g, a, seed + 2, &.{ 1, total, heads, d_rel }, 0.5, dt);
+        const sinks = try randomRow(&g, a, seed + 3, &.{ 1, total, heads }, 1.0, dt);
+        const kb = try randomRow(&g, a, seed + 6, &.{ 1, kv_heads, total, hd }, 0.6, dt);
+        const vb = try randomRow(&g, a, seed + 7, &.{ 1, kv_heads, total, hd }, 1.0, dt);
+        const gate = try g.sigmoid(try randomRow(&g, a, seed + 8, &.{total * heads * hd}, 2.0, .float32));
+        var ks: [4]ops.Array = undefined;
+        var vs: [4]ops.Array = undefined;
+        var offsets: [4]c_int = undefined;
+        var want: [4]ops.Array = undefined;
+        for (0..n) |i| {
+            const cached = cached_at[i];
+            ks[i] = try randomRow(&g, a, seed + 30 + i, &.{ 1, kv_heads, cached, hd }, 0.6, dt);
+            vs[i] = try randomRow(&g, a, seed + 40 + i, &.{ 1, kv_heads, cached, hd }, 1.0, dt);
+            offsets[i] = cached;
+            const at: c_int = @as(c_int, @intCast(i)) * rows;
+            const from: c_int = if (global) 0 else @max(0, cached - 1023);
+            want[i] = (try kernels.splitRead(&g, &L, &cfg, try g.sliceAxis(q, 1, at, at + rows), try g.sliceAxis(rel_st, 1, at, at + rows), try g.sliceAxis(sinks, 1, at, at + rows), try g.sliceAxis(ks[i], 2, from, cached), try g.sliceAxis(vs[i], 2, from, cached), .{ try g.sliceAxis(kb, 2, at, at + rows), try g.sliceAxis(vb, 2, at, at + rows) }, cached, try g.sliceAxis(gate, 0, at * heads * hd, (at + rows) * heads * hd))) orelse return error.TestUnexpectedResult;
+        }
+        const got = (try kernels.splitReadLanesM4(&g, &L, &cfg, q, rel_st, sinks, ks[0..n], vs[0..n], .{ kb, vb }, offsets[0..n], gate, rows, null)) orelse return error.TestUnexpectedResult;
+        try expectClose(got, if (n == 1) want[0] else try g.concat(want[0..n], 1), 6e-2, "relsplit_lanes M4");
+    };
+}
+
+// Bar: `relsplit_lanes.metal` with `TREE=1` matches exact per-branch `splitRead` at EVERY node of the 8-node
+// branching tree `{-1, 0, 0, 1, 1, 2, 4, 5}` (sliding + global), isolating tree attention from fixture router ties.
+test "inkling2 kernels: relsplit_lanes TREE=1 matches per-branch splitRead at every node" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    fx_stream = mlx.gpuStream();
+    const heads: c_int = 24;
+    const kv_heads: c_int = 8;
+    const hd: c_int = 128;
+    const d_rel: c_int = 16;
+    const r_ext: c_int = 1024;
+    var cfg: plugin.config.Config = undefined;
+    cfg.hidden_size = 2304;
+    cfg.num_attention_heads = @intCast(heads);
+    cfg.num_key_value_heads = @intCast(kv_heads);
+    cfg.head_dim = @intCast(hd);
+    cfg.d_rel = @intCast(d_rel);
+    cfg.sliding_window = 1024;
+    cfg.log_n_floor = 256;
+    cfg.log_alpha = 0.2;
+    const W: usize = 8;
+    const par = [W]i32{ -1, 0, 0, 1, 1, 2, 4, 5 };
+    var meta: [W * 2]i32 = undefined;
+    for (0..W) |r| {
+        if (r == 0) {
+            meta[0] = 0;
+            meta[1] = 1;
+        } else {
+            const p: usize = @intCast(par[r]);
+            meta[r * 2 + 0] = meta[p * 2 + 0] + 1;
+            meta[r * 2 + 1] = meta[p * 2 + 1] | (@as(i32, 1) << @intCast(r));
+        }
+    }
+    var seed: u64 = 82500;
+    for ([_]bool{ false, true }) |global| for ([_]c_int{ 40, 700 }) |cached| {
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 20;
+        const dt: ops.Dtype = .bfloat16;
+        var L: layers.Layer = undefined;
+        L.global = global;
+        L.rel_proj = try randomRow(&g, a, seed, &.{ d_rel, r_ext }, 0.3, dt);
+        const q = try randomRow(&g, a, seed + 1, &.{ 1, W, heads, hd }, 0.6, dt);
+        const rel_st = try randomRow(&g, a, seed + 2, &.{ 1, W, heads, d_rel }, 0.5, dt);
+        const sinks = try randomRow(&g, a, seed + 3, &.{ 1, W, heads }, 1.0, dt);
+        const k = try randomRow(&g, a, seed + 4, &.{ 1, kv_heads, cached, hd }, 0.6, dt);
+        const v = try randomRow(&g, a, seed + 5, &.{ 1, kv_heads, cached, hd }, 1.0, dt);
+        const kb = try randomRow(&g, a, seed + 6, &.{ 1, kv_heads, W, hd }, 0.6, dt);
+        const vb = try randomRow(&g, a, seed + 7, &.{ 1, kv_heads, W, hd }, 1.0, dt);
+        const gate = try g.sigmoid(try randomRow(&g, a, seed + 8, &.{W * heads * hd}, 2.0, .float32));
+        const tmeta = try g.fromSlice(i32, &meta, &.{ W, 2 });
+        const got = (try kernels.splitReadLanesM4(&g, &L, &cfg, q, rel_st, sinks, &.{k}, &.{v}, .{ kb, vb }, &.{cached}, gate, W, tmeta)) orelse return error.TestUnexpectedResult;
+        const from: c_int = if (global) 0 else @max(0, cached - 1023);
+        const kc = try g.sliceAxis(k, 2, from, cached);
+        const vc = try g.sliceAxis(v, 2, from, cached);
+        for (1..W) |node| {
+            var chain: [W]i32 = undefined;
+            var len: usize = 0;
+            var cur: i32 = @intCast(node);
+            while (cur >= 0) {
+                chain[len] = cur;
+                len += 1;
+                cur = par[@intCast(cur)];
+            }
+            std.mem.reverse(i32, chain[0..len]);
+            const idx = try g.fromSlice(i32, chain[0..len], &.{@intCast(len)});
+            const q_c = try g.take(q, idx, 1);
+            const rel_c = try g.take(rel_st, idx, 1);
+            const sink_c = try g.take(sinks, idx, 1);
+            const kb_c = try g.take(kb, idx, 2);
+            const vb_c = try g.take(vb, idx, 2);
+            const gate_c = try g.reshape(try g.take(try g.reshape(gate, &.{ W, heads * hd }), idx, 0), &.{@as(c_int, @intCast(len)) * heads * hd});
+            const want_c = (try kernels.splitRead(&g, &L, &cfg, q_c, rel_c, sink_c, kc, vc, .{ kb_c, vb_c }, cached, gate_c)) orelse return error.TestUnexpectedResult;
+            const last: c_int = @intCast(len - 1);
+            const want_row = try g.sliceAxis(want_c, 1, last, last + 1);
+            const got_row = try g.sliceAxis(got, 1, @intCast(node), @intCast(node + 1));
+            try expectClose(got_row, want_row, 6e-2, "relsplit_lanes TREE=1 node");
+        }
+    };
+}
+
+// Bar: a forward's kernel instantiations do not move with its row count.
+test "inkling2 kernels: a forward of another length instantiates no kernel anew" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Setup.init(a, true);
+    defer s.deinit(a);
+    const saved = kernels.prove_past;
+    defer kernels.prove_past = saved;
+    kernels.prove_past = 0;
+    var tokens: [kernels.packed_rows + 9]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = prompt[i % prompt.len];
+    var counts: [3]usize = undefined;
+    for ([_]usize{ tokens.len - 2, tokens.len - 1, tokens.len }, &counts) |n, *count| {
+        var cache = try test_cache.TestCache.init(a, s.pack.parsed.shell.num_hidden_layers);
+        defer cache.deinit();
+        a.free(try step(a, &s.pack, &cache, tokens[0..n], 0, .last_row));
+        count.* = kernels.instantiations();
+    }
+    try testing.expect(counts[0] > 0);
+    try testing.expectEqual(counts[0], counts[1]);
+    try testing.expectEqual(counts[1], counts[2]);
+}
+
+// Bar: a branching draft tree verified in one forward (with `Open.tree`) produces the same logits at every node as
+// a fresh forward of that node's ancestor path, and committing a non-linear branch via `commitPath` leaves the cache
+// and conv windows identical to serial forward along that branch.
+test "inkling2 proof: branching tree verify and commitPath match serial forward along every branch" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Setup.init(a, true);
+    defer s.deinit(a);
+    const m: *plugin.Loaded = @ptrCast(@alignCast(s.pack.model));
+    const run_mod = @import("../../sdk/bases/run.zig");
+    const visits = s.pack.parsed.shell.num_hidden_layers;
+    const split: usize = 8;
+
+    // 8-node branching tree:
+    //   0 (root) -> 1, 2
+    //   1 -> 3, 4
+    //   2 -> 5
+    //   4 -> 6
+    //   5 -> 7
+    const W: usize = 8;
+    const tree_toks = [W]u32{ prompt[split], 10, 20, 11, 12, 21, 13, 22 };
+    const tree_par = [W]i32{ -1, 0, 0, 1, 1, 2, 4, 5 };
+    var tree_meta: [W * 2]i32 = undefined;
+    for (0..W) |r| {
+        if (r == 0) {
+            tree_meta[0] = 0;
+            tree_meta[1] = 1;
+        } else {
+            const p: usize = @intCast(tree_par[r]);
+            tree_meta[r * 2 + 0] = tree_meta[p * 2 + 0] + 1;
+            tree_meta[r * 2 + 1] = tree_meta[p * 2 + 1] | (@as(i32, 1) << @intCast(r));
+        }
+    }
+
+    var cache = try test_cache.TestCache.init(a, visits);
+    defer cache.deinit();
+    a.free(try step(a, &s.pack, &cache, prompt[0..split], 0, .last_row));
+
+    var g = ops.Graph.init(a, m.base.s);
+    defer g.deinit();
+    const opens = try a.alloc(kernels.Open, visits);
+    defer a.free(opens);
+    const tctx: kernels.TreeCtx = .{
+        .parent = try g.fromSlice(i32, &tree_par, &.{ 1, @intCast(W) }),
+        .meta = try g.fromSlice(i32, &tree_meta, &.{ @intCast(W), 2 }),
+    };
+    for (opens) |*o| o.* = .{ .g = &g, .tree = tctx };
+    var sp: plugin.Spec = .{ .visits = &.{}, .keep = 4 };
+    defer {
+        m.base.weights.spec = null;
+        for ([_]mlx.mlx_array{ sp.ring, sp.held }) |x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x);
+        };
+    }
+    m.base.weights.spec = &sp;
+    sp.opens = opens;
+    const tree_logits = try step(a, &s.pack, &cache, &tree_toks, split, .all_rows);
+    defer a.free(tree_logits);
+    sp.opens = null;
+
+    // Every tree node's logits must match serial forward along its ancestor chain.
+    for (0..W) |node| {
+        var chain: [W]u32 = undefined;
+        var len: usize = 0;
+        var cur: i32 = @intCast(node);
+        while (cur >= 0) {
+            chain[len] = tree_toks[@intCast(cur)];
+            len += 1;
+            cur = tree_par[@intCast(cur)];
+        }
+        std.mem.reverse(u32, chain[0..len]);
+        var serial = try test_cache.TestCache.init(a, visits);
+        defer serial.deinit();
+        a.free(try step(a, &s.pack, &serial, prompt[0..split], 0, .last_row));
+        const want = try step(a, &s.pack, &serial, chain[0..len], split, .last_row);
+        defer a.free(want);
+        const got_row = tree_logits[node * VOCAB .. (node + 1) * VOCAB];
+        try testing.expect(parity.qwen4CompareRows(got_row, want, 1, VOCAB).min_cos > 0.999);
+    }
+
+    // Commit non-linear branch {0, 2, 5, 7} and verify the next step matches serial forward along {0, 2, 5, 7}.
+    const branch = [_]u32{ 0, 2, 5, 7 };
+    const branch_toks = [_]u32{ tree_toks[0], tree_toks[2], tree_toks[5], tree_toks[7] };
+    const follow = [_]u32{33};
+    var h = [_]abi.Handle{cache.handle()};
+    const pos = [_]u32{split};
+    const cr: run_mod.Run = .{ .mode = .verify, .rows = @intCast(branch.len), .positions = &pos, .caches = &h, .cache_ops = &test_cache.ops };
+    var cc = cr.ctx(&g, &m.base.shared);
+    try kernels.commitPath(&cc, &m.base.weights.body.cfg, opens, &branch, 0, 1);
+    try testing.expectEqual(@as(u64, split + branch.len), test_cache.ops.len(cache.handle(), 0));
+    const got_next = try step(a, &s.pack, &cache, &follow, split + branch.len, .last_row);
+    defer a.free(got_next);
+
+    var serial = try test_cache.TestCache.init(a, visits);
+    defer serial.deinit();
+    a.free(try step(a, &s.pack, &serial, prompt[0..split], 0, .last_row));
+    a.free(try step(a, &s.pack, &serial, &branch_toks, split, .last_row));
+    const want_next = try step(a, &s.pack, &serial, &follow, split + branch.len, .last_row);
+    defer a.free(want_next);
+    try testing.expect(parity.qwen4CompareRows(got_next, want_next, 1, VOCAB).min_cos > 0.999);
+}
+
+// Bar: `sampleAndAcceptTree` matches greedy argmax (with suppress mask, stops, non-linear tree walk), enforces
+// top-k/top-p/min-p support cutoffs, and preserves the exact target distribution under multi-child without-replacement
+// sparse-16 rejection sampling.
+test "inkling2 kernels: sampleAndAcceptTree greedy, filtering, and exact multi-child distribution" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    fx_stream = mlx.gpuStream();
+    var g = ops.Graph.init(a, fx_stream);
+    defer g.deinit();
+
+    // 1. Greedy tree walk with suppress mask and non-linear branch {0 -> 2 -> 4}.
+    {
+        const V: c_int = 64;
+        const W: c_int = 6;
+        var logits = try a.alloc(f32, @intCast(W * V));
+        defer a.free(logits);
+        @memset(logits, -5.0);
+        // Row 0 prefers token 7 (suppressed!) and second-best token 20 (child 2).
+        logits[0 * V + 7] = 10.0;
+        logits[0 * V + 20] = 8.0;
+        // Row 2 prefers token 30 (child 4).
+        logits[2 * V + 30] = 9.0;
+        // Row 4 prefers token 45 (not a child -> becomes next_token).
+        logits[4 * V + 45] = 9.0;
+        var supp: [64]u8 = @splat(0);
+        supp[7] = 1;
+        const toks = try g.fromSlice(i32, &.{ 5, 10, 20, 11, 30, 31 }, &.{ 1, W });
+        const pars = try g.fromSlice(i32, &.{ -1, 0, 0, 1, 2, 2 }, &.{ 1, W });
+        const res = try kernels.sampleAndAcceptTree(
+            &g,
+            try g.fromSlice(f32, logits, &.{ W, V }),
+            V,
+            try g.adopt(mlx.mlx_array_new_data(&supp, &[_]c_int{V}, 1, .bool_)),
+            toks,
+            pars,
+            &.{.{ .temperature = 0.0, .accept_cap = 5 }},
+            W,
+            &.{2},
+            null,
+        );
+        try ops.eval(res);
+        const r = mlx.mlx_array_data_int32(res).?;
+        try testing.expectEqual(@as(i32, 2), r[0]); // accepted = 2
+        try testing.expectEqual(@as(i32, 45), r[1]); // next_token = 45
+        try testing.expectEqualSlices(i32, &.{ 0, 2, 4 }, r[2 .. 2 + 3]);
+        try testing.expectEqualSlices(i32, &.{ 5, 20, 30 }, r[2 + W .. 2 + W + 3]);
+    }
+
+    // 2. Statistical exactness of 4-child without-replacement sparse-16 rejection sampling on a 32-token vocab.
+    {
+        const V: usize = 32;
+        const K: usize = 16;
+        const W: c_int = 5;
+        const temp: f32 = 0.85;
+        var target_logits: [V]f32 = undefined;
+        var target_p: [V]f32 = undefined;
+        var max_l: f32 = -std.math.inf(f32);
+        for (0..V) |v| {
+            target_logits[v] = @as(f32, @floatFromInt(@as(i32, @intCast((v * 7) % 13)) - 6)) * 0.4;
+            max_l = @max(max_l, target_logits[v] / temp);
+        }
+        var sum_p: f32 = 0;
+        for (0..V) |v| {
+            target_p[v] = @exp(target_logits[v] / temp - max_l);
+            sum_p += target_p[v];
+        }
+        for (0..V) |v| target_p[v] /= sum_p;
+
+        // Deliberately mismatched draft proposal over first 16 tokens, 4 children placed at root: {0, 1, 2, 3}.
+        var q_row: [K]f32 = undefined;
+        var q_sum: f32 = 0;
+        for (0..K) |k| {
+            q_row[k] = 1.0 / @as(f32, @floatFromInt(k + 2));
+            q_sum += q_row[k];
+        }
+        for (0..K) |k| q_row[k] /= q_sum;
+
+        // Batch 16 lanes x 200 batches = 3200 independent draws at root row 0.
+        const B: usize = 16;
+        var counts: [V]u32 = @splat(0);
+        const total_draws: usize = B * 200;
+
+        var lg_buf = try a.alloc(f32, B * @as(usize, @intCast(W)) * V);
+        defer a.free(lg_buf);
+        for (0..B * @as(usize, @intCast(W))) |r| @memcpy(lg_buf[r * V ..][0..V], &target_logits);
+        const logits_arr = try g.fromSlice(f32, lg_buf, &.{ @intCast(B * @as(usize, @intCast(W))), @intCast(V) });
+
+        var tok_buf: [B * 5]i32 = undefined;
+        var par_buf: [B * 5]i32 = undefined;
+        var meta_buf: [B * 5 * 2]i32 = @splat(0);
+        var cand_buf: [B * 1 * K]i32 = undefined;
+        var nq_buf: [B * 5 * K]f32 = @splat(0);
+        var draw_buf: [B * 5 * 4]u8 = @splat(255);
+        for (0..B) |b| {
+            par_buf[b * 5 + 0] = -1;
+            par_buf[b * 5 + 1] = 0;
+            par_buf[b * 5 + 2] = 0;
+            par_buf[b * 5 + 3] = 0;
+            par_buf[b * 5 + 4] = 0;
+            for (0..K) |k| {
+                cand_buf[b * K + k] = @intCast(k);
+                nq_buf[(b * 5 + 0) * K + k] = q_row[k];
+            }
+        }
+        const pars_arr = try g.fromSlice(i32, &par_buf, &.{ @intCast(B), W });
+        const meta_arr = try g.fromSlice(i32, &meta_buf, &.{ @intCast(B * 5), 2 });
+        const cand_arr = try g.fromSlice(i32, &cand_buf, &.{ @intCast(B), 1, @intCast(K) });
+        const nq_arr = try g.fromSlice(f32, &nq_buf, &.{ @intCast(B), W, @intCast(K) });
+        var prng = std.Random.DefaultPrng.init(0x5a3b);
+        const rng = prng.random();
+        for (0..200) |iter| {
+            var sl: [B]kernels.SampleLane = undefined;
+            for (0..B) |b| {
+                // Draw 4 distinct candidates without replacement from q_row (exact without-replacement proposal).
+                var used: [K]bool = @splat(false);
+                var rem: f32 = 1.0;
+                tok_buf[b * 5 + 0] = 0;
+                for (0..4) |ch| {
+                    var u = rng.float(f32) * rem;
+                    var pick: usize = K - 1;
+                    for (0..K) |k| {
+                        if (used[k]) continue;
+                        u -= q_row[k];
+                        if (u <= 0) {
+                            pick = k;
+                            break;
+                        }
+                    }
+                    used[pick] = true;
+                    rem -= q_row[pick];
+                    tok_buf[b * 5 + 1 + ch] = @intCast(pick);
+                    draw_buf[(b * 5 + 0) * 4 + ch] = @intCast(pick);
+                }
+                sl[b] = .{ .temperature = temp, .top_k = 0, .top_p = 1.0, .min_p = 0.0, .seed = @as(u64, iter * B + b) *% 0x9E3779B97F4A7C15 + 1, .accept_cap = 1 };
+            }
+            var ig = g.scope();
+            defer ig.deinit();
+            const ti: kernels.SampleTreeIn = .{
+                .tmeta = meta_arr,
+                .cands = cand_arr,
+                .next_q = nq_arr,
+                .draws = try ig.adopt(mlx.mlx_array_new_data(&draw_buf, &[_]c_int{ @intCast(B), W, 4 }, 3, .uint8)),
+                .r = 1,
+                .k = @intCast(K),
+            };
+            const res = try kernels.sampleAndAcceptTree(&ig, logits_arr, @intCast(V), .{}, try ig.fromSlice(i32, &tok_buf, &.{ @intCast(B), W }), pars_arr, &sl, W, &.{}, ti);
+            try ops.eval(res);
+            const rdata = mlx.mlx_array_data_int32(res).?;
+            const stride = 2 + 2 * @as(usize, @intCast(W));
+            for (0..B) |b| {
+                const row = rdata[b * stride .. (b + 1) * stride];
+                // Root selection is emitted_tokens[1] if accepted == 1 else next_token.
+                const drawn: usize = @intCast(if (row[0] == 1) row[2 + @as(usize, @intCast(W)) + 1] else row[1]);
+                counts[drawn] += 1;
+            }
+        }
+        var max_err: f32 = 0;
+        for (0..V) |v| {
+            const emp = @as(f32, @floatFromInt(counts[v])) / @as(f32, @floatFromInt(total_draws));
+            max_err = @max(max_err, @abs(emp - target_p[v]));
+        }
+        try testing.expect(max_err < 0.025);
+    }
+}
+
+// Bar: the bundled head keeps too few drafts a round for a group past two slots to beat plain batched decode; the
+// DFlash2 draft's groups pay to the GPU's width.
+test "inkling2 plugin: a group of the bundled head's slots is two wide, of DFlash2's the GPU's" {
+    try testing.expectEqual(@as(u32, 2), plugin.groupWidth(false, true));
+    try testing.expectEqual(@as(u32, 2), plugin.groupWidth(false, false));
+    try testing.expectEqual(@as(u32, 16), plugin.groupWidth(true, true));
+    try testing.expectEqual(@as(u32, 8), plugin.groupWidth(true, false));
+}
+
+test "inkling2 plugin: a lane's tree rows follow the device, the lanes and the sampling" {
+    const nax = @import("../../mlx/device.zig").naxAvailable();
+    try testing.expectEqual(@as(u32, 8), plugin.treeWidth(1, false));
+    try testing.expectEqual(@as(u32, if (nax) 8 else 5), plugin.treeWidth(2, false));
+    try testing.expectEqual(@as(u32, if (nax) 6 else 5), plugin.treeWidth(4, false));
+    try testing.expectEqual(@as(u32, if (nax) 6 else 4), plugin.treeWidth(16, false));
+    try testing.expectEqual(@as(u32, if (nax) 6 else 8), plugin.treeWidth(1, true));
+    try testing.expectEqual(@as(u32, 5), plugin.treeWidth(4, true));
+    try testing.expectEqual(@as(u32, 4), plugin.treeWidth(8, true));
 }
 
 /// The command-buffer pair a fake host holds.

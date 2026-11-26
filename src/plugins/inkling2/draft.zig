@@ -43,7 +43,10 @@ pub const Layer = struct {
 };
 
 /// The drafter's layers a context cache holds.
-pub const max_layers = 4;
+pub const max_layers = config.max_draft_layers;
+/// The width and group of the drafter's copy of a dense trunk head.
+const draft_head_bits = 8;
+const draft_head_group = 64;
 
 /// The drafter's context keys and values a layer (`[1, kv_heads, rows, hd]`, normed and rotated at their positions)
 /// for the positions before `end`, kept across one slot's rounds: a round projects only the rows committed since. It
@@ -60,6 +63,26 @@ pub const ContextKv = struct {
     full_end: u64 = 0,
     /// The buffers' growth, in positions.
     chunk: c_int = 4096,
+
+    /// Keeps the full context of the positions before `at` and drops the ring's keys and values (re-projected from the
+    /// ring at the next draft).
+    pub fn cut(c: *ContextKv, at: u64) void {
+        for (c.k ++ c.v) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
+        c.k = @splat(.{});
+        c.v = @splat(.{});
+        c.end = 0;
+        if (at < c.full_from) {
+            for (c.fk ++ c.fv) |a| if (a.ctx != null) {
+                _ = mlx.mlx_array_free(a);
+            };
+            c.fk = @splat(.{});
+            c.fv = @splat(.{});
+            c.full_from = 0;
+            c.full_end = 0;
+        } else c.full_end = @min(c.full_end, at);
+    }
 
     pub fn release(c: *ContextKv) void {
         for (c.k ++ c.v ++ c.fk ++ c.fv) |a| if (a.ctx != null) {
@@ -89,6 +112,8 @@ pub const Drafter = struct {
     rnn_norm: Array = .{},
     fold: Array = .{},
     fold_bias: Array = .{},
+    /// An 8-bit copy of a dense trunk head, which the block rows are read through (`draftHead`); null = the trunk's.
+    head: ?Linear = null,
 
     /// The drafter beside the pack, its Markov head folded over the trunk's `head`; null when the pack ships none.
     pub fn load(ctx: *const abi.LoadCtx, cfg: config.Draft, hidden: u32, head: *const Linear, s: mlx.mlx_stream) !?*Drafter {
@@ -102,7 +127,7 @@ pub const Drafter = struct {
         errdefer d.release();
         var g = Graph.init(gpa, s);
         defer g.deinit();
-        var at: At = .{ .d = d, .w = &w, .g = &g };
+        var at: At = .{ .owned = &d.owned, .w = &w, .g = &g };
 
         if (cfg.layers > max_layers) return error.Inkling2DraftGeometry;
         d.layers = try gpa.alloc(Layer, cfg.layers);
@@ -145,6 +170,7 @@ pub const Drafter = struct {
         const out_b = try at.raw("markov_head.hidden_out.bias");
         d.fold = try at.keep(try g.reshape(try project(&g, head, try g.reshape(try g.transpose(out_w, &.{ 1, 0 }), &.{ 1, rank, @intCast(hidden) })), &.{ rank, -1 }));
         d.fold_bias = try at.keep(try project(&g, head, try g.reshape(out_b, &.{ 1, 1, @intCast(hidden) })));
+        d.head = try at.draftHead(head);
         return d;
     }
 
@@ -175,10 +201,11 @@ pub const Drafter = struct {
         return if (at) |p| g.rope(h, @intCast(d.cfg.head_dim), d.cfg.theta, p) else h;
     }
 
-    /// Appends the full layers' context keys and values of the taps `[1, n, taps * hidden]` at positions `first`.. to
-    /// `cc` (restarted when it ends elsewhere), queued on the GPU.
-    pub fn appendFull(d: *const Drafter, g: *Graph, cc: *ContextKv, taps: Array, first: u64) !void {
-        const n = ops.shape(taps)[1];
+    /// Appends the full layers' context keys and values of the taps at positions `first`.. to `cc` (restarted when it
+    /// ends elsewhere), queued on the GPU. `parts` side by side are the taps `[1, n, taps * hidden]`: a prompt's are
+    /// joined a slice of rows at a time, never whole.
+    pub fn appendFull(d: *const Drafter, g: *Graph, cc: *ContextKv, parts: []const Array, first: u64) !void {
+        const n = ops.shape(parts[0])[1];
         if (n == 0) return;
         const restart = cc.full_end != first;
         if (restart) cc.full_from = first;
@@ -209,7 +236,7 @@ pub const Drafter = struct {
             var r0: c_int = 0;
             while (r0 < n) : (r0 += 1024) {
                 const r1 = @min(n, r0 + 1024);
-                const rows32 = try lg.astype(try lg.reshape(try lg.sliceAxis(taps, 1, r0, r1), &.{ 1, r1 - r0, @intCast(d.cfg.tap_count), @intCast(d.hidden) }), .float32);
+                const rows32 = try lg.astype(try lg.reshape(try sideBySide(&lg, parts, r0, r1), &.{ 1, r1 - r0, @intCast(d.cfg.tap_count), @intCast(d.hidden) }), .float32);
                 const context = try d.mix(&lg, rows32, @intCast(i), L.mix_norm);
                 const k = try d.heads(&lg, try project(&lg, &L.k_ctx, context), d.cfg.kv_heads, L.k_norm_ctx, @as(c_int, @intCast(first)) + r0);
                 const v = try d.heads(&lg, try project(&lg, &L.v_ctx, context), d.cfg.kv_heads, null, null);
@@ -230,13 +257,24 @@ pub const Drafter = struct {
         try mlx.check(mlx.mlx_async_eval(vec));
     }
 
-    /// A drafted block: its tokens `[block - 1]` int32 and the drafter's probability of each `[block - 1]` f32, lazy.
-    pub const Block = struct { tokens: Array, confidence: Array };
+    /// Rows `r0` to `r1` of `parts`, side by side.
+    pub fn sideBySide(g: *Graph, parts: []const Array, r0: c_int, r1: c_int) !Array {
+        var rows: [config.max_taps]Array = undefined;
+        for (parts, rows[0..parts.len]) |x, *r| r.* = try g.sliceAxis(x, 1, r0, r1);
+        return if (parts.len == 1) rows[0] else g.concat(rows[0..parts.len], 2);
+    }
+
+    /// A drafted block: its tokens `[block - 1]` int32 and the drafter's probability of each `[block - 1]` f32, lazy;
+    /// drawn under a `Law`, the law each was drawn from `[block - 1, vocab]` f32 and, as the confidence, its peak.
+    pub const Block = struct { tokens: Array, confidence: Array, probs: Array = .{} };
+
+    /// `steps` drafts drawn from the drafter's soft-capped softmax at `temperature`, each keyed by `seed` and its index.
+    pub const Law = struct { temperature: f32, seed: u64, steps: u32 = std.math.maxInt(u32) };
 
     /// The `block - 1` tokens drafted after the committed token `t1` (`[1]` int32) at position `position`. `anchor` `[1, 1, hidden]` is `t1`'s normed embedding, `taps` `[1, n, taps * hidden]` the trunk's
     /// taps at the `n >= 1` positions before `position`, `head` the trunk's LM head, `vocab` its real rows and `softcap` its
 /// logit soft cap. `cache` carries the context's keys and values over the slot's rounds (null: projected afresh).
-    pub fn draft(d: *const Drafter, g: *Graph, t1: Array, anchor: Array, taps: Array, position: c_int, head: *const Linear, vocab: c_int, softcap: f32, cache: ?*ContextKv) !Block {
+    pub fn draft(d: *const Drafter, g: *Graph, t1: Array, anchor: Array, taps: Array, position: c_int, head: *const Linear, vocab: c_int, softcap: f32, cache: ?*ContextKv, law: ?Law) !Block {
         const cfg = &d.cfg;
         const hidden: c_int = @intCast(d.hidden);
         const block: c_int = @intCast(cfg.block);
@@ -333,19 +371,21 @@ pub const Drafter = struct {
             const mlp = try project(&lg, &L.down, try lg.mul(try lg.silu(try project(&lg, &L.gate, y)), try project(&lg, &L.up, y)));
             h = try g.keep(try lg.add(mid, mlp));
         }
-        const rows = try g.sliceAxis(try g.rmsNorm(h, d.norm, cfg.eps), 1, 1, block);
-        const base = try g.astype(try project(g, head, rows), .float32);
+        const drafts: c_int = if (law) |l| @min(block - 1, @as(c_int, @intCast(@min(l.steps, block - 1)))) else block - 1;
+        const rows = try g.sliceAxis(try g.rmsNorm(h, d.norm, cfg.eps), 1, 1, 1 + drafts);
+        const base = try g.astype(try project(g, if (d.head) |*own| own else head, rows), .float32);
 
         if (cache) |cc| cc.end = at;
         // The RNN restarts each block from the newest committed position's mix.
         const newest = try d.mix(g, try tapsOf(g, taps, n - 1, n, cfg.tap_count, hidden), @intCast(d.layers.len), d.rnn_norm);
-        return d.markov(g, t1, rows, newest, base, vocab, softcap, kernels.markovRuns(g, d.rnn.w, d.fold, rank));
+        return d.markov(g, t1, rows, newest, base, vocab, softcap, kernels.markovRuns(g, d.rnn.w, d.fold, rank), law);
     }
 
     /// The Markov head's chain over the block rows `rows` `[1, block - 1, hidden]` and their head logits `base` f32,
     /// from the committed token `t1` and the newest mix `newest` `[1, 1, hidden]`: each step's token and probability.
-    /// `fused` runs a step as `kernels.markovStep`'s three launches, else as the op chain.
-    pub fn markov(d: *const Drafter, g: *Graph, t1: Array, rows: Array, newest: Array, base: Array, vocab: c_int, softcap: f32, fused: bool) !Block {
+    /// `fused` runs an argmax step as `kernels.markovStep`'s three launches, else as the op chain; a `law` draws each step
+    /// on the op chain, which keeps the whole row.
+    pub fn markov(d: *const Drafter, g: *Graph, t1: Array, rows: Array, newest: Array, base: Array, vocab: c_int, softcap: f32, fused: bool, law: ?Law) !Block {
         const rank: c_int = @intCast(d.cfg.rank);
         const steps: usize = @intCast(ops.shape(rows)[1]);
         const dt = ops.dtype(d.norm);
@@ -353,10 +393,11 @@ pub const Drafter = struct {
         var prev = t1;
         var drafted: [abi.max_round_tokens]Array = undefined;
         var sure: [abi.max_round_tokens]Array = undefined;
+        var probs: [abi.max_round_tokens]Array = undefined;
         const dense_rows = try g.contiguous(rows);
         for (0..steps) |i| {
             const at: c_int = @intCast(i);
-            if (fused) {
+            if (fused and law == null) {
                 const st = try kernels.markovStep(g, d.rnn.w, d.rnn_bias, state, d.prev_rows, dense_rows, newest, prev, d.fold, d.fold_bias, base, at, vocab, softcap);
                 state = st.state;
                 prev = st.token;
@@ -374,47 +415,84 @@ pub const Drafter = struct {
             const bias = try g.astype(try g.add(try g.matmul(latent, d.fold), d.fold_bias), .float32);
             // The soft cap is monotonic: the pick over the real rows is the capped logits'; the probability is not.
             const logits = try g.sliceAxis(try g.add(try g.sliceAxis(base, 1, at, at + 1), bias), 2, 0, vocab);
-            prev = try g.astype(try g.reshape(try g.argmax(logits, -1, false), &.{1}), .int32);
-            drafted[i] = prev;
             const capped = if (softcap > 0) try g.mulScalar(try g.tanh(try g.mulScalar(logits, 1.0 / softcap)), softcap) else logits;
-            sure[i] = try g.reshape(try g.exp(try g.sub(try g.max(capped, -1, false), try g.call(mlx.mlx_logsumexp_axis, .{ capped, -1, false }))), &.{1});
+            if (law) |l| {
+                const scaled = try g.mulScalar(capped, 1.0 / l.temperature);
+                const key = try g.call(mlx.mlx_random_key, .{l.seed +% @as(u64, i) *% 0x9E3779B97F4A7C15});
+                prev = try g.astype(try g.reshape(try g.call(mlx.mlx_random_categorical, .{ scaled, @as(c_int, -1), key }), &.{1}), .int32);
+                probs[i] = try g.reshape(try g.softmax(scaled, -1, true), &.{ 1, vocab });
+                // How sure the law is (its peak), the argmax step's measure: a drawn token's own probability is not.
+                sure[i] = try g.reshape(try g.max(probs[i], -1, false), &.{1});
+            } else {
+                prev = try g.astype(try g.reshape(try g.argmax(logits, -1, false), &.{1}), .int32);
+                sure[i] = try g.reshape(try g.exp(try g.sub(try g.max(capped, -1, false), try g.call(mlx.mlx_logsumexp_axis, .{ capped, -1, false }))), &.{1});
+            }
+            drafted[i] = prev;
         }
-        return .{ .tokens = try g.concat(drafted[0..steps], 0), .confidence = try g.concat(sure[0..steps], 0) };
+        return .{
+            .tokens = try g.concat(drafted[0..steps], 0),
+            .confidence = try g.concat(sure[0..steps], 0),
+            .probs = if (law != null) try g.concat(probs[0..steps], 0) else .{},
+        };
     }
 };
 
+/// A dense `head` as the affine 8-bit weight the drafter reads (owned by `g`); null for a quantized one.
+pub fn headCopy(g: *Graph, head: *const Linear) !?Linear {
+    if (head.s.ctx != null) return null;
+    var parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts);
+    try mlx.check(mlx.mlx_quantize(&parts, head.w, mlx.mlx_optional_int.some(draft_head_group), mlx.mlx_optional_int.some(draft_head_bits), "affine", .{}, g.s));
+    var own: Linear = .{ .bits = draft_head_bits, .group_size = draft_head_group };
+    inline for (.{ &own.w, &own.s, &own.b }, 0..) |dst, i| {
+        var x = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&x, parts, i));
+        dst.* = try g.adopt(x);
+    }
+    return own;
+}
+
 /// Reads the sidecar's tensors (a layer's under `layers.N.`), owned by the drafter.
-const At = struct {
-    d: *Drafter,
+pub const At = struct {
+    owned: *std.ArrayList(Array),
     w: *const Weights,
     g: *Graph,
     layer: ?u32 = null,
 
     /// A new handle the graph owns.
-    fn raw(a: At, leaf: []const u8) !Array {
+    pub fn raw(a: At, leaf: []const u8) !Array {
         var buf: [160]u8 = undefined;
         const name = if (a.layer) |i| try std.fmt.bufPrint(&buf, "layers.{d}.{s}", .{ i, leaf }) else leaf;
         const x = a.w.get(name) orelse return error.MissingWeight;
         return a.g.keep(x);
     }
 
-    fn keep(a: At, x: Array) !Array {
+    pub fn keep(a: At, x: Array) !Array {
         try ops.eval(x);
         const out = a.g.escape(x);
-        try a.d.owned.append(gpa, out);
+        try a.owned.append(gpa, out);
         return out;
     }
 
-    fn need(a: At, leaf: []const u8) !Array {
+    pub fn need(a: At, leaf: []const u8) !Array {
         return a.keep(try a.raw(leaf));
     }
 
-    fn float(a: At, leaf: []const u8) !Array {
+    pub fn float(a: At, leaf: []const u8) !Array {
         return a.keep(try a.g.astype(try a.raw(leaf), .float32));
     }
 
+    /// The head the block rows are read through: a dense trunk head as an affine 8-bit copy in groups of 64, owned
+    /// by the drafter; null for a quantized one, read as it is. The rows are drafts (the trunk verifies each one),
+    /// and the head is a round's largest read: at 8 bits it is half the bytes.
+    pub fn draftHead(a: At, head: *const Linear) !?Linear {
+        var own = (try headCopy(a.g, head)) orelse return null;
+        for ([_]*Array{ &own.w, &own.s, &own.b }) |x| x.* = try a.keep(x.*);
+        return own;
+    }
+
     /// A projection in the checkpoint's layout, `[out, in]`.
-    fn linear(a: At, base: []const u8) !Linear {
+    pub fn linear(a: At, base: []const u8) !Linear {
         var buf: [160]u8 = undefined;
         return .{ .w = try a.need(try std.fmt.bufPrint(&buf, "{s}.weight", .{base})) };
     }

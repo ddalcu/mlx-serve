@@ -14,6 +14,7 @@ const round_cost = @import("../spec/round_cost.zig");
 const context = @import("../admission/context.zig");
 const mtp_group_planner = @import("../spec/mtp_group_planner.zig");
 const dflash_policy = @import("../spec/dflash/policy.zig");
+const spec_rounds = @import("../../../sdk/spec/rounds.zig");
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ForwardCtx = transformer_mod.ForwardCtx;
@@ -182,6 +183,12 @@ pub fn initWithOptions(
     const owned_src = pickLookupPromptSource(prompt_ids, options.lookup_prompt);
     const prompt_owned = try allocator.dupe(u32, owned_src);
     errdefer allocator.free(prompt_owned);
+    // A native drafter's state continues the finished slot whose sequence this prompt repeats furthest
+    // (`SamplingParams.repeats`: not for a request that must answer the same twice).
+    if (!sampling.repeats()) if (plugin_driver.adoptFor(xfm, prompt_owned)) |a| {
+        ctx.adopt_slot = a.slot;
+        ctx.adopt_len = a.len;
+    };
 
     // Split prefill: process first N-1 tokens (cache-only, skip lm_head eval),
     // then the last token (produces logits for sampling). This mirrors mlx-lm's
@@ -1019,8 +1026,10 @@ pub fn initWithOptions(
             .dspark_enabled = dspark_active,
             .dspark_stochastic = dspark_stochastic,
             // A streamed EXL3 bank verifies the whole block on a greedy request: its verify costs about a plain tick.
-            // A plugin's drafter opens with the plain rounds that time one, then drafts while its rounds pay.
-            .dspark_pol = if (!dspark_active) null else if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else if (plugin_driver.nativeDrafter(xfm) != null) .{ .plain = .unmeasured, .drafting = .{ .owed = 4 } } else null,
+            // A plugin's drafter runs the rounds its load's ladder prices; a load not timed yet decodes plainly.
+            .dspark_pol = if (!dspark_active) null else if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else if (plugin_driver.nativeDrafter(xfm) != null) .{
+                .rounds = if (xfm.plugin.?.ladder) |l| .{ .ladder = l, .acc = .{ .prior = if (dspark_stochastic) spec_rounds.Acceptance.SAMPLED else spec_rounds.Acceptance.GREEDY } } else null,
+            } else null,
             .drafter = if (drafter_active) options.drafter else null,
             .drafter_block_size = options.drafter_block_size,
             .dflash = if (dflash_active) options.dflash else null,

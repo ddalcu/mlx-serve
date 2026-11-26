@@ -1,11 +1,13 @@
 // Inkling 2, up to 8 rows behind a cache: relattn.metal's read split over the keys, the G = HQ / HKV query heads of a
 // KV head sharing each K/V tile (MLX's attention reads the keys once per row and head). grid (splits * 32 G, HKV, 1),
 // threadgroup (32 G, 1, 1): a threadgroup takes keys [first + split * KPS, + KPS) of one KV head, SIMD group g its
-// query head kv * G + g, the rows as one 8-row fragment. q [1, HQ, L, D] and k, v [1, HKV, S, D] (T, any strides over
-// a unit last axis), the rows at the last L keys; rel [1, L, HQ, R] (T) each row's bias at the distances below R;
-// sinks [1, L, HQ] f32, the first split starting each row from its sink; sizes = { L, S, first }. WINDOW > 0 keeps
-// the keys fewer than WINDOW behind a row. PART [splits, L, HQ, D] f32 = the unnormalised sums, ML [splits, L, HQ, 2]
-// f32 = each row's running max (log2 units) and sum.
+// query head kv * G + g, the rows as one 8-row fragment. q [1, HQ, L, D] and the keys and values (T, any strides over
+// a unit last axis), the rows at the last L of the S keys: k, v [1, HKV, ., D] hold the first SC keys and kb, vb the
+// ones after them (a verify's own rows, behind a cache it does not append to; SC = S reads k, v alone). rel
+// [1, L, HQ, R] (T) each row's bias at the distances below R; sinks [1, L, HQ] f32, the first split starting each
+// row from its sink; sizes = { L, S, first, SC }. WINDOW > 0 keeps the keys fewer than WINDOW behind a row.
+// PART [splits, L, HQ, D] f32 = the unnormalised sums, ML [splits, L, HQ, 2] f32 = each row's running max (log2
+// units) and sum.
 constexpr float LOG2E = 1.4426950408889634f;
 constexpr int BK = 16;
 constexpr int LDK = BK + 8;
@@ -13,6 +15,7 @@ constexpr int LDV = D + 8;
 constexpr int G = HQ / HKV;
 const int L = sizes[0];
 const int S = sizes[1];
+const int SC = sizes[3];
 const int split = threadgroup_position_in_grid.x;
 const int kvh = threadgroup_position_in_grid.y;
 const uint tid = thread_position_in_threadgroup.x;
@@ -50,6 +53,8 @@ if (split == 0 && row_ok) {
 const device T* bias = rel + (size_t(row_ok ? fm : 0) * HQ + head) * R;
 const device T* k_head = k + kvh * k_strides[1];
 const device T* v_head = v + kvh * v_strides[1];
+const device T* kb_head = kb + kvh * kb_strides[1];
+const device T* vb_head = vb + kvh * vb_strides[1];
 for (int k0 = kbeg; k0 < kend; k0 += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int c = tid; c < BK * D / 8; c += 32 * G) {
@@ -59,8 +64,9 @@ for (int k0 = kbeg; k0 < kend; k0 += BK) {
         vec<T, 4> kv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
         vec<T, 4> vv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
         if (key < kend) {
-            auto kp = (const device vec<T, 4>*)(k_head + key * k_strides[2] + col);
-            auto vp = (const device vec<T, 4>*)(v_head + key * v_strides[2] + col);
+            const bool own = key >= SC;
+            auto kp = (const device vec<T, 4>*)((own ? kb_head + (key - SC) * kb_strides[2] : k_head + key * k_strides[2]) + col);
+            auto vp = (const device vec<T, 4>*)((own ? vb_head + (key - SC) * vb_strides[2] : v_head + key * v_strides[2]) + col);
             kv[0] = kp[0]; kv[1] = kp[1]; vv[0] = vp[0]; vv[1] = vp[1];
         }
         for (int j = 0; j < 8; ++j) {

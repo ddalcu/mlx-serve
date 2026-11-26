@@ -116,6 +116,11 @@ Attention + KV:
 - **Allocator cache**: `mlx_clear_cache()` per CHUNK and per emitted block, un-skippable (#110): `applyMlxCacheLimit` once in `main()`; cadence interval-based; `Generator.advanceStep` is the one step mover; `finishSlot` clears the tail.
 - **Hybrid-SSM prefix cache retains ~3.4× what it reports** (lever = ENTRY COUNT, `ramCappedPrefixCacheEntries`). SSM-checkpoint stride never sub-divides the chunk; dense hd-256 chunk cap 8192, MoE 4096.
 - **Hybrid prefix candidates rank by RESTORABLE SSM position** (`findBestRestorableMatch`). The always-on SSM snapshot sits `SSM_SNAPSHOT_BACKOFF` (30) tokens BEFORE prompt end.
+- **A re-rendered answer re-tokenizes, and a sampled answer need not be canonical** (`" ----" "--------"` against
+  `" " "--------" "----"`): the prompt takes the cache's spelling where the bytes agree (`respell`), never across an
+  added token, never for a greedy or seeded request; its media items move with it. Without it a miss re-read it all.
+- **A sliding-ring entry keeps only checkpoints its ring can restore** (`mergeCheckpointLists` drops those below
+  `ringFloor` before the cap thins): spread over 440K, the cap thinned away the one turn-end checkpoint inside the ring.
 - **A committed turn also snapshots where decode stopped** (`appendDecodeEndCheckpoint`, image turns too), so the next round resumes after the generated tail; a plain pipelined step forwarded its stop and a lookahead, so it rolls back to its lagged state first (`rollbackSsmTo`); an in-place arch keeps no lag and keys the two (`forwarded_stop`). Guards: `tests/test_cache_reuses_generated_tokens.sh`, `tests/test_decode_end_media_reuse.sh`.
 - **A restored tail inside the backoff window forwards as ONE span** (`ssmSnapshotBackoff(…, restored)`): same prompt warm == cold BYTES. Guard: `tests/test_hybrid_reuse_equivalence.sh`.
 - **INT4 long-greedy divergence is legit**; byte-stable greedy ⇒ no spec + `--kv-quant off/8`. A prefix-cache HIT is not bit-identical on a HYBRID (≤0.047 nats; GLM-5.3 low-margin tokens move >1 nat with chunk width, numerics not state) ⇒ `--prefix-cache-entries 0`.
@@ -132,6 +137,17 @@ Spec decode:
 - **A sparse target's DFlash is policy-driven** (`engines/mlx/spec/dflash/policy.zig`, GLM): rows follow the selector's calibrated confidence, plain ticks ride the serial pipeline with their taps parked (`dflash_pending`), and the plain cost is the REQUEST's own tick interval — the shared round-cost table's plain cell ran stale-high and the policy never stepped back.
 - **A native drafter's round is handed the request's stop ids and never verifies one** (`Forward.stop_ids`): the trunk's own
   token carries the stop, as in serial decode; a kept stop row left no decode-end entry, and an agent re-prefilled its context.
+- **A native drafter's copy is looked up where a round may not run** (`copyAhead` over the committed tail): checked only
+  in drafted rounds, a sampled request whose policy had stopped drafting never copied a repeated file. A repeated prompt
+  also copies from the earlier answer (`adoptFor`'s tail, indexed before the prompt).
+- **A greedy or seeded request takes nothing an earlier request left** (`SamplingParams.repeats`: no adopted drafter
+  state, no earlier answer to copy): with either its rounds line up otherwise, a verify row's logits part in the low
+  bits, and the same request answered differently twice. Alone it repeats; beside others its group follows arrivals.
+- **A native drafter's rounds are priced on a ladder its load times once, never on a clock inside a request**
+  (`sdk/spec/rounds.zig`: `Timing` through `warm_requests.timeRounds`, a `Controller` per request over its own
+  acceptance counts): wall-clock samples sent a seed to plain decode or wide rounds by boot. Untimed = plain steps.
+- **A pipelined step is timed as the mean of a run of ticks, a round as its least** (`rounds.Timing`): pipelined ticks
+  trade time with each other, and the least tick read the step a quarter short, which prices every round as a loss.
 - **A block decoder checks its ENTRY token first** (`generate.tokenStops`, all five); only an ALL-pad generation declines commit (`commitDeclinesPadOnly`); a cancel mid batched tick still RECORDS the row (`batchedTickAction`).
 - **The token budget is a PRE-COMMIT invariant in every block decoder**; blocks publish through ONE `+= 1` loop.
 - **A spec path that refuses a KV scheme must be gated at LOAD, or implemented**: `compactRows` refused quantized KV mid-decode, so a draft tree under `--kv-quant 8` 500'd the second request. Guard: smoke `drafter_kv8`.
@@ -237,3 +253,6 @@ Kernels + numerics:
 - **Tokenizer**: special-token splitting only in `Tokenizer.encode` (first-byte buckets); any per-position loop over a vocab-derived collection needs an index.
 - **Upgrades**: mlx-c → diff `lib/mlxc-src/mlx/c/*.h` vs `src/mlx/ffi.zig`; ds4 → re-sync `engines/ds4/ffi.zig` EngineOptions + CORE_OBJS; NAX presence asserted, never assumed.
 - **ANE prefill (opt-in, M4-and-below, LOSSY)**: rules in `docs/reference.md` "ANE prefill rules"; parity = per-program cos/rms + perceived-content equivalence; `ready: N/M` under-count = silent partial coverage. Guard: `tests/test_ane_prefill.sh`.
+- **Slots of a served drafter verify as ONE group round, sampled or greedy** (`spec/native_group.zig`, `dspark.nativeGroupRound`): the plugin opens every slot's block as one forward (`NativeDrafter.verify_group`), the accepts start together (sampled: `acceptStartProbs`, one filter block when the slots filter alike; greedy: `greedyPicks`, one argmax block), each slot accepts under its own sampling. A slot the controller sends plain rides it on its one row; `specYieldTick` keeps group-capable slots from yielding to plain decode up to `NativeDrafter.group_width`. `MLX_SERVE_NATIVE_GROUPS=0` = a slot's round after another.
+- **A drafter that serves `NativeDrafter.step_group` runs the whole round itself** (draft, verify, accept, commit; `nativeStepGroup`): the engine hands each slot its sampling filters and seed, takes the committed tokens back, and falls to verify_group/finish_group when the plugin answers `unsupported`; a keyed-serial sampler and the load's ladder timing never take it.
+- **A default-on kill switch is read with `env.notOff`**: `env.on` is false when the variable is unset (the group rounds ran in no server that did not set it).
