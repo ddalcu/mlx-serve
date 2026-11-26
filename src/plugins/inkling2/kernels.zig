@@ -62,7 +62,7 @@ pub var ups_grp_kernel: Kernel = .{ .name = "msv_inkling2_ups_grp", .ins = &.{ "
 pub var downs_grp_kernel: Kernel = .{ .name = "msv_inkling2_downs_grp", .ins = &.{ "ACT", "WQ", "WS", "WB", "TEXP", "TCNT", "TPICK" }, .outs = &.{"DN"}, .source = kernelSource("plugins/inkling2/kernels/downs_grp.metal"), .header = bank_header };
 pub var relattn_kernel: Kernel = .{ .name = "msv_inkling2_relattn", .ins = &.{ "q", "k", "v", "rel", "sinks", "key_start", "sizes", "scale" }, .outs = &.{"out"}, .source = kernelSource("plugins/inkling2/kernels/relattn.metal"), .contiguous = false };
 pub var router_kernel: Kernel = .{ .name = "msv_inkling2_router", .ins = &.{ "X", "RT" }, .outs = &.{"SC"}, .source = kernelSource("plugins/inkling2/kernels/router.metal") };
-pub var relattn_nax_kernel: Kernel = .{ .name = "msv_inkling2_relattn_nax", .ins = &.{ "q", "k", "v", "rel", "sinks", "sizes", "scale" }, .outs = &.{"out"}, .source = kernelSource("plugins/inkling2/kernels/relattn_nax.metal"), .header = kernelSource("kernels/common/mpp_tensor_ops.metal"), .contiguous = false };
+pub var relattn_nax_kernel: Kernel = .{ .name = "msv_inkling2_relattn_nax", .ins = &.{ "q", "k", "v", "rel", "rproj", "sinks", "sizes", "scale" }, .outs = &.{"out"}, .source = kernelSource("plugins/inkling2/kernels/relattn_nax.metal"), .header = kernelSource("kernels/common/mpp_tensor_ops.metal"), .contiguous = false };
 pub var relsplit_nax_kernel: Kernel = .{ .name = "msv_inkling2_relsplit_nax", .ins = &.{ "q", "k0", "k1", "k2", "k3", "v0", "v1", "v2", "v3", "kb", "vb", "rel", "sinks", "GATE", "TMETA", "sizes", "params" }, .outs = &.{ "PART", "ML", "OUT" }, .source = kernelSource("plugins/inkling2/kernels/relsplit_nax.metal"), .header = kernelSource("kernels/common/mpp_tensor_ops.metal"), .contiguous = false };
 pub var relsplit_lanes_kernel: Kernel = .{ .name = "msv_inkling2_relsplit_lanes", .ins = &.{ "q", "k0", "k1", "k2", "k3", "v0", "v1", "v2", "v3", "kb", "vb", "rel", "sinks", "GATE", "TMETA", "sizes", "params" }, .outs = &.{ "PART", "ML", "OUT" }, .source = kernelSource("plugins/inkling2/kernels/relsplit_lanes.metal"), .header = lanes_header, .contiguous = false };
 pub var relsplit_kernel: Kernel = .{ .name = "msv_inkling2_relsplit", .ins = &.{ "q", "k", "v", "kb", "vb", "rel", "sinks", "sizes", "scale" }, .outs = &.{ "PART", "ML" }, .source = kernelSource("plugins/inkling2/kernels/relsplit.metal"), .contiguous = false };
@@ -477,6 +477,11 @@ pub fn relative(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, r
     return o[0];
 }
 
+fn relProjT(g: *Graph, L: *const Layer, dt: Dtype) !Array {
+    if (L.rel_proj_t.ctx != null and ops.dtype(L.rel_proj_t) == dt) return L.rel_proj_t;
+    return g.contiguous(try g.astype(try g.transpose(L.rel_proj, &.{ 1, 0 }), dt));
+}
+
 /// `relative`'s read of a prompt's rows on the NAX tensor unit (`relattn_nax.metal`): `[1, S, H, hd]`, null where it does
 /// not serve the read (a GPU without NAX, a dtype but half or bfloat16, a head width off 16).
 pub fn relativeNax(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, rel_states: Array, sinks: Array, k: Array, v: Array, offset: c_int) !?Array {
@@ -484,13 +489,22 @@ pub fn relativeNax(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array
     const hd: c_int = @intCast(cfg.head_dim);
     if ((dt != .bfloat16 and dt != .float16) or ops.dtype(k) != dt or ops.dtype(v) != dt or @rem(hd, 16) != 0) return null;
     if (!mlx.streamIsGpu(g.s) or !enabled() or !@import("../../mlx/device.zig").naxAvailable()) return null;
-    const in = try readInputs(g, L, cfg, q_rows, rel_states, sinks, offset);
-    return try naxRead(g, in.q, k, v, in.bias, in.sinks, if (L.global) 0 else @intCast(cfg.sliding_window));
+    const s = ops.shape(q_rows)[1];
+    var q = try g.transpose(q_rows, &.{ 0, 2, 1, 3 });
+    var states = rel_states;
+    if (L.global and offset + s > @as(c_int, @intCast(cfg.log_n_floor))) {
+        const tau = try g.adopt(try rel.inklingLogScaleTau(g.s, offset, s, cfg.log_n_floor, cfg.log_alpha));
+        q = try g.astype(try g.mul(try g.astype(q, .float32), tau), dt);
+        states = try g.astype(try g.mul(try g.astype(states, .float32), try g.reshape(tau, &.{ 1, s, 1, 1 })), dt);
+    }
+    const rproj = try relProjT(g, L, dt);
+    const sink_rows = try g.contiguous(try g.astype(sinks, .float32));
+    return try naxRead(g, q, k, v, try g.contiguous(states), rproj, sink_rows, if (L.global) 0 else @intCast(cfg.sliding_window));
 }
 
-/// `relattn_nax.metal` over prepared inputs: `q` `[1, H, S, hd]`, `k` and `v` `[1, Hkv, keys, hd]`, `bias` `[1, S, H, R]`
-/// and `sinks` `[1, S, H]` f32; `window` 0 on a global layer. `[1, S, H, hd]` in q's dtype.
-pub fn naxRead(g: *Graph, q: Array, k: Array, v: Array, bias: Array, sinks: Array, window: c_int) !Array {
+/// `relattn_nax.metal` over prepared inputs: `q` `[1, H, S, hd]`, `k` and `v` `[1, Hkv, keys, hd]`, `rel_states`
+/// `[1, S, H, d_rel]`, `rproj` `[R, d_rel]` and `sinks` `[1, S, H]` f32; `window` 0 on a global layer. `[1, S, H, hd]`.
+pub fn naxRead(g: *Graph, q: Array, k: Array, v: Array, rel_states: Array, rproj: Array, sinks: Array, window: c_int) !Array {
     const dt = ops.dtype(q);
     const sh = ops.shape(q);
     const heads = sh[1];
@@ -498,11 +512,12 @@ pub fn naxRead(g: *Graph, q: Array, k: Array, v: Array, bias: Array, sinks: Arra
     const hd = sh[3];
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     const o = try launchGrid(g, &relattn_nax_kernel, &.{
-        q, k, v, bias, sinks, try g.fromSlice(i32, &.{ s, ops.shape(k)[2] }, &.{2}), try g.scalar(scale, .float32),
+        q, k, v, rel_states, rproj, sinks, try g.fromSlice(i32, &.{ s, ops.shape(k)[2] }, &.{2}), try g.scalar(scale, .float32),
     }, 1, .{.{ .shape = &.{ 1, s, heads, hd }, .dtype = dt }}, .{ @divTrunc(s + 63, 64) * 128, heads, 1 }, .{ 128, 1, 1 }, &.{
-        .{ "T", .{ .dtype = dt } },           .{ "D", .{ .int = hd } },
-        .{ "HQ", .{ .int = heads } },         .{ "HKV", .{ .int = ops.shape(k)[1] } },
-        .{ "R", .{ .int = ops.shape(bias)[3] } }, .{ "WINDOW", .{ .int = window } },
+        .{ "T", .{ .dtype = dt } },                .{ "D", .{ .int = hd } },
+        .{ "HQ", .{ .int = heads } },              .{ "HKV", .{ .int = ops.shape(k)[1] } },
+        .{ "R", .{ .int = ops.shape(rproj)[0] } }, .{ "DREL", .{ .int = ops.shape(rproj)[1] } },
+        .{ "WINDOW", .{ .int = window } },
     });
     return o[0];
 }

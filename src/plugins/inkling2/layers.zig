@@ -63,8 +63,10 @@ pub const Layer = struct {
     /// `[heads, head_dim]` and `[heads, d_rel]`.
     q_scale: Array,
     rel_scale: Array,
-    /// `[d_rel, extent]`, and the same f32 with its columns reversed (the one-row step's bias, newest key last).
+    /// `[d_rel, extent]`, its contiguous `[extent, d_rel]` transpose for on-the-fly NAX bias, and the f32 column-reversed
+    /// copy (the one-row step's bias, newest key last).
     rel_proj: Array,
+    rel_proj_t: Array = .{},
     rel_proj_rev: Array,
     k_conv: Conv,
     v_conv: Conv,

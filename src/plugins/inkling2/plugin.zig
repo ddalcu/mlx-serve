@@ -1411,6 +1411,7 @@ fn loadLayer(at: At, c: *const config.Config, i: u32) !layers.Layer {
     var g = ops.Graph.init(gpa, at.r.s);
     defer g.deinit();
     const extent = ops.shape(rel_proj)[1];
+    const rel_proj_t = try at.keep(&g, try g.contiguous(try g.transpose(rel_proj, &.{ 1, 0 })));
     const rel_proj_rev = try at.keep(&g, try g.take(try g.astype(rel_proj, .float32), try g.arange(@floatFromInt(extent - 1), -1, -1, .int32), 1));
     var L: layers.Layer = .{
         .global = global,
@@ -1429,6 +1430,7 @@ fn loadLayer(at: At, c: *const config.Config, i: u32) !layers.Layer {
         .q_scale = try at.need("self_attn.q_l2_clip.scale", "attn.q_l2_clip.scale"),
         .rel_scale = try at.need("self_attn.rel_l2_clip.scale", "attn.rel_l2_clip.scale"),
         .rel_proj = rel_proj,
+        .rel_proj_t = rel_proj_t,
         .rel_proj_rev = rel_proj_rev,
         .k_conv = try at.conv("k", global, hidden),
         .v_conv = try at.conv("v", global, hidden),

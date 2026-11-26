@@ -1402,7 +1402,8 @@ const RelSplit = struct {
     }
 };
 
-const nax_launch = metal.Launch{ .name = "msv_inkling2_relattn_nax", .inputs = &.{ "q", "k", "v", "rel", "sinks", "sizes", "scale" }, .outputs = &.{"out"}, .source = source("plugins/inkling2/kernels/relattn_nax.metal"), .header = source("kernels/common/mpp_tensor_ops.metal"), .contiguous = false, .tg_bytes = 0, .m1 = 1024, .m2 = 1024, .offline = false, .min_gen = 17 };
+const NAX_DREL = 16;
+const nax_launch = metal.Launch{ .name = "msv_inkling2_relattn_nax", .inputs = &.{ "q", "k", "v", "rel", "rproj", "sinks", "sizes", "scale" }, .outputs = &.{"out"}, .source = source("plugins/inkling2/kernels/relattn_nax.metal"), .header = source("kernels/common/mpp_tensor_ops.metal"), .contiguous = false, .tg_bytes = 0, .m1 = 1024, .m2 = 1024, .offline = false, .min_gen = 17 };
 const NAX_ROWS = 16;
 const NAX_BK = 32;
 
@@ -1416,14 +1417,15 @@ const RelNax = struct {
     dt: mlx.mlx_dtype,
     window: usize,
     shape: Shape = undefined,
-    /// `[HQ, L, SD]`, `[HKV, S, SD]` twice, `[L, HQ, R]`, `[L, HQ]`.
+    /// `[HQ, L, SD]`, `[HKV, S, SD]` twice, `[L, HQ, NAX_DREL]`, `[R, NAX_DREL]`, `[L, HQ]`.
     q: []f64 = &.{},
     k: []f64 = &.{},
     v: []f64 = &.{},
     rel: []f64 = &.{},
+    rproj: []f64 = &.{},
     sinks: []f64 = &.{},
     scale: f64 = @as(f32, 1.0 / @sqrt(@as(f32, SD))),
-    args: [7]mlx.mlx_array = undefined,
+    args: [8]mlx.mlx_array = undefined,
     msg: [256]u8 = undefined,
 
     const Self = @This();
@@ -1447,6 +1449,7 @@ const RelNax = struct {
         g.int("HQ", hq);
         g.int("HKV", @as(c_int, @intCast(shape.n)));
         g.int("R", @as(c_int, R));
+        g.int("DREL", @as(c_int, NAX_DREL));
         g.int("WINDOW", @as(c_int, @intCast(self.window)));
         return g;
     }
@@ -1463,7 +1466,8 @@ const RelNax = struct {
         self.q = try host.uniform(a, rng, hq * shape.rows * SD, -2, 2, self.dt);
         self.k = try host.uniform(a, rng, shape.n * shape.k * SD, -2, 2, self.dt);
         self.v = try host.uniform(a, rng, shape.n * shape.k * SD, -2, 2, self.dt);
-        self.rel = try host.uniform(a, rng, shape.rows * hq * R, -2, 2, self.dt);
+        self.rel = try host.uniform(a, rng, shape.rows * hq * NAX_DREL, -1, 1, self.dt);
+        self.rproj = try host.uniform(a, rng, R * NAX_DREL, -0.5, 0.5, self.dt);
         self.sinks = try host.uniform(a, rng, shape.rows * hq, -3, 3, .float32);
         if (fill == .nonfinite) {
             host.plant(self.q, hq * shape.rows, SD);
@@ -1479,7 +1483,8 @@ const RelNax = struct {
             try self.rig.input(self.dt, &.{ 1, ci(hq), ci(shape.rows), SD }, self.q),
             try self.rig.input(self.dt, &.{ 1, ci(shape.n), ci(shape.k), SD }, self.k),
             try self.rig.input(self.dt, &.{ 1, ci(shape.n), ci(shape.k), SD }, self.v),
-            try self.rig.input(self.dt, &.{ 1, ci(shape.rows), ci(hq), R }, self.rel),
+            try self.rig.input(self.dt, &.{ 1, ci(shape.rows), ci(hq), NAX_DREL }, self.rel),
+            try self.rig.input(self.dt, &.{ R, NAX_DREL }, self.rproj),
             try self.rig.input(.float32, &.{ 1, ci(shape.rows), ci(hq) }, self.sinks),
             try self.rig.input(.int32, &.{2}, &.{ @floatFromInt(shape.rows), @floatFromInt(shape.k) }),
             try self.rig.scalar(@floatCast(self.scale)),
@@ -1542,9 +1547,21 @@ const RelNax = struct {
                     }
                     const k = self.k[(kv * keys_n + j) * SD ..][0..SD];
                     const d = attn.dot(q, k, qs, SD, 1, null, terms);
-                    const b: f64 = if (at - j < R) @as(f64, @as(f32, @floatCast(self.rel[(r * hq + h) * R + at - j] * LOG2E))) else 0;
+                    var b: f64 = 0;
+                    var bmag: f64 = 0;
+                    if (at - j < R) {
+                        const rs = self.rel[(r * hq + h) * NAX_DREL ..][0..NAX_DREL];
+                        const rp = self.rproj[(at - j) * NAX_DREL ..][0..NAX_DREL];
+                        for (rs, rp) |rx, ry| {
+                            const t = rx * ry;
+                            b += t;
+                            bmag += @abs(t);
+                        }
+                        b *= LOG2E;
+                        bmag *= LOG2E;
+                    }
                     const sv = d.v + b;
-                    keys[n] = .{ .s = sv, .e = d.e + host.U * (@abs(b) + @abs(sv)), .v = vrow };
+                    keys[n] = .{ .s = sv, .e = d.e + host.U * (@as(f64, NAX_DREL + 2) * bmag + @abs(sv)), .v = vrow };
                     n += 1;
                 }
                 ends[nb] = n;
@@ -1580,7 +1597,7 @@ const RelNax = struct {
         var g = ops.Graph.init(self.rig.a, self.rig.stream());
         defer g.deinit();
         const x = self.args;
-        const out = [_]mlx.mlx_array{try kernels.naxRead(&g, x[0], x[1], x[2], x[3], x[4], @intCast(self.window))};
+        const out = [_]mlx.mlx_array{try kernels.naxRead(&g, x[0], x[1], x[2], x[3], x[4], x[5], @intCast(self.window))};
         return self.rig.bytesOf(&out);
     }
 };
