@@ -12,7 +12,6 @@ const ssmFreeQsaState = @import("../../../plugins/qwen4_exp/qsa/history.zig").ss
 const attn256MaxDiff = @import("../../../sdk/blocks/attention/attn256.zig").attn256MaxDiff;
 const attn256RandBf16 = @import("../../../sdk/blocks/attention/attn256.zig").attn256RandBf16;
 const KVCache = @import("../kv/cache.zig").KVCache;
-const KVCacheSnapshot = @import("../kv/cache.zig").KVCacheSnapshot;
 const testing = @import("../kv/cache.zig").testing;
 const SSMCacheEntry = @import("entry.zig").SSMCacheEntry;
 const SSMCacheEntrySnapshot = @import("entry.zig").SSMCacheEntrySnapshot;
@@ -50,21 +49,12 @@ pub const SSMCheckpoint = struct {
     /// layers (plain attention) get a null-handle snapshot which is a no-op
     /// in `ssmRestore`.
     layers: []SSMCacheEntrySnapshot,
-    /// The sliding rings' rows a restore at `pos` reads (`KVCache.ringTail`), on the prompt's last checkpoint only:
-    /// decode moves the rings past it.
-    ring: ?KVCacheSnapshot = null,
 
     pub fn deinit(self: *SSMCheckpoint, allocator: std.mem.Allocator) void {
         for (self.layers) |*l| ssmSnapshotDeinit(l);
         allocator.free(self.layers);
         self.layers = &[_]SSMCacheEntrySnapshot{};
         self.pos = 0;
-        self.dropRing();
-    }
-
-    pub fn dropRing(self: *SSMCheckpoint) void {
-        if (self.ring) |*r| r.deinit();
-        self.ring = null;
     }
 };
 
@@ -275,7 +265,7 @@ pub fn restoreSsmCheckpoint(
 /// all layers). Used for hot-cache memory budgeting alongside `KVCacheSnapshot`
 /// bytes.
 pub fn ssmCheckpointBytes(cp: *const SSMCheckpoint) u64 {
-    var total: u64 = if (cp.ring) |*r| r.bytes() else 0;
+    var total: u64 = 0;
     for (cp.layers) |l| {
         inline for (.{ l.conv_state, l.ssm_state, l.aux_state, l.qsa_pooled }) |arr| {
             if (arr.ctx != null) total += @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));

@@ -121,8 +121,8 @@ Attention + KV:
   added token, never for a greedy or seeded request; its media items move with it. Without it a miss re-read it all.
 - **A sliding-ring entry keeps only checkpoints its ring can restore** (`mergeCheckpointLists` drops those below
   `ringFloor` before the cap thins): spread over 440K, the cap thinned away the one turn-end checkpoint inside the ring.
-- **The prompt's last checkpoint carries its rings' window** (`KVCache.ringTail`, kept below the floor by
-  `keepNeededRingTail`): decode moves a ring past its prompt, and a turn that left a long answer early re-read it all.
+- **An entry keeps its rings' window at the prompt's end** (`Entry.ring_tail` from `KVCache.ringTail`; a hybrid's ends
+  at its last checkpoint): decode moves a ring past its prompt, and a turn that left the answer early re-read it all.
 - **A committed turn also snapshots where decode stopped** (`appendDecodeEndCheckpoint`, image turns too), so the next round resumes after the generated tail; a plain pipelined step forwarded its stop and a lookahead, so it rolls back to its lagged state first (`rollbackSsmTo`); an in-place arch keeps no lag and keys the two (`forwarded_stop`). Guards: `tests/test_cache_reuses_generated_tokens.sh`, `tests/test_decode_end_media_reuse.sh`.
 - **A restored tail inside the backoff window forwards as ONE span** (`ssmSnapshotBackoff(…, restored)`): same prompt warm == cold BYTES. Guard: `tests/test_hybrid_reuse_equivalence.sh`.
 - **INT4 long-greedy divergence is legit**; byte-stable greedy ⇒ no spec + `--kv-quant off/8`. A prefix-cache HIT is not bit-identical on a HYBRID (≤0.047 nats; GLM-5.3 low-margin tokens move >1 nat with chunk width, numerics not state) ⇒ `--prefix-cache-entries 0`.

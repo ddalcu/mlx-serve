@@ -1718,12 +1718,12 @@ threadgroup once per instantiation in a 256-entry table, and a full table re-pro
 Fix: the kernels read the count from their inputs' shapes, and the table holds 2048. Rule: a template argument never
 carries a launch's shape. Guard: `inkling2 kernels: a forward of another length instantiates no kernel anew`.
 
-### A turn that left a long answer early re-read the whole context on a sliding-ring hybrid (#1291)
+### A turn that left a long answer early re-read the whole context on a sliding-ring model (#1291)
 Defect: Inkling 2 agent sessions re-prefilled 67k-235k tokens on 29 of 462 turns (`hybrid miss (no checkpoint ≤ 90183
-of 90552)`, `sliding ring holds rows from 88032`), 37 minutes of cold prefill in 4 hours. Cause: the history matched
-into the previous answer and left it; the only checkpoint below the match was the prompt's (30 tokens before its end),
-and decode had moved every sliding ring past the window that checkpoint reads, so the commit dropped it and the match
-fell back to cold. Fix: the prompt's last checkpoint copies its rings' window (`KVCache.ringTail`, ~170 MB on Inkling,
-billed); the commit keeps the newest one below the entry's ring floor and the restore binds it
-(`restoreRingTail`). Non-hybrid ring archs (no checkpoints) are not covered yet. Guard: `HotPrefixCache: a prompt
-that leaves a long answer early restores the rings' rows kept at its prompt end`.
+of 90552)`, `sliding ring holds rows from 88032`); Gemma 4 26B re-prefilled the whole context on EVERY follow-up after a
+reply past ~2K tokens (its template drops the thought, so the history leaves the reply at its first token). Cause: decode
+moves every sliding ring past the window a restore at the prompt's end reads, so no state below the match was
+restorable. Fix: the prefill keeps the rings' window at the prompt's end (`KVCache.ringTail`; a hybrid's at its last
+checkpoint), the entry holds it while its own rings cannot restore there (`Entry.ring_tail`, billed) and the restore
+binds it (`restoreRingTail`). Guards: `HotPrefixCache: a prompt that leaves a long answer early restores the rings' rows
+kept at its prompt end`, `... a plain-attention ring restores at the prompt's end after a long answer moved it`.

@@ -221,18 +221,21 @@ pub const KVCache = struct {
         self.step = snap.step;
     }
 
-    /// What a restore at `pos` needs from every sliding ring, copied: the window behind `pos` (one row more, from a
-    /// `ring_drop_align` boundary), the other layers left empty. Decode moves a ring past its prompt, so a later turn
-    /// that leaves the answer early restores here (`restoreRingTail`). Null when no ring holds those rows.
-    pub fn ringTail(self: *const KVCache, pos: usize, s: mlx.mlx_stream) !?KVCacheSnapshot {
+    /// What a restore at `pos` (null: where the rings stand) needs from every sliding ring, copied: the window behind
+    /// it and `tail_slack` rows more, from a `ring_drop_align` boundary; the other layers left empty. Decode moves a
+    /// ring past its prompt, so a later turn that leaves the answer early restores here (`restoreRingTail`). Null when
+    /// no ring holds those rows.
+    pub fn ringTail(self: *const KVCache, at: ?usize, s: mlx.mlx_stream) !?KVCacheSnapshot {
         const out = try self.allocator.alloc(KVCacheEntry, self.entries.len);
         for (out) |*e| e.* = newEmptyKVEntry();
-        var snap: KVCacheSnapshot = .{ .entries = out, .step = pos, .allocator = self.allocator, .config = self.config };
+        var snap: KVCacheSnapshot = .{ .entries = out, .step = 0, .allocator = self.allocator, .config = self.config };
         errdefer snap.deinit();
         var rings: usize = 0;
         for (self.entries, out) |src, *dst| {
             if (!src.initialized or src.keep == 0 or src.window == 0) continue;
-            const from = (pos -| (src.window + 1)) / ring_drop_align * ring_drop_align;
+            const pos = at orelse src.offset;
+            snap.step = pos;
+            const from = (pos -| (src.window + tail_slack)) / ring_drop_align * ring_drop_align;
             if (from < src.base or pos > src.offset) {
                 snap.deinit();
                 return null;
@@ -645,6 +648,9 @@ pub const KVCache = struct {
 
     /// A grow: the capacity to allocate, and which of the current rows move into it.
     const Grow = struct { cap: c_int, drop: usize, kept: usize };
+
+    /// Rows a `ringTail` keeps past the window: a next prompt matches a few tokens short of the last one's end.
+    pub const tail_slack = 32;
 
     /// A sliding ring drops rows in whole blocks of this many, so a whole-buffer view keeps the absolute key-block
     /// boundaries of the hd-256 band kernel (`attn256.metal` BK) and sums as a full buffer does, bit for bit.

@@ -7,6 +7,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const log = @import("../../../sdk/util/log.zig");
+const KVCacheSnapshot = @import("../kv/cache.zig").KVCacheSnapshot;
 const io_util = @import("../../../sdk/util/io_util.zig");
 const mtp_mod = @import("../../../sdk/spec/mtp/mtp.zig");
 const mtp_acceptance = @import("../../../sdk/spec/mtp_acceptance.zig");
@@ -914,24 +915,27 @@ pub fn initWithOptions(
         _ = mlx.mlx_array_free(captured_hidden);
     };
 
-    // The prompt's last checkpoint keeps the rows its sliding rings hold now: decode moves the rings past it.
-    if (ssm_checkpoints.items.len > 0) {
-        const last = &ssm_checkpoints.items[ssm_checkpoints.items.len - 1];
-        last.ring = ctx.cache.ringTail(last.pos, xfm.s) catch |e| blk: {
-            log.debug("[hot-cache] no ring tail at {d}: {s}\n", .{ last.pos, @errorName(e) });
-            break :blk null;
-        };
-    }
+    // The rows a restore at the prompt's end reads from the sliding rings: decode moves the rings past them. A hybrid
+    // restores at a checkpoint, so its rows end at the last one.
+    var ring_tail: ?KVCacheSnapshot = null;
+    errdefer if (ring_tail) |*t| t.deinit();
+    const tail_at: ?usize = if (ssm_checkpoints.items.len > 0) ssm_checkpoints.items[ssm_checkpoints.items.len - 1].pos else if (ctx.ssm_entries != null) 0 else null;
+    if (tail_at != 0) ring_tail = ctx.cache.ringTail(tail_at, xfm.s) catch |e| blk: {
+        log.debug("[hot-cache] no ring tail: {s}\n", .{@errorName(e)});
+        break :blk null;
+    };
 
     // Attach the SSM-checkpoint buffer to whichever Generator variant
     // we're about to return. Clears the local list so the errdefer above
     // doesn't double-free. All four init paths below call this once
     // before returning their Generator.
     const attachCp = struct {
-        fn f(g: *Generator, list: *std.ArrayList(SSMCheckpoint), a: std.mem.Allocator) void {
+        fn f(g: *Generator, list: *std.ArrayList(SSMCheckpoint), tail: *?KVCacheSnapshot, a: std.mem.Allocator) void {
             g.ssm_checkpoints = list.*;
             g.ssm_checkpoint_alloc = a;
             list.* = std.ArrayList(SSMCheckpoint).empty;
+            g.ring_tail = tail.*;
+            tail.* = null;
         }
     }.f;
 
@@ -973,7 +977,7 @@ pub fn initWithOptions(
         };
         gen.pending_logits = logits;
         gen.has_pending_logits = true;
-        attachCp(&gen, &ssm_checkpoints, allocator);
+        attachCp(&gen, &ssm_checkpoints, &ring_tail, allocator);
         return gen;
     }
 
@@ -1067,7 +1071,7 @@ pub fn initWithOptions(
         // pending_logits/pending_token left empty — the lazy pipeline is
         // skipped under PLD / drafter / MTP. The speculative `next*` paths
         // drive every subsequent step with predictable cache offset.
-        attachCp(&gen, &ssm_checkpoints, allocator);
+        attachCp(&gen, &ssm_checkpoints, &ring_tail, allocator);
         return gen;
     }
 
@@ -1108,7 +1112,7 @@ pub fn initWithOptions(
         };
         gen.pending_logits = logits;
         gen.has_pending_logits = true;
-        attachCp(&gen, &ssm_checkpoints, allocator);
+        attachCp(&gen, &ssm_checkpoints, &ring_tail, allocator);
         return gen;
     }
     if (options.skip_lazy_preforward) {
@@ -1151,7 +1155,7 @@ pub fn initWithOptions(
             .prompt_ids_owned = prompt_owned,
             .prompt_ids_alloc = allocator,
         };
-        attachCp(&gen, &ssm_checkpoints, allocator);
+        attachCp(&gen, &ssm_checkpoints, &ring_tail, allocator);
         return gen;
     }
 
@@ -1212,7 +1216,7 @@ pub fn initWithOptions(
     gen.pending_logits = next_logits;
     gen.has_pending_logits = true;
 
-    attachCp(&gen, &ssm_checkpoints, allocator);
+    attachCp(&gen, &ssm_checkpoints, &ring_tail, allocator);
     return gen;
 }
 
