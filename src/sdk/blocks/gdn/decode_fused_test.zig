@@ -1256,6 +1256,43 @@ test "qwen4_exp GDN: a slow-decay head forgets at its own rate on every arm" {
     try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(cold.ssm_state));
 }
 
+test "qwen4_exp GDN: a projection op that fails returns MlxError and frees only the arrays it made" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xFA17);
+    var A_log = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&A_log, &[_]c_int{8}, 1, .bfloat16, s));
+    var dt_bias = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&dt_bias, &[_]c_int{8}, 1, .bfloat16, s));
+    var rig: Qwen4GdnRig = undefined;
+    try rig.init(A_log, dt_bias, prng.random(), s);
+    defer rig.deinit();
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_ones(&x, &[_]c_int{ 1, 4, 1 }, 3, .bfloat16, s));
+
+    var e = SSMCacheEntry{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+    defer inline for (.{ e.conv_state, e.ssm_state }) |a| if (a.ctx != null) {
+        _ = mlx.mlx_array_free(a);
+    };
+    _ = mlx.mlx_array_free(try rig.xfm.gatedDeltaNetProjected(x, &rig.la, &e, 0, 1, 4, true, null, true));
+
+    const before = mlx.op_count.load(.monotonic);
+    const proj = try rig.xfm.gdnProjGpu(x, &rig.la);
+    for ([_]mlx.mlx_array{ proj.qkv, proj.z, try rig.xfm.qmatmul(x, rig.la.a_w, rig.la.a_s, rig.la.a_b), try rig.xfm.qmatmul(x, rig.la.b_w, rig.la.b_s, rig.la.b_b) }) |a| _ = mlx.mlx_array_free(a);
+    const proj_ops = mlx.op_count.load(.monotonic) - before;
+    try testing.expect(proj_ops > 1);
+
+    var k: u64 = 1;
+    while (k <= proj_ops) : (k += 1) {
+        mlx.fault.arm(k);
+        const r = rig.xfm.gatedDeltaNetProjected(x, &rig.la, &e, 0, 1, 4, true, null, true);
+        mlx.fault.disarm();
+        try testing.expect(mlx.fault.didFire());
+        try testing.expectError(error.MlxError, r);
+    }
+}
+
 test "qwen4_exp GDN: verify windows, batched rows and a prefill-width dispatch equal serial decode bit for bit" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
