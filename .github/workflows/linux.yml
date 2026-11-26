@@ -149,6 +149,16 @@ jobs:
           path: .zig-toolchain
           key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}
 
+      # build-linux.sh rebuilds it unless the stamp matches: the key hashes every input the stamp does.
+      - name: Restore libjinja
+        id: jinja
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            lib/jinja_cpp/libjinja-linux.a
+            lib/jinja_cpp/.linux-version
+          key: jinja-linux-${{ matrix.name }}-${{ env.ZIG_CPU }}-${{ hashFiles('lib/jinja_cpp/*.cpp', 'lib/jinja_cpp/*.h', 'lib/jinja_cpp/nlohmann/*.hpp', 'scripts/fetch-zig.sh', 'scripts/build-linux.sh', 'scripts/build-mlx-linux.sh') }}
+
       # With both stages cached the build compiles only mlx-serve, which needs no toolkit.
       - name: Is the build only mlx-serve
         id: warm
@@ -165,8 +175,8 @@ jobs:
 
       # Not cached: the .debs are ~4 GB per arch, and two of them pushed the repo past
       # GitHub's 10 GB cache limit, evicting the MLX stage (an hour to rebuild).
-      # Warm: the stage scripts still check for nvcc, cmake, LAPACKE and the cuDNN header
-      # before they find the stamp, and the ldd gate below needs the runtime libraries
+      # Warm: the build scripts still check for nvcc, cmake, LAPACKE and the cuDNN header
+      # before they find the stamps, and the ldd gate below needs the runtime libraries
       # libmlx.so (cublasLt, cufft, cusolver, nvrtc, cudnn) and libds4.so (cudart, cublas) link.
       - name: Install CUDA 13, cuDNN and build dependencies
         env:
@@ -230,3 +240,12 @@ jobs:
         with:
           path: .zig-toolchain
           key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}
+
+      - name: Save libjinja
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.jinja.outputs.cache-hit != 'true' && hashFiles('lib/jinja_cpp/.linux-version') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            lib/jinja_cpp/libjinja-linux.a
+            lib/jinja_cpp/.linux-version
+          key: ${{ steps.jinja.outputs.cache-primary-key }}
