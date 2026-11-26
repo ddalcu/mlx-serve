@@ -880,6 +880,14 @@ entry per folder by real path, under the `org/name` id, and `rescan` compares re
 `tests/test_multi_model_dir.sh` [5][6], `discoverModelsMany lists a folder two roots reach once…`,
 `ModelRegistry: rescan adds no second entry…`.
 
+### A split GGUF in its quant folder was missing from `list` and `/v1/models` (#1259)
+Defect: a 157 GB split quant the app downloaded and served did not appear in `mlx-serve list` or `/v1/models`. Cause:
+the app (and `pull`) save a split quant in its own folder, `<repo>/<quant>/…-00001-of-N.gguf`, and every server-side
+GGUF check read only the repo folder's own files. Fix: `shardFolderFirst` is the app's rule (one complete split set,
+nothing else); `scanLlmGguf`, `isGgufModelPath` and `list` read it below an org folder, and `peekByPath` maps the
+app's shard path to the repo entry. Guard: the tests named for the quant folder in `files.zig`, `discovery.zig`,
+`cli.zig` and `registry.zig`.
+
 ### `/v1/completions` echo logprobs came back as invalid JSON
 
 A logprob that is NaN (a forward that overflowed) or -inf was printed with `{d:.6}`, which writes `nan` / `-inf`: JSON

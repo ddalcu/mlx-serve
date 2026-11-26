@@ -51,6 +51,9 @@ Request parsing + media:
 - **Media atoms come from media parts, never rewriting user/tool text** (`chat.appendMediaContentParts`); item k expands to run k (`expandMediaPlaceholders`), count/kind mismatch = named 400. Encoder cache keys pixels; text parts JOIN in order. Guards: format corpus, `tests/test_nemotron_bolt.py`.
 - **A registered model's path is matched by its stored `real_path` too, never re-resolved per request** (`model_settings.ModelPath`; loads: `lookupPack`):
   the app keys a symlinked folder by its target, discovery registers the link. Guard: `tests/test_model_settings_symlink.sh`.
+- **A GGUF model folder is the app's: flat quants plus quant folders holding one complete split set** (`shardFolderFirst`,
+  `<repo>/Q6_K_XL/…-00001-of-N.gguf`, how the app and `pull` save a split quant): `list`, discovery, `--model` and
+  `peekByPath` read the same rule, and only below an org folder, or a folder of split repos turns into one model.
 - **A dispatch field must be readable from every body SHAPE** (`parseModelFromRequest(body, content_type)`); header parameter lookups key at a boundary (`name=` vs `filename=`); binary bodies are not logged (`bodyIsText`); request ints clamp (`parseRequestSeed`, `clampJsonI32`).
 - **A client-supplied PATH is proven on OUR side of the mlx boundary** (`lora.loadFile` stat → 400) and accepted only from LOOPBACK (`parseLoraFields(…, local)` → 403, #540: missing vs not-a-LoRA is a host-file oracle). `/v1/images/edits` forwards the LoRA fields (#268).
 - **Hand-written error text is not JSON**: escape at the SINK (`jsonEscapeMessage`), truncate on a UTF-8 boundary. NO model-byte string is guaranteed UTF-8 — sanitizing lives INSIDE every escaper (`chat.utf8Next`); logprobs `bytes` keeps exact bytes.

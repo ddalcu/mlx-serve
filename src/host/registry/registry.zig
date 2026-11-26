@@ -795,10 +795,11 @@ pub const ModelRegistry = struct {
             defer self.mutex.unlock(self.io);
             if (self.findDirLocked(path, real)) |e| return e;
         }
-        // A GGUF pack is registered by its folder; a client (the app) names the `.gguf` inside it. Only the file the
-        // folder serves: another quant beside it is a model of its own.
-        if (std.mem.endsWith(u8, path, ".gguf")) if (std.fs.path.dirname(path)) |dir| if (self.peekByPath(dir)) |e| {
-            if (self.folderServes(e.path, path)) return e;
+        // A GGUF pack is registered by its folder; a client (the app) names the `.gguf` inside it, or inside its
+        // quant folder. Only the file the folder serves: another quant beside it is a model of its own.
+        if (std.mem.endsWith(u8, path, ".gguf")) if (std.fs.path.dirname(path)) |dir| {
+            if (self.peekByPath(dir)) |e| if (self.folderServes(e.path, path)) return e;
+            if (std.fs.path.dirname(dir)) |repo| if (self.peekByPath(repo)) |e| if (self.folderServes(e.path, path)) return e;
         };
         return null;
     }
@@ -1651,6 +1652,32 @@ test "ModelRegistry: peekByPath finds a GGUF pack by the .gguf file inside it, a
     const readme = try std.fs.path.join(testing.allocator, &.{ link, "README.md" });
     defer testing.allocator.free(readme);
     try testing.expect(reg.peekByPath(readme) == null);
+}
+
+test "ModelRegistry: peekByPath finds a GGUF pack by the first shard in its quant folder, not another quant's" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "pack/Q6");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/Q6/m-00001-of-00002.gguf", .data = "GGUF" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/Q6/m-00002-of-00002.gguf", .data = "GGUF" });
+    try tmp.dir.createDirPath(io, "pack/Q8");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/Q8/m-00001-of-00002.gguf", .data = "GGUF" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/Q8/m-00002-of-00002.gguf", .data = "GGUF" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    const pack = try std.fs.path.join(testing.allocator, &.{ root, "pack" });
+    defer testing.allocator.free(pack);
+    const served = try std.fs.path.join(testing.allocator, &.{ pack, "Q6", "m-00001-of-00002.gguf" });
+    defer testing.allocator.free(served);
+    const other = try std.fs.path.join(testing.allocator, &.{ pack, "Q8", "m-00001-of-00002.gguf" });
+    defer testing.allocator.free(other);
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStubWithArch("pack", pack, 64, "gguf");
+    try testing.expectEqual(e, reg.peekByPath(served) orelse return error.TestUnexpectedResult);
+    try testing.expect(reg.peekByPath(other) == null);
 }
 
 test "ModelRegistry: registerByPath rejects a nonexistent directory" {
