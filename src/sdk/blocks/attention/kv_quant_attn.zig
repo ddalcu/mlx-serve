@@ -109,7 +109,7 @@ const QkvDecCfgKey = struct {
     gs: u32,
     gqa: c_int,
     nblk: c_int,
-    has_mask: bool,
+    mask: u8,
     dtype: mlx.mlx_dtype,
 };
 var qkv_dec_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
@@ -166,7 +166,7 @@ fn qkvDecMmaEnabled() bool {
 
 var qkv_dec_mma_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var qkv_merge_kernel: ?mlx.mlx_fast_metal_kernel = null;
-const QkvDecMmaCfgKey = struct { hq: c_int, hkv: c_int, dk: c_int, dv: c_int, bits: u8, gs: u32, gqa: c_int, nsplit: c_int, has_mask: bool, dtype: mlx.mlx_dtype };
+const QkvDecMmaCfgKey = struct { hq: c_int, hkv: c_int, dk: c_int, dv: c_int, bits: u8, gs: u32, gqa: c_int, nsplit: c_int, mask: u8, dtype: mlx.mlx_dtype };
 var qkv_dec_mma_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var qkv_dec_mma_cfg_key: QkvDecMmaCfgKey = std.mem.zeroes(QkvDecMmaCfgKey);
 var qkv_dec_mma_engaged: bool = false;
@@ -183,11 +183,11 @@ fn kernelNamed(cache: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, inputs: 
     return k;
 }
 
-fn qkvAttnDecodeMma(s: mlx.mlx_stream, q: mlx.mlx_array, view: *const DenseKVView, scale: f32, mask: ?mlx.mlx_array, h_q: c_int, h_kv: c_int, dk: c_int, dv: c_int, t_k: c_int, qdt: mlx.mlx_dtype) !mlx.mlx_array {
+fn qkvAttnDecodeMma(s: mlx.mlx_stream, q: mlx.mlx_array, view: *const DenseKVView, scale: f32, mask: ?mlx.mlx_array, mask_kind: u8, sinks: ?mlx.mlx_array, h_q: c_int, h_kv: c_int, dk: c_int, dv: c_int, t_k: c_int, qdt: mlx.mlx_dtype) !mlx.mlx_array {
     const kernel = try kernelNamed(&qkv_dec_mma_kernel, "qkv_attn_dec_mma", &.{ "q", "kq", "ksc", "kbi", "vq", "vsc", "vbi", "scl", "tk", "msk" }, &.{ "m_out", "l_out", "o_out" }, QKV_DEC_MMA_KERNEL_SOURCE, "#include <metal_simdgroup_matrix>\n", false);
     const gqa = @divExact(h_q, h_kv);
     const nsplit = qkvDecMmaSplits(t_k);
-    const key = QkvDecMmaCfgKey{ .hq = h_q, .hkv = h_kv, .dk = dk, .dv = dv, .bits = view.bits, .gs = view.group_size, .gqa = gqa, .nsplit = nsplit, .has_mask = mask != null, .dtype = qdt };
+    const key = QkvDecMmaCfgKey{ .hq = h_q, .hkv = h_kv, .dk = dk, .dv = dv, .bits = view.bits, .gs = view.group_size, .gqa = gqa, .nsplit = nsplit, .mask = mask_kind, .dtype = qdt };
     if (qkv_dec_mma_cfg == null or !std.meta.eql(qkv_dec_mma_cfg_key, key)) {
         if (qkv_dec_mma_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         qkv_dec_mma_cfg = null;
@@ -205,7 +205,7 @@ fn qkvAttnDecodeMma(s: mlx.mlx_stream, q: mlx.mlx_array, view: *const DenseKVVie
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DK", dk));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DV", dv));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GQA", gqa));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HAS_MASK", @intFromBool(mask != null)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HAS_MASK", mask_kind));
         qkv_dec_mma_cfg = config;
         qkv_dec_mma_cfg_key = key;
     }
@@ -227,7 +227,7 @@ fn qkvAttnDecodeMma(s: mlx.mlx_stream, q: mlx.mlx_array, view: *const DenseKVVie
         _ = mlx.mlx_array_free(a);
     };
     for (&parts, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, outputs_vec, i));
-    const o_t = try qkvMergeFused(s, parts[0], parts[1], parts[2], qdt);
+    const o_t = try mergeFusedSinks(s, parts[0], parts[1], parts[2], qdt, sinks);
     defer _ = mlx.mlx_array_free(o_t);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -235,15 +235,20 @@ fn qkvAttnDecodeMma(s: mlx.mlx_stream, q: mlx.mlx_array, view: *const DenseKVVie
     qkv_dec_mma_calls += 1;
     if (!qkv_dec_mma_engaged) {
         qkv_dec_mma_engaged = true;
-        log.info("[kv-attn] decode kernel (simdgroup matrix) engaged: bits={d} gs={d} DK={d} DV={d} Hq={d} Hkv={d} splits={d} mask={}\n", .{ view.bits, view.group_size, dk, dv, h_q, h_kv, nsplit, mask != null });
+        log.info("[kv-attn] decode kernel (simdgroup matrix) engaged: bits={d} gs={d} DK={d} DV={d} Hq={d} Hkv={d} splits={d} mask={d} sinks={}\n", .{ view.bits, view.group_size, dk, dv, h_q, h_kv, nsplit, mask_kind, sinks != null });
     }
     return out;
 }
 
 /// `qkvMergeArrays` in one dispatch: one threadgroup per row, one thread per output element.
 pub fn qkvMergeFused(s: mlx.mlx_stream, m_b: mlx.mlx_array, l_b: mlx.mlx_array, o_b: mlx.mlx_array, qdt: mlx.mlx_dtype) !mlx.mlx_array {
+    return mergeFusedSinks(s, m_b, l_b, o_b, qdt, null);
+}
+
+/// `qkvMergeFused` with a sink logit a row (`[ROWS]`): one more key of zero value.
+fn mergeFusedSinks(s: mlx.mlx_stream, m_b: mlx.mlx_array, l_b: mlx.mlx_array, o_b: mlx.mlx_array, qdt: mlx.mlx_dtype, sinks: ?mlx.mlx_array) !mlx.mlx_array {
     const os = mlx.getShape(o_b);
-    const kernel = try kernelNamed(&qkv_merge_kernel, "qkv_merge_partials", &.{ "m_in", "l_in", "o_in" }, &.{"out"}, QKV_MERGE_KERNEL_SOURCE, "", true);
+    const kernel = try kernelNamed(&qkv_merge_kernel, "qkv_merge_partials", &.{ "m_in", "l_in", "o_in", "sink" }, &.{"out"}, QKV_MERGE_KERNEL_SOURCE, "", true);
     const config = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ os[0], os[2] }, 2, qdt));
@@ -252,7 +257,10 @@ pub fn qkvMergeFused(s: mlx.mlx_stream, m_b: mlx.mlx_array, l_b: mlx.mlx_array, 
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", qdt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NS", os[1]));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DV", os[2]));
-    const inputs_arr = [_]mlx.mlx_array{ m_b, l_b, o_b };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HAS_SINK", @intFromBool(sinks != null)));
+    const dummy = mlx.mlx_array_new_data(&[_]f32{0}, &[_]c_int{1}, 1, .float32);
+    defer _ = mlx.mlx_array_free(dummy);
+    const inputs_arr = [_]mlx.mlx_array{ m_b, l_b, o_b, sinks orelse dummy };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var res = mlx.mlx_vector_array_new();
@@ -275,6 +283,24 @@ pub fn qkvAttnDecodeKernel(
     scale: f32,
     mask_mode: []const u8,
     mask_arr: mlx.mlx_array,
+) !?mlx.mlx_array {
+    return decodeKernel(s, q, view, scale, mask_mode, mask_arr, null);
+}
+
+/// `qkvAttnDecodeKernel` under an additive bias a head (`[1, Hq, 1, Tk]`) and a sink logit a head (`[Hq]`, a dtype that
+/// promotes to q's: MLX's rule), the read of `scaled_dot_product_attention(.., "array", bias, sinks)`. Null = declined.
+pub fn qkvAttnDecodeBiased(s: mlx.mlx_stream, q: mlx.mlx_array, view: *const DenseKVView, scale: f32, bias: mlx.mlx_array, sinks: mlx.mlx_array) !?mlx.mlx_array {
+    return decodeKernel(s, q, view, scale, "array", bias, sinks);
+}
+
+fn decodeKernel(
+    s: mlx.mlx_stream,
+    q: mlx.mlx_array,
+    view: *const DenseKVView,
+    scale: f32,
+    mask_mode: []const u8,
+    mask_in: mlx.mlx_array,
+    sinks_in: ?mlx.mlx_array,
 ) !?mlx.mlx_array {
     if (!qkvDecKernelEnabled()) return null;
     if (!view.has_quant_triple) return null;
@@ -313,19 +339,43 @@ pub fn qkvAttnDecodeKernel(
     if (ksc_sh[3] != @divExact(dk, @as(c_int, @intCast(view.group_size)))) return null;
     if (vsc_sh[3] != @divExact(dv, @as(c_int, @intCast(view.group_size)))) return null;
 
-    // Mask: none, trivially-causal (T_q == 1), or a [.., 1, T_k] additive row.
-    var has_mask = false;
+    // Mask: none, trivially-causal (T_q == 1), a [.., 1, T_k] additive row every head shares, or a row a head.
+    var mask_kind: u8 = 0;
+    var mask_arr = mask_in;
+    var sinks: ?mlx.mlx_array = null;
     if (std.mem.eql(u8, mask_mode, "array")) {
-        if (mask_arr.ctx == null) return null;
-        const msize = mlx.mlx_array_size(mask_arr);
-        if (msize != @as(usize, @intCast(t_k))) return null;
-        has_mask = true;
+        if (mask_in.ctx == null) return null;
+        const msize = mlx.mlx_array_size(mask_in);
+        if (msize == @as(usize, @intCast(t_k))) {
+            mask_kind = 1;
+        } else if (msize == @as(usize, @intCast(h_q)) * @as(usize, @intCast(t_k))) {
+            mask_kind = 2;
+        } else return null;
     } else if (!std.mem.eql(u8, mask_mode, "") and !std.mem.eql(u8, mask_mode, "causal")) {
         return null;
     }
+    if (sinks_in) |sk| {
+        if (sk.ctx == null or mlx.mlx_array_size(sk) != @as(usize, @intCast(h_q))) return null;
+    }
+    // The kernels index a bias and the sinks as row-major (the view's own strides are the cache's).
+    var owned: [2]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (owned) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    if (mask_kind == 2) {
+        try mlx.check(mlx.mlx_contiguous(&owned[0], mask_in, false, s));
+        mask_arr = owned[0];
+    }
+    if (sinks_in) |sk| {
+        var f = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f);
+        try mlx.check(mlx.mlx_astype(&f, sk, .float32, s));
+        try mlx.check(mlx.mlx_contiguous(&owned[1], f, false, s));
+        sinks = owned[1];
+    }
 
     if (qkvDecMmaTakes(q, view)) {
-        return try qkvAttnDecodeMma(s, q, view, scale, if (has_mask) mask_arr else null, h_q, h_kv, dk, dv, t_k, qdt);
+        return try qkvAttnDecodeMma(s, q, view, scale, if (mask_kind != 0) mask_arr else null, mask_kind, sinks, h_q, h_kv, dk, dv, t_k, qdt);
     }
 
     const kernel = getQkvDecKernel() catch return null;
@@ -341,7 +391,7 @@ pub fn qkvAttnDecodeKernel(
         .gs = view.group_size,
         .gqa = gqa,
         .nblk = nblk,
-        .has_mask = has_mask,
+        .mask = mask_kind,
         .dtype = qdt,
     };
     if (qkv_dec_cfg == null or !std.meta.eql(qkv_dec_cfg_key, key)) {
@@ -361,7 +411,7 @@ pub fn qkvAttnDecodeKernel(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DV", dv));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GQA", gqa));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BLOCK", block));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HAS_MASK", @intFromBool(has_mask)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HAS_MASK", mask_kind));
         qkv_dec_cfg = config;
         qkv_dec_cfg_key = key;
     }
@@ -388,14 +438,14 @@ pub fn qkvAttnDecodeKernel(
         view.v_triple_biases,
         scl,
         tk,
-        if (has_mask) mask_arr else dummy,
+        if (mask_kind != 0) mask_arr else dummy,
     };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qkv_dec_cfg.?, s));
-    const o_t = try qkvMergePartials(s, outputs_vec, qdt);
+    const o_t = try qkvMergePartials(s, outputs_vec, qdt, sinks);
     defer _ = mlx.mlx_array_free(o_t);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -403,7 +453,7 @@ pub fn qkvAttnDecodeKernel(
     try mlx.check(mlx.mlx_reshape(&out, o_t, &out_shape, 4, s));
     if (!qkv_dec_engaged) {
         qkv_dec_engaged = true;
-        log.info("[kv-attn] decode kernel engaged: bits={d} gs={d} DK={d} DV={d} Hq={d} Hkv={d} block={d} mask={}\n", .{ view.bits, view.group_size, dk, dv, h_q, h_kv, block, has_mask });
+        log.info("[kv-attn] decode kernel engaged: bits={d} gs={d} DK={d} DV={d} Hq={d} Hkv={d} block={d} mask={d} sinks={}\n", .{ view.bits, view.group_size, dk, dv, h_q, h_kv, block, mask_kind, sinks != null });
     }
     return out;
 }
@@ -418,7 +468,7 @@ pub fn qkvAttnDecodeKernel(
 /// KB-scale tensors — a handful of elementwise/reduce ops per layer. Shared
 /// by the decode and verify packed-attention kernels; the op sequence is
 /// load-bearing (decode bit-identity across refactors is a bar).
-fn qkvMergePartials(s: mlx.mlx_stream, outputs_vec: mlx.mlx_vector_array, qdt: mlx.mlx_dtype) !mlx.mlx_array {
+fn qkvMergePartials(s: mlx.mlx_stream, outputs_vec: mlx.mlx_vector_array, qdt: mlx.mlx_dtype, sinks: ?mlx.mlx_array) !mlx.mlx_array {
     if (mlx.mlx_vector_array_size(outputs_vec) != 3) return error.MetalKernelBadOutputCount;
     var m_b = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(m_b);
@@ -429,13 +479,27 @@ fn qkvMergePartials(s: mlx.mlx_stream, outputs_vec: mlx.mlx_vector_array, qdt: m
     try mlx.check(mlx.mlx_vector_array_get(&m_b, outputs_vec, 0));
     try mlx.check(mlx.mlx_vector_array_get(&l_b, outputs_vec, 1));
     try mlx.check(mlx.mlx_vector_array_get(&o_b, outputs_vec, 2));
-    return qkvMergeArrays(s, m_b, l_b, o_b, qdt);
+    return mergeArraysSinks(s, m_b, l_b, o_b, qdt, sinks);
 }
 
 pub fn qkvMergeArrays(s: mlx.mlx_stream, m_b: mlx.mlx_array, l_b: mlx.mlx_array, o_b: mlx.mlx_array, qdt: mlx.mlx_dtype) !mlx.mlx_array {
+    return mergeArraysSinks(s, m_b, l_b, o_b, qdt, null);
+}
+
+/// `qkvMergeArrays` with a sink logit a row (`[ROWS]` f32): one more key of zero value.
+fn mergeArraysSinks(s: mlx.mlx_stream, m_b: mlx.mlx_array, l_b: mlx.mlx_array, o_b: mlx.mlx_array, qdt: mlx.mlx_dtype, sinks: ?mlx.mlx_array) !mlx.mlx_array {
     var m_max = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(m_max);
     try mlx.check(mlx.mlx_max_axis(&m_max, m_b, 1, true, s));
+    var sk_col = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sk_col);
+    if (sinks) |sk| {
+        try mlx.check(mlx.mlx_expand_dims(&sk_col, sk, 1, s)); // [ROWS, 1]
+        var top = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(top);
+        try mlx.check(mlx.mlx_maximum(&top, m_max, sk_col, s));
+        _ = mlx.mlx_array_set(&m_max, top);
+    }
     var m_shift = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(m_shift);
     try mlx.check(mlx.mlx_subtract(&m_shift, m_b, m_max, s));
@@ -448,6 +512,18 @@ pub fn qkvMergeArrays(s: mlx.mlx_stream, m_b: mlx.mlx_array, l_b: mlx.mlx_array,
     var l_tot = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(l_tot);
     try mlx.check(mlx.mlx_sum_axis(&l_tot, lw, 1, true, s)); // [ROWS, 1]
+    if (sinks != null) {
+        var sk_shift = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sk_shift);
+        try mlx.check(mlx.mlx_subtract(&sk_shift, sk_col, m_max, s));
+        var sk_w = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sk_w);
+        try mlx.check(mlx.mlx_exp(&sk_w, sk_shift, s));
+        var with_sink = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(with_sink);
+        try mlx.check(mlx.mlx_add(&with_sink, l_tot, sk_w, s));
+        _ = mlx.mlx_array_set(&l_tot, with_sink);
+    }
     var w3 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(w3);
     try mlx.check(mlx.mlx_expand_dims(&w3, w, 2, s)); // [ROWS, NBLK, 1]
@@ -693,7 +769,7 @@ pub fn qkvAttnVerifyKernel(
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qkv_ver_cfgs[slot].?, s));
-    const o_t = try qkvMergePartials(s, outputs_vec, qdt);
+    const o_t = try qkvMergePartials(s, outputs_vec, qdt, null);
     defer _ = mlx.mlx_array_free(o_t);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);

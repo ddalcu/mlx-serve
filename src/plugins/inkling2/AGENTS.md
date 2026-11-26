@@ -115,6 +115,9 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **The draft head loads on Apple9+ only, with the kernels on** (`draftsOn`, told to the engine by `NativeDrafter.active`):
   on an M1 a few-row verify costs so much more than a step that drafted decode ran under serial, and only the kernels
   serve a verified or batched visit (`MLX_SERVE_INKLING2_FUSED=0` also batches no slots).
+- **A one-row read of a quantized cache runs off the packed words** (`layers.packedRead`: the SDK's decode kernel under a bias a
+  head and the sinks, from `KV_ATTN_FUSED_MIN_TK` keys, `nax_packed_min_keys` on NAX where its block kernel loses below 16K):
+  dense, every global visit dequantized its whole cache each token (-30% at 32K). `auto` engages it from an 8192-token prompt.
 - **A sliding visit keeps a ring of window + 2048 rows** (`Config.ring`, declared as `CacheFacts.sliding_ring`;
   `layers.appendKv` at every append): kept whole, the 40 sliding visits held several times the KV a long prompt needs, and every
   prefix-cache entry with it. A match more than the slack behind an entry's end then misses.
