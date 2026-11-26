@@ -3716,8 +3716,14 @@ pub const HotPrefixCache = struct {
             merged.deinit(self.allocator);
             return null;
         }
+        // The checkpoint the ring tail restores at is thinned last: without it the tail restores nothing.
+        var tail_cp: ?SSMCheckpoint = if (tail) |t| for (merged.items, 0..) |c, k| {
+            if (c.pos == t.step) break merged.orderedRemove(k);
+        } else null else null;
+        defer if (tail_cp) |*c| c.deinit(self.allocator);
+        const keep_max = self.ssm_checkpoint_max -| @intFromBool(tail_cp != null);
         while (self.ssm_checkpoint_max > 0 and
-            merged.items.len > self.ssm_checkpoint_max)
+            merged.items.len > keep_max)
         {
             // Under three there is no interior to thin; honour the cap by
             // dropping the oldest, which is also the cheapest to redo.
@@ -3729,6 +3735,12 @@ pub const HotPrefixCache = struct {
             );
             var dropped = merged.orderedRemove(drop);
             dropped.deinit(self.allocator);
+        }
+        if (tail_cp) |c| {
+            var at: usize = 0;
+            while (at < merged.items.len and merged.items[at].pos < c.pos) at += 1;
+            try merged.insert(self.allocator, at, c);
+            tail_cp = null;
         }
         const owned = try merged.toOwnedSlice(self.allocator);
         // The inherited latest and this turn's latest both carry the indexer
@@ -6524,6 +6536,29 @@ test "HotPrefixCache: a plain-attention ring restores at the prompt's end after 
     const rows = try pcRingRows(&target_cache.entries[0], s);
     try testing.expectEqual(@as(usize, 160), rows.base);
     try testing.expectApproxEqAbs(@as(f32, 7180), rows.sum, 1e-3);
+}
+
+test "HotPrefixCache: the cap thins the checkpoint the ring tail restores at last" {
+    const a = testing.allocator;
+    var hc = HotPrefixCache.initWithMem(a, 4, 0);
+    defer hc.deinit();
+    hc.ssm_checkpoint_max = 4;
+    const old = try a.alloc(SSMCheckpoint, 3);
+    for (old, [_]usize{ 100, 400, 700 }) |*c, p| c.* = .{ .pos = p, .layers = try a.alloc(transformer_mod.SSMCacheEntrySnapshot, 0) };
+    const new = try a.alloc(SSMCheckpoint, 2);
+    for (new, [_]usize{ 905, 910 }) |*c, p| c.* = .{ .pos = p, .layers = try a.alloc(transformer_mod.SSMCacheEntrySnapshot, 0) };
+    var tail: KVCacheSnapshot = .{ .entries = try a.alloc(transformer_mod.KVCacheEntry, 0), .step = 905, .allocator = a, .config = transformer_mod.KVQuantConfig.dense };
+    defer tail.deinit();
+    // Bar: 905 sits closest to its neighbours, so a plain thin drops it first; the tail keeps it.
+    const merged = (try hc.mergeCheckpointLists(old, new, null, 0, &tail)).?;
+    defer {
+        for (merged) |*c| c.deinit(a);
+        a.free(merged);
+    }
+    try testing.expectEqual(@as(usize, 4), merged.len);
+    var kept = false;
+    for (merged) |c| kept = kept or c.pos == 905;
+    try testing.expect(kept);
 }
 
 test "HotPrefixCache: a revised budget evicts down to fit and a raised one keeps everything" {
