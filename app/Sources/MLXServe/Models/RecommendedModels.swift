@@ -64,6 +64,7 @@ enum RecommendedModelFamily: String {
     case gemma = "Gemma"
     case qwen = "Qwen"
     case liquid = "Liquid"
+    case inkling = "Inkling"
     case largest = "Largest models"
 }
 
@@ -182,6 +183,26 @@ struct RecommendedModelPick: Identifiable, Hashable {
 /// members on the type itself so the catalogs below can use plain
 /// dot-shorthand (`.gemmaE4B`).
 extension RecommendedModelPick {
+    /// Inkling 2 Mini (26.4B-A3.4B, its middle layers run three times) in our 8-bit pack, with incoai's DFlash2
+    /// draft in `drafter/` (the size counts it). `intelligence` is ESTIMATED: the index read predates the model;
+    /// placed between the two MoE picks of its active size. `speed` is ESTIMATED with the draft: 229 tok/s on the M5
+    /// Ultra at 4K against Qwen 3.6 35B-A3B's 439 there, scaled to that model's 238 on the M4 Max.
+    static let inkling2Mini8bit = RecommendedModelPick(
+        id: "inkling-2-mini-8bit",
+        name: "Inkling 2 Mini",
+        tagline: "Sees images, codes well",
+        blurb: "Thinking Machines' compact mixture-of-experts model: it reads images as well as text, and is good at coding and multi-step agent work. It ships with a separate drafting helper that guesses several words ahead, so it answers quickly. Needs a Mac with 32 GB of memory or more.",
+        repoId: "ddalcu/Inkling-2-Mini-MLX-8bit",
+        sizeGB: 19.7,
+        family: .inkling,
+        intelligence: 45,
+        intelligenceIsEstimated: true,
+        speed: 62,
+        speedIsWithMtp: true,
+        contextTokens: 1_048_576,
+        activeParamsB: 3.4
+    )
+
     static let lfm3_1_7b = lfm3(id: "lfm3-1.7b", name: "LFM3 1.7B", tagline: "Tiny and quick",
         blurb: "Liquid's small text model: answers in a blink, thinks before it answers, and calls tools. A good fit for quick questions on any Mac.",
         repo: "LiquidAI/LFM3-1.7B-MLX-8bit", sizeGB: 1.9, context: 262_144)
@@ -519,10 +540,13 @@ extension RecommendedModelPick {
     /// from its weight bytes (no M4 Max cell yet), intelligence is ours (no Artificial Analysis entry).
     static let liquidCatalog: [RecommendedModelPick] = [lfm3_1_7b, lfm3Omni2b]
 
+    /// Thinking Machines' Inkling 2 Mini in our 8-bit pack, which carries the DFlash2 draft.
+    static let inklingCatalog: [RecommendedModelPick] = [inkling2Mini8bit]
+
     /// Every curated pick: the pane's sections plus the Gemma picks the welcome screen and the starter offer —
     /// the union the score invariants sweep and the one list a new section can't slip past.
     static let allCatalogs: [RecommendedModelPick] =
-        gemmaCatalog + qwenCatalog + liquidCatalog + largestCatalog
+        gemmaCatalog + qwenCatalog + liquidCatalog + inklingCatalog + largestCatalog
 
     // MARK: - The starter recommendation
 

@@ -140,6 +140,13 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .anthropic_type = "overloaded_error",
             .message = "the cluster's worker Mac left during this request; the server restarts to pair again",
         },
+        error.Shutdown => .{
+            .status_line = "503 Service Unavailable",
+            .code = 503,
+            .openai_type = "server_error",
+            .anthropic_type = "overloaded_error",
+            .message = "Server is shutting down",
+        },
         error.GenerationFailed => .{
             .status_line = "500 Internal Server Error",
             .code = 500,
@@ -711,4 +718,16 @@ test "generation out of memory does not carry a refusal reason" {
     const openai = try buildOpenAiStreamError(a, w);
     defer a.free(openai);
     try t.expect(std.mem.indexOf(u8, openai, "\"reason\"") == null);
+}
+
+test "shutdown maps to a 503 anthropic overloaded_error" {
+    const t = std.testing;
+    var buf: [320]u8 = undefined;
+    const w = mapGenerationError(error.Shutdown, &buf);
+    try t.expectEqual(@as(u32, 503), w.code);
+    try t.expectEqualStrings("overloaded_error", w.anthropic_type);
+
+    const body = try buildAnthropicStreamError(t.allocator, w);
+    defer t.allocator.free(body);
+    try t.expectEqualStrings("{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Server is shutting down\"}}", body);
 }

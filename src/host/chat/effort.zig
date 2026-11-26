@@ -128,6 +128,20 @@ fn kolibriEffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
     return "high";
 }
 
+/// Inkling's template raises on an effort word its `effort_map` lacks (Inkling 2's adds xhigh): a word the map
+/// defines passes through, xhigh falls to max where it is missing, anything else to high (the template's 0.9).
+fn inklingEffortFor(tpl: []const u8, effort: ?[]const u8, enable_thinking: bool) []const u8 {
+    if (!enable_thinking) return "none";
+    const e = effort orelse return "high";
+    for ([_][]const u8{ "minimal", "low", "medium", "high", "xhigh", "max" }) |w| {
+        if (!std.mem.eql(u8, e, w)) continue;
+        var key: [16]u8 = undefined;
+        if (std.mem.indexOf(u8, tpl, std.fmt.bufPrint(&key, "\"{s}\":", .{w}) catch unreachable) != null) return w;
+        return if (std.mem.eql(u8, w, "xhigh")) "max" else "high";
+    }
+    return "high";
+}
+
 pub fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatConfig, enable_thinking: bool, effort: ?[]const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
@@ -211,10 +225,12 @@ pub fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const C
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, kolibriEffortFor(effort, enable_thinking));
         try buf.append(allocator, '"');
+    } else if (inkling_style) {
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
+        try buf.appendSlice(allocator, inklingEffortFor(chat_config.chat_template, effort, enable_thinking));
+        try buf.append(allocator, '"');
     } else try buf.appendSlice(allocator, if (enable_thinking)
         ",\"reasoning_effort\":\"high\""
-    else if (inkling_style)
-        ",\"reasoning_effort\":\"none\""
     else
         ",\"reasoning_effort\":\"no_think\"");
 
@@ -324,6 +340,31 @@ test "serializeExtraContext: glm5_next maps effort onto low|high|max" {
     };
     for (cases) |c| {
         const r = try serializeExtraContext(allocator, &glm, true, c.in);
+        defer allocator.free(r);
+        var want: [64]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, r, try std.fmt.bufPrint(&want, "\"reasoning_effort\":\"{s}\"", .{c.out})) != null);
+    }
+}
+
+test "serializeExtraContext: Inkling passes an effort word its template's map defines, else high" {
+    const allocator = testing.allocator;
+    const two = "{%- set effort_map = {\"none\": 0.0, \"minimal\": 0.1, \"low\": 0.2, \"medium\": 0.7, \"high\": 0.9, \"xhigh\": 0.99, \"max\": 0.99} -%}Thinking effort level: ";
+    const small = @embedFile("../../fixtures/inkling_chat_template.jinja");
+    const cases = [_]struct { tpl: []const u8, in: ?[]const u8, thinking: bool, out: []const u8 }{
+        .{ .tpl = two, .in = null, .thinking = true, .out = "high" },
+        .{ .tpl = two, .in = "minimal", .thinking = true, .out = "minimal" },
+        .{ .tpl = two, .in = "low", .thinking = true, .out = "low" },
+        .{ .tpl = two, .in = "medium", .thinking = true, .out = "medium" },
+        .{ .tpl = two, .in = "xhigh", .thinking = true, .out = "xhigh" },
+        .{ .tpl = two, .in = "max", .thinking = true, .out = "max" },
+        .{ .tpl = two, .in = "banana", .thinking = true, .out = "high" },
+        .{ .tpl = two, .in = "low", .thinking = false, .out = "none" },
+        .{ .tpl = small, .in = "medium", .thinking = true, .out = "medium" },
+        .{ .tpl = small, .in = "xhigh", .thinking = true, .out = "max" },
+    };
+    for (cases) |c| {
+        const cfg = ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
+        const r = try serializeExtraContext(allocator, &cfg, c.thinking, c.in);
         defer allocator.free(r);
         var want: [64]u8 = undefined;
         try testing.expect(std.mem.indexOf(u8, r, try std.fmt.bufPrint(&want, "\"reasoning_effort\":\"{s}\"", .{c.out})) != null);

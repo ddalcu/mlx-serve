@@ -61,7 +61,7 @@ def parse(route, line, out):
     text = None
     if route == "generate":
         obj = json.loads(line)
-        text = obj.get("response")
+        text = obj.get("response") or obj.get("thinking")
         if obj.get("done"):
             out["finish"] = obj.get("done_reason") or "stop"
             out["prompt_tokens"] = obj.get("prompt_eval_count")
@@ -72,14 +72,16 @@ def parse(route, line, out):
             if kind == "message_start":
                 out["prompt_tokens"] = obj["message"]["usage"]["input_tokens"]
             elif kind == "content_block_delta":
-                text = obj["delta"].get("text")
+                text = obj["delta"].get("text") or obj["delta"].get("thinking")
             elif kind == "message_delta" and obj["delta"].get("stop_reason"):
                 out["finish"] = obj["delta"]["stop_reason"]
         else:
             if obj.get("usage"):
                 out["prompt_tokens"] = obj["usage"].get("prompt_tokens")
             for ch in obj.get("choices", []):
-                text = ch.get("delta", {}).get("content") or text
+                # A thinking model streams its reply as reasoning first: either field is decoded text.
+                delta = ch.get("delta", {})
+                text = delta.get("content") or delta.get("reasoning_content") or text
                 if ch.get("finish_reason"):
                     out["finish"] = ch["finish_reason"]
     if text:
@@ -146,6 +148,15 @@ def survived(out):
     return bool(out.get("finish")) and bool("".join(out["text"]).strip())
 
 
+def wait_tokens(out, thread, n=20, limit=300):
+    """Until the stream in `thread` has sent `n` text chunks; it ending or stalling first fails the run."""
+    deadline = time.monotonic() + limit
+    while len(out.get("text", [])) < n:
+        if time.monotonic() > deadline or not thread.is_alive():
+            sys.exit(f"stream A sent fewer than {n} text chunks")
+        time.sleep(0.01)
+
+
 def quiet_stream(payload, out, abort_after=None):
     """A stream whose connection the client may drop: the read error is the expected end."""
     try:
@@ -161,8 +172,7 @@ def cancel_case(drop):
     a, b, c = {}, {}, {}
     ta = threading.Thread(target=stream, args=(payload("Count from 1 to 400, one number per line.", 400), a))
     ta.start()
-    while len(a.get("text", [])) < 20:
-        time.sleep(0.01)
+    wait_tokens(a, ta)
     salt = random.randint(0, 10**9)
     words = " ".join(f"w{salt}x{i}" for i in range(B_WORDS))
     tb = threading.Thread(target=quiet_stream, args=(payload(f"Summarize in one word. {words}", 4), b, 2.5 if drop == "b" else None))
@@ -188,8 +198,7 @@ def priority_case(priority, route):
     c_body = route_payload(route, f"Reply with the single word ok. {sized(f'p{salt}y', C_TOKENS)}", 4)
     ta = threading.Thread(target=stream, args=(payload("Count from 1 to 400, one number per line.", 800), a))
     ta.start()
-    while len(a.get("text", [])) < 20:
-        time.sleep(0.01)
+    wait_tokens(a, ta)
     tb = threading.Thread(target=stream, args=(payload(f"Summarize in one word. {words}", 4), b))
     tb.start()
     time.sleep(0.8)
@@ -221,8 +230,7 @@ if MODE == "priority":
 a, b, c = {}, {}, {}
 ta = threading.Thread(target=stream, args=(payload("Count from 1 to 400, one number per line.", 800), a))
 ta.start()
-while len(a.get("text", [])) < 20:
-    time.sleep(0.01)
+wait_tokens(a, ta)
 salt = random.randint(0, 10**9)
 words = " ".join(f"w{salt}x{i}" for i in range(B_WORDS))
 tb = threading.Thread(target=stream, args=(payload(f"Summarize in one word. {words}", 4), b))

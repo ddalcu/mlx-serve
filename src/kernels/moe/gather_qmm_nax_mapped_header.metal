@@ -105,9 +105,10 @@ METAL_FUNC void map_rows(
   }
 }
 
-template <typename T, int EPI, typename DTile>
+template <typename T, int EPI, bool WEIGHTED = false, typename DTile>
 METAL_FUNC void store_act(thread DTile& D, device T* y, const int ld,
-                          const int rows, const device T* sigtab);
+                          const int rows, const device T* sigtab,
+                          const device float* row_wt);
 
 template <
     typename T,
@@ -116,7 +117,8 @@ template <
     bool ALIGN_N,
     bool ALIGN_K,
     int EPI = 0,
-    bool MAP = false>
+    bool MAP = false,
+    bool WEIGHTED = false>
 METAL_FUNC void gather_mapped_seg(
     const device T* x,
     const device uint32_t* rmap,
@@ -133,6 +135,7 @@ METAL_FUNC void gather_mapped_seg(
     const uint sgid,
     const uint lane,
     const device T* sigtab,
+    const device float* row_wt = nullptr,
     const int up_off = 0) {
   using WT = typename Q::WT;
   constexpr bool kPair = EPI != 0;
@@ -237,8 +240,9 @@ METAL_FUNC void gather_mapped_seg(
 
     if constexpr (kPair) {
       if (sg_active) {
-        store_act<T, EPI>(
-            Dtile, y + tm * ldy + tn / 2, ldy, int(sgp_sm), sigtab);
+        store_act<T, EPI, WEIGHTED>(
+            Dtile, y + tm * ldy + tn / 2, ldy, int(sgp_sm), sigtab,
+            WEIGHTED ? (row_wt + row_start + tm) : row_wt);
       }
     } else if (kAlignedM.value && sgp_sn == kSN) {
       Dtile.store(y + tm * N + tn, N);
@@ -248,7 +252,7 @@ METAL_FUNC void gather_mapped_seg(
   });
 }
 
-template <typename T, typename Q, typename G, int EPI = 0, bool MAP = false>
+template <typename T, typename Q, typename G, int EPI = 0, bool MAP = false, bool WEIGHTED = false>
 METAL_FUNC void gather_mapped_db(
     const device T* x,
     const device uint32_t* rmap,
@@ -265,6 +269,7 @@ METAL_FUNC void gather_mapped_db(
     const uint sgid,
     const uint lane,
     const device T* sigtab,
+    const device float* row_wt = nullptr,
     const int up_off = 0) {
   using WT = typename Q::WT;
   static_assert(G::kBK == 64, "db runs 64-deep K steps");
@@ -372,12 +377,13 @@ METAL_FUNC void gather_mapped_db(
 
   if constexpr (kPair) {
     if (rows > 0) {
-      store_act<T, EPI>(
+      store_act<T, EPI, WEIGHTED>(
           D,
           y + size_t(row_start + m0) * half_n + w_col + (kSN / 2) * (sgid % kWN),
           half_n,
           rows,
-          sigtab);
+          sigtab,
+          WEIGHTED ? (row_wt + row_start + m0) : row_wt);
     }
   } else {
     device T* yb = y + size_t(row_start + m0) * N + y_col + kSN * (sgid % kWN);
@@ -391,11 +397,12 @@ METAL_FUNC void gather_mapped_db(
 
 
 // EPI 1: silu(g) * u. EPI = 1 + L: the gate clamped above at L and u to [-L, L] first
-// (a `swiglu_limit`), on the rounded values like the split path's ops.
-template <typename T, int EPI, typename DTile>
+// (a `swiglu_limit`), on the rounded values like the split path's ops; WEIGHTED adds the
+// per-row routing weight on the rounded activation, bit-identical to a separate pass.
+template <typename T, int EPI, bool WEIGHTED, typename DTile>
 METAL_FUNC void store_act(
     thread DTile& D, device T* y, const int ld, const int rows,
-    const device T* sigtab) {
+    const device T* sigtab, const device float* row_wt) {
   const short2 sc = BaseNAXFrag::get_coord();
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < DTile::kTileRows; i++) {
@@ -404,6 +411,7 @@ METAL_FUNC void store_act(
       const int r = i * 16 +
           h * 8 + sc.y;
       if (r < rows) {
+        const float wt = WEIGHTED ? row_wt[r] : 1.0f;
         vec<T, 4> v;
         STEEL_PRAGMA_UNROLL
         for (short j = 0; j < 4; j++) {
@@ -415,7 +423,11 @@ METAL_FUNC void store_act(
             u = metal::max(metal::min(u, T(EPI - 1)), T(1 - EPI));
           }
           const T a = T(g * sigtab[as_type<ushort>(g)]);
-          v[j] = T(a * u);
+          if constexpr (WEIGHTED) {
+            v[j] = T(float(T(a * u)) * wt);
+          } else {
+            v[j] = T(a * u);
+          }
         }
         *(device vec<T, 4>*)(y + size_t(r) * ld + sc.x) = v;
       }

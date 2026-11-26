@@ -153,6 +153,12 @@ fn sentTokens(lens: []const usize, bytes_sent: usize) usize {
     return lens.len;
 }
 
+/// A logprob as a JSON number: JSON has no NaN or infinity, so NaN is `null` and -inf OpenAI's -9999.
+fn jsonLogprob(num: *[48]u8, v: f32) []const u8 {
+    if (std.math.isNan(v) or v == std.math.inf(f32)) return "null";
+    return std.fmt.bufPrint(num, "{d:.6}", .{@max(v, -9999)}) catch unreachable;
+}
+
 /// Build logprobs JSON for a single token (for both streaming and non-streaming).
 /// Returns a string like: {"token":"hello","logprob":-1.23,"bytes":[104,101],"top_logprobs":[...]}
 fn formatTokenLogprob(
@@ -208,17 +214,19 @@ fn formatTokenLogprob(
         }
         try tlp_bytes.appendSlice(allocator, "]");
 
+        var num: [48]u8 = undefined;
         const entry = try std.fmt.allocPrint(allocator,
-            \\{{"token":{s},"logprob":{d:.6},"bytes":{s}}}
-        , .{ escaped_tlp, tlp.logprob, tlp_bytes.items });
+            \\{{"token":{s},"logprob":{s},"bytes":{s}}}
+        , .{ escaped_tlp, jsonLogprob(&num, tlp.logprob), tlp_bytes.items });
         defer allocator.free(entry);
         try top_buf.appendSlice(allocator, entry);
     }
     try top_buf.appendSlice(allocator, "]");
 
+    var num: [48]u8 = undefined;
     const result = try std.fmt.allocPrint(allocator,
-        \\{{"token":{s},"logprob":{d:.6},"bytes":{s},"top_logprobs":{s}}}
-    , .{ escaped_token, logprob, bytes_buf.items, top_buf.items });
+        \\{{"token":{s},"logprob":{s},"bytes":{s},"top_logprobs":{s}}}
+    , .{ escaped_token, jsonLogprob(&num, logprob), bytes_buf.items, top_buf.items });
 
     return result;
 }
@@ -278,7 +286,7 @@ pub fn formatCompletionsLogprobs(
             continue;
         }
         const lp = logprobs[i - lead];
-        try lps.appendSlice(allocator, try std.fmt.bufPrint(&num, "{d:.6}", .{lp.token_logprob}));
+        try lps.appendSlice(allocator, jsonLogprob(&num, lp.token_logprob));
 
         try tops.appendSlice(allocator, "{");
         for (lp.top_logprobs, 0..) |t, j| {
@@ -289,7 +297,7 @@ pub fn formatCompletionsLogprobs(
             defer allocator.free(tesc);
             try tops.appendSlice(allocator, tesc);
             try tops.appendSlice(allocator, ":");
-            try tops.appendSlice(allocator, try std.fmt.bufPrint(&num, "{d:.6}", .{t.logprob}));
+            try tops.appendSlice(allocator, jsonLogprob(&num, t.logprob));
         }
         try tops.appendSlice(allocator, "}");
     }
@@ -418,6 +426,33 @@ test "formatCompletionsLogprobs: an echoed prompt's first token carries null, th
     try std.testing.expectApproxEqAbs(@as(f64, -0.5), o.get("token_logprobs").?.array.items[1].float, 1e-6);
     try std.testing.expect(o.get("top_logprobs").?.array.items[2].object.get(" is") != null);
     try std.testing.expectEqual(@as(i64, 7), o.get("text_offset").?.array.items[2].integer);
+}
+
+test "logprobs: a non-finite value is valid JSON (NaN null, -inf -9999) in both shapes" {
+    const allocator = std.testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    defer tok.vocab.deinit();
+    defer tok.id_to_token.deinit();
+    defer tok.merge_ranks.deinit();
+    defer tok.special_tokens.deinit();
+    defer tok.unicode_to_byte.deinit();
+    try tok.id_to_token.put(1, "a");
+    try tok.id_to_token.put(2, "b");
+    var top = [_]request_mod.TokenLogprob{ .{ .token_id = 1, .logprob = std.math.nan(f32) }, .{ .token_id = 2, .logprob = -std.math.inf(f32) } };
+    const lps = [_]request_mod.LogprobResult{.{ .token_logprob = std.math.nan(f32), .top_logprobs = &top }};
+    var tbase: usize = 0;
+    const legacy = try formatCompletionsLogprobs(allocator, &tok, &[_]u32{1}, &lps, false, &tbase);
+    defer allocator.free(legacy);
+    const a = try std.json.parseFromSlice(std.json.Value, allocator, legacy, .{});
+    defer a.deinit();
+    try std.testing.expect(a.value.object.get("token_logprobs").?.array.items[0] == .null);
+    try std.testing.expectEqual(@as(f64, -9999), a.value.object.get("top_logprobs").?.array.items[0].object.get("b").?.float);
+    const chat = try formatTokenLogprob(allocator, &tok, 1, std.math.nan(f32), &top);
+    defer allocator.free(chat);
+    const b = try std.json.parseFromSlice(std.json.Value, allocator, chat, .{});
+    defer b.deinit();
+    try std.testing.expect(b.value.object.get("logprob").? == .null);
+    try std.testing.expectEqual(@as(f64, -9999), b.value.object.get("top_logprobs").?.array.items[1].object.get("logprob").?.float);
 }
 
 test "formatCompletionsLogprobs: legacy shape, byte-aligned offsets, escaped tokens" {

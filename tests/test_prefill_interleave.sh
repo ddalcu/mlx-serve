@@ -48,7 +48,8 @@ def stream(payload, stamps, parts):
             if line.startswith("data: ") and line != "data: [DONE]":
                 obj = json.loads(line[6:])
                 for ch in obj.get("choices", []):
-                    d = ch.get("delta", {}).get("content")
+                    # A thinking model streams its reply as reasoning first: either field is a decoded token.
+                    d = ch.get("delta", {}).get("content") or ch.get("delta", {}).get("reasoning_content")
                     if d:
                         stamps.append(time.monotonic())
                         parts.append(d)
@@ -61,7 +62,10 @@ b = {"model": "mlx-serve", "temperature": 0.0, "max_tokens": 4, "stream": True,
      "messages": [{"role": "user", "content": f"Summarize in one word. {words}"}]}
 ta = threading.Thread(target=stream, args=(a, a_st, a_tx))
 ta.start()
+deadline = time.monotonic() + 300
 while len(a_st) < 20:
+    if time.monotonic() > deadline or not ta.is_alive():
+        sys.exit("stream A sent fewer than 20 tokens")
     time.sleep(0.01)
 tb = threading.Thread(target=stream, args=(b, b_st, []))
 tb.start()

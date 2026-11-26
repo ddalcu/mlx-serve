@@ -1072,3 +1072,13 @@ final class RAMFitnessTests: XCTestCase {
         XCTAssertEqual(RAMFitness.of(bytes: 0, memory: mac96), .unknown)
     }
 }
+
+/// Inkling 2 Mini's official release is a ModelOpt pack (NVFP4/MXFP8 experts) the engine serves as released.
+final class InklingReleaseSupportTests: XCTestCase {
+    func testTheOfficialReleaseIsOfferedAsSupported() {
+        let release = HFModel(id: "thinkingmachines/Inkling-2-Mini", downloads: 100, likes: 10, lastModified: nil,
+                              tags: ["transformers", "safetensors", "inkling2_loop", "image-text-to-text", "moe", "8-bit", "modelopt"],
+                              safetensors: nil, pipelineTag: "image-text-to-text")
+        XCTAssertNil(release.incompatibleReason)
+    }
+}

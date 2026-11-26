@@ -96,6 +96,23 @@ const RawRequest = struct {
     header_end: usize,
 };
 
+/// A request's head, read before anything is allocated for its body.
+pub const RequestHead = struct {
+    /// `buf[0..len]` is the head plus whatever body bytes arrived with it.
+    buf: [16 * 1024]u8 = undefined,
+    len: usize = 0,
+    end: usize = 0,
+    content_length: usize = 0,
+
+    pub fn bytes(self: *const RequestHead) []const u8 {
+        return self.buf[0..self.end];
+    }
+
+    fn totalSize(self: *const RequestHead) usize {
+        return self.end +| self.content_length;
+    }
+};
+
 /// Reads one request: the head (up to 16 KB), then its `Content-Length` body. Null when no
 /// complete head arrived, the client stalled, or the body is over the route's cap (the 413 is
 /// already sent).
@@ -106,35 +123,42 @@ pub fn readRequest(allocator: std.mem.Allocator, stream: *Conn) !?RawRequest {
 
 /// A client gets this long between bytes of its request, and in all for its head: an idle or
 /// dripping connection otherwise holds its thread forever.
-const REQUEST_READ_LIMIT_MS: i64 = 30_000;
+pub const REQUEST_READ_LIMIT_MS: i64 = 30_000;
 
 fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64) !?RawRequest {
+    var head: RequestHead = .{};
+    if (!try readHead(stream, &head, limit_ms)) return null;
+    return readBody(allocator, stream, &head, limit_ms);
+}
+
+/// False when no complete head arrived in time.
+pub fn readHead(stream: *Conn, head: *RequestHead, limit_ms: i64) !bool {
     const head_deadline = nowMsMonotonic(stream.io) + limit_ms;
-    var hdr_buf: [16 * 1024]u8 = undefined;
-    var total_read: usize = 0;
-    var content_length: ?usize = null;
-    var header_end_pos: usize = 0;
-
-    while (total_read < hdr_buf.len) {
-        if (!stream.awaitReadable(head_deadline - nowMsMonotonic(stream.io))) return null;
-        const n = try stream.read(hdr_buf[total_read..]);
+    while (head.len < head.buf.len) {
+        if (!stream.awaitReadable(head_deadline - nowMsMonotonic(stream.io))) return false;
+        const n = try stream.read(head.buf[head.len..]);
         if (n == 0) break;
-        total_read += n;
+        head.len += n;
 
-        if (std.mem.indexOf(u8, hdr_buf[0..total_read], "\r\n\r\n")) |he| {
-            header_end_pos = he + 4;
-            content_length = findContentLength(hdr_buf[0..he]);
-            break;
+        if (std.mem.indexOf(u8, head.buf[0..head.len], "\r\n\r\n")) |he| {
+            head.end = he + 4;
+            head.content_length = findContentLength(head.buf[0..he]) orelse 0;
+            return true;
         }
     }
-    if (header_end_pos == 0) return null;
+    return false;
+}
 
-    const total_size = header_end_pos +| (content_length orelse 0);
+/// The rest of `head`'s request. Null when the client stalled or hung up, or the body is over
+/// the route's cap (the 413 is already sent).
+pub fn readBody(allocator: std.mem.Allocator, stream: *Conn, head: *RequestHead, limit_ms: i64) !?RawRequest {
+    const header_end_pos = head.end;
+    const total_size = head.totalSize();
     // The cap is per ROUTE, so peek the path off the request line we already
     // have — media bodies carry base64 frames and dwarf any JSON chat body.
     const req_path = blk: {
-        const line_end = std.mem.indexOf(u8, hdr_buf[0..header_end_pos], "\r\n") orelse break :blk "";
-        var it = std.mem.splitScalar(u8, hdr_buf[0..line_end], ' ');
+        const line_end = std.mem.indexOf(u8, head.bytes(), "\r\n") orelse break :blk "";
+        var it = std.mem.splitScalar(u8, head.buf[0..line_end], ' ');
         _ = it.next();
         break :blk it.next() orelse "";
     };
@@ -144,19 +168,12 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
         const msg = payloadTooLargeMessage(&msg_buf, total_size, max_request_size);
         log.warn("[http] 413 {s}: {s}\n", .{ logSafePath(req_path), msg });
         try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
-        // Closing with body bytes unread resets the connection, and the client
-        // can lose the 413 before reading it: read what is left, up to the chat cap.
-        var left = @min(total_size, max_request_bytes) -| total_read;
-        while (left > 0 and stream.awaitReadable(limit_ms)) {
-            const n = stream.read(hdr_buf[0..@min(left, hdr_buf.len)]) catch break;
-            if (n == 0) break;
-            left -= n;
-        }
+        drainBody(stream, head, limit_ms);
         return null;
     }
 
     // curl asks before a body over 1 MB and otherwise waits a second for the answer.
-    if (total_read < total_size) if (findHeaderValue(hdr_buf[0 .. header_end_pos - 4], "expect")) |v| {
+    if (head.len < total_size) if (findHeaderValue(head.buf[0 .. header_end_pos - 4], "expect")) |v| {
         if (std.ascii.eqlIgnoreCase(v, "100-continue")) {
             try stream.writeAll("HTTP/1.1 100 Continue\r\n\r\n");
             try stream.flush();
@@ -165,8 +182,8 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
 
     const buf = try allocator.alloc(u8, total_size);
     errdefer allocator.free(buf);
-    total_read = @min(total_read, total_size);
-    @memcpy(buf[0..total_read], hdr_buf[0..total_read]);
+    var total_read = @min(head.len, total_size);
+    @memcpy(buf[0..total_read], head.buf[0..total_read]);
     while (total_read < total_size) {
         if (!stream.awaitReadable(limit_ms)) {
             allocator.free(buf);
@@ -181,6 +198,18 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
         total_read += n;
     }
     return .{ .buf = buf, .len = total_read, .header_end = header_end_pos };
+}
+
+/// Closing with body bytes unread resets the connection, and the client can lose a refusal
+/// before reading it: read what is left of the body into nothing, up to the chat cap.
+pub fn drainBody(stream: *Conn, head: *const RequestHead, limit_ms: i64) void {
+    var scratch: [16 * 1024]u8 = undefined;
+    var left = @min(head.totalSize(), max_request_bytes) -| head.len;
+    while (left > 0 and stream.awaitReadable(limit_ms)) {
+        const n = stream.read(scratch[0..@min(left, scratch.len)]) catch break;
+        if (n == 0) break;
+        left -= n;
+    }
 }
 
 fn findContentLength(headers: []const u8) ?usize {

@@ -1547,8 +1547,16 @@ static void *spec_worker(void *arg) {
             if (want_end > s->file_size) want_end = s->file_size;
             int64_t aligned_end = (want_end + page_size - 1) / page_size * page_size;
             s->span = aligned_end - s->aligned;
-            if (s->span > spec_slot_bytes) s->span = spec_slot_bytes;
             if (s->file_size - s->aligned < s->span) s->span = s->file_size - s->aligned;
+            if (s->span > spec_slot_bytes) {
+                /* Unaligned record + alignment padding exceeds slot_bytes; fail instead of marking truncated bytes SP_LANDED. */
+                s->running = 1;
+                spec_inflight += 1;
+                s->landed = 0;
+                sc[SC_FAILED] += 1;
+                spec_end(s, SP_FAILED);
+                continue;
+            }
             s->got = 0;
             s->landed = 0;
             s->df = demand_first;                                 /* DEMAND FIRST: the record's mode, all its reads */

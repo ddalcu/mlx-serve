@@ -63,10 +63,12 @@ fn slotLoopStop(eos_token_ids: []const u32, generated_ids: []const u32, fresh: u
 }
 
 /// A file written through a tool can repeat one long block, and a cut drops the whole
-/// call: the recurring-span tier abstains once the answer has opened one.
-pub fn spanCutYieldsToToolCall(tier: generate_mod.DegenerateTail.Tier, has_tools: bool, text: []const u8) bool {
-    if (tier != .recurring_span or !has_tools) return false;
-    return chat_mod.trimLeakedToolMarkup(text).len < text.len;
+/// call: the recurring-span tier abstains once the answer has opened one. Markup inside
+/// the thought is not a call, since the parser only reads past the closer.
+pub fn spanCutYieldsToToolCall(tier: generate_mod.DegenerateTail.Tier, has_tools: bool, in_think: bool, text: []const u8) bool {
+    if (tier != .recurring_span or !has_tools or in_think) return false;
+    const answer = if (chat_mod.indexOfThinkCloseTag(text, 0)) |close| text[close.pos + close.len ..] else text;
+    return chat_mod.trimLeakedToolMarkup(answer).len < answer.len;
 }
 
 /// `spanCutYieldsToToolCall` over the slot's output; an opened call stays opened.
@@ -76,7 +78,11 @@ fn toolCallHoldsCut(slot: *Slot, gen: *Generator, tier: generate_mod.DegenerateT
     const tok = slot.model.tokenizer orelse return false;
     const text = tok.decode(slot.allocator, gen.generated_ids.items, false) catch return false;
     defer slot.allocator.free(text);
-    slot.tool_call_opened = spanCutYieldsToToolCall(tier, true, text);
+    const in_think = if (gen.sampling.think_bound) |tb| blk: {
+        tb.observe(gen.generated_ids.items);
+        break :blk tb.in_think;
+    } else false;
+    slot.tool_call_opened = spanCutYieldsToToolCall(tier, true, in_think, text);
     return slot.tool_call_opened;
 }
 
@@ -310,11 +316,11 @@ test "a recurring-span cut yields to an open tool call, and only that tier does"
     try testing.expectEqual(generate_mod.DegenerateTail.Tier.recurring_span, stop.tier);
 
     const call = "<tool_call>\n{\"name\": \"write\", \"arguments\": {\"content\": \"{\\\"id\\\": 1,";
-    try testing.expect(spanCutYieldsToToolCall(stop.tier, true, call));
-    try testing.expect(!spanCutYieldsToToolCall(stop.tier, true, "The same paragraph again."));
-    try testing.expect(!spanCutYieldsToToolCall(stop.tier, false, call));
-    try testing.expect(!spanCutYieldsToToolCall(.exact_cycle, true, call));
-    try testing.expect(!spanCutYieldsToToolCall(.near_repeat, true, call));
+    try testing.expect(spanCutYieldsToToolCall(stop.tier, true, false, call));
+    try testing.expect(!spanCutYieldsToToolCall(stop.tier, true, false, "The same paragraph again."));
+    try testing.expect(!spanCutYieldsToToolCall(stop.tier, false, false, call));
+    try testing.expect(!spanCutYieldsToToolCall(.exact_cycle, true, false, call));
+    try testing.expect(!spanCutYieldsToToolCall(.near_repeat, true, false, call));
 }
 
 test "loop recovery: a loop inside an open think block closes the thought once" {
@@ -343,4 +349,15 @@ test "loop recovery: an answer-side loop and an unarmed request are still cut" {
     const closed = [_]u32{ 5, 6, CLOSE, 7, 8 };
     try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, &closed, 5, 4096));
     try testing.expectEqual(LoopAction.cut, loopRecoveryAction(null, &closed, 5, 4096));
+}
+
+test "a recurring-span cut does not yield to tool markup inside the thought" {
+    const draft = "I will call <tool_call>\n<function=Read>\n<parameter=path>a</parameter>\n</function>\n</tool_call> next. The same paragraph again.";
+    try testing.expect(!spanCutYieldsToToolCall(.recurring_span, true, true, draft));
+    try testing.expect(spanCutYieldsToToolCall(.recurring_span, true, false, draft));
+
+    const closed = "<think>" ++ draft ++ "</think>\n\nThe same paragraph again.";
+    try testing.expect(!spanCutYieldsToToolCall(.recurring_span, true, false, closed));
+    const answer_call = closed ++ "\n<tool_call>\n{\"name\": \"write\", \"arguments\": {\"content\": \"";
+    try testing.expect(spanCutYieldsToToolCall(.recurring_span, true, false, answer_call));
 }

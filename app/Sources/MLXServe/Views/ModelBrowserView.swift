@@ -254,6 +254,8 @@ private struct RecommendedModelTable: View {
                    picks: RecommendedModelPick.liquidCatalog),
             Family(id: "qwen", title: "Qwen", systemImage: "q.circle", tint: .teal,
                    picks: RecommendedModelPick.qwenCatalog),
+            Family(id: "inkling", title: "Inkling", systemImage: "eye.circle", tint: .indigo,
+                   picks: RecommendedModelPick.inklingCatalog),
             Family(id: "largest", title: "Largest models", systemImage: "memorychip", tint: .red,
                    picks: RecommendedModelPick.largestCatalog),
         ]

@@ -9,6 +9,7 @@ const generate_mod = @import("../../sdk/request/request.zig");
 const chat_mod = @import("../chat/chat.zig");
 const rp_mod = @import("../../sdk/grammar/protocol.zig");
 const log = @import("../../sdk/util/log.zig");
+const responses_mod = @import("responses/model.zig");
 const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
 const mlx_engine = @import("../engines/mlx.zig");
 const Stream = @import("../engines/stream.zig").Stream;
@@ -963,7 +964,7 @@ pub fn handleStreamingGeneration(
 
             // Emit tool call deltas in OpenAI streaming format
             for (tool_calls, 0..) |tc, i| {
-                const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ chat_id, i });
+                const tc_id = try responses_mod.makeId(stream.io, allocator, "call");
                 defer allocator.free(tc_id);
                 const first_delta = try streamToolCallDelta(allocator, i, tc_id, tc.name, tc.arguments);
                 defer allocator.free(first_delta);

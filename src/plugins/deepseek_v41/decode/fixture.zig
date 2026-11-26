@@ -46,6 +46,7 @@ pub const Fixture = struct {
     group: c_int = 64,
 
     pub fn init(gpa: std.mem.Allocator, opts: Opts) !*Fixture {
+        mlx.installErrorHandler(); // the model's threadgroup probes raise on M1/M2: latch it, never exit
         const fx = try gpa.create(Fixture);
         errdefer gpa.destroy(fx);
         var cfg = try releaseConfig();
@@ -584,6 +585,29 @@ test "dsv41 tensor parallel: a worker keeps its copy of rank 0's snapshots by id
     try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .free, 2, 0);
     try std.testing.expectEqual(@as(usize, 0), snaps.count());
     try std.testing.expectError(error.DistPeerDiverged, dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .restore, 1, 8));
+}
+
+test "dsv41 tensor parallel: a capture at the end of a turn closes the worker's open verify chunk at rank 0's position" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const o: Opts = .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 66, .act = .float32 };
+    const fx = try Fixture.init(gpa, o);
+    defer fx.deinit();
+    const m = fx.m;
+    var parked: dsv41.Parked = .init(gpa);
+    defer dsv41.dropParked(&parked);
+    var snaps: dsv41.Snaps = .init(gpa);
+    defer dsv41.dropSnaps(&snaps, gpa);
+    const chunk = try Input.of(fx, 5);
+    defer chunk.deinit();
+    for (try dsv41.workerStep(m, gpa, chunk.x, chunk.pre, o.ctx, false, true)) |r| _ = mlx.mlx_array_free(r);
+    // Rank 0 kept 3 of the 5 rows and the turn ended: no next step tells the worker.
+    const host_n = o.ctx + 3;
+    const gen = m.state_gen;
+    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .capture, gen, host_n);
+    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .take, gen, 1);
+    try dsv41.tpWorkerSnap(m, gpa, &parked, &snaps, .restore, 1, gen + 1);
+    try std.testing.expectEqual(@as(usize, host_n), m.dec_state.?.n);
 }
 
 test "dsv41 tensor parallel: a chunk's image rows, sent alone, splice as the request's rows at their offset" {

@@ -9,7 +9,7 @@ const log = @import("../../util/log.zig");
 pub const Plan = struct { sched: enum { seg, db }, bm: c_int, bk: c_int, gx: c_int, pad: c_int };
 /// `mx`: an FP4 bank (uint8 scales, no biases: e8m0 per 32 for MXFP4, e4m3 per 16 for NVFP4) instead of affine.
 const CanaryKey = struct { plan: Plan, bits: u32, group: u32, align_n: bool, align_k: bool, mx: bool };
-const MmKey = struct { rows: c_int, n: c_int, k: c_int, max_tiles: c_int, plan: Plan, bits: u32, group: u32, mx: bool, mapped: bool = false, paired: bool = false, limit: u32 = 0 };
+const MmKey = struct { rows: c_int, n: c_int, k: c_int, max_tiles: c_int, plan: Plan, bits: u32, group: u32, mx: bool, mapped: bool = false, paired: bool = false, weighted: bool = false, limit: u32 = 0 };
 var scan_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mm_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mapped_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -17,6 +17,7 @@ var paired_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var canaries: std.AutoHashMapUnmanaged(CanaryKey, bool) = .{};
 var mapped_canaries: std.AutoHashMapUnmanaged(CanaryKey, bool) = .{};
 var paired_canaries: std.AutoHashMapUnmanaged(CanaryKey, bool) = .{};
+var weighted_canaries: std.AutoHashMapUnmanaged(CanaryKey, bool) = .{};
 var engaged_logged = false;
 var mapped_engaged_logged = false;
 var paired_engaged_logged = false;
@@ -94,7 +95,7 @@ fn kernel(scan: bool) !mlx.mlx_fast_metal_kernel {
 fn mapKernel(paired: bool) !mlx.mlx_fast_metal_kernel {
     const slot = if (paired) &paired_kernel else &mapped_kernel;
     if (slot.*) |v| return v;
-    const names = [_][*:0]const u8{ "x", "w", "scales", "biases", "up_w", "up_scales", "up_biases", "tiles", "tile_count", "params", "sigtab", "rmap" };
+    const names = [_][*:0]const u8{ "x", "w", "scales", "biases", "up_w", "up_scales", "up_biases", "tiles", "tile_count", "params", "sigtab", "rmap", "row_wt" };
     const outs = [_][*:0]const u8{"y"};
     const ins_vec = mlx.mlx_vector_string_new_data(&names, names.len);
     defer _ = mlx.mlx_vector_string_free(ins_vec);
@@ -168,13 +169,16 @@ fn mmConfig(key: MmKey) !mlx.mlx_fast_metal_kernel_config {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BK", key.plan.bk));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GX", key.plan.gx));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "PAD", key.plan.pad));
-    if (key.mapped) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "EPI", if (key.paired) 1 + @as(c_int, @intCast(key.limit)) else 0));
+    if (key.mapped) {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "EPI", if (key.paired) 1 + @as(c_int, @intCast(key.limit)) else 0));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "WEIGHTED", key.weighted));
+    }
     return cfg;
 }
 
 /// `limit`: a `swiglu_limit` the epilogue clamps at (whole numbers; 0 = none). `up_off`: the up rows' offset in an
 /// expert of a bank fused along its rows (gate rows, then up rows; `w` is then the gate's bank too), else 0.
-const Pair = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, sigtab: mlx.mlx_array, limit: u32 = 0, up_off: c_int = 0 };
+const Pair = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, sigtab: mlx.mlx_array, row_wt: mlx.mlx_array = .{ .ctx = null }, limit: u32 = 0, up_off: c_int = 0 };
 
 /// An MXFP4 bank has no biases; the kernel signature still binds the slot. 16
 /// elements: MLX binds an array under 8 in `constant`, not `device`.
@@ -183,6 +187,13 @@ fn biasArg(bi: mlx.mlx_array) mlx.mlx_array {
     if (bi.ctx != null) return bi;
     if (no_bias.ctx == null) no_bias = mlx.mlx_array_new_data(&@as([16]u16, @splat(0)), &[_]c_int{16}, 1, .bfloat16);
     return no_bias;
+}
+
+var no_wt: mlx.mlx_array = .{ .ctx = null };
+fn wtArg(wt: mlx.mlx_array) mlx.mlx_array {
+    if (wt.ctx != null) return wt;
+    if (no_wt.ctx == null) no_wt = mlx.mlx_array_new_data(&@as([16]f32, @splat(0)), &[_]c_int{16}, 1, .float32);
+    return no_wt;
 }
 
 fn launchMapped(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, pair: ?Pair, bits: u32, group: u32, mx: bool, p: Plan, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -201,8 +212,9 @@ fn launchMapped(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: 
     const ps = if (pair) |v| v.sc else sc;
     const pb = if (pair) |v| v.bi else bi;
     const sigtab = if (pair) |v| v.sigtab else biasArg(.{ .ctx = null }); // unread without a pair
-    const inputs = [_]mlx.mlx_array{ x, w, sc, biasArg(bi), pw, ps, biasArg(pb), t.tiles, t.count, params, sigtab, row_map };
-    const cfg = try mmConfig(.{ .rows = m, .n = n, .k = k, .max_tiles = t.max_tiles, .plan = p, .bits = bits, .group = group, .mx = mx, .mapped = true, .paired = pair != null, .limit = if (pair) |v| v.limit else 0 });
+    const row_wt: mlx.mlx_array = if (pair) |v| v.row_wt else .{ .ctx = null };
+    const inputs = [_]mlx.mlx_array{ x, w, sc, biasArg(bi), pw, ps, biasArg(pb), t.tiles, t.count, params, sigtab, row_map, wtArg(row_wt) };
+    const cfg = try mmConfig(.{ .rows = m, .n = n, .k = k, .max_tiles = t.max_tiles, .plan = p, .bits = bits, .group = group, .mx = mx, .mapped = true, .paired = pair != null, .weighted = row_wt.ctx != null, .limit = if (pair) |v| v.limit else 0 });
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     return applyOne(try mapKernel(pair != null), &inputs, cfg, s);
 }
@@ -402,7 +414,7 @@ fn expectBitEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !void {
     try std.testing.expect(try arraysEqual(a, b, s));
 }
 
-fn canaryMapped(key: CanaryKey, paired: bool, s: mlx.mlx_stream) !bool {
+fn canaryMapped(key: CanaryKey, paired: bool, weighted: bool, s: mlx.mlx_stream) !bool {
     const rows: c_int = 340;
     const tokens: c_int = 97;
     const experts: c_int = 8;
@@ -417,11 +429,13 @@ fn canaryMapped(key: CanaryKey, paired: bool, s: mlx.mlx_stream) !bool {
     const counts = [_]u32{ 70, 0, 5, 33, 64, 17, 140, 11 };
     var ids_data: [rows]u32 = undefined;
     var map_data: [rows]u32 = undefined;
+    var wt_data: [rows]f32 = undefined;
     var pos: usize = 0;
     for (counts, 0..) |count, expert| {
         for (0..count) |_| {
             ids_data[pos] = @intCast(expert);
             map_data[pos] = @intCast((pos * 7 + 3) % tokens);
+            wt_data[pos] = 0.15 + @as(f32, @floatFromInt((pos * 19 + 5) % 97)) * 0.02;
             pos += 1;
         }
     }
@@ -429,6 +443,10 @@ fn canaryMapped(key: CanaryKey, paired: bool, s: mlx.mlx_stream) !bool {
     defer _ = mlx.mlx_array_free(ids);
     const map = mlx.mlx_array_new_data(&map_data, &[_]c_int{rows}, 1, .uint32);
     defer _ = mlx.mlx_array_free(map);
+    const row_wt: mlx.mlx_array = if (weighted) mlx.mlx_array_new_data(&wt_data, &[_]c_int{rows}, 1, .float32) else .{ .ctx = null };
+    defer if (row_wt.ctx != null) {
+        _ = mlx.mlx_array_free(row_wt);
+    };
     var x_rep = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x_rep);
     try mlx.check(mlx.mlx_take_axis(&x_rep, x, map, 0, s));
@@ -477,7 +495,7 @@ fn canaryMapped(key: CanaryKey, paired: bool, s: mlx.mlx_stream) !bool {
     const up_ref = try launch(x_rep, uw, us, ub, ids, key.bits, key.group, key.mx, key.plan, s);
     defer _ = mlx.mlx_array_free(up_ref);
     const sigtab = try @import("../hc/hc_prefill.zig").sigmoidTable(s);
-    const got = try launchMapped(x, map, w, sc, bi, ids, .{ .w = uw, .sc = us, .bi = ub, .sigtab = sigtab }, key.bits, key.group, key.mx, key.plan, s);
+    const got = try launchMapped(x, map, w, sc, bi, ids, .{ .w = uw, .sc = us, .bi = ub, .sigtab = sigtab, .row_wt = row_wt }, key.bits, key.group, key.mx, key.plan, s);
     defer _ = mlx.mlx_array_free(got);
     var sig = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sig);
@@ -488,19 +506,29 @@ fn canaryMapped(key: CanaryKey, paired: bool, s: mlx.mlx_stream) !bool {
     try mlx.check(mlx.mlx_sigmoid(&sig, gate_ref, s));
     try mlx.check(mlx.mlx_multiply(&act, gate_ref, sig, s));
     try mlx.check(mlx.mlx_multiply(&ref, act, up_ref, s));
-    return arraysEqual(got, ref, s);
+    if (!weighted) return arraysEqual(got, ref, s);
+    var wt3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wt3);
+    try mlx.check(mlx.mlx_reshape(&wt3, row_wt, &[_]c_int{ rows, 1, 1 }, 3, s));
+    var ref_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref_f32);
+    try mlx.check(mlx.mlx_multiply(&ref_f32, ref, wt3, s));
+    var ref_bf16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref_bf16);
+    try mlx.check(mlx.mlx_astype(&ref_bf16, ref_f32, .bfloat16, s));
+    return arraysEqual(got, ref_bf16, s);
 }
 
-fn armedMapped(key: CanaryKey, paired: bool, s: mlx.mlx_stream) bool {
-    const cache = if (paired) &paired_canaries else &mapped_canaries;
+fn armedMapped(key: CanaryKey, paired: bool, weighted: bool, s: mlx.mlx_stream) bool {
+    const cache = if (!paired) &mapped_canaries else if (weighted) &weighted_canaries else &paired_canaries;
     if (cache.get(key)) |ok| return ok;
     const had_error = mlx.errorPending();
-    const ok = canaryMapped(key, paired, s) catch blk: {
+    const ok = canaryMapped(key, paired, weighted, s) catch blk: {
         mlx.dropLatchedErrorUnless(had_error);
         break :blk false;
     };
     cache.put(std.heap.c_allocator, key, ok) catch return false;
-    if (!ok) log.warn("[gather-nax] {s} canary mismatch: {d}-bit group={d} {s} bm={d} bk={d}\n", .{ if (paired) @as([]const u8, "paired") else "mapped", key.bits, key.group, @tagName(key.plan.sched), key.plan.bm, key.plan.bk });
+    if (!ok) log.warn("[gather-nax] {s} canary mismatch: {d}-bit group={d} {s} bm={d} bk={d}\n", .{ if (!paired) @as([]const u8, "mapped") else if (weighted) "weighted" else "paired", key.bits, key.group, @tagName(key.plan.sched), key.plan.bm, key.plan.bk });
     return ok;
 }
 
@@ -524,7 +552,7 @@ fn sortedGatherMappedAt(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_arr
     if (!nax_available or !mlx.streamIsGpu(s)) return null;
     if (!supported(x, w, sc, bi, idx, bits, group, mx, row_map, prompt)) return null;
     const key = mappedKey(x, w, idx, bits, group, mx, false);
-    if (!armed(key, s) or !armedMapped(key, false, s)) return null;
+    if (!armed(key, s) or !armedMapped(key, false, false, s)) return null;
     const out = try launchMapped(x, row_map, w, sc, bi, idx, null, bits, group, mx, key.plan, s);
     if (!mapped_engaged_logged) {
         mapped_engaged_logged = true;
@@ -533,14 +561,29 @@ fn sortedGatherMappedAt(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_arr
     return out;
 }
 
+fn validWt(row_wt: ?mlx.mlx_array, idx: mlx.mlx_array) bool {
+    const wt = row_wt orelse return true;
+    return wt.ctx != null and mlx.mlx_array_dtype(wt) == .float32 and mlx.mlx_array_ndim(wt) == 1 and mlx.getShape(wt)[0] == mlx.getShape(idx)[0];
+}
+
 pub fn sortedGateUp(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, up_w: mlx.mlx_array, up_sc: mlx.mlx_array, up_bi: mlx.mlx_array, idx: mlx.mlx_array, sigtab: mlx.mlx_array, limit: u32, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    return sortedGateUpWithWt(x, row_map, w, sc, bi, up_w, up_sc, up_bi, idx, sigtab, null, limit, bits, group, mx, nax_available, s);
+}
+
+pub fn sortedGateUpWeighted(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, up_w: mlx.mlx_array, up_sc: mlx.mlx_array, up_bi: mlx.mlx_array, idx: mlx.mlx_array, sigtab: mlx.mlx_array, row_wt: mlx.mlx_array, limit: u32, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    return sortedGateUpWithWt(x, row_map, w, sc, bi, up_w, up_sc, up_bi, idx, sigtab, row_wt, limit, bits, group, mx, nax_available, s);
+}
+
+fn sortedGateUpWithWt(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, up_w: mlx.mlx_array, up_sc: mlx.mlx_array, up_bi: mlx.mlx_array, idx: mlx.mlx_array, sigtab: mlx.mlx_array, row_wt: ?mlx.mlx_array, limit: u32, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!nax_available or !mlx.streamIsGpu(s)) return null;
     if (!supported(x, w, sc, bi, idx, bits, group, mx, row_map, false) or !supported(x, up_w, up_sc, up_bi, idx, bits, group, mx, row_map, false)) return null;
     if (!std.mem.eql(c_int, mlx.getShape(w), mlx.getShape(up_w)) or @rem(mlx.getShape(w)[1], 32) != 0) return null;
     if (sigtab.ctx == null or mlx.mlx_array_dtype(sigtab) != .bfloat16 or mlx.mlx_array_size(sigtab) != 65536) return null;
+    if (!validWt(row_wt, idx)) return null;
+    const weighted = row_wt != null;
     const key = mappedKey(x, w, idx, bits, group, mx, true);
-    if (!armed(key, s) or !armedMapped(key, false, s) or !armedMapped(key, true, s)) return null;
-    const out = try launchMapped(x, row_map, w, sc, bi, idx, .{ .w = up_w, .sc = up_sc, .bi = up_bi, .sigtab = sigtab, .limit = limit }, bits, group, mx, key.plan, s);
+    if (!armed(key, s) or !armedMapped(key, false, false, s) or !armedMapped(key, true, weighted, s)) return null;
+    const out = try launchMapped(x, row_map, w, sc, bi, idx, .{ .w = up_w, .sc = up_sc, .bi = up_bi, .sigtab = sigtab, .row_wt = row_wt orelse .{ .ctx = null }, .limit = limit }, bits, group, mx, key.plan, s);
     if (!paired_engaged_logged) {
         paired_engaged_logged = true;
         log.info("[gather-nax] paired SwiGLU engaged: M={d} E={d} N={d} K={d}\n", .{ mlx.getShape(idx)[0], mlx.getShape(w)[0], mlx.getShape(w)[1], mlx.getShape(x)[2] });
@@ -551,17 +594,28 @@ pub fn sortedGateUp(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, 
 /// `sortedGateUp` over one bank `[E, 2 n, K]` holding each expert's gate rows then its up rows, for a prompt's rows
 /// (`sortedGatherPrompt`): `[M, 1, n]`, the SwiGLU of the two products.
 pub fn sortedGateUpFused(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, sigtab: mlx.mlx_array, limit: u32, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    return sortedGateUpFusedWithWt(x, row_map, w, sc, bi, idx, sigtab, null, limit, bits, group, mx, nax_available, s);
+}
+
+/// `sortedGateUpFused` with per-row routing weights `row_wt` (`[M]` f32) multiplied into the rounded activation.
+pub fn sortedGateUpFusedWeighted(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, sigtab: mlx.mlx_array, row_wt: mlx.mlx_array, limit: u32, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    return sortedGateUpFusedWithWt(x, row_map, w, sc, bi, idx, sigtab, row_wt, limit, bits, group, mx, nax_available, s);
+}
+
+fn sortedGateUpFusedWithWt(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, sigtab: mlx.mlx_array, row_wt: ?mlx.mlx_array, limit: u32, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!nax_available or !mlx.streamIsGpu(s)) return null;
     if (!supported(x, w, sc, bi, idx, bits, group, mx, row_map, true)) return null;
     if (sigtab.ctx == null or mlx.mlx_array_dtype(sigtab) != .bfloat16 or mlx.mlx_array_size(sigtab) != 65536) return null;
+    if (!validWt(row_wt, idx)) return null;
     const ws = mlx.getShape(w);
     const xs = mlx.getShape(x);
     if (@rem(ws[1], 64) != 0) return null;
     const n = @divExact(ws[1], 2);
     const p = plan(mlx.getShape(idx)[0], ws[0], xs[2], n, true);
+    const weighted = row_wt != null;
     const key: CanaryKey = .{ .plan = p, .bits = bits, .group = group, .align_n = @rem(n, 64) == 0, .align_k = @rem(xs[2], p.bk) == 0, .mx = mx };
-    if (!armed(key, s) or !armedMapped(key, false, s) or !armedMapped(key, true, s)) return null;
-    const out = try launchMapped(x, row_map, w, sc, bi, idx, .{ .w = w, .sc = sc, .bi = bi, .sigtab = sigtab, .limit = limit, .up_off = n }, bits, group, mx, p, s);
+    if (!armed(key, s) or !armedMapped(key, false, false, s) or !armedMapped(key, true, weighted, s)) return null;
+    const out = try launchMapped(x, row_map, w, sc, bi, idx, .{ .w = w, .sc = sc, .bi = bi, .sigtab = sigtab, .row_wt = row_wt orelse .{ .ctx = null }, .limit = limit, .up_off = n }, bits, group, mx, p, s);
     if (!paired_engaged_logged) {
         paired_engaged_logged = true;
         log.info("[gather-nax] paired SwiGLU engaged (fused bank): M={d} E={d} N={d} K={d}\n", .{ mlx.getShape(idx)[0], ws[0], n, xs[2] });
@@ -937,6 +991,89 @@ test "segmented NAX sorted gather: a gate/up bank fused along its rows gives the
             defer _ = mlx.mlx_array_free(got);
             try expectBitEqual(want, got, s);
         }
+    }
+}
+
+test "segmented NAX sorted gather: weighted paired SwiGLU matches unweighted times row_wt bit for bit" {
+    try requireNax();
+    if (mlx.virtualGpu()) return error.SkipZigTest;
+    errdefer dropOwnLatch();
+    const s = mlx.gpuStream();
+    const alloc = std.testing.allocator;
+    const sigtab = try @import("../hc/hc_prefill.zig").sigmoidTable(s);
+    const Case = struct { tokens: c_int, experts: c_int, top_k: c_int, bits: u32, group: u32, mx: bool, limit: u32 };
+    const cases = [_]Case{
+        .{ .tokens = 700, .experts = 32, .top_k = 6, .bits = 2, .group = 64, .mx = false, .limit = 10 },
+        .{ .tokens = 700, .experts = 32, .top_k = 6, .bits = 3, .group = 64, .mx = false, .limit = 10 },
+        .{ .tokens = 320, .experts = 32, .top_k = 6, .bits = 4, .group = 64, .mx = false, .limit = 0 },
+        .{ .tokens = 320, .experts = 32, .top_k = 6, .bits = 8, .group = 32, .mx = false, .limit = 0 },
+        .{ .tokens = 320, .experts = 32, .top_k = 6, .bits = 4, .group = 32, .mx = true, .limit = 0 },
+        .{ .tokens = 320, .experts = 32, .top_k = 6, .bits = 4, .group = 16, .mx = true, .limit = 0 },
+    };
+    for (cases) |c| {
+        const rows = c.tokens * c.top_k;
+        const n: c_int = 128;
+        const k: c_int = 1024;
+        const ids_data = try alloc.alloc(u32, @intCast(rows));
+        defer alloc.free(ids_data);
+        skewedRouting(ids_data, @intCast(c.experts));
+        const map_data = try alloc.alloc(u32, @intCast(rows));
+        defer alloc.free(map_data);
+        const wt_data = try alloc.alloc(f32, @intCast(rows));
+        defer alloc.free(wt_data);
+        for (map_data, wt_data, 0..) |*m, *w, i| {
+            m.* = @intCast((i * 73 + 11) % @as(usize, @intCast(c.tokens)));
+            w.* = 0.05 + @as(f32, @floatFromInt((i * 37 + 7) % 101)) * 0.025;
+        }
+        const ids = mlx.mlx_array_new_data(ids_data.ptr, &[_]c_int{rows}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(ids);
+        const row_map = mlx.mlx_array_new_data(map_data.ptr, &[_]c_int{rows}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(row_map);
+        const row_wt = mlx.mlx_array_new_data(wt_data.ptr, &[_]c_int{rows}, 1, .float32);
+        defer _ = mlx.mlx_array_free(row_wt);
+        const gate = try randomBank(c.experts, n, k, c.bits, c.group, c.mx, 0x2267, s);
+        defer gate.deinit();
+        const up = try randomBank(c.experts, n, k, c.bits, c.group, c.mx, 0x4521, s);
+        defer up.deinit();
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_random_normal(&x, &[_]c_int{ c.tokens, 1, k }, 3, .bfloat16, 0, 0.5, gate.key, s));
+
+        const base = (try sortedGateUp(x, row_map, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, ids, sigtab, c.limit, c.bits, c.group, c.mx, true, s)) orelse return error.KernelDeclinedTestShape;
+        defer _ = mlx.mlx_array_free(base);
+        var wt3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wt3);
+        try mlx.check(mlx.mlx_reshape(&wt3, row_wt, &[_]c_int{ rows, 1, 1 }, 3, s));
+        var ref_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref_f32);
+        try mlx.check(mlx.mlx_multiply(&ref_f32, base, wt3, s));
+        var want = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(want);
+        try mlx.check(mlx.mlx_astype(&want, ref_f32, .bfloat16, s));
+
+        const got_split = (try sortedGateUpWeighted(x, row_map, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, ids, sigtab, row_wt, c.limit, c.bits, c.group, c.mx, true, s)) orelse return error.KernelDeclinedTestShape;
+        defer _ = mlx.mlx_array_free(got_split);
+        try expectBitEqual(want, got_split, s);
+
+        var fused: [3]mlx.mlx_array = undefined;
+        for ([_][2]mlx.mlx_array{ .{ gate.w, up.w }, .{ gate.sc, up.sc }, .{ gate.bi, up.bi } }, &fused, 0..) |pair, *o, fi| {
+            if (pair[0].ctx == null) {
+                o.* = .{ .ctx = null };
+                continue;
+            }
+            _ = fi;
+            const v = mlx.mlx_vector_array_new_data(&pair, 2);
+            defer _ = mlx.mlx_vector_array_free(v);
+            o.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_concatenate_axis(o, v, 1, s));
+            try mlx.check(mlx.mlx_array_eval(o.*));
+        }
+        defer for (fused) |f| if (f.ctx != null) {
+            _ = mlx.mlx_array_free(f);
+        };
+        const got_fused = (try sortedGateUpFusedWeighted(x, row_map, fused[0], fused[1], fused[2], ids, sigtab, row_wt, c.limit, c.bits, c.group, c.mx, true, s)) orelse return error.KernelDeclinedTestShape;
+        defer _ = mlx.mlx_array_free(got_fused);
+        try expectBitEqual(want, got_fused, s);
     }
 }
 

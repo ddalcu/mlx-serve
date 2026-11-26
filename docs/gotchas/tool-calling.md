@@ -300,10 +300,11 @@ emitted a real opener, `saw_think_open`). Guard: the stream/non-stream split inv
 the server invariant and branch on the model's choice, never "the model must think".
 
 ### A model that opens its own think block had no way in
-Defect: Gemma 4, LFM2.5-8B-A1B and Muse streamed their thought as the answer. Cause: the model's own opener
-(`<|channel>` + `thought`, a bare `<think>`, Muse's ` to=self<|message|>`) was swallowed by the marker skip before the
-plain arm saw it. Fix: `modelThinkOpener` latches before the marker skip; `promptOpensMuseHeader` arms the header skip
-at stream start. Guard: `test_thinking_tools.sh` 6b, the smoke matrix stream-vs-non-stream thinking check.
+Defect: Gemma 4, LFM2.5-8B-A1B, Muse and Inkling streamed their thought as the answer. Cause: the model's own opener
+(`<|channel>` + `thought`, a bare `<think>`, Muse's ` to=self<|message|>`, Inkling's `<|content_thinking|>`) was
+swallowed by the marker skip before the plain arm saw it. Fix: `modelThinkOpener` latches before the marker skip;
+`promptOpensMuseHeader` arms the header skip at stream start. Guard: `test_thinking_tools.sh` 6b, the smoke matrix
+stream-vs-non-stream thinking check (a family the matrix does not list is not guarded).
 
 ### `.hold_thinking` streamed nothing for seconds with tools
 Defect: with tools and thinking the first reasoning byte arrived after 4.4 s instead of 0.05 s. Cause: the hold arm
@@ -374,3 +375,10 @@ Defect: a GLM-5.3-Flash answer restated one paragraph 52 times until the client 
 Cause: each copy opened with the same ~130-token head and ended with a tail the model reworded. No exact cycle exists, and the tails held the near-repeat novelty at 0.376, inside the healthy band; no novelty bar separates it from procedural code.
 Fix: a fourth tier, `recurring_span`: the last 96 tokens recur verbatim 12 times, carry at least 24 distinct tokens, and the copies cover `near_repeat_min_span` (`loop_guard.recurringSpanStart`). Records that share one long block fire it too, and a cut drops a whole tool call, so the tier abstains once the answer opens one (`loop_stop.spanCutYieldsToToolCall`). A speculative tick commits several tokens, so the tier checks every tail end committed since the guard last ran (`Slot.loop_guard_seen`), not a fixed count that a wider block would outgrow.
 Guard: the `degenerateTail` fixed-head tests (conviction, acquittal, the stride-8 walk) and `a recurring-span cut yields to an open tool call` (`loop_stop.zig`).
+
+### An Inkling reply cut after its opener shipped the marker
+Defect: a pi agent on a 16 GB Mac (Inkling 2, 45k context) ended its session on the reply `<|message_model|>`.
+Cause: near its window pi asked `max_tokens` 1; the one token was the message opener, `splitInklingChannels` stripped
+it, found no channel and returned null, and the generic split shipped the raw marker, which the leak trim (cutting at
+the invoke marker) let through. Fix: a text holding only the message head splits to empty content. Guard: corpus `a
+reply cut after its message opener ships no marker`.

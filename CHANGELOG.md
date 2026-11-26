@@ -1,5 +1,12 @@
 # Changelog
 
+## v26.11.4 — Inkling 2 Mini
+
+- **Inkling 2 Mini.** Thinking Machines' looped 26B model runs straight from its released checkpoint, or from an mlx-lm pack: it reads images, drafts ahead with the head it ships, and serves several chats at once, checking their drafts together on the GPU. With a DFlash2 drafter in the pack, each round checks a small tree of candidate continuations in one pass.
+- **Fixes.** On 16 and 32 GB Macs the prompt cache keeps room for a long conversation instead of re-reading it every turn. `--os-reserve-gib` takes effect again. `logprobs` stay valid JSON when a value is not a number. Inkling models follow the reasoning effort a client asks for instead of always thinking hard. A streamed Inkling reply keeps its thinking out of the answer.
+
+---
+
 ## v26.11.3 — Quick Create, H3 Image and Flash, Ming Speech, Steadier Memory
 
 - **Quick Create.** Add photos of your people and pets once, pick a template, and the app makes the rest on your Mac: videos with sound and captions (talking pets, a message from Santa, reaction memes that save as a GIF, a dance party, a hug with your younger self), pictures with meme text (a royal portrait, a LinkedIn headshot, a movie poster, an action figure), and songs written and sung for them (a birthday song, a sitcom theme, a power ballad, a roast rap), each ready to share. Every option shows a preview, finished work stays in a history beside the gallery, and a Mac on your network that has the model can make it when yours can't.

@@ -175,6 +175,9 @@ pub const Scheduler = struct {
     /// Set on unload: the OS hands freed pages back lazily, so the budget revise repeats
     /// before each prefill batch while this is armed and settles as the ceiling recovers.
     budget_revise_sw: ?io_util.Stopwatch = null,
+    /// Inference thread only. The running decode tick's clock: a slot that finishes inside the tick
+    /// is charged its part before `finishSlot` records and publishes its decode time.
+    decode_tick: ?io_util.Stopwatch = null,
     promise_ledger: PromiseLedger = .{},
     /// Inference thread only. Greater than 0 while a prefill started at a chunk boundary runs: it may
     /// tick decoders at its own boundaries but never admits.

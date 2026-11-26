@@ -955,16 +955,19 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // `--warmup-full`: ready only once it has served its own first requests, so whoever asks next measures the model,
     // not its compiles. Otherwise it is ready now and owes a short warm-up for when the server is idle.
     const chat = ModelRegistry.chatCapable(entry);
-    if (params.warmup_full) if (warm_marker) |marker| {
-        if (!chat or warm_requests.run(sch, entry)) warm_requests.remember(marker);
-        warm_marker = null;
-    };
+    if (params.warmup_full) {
+        if (warm_marker) |marker| {
+            if (!chat or warm_requests.run(sch, entry)) warm_requests.remember(marker);
+            warm_marker = null;
+        }
+        warm_requests.timeRounds(sch, entry);
+    }
 
     sch.registry.mutex.lockUncancelable(sch.io);
     entry.bytes_live = bytes_live;
     sch.registry.markReadyLocked(entry, bytes_resident);
     sch.registry.mutex.unlock(sch.io);
-    if (warm_marker) |marker| warm_requests.owe(sch, entry, marker, verify_rows, chat);
+    warm_requests.owe(sch, entry, warm_marker, verify_rows, chat);
     publishHotCacheResidency(sch);
 }
 

@@ -53,6 +53,8 @@ test {
     _ = @import("plugins/hy_v3/mtp_head_test.zig");
     _ = @import("plugins/gemma3/proof_test.zig");
     _ = @import("plugins/inkling/proof_test.zig");
+    _ = @import("plugins/inkling2/proof_test.zig");
+    _ = @import("plugins/inkling2/served_test.zig");
     _ = @import("plugins/nemotron_h/proof_test.zig");
     _ = @import("plugins/nemotron_h/mtp_head_test.zig");
     _ = @import("plugins/gemma4/proof_test.zig");
@@ -236,6 +238,7 @@ test {
     _ = @import("host/api/responses/model.zig");
     _ = @import("host/http/ws.zig");
     _ = @import("sdk/spec/pld_index.zig");
+    _ = @import("sdk/spec/rounds.zig");
     _ = @import("sdk/blocks/attention/kv_quant.zig");
     _ = @import("host/registry/model_settings.zig");
     _ = @import("host/registry/load_progress.zig");

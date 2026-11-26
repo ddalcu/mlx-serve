@@ -63,6 +63,8 @@ pub fn specInitWiring(
         .use_pld = false,
         .native_intent = has_native_draft and enable_mtp,
     };
+    // A plugin's own block drafter over the shell's caches verifies and commits by itself: no shell mode beside it.
+    if (has_native_draft) return .{ .use_mtp = false, .use_drafter = false, .use_dflash = false, .use_pld = false, .native_intent = enable_mtp };
     // enable_drafter is the request-level "assistant sidecar" switch for BOTH
     // sidecar kinds; the loader guarantees at most one of drafter/dflash is
     // loaded per model. Priority: dflash > MTP > gemma drafter > PLD — a
@@ -266,6 +268,12 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
     //        enable_mtp, has_mtp, enable_drafter, has_drafter, has_dflash,
     //        enable_pld)
 
+    // A shell-cached arch with its own drafter rides it alone, on the MTP flag.
+    {
+        const w = specInitWiring(false, false, true, true, false, true, false, false, true);
+        try testing.expect(w.native_intent and !w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
+        try testing.expect(!specInitWiring(false, false, true, false, false, true, false, false, true).native_intent);
+    }
     // Plain arch: today's precedence, unchanged.
     {
         const w = specInitWiring(false, false, false, true, true, true, true, false, true);

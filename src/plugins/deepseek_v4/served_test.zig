@@ -31,6 +31,7 @@ const finish_request = @import("../../engines/mlx/finish.zig");
 const scheduler = @import("../../engines/mlx/scheduler.zig");
 const RequestSlot = @import("../../engines/mlx/slot.zig").Slot;
 const registry = @import("../../host/registry/registry.zig");
+const metrics_mod = @import("../../host/metrics/metrics.zig");
 
 const testing = std.testing;
 const Array = mlx.mlx_array;
@@ -58,6 +59,7 @@ const Served = struct {
     after_greedy: bool = false,
 
     fn open(table: *const abi.ModelTable, files: []const sdk.fixture.File, tape: []const u8) !*Served {
+        mlx.installErrorHandler(); // the model's threadgroup probes raise on M1/M2: latch it, never exit
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
         const p = try a.create(Served);
@@ -229,6 +231,29 @@ test "deepseek_v41 served: disk-disabled requests retain alternating RAM convers
     }
 }
 
+test "deepseek_v41 served: a prefill admitted at a chunk boundary leaves the outer prefill's progress gauges alone" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    var m = metrics_mod.Metrics.init();
+    h.sch.metrics = &m;
+    h.sch.requests_prefilling = .init(1);
+    h.sch.inflight_prefill_tokens = .init(4096);
+    h.sch.inflight_prefill_expected = .init(8192);
+    h.sch.boundary_depth = 1;
+    const guest = try h.prefill(&.{ 3, 17, 42, 9, 7, 25, 1, 60 });
+    defer guest.deinit();
+    finish_request.releasePluginSlot(guest);
+    try testing.expectEqual(@as(u64, 1), h.sch.requests_prefilling.load(.monotonic));
+    try testing.expectEqual(@as(u64, 4096), h.sch.inflight_prefill_tokens.load(.monotonic));
+    try testing.expectEqual(@as(u64, 8192), h.sch.inflight_prefill_expected.load(.monotonic));
+}
+
 test "deepseek_v41 served: an ablated request restores and commits only entries of its own profile and strength" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -308,6 +333,7 @@ const Requests = struct {
         h.sch.max_concurrent = 4;
         h.sch.boundary_depth = 0;
         h.sch.boundary_outer = null;
+        h.sch.decode_tick = null;
         h.sch.hot_prefix_cache = h.entry.prefix_cache;
         h.sch.digest_mu = .init;
         h.sch.hot_cache_digests = &.{};
@@ -762,6 +788,37 @@ test "deepseek_v41 served: cancel, pad-only, failed forward and mismatched snaps
     try testing.expectEqual(@as(u64, 0), driver.stateBytes(&p.xfm));
 }
 
+test "deepseek_v41 served: a cancelled slot drained from the cleanup queue returns its buffers to the OS" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    const abandoned = try h.newSlot(&.{ 3, 17, 42, 9, 7, 25, 1, 60 });
+    const id = @import("../../engines/mlx/plugin/settle.zig").slotId(p.xfm.plugin.?, &abandoned.ctx);
+    try testing.expect(driver.auxBeginPrompt(&p.xfm, id, abandoned.full_prompt, null, 0, true).isOk());
+    {
+        var g = ops.Graph.init(testing.allocator, mlx.gpuStream());
+        defer g.deinit();
+        try ops.eval(try g.adopt(try p.xfm.forwardWith(&abandoned.ctx, try g.fromSlice(i32, &.{ 3, 17, 42, 9, 7, 25, 1 }, &.{ 1, 7 }))));
+    }
+    abandoned.cancelled.store(true, .release);
+    try h.sch.cleanup_queue.append(testing.allocator, abandoned);
+    _ = mlx.mlx_synchronize(mlx.gpuStream());
+    _ = mlx.mlx_clear_cache();
+    var held: usize = 0;
+    _ = mlx.mlx_get_active_memory(&held);
+    try testing.expect(@import("../../engines/mlx/runtime/loop.zig").drainSideQueues(&h.sch));
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    try testing.expect(active < held);
+    var pooled: usize = 0;
+    _ = mlx.mlx_get_cache_memory(&pooled);
+    try testing.expectEqual(@as(usize, 0), pooled);
+}
+
 test "deepseek_v41 served: a prefill cancelled past the commit floor is committed where it stopped, and the same prompt resumes there" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -819,6 +876,37 @@ test "deepseek_v41 served: a prefill cancelled past the commit floor is committe
     defer s.deinit();
     try testing.expectEqual(@as(u32, @intCast(stop)), s.cached_tokens);
     finish_request.releasePluginSlot(s);
+}
+
+test "deepseek_v41 served: a request that ends inside a decode tick is charged that tick's decode time" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    var m = @import("../../host/metrics/metrics.zig").Metrics.init();
+    h.sch.metrics = &m;
+    h.sch.force_batched = false;
+    h.sch.inflight_generated_tokens = .init(0);
+    defer h.sch.decoding.deinit(testing.allocator);
+    const s = try h.newSlot(&.{ 3, 17, 42, 9, 7, 25, 1, 60 });
+    defer s.deinit();
+    try testing.expectEqual(.decoding, @import("../../engines/mlx/step.zig").prefillAdmitted(&h.sch, s));
+    var before_last: u64 = 0;
+    var total: u64 = 0;
+    for (0..8) |_| {
+        if (s.finished) break;
+        try testing.expect(s.error_code == null);
+        before_last = total;
+        total += @import("../../engines/mlx/prefill_interleave.zig").interleaveDecodeTick(&h.sch);
+    }
+    try testing.expect(s.finished);
+    try testing.expectEqual(@as(u64, 1), m.requests_success_total.load());
+    const charged = m.decode_time_ns.sum.load(.monotonic);
+    try testing.expect(charged > before_last);
+    try testing.expect(charged <= total);
 }
 
 test "deepseek_v41 served: restored state is discarded once when only cold prefill fits" {
@@ -1249,3 +1337,35 @@ test "deepseek_v4 served: mlx-community's withdrawn preview pack is refused by t
     try testing.expectError(error.PluginDeclinedNoLegacy, model.parseConfig(io, testing.allocator, dir));
 }
 
+
+test "deepseek_v41 served: a prefill that fails after admission gives its memory promise back" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    h.sch.promise_ledger = .{};
+    h.sch.gen_reserve_bytes = 0;
+    const Bill = struct {
+        fn numbers(_: *const model.ModelConfig, _: usize, _: u32, _: KVQuantConfig, _: bool) [2]u64 {
+            return .{ 1 << 30, 1 << 40 };
+        }
+        fn refuse(_: *const model.ModelConfig, _: usize, _: u32, _: KVQuantConfig, _: u64, _: u64, _: bool, _: bool) bool {
+            return false;
+        }
+    };
+    const old_numbers = scheduler.prefill_admission_numbers;
+    defer scheduler.prefill_admission_numbers = old_numbers;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_numbers = &Bill.numbers;
+    scheduler.prefill_admission_fits = &Bill.refuse;
+    const s = try h.newSlot(&.{ 3, 17, 42, 9, 7, 25, 1, 60 });
+    defer s.deinit();
+    try testing.expectEqual(.errored, @import("../../engines/mlx/step.zig").prefillAdmitted(&h.sch, s));
+    try testing.expectEqual(@as(u64, 0), h.sch.promise_ledger.promised);
+    try testing.expectEqual(@as(u64, 0), s.memory_promised);
+    finish_request.releasePluginSlot(s);
+}

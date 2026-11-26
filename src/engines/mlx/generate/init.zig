@@ -14,6 +14,7 @@ const round_cost = @import("../spec/round_cost.zig");
 const context = @import("../admission/context.zig");
 const mtp_group_planner = @import("../spec/mtp_group_planner.zig");
 const dflash_policy = @import("../spec/dflash/policy.zig");
+const spec_rounds = @import("../../../sdk/spec/rounds.zig");
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ForwardCtx = transformer_mod.ForwardCtx;
@@ -182,6 +183,12 @@ pub fn initWithOptions(
     const owned_src = pickLookupPromptSource(prompt_ids, options.lookup_prompt);
     const prompt_owned = try allocator.dupe(u32, owned_src);
     errdefer allocator.free(prompt_owned);
+    // A native drafter's state continues the finished slot whose sequence this prompt repeats furthest
+    // (`SamplingParams.repeats`: not for a request that must answer the same twice).
+    if (!sampling.repeats()) if (plugin_driver.adoptFor(xfm, prompt_owned)) |a| {
+        ctx.adopt_slot = a.slot;
+        ctx.adopt_len = a.len;
+    };
 
     // Split prefill: process first N-1 tokens (cache-only, skip lm_head eval),
     // then the last token (produces logits for sampling). This mirrors mlx-lm's
@@ -468,11 +475,14 @@ pub fn initWithOptions(
             errdefer if (dflash_active) {
                 for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
             };
+            errdefer ctx.no_logits = false;
+            ctx.no_logits = options.prompt_logprobs == null and !mtp_capture and !dflash_active and end < loop_end;
             const chunk_logits = if (mtp_capture) blk: {
                 var last_unused = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(last_unused);
                 break :blk try xfm.forwardWithCaptureAll(&ctx, chunk_input, &last_unused, &chunk_hidden_all);
             } else try xfm.forwardWith(&ctx, chunk_input);
+            ctx.no_logits = false;
             if (options.prompt_logprobs) |out| promptLogprobs(allocator, chunk_logits, prompt_ids[pos + 1 .. end + 1], options.logprobs_n, xfm.s, out) catch |err| {
                 _ = mlx.mlx_array_free(chunk_logits);
                 return err;
@@ -796,6 +806,7 @@ pub fn initWithOptions(
     ctx.ssm_cp_positions = &.{};
     ctx.cp_sink = null;
     ctx.last_row_logits = false;
+    ctx.no_logits = false;
     // The prompt is forwarded: from here on the generator's forwards are decode steps, and a plugin's prompt tap must
     // not dump one per token.
     ctx.prefill = false;
@@ -1015,7 +1026,10 @@ pub fn initWithOptions(
             .dspark_enabled = dspark_active,
             .dspark_stochastic = dspark_stochastic,
             // A streamed EXL3 bank verifies the whole block on a greedy request: its verify costs about a plain tick.
-            .dspark_pol = if (dspark_active) if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else null else null,
+            // A plugin's drafter runs the rounds its load's ladder prices; a load not timed yet decodes plainly.
+            .dspark_pol = if (!dspark_active) null else if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else if (plugin_driver.nativeDrafter(xfm) != null) .{
+                .rounds = if (xfm.plugin.?.ladder) |l| .{ .ladder = l, .acc = .{ .prior = if (dspark_stochastic) spec_rounds.Acceptance.SAMPLED else spec_rounds.Acceptance.GREEDY } } else null,
+            } else null,
             .drafter = if (drafter_active) options.drafter else null,
             .drafter_block_size = options.drafter_block_size,
             .dflash = if (dflash_active) options.dflash else null,

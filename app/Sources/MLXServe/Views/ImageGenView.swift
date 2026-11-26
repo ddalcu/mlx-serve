@@ -157,7 +157,7 @@ struct ImageGenView: View {
             Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
         .sheet(isPresented: $showEnhance) {
-            PromptRewriteSheet(title: "Rewrite image prompt", request: { _ in PromptRewriter.image(text: prompt, editing: isEditing, groups: model.promptExamples(editing: isEditing), denseText: model.rendersDenseText, mossCanvas: model.variant == .mossImage ? .init(width: effectiveSize.width, height: effectiveSize.height) : nil, detailedCaption: model.variant == .minimaxH3Image) }, onApply: { prompt = $0 })
+            PromptRewriteSheet(title: "Rewrite image prompt", request: { _ in PromptRewriter.image(text: prompt, editing: isEditing, groups: model.promptExamples(editing: isEditing), denseText: model.rendersDenseText, mossCanvas: model.variant == .mossImage ? .init(width: effectiveSize.width, height: effectiveSize.height) : nil, detailedCaption: model.variant == .minimaxH3Image, source: isEditing ? initImageURL.flatMap { try? Data(contentsOf: $0) } : nil) }, onApply: { prompt = $0 })
                 .environmentObject(appState)
         }
     }

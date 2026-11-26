@@ -153,6 +153,10 @@ pub fn slotFixedKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64, chun
 /// Counts rows held, not the buffer planGrow allocates (KVCache.nextCapacity rounds up in 256-row steps);
 /// full-attention layers round the same way, and the flat runtime floor (KVCache.RESERVE_MIN_TOKENS) covers it.
 fn slotFixedKvBytesUpTo(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64, rows: u64) u64 {
+    if (config.plugin) |b| {
+        const fixed = b.billTerms().fixed_slot_bytes;
+        if (fixed > 0) return fixed;
+    }
     const ring_rows: u64 = @min(@as(u64, config.slidingKeepRows()) +| chunk, rows);
     return config.qsaRingBytes() +| kvBytesPerTokenAtBits(config.slidingRowBytes(), kv_bits) *| ring_rows;
 }
@@ -338,9 +342,15 @@ pub fn prefillFfnWidth(config: *const model_mod.ModelConfig) u64 {
 /// hide. One helper because the auto-context sizer and the admission guard must agree.
 pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
     const one = config.qsaHistoryBytesPerToken();
-    if (one == 0) return 0;
+    if (one == 0) return pluginStatePerToken(config);
     const copies: u64 = if (transformer_mod.qsaHistoryShareEnabled()) 1 else 2;
     return one * copies + config.qsaScoreBankBytesPerToken();
+}
+
+/// A plugin's own state per token beside the KV (`Bill.state_per_token`: inkling2's draft context), billed where the
+/// engine knows none of its own.
+fn pluginStatePerToken(config: *const model_mod.ModelConfig) u64 {
+    return if (config.plugin) |b| b.billTerms().state_per_token else 0;
 }
 
 /// Tokens of cache capacity a request reserves at admission (prompt + generation + one chunk
@@ -418,6 +428,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         // A checked-out entry is the slot's own buffer on every arch; both terms are zero for a share.
         const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
         return .{
+            .state_bytes = seq *| pluginStatePerToken(config),
             .shared_resident_bytes = warm.creditedRows(seq) *| kv_per_tok,
             .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
             .slot_fixed_kv_bytes = slot_fixed,

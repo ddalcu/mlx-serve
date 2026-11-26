@@ -65,7 +65,7 @@ pub fn geometry(a: std.mem.Allocator, config_json: []const u8) !h3.Geometry {
     }, try config_fields.section(root, "text_encoder"), &g.te);
     try config_fields.fill(@TypeOf(g.vae), .{ .{ "layers", "layers" }, .{ "heads", "heads" }, .{ "head_dim", "head_dim" } }, try config_fields.section(root, "video_vae"), &g.vae);
     if (root.get("two_time")) |v| {
-        if (v != .object) return error.BadPackConfig;
+        if (v != .object or root.get("pdd_steps") != null) return error.BadPackConfig;
         g.two_time = try h3.TwoTime.parse(v.object);
         try config_fields.fill(h3.Config, .{.{ "gate", "two_time_gate" }}, v.object, &g.dit);
         if (!(g.dit.two_time_gate > 0)) return error.BadPackConfig;
@@ -329,7 +329,7 @@ test "declaresTask reads the pack's own task list" {
     try std.testing.expect(!declaresTask(a, "{\"note\":\"ref2va\",\"tasks\":[\"t2va\",\"fl2va\"]}", "ref2va"));
 }
 
-test "h3 two-time packs: the schedule and gate come from config.json, and a grid that cannot be sampled is refused" {
+test "h3 two-time packs: the schedule and gate come from config.json; a grid that cannot be sampled, a default past the grids or a PDD contract beside it is refused" {
     const a = std.testing.allocator;
     const good = "{\"two_time\":{\"gate\":0.25,\"default_steps\":2,\"sigma_grids\":{\"2\":[1.0,0.4,0.0],\"4\":[1,0.7,0.3,0.1,0]}}}";
     const g = try geometry(a, good);
@@ -342,5 +342,7 @@ test "h3 two-time packs: the schedule and gate come from config.json, and a grid
         "{\"two_time\":{\"gate\":0.25,\"default_steps\":2,\"sigma_grids\":{\"2\":[1.0,0.4,0.1]}}}",
         "{\"two_time\":{\"gate\":0.25,\"default_steps\":2,\"sigma_grids\":{\"2\":[1.0,0.0,0.4]}}}",
         "{\"two_time\":{\"default_steps\":2,\"sigma_grids\":{\"2\":[1.0,0.4,0.0]}}}",
+        "{\"two_time\":{\"gate\":0.25,\"default_steps\":4294967298,\"sigma_grids\":{\"2\":[1.0,0.4,0.0]}}}",
+        "{\"pdd_steps\":32,\"pdd_step_indices\":[0,32],\"grid_max_t\":0.999,\"two_time\":{\"gate\":0.25,\"default_steps\":2,\"sigma_grids\":{\"2\":[1.0,0.4,0.0]}}}",
     }) |bad| try std.testing.expectError(error.BadPackConfig, geometry(a, bad));
 }

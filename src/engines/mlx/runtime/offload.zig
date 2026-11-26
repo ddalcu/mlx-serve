@@ -149,20 +149,18 @@ fn finished(s: *Served, slot: *Slot, ev: *const abi.Event) void {
         slot.decode_ns = st.decode_ns;
         logSpec(s.kind, st);
     }
-    _ = s.gauges.generated.fetchSub(slot.completion_tokens, .monotonic);
-    if (ev.reason == .failed) {
-        const why = abi.items(u8, ev.verdict.why);
-        log.err("[{s}] request failed: {s}\n", .{ @tagName(s.kind), why });
-        finish.recordSlotEnd(s.metrics, slot, .failed);
-        slot.markError(why);
-        return;
-    }
     const reason: []const u8 = if (slot.cancelled.load(.acquire)) "cancelled" else switch (ev.reason) {
         .stop => "stop",
         .length => "length",
         .cancelled, .failed => "cancelled",
     };
-    finish.recordSlotEnd(s.metrics, slot, finish.finishOutcome(reason, null));
+    finish.moveSlotTokens(s.metrics, &s.gauges.generated, slot, if (ev.reason == .failed) .failed else finish.finishOutcome(reason, null));
+    if (ev.reason == .failed) {
+        const why = abi.items(u8, ev.verdict.why);
+        log.err("[{s}] request failed: {s}\n", .{ @tagName(s.kind), why });
+        slot.markError(why);
+        return;
+    }
     finish.publishSlotTerminator(slot, reason, null);
 }
 

@@ -42,10 +42,14 @@ const decodeBilled = @import("../admission/glm5_bill.zig").decodeBilled;
 const outside_model = @import("../../../sdk/quant/outside_model.zig");
 const group = @import("../ssm/group.zig");
 const entry_mod = @import("../ssm/entry.zig");
+const rounds = @import("../../../sdk/spec/rounds.zig");
 
 const Transformer = transformer_mod.Transformer;
 const ModelConfig = model.ModelConfig;
 const Array = mlx.mlx_array;
+
+/// A finished slot's sequence (`Bound.seqs`).
+pub const Seq = struct { slot: u32 = 0, tokens: std.ArrayList(u32) = .empty, at: u64 = 0 };
 
 /// A loaded plugin model behind a `Transformer` shell (`Transformer.plugin`).
 pub const Bound = struct {
@@ -59,6 +63,13 @@ pub const Bound = struct {
     positions: Positions = .kv_step,
     /// The last slot id handed out (`settle.slotId`).
     next_slot: u32 = 0,
+    /// The sequences the latest finished slots ran, for a native drafter (`noteSequence`, `adoptFor`).
+    seqs: [4]Seq = @splat(.{}),
+    clock: u64 = 0,
+    /// What a native drafter's rounds cost here, timed once after the load (`rounds.Timing`); null until then, and
+    /// for good where the timing request (`ladder_asked`) could not time them: the drafter stays off.
+    ladder: ?rounds.Ladder = null,
+    ladder_asked: bool = false,
     /// Each layer's kind (`CacheHooks.layout`), `.full` past the layout or without one.
     kinds: [128]abi.LayerKind = @splat(.full),
 
@@ -1182,6 +1193,7 @@ fn adoptRotations(xfm: *Transformer, table: *const abi.ModelTable, m: *anyopaque
 
 pub fn unbind(b: *Bound, a: std.mem.Allocator) void {
     b.table.unload(b.model);
+    for (&b.seqs) |*q| q.tokens.deinit(std.heap.c_allocator);
     a.destroy(b);
 }
 
@@ -1241,7 +1253,7 @@ fn slotFor(xfm: *const Transformer, ctx: *const ForwardCtx) cache_ops.Slot {
 }
 
 fn freeOut(out: *const abi.ForwardOut, captured: []const abi.Array) void {
-    for ([_]abi.Array{ out.logits, out.hidden }) |x| if (x.ctx != null) {
+    for ([_]abi.Array{ out.logits, out.hidden, out.draft_probs }) |x| if (x.ctx != null) {
         _ = mlx.mlx_array_free(.{ .ctx = x.ctx });
     };
     for (captured) |x| if (x.ctx != null) {
@@ -1341,11 +1353,13 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     var ablated: Ablated = .{};
     defer ablated.deinit();
     const ablation = try ablated.init(&.{ctx});
+    const want_hidden = !head or ctx.capture_hidden != null or ctx.capture_hidden_all != null;
+    const drop_logits = head and ctx.no_logits and module and !capture and !ctx.spec_verify and !want_hidden and ids.len == 0;
     const f: abi.Forward = .{
         .mode = mode,
         .row_exact = xfm.config.dflash_bound,
-        .logits = if (!head) .none else if (last_row and !capture and !ctx.spec_verify) .last_row else .all_rows,
-        .want_hidden = !head or ctx.capture_hidden != null or ctx.capture_hidden_all != null,
+        .logits = if (!head or drop_logits) .none else if (last_row and !capture and !ctx.spec_verify) .last_row else .all_rows,
+        .want_hidden = want_hidden,
         .rows = rows,
         .tokens = .{},
         .ids = .{ .ctx = token_ids.ctx },
@@ -1374,7 +1388,10 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         .prompt_spans = if (mode == .prefill) .of(ctx.prompt_spans) else .{},
         .ssm_checkpoints = if (mode == .prefill) .of(ctx.ssm_cp_positions) else .{},
         .prefill = ctx.prefill,
+        .adopt_slot = if (ctx.prefill) ctx.adopt_slot else 0,
+        .adopt_len = if (ctx.prefill) ctx.adopt_len else 0,
     };
+    if (ctx.prefill) ctx.adopt_slot = 0;
     var out: abi.ForwardOut = .{ .captured = &captured };
     intree.enter(ctx);
     const v = b.table.forward(b.model, &f, &out);
@@ -1414,6 +1431,10 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         _ = mlx.mlx_array_set(&h, hidden);
         return h;
     }
+    if (drop_logits) {
+        if (out.logits.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = out.logits.ctx });
+        return mlx.mlx_array_new();
+    }
     const logits: Array = .{ .ctx = out.logits.ctx };
     defer _ = mlx.mlx_array_free(logits);
     var shaped = mlx.mlx_array_new();
@@ -1432,13 +1453,30 @@ pub fn nativeDrafter(xfm: *const Transformer) ?*const abi.NativeDrafter {
 
 /// The draft stages of the served model's native drafter (`SpecFacts.native_stages`); 0 without one.
 pub fn nativeStages(xfm: *const Transformer) u32 {
-    if (nativeDrafter(xfm) == null) return 0;
+    const nd = nativeDrafter(xfm) orelse return 0;
+    if (nd.size >= @offsetOf(abi.NativeDrafter, "active") + @sizeOf(?*const fn (*anyopaque) callconv(.c) bool))
+        if (nd.active) |f| if (!f(xfm.plugin.?.model)) return 0;
     return xfm.config.plugin.?.parsed.spec.native_stages;
 }
 
+/// What a native round is asked: the drafts it may keep at most (`cap`), the request's stop ids, drafts to verify in
+/// place of the drafter's (`copy`, `Forward.draft_ids`; empty = the drafter drafts), the law a sampled round draws its
+/// drafts from, the round's ms by the drafts it verifies (`Forward.round_ms`; empty = not timed), and the request's sampling
+/// filter for `step_group`.
+pub const RoundAsk = struct {
+    cap: u32,
+    stops: []const u32 = &.{},
+    copy: []const u32 = &.{},
+    law: ?DraftLaw = null,
+    round_ms: []const f32 = &.{},
+    top_k: u32 = 0,
+    top_p: f32 = 1.0,
+    min_p: f32 = 0.0,
+};
+
 /// One native drafter round from the committed token `t1` (`NativeDrafter.step`); the model's state,
 /// `ctx.cache.step` and `ctx.moe_seq_offset` move to the round's position.
-pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !abi.Round {
+pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, ask: RoundAsk) !abi.Round {
     const b = xfm.plugin.?;
     if (ctx.ablation != null) try roundServes(xfm, b, ctx);
     const nd = nativeDrafter(xfm).?;
@@ -1447,15 +1485,23 @@ pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !abi.
     const pos = [_]u32{@intCast(ctx.cache.step)};
     var ablated: Ablated = .{};
     defer ablated.deinit();
+    // A drafter on the engine's caches (not module-owned state) verifies and commits through them.
+    var slot = slotFor(xfm, ctx);
+    const handles = [_]abi.Handle{slot.handle()};
     const f: abi.Forward = .{
         .mode = .decode,
         .rows = 1,
         .tokens = .of(&tokens),
         .slots = .of(&slot_ids),
         .positions = .of(&pos),
-        .accept_cap = cap,
+        .caches = .of(&handles),
+        .cache_ops = &cache_ops.ops,
+        .accept_cap = ask.cap,
         .suppress_mask = .{ .ctx = if (xfm.suppress_mask) |m| m.ctx else null },
         .ablation = try ablated.init(&.{ctx}),
+        .stop_ids = .of(ask.stops),
+        .draft_ids = .of(ask.copy),
+        .round_ms = .of(ask.round_ms),
     };
     var out: abi.ForwardOut = .{};
     intree.enter(ctx);
@@ -1472,17 +1518,66 @@ pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !abi.
     return out.round;
 }
 
+/// A finished slot's sequence (its prompt, then what it generated), kept for a native drafter: the next request that
+/// repeats it can continue the drafter's state (`adoptFor`). The oldest record goes first.
+pub fn noteSequence(xfm: *Transformer, slot: u32, prompt: []const u32, generated: []const u32) void {
+    if (slot == 0 or nativeDrafter(xfm) == null) return;
+    const b = xfm.plugin.?;
+    var to: usize = 0;
+    for (b.seqs, 0..) |q, i| {
+        if (q.slot == slot) {
+            to = i;
+            break;
+        }
+        if (q.at < b.seqs[to].at) to = i;
+    }
+    const q = &b.seqs[to];
+    q.tokens.clearRetainingCapacity();
+    q.slot = 0;
+    q.tokens.appendSlice(std.heap.c_allocator, prompt) catch return;
+    q.tokens.appendSlice(std.heap.c_allocator, generated) catch return;
+    b.clock += 1;
+    q.slot = slot;
+    q.at = b.clock;
+}
+
+/// A recorded slot and the positions its sequence shares with a prompt. `tail`: the record past them (a repeated
+/// prompt's earlier answer), borrowed until the next record is noted.
+pub const Adopt = struct { slot: u32, len: u64, tail: []const u32 = &.{} };
+
+/// The recorded slot whose sequence agrees longest with `prompt`, the newest on a tie: an older one's drafter state
+/// went to the request that repeated it. Null unless they agree over half of `prompt`: one that shares a template's
+/// first ids with a record would take its state and leave the conversation that owns it none.
+pub fn adoptFor(xfm: *const Transformer, prompt: []const u32) ?Adopt {
+    if (nativeDrafter(xfm) == null) return null;
+    var best: ?Adopt = null;
+    var newest: u64 = 0;
+    for (xfm.plugin.?.seqs) |q| if (q.slot != 0) {
+        const n = std.mem.indexOfDiff(u32, q.tokens.items, prompt) orelse @min(q.tokens.items.len, prompt.len);
+        if (n == 0 or n * 2 < prompt.len) continue;
+        if (best == null or n > best.?.len or (n == best.?.len and q.at > newest)) {
+            best = .{ .slot = q.slot, .len = n, .tail = q.tokens.items[n..] };
+            newest = q.at;
+        }
+    };
+    return best;
+}
+
 /// Whether the served drafter lets the engine accept a block itself (`NativeDrafter.verify` and `finish`): a sampled request.
 pub fn nativeSplit(xfm: *const Transformer) bool {
     const nd = nativeDrafter(xfm) orelse return false;
     return nd.size >= @offsetOf(abi.NativeDrafter, "finish") + @sizeOf(@TypeOf(nd.finish)) and nd.verify != null and nd.finish != null;
 }
 
-pub const Verified = struct { round: abi.Round, logits: Array };
+/// `law`: the drafts' law `[drafts, vocab]` f32 when the drafter drew them (`ForwardOut.draft_probs`), else unset.
+pub const Verified = struct { round: abi.Round, logits: Array, law: Array = .{} };
+
+/// A sampled round's drafter law: drafts drawn at `temperature`, keyed by `seed` (`Forward.draft_temperature`).
+pub const DraftLaw = struct { temperature: f32, seed: u64 };
 
 /// The first half of a native round (`NativeDrafter.verify`): the verified rows' ids and logits `[rows, vocab]`, the
-/// verify left open until `nativeFinish`. The caller frees `logits`.
-pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !Verified {
+/// verify left open until `nativeFinish`. The caller frees `logits` and `law`.
+pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, ask: RoundAsk) !Verified {
     const b = xfm.plugin.?;
     if (ctx.ablation != null) try roundServes(xfm, b, ctx);
     const nd = nativeDrafter(xfm).?;
@@ -1491,7 +1586,26 @@ pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !Ver
     const pos = [_]u32{@intCast(ctx.cache.step)};
     var ablated: Ablated = .{};
     defer ablated.deinit();
-    const f: abi.Forward = .{ .mode = .verify, .rows = 1, .tokens = .of(&tokens), .slots = .of(&slot_ids), .positions = .of(&pos), .accept_cap = cap, .ablation = try ablated.init(&.{ctx}) };
+    // A drafter on the engine's caches commits through them at the finish: the slot outlives this call.
+    ctx.native_slot = slotFor(xfm, ctx);
+    const handles = [_]abi.Handle{ctx.native_slot.handle()};
+    const f: abi.Forward = .{
+        .mode = .verify,
+        .rows = 1,
+        .tokens = .of(&tokens),
+        .slots = .of(&slot_ids),
+        .positions = .of(&pos),
+        .caches = .of(&handles),
+        .cache_ops = &cache_ops.ops,
+        .accept_cap = ask.cap,
+        .suppress_mask = .{ .ctx = if (xfm.suppress_mask) |m| m.ctx else null },
+        .ablation = try ablated.init(&.{ctx}),
+        .stop_ids = .of(ask.stops),
+        .draft_ids = .of(ask.copy),
+        .draft_temperature = if (ask.law) |l| l.temperature else 0,
+        .draft_seed = if (ask.law) |l| l.seed else 0,
+        .round_ms = .of(ask.round_ms),
+    };
     var out: abi.ForwardOut = .{};
     intree.enter(ctx);
     const v = nd.verify.?(b.model, &f, &out);
@@ -1505,7 +1619,7 @@ pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !Ver
         freeOut(&out, &.{});
         return error.PluginForwardFailed;
     }
-    return .{ .round = out.round, .logits = .{ .ctx = out.logits.ctx } };
+    return .{ .round = out.round, .logits = .{ .ctx = out.logits.ctx }, .law = .{ .ctx = out.draft_probs.ctx } };
 }
 
 /// The second half (`NativeDrafter.finish`): keeps `accepted` drafts and moves `ctx.cache.step` and
@@ -1522,6 +1636,160 @@ pub fn nativeFinish(xfm: *Transformer, ctx: *ForwardCtx, accepted: u32) !u64 {
     ctx.cache.step = @intCast(out.round.position);
     ctx.moe_seq_offset.* = @intCast(out.round.position);
     return out.round.position;
+}
+
+/// Whether the served drafter supports fused single-call draft+verify+accept+commit (`NativeDrafter.step_group`).
+pub fn nativeStepGroupAvail(xfm: *const Transformer) bool {
+    const nd = nativeDrafter(xfm) orelse return false;
+    return nd.size >= @offsetOf(abi.NativeDrafter, "step_group") + @sizeOf(@FieldType(abi.NativeDrafter, "step_group")) and nd.step_group != null;
+}
+
+/// Fused single-call round for `n` slots (`NativeDrafter.step_group`): greedy or sampled, each slot with its own
+/// sampling parameters, writing each slot's committed block into `out[k]` and advancing `cache.step`/`moe_seq_offset`.
+/// Returns `error.PluginStepGroupUnsupported` when the plugin declines (caller falls back to split verify/finish).
+pub fn nativeStepGroup(xfm: *Transformer, ctxs: []const *ForwardCtx, t1s: []const u32, asks: []const RoundAsk, out: []abi.Round) !void {
+    const b = xfm.plugin.?;
+    const nd = nativeDrafter(xfm).?;
+    const step_group = nd.step_group orelse return error.PluginStepGroupUnsupported;
+    const n = ctxs.len;
+    if (n == 0 or n > max_native_group) return error.PluginForwardUnsupported;
+    var tokens: [max_native_group][1]u32 = undefined;
+    var slot_ids: [max_native_group][1]u32 = undefined;
+    var pos: [max_native_group][1]u32 = undefined;
+    var handles: [max_native_group][1]abi.Handle = undefined;
+    var fs: [max_native_group]abi.Forward = undefined;
+    var outs: [max_native_group]abi.ForwardOut = @splat(.{});
+    var ablated: Ablated = .{};
+    defer ablated.deinit();
+    for (ctxs, t1s, asks, 0..) |ctx, t1, ask, k| {
+        if (n > 1 and ctx.ablation != null) return error.PluginForwardUnsupported;
+        if (n > 1 or ctx.ablation != null) try roundServes(xfm, b, ctx);
+        tokens[k] = .{t1};
+        slot_ids[k] = .{settle.slotId(b, ctx)};
+        pos[k] = .{@intCast(ctx.cache.step)};
+        ctx.native_slot = slotFor(xfm, ctx);
+        handles[k] = .{ctx.native_slot.handle()};
+        fs[k] = .{
+            .mode = .verify,
+            .rows = 1,
+            .tokens = .of(&tokens[k]),
+            .slots = .of(&slot_ids[k]),
+            .positions = .of(&pos[k]),
+            .caches = .of(&handles[k]),
+            .cache_ops = &cache_ops.ops,
+            .accept_cap = ask.cap,
+            .suppress_mask = .{ .ctx = if (xfm.suppress_mask) |m| m.ctx else null },
+            .ablation = if (n == 1) try ablated.init(&.{ctx}) else null,
+            .stop_ids = .of(ask.stops),
+            .draft_ids = .of(ask.copy),
+            .draft_temperature = if (ask.law) |l| l.temperature else 0,
+            .draft_seed = if (ask.law) |l| l.seed else 0,
+            .round_ms = .of(ask.round_ms),
+            .top_k = ask.top_k,
+            .top_p = ask.top_p,
+            .min_p = ask.min_p,
+        };
+    }
+    if (n == 1) intree.enter(ctxs[0]);
+    const v = step_group(b.model, &fs, &outs, @intCast(n));
+    if (n == 1) intree.leave();
+    if (v.code == .unsupported) return error.PluginStepGroupUnsupported;
+    var ok = v.isOk();
+    for (outs[0..n]) |o| ok = ok and o.round.n > 0 and o.round.n <= abi.max_round_tokens;
+    if (!ok) {
+        log.err("[plugin] {s}: step_group failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
+        return error.PluginForwardFailed;
+    }
+    for (ctxs, outs[0..n], out[0..n]) |ctx, o, *r| {
+        ctx.cache.step = @intCast(o.round.position);
+        ctx.moe_seq_offset.* = @intCast(o.round.position);
+        r.* = o.round;
+    }
+}
+
+/// The most slots one group round carries (the plugin's `max_open`).
+pub const max_native_group = 16;
+
+/// Whether the served drafter opens the verifies of several slots as one forward (`NativeDrafter.verify_group`).
+pub fn nativeGroups(xfm: *const Transformer) bool {
+    const nd = nativeDrafter(xfm) orelse return false;
+    return nd.verify_group != null and nd.finish_group != null;
+}
+
+/// The most slots a group round carries to the benefit of each (`NativeDrafter.group_width`).
+pub fn nativeGroupWidth(xfm: *const Transformer) u32 {
+    const nd = nativeDrafter(xfm) orelse return 1;
+    const width = if (nd.group_width) |call| call(xfm.plugin.?.model) else max_native_group;
+    return @min(width, max_native_group);
+}
+
+/// `nativeVerify` for several slots of one model at once (`NativeDrafter.verify_group`): `ctxs[k]` asks `asks[k]` after
+/// `t1s[k]`; the blocks are read as one forward and stay open together until `nativeFinishGroup`. The caller frees every
+/// `out[k].logits` and `out[k].law`.
+pub fn nativeVerifyGroup(xfm: *Transformer, ctxs: []const *ForwardCtx, t1s: []const u32, asks: []const RoundAsk, out: []Verified) !void {
+    const b = xfm.plugin.?;
+    const nd = nativeDrafter(xfm).?;
+    const n = ctxs.len;
+    var tokens: [max_native_group][1]u32 = undefined;
+    var slot_ids: [max_native_group][1]u32 = undefined;
+    var pos: [max_native_group][1]u32 = undefined;
+    var handles: [max_native_group][1]abi.Handle = undefined;
+    var fs: [max_native_group]abi.Forward = undefined;
+    var outs: [max_native_group]abi.ForwardOut = @splat(.{});
+    for (ctxs, t1s, asks, 0..) |ctx, t1, ask, k| {
+        if (ctx.ablation != null) return error.PluginForwardUnsupported;
+        try roundServes(xfm, b, ctx);
+        tokens[k] = .{t1};
+        slot_ids[k] = .{settle.slotId(b, ctx)};
+        pos[k] = .{@intCast(ctx.cache.step)};
+        ctx.native_slot = slotFor(xfm, ctx);
+        handles[k] = .{ctx.native_slot.handle()};
+        fs[k] = .{
+            .mode = .verify,
+            .rows = 1,
+            .tokens = .of(&tokens[k]),
+            .slots = .of(&slot_ids[k]),
+            .positions = .of(&pos[k]),
+            .caches = .of(&handles[k]),
+            .cache_ops = &cache_ops.ops,
+            .accept_cap = ask.cap,
+            .suppress_mask = .{ .ctx = if (xfm.suppress_mask) |m| m.ctx else null },
+            .stop_ids = .of(ask.stops),
+            .draft_ids = .of(ask.copy),
+            .draft_temperature = if (ask.law) |l| l.temperature else 0,
+            .draft_seed = if (ask.law) |l| l.seed else 0,
+            .round_ms = .of(ask.round_ms),
+        };
+    }
+    const v = nd.verify_group.?(b.model, &fs, &outs, @intCast(n));
+    var ok = v.isOk();
+    for (outs[0..n]) |o| ok = ok and o.logits.ctx != null and o.round.n > 0 and o.round.n <= abi.max_round_tokens;
+    if (!ok) {
+        for (outs[0..n]) |*o| freeOut(o, &.{});
+        log.err("[plugin] {s}: group verify failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
+        return error.PluginForwardFailed;
+    }
+    for (outs[0..n], out[0..n]) |o, *r| r.* = .{ .round = o.round, .logits = .{ .ctx = o.logits.ctx }, .law = .{ .ctx = o.draft_probs.ctx } };
+}
+
+/// `nativeFinish` for the group `nativeVerifyGroup` left open: `accepted[k]` drafts kept of `ctxs[k]`'s round, in the
+/// order it was verified; each slot's state and position move to its round's.
+pub fn nativeFinishGroup(xfm: *Transformer, ctxs: []const *ForwardCtx, accepted: []const u32) !void {
+    const b = xfm.plugin.?;
+    const nd = nativeDrafter(xfm).?;
+    const n = ctxs.len;
+    var slot_ids: [max_native_group]u32 = undefined;
+    var outs: [max_native_group]abi.ForwardOut = @splat(.{});
+    for (ctxs, slot_ids[0..n]) |ctx, *s| s.* = settle.slotId(b, ctx);
+    const v = nd.finish_group.?(b.model, &slot_ids, accepted.ptr, &outs, @intCast(n));
+    if (!v.isOk()) {
+        log.err("[plugin] {s}: group finish failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
+        return error.PluginForwardFailed;
+    }
+    for (ctxs, outs[0..n]) |ctx, o| {
+        ctx.cache.step = @intCast(o.round.position);
+        ctx.moe_seq_offset.* = @intCast(o.round.position);
+    }
 }
 
 /// Whether an embedding batch may reach the forward padded: the legacy forward and an encoder always, a decoder only
@@ -2333,6 +2601,59 @@ test "unsupported disk hooks preserve RAM auxiliary snapshots" {
     try t.expectEqual(@as(usize, 1), fake.frees);
 }
 
+// Bar: a sampled round's verify hands the drafter the slot's caches, their ops and the suppress mask (a drafter on
+// the engine's caches commits through them at its finish), the slot living in the request's context past the call.
+test "plugin driver: a native verify carries the slot's cache, its ops and the suppress mask" {
+    const t = std.testing;
+    const Fake = struct {
+        var caches: usize = 0;
+        var handle: ?abi.Handle = null;
+        var ops_given = false;
+        var mask: ?*anyopaque = null;
+        fn verify(_: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            caches = f.caches.len;
+            handle = if (f.caches.len == 1) f.caches.slice()[0] else null;
+            ops_given = f.cache_ops != null;
+            mask = f.suppress_mask.ctx;
+            const one = [_]f32{0};
+            out.logits = .{ .ctx = mlx.mlx_array_new_data(&one, &[_]c_int{ 1, 1 }, 2, .float32).ctx };
+            out.round = .{ .n = 1, .rows = 1, .position = f.positions.slice()[0] };
+            return .ok;
+        }
+        fn step(_: *anyopaque, _: *const abi.Forward, _: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            return .ok;
+        }
+        fn finish(_: *anyopaque, _: u32, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            out.round = .{ .position = 13 };
+            return .ok;
+        }
+        const drafter: abi.NativeDrafter = .{ .step = &step, .verify = &verify, .finish = &finish };
+        const spec: abi.SpecHooks = .{ .native_drafter = &drafter };
+        const cache: abi.CacheHooks = .{};
+        const weights: abi.WeightHooks = .{};
+        const table: abi.ModelTable = .{ .name = .of("native_fixture"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &cache, .spec = &spec, .weights = &weights };
+    };
+    var m: u8 = 0;
+    var bound: Bound = .{ .table = &Fake.table, .model = &m, .positions = .hybrid };
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    x.batched_kv_append_override = null;
+    const zero = [_]u8{0};
+    const suppress = mlx.mlx_array_new_data(&zero, &[_]c_int{1}, 1, .bool_);
+    defer _ = mlx.mlx_array_free(suppress);
+    x.suppress_mask = suppress;
+    var kv: KVCache = undefined;
+    kv.step = 12;
+    var off: usize = 12;
+    var ctx: ForwardCtx = .{ .cache = &kv, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    const v = try nativeVerify(&x, &ctx, 5, .{ .cap = 4 });
+    defer _ = mlx.mlx_array_free(v.logits);
+    try t.expectEqual(@as(usize, 1), Fake.caches);
+    try t.expectEqual(@intFromPtr(&ctx.native_slot), @intFromPtr(Fake.handle.?));
+    try t.expect(Fake.ops_given);
+    try t.expectEqual(suppress.ctx, Fake.mask);
+}
+
 test "plugin driver: a native round and a finish move moe_seq_offset with cache.step" {
     const t = std.testing;
     const Fake = struct {
@@ -2360,11 +2681,53 @@ test "plugin driver: a native round and a finish move moe_seq_offset with cache.
     kv.step = 12;
     var off: usize = 12;
     var ctx: ForwardCtx = .{ .cache = &kv, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
-    const r = try nativeRound(&x, &ctx, 5, 4);
+    const r = try nativeRound(&x, &ctx, 5, .{ .cap = 4 });
     try t.expectEqual(@as(u64, 15), r.position);
     try t.expectEqual(@as(usize, 15), kv.step);
     try t.expectEqual(kv.step, off);
     try t.expectEqual(@as(u64, 21), try nativeFinish(&x, &ctx, 1));
     try t.expectEqual(@as(usize, 21), kv.step);
     try t.expectEqual(kv.step, off);
+}
+
+// Bar: a finished slot's sequence is kept for a native drafter; a later prompt names the slot it repeats furthest, how
+// far, and what that slot ran past it; the oldest record gives way, and a model without a drafter keeps none.
+test "plugin driver: a prompt names the finished slot whose sequence it repeats" {
+    const t = std.testing;
+    const Fake = struct {
+        fn step(_: *anyopaque, _: *const abi.Forward, _: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            return .ok;
+        }
+        const drafter: abi.NativeDrafter = .{ .step = &step };
+        const spec: abi.SpecHooks = .{ .native_drafter = &drafter };
+        const table: abi.ModelTable = .{ .name = .of("native_fixture"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &.{}, .spec = &spec, .weights = &.{} };
+        const bare: abi.ModelTable = .{ .name = .of("bare_fixture"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &.{}, .weights = &.{} };
+    };
+    var m: u8 = 0;
+    var bound: Bound = .{ .table = &Fake.table, .model = &m };
+    defer for (&bound.seqs) |*q| q.tokens.deinit(std.heap.c_allocator);
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    noteSequence(&x, 3, &.{ 1, 2, 3, 4 }, &.{ 7, 8 });
+    noteSequence(&x, 5, &.{ 1, 2, 9 }, &.{6});
+    const a = adoptFor(&x, &.{ 1, 2, 3, 4 }).?;
+    try t.expectEqual(@as(u32, 3), a.slot);
+    try t.expectEqual(@as(u64, 4), a.len);
+    try t.expectEqualSlices(u32, &.{ 7, 8 }, a.tail);
+    try t.expect(adoptFor(&x, &.{ 4, 4 }) == null);
+    for ([_]u32{ 6, 7, 8 }) |id| noteSequence(&x, id, &.{id}, &.{});
+    // Slot 3, recorded first, gave way.
+    try t.expectEqual(@as(u32, 5), adoptFor(&x, &.{ 1, 2, 3, 4 }).?.slot);
+    // A prompt that shares only its first ids with a record takes no state.
+    try t.expect(adoptFor(&x, &.{ 1, 2, 4, 4, 4 }) == null);
+    // The same prompt answered twice: the later answer's slot holds the drafter's state.
+    noteSequence(&x, 10, &.{ 1, 2, 3, 4 }, &.{5});
+    noteSequence(&x, 11, &.{ 1, 2, 3, 4 }, &.{6});
+    const again = adoptFor(&x, &.{ 1, 2, 3, 4 }).?;
+    try t.expectEqual(@as(u32, 11), again.slot);
+    try t.expectEqualSlices(u32, &.{6}, again.tail);
+    var plain_bound: Bound = .{ .table = &Fake.bare, .model = &m };
+    x.plugin = &plain_bound;
+    noteSequence(&x, 9, &.{ 1, 2 }, &.{});
+    try t.expect(adoptFor(&x, &.{ 1, 2 }) == null);
 }

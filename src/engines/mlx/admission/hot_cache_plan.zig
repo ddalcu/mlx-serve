@@ -332,16 +332,18 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
     // Ungated is the previous `prefixCacheMemForLoad`.
     if (!config.longCtxGated()) {
         const chunk: u64 = pinPrefillChunk(config);
-        // `statePerTokenBilled` is 0 off qwen4_exp.
+        // `statePerTokenBilled` is 0 off qwen4_exp and a plugin that bills its own state.
         const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
             getEffectiveContextLength(config) +| slotFixedKvBytes(config, kv_bits, chunk);
         const ask = ungatedHotCacheAsk(config, requested, http_server.launch().prefix_cache_mem_explicit, kv_bits, getEffectiveContextLength(config), chunk);
-        const clamped = clampedPrefixCacheMem(
-            ask,
-            idleCacheGpuMemoryCeiling(config, active_mem),
-            active_mem,
-            ctx_kv,
-            prefillTransientReserve(config, kv_bits, chunk),
+        const idle_ceiling = idleCacheGpuMemoryCeiling(config, active_mem);
+        const transient = prefillTransientReserve(config, kv_bits, chunk);
+        // An auto context was sized beside a cache share (`computeMemoryContext`): the cache keeps that share of what
+        // nobody holds, though the context's KV, not yet allocated, takes every byte past it.
+        const share: u64 = if (manualContext(config) > 0) 0 else ctxCacheShare(ctxSizingCacheReserve(config), idle_ceiling, active_mem, transient);
+        const clamped = @max(
+            clampedPrefixCacheMem(ask, idle_ceiling, active_mem, ctx_kv, transient),
+            if (ask == 0) share else @min(ask, share),
         );
         // Publishing the resolved budget is kept on every arch: the ANE gate used to reserve the raw ask.
         publishResolvedPrefixCacheMem(clamped);
@@ -647,6 +649,45 @@ test "the hot cache is sized against memory nobody holds, while requests may cou
     );
 }
 
+test "an auto context leaves its hot cache the share it was sized beside" {
+    // Bar: a small idle figure still leaves the cache its sizing share, out of memory nobody holds, and that share
+    // fits beside the context's KV under the request ceiling; an explicit context gets no share.
+    const t = std.testing;
+    const memory_ceiling = @import("../../../host/registry/memory_ceiling.zig");
+    const GB: u64 = 1 << 30;
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "llama"; // arch-scan-exempt: test fixture, not a gate
+    cfg.num_hidden_layers = 28;
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 8;
+    cfg.head_dim = 128;
+    cfg.hidden_size = 3072;
+    cfg.intermediate_size = 8192;
+    cfg.max_position_embeddings = 131072;
+
+    const saved = memory_ceiling.overrides().*;
+    defer memory_ceiling.overrides().* = saved;
+    const orig_ctx = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = orig_ctx;
+    defer clearResolvedPrefixCacheMem();
+    memory_ceiling.overrides().static_ceiling = 30 * GB;
+    memory_ceiling.overrides().wired_limit_mb = 0;
+    memory_ceiling.overrides().machine_free = .{ .idle = 5 * GB, .request = 16 * GB };
+
+    var idle: u64 = 0;
+    http_server.serverState().server_config.max_context_size = 0;
+    const budget = prefixCacheMemForLoad(&cfg, PREFIX_CACHE_MEM_DEFAULT, .{ .quiet = true }, &idle);
+    try t.expect(budget >= GB);
+    try t.expect(budget <= 5 * GB);
+    const kv_bits = defaultKvBits(&cfg);
+    const ctx_kv = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) * getEffectiveContextLength(&cfg);
+    const transient = prefillTransientReserve(&cfg, kv_bits, pinPrefillChunk(&cfg));
+    try t.expect(ctx_kv + budget + transient <= memory_ceiling.currentGpuMemoryCeiling(&cfg, 0));
+
+    http_server.serverState().server_config.max_context_size = 65536;
+    try t.expect(prefixCacheMemForLoad(&cfg, PREFIX_CACHE_MEM_DEFAULT, .{ .quiet = true }, &idle) < GB);
+}
+
 /// A streamed plugin's bill whose prompt the engine prices (a built-in GLM's) or its plugin does (`Bill.prefill_bytes`).
 const StreamedProbe = struct {
     const abi = @import("../../../abi/plugin.zig");
@@ -795,4 +836,59 @@ test "a streamed GLM's load-time hot-cache budget fits the bill's hot-cache term
 
     binding.parsed.caps.streamed_weights = false;
     try t.expectEqual(session, prefixCacheMemForLoad(&glm, PREFIX_CACHE_MEM_DEFAULT, .{ .quiet = true }, &idle));
+}
+
+test "hot-cache plan: outside plugin bill kv_per_token, fixed_slot_bytes, and prefill_attn_keys govern admission" {
+    const t = std.testing;
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    const Outside = struct {
+        fn attnKeys(_: *const StreamedProbe.abi.Parsed, seq: u64) callconv(.c) u64 {
+            return @min(seq, 512 + 128 + 1);
+        }
+        fn bill(_: *const StreamedProbe.abi.Parsed, _: *const StreamedProbe.abi.Shape, out: *StreamedProbe.abi.Bill) callconv(.c) void {
+            out.* = .{
+                .kv_per_token = 890,
+                .fixed_slot_bytes = 24 * MiB,
+                .prefill_attn_keys = &attnKeys,
+                .prefill_bytes = &StreamedProbe.prefill,
+            };
+        }
+    };
+    var table: StreamedProbe.abi.ModelTable = undefined;
+    table.bill = &Outside.bill;
+    table.cache = @import("../../../plugins/deepseek_v41/plugin.zig").table.cache;
+    var binding: @import("../plugin/config.zig").Binding = .{
+        .table = &table,
+        .outside = true,
+        .parsed = .{ .caps = .{ .streamed_weights = true, .owns_decode_state = true } },
+    };
+    binding.readBillTerms();
+
+    var cfg: model_mod.ModelConfig = .{
+        .model_type = "sushi_deepseek_v41",
+        .num_hidden_layers = 40,
+        .num_attention_heads = 64,
+        .num_key_value_heads = 1,
+        .head_dim = 512,
+        .max_position_embeddings = 1_048_576,
+    };
+    cfg.plugin = &binding;
+
+    try t.expectEqual(@as(u64, 890), cfg.kvBytesPerToken());
+    try t.expectEqual(@as(u64, 641), cfg.prefillAttnKeys(262_144));
+    try t.expectEqual(@as(u64, 24 * MiB), slotFixedKvBytes(&cfg, 16, 8192));
+    try t.expectEqual(@as(u64, 890 * 262_144 + 24 * MiB), oneSessionEntryBytes(&cfg, 16, 262_144, 8192));
+
+    // At 256k context on a 225 GiB ceiling with ~147 GiB resident, 890 B/tok (~246 MiB)
+    // keeps the full 8 GiB hot-cache budget instead of clamping to 0 MB under the 81,920 B/tok fallback.
+    const memory_ceiling = @import("../../../host/registry/memory_ceiling.zig");
+    const saved = memory_ceiling.overrides().*;
+    defer memory_ceiling.overrides().* = saved;
+    defer clearResolvedPrefixCacheMem();
+    memory_ceiling.overrides().static_ceiling = 225 * GiB;
+    memory_ceiling.overrides().machine_free = .{ .idle = 78 * GiB, .request = 78 * GiB };
+    cfg.ctx_override = 262_144;
+    var idle: u64 = 0;
+    try t.expectEqual(8 * GiB, prefixCacheMemForLoad(&cfg, 8 * GiB, .{ .quiet = true }, &idle));
 }

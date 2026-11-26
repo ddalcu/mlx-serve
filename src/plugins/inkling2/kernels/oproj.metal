@@ -1,0 +1,26 @@
+// Inkling 2, one row: the attention read ATT [H * HD] (T) times its output gate GATE [H * HD] f32, rounded to T as
+// `gated` leaves it, then the output projection Y [1, 1, N] (T): an affine weight (FMT 3: BITS-bit rows of WQ in MLX's
+// packing, group GS scales WS and biases WB of S) or a dense [N, K] weight of T (FMT 4). grid (32, N, 1), threadgroup
+// (32, SGS, 1): a SIMD group owns one output row, a lane 16 inputs a sweep.
+const uint lane = thread_index_in_simdgroup;
+const uint n = thread_position_in_grid.y;
+constexpr uint WBR = K * BITS / 8;
+constexpr uint SPR = K / GS;
+const device uchar* arow = (const device uchar*)WQ + size_t(n) * WBR;
+const device S* sa = (const device S*)WS + size_t(n) * SPR;
+const device S* ba = (const device S*)WB + size_t(n) * SPR;
+const device T* drow = (const device T*)WQ + size_t(n) * K;
+float acc = 0.0f;
+for (uint c = lane; c < K / 16; c += 32) {
+  float xr[16];
+  for (uint i = 0; i < 16; i++) xr[i] = float(T(float(ATT[c * 16 + i]) * GATE[c * 16 + i]));
+  if (FMT == 3) {
+    acc += msv_ink2_affine_chunk<S, BITS, GS>(arow, sa, ba, c, xr);
+  } else {
+    float d = 0.0f;
+    for (uint i = 0; i < 16; i++) d += float(drow[c * 16 + i]) * xr[i];
+    acc += d;
+  }
+}
+const float v = simd_sum(acc);
+if (lane == 0) Y[n] = T(v);

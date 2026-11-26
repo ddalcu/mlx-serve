@@ -254,6 +254,10 @@ pub fn computeEmbeddingsBatchWith(
         for (results[0..filled]) |r| allocator.free(r);
         allocator.free(results);
     }
+    defer {
+        xfm.resetCache() catch {};
+        _ = mlx.mlx_clear_cache();
+    }
     const max_items: usize = if (plugin_driver.batchesEmbeddings(&xfm.config)) EMBED_MAX_BATCH else 1;
     var start: usize = 0;
     while (start < seqs.len) {
