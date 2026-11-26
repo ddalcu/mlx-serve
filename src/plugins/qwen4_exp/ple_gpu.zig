@@ -119,6 +119,7 @@ fn wrapEmbedded(src: *const qwen4_ple.EmbeddedTable) !Table {
 /// `map` as one no-copy uint8 `[pages, 4096]` array (no dim past int32). The caller has
 /// checked the base and length (`chooseArm`); on success MLX owns the munmap.
 fn wrapMap(map: []const u8) !mlx.mlx_array {
+    if (comptime @import("builtin").os.tag == .windows) return error.PleGpuUnsupportedOnWindows;
     const page = std.heap.pageSize();
     if (@intFromPtr(map.ptr) % page != 0) return error.PleMapMisaligned;
     const len = std.mem.alignForward(usize, map.len, page);

@@ -11,8 +11,7 @@ name: Windows
 # the stage, and CUDA is only installed when the MLX stage has to be rebuilt.
 #
 # A PR runs only when its files reach the Zig graph (`changes`, scripts/ci-changes.sh; a
-# skipped job counts as passing) and builds the fast variant: `-Dstrip`, no zip. It stays
-# ReleaseFast, unlike linux.yml: a Debug link wants `munmap`, which Windows has not got.
+# skipped job counts as passing) and builds stripped Debug without a zip.
 # push to main and workflow_dispatch build what release.yml attaches to a release. Only
 # main saves the cheap caches: a PR's copy is unreadable to every other PR and pushed the
 # repo over the 10 GB cap.
@@ -61,6 +60,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 360
     env:
+      ZIG_OPTIMIZE: ${{ github.event_name == 'pull_request' && 'Debug' || 'ReleaseFast' }}
       MLX_CUDA_ARCHITECTURES: "75;86;120"
       ZIG_CPU: x86_64_v3
       ZIG_BUILD_ARGS: ${{ github.event_name == 'pull_request' && '-Dstrip=true' || '' }}
