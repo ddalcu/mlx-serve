@@ -85,18 +85,16 @@ pub fn WsConn(comptime ConnT: type) type {
                 } else {
                     if (frame.opcode != .continuation) return error.WsProtocol;
                     var buf = &self.in_message.?;
-                    if (buf.items.len + frame.payload.len > max_message_bytes) {
-                        allocator.free(frame.payload);
-                        return error.WsTooLarge;
-                    }
+                    if (buf.items.len + frame.payload.len > max_message_bytes) return error.WsTooLarge;
                     try buf.appendSlice(allocator, frame.payload);
-                    allocator.free(frame.payload);
                     if (frame.fin) {
                         const owned = try buf.toOwnedSlice(allocator);
+                        allocator.free(frame.payload);
                         const op = self.in_opcode;
                         self.in_message = null;
                         return .{ .opcode = op, .payload = owned };
                     }
+                    allocator.free(frame.payload);
                 }
             }
         }
@@ -384,6 +382,58 @@ test "fragmented text reassembles" {
     defer a.free(msg.payload);
     try testing.expectEqual(Opcode.text, msg.opcode);
     try testing.expectEqualStrings("hello!", msg.payload);
+}
+
+test "fragmented message over the cap is refused without a double free" {
+    const a = testing.allocator;
+    // Keeps the 1-byte size class live so a second free is reported, not a segfault.
+    const keep = try a.alloc(u8, 1);
+    defer a.free(keep);
+
+    const big = try a.alloc(u8, max_message_bytes);
+    defer a.free(big);
+    @memset(big, 'x');
+    const f1 = try buildClientFrame(a, .text, false, big);
+    defer a.free(f1);
+    const f2 = try buildClientFrame(a, .continuation, true, "y");
+    defer a.free(f2);
+    const all = try std.mem.concat(a, u8, &.{ f1, f2 });
+    defer a.free(all);
+
+    var mock = MockConn.init(a, all);
+    defer mock.deinit();
+    var ws = WsConn(MockConn).init(&mock);
+    defer ws.deinit(a);
+
+    try testing.expectError(error.WsTooLarge, ws.readMessage(a));
+}
+
+test "fragmented message under allocation failure is refused without a double free" {
+    const a = testing.allocator;
+    const f1 = try buildClientFrame(a, .text, false, "hel");
+    defer a.free(f1);
+    const f2 = try buildClientFrame(a, .continuation, true, "lo!");
+    defer a.free(f2);
+    const all = try std.mem.concat(a, u8, &.{ f1, f2 });
+    defer a.free(all);
+
+    var succeeded = false;
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        var failing = testing.FailingAllocator.init(a, .{ .fail_index = i, .resize_fail_index = i });
+        const fa = failing.allocator();
+        var mock = MockConn.init(a, all);
+        defer mock.deinit();
+        var ws = WsConn(MockConn).init(&mock);
+        defer ws.deinit(fa);
+
+        if (ws.readMessage(fa)) |msg| {
+            defer fa.free(msg.payload);
+            try testing.expectEqualStrings("hello!", msg.payload);
+            succeeded = true;
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+    try testing.expect(succeeded);
 }
 
 test "ping interleaved during fragmented data is reported separately" {
