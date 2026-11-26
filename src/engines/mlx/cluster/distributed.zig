@@ -19,7 +19,7 @@ const ssmFreeQsaState = @import("../../../plugins/qwen4_exp/qsa/history.zig").ss
 const h3_split = @import("../../../plugins/minimax_h3/cluster.zig");
 const wire = @import("../../../sdk/util/wire.zig");
 const lan = @import("../../../host/lan/lan.zig");
-const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
+const dsv41_mod = @import("../plugin/dsv41_link.zig").deepseek_v41;
 
 pub const Mode = enum {
     /// Each rank owns a contiguous range of layers; the hidden stream hops at the seams.
@@ -1098,7 +1098,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
     };
     defer w.deinit();
     const binding = config.plugin orelse return error.NotPluginServed;
-    const m = dsv41_mod.init(allocator, @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed), &w, mlx.gpuStream(), .{ .pair = config.dist_dsv41, .tp = config.dist_shard, .pack_dir = if (pl.mode == .tensor) dir else null }) catch |err| {
+    const m = dsv41_mod.init(allocator, @import("../plugin/dsv41_link.zig").config.of(&binding.parsed), &w, mlx.gpuStream(), .{ .pair = config.dist_dsv41, .tp = config.dist_shard, .pack_dir = if (pl.mode == .tensor) dir else null }) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
         sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
         return err;

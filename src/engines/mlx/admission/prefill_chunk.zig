@@ -45,7 +45,7 @@ const kvBytesPerTokenAtBits = @import("bills.zig").kvBytesPerTokenAtBits;
 const WarmPrefix = @import("bills.zig").WarmPrefix;
 const prefillMemoryNeeded = @import("bills.zig").prefillMemoryNeeded;
 const dsv4PrefillMemoryNeeded = @import("../../../plugins/deepseek_v4/bill.zig").dsv4PrefillMemoryNeeded;
-const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
+const dsv41_mod = @import("../plugin/dsv41_link.zig").deepseek_v41;
 const PREFILL_RUNTIME_FLOOR_BYTES = @import("bills.zig").PREFILL_RUNTIME_FLOOR_BYTES;
 
 /// DeepSeek-V4.1's prompt pass (`deepseek_v41.prefillBytes`) over the engine's config.
@@ -216,7 +216,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
             const rows = dsv41PassRows(config, kv_bits, cap, explicitPrefillChunk(), config.pinned_prefill_chunk);
             config.dsv41_pass_rows = rows;
             config.pinned_prefill_chunk = rows;
-            @import("../../../plugins/deepseek_v41/prompt/keep_wide.zig").pinned(rows, prefillTransientReserve(config, kv_bits, rows));
+            @import("../plugin/dsv41_link.zig").keep_wide.pinned(rows, prefillTransientReserve(config, kv_bits, rows));
             log.info("[prefill] DeepSeek-V4.1 passes of up to {d} rows, cut near-equal (MLX_SERVE_DSV41_PF_PASS_SIZE; {s}, reserve {d} MB of {d} MB)\n", .{ rows, if (explicitPrefillChunk() > 0) "--prefill-chunk" else if (rows == dsv41_mod.passCeil()) "memory-sized, under MLX_SERVE_DSV41_PF_PASS_CEIL's machine ceiling" else "memory-sized", prefillTransientReserve(config, kv_bits, rows) >> 20, cap >> 20 });
         }
         // Say when the ctx bar is the binding one.

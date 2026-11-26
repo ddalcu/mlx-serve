@@ -1941,7 +1941,8 @@ test "isSupportedModelType accepts every served arch spelling (glm5_next)" {
     // its path is answered 404 instead of cold-loading it.
     try testing.expect(isSupportedModelType("glm5_next"));
     try testing.expect(isSupportedModelType("glm5_next_text"));
-    try testing.expect(isSupportedModelType("deepseek_v41"));
+    // A macOS-only plugin is supported where the build registers it.
+    try testing.expectEqual(registry.has("deepseek_v41"), isSupportedModelType("deepseek_v41"));
     // GLM-5.3 left the tree with its streamed pack: an outside plugin can claim it.
     try testing.expect(!isSupportedModelType("glm_moe_dsa"));
 }

@@ -24,11 +24,9 @@
 //! counts its bytes as active memory from the arming on (resident, as the weights are), so the engine's ceiling and
 //! admission, which read MLX's counters, see it. The load's line names its bytes.
 //!
-//! Without the patched libmlx (no `mlx_metal_wide_reserve` symbol), and on every OS but macOS (the patch is to MLX's
-//! Metal allocator), the switch is declined by name.
+//! Without the patched libmlx (no `mlx_metal_wide_reserve` symbol) the switch is declined by name.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const env = @import("../../../env.zig");
 const lev = @import("../levers.zig");
 const log = @import("../../../sdk/util/log.zig");
@@ -40,8 +38,6 @@ const mlx = @import("../../../mlx/ffi.zig");
 pub const min_bytes: usize = 64 << 20;
 /// The reserve's buffers at most.
 pub const max_buffers = 32;
-/// The reserve is a patch to MLX's Metal allocator: only a macOS build looks for it (`std.c.dlopen` differs elsewhere).
-const metal = builtin.os.tag == .macos;
 
 const ReserveFn = *const fn (min: usize, sizes: ?[*]const usize, n: usize) callconv(.c) c_int;
 const StatsFn = *const fn (out: [*]usize, n: usize) callconv(.c) void;
@@ -86,7 +82,6 @@ pub inline fn ps() *State {
 fn lookUp() void {
     if (ps().looked) return;
     ps().looked = true;
-    if (comptime !metal) return;
     const self = std.c.dlopen(null, .{ .LAZY = true }) orelse return;
     if (std.c.dlsym(self, "mlx_metal_wide_reserve")) |f| ps().reserve_fn = @ptrCast(@alignCast(f));
     if (std.c.dlsym(self, "mlx_metal_wide_reserve_stats")) |f| ps().stats_fn = @ptrCast(@alignCast(f));
@@ -163,7 +158,6 @@ pub fn pinned(rows: usize, bill: u64) void {
     ps().bill = bill;
     if (ps().decided or ps().n_per_row == 0 or !lev.onUnlessZero(.PF_KEEP_WIDE)) return;
     ps().decided = true;
-    if (comptime !metal) return log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE declined: the reserve is a patch to MLX's Metal allocator, macOS only\n", .{});
     if (!available()) return log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE declined: the loaded libmlx has no mlx_metal_wide_reserve (patches/mlx-metal-wide-reserve.patch)\n", .{});
     var buf: [max_buffers]usize = undefined;
     const n = atRows(ps().per_row[0..ps().n_per_row], rows, &buf);

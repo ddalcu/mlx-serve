@@ -305,7 +305,7 @@ pub const ModelConfig = struct {
     /// Pipeline-parallel rank: the trunk layers this process holds (`applyLayerSpan`).
     dist_span: ?distributed.LayerSpan = null,
     /// DeepSeek-V4.1 on a two-Mac pair: the worker's layers, kept under their own numbers.
-    dist_dsv41: ?@import("../../plugins/deepseek_v41/deepseek_v41.zig").Pair = null,
+    dist_dsv41: ?@import("../../engines/mlx/plugin/dsv41_link.zig").deepseek_v41.Pair = null,
     /// Tensor-parallel rank: its slice of each MoE expert (`applyShard`).
     dist_shard: ?distributed.Shard = null,
     partial_rotary_factor: f32 = 1.0,
@@ -1000,7 +1000,7 @@ pub const ModelConfig = struct {
 
     /// V4.1's layers split with a worker Mac: the worker keeps ONE decode state and its exchange names no slot, so the
     /// model leaves per-slot state and batched decode and serves one request at a time.
-    pub fn pairDsv41(self: *ModelConfig, p: @import("../../plugins/deepseek_v41/deepseek_v41.zig").Pair) void {
+    pub fn pairDsv41(self: *ModelConfig, p: @import("../../engines/mlx/plugin/dsv41_link.zig").deepseek_v41.Pair) void {
         self.dist_dsv41 = p;
         if (self.plugin) |b| {
             b.parsed.caps.slot_state = false;
@@ -1029,7 +1029,7 @@ pub const ModelConfig = struct {
     /// (`deepseek_v41.PASS_MIN_ROWS`: a box or a `--prefill-chunk` that narrows the chunk keeps today's cut, the engine's
     /// tail merge included). The forward's own config copy holds no pin, so the pass comes in as the request's width.
     pub fn passPrefillChunk(self: *const ModelConfig, pinned: usize, rows: usize) ?usize {
-        const dsv41 = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
+        const dsv41 = @import("../../engines/mlx/plugin/dsv41_link.zig").deepseek_v41;
         if (pinned < dsv41.PASS_MIN_ROWS or !dsv41.passPlanned(self)) return null;
         return dsv41.passRows(rows, pinned);
     }
@@ -4891,7 +4891,7 @@ const TensorWorker = struct {
 /// sources and Engram layers by absolute index); the worker keeps nothing else, and neither
 /// keeps the DSpark stages, which stay off on a pair.
 const Dsv41Keep = struct {
-    pair: @import("../../plugins/deepseek_v41/deepseek_v41.zig").Pair,
+    pair: @import("../../engines/mlx/plugin/dsv41_link.zig").deepseek_v41.Pair,
 
     pub fn remap(self: Dsv41Keep, key: []const u8, _: []u8) ?[]const u8 {
         if (std.mem.startsWith(u8, key, "layers.")) {

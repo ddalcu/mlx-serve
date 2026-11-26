@@ -23,10 +23,12 @@ export fn msv_test_enter() void {
     @import("sdk/testing/world.zig").enter();
     @import("engines/mlx/generate.zig").prefillCli().* = .{};
     @import("host/registry/memory_ceiling.zig").overrides().* = .{};
-    @import("plugins/deepseek_v41/fuse.zig").shared_state.get().* = .{};
-    @import("plugins/deepseek_v41/decode/fp8_codes.zig").shared_state.get().* = .{};
-    @import("plugins/deepseek_v41/prompt/flash_attn.zig").shared_state.get().* = .{};
-    @import("plugins/deepseek_v41/deepseek_v41.zig").testReset();
+    if (@import("engines/mlx/plugin/dsv41_link.zig").on) {
+        @import("plugins/deepseek_v41/fuse.zig").shared_state.get().* = .{};
+        @import("plugins/deepseek_v41/decode/fp8_codes.zig").shared_state.get().* = .{};
+        @import("plugins/deepseek_v41/prompt/flash_attn.zig").shared_state.get().* = .{};
+        @import("plugins/deepseek_v41/deepseek_v41.zig").testReset();
+    }
     @import("plugins/deepseek_v4/deepseek_v4.zig").testReset();
 }
 
@@ -89,7 +91,26 @@ test {
     _ = @import("plugins/bert/proof_test.zig");
     _ = @import("plugins/deepseek_v4/proof_test.zig");
     _ = @import("plugins/deepseek_v4/served_test.zig");
-    _ = @import("plugins/deepseek_v41/proof_test.zig");
+    // DeepSeek-V4.1 is in macOS builds only (`dsv41_link`).
+    _ = @import("engines/mlx/plugin/dsv41_link.zig");
+    if (@import("engines/mlx/plugin/dsv41_link.zig").on) {
+        _ = @import("plugins/deepseek_v41/proof_test.zig");
+        _ = @import("plugins/deepseek_v41/streamed_test.zig");
+        _ = @import("plugins/deepseek_v41/mx_view.zig");
+        _ = @import("plugins/deepseek_v41/vision.zig");
+        _ = @import("engines/mlx/plugin/deepseek_test.zig");
+        _ = @import("plugins/deepseek_v41/engram.zig");
+        _ = @import("plugins/deepseek_v41/deepseek_v41.zig");
+        _ = @import("plugins/deepseek_v41/levers.zig");
+        _ = @import("plugins/deepseek_v41/decode/moe_fp4_test.zig");
+        _ = @import("plugins/deepseek_v41/prompt/m_invariance_test.zig");
+        _ = @import("plugins/deepseek_v41/prompt/pass_async_test.zig");
+        _ = @import("plugins/deepseek_v41/prompt/ced_lazy_test.zig");
+        _ = @import("plugins/deepseek_v41/prompt/wide_test.zig");
+        _ = @import("plugins/deepseek_v41/prompt/trunk_q_test.zig");
+        _ = @import("plugins/deepseek_v41/prompt/pf_int8_plan_test.zig");
+        _ = @import("plugins/deepseek_v41/fuse.zig");
+    }
     _ = @import("plugins/muse_glimmer/proof_test.zig");
     _ = @import("plugins/qwen3_asr/proof_test.zig");
     _ = @import("plugins/qwen3_5/proof_test.zig");
@@ -133,8 +154,6 @@ test {
     _ = @import("sdk/weights/streamed/expert/direct_parts_test.zig");
     _ = @import("sdk/weights/streamed/expert/demand_first_test.zig");
     _ = @import("sdk/weights/streamed/mlx_pack_test.zig");
-    _ = @import("plugins/deepseek_v41/streamed_test.zig");
-    _ = @import("plugins/deepseek_v41/mx_view.zig");
     _ = @import("version.zig");
     _ = @import("mlx/ops.zig");
     _ = @import("mlx/kernels.zig");
@@ -191,7 +210,6 @@ test {
     _ = @import("plugins/muse_glimmer/vision.zig");
     _ = @import("plugins/lfm2/vision.zig");
     _ = @import("plugins/glm5_next/vision.zig");
-    _ = @import("plugins/deepseek_v41/vision.zig");
     _ = @import("plugins/qwen3_5/minicpm_vision.zig");
     _ = @import("plugins/qwen3_5/minicpm_canvas.zig");
     _ = @import("plugins/qwen3_asr/audio_tower.zig");
@@ -275,19 +293,7 @@ test {
     _ = @import("plugins/glm5_next/served_test.zig");
     _ = @import("sdk/bases/kda_hybrid/cuts_test.zig");
     _ = @import("plugins/bailing_hybrid/bill_test.zig");
-    _ = @import("engines/mlx/plugin/deepseek_test.zig");
-    _ = @import("plugins/deepseek_v41/engram.zig");
     _ = @import("sdk/weights/nocache_reader.zig");
-    _ = @import("plugins/deepseek_v41/deepseek_v41.zig");
-    _ = @import("plugins/deepseek_v41/levers.zig");
-    _ = @import("plugins/deepseek_v41/decode/moe_fp4_test.zig");
-    _ = @import("plugins/deepseek_v41/prompt/m_invariance_test.zig");
-    _ = @import("plugins/deepseek_v41/prompt/pass_async_test.zig");
-    _ = @import("plugins/deepseek_v41/prompt/ced_lazy_test.zig");
-    _ = @import("plugins/deepseek_v41/prompt/wide_test.zig");
-    _ = @import("plugins/deepseek_v41/prompt/trunk_q_test.zig");
-    _ = @import("plugins/deepseek_v41/prompt/pf_int8_plan_test.zig");
-    _ = @import("plugins/deepseek_v41/fuse.zig");
     _ = @import("plugins/qwen4_exp/qwen4_exp.zig");
     _ = @import("plugins/qwen4_exp/ple_gpu.zig");
     _ = @import("plugins/kokoro/kokoro.zig");

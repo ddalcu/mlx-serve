@@ -31,6 +31,8 @@ const finish_request = @import("../../engines/mlx/finish.zig");
 const scheduler = @import("../../engines/mlx/scheduler.zig");
 const RequestSlot = @import("../../engines/mlx/slot.zig").Slot;
 const registry = @import("../../host/registry/registry.zig");
+/// DeepSeek-V4.1 is in macOS builds only: its tests skip elsewhere.
+const plugin_registry = @import("../registry.zig");
 
 const testing = std.testing;
 const Array = mlx.mlx_array;
@@ -154,6 +156,7 @@ test "deepseek_v4 served: chunked prefill, host and pipelined decodes and a new 
 }
 
 test "deepseek_v41 served: chunked prefill, host and pipelined decodes and a new request equal the legacy forward bit for bit" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -162,6 +165,7 @@ test "deepseek_v41 served: chunked prefill, host and pipelined decodes and a new
 }
 
 test "deepseek_v41 served: two slots decode in one batched tick through the driver, each slot's step following its state" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -187,6 +191,7 @@ test "deepseek_v41 served: two slots decode in one batched tick through the driv
 }
 
 test "deepseek_v41 served: disk-disabled requests retain alternating RAM conversations after slot release" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -230,6 +235,7 @@ test "deepseek_v41 served: disk-disabled requests retain alternating RAM convers
 }
 
 test "deepseek_v41 served: an ablated request restores and commits only entries of its own profile and strength" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -412,6 +418,7 @@ fn diskPrompt() [513]u32 {
 }
 
 test "deepseek_v41 served: disk import restores exact counters and cold-reference logits" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -449,6 +456,7 @@ test "deepseek_v41 served: disk import restores exact counters and cold-referenc
 }
 
 test "deepseek_v41 served: entries zero and RAM disabled bypass a valid disk history" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -474,6 +482,7 @@ test "deepseek_v41 served: entries zero and RAM disabled bypass a valid disk his
 }
 
 test "deepseek_v41 served: peak refusal precedes tensor loading and preserves the disk record" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const old_fits = scheduler.prefill_admission_fits;
     defer scheduler.prefill_admission_fits = old_fits;
@@ -510,6 +519,7 @@ test "deepseek_v41 served: peak refusal precedes tensor loading and preserves th
 }
 
 test "deepseek_v41 served: idle staging pressure cancels its source before materialization" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -536,6 +546,7 @@ test "deepseek_v41 served: idle staging pressure cancels its source before mater
 }
 
 test "deepseek_v41 served: unsupported disk hooks preserve RAM reuse" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -615,16 +626,19 @@ fn expectDiskMedia(appended: bool) !void {
 }
 
 test "deepseek_v41 served: changed covered media rows miss without poisoning disk history" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (mlx.virtualGpu()) return error.SkipZigTest;
     try expectDiskMedia(false);
 }
 
 test "deepseek_v41 served: appended media leaves an exact disk checkpoint eligible" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (mlx.virtualGpu()) return error.SkipZigTest;
     try expectDiskMedia(true);
 }
 
 test "deepseek_v41 served: disk imports use their owning model with a foreign cache view" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -654,16 +668,19 @@ test "deepseek_v41 served: disk imports use their owning model with a foreign ca
 }
 
 test "deepseek_v41 served: failed imported restore resets the prompt and retires only its record" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (mlx.virtualGpu()) return error.SkipZigTest;
     try expectImportFallback(.restore);
 }
 
 test "deepseek_v41 served: failed restored prompt setup retries cold with zero cached tokens" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (mlx.virtualGpu()) return error.SkipZigTest;
     try expectImportFallback(.prompt);
 }
 
 test "deepseek_v41 served: failed tensor import releases its inputs and prefills cold" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (mlx.virtualGpu()) return error.SkipZigTest;
     try expectImportFallback(.arrays);
 }
@@ -724,6 +741,7 @@ fn expectImportFallback(comptime failure: enum { arrays, restore, prompt }) !voi
 }
 
 test "deepseek_v41 served: cancel, pad-only, failed forward and mismatched snapshot IDs commit nothing" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -763,6 +781,7 @@ test "deepseek_v41 served: cancel, pad-only, failed forward and mismatched snaps
 }
 
 test "deepseek_v41 served: a prefill cancelled past the commit floor is committed where it stopped, and the same prompt resumes there" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -822,6 +841,7 @@ test "deepseek_v41 served: a prefill cancelled past the commit floor is committe
 }
 
 test "deepseek_v41 served: restored state is discarded once when only cold prefill fits" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -874,6 +894,7 @@ test "deepseek_v41 served: restored state is discarded once when only cold prefi
 }
 
 test "deepseek_v41 served: two models retain separate histories even with a foreign current-cache view" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -900,6 +921,7 @@ test "deepseek_v41 served: two models retain separate histories even with a fore
 }
 
 test "deepseek_v41 served: ordinary unload frees retained module entries before their plugin binding" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -927,6 +949,7 @@ test "deepseek_v41 served: ordinary unload frees retained module entries before 
 }
 
 test "deepseek_v41 served: an excluded instance keeps legacy resume through request prefill" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -953,6 +976,7 @@ test "deepseek_v41 served: an excluded instance keeps legacy resume through requ
 }
 
 test "deepseek_v41 served: image rows from Forward.media splice as the legacy seam splices them, across a chunk boundary" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1054,6 +1078,7 @@ test "deepseek_v4 served: DSpark rounds (greedy, then seeded sampling) equal the
 }
 
 test "deepseek_v41 served: DSpark rounds (greedy, then seeded sampling) equal the legacy shell's" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1067,6 +1092,7 @@ test "deepseek_v41 served: DSpark rounds (greedy, then seeded sampling) equal th
 }
 
 test "deepseek_v41 served: a pack that quantized its DSpark heads drafts from them dequantized" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const dsv41 = @import("../deepseek_v41/deepseek_v41.zig");
@@ -1114,6 +1140,7 @@ fn relGap(g: *ops.Graph, got: Array, want: Array) !f32 {
 }
 
 test "deepseek_v41 served: a batched verify gives each state its solo verify's rows, and its kept prefix the state a solo round leaves" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const dsv41 = @import("../deepseek_v41/deepseek_v41.zig");
@@ -1224,6 +1251,7 @@ fn groupRounds(files: []const sdk.fixture.File, prompts: []const []const u32, ou
 }
 
 test "deepseek_v41 served: a slot's greedy DSpark group rounds emit the same tokens whichever slot shares them" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1272,6 +1300,7 @@ fn dsparkTokens(files: []const sdk.fixture.File, sampling: SamplingParams, out: 
 }
 
 test "deepseek_v41 served: a draft-only head (DRAFT_VOCAB) changes the drafts, never the tokens, greedy and seeded" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const dsv41 = @import("../deepseek_v41/deepseek_v41.zig");

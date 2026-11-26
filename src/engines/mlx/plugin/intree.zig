@@ -33,7 +33,8 @@ pub fn module(xfm: *const Transformer) ?*anyopaque {
 // (`ds_want_conf`, the copy-step drafts).
 
 const v4plugin = @import("../../../plugins/deepseek_v4/plugin.zig");
-const v41plugin = @import("../../../plugins/deepseek_v41/plugin.zig");
+const dsv41_link = @import("dsv41_link.zig");
+const v41plugin = dsv41_link.plugin;
 
 /// The DeepSeek-V4 module of the served plugin behind `xfm`; null for any other model.
 pub fn dsv4(xfm: *const Transformer) ?*v4plugin.Module {
@@ -41,10 +42,11 @@ pub fn dsv4(xfm: *const Transformer) ?*v4plugin.Module {
     return if (served(b.table, @import("../../../plugins/deepseek_v4/config.zig").plugin.name)) v4plugin.moduleOf(b.model) else null;
 }
 
-/// The DeepSeek-V4.1 module of the served plugin behind `xfm`; null for any other model.
+/// The DeepSeek-V4.1 module of the served plugin behind `xfm`; null for any other model, and in a build without it.
 pub fn dsv41(xfm: *const Transformer) ?*v41plugin.Module {
+    if (!dsv41_link.on) return null;
     const b = xfm.plugin orelse return null;
-    return if (served(b.table, @import("../../../plugins/deepseek_v41/config.zig").plugin.name)) v41plugin.moduleOf(b.model) else null;
+    return if (served(b.table, dsv41_link.config.plugin.name)) v41plugin.moduleOf(b.model) else null;
 }
 
 /// The typical pair a DeepSeek-V4.1 model's sampled DSpark request takes by default (its plugin's precision); null
