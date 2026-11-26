@@ -448,7 +448,7 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | MOE_PAIR_FP4 | fp4 prompt gate/up (NVFP4 and MXFP4), the scales (NVFP4) and activation in one launch | REORDER (bounded) | test |
 | PF_HC_V2 | Wide-layer hc in three passes, not five | REORDER (bounded) | test |
 | PF_PASS_SIZE | Near-equal memory-sized prompt passes | REORDER (partition) | commit |
-| PF_PASS_CEIL | Prompt passes no wider than the machine's measured knee (39,680 rows on the M5 Ultra 512 GiB; other machines keep the memory-sized width) | REORDER (partition) | test (the plan) and A/B text (the view at 1M +3.27%, 512K +0.84%; NVFP4 already plans under it) |
+| PF_PASS_CEIL | A memory-sized prompt pass's working set capped at the bytes of the knee measured on the M5 Ultra 512 GiB (the bill of 39,680 rows; a narrower memory-sized pass is kept) | REORDER (partition) | test (the plan) and A/B text (the view at 1M +3.27%, 512K +0.84%; NVFP4 already plans under it) |
 | PF_IDX_NAX | Indexer scores on the matrix units | REORDER (bounded) | test (within 2·γ(34) of `idx_tile`, the same top-half picks except near-ties; NAX) |
 | PF_COMP_BF16 | Compressor projection on a bf16 MMA, K blocks summed apart | REORDER | test |
 | PF_IDX_PASS | Indexer queries and head weights once over the pass, the head weights on a shape-cut kernel (16 partial sums) | REORDER | test (head weights no farther from float64 than MLX's GEMM per span; +0.8 GB peak, billed) |

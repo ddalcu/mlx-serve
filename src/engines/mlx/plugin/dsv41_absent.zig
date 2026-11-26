@@ -114,7 +114,7 @@ pub const deepseek_v41 = struct {
         return 0;
     }
 
-    pub fn passCeil() usize {
+    pub fn passKneeBytes() u64 {
         return 0;
     }
 
