@@ -44,6 +44,9 @@ pub const Row = struct {
     accepted: bool = true,
     /// The accepted-lines text when it is more than the engage line.
     accepted_line: ?[]const u8 = null,
+    /// The request conditions (`accepted_conditions`, comma-separated) under which the line is required; written
+    /// `<line>\tif=<conditions>`. A run where one of them does not hold may omit the line. Null: always required.
+    accepted_if: ?[]const u8 = null,
     class_text: []const u8,
     what: []const u8,
     evidence: []const u8,
@@ -71,14 +74,14 @@ pub const rows = [_]Row{
     .{ .name = "CED_LAZY", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted = false, .class_text = "EXACT", .what = "Runs a CED replay once, for its first reader", .evidence = "test (word for word)" },
     .{ .name = "IN_PROJ_MIXR", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Verify in_proj hc mixes as one threadgroup per (mix, row)", .evidence = "test (word for word; M3 or later)" },
     .{ .name = "HC_EXPAND_NORM", .stack = .prefill, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER", .what = "FFN-side hc expand and norm in one launch", .evidence = "A/B text (its test allows 1% relative error, not counted as a bound)" },
-    .{ .name = "PF_MOE_EPI", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Counting-sort route pack in place of two argsorts", .evidence = "test" },
+    .{ .name = "PF_MOE_EPI", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted = false, .class_text = "EXACT", .what = "Counting-sort route pack in place of two argsorts", .evidence = "test" },
     .{ .name = "PF_GU_SEG", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "PF_FP4_GEMM", .engage = .canonical, .class_text = "EXACT", .what = "128 x 128 paired gate/up where the planner picks it", .evidence = "test (word for word, to 8,192 rows, NVFP4 with per-expert scales; NAX)" },
     .{ .name = "PF_KV_ROWS", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Window kv rows on one simdgroup per row", .evidence = "test (word for word)" },
     .{ .name = "PF_COMP_PASS", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "PF_COMP_BF16", .engage = .canonical, .class_text = "EXACT", .what = "Compressor pooling once over the pass, each span's index-key linear on its own groups", .evidence = "test (word for word)" },
     .{ .name = "PF_CED_COMP", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "PF_CED_HC", .engage = .canonical, .class_text = "EXACT", .what = "The CED compressor at the split layer: each span's projection as before, then its norm, index keys and rope over the pass in one compressPass", .evidence = "test (word for word)" },
     .{ .name = "PF_DOWN_TOKORD", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "PF_FP4_GEMM", .engage = .canonical, .class_text = "EXACT", .what = "Staged down writes rows in token order", .evidence = "test" },
     .{ .name = "PF_DOWN_BK32", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "PF_FP4_GEMM", .engage = .canonical, .class_text = "EXACT", .what = "Staged down on the 64 x 64 tile, 32 deep a step, at 96 routed rows an expert and more", .evidence = "test (word for word)" },
-    .{ .name = "PF_FP4_GEMM", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Staged matrix-unit gather for routed gate/up and down", .evidence = "test" },
+    .{ .name = "PF_FP4_GEMM", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted = false, .class_text = "EXACT", .what = "Staged matrix-unit gather for routed gate/up and down", .evidence = "test" },
     .{ .name = "WOA_JOIN", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Joins the spans' wo_a rows in one copy", .evidence = "commit" },
     .{ .name = "PF_ROUTE_PACK", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Router top-6 on a simdgroup per row; one-threadgroup scan", .evidence = "test" },
     .{ .name = "PF_ROUTER_BF16", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Router logits on a bf16 MMA, only where MLX runs one sum (1,707 rows and more)", .evidence = "test" },
@@ -87,16 +90,16 @@ pub const rows = [_]Row{
     .{ .name = "MOE_TAIL", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted = false, .class_text = "EXACT", .what = "MoE combine and hc expand in one launch", .evidence = "test" },
     .{ .name = "FLASH_TRIM", .stack = .attention, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "FLASH_ATTN", .engage = .canonical, .class_text = "EXACT (to FLASH_ATTN)", .what = "FLASH_ATTN with a raw-score block max and 8-byte stores", .evidence = "test" },
     .{ .name = "FFN_IN_SINK", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "ffn_in mix tail in its own launch", .evidence = "test (word for word)" },
-    .{ .name = "SPEC_ENGRAM_AHEAD", .stack = .spec, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "SPEC_SYNC", .engage = .canonical, .class_text = "EXACT", .what = "Queues the next verify's Engram kv behind the draft", .evidence = "test" },
+    .{ .name = "SPEC_ENGRAM_AHEAD", .stack = .spec, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "SPEC_SYNC", .engage = .canonical, .accepted_if = "greedy,spec", .class_text = "EXACT", .what = "Queues the next verify's Engram kv behind the draft", .evidence = "test" },
     .{ .name = "FFN_IN_R5_COLS1", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "5-row ffn_in launch 1 with one column per simdgroup", .evidence = "test (word for word)" },
-    .{ .name = "DRAFT_POS_ONCE", .stack = .spec, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "SPEC_SYNC", .engage = .canonical, .class_text = "EXACT", .what = "Makes draft ring slots and positions once", .evidence = "commit" },
+    .{ .name = "DRAFT_POS_ONCE", .stack = .spec, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "SPEC_SYNC", .engage = .canonical, .accepted_if = "spec", .class_text = "EXACT", .what = "Makes draft ring slots and positions once", .evidence = "commit" },
     .{ .name = "FUSE_WQB_RING", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "The wq_b launch writes the window ring", .evidence = "contract" },
     .{ .name = "ENGRAM_KV_CACHE", .stack = .memory, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "ENGRAM_KV_SLOTS", .engage = .canonical, .class_text = "EXACT (to ENGRAM_KV_SLOTS)", .what = "GPU cache of Engram slot partials, at most 4 GB", .evidence = "test" },
     .{ .name = "FP4_DEC_WORD", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Decodes e2m1 codes a word at a time", .evidence = "test" },
     .{ .name = "FP4_UP_SPLIT", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Shared gate and up rows on separate simdgroups", .evidence = "test" },
     .{ .name = "FP8_FOLD", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .{ .line = "deepseek_v41: decode mxfp8 reads folded" }, .class_text = "EXACT (declines on rare codes)", .what = "Folds 2^8 into the e8m0 scale in mxfp8 reads", .evidence = "test (word for word on finite codes), load scan" },
     .{ .name = "MOE_DOWN_ORDER", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Verify down launch in column-block order", .evidence = "test (bit for bit, R = 2 to 6)" },
-    .{ .name = "FUSE_DOWN_SCALE", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "WEIGHT_PATH", .engage = .{ .line = "deepseek_v41: fused down scale" }, .class_text = "EXACT", .what = "NVFP4 down scale inside the gate/up launch", .evidence = "test (word for word)" },
+    .{ .name = "FUSE_DOWN_SCALE", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "WEIGHT_PATH", .engage = .{ .line = "deepseek_v41: fused down scale" }, .accepted_if = "nvfp4", .class_text = "EXACT", .what = "NVFP4 down scale inside the gate/up launch", .evidence = "test (word for word)" },
     .{ .name = "CED", .stack = .prefill, .class = .reorder, .kind = .on, .off = null, .engage = .{ .none = "the chunked prompt path itself; -prefill keeps it" }, .class_text = "REORDER (row count)", .what = "The chunked prompt path: the decoder layers run again over a chunk's last window rows only", .evidence = "commit (its fixture test is bit for bit only at 16-row chunks)" },
     .{ .name = "MOE_FP4_NAX", .stack = .decode, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .{ .line = "deepseek_v41: fused fp4 MoE decode kernels on" }, .class_text = "REORDER (bounded)", .what = "Fused fp4 MoE decode kernels on the matrix units", .evidence = "test (within 1.25x of the `=0` path's rel-rms against f32, + 1e-4)" },
     .{ .name = "MOE_PAIR_FP4", .stack = .prefill, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER (bounded)", .what = "fp4 prompt gate/up (NVFP4 and MXFP4), the scales (NVFP4) and activation in one launch", .evidence = "test" },
@@ -113,10 +116,10 @@ pub const rows = [_]Row{
     .{ .name = "ATTN_DEC", .stack = .decode, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER", .what = "Decode attention on a shape-cut tile kernel", .evidence = "test" },
     .{ .name = "WOA_PLAIN", .stack = .decode, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER", .what = "Splits merged once; wo_a as a plain grouped GEMV", .evidence = "test" },
     .{ .name = "FUSE_MXFP8_QMM", .stack = .prefill, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .parent = "WEIGHT_PATH", .engage = .{ .line = "deepseek_v41: fused mxfp8 prompt linears" }, .class_text = "REORDER (bounded)", .what = "Prompt mxfp8 linears on MLX's quantized matmul", .evidence = "test (within 1.25x of the `=0` path's rel-rms against f32, + 1e-4)" },
-    .{ .name = "DRAFT_FUSED", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "DRAFT-ONLY", .what = "DSpark stages on the fused decode kernels", .evidence = "test (within 1% relative rms of the op chain)" },
-    .{ .name = "DRAFT_SAMPLE", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "DRAFT-ONLY", .what = "Sampled drafts from q, kept at min(1, p / q)", .evidence = "test (engine: `spec/dspark.zig`, \"dspark sampled verdict\")" },
+    .{ .name = "DRAFT_FUSED", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted_if = "spec", .class_text = "DRAFT-ONLY", .what = "DSpark stages on the fused decode kernels", .evidence = "test (within 1% relative rms of the op chain)" },
+    .{ .name = "DRAFT_SAMPLE", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted_if = "spec", .class_text = "DRAFT-ONLY", .what = "Sampled drafts from q, kept at min(1, p / q)", .evidence = "test (engine: `spec/dspark.zig`, \"dspark sampled verdict\")" },
     .{ .name = "DRAFT_QKV", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "DRAFT-ONLY", .what = "Fuses a stage's wq_a and wkv at load", .evidence = "test (within 1e-3 relative rms, no farther from the op chain)" },
-    .{ .name = "SPEC_SYNC", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "DRAFT-ONLY", .what = "Greedy accept on the GPU; next draft queued behind the verify", .evidence = "A/B text (its test needs a pack)" },
+    .{ .name = "SPEC_SYNC", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted_if = "spec", .class_text = "DRAFT-ONLY", .what = "Greedy accept on the GPU; next draft queued behind the verify", .evidence = "A/B text (its test needs a pack)" },
     .{ .name = "DRAFT_VOCAB", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted = false, .class_text = "DRAFT-ONLY", .what = "Greedy drafts score only the pack's `draft-vocab.txt` ids (default: the pack's file, which the converter writes)", .evidence = "test (and `deepseek_v4/served_test.zig`)" },
     .{ .name = "DRAFT_VOCAB_PROMPT", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .parent = "DRAFT_VOCAB", .engage = .canonical, .accepted = false, .class_text = "DRAFT-ONLY", .what = "A request's prompt ids join the draft vocabulary", .evidence = "test (`deepseek_v4/served_test.zig`)" },
     .{ .name = "HEAD8", .stack = .decode, .class = .requant, .kind = .on, .off = .{ .value = "0" }, .engage = .{ .none = "a load-time requantization; the load logs the head" }, .class_text = "Requantized (KLD within one standard error)", .what = "LM head requantized to 8-bit g64", .evidence = "KLD measurement" },
@@ -131,11 +134,11 @@ pub const rows = [_]Row{
 };
 
 /// Engine variables on the DeepSeek path: listed and reported here, read and owned by the engine or MLX.
-pub const EngineRow = struct { name: []const u8, class: Class, line: ?[]const u8 = null, note: []const u8 };
+pub const EngineRow = struct { name: []const u8, class: Class, line: ?[]const u8 = null, line_if: ?[]const u8 = null, note: []const u8 };
 pub const engine_rows = [_]EngineRow{
     .{ .name = "MLX_SERVE_DSV4_DSPARK", .class = .reorder, .note = "the verify's multi-row kernels, by reasoning" },
-    .{ .name = "MLX_SERVE_DSPARK_POLICY2", .class = .draft_only, .line = "dspark policy2: next_decided", .note = "picks verify widths" },
-    .{ .name = "MLX_SERVE_DSPARK_POLICY2_MODELED", .class = .draft_only, .line = "dspark policy2 modeled:", .note = "picks verify widths" },
+    .{ .name = "MLX_SERVE_DSPARK_POLICY2", .class = .draft_only, .line = "dspark policy2: next_decided", .line_if = "spec", .note = "picks verify widths" },
+    .{ .name = "MLX_SERVE_DSPARK_POLICY2_MODELED", .class = .draft_only, .line = "dspark policy2 modeled:", .line_if = "spec", .note = "picks verify widths" },
     .{ .name = "MLX_ENABLE_TF32", .class = .tf32, .note = "MLX's TF32 matmuls; on M5 at the defaults only the drafter's P·V" },
 };
 
@@ -437,13 +440,21 @@ pub fn renderStacks(w: *std.Io.Writer) !void {
     }
 }
 
+/// The conditions an `accepted_if` or `line_if` may name: the request decodes greedy or sampled, speculates, or
+/// serves an NVFP4 pack.
+pub const accepted_conditions = [_][]const u8{ "greedy", "sampled", "spec", "nvfp4" };
+
 /// `accepted-lines.txt`: the line each accepted switch logs on the standard test's route, then the engine's.
 pub fn renderAccepted(w: *std.Io.Writer) !void {
     inline for (rows) |r| {
         if (comptime r.accepted and r.engage != .none and (r.kind == .on or r.accepted_line != null))
-            try w.print("{s}\n", .{comptime r.accepted_line orelse lineOf(r)});
+            try acceptedLine(w, comptime r.accepted_line orelse lineOf(r), r.accepted_if);
     }
-    for (engine_rows) |e| if (e.line) |l| try w.print("{s}\n", .{l});
+    for (engine_rows) |e| if (e.line) |l| try acceptedLine(w, l, e.line_if);
+}
+
+fn acceptedLine(w: *std.Io.Writer, text: []const u8, cond: ?[]const u8) !void {
+    if (cond) |c| try w.print("{s}\tif={s}\n", .{ text, c }) else try w.print("{s}\n", .{text});
 }
 
 // ── checks over a table ──
@@ -685,6 +696,29 @@ test "deepseek_v41 levers: the README's switch tables and counts are the table's
     try renderSwitches(&w);
     try w.writeAll("| PLANTED | a row the README lacks | EXACT | none |\n");
     try testing.expect(!std.mem.eql(u8, block(doc, "switches").?, w.buffered()));
+}
+
+test "deepseek_v41 levers: accepted-lines conditions name only accepted_conditions" {
+    const vocab = struct {
+        fn cond(c: []const u8) !void {
+            try testing.expect(c.len > 0);
+            var it = std.mem.splitScalar(u8, c, ',');
+            while (it.next()) |item| {
+                var known = false;
+                for (accepted_conditions) |k| known = known or std.mem.eql(u8, item, k);
+                if (!known) std.debug.print("unknown accepted-lines condition '{s}' in '{s}'\n", .{ item, c });
+                try testing.expect(known);
+            }
+        }
+    };
+    inline for (rows) |r| if (r.accepted_if) |c| {
+        try testing.expect(r.accepted);
+        try vocab.cond(c);
+    };
+    for (engine_rows) |e| if (e.line_if) |c| {
+        try testing.expect(e.line != null);
+        try vocab.cond(c);
+    };
 }
 
 test "deepseek_v41 levers: accepted-lines.txt is the table's harness check list" {

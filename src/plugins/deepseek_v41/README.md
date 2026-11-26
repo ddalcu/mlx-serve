@@ -198,7 +198,9 @@ below.
 - Each load logs one line: `[dsv41] settings: precision=... stacks_off=... changed=...`, where `changed` lists every
   switch variable that is set.
 - The engage line that each switch logs when it serves, and `accepted-lines.txt`, the list that an A/B's control arm
-  must show, come from the same table.
+  must show, come from the same table. A line that ends in `<TAB>if=<conditions>` is required only when every
+  condition holds for the run: `greedy` or `sampled` decoding, `spec` (speculative decoding on), `nvfp4` (an NVFP4
+  pack). A line without conditions is always required.
 
 <!-- levers:lossy -->
 | Switch | Under lossless | Under lossy | What it does |
