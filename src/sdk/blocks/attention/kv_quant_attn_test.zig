@@ -271,6 +271,18 @@ test "qkv decode simdgroup-matrix kernel: a NAX GPU keeps the block kernel at 4K
     try testing.expectEqual(at, kv_quant_attn.qkv_dec_mma_calls);
 }
 
+test "qkv decode simdgroup-matrix kernel: a NAX GPU serves the read under a bias a head and sinks on it" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const nax = @import("../linear/verify_qmm_nax.zig");
+    // Bar: on a NAX tile Inkling's read takes the kernel; the plain read keeps the block kernel (the test above).
+    const saved = nax.vqmm_nax_probe_override;
+    defer nax.vqmm_nax_probe_override = saved;
+    nax.vqmm_nax_probe_override = true;
+    const before = kv_quant_attn.qkv_dec_mma_calls;
+    try qkvDecParityBias(24, 8, 128, 8, 2600, .heads_sinks);
+    try testing.expect(kv_quant_attn.qkv_dec_mma_calls > before);
+}
+
 fn qkvVerParityCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usize, t_q: c_int) !void {
     return qkvVerParityCaseWith(h_q, h_kv, d, bits, t_prefill, t_q, false);
 }
