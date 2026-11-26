@@ -116,7 +116,7 @@ pub const Drafter = struct {
     fold: Array = .{},
     fold_bias: Array = .{},
     /// Group-64 affine 8-bit copy of `fold` (`[rank, V]` uint8 + `[rank/64, V]` f16 scale/bias) so the 7-step Markov
-    /// argmax chain fits in SLC (~55 MB vs 103 MB). `fold` stays for sampled `Law` op-chain draws.
+    /// chain fits in SLC (~55 MB vs 103 MB). `fold` stays for the CPU/op-chain fallback.
     fold_q: Array = .{},
     fold_s: Array = .{},
     fold_qb: Array = .{},

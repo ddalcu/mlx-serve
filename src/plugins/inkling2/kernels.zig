@@ -1515,8 +1515,7 @@ pub fn tileScan(g: *Graph, sel: Array, num_experts: u32, bm: c_int) !ExpertTiles
 }
 
 /// Minimum prefill rows for `moeWide`: below 1536, per-expert row counts underfill wide 32/64-row tiles and stock
-/// sorted `gather_qmm` is faster (recovering 0.5k prefill and batched TTFT); at 1536+ (including 2048/4096 chunks)
-/// `moeWide` wins via fused SwiGLU and zero input scatter copy.
+/// sorted `gather_qmm` is faster; from 1536 rows on, `moeWide` wins via fused SwiGLU and direct `rmap` row reads.
 pub const moe_wide_min_rows: c_int = 1536;
 
 /// Whether `moeWide` serves a prompt's sorted experts on this GPU: non-NAX Apple9+ (native `simdgroup_matrix<bfloat>`),
