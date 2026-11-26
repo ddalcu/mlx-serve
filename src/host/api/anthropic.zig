@@ -10,6 +10,7 @@ const request_mod = @import("../../sdk/request/request.zig");
 const chat_mod = @import("../chat/chat.zig");
 const rp_mod = @import("../../sdk/grammar/protocol.zig");
 const log = @import("../../sdk/util/log.zig");
+const responses_mod = @import("responses/model.zig");
 const pld_index = @import("../../sdk/spec/pld_index.zig");
 const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
 const model_registry_mod = @import("../registry/registry.zig");
@@ -1049,9 +1050,9 @@ fn handleAnthropicNonStreaming(
             }
 
             // Emit tool_use content blocks
-            for (tool_calls, 0..) |tc, i| {
+            for (tool_calls) |tc| {
                 if (block_count > 0) try content.append(allocator, ',');
-                const tc_id = try std.fmt.allocPrint(allocator, "toolu_{d}_{d}", .{ nowMs(stream.io), i });
+                const tc_id = try responses_mod.makeId(stream.io, allocator, "toolu");
                 defer allocator.free(tc_id);
                 const esc_name = try jsonEscape(allocator, tc.name);
                 defer allocator.free(esc_name);

@@ -1182,7 +1182,7 @@ fn handleNonStreamingGeneration(
             try tc_buf.appendSlice(allocator, "[");
             for (tool_calls, 0..) |tc, i| {
                 if (i > 0) try tc_buf.appendSlice(allocator, ",");
-                const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ nowMs(stream.io), i });
+                const tc_id = try responses_mod.makeId(stream.io, allocator, "call");
                 defer allocator.free(tc_id);
                 const escaped_name = try jsonEscape(allocator, tc.name);
                 defer allocator.free(escaped_name);

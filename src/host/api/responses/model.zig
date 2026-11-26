@@ -94,12 +94,15 @@ pub fn serializeJsonValue(allocator: std.mem.Allocator, buf: *std.ArrayList(u8),
 
 // ─── ID generation ────────────────────────────────────────────────────────
 
-var id_counter: std.atomic.Value(u64) = .{ .raw = 0 };
-
+/// Clients may bind permissions to a tool-call id (Claude Code requires at least 22 chars), so the
+/// body is 144 bits from the system CSPRNG, never clock or counter that a caller can guess.
+/// `randomSecure`, not `random`: `random` falls back to a weaker seed when entropy is unavailable.
 pub fn makeId(io: std.Io, allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
-    const ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
-    const seq = id_counter.fetchAdd(1, .monotonic);
-    return std.fmt.allocPrint(allocator, "{s}_{d}_{x}", .{ prefix, ms, seq });
+    var raw: [18]u8 = undefined;
+    try io.randomSecure(&raw);
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    var body: [enc.calcSize(raw.len)]u8 = undefined;
+    return std.fmt.allocPrint(allocator, "{s}_{s}", .{ prefix, enc.encode(&body, &raw) });
 }
 
 // ─── reasoning effort ────────────────────────────────────────────────────
@@ -2114,4 +2117,25 @@ fn expectReasoningTemplateEquivalent(actual: []const chat_mod.Message, expected:
     try testing.expect(std.mem.indexOf(u8, rendered, thought) != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>assistant\n<think>\n") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "<function=example_function_name>") != null);
+}
+
+test "makeId: 144-bit CSPRNG body as base64url, no clock or counter" {
+    const a = testing.allocator;
+    const first = try makeId(testing.io, a, "toolu");
+    defer a.free(first);
+    const second = try makeId(testing.io, a, "toolu");
+    defer a.free(second);
+    try testing.expectEqual(@as(usize, "toolu_".len + 24), first.len);
+    try testing.expect(std.mem.startsWith(u8, first, "toolu_"));
+    try testing.expect(!std.mem.eql(u8, first, second));
+    const body = first["toolu_".len..];
+    const dec = std.base64.url_safe_no_pad.Decoder;
+    try testing.expectEqual(@as(usize, 18), try dec.calcSizeForSlice(body));
+    var raw: [18]u8 = undefined;
+    try dec.decode(&raw, body);
+    var run: usize = 0;
+    for (first) |c| {
+        run = if (c >= '0' and c <= '9') run + 1 else 0;
+        try testing.expect(run < 13);
+    }
 }

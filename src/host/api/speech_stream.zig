@@ -6,6 +6,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const request_mod = @import("../../sdk/request/request.zig");
 const log = @import("../../sdk/util/log.zig");
+const responses_mod = @import("responses/model.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
 const mlx_engine = @import("../engines/mlx.zig");
@@ -141,7 +142,7 @@ pub fn handle(
             allocator.free(tcs);
         }
         for (tcs, 0..) |tc, i| {
-            const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ id, i });
+            const tc_id = try responses_mod.makeId(stream.io, allocator, "call");
             defer allocator.free(tc_id);
             const delta = try pipeline.streamToolCallDelta(allocator, i, tc_id, tc.name, tc.arguments);
             defer allocator.free(delta);
