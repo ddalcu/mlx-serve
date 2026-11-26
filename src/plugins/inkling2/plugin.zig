@@ -4,6 +4,7 @@
 //! saved blocks, not a plain residual, so the forward is the plugin's own loop (`layers.zig`), not a base's.
 
 const std = @import("std");
+const log = @import("../../sdk/util/log.zig");
 const abi = @import("../../abi/plugin.zig");
 const env = @import("../../env.zig");
 const sdk = @import("../../sdk/root.zig");
@@ -34,6 +35,33 @@ const gpa = std.heap.c_allocator;
 
 /// MLX's nvfp4 global scale is the block's amax; the codes times their block scales carry it over 6 x 448.
 const nvfp4_global_unit: f32 = 6.0 * 448.0;
+/// `At.affine8`'s group, `tests/convert_inkling2.py`'s GROUP_SIZE.
+const q8_group = 64;
+/// Tensors the load's `At.affine8` quantized, for its engagement line.
+var q8_tensors: u32 = 0;
+
+/// What the last load's `TRUNK_Q8` quantized.
+pub fn trunkQ8Tensors() u32 {
+    return q8_tensors;
+}
+
+/// The dense `[out, in]` `l` (unowned) as MLX's 8-bit affine at `q8_group`, evaluated; its dense handle released.
+fn quant8(l: Linear, s: mlx.mlx_stream) !Linear {
+    var v = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_quantize(&v, l.w, mlx.mlx_optional_int.some(q8_group), mlx.mlx_optional_int.some(8), "affine", .{ .ctx = null }, s));
+    var parts: [3]Array = @splat(.{ .ctx = null });
+    errdefer for (parts) |p| if (p.ctx != null) {
+        _ = mlx.mlx_array_free(p);
+    };
+    for (&parts, 0..) |*p, k| {
+        p.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(p, v, k));
+    }
+    try ops.evalMany(&parts);
+    _ = mlx.mlx_array_free(l.w);
+    return .{ .w = parts[0], .s = parts[1], .b = parts[2], .bits = 8, .group_size = q8_group, .mode = .affine };
+}
 
 /// The slots whose rounds one verify carries, and whose rings the Spec keeps (the current one and `max_open - 1` parked).
 const max_open = 16;
@@ -294,6 +322,9 @@ pub const Model = struct {
         const visits = cfg.visits();
         const spec: ?*Spec = if (batched) null else w.spec;
         var taps: [config.max_taps]ops.Array = undefined;
+        // `MLX_SERVE_INKLING2_PREFILL_ASYNC` (default on): a prompt chunk's eval points hand the graph to the GPU and go
+        // on building.
+        const prompt_async = run.rows > 1 and run.eval_every > 0 and config.lever(.MLX_SERVE_INKLING2_PREFILL_ASYNC);
         for (0..visits) |v| {
             const at = cfg.visit(@intCast(v));
             if (cfg.core() > 0 and at.layer == cfg.core_start) {
@@ -333,7 +364,7 @@ pub const Model = struct {
             }
             if (old.ctx != loop_in.ctx) g.drop(old);
             try run.capture(g, @intCast(v), h);
-            try run.cadence(v, visits, h);
+            if (prompt_async) try cadenceAsync(&run, v, visits, h) else try run.cadence(v, visits, h);
         }
         const stepped: ?ops.Array = try kernels.finalStream(g, &w.body, h, blocks, w.final_norm);
         var final = stepped orelse try g.astype(try g.rmsNorm(try layers.finalInput(g, &w.body, h, blocks), w.final_norm, cfg.rms_norm_eps), ops.dtype(h));
@@ -450,6 +481,30 @@ const Lane = struct {
     proposed: ops.Array = .{},
     want: ?Want = null,
 };
+
+/// The server's lever settings as one digest, in any order: every `MLX_` variable but the diagnostics (a lever moves
+/// which kernels a launch builds, so each composition keeps its own record).
+fn composition() [32]u8 {
+    var acc: [32]u8 = @splat(0);
+    if (comptime @import("builtin").os.tag == .windows) return acc; // no C `environ` to walk; the plugin serves on Metal
+    var i: usize = 0;
+    while (std.c.environ[i]) |e| : (i += 1) {
+        const entry = std.mem.span(e);
+        if (!std.mem.startsWith(u8, entry, "MLX_")) continue;
+        if (std.mem.indexOf(u8, entry, "DIAG") != null) continue;
+        var d: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(entry, &d, .{});
+        for (&acc, d) |*x, y| x.* ^= y;
+    }
+    return acc;
+}
+
+/// `fmt` of `args` in `buf`, zero-terminated.
+fn printZ(buf: []u8, comptime fmt: []const u8, args: anytype) ![:0]u8 {
+    const n = (try std.fmt.bufPrint(buf[0 .. buf.len - 1], fmt, args)).len;
+    buf[n] = 0;
+    return buf[0..n :0];
+}
 
 /// A lane's call on the drafter: `t1`'s normed embedding, the drafts it may make, the law to draw them from.
 const Want = struct { anchor: ops.Array, cap: u32, law: ?draft.Drafter.Law, round_ms: []const f32, stops: []const u32 };
@@ -1345,6 +1400,14 @@ fn stepGroup(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut) !abi.V
     return .ok;
 }
 
+fn nowUs() i64 {
+    return @import("../../sdk/util/io_util.zig").nowUsMonotonic(std.Io.Threaded.global_single_threaded.io());
+}
+
+fn msSince(t0: i64) f32 {
+    return @as(f32, @floatFromInt(nowUs() - t0)) / 1000;
+}
+
 /// The engine's default arithmetic over the shell and the layout, plus the drafter's context (`draftStatePerToken`).
 fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
     out.* = .{ .state_per_token = config.draftStatePerToken(p) };
@@ -1399,6 +1462,8 @@ fn unload(mp: *anyopaque) callconv(.c) void {
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
     const m: *Loaded = @ptrCast(@alignCast(mp));
     kernels.setHost(m.host);
+    // A pipeline first built while this forward is built is one built inside the measured window when not a prompt's.
+    kernels.pipes.in_decode = f.mode != .prefill;
     if (f.slots.len == 1) {
         const slot = f.slots.slice()[0];
         const from: u32 = if (f.size >= @offsetOf(abi.Forward, "adopt_len") + @sizeOf(u64)) f.adopt_slot else 0;
@@ -1406,6 +1471,19 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     }
     m.split.follow(f.rows == 1);
     return run_mod.tableForward(Model, &m.base, f, out);
+}
+
+/// `Run.cadence`'s eval points as async evals of the same arrays (the stream and the conv states): the CPU builds the
+/// next visits while the GPU runs these. The same graph, so the same values.
+fn cadenceAsync(r: *const run_mod.Run, layer: usize, n: usize, h: ops.Array) !void {
+    if ((layer + 1) % r.eval_every != 0 and layer + 1 != n) return;
+    const vec = mlx.mlx_vector_array_new_value(h);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    if (r.cache_ops) |co| for (r.caches) |cache| for (0..n) |l| {
+        const st = co.state(cache, @intCast(l), .conv);
+        if (st.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, .{ .ctx = st.ctx });
+    };
+    try mlx.check(mlx.mlx_async_eval(vec));
 }
 
 fn load(ctx: *const abi.LoadCtx, out: *abi.Verdict) callconv(.c) ?*anyopaque {
@@ -1426,6 +1504,17 @@ const At = struct {
     /// oMLX's oQ layout: mlx-lm's tensors under `oqLeaf`'s names, the projections off one input stored joined along
     /// their rows, a looped layer's gates and message queries stacked under the layer.
     oq: bool = false,
+    /// The dense attention projections, dynamic-conv projections, embedding and head as 8-bit affine at load
+    /// (default; `MLX_SERVE_INKLING2_TRUNK_Q8=0` keeps them dense): MLX's quantize at group 64, the values
+    /// `tests/convert_inkling2.py --bits 8` stores.
+    q8: bool = false,
+
+    /// `l` (unowned) as 8-bit affine when `q8` and it is dense, its dense handle released; else `l`.
+    fn affine8(a: At, l: Linear) !Linear {
+        if (!a.q8 or l.s.ctx != null or l.w.ctx == null) return l;
+        q8_tensors += 1;
+        return quant8(l, a.r.s);
+    }
 
     fn name(a: At, buf: []u8, comptime leaf: []const u8, comptime rel: []const u8) ![]const u8 {
         if (a.release) return if (a.layer) |i| a.r.name(buf, "layers.{d}." ++ rel, .{i}) else a.r.name(buf, rel, .{});
@@ -1555,7 +1644,7 @@ const At = struct {
     /// A projection the caller owns once it has tried a join.
     fn projRaw(a: At, comptime leaf: []const u8, comptime rel: []const u8, in_dim: u32) !Linear {
         var buf: [256]u8 = undefined;
-        return a.r.tableAt(try a.name(&buf, leaf, rel), in_dim);
+        return a.affine8(try a.r.tableAt(try a.name(&buf, leaf, rel), in_dim));
     }
 
     /// Dense projections off one input joined along their rows: the parts become row views of the joined weight, as
@@ -1689,7 +1778,12 @@ const At = struct {
             .dynamic = .{
                 .static = try a.need(leaf ++ ".static_weight", rel ++ ".static_w"),
                 // The release's is a bare `[out, in]` tensor, with no `.weight` leaf for the format to find.
-                .proj = if (cut) |l| l else if (a.release) .{ .w = try a.need("", rel ++ ".weight_proj") } else try a.proj(leaf ++ ".weight_proj", "", hidden),
+                .proj = if (cut) |l| l else if (a.release) blk: {
+                    var buf: [256]u8 = undefined;
+                    const l = try a.affine8(.{ .w = try a.r.need(try a.name(&buf, "", rel ++ ".weight_proj")) });
+                    try a.o.linear(l);
+                    break :blk l;
+                } else try a.proj(leaf ++ ".weight_proj", "", hidden),
             },
         };
     }
@@ -1852,15 +1946,19 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     m.* = .{ .base = .{ .weights = undefined, .shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps), .a = gpa, .s = r.s, .placeholders = ctx.parsed.placeholder_ids } };
     errdefer m.release();
     m.layers = try gpa.alloc(layers.Layer, c.num_hidden_layers);
-    for (m.layers, 0..) |*L, i| L.* = try loadLayer(.{ .r = &r, .o = &m.owned, .layer = @intCast(i), .release = release, .oq = oq }, c, @intCast(i));
+    const q8 = config.lever(.MLX_SERVE_INKLING2_TRUNK_Q8);
+    var dir_buf: [512]u8 = undefined;
+    q8_tensors = 0;
+    for (m.layers, 0..) |*L, i| L.* = try loadLayer(.{ .r = &r, .o = &m.owned, .layer = @intCast(i), .release = release, .oq = oq, .q8 = q8 }, c, @intCast(i));
 
-    const at: At = .{ .r = &r, .o = &m.owned, .release = release, .oq = oq };
+    const at: At = .{ .r = &r, .o = &m.owned, .release = release, .oq = oq, .q8 = q8 };
     const hidden: c_int = @intCast(c.hidden_size);
     var nb: [256]u8 = undefined;
-    const embed = try r.tableAt(try at.name(&nb, "embed_tokens", "embed"), c.hidden_size);
+    const embed = try at.affine8(try r.tableAt(try at.name(&nb, "embed_tokens", "embed"), c.hidden_size));
     try m.owned.linear(embed);
-    const head = try r.tableAt(if (release) try at.name(&nb, "", "unembed") else "lm_head", c.hidden_size);
+    const head = try at.affine8(try r.tableAt(if (release) try at.name(&nb, "", "unembed") else "lm_head", c.hidden_size));
     try m.owned.linear(head);
+    if (q8) log.info("[inkling2] trunk_q8 engaged: {d} dense tensors at 8-bit affine, group {d}\n", .{ q8_tensors, q8_group });
     var ones: [2]Array = undefined;
     for (&ones, [_]c_int{ hidden, @intCast(c.head_dim) }) |*x, n| {
         x.* = mlx.mlx_array_new();
@@ -1931,9 +2029,41 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     m.host = ctx.host;
     kernels.setHost(ctx.host);
 
+    // `MLX_SERVE_INKLING2_PIPELINES_AT_LOAD`: this build, machine and composition's recorded launches replayed, their
+    // pipelines built before ready; later first launches append to the record.
+    if (leverDir(.MLX_SERVE_INKLING2_PIPELINES_AT_LOAD, &dir_buf)) |dir| {
+        var own_buf: [512]u8 = undefined;
+        const key = @import("fit_key.zig").own(&own_buf) catch "unkeyed";
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update(key);
+        h.update(&composition());
+        var digest: [32]u8 = undefined;
+        h.final(&digest);
+        const hex = std.fmt.bytesToHex(digest[0..12].*, .lower);
+        var path_buf: [600]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/inkling2-pipelines-{s}.txt", .{ dir, &hex });
+        const t0 = nowUs();
+        const got = kernels.pipelinesAtLoad(m.base.s, path) catch |e| blk: {
+            log.warn("[inkling2] pipelines at load: {s}\n", .{@errorName(e)});
+            break :blk [3]usize{ 0, 0, 0 };
+        };
+        log.info("[inkling2] pipelines at load: {d} built from {d} recorded launches ({d} lines unreadable) in {d:.1} ms ({s})\n", .{ got[0], got[1], got[2], msSince(t0), path });
+    }
     return m;
 }
 
+/// The folder a lever keeps its stored files in (`MLX_SERVE_INKLING2_PIPELINES_AT_LOAD`): the
+/// variable's value, else `~/.mlx-serve/inkling2` (made when missing; none in a test build, which stays hermetic);
+/// null at `0`.
+fn leverDir(comptime name: @EnumLiteral(), buf: []u8) ?[]const u8 {
+    if (@import("../../env.zig").span(name)) |v| return if (v.len == 0 or v[0] == '0') null else v;
+    if (@import("builtin").is_test) return null;
+    const home = std.mem.span(std.c.getenv("HOME") orelse return null);
+    _ = std.c.mkdir(printZ(buf, "{s}/.mlx-serve", .{home}) catch return null, 0o755);
+    const dir = printZ(buf, "{s}/.mlx-serve/inkling2", .{home}) catch return null;
+    _ = std.c.mkdir(dir, 0o755);
+    return dir;
+}
 /// The width the DFlash2 draft's projections are held at: its weights are read every round, and drafts are only proposals.
 const draft_bits = 8;
 
@@ -2172,6 +2302,7 @@ test {
     _ = vision;
     _ = media;
     _ = draft;
+    _ = @import("fit_key.zig");
     _ = dflash2;
 }
 

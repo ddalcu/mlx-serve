@@ -200,6 +200,18 @@ pub fn fusedOn() bool {
     return kernelsServe(@import("builtin").os.tag.isDarwin(), @import("../../env.zig").span(.MLX_SERVE_INKLING2_FUSED));
 }
 
+/// A speed lever's kill switch (a `.kill` flag in `src/env.zig`): on unless set to `0`.
+pub fn lever(comptime name: @EnumLiteral()) bool {
+    const env = @import("../../env.zig");
+    return !env.present(name) or env.on(name);
+}
+
+/// An opt-in arm (`.kill`, default "off" in `src/env.zig`): off unless set on. Its off arm is main's path, which an A/B
+/// compares it against.
+pub fn optIn(comptime name: @EnumLiteral()) bool {
+    return @import("../../env.zig").on(name);
+}
+
 fn kernelsServe(metal: bool, raw: ?[]const u8) bool {
     const r = raw orelse return metal;
     return metal and !(r.len > 0 and r[0] == '0');
