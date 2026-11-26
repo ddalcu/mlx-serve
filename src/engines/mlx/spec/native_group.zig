@@ -27,7 +27,7 @@ pub const MAX_SLOTS: usize = plugin_driver.max_native_group;
 /// twice (`SamplingParams.repeats`). A group's forward carries every slot's rows, and its kernels, tiles, splits and
 /// tree widths follow the group, so a near-tie token would follow who else was served and in what order.
 pub fn roundsAlone(sampling: SamplingParams) bool {
-    return env.notOff(.MLX_SERVE_GREEDY_SOLO_ROUNDS) and sampling.repeats();
+    return env.on(.MLX_SERVE_GREEDY_SOLO_ROUNDS) and sampling.repeats();
 }
 
 /// Whether `slot` ticks rounds of a served drafter whose slots group (`MLX_SERVE_NATIVE_GROUPS`).
@@ -114,18 +114,20 @@ fn runGroupTickInner(sch: *Scheduler, group: []*Slot) !void {
     }
 }
 
-// Bar: a greedy or seeded request rounds alone beside any company, an unseeded sampled one may group, and
-// MLX_SERVE_GREEDY_SOLO_ROUNDS=0 sends every request into the group.
-test "roundsAlone: a request that must answer the same twice never shares a forward" {
-    const saved = env.override(.MLX_SERVE_GREEDY_SOLO_ROUNDS, null);
-    defer saved.restore();
+// Bar: by default every request groups; with MLX_SERVE_GREEDY_SOLO_ROUNDS=1 a greedy or seeded request rounds alone
+// beside any company and an unseeded sampled one still groups.
+test "roundsAlone: with the switch on, a request that must answer the same twice never shares a forward" {
     const greedy: SamplingParams = .{ .temperature = 0.0 };
     const top1: SamplingParams = .{ .temperature = 0.8, .top_k = 1 };
     const seeded: SamplingParams = .{ .temperature = 0.8, .seed = 7 };
     const sampled: SamplingParams = .{ .temperature = 0.8 };
+    {
+        const unset = env.override(.MLX_SERVE_GREEDY_SOLO_ROUNDS, null);
+        defer unset.restore();
+        for ([_]SamplingParams{ greedy, top1, seeded, sampled }) |sp| try std.testing.expect(!roundsAlone(sp));
+    }
+    const on = env.override(.MLX_SERVE_GREEDY_SOLO_ROUNDS, "1");
+    defer on.restore();
     for ([_]SamplingParams{ greedy, top1, seeded }) |sp| try std.testing.expect(roundsAlone(sp));
     try std.testing.expect(!roundsAlone(sampled));
-    const off = env.override(.MLX_SERVE_GREEDY_SOLO_ROUNDS, "0");
-    defer off.restore();
-    for ([_]SamplingParams{ greedy, top1, seeded, sampled }) |sp| try std.testing.expect(!roundsAlone(sp));
 }
