@@ -133,6 +133,7 @@ test {
     _ = @import("sdk/util/rtfmt.zig");
     _ = @import("env.zig");
     _ = @import("sdk/util/win_io.zig");
+    _ = @import("sdk/util/spawn_test.zig");
     _ = @import("sdk/quant/gguf/claim.zig");
     _ = @import("sdk/weights/streamed/expert.zig");
     _ = @import("sdk/weights/streamed/expert/io.zig");

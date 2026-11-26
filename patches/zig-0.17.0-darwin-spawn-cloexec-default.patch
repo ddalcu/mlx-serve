@@ -1,0 +1,25 @@
+Zig 0.17.0 std, spawnDarwin: posix_spawn with POSIX_SPAWN_CLOEXEC_DEFAULT, so a child holds only the descriptors its
+spawner named. macOS has no pipe2; `Io.Threaded.pipe2` falls back to pipe() and then fcntl(FD_CLOEXEC), and Darwin
+takes no spawn lock. A child spawned by another thread between those two calls inherits the new pipe; the parent then
+reads no end-of-file on the first child's stdout until the second exits. The build runner spawns test shards from
+several threads at once and fails a zig-test step whose stdout stays open 60 s after its child exited ("test runner
+failed to respond"), dropping its results. Every descriptor the child needs is already named by a file action: stdio
+by adddup2 (pipe, ignore, file) or addinherit_np (inherit), the progress pipe, inherit_dirs and inherit_files by
+addinherit_np. scripts/fetch-zig.sh applies this to lib/ after staging (macOS only: the code is Darwin's).
+--- a/lib/std/Io/Threaded.zig
++++ b/lib/std/Io/Threaded.zig
+@@ -17557,6 +17557,14 @@
+             .replace => true,
+         },
+         .START_SUSPENDED = start_suspended,
++        // Darwin has no pipe2, so `pipe2` makes the pipes above with pipe()
++        // and sets CLOEXEC with a separate fcntl(). A thread spawning another
++        // child between those two calls would inherit them, and the parent
++        // would not see this child's stdout close until that other child
++        // exits. With CLOEXEC_DEFAULT the kernel closes, within posix_spawn,
++        // every descriptor the file actions above do not name (stdio,
++        // inherit_dirs, inherit_files, the progress pipe).
++        .CLOEXEC_DEFAULT = true,
+     }))))) {
+         .SUCCESS => {},
+         .INVAL => |err| return errnoBug(err),

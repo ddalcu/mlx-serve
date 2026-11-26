@@ -84,6 +84,10 @@ pub fn addTests(b: *std.Build, step: *std.Build.Step) void {
     step.dependOn(&run.step);
 }
 
+/// The Zig std patches `scripts/fetch-zig.sh` applies (`patches/zig-<version>-*.patch`): the kit's copy of the script
+/// stages the same toolchain.
+const zig_patches = [_][]const u8{"zig-0.17.0-darwin-spawn-cloexec-default.patch"};
+
 fn stage(b: *std.Build, wf: *std.Build.Step.WriteFile, name: []const u8, version: []const u8, header: std.Build.LazyPath) void {
     const reader: plugins.FsReader = .{ .b = b, .dir = b.root.root_dir.handle, .io = b.graph.io };
     const staged = switch (kitClosure(b.allocator, reader, "src/kit.zig") catch |e| std.process.fatal("kit: reading src/kit.zig's imports: {t}", .{e})) {
@@ -105,7 +109,7 @@ fn stage(b: *std.Build, wf: *std.Build.Step.WriteFile, name: []const u8, version
         \\    .version = "{s}",
         \\    .fingerprint = 0xf5cd6b8abae7f101,
         \\    .minimum_zig_version = "0.17.0",
-        \\    .paths = .{{ "build.zig", "build.zig.zon", "mlx.version", "src", "lib", "include", "examples", "scripts", "LICENSE", "LICENSE-APACHE-2.0", "NOTICE" }},
+        \\    .paths = .{{ "build.zig", "build.zig.zon", "mlx.version", "src", "lib", "include", "examples", "scripts", "patches", "LICENSE", "LICENSE-APACHE-2.0", "NOTICE" }},
         \\}}
         \\
     , .{version}));
@@ -120,8 +124,9 @@ fn stage(b: *std.Build, wf: *std.Build.Step.WriteFile, name: []const u8, version
     _ = wf.addCopyDirectory(b.path("lib/mlx/include/mlx/c"), b.fmt("{s}/include/mlx/c", .{name}), .{ .include_extensions = &.{".h"} });
     _ = wf.addCopyFile(b.path("lib/mlxc-src/LICENSE"), b.fmt("{s}/include/mlx/LICENSE", .{name}));
     _ = wf.addCopyFile(header, b.fmt("{s}/include/mlx_serve_plugin.h", .{name}));
-    // `scripts/fetch-zig.sh` stages the pinned Zig at the kit's `.zig-toolchain/`.
+    // `scripts/fetch-zig.sh` stages the pinned Zig at the kit's `.zig-toolchain/`, with the std patches it applies.
     _ = wf.addCopyFile(b.path("scripts/fetch-zig.sh"), b.fmt("{s}/scripts/fetch-zig.sh", .{name}));
+    for (zig_patches) |p| _ = wf.addCopyFile(b.path(b.fmt("patches/{s}", .{p})), b.fmt("{s}/patches/{s}", .{ name, p }));
     for ([_][]const u8{ "LICENSE", "LICENSE-APACHE-2.0", "NOTICE" }) |f| _ = wf.addCopyFile(b.path(f), b.fmt("{s}/{s}", .{ name, f }));
     for (examples) |ex| _ = wf.addCopyDirectory(b.path(b.fmt("src/plugins/{s}", .{ex})), b.fmt("{s}/examples/{s}", .{ name, ex }), .{ .include_extensions = &.{ ".zig", ".zon" } });
     _ = wf.addCopyDirectory(b.path("build/kit/blocks_check"), b.fmt("{s}/checks/blocks", .{name}), .{});
