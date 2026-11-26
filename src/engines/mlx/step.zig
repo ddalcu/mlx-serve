@@ -23,6 +23,7 @@ const holdsSleepWhileParked = @import("cache/budget.zig").holdsSleepWhileParked;
 const runDecodeTick = @import("decode.zig").runDecodeTick;
 const finishSlot = @import("finish.zig").finishSlot;
 const runPrefill = @import("prefill.zig").runPrefill;
+const sumInflightGeneratedTokens = @import("prefill.zig").sumInflightGeneratedTokens;
 const prefillDecodeShare = @import("prefill_interleave.zig").prefillDecodeShare;
 const specYieldTick = @import("prefill_interleave.zig").specYieldTick;
 const orderByTail = @import("prefill_interleave.zig").orderByTail;
@@ -395,6 +396,8 @@ pub fn publishLiveKvResidency(sch: *Scheduler, prefilling: ?*Slot, module_bytes:
         bytes += slotStateBytes(s);
     }
     sch.resident_live_kv_bytes.store(bytes, .monotonic);
+    // A cancelled or errored last stream gets no further decode tick to republish this, so live == total at rest.
+    sch.inflight_generated_tokens.store(sumInflightGeneratedTokens(sch.decoding.items), .monotonic);
 }
 
 fn recordLiveSession(sch: *Scheduler, s: *const Slot, phase: metrics_mod.Session.Phase, state_bytes: u64) void {
@@ -513,4 +516,23 @@ test "a busy disk retry parks until its bounded timeout or pending work" {
     try testing.expect(before.read() >= 5 * std.time.ns_per_ms);
     sch.shutdown.store(true, .release);
     waitForDiskRetryLocked(&sch, 10);
+}
+
+test "a pass that empties the decode list publishes zero in-flight generated tokens" {
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.metrics = null;
+    sch.queue_mu = .init;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.cleanup_queue = .empty;
+    sch.offloaded = .empty;
+    sch.live_session_count = 0;
+    sch.resident_live_kv_bytes = .init(0);
+    sch.inflight_generated_tokens = .init(500);
+
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    publishLiveKvResidency(&sch, null, 0);
+    try testing.expectEqual(@as(u64, 0), sch.inflight_generated_tokens.load(.monotonic));
 }
