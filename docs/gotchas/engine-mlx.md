@@ -53,6 +53,14 @@ clamps an inflated snapshot to the matched length`.
 Defect: reusing a cache whose generated tool-call tokens are not in `cached_prompt_ids` corrupts attention. Fix:
 invalidate after tool calls and pad-only generations.
 
+### An agent's long answers fell out of the cache because the next prompt spelled them in other tokens
+Defect: in a Ship Score run on Inkling 2 three requests restored nothing (18K, 31K and 62K tokens prefilled cold),
+each right after a long `write` call. Cause: the model samples at temperature 1 with no top-p, and its answer spelled a
+comment's dashes `" ----" "--------"` where encoding the same text gives `" " "--------" "----"`; the re-rendered turn
+left the cached tokens there, and on its sliding rings no checkpoint near that point could restore. Fix: before the
+lookup the prompt takes the cached entry's spelling wherever the bytes agree (`respell`, `HotPrefixCache.respellPrompt`;
+never across an added token, never for a greedy or seeded request). Guard: the `respell:` tests in `prefix_cache.zig`.
+
 ### Sliding layers keep the full buffer; the view is what is trimmed
 Defect: (design) Gemma 4 E4B's 512-token window. Fix: the buffer keeps every row, as mlx-lm's `RotatingKVCache` does;
 `slidingViewFor` sizes the view the forward reaches (`window + q_len - 1`), at prefill too (it was once decode-only,

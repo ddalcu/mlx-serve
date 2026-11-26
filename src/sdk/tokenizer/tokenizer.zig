@@ -465,6 +465,13 @@ pub const Tokenizer = struct {
     }
 
     /// Look up a special token ID by its string representation.
+    /// A token's vocabulary text, null for an added token: two runs of plain tokens with equal spellings decode alike.
+    pub fn tokenSpelling(self: *const Tokenizer, id: u32) ?[]const u8 {
+        const text = self.id_to_token.get(id) orelse return null;
+        if (self.special_tokens.get(text)) |added| if (added == id) return null;
+        return text;
+    }
+
     pub fn specialTokenId(self: *const Tokenizer, name: []const u8) ?u32 {
         return self.special_tokens.get(name);
     }

@@ -96,6 +96,53 @@ pub fn missKind(candidates: usize, best_raw: usize) MissKind {
     return .no_checkpoint;
 }
 
+/// The most tokens either side of one respelled span may take.
+const RESPELL_MAX_TOKENS = 64;
+
+/// `prompt` spelled as `entry` spells the bytes they share, or null when nothing changes. A sampled answer need not
+/// use the tokenizer's canonical tokens (" ----" "--------" where encoding the text gives " " "--------" "----"), so its
+/// re-rendered turn left the cache inside that answer. `spelling.tokenSpelling(id)` is a token's text, null for a
+/// special token, which never respells. Caller owns the result.
+pub fn respell(allocator: std.mem.Allocator, entry: []const u32, prompt: []const u32, spelling: anytype) !?[]u32 {
+    var i = std.mem.indexOfDiff(u32, entry, prompt) orelse return null;
+    var span = sameBytes(entry[i..], prompt[i..], spelling) orelse return null;
+    var out: std.ArrayList(u32) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, prompt[0..i]);
+    var j = i;
+    while (true) {
+        try out.appendSlice(allocator, entry[i..][0..span[0]]);
+        i += span[0];
+        j += span[1];
+        const k = std.mem.indexOfDiff(u32, entry[i..], prompt[j..]) orelse break;
+        try out.appendSlice(allocator, prompt[j..][0..k]);
+        i += k;
+        j += k;
+        span = sameBytes(entry[i..], prompt[j..], spelling) orelse break;
+    }
+    try out.appendSlice(allocator, prompt[j..]);
+    return try out.toOwnedSlice(allocator);
+}
+
+/// The shortest token runs at the head of `a` and `b` that spell the same bytes, as their lengths.
+fn sameBytes(a: []const u32, b: []const u32, spelling: anytype) ?[2]usize {
+    var n: [2]usize = .{ 0, 0 };
+    var rest: [2][]const u8 = .{ "", "" };
+    const sides = [2][]const u32{ a, b };
+    while (true) {
+        for (0..2) |s| if (rest[s].len == 0) {
+            if (n[s] == @min(sides[s].len, RESPELL_MAX_TOKENS)) return null;
+            rest[s] = spelling.tokenSpelling(sides[s][n[s]]) orelse return null;
+            if (rest[s].len == 0) return null;
+            n[s] += 1;
+        };
+        const k = @min(rest[0].len, rest[1].len);
+        if (!std.mem.eql(u8, rest[0][0..k], rest[1][0..k])) return null;
+        rest = .{ rest[0][k..], rest[1][k..] };
+        if (rest[0].len == 0 and rest[1].len == 0) return n;
+    }
+}
+
 /// Why an oversized commit retained nothing; three outcomes used to print one identical line.
 pub const TrimDecline = enum {
     no_restorable_prefix,
@@ -1522,6 +1569,22 @@ pub const HotPrefixCache = struct {
     fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, media: []const MediaSpan, quant_config: kv_quant.KVQuantConfig) ?struct { idx: usize, shared: usize } {
         const match = self.findBestRestorableMatch(prompt_ids, has_tools, media, quant_config, false, null) orelse return null;
         return .{ .idx = match.idx, .shared = match.shared };
+    }
+
+    /// `respell` the text-only prompt against the RAM entry it follows furthest, when it leaves that entry inside it.
+    pub fn respellPrompt(self: *const HotPrefixCache, allocator: std.mem.Allocator, prompt_ids: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig, spelling: anytype) !?[]u32 {
+        var best: ?*const Entry = null;
+        var best_shared: usize = 0;
+        for (self.entries.items) |*e| {
+            if (e.checked_out_by != null or e.module != null or e.media.len > 0 or e.has_tools != has_tools) continue;
+            if (!std.meta.eql(e.quant_config, quant_config)) continue;
+            const shared = std.mem.indexOfDiff(u32, e.tokens, prompt_ids) orelse return null;
+            if (shared > best_shared) {
+                best = e;
+                best_shared = shared;
+            }
+        }
+        return respell(allocator, (best orelse return null).tokens, prompt_ids, spelling);
     }
 
     /// Try to restore a matching entry into `target_cache`. On success, returns
@@ -4223,6 +4286,38 @@ pub const HotPrefixCache = struct {
 // ── Tests ──
 
 const testing = std.testing;
+
+/// Token spellings for the respell tests: 7 is a special token, which has none.
+const TestSpelling = struct {
+    const words = [_]?[]const u8{ "A", " ----", "--------", "--", " ", "------", "B", null, "C" };
+    pub fn tokenSpelling(_: TestSpelling, id: u32) ?[]const u8 {
+        return if (id < words.len) words[id] else null;
+    }
+};
+
+test "respell: a prompt takes the entry's spelling of the bytes they share, to the entry's end" {
+    // " ----" "--------" "--" and " " "--------" "------" are the same 15 bytes.
+    const entry = [_]u32{ 0, 1, 2, 3, 6 };
+    const prompt = [_]u32{ 0, 4, 2, 5, 6, 8 };
+    const got = (try respell(testing.allocator, &entry, &prompt, TestSpelling{})).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 6, 8 }, got);
+}
+
+test "respell: two respelled runs in one answer, with plain tokens between them" {
+    const entry = [_]u32{ 0, 1, 2, 3, 6, 0, 1, 2, 3, 6 };
+    const prompt = [_]u32{ 0, 4, 2, 5, 6, 0, 4, 2, 5, 6, 8 };
+    const got = (try respell(testing.allocator, &entry, &prompt, TestSpelling{})).?;
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 6, 0, 1, 2, 3, 6, 8 }, got);
+}
+
+test "respell: different bytes, a special token or an identical prompt leave the prompt as it is" {
+    const entry = [_]u32{ 0, 1, 2, 3, 6 };
+    try testing.expectEqual(null, try respell(testing.allocator, &entry, &.{ 0, 4, 2, 6 }, TestSpelling{}));
+    try testing.expectEqual(null, try respell(testing.allocator, &.{ 0, 7, 6 }, &.{ 0, 4, 6 }, TestSpelling{}));
+    try testing.expectEqual(null, try respell(testing.allocator, &entry, &.{ 0, 1, 2, 3, 6, 8 }, TestSpelling{}));
+}
 
 test "HotPrefixCache: shouldUse gates hybrid by enable_ssm_checkpoints" {
     var cfg = model_mod.ModelConfig{};
