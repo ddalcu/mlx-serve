@@ -11,7 +11,7 @@
 # strips the test binary, and only main saves Actions caches (the MLX and ds4 stages aside). linux.yml's libjinja
 # cache key hashes the inputs of build-linux.sh's libjinja stamp.
 #
-#   ./tests/test_release_workflow_gates.sh   # hermetic: PyYAML parse, no runners
+#   ./tests/test_release_workflow_gates.sh   # hermetic: PyYAML parse, no runners (ci.yml's `gates` job runs it)
 
 set -euo pipefail
 cd "$(dirname "$0")/.."

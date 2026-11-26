@@ -54,6 +54,18 @@ jobs:
       - name: Scope rules still cover what the Swift tests read
         run: bash tests/test_ci_changes.sh
 
+  # Needed by no job: a red `changes` would run every job, slow tests included.
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Release, build-mode and cache gates
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml; }
+          bash tests/test_release_workflow_gates.sh
+
   # The Zig graph and the Swift app share nothing on disk (app/ never reads
   # zig-out), so they run as two jobs on two runners instead of one after the
   # other (#639). The Zig build and `zig build test` share no output either, so
