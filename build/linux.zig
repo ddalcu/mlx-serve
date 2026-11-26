@@ -186,8 +186,6 @@ fn unitModule(
     return m;
 }
 
-/// Linux counterpart of verifyMlxStage: fail loudly when scripts/
-/// build-mlx-linux.sh has not staged the Linux mlx/mlx-c pair.
 /// The values `options` takes from the build's own flags and stamps.
 pub const Pins = struct {
     version: []const u8,
@@ -246,6 +244,8 @@ pub fn serverModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     return mod;
 }
 
+/// Linux counterpart of verifyMlxStage: fail loudly when scripts/
+/// build-mlx-linux.sh has not staged the Linux mlx/mlx-c pair.
 fn verifyMlxStageLinux(b: *std.Build) void {
     const root = config.buildRootHandle(b);
     const stage_ok = blk: {
