@@ -1030,7 +1030,9 @@ const dialect_corpus = [_][]const u8{
     "<|end|><|channel|>analysis<|message|>closer ahead of the header",
     "<|channel|>analysis<|start|><|message|><|channel|>final",
     "some prose first <|channel|>analysis<|message|>then reasoning<|end|>",
+    "<|channel|>analysis<|message|>a<|end|><|start|>assistant<|channel|>analysis<|message|>second thought still open",
     // muse
+    " to=self<|message|>a<|eom|><|start|>assistant to=self<|message|>second thought still open",
     " to=self<|message|>a long enough chain of thought to cross the window<|eom|><|start|>assistant to=user<|message|>Hi<|eot|>",
     " to=self<|message|>ends the turn<|eot|>",
     " to=weather.get<|message|><atem:function_calls>x<|eot|>",
