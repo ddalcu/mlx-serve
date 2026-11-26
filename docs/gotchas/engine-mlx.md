@@ -809,6 +809,18 @@ Defect: `MLX_SERVE_FORCE_BATCHED=1` at one slot still has `batch == 1`, which ar
 QK-norm gates that real N>1 does not. Fix: `tests/test_batched_equivalence.sh` runs a real two-stream arm and both
 kernels log `[batched] ... engaged (slots=N)`; an arm whose curls did not overlap reports NOT-RUN.
 
+### A plain row in the batched tick skipped the serial step's per-tick guards
+Defect: a plain request decoding beside others ran a repetition loop to `max_tokens` that the same request alone had
+cut (`[loop-stop]`); its `reasoning_budget_tokens` never closed the thought and `tool_choice: required` never forced
+the call. Cause: `loopGuardTick` (the loop cut, then `thinkBoundTick` and `toolForceTick`) opens the serial step and the
+MTP and DSpark group rounds; the split loop sent a plain row straight to `runBatchedDecodeTick`. Fix: `guardSpentTick`
+runs it on every batchable row first, and on a crowded MTP group's rows (`mtp_plain_tick`) before they join the plain
+tick; a row whose guard spent the tick sits the group out, and a guard failure fails that row alone. A batched row's
+forced commit forwards its pending token inside the span's chunk (the serial step forwarded it alone), so a hybrid
+trunk's answer after the commit can round differently from the serial step's. Guards: `test_batched_tick_guards.sh`,
+`a batched row whose per-tick guard fails errors alone and the tick returns`, `a crowded MTP row runs the per-tick
+guards before it joins the batched tick`.
+
 ### DSpark on LFM2.5: three silent zeros
 Defect: LFM2.5 DSpark drafters loaded nothing, or engaged at near-zero acceptance, without an error. Cause: the
 contract splits across root and `dflash_config`; a hybrid veto aimed at the Gemma drafter blocked every hybrid trunk

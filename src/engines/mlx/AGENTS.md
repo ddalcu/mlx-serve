@@ -196,6 +196,7 @@ Spec decode:
 Sampling:
 - **Penalties apply in `Generator.sampleLazy`** (#564); `SamplingParams.penalized()` keeps a request off `next`'s fast path, spec and batching. `frequency_penalty` is OpenAI's, subtracted per occurrence, never a `repeat_penalty` multiplier (#912). Guard: `tests/test_repeat_penalty.sh`.
 - **`top_p` 0 is GREEDY** (`applyTopP` floors at `floatMin`). Filters cut by RANK with lowest-id tie break (`ranksDescending`, `topRanksDescending`); cumsum in f32; top-k + top-p are ONE pass (`filterTopKTopP`). Block helpers use `_axis` ops.
+- **Every decoding row runs `loopGuardTick` before its step** (the loop cut, `thinkBoundTick`, `toolForceTick`): the serial step, the MTP and DSpark group rounds and the batched tick's split loop, where a row whose guard spent the tick sits the group out. A crowded MTP group's rows (`mtp_plain_tick`) run it before they join the plain tick; a guard failure fails that row alone (`guardSpentTick`). Guards: `test_batched_tick_guards.sh`, decode.zig's two per-tick guard tests.
 
 Kernels + numerics:
 - **A Metal tensor over a whole matrix indexes in `int`**: past 2^31 elements its stores wrap into other memory (w8a8's
