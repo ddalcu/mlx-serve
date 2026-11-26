@@ -13,6 +13,7 @@ const QKV_VERIFY_MAX_TQ = kv_quant_attn.QKV_VERIFY_MAX_TQ;
 const kvAttnFusedEligible = kv_quant_attn.kvAttnFusedEligible;
 const kvAttnVerifyEligible = kv_quant_attn.kvAttnVerifyEligible;
 const qkvAttnDecodeKernel = kv_quant_attn.qkvAttnDecodeKernel;
+const qkvAttnDecodeBiased = kv_quant_attn.qkvAttnDecodeBiased;
 const qkvAttnMppKernel = kv_quant_attn.qkvAttnMppKernel;
 const qkvAttnVerifyKernel = kv_quant_attn.qkvAttnVerifyKernel;
 const qkvMppWins = kv_quant_attn.qkvMppWins;
@@ -29,6 +30,14 @@ const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
 /// kernel is NOT expected to bit-match (f32 in-register dequant vs the
 /// bf16-rounded dense views + different reduction order — qmv class).
 fn qkvDecParityCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usize, masked: bool) !void {
+    return qkvDecParityBias(h_q, h_kv, d, bits, t_prefill, if (masked) .row else .none);
+}
+
+/// What the read adds to its scores: nothing, one additive row every head shares, or a row a head plus a sink logit a head.
+const Bias = enum { none, row, heads_sinks };
+
+fn qkvDecParityBias(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usize, bias: Bias) !void {
+    const masked = bias != .none;
     const s = mlx.gpuStream();
     var cache = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(bits));
     defer cache.deinit();
@@ -82,12 +91,34 @@ fn qkvDecParityCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usiz
     defer if (mask.ctx != null) {
         _ = mlx.mlx_array_free(mask);
     };
+    var sinks = mlx.mlx_array{ .ctx = null };
+    defer if (sinks.ctx != null) {
+        _ = mlx.mlx_array_free(sinks);
+    };
     if (masked) {
         const tk_us: usize = @intCast(t_k);
-        const mbuf = try testing.allocator.alloc(f32, tk_us);
+        const heads: usize = if (bias == .heads_sinks) @intCast(h_q) else 1;
+        const mbuf = try testing.allocator.alloc(f32, heads * tk_us);
         defer testing.allocator.free(mbuf);
-        for (mbuf, 0..) |*x, i| x.* = if (i < 2) -std.math.inf(f32) else 0.0;
-        const mshape = [_]c_int{ 1, 1, 1, t_k };
+        // A head's row blocks its own first positions and tilts the rest, so a row read for the wrong head differs.
+        for (mbuf, 0..) |*x, i| {
+            const head = i / tk_us;
+            const t = i % tk_us;
+            x.* = if (t < 2 + head % 3) -std.math.inf(f32) else 2.0 * @sin(@as(f32, @floatFromInt(t + 7 * head)));
+        }
+        if (bias == .row) {
+            for (mbuf, 0..) |*x, i| x.* = if (i < 2) -std.math.inf(f32) else 0.0;
+        }
+        if (bias == .heads_sinks) {
+            const sbuf = try testing.allocator.alloc(f32, heads);
+            defer testing.allocator.free(sbuf);
+            for (sbuf, 0..) |*x, i| x.* = 4.0 + 3.0 * @sin(@as(f32, @floatFromInt(i)) + 0.3);
+            const sf32 = mlx.mlx_array_new_data(sbuf.ptr, &[_]c_int{@intCast(heads)}, 1, .float32);
+            defer _ = mlx.mlx_array_free(sf32);
+            // MLX's attention takes sinks in a dtype that promotes to the output's.
+            try mlx.check(mlx.mlx_astype(&sinks, sf32, .bfloat16, s));
+        }
+        const mshape = [_]c_int{ 1, @intCast(heads), 1, t_k };
         const mf32 = mlx.mlx_array_new_data(mbuf.ptr, &mshape, 4, .float32);
         defer _ = mlx.mlx_array_free(mf32);
         var mbf = mlx.mlx_array_new();
@@ -107,19 +138,15 @@ fn qkvDecParityCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usiz
         scale,
         if (masked) "array" else "",
         if (masked) mask else none,
-        .{ .ctx = null },
+        sinks,
         false,
         s,
     ));
 
-    const cand = (try qkvAttnDecodeKernel(
-        s,
-        q,
-        &dv,
-        scale,
-        if (masked) "array" else "",
-        if (masked) mask else none,
-    )) orelse return error.KernelDeclined; // engagement IS the assertion
+    const cand = (if (bias == .heads_sinks)
+        try qkvAttnDecodeBiased(s, q, &dv, scale, mask, sinks)
+    else
+        try qkvAttnDecodeKernel(s, q, &dv, scale, if (masked) "array" else "", if (masked) mask else none)) orelse return error.KernelDeclined; // engagement IS the assertion
 
     defer _ = mlx.mlx_array_free(cand);
     const cand_shape = mlx.getShape(cand);
@@ -185,6 +212,19 @@ test "qkv decode kernel parity: additive mask row (sliding decode shape)" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     try qkvDecParityCase(8, 2, 128, 8, 37, true);
     try qkvDecParityCase(8, 2, 128, 4, 37, true);
+}
+
+test "qkv decode kernel parity: a bias row a head and a sink a head (Inkling's read), both kernels" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const was = kv_quant_attn.qkv_dec_mma_override;
+    defer kv_quant_attn.qkv_dec_mma_override = was;
+    for ([_]bool{ false, true }) |mma| {
+        kv_quant_attn.qkv_dec_mma_override = mma;
+        try qkvDecParityBias(24, 8, 128, 8, 37, .heads_sinks); // Inkling: 3 heads a KV head, one head tile
+        try qkvDecParityBias(24, 8, 128, 8, 2600, .heads_sinks); // past the 2048-key floor, several splits and blocks
+        try qkvDecParityBias(8, 2, 64, 4, 700, .heads_sinks);
+        try qkvDecParityBias(72, 8, 128, 8, 300, .heads_sinks); // 9 heads a KV head: two head tiles
+    }
 }
 
 test "qkv decode kernel parity: multi-block split-KV merge (T_k > BLOCK)" {

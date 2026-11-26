@@ -49,8 +49,11 @@ for (int t = int(tid); t < rows; t += NT) {
       for (int gi = 0; gi < GQA; ++gi) sc[gi] += q_tg[gi * DK + e] * kv;
     }
   }
-  const float madd = HAS_MASK ? float(msk[t0 + t]) : 0.0f;
-  for (int gi = 0; gi < GQA; ++gi) p_tg[gi * BLOCK + t] = sc[gi] + madd;
+  // HAS_MASK: 1 = one additive row every head shares, 2 = a row a head ([Hq, Tk]).
+  for (int gi = 0; gi < GQA; ++gi) {
+    const float madd = HAS_MASK == 2 ? float(msk[((long)hkv * GQA + gi) * (long)Tk + t0 + t]) : HAS_MASK == 1 ? float(msk[t0 + t]) : 0.0f;
+    p_tg[gi * BLOCK + t] = sc[gi] + madd;
+  }
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
 

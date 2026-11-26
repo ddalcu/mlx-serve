@@ -321,14 +321,15 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     defer if (quant) |q| q.close();
     // A pack an outside plugin reads has no tower reader here: its weights leave before the bank sizes its rows.
     if (quant != null) m.weights.dropPrefix("vision.");
-    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice(), .quant = quant });
+    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .tp_sum = try dsv41.tpSumWanted(), .draft_shard = ctx.tp_size > 0, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice(), .quant = quant });
     errdefer m.mdl.deinit();
-    // The fused Markov chain's kernels compiled now, not in the first draft.
-    if (m.mdl.dspark) |*w| {
+    // The fused Markov chain's kernels compiled now, not in the first draft; a sharded draft holds only its rows of the
+    // Markov head, which the fused chain's shape check refuses, and runs its own chain (no draft vocabulary either).
+    if (m.mdl.dspark) |*w| if (!m.mdl.draft_shard) {
         const mk = w.markovFor();
         try @import("spec/markov.zig").warm(m.mdl.s, mk.emb, mk.mh, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true, dsv41.draftSampleOn());
         try dsv41.warmDraftVocab(m.mdl, dsv41.draftSampleOn());
-    }
+    };
     try dsv41.syncWarm(m.mdl);
     m.bank = null;
     m.bank_streams = false;
@@ -617,7 +618,8 @@ fn run(m: *Model, host_ids: []const u32, pos: usize, want_logits: abi.Logits, ro
     const mdl = m.mdl;
     const all = want_logits == .all_rows;
     var one: [1]u32 = undefined;
-    const gpu_decode = !all and pos > 0 and (dev.ctx != null or host_ids.len == 1) and mdl.pair == null and mdl.tp == null;
+    const image_row = rows != null and std.mem.indexOfScalar(u32, host_ids, m.cfg.image_token_id) != null;
+    const gpu_decode = !all and pos > 0 and (dev.ctx != null or host_ids.len == 1) and mdl.pair == null and (mdl.tp == null or (dsv41.tpPipeOn() and !image_row));
     const ids = if (dev.ctx != null and !gpu_decode) blk: {
         one[0] = try v4plugin.hostToken(dev);
         if (one[0] >= m.cfg.vocab_size) return error.TokenPastVocabulary;

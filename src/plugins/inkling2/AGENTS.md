@@ -29,8 +29,8 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - Every read in `plugin.zig` names its tensor twice, mlx-lm's name then the release's (`At`). Same tensors, so both
   layouts serve the same greedy text, which holds only while the release's per-expert multiplier is computed in the
   converter's order of operations (`amax x 2688 / den`, then `/ 2688`): `amax / den` is one ulp off.
-- Refused by name: oMLX's oQ layout (`model.embed`, `attn.in_proj`), a `quant_method` other than the release's
-  `modelopt`, shared experts, a variable loop, a sliding geometry other than the global one.
+- Refused by name: a `quant_method` other than the release's `modelopt`, shared experts, a variable loop, a sliding
+  geometry other than the global one.
 
 ## Rules
 
@@ -115,6 +115,9 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **The draft head loads on Apple9+ only, with the kernels on** (`draftsOn`, told to the engine by `NativeDrafter.active`):
   on an M1 a few-row verify costs so much more than a step that drafted decode ran under serial, and only the kernels
   serve a verified or batched visit (`MLX_SERVE_INKLING2_FUSED=0` also batches no slots).
+- **A one-row read of a quantized cache runs off the packed words** (`layers.packedRead`: the SDK's decode kernel under a bias a
+  head and the sinks, from `KV_ATTN_FUSED_MIN_TK` keys, `nax_packed_min_keys` on NAX where its block kernel loses below 16K):
+  dense, every global visit dequantized its whole cache each token (-30% at 32K). `auto` engages it from an 8192-token prompt.
 - **A sliding visit keeps a ring of window + 2048 rows** (`Config.ring`, declared as `CacheFacts.sliding_ring`;
   `layers.appendKv` at every append): kept whole, the 40 sliding visits held several times the KV a long prompt needs, and every
   prefix-cache entry with it. A match more than the slack behind an entry's end then misses.
@@ -141,6 +144,11 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 
 ## Packs and proof
 
+- oMLX's oQ packs (`model.embed`, `mlx-community/Inkling-2-Mini-oQ4e-mtp`) load as they are (`At.oq`): mlx-lm's
+  tensors under `oqLeaf`'s names, the projections off one input cut from one row-joined weight (`cutRows`; a sliding
+  layer's `in_proj` is q, k, v, r, gate, sink), a looped layer's gates and message queries stacked under the layer.
+  Its `quantization` block is keyed by its own names; its gates' down projection, widened to f32, is held at the
+  pack's float width (the norms'), so it serves the mlx-lm pack's greedy text.
 - The release needs no conversion. `tests/convert_inkling2.py --bits 4|5|6|8|16` writes mlx-lm's layout with the
   attention, embedding and head affine (the experts keep the release's bytes) and copies the draft head: at 4 bits
   its names, dtypes and shapes equal `mlx-community/Inkling-2-Mini-4bit`'s.
@@ -152,7 +160,8 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
   place (`ups`/`downs` FMT 3), more go through MLX's gather. Score a pack with `tests/inkling2_kld.py`: no bf16 experts.
 - **An fp16 gather is for affine banks only** (`gatherRowsDtype`, GPUs before Apple9 that lack bf16): NVFP4 and MXFP8
   raw outputs carry the per-expert multiplier's inverse and overflow fp16 (the answer was `!!`).
-- `proof_test.zig`: whole == chunked == stepwise on the tiny looped fixture (CPU), planted state mutations, the media
+- `proof_test.zig`: whole == chunked == stepwise on the tiny looped fixture (CPU), the fixture in oQ's layout against
+  mlx-lm's bit for bit (dense and quantized), planted state mutations, the media
   splice, a verified block's commit, batched slots against each slot alone (CPU) or reordered and re-neighboured
   (GPU), and each kernel against its chain.
 - `contract.zig`: `gated`, `state`, `relmask`, `act`, `sum`, `topk`, `gate` (its one-row arm), `relsplit`, `relattn_nax`,

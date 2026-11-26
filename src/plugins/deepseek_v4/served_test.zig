@@ -1287,7 +1287,7 @@ test "deepseek_v41 served: a batched verify gives each state its solo verify's r
     }
     // The next draft reads the main rows each finish committed: the batched draft drafts what each state drafts alone.
     var drafts: [2]dsv41.DsparkDraft = undefined;
-    try dsv41.dsparkDraftBatched(m, a, &ptrs, &.{ 60, 61 }, true, &drafts);
+    try dsv41.dsparkDraftBatched(m, a, &ptrs, &gens, &.{ 60, 61 }, true, &drafts);
     defer for (&drafts) |*d| d.deinit(a);
     for (0..2) |k| {
         var alone = try dsv41.dsparkDraft(m, a, &solo[k], drafts[k].ids[0]);
@@ -1473,7 +1473,7 @@ test "deepseek_v41 served: a draft-only head (DRAFT_VOCAB) changes the drafts, n
     defer for (&sts) |*st| st.deinit();
     var drafts: [2]dsv41.DsparkDraft = undefined;
     // t1 = 7, outside the vocabulary: it enters the chain all the same.
-    try dsv41.dsparkDraftBatched(m, a, &.{ &sts[0], &sts[1] }, &.{ 7, 5 }, true, &drafts);
+    try dsv41.dsparkDraftBatched(m, a, &.{ &sts[0], &sts[1] }, &.{ 0, 1 }, &.{ 7, 5 }, true, &drafts);
     defer for (&drafts) |*d| d.deinit(a);
     for (&sts, &drafts) |*st, *d| {
         for (d.ids[1..]) |id| try testing.expect(id < 96 and id % 3 != 1);
@@ -1539,11 +1539,11 @@ test "deepseek_v41 served: a draft-only head (DRAFT_VOCAB) changes the drafts, n
         try testing.expectEqualSlices(u8, (mlx.mlx_array_data_uint8(ctl.q) orelse return error.NoData)[0..nq], (mlx.mlx_array_data_uint8(whole.q) orelse return error.NoData)[0..nq]);
         // A batch holding that state drafts every id for both states, as the model without the vocabulary does.
         var bw: [2]dsv41.DsparkDraft = undefined;
-        try dsv41.dsparkDraftBatched(m, a, &.{ &sts[0], &sts[1] }, &.{ 7, 5 }, true, &bw);
+        try dsv41.dsparkDraftBatched(m, a, &.{ &sts[0], &sts[1] }, &.{ 0, 1 }, &.{ 7, 5 }, true, &bw);
         defer for (&bw) |*d| d.deinit(a);
         m.dspark.?.draft = null;
         var bc: [2]dsv41.DsparkDraft = undefined;
-        const plain_b = dsv41.dsparkDraftBatched(m, a, &.{ &sts[0], &sts[1] }, &.{ 7, 5 }, true, &bc);
+        const plain_b = dsv41.dsparkDraftBatched(m, a, &.{ &sts[0], &sts[1] }, &.{ 0, 1 }, &.{ 7, 5 }, true, &bc);
         m.dspark.?.draft = kept;
         try plain_b;
         defer for (&bc) |*d| d.deinit(a);

@@ -46,6 +46,7 @@ pub const deepseek_v41 = struct {
         dspark: ?void = null,
         dec_state: ?State = null,
         pair: ?Pair = null,
+        draft_shard: bool = false,
         ds_want_conf: bool = false,
         suppress: A = .{ .ctx = null },
 
@@ -57,6 +58,7 @@ pub const deepseek_v41 = struct {
     };
 
     pub const SnapOp = enum(i32) { take, restore, clone, free, capture };
+    pub const TpSumMode = enum(u8) { auto, bf16, f32 };
     pub const Parked = std.AutoHashMap(u64, State);
     pub const Snaps = std.AutoHashMap(u64, void);
 
@@ -65,7 +67,10 @@ pub const deepseek_v41 = struct {
     const ClusterHooksState = struct {
         pair_exchange: ?*const fn (x: A, pre: A, p0: usize, snap: bool, verify: bool) anyerror![2]A = null,
         tp_sum: ?*const fn (x: A) anyerror!A = null,
+        tp_gather: ?*const fn (x: A) anyerror!A = null,
         tp_step: ?*const fn (ids: []const u32, p0: usize, snap: bool, all: bool, verify: bool, gen: u64, images: ?A) anyerror!void = null,
+        tp_pipe: ?*const fn (gen: u64, n: usize) anyerror!bool = null,
+        tp_draft: ?*const fn (gens: []const u64, p0s: []const usize, t1s: []const u32) anyerror!void = null,
         tp_batch: ?*const fn (gens: []const u64, p0s: []const usize, chunks: []const []const u32, verify: bool) anyerror!void = null,
         tp_free: ?*const fn (gen: u64) void = null,
         tp_load: ?*const fn (id: u64, ids: []const u32, tensors: []const A) anyerror!void = null,
@@ -134,6 +139,26 @@ pub const deepseek_v41 = struct {
         return error.Dsv41Absent;
     }
 
+    pub fn dsparkWanted(_: *const v4_config.Config, _: ?Pair, _: ?bool) bool {
+        return false;
+    }
+
+    pub fn packShipsStages(_: std.Io, _: []const u8) bool {
+        return false;
+    }
+
+    pub fn head8Wanted() bool {
+        return false;
+    }
+
+    pub fn tpSumWanted() !TpSumMode {
+        return .auto;
+    }
+
+    pub fn tpPipeOn() bool {
+        return false;
+    }
+
     pub fn dropParked(p: *Parked) void {
         p.deinit();
     }
@@ -155,6 +180,14 @@ pub const deepseek_v41 = struct {
     }
 
     pub fn tpWorkerFree(_: *Dsv41Model, _: *Parked, _: u64) void {}
+
+    pub fn tpWorkerPipe(_: *Dsv41Model, _: std.mem.Allocator) !void {
+        return error.Dsv41Absent;
+    }
+
+    pub fn tpWorkerDraft(_: *Dsv41Model, _: std.mem.Allocator, _: *Parked, _: []const u64, _: []const usize, _: []const u32) !void {
+        return error.Dsv41Absent;
+    }
 
     pub fn tpWorkerSnap(_: *Dsv41Model, _: std.mem.Allocator, _: *Parked, _: *Snaps, _: SnapOp, _: u64, _: u64) !void {
         return error.Dsv41Absent;
@@ -192,6 +225,10 @@ pub const deepseek_v41 = struct {
         return false;
     }
 
+    pub fn draftSampleServes(_: *const Dsv41Model) bool {
+        return false;
+    }
+
     pub fn draftPromptVocab(_: *Dsv41Model, _: *State, _: []const u32, _: bool) !void {
         return error.Dsv41Absent;
     }
@@ -206,7 +243,7 @@ pub const deepseek_v41 = struct {
         return error.Dsv41Absent;
     }
 
-    pub fn dsparkDraftBatched(_: *Dsv41Model, _: std.mem.Allocator, _: []const *State, _: []const u32, _: bool, _: []DsparkDraft) !void {
+    pub fn dsparkDraftBatched(_: *Dsv41Model, _: std.mem.Allocator, _: []const *State, _: []const u64, _: []const u32, _: bool, _: []DsparkDraft) !void {
         return error.Dsv41Absent;
     }
 
@@ -257,6 +294,7 @@ pub const plugin = struct {
 
 /// `plugins/deepseek_v41/config.zig`.
 pub const config = struct {
+    pub const Config = v4_config.Config;
     pub const plugin = struct {
         pub const name = "";
     };

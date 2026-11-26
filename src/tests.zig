@@ -95,6 +95,7 @@ test {
     _ = @import("engines/mlx/plugin/dsv41_link.zig");
     if (@import("engines/mlx/plugin/dsv41_link.zig").on) {
         _ = @import("plugins/deepseek_v41/proof_test.zig");
+        _ = @import("plugins/deepseek_v41/draft_test.zig");
         _ = @import("plugins/deepseek_v41/streamed_test.zig");
         _ = @import("plugins/deepseek_v41/mx_view.zig");
         _ = @import("plugins/deepseek_v41/vision.zig");

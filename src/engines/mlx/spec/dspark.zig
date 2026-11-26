@@ -669,7 +669,7 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     defer if (q.ctx != null) {
         _ = mlx.mlx_array_free(q);
     };
-    var d = if (self.dspark_stochastic and dsv41_mod.draftSampleOn()) blk: {
+    var d = if (self.dspark_stochastic and dsv41_mod.draftSampleServes(mdl)) blk: {
         const sd = try draftSampled(self, allocator, mdl, st, t1);
         q = sd.q;
         break :blk sd.d;

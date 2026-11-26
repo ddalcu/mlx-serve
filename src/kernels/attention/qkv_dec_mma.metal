@@ -85,7 +85,14 @@ for (int t0 = s0; t0 < s1; t0 += 8) {
   simdgroup_float8x8 P[NHT];
   UNR for (int h = 0; h < NHT; ++h) {
     float x0 = S[h].thread_elements()[0], x1 = S[h].thread_elements()[1];
-    if (HAS_MASK) { x0 += a_ok ? float(msk[ra]) : 0.0f; x1 += b_ok ? float(msk[rb]) : 0.0f; }
+    if (HAS_MASK) {
+      // HAS_MASK 2: a row a head ([Hq, Tk]); the padded head rows of the tile (head >= GQA) read none.
+      const int head = fm + 8 * h;
+      const long mr = HAS_MASK == 2 ? ((long)hkv * GQA + head) * (long)Tk : 0;
+      const bool hv = HAS_MASK != 2 || head < GQA;
+      x0 += (a_ok && hv) ? float(msk[mr + ra]) : 0.0f;
+      x1 += (b_ok && hv) ? float(msk[mr + rb]) : 0.0f;
+    }
     x0 = a_ok ? x0 : -INFINITY; x1 = b_ok ? x1 : -INFINITY;
     float mx = max(x0, x1);
     mx = max(mx, simd_shuffle_xor(mx, 1));
