@@ -526,16 +526,8 @@ fn handleResponsesInner(
     } else default_budget);
 
     // ── tools ──
-    var tools_json: ?[]const u8 = null;
-    var tools_json_owned = false;
-    defer if (tools_json_owned) {
-        if (tools_json) |tj| allocator.free(tj);
-    };
-    var has_tools = root.get("tools") != null;
-
     const tool_choice = try responses_mod.parseToolChoice(allocator, root.get("tool_choice"), root.get("tools"));
     defer if (tool_choice.instruction) |ins| allocator.free(ins);
-    if (!tool_choice.include_tools) has_tools = false;
     if (tool_choice.forced) |ft| if (ft == .name and !chat_mod.toolsDeclare(root.get("tools"), ft.name)) {
         const msg = try std.fmt.allocPrint(allocator, "tool_choice names function \"{s}\", which is not in tools", .{ft.name});
         defer allocator.free(msg);
@@ -549,14 +541,10 @@ fn handleResponsesInner(
     var namespace_aliases = responses_mod.NamespaceAliases.init(allocator);
     defer responses_mod.freeNamespaceAliases(allocator, &namespace_aliases);
 
-    if (has_tools) {
-        if (root.get("tools")) |tools_val| if (tools_val == .array) {
-            const reshaped = try responses_mod.buildToolsJson(allocator, tools_val.array, &namespace_aliases);
-            tools_json = reshaped;
-            tools_json_owned = true;
-            if (reshaped.len <= 2) has_tools = false; // "[]" — no function tools
-        };
-    }
+    const request_tools = try responsesRequestTools(allocator, root.get("tools"), tool_choice.include_tools, &namespace_aliases);
+    defer if (request_tools.json) |tj| allocator.free(tj);
+    const tools_json = request_tools.json;
+    const has_tools = request_tools.has_tools;
 
     // Once tool outputs are supplied for a structured-output request, this turn
     // must produce the final JSON answer. Keeping tools available lets local
@@ -1491,9 +1479,42 @@ fn completedEventPayload(allocator: std.mem.Allocator, envelope: []const u8, tim
     return std.fmt.allocPrint(allocator, "{{\"type\":\"response.completed\",\"response\":{s},\"timings\":{s}}}", .{ envelope, timings });
 }
 
+const ResponsesRequestTools = struct { json: ?[]const u8 = null, has_tools: bool = false };
+
+/// The caller frees `json`.
+fn responsesRequestTools(allocator: std.mem.Allocator, tools: ?std.json.Value, include_tools: bool, aliases: *responses_mod.NamespaceAliases) !ResponsesRequestTools {
+    var out: ResponsesRequestTools = .{ .has_tools = include_tools and chat_mod.declaresTools(tools) };
+    if (out.has_tools) {
+        out.json = try responses_mod.buildToolsJson(allocator, tools.?.array, aliases);
+        out.has_tools = out.json.?.len > 2;
+    }
+    return out;
+}
+
 // ─── WebSocket transport for /v1/responses ────────────────────────────────
 
 // ── tests ──
+
+test "responsesRequestTools: null or [] tools leave tool mode off, a function tool turns it on with its list" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var aliases = responses_mod.NamespaceAliases.init(a);
+    const cases = [_]struct { tools: []const u8, include: bool, has_tools: bool }{
+        .{ .tools = "null", .include = true, .has_tools = false },
+        .{ .tools = "[]", .include = true, .has_tools = false },
+        .{ .tools = "[{\"type\":\"web_search\"}]", .include = true, .has_tools = false },
+        .{ .tools = "[{\"type\":\"function\",\"name\":\"f\",\"parameters\":{}}]", .include = false, .has_tools = false },
+        .{ .tools = "[{\"type\":\"function\",\"name\":\"f\",\"parameters\":{}}]", .include = true, .has_tools = true },
+    };
+    for (cases) |c| {
+        const tools = try std.json.parseFromSliceLeaky(std.json.Value, a, c.tools, .{});
+        const got = try responsesRequestTools(a, tools, c.include, &aliases);
+        try testing.expectEqual(c.has_tools, got.has_tools);
+        if (c.has_tools) try testing.expect(std.mem.indexOf(u8, got.json.?, "\"f\"") != null);
+    }
+    try testing.expect(!(try responsesRequestTools(a, null, true, &aliases)).has_tools);
+}
 
 test "responsesToolExists validates Responses function tool names" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,

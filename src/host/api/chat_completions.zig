@@ -425,7 +425,7 @@ pub fn handleChatCompletions(
 
     // Extract tools JSON from request body for chat template injection
     var tools_json: ?[]const u8 = null;
-    var has_tools = root.get("tools") != null;
+    var has_tools = chat_mod.declaresTools(root.get("tools"));
     var forced_tool: ?chat_mod.ForcedTool = null;
 
     // OpenAI parallel_tool_calls: only an explicit false clamps to one call
@@ -1361,6 +1361,26 @@ fn formatToolCallReply(
 }
 
 // ── tests ──
+
+test "extractJsonField and declaresTools see tools only in a non-empty top-level array" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { body: []const u8, tools: ?[]const u8 }{
+        .{ .body = "{\"messages\":[]}", .tools = null },
+        .{ .body = "{\"messages\":[],\"tools\":null}", .tools = null },
+        .{ .body = "{\"messages\":[],\"tools\":[]}", .tools = null },
+        .{ .body = "{\"messages\":[],\"tools\":{\"type\":\"function\"}}", .tools = null },
+        .{ .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"tools\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\"}}]}", .tools = "[{\"type\":\"function\",\"function\":{\"name\":\"f\"}}]" },
+    };
+    for (cases) |c| {
+        const root = (try std.json.parseFromSliceLeaky(std.json.Value, a, c.body, .{})).object;
+        const has_tools = chat_mod.declaresTools(root.get("tools"));
+        try testing.expectEqual(c.tools != null, has_tools);
+        if (c.tools) |want| try testing.expectEqualStrings(want, extractJsonField(c.body, "tools").?);
+    }
+}
 
 test "a tool-call reply's usage reports its reasoning tokens" {
     const testing = std.testing;

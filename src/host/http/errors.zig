@@ -256,48 +256,54 @@ pub fn sendGenerationError(allocator: std.mem.Allocator, stream: *Conn, err: any
     }
 }
 
-/// Extract a JSON field's raw value from a JSON body string.
+/// Extract a top-level JSON field's raw value from a JSON object body.
 /// Returns the raw substring for the field value (e.g., the array or object).
 pub fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
-    // Search for "field": or "field" :
+    var level: usize = 0;
     var pos: usize = 0;
-    while (pos < body.len) {
-        const quote_pos = std.mem.indexOf(u8, body[pos..], "\"") orelse return null;
-        const key_start = pos + quote_pos + 1;
-        if (key_start + field.len >= body.len) return null;
-
-        if (std.mem.eql(u8, body[key_start .. key_start + field.len], field) and
-            body[key_start + field.len] == '"')
-        {
-            // Found the key, skip to colon
-            var i = key_start + field.len + 1;
-            while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\n' or body[i] == '\r' or body[i] == '\t')) {
-                i += 1;
-            }
-            if (i >= body.len) return null;
-
-            // Now extract the value - find matching bracket/brace
-            const start = i;
-            const open = body[start];
-            const close: u8 = if (open == '[') ']' else if (open == '{') '}' else return null;
-            var depth: usize = 1;
-            var j = start + 1;
-            var in_string = false;
-            while (j < body.len and depth > 0) {
-                if (body[j] == '\\' and in_string) {
-                    j += 1; // skip escaped char
-                } else if (body[j] == '"') {
-                    in_string = !in_string;
-                } else if (!in_string) {
-                    if (body[j] == open) depth += 1;
-                    if (body[j] == close) depth -= 1;
-                }
-                j += 1;
-            }
-            if (depth == 0) return body[start..j];
-            return null;
+    while (pos < body.len) : (pos += 1) {
+        switch (body[pos]) {
+            '{', '[' => level += 1,
+            '}', ']' => level -|= 1,
+            else => {},
         }
-        pos = key_start;
+        if (body[pos] != '"') continue;
+        const key_start = pos + 1;
+        var key_end = key_start;
+        while (key_end < body.len and body[key_end] != '"') : (key_end += 1) {
+            if (body[key_end] == '\\') key_end += 1;
+        }
+        if (key_end >= body.len) return null;
+        pos = key_end;
+        if (level != 1 or !std.mem.eql(u8, body[key_start..key_end], field)) continue;
+
+        var i = key_end + 1;
+        while (i < body.len and (body[i] == ' ' or body[i] == '\n' or body[i] == '\r' or body[i] == '\t')) i += 1;
+        if (i >= body.len or body[i] != ':') continue;
+        i += 1;
+        while (i < body.len and (body[i] == ' ' or body[i] == '\n' or body[i] == '\r' or body[i] == '\t')) i += 1;
+        if (i >= body.len) return null;
+
+        // Now extract the value - find matching bracket/brace
+        const start = i;
+        const open = body[start];
+        const close: u8 = if (open == '[') ']' else if (open == '{') '}' else return null;
+        var depth: usize = 1;
+        var j = start + 1;
+        var in_string = false;
+        while (j < body.len and depth > 0) {
+            if (body[j] == '\\' and in_string) {
+                j += 1; // skip escaped char
+            } else if (body[j] == '"') {
+                in_string = !in_string;
+            } else if (!in_string) {
+                if (body[j] == open) depth += 1;
+                if (body[j] == close) depth -= 1;
+            }
+            j += 1;
+        }
+        if (depth == 0) return body[start..j];
+        return null;
     }
     return null;
 }
@@ -468,6 +474,28 @@ test "extractJsonField handles escaped quotes in strings" {
     const result = extractJsonField(body, "tools").?;
     try testing.expect(std.mem.startsWith(u8, result, "["));
     try testing.expect(std.mem.endsWith(u8, result, "]"));
+}
+
+test "extractJsonField takes the top-level key, not a nested key or string of the same name" {
+    const tools =
+        \\[{"type":"function","function":{"name":"f"}}]
+    ;
+    const nested_key =
+        \\{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"tools":{"type":"array"}}}}},"tools":
+    ++ tools ++ "}";
+    const string_value =
+        \\{"messages":[{"role":"user","content":"tools"}],"tools":
+    ++ tools ++ "}";
+    const top_level_null =
+        \\{"messages":[{"role":"user","content":"hi","x":{"tools":[1]}}],"tools":null}
+    ;
+    const from_nested = extractJsonField(nested_key, "tools");
+    try testing.expect(from_nested != null);
+    try testing.expectEqualStrings(tools, from_nested.?);
+    const from_string = extractJsonField(string_value, "tools");
+    try testing.expect(from_string != null);
+    try testing.expectEqualStrings(tools, from_string.?);
+    try testing.expect(extractJsonField(top_level_null, "tools") == null);
 }
 
 test "the out-of-memory 503 names the cap's flag and never blames concurrency" {

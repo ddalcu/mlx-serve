@@ -611,7 +611,7 @@ pub fn handleAnthropicMessages(
         return;
     };
     const request_effort = if (output_cfg.effort) |word| reasoningEffortFromWord(word, default_budget) else null;
-    const thinking = resolveThinking(gen, thinking_on, request_effort, config.defaultEnableThinking(root.get("tools") != null), default_budget);
+    const thinking = resolveThinking(gen, thinking_on, request_effort, config.defaultEnableThinking(chat_mod.declaresTools(root.get("tools"))), default_budget);
     var enable_thinking = thinking.enable;
     const effort_word: ?[]const u8 = if (thinking.effort) |cfg| cfg.effort else null;
     const reasoning_budget = forcedReasoningBudget(gen, budget_tokens orelse default_budget);
