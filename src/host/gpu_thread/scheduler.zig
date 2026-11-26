@@ -5,7 +5,6 @@
 const std = @import("std");
 const handles = @import("../../abi/mlx_handles.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
-const crt = @import("../../sdk/util/crt.zig");
 const system = @import("../../sdk/util/system.zig");
 const metrics_mod = @import("../metrics/metrics.zig");
 const engines_served = @import("../engines/served.zig");
@@ -73,18 +72,14 @@ pub const PressureGauge = struct {
     const BETTER_HOLD_MS: i64 = 30_000;
 
     /// Which way the level moved, or null when it did not or no reading is due: the caller then has nothing to do.
-    pub fn sample(self: *PressureGauge) ?Move {
-        if (!self.enabled) return null;
-        return self.sampleAt(crt.monotonicMs());
-    }
-
     pub fn sampleAt(self: *PressureGauge, now_ms: i64) ?Move {
         if (!self.enabled) return null;
         if (self.read_ms) |t| if (now_ms - t < READ_EVERY_MS) return null;
         self.read_ms = now_ms;
         const kernel = system.pressureOverrideLevel() orelse system.memoryPressureLevel();
-        self.readable = self.readable or kernel != 0;
-        return if (self.readable) self.observe(kernel, now_ms) else null;
+        if (kernel == 0) return null;
+        self.readable = true;
+        return self.observe(kernel, now_ms);
     }
 
     /// One reading of the kernel's level (1 normal, 2 warning, 4 critical) taken at `now_ms`.
@@ -95,7 +90,7 @@ pub const PressureGauge = struct {
             return null;
         }
         const worse = step > self.level;
-        if (self.since_ms == null or worse != (self.pending > self.level)) {
+        if (self.since_ms == null or worse != (self.pending > self.level) or (step == 2 and self.pending < 2)) {
             self.since_ms = now_ms;
             self.pending = step;
         }
@@ -118,8 +113,8 @@ pub const PressureGauge = struct {
     }
 
     fn due(self: *const PressureGauge, worse: bool, held_ms: i64) bool {
-        if (!worse) return held_ms >= BETTER_HOLD_MS;
-        return if (self.pending == 2) held_ms > 0 else held_ms >= WARNING_HOLD_MS;
+        if (self.pending == 2) return held_ms > 0;
+        return held_ms >= if (worse) WARNING_HOLD_MS else BETTER_HOLD_MS;
     }
 
     fn stepOf(kernel: u32) u2 {

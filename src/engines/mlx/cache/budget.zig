@@ -68,12 +68,11 @@ pub fn memoryPressureGauge() PressureGauge {
 /// null (until work arrives) where nothing is clamped or the OS has no level, 1 s while the level is high or
 /// changing, else 5 s.
 pub fn followMemoryPressure(sch: *Scheduler) ?u32 {
-    if (sch.prefix_cache_mem_resolver == null or !sch.memory_pressure.enabled) return null;
     return followMemoryPressureAt(sch, crt.monotonicMs());
 }
 
 fn followMemoryPressureAt(sch: *Scheduler, now_ms: i64) ?u32 {
-    if (sch.prefix_cache_mem_resolver == null) return null;
+    if (sch.prefix_cache_mem_resolver == null or !sch.memory_pressure.enabled) return null;
     const gauge = &sch.memory_pressure;
     if (gauge.sampleAt(now_ms)) |move| {
         log.info("[hot-cache] memory pressure {s}: {s}, re-clamping the budgets\n", .{ @tagName(move), gauge.levelName() });
@@ -595,138 +594,179 @@ fn initPressureTestScheduler(sch: *Scheduler, reg: *ModelRegistry) void {
     sch.decoding = .empty;
 }
 
-test "prefix cache pressure: normal does nothing, warning and critical step the budget and log" {
-    const kill_ov = env.override(.MLX_SERVE_PREFIX_CACHE_PRESSURE, null);
-    defer kill_ov.restore();
+const PressureTestFixture = struct {
+    kill_ov: env.Override(.MLX_SERVE_PREFIX_CACHE_PRESSURE),
+    press_ov: env.Override(.MLX_SERVE_PRESSURE_OVERRIDE),
+    tmp: testing.TmpDir,
+    press_buf: [600]u8 = undefined,
+    log_path_buf: [600]u8 = undefined,
+    press_path: [:0]const u8 = "",
+    log_path: [:0]const u8 = "",
+    prev_level: log.Level = .info,
+    prev_stderr: bool = true,
+    reg: *ModelRegistry = undefined,
+    cfg: model_mod.ModelConfig = .{},
+    model: *LoadedModel = undefined,
+    hc: *prefix_cache_mod.HotPrefixCache = undefined,
+    sch: Scheduler = undefined,
 
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var base_buf: [512]u8 = undefined;
-    const base = base_buf[0..try tmp.dir.realPath(testing.io, &base_buf)];
-    var press_buf: [600]u8 = undefined;
-    var log_path_buf: [600]u8 = undefined;
-    const press_path = try std.fmt.bufPrintSentinel(&press_buf, "{s}/pressure.level", .{base}, 0);
-    const log_path = try std.fmt.bufPrintSentinel(&log_path_buf, "{s}/server.log", .{base}, 0);
+    fn init(self: *PressureTestFixture, kill_val: ?[*:0]const u8) !void {
+        self.kill_ov = env.override(.MLX_SERVE_PREFIX_CACHE_PRESSURE, kill_val);
+        errdefer self.kill_ov.restore();
+        self.tmp = testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
 
-    const press_ov = env.override(.MLX_SERVE_PRESSURE_OVERRIDE, press_path.ptr);
-    defer press_ov.restore();
+        var base_buf: [512]u8 = undefined;
+        const base = base_buf[0..try self.tmp.dir.realPath(testing.io, &base_buf)];
+        self.press_path = try std.fmt.bufPrintSentinel(&self.press_buf, "{s}/pressure.level", .{base}, 0);
+        self.log_path = try std.fmt.bufPrintSentinel(&self.log_path_buf, "{s}/server.log", .{base}, 0);
+        self.press_ov = env.override(.MLX_SERVE_PRESSURE_OVERRIDE, self.press_path.ptr);
+        errdefer self.press_ov.restore();
 
-    const sinks = log.sinks_shared.get();
-    const prev_level = sinks.current_level;
-    const prev_stderr = sinks.stderr_enabled;
-    sinks.current_level = .info;
-    sinks.stderr_enabled = false;
-    defer {
-        log.closeFile();
-        sinks.current_level = prev_level;
-        sinks.stderr_enabled = prev_stderr;
+        const sinks = log.sinks_shared.get();
+        self.prev_level = sinks.current_level;
+        self.prev_stderr = sinks.stderr_enabled;
+        sinks.current_level = .info;
+        sinks.stderr_enabled = false;
+        errdefer {
+            log.closeFile();
+            sinks.current_level = self.prev_level;
+            sinks.stderr_enabled = self.prev_stderr;
+        }
+        try log.openFile(self.log_path, 0);
+
+        self.reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 4, 0, null);
+        errdefer self.reg.deinit();
+        self.cfg = .{ .model_type = "qwen3_5" };
+        self.model = try self.reg.registerStub("m", "/m/m", 64);
+        self.model.config = &self.cfg;
+        self.model.state = .ready;
+        self.model.prefix_cache = try testHotCache();
+        self.hc = self.model.prefix_cache.?;
+        initPressureTestScheduler(&self.sch, self.reg);
     }
-    try log.openFile(log_path, 0);
 
-    const reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 4, 0, null);
-    defer reg.deinit();
-    var cfg = model_mod.ModelConfig{};
-    cfg.model_type = "qwen3_5";
-    const m = try reg.registerStub("m", "/m/m", 64);
-    defer m.config = null;
-    m.config = &cfg;
-    m.state = .ready;
-    m.prefix_cache = try testHotCache();
-    const hc = m.prefix_cache.?;
+    fn deinit(self: *PressureTestFixture) void {
+        self.model.config = null;
+        self.reg.deinit();
+        const sinks = log.sinks_shared.get();
+        log.closeFile();
+        sinks.current_level = self.prev_level;
+        sinks.stderr_enabled = self.prev_stderr;
+        self.press_ov.restore();
+        self.tmp.cleanup();
+        self.kill_ov.restore();
+    }
 
-    var sch: Scheduler = undefined;
-    initPressureTestScheduler(&sch, reg);
-    try testing.expect(sch.memory_pressure.enabled);
+    fn setLevel(self: *const PressureTestFixture, text: []const u8) !void {
+        try writePressureTestFile(self.press_path.ptr, text);
+    }
+
+    fn readLog(self: *const PressureTestFixture, buf: []u8) []const u8 {
+        return readPressureTestFile(self.log_path.ptr, buf);
+    }
+};
+
+test "prefix cache pressure: normal does nothing, warning and critical step the budget and log" {
+    var fx: PressureTestFixture = undefined;
+    try fx.init(null);
+    defer fx.deinit();
+    try testing.expect(fx.sch.memory_pressure.enabled);
 
     var log_buf: [4096]u8 = undefined;
-    hc.max_kv_bytes = 600 << 20;
+    fx.hc.max_kv_bytes = 600 << 20;
 
-    try writePressureTestFile(press_path.ptr, "normal\n");
+    try fx.setLevel("normal\n");
     for ([_]i64{ 0, 1_000, 6_000, 40_000 }) |t_ms| {
-        try testing.expectEqual(@as(?u32, 5000), followMemoryPressureAt(&sch, t_ms));
-        try testing.expectEqual(@as(u64, 600 << 20), hc.max_kv_bytes);
+        try testing.expectEqual(@as(?u32, 5000), followMemoryPressureAt(&fx.sch, t_ms));
+        try testing.expectEqual(@as(u64, 600 << 20), fx.hc.max_kv_bytes);
     }
-    try testing.expectEqualStrings("", readPressureTestFile(log_path.ptr, &log_buf));
+    try testing.expectEqualStrings("", fx.readLog(&log_buf));
 
-    try writePressureTestFile(press_path.ptr, "warning\n");
-    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&sch, 41_000));
-    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&sch, 45_000));
-    try testing.expectEqual(@as(u64, 600 << 20), hc.max_kv_bytes);
-    try testing.expectEqualStrings("", readPressureTestFile(log_path.ptr, &log_buf));
+    try fx.setLevel("warning\n");
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&fx.sch, 41_000));
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&fx.sch, 45_000));
+    try testing.expectEqual(@as(u64, 600 << 20), fx.hc.max_kv_bytes);
+    try testing.expectEqualStrings("", fx.readLog(&log_buf));
 
-    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&sch, 46_000));
-    try testing.expectEqual(@as(u64, 200 << 20), hc.max_kv_bytes);
-    const warn_log = readPressureTestFile(log_path.ptr, &log_buf);
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&fx.sch, 46_000));
+    try testing.expectEqual(@as(u64, 200 << 20), fx.hc.max_kv_bytes);
+    const warn_log = fx.readLog(&log_buf);
     try testing.expect(std.mem.indexOf(u8, warn_log, "[hot-cache] memory pressure worse: warning, re-clamping the budgets\n") != null);
     try testing.expect(std.mem.indexOf(u8, warn_log, "[hot-cache] budget revised 600 -> 200 MB\n") != null);
 
-    hc.max_kv_bytes = 500 << 20;
-    try writePressureTestFile(press_path.ptr, "critical\n");
-    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&sch, 47_000));
-    try testing.expectEqual(@as(u64, 500 << 20), hc.max_kv_bytes);
-    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&sch, 48_000));
-    try testing.expectEqual(@as(u64, 200 << 20), hc.max_kv_bytes);
-    const crit_log = readPressureTestFile(log_path.ptr, &log_buf);
+    fx.hc.max_kv_bytes = 500 << 20;
+    try fx.setLevel("critical\n");
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&fx.sch, 47_000));
+    try testing.expectEqual(@as(u64, 500 << 20), fx.hc.max_kv_bytes);
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&fx.sch, 48_000));
+    try testing.expectEqual(@as(u64, 200 << 20), fx.hc.max_kv_bytes);
+    const crit_log = fx.readLog(&log_buf);
     try testing.expect(std.mem.indexOf(u8, crit_log, "[hot-cache] memory pressure worse: critical, re-clamping the budgets\n") != null);
     try testing.expect(std.mem.indexOf(u8, crit_log, "[hot-cache] budget revised 500 -> 200 MB\n") != null);
 }
 
+test "prefix cache pressure: normal -> warning -> critical fires on second critical reading and eased is grow-only" {
+    var fx: PressureTestFixture = undefined;
+    try fx.init(null);
+    defer fx.deinit();
+
+    fx.hc.max_kv_bytes = 600 << 20;
+    try fx.setLevel("normal\n");
+    try testing.expectEqual(@as(?u32, 5000), followMemoryPressureAt(&fx.sch, 0));
+
+    // One warning reading, then two critical readings: escalates to critical on the 2nd critical reading.
+    try fx.setLevel("warning\n");
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&fx.sch, 1_000));
+    try fx.setLevel("critical\n");
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&fx.sch, 2_000));
+    try testing.expectEqual(@as(u64, 600 << 20), fx.hc.max_kv_bytes);
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&fx.sch, 3_000));
+    try testing.expectEqual(@as(u2, 2), fx.sch.memory_pressure.level);
+    try testing.expectEqual(@as(u64, 200 << 20), fx.hc.max_kv_bytes);
+
+    // Easing back to normal requires 30 s and is grow-only (raises 100 -> 200 MB, never shrinks 600 -> 200 MB).
+    fx.hc.max_kv_bytes = 100 << 20;
+    try fx.setLevel("normal\n");
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&fx.sch, 4_000));
+    // Transient unreadable file (kernel == 0) does not reset easing or fake normal.
+    try fx.setLevel("bogus\n");
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&fx.sch, 10_000));
+    try fx.setLevel("normal\n");
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&fx.sch, 33_000));
+    try testing.expectEqual(@as(u64, 100 << 20), fx.hc.max_kv_bytes);
+    try testing.expectEqual(@as(?u32, 5000), followMemoryPressureAt(&fx.sch, 34_000));
+    try testing.expectEqual(@as(u2, 0), fx.sch.memory_pressure.level);
+    try testing.expectEqual(@as(u64, 200 << 20), fx.hc.max_kv_bytes);
+
+    // Easing from warning -> normal must never shrink a budget already above the resolved value.
+    fx.sch.memory_pressure.level = 1;
+    fx.hc.max_kv_bytes = 600 << 20;
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&fx.sch, 35_000));
+    try testing.expectEqual(@as(?u32, 5000), followMemoryPressureAt(&fx.sch, 65_000));
+    try testing.expectEqual(@as(u2, 0), fx.sch.memory_pressure.level);
+    try testing.expectEqual(@as(u64, 600 << 20), fx.hc.max_kv_bytes);
+}
+
 test "prefix cache pressure: disabling the gauge skips every pressure level" {
-    const kill_ov = env.override(.MLX_SERVE_PREFIX_CACHE_PRESSURE, "0");
-    defer kill_ov.restore();
+    var fx: PressureTestFixture = undefined;
+    try fx.init("0");
+    defer fx.deinit();
+    try testing.expect(!fx.sch.memory_pressure.enabled);
 
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var base_buf: [512]u8 = undefined;
-    const base = base_buf[0..try tmp.dir.realPath(testing.io, &base_buf)];
-    var press_buf: [600]u8 = undefined;
-    var log_path_buf: [600]u8 = undefined;
-    const press_path = try std.fmt.bufPrintSentinel(&press_buf, "{s}/pressure.level", .{base}, 0);
-    const log_path = try std.fmt.bufPrintSentinel(&log_path_buf, "{s}/server.log", .{base}, 0);
-
-    const press_ov = env.override(.MLX_SERVE_PRESSURE_OVERRIDE, press_path.ptr);
-    defer press_ov.restore();
-
-    const sinks = log.sinks_shared.get();
-    const prev_level = sinks.current_level;
-    const prev_stderr = sinks.stderr_enabled;
-    sinks.current_level = .info;
-    sinks.stderr_enabled = false;
-    defer {
-        log.closeFile();
-        sinks.current_level = prev_level;
-        sinks.stderr_enabled = prev_stderr;
-    }
-    try log.openFile(log_path, 0);
-
-    const reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 4, 0, null);
-    defer reg.deinit();
-    var cfg = model_mod.ModelConfig{};
-    cfg.model_type = "qwen3_5";
-    const m = try reg.registerStub("m", "/m/m", 64);
-    defer m.config = null;
-    m.config = &cfg;
-    m.state = .ready;
-    m.prefix_cache = try testHotCache();
-    const hc = m.prefix_cache.?;
-
-    var sch: Scheduler = undefined;
-    initPressureTestScheduler(&sch, reg);
-    try testing.expect(!sch.memory_pressure.enabled);
-
-    hc.max_kv_bytes = 600 << 20;
+    fx.hc.max_kv_bytes = 600 << 20;
     var now_ms: i64 = 0;
     for ([_][]const u8{ "normal\n", "warning\n", "critical\n" }) |level_text| {
-        try writePressureTestFile(press_path.ptr, level_text);
+        try fx.setLevel(level_text);
         for (0..10) |_| {
-            try testing.expectEqual(@as(?u32, null), followMemoryPressureAt(&sch, now_ms));
-            try testing.expectEqual(@as(u64, 600 << 20), hc.max_kv_bytes);
+            try testing.expectEqual(@as(?u32, null), followMemoryPressureAt(&fx.sch, now_ms));
+            try testing.expectEqual(@as(u64, 600 << 20), fx.hc.max_kv_bytes);
             now_ms += 1_000;
         }
     }
-    try testing.expectEqual(@as(?u32, null), followMemoryPressure(&sch));
-    try testing.expectEqual(@as(u64, 600 << 20), hc.max_kv_bytes);
+    try testing.expectEqual(@as(?u32, null), followMemoryPressure(&fx.sch));
+    try testing.expectEqual(@as(u64, 600 << 20), fx.hc.max_kv_bytes);
 
     var log_buf: [4096]u8 = undefined;
-    try testing.expectEqualStrings("", readPressureTestFile(log_path.ptr, &log_buf));
+    try testing.expectEqualStrings("", fx.readLog(&log_buf));
 }

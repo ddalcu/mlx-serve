@@ -6,7 +6,7 @@
 # Phase 1 (default): starts mlx-serve with an isolated HOME, a small hot cache,
 #   and MLX_SERVE_PRESSURE_OVERRIDE pointing at a level file initialized to normal;
 #   sends distinct chat requests to fill the cache, switches the override file to
-#   warning, and asserts B3's budget-step log line:
+#   warning, and asserts the budget-step log line:
 #   `[hot-cache] memory pressure worse: (warning|critical), re-clamping the budgets`.
 # Phase 2 (`MLX_SERVE_PREFIX_CACHE_PRESSURE=0`): repeats across warning and critical
 #   overrides and asserts that no pressure budget step is logged.
@@ -99,23 +99,8 @@ fi
 [ -n "$MODEL" ] || fail "no model specified or found (set PRESSURE_TEST_MODEL or pass model dir)"
 [ -f "$MODEL/config.json" ] || fail "missing config.json in $MODEL"
 
-mkdir -p "$HOME/claude-tmp"
-OUT=$(mktemp -d "$HOME/claude-tmp/prefix-cache-pressure.XXXXXX")
+OUT=$(mktemp -d "${TMPDIR:-/tmp}/prefix-cache-pressure.XXXXXX")
 PRESSURE_FILE="$OUT/pressure.level"
-
-check_port_free() {
-    python3 - "$PORT" <<'PY' || fail "port $PORT is already in use"
-import socket, sys
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-try:
-    sock.bind(("127.0.0.1", int(sys.argv[1])))
-except OSError:
-    sys.exit(1)
-finally:
-    sock.close()
-PY
-}
 
 start_server() {
     local label="$1"
@@ -124,7 +109,7 @@ start_server() {
     mkdir -p "$case_home"
     LOGFILE="$OUT/$label.server.log"
     set_pressure "normal"
-    check_port_free
+    srv_preclean "$PORT"
     if [ -n "$pressure_env" ]; then
         HOME="$case_home" \
             MLX_SERVE_PRESSURE_OVERRIDE="$PRESSURE_FILE" \
