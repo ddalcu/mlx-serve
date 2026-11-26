@@ -2,7 +2,7 @@
 //! patches (one linear patch embedding, a learned position table read bilinearly at each patch's place, a class
 //! token), pre-norm layers of full attention under a 2-D rotary with layer-scaled residuals, then the merger: every
 //! `merge` x `merge` block of patches folded into one row and a GELU MLP to the text width. Each tensor is read by its
-//! mlx-lm name (`model.vision_tower.*`) or the release's (`model.visual.*`).
+//! mlx-lm name (`model.vision_tower.*`) or the release's (`model.visual.*`; `vision_tower.*` in oMLX's oQ packs).
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
@@ -128,10 +128,11 @@ pub const Tower = struct {
         var r = try reader.Reader.open(ctx, block_json, "");
         defer r.close();
         const release = !r.has("model.vision_tower.embeddings.patch_embedding.weight");
-        if (release and !r.has("model.visual.backbone.embeddings.patch_embedding.weight")) return null;
+        const oq = r.has("vision_tower.backbone.embeddings.patch_embedding.weight");
+        if (release and !oq and !r.has("model.visual.backbone.embeddings.patch_embedding.weight")) return null;
         var t: Tower = .{ .cfg = cfg, .s = r.s, .patch = .{}, .positions = .{}, .class = .{}, .pre_norm = undefined, .layers = &.{}, .merge_1 = .{}, .merge_2 = .{} };
         errdefer t.deinit();
-        var at: At = .{ .r = &r, .o = &t.owned, .release = release };
+        var at: At = .{ .r = &r, .o = &t.owned, .release = release, .root = if (oq) "vision_tower." else "model.visual." };
         const h = cfg.hidden;
         t.patch = try at.linear("embeddings.patch_embedding", "backbone.embeddings.patch_embedding", cfg.channels * cfg.patch * cfg.patch, false);
         t.pre_norm = .{ try at.need("pre_layernorm.weight", "backbone.ln_pre.weight"), try at.need("pre_layernorm.bias", "backbone.ln_pre.bias") };
@@ -353,18 +354,20 @@ fn gelu(g: *Graph, x: Array) !Array {
     return g.astype(try g.mul(try g.mulScalar(f, 0.5), try g.addScalar(try g.erf(try g.mulScalar(f, std.math.sqrt1_2)), 1.0)), ops.dtype(x));
 }
 
-/// Reads a tensor by its mlx-lm leaf under `model.vision_tower` or the release's under `model.visual`; a layer's
-/// leaves sit under `layers.N` (the release's under `backbone.layers.N`).
+/// Reads a tensor by its mlx-lm leaf under `model.vision_tower` or the release's under `root`; a layer's leaves sit
+/// under `layers.N` (the release's under `backbone.layers.N`).
 const At = struct {
     r: *reader.Reader,
     o: *reader.Owned,
     release: bool,
+    root: []const u8 = "model.visual.",
     layer: ?u32 = null,
 
     fn name(a: At, buf: []u8, leaf: []const u8, rel: []const u8) ![]const u8 {
         const tail = if (a.release) rel else leaf;
-        if (a.layer) |i| return std.fmt.bufPrint(buf, "{s}layers.{d}.{s}", .{ if (a.release) "model.visual.backbone." else "model.vision_tower.", i, tail });
-        return std.fmt.bufPrint(buf, "{s}{s}", .{ if (a.release) "model.visual." else "model.vision_tower.", tail });
+        const root = if (a.release) a.root else "model.vision_tower.";
+        if (a.layer) |i| return std.fmt.bufPrint(buf, "{s}{s}layers.{d}.{s}", .{ root, if (a.release) "backbone." else "", i, tail });
+        return std.fmt.bufPrint(buf, "{s}{s}", .{ root, tail });
     }
 
     /// An unowned handle.
