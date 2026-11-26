@@ -59,6 +59,7 @@ const Served = struct {
     after_greedy: bool = false,
 
     fn open(table: *const abi.ModelTable, files: []const sdk.fixture.File, tape: []const u8) !*Served {
+        mlx.installErrorHandler(); // the model's threadgroup probes raise on M1/M2: latch it, never exit
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
         const p = try a.create(Served);
