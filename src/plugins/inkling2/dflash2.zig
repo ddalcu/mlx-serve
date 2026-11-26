@@ -256,7 +256,7 @@ pub const Drafter = struct {
         };
     }
 
-    fn prepare(d: *const Drafter, g: *Graph, c: *const Conv, x: Array) !Prepared {
+    pub fn prepare(d: *const Drafter, g: *Graph, c: *const Conv, x: Array) !Prepared {
         const dyn_raw = try project(g, &c.proj, x);
         const lanes = ops.shape(x)[0];
         const len = ops.shape(x)[1];
@@ -285,7 +285,7 @@ pub const Drafter = struct {
         };
     }
 
-    fn finishAdd(d: *const Drafter, g: *Graph, c: *const Conv, x: Array, dyn: Array, res: Array) !Array {
+    pub fn finishAdd(d: *const Drafter, g: *Graph, c: *const Conv, x: Array, dyn: Array, res: Array) !Array {
         const lanes = ops.shape(x)[0];
         const len = ops.shape(x)[1];
         const dt = ops.dtype(x);

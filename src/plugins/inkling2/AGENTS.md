@@ -46,8 +46,9 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **Every step kernel takes rows on grid y**, so `kernels.visit` serves one row, a prompt's rows and batched slots;
   the conv kernels read one state the rows chain behind (`SEQ` 1) or a state per row (`SEQ` 0, batched slots).
 - **A prompt's rows (past `small_rows`) read on the NAX tensor unit** (`relattn_nax.metal`: `matmul2d` for Q K^T and
-  P V, no mask built); `relattn.metal` (8x8 SIMD matrices, 4x the time a key) serves a GPU without NAX. A masked key's
-  value still enters P V at weight 0 in its 32-key tile: a NaN there reaches the row.
+  P V, no mask built; `NAX_PREFILL`, opt-in for an A/B: `relative_attention_nax.metal`); `relattn.metal` (8x8 SIMD
+  matrices, 4x the time a key) serves a GPU without NAX. A masked key's value still enters P V at weight 0 in its
+  32-key tile: a NaN there reaches the row.
 - **Reads of at most `small_rows` rows build a mask (`relmask.metal`) and use MLX's attention**, which beats the flash
   kernel (`relattn.metal`, mlx-lm's, MIT: 16 keys at a time on one threadgroup) at a few rows' latency.
 - **2 to `packed_rows` rows (64) read the packed expert banks in place, their picks GROUPED by expert** (`group`: tiles
@@ -127,6 +128,17 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **The draft head's 3 layers and Markov chain**: `draft_bits = 8` joins `q|k|v`, `k_ctx|v_ctx`, `gate|up` and quantizes
   the layers to affine 8-bit g64; `fold` is group-64 uint8+f16 (`markov_fold_q8.metal`, `~55 MB < 96 MB` SLC) and
   `markov_pick_rnn.metal` fuses pick + next-step RNN (`LAW=0` greedy, `LAW=1` Gumbel-max + parallel law probs). `draft.markov`'s op chain is the proof reference.
+- **`MARKOV_Q8` (opt-in for an A/B; off: the group-64 fold above) folds the chain's head into int8 a vocab row**
+  (`Drafter.quantizeFoldRows`, `markov_fold_q8_row`, `markov_step_rnn` over a block's precomputed context `kappa`);
+  drafts are proposals, so the trunk's picks stand. It acts only on a pack without a DFlash2 `drafter/`.
+- **A speed lever is a kill switch** (`config.lever`, `.kill` in `src/env.zig`): on unless `=0`, and its `=0` arm is
+  the path it replaced, which its proof test or contract case compares against. An arm beside main's code for the same
+  job is opt-in (`config.optIn`, default off) until the standard A/B picks one; an arm that loses is removed with the
+  code only it reaches.
+- **The 8-bit trunk is made at load** (`TRUNK_Q8`: attention and conv projections, embedding, head; affine 8, group
+  64), byte for byte as `convert_inkling2.py --bits 8` stores it (`INKLING2_Q8_REF`). The proofs pin the dense trunk.
+- **The first-launch pipelines are kept per build, machine and composition** (`fit_key.zig`, `~/.mlx-serve/inkling2`):
+  the file name carries the key, so a new build or MLX setting records again.
 - **Batched decode**: slots are rows with their own cache and conv state (`attendSlots`, `state.get`/`put`); their
   reads run as one `relslots` launch per 8 slots (each slot's K, V and K's strides a buffer: a kernel takes 31) into
   `relcomb`. A CPU stream or several rows a slot run a slot at a time.
@@ -166,11 +178,13 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
   mlx-lm's bit for bit (dense and quantized), planted state mutations, the media
   splice, a verified block's commit, batched slots against each slot alone (CPU) or reordered and re-neighboured
   (GPU), and each kernel against its chain.
-- `contract.zig`: `gated`, `state`, `relmask`, `act`, `sum`, `topk`, `gate` (its one-row arm), `relsplit`, `relattn_nax`,
-  `relcomb`, `relslots`, `markov_rnn`, `markov_fold`, `markov_pick`, `markov_fold_batch`, `markov_pick_batch`,
-  `markov_pick_sample`, `oproj`, `router`, `norm`.
+- `contract.zig`: `gated`, `state`, `relmask`, `act`, `sum`, `topk`, `gate` (its one-row arm), `gate_mm`, `prep` (its
+  strided reads), `relsplit`, `relnax`, `relattn_nax`, `relcomb`, `relslots`, `markov_rnn`, `markov_fold`, `markov_pick`,
+  `markov_fold_batch`, `markov_pick_batch`, `markov_pick_sample`, `markov_step_rnn`, `markov_fold_q8_row`, `oproj`,
+  `router`, `norm`; its `rounds_contract.zig`: `commit_conv`, `accept_tree`, `sample_tree_mass`/`_search`/`_draw`,
+  `dflash_conv`/`_top16_shard`/`_top16_merge`/`_edges`/`_tree`; its `group_contract.zig`: `relsplit_nax`,
+  `relsplit_lanes`; its `trunk_contract.zig`: `gate` (its prompt arm); its `vision_contract.zig`: the tower's kernels.
 - Contract entries owed (GPU proofs in `proof_test.zig` cover each): `pre`, `prep`, `mid`, `ups`, `downs`, `relattn`,
-  `gate`'s prompt arm, `group`, `ups_grp`, `downs_grp`, `few_tail`, `topk_group`, `tile_scan`, `moe_wide`,
-  `markov_fold_q8`, `markov_pick_rnn`, `relsplit_nax`, `relsplit_lanes`, `commit_conv`,
-  `accept_tree`, `sample_tree_draw`/`_mass`/`_search`, `dflash_conv`/`_edges`/`_top16_shard`/`_top16_merge`/`_tree`.
+  `group`, `ups_grp`, `downs_grp`, `few_tail`, `topk_group`, `tile_scan`, `moe_wide`, `markov_fold_q8`,
+  `markov_pick_rnn`.
 - Not verified: an image against mlx-lm's tower, the drafter's tokens against oMLX's.
