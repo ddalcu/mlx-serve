@@ -948,7 +948,9 @@ fn attend(c: *block.Ctx, L: *const Layer, cfg: *const Config, p: *const Prep, si
     const dv = kv.dense(view);
     if (s > 1) return readRows(g, L, cfg, p, sinks, dv.k, dv.v, offset, s);
     if (ops.shape(dv.k)[2] != ops.shape(p.bias)[3]) return error.Inkling2KvView;
-    const attn = try sdpaSinks(g, p.q, dv.k, dv.v, 1.0 / @sqrt(@as(f32, @floatFromInt(hd))), "array", p.bias, try g.reshape(sinks, &.{heads}), false);
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const row_sinks = try g.reshape(sinks, &.{heads});
+    const attn = (try layers.packedRead(g, view, p.q, p.bias, row_sinks, scale)) orelse try sdpaSinks(g, p.q, dv.k, dv.v, scale, "array", p.bias, row_sinks, false);
     return if (raw) attn else gated(g, attn, p.gate, 1);
 }
 
