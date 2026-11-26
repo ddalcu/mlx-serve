@@ -506,6 +506,13 @@ fn clearControls() void {
     refresh();
 }
 
+/// The premise of a test that reads a lever's resolution or the settings line: no lever's own variable is set. A flip
+/// proof (`MLX_SERVE_TEST_FLIP`) starts every test with one set; the next test's world restores it.
+fn clearLeverVars() void {
+    inline for (rows) |r| env.unsetForeign(prefix ++ r.name);
+    refresh();
+}
+
 test "deepseek_v41 levers: every row is a registered switch, and every DSV41 switch in env.zig is a row" {
     @setEvalBranchQuota(400_000);
     inline for (rows) |r| try testing.expect(env.registered(prefix ++ r.name));
@@ -610,6 +617,7 @@ test "deepseek_v41 levers: each stack switch turns off its stack's default-on sw
 
 test "deepseek_v41 levers: precision lossy picks PF_INT8=4 and the site's ATTN_F16, a stack off wins over it, and an unknown precision refuses" {
     clearControls();
+    clearLeverVars();
     defer clearControls();
     try testing.expectEqual(@as(u32, 0), int(.PF_INT8, u32, 0));
     _ = env.setForeign("MLX_SERVE_DSV41_PRECISION", "lossy");
@@ -634,6 +642,7 @@ test "deepseek_v41 levers: precision lossy picks PF_INT8=4 and the site's ATTN_F
 
 test "deepseek_v41 levers: the startup line names the precision, the stacks off and each lever set" {
     clearControls();
+    clearLeverVars();
     defer clearControls();
     var buf: [4096]u8 = undefined;
     _ = env.setForeign("MLX_SERVE_DSV41_STACK_SPEC", "0");
