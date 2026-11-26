@@ -116,6 +116,9 @@ const markov_header = kernelSource("plugins/inkling2/kernels/markov_header.metal
 pub var markov_rnn_kernel: Kernel = .{ .name = "msv_inkling2_markov_rnn", .ins = &.{ "W", "B", "ST", "PREV", "ROWS", "NEW", "TOK", "AT" }, .outs = &.{"P"}, .source = kernelSource("plugins/inkling2/kernels/markov_rnn.metal") };
 pub var markov_fold_kernel: Kernel = .{ .name = "msv_inkling2_markov_fold", .ins = &.{ "P", "FOLD", "FB", "BASE", "AT", "CAP" }, .outs = &.{ "PM", "PI", "PS" }, .source = kernelSource("plugins/inkling2/kernels/markov_fold.metal"), .header = markov_header };
 pub var markov_fold_q8_kernel: Kernel = .{ .name = "msv_inkling2_markov_fold_q8", .ins = &.{ "P", "FQ", "FS", "FQB", "FB", "BASE", "AT", "CAP", "LPARAMS" }, .outs = &.{ "PM", "PI", "PS", "GM", "SCALED" }, .source = kernelSource("plugins/inkling2/kernels/markov_fold_q8.metal"), .header = markov_header };
+/// `MLX_SERVE_INKLING2_MARKOV_Q8` (opt-in): one RNN step over a block's precomputed context, and the int8 fold a vocab row.
+pub var markov_step_rnn_kernel: Kernel = .{ .name = "msv_inkling2_markov_step_rnn", .ins = &.{ "W", "KAPPA", "ST", "PREV", "TOK", "AT" }, .outs = &.{"P"}, .source = kernelSource("plugins/inkling2/kernels/markov_step_rnn.metal") };
+pub var markov_fold_q8_row_kernel: Kernel = .{ .name = "msv_inkling2_markov_fold_q8_row", .ins = &.{ "P", "FQ", "FSC", "BASE", "AT", "CAP" }, .outs = &.{ "PM", "PI", "PS" }, .source = kernelSource("plugins/inkling2/kernels/markov_fold_q8_row.metal"), .header = markov_header };
 pub var markov_pick_kernel: Kernel = .{ .name = "msv_inkling2_markov_pick", .ins = &.{ "PM", "PI", "PS", "P", "ST", "CAP" }, .outs = &.{ "TOKN", "CONF", "NST" }, .source = kernelSource("plugins/inkling2/kernels/markov_pick.metal"), .header = markov_header };
 pub var markov_fold_batch_kernel: Kernel = .{ .name = "msv_inkling2_markov_fold_batch", .ins = &.{ "P", "FOLD", "FB", "BASE", "AT", "CAP" }, .outs = &.{ "PM", "PI", "PS" }, .source = kernelSource("plugins/inkling2/kernels/markov_fold_batch.metal"), .header = markov_header };
 pub var markov_pick_batch_kernel: Kernel = .{ .name = "msv_inkling2_markov_pick_batch", .ins = &.{ "PM", "PI", "PS", "P", "ST", "CAP" }, .outs = &.{ "TOKN", "CONF", "NST" }, .source = kernelSource("plugins/inkling2/kernels/markov_pick_batch.metal"), .header = markov_header };
@@ -235,7 +238,7 @@ pub fn launchGrid(g: *Graph, k: *Kernel, inputs: []const Array, comptime n: usiz
 }
 
 /// Every plugin kernel, by name, for a pipeline record's replay.
-const all_kernels = [_]*Kernel{ &pre_kernel, &prep_kernel, &prep_strided_kernel, &oproj_kernel, &gated_kernel, &mid_kernel, &gate_kernel, &gate_mm_kernel, &norm_kernel, &topk_kernel, &topk_group_kernel, &act_kernel, &ups_kernel, &downs_kernel, &group_kernel, &ups_grp_kernel, &downs_grp_kernel, &relattn_kernel, &tile_scan_kernel, &moe_wide_kernel, &router_kernel, &relattn_nax_kernel, &relsplit_nax_kernel, &relsplit_lanes_kernel, &relsplit_kernel, &relcomb_kernel, &markov_rnn_kernel, &markov_fold_kernel, &markov_fold_q8_kernel, &markov_pick_kernel, &markov_fold_batch_kernel, &markov_pick_batch_kernel, &markov_pick_sample_kernel, &markov_pick_rnn_kernel, &relslots_kernel, &relmask_kernel, &sum_kernel, &few_tail_kernel, &state_kernel, &commit_conv_kernel, &sample_mass_kernel, &sample_search_kernel, &sample_draw_kernel, &accept_tree_kernel };
+const all_kernels = [_]*Kernel{ &pre_kernel, &prep_kernel, &prep_strided_kernel, &oproj_kernel, &gated_kernel, &mid_kernel, &gate_kernel, &gate_mm_kernel, &norm_kernel, &topk_kernel, &topk_group_kernel, &act_kernel, &ups_kernel, &downs_kernel, &group_kernel, &ups_grp_kernel, &downs_grp_kernel, &relattn_kernel, &tile_scan_kernel, &moe_wide_kernel, &router_kernel, &relattn_nax_kernel, &relsplit_nax_kernel, &relsplit_lanes_kernel, &relsplit_kernel, &relcomb_kernel, &markov_rnn_kernel, &markov_fold_kernel, &markov_fold_q8_kernel, &markov_step_rnn_kernel, &markov_fold_q8_row_kernel, &markov_pick_kernel, &markov_fold_batch_kernel, &markov_pick_batch_kernel, &markov_pick_sample_kernel, &markov_pick_rnn_kernel, &relslots_kernel, &relmask_kernel, &sum_kernel, &few_tail_kernel, &state_kernel, &commit_conv_kernel, &sample_mass_kernel, &sample_search_kernel, &sample_draw_kernel, &accept_tree_kernel };
 
 /// The plugin's kernel pipelines (`MLX_SERVE_INKLING2_PIPELINES_AT_LOAD`): MLX builds one for each kernel, template
 /// arguments and input and output dtypes at its first launch. Each first launch is counted (and, with the switch, its
@@ -1033,6 +1036,44 @@ pub fn markovStep(g: *Graph, rnn: Array, rnn_bias: Array, state: Array, prev_row
     const p = try markovRnn(g, rnn, rnn_bias, state, prev_rows, rows, newest, token, step);
     const o = try markovPick(g, try markovFold(g, p, fold, fold_bias, base, step, vocab, cap), p, state, cap);
     return .{ .token = o[0], .confidence = o[1], .state = o[2] };
+}
+
+/// Whether `markovStepQ8` serves a drafter with the RNN's step columns `rnn_step` `[3R, 2R]` and the 8-bit fold
+/// `fold_q` `[V, R]` (`MLX_SERVE_INKLING2_MARKOV_Q8`, opt-in).
+pub fn markovQ8Runs(g: *const Graph, rnn_step: Array, fold_q: Array, rank: c_int) bool {
+    const dt = ops.dtype(rnn_step);
+    if (!mlx.streamIsGpu(g.s) or !enabled() or (dt != .bfloat16 and dt != .float16) or ops.dtype(fold_q) != .int8) return false;
+    return @rem(rank, 4) == 0 and @rem(3 * rank, 8) == 0;
+}
+
+/// `markovStep` over the 8-bit fold: the step's RNN reads its block-row and newest-mix share from `kappa`
+/// `[steps, 3R]` f32 (made once a block), and the fold `fold_q` `[V, R]` int8 with a scale a vocab row `fold_sc` `[V]`
+/// f32; `base_b` `[1, steps, V]` f32 is the rows' head logits with the fold's bias in.
+pub fn markovStepQ8(g: *Graph, rnn_step: Array, kappa: Array, state: Array, prev_rows: Array, token: Array, fold_q: Array, fold_sc: Array, base_b: Array, at: c_int, vocab: c_int, softcap: f32) !MarkovStep {
+    const step = try g.fromSlice(i32, &.{at}, &.{1});
+    const cap = try g.fromSlice(f32, &.{softcap}, &.{1});
+    const p = try markovStepRnn(g, rnn_step, kappa, state, prev_rows, token, step);
+    const o = try markovPick(g, try markovFoldQ8Row(g, p, fold_q, fold_sc, base_b, step, vocab, cap, ops.dtype(rnn_step)), p, state, cap);
+    return .{ .token = o[0], .confidence = o[1], .state = o[2] };
+}
+
+/// `markov_step_rnn.metal`: the step's RNN projection `[3 R]` f32 over `rnn_step` `[3 R, 2 R]` plus `kappa`'s row.
+pub fn markovStepRnn(g: *Graph, rnn_step: Array, kappa: Array, state: Array, prev_rows: Array, token: Array, step: Array) !Array {
+    const rank = @divExact(ops.shape(rnn_step)[0], 3);
+    const o = try launch(g, &markov_step_rnn_kernel, &.{ rnn_step, kappa, state, prev_rows, token, step }, 1, .{.{ .shape = &.{3 * rank}, .dtype = .float32 }}, 32 * 3 * rank, 256, &.{
+        .{ "T", .{ .dtype = ops.dtype(rnn_step) } }, .{ "R", .{ .int = rank } },
+    });
+    return o[0];
+}
+
+/// `markov_fold_q8_row.metal`: each threadgroup's (max, argmax, sum of exp) over 64 vocab rows of the 8-bit fold.
+pub fn markovFoldQ8Row(g: *Graph, p: Array, fold_q: Array, fold_sc: Array, base_b: Array, step: Array, vocab: c_int, cap: Array, dt: Dtype) ![3]Array {
+    const groups = @divTrunc(vocab + 63, 64);
+    return launch(g, &markov_fold_q8_row_kernel, &.{ p, fold_q, fold_sc, base_b, step, cap }, 3, .{
+        .{ .shape = &.{groups}, .dtype = .float32 }, .{ .shape = &.{groups}, .dtype = .uint32 }, .{ .shape = &.{groups}, .dtype = .float32 },
+    }, groups * 256, 256, &.{
+        .{ "T", .{ .dtype = dt } }, .{ "R", .{ .int = ops.shape(fold_q)[1] } }, .{ "VOCAB", .{ .int = vocab } },
+    });
 }
 
 /// `markov_rnn.metal`: the step's RNN projection `[3 R]` f32.

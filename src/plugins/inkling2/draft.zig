@@ -120,6 +120,12 @@ pub const Drafter = struct {
     fold_q: Array = .{},
     fold_s: Array = .{},
     fold_qb: Array = .{},
+    /// `MLX_SERVE_INKLING2_MARKOV_Q8` (opt-in): the RNN's step columns `[3R, 2R]` and context columns `[3R, 2H]`, and
+    /// the fold as int8 `[V, R]` with a scale a vocab row `[V]` f32 (each row's absolute max over 127).
+    rnn_step: Array = .{},
+    rnn_ctx: Array = .{},
+    fold_q8: Array = .{},
+    fold_q8_sc: Array = .{},
     /// An 8-bit copy of a dense trunk head, which the block rows are read through (`draftHead`); null = the trunk's.
     head: ?Linear = null,
 
@@ -181,8 +187,31 @@ pub const Drafter = struct {
             d.fold_s = try at.keep(qf[1]);
             d.fold_qb = try at.keep(qf[2]);
         }
+        const rdt = ops.dtype(d.rnn.w);
+        if (config.optIn(.MLX_SERVE_INKLING2_MARKOV_Q8) and mlx.streamIsGpu(s) and (rdt == .bfloat16 or rdt == .float16) and @rem(rank, 4) == 0) {
+            const h_int: c_int = @intCast(hidden);
+            d.rnn_step = try at.keep(try g.contiguous(try g.sliceAxis(d.rnn.w, 1, 0, 2 * rank)));
+            d.rnn_ctx = try at.keep(try g.contiguous(try g.sliceAxis(d.rnn.w, 1, 2 * rank, 2 * rank + 2 * h_int)));
+            const qf = try quantizeFoldRows(&g, d.fold);
+            d.fold_q8 = try at.keep(qf[0]);
+            d.fold_q8_sc = try at.keep(qf[1]);
+        }
         d.head = try at.draftHead(head);
         return d;
+    }
+
+    /// `fold_src` `[R, V]` as int8 `[V, R]`, a vocab row at a time, and its scales `[V]` f32 (`MARKOV_Q8`).
+    pub fn quantizeFoldRows(g: *Graph, fold_src: Array) ![2]Array {
+        const ft = try g.astype(try g.transpose(fold_src, &.{ 1, 0 }), .float32);
+        const mx = try g.max(try g.abs(ft), 1, true);
+        const zero = try g.scalar(0.0, .float32);
+        const pos = try g.greater(mx, zero);
+        const sc = try g.where(pos, try g.mulScalar(mx, 1.0 / 127.0), try g.scalar(1.0, .float32));
+        const inv = try g.where(pos, try g.div(try g.scalar(127.0, .float32), mx), zero);
+        const clamped = try g.minimum(try g.maximum(try g.mul(ft, inv), try g.scalar(-127.0, .float32)), try g.scalar(127.0, .float32));
+        const fq = try g.contiguous(try g.astype(try g.call(mlx.mlx_round, .{ clamped, @as(c_int, 0) }), .int8));
+        const fsc = try g.contiguous(try g.reshape(sc, &.{ops.shape(ft)[0]}));
+        return .{ fq, fsc };
     }
 
     fn release(d: *Drafter) void {
@@ -680,6 +709,28 @@ pub const Drafter = struct {
         var sure: [abi.max_round_tokens]Array = undefined;
         var probs: [abi.max_round_tokens]Array = undefined;
         const dense_rows = try g.contiguous(rows);
+        // `MLX_SERVE_INKLING2_MARKOV_Q8` (opt-in; off: the fold path below): the block rows' and newest mix's share of
+        // each step's RNN input made once for the block, then one RNN step and one int8 fold a step.
+        if (fused and law == null and d.fold_q8.ctx != null and kernels.markovQ8Runs(g, d.rnn_step, d.fold_q8, rank)) {
+            kernels.engaged(.MLX_SERVE_INKLING2_MARKOV_Q8);
+            const st_c: c_int = @intCast(steps);
+            const ctx_in = try g.concat(&.{ dense_rows, try g.broadcast(newest, &.{ 1, st_c, @intCast(d.hidden) }) }, 2);
+            const k3 = try g.add(try g.matmul(ctx_in, try g.transpose(d.rnn_ctx, &.{ 1, 0 })), d.rnn_bias);
+            const kappa = try g.contiguous(try g.reshape(try g.astype(k3, .float32), &.{ st_c, 3 * rank }));
+            const base_b = try g.contiguous(try g.add(base, try g.astype(d.fold_bias, .float32)));
+            for (0..steps) |i| {
+                const st = try kernels.markovStepQ8(g, d.rnn_step, kappa, state, d.prev_rows, prev, d.fold_q8, d.fold_q8_sc, base_b, @intCast(i), vocab, softcap);
+                state = st.state;
+                prev = st.token;
+                drafted[i] = st.token;
+                sure[i] = st.confidence;
+            }
+            return .{
+                .tokens = try g.concat(drafted[0..steps], 0),
+                .confidence = try g.concat(sure[0..steps], 0),
+                .probs = .{},
+            };
+        }
         if (fused and steps > 0) {
             const cap = try g.fromSlice(f32, &.{softcap}, &.{1});
             const q8 = d.fold_q.ctx != null;

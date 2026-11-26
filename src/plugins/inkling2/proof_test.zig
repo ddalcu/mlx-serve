@@ -4586,3 +4586,40 @@ test "inkling2 kernels: the read's in-read bias is no farther from float64 than 
     };
 }
 
+// Bar: MARKOV_Q8's precomputed-kappa + coalesced Q8 Markov kernels pick the exact same tokens and close probabilities as the op chain.
+test "inkling2 draft: Q8 Markov kernels match op chain tokens and probabilities" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    fx_stream = mlx.gpuStream();
+    var g = ops.Graph.init(a, fx_stream);
+    defer g.deinit();
+    const H: c_int = 64;
+    const R: c_int = 32;
+    const V: c_int = 256;
+    const vocab: c_int = 250;
+    var d: draft.Drafter = .{
+        .cfg = .{ .layers = 1, .heads = 2, .kv_heads = 1, .head_dim = 16, .intermediate = 48, .window = 16, .block = 5, .rank = @intCast(R), .tap_count = 2 },
+        .hidden = @intCast(H),
+        .s = fx_stream,
+    };
+    d.norm = try g.ones(&.{H}, .bfloat16);
+    d.prev_rows = try randomRow(&g, a, 61001, &.{ V, R }, 0.3, .bfloat16);
+    d.rnn = .{ .w = try randomRow(&g, a, 61002, &.{ 3 * R, 2 * R + 2 * H }, 0.15, .bfloat16) };
+    d.rnn_bias = try randomRow(&g, a, 61003, &.{3 * R}, 0.1, .bfloat16);
+    d.rnn_step = try g.contiguous(try g.sliceAxis(d.rnn.w, 1, 0, 2 * R));
+    d.rnn_ctx = try g.contiguous(try g.sliceAxis(d.rnn.w, 1, 2 * R, 2 * R + 2 * H));
+    d.fold = try randomRow(&g, a, 61004, &.{ R, V }, 0.25, .bfloat16);
+    const qf = try draft.Drafter.quantizeFoldRows(&g, d.fold);
+    d.fold_q8 = qf[0];
+    d.fold_q8_sc = qf[1];
+    d.fold_bias = try randomRow(&g, a, 61005, &.{ 1, 1, V }, 0.2, .bfloat16);
+    const rows = try randomRow(&g, a, 61006, &.{ 1, 4, H }, 0.8, .bfloat16);
+    const newest = try randomRow(&g, a, 61007, &.{ 1, 1, H }, 0.8, .bfloat16);
+    // Clear margins so Q8 quantization (~0.5%) never flips an arbitrary near-tie.
+    const base = try randomRow(&g, a, 61008, &.{ 1, 4, V }, 4.0, .float32);
+    const t1 = try g.fromSlice(i32, &.{17}, &.{1});
+    const want = try d.markov(&g, t1, rows, newest, base, vocab, 30.0, false, null);
+    const got = try d.markov(&g, t1, rows, newest, base, vocab, 30.0, true, null);
+    try expectClose(got.tokens, want.tokens, 0, "q8 drafted tokens");
+    try expectClose(got.confidence, want.confidence, 2e-2, "q8 draft probabilities");
+}
