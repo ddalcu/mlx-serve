@@ -91,5 +91,4 @@ pub fn unloadResident(self: *LoadedModel) void {
     // re-pins from then-current memory. `pinned_context` stays — clients
     // budget against it for the whole session.
     if (self.config) |c| c.pinned_prefill_chunk = 0;
-    self.state = .unloaded;
 }

@@ -1920,6 +1920,26 @@ test "unloadResident resets the prefill-chunk pin but never the context pin" {
     try testing.expectEqual(@as(u32, 8192), cfg.pinned_context);
 }
 
+test "ModelRegistry: an unloading model stays evicting until finalizeEvictionLocked, so no load claims it early" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const lm = try makeReadyStub(reg, "foo", 1024);
+
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markEvictingLocked(lm);
+    reg.mutex.unlock(reg.io);
+
+    lm.unloadResident();
+
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    try testing.expectEqual(LoadState.evicting, lm.state);
+    try testing.expect(!reg.tryBeginLoadLocked(lm));
+    reg.finalizeEvictionLocked(lm);
+    try testing.expectEqual(LoadState.unloaded, lm.state);
+    try testing.expect(reg.tryBeginLoadLocked(lm));
+}
+
 test "ModelRegistry: default routing on empty / mlx-serve" {
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();

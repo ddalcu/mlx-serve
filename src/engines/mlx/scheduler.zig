@@ -461,6 +461,7 @@ pub fn deinit(self: *Scheduler) void {
             const entry = entry_ptr.*;
             if (entry.state == .ready or entry.state == .evicting) {
                 entry.unloadResident();
+                entry.state = .unloaded;
             }
         }
     }
