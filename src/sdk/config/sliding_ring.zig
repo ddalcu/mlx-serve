@@ -8,10 +8,13 @@ pub fn rows(window: u32) u32 {
     return if (window > 0) window + slack else 0;
 }
 
+/// A ring drops rows in whole blocks of this many (`KVCache.ring_drop_align`).
+pub const drop_align: u32 = 32;
+
 /// Rows a ring's copy at the prompt's end holds (`KVCache.ringTail`): the window, `tail_slack` more (a next prompt
-/// matches a few tokens short of the last one's end) and up to one 32-row drop block, where the copy starts.
+/// matches a few tokens short of the last one's end) and up to one drop block, where the copy starts.
 pub const tail_slack: u32 = 32;
 
 pub fn tailRows(window: u32) u32 {
-    return if (window > 0) window + tail_slack + 32 else 0;
+    return if (window > 0) window + tail_slack + drop_align else 0;
 }
