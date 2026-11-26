@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const env = @import("../../env.zig");
+const dsv41 = @import("deepseek_v41.zig");
 const flash_attn = @import("prompt/flash_attn.zig");
 
 pub fn attnF16() bool {
@@ -13,18 +14,31 @@ pub fn ced() bool {
     return if (env.get(.MLX_SERVE_DSV41_CED)) |v| v[0] != '0' else true;
 }
 
-/// Flash attention is the lever whose effect depends on the pack (a non-EXL3 pack takes the gather unless the setting
-/// says `1`), so its entry is the mode this load chose.
-pub const Resolved = struct { attn_f16: bool, ced: bool, flash_attn: flash_attn.Mode };
+/// Effective tensor-parallel collective sum dtype for a load (`none` on a single box). Matches `dsv41.tpSum`:
+/// `bf16` sums all parts in activation dtype; `f32` keeps wider parts in f32 (`auto` uses `f32` on a pair and `bf16` past a pair).
+pub const TpSum = enum(u8) { none, bf16, f32 };
 
-pub fn resolved(flash: flash_attn.Mode) Resolved {
-    return .{ .attn_f16 = attnF16(), .ced = ced(), .flash_attn = flash };
+pub fn tpSumFor(tp_size: usize, mode: dsv41.TpSumMode) TpSum {
+    if (tp_size <= 1) return .none;
+    return switch (mode) {
+        .bf16 => .bf16,
+        .f32 => .f32,
+        .auto => if (tp_size > 2) .bf16 else .f32,
+    };
 }
 
-/// `flash` is the mode the model was loaded with: the process-wide mode belongs to whichever load ran last.
-pub fn key(flash: flash_attn.Mode) u64 {
+/// Flash attention and tensor-parallel sum mode depend on the load (pack / group size / rank 0's plan), so their
+/// entries are the modes this load chose rather than raw process env text.
+pub const Resolved = struct { attn_f16: bool, ced: bool, flash_attn: flash_attn.Mode, tp_sum: TpSum };
+
+pub fn resolved(flash: flash_attn.Mode, tp_sum: TpSum) Resolved {
+    return .{ .attn_f16 = attnF16(), .ced = ced(), .flash_attn = flash, .tp_sum = tp_sum };
+}
+
+/// `flash` and `tp_sum` are the modes the model was loaded with: the process-wide settings belong to whichever load ran last.
+pub fn key(flash: flash_attn.Mode, tp_sum: TpSum) u64 {
     var h = std.hash.Wyhash.init(0x6473_7634_315f_6e75);
-    std.hash.autoHash(&h, resolved(flash));
+    std.hash.autoHash(&h, resolved(flash, tp_sum));
     return h.final();
 }
 
@@ -42,6 +56,7 @@ pub const KvEffect = enum {
 /// served (`env.Kind`), except the three the engine hashes itself (`LAYER_CAP`, `DSV4_SKIP_MOE`,
 /// `FORCE_GPU_FAMILY_FALLBACK`); of the `public` ones only `MLX_SERVE_KERNEL_DIR` does, and it refuses transfers.
 pub const kill_levers = [_]struct { []const u8, KvEffect }{
+    .{ "DSV41_TP_SUM", .key },
     .{ "MLX_SERVE_DSV41_ATTN_F16", .key },
     .{ "MLX_SERVE_DSV41_CED", .key },
     .{ "MLX_SERVE_DSV41_FLASH_ATTN", .key },
@@ -49,6 +64,8 @@ pub const kill_levers = [_]struct { []const u8, KvEffect }{
     .{ "MLX_SERVE_DSV41_EXACT", .same },
     .{ "MLX_SERVE_DSV41_ENGRAM_LRU_MB", .same },
     .{ "MLX_SERVE_KEYED_SAMPLING", .same },
+    .{ "MLX_SERVE_NATIVE_GROUPS", .same },
+    .{ "MLX_SERVE_PREFIX_CACHE_PRESSURE", .same },
     .{ "MLX_SERVE_F16_PREFILL", .other_model },
     .{ "MLX_SERVE_KV_ATTN_MMA", .other_model },
     .{ "MLX_SERVE_GDN_STATE_F32", .other_model },
@@ -58,6 +75,7 @@ pub const kill_levers = [_]struct { []const u8, KvEffect }{
     .{ "MLX_SERVE_H3_RESIDENT", .other_model },
     .{ "MLX_SERVE_MING_FUSED", .other_model },
     .{ "MLX_SERVE_INKLING2_FUSED", .other_model },
+    .{ "MLX_SERVE_INKLING2_TREE", .other_model },
 };
 
 fn classified(name: []const u8) bool {
@@ -83,20 +101,36 @@ test "dsv41 numerics: every kill lever is classified once, and the table holds o
     }
 }
 
-test "dsv41 numerics: the key follows each lever and the flash mode it is given, not the flash lever's text" {
-    const unset = env.override(.MLX_SERVE_DSV41_FLASH_ATTN, null);
-    defer unset.restore();
-    const base = key(.off);
+test "dsv41 numerics: the key follows each lever and the load modes it is given, not raw flash or tp_sum text" {
+    const unset_flash = env.override(.MLX_SERVE_DSV41_FLASH_ATTN, null);
+    defer unset_flash.restore();
+    const unset_tp = env.override(.DSV41_TP_SUM, null);
+    defer unset_tp.restore();
+    const base = key(.off, .none);
 
     const flash_text = env.override(.MLX_SERVE_DSV41_FLASH_ATTN, "1");
-    try testing.expectEqual(base, key(.off));
+    try testing.expectEqual(base, key(.off, .none));
     flash_text.restore();
 
-    try testing.expect(base != key(.on));
+    const tp_text = env.override(.DSV41_TP_SUM, "bf16");
+    try testing.expectEqual(base, key(.off, .none));
+    tp_text.restore();
+
+    try testing.expect(base != key(.on, .none));
+    try testing.expect(base != key(.off, .bf16));
+    try testing.expect(base != key(.off, .f32));
+    try testing.expect(key(.off, .bf16) != key(.off, .f32));
+
+    try testing.expectEqual(TpSum.none, tpSumFor(0, .bf16));
+    try testing.expectEqual(TpSum.none, tpSumFor(1, .f32));
+    try testing.expectEqual(TpSum.f32, tpSumFor(2, .auto));
+    try testing.expectEqual(TpSum.bf16, tpSumFor(2, .bf16));
+    try testing.expectEqual(TpSum.bf16, tpSumFor(4, .auto));
+    try testing.expectEqual(TpSum.f32, tpSumFor(4, .f32));
 
     inline for (.{ .{ .MLX_SERVE_DSV41_ATTN_F16, "0" }, .{ .MLX_SERVE_DSV41_CED, "0" } }) |lever| {
         const saved = env.override(lever[0], lever[1]);
         defer saved.restore();
-        try testing.expect(base != key(.off));
+        try testing.expect(base != key(.off, .none));
     }
 }

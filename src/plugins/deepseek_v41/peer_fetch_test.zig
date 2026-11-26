@@ -172,6 +172,7 @@ const PeerHarness = struct {
         testing.allocator.free(h.sch.hot_cache_digests);
         h.tok.deinit();
         h.xfm.deinit();
+        _ = mlx.mlx_clear_cache();
         h.cfg.deinit(testing.allocator);
         h.tmp.cleanup();
         testing.allocator.destroy(h);
@@ -1644,6 +1645,8 @@ test "dsv41 peer fetch: each numerics lever unset or at its default gives one se
     defer s1.restore();
     const s2 = env.override(.MLX_SERVE_DSV41_FLASH_ATTN, null);
     defer s2.restore();
+    const s3 = env.override(.DSV41_TP_SUM, null);
+    defer s3.restore();
     const s4 = env.override(.MLX_SERVE_DIAG, null);
     defer s4.restore();
     const unset = peer_transfer.modelSettingsKey(h.entry, &h.cfg, &h.xfm);
@@ -1652,6 +1655,7 @@ test "dsv41 peer fetch: each numerics lever unset or at its default gives one se
         .{ .MLX_SERVE_DSV41_CED, "1" },
         .{ .MLX_SERVE_DSV41_FLASH_ATTN, "1" },
         .{ .MLX_SERVE_DSV41_FLASH_ATTN, "" },
+        .{ .DSV41_TP_SUM, "auto" },
         .{ .MLX_SERVE_DIAG, "layer-cap=0,dsv4-skip-moe=0,force-gpu-family-fallback=0" },
     }) |d| {
         const saved = env.override(d[0], d[1]);
@@ -1833,6 +1837,7 @@ const LiveNode = struct {
 
     fn close(n: *LiveNode) void {
         n.sch.deinit();
+        _ = mlx.mlx_clear_cache();
         n.reg.deinit();
         n.tmp.cleanup();
         testing.allocator.destroy(n);

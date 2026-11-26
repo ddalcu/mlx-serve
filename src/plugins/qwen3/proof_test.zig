@@ -410,6 +410,7 @@ test "qwen3 plugin: an embedding request leaves no KV or pooled buffers behind" 
     var b: Both = undefined;
     try b.open(.{ .quantized = true, .last_token_pooling = true }, 0x3e01);
     defer b.close();
+    _ = mlx.mlx_clear_cache();
     const rows = try pooling.computeEmbeddingsBatch(a, &b.xfm, &.{&.{ 5, 9, 33, 70, 2 }});
     for (rows) |row| a.free(row);
     a.free(rows);

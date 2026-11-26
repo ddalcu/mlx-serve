@@ -738,7 +738,8 @@ const aux_hooks = abi.AuxHooks{
 
 fn auxSettingsKey(mp: *anyopaque) callconv(.c) u64 {
     const m: *Model = @ptrCast(@alignCast(mp));
-    return numerics.key(m.flash_mode);
+    const tp_size: usize = if (m.mdl.tp) |tp| tp.size else 0;
+    return numerics.key(m.flash_mode, numerics.tpSumFor(tp_size, m.mdl.tp_sum));
 }
 
 fn auxEnabled(mp: *anyopaque) callconv(.c) bool {
