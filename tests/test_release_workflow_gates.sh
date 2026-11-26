@@ -453,17 +453,20 @@ workflows = {n: yaml.safe_load(open(f".github/workflows/{n}")) for n in ("ci.yml
 release_modes = re.findall(r"-Doptimize=(\w+)", code_of(".github/workflows/release.yml"))
 check(release_modes and set(release_modes) == {"ReleaseFast"}, "every release.yml build is ReleaseFast")
 
-linux, windows = workflows["linux.yml"], workflows["windows.yml"]
-check(linux["jobs"]["cuda"]["env"].get("ZIG_OPTIMIZE") == DEBUG_ON_PR,
-      "linux.yml builds Debug on pull requests and ReleaseFast otherwise")
-check("ZIG_OPTIMIZE" not in str(linux.get("env", {})) + str(linux["jobs"]["cuda"]["steps"]),
-      "no other linux.yml scope or step overrides ZIG_OPTIMIZE")
-check("ZIG_OPTIMIZE" not in str(windows),
-      "windows.yml leaves ZIG_OPTIMIZE unset (a Windows Debug link wants munmap)")
+linux = workflows["linux.yml"]
+# `-Dunits` and `-Dstrip` too: push and dispatch build the shipped binary as one unit, with debug info.
+ARGS_ON_PR = r"\$\{\{ github\.event_name == 'pull_request' && '[^']*' \|\| '' \}\}"
 for name in ("linux.yml", "windows.yml"):
-    scopes = (workflows[name], workflows[name]["jobs"]["cuda"])
-    check(not any("-Doptimize" in str(s.get("env", {}).get("ZIG_BUILD_ARGS", "")) for s in scopes),
-          f"{name} sets no optimize mode through ZIG_BUILD_ARGS")
+    cwf, cuda = workflows[name], workflows[name]["jobs"]["cuda"]
+    check(cuda["env"].get("ZIG_OPTIMIZE") == DEBUG_ON_PR,
+          f"{name} builds Debug on pull requests and ReleaseFast otherwise")
+    args = str(cuda["env"].get("ZIG_BUILD_ARGS", ""))
+    check(args == "" or re.fullmatch(ARGS_ON_PR, args),
+          f"{name} passes extra zig build arguments on pull requests only")
+    elsewhere = str(cwf.get("env", {})) + str(cuda["steps"])
+    for var in ("ZIG_OPTIMIZE", "ZIG_BUILD_ARGS"):
+        check(var not in elsewhere, f"no other {name} scope or step overrides {var}")
+    check("-Doptimize" not in args, f"{name} sets no optimize mode through ZIG_BUILD_ARGS")
 
 check(re.findall(r'-Doptimize=("[^"]*"|\S+)', code_of("scripts/build-linux.sh"))
       == ['"${ZIG_OPTIMIZE:-ReleaseFast}"'],
