@@ -2425,3 +2425,11 @@ test "renderChatTemplate: REAL MiniCPM-V 4.7 chat_template.jinja renders without
     try testing.expect(std.mem.endsWith(u8, off, "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     try testing.expect(!promptTailOpensThink(off));
 }
+
+test "renderChatTemplate: floats render like Python, shortest round-trip with tojson and as text" {
+    const cfg = ChatConfig{ .chat_template = "{{ tools[0].x | tojson }}|{{ tools[0].y | tojson }}|{{ tools[0].z | tojson }}|{{ tools[0].w | tojson }}|{{ tools[0].x }}|{{ tools[0].w }}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    const out = try renderChatTemplate(testing.allocator, &messages, &cfg, "[{\"x\":47.3769181,\"y\":1.0,\"z\":123456789.5,\"w\":1e-7}]", null, false, null, false);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("47.3769181|1.0|123456789.5|1e-07|47.3769181|1e-07", out);
+}
