@@ -44,7 +44,8 @@ pub fn build(b: *std.Build) void {
     const units_opt = b.option(bool, "units", "Compile the host, the engine and each plugin group as their own units, in parallel");
     const units = units_opt orelse (builtin.os.tag == .macos);
     // A plugin registers by its folder: the scan writes src/plugins/registry.zig, every graph compiles it.
-    const plugin_names = plugins.generate(b);
+    const linux_or_windows = target.result.os.tag == .linux or target.result.os.tag == .windows;
+    const plugin_names = plugins.generate(b, if (linux_or_windows) units_opt orelse false else units);
 
     // `lint`, `lint-test`, `unit-closure`.
     lint.add(b);
@@ -56,7 +57,7 @@ pub fn build(b: *std.Build) void {
 
     // `install`, `run`, `test` for Linux and Windows, gated on the TARGET so the Linux exe can be built on any host
     // zig can target; the host gate below still guards the macOS graph.
-    if (target.result.os.tag == .linux or target.result.os.tag == .windows) return linux.add(b, target, optimize, units_opt orelse false, plugin_names);
+    if (linux_or_windows) return linux.add(b, target, optimize, units_opt orelse false, plugin_names);
     if (builtin.os.tag != .macos) return;
 
     const graph: macos.Graph = .init(b, target, optimize, host, units);

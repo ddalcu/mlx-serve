@@ -13,7 +13,8 @@ table and plug in at seams below it; their sections close this page. mlx-stream'
   and an `AGENTS.md` (what it owns, its rules, its known issues). The table's contract is `src/abi/plugin.zig`;
   `Caps` declares what the engine may assume (batching, MoE, the exactness contracts in `docs/known-issues.md`).
 - **Registration is a scan.** `build/plugins.zig` scans `src/plugins/*/plugin.zig` at configure time and writes the
-  git-ignored `src/plugins/registry.zig`. A folder starting with `_` is a template (`_template`, `_template_media`,
+  git-ignored `src/plugins/registry_full.zig` (every plugin) and `src/plugins/registry.zig` (under `-Dunits`, only
+  each `config.zig`, so a plugin edit never rebuilds the host). A folder starting with `_` is a template (`_template`, `_template_media`,
   `_template_quant`): compiled and tested, never registered. Copy one to start a family.
 - **Blocks come from the SDK.** `src/sdk/` holds the bases, blocks, quant formats, weight sources, spec heads and test
   harnesses a plugin builds on; a plugin never imports another plugin (shared code moves into the SDK).

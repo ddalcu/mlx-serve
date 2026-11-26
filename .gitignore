@@ -112,4 +112,5 @@ app-web/node_modules/
 
 # Generated at configure time by build/plugins.zig
 /src/plugins/registry.zig
+/src/plugins/registry_full.zig
 /src/unit_*.zig
