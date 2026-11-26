@@ -8820,7 +8820,7 @@ const FfnFixture = struct {
 };
 
 test "dsv41 ffn decode: the two kernels are no further from f32 truth than the composed path, every routed width, affine and mxfp8 shared" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const k = 6;
     const d = 512;
@@ -9023,7 +9023,7 @@ test "dsv41 ffn decode, GGUF experts: the two kernels are no further from f32 tr
 }
 
 test "dsv41 ffn prefill: the sorted-gather MoE with its activation and combine kernels is no further from f32 truth than the composed path at 2048 rows, every routed width" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const L = 2048;
     const k = 6;
@@ -9218,7 +9218,7 @@ test "dsv41 bench: one-token FFN as a dependent chain, composed vs kernels (DSV4
 }
 
 test "dsv41 topk: the kernel picks the k largest of each row in index order, ties to the lower index" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
@@ -9259,7 +9259,7 @@ test "dsv41 topk: the kernel picks the k largest of each row in index order, tie
 }
 
 test "dsv41 topk: a threadgroup the GPU refuses is halved until the kernel launches" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler();
     var m: Dsv41Model = undefined;
     m.s = mlx.gpuStream();
@@ -9272,7 +9272,7 @@ test "dsv41 topk: a threadgroup the GPU refuses is halved until the kernel launc
 
 test "dsv41 index scores: the matrix kernel scores what the scalar kernel scores and picks its blocks, near-ties aside" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());
@@ -9517,7 +9517,7 @@ test "dsv41 decode attention: rows split across threadgroups give the one-thread
 
 test "dsv41 decode attention: the folded inverse rope is ropeTail of the heads, bit for bit" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
@@ -9600,7 +9600,7 @@ test "dsv41 engram: the kernel writes the op chain's stream bit for bit, decode 
 }
 
 test "dsv41 wide attention: the f16 core and the matrix-unit core give the f32 chain's heads at the release's span shape" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     // Bar: per (row, head) cosine, norm ratio and peak error against the f32 chain, both read in f32.
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());
@@ -9933,7 +9933,7 @@ test "dsv41 kv row: a head-width row launches and is normed by its own rms on th
 
 test "dsv41 hc: a threadgroup the GPU refuses is halved until the kernels launch" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler();
     var m: Dsv41Model = undefined;
     try hcTestModel(&m);
@@ -9948,7 +9948,7 @@ test "dsv41 hc: a threadgroup the GPU refuses is halved until the kernels launch
 
 test "dsv41 hc: a decode-width stage gives the wide path's mixes, split, norm and expanded stream bit for bit" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());

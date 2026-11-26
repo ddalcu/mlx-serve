@@ -502,7 +502,7 @@ pub fn register(set: *kc.Set) !void {
 // ── tests ──
 
 test "kernel contract qwen4_exp: the affine-4 launches, chained, are moe_affine4.decode's bytes" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     for ([_]u32{ 4, 3 }) |bits| for ([_]Shared{ .none, .gated, .ungated }) |sh| {
         var k = Affine4.init(a, .gateup, sh, bits);

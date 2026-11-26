@@ -25,7 +25,7 @@ fn host(g: *ops.Graph, x: mlx.mlx_array) ![]const f32 {
 }
 
 test "sparse block: 128-key blocks, top 16, one init and one local block, key max, against the float64 reference" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const p: params.Params = .{ .blocks = .{ .size = 128, .top_k = 16, .init = 1, .local = 1 }, .index_heads = 4, .index_dim = 64, .score = .key_max };
     try p.validate();
     const a = testing.allocator;

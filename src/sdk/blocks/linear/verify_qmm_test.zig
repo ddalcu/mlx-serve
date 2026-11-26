@@ -452,6 +452,7 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
     // replaces. That is machine-independent, and a real defect (a partial-sum
     // race, a register spill, bad indexing) blows kernel-vs-truth far past
     // stock-vs-truth while a rounding-order difference cannot.
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5EED);

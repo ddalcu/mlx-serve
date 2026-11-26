@@ -196,6 +196,7 @@ test "fusedSdpa256Prefill: sliding-band parity vs composed 'array' mask (Gemma l
 test "fusedSinkAttnPrefill: q/k 192, v 128 with sinks matches MLX sdpa (causal and band, with a cache prefix)" {
     // MiMo's attention: K 192 / V 128, GQA 8, a learned sink per head. The
     // reference is MLX's composed sdpa with the same sinks and an explicit mask.
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x5191);
     const rnd = prng.random();

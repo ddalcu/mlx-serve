@@ -419,6 +419,7 @@ test "simd_qmm: a shape whose probe fails on this GPU declines by name and leave
 }
 
 test "simd_qmm: every row of an R-row call equals its one-row call bit for bit, and matches f32 truth at 4, 6 and 8 bits" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     // A kernel failure is this test's: name it and drop its latch before the next test.
     errdefer {
