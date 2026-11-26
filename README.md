@@ -72,15 +72,15 @@ Thousands more run too: any MLX model with a supported architecture, and any GGU
 
 ## Speed
 
-Decode speed in v26.11.3 on an M5 Ultra with 256 GB, on a code prompt, with speculative decoding on:
+Decode speed in v26.11.4 on an M5 Ultra with 256 GB, on a code prompt, with speculative decoding on:
 
 | Model | Tokens per second |
 |---|---:|
-| Qwen3.6 35B-A3B, 4-bit | 439 |
-| Qwen3.8 27B, 4-bit | 244 |
+| Qwen3.6 35B-A3B, 4-bit | 436 |
+| Qwen3.8 27B, 4-bit | 250 |
 | Gemma 4 E4B, 4-bit | 197 |
-| Gemma 4 26B-A4B, 4-bit | 184 |
-| Qwen3.8-Flash-Next, 4.7 bits | 168 |
+| Gemma 4 26B-A4B, 4-bit | 186 |
+| Qwen3.8-Flash-Next, 4.7 bits | 164 |
 
 On an M4 Max, the same models decode 10% to 47% faster than they did in v26.8. Every release is measured the same way in [benchmarks.md](benchmarks.md); speculative decoding and tuning are in [docs/performance.md](docs/performance.md).
 
@@ -113,7 +113,7 @@ Questions, ideas and things you made: the [community chat on X](https://x.com/i/
 
 ## Thank you
 
-Thank you to the sponsors who back mlx-serve: @jcprichard, @skudinov, @davidfekke, @lojza3d, @cpko, @d-b, @alinselea, Johnny Dang and @R0xr1te. If it's useful to you, you can support it on [GitHub Sponsors](https://github.com/sponsors/ddalcu) or [Buy Me a Coffee](https://buymeacoffee.com/ddalcu). Nothing is paywalled: it's MIT now and stays MIT.
+Thank you to the sponsors who back mlx-serve: @jcprichard, @skudinov, @davidfekke, @lojza3d, @cpko, @d-b, @alinselea, @sbusso, @Yue-Hao, @HLGRL, @iTAGXX, @abeansits, @VincentRK, @davecrist, @djnmrjnvc, @travishaby, Ivan Fioravanti, Patrik Svancara, Jaroslav, Marius, Johnny Dang, @R0xr1te and two supporters who gave anonymously. If it's useful to you, you can support it on [GitHub Sponsors](https://github.com/sponsors/ddalcu) or [Buy Me a Coffee](https://buymeacoffee.com/ddalcu). Nothing is paywalled: it's MIT now and stays MIT.
 
 Thank you also to everyone who sends code, reports and ideas. The [contributors page](https://github.com/ddalcu/mlx-serve/graphs/contributors) shows the code side, and the [changelog](CHANGELOG.md) thanks people release by release.
 

@@ -114,7 +114,7 @@ git clone --recurse-submodules https://github.com/ddalcu/mlx-serve && cd mlx-ser
 
 ## 感谢
 
-感谢支持 mlx-serve 的赞助者：@jcprichard、@skudinov、@davidfekke、@lojza3d、@cpko、@d-b、@alinselea、Johnny Dang 与 @R0xr1te。如果它对你有用，可以通过 [GitHub Sponsors](https://github.com/sponsors/ddalcu) 或 [Buy Me a Coffee](https://buymeacoffee.com/ddalcu) 支持它。没有任何功能收费：现在是 MIT，以后也是 MIT。
+感谢支持 mlx-serve 的赞助者：@jcprichard、@skudinov、@davidfekke、@lojza3d、@cpko、@d-b、@alinselea、@sbusso、@Yue-Hao、@HLGRL、@iTAGXX、@abeansits、@VincentRK、@davecrist、@djnmrjnvc、@travishaby、Ivan Fioravanti、Patrik Svancara、Jaroslav、Marius、Johnny Dang、@R0xr1te，以及两位匿名支持者。如果它对你有用，可以通过 [GitHub Sponsors](https://github.com/sponsors/ddalcu) 或 [Buy Me a Coffee](https://buymeacoffee.com/ddalcu) 支持它。没有任何功能收费：现在是 MIT，以后也是 MIT。
 
 也感谢每一位贡献代码、报告问题和提出想法的人。[贡献者页面](https://github.com/ddalcu/mlx-serve/graphs/contributors)记录了代码方面的贡献，[更新日志](CHANGELOG.md)在每个版本里逐一致谢。
 

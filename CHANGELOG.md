@@ -2,8 +2,19 @@
 
 ## v26.11.4 — Inkling 2 Mini
 
-- **Inkling 2 Mini.** Thinking Machines' looped 26B model runs straight from its released checkpoint, or from an mlx-lm pack: it reads images, drafts ahead with the head it ships, and serves several chats at once, checking their drafts together on the GPU. With a DFlash2 drafter in the pack, each round checks a small tree of candidate continuations in one pass.
-- **Fixes.** On 16 and 32 GB Macs the prompt cache keeps room for a long conversation instead of re-reading it every turn. `--os-reserve-gib` takes effect again. `logprobs` stay valid JSON when a value is not a number. Inkling models follow the reasoning effort a client asks for instead of always thinking hard. A streamed Inkling reply keeps its thinking out of the answer.
+- **Inkling 2 Mini.** Thinking Machines' looped 26B model runs straight from its released checkpoint, an mlx-lm pack or an oMLX oQ pack: it reads images, drafts ahead with the head it ships, and serves several chats at once, checking their drafts together on the GPU. With a DFlash2 drafter in the pack, each round checks a small tree of candidate continuations in one pass (thanks @CerebralCoding, @davidtai, @JaySNL).
+
+- **Faster where it counts.** Inkling 2 decodes 10-13% faster, reads prompts about 20% faster on M1 to M4 Macs, decodes long contexts up to 14% faster with an 8-bit KV cache on M5, and on M5 its bundled draft head serves 4 to 8 chats at once 23-31% faster. DeepSeek-V4.1 reads prompts faster and decodes about 11% faster on M5 Macs (thanks @ivanfioravanti, @chrisvil, @CerebralCoding, @STRML).
+
+- **DeepSeek-V4.1 across more Macs.** Thunderbolt tensor parallel now spans more than two Macs, with the LM head and the DSpark draft split across them, and its built-in plugin can apply a directional ablation (thanks @STRML, @chapai).
+
+- **Long agent sessions stay warm.** On Gemma 4, Inkling 2 and other sliding-window models, a follow-up after a long answer resumes where the last prompt ended, even when the client or the chat template drops the previous turn's thinking; it used to re-read the whole conversation. Gemma 4 26B at 80K tokens: 20 s to the first token before, 2 s now.
+
+- **Tool calls arrive whole.** An Inkling 2 call whose payload is slightly malformed keeps its arguments instead of arriving empty. Tool-call ids are random and long enough for Claude Code, a string argument that looks like a number keeps its exact digits, Claude-style tool markup keeps JSON text as text, and `tools: null` or `[]` no longer switches tool mode on (thanks @dmumber).
+
+- **A steadier server.** A load waits out an unload in flight instead of failing with 503, requests without the API key are refused before their body is read, cancelled and embedding requests hand their memory back, decode timings and live token gauges are exact, and several rare crashes are gone (a fragmented WebSocket message, a refused load under `--max-resident-models`), structured output no longer dead-ends after a full array or string, and the test suite catches MLX errors it used to miss (thanks @dmumber, @bitworks-io, @unaltolga, @rminerick).
+
+- **Fixes.** On 16 and 32 GB Macs the prompt cache keeps room for a long conversation instead of re-reading it every turn, and it gives memory back when macOS runs short (thanks @STRML). `--os-reserve-gib` takes effect again. `logprobs` stay valid JSON when a value is not a number. Inkling models follow the reasoning effort a client asks for instead of always thinking hard. A streamed Inkling reply keeps its thinking out of the answer (thanks @myetis433). A split GGUF quant in its own folder is listed and served, and every resizable app window can go full screen (thanks @lborloz). MiniMax-H3 refuses a pack config it cannot sample (thanks @hancheng-ai).
 
 ---
 
