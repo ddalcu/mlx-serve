@@ -2762,31 +2762,23 @@ pub fn passRowsLimit(config: anytype) u64 {
     return ((@as(u64, 1) << 31) - 1) / per_row / SPAN * SPAN;
 }
 
-/// `MLX_SERVE_DSV41_PF_PASS_CEIL`'s ceiling on the M5 Ultra with 512 GiB, a machine constant: the knee measured there
-/// at 1M prompt rows on both fp4 formats. At 1M, NVFP4 prefilled the same at 30,720, 34,816 and 39,680 rows a pass;
-/// the MXFP4 view lost 2.97% at its memory-sized 47,360 rows and 2.4% at 44,032 against 39,680 (its fresh allocations,
-/// the per-span context-prefix arrays the pass's reserve does not hold, rose from about 780 to 1,370 and 1,490 GiB).
-/// 155 spans; under it a prompt of 128K, 256K or 512K rows runs in 4, 7 or 14 passes (32,768, 37,632 and 37,632 rows).
-pub const PASS_CEIL_M5_ULTRA_512: usize = 155 * SPAN;
+/// `MLX_SERVE_DSV41_PF_PASS_CEIL`'s cap on a memory-sized prompt pass's working set, in bytes of its bill
+/// (`prefillBytes` at a context as long as the pass, as `dsv41PassRows` prices a width): the fresh-allocation knee,
+/// measured on an M5 Ultra with 512 GiB at 1M prompt rows. There the MXFP4 view's memory-sized 47,360-row passes
+/// prefilled 3,963.6 tok/s, 44,032 rows 3,985.1 and 39,680 rows 4,081.2 (A B B A each), and NVFP4, whose share
+/// already sizes 39,680-row passes, was flat from 30,720 rows up. The cause is fresh allocations (about 15 ms/GB) that
+/// miss the pass's reserve (`MLX_SERVE_DSV41_PF_KEEP_WIDE`): the per-span context-prefix arrays, which grow faster
+/// than the width, took about 780 GiB at 39,680 rows and 1,370 and 1,490 GiB at 44,032 and 47,360. The cap is the
+/// bill of those 39,680 rows (155 spans) on the release config with the matrix units and the default levers
+/// (22,784,030,720 bytes), rounded up to whole MiB and short of the next span's (22,927,196,160), so that machine plans
+/// as measured; a machine whose share sizes a narrower pass keeps it, and one with more memory stops at these bytes.
+/// Under it a 128K, 256K or 512K prompt runs in 4, 7 or 14 passes (32,768, 37,632 and 37,632 rows).
+pub const PASS_KNEE_BYTES: u64 = 21_729 << 20;
 
-/// The ceiling `MLX_SERVE_DSV41_PF_PASS_CEIL` puts on a memory-sized prompt pass for `chip` (the CPU brand) with `mem`
-/// bytes of memory; 0 where none is measured. Only the M5 Ultra with 512 GiB has a measured knee; every other machine
-/// keeps the memory-sized width until its own is measured.
-pub fn passCeilFor(chip: []const u8, mem: u64) usize {
-    if (std.mem.indexOf(u8, chip, "M5 Ultra") != null and mem >= @as(u64, 512) << 30) return PASS_CEIL_M5_ULTRA_512;
-    return 0;
+/// `PASS_KNEE_BYTES` under `MLX_SERVE_DSV41_PF_PASS_CEIL` (default on); 0 (no cap, the memory-sized width) at `=0`.
+pub fn passKneeBytes() u64 {
+    return if (env.onUnlessZero(.MLX_SERVE_DSV41_PF_PASS_CEIL)) PASS_KNEE_BYTES else 0;
 }
-
-/// `passCeilFor` this machine under `MLX_SERVE_DSV41_PF_PASS_CEIL` (default on): 0 at `=0`, or where no knee is measured.
-pub fn passCeil() usize {
-    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_PASS_CEIL)) return 0;
-    const id = device.machineId();
-    const c = passCeilFor(id.chip, id.mem);
-    return if (pass_ceil_plant and c > 0) c + 4 * SPAN else c;
-}
-
-/// `MLX_SERVE_DSV41_PF_PASS_CEIL`'s planted bug (its test): the ceiling 1,024 rows too high.
-pub var pass_ceil_plant = false;
 
 /// Whether `MLX_SERVE_DSV41_PF_PASS_SIZE` serves a load, for its prompt bill (`prefillBytes`): `passSettle`'s
 /// conditions as the engine's `ModelConfig` sees them (a resident bank, no layer pair, span or shard), or the plugin's
