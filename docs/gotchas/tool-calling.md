@@ -382,3 +382,11 @@ Cause: near its window pi asked `max_tokens` 1; the one token was the message op
 it, found no channel and returned null, and the generic split shipped the raw marker, which the leak trim (cutting at
 the invoke marker) let through. Fix: a text holding only the message head splits to empty content. Guard: corpus `a
 reply cut after its message opener ships no marker`.
+
+### An Inkling call that dropped the `,"` before `args` shipped `{}` (#1329)
+Defect: about half of Inkling 2 Mini's tool calls came back as `"arguments": "{}"` with a required parameter, at temp 0
+every time, serial decode too (the model writes `{"name":"read_file"args":{"path":"README.md"}}`). Cause: the dropped
+`,"` leaves the quotes unpaired, the string-aware brace scan found no balanced body and read it as truncation: NAME +
+`{}`. Fix: an unbalanced payload runs to its end tag (or the next call) and a body that does not parse ships the first
+`args` object that does (`salvageArgs`); a truncated one still ships `{}`. Guard: corpus `a payload missing the comma
+before args keeps its args`.
