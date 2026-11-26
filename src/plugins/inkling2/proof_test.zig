@@ -1491,6 +1491,35 @@ test "inkling2 experts: the fp16 gather of a bf16 call agrees with the bf16 one"
     };
 }
 
+// Bar: on an M1 the fp16 gather of a bf16 call is MLX's fp16 gather bit for bit: bf16 scales beside fp16 rows would
+// promote it to f32, the kernel the fp16 rows are there to avoid. Sorted and not, two widths.
+test "inkling2 experts: the fp16 gather of a bf16 call reads its scales and biases as fp16" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    fx_stream = mlx.gpuStream();
+    const saved = device.device_gen_override;
+    defer device.device_gen_override = saved;
+    device.device_gen_override = .{ .gen = 13, .phone = false };
+    var seed: u64 = 14000;
+    for ([_]u32{ 3, 4 }) |bits| for ([_]bool{ false, true }) |sorted| {
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 10;
+        // bf16 scales and biases, as a pack's loader leaves them (`narrowsLoadedF16`).
+        var bank = try packedBank(&g, a, seed, &.{ 8, 64, 256 }, bits, 64, .affine);
+        bank.s = try g.astype(bank.s, .bfloat16);
+        bank.b = try g.astype(bank.b, .bfloat16);
+        const x = try randomRow(&g, a, seed + 1, &.{ 6, 1, 256 }, 1.0, .bfloat16);
+        const picks = try g.fromSlice(u32, &.{ 0, 3, 3, 5, 5, 7 }, &.{6});
+        const served = try layers.gather(&g, x, &bank, picks, sorted);
+        var y = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_gather_qmm(&y, try g.astype(x, .float16), bank.w, try g.astype(bank.s, .float16), try g.astype(bank.b, .float16), .{ .ctx = null }, picks, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", sorted, g.s));
+        const want = try g.astype(try g.adopt(y), .bfloat16);
+        var label: [48]u8 = undefined;
+        try expectClose(try g.astype(served, .float32), try g.astype(want, .float32), 0.0, try std.fmt.bufPrint(&label, "affine {d} bits, sorted {}", .{ bits, sorted }));
+    };
+}
+
 // Bar: the flash kernel (q, k, v as halves, an online softmax from the sink) against the masked SDPA chain on the
 // same rows, on a sliding and a global layer, from the sequence's start and behind earlier keys (past the window, the
 // extent and the log-scaling floor), for a row count off the kernel's tiles: f32 1e-2, bf16 5e-2 of unit-RMS values.
