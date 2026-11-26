@@ -335,6 +335,18 @@ pub fn addTestCompile(b: *std.Build, tests: Tests) void {
     for (tests.runs[0].step.dependencies.items) |d| step.dependOn(d);
 }
 
+/// `test-aux-build`: the zig tests `test-aux` runs, compiled into `zig-out/tests/aux/` and not run. A gate runs each
+/// binary itself (from the repo root, as `test-aux` does) and reads its per-test lines. Called after every `test-aux`
+/// test is added.
+pub fn addAuxBuild(b: *std.Build, tests: Tests) void {
+    const step = b.step("test-aux-build", "Compile the zig tests of test-aux into zig-out/tests/aux, running none");
+    for (tests.aux.dependencies.items) |d| {
+        const run = d.cast(std.Build.Step.Run) orelse continue;
+        const t = run.producer orelse continue;
+        step.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests/aux" } } }).step);
+    }
+}
+
 /// Every shard holds its own GPU tests' memory, and the heaviest (dsv41 moe_down) wants ~10 GB: a 16 GB Mac hung with
 /// two shards (a Metal command buffer that fails for memory never signals, so its test waits forever).
 fn defaultShards() u32 {

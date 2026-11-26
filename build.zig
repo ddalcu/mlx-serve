@@ -75,6 +75,8 @@ pub fn build(b: *std.Build) void {
     macos.addCheck(&graph);
     // `vz-agent`, `vz-agent-host`; its host-side tests join `test`.
     standalone.addVzAgent(b, target, optimize, tests.aux);
+    // `test-aux-build` (after every `test-aux` test is added).
+    macos.addAuxBuild(b, tests);
     // `ios-lib`, `ios-lib-sim`.
     ios.add(b, graph.version, host.brew_prefix);
 }
