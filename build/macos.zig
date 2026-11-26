@@ -14,9 +14,13 @@ pub const Graph = struct {
     host: config.Host,
     version: []const u8,
     units: bool,
-    /// The server's module (`src/main.zig`; `src/exe.zig` under `-Dunits`) and the unit tests' (`src/tests.zig`).
+    /// The server's module (`src/main.zig`; `src/exe.zig` under `-Dunits`) and the unit tests' modules.
     exe_mod: *std.Build.Module,
     test_mod: *std.Build.Module,
+    test_core_mod: *std.Build.Module,
+    test_llm_mod: *std.Build.Module,
+    test_media_mod: *std.Build.Module,
+    test_contracts_mod: *std.Build.Module,
 
     pub fn init(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, host: config.Host, units: bool) Graph {
         // App version. Release builds pass it explicitly (app/build.sh computes the
@@ -84,10 +88,18 @@ pub const Graph = struct {
         const strip = b.option(bool, "strip", "Omit debug info and Zig symbols from mlx-serve and its main test binary");
         const exe_mod = shared.engineModule(b, target, optimize, host, "src/main.zig");
         const test_mod = shared.engineModule(b, target, optimize, host, "src/tests.zig");
+        const test_core_mod = shared.engineModule(b, target, optimize, host, "src/tests_core.zig");
+        const test_llm_mod = shared.engineModule(b, target, optimize, host, "src/tests_llm.zig");
+        const test_media_mod = shared.engineModule(b, target, optimize, host, "src/tests_media.zig");
+        const test_contracts_mod = shared.engineModule(b, target, optimize, host, "src/tests_contracts.zig");
         // CI and release strip mlx-serve because ReleaseFast debug info can exceed the macOS runner's 7 GB.
         // Tests keep Zig frames in failure traces unless the caller opts into stripping.
         exe_mod.strip = strip;
         test_mod.strip = strip;
+        test_core_mod.strip = strip;
+        test_llm_mod.strip = strip;
+        test_media_mod.strip = strip;
+        test_contracts_mod.strip = strip;
         return .{
             .b = b,
             .target = target,
@@ -97,6 +109,10 @@ pub const Graph = struct {
             .units = units,
             .exe_mod = exe_mod,
             .test_mod = test_mod,
+            .test_core_mod = test_core_mod,
+            .test_llm_mod = test_llm_mod,
+            .test_media_mod = test_media_mod,
+            .test_contracts_mod = test_contracts_mod,
         };
     }
 };
@@ -152,7 +168,7 @@ const Shared = struct {
         // dylib + headers extracted from the pinned XCFramework). See src/engines/llama/bridge.zig.
         libs.addLlamaLib(b, mod);
         _ = libs.addExl3Module(b, mod, target, optimize);
-        libs.addStreamSources(b, mod, std.mem.eql(u8, root, "src/tests.zig"));
+        libs.addStreamSources(b, mod, std.mem.startsWith(u8, root, "src/tests"));
 
         // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
         // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels
@@ -258,7 +274,7 @@ pub const Tests = struct {
 };
 
 /// `test-build` and `test`: the unit tests, plus the plugins' own tests, the lint's and the import closure check.
-pub fn addUnitTests(g: *const Graph) Tests {
+pub fn addUnitTests(g: *const Graph, plugin_names: []const []const u8) Tests {
     const b = g.b;
     const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
     const qwen_preprocess_fixture = b.option(
@@ -266,45 +282,211 @@ pub fn addUnitTests(g: *const Graph) Tests {
         "qwen-preprocess-fixture",
         "CPU reference fixture for the gated Qwen preprocessing parity test",
     );
-    const unit_tests = b.addTest(.{
-        .root_module = g.test_mod,
-        .filters = if (test_filter) |f| &.{f} else &.{},
-        .test_runner = .{ .path = b.path("build/test_runner.zig"), .mode = .server },
-    });
-
+    const filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
     const test_build = b.step("test-build", "Compile unit tests without running them");
-    test_build.dependOn(&b.addInstallArtifact(unit_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-
-    // The one test binary runs as `test-shards` processes in parallel, each every n-th test (build/test_runner.zig);
-    // a filtered run is one process.
-    const shards: u32 = if (test_filter != null) 1 else b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse defaultShards();
-    const test_runs = b.allocator.alloc(*std.Build.Step.Run, shards) catch @panic("OOM");
     const test_step = b.step("test", "Run unit tests");
+    // The test binaries run in parallel shards (`MLX_SERVE_TEST_SHARD`, build/test_runner.zig); a filtered run is one process.
+    const shards: u32 = if (test_filter != null) 1 else b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse defaultShards();
     // A Run step given an env var copies the WHOLE configure-time environment into the cached configuration, so the
     // tests' own variables (MLX_SERVE_TAPE_RECORD, *_TEST_MODEL) would stay frozen at the last reconfigure.
     b.graph.poisonCache();
-    for (test_runs, 0..) |*run, k| {
-        run.* = b.addRunArtifact(unit_tests);
+
+    const test_runs: []*std.Build.Step.Run = if (!g.units) blk: {
+        const unit_tests = b.addTest(.{
+            .root_module = g.test_mod,
+            .filters = filters,
+            .test_runner = .{ .path = b.path("build/test_runner.zig"), .mode = .server },
+        });
+        test_build.dependOn(&b.addInstallArtifact(unit_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+        break :blk addShardedRuns(b, unit_tests, test_step, null, "", shards, test_filter != null, qwen_preprocess_fixture);
+    } else blk: {
+        const pure_media = plugins.pureMediaNames(b, plugin_names);
+        const media_csv = std.mem.join(b.allocator, ",", pure_media) catch @panic("OOM");
+        const core_filters = if (test_filter != null) filters else coreTestFilters();
+        const llm_filters = if (test_filter != null) filters else llmTestFilters(b, plugin_names, pure_media);
+        const media_filters = if (test_filter != null) filters else mediaTestFilters(b, pure_media);
+        const contract_filters = if (test_filter != null) filters else contractTestFilters();
+        const core_bin = b.addTest(.{
+            .name = "test-core",
+            .root_module = g.test_core_mod,
+            .filters = core_filters,
+            .test_runner = .{ .path = b.path("build/test_runner.zig"), .mode = .server },
+        });
+        const llm_bin = b.addTest(.{
+            .name = "test-llm",
+            .root_module = g.test_llm_mod,
+            .filters = llm_filters,
+            .test_runner = .{ .path = b.path("build/test_runner.zig"), .mode = .server },
+        });
+        const media_bin = b.addTest(.{
+            .name = "test-media",
+            .root_module = g.test_media_mod,
+            .filters = media_filters,
+            .test_runner = .{ .path = b.path("build/test_runner.zig"), .mode = .server },
+        });
+        const contracts_bin = b.addTest(.{
+            .name = "test-contracts",
+            .root_module = g.test_contracts_mod,
+            .filters = contract_filters,
+            .test_runner = .{ .path = b.path("build/test_runner.zig"), .mode = .server },
+        });
+        for ([_]*std.Build.Step.Compile{ core_bin, llm_bin, media_bin, contracts_bin }) |bin| {
+            test_build.dependOn(&b.addInstallArtifact(bin, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+        }
+        const core_step = b.step("test-core", "Run core (host, engines, SDK, ABI) unit tests");
+        const llm_step = b.step("test-llm", "Run LLM model plugin proof, served and conformance tests");
+        const media_step = b.step("test-media", "Run media/3D/audio/image plugin unit tests");
+        const contracts_step = b.step("test-contracts", "Run kernel contract and SDK block/quant/weight unit tests");
+        const llm_shards: u32 = if (test_filter != null) 1 else @min(shards, if (shards <= 4) @as(u32, 2) else 3);
+        const media_shards: u32 = if (test_filter != null or shards <= 4) 1 else @min(shards, 2);
+        const contract_shards: u32 = if (test_filter != null or shards <= 4) 1 else @min(shards, 5);
+        const core_runs = addShardedRuns(b, core_bin, core_step, "core", media_csv, shards, test_filter != null, qwen_preprocess_fixture);
+        _ = addShardedRuns(b, llm_bin, llm_step, "llm", media_csv, llm_shards, test_filter != null, null);
+        _ = addShardedRuns(b, media_bin, media_step, "media", media_csv, media_shards, test_filter != null, null);
+        _ = addShardedRuns(b, contracts_bin, contracts_step, "contracts", media_csv, contract_shards, test_filter != null, null);
+        test_step.dependOn(core_step);
+        test_step.dependOn(llm_step);
+        test_step.dependOn(media_step);
+        test_step.dependOn(contracts_step);
+        break :blk core_runs;
+    };
+
+    plugins.addTests(b, test_step);
+    config.addTests(b, test_step);
+    test_step.dependOn(&b.top_level_steps.get("lint-test").?.step);
+    test_step.dependOn(&b.top_level_steps.get("unit-closure").?.step);
+    return .{ .step = test_step, .build = test_build, .runs = test_runs, .filter = test_filter };
+}
+
+fn addShardedRuns(
+    b: *std.Build,
+    bin: *std.Build.Step.Compile,
+    parent: *std.Build.Step,
+    suite: ?[]const u8,
+    media_csv: []const u8,
+    shards: u32,
+    filtered: bool,
+    qwen_preprocess_fixture: ?[]const u8,
+) []*std.Build.Step.Run {
+    const runs = b.allocator.alloc(*std.Build.Step.Run, shards) catch @panic("OOM");
+    for (runs, 0..) |*run, k| {
+        run.* = b.addRunArtifact(bin);
+        if (suite) |s| {
+            run.*.setEnvironmentVariable("MLX_SERVE_TEST_SUITE", s);
+            run.*.setEnvironmentVariable("MLX_SERVE_TEST_MEDIA_PLUGINS", media_csv);
+        }
         if (shards > 1) {
             run.*.setEnvironmentVariable("MLX_SERVE_TEST_SHARD", b.fmt("{d}/{d}", .{ k, shards }));
-            run.*.setName(b.fmt("run test shard {d}/{d}", .{ k, shards }));
+            run.*.setName(if (suite) |s| b.fmt("run test-{s} shard {d}/{d}", .{ s, k, shards }) else b.fmt("run test shard {d}/{d}", .{ k, shards }));
+        } else if (suite) |s| {
+            run.*.setName(b.fmt("run test-{s}", .{s}));
         }
-        // A filtered run is a targeted one, often gated on an env var (ANE_TEST_PACK, QWEN4_TEST_MODEL)
-        // that the run's cache key does not see: it reruns every time.
-        if (test_filter != null) run.*.has_side_effects = true;
+        if (filtered) run.*.has_side_effects = true;
         if (qwen_preprocess_fixture) |fixture| {
             run.*.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
             run.*.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
             run.*.addFileInput(.{ .cwd_relative = b.fmt("{s}/source_rgb.bin", .{fixture}) });
             run.*.addFileInput(.{ .cwd_relative = b.fmt("{s}/pixel_values.bin", .{fixture}) });
         }
-        test_step.dependOn(&run.*.step);
+        parent.dependOn(&run.*.step);
     }
-    plugins.addTests(b, test_step);
-    config.addTests(b, test_step);
-    test_step.dependOn(&b.top_level_steps.get("lint-test").?.step);
-    test_step.dependOn(&b.top_level_steps.get("unit-closure").?.step);
-    return .{ .step = test_step, .build = test_build, .runs = test_runs, .filter = test_filter };
+    return runs;
+}
+
+/// Compile-time `--test-filter` prefixes for `test-media` so Zig skips Sema/LLVM codegen for transitively-reached
+/// `host/` and `sdk/` tests owned by the other suites.
+fn mediaTestFilters(b: *std.Build, pure_media: []const []const u8) []const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    list.appendSlice(b.allocator, &.{
+        "plugins.registry_test_media.",
+        "sdk.media.",
+        "sdk.mesh.",
+        "sdk.vision.dinov3.",
+        "sdk.bases.dit.",
+        "sdk.blocks.dit.linear.",
+        "sdk.blocks.dit.mixed_linear.",
+        "sdk.blocks.dit.modulate.",
+        "sdk.blocks.dit.timestep.",
+        "sdk.blocks.mlp.gelu.",
+        "sdk.blocks.norms.layer_norm_f32.",
+        "sdk.blocks.schedulers.",
+        "sdk.blocks.text_encoders.",
+        "sdk.blocks.vae.",
+        "host.media_jobs.plugin.flip_test.",
+        "host.media_jobs.plugin.flip_image_test.",
+    }) catch @panic("OOM");
+    for (pure_media) |m| list.append(b.allocator, b.fmt("plugins.{s}.", .{m})) catch @panic("OOM");
+    return list.items;
+}
+
+/// Compile-time `--test-filter` prefixes for `test-core`: host, engines, ABI, MLX and non-contract/non-media SDK.
+fn coreTestFilters() []const []const u8 {
+    return &.{
+        "host.",
+        "engines.",
+        "abi.",
+        "mlx.",
+        "testing.",
+        "env.",
+        "version.",
+        "kit_header.",
+        "sdk.config.",
+        "sdk.dylib.",
+        "sdk.quant.mxfp8.",
+        "sdk.tokenizer.",
+        "sdk.grammar.",
+        "sdk.spec.",
+        "sdk.util.",
+        "sdk.ane.",
+        "sdk.kv.",
+        "sdk.request.",
+        "sdk.vision.",
+        "sdk.bases.",
+        "sdk.bill.",
+        "sdk.diag.",
+        "sdk.plugin.",
+        "sdk.root.",
+        "sdk.testing.conformance.",
+        "sdk.testing.fixture.",
+        "sdk.testing.media_pack.",
+        "sdk.testing.parity.",
+        "sdk.testing.tape.",
+    };
+}
+
+/// Compile-time `--test-filter` prefixes for `test-llm`: model plugins, clef, proof/served harnesses and conformance.
+fn llmTestFilters(b: *std.Build, plugin_names: []const []const u8, pure_media: []const []const u8) []const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    list.appendSlice(b.allocator, &.{
+        "plugins.registry.",
+        "plugins.registry_test_core.",
+        "plugins._template",
+        "engines.mlx.plugin.proof",
+        "engines.mlx.plugin.mlx_lm_configs_test.",
+        "engines.mlx.plugin.deepseek_test.",
+        "host.media_jobs.plugin.clef_flip_test.",
+    }) catch @panic("OOM");
+    for (plugin_names) |n| {
+        const is_pm = for (pure_media) |m| {
+            if (std.mem.eql(u8, m, n)) break true;
+        } else false;
+        if (!is_pm) list.append(b.allocator, b.fmt("plugins.{s}.", .{n})) catch @panic("OOM");
+    }
+    return list.items;
+}
+
+fn contractTestFilters() []const []const u8 {
+    return &.{
+        ".contract.",
+        "sdk.testing.kernel_contract.",
+        "sdk.testing.shard.",
+        "sdk.blocks.",
+        "sdk.quant.",
+        "sdk.weights.",
+        "plugins.deepseek_v41.streamed_test.",
+        "plugins.gemma4.gelu_ple_test.",
+        "plugins.qwen4_exp.trunk.warmup.",
+    };
 }
 
 /// Every shard holds its own GPU tests' memory, and the heaviest (dsv41 moe_down) wants ~10 GB: a 16 GB Mac hung with
@@ -337,9 +519,17 @@ pub fn addPluginTests(g: *const Graph, tests: Tests) void {
 /// binary, so this is AstGen + Sema alone — the whole tree in seconds, where
 /// emitting it costs minutes (LLVM, single-threaded, ~4x more again at
 /// ReleaseFast). For the edit loop; a real build still gates every change.
-pub fn addCheck(g: *const Graph) void {
+pub fn addCheck(g: *const Graph, plugin_names: []const []const u8) void {
     const b = g.b;
     const check = b.step("check", "Type-check everything, emitting no binary");
     check.dependOn(&b.addExecutable(.{ .name = "mlx-serve", .root_module = g.exe_mod }).step);
-    check.dependOn(&b.addTest(.{ .root_module = g.test_mod }).step);
+    if (g.units) {
+        const pure_media = plugins.pureMediaNames(b, plugin_names);
+        check.dependOn(&b.addTest(.{ .name = "test-core", .root_module = g.test_core_mod, .filters = coreTestFilters() }).step);
+        check.dependOn(&b.addTest(.{ .name = "test-llm", .root_module = g.test_llm_mod, .filters = llmTestFilters(b, plugin_names, pure_media) }).step);
+        check.dependOn(&b.addTest(.{ .name = "test-media", .root_module = g.test_media_mod, .filters = mediaTestFilters(b, pure_media) }).step);
+        check.dependOn(&b.addTest(.{ .name = "test-contracts", .root_module = g.test_contracts_mod, .filters = contractTestFilters() }).step);
+    } else {
+        check.dependOn(&b.addTest(.{ .root_module = g.test_mod }).step);
+    }
 }

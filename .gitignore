@@ -113,4 +113,7 @@ app-web/node_modules/
 # Generated at configure time by build/plugins.zig
 /src/plugins/registry.zig
 /src/plugins/registry_full.zig
+/src/plugins/registry_test_core.zig
+/src/plugins/registry_test_media.zig
+/src/plugins/registry_test_stubs.zig
 /src/unit_*.zig

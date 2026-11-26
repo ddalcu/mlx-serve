@@ -64,14 +64,14 @@ pub fn build(b: *std.Build) void {
     // `install`, `units`, `units-check`, `run`.
     macos.addServer(&graph, plugin_names);
     // `test-build`, `test`.
-    const tests = macos.addUnitTests(&graph);
+    const tests = macos.addUnitTests(&graph, plugin_names);
     // `kit`, and the kit's example plugins built from it as dylibs the unit tests load; its closure's tests join `test`.
     kit.add(b, graph.version, tests.runs);
     kit.addTests(b, tests.step);
     // `exl3-test`.
     macos.addPluginTests(&graph, tests);
     // `check`.
-    macos.addCheck(&graph);
+    macos.addCheck(&graph, plugin_names);
     // `vz-agent`, `vz-agent-host`; its host-side tests join `test`.
     standalone.addVzAgent(b, target, optimize, tests.step);
     // `ios-lib`, `ios-lib-sim`.

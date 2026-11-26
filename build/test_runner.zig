@@ -36,22 +36,103 @@ const need_simple = switch (builtin.zig_backend) {
     else => false,
 };
 
-/// This process's tests: `builtin.test_functions` narrowed to the shard.
+/// This process's tests: `builtin.test_functions` narrowed to the suite (`MLX_SERVE_TEST_SUITE`) and shard
+/// (`MLX_SERVE_TEST_SHARD`).
 var tests: []const std.builtin.TestFn = &.{};
+
+const Suite = enum { core, llm, media, contracts };
+
+fn belongsToSuite(name: []const u8, media_plugins: []const u8) Suite {
+    // Kernel contract files (every `*.contract.zig` registered in `kernel_contract/registry.zig`) live in `contracts`.
+    if (std.mem.indexOf(u8, name, ".contract.") != null or
+        std.mem.startsWith(u8, name, "sdk.testing.kernel_contract.") or
+        std.mem.startsWith(u8, name, "sdk.testing.shard.") or
+        std.mem.startsWith(u8, name, "plugins.deepseek_v41.streamed_test.") or
+        std.mem.startsWith(u8, name, "plugins.gemma4.gelu_ple_test.") or
+        std.mem.startsWith(u8, name, "plugins.qwen4_exp.trunk.warmup."))
+    {
+        return .contracts;
+    }
+    if (std.mem.startsWith(u8, name, "sdk.quant.mxfp8.")) {
+        return .core;
+    }
+    if (std.mem.startsWith(u8, name, "plugins.registry_test_media.") or
+        std.mem.startsWith(u8, name, "sdk.media.") or
+        std.mem.startsWith(u8, name, "sdk.mesh.") or
+        std.mem.startsWith(u8, name, "sdk.vision.dinov3.") or
+        std.mem.startsWith(u8, name, "sdk.bases.dit.") or
+        std.mem.startsWith(u8, name, "sdk.blocks.dit.linear.") or
+        std.mem.startsWith(u8, name, "sdk.blocks.dit.mixed_linear.") or
+        std.mem.startsWith(u8, name, "sdk.blocks.dit.modulate.") or
+        std.mem.startsWith(u8, name, "sdk.blocks.dit.timestep.") or
+        std.mem.startsWith(u8, name, "sdk.blocks.mlp.gelu.") or
+        std.mem.startsWith(u8, name, "sdk.blocks.norms.layer_norm_f32.") or
+        std.mem.startsWith(u8, name, "sdk.blocks.schedulers.") or
+        std.mem.startsWith(u8, name, "sdk.blocks.text_encoders.") or
+        std.mem.startsWith(u8, name, "sdk.blocks.vae.") or
+        std.mem.startsWith(u8, name, "host.media_jobs.plugin.flip_test.") or
+        std.mem.startsWith(u8, name, "host.media_jobs.plugin.flip_image_test."))
+    {
+        return .media;
+    }
+    if (std.mem.startsWith(u8, name, "plugins.") and media_plugins.len > 0) {
+        const rest = name["plugins.".len..];
+        if (std.mem.indexOfScalar(u8, rest, '.')) |dot| {
+            const plug = rest[0..dot];
+            var it = std.mem.splitScalar(u8, media_plugins, ',');
+            while (it.next()) |m| if (m.len > 0 and std.mem.eql(u8, plug, m)) return .media;
+        }
+    }
+    if (std.mem.startsWith(u8, name, "sdk.blocks.") or
+        std.mem.startsWith(u8, name, "sdk.quant.") or
+        std.mem.startsWith(u8, name, "sdk.weights."))
+    {
+        return .contracts;
+    }
+    if (std.mem.startsWith(u8, name, "plugins.") or
+        std.mem.startsWith(u8, name, "engines.mlx.plugin.proof") or
+        std.mem.startsWith(u8, name, "engines.mlx.plugin.mlx_lm_configs_test.") or
+        std.mem.startsWith(u8, name, "engines.mlx.plugin.deepseek_test.") or
+        std.mem.startsWith(u8, name, "host.media_jobs.plugin.clef_flip_test."))
+    {
+        return .llm;
+    }
+    return .core;
+}
 
 fn shardTests() void {
     tests = builtin.test_functions;
     if (builtin.os.tag == .windows) return;
-    const raw = std.mem.span(std.c.getenv("MLX_SERVE_TEST_SHARD") orelse return);
-    const slash = std.mem.indexOfScalar(u8, raw, '/') orelse panic("MLX_SERVE_TEST_SHARD: want k/n, got {s}", .{raw});
-    const k = std.fmt.parseUnsigned(usize, raw[0..slash], 10) catch panic("MLX_SERVE_TEST_SHARD: {s}", .{raw});
-    const n = std.fmt.parseUnsigned(usize, raw[slash + 1 ..], 10) catch panic("MLX_SERVE_TEST_SHARD: {s}", .{raw});
-    if (n == 0 or k >= n) panic("MLX_SERVE_TEST_SHARD: {s}", .{raw});
+    const suite_opt: ?Suite = if (std.c.getenv("MLX_SERVE_TEST_SUITE")) |p| blk: {
+        const s = std.mem.span(p);
+        if (std.mem.eql(u8, s, "core")) break :blk .core;
+        if (std.mem.eql(u8, s, "llm")) break :blk .llm;
+        if (std.mem.eql(u8, s, "media")) break :blk .media;
+        if (std.mem.eql(u8, s, "contracts")) break :blk .contracts;
+        panic("MLX_SERVE_TEST_SUITE: want core|llm|media|contracts, got {s}", .{s});
+    } else null;
+    const media_plugins = if (std.c.getenv("MLX_SERVE_TEST_MEDIA_PLUGINS")) |p| std.mem.span(p) else "";
+
+    var shard_k: usize = 0;
+    var shard_n: usize = 1;
+    if (std.c.getenv("MLX_SERVE_TEST_SHARD")) |p| {
+        const raw = std.mem.span(p);
+        const slash = std.mem.indexOfScalar(u8, raw, '/') orelse panic("MLX_SERVE_TEST_SHARD: want k/n, got {s}", .{raw});
+        shard_k = std.fmt.parseUnsigned(usize, raw[0..slash], 10) catch panic("MLX_SERVE_TEST_SHARD: {s}", .{raw});
+        shard_n = std.fmt.parseUnsigned(usize, raw[slash + 1 ..], 10) catch panic("MLX_SERVE_TEST_SHARD: {s}", .{raw});
+        if (shard_n == 0 or shard_k >= shard_n) panic("MLX_SERVE_TEST_SHARD: {s}", .{raw});
+    }
+    if (suite_opt == null and shard_n == 1) return;
+
     const all = builtin.test_functions;
     const mine = std.heap.page_allocator.alloc(std.builtin.TestFn, all.len) catch panic("out of memory", .{});
     var len: usize = 0;
-    for (all, 0..) |t, i| {
-        if (i % n != k and std.mem.indexOf(u8, t.name, ".sharded: ") == null) continue;
+    var suite_idx: usize = 0;
+    for (all) |t| {
+        if (suite_opt) |want| if (belongsToSuite(t.name, media_plugins) != want) continue;
+        const keep = shard_n == 1 or (suite_idx % shard_n == shard_k) or std.mem.indexOf(u8, t.name, ".sharded: ") != null;
+        suite_idx += 1;
+        if (!keep) continue;
         mine[len] = t;
         len += 1;
     }

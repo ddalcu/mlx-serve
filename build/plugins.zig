@@ -8,6 +8,9 @@ const plugins_dir = "src/plugins";
 const configs_dir = "src/fixtures/model-configs";
 const registry_path = "src/plugins/registry.zig";
 const registry_full_path = "src/plugins/registry_full.zig";
+const registry_test_core_path = "src/plugins/registry_test_core.zig";
+const registry_test_media_path = "src/plugins/registry_test_media.zig";
+const registry_test_stubs_path = "src/plugins/registry_test_stubs.zig";
 
 /// What a `config.zig` may never reach: the MLX layer and everything built on it. Anything outside `src/` too.
 const denied = [_][]const u8{ "src/mlx/", "src/engines/", "src/host/", "src/kernels/" };
@@ -40,17 +43,43 @@ pub fn generate(b: *std.Build, units: bool) []const []const u8 {
     for (configs) |c| if (std.mem.endsWith(u8, c, ".json")) jsons.append(a, c) catch @panic("OOM");
     const split = splitTemplates(a, names.items) catch @panic("OOM");
     const in_config = a.alloc(bool, split.plugins.len) catch @panic("OOM");
-    for (split.plugins, in_config) |n, *f| {
+    const is_media = a.alloc(bool, split.plugins.len) catch @panic("OOM");
+    for (split.plugins, in_config, is_media) |n, *f, *m| {
         const text = root.readFileAlloc(io, b.fmt("{s}/{s}/config.zig", .{ plugins_dir, n }), a, .limited(1 << 20)) catch "";
         f.* = std.mem.indexOf(u8, text, "\npub const plugin = ") != null;
+        m.* = std.mem.indexOf(u8, text, ".kind = .media") != null;
     }
     const full = renderFull(a, split.plugins, split.templates, jsons.items) catch @panic("OOM");
     const facade = renderFacade(a, units, split.plugins, in_config, jsons.items) catch @panic("OOM");
-    for ([_][2][]const u8{ .{ registry_full_path, full }, .{ registry_path, facade } }) |w| {
+    const test_core = renderTestCore(a, split.plugins, is_media, split.templates) catch @panic("OOM");
+    const test_media = renderTestMedia(a, split.plugins, is_media) catch @panic("OOM");
+    const test_stubs = renderTestStubs(a, split.plugins, is_media) catch @panic("OOM");
+    for ([_][2][]const u8{
+        .{ registry_full_path, full },
+        .{ registry_path, facade },
+        .{ registry_test_core_path, test_core },
+        .{ registry_test_media_path, test_media },
+        .{ registry_test_stubs_path, test_stubs },
+    }) |w| {
         writeIfChanged(io, root, w[0], w[1]) catch |e| std.process.fatal("plugins: cannot write {s}: {t}", .{ w[0], e });
         b.dependOnFileContents(b.path(w[0]));
     }
     return split.plugins;
+}
+
+/// Pure-SDK media plugins compiled in `test-media` instead of `test-core` (every `.media` plugin except `clef`,
+/// whose forward reaches `engines/mlx`).
+pub fn pureMediaNames(b: *std.Build, plugin_names: []const []const u8) []const []const u8 {
+    const a = b.allocator;
+    const io = b.graph.io;
+    const root = b.root.root_dir.handle;
+    var out: std.ArrayList([]const u8) = .empty;
+    for (plugin_names) |n| {
+        if (std.mem.eql(u8, n, "clef")) continue;
+        const text = root.readFileAlloc(io, b.fmt("{s}/{s}/config.zig", .{ plugins_dir, n }), a, .limited(1 << 20)) catch "";
+        if (std.mem.indexOf(u8, text, ".kind = .media") != null) out.append(a, n) catch @panic("OOM");
+    }
+    return out.items;
 }
 
 /// `-Dunits`: one root per plugin group, `src/unit_<g>.zig` (generated, git-ignored), importing only its own plugins so
@@ -358,6 +387,91 @@ fn renderConfigs(a: std.mem.Allocator, out: *std.ArrayList(u8), configs: []const
     try out.appendSlice(a, "};\n");
 }
 
+fn isPureMedia(name: []const u8, is_media: bool) bool {
+    return is_media and !std.mem.eql(u8, name, "clef");
+}
+
+/// `registry_test_core.zig`: model plugins + clef + templates compiled in, pure-SDK media plugins exported as
+/// config-only tables so `test-core` links `registry.entries` without compiling media plugin bodies.
+fn renderTestCore(a: std.mem.Allocator, plugins: []const []const u8, is_media: []const bool, templates: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, header);
+    try out.appendSlice(a, "pub const plugins = [_]type{\n");
+    for (plugins, is_media) |n, m| if (!isPureMedia(n, m)) try out.print(a, "    @import(\"{s}/plugin.zig\"),\n", .{n});
+    try out.appendSlice(a, "};\npub const templates = [_]type{\n");
+    for (templates) |n| try out.print(a, "    @import(\"{s}/plugin.zig\"),\n", .{n});
+    try out.appendSlice(a, "};\npub const templates_names = [_][]const u8{\n");
+    for (templates) |n| try out.print(a, "    \"{s}\",\n", .{n});
+    try out.appendSlice(a, "};\nconst media_stubs = [_]type{\n");
+    for (plugins, is_media) |n, m| if (isPureMedia(n, m)) try out.print(a, "    @import(\"{s}/config.zig\"),\n", .{n});
+    try out.appendSlice(a,
+        \\};
+        \\pub const claimant_entries = @import("registry.zig").entries;
+        \\pub const model_configs = @import("registry.zig").model_configs;
+        \\
+        \\comptime {
+        \\    _ = sdk.entries(&templates, &templates_names);
+        \\    sdk.exportAll(&plugins);
+        \\    sdk.exportMediaConfigStubs(&media_stubs);
+        \\}
+        \\
+        \\test "plugin registry: every template and model plugin passes conformance; one plugin claims each fixture pack" {
+        \\    try @import("../sdk/testing/conformance.zig").expectRegistrySlice(@This());
+        \\}
+        \\
+    );
+    return out.items;
+}
+
+/// `registry_test_media.zig`: pure-SDK media plugins compiled in, model plugins + clef exported as config-only tables
+/// so `test-media` links `registry.entries` without compiling LLM plugin bodies.
+fn renderTestMedia(a: std.mem.Allocator, plugins: []const []const u8, is_media: []const bool) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, header);
+    try out.appendSlice(a, "pub const plugins = [_]type{\n");
+    for (plugins, is_media) |n, m| if (isPureMedia(n, m)) try out.print(a, "    @import(\"{s}/plugin.zig\"),\n", .{n});
+    try out.appendSlice(a, "};\nconst media_stubs = [_]type{\n");
+    for (plugins, is_media) |n, m| if (m and !isPureMedia(n, m)) try out.print(a, "    @import(\"{s}/config.zig\"),\n", .{n});
+    try out.appendSlice(a, "};\nconst model_stubs = [_]type{\n");
+    for (plugins, is_media) |n, m| if (!m) try out.print(a, "    @import(\"{s}/config.zig\"),\n", .{n});
+    try out.appendSlice(a,
+        \\};
+        \\
+        \\comptime {
+        \\    sdk.exportAll(&plugins);
+        \\    sdk.exportMediaConfigStubs(&media_stubs);
+        \\    sdk.exportModelConfigStubs(&model_stubs);
+        \\}
+        \\
+        \\test "plugin registry: every media plugin passes conformance" {
+        \\    try @import("../sdk/testing/conformance.zig").expectRegistrySlice(@This());
+        \\}
+        \\
+    );
+    return out.items;
+}
+
+/// `registry_test_stubs.zig`: every plugin exported as a config-only table so `test-contracts` resolves
+/// `registry.entries` without compiling any plugin body.
+fn renderTestStubs(a: std.mem.Allocator, plugins: []const []const u8, is_media: []const bool) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, header);
+    try out.appendSlice(a, "const media_stubs = [_]type{\n");
+    for (plugins, is_media) |n, m| if (m) try out.print(a, "    @import(\"{s}/config.zig\"),\n", .{n});
+    try out.appendSlice(a, "};\nconst model_stubs = [_]type{\n");
+    for (plugins, is_media) |n, m| if (!m) try out.print(a, "    @import(\"{s}/config.zig\"),\n", .{n});
+    try out.appendSlice(a,
+        \\};
+        \\
+        \\comptime {
+        \\    sdk.exportMediaConfigStubs(&media_stubs);
+        \\    sdk.exportModelConfigStubs(&model_stubs);
+        \\}
+        \\
+    );
+    return out.items;
+}
+
 fn writeIfChanged(io: std.Io, root: std.Io.Dir, path: []const u8, bytes: []const u8) !void {
     var buf: [1 << 16]u8 = undefined;
     if (root.readFile(io, path, &buf)) |old| {
@@ -537,4 +651,27 @@ test "build plugins: only Debug builds take the packed groups; release builds de
     try testing.expectEqualStrings("llama", fast[0][1]);
     try testing.expectEqualStrings("qwen3", fast[1][0]);
     try testing.expectEqual(@as(usize, 1), (try unitGroups(a, &names, 0, .ReleaseFast)).len);
+}
+
+test "build plugins: split test registries partition every plugin without overlap" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const names = [_][]const u8{ "clef", "flux2", "kokoro", "qwen3" };
+    const media = [_]bool{ true, true, true, false };
+    const core = try renderTestCore(a, &names, &media, &.{"_template"});
+    const med = try renderTestMedia(a, &names, &media);
+    // Core compiles model plugins + clef, stubs pure-SDK media configs.
+    try testing.expect(std.mem.indexOf(u8, core, "@import(\"qwen3/plugin.zig\")") != null);
+    try testing.expect(std.mem.indexOf(u8, core, "@import(\"clef/plugin.zig\")") != null);
+    try testing.expect(std.mem.indexOf(u8, core, "@import(\"flux2/plugin.zig\")") == null);
+    try testing.expect(std.mem.indexOf(u8, core, "@import(\"flux2/config.zig\")") != null);
+    try testing.expect(std.mem.indexOf(u8, core, "@import(\"kokoro/config.zig\")") != null);
+    // Media compiles pure-SDK media plugins, stubs model + clef configs.
+    try testing.expect(std.mem.indexOf(u8, med, "@import(\"flux2/plugin.zig\")") != null);
+    try testing.expect(std.mem.indexOf(u8, med, "@import(\"kokoro/plugin.zig\")") != null);
+    try testing.expect(std.mem.indexOf(u8, med, "@import(\"qwen3/plugin.zig\")") == null);
+    try testing.expect(std.mem.indexOf(u8, med, "@import(\"clef/plugin.zig\")") == null);
+    try testing.expect(std.mem.indexOf(u8, med, "@import(\"qwen3/config.zig\")") != null);
+    try testing.expect(std.mem.indexOf(u8, med, "@import(\"clef/config.zig\")") != null);
 }
