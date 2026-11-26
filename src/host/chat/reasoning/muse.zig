@@ -115,39 +115,52 @@ pub fn museStreamVerdict(buf: []const u8) ?StreamThinkGate {
     const has_marker = std.mem.indexOf(u8, buf, MUSE_MSG_TAG) != null or
         std.mem.indexOf(u8, buf, MUSE_START_TAG) != null or
         std.mem.indexOf(u8, buf, MUSE_EOM_TAG) != null;
-    if (!has_marker) {
-        // A growing bare header (` to=sel`) carries no marker yet: claim it
-        // only while every byte fits the recipient grammar, so prose that
-        // merely starts with "to=" is released to the generic gate. The
-        // first tokens can be SHORTER than "to=" (" to" leaked live
-        // ) — a strict prefix of it still holds.
-        const t = std.mem.trimStart(u8, buf, " \n");
-        if (t.len < "to=".len) {
-            return if (t.len > 0 and std.mem.startsWith(u8, "to=", t)) .hold_thinking else null;
-        }
-        if (!std.mem.startsWith(u8, t, "to=")) return null;
-        for (t["to=".len..]) |c| {
-            if (!museIsRecipientChar(c)) return null;
-        }
-        return .hold_thinking;
-    }
+    if (!has_marker) return museBareHeaderVerdict(buf);
     const seg_start = std.mem.lastIndexOf(u8, buf, MUSE_START_TAG) orelse 0;
     const seg = buf[seg_start..];
     const msg_rel = std.mem.indexOf(u8, seg, MUSE_MSG_TAG) orelse return .hold_thinking;
-    const header = seg[0..msg_rel];
+    const closed = std.mem.indexOf(u8, seg, MUSE_EOM_TAG) != null or
+        std.mem.indexOf(u8, seg, MUSE_EOT_TAG) != null;
+    return museRouteVerdict(museHeaderRoute(seg[0..msg_rel]), closed);
+}
+
+/// The verdict before any marker: a growing bare header (` to=sel`) holds while every
+/// byte fits the recipient grammar, a strict prefix of "to=" included. Prose that merely
+/// starts with "to=" is released (null) to the generic gate.
+pub fn museBareHeaderVerdict(buf: []const u8) ?StreamThinkGate {
+    const t = std.mem.trimStart(u8, buf, " \n");
+    if (t.len < "to=".len) {
+        return if (t.len > 0 and std.mem.startsWith(u8, "to=", t)) .hold_thinking else null;
+    }
+    if (!std.mem.startsWith(u8, t, "to=")) return null;
+    for (t["to=".len..]) |c| {
+        if (!museIsRecipientChar(c)) return null;
+    }
+    return .hold_thinking;
+}
+
+/// Where a segment's resolved header sends its body.
+pub const MuseRoute = enum { self, visible, tool };
+
+/// `header` is a segment up to its `<|message|>`.
+pub fn museHeaderRoute(header: []const u8) MuseRoute {
     const recipient: []const u8 = if (std.mem.indexOf(u8, header, "to=")) |t|
         std.mem.trim(u8, header[t + 3 ..], " \n")
     else
         "";
-    if (std.mem.eql(u8, recipient, "self")) {
-        const closed = std.mem.indexOf(u8, seg, MUSE_EOM_TAG) != null or
-            std.mem.indexOf(u8, seg, MUSE_EOT_TAG) != null;
-        return if (closed) .split_think else .hold_thinking;
-    }
-    if (recipient.len == 0 or std.mem.eql(u8, recipient, "user")) return .split_think;
-    // Tool recipient: the tools path buffers before this gate is consulted;
-    // hold defensively on a no-tools request rather than leak ATEM markup.
-    return .hold_thinking;
+    if (std.mem.eql(u8, recipient, "self")) return .self;
+    return if (recipient.len == 0 or std.mem.eql(u8, recipient, "user")) .visible else .tool;
+}
+
+/// The current segment's verdict. A null route is a header still arriving.
+pub fn museRouteVerdict(route: ?MuseRoute, closed: bool) StreamThinkGate {
+    return switch (route orelse return .hold_thinking) {
+        .self => if (closed) .split_think else .hold_thinking,
+        .visible => .split_think,
+        // The tools path buffers before this gate is consulted; hold on a
+        // no-tools request rather than leak ATEM markup.
+        .tool => .hold_thinking,
+    };
 }
 
 /// Muse streaming tool hold: true while a segment header is unresolved (the

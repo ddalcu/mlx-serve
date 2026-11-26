@@ -18,8 +18,24 @@ const INKLING_INVOKE_TAG = @import("inkling.zig").INKLING_INVOKE_TAG;
 const inklingStripMessageHead = @import("inkling.zig").inklingStripMessageHead;
 const harmonyStreamVerdict = @import("harmony.zig").harmonyStreamVerdict;
 const harmonyHeaderHoldsForTools = @import("harmony.zig").harmonyHeaderHoldsForTools;
+const HarmonyRoute = @import("harmony.zig").HarmonyRoute;
+const harmonyHeaderRoute = @import("harmony.zig").harmonyHeaderRoute;
+const harmonyRouteVerdict = @import("harmony.zig").harmonyRouteVerdict;
+const HARMONY_START_TAG = @import("harmony.zig").HARMONY_START_TAG;
+const HARMONY_CHANNEL_TAG = @import("harmony.zig").HARMONY_CHANNEL_TAG;
+const HARMONY_MSG_TAG = @import("harmony.zig").HARMONY_MSG_TAG;
+const HARMONY_END_TAG = @import("harmony.zig").HARMONY_END_TAG;
+const HARMONY_RETURN_TAG = @import("harmony.zig").HARMONY_RETURN_TAG;
 const museStreamVerdict = @import("muse.zig").museStreamVerdict;
 const museHeaderHoldsForTools = @import("muse.zig").museHeaderHoldsForTools;
+const MuseRoute = @import("muse.zig").MuseRoute;
+const museHeaderRoute = @import("muse.zig").museHeaderRoute;
+const museRouteVerdict = @import("muse.zig").museRouteVerdict;
+const museBareHeaderVerdict = @import("muse.zig").museBareHeaderVerdict;
+const MUSE_START_TAG = @import("muse.zig").MUSE_START_TAG;
+const MUSE_MSG_TAG = @import("muse.zig").MUSE_MSG_TAG;
+const MUSE_EOM_TAG = @import("muse.zig").MUSE_EOM_TAG;
+const MUSE_EOT_TAG = @import("muse.zig").MUSE_EOT_TAG;
 const parseToolCalls = @import("../tools/parse.zig").parseToolCalls;
 const inklingIsNameChar = @import("../tools/inkling.zig").inklingIsNameChar;
 const miniCpm5AttrValue = @import("../tools/minicpm5.zig").miniCpm5AttrValue;
@@ -31,6 +47,11 @@ const miniCpm5AttrValue = @import("../tools/minicpm5.zig").miniCpm5AttrValue;
 /// in a glued "thought" because `<|channel>` flushed before "thought"
 /// arrived and completed the opener).
 pub fn endsWithPartialThinkOpen(buf: []const u8) bool {
+    return endsWithPartialThinkOpenAt(buf, std.mem.lastIndexOfScalar(u8, buf, '<'));
+}
+
+/// `last_lt` is the index of the last `<` in `buf`.
+fn endsWithPartialThinkOpenAt(buf: []const u8, last_lt: ?usize) bool {
     const tags = [_][]const u8{ "<|channel>thought", "<think>" };
     for (tags) |tag| {
         // Strictly-partial prefixes only — a COMPLETE opener in the buffer is
@@ -42,7 +63,7 @@ pub fn endsWithPartialThinkOpen(buf: []const u8) bool {
     }
     // Hy3-suffixed opener mid-stream (`…<think:opensou`): everything from the
     // last `<` must be a valid growing prefix of `<think:suffix>`.
-    if (std.mem.lastIndexOfScalar(u8, buf, '<')) |lt| {
+    if (last_lt) |lt| {
         const tail = buf[lt..];
         if (tail.len > "<think".len and isPartialSuffixedTag(tail, "<think")) return true;
     }
@@ -260,6 +281,45 @@ pub fn streamThinkGate(buf: []const u8, enable_thinking: bool, think_closed: boo
     return streamThinkGate2(buf, enable_thinking, think_closed, false);
 }
 
+/// The harmony or muse segment a stream is in: both open one with `<|start|>` and end its
+/// header with `<|message|>`.
+const ChannelSegment = struct {
+    start: usize = 0,
+    channel_at: ?usize = null,
+    harmony: ?HarmonyRoute = null,
+    harmony_closed: bool = false,
+    muse: ?MuseRoute = null,
+    muse_closed: bool = false,
+
+    comptime {
+        std.debug.assert(std.mem.eql(u8, HARMONY_START_TAG, MUSE_START_TAG));
+        std.debug.assert(std.mem.eql(u8, HARMONY_MSG_TAG, MUSE_MSG_TAG));
+    }
+
+    /// `from` reaches back far enough to hold any marker that straddles the last scan.
+    fn advance(self: *ChannelSegment, buf: []const u8, from: usize) void {
+        if (std.mem.lastIndexOf(u8, buf[from..], HARMONY_START_TAG)) |rel| {
+            if (from + rel > self.start) self.* = .{ .start = from + rel };
+        }
+        const lo = @max(from, self.start);
+        if (self.channel_at == null) self.channel_at = std.mem.indexOfPos(u8, buf, lo, HARMONY_CHANNEL_TAG);
+        if (self.harmony == null) if (self.channel_at) |chan| {
+            if (std.mem.indexOfPos(u8, buf, @max(lo, chan), HARMONY_MSG_TAG)) |msg|
+                self.harmony = harmonyHeaderRoute(buf[self.start..msg], chan - self.start);
+        };
+        if (self.muse == null) if (std.mem.indexOfPos(u8, buf, lo, MUSE_MSG_TAG)) |msg| {
+            self.muse = museHeaderRoute(buf[self.start..msg]);
+        };
+        const new = buf[lo..];
+        self.harmony_closed = self.harmony_closed or
+            std.mem.indexOf(u8, new, HARMONY_END_TAG) != null or
+            std.mem.indexOf(u8, new, HARMONY_RETURN_TAG) != null;
+        self.muse_closed = self.muse_closed or
+            std.mem.indexOf(u8, new, MUSE_EOM_TAG) != null or
+            std.mem.indexOf(u8, new, MUSE_EOT_TAG) != null;
+    }
+};
+
 /// `prompt_opened_think`: the rendered generation prompt ended with an OPEN
 /// think tag (`server.promptOpensThink`). That is a fact about the prompt
 /// BYTES, not about our request flag — LFM2.5's template pre-opens `<think>`
@@ -269,7 +329,8 @@ pub fn streamThinkGate(buf: []const u8, enable_thinking: bool, think_closed: boo
 /// thinking is on `enable_thinking` already held, and once `think_closed` the
 /// term is dropped so the answer after the block still flushes.
 /// Memoized marker scan for the streaming think gate, owned BESIDE the stream
-/// buffer and reset with it.
+/// buffer and reset with it. Between calls the buffer only grows: a shorter one
+/// re-arms the scan, and any other edit needs `reset()`.
 ///
 /// Without it `streamThinkGate2` re-scans the whole accumulated buffer on every
 /// token for as long as thinking markup is present and no close has arrived —
@@ -303,6 +364,13 @@ pub const ThinkScan = struct {
     saw_tool_marker: bool = false,
     /// First real close tag, once found and stable.
     close: ?TagAt = null,
+    saw_harmony_channel: bool = false,
+    saw_muse_marker: bool = false,
+    /// The buffer's first visible bytes can no longer be a bare muse `to=` header.
+    muse_bare_ruled_out: bool = false,
+    /// `<|end_message|>` seen inside a leading Inkling thinking message.
+    inkling_closed: bool = false,
+    segment: ChannelSegment = .{},
     /// Bytes examined by the last call, INCLUDING the exact full re-scan the
     /// tool-markup case falls back to. Test-visible: the invariant is that this
     /// stays FLAT as the buffer grows for traffic with no tool markup — which
@@ -313,6 +381,15 @@ pub const ThinkScan = struct {
     /// substring search needs so a needle split across two arrivals is caught.
     /// `<|channel>thought` is the longest at 17.
     const substr_overlap: usize = 16;
+
+    comptime {
+        for (.{
+            "<|channel>thought", "<channel|>",        "tool_call",
+            HARMONY_START_TAG,   HARMONY_CHANNEL_TAG, HARMONY_MSG_TAG,
+            HARMONY_END_TAG,     HARMONY_RETURN_TAG,  MUSE_EOM_TAG,
+            MUSE_EOT_TAG,        INKLING_END_TAG,
+        }) |needle| std.debug.assert(needle.len - 1 <= substr_overlap);
+    }
 
     pub fn reset(self: *ThinkScan) void {
         self.* = .{};
@@ -357,8 +434,39 @@ pub const ThinkScan = struct {
             if (!self.saw_open and indexOfThinkOpenTag(buf, from) != null) self.saw_open = true;
             if (self.close == null and !self.saw_tool_marker)
                 self.close = indexOfThinkCloseTag(buf, from);
+            if (!self.saw_harmony_channel and std.mem.indexOf(u8, win, HARMONY_CHANNEL_TAG) != null)
+                self.saw_harmony_channel = true;
+            self.saw_muse_marker = self.saw_muse_marker or
+                std.mem.indexOf(u8, win, MUSE_MSG_TAG) != null or
+                std.mem.indexOf(u8, win, MUSE_START_TAG) != null or
+                std.mem.indexOf(u8, win, MUSE_EOM_TAG) != null;
+            self.segment.advance(buf, from);
+            if (!self.inkling_closed) {
+                const ihead = inklingStripMessageHead(buf);
+                if (std.mem.startsWith(u8, ihead, INKLING_THINKING_TAG))
+                    self.inkling_closed = std.mem.indexOfPos(u8, buf, @max(from, buf.len - ihead.len), INKLING_END_TAG) != null;
+            }
             self.checked_upto = buf.len;
         }
+    }
+
+    /// `harmonyStreamVerdict` from the latched facts.
+    fn harmonyVerdict(self: *const ThinkScan) ?StreamThinkGate {
+        if (!self.saw_harmony_channel) return null;
+        return harmonyRouteVerdict(self.segment.harmony, self.segment.harmony_closed);
+    }
+
+    /// `museStreamVerdict` from the latched facts.
+    fn museVerdict(self: *ThinkScan, buf: []const u8) ?StreamThinkGate {
+        if (self.saw_muse_marker) return museRouteVerdict(self.segment.muse, self.segment.muse_closed);
+        if (self.muse_bare_ruled_out) return null;
+        const verdict = museBareHeaderVerdict(buf);
+        // A blank buffer declines too, and can still grow into a header.
+        if (verdict == null and std.mem.indexOfNone(u8, buf, " \n") != null) self.muse_bare_ruled_out = true;
+        return verdict;
+    }
+
+    fn hasThinkClose(self: *ThinkScan, buf: []const u8) bool {
         if (self.saw_tool_marker) {
             // Exact, and only here: the payload classification looks FORWARD
             // past the close for a `</tool_call`, so it must be recomputed on
@@ -367,6 +475,7 @@ pub const ThinkScan = struct {
             self.close = indexOfThinkCloseTag(buf, 0);
             self.last_scan_span = buf.len;
         }
+        return self.close != null;
     }
 };
 
@@ -381,26 +490,26 @@ pub fn streamThinkGateScan(
     prompt_opened_think: bool,
     scan: *ThinkScan,
 ) StreamThinkGate {
+    scan.advance(buf);
     // Harmony (gpt_oss) decides before muse — both emit <|message|>, and only
     // the <|channel|> marker tells them apart.
-    if (harmonyStreamVerdict(buf)) |v| return v;
-    if (museStreamVerdict(buf)) |v| return v;
+    if (scan.harmonyVerdict()) |v| return v;
+    if (scan.museVerdict(buf)) |v| return v;
     {
         const ihead = inklingStripMessageHead(buf);
         if (std.mem.startsWith(u8, ihead, INKLING_TEXT_TAG)) return .flush_text;
         if (std.mem.startsWith(u8, ihead, INKLING_THINKING_TAG)) {
-            return if (std.mem.indexOf(u8, ihead, INKLING_END_TAG) != null) .split_think else .hold_thinking;
+            return if (scan.inkling_closed) .split_think else .hold_thinking;
         }
     }
-    scan.advance(buf);
     const has_thinking = ((enable_thinking or prompt_opened_think) and !think_closed) or
         scan.saw_channel_thought or
         scan.saw_open or
         (std.mem.startsWith(u8, buf, "<|channel>") and buf.len < 18) or
         (std.mem.startsWith(u8, buf, "<think") and buf.len < 7) or
-        endsWithPartialThinkOpen(buf);
+        endsWithPartialThinkOpenAt(buf, scan.last_lt);
     if (!has_thinking) return .flush_text;
-    return if (scan.saw_channel_close or scan.close != null) .split_think else .hold_thinking;
+    return if (scan.saw_channel_close or scan.hasThinkClose(buf)) .split_think else .hold_thinking;
 }
 
 pub fn streamThinkGate2(buf: []const u8, enable_thinking: bool, think_closed: bool, prompt_opened_think: bool) StreamThinkGate {
@@ -843,8 +952,7 @@ test "ThinkScan: per-token work is FLAT in buffer size, not linear" {
     var scan: ThinkScan = .{};
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(testing.allocator);
-    // A think block that never closes — the expensive arm of the bench. Measured on a short buffer, then past 60 KB:
-    // the gate's other checks read the whole buffer, so growing it token by token costs a Debug build seconds.
+    // A think block that never closes — the expensive arm of the bench. Measured on a short buffer, then past 60 KB.
     try buf.appendSlice(testing.allocator, "<think>");
     _ = streamThinkGateScan(buf.items, true, false, false, &scan);
     for ([_]usize{ 0, 60_000 }) |grow_to| {
@@ -887,13 +995,184 @@ test "ThinkScan: reset() re-arms the cursor when the stream buffer is cleared" {
     try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGateScan("<think>more", true, false, false, &scan));
 }
 
+/// The three request flags both gates take, as the low bits of `bits`.
+fn expectScanMatchesFresh(buf: []const u8, bits: usize, scan: *ThinkScan) !void {
+    const enable = bits & 1 != 0;
+    const closed = bits & 2 != 0;
+    const opened = bits & 4 != 0;
+    const want = streamThinkGate2(buf, enable, closed, opened);
+    const got = streamThinkGateScan(buf, enable, closed, opened, scan);
+    if (want == got) return;
+    std.debug.print("\"{s}\" (think={}, closed={}, opened={}): scan {any} != fresh {any}\n", .{ buf, enable, closed, opened, got, want });
+    return error.IncrementalGateDiverged;
+}
+
+const dialect_corpus = [_][]const u8{
+    "plain visible prose with no markup at all, long enough to leave the first window behind",
+    "a < b, <table> and a partial tail <thi",
+    "visible<think:opensou",
+    "x < y <think:abc def",
+    "prose ends here.<|channel>thoug",
+    "<think>reasoning</think>the answer",
+    "<think:opensource>hy3 reasoning</think:opensource>answer",
+    "<think>x</think:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>tail",
+    "<think>plan<tool_call>f<arg_value>closes with </think> inside</arg_value></tool_call>done</think>visible",
+    "<think>mentions tool_call only</think>visible",
+    "<|channel>thought hidden<channel|>visible",
+    "Done.<|channel>thought again<channel|>more",
+    // harmony
+    "<|channel|>analysis<|message|>a long enough chain of thought to cross the window<|end|><|start|>assistant<|channel|>final<|message|>answer<|return|>",
+    "<|start|>assistant<|channel|>analysis<|message|>reasoning that returns<|return|>",
+    "<|start|>assistant to=functions.x<|channel|>commentary <|constrain|>json<|message|>{\"a\":1}<|call|>",
+    "<|channel|>commentary to=functions.get<|message|>{}<|call|>",
+    "<|channel|>commentary<|message|>a preamble<|end|>",
+    "<|message|>message before channel<|channel|>analysis<|message|>x<|end|>",
+    "<|end|><|channel|>analysis<|message|>closer ahead of the header",
+    "<|channel|>analysis<|start|><|message|><|channel|>final",
+    "some prose first <|channel|>analysis<|message|>then reasoning<|end|>",
+    // muse
+    " to=self<|message|>a long enough chain of thought to cross the window<|eom|><|start|>assistant to=user<|message|>Hi<|eot|>",
+    " to=self<|message|>ends the turn<|eot|>",
+    " to=weather.get<|message|><atem:function_calls>x<|eot|>",
+    "<|start|>assistant to=self<|message|>r<|eom|>",
+    "<|message|>direct body",
+    "<|eom|>closer first<|message|>x",
+    "<|eom|> to=self<|message|>closer ahead of the header",
+    " to=self",
+    " to=self ",
+    " to=user hello there",
+    "  \n\n to=fn_name-1.x",
+    "\n  \n",
+    " tomorrow",
+    "to=5 grams of flour",
+    "to=foo bar<|message|>x",
+    "to=a<|eom|>",
+    // inkling
+    INKLING_THINKING_TAG ++ "a long enough thought to cross the window" ++ INKLING_END_TAG ++ "after",
+    "\n " ++ INKLING_THINKING_TAG ++ "led by whitespace" ++ INKLING_END_TAG,
+    INKLING_END_TAG ++ INKLING_MODEL_TAG ++ INKLING_THINKING_TAG ++ "after a stripped head" ++ INKLING_END_TAG,
+    INKLING_MODEL_TAG ++ INKLING_TEXT_TAG ++ "visible" ++ INKLING_END_TAG,
+    "prose then " ++ INKLING_THINKING_TAG ++ "mid" ++ INKLING_END_TAG,
+    // mixed
+    "<think>a<|channel|>analysis<|message|>b</think>c<|end|>",
+    " to=self<|message|><|channel|>analysis<|message|>x<|end|>",
+};
+
+test "ThinkScan: every dialect matches the fresh gate under every chunking and flag" {
+    for (dialect_corpus) |full| {
+        for (0..8) |bits| {
+            for ([_]usize{ 1, 2, 3, 5, 8, 16, 17, 18, 64 }) |step| {
+                var scan: ThinkScan = .{};
+                var n: usize = 0;
+                try expectScanMatchesFresh(full[0..0], bits, &scan);
+                while (n < full.len) {
+                    n = @min(n + step, full.len);
+                    try expectScanMatchesFresh(full[0..n], bits, &scan);
+                }
+            }
+            for (0..full.len + 1) |split| {
+                var scan: ThinkScan = .{};
+                try expectScanMatchesFresh(full[0..split], bits, &scan);
+                try expectScanMatchesFresh(full, bits, &scan);
+            }
+        }
+    }
+}
+
+test "ThinkScan: random marker soup matches the fresh gate across buffer resets" {
+    const fragments = [_][]const u8{
+        "<|channel|>",        "<|start|>",                                         "<|message|>",   "<|end|>",
+        "<|return|>",         "<|call|>",                                          "<|eom|>",       "<|eot|>",
+        INKLING_THINKING_TAG, INKLING_TEXT_TAG,                                    INKLING_END_TAG, INKLING_MODEL_TAG,
+        "<think>",            "</think>",                                          "<think:",       "</think:",
+        "<|channel>thought",  "<|channel>",                                        "<channel|>",    "<tool_call>",
+        "</tool_call>",       "tool_call",                                         "<|chan",        "<|mess",
+        "<th",                "<",                                                 "|>",            ">",
+        " ",                  "\n",                                                " to=",          "to",
+        "=",                  "self",                                              "user",          "assistant",
+        "analysis",           "final",                                             "commentary",    "functions.",
+        "x",                  "a run of ordinary prose that outlasts the window ",
+    };
+    const a = testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(a);
+    var prng = std.Random.DefaultPrng.init(0x5ca9);
+    const random = prng.random();
+    var scan: ThinkScan = .{};
+    for (0..6000) |_| {
+        // A few fragments per case, so markers of one dialect meet often.
+        var alphabet: [5][]const u8 = undefined;
+        for (&alphabet) |*f| f.* = fragments[random.uintLessThan(usize, fragments.len)];
+        buf.clearRetainingCapacity();
+        for (0..1 + random.uintLessThan(usize, 12)) |_|
+            try buf.appendSlice(a, alphabet[random.uintLessThan(usize, alphabet.len)]);
+        const bits = random.uintLessThan(usize, 8);
+        var n: usize = 0;
+        while (n < buf.items.len) {
+            const first = n == 0;
+            n = @min(n + 1 + random.uintLessThan(usize, 24), buf.items.len);
+            // A shorter buffer re-arms the scan by itself; otherwise the stream loop calls reset().
+            if (first and n >= scan.checked_upto) scan.reset();
+            try expectScanMatchesFresh(buf.items[0..n], bits, &scan);
+        }
+    }
+}
+
+test "ThinkScan: the gate never re-reads bytes it already scanned" {
+    // Each marker is planted into already-scanned bytes: only a re-read of them can see it.
+    const Case = struct { head: []const u8 = "", plant: []const u8, bits: usize = 0 };
+    const cases = [_]Case{
+        .{ .plant = "<|channel|>" },
+        .{ .plant = "<|message|>" },
+        .{ .plant = "<|start|>" },
+        .{ .plant = "<|eom|>" },
+        .{ .plant = "<think>" },
+        .{ .plant = "<think:" },
+        .{ .plant = "<think:", .bits = 1 | 2 },
+        .{ .head = "<think>", .plant = "</think>" },
+        .{ .head = "<think>", .plant = "<channel|>" },
+        .{ .head = "<|channel|>analysis<|message|>", .plant = "<|end|>" },
+        .{ .head = "<|channel|>analysis<|message|>", .plant = "<|return|>" },
+        .{ .head = "<|channel|>analysis<|message|>", .plant = "<|start|>a<|channel|>final<|message|>" },
+        .{ .head = " to=self<|message|>", .plant = "<|eom|>" },
+        .{ .head = " to=self<|message|>", .plant = "<|eot|>" },
+        .{ .head = " to=self<|message|>", .plant = "<|start|>assistant to=user<|message|>" },
+        .{ .head = INKLING_THINKING_TAG, .plant = INKLING_END_TAG },
+    };
+    const a = testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(a);
+    var reread: usize = 0;
+    for (cases) |c| {
+        buf.clearRetainingCapacity();
+        try buf.appendSlice(a, c.head);
+        // No `<` and every byte a tag-suffix char, so a planted `<think:` reads as still growing.
+        while (buf.items.len < 60_000) try buf.appendSlice(a, "reasoning");
+        var scan: ThinkScan = .{};
+        try expectScanMatchesFresh(buf.items, c.bits, &scan);
+        try buf.appendSlice(a, "token");
+        const enable = c.bits & 1 != 0;
+        const closed = c.bits & 2 != 0;
+        const want = streamThinkGate2(buf.items, enable, closed, false);
+        @memcpy(buf.items[buf.items.len / 2 ..][0..c.plant.len], c.plant);
+        // Control: the planted marker does change a whole-buffer verdict.
+        try testing.expect(streamThinkGate2(buf.items, enable, closed, false) != want);
+        const got = streamThinkGateScan(buf.items, enable, closed, false, &scan);
+        if (got != want) {
+            std.debug.print("re-read old bytes: head \"{s}\" found planted \"{s}\"\n", .{ c.head, c.plant });
+            reread += 1;
+        } else try testing.expect(scan.last_scan_span <= 64);
+    }
+    try testing.expectEqual(@as(usize, 0), reread);
+}
+
 test "bench: streaming think gate scans BYTES, memoized vs fresh" {
     if (!@import("build_options").slow_tests) return error.SkipZigTest;
     // The 5.10 acceptance bar is that per-token work is FLAT in buffer size,
     // not merely smaller. Wall clock is unavailable in a hermetic test under
     // Zig 0.17 (clocks live under std.Io) and would be noise anyway — bytes
     // examined is the thing that was quadratic, and it is deterministic.
-    // 1000 tokens growing to ~26 KB: the gate's other checks read the whole buffer on every token.
+    // 1000 tokens growing to ~26 KB.
     const a = testing.allocator;
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(a);
