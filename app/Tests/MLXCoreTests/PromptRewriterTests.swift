@@ -152,4 +152,17 @@ final class PromptRewriterTests: XCTestCase {
         XCTAssertNil(r.firstFrame)
         XCTAssertEqual(r.user(seeingImage: true), r.user)
     }
+
+    /// Enhance on an edit shows the chat model the picture being edited, with the rule for it.
+    func testAnEditsEnhanceSeesThePictureBeingEdited() {
+        let source = Data([1, 2, 3])
+        let edit = PromptRewriter.image(text: "make it snow", editing: true, groups: [], denseText: false, source: source)
+        XCTAssertEqual(edit.images, [source])
+        XCTAssertTrue(edit.editsFirstFrame)
+        XCTAssertTrue(edit.user(seeingImage: true).contains("being edited"))
+        XCTAssertFalse(edit.user(seeingImage: false).contains("being edited"), "the rule rides only with the picture")
+        let t2i = PromptRewriter.image(text: "a castle", editing: false, groups: [], denseText: false, source: source)
+        XCTAssertTrue(t2i.images.isEmpty, "a picture made from text has no source to show")
+    }
 }
+

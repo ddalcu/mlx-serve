@@ -564,6 +564,87 @@ test "plugin forward: a prompt asks a prompt_last_row model for its last row, ch
     try testing.expectEqual(prompt.len - 1, lps.items.len);
 }
 
+test "plugin forward: interior prefill chunks of an owns_decode_state model ask for no logits unless prompt logprobs need them" {
+    const T = struct {
+        var asks: [16]abi.Logits = undefined;
+        var rows_seen: [16]u32 = undefined;
+        var want_hidden_seen: [16]bool = undefined;
+        var count: usize = 0;
+        fn forward(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            if (count < asks.len) {
+                asks[count] = f.logits;
+                rows_seen[count] = f.rows;
+                want_hidden_seen[count] = f.want_hidden;
+                count += 1;
+            }
+            return llama.table.forward(m, f, out);
+        }
+        const table: abi.ModelTable = blk: {
+            var t = llama.table;
+            t.forward = &forward;
+            break :blk t;
+        };
+    };
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var b: Served = undefined;
+    try b.open(.{}, 0x1a59);
+    defer b.close();
+    b.xfm.plugin.?.table = &T.table;
+    const caps = &b.xfm.config.plugin.?.parsed.caps;
+    caps.owns_decode_state = true;
+    var tok: Tokenizer = undefined;
+    var prompt: [1201]u32 = undefined;
+    for (&prompt, 0..) |*p, i| p.* = @intCast((i * 7 + 3) % 60);
+    try b.xfm.resetCache();
+    T.count = 0;
+    var gen = try Generator.initWithOptions(io, testing.allocator, &b.xfm, &tok, &prompt, 2, .{ .temperature = 0.0 }, &.{}, .{ .pinned_prefill_chunk = 300 });
+    defer gen.deinit(testing.allocator);
+    // Chunks: [0..300) (none), [300..600) (none), [600..1200) (last_row, tail-merged), [1200..1201) (last_row), lazy t1 (last_row)
+    try testing.expectEqual(@as(usize, 5), T.count);
+    try testing.expectEqualSlices(abi.Logits, &.{ .none, .none, .last_row, .last_row, .last_row }, T.asks[0..T.count]);
+    try testing.expectEqualSlices(u32, &.{ 300, 300, 600, 1, 1 }, T.rows_seen[0..T.count]);
+    try testing.expectEqualSlices(bool, &.{ false, false, false, false, false }, T.want_hidden_seen[0..T.count]);
+    try testing.expect(!gen.ctx.no_logits);
+
+    var s_cap: Slot = undefined;
+    try s_cap.init(b.layers);
+    defer s_cap.deinit();
+    var g = ops.Graph.init(testing.allocator, fixture.stream());
+    defer g.deinit();
+    var cap_arr: Array = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cap_arr);
+    s_cap.ctx.no_logits = true;
+    s_cap.ctx.capture_hidden = &cap_arr;
+    T.count = 0;
+    _ = try g.adopt(try b.xfm.forwardWith(&s_cap.ctx, try fixture.tokens(&g, &.{ 7, 8, 9 })));
+    try testing.expectEqual(@as(usize, 1), T.count);
+    try testing.expectEqual(abi.Logits.last_row, T.asks[0]);
+    try testing.expect(T.want_hidden_seen[0]);
+
+    var s_ver: Slot = undefined;
+    try s_ver.init(b.layers);
+    defer s_ver.deinit();
+    s_ver.ctx.no_logits = true;
+    s_ver.ctx.spec_verify = true;
+    T.count = 0;
+    _ = try g.adopt(try b.xfm.forwardWith(&s_ver.ctx, try fixture.tokens(&g, &.{ 7, 8, 9 })));
+    try testing.expectEqual(@as(usize, 1), T.count);
+    try testing.expectEqual(abi.Logits.all_rows, T.asks[0]);
+
+    caps.owns_decode_state = false;
+    var lps: std.ArrayList(LogprobResult) = .empty;
+    defer {
+        for (lps.items) |lp| testing.allocator.free(lp.top_logprobs);
+        lps.deinit(testing.allocator);
+    }
+    try b.xfm.resetCache();
+    T.count = 0;
+    var gen_lp = try Generator.initWithOptions(io, testing.allocator, &b.xfm, &tok, &prompt, 2, .{ .temperature = 0.0 }, &.{}, .{ .pinned_prefill_chunk = 300, .prompt_logprobs = &lps, .logprobs_n = 1 });
+    defer gen_lp.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 5), T.count);
+    try testing.expectEqualSlices(abi.Logits, &.{ .all_rows, .all_rows, .all_rows, .all_rows, .all_rows }, T.asks[0..T.count]);
+}
+
 test "plugin forward: a prompt forward hands the plugin the host's prefill counter, a decode step does not" {
     const T = struct {
         var saw_progress = false;
@@ -747,7 +828,7 @@ test "plugin forward: an ablated request hands every forward and draft round its
     try testing.expectEqual(@as(u64, 0x5eed), seen.key);
     try testing.expectEqual(@as(f32, 1), seen.first);
     T.seen = null;
-    _ = try driver.nativeRound(&b.xfm, &s.ctx, 9, 4);
+    _ = try driver.nativeRound(&b.xfm, &s.ctx, 9, .{ .cap = 4 });
     try testing.expect(T.seen != null);
     s.ctx.ablation = null;
     _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, &.{10})));

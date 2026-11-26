@@ -860,7 +860,7 @@ fn decodeDrift(a: std.mem.Allocator, nd: *Nd, up: *Up, rows: usize) !void {
 }
 
 test "kernel contract hc: each declared launch is the shipped wrapper's, byte for byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |wr| {
         var n = PrefillNorm.init(a, wr);

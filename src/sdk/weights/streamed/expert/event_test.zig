@@ -194,3 +194,39 @@ test "dsv41 event: a refused host event names its reason; the shim's counters co
     // An unknown id reads 0.
     try testing.expectEqual(@as(u64, 0), signaledValue(.{ .id = 1 << 30, .object = 0 }));
 }
+
+test "dsv41 event: failed create returns -1 and already-signaled metal wait skips GPU wait encoding" {
+    var word: i64 align(8) = 0;
+    try testing.expectEqual(@as(i32, -1), c.dsv41ev_create_host(&word, 0));
+
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const stream = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(stream);
+
+    var object: u64 = 0;
+    const id = c.dsv41ev_create_metal(2, &object);
+    try testing.expect(id >= 1);
+    const ev: Event = .{ .id = id, .object = object };
+
+    const data = [_]f32{ 1.5, 2.5, 3.5, 4.5 };
+    const x = mlx.mlx_array_new_data(&data, &.{4}, 1, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const d0 = [_]f32{ 0.5, 0.5, 0.5, 0.5 };
+    const dep_in = mlx.mlx_array_new_data(&d0, &.{4}, 1, .float32);
+    defer _ = mlx.mlx_array_free(dep_in);
+    var dep = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dep);
+    try mlx.check(mlx.mlx_add(&dep, x, dep_in, stream));
+
+    const waits0 = stats().gpu_waits;
+    var out = [1]mlx.mlx_array{mlx.mlx_array_new()};
+    try wait(&.{x}, ev, 2, &.{dep}, false, stream, &out);
+    defer _ = mlx.mlx_array_free(out[0]);
+    var scaled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scaled);
+    try mlx.check(mlx.mlx_add(&scaled, out[0], dep_in, stream));
+    try mlx.check(mlx.mlx_array_eval(scaled));
+    try testing.expectEqual(waits0, stats().gpu_waits);
+    const got = mlx.mlx_array_data_float32(scaled) orelse return error.MlxNoData;
+    for (data, 0..) |v, i| try testing.expectApproxEqAbs(v + 0.5, got[i], 1e-5);
+}

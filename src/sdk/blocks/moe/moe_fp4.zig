@@ -309,7 +309,7 @@ fn row(a: mlx.mlx_array, r: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
 }
 
 test "moe fp4 decode: gate+up+SwiGLU and the weighted down match fp32 truth per token (mxfp4, nvfp4; widths 640 and a tensor rank's 320, per-expert gate scale)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     try fp4DecodeCase(640);
     try fp4DecodeCase(320);
 }
@@ -416,7 +416,7 @@ fn scaledBank(deq: mlx.mlx_array, sc: mlx.mlx_array, e: c_int, s: mlx.mlx_stream
 }
 
 test "moe fp4 decode: a clamped SwiGLU with per-expert gate and up scales matches fp32 truth (mxfp4, nvfp4; one and two tokens)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xC1A4F4);
     const rnd = prng.random();
@@ -500,7 +500,7 @@ test "moe fp4 decode: a clamped SwiGLU with per-expert gate and up scales matche
 }
 
 test "moe fp4 decode: one-expert bank views and the fused shared expert match fp32 truth (mxfp4, nvfp4; one token)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x5A4E0F4);
     const rnd = prng.random();
@@ -592,7 +592,7 @@ test "moe fp4 decode: one-expert bank views and the fused shared expert match fp
 }
 
 test "moe fp4 decode: experts spread over three slot banks give the one-bank kernel's output bit for bit (mxfp4, nvfp4; one and two tokens, the fused shared expert)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xBA4C5);
     const rnd = prng.random();

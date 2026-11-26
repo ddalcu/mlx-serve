@@ -51,6 +51,9 @@ Request parsing + media:
 - **Media atoms come from media parts, never rewriting user/tool text** (`chat.appendMediaContentParts`); item k expands to run k (`expandMediaPlaceholders`), count/kind mismatch = named 400. Encoder cache keys pixels; text parts JOIN in order. Guards: format corpus, `tests/test_nemotron_bolt.py`.
 - **A registered model's path is matched by its stored `real_path` too, never re-resolved per request** (`model_settings.ModelPath`; loads: `lookupPack`):
   the app keys a symlinked folder by its target, discovery registers the link. Guard: `tests/test_model_settings_symlink.sh`.
+- **A GGUF model folder is the app's: flat quants plus quant folders holding one complete split set** (`shardFolderFirst`,
+  `<repo>/Q6_K_XL/…-00001-of-N.gguf`, how the app and `pull` save a split quant): `list`, discovery, `--model` and
+  `peekByPath` read the same rule, and only below an org folder, or a folder of split repos turns into one model.
 - **A dispatch field must be readable from every body SHAPE** (`parseModelFromRequest(body, content_type)`); header parameter lookups key at a boundary (`name=` vs `filename=`); binary bodies are not logged (`bodyIsText`); request ints clamp (`parseRequestSeed`, `clampJsonI32`).
 - **A client-supplied PATH is proven on OUR side of the mlx boundary** (`lora.loadFile` stat → 400) and accepted only from LOOPBACK (`parseLoraFields(…, local)` → 403, #540: missing vs not-a-LoRA is a host-file oracle). `/v1/images/edits` forwards the LoRA fields (#268).
 - **Hand-written error text is not JSON**: escape at the SINK (`jsonEscapeMessage`), truncate on a UTF-8 boundary. NO model-byte string is guaranteed UTF-8 — sanitizing lives INSIDE every escaper (`chat.utf8Next`); logprobs `bytes` keeps exact bytes.
@@ -59,7 +62,7 @@ Request parsing + media:
 
 Sampling + logprobs + streams:
 - **A `seed` binds EVERY sampler with a fresh key PER DRAW** (`generate.seedKey` + `SamplingParams.draw`), the verify round's bonus/residual draw included (`correctionDraw`: keyed at the output position; an unkeyed `sampleFromProbs` made every seeded drafter run differ).
-- **Logprobs are the MODEL's distribution**: pre-temperature, `logits - logsumexp` in f32 (`computeLogprobs`), ids travel with values, entry belongs to the RETURNED token (`pending_logprob`), pre-GRAMMAR-mask under `response_format` (`nextConstrained`). Bar: temp-0 rank 1 == chosen.
+- **Logprobs are the MODEL's distribution**: pre-temperature, `logits - logsumexp` in f32 (`computeLogprobs`), ids travel with values, entry belongs to the RETURNED token (`pending_logprob`), pre-GRAMMAR-mask under `response_format` (`nextConstrained`). Bar: temp-0 rank 1 == chosen. A non-finite value is `null` (NaN) or -9999 (-inf), never `nan` (`jsonLogprob`).
 - **Streaming logprobs**: a SIBLING of `delta`/`text` (`ChunkExtras`), ONE collector `StreamLogprobs` with a high-water mark, shipped once; `logprobs.content` describes `message.content` (`contentTokenRange`, `skipToContent`, `dropPending`). `/v1/completions` logprobs is an INTEGER + four arrays. Guard: `tests/test_logprobs.sh`.
 - **A client stop string ends the ANSWER, never the reasoning** (#549, `chat.answerStopIndex`): a match counts only where the split delivers it as content, judged on the text UP TO the match, so stream and non-stream cut the same byte. Guard: corpus `a stop string ends the answer`.
 - **Stream and non-stream are the SAME BYTES**; only an all-whitespace lead chunk may be withheld (`streamContentLead`). Also agree: spent budget WITHHOLDS the rest; tool replies carry `visibleToolPreamble`; disconnect = `client_disconnect`; stop sequences cut at INDEX, a tail that may still begin one is HELD (`StopStream`).

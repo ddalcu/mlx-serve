@@ -5,6 +5,7 @@ const std = @import("std");
 const testing = std.testing;
 
 const BARE_THINK_OPENER = @import("muse.zig").BARE_THINK_OPENER;
+const INKLING_THINKING_TAG = @import("inkling.zig").INKLING_THINKING_TAG;
 const splitThinkBlock = @import("split.zig").splitThinkBlock;
 const nextThinkOpen = @import("split.zig").nextThinkOpen;
 
@@ -109,6 +110,15 @@ pub fn indexOfThinkCloseTag(text: []const u8, from: usize) ?TagAt {
             if (!thinkCloseIsToolCallPayload(text, p)) return .{ .pos = p, .len = l };
         }
         i = p + "</think".len;
+    }
+    return null;
+}
+
+pub fn indexOfChannelCloseTag(text: []const u8, from: usize) ?usize {
+    var i = from;
+    while (std.mem.indexOfPos(u8, text, i, "<channel|>")) |p| {
+        if (!thinkCloseIsToolCallPayload(text, p)) return p;
+        i = p + "<channel|>".len;
     }
     return null;
 }
@@ -232,12 +242,13 @@ pub const ThinkSplit = struct {
     content: []const u8,
 };
 
-/// A think block the MODEL opens when the template did not: a bare `<think>` token, or
-/// Gemma 4's TWO tokens, the `<|channel>` marker (dropped from visible deltas) then the
-/// word `thought`. `channel_armed` = the previous delta was that marker and nothing visible
-/// has been emitted. Returns the opener to seed `think_buf` with.
+/// A think block the MODEL opens when the template did not: a bare `<think>` token, Inkling's
+/// `<|content_thinking|>`, or Gemma 4's TWO tokens, the `<|channel>` marker (dropped from visible
+/// deltas) then the word `thought`. `channel_armed` = the previous delta was that marker and
+/// nothing visible has been emitted. Returns the opener to seed `think_buf` with.
 pub fn modelThinkOpener(channel_armed: bool, token_text: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, std.mem.trimEnd(u8, token_text, "\n"), "<think>")) return "<think>";
+    if (std.mem.eql(u8, token_text, INKLING_THINKING_TAG)) return INKLING_THINKING_TAG;
     if (channel_armed and std.mem.eql(u8, token_text, "thought")) return "<|channel>thought";
     return null;
 }
@@ -423,12 +434,13 @@ test "hy3 think: promptTailOpensThink recognizes the suffixed opener, not a clos
 }
 
 test "a model-opened think block latches from its own opener token" {
-    // Both openers are dropped from visible deltas as channel markers, so without
-    // this latch the whole thought streams as the answer (LFM2.5-8B-A1B, Gemma 4).
+    // The openers are dropped from visible deltas as channel markers, so without
+    // this latch the whole thought streams as the answer (LFM2.5-8B-A1B, Gemma 4, Inkling).
     try std.testing.expectEqualStrings("<think>", modelThinkOpener(false, "<think>").?);
     try std.testing.expectEqualStrings("<think>", modelThinkOpener(false, "<think>\n").?);
     try std.testing.expectEqualStrings("<|channel>thought", modelThinkOpener(true, "thought").?);
     try std.testing.expect(modelThinkOpener(false, "thought") == null);
+    try std.testing.expectEqualStrings("<|content_thinking|>", modelThinkOpener(false, "<|content_thinking|>").?);
     // Prose that merely BEGINS with the word is not the opener token.
     try std.testing.expect(modelThinkOpener(true, "thoughts") == null);
     try std.testing.expect(modelThinkOpener(true, "\n") == null);

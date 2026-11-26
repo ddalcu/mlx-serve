@@ -40,6 +40,11 @@ pub fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
     return true;
 }
 
+pub fn releasePromise(sch: *Scheduler, slot: *Slot) void {
+    sch.promise_ledger.release(slot.memory_promised);
+    slot.memory_promised = 0;
+}
+
 /// One pending-drain candidate (or live decoding slot), reduced to what
 /// admission needs: an opaque model identity + the exclusive-decode bit.
 pub const AdmitCand = struct { model: usize, exclusive: bool };

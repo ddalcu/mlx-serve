@@ -55,7 +55,7 @@ Generation defaults for omitted fields: body > model `generation_defaults` > glo
 - Zig caches configure-time subprocess output: after a toolchain/SDK change `rm -rf .zig-cache` or the link references a ghost path.
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug 2–4× slower ⇒ fake regressions). `zig build test` does NOT refresh `zig-out/bin/mlx-serve` — rebuild before any live A/B.
 - **Edit loop: `zig build check`** (35 s, Sema only) → `zig build test` (parallel shards, one per 16 GiB of RAM past the first 16, 1 to 8, `-Dtest-shards=N`; a `sharded:` test splits its own work) → ReleaseFast only to RUN or MEASURE. ReleaseFast is single-threaded LLVM `-O3` per object (no flag tunes it): a plugin edit rebuilds in 0:30 with `-Dunits`, 3:30 without.
-- **`-Dunits=true`** (off by default; `test`/`check` run without it) builds the host and 8 plugin groups as parallel objects; a plugin edit rebuilds its group only while `zig build unit-closure` holds (the plugin's imports stay in `sdk/`, `mlx/`, `abi/`, `kernels/`).
+- **`-Dunits=true`** (off by default; `test`/`check` run without it) builds the host and a plugin group per core (2-8, `-Dunit-groups=N`; fewer cores, fewer and larger units) as parallel objects; a plugin edit rebuilds its group only while `zig build unit-closure` holds (the plugin's imports stay in `sdk/`, `mlx/`, `abi/`, `kernels/`).
   A unit copies every global it reaches: host state is `Shared` / `SharedThreadLocal` (`sdk/util/shared.zig`), checked by `zig build units-check -Dunits=true` (data AND thread-local sections).
 - **Every kernel registers with the kernel contract** (`sdk/testing/kernel_contract/REGISTERING.md`: one `contract.zig`
   per area or plugin, five gates against a float64 reference, planted controls must fail); it runs as ONE `sharded:`
@@ -140,6 +140,7 @@ DSpark arms with `--dspark` when a `-DSpark-` GGUF sits beside the model (`mtpDr
 | `gpt_oss`, `spark2_5`, `k2_horizon`, `muse_glimmer(_text)` | same | Sink attention / sliding dense / grouped-RMS Llama / Muse VL (Harmony channels, ATEM tools) |
 | `mimo_v2`, `mimo_v2_flash` | `mimo_v2` | MiMo-V2.6-Flash, mlx-lm's layout (release refused by name); legacy forward deleted; MTP = 3 heads (`mtp_head.zig`); stream packs (`expert_streaming`) refused by name |
 | `inkling_mm_model` | `inkling` | NO RoPE (relative-logit bias + short convs); serial, spec off |
+| `inkling2_loop` | `inkling2` | Inkling 2 Mini, as released or in mlx-lm's layout: 24 layers run as 48 visits (the middle 12 three times), depth attention in place of the residual; images, its bundled draft head, batched decode |
 | `deepseek_v4`, `deepseek_v41` | `deepseek_v4`, `deepseek_v41` | 1M ctx, module-owned state (V4 single-flight; V4.1 one state per slot, decode and DSpark rounds batched), DSML tools on our byte-pinned templates, DSpark; V4.1 images; EXL3 stream packs through a quant plugin's bank; `stream_experts` streams an MLX pack's experts |
 | `bailing_hybrid` | `bailing_hybrid` | Ling 3.0: KDA + MLA hybrid MoE |
 | `glm5_next(_text)` | `glm5_next` | GLM-5.3-Flash: KDA + DSA inside mHC, 288-expert MoE, batched decode, `mtp.0` head, vision |

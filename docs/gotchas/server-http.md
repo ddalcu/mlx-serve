@@ -399,6 +399,7 @@ Defect: an extra key appeared under `additionalProperties:false`. Cause: `.after
 property seen, leaving no legal byte; the sampler drew id 0 and enforcement switched off. Fix: the comma is refused
 when nothing can follow; a zero-count mask is a named bug before degrading. Guard:
 `tests/test_json_schema_enforcement.sh`.
+Same at a full array or string: a `,` past `maxItems` or a `\` at `maxLength` led nowhere, so both are refused.
 
 ### JSON-schema decode was 60x slower on Flash Next (#380)
 Defect: 0.9 tok/s against 54 without `response_format`. Cause: `buildMask` walked all 248k tokens through the grammar
@@ -878,3 +879,17 @@ by id only, so the nested root registered the same folder under its bare name. F
 entry per folder by real path, under the `org/name` id, and `rescan` compares real paths. Guard:
 `tests/test_multi_model_dir.sh` [5][6], `discoverModelsMany lists a folder two roots reach once…`,
 `ModelRegistry: rescan adds no second entry…`.
+
+### A split GGUF in its quant folder was missing from `list` and `/v1/models` (#1259)
+Defect: a 157 GB split quant the app downloaded and served did not appear in `mlx-serve list` or `/v1/models`. Cause:
+the app (and `pull`) save a split quant in its own folder, `<repo>/<quant>/…-00001-of-N.gguf`, and every server-side
+GGUF check read only the repo folder's own files. Fix: `shardFolderFirst` is the app's rule (one complete split set,
+nothing else); `scanLlmGguf`, `isGgufModelPath` and `list` read it below an org folder, and `peekByPath` maps the
+app's shard path to the repo entry. Guard: the tests named for the quant folder in `files.zig`, `discovery.zig`,
+`cli.zig` and `registry.zig`.
+
+### `/v1/completions` echo logprobs came back as invalid JSON
+
+A logprob that is NaN (a forward that overflowed) or -inf was printed with `{d:.6}`, which writes `nan` / `-inf`: JSON
+has neither, so the client's parser died instead of reading a value. Fix: every logprob float goes through
+`logprobs.jsonLogprob` (NaN `null`, -inf OpenAI's -9999). Guard: `logprobs: a non-finite value is valid JSON ...`.

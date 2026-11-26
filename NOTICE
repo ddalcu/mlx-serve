@@ -179,6 +179,29 @@ follows the structure of Splash's q8 attention tile
 the MetalPerformancePrimitives tensor op with an online softmax and split-KV
 partials. Re-implemented over MLX's affine group-quantized cache.
 
+Inkling 2's DFlash2 draft tree follows the scheme of Splash's
+(runtime/metal/kernels/decode/sampling.metal, runtime/metal/abi/VerifyTree.h):
+`src/plugins/inkling2/kernels/dflash_tree.metal` builds a lane's tree best-first
+as `tree_expand` does, with its SplitMix64 row keys and its Gumbel top-k draw of
+a sampled row's children without replacement (the hash constants are Splash's);
+`sample_tree_draw.metal`, `sample_tree_mass.metal`, `sample_tree_search.metal`
+and `accept_tree.metal` accept a sampled row by its recursive rejection over the
+children in the order drawn. Re-implemented as MLX custom kernels over our own
+verify, caches and commit.
+
+--------------------------------------------------------------------------------
+DFlash
+https://github.com/z-lab/dflash
+Copyright (c) 2026 Z Lab
+Licensed under the MIT License.
+
+`src/plugins/inkling2/dflash2.zig` ports the DFlash2 draft model of
+`dflash/model_mlx.py` (the block forward over the target's taps, the grouped
+dynamic convolutions, the candidate path selector) to Zig against mlx-c, for the
+`incoai/Inkling-2-Mini-DFlash2` weights; `tests/dump_inkling2_dflash2_fixtures.py`
+drives that reference for the parity fixtures. The soft cap after the edge
+correction follows the sglang adapter shipped beside the weights (Apache-2.0).
+
 --------------------------------------------------------------------------------
 dflash-mlx
 https://github.com/bstnxbt/dflash-mlx
@@ -229,6 +252,8 @@ Used in mlx-serve (`src/engines/mlx/transformer.zig`):
     the sliding-window bound is ours.
   * The block-sparse VSA attention (`src/plugins/minimax_h3/kernels/vsa_nax.metal`): that
     attention kernel's loop walking each query tile's selected key tiles.
+  * Inkling 2's bundled DSpark drafter (`src/plugins/inkling2/draft.zig`), reimplemented in Zig after
+    the DFlash drafter of `omlx/patches/inkling2/dspark.py`, the one open reference that runs it.
 
 Used in mlx-serve for GLM-5-Next (`src/plugins/glm5_next/glm5_next.zig`, `src/plugins/glm5_next/dsa_nax.zig`,
 `src/sdk/blocks/kda/recurrence.zig`, `src/kernels/kda_*.metal`, `src/kernels/glm5_*.metal`),
@@ -483,7 +508,12 @@ Used in mlx-serve:
   * The global-sort MoE gather (`_gather_sort`: argsort the flattened
     (token, expert) pairs, gather rows, run with sorted indices, then inverse
     permute) is theirs, used by our multi-position MoE paths in
-    `src/engines/mlx/transformer.zig` and `src/plugins/deepseek_v4/deepseek_v4.zig`.
+    `src/engines/mlx/transformer.zig`, `src/plugins/deepseek_v4/deepseek_v4.zig`
+    and `src/plugins/inkling2/layers.zig`.
+  * `src/plugins/inkling2/kernels/relattn.metal` ports the `relative_attention`
+    kernel of the Inkling 2 model (`mlx_lm/models/inkling2/kernels.py`,
+    https://github.com/ml-explore/mlx-lm/pull/2086); `relsplit.metal` and
+    `relslots.metal` split that kernel's read over the keys and over slots.
 
 Modifications by mlx-serve: reimplemented in Zig against mlx-c, and the GDN
 kernel is extended by a sequence variant (`GDN_KERNEL_SEQ_SOURCE`) that records
@@ -754,6 +784,9 @@ and they are listed because they made that work possible.
   * The `inkling_mlx/` package bundled with Thinking Machines' Inkling Small
     checkpoints (Apache-2.0), the reference and parity oracle for
     `inkling_mm_model`.
+  * mlx-lm's `mlx_lm/models/inkling2` (MIT, ml-explore/mlx-lm#2086), the
+    reference and parity oracle for `inkling2_loop`, its image tower and its
+    processor.
   * inclusionAI's Ming-3.0-tts modeling code and Blaizzy/mlx-audio (MIT), the
     references for the `ming_tts` plugin's model, task and text frontend ports.
   * hexgrad/misaki (Apache-2.0), whose pronunciation dictionaries are fetched

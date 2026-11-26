@@ -104,11 +104,25 @@ class LaunchCached : public mx::Primitive {
   // where the kernel asks for it (the launch's `contiguous`), no init value (such configs never reach here).
   void eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) override {
     for (auto& out : outputs) out.set_data(mx::allocator::malloc(out.nbytes()));
+    std::vector<mx::array> copies;
+    std::vector<mx::array> checked;
+    checked.reserve(inputs.size());
+    for (const auto& in : inputs) {
+      if (!v_->ensure_row_contiguous || in.flags().row_contiguous) {
+        checked.push_back(in);
+      } else {
+        std::vector<mx::array> c_outs = {mx::contiguous(in, false, stream())};
+        c_outs[0].primitive().eval_gpu({in}, c_outs);
+        c_outs[0].detach();
+        copies.push_back(c_outs[0]);
+        checked.push_back(copies.back());
+      }
+    }
     auto& enc = mx::metal::get_command_encoder(stream());
     enc.set_compute_pipeline_state(v_->pipeline);
     int index = 0;
-    for (size_t i = 0; i < inputs.size(); i++) {
-      const mx::array& in = inputs[i];
+    for (size_t i = 0; i < checked.size(); i++) {
+      const mx::array& in = checked[i];
       const auto& si = v_->shape_infos[i];
       enc.set_input_array(in, index);
       index++;
@@ -142,6 +156,7 @@ class LaunchCached : public mx::Primitive {
     }
     const auto [gx, gy, gz] = grid_;
     enc.dispatch_threads(MTL::Size(gx, gy, gz), MTL::Size(std::min(tx, gx), std::min(ty, gy), std::min(tz, gz)));
+    enc.add_temporaries(std::move(copies));
   }
 
   const char* name() const override {
@@ -266,7 +281,9 @@ int mlxlc_apply(mlx_vector_array* outputs, mlx_fast_metal_kernel cls, const mlx_
     std::vector<mx::array> launch_in;
     launch_in.reserve(ins.size());
     for (const auto& x : ins) {
-      if (v->ensure_row_contiguous && !(x.status() == mx::array::Status::available && x.flags().row_contiguous))
+      // Unscheduled arrays keep default row_contiguous=true until eval; LaunchCached::eval_gpu
+      // checks them after eval, so avoid unconditional Copy nodes on unevaluated inputs here.
+      if (v->ensure_row_contiguous && x.status() != mx::array::Status::unscheduled && !x.flags().row_contiguous)
         launch_in.push_back(mx::contiguous(x, false, s));
       else
         launch_in.push_back(x);

@@ -142,3 +142,4 @@ src/host/api/chat_completions.zig	var has_tools = chat_mod.declaresTools(root.ge
 src/host/api/responses/handler.zig	.has_tools = include_tools and chat_mod.declaresTools(tools)	tool mode needs a non-empty top-level tools array (declaresTools)
 src/host/api/anthropic.zig	defaultEnableThinking(chat_mod.declaresTools(root.get("tools")))	tool mode and the tools thinking default need a non-empty top-level tools array (declaresTools)
 src/host/api/*.zig	!get("tools") != null	tool mode and the tools thinking default need a non-empty top-level tools array (declaresTools)
+app/Sources/MLXServe/MLXServeApp.swift	.windowManagerRole(.principal)	resizable window scenes are principal windows, or an LSUIElement app cannot take them full screen

@@ -274,5 +274,56 @@ fi
 run_test "chat \$ref into \$defs" "$( [ "$OK" = ok ] && echo PASS || echo FAIL )" "$OK"
 echo ""
 
+# run_seed_case NAME SEEDS SCHEMA PROMPT CHECK: seeded chat requests at temperature 0.7, each reply checked by
+# CHECK, a Python expression over the reply object `o` and the request's `schema`. Any reply off schema fails the
+# case, and so does a mask the server had to switch off.
+run_seed_case() {
+    local name="$1" seeds="$2" schema="$3" prompt="$4" check="$5" mark seed body r ok=ok
+    mark=$(wc -l < /tmp/mlx-serve-schema-test.log)
+    for seed in $(seq 1 "$seeds"); do
+        body=$(jq -n --argjson schema "$schema" --arg prompt "$prompt" --argjson seed "$seed" '{
+            model:"mlx-serve",
+            messages:[{role:"user",content:$prompt}],
+            response_format:{type:"json_schema",json_schema:{name:"reply",schema:$schema,strict:true}},
+            max_tokens:256, temperature:0.7, seed:$seed, enable_thinking:false
+        }')
+        r=$(curl -sf "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "$body" \
+            | SCHEMA="$schema" CHECK="$check" python3 -c '
+import sys, json, os
+schema = json.loads(os.environ["SCHEMA"])
+try:
+    c = json.loads(sys.stdin.read())["choices"][0]
+    o = json.loads(c["message"]["content"] or "")
+except Exception:
+    print("fail:no_json_reply"); sys.exit()
+ok = c["finish_reason"] == "stop" and isinstance(o, dict) and eval("(" + os.environ["CHECK"] + ")")
+print("ok" if ok else "fail:off_schema:" + repr(o)[:80])
+')
+        [ "$r" = ok ] || ok="$r (seed $seed)"
+    done
+    if tail -n +"$((mark + 1))" /tmp/mlx-serve-schema-test.log | grep -q "disabling further mask enforcement"; then
+        ok="fail:mask_disabled"
+    fi
+    run_test "$name" "$( [ "$ok" = ok ] && echo PASS || echo FAIL )" "$ok"
+    echo ""
+}
+
+# ── Case H: an array that reaches maxItems closes; a comma there killed the mask ──
+# The prompt asks for more tags than maxItems allows; enum items keep every tag short.
+echo "--- Case H: /v1/chat/completions + array at maxItems ---"
+run_seed_case "chat array at maxItems" 10 \
+    '{"type":"object","additionalProperties":false,"required":["city","population","tags"],"properties":{"city":{"type":"string"},"population":{"type":"integer","minimum":0},"tags":{"type":"array","items":{"enum":["temples","tea","history","gardens","culture","food","shrines","art","nature","festivals"]},"maxItems":3}}}' \
+    "Give facts about Kyoto with ten tags." \
+    'set(o) == {"city", "population", "tags"} and isinstance(o["city"], str) and type(o["population"]) is int
+     and o["population"] >= 0 and isinstance(o["tags"], list) and len(o["tags"]) <= 3
+     and all(t in schema["properties"]["tags"]["items"]["enum"] for t in o["tags"])'
+
+# ── Case I: a string that reaches maxLength closes; an escape opened there killed the mask ──
+echo "--- Case I: /v1/chat/completions + string at maxLength ---"
+run_seed_case "chat string at maxLength" 30 \
+    '{"type":"object","additionalProperties":false,"required":["quote"],"properties":{"quote":{"type":"string","maxLength":20}}}' \
+    "Quote a famous line about Kyoto, keeping its double quotes." \
+    'set(o) == {"quote"} and isinstance(o["quote"], str) and len(o["quote"]) <= schema["properties"]["quote"]["maxLength"]'
+
 echo "=== Result: $PASS/$TOTAL passed ==="
 [ "$FAIL" -eq 0 ]

@@ -53,6 +53,23 @@ clamps an inflated snapshot to the matched length`.
 Defect: reusing a cache whose generated tool-call tokens are not in `cached_prompt_ids` corrupts attention. Fix:
 invalidate after tool calls and pad-only generations.
 
+### An agent's long answers fell out of the cache because the next prompt spelled them in other tokens
+Defect: in a Ship Score run on Inkling 2 three requests restored nothing (18K, 31K and 62K tokens prefilled cold),
+each right after a long `write` call. Cause: the model samples at temperature 1 with no top-p, and its answer spelled a
+comment's dashes `" ----" "--------"` where encoding the same text gives `" " "--------" "----"`; the re-rendered turn
+left the cached tokens there, and on its sliding rings no checkpoint near that point could restore. Fix: before the
+lookup the prompt takes the cached entry's spelling wherever the bytes agree (`respell`, `HotPrefixCache.respellPrompt`;
+never across an added token, never for a greedy or seeded request). Guard: the `respell:` tests in `prefix_cache.zig`.
+
+### The same misses came back in sessions with screenshots, and each one re-read the whole prompt
+Defect: a pi session on Inkling 2 with 64 screenshots cold-prefilled ten prompts of 47K to 440K tokens (15 minutes),
+each diverging inside the previous answer. Cause: `respell` skipped any prompt with media, since a respelled answer
+moves every image after it; and the fallback, the previous prompt's end checkpoint, had been thinned away: the cap
+spread 16 checkpoints over the whole prompt, though a sliding ring restores nothing below its floor. Fix: `respell`
+moves each media span with the run that carries it (refused when one starts inside a respelled run; M-RoPE prompts
+stay out), and `mergeCheckpointLists` drops checkpoints below the entry's `ringFloor` before the cap thins. Guards:
+`respell: an image after a respelled answer…`, `HotPrefixCache: a sliding entry's checkpoint cap keeps…`.
+
 ### Sliding layers keep the full buffer; the view is what is trimmed
 Defect: (design) Gemma 4 E4B's 512-token window. Fix: the buffer keeps every row, as mlx-lm's `RotatingKVCache` does;
 `slidingViewFor` sizes the view the forward reaches (`window + q_len - 1`), at prefill too (it was once decode-only,
@@ -1592,3 +1609,99 @@ oversized commit evicts before it copies (`evict_before_copy`), a streamed bank 
 bank's GLM or Ling asks no more than the hot-cache term its decode room holds`, `HotPrefixCache: a capped streamed
 bank's oversized commit evicts before it copies`, `outside model: a fitted base carries the hot cache's resident entry`,
 `a streamed bank's slot is exclusive on GLM and Ling`, `outside model: a bills-only fit gives each phase's bills' growth`.
+
+### A one-row matmul over a pre-transposed weight cost five launches
+Defect: Inkling 2's one-row decode sat at 72 tok/s with its glue already in kernels; the dense attention projections
+(bf16, loaded pre-transposed `[in, out]`, the loader's convention) were the top entry of the profile. Cause: MLX runs
+`x @ W` for one row as `gemv_t`, about 43 us of latency at a 2304-wide input whatever the output width, where
+`x @ W.T` over the checkpoint's `[out, in]` weight is its `gemv`, 9 us and bandwidth-bound; prompt-width GEMM is as
+fast either way. A one-row step is bound by the dependent launches on its critical path (5-7 us each) plus bytes,
+not by node count. Fix: `layers.projectRows` keeps dense projections `[out, in]`, the gates' down projections too.
+Guard: `inkling2 kernels: the stream kernels serve the projections of the chain they replace`.
+
+### A few-row f32 matmul is TF32, and the slow one
+Defect: Inkling 2's draft verify and batched decode (2-8 rows) ran each visit's router, an f32 product, as MLX's f32
+GEMM; a 3-row GPU proof flipped an expert pick against one-row steps, and every visit paid the GEMM's latency. Cause:
+on a NAX GPU MLX runs an f32 matmul past one row as TF32 (see "An f32 reference on M5 is a TF32 reference"), ~7x the
+one-row `gemv`'s latency and ~1e-3 relative where the `gemv` is exact. Fix: `kernels.routerRows` and `kernels.gate`
+keep these dots in a kernel up to `small_rows`; the batched proof's GPU arm compares forwards of the same width.
+Guard: `inkling2 kernels: the router kernel's rows are the matmul's`.
+
+### An auto context left its own prompt cache nothing
+Defect: Inkling 2's 8-bit pack on a 32 GB M1 Pro re-prefilled every long turn (16.8k tokens, 99 s each): the hot cache
+was clamped 3280 -> 116 MB, and a 16.8k entry is 1.2 GB. Cause: the auto context is sized against the request figure
+(what macOS can move) beside a cache share (`ctxCacheShare`), but the clamp reads the idle figure (what nobody holds)
+and subtracts the whole context's KV, which no idle server holds; after 17 GB of weights the two left nothing. An
+emulated ceiling (`MLX_SERVE_GPU_CEILING_MB`) on a big Mac hid it: its idle figure stays huge. Fix: an auto context's
+cache keeps `ctxCacheShare` of the idle figure. Guard: `an auto context leaves its hot cache the share it was sized
+beside`.
+
+### A drafted round kept the turn's end and the token after it
+Defect: Inkling 2's agent run on an M5 re-prefilled its whole ~100k-token context on many turns:
+`sliding ring holds rows from ...; match ... falls behind them`. Cause: the native drafter's round kept every draft
+the trunk agreed with, a stop token and a draft after it included; the decode-end entry then held tokens the
+conversation never contains, the next prompt matched one or two short of its end, and the nearest checkpoint below
+that sat behind the sliding ring. A kept stop alone still left the live state one row past the committed length,
+which `rollbackSsmTo` cannot undo after a drafted round, so no decode-end entry was written. Fix: the engine hands a
+round the request's stop ids (`Forward.stop_ids`) and the drafter never verifies one (`draftsToVerify`): the trunk's
+token carries the stop. Guards: `plugin native drafter: a round is handed the request's stop ids`, `inkling2 draft: a
+round never verifies a stop`.
+
+### A round priced on a clock inside the request read 93 or 208 tok/s by seed
+Defect: Inkling 2's sampled requests ran at plain-decode speed or at twice it depending on the seed and the boot,
+and five separate pieces of code priced a round (the plugin's own row costs and widths, the engine's doubling
+backoff, a plain-step average, a copy-landing average). Cause: each fed wall-clock samples of live rounds back into
+the next decision, so one slow round, or a warm-up's compile, moved a request onto another path, and what it then
+measured kept it there. Fix: `sdk/spec/rounds.zig`. A load times the model's rounds once, by draft count, with a
+request of its own (`rounds.Timing`, `warm_requests.timeRounds`); a request counts what its own rounds kept
+(`Acceptance`, `CopyStats`) and runs the copy, the drafter's block or the plain step with the most expected tokens
+per ms (`Controller.choose`). Nothing reads a clock inside a request, so with one ladder a seeded request makes the
+same choices again; boots time their own ladders (within 1%), so a choice near a tie can still differ across boots.
+A plain step is timed as the mean of a run of pipelined ticks, never the least one. Guards: `Timing: a cell keeps
+the least of its timed rounds`, `Controller: plain when no round pays`, `plugin native drafter: no rounds before the
+load's timing request`.
+
+### A drawn draft block cut before its stop id ended sampled turns less often than the model does
+Defect: a native drafter's sampled round dropped a drafted stop id and everything after it before the verify, as a
+greedy round does. Cause: a greedy block is a function of the context, so cutting it changes nothing; a drawn block
+is a sample, and the accept rule (keep with min(1, p/q), else draw the residual) is exact only if every drawn draft
+is tested. A dropped stop was replaced by a fresh draw from the trunk, so the stop needed two draws to land: where
+drafter and trunk both gave it 0.5, the turn ended a quarter of the time. Fix: a drawn block ends ON its stop
+(`draftsToVerify` in the plugin), the engine tests it like any draft, and an accepted stop becomes the pending token
+(`stopPending`), so its row is never committed. Rule: no cut of a drawn block may depend on what was drawn. Guards:
+`an accepted stop id is the pending token`, `inkling2 draft: only a drawn block verifies a stop`.
+
+### A prompt's rate fell by a third by 64K because its attention kernel did not use the tensor units
+Defect: Inkling 2's prompt processing read 4,900 tok/s at 4K and 3,200 at 64K on an M5 Ultra.
+Cause: the 8 global visits cost time per (row, key) pair, so a prompt's total grows with its square, and their read was
+an 8x8-SIMD-matrix flash kernel (`relattn.metal`); fitting
+tokens/s against length (time a token = a + c x length) showed the same `a` and a `c` 4x larger. Fix:
+`relattn_nax.metal`, the same read as `matmul2d` ops on the tensor unit (7.2K 5,130 -> 5,840 tok/s, 28.7K 4,275 -> 5,648,
+57K 3,414 -> 5,110), the old kernel kept where there is no NAX. Rule: a prompt rate that falls with length is the attention
+kernel; fit `a + c x length` before looking anywhere else. Guards: `a prompt's rows read on the tensor unit are the masked
+chain's`, the `relattn_nax` contract cases.
+
+### A default-on switch read with `env.on` was off in every server that did not set it
+Defect: the batched group rounds of a served drafter (`MLX_SERVE_NATIVE_GROUPS`, registered default `on`) never ran in a plain
+`mlx-serve --serve`: eight simultaneous requests all yielded speculation to plain batched decode after two ticks. Cause:
+`env.on` is "set and not 0", so an unset variable reads off, and every A/B passed `=1` explicitly. Fix: `env.notOff` reads a
+default-on switch (on unless `0`). Rule: a switch whose registered default is on is read with `notOff`, and a bench boots the
+default arm without the variable. Guard: `notOff: a default-on switch is off only at 0, where on reads unset as off`.
+
+### The same greedy request answered differently the second time
+Defect: on Inkling 2 a repeated temperature-0 request changed its text within 200 tokens for 10 of 12 prompts (3 of 12
+before the drafter's state carried over), and a seeded sampled one never repeated. Cause: a request that repeats a
+finished one adopted its drafter state (context rows, calibration) and copied its answer as drafts, so its rounds
+lined up differently; a verify row's logits differ from another alignment's in the low bits (bf16), and a near-tie
+token flips. Fix: a greedy or seeded request (`SamplingParams.repeats`) adopts nothing and copies no earlier answer;
+an unseeded sampled one keeps both. Rule: state carried between requests may speed a request up, never change what
+a request that asks to repeat reads. Beside other requests a group still follows arrival order. Guard: `plugin native
+drafter: only an unseeded sampled request continues an earlier one`.
+
+### A kernel template argument that carried a launch's rows filled the proof table, and every launch then paid an evaluation
+Defect: Inkling 2's decode ran 10 ms a round slower for the life of a process, from the first boot of a build (its warm
+requests) or after a few dozen distinct prompt lengths: an 18 ms verify took 28. Cause: the conv kernels took the rows
+a slot (`RPS`) as a template argument, so every prompt length was a new instantiation; `kernels.zig` proves a wide
+threadgroup once per instantiation in a 256-entry table, and a full table re-proves, one synchronous evaluation a launch.
+Fix: the kernels read the count from their inputs' shapes, and the table holds 2048. Rule: a template argument never
+carries a launch's shape. Guard: `inkling2 kernels: a forward of another length instantiates no kernel anew`.

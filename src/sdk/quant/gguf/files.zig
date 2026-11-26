@@ -17,10 +17,15 @@ pub const GgufScan = struct {
     saw_embedding: bool = false,
 };
 
+pub const ScanOptions = struct {
+    /// Also pick from quant folders (`shardFolderFirst`). Off for an org folder, whose children are repos.
+    shard_folders: bool = false,
+};
+
 /// Scan an iterable dir for LLM `.gguf` entries. Symlinked files count
 /// (statFile follows links) — users symlink multi-GB weights rather than
 /// copy them. Caller frees `pick`.
-pub fn scanLlmGguf(io: std.Io, allocator: std.mem.Allocator, dir: *std.Io.Dir) !GgufScan {
+pub fn scanLlmGguf(io: std.Io, allocator: std.mem.Allocator, dir: *std.Io.Dir, opts: ScanOptions) !GgufScan {
     var scan: GgufScan = .{};
     errdefer if (scan.pick) |p| allocator.free(p);
     var it = dir.iterate();
@@ -45,17 +50,68 @@ pub fn scanLlmGguf(io: std.Io, allocator: std.mem.Allocator, dir: *std.Io.Dir) !
         }
     }
     // A split set's first shard is its metadata: the set is billed whole.
-    if (scan.pick) |p| if (splitSet(p)) |set| {
-        scan.pick_bytes = 0;
-        var again = dir.iterate();
-        while (again.next(io) catch null) |entry| {
-            if (!std.mem.startsWith(u8, entry.name, set.stem) or !std.mem.endsWith(u8, entry.name, set.tail)) continue;
-            if (entry.name.len != p.len) continue;
-            const st = dir.statFile(io, entry.name, .{}) catch continue;
-            scan.pick_bytes += @intCast(st.size);
-        }
+    if (scan.pick) |p| if (splitSet(p) != null) {
+        scan.pick_bytes = setBytes(io, dir.*, p);
     };
+    if (opts.shard_folders) {
+        var folders: ShardFolders = .{ .dir = dir.*, .it = dir.iterate() };
+        defer folders.deinit(io);
+        while (folders.next(io)) |f| {
+            if (gguf_meta.fileDeclaresPooling(io, f.sub, f.first)) {
+                scan.saw_embedding = true;
+                continue;
+            }
+            const rel = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ f.name, f.first });
+            if (scan.pick != null and !std.mem.lessThan(u8, rel, scan.pick.?)) {
+                allocator.free(rel);
+                continue;
+            }
+            if (scan.pick) |p| allocator.free(p);
+            scan.pick = rel;
+            scan.pick_bytes = setBytes(io, f.sub, f.first);
+        }
+    }
     return scan;
+}
+
+/// Bytes of the split set whose first shard is `first`, in `dir`.
+fn setBytes(io: std.Io, dir: std.Io.Dir, first: []const u8) u64 {
+    const set = splitSet(first) orelse return 0;
+    var bytes: u64 = 0;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, set.stem) or !std.mem.endsWith(u8, entry.name, set.tail)) continue;
+        if (entry.name.len != first.len) continue;
+        const st = dir.statFile(io, entry.name, .{}) catch continue;
+        bytes += @intCast(st.size);
+    }
+    return bytes;
+}
+
+/// A quant folder (`<repo>/Q6_K_XL/`, the layout the app downloads a split quant into) holds one COMPLETE split
+/// set and nothing else but in-flight `.partial` files; returns its first shard's name (in `buf`), else null.
+/// The app's `shardSubfolderShards` + `isComplete` is the same rule, so both list the same models.
+pub fn shardFolderFirst(io: std.Io, dir: std.Io.Dir, buf: []u8) ?[]const u8 {
+    var first: ?[]const u8 = null;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (splitSet(entry.name) == null) continue;
+        if (first != null or entry.name.len > buf.len) return null;
+        @memcpy(buf[0..entry.name.len], entry.name);
+        first = buf[0..entry.name.len];
+    }
+    const f = first orelse return null;
+    const set = splitSet(f).?;
+    // Every other entry is a shard of this one set (same stem, tail and length), and none is missing.
+    var count: usize = 0;
+    var again = dir.iterate();
+    while (again.next(io) catch null) |entry| {
+        if (entry.name.len == 0 or entry.name[0] == '.' or std.mem.endsWith(u8, entry.name, ".partial")) continue;
+        if (entry.kind != .file and entry.kind != .sym_link) return null;
+        if (entry.name.len != f.len or !std.mem.startsWith(u8, entry.name, set.stem) or !std.mem.endsWith(u8, entry.name, set.tail)) return null;
+        count += 1;
+    }
+    return if (count == std.fmt.parseInt(usize, set.tail[4..9], 10) catch return null) f else null;
 }
 
 /// `<stem>-00001-of-NNNNN.gguf` as (`<stem>-`, `-of-NNNNN.gguf`), null for any other name.
@@ -82,7 +138,7 @@ test "a split set is picked by its first shard and billed whole" {
         try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
     }
     try tmp.dir.writeFile(io, .{ .sub_path = "M-other.gguf.txt", .data = "x" });
-    const scan = try scanLlmGguf(io, std.testing.allocator, &tmp.dir);
+    const scan = try scanLlmGguf(io, std.testing.allocator, &tmp.dir, .{});
     defer std.testing.allocator.free(scan.pick.?);
     try std.testing.expectEqualStrings("M-00001-of-00003.gguf", scan.pick.?);
     try std.testing.expectEqual(@as(u64, 3210), scan.pick_bytes);
@@ -116,8 +172,46 @@ pub fn isGgufModelPath(io: std.Io, path: []const u8) bool {
         const st = dir.statFile(io, entry.name, .{}) catch continue;
         if (st.kind == .file) return true;
     }
-    return false;
+    return hasShardFolder(io, dir);
 }
+
+/// Does `dir` hold a quant folder (`shardFolderFirst`)?
+pub fn hasShardFolder(io: std.Io, dir: std.Io.Dir) bool {
+    var folders: ShardFolders = .{ .dir = dir, .it = dir.iterate() };
+    defer folders.deinit(io);
+    return folders.next(io) != null;
+}
+
+/// The quant folders (`shardFolderFirst`) in `dir`. A result lives until the next `next` call.
+const ShardFolders = struct {
+    dir: std.Io.Dir,
+    it: std.Io.Dir.Iterator,
+    sub: ?std.Io.Dir = null,
+    buf: [std.fs.max_name_bytes]u8 = undefined,
+
+    const Folder = struct { name: []const u8, sub: std.Io.Dir, first: []const u8 };
+
+    fn next(self: *ShardFolders, io: std.Io) ?Folder {
+        self.deinit(io);
+        while (self.it.next(io) catch null) |entry| {
+            if (entry.kind != .directory and entry.kind != .sym_link) continue;
+            if (entry.name.len == 0 or entry.name[0] == '.') continue;
+            var sub = self.dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+            const first = shardFolderFirst(io, sub, &self.buf) orelse {
+                sub.close(io);
+                continue;
+            };
+            self.sub = sub;
+            return .{ .name = entry.name, .sub = sub, .first = first };
+        }
+        return null;
+    }
+
+    fn deinit(self: *ShardFolders, io: std.Io) void {
+        if (self.sub) |*s| s.close(io);
+        self.sub = null;
+    }
+};
 
 /// Resolve the actual .gguf file path. When `path` is a directory, return
 /// the alphabetically-smallest non-mmproj `.gguf` entry within it (caller
@@ -141,7 +235,7 @@ pub fn resolveGgufFile(io: std.Io, allocator: std.mem.Allocator, path: []const u
     }
     var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
     defer dir.close(io);
-    const scan = try scanLlmGguf(io, allocator, &dir);
+    const scan = try scanLlmGguf(io, allocator, &dir, .{ .shard_folders = true });
     if (scan.pick) |p| {
         defer allocator.free(p);
         return std.fmt.allocPrint(allocator, "{s}/{s}", .{ trimTrailingSlash(path), p });
@@ -295,7 +389,7 @@ test "a vision tower GGUF is a sidecar, never the model, and is found beside it"
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     for ([_][]const u8{ "A-1017-Vision.gguf", "B-IQ2.gguf", "B-DSpark-support.gguf" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "x" });
-    const scan = try scanLlmGguf(io, a, &tmp.dir);
+    const scan = try scanLlmGguf(io, a, &tmp.dir, .{});
     defer a.free(scan.pick.?);
     try std.testing.expectEqualStrings("B-IQ2.gguf", scan.pick.?);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -329,4 +423,43 @@ test "a quant folder's vision tower is found one level up, as a repo ships its m
     const own = findVisionSidecar(io, a, model) orelse return error.TestUnexpectedResult;
     defer a.free(own);
     try std.testing.expectEqualStrings("mmproj-own.gguf", std.fs.path.basename(own));
+}
+
+test "a quant folder holding one complete split set is the model, billed whole; any other folder is not" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const big: [200]u8 = @splat('x');
+    try tmp.dir.createDirPath(io, "Q6_K_XL");
+    try tmp.dir.writeFile(io, .{ .sub_path = "Q6_K_XL/X-Q6_K_XL-00001-of-00002.gguf", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Q6_K_XL/X-Q6_K_XL-00002-of-00002.gguf", .data = &big });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Q6_K_XL/X-Q6_K_XL-00002-of-00002.gguf.partial", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mmproj-X-BF16.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "README.md", .data = "x" });
+    // Not quant folders: a stray file beside the shards, and a set missing a shard.
+    try tmp.dir.createDirPath(io, "Q2");
+    try tmp.dir.writeFile(io, .{ .sub_path = "Q2/A-00001-of-00002.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Q2/A-00002-of-00002.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Q2/notes.txt", .data = "x" });
+    try tmp.dir.createDirPath(io, "Q1");
+    try tmp.dir.writeFile(io, .{ .sub_path = "Q1/A-00001-of-00003.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Q1/A-00002-of-00003.gguf", .data = "x" });
+
+    const scan = try scanLlmGguf(io, a, &tmp.dir, .{ .shard_folders = true });
+    defer a.free(scan.pick.?);
+    try std.testing.expectEqualStrings("Q6_K_XL/X-Q6_K_XL-00001-of-00002.gguf", scan.pick.?);
+    try std.testing.expectEqual(@as(u64, 210), scan.pick_bytes);
+    // A caller walking an org folder opts out: its children are repos, not quants.
+    const flat = try scanLlmGguf(io, a, &tmp.dir, .{});
+    try std.testing.expect(flat.pick == null);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try std.testing.expect(isGgufModelPath(io, root));
+    const file = try resolveGgufFile(io, a, root);
+    defer a.free(file);
+    try std.testing.expect(std.mem.endsWith(u8, file, "/Q6_K_XL/X-Q6_K_XL-00001-of-00002.gguf"));
+    try tmp.dir.deleteTree(io, "Q6_K_XL");
+    try std.testing.expect(!isGgufModelPath(io, root));
 }

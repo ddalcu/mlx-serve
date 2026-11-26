@@ -456,6 +456,9 @@ fn stepString(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
                 return .consumed;
             }
             if (byte == '\\') {
+                // Every escape adds one to the length: at maxLength none can
+                // finish and the mask would come back empty. `"` is the way out.
+                if (schema.str_max_len) |max| if (s.byte_count >= max) return .reject;
                 s.phase = .after_backslash;
                 g.top().sub = .{ .in_string = s };
                 return .consumed;
@@ -800,6 +803,9 @@ fn stepArray(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
         },
         .after_value => {
             if (byte == ',') {
+                // At maxItems a comma leads to expect_value, which takes no
+                // item: only whitespace, then an empty mask. `]` is the way out.
+                if (schema.arr_max_items) |max| if (a.count >= max) return .reject;
                 a.phase = .expect_value;
                 g.top().sub = .{ .in_array = a };
                 return .consumed;
@@ -983,6 +989,39 @@ test "grammar respects minLength and maxLength" {
     }
 }
 
+test "a string at maxLength admits its closing quote and no escape" {
+    // A `\` at maxLength opens an escape no character can finish, so the mask
+    // comes back empty. maxLength counts raw bytes and whole escapes, one each.
+    const max3 =
+        \\{"type":"string","maxLength":3}
+    ;
+    const exactly3 =
+        \\{"type":"string","minLength":3,"maxLength":3}
+    ;
+    const cases = [_]struct { schema: []const u8, prefix: []const u8, byte: u8, ok: bool }{
+        .{ .schema = max3, .prefix = "\"abc", .byte = '\\', .ok = false },
+        .{ .schema = max3, .prefix = "\"abc", .byte = '"', .ok = true },
+        .{ .schema = max3, .prefix = "\"ab\\u00e9", .byte = '\\', .ok = false },
+        .{ .schema = max3, .prefix = "\"a\xc3\xa9", .byte = '\\', .ok = false },
+        // One unit short, an escape still finishes.
+        .{ .schema = max3, .prefix = "\"ab", .byte = '\\', .ok = true },
+        .{ .schema = max3, .prefix = "\"ab\\", .byte = 'n', .ok = true },
+        .{ .schema = max3, .prefix = "\"ab\\u00e", .byte = '9', .ok = true },
+        .{ .schema = exactly3, .prefix = "\"ab", .byte = '"', .ok = false },
+        .{ .schema = exactly3, .prefix = "\"ab\\n", .byte = '"', .ok = true },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("prefix {s} byte {c}\n", .{ c.prefix, c.byte });
+        var schema = try parseSchema(testing.allocator, c.schema);
+        defer schema.deinit();
+        var g = try Grammar.init(testing.allocator, &schema);
+        defer g.deinit();
+        try feed(&g, c.prefix);
+        const mask = try g.allowedBytes();
+        try testing.expectEqual(c.ok, mask.contains(c.byte));
+    }
+}
+
 test "grammar respects minItems and maxItems" {
     var schema = try parseSchema(testing.allocator,
         \\{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":3}
@@ -1102,6 +1141,40 @@ test "comma still allowed while a property remains unseen" {
     try testing.expect(mask.contains(','));
     // `}` is not: `age` is required and still unseen.
     try testing.expect(!mask.contains('}'));
+}
+
+test "an array at maxItems admits `]` and no comma" {
+    // A comma at maxItems leads where no item is legal: free whitespace runs
+    // out after MAX_FREE_WS and the mask comes back empty.
+    const tags =
+        \\{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"},"maxItems":3}}}
+    ;
+    const pair =
+        \\{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":2}
+    ;
+    const nested =
+        \\{"type":"array","items":{"type":"array","items":{"type":"integer"},"maxItems":1},"maxItems":2}
+    ;
+    const cases = [_]struct { schema: []const u8, prefix: []const u8, comma: bool, close: bool }{
+        .{ .schema = tags, .prefix = "{\"tags\":[\"a\",\"b\"", .comma = true, .close = true },
+        .{ .schema = tags, .prefix = "{\"tags\":[\"a\",\"b\",\"c\"", .comma = false, .close = true },
+        .{ .schema = pair, .prefix = "[1", .comma = true, .close = false },
+        .{ .schema = pair, .prefix = "[1,2", .comma = false, .close = true },
+        .{ .schema = nested, .prefix = "[[1", .comma = false, .close = true },
+        .{ .schema = nested, .prefix = "[[1]", .comma = true, .close = true },
+        .{ .schema = nested, .prefix = "[[1],[2]", .comma = false, .close = true },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("prefix {s}\n", .{c.prefix});
+        var schema = try parseSchema(testing.allocator, c.schema);
+        defer schema.deinit();
+        var g = try Grammar.init(testing.allocator, &schema);
+        defer g.deinit();
+        try feed(&g, c.prefix);
+        const mask = try g.allowedBytes();
+        try testing.expectEqual(c.comma, mask.contains(','));
+        try testing.expectEqual(c.close, mask.contains(']'));
+    }
 }
 
 test "snapshot/restore roundtrip" {

@@ -58,6 +58,7 @@ let supportedModelTypes: Set<String> = [
     "mimo_v2", "mimo_v2_flash", // Xiaomi MiMo-V2.6-Flash (309B-A15B MoE, mlx-lm layout packs)
     "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA hybrid MoE, text + vision)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
+    "inkling2_loop", // Thinking Machines Inkling 2 Mini (26.4B-A3.4B looped MoE; text and images)
     "muse_glimmer", "muse_glimmer_text", // meta-models Muse-Glimmer-30B (text + vision)
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
     "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
@@ -394,6 +395,7 @@ struct HFModel: Identifiable, Codable {
     static let verifiedModelOptRepos: Set<String> = [
         "nvidia/Qwen3.8-Flash-Next-FP4-Local",
         "nvidia/GLM-5.3-Flash-FP4-Local",
+        "thinkingmachines/Inkling-2-Mini",
     ]
 
     /// Human-readable reason why this model isn't compatible. The row renders

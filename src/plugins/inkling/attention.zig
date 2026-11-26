@@ -86,7 +86,7 @@ pub fn inklingSconvCore(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, p
 /// and zeroed outside 0 <= distance < extent. `kv_start` = the absolute
 /// position of the view's first key (non-zero when a sliding-layer decode
 /// reads the last-window KV view). Returns [B, H, Lq, kv_len] f32.
-fn inklingRelBias(s: mlx.mlx_stream, rel_states: mlx.mlx_array, proj: mlx.mlx_array, q_start: i64, kv_len: c_int, kv_start: c_int) !mlx.mlx_array {
+pub fn inklingRelBias(s: mlx.mlx_stream, rel_states: mlx.mlx_array, proj: mlx.mlx_array, q_start: i64, kv_len: c_int, kv_start: c_int) !mlx.mlx_array {
     const rs_shape = mlx.getShape(rel_states); // [B, Lq, H, d_rel]
     const batch = rs_shape[0];
     const lq = rs_shape[1];
@@ -172,7 +172,7 @@ fn inklingRelBias(s: mlx.mlx_stream, rel_states: mlx.mlx_array, proj: mlx.mlx_ar
 /// additive mask: where allowed, the bias; elsewhere -1e30 (the reference's
 /// NEG_INF — built with where, never indicator × -inf). Returns f32
 /// [.., Lq, kv_len] broadcastable against the bias shape.
-fn inklingCombineMask(s: mlx.mlx_stream, bias: mlx.mlx_array, q_start: c_int, kv_len: c_int, kv_start: c_int, window: ?c_int) !mlx.mlx_array {
+pub fn inklingCombineMask(s: mlx.mlx_stream, bias: mlx.mlx_array, q_start: c_int, kv_len: c_int, kv_start: c_int, window: ?c_int) !mlx.mlx_array {
     const b_shape = mlx.getShape(bias); // [B, H, Lq, kv_len]
     const lq = b_shape[2];
     var q_pos = mlx.mlx_array_new();
@@ -218,7 +218,7 @@ fn inklingCombineMask(s: mlx.mlx_stream, bias: mlx.mlx_array, q_start: c_int, kv
 
 /// Per-query log-scaling factor for global layers past the floor:
 /// tau_i = 1 + alpha·ln(max((q_start + i + 1)/n_floor, 1)), f32 [1,1,Lq,1].
-fn inklingLogScaleTau(s: mlx.mlx_stream, q_start: c_int, lq: c_int, n_floor: u32, alpha: f32) !mlx.mlx_array {
+pub fn inklingLogScaleTau(s: mlx.mlx_stream, q_start: c_int, lq: c_int, n_floor: u32, alpha: f32) !mlx.mlx_array {
     var eff_n = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(eff_n);
     try mlx.check(mlx.mlx_arange(&eff_n, @floatFromInt(q_start + 1), @floatFromInt(q_start + lq + 1), 1, .float32, s));

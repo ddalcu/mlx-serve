@@ -11,6 +11,7 @@ const sleep_inhibit = @import("runtime/sleep_inhibit.zig");
 const testing = std.testing;
 
 const slotHoldsForMemory = @import("admission/pending.zig").slotHoldsForMemory;
+const releasePromise = @import("admission/pending.zig").releasePromise;
 const AdmitCand = @import("admission/pending.zig").AdmitCand;
 const admitPendingTick = @import("admission/pending.zig").admitPendingTick;
 const slotExclusiveDecode = @import("batching/verdict.zig").slotExclusiveDecode;
@@ -22,6 +23,7 @@ const holdsSleepWhileParked = @import("cache/budget.zig").holdsSleepWhileParked;
 const runDecodeTick = @import("decode.zig").runDecodeTick;
 const finishSlot = @import("finish.zig").finishSlot;
 const runPrefill = @import("prefill.zig").runPrefill;
+const sumInflightGeneratedTokens = @import("prefill.zig").sumInflightGeneratedTokens;
 const prefillDecodeShare = @import("prefill_interleave.zig").prefillDecodeShare;
 const specYieldTick = @import("prefill_interleave.zig").specYieldTick;
 const orderByTail = @import("prefill_interleave.zig").orderByTail;
@@ -62,6 +64,13 @@ pub const AdmitOutcome = enum {
 /// One admitted slot's cancelled check, memory hold, prefill (with the one QSA-gap retry), first-token
 /// publish and move into `decoding`. The caller holds the slot's `in_pass`.
 pub fn prefillAdmitted(sch: *Scheduler, slot: *Slot) AdmitOutcome {
+    const outcome = admitAndPrefill(sch, slot);
+    // Only a slot in `decoding` reaches the cull that releases its promise; a requeued one is billed again.
+    if (outcome != .decoding) releasePromise(sch, slot);
+    return outcome;
+}
+
+fn admitAndPrefill(sch: *Scheduler, slot: *Slot) AdmitOutcome {
     if (slot.cancelled.load(.acquire)) {
         // finishSlot (not raw markFinished) so the metrics sink
         // counts the cancellation; safe pre-prefill — commit
@@ -306,12 +315,17 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
     if (active.items.len > 0) {
         ran = true;
         var decode_sw = io_util.Stopwatch.init(sch.io);
+        const outer_tick = sch.decode_tick;
+        sch.decode_tick = decode_sw;
         runDecodeTick(sch, active.items) catch |err| {
             log.err("[scheduler] decode tick failed: {s}\n", .{if (err == error.EngineFailed) err_name.last() else @errorName(err)});
             for (active.items) |s| s.markError(@errorName(err));
         };
+        sch.decode_tick = outer_tick;
         const tick_ns = decode_sw.read();
-        for (active.items) |s| s.decode_ns +|= tick_ns;
+        for (active.items) |s| {
+            if (!s.finished) s.decode_ns +|= tick_ns;
+        }
     }
 
     // 5. Cull finished / errored / cancelled from `decoding`. The slot
@@ -331,8 +345,7 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
             const drop = s.cancelled.load(.acquire) or s.finished or s.error_code != null;
             const grown = if (s.legacy_gen) |*g| promiseMaterialized(g.completion_tokens) else false;
             if (drop or grown) {
-                sch.promise_ledger.release(s.memory_promised);
-                s.memory_promised = 0;
+                releasePromise(sch, s);
             }
             if (drop) {
                 if (!s.finished and s.error_code == null) {
@@ -388,6 +401,8 @@ pub fn publishLiveKvResidency(sch: *Scheduler, prefilling: ?*Slot, module_bytes:
         bytes += slotStateBytes(s);
     }
     sch.resident_live_kv_bytes.store(bytes, .monotonic);
+    // A cancelled or errored last stream gets no further decode tick to republish this, so live == total at rest.
+    sch.inflight_generated_tokens.store(sumInflightGeneratedTokens(sch.decoding.items), .monotonic);
 }
 
 fn recordLiveSession(sch: *Scheduler, s: *const Slot, phase: metrics_mod.Session.Phase, state_bytes: u64) void {
@@ -506,4 +521,23 @@ test "a busy disk retry parks until its bounded timeout or pending work" {
     try testing.expect(before.read() >= 5 * std.time.ns_per_ms);
     sch.shutdown.store(true, .release);
     waitForDiskRetryLocked(&sch, 10);
+}
+
+test "a pass that empties the decode list publishes zero in-flight generated tokens" {
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.metrics = null;
+    sch.queue_mu = .init;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.cleanup_queue = .empty;
+    sch.offloaded = .empty;
+    sch.live_session_count = 0;
+    sch.resident_live_kv_bytes = .init(0);
+    sch.inflight_generated_tokens = .init(500);
+
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    publishLiveKvResidency(&sch, null, 0);
+    try testing.expectEqual(@as(u64, 0), sch.inflight_generated_tokens.load(.monotonic));
 }

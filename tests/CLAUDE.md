@@ -73,6 +73,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 **Tool calling, thinking, sampling, formats**
 - `test_tool_args.sh`, `test_tool_parsing.sh`, `test_tool_call_parse.sh` argument parsing · `test_tool_response.sh` Gemma 4 round trip
 - `test_tool_choice_required.sh` forced calls · `test_tools_concurrent.sh` per-stream calls under batching
+- `test_tool_call_ids.sh` tool-call ids random, ≥ 22 chars, distinct on every surface
 - `test_tools_long_context.sh` calls at 16-64k · `test_cancel_mid_tool_buffer.sh` disconnect while buffering
 - `test_no_tools_markup_passthrough.sh` no `tools` = raw text · `test_minicpm5_tool_call.sh` MiniCPM5 XML calls
 - `test_thinking_split.sh`, `test_thinking_streaming.sh`, `test_thinking_tools.sh` reasoning/content split
@@ -170,6 +171,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 **Static and release guards** (all **H**)
 - `test_build_env_reaches_tests.sh` a shell variable reaches `zig build test` on a cached configuration
 - `test_release_workflow_gates.sh` release.yml + app/build.sh · `test_release.sh` release.sh · `test_resource_xattrs.sh`
+- `test_ci_changes.sh` which CI jobs a PR runs (`scripts/ci-changes.sh`), and that every repo file a Swift test reads keeps the Swift job on
 - `test_dev_version.sh` a source build stamps the newest release tag behind HEAD (`scripts/dev-version.sh`)
 - `test_model_card_frontmatter.sh` converter model cards · `test_website_pages.sh` · `website_benchmarks_logic.mjs`, `website_tier_list_logic.mjs`
 
@@ -180,7 +182,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `MLX_SERVE_DIAG=vqmm-fn-ubench zig build test -Doptimize=ReleaseFast -Dtest-filter="Flash Next shapes µbench"` verify-lane prices
 
 **Converters, pack tools, calibration** (user-run; the header names inputs and the bar)
-- `convert_{acestep_weights,dsv4_weights,hunyuan3d_weights,hunyuan3d_paint_weights,idol_weights,kev_weights,kokoro_weights,mageflow_weights,mimo_v2,minicpmv4_7,minimax_h3_weights,moss_image_weights,nemotron_lilicorr,nemotron_transcribe,qwen38_flash_next,qwen38_iq,qwen_image21_weights,trellis2_pixal3d,yue2}.py`
+- `convert_{acestep_weights,dsv4_weights,hunyuan3d_weights,hunyuan3d_paint_weights,idol_weights,inkling2,kev_weights,kokoro_weights,mageflow_weights,mimo_v2,minicpmv4_7,minimax_h3_weights,moss_image_weights,nemotron_lilicorr,nemotron_transcribe,qwen38_flash_next,qwen38_iq,qwen_image21_weights,trellis2_pixal3d,yue2}.py`
 - `fetch_convert_dsv4_0731.py`, `fetch_convert_minimax_h3_ref2va.py` disk-safe fetch+convert · `graft_qwen_image21_vision.py`
 - `requant_qwen4_pack.py`, `restandardize_qwen38_pack.py` repack in place · `verify_nemotron_lilicorr.py`
 - `test_convert_{minicpmv4_7,minimax_h3_image,minimax_h3_omni,nemotron_lilicorr,qwen38_flash_next_bf16}.py` **H** converter checks (mlx or torch)
@@ -189,7 +191,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 
 **Reference oracles** (write fixtures for env-gated Zig parity tests; each header names its test)
 - `dump_*_fixtures.py` / `dump_*_fixture.py`, one per port: acestep, csf32, d1, dflash, dflash2, dsv41 (+ token map, vision),
-  embeddinggemma (+ 2, 2 media), flint, glm5_next (+ vision), h3_vsa, hunyuan3d (+ paint), idol, inkling, kev, kokoro, krea,
+  embeddinggemma (+ 2, 2 media), flint, glm5_next (+ vision), h3_vsa, hunyuan3d (+ paint), idol, inkling, inkling2_dflash2, kev, kokoro, krea,
   laguna, latent_rgb_factors, laya (+ numeric), lfm2_vision, lilicorr, ltx (audio, audio encoder, diffvae, upsampler, vae
   encoder), mageflow (dit, e2e, edit e2e, te, te edit, vae, vae encoder, vit), mimo_v2, minicpmv4_7_vision, minimax_h3
   (+ layout, vision, vision tower, vae encoder, audio encoder, flash), moss_image, muse_vision, music3, nemotron_diarization,

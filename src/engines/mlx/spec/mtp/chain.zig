@@ -9,6 +9,7 @@ const tokenizer_mod = @import("../../../../sdk/tokenizer/tokenizer.zig");
 const model_mod = @import("../../../../sdk/config/model.zig");
 const log = @import("../../../../sdk/util/log.zig");
 const mtp_lookup = @import("../mtp_lookup.zig");
+const plugin_driver = @import("../../plugin/driver.zig");
 const mtp_mod = @import("../../../../sdk/spec/mtp/mtp.zig");
 const mtp_acceptance = @import("../../../../sdk/spec/mtp_acceptance.zig");
 const group_planner = @import("../mtp_group_planner.zig");
@@ -311,10 +312,18 @@ pub fn mtpRoundAcceptObserve(self: *Generator, lookup: bool, drafted: u32, accep
 }
 
 /// The committed-token index, synced to `generated_ids`.
+/// Tokens of an earlier answer a repeated request's lookups read at most.
+const MAX_EARLIER_ANSWER: usize = 8192;
+
 pub fn mtpLookupIndex(self: *Generator, allocator: std.mem.Allocator) !*mtp_lookup.Index {
     if (self.mtp_lookup_idx == null) {
         var idx = mtp_lookup.Index.init(allocator);
         errdefer idx.deinit();
+        // A served drafter's request that repeats an earlier one copies from that one's answer too, indexed first so
+        // the tail a lookup keys on stays this request's (`SamplingParams.repeats`: not one that must answer the same).
+        if (!self.sampling.repeats())
+            if (plugin_driver.adoptFor(self.xfm, self.prompt_ids_owned)) |a| if (a.len >= self.prompt_ids_owned.len)
+                try idx.extend(a.tail[0..@min(a.tail.len, MAX_EARLIER_ANSWER)]);
         try idx.extend(self.prompt_ids_owned);
         self.mtp_lookup_idx = idx;
         self.mtp_lookup_gen = 0;

@@ -841,6 +841,9 @@ test "verify rollback permits in-place KV append and restores its valid prefix" 
             defer _ = mlx.mlx_vector_array_free(vec);
             inline for (.{ "keys", "values", "keys_scales", "keys_biases", "values_scales", "values_biases" }) |field| _ = mlx.mlx_vector_array_append_value(vec, @field(entry, field));
             try mlx.check(mlx.mlx_eval(vec));
+            // MLX drops an eval's input buffers in its command buffer's completion handler; until that ran, the next
+            // append sees a second reference and copies instead of donating (seen under a loaded GPU).
+            try mlx.check(mlx.mlx_synchronize(mlx.gpuStream()));
         }
     };
     try Eval.buffers(&cache.entries[0]);

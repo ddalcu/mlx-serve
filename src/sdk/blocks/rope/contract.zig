@@ -518,7 +518,7 @@ pub fn register(set: *kc.Set) !void {
 // ── tests ──
 
 test "kernel contract rope: each declared launch is the shipped wrapper's, byte for byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     qk.qk_fused_override = true;
     defer qk.qk_fused_override = null;

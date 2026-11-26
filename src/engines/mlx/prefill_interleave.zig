@@ -20,6 +20,8 @@ const Slot = @import("slot.zig").Slot;
 const mtpCrowdThresholdFor = @import("spec/mtp_groups.zig").mtpCrowdThresholdFor;
 const SpecTickMode = @import("spec/wiring.zig").SpecTickMode;
 const dspark_group = @import("spec/dspark_group.zig");
+const native_group = @import("spec/native_group.zig");
+const plugin_driver = @import("plugin/driver.zig");
 const slotSpecMode = @import("spec/wiring.zig").slotSpecMode;
 const prefillAdmitted = @import("step.zig").prefillAdmitted;
 const AdmitOutcome = @import("step.zig").AdmitOutcome;
@@ -74,6 +76,11 @@ fn modelCompany(active: anytype, s: anytype, groupable: anytype) Company {
     return c;
 }
 
+/// Whether `slot` ticks speculative rounds as part of a group round (DSpark's module groups, a served drafter's).
+fn groupRoundSlot(slot: *const Slot) bool {
+    return dspark_group.slotGroupable(slot) or native_group.slotGroupable(slot);
+}
+
 /// The first request of a burst was admitted alone, so it armed speculation and ticks
 /// serial beside the group; once company is steady it yields.
 pub fn specYieldTick(active: []const *Slot) void {
@@ -86,7 +93,11 @@ pub fn specYieldTick(active: []const *Slot) void {
             s.company_ticks = 0;
             continue;
         };
-        const company = modelCompany(active, s, dspark_group.slotGroupable);
+        var company = modelCompany(active, s, groupRoundSlot);
+        // More slots than a served drafter's group carries to each one's benefit decode plain in the batched group.
+        if (s.model.transformer) |t| if (native_group.slotGroupable(s) and company.others + 1 > plugin_driver.nativeGroupWidth(t)) {
+            company.dspark = false;
+        };
         if (!yieldsToCompany(mode, mlx.cudaAvailable(), s.model.config.?.isMoe(), company.others, mtpCrowdThresholdFor(s), company.dspark)) {
             s.company_ticks = 0;
             continue;
@@ -335,12 +346,7 @@ fn admitSmallAtBoundary(ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget,
         slot.boundary_max_tail = if (priority) PRIORITY_MAX_TAIL else BOUNDARY_MAX_TAIL;
         sch.boundary_depth += 1;
         sch.boundary_outer = ic.slot;
-        const saved_tokens = sch.inflight_prefill_tokens.load(.monotonic);
-        const saved_expected = sch.inflight_prefill_expected.load(.monotonic);
         const outcome = prefill(sch, slot);
-        // runPrefill zeroes the progress gauges on exit; the outer prefill's go back.
-        sch.inflight_prefill_tokens.store(saved_tokens, .monotonic);
-        sch.inflight_prefill_expected.store(saved_expected, .monotonic);
         sch.boundary_outer = null;
         sch.boundary_depth -= 1;
         slot.boundary_max_tail = null;
@@ -607,12 +613,17 @@ pub fn interleaveDecodeTick(sch: *Scheduler) u64 {
     if (n == 0) return 0;
     invalidateDecodeClocks(buf[0..n]);
     var sw = io_util.Stopwatch.init(sch.io);
+    const outer_tick = sch.decode_tick;
+    sch.decode_tick = sw;
     runDecodeTick(sch, buf[0..n]) catch |err| {
         log.err("[interleave] decode tick failed: {s}\n", .{if (err == error.EngineFailed) err_name.last() else @errorName(err)});
         for (buf[0..n]) |s| s.markError(@errorName(err));
     };
+    sch.decode_tick = outer_tick;
     const tick_ns = sw.read();
-    for (buf[0..n]) |s| s.decode_ns +|= tick_ns;
+    for (buf[0..n]) |s| {
+        if (!s.finished) s.decode_ns +|= tick_ns;
+    }
     return tick_ns;
 }
 

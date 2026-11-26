@@ -1700,3 +1700,31 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     try t.expectEqual(@as(u64, 10_774), (before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) / mb);
     try t.expect((before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) > available);
 }
+
+// Bar: a plugin's state per token (inkling2's draft context) is billed where the engine knows none: per context token
+// in a session, per prompt token at admission; the engine's own QSA term stays its own.
+test "a plugin's state per token joins the session and admission bills" {
+    const t = std.testing;
+    const abi = @import("../../../abi/plugin.zig");
+    const Own = struct {
+        fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .state_per_token = 4096 };
+        }
+    };
+    var table: abi.ModelTable = undefined;
+    table.bill = &Own.bill;
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = &table };
+    binding.readBillTerms();
+    const bare: model_mod.ModelConfig = .{ .model_type = "inkling2_loop", .num_hidden_layers = 48, .num_attention_heads = 24, .num_key_value_heads = 8, .head_dim = 128 };
+    var cfg = bare;
+    cfg.plugin = &binding;
+    const sessionBytesPerToken = @import("bills.zig").sessionBytesPerToken;
+    try t.expectEqual(@as(u64, 4096), statePerTokenBilled(&cfg));
+    try t.expectEqual(sessionBytesPerToken(&bare, 16) + 4096, sessionBytesPerToken(&cfg, 16));
+    try t.expectEqual(@as(u64, 20_000 * 4096), prefillRequestTerms(&cfg, 20_000, 1024, 16, 2048, .{}).state_bytes);
+    try t.expectEqual(@as(u64, 0), prefillRequestTerms(&bare, 20_000, 1024, 16, 2048, .{}).state_bytes);
+    var qwen4 = qwen4ExpLive364kConfig();
+    const own = statePerTokenBilled(&qwen4);
+    qwen4.plugin = &binding;
+    try t.expectEqual(own, statePerTokenBilled(&qwen4));
+}

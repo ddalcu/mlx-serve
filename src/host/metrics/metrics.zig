@@ -189,6 +189,9 @@ pub const Metrics = struct {
     usage_other: ModelUsage,
     usage_count: std.atomic.Value(u32),
     usage_lock: std.atomic.Mutex,
+    /// Brackets of `finish.moveSlotTokens`; `liveGenerationTokens` retakes a sample that overlaps one.
+    token_moves_begun: std.atomic.Value(u64) = .init(0),
+    token_moves_done: std.atomic.Value(u64) = .init(0),
 
     pub fn init() Metrics {
         return .{
@@ -287,7 +290,8 @@ pub const Metrics = struct {
 
     /// Record per-request metrics once per request that owned a slot.
     ///
-    /// `.success`: updates all latency histograms, token histograms, and counters.
+    /// `.success`: updates all latency histograms, token histograms, and counters but `generation_tokens_total`,
+    /// which the caller adds; returns true.
     ///
     /// `.cancelled`: only increments `requests_cancelled_total`. Latency
     /// histograms are NOT touched: a cancelled slot's decode_ns is zero or
@@ -315,7 +319,7 @@ pub const Metrics = struct {
         completion_tokens: u32,
         cached_tokens: u32,
         model: []const u8,
-    ) void {
+    ) bool {
         // Wire prefix-cache stats unconditionally: every request queries the cache.
         self.prefix_cache_queries_total.inc();
         if (cached_tokens > 0) self.prefix_cache_hits_total.inc();
@@ -324,11 +328,11 @@ pub const Metrics = struct {
             .success => {},
             .cancelled => {
                 self.requests_cancelled_total.inc();
-                return;
+                return false;
             },
             .failed => {
                 self.requests_failed_total.inc();
-                return;
+                return false;
             },
         }
 
@@ -340,7 +344,6 @@ pub const Metrics = struct {
         const restored = @min(cached_tokens, prompt_tokens);
         self.prefill_tokens_total.add(prompt_tokens - restored);
         self.prefix_cache_tokens_total.add(restored);
-        self.generation_tokens_total.add(completion_tokens);
 
         const u = self.usageFor(model);
         u.requests.inc();
@@ -358,17 +361,34 @@ pub const Metrics = struct {
 
         self.prompt_tokens_hist.observe(@as(u64, prompt_tokens));
         self.output_tokens_hist.observe(@as(u64, completion_tokens));
+        return true;
+    }
+
+    pub fn beginTokenMove(self: *Metrics) void {
+        _ = self.token_moves_begun.fetchAdd(1, .seq_cst);
+    }
+
+    pub fn endTokenMove(self: *Metrics) void {
+        _ = self.token_moves_done.fetchAdd(1, .seq_cst);
     }
 };
 
-/// Pure: the live-tokens gauge value = completed generation tokens PLUS the
+/// The live-tokens gauge value = completed generation tokens PLUS the
 /// tokens generated so far by still-decoding slots. The scheduler publishes the
 /// in-flight aggregate (`inflight_generated_tokens`) once per decode tick; the
 /// sampler thread calls this each tick to set `generation_tokens_live`. Kept
 /// here (not inline in the sampler) so the arithmetic is unit-testable and the
 /// "at rest ⇒ live == total" invariant is pinned without a running server.
-pub fn liveGenerationTokens(m: *const Metrics, inflight: u64) u64 {
-    return m.generation_tokens_total.load() + inflight;
+/// A sample that overlaps a token move would count the moving request twice or not at all, so it is
+/// retaken.
+pub fn liveGenerationTokens(m: *const Metrics, inflight: []const *const std.atomic.Value(u64)) u64 {
+    while (true) {
+        const done = m.token_moves_done.load(.seq_cst);
+        var sum = m.generation_tokens_total.value.load(.seq_cst);
+        for (inflight) |src| sum += src.load(.seq_cst);
+        if (m.token_moves_begun.load(.seq_cst) == done) return sum;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -830,12 +850,16 @@ test "liveGenerationTokens = total + inflight aggregate" {
     const testing = std.testing;
     var m = Metrics.init();
     m.generation_tokens_total.add(100);
+    var inflight = std.atomic.Value(u64).init(30);
+    var engine = std.atomic.Value(u64).init(7);
     // Live gauge = completed (100) + in-flight aggregate (37) published by the
     // scheduler once per decode tick.
-    try testing.expectEqual(@as(u64, 137), liveGenerationTokens(&m, 37));
+    try testing.expectEqual(@as(u64, 137), liveGenerationTokens(&m, &.{ &inflight, &engine }));
     // At rest (nothing decoding ⇒ inflight aggregate 0) the live gauge must
     // equal the completion counter — the invariant test_metrics.sh checks.
-    try testing.expectEqual(@as(u64, 100), liveGenerationTokens(&m, 0));
+    inflight.store(0, .monotonic);
+    engine.store(0, .monotonic);
+    try testing.expectEqual(@as(u64, 100), liveGenerationTokens(&m, &.{ &inflight, &engine }));
 }
 
 test "prefill throughput must exclude cache-restored tokens" {
@@ -847,7 +871,7 @@ test "prefill throughput must exclude cache-restored tokens" {
     // a 91% token-level cache hit rate reported 9.8K tok/s where the server's
     // own log line said ~220-1100. The panel needs the FORWARDED token count.
     var m = Metrics.init();
-    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 1000, 50, 900, "m");
+    _ = m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 1000, 50, 900, "m");
 
     // vLLM semantics preserved: every prompt token is billed.
     try testing.expectEqual(@as(u64, 1000), m.prompt_tokens_total.load());
@@ -862,12 +886,12 @@ test "prefill throughput must exclude cache-restored tokens" {
     );
 
     // A cold request (no cache hit) forwards everything.
-    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 400, 10, 0, "m");
+    _ = m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 400, 10, 0, "m");
     try testing.expectEqual(@as(u64, 500), m.prefill_tokens_total.load());
     try testing.expectEqual(@as(u64, 900), m.prefix_cache_tokens_total.load());
 
     // Degenerate: cached >= prompt must saturate (restore 10, not 99) and never wrap.
-    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 10, 1, 99, "m");
+    _ = m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 10, 1, 99, "m");
     try testing.expectEqual(@as(u64, 500), m.prefill_tokens_total.load());
     try testing.expectEqual(@as(u64, 910), m.prefix_cache_tokens_total.load());
     // Invariant survives the saturation.
@@ -995,12 +1019,12 @@ test "Metrics.recordRequest increments correct fields on success" {
     const testing = std.testing;
     var m = Metrics.init();
     // real_ttft=60ms (includes 10ms queue wait + 50ms prefill), prefill=50ms, decode=200ms
-    m.recordRequest(.success, 60_000_000, 50_000_000, 200_000_000, 128, 64, 20, "m");
+    try testing.expect(m.recordRequest(.success, 60_000_000, 50_000_000, 200_000_000, 128, 64, 20, "m"));
 
     try testing.expectEqual(@as(u64, 1), m.requests_success_total.load());
     try testing.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
     try testing.expectEqual(@as(u64, 128), m.prompt_tokens_total.load());
-    try testing.expectEqual(@as(u64, 64), m.generation_tokens_total.load());
+    try testing.expectEqual(@as(u64, 0), m.generation_tokens_total.load());
     // TTFT histogram got one observation (60ms)
     try testing.expectEqual(@as(u64, 1), m.ttft_ns.count.load(.monotonic));
     try testing.expectEqual(@as(u64, 60_000_000), m.ttft_ns.sum.load(.monotonic));
@@ -1022,7 +1046,7 @@ test "Metrics.recordRequest increments correct fields on success" {
 test "Metrics.recordRequest skips histograms on cancelled request" {
     const testing = std.testing;
     var m = Metrics.init();
-    m.recordRequest(.cancelled, 50_000_000, 50_000_000, 0, 128, 0, 0, "m");
+    try testing.expect(!m.recordRequest(.cancelled, 50_000_000, 50_000_000, 0, 128, 0, 0, "m"));
 
     try testing.expectEqual(@as(u64, 0), m.requests_success_total.load());
     try testing.expectEqual(@as(u64, 1), m.requests_cancelled_total.load());
@@ -1305,7 +1329,7 @@ test "process_start_time_seconds is exposed as a gauge in both feeds" {
 test "Metrics.recordRequest counts a failed request and leaves histograms and token counters alone" {
     const testing = std.testing;
     var m = Metrics.init();
-    m.recordRequest(.failed, 50_000_000, 50_000_000, 100_000_000, 128, 5, 0, "m");
+    try testing.expect(!m.recordRequest(.failed, 50_000_000, 50_000_000, 100_000_000, 128, 5, 0, "m"));
 
     try testing.expectEqual(@as(u64, 1), m.requests_failed_total.load());
     try testing.expectEqual(@as(u64, 0), m.requests_success_total.load());
@@ -1327,7 +1351,7 @@ test "Metrics.recordRejected moves only the rejected counter" {
 test "failed and rejected counters render under their Prometheus and JSON names" {
     const testing = std.testing;
     var m = Metrics.init();
-    m.recordRequest(.failed, 0, 0, 0, 1, 0, 0, "m");
+    _ = m.recordRequest(.failed, 0, 0, 0, 1, 0, 0, "m");
     m.recordRejected();
     m.recordRejected();
 
@@ -1351,12 +1375,13 @@ test "failed and rejected counters render under their Prometheus and JSON names"
 test "per-model usage rows carry each model's tokens and add up to the global counters" {
     const testing = std.testing;
     var m = Metrics.init();
-    m.recordRequest(.success, 60_000_000, 50_000_000, 200_000_000, 128, 64, 20, "org/a");
-    m.recordRequest(.success, 10_000_000, 5_000_000, 100_000_000, 40, 10, 0, "org/b \"q\"");
-    m.recordRequest(.success, 10_000_000, 5_000_000, 100_000_000, 10, 6, 10, "org/a");
+    _ = m.recordRequest(.success, 60_000_000, 50_000_000, 200_000_000, 128, 64, 20, "org/a");
+    _ = m.recordRequest(.success, 10_000_000, 5_000_000, 100_000_000, 40, 10, 0, "org/b \"q\"");
+    _ = m.recordRequest(.success, 10_000_000, 5_000_000, 100_000_000, 10, 6, 10, "org/a");
     // A cancelled or failed request holds no tokens in the global counters, so it holds none in a model's row.
-    m.recordRequest(.cancelled, 1, 1, 1, 999, 999, 0, "org/a");
-    m.recordRequest(.failed, 1, 1, 1, 999, 999, 0, "org/c");
+    _ = m.recordRequest(.cancelled, 1, 1, 1, 999, 999, 0, "org/a");
+    _ = m.recordRequest(.failed, 1, 1, 1, 999, 999, 0, "org/c");
+    m.generation_tokens_total.add(64 + 10 + 6);
 
     var buf: [64 * 1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -1395,7 +1420,7 @@ test "a model past the table's capacity folds into an other row, so the split st
     var m = Metrics.init();
     var name: [16]u8 = undefined;
     const models = MAX_USAGE_MODELS + 5;
-    for (0..models) |i| m.recordRequest(.success, 1, 1, 1, 10, 5, 0, std.fmt.bufPrint(&name, "model-{d}", .{i}) catch unreachable);
+    for (0..models) |i| _ = m.recordRequest(.success, 1, 1, 1, 10, 5, 0, std.fmt.bufPrint(&name, "model-{d}", .{i}) catch unreachable);
 
     var buf: [64 * 1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);

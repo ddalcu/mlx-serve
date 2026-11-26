@@ -5,6 +5,7 @@ const log = @import("../../../sdk/util/log.zig");
 const testing = std.testing;
 
 const indexOfThinkCloseTag = @import("../reasoning/think_tags.zig").indexOfThinkCloseTag;
+const indexOfChannelCloseTag = @import("../reasoning/think_tags.zig").indexOfChannelCloseTag;
 const INKLING_INVOKE_TAG = @import("../reasoning/inkling.zig").INKLING_INVOKE_TAG;
 const HARMONY_CHANNEL_TAG = @import("../reasoning/harmony.zig").HARMONY_CHANNEL_TAG;
 const stripParametersWrapper = @import("json_infer.zig").stripParametersWrapper;
@@ -37,7 +38,7 @@ const parseMiniCpm5ToolCalls = @import("minicpm5.zig").parseMiniCpm5ToolCalls;
 pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]ParsedToolCall {
     // Strip thinking blocks if present
     var effective_text = text;
-    if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
+    if (indexOfChannelCloseTag(text, 0)) |end| {
         effective_text = std.mem.trimStart(u8, text[end + 10 ..], "\n ");
     } else if (indexOfThinkCloseTag(text, 0)) |close| {
         effective_text = std.mem.trimStart(u8, text[close.pos + close.len ..], "\n ");
@@ -1402,4 +1403,22 @@ test "parseXmlElementToolCall is already dup-key + escape safe (characterization
     defer parsed.deinit();
     try testing.expect(parsed.value == .object);
     try testing.expect(parsed.value.object.get("command") != null);
+}
+
+test "parseToolCalls: a Gemma <channel|> inside a hermes parameter value is payload" {
+    const allocator = testing.allocator;
+    const call = "<tool_call>\n<function=Edit>\n<parameter=file_path>\n/x/split.zig\n</parameter>\n<parameter=old_string>\nif (std.mem.indexOf(u8, text, \"<channel|>\")) |end| {\n</parameter>\n<parameter=new_string>\nx\n</parameter>\n</function>\n</tool_call>";
+    for ([_][]const u8{ call, "Reasoning.\n</think>\n\n" ++ call }) |text| {
+        const calls = (try parseToolCalls(allocator, text)) orelse return error.TestUnexpectedResult;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("Edit", calls[0].name);
+        try testing.expect(std.mem.indexOf(u8, calls[0].arguments, "<channel|>") != null);
+    }
 }
