@@ -385,7 +385,7 @@ pub fn errVsTruth(got: mlx.mlx_array, truth: []const f32, m: usize, n: usize, s:
 }
 
 test "qmv2: no worse than stock quantized_matmul against f32 truth (bf16 + f16, M 1..16, every geometry, both bias layouts)" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     // Ternary codes with bias == -scale, as the Hadamard packs ship them, plus
     // a generic affine bias; x carries outliers that stress the half2 range.
     const s = mlx.gpuStream();

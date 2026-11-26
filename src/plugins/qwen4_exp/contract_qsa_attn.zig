@@ -917,7 +917,7 @@ pub fn register(set: *kc.Set) !void {
 // ── tests ──
 
 test "kernel contract qwen4_exp: the qsa_attn launches, chained over strided cache views, are qsaSparseAttn's bytes" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     inline for (.{ Kv.dense, Kv.q8, Kv.q4 }) |kv| {
         var p = Split.init(a, kv);

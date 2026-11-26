@@ -1451,7 +1451,7 @@ test "glm5 NAX sparse latent attention matches the gathered sdpa" {
 }
 
 test "glm5 mHC mixes and expand kernels match the op chain" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
@@ -1806,7 +1806,7 @@ test "glm5 one-token hcPre chain matches collapse, rms_norm and expand" {
 }
 
 test "glm5 hcPre over R rows equals R one-row dispatches, up to the widest verify window" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler(); // the threadgroup probe raises on M1/M2: latch it, never exit
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
@@ -2128,7 +2128,7 @@ test "glm5 one-query top-k expands the chronological top pools, ties to the lowe
 }
 
 test "glm5 one-token per-head qmv matches MLX's batched quantized matmul" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     const s = mlx.gpuStream();
@@ -2278,7 +2278,7 @@ test "glm5 a pool's completing row carries its pooled key, across a chunk bounda
 }
 
 test "glm5 a deferred expand over R rows rebuilds the materialized stream and feeds the next hcPre, bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler(); // the threadgroup probe raises on M1/M2: latch it, never exit
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);

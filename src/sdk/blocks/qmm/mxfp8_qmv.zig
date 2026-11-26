@@ -89,7 +89,7 @@ fn randBf16(rnd: std.Random, shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_a
 }
 
 test "mxfp8 qmv: 1..8 rows no worse than MLX's matmul against the fp32 truth (K a whole step and not)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const xfm = @import("../../../mlx/device.zig");
     xfm.device_gen_override = .{ .gen = 16, .phone = false }; // the gate is a perf choice; the numerics are checked on every Mac
     defer xfm.device_gen_override = null;

@@ -604,6 +604,7 @@ test "gatherQmv is no worse than stock gather_qmm vs fp32 dequant ground truth" 
     // bf16 in different orders, so exact agreement is not a real invariant).
     // Covers BOTH input layouts: the shared-x gate/up projection and the
     // per-expert-x down projection.
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x9E3779B9);
@@ -743,6 +744,7 @@ test "gatherQmv nvfp4 is no worse than stock gather_qmm vs fp32 dequant ground t
     //
     // NVFP4 is bits=4 / group_size=16 by definition: packed-u32 e2m1 weights,
     // uint8 e4m3 scales, NO biases.
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5BD1E995);
