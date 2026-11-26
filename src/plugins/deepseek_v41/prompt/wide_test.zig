@@ -2236,6 +2236,9 @@ fn servedRoute(sv: Served, r: Route, salt: usize) ![4]usize {
 
 test "dsv41 wide: on NAX at the release's defaults every prompt-attention call of a served request takes a lossless core (flash, the gather or the f32 chain), never the f16 core: first turns of 18, 100, 200 and 450 tokens (the CED replay), a cached-prefix turn to 700, rewinds of 600 and 12 rows, 200-row chunks, prompt logprobs, FLASH_ATTN=1 named; the fall-through before attnCore (planted) takes the f16 core" {
     if (skip()) return error.SkipZigTest;
+    // Its routes are ATTN_F16's lossless default (=0): declared, so a flip of that lever cannot reach it.
+    const no_f16 = env.override(.MLX_SERVE_DSV41_ATTN_F16, "0");
+    defer no_f16.restore();
     const saved = fa.ps().*;
     defer fa.ps().* = saved;
     fa.ps().* = .{ .mode = .on, .trim = true };
@@ -2258,6 +2261,9 @@ test "dsv41 wide: on NAX at the release's defaults every prompt-attention call o
 
 test "dsv41 wide: under FLASH_ATTN=0 a served 300-token prompt's spans whose picks are not a multiple of 64 take the f32 chain on NAX, never the f16 core; the fall-through before attnCore (planted) takes the f16 core" {
     if (skip()) return error.SkipZigTest;
+    // Its routes are ATTN_F16's lossless default (=0): declared, so a flip of that lever cannot reach it.
+    const no_f16 = env.override(.MLX_SERVE_DSV41_ATTN_F16, "0");
+    defer no_f16.restore();
     const saved = fa.ps().*;
     defer fa.ps().* = saved;
     fa.ps().* = .{};
@@ -2281,6 +2287,9 @@ test "dsv41 wide: under FLASH_ATTN=0 a served 300-token prompt's spans whose pic
 
 test "dsv41 wide: a tensor split's prompt-attention calls (32 heads a rank: no gather or flash shape) take the f32 chain on NAX, never the f16 core, one span and wide; the fall-through before attnCore (planted) takes the f16 core" {
     if (skip()) return error.SkipZigTest;
+    // Its routes are ATTN_F16's lossless default (=0): declared, so a flip of that lever cannot reach it.
+    const no_f16 = env.override(.MLX_SERVE_DSV41_ATTN_F16, "0");
+    defer no_f16.restore();
     const gpa = testing.allocator;
     const saved = fa.ps().*;
     defer fa.ps().* = saved;
