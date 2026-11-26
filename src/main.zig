@@ -164,8 +164,9 @@ fn printUsage(io: std.Io) void {
         \\Options:
         \\  --model <dir>       Path to MLX model directory
         \\  --serve             Start HTTP server mode (the default unless --prompt)
-        \\  --host <ip>         Bind address (default: 0.0.0.0 — open to the local
-        \\                      network; a future version will default to 127.0.0.1)
+        \\  --host <ip>         IPv4 bind address or localhost (default: 0.0.0.0 —
+        \\                      open to the local network; a future version will
+        \\                      default to 127.0.0.1)
         \\  --port <n>          Bind port (default: 11234)
         \\  --ctx-size <n>      Maximum context length (default: model max)
         \\  --config-overrides <json>   JSON object deep-merged into EVERY
@@ -778,6 +779,10 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             host = args[i];
             host_explicit = true;
+            if (server_mod.parseIp4(host) == null) {
+                log.err("--host takes an IPv4 address or localhost, got '{s}'\n", .{host});
+                std.process.exit(1);
+            }
         } else if (std.mem.eql(u8, args[i], "--serve")) {
             serve_mode = true;
         } else if (std.mem.eql(u8, args[i], "--stream")) {

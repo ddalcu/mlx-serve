@@ -374,6 +374,11 @@ pub var max_concurrent: u32 = 1;
 /// — they all funnel into `handleEmbeddings`).
 pub var embedding_max_length: u32 = 0;
 
+/// Start the HTTP server on the given host and port.
+///
+/// `cfg` carries all process-wide defaults (context size, timeouts, PLD
+/// defaults, reasoning budget). It's copied into the module-level
+/// `server_config` before the listen loop starts.
 pub fn serve(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -399,7 +404,7 @@ pub fn serve(
     //    to the inference thread's GPU stream.
     // Bound before the startup load, which can take minutes (a first Neural Engine compile):
     // until it ends, `StartupResponder` answers in place of the accept loop below.
-    const ip_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = parseIp4(host), .port = port } };
+    const ip_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = parseIp4(host) orelse return error.InvalidHost, .port = port } };
     var server = listenExclusive(io, ip_addr) catch |err| {
         if (err == error.AddressInUse) log.err("Port {d} is already in use — another mlx-serve instance may be running.\n", .{port});
         return err;
