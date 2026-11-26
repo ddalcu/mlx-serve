@@ -288,11 +288,31 @@ fn matrixCase(sh: Shape, v: Variant, seed: u64) !void {
     }
 }
 
-test "gqmv fp4 matrix: every kernel x {NVFP4, NVFP4 scaled, clamped} equals MLX's composed ops bit for bit" {
+/// Every variant at shape `si`, each seeded as it always was.
+fn matrixShape(si: usize) !void {
     if (skip()) return error.SkipZigTest;
-    for (shapes, 0..) |sh, si| for (variants, 0..) |v, vi| {
-        try matrixCase(sh, v, 0x6F40 + si * 16 + vi);
-    };
+    for (variants, 0..) |v, vi| try matrixCase(shapes[si], v, 0x6F40 + si * 16 + vi);
+}
+
+comptime {
+    if (shapes.len != 4) @compileError("gqmv fp4 matrix: one test per shape below");
+}
+
+// One test per shape, so the shards spread them.
+test "gqmv fp4 matrix: every kernel x {NVFP4, NVFP4 scaled, clamped} equals MLX's composed ops bit for bit [contract]" {
+    try matrixShape(0);
+}
+
+test "gqmv fp4 matrix: every kernel x {NVFP4, NVFP4 scaled, clamped} equals MLX's composed ops bit for bit [contract down]" {
+    try matrixShape(1);
+}
+
+test "gqmv fp4 matrix: every kernel x {NVFP4, NVFP4 scaled, clamped} equals MLX's composed ops bit for bit [GLM-5.3 Pro]" {
+    try matrixShape(2);
+}
+
+test "gqmv fp4 matrix: every kernel x {NVFP4, NVFP4 scaled, clamped} equals MLX's composed ops bit for bit [DeepSeek-V4.1-Flash]" {
+    try matrixShape(3);
 }
 
 // ── edge codes ──
