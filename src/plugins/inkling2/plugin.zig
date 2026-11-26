@@ -66,8 +66,11 @@ pub const Spec = struct {
     visits: []const u32,
     /// Rows kept: the drafter's window less the block's anchor.
     keep: c_int,
-    /// `[1, n, taps * hidden]` and the position after its last row.
+    /// Pre-allocated slack ring `[1, cap, taps * hidden]`, live window `[ring_start..ring_len)` (at most `keep` rows),
+    /// and the position after its last row.
     ring: Array = .{},
+    ring_start: c_int = 0,
+    ring_len: c_int = 0,
     end: u64 = 0,
     /// The drafter's context keys and values projected from the ring, parked and released with it.
     context: draft.ContextKv = .{},
@@ -88,7 +91,7 @@ pub const Spec = struct {
     /// Set when a drafter layer attends every committed position: a push hands it each forward's rows, all of them.
     full: ?*const draft.Drafter = null,
 
-    const Parked = struct { owner: u32 = 0, ring: Array = .{}, end: u64 = 0, at: u64 = 0, context: draft.ContextKv = .{}, calib: rounds.Calibration = .{ .head = true }, tree_calib: TreeCalib = .{} };
+    const Parked = struct { owner: u32 = 0, ring: Array = .{}, ring_start: c_int = 0, ring_len: c_int = 0, end: u64 = 0, at: u64 = 0, context: draft.ContextKv = .{}, calib: rounds.Calibration = .{ .head = true }, tree_calib: TreeCalib = .{} };
 
     /// Makes slot `from`'s ring slot `slot`'s, valid for the positions before `agree` (`Forward.adopt_slot`): a new
     /// request that repeats `from`'s sequence that far continues its drafter.
@@ -117,8 +120,10 @@ pub const Spec = struct {
             if (theirs.ring.ctx != null) _ = mlx.mlx_array_free(theirs.ring);
             theirs.context.release();
         }
-        sp.parked[to] = .{ .owner = sp.owner, .ring = sp.ring, .end = sp.end, .at = sp.clock, .context = sp.context, .calib = sp.calib, .tree_calib = sp.tree_calib };
+        sp.parked[to] = .{ .owner = sp.owner, .ring = sp.ring, .ring_start = sp.ring_start, .ring_len = sp.ring_len, .end = sp.end, .at = sp.clock, .context = sp.context, .calib = sp.calib, .tree_calib = sp.tree_calib };
         sp.ring = if (found) theirs.ring else .{};
+        sp.ring_start = if (found) theirs.ring_start else 0;
+        sp.ring_len = if (found) theirs.ring_len else 0;
         sp.end = if (found) theirs.end else 0;
         sp.context = if (found) theirs.context else .{};
         sp.calib = if (found) theirs.calib else .{ .head = true };
@@ -128,33 +133,74 @@ pub const Spec = struct {
 
     /// The context rows before `position`; 0 when the ring ends elsewhere.
     pub fn rows(sp: *const Spec, position: u64) c_int {
-        return if (sp.ring.ctx != null and sp.end == position) ops.shape(sp.ring)[1] else 0;
+        return if (sp.ring.ctx != null and sp.ring_len > sp.ring_start and sp.end == position) sp.ring_len - sp.ring_start else 0;
     }
 
-    /// The taps of the rows from `first` on (`parts` side by side): they extend the ring or restart it.
+    /// Zero-copy view of the live window `[1, ring_len - ring_start, taps * hidden]`.
+    pub fn ringView(sp: *const Spec, g: *ops.Graph) !Array {
+        return g.sliceAxis(sp.ring, 1, sp.ring_start, sp.ring_len);
+    }
+
+    /// The taps of the rows from `first` on (`parts` side by side): they extend the ring in place or compact/restart it.
     fn push(sp: *Spec, g: *ops.Graph, first: u64, parts: []const ops.Array) !void {
         const n = ops.shape(parts[0])[1];
+        if (n == 0) return;
+        const used = sp.ring_len - sp.ring_start;
         // An adopted ring the request repeats past `first` is cut back to it, its newest rows a later turn's.
-        if (sp.ring.ctx != null and first < sp.end and first <= sp.agree and sp.end - first < ops.shape(sp.ring)[1]) {
-            const cut = try g.contiguous(try g.sliceAxis(sp.ring, 1, 0, ops.shape(sp.ring)[1] - @as(c_int, @intCast(sp.end - first))));
-            _ = mlx.mlx_array_free(sp.ring);
-            sp.ring = g.escape(cut);
+        if (sp.ring.ctx != null and used > 0 and first < sp.end and first <= sp.agree and sp.end - first < used) {
+            sp.ring_len -= @intCast(sp.end - first);
             sp.end = first;
             sp.context.cut(first);
         }
         sp.agree = 0;
         const continues = sp.rows(first) > 0;
-        if (!continues) sp.context.release();
+        if (!continues) {
+            sp.context.release();
+            sp.ring_start = 0;
+            sp.ring_len = 0;
+        }
         if (sp.full) |d| try d.appendFull(g, &sp.context, parts, first);
         const taps = try draft.Drafter.sideBySide(g, parts, @max(0, n - sp.keep), n);
-        var all = if (continues) try g.concat(&.{ sp.ring, taps }, 1) else taps;
-        const total = ops.shape(all)[1];
-        if (total > sp.keep) all = try g.contiguous(try g.sliceAxis(all, 1, total - sp.keep, total));
-        const next = g.escape(all);
-        // Evaluated now: left lazy, each forward would hang another concat off the last.
-        try ops.asyncMany(&.{next});
-        if (sp.ring.ctx != null) _ = mlx.mlx_array_free(sp.ring);
-        sp.ring = next;
+        const tsh = ops.shape(taps);
+        const n_new = tsh[1];
+        const width = tsh[2];
+        const dt = ops.dtype(taps);
+        const slack: c_int = @min(sp.keep, 512);
+        const cap: c_int = sp.keep + slack;
+        const reuse = sp.ring.ctx != null and ops.shape(sp.ring)[1] >= cap and ops.shape(sp.ring)[2] == width and ops.dtype(sp.ring) == dt;
+        var next_start: c_int = undefined;
+        var next_len: c_int = undefined;
+        var next_arr: Array = undefined;
+        if (reuse and sp.ring_len + n_new <= ops.shape(sp.ring)[1]) {
+            // Donate `sp.ring` in place: free the old handle before `asyncMany` so MLX sees refcount 1.
+            const at = sp.ring_len;
+            next_arr = g.escape(try g.sliceUpdate(sp.ring, taps, &.{ 0, at, 0 }, &.{ 1, at + n_new, width }));
+            next_len = at + n_new;
+            next_start = @max(sp.ring_start, next_len - sp.keep);
+            _ = mlx.mlx_array_free(sp.ring);
+            sp.ring = .{};
+        } else {
+            var buf = try g.zeros(&.{ 1, cap, width }, dt);
+            var keep_old: c_int = 0;
+            if (continues and sp.ring_len > sp.ring_start and n_new < sp.keep) {
+                keep_old = @min(sp.ring_len - sp.ring_start, sp.keep - n_new);
+                const tail = try g.sliceAxis(sp.ring, 1, sp.ring_len - keep_old, sp.ring_len);
+                buf = try g.sliceUpdate(buf, tail, &.{ 0, 0, 0 }, &.{ 1, keep_old, width });
+            }
+            buf = try g.sliceUpdate(buf, taps, &.{ 0, keep_old, 0 }, &.{ 1, keep_old + n_new, width });
+            next_arr = g.escape(buf);
+            next_start = 0;
+            next_len = keep_old + n_new;
+            if (sp.ring.ctx != null) {
+                _ = mlx.mlx_array_free(sp.ring);
+                sp.ring = .{};
+            }
+        }
+        // Evaluated now: left lazy, each forward would hang another update off the last.
+        try ops.asyncMany(&.{next_arr});
+        sp.ring = next_arr;
+        sp.ring_start = next_start;
+        sp.ring_len = next_len;
         sp.end = first + @as(u64, @intCast(n));
     }
 
@@ -494,10 +540,11 @@ fn draftWanted(m: *Loaded, o: *Opened) !void {
         for (asking[0..n]) |lane| {
             sp.select(lane.slot);
             const want = lane.want.?;
+            const view = try sp.ringView(g);
             const drafted = if (m.drafter2) |d2|
-                try d2.draft(g, lane.first, want.anchor, sp.ring, @intCast(lane.position), &w.head.lin, w.head.vocab, &sp.context, want.law)
+                try d2.draft(g, lane.first, want.anchor, view, @intCast(lane.position), &w.head.lin, w.head.vocab, &sp.context, want.law)
             else
-                try m.drafter.?.draft(g, lane.first, want.anchor, sp.ring, @intCast(lane.position), &w.head.lin, w.head.vocab, w.head.softcap, &sp.context, want.law);
+                try m.drafter.?.draft(g, lane.first, want.anchor, view, @intCast(lane.position), &w.head.lin, w.head.vocab, w.head.softcap, &sp.context, want.law);
             lane.proposed = try adoptDrafted(g, sp, lane, drafted);
         }
         return;
@@ -510,7 +557,7 @@ fn draftWanted(m: *Loaded, o: *Opened) !void {
         sp.select(lane.slot);
         const want = lane.want.?;
         contexts[k] = sp.context;
-        lanes[k] = .{ .t1 = lane.first, .anchor = want.anchor, .taps = sp.ring, .position = @intCast(lane.position), .cache = &contexts[k], .steps = want.cap };
+        lanes[k] = .{ .t1 = lane.first, .anchor = want.anchor, .taps = try sp.ringView(g), .position = @intCast(lane.position), .cache = &contexts[k], .steps = want.cap };
         temperatures[k] = want.law.?.temperature;
     }
     var blocks: [max_open]draft.Drafter.Block = undefined;
@@ -550,6 +597,7 @@ fn adoptDrafted(g: *ops.Graph, sp: *Spec, lane: *Lane, drafted: draft.Drafter.Bl
 /// Drafts after each of `fs`' tokens (a slot each) and reads their blocks as one forward (or steps plainly): `fo.logits`
 /// are the rows', `rows` a slot.
 fn openGroup(m: *Loaded, fs: []const abi.Forward) !*Opened {
+    kernels.setHost(m.host);
     const w = &m.base.weights;
     const cfg = &w.body.cfg;
     const g = try gpa.create(ops.Graph);
@@ -742,6 +790,7 @@ pub fn treeWidth(n: usize, sampled: bool) u32 {
 /// One DFlash2 round for `1..max_open` lanes, greedy, sampled or mixed (`NativeDrafter.step_group`): the draft tree, its
 /// verify, the accept and the path's commit stay on the GPU, and the host reads one small result a round.
 fn stepGroup(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut) !abi.Verdict {
+    kernels.setHost(m.host);
     const d2 = m.drafter2 orelse return abi.Verdict.refuse(.unsupported, "no dflash2 drafter");
     if (!env.notOff(.MLX_SERVE_INKLING2_TREE) or !mlx.streamIsGpu(m.base.s) or !kernels.enabled())
         return abi.Verdict.refuse(.unsupported, "tree verify disabled");
@@ -805,7 +854,7 @@ fn stepGroup(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut) !abi.V
         tree_lanes[i] = .{
             .t1 = @intCast(t1_ids[i]),
             .anchor = if (n == 1) anchors else try g.sliceAxis(anchors, 0, at, at + 1),
-            .taps = sp.ring,
+            .taps = try sp.ringView(&g),
             .position = @intCast(positions[i]),
             .cache = &contexts[i],
             .temperature = temp,
@@ -965,6 +1014,8 @@ pub const Loaded = struct {
     tap_visits: [config.max_taps]u32 = @splat(0),
     /// The host's command-buffer split, moved per forward (`BufferSplit`).
     split: BufferSplit = .{},
+    /// The host table captured at load, bound into `kernels` for cached GPU launches.
+    host: ?*const anyopaque = null,
 
     /// The block the loaded drafter proposes (the anchor and its masks); 0 = none.
     fn blockWidth(m: *const Loaded) u32 {
@@ -988,12 +1039,14 @@ pub const Loaded = struct {
 fn unload(mp: *anyopaque) callconv(.c) void {
     const m: *Loaded = @ptrCast(@alignCast(mp));
     m.split.follow(false);
+    kernels.clearHost(m.host);
     m.release();
     gpa.destroy(m);
 }
 
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
     const m: *Loaded = @ptrCast(@alignCast(mp));
+    kernels.setHost(m.host);
     if (f.slots.len == 1) {
         const slot = f.slots.slice()[0];
         const from: u32 = if (f.size >= @offsetOf(abi.Forward, "adopt_len") + @sizeOf(u64)) f.adopt_slot else 0;
@@ -1434,7 +1487,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         m.tap_visits = dc.taps;
         m.spec = .{ .visits = m.tap_visits[0 .. dc.tap_count - 1], .keep = @intCast(dc.window - 1) };
         m.base.weights.spec = &m.spec;
-    } else if (drafts_on) if (c.draft) |dc| if (try draft.Drafter.load(ctx, dc, c.hidden_size, &head, r.s)) |d| {
+    } else if (drafts_on) if (c.draft) |dc| if (try draft.Drafter.load(ctx, dc, c.hidden_size, &head, r.s, draft_bits)) |d| {
         m.drafter = d;
         m.tap_visits = dc.taps;
         m.spec = .{ .visits = m.tap_visits[0 .. dc.tap_count - 1], .keep = @intCast(dc.window - 1) };
@@ -1444,6 +1497,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     // The parse's quant block is freed with it; the forward reads none of it.
     m.base.weights.body.cfg.block_json = "{}";
     m.split = BufferSplit.of(ctx.host);
+    m.host = ctx.host;
+    kernels.setHost(ctx.host);
 
     return m;
 }
@@ -1736,6 +1791,55 @@ test "inkling2 draft taps: an adopted ring continues from the positions its sequ
     // The adopted slot's ring moved: slot 8 holds none now.
     sp.select(8);
     try std.testing.expectEqual(@as(c_int, 0), sp.rows(7));
+}
+
+// Bar: the slack ring buffer retains exact row values across in-place appends, periodic compaction, cut, park/select
+// and restart.
+test "inkling2 draft taps: slack ring retains exact rows across wraparound, compaction, cut and park" {
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    var sp: Spec = .{ .visits = &.{}, .keep = 4 };
+    defer sp.deinit();
+    sp.select(1);
+    // Push 13 distinct rows (past keep=4 and cap=keep+slack=8, forcing compaction twice).
+    for (0..13) |i| {
+        const v: f32 = @floatFromInt(i + 1);
+        const row = try g.fromSlice(f32, &.{ v, v * 10.0 }, &.{ 1, 1, 2 });
+        try sp.push(&g, @intCast(i), &.{row});
+        try std.testing.expectEqual(@as(c_int, @intCast(@min(i + 1, 4))), sp.rows(@intCast(i + 1)));
+    }
+    const expectRows = struct {
+        fn check(gr: *ops.Graph, spec: *const Spec, want: []const f32) !void {
+            const view = try gr.contiguous(try spec.ringView(gr));
+            try ops.eval(view);
+            const sh = ops.shape(view);
+            try std.testing.expectEqual(@as(c_int, @intCast(want.len)), sh[1]);
+            const data = mlx.mlx_array_data_float32(view) orelse return error.TestUnexpectedResult;
+            for (want, 0..) |w, idx| {
+                try std.testing.expectEqual(w, data[idx * 2]);
+                try std.testing.expectEqual(w * 10.0, data[idx * 2 + 1]);
+            }
+        }
+    }.check;
+    try expectRows(&g, &sp, &.{ 10, 11, 12, 13 });
+    // Park slot 1, push into slot 2, then return to slot 1: live window stays exact.
+    sp.select(2);
+    try sp.push(&g, 0, &.{try g.fromSlice(f32, &.{ 99, 990 }, &.{ 1, 1, 2 })});
+    sp.select(1);
+    try std.testing.expectEqual(@as(c_int, 4), sp.rows(13));
+    try expectRows(&g, &sp, &.{ 10, 11, 12, 13 });
+    // Adopt and cut back 2 rows to position 11, then push row 100 at position 11.
+    sp.adopt(1, 3, 11);
+    try sp.push(&g, 11, &.{try g.fromSlice(f32, &.{ 100, 1000 }, &.{ 1, 1, 2 })});
+    try std.testing.expectEqual(@as(c_int, 3), sp.rows(12));
+    try expectRows(&g, &sp, &.{ 10, 11, 100 });
+    // Discontinuous push restarts cleanly without keeping stale rows.
+    try sp.push(&g, 50, &.{try g.fromSlice(f32, &.{ 500, 5000 }, &.{ 1, 1, 2 })});
+    try std.testing.expectEqual(@as(c_int, 1), sp.rows(51));
+    try expectRows(&g, &sp, &.{500});
 }
 
 test "inkling2: the bundled drafter loads on Apple9 and later only" {

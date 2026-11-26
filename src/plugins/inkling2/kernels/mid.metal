@@ -75,14 +75,17 @@ for (uint n = 1; n < NS; n++) mx = max(mx, acc[1 + n]);
 float tot = 0.0f;
 for (uint n = 0; n < NS; n++) { w[n] = exp(acc[1 + n] - mx); tot += w[n]; }
 for (uint n = 0; n < NS; n++) w[n] /= tot;
-float ss = 0.0f, mine = 0.0f;
+constexpr uint ELEMS = ONE_TG ? (D / TG) : 1;
+float ss = 0.0f;
+float mine[ELEMS];
 for (uint i = t, k = 0; i < D; i += TG, k++) {
     float m = 0.0f;
     for (uint n = 0; n < NB; n++) m += w[n] * float(BLK[(row * NB + n) * D + i]);
     if (BOUND) m += w[NB] * float(NORMED[ro + i]);
     m += w[NS - 1] * (res[k] * rs);
     ss += m * m;
-    if (i == e) mine = m;
+    if (ONE_TG) mine[k] = m;
+    else if (i == e) mine[0] = m;
 }
 ss = simd_sum(ss);
 if (lane == 0) red2[sg] = ss;
@@ -94,13 +97,28 @@ if (t == 0) {
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
 ss = fold2[0] / float(D);
-RES[ro + e] = res[e / TG];
-if (MSG) {
-    M[ro + e] = mine;
-    BOTH[2 * ro + e] = GT(mine * metal::precise::rsqrt(ss + 1e-6f));
-    BOTH[2 * ro + D + e] = GT(float(MSG3[ro + e]) * metal::precise::rsqrt(acc[1 + NS] / float(D) + 1e-6f));
+if constexpr (ONE_TG) {
+    for (uint i = t, k = 0; i < D; i += TG, k++) {
+        RES[ro + i] = res[k];
+        if (MSG) {
+            M[ro + i] = mine[k];
+            BOTH[2 * ro + i] = GT(mine[k] * metal::precise::rsqrt(ss + 1e-6f));
+            BOTH[2 * ro + D + i] = GT(float(MSG3[ro + i]) * metal::precise::rsqrt(acc[1 + NS] / float(D) + 1e-6f));
+        } else {
+            const XT x = XT(mine[k] * metal::precise::rsqrt(ss + PR[1]) * float(PN[i]));
+            X[ro + i] = x;
+            X32[ro + i] = float(x);
+        }
+    }
 } else {
-    const XT x = XT(mine * metal::precise::rsqrt(ss + PR[1]) * float(PN[e]));
-    X[ro + e] = x;
-    X32[ro + e] = float(x);
+    RES[ro + e] = res[e / TG];
+    if (MSG) {
+        M[ro + e] = mine[0];
+        BOTH[2 * ro + e] = GT(mine[0] * metal::precise::rsqrt(ss + 1e-6f));
+        BOTH[2 * ro + D + e] = GT(float(MSG3[ro + e]) * metal::precise::rsqrt(acc[1 + NS] / float(D) + 1e-6f));
+    } else {
+        const XT x = XT(mine[0] * metal::precise::rsqrt(ss + PR[1]) * float(PN[e]));
+        X[ro + e] = x;
+        X32[ro + e] = float(x);
+    }
 }

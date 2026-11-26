@@ -131,10 +131,11 @@ pub fn qkvDecMmaFits(gqa: c_int, dk: c_int, dv: c_int, gs: c_int) bool {
 }
 
 /// Whether a decode-width call goes to the simdgroup-matrix kernel ahead of the matmul2d page kernel: on the M4
-/// family's shader tile (measured there); a GPU with matrix units keeps the page kernel past its window.
+/// family's shader tile (measured there); a GPU with matrix units keeps the page kernel past its window, except for a
+/// read under a bias a head and sinks (`biased`), which the page kernel declines and the block kernel serves slower.
 /// The one gate for both sites (the matmul2d skip and the dispatch); the test seam wins over the tile.
-fn qkvDecMmaTakes(q: mlx.mlx_array, view: *const DenseKVView) bool {
-    if (!(qkv_dec_mma_override orelse (qkvDecMmaEnabled() and verifyQmmTile() != .nax))) return false;
+fn qkvDecMmaTakes(q: mlx.mlx_array, view: *const DenseKVView, biased: bool) bool {
+    if (!(qkv_dec_mma_override orelse (qkvDecMmaEnabled() and (biased or verifyQmmTile() != .nax)))) return false;
     if ((view.bits != 4 and view.bits != 8) or view.group_size == 0) return false;
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(view.k_triple_q);
@@ -305,7 +306,7 @@ fn decodeKernel(
     if (!qkvDecKernelEnabled()) return null;
     if (!view.has_quant_triple) return null;
     if (!qkvVerifyForced() and mlx.mlx_array_ndim(q) == 4 and mlx.mlx_array_ndim(view.k_triple_q) == 4 and
-        qkvMppWins(mlx.getShape(q)[2], mlx.getShape(view.k_triple_q)[2]) and !qkvDecMmaTakes(q, view))
+        qkvMppWins(mlx.getShape(q)[2], mlx.getShape(view.k_triple_q)[2]) and !qkvDecMmaTakes(q, view, sinks_in != null))
     {
         if (try qkvAttnMppKernel(s, q, view, scale, mask_mode)) |o| return o;
     }
@@ -374,7 +375,7 @@ fn decodeKernel(
         sinks = owned[1];
     }
 
-    if (qkvDecMmaTakes(q, view)) {
+    if (qkvDecMmaTakes(q, view, sinks_in != null)) {
         return try qkvAttnDecodeMma(s, q, view, scale, if (mask_kind != 0) mask_arr else null, mask_kind, sinks, h_q, h_kv, dk, dv, t_k, qdt);
     }
 
@@ -959,7 +960,6 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
 }
 
 // ── Fused quant-attention gate (docs/kv-quant-perf.md Phase 1) ──
-
 
 /// Per-LAYER kv-length floor: below this the packed read cannot pay for the
 /// kernel's split-KV merge ops (~11 dispatches/layer) — Laguna's 512-window

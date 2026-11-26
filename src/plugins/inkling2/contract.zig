@@ -558,10 +558,12 @@ const Act = struct {
 
     pub fn geometry(_: *const Act, shape: Shape) ?metal.Geometry {
         if (shape.rows == 0 or shape.k == 0 or shape.n == 0 or shape.n > 2 or shape.rows * shape.k % 64 != 0) return null;
-        var g = metal.Geometry{ .grid = .{ @intCast(shape.rows * shape.k), 1, 1 }, .tg = .{ 64, 1, 1 } };
+        const vec4 = shape.k % 256 == 0;
+        var g = metal.Geometry{ .grid = .{ @intCast(if (vec4) shape.rows * (shape.k / 4) else shape.rows * shape.k), 1, 1 }, .tg = .{ 64, 1, 1 } };
         g.out(&.{ @intCast(shape.rows), 1, @intCast(shape.k) }, .bfloat16);
         g.dtype("T", .bfloat16);
         g.int("SCALED", @as(c_int, @intFromBool(scaled(shape))));
+        g.int("VEC4", @as(c_int, @intFromBool(vec4)));
         return g;
     }
 
@@ -663,7 +665,8 @@ const Sum = struct {
     pub fn geometry(_: *const Sum, shape: Shape) ?metal.Geometry {
         if (shape.rows == 0 or shape.k == 0 or shape.n == 0 or shape.n > 2 or shape.rows * shape.k % 64 != 0) return null;
         const out: []const c_int = &.{ 1, @intCast(shape.rows), @intCast(shape.k) };
-        var g = metal.Geometry{ .grid = .{ @intCast(shape.rows * shape.k), 1, 1 }, .tg = .{ 64, 1, 1 } };
+        const vec4 = shape.k % 256 == 0;
+        var g = metal.Geometry{ .grid = .{ @intCast(if (vec4) shape.rows * (shape.k / 4) else shape.rows * shape.k), 1, 1 }, .tg = .{ 64, 1, 1 } };
         g.out(out, .bfloat16);
         g.out(out, .bfloat16);
         g.dtype("T", .bfloat16);
@@ -672,6 +675,7 @@ const Sum = struct {
         g.int("KT", @as(c_int, KT));
         g.int("SCALED", @as(c_int, @intFromBool(scaled(shape))));
         g.int("TREE", @as(c_int, 0));
+        g.int("VEC4", @as(c_int, @intFromBool(vec4)));
         return g;
     }
 

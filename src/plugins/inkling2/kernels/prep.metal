@@ -24,13 +24,19 @@ const uint R = RJ_shape[1];
 const uint SW = ST_shape[2];
 const float qk_thr = PR[0], rel_thr = PR[1], eps = PR[2], tau = PR[3], cs = PR[4];
 threadgroup float buf[HD];
+threadgroup float n2_sh;
 if (i < QD) {
     const uint at = row * QD + i;
     const float mine = float(QP[at]) * float(QS[i]);
     buf[t] = mine * mine;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float n2 = 0.0f;
-    for (uint j = 0; j < HD; j++) n2 += buf[j];
+    if (t == 0) {
+        float s = 0.0f;
+        for (uint j = 0; j < HD; j++) s += buf[j];
+        n2_sh = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float n2 = n2_sh;
     const float f = min(qk_thr / (sqrt(n2) + 1e-6f), 1.0f);
     T q = T(mine * f);
     if (tau != 1.0f) q = T(float(q) * tau);
@@ -73,8 +79,13 @@ if (r < 2 * C) {
     const float mine = float(T((y + x) * cs));
     buf[t] = mine * mine;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float n2 = 0.0f;
-    for (uint j = 0; j < HD; j++) n2 += buf[j];
+    if (t == 0) {
+        float s = 0.0f;
+        for (uint j = 0; j < HD; j++) s += buf[j];
+        n2_sh = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float n2 = n2_sh;
     const uint at = (h * ROWS + row) * HD + c % HD;
     if (is_v) V[at] = T(mine * rsqrt(n2 / float(HD) + eps));
     else K[at] = T(mine * min(qk_thr / (sqrt(n2) + 1e-6f), 1.0f));
@@ -82,7 +93,16 @@ if (r < 2 * C) {
 }
 r -= 2 * C;
 // A head's relative states, clipped.
-const uint h = WIDE ? r / DREL : r / uint(PR[5]);
+const uint KV = WIDE ? 0u : uint(PR[5]);
+const uint h = WIDE ? r / DREL : r / KV;
+if (!WIDE) {
+    const uint col = r % KV;
+    // Key `col` sits R - KV + col columns into the logits; keys past R are zero.
+    if (col + R < KV) {
+        BIAS[r] = T(0.0f);
+        return;
+    }
+}
 const uint rp = row * H * DREL + h * DREL;
 float n2 = 0.0f;
 for (uint j = 0; j < DREL; j++) {
@@ -95,13 +115,7 @@ if (WIDE) {
     REL[rp + j] = T(float(RP[rp + j]) * float(RS[h * DREL + j]) * f);
     return;
 }
-const uint KV = uint(PR[5]);
 const uint col = r % KV;
-// Key `col` sits R - KV + col columns into the logits.
-if (col + R < KV) {
-    BIAS[r] = T(0.0f);
-    return;
-}
 const uint d = col + R - KV;
 float acc = 0.0f;
 for (uint j = 0; j < DREL; j++) acc += float(T(float(RP[rp + j]) * float(RS[h * DREL + j]) * f)) * RJ[j * R + d];
