@@ -115,7 +115,19 @@ pub const Index = struct {
     /// `match` over the last `CANDIDATES` occurrences of the n-gram: the one that agrees furthest back wins,
     /// the latest among equals. An edit that left the latest occurrence on the wrong copy still finds the right one.
     pub fn matchBest(self: *const Index, t1: u32, max_draft: u32) ?Match {
+        return self.matchIn(self.toks.items, t1, max_draft);
+    }
+
+    /// How far back the newest committed tokens agree with their best earlier occurrence (`matchBest` with the
+    /// newest as `t1`): a copy is likely at the next round. 0 when there is none.
+    pub fn tailAgreement(self: *const Index) u32 {
         const toks = self.toks.items;
+        if (toks.len < NGRAM) return 0;
+        const m = self.matchIn(toks[0 .. toks.len - 1], toks[toks.len - 1], 1) orelse return 0;
+        return if (m.draft.len > 0) m.suffix else 0;
+    }
+
+    fn matchIn(self: *const Index, toks: []const u32, t1: u32, max_draft: u32) ?Match {
         if (toks.len < NGRAM - 1 or max_draft == 0) return null;
         const t = toks[toks.len - (NGRAM - 1) ..];
         var p: usize = self.next.get(key(t[0], t[1], t[2], t1)) orelse return null;
@@ -262,4 +274,15 @@ test "lookup: matchBest takes the earlier occurrence that agrees further back ov
     defer one.deinit();
     try one.extend(&.{ 1, 2, 3, 4, 5, 6, 1, 2, 3 });
     try testing.expectEqual(one.match(4, 3).?.draft[0], one.matchBest(4, 3).?.draft[0]);
+}
+
+test "lookup: the committed tail's agreement with an earlier occurrence that goes on, 0 for a tail seen once" {
+    var idx = Index.init(std.testing.allocator);
+    defer idx.deinit();
+    try idx.extend(&.{ 1, 2, 3, 4, 5, 6, 7, 8, 9 });
+    try std.testing.expectEqual(@as(u32, 0), idx.tailAgreement());
+    try idx.extend(&.{ 0, 3, 4, 5, 6 });
+    try std.testing.expectEqual(@as(u32, 4), idx.tailAgreement());
+    try idx.extend(&.{7});
+    try std.testing.expectEqual(@as(u32, 5), idx.tailAgreement());
 }

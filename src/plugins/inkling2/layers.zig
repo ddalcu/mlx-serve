@@ -63,8 +63,10 @@ pub const Layer = struct {
     /// `[heads, head_dim]` and `[heads, d_rel]`.
     q_scale: Array,
     rel_scale: Array,
-    /// `[d_rel, extent]`, and the same f32 with its columns reversed (the one-row step's bias, newest key last).
+    /// `[d_rel, extent]`, its contiguous `[extent, d_rel]` transpose for on-the-fly NAX bias, and the f32 column-reversed
+    /// copy (the one-row step's bias, newest key last).
     rel_proj: Array,
+    rel_proj_t: Array = .{},
     rel_proj_rev: Array,
     k_conv: Conv,
     v_conv: Conv,
@@ -403,8 +405,12 @@ pub fn wideRead(g: *Graph, L: *const Layer, cfg: *const Config, p: *const Pre, k
 pub fn gather(g: *Graph, x: Array, bank: *const Bank, sel: Array, sorted: bool) !Array {
     const dt = ops.dtype(x);
     const rows = gatherRowsDtype(dt, bank.qp.mode, mlx.streamIsGpu(g.s), device.deviceGeneration().gen);
+    // The loader narrows affine scales and biases to bf16 (`narrowsLoadedF16`): fp16 rows beside them promote the
+    // gather to f32 inside MLX (`affine_gather_qmm_rhs_float`), slower than the bf16 rows the cast was meant to avoid.
+    const sc = if (rows != dt and bank.s.ctx != null and ops.dtype(bank.s) != rows) try g.astype(bank.s, rows) else bank.s;
+    const bi = if (rows != dt and bank.b.ctx != null and ops.dtype(bank.b) != rows) try g.astype(bank.b, rows) else bank.b;
     var y = mlx.mlx_array_new();
-    gatherExpertMm(&y, if (rows == dt) x else try g.astype(x, rows), bank.w, bank.s, bank.b, .{ .ctx = null }, sel, bank.qp.bits, bank.qp.group_size, bank.qp.mode, sorted, g.s) catch |e| {
+    gatherExpertMm(&y, if (rows == dt) x else try g.astype(x, rows), bank.w, sc, bi, .{ .ctx = null }, sel, bank.qp.bits, bank.qp.group_size, bank.qp.mode, sorted, g.s) catch |e| {
         _ = mlx.mlx_array_free(y);
         return e;
     };

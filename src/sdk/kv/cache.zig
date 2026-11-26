@@ -221,6 +221,83 @@ pub const KVCache = struct {
         self.step = snap.step;
     }
 
+    /// What a restore at `pos` (null: where the rings stand) needs from every sliding ring, copied: the window behind
+    /// it and `tail_slack` rows more, from a `ring_drop_align` boundary; the other layers left empty. Decode moves a
+    /// ring past its prompt, so a later turn that leaves the answer early restores here (`restoreRingTail`). Null when
+    /// no ring holds those rows.
+    pub fn ringTail(self: *const KVCache, at: ?usize, s: mlx.mlx_stream) !?KVCacheSnapshot {
+        const out = try self.allocator.alloc(KVCacheEntry, self.entries.len);
+        for (out) |*e| e.* = newEmptyKVEntry();
+        var snap: KVCacheSnapshot = .{ .entries = out, .step = 0, .allocator = self.allocator, .config = self.config };
+        errdefer snap.deinit();
+        var rings: usize = 0;
+        for (self.entries, out) |src, *dst| {
+            if (!src.initialized or src.keep == 0 or src.window == 0) continue;
+            const pos = at orelse src.offset;
+            snap.step = pos;
+            const from = (pos -| (src.window + tail_slack)) / ring_drop_align * ring_drop_align;
+            if (from < src.base or pos > src.offset) {
+                snap.deinit();
+                return null;
+            }
+            dst.offset = pos;
+            dst.initialized = true;
+            dst.base = from;
+            dst.keep = src.keep;
+            dst.window = src.window;
+            const a = from - src.base;
+            const b = pos - src.base;
+            inline for (.{ "keys", "values", "keys_scales", "keys_biases", "values_scales", "values_biases" }, 0..) |f, k| {
+                if (k < 2 or self.config.scheme != .off) {
+                    const copy = try sliceRowsOwned(@field(src, f), a, b, s);
+                    _ = mlx.mlx_array_free(@field(dst.*, f));
+                    @field(dst.*, f) = copy;
+                }
+            }
+            rings += 1;
+        }
+        if (rings == 0) {
+            snap.deinit();
+            return null;
+        }
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        for (out) |*e| {
+            if (!e.initialized) continue;
+            inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |arr| {
+                if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, arr);
+            }
+        }
+        try mlx.check(mlx.mlx_eval(vec));
+        return snap;
+    }
+
+    /// Bind a `ringTail` over the ring layers of a cache just restored from its entry: they then stand at the
+    /// tail's position, sharing its rows (a write grows into a fresh buffer). Every other layer is untouched.
+    pub fn restoreRingTail(self: *KVCache, tail: *const KVCacheSnapshot) !void {
+        std.debug.assert(self.entries.len == tail.entries.len);
+        for (self.entries, tail.entries) |*dst, src| {
+            if (!src.initialized) continue;
+            freeKVEntry(dst);
+            dst.* = newEmptyKVEntry();
+            dst.offset = src.offset;
+            dst.initialized = true;
+            dst.base = src.base;
+            dst.keep = src.keep;
+            dst.window = src.window;
+            try mlx.check(mlx.mlx_array_set(&dst.keys, src.keys));
+            try mlx.check(mlx.mlx_array_set(&dst.values, src.values));
+            if (self.config.scheme != .off) {
+                try mlx.check(mlx.mlx_array_set(&dst.keys_scales, src.keys_scales));
+                try mlx.check(mlx.mlx_array_set(&dst.keys_biases, src.keys_biases));
+                try mlx.check(mlx.mlx_array_set(&dst.values_scales, src.values_scales));
+                try mlx.check(mlx.mlx_array_set(&dst.values_biases, src.values_biases));
+            }
+            dst.shared_view = true;
+            dst.shared_rows = src.offset - src.base;
+        }
+    }
+
     const chunk_step = 256;
 
     /// Cap on the slack a single growth event adds, in tokens. Keeps the
@@ -572,9 +649,11 @@ pub const KVCache = struct {
     /// A grow: the capacity to allocate, and which of the current rows move into it.
     const Grow = struct { cap: c_int, drop: usize, kept: usize };
 
+    pub const tail_slack = @import("../config/sliding_ring.zig").tail_slack;
+
     /// A sliding ring drops rows in whole blocks of this many, so a whole-buffer view keeps the absolute key-block
     /// boundaries of the hd-256 band kernel (`attn256.metal` BK) and sums as a full buffer does, bit for bit.
-    pub const ring_drop_align = 32;
+    pub const ring_drop_align = @import("../config/sliding_ring.zig").drop_align;
 
     /// The grow a write of `new_len` rows needs, or null. A sliding ring carries only its newest
     /// `keep` rows (up to one drop block more) across and ignores the request's reservation, which sizes a full buffer.
@@ -1011,6 +1090,19 @@ pub const KVCacheSnapshot = struct {
         self.allocator.free(self.entries);
     }
 
+    /// Bytes its arrays hold (the buffers' capacity, which a shared snapshot keeps alive).
+    pub fn bytes(self: *const KVCacheSnapshot) u64 {
+        var total: u64 = 0;
+        for (self.entries) |e| {
+            if (!e.initialized) continue;
+            const arrays = [_]mlx.mlx_array{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases };
+            for (arrays[0..if (self.config.scheme != .off) 6 else 2]) |arr| {
+                total += @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
+            }
+        }
+        return total;
+    }
+
     /// Shortest length this snapshot restores to: a sliding ring must still hold the window
     /// behind it. 0 when no ring has dropped a row.
     pub fn ringFloor(self: *const KVCacheSnapshot) usize {
@@ -1094,11 +1186,16 @@ pub const KVCacheSnapshot = struct {
 /// Slice `[0:rows]` on axis 2 and force a real copy (see
 /// `materializedOwnedCopy` for why a plain slice keeps the parent alive).
 fn trimRowsOwned(x: mlx.mlx_array, rows: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+    return sliceRowsOwned(x, 0, rows, s);
+}
+
+/// `trimRowsOwned` over buffer rows `[from, to)`.
+fn sliceRowsOwned(x: mlx.mlx_array, from: usize, to: usize, s: mlx.mlx_stream) !mlx.mlx_array {
     const sh = mlx.mlx_array_shape(x);
     var sliced = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sliced);
-    const start = [_]c_int{ 0, 0, 0, 0 };
-    const stop = [_]c_int{ sh[0], sh[1], @intCast(rows), sh[3] };
+    const start = [_]c_int{ 0, 0, @intCast(from), 0 };
+    const stop = [_]c_int{ sh[0], sh[1], @intCast(to), sh[3] };
     const strides = [_]c_int{ 1, 1, 1, 1 };
     try mlx.check(mlx.mlx_slice(&sliced, x, &start, 4, &stop, 4, &strides, 4, s));
     return materializedOwnedCopy(s, sliced);

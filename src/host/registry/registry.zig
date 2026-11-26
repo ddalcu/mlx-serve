@@ -795,10 +795,11 @@ pub const ModelRegistry = struct {
             defer self.mutex.unlock(self.io);
             if (self.findDirLocked(path, real)) |e| return e;
         }
-        // A GGUF pack is registered by its folder; a client (the app) names the `.gguf` inside it. Only the file the
-        // folder serves: another quant beside it is a model of its own.
-        if (std.mem.endsWith(u8, path, ".gguf")) if (std.fs.path.dirname(path)) |dir| if (self.peekByPath(dir)) |e| {
-            if (self.folderServes(e.path, path)) return e;
+        // A GGUF pack is registered by its folder; a client (the app) names the `.gguf` inside it, or inside its
+        // quant folder. Only the file the folder serves: another quant beside it is a model of its own.
+        if (std.mem.endsWith(u8, path, ".gguf")) if (std.fs.path.dirname(path)) |dir| {
+            if (self.peekByPath(dir)) |e| if (self.folderServes(e.path, path)) return e;
+            if (std.fs.path.dirname(dir)) |repo| if (self.peekByPath(repo)) |e| if (self.folderServes(e.path, path)) return e;
         };
         return null;
     }
@@ -1261,6 +1262,26 @@ pub const ModelRegistry = struct {
         }
     }
 
+    /// `planEvictionsLocked`, but a plan that only fails for a model already on its way out waits for
+    /// that unload to land and plans again, with `live_bytes` read afresh. An unload still draining a
+    /// reader is not waited for: that reader may be the caller's own request.
+    pub fn planEvictionsAfterUnloadsLocked(self: *ModelRegistry, exclude_id: []const u8, out: []*LoadedModel, live_bytes: *const fn () u64) ?usize {
+        while (true) {
+            if (self.planEvictionsLocked(exclude_id, out, live_bytes())) |n| return n;
+            const leaving = self.unloadInFlightLocked() orelse return null;
+            while (leaving.state == .evicting) self.state_cond.waitUncancelable(self.io, &self.mutex);
+        }
+    }
+
+    fn unloadInFlightLocked(self: *ModelRegistry) ?*LoadedModel {
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.state == .evicting and entry.refcount.load(.acquire) == 0) return entry;
+        }
+        return null;
+    }
+
     /// MLX bytes the ready models hold as loaded: each load's own measure (`bytes_live`), its bill where none was
     /// taken. The bill alone would count a host-mapped table that is not MLX memory.
     pub fn residentLiveBytes(self: *ModelRegistry, io: std.Io) u64 {
@@ -1633,6 +1654,32 @@ test "ModelRegistry: peekByPath finds a GGUF pack by the .gguf file inside it, a
     try testing.expect(reg.peekByPath(readme) == null);
 }
 
+test "ModelRegistry: peekByPath finds a GGUF pack by the first shard in its quant folder, not another quant's" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "pack/Q6");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/Q6/m-00001-of-00002.gguf", .data = "GGUF" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/Q6/m-00002-of-00002.gguf", .data = "GGUF" });
+    try tmp.dir.createDirPath(io, "pack/Q8");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/Q8/m-00001-of-00002.gguf", .data = "GGUF" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/Q8/m-00002-of-00002.gguf", .data = "GGUF" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    const pack = try std.fs.path.join(testing.allocator, &.{ root, "pack" });
+    defer testing.allocator.free(pack);
+    const served = try std.fs.path.join(testing.allocator, &.{ pack, "Q6", "m-00001-of-00002.gguf" });
+    defer testing.allocator.free(served);
+    const other = try std.fs.path.join(testing.allocator, &.{ pack, "Q8", "m-00001-of-00002.gguf" });
+    defer testing.allocator.free(other);
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStubWithArch("pack", pack, 64, "gguf");
+    try testing.expectEqual(e, reg.peekByPath(served) orelse return error.TestUnexpectedResult);
+    try testing.expect(reg.peekByPath(other) == null);
+}
+
 test "ModelRegistry: registerByPath rejects a nonexistent directory" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
@@ -1918,6 +1965,26 @@ test "unloadResident resets the prefill-chunk pin but never the context pin" {
     lm.unloadResident();
     try testing.expectEqual(@as(u32, 0), cfg.pinned_prefill_chunk);
     try testing.expectEqual(@as(u32, 8192), cfg.pinned_context);
+}
+
+test "ModelRegistry: an unloading model stays evicting until finalizeEvictionLocked, so no load claims it early" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const lm = try makeReadyStub(reg, "foo", 1024);
+
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markEvictingLocked(lm);
+    reg.mutex.unlock(reg.io);
+
+    lm.unloadResident();
+
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    try testing.expectEqual(LoadState.evicting, lm.state);
+    try testing.expect(!reg.tryBeginLoadLocked(lm));
+    reg.finalizeEvictionLocked(lm);
+    try testing.expectEqual(LoadState.unloaded, lm.state);
+    try testing.expect(reg.tryBeginLoadLocked(lm));
 }
 
 test "ModelRegistry: default routing on empty / mlx-serve" {
@@ -2350,6 +2417,54 @@ test "planEvictions: another model still loading counts against the model cap" {
     // a + b + c would be three models under a cap of two: `a` has to go.
     try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 0));
     try testing.expectEqualStrings("a", buf[0].id);
+}
+
+fn noLiveBytes() u64 {
+    return 0;
+}
+
+test "planEvictions: a load waits out an unload in flight instead of refusing" {
+    const io = testing.io;
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 1, 0, null);
+    defer reg.deinit();
+    const a = try makeReadyStub(reg, "a", 10);
+    reg.mutex.lockUncancelable(io);
+    reg.markEvictingLocked(a);
+    reg.mutex.unlock(io);
+    const b = try beginLoad(reg, "b", 10);
+    const Unload = struct {
+        fn finish(r: *ModelRegistry, e: *LoadedModel) void {
+            testing.io.sleep(.fromMilliseconds(50), .awake) catch {};
+            r.mutex.lockUncancelable(r.io);
+            r.accountEvictedLocked(10);
+            r.finalizeEvictionLocked(e);
+            r.mutex.unlock(r.io);
+        }
+    };
+    const unload = try std.Thread.spawn(.{}, Unload.finish, .{ reg, a });
+    reg.mutex.lockUncancelable(io);
+    var buf: [16]*LoadedModel = undefined;
+    const plan = reg.planEvictionsAfterUnloadsLocked(b.id, &buf, noLiveBytes);
+    reg.mutex.unlock(io);
+    unload.join();
+    try testing.expectEqual(@as(?usize, 0), plan);
+}
+
+test "planEvictions: an unload still waiting on a reader is not waited for" {
+    const io = testing.io;
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 1, 0, null);
+    defer reg.deinit();
+    const a = try makeReadyStub(reg, "a", 10);
+    _ = a.refcount.fetchAdd(1, .acq_rel);
+    reg.mutex.lockUncancelable(io);
+    reg.markEvictingLocked(a);
+    reg.mutex.unlock(io);
+    const b = try beginLoad(reg, "b", 10);
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    try testing.expectEqual(@as(?usize, null), reg.planEvictionsAfterUnloadsLocked(b.id, &buf, noLiveBytes));
+    a.refcount.store(0, .release);
 }
 
 test "reservation: released back to zero on markReady / markUnloaded" {

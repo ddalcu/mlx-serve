@@ -42,6 +42,7 @@ const lilicorr_mod = @import("../spec/dflash/lilicorr.zig");
 const DflashModel = dflash_mod.DflashModel;
 const gdn_decode = @import("../../../sdk/blocks/gdn/decode.zig");
 const KVCache = transformer_mod.KVCache;
+const KVCacheSnapshot = @import("../kv/cache.zig").KVCacheSnapshot;
 const testing = std.testing;
 const CACHE_CLEAR_INTERVAL = @import("prefill_chunk.zig").CACHE_CLEAR_INTERVAL;
 const DflashPol = @import("../spec/dflash.zig").DflashPol;
@@ -449,6 +450,8 @@ pub const Generator = struct {
     /// allocator to free, since the layer-slice backing memory was allocated
     /// here.
     ssm_checkpoint_alloc: ?std.mem.Allocator = null,
+    /// Owned: the sliding rings' rows at the prompt's end (`KVCache.ringTail`), taken by the commit.
+    ring_tail: ?KVCacheSnapshot = null,
 
     // ── Runtime acceptance gate ──
     // Set to true mid-request when the per-request acceptance rate
@@ -673,6 +676,8 @@ pub const Generator = struct {
             self.ssm_checkpoints.deinit(allocator);
             self.ssm_checkpoints = std.ArrayList(SSMCheckpoint).empty;
         }
+        if (self.ring_tail) |*t| t.deinit();
+        self.ring_tail = null;
         self.generated_ids.deinit(allocator);
     }
 
@@ -682,6 +687,11 @@ pub const Generator = struct {
     /// where `allocator` is the same one passed to `initWithOptions`.
     /// After return, `ssm_checkpoints` is empty and the Generator owns
     /// nothing related to checkpoints.
+    pub fn takeRingTail(self: *Generator) ?KVCacheSnapshot {
+        defer self.ring_tail = null;
+        return self.ring_tail;
+    }
+
     pub fn takeSsmCheckpoints(self: *Generator) []SSMCheckpoint {
         const a = self.ssm_checkpoint_alloc orelse return &[_]SSMCheckpoint{};
         const out = self.ssm_checkpoints.toOwnedSlice(a) catch return &[_]SSMCheckpoint{};
@@ -698,6 +708,9 @@ pub const Generator = struct {
     pub const PldStepResult = @import("../spec/pld.zig").PldStepResult;
     pub const nextDspark = @import("../spec/dspark.zig").nextDspark;
     pub const dsparkCopyStep = @import("../spec/dspark.zig").dsparkCopyStep;
+    pub const noteCopy = @import("../spec/dspark.zig").noteCopy;
+    pub const timeRounds = @import("../spec/dspark.zig").timeRounds;
+    pub const keepLadder = @import("../spec/dspark.zig").keepLadder;
     pub const dsparkStep = @import("../spec/dspark.zig").dsparkStep;
     pub const dsparkPlainPipelined = @import("../spec/dspark.zig").dsparkPlainPipelined;
     pub const dsparkPolicyStep = @import("../spec/dspark.zig").dsparkPolicyStep;

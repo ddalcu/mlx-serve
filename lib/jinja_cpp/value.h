@@ -174,6 +174,8 @@ protected:
 
 const func_builtins & global_builtins();
 
+std::string float_repr(double v);
+
 std::string value_to_json(const value & val, int indent = -1, const std::string_view item_sep = ", ", const std::string_view key_sep = ": ", bool sort_keys = false);
 
 // Note: only used for debugging purposes
@@ -253,10 +255,7 @@ struct value_float_t : public value_t {
     virtual double as_float() const override { return val_flt; }
     virtual int64_t as_int() const override { return val_int; }
     virtual string as_string() const override {
-        std::string out = std::to_string(val_flt);
-        out.erase(out.find_last_not_of('0') + 1, std::string::npos); // remove trailing zeros
-        if (out.back() == '.') out.push_back('0'); // leave one zero if no decimals
-        return out;
+        return float_repr(val_flt);
     }
     virtual bool as_bool() const override {
         return val_flt != 0.0;

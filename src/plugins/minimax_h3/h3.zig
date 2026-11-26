@@ -5794,7 +5794,7 @@ test "minimax h3: the timestep plan reads a PDD student's 0.999 clock" {
 }
 
 test "minimax h3: fused PDD heads equal the weighted sum of the heads they replace" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const grid: u32 = 6;
     const out: c_int = 5;
@@ -7583,7 +7583,7 @@ fn expectBitEqual(a: mlx.mlx_array, b: mlx.mlx_array, what: []const u8, s: S) !v
 }
 
 test "h3_glue: fused q/k norm + rope + head-major layout is bit-equal to the chain at the real row count" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const cfg = Config{};
     const rows: c_int = 15406;
@@ -7617,7 +7617,7 @@ test "h3_glue: fused q/k norm + rope + head-major layout is bit-equal to the cha
 }
 
 test "h3_glue: fused swiglu is bit-equal to silu(gate) * up at the real row count" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const cfg = Config{};
     const rows: c_int = 15406;
@@ -7634,7 +7634,7 @@ test "h3_glue: fused swiglu is bit-equal to silu(gate) * up at the real row coun
 }
 
 test "add_norm: fused gate + rmsnorm + modulation is bit-equal to modGate -> rmsNormLast -> modScaleShift" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = testing.allocator;
     const s = mlx.gpuStream();
     const cfg = Config{};
@@ -7791,7 +7791,7 @@ fn qkvDenseRef(w: *const Weights, x: mlx.mlx_array, s: S) !mlx.mlx_array {
 }
 
 test "minimax h3: split Q/K/V runs each projection, factored or not, and lands in q | k | v order" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = testing.allocator;
     const s = mlx.gpuStream();
     const cfg = Config{ .hidden_size = 64, .num_attention_heads = 2, .attention_head_dim = 32 };
@@ -7823,7 +7823,7 @@ test "minimax h3: split Q/K/V runs each projection, factored or not, and lands i
 }
 
 test "minimax h3: a two-time embedding moves from te(t) toward the endpoint embedder's ee(r) by the gate" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = testing.allocator;
     const s = mlx.gpuStream();
     var m: Model = undefined;

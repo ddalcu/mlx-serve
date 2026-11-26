@@ -157,11 +157,15 @@ fn slotFixedKvBytesUpTo(config: *const model_mod.ModelConfig, kv_bits: u64, chun
         const fixed = b.billTerms().fixed_slot_bytes;
         if (fixed > 0) return fixed;
     }
-    const ring_rows: u64 = @min(@as(u64, config.slidingKeepRows()) +| chunk, rows);
+    const keep: u64 = config.slidingKeepRows();
+    // The ring, and the copy of its window at the prompt's end the hot cache keeps (`KVCache.ringTail`).
+    const tail: u64 = sliding_ring.tailRows(@intCast(keep -| model_mod.ModelConfig.SLIDING_RING_SLACK));
+    const ring_rows: u64 = @min(keep +| chunk, rows) +| @min(tail, rows);
     return config.qsaRingBytes() +| kvBytesPerTokenAtBits(config.slidingRowBytes(), kv_bits) *| ring_rows;
 }
 
 const sdk_bill = @import("../../../sdk/bill/prefill.zig");
+const sliding_ring = @import("../../../sdk/config/sliding_ring.zig");
 pub const kvBytesPerTokenAtBits = sdk_bill.kvBytesPerTokenAtBits;
 pub const PREFILL_RUNTIME_FLOOR_BYTES = sdk_bill.PREFILL_RUNTIME_FLOOR_BYTES;
 pub const PrefillRequestTerms = sdk_bill.PrefillRequestTerms;

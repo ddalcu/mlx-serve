@@ -77,10 +77,17 @@ pub fn on(comptime name: @EnumLiteral()) bool {
     return onValue(get(name));
 }
 
-/// A default-on flag: on unless set to a value starting with `0`.
-pub fn onUnlessZero(comptime name: @EnumLiteral()) bool {
+/// A default-on kill switch: on unless `FOO=0` (`on` reads unset as off).
+pub fn notOff(comptime name: @EnumLiteral()) bool {
     comptime expectType(name, .flag);
-    const v = get(name) orelse return true;
+    return notOffValue(get(name));
+}
+
+/// A default-on flag: on unless set to a value starting with `0` (`notOff` by its levers' name).
+pub const onUnlessZero = notOff;
+
+pub fn notOffValue(raw: ?[*:0]const u8) bool {
+    const v = raw orelse return true;
     return v[0] != '0';
 }
 
@@ -430,6 +437,7 @@ pub const vars = struct {
     pub const MINIMAX_H3_VSA: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.3", .doc = "H3 trained VSA sparse attention (=0: dense attention, no gate branch)" };
     pub const MLX_SERVE_MING_FUSED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/ming_tts", .since = "26.11.3", .doc = "Ming-3.0-tts fused DiT and LM kernels (=0: the op chain)" };
     pub const MLX_SERVE_INKLING2_FUSED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/inkling2", .since = "26.11.4", .doc = "Inkling 2 one-row step kernels (=0: the op chain)" };
+    pub const MLX_SERVE_INKLING2_TREE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/inkling2", .since = "26.11.4", .doc = "Inkling 2 DFlash2 GPU draft tree and fused accept (=0: chain verify)" };
     pub const MLX_SERVE_CUDA_QMV_TC: Var = .{ .kind = .kill, .type = .flag, .default = "on where measured (sm_120)", .owner = "sdk/blocks/qmm", .since = "26.10.3", .doc = "CUDA tensor-core 4-bit GEMV for 2..8 rows" };
     pub const MLX_SERVE_DSPARK_POLICY2: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx/spec", .since = "26.11.5", .doc = "on (default; =0: the GLM-5.3-priced policy): a DeepSeek-V4.1 DSpark request verifies the rows that maximize tokens less its own decode rate times the round's measured ms, its calibration learns the first unverified draft from the next token, and its drafting backoff waits at most 8 plain rounds; read at request start" };
     pub const MLX_SERVE_DSPARK_POLICY2_MODELED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx/spec", .since = "26.11.5", .doc = "on (default; =0 the stopwatch-priced policy2): the DSpark policy2 prices a round's time by its fitted ladder in plain steps, never the round timers, so a request's verify widths (and a greedy text) repeat from run to run and box to box; read at request start" };
@@ -507,6 +515,7 @@ pub const vars = struct {
     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
     pub const MLX_SERVE_H3_RESIDENT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 DiT resident between requests" };
     pub const MLX_SERVE_KV_ATTN_MMA: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "sdk/blocks/attention", .since = "26.11.3", .doc = "packed-KV decode attention on the simdgroup-matrix kernel (=0: the block kernel, or matmul2d on M4/M5 past 16K keys)" };
+    pub const MLX_SERVE_NATIVE_GROUPS: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx/spec", .since = "26.11.4", .doc = "a served drafter's slots, sampled or greedy, run their rounds as one group tick (=0: they decode plain in the batched group)" };
     pub const MLX_SERVE_KEYED_SAMPLING: Var = .{ .kind = .kill, .type = .flag, .default = "off (keyed only where the decode is row-exact)", .owner = "engines/mlx/sampling", .since = "26.11.2", .doc = "every clean sampled request draws through the keyed sampler (Gumbel-max keyed by seed, position and id; an unseeded request gets a seed), and DSpark's stochastic arm keeps a draft only while it equals the keyed draw at its position (the serial verdict): a drafted request emits what serial decoding draws from the same rows' logits, at the same acceptance law" };
 
     // ── diagnostics ──
@@ -728,6 +737,9 @@ pub const vars = struct {
     pub const HY3_MODEL_DIR: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "host/chat", .since = "26.7.8", .doc = "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback (HY3_MODEL_DIR)" };
     pub const INKLING2_PACK: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/inkling2", .since = "26.11.3", .doc = "an Inkling 2 pack dir whose lm_head the last-row test reads" };
     pub const INKLING2_RELEASE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/inkling2", .since = "26.11.4", .doc = "the Inkling 2 Mini release's directory, for the tests that load it" };
+    pub const INKLING2_DFLASH2_PACK: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/inkling2", .since = "26.11.4", .doc = "the Inkling 2 Mini release's files with its DFlash2 draft as `drafter/`, for the tests that run them together" };
+    pub const INKLING2_DFLASH2_DIR: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/inkling2", .since = "26.11.4", .doc = "incoai/Inkling-2-Mini-DFlash2's directory, for the DFlash2 parity test" };
+    pub const INKLING2_DFLASH2_FIXTURES: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/inkling2", .since = "26.11.4", .doc = "tests/dump_inkling2_dflash2_fixtures.py's output (the reference's block rows and selector path)" };
     pub const INKLING_FIXTURES: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/inkling", .since = "26.7.12", .doc = "test input read by `loadInklingFixtures`" };
     pub const KEV_FIXTURES: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/kev", .since = "26.10.1", .doc = "kev: oracle against kev's MLX backend (KEV_TEST_MODEL + KEV_FIXTURES)" };
     pub const KEV_TEST_MODEL: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/kev", .since = "26.10.1", .doc = "kev: oracle against kev's MLX backend (KEV_TEST_MODEL + KEV_FIXTURES)" };
@@ -1031,6 +1043,14 @@ test "onUnlessZero: a default-on flag is on unset and off only at 0" {
     const o = override(.MLX_SERVE_DSV41_HC_EXPAND_NORM, "1");
     defer o.restore();
     try testing.expect(onUnlessZero(.MLX_SERVE_DSV41_HC_EXPAND_NORM));
+}
+
+test "notOff: a default-on switch is off only at 0, where on reads unset as off" {
+    try testing.expect(notOffValue(null));
+    try testing.expect(notOffValue(""));
+    try testing.expect(notOffValue("1"));
+    try testing.expect(!notOffValue("0"));
+    try testing.expect(!onValue(null));
 }
 
 test "value readers: on is set-and-not-0, int and float fall back on empty or garbage" {

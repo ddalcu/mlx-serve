@@ -540,3 +540,28 @@ test "loopTrimmedIds: the degenerate span is cut, and a bad index degrades to em
     try std.testing.expectEqualSlices(u32, &ids, loopTrimmedIds(&ids, 5));
     try std.testing.expectEqualSlices(u32, &ids, loopTrimmedIds(&ids, 99));
 }
+
+test "parseToolCallsForRequest: bare <invoke> string params keep their bytes (package.json class)" {
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"Write","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"},"old":{"type":"string"},"replace_all":{"type":"boolean"}}}}}]
+    ;
+    const text = "<function_calls>\n<invoke name=\"Write\">\n<parameter name=\"file_path\">/tmp/p.json</parameter>\n" ++
+        "<parameter name=\"content\">{\n  \"name\": \"x\"\n}</parameter>\n<parameter name=\"old\">\"version\"</parameter>\n" ++
+        "<parameter name=\"replace_all\">true</parameter>\n</invoke>\n</function_calls>";
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("{\n  \"name\": \"x\"\n}", obj.get("content").?.string);
+    try std.testing.expectEqualStrings("\"version\"", obj.get("old").?.string);
+    try std.testing.expectEqual(true, obj.get("replace_all").?.bool);
+}

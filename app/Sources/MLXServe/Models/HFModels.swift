@@ -395,6 +395,7 @@ struct HFModel: Identifiable, Codable {
     static let verifiedModelOptRepos: Set<String> = [
         "nvidia/Qwen3.8-Flash-Next-FP4-Local",
         "nvidia/GLM-5.3-Flash-FP4-Local",
+        "thinkingmachines/Inkling-2-Mini",
     ]
 
     /// Human-readable reason why this model isn't compatible. The row renders

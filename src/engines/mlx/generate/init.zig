@@ -7,6 +7,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const log = @import("../../../sdk/util/log.zig");
+const KVCacheSnapshot = @import("../kv/cache.zig").KVCacheSnapshot;
 const io_util = @import("../../../sdk/util/io_util.zig");
 const mtp_mod = @import("../../../sdk/spec/mtp/mtp.zig");
 const mtp_acceptance = @import("../../../sdk/spec/mtp_acceptance.zig");
@@ -14,6 +15,7 @@ const round_cost = @import("../spec/round_cost.zig");
 const context = @import("../admission/context.zig");
 const mtp_group_planner = @import("../spec/mtp_group_planner.zig");
 const dflash_policy = @import("../spec/dflash/policy.zig");
+const spec_rounds = @import("../../../sdk/spec/rounds.zig");
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ForwardCtx = transformer_mod.ForwardCtx;
@@ -199,6 +201,12 @@ pub fn initWithOptions(
     const owned_src = pickLookupPromptSource(prompt_ids, options.lookup_prompt);
     const prompt_owned = try allocator.dupe(u32, owned_src);
     errdefer allocator.free(prompt_owned);
+    // A native drafter's state continues the finished slot whose sequence this prompt repeats furthest
+    // (`SamplingParams.repeats`: not for a request that must answer the same twice).
+    if (!sampling.repeats()) if (plugin_driver.adoptFor(xfm, prompt_owned)) |a| {
+        ctx.adopt_slot = a.slot;
+        ctx.adopt_len = a.len;
+    };
 
     // Split prefill: process first N-1 tokens (cache-only, skip lm_head eval),
     // then the last token (produces logits for sampling). This mirrors mlx-lm's
@@ -927,15 +935,27 @@ pub fn initWithOptions(
         _ = mlx.mlx_array_free(captured_hidden);
     };
 
+    // The rows a restore at the prompt's end reads from the sliding rings: decode moves the rings past them. A hybrid
+    // restores at a checkpoint, so its rows end at the last one.
+    var ring_tail: ?KVCacheSnapshot = null;
+    errdefer if (ring_tail) |*t| t.deinit();
+    const tail_at: ?usize = if (ssm_checkpoints.items.len > 0) ssm_checkpoints.items[ssm_checkpoints.items.len - 1].pos else if (ctx.ssm_entries != null) 0 else null;
+    if (tail_at != 0) ring_tail = ctx.cache.ringTail(tail_at, xfm.s) catch |e| blk: {
+        log.debug("[hot-cache] no ring tail: {s}\n", .{@errorName(e)});
+        break :blk null;
+    };
+
     // Attach the SSM-checkpoint buffer to whichever Generator variant
     // we're about to return. Clears the local list so the errdefer above
     // doesn't double-free. All four init paths below call this once
     // before returning their Generator.
     const attachCp = struct {
-        fn f(g: *Generator, list: *std.ArrayList(SSMCheckpoint), a: std.mem.Allocator) void {
+        fn f(g: *Generator, list: *std.ArrayList(SSMCheckpoint), tail: *?KVCacheSnapshot, a: std.mem.Allocator) void {
             g.ssm_checkpoints = list.*;
             g.ssm_checkpoint_alloc = a;
             list.* = std.ArrayList(SSMCheckpoint).empty;
+            g.ring_tail = tail.*;
+            tail.* = null;
         }
     }.f;
 
@@ -977,7 +997,7 @@ pub fn initWithOptions(
         };
         gen.pending_logits = logits;
         gen.has_pending_logits = true;
-        attachCp(&gen, &ssm_checkpoints, allocator);
+        attachCp(&gen, &ssm_checkpoints, &ring_tail, allocator);
         return gen;
     }
 
@@ -1040,9 +1060,11 @@ pub fn initWithOptions(
             .dspark_stochastic = dspark_stochastic,
             .dspark_typical = dspark_typical,
             // A streamed EXL3 bank verifies the whole block on a greedy request: its verify costs about a plain tick.
-            // `dspark.test_pin_rows` (a test hook) pins every round at N rows. A plugin's drafter opens with the plain
-            // rounds that time one, then drafts while its rounds pay.
-            .dspark_pol = if (!dspark_active) null else if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = dsparkPinRows(!dspark_stochastic and dm.cfg.dsv41_exl3_bank), .p2 = if (env.onUnlessZero(.MLX_SERVE_DSPARK_POLICY2)) .{ .modeled = env.onUnlessZero(.MLX_SERVE_DSPARK_POLICY2_MODELED) } else null } else if (plugin_driver.nativeDrafter(xfm) != null) .{ .plain = .unmeasured, .drafting = .{ .owed = 4 } } else null,
+            // `dspark.test_pin_rows` (a test hook) pins every round at N rows. A plugin's drafter runs the rounds its
+            // load's ladder prices; a load not timed yet decodes plainly.
+            .dspark_pol = if (!dspark_active) null else if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = dsparkPinRows(!dspark_stochastic and dm.cfg.dsv41_exl3_bank), .p2 = if (env.onUnlessZero(.MLX_SERVE_DSPARK_POLICY2)) .{ .modeled = env.onUnlessZero(.MLX_SERVE_DSPARK_POLICY2_MODELED) } else null } else if (plugin_driver.nativeDrafter(xfm) != null) .{
+                .rounds = if (xfm.plugin.?.ladder) |l| .{ .ladder = l, .acc = .{ .prior = if (dspark_stochastic) spec_rounds.Acceptance.SAMPLED else spec_rounds.Acceptance.GREEDY } } else null,
+            } else null,
             .drafter = if (drafter_active) options.drafter else null,
             .drafter_block_size = options.drafter_block_size,
             .dflash = if (dflash_active) options.dflash else null,
@@ -1071,7 +1093,7 @@ pub fn initWithOptions(
         // pending_logits/pending_token left empty — the lazy pipeline is
         // skipped under PLD / drafter / MTP. The speculative `next*` paths
         // drive every subsequent step with predictable cache offset.
-        attachCp(&gen, &ssm_checkpoints, allocator);
+        attachCp(&gen, &ssm_checkpoints, &ring_tail, allocator);
         return gen;
     }
 
@@ -1112,7 +1134,7 @@ pub fn initWithOptions(
         };
         gen.pending_logits = logits;
         gen.has_pending_logits = true;
-        attachCp(&gen, &ssm_checkpoints, allocator);
+        attachCp(&gen, &ssm_checkpoints, &ring_tail, allocator);
         return gen;
     }
     if (options.skip_lazy_preforward) {
@@ -1155,7 +1177,7 @@ pub fn initWithOptions(
             .prompt_ids_owned = prompt_owned,
             .prompt_ids_alloc = allocator,
         };
-        attachCp(&gen, &ssm_checkpoints, allocator);
+        attachCp(&gen, &ssm_checkpoints, &ring_tail, allocator);
         return gen;
     }
 
@@ -1216,7 +1238,7 @@ pub fn initWithOptions(
     gen.pending_logits = next_logits;
     gen.has_pending_logits = true;
 
-    attachCp(&gen, &ssm_checkpoints, allocator);
+    attachCp(&gen, &ssm_checkpoints, &ring_tail, allocator);
     return gen;
 }
 

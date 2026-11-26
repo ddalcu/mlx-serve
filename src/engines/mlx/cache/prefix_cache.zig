@@ -96,6 +96,73 @@ pub fn missKind(candidates: usize, best_raw: usize) MissKind {
     return .no_checkpoint;
 }
 
+/// The most tokens either side of one respelled span may take.
+const RESPELL_MAX_TOKENS = 64;
+
+/// A prompt `respell` changed, with its media items where the new spelling puts them. Caller owns both.
+pub const Respelled = struct { ids: []u32, media: []MediaSpan };
+
+/// `prompt` spelled as `entry` spells the bytes they share, or null when nothing changes. A sampled answer need not
+/// use the tokenizer's canonical tokens (" ----" "--------" where encoding the text gives " " "--------" "----"), so its
+/// re-rendered turn left the cache inside that answer. `spelling.tokenSpelling(id)` is a token's text, null for a
+/// special token, which never respells; a media item (`media`, the prompt's) moves with the run it sits in.
+pub fn respell(allocator: std.mem.Allocator, entry: []const u32, prompt: []const u32, media: []const MediaSpan, spelling: anytype) !?Respelled {
+    var i = std.mem.indexOfDiff(u32, entry, prompt) orelse return null;
+    var span = sameBytes(entry[i..], prompt[i..], spelling) orelse return null;
+    var out: std.ArrayList(u32) = .empty;
+    errdefer out.deinit(allocator);
+    const moved = try allocator.alloc(MediaSpan, media.len);
+    errdefer allocator.free(moved);
+    for (moved, media) |*m, src| m.* = .{ .start = std.math.maxInt(u32), .key = src.key };
+    try copyRun(allocator, &out, prompt, 0, i, media, moved);
+    var j = i;
+    while (true) {
+        try out.appendSlice(allocator, entry[i..][0..span[0]]);
+        i += span[0];
+        j += span[1];
+        const k = std.mem.indexOfDiff(u32, entry[i..], prompt[j..]) orelse break;
+        try copyRun(allocator, &out, prompt, j, k, media, moved);
+        i += k;
+        j += k;
+        span = sameBytes(entry[i..], prompt[j..], spelling) orelse break;
+    }
+    try copyRun(allocator, &out, prompt, j, prompt.len - j, media, moved);
+    // An item that starts inside a respelled run has no place in the new spelling.
+    for (moved) |m| if (m.start == std.math.maxInt(u32)) {
+        allocator.free(moved);
+        out.deinit(allocator);
+        return null;
+    };
+    return .{ .ids = try out.toOwnedSlice(allocator), .media = moved };
+}
+
+/// Appends `prompt[from..][0..len]` to `out`; an item of `media` starting in it lands at its new place in `moved`.
+fn copyRun(allocator: std.mem.Allocator, out: *std.ArrayList(u32), prompt: []const u32, from: usize, len: usize, media: []const MediaSpan, moved: []MediaSpan) !void {
+    for (media, moved) |m, *to| if (m.start >= from and m.start < from + len) {
+        to.start = @intCast(m.start - from + out.items.len);
+    };
+    try out.appendSlice(allocator, prompt[from..][0..len]);
+}
+
+/// The shortest token runs at the head of `a` and `b` that spell the same bytes, as their lengths.
+fn sameBytes(a: []const u32, b: []const u32, spelling: anytype) ?[2]usize {
+    var n: [2]usize = .{ 0, 0 };
+    var rest: [2][]const u8 = .{ "", "" };
+    const sides = [2][]const u32{ a, b };
+    while (true) {
+        for (0..2) |s| if (rest[s].len == 0) {
+            if (n[s] == @min(sides[s].len, RESPELL_MAX_TOKENS)) return null;
+            rest[s] = spelling.tokenSpelling(sides[s][n[s]]) orelse return null;
+            if (rest[s].len == 0) return null;
+            n[s] += 1;
+        };
+        const k = @min(rest[0].len, rest[1].len);
+        if (!std.mem.eql(u8, rest[0][0..k], rest[1][0..k])) return null;
+        rest = .{ rest[0][k..], rest[1][k..] };
+        if (rest[0].len == 0 and rest[1].len == 0) return n;
+    }
+}
+
 /// Why an oversized commit retained nothing; three outcomes used to print one identical line.
 pub const TrimDecline = enum {
     no_restorable_prefix,
@@ -379,6 +446,9 @@ const Entry = struct {
     /// cache restore picks the largest `pos ≤ matched` and rewinds both KV
     /// and SSM to it.
     ssm_checkpoints: ?[]SSMCheckpoint = null,
+    /// The sliding rings' rows at the committing prompt's end (`KVCache.ringTail`), kept while decode moved the
+    /// entry's own rings past them; billed in `kv_bytes`.
+    ring_tail: ?KVCacheSnapshot = null,
     /// Bytes resident in `ssm_checkpoints` (sum across all checkpoints and
     /// layers). Folded into `kv_bytes` for the byte-budget accounting so the
     /// memory cap covers both KV and SSM state.
@@ -789,6 +859,8 @@ pub const HotPrefixCache = struct {
         allocator.free(e.tokens);
         allocator.free(e.media);
         e.snapshot.deinit();
+        if (e.ring_tail) |*t| t.deinit();
+        e.ring_tail = null;
         if (e.ssm_checkpoints) |cps| {
             for (cps) |*cp| cp.deinit(allocator);
             allocator.free(cps);
@@ -1025,19 +1097,7 @@ pub const HotPrefixCache = struct {
     /// their shape + dtype so this is exact, not a heuristic. Quant schemes
     /// account for q, scales, biases together.
     fn snapshotBytes(snap: *const KVCacheSnapshot) u64 {
-        var total: u64 = 0;
-        for (snap.entries) |e| {
-            if (!e.initialized) continue;
-            total += @as(u64, mlx.mlx_array_size(e.keys)) * @as(u64, mlx.mlx_array_itemsize(e.keys));
-            total += @as(u64, mlx.mlx_array_size(e.values)) * @as(u64, mlx.mlx_array_itemsize(e.values));
-            if (snap.config.scheme != .off) {
-                total += @as(u64, mlx.mlx_array_size(e.keys_scales)) * @as(u64, mlx.mlx_array_itemsize(e.keys_scales));
-                total += @as(u64, mlx.mlx_array_size(e.keys_biases)) * @as(u64, mlx.mlx_array_itemsize(e.keys_biases));
-                total += @as(u64, mlx.mlx_array_size(e.values_scales)) * @as(u64, mlx.mlx_array_itemsize(e.values_scales));
-                total += @as(u64, mlx.mlx_array_size(e.values_biases)) * @as(u64, mlx.mlx_array_itemsize(e.values_biases));
-            }
-        }
-        return total;
+        return snap.bytes();
     }
 
     /// Resident bytes of a speculative-side snap: the KV plus (qwen4_exp) the head's QSA aux half.
@@ -1370,12 +1430,13 @@ pub const HotPrefixCache = struct {
                 continue;
             }
             if (module_request != null) continue;
-            if (!ringRestores(&e.snapshot, shared, prompt_ids.len)) continue;
+            const tail: ?*const KVCacheSnapshot = if (e.ring_tail) |*t| t else null;
             const effective = if (require_ssm_checkpoint) blk: {
                 const cps = e.ssm_checkpoints orelse continue;
                 const cp = highestCheckpointAtOrBelow(cps, shared) orelse continue;
+                if (!ringRestores(&e.snapshot, cp.pos, prompt_ids.len) and !(tail != null and tailRestores(tail.?, cp.pos))) continue;
                 break :blk cp.pos;
-            } else shared;
+            } else if (ringRestores(&e.snapshot, shared, prompt_ids.len)) shared else if (tail != null and tailRestores(tail.?, @min(shared, tail.?.step))) @min(shared, tail.?.step) else continue;
             if (effective > best_effective or
                 (effective == best_effective and shared > best_shared))
             {
@@ -1519,9 +1580,31 @@ pub const HotPrefixCache = struct {
         return matched - @intFromBool(matched == prompt_len and matched > 0) >= snap.ringFloor();
     }
 
+    /// Whether a `ringTail` holds the window behind `pos`.
+    fn tailRestores(tail: *const KVCacheSnapshot, pos: usize) bool {
+        return pos > 0 and pos <= tail.step and pos >= tail.ringFloor();
+    }
+
     fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, media: []const MediaSpan, quant_config: kv_quant.KVQuantConfig) ?struct { idx: usize, shared: usize } {
         const match = self.findBestRestorableMatch(prompt_ids, has_tools, media, quant_config, false, null) orelse return null;
         return .{ .idx = match.idx, .shared = match.shared };
+    }
+
+    /// `respell` the prompt against the RAM entry it follows furthest, when it leaves that entry inside it.
+    pub fn respellPrompt(self: *const HotPrefixCache, allocator: std.mem.Allocator, prompt_ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, spelling: anytype) !?Respelled {
+        var best: ?*const Entry = null;
+        var best_shared: usize = 0;
+        for (self.entries.items) |*e| {
+            if (e.checked_out_by != null or e.module != null or e.has_tools != has_tools) continue;
+            if (!std.meta.eql(e.quant_config, quant_config)) continue;
+            const shared = std.mem.indexOfDiff(u32, e.tokens, prompt_ids) orelse return null;
+            if (mediaSharedBound(e.media, media) < shared) continue;
+            if (shared > best_shared) {
+                best = e;
+                best_shared = shared;
+            }
+        }
+        return respell(allocator, (best orelse return null).tokens, prompt_ids, media, spelling);
     }
 
     /// Try to restore a matching entry into `target_cache`. On success, returns
@@ -1864,7 +1947,16 @@ pub const HotPrefixCache = struct {
                 effective_matched = 0;
             }
         }
-        if (effective_matched > 0 and !ringRestores(&e.snapshot, effective_matched, prompt_ids.len)) {
+        // Rings past the match restore through the rows the entry kept at its prompt's end.
+        var ring_from_tail = false;
+        if (effective_matched > 0 and !ringRestores(&e.snapshot, effective_matched, prompt_ids.len)) if (e.ring_tail) |*t| {
+            if (target_ssm_entries == null) effective_matched = @min(effective_matched, t.step);
+            if (tailRestores(t, effective_matched)) {
+                try target_cache.restoreRingTail(t);
+                ring_from_tail = true;
+            }
+        };
+        if (effective_matched > 0 and !ring_from_tail and !ringRestores(&e.snapshot, effective_matched, prompt_ids.len)) {
             log.info("  [hot-cache] sliding ring holds rows from {d}; match {d} falls behind them\n", .{ e.snapshot.ringFloor(), effective_matched });
             effective_matched = 0;
         }
@@ -2447,7 +2539,7 @@ pub const HotPrefixCache = struct {
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
     ) !CommitStatus {
-        return self.commitWithMediaState(source_cache, tokens, has_tools, media, 0, ssm_cps, dflash, mtp, tokens.len);
+        return self.commitWithMediaState(source_cache, tokens, has_tools, media, 0, ssm_cps, dflash, mtp, tokens.len, null);
     }
 
     /// `prompt_len` is the committing request's PROMPT length inside `tokens`
@@ -2466,8 +2558,11 @@ pub const HotPrefixCache = struct {
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
         prompt_len: usize,
+        ring_tail: ?KVCacheSnapshot,
     ) !CommitStatus {
         const quant_config = source_cache.config;
+        var new_tail = ring_tail;
+        defer if (new_tail) |*t| t.deinit();
         // An item's key applies only to rows the entry covers: a cancelled
         // prefill that stopped before an item commits without it.
         var eff_media = spansBelow(media, tokens.len);
@@ -2520,6 +2615,11 @@ pub const HotPrefixCache = struct {
         }
 
         var new_snap = try source_cache.snapshot();
+        // A tail the entry's own rings already restore is not worth its bytes.
+        if (new_tail) |*t| if (ringRestores(&new_snap, t.step, t.step + 1)) {
+            t.deinit();
+            new_tail = null;
+        };
         // The speculative-side payloads are best-effort: a snapshot failure
         // must not cost the trunk KV entry they ride on.
         var new_dflash: ?DflashSnap = null;
@@ -2549,7 +2649,7 @@ pub const HotPrefixCache = struct {
                 log.warn("  [hot-cache] mtp history snapshot failed: {s}\n", .{@errorName(err)});
             }
         }
-        var new_kv_bytes = snapshotBytes(&new_snap);
+        var new_kv_bytes = snapshotBytes(&new_snap) + if (new_tail) |*t| t.bytes() else 0;
         var new_ssm_bytes: u64 = 0;
         if (ssm_cps) |cps| {
             for (cps) |*cp| new_ssm_bytes += ssmCheckpointBytes(cp);
@@ -2662,6 +2762,8 @@ pub const HotPrefixCache = struct {
                         eff_cps = shrunk;
                     }
                 }
+                if (new_tail) |*t| t.deinit();
+                new_tail = null;
                 eff_tokens = tokens[0..tl];
                 // The entry keeps only the items whose rows it still holds.
                 eff_media = spansBelow(eff_media, tl);
@@ -2769,7 +2871,7 @@ pub const HotPrefixCache = struct {
             }
             if (eff_cps) |own| {
                 // Consumes both on every path; on error neither survives.
-                const merged = self.mergeCheckpointLists(cloned, own, firstSpanStart(eff_media)) catch |err| {
+                const merged = self.mergeCheckpointLists(cloned, own, firstSpanStart(eff_media), new_snap.ringFloor(), if (new_tail) |*t| t else null) catch |err| {
                     log.warn("  [hot-cache] checkpoint merge failed: {s}\n", .{@errorName(err)});
                     eff_cps = null;
                     new_bytes -= new_ssm_bytes;
@@ -2830,7 +2932,7 @@ pub const HotPrefixCache = struct {
                 // not touch it.
                 e.ssm_checkpoints = null;
                 const new = eff_cps orelse break :blk old;
-                break :blk try self.mergeCheckpointLists(old, new, firstSpanStart(eff_media));
+                break :blk try self.mergeCheckpointLists(old, new, firstSpanStart(eff_media), new_snap.ringFloor(), if (new_tail) |*t| t else null);
             };
 
             // Free everything the old entry owned EXCEPT the (now-detached)
@@ -2838,6 +2940,9 @@ pub const HotPrefixCache = struct {
             self.allocator.free(e.tokens);
             self.allocator.free(e.media);
             e.snapshot.deinit();
+            if (e.ring_tail) |*t| t.deinit();
+            e.ring_tail = new_tail;
+            new_tail = null;
             // The old speculative payloads describe a strict PREFIX of the
             // new tokens, but they are keyed to their own base_pos and
             // length; the new ones supersede them outright. A commit with no
@@ -2928,6 +3033,7 @@ pub const HotPrefixCache = struct {
             .quant_config = quant_config,
             .kv_bytes = new_bytes,
             .ssm_checkpoints = eff_cps,
+            .ring_tail = new_tail,
             .ssm_bytes = new_ssm_bytes,
             .dflash = new_dflash,
             .dflash_bytes = new_dflash_bytes,
@@ -2947,6 +3053,7 @@ pub const HotPrefixCache = struct {
             }
             return err;
         };
+        new_tail = null;
         self.current_kv_bytes += new_bytes;
         // The trim prices a prefix against the checkpoints that survive a shed, so the shed runs here too.
         if (self.max_kv_bytes > 0) self.shedCheckpointsToFit();
@@ -3550,6 +3657,8 @@ pub const HotPrefixCache = struct {
         old: []SSMCheckpoint,
         new: []SSMCheckpoint,
         media_start: ?usize,
+        ring_floor: usize,
+        tail: ?*const KVCacheSnapshot,
     ) !?[]SSMCheckpoint {
         var merged = std.ArrayList(SSMCheckpoint).empty;
         var i: usize = 0;
@@ -3592,8 +3701,29 @@ pub const HotPrefixCache = struct {
         self.allocator.free(old);
         self.allocator.free(new);
         sources_freed = true;
+        // The entry's sliding ring restores nothing below its floor (`ringRestores`) but where its ring tail holds the
+        // window: the cap must not thin away the checkpoints it can still reach to keep ones it never will.
+        var reachable: usize = 0;
+        for (merged.items) |c| {
+            var cp = c;
+            if (cp.pos < ring_floor and !(tail != null and tailRestores(tail.?, cp.pos))) cp.deinit(self.allocator) else {
+                merged.items[reachable] = cp;
+                reachable += 1;
+            }
+        }
+        merged.shrinkRetainingCapacity(reachable);
+        if (reachable == 0) {
+            merged.deinit(self.allocator);
+            return null;
+        }
+        // The checkpoint the ring tail restores at is thinned last: without it the tail restores nothing.
+        var tail_cp: ?SSMCheckpoint = if (tail) |t| for (merged.items, 0..) |c, k| {
+            if (c.pos == t.step) break merged.orderedRemove(k);
+        } else null else null;
+        defer if (tail_cp) |*c| c.deinit(self.allocator);
+        const keep_max = self.ssm_checkpoint_max -| @intFromBool(tail_cp != null);
         while (self.ssm_checkpoint_max > 0 and
-            merged.items.len > self.ssm_checkpoint_max)
+            merged.items.len > keep_max)
         {
             // Under three there is no interior to thin; honour the cap by
             // dropping the oldest, which is also the cheapest to redo.
@@ -3605,6 +3735,12 @@ pub const HotPrefixCache = struct {
             );
             var dropped = merged.orderedRemove(drop);
             dropped.deinit(self.allocator);
+        }
+        if (tail_cp) |c| {
+            var at: usize = 0;
+            while (at < merged.items.len and merged.items[at].pos < c.pos) at += 1;
+            try merged.insert(self.allocator, at, c);
+            tail_cp = null;
         }
         const owned = try merged.toOwnedSlice(self.allocator);
         // The inherited latest and this turn's latest both carry the indexer
@@ -4223,6 +4359,56 @@ pub const HotPrefixCache = struct {
 // ── Tests ──
 
 const testing = std.testing;
+
+/// Token spellings for the respell tests: 7 is a special token, which has none.
+const TestSpelling = struct {
+    const words = [_]?[]const u8{ "A", " ----", "--------", "--", " ", "------", "B", null, "C" };
+    pub fn tokenSpelling(_: TestSpelling, id: u32) ?[]const u8 {
+        return if (id < words.len) words[id] else null;
+    }
+};
+
+fn freeRespelled(r: Respelled) void {
+    testing.allocator.free(r.ids);
+    testing.allocator.free(r.media);
+}
+
+test "respell: a prompt takes the entry's spelling of the bytes they share, to the entry's end" {
+    // " ----" "--------" "--" and " " "--------" "------" are the same 15 bytes.
+    const entry = [_]u32{ 0, 1, 2, 3, 6 };
+    const prompt = [_]u32{ 0, 4, 2, 5, 6, 8 };
+    const got = (try respell(testing.allocator, &entry, &prompt, &.{}, TestSpelling{})).?;
+    defer freeRespelled(got);
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 6, 8 }, got.ids);
+}
+
+test "respell: two respelled runs in one answer, with plain tokens between them" {
+    const entry = [_]u32{ 0, 1, 2, 3, 6, 0, 1, 2, 3, 6 };
+    const prompt = [_]u32{ 0, 4, 2, 5, 6, 0, 4, 2, 5, 6, 8 };
+    const got = (try respell(testing.allocator, &entry, &prompt, &.{}, TestSpelling{})).?;
+    defer freeRespelled(got);
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 6, 0, 1, 2, 3, 6, 8 }, got.ids);
+}
+
+test "respell: an image after a respelled answer moves by the tokens the respelling saved" {
+    // 7 7 is an image's placeholder run. The answer " " "------" "------" "--" is " ----" "--------" "--", one token less.
+    const entry = [_]u32{ 0, 7, 7, 0, 1, 2, 3, 6 };
+    const prompt = [_]u32{ 0, 7, 7, 0, 4, 5, 5, 3, 6, 0, 7, 7, 8 };
+    const media = [_]MediaSpan{ .{ .start = 1, .key = 9 }, .{ .start = 10, .key = 11 } };
+    const got = (try respell(testing.allocator, &entry, &prompt, &media, TestSpelling{})).?;
+    defer freeRespelled(got);
+    try testing.expectEqualSlices(u32, &.{ 0, 7, 7, 0, 1, 2, 3, 6, 0, 7, 7, 8 }, got.ids);
+    try testing.expectEqualSlices(MediaSpan, &.{ .{ .start = 1, .key = 9 }, .{ .start = 9, .key = 11 } }, got.media);
+}
+
+test "respell: different bytes, a special token, an identical prompt or an item inside the run leave the prompt" {
+    const entry = [_]u32{ 0, 1, 2, 3, 6 };
+    try testing.expectEqual(null, try respell(testing.allocator, &entry, &.{ 0, 4, 2, 6 }, &.{}, TestSpelling{}));
+    try testing.expectEqual(null, try respell(testing.allocator, &.{ 0, 7, 6 }, &.{ 0, 4, 6 }, &.{}, TestSpelling{}));
+    try testing.expectEqual(null, try respell(testing.allocator, &entry, &.{ 0, 1, 2, 3, 6, 8 }, &.{}, TestSpelling{}));
+    const inside = [_]MediaSpan{.{ .start = 2, .key = 9 }};
+    try testing.expectEqual(null, try respell(testing.allocator, &entry, &.{ 0, 4, 2, 5, 6 }, &inside, TestSpelling{}));
+}
 
 test "HotPrefixCache: shouldUse gates hybrid by enable_ssm_checkpoints" {
     var cfg = model_mod.ModelConfig{};
@@ -4880,7 +5066,7 @@ test "HotPrefixCache: media spans bound the reusable prefix at the first differi
     const a = MediaSpan{ .start = 100, .key = 0xA };
     const b = MediaSpan{ .start = 300, .key = 0xB };
     // An item past the committed rows (a cancelled prefill) is not the entry's.
-    _ = try hc.commitWithMediaState(&cache, tokens[0..400], false, &.{ a, b, .{ .start = 450, .key = 0xC } }, 0, null, null, null, 400);
+    _ = try hc.commitWithMediaState(&cache, tokens[0..400], false, &.{ a, b, .{ .start = 450, .key = 0xC } }, 0, null, null, null, 400, null);
     try testing.expectEqualSlices(MediaSpan, &.{ a, b }, hc.entries.items[0].media);
 
     const Case = struct { media: []const MediaSpan, want: usize };
@@ -4906,7 +5092,7 @@ test "HotPrefixCache: media spans bound the reusable prefix at the first differi
     var cache2 = try KVCache.init(testing.allocator, 2);
     defer cache2.deinit();
     try testFillCache(&cache2, s, 2, 600);
-    const st2 = try hc2.commitWithMediaState(&cache2, &tokens, false, &.{ a, b }, 0, null, null, null, tokens.len);
+    const st2 = try hc2.commitWithMediaState(&cache2, &tokens, false, &.{ a, b }, 0, null, null, null, tokens.len, null);
     try testing.expectEqual(@as(usize, 256), st2.ok); // 32 KB / 128 B rows
     try testing.expectEqualSlices(MediaSpan, &.{a}, hc2.entries.items[0].media);
 }
@@ -5289,6 +5475,7 @@ test "HotPrefixCache: hybrid lookup reuses only the prefix before changed media"
         null,
         null,
         cached_tokens.len,
+        null,
     );
 
     var target_cache = try KVCache.init(testing.allocator, 3);
@@ -5467,7 +5654,7 @@ test "HotPrefixCache: a text turn after image turns restores the pre-media prefi
     text_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &text_ssm, 4, s);
     text_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &text_ssm, 8, s);
     text_cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &text_ssm, 10, s);
-    _ = try hc.commitWithMediaState(&text_cache, &text_tokens, false, &.{}, 0, text_cps, null, null, text_tokens.len);
+    _ = try hc.commitWithMediaState(&text_cache, &text_tokens, false, &.{}, 0, text_cps, null, null, text_tokens.len, null);
 
     // The image turn restores the pre-media text prefix (cross-key, capped
     // at the boundary) and prefills the rest.
@@ -5500,7 +5687,7 @@ test "HotPrefixCache: a text turn after image turns restores the pre-media prefi
     const image_cps = try testing.allocator.alloc(SSMCheckpoint, 2);
     image_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &image_state, 16, s);
     image_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &image_state, 18, s);
-    _ = try hc.commitWithMediaState(&image_cache, &image_tokens, false, &image_media, 0, image_cps, null, null, image_tokens.len);
+    _ = try hc.commitWithMediaState(&image_cache, &image_tokens, false, &image_media, 0, image_cps, null, null, image_tokens.len, null);
     try testing.expectEqual(@as(usize, 1), hc.entryCount());
 
     // The next text-only turn must still restore the pre-media prefix: the
@@ -5550,7 +5737,7 @@ test "HotPrefixCache: thinning keeps the highest checkpoint below the media boun
     try testFillCache(&c1, s, 3, 16);
     const first = try testing.allocator.alloc(SSMCheckpoint, 3);
     for (first, 0..) |*c, i| c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &ssm, 2 + i * 2, s);
-    _ = try hc.commitWithMediaState(&c1, tokens[0..16], false, &.{.{ .start = media_start, .key = 0xF00D }}, 0, first, null, null, 16);
+    _ = try hc.commitWithMediaState(&c1, tokens[0..16], false, &.{.{ .start = media_start, .key = 0xF00D }}, 0, first, null, null, 16, null);
 
     // The next turn extends the same conversation, so the commit replaces the
     // entry and merges: seven checkpoints thinned down to the cap of three.
@@ -5559,7 +5746,7 @@ test "HotPrefixCache: thinning keeps the highest checkpoint below the media boun
     try testFillCache(&c2, s, 3, 24);
     const second = try testing.allocator.alloc(SSMCheckpoint, 4);
     for (second, 0..) |*c, i| c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &ssm, 12 + i * 2, s);
-    _ = try hc.commitWithMediaState(&c2, &tokens, false, &.{.{ .start = media_start, .key = 0xF00D }}, 0, second, null, null, tokens.len);
+    _ = try hc.commitWithMediaState(&c2, &tokens, false, &.{.{ .start = media_start, .key = 0xF00D }}, 0, second, null, null, tokens.len, null);
 
     try testing.expectEqual(@as(usize, 1), hc.entryCount());
     const kept = hc.entries.items[0].ssm_checkpoints.?;
@@ -6190,6 +6377,188 @@ test "HotPrefixCache: replace path bounds SSM checkpoints and keeps them spread"
     try testing.expectEqual(@as(usize, 300), kept[1].pos);
     try testing.expectEqual(@as(usize, 500), kept[2].pos);
     try testing.expectEqual(@as(usize, 800), kept[3].pos);
+}
+
+// Bar: on a sliding ring the cap keeps the checkpoints the ring can still restore, so a turn that leaves the entry
+// inside its last answer restores at that answer's prompt end instead of cold-prefilling the whole prompt.
+test "HotPrefixCache: a sliding entry's checkpoint cap keeps what its ring can restore" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var toks: [400]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 11);
+    var srcs: [6][3]SSMCacheEntry = undefined;
+    for (&srcs, 0..) |*e, i| {
+        const f: f64 = @floatFromInt(i + 1);
+        e.* = pcBuildHybrid(s, 100.0 * f, 500.0 * f);
+    }
+    defer for (&srcs) |*e| pcFreeHybrid(e);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.ssm_checkpoint_max = 4;
+
+    // An 8-row window over a ring that keeps 24 rows, written 50 rows at a time.
+    const Fill = struct {
+        fn blocks(c: *KVCache, st: mlx.mlx_stream, n: usize) !void {
+            for (0..n) |_| {
+                var k = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(k);
+                try mlx.check(mlx.mlx_zeros(&k, &[_]c_int{ 1, 2, 50, 4 }, 4, .bfloat16, st));
+                var view = try c.updateSliding(0, k, k, st, 8 + 50 - 1, 8, 24);
+                view.deinit();
+            }
+        }
+    };
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try Fill.blocks(&cache, s, 6);
+    const cps1 = try testing.allocator.alloc(SSMCheckpoint, 3);
+    for (cps1, 0..) |*c, i| c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], 50 + i * 90, s);
+    _ = try hc.commitWithSsm(&cache, toks[0..300], false, cps1, null, null);
+
+    // The next turn extends it to 400, with checkpoints at its prompt's end and its answer's.
+    try Fill.blocks(&cache, s, 2);
+    var snap = try cache.snapshot();
+    const floor = snap.ringFloor();
+    snap.deinit();
+    try testing.expect(floor > 230 and floor <= 390);
+    const cps2 = try testing.allocator.alloc(SSMCheckpoint, 2);
+    cps2[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[4], 390, s);
+    cps2[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[5], 398, s);
+    _ = try hc.commitWithSsm(&cache, toks[0..400], false, cps2, null, null);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+
+    // A prompt that leaves the entry inside the answer restores at the answer's prompt end.
+    var next = toks;
+    for (next[395..]) |*t| t.* = 7;
+    var target_cache = try KVCache.init(testing.allocator, 1);
+    defer target_cache.deinit();
+    var target_ssm = pcEmptySsm();
+    defer pcFreeHybrid(&target_ssm);
+    var moe_off: usize = 0;
+    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target_ssm, s, &next, false, &.{}, null, null);
+    try testing.expectEqual(@as(usize, 390), r.matched);
+}
+
+/// An 8-row window over a ring that keeps 64 rows, written 50 rows at a time; a row holds its own position.
+fn pcFillRing(c: *KVCache, st: mlx.mlx_stream, from: usize, n: usize) !void {
+    for (0..n) |b| {
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        const lo: f64 = @floatFromInt(from + b * 50);
+        try mlx.check(mlx.mlx_arange(&flat, lo, lo + 50, 1.0, .float32, st));
+        var k = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k);
+        try mlx.check(mlx.mlx_reshape(&k, flat, &[_]c_int{ 1, 1, 50, 1 }, 4, st));
+        var view = try c.updateSliding(0, k, k, st, 8 + 50 - 1, 8, 64);
+        view.deinit();
+    }
+}
+
+/// The sum of the positions a restored ring holds, and its first row.
+fn pcRingRows(ring: *const transformer_mod.KVCacheEntry, s: mlx.mlx_stream) !struct { sum: f32, base: usize } {
+    var sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sum);
+    try mlx.check(mlx.mlx_sum(&sum, ring.keys, false, s));
+    _ = mlx.mlx_array_eval(sum);
+    var got: f32 = 0;
+    _ = mlx.mlx_array_item_float32(&got, sum);
+    return .{ .sum = got, .base = ring.base };
+}
+
+test "HotPrefixCache: a prompt that leaves a long answer early restores the rings' rows kept at its prompt end" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var toks: [1000]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 11);
+    var srcs: [2][3]SSMCacheEntry = .{ pcBuildHybrid(s, 100.0, 500.0), pcBuildHybrid(s, 200.0, 900.0) };
+    defer for (&srcs) |*e| pcFreeHybrid(e);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+
+    // A 200-token prompt whose last checkpoint sits at 190, then an 800-token answer that moves the ring past it.
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try pcFillRing(&cache, s, 0, 4);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[0], 190, s);
+    const tail = try cache.ringTail(190, s);
+    try testing.expect(tail != null);
+    try pcFillRing(&cache, s, 200, 16);
+    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[1], 998, s);
+    var snap = try cache.snapshot();
+    const floor = snap.ringFloor();
+    snap.deinit();
+    try testing.expect(floor > 250);
+    _ = try hc.commitWithMediaState(&cache, &toks, false, &.{}, 0, cps, null, null, 200, tail);
+
+    // The next prompt leaves the answer at 250, under the entry's ring floor: it resumes at the prompt's checkpoint.
+    var next = toks;
+    for (next[250..]) |*t| t.* = 7;
+    var target_cache = try KVCache.init(testing.allocator, 1);
+    defer target_cache.deinit();
+    var target_ssm = pcEmptySsm();
+    defer pcFreeHybrid(&target_ssm);
+    var moe_off: usize = 0;
+    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target_ssm, s, &next, false, &.{}, null, null);
+    try testing.expectEqual(@as(usize, 190), r.matched);
+    try testing.expectEqual(@as(usize, 190), target_cache.entries[0].offset);
+    // The window behind 190 is rows 128..189 (from a 32-row boundary, 32 rows of slack): their positions sum to 9827.
+    const rows = try pcRingRows(&target_cache.entries[0], s);
+    try testing.expectEqual(@as(usize, 128), rows.base);
+    try testing.expectApproxEqAbs(@as(f32, 9827), rows.sum, 1e-3);
+}
+
+test "HotPrefixCache: a plain-attention ring restores at the prompt's end after a long answer moved it" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var toks: [1000]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 11);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+
+    // A 200-token prompt, its rings' end kept, then an 800-token answer.
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try pcFillRing(&cache, s, 0, 4);
+    const tail = try cache.ringTail(null, s);
+    try pcFillRing(&cache, s, 200, 16);
+    _ = try hc.commitWithMediaState(&cache, &toks, false, &.{}, 0, null, null, null, 200, tail);
+
+    // The next prompt drops the answer (a template that drops the thought): it shares the prompt and resumes there.
+    var next: [260]u32 = undefined;
+    @memcpy(next[0..200], toks[0..200]);
+    for (next[200..]) |*t| t.* = 7;
+    var target_cache = try KVCache.init(testing.allocator, 1);
+    defer target_cache.deinit();
+    var moe_off: usize = 0;
+    const r = try hc.lookupAndRestore(&target_cache, &moe_off, null, s, &next, false, &.{}, null, null);
+    try testing.expectEqual(@as(usize, 200), r.matched);
+    const rows = try pcRingRows(&target_cache.entries[0], s);
+    try testing.expectEqual(@as(usize, 160), rows.base);
+    try testing.expectApproxEqAbs(@as(f32, 7180), rows.sum, 1e-3);
+}
+
+test "HotPrefixCache: the cap thins the checkpoint the ring tail restores at last" {
+    const a = testing.allocator;
+    var hc = HotPrefixCache.initWithMem(a, 4, 0);
+    defer hc.deinit();
+    hc.ssm_checkpoint_max = 4;
+    const old = try a.alloc(SSMCheckpoint, 3);
+    for (old, [_]usize{ 100, 400, 700 }) |*c, p| c.* = .{ .pos = p, .layers = try a.alloc(transformer_mod.SSMCacheEntrySnapshot, 0) };
+    const new = try a.alloc(SSMCheckpoint, 2);
+    for (new, [_]usize{ 905, 910 }) |*c, p| c.* = .{ .pos = p, .layers = try a.alloc(transformer_mod.SSMCacheEntrySnapshot, 0) };
+    var tail: KVCacheSnapshot = .{ .entries = try a.alloc(transformer_mod.KVCacheEntry, 0), .step = 905, .allocator = a, .config = transformer_mod.KVQuantConfig.dense };
+    defer tail.deinit();
+    // Bar: 905 sits closest to its neighbours, so a plain thin drops it first; the tail keeps it.
+    const merged = (try hc.mergeCheckpointLists(old, new, null, 0, &tail)).?;
+    defer {
+        for (merged) |*c| c.deinit(a);
+        a.free(merged);
+    }
+    try testing.expectEqual(@as(usize, 4), merged.len);
+    var kept = false;
+    for (merged) |c| kept = kept or c.pos == 905;
+    try testing.expect(kept);
 }
 
 test "HotPrefixCache: a revised budget evicts down to fit and a raised one keeps everything" {
@@ -6990,7 +7359,7 @@ test "HotPrefixCache: a failed commit still frees the checkpoints it was handed 
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
     cps[0] = .{ .pos = 4, .layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 0) };
     var toks = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    try testing.expectError(error.OutOfMemory, hc.commitWithMediaState(&src, &toks, false, &.{}, 0, cps, null, null, toks.len));
+    try testing.expectError(error.OutOfMemory, hc.commitWithMediaState(&src, &toks, false, &.{}, 0, cps, null, null, toks.len, null));
     // No frees here: the cache owns the checkpoints on every outcome.
 }
 
@@ -7880,7 +8249,7 @@ test "HotPrefixCache: inherit of a greedy continuation stops at the prompt" {
     var heir_cache = try KVCache.init(testing.allocator, 3);
     defer heir_cache.deinit();
     try testFillCache(&heir_cache, s, 3, heir_toks.len);
-    _ = try hc.commitWithMediaState(&heir_cache, &heir_toks, false, &.{}, 0, null, null, null, prompt_len);
+    _ = try hc.commitWithMediaState(&heir_cache, &heir_toks, false, &.{}, 0, null, null, null, prompt_len, null);
 
     var found = false;
     for (hc.entries.items) |*e| {
@@ -11363,7 +11732,7 @@ test "an image turn persists its full media-keyed prefix to the SSD tier" {
                 cps = try testing.allocator.alloc(SSMCheckpoint, positions.len);
                 for (positions, cps.?) |p, *cp| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, p, s);
             }
-            _ = try hc.commitWithMediaState(&cache, &tokens, false, &media, 0, cps, null, null, tokens.len);
+            _ = try hc.commitWithMediaState(&cache, &tokens, false, &media, 0, cps, null, null, tokens.len, null);
             hc.flushPendingDisk(s);
         }
         // A cold RAM tier (idle unload, restart) holds nothing of its own: the record
@@ -11435,7 +11804,7 @@ test "HotPrefixCache v9: a media turn persists media-keyed deep state; same span
         const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
         cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src300, 300, s);
         cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
-        _ = try hc.commitWithMediaState(&cache, &tokens, false, &spans, 0, cps, null, null, 600);
+        _ = try hc.commitWithMediaState(&cache, &tokens, false, &spans, 0, cps, null, null, 600, null);
         try testing.expect(hc.disk_dirty);
         hc.flushPendingDisk(s);
         try testing.expect(!hc.disk_dirty);

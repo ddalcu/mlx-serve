@@ -605,10 +605,33 @@ pub const Forward = extern struct {
     /// arrives as `Mode.decode`. False on decode steps and verify blocks. Read it only when `size` reaches it: an older
     /// host's `Forward` ends before it.
     prefill: bool = false,
-    /// A native drafter's round (`NativeDrafter.step`, `verify`): the request's stop ids. A round that verifies one
-    /// leaves the state past what the request commits, which the prefix cache cannot restore. Read it only when
-    /// `size` reaches it.
+    /// A native drafter's round (`NativeDrafter.step`, `verify`): the request's stop ids. A round that commits one
+    /// leaves the state past what the request commits, which the prefix cache cannot restore: `step` verifies none,
+    /// and a block `verify` drew (`draft_probs`) ends on its stop, which the engine tests and never asks `finish` to
+    /// keep. Read it only when `size` reaches it.
     stop_ids: Span(u32) = .{},
+    /// A native drafter's round: the drafts to verify after `t1` (a copy of the context), in place of the drafter's.
+    /// Empty = the drafter drafts. Read it only when `size` reaches it.
+    draft_ids: Span(u32) = .{},
+    /// A sampled native round (`NativeDrafter.verify`): the drafter draws its drafts from its own law at this
+    /// temperature, keyed by `draft_seed`, and returns that law (`ForwardOut.draft_probs`); 0 = its argmax drafts.
+    /// Read it only when `size` reaches it.
+    draft_temperature: f32 = 0,
+    draft_seed: u64 = 0,
+    /// A request's first prompt forward: the slot (`slots`' id of an earlier request) whose sequence this one repeats for
+    /// its first `adopt_len` positions, by the engine's record. State the model keeps per slot beside its caches (a
+    /// native drafter's) may move to this slot, valid up to there. 0 = none. Read it only when `size` reaches it.
+    adopt_slot: u32 = 0,
+    adopt_len: u64 = 0,
+    /// A native drafter's round: what the round costs on this machine by the drafts it verifies, in ms and timed at
+    /// load (`[0]` = it drafted and verified none), for the drafter's choice of how many to verify. Empty = not timed:
+    /// it verifies every draft. Read it only when `size` reaches it.
+    round_ms: Span(f32) = .{},
+    /// A native drafter's `step_group`: the request's sampling filter (`top_k` 0 = disabled, `top_p` 1 = off, `min_p`
+    /// 0 = off). Read them only when `size` reaches them.
+    top_k: u32 = 0,
+    top_p: f32 = 1.0,
+    min_p: f32 = 0.0,
 };
 
 /// Directional ablation (Arditi et al. 2024): slot i's forward removes `strengths[i]` times the component along its
@@ -773,6 +796,9 @@ pub const ForwardOut = extern struct {
     owed: Owed = .none,
     /// `NativeDrafter.step`'s result.
     round: Round = .{},
+    /// A sampled native round's drafter law `[drafts, vocab]` f32, a row per verified draft (`Forward.draft_temperature`);
+    /// null = the drafts are point masses. Read it only when `size` reaches it.
+    draft_probs: Array = .{},
 };
 
 // ── Hooks ──
@@ -922,6 +948,20 @@ pub const NativeDrafter = extern struct {
     /// Whether this load drafts: a load may leave its drafter out (a GPU it loses on), and then the model has no
     /// stages. Null = always. Read it only when `size` reaches it.
     active: ?*const fn (m: *anyopaque) callconv(.c) bool = null,
+    /// `verify` for `n` requests at once, one slot each (`fs[k]` is the one-slot `Forward` `verify` takes, `outs[k]` its
+    /// out): their blocks are read as the rows of one forward and stay open together until `finish_group`. Null = one
+    /// open verify at a time.
+    verify_group: ?*const fn (m: *anyopaque, fs: [*]const Forward, outs: [*]ForwardOut, n: u32) callconv(.c) Verdict = null,
+    /// `finish` for the group `verify_group` left open: `accepted[k]` drafts kept of the request of slot `slots[k]`, in
+    /// the order the verify took them; `outs[k].round.position` the model's position after its round.
+    finish_group: ?*const fn (m: *anyopaque, slots: [*]const u32, accepted: [*]const u32, outs: [*]ForwardOut, n: u32) callconv(.c) Verdict = null,
+    /// The most slots whose rounds verify as one forward to the benefit of each on this GPU (where more slots decode, they
+    /// decode plain in the batched group). Null = no limit past the plugin's own.
+    group_width: ?*const fn (m: *anyopaque) callconv(.c) u32 = null,
+    /// One complete round (draft, verify, accept and commit) for `n` requests at once, greedy or sampled (each lane
+    /// reads its own sampling params and seed from `fs[k]`), writing each lane's committed block into `outs[k].round`.
+    /// Null = use `step` / `verify_group` + `finish_group`. Read only when `size` reaches it.
+    step_group: ?*const fn (m: *anyopaque, fs: [*]const Forward, outs: [*]ForwardOut, n: u32) callconv(.c) Verdict = null,
 };
 
 /// A trunk tensor a drafter reads beside the trunk's forward.

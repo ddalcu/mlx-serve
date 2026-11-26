@@ -45,19 +45,30 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
   projections are held `[4, rank, 2 D]` for the same reason.
 - **Every step kernel takes rows on grid y**, so `kernels.visit` serves one row, a prompt's rows and batched slots;
   the conv kernels read one state the rows chain behind (`SEQ` 1) or a state per row (`SEQ` 0, batched slots).
-- **Reads of at most `small_rows` rows build a mask (`relmask.metal`) and use MLX's attention**: the flash kernel
-  (`relattn.metal`, mlx-lm's, MIT) walks the keys 16 at a time on one threadgroup, a prompt's throughput and a few
-  rows' latency.
-- **2 to `packed_rows` rows read the packed expert banks in place** (`ups`, `downs`, then `sum` over one pick a
-  row); past that MLX's gather, which reads a bank once for all its picks, wins.
+- **A prompt's rows (past `small_rows`) read on the NAX tensor unit** (`relattn_nax.metal`: `matmul2d` for Q K^T and
+  P V, no mask built); `relattn.metal` (8x8 SIMD matrices, 4x the time a key) serves a GPU without NAX. A masked key's
+  value still enters P V at weight 0 in its 32-key tile: a NaN there reaches the row.
+- **Reads of at most `small_rows` rows build a mask (`relmask.metal`) and use MLX's attention**, which beats the flash
+  kernel (`relattn.metal`, mlx-lm's, MIT: 16 keys at a time on one threadgroup) at a few rows' latency.
+- **2 to `packed_rows` rows (63) read the packed expert banks in place, their picks GROUPED by expert** (`group`: tiles
+  of up to 4 picks; `ups_grp`, `downs_grp`, then `few_tail`): an expert's bytes are decoded once a tile. One row reads
+  `ups`/`downs`; MLX's gather wins only from 64 rows (its sorted tiles start there; under it, it reads a bank a pick).
+- **2 to 16 rows read the keys on the NAX tensor unit in one pass** (`relsplit_nax.metal`, `splitReadNax`; up to four
+  slots' blocks a launch, `splitReadNaxLanes`: a kernel takes 31 buffers). `relsplit.metal` serves a GPU without NAX, its
+  splits joined in `relcomb` (normalised after the sum: contract gate 4). Under 4 KB of keys MLX binds them `constant`: old path.
 - **A threadgroup past 256 threads is proven per instantiation** (`unproven`): an M1/M2 compiles `pre` and `mid` for
   384 to 576 threads, under the 768 an M3+ runs. The first dispatch is evaluated and a refusal narrows
   `stream_threads` for the process; every other kernel's group is at most 256.
+- **A template argument never carries a launch's shape** (rows, rows a slot, keys): each value is an instantiation, and
+  past the proof table every launch pays an evaluation. A kernel reads such a count from its inputs' shapes.
 - **The activation and the message gates use `precise::tanh` / `precise::exp`, the sigmoid divided once**: the fast
   tanh is NaN at an infinity and a percent off near zero, and `capped * (1 / (1 + e))` flushes a tiny sigmoid to zero.
 - **`split_from` to `split_rows` rows (4 to 8) read through `relsplit` + `relcomb`**: MLX's attention reads the keys
   once per row and head, the split kernel once per KV head over threadgroups of 128 keys. At 2 or 3 rows they tie,
   and the mask path keeps them.
+- **A verify's rows (2 to `open_rows`) read the cache where it lies, their own keys a second source of `relsplit`**,
+  `split_rows` a launch: joined to the cache, every global visit copied all of it, and past 8 rows the mask path
+  walked the keys once per row and head (at 32K a ninth row cost more than the eight before it).
 - **A few-row f32 dot stays in a kernel** (`routerRows`, `gate`'s dots, 2 to `small_rows` rows): on NAX, MLX's f32
   matmul past one row is TF32 (~1e-3) at ~7x a row's latency; its one-row path is exact.
 - **A kernel is more exact than its op chain**, and on the random fixture a last bit flips an expert pick:
@@ -68,11 +79,39 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
   spliced at `<|unused_200054|>`. `bases.Model.placeholders` must be set at load or the rows never land.
 - **One row's output gate rides the output projection** (`oGated`, `oproj.metal`): the launch it saves beats MLX's
   one-row qmv on this shape too. Affine at every width or dense (`oFormat`); anything else keeps `gated` + `projectRows`.
-- **The draft head** (`mtp.safetensors`, greedy and sampled requests): a round drafts 7 tokens,
-  verifies the prefix the drafter is sure of (`min_sure`, never a stop id: `draftsToVerify`) as ONE forward that appends nothing (`kernels.Open`), and
-  commits the rows the trunk agrees with (`kernels.commit`): no rollback. Its taps are per engine slot (`Spec.select`).
+- **The draft head** (`mtp.safetensors`): a round drafts 7 tokens, verifies the drafts worth their rows
+  (`draftsToVerify`, on the engine's ladder `Forward.round_ms`; never a stop id) as ONE forward that appends nothing
+  (`kernels.Open`), and commits the rows the trunk agrees with (`kernels.commit`): no rollback. State is per slot (`Spec.select`).
+- **A `drafter/` folder in the pack serves in place of the bundled head** when `config.readDflash2` runs its config
+  (`incoai/Inkling-2-Mini-DFlash2`, `dflash2.zig`, z-lab's MLX model the reference): five sliding layers over the taps, a
+  selector chaining top-16 candidates a row, its soft cap AFTER the edge (`after_correction`, the one mode ported).
+- **A sampled block's draft starts on the GPU and its ids are read AFTER the verify graph is built** (`chainDraft`, `settleDraft`):
+  the verify embeds the ids as an array, so nothing waits on the host; a stop id ends the block there and the later rows go unread.
+- **A DFlash2 round is one launch chain: a draft TREE built on the GPU, its verify, the accept and the path's commit**
+  (`stepGroup`, `NativeDrafter.step_group`; `MLX_SERVE_INKLING2_TREE=0` = the chain). A sampled node draws its children without
+  replacement and the accept is rejection over the top 16 (`sample_tree_*`); the host reads one small result a round.
+- **A lane's tree has `treeWidth` rows: 8 alone, fewer with more lanes or a sampled lane** (every row reads its experts'
+  banks, the forward's largest read). A chain block never has more than 15 rows: 16 takes the NAX quantized tile lane, 3x slower.
+- **A float32 stream's tree read keeps float matrices** (`relsplit_lanes`, `msv_ink2_el`): in half, one flipped expert pick
+  on the fixture moved a node's logits (cosine 0.97) on a GPU without the tensor unit.
+- **The DFlash2 context is the newest `window - 1` (2047) committed positions** (`Spec.keep`): a row attends a ring key
+  only within `window` of its index, so past 2040 keys the block's later rows lose the oldest (`windowMask`); the
+  parity test runs both sides of it. The engine's own sidecar resolver also sees `drafter/` and declines it by name.
+- **The plugin times nothing and the verify stays lazy** (`verifyRound`): the engine prices rounds
+  (`Forward.round_ms`) and its accept evaluates the verify with it, one evaluation a round.
+- **The drafter reads its block rows through an 8-bit copy of a dense head** (`draft.headCopy`, 463 MB): the 926 MB
+  head is a draft's largest read, and drafts are only proposals. At 4 bits acceptance fell.
 - **A drafter layer `local_layer_ids` leaves out reads every committed position** (`appendFull`, billed as `Bill.state_per_token`),
   the others the ring's newest window - 1: read as a sliding layer, the release's layer 1 drafted blind past 1K tokens.
+- **A sampled round draws its drafts from the drafter's law at the request's temperature, as many as the engine
+  asks** (`Drafter.Law`, `accept_cap`): the width is chosen before any draft is drawn (a drawn token's probability, or
+  its law's peak, cut rounds that land), and a draft law cooler than the request's lands less.
+- **A drawn block is never cut on what was drawn**: it ends on its stop id (`draftsToVerify`), which the engine tests
+  like any draft and hands back as the pending token (`stopPending`). Cut before it, a sampled turn ended less often
+  than the trunk ends it.
+- **A sampled, unseeded request continues the slot whose sequence it repeats** (`Forward.adopt_slot`, `Spec.adopt`):
+  slot ids are per request, so the drafter re-read only the uncached tail every turn. The ring and full context are cut
+  back to the restore. The engine picks the newest record agreeing over half the prompt (`adoptFor`); the state moves.
 - **The draft head loads on Apple9+ only, with the kernels on** (`draftsOn`, told to the engine by `NativeDrafter.active`):
   on an M1 a few-row verify costs so much more than a step that drafted decode ran under serial, and only the kernels
   serve a verified or batched visit (`MLX_SERVE_INKLING2_FUSED=0` also batches no slots).
@@ -86,11 +125,28 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
   reads run as one `relslots` launch per 8 slots (each slot's K, V and K's strides a buffer: a kernel takes 31) into
   `relcomb`. A CPU stream or several rows a slot run a slot at a time.
 
+- **A verify of several slots is ONE forward** (`openGroup`, `Spec.opens`, `NativeDrafter.verify_group`/`finish_group`): blocks stack
+  `rows` a slot (shorter ones padded), the conv kernels read `RPS` rows behind each slot's own state, `attendOpen` reads each
+  slot's own cache, `commitLane` keeps a slot's accepted rows. A slot's rows equal its verify alone (proof test).
+- **The DFlash2 draft batches across slots** (`draftBatch`, `pickBatch`): dense work over every lane's rows, attention
+  per lane over its own context; it differs from a lane alone by matmul tiling (cosine 0.95+) and accepts the same.
+  The bundled head drafts a slot at a time.
+- **A DFlash2 group's width is the GPU's, the bundled head's 2** (`groupWidth`, `NativeDrafter.group_width`): 16 with NAX,
+  8 elsewhere; past it the slots decode plain in the batched group. The head keeps too few drafts a grouped round for a
+  wider group to beat the plain batched steps it replaces.
+- **A quantized pack's joined projections are whole 64-row tiles** (`At.joinQuant`: zero rows behind the parts, `widths`
+  the parts alone): the tensor unit's quantized matmul takes no other output width, and a verify's rows fell to a slow lane.
+- **The q, k and v gates' down projections are a matmul a gate from 16 rows** (`gateDowns`): MLX's batched matmul leaves
+  its few-row kernel there for one several times slower.
+
 ## Packs and proof
 
 - The release needs no conversion. `tests/convert_inkling2.py --bits 4|5|6|8|16` writes mlx-lm's layout with the
   attention, embedding and head affine (the experts keep the release's bytes) and copies the draft head: at 4 bits
   its names, dtypes and shapes equal `mlx-community/Inkling-2-Mini-4bit`'s.
+- The DFlash2 pair: a pack with the draft's two files in `drafter/`. Fixtures: `tests/dump_inkling2_dflash2_fixtures.py`
+  (its header has the command), then `INKLING2_DFLASH2_DIR` + `INKLING2_DFLASH2_FIXTURES` (`inkling2 dflash2` parity)
+  and `INKLING2_DFLASH2_PACK` (the rounds).
 - `--experts BITS:GROUP[,LAYERS=...]` re-quantizes the experts to mlx-lm's affine (2-6, 8 bits, groups 32/64/128; a
   width off the `--bits` block is listed per module path in `quantization`). One to `packed_rows` rows read them in
   place (`ups`/`downs` FMT 3), more go through MLX's gather. Score a pack with `tests/inkling2_kld.py`: no bf16 experts.
@@ -99,7 +155,9 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - `proof_test.zig`: whole == chunked == stepwise on the tiny looped fixture (CPU), planted state mutations, the media
   splice, a verified block's commit, batched slots against each slot alone (CPU) or reordered and re-neighboured
   (GPU), and each kernel against its chain.
-- `contract.zig`: `gated`, `state`, `relmask`, `act`, `sum`, `topk`, `gate` (its one-row arm), `relsplit`, `relcomb`,
-  `relslots`, `markov_rnn`, `markov_fold`, `markov_pick`, `oproj`, `router`, `norm`.
-  Owed: `pre`, `prep`, `mid`, `ups`, `downs`, `relattn`, and `gate`'s prompt arm.
+- `contract.zig`: `gated`, `state`, `relmask`, `act`, `sum`, `topk`, `gate` (its one-row arm), `relsplit`, `relattn_nax`,
+  `relcomb`, `relslots`, `markov_rnn`, `markov_fold`, `markov_pick`, `oproj`, `router`, `norm`.
+- Contract entries owed (GPU proofs in `proof_test.zig` cover each): `pre`, `prep`, `mid`, `ups`, `downs`, `relattn`,
+  `gate`'s prompt arm, `group`, `ups_grp`, `downs_grp`, `few_tail`, `relsplit_nax`, `relsplit_lanes`, `commit_conv`,
+  `accept_tree`, `sample_tree_draw`/`_mass`/`_search`, `dflash_conv`/`_edges`/`_top16_shard`/`_top16_merge`/`_tree`.
 - Not verified: an image against mlx-lm's tower, the drafter's tokens against oMLX's.

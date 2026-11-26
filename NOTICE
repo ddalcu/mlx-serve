@@ -179,6 +179,29 @@ follows the structure of Splash's q8 attention tile
 the MetalPerformancePrimitives tensor op with an online softmax and split-KV
 partials. Re-implemented over MLX's affine group-quantized cache.
 
+Inkling 2's DFlash2 draft tree follows the scheme of Splash's
+(runtime/metal/kernels/decode/sampling.metal, runtime/metal/abi/VerifyTree.h):
+`src/plugins/inkling2/kernels/dflash_tree.metal` builds a lane's tree best-first
+as `tree_expand` does, with its SplitMix64 row keys and its Gumbel top-k draw of
+a sampled row's children without replacement (the hash constants are Splash's);
+`sample_tree_draw.metal`, `sample_tree_mass.metal`, `sample_tree_search.metal`
+and `accept_tree.metal` accept a sampled row by its recursive rejection over the
+children in the order drawn. Re-implemented as MLX custom kernels over our own
+verify, caches and commit.
+
+--------------------------------------------------------------------------------
+DFlash
+https://github.com/z-lab/dflash
+Copyright (c) 2026 Z Lab
+Licensed under the MIT License.
+
+`src/plugins/inkling2/dflash2.zig` ports the DFlash2 draft model of
+`dflash/model_mlx.py` (the block forward over the target's taps, the grouped
+dynamic convolutions, the candidate path selector) to Zig against mlx-c, for the
+`incoai/Inkling-2-Mini-DFlash2` weights; `tests/dump_inkling2_dflash2_fixtures.py`
+drives that reference for the parity fixtures. The soft cap after the edge
+correction follows the sglang adapter shipped beside the weights (Apache-2.0).
+
 --------------------------------------------------------------------------------
 dflash-mlx
 https://github.com/bstnxbt/dflash-mlx

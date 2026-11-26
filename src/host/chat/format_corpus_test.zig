@@ -1629,6 +1629,17 @@ const corpus = [_]Expect{
         .content_exact = "",
     },
     .{
+        // Live (Inkling 2 Mini, temp 0): the `,"` before `args` is dropped; the whole args object still ships.
+        .family = "inkling",
+        .name = "a payload missing the comma before args keeps its args",
+        .raw = "<|content_thinking|>Read the file first.<|end_message|><|message_model|>read<|content_invoke_tool_json|>{\"name\":\"read\"args\":{\"path\":\"README.md\"}}<|end_message|>",
+        .tools_json = write_read_tools_schema,
+        .thinking = true,
+        .tool_name = "read",
+        .tool_arg_key = "path",
+        .tool_arg_value = "README.md",
+    },
+    .{
         // Truncation salvage: the cut landed inside an argument VALUE — the
         // call keeps its NAME and ships `{}`, never a fragment.
         .family = "inkling",

@@ -480,11 +480,11 @@ test "auto-context never sizes past the ceiling as weights grow" {
     try t.expectEqual(@as(u32, 1024), safeContextForBudget(ceiling, ceiling, reserve, per_tok, 262144));
 }
 
-test "slotFixedKvBytes: a MiMo slot bills its sliding rings once, at keep + one chunk of rows" {
+test "slotFixedKvBytes: a MiMo slot bills its sliding rings at keep + one chunk of rows, and the window it keeps at the prompt's end" {
     const t = std.testing;
     // Layer 3 global (4 KV heads), layers 0-2 sliding (8 KV heads).
     const mimo: model_mod.ModelConfig = .{ .model_type = "mimo_v2", .num_hidden_layers = 4, .head_dim = 192, .v_head_dim = 128, .num_key_value_heads = 8, .num_global_key_value_heads = 4, .sliding_window = 128, .sliding_window_pattern = 4 };
-    const rows: u64 = 128 + model_mod.ModelConfig.SLIDING_RING_SLACK + 8192;
+    const rows: u64 = 128 + model_mod.ModelConfig.SLIDING_RING_SLACK + 8192 + @import("../../../sdk/config/sliding_ring.zig").tailRows(128);
     try t.expectEqual(3 * 8 * (192 + 128) * 2 * rows, slotFixedKvBytes(&mimo, 16, 8192));
     try t.expectEqual(kvBytesPerTokenAtBits(3 * 8 * (192 + 128) * 2, 8) * rows, slotFixedKvBytes(&mimo, 8, 8192));
     // The admission guard bills them on an ungated arch too.
@@ -516,12 +516,14 @@ test "sliding layers keep a ring: released laguna, gpt_oss and gemma4 configs bi
         // At 128k with an 8192-row chunk the ring is a small fixed term beside the per-token bill.
         const ctx: u64 = 131072;
         try t.expect(slotFixedKvBytes(&cfg, 16, 8192) + c.global * ctx < c.full * ctx / 4 * 3);
-        // A request's ring holds at most its prompt plus the generation it may add, and keep + its chunk.
+        // A request's ring holds at most its prompt plus the generation it may add, and keep + its chunk; the copy of
+        // its window at the prompt's end at most as many.
         const keep: u64 = cfg.slidingKeepRows();
+        const tail: u64 = @import("../../../sdk/config/sliding_ring.zig").tailRows(c.window);
         const omitted: u64 = std.math.maxInt(u32) / 4;
         for ([_]u64{ 10, 1000 }) |seq| {
-            try t.expectEqual(c.ring_row * (seq + 256), prefillRequestTerms(&cfg, seq, 256, 16, 8192, .{}).slot_fixed_kv_bytes);
-            try t.expectEqual(c.ring_row * (keep + seq), prefillRequestTerms(&cfg, seq, omitted, 16, 8192, .{}).slot_fixed_kv_bytes);
+            try t.expectEqual(c.ring_row * (seq + 256 + @min(tail, seq + 256)), prefillRequestTerms(&cfg, seq, 256, 16, 8192, .{}).slot_fixed_kv_bytes);
+            try t.expectEqual(c.ring_row * (keep + seq + tail), prefillRequestTerms(&cfg, seq, omitted, 16, 8192, .{}).slot_fixed_kv_bytes);
         }
         try t.expectEqual(slotFixedKvBytes(&cfg, 16, 8192), prefillRequestTerms(&cfg, 100_000, 256, 16, 8192, .{}).slot_fixed_kv_bytes);
     }

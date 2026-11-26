@@ -15,6 +15,8 @@ const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
+const plugin_driver = @import("plugin/driver.zig");
+const dsparkEnabled = @import("spec/dspark.zig").dsparkEnabled;
 const LoadedModel = @import("../../host/registry/registry.zig").LoadedModel;
 const scheduler_mod = @import("scheduler.zig");
 const Scheduler = scheduler_mod.Scheduler;
@@ -24,7 +26,12 @@ const drainSideQueues = @import("runtime/loop.zig").drainSideQueues;
 
 /// A prompt of `len` synthetic ids and `gen` tokens generated from it. The ids are the start of sequence `base`,
 /// but for the last `own`: a request with some lands on what the one before it left in the cache, and forks.
-const Request = struct { base: u32, len: u32, own: u32 = 0, gen: u32, sampled: bool = false };
+/// `rounds`: the request times a native drafter's rounds (`ROUNDS`).
+const Request = struct { base: u32, len: u32, own: u32 = 0, gen: u32, sampled: bool = false, rounds: bool = false };
+
+/// The request a load times a native drafter's rounds with (`rounds.Timing`, `Generator.timeRounds`): a context past
+/// the sliding window, sampled at temperature 1 under a fixed seed, and room for every round to keep its block.
+const ROUNDS: Request = .{ .base = 3, .len = 1280, .gen = 2048, .rounds = true };
 
 /// Past the row counts the prefill kernels switch on.
 const LONG: u32 = 256;
@@ -163,6 +170,24 @@ fn fits(r: Request, cap: u32) bool {
     return cap == 0 or r.len + r.gen <= cap;
 }
 
+/// Whether `entry` serves a native drafter whose rounds no request has been asked to time, where rounds run at all.
+pub fn owesRounds(entry: *const LoadedModel) bool {
+    const xfm = entry.transformer orelse return false;
+    return plugin_driver.nativeStages(xfm) > 0 and !xfm.plugin.?.ladder_asked and dsparkEnabled();
+}
+
+/// Time `entry`'s native drafter's rounds now, inside the load (`--warmup-full`: whoever asks next is served on them).
+pub fn timeRounds(sch: *Scheduler, entry: *LoadedModel) void {
+    if (!owesRounds(entry)) return;
+    const cfg = entry.config orelse return;
+    if (!holds(sch, cfg, ROUNDS)) return;
+    var twin = twinOf(entry);
+    defer if (twin) |*t| t.deinit();
+    var buf: [ROUNDS.len]u32 = undefined;
+    serve(sch, entry, if (twin) |*t| t else null, fill(&buf, cfg.vocab_size, ROUNDS), ROUNDS) catch |err|
+        log.warn("Timing the drafter's rounds failed ({s}); it stays off.\n", .{@errorName(err)});
+}
+
 /// An empty cache with the retention rules of the model's own, for its warm requests.
 fn twinOf(entry: *const LoadedModel) ?prefix_cache_mod.HotPrefixCache {
     var twin = (entry.prefix_cache orelse return null).ramTwin();
@@ -179,6 +204,14 @@ fn promptLimit(model_cap: u32, model_ctx: u32, launch_ctx: u32) u32 {
     return if (model_cap == 0) set else @min(model_cap, set);
 }
 
+/// Whether the context this load serves holds `r`. A drafter whose timing request it cannot hold stays off.
+fn holds(sch: *const Scheduler, cfg: anytype, r: Request) bool {
+    const cap = promptLimit(cfg.contextCap(), cfg.ctx_override, sch.gguf_ctx_size);
+    if (cap == 0 or r.len + r.gen <= cap) return true;
+    if (r.rounds) log.warn("[rounds] the context holds under {d} tokens: the drafter's rounds are not timed and it stays off\n", .{r.len + r.gen});
+    return false;
+}
+
 fn submit(sch: *Scheduler, entry: *LoadedModel, cache: ?*prefix_cache_mod.HotPrefixCache, ids: []const u32, r: Request) !*Slot {
     const cfg = entry.config.?;
     // The request-level defaults of `host/api/request_options.zig`; the engine picks one mode from them.
@@ -187,7 +220,7 @@ fn submit(sch: *Scheduler, entry: *LoadedModel, cache: ?*prefix_cache_mod.HotPre
         .model = entry,
         .prefix_cache = cache,
         .prompt_ids = ids,
-        .sampling = if (r.sampled) .{ .temperature = 0.7, .top_p = 0.95, .top_k = 20 } else .{ .temperature = 0 },
+        .sampling = if (r.rounds) .{ .temperature = 1.0, .seed = 1 } else if (r.sampled) .{ .temperature = 0.7, .top_p = 0.95, .top_k = 20 } else .{ .temperature = 0 },
         .eos_token_ids = &.{},
         .max_tokens = r.gen,
         .enable_thinking = r.sampled,
@@ -202,6 +235,8 @@ fn submit(sch: *Scheduler, entry: *LoadedModel, cache: ?*prefix_cache_mod.HotPre
     });
     slot.metrics_recorded = true;
     slot.warm = true;
+    slot.times_rounds = r.rounds;
+    if (r.rounds) entry.transformer.?.plugin.?.ladder_asked = true;
     return slot;
 }
 
@@ -243,8 +278,10 @@ fn serve(sch: *Scheduler, entry: *LoadedModel, cache: ?*prefix_cache_mod.HotPref
 pub const Idle = struct {
     entry: *LoadedModel,
     verify_rows: u32,
-    /// How many of `MINIMAL` it serves: none on a model that cannot chat.
+    /// How many of `MINIMAL` it serves: none on a model that cannot chat, or a load that served them before ready.
     requests: u32,
+    /// Then `ROUNDS`: the model's native drafter is not timed yet.
+    rounds: bool,
     twin: ?prefix_cache_mod.HotPrefixCache,
     /// The sweep's widths done, then the requests ended.
     step: u32 = 0,
@@ -255,11 +292,12 @@ pub const Idle = struct {
     spent_ns: u64 = 0,
 };
 
-/// `entry`, just loaded, owes the minimal warm-up: every load does, whatever an earlier one served. Inference thread.
+/// `entry`, just loaded, owes the minimal warm-up (every load does, whatever an earlier one served) and the timing of
+/// its native drafter's rounds, if it has one. `verify_rows` 0 and `chat` false: the timing alone. Inference thread.
 pub fn owe(sch: *Scheduler, entry: *LoadedModel, verify_rows: u32, chat: bool) void {
     const w = sch.allocator.create(Idle) catch return;
     sch.warm_queue.append(sch.allocator, w) catch return sch.allocator.destroy(w);
-    w.* = .{ .entry = entry, .verify_rows = verify_rows, .requests = if (chat) MINIMAL.len else 0, .twin = twinOf(entry) };
+    w.* = .{ .entry = entry, .verify_rows = verify_rows, .requests = if (chat) MINIMAL.len else 0, .rounds = owesRounds(entry), .twin = twinOf(entry) };
 }
 
 /// Idle warm-ups that served their whole plan, and those cut short (a failed or slow request, a request given way to,
@@ -325,7 +363,11 @@ pub fn tick(sch: *Scheduler) void {
             w.step += 1;
         },
         .failed, .timed_out => |why| {
-            log.warn("Warm request {d} of {d} {s}; the first prompts compile what is left.\n", .{ w.step - w.verify_rows + 1, w.requests, if (why == .failed) "failed" else "took too long" });
+            const how = if (why == .failed) "failed" else "took too long";
+            if (slot.times_rounds)
+                log.warn("[rounds] the round timing {s}: the drafter stays off until the model loads again\n", .{how})
+            else
+                log.warn("Warm request {d} of {d} {s}; the first prompts compile what is left.\n", .{ w.step - w.verify_rows + 1, w.requests, how });
             end(sch, w, false);
         },
     }
@@ -333,7 +375,7 @@ pub fn tick(sch: *Scheduler) void {
 
 /// Start the next step of `w`: nothing of its own is in flight and nothing else is asked of the server.
 fn start(sch: *Scheduler, w: *Idle) void {
-    switch (nextStep(w.step, w.verify_rows, w.requests, readyNow(sch, w.entry), false, true)) {
+    switch (nextStep(w.step, w.verify_rows, w.requests + @intFromBool(w.rounds), readyNow(sch, w.entry), false, true)) {
         .wait => {},
         .abort => end(sch, w, false),
         .done => end(sch, w, true),
@@ -348,14 +390,13 @@ fn start(sch: *Scheduler, w: *Idle) void {
         },
         .request => |i| {
             const cfg = w.entry.config.?;
-            const r = MINIMAL[i];
-            const cap = promptLimit(cfg.contextCap(), cfg.ctx_override, sch.gguf_ctx_size);
+            const r = if (i < w.requests) MINIMAL[i] else ROUNDS;
             // Past the context: no request can reach it, so it is no part of this load's plan.
-            if (!fits(r, cap)) {
+            if (!holds(sch, cfg, r)) {
                 w.step += 1;
                 return;
             }
-            var buf: [LONG + FORK_GROWTH[0]]u32 = undefined;
+            var buf: [@max(LONG + FORK_GROWTH[0], ROUNDS.len)]u32 = undefined;
             sch.queue_mu.lockUncancelable(sch.io);
             sch.warm_in_flight = 1;
             sch.queue_mu.unlock(sch.io);

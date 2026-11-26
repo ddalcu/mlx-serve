@@ -83,8 +83,8 @@ DSpark, lossless classes): `README.md`.
 - Under `tp` the worker knows a state by the gen rank 0 gave it: every state rank 0 drops must reach `tpFree`, or the
   worker keeps it; a step on another state (`st != &dec_state`) is refused.
 - Under `tp` every aux snapshot rank 0 takes, restores, clones or frees reaches the worker by id (`tpSnap`); one taken
-  outside a step (`armPrompt` at a restored boundary) goes as `.capture`. The ranks' caches are equal (`tpStream`
-  asserts it), so the SSD tier writes rank 0's and a disk import sends the worker its tensors (`tpLoad`).
+  outside a step (`armPrompt`) goes as `.capture` with rank 0's position, closing the worker's open verify first. The
+  ranks' caches are equal (`tpStream`), so the SSD tier writes rank 0's and a disk import sends its tensors (`tpLoad`).
 - Under `tp` rank 0 alone holds the vision tower: a chunk's image rows ride with its step (`tp_step` `images`), the
   worker splices them at offset 0, so a rank's splice must depend only on the chunk's own rows (`chunkImageRows`).
 - Thinking default ON; effort vocabulary `dsv41`; DSML tools on OUR byte-pinned template.

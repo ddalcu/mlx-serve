@@ -787,8 +787,7 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // generated so far by still-decoding slots (the scheduler publishes that
     // aggregate atomically once per decode tick — race-free, no per-token
     // write). Non-zero even mid-request, unlike the completion-only counter.
-    const inflight = ctx.scheduler.inflight_generated_tokens.load(.monotonic) + ctx.scheduler.engine_gauges.generated.load(.monotonic);
-    ctx.metrics.generation_tokens_live.set(instr.liveGenerationTokens(ctx.metrics, inflight));
+    ctx.metrics.generation_tokens_live.set(instr.liveGenerationTokens(ctx.metrics, &.{ &ctx.scheduler.inflight_generated_tokens, &ctx.scheduler.engine_gauges.generated }));
 
     // The other phase. Prompt-token counters and the prefill-time histogram
     // only advance at request COMPLETION, so a long prefill was invisible: GPU

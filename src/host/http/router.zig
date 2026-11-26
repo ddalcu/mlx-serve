@@ -18,7 +18,11 @@ const queryModel = @import("../api/request_model.zig").queryModel;
 const parseModelFromRequest = @import("../api/request_model.zig").parseModelFromRequest;
 const MAX_JSON_DEPTH = @import("request.zig").MAX_JSON_DEPTH;
 const jsonNestingDepth = @import("request.zig").jsonNestingDepth;
-const readRequest = @import("request.zig").readRequest;
+const RequestHead = @import("request.zig").RequestHead;
+const readHead = @import("request.zig").readHead;
+const readBody = @import("request.zig").readBody;
+const drainBody = @import("request.zig").drainBody;
+const REQUEST_READ_LIMIT_MS = @import("request.zig").REQUEST_READ_LIMIT_MS;
 const sendOllamaError = @import("../api/ollama_routes.zig").sendOllamaError;
 const handleOllamaEarly = @import("../api/ollama_routes.zig").handleOllamaEarly;
 const handleOllamaChat = @import("../api/ollama_routes.zig").handleOllamaChat;
@@ -179,6 +183,41 @@ pub fn payloadTooLargeMessage(buf: []u8, got: usize, cap: usize) []const u8 {
     }) catch "Request body too large";
 }
 
+fn keyGateCovers(stream: *const Conn, method: []const u8, path: []const u8) bool {
+    return apiKeyGateApplies(http_server.g_api_key != null, http_server.g_api_key_strict, peerIsLoopback(stream)) and
+        !std.mem.eql(u8, method, "OPTIONS") and
+        !(std.mem.eql(u8, method, "GET") and isRoute(path, "/health"));
+}
+
+fn sendKeyRefusal(stream: *Conn, method: []const u8, path: []const u8, raw_headers: []const u8, raw_path: []const u8) !void {
+    log.debug("{s} {s} -> 401 (missing/invalid API key)\n", .{ method, path });
+    if (wantsLoginPage(method, path, raw_headers))
+        try sendResponse(stream, "401 Unauthorized", "text/html; charset=utf-8", loginPage(raw_headers, raw_path))
+    else
+        try sendUnauthorized(stream);
+}
+
+/// The login form's POST carries a key of at most 512 encoded bytes.
+const LOGIN_FORM_MAX_BYTES = 4096;
+
+/// The key gate on the head alone, so a client without the key gets no `100 Continue` and no
+/// buffer for its body. Only the login form, which carries its key in the body, is let through.
+fn refusedBeforeBody(stream: *Conn, head: *const RequestHead) !bool {
+    const raw_headers = head.bytes();
+    const line_end = std.mem.indexOf(u8, raw_headers, "\r\n") orelse return false;
+    var it = std.mem.splitScalar(u8, raw_headers[0..line_end], ' ');
+    const method = it.next() orelse return false;
+    const raw_path = it.next() orelse return false;
+    const path = raw_path[0 .. std.mem.indexOfScalar(u8, raw_path, '?') orelse raw_path.len];
+    if (!keyGateCovers(stream, method, path) or apiKeyAuthorized(raw_headers, raw_path)) return false;
+    const content_type = findHeaderValue(raw_headers, "content-type") orelse "";
+    if (std.mem.eql(u8, method, "POST") and isRoute(path, "/") and
+        std.mem.startsWith(u8, content_type, "application/x-www-form-urlencoded") and
+        head.content_length <= LOGIN_FORM_MAX_BYTES) return false;
+    try sendKeyRefusal(stream, method, path, raw_headers, raw_path);
+    return true;
+}
+
 pub fn handleConnection(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -192,7 +231,10 @@ pub fn handleConnection(
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Server not ready", 503);
         return;
     };
-    const raw = (try readRequest(allocator, stream)) orelse return;
+    var head: RequestHead = .{};
+    if (!try readHead(stream, &head, REQUEST_READ_LIMIT_MS)) return;
+    if (try refusedBeforeBody(stream, &head)) return drainBody(stream, &head, REQUEST_READ_LIMIT_MS);
+    const raw = (try readBody(allocator, stream, &head, REQUEST_READ_LIMIT_MS)) orelse return;
     defer allocator.free(raw.buf);
     // The request's ablation key points into `raw.buf`.
     defer stream.clearAblation();
@@ -228,23 +270,13 @@ pub fn handleConnection(
     //    exposure. Browser-facing pages get a `WWW-Authenticate: Basic`
     //    challenge so the index + metrics panel prompt for the key; API clients
     //    pass Bearer / x-api-key. null key ⇒ fully open. See `apiKeyAuthorized`.
-    if (apiKeyGateApplies(http_server.g_api_key != null, http_server.g_api_key_strict, peerIsLoopback(stream)) and
-        !std.mem.eql(u8, method, "OPTIONS") and
-        !(std.mem.eql(u8, method, "GET") and isRoute(path, "/health")))
-    {
+    if (keyGateCovers(stream, method, path)) {
         const raw_headers = request[0..header_end_pos];
         if (loginFormKey(method, path, request_content_type, request_body)) |k| {
             if (encodedKeyMatches(k, http_server.g_api_key.?)) return sendKeyCookie(stream, k);
             return sendResponse(stream, "401 Unauthorized", "text/html; charset=utf-8", loginPageHtml("<p class=err>That key was not accepted. Try again.</p>"));
         }
-        if (!apiKeyAuthorized(raw_headers, raw_path)) {
-            log.debug("{s} {s} -> 401 (missing/invalid API key)\n", .{ method, path });
-            if (wantsLoginPage(method, path, raw_headers))
-                try sendResponse(stream, "401 Unauthorized", "text/html; charset=utf-8", loginPage(raw_headers, raw_path))
-            else
-                try sendUnauthorized(stream);
-            return;
-        }
+        if (!apiKeyAuthorized(raw_headers, raw_path)) return sendKeyRefusal(stream, method, path, raw_headers, raw_path);
         // A page opened with `?api_key=` trades it for the cookie, so the key leaves the address bar.
         if (wantsLoginPage(method, path, raw_headers)) {
             if (queryParamValue(raw_path, "api_key") orelse queryParamValue(raw_path, "key")) |k| {
@@ -923,4 +955,49 @@ test "a <id>@<provider> or <id>@<peer> body that asks for ablation is refused be
     const got = buf[0..@intCast(n)];
     try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400"));
     try std.testing.expect(std.mem.indexOf(u8, got, "not forwarded to a provider") != null);
+}
+
+/// What a keyless loopback client under `--api-key-strict` reads back within a second of sending only `head`.
+fn keylessStrictReply(head: []const u8, out: []u8) ![]const u8 {
+    const a = std.testing.allocator;
+    var reg = try ModelRegistry.init(a, std.testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const prev = .{ http_server.global_registry, http_server.g_api_key, http_server.g_api_key_strict };
+    defer {
+        http_server.global_registry = prev[0];
+        http_server.g_api_key = prev[1];
+        http_server.g_api_key_strict = prev[2];
+    }
+    http_server.global_registry = reg;
+    http_server.g_api_key = "k";
+    http_server.g_api_key_strict = true;
+
+    var sv: [2]std.posix.fd_t = undefined;
+    try std.testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) } } }, std.testing.io);
+    _ = std.c.send(sv[1], head.ptr, head.len, 0);
+    const server = try std.Thread.spawn(.{}, struct {
+        fn run(c: *Conn) void {
+            handleConnection(std.testing.allocator, c) catch {};
+            c.close();
+        }
+    }.run, .{&conn});
+    var got: isize = 0;
+    var waited: u32 = 0;
+    while (got <= 0 and waited < 1000) : (waited += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .real) catch {};
+        got = std.c.recv(sv[1], out.ptr, out.len, std.c.MSG.DONTWAIT);
+    }
+    _ = std.c.close(sv[1]);
+    server.join();
+    return out[0..@intCast(@max(got, 0))];
+}
+
+test "an unauthenticated POST under --api-key-strict is refused before its body is read" {
+    var buf: [2048]u8 = undefined;
+    const chat = try keylessStrictReply("POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 104857600\r\nExpect: 100-continue\r\n\r\n", &buf);
+    try std.testing.expect(std.mem.startsWith(u8, chat, "HTTP/1.1 401"));
+    const form = try keylessStrictReply("POST / HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 104857600\r\n\r\n", &buf);
+    try std.testing.expect(std.mem.startsWith(u8, form, "HTTP/1.1 401"));
 }

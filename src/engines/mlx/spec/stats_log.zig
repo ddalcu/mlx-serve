@@ -66,19 +66,26 @@ pub fn logSpecStats(self: *const Generator) void {
             .{ t.delta, t.eps, self.dspark_typical_rounds, self.dspark_attempted },
         );
         if (self.dspark_pol) |pol| {
-            const skipped = if (pol.p2) |p| p.drafting.skipped else pol.drafting.skipped;
-            const probes = if (pol.p2) |p| p.drafting.probes else pol.drafting.probes;
-            log.info(
-                "  [spec-stats] dspark policy: plain_ticks={d} skipped={d} probes={d} plain_ms={d:.2} acc_pos={s} rows_hist={s}\n",
-                .{ self.dspark_plain, skipped, probes, pol.plain.ms, self.dspark_stats.formatAcc(&acc_buf), self.dspark_stats.formatRows(&rows_buf) },
-            );
-            if (pol.p2) |p| {
-                const c = p.cost.costs(pol.plain.ms);
+            if (pol.rounds) |ctl| {
                 log.info(
-                    "  [spec-stats] dspark policy2: next_decided={d} next_took={d} rate_tok_ms={d:.4} round_ms={d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}\n",
-                    .{ p.free_seen, p.free_hit, p.rate.perMs(pol.plain.ms), c[1], c[2], c[3], c[4], c[5], c[6] },
+                    "  [spec-stats] dspark rounds: plain_ticks={d} plain_ms={d:.2} acc={d:.2} acc_pos={s} rows_hist={s}\n",
+                    .{ self.dspark_plain, ctl.ladder.plain, ctl.acc.overall(), self.dspark_stats.formatAcc(&acc_buf), self.dspark_stats.formatRows(&rows_buf) },
                 );
-                if (p.modeled) log.info("  [spec-stats] dspark policy2 modeled: widths priced by the fitted ladder in plain steps, rate_tok_step={d:.4}\n", .{p.rate.perMs(1)});
+            } else {
+                const skipped = if (pol.p2) |p| p.drafting.skipped else pol.drafting.skipped;
+                const probes = if (pol.p2) |p| p.drafting.probes else pol.drafting.probes;
+                log.info(
+                    "  [spec-stats] dspark policy: plain_ticks={d} skipped={d} probes={d} plain_ms={d:.2} acc_pos={s} rows_hist={s}\n",
+                    .{ self.dspark_plain, skipped, probes, pol.plain.ms, self.dspark_stats.formatAcc(&acc_buf), self.dspark_stats.formatRows(&rows_buf) },
+                );
+                if (pol.p2) |p| {
+                    const c = p.cost.costs(pol.plain.ms);
+                    log.info(
+                        "  [spec-stats] dspark policy2: next_decided={d} next_took={d} rate_tok_ms={d:.4} round_ms={d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}\n",
+                        .{ p.free_seen, p.free_hit, p.rate.perMs(pol.plain.ms), c[1], c[2], c[3], c[4], c[5], c[6] },
+                    );
+                    if (p.modeled) log.info("  [spec-stats] dspark policy2 modeled: widths priced by the fitted ladder in plain steps, rate_tok_step={d:.4}\n", .{p.rate.perMs(1)});
+                }
             }
         }
         return;

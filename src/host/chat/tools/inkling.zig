@@ -46,7 +46,11 @@ pub fn parseInklingToolCalls(allocator: std.mem.Allocator, text: []const u8, cal
                 body = obj;
                 pos = (body_start + (text.len - body_start - after.len)) + obj.len;
             } else {
-                pos = text.len; // truncated object — nothing further to scan
+                // Unpaired quotes (a dropped `,"`) or truncation: the payload runs to its end tag or the next call.
+                const end_tag = std.mem.indexOfPos(u8, text, body_start, INKLING_END_TAG) orelse text.len;
+                const next_call = std.mem.indexOfPos(u8, text, body_start, INKLING_INVOKE_TAG) orelse text.len;
+                pos = @min(end_tag, next_call);
+                body = std.mem.trim(u8, text[body_start..pos], "\n ");
             }
         } else {
             // No object after the marker at all: keep the old end-tag-bounded
@@ -88,7 +92,9 @@ pub fn parseInklingToolCalls(allocator: std.mem.Allocator, text: []const u8, cal
                 name = try allocator.dupe(u8, name);
             }
         } else |_| {
-            // Truncated / mangled payload: NAME + {} (never ship fragments).
+            // A mangled payload can still carry a whole args object (the model drops the `,"` before `args`);
+            // a truncated one ships NAME + {} (never fragments).
+            args_json = try salvageArgs(allocator, body);
             name = try allocator.dupe(u8, name);
         }
         errdefer allocator.free(name);
@@ -100,6 +106,24 @@ pub fn parseInklingToolCalls(allocator: std.mem.Allocator, text: []const u8, cal
         const arguments = args_json orelse try allocator.dupe(u8, "{}");
         try calls.append(allocator, .{ .name = name, .arguments = arguments, .inferred = false });
     }
+}
+
+/// The object after the first `args"` key that parses whole, re-serialized; null when there is none.
+fn salvageArgs(allocator: std.mem.Allocator, body: []const u8) !?[]const u8 {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, body, from, "args\"")) |k| {
+        from = k + 1;
+        const rest = std.mem.trimStart(u8, body[k + "args\"".len ..], " \t\r\n");
+        if (rest.len == 0 or rest[0] != ':') continue;
+        const value = std.mem.trimStart(u8, rest[1..], " \t\r\n");
+        if (!std.mem.startsWith(u8, value, "{")) continue;
+        const obj = balancedJsonObject(value) orelse return null;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, obj, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+        return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+    }
+    return null;
 }
 
 // ── tests ──
@@ -225,4 +249,21 @@ test "parseToolCalls: Inkling back-to-back invokes without <|end_message|>" {
     const p1 = try std.json.parseFromSlice(std.json.Value, allocator, calls[1].arguments, .{});
     defer p1.deinit();
     try testing.expectEqualStrings("b.js", p1.value.object.get("path").?.string);
+}
+
+test "parseToolCalls: an Inkling payload missing the comma before args keeps its args" {
+    const allocator = testing.allocator;
+    // Live (Inkling 2 Mini, temp 0, serial decode too): `"read_file"args"` drops the `,"` between the two keys.
+    const text = "<|message_model|>read_file<|content_invoke_tool_json|>{\"name\":\"read_file\"args\":{\"path\":\"README.md\"}}<|end_message|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("read_file", calls[0].name);
+    try testing.expectEqualStrings("{\"path\":\"README.md\"}", calls[0].arguments);
 }
