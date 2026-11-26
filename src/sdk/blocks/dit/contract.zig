@@ -967,6 +967,10 @@ const Rq = struct {
 };
 
 fn rqSpec(comptime name: []const u8, known: ?spec.Known) spec.Spec {
+    return rqSpecServed(name, known, &.{ .{ .rows = 300, .n = 1, .k = 3072 }, .{ .rows = 64, .n = 1, .k = 12288 } });
+}
+
+fn rqSpecServed(comptime name: []const u8, known: ?spec.Known, served: []const Shape) spec.Spec {
     return .{
         .name = name,
         .accum = .none,
@@ -975,7 +979,7 @@ fn rqSpec(comptime name: []const u8, known: ?spec.Known) spec.Spec {
         .nan = .{ .stated = "a row holding a NaN has a NaN scale; codes exist for finite rows only" },
         // Eight 256-wide blocks a pass of the threadgroup.
         .tiles = .{ .{}, .{}, .{ .size = 2048, .step = 256, .min = 256 } },
-        .served = &.{ .{ .rows = 300, .n = 1, .k = 3072 }, .{ .rows = 64, .n = 1, .k = 12288 } },
+        .served = served,
         .known = known,
     };
 }
@@ -1138,12 +1142,19 @@ pub fn register(set: *kc.Set) !void {
     try set.add(Gemm, .init(a, false), gemmSpec("w8a8 gemm bf16 (NAX; BM 128)", false, &.{ .{ .rows = 129, .n = 256, .k = 3072 }, .{ .rows = 300, .n = 320, .k = 512 } }), null);
     try set.add(Gemm, .init(a, false), gemmSpec("w8a8 gemm bf16 (NAX; BM 64 past 8192 rows)", false, &.{.{ .rows = 8200, .n = 128, .k = 256 }}), null);
     try set.add(Gemm, .init(a, true), gemmSpec("w8a8 gemm + swiglu bf16 (NAX; BM 128)", true, &.{ .{ .rows = 129, .n = 256, .k = 3072 }, .{ .rows = 300, .n = 320, .k = 512 } }), null);
+    // deepseek_v41's MLX_SERVE_DSV41_PF_INT8=3/4 (the trunk): the reduction lengths it serves (wq_b 1280, the shared
+    // down 2304, the q/kv and shared gate/up 5120, wo_b 8192), at the BM 64 tile its wide passes take (past 8192
+    // rows: every length, as the 16K pass runs them) and at the BM 128 one (a prompt of 1,024 to 8,191 rows: every
+    // length), the outputs cut to a few column tiles.
+    try set.add(Rq, .init(a), rqSpecServed("w8a8_rq bf16 (deepseek_v41 PF_INT8=3/4: K 1280, 2304, 5120, 8192)", scale_drops_nan, &.{ .{ .rows = 300, .n = 1, .k = 1280 }, .{ .rows = 129, .n = 1, .k = 2304 }, .{ .rows = 64, .n = 1, .k = 5120 }, .{ .rows = 64, .n = 1, .k = 8192 } }), null);
+    try set.add(Gemm, .init(a, false), gemmSpec("w8a8 gemm bf16 (NAX; deepseek_v41 PF_INT8=3/4, BM 64 past 8192 rows: K 1280, 2304, 5120, 8192)", false, &.{ .{ .rows = 8200, .n = 128, .k = 1280 }, .{ .rows = 8200, .n = 64, .k = 2304 }, .{ .rows = 8200, .n = 64, .k = 5120 }, .{ .rows = 8200, .n = 64, .k = 8192 } }), null);
+    try set.add(Gemm, .init(a, false), gemmSpec("w8a8 gemm bf16 (NAX; deepseek_v41 PF_INT8=3/4, BM 128 under 8192 rows: K 1280, 2304, 5120, 8192)", false, &.{ .{ .rows = 1024, .n = 128, .k = 1280 }, .{ .rows = 1500, .n = 64, .k = 2304 }, .{ .rows = 129, .n = 256, .k = 5120 }, .{ .rows = 300, .n = 192, .k = 8192 } }), null);
 }
 
 // ── tests ──
 
 test "kernel contract dit: each declared launch is the shipped wrapper's, byte for byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var set = kc.Set.init(a);
     defer set.deinit();

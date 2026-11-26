@@ -114,6 +114,10 @@ pub const deepseek_v41 = struct {
         return 0;
     }
 
+    pub fn passCeil() usize {
+        return 0;
+    }
+
     pub fn passRows(rows: usize, _: usize) usize {
         return rows;
     }

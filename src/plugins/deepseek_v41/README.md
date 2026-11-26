@@ -17,9 +17,9 @@ On an M5 Ultra, the release build decoded 98.80 tok/s greedy with DSpark on and 
 test's p01 prompt. The first NVFP4 build gave 71.77 and 3,994 tok/s (see "Results"). Both runs used the NVFP4 pack, so
 the pack gives none of the gain; the runs also differ in setup.
 
-The plugin has 52 default-on switches (51 on M5, where `ATTN_F16` is off). We count 50 of them as lossless.
+The plugin has 56 default-on switches (55 on M5, where `ATTN_F16` is off). We count 54 of them as lossless.
 "Lossless" here means each switch's output is bit-identical to its `=0` path (EXACT); or (REORDER) not
-bit-identical but measured no farther from float64 (5 switches), held to a stated bound that can allow somewhat more
+bit-identical but measured no farther from float64 (6 switches), held to a stated bound that can allow somewhat more
 error than `=0` (7), or classed by reasoning or A/B text alone (3); or changes only drafts and verify widths, or how a sampled verify accepts drafts while keeping the model's
 distribution
 (DRAFT-ONLY). `MLX_ENABLE_TF32` has its own class (TF32): on M5 at the defaults it rounds only the drafter's P·V.
@@ -190,7 +190,7 @@ The release's p01 peak is 452.0 GB: 13.4 GB above the first NVFP4 build on the s
 31.3 GB above it on the MXFP4-experts pack (420.7 GB). The NVFP4 pack adds 17.9 GB, because its 16-value groups carry
 more scale bytes. The last reviewed head peaked at 438.6 GB too. Six changes moved the peak by more than
 0.5 GB: `PF_KEEP_WIDE` +7.3 GB, the Engram partials cache (`ENGRAM_KV_CACHE`) +4.0, `PF_PASS_SIZE` +3.9,
-`MOE_PAIR_SCALED` -1.4, `PF_COMP_BF16` -0.7 and `FLASH_ATTN` -0.7. Changes under 0.5 GB each add about +0.7 GB
+`MOE_PAIR_FP4` -1.4, `PF_COMP_BF16` -0.7 and `FLASH_ATTN` -0.7. Changes under 0.5 GB each add about +0.7 GB
 (`PF_ENGRAM_PASS` +0.4, `DRAFT_VOCAB` +0.4), and drift between A/B bases the last +0.3 GB. The
 three that add memory trade it for speed (`PF_PASS_SIZE` +7.96% prefill, `PF_KEEP_WIDE` +2.19% prefill, the Engram
 slot kernel and partials cache, one A/B, +0.28% decode). We kept them because
@@ -235,21 +235,21 @@ declines the switch by name and logs why.
 
 ## Accuracy: what "lossless" means here
 
-50 plugin switches fall in three classes, and a fourth class, TF32, covers one engine variable:
+54 plugin switches fall in three classes, and a fourth class, TF32, covers one engine variable:
 - EXACT: the same output values as the `=0` path, bit for bit. A test shows it, or (2 switches) it is classed without
   a measurement, by the commit's reasoning.
-- REORDER: not bit-identical; the table below splits the 15 by their evidence.
+- REORDER: not bit-identical; the table below splits the 17 by their evidence.
 - DRAFT-ONLY: changes only the drafts, or how many rows a verify checks (1 switch classed without a measurement).
 - TF32 (one engine variable): MLX's TF32 matmuls; on off-default routes they also round the f32 chain's P·V (the
   block below). Without NAX, MLX does not use TF32.
 
-44 of the 50 have a standing test or a kernel contract case. 6 do not: `WOA_JOIN`, `DRAFT_POS_ONCE` (EXACT); `CED`,
+48 of the 54 have a standing test or a kernel contract case. 6 do not: `WOA_JOIN`, `DRAFT_POS_ONCE` (EXACT); `CED`,
 `PF_PASS_SIZE`, `HC_EXPAND_NORM` (REORDER); and `SPEC_SYNC` (DRAFT-ONLY). The table below says why for each.
 
 | Class | Plugin switches | Engine variables |
 |---|---|---|
-| EXACT | 29 | 0 |
-| REORDER | 15 | 1: `MLX_SERVE_DSV4_DSPARK` (the verify's multi-row kernels, by reasoning) |
+| EXACT | 31 | 0 |
+| REORDER | 17 | 1: `MLX_SERVE_DSV4_DSPARK` (the verify's multi-row kernels, by reasoning) |
 | DRAFT-ONLY | 6, including `DRAFT_VOCAB` | 2: `MLX_SERVE_DSPARK_POLICY2`, `MLX_SERVE_DSPARK_POLICY2_MODELED` |
 | TF32 | 0 | 1: `MLX_ENABLE_TF32` |
 
@@ -262,10 +262,10 @@ prompt-attention call (the block below).
 
 | REORDER switches | How many |
 |---|---|
-| Measured no farther from float64 than the `=0` path (`PF_COMP_BF16`, `FLASH_ATTN`, `ENGRAM_KV_SLOTS`, `ATTN_DEC`, `WOA_PLAIN`) | 5 |
-| Held to a stated bound that can allow more error than `=0`: `MOE_FP4_NAX`, `FP4_READS`, `FUSE_MXFP8_QMM` (rel-rms against f32 up to 1.25 times the `=0` path's, plus 1e-4); `PF_HC_V2` (mixes and split 2.0 to 5.9 times farther from float64, within 1e-5 of it); `ENGRAM_GPU_IDS` (4 of 409,600 words farther, worst element no farther); `MOE_PAIR_SCALED` (each differing word within one bf16 step of its row's peak, under 1% differing, sample l2 within 1.05 times); `PF_IDX_NAX` (each score within 2·γ(34) of `idx_tile`'s, the same top-half picks except near-ties) | 7 |
+| Measured no farther from float64 than the `=0` path (`PF_COMP_BF16`, `FLASH_ATTN`, `ENGRAM_KV_SLOTS`, `ATTN_DEC`, `WOA_PLAIN`, `PF_IDX_PASS`) | 6 |
+| Held to a stated bound that can allow more error than `=0`: `MOE_FP4_NAX`, `FP4_READS`, `FUSE_MXFP8_QMM` (rel-rms against f32 up to 1.25 times the `=0` path's, plus 1e-4); `PF_HC_V2` (mixes and split 2.0 to 5.9 times farther from float64, within 1e-5 of it); `ENGRAM_GPU_IDS` (4 of 409,600 words farther, worst element no farther); `MOE_PAIR_FP4` (each differing word within one bf16 step of its row's peak, under 1% differing, sample l2 within 1.05 times); `PF_IDX_NAX` (each score within 2·γ(34) of `idx_tile`'s, the same top-half picks except near-ties) | 7 |
 | Resting on the commit's reasoning (`CED`, the chunked prompt path; `PF_PASS_SIZE`) | 2 |
-| Resting on its A/B's same text (`HC_EXPAND_NORM`: its test allows 1% relative error, far looser than bf16 rounding, so we do not count it as a bound) | 1 |
+| Resting on its A/B's same text (`HC_EXPAND_NORM`: its test allows 1% relative error, far looser than bf16 rounding, so we do not count it as a bound; `PF_PASS_CEIL`, a different partition into passes: 28 of 28 sweep pairs from 128K to 1M gave the same text) | 2 |
 
 A DRAFT-ONLY switch keeps the verify's rule: a greedy verify keeps only tokens that the model agrees with, and a
 sampled verify keeps the model's distribution. Greedy text can still change by rounding, because the verify kernels'
@@ -319,11 +319,17 @@ tests of `attnCore` count each core's calls; on NAX they count 0 f16 calls.
   and f32-out l2 6.2e-5 to 6.6e-5 against 1.52e-4 to 1.67e-4.
 - `MOE_TAIL` (EXACT): one launch gives the two launches' words, with 0 differing words at 17 to 8,192 rows.
 - `FLASH_ATTN` (REORDER): its f32-out l2 is 6.4e-5, against 1.8e-4 for the gather.
-- `MOE_PAIR_SCALED` (REORDER, bounded): at 384 experts, 0.223% to 0.237% of the activation words differ from the split
-  path. The whole-sample float64 l2 is 1.0000 times the split path's. The test requires each differing word within one
+- `MOE_PAIR_FP4` (REORDER, bounded): one switch for both fp4 formats. NVFP4 brings ModelOpt's per-expert scales into
+  the epilogue; MXFP4 (or the MXFP4 view) runs the same kernel with that step compiled out. It replaces
+  `MOE_PAIR_SCALED` (NVFP4 only), which no release on main carried. The test requires each differing word within one
   bf16 step of its row's largest value, under 1% of words differing, and a sample l2 within 1.05 times the split
-  path's. The words more than one step apart in bf16 code are words that the split path gives as exactly 0.0, where
-  the paired kernel keeps a tiny value, about 1e-35.
+  path's. At 384 experts:
+  - NVFP4: 0.223% to 0.237% of the activation words differ from the split path, and the whole-sample float64 l2 is
+    1.0000 times the split path's. The words more than one step apart in bf16 code are words that the split path
+    gives as exactly 0.0, where the paired kernel keeps a tiny value, about 1e-35.
+  - MXFP4: 0.0014% to 0.0017% of the words differ, none more than one bf16 code step apart, and the whole-sample
+    float64 l2 is 1.0000 to 1.0008 times the split path's. The planted control (each pair's routing weight on the
+    next pair) is 233 to 325 times farther.
 - `PF_HC_V2` (REORDER, bounded): an f32 reorder of the five-pass hyper-connections. Its f32 mixes and split are 2 to 6
   times farther from float64 than the five passes', at the 1e-7 level. That is below the bf16 rounding that follows,
   and the tail's output words are the five passes' words. The test holds the mixes and split within 1e-5 of float64,
@@ -363,7 +369,10 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | PF_MOE_EPI | Counting-sort route pack in place of two argsorts | EXACT | test |
 | PF_GU_SEG | 128 x 128 paired gate/up where the planner picks it | EXACT | test (word for word, to 8,192 rows, NVFP4 with per-expert scales; NAX) |
 | PF_KV_ROWS | Window kv rows on one simdgroup per row | EXACT | test (word for word) |
+| PF_COMP_PASS | Compressor pooling once over the pass, each span's index-key linear on its own groups | EXACT | test (word for word) |
+| PF_CED_COMP | The CED compressor at the split layer: each span's projection as before, then its norm, index keys and rope over the pass in one compressPass | EXACT | test (word for word) |
 | PF_DOWN_TOKORD | Staged down writes rows in token order | EXACT | test |
+| PF_DOWN_BK32 | Staged down on the 64 x 64 tile, 32 deep a step, at 96 routed rows an expert and more | EXACT | test (word for word) |
 | PF_FP4_GEMM | Staged matrix-unit gather for routed gate/up and down | EXACT | test |
 | WOA_JOIN | Joins the spans' wo_a rows in one copy | EXACT | commit |
 | PF_ROUTE_PACK | Router top-6 on a simdgroup per row; one-threadgroup scan | EXACT | test |
@@ -385,11 +394,13 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | FUSE_DOWN_SCALE | NVFP4 down scale inside the gate/up launch | EXACT | test (word for word) |
 | CED | The chunked prompt path: the decoder layers run again over a chunk's last window rows only | REORDER (row count) | commit (its fixture test is bit for bit only at 16-row chunks) |
 | MOE_FP4_NAX | Fused fp4 MoE decode kernels on the matrix units | REORDER (bounded) | test (within 1.25x of the `=0` path's rel-rms against f32, + 1e-4) |
-| MOE_PAIR_SCALED | NVFP4 prompt gate/up, scales and activation in one launch | REORDER (bounded) | test |
+| MOE_PAIR_FP4 | fp4 prompt gate/up (NVFP4 and MXFP4), the scales (NVFP4) and activation in one launch | REORDER (bounded) | test |
 | PF_HC_V2 | Wide-layer hc in three passes, not five | REORDER (bounded) | test |
 | PF_PASS_SIZE | Near-equal memory-sized prompt passes | REORDER (partition) | commit |
+| PF_PASS_CEIL | Prompt passes no wider than the machine's measured knee (39,680 rows on the M5 Ultra 512 GiB; other machines keep the memory-sized width) | REORDER (partition) | test (the plan) and A/B text (the view at 1M +3.27%, 512K +0.84%; NVFP4 already plans under it) |
 | PF_IDX_NAX | Indexer scores on the matrix units | REORDER (bounded) | test (within 2·γ(34) of `idx_tile`, the same top-half picks except near-ties; NAX) |
 | PF_COMP_BF16 | Compressor projection on a bf16 MMA, K blocks summed apart | REORDER | test |
+| PF_IDX_PASS | Indexer queries and head weights once over the pass, the head weights on a shape-cut kernel (16 partial sums) | REORDER | test (head weights no farther from float64 than MLX's GEMM per span; +0.8 GB peak, billed) |
 | FLASH_ATTN | Every prompt-attention call on one flash kernel where it fits | REORDER | test |
 | ENGRAM_GPU_IDS | Engram ids hashed on the GPU; fused wkv | REORDER (bounded) | test |
 | ENGRAM_KV_SLOTS | Slot-blocked Engram wkv | REORDER | test |
@@ -414,7 +425,7 @@ Engine variables on the DeepSeek path: `MLX_SERVE_DSV4_DSPARK` (REORDER, by reas
 
 ## Switches that stay opt-in
 
-Three switches stay off by default (`EXACT`, `FLASH_PSUM`, `MXFP4_VIEW`), and three value switches set
+Four switches stay off by default (`EXACT`, `FLASH_PSUM`, `MXFP4_VIEW`, `PF_INT8`), and three value switches set
 memory and kernel choices. `MLX_SERVE_DSV41_EXACT=1` now also serves NAX; `MLX_SERVE_DSV41_EXACT_VERIFY`, which only
 earlier heads of PR 1256 had, is gone.
 
@@ -432,6 +443,13 @@ Each of these is off by default. Names omit `MLX_SERVE_DSV41_` except where show
   release build the greedy A/B decides: the view is -1.70% prefill and -0.33% decode there, and its use is the
   16.8 GB of peak it saves (452.3 to 435.5 GB). With the card's settings, for the record: -1.62% prefill, +3.85%
   decode.
+- `PF_INT8=3|4` (LOSSY; single Mac, M5 Ultra 512 GB) runs a wide prompt pass's trunk projections in the 20 CED
+  encoder layers on w8a8's rotated int8 GEMM (one f32 scale per row on each side). Level 3 takes `wq_b` and `wo_b`.
+  Level 4 also takes the shared expert and the fused `wq_a`+`wkv`. The int8 weights are made at load and billed
+  (1.68 GB at level 3, 2.57 GB at level 4). The decoder layers stay exact. A two-Mac pair, a tensor split, streamed
+  weights and Macs without NAX run the exact path, and the load says so. On the
+  16K standard test, level 4 is +11.48% prefill (5,591.8 to 6,233.9 tok/s) with the same decode. Its 16K continuation
+  KLD against the exact path is 0.00834, and the `FLASH_ATTN=0` path's is 0.00829 (a difference of z +0.12).
 
 Three value switches set memory and kernel choices. `ENGRAM_LRU_MB` (256) sets memory only. `ENGRAM_RESIDENT` (`auto`)
 and `WEIGHT_PATH` (`auto`) can turn off the resident fusions. The `ssd` path turns off `FUSE_DOWN_SCALE` and `FUSE_MXFP8_QMM`. Tables not
@@ -452,7 +470,9 @@ Standard test, p01, greedy, DSpark on, NVFP4 pack:
 | `58279979`, the last reviewed head | 4,009.6 | 82.93 |
 | `a99fc4f6`, the release | 5,551.3 | 98.80 |
 
-From `58279979` to the release (the 47 changes, the upstream merge and the audit fixes): +38.4% prefill and +19.1% decode (`58279979` on
+Four later prompt levers (`PF_COMP_PASS`, `PF_IDX_PASS`, `PF_DOWN_BK32`, `PF_CED_COMP`) are on by default and not in
+these cells; their gains are measured per A/B (+0.27%, +0.26%, +0.08% and +0.02% prefill; `PF_CED_COMP`'s A/B gave
+the same text in both arms and is kept for the about 50 launches a span it removes). From `58279979` to the release (the 47 changes, the upstream merge and the audit fixes): +38.4% prefill and +19.1% decode (`58279979` on
 Mac 1, the release on Mac 2, which runs about 0.8% slower per round). On `f7e4da9e` the MXFP4-experts pack ran
 4,108.3 / 73.83 tok/s; NVFP4 was 2.8% slower.
 

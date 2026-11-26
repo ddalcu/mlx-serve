@@ -206,8 +206,10 @@ pub fn addServer(g: *const Graph, plugin_names: []const []const u8) void {
         }
         mod.root_source_file = b.path("src/exe.zig");
         // Plugins dealt round-robin into `unit-groups` objects: each compiles the shared code it reaches once, so fewer
-        // groups cost less CPU, more groups more parallelism.
-        const n_groups = @min(plugin_names.len, b.option(usize, "unit-groups", "Plugin objects under -Dunits (default 8)") orelse 8);
+        // groups cost less CPU, more groups more parallelism. The default is one group per core, 2 to 8.
+        const cores = std.Thread.getCpuCount() catch 8;
+        const default_groups = std.math.clamp(cores, 2, 8);
+        const n_groups = @min(plugin_names.len, b.option(usize, "unit-groups", "Plugin objects under -Dunits (default: one per core, 2 to 8)") orelse default_groups);
         const groups = b.allocator.alloc([]const []const u8, n_groups) catch @panic("OOM");
         for (groups, 0..) |*names, gi| {
             var list: std.ArrayList([]const u8) = .empty;
@@ -241,7 +243,7 @@ pub fn addServer(g: *const Graph, plugin_names: []const []const u8) void {
 /// modules (they import their host root), and no C sources (the exe links those once).
 fn unitModule(g: *const Graph, includes: []const std.Build.Module.IncludeDir, root: []const u8) *std.Build.Module {
     const b = g.b;
-    const m = b.createModule(.{ .root_source_file = b.path(root), .target = g.target, .optimize = g.optimize, .link_libcpp = true });
+    const m = b.createModule(.{ .root_source_file = b.path(root), .target = g.target, .optimize = g.optimize, .link_libcpp = true, .strip = g.exe_mod.strip });
     var it = g.exe_mod.import_table.iterator();
     while (it.next()) |e| if (!std.mem.eql(u8, e.key_ptr.*, "sushi_exl3")) m.addImport(e.key_ptr.*, e.value_ptr.*);
     m.include_dirs.appendSlice(b.allocator, includes) catch @panic("OOM");
@@ -284,6 +286,8 @@ pub fn addUnitTests(g: *const Graph) Tests {
     // filtered or not: a `sharded:` test (the kernel contract's gates 1-4) splits its own work across them, so a
     // filtered contract run takes a shard's time, not the whole registry's on one core. `-Dtest-shards=1`: one process.
     const shards: u32 = b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse defaultShards();
+    // The flip proof (`scripts/flip_proof.py`): every test starts with this lever at its other arm (sdk/testing/world.zig).
+    const test_flip = b.option([]const u8, "test-flip", "Run every test with this lever (NAME or NAME=value) at its other arm: the flip proof");
     const test_runs = b.allocator.alloc(*std.Build.Step.Run, shards) catch @panic("OOM");
     const test_step = b.step("test", "Run unit tests");
     // A Run step given an env var copies the WHOLE configure-time environment into the cached configuration, so the
@@ -298,6 +302,10 @@ pub fn addUnitTests(g: *const Graph) Tests {
         // A filtered run is a targeted one, often gated on an env var (ANE_TEST_PACK, QWEN4_TEST_MODEL)
         // that the run's cache key does not see: it reruns every time.
         if (test_filters.len != 0) run.*.has_side_effects = true;
+        if (test_flip) |f| {
+            run.*.setEnvironmentVariable("MLX_SERVE_TEST_FLIP", f);
+            run.*.has_side_effects = true;
+        }
         if (qwen_preprocess_fixture) |fixture| {
             run.*.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
             run.*.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });

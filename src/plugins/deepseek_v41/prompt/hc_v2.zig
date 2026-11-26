@@ -20,6 +20,7 @@ const device = @import("../../../mlx/device.zig");
 const log = @import("../../../sdk/util/log.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const dsv41 = @import("../deepseek_v41.zig");
+const gather_nax = @import("../../../sdk/blocks/moe/gather_qmm_nax.zig");
 
 const A = mlx.mlx_array;
 const none: A = .{ .ctx = null };
@@ -408,7 +409,6 @@ test "hc_v2 bench: the combining tails at a prompt width over a served routing, 
     try dsv41.evalAll(&.{ x, y, dn, sh, post, comb, cpre, fnw });
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(path), gpa, .limited(1 << 30));
     defer gpa.free(bytes);
-    const words = std.mem.bytesAsSlice(u32, bytes[0 .. bytes.len / 4 * 4]);
     const S = slicesFor(L);
     // One launch's time: a chain of `n` launches, each reading the one before's x2 as its stream, evaluated at once;
     // the chain of 9 less the chain of 1, over 8, best of 4.
@@ -445,14 +445,11 @@ test "hc_v2 bench: the combining tails at a prompt width over a served routing, 
     defer gpa.free(fill);
     var tot: [2][2]f64 = .{ .{ 0, 0 }, .{ 0, 0 } };
     var calls: usize = 0;
-    var at: usize = 0;
-    while (at + 4 <= words.len) {
-        const rl: usize = words[at];
-        const n: usize = words[at + 3];
-        if (words[at + 1] != K or at + 4 + 2 * n > words.len) return error.BadRouteDump;
-        const rows_ = words[at + 4 + n ..][0..n];
-        at += 4 + 2 * n;
-        if (rl != L) continue;
+    var it = gather_nax.RouteDump.init(bytes);
+    while (try it.next()) |rc| {
+        if (rc.k != K) return error.BadRouteDump;
+        const rows_ = rc.rows_of;
+        if (rc.rows != L) continue;
         // The served unsort: pair (token r, slot j) at its sorted place, slot j in the order the token's rows come.
         @memset(fill, 0);
         for (rows_, 0..) |r, place| {

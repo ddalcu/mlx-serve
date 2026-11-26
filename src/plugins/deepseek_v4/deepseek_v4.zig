@@ -1657,6 +1657,14 @@ pub fn decChainSetForTest(v: ?bool) void {
     dec_chain_state = v;
 }
 
+/// The test world's reset (`src/tests.zig` calls it before every test): the arms the test hooks force and the latched
+/// trace switch, as a fresh process holds them.
+pub fn testReset() void {
+    emit_kernel_state = null;
+    dec_chain_state = null;
+    dsv4_trace_state = null;
+}
+
 /// comp_in decode-side int8 requant engagement counter — the serving arm is
 /// gated by the user-facing `--decode-attn-quant` config flag
 /// (`decode_attn_quant.decodeAttnQuantEnabled`), same contract as the laguna

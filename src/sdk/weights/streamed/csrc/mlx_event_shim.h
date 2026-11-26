@@ -23,9 +23,9 @@ extern "C" {
 
 int32_t dsv41ev_abi(void);
 /* An MTLSharedEvent on MLX's GPU device, signaled value = start, kept for the process life. Returns its id
- * (>= 1) and writes the id<MTLSharedEvent> (the pool's EVK_MTL object) to *object; 0 on failure. */
+ * (>= 1) and writes the id<MTLSharedEvent> (the pool's EVK_MTL object) to *object; -1 on failure. */
 int32_t dsv41ev_create_metal(uint64_t start, uint64_t *object);
-/* A host event over an 8-aligned int64 word; a CPU-stream wait gives up (counted) after timeout_ns. 0 on failure. */
+/* A host event over an 8-aligned int64 word; a CPU-stream wait gives up (counted) after timeout_ns. -1 on failure. */
 int32_t dsv41ev_create_host(int64_t *word, int64_t timeout_ns);
 /* outs[i] (mlx_array_new() handles) alias xs[i], n >= 1, value >= 1; deps are ordering-only inputs; track_inputs
  * orders the post-wait GPU pass after the producers of xs (only for xs produced by in-flight GPU work). A host

@@ -224,6 +224,104 @@ pub fn floatValue(raw: ?[*:0]const u8, default: f32) f32 {
     return if (std.math.isFinite(v) and v >= 0) v else default;
 }
 
+// ── the test world's environment (`src/sdk/testing/world.zig` drives these) ──
+
+/// The variables the test world puts back before each test: every registered one but a `diag` (a token of
+/// `MLX_SERVE_DIAG`, itself registered) and `MLX_ENABLE_TF32`, which MLX reads once, at the process's first matmul.
+fn worldVar(comptime n: []const u8) bool {
+    return @field(vars, n).kind != .diag and !std.mem.eql(u8, n, "MLX_ENABLE_TF32");
+}
+
+/// One slot per world variable: its value when the test process started (null: unset).
+fn WorldSlot(comptime n: []const u8) type {
+    return SlotOfWorld(&@field(vars, n));
+}
+
+fn SlotOfWorld(comptime v: *const Var) type {
+    return struct {
+        const of = v;
+        var value: ?[:0]u8 = null;
+    };
+}
+
+/// Records every world variable's value as the reference each test starts from. The test process calls it once,
+/// before the first test (after it sets `MLX_SERVE_TEST_FLIP`'s arm).
+pub fn worldSnapshot() void {
+    @setEvalBranchQuota(200_000);
+    inline for (comptime std.meta.declarations(vars)) |n| {
+        if (comptime worldVar(n)) {
+            const z = comptime std.fmt.comptimePrint("{s}", .{n});
+            WorldSlot(n).value = if (std.c.getenv(z)) |v| std.heap.page_allocator.dupeSentinel(u8, std.mem.span(v), 0) catch @panic("env: out of memory") else null;
+        }
+    }
+}
+
+/// Puts back every world variable that differs from `worldSnapshot`'s value (setting only those, so a leftover
+/// thread's read races nothing else) and forgets `init`'s snapshot. Returns how many it put back.
+pub fn worldRestore() usize {
+    @setEvalBranchQuota(200_000);
+    var n_changed: usize = 0;
+    inline for (comptime std.meta.declarations(vars)) |n| {
+        if (comptime worldVar(n)) {
+            const z = comptime std.fmt.comptimePrint("{s}", .{n});
+            const want = WorldSlot(n).value;
+            const same = if (std.c.getenv(z)) |cur| want != null and std.mem.eql(u8, std.mem.span(cur), want.?) else want == null;
+            if (!same) {
+                n_changed += 1;
+                if (want) |w| _ = setForeign(z, w.ptr) else unsetForeign(z);
+            }
+        }
+    }
+    snapshot_taken = false;
+    return n_changed;
+}
+
+/// The `kill` variables `worldSnapshot`'s reference holds, `NAME=value` each, for the test world's start line.
+pub fn worldLevers(out: []u8) []const u8 {
+    @setEvalBranchQuota(200_000);
+    var w: std.Io.Writer = .fixed(out);
+    inline for (comptime std.meta.declarations(vars)) |n| {
+        if (comptime @field(vars, n).kind == .kill) {
+            if (WorldSlot(n).value) |v| w.print("{s}{s}={s}", .{ if (w.buffered().len > 0) " " else "", n, v }) catch {};
+        }
+    }
+    return w.buffered();
+}
+
+/// `MLX_SERVE_TEST_FLIP`'s lever and the arm it names.
+pub const Flip = struct { name: [:0]const u8, value: [:0]const u8 };
+
+pub const FlipError = error{ UnknownFlip, NoFlipArm };
+
+/// The flip proof's lever: `spec` is a registered name, or one without its `MLX_SERVE_DSV41_`, `MLX_SERVE_DSV4_` or
+/// `MLX_SERVE_` prefix, optionally `=value`. Without a value a flag takes its other arm: `0` where its registered
+/// default starts with "on", `1` where it starts with "off"; any other variable needs the value.
+pub fn flipArm(spec: []const u8) FlipError!Flip {
+    @setEvalBranchQuota(400_000);
+    const eq = std.mem.indexOfScalar(u8, spec, '=');
+    const name = spec[0 .. eq orelse spec.len];
+    inline for (comptime std.meta.declarations(vars)) |n| {
+        if (comptime @field(vars, n).kind != .diag) {
+            var hit = std.mem.eql(u8, name, n);
+            inline for (.{ "MLX_SERVE_DSV41_", "MLX_SERVE_DSV4_", "MLX_SERVE_" }) |p| {
+                if (comptime std.mem.startsWith(u8, n, p)) {
+                    if (std.mem.eql(u8, name, n[p.len..])) hit = true;
+                }
+            }
+            if (hit) {
+                const v = @field(vars, n);
+                const z = comptime std.fmt.comptimePrint("{s}", .{n});
+                if (eq) |e| return .{ .name = z, .value = std.heap.page_allocator.dupeSentinel(u8, spec[e + 1 ..], 0) catch @panic("env: out of memory") };
+                if (v.type != .flag) return error.NoFlipArm;
+                if (std.mem.startsWith(u8, v.default, "on")) return .{ .name = z, .value = "0" };
+                if (std.mem.startsWith(u8, v.default, "off")) return .{ .name = z, .value = "1" };
+                return error.NoFlipArm;
+            }
+        }
+    }
+    return error.UnknownFlip;
+}
+
 const c = struct {
     extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
     extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -345,7 +443,7 @@ pub const vars = struct {
     pub const MLX_SERVE_DSV41_ENGRAM_LRU_MB: Var = .{ .kind = .kill, .type = .text, .default = "256", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram LRU's size in MiB: the rows kept across a conversation's turns and their index, 1 to 16384, billed at load beside the host's bytes" };
     pub const MLX_SERVE_DSV41_ENGRAM_RESIDENT: Var = .{ .kind = .kill, .type = .text, .default = "auto", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "DeepSeek-V4.1 Engram tables read into memory once at load, their rows then copied from it, not read from disk. auto: where the bill with them fits 7/8 of RAM and the GPU working set and the memory is free after the weights; wired: auto, then mlock'd; 0: read from disk per lookup" };
     pub const MLX_SERVE_DSV41_MOE_FP4_NAX: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "on (default; =0 the routed gathers): DeepSeek-V4.1 fused fp4 MoE decode kernels (MXFP4, NVFP4 with per-expert scales) on a NAX GPU too, read each call (=0: there decode runs the routed gathers; without NAX the kernels always serve)" };
-    pub const MLX_SERVE_DSV41_MOE_PAIR_SCALED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "on (default; =0 the split gathers): a DeepSeek-V4.1 prompt call runs an NVFP4 bank's gate and up (ModelOpt's per-expert scales in the epilogue) as one paired launch with moe_act in its epilogue; a reorder held to bounds against float64: under 1% of the activation's words differ (measured about 0.2%), each within one bf16 step of its row's largest value (a word the split path gives as zero keeps a tiny value), float64 l2 within 1.05x of the split path's over the test's sample (measured equal); read each call" };
+    pub const MLX_SERVE_DSV41_MOE_PAIR_FP4: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "on (default; =0 the split gathers): a DeepSeek-V4.1 prompt call runs an fp4 bank's gate and up as one paired launch with moe_act in its epilogue, either format: NVFP4 with ModelOpt's per-expert scales in the epilogue, MXFP4 (or the MXFP4 view) with that step compiled out; a reorder held to bounds against float64: under 1% of the activation's words differ (measured about 0.2% on NVFP4, 0.0015% on MXFP4), each within one bf16 step of its row's largest value (a word the split path gives as zero keeps a tiny value), float64 l2 within 1.05x of the split path's over the test's sample (measured equal); read each call. Replaces MOE_PAIR_SCALED (NVFP4 only), which no release on main carried" };
     pub const MLX_SERVE_DSV41_IN_PROJ_MIXR: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 the mixes last, one threadgroup a mix): a DeepSeek-V4.1 decode in_proj of 3..6 rows (a DSpark verify) runs its hc mixes as one threadgroup a (mix, row), first in the grid, so the mixes no longer trail the launch by every row's stream (each row's sums as before: the same words); read each call" };
     pub const MLX_SERVE_DSV41_DRAFT_FUSED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "on (default; =0 the batched draft kernels): a DeepSeek-V4.1 DSpark stage of up to 6 draft rows runs on the fused decode kernels a trunk layer's decode runs (in_proj, wq_b, ffn_in, the fused MoE with the hc expand; a batched draft's stage the last two), its attention core as before, instead of the op chain; read each stage" };
     pub const MLX_SERVE_DSV41_DRAFT_SAMPLE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 one-hot acceptance of argmax drafts): a sampled request's DeepSeek-V4.1 DSpark rounds draw each draft token from the draft's own distribution (softmax of its Markov-biased row at the request's temperature, inside the fused Markov chain) and accept it with min(1, p / q), resampling a reject from max(0, p - q), in place of the argmax draft's one-hot acceptance; greedy rounds unchanged; read each round" };
@@ -355,11 +453,17 @@ pub const vars = struct {
     pub const MLX_SERVE_DSV41_PF_GU_SEG: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 the staged gather everywhere): under PF_FP4_GEMM a DeepSeek-V4.1 prompt MoE call's routed gate/up takes the seg 128 x 128 paired launch where the gather planner picks it (96 routed rows an expert and more), the staged gather elsewhere; the same words; read each call" };
     pub const MLX_SERVE_DSV41_PF_KV_ROWS: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 kv_row, one 512-thread threadgroup a row): a DeepSeek-V4.1 prompt call's window kv rows (more than 16) get kv_row's rms, rope and fp8 round trip from one simdgroup a row, the row width compiled in, no threadgroup memory or barrier; the same words; read each call" };
     pub const MLX_SERVE_DSV41_PF_DOWN_TOKORD: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 the down rows in expert order, unsorted by the combine): a DeepSeek-V4.1 prompt MoE call's staged fp4 down (PF_FP4_GEMM) writes each expert row straight to its pair's slot (token order), and the combine, MOE_TAIL and the hc_v2 tail read the rows in place with no unsort gather; the same words; read each call" };
+    pub const MLX_SERVE_DSV41_PF_DOWN_BK32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "on (default; =0 the 64-deep step): under PF_FP4_GEMM a DeepSeek-V4.1 prompt MoE call of 96 routed rows an expert and more runs its staged fp4 down (and PF_DOWN_TOKORD's scatter) on the 64 x 64 tile 32 deep a step (gather_qmm_nax.wide_down) instead of 64; the k16 blocks sum in the same order, so the same words; read each call" };
+    pub const MLX_SERVE_DSV41_PF_INT8: Var = .{ .kind = .kill, .type = .int, .default = "0", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "NOT LOSSLESS; a single-Mac (M5 Ultra 512 GB) feature. 3: a resident DeepSeek-V4.1 wide prompt pass runs wq_b and wo_b of the CED encoder's layers on w8a8's int8 GEMM (input and weight rotated by a signed 256-point Hadamard transform, an f32 scale a row each over int8 values; the int8 weights made from the mxfp8 weights at load, billed); 4: level 3, and the shared expert's gate/up and down and the fused wq_a+wkv on the same GEMM; the decoder layers stay exact on every call; inert (a load line names why) on a two-Mac pair, a tensor split, streamed weights or without NAX; the served text can change; 0 and every other value (default 0): the exact path; read at load" };
     pub const MLX_SERVE_DSV41_PF_FP4_GEMM: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 MLX's gather_qmm): a DeepSeek-V4.1 prompt MoE call runs an fp4 bank's routed gate/up (with moe_act) and down on the staged NAX gather (activations and weight words a 64-deep step ahead, one barrier a step, K and N compiled in), the same words; read each call" };
     pub const MLX_SERVE_DSV41_WOA_JOIN: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.4", .doc = "on (default; =0 two copies): a wide prompt layer joins its spans' wo_a rows from their groups' views (one copy where each span's reshape and the join made two), the same math; read each call" };
     pub const MLX_SERVE_DSV41_PF_HC_V2: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 the five passes): a resident DeepSeek-V4.1 wide prompt layer on a NAX GPU (bf16, the release's hc shapes) runs its hyper-connections in three passes over the stream (the FFN side's expand, norm and mixes; the tail's expand with the next layer's attention-side norm and mixes), 64 rows a threadgroup sharing the mix weights; an f32 reorder held to bounds: the attention side's mixes and split within 1e-5 of float64 in l2 and max (measured 2-6x farther than the five passes, at the 1e-7 level, below the bf16 rounding that follows), every other output within 1.01x of the five passes' float64 l2, the stream the same words; read each call" };
     pub const MLX_SERVE_DSV41_PF_PASS_SIZE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 8192-row chunks and a tail): a resident DeepSeek-V4.1 prompt runs in near-equal passes no wider than the widest pass the load-time memory share bills (`--prefill-chunk` narrows it), not 8192-row chunks and a short tail; each pass runs its MoE over all of its rows in one call, and with every Engram table held a chunk sends no lead pass ahead; no layer pair or tensor split; read at load" };
+    pub const MLX_SERVE_DSV41_PF_PASS_CEIL: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "on (default; =0 the memory-sized width): under PF_PASS_SIZE a DeepSeek-V4.1 prompt pass is no wider than this machine's measured ceiling, a machine constant: on the M5 Ultra with 512 GiB, 39,680 rows (155 spans), the knee measured there at 1M prompt rows on both fp4 formats (wider passes' fresh allocations cost more than their fewer passes save); every other machine keeps the memory-sized width until its knee is measured; --prefill-chunk is never ceiled; a reorder (a different partition into passes); read at load" };
     pub const MLX_SERVE_DSV41_PF_IDX_NAX: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 idx_tile): a DeepSeek-V4.1 wide prompt span's indexer scores run on the matrix units (pf_idx_score: 8 rows a threadgroup over a range of 16-key tiles, the 32 heads' queries in registers), not idx_tile's 8x8 simdgroup matrices; f32 sums in another order; read each call" };
+    pub const MLX_SERVE_DSV41_PF_CED_COMP: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "on (default; =0 span by span): under MLX_SERVE_DSV41_PF_CED_HC, a DeepSeek-V4.1 CED prompt pass's compressor at the split layer (ratio 1) projects each span as today, then norms, makes the index keys (a span's groups at a time) and ropes every span's rows in one pass of its ops: the same words in a few launches, not about 50 a span; read each call" };
+    pub const MLX_SERVE_DSV41_PF_COMP_PASS: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "on (default; =0 span by span): a DeepSeek-V4.1 wide prompt layer's compressor (under MLX_SERVE_DSV41_PF_COMP_BF16) pools, norms and ropes every span's rows in one pass of its ops instead of span by span, each span's index-key linear still over its own groups: the same words in about 15 launches a layer, not about 1,000" };
+    pub const MLX_SERVE_DSV41_PF_IDX_PASS: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "on (default; =0 per span): a DeepSeek-V4.1 wide prompt layer's indexer queries (wq_b, rope and fp4 round trip) and head weights over the whole pass before its span loop, each span reading its rows; the head weights on one shape-cut launch (kernels/idx_wproj.metal, 16 partial sums of 320 products) in place of MLX's split GEMM per span (a reorder)" };
     pub const MLX_SERVE_DSV41_PF_COMP_BF16: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 a TF32 GEMM per 256-row span): on a NAX GPU a DeepSeek-V4.1 wide prompt layer's compressor projection (wkv and wgate, bf16 weights, f32 out) runs once over all of the layer's rows, each GEMM one launch with its MMA in bf16, each 256-wide K block summed in its own f32 tile and then added (every product exact; no farther from float64 than the per-span TF32 chain); read each call" };
     pub const MLX_SERVE_DSV41_PF_ROUTE_PACK: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 route.metal's top-6 and the one-threadgroup pack scan): a DeepSeek-V4.1 prompt layer's router top-6 (past 32 rows) on one simdgroup a row with no threadgroup barrier, and its route pack's offsets scan on a whole 1024-thread threadgroup instead of one thread an expert walking every block twice: the same words; read each call" };
     pub const MLX_SERVE_DSV41_PF_ROUTER_BF16: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "on (default; =0 the f32 chain: MLX's words, as one launch where MLX runs its regular kernel): on a NAX GPU a DeepSeek-V4.1 wide prompt layer's router logits (x and gate_w both bf16, f32 out), where MLX runs its single-sum kernel (1,707 rows and more at 384 experts), run as one launch with its MMA in bf16 into f32 accumulators: every product exact and the same single sum, the same words; narrower calls keep MLX's split-K matmul; read each call" };
@@ -416,12 +520,13 @@ pub const vars = struct {
     pub const DSV4_SKIP_MOE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v4", .since = "26.8.1", .doc = "set: DeepSeek-V4 decode skips the MoE (timing only, garbage output)" };
     pub const DSV4_TRACE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v4", .since = "26.8.1", .doc = "DeepSeek-V4 decode trace (exactly 1)" };
     pub const DSV41_ROUTE_DUMP: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "each DeepSeek-V4.1 prompt MoE call with under 4 rows an expert (every call under DSV41_ROUTE_DUMP_WIDE) appends its routing to the named file (u32 rows, picks a row, experts, pairs, then the pairs' experts in expert order and their rows), a profile of the calls' expert reuse" };
+    pub const DSV41_TRUNK_DUMP: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "a directory: each DeepSeek-V4.1 wide prompt pass writes the inputs of its trunk projections (the q/kv input, wq_b, wo_b, the shared expert's gate/up and down) at layers 3, 10 and 17, every stride-th row to at most 1,024 rows, raw bf16 (L<layer>_<name>.bin: u32 rows, u32 columns, then the words), for MLX_SERVE_DSV41_PF_INT8's quality test" };
     pub const DSV41_ROUTE_DUMP_WIDE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "=1: DSV41_ROUTE_DUMP records every prompt MoE call, the wide passes too" };
     pub const DUMP_RESTORE: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "engines/mlx/cache", .since = "26.9.3", .doc = "dir: dump restored prefix-cache state" };
     pub const FORCE_GPU_FAMILY_FALLBACK: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "mlx", .since = "26.7.10", .doc = "=1: report no NAX (the pre-NAX GPU-family fallback)" };
     pub const GDN_UBENCH: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "sdk/blocks/gdn", .since = "26.7.7", .doc = "GDN µbench: sequential kernel vs bare qmm at 27B shapes (attribution)" };
     pub const GGUF_NAX_UBENCH: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "sdk/quant/gguf", .since = "26.11.2", .doc = "GGUF expert-bank ubenches at the DeepSeek-V4.1 Coder's shapes (prefill on the matrix units, decode gathers) against MLX's 2-bit affine" };
-    pub const GQMM_UBENCH: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "sdk/blocks/moe", .since = "26.10.2", .doc = "gather-QMM NAX ubench (`sweep`: every tile config)" };
+    pub const GQMM_UBENCH: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "sdk/blocks/moe", .since = "26.10.2", .doc = "gather-QMM NAX ubench (`sweep`: every tile config; `route:<file>` / `wide:<file>`: a DSV41_ROUTE_DUMP file's calls, `wide` its widest pass on the served kernels against staged tiles)" };
     pub const H3_SPLIT_SHARE: Var = .{ .kind = .diag, .type = .float, .default = "the calibrated cut", .owner = "plugins/minimax_h3", .since = "26.10.3", .doc = "H3 cluster: share of rows kept on this Mac (0..1)" };
     pub const KVQ_UBENCH: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "engines/mlx/cache", .since = "26.7.12", .doc = "kv-quant decode attention ubench" };
     pub const LAGUNA_UBENCH: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/laguna", .since = "26.7.12", .doc = "Laguna-XS decode µbench: bf16 attention projections" };
@@ -547,6 +652,7 @@ pub const vars = struct {
     pub const DSV41_TF32_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "dsv41 tf32: a directory of a served run's f32 GEMM operands (<site>-<i>.safetensors); the trunk's sites read TF32-exact operands, each GEMM measured against float64 under the process's MLX_ENABLE_TF32" };
     pub const DSV41_TINY: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41", .since = "26.10.2", .doc = "dsv41 fixture: prefill, chunked prefill, spans and decode match DeepSeek's reference (DSV41_TINY)" };
     pub const DSV41_VERIFY_ROWS: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "dsv41 verify width: time of a verify block per draft count (DSV41_VERIFY_ROWS)" };
+    pub const DSV41_TRUNK_Q: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41", .since = "26.11.5", .doc = "dsv41 pf int8 quality: <DSV41_TRUNK_DUMP dir>:<pack dir>, each trunk projection's served mxfp8 and int8 outputs against float64" };
     pub const DSV41_VERIFY_EXACT: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41", .since = "26.11.0", .doc = "dsv41 verify exact: on a real pack, each verify row's logits against the plain step's (DSV41_VERIFY_EXACT = the pack dir)" };
     pub const DSV41_VERIFY_EXACT_STEPS: Var = .{ .kind = .fixture, .type = .int, .default = "120", .owner = "plugins/deepseek_v41", .since = "26.11.0", .doc = "dsv41 verify exact: the plain steps the real-pack check decodes and verifies" };
     pub const DSV41_VERIFY_EXACT_DUMP: Var = .{ .kind = .fixture, .type = .text, .default = "unset: no dump", .owner = "plugins/deepseek_v41", .since = "26.11.0", .doc = "dsv41 verify exact: a file for each plain step's token and logits hash" };
@@ -783,6 +889,7 @@ pub const vars = struct {
     pub const MLX_SERVE_TAPE_RECORD: Var = .{ .kind = .fixture, .type = .text, .default = "unset: tapes are compared", .owner = "sdk/testing", .since = "26.11.2", .doc = "dir: proof tapes record this run as <sha256 of the played tape>.tape instead of comparing (re-baseline after an MLX bump)" };
     pub const MLX_SERVE_TEST_ANE_MODEL: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "engines/ane", .since = "unreleased", .doc = "test input read by `realPack`" };
     pub const MLX_SERVE_TEST_DS4_GGUF: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "engines/ds4", .since = "unreleased", .doc = "test input read by `realGguf`" };
+    pub const MLX_SERVE_TEST_FLIP: Var = .{ .kind = .fixture, .type = .text, .default = "unset: every lever at its default", .owner = "sdk/testing", .since = "unreleased", .doc = "the flip proof: a lever (NAME, or NAME=value) every test starts at its other arm (`sdk/testing/world.zig`, `scripts/flip_proof.py`)" };
     pub const MLX_SERVE_TEST_LLAMA_GGUF: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "engines/llama", .since = "unreleased", .doc = "test input read by `realGguf`" };
     pub const MLX_SERVE_TEST_SHARD: Var = .{ .kind = .fixture, .type = .text, .default = "unset: every test", .owner = "build/test_runner.zig", .since = "unreleased", .doc = "k/n: this test process runs every n-th test from k; a `sharded:` test splits its own work the same way" };
     pub const MOE_UBENCH: Var = .{ .kind = .fixture, .type = .flag, .default = "off", .owner = "sdk/blocks/moe", .since = "26.10.2", .doc = "moe gather kernels: microbench (MOE_UBENCH=1)" };

@@ -7,6 +7,7 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const env = @import("../../env.zig");
 const device = @import("../../mlx/device.zig");
+const world = @import("../../sdk/testing/world.zig");
 const kit = @import("../deepseek_v4/contract_kit.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const v41 = @import("deepseek_v41.zig");
@@ -2220,6 +2221,35 @@ const GateGemm = struct {
         defer sc.deinit();
         const w = try sc.astype(k.args[1], .float32);
         return k.rig.bytesOf(&.{try sc.matmul(try sc.astype(k.args[0], .float32), try sc.transpose(w, &.{ 1, 0 }))});
+    }
+};
+
+// ── MLX_SERVE_DSV41_PF_IDX_PASS: the indexer's head weights over a pass (kernels/idx_wproj.metal) ──
+
+/// x [rows, 5120] . W [32, 5120]^T in f32, bf16 out: the model's shape compiled in (any rows), 16 partial sums of
+/// 320 products added as a tree, so an f32 sum in another order than MLX's split GEMM.
+const IdxWproj = struct {
+    pub const Params = struct {};
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n != @as(usize, @intCast(v41.idx_wproj_n)) or s.k != @as(usize, @intCast(v41.idx_wproj_k))) return null;
+        var g = metal.Geometry{ .grid = .{ 256, ci((s.rows + 15) / 16), 1 }, .tg = .{ 256, 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(s.n) }, act);
+        g.dtype("T", act);
+        g.dtype("OT", act);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        return GemvTwin.fill(k, f, rng);
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        return GemvTwin.compute(k, out, mag, sum);
     }
 };
 
@@ -4839,6 +4869,7 @@ const expand_norm_into_l = launch("dsv41_hc_expand_norm_into", &.{ "y", "res", "
 const gate_gemm_l = metal.Launch{ .name = "dsv41_gate_gemm", .inputs = &.{ "a", "b" }, .outputs = &.{"y"}, .source = ggemm.body, .header = ggemm.header, .tg_bytes = 0, .offline = false, .min_gen = 17 };
 const markov_step_l = launch("dsv41_markov_step", &.{ "lg", "emb", "mh", "t1", "pin" }, &.{ "pout", "row" }, markov.step_source, markov.header, 4 * (2 * 8 + 1), 1024, false);
 const markov_final_l = launch("dsv41_markov_final", &.{ "parts", "t1", "hout", "emb", "cw" }, &.{ "toks", "conf" }, markov.final_source, markov.header, 4 * (3 * 16 + 1), 1024, false);
+const idx_wproj_l = metal.Launch{ .name = "dsv41_idx_wproj", .inputs = &.{ "x", "w" }, .outputs = &.{"y"}, .source = v41.IDX_WPROJ_SOURCE, .header = v41.IDX_WPROJ_HEADER, .tg_bytes = 4 * 8 * 16 * 32, .offline = false, .min_gen = 17 };
 const flash_l = metal.Launch{ .name = "dsv41_attn_flash", .inputs = &v41.GatherAttn.FLASH_INS, .outputs = &.{"o"}, .source = fa.source, .header = @import("decode/attn.zig").HEADER, .tg_bytes = 4 * 2 * 128 + 4 * 2 * 4 * 4 * 16 + 2 * 4 * 8 * 256, .offline = false, .min_gen = 17 };
 const flash_trim_l = metal.Launch{ .name = "dsv41_attn_flash_trim", .inputs = flash_l.inputs, .outputs = flash_l.outputs, .source = fa.source, .header = fa.header_trim, .tg_bytes = flash_l.tg_bytes, .offline = false, .min_gen = 17 };
 const flash_psum_l = metal.Launch{ .name = "dsv41_attn_flash_psum", .inputs = flash_l.inputs, .outputs = flash_l.outputs, .source = fa.source, .header = fa.header_psum, .tg_bytes = flash_l.tg_bytes, .offline = false, .min_gen = 17 };
@@ -5380,7 +5411,7 @@ const Shell = struct {
         m.moe_dn_kernel = try b("dsv41_moe_dn", &v41.MOE_DN_INS, &.{"out"}, v41.MOE_DN_SOURCE, v41.MOE_HEADER);
         m.moe_act_kernel = try b("dsv41_moe_act", &v41.MOE_ACT_INS, &.{"out"}, v41.MOE_ACT_SOURCE, "");
         m.moe_combine_kernel = try b("dsv41_moe_combine", &v41.MOE_COMBINE_INS, &.{"out"}, v41.MOE_COMBINE_SOURCE, "");
-        const use_nax = device.naxAvailable();
+        const use_nax = world.nax();
         m.idx_nax_kernel = if (use_nax) try v41.buildIdxNaxKernel() else null;
         return .{ .m = m };
     }
@@ -5434,6 +5465,14 @@ fn registerStreamed(set: *kc.Set) !void {
         .nax = true,
         .served = flash_first_served,
         .sums = .{ .exact = false },
+    });
+    try kit.add(set, IdxWproj, &idx_wproj_l, .{}, .{
+        .name = "dsv41 idx_wproj (PF_IDX_PASS: the indexer's head weights over a pass, 32 x 5,120 compiled in, bf16 out)",
+        .accum = .f32,
+        .depth = depthK,
+        .out = .bf16,
+        .nax = true,
+        .served = &.{ .{ .rows = 33, .n = 32, .k = 5120 }, .{ .rows = 256, .n = 32, .k = 5120 }, .{ .rows = 1000, .n = 32, .k = 5120 } },
     });
     // FLASH_TRIM and FLASH_PSUM together: the same bound.
     inline for (.{ true, false }) |qt| try kit.add(set, AttnFlash, &flash_trim_psum_l, .{ .qt = qt }, .{
@@ -5673,7 +5712,7 @@ fn held(x: A) A {
 
 test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte for byte" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var sh = try Shell.init(mlx.gpuStream());
     defer sh.deinit();
@@ -5748,7 +5787,7 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         defer _ = mlx.mlx_array_free(y);
         try Expect.same(r.c, r.bytes, &.{y});
     }
-    if (@import("../../mlx/device.zig").naxAvailable()) {
+    if (world.nax()) {
         const r = try ours(GateGemm, a, &gate_gemm_l, .{}, .{ .rows = 100, .n = 384, .k = 768 });
         const y = (try ggemm.router(m.s, r.c.args[0], r.c.args[1], true)).?;
         defer _ = mlx.mlx_array_free(y);
@@ -5763,7 +5802,7 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         try Expect.same(rk.c, rk.bytes, &.{yk});
     }
     // The flash kernel as the model launches it (`flashLaunch`, grouped).
-    if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
+    if (world.nax()) inline for (.{ true, false }) |qt| {
         const r = try ours(AttnFlash, a, &flash_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
         const fk = try v41.buildKernel("dsv41_attn_flash", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, @import("decode/attn.zig").HEADER);
         defer _ = mlx.mlx_fast_metal_kernel_free(fk);
@@ -5772,7 +5811,7 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         try Expect.same(r.c, r.bytes, &got);
     };
     // FLASH_TRIM's kernel as the model builds and launches it (`fa.header_trim`).
-    if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
+    if (world.nax()) inline for (.{ true, false }) |qt| {
         const r = try ours(AttnFlash, a, &flash_trim_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
         const fk = try v41.buildKernel("dsv41_attn_flash_trim", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, fa.header_trim);
         defer _ = mlx.mlx_fast_metal_kernel_free(fk);
@@ -5781,7 +5820,7 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         try Expect.same(r.c, r.bytes, &got);
     };
     // Both switches' kernel as the model builds and launches it (`fa.header_trim_psum`).
-    if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
+    if (world.nax()) inline for (.{ true, false }) |qt| {
         const r = try ours(AttnFlash, a, &flash_trim_psum_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
         const fk = try v41.buildKernel("dsv41_attn_flash_trim_psum", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, fa.header_trim_psum);
         defer _ = mlx.mlx_fast_metal_kernel_free(fk);
@@ -5790,7 +5829,7 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         try Expect.same(r.c, r.bytes, &got);
     };
     // FLASH_PSUM's kernel as the model builds and launches it (`fa.header_psum`).
-    if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
+    if (world.nax()) inline for (.{ true, false }) |qt| {
         const r = try ours(AttnFlash, a, &flash_psum_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
         const fk = try v41.buildKernel("dsv41_attn_flash_psum", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, fa.header_psum);
         defer _ = mlx.mlx_fast_metal_kernel_free(fk);
@@ -5977,7 +6016,7 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const r = try ours(IdxTile, a, &tile_l, .{}, .{ .rows = 18, .n = 200, .k = IHD });
         try Expect.same(r.c, r.bytes, &.{try v41.indexScoresTiled(&sc, m, r.c.args[0], r.c.args[1], r.c.args[2], @floatCast(r.c.in(4)[0]), @intFromFloat(r.c.in(3)[0]), @intFromFloat(r.c.in(3)[1]))});
     }
-    if (@import("../../mlx/device.zig").naxAvailable()) {
+    if (world.nax()) {
         const r = try ours(IdxNax, a, &idx_nax_l, .{}, .{ .rows = 18, .n = 200, .k = IHD });
         try Expect.same(r.c, r.bytes, &.{try inax.launch(&sc, try inax.kernel(), r.c.args[0..5])});
     }

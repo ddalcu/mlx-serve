@@ -150,7 +150,7 @@ fn addState(r: *Run, m: *dsv41.Dsv41Model, st: *const dsv41.State) !void {
 }
 
 /// The switches an arm runs under.
-const Sw = struct { lazy: bool = false, async_end: bool = false, ced_hc: bool = false, rope_pairs: bool = false, rms_rows: bool = false };
+const Sw = struct { lazy: bool = false, async_end: bool = false, ced_hc: bool = false, rope_pairs: bool = false, rms_rows: bool = false, ced_comp: bool = false };
 
 /// After each chunk of an arm: `State.ced_lazy`, and whether the first decoder layer's ring was ready once the GPU
 /// went idle (`ran`).
@@ -172,6 +172,8 @@ fn arm(fx: *fixture.Fixture, ids: []const u32, plan: []const isize, next: []cons
     defer rp.restore();
     const rr = env.override(.MLX_SERVE_DSV41_PF_RMS_ROWS, if (sw.rms_rows) "1" else "0");
     defer rr.restore();
+    const cc = env.override(.MLX_SERVE_DSV41_PF_CED_COMP, if (sw.ced_comp) "1" else "0");
+    defer cc.restore();
     try dsv41.reset(m, gpa);
     try dsv41.armPrompt(m, ids, null, capture);
     const st = &m.dec_state.?;
@@ -418,5 +420,42 @@ test "dsv41 pf rms_rows: the query latent's rms read in place in q_kv's output l
         try expectSame("rms_rows", &on, &off, w, &dead);
         try testing.expectEqual(@as(usize, 0), dead);
         std.debug.print("[rms_rows] {s}: {d} strided rms launches, every part word for word\n", .{ if (nv) "nvfp4" else "mxfp4", dsv41.rms_rows_calls.load(.monotonic) - before });
+    }
+}
+
+test "dsv41 pf ced_comp: the CED compressor's pooling, index keys and rope over the pass in one compressPass (each span's projection as before) leave every cache, window row and logits row of the span-by-span compressor word for word, the 17.6K card's chunks, NVFP4 with per-expert scales and MXFP4 experts; the groups' rope a row late fails" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var rng = std.Random.DefaultPrng.init(61);
+    for ([_]bool{ true, false }) |nv| {
+        const fx = try build(gpa, nv);
+        defer fx.deinit();
+        const w: usize = fx.m.cfg.sliding_window;
+        const next = [_]u32{ 7, 11, 13 };
+        const card = try gpa.alloc(u32, 17_639);
+        defer gpa.free(card);
+        for (card) |*t| t.* = 1 + rng.random().uintLessThan(u32, 3999);
+        const plan = [_]isize{ -4096, 4096, 8192, 1254 };
+        var off: Run = .{};
+        defer off.deinit();
+        var on: Run = .{};
+        defer on.deinit();
+        var planted: Run = .{};
+        defer planted.deinit();
+        var no_snap: Run = .{};
+        defer no_snap.deinit();
+        var obs: Obs = .{};
+        try arm(fx, card, &plan, &next, .{ .ced_hc = true }, false, null, &off, &no_snap, &obs);
+        const before = dsv41.ced_comp_passes.load(.monotonic);
+        try arm(fx, card, &plan, &next, .{ .ced_hc = true, .ced_comp = true }, false, null, &on, &no_snap, &obs);
+        try testing.expectEqual(before + plan.len, dsv41.ced_comp_passes.load(.monotonic));
+        var dead: usize = 0;
+        try expectSame("ced_comp", &on, &off, w, &dead);
+        try testing.expectEqual(@as(usize, 0), dead);
+        dsv41.comp_pass_plant = true;
+        defer dsv41.comp_pass_plant = false;
+        try arm(fx, card, &plan, &next, .{ .ced_hc = true, .ced_comp = true }, false, null, &planted, &no_snap, &obs);
+        try testing.expectError(error.NotByteIdentical, expectSame("ced_comp planted", &planted, &off, w, &dead));
+        std.debug.print("[ced_comp] {s}: {d} passes in one compressPass, every part word for word; the planted late rope differs\n", .{ if (nv) "nvfp4" else "mxfp4", plan.len });
     }
 }

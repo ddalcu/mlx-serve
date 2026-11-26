@@ -129,6 +129,14 @@ class Hygiene(unittest.TestCase):
         ok = HDR + "fn f(parent: *ops.Graph, x: Array) !Array {\n    var g = parent.scope();\n    defer g.deinit();\n    return parent.keep(try g.add(x, x));\n}\n"
         self.assertEqual(count("graph-scope", {"src/sdk/x.zig": ok}), 0)
 
+    def test_machine_read_in_test(self):
+        body = HDR + ("fn plan() bool {\n    return device.naxAvailable();\n}\n// ── tests ──\n"
+                      "test \"a\" {\n    if (!device.naxAvailable()) return error.SkipZigTest;\n"
+                      "    const tol: f32 = if (device.naxAvailable()) 1e-2 else 1e-3;\n    _ = world.nax();\n"
+                      "    _ = ane.chipBrand();\n}\n")
+        self.assertEqual(count("machine-read-in-test", {"src/plugins/deepseek_v41/x.zig": body}), 2)
+        self.assertEqual(count("machine-read-in-test", {"src/plugins/qwen3/x.zig": body}), 0)
+
 
 class PinsForksRatchets(unittest.TestCase):
     def test_pins(self):

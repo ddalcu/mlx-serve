@@ -585,3 +585,85 @@ test "builtin host gpu: a host event round-trips through event_set and event_val
     // A refusal names the call; the shim's reason goes to the log.
     try testing.expectEqual(abi.Verdict.Code.failed, g.event_host(null, &word, 0, &ev).code);
 }
+
+const mlxlc_test_abi = if (shims != null) struct {
+    pub extern "c" fn mlxlc_test_graph_ops(outputs: mlx.mlx_vector_array, out: [*]u8, cap: c_int) c_int;
+} else struct {};
+
+test "builtin host gpu: mlxlc_apply avoids Contiguous node on unevaluated inputs while keeping transpose eval correct" {
+    const s = shims orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const st = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(st);
+
+    const src = "uint i = thread_position_in_grid.x; out[i] = inp[i] + 1.0f;";
+    const in_names = [_][*:0]const u8{"inp"};
+    const out_names = [_][*:0]const u8{"out"};
+    const iv_n = mlx.mlx_vector_string_new_data(&in_names, 1);
+    defer _ = mlx.mlx_vector_string_free(iv_n);
+    const ov_n = mlx.mlx_vector_string_new_data(&out_names, 1);
+    defer _ = mlx.mlx_vector_string_free(ov_n);
+    const k = s.mlxlc_kernel_new("host_mlxlc_row_contig_test", iv_n, ov_n, src, "", true, false);
+    defer s.mlxlc_kernel_free(k);
+    try testing.expect(k.ctx != null);
+
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{6}, 1, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 6, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 6, 1, 1));
+
+    // Warm up the pipeline once.
+    const init_vals = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const a = mlx.mlx_array_new_data(&init_vals, &[_]c_int{6}, 1, .float32);
+    defer _ = mlx.mlx_array_free(a);
+    const vin0 = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{a}, 1);
+    defer _ = mlx.mlx_vector_array_free(vin0);
+    var vout0 = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vout0);
+    try testing.expectEqual(@as(c_int, 0), s.mlxlc_apply(&vout0, k, vin0, cfg, st));
+    var out0 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out0);
+    try mlx.check(mlx.mlx_vector_array_get(&out0, vout0, 0));
+    try mlx.check(mlx.mlx_array_eval(out0));
+
+    // Unevaluated row-contiguous input: must not inject a Contiguous graph node.
+    var lazy = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lazy);
+    try mlx.check(mlx.mlx_add(&lazy, a, a, st));
+    const vin1 = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{lazy}, 1);
+    defer _ = mlx.mlx_vector_array_free(vin1);
+    var vout1 = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vout1);
+    try testing.expectEqual(@as(c_int, 0), s.mlxlc_apply(&vout1, k, vin1, cfg, st));
+    var ops_buf: [256]u8 = undefined;
+    const n_ops = mlxlc_test_abi.mlxlc_test_graph_ops(vout1, &ops_buf, ops_buf.len);
+    try testing.expect(n_ops > 0);
+    const ops_str = std.mem.sliceTo(&ops_buf, 0);
+    try testing.expect(std.mem.indexOf(u8, ops_str, "CustomKernelCached") != null);
+    try testing.expect(std.mem.indexOf(u8, ops_str, "Contiguous") == null);
+
+    // Unevaluated non-contiguous transpose input: must still produce exact row-major result at eval.
+    const m = mlx.mlx_array_new_data(&init_vals, &[_]c_int{ 2, 3 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(m);
+    var mt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mt);
+    try mlx.check(mlx.mlx_transpose(&mt, m, st));
+    const cfg2 = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg2);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg2, &[_]c_int{ 3, 2 }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg2, 6, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg2, 6, 1, 1));
+    const vin2 = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{mt}, 1);
+    defer _ = mlx.mlx_vector_array_free(vin2);
+    var vout2 = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vout2);
+    try testing.expectEqual(@as(c_int, 0), s.mlxlc_apply(&vout2, k, vin2, cfg2, st));
+    var out2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out2);
+    try mlx.check(mlx.mlx_vector_array_get(&out2, vout2, 0));
+    try mlx.check(mlx.mlx_array_eval(out2));
+    const got = mlx.mlx_array_data_float32(out2) orelse return error.MlxNoData;
+    const want = [_]f32{ 2, 5, 3, 6, 4, 7 };
+    for (want, 0..) |w, i| try testing.expectApproxEqAbs(w, got[i], 1e-5);
+}

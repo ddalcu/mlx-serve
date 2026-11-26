@@ -109,7 +109,7 @@ var ane_prefill: bool = false;
 var ane_serve: bool = false;
 var ane_slots: u32 = 1;
 // Pre-fault weights and pre-compile kernels at load: on by default, `--no-warmup-eager` opts out (minimal-footprint
-// deployments). `--warmup-full`: a build's first load of a model serves its whole warm plan before it reports ready.
+// deployments). `--warmup-full`: every load of a model serves its whole warm plan before it reports ready.
 // File-level for the same reason.
 var warmup_eager: bool = true;
 var warmup_full: bool = false;
@@ -209,16 +209,17 @@ fn printUsage(io: std.Io) void {
         \\                        MLX allocates); use this if a load you know fits
         \\                        is being refused. A genuine over-commit can
         \\                        hard-crash the server.
-        \\  --no-warmup-eager   Skip the eager warmup at boot and a build's
-        \\                        first warm-up of a model (the first prompts
-        \\                        then compile its Metal kernels).
+        \\  --no-warmup-eager   Skip the eager warmup at boot and a load's own
+        \\                        warm-up of a model (the first prompts then
+        \\                        compile its Metal kernels).
         \\  --warmup-full       Compile a model's Metal kernels BEFORE it reports
-        \\                        ready: the first time a build loads a model it
-        \\                        serves itself a ladder of prompt sizes first
-        \\                        (seconds to a minute, that one load only).
-        \\                        Strongly recommended when benchmarking: without
-        \\                        it a short warm-up runs once the server is idle
-        \\                        and the first long prompts still compile.
+        \\                        ready: every load serves itself a ladder of
+        \\                        prompt sizes and a prompt at its widest pass
+        \\                        first (seconds; longer the first time a build
+        \\                        compiles them). Strongly recommended when
+        \\                        benchmarking: without it a short warm-up runs
+        \\                        once the server is idle and the first long
+        \\                        prompts still compile.
         \\  --pld               Enable Prompt Lookup Decoding (default: ON).
         \\                        Model-agnostic speculative decoding via n-gram
         \\                        matches in the prompt + generated tokens. Big

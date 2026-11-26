@@ -12,16 +12,25 @@
 //!     libjinja.a holds Mach-O objects).
 //! Windows reuses this graph without ds4, libwebp or Bonjour (src/windows_stubs.c), linking the
 //! MSVC-built mlx + mlx-c staged in lib/mlx-win/{include,lib} and llama.cpp's release DLLs.
+//! `-Dunits` (ELF only) compiles the host, the MLX engine and the plugin groups as parallel objects, as on macOS
+//! (`macos.addServer`); `src/exe.zig` and `src/host_unit.zig` read POSIX argv/envp, so Windows stays one unit.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("config.zig");
 const libs = @import("libs.zig");
+const plugins = @import("plugins.zig");
 
-/// `install`, `run`, `test`.
-pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+/// `install`, `run`, `test`, `units`.
+pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, units: bool, plugin_names: []const []const u8) void {
     const windows = target.result.os.tag == .windows;
+    if (windows and units) {
+        std.debug.print("\n[mlx-serve] -Dunits is not wired for Windows (src/exe.zig reads POSIX argv); build without it.\n\n", .{});
+        std.process.exit(1);
+    }
     if (!windows) verifyMlxStageLinux(b);
+    // CI passes -Dstrip: without debug info LLVM has less to emit, and the PR gate's binary is never shipped.
+    const strip = b.option(bool, "strip", "Omit debug info and Zig symbols from the mlx-serve executable");
 
     const version = b.option([]const u8, "version", "Version string") orelse config.readAppVersion(b) orelse "0.0.0-dev";
     const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse config.readMlxcPin(b) orelse "unknown";
@@ -34,7 +43,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     build_options.addOption([]const u8, "llama_tag", config.readLlamaTag(b) orelse "unknown");
     build_options.addOption([]const u8, "git_sha", "");
     build_options.addOption(bool, "ios", false);
-    build_options.addOption(bool, "units", false);
+    build_options.addOption(bool, "units", units);
     build_options.addOption(bool, "ds4_engine", !windows);
     build_options.addOption(bool, "llama_engine", true);
     // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
@@ -51,6 +60,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
             .root_source_file = b.path(root),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
             .link_libcpp = true,
             .imports = &.{
                 .{ .name = "build_options", .module = build_options.createModule() },
@@ -118,6 +128,12 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         .root_module = mods[0],
         .win32_manifest = if (windows) b.path("src/windows/mlx-serve.manifest") else null,
     });
+    const units_step = b.step("units", "Compile every unit (-Dunits: host, engine, plugin groups) without linking");
+    if (units) {
+        addUnits(b, mods[0], target, optimize, strip, plugin_names, units_step);
+    } else {
+        units_step.dependOn(&b.addFail("pass -Dunits=true").step);
+    }
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -139,6 +155,64 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     // Rerun every time when filtered, as on macOS (env-gated tests).
     if (test_filters.len != 0) run_unit_tests.has_side_effects = true;
     test_step.dependOn(&run_unit_tests.step);
+}
+
+/// `-Dunits`: the host, the MLX engine, the module archs and the plugin groups become objects of their own, compiled in
+/// parallel and linked into `mod`, whose root becomes `src/exe.zig`. Mirrors `macos.addServer`.
+fn addUnits(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    strip: ?bool,
+    plugin_names: []const []const u8,
+    units_step: *std.Build.Step,
+) void {
+    // Taken before any unit joins `mod`: an added object becomes one of its include sources, which would chain the units.
+    const includes = b.allocator.dupe(std.Build.Module.IncludeDir, mod.include_dirs.items) catch @panic("OOM");
+    for ([_][2][]const u8{
+        .{ "host", "src/host_unit.zig" },
+        .{ "engine-mlx", "src/engine_unit.zig" },
+        .{ "engine-modules", "src/modules_unit.zig" },
+    }) |u| addUnit(b, mod, units_step, unitModule(b, mod, includes, target, optimize, strip, u[1]), u[0], u[0]);
+    mod.root_source_file = b.path("src/exe.zig");
+    const n_groups = @min(plugin_names.len, b.option(usize, "unit-groups", "Plugin objects under -Dunits (default 8)") orelse 8);
+    const groups = b.allocator.alloc([]const []const u8, n_groups) catch @panic("OOM");
+    for (groups, 0..) |*names, gi| {
+        var list: std.ArrayList([]const u8) = .empty;
+        var i = gi;
+        while (i < plugin_names.len) : (i += n_groups) list.append(b.allocator, plugin_names[i]) catch @panic("OOM");
+        names.* = list.items;
+    }
+    for (plugins.writeUnitRoots(b, groups), 0..) |root, gi| {
+        addUnit(b, mod, units_step, unitModule(b, mod, includes, target, optimize, strip, root), b.fmt("unit-{d}", .{gi}), b.fmt("{d}", .{gi}));
+    }
+}
+
+fn addUnit(b: *std.Build, mod: *std.Build.Module, units_step: *std.Build.Step, um: *std.Build.Module, name: []const u8, file: []const u8) void {
+    const obj = b.addObject(.{ .name = name, .root_module = um });
+    mod.addObject(obj);
+    units_step.dependOn(&b.addInstallFile(obj.getEmittedBin(), b.fmt("units/{s}.o", .{file})).step);
+}
+
+/// A unit's module rooted at `root`: the exe module's imports and include dirs, its own absorbed EXL3 module, and no C
+/// sources or system libraries (the exe links those once).
+fn unitModule(
+    b: *std.Build,
+    exe_mod: *std.Build.Module,
+    includes: []const std.Build.Module.IncludeDir,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    strip: ?bool,
+    root: []const u8,
+) *std.Build.Module {
+    const m = b.createModule(.{ .root_source_file = b.path(root), .target = target, .optimize = optimize, .strip = strip, .link_libcpp = true });
+    var it = exe_mod.import_table.iterator();
+    while (it.next()) |e| if (!std.mem.eql(u8, e.key_ptr.*, "sushi_exl3")) m.addImport(e.key_ptr.*, e.value_ptr.*);
+    m.include_dirs.appendSlice(b.allocator, includes) catch @panic("OOM");
+    libs.addMlxLib(b, m);
+    _ = libs.addExl3Module(b, m, target, optimize);
+    return m;
 }
 
 /// Linux counterpart of verifyMlxStage: fail loudly when scripts/

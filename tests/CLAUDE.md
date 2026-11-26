@@ -117,7 +117,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_memory_pressure_4way.sh` low guard ceiling · `test_oom_preflight.sh` **H** refusal exits cleanly
 - `test_kv_cache_growth_memory.sh` long decode does not ratchet · `test_evict_returns_memory.sh` make-room frees memory
 - `test_idle_evict.sh` --idle-evict-secs · `test_load_progress.sh` /v1/load-progress · `test_cold_load_launch_flags.sh` cold loads keep flags
-- `test_first_request_compiles.sh` a build's first load of a model warms its kernels: when idle by default, before ready with `--warmup-full` (empty shader cache via a re-identified copy)
+- `test_first_request_compiles.sh` every load of a model warms its kernels: when idle by default, before ready with `--warmup-full`; a load after another under other switches, flags or pack compiles nothing in its first requests, nor at the widest pass (empty shader cache via a re-identified copy)
 - `test_load_failure_no_fallback.sh` a broken pack never falls back · `test_load_model_api.sh`, `test_load_model_default.sh` /v1/load-model
 - `test_model_alias.sh` Model Settings alias · `test_model_settings.sh` per-model settings · `test_model_settings_symlink.sh` settings through a symlinked folder · `test_model_discovery.sh` discovery
 - `test_model_rescan.sh` **H** rescan · `test_multi_model_dir.sh` **H** repeatable --model-dir
@@ -171,6 +171,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 **Static and release guards** (all **H**)
 - `test_build_env_reaches_tests.sh` a shell variable reaches `zig build test` on a cached configuration
 - `test_release_workflow_gates.sh` release.yml + app/build.sh · `test_release.sh` release.sh · `test_resource_xattrs.sh`
+- `test_ci_changes.sh` which CI jobs a PR runs (`scripts/ci-changes.sh`), and that every repo file a Swift test reads keeps the Swift job on
 - `test_dev_version.sh` a source build stamps the newest release tag behind HEAD (`scripts/dev-version.sh`)
 - `test_model_card_frontmatter.sh` converter model cards · `test_website_pages.sh` · `website_benchmarks_logic.mjs`, `website_tier_list_logic.mjs`
 

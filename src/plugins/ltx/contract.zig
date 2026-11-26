@@ -232,7 +232,7 @@ pub fn register(set: *kc.Set) !void {
 const testing = std.testing;
 
 test "kernel contract ltx: each declared launch is the shipped wrapper's, byte for byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = testing.allocator;
     inline for (.{ .{ &k777, geom.Kernel{ 3, 7, 7 } }, .{ &k355, geom.Kernel{ 3, 5, 5 } } }) |c| {
         var t = Na3d.init(a, c[0], c[1], 4, 6);
