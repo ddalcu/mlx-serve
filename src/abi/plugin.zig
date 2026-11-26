@@ -942,6 +942,10 @@ pub const NativeDrafter = extern struct {
     /// Whether this load drafts: a load may leave its drafter out (a GPU it loses on), and then the model has no
     /// stages. Null = always. Read it only when `size` reaches it.
     active: ?*const fn (m: *anyopaque) callconv(.c) bool = null,
+    /// The model drafts every round: the engine runs no drafting backoff for it (no plain ticks that time a step, no
+    /// skipped rounds, no probes), as a model whose rounds always pay asks. False = the engine's backoff. Read it only
+    /// when `size` reaches it.
+    every_round: bool = false,
 };
 
 /// A trunk tensor a drafter reads beside the trunk's forward.

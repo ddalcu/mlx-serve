@@ -1444,6 +1444,12 @@ pub fn nativeStages(xfm: *const Transformer) u32 {
     return xfm.config.plugin.?.parsed.spec.native_stages;
 }
 
+/// Whether the served model's native drafter drafts every round (`NativeDrafter.every_round`): no drafting backoff.
+pub fn nativeEveryRound(xfm: *const Transformer) bool {
+    const nd = nativeDrafter(xfm) orelse return false;
+    return nd.size >= @offsetOf(abi.NativeDrafter, "every_round") + @sizeOf(bool) and nd.every_round;
+}
+
 /// One native drafter round from the committed token `t1` (`NativeDrafter.step`); the model's state,
 /// `ctx.cache.step` and `ctx.moe_seq_offset` move to the round's position.
 pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32, stop_ids: []const u32) !abi.Round {

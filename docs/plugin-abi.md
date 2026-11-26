@@ -842,6 +842,7 @@ A drafter the model carries in its own forward (DSpark); stages and block are `S
 | `verify` | `?*const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict` | `null` | The first half of a round the engine accepts itself (a sampled request): the model drafts from `t1` and verifies the block, leaving the verify open. A `verify` while one is open discards the open one. `out.round.tokens[0..n]` are the verified rows' ids (`t1` first) and `out.logits` their logits `[n, vocab]` (f32). Needs `finish`. |
 | `finish` | `?*const fn (m: *anyopaque, accepted: u32, out: *ForwardOut) callconv(.c) Verdict` | `null` | The second half: keeps `t1` and the first `accepted` drafts of the open verify, rewinds the state to them and writes the model's position into `out.round.position`. |
 | `active` | `?*const fn (m: *anyopaque) callconv(.c) bool` | `null` | Whether this load drafts: a load may leave its drafter out (a GPU it loses on), and then the model has no stages. Null = always. Read it only when `size` reaches it. |
+| `every_round` | `bool` | `false` | The model drafts every round: the engine runs no drafting backoff for it (no plain ticks that time a step, no skipped rounds, no probes), as a model whose rounds always pay asks. False = the engine's backoff. Read it only when `size` reaches it. |
 
 ### `TrunkWeight` (enum(u8))
 

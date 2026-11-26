@@ -158,6 +158,14 @@ const drafting_table: abi.ModelTable = blk: {
     break :blk t;
 };
 
+const every_round: abi.NativeDrafter = .{ .step = &dStep, .every_round = true };
+const every_round_hooks: abi.SpecHooks = .{ .native_drafter = &every_round, .trunk_weight = llama.table.spec.?.trunk_weight };
+const every_round_table: abi.ModelTable = blk: {
+    var t = llama.table;
+    t.spec = &every_round_hooks;
+    break :blk t;
+};
+
 /// A sampled drafter's open verify: where it started and how many drafts it verified.
 var open_verify: struct { p0: u64 = 0, drafts: u32 = 0 } = .{};
 
@@ -389,4 +397,71 @@ test "plugin native drafter: a round that appends less than it commits fails" {
     _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, &.{ 3, 7, 1 })));
     try testing.expectError(error.PluginForwardFailed, driver.nativeRound(&b.xfm, &s.ctx, 12, 4, &.{}));
     try testing.expectEqual(@as(usize, 3), s.kv.step);
+}
+
+/// A greedy request of `out.len` tokens of DSpark rounds under the policy init gives `x`'s drafter; the plain ticks it ran.
+fn decodeRounds(x: *Transformer, out: []u32) !u64 {
+    const a = testing.allocator;
+    try x.resetCache();
+    var tok: Tokenizer = undefined; // never read by the Generator
+    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5 };
+    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, x, &tok, &prompt, @intCast(out.len), .{ .temperature = 0.0 }, &.{}, .{ .mtp_enabled = true });
+    defer gen.deinit(a);
+    try testing.expect(gen.dspark_enabled);
+    trunk = .{ .x = x, .ctx = &gen.ctx };
+    var n: usize = 0;
+    while (n < out.len) {
+        const res = (try gen.nextDspark(a)) orelse break;
+        defer a.free(res.tokens);
+        @memcpy(out[n..][0..res.tokens.len], res.tokens);
+        n += res.tokens.len;
+        try expectSettled(&gen.ctx);
+    }
+    try testing.expectEqual(out.len, n);
+    return gen.dspark_plain;
+}
+
+// Bar: a drafter that declares every round (`NativeDrafter.every_round`) gets no drafting backoff, one that does not
+// gets the engine's: init's policy is null for the first, the backoff for the second.
+test "plugin native drafter: a drafter that drafts every round gets no backoff, another gets the engine's" {
+    const saved = env.override(.MLX_SERVE_DSV4_DSPARK, null);
+    defer saved.restore();
+    var b: proof.Served = undefined;
+    try b.open(.{ .quantized = true }, 0x9a7e);
+    defer b.close();
+    b.xfm.config.plugin.?.parsed.spec.native_stages = 1;
+    const a = testing.allocator;
+    var tok: Tokenizer = undefined; // never read by the Generator
+    const prompt = [_]u32{ 3, 7, 1 };
+    for ([_]bool{ true, false }) |every| {
+        b.xfm.plugin.?.table = if (every) &every_round_table else &drafting_table;
+        try testing.expectEqual(every, driver.nativeEveryRound(&b.xfm));
+        try b.xfm.resetCache();
+        var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, &b.xfm, &tok, &prompt, 4, .{ .temperature = 0.0 }, &.{}, .{ .mtp_enabled = true });
+        defer gen.deinit(a);
+        try testing.expect(gen.dspark_enabled);
+        try testing.expectEqual(every, gen.dspark_pol == null);
+    }
+}
+
+// Bar: an every-round drafter's request runs only rounds (no plain tick) and decodes the plain stream; the same drafter
+// without the declaration runs the backoff's plain ticks (the red check) and decodes the same stream.
+test "plugin native drafter: an every-round drafter runs no plain tick and decodes the plain stream" {
+    const saved = env.override(.MLX_SERVE_DSV4_DSPARK, null);
+    defer saved.restore();
+    var b: proof.Served = undefined;
+    try b.open(.{ .quantized = true }, 0x9a7e);
+    defer b.close();
+    var want: [12]u32 = undefined;
+    try decode(&b.xfm, false, false, want.len, &.{}, &want);
+    oracle = .{ .want = &want, .prompt_len = 6 };
+    defer oracle = .{};
+    b.xfm.config.plugin.?.parsed.spec.native_stages = 1;
+    for ([_]bool{ true, false }) |every| {
+        b.xfm.plugin.?.table = if (every) &every_round_table else &drafting_table;
+        var got: [12]u32 = undefined;
+        const plain = try decodeRounds(&b.xfm, &got);
+        try testing.expectEqualSlices(u32, &want, &got);
+        if (every) try testing.expectEqual(@as(u64, 0), plain) else try testing.expect(plain > 0);
+    }
 }
