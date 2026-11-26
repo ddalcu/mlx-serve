@@ -38,6 +38,18 @@ inline float msv_ink2_affine_chunk(const device uchar* row, const device S* srow
       qx += float(q.z) * x[base + 2]; sx += x[base + 2];
       qx += float(q.w) * x[base + 3]; sx += x[base + 3];
     }
+  } else if constexpr (BITS == 4) {
+    const uint2 q = *(const device uint2*)(row + c * 8u);
+    const uint words[2] = {q.x, q.y};
+    for (int j = 0; j < 2; ++j) {
+      uint w = words[j];
+      const int b = j * 8;
+      for (int i = 0; i < 8; ++i) {
+        qx += float(w & 0xfu) * x[b + i];
+        sx += x[b + i];
+        w >>= 4;
+      }
+    }
   } else {
     const device ushort* p = (const device ushort*)(row + c * 2 * BITS);
     ulong lo = 0, hi = 0;
@@ -105,6 +117,12 @@ inline void msv_ink2_decode16_affine_v4(const device uchar* row, const device S*
     w1 = half4(p4[1]);
     w2 = half4(p4[2]);
     w3 = half4(p4[3]);
+  } else if constexpr (BITS == 4) {
+    const uint2 q = *(const device uint2*)(row + c * 8u);
+    w0 = half4(half(q.x & 0xfu), half((q.x >> 4) & 0xfu), half((q.x >> 8) & 0xfu), half((q.x >> 12) & 0xfu));
+    w1 = half4(half((q.x >> 16) & 0xfu), half((q.x >> 20) & 0xfu), half((q.x >> 24) & 0xfu), half(q.x >> 28));
+    w2 = half4(half(q.y & 0xfu), half((q.y >> 4) & 0xfu), half((q.y >> 8) & 0xfu), half((q.y >> 12) & 0xfu));
+    w3 = half4(half((q.y >> 16) & 0xfu), half((q.y >> 20) & 0xfu), half((q.y >> 24) & 0xfu), half(q.y >> 28));
   } else {
     const device ushort* p = (const device ushort*)(row + c * 2 * BITS);
     ulong lo = 0, hi = 0;

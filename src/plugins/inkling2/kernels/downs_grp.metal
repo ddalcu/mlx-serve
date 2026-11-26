@@ -1,5 +1,5 @@
-// Inkling 2, a few rows: the down projection of the picks grouped by expert (group.metal), a tile of up to 4 picks reading
-// the expert's rows once. grid (32 * N, D / 4, 1), threadgroup (32, SGS, 1): each half of a SIMD group (16 lanes) owns 2 output rows.
+// Inkling 2, a few rows: the down projection of the picks grouped by expert (group.metal), a tile of up to BM (4 or 8) picks reading
+// the expert's rows once. grid (32 * MAX_TILES, D / 4, 1), threadgroup (32, SGS, 1): each half of a SIMD group (16 lanes) owns 2 output rows.
 const uint tile = threadgroup_position_in_grid.x;
 const uint exp_id = TEXP[tile];
 if (exp_id == 0xFFFFFFFFu) return;
@@ -8,10 +8,18 @@ const uint lane = thread_index_in_simdgroup;
 const uint sub = lane & 15u;
 const uint half_sg = lane >> 4;
 const uint row0 = (thread_position_in_grid.y * 2u + half_sg) * 2u;
-const uint p0 = TPICK[tile * 4u + 0u];
-const uint p1 = (cnt > 1u) ? TPICK[tile * 4u + 1u] : p0;
-const uint p2 = (cnt > 2u) ? TPICK[tile * 4u + 2u] : p0;
-const uint p3 = (cnt > 3u) ? TPICK[tile * 4u + 3u] : p0;
+const uint tbase = tile * uint(BM);
+const uint p0 = TPICK[tbase + 0u];
+const uint p1 = (cnt > 1u) ? TPICK[tbase + 1u] : p0;
+const uint p2 = (cnt > 2u) ? TPICK[tbase + 2u] : p0;
+const uint p3 = (cnt > 3u) ? TPICK[tbase + 3u] : p0;
+uint p4 = p0, p5 = p0, p6 = p0, p7 = p0;
+if constexpr (BM > 4) {
+    p4 = (cnt > 4u) ? TPICK[tbase + 4u] : p0;
+    p5 = (cnt > 5u) ? TPICK[tbase + 5u] : p0;
+    p6 = (cnt > 6u) ? TPICK[tbase + 6u] : p0;
+    p7 = (cnt > 7u) ? TPICK[tbase + 7u] : p0;
+}
 
 constexpr uint WPR = FMT == 2 ? I / 4 : I / 8;
 constexpr uint WBR = I * BITS / 8;
@@ -62,8 +70,8 @@ if (cnt == 1u) {
     return;
 }
 
-float a00 = 0.0f, a01 = 0.0f, a02 = 0.0f, a03 = 0.0f;
-float a10 = 0.0f, a11 = 0.0f, a12 = 0.0f, a13 = 0.0f;
+float a00 = 0.0f, a01 = 0.0f, a02 = 0.0f, a03 = 0.0f, a04 = 0.0f, a05 = 0.0f, a06 = 0.0f, a07 = 0.0f;
+float a10 = 0.0f, a11 = 0.0f, a12 = 0.0f, a13 = 0.0f, a14 = 0.0f, a15 = 0.0f, a16 = 0.0f, a17 = 0.0f;
 
 for (uint k = sub * 16u; k < I; k += 256u) {
     const uint c = k >> 4;
@@ -98,6 +106,12 @@ for (uint k = sub * 16u; k < I; k += 256u) {
     if (cnt > 1u) ACC_DN(p1, a01, a11);
     if (cnt > 2u) ACC_DN(p2, a02, a12);
     if (cnt > 3u) ACC_DN(p3, a03, a13);
+    if constexpr (BM > 4) {
+        if (cnt > 4u) ACC_DN(p4, a04, a14);
+        if (cnt > 5u) ACC_DN(p5, a05, a15);
+        if (cnt > 6u) ACC_DN(p6, a06, a16);
+        if (cnt > 7u) ACC_DN(p7, a07, a17);
+    }
     #undef ACC_DN
 }
 
@@ -105,12 +119,33 @@ SUM16(a00); SUM16(a10);
 if (cnt > 1u) { SUM16(a01); SUM16(a11); }
 if (cnt > 2u) { SUM16(a02); SUM16(a12); }
 if (cnt > 3u) { SUM16(a03); SUM16(a13); }
+if constexpr (BM > 4) {
+    if (cnt > 4u) { SUM16(a04); SUM16(a14); }
+    if (cnt > 5u) { SUM16(a05); SUM16(a15); }
+    if (cnt > 6u) { SUM16(a06); SUM16(a16); }
+    if (cnt > 7u) { SUM16(a07); SUM16(a17); }
+}
 #undef SUM16
 
 if (sub < cnt) {
-    const float r0v = (sub == 0u) ? a00 : ((sub == 1u) ? a01 : ((sub == 2u) ? a02 : a03));
-    const float r1v = (sub == 0u) ? a10 : ((sub == 1u) ? a11 : ((sub == 2u) ? a12 : a13));
-    const uint pk = (sub == 0u) ? p0 : ((sub == 1u) ? p1 : ((sub == 2u) ? p2 : p3));
+    float r0v, r1v;
+    uint pk;
+    if constexpr (BM > 4) {
+        switch (sub) {
+            case 0u: r0v = a00; r1v = a10; pk = p0; break;
+            case 1u: r0v = a01; r1v = a11; pk = p1; break;
+            case 2u: r0v = a02; r1v = a12; pk = p2; break;
+            case 3u: r0v = a03; r1v = a13; pk = p3; break;
+            case 4u: r0v = a04; r1v = a14; pk = p4; break;
+            case 5u: r0v = a05; r1v = a15; pk = p5; break;
+            case 6u: r0v = a06; r1v = a16; pk = p6; break;
+            default: r0v = a07; r1v = a17; pk = p7; break;
+        }
+    } else {
+        r0v = (sub == 0u) ? a00 : ((sub == 1u) ? a01 : ((sub == 2u) ? a02 : a03));
+        r1v = (sub == 0u) ? a10 : ((sub == 1u) ? a11 : ((sub == 2u) ? a12 : a13));
+        pk = (sub == 0u) ? p0 : ((sub == 1u) ? p1 : ((sub == 2u) ? p2 : p3));
+    }
     DN[size_t(pk) * D + row0] = T(r0v);
     DN[size_t(pk) * D + row0 + 1u] = T(r1v);
 }

@@ -1,9 +1,11 @@
-// Inkling 2, a few rows: group N = S * KSEL picks IDX [N] u32 by expert into tiles of at most BM = 4 picks each.
+// Inkling 2, a few rows: group N = IDX_shape[0] picks IDX [N] u32 by expert into tiles of at most BM (4 or 8) picks each.
 // grid (TG, 1, 1), threadgroup (TG, 1, 1) with TG = ceil(E / 32) * 32.
-// Outputs: TEXP [N] u32 (expert id or 0xFFFFFFFF), TCNT [N] u32 (1..4), TPICK [N * 4] u32.
+// Outputs: TEXP [MAX_TILES] u32 (expert id or 0xFFFFFFFF), TCNT [MAX_TILES] u32 (1..BM), TPICK [MAX_TILES * BM] u32.
 constexpr uint NSG = TG / 32;
-threadgroup uint idx_s[N];
+threadgroup uint idx_s[512];
 threadgroup uint sg_sums[NSG];
+const uint N = IDX_shape[0];
+const uint MAX_TILES = min(N, uint(E) + (N - 1u) / uint(BM));
 const uint tid = thread_position_in_threadgroup.x;
 const uint sg = simdgroup_index_in_threadgroup;
 const uint lane = thread_index_in_simdgroup;
@@ -13,7 +15,7 @@ uint cnt = 0;
 if (tid < E) {
     for (uint p = 0; p < N; ++p) cnt += (idx_s[p] == tid) ? 1u : 0u;
 }
-const uint my_tiles = (cnt + 3u) >> 2;
+const uint my_tiles = (cnt + uint(BM) - 1u) / uint(BM);
 const uint sg_off = simd_prefix_exclusive_sum(my_tiles);
 const uint sg_tot = simd_sum(my_tiles);
 if (lane == 0) sg_sums[sg] = sg_tot;
@@ -29,17 +31,17 @@ if (tid < E && cnt > 0u) {
     for (uint t = 0; t < my_tiles; ++t) {
         const uint off = base + t;
         TEXP[off] = tid;
-        TCNT[off] = min(4u, cnt - (t << 2));
+        TCNT[off] = min(uint(BM), cnt - t * uint(BM));
     }
     uint k = 0;
     for (uint p = 0; p < N; ++p) {
         if (idx_s[p] == tid) {
-            TPICK[((base + (k >> 2)) << 2) + (k & 3u)] = p;
+            TPICK[(base + (k / uint(BM))) * uint(BM) + (k % uint(BM))] = p;
             ++k;
         }
     }
 }
-for (uint t = tot + tid; t < N; t += TG) {
+for (uint t = tot + tid; t < MAX_TILES; t += TG) {
     TEXP[t] = 0xFFFFFFFFu;
     TCNT[t] = 0u;
 }

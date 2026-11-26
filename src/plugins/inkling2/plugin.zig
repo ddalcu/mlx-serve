@@ -82,6 +82,9 @@ pub const Spec = struct {
     calib: rounds.Calibration = .{ .head = true },
     /// Per-slot online logistic calibration for DFlash2 tree expansion.
     tree_calib: TreeCalib = .{},
+    /// Decayed acceptance counts for sampled bundled-drafter group sizing (`stepGroupBundled`).
+    group_hit: f32 = 0,
+    group_seen: f32 = 0,
     parked: [max_open - 1]Parked = @splat(.{}),
     clock: u64 = 0,
     /// Set for a verify: the visits read the caches without appending and leave their rows here.
@@ -91,7 +94,7 @@ pub const Spec = struct {
     /// Set when a drafter layer attends every committed position: a push hands it each forward's rows, all of them.
     full: ?*const draft.Drafter = null,
 
-    const Parked = struct { owner: u32 = 0, ring: Array = .{}, ring_start: c_int = 0, ring_len: c_int = 0, end: u64 = 0, at: u64 = 0, context: draft.ContextKv = .{}, calib: rounds.Calibration = .{ .head = true }, tree_calib: TreeCalib = .{} };
+    const Parked = struct { owner: u32 = 0, ring: Array = .{}, ring_start: c_int = 0, ring_len: c_int = 0, end: u64 = 0, at: u64 = 0, context: draft.ContextKv = .{}, calib: rounds.Calibration = .{ .head = true }, tree_calib: TreeCalib = .{}, group_hit: f32 = 0, group_seen: f32 = 0 };
 
     /// Makes slot `from`'s ring slot `slot`'s, valid for the positions before `agree` (`Forward.adopt_slot`): a new
     /// request that repeats `from`'s sequence that far continues its drafter.
@@ -120,7 +123,7 @@ pub const Spec = struct {
             if (theirs.ring.ctx != null) _ = mlx.mlx_array_free(theirs.ring);
             theirs.context.release();
         }
-        sp.parked[to] = .{ .owner = sp.owner, .ring = sp.ring, .ring_start = sp.ring_start, .ring_len = sp.ring_len, .end = sp.end, .at = sp.clock, .context = sp.context, .calib = sp.calib, .tree_calib = sp.tree_calib };
+        sp.parked[to] = .{ .owner = sp.owner, .ring = sp.ring, .ring_start = sp.ring_start, .ring_len = sp.ring_len, .end = sp.end, .at = sp.clock, .context = sp.context, .calib = sp.calib, .tree_calib = sp.tree_calib, .group_hit = sp.group_hit, .group_seen = sp.group_seen };
         sp.ring = if (found) theirs.ring else .{};
         sp.ring_start = if (found) theirs.ring_start else 0;
         sp.ring_len = if (found) theirs.ring_len else 0;
@@ -128,6 +131,8 @@ pub const Spec = struct {
         sp.context = if (found) theirs.context else .{};
         sp.calib = if (found) theirs.calib else .{ .head = true };
         sp.tree_calib = if (found) theirs.tree_calib else .{};
+        sp.group_hit = if (found) theirs.group_hit else 0;
+        sp.group_seen = if (found) theirs.group_seen else 0;
         sp.owner = slot;
     }
 
@@ -143,6 +148,10 @@ pub const Spec = struct {
 
     /// The taps of the rows from `first` on (`parts` side by side): they extend the ring in place or compact/restart it.
     fn push(sp: *Spec, g: *ops.Graph, first: u64, parts: []const ops.Array) !void {
+        try sp.pushOpt(g, first, parts, true);
+    }
+
+    fn pushOpt(sp: *Spec, g: *ops.Graph, first: u64, parts: []const ops.Array, flush: bool) !void {
         const n = ops.shape(parts[0])[1];
         if (n == 0) return;
         const used = sp.ring_len - sp.ring_start;
@@ -197,7 +206,7 @@ pub const Spec = struct {
             }
         }
         // Evaluated now: left lazy, each forward would hang another update off the last.
-        try ops.asyncMany(&.{next_arr});
+        if (flush) try ops.asyncMany(&.{next_arr});
         sp.ring = next_arr;
         sp.ring_start = next_start;
         sp.ring_len = next_len;
@@ -386,10 +395,9 @@ fn draftVerifyGroup(mp: *anyopaque, fs: [*]const abi.Forward, outs: [*]abi.Forwa
 }
 
 /// Slots whose rounds pay as one verify. The DFlash2 draft's: `max_open` on the tensor unit (it reads a block's keys for
-/// four slots a launch), else 8. The bundled head's: 2, since it keeps too few drafts a round for a wider group to beat
-/// the plain batched steps it replaces.
+/// four slots a launch), else 8. The bundled head's: 8 on the tensor unit (batched draft + BM=8 grouped MoE), else 2.
 pub fn groupWidth(dflash2_draft: bool, nax: bool) u32 {
-    if (!dflash2_draft) return 2;
+    if (!dflash2_draft) return if (nax) 8 else 2;
     return if (nax) max_open else 8;
 }
 
@@ -523,7 +531,8 @@ fn draftLane(m: *Loaded, o: *Opened, lane: *Lane, f: *const abi.Forward) !void {
     }
 }
 
-/// Answers every lane's call on the drafter: the sampled lanes of a DFlash2 pack in one batched draft, the rest each alone.
+/// Answers every lane's call on the drafter: multi-lane calls batch through `dflash2.draftBatch` or `draft.draftBatch`,
+/// sharing layer projections, `lm_head` and the Markov fold read across lanes.
 fn draftWanted(m: *Loaded, o: *Opened) !void {
     const w = &m.base.weights;
     const sp = w.spec.?;
@@ -534,37 +543,87 @@ fn draftWanted(m: *Loaded, o: *Opened) !void {
         asking[n] = lane;
         n += 1;
     };
-    var batched = m.drafter2 != null and n > 1;
-    for (asking[0..n]) |lane| batched = batched and lane.want.?.law != null;
-    if (!batched) {
-        for (asking[0..n]) |lane| {
-            sp.select(lane.slot);
-            const want = lane.want.?;
-            const view = try sp.ringView(g);
-            const drafted = if (m.drafter2) |d2|
-                try d2.draft(g, lane.first, want.anchor, view, @intCast(lane.position), &w.head.lin, w.head.vocab, &sp.context, want.law)
-            else
-                try m.drafter.?.draft(g, lane.first, want.anchor, view, @intCast(lane.position), &w.head.lin, w.head.vocab, w.head.softcap, &sp.context, want.law);
-            lane.proposed = try adoptDrafted(g, sp, lane, drafted);
+    if (n == 0) return;
+    if (m.drafter2) |d2| {
+        var batched = n > 1;
+        for (asking[0..n]) |lane| batched = batched and lane.want.?.law != null;
+        if (batched) {
+            var contexts: [max_open]draft.ContextKv = undefined;
+            var lanes: [max_open]dflash2.Drafter.DraftLane = undefined;
+            var temperatures: [max_open]f32 = undefined;
+            for (asking[0..n], 0..) |lane, k| {
+                sp.select(lane.slot);
+                const want = lane.want.?;
+                contexts[k] = sp.context;
+                lanes[k] = .{ .t1 = lane.first, .anchor = want.anchor, .taps = try sp.ringView(g), .position = @intCast(lane.position), .cache = &contexts[k], .steps = want.cap };
+                temperatures[k] = want.law.?.temperature;
+            }
+            var blocks: [max_open]draft.Drafter.Block = undefined;
+            try d2.draftBatch(g, lanes[0..n], .{ .temperatures = temperatures[0..n], .seed = asking[0].want.?.law.?.seed }, &w.head.lin, w.head.vocab, &blocks);
+            for (asking[0..n], blocks[0..n], 0..) |lane, drafted, k| {
+                sp.select(lane.slot);
+                sp.context = contexts[k];
+                lane.proposed = try adoptDrafted(g, sp, lane, drafted);
+            }
+            return;
         }
-        return;
-    }
-    // Each lane's ring and context are the Spec's current ones in turn: they are copied out for the one pass and back.
-    var contexts: [max_open]draft.ContextKv = undefined;
-    var lanes: [max_open]dflash2.Drafter.DraftLane = undefined;
-    var temperatures: [max_open]f32 = undefined;
-    for (asking[0..n], 0..) |lane, k| {
+    } else if (m.drafter) |d1| if (n > 1) {
+        var all_sampled = true;
+        var all_greedy = true;
+        for (asking[0..n]) |lane| {
+            all_sampled = all_sampled and lane.want.?.law != null;
+            all_greedy = all_greedy and lane.want.?.law == null;
+        }
+        if (all_sampled or all_greedy) {
+            var contexts: [max_open]draft.ContextKv = undefined;
+            var lanes: [max_open]draft.Drafter.DraftLane = undefined;
+            var temperatures: [max_open]f32 = undefined;
+            for (asking[0..n], 0..) |lane, k| {
+                sp.select(lane.slot);
+                const want = lane.want.?;
+                contexts[k] = sp.context;
+                lanes[k] = .{ .t1 = lane.first, .anchor = want.anchor, .taps = try sp.ringView(g), .position = @intCast(lane.position), .cache = &contexts[k], .steps = want.cap };
+                if (all_sampled) temperatures[k] = want.law.?.temperature;
+            }
+            if (all_sampled) {
+                var blocks: [max_open]draft.Drafter.Block = undefined;
+                try d1.draftBatch(g, lanes[0..n], &w.head.lin, w.head.vocab, w.head.softcap, .{ .temperatures = temperatures[0..n], .seed = asking[0].want.?.law.?.seed }, &blocks);
+                for (asking[0..n], blocks[0..n], 0..) |lane, drafted, k| {
+                    sp.select(lane.slot);
+                    sp.context = contexts[k];
+                    lane.proposed = try adoptDrafted(g, sp, lane, drafted);
+                }
+            } else {
+                const packed_b = try d1.draftBatchPacked(g, lanes[0..n], &w.head.lin, w.head.vocab, w.head.softcap, null);
+                try ops.evalMany(&.{ packed_b.tokens, packed_b.confidence });
+                const cols: usize = @intCast(ops.shape(packed_b.tokens)[1]);
+                const all_toks = mlx.mlx_array_data_int32(packed_b.tokens) orelse return error.Inkling2DraftRound;
+                const all_sure = mlx.mlx_array_data_float32(packed_b.confidence) orelse return error.Inkling2DraftRound;
+                for (asking[0..n], 0..) |lane, k| {
+                    sp.select(lane.slot);
+                    sp.context = contexts[k];
+                    const want = lane.want.?;
+                    const row_toks = all_toks[k * cols ..][0..cols];
+                    const row_sure = all_sure[k * cols ..][0..cols];
+                    const cap = @min(want.cap, @as(u32, @intCast(cols)));
+                    lane.drafts = draftsToVerify(row_sure[0..cap], row_toks[0..cap], want.stops, &sp.calib, want.round_ms);
+                    for (0..lane.drafts) |j| lane.ids[1 + j] = @intCast(row_toks[j]);
+                    lane.sure_n = lane.drafts;
+                    @memcpy(lane.sure[0..lane.drafts], row_sure[0..lane.drafts]);
+                    lane.proposed = if (lane.drafts > 0) try g.fromSlice(i32, row_toks[0..lane.drafts], &.{@intCast(lane.drafts)}) else .{};
+                }
+            }
+            return;
+        }
+    };
+    for (asking[0..n]) |lane| {
         sp.select(lane.slot);
         const want = lane.want.?;
-        contexts[k] = sp.context;
-        lanes[k] = .{ .t1 = lane.first, .anchor = want.anchor, .taps = try sp.ringView(g), .position = @intCast(lane.position), .cache = &contexts[k], .steps = want.cap };
-        temperatures[k] = want.law.?.temperature;
-    }
-    var blocks: [max_open]draft.Drafter.Block = undefined;
-    try m.drafter2.?.draftBatch(g, lanes[0..n], .{ .temperatures = temperatures[0..n], .seed = asking[0].want.?.law.?.seed }, &w.head.lin, w.head.vocab, &blocks);
-    for (asking[0..n], blocks[0..n], 0..) |lane, drafted, k| {
-        sp.select(lane.slot);
-        sp.context = contexts[k];
+        const view = try sp.ringView(g);
+        const drafted = if (m.drafter2) |d2|
+            try d2.draft(g, lane.first, want.anchor, view, @intCast(lane.position), &w.head.lin, w.head.vocab, &sp.context, want.law)
+        else
+            try m.drafter.?.draft(g, lane.first, want.anchor, view, @intCast(lane.position), &w.head.lin, w.head.vocab, w.head.softcap, &sp.context, want.law);
         lane.proposed = try adoptDrafted(g, sp, lane, drafted);
     }
 }
@@ -787,11 +846,304 @@ pub fn treeWidth(n: usize, sampled: bool) u32 {
     return if (n <= 2) 8 else 6;
 }
 
+/// Verify rows per lane for a grouped bundled-drafter round (`stepGroupBundled`), picking the width `2..block`
+/// with the highest expected tokens/ms under the group's empirical acceptance rate `acc` and packed-bank cost curve.
+pub fn bundledGroupRows(n: usize, block_len: u32, acc: f32) u32 {
+    const p = std.math.clamp(acc, 0.05, 0.99);
+    const max_w: u32 = @min(block_len, @max(@as(u32, 2), @as(u32, @intCast(kernels.packed_rows)) / @as(u32, @intCast(@max(n, 1)))));
+    var best_w: u32 = 2;
+    var best_rate: f32 = 0;
+    var expected: f32 = 1.0;
+    var alive: f32 = 1.0;
+    var w: u32 = 2;
+    while (w <= max_w) : (w += 1) {
+        alive *= p;
+        expected += alive;
+        const total_rows: f32 = @floatFromInt(n * @as(usize, w));
+        const drafts: f32 = @floatFromInt(w - 1);
+        const ms = 24.5 + 0.75 * total_rows + 0.35 * drafts;
+        const rate = expected / ms;
+        if (rate > best_rate * 1.01) {
+            best_rate = rate;
+            best_w = w;
+        }
+    }
+    return best_w;
+}
+
+/// One batched bundled-drafter round for `2..max_open` lanes (`NativeDrafter.step_group`), greedy, sampled or mixed:
+/// drafts all lanes in one batched pass, runs verify + argmax or GPU rejection sampling in one sync; copy groups decline.
+fn stepGroupBundled(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut) !abi.Verdict {
+    const d1 = m.drafter orelse return abi.Verdict.refuse(.unsupported, "no bundled drafter");
+    const n = fs.len;
+    if (n < 2 or !mlx.streamIsGpu(m.base.s) or !kernels.enabled())
+        return abi.Verdict.refuse(.unsupported, "bundled solo or cpu");
+    const w = &m.base.weights;
+    const cfg = &w.body.cfg;
+    const sp = w.spec orelse return abi.Verdict.refuse(.unsupported, "no spec state");
+    if (m.opened) |x| {
+        closeOpen(x);
+        m.opened = null;
+    }
+
+    var slot_ids: [max_open]u32 = undefined;
+    var positions: [max_open]u32 = undefined;
+    var handles: [max_open]abi.Handle = undefined;
+    var t1_ids: [max_open]i32 = undefined;
+    var stops: [16]u32 = undefined;
+    var n_stops: usize = 0;
+    var sampled = false;
+    var max_cap: u32 = 0;
+    var hit_sum: f32 = 0;
+    var seen_sum: f32 = 0;
+    var grp_hit_sum: f32 = 0;
+    var grp_seen_sum: f32 = 0;
+    for (fs, 0..) |*f, i| {
+        const given: []const u32 = if (f.size >= @offsetOf(abi.Forward, "draft_ids") + @sizeOf(abi.Span(u32))) f.draft_ids.slice() else &.{};
+        if (given.len > 0) return abi.Verdict.refuse(.unsupported, "copy drafts in group");
+        const slot = f.slots.slice()[0];
+        const pos = f.positions.slice()[0];
+        sp.select(slot);
+        if (sp.rows(pos) == 0 or f.accept_cap == 0) return abi.Verdict.refuse(.unsupported, "lane needs plain step");
+        for (sp.calib.hit, sp.calib.seen) |h, se| {
+            hit_sum += h;
+            seen_sum += se;
+        }
+        grp_hit_sum += sp.group_hit;
+        grp_seen_sum += sp.group_seen;
+        max_cap = @max(max_cap, f.accept_cap);
+        slot_ids[i] = slot;
+        positions[i] = pos;
+        handles[i] = f.caches.slice()[0];
+        t1_ids[i] = @intCast(f.tokens.slice()[0]);
+        for (stopIds(f)) |sid| {
+            if (n_stops < stops.len and std.mem.indexOfScalar(u32, stops[0..n_stops], sid) == null) {
+                stops[n_stops] = sid;
+                n_stops += 1;
+            }
+        }
+        sampled = sampled or (f.size >= @offsetOf(abi.Forward, "draft_seed") + @sizeOf(u64) and f.draft_temperature > 0);
+    }
+    var g = ops.Graph.init(gpa, m.base.s);
+    defer g.deinit();
+    if (sampled and !kernels.markovRuns(&g, d1.rnn.w, d1.fold, @intCast(d1.cfg.rank)))
+        return abi.Verdict.refuse(.unsupported, "sampled bundled needs markov kernel");
+
+    const acc_rate: f32 = if (sampled)
+        (grp_hit_sum + 6.0 * 0.65) / (grp_seen_sum + 6.0)
+    else
+        (hit_sum + 6.0 * 0.72) / (seen_sum + 6.0);
+    const target_rows = bundledGroupRows(n, d1.cfg.block, acc_rate);
+    const drafts: u32 = @min(target_rows - 1, @min(d1.cfg.block - 1, max_cap));
+    if (drafts == 0) return abi.Verdict.refuse(.unsupported, "zero drafts");
+    const w_rows: u32 = 1 + drafts;
+
+    const t1_mat = try g.fromSlice(i32, t1_ids[0..n], &.{ @intCast(n), 1 });
+    const erun: run_mod.Run = .{ .mode = .verify, .rows = 1, .slots = @intCast(n), .positions = positions[0..n], .caches = handles[0..n], .cache_ops = fs[0].cache_ops };
+    var ec = erun.ctx(&g, &m.base.shared);
+    const anchors = try g.rmsNorm(try b.embed.TableEmbed.forward(&w.embed, &ec, t1_mat), w.embed_norm, cfg.rms_norm_eps);
+
+    var contexts: [max_open]draft.ContextKv = undefined;
+    var draft_lanes: [max_open]draft.Drafter.DraftLane = undefined;
+    var seeds: [max_open]u64 = undefined;
+    var sample_lanes: [max_open]kernels.SampleLane = undefined;
+    for (fs, 0..) |*f, i| {
+        sp.select(slot_ids[i]);
+        contexts[i] = sp.context;
+        const at: c_int = @intCast(i);
+        draft_lanes[i] = .{
+            .t1 = try g.reshape(try g.sliceAxis(t1_mat, 0, at, at + 1), &.{1}),
+            .anchor = try g.sliceAxis(anchors, 0, at, at + 1),
+            .taps = try sp.ringView(&g),
+            .position = @intCast(positions[i]),
+            .cache = &contexts[i],
+            .steps = drafts,
+        };
+        const temp: f32 = if (f.size >= @offsetOf(abi.Forward, "draft_seed") + @sizeOf(u64) and f.draft_temperature > 0) f.draft_temperature else 0.0;
+        const seed: u64 = if (f.size >= @offsetOf(abi.Forward, "draft_seed") + @sizeOf(u64)) f.draft_seed else 0;
+        const top_k: u32 = if (f.size >= @offsetOf(abi.Forward, "top_k") + @sizeOf(u32)) f.top_k else 0;
+        const top_p: f32 = if (f.size >= @offsetOf(abi.Forward, "top_p") + @sizeOf(f32)) f.top_p else 1.0;
+        const min_p: f32 = if (f.size >= @offsetOf(abi.Forward, "min_p") + @sizeOf(f32)) f.min_p else 0.0;
+        seeds[i] = seed;
+        sample_lanes[i] = .{
+            .temperature = temp,
+            .top_k = top_k,
+            .top_p = top_p,
+            .min_p = min_p,
+            .seed = seed ^ 0x9E3779B97F4A7C15,
+            .accept_cap = @min(f.accept_cap, drafts),
+        };
+    }
+
+    var packed_b: draft.Drafter.BatchBlock = .{ .tokens = .{}, .confidence = .{} };
+    var sampled_b: draft.Drafter.SampledBlock = .{ .tokens = .{}, .cands = .{}, .probs = .{}, .draws = .{}, .k = 0 };
+    var all_tokens: ops.Array = .{};
+    var parent: ops.Array = .{};
+    var tmeta: ops.Array = .{};
+    var next_q: ops.Array = .{};
+    var draws_full: ops.Array = .{};
+    const all_ids = if (!sampled) blk: {
+        packed_b = try d1.draftBatchPacked(&g, draft_lanes[0..n], &w.head.lin, w.head.vocab, w.head.softcap, null);
+        try ops.asyncMany(&.{ packed_b.tokens, packed_b.confidence });
+        break :blk try g.reshape(try g.concat(&.{ t1_mat, packed_b.tokens }, 1), &.{@intCast(n * w_rows)});
+    } else blk: {
+        sampled_b = try d1.draftBatchSampled(&g, draft_lanes[0..n], sample_lanes[0..n], seeds[0..n], &w.head.lin, w.head.vocab, w.head.softcap);
+        const b_i: c_int = @intCast(n);
+        const w_i: c_int = @intCast(w_rows);
+        all_tokens = try g.concat(&.{ t1_mat, sampled_b.tokens }, 1);
+        var par_buf: [max_open * kernels.open_rows]i32 = undefined;
+        var meta_buf: [max_open * kernels.open_rows * 2]i32 = undefined;
+        for (0..n) |i| for (0..w_rows) |r_idx| {
+            par_buf[i * w_rows + r_idx] = @as(i32, @intCast(r_idx)) - 1;
+            meta_buf[(i * w_rows + r_idx) * 2 + 0] = @intCast(r_idx);
+            meta_buf[(i * w_rows + r_idx) * 2 + 1] = 0;
+        };
+        parent = try g.fromSlice(i32, par_buf[0 .. n * w_rows], &.{ b_i, w_i });
+        tmeta = try g.fromSlice(i32, meta_buf[0 .. n * w_rows * 2], &.{ b_i * w_i, 2 });
+        next_q = try g.concat(&.{ sampled_b.probs, try g.zeros(&.{ b_i, 1, sampled_b.k }, .float32) }, 1);
+        const ff_leaf = try g.broadcast(try g.scalar(255, .uint8), &.{ b_i, 1 });
+        const d0 = try g.expandDims(try g.concat(&.{ sampled_b.draws, ff_leaf }, 1), 2);
+        const ff_pad = try g.broadcast(try g.scalar(255, .uint8), &.{ b_i, w_i, 3 });
+        draws_full = try g.concat(&.{ d0, ff_pad }, 2);
+        try ops.asyncMany(&.{ all_tokens, sampled_b.cands, next_q, draws_full });
+        break :blk try g.reshape(all_tokens, &.{@intCast(n * w_rows)});
+    };
+    for (0..n) |i| {
+        sp.select(slot_ids[i]);
+        sp.context = contexts[i];
+    }
+
+    const opens = try gpa.alloc(kernels.Open, cfg.visits());
+    defer gpa.free(opens);
+    @memset(opens, .{ .g = &g });
+    sp.opens = opens;
+    defer sp.opens = null;
+
+    var fo: abi.ForwardOut = .{};
+    defer {
+        if (fo.logits.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = fo.logits.ctx });
+        if (fo.hidden.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = fo.hidden.ctx });
+    }
+    m.split.follow(false);
+    const v = run_mod.tableForward(Model, &m.base, &.{
+        .mode = .batched_rows,
+        .logits = .all_rows,
+        .rows = w_rows,
+        .tokens = .{},
+        .ids = .{ .ctx = all_ids.ctx },
+        .slots = .of(slot_ids[0..n]),
+        .positions = .of(positions[0..n]),
+        .caches = .of(handles[0..n]),
+        .cache_ops = fs[0].cache_ops,
+        .pipeline_every = pipeline_layers,
+    }, &fo);
+    const held = sp.held;
+    sp.held = .{};
+    defer if (held.ctx != null) {
+        _ = mlx.mlx_array_free(held);
+    };
+    if (!v.isOk()) return v;
+
+    var rings: [max_open]ops.Array = undefined;
+    if (!sampled) {
+        const flat_logits = try g.reshape(.{ .ctx = fo.logits.ctx }, &.{ @intCast(n * w_rows), -1 });
+        const picked = try picks(&g, flat_logits, fs[0].suppress_mask);
+        try ops.evalMany(&.{ packed_b.tokens, packed_b.confidence, picked });
+        const draft_data = mlx.mlx_array_data_int32(packed_b.tokens) orelse return error.Inkling2DraftRound;
+        const sure_data = mlx.mlx_array_data_float32(packed_b.confidence) orelse return error.Inkling2DraftRound;
+        const want_data = mlx.mlx_array_data_int32(picked) orelse return error.Inkling2DraftRound;
+
+        for (fs, 0..) |*f, i| {
+            const lane_stops = stopIds(f);
+            const lane_drafts = draft_data[i * drafts .. (i + 1) * drafts];
+            const lane_sure = sure_data[i * drafts .. (i + 1) * drafts];
+            const lane_want = want_data[i * w_rows .. (i + 1) * w_rows];
+            const lane_cap = @min(drafts, f.accept_cap);
+            var accepted: u32 = 0;
+            while (accepted < lane_cap) : (accepted += 1) {
+                const dtok: u32 = @intCast(lane_drafts[accepted]);
+                if (std.mem.indexOfScalar(u32, lane_stops, dtok) != null) break;
+                if (lane_want[accepted] != lane_drafts[accepted]) break;
+            }
+            sp.select(slot_ids[i]);
+            for (lane_sure[0..@min(lane_cap, accepted + 1)], 0..) |conf, k| sp.calib.observe(conf, k < accepted);
+            const kept: c_int = @intCast(1 + accepted);
+            const h_one = [_]abi.Handle{handles[i]};
+            const p_one = [_]u32{positions[i]};
+            const crun: run_mod.Run = .{ .mode = .verify, .rows = kept, .positions = &p_one, .caches = &h_one, .cache_ops = fs[0].cache_ops };
+            var cc = crun.ctx(&g, &m.base.shared);
+            try kernels.commit(&cc, cfg, opens, kept, i, n);
+            const at: c_int = @intCast(i * w_rows);
+            try sp.pushOpt(&g, positions[i], &.{try g.sliceAxis(held, 1, at, at + kept)}, false);
+            rings[i] = sp.ring;
+
+            outs[i].round = .{
+                .n = @intCast(kept),
+                .accepted = accepted,
+                .next_token = @intCast(lane_want[accepted]),
+                .rows = w_rows,
+                .position = @as(u64, positions[i]) + @as(u64, @intCast(kept)),
+            };
+            outs[i].round.tokens[0] = @intCast(t1_ids[i]);
+            for (0..accepted) |k| outs[i].round.tokens[1 + k] = @intCast(lane_drafts[k]);
+        }
+    } else {
+        const result = try kernels.sampleAndAcceptTree(
+            &g,
+            .{ .ctx = fo.logits.ctx },
+            w.head.vocab,
+            .{ .ctx = fs[0].suppress_mask.ctx },
+            all_tokens,
+            parent,
+            sample_lanes[0..n],
+            @intCast(w_rows),
+            stops[0..n_stops],
+            .{ .tmeta = tmeta, .cands = sampled_b.cands, .next_q = next_q, .draws = draws_full, .r = @intCast(drafts), .k = sampled_b.k },
+        );
+        try ops.eval(result);
+        const res_data = mlx.mlx_array_data_int32(result) orelse return error.Inkling2DraftRound;
+        const stride = 2 + 2 * @as(usize, w_rows);
+        for (fs, 0..) |*f, i| {
+            const row = res_data[i * stride .. (i + 1) * stride];
+            const accepted: u32 = @intCast(row[0]);
+            const next_token: u32 = @intCast(row[1]);
+            const kept: usize = 1 + @as(usize, accepted);
+            if (kept > w_rows or kept > abi.max_round_tokens) return error.Inkling2DraftRound;
+
+            sp.select(slot_ids[i]);
+            const lane_cap = @min(drafts, f.accept_cap);
+            const tested = @min(lane_cap, accepted + 1);
+            sp.group_hit = sp.group_hit * 0.92 + @as(f32, @floatFromInt(accepted));
+            sp.group_seen = sp.group_seen * 0.92 + @as(f32, @floatFromInt(tested));
+
+            const h_one = [_]abi.Handle{handles[i]};
+            const p_one = [_]u32{positions[i]};
+            const crun: run_mod.Run = .{ .mode = .verify, .rows = @intCast(kept), .positions = &p_one, .caches = &h_one, .cache_ops = fs[0].cache_ops };
+            var cc = crun.ctx(&g, &m.base.shared);
+            try kernels.commit(&cc, cfg, opens, @intCast(kept), i, n);
+            const at: c_int = @intCast(i * w_rows);
+            try sp.pushOpt(&g, positions[i], &.{try g.sliceAxis(held, 1, at, at + @as(c_int, @intCast(kept)))}, false);
+            rings[i] = sp.ring;
+
+            outs[i].round = .{
+                .n = @intCast(kept),
+                .accepted = accepted,
+                .next_token = next_token,
+                .rows = w_rows,
+                .position = @as(u64, positions[i]) + @as(u64, @intCast(kept)),
+            };
+            for (0..kept) |k| outs[i].round.tokens[k] = @intCast(row[2 + w_rows + k]);
+        }
+    }
+    try ops.asyncMany(rings[0..n]);
+    return .ok;
+}
+
 /// One DFlash2 round for `1..max_open` lanes, greedy, sampled or mixed (`NativeDrafter.step_group`): the draft tree, its
 /// verify, the accept and the path's commit stay on the GPU, and the host reads one small result a round.
 fn stepGroup(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut) !abi.Verdict {
     kernels.setHost(m.host);
-    const d2 = m.drafter2 orelse return abi.Verdict.refuse(.unsupported, "no dflash2 drafter");
+    const d2 = m.drafter2 orelse return stepGroupBundled(m, fs, outs);
     if (!env.notOff(.MLX_SERVE_INKLING2_TREE) or !mlx.streamIsGpu(m.base.s) or !kernels.enabled())
         return abi.Verdict.refuse(.unsupported, "tree verify disabled");
     const w = &m.base.weights;
@@ -1271,16 +1623,75 @@ const At = struct {
         return j;
     }
 
+    /// Six quantized projections `[k, v, q, gate, r, sink]` joined in one 64-row-aligned buffer so `join_qkv`,
+    /// `join_kv` (`[0..kv_rows]`) and `join_q` (`[kv_rows..total]`) share storage with zero extra memory when
+    /// `kv_rows` is already a multiple of 64.
+    fn joinQuant6(a: At, parts: [6]*Linear) !?struct { qkv: layers.Joined6, kv: b.linear.Joined, q: b.linear.Joined } {
+        const q0 = parts[0].*;
+        for (parts) |p| if (p.s.ctx == null or p.bits != q0.bits or p.group_size != q0.group_size or p.mode != q0.mode or (p.b.ctx == null) != (q0.b.ctx == null) or ops.dtype(p.w) != ops.dtype(q0.w) or ops.dtype(p.s) != ops.dtype(q0.s)) {
+            return null;
+        };
+        const kv_rows = ops.shape(parts[0].w)[0] + ops.shape(parts[1].w)[0];
+        if (@rem(kv_rows, 64) != 0) return null;
+        var g = ops.Graph.init(gpa, a.r.s);
+        defer g.deinit();
+        var triples: [3][7]Array = undefined;
+        var j6: layers.Joined6 = .{};
+        var sum: c_int = 0;
+        for (parts, 0..) |p, i| {
+            triples[0][i] = p.w;
+            triples[1][i] = p.s;
+            triples[2][i] = p.b;
+            j6.widths[i] = ops.shape(p.w)[0];
+            sum += j6.widths[i];
+        }
+        const pad = @rem(64 - @rem(sum, 64), 64);
+        var count: usize = 6;
+        if (pad > 0) {
+            for (&triples, [_]Array{ q0.w, q0.s, q0.b }) |*t, like| if (like.ctx != null) {
+                t[count] = try g.zeros(&.{ pad, ops.shape(like)[1] }, ops.dtype(like));
+            };
+            count += 1;
+        }
+        var fused: [3]Array = @splat(.{});
+        for (&fused, &triples, [_]Array{ q0.w, q0.s, q0.b }) |*f, *t, like| {
+            if (like.ctx != null) f.* = try a.keep(&g, try g.contiguous(try g.concat(t[0..count], 0)));
+        }
+        const total = sum + pad;
+        var start: c_int = 0;
+        for (parts, j6.widths) |p, n| {
+            for ([_]*Array{ &p.w, &p.s, &p.b }, fused) |x, f| if (f.ctx != null) {
+                _ = mlx.mlx_array_free(x.*);
+                x.* = g.escape(try g.sliceAxis(f, 0, start, start + n));
+            };
+            start += n;
+        }
+        j6.lin = .{ .w = fused[0], .s = fused[1], .b = fused[2], .bits = q0.bits, .group_size = q0.group_size, .mode = q0.mode };
+        var jkv: b.linear.Joined = .{ .widths = .{ j6.widths[0], j6.widths[1], 0, 0 } };
+        var jq: b.linear.Joined = .{ .widths = .{ j6.widths[2], j6.widths[3], j6.widths[4], j6.widths[5] } };
+        jkv.lin = .{ .bits = q0.bits, .group_size = q0.group_size, .mode = q0.mode };
+        jq.lin = .{ .bits = q0.bits, .group_size = q0.group_size, .mode = q0.mode };
+        for ([_]*Array{ &jkv.lin.w, &jkv.lin.s, &jkv.lin.b }, [_]*Array{ &jq.lin.w, &jq.lin.s, &jq.lin.b }, fused) |kvd, qd, f| {
+            if (f.ctx != null) {
+                kvd.* = try a.keep(&g, try g.sliceAxis(f, 0, 0, kv_rows));
+                qd.* = try a.keep(&g, try g.sliceAxis(f, 0, kv_rows, total));
+            }
+        }
+        return .{ .qkv = j6, .kv = jkv, .q = jq };
+    }
+
     /// `cut`: a global layer's kernel projection where the pack stores it behind the k or v projection's rows (oQ).
     fn conv(a: At, comptime x: []const u8, global: bool, hidden: u32, cut: ?Linear) !layers.Conv {
         const leaf = "self_attn." ++ x ++ "_sconv";
         const rel = "attn." ++ x ++ "_sconv";
         if (!global) return .{ .static = try a.kernel(leaf ++ ".conv1d.weight", rel ++ ".weight") };
-        return .{ .dynamic = .{
-            .static = try a.need(leaf ++ ".static_weight", rel ++ ".static_w"),
-            // The release's is a bare `[out, in]` tensor, with no `.weight` leaf for the format to find.
-            .proj = if (cut) |l| l else if (a.release) .{ .w = try a.need("", rel ++ ".weight_proj") } else try a.proj(leaf ++ ".weight_proj", "", hidden),
-        } };
+        return .{
+            .dynamic = .{
+                .static = try a.need(leaf ++ ".static_weight", rel ++ ".static_w"),
+                // The release's is a bare `[out, in]` tensor, with no `.weight` leaf for the format to find.
+                .proj = if (cut) |l| l else if (a.release) .{ .w = try a.need("", rel ++ ".weight_proj") } else try a.proj(leaf ++ ".weight_proj", "", hidden),
+            },
+        };
     }
 
     /// An expert bank `[E, out, in]`. Neither layout names a quant scheme for the experts: a bank with e8m0/e4m3
@@ -1456,6 +1867,25 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         try mlx.check(mlx.mlx_ones(x, &[_]c_int{n}, 1, .float32, r.s));
         try m.owned.own(x.*);
     }
+    var consts_g = ops.Graph.init(gpa, r.s);
+    defer consts_g.deinit();
+    const kt: c_int = @intCast(c.sconv_kernel);
+    const cs_static: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(kt + 1)));
+    const cs_dyn: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(2 * kt + 1)));
+    const attn_sc: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim)));
+    const consts: layers.Consts = .{
+        .eps = try at.keep(&consts_g, try consts_g.fromSlice(f32, &.{c.rms_norm_eps}, &.{1})),
+        .caps = try at.keep(&consts_g, try consts_g.fromSlice(f32, &.{ 1.0 / c.gate_softcap, c.gate_softcap, 1.0 / c.up_softcap, c.up_softcap }, &.{4})),
+        .route_scale = try at.keep(&consts_g, try consts_g.fromSlice(f32, &.{c.route_scale}, &.{1})),
+        .conv_scale = try at.keep(&consts_g, try consts_g.fromSlice(f32, &.{cs_static}, &.{1})),
+        .mid_pr = try at.keep(&consts_g, try consts_g.fromSlice(f32, &.{ cs_static, c.rms_norm_eps }, &.{2})),
+        .prep_pr_static = try at.keep(&consts_g, try consts_g.fromSlice(f32, &.{ c.qk_clip, c.rel_clip, c.rms_norm_eps, 1.0, cs_static, 0.0 }, &.{6})),
+        .prep_pr_dyn = try at.keep(&consts_g, try consts_g.fromSlice(f32, &.{ c.qk_clip, c.rel_clip, c.rms_norm_eps, 1.0, cs_dyn, 0.0 }, &.{6})),
+        .attn_scale = try at.keep(&consts_g, try consts_g.scalar(attn_sc, .float32)),
+        .rel_params = try at.keep(&consts_g, try consts_g.fromSlice(f32, &.{ attn_sc, c.log_alpha }, &.{2})),
+        .zero_i32 = try at.keep(&consts_g, try consts_g.zeros(&.{1}, .int32)),
+        .zero_tmeta = try at.keep(&consts_g, try consts_g.zeros(&.{ 1, 2 }, .int32)),
+    };
     m.base.weights = .{
         .embed = .{ .table = embed, .hidden = hidden, .act = .bfloat16 },
         .embed_norm = try at.need("embed_norm.weight", "embed_norm.weight"),
@@ -1467,6 +1897,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
             .final_query = try at.query("final_input.query", "output_query", null, 1, hidden),
             .ones = ones[0],
             .ones_head = ones[1],
+            .consts = consts,
         },
     };
     if (c.vision) |v| m.tower = try vision.Tower.load(ctx, v, c.block_json);
@@ -1576,8 +2007,20 @@ fn loadLayer(at: At, c: *const config.Config, i: u32) !layers.Layer {
         l.* = try at.projRaw("self_attn." ++ leaf, "attn." ++ rel, hidden);
     // Projections off one input join into one matmul; a sliding layer's k and v read the q input too.
     const quantized = lins[0].s.ctx != null;
-    const join_q = if (quantized) try at.joinQuant(&.{ &lins[0], &lins[1], &lins[2], &lins[3] }) else try at.joinRows(&.{ &lins[0], &lins[1], &lins[2], &lins[3] });
-    const join_kv = if (global) b.linear.Joined{} else if (quantized) try at.joinQuant(&.{ &lins[4], &lins[5] }) else try at.joinRows(&.{ &lins[4], &lins[5] });
+    var join_q: b.linear.Joined = .{};
+    var join_kv: b.linear.Joined = .{};
+    var join_qkv: layers.Joined6 = .{};
+    if (!global and quantized) {
+        if (try at.joinQuant6(.{ &lins[4], &lins[5], &lins[0], &lins[1], &lins[2], &lins[3] })) |j6| {
+            join_qkv = j6.qkv;
+            join_kv = j6.kv;
+            join_q = j6.q;
+        }
+    }
+    if (!join_q.built()) {
+        join_q = if (quantized) try at.joinQuant(&.{ &lins[0], &lins[1], &lins[2], &lins[3] }) else try at.joinRows(&.{ &lins[0], &lins[1], &lins[2], &lins[3] });
+        join_kv = if (global) b.linear.Joined{} else if (quantized) try at.joinQuant(&.{ &lins[4], &lins[5] }) else try at.joinRows(&.{ &lins[4], &lins[5] });
+    }
     for (lins) |l| try at.o.linear(l);
 
     const rel_proj = try at.need("self_attn.rel_logits_proj.proj", "attn.rel_logits_proj.proj");
@@ -1614,6 +2057,7 @@ fn loadLayer(at: At, c: *const config.Config, i: u32) !layers.Layer {
         .router_bias = try at.float("mlp.gate.e_score_correction_bias", "mlp.gate.bias", null),
         .join_q = join_q,
         .join_kv = join_kv,
+        .join_qkv = join_qkv,
         .gate_up = undefined,
         .down = undefined,
     };
@@ -1867,4 +2311,17 @@ test "inkling2 draft: only a drawn block verifies a stop, and a timed round only
     try std.testing.expectEqual(@as(u32, 0), draftsToVerify(&.{ 0.05, 0.99, 0.99, 0.99 }, &tokens, &.{}, &cal, &ms));
     // A drawn block is verified whole.
     try std.testing.expectEqual(@as(u32, 4), draftsToVerify(&.{ 0.2, 0.2, 0.2, 0.2 }, &tokens, &.{}, null, &ms));
+}
+
+// Bar: `bundledGroupRows` stays within `2..block`, keeps `n * rows <= packed_rows`, widens with acceptance, and keeps
+// 2-lane rounds wide enough (`>= 5` at 0.65 acc) not to cap speculative yield.
+test "inkling2 draft: bundledGroupRows stays within packed_rows and adapts to acceptance" {
+    for ([_]usize{ 2, 4, 6, 8 }) |n| {
+        const low = bundledGroupRows(n, 8, 0.35);
+        const mid = bundledGroupRows(n, 8, 0.70);
+        const high = bundledGroupRows(n, 8, 0.90);
+        try std.testing.expect(low >= 2 and low <= mid and mid <= high and high <= 8);
+        try std.testing.expect(n * @as(usize, high) <= @as(usize, @intCast(kernels.packed_rows)));
+    }
+    try std.testing.expect(bundledGroupRows(2, 8, 0.65) >= 5);
 }

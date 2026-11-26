@@ -25,10 +25,16 @@ const float qscale = scale * LOG2E;
 float qv[G][DL], acc[G][DL], m[G], l[G];
 for (int g = 0; g < G; g++) {
     const int h = kvh * G + g;
-    for (int i = 0; i < DL; i++) {
-        const int c = lane * DL + i;
-        qv[g][i] = c < D ? float(q[(slot * HQ + h) * D + c]) * qscale : 0.0f;
-        acc[g][i] = 0.0f;
+    if constexpr (D == 128) {
+        const float4 q4 = float4(*(const device vec<T, 4>*)(q + (slot * HQ + h) * 128 + lane * 4)) * qscale;
+        qv[g][0] = q4.x; qv[g][1] = q4.y; qv[g][2] = q4.z; qv[g][3] = q4.w;
+        acc[g][0] = 0.0f; acc[g][1] = 0.0f; acc[g][2] = 0.0f; acc[g][3] = 0.0f;
+    } else {
+        for (int i = 0; i < DL; i++) {
+            const int c = lane * DL + i;
+            qv[g][i] = c < D ? float(q[(slot * HQ + h) * D + c]) * qscale : 0.0f;
+            acc[g][i] = 0.0f;
+        }
     }
     // A finite floor: a split with no key a row sees joins at weight 0.
     m[g] = -1e30f;
@@ -43,10 +49,17 @@ const device T* vh = vp[slot] + size_t(kvh) * head[slot];
 const size_t step = row[slot];
 for (int j = kbeg + int(sg); j < kend; j += NSG) {
     float kd[DL], vd[DL];
-    for (int i = 0; i < DL; i++) {
-        const int c = lane * DL + i;
-        kd[i] = c < D ? float(kh[size_t(j) * step + c]) : 0.0f;
-        vd[i] = c < D ? float(vh[size_t(j) * step + c]) : 0.0f;
+    if constexpr (D == 128) {
+        const float4 k4 = float4(*(const device vec<T, 4>*)(kh + size_t(j) * step + lane * 4));
+        const float4 v4 = float4(*(const device vec<T, 4>*)(vh + size_t(j) * step + lane * 4));
+        kd[0] = k4.x; kd[1] = k4.y; kd[2] = k4.z; kd[3] = k4.w;
+        vd[0] = v4.x; vd[1] = v4.y; vd[2] = v4.z; vd[3] = v4.w;
+    } else {
+        for (int i = 0; i < DL; i++) {
+            const int c = lane * DL + i;
+            kd[i] = c < D ? float(kh[size_t(j) * step + c]) : 0.0f;
+            vd[i] = c < D ? float(vh[size_t(j) * step + c]) : 0.0f;
+        }
     }
     const int d = S - 1 - j;
     for (int g = 0; g < G; g++) {
