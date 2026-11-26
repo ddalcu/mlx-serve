@@ -49,6 +49,7 @@ const MropeData = @import("../media/encode.zig").MropeData;
 const beatStreamKeepalive = @import("../http/sse.zig").beatStreamKeepalive;
 const sendAnthropicEvent = @import("anthropic.zig").sendAnthropicEvent;
 const anthropicStopReason = @import("anthropic.zig").anthropicStopReason;
+const anthropicRunFinish = @import("anthropic.zig").anthropicRunFinish;
 
 pub fn handleAnthropicStreaming(
     allocator: std.mem.Allocator,
@@ -720,7 +721,7 @@ pub fn handleAnthropicStreaming(
     ts.finalize();
 
     // Handle tool calls
-    var finish_reason: []const u8 = if (client_gone) "client_disconnect" else if (stopped) "stop" else ts.finish_reason;
+    var finish_reason: []const u8 = try anthropicRunFinish(client_gone, stopped, ts.finish_reason);
 
     if (gated_stream and !client_gone) {
         if (log.isDebug() and text_buf.items.len > 0) {

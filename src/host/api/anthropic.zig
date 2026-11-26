@@ -148,6 +148,14 @@ pub fn anthropicStopReason(finish_reason: []const u8, matched_stop_seq: ?[]const
     return mapFinishToStopReason(finish_reason);
 }
 
+pub fn anthropicRunFinish(client_gone: bool, stopped: bool, engine_finish: []const u8) error{Shutdown}![]const u8 {
+    if (client_gone) return "client_disconnect";
+    if (stopped) return "stop";
+    // Only shutdown's cancelAllInFlight aborts a slot whose client is still connected.
+    if (std.mem.eql(u8, engine_finish, "abort")) return error.Shutdown;
+    return engine_finish;
+}
+
 /// Serialize a std.json.Value to JSON text, appending to buf.
 fn serializeJsonValue(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: std.json.Value) !void {
     switch (value) {
@@ -940,15 +948,14 @@ fn handleAnthropicNonStreaming(
     // Apply stop sequences; remember WHICH one matched (Anthropic reports it
     // as stop_reason "stop_sequence" + the echoed `stop_sequence` field).
     var final_text: []const u8 = result.text;
-    var finish_reason = result.finish_reason;
     var matched_stop_seq: ?[]const u8 = null;
     const opens_think = promptOpensThink(allocator, lm, tok, prompt_ids);
     const constrained_proto = sampling.constraint != null and sampling.constraint.?.proto != null;
     if (answerStopCut(result.text, result.text.len, stop_sequences, opens_think and !constrained_proto)) |cut| {
         final_text = result.text[0..cut.index];
-        finish_reason = "stop";
         matched_stop_seq = cut.matched;
     }
+    var finish_reason = try anthropicRunFinish(false, matched_stop_seq != null, result.finish_reason);
 
     // Merge re-opened mid-text thought channels into the leading block so the
     // split/parse below never leaks raw tags (Gemma 12B re-opens channels
@@ -1160,4 +1167,12 @@ test "Anthropic errors without a reason preserve their existing body bytes" {
         "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"the prompt encodes to no tokens\"}}",
         body,
     );
+}
+
+test "anthropicRunFinish: a slot aborted under a connected client is a shutdown, other endings keep their reason" {
+    try std.testing.expectError(error.Shutdown, anthropicRunFinish(false, false, "abort"));
+    try std.testing.expectEqualStrings("client_disconnect", try anthropicRunFinish(true, false, "abort"));
+    try std.testing.expectEqualStrings("stop", try anthropicRunFinish(false, true, "abort"));
+    try std.testing.expectEqualStrings("stop", try anthropicRunFinish(false, false, "stop"));
+    try std.testing.expectEqualStrings("length", try anthropicRunFinish(false, false, "length"));
 }
