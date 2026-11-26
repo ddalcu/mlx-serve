@@ -130,9 +130,14 @@ fn cleanupOutcome(slot: anytype) metrics_mod.Outcome {
 /// Count a slot's outcome once. The first path to reach a slot wins.
 pub fn recordSlotEnd(metrics: ?*metrics_mod.Metrics, slot: anytype, outcome: metrics_mod.Outcome) void {
     const m = metrics orelse return;
-    if (slot.metrics_recorded) return;
+    if (countSlot(m, slot, outcome)) m.generation_tokens_total.add(slot.completion_tokens);
+}
+
+/// `recordSlotEnd` short of `generation_tokens_total`; true when it counted a success.
+fn countSlot(m: *metrics_mod.Metrics, slot: anytype, outcome: metrics_mod.Outcome) bool {
+    if (slot.metrics_recorded) return false;
     slot.metrics_recorded = true;
-    m.recordRequest(
+    return m.recordRequest(
         outcome,
         slot.first_token_ns,
         slot.prefill_ns,
@@ -142,6 +147,17 @@ pub fn recordSlotEnd(metrics: ?*metrics_mod.Metrics, slot: anytype, outcome: met
         slot.cached_tokens,
         slot.model.id,
     );
+}
+
+/// Both writes are `.seq_cst` inside the bracket, as are the sampler's loads: a sample that sees either one also
+/// sees the bracket open and is retaken. Saturating: `completion_tokens` can be ahead of a per-tick aggregate.
+pub fn moveSlotTokens(metrics: ?*metrics_mod.Metrics, inflight: *std.atomic.Value(u64), slot: anytype, outcome: metrics_mod.Outcome) void {
+    if (metrics) |m| m.beginTokenMove();
+    defer if (metrics) |m| m.endTokenMove();
+    var left = inflight.load(.monotonic);
+    while (inflight.cmpxchgWeak(left, left -| slot.completion_tokens, .seq_cst, .monotonic)) |seen| left = seen;
+    const m = metrics orelse return;
+    if (countSlot(m, slot, outcome)) _ = m.generation_tokens_total.value.fetchAdd(slot.completion_tokens, .seq_cst);
 }
 
 /// The cleanup drain's count: a slot refused before its first forward is a rejection, anything
@@ -157,13 +173,11 @@ pub fn recordSlotCleanup(metrics: ?*metrics_mod.Metrics, slot: anytype) void {
     recordSlotEnd(m, slot, cleanupOutcome(slot));
 }
 
-/// `finishSlot`'s count. The slot leaves the in-flight aggregate before its tokens reach
-/// `generation_tokens_total`: a gauge sample taken before the tick-exit store would count them twice.
-/// Saturating, since `completion_tokens` can be ahead of the aggregate by this tick's tokens.
+/// `finishSlot`'s count. The slot leaves the in-flight aggregate now, not at the tick-exit store: a gauge
+/// sample in between would count its tokens twice.
 fn recordSlotFinish(metrics: ?*metrics_mod.Metrics, inflight: *std.atomic.Value(u64), slot: anytype, outcome: metrics_mod.Outcome) void {
     if (metrics == null or slot.metrics_recorded) return;
-    inflight.store(inflight.load(.monotonic) -| slot.completion_tokens, .monotonic);
-    recordSlotEnd(metrics, slot, outcome);
+    moveSlotTokens(metrics, inflight, slot, outcome);
 }
 
 pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
@@ -394,7 +408,7 @@ test "a finish moves its tokens from the in-flight aggregate to the counter, so 
     var inflight = std.atomic.Value(u64).init(15);
     var s = OutcomeStub{};
     recordSlotFinish(&m, &inflight, &s, .success);
-    try testing.expectEqual(@as(u64, 15), metrics_mod.liveGenerationTokens(&m, inflight.load(.monotonic)));
+    try testing.expectEqual(@as(u64, 15), metrics_mod.liveGenerationTokens(&m, &.{&inflight}));
 
     var ahead = OutcomeStub{};
     ahead.completion_tokens = 7;
@@ -404,6 +418,31 @@ test "a finish moves its tokens from the in-flight aggregate to the counter, so 
     inflight.store(3, .monotonic);
     recordSlotFinish(&m, &inflight, &s, .success);
     try testing.expectEqual(@as(u64, 3), inflight.load(.monotonic));
+}
+
+test "a gauge sample taken while another thread finishes slots counts each slot's tokens exactly once" {
+    const slots = 20_000;
+    const tokens = 3;
+    var m = metrics_mod.Metrics.init();
+    var inflight = std.atomic.Value(u64).init(slots * tokens);
+    var finished = std.atomic.Value(bool).init(false);
+    const Finisher = struct {
+        fn run(metrics: *metrics_mod.Metrics, agg: *std.atomic.Value(u64), done: *std.atomic.Value(bool)) void {
+            for (0..slots) |_| {
+                var s = OutcomeStub{ .completion_tokens = tokens };
+                moveSlotTokens(metrics, agg, &s, .success);
+            }
+            done.store(true, .release);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Finisher.run, .{ &m, &inflight, &finished });
+    var off: u64 = 0;
+    while (!finished.load(.acquire)) {
+        if (metrics_mod.liveGenerationTokens(&m, &.{&inflight}) != slots * tokens) off += 1;
+    }
+    t.join();
+    try testing.expectEqual(@as(u64, 0), off);
+    try testing.expectEqual(@as(u64, slots * tokens), m.generation_tokens_total.load());
 }
 
 test "[short-gen] carries both token counts, the ids and what they decode to" {
