@@ -4,23 +4,23 @@ import Foundation
 
 // MARK: - What a launch opens
 
-/// What the app puts on screen at launch, given whether the user ticked
-/// "Don't show again" on the welcome window.
+/// What the app puts on screen at launch, given the release the user hid the
+/// welcome for.
 enum LaunchDecision: Equatable {
     /// Show the welcome window (which opens Chat when dismissed).
     case showWelcome
     /// Skip straight to the chat window.
     case openChat
 
+    /// The checkbox hides ONE release: a launch of any other version (the next
+    /// update) shows the welcome again, with that release's notes.
+    ///
     /// `hasChatModels` is taken and deliberately does NOT change the answer: a
-    /// user who suppressed the welcome gets Chat whether or not anything is
+    /// user who hid the welcome gets Chat whether or not anything is
     /// downloaded, because the CHAT GATE offers the same starter card there.
-    /// Re-showing a window they turned off — on the one launch where they have
-    /// nothing, i.e. exactly when they'd retick it — is how a "don't show
-    /// again" box loses the user's trust. It's a parameter so that stays a
-    /// pinned decision rather than an omission.
-    static func resolve(welcomeSuppressed: Bool, hasChatModels: Bool) -> LaunchDecision {
-        welcomeSuppressed ? .openChat : .showWelcome
+    /// It's a parameter so that stays a pinned decision rather than an omission.
+    static func resolve(hiddenForVersion: String?, currentVersion: String, hasChatModels: Bool) -> LaunchDecision {
+        hiddenForVersion == currentVersion ? .openChat : .showWelcome
     }
 
     /// Constant, and that IS the point: the welcome is a SHEET on the chat
@@ -31,9 +31,9 @@ enum LaunchDecision: Equatable {
 
     var presentsWelcome: Bool { self == .showWelcome }
 
-    /// UserDefaults key behind `welcomeSuppressed`. Absent ⇒ false ⇒ the
-    /// welcome shows, which is the pre-existing behaviour on every launch.
-    static let suppressDefaultsKey = "suppressWelcomeWindow"
+    /// UserDefaults key: the app version the user hid the welcome for. Absent,
+    /// or another version, shows it.
+    static let hiddenForVersionKey = "welcomeHiddenForVersion"
 }
 
 // MARK: - Leaving the welcome window

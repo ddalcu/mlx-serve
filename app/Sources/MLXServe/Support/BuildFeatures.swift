@@ -43,6 +43,9 @@ struct BuildFeatures: Equatable {
     /// processes resolve `~/.mlx-serve/models` to the same place.) A setting
     /// that silently breaks model loading is worse than one that isn't there.
     let customModelFolders: Bool
+    /// Link to the outside donation pages (Settings ▸ About). Not on the store:
+    /// App Review 3.1.1 sends tips to the developer through in-app purchase.
+    let donationLinks: Bool
 
     let guest: GuestCapability
 
@@ -76,12 +79,12 @@ struct BuildFeatures: Equatable {
 
     static let developerID = BuildFeatures(
         selfUpdate: true, cliInstaller: true, cliLauncher: true,
-        hostShell: true, ociPull: true, appleEvents: true, customModelFolders: true,
+        hostShell: true, ociPull: true, appleEvents: true, customModelFolders: true, donationLinks: true,
         guest: .init(packageManagers: .live, mcpServers: .fetched))
 
     static let mas = BuildFeatures(
         selfUpdate: false, cliInstaller: false, cliLauncher: false,
-        hostShell: false, ociPull: false, appleEvents: false, customModelFolders: false,
+        hostShell: false, ociPull: false, appleEvents: false, customModelFolders: false, donationLinks: false,
         guest: .init(packageManagers: .live, mcpServers: .prebaked))
 
     static let current: BuildFeatures = {

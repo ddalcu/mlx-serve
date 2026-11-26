@@ -717,10 +717,10 @@ class AppState: ObservableObject {
         // ⌘Tab-selectable; menu-bar-only → back to accessory.
         ActivationPolicyManager.shared.start()
 
-        // The welcome screen is the app's intro / quick-start screen and hosts
-        // the CLI install button, so it shows on every launch — unless the user
-        // ticked "Don't show this again", in which case the launch goes
-        // straight to Chat (`LaunchDecision`).
+        // The welcome screen is the app's intro / quick-start screen, carries
+        // this release's notes and hosts the CLI install button, so it shows on
+        // every launch — unless the user hid it for this release, in which case
+        // the launch goes straight to Chat until the next update (`LaunchDecision`).
         //
         // The chat window opens in BOTH branches: the welcome is a SHEET on it,
         // and a sheet with no host window is a screen nobody can see. That is
@@ -737,9 +737,9 @@ class AppState: ObservableObject {
         adoptDiscoveredModels(await libraryRefresher.scan(inputs: downloads.scanInputs()))
 
         let hasChat = localModels.contains(where: \.isChatPickable)
-        let suppressed = UserDefaults.standard.bool(forKey: LaunchDecision.suppressDefaultsKey)
-        let decision = LaunchDecision.resolve(welcomeSuppressed: suppressed,
-                                              hasChatModels: hasChat)
+        let decision = LaunchDecision.resolve(
+            hiddenForVersion: UserDefaults.standard.string(forKey: LaunchDecision.hiddenForVersionKey),
+            currentVersion: updates.currentVersion, hasChatModels: hasChat)
         if decision.opensChatWindow { pendingChatOpenTick += 1 }
         if decision.presentsWelcome {
             welcomeHasChatModels = hasChat

@@ -1,23 +1,28 @@
 import Foundation
 
-/// The three features listed as clickable bullets in the welcome screen's left
+/// The features listed as clickable bullets in the welcome screen's left
 /// column. Selecting one drives the right column (`rightPanel`). Pure data so
 /// the order, copy and panel mapping are testable without standing up a view.
 enum WelcomeFeature: String, CaseIterable, Identifiable, Equatable {
+    case whatsNew
     case runModels
     case menuBar
     case agentTools
 
     var id: String { rawValue }
 
-    /// Top-to-bottom display order. `runModels` first (see the type comment).
-    static let ordered: [WelcomeFeature] = [.runModels, .menuBar, .agentTools]
+    /// Top-to-bottom display order.
+    static let ordered: [WelcomeFeature] = [.whatsNew, .runModels, .menuBar, .agentTools]
 
-    /// The bullet the screen opens on.
-    static let `default`: WelcomeFeature = .runModels
+    /// The bullet the screen opens on: this release's notes, unless there is
+    /// nothing to chat with yet, when the starter download comes first.
+    static func initial(hasChatModels: Bool) -> WelcomeFeature {
+        hasChatModels ? .whatsNew : .runModels
+    }
 
     var icon: String {
         switch self {
+        case .whatsNew:   return "sparkles"
         case .runModels:  return "bolt.fill"
         case .menuBar:    return "menubar.rectangle"
         case .agentTools: return "wrench.and.screwdriver.fill"
@@ -26,6 +31,7 @@ enum WelcomeFeature: String, CaseIterable, Identifiable, Equatable {
 
     var title: String {
         switch self {
+        case .whatsNew:   return "What's new"
         case .runModels:  return "Run models locally"
         case .menuBar:    return "App, Menu Bar, or Terminal"
         case .agentTools: return "Agent with tools"
@@ -34,6 +40,8 @@ enum WelcomeFeature: String, CaseIterable, Identifiable, Equatable {
 
     var description: String {
         switch self {
+        case .whatsNew:
+            return "See what changed in this release."
         case .runModels:
             return "No cloud, no API keys. All processing stays on your device."
         case .menuBar:
@@ -46,6 +54,7 @@ enum WelcomeFeature: String, CaseIterable, Identifiable, Equatable {
     /// Which right-column panel this feature shows.
     var rightPanel: WelcomeRightPanel {
         switch self {
+        case .whatsNew:   return .releaseNotes     // this release's notes from GitHub
         case .runModels:  return .modelDownload   // Gemma 4 recommended-download card
         case .menuBar:    return .surfaces         // App / Menu bar / Terminal, the last installable
         case .agentTools: return .toolsDemo        // looping screen recording of the tool loop
@@ -57,6 +66,8 @@ enum WelcomeFeature: String, CaseIterable, Identifiable, Equatable {
 /// renders each; the enum just decides WHICH, so the feature→panel wiring can
 /// be pinned in a test.
 enum WelcomeRightPanel: Equatable {
+    /// The running release's notes, read from its GitHub release (`ReleaseNotes`).
+    case releaseNotes
     /// The recommended-model download card (`RecommendedStarterCard`).
     case modelDownload
     /// The three places you can drive the app from (`WelcomeSurface`): the

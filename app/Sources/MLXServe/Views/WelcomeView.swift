@@ -14,6 +14,15 @@ struct WelcomeView: View {
     /// in a chat, not in a closed window.
     let onOpenChat: () -> Void
 
+    init(onDismiss: @escaping () -> Void, hasChatModels: Bool,
+         onOpenModelBrowser: @escaping () -> Void, onOpenChat: @escaping () -> Void) {
+        self.onDismiss = onDismiss
+        self.hasChatModels = hasChatModels
+        self.onOpenModelBrowser = onOpenModelBrowser
+        self.onOpenChat = onOpenChat
+        _selected = State(initialValue: .initial(hasChatModels: hasChatModels))
+    }
+
     /// Injected AT THE SHEET (see the chat scene) — a sheet does not inherit
     /// the environment of the view it hangs on.
     @EnvironmentObject var appState: AppState
@@ -21,11 +30,21 @@ struct WelcomeView: View {
     @EnvironmentObject var server: ServerManager
 
     /// Which left-column bullet is selected — drives the right column.
-    @State private var selected: WelcomeFeature = .default
+    @State private var selected: WelcomeFeature
     @State private var appeared = false
-    /// UserDefaults-backed: when set, the next launch skips this window and
-    /// opens Chat directly (`LaunchDecision.resolve`).
-    @AppStorage(LaunchDecision.suppressDefaultsKey) private var suppressWelcome = false
+    /// The version the user hid this window for: launches of that version open
+    /// Chat directly, the next release shows it again (`LaunchDecision.resolve`).
+    @AppStorage(LaunchDecision.hiddenForVersionKey) private var hiddenForVersion = ""
+    /// This release's notes; nil until fetched, or when GitHub can't be reached.
+    @State private var notes: ReleaseNotes?
+    @State private var notesFetched = false
+
+    private var currentVersion: String { appState.updates.currentVersion }
+
+    private var hiddenForThisVersion: Binding<Bool> {
+        Binding(get: { hiddenForVersion == currentVersion },
+                set: { hiddenForVersion = $0 ? currentVersion : "" })
+    }
 
     // CLI install row state. nil probe = still checking (the probe spawns the
     // user's login shell to read the real PATH, so it runs off-main).
@@ -227,6 +246,8 @@ struct WelcomeView: View {
     @ViewBuilder
     private func panelContent(for panel: WelcomeRightPanel) -> some View {
         switch panel {
+        case .releaseNotes:
+            releaseNotesPanel
         case .modelDownload:
             runModelsPanel
         case .surfaces:
@@ -234,6 +255,48 @@ struct WelcomeView: View {
         case .toolsDemo:
             toolsDemoPanel
         }
+    }
+
+    // MARK: - Release notes panel
+
+    private var releaseNotesPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("What's new in v\(notes?.version ?? currentVersion)")
+                .font(.app(.headline))
+            if let notes, !notes.items.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(Array(notes.items.enumerated()), id: \.offset) { _, item in
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text(verbatim: "•").foregroundStyle(.secondary)
+                                Text(Self.inlineMarkdown(item))
+                                    .font(.app(.subheadline))
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if let page = notes.page {
+                    Link("Full release notes on GitHub", destination: page)
+                        .font(.app(.subheadline))
+                }
+            } else {
+                Text(notesFetched ? "Couldn't load the release notes." : "Loading the release notes…")
+                    .font(.app(.subheadline))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .task {
+            guard !notesFetched else { return }
+            notes = await ReleaseNotes.fetch(version: currentVersion)
+            notesFetched = true
+        }
+    }
+
+    private static func inlineMarkdown(_ line: String) -> AttributedString {
+        (try? AttributedString(markdown: line, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+            ?? AttributedString(line)
     }
 
     // MARK: - Surfaces panel (App / Menu bar / Terminal)
@@ -380,7 +443,7 @@ struct WelcomeView: View {
 
     private var footer: some View {
         HStack(spacing: 16) {
-            Toggle("Don't show again", isOn: $suppressWelcome)
+            Toggle("Don't show until the next update", isOn: hiddenForThisVersion)
                 .toggleStyle(.checkbox)
                 .font(.app(.subheadline))
                 .foregroundStyle(.secondary)

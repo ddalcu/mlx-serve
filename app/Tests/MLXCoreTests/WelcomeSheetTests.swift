@@ -38,12 +38,12 @@ final class WelcomeSheetTests: XCTestCase {
         XCTAssertFalse(LaunchDecision.openChat.presentsWelcome)
     }
 
-    /// Unchanged: ticking "Don't show this again" is honoured whether or not
-    /// anything is downloaded — the chat gate offers the same starter card.
-    func testSuppressionStillDecidesTheBranch() {
-        XCTAssertEqual(LaunchDecision.resolve(welcomeSuppressed: true, hasChatModels: false),
+    /// Hiding for the running release is honoured whether or not anything is downloaded — the
+    /// chat gate offers the same starter card.
+    func testHidingStillDecidesTheBranch() {
+        XCTAssertEqual(LaunchDecision.resolve(hiddenForVersion: "26.11.4", currentVersion: "26.11.4", hasChatModels: false),
                        .openChat)
-        XCTAssertEqual(LaunchDecision.resolve(welcomeSuppressed: false, hasChatModels: true),
+        XCTAssertEqual(LaunchDecision.resolve(hiddenForVersion: nil, currentVersion: "26.11.4", hasChatModels: true),
                        .showWelcome)
     }
 

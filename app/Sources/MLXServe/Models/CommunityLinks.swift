@@ -19,6 +19,30 @@ enum CommunityLinks {
         let url: URL
     }
 
+    /// Where to support the project, ahead of `all` on builds that may link
+    /// out to them (`BuildFeatures.donationLinks`).
+    static let support: [Item] = [
+        Item(
+            id: "sponsor",
+            title: "Sponsor on GitHub",
+            explainer: "mlx-serve is supported by community members. We need more Macs to test and validate every release, so we can keep bringing you updates, new model support and faster speeds.",
+            actionLabel: "Sponsor ↗",
+            url: URL(string: "https://github.com/sponsors/ddalcu")!
+        ),
+        Item(
+            id: "coffee",
+            title: "Buy Me a Coffee",
+            explainer: "A one-off thank-you helps too.",
+            actionLabel: "Open Buy Me a Coffee ↗",
+            url: URL(string: "https://buymeacoffee.com/ddalcu")!
+        ),
+    ]
+
+    /// The About section's rows: the support links lead where the build may show them.
+    static func visible(donations: Bool) -> [Item] {
+        donations ? support + all : all
+    }
+
     static let all: [Item] = [
         Item(
             id: "releases",

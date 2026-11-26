@@ -7,12 +7,12 @@ import XCTest
 /// selection), that every feature carries copy + an icon, and the exact
 /// feature→panel mapping the user asked for.
 final class WelcomeFeatureTests: XCTestCase {
-    func testRunModelsLeadsAndIsTheDefaultSelection() {
-        XCTAssertEqual(WelcomeFeature.ordered.first, .runModels,
-                       "'Run models locally' must be the top bullet")
-        XCTAssertEqual(WelcomeFeature.default, .runModels,
-                       "the right column opens on the Run-models panel")
-        XCTAssertEqual(WelcomeFeature.ordered, [.runModels, .menuBar, .agentTools])
+    /// "What's new" leads; a Mac with a chat model opens on it, a first run (nothing to chat with
+    /// yet) opens on the starter download.
+    func testWhatsNewLeadsAndOpensUnlessThereIsNoModelYet() {
+        XCTAssertEqual(WelcomeFeature.ordered, [.whatsNew, .runModels, .menuBar, .agentTools])
+        XCTAssertEqual(WelcomeFeature.initial(hasChatModels: true), .whatsNew)
+        XCTAssertEqual(WelcomeFeature.initial(hasChatModels: false), .runModels)
     }
 
     func testOrderedCoversEveryCaseExactlyOnce() {
@@ -37,5 +37,7 @@ final class WelcomeFeatureTests: XCTestCase {
         XCTAssertEqual(WelcomeFeature.menuBar.rightPanel, .surfaces)
         // Agent with tools           → the looping, silent tools demo
         XCTAssertEqual(WelcomeFeature.agentTools.rightPanel, .toolsDemo)
+        // What's new                 → this release's notes from GitHub
+        XCTAssertEqual(WelcomeFeature.whatsNew.rightPanel, .releaseNotes)
     }
 }

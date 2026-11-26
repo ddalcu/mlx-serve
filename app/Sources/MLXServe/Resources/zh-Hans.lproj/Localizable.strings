@@ -2543,3 +2543,17 @@
 "3072 × 5472 (portrait 9:16, 16 MP)" = "3072 × 5472（竖版 9:16，1600 万像素）";
 "6272 × 2688 (cinematic 21:9, 16 MP)" = "6272 × 2688（电影宽幅 21:9，1600 万像素）";
 "Travel poster" = "旅行海报";
+"What's new" = "新内容";
+"See what changed in this release." = "看看这个版本有哪些变化。";
+"Don't show until the next update" = "下次更新前不再显示";
+"What's new in v%@" = "v%@ 的新内容";
+"Full release notes on GitHub" = "在 GitHub 上查看完整发布说明";
+"Couldn't load the release notes." = "无法加载发布说明。";
+"Loading the release notes…" = "正在加载发布说明…";
+"mlx-serve is free and open source, supported by community members, and questions and bug reports are welcome." = "mlx-serve 免费开源，由社区成员支持，欢迎提问和报告问题。";
+"Sponsor on GitHub" = "在 GitHub 上赞助";
+"mlx-serve is supported by community members. We need more Macs to test and validate every release, so we can keep bringing you updates, new model support and faster speeds." = "mlx-serve 由社区成员支持。我们需要更多 Mac 来测试和验证每个版本，才能持续为你带来更新、新模型支持和更快的速度。";
+"Sponsor ↗" = "赞助 ↗";
+"Buy Me a Coffee" = "请我喝杯咖啡";
+"A one-off thank-you helps too." = "一次性的感谢也很有帮助。";
+"Open Buy Me a Coffee ↗" = "打开 Buy Me a Coffee ↗";

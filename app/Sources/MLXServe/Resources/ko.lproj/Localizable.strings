@@ -2475,3 +2475,17 @@
 "3072 × 5472 (portrait 9:16, 16 MP)" = "3072 × 5472 (세로 9:16, 1600만 화소)";
 "6272 × 2688 (cinematic 21:9, 16 MP)" = "6272 × 2688 (시네마틱 21:9, 1600만 화소)";
 "Travel poster" = "여행 포스터";
+"What's new" = "새로운 기능";
+"See what changed in this release." = "이번 릴리스에서 무엇이 바뀌었는지 확인하세요.";
+"Don't show until the next update" = "다음 업데이트까지 표시하지 않음";
+"What's new in v%@" = "v%@의 새로운 기능";
+"Full release notes on GitHub" = "GitHub에서 전체 릴리스 노트 보기";
+"Couldn't load the release notes." = "릴리스 노트를 불러올 수 없습니다.";
+"Loading the release notes…" = "릴리스 노트를 불러오는 중…";
+"mlx-serve is free and open source, supported by community members, and questions and bug reports are welcome." = "mlx-serve는 커뮤니티 회원들의 후원으로 운영되는 무료 오픈 소스이며, 질문과 버그 보고를 환영합니다.";
+"Sponsor on GitHub" = "GitHub에서 후원하기";
+"mlx-serve is supported by community members. We need more Macs to test and validate every release, so we can keep bringing you updates, new model support and faster speeds." = "mlx-serve는 커뮤니티 회원들의 후원으로 운영됩니다. 모든 릴리스를 테스트하고 검증하려면 더 많은 Mac이 필요합니다. 그래야 업데이트, 새로운 모델 지원, 더 빠른 속도를 계속 전해 드릴 수 있습니다.";
+"Sponsor ↗" = "후원하기 ↗";
+"Buy Me a Coffee" = "커피 한 잔 사주기";
+"A one-off thank-you helps too." = "한 번의 감사 표시도 큰 도움이 됩니다.";
+"Open Buy Me a Coffee ↗" = "Buy Me a Coffee 열기 ↗";

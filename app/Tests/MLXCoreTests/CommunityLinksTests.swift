@@ -50,6 +50,22 @@ final class CommunityLinksTests: XCTestCase {
                        "https://github.com/\(UpdateChecker.repo)/releases")
     }
 
+    func testSupportLinksPointAtOurDonationPages() {
+        let byId = Dictionary(uniqueKeysWithValues: CommunityLinks.support.map { ($0.id, $0.url.absoluteString) })
+        XCTAssertEqual(byId["sponsor"], "https://github.com/sponsors/ddalcu")
+        XCTAssertEqual(byId["coffee"], "https://buymeacoffee.com/ddalcu")
+    }
+
+    /// Bar: the donation rows lead the About section on a GitHub build and are absent from the
+    /// App Store build (App Review 3.1.1: tips to the developer go through in-app purchase).
+    func testDonationLinksLeadOnGitHubBuildsAndStayOffTheAppStore() {
+        XCTAssertTrue(BuildFeatures.developerID.donationLinks)
+        XCTAssertFalse(BuildFeatures.mas.donationLinks)
+        XCTAssertEqual(CommunityLinks.visible(donations: true).map(\.id),
+                       CommunityLinks.support.map(\.id) + CommunityLinks.all.map(\.id))
+        XCTAssertEqual(CommunityLinks.visible(donations: false), CommunityLinks.all)
+    }
+
     func testIdsAreUnique() {
         let ids = CommunityLinks.all.map(\.id)
         XCTAssertEqual(Set(ids).count, ids.count, "duplicate link id")
@@ -77,7 +93,7 @@ final class CommunityLinksTests: XCTestCase {
         let src = try source("Sources/MLXServe/Views/SettingsView.swift")
         XCTAssertTrue(src.contains("category: .about"),
                       "SettingsView no longer builds the About section")
-        XCTAssertTrue(src.contains("CommunityLinks.all"),
+        XCTAssertTrue(src.contains("CommunityLinks.visible("),
                       "the About section must iterate the shared catalog")
     }
 }

@@ -60,20 +60,22 @@ final class FirstRunFlowTests: XCTestCase {
 
     // MARK: - LaunchDecision
 
-    /// The default (key absent ⇒ false) is today's behaviour: the welcome
-    /// window on every launch.
-    func testLaunchShowsWelcomeWhenNotSuppressed() {
-        XCTAssertEqual(LaunchDecision.resolve(welcomeSuppressed: false, hasChatModels: true), .showWelcome)
-        XCTAssertEqual(LaunchDecision.resolve(welcomeSuppressed: false, hasChatModels: false), .showWelcome)
+    /// Nothing hidden (key absent) shows the welcome on every launch, in both model states.
+    func testLaunchShowsWelcomeWhenNothingIsHidden() {
+        XCTAssertEqual(LaunchDecision.resolve(hiddenForVersion: nil, currentVersion: "26.11.4", hasChatModels: true), .showWelcome)
+        XCTAssertEqual(LaunchDecision.resolve(hiddenForVersion: nil, currentVersion: "26.11.4", hasChatModels: false), .showWelcome)
     }
 
-    /// "Don't show this again" means it, in BOTH model states. A suppressed
-    /// welcome that comes back on the one launch where the user has no models —
-    /// exactly when they'd want to re-tick the box — is how the checkbox loses
-    /// its meaning; the chat gate covers that case with the same starter card.
-    func testSuppressedLaunchOpensChatEvenWithNoModels() {
-        XCTAssertEqual(LaunchDecision.resolve(welcomeSuppressed: true, hasChatModels: true), .openChat)
-        XCTAssertEqual(LaunchDecision.resolve(welcomeSuppressed: true, hasChatModels: false), .openChat)
+    /// Hidden for the running release means it, in BOTH model states: the chat gate covers the
+    /// no-model case with the same starter card.
+    func testHiddenForThisReleaseOpensChatEvenWithNoModels() {
+        XCTAssertEqual(LaunchDecision.resolve(hiddenForVersion: "26.11.4", currentVersion: "26.11.4", hasChatModels: true), .openChat)
+        XCTAssertEqual(LaunchDecision.resolve(hiddenForVersion: "26.11.4", currentVersion: "26.11.4", hasChatModels: false), .openChat)
+    }
+
+    /// The checkbox hides one release: the next one shows the welcome (and its notes) again.
+    func testTheNextReleaseShowsTheWelcomeAgain() {
+        XCTAssertEqual(LaunchDecision.resolve(hiddenForVersion: "26.11.3", currentVersion: "26.11.4", hasChatModels: true), .showWelcome)
     }
 
     // MARK: - ChatGateState
