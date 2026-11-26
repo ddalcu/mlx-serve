@@ -90,9 +90,12 @@ jobs:
             ~/.cache/zig
           key: ${{ steps.zigkey.outputs.key }}
 
-      - name: Build mlx-serve (Zig, ReleaseFast)
+      # A PR's binary only runs the checks below, so it builds Debug; push and dispatch keep the shipped mode.
+      - name: Build mlx-serve (Zig)
         id: build
-        run: zig build -Doptimize=ReleaseFast -Dstrip
+        env:
+          OPTIMIZE: ${{ github.event_name == 'pull_request' && 'Debug' || 'ReleaseFast' }}
+        run: zig build -Doptimize="$OPTIMIZE" -Dstrip
 
       - name: Build vz-agent guest binary
         run: zig build vz-agent
