@@ -89,6 +89,76 @@ pub fn writeUnitRoots(b: *std.Build, groups: []const []const []const u8) []const
     return paths;
 }
 
+/// `-Dunits` plugin groups packed so plugins that compile the same SDK code share an object, each at most as costly as
+/// the largest round-robin group for 8, 4 and 3 groups: same longest compile, about half the code compiled in total.
+/// Regenerate with `scripts/unit_groups.py` when plugins come or go; a test names any plugin the table misses.
+const packed_groups = [_][]const []const []const u8{
+    &.{
+        &.{ "clef", "d1", "hy_v3", "kev", "laguna", "lfm2", "llama", "moss_image", "nemotron_h", "nemotron_transcribe", "prism_hadamard_qwen35", "qwen3", "qwen3_5", "qwen3_asr", "qwen3_next", "qwen4_exp" },
+        &.{ "bailing_hybrid", "bert", "embedding_gemma", "embedding_gemma2", "flint", "gemma3", "gemma4", "glm5_next", "gpt_oss", "inkling", "inkling2", "k2_horizon", "kolibri1", "lfm3", "ltx", "mimo_v2", "minimax_h3", "minimax_h3_image", "muse_glimmer", "spark2_5" },
+        &.{ "acestep", "deepseek_v41", "flux2", "hunyuan3d", "idol", "krea", "laya", "mage_flow", "ming_tts", "music3", "nemotron_diarization", "pixal3d", "qwen3_tts", "qwen_image", "stable_audio3", "trellis2" },
+        &.{ "deepseek_v4", "kokoro", "yue2" },
+    },
+    &.{
+        &.{ "bailing_hybrid", "clef", "d1", "flint", "gemma3", "gemma4", "glm5_next", "gpt_oss", "hy_v3", "k2_horizon", "kev", "kolibri1", "laguna", "lfm2", "lfm3", "llama", "ltx", "mimo_v2", "moss_image", "muse_glimmer", "nemotron_h", "nemotron_transcribe", "prism_hadamard_qwen35", "qwen3", "qwen3_5", "qwen3_asr", "qwen3_next", "qwen4_exp", "spark2_5" },
+        &.{ "acestep", "bert", "deepseek_v41", "embedding_gemma", "embedding_gemma2", "flux2", "inkling", "inkling2", "krea", "mage_flow", "ming_tts", "minimax_h3", "minimax_h3_image", "music3", "qwen3_tts", "qwen_image" },
+        &.{ "deepseek_v4", "hunyuan3d", "idol", "kokoro", "laya", "nemotron_diarization", "pixal3d", "stable_audio3", "trellis2", "yue2" },
+    },
+    &.{
+        &.{ "bailing_hybrid", "bert", "clef", "d1", "embedding_gemma", "embedding_gemma2", "flint", "gemma3", "gemma4", "glm5_next", "gpt_oss", "hy_v3", "inkling", "inkling2", "k2_horizon", "kev", "kolibri1", "laguna", "lfm2", "lfm3", "llama", "ltx", "mimo_v2", "minimax_h3", "moss_image", "muse_glimmer", "nemotron_h", "nemotron_transcribe", "prism_hadamard_qwen35", "qwen3", "qwen3_5", "qwen3_asr", "qwen3_next", "qwen4_exp", "spark2_5" },
+        &.{ "acestep", "deepseek_v4", "deepseek_v41", "flux2", "hunyuan3d", "idol", "kokoro", "krea", "laya", "mage_flow", "ming_tts", "minimax_h3_image", "music3", "nemotron_diarization", "pixal3d", "qwen3_tts", "qwen_image", "stable_audio3", "trellis2", "yue2" },
+    },
+};
+
+/// `names` in at most `max_groups` plugin groups: one plugin each when that many fit (what `scripts/unit_groups.py`
+/// measures), else the largest packed table that fits, a plugin it misses dealt round-robin after the packed ones, or
+/// one group when only one fits.
+pub fn assignGroups(a: std.mem.Allocator, names: []const []const u8, max_groups: usize) ![]const []const []const u8 {
+    if (max_groups >= names.len) {
+        const solo = try a.alloc([]const []const u8, names.len);
+        for (solo, names) |*s, *n| s.* = n[0..1];
+        return solo;
+    }
+    const table: []const []const []const u8 = for (packed_groups) |t| {
+        if (t.len <= max_groups) break t;
+    } else &.{names};
+    const groups = try a.alloc(std.ArrayList([]const u8), table.len);
+    for (groups) |*g| g.* = .empty;
+    var spill: usize = 0;
+    for (names) |n| {
+        const gi = for (table, 0..) |t, i| {
+            if (contains(t, n)) break i;
+        } else blk: {
+            spill += 1;
+            break :blk (spill - 1) % table.len;
+        };
+        try groups[gi].append(a, n);
+    }
+    var out: std.ArrayList([]const []const u8) = .empty;
+    for (groups) |g| if (g.items.len > 0) try out.append(a, g.items);
+    return out.items;
+}
+
+/// The `-Dunits` plugin groups for a build at `optimize`: packed for Debug, where the tables were measured; dealt
+/// round-robin otherwise, where the packed media group compiles longer at -O3 than the engine object.
+pub fn unitGroups(a: std.mem.Allocator, names: []const []const u8, max_groups: usize, optimize: std.builtin.OptimizeMode) ![]const []const []const u8 {
+    if (optimize == .debug) return assignGroups(a, names, max_groups);
+    const n = @min(names.len, @max(max_groups, 1));
+    const groups = try a.alloc([]const []const u8, n);
+    for (groups, 0..) |*g, gi| {
+        var list: std.ArrayList([]const u8) = .empty;
+        var i = gi;
+        while (i < names.len) : (i += n) try list.append(a, names[i]);
+        g.* = list.items;
+    }
+    return groups;
+}
+
+fn contains(list: []const []const u8, name: []const u8) bool {
+    for (list) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
 /// The build's own tests of this file (the scan, the closure check, the rendering), on the host.
 pub fn addTests(b: *std.Build, step: *std.Build.Step) void {
     const t = b.addTest(.{ .name = "build-plugins-test", .root_module = b.createModule(.{
@@ -405,4 +475,66 @@ test "build plugins: without -Dunits the registry is the full one" {
     const src = try renderFacade(arena.allocator(), false, &.{"flint"}, &.{true}, &.{});
     try testing.expect(std.mem.indexOf(u8, src, "const full = @import(\"registry_full.zig\");") != null);
     try testing.expect(std.mem.indexOf(u8, src, "/plugin.zig\")") == null);
+}
+
+test "build plugins: every packed table holds every registered plugin once (else rerun scripts/unit_groups.py)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const root = std.Io.Dir.cwd();
+    var registered: std.ArrayList([]const u8) = .empty;
+    for (try listDir(a, io, root, plugins_dir, .directory)) |f| {
+        if (f[0] == '_') continue;
+        if (root.access(io, try std.fmt.allocPrint(a, "{s}/{s}/build.zig", .{ plugins_dir, f }), .{})) |_| continue else |_| {}
+        root.access(io, try std.fmt.allocPrint(a, "{s}/{s}/plugin.zig", .{ plugins_dir, f }), .{}) catch continue;
+        try registered.append(a, f);
+    }
+    try testing.expect(registered.items.len > 0);
+    for (packed_groups) |table| {
+        var count: usize = 0;
+        for (table) |g| count += g.len;
+        for (registered.items) |n| {
+            var seen: usize = 0;
+            for (table) |g| seen += @intFromBool(contains(g, n));
+            if (seen != 1) std.debug.print("plugin {s} is in {d} groups of a {d}-group packed table: rerun scripts/unit_groups.py\n", .{ n, seen, table.len });
+            try testing.expectEqual(@as(usize, 1), seen);
+        }
+        try testing.expectEqual(registered.items.len, count);
+    }
+}
+
+test "build plugins: assignGroups takes the largest packed table that fits and deals unknown plugins round-robin" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const names = [_][]const u8{ "kokoro", "qwen3", "llama", "krea", "deepseek_v4", "zz_new_a", "zz_new_b" };
+    const four = try assignGroups(a, &names, 4);
+    try testing.expectEqual(@as(usize, 4), four.len);
+    var total: usize = 0;
+    for (four) |g| total += g.len;
+    try testing.expectEqual(names.len, total);
+    try testing.expect(contains(four[0], "qwen3") and contains(four[0], "llama"));
+    try testing.expect(contains(four[3], "kokoro") and contains(four[3], "deepseek_v4"));
+    try testing.expectEqual(@as(usize, 2), (try assignGroups(a, &names, 2)).len);
+    try testing.expectEqual(names.len, (try assignGroups(a, &names, names.len)).len);
+    const one = try assignGroups(a, &names, 1);
+    try testing.expectEqual(@as(usize, 1), one.len);
+    try testing.expectEqual(names.len, one[0].len);
+    try testing.expectEqual(@as(usize, 0), (try assignGroups(a, &.{}, 4)).len);
+}
+
+test "build plugins: only Debug builds take the packed groups; release builds deal round-robin" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const names = [_][]const u8{ "kokoro", "qwen3", "llama", "krea", "deepseek_v4" };
+    const debug = try unitGroups(a, &names, 4, .debug);
+    try testing.expect(contains(debug[0], "qwen3") and contains(debug[0], "llama"));
+    const fast = try unitGroups(a, &names, 2, .ReleaseFast);
+    try testing.expectEqual(@as(usize, 2), fast.len);
+    try testing.expectEqualStrings("kokoro", fast[0][0]);
+    try testing.expectEqualStrings("llama", fast[0][1]);
+    try testing.expectEqualStrings("qwen3", fast[1][0]);
+    try testing.expectEqual(@as(usize, 1), (try unitGroups(a, &names, 0, .ReleaseFast)).len);
 }

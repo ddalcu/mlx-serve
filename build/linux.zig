@@ -172,14 +172,8 @@ fn addUnits(
         .{ "engine-modules", "src/modules_unit.zig" },
     }) |u| addUnit(b, mod, units_step, unitModule(b, mod, includes, target, optimize, strip, u[1]), u[0], u[0]);
     mod.root_source_file = b.path("src/exe.zig");
-    const n_groups = @min(plugin_names.len, b.option(usize, "unit-groups", "Plugin objects under -Dunits (default 8)") orelse 8);
-    const groups = b.allocator.alloc([]const []const u8, n_groups) catch @panic("OOM");
-    for (groups, 0..) |*names, gi| {
-        var list: std.ArrayList([]const u8) = .empty;
-        var i = gi;
-        while (i < plugin_names.len) : (i += n_groups) list.append(b.allocator, plugin_names[i]) catch @panic("OOM");
-        names.* = list.items;
-    }
+    const max_groups = b.option(usize, "unit-groups", "Most plugin objects under -Dunits (default 8)") orelse 8;
+    const groups = plugins.unitGroups(b.allocator, plugin_names, max_groups, optimize) catch @panic("OOM");
     for (plugins.writeUnitRoots(b, groups), 0..) |root, gi| {
         addUnit(b, mod, units_step, unitModule(b, mod, includes, target, optimize, strip, root), b.fmt("unit-{d}", .{gi}), b.fmt("{d}", .{gi}));
     }
