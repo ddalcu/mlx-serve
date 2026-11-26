@@ -346,12 +346,7 @@ fn admitSmallAtBoundary(ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget,
         slot.boundary_max_tail = if (priority) PRIORITY_MAX_TAIL else BOUNDARY_MAX_TAIL;
         sch.boundary_depth += 1;
         sch.boundary_outer = ic.slot;
-        const saved_tokens = sch.inflight_prefill_tokens.load(.monotonic);
-        const saved_expected = sch.inflight_prefill_expected.load(.monotonic);
         const outcome = prefill(sch, slot);
-        // runPrefill zeroes the progress gauges on exit; the outer prefill's go back.
-        sch.inflight_prefill_tokens.store(saved_tokens, .monotonic);
-        sch.inflight_prefill_expected.store(saved_expected, .monotonic);
         sch.boundary_outer = null;
         sch.boundary_depth -= 1;
         slot.boundary_max_tail = null;

@@ -31,6 +31,7 @@ const finish_request = @import("../../engines/mlx/finish.zig");
 const scheduler = @import("../../engines/mlx/scheduler.zig");
 const RequestSlot = @import("../../engines/mlx/slot.zig").Slot;
 const registry = @import("../../host/registry/registry.zig");
+const metrics_mod = @import("../../host/metrics/metrics.zig");
 
 const testing = std.testing;
 const Array = mlx.mlx_array;
@@ -227,6 +228,29 @@ test "deepseek_v41 served: disk-disabled requests retain alternating RAM convers
         try testing.expect(try sameValues(&g, warm_logits, cold_logits));
         finish_request.releasePluginSlot(cold);
     }
+}
+
+test "deepseek_v41 served: a prefill admitted at a chunk boundary leaves the outer prefill's progress gauges alone" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    var m = metrics_mod.Metrics.init();
+    h.sch.metrics = &m;
+    h.sch.requests_prefilling = .init(1);
+    h.sch.inflight_prefill_tokens = .init(4096);
+    h.sch.inflight_prefill_expected = .init(8192);
+    h.sch.boundary_depth = 1;
+    const guest = try h.prefill(&.{ 3, 17, 42, 9, 7, 25, 1, 60 });
+    defer guest.deinit();
+    finish_request.releasePluginSlot(guest);
+    try testing.expectEqual(@as(u64, 1), h.sch.requests_prefilling.load(.monotonic));
+    try testing.expectEqual(@as(u64, 4096), h.sch.inflight_prefill_tokens.load(.monotonic));
+    try testing.expectEqual(@as(u64, 8192), h.sch.inflight_prefill_expected.load(.monotonic));
 }
 
 test "deepseek_v41 served: an ablated request restores and commits only entries of its own profile and strength" {

@@ -202,10 +202,14 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         defer sch.queue_mu.unlock(sch.io);
         publishLiveKvResidency(sch, slot, module_bytes);
     }
+    // The progress gauges are the outer prefill's while a request admitted at its boundary runs.
+    const publish_progress = observe and sch.boundary_depth == 0;
     defer if (observe) {
         _ = sch.requests_prefilling.fetchSub(1, .monotonic);
-        sch.inflight_prefill_tokens.store(0, .monotonic);
-        sch.inflight_prefill_expected.store(0, .monotonic);
+        if (publish_progress) {
+            sch.inflight_prefill_tokens.store(0, .monotonic);
+            sch.inflight_prefill_expected.store(0, .monotonic);
+        }
     };
 
     const sampling = slot.sampling;
@@ -638,8 +642,8 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // construction otherwise) so the cancelled-prefill commit can
             // restore hybrids too.
             .cancelled_checkpoint_sink = &slot.cancelled_prefill,
-            .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
-            .prefill_expected = if (observe) &sch.inflight_prefill_expected else null,
+            .prefill_progress = if (publish_progress) &sch.inflight_prefill_tokens else null,
+            .prefill_expected = if (publish_progress) &sch.inflight_prefill_expected else null,
             .interleave_hook = .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb },
             .write_through_hook = if (writeThroughArmed(slot, prefill_tokens.len))
                 .{ .ctx = &write_through_ctx, .call = prefillWriteThroughCb }
