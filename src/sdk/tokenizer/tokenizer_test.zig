@@ -1558,3 +1558,15 @@ test "encodeMarked: a marked token is text, the template's own stay special, a l
     defer a.free(want);
     try testing.expectEqualSlices(u32, want, plain);
 }
+
+test "gpt2PreTokenize: \\p{L} and \\p{M} cover every script, not just the common blocks" {
+    // Reference: HF `tokenizers` Split on the Qwen regex; inputs NFC as the encoder sees them.
+    const a = testing.allocator;
+    try expectPreTokens(a, "Vi\u{1ec7}t Nam", &.{ "Vi\u{1ec7}t", " Nam" });
+    try expectPreTokens(a, " \u{b5}s", &.{" \u{b5}s"});
+    try expectPreTokens(a, "a\u{f7}b", &.{ "a", "\u{f7}b" });
+    try expectPreTokens(a, "\u{5e9}\u{5dc}\u{5d5}\u{5dd},", &.{ "\u{5e9}\u{5dc}\u{5d5}\u{5dd}", "," });
+    try expectPreTokens(a, "\u{e2a}\u{e27}\u{e31}\u{e2a}\u{e14}\u{e35}", &.{"\u{e2a}\u{e27}\u{e31}\u{e2a}\u{e14}\u{e35}"});
+    try expectPreTokens(a, "\u{928}\u{92e}\u{938}\u{94d}\u{924}\u{947}\u{964}", &.{ "\u{928}\u{92e}\u{938}\u{94d}\u{924}\u{947}", "\u{964}" });
+    try expectPreTokens(a, "\u{645}\u{631}\u{62d}\u{628}\u{627}\u{61f}", &.{ "\u{645}\u{631}\u{62d}\u{628}\u{627}", "\u{61f}" });
+}
