@@ -170,7 +170,11 @@ jobs:
       # (scripts/flip_proof.py). GPU tests skip on this runner; the box job runs them for the lever being flipped.
       - name: Flip proof (CPU, the levers this PR flips)
         if: github.event_name == 'pull_request'
-        run: python3 scripts/flip_proof.py ci "origin/${{ github.base_ref }}" -Dtest-shards=4 -Dtest-filter=deepseek -Dtest-filter=dsv4
+        # The checkout holds the PR's own commits only (fetch-depth 2): fetch the base branch's tip so the script can
+        # read its src/env.zig defaults.
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+          python3 scripts/flip_proof.py ci "origin/${{ github.base_ref }}" -Dtest-shards=4 -Dtest-filter=deepseek -Dtest-filter=dsv4
 
   swift-app:
     needs: changes
