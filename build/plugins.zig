@@ -238,8 +238,9 @@ fn render(a: std.mem.Allocator, plugins: []const []const u8, in_config: []const 
     try renderMetas(a, &out, plugins, in_config, macos_only, configs);
     try out.appendSlice(a,
         \\
-        \\/// Whether this build registers the plugin `name` (false off macOS for a macOS-only one).
-        \\pub fn has(comptime name: []const u8) bool {
+        \\/// Whether this build registers the plugin `name` (false off macOS for a macOS-only one). Inline: comptime-known
+        \\/// at every call, so an `if` on it leaves the other branch unanalyzed.
+        \\pub inline fn has(comptime name: []const u8) bool {
         \\    return comptime for (plugins_names) |n| {
         \\        if (std.mem.eql(u8, n, name)) break true;
         \\    } else false;
