@@ -155,7 +155,8 @@ jobs:
       - name: Run Zig tests
         # 4 shards: the default sizes them by RAM. Not every GPU test skips on this virtual GPU, and at 8 they ran it
         # out of memory (a different kernel test exited 255 on each run).
-        run: zig build test --summary all -Dtest-shards=4 ${{ (needs.changes.result != 'success' || needs.changes.outputs.slow == 'true') && '-Dslow-tests' || '' }}
+        # -Dstrip on a PR keeps the test compile's memory down; a panic there prints no stack, so rerun it without.
+        run: zig build test --summary all -Dtest-shards=4 ${{ (needs.changes.result != 'success' || needs.changes.outputs.slow == 'true') && '-Dslow-tests' || '' }} ${{ github.event_name == 'pull_request' && '-Dstrip' || '' }}
 
       - name: Save Zig build artifacts
         if: ${{ success() && github.ref == 'refs/heads/main' && steps.zigcache.outputs.cache-hit != 'true' }}
