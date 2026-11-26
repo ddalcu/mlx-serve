@@ -13,12 +13,30 @@ const device T* drow = (const device T*)WQ + size_t(n) * K;
 float acc = 0.0f;
 for (uint c = lane; c < K / 16; c += 32) {
   float xr[16];
-  for (uint i = 0; i < 16; i++) xr[i] = float(T(float(ATT[c * 16 + i]) * GATE[c * 16 + i]));
+  const device vec<T, 4>* ap = (const device vec<T, 4>*)(ATT + c * 16);
+  const device float4* gp = (const device float4*)(GATE + c * 16);
+  for (uint b = 0; b < 4; b++) {
+    const vec<T, 4> a = ap[b];
+    const float4 g = gp[b];
+    const uint base = b * 4;
+    xr[base + 0] = float(T(float(a[0]) * g.x));
+    xr[base + 1] = float(T(float(a[1]) * g.y));
+    xr[base + 2] = float(T(float(a[2]) * g.z));
+    xr[base + 3] = float(T(float(a[3]) * g.w));
+  }
   if (FMT == 3) {
     acc += msv_ink2_affine_chunk<S, BITS, GS>(arow, sa, ba, c, xr);
   } else {
+    const device vec<T, 4>* dp = (const device vec<T, 4>*)(drow + c * 16);
     float d = 0.0f;
-    for (uint i = 0; i < 16; i++) d += float(drow[c * 16 + i]) * xr[i];
+    for (uint b = 0; b < 4; b++) {
+      const vec<T, 4> w = dp[b];
+      const uint base = b * 4;
+      d += float(w[0]) * xr[base + 0];
+      d += float(w[1]) * xr[base + 1];
+      d += float(w[2]) * xr[base + 2];
+      d += float(w[3]) * xr[base + 3];
+    }
     acc += d;
   }
 }

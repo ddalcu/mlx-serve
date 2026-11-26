@@ -10,6 +10,7 @@ const kernelSource = @import("../../mlx/kernels.zig").source;
 const block = @import("../../sdk/bases/block.zig");
 const kv = @import("../../sdk/bases/kv.zig");
 const abi = @import("../../abi/plugin.zig");
+const sdk_host = @import("../../sdk/host.zig");
 const band = @import("../../sdk/bases/blocks/sliding.zig");
 const slot_state = @import("../../sdk/bases/blocks/state.zig");
 const sdpaSinks = @import("../../sdk/bases/blocks/decoder_attention.zig").sdpaSinks;
@@ -34,7 +35,34 @@ pub const Kernel = struct {
     /// False = the kernel walks its inputs' strides itself (a cache view is not copied).
     contiguous: bool = true,
     built: ?mlx.mlx_fast_metal_kernel = null,
+    host_built: ?*anyopaque = null,
+    host_src: ?*const sdk_host.abi.Host = null,
 };
+
+/// Active host table for cached Metal kernel launches (`Host.kernel` + `HostGpu.launch`), bound at load.
+var kernel_host: ?sdk_host.Host = null;
+/// A host whose `HostGpu.launch` returned `unsupported` (e.g. FakeHost or non-Metal build) falls back to MLX's apply.
+var kernel_host_declined: ?*const sdk_host.abi.Host = null;
+
+pub fn setHost(raw: ?*const anyopaque) void {
+    const ptr = raw orelse return;
+    if (kernel_host) |cur| if (@as(*const anyopaque, @ptrCast(cur.t)) == ptr) return;
+    const h = sdk_host.Host.of(raw) catch return;
+    kernel_host = h;
+}
+
+pub fn clearHost(raw: ?*const anyopaque) void {
+    if (raw == null) {
+        kernel_host = null;
+        kernel_host_declined = null;
+        return;
+    }
+    const h = sdk_host.Host.of(raw) catch return;
+    if (kernel_host) |cur| if (cur.t == h.t) {
+        kernel_host = null;
+    };
+    if (kernel_host_declined == h.t) kernel_host_declined = null;
+}
 
 /// The SDK's fp4 and fp8 decodes under the packed expert kernels' chunk reader.
 pub const bank_header = moe_fp4.NV_SCALE ++ moe_fp4.DOT16 ++ mxfp8.HEADER ++ kernelSource("plugins/inkling2/kernels/bank_header.metal");
@@ -97,16 +125,6 @@ pub fn launch(g: *Graph, k: *Kernel, inputs: []const Array, comptime n: usize, o
 }
 
 pub fn launchGrid(g: *Graph, k: *Kernel, inputs: []const Array, comptime n: usize, outs: [n]Out, grid: [3]c_int, tg: [3]c_int, targs: TArgs) ![n]Array {
-    const kernel = k.built orelse blk: {
-        const iv = mlx.mlx_vector_string_new_data(k.ins.ptr, k.ins.len);
-        defer _ = mlx.mlx_vector_string_free(iv);
-        const ov = mlx.mlx_vector_string_new_data(k.outs.ptr, k.outs.len);
-        defer _ = mlx.mlx_vector_string_free(ov);
-        const made = mlx.mlx_fast_metal_kernel_new(k.name, iv, ov, k.source, k.header, k.contiguous, false);
-        if (made.ctx == null) return error.MetalKernelCompileFailed;
-        k.built = made;
-        break :blk made;
-    };
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     for (outs) |o| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, o.shape.ptr, o.shape.len, o.dtype));
@@ -120,7 +138,61 @@ pub fn launchGrid(g: *Graph, k: *Kernel, inputs: []const Array, comptime n: usiz
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernel, iv, cfg, g.s));
+    var launched = false;
+    if (kernel_host) |h| if (h.t != kernel_host_declined) {
+        const hk: ?*anyopaque = if (k.host_src == h.t) k.host_built else blk: {
+            var in_s: [32]sdk_host.abi.Str = undefined;
+            var out_s: [8]sdk_host.abi.Str = undefined;
+            if (k.ins.len > in_s.len or k.outs.len > out_s.len) break :blk null;
+            for (k.ins, in_s[0..k.ins.len]) |s, *dst| dst.* = sdk_host.abi.Str.of(std.mem.span(s));
+            for (k.outs, out_s[0..k.outs.len]) |s, *dst| dst.* = sdk_host.abi.Str.of(std.mem.span(s));
+            const src_s = std.mem.span(k.source);
+            const hdr_s = std.mem.span(k.header);
+            const desc: sdk_host.abi.KernelDesc = .{
+                .backend = .metal,
+                .ensure_row_contiguous = k.contiguous,
+                .atomic_outputs = false,
+                .digest = sdk_host.digest(src_s, hdr_s),
+                .name = sdk_host.abi.Str.of(std.mem.span(k.name)),
+                .source = sdk_host.abi.Str.of(src_s),
+                .header = sdk_host.abi.Str.of(hdr_s),
+                .inputs = .of(in_s[0..k.ins.len]),
+                .outputs = .of(out_s[0..k.outs.len]),
+            };
+            const made = h.kernel(&desc);
+            k.host_src = h.t;
+            k.host_built = made;
+            break :blk made;
+        };
+        if (hk) |handle| {
+            var h_ov: sdk_host.abi.VectorArray = .{ .ctx = ov.ctx };
+            const g_tbl = h.gpu();
+            const v = g_tbl.launch(g_tbl.ctx, &h_ov, handle, .{ .ctx = iv.ctx }, .{ .ctx = cfg.ctx }, .{ .ctx = g.s.ctx });
+            ov.ctx = h_ov.ctx;
+            if (v.isOk()) {
+                launched = true;
+            } else if (v.code == .unsupported) {
+                kernel_host_declined = h.t;
+                k.host_src = null;
+                k.host_built = null;
+            } else {
+                return error.MlxError;
+            }
+        }
+    };
+    if (!launched) {
+        const kernel = k.built orelse blk: {
+            const ins_v = mlx.mlx_vector_string_new_data(k.ins.ptr, k.ins.len);
+            defer _ = mlx.mlx_vector_string_free(ins_v);
+            const outs_v = mlx.mlx_vector_string_new_data(k.outs.ptr, k.outs.len);
+            defer _ = mlx.mlx_vector_string_free(outs_v);
+            const made = mlx.mlx_fast_metal_kernel_new(k.name, ins_v, outs_v, k.source, k.header, k.contiguous, false);
+            if (made.ctx == null) return error.MetalKernelCompileFailed;
+            k.built = made;
+            break :blk made;
+        };
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernel, iv, cfg, g.s));
+    }
     if (unproven(k, tg, targs)) |key| if (!mlx.errorPending()) {
         _ = mlx.mlx_eval(ov);
         if (mlx.takeErrorIf("maximum allowed threads per threadgroup")) return error.ThreadLimit;
@@ -219,18 +291,20 @@ fn streams(g: *Graph, cfg: *const Config, h: Array, blocks: ?Array, query: Array
     const on = msg != null;
     while (true) {
         const tg = streamGroup(cfg.hidden_size) orelse return error.ThreadLimit;
+        // Wide forwards launch one TG per row so BLK/BANK/HIN/QY/MQ are read once per row instead of D/TG times.
+        const one_tg = s >= 64 and @divExact(d, tg) <= 4;
         return launchGrid(g, &pre_kernel, &.{ h, blocks orelse h, if (q > 0) query else h, nw[0], nw[1], nw[2], m.bank, m.partial, m.query, eps }, 5, .{
             if (on) unused else .{ .shape = &.{ inputs, s, d }, .dtype = dt },
             .{ .shape = &.{ 1, s, d }, .dtype = .float32 },
             if (on) .{ .shape = &.{ 3, s, d }, .dtype = .float32 } else unused,
             if (on) .{ .shape = &.{ 4, s, d }, .dtype = .float32 } else unused,
             if (on) .{ .shape = &.{ 3, s, 2 * d }, .dtype = m.gt } else unused,
-        }, .{ d, s, 1 }, .{ tg, 1, 1 }, &.{
+        }, .{ if (one_tg) tg else d, s, 1 }, .{ tg, 1, 1 }, &.{
             .{ "T", .{ .dtype = dt } },                                    .{ "GT", .{ .dtype = m.gt } },
             .{ "TG", .{ .int = tg } },                                     .{ "D", .{ .int = d } },
             .{ "Q", .{ .int = q } },                                       .{ "J", .{ .int = inputs } },
             .{ "NB", .{ .int = if (blocks) |b| ops.shape(b)[2] else 0 } }, .{ "MSG", .{ .int = @intFromBool(on) } },
-            .{ "NBK", .{ .int = if (on) ops.shape(m.bank)[2] else 0 } },
+            .{ "NBK", .{ .int = if (on) ops.shape(m.bank)[2] else 0 } },   .{ "ONE_TG", .{ .int = @intFromBool(one_tg) } },
         }) catch |e| if (e == error.ThreadLimit and narrow(cfg.hidden_size)) continue else return e;
     }
 }
@@ -1196,31 +1270,32 @@ pub fn midWith(g: *Graph, L: *const Layer, w: *const Body, attn: Array, out_gate
     const on = gates != null;
     const o = while (true) {
         const tg = streamGroup(cfg.hidden_size) orelse return error.ThreadLimit;
+        const one_tg = s >= 64 and @divExact(d, tg) <= 4;
         break launchGrid(g, &mid_kernel, &.{ op, st, L.attn_conv, h, normed, blocks orelse h, L.mlp_query, L.post_norm, msg3, pr, par }, 5, .{
             .{ .shape = &.{ 1, s, d }, .dtype = .float32 },
             if (on) unused else .{ .shape = &.{ 1, s, d }, .dtype = dt },
             if (on) unused else .{ .shape = &.{ 1, s, d }, .dtype = .float32 },
             if (on) .{ .shape = &.{ 1, s, d }, .dtype = .float32 } else unused,
             if (on) .{ .shape = &.{ 1, s, 2 * d }, .dtype = gt } else unused,
-        }, .{ d, s, 1 }, .{ tg, 1, 1 }, &.{
+        }, .{ if (one_tg) tg else d, s, 1 }, .{ tg, 1, 1 }, &.{
             .{ "T", .{ .dtype = ops.dtype(op) } },                         .{ "XT", .{ .dtype = dt } },
             .{ "WT", .{ .dtype = ops.dtype(L.attn_conv) } },               .{ "GT", .{ .dtype = gt } },
             .{ "TG", .{ .int = tg } },                                     .{ "D", .{ .int = d } },
             .{ "KT", .{ .int = kt } },                                     .{ "OFF", .{ .int = @intCast(2 * cfg.kvDim()) } },
             .{ "NB", .{ .int = if (blocks) |b| ops.shape(b)[2] else 0 } }, .{ "BOUND", .{ .int = @intFromBool(L.boundary) } },
-            .{ "MSG", .{ .int = @intFromBool(on) } },
-            .{ "TREE", .{ .int = @intFromBool(parent != null) } },
+            .{ "MSG", .{ .int = @intFromBool(on) } },                      .{ "TREE", .{ .int = @intFromBool(parent != null) } },
+            .{ "ONE_TG", .{ .int = @intFromBool(one_tg) } },
         }) catch |e| if (e == error.ThreadLimit and narrow(cfg.hidden_size)) continue else return e;
     };
     var x = o[1];
-    // A plain visit's router is MLX's matmul; a looped one's rides its norm kernel, where the rows read the stream
-    // as it is (inside `mid.metal` each row would redo the conv and the mix: slower than the launch it saves).
+    // Wide forwards route through MLX's GEMM; few-row looped visits fuse the scalar router into `norm`.
     var scores: Array = undefined;
     if (gates) |gs| {
         const state = try gateDowns(g, o[4], gs, 3, 1);
-        const xs = try norm(g, cfg, try gate(g, gs, o[3], msg3, state, 3, 1), @splat(L.post_norm), 1, dt, L.router);
+        const wide_router = s > small_rows;
+        const xs = try norm(g, cfg, try gate(g, gs, o[3], msg3, state, 3, 1), @splat(L.post_norm), 1, dt, if (wide_router) null else L.router);
         x = xs[0];
-        scores = xs[1];
+        scores = if (wide_router) try g.matmul(try g.astype(x, .float32), try g.transpose(L.router, &.{ 1, 0 })) else xs[1];
     } else scores = if (s > 1 and s <= small_rows) try routerRows(g, o[2], L.router) else try g.matmul(o[2], try g.transpose(L.router, &.{ 1, 0 }));
     var opened: ?Array = null;
     if (L.boundary) {

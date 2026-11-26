@@ -76,10 +76,12 @@ if (MSG) for (uint j = 0; j < 4; j++) {
     for (uint n = 0; n < NM; n++) { wm[j * NM + n] = exp(acc[MB + j * NM + n] - mx); tot += wm[j * NM + n]; }
     for (uint n = 0; n < NM; n++) wm[j * NM + n] /= tot;
 }
-float ss[R2], mine[R2];
+constexpr uint ELEMS = ONE_TG ? (D / TG) : 1;
+float ss[R2], mine[ELEMS * R2];
 for (uint r = 0; r < R2; r++) ss[r] = 0.0f;
-for (uint i = t; i < D; i += TG) {
+for (uint i = t, k = 0; i < D; i += TG, k++) {
     const float h = float(HIN[ro + i]);
+    const uint dst = ONE_TG ? k * R2 : 0u;
     for (uint j = 0; j < QC; j++) {
         float a = h;
         if (Q > 0) {
@@ -88,14 +90,14 @@ for (uint i = t; i < D; i += TG) {
             a += w[j * NS + NB] * (h * hs);
         }
         ss[j] += a * a;
-        if (i == e) mine[j] = a;
+        if (ONE_TG || i == e) mine[dst + j] = a;
     }
     if (MSG) for (uint j = 0; j < 4; j++) {
         float m = 0.0f;
         for (uint n = 0; n < NBK; n++) m += wm[j * NM + n] * float(BANK[(row * NBK + n) * D + i]);
         m += wm[j * NM + NBK] * float(BPART[ro + i]);
         ss[QC + j] += m * m;
-        if (i == e) mine[QC + j] = m;
+        if (ONE_TG || i == e) mine[dst + QC + j] = m;
     }
 }
 for (uint r = 0; r < R2; r++) {
@@ -110,19 +112,41 @@ for (uint r = t; r < R2; r += TG) {
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
 for (uint r = 0; r < R2; r++) ss[r] = fold2[r] / float(D);
-NORMED[ro + e] = float(HIN[ro + e]) * hs;
-if (MSG) {
-    for (uint j = 0; j < 3; j++) {
-        const uint c = min(j, QC - 1);
-        A[(j * S + row) * D + e] = mine[c];
-        BOTH[(j * S + row) * 2 * D + e] = GT(mine[c] * metal::precise::rsqrt(ss[c] + 1e-6f));
-        BOTH[(j * S + row) * 2 * D + D + e] = GT(mine[QC + j] * metal::precise::rsqrt(ss[QC + j] + 1e-6f));
+if constexpr (ONE_TG) {
+    for (uint i = t, k = 0; i < D; i += TG, k++) {
+        const uint src = k * R2;
+        NORMED[ro + i] = float(HIN[ro + i]) * hs;
+        if (MSG) {
+            for (uint j = 0; j < 3; j++) {
+                const uint c = min(j, QC - 1);
+                A[(j * S + row) * D + i] = mine[src + c];
+                BOTH[(j * S + row) * 2 * D + i] = GT(mine[src + c] * metal::precise::rsqrt(ss[c] + 1e-6f));
+                BOTH[(j * S + row) * 2 * D + D + i] = GT(mine[src + QC + j] * metal::precise::rsqrt(ss[QC + j] + 1e-6f));
+            }
+            for (uint j = 0; j < 4; j++) MSGO[(j * S + row) * D + i] = mine[src + QC + j];
+        } else {
+            for (uint j = 0; j < J; j++) {
+                const uint c = min(j, QC - 1);
+                const float nw = float(j == 0 ? NW0[i] : (j == 1 ? NW1[i] : NW2[i]));
+                X[(j * S + row) * D + i] = T(mine[src + c] * metal::precise::rsqrt(ss[c] + PR[0]) * nw);
+            }
+        }
     }
-    for (uint j = 0; j < 4; j++) MSGO[(j * S + row) * D + e] = mine[QC + j];
 } else {
-    for (uint j = 0; j < J; j++) {
-        const uint c = min(j, QC - 1);
-        const float nw = float(j == 0 ? NW0[e] : (j == 1 ? NW1[e] : NW2[e]));
-        X[(j * S + row) * D + e] = T(mine[c] * metal::precise::rsqrt(ss[c] + PR[0]) * nw);
+    NORMED[ro + e] = float(HIN[ro + e]) * hs;
+    if (MSG) {
+        for (uint j = 0; j < 3; j++) {
+            const uint c = min(j, QC - 1);
+            A[(j * S + row) * D + e] = mine[c];
+            BOTH[(j * S + row) * 2 * D + e] = GT(mine[c] * metal::precise::rsqrt(ss[c] + 1e-6f));
+            BOTH[(j * S + row) * 2 * D + D + e] = GT(mine[QC + j] * metal::precise::rsqrt(ss[QC + j] + 1e-6f));
+        }
+        for (uint j = 0; j < 4; j++) MSGO[(j * S + row) * D + e] = mine[QC + j];
+    } else {
+        for (uint j = 0; j < J; j++) {
+            const uint c = min(j, QC - 1);
+            const float nw = float(j == 0 ? NW0[e] : (j == 1 ? NW1[e] : NW2[e]));
+            X[(j * S + row) * D + e] = T(mine[c] * metal::precise::rsqrt(ss[c] + PR[0]) * nw);
+        }
     }
 }

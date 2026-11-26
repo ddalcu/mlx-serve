@@ -1205,6 +1205,52 @@ test "inkling2 kernels: the mid kernels serve the values of the chain they repla
     };
 }
 
+// Bar: wide forwards (`S >= 64`) use the 1-TG-per-row stream kernels (including multi-element-per-thread `D/TG > 1`)
+// and route looped visits via GEMM (`s > small_rows`), matching the chain `layers.pre` and `layers.mid`.
+test "inkling2 kernels: wide prefill 1-TG stream kernels and looped router GEMM match the chain" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Stage.init(a);
+    defer s.deinit();
+    const body = s.body;
+    const cfg = &body.cfg;
+    const hidden: c_int = @intCast(cfg.hidden_size);
+    const taps: c_int = @intCast(cfg.sconv_kernel);
+    const q_dim: c_int = @intCast(cfg.num_attention_heads * cfg.head_dim);
+    const saved_tg = kernels.stream_threads;
+    defer kernels.stream_threads = saved_tg;
+    // Fixture hidden=64, so stream_threads=32 exercises D/TG = 2 in ONE_TG=1 mode.
+    kernels.stream_threads = 32;
+    const rows: c_int = 64;
+    var seed: u64 = 5700;
+    for (stage_cases) |case| {
+        const L = &body.layers[case.layer];
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 20;
+        const h = try randomRow(&g, a, seed, &.{ 1, rows, hidden }, 1.0, .bfloat16);
+        const blocks: ?ops.Array = if (case.blocks > 0) try randomRow(&g, a, seed + 1, &.{ 1, rows, case.blocks, hidden }, 1.0, .float32) else null;
+        const bank_arr: ?[2]ops.Array = if (case.messages) .{
+            try randomRow(&g, a, seed + 2, &.{ 1, rows, 3, hidden }, 1.0, .float32),
+            try randomRow(&g, a, seed + 3, &.{ 1, rows, hidden }, 1.0, .float32),
+        } else null;
+        const got_pre = try kernels.pre(&g, L, body, h, blocks, bank_arr);
+        const msgs_want: ?ops.Array = if (bank_arr) |bk| try layers.messagesFor(&g, L, bk[0], bk[1]) else null;
+        const want_pre = try layers.project(&g, L, body, h, blocks, msgs_want);
+        try expectClose(got_pre.normed, want_pre.normed, 1e-4, "wide pre normed");
+        try expectClose(got_pre.proj[0], want_pre.proj[0], 5e-2, "wide pre q_proj");
+
+        const attn = try randomRow(&g, a, seed + 4, &.{ 1, rows, q_dim }, 1.0, .bfloat16);
+        const st = try randomRow(&g, a, seed + 5, &.{ 1, taps - 1, 2 * @as(c_int, @intCast(cfg.kvDim())) + 2 * hidden }, 1.0, .float32);
+        const got_mid = try kernels.mid(&g, L, body, attn, null, h, got_pre.normed, blocks, st, got_pre.messages);
+        const want_mid = try layers.mid(&g, L, body, attn, try g.astype(h, .float32), want_pre.normed, blocks, st, msgs_want);
+        try expectClose(got_mid.residual, want_mid.residual, 0.1, "wide mid residual");
+        try expectClose(got_mid.x, want_mid.x, 0.1, "wide mid x");
+        const want_scores = try g.matmul(try g.astype(got_mid.x, .float32), try g.transpose(L.router, &.{ 1, 0 }));
+        try expectClose(got_mid.scores, want_scores, 1e-5, "wide looped router scores");
+    }
+}
+
 fn hostValues(a: std.mem.Allocator, g: *ops.Graph, x: ops.Array) ![]f32 {
     return conformance.consumeF32(a, .{ .ctx = g.escape(try g.astype(try g.contiguous(x), .float32)).ctx });
 }
@@ -2808,4 +2854,99 @@ test "inkling2 load: decode steps lift the command-buffer MB split, prompts and 
     } else |_| {}
     try testing.expectEqual(@as(i32, 77), Limits.mb_split);
     try testing.expectEqual(@as(i32, 50), Limits.op_split);
+}
+
+// Bar: when the host provides `Host.kernel` + `HostGpu.launch`, `kernels.launchGrid` builds the kernel once via the
+// host and dispatches through `HostGpu.launch` with bit-identical results; when a host refuses `launch` as unsupported,
+// it falls back to MLX's direct apply.
+test "inkling2 kernels: HostGpu.launch cache dispatches bit-identically and falls back when unsupported" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const host_abi = @import("../../abi/host.zig");
+    const FakeHost = @import("../../sdk/testing/fake_host.zig").FakeHost;
+    const Hook = struct {
+        var created: usize = 0;
+        var launched: usize = 0;
+        var made_handle: mlx.mlx_fast_metal_kernel = .{};
+        fn makeKernel(_: ?*anyopaque, desc: *const host_abi.KernelDesc) callconv(.c) ?*anyopaque {
+            created += 1;
+            if (made_handle.ctx != null) return made_handle.ctx;
+            var ins_z: [8][*:0]const u8 = undefined;
+            var outs_z: [8][*:0]const u8 = undefined;
+            var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer arena.deinit();
+            const aa = arena.allocator();
+            const toZ = struct {
+                fn f(al: std.mem.Allocator, bytes: []const u8) ?[*:0]const u8 {
+                    const buf = al.allocSentinel(u8, bytes.len, 0) catch return null;
+                    @memcpy(buf, bytes);
+                    return buf.ptr;
+                }
+            }.f;
+            for (desc.inputs.slice(), 0..) |s, i| ins_z[i] = toZ(aa, s.slice()) orelse return null;
+            for (desc.outputs.slice(), 0..) |s, i| outs_z[i] = toZ(aa, s.slice()) orelse return null;
+            const iv = mlx.mlx_vector_string_new_data(&ins_z, desc.inputs.len);
+            defer _ = mlx.mlx_vector_string_free(iv);
+            const ov = mlx.mlx_vector_string_new_data(&outs_z, desc.outputs.len);
+            defer _ = mlx.mlx_vector_string_free(ov);
+            const name_z = toZ(aa, desc.name.slice()) orelse return null;
+            const src_z = toZ(aa, desc.source.slice()) orelse return null;
+            const hdr_z = toZ(aa, desc.header.slice()) orelse return null;
+            made_handle = mlx.mlx_fast_metal_kernel_new(name_z, iv, ov, src_z, hdr_z, desc.ensure_row_contiguous, desc.atomic_outputs);
+            return made_handle.ctx;
+        }
+        fn runLaunch(_: ?*anyopaque, outputs: *host_abi.VectorArray, k: ?*anyopaque, inputs: host_abi.VectorArray, config: host_abi.KernelConfig, s_: host_abi.Stream) callconv(.c) host_abi.Verdict {
+            launched += 1;
+            var ov: mlx.mlx_vector_array = .{ .ctx = outputs.ctx };
+            const rc = mlx.mlx_fast_metal_kernel_apply(&ov, .{ .ctx = k }, .{ .ctx = inputs.ctx }, .{ .ctx = config.ctx }, .{ .ctx = s_.ctx });
+            outputs.ctx = ov.ctx;
+            return if (rc == 0) .ok else host_abi.Verdict.refuse(.failed, "apply failed");
+        }
+    };
+    Hook.created = 0;
+    Hook.launched = 0;
+    Hook.made_handle = .{};
+    defer if (Hook.made_handle.ctx != null) {
+        kernels.gated_kernel.host_src = null;
+        kernels.gated_kernel.host_built = null;
+        _ = mlx.mlx_fast_metal_kernel_free(Hook.made_handle);
+        Hook.made_handle = .{};
+    };
+
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    const x = try randomRow(&g, a, 7100, &.{ 1, 1, 64 }, 1.0, .bfloat16);
+    const gate = try g.sigmoid(try randomRow(&g, a, 7101, &.{64}, 1.0, .float32));
+
+    // Direct baseline (no host).
+    kernels.clearHost(null);
+    const direct = try hostValues(a, &g, try kernels.gated(&g, x, gate, 1));
+    defer a.free(direct);
+
+    // Working Host.kernel + HostGpu.launch: kernel built once, both launches go through HostGpu.launch.
+    var good: FakeHost = undefined;
+    good.init(.{});
+    good.table.kernel = Hook.makeKernel;
+    good.gpu_table.launch = Hook.runLaunch;
+    kernels.setHost(good.host());
+    defer kernels.clearHost(good.host());
+    const h1 = try hostValues(a, &g, try kernels.gated(&g, x, gate, 1));
+    defer a.free(h1);
+    const h2 = try hostValues(a, &g, try kernels.gated(&g, x, gate, 1));
+    defer a.free(h2);
+    try testing.expectEqual(@as(usize, 1), Hook.created);
+    try testing.expectEqual(@as(usize, 2), Hook.launched);
+    try testing.expectEqualSlices(f32, direct, h1);
+    try testing.expectEqualSlices(f32, direct, h2);
+
+    // Refusing FakeHost falls back cleanly to MLX's direct apply.
+    var refusing: FakeHost = undefined;
+    refusing.init(.{});
+    kernels.setHost(refusing.host());
+    defer kernels.clearHost(refusing.host());
+    const fb = try hostValues(a, &g, try kernels.gated(&g, x, gate, 1));
+    defer a.free(fb);
+    try testing.expectEqualSlices(f32, direct, fb);
 }
