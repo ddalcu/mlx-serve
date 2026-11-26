@@ -10,19 +10,21 @@ const std = @import("std");
 const env = @import("../env.zig");
 const crt = @import("../sdk/util/crt.zig");
 const log = @import("../sdk/util/log.zig");
+const shared = @import("../sdk/util/shared.zig");
 
 /// The file's bytes, comptime-known and typed like a string literal, so `++` and `std.fmt` compose them.
 pub inline fn source(comptime path: []const u8) @TypeOf(@embedFile("../" ++ path)) {
     return @embedFile("../" ++ path);
 }
 
-const File = struct { path: []const u8, digest: []const u8, text: [:0]const u8 };
+const Listed = struct { path: []const u8, digest: []const u8 };
 
-const files: []const File = blk: {
+/// `digests.txt` alone: a unit that embedded the kernel texts would rebuild on every kernel edit.
+const listed: []const Listed = blk: {
     @setEvalBranchQuota(1_000_000);
-    var out: []const File = &.{};
+    var out: []const Listed = &.{};
     var lines = std.mem.tokenizeScalar(u8, @embedFile("../kernels/digests.txt"), '\n');
-    while (lines.next()) |line| out = out ++ [_]File{.{ .path = line[66..], .digest = line[0..64], .text = source(line[66..]) }};
+    while (lines.next()) |line| out = out ++ [_]Listed{.{ .path = line[66..], .digest = line[0..64] }};
     const final = out[0..out.len].*;
     break :blk &final;
 };
@@ -30,14 +32,19 @@ const files: []const File = blk: {
 /// Texts read from one override directory, each at its first use; a file it cannot read keeps the built-in text.
 const Overrides = struct {
     root: []const u8,
-    texts: [files.len]?[:0]const u8 = @splat(null),
+    texts: [listed.len]?[:0]const u8 = @splat(null),
+    tried: [listed.len]bool = @splat(false),
 
+    /// A text is one whole listed file when its sha256 is that file's digest.
     fn get(self: *Overrides, text: [*:0]const u8) [*:0]const u8 {
-        const t = std.mem.span(text);
-        for (files, &self.texts) |f, *slot| {
-            if (!std.mem.eql(u8, f.text, t)) continue;
-            if (slot.* == null) slot.* = read(self.root, f.path) orelse f.text;
-            return slot.*.?.ptr;
+        var h: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(std.mem.span(text), &h, .{});
+        const hex = std.fmt.bytesToHex(h, .lower);
+        for (listed, &self.texts, &self.tried) |f, *slot, *tried| {
+            if (!std.mem.eql(u8, f.digest, &hex)) continue;
+            if (!tried.*) slot.* = read(self.root, f.path);
+            tried.* = true;
+            return if (slot.*) |s| s.ptr else text;
         }
         return text;
     }
@@ -66,9 +73,21 @@ const Overrides = struct {
 var overrides: ?Overrides = null;
 var env_read = false;
 
+const resolve_sym = "mlx_serve_kernels_resolve";
+
+comptime {
+    if (!shared.in_unit) @export(&resolveHere, .{ .name = resolve_sym });
+}
+
 /// `text` as MLX should compile it: itself, or with `MLX_SERVE_KERNEL_DIR` set and `text` one whole kernel
-/// file, that file from the directory. Kernels are created on the inference thread only.
+/// file, that file from the directory. Kernels are created on the inference thread only. A `-Dunits` unit asks
+/// the host's copy, so the override state is one and no unit keys on `digests.txt`.
 pub fn resolve(text: [*:0]const u8) [*:0]const u8 {
+    if (shared.in_unit) return @extern(*const fn ([*:0]const u8) callconv(.c) [*:0]const u8, .{ .name = resolve_sym })(text);
+    return resolveHere(text);
+}
+
+fn resolveHere(text: [*:0]const u8) callconv(.c) [*:0]const u8 {
     if (!env_read) {
         env_read = true;
         if (env.get(.MLX_SERVE_KERNEL_DIR)) |dir| overrides = .{ .root = std.mem.span(dir) };
@@ -77,6 +96,16 @@ pub fn resolve(text: [*:0]const u8) [*:0]const u8 {
 }
 
 // ── tests ──
+
+const File = struct { path: []const u8, digest: []const u8, text: [:0]const u8 };
+
+const files: []const File = blk: {
+    @setEvalBranchQuota(1_000_000);
+    var out: []const File = &.{};
+    for (listed) |f| out = out ++ [_]File{.{ .path = f.path, .digest = f.digest, .text = source(f.path) }};
+    const final = out[0..out.len].*;
+    break :blk &final;
+};
 
 test "every kernel file still has the bytes digests.txt records" {
     for (files) |f| {
