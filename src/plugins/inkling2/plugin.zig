@@ -1366,25 +1366,22 @@ fn oqLeaf(comptime leaf: []const u8) []const u8 {
 
 fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     const c = config.of(ctx.parsed);
+    // Each layout by its embedding's name: mlx-lm's, the release's, oMLX's oQ.
+    const layouts = [_]struct { prefix: []const u8, probe: []const u8, release: bool = false, oq: bool = false }{
+        .{ .prefix = "model.language_model", .probe = "embed_tokens.weight" },
+        .{ .prefix = "model.llm", .probe = "embed.weight", .release = true },
+        .{ .prefix = "model", .probe = "embed.weight", .oq = true },
+    };
     var release = false;
     var oq = false;
-    var r = loader.Reader.open(ctx, c.block_json, &.{"model.language_model"}, "embed_tokens.weight") catch |e| switch (e) {
-        error.MissingWeight => blk: {
-            release = true;
-            break :blk loader.Reader.open(ctx, c.block_json, &.{"model.llm"}, "embed.weight") catch |e2| switch (e2) {
-                error.MissingWeight => blk2: {
-                    release = false;
-                    oq = true;
-                    break :blk2 loader.Reader.open(ctx, c.block_json, &.{"model"}, "embed.weight") catch |e3| return switch (e3) {
-                        error.MissingWeight => error.Inkling2PackLayoutUnknown,
-                        else => e3,
-                    };
-                },
-                else => return e2,
-            };
-        },
-        else => return e,
-    };
+    var r = for (layouts) |l| {
+        release = l.release;
+        oq = l.oq;
+        break loader.Reader.open(ctx, c.block_json, &.{l.prefix}, l.probe) catch |e| switch (e) {
+            error.MissingWeight => continue,
+            else => return e,
+        };
+    } else return error.Inkling2PackLayoutUnknown;
     defer r.close();
     const m = try gpa.create(Loaded);
     errdefer gpa.destroy(m);

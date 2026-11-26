@@ -158,7 +158,7 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **An fp16 gather is for affine banks only** (`gatherRowsDtype`, GPUs before Apple9 that lack bf16): NVFP4 and MXFP8
   raw outputs carry the per-expert multiplier's inverse and overflow fp16 (the answer was `!!`).
 - `proof_test.zig`: whole == chunked == stepwise on the tiny looped fixture (CPU), the fixture in oQ's layout against
-  mlx-lm's bit for bit, planted state mutations, the media
+  mlx-lm's bit for bit (dense and quantized), planted state mutations, the media
   splice, a verified block's commit, batched slots against each slot alone (CPU) or reordered and re-neighboured
   (GPU), and each kernel against its chain.
 - `contract.zig`: `gated`, `state`, `relmask`, `act`, `sum`, `topk`, `gate` (its one-row arm), `relsplit`, `relattn_nax`,

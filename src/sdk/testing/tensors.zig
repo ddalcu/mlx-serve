@@ -35,7 +35,8 @@ pub const Tensors = struct {
         return n;
     }
 
-    fn put(t: *Tensors, comptime fmt: []const u8, args: anytype, dtype: Dtype, shape: []const u64, data: []const u8) !void {
+    /// `data` stored as given (packed quantized words, say).
+    pub fn put(t: *Tensors, comptime fmt: []const u8, args: anytype, dtype: Dtype, shape: []const u64, data: []const u8) !void {
         try t.list.append(t.a, .{ .name = try std.fmt.allocPrint(t.a, fmt, args), .dtype = dtype, .shape = try t.a.dupe(u64, shape), .bytes = data });
     }
 

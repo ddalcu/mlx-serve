@@ -14,6 +14,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const conformance = @import("../../sdk/testing/conformance.zig");
 const test_cache = @import("../../sdk/testing/cache_ops.zig");
 const fixture = @import("../../sdk/testing/fixture.zig");
+const Tensors = @import("../../sdk/testing/tensors.zig").Tensors;
 const parity = @import("../../sdk/testing/parity.zig");
 const run = @import("../../sdk/bases/run.zig");
 const head_block = @import("../../sdk/bases/blocks/head.zig");
@@ -290,27 +291,81 @@ fn oqLayout(a: std.mem.Allocator, tensors: []const fixture.Tensor) ![]fixture.Te
     return p.out.items;
 }
 
-// Bar: the fixture as oMLX's oQ layout stores it serves the bytes the mlx-lm layout serves for a prompt's rows, on
-// the CPU's stream and the GPU's.
+/// `tensors` as a quantized pack stores them: the attention projections, the embedding and the head affine in groups
+/// of 32 (4 bits in layers 1 and 4, 8 elsewhere; bf16 scales and biases), the norms and the message gates' down
+/// projections bf16 (oQ's `loop_down` holds those bf16 values as f32), the rest f32.
+fn quantizedPack(a: std.mem.Allocator, tensors: []const fixture.Tensor) ![]u8 {
+    var t = Tensors.init(a, 0);
+    for (tensors) |x| {
+        const n = x.name;
+        const attn_proj = std.mem.indexOf(u8, n, "attn.") != null and std.mem.endsWith(u8, n, "_proj.weight");
+        if (attn_proj or std.mem.endsWith(u8, n, "embed.weight") or std.mem.endsWith(u8, n, "embed_tokens.weight") or std.mem.eql(u8, n, "lm_head.weight")) {
+            const bits: u32 = if (std.mem.indexOf(u8, n, "layers.1.") != null or std.mem.indexOf(u8, n, "layers.4.") != null) 4 else 8;
+            const levels: f32 = @floatFromInt((@as(u32, 1) << @intCast(bits)) - 1);
+            const codes = try a.alloc(u32, x.data.len * bits / 32);
+            @memset(codes, 0);
+            const scales = try a.alloc(f32, x.data.len / 32);
+            const biases = try a.alloc(f32, x.data.len / 32);
+            for (scales, biases, 0..) |*s, *b, g| {
+                const v = x.data[g * 32 ..][0..32];
+                b.* = std.mem.min(f32, v);
+                s.* = (std.mem.max(f32, v) - b.*) / levels;
+                for (v, g * 32..) |e, k| codes[k * bits / 32] |= @as(u32, @intFromFloat(@min(levels, @round((e - b.*) / s.*)))) << @intCast(k * bits % 32);
+            }
+            const base = n[0 .. n.len - ".weight".len];
+            try t.put("{s}.weight", .{base}, .U32, &.{ x.shape[0], x.shape[1] * bits / 32 }, std.mem.sliceAsBytes(codes));
+            try t.values("{s}.scales", .{base}, &.{ x.shape[0], x.shape[1] / 32 }, .BF16, scales);
+            try t.values("{s}.biases", .{base}, &.{ x.shape[0], x.shape[1] / 32 }, .BF16, biases);
+        } else if (std.mem.endsWith(u8, n, "norm.weight") or std.mem.endsWith(u8, n, "message_gate.down_proj.weight")) {
+            try t.values("{s}", .{n}, x.shape, .BF16, x.data);
+        } else if (std.mem.endsWith(u8, n, "loop_down")) {
+            // Rounded to bf16 (nearest even), as the bf16 file holds it.
+            const wide = try a.alloc(f32, x.data.len);
+            for (wide, x.data) |*w, e| {
+                const u: u32 = @bitCast(e);
+                w.* = @bitCast((u + 0x7fff + ((u >> 16) & 1)) & 0xffff_0000);
+            }
+            try t.values("{s}", .{n}, x.shape, .F32, wide);
+        } else try t.values("{s}", .{n}, x.shape, .F32, x.data);
+    }
+    return t.bytes();
+}
+
+/// The whole prompt's rows from the fixture with `weights` (safetensors bytes) in place of its own.
+fn wholeRows(a: std.mem.Allocator, gpu: bool, weights: []const u8) ![]f32 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var fx = try plugin.conformanceFixture(arena.allocator());
+    const files = try arena.allocator().dupe(fixture.File, fx.files);
+    files[1].bytes = weights;
+    fx.files = files;
+    var pack = try conformance.Loaded.openWith(testing.io, arena.allocator(), plugin.plugin.name, &plugin.table, fx, .{ .gpu = gpu });
+    defer pack.close();
+    var cache = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
+    defer cache.deinit();
+    return step(a, &pack, &cache, &prompt, 0, .all_rows);
+}
+
+// Bar: the fixture as oMLX's oQ layout stores it serves the bytes the mlx-lm layout serves for a prompt's rows, dense
+// and quantized as packs ship, on the CPU's stream and the GPU's.
 test "inkling2 proof: oMLX's oQ layout serves the mlx-lm layout's rows, bit for bit" {
     const a = testing.allocator;
-    for (streams()) |gpu| {
-        var s = try Setup.init(a, gpu);
-        defer s.deinit(a);
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        var fx = try plugin.conformanceFixture(arena.allocator());
-        const files = try arena.allocator().dupe(fixture.File, fx.files);
-        files[1].bytes = try fixture.safetensors(arena.allocator(), try oqLayout(arena.allocator(), try plugin.fixtureTensors(arena.allocator())));
-        fx.files = files;
-        var pack = try conformance.Loaded.openWith(testing.io, arena.allocator(), plugin.plugin.name, &plugin.table, fx, .{ .gpu = gpu });
-        defer pack.close();
-        var cache = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
-        defer cache.deinit();
-        const whole = try step(a, &pack, &cache, &prompt, 0, .all_rows);
-        defer a.free(whole);
-        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(s.whole), std.mem.sliceAsBytes(whole));
-    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    const lm = try plugin.fixtureTensors(ar);
+    const oq = try oqLayout(ar, lm);
+    const packs = [_][2][]const u8{
+        .{ try fixture.safetensors(ar, lm), try fixture.safetensors(ar, oq) },
+        .{ try quantizedPack(ar, lm), try quantizedPack(ar, oq) },
+    };
+    for (streams()) |gpu| for (packs) |p| {
+        const want = try wholeRows(a, gpu, p[0]);
+        defer a.free(want);
+        const got = try wholeRows(a, gpu, p[1]);
+        defer a.free(got);
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got));
+    };
 }
 
 /// The release parsed and loaded through the plugin table (its defaults), for the tests that run it.
