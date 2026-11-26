@@ -34,4 +34,30 @@ final class HubEndpointTests: XCTestCase {
     func testTheLoginShellIsAskedForTheEndpoint() {
         XCTAssertTrue(LoginShellEnv.huggingFaceNames.contains("HF_ENDPOINT"))
     }
+
+    /// Settings ▸ Server ▸ Download models from (#1306) names the hub for the app and the server it launches,
+    /// over the shell's `HF_ENDPOINT`; left empty, the shell's value (or huggingface.co) stays.
+    func testTheSettingNamesTheHubForTheAppAndTheServer() {
+        let shell = ["HF_ENDPOINT": "https://shell-mirror.example", "HF_TOKEN": "secret"]
+        let env = LoginShellEnv.huggingFaceEnvironment(process: shell, hubSetting: " https://mirror.corp.example/ ")
+        XCTAssertEqual(DownloadManager.hubBase(environment: env), "https://mirror.corp.example")
+        XCTAssertEqual(env["HF_TOKEN"], "secret")
+        let launched = ServerManager.launchEnvironment(process: shell, hubSetting: "https://mirror.corp.example")
+        XCTAssertEqual(launched["HF_ENDPOINT"], "https://mirror.corp.example")
+        for unset in ["", "   "] {
+            XCTAssertEqual(LoginShellEnv.huggingFaceEnvironment(process: shell, hubSetting: unset)["HF_ENDPOINT"], "https://shell-mirror.example")
+            XCTAssertEqual(ServerManager.launchEnvironment(process: shell, hubSetting: unset)["HF_ENDPOINT"], "https://shell-mirror.example")
+        }
+        XCTAssertNil(ServerManager.launchEnvironment(process: [:], hubSetting: "")["HF_ENDPOINT"])
+    }
+
+    /// The field says when what was typed is not a hub, rather than quietly downloading from huggingface.co.
+    func testTheFieldRefusesWhatIsNotAHub() {
+        for good in ["", "https://hf-mirror.com/", "http://127.0.0.1:8123"] {
+            XCTAssertTrue(HubEndpointSetting.isUsable(good), good)
+        }
+        for bad in ["hf-mirror.com", "ftp://hf-mirror.com", "https://"] {
+            XCTAssertFalse(HubEndpointSetting.isUsable(bad), bad)
+        }
+    }
 }

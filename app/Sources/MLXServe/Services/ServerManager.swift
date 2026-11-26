@@ -970,12 +970,13 @@ class ServerManager: ObservableObject {
     /// `nonisolated static` so version probing (`EngineVersions.probe`) can find
     /// it without touching `@MainActor` server state.
     /// The app's environment plus the bundled frameworks the engine loads its dylibs from.
-    nonisolated static func launchEnvironment() -> [String: String] {
-        var env = ProcessInfo.processInfo.environment
-        // The server's own pulls (`/api/pull`, `run`) must reach the hub the user's shell names: a Finder launch
+    nonisolated static func launchEnvironment(process: [String: String] = ProcessInfo.processInfo.environment,
+                                              hubSetting: String = HubEndpointSetting.current) -> [String: String] {
+        var env = process
+        // The server's own pulls (`/api/pull`, `run`) must reach the hub the app uses: a Finder launch
         // has no shell environment to inherit it from.
-        let hf = LoginShellEnv.huggingFaceEnvironment(process: env)
-        for name in ["HF_ENDPOINT", "HF_TOKEN"] where env[name] == nil { env[name] = hf[name] }
+        let hf = LoginShellEnv.huggingFaceEnvironment(process: env, hubSetting: hubSetting)
+        for name in ["HF_ENDPOINT", "HF_TOKEN"] { env[name] = hf[name] }
         if let frameworksPath = Bundle.main.privateFrameworksPath {
             let existing = env["DYLD_LIBRARY_PATH"] ?? ""
             env["DYLD_LIBRARY_PATH"] = existing.isEmpty ? frameworksPath : "\(frameworksPath):\(existing)"

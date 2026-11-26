@@ -779,6 +779,33 @@ fileprivate struct ServerLaunchDirty {
 
 // MARK: - Model folders section
 
+/// Where downloads come from (`HubEndpointSetting`): the app reads it per request, the server at its next start.
+private struct HubEndpointRow: View {
+    @AppStorage(HubEndpointSetting.key) private var hub = ""
+
+    private static let explainer = "A Hugging Face mirror or company proxy, such as https://hf-mirror.com. Empty uses HF_ENDPOINT from your shell, else Hugging Face itself. The server uses it from its next start."
+
+    var body: some View {
+        let usable = HubEndpointSetting.isUsable(hub)
+        SearchableRow(searchText: ["Download models from", "Hugging Face", "mirror", "proxy", "HF_ENDPOINT", Self.explainer]) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(L10n.text("Download models from"))
+                        .font(.app(.rowTitle))
+                    Spacer(minLength: 12)
+                    TextField("", text: $hub, prompt: Text(verbatim: DownloadManager.defaultHub))
+                        .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing)
+                        .frame(width: 260).font(.app(.body))
+                }
+                Text(usable ? L10n.text(Self.explainer) : L10n.text(HubEndpointSetting.notUsed))
+                    .font(.app(.explainer))
+                    .foregroundStyle(usable ? Color.secondary : Color.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
 /// One row showing the user-configured extra discovery root. The path is
 /// rendered verbatim (raw, not standardized) so the user sees exactly what
 /// they picked; discovery silently skips it when it doesn't resolve to an
@@ -798,6 +825,7 @@ private struct ModelFoldersSectionContent: View {
     var body: some View {
         if BuildFeatures.current.customModelFolders { defaultFolderRow }
         customFolderRow
+        HubEndpointRow()
     }
 
     // MARK: - Default (download destination)

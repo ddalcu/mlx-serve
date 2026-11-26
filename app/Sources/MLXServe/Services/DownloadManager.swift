@@ -2573,10 +2573,15 @@ class DownloadManager: ObservableObject {
     /// huggingface.co. The Zig CLI's rule (`sdk/util/hub.zig`): a value that is not an http(s) URL with a host is
     /// ignored, because the token rides every request to it.
     nonisolated static func hubBase(environment: [String: String] = LoginShellEnv.huggingFaceEnvironment()) -> String {
-        var raw = (environment["HF_ENDPOINT"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        validHub(environment["HF_ENDPOINT"] ?? "") ?? defaultHub
+    }
+
+    /// `raw` as a hub base (trimmed, no trailing slash) when it is an http(s) URL with a host, else nil.
+    nonisolated static func validHub(_ raw: String) -> String? {
+        var raw = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         while raw.hasSuffix("/") { raw.removeLast() }
         guard let url = URL(string: raw), let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http",
-              let host = url.host, !host.isEmpty else { return defaultHub }
+              let host = url.host, !host.isEmpty else { return nil }
         return raw
     }
 
