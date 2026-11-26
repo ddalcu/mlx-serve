@@ -24,7 +24,7 @@ with the KDA-hybrid family's readers (`sdk/bases/kda_hybrid/config.zig`) and loa
 - Ling-3.1 streaming pack (the EXL3 repack beside `experts.bin`): it keeps the release's config, so its EXL3
   `quantization_config` (not `expert_streaming`) sets `streamed_bank`; glm5_next's streaming rules then apply. Its prompt
   bill is `prefill_bytes`: the engine's unstreamed arithmetic over `sdk/bill/prefill.zig`, pinned by `bill_test.zig`
-  (the closure stays in sdk/); `prompt_last_row` reads the head's last 32 rows only.
+  (the closure stays in sdk/); `prompt_last_row` slices the head's call over every row of the forward.
 - Exact verify (streaming packs, `serialVerify`, ≤ 16 rows): every verify row carries serial decode's bytes
   (projections at `QuantTable.exact_rows`, KDA and MLA per row, `moe.mlpRows`), so greedy MTP text equals MTP off;
   not `exact_drafted` (sampled MTP is not position-keyed). Bar: `served_test.zig`.

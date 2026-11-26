@@ -122,8 +122,7 @@ fn lingFacts(c: *const Config, p: *abi.Parsed) void {
     p.caps = .{ .moe = c.num_experts > 0, .dflash_capture = true, .experts_stream = c.num_experts > 0 };
     if (c.streamed_bank) {
         family.bankFacts(p);
-        // The outside plugin's head computes a prompt row as the whole prompt's call does
-        // (sdk/bases/kda_hybrid/host.zig `finish`).
+        // A last-row prompt is the slice of the head's call over every row (sdk/bases/kda_hybrid/host.zig `finish`).
         p.caps.prompt_last_row = true;
     }
     p.chat.thinking_default = .on;
