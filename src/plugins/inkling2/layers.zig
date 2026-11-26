@@ -77,9 +77,10 @@ pub const Layer = struct {
     /// `[experts, hidden]` and `[experts]`, f32.
     router: Array,
     router_bias: Array,
-    /// q | gate | r | sink, and a sliding layer's k | v, as one projection each (the parts are its row views).
+    /// q | gate | r | sink, a sliding layer's k | v, and their combined k | v | q | gate | r | sink on pass 0.
     join_q: linear.Joined = .{},
     join_kv: linear.Joined = .{},
+    join_qkv: Joined6 = .{},
     /// Rows alternate gate, up.
     gate_up: Bank,
     down: Bank,
@@ -91,6 +92,37 @@ pub const Layer = struct {
     message_query: Array = .{},
 };
 
+/// Six projections reading one input joined along their output rows (k | v | q | gate | r | sink on a sliding layer).
+pub const Joined6 = struct {
+    lin: Linear = .{},
+    widths: [6]c_int = @splat(0),
+
+    pub fn built(j: *const Joined6) bool {
+        return j.lin.w.ctx != null;
+    }
+
+    pub fn part(j: *const Joined6, g: *Graph, y: Array, i: usize) !Array {
+        var start: c_int = 0;
+        for (j.widths[0..i]) |w| start += w;
+        return g.sliceAxis(y, 2, start, start + j.widths[i]);
+    }
+};
+
+/// Pre-evaluated GPU constants shared across visits to avoid per-visit host-to-GPU copies.
+pub const Consts = struct {
+    eps: Array = .{},
+    caps: Array = .{},
+    route_scale: Array = .{},
+    conv_scale: Array = .{},
+    mid_pr: Array = .{},
+    prep_pr_static: Array = .{},
+    prep_pr_dyn: Array = .{},
+    attn_scale: Array = .{},
+    rel_params: Array = .{},
+    zero_i32: Array = .{},
+    zero_tmeta: Array = .{},
+};
+
 pub const Body = struct {
     cfg: Config,
     layers: []const Layer,
@@ -98,6 +130,7 @@ pub const Body = struct {
     /// Ones `[hidden]` and `[head_dim]` f32: the unweighted norms' weight.
     ones: Array,
     ones_head: Array,
+    consts: Consts = .{},
 };
 
 pub const projectRows = head_block.project;
@@ -272,18 +305,25 @@ pub const Projections = struct { proj: [6]Array, dyn: ?[2]Array };
 /// are one array; then a global layer's projected k and v conv taps.
 pub fn projections(g: *Graph, L: *const Layer, qkv: [3]Array) !Projections {
     var proj: [6]Array = undefined;
-    if (L.join_q.built()) {
-        const y = try projectRows(g, &L.join_q.lin, qkv[0]);
-        for (proj[0..4], 0..) |*x, i| x.* = try L.join_q.part(g, y, i);
-    } else for (proj[0..4], [_]*const Linear{ &L.q, &L.gate, &L.r, &L.sink }) |*x, l| {
-        x.* = try projectRows(g, l, qkv[0]);
-    }
-    if (L.join_kv.built() and qkv[1].ctx == qkv[0].ctx and qkv[2].ctx == qkv[0].ctx) {
-        const y = try projectRows(g, &L.join_kv.lin, qkv[0]);
-        for (proj[4..6], 0..) |*x, i| x.* = try L.join_kv.part(g, y, i);
+    if (L.join_qkv.built() and qkv[1].ctx == qkv[0].ctx and qkv[2].ctx == qkv[0].ctx) {
+        const y = try projectRows(g, &L.join_qkv.lin, qkv[0]);
+        proj[4] = try L.join_qkv.part(g, y, 0);
+        proj[5] = try L.join_qkv.part(g, y, 1);
+        for (proj[0..4], 0..) |*x, i| x.* = try L.join_qkv.part(g, y, 2 + i);
     } else {
-        proj[4] = try projectRows(g, &L.k, qkv[1]);
-        proj[5] = try projectRows(g, &L.v, qkv[2]);
+        if (L.join_q.built()) {
+            const y = try projectRows(g, &L.join_q.lin, qkv[0]);
+            for (proj[0..4], 0..) |*x, i| x.* = try L.join_q.part(g, y, i);
+        } else for (proj[0..4], [_]*const Linear{ &L.q, &L.gate, &L.r, &L.sink }) |*x, l| {
+            x.* = try projectRows(g, l, qkv[0]);
+        }
+        if (L.join_kv.built() and qkv[1].ctx == qkv[0].ctx and qkv[2].ctx == qkv[0].ctx) {
+            const y = try projectRows(g, &L.join_kv.lin, qkv[0]);
+            for (proj[4..6], 0..) |*x, i| x.* = try L.join_kv.part(g, y, i);
+        } else {
+            proj[4] = try projectRows(g, &L.k, qkv[1]);
+            proj[5] = try projectRows(g, &L.v, qkv[2]);
+        }
     }
     const dyn: ?[2]Array = if (L.k_conv == .dynamic) .{ try projectRows(g, &L.k_conv.dynamic.proj, qkv[1]), try projectRows(g, &L.v_conv.dynamic.proj, qkv[2]) } else null;
     return .{ .proj = proj, .dyn = dyn };
@@ -586,7 +626,7 @@ pub const Head = struct {
     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
         const g = c.g;
         // Trimmed before the cap: the cap's result is then a dense array, not a strided view of the padded rows.
-        const logits = try g.astype(try g.sliceAxis(try head_block.project(g, &w.lin, x), 2, 0, w.vocab), .float32);
+        const logits = try g.astype(try g.sliceAxis(try projectRows(g, &w.lin, x), 2, 0, w.vocab), .float32);
         return g.mulScalar(try g.tanh(try g.mulScalar(logits, 1.0 / w.softcap)), w.softcap);
     }
 };

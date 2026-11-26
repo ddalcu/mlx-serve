@@ -50,9 +50,9 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
   value still enters P V at weight 0 in its 32-key tile: a NaN there reaches the row.
 - **Reads of at most `small_rows` rows build a mask (`relmask.metal`) and use MLX's attention**, which beats the flash
   kernel (`relattn.metal`, mlx-lm's, MIT: 16 keys at a time on one threadgroup) at a few rows' latency.
-- **2 to `packed_rows` rows (63) read the packed expert banks in place, their picks GROUPED by expert** (`group`: tiles
-  of up to 4 picks; `ups_grp`, `downs_grp`, then `few_tail`): an expert's bytes are decoded once a tile. One row reads
-  `ups`/`downs`; MLX's gather wins only from 64 rows (its sorted tiles start there; under it, it reads a bank a pick).
+- **2 to `packed_rows` rows (64) read the packed expert banks in place, their picks GROUPED by expert** (`group`: tiles
+  of up to 4 picks for <= 128 picks, 8 past that; `ups_grp`, `downs_grp`, `few_tail`): an expert's bytes are decoded once a tile.
+  One row reads `ups`/`downs`; MLX's gather wins only past 64 rows.
 - **2 to 16 rows read the keys on the NAX tensor unit in one pass** (`relsplit_nax.metal`, `splitReadNax`; up to four
   slots' blocks a launch, `splitReadNaxLanes`: a kernel takes 31 buffers). `relsplit.metal` serves a GPU without NAX, its
   splits joined in `relcomb` (normalised after the sum: contract gate 4). Under 4 KB of keys MLX binds them `constant`: old path.
@@ -131,12 +131,11 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **A verify of several slots is ONE forward** (`openGroup`, `Spec.opens`, `NativeDrafter.verify_group`/`finish_group`): blocks stack
   `rows` a slot (shorter ones padded), the conv kernels read `RPS` rows behind each slot's own state, `attendOpen` reads each
   slot's own cache, `commitLane` keeps a slot's accepted rows. A slot's rows equal its verify alone (proof test).
-- **The DFlash2 draft batches across slots** (`draftBatch`, `pickBatch`): dense work over every lane's rows, attention
-  per lane over its own context; it differs from a lane alone by matmul tiling (cosine 0.95+) and accepts the same.
-  The bundled head drafts a slot at a time.
-- **A DFlash2 group's width is the GPU's, the bundled head's 2** (`groupWidth`, `NativeDrafter.group_width`): 16 with NAX,
-  8 elsewhere; past it the slots decode plain in the batched group. The head keeps too few drafts a grouped round for a
-  wider group to beat the plain batched steps it replaces.
+- **Both drafters batch across slots** (`dflash2.draftBatch`, `draft.draftBatchPacked`, `draft.draftBatchSampled`): dense
+  work over every lane's rows, attention per lane over its own context; `stepGroupBundled` runs greedy and sampled
+  bundled groups in one GPU sync with adaptive width (`bundledGroupRows`) and `markov_fold_batch` sharing one `FOLD` read per 8 lanes.
+- **Group widths (`groupWidth`, `NativeDrafter.group_width`)**: DFlash2 takes `max_open` (16) on NAX, 8 elsewhere;
+  the bundled head takes 8 on NAX (batched draft + BM=8 grouped MoE), 2 elsewhere.
 - **A quantized pack's joined projections are whole 64-row tiles** (`At.joinQuant`: zero rows behind the parts, `widths`
   the parts alone): the tensor unit's quantized matmul takes no other output width, and a verify's rows fell to a slow lane.
 - **The q, k and v gates' down projections are a matmul a gate from 16 rows** (`gateDowns`): MLX's batched matmul leaves
@@ -159,7 +158,8 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
   splice, a verified block's commit, batched slots against each slot alone (CPU) or reordered and re-neighboured
   (GPU), and each kernel against its chain.
 - `contract.zig`: `gated`, `state`, `relmask`, `act`, `sum`, `topk`, `gate` (its one-row arm), `relsplit`, `relattn_nax`,
-  `relcomb`, `relslots`, `markov_rnn`, `markov_fold`, `markov_pick`, `oproj`, `router`, `norm`.
+  `relcomb`, `relslots`, `markov_rnn`, `markov_fold`, `markov_pick`, `markov_fold_batch`, `markov_pick_batch`,
+  `markov_pick_sample`, `oproj`, `router`, `norm`.
 - Contract entries owed (GPU proofs in `proof_test.zig` cover each): `pre`, `prep`, `mid`, `ups`, `downs`, `relattn`,
   `gate`'s prompt arm, `group`, `ups_grp`, `downs_grp`, `few_tail`, `relsplit_nax`, `relsplit_lanes`, `commit_conv`,
   `accept_tree`, `sample_tree_draw`/`_mass`/`_search`, `dflash_conv`/`_edges`/`_top16_shard`/`_top16_merge`/`_tree`.

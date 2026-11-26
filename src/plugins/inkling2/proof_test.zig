@@ -1368,7 +1368,7 @@ test "inkling2 kernels: the gate_up launch ranks the router's picks as the top-k
 }
 
 // Bar: the packed kernels take an affine bank at every width a pack may be re-quantized to, read in place.
-// Bar: the pick grouping tiles every pick once, each tile holding at most four picks of one expert, the used tiles first.
+// Bar: the pick grouping tiles every pick once, each tile holding at most BM (4 for <= 128 picks, 8 past that) picks of one expert, the used tiles first.
 test "inkling2 kernels: the pick grouping tiles each pick once, an expert at a time" {
     if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const a = testing.allocator;
@@ -1376,20 +1376,22 @@ test "inkling2 kernels: the pick grouping tiles each pick once, an expert at a t
     var prng = std.Random.DefaultPrng.init(0x6d1);
     const rng = prng.random();
     const experts = 128;
-    for ([_]usize{ 16, 40, 64, 128 }) |n| for ([_]u32{ 1, 3, 9, experts }) |pool| {
+    for ([_]usize{ 16, 40, 64, 128, 160, 256 }) |n| for ([_]u32{ 1, 3, 9, experts }) |pool| {
         var g = ops.Graph.init(a, fx_stream);
         defer g.deinit();
-        var picks: [128]i32 = undefined;
+        var picks: [256]i32 = undefined;
         for (picks[0..n]) |*p| p.* = @intCast(rng.uintLessThan(u32, pool));
         const sel = try g.astype(try g.fromSlice(i32, picks[0..n], &.{@intCast(n)}), .uint32);
+        const bm: usize = @intCast(kernels.groupTileWidth(@intCast(n)));
         const grp = try kernels.groupPicks(&g, sel, experts);
         try ops.evalMany(&grp);
-        const tile_expert = mlx.mlx_array_data_uint32(grp[0]).?[0..n];
-        const tile_picks = mlx.mlx_array_data_uint32(grp[1]).?[0..n];
-        const pick_at = mlx.mlx_array_data_uint32(grp[2]).?[0 .. 4 * n];
-        var seen: [128]bool = @splat(false);
+        const max_tiles: usize = @intCast(ops.shape(grp[0])[0]);
+        const tile_expert = mlx.mlx_array_data_uint32(grp[0]).?[0..max_tiles];
+        const tile_picks = mlx.mlx_array_data_uint32(grp[1]).?[0..max_tiles];
+        const pick_at = mlx.mlx_array_data_uint32(grp[2]).?[0 .. bm * max_tiles];
+        var seen: [256]bool = @splat(false);
         var tiles: usize = 0;
-        for (0..n) |t| {
+        for (0..max_tiles) |t| {
             if (tile_expert[t] == 0xFFFFFFFF) {
                 try testing.expectEqual(@as(u32, 0), tile_picks[t]);
                 continue;
@@ -1397,8 +1399,8 @@ test "inkling2 kernels: the pick grouping tiles each pick once, an expert at a t
             // The used tiles come first.
             try testing.expectEqual(t, tiles);
             tiles += 1;
-            try testing.expect(tile_picks[t] >= 1 and tile_picks[t] <= 4);
-            for (pick_at[4 * t ..][0..tile_picks[t]]) |p| {
+            try testing.expect(tile_picks[t] >= 1 and tile_picks[t] <= bm);
+            for (pick_at[bm * t ..][0..tile_picks[t]]) |p| {
                 try testing.expect(p < n and !seen[p]);
                 seen[p] = true;
                 try testing.expectEqual(tile_expert[t], @as(u32, @intCast(picks[p])));
@@ -1408,7 +1410,7 @@ test "inkling2 kernels: the pick grouping tiles each pick once, an expert at a t
         var count: [experts]usize = @splat(0);
         for (picks[0..n]) |p| count[@intCast(p)] += 1;
         var want: usize = 0;
-        for (count) |c| want += (c + 3) / 4;
+        for (count) |c| want += (c + bm - 1) / bm;
         try testing.expectEqual(want, tiles);
     };
 }
@@ -2001,11 +2003,21 @@ test "inkling2 draft: rounds that carry the context keys and values draft what f
     };
     const one = try g.ones(&.{H}, dt);
     var layer: draft.Layer = .{
-        .in_norm = one, .post_norm = one, .mix_norm = one,
-        .q = try lin.of(&g, a, &seed, 2 * HD, H), .k = try lin.of(&g, a, &seed, HD, H), .v = try lin.of(&g, a, &seed, HD, H), .o = try lin.of(&g, a, &seed, H, 2 * HD),
-        .k_ctx = try lin.of(&g, a, &seed, HD, H), .v_ctx = try lin.of(&g, a, &seed, HD, H),
-        .q_norm = try g.ones(&.{HD}, dt), .k_norm = try g.ones(&.{HD}, dt), .k_norm_ctx = try g.ones(&.{HD}, dt),
-        .gate = try lin.of(&g, a, &seed, 48, H), .up = try lin.of(&g, a, &seed, 48, H), .down = try lin.of(&g, a, &seed, H, 48),
+        .in_norm = one,
+        .post_norm = one,
+        .mix_norm = one,
+        .q = try lin.of(&g, a, &seed, 2 * HD, H),
+        .k = try lin.of(&g, a, &seed, HD, H),
+        .v = try lin.of(&g, a, &seed, HD, H),
+        .o = try lin.of(&g, a, &seed, H, 2 * HD),
+        .k_ctx = try lin.of(&g, a, &seed, HD, H),
+        .v_ctx = try lin.of(&g, a, &seed, HD, H),
+        .q_norm = try g.ones(&.{HD}, dt),
+        .k_norm = try g.ones(&.{HD}, dt),
+        .k_norm_ctx = try g.ones(&.{HD}, dt),
+        .gate = try lin.of(&g, a, &seed, 48, H),
+        .up = try lin.of(&g, a, &seed, 48, H),
+        .down = try lin.of(&g, a, &seed, H, 48),
     };
     var d: draft.Drafter = .{
         .cfg = .{ .layers = 1, .heads = 2, .kv_heads = 1, .head_dim = HD, .intermediate = 48, .window = 13, .block = 4, .rank = R, .tap_count = 2 },
@@ -2066,11 +2078,21 @@ test "inkling2 draft: a layer outside local_layer_ids reads every committed posi
         }
         fn layer(gr: *ops.Graph, al: std.mem.Allocator, sd: *u64, one: ops.Array, ones_hd: ops.Array) !draft.Layer {
             return .{
-                .in_norm = one, .post_norm = one, .mix_norm = one,
-                .q = try lin(gr, al, sd, 2 * HD, H), .k = try lin(gr, al, sd, HD, H), .v = try lin(gr, al, sd, HD, H), .o = try lin(gr, al, sd, H, 2 * HD),
-                .k_ctx = try lin(gr, al, sd, HD, H), .v_ctx = try lin(gr, al, sd, HD, H),
-                .q_norm = ones_hd, .k_norm = ones_hd, .k_norm_ctx = ones_hd,
-                .gate = try lin(gr, al, sd, 48, H), .up = try lin(gr, al, sd, 48, H), .down = try lin(gr, al, sd, H, 48),
+                .in_norm = one,
+                .post_norm = one,
+                .mix_norm = one,
+                .q = try lin(gr, al, sd, 2 * HD, H),
+                .k = try lin(gr, al, sd, HD, H),
+                .v = try lin(gr, al, sd, HD, H),
+                .o = try lin(gr, al, sd, H, 2 * HD),
+                .k_ctx = try lin(gr, al, sd, HD, H),
+                .v_ctx = try lin(gr, al, sd, HD, H),
+                .q_norm = ones_hd,
+                .k_norm = ones_hd,
+                .k_norm_ctx = ones_hd,
+                .gate = try lin(gr, al, sd, 48, H),
+                .up = try lin(gr, al, sd, 48, H),
+                .down = try lin(gr, al, sd, H, 48),
             };
         }
     };
@@ -2730,10 +2752,9 @@ test "inkling2 kernels: sampleAndAcceptTree greedy, filtering, and exact multi-c
     }
 }
 
-// Bar: the bundled head keeps too few drafts a round for a group past two slots to beat plain batched decode; the
-// DFlash2 draft's groups pay to the GPU's width.
-test "inkling2 plugin: a group of the bundled head's slots is two wide, of DFlash2's the GPU's" {
-    try testing.expectEqual(@as(u32, 2), plugin.groupWidth(false, true));
+// Bar: the bundled head's groups run up to 8 slots on NAX (2 elsewhere); DFlash2's run to the GPU's width.
+test "inkling2 plugin: a group of the bundled head's slots is 8 wide on NAX (2 elsewhere), of DFlash2's the GPU's" {
+    try testing.expectEqual(@as(u32, 8), plugin.groupWidth(false, true));
     try testing.expectEqual(@as(u32, 2), plugin.groupWidth(false, false));
     try testing.expectEqual(@as(u32, 16), plugin.groupWidth(true, true));
     try testing.expectEqual(@as(u32, 8), plugin.groupWidth(true, false));
@@ -2808,4 +2829,386 @@ test "inkling2 load: decode steps lift the command-buffer MB split, prompts and 
     } else |_| {}
     try testing.expectEqual(@as(i32, 77), Limits.mb_split);
     try testing.expectEqual(@as(i32, 50), Limits.op_split);
+}
+
+// Bar: `draftBatchPacked` matches serial `draft()` across 4 lanes on GPU (bf16 fused Markov path) with carried
+// `ContextKv` caches and different positions, and produces valid normalized distributions in sampled mode.
+test "inkling2 draft: draftBatchPacked matches serial draft across lanes (greedy and sampled)" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const saved = fx_stream;
+    fx_stream = mlx.gpuStream();
+    defer fx_stream = saved;
+    var g = ops.Graph.init(a, fx_stream);
+    defer g.deinit();
+    const H = 64;
+    const HD = 16;
+    const V = 64;
+    const R = 16;
+    const dt: ops.Dtype = .bfloat16;
+    var seed: u64 = 93000;
+    const W = struct {
+        fn of(gr: *ops.Graph, al: std.mem.Allocator, sd: *u64, shape: []const c_int, scale: f32) !ops.Array {
+            sd.* += 1;
+            return randomRow(gr, al, sd.*, shape, scale, dt);
+        }
+    };
+    const lin = struct {
+        fn of(gr: *ops.Graph, al: std.mem.Allocator, sd: *u64, out: c_int, in: c_int) !layers.Linear {
+            return .{ .w = try W.of(gr, al, sd, &.{ out, in }, 0.15) };
+        }
+    };
+    const one = try g.ones(&.{H}, dt);
+    const one32 = try g.ones(&.{H}, .float32);
+    var layer: draft.Layer = .{
+        .in_norm = one,
+        .post_norm = one,
+        .mix_norm = one32,
+        .q = try lin.of(&g, a, &seed, 2 * HD, H),
+        .k = try lin.of(&g, a, &seed, HD, H),
+        .v = try lin.of(&g, a, &seed, HD, H),
+        .o = try lin.of(&g, a, &seed, H, 2 * HD),
+        .k_ctx = try lin.of(&g, a, &seed, HD, H),
+        .v_ctx = try lin.of(&g, a, &seed, HD, H),
+        .q_norm = try g.ones(&.{HD}, dt),
+        .k_norm = try g.ones(&.{HD}, dt),
+        .k_norm_ctx = try g.ones(&.{HD}, dt),
+        .gate = try lin.of(&g, a, &seed, 96, H),
+        .up = try lin.of(&g, a, &seed, 96, H),
+        .down = try lin.of(&g, a, &seed, H, 96),
+    };
+    layer.qkv = .{ .w = try g.concat(&.{ layer.q.w, layer.k.w, layer.v.w }, 0) };
+    layer.kv_ctx = .{ .w = try g.concat(&.{ layer.k_ctx.w, layer.v_ctx.w }, 0) };
+    layer.gate_up = .{ .w = try g.concat(&.{ layer.gate.w, layer.up.w }, 0) };
+    var d: draft.Drafter = .{
+        .cfg = .{ .layers = 1, .heads = 2, .kv_heads = 1, .head_dim = HD, .intermediate = 96, .window = 16, .block = 5, .rank = R, .tap_count = 2 },
+        .hidden = H,
+        .s = fx_stream,
+    };
+    d.layers = (&layer)[0..1];
+    d.norm = one;
+    d.mask = try W.of(&g, a, &seed, &.{ 1, 1, H }, 0.8);
+    d.alpha = try g.softmax(try randomRow(&g, a, seed + 1, &.{ 2, 2, 1 }, 1.0, .float32), 1, true);
+    d.prev_rows = try W.of(&g, a, &seed, &.{ V, R }, 0.4);
+    d.rnn = .{ .w = try W.of(&g, a, &seed, &.{ 3 * R, 2 * R + 2 * H }, 0.08) };
+    d.rnn_bias = try W.of(&g, a, &seed, &.{3 * R}, 0.08);
+    d.rnn_norm = one32;
+    d.fold = try W.of(&g, a, &seed, &.{ R, V }, 0.25);
+    d.fold_bias = try W.of(&g, a, &seed, &.{ 1, 1, V }, 0.25);
+    const head = try lin.of(&g, a, &seed, V, H);
+
+    const B = 4;
+    var anchors: [B]ops.Array = undefined;
+    var t1s: [B]ops.Array = undefined;
+    var fulls: [B]ops.Array = undefined;
+    var batch_ctxs: [B]draft.ContextKv = @splat(.{});
+    var solo_ctxs: [B]draft.ContextKv = @splat(.{});
+    defer for (&batch_ctxs, &solo_ctxs) |*bc, *sc| {
+        bc.release();
+        sc.release();
+    };
+    for (0..B) |j| {
+        anchors[j] = try W.of(&g, a, &seed, &.{ 1, 1, H }, 1.0);
+        t1s[j] = try g.fromSlice(i32, &.{@intCast(3 + j * 5)}, &.{1});
+        fulls[j] = try W.of(&g, a, &seed, &.{ 1, 24, 2 * H }, 1.0);
+    }
+    const spans = [_][2]c_int{ .{ 0, 6 }, .{ 0, 10 }, .{ 4, 16 } };
+    for (spans) |sp| {
+        var lanes: [B]draft.Drafter.DraftLane = undefined;
+        for (0..B) |j| {
+            const hi = sp[1] + @as(c_int, @intCast(j));
+            const lo = @max(0, hi - 15);
+            lanes[j] = .{
+                .t1 = t1s[j],
+                .anchor = anchors[j],
+                .taps = try g.sliceAxis(fulls[j], 1, lo, hi),
+                .position = hi,
+                .cache = &batch_ctxs[j],
+                .steps = 4,
+            };
+        }
+        const got = try d.draftBatchPacked(&g, &lanes, &head, V - 4, 30, null);
+        try ops.evalMany(&.{ got.tokens, got.confidence });
+        const got_t = mlx.mlx_array_data_int32(got.tokens).?;
+        const got_c = mlx.mlx_array_data_float32(got.confidence).?;
+        for (0..B) |j| {
+            const want = try d.draft(&g, lanes[j].t1, lanes[j].anchor, lanes[j].taps, lanes[j].position, &head, V - 4, 30, &solo_ctxs[j], null);
+            try ops.evalMany(&.{ want.tokens, want.confidence });
+            const wt = mlx.mlx_array_data_int32(want.tokens).?;
+            const wc = mlx.mlx_array_data_float32(want.confidence).?;
+            for (0..4) |k| {
+                try testing.expectEqual(wt[k], got_t[j * 4 + k]);
+                try testing.expectApproxEqAbs(wc[k], got_c[j * 4 + k], 5e-2);
+            }
+        }
+    }
+    // Sampled path: probabilities normalize to 1 and each drawn token has positive probability.
+    var slanes: [B]draft.Drafter.DraftLane = undefined;
+    for (0..B) |j| slanes[j] = .{ .t1 = t1s[j], .anchor = anchors[j], .taps = try g.sliceAxis(fulls[j], 1, 0, 12), .position = 12, .cache = &batch_ctxs[j], .steps = 3 };
+    var blocks: [B]draft.Drafter.Block = undefined;
+    try d.draftBatch(&g, &slanes, &head, V - 4, 30, .{ .temperatures = &.{ 0.8, 1.0, 0.7, 1.2 }, .seed = 99 }, &blocks);
+    const vocab: usize = V - 4;
+    for (blocks) |blk| {
+        try ops.evalMany(&.{ blk.tokens, blk.probs });
+        const toks = mlx.mlx_array_data_int32(blk.tokens).?[0..3];
+        const law = mlx.mlx_array_data_float32(blk.probs).?;
+        for (0..3) |r| {
+            var sum: f32 = 0;
+            for (law[r * vocab ..][0..vocab]) |x| sum += x;
+            try testing.expectApproxEqAbs(@as(f32, 1.0), sum, 1e-3);
+            try testing.expect(law[r * vocab + @as(usize, @intCast(toks[r]))] > 0);
+        }
+    }
+    // GPU-fused sparse top-K sampled path: normalized proposal probs, drawn token matches candidate, mixed greedy+sampled.
+    if (kernels.markovRuns(&g, d.rnn.w, d.fold, R)) {
+        const s_params = [B]kernels.SampleLane{
+            .{ .temperature = 0.0 },
+            .{ .temperature = 1.0, .top_p = 0.95 },
+            .{ .temperature = 0.8, .top_k = 8 },
+            .{ .temperature = 1.2, .min_p = 0.05 },
+        };
+        const sb = try d.draftBatchSampled(&g, &slanes, &s_params, &.{ 11, 22, 33, 44 }, &head, V - 4, 30);
+        try ops.evalMany(&.{ sb.tokens, sb.cands, sb.probs, sb.draws });
+        const stoks = mlx.mlx_array_data_int32(sb.tokens).?;
+        const scands = mlx.mlx_array_data_int32(sb.cands).?;
+        const sprobs = mlx.mlx_array_data_float32(sb.probs).?;
+        const sdraws = mlx.mlx_array_data_uint8(sb.draws).?;
+        const K: usize = @intCast(sb.k);
+        for (0..B) |j| for (0..3) |r| {
+            const di = sdraws[j * 3 + r];
+            try testing.expect(di < K);
+            const row_c = scands[(j * 3 + r) * K ..][0..K];
+            const row_p = sprobs[(j * 3 + r) * K ..][0..K];
+            try testing.expectEqual(row_c[di], stoks[j * 3 + r]);
+            var sum: f32 = 0;
+            for (row_p) |p| sum += p;
+            try testing.expectApproxEqAbs(@as(f32, 1.0), sum, 1e-4);
+            try testing.expect(row_p[di] > 0);
+        };
+        // Dense common-token block: 4 peaks inside the first 16 tokens must all appear in top-K for both NB=2 and NB=8.
+        for ([_]c_int{ 2, 6 }) |nb_test| {
+            const tv: c_int = 128;
+            const p0 = try g.zeros(&.{ nb_test, 3 * R }, .float32);
+            const fold0 = try g.zeros(&.{ R, tv }, .bfloat16);
+            const fb0 = try g.zeros(&.{ 1, 1, tv }, .bfloat16);
+            const base_buf = try a.alloc(f32, @intCast(nb_test * tv));
+            defer a.free(base_buf);
+            @memset(base_buf, -5.0);
+            for (0..@intCast(nb_test)) |b_i| {
+                base_buf[b_i * @as(usize, @intCast(tv)) + 3] = 9.0;
+                base_buf[b_i * @as(usize, @intCast(tv)) + 7] = 8.5;
+                base_buf[b_i * @as(usize, @intCast(tv)) + 11] = 8.0;
+                base_buf[b_i * @as(usize, @intCast(tv)) + 15] = 7.5;
+            }
+            const base0 = try g.fromSlice(f32, base_buf, &.{ nb_test, 1, tv });
+            const step0 = try g.fromSlice(i32, &.{0}, &.{1});
+            const cap0 = try g.fromSlice(f32, &.{30.0}, &.{1});
+            const part = try kernels.markovFoldBatchSg(&g, p0, fold0, fb0, base0, step0, tv, cap0);
+            var lp6: [6 * 4]f32 = undefined;
+            for (0..6) |bi| {
+                lp6[bi * 4 + 0] = 1.0;
+                lp6[bi * 4 + 1] = 0.0;
+                lp6[bi * 4 + 2] = 0.95;
+                lp6[bi * 4 + 3] = 0.0;
+            }
+            const lparams_arr = try g.fromSlice(f32, lp6[0..@intCast(nb_test * 4)], &.{ nb_test, 4 });
+            const seeds_arr = try g.zeros(&.{ nb_test, 2 }, .uint32);
+            const st0 = try g.zeros(&.{ nb_test, 1, R }, .bfloat16);
+            const picked = try kernels.markovPickSample(&g, part[0], part[1], p0, st0, cap0, lparams_arr, seeds_arr, step0, kernels.markov_sample_k);
+            try ops.eval(picked.cands);
+            const cdata = mlx.mlx_array_data_int32(picked.cands).?;
+            for (0..@intCast(nb_test)) |b_i| {
+                const lane_c = cdata[b_i * K ..][0..4];
+                try testing.expectEqual(@as(i32, 3), lane_c[0]);
+                try testing.expectEqual(@as(i32, 7), lane_c[1]);
+                try testing.expectEqual(@as(i32, 11), lane_c[2]);
+                try testing.expectEqual(@as(i32, 15), lane_c[3]);
+            }
+        }
+    }
+}
+
+// Bar: `step_group` on the bundled drafter (`stepGroupBundled`) generates the exact same greedy tokens as plain
+// serial decode across 4 concurrent slots on the real Inkling-2-Mini pack.
+test "inkling2 draft: stepGroupBundled matches plain decode on the release pack" {
+    const env = @import("../../env.zig");
+    const pack_dir = std.mem.span(env.get(.INKLING2_RELEASE) orelse return error.SkipZigTest);
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var rel = try Release.open(a, pack_dir);
+    defer rel.close();
+    if (rel.m.drafter == null or rel.m.drafter2 != null) return error.SkipZigTest;
+    const nd = plugin.table.spec.?.native_drafter.?;
+    const step_group = nd.step_group.?;
+    const n_layers = rel.parsed.shell.num_hidden_layers;
+
+    const B = 4;
+    const gen_n = 16;
+    const prompts = [B][]const u32{
+        quokka_def[0..24],
+        quokka_def[0..28],
+        quokka_def[0..32],
+        quokka_def[0..36],
+    };
+
+    var want_toks: [B][gen_n]u32 = undefined;
+    var step_logits: [B][gen_n][]f32 = undefined;
+    var first_toks: [B]u32 = undefined;
+    for (0..B) |i| {
+        var c = try test_cache.TestCache.init(std.heap.c_allocator, n_layers);
+        defer c.deinit();
+        var h = [_]abi.Handle{c.handle()};
+        var out: abi.ForwardOut = .{};
+        try testing.expect(plugin.table.forward(rel.m, &.{ .mode = .prefill, .logits = .last_row, .rows = @intCast(prompts[i].len), .tokens = .of(prompts[i]), .slots = .of(&[_]u32{@intCast(100 + i)}), .positions = .of(&[_]u32{0}), .caches = .of(&h), .cache_ops = &test_cache.ops }, &out).isOk());
+        step_logits[i][0] = try conformance.consumeF32(a, out.logits);
+        first_toks[i] = argmaxOf(step_logits[i][0]);
+        var tok = first_toks[i];
+        var pos: u32 = @intCast(prompts[i].len);
+        for (0..gen_n) |t| {
+            want_toks[i][t] = tok;
+            if (t + 1 < gen_n) {
+                var o2: abi.ForwardOut = .{};
+                try testing.expect(plugin.table.forward(rel.m, &.{ .mode = .decode, .logits = .last_row, .rows = 1, .tokens = .of(&[_]u32{tok}), .slots = .of(&[_]u32{@intCast(100 + i)}), .positions = .of(&[_]u32{pos}), .caches = .of(&h), .cache_ops = &test_cache.ops }, &o2).isOk());
+                step_logits[i][t + 1] = try conformance.consumeF32(a, o2.logits);
+                tok = argmaxOf(step_logits[i][t + 1]);
+                pos += 1;
+            }
+        }
+    }
+
+    var caches: [B]test_cache.TestCache = undefined;
+    var cur_pos: [B]u32 = undefined;
+    for (0..B) |i| {
+        caches[i] = try test_cache.TestCache.init(std.heap.c_allocator, n_layers);
+        cur_pos[i] = @intCast(prompts[i].len);
+        var h = [_]abi.Handle{caches[i].handle()};
+        var out: abi.ForwardOut = .{};
+        try testing.expect(plugin.table.forward(rel.m, &.{ .mode = .prefill, .logits = .last_row, .rows = @intCast(prompts[i].len), .tokens = .of(prompts[i]), .slots = .of(&[_]u32{@intCast(200 + i)}), .positions = .of(&[_]u32{0}), .caches = .of(&h), .cache_ops = &test_cache.ops }, &out).isOk());
+        try ops.eval(.{ .ctx = out.logits.ctx });
+        _ = mlx.mlx_array_free(.{ .ctx = out.logits.ctx });
+    }
+    defer for (&caches) |*c| c.deinit();
+
+    var cur_tok: [B]u32 = first_toks;
+    var got_n: [B]usize = @splat(0);
+    var got_toks: [B][gen_n]u32 = undefined;
+    var rounds_run: usize = 0;
+    while (rounds_run < gen_n) : (rounds_run += 1) {
+        var active: [B]usize = undefined;
+        var n_act: usize = 0;
+        for (0..B) |i| if (got_n[i] < gen_n) {
+            active[n_act] = i;
+            n_act += 1;
+        };
+        if (n_act < 2) break;
+        var fs: [B]abi.Forward = undefined;
+        var outs: [B]abi.ForwardOut = @splat(.{});
+        var h_arr: [B]abi.Handle = undefined;
+        var s_arr: [B]u32 = undefined;
+        var p_arr: [B]u32 = undefined;
+        var t_arr: [B]u32 = undefined;
+        var all_cap = true;
+        for (0..n_act) |k| {
+            const i = active[k];
+            h_arr[k] = caches[i].handle();
+            s_arr[k] = @intCast(200 + i);
+            p_arr[k] = cur_pos[i];
+            t_arr[k] = cur_tok[i];
+            const rem: u32 = @intCast(gen_n - got_n[i]);
+            if (rem <= 1) all_cap = false;
+            fs[k] = .{
+                .mode = .verify,
+                .logits = .all_rows,
+                .rows = 1,
+                .tokens = .of(t_arr[k .. k + 1]),
+                .slots = .of(s_arr[k .. k + 1]),
+                .positions = .of(p_arr[k .. k + 1]),
+                .caches = .of(h_arr[k .. k + 1]),
+                .cache_ops = &test_cache.ops,
+                .accept_cap = rem -| 1,
+            };
+        }
+        if (!all_cap) break;
+        const v = step_group(rel.m, &fs, &outs, @intCast(n_act));
+        try testing.expect(v.isOk());
+        for (0..n_act) |k| {
+            const i = active[k];
+            const rd = outs[k].round;
+            try testing.expect(rd.n >= 1);
+            for (0..rd.n) |j| {
+                if (got_n[i] < gen_n) {
+                    got_toks[i][got_n[i]] = rd.tokens[j];
+                    got_n[i] += 1;
+                }
+            }
+            cur_tok[i] = rd.next_token;
+            cur_pos[i] = @intCast(rd.position);
+        }
+    }
+    for (0..B) |i| {
+        try testing.expect(got_n[i] >= 8);
+        var same: usize = 0;
+        while (same < got_n[i] and want_toks[i][same] == got_toks[i][same]) same += 1;
+        if (same < got_n[i]) {
+            try testing.expect(same >= 1);
+            const lg = step_logits[i][same];
+            const gap = lg[want_toks[i][same]] - lg[got_toks[i][same]];
+            try testing.expect(gap <= 0.01 * @abs(lg[want_toks[i][same]]));
+        }
+    }
+    // Sampled + mixed greedy/sampled bundled group: runs cleanly, accepts drafts, and respects valid vocab ids.
+    for (0..B) |i| {
+        caches[i].deinit();
+        caches[i] = try test_cache.TestCache.init(std.heap.c_allocator, n_layers);
+        cur_pos[i] = @intCast(prompts[i].len);
+        var h = [_]abi.Handle{caches[i].handle()};
+        var out: abi.ForwardOut = .{};
+        try testing.expect(plugin.table.forward(rel.m, &.{ .mode = .prefill, .logits = .last_row, .rows = @intCast(prompts[i].len), .tokens = .of(prompts[i]), .slots = .of(&[_]u32{@intCast(300 + i)}), .positions = .of(&[_]u32{0}), .caches = .of(&h), .cache_ops = &test_cache.ops }, &out).isOk());
+        try ops.eval(.{ .ctx = out.logits.ctx });
+        _ = mlx.mlx_array_free(.{ .ctx = out.logits.ctx });
+    }
+    var scur_tok: [B]u32 = first_toks;
+    var s_accepted: usize = 0;
+    const vocab_size: u32 = rel.parsed.shell.vocab_size;
+    for (0..4) |rd_i| {
+        var fs: [B]abi.Forward = undefined;
+        var outs: [B]abi.ForwardOut = @splat(.{});
+        var h_arr: [B]abi.Handle = undefined;
+        var s_arr: [B]u32 = undefined;
+        var p_arr: [B]u32 = undefined;
+        var t_arr: [B]u32 = undefined;
+        for (0..B) |i| {
+            h_arr[i] = caches[i].handle();
+            s_arr[i] = @intCast(300 + i);
+            p_arr[i] = cur_pos[i];
+            t_arr[i] = scur_tok[i];
+            fs[i] = .{
+                .mode = .verify,
+                .logits = .all_rows,
+                .rows = 1,
+                .tokens = .of(t_arr[i .. i + 1]),
+                .slots = .of(s_arr[i .. i + 1]),
+                .positions = .of(p_arr[i .. i + 1]),
+                .caches = .of(h_arr[i .. i + 1]),
+                .cache_ops = &test_cache.ops,
+                .accept_cap = 7,
+                .draft_temperature = if (i == 0) 0.0 else 1.0,
+                .draft_seed = 0x12345678 +% @as(u64, @intCast(rd_i * 17 + i)),
+                .top_p = 0.95,
+            };
+        }
+        try testing.expect(step_group(rel.m, &fs, &outs, B).isOk());
+        for (0..B) |i| {
+            const rd = outs[i].round;
+            try testing.expect(rd.n >= 1);
+            try testing.expect(rd.next_token < vocab_size);
+            for (0..rd.n) |j| try testing.expect(rd.tokens[j] < vocab_size);
+            s_accepted += rd.accepted;
+            scur_tok[i] = rd.next_token;
+            cur_pos[i] = @intCast(rd.position);
+        }
+    }
+    try testing.expect(s_accepted >= 4);
 }

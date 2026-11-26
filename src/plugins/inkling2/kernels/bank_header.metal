@@ -27,18 +27,42 @@ inline float msv_ink2_chunk(int fmt, const device uint* row, const device uchar*
 // and `brow` hold its group scales and biases (S).
 template <typename S, int BITS, int GS>
 inline float msv_ink2_affine_chunk(const device uchar* row, const device S* srow, const device S* brow, uint c, thread const float* x) {
-  const device ushort* p = (const device ushort*)(row + c * 2 * BITS);
-  ulong lo = 0, hi = 0;
-  for (int i = 0; i < BITS; ++i) {
-    const ulong v = ulong(p[i]);
-    if (16 * i < 64) lo |= v << (16 * i); else hi |= v << (16 * i - 64);
-  }
   float qx = 0.0f, sx = 0.0f;
-  for (int i = 0; i < 16; ++i) {
-    const int off = i * BITS;
-    const ulong w = off + BITS <= 64 ? lo >> off : (off >= 64 ? hi >> (off - 64) : ((lo >> off) | (hi << (64 - off))));
-    qx += float(w & ((1ul << BITS) - 1ul)) * x[i];
-    sx += x[i];
+  if constexpr (BITS == 8) {
+    const uint4 q = *(const device uint4*)(row + c * 16u);
+    const uint words[4] = {q.x, q.y, q.z, q.w};
+    for (int j = 0; j < 4; ++j) {
+      const uint w = words[j];
+      const int b = j * 4;
+      qx += float(w & 0xffu) * x[b] + float((w >> 8) & 0xffu) * x[b + 1]
+          + float((w >> 16) & 0xffu) * x[b + 2] + float(w >> 24) * x[b + 3];
+      sx += x[b] + x[b + 1] + x[b + 2] + x[b + 3];
+    }
+  } else if constexpr (BITS == 4) {
+    const uint2 q = *(const device uint2*)(row + c * 8u);
+    const uint words[2] = {q.x, q.y};
+    for (int j = 0; j < 2; ++j) {
+      uint w = words[j];
+      const int b = j * 8;
+      for (int i = 0; i < 8; ++i) {
+        qx += float(w & 0xfu) * x[b + i];
+        sx += x[b + i];
+        w >>= 4;
+      }
+    }
+  } else {
+    const device ushort* p = (const device ushort*)(row + c * 2 * BITS);
+    ulong lo = 0, hi = 0;
+    for (int i = 0; i < BITS; ++i) {
+      const ulong v = ulong(p[i]);
+      if (16 * i < 64) lo |= v << (16 * i); else hi |= v << (16 * i - 64);
+    }
+    for (int i = 0; i < 16; ++i) {
+      const int off = i * BITS;
+      const ulong w = off + BITS <= 64 ? lo >> off : (off >= 64 ? hi >> (off - 64) : ((lo >> off) | (hi << (64 - off))));
+      qx += float(w & ((1ul << BITS) - 1ul)) * x[i];
+      sx += x[i];
+    }
   }
   const uint g = (c * 16) / GS;
   return float(srow[g]) * qx + float(brow[g]) * sx;
@@ -87,22 +111,36 @@ template <typename S, int BITS, int GS>
 inline void msv_ink2_decode16_affine_v4(const device uchar* row, const device S* srow, const device S* brow, uint c,
                                         thread half4& w0, thread half4& w1, thread half4& w2, thread half4& w3,
                                         thread float& scale, thread float& bias) {
-  const device ushort* p = (const device ushort*)(row + c * 2 * BITS);
-  ulong lo = 0, hi = 0;
-  for (int i = 0; i < BITS; ++i) {
-    const ulong v = ulong(p[i]);
-    if (16 * i < 64) lo |= v << (16 * i); else hi |= v << (16 * i - 64);
+  if constexpr (BITS == 8) {
+    const uint4 q = *(const device uint4*)(row + c * 16u);
+    w0 = half4(half(q.x & 0xffu), half((q.x >> 8) & 0xffu), half((q.x >> 16) & 0xffu), half(q.x >> 24));
+    w1 = half4(half(q.y & 0xffu), half((q.y >> 8) & 0xffu), half((q.y >> 16) & 0xffu), half(q.y >> 24));
+    w2 = half4(half(q.z & 0xffu), half((q.z >> 8) & 0xffu), half((q.z >> 16) & 0xffu), half(q.z >> 24));
+    w3 = half4(half(q.w & 0xffu), half((q.w >> 8) & 0xffu), half((q.w >> 16) & 0xffu), half(q.w >> 24));
+  } else if constexpr (BITS == 4) {
+    const uint2 q = *(const device uint2*)(row + c * 8u);
+    w0 = half4(half(q.x & 0xfu), half((q.x >> 4) & 0xfu), half((q.x >> 8) & 0xfu), half((q.x >> 12) & 0xfu));
+    w1 = half4(half((q.x >> 16) & 0xfu), half((q.x >> 20) & 0xfu), half((q.x >> 24) & 0xfu), half(q.x >> 28));
+    w2 = half4(half(q.y & 0xfu), half((q.y >> 4) & 0xfu), half((q.y >> 8) & 0xfu), half((q.y >> 12) & 0xfu));
+    w3 = half4(half((q.y >> 16) & 0xfu), half((q.y >> 20) & 0xfu), half((q.y >> 24) & 0xfu), half(q.y >> 28));
+  } else {
+    const device ushort* p = (const device ushort*)(row + c * 2 * BITS);
+    ulong lo = 0, hi = 0;
+    for (int i = 0; i < BITS; ++i) {
+      const ulong v = ulong(p[i]);
+      if (16 * i < 64) lo |= v << (16 * i); else hi |= v << (16 * i - 64);
+    }
+    const ulong mask = (1ul << BITS) - 1ul;
+    auto grab = [&](int i) -> half {
+      const int off = i * BITS;
+      const ulong q = off + BITS <= 64 ? lo >> off : (off >= 64 ? hi >> (off - 64) : ((lo >> off) | (hi << (64 - off))));
+      return half(uint(q & mask));
+    };
+    w0 = half4(grab(0), grab(1), grab(2), grab(3));
+    w1 = half4(grab(4), grab(5), grab(6), grab(7));
+    w2 = half4(grab(8), grab(9), grab(10), grab(11));
+    w3 = half4(grab(12), grab(13), grab(14), grab(15));
   }
-  const ulong mask = (1ul << BITS) - 1ul;
-  auto grab = [&](int i) -> half {
-    const int off = i * BITS;
-    const ulong q = off + BITS <= 64 ? lo >> off : (off >= 64 ? hi >> (off - 64) : ((lo >> off) | (hi << (64 - off))));
-    return half(uint(q & mask));
-  };
-  w0 = half4(grab(0), grab(1), grab(2), grab(3));
-  w1 = half4(grab(4), grab(5), grab(6), grab(7));
-  w2 = half4(grab(8), grab(9), grab(10), grab(11));
-  w3 = half4(grab(12), grab(13), grab(14), grab(15));
   const uint g = (c * 16) / GS;
   scale = float(srow[g]);
   bias = float(brow[g]);
