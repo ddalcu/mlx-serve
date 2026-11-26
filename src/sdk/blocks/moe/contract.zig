@@ -3208,7 +3208,7 @@ fn registerFp4(set: *kc.Set) !void {
 // ── tests ──
 
 test "kernel contract moe: each declared launch is the shipped wrapper's, byte for byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     gq.gqmv_gateup_override = true;
     defer gq.gqmv_gateup_override = null;

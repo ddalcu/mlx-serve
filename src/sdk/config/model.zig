@@ -801,6 +801,7 @@ pub const ModelConfig = struct {
     /// freezing at `index_topk`. A checkpoint declaring no ratios stays dense —
     /// an arch we cannot bound must never be billed as though we had.
     pub fn prefillAttnKeys(self: *const ModelConfig, seq: u64) u64 {
+        if (self.plugin) |b| if (b.billTerms().prefill_attn_keys) |f| return f(&b.parsed, seq);
         if (self.isDsv41()) return @min(seq, @as(u64, self.sliding_window) + self.dsv4_index_topk + 1);
         if (!std.mem.eql(u8, self.model_type, "deepseek_v4")) return seq;
         const n = @min(self.dsv4_n_compress_ratios, self.dsv4_compress_ratios.len);
@@ -1076,6 +1077,10 @@ pub const ModelConfig = struct {
     /// memory estimate that sizes a KV cache reads this one helper so the
     /// auto-context sizer and the prefill admission guard cannot disagree.
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
+        if (self.plugin) |b| {
+            const kv = b.billTerms().kv_per_token;
+            if (kv > 0) return kv;
+        }
         // DeepSeek-V4.1 grows only its KV sources' compressed latents and index
         // keys (bf16); the window is a fixed ring per slot.
         if (self.isDsv41()) {

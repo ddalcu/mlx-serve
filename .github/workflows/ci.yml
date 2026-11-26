@@ -7,6 +7,13 @@ name: CI
 # This is also the macOS 26.2 compatibility gate: dev machines may run newer
 # macOS betas, but the shipped binaries must keep building and testing against
 # the 26.x SDK the runner provides (build.zig targets os_version_min 26.2).
+#
+# A PR runs only the jobs its files reach (`changes`, scripts/ci-changes.sh; a
+# skipped job counts as passing; if `changes` itself fails every job runs).
+# push to main and workflow_dispatch run all of
+# them. The Zig and SwiftPM caches are saved from main only: a PR restores them
+# and never writes its own 250-550 MB copy, which no other PR can read and which
+# pushed the repo over the 10 GB cap (evicting the Linux and Windows MLX stages).
 
 on:
   push:
@@ -19,11 +26,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      zig: ${{ steps.scope.outputs.zig }}
+      swift: ${{ steps.scope.outputs.swift }}
+      slow: ${{ steps.scope.outputs.slow }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # The PR's own files: a pull_request checkout is the merge commit, whose first
+      # parent is the base it was merged onto. Anything else runs everything.
+      - name: Which jobs does this change need
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != "pull_request" ] || ! git rev-parse --verify -q HEAD^2 > /dev/null; then
+            printf 'zig=true\nswift=true\nslow=true\n' | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --name-only HEAD^1 HEAD | tee /dev/stderr | bash scripts/ci-changes.sh | tee -a "$GITHUB_OUTPUT"
+
+      - name: Scope rules still cover what the Swift tests read
+        run: bash tests/test_ci_changes.sh
+
   # The Zig graph and the Swift app share nothing on disk (app/ never reads
   # zig-out), so they run as two jobs on two runners instead of one after the
   # other (#639). The Zig build and `zig build test` share no output either, so
   # they are two jobs too.
   zig:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.zig == 'true') }}
     runs-on: macos-26
     timeout-minutes: 60
     steps:
@@ -35,19 +72,26 @@ jobs:
         id: stage
         uses: ./.github/actions/zig-stage
 
-      # Bounded: the key is written once per toolchain/build/submodule set, so
-      # later runs restore it and never re-save a growing cache. Xcode is in the
-      # key because zig caches configure-time SDK paths. One key per job, or the
-      # two jobs race to save one.
-      - name: Cache Zig build artifacts
-        uses: actions/cache@v4
+      # Bounded: one entry per job per ISO week and toolchain/build/submodule set,
+      # saved by main's first good build of the week, no restore-keys fallback: a
+      # zig cache only grows, so the week is the restart. Xcode is in the key
+      # because zig caches configure-time SDK paths. One key per job, or the two
+      # jobs race to save one.
+      - name: Zig cache key
+        id: zigkey
+        run: echo "key=zig-cache-build-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.stage.outputs.submodules }}-${{ steps.stage.outputs.xcode }}-$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Zig build artifacts
+        id: zigcache
+        uses: actions/cache/restore@v4
         with:
           path: |
             .zig-cache
             ~/.cache/zig
-          key: zig-cache-build-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.stage.outputs.submodules }}-${{ steps.stage.outputs.xcode }}
+          key: ${{ steps.zigkey.outputs.key }}
 
       - name: Build mlx-serve (Zig, ReleaseFast)
+        id: build
         run: zig build -Doptimize=ReleaseFast -Dstrip
 
       - name: Build vz-agent guest binary
@@ -68,48 +112,59 @@ jobs:
       - name: Plugin kit end to end
         run: bash tests/test_plugin_kit.sh
 
+      - name: Save Zig build artifacts
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && github.ref == 'refs/heads/main' && steps.zigcache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: ${{ steps.zigkey.outputs.key }}
+
   zig-test:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.zig == 'true') }}
     runs-on: macos-26
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
-          # Needed to diff against origin/${{ github.base_ref }} below.
-          fetch-depth: 0
 
       - name: Zig + mlx stage
         id: stage
         uses: ./.github/actions/zig-stage
 
-      - name: Cache Zig build artifacts
-        uses: actions/cache@v4
+      - name: Zig cache key
+        id: zigkey
+        run: echo "key=zig-cache-test-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.stage.outputs.submodules }}-${{ steps.stage.outputs.xcode }}-$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Zig build artifacts
+        id: zigcache
+        uses: actions/cache/restore@v4
         with:
           path: |
             .zig-cache
             ~/.cache/zig
-          key: zig-cache-test-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.stage.outputs.submodules }}-${{ steps.stage.outputs.xcode }}
+          key: ${{ steps.zigkey.outputs.key }}
 
       # PRs skip the slow corpus replay and benchmarks unless the diff touches
-      # the tool-calling parse chain or its fixture, since that replay is the
-      # only guard for the "hard invariants (replay-pinned)" in CLAUDE.md.
+      # the tool-calling parse chain or its fixture (`changes`), since that replay
+      # is the only guard for the "hard invariants (replay-pinned)" in CLAUDE.md.
       # Pushes to main always run them.
-      - name: Check whether this diff needs the slow tool-traffic replay
-        id: slowtests
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            echo "needed=1" >> "$GITHUB_OUTPUT"
-          elif git diff --name-only "origin/${{ github.base_ref }}..." \
-              | grep -qE '^src/host/chat/|^src/fixtures/tool_traffic\.jsonl$'; then
-            echo "needed=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "needed=0" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Run Zig tests
         # 4 shards: the default sizes them by RAM. Not every GPU test skips on this virtual GPU, and at 8 they ran it
         # out of memory (a different kernel test exited 255 on each run).
-        run: zig build test --summary all -Dtest-shards=4 ${{ steps.slowtests.outputs.needed == '1' && '-Dslow-tests' || '' }}
+        run: zig build test --summary all -Dtest-shards=4 ${{ (needs.changes.result != 'success' || needs.changes.outputs.slow == 'true') && '-Dslow-tests' || '' }}
+
+      - name: Save Zig build artifacts
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.zigcache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: ${{ steps.zigkey.outputs.key }}
 
       # The flip proof: a PR that flips a lever's default lists the tests that hold only at the new default
       # (scripts/flip_proof.py). GPU tests skip on this runner; the box job runs them for the lever being flipped.
@@ -118,6 +173,8 @@ jobs:
         run: python3 scripts/flip_proof.py ci "origin/${{ github.base_ref }}" -Dtest-shards=4 -Dtest-filter=deepseek -Dtest-filter=dsv4
 
   swift-app:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.swift == 'true') }}
     runs-on: macos-26
     timeout-minutes: 45
     steps:
@@ -135,16 +192,22 @@ jobs:
       # Dependencies (NIO, MCP, SwiftTerm, SwaTex) are most of a cold Swift
       # build and only change with Package.resolved. Our own sources get fresh
       # mtimes from checkout, so MLXCore always recompiles.
-      - name: Cache SwiftPM build
-        uses: actions/cache@v4
+      - name: SwiftPM cache key
+        id: swiftkey
+        run: echo "key=swiftpm-ci-${{ hashFiles('app/Package.resolved', 'scripts/patch-swatex-font-lookup.sh') }}-${{ steps.xcode.outputs.xcode }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore SwiftPM build
+        id: swiftpm
+        uses: actions/cache/restore@v4
         with:
           path: app/.build
-          key: swiftpm-ci-${{ hashFiles('app/Package.resolved', 'scripts/patch-swatex-font-lookup.sh') }}-${{ steps.xcode.outputs.xcode }}
+          key: ${{ steps.swiftkey.outputs.key }}
 
       # Do not force one Swift language mode through the dependency graph.
       # Each package's manifest owns its mode (SwaTex requires Swift 6.1).
       # Debug build only; the release build is release.yml's.
-      - name: Build and test Swift app
+      - name: Build Swift app and tests
+        id: compile
         working-directory: app
         run: |
           # Catch a drifted SwaTex font-lookup patch here rather than at release
@@ -152,4 +215,15 @@ jobs:
           swift package resolve
           bash ../scripts/patch-swatex-font-lookup.sh .build/checkouts/SwaTex
           swift build --build-tests
-          bash test.sh
+
+      - name: Test Swift app
+        working-directory: app
+        run: bash test.sh --skip-build
+
+      - name: Save SwiftPM build
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' && github.ref == 'refs/heads/main' && steps.swiftpm.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: app/.build
+          key: ${{ steps.swiftkey.outputs.key }}
+

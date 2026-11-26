@@ -1685,3 +1685,45 @@ test "glm io: with direct reads every range lands straight in its rows (aligned 
     try testing.expectEqual(@as(i64, 2 * n), pool.counter(.direct_ranges));
     try testing.expectEqual(@as(i64, 2), pool.result(first + 1).preadv_calls);
 }
+
+fn specSettledAt(base: i64) bool {
+    var slots: [max_spec]SpecSlot = undefined;
+    for (specSlots(&slots)) |s| if (s.base == base and (s.state == 3 or s.state == 4)) return true;
+    return false;
+}
+
+test "dsv41 io: unaligned speculative record exceeding slot_bytes is never marked SP_LANDED truncated" {
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(8 * page);
+    defer f.deinit();
+    var counters: [io.counters_n]i64 = @splat(0);
+    const spec_buf = try std.heap.page_allocator.alloc(u8, page);
+    defer std.heap.page_allocator.free(spec_buf);
+    const stage_buf = try std.heap.page_allocator.alloc(u8, page);
+    defer std.heap.page_allocator.free(stage_buf);
+    const spec_ptrs = [1]u64{@intFromPtr(spec_buf.ptr)};
+    const stage_ptrs = [1]u64{@intFromPtr(stage_buf.ptr)};
+    var res_arr: [16 * res_w]i64 = @splat(0);
+    var log_arr: [16]i64 = @splat(0);
+    var gauge: [6]i64 = @splat(0);
+
+    try testing.expectEqual(@as(c_int, 0), c.q3ld_spec_config(1, &spec_ptrs, 1, @intCast(page), @intCast(page), @intCast(page), &counters));
+    try testing.expectEqual(@as(c_int, 0), c.q3ld_start(1, &stage_ptrs, @intCast(page), @intCast(page), &res_arr, 16, &log_arr, 16, &gauge));
+    defer _ = c.q3ld_stop();
+
+    // Unaligned base=40 with len=page spans [0, 2*page) aligned, exceeding 1-page slot_bytes.
+    const bases = [_]i64{40};
+    try testing.expectEqual(@as(i32, 1), q3raw.q3ld_spec_step(f.ufd.fd, @intCast(f.image.len), 0, 1, &bases));
+    try waitFor(@as(i64, 40), specSettledAt);
+
+    var st: [spec_state_w * max_spec]i64 = @splat(0);
+    _ = c.q3ld_spec_state(&st);
+    // SP_LANDED == 3, SP_FAILED == 4. Truncated record must fail rather than report SP_LANDED.
+    try testing.expectEqual(@as(i64, 4), st[0]);
+    try testing.expectEqual(@as(i64, 0), st[3]);
+
+    // Verify C pool ABI/limits match the synced header constants.
+    try testing.expectEqual(@as(i32, 512), c.q3ld_max_gates());
+    try testing.expectEqual(@as(i32, 768), c.q3ld_max_gate_tickets());
+    try testing.expectEqual(@as(i32, 2026110203), c.q3ld_abi());
+}

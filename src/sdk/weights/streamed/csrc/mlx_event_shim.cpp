@@ -102,14 +102,29 @@ class WaitEvent : public mx::Primitive {
     for (int i = 0; i < n_gated_; i++) outputs[i].copy_shared_buffer(inputs[i]);
     if (ev_->kind != KIND_METAL) return;
     auto& enc = mx::metal::get_command_encoder(stream());
-    enc.end_encoding();
-    enc.get_command_buffer()->encodeWait(ev_->mtl, value_);
-    enc.barrier();
-    if (track_inputs_) {
-      for (int i = 0; i < n_gated_; i++) enc.set_input_array(inputs[i], 0);
+    if (ev_->mtl->signaledValue() < value_) {
+      enc.end_encoding();
+      enc.get_command_buffer()->encodeWait(ev_->mtl, value_);
+      enc.barrier();
+      g_gpu_waits++;
     }
-    for (int i = 0; i < n_gated_; i++) enc.register_output_array(outputs[i]);
-    g_gpu_waits++;
+    if (track_inputs_) {
+      for (int i = 0; i < n_gated_; i++) {
+        if (inputs[i].data_shared_ptr() && inputs[i].buffer().ptr() != nullptr) {
+          enc.set_input_array(inputs[i], 0);
+        }
+      }
+    }
+    for (size_t i = static_cast<size_t>(n_gated_); i < inputs.size(); i++) {
+      if (inputs[i].data_shared_ptr() && inputs[i].buffer().ptr() != nullptr) {
+        enc.set_input_array(inputs[i], 0);
+      }
+    }
+    for (int i = 0; i < n_gated_; i++) {
+      if (outputs[i].data_shared_ptr() && outputs[i].buffer().ptr() != nullptr) {
+        enc.register_output_array(outputs[i]);
+      }
+    }
   }
 
   const char* name() const override {
@@ -173,7 +188,7 @@ int32_t dsv41ev_create_metal(uint64_t start, uint64_t* object) {
     MTL::SharedEvent* e = mx::metal::device(mx::Device::gpu).mtl_device()->newSharedEvent();
     if (!e) {
       g_error = "newSharedEvent failed";
-      return 0;
+      return -1;
     }
     e->setSignaledValue(start);
     auto* rec = new EventRec(KIND_METAL);
@@ -182,14 +197,14 @@ int32_t dsv41ev_create_metal(uint64_t start, uint64_t* object) {
     return add(rec);
   } catch (...) {
     g_error = "the MLX GPU device is unavailable";
-    return 0;
+    return -1;
   }
 }
 
 int32_t dsv41ev_create_host(int64_t* word, int64_t timeout_ns) {
   if (!word || (reinterpret_cast<uintptr_t>(word) % alignof(int64_t)) || timeout_ns <= 0) {
     g_error = "a host event needs an aligned int64 word and a positive timeout";
-    return 0;
+    return -1;
   }
   auto* rec = new EventRec(KIND_HOST);
   rec->word = word;

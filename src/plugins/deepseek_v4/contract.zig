@@ -967,7 +967,7 @@ fn expectWrapper(comptime D: type, launch: *const metal.Launch, p: D.Params, sha
 }
 
 test "kernel contract dsv4: each declared launch is the shipped wrapper's, byte for byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     try expectWrapper(HcPost, &hcpost_launch, .{}, .{ .rows = 2, .n = 300, .k = HC });
     try expectWrapper(Sinkhorn, &sinkhorn_launch, .{}, .{ .rows = 3, .n = DIM, .k = HC });
     try expectWrapper(SinkhornY, &sinkhorn_y_launch, .{}, .{ .rows = 2, .n = 300, .k = HC });
