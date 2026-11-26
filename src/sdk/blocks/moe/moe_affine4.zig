@@ -222,6 +222,7 @@ fn readF32(a: mlx.mlx_array, s: mlx.mlx_stream) ![]f32 {
 }
 
 test "moe affine-4 decode: no worse than the per-slot gather kernels against the f32 truth (Flash Next geometry, K not a whole block)" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     try routedDecodeCase(4, 64, 2560, 640, 10);
     try routedDecodeCase(3, 64, 2048, 768, 8);
     try routedDecodeCase(3, 32, 2048, 768, 8);
@@ -378,6 +379,7 @@ fn routedDecodeCase(comptime bits: u32, comptime group_size: u32, comptime H: c_
 }
 
 test "moe affine-4 decode: an ungated shared expert folded into both kernels is no worse than the separate chain against the f32 truth (Flint, Kolibri-1, Hunyuan 3 geometries)" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     try ungatedFoldCase(4, 2048, 512, 1024, 6);
     try ungatedFoldCase(4, 2560, 512, 512, 6);
     try ungatedFoldCase(4, 4096, 1536, 1536, 8);
