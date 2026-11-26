@@ -1706,9 +1706,13 @@ before the drafter's state carried over), and a seeded sampled one never repeate
 finished one adopted its drafter state (context rows, calibration) and copied its answer as drafts, so its rounds
 lined up differently; a verify row's logits differ from another alignment's in the low bits (bf16), and a near-tie
 token flips. Fix: a greedy or seeded request (`SamplingParams.repeats`) adopts nothing and copies no earlier answer;
-an unseeded sampled one keeps both. Rule: state carried between requests may speed a request up, never change what
-a request that asks to repeat reads. Beside other requests a group still follows arrival order. Guard: `plugin native
-drafter: only an unseeded sampled request continues an earlier one`.
+an unseeded sampled one keeps both. Beside other requests the group rounds then made its text follow arrivals: a
+group's forward carries every slot's rows, and the kernels (MLX's matmul by row count, the router and expert paths past
+32 and 63 rows, the split-K by the launch's longest lane, the draft head and tree width by lanes) follow the group. Fix:
+such a request rounds alone (`native_group.roundsAlone`). Rule: a request that asks to repeat reads nothing another
+request chose, state or shape. Guards: `plugin native drafter: only an unseeded sampled request continues an earlier
+one`, `roundsAlone: a request that must answer the same twice never shares a forward`, `inkling2 release: a greedy lane's
+rounds beside a sampled group are its rounds alone`.
 
 ### A kernel template argument that carried a launch's rows filled the proof table, and every launch then paid an evaluation
 Defect: Inkling 2's decode ran 10 ms a round slower for the life of a process, from the first boot of a build (its warm

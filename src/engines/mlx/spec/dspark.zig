@@ -148,6 +148,7 @@ pub fn keepLadder(self: *Generator) void {
     const t = if (self.dspark_pol) |*pol| (if (pol.timing) |*x| x else return) else return;
     const l = t.ladder() orelse return log.warn("[rounds] the round timing did not finish; the drafter stays off\n", .{});
     self.xfm.plugin.?.ladder = l;
+    @import("ladder_store.zig").keep(self.timer.io, self.xfm.plugin.?, &l);
     var copies: [160]u8 = undefined;
     var drafts: [160]u8 = undefined;
     log.info("[rounds] plain step {d:.1} ms; a round by its drafts: copied {s}; drafted {s}\n", .{ l.plain, joinMs(&copies, &l.copies), joinMs(&drafts, l.drafts[0 .. l.block + 1]) });

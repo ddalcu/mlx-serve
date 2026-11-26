@@ -1,6 +1,7 @@
 //! Rounds of a served drafter (a plugin's `NativeDrafter`) for several slots of one model at once: each slot drafts and
 //! opens its verify, every accept starts on the GPU together, and each slot then keeps its accepted prefix (a sampled slot
-//! accepts under its own sampling, a greedy one against the trunk's picks). A slot alone, or one whose next round is not a group's, ticks solo.
+//! accepts under its own sampling, a greedy one against the trunk's picks). A slot alone, or one whose next round is not a
+//! group's, ticks solo; so does a request that must answer the same twice (`roundsAlone`), at any load.
 
 const std = @import("std");
 const env = @import("../../../env.zig");
@@ -17,16 +18,35 @@ const runSingleDecodeTick = @import("../decode.zig").runSingleDecodeTick;
 const loopGuardTick = @import("../loop_stop.zig").loopGuardTick;
 const publishSpeculativeBlock = @import("wiring.zig").publishSpeculativeBlock;
 const slotSpecMode = @import("wiring.zig").slotSpecMode;
+const SamplingParams = @import("../sampling/params.zig").SamplingParams;
 
 /// Slots one group round carries: the plugin keeps a verify open for each.
 pub const MAX_SLOTS: usize = plugin_driver.max_native_group;
 
-/// Whether `slot` ticks rounds of a served drafter that keeps a verify open a slot.
-pub fn slotGroupable(slot: *const Slot) bool {
+/// Whether a request rounds alone beside any company (`MLX_SERVE_GREEDY_SOLO_ROUNDS`): one that must answer the same
+/// twice (`SamplingParams.repeats`). A group's forward carries every slot's rows, and its kernels, tiles, splits and
+/// tree widths follow the group, so a near-tie token would follow who else was served and in what order.
+pub fn roundsAlone(sampling: SamplingParams) bool {
+    return env.notOff(.MLX_SERVE_GREEDY_SOLO_ROUNDS) and sampling.repeats();
+}
+
+/// Whether `slot` ticks rounds of a served drafter whose slots group (`MLX_SERVE_NATIVE_GROUPS`).
+fn groupedRounds(slot: *const Slot) bool {
     if (!env.notOff(.MLX_SERVE_NATIVE_GROUPS)) return false;
     const gen = if (slot.legacy_gen) |*g| g else return false;
     if (gen.spec_disabled_runtime or slotSpecMode(slot, gen) != .dspark) return false;
     return plugin_driver.nativeGroups(slot.model.transformer orelse return false);
+}
+
+/// Whether `slot` joins its model's group rounds.
+pub fn slotGroupable(slot: *const Slot) bool {
+    return groupedRounds(slot) and !roundsAlone(slot.legacy_gen.?.sampling);
+}
+
+/// Whether `slot`'s every forward carries its own rows only, whatever its company (`roundsAlone`): it joins no group
+/// round, never yields its rounds to the batched decode, and is no other slot's company.
+pub fn slotAlone(slot: *const Slot) bool {
+    return groupedRounds(slot) and roundsAlone(slot.legacy_gen.?.sampling);
 }
 
 /// The decode tick's grouped slots: one group round per model, `MAX_SLOTS` slots at a time; a slot alone ticks solo.
@@ -92,4 +112,20 @@ fn runGroupTickInner(sch: *Scheduler, group: []*Slot) !void {
         defer slot.allocator.free(r.tokens);
         publishSpeculativeBlock(sch, slot, gen, r.tokens);
     }
+}
+
+// Bar: a greedy or seeded request rounds alone beside any company, an unseeded sampled one may group, and
+// MLX_SERVE_GREEDY_SOLO_ROUNDS=0 sends every request into the group.
+test "roundsAlone: a request that must answer the same twice never shares a forward" {
+    const saved = env.override(.MLX_SERVE_GREEDY_SOLO_ROUNDS, null);
+    defer saved.restore();
+    const greedy: SamplingParams = .{ .temperature = 0.0 };
+    const top1: SamplingParams = .{ .temperature = 0.8, .top_k = 1 };
+    const seeded: SamplingParams = .{ .temperature = 0.8, .seed = 7 };
+    const sampled: SamplingParams = .{ .temperature = 0.8 };
+    for ([_]SamplingParams{ greedy, top1, seeded }) |sp| try std.testing.expect(roundsAlone(sp));
+    try std.testing.expect(!roundsAlone(sampled));
+    const off = env.override(.MLX_SERVE_GREEDY_SOLO_ROUNDS, "0");
+    defer off.restore();
+    for ([_]SamplingParams{ greedy, top1, seeded, sampled }) |sp| try std.testing.expect(!roundsAlone(sp));
 }

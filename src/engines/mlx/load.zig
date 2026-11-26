@@ -29,6 +29,7 @@ const plugin_media = @import("plugin/media.zig");
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("spec/dflash/dflash.zig");
 const round_cost_mod = @import("spec/round_cost.zig");
+const ladder_store = @import("spec/ladder_store.zig");
 const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
 const Weights = model_mod.Weights;
@@ -955,6 +956,14 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // `--warmup-full`: ready only once it has served its own first requests, so whoever asks next measures the model,
     // not its compiles. Otherwise it is ready now and owes a short warm-up for when the server is idle.
     const chat = ModelRegistry.chatCapable(entry);
+    // A served drafter's ladder stored by an earlier boot of this build, machine and composition: nothing times it.
+    if (entry.transformer) |xfm| if (plugin_driver.nativeStages(xfm) > 0) ladder_store.restore(sch.io, xfm.plugin.?, .{
+        .build = round_cost_mod.engineBuildId(),
+        .chip = ane_mod.chipBrand(),
+        .mem_bytes = ane_mod.totalMemBytes(),
+        .model_dir = params.model_dir,
+        .levers = ladder_store.levers(),
+    });
     if (params.warmup_full) {
         if (warm_marker) |marker| {
             if (!chat or warm_requests.run(sch, entry)) warm_requests.remember(marker);

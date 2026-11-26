@@ -70,6 +70,9 @@ pub const Bound = struct {
     /// for good where the timing request (`ladder_asked`) could not time them: the drafter stays off.
     ladder: ?rounds.Ladder = null,
     ladder_asked: bool = false,
+    /// Where this load's ladder is stored once timed (`spec/ladder_store.zig`); empty = nowhere.
+    ladder_file: [600]u8 = undefined,
+    ladder_file_len: usize = 0,
     /// Each layer's kind (`CacheHooks.layout`), `.full` past the layout or without one.
     kinds: [128]abi.LayerKind = @splat(.full),
 

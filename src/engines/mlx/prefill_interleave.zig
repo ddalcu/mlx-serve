@@ -65,11 +65,12 @@ pub fn yieldsToCompany(mode: SpecTickMode, cuda: bool, sparse_target: bool, othe
 const Company = struct { others: usize = 0, dspark: bool = false };
 
 /// Who else decodes on `s`'s model: how many, and whether one of them can join its DSpark group round
-/// (`groupable`). Plain company would wait on a solo DSpark round every token.
-fn modelCompany(active: anytype, s: anytype, groupable: anytype) Company {
+/// (`groupable`). Plain company would wait on a solo DSpark round every token. A slot that rounds `alone` batches
+/// with nobody, so it is no one's company.
+fn modelCompany(active: anytype, s: anytype, groupable: anytype, alone: anytype) Company {
     var c: Company = .{};
     for (active) |o| {
-        if (o == s or o.model != s.model) continue;
+        if (o == s or o.model != s.model or alone(o)) continue;
         c.others += 1;
         c.dspark = c.dspark or groupable(o);
     }
@@ -93,7 +94,12 @@ pub fn specYieldTick(active: []const *Slot) void {
             s.company_ticks = 0;
             continue;
         };
-        var company = modelCompany(active, s, groupRoundSlot);
+        // A request that must answer the same twice keeps its own rounds at any load (`native_group.slotAlone`).
+        if (native_group.slotAlone(s)) {
+            s.company_ticks = 0;
+            continue;
+        }
+        var company = modelCompany(active, s, groupRoundSlot, native_group.slotAlone);
         // More slots than a served drafter's group carries to each one's benefit decode plain in the batched group.
         if (s.model.transformer) |t| if (native_group.slotGroupable(s) and company.others + 1 > plugin_driver.nativeGroupWidth(t)) {
             company.dspark = false;
@@ -1039,18 +1045,27 @@ test "yieldsToCompany: a DSpark slot keeps drafting beside a slot it can group w
 }
 
 test "modelCompany: only another slot on the same model that can join its group round is DSpark company" {
-    const F = struct { model: u8, ds: bool };
-    const fs = [_]F{ .{ .model = 1, .ds = true }, .{ .model = 1, .ds = false }, .{ .model = 2, .ds = true }, .{ .model = 1, .ds = true } };
-    const p = [_]*const F{ &fs[0], &fs[1], &fs[2], &fs[3] };
+    const F = struct { model: u8, ds: bool, alone: bool = false };
+    const fs = [_]F{ .{ .model = 1, .ds = true }, .{ .model = 1, .ds = false }, .{ .model = 2, .ds = true }, .{ .model = 1, .ds = true }, .{ .model = 1, .ds = false, .alone = true } };
+    const p = [_]*const F{ &fs[0], &fs[1], &fs[2], &fs[3], &fs[4] };
     const groupable = struct {
         fn f(x: *const F) bool {
             return x.ds;
         }
     }.f;
+    const alone = struct {
+        fn f(x: *const F) bool {
+            return x.alone;
+        }
+    }.f;
     // Plain company on its model and a DSpark slot on another model: nothing to group with.
-    try testing.expectEqual(Company{ .others = 1, .dspark = false }, modelCompany(p[0..3], p[0], groupable));
-    try testing.expectEqual(Company{ .others = 2, .dspark = true }, modelCompany(p[0..4], p[0], groupable));
-    try testing.expectEqual(Company{ .others = 0, .dspark = false }, modelCompany(p[0..4], p[2], groupable));
+    try testing.expectEqual(Company{ .others = 1, .dspark = false }, modelCompany(p[0..3], p[0], groupable, alone));
+    try testing.expectEqual(Company{ .others = 2, .dspark = true }, modelCompany(p[0..4], p[0], groupable, alone));
+    try testing.expectEqual(Company{ .others = 0, .dspark = false }, modelCompany(p[0..4], p[2], groupable, alone));
+    // A slot that rounds alone (a greedy request on a grouping drafter) is nobody's company.
+    try testing.expectEqual(Company{ .others = 2, .dspark = true }, modelCompany(p[0..5], p[0], groupable, alone));
+    const pair = [_]*const F{ p[1], p[4] };
+    try testing.expectEqual(Company{ .others = 0, .dspark = false }, modelCompany(pair[0..], p[1], groupable, alone));
 }
 
 test "companyPrefillChunk: a prefill narrows only while someone decodes" {

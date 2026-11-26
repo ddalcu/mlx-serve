@@ -143,12 +143,12 @@ Spec decode:
 - **A native drafter's copy is looked up where a round may not run** (`copyAhead` over the committed tail): checked only
   in drafted rounds, a sampled request whose policy had stopped drafting never copied a repeated file. A repeated prompt
   also copies from the earlier answer (`adoptFor`'s tail, indexed before the prompt).
-- **A greedy or seeded request takes nothing an earlier request left** (`SamplingParams.repeats`: no adopted drafter
-  state, no earlier answer to copy): with either its rounds line up otherwise, a verify row's logits part in the low
-  bits, and the same request answered differently twice. Alone it repeats; beside others its group follows arrivals.
-- **A native drafter's rounds are priced on a ladder its load times once, never on a clock inside a request**
-  (`sdk/spec/rounds.zig`: `Timing` through `warm_requests.timeRounds`, a `Controller` per request over its own
-  acceptance counts): wall-clock samples sent a seed to plain decode or wide rounds by boot. Untimed = plain steps.
+- **A greedy or seeded request reads nothing another request chose** (`SamplingParams.repeats`): no adopted drafter
+  state, no earlier answer to copy, and no shared forward (`native_group.slotAlone`: no group round, no yield to the
+  batched decode). Each lines its rounds up otherwise: a verify row's logits part in the low bits, a near-tie flips.
+- **A native drafter's rounds are priced on a ladder timed once per release, never on a clock inside a request**
+  (`rounds.Timing` via `warm_requests.timeRounds`, stored per build/machine/model/`MLX_` set by `spec/ladder_store.zig`;
+  a `Controller` per request): wall-clock samples, or a ladder re-timed each boot, moved the rounds by boot.
 - **A pipelined step is timed as the mean of a run of ticks, a round as its least** (`rounds.Timing`): pipelined ticks
   trade time with each other, and the least tick read the step a quarter short, which prices every round as a loss.
 - **A block decoder checks its ENTRY token first** (`generate.tokenStops`, all five); only an ALL-pad generation declines commit (`commitDeclinesPadOnly`); a cancel mid batched tick still RECORDS the row (`batchedTickAction`).
@@ -257,6 +257,6 @@ Kernels + numerics:
 - **Tokenizer**: special-token splitting only in `Tokenizer.encode` (first-byte buckets); any per-position loop over a vocab-derived collection needs an index.
 - **Upgrades**: mlx-c → diff `lib/mlxc-src/mlx/c/*.h` vs `src/mlx/ffi.zig`; ds4 → re-sync `engines/ds4/ffi.zig` EngineOptions + CORE_OBJS; NAX presence asserted, never assumed.
 - **ANE prefill (opt-in, M4-and-below, LOSSY)**: rules in `docs/reference.md` "ANE prefill rules"; parity = per-program cos/rms + perceived-content equivalence; `ready: N/M` under-count = silent partial coverage. Guard: `tests/test_ane_prefill.sh`.
-- **Slots of a served drafter verify as ONE group round, sampled or greedy** (`spec/native_group.zig`, `dspark.nativeGroupRound`): the plugin opens every slot's block as one forward (`NativeDrafter.verify_group`), the accepts start together (sampled: `acceptStartProbs`, one filter block when the slots filter alike; greedy: `greedyPicks`, one argmax block), each slot accepts under its own sampling. A slot the controller sends plain rides it on its one row; `specYieldTick` keeps group-capable slots from yielding to plain decode up to `NativeDrafter.group_width`. `MLX_SERVE_NATIVE_GROUPS=0` = a slot's round after another.
+- **Slots of a served drafter verify as ONE group round** (`spec/native_group.zig`, `dspark.nativeGroupRound`): the plugin opens every slot's block as one forward (`NativeDrafter.verify_group`), the accepts start together (sampled: `acceptStartProbs`, one filter block when the slots filter alike; greedy: `greedyPicks`, one argmax block), each slot accepts under its own sampling. A slot the controller sends plain rides it on its one row; `specYieldTick` keeps group-capable slots from yielding to plain decode up to `NativeDrafter.group_width`. A greedy or seeded slot rounds alone (`roundsAlone`; `MLX_SERVE_GREEDY_SOLO_ROUNDS=0` groups it too). `MLX_SERVE_NATIVE_GROUPS=0` = a slot's round after another.
 - **A drafter that serves `NativeDrafter.step_group` runs the whole round itself** (draft, verify, accept, commit; `nativeStepGroup`): the engine hands each slot its sampling filters and seed, takes the committed tokens back, and falls to verify_group/finish_group when the plugin answers `unsupported`; a keyed-serial sampler and the load's ladder timing never take it.
 - **A default-on kill switch is read with `env.notOff`**: `env.on` is false when the variable is unset (the group rounds ran in no server that did not set it).

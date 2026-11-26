@@ -159,6 +159,7 @@ test {
     _ = @import("slot.zig");
     _ = @import("spec/dflash_gate.zig");
     _ = @import("spec/mtp_groups.zig");
+    _ = @import("spec/native_group.zig");
     _ = @import("spec/wiring.zig");
     _ = @import("step.zig");
     _ = @import("loop_stop.zig");
