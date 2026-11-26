@@ -46,7 +46,7 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **Every step kernel takes rows on grid y**, so `kernels.visit` serves one row, a prompt's rows and batched slots;
   the conv kernels read one state the rows chain behind (`SEQ` 1) or a state per row (`SEQ` 0, batched slots).
 - **A prompt's rows (past `small_rows`) read on the NAX tensor unit** (`relattn_nax.metal`: `matmul2d` for Q K^T and
-  P V, no mask built; `NAX_PREFILL`, opt-in for an A/B: `relative_attention_nax.metal`); `relattn.metal` (8x8 SIMD
+  P V, no mask built; `NAX_PREFILL`, default on: `relative_attention_nax.metal`; `=0` main's read); `relattn.metal` (8x8 SIMD
   matrices, 4x the time a key) serves a GPU without NAX. A masked key's value still enters P V at weight 0 in its
   32-key tile: a NaN there reaches the row.
 - **Reads of at most `small_rows` rows build a mask (`relmask.metal`) and use MLX's attention**, which beats the flash

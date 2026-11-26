@@ -873,9 +873,9 @@ pub fn relative(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, r
 /// `[1, S, H * hd]` directly (fused into `relattn.metal` on non-NAX GPUs, or via `gated` on NAX / small-row paths).
 pub fn relativeWith(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, rel_states: Array, sinks: Array, k: Array, v: Array, offset: c_int, flash: bool, out_gate: ?Array) !Array {
     const s = ops.shape(q_rows)[1];
-    // `MLX_SERVE_INKLING2_NAX_PREFILL` (opt-in, for an A/B): `relative_attention_nax.metal`'s read (off: main's
+    // `MLX_SERVE_INKLING2_NAX_PREFILL` (default on): `relative_attention_nax.metal`'s read (=0: main's
     // `relattn_nax.metal`).
-    const tiles = optIn(.MLX_SERVE_INKLING2_NAX_PREFILL);
+    const tiles = lever(.MLX_SERVE_INKLING2_NAX_PREFILL);
     if (!tiles and s > small_rows) if (try relativeNax(g, L, cfg, q_rows, rel_states, sinks, k, v, offset)) |o| {
         return if (out_gate) |gt| gated(g, o, gt, s) else o;
     };
@@ -925,7 +925,7 @@ pub fn relativeWith(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Arra
 /// of 4 SIMD groups, keys 32 at a time.
 pub var relnax_kernel: Kernel = .{ .name = "msv_inkling2_relnax", .ins = &.{ "q", "k", "v", "rel", "sinks", "key_start", "sizes", "scale", "relp" }, .outs = &.{"out"}, .source = kernelSource("plugins/inkling2/kernels/relative_attention_nax.metal"), .header = kernelSource("kernels/attention/nax_tiles.metal") ++ kernelSource("kernels/attention/nax_attention.metal"), .contiguous = false };
 
-/// A prompt's flash read (`relative`'s arguments) on the tensor units (`MLX_SERVE_INKLING2_NAX_PREFILL`, opt-in),
+/// A prompt's flash read (`relative`'s arguments) on the tensor units (`MLX_SERVE_INKLING2_NAX_PREFILL`, default on),
 /// or null (switched off, no tensor units, not bf16 at head dim 128).
 pub fn relativeNaxTiles(g: *Graph, heads: c_int, kv_heads: c_int, q: Array, k: Array, v: Array, bias: Array, sinks: Array, window: c_int, s: c_int, keys: c_int, r: c_int, scale: f32) !?Array {
     // The unread `relp` slot: 16 elements, so MLX binds it in `device` as the source declares.
@@ -951,7 +951,7 @@ pub fn relPad(g: *Graph, L: *const Layer, dt: Dtype) !Array {
 }
 
 fn relnaxLaunch(g: *Graph, heads: c_int, kv_heads: c_int, q: Array, k: Array, v: Array, rel_in: Array, relp: Array, bia: bool, sinks: Array, window: c_int, s: c_int, keys: c_int, r: c_int, scale: f32) !?Array {
-    if (!optIn(.MLX_SERVE_INKLING2_NAX_PREFILL) or !nax.verifyQmmNaxAvailable()) return null;
+    if (!lever(.MLX_SERVE_INKLING2_NAX_PREFILL) or !nax.verifyQmmNaxAvailable()) return null;
     if (ops.dtype(q) != .bfloat16 or ops.dtype(k) != .bfloat16 or ops.dtype(v) != .bfloat16 or ops.shape(q)[3] != 128 or s < 2) return null;
     engaged(.MLX_SERVE_INKLING2_NAX_PREFILL);
     const o = try launchGrid(g, &relnax_kernel, &.{
