@@ -13,6 +13,7 @@ const ops = @import("../../mlx/ops.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const source = @import("../../mlx/kernels.zig").source;
 const kernels = @import("kernels.zig");
+const vision_contract = @import("vision_contract.zig");
 const layers = @import("layers.zig");
 const config = @import("config.zig");
 const attn = @import("../../sdk/blocks/attention/contract.zig");
@@ -3045,6 +3046,7 @@ pub fn register(set: *kc.Set) !void {
     try set.add(OProj, .init(set.a, 4, 32), oprojSpec("inkling2 oproj bf16 (4-bit g32)", 32, .{ .f16 = 40, .why = "stress codes under 16 in groups of 32: an fp16 sum misses by ~45x, short of 100x but far past fp32's exact sums" }), null);
     try set.add(OProj, .init(set.a, 4, 128), oprojSpec("inkling2 oproj bf16 (4-bit g128)", 128, .{}), null);
     try set.add(OProj, .init(set.a, 0, 16), oprojSpec("inkling2 oproj bf16 (dense)", 16, .{}), null);
+    try vision_contract.register(set);
 }
 
 // ── tests ──
@@ -3093,7 +3095,9 @@ test "kernel contract inkling2: each declared launch is the shipped wrapper's, b
             try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
         };
     }
-    for (set.kernels.items[at..]) |k| {
+    var end = at;
+    while (end < set.kernels.items.len and std.mem.startsWith(u8, set.kernels.items[end].spec.name, "inkling2 oproj")) end += 1;
+    for (set.kernels.items[at..end]) |k| {
         const p: *OProj = @ptrCast(@alignCast(k.ctx));
         for (k.spec.served) |shape| {
             try std.testing.expect(try p.prepare(shape, .random, 7));
@@ -3103,6 +3107,7 @@ test "kernel contract inkling2: each declared launch is the shipped wrapper's, b
             try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
         }
     }
+    try vision_contract.checkWrappers(a, set.kernels.items[end..]);
 }
 
 // Bar: gates 1-4 on this area alone (the registry's sharded test runs them with every other area).
