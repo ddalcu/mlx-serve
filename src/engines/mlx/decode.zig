@@ -305,7 +305,12 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     }
     if (tick_mode == .mtp) {
         gen.mtp_group_cap = 0;
-        const result = try gen.nextMtp(slot.allocator);
+        const result = gen.nextMtp(slot.allocator) catch |e| {
+            if (mlx.errorPending()) return e;
+            log.err("[mtp] solo round failed ({s}); failing this request only\n", .{@errorName(e)});
+            slot.markError(@errorName(e));
+            return;
+        };
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);
             return;
@@ -386,7 +391,9 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
 
 // ── tests ──
 
-test "single MTP slot reaches the round entry through runDecodeTick" {
+fn expectSoloMtpRoundFailure(latched: ?[:0]const u8, want: []const u8) !void {
+    var stale: [512]u8 = undefined;
+    _ = mlx.takeError(&stale);
     var xfm: @import("../../plugins/qwen4_exp/trunk.zig").Trunk = undefined;
     xfm.outside = null;
     var model: model_registry_mod.LoadedModel = undefined;
@@ -407,7 +414,12 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     gen.sampling = .{};
     gen.logprobs_n = 1;
     var slot: Slot = undefined;
+    slot.io = testing.io;
     slot.allocator = testing.allocator;
+    slot.out_mu = .init;
+    slot.out_cond = .init;
+    slot.out_event = .unset;
+    slot.sink = null;
     slot.model = &model;
     slot.legacy_gen = gen;
     slot.enable_mtp = true;
@@ -421,8 +433,20 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     sch.force_batched = false;
     sch.inflight_generated_tokens = std.atomic.Value(u64).init(0);
     var active = [_]*Slot{&slot};
-    try testing.expectError(error.SpecDecodeUnsupported, runDecodeTick(&sch, &active));
+    if (latched) |msg| mlx.latchErrorForTest(msg);
+    try runDecodeTick(&sch, &active);
+    defer testing.allocator.free(slot.error_code.?);
+    try testing.expectEqualStrings(want, slot.error_code.?);
+    try testing.expect(!mlx.errorPending());
     try testing.expect(slot.legacy_gen.?.spec_cost_solo);
     try testing.expectEqual(@as(u32, 0), slot.legacy_gen.?.mtp_group_cap);
     try testing.expectEqual(@as(u64, 0), sch.inflight_generated_tokens.load(.monotonic));
+}
+
+test "a failed solo MTP round fails only its own request" {
+    try expectSoloMtpRoundFailure(null, "SpecDecodeUnsupported");
+}
+
+test "a GPU memory failure in a solo MTP round still reaches its request as OutOfMemory" {
+    try expectSoloMtpRoundFailure("[malloc] Unable to allocate 8589934592 bytes.", "OutOfMemory");
 }
