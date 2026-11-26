@@ -1261,6 +1261,26 @@ pub const ModelRegistry = struct {
         }
     }
 
+    /// `planEvictionsLocked`, but a plan that only fails for a model already on its way out waits for
+    /// that unload to land and plans again, with `live_bytes` read afresh. An unload still draining a
+    /// reader is not waited for: that reader may be the caller's own request.
+    pub fn planEvictionsAfterUnloadsLocked(self: *ModelRegistry, exclude_id: []const u8, out: []*LoadedModel, live_bytes: *const fn () u64) ?usize {
+        while (true) {
+            if (self.planEvictionsLocked(exclude_id, out, live_bytes())) |n| return n;
+            const leaving = self.unloadInFlightLocked() orelse return null;
+            while (leaving.state == .evicting) self.state_cond.waitUncancelable(self.io, &self.mutex);
+        }
+    }
+
+    fn unloadInFlightLocked(self: *ModelRegistry) ?*LoadedModel {
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.state == .evicting and entry.refcount.load(.acquire) == 0) return entry;
+        }
+        return null;
+    }
+
     /// MLX bytes the ready models hold as loaded: each load's own measure (`bytes_live`), its bill where none was
     /// taken. The bill alone would count a host-mapped table that is not MLX memory.
     pub fn residentLiveBytes(self: *ModelRegistry, io: std.Io) u64 {
@@ -2370,6 +2390,54 @@ test "planEvictions: another model still loading counts against the model cap" {
     // a + b + c would be three models under a cap of two: `a` has to go.
     try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 0));
     try testing.expectEqualStrings("a", buf[0].id);
+}
+
+fn noLiveBytes() u64 {
+    return 0;
+}
+
+test "planEvictions: a load waits out an unload in flight instead of refusing" {
+    const io = testing.io;
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 1, 0, null);
+    defer reg.deinit();
+    const a = try makeReadyStub(reg, "a", 10);
+    reg.mutex.lockUncancelable(io);
+    reg.markEvictingLocked(a);
+    reg.mutex.unlock(io);
+    const b = try beginLoad(reg, "b", 10);
+    const Unload = struct {
+        fn finish(r: *ModelRegistry, e: *LoadedModel) void {
+            testing.io.sleep(.fromMilliseconds(50), .awake) catch {};
+            r.mutex.lockUncancelable(r.io);
+            r.accountEvictedLocked(10);
+            r.finalizeEvictionLocked(e);
+            r.mutex.unlock(r.io);
+        }
+    };
+    const unload = try std.Thread.spawn(.{}, Unload.finish, .{ reg, a });
+    reg.mutex.lockUncancelable(io);
+    var buf: [16]*LoadedModel = undefined;
+    const plan = reg.planEvictionsAfterUnloadsLocked(b.id, &buf, noLiveBytes);
+    reg.mutex.unlock(io);
+    unload.join();
+    try testing.expectEqual(@as(?usize, 0), plan);
+}
+
+test "planEvictions: an unload still waiting on a reader is not waited for" {
+    const io = testing.io;
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 1, 0, null);
+    defer reg.deinit();
+    const a = try makeReadyStub(reg, "a", 10);
+    _ = a.refcount.fetchAdd(1, .acq_rel);
+    reg.mutex.lockUncancelable(io);
+    reg.markEvictingLocked(a);
+    reg.mutex.unlock(io);
+    const b = try beginLoad(reg, "b", 10);
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    try testing.expectEqual(@as(?usize, null), reg.planEvictionsAfterUnloadsLocked(b.id, &buf, noLiveBytes));
+    a.refcount.store(0, .release);
 }
 
 test "reservation: released back to zero on markReady / markUnloaded" {

@@ -934,7 +934,7 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
         // (multi-victim). On failure — every other resident model is pinned
         // by an in-flight request — roll back and surface a 503 instead of
         // loading anyway and crashing.
-        const n = self.registry.planEvictionsLocked(entry.id, &victims_buf, mlxActiveBytes()) orelse {
+        const n = self.registry.planEvictionsAfterUnloadsLocked(entry.id, &victims_buf, mlxActiveBytes) orelse {
             // Name the numbers. A refusal that logs NOTHING sends the user
             // hunting for a concurrent request that does not exist: on an
             // idle server the cause is always the static cap (#126), and
