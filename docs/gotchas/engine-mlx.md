@@ -61,6 +61,15 @@ left the cached tokens there, and on its sliding rings no checkpoint near that p
 lookup the prompt takes the cached entry's spelling wherever the bytes agree (`respell`, `HotPrefixCache.respellPrompt`;
 never across an added token, never for a greedy or seeded request). Guard: the `respell:` tests in `prefix_cache.zig`.
 
+### The same misses came back in sessions with screenshots, and each one re-read the whole prompt
+Defect: a pi session on Inkling 2 with 64 screenshots cold-prefilled ten prompts of 47K to 440K tokens (15 minutes),
+each diverging inside the previous answer. Cause: `respell` skipped any prompt with media, since a respelled answer
+moves every image after it; and the fallback, the previous prompt's end checkpoint, had been thinned away: the cap
+spread 16 checkpoints over the whole prompt, though a sliding ring restores nothing below its floor. Fix: `respell`
+moves each media span with the run that carries it (refused when one starts inside a respelled run; M-RoPE prompts
+stay out), and `mergeCheckpointLists` drops checkpoints below the entry's `ringFloor` before the cap thins. Guards:
+`respell: an image after a respelled answer…`, `HotPrefixCache: a sliding entry's checkpoint cap keeps…`.
+
 ### Sliding layers keep the full buffer; the view is what is trimmed
 Defect: (design) Gemma 4 E4B's 512-token window. Fix: the buffer keeps every row, as mlx-lm's `RotatingKVCache` does;
 `slidingViewFor` sizes the view the forward reaches (`window + q_len - 1`), at prefill too (it was once decode-only,

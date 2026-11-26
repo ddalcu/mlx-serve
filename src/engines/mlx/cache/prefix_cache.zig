@@ -99,29 +99,49 @@ pub fn missKind(candidates: usize, best_raw: usize) MissKind {
 /// The most tokens either side of one respelled span may take.
 const RESPELL_MAX_TOKENS = 64;
 
+/// A prompt `respell` changed, with its media items where the new spelling puts them. Caller owns both.
+pub const Respelled = struct { ids: []u32, media: []MediaSpan };
+
 /// `prompt` spelled as `entry` spells the bytes they share, or null when nothing changes. A sampled answer need not
 /// use the tokenizer's canonical tokens (" ----" "--------" where encoding the text gives " " "--------" "----"), so its
 /// re-rendered turn left the cache inside that answer. `spelling.tokenSpelling(id)` is a token's text, null for a
-/// special token, which never respells. Caller owns the result.
-pub fn respell(allocator: std.mem.Allocator, entry: []const u32, prompt: []const u32, spelling: anytype) !?[]u32 {
+/// special token, which never respells; a media item (`media`, the prompt's) moves with the run it sits in.
+pub fn respell(allocator: std.mem.Allocator, entry: []const u32, prompt: []const u32, media: []const MediaSpan, spelling: anytype) !?Respelled {
     var i = std.mem.indexOfDiff(u32, entry, prompt) orelse return null;
     var span = sameBytes(entry[i..], prompt[i..], spelling) orelse return null;
     var out: std.ArrayList(u32) = .empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, prompt[0..i]);
+    const moved = try allocator.alloc(MediaSpan, media.len);
+    errdefer allocator.free(moved);
+    for (moved, media) |*m, src| m.* = .{ .start = std.math.maxInt(u32), .key = src.key };
+    try copyRun(allocator, &out, prompt, 0, i, media, moved);
     var j = i;
     while (true) {
         try out.appendSlice(allocator, entry[i..][0..span[0]]);
         i += span[0];
         j += span[1];
         const k = std.mem.indexOfDiff(u32, entry[i..], prompt[j..]) orelse break;
-        try out.appendSlice(allocator, prompt[j..][0..k]);
+        try copyRun(allocator, &out, prompt, j, k, media, moved);
         i += k;
         j += k;
         span = sameBytes(entry[i..], prompt[j..], spelling) orelse break;
     }
-    try out.appendSlice(allocator, prompt[j..]);
-    return try out.toOwnedSlice(allocator);
+    try copyRun(allocator, &out, prompt, j, prompt.len - j, media, moved);
+    // An item that starts inside a respelled run has no place in the new spelling.
+    for (moved) |m| if (m.start == std.math.maxInt(u32)) {
+        allocator.free(moved);
+        out.deinit(allocator);
+        return null;
+    };
+    return .{ .ids = try out.toOwnedSlice(allocator), .media = moved };
+}
+
+/// Appends `prompt[from..][0..len]` to `out`; an item of `media` starting in it lands at its new place in `moved`.
+fn copyRun(allocator: std.mem.Allocator, out: *std.ArrayList(u32), prompt: []const u32, from: usize, len: usize, media: []const MediaSpan, moved: []MediaSpan) !void {
+    for (media, moved) |m, *to| if (m.start >= from and m.start < from + len) {
+        to.start = @intCast(m.start - from + out.items.len);
+    };
+    try out.appendSlice(allocator, prompt[from..][0..len]);
 }
 
 /// The shortest token runs at the head of `a` and `b` that spell the same bytes, as their lengths.
@@ -1571,20 +1591,21 @@ pub const HotPrefixCache = struct {
         return .{ .idx = match.idx, .shared = match.shared };
     }
 
-    /// `respell` the text-only prompt against the RAM entry it follows furthest, when it leaves that entry inside it.
-    pub fn respellPrompt(self: *const HotPrefixCache, allocator: std.mem.Allocator, prompt_ids: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig, spelling: anytype) !?[]u32 {
+    /// `respell` the prompt against the RAM entry it follows furthest, when it leaves that entry inside it.
+    pub fn respellPrompt(self: *const HotPrefixCache, allocator: std.mem.Allocator, prompt_ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig, spelling: anytype) !?Respelled {
         var best: ?*const Entry = null;
         var best_shared: usize = 0;
         for (self.entries.items) |*e| {
-            if (e.checked_out_by != null or e.module != null or e.media.len > 0 or e.has_tools != has_tools) continue;
+            if (e.checked_out_by != null or e.module != null or e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
             const shared = std.mem.indexOfDiff(u32, e.tokens, prompt_ids) orelse return null;
+            if (mediaSharedBound(e.media, media) < shared) continue;
             if (shared > best_shared) {
                 best = e;
                 best_shared = shared;
             }
         }
-        return respell(allocator, (best orelse return null).tokens, prompt_ids, spelling);
+        return respell(allocator, (best orelse return null).tokens, prompt_ids, media, spelling);
     }
 
     /// Try to restore a matching entry into `target_cache`. On success, returns
@@ -2832,7 +2853,7 @@ pub const HotPrefixCache = struct {
             }
             if (eff_cps) |own| {
                 // Consumes both on every path; on error neither survives.
-                const merged = self.mergeCheckpointLists(cloned, own, firstSpanStart(eff_media)) catch |err| {
+                const merged = self.mergeCheckpointLists(cloned, own, firstSpanStart(eff_media), new_snap.ringFloor()) catch |err| {
                     log.warn("  [hot-cache] checkpoint merge failed: {s}\n", .{@errorName(err)});
                     eff_cps = null;
                     new_bytes -= new_ssm_bytes;
@@ -2893,7 +2914,7 @@ pub const HotPrefixCache = struct {
                 // not touch it.
                 e.ssm_checkpoints = null;
                 const new = eff_cps orelse break :blk old;
-                break :blk try self.mergeCheckpointLists(old, new, firstSpanStart(eff_media));
+                break :blk try self.mergeCheckpointLists(old, new, firstSpanStart(eff_media), new_snap.ringFloor());
             };
 
             // Free everything the old entry owned EXCEPT the (now-detached)
@@ -3613,6 +3634,7 @@ pub const HotPrefixCache = struct {
         old: []SSMCheckpoint,
         new: []SSMCheckpoint,
         media_start: ?usize,
+        ring_floor: usize,
     ) !?[]SSMCheckpoint {
         var merged = std.ArrayList(SSMCheckpoint).empty;
         var i: usize = 0;
@@ -3655,6 +3677,21 @@ pub const HotPrefixCache = struct {
         self.allocator.free(old);
         self.allocator.free(new);
         sources_freed = true;
+        // The entry's sliding ring restores nothing below its floor (`ringRestores`): the cap
+        // must not thin away the checkpoints it can still reach to keep ones it never will.
+        var reachable: usize = 0;
+        for (merged.items) |c| {
+            var cp = c;
+            if (cp.pos < ring_floor) cp.deinit(self.allocator) else {
+                merged.items[reachable] = cp;
+                reachable += 1;
+            }
+        }
+        merged.shrinkRetainingCapacity(reachable);
+        if (reachable == 0) {
+            merged.deinit(self.allocator);
+            return null;
+        }
         while (self.ssm_checkpoint_max > 0 and
             merged.items.len > self.ssm_checkpoint_max)
         {
@@ -4295,28 +4332,46 @@ const TestSpelling = struct {
     }
 };
 
+fn freeRespelled(r: Respelled) void {
+    testing.allocator.free(r.ids);
+    testing.allocator.free(r.media);
+}
+
 test "respell: a prompt takes the entry's spelling of the bytes they share, to the entry's end" {
     // " ----" "--------" "--" and " " "--------" "------" are the same 15 bytes.
     const entry = [_]u32{ 0, 1, 2, 3, 6 };
     const prompt = [_]u32{ 0, 4, 2, 5, 6, 8 };
-    const got = (try respell(testing.allocator, &entry, &prompt, TestSpelling{})).?;
-    defer testing.allocator.free(got);
-    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 6, 8 }, got);
+    const got = (try respell(testing.allocator, &entry, &prompt, &.{}, TestSpelling{})).?;
+    defer freeRespelled(got);
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 6, 8 }, got.ids);
 }
 
 test "respell: two respelled runs in one answer, with plain tokens between them" {
     const entry = [_]u32{ 0, 1, 2, 3, 6, 0, 1, 2, 3, 6 };
     const prompt = [_]u32{ 0, 4, 2, 5, 6, 0, 4, 2, 5, 6, 8 };
-    const got = (try respell(testing.allocator, &entry, &prompt, TestSpelling{})).?;
-    defer testing.allocator.free(got);
-    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 6, 0, 1, 2, 3, 6, 8 }, got);
+    const got = (try respell(testing.allocator, &entry, &prompt, &.{}, TestSpelling{})).?;
+    defer freeRespelled(got);
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 6, 0, 1, 2, 3, 6, 8 }, got.ids);
 }
 
-test "respell: different bytes, a special token or an identical prompt leave the prompt as it is" {
+test "respell: an image after a respelled answer moves by the tokens the respelling saved" {
+    // 7 7 is an image's placeholder run. The answer " " "------" "------" "--" is " ----" "--------" "--", one token less.
+    const entry = [_]u32{ 0, 7, 7, 0, 1, 2, 3, 6 };
+    const prompt = [_]u32{ 0, 7, 7, 0, 4, 5, 5, 3, 6, 0, 7, 7, 8 };
+    const media = [_]MediaSpan{ .{ .start = 1, .key = 9 }, .{ .start = 10, .key = 11 } };
+    const got = (try respell(testing.allocator, &entry, &prompt, &media, TestSpelling{})).?;
+    defer freeRespelled(got);
+    try testing.expectEqualSlices(u32, &.{ 0, 7, 7, 0, 1, 2, 3, 6, 0, 7, 7, 8 }, got.ids);
+    try testing.expectEqualSlices(MediaSpan, &.{ .{ .start = 1, .key = 9 }, .{ .start = 9, .key = 11 } }, got.media);
+}
+
+test "respell: different bytes, a special token, an identical prompt or an item inside the run leave the prompt" {
     const entry = [_]u32{ 0, 1, 2, 3, 6 };
-    try testing.expectEqual(null, try respell(testing.allocator, &entry, &.{ 0, 4, 2, 6 }, TestSpelling{}));
-    try testing.expectEqual(null, try respell(testing.allocator, &.{ 0, 7, 6 }, &.{ 0, 4, 6 }, TestSpelling{}));
-    try testing.expectEqual(null, try respell(testing.allocator, &entry, &.{ 0, 1, 2, 3, 6, 8 }, TestSpelling{}));
+    try testing.expectEqual(null, try respell(testing.allocator, &entry, &.{ 0, 4, 2, 6 }, &.{}, TestSpelling{}));
+    try testing.expectEqual(null, try respell(testing.allocator, &.{ 0, 7, 6 }, &.{ 0, 4, 6 }, &.{}, TestSpelling{}));
+    try testing.expectEqual(null, try respell(testing.allocator, &entry, &.{ 0, 1, 2, 3, 6, 8 }, &.{}, TestSpelling{}));
+    const inside = [_]MediaSpan{.{ .start = 2, .key = 9 }};
+    try testing.expectEqual(null, try respell(testing.allocator, &entry, &.{ 0, 4, 2, 5, 6 }, &inside, TestSpelling{}));
 }
 
 test "HotPrefixCache: shouldUse gates hybrid by enable_ssm_checkpoints" {
@@ -6285,6 +6340,66 @@ test "HotPrefixCache: replace path bounds SSM checkpoints and keeps them spread"
     try testing.expectEqual(@as(usize, 300), kept[1].pos);
     try testing.expectEqual(@as(usize, 500), kept[2].pos);
     try testing.expectEqual(@as(usize, 800), kept[3].pos);
+}
+
+// Bar: on a sliding ring the cap keeps the checkpoints the ring can still restore, so a turn that leaves the entry
+// inside its last answer restores at that answer's prompt end instead of cold-prefilling the whole prompt.
+test "HotPrefixCache: a sliding entry's checkpoint cap keeps what its ring can restore" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var toks: [400]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 11);
+    var srcs: [6][3]SSMCacheEntry = undefined;
+    for (&srcs, 0..) |*e, i| {
+        const f: f64 = @floatFromInt(i + 1);
+        e.* = pcBuildHybrid(s, 100.0 * f, 500.0 * f);
+    }
+    defer for (&srcs) |*e| pcFreeHybrid(e);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.ssm_checkpoint_max = 4;
+
+    // An 8-row window over a ring that keeps 24 rows, written 50 rows at a time.
+    const Fill = struct {
+        fn blocks(c: *KVCache, st: mlx.mlx_stream, n: usize) !void {
+            for (0..n) |_| {
+                var k = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(k);
+                try mlx.check(mlx.mlx_zeros(&k, &[_]c_int{ 1, 2, 50, 4 }, 4, .bfloat16, st));
+                var view = try c.updateSliding(0, k, k, st, 8 + 50 - 1, 8, 24);
+                view.deinit();
+            }
+        }
+    };
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try Fill.blocks(&cache, s, 6);
+    const cps1 = try testing.allocator.alloc(SSMCheckpoint, 3);
+    for (cps1, 0..) |*c, i| c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], 50 + i * 90, s);
+    _ = try hc.commitWithSsm(&cache, toks[0..300], false, cps1, null, null);
+
+    // The next turn extends it to 400, with checkpoints at its prompt's end and its answer's.
+    try Fill.blocks(&cache, s, 2);
+    var snap = try cache.snapshot();
+    const floor = snap.ringFloor();
+    snap.deinit();
+    try testing.expect(floor > 230 and floor <= 390);
+    const cps2 = try testing.allocator.alloc(SSMCheckpoint, 2);
+    cps2[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[4], 390, s);
+    cps2[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[5], 398, s);
+    _ = try hc.commitWithSsm(&cache, toks[0..400], false, cps2, null, null);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+
+    // A prompt that leaves the entry inside the answer restores at the answer's prompt end.
+    var next = toks;
+    for (next[395..]) |*t| t.* = 7;
+    var target_cache = try KVCache.init(testing.allocator, 1);
+    defer target_cache.deinit();
+    var target_ssm = pcEmptySsm();
+    defer pcFreeHybrid(&target_ssm);
+    var moe_off: usize = 0;
+    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target_ssm, s, &next, false, &.{}, null, null);
+    try testing.expectEqual(@as(usize, 390), r.matched);
 }
 
 test "HotPrefixCache: a revised budget evicts down to fit and a raised one keeps everything" {

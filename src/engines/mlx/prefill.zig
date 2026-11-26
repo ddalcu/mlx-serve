@@ -167,11 +167,13 @@ fn importModuleSnapshot(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, ma
 /// takes nothing an earlier request left.
 fn respellPrompt(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache, xfm: *Transformer) bool {
     const tok = slot.model.tokenizer orelse return false;
-    const p = (hc.respellPrompt(slot.allocator, slot.full_prompt, slot.has_tools, slot.cache.config, tok) catch null) orelse return false;
-    log.info("  [hot-cache] respelled the prompt as the cache spells its answers ({d} -> {d} tokens)\n", .{ slot.full_prompt.len, p.len });
+    const p = (hc.respellPrompt(slot.allocator, slot.full_prompt, slot.media, slot.has_tools, slot.cache.config, tok) catch null) orelse return false;
+    log.info("  [hot-cache] respelled the prompt as the cache spells its answers ({d} -> {d} tokens)\n", .{ slot.full_prompt.len, p.ids.len });
     slot.allocator.free(slot.full_prompt);
-    slot.full_prompt = p;
-    const room = @as(usize, @import("admission/context.zig").getEffectiveContextLength(&xfm.config)) -| p.len;
+    slot.allocator.free(slot.media);
+    slot.full_prompt = p.ids;
+    slot.media = p.media;
+    const room = @as(usize, @import("admission/context.zig").getEffectiveContextLength(&xfm.config)) -| p.ids.len;
     slot.max_tokens = @intCast(@max(1, @min(slot.max_tokens, room)));
     return true;
 }
@@ -311,7 +313,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         }
     }
     if (module_binding == null) if (slot.prefix_cache) |hc| {
-        if (hot_matched == 0 and !slot.sampling.repeats() and !slot.skip_prefix_cache and slot.cache_variant == 0 and slot.media.len == 0 and respellPrompt(slot, hc, xfm_ptr))
+        if (hot_matched == 0 and !slot.sampling.repeats() and !slot.skip_prefix_cache and slot.cache_variant == 0 and slot.mrope_pos == null and respellPrompt(slot, hc, xfm_ptr))
             prefill_tokens = slot.full_prompt;
         {
             // Only build a restore target when this request will actually
