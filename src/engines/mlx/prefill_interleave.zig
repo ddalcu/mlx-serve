@@ -618,12 +618,17 @@ pub fn interleaveDecodeTick(sch: *Scheduler) u64 {
     if (n == 0) return 0;
     invalidateDecodeClocks(buf[0..n]);
     var sw = io_util.Stopwatch.init(sch.io);
+    const outer_tick = sch.decode_tick;
+    sch.decode_tick = sw;
     runDecodeTick(sch, buf[0..n]) catch |err| {
         log.err("[interleave] decode tick failed: {s}\n", .{if (err == error.EngineFailed) err_name.last() else @errorName(err)});
         for (buf[0..n]) |s| s.markError(@errorName(err));
     };
+    sch.decode_tick = outer_tick;
     const tick_ns = sw.read();
-    for (buf[0..n]) |s| s.decode_ns +|= tick_ns;
+    for (buf[0..n]) |s| {
+        if (!s.finished) s.decode_ns +|= tick_ns;
+    }
     return tick_ns;
 }
 

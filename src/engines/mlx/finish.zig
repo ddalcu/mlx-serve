@@ -211,6 +211,7 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // a single per-request branch. real_ttft = first_token_ns (queue+prefill,
     // captured exactly at prefill completion); recordRequest derives
     // e2e = first_token_ns + decode_ns.
+    if (sch.decode_tick) |tick| slot.decode_ns +|= tick.read();
     recordSlotFinish(sch.metrics, &sch.inflight_generated_tokens, slot, finishOutcome(reason, latched));
     publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {

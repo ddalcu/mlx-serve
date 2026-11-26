@@ -308,6 +308,7 @@ const Requests = struct {
         h.sch.max_concurrent = 4;
         h.sch.boundary_depth = 0;
         h.sch.boundary_outer = null;
+        h.sch.decode_tick = null;
         h.sch.hot_prefix_cache = h.entry.prefix_cache;
         h.sch.digest_mu = .init;
         h.sch.hot_cache_digests = &.{};
@@ -850,6 +851,37 @@ test "deepseek_v41 served: a prefill cancelled past the commit floor is committe
     defer s.deinit();
     try testing.expectEqual(@as(u32, @intCast(stop)), s.cached_tokens);
     finish_request.releasePluginSlot(s);
+}
+
+test "deepseek_v41 served: a request that ends inside a decode tick is charged that tick's decode time" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    var m = @import("../../host/metrics/metrics.zig").Metrics.init();
+    h.sch.metrics = &m;
+    h.sch.force_batched = false;
+    h.sch.inflight_generated_tokens = .init(0);
+    defer h.sch.decoding.deinit(testing.allocator);
+    const s = try h.newSlot(&.{ 3, 17, 42, 9, 7, 25, 1, 60 });
+    defer s.deinit();
+    try testing.expectEqual(.decoding, @import("../../engines/mlx/step.zig").prefillAdmitted(&h.sch, s));
+    var before_last: u64 = 0;
+    var total: u64 = 0;
+    for (0..8) |_| {
+        if (s.finished) break;
+        try testing.expect(s.error_code == null);
+        before_last = total;
+        total += @import("../../engines/mlx/prefill_interleave.zig").interleaveDecodeTick(&h.sch);
+    }
+    try testing.expect(s.finished);
+    try testing.expectEqual(@as(u64, 1), m.requests_success_total.load());
+    const charged = m.decode_time_ns.sum.load(.monotonic);
+    try testing.expect(charged > before_last);
+    try testing.expect(charged <= total);
 }
 
 test "deepseek_v41 served: restored state is discarded once when only cold prefill fits" {

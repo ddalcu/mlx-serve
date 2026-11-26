@@ -315,12 +315,17 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
     if (active.items.len > 0) {
         ran = true;
         var decode_sw = io_util.Stopwatch.init(sch.io);
+        const outer_tick = sch.decode_tick;
+        sch.decode_tick = decode_sw;
         runDecodeTick(sch, active.items) catch |err| {
             log.err("[scheduler] decode tick failed: {s}\n", .{if (err == error.EngineFailed) err_name.last() else @errorName(err)});
             for (active.items) |s| s.markError(@errorName(err));
         };
+        sch.decode_tick = outer_tick;
         const tick_ns = decode_sw.read();
-        for (active.items) |s| s.decode_ns +|= tick_ns;
+        for (active.items) |s| {
+            if (!s.finished) s.decode_ns +|= tick_ns;
+        }
     }
 
     // 5. Cull finished / errored / cancelled from `decoding`. The slot
