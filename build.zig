@@ -71,7 +71,7 @@ pub fn build(b: *std.Build) void {
     macos.addTestCompile(b, tests);
     // `exl3-test`.
     macos.addPluginTests(&graph, tests);
-    // `check`.
+    // `check`, `check-cross`.
     macos.addCheck(&graph);
     // `vz-agent`, `vz-agent-host`; its host-side tests join `test`.
     standalone.addVzAgent(b, target, optimize, tests.aux);

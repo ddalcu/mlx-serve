@@ -6,6 +6,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const libs = @import("libs.zig");
 const plugins = @import("plugins.zig");
+const linux = @import("linux.zig");
 
 pub const Graph = struct {
     b: *std.Build,
@@ -364,61 +365,26 @@ pub fn addPluginTests(g: *const Graph, tests: Tests) void {
 /// binary, so this is AstGen + Sema alone — the whole tree in seconds, where
 /// emitting it costs minutes (LLVM, single-threaded, ~4x more again at
 /// ReleaseFast). For the edit loop; a real build still gates every change.
-/// It also type-checks the server for Windows and Linux (`cross_check`): code that compiles only on macOS (a macOS-only
-/// plugin's use its stubs elsewhere do not cover: `engines/mlx/plugin/dsv41_absent.zig`) fails here, on a Mac.
+/// `zig build check-cross`: the same for the server on Windows and Linux, as build/linux.zig sets its module up
+/// (`linux.options`, `linux.serverModule`): code that compiles only on macOS (a macOS-only plugin's use its stubs
+/// elsewhere do not cover: `engines/mlx/plugin/dsv41_absent.zig`) fails there, on a Mac.
 pub fn addCheck(g: *const Graph) void {
     const b = g.b;
     const check = b.step("check", "Type-check everything, emitting no binary");
     check.dependOn(&b.addExecutable(.{ .name = "mlx-serve", .root_module = g.exe_mod }).step);
     check.dependOn(&b.addTest(.{ .root_module = g.test_mod }).step);
+    const cross = b.step("check-cross", "Type-check the server for Windows and Linux, emitting no binary");
     for (cross_check) |q| {
         const t = b.resolveTargetQuery(q);
-        const tag = @tagName(q.os_tag.?);
-        check.dependOn(&b.addExecutable(.{ .name = b.fmt("mlx-serve-{s}", .{tag}), .root_module = crossModule(b, t, g.optimize) }).step);
+        const opts = linux.options(b, t, .{ .version = g.version, .mlx_c_version = "unknown", .ds4_commit = "unknown", .llama_tag = "unknown", .units = false, .slow_tests = false });
+        const mod = linux.serverModule(b, t, g.optimize, "src/main.zig", opts, null);
+        cross.dependOn(&b.addExecutable(.{ .name = b.fmt("mlx-serve-{s}", .{@tagName(q.os_tag.?)}), .root_module = mod }).step);
     }
 }
 
-/// The other targets `check` type-checks (build/linux.zig's graph builds them).
+/// The targets `check-cross` type-checks (build/linux.zig's graph builds them). glibc 2.39 (Ubuntu 24.04's): `std.c`
+/// declares what the Linux build calls (arc4random_buf, 2.36) from the target's version.
 const cross_check = [_]std.Target.Query{
     .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu },
-    // glibc 2.39 (Ubuntu 24.04's): `std.c` declares what the Linux build calls (arc4random_buf, 2.36) from the
-    // target's version.
     .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 39, .patch = 0 } },
 };
-
-/// The server's module for `target` as build/linux.zig sets it up, for Sema alone: its options and named modules, no
-/// C sources or libraries (nothing is compiled or linked). libwebp's header is the Windows stub's API.
-fn crossModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    const windows = target.result.os.tag == .windows;
-    const opts = b.addOptions();
-    opts.addOption([]const u8, "version", "0.0.0-check");
-    opts.addOption(bool, "mas", false);
-    opts.addOption([]const u8, "mlx_c_version", "unknown");
-    opts.addOption([]const u8, "ds4_commit", "unknown");
-    opts.addOption([]const u8, "llama_tag", "unknown");
-    opts.addOption([]const u8, "git_sha", "");
-    opts.addOption(bool, "ios", false);
-    opts.addOption(bool, "units", false);
-    opts.addOption(bool, "ds4_engine", !windows);
-    opts.addOption(bool, "llama_engine", true);
-    opts.addOption(bool, "slow_tests", false);
-    const embedded: libs.Embedded = .init(b, target, optimize);
-    const mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libcpp = true,
-        .imports = &.{
-            .{ .name = "build_options", .module = opts.createModule() },
-            .{ .name = "mlx_stamp", .module = config.mlxStampModule(b, "lib/mlx/.version") },
-            .{ .name = "mlx_steel_sources", .module = embedded.mlx_steel_sources },
-            .{ .name = "opencode2_plugin", .module = embedded.opencode2_plugin },
-            .{ .name = "agent_skills", .module = embedded.agent_skills },
-            .{ .name = "jinja_c", .module = libs.addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
-            .{ .name = "stb", .module = libs.addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
-            .{ .name = "webp", .module = libs.addCHeaderModule(b, b.path("src/webp_stub.h"), b.path("src"), target, optimize, "") },
-        },
-    });
-    _ = libs.addExl3Module(b, mod, target, optimize);
-    return mod;
-}
