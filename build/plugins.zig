@@ -16,8 +16,9 @@ const denied = [_][]const u8{ "src/mlx/", "src/engines/", "src/host/", "src/kern
 const macos_only_line = "\npub const macos_only = true;";
 
 /// Zig caches the configure phase: every input the scan reads is declared, so a new plugin folder, a changed
-/// `config.zig` closure, a new fixture or a deleted registry re-runs it. Returns the registered plugins' names.
-pub fn generate(b: *std.Build) []const []const u8 {
+/// `config.zig` closure, a new fixture or a deleted registry re-runs it. Returns the names of the plugins a build for
+/// `os` compiles in (its `-Dunits` plugin groups): a macOS-only one only for macOS, as the registry keeps it.
+pub fn generate(b: *std.Build, os: std.Target.Os.Tag) []const []const u8 {
     const a = b.allocator;
     const io = b.graph.io;
     const root = b.root.root_dir.handle;
@@ -51,7 +52,14 @@ pub fn generate(b: *std.Build) []const []const u8 {
     const src = render(a, split.plugins, in_config, macos_only, split.templates, jsons.items) catch @panic("OOM");
     writeIfChanged(io, root, registry_path, src) catch |e| std.process.fatal("plugins: cannot write {s}: {t}", .{ registry_path, e });
     b.dependOnFileContents(b.path(registry_path));
-    return split.plugins;
+    return builtFor(a, split.plugins, macos_only, os) catch @panic("OOM");
+}
+
+/// The plugins a build for `os` compiles in, in order: every one on macOS, none that is macOS only elsewhere.
+fn builtFor(a: std.mem.Allocator, plugins: []const []const u8, macos_only: []const bool, os: std.Target.Os.Tag) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (plugins, macos_only) |n, m| if (!m or os == .macos) try out.append(a, n);
+    return out.items;
 }
 
 /// `-Dunits`: one root per plugin group, `src/unit_<g>.zig` (generated, git-ignored), importing only its own plugins so
@@ -394,6 +402,21 @@ test "build plugins: the -Dunits metadata reads each plugin's config.zig where i
     try testing.expect(std.mem.indexOf(u8, src, "@import(\"flint/config.zig\").plugin,") != null);
     try testing.expect(std.mem.indexOf(u8, src, "@import(\"laguna/plugin.zig\").plugin,") != null);
     try testing.expect(std.mem.indexOf(u8, src, "sdk.externEntries(&unit_metas)") != null);
+}
+
+test "build plugins: a macOS-only plugin is in no other target's plugin units" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const names: []const []const u8 = &.{ "flint", "deepseek_v41", "laguna" };
+    const flags: []const bool = &.{ false, true, false };
+    try testing.expectEqual(@as(usize, 3), (try builtFor(a, names, flags, .macos)).len);
+    for ([_]std.Target.Os.Tag{ .linux, .windows, .ios }) |os| {
+        const got = try builtFor(a, names, flags, os);
+        try testing.expectEqual(@as(usize, 2), got.len);
+        try testing.expectEqualStrings("flint", got[0]);
+        try testing.expectEqualStrings("laguna", got[1]);
+    }
 }
 
 test "build plugins: a macOS-only plugin is listed with its flag and kept, in order, only behind `if (macos)`" {
