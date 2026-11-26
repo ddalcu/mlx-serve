@@ -230,14 +230,17 @@ pub fn moeDown(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A, 
 pub fn runDown(sc: *dsv41.Scope, kern: Kernels, f: fp4.Format, R: usize, K: usize, N: usize, topk: usize, hc: usize, nc: usize, act: A, w: A, scales: A, sw: A, sscales: A, idx: A, x1: A, post: A, comb: A) !A {
     const order = R >= order_min_rows and orderOn();
     if (order and !order_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info(lev.line(.MOE_DOWN_ORDER) ++ "\n", .{});
-    return launchDown(sc, if (order) kern.down_order else kern.down, order, f, R, K, N, topk, hc, nc, act, w, scales, sw, sscales, idx, x1, post, comb);
+    return launchDown(sc, if (order) kern.down_order else kern.down, order, f, R, K, N, topk, hc, nc, act, w, scales, sw, sscales, idx, x1, post, comb, null);
 }
 
 /// `runDown` on `down` (a down pipeline), its grid row major or (`order`, the `DSV41_DOWN_ORDER` pipelines) column
 /// block major.
-fn launchDown(sc: *dsv41.Scope, down: mlx.mlx_fast_metal_kernel, order: bool, f: fp4.Format, R: usize, K: usize, N: usize, topk: usize, hc: usize, nc: usize, act: A, w: A, scales: A, sw: A, sscales: A, idx: A, x1: A, post: A, comb: A) !A {
+/// `init`: a value MLX fills the output with before the launch (a test's poison: an element the kernel leaves unwritten
+/// reads as it, not as whatever a recycled buffer held); null, no fill.
+fn launchDown(sc: *dsv41.Scope, down: mlx.mlx_fast_metal_kernel, order: bool, f: fp4.Format, R: usize, K: usize, N: usize, topk: usize, hc: usize, nc: usize, act: A, w: A, scales: A, sw: A, sscales: A, idx: A, x1: A, post: A, comb: A, init: ?f32) !A {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    if (init) |v| try mlx.check(mlx.mlx_fast_metal_kernel_config_set_init_value(cfg, v));
     const shape = [_]c_int{ ci(R), ci(hc), ci(N) };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, shape.len, .bfloat16));
     const lv = Levers.fromEnv();
@@ -1014,12 +1017,14 @@ test "dsv41 dec moe_fp4: the column-major down grid gives the row-major launch's
         const post = try sc.keep(try fx.uniform(&.{ ci(rows), ci(hc) }, 0.05, 1.5));
         const comb = try sc.keep(try fx.uniform(&.{ ci(rows), ci(hc), ci(hc) }, -0.5, 0.5));
         const sh = &ly.shared[2];
-        const want = try moe_up.bitsOf(try launchDown(&sc, kern.down, false, f, rows, K, N, topk, hc, nc, act, down.w, down.s, sh.w, sh.s, idx, x1, post, comb));
+        // Outputs start NaN: an element a launch leaves unwritten reads wrong, never a recycled buffer's answer.
+        const poison = std.math.nan(f32);
+        const want = try moe_up.bitsOf(try launchDown(&sc, kern.down, false, f, rows, K, N, topk, hc, nc, act, down.w, down.s, sh.w, sh.s, idx, x1, post, comb, poison));
         defer gpa.free(want);
-        const got = try moe_up.bitsOf(try launchDown(&sc, kern.down_order, true, f, rows, K, N, topk, hc, nc, act, down.w, down.s, sh.w, sh.s, idx, x1, post, comb));
+        const got = try moe_up.bitsOf(try launchDown(&sc, kern.down_order, true, f, rows, K, N, topk, hc, nc, act, down.w, down.s, sh.w, sh.s, idx, x1, post, comb, poison));
         defer gpa.free(got);
         try testing.expectEqualSlices(u16, want, got);
-        const bad = try moe_up.bitsOf(try launchDown(&sc, plant, true, f, rows, K, N, topk, hc, nc, act, down.w, down.s, sh.w, sh.s, idx, x1, post, comb));
+        const bad = try moe_up.bitsOf(try launchDown(&sc, plant, true, f, rows, K, N, topk, hc, nc, act, down.w, down.s, sh.w, sh.s, idx, x1, post, comb, poison));
         defer gpa.free(bad);
         try testing.expect(!std.mem.eql(u16, want, bad));
     };
