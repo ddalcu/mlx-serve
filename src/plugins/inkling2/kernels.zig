@@ -82,9 +82,10 @@ pub var mid_kernel: Kernel = .{ .name = "msv_inkling2_mid", .ins = &.{ "OP", "ST
 pub var gate_kernel: Kernel = .{ .name = "msv_inkling2_gate", .ins = &.{ "A", "MS", "ST", "F", "G" }, .outs = &.{"Y"}, .source = kernelSource("plugins/inkling2/kernels/gate.metal") };
 pub var norm_kernel: Kernel = .{ .name = "msv_inkling2_norm", .ins = &.{ "Y", "NW0", "NW1", "NW2", "RT", "PR" }, .outs = &.{ "X", "SCORES" }, .source = kernelSource("plugins/inkling2/kernels/norm.metal") };
 pub var topk_kernel: Kernel = .{ .name = "msv_inkling2_topk", .ins = &.{ "SC", "RB", "PR" }, .outs = &.{ "IDX", "WTS" }, .source = kernelSource("plugins/inkling2/kernels/topk.metal") };
+pub var topk_group_kernel: Kernel = .{ .name = "msv_inkling2_topk_group", .ins = &.{ "SC", "RB", "PR" }, .outs = &.{ "IDX", "WTS", "TEXP", "TCNT", "TPICK" }, .source = kernelSource("plugins/inkling2/kernels/topk_group.metal") };
 pub var act_kernel: Kernel = .{ .name = "msv_inkling2_act", .ins = &.{ "GU", "IDX", "SC", "PR" }, .outs = &.{"ACT"}, .source = kernelSource("plugins/inkling2/kernels/act.metal") };
 pub var ups_kernel: Kernel = .{ .name = "msv_inkling2_ups", .ins = &.{ "X", "WQ", "WS", "WB", "SCR", "RB", "RS", "IDX", "SC", "PR" }, .outs = &.{ "ACT", "PIDX", "PWTS" }, .source = kernelSource("plugins/inkling2/kernels/ups.metal"), .header = bank_header };
-pub var downs_kernel: Kernel = .{ .name = "msv_inkling2_downs", .ins = &.{ "ACT", "WQ", "WS", "WB", "IDX", "SC", "WTS", "RES", "ST", "MW", "PR" }, .outs = &.{ "HOUT", "XM" }, .source = kernelSource("plugins/inkling2/kernels/downs.metal"), .header = bank_header };
+pub var downs_kernel: Kernel = .{ .name = "msv_inkling2_downs", .ins = &.{ "ACT", "WQ", "WS", "WB", "IDX", "SC", "WTS", "RES", "ST", "MW", "PR", "KP", "VP", "OP" }, .outs = &.{ "HOUT", "XM", "NST" }, .source = kernelSource("plugins/inkling2/kernels/downs.metal"), .header = bank_header };
 pub var group_kernel: Kernel = .{ .name = "msv_inkling2_group", .ins = &.{"IDX"}, .outs = &.{ "TEXP", "TCNT", "TPICK" }, .source = kernelSource("plugins/inkling2/kernels/group.metal") };
 pub var ups_grp_kernel: Kernel = .{ .name = "msv_inkling2_ups_grp", .ins = &.{ "X", "WQ", "WS", "WB", "TEXP", "TCNT", "TPICK", "SC", "PR" }, .outs = &.{"ACT"}, .source = kernelSource("plugins/inkling2/kernels/ups_grp.metal"), .header = bank_header };
 pub var downs_grp_kernel: Kernel = .{ .name = "msv_inkling2_downs_grp", .ins = &.{ "ACT", "WQ", "WS", "WB", "TEXP", "TCNT", "TPICK" }, .outs = &.{"DN"}, .source = kernelSource("plugins/inkling2/kernels/downs_grp.metal"), .header = bank_header };
@@ -101,7 +102,9 @@ pub var relcomb_kernel: Kernel = .{ .name = "msv_inkling2_relcomb", .ins = &.{ "
 const markov_header = kernelSource("plugins/inkling2/kernels/markov_header.metal");
 pub var markov_rnn_kernel: Kernel = .{ .name = "msv_inkling2_markov_rnn", .ins = &.{ "W", "B", "ST", "PREV", "ROWS", "NEW", "TOK", "AT" }, .outs = &.{"P"}, .source = kernelSource("plugins/inkling2/kernels/markov_rnn.metal") };
 pub var markov_fold_kernel: Kernel = .{ .name = "msv_inkling2_markov_fold", .ins = &.{ "P", "FOLD", "FB", "BASE", "AT", "CAP" }, .outs = &.{ "PM", "PI", "PS" }, .source = kernelSource("plugins/inkling2/kernels/markov_fold.metal"), .header = markov_header };
+pub var markov_fold_q8_kernel: Kernel = .{ .name = "msv_inkling2_markov_fold_q8", .ins = &.{ "P", "FQ", "FS", "FQB", "FB", "BASE", "AT", "CAP", "LPARAMS" }, .outs = &.{ "PM", "PI", "PS", "GM", "SCALED" }, .source = kernelSource("plugins/inkling2/kernels/markov_fold_q8.metal"), .header = markov_header };
 pub var markov_pick_kernel: Kernel = .{ .name = "msv_inkling2_markov_pick", .ins = &.{ "PM", "PI", "PS", "P", "ST", "CAP" }, .outs = &.{ "TOKN", "CONF", "NST" }, .source = kernelSource("plugins/inkling2/kernels/markov_pick.metal"), .header = markov_header };
+pub var markov_pick_rnn_kernel: Kernel = .{ .name = "msv_inkling2_markov_pick_rnn", .ins = &.{ "PM", "PI", "PS", "GM", "P", "ST", "CAP", "W", "B", "PREV", "ROWS", "NEW", "AT" }, .outs = &.{ "TOKN", "CONF", "NST", "PN", "LSE" }, .source = kernelSource("plugins/inkling2/kernels/markov_pick_rnn.metal"), .header = markov_header };
 pub var relslots_kernel: Kernel = .{ .name = "msv_inkling2_relslots", .ins = &.{ "q", "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "rel", "sinks", "KEYS", "scale" }, .outs = &.{ "PART", "ML" }, .source = kernelSource("plugins/inkling2/kernels/relslots.metal"), .contiguous = false };
 pub var relmask_kernel: Kernel = .{ .name = "msv_inkling2_relmask", .ins = &.{ "rel", "sinks", "sizes" }, .outs = &.{"M"}, .source = kernelSource("plugins/inkling2/kernels/relmask.metal") };
 pub var sum_kernel: Kernel = .{ .name = "msv_inkling2_sum", .ins = &.{ "DN", "IDX", "INV", "SC", "WTS", "RES", "ST", "MW", "PR", "PARENT" }, .outs = &.{ "HOUT", "XM" }, .source = kernelSource("plugins/inkling2/kernels/sum.metal") };
@@ -552,9 +555,10 @@ pub fn relativeWith(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Arra
         return if (out_gate) |gt| gated(g, out, gt, s) else out;
     }
     const fused_gate = out_gate != null;
-    const bq: c_int = 64;
+    const wide = s >= 4096;
+    const bq: c_int = if (wide) 64 else 32;
     const bk: c_int = 32;
-    const tg: c_int = 256;
+    const tg: c_int = if (wide) 256 else 128;
     const o = try launchGrid(g, &relattn_kernel, &.{
         q, k, v, bias, sink_rows, try g.zeros(&.{1}, .int32), try g.fromSlice(i32, &.{ s, keys }, &.{2}), try g.scalar(scale, .float32), out_gate orelse sink_rows,
     }, 1, .{.{ .shape = if (fused_gate) &.{ 1, s, heads * hd } else &.{ 1, s, heads, hd }, .dtype = dt }}, .{ @divTrunc(s + bq - 1, bq) * tg, heads, 1 }, .{ tg, 1, 1 }, &.{
@@ -658,12 +662,74 @@ pub fn markovFold(g: *Graph, p: Array, fold: Array, fold_bias: Array, base: Arra
     });
 }
 
+/// `markov_fold_q8.metal`: 8-bit group-64 quantized fold over the vocab (54.7 MB fits in SLC).
+pub fn markovFoldQ8(g: *Graph, p: Array, fq: Array, fs: Array, fqb: Array, fold_bias: Array, base: Array, step: Array, vocab: c_int, cap: Array, dt: Dtype) ![3]Array {
+    const groups = @divTrunc(vocab + markov_tg * markov_cols - 1, markov_tg * markov_cols);
+    const rank = ops.shape(fq)[0];
+    const gs = @divExact(rank, ops.shape(fs)[0]);
+    const o = try launch(g, &markov_fold_q8_kernel, &.{ p, fq, fs, fqb, fold_bias, base, step, cap, step }, 5, .{
+        .{ .shape = &.{groups}, .dtype = .float32 }, .{ .shape = &.{groups}, .dtype = .uint32 }, .{ .shape = &.{groups}, .dtype = .float32 }, unused, unused,
+    }, groups * markov_tg, markov_tg, &.{
+        .{ "T", .{ .dtype = dt } }, .{ "R", .{ .int = rank } }, .{ "GS", .{ .int = gs } }, .{ "TG", .{ .int = markov_tg } },
+        .{ "VPT", .{ .int = markov_cols } }, .{ "VOCAB", .{ .int = vocab } }, .{ "LAW", .{ .int = 0 } },
+    });
+    return .{ o[0], o[1], o[2] };
+}
+
+/// `markov_fold_q8.metal` (`LAW=1`): 8-bit SLC fold + scaled logits `[1, vocab]` f32 + exact Gumbel-max partials.
+pub fn markovFoldQ8Law(g: *Graph, p: Array, fq: Array, fs: Array, fqb: Array, fold_bias: Array, base: Array, step: Array, vocab: c_int, cap: Array, lparams: Array, dt: Dtype) ![5]Array {
+    const groups = @divTrunc(vocab + markov_tg * markov_cols - 1, markov_tg * markov_cols);
+    const rank = ops.shape(fq)[0];
+    const gs = @divExact(rank, ops.shape(fs)[0]);
+    return launch(g, &markov_fold_q8_kernel, &.{ p, fq, fs, fqb, fold_bias, base, step, cap, lparams }, 5, .{
+        .{ .shape = &.{groups}, .dtype = .float32 },
+        .{ .shape = &.{groups}, .dtype = .uint32 },
+        .{ .shape = &.{groups}, .dtype = .float32 },
+        .{ .shape = &.{groups}, .dtype = .float32 },
+        .{ .shape = &.{ 1, vocab }, .dtype = .float32 },
+    }, groups * markov_tg, markov_tg, &.{
+        .{ "T", .{ .dtype = dt } }, .{ "R", .{ .int = rank } }, .{ "GS", .{ .int = gs } }, .{ "TG", .{ .int = markov_tg } },
+        .{ "VPT", .{ .int = markov_cols } }, .{ "VOCAB", .{ .int = vocab } }, .{ "LAW", .{ .int = 1 } },
+    });
+}
+
 /// `markov_pick.metal`: the step's token `[1]` int32, its probability `[1]` f32 and the next state `[1, 1, R]`.
 pub fn markovPick(g: *Graph, part: [3]Array, p: Array, state: Array, cap: Array) ![3]Array {
     const rank = @divExact(ops.shape(p)[0], 3);
     return launch(g, &markov_pick_kernel, &.{ part[0], part[1], part[2], p, state, cap }, 3, .{
         .{ .shape = &.{1}, .dtype = .int32 }, .{ .shape = &.{1}, .dtype = .float32 }, .{ .shape = &.{ 1, 1, rank }, .dtype = ops.dtype(state) },
     }, 256, 256, &.{ .{ "T", .{ .dtype = ops.dtype(state) } }, .{ "R", .{ .int = rank } } });
+}
+
+/// `markov_pick_rnn.metal`: fused pick of step `at - 1` + RNN projection of step `at` in one launch.
+pub fn markovPickRnn(g: *Graph, part: [3]Array, p: Array, state: Array, cap: Array, rnn: Array, rnn_bias: Array, prev_rows: Array, rows: Array, newest: Array, next_step: Array) ![4]Array {
+    const rank = @divExact(ops.shape(p)[0], 3);
+    const o = try launch(g, &markov_pick_rnn_kernel, &.{ part[0], part[1], part[2], part[0], p, state, cap, rnn, rnn_bias, prev_rows, rows, newest, next_step }, 5, .{
+        .{ .shape = &.{1}, .dtype = .int32 },
+        .{ .shape = &.{1}, .dtype = .float32 },
+        .{ .shape = &.{ 1, 1, rank }, .dtype = ops.dtype(state) },
+        .{ .shape = &.{3 * rank}, .dtype = .float32 },
+        unused,
+    }, 32 * 3 * rank, 256, &.{
+        .{ "T", .{ .dtype = ops.dtype(state) } }, .{ "R", .{ .int = rank } }, .{ "H", .{ .int = ops.shape(rows)[2] } },
+        .{ "LAW", .{ .int = 0 } }, .{ "DO_RNN", .{ .int = 1 } },
+    });
+    return .{ o[0], o[1], o[2], o[3] };
+}
+
+/// `markov_pick_rnn.metal` (`LAW=1`): reduces Gumbel-max pick + softmax LSE, optionally running next-step RNN (`do_rnn`).
+pub fn markovPickRnnLaw(g: *Graph, part: [4]Array, p: Array, state: Array, cap: Array, rnn: Array, rnn_bias: Array, prev_rows: Array, rows: Array, newest: Array, next_step: Array, do_rnn: bool) ![5]Array {
+    const rank = @divExact(ops.shape(p)[0], 3);
+    return launch(g, &markov_pick_rnn_kernel, &.{ part[0], part[1], part[2], part[3], p, state, cap, rnn, rnn_bias, prev_rows, rows, newest, next_step }, 5, .{
+        .{ .shape = &.{1}, .dtype = .int32 },
+        .{ .shape = &.{1}, .dtype = .float32 },
+        if (do_rnn) .{ .shape = &.{ 1, 1, rank }, .dtype = ops.dtype(state) } else unused,
+        if (do_rnn) .{ .shape = &.{3 * rank}, .dtype = .float32 } else unused,
+        .{ .shape = &.{1}, .dtype = .float32 },
+    }, if (do_rnn) 32 * 3 * rank else 256, 256, &.{
+        .{ "T", .{ .dtype = ops.dtype(state) } }, .{ "R", .{ .int = rank } }, .{ "H", .{ .int = ops.shape(rows)[2] } },
+        .{ "LAW", .{ .int = 1 } }, .{ "DO_RNN", .{ .int = @intFromBool(do_rnn) } },
+    });
 }
 
 /// What a read of the rows takes: q `[1, H, S, hd]` (log-scaled on a global layer past the floor), the bias rows
@@ -1448,14 +1514,19 @@ pub fn tileScan(g: *Graph, sel: Array, num_experts: u32, bm: c_int) !ExpertTiles
     return .{ .tiles = o[0], .count = o[1], .max_tiles = max_tiles, .bm = bm, .m = m };
 }
 
+/// Minimum prefill rows for `moeWide`: below 1536, per-expert row counts underfill wide 32/64-row tiles and stock
+/// sorted `gather_qmm` is faster (recovering 0.5k prefill and batched TTFT); at 1536+ (including 2048/4096 chunks)
+/// `moeWide` wins via fused SwiGLU and zero input scatter copy.
+pub const moe_wide_min_rows: c_int = 1536;
+
 /// Whether `moeWide` serves a prompt's sorted experts on this GPU: non-NAX Apple9+ (native `simdgroup_matrix<bfloat>`),
-/// packed banks over multiples of 32, and rows past `packed_rows`.
+/// packed banks over multiples of 32, and rows at or past `moe_wide_min_rows`.
 pub fn moeWideRuns(g: *const Graph, dt: Dtype, s: c_int, cfg: *const Config, L: *const Layer) bool {
     if (!mlx.streamIsGpu(g.s) or !enabled()) return false;
     const dev = @import("../../mlx/device.zig");
     if (dev.naxAvailable() or dev.deviceGeneration().gen < 15) return false;
     if (dt != .bfloat16 and dt != .float16) return false;
-    if (s <= packed_rows or cfg.num_experts > 2048) return false;
+    if (s < moe_wide_min_rows or cfg.num_experts > 2048) return false;
     const hidden: c_int = @intCast(cfg.hidden_size);
     const inter: c_int = @intCast(cfg.moe_intermediate_size);
     if (@rem(hidden, 32) != 0 or @rem(inter, 32) != 0) return false;
@@ -1486,6 +1557,27 @@ pub fn moeWide(g: *Graph, x: Array, bank: anytype, scale: Array, tiles: ExpertTi
     return o[0];
 }
 
+/// Fused `topK` + `groupPicks` for verify widths (`s = 2..8`, `E <= 128`, `E % 32 == 0`), bit-identical to running
+/// both kernels in sequence. Returns `{ idx [1, S, k], wts [1, S, k], texp [N], tcnt [N], tpick [N * 4] }`.
+pub fn topKGroup(g: *Graph, scores: Array, bias: Array, scale: Array, k: c_int, num_experts: u32) ![5]Array {
+    const sh = ops.shape(scores);
+    const s = sh[sh.len - 2];
+    const e: c_int = @intCast(num_experts);
+    const sc2 = if (sh.len == 2) scores else try g.reshape(scores, &.{ s, e });
+    const n = s * k;
+    const rpar: c_int = @min(s, @divTrunc(512, e));
+    const tg: c_int = rpar * e;
+    return launch(g, &topk_group_kernel, &.{ sc2, bias, scale }, 5, .{
+        .{ .shape = &.{ 1, s, k }, .dtype = .uint32 },
+        .{ .shape = &.{ 1, s, k }, .dtype = .float32 },
+        .{ .shape = &.{n}, .dtype = .uint32 },
+        .{ .shape = &.{n}, .dtype = .uint32 },
+        .{ .shape = &.{n * 4}, .dtype = .uint32 },
+    }, tg, tg, &.{
+        .{ "E", .{ .int = e } }, .{ "KSEL", .{ .int = k } }, .{ "MAXN", .{ .int = 8 * k } }, .{ "TG", .{ .int = tg } },
+    });
+}
+
 /// `layers.tail`. The visit's new conv state (off the next visit's path) is `st` behind the rows' k and v projections
 /// `kp`, `vp`, their output projection and the MLP's output.
 /// One row, a packed bank read in place: the router's picks, their gate_up and the soft-capped SwiGLU as one launch,
@@ -1505,8 +1597,11 @@ pub fn experts(g: *Graph, L: *const Layer, cfg: *const Config, m: *const Middle,
     const gu_fmt = packedFormat(&L.gate_up, hidden);
     const dn_fmt = packedFormat(&L.down, inter);
     const few = s > 1 and s <= packed_rows and gu_fmt != null and dn_fmt != null;
+    const fused_tkg = few and s <= 8 and cfg.num_experts <= 128 and @rem(cfg.num_experts, 32) == 0;
+    const rs = try g.fromSlice(f32, &.{cfg.route_scale}, &.{1});
+    const tkg: ?[5]Array = if (fused_tkg) try topKGroup(g, m.scores, L.router_bias, rs, top_k, cfg.num_experts) else null;
     const up = if (s == 1 and gu_fmt != null) try ups(g, L, cfg, m.x, .{ .scores = m.scores }) else null;
-    const picks: [2]Array = if (up) |u| .{ u[1], u[2] } else try topK(g, m.scores, L.router_bias, try g.fromSlice(f32, &.{cfg.route_scale}, &.{1}), top_k);
+    const picks: [2]Array = if (tkg) |tk| .{ tk[0], tk[1] } else if (up) |u| .{ u[1], u[2] } else try topK(g, m.scores, L.router_bias, rs, top_k);
     const weights = picks[1];
     const caps = try g.fromSlice(f32, &.{ 1.0 / cfg.gate_softcap, cfg.gate_softcap, 1.0 / cfg.up_softcap, cfg.up_softcap }, &.{4});
     const conv_scale = try g.fromSlice(f32, &.{1.0 / @sqrt(@as(f32, @floatFromInt(kt + 1)))}, &.{1});
@@ -1516,7 +1611,7 @@ pub fn experts(g: *Graph, L: *const Layer, cfg: *const Config, m: *const Middle,
 
     if (few) {
         const sel = try g.reshape(picks[0], &.{n});
-        const grp = try groupPicks(g, sel, cfg.num_experts);
+        const grp: [3]Array = if (tkg) |tk| .{ tk[2], tk[3], tk[4] } else try groupPicks(g, sel, cfg.num_experts);
         const gu_scale = if (L.gate_up_scale.ctx != null) L.gate_up_scale else caps;
         const gu_scaled: TArg = .{ .int = @intFromBool(L.gate_up_scale.ctx != null) };
         const act_out: [1]Out = .{.{ .shape = &.{ n, 1, inter }, .dtype = dt }};
@@ -1595,16 +1690,21 @@ pub fn experts(g: *Graph, L: *const Layer, cfg: *const Config, m: *const Middle,
         break :blk .{try activation(g, gu, sel, if (L.gate_up_scale.ctx != null) L.gate_up_scale else caps, caps, L.gate_up_scale.ctx != null)};
     };
 
-    // The down kernel's threadgroup holds every pick of its row.
-    const o = if (if (s == 1 and 32 * top_k <= sure_threads) dn_fmt else null) |fmt|
-        try launchGrid(g, &downs_kernel, &.{ act[0], L.down.w, L.down.s, biasesOf(&L.down), sel, dn_scale, weights, m.residual, st, L.mlp_conv, conv_scale }, 2, tail_out, .{ 32, top_k, @divExact(hidden, bank_rows) }, .{ 32, top_k, 1 }, &.{
+    // The down kernel's threadgroup holds every pick of its row and updates the conv state in-place.
+    if (if (s == 1 and open == null and 32 * top_k <= sure_threads) dn_fmt else null) |fmt| {
+        const st_sh = ops.shape(st);
+        const o = try launchGrid(g, &downs_kernel, &.{ act[0], L.down.w, L.down.s, biasesOf(&L.down), sel, dn_scale, weights, m.residual, st, L.mlp_conv, conv_scale, kp, vp, m.op }, 3, .{
+            tail_out[0], tail_out[1], .{ .shape = &.{ st_sh[0], st_sh[1], st_sh[2] }, .dtype = .float32 },
+        }, .{ 32, top_k, @divExact(hidden, bank_rows) }, .{ 32, top_k, 1 }, &.{
             .{ "T", .{ .dtype = dt } },         .{ "WT", .{ .dtype = ops.dtype(L.mlp_conv) } },        .{ "I", .{ .int = inter } },
             .{ "D", .{ .int = hidden } },       .{ "GS", .{ .int = @intCast(L.down.qp.group_size) } }, .{ "FMT", .{ .int = fmt } },
             .{ "ROWS", .{ .int = bank_rows } }, .{ "KSEL", .{ .int = top_k } },                        .{ "KT", .{ .int = kt } },
             .{ "BITS", .{ .int = @intCast(L.down.qp.bits) } }, .{ "S", .{ .dtype = ops.dtype(L.down.s) } },
             .{ "SCALED", dn_scaled },           .{ "TAIL", .{ .int = 1 } },
-        })
-    else blk: {
+        });
+        return .{ .h = o[0], .state = o[2] };
+    }
+    const o = blk: {
         const dn = try layers.gather(g, act[0], &L.down, sel, sorted);
         if (!floating(ops.dtype(dn))) return error.Inkling2StepDtype;
         // Unsorted pairs sit in (row, pick) order already.

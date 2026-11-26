@@ -1386,7 +1386,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         m.tap_visits = dc.taps;
         m.spec = .{ .visits = m.tap_visits[0 .. dc.tap_count - 1], .keep = @intCast(dc.window - 1) };
         m.base.weights.spec = &m.spec;
-    } else if (drafts_on) if (c.draft) |dc| if (try draft.Drafter.load(ctx, dc, c.hidden_size, &head, r.s)) |d| {
+    } else if (drafts_on) if (c.draft) |dc| if (try draft.Drafter.load(ctx, dc, c.hidden_size, &head, r.s, draft_bits)) |d| {
         m.drafter = d;
         m.tap_visits = dc.taps;
         m.spec = .{ .visits = m.tap_visits[0 .. dc.tap_count - 1], .keep = @intCast(dc.window - 1) };

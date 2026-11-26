@@ -27,8 +27,12 @@ const device S* ba = (const device S*)WB + base * SPR;
 float acc[ROWS];
 for (uint r = 0; r < ROWS; r++) acc[r] = 0.0f;
 for (uint k = lane * 16; k < I; k += 512) {
-    float xr[16];
-    for (uint i = 0; i < 16; i++) xr[i] = float(ACT[size_t(p) * I + k + i]);
+    const device vec<T, 4>* xp = (const device vec<T, 4>*)(ACT + size_t(p) * I + k);
+    const float4 v0 = float4(xp[0]), v1 = float4(xp[1]), v2 = float4(xp[2]), v3 = float4(xp[3]);
+    float xr[16] = {
+        v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w,
+        v2.x, v2.y, v2.z, v2.w, v3.x, v3.y, v3.z, v3.w,
+    };
     for (uint r = 0; r < ROWS; r++)
         acc[r] += FMT == 3 ? msv_ink2_affine_chunk<S, BITS, GS>(arow + r * WBR, sa + r * SPR, ba + r * SPR, k / 16, xr)
                            : msv_ink2_chunk(FMT, wrow + r * WPR, scales + r * SPR, k / 16, xr);
@@ -49,4 +53,27 @@ if (e == 0 && lane < ROWS) {
     for (uint j = 0; j < KT; j++) y += ((j + 1 < KT) ? ST[j * SW + OFF + c] : float(xm)) * float(MW[c * KT + j]);
     y = float(WT(y));
     HOUT[c] = T(RES[c] + float(T((y + float(xm)) * PR[0])));
+    for (uint j = 0; j + 1 < KT - 1; j++) NST[j * SW + OFF + c] = ST[(j + 1) * SW + OFF + c];
+    NST[(KT - 2) * SW + OFF + c] = float(xm);
+    if constexpr (KSEL == 1) {
+        const uint C = KP_shape[2];
+        for (uint col = c; col < OFF; col += D) {
+            for (uint j = 0; j + 1 < KT - 1; j++) NST[j * SW + col] = ST[(j + 1) * SW + col];
+            float val;
+            if (col < C) val = float(KP[col]);
+            else if (col < 2 * C) val = float(VP[col - C]);
+            else val = float(OP[col - 2 * C]);
+            NST[(KT - 2) * SW + col] = val;
+        }
+    }
+} else if (TAIL && KSEL > 1 && lane < ROWS) {
+    const uint C = KP_shape[2];
+    for (uint col = (e - 1) * D + row0 + lane; col < OFF; col += (KSEL - 1) * D) {
+        for (uint j = 0; j + 1 < KT - 1; j++) NST[j * SW + col] = ST[(j + 1) * SW + col];
+        float val;
+        if (col < C) val = float(KP[col]);
+        else if (col < 2 * C) val = float(VP[col - C]);
+        else val = float(OP[col - 2 * C]);
+        NST[(KT - 2) * SW + col] = val;
+    }
 }
