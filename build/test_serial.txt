@@ -14,4 +14,3 @@ fake engine: the contract catches every planted flaw, by name, in both threading
 llama adapter: the contract holds over a model-free bridge, batched and with MTP rounds	# 500 ms status gate
 ds4 adapter: the contract holds over a model-free bridge, speculative rounds and the plain path	# 500 ms status gate
 ane adapter: the contract holds over a model-free lm, several slots, and DFlash cycles	# 500 ms status gate
-deepseek_v41 served: DSpark rounds (greedy, then seeded sampling) equal the legacy shell's	# rows follow measured round times

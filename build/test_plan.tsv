@@ -312,7 +312,7 @@ gpu	82	plugins.deepseek_v4.proof_test.test.deepseek_v4 plugin: a position that d
 gpu	4269	plugins.deepseek_v4.proof_test.test.deepseek_v4 plugin: prefill, decode (lazy on the GPU), a verify block and a later chunk equal the legacy seam bit for bit
 gpu	3001	plugins.deepseek_v4.served_test.test.deepseek_v4 served: DSpark rounds (greedy, then seeded sampling) equal the legacy shell's
 gpu	1464	plugins.deepseek_v4.served_test.test.deepseek_v4 served: chunked prefill, host and pipelined decodes and a new request equal the legacy forward bit for bit
-serial	8466	plugins.deepseek_v4.served_test.test.deepseek_v41 served: DSpark rounds (greedy, then seeded sampling) equal the legacy shell's
+gpu	8466	plugins.deepseek_v4.served_test.test.deepseek_v41 served: DSpark rounds (greedy, then seeded sampling) equal the legacy shell's
 gpu	795	plugins.deepseek_v4.served_test.test.deepseek_v41 served: a batched verify gives each state its solo verify's rows, and its kept prefix the state a solo round leaves
 gpu	11532	plugins.deepseek_v4.served_test.test.deepseek_v41 served: a draft-only head (DRAFT_VOCAB) changes the drafts, never the tokens, greedy and seeded
 gpu	1393	plugins.deepseek_v4.served_test.test.deepseek_v41 served: a pack that quantized its DSpark heads drafts from them dequantized

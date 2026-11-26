@@ -22,6 +22,7 @@ const prefix_cache = @import("../../engines/mlx/cache/prefix_cache.zig");
 const verdict = @import("../../engines/mlx/batching/verdict.zig");
 const env = @import("../../env.zig");
 const Generator = @import("../../engines/mlx/generate/generator.zig").Generator;
+const dspark_spec = @import("../../engines/mlx/spec/dspark.zig");
 const SamplingParams = @import("../../engines/mlx/sampling/params.zig").SamplingParams;
 const Tokenizer = @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer;
 const Tape = @import("../../engines/mlx/plugin/tape.zig").Tape;
@@ -1084,6 +1085,9 @@ test "deepseek_v41 served: DSpark rounds (greedy, then seeded sampling) equal th
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const files = try fixture.v41DsparkFiles(arena.allocator(), 7);
+    // Every round verifies 3 rows (t1 and 2 drafts): the adaptive widths follow measured round times.
+    dspark_spec.test_pin_rows = 3;
+    defer dspark_spec.test_pin_rows = 0;
     try expectDspark(@import("../deepseek_v41/plugin.zig"), files, .{ .temperature = 0 }, 4, @embedFile("../deepseek_v41/fixtures/dspark-greedy.tape"));
     // The sampled tape records the legacy shell's one-hot acceptance of argmax drafts (DRAFT_SAMPLE=0).
     const one_hot = env.override(.MLX_SERVE_DSV41_DRAFT_SAMPLE, "0");
