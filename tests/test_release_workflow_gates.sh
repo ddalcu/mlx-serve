@@ -8,7 +8,8 @@
 # ReleaseFast default, `-Doptimize=Debug` only under the ZIG_DEBUG gate, which is FAST_DEV-only and refused by name,
 # signing skipped only with the staging that invalidates it, the FAST_DEV exit after signing and before notarizing).
 # ci.yml, linux.yml, windows.yml and the two one-shot build scripts: only a pull request builds below ReleaseFast or
-# strips the test binary, and only main saves Actions caches (the MLX and ds4 stages aside).
+# strips the test binary, and only main saves Actions caches (the MLX and ds4 stages aside). linux.yml's libjinja
+# cache key hashes the inputs of build-linux.sh's libjinja stamp.
 #
 #   ./tests/test_release_workflow_gates.sh   # hermetic: PyYAML parse, no runners
 
@@ -19,7 +20,7 @@ PY=python3
 [ -x venv/bin/python3 ] && PY=venv/bin/python3
 
 "$PY" - <<'EOF'
-import re, sys, yaml
+import glob, re, sys, yaml
 
 FAIL = 0
 def check(cond, msg):
@@ -491,6 +492,44 @@ test_runs = [str(s.get("run", "")) for s in ci_jobs["zig-test"]["steps"]
 check(len(test_runs) == 1 and STRIP_ON_PR in test_runs[0]
       and "-Dstrip" not in test_runs[0].replace(STRIP_ON_PR, ""),
       "ci.yml strips the test binary on pull requests only")
+
+# ── libjinja cache: build-linux.sh rebuilds on a stamp mismatch, and an exact key hit is never saved again, so a
+# file the stamp hashes and the key does not would rebuild on every run.
+JINJA_FILES = {"lib/jinja_cpp/libjinja-linux.a", "lib/jinja_cpp/.linux-version"}
+linux_steps = linux["jobs"]["cuda"]["steps"]
+
+def step_at(uses, name):
+    return next((i for i, s in enumerate(linux_steps)
+                 if s.get("name") == name and str(s.get("uses", "")).startswith(uses)), None)
+
+restore_at = step_at("actions/cache/restore@", "Restore libjinja")
+save_at = step_at("actions/cache/save@", "Save libjinja")
+build_at = next((i for i, s in enumerate(linux_steps) if s.get("run") == "./scripts/build-linux.sh"), None)
+check(None not in (restore_at, build_at, save_at) and restore_at < build_at < save_at,
+      "linux.yml restores libjinja before the build and saves it after")
+restore = linux_steps[restore_at] if restore_at is not None else {}
+save = linux_steps[save_at] if save_at is not None else {}
+for what, s in (("restore", restore), ("save", save)):
+    check(set(str(s.get("with", {}).get("path", "")).split()) == JINJA_FILES,
+          f"the libjinja {what} carries the archive and its stamp")
+key = str(restore.get("with", {}).get("key", ""))
+check(restore.get("id") == "jinja"
+      and save.get("with", {}).get("key") == "${{ steps.jinja.outputs.cache-primary-key }}",
+      "the libjinja save writes the key the restore missed")
+check("steps.jinja.outputs.cache-hit != 'true'" in str(save.get("if", ""))
+      and "hashFiles('lib/jinja_cpp/.linux-version') != ''" in str(save.get("if", "")),
+      "libjinja is saved only after a miss that left a stamp")
+for part in ("matrix.name", "env.ZIG_CPU"):
+    check(part in key, f"the libjinja cache key names {part}")
+hashed = set(re.findall(r"'([^']+)'", " ".join(re.findall(r"hashFiles\(([^)]*)\)", key))))
+stamp_inputs = re.search(r"^JINJA_INPUTS=\((.*)\)$", open("scripts/build-linux.sh").read(), re.M)
+stamp_inputs = set(stamp_inputs.group(1).split()) if stamp_inputs else set()
+drift = sorted(hashed ^ (stamp_inputs | {"scripts/fetch-zig.sh"}))
+check(stamp_inputs and not drift,
+      f"the libjinja cache key hashes the stamp's inputs and the pinned Zig, no more (differ: {drift})")
+stamped = {p for pattern in stamp_inputs for p in glob.glob(pattern)}
+sources = {p for ext in ("cpp", "h", "hpp") for p in glob.glob(f"lib/jinja_cpp/**/*.{ext}", recursive=True)}
+check(sources and sources <= stamped, f"the libjinja stamp covers every source and header (missing: {sorted(sources - stamped)})")
 
 # ── The 10 GB Actions cache cap: only main saves. The MLX and ds4 stages take an hour to rebuild, so a pull request
 # that changes their inputs keeps its own copy.
