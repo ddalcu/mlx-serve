@@ -163,6 +163,11 @@ pub const Generator = struct {
     /// chokepoint when the request samples (temp ≥ 0.01, top_k ≠ 1) and the
     /// stochastic arm isn't env-killed; meaningless unless `dspark_enabled`.
     dspark_stochastic: bool = false,
+    /// The stochastic arm's typical pair (`dspark.Rule.typical`, LOSSY; the request's `mtp_acceptance`), null for the
+    /// exact rule. Copied drafts keep the exact rule whatever it is (`dspark.draftRule`).
+    dspark_typical: ?mtp_acceptance.Typical = null,
+    /// Sampled rounds the typical rule decided (`dspark.stochasticVerdict`), for `[spec-stats] dspark typical`.
+    dspark_typical_rounds: u64 = 0,
     dspark_attempted: u64 = 0,
     dspark_accepted_tokens: u64 = 0,
     /// Rounds whose drafts were copied from the context (`dsparkCopyStep`), included in `dspark_attempted`.
@@ -269,7 +274,7 @@ pub const Generator = struct {
     /// Installed verifier route; selected once at init, not checked per token.
     mtp_accept_graph: MtpGraphFn = mtpBatchedExactGraph,
     mtp_accept_prefix: mtp_acceptance.PrefixFn = mtp_acceptance.exactPrefix,
-    mtp_accept_param: f32 = 0,
+    mtp_accept_param: mtp_acceptance.Param = .{},
     /// A sampled request drafts only depth 0 from the draft sampler, every later depth by argmax.
     mtp_greedy_tail: bool = false,
     /// A row-exact trunk verifies sampled rounds with the serial sampler itself:

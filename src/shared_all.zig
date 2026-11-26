@@ -20,6 +20,7 @@ comptime {
     _ = @import("plugins/deepseek_v41/prompt/scratch_x1.zig").shared_state;
     _ = @import("plugins/deepseek_v41/prompt/transient_keep.zig").shared_state;
     _ = @import("plugins/deepseek_v41/prompt/keep_wide.zig").shared_state;
+    _ = @import("plugins/deepseek_v41/levers.zig").shared_state;
     _ = @import("host/plugin_host_impl.zig").process_shared;
     _ = @import("host/host_table.zig").published;
     _ = @import("host/http/server.zig").serverState_shared;

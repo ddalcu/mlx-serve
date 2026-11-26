@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const log = @import("../../../sdk/util/log.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
@@ -27,7 +28,7 @@ const A = mlx.mlx_array;
 
 /// The switch's value, read by the bill and once by the load (`Table.plan`); call sites read the table.
 pub fn level() u32 {
-    return env.int(.MLX_SERVE_DSV41_PF_INT8, u32, 0);
+    return lev.int(.PF_INT8, u32, 0);
 }
 
 /// The linears a level can take, one table column each.
@@ -291,7 +292,7 @@ pub fn apply(sc: *dsv41.Scope, lv: u32, w: *const w8a8.Weight, x: A, out_dt: mlx
     var x8 = try w8a8.quantize(xin, sc.s);
     defer x8.deinit();
     const y = try sc.keep(try w8a8.gemm(x8, w, out_dt, false, sc.s));
-    if (!trunk_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_INT8={d} engaged (not lossless): trunk {s} on int8 (w8a8: rotated, a scale a row), first {s} over {d} rows\n", .{ lv, if (lv == 4) @as([]const u8, "wq_b, wo_b, the shared expert and wq_a+wkv") else "wq_b and wo_b", name, L });
+    if (!trunk_logged.swap(true, .monotonic)) log.info(lev.line(.PF_INT8) ++ " (level {d}, not lossless): trunk {s} on int8 (w8a8: rotated, a scale a row), first {s} over {d} rows\n", .{ lv, if (lv == 4) @as([]const u8, "wq_b, wo_b, the shared expert and wq_a+wkv") else "wq_b and wo_b", name, L });
     _ = trunk_calls.fetchAdd(1, .monotonic);
     return y;
 }

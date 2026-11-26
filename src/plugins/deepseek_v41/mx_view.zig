@@ -6,6 +6,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const env = @import("../../env.zig");
+const lev = @import("levers.zig");
 const log = @import("../../sdk/util/log.zig");
 const weights_load = @import("../../sdk/weights/load.zig");
 const dsv41 = @import("deepseek_v41.zig");
@@ -14,7 +15,7 @@ const A = mlx.mlx_array;
 const S = mlx.mlx_stream;
 
 pub fn on() bool {
-    return env.on(.MLX_SERVE_DSV41_MXFP4_VIEW);
+    return lev.on(.MXFP4_VIEW);
 }
 
 /// The exponent of e4m3 byte `b` where it is a positive power of two: 2^-9 .. 2^-7 subnormal, 2^-6 .. 2^8 normal.
@@ -122,7 +123,7 @@ pub const Tally = struct {
 
     pub fn report(t: *const Tally) void {
         if (t.viewed + t.refused == 0) return;
-        log.info("deepseek_v41: NVFP4 routed experts served as MXFP4 (MLX_SERVE_DSV41_MXFP4_VIEW): {d} of {d} banks, {d:.2} GB of e4m3 scales and globals as {d:.2} GB of e8m0, {d} ms{s}\n", .{ t.viewed, t.viewed + t.refused, gb(t.nv_bytes), gb(t.mx_bytes), t.ms, if (t.refused > 0) "; the others stay NVFP4, named above" else "" });
+        log.info(lev.line(.MXFP4_VIEW) ++ " (MLX_SERVE_DSV41_MXFP4_VIEW): {d} of {d} banks, {d:.2} GB of e4m3 scales and globals as {d:.2} GB of e8m0, {d} ms{s}\n", .{ t.viewed, t.viewed + t.refused, gb(t.nv_bytes), gb(t.mx_bytes), t.ms, if (t.refused > 0) "; the others stay NVFP4, named above" else "" });
     }
 };
 

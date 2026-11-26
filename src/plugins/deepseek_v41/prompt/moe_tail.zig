@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
@@ -23,7 +24,7 @@ var engaged_logged: std.atomic.Value(bool) = .init(false);
 /// The new streams `[L, hc, d]` after layer `li`'s MoE over the normed rows `x` (`img` its image rows) on the streams
 /// `x1` with the split `sf`; null where the switch is off or the layer's experts are not the trunk's resident banks.
 pub fn tail(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, li: usize, x: A, img: A, x1: A, sf: *const dsv41.Split) !?A {
-    if (!env.onUnlessZero(.MLX_SERVE_DSV41_MOE_TAIL)) return null;
+    if (!lev.onUnlessZero(.MOE_TAIL)) return null;
     if (li >= m.n_layers or m.streamed != null or m.tp != null or mlx.getShape(x)[0] <= dsv41.region_rows) return null;
     const ly = &m.layers[li];
     if (ly.experts.ext != null or mlx.mlx_array_dtype(x) != m.act or mlx.mlx_array_dtype(x1) != m.act) return null;
@@ -40,7 +41,7 @@ pub fn launch(sc: *dsv41.Scope, p: dsv41.MoeParts, x1: A, sf: *const dsv41.Split
     const k = @divExact(@as(c_int, @intCast(mlx.mlx_array_size(p.inv))), L);
     if (kernel == null) kernel = try dsv41.buildKernel("dsv41_moe_tail", &ins, &.{"out"}, source, "");
     if (p.tok and kernel_tok == null) kernel_tok = try dsv41.buildKernel("dsv41_moe_tail_tok", &ins, &.{"out"}, source, "#define TOK 1\n");
-    if (!engaged_logged.swap(true, .monotonic)) log.info("[dsv41] MOE_TAIL engaged (rows {d})\n", .{L});
+    if (!engaged_logged.swap(true, .monotonic)) log.info(lev.line(.MOE_TAIL) ++ " (rows {d})\n", .{L});
     const dt = mlx.mlx_array_dtype(x1);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);

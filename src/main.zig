@@ -307,6 +307,15 @@ fn printUsage(io: std.Io) void {
         \\                        so --no-ds4-mtp disables it too).
         \\                        DeepSeek-V4.1 runs the stages its pack ships
         \\                        unless --no-mtp.
+        \\  --precision <p>     DeepSeek-V4.1: lossless (default) serves every
+        \\                        lossless lever and the 8-bit LM head; lossy
+        \\                        adds the LOSSY ones (int8 prompt trunk
+        \\                        projections, the f16 attention core without
+        \\                        NAX, DSpark typical acceptance at delta 0.3,
+        \\                        eps 0.09 for sampled requests unless an
+        \\                        --mtp-typical or --mtp-tokenv3 flag or a model
+        \\                        setting sets it). MLX_SERVE_DSV41_STACK_<STACK>=0 turns a
+        \\                        stack off (src/plugins/deepseek_v41/README.md).
         \\  --decode-attn-quant / --no-decode-attn-quant
         \\                      Serve decode from quantized side copies of
         \\                      DENSE (bf16/f16) attention projection weights:
@@ -331,8 +340,15 @@ fn printUsage(io: std.Io) void {
         \\                        verify-width cliff). A --mtp-min-depth above that default
         \\                        lifts it. --mtp-depth is the old spelling.
         \\                        Each machine finds its own range.
-        \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance (d > 0).
+        \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance (d > 0): a
+        \\                        draft is kept iff p > min(e, d * e^-H), uncapped
+        \\                        (e = 1) unless --mtp-typical-eps sets e.
         \\                        Use 0.2 for the Qwen3.8 matched comparison.
+        \\  --mtp-typical-eps <e> Opt-in cap on the typical floor, 0 < e <= 1
+        \\                        (Medusa's posterior_threshold). Alone it turns
+        \\                        typical on with d = sqrt(e) (Medusa's coupling);
+        \\                        with --mtp-typical both apply as given.
+        \\                        Medusa's standard pair: e 0.09, d 0.3.
         \\  --mtp-tokenv3 <a>  Opt-in lossy TokenV3 cascade (0 <= a <= 1).
         \\                        Alias: --mtp-cascade. Use 0.95 for the
         \\                        Qwen3.8 matched comparison. Exclusive with
@@ -717,6 +733,7 @@ pub fn main(init: std.process.Init) !void {
     var mtp_forced = false;
     var mtp_head_kv_quant = false;
     var mtp_typical_raw: ?[]const u8 = null;
+    var mtp_typical_eps_raw: ?[]const u8 = null;
     var mtp_tokenv3_raw: ?[]const u8 = null;
     var kv_quant_config: KVQuantConfig = KVQuantConfig.dense;
     // Phase 2 (Plan ricky): fused attention reads K/V triples directly via
@@ -963,6 +980,13 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             ane_media.share = v;
+        } else if (std.mem.eql(u8, args[i], "--precision") and i + 1 < args.len) {
+            // DeepSeek-V4.1's precision (src/plugins/deepseek_v41/levers.zig): the plugin reads the variable at load.
+            i += 1;
+            if (std.mem.eql(u8, args[i], "lossless")) env.set(.MLX_SERVE_DSV41_PRECISION, "lossless") else if (std.mem.eql(u8, args[i], "lossy")) env.set(.MLX_SERVE_DSV41_PRECISION, "lossy") else {
+                log.err("--precision takes lossless or lossy; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
         } else if (std.mem.eql(u8, args[i], "--dspark")) {
             // DSpark (DeepSeek-V4 draft stages) is OPT-IN: the stages cost
             // ~11 GB resident, so the default leaves them lazy and serves
@@ -989,6 +1013,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--mtp-typical") and i + 1 < args.len) {
             i += 1;
             mtp_typical_raw = args[i];
+        } else if (std.mem.eql(u8, args[i], "--mtp-typical-eps") and i + 1 < args.len) {
+            i += 1;
+            mtp_typical_eps_raw = args[i];
         } else if ((std.mem.eql(u8, args[i], "--mtp-tokenv3") or std.mem.eql(u8, args[i], "--mtp-cascade")) and i + 1 < args.len) {
             i += 1;
             mtp_tokenv3_raw = args[i];
@@ -1234,8 +1261,8 @@ pub fn main(init: std.process.Init) !void {
     };
 
     engine_flags.mtp_head_kv_quant = mtp_head_kv_quant;
-    engine_flags.mtp_acceptance = mtp_acceptance.parse(mtp_typical_raw, mtp_tokenv3_raw) catch |err| {
-        log.err("MTP acceptance settings: {s} (--mtp-typical needs d > 0; --mtp-tokenv3 needs 0 <= a <= 1; choose one)\n", .{@errorName(err)});
+    engine_flags.mtp_acceptance = mtp_acceptance.parse(mtp_typical_raw, mtp_typical_eps_raw, mtp_tokenv3_raw) catch |err| {
+        log.err("MTP acceptance settings: {s} (--mtp-typical needs d > 0; --mtp-typical-eps needs 0 < e <= 1; --mtp-tokenv3 needs 0 <= a <= 1; typical or tokenv3, not both)\n", .{@errorName(err)});
         std.process.exit(1);
     };
 

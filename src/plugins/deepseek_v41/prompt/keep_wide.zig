@@ -30,6 +30,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const log = @import("../../../sdk/util/log.zig");
 const crt = @import("../../../sdk/util/crt.zig");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -160,7 +161,7 @@ pub fn prepare(cfg: anytype) void {
 pub fn pinned(rows: usize, bill: u64) void {
     ps().rows = rows;
     ps().bill = bill;
-    if (ps().decided or ps().n_per_row == 0 or !env.onUnlessZero(.MLX_SERVE_DSV41_PF_KEEP_WIDE)) return;
+    if (ps().decided or ps().n_per_row == 0 or !lev.onUnlessZero(.PF_KEEP_WIDE)) return;
     ps().decided = true;
     if (comptime !metal) return log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE declined: the reserve is a patch to MLX's Metal allocator, macOS only\n", .{});
     if (!available()) return log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE declined: the loaded libmlx has no mlx_metal_wide_reserve (patches/mlx-metal-wide-reserve.patch)\n", .{});
@@ -206,7 +207,7 @@ pub fn passEnd() void {
     ps().last = st;
     if (!ps().engaged and st.hits > was.hits) {
         ps().engaged = true;
-        log.info("[dsv41] MLX_SERVE_DSV41_PF_KEEP_WIDE engaged (a pass took {d} reserve buffers of {d}, {d} MB)\n", .{ st.hits - was.hits, st.buffers, st.bytes >> 20 });
+        log.info(lev.line(.PF_KEEP_WIDE) ++ " (a pass took {d} reserve buffers of {d}, {d} MB)\n", .{ st.hits - was.hits, st.buffers, st.bytes >> 20 });
     }
     log.info("deepseek_v41: MLX_SERVE_DSV41_PF_KEEP_WIDE: the pass took {d} reserve buffers, {d} allocations missed ({d} MB); reserve {d} MB, {d} MB idle\n", .{ st.hits -| was.hits, st.misses -| was.misses, (st.missed_bytes -| was.missed_bytes) >> 20, st.bytes >> 20, st.idle >> 20 });
 }

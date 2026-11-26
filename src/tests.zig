@@ -279,6 +279,7 @@ test {
     _ = @import("plugins/deepseek_v41/engram.zig");
     _ = @import("sdk/weights/nocache_reader.zig");
     _ = @import("plugins/deepseek_v41/deepseek_v41.zig");
+    _ = @import("plugins/deepseek_v41/levers.zig");
     _ = @import("plugins/deepseek_v41/decode/moe_fp4_test.zig");
     _ = @import("plugins/deepseek_v41/prompt/m_invariance_test.zig");
     _ = @import("plugins/deepseek_v41/prompt/pass_async_test.zig");

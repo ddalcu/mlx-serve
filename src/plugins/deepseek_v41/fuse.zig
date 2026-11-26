@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const env = @import("../../env.zig");
+const lev = @import("levers.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
 const dsv41 = @import("deepseek_v41.zig");
@@ -27,8 +28,8 @@ pub const Fuse = struct {
 
     pub fn wanted() Fuse {
         return .{
-            .down_scale = env.onUnlessZero(.MLX_SERVE_DSV41_FUSE_DOWN_SCALE),
-            .mxfp8_qmm = env.onUnlessZero(.MLX_SERVE_DSV41_FUSE_MXFP8_QMM),
+            .down_scale = lev.onUnlessZero(.FUSE_DOWN_SCALE),
+            .mxfp8_qmm = lev.onUnlessZero(.FUSE_MXFP8_QMM),
         };
     }
 };
@@ -73,13 +74,13 @@ pub fn choose(p: Path, streamed: bool, held: bool) error{ Dsv41WeightPathResiden
 /// At load, once the Engram tables are held or not (`holdEngram`): the weight path and the fusions it lets serve; one
 /// line names them.
 pub fn settle(m: *dsv41.Dsv41Model) !void {
-    const p = try pathOf(env.span(.MLX_SERVE_DSV41_WEIGHT_PATH));
+    const p = try pathOf(lev.span(.WEIGHT_PATH));
     var held = true;
     for (m.engrams) |*e| held = held and e.table.isHeld();
     const mode = try choose(p, m.cfg.dsv41_streamed, held);
     m.fuse = if (mode.resident) Fuse.wanted() else .{};
     ps().mxfp8_qmm = m.fuse.mxfp8_qmm;
-    log.info("deepseek_v41: weight path {s} ({s}); fusions down_scale={} mxfp8_qmm={}\n", .{ if (mode.resident) "resident" else "ssd", mode.why, m.fuse.down_scale, m.fuse.mxfp8_qmm });
+    log.info(lev.line(.WEIGHT_PATH) ++ " {s} ({s}); fusions down_scale={} mxfp8_qmm={}\n", .{ if (mode.resident) "resident" else "ssd", mode.why, m.fuse.down_scale, m.fuse.mxfp8_qmm });
 }
 
 /// MLX's deleter for a wrapped region: the table owns the memory. `armed` stays false until the wrap proved the
@@ -146,10 +147,10 @@ pub fn unwrap(e: *dsv41.EngramLayer) void {
 /// The fusions that have served, each logged the first time (an A/B arm's engagement lines).
 pub var engaged: struct { down_scale: bool = false, mxfp8_qmm: bool = false } = .{};
 
-fn engage(comptime which: []const u8, comptime what: []const u8) void {
+fn engage(comptime which: []const u8, comptime line: []const u8, comptime what: []const u8) void {
     if (@field(engaged, which)) return;
     @field(engaged, which) = true;
-    log.info("deepseek_v41: fused " ++ what ++ " engaged\n", .{});
+    log.info(line ++ what ++ " engaged\n", .{});
 }
 
 /// `ffnDecode` over routes whose weights `wts` do not hold the layer's down scale: the fused fp4 launches with the
@@ -160,7 +161,7 @@ pub fn ffnDownScaled(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, ly: *const ds
     const kf = dsv41.fp4Decode(m) orelse return null;
     const act = try dkern.moe_fp4.moeUpScaled(sc, m, kf, ly, h, idx, wts, .{ .gate = ly.experts.scale[0], .up = ly.experts.scale[1], .down = ds }) orelse return null;
     const y = try dkern.moe_fp4.moeDown(sc, kf, ly, act, idx, x1, sp) orelse return null;
-    engage("down_scale", "down scale (an NVFP4 bank's per-expert down scale inside the fp4 gate/up launch)");
+    engage("down_scale", lev.line(.FUSE_DOWN_SCALE), " (an NVFP4 bank's per-expert down scale inside the fp4 gate/up launch)");
     return y;
 }
 
@@ -178,7 +179,7 @@ pub fn kvServes(m: *const dsv41.Dsv41Model, e: *const dsv41.EngramLayer, rows: u
 /// `mxfp8_qmm` (`settle`).
 pub fn mxfp8Qmm(mode: QuantMode) bool {
     if (mode != .mxfp8 or !ps().mxfp8_qmm) return false;
-    engage("mxfp8_qmm", "mxfp8 prompt linears (MLX's quantized matmul, no bf16 weight)");
+    engage("mxfp8_qmm", lev.line(.FUSE_MXFP8_QMM), " (MLX's quantized matmul, no bf16 weight)");
     return true;
 }
 

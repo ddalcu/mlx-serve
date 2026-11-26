@@ -9,6 +9,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 const decode = @import("decode.zig");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const v41 = @import("../deepseek_v41.zig");
 
 const A = mlx.mlx_array;
@@ -149,8 +150,8 @@ pub fn planRows(m: *const v41.Dsv41Model, ly: *const v41.Layer, rows: usize) ?Pl
 
 /// `MLX_SERVE_DSV41_IN_PROJ_MIXR`, read each call; its engaged line once.
 fn mixrOn() bool {
-    if (!env.onUnlessZero(.MLX_SERVE_DSV41_IN_PROJ_MIXR)) return false;
-    if (!mixr_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info("[dsv41] MLX_SERVE_DSV41_IN_PROJ_MIXR engaged: a verify's hc mixes a (mix, row) a threadgroup, first\n", .{});
+    if (!lev.onUnlessZero(.IN_PROJ_MIXR)) return false;
+    if (!mixr_logged.swap(true, .monotonic)) @import("../../../sdk/util/log.zig").info(lev.line(.IN_PROJ_MIXR) ++ ": a verify's hc mixes a (mix, row) a threadgroup, first\n", .{});
     return true;
 }
 var mixr_logged = std.atomic.Value(bool).init(false);

@@ -17,15 +17,16 @@ On an M5 Ultra, the release build decoded 98.80 tok/s greedy with DSpark on and 
 test's p01 prompt. The first NVFP4 build gave 71.77 and 3,994 tok/s (see "Results"). Both runs used the NVFP4 pack, so
 the pack gives none of the gain; the runs also differ in setup.
 
-The plugin has 56 default-on switches (55 on M5, where `ATTN_F16` is off). We count 54 of them as lossless.
-"Lossless" here means each switch's output is bit-identical to its `=0` path (EXACT); or (REORDER) not
+The plugin has two precisions. `--precision lossless`, the default, serves every lossless switch and the 8-bit LM
+head; `--precision lossy` adds the LOSSY ones (see "Precision and stacks"). "Lossless" here means each switch's output is bit-identical to its `=0` path (EXACT); or (REORDER) not
 bit-identical but measured no farther from float64 (6 switches), held to a stated bound that can allow somewhat more
 error than `=0` (7), or classed by reasoning or A/B text alone (3); or changes only drafts and verify widths, or how a sampled verify accepts drafts while keeping the model's
 distribution
 (DRAFT-ONLY). `MLX_ENABLE_TF32` has its own class (TF32): on M5 at the defaults it rounds only the drafter's P·V.
-Greedy text can still change. No test compares the whole model with a reference implementation (see "Accuracy"). The two outside are an 8-bit LM
-head, whose KLD was within one standard error of the bf16 head's, and a lossy f16 attention core. That core is on by
-default only without NAX. NAX is the M5 GPU's matrix units; M4 and older Macs have none. On EvalPlus the release
+Greedy text can still change. No test compares the whole model with a reference implementation (see "Accuracy"). The
+8-bit LM head is the one exception that lossless keeps: an accepted requantization, whose KLD was within one standard
+error of the bf16 head's. The LOSSY switches, an int8 prompt trunk and an f16 attention core, serve only under
+`--precision lossy`. NAX is the M5 GPU's matrix units; M4 and older Macs have none. On EvalPlus the release
 build scored 161/164 on HumanEval and 366/378 on MBPP (base tests).
 
 ## Serve the model on an M5 Ultra with 512 GiB
@@ -157,8 +158,8 @@ set `MLX_SERVE_DSV41_DRAFT_VOCAB=0`, to draft over the whole vocabulary.
 The plugin's switches are environment variables `MLX_SERVE_DSV41_<NAME>`, registered in `src/env.zig`; a default-on
 switch turns off with `=0`. The block below has the other prefixes.
 
-Other Macs get the same defaults except `ATTN_F16`, the lossy f16 attention core, which is on by default without NAX.
-Some parts scale or turn off by themselves (listed below).
+Other Macs get the same defaults. Under `--precision lossy`, `ATTN_F16`, the lossy f16 attention core, is on there
+without NAX. Some parts scale or turn off by themselves (listed below).
 
 <details>
 <summary>Switch prefixes, and what changes on other Macs</summary>
@@ -176,6 +177,46 @@ release won its A/B on an M5 Ultra with 512 GiB, except `DRAFT_POS_ONCE`, a wash
 - GPUs without NAX (M4 and older) do not run the matrix-unit kernels.
 
 </details>
+
+## Precision and stacks
+
+`src/plugins/deepseek_v41/levers.zig` holds every switch in one table: its stack, its class, its default, its lossy
+pick and its README row. The blocks marked `levers:` in this README are rendered from that table, and a test holds
+them to it. Each switch's own variable, `MLX_SERVE_DSV41_<NAME>`, stays its A/B input and wins over the settings
+below.
+
+- `--precision lossless|lossy` (or `MLX_SERVE_DSV41_PRECISION`): lossless is the default. Another value refuses the
+  load by name. Under lossy, a sampled DSpark request takes typical acceptance at δ 0.3, ε 0.09 (Medusa's standard pair:
+  a draft is kept when p > min(ε, δ·e^-H)) unless `--mtp-typical`, `--mtp-tokenv3` or a model `mtp_acceptance`
+  setting chooses its acceptance. On the 16K standard cells with the card's sampling (Mac 2, build `4daa4a3a`, 6 runs
+  an arm) it decoded 96.05 tok/s (sd 4.74) against 88.25 (sd 4.35) with exact acceptance, +8.8%, at 3.002 tokens a
+  round against 2.797; prefill was unchanged. On HumanEval+ (Mac 1, the same build, card sampling, seed 1234) it
+  scored 162/164 base and 155/164 plus, against 161/164 and 155/164 with exact acceptance, and decoded 105.27 tok/s
+  against 96.72.
+- `MLX_SERVE_DSV41_STACK_<STACK>=0` turns one stack's default-on switches to their `=0` paths. A switch whose own
+  variable is set keeps that value, so one switch can stay on in a stack that is off.
+- Each load logs one line: `[dsv41] settings: precision=... stacks_off=... changed=...`, where `changed` lists every
+  switch variable that is set.
+- The engage line that each switch logs when it serves, and `accepted-lines.txt`, the list that an A/B's control arm
+  must show, come from the same table.
+
+<!-- levers:lossy -->
+| Switch | Under lossless | Under lossy | What it does |
+|---|---|---|---|
+| ATTN_F16 | `0` | the switch's own default | f16 attention core: under precision=lossy on without NAX, off on NAX; off under lossless |
+| PF_INT8 | `0` | `4` | A resident wide pass's trunk projections on w8a8's rotated int8 GEMM (3: wq_b, wo_b; 4: also the shared expert and wq_a+wkv) |
+| typical acceptance (the engine's DSpark rule) | exact | typical at delta 0.3, eps 0.09 (`levers.lossy_typical`), unless `--mtp-typical`, `--mtp-tokenv3` or a model `mtp_acceptance` sets it | a sampled request's drafts kept iff p > min(eps, delta e^-H) |
+<!-- /levers:lossy -->
+
+<!-- levers:stacks -->
+| Stack switch (`=0` turns it off) | Switches it sets to their `=0` path |
+|---|---|
+| `MLX_SERVE_DSV41_STACK_PREFILL` | PROMPT_ASYNC_EVAL, PF_CED_HC, PF_ROPE_PAIRS, PF_RMS_ROWS, CED_LAZY, HC_EXPAND_NORM, PF_MOE_EPI, PF_GU_SEG, PF_KV_ROWS, PF_COMP_PASS, PF_CED_COMP, PF_DOWN_TOKORD, PF_DOWN_BK32, PF_FP4_GEMM, WOA_JOIN, PF_ROUTE_PACK, PF_ROUTER_BF16, PF_ENGRAM_PASS, MOE_TAIL, MOE_PAIR_FP4, PF_HC_V2, PF_IDX_NAX, PF_COMP_BF16, PF_IDX_PASS, FUSE_MXFP8_QMM, PF_INT8 |
+| `MLX_SERVE_DSV41_STACK_ATTENTION` | FLASH_TRIM, FLASH_ATTN, ATTN_F16 |
+| `MLX_SERVE_DSV41_STACK_DECODE` | IN_PROJ_MIXR, FFN_IN_SINK, FFN_IN_R5_COLS1, FUSE_WQB_RING, FP4_DEC_WORD, FP4_UP_SPLIT, FP8_FOLD, MOE_DOWN_ORDER, FUSE_DOWN_SCALE, MOE_FP4_NAX, ENGRAM_GPU_IDS, ENGRAM_KV_SLOTS, FP4_READS, ATTN_DEC, WOA_PLAIN, HEAD8 |
+| `MLX_SERVE_DSV41_STACK_SPEC` | SPEC_ENGRAM_AHEAD, DRAFT_POS_ONCE, DRAFT_FUSED, DRAFT_SAMPLE, DRAFT_QKV, SPEC_SYNC, DRAFT_VOCAB, DRAFT_VOCAB_PROMPT |
+| `MLX_SERVE_DSV41_STACK_MEMORY` | PF_KEEP_WIDE, ENGRAM_KV_CACHE, PF_PASS_SIZE, PF_PASS_CEIL |
+<!-- /levers:stacks -->
 
 ## Memory and the 1M-token context
 
@@ -235,26 +276,34 @@ declines the switch by name and logs why.
 
 ## Accuracy: what "lossless" means here
 
-54 plugin switches fall in three classes, and a fourth class, TF32, covers one engine variable:
+<!-- levers:counts -->
+Under `precision=lossless` (the default) the plugin has 56 default-on switches: 32 EXACT, 17 REORDER, 6 DRAFT-ONLY and `HEAD8`, the 8-bit LM head, the one accepted requantization (REQUANT). `precision=lossy` adds the LOSSY picks below. `src/plugins/deepseek_v41/levers.zig` holds every switch; this block and the tables marked `levers:` are rendered from it.
+<!-- /levers:counts -->
+
+The classes:
 - EXACT: the same output values as the `=0` path, bit for bit. A test shows it, or (2 switches) it is classed without
   a measurement, by the commit's reasoning.
-- REORDER: not bit-identical; the table below splits the 17 by their evidence.
+- REORDER: not bit-identical; the table below splits them by their evidence.
 - DRAFT-ONLY: changes only the drafts, or how many rows a verify checks (1 switch classed without a measurement).
 - TF32 (one engine variable): MLX's TF32 matmuls; on off-default routes they also round the f32 chain's P·V (the
   block below). Without NAX, MLX does not use TF32.
 
-48 of the 54 have a standing test or a kernel contract case. 6 do not: `WOA_JOIN`, `DRAFT_POS_ONCE` (EXACT); `CED`,
+Every default-on switch but 6 has a standing test or a kernel contract case. The 6 are `WOA_JOIN`, `DRAFT_POS_ONCE` (EXACT); `CED`,
 `PF_PASS_SIZE`, `HC_EXPAND_NORM` (REORDER); and `SPEC_SYNC` (DRAFT-ONLY). The table below says why for each.
 
-| Class | Plugin switches | Engine variables |
+<!-- levers:classes -->
+| Class | Plugin switches (default-on) | Engine variables |
 |---|---|---|
-| EXACT | 31 | 0 |
-| REORDER | 17 | 1: `MLX_SERVE_DSV4_DSPARK` (the verify's multi-row kernels, by reasoning) |
-| DRAFT-ONLY | 6, including `DRAFT_VOCAB` | 2: `MLX_SERVE_DSPARK_POLICY2`, `MLX_SERVE_DSPARK_POLICY2_MODELED` |
-| TF32 | 0 | 1: `MLX_ENABLE_TF32` |
+| EXACT | 32 | 0 |
+| REORDER | 17 | `MLX_SERVE_DSV4_DSPARK` (the verify's multi-row kernels, by reasoning) |
+| DRAFT-ONLY | 6 | `MLX_SERVE_DSPARK_POLICY2` (picks verify widths); `MLX_SERVE_DSPARK_POLICY2_MODELED` (picks verify widths) |
+| TF32 | 0 | `MLX_ENABLE_TF32` (MLX's TF32 matmuls; on M5 at the defaults only the drafter's P·V) |
+| REQUANT | 1 | 0 |
+<!-- /levers:classes -->
 
-The two exceptions, both on in `main`, are `HEAD8` (the 8-bit LM head in "What the pack holds") and
-`ATTN_F16`, an attention core with f16 scores and probabilities. One function, `attnCore`, picks the core for every
+Outside the lossless classes, `HEAD8` (the 8-bit LM head in "What the pack holds") is the one exception that
+lossless keeps, as REQUANT. `ATTN_F16`, an attention core with f16 scores and probabilities, is LOSSY and serves only
+under `--precision lossy`. One function, `attnCore`, picks the core for every
 prompt-attention call (the block below).
 
 <details>
@@ -289,9 +338,10 @@ device and the load's switches only, never from the caller (a debug trace also t
 3. the f32 chain (MLX's matmuls and softmax in f32).
 
 Without NAX the plugin has no flash kernel and no gather, because both need the matrix units. A call that fits the
-f16 core's 1,024-column softmax takes the f16 core, or the f32 chain under `ATTN_F16=0`; the f32 chain takes the rest.
-The f16 core was mlx-serve's default there before this release. We kept it, because we have not measured the speed or the error of the f32 chain (`=0`) on those Macs. On NAX the f16 core serves only under an
-explicit `ATTN_F16=1`. The load fixes the switch's value, and the prompt cache's layout hash includes it.
+f16 core's 1,024-column softmax takes the f16 core under `--precision lossy` (or `ATTN_F16=1`), else the f32 chain;
+the f32 chain takes the rest. The f16 core was mlx-serve's default there before; under lossless, the default, those
+Macs now serve the f32 chain, whose speed and error we have not measured there. On NAX the f16 core serves only
+under an explicit `ATTN_F16=1`. The load fixes the switch's value, and the prompt cache's layout hash includes it.
 
 TF32 rounds an f32 matmul's operands to a 10-bit mantissa. On M5 at the defaults, every prompt-attention call takes
 the flash kernel or the gather, and the trunk's f32 matmuls read bf16 values held in f32 or run on MLX's gemv kernel.
@@ -357,6 +407,7 @@ tests of `attnCore` count each core's calls; on NAX they count 0 f16 calls.
 Names omit `MLX_SERVE_DSV41_`. "Evidence" names the evidence kind: a standing test (in the plugin unless named), the kernel contract,
 or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit").
 
+<!-- levers:switches -->
 | Switch | What it does | Class | Evidence |
 |---|---|---|---|
 | PROMPT_ASYNC_EVAL | Commits the last wide prompt layer without a wait | EXACT | test (word for word) |
@@ -415,7 +466,7 @@ or the A/B's same output text ("A/B text"), or the commit's reasoning ("commit")
 | DRAFT_VOCAB | Greedy drafts score only the pack's `draft-vocab.txt` ids (default: the pack's file, which the converter writes) | DRAFT-ONLY | test (and `deepseek_v4/served_test.zig`) |
 | DRAFT_VOCAB_PROMPT | A request's prompt ids join the draft vocabulary | DRAFT-ONLY | test (`deepseek_v4/served_test.zig`) |
 | HEAD8 | LM head requantized to 8-bit g64 | Requantized (KLD within one standard error) | KLD measurement |
-| ATTN_F16 | f16 attention core; on by default only without NAX | LOSSY (measured, not gated) | printed float64 measurement, served-route tests |
+<!-- /levers:switches -->
 
 Engine variables on the DeepSeek path: `MLX_SERVE_DSV4_DSPARK` (REORDER, by reasoning: the verify's multi-row kernels),
 `MLX_SERVE_DSPARK_POLICY2` and `MLX_SERVE_DSPARK_POLICY2_MODELED` (DRAFT-ONLY: they pick verify widths) and
@@ -526,11 +577,10 @@ of about 44,500 rows), but we have not measured the cells at the 1M default.
 | Gap | What the release needs |
 |---|---|
 | The plugin does not stream experts with per-expert scales, so a Mac that cannot hold the NVFP4 pack cannot serve it | The `--experts-mxfp4` pack for those Macs, or streamed per-expert scales |
-| Without NAX, the lossy f16 attention core (`ATTN_F16`) is on by default, and we have not measured it on those Macs | A float64 test on those Macs, or `ATTN_F16` off there |
+| Without NAX, lossless serves the f32 attention chain in place of the lossy f16 core (`ATTN_F16`, now lossy only), and we have measured neither speed nor error on those Macs | A float64 test and a speed run on those Macs |
 | On the f32 attention chain's routes, attention's output depends on the prompt pass width | A test that holds each pass width no farther from float64 |
 | 6 classed switches have no standing test against their `=0` path (listed in "Accuracy") | A standing word or float64 test for each |
 | TF32's float64 test needs a fixture that no tool in this PR writes; ours came from the `DSV41_TF32_AUDIT` dump on branch `rel-harden-tf32` (`6965929b`), not in this PR | A fixture writer, or the fixture in the repo |
-| `HEAD8` is a quantization change. Its KLD is within one standard error of the bf16 head's on our set, but it is not bit-identical | A ruling to keep it, or `=0` by default |
 | We tuned and measured only on M5 Ultra Macs with 512 GiB | Runs on smaller Macs and older GPUs |
 | The release has not loaded at the default wired limit | One load at the default limit |
 | We have no PPL or KLD of the whole stack; the KLD above is of the LM head alone | A whole-stack KLD against the same reference |

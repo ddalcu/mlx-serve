@@ -61,6 +61,10 @@ pub fn logSpecStats(self: *const Generator) void {
             "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2} stage_rounds={d} copy_rounds={d} copy_drafted={d} copy_accepted={d} group_rounds={d}\n",
             .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round, self.dspark_attempted - self.dspark_copies, self.dspark_copies, self.dspark_copy_drafted, self.dspark_copy_accepted, self.dspark_group_rounds },
         );
+        if (self.dspark_typical) |t| log.info(
+            "  [spec-stats] dspark typical: delta={d:.3} eps={d:.3} rounds={d} of {d} (copied drafts exact)\n",
+            .{ t.delta, t.eps, self.dspark_typical_rounds, self.dspark_attempted },
+        );
         if (self.dspark_pol) |pol| {
             const skipped = if (pol.p2) |p| p.drafting.skipped else pol.drafting.skipped;
             const probes = if (pol.p2) |p| p.drafting.probes else pol.drafting.probes;

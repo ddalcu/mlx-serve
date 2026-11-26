@@ -22,6 +22,7 @@ const streamed = @import("../../sdk/weights/streamed.zig");
 const outside = @import("../../sdk/quant/outside.zig");
 const outside_model = @import("../../sdk/quant/outside_model.zig");
 const env = @import("../../env.zig");
+const lev = @import("levers.zig");
 const engram_decode = @import("decode/engram_decode.zig");
 const engram_kvc = @import("decode/engram_kvc.zig");
 const mx_view = @import("mx_view.zig");
@@ -249,17 +250,25 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
 }
 
-/// The settings a load reads, each refused by name at a bad value. Flash attention is on for every pack by default
+/// The settings a load reads, each refused by name at a bad value: the precision and the stack switches
+/// (`levers.check`, then the load's settings line), the Engram LRU, flash attention. Flash attention is on for every pack by default
 /// (`MLX_SERVE_DSV41_FLASH_ATTN`: unset, empty or 1 on, =0 the exact gather; its f32 output sits closer to float64 than
+/// The DSpark typical pair a sampled request takes by default (`levers.lossyTypical`: under `--precision lossy`).
+pub fn lossyTypical() ?@import("../../sdk/spec/mtp_acceptance.zig").Typical {
+    return lev.lossyTypical();
+}
+
 /// the gather's).
 fn configureLoad(c: *const config.Config) !void {
     _ = c;
-    engram_decode.ps().lru_mb = try engram_decode.parseMb(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB));
+    try lev.check();
+    lev.logSettings();
+    engram_decode.ps().lru_mb = try engram_decode.parseMb(lev.span(.ENGRAM_LRU_MB));
     flash_attn.ps().mode = .off;
     flash_attn.ps().explicit = false;
     flash_attn.ps().trim = false;
     flash_attn.ps().psum = false;
-    try flash_attn.configure(env.span(.MLX_SERVE_DSV41_FLASH_ATTN), try flash_attn.plan.parseTrim(env.span(.MLX_SERVE_DSV41_FLASH_TRIM)), try flash_attn.plan.parsePsum(env.span(.MLX_SERVE_DSV41_FLASH_PSUM)));
+    try flash_attn.configure(lev.span(.FLASH_ATTN), try flash_attn.plan.parseTrim(lev.span(.FLASH_TRIM)), try flash_attn.plan.parsePsum(lev.span(.FLASH_PSUM)));
     scratch_attn.ps().ring_regions = flash_attn.ps().mode != .on;
 }
 
@@ -956,7 +965,7 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 /// The Engram LRU every load of a pack with Engram layers bills (the affine fixture's table allocates no partials' cache).
 fn lru() u64 {
-    return @import("decode/engram_decode.zig").billBytes(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB));
+    return @import("decode/engram_decode.zig").billBytes(lev.span(.ENGRAM_LRU_MB));
 }
 
 /// `residentBytes` over the Engram fixture (`engram.writeAffineFixture`) in `dir`, from `shards` bytes.

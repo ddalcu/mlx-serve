@@ -18,6 +18,7 @@ const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const engram_kv = @import("engram_kv.zig");
 const engram_ids = @import("engram_ids.zig");
@@ -37,7 +38,7 @@ pub const cap_bytes: u64 = 4_000_000_000;
 var plan_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 pub fn on() bool {
-    return env.onUnlessZero(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE);
+    return lev.onUnlessZero(.ENGRAM_KV_CACHE);
 }
 
 /// What decides the cache, known alike before the load (the bill, `residentDiskBytes`) and at it (`engram_ids.settle`).

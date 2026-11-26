@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const log = @import("../../../sdk/util/log.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const gather_nax = @import("../../../sdk/blocks/moe/gather_qmm_nax.zig");
@@ -14,15 +15,15 @@ const dsv41 = @import("../deepseek_v41.zig");
 const A = mlx.mlx_array;
 
 pub fn on() bool {
-    return env.onUnlessZero(.MLX_SERVE_DSV41_PF_FP4_GEMM);
+    return lev.onUnlessZero(.PF_FP4_GEMM);
 }
 
 /// `MLX_SERVE_DSV41_PF_DOWN_BK32`: the down's tile for a call of `rows` routed rows over `experts`
 /// (`gather_nax.stagedDownWide`), or null (the planner's).
 fn downTile(rows: c_int, experts: c_int) ?gather_nax.Staged {
-    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_DOWN_BK32)) return null;
+    if (!lev.onUnlessZero(.PF_DOWN_BK32)) return null;
     const st = gather_nax.stagedDownWide(rows, experts) orelse return null;
-    if (!bk32_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_DOWN_BK32 engaged (pairs {d}; down tile bm={d} bn={d} bk={d})\n", .{ rows, st.bm, st.bn, st.bk });
+    if (!bk32_logged.swap(true, .monotonic)) log.info(lev.line(.PF_DOWN_BK32) ++ " (pairs {d}; down tile bm={d} bn={d} bk={d})\n", .{ rows, st.bm, st.bn, st.bk });
     _ = bk32_launches.fetchAdd(1, .monotonic);
     return st;
 }
@@ -39,8 +40,8 @@ var bk32_logged: std.atomic.Value(bool) = .init(false);
 /// caller runs that paired launch.
 pub fn gateUp(gu: *const dsv41.Bank, x3: A, rows: A, sidx: A, w_sorted: A, limit: f32, scales: gather_nax.ExpertScales, s: mlx.mlx_stream) !?A {
     const ws = mlx.getShape(gu.w);
-    if (env.onUnlessZero(.MLX_SERVE_DSV41_PF_GU_SEG) and !gather_nax.stagedServesGateUp(mlx.getShape(sidx)[0], ws[0], mlx.getShape(x3)[2], @divTrunc(ws[1], 2))) {
-        if (!gu_seg_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_GU_SEG engaged (pairs {d})\n", .{mlx.getShape(sidx)[0]});
+    if (lev.onUnlessZero(.PF_GU_SEG) and !gather_nax.stagedServesGateUp(mlx.getShape(sidx)[0], ws[0], mlx.getShape(x3)[2], @divTrunc(ws[1], 2))) {
+        if (!gu_seg_logged.swap(true, .monotonic)) log.info(lev.line(.PF_GU_SEG) ++ " (pairs {d})\n", .{mlx.getShape(sidx)[0]});
         return null;
     }
     const y = (try gather_nax.sortedGateUpRoutedStaged(x3, rows, gu.w, gu.s, gu.b, sidx, w_sorted, limit, scales, gu.qp.bits, gu.qp.group_size, gu.qp.mode.isFp4(), verify_qmm_nax.verifyQmmNaxAvailable(), s)) orelse
@@ -58,7 +59,7 @@ pub fn down(sc: *dsv41.Scope, b: *const dsv41.Bank, act: A, sidx: A) !?A {
         return decline("down", P, "the bank is not fp4, or K or N is not a multiple of 64");
     if (!engaged_logged.swap(true, .monotonic)) {
         const st = gather_nax.stagedPlan(P, mlx.getShape(b.w)[0]);
-        log.info("[dsv41] MLX_SERVE_DSV41_PF_FP4_GEMM engaged (pairs {d}, gate+up {s}, down; tile bm={d} wm={d} wn={d})\n", .{ P, if (gate_up_engaged.load(.monotonic)) @as([]const u8, "staged") else "seg 128", st.bm, st.wm, st.wn });
+        log.info(lev.line(.PF_FP4_GEMM) ++ " (pairs {d}, gate+up {s}, down; tile bm={d} wm={d} wn={d})\n", .{ P, if (gate_up_engaged.load(.monotonic)) @as([]const u8, "staged") else "seg 128", st.bm, st.wm, st.wn });
     }
     _ = launches.fetchAdd(1, .monotonic);
     return try sc.keep(y);
@@ -78,7 +79,7 @@ pub fn downTok(sc: *dsv41.Scope, b: *const dsv41.Bank, act: A, sidx: A, rows: A,
         r = try sc.op2(mlx.mlx_remainder, try sc.add(r, try sc.u(1)), try sc.u(tokens));
     }
     const y = (try gather_nax.sortedGatherPromptTokTile(act, b.w, b.s, b.b, sidx, r, try sc.astype(flat, .uint32), @intCast(k), b.qp.bits, b.qp.group_size, b.qp.mode.isFp4(), verify_qmm_nax.verifyQmmNaxAvailable(), st, sc.s)) orelse return null;
-    if (!tok_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_DOWN_TOKORD engaged (pairs {d}, {d} a row)\n", .{ P, k });
+    if (!tok_logged.swap(true, .monotonic)) log.info(lev.line(.PF_DOWN_TOKORD) ++ " (pairs {d}, {d} a row)\n", .{ P, k });
     _ = launches.fetchAdd(1, .monotonic);
     _ = tok_launches.fetchAdd(1, .monotonic);
     return try sc.keep(y);

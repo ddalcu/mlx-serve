@@ -9,6 +9,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const log = @import("../../../sdk/util/log.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const vk = @import("../../../sdk/blocks/moe/verify_kernels.zig");
@@ -46,12 +47,12 @@ fn placed(sc: *dsv41.Scope, flat: A, wts: A, inv: A, rows: A, sidx: A, experts: 
     const n: c_int = @intCast(mlx.mlx_array_size(flat));
     var o = mlx.mlx_array_new();
     const w = try sc.res(mlx.mlx_put_along_axis(&o, try sc.zeros(&.{n}, .float32), inv, wts, 0, sc.s), &o);
-    if (!engaged_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_MOE_EPI engaged (pairs {d}, experts {d})\n", .{ n, experts });
+    if (!engaged_logged.swap(true, .monotonic)) log.info(lev.line(.PF_MOE_EPI) ++ " (pairs {d}, experts {d})\n", .{ n, experts });
     return .{ .inv = inv, .rows = rows, .sidx = sidx, .w = w };
 }
 
 pub fn on() bool {
-    return env.onUnlessZero(.MLX_SERVE_DSV41_PF_ROUTE_PACK);
+    return lev.onUnlessZero(.PF_ROUTE_PACK);
 }
 
 var pack_logged: std.atomic.Value(bool) = .init(false);
@@ -60,7 +61,7 @@ pub var served = std.atomic.Value(usize).init(0);
 
 fn logged(rows: usize, experts: usize) void {
     _ = served.fetchAdd(1, .monotonic);
-    if (!pack_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_PF_ROUTE_PACK engaged (rows {d}, experts {d})\n", .{ rows, experts });
+    if (!pack_logged.swap(true, .monotonic)) log.info(lev.line(.PF_ROUTE_PACK) ++ " (rows {d}, experts {d})\n", .{ rows, experts });
 }
 
 pub const ROWS_SOURCE = kernelSource("plugins/deepseek_v41/kernels/pf_route_rows.metal");

@@ -303,3 +303,44 @@ test "dsv41 pf int8 bill: levels 3 and 4 add their int8 inputs and bf16 outputs 
         try std.testing.expectEqual(if (world.nax()) rows * 120_852 else 0, pfint8.transientBytes(&c, rows, 2048));
     }
 }
+
+test "dsv41 pf int8 bill: precision lossy bills level 4 with no model and no PF_INT8 set (where the plan serves, NAX); the prefill stack off and PF_INT8=3 win over it" {
+    const lev = @import("../levers.zig");
+    const C = struct {
+        hidden_size: u32 = 5120,
+        dsv4_q_lora_rank: u32 = 1280,
+        num_attention_heads: u32 = 64,
+        head_dim: u32 = 512,
+        dsv4_o_groups: u32 = 8,
+        dsv4_o_lora_rank: u32 = 1024,
+        moe_intermediate_size: u32 = 2304,
+    };
+    const c = C{};
+    const rows: u64 = 38656;
+    const unset = env.override(.MLX_SERVE_DSV41_PF_INT8, null);
+    defer unset.restore();
+    try std.testing.expectEqual(@as(u64, 0), pfint8.transientBytes(&c, rows, 2048));
+    const lossy = env.override(.MLX_SERVE_DSV41_PRECISION, "lossy");
+    defer {
+        lossy.restore();
+        lev.refresh();
+    }
+    lev.refresh();
+    // Without NAX the plan is inert and reserves nothing.
+    const nax = world.nax();
+    try std.testing.expectEqual(if (nax) rows * 120_852 else 0, pfint8.transientBytes(&c, rows, 2048));
+    {
+        const pin = env.override(.MLX_SERVE_DSV41_PF_INT8, "3");
+        defer pin.restore();
+        try std.testing.expectEqual(if (nax) rows * 85_256 else 0, pfint8.transientBytes(&c, rows, 2048));
+    }
+    {
+        const off = env.override(.MLX_SERVE_DSV41_STACK_PREFILL, "0");
+        defer {
+            off.restore();
+            lev.refresh();
+        }
+        lev.refresh();
+        try std.testing.expectEqual(@as(u64, 0), pfint8.transientBytes(&c, rows, 2048));
+    }
+}

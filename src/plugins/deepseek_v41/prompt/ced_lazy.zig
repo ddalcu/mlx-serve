@@ -12,9 +12,10 @@
 
 const std = @import("std");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 
 pub fn on() bool {
-    return env.onUnlessZero(.MLX_SERVE_DSV41_CED_LAZY);
+    return lev.onUnlessZero(.CED_LAZY);
 }
 
 /// Whether a replaying chunk `ids` at `p0` leaves its replay to a reader: it is the armed `prompt`'s, at least a

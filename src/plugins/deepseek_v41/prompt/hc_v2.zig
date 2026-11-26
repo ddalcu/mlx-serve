@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
 const log = @import("../../../sdk/util/log.zig");
@@ -126,7 +127,7 @@ const Slot = struct { li: usize = 0, x: ?*anyopaque = null, z: A = none, pre: A 
 /// NAX only: the kernels' M1/M2 thread limits cannot be compiled offline (every requested build differs), so an older
 /// GPU keeps the stock hc launches.
 pub fn serves(m: *const dsv41.Dsv41Model) bool {
-    if (!env.onUnlessZero(.MLX_SERVE_DSV41_PF_HC_V2) or !device.naxAvailable()) return false;
+    if (!lev.onUnlessZero(.PF_HC_V2) or !device.naxAvailable()) return false;
     return m.streamed == null and m.tp == null and m.trace == null and m.act == .bfloat16 and
         m.cfg.hidden_size == D and m.cfg.dsv4_hc_mult == HC and mlx.streamIsGpu(m.s);
 }
@@ -134,7 +135,7 @@ pub fn serves(m: *const dsv41.Dsv41Model) bool {
 fn engaged(L: usize) void {
     if (ps().logged) return;
     ps().logged = true;
-    log.info("[dsv41] MLX_SERVE_DSV41_PF_HC_V2 engaged (rows {d}, {d} slices)\n", .{ L, slicesFor(L) });
+    log.info(lev.line(.PF_HC_V2) ++ " (rows {d}, {d} slices)\n", .{ L, slicesFor(L) });
 }
 
 fn kernel(p: Pro) !mlx.mlx_fast_metal_kernel {

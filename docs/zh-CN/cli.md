@@ -67,6 +67,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--mtp-max-depth N` | auto | 每轮 MTP 最多草拟的 Token 数（1..8）；上下限相同则固定深度；`--mtp-depth` 是旧写法。草拟头数量和剩余 Token 数仍可缩短一轮。 |
 | `--mtp-history-window N` | `0`（完整） | 超过 16K Token 的提示词只为最后 N 个 Token 构建 MTP 头历史（开窗会在原版 Qwen 头上损失接受率） |
 | `--dspark` | 关闭 | DeepSeek V4 自有的块并行草稿阶段（在模型之上额外约 11 GB） |
+| `--precision <p>` | lossless | DeepSeek-V4.1：`lossless` 启用所有无损优化与 8 位 LM head；`lossy` 另加有损项（int8 提示主干投影、无 NAX 时的 f16 注意力核心） |
 | `--ssd-streaming` | 关闭 | 仅 ds4 / DeepSeek-V4-Flash GGUF：从 SSD 流式读取专家权重，而不是把整个模型放在内存里 |
 | `--prefill-chunk N` | `8192` | 每个预填充分块最多前向的 Token 数（还会按模型进一步自动设上限）；调低可削减预填充峰值内存 |
 | `--no-decode-attn-quant` | 开启 | 禁用仅解码阶段对稠密 bf16 注意力权重的重新量化（即 “Fast decode for bf16-attention models” 开关） |

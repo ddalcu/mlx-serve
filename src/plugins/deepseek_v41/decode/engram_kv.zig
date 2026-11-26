@@ -9,6 +9,7 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const log = @import("../../../sdk/util/log.zig");
 
 const A = mlx.mlx_array;
@@ -64,14 +65,14 @@ fn is(a: A, dt: mlx.mlx_dtype, want: []const usize) bool {
 /// kernel serves (`launchSlots`).
 pub fn launch(sc: *dsv41.Scope, t: Table, rows: usize, codes: A, tsc: A, ids: A, geo: A, w: A, wsc: A) !?A {
     if (rows == 1 and slotsOn()) if (try launchSlots(sc, t, codes, tsc, ids, geo, w, wsc, null)) |kv| {
-        if (!slots_logged.swap(true, .monotonic)) log.info("[dsv41] MLX_SERVE_DSV41_ENGRAM_KV_SLOTS engaged: a decode row's Engram wkv slot-blocked\n", .{});
+        if (!slots_logged.swap(true, .monotonic)) log.info(lev.line(.ENGRAM_KV_SLOTS) ++ ": a decode row's Engram wkv slot-blocked\n", .{});
         return kv;
     };
     return launchRows(sc, t, rows, codes, tsc, ids, geo, w, wsc);
 }
 
 pub fn slotsOn() bool {
-    return env.onUnlessZero(.MLX_SERVE_DSV41_ENGRAM_KV_SLOTS);
+    return lev.onUnlessZero(.ENGRAM_KV_SLOTS);
 }
 
 fn launchRows(sc: *dsv41.Scope, t: Table, rows: usize, codes: A, tsc: A, ids: A, geo: A, w: A, wsc: A) !?A {

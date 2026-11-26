@@ -11,6 +11,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const log = @import("../../../sdk/util/log.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const engram = @import("../engram.zig");
@@ -38,7 +39,7 @@ pub const Ctx = struct {
 };
 
 pub fn on() bool {
-    return env.onUnlessZero(.MLX_SERVE_DSV41_ENGRAM_GPU_IDS);
+    return lev.onUnlessZero(.ENGRAM_GPU_IDS);
 }
 
 /// The constants of `hs` over `map` (`Dsv41Model.token_map`).

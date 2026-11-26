@@ -75,6 +75,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--mtp-greedy-tail` | off | Sampled requests draft only the first MTP token by sampling, later ones by argmax; pairs with `--mtp-typical`. A model's `mtp_greedy_tail` in `model-settings.json` outranks it |
 | `--mtp-history-window N` | `0` (full) | Prompts past 16K tokens only build MTP head history for the last N tokens (windowing costs acceptance on stock Qwen heads) |
 | `--dspark` | off | DeepSeek V4's own block-parallel draft stages (~11 GB on top of the model). DeepSeek-V4.1 runs the stages its pack ships unless `--no-mtp` |
+| `--precision <p>` | lossless | DeepSeek-V4.1: `lossless` serves every lossless lever and the 8-bit LM head; `lossy` adds the LOSSY ones (int8 prompt trunk projections, the f16 attention core without NAX, DSpark typical acceptance at δ 0.3, ε 0.09 for sampled requests unless `--mtp-typical`, `--mtp-tokenv3` or a model setting sets it). The stack switches and every lever are in [the plugin README](../src/plugins/deepseek_v41/README.md) |
 | `--ssd-streaming` | off | ds4 / DeepSeek-V4-Flash GGUF only: stream expert weights from SSD instead of holding the whole model in RAM |
 | `--ane` | off | Serve dense qwen3_5 and Qwen3 MLX packs on the Neural Engine instead of the GPU, contexts up to 64K (a model's `"ane"` in `model-settings.json` wins); the first load on a Mac compiles its programs (minutes, then cached) |
 | `--ane-slots N` | `1` | Requests each Neural Engine model runs at once (1..4); slots share the weights, each adds its own KV and state |
