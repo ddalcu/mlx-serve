@@ -888,7 +888,6 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
     // ── Stage 1 (registry mutex): claim .loading, plan eviction.
     {
         self.registry.mutex.lockUncancelable(self.io);
-        errdefer self.registry.mutex.unlock(self.io); // bail on early returns
 
         // Wait out any concurrent .loading / .evicting state.
         wait_loop: while (true) {
@@ -1349,6 +1348,41 @@ test "a load refused for memory unloads idle models one at a time until it loads
     var c = Fake{ .fits_after = 0, .idle = 3 };
     try t.expectError(error.LoadFailed, loadAfterUnloadingIdle(u32, &c, Fake.failsOther, Fake.unloadOne));
     try t.expectEqual(@as(usize, 0), c.unloaded);
+}
+
+test "a load refused for memory leaves the registry unlocked and the entry unloaded" {
+    const t = std.testing;
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"laya\"}" });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = pbuf[0..try tmp.dir.realPath(io, &pbuf)];
+
+    var reg = try ModelRegistry.init(t.allocator, io, null, 1, 0, null);
+    defer reg.deinit();
+    const busy = try reg.registerStub("busy", "busy", 1024);
+    reg.mutex.lockUncancelable(io);
+    reg.markReadyLocked(busy, 1024);
+    reg.mutex.unlock(io);
+    _ = busy.refcount.fetchAdd(1, .acq_rel);
+    defer _ = busy.refcount.fetchSub(1, .acq_rel);
+    const cold = try reg.registerStub("cold", path, null);
+
+    var sch: Scheduler = undefined;
+    sch.allocator = t.allocator;
+    sch.io = io;
+    sch.registry = reg;
+    sch.gguf_ctx_size = 0;
+    sch.mtp_enabled = false;
+    sch.ane = false;
+    sch.ane_slots = 0;
+
+    try t.expectError(error.NotEnoughMemory, ensureLoadedOnce(&sch, "cold"));
+    try t.expect(reg.mutex.state.load(.acquire) == .unlocked);
+    try t.expectEqual(model_registry_mod.LoadState.unloaded, cold.state);
+    try t.expectEqual(@as(u32, 0), cold.refcount.load(.acquire));
+    try t.expectEqual(@as(u64, 0), reg.reserved_bytes);
 }
 
 test "a live MTP slot never ticks regular, an unarmed one always does" {
