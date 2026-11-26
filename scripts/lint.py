@@ -38,6 +38,7 @@ RULES = [
     ("engine-imports-plugin", "src/engines/mlx/ imports a file under src/plugins/"),
     ("plugin-imports-core", "a plugin imports a file outside src/sdk/, src/mlx/, src/abi/, src/plugins/"),
     ("media-plugin-imports-engine", "a media plugin imports a file under src/engines/"),
+    ("dsv41-import", "a file outside src/plugins/deepseek_v41/ imports one of its files, not through dsv41_link.zig"),
     ("model-type-compare", "a model_type string compare outside src/plugins/"),
     ("model-predicate", "an is<Model>() call outside src/plugins/"),
     ("plugin-name", "a plugin identity (code identifier or model-type string) in src/engines/ or src/host/"),
@@ -208,6 +209,23 @@ def plugin_core(src, dest):
 
 def media_engine(src, dest):
     return plugin_of(src) in MEDIA_PLUGINS and under(dest, "src/engines")
+
+
+DSV41 = "src/plugins/deepseek_v41"
+# DeepSeek-V4.1 is macOS only: the rest of the tree reaches it through its one boundary module. Beside it: the MLX-free
+# manifest another plugin reads (a plugin cannot import engine code), the generated roots that list every plugin, the
+# test root and the test files it includes only under `dsv41_link.on`, and deepseek_v4's served proofs, whose V4.1
+# tests skip unless the registry `has` it.
+DSV41_IMPORTERS = {"src/engines/mlx/plugin/dsv41_link.zig", "src/plugins/registry.zig", "src/tests.zig",
+                   "src/engines/mlx/plugin/deepseek_test.zig", "src/plugins/deepseek_v4/served_test.zig"}
+DSV41_MANIFEST = ("src/plugins/deepseek_v4/model_config.zig", DSV41 + "/config.zig")
+UNIT_ROOT = re.compile(r'^src/unit_\d+\.zig$')
+
+
+def dsv41_import(src, dest):
+    if not under(dest, DSV41) or under(src, DSV41) or src in DSV41_IMPORTERS or UNIT_ROOT.match(src):
+        return False
+    return (src, dest) != DSV41_MANIFEST
 
 
 def r_model_type_compare(f, ctx):
@@ -388,6 +406,7 @@ FILE_RULES = {
     "engine-imports-plugin": r_imports(engine_plugin, "imports"),
     "plugin-imports-core": r_imports(plugin_core, "imports"),
     "media-plugin-imports-engine": r_imports(media_engine, "imports"),
+    "dsv41-import": r_imports(dsv41_import, "imports"),
     "model-type-compare": r_model_type_compare,
     "model-predicate": r_model_predicate,
     "plugin-name": r_plugin_name,
