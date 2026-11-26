@@ -207,6 +207,112 @@ test "inkling2 pack: a quantized joined projection is whole tiles and serves eac
     }
 }
 
+/// The fixture's tensors (mlx-lm's layout) as oMLX's oQ layout stores them: renamed, the projections off one input
+/// joined along their rows, a looped layer's gates and message queries stacked under the layer.
+fn oqLayout(a: std.mem.Allocator, tensors: []const fixture.Tensor) ![]fixture.Tensor {
+    const H = 64;
+    const RANK = 8;
+    const lm = "model.language_model.";
+    const Pack = struct {
+        a: std.mem.Allocator,
+        by: std.StringHashMap(fixture.Tensor),
+        out: std.ArrayList(fixture.Tensor) = .empty,
+
+        fn get(p: *@This(), layer: ?usize, leaf: []const u8) !?fixture.Tensor {
+            const name = if (layer) |i| try std.fmt.allocPrint(p.a, lm ++ "layers.{d}.{s}", .{ i, leaf }) else try std.fmt.allocPrint(p.a, lm ++ "{s}", .{leaf});
+            return p.by.get(name);
+        }
+
+        fn put(p: *@This(), layer: ?usize, leaf: []const u8, shape: []const u64, data: []const f32) !void {
+            const name = if (layer) |i| try std.fmt.allocPrint(p.a, "model.layers.{d}.{s}", .{ i, leaf }) else try p.a.dupe(u8, leaf);
+            try p.out.append(p.a, .{ .name = name, .shape = try p.a.dupe(u64, shape), .data = data });
+        }
+
+        /// `leaves` joined along their rows as `dst`.
+        fn join(p: *@This(), layer: usize, dst: []const u8, leaves: []const []const u8) !void {
+            var data: std.ArrayList(f32) = .empty;
+            for (leaves) |leaf| try data.appendSlice(p.a, (try p.get(layer, leaf)).?.data);
+            try p.put(layer, dst, &.{ data.items.len / H, H }, data.items);
+        }
+    };
+    var p: Pack = .{ .a = a, .by = .init(a) };
+    for (tensors) |t| try p.by.put(t.name, t);
+    try p.put(null, "lm_head.weight", &.{ 64, H }, p.by.get("lm_head.weight").?.data);
+    inline for (.{ .{ "embed_tokens.weight", "model.embed.weight" }, .{ "embed_norm.weight", "model.embed_norm.weight" }, .{ "norm.weight", "model.norm.weight" } }) |r| {
+        const t = (try p.get(null, r[0])).?;
+        try p.put(null, r[1], t.shape, t.data);
+    }
+    try p.put(null, "model.final_input.query", &.{ 1, H }, (try p.get(null, "final_input.query")).?.data);
+    const message = (try p.get(null, "message_input.query")).?.data;
+    const renames = [_][2][]const u8{
+        .{ "attention_input.query", "attn_input.query" },                  .{ "mlp_input.query", "mlp_input.query" },
+        .{ "input_layernorm.weight", "attn_norm.weight" },                 .{ "q_input_layernorm.weight", "q_input_norm.weight" },
+        .{ "k_input_layernorm.weight", "k_input_norm.weight" },            .{ "v_input_layernorm.weight", "v_input_norm.weight" },
+        .{ "post_attention_layernorm.weight", "mlp_norm.weight" },         .{ "self_attn.o_proj.weight", "attn.o_proj.weight" },
+        .{ "self_attn.q_l2_clip.scale", "attn.q_scale" },                  .{ "self_attn.rel_l2_clip.scale", "attn.r_scale" },
+        .{ "self_attn.rel_logits_proj.proj", "attn.rel_proj" },            .{ "self_attn.k_sconv.static_weight", "attn.k_static" },
+        .{ "self_attn.v_sconv.static_weight", "attn.v_static" },           .{ "self_attn.k_sconv.conv1d.weight", "attn.k_conv" },
+        .{ "self_attn.v_sconv.conv1d.weight", "attn.v_conv" },             .{ "post_attention_convolution.conv1d.weight", "attn_conv" },
+        .{ "post_mlp_convolution.conv1d.weight", "mlp_conv" },             .{ "mlp.gate.weight", "mlp.router_weight" },
+        .{ "mlp.gate.e_score_correction_bias", "mlp.router_bias" },        .{ "mlp.experts.gate_up_proj.weight", "mlp.experts.w13.weight" },
+        .{ "mlp.experts.down_proj.weight", "mlp.experts.w2.weight" },
+    };
+    for (0..8) |i| {
+        for (renames) |r| if (try p.get(i, r[0])) |t| {
+            // oQ drops a kernel's trailing axis and keeps a lone query as one row.
+            const shape: []const u64 = if (std.mem.endsWith(u8, r[0], "conv1d.weight")) t.shape[0..2] else if (t.shape.len == 1 and std.mem.endsWith(u8, r[0], "query")) &.{ 1, H } else t.shape;
+            try p.put(i, r[1], shape, t.data);
+        };
+        const A = "self_attn.";
+        if (try p.get(i, "input_layernorm.weight") != null) {
+            try p.join(i, "attn.in_proj.weight", &.{ A ++ "q_proj.weight", A ++ "k_proj.weight", A ++ "v_proj.weight", A ++ "r_proj.weight", A ++ "gate_proj.weight", A ++ "sink_proj.weight" });
+        } else {
+            try p.join(i, "attn.q_proj.weight", &.{ A ++ "q_proj.weight", A ++ "r_proj.weight", A ++ "gate_proj.weight", A ++ "sink_proj.weight" });
+            try p.join(i, "attn.k_proj.weight", &.{ A ++ "k_proj.weight", A ++ "k_sconv.weight_proj.weight" });
+            try p.join(i, "attn.v_proj.weight", &.{ A ++ "v_proj.weight", A ++ "v_sconv.weight_proj.weight" });
+        }
+        if (try p.get(i, "q_message_gate.down_proj.weight") == null) continue;
+        const down = try a.alloc(f32, 4 * 2 * H * RANK);
+        const both = try a.alloc(f32, 4 * RANK * 2 * H);
+        inline for (.{ "q", "k", "v", "mlp" }, 0..) |x, g| {
+            const d = (try p.get(i, x ++ "_message_gate.down_proj.weight")).?.data;
+            const gain = (try p.get(i, x ++ "_message_gate.message_gate_proj.weight")).?.data;
+            const forget = (try p.get(i, x ++ "_message_gate.forget_gate_proj.weight")).?.data;
+            for (0..RANK) |r| for (0..2 * H) |c| {
+                down[((g * 2 + c / H) * H + c % H) * RANK + r] = d[r * 2 * H + c];
+                both[(g * RANK + r) * 2 * H + c] = if (c < H) gain[c * RANK + r] else forget[(c - H) * RANK + r];
+            };
+        }
+        try p.put(i, "loop_down", &.{ 4, 2, H, RANK }, down);
+        try p.put(i, "loop_gain_forget", &.{ 4, RANK, 2 * H }, both);
+        try p.put(i, "loop_message.query", &.{ 4, H }, message[(i - 2) * 4 * H ..][0 .. 4 * H]);
+    }
+    return p.out.items;
+}
+
+// Bar: the fixture as oMLX's oQ layout stores it serves the bytes the mlx-lm layout serves for a prompt's rows, on
+// the CPU's stream and the GPU's.
+test "inkling2 proof: oMLX's oQ layout serves the mlx-lm layout's rows, bit for bit" {
+    const a = testing.allocator;
+    for (streams()) |gpu| {
+        var s = try Setup.init(a, gpu);
+        defer s.deinit(a);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var fx = try plugin.conformanceFixture(arena.allocator());
+        const files = try arena.allocator().dupe(fixture.File, fx.files);
+        files[1].bytes = try fixture.safetensors(arena.allocator(), try oqLayout(arena.allocator(), try plugin.fixtureTensors(arena.allocator())));
+        fx.files = files;
+        var pack = try conformance.Loaded.openWith(testing.io, arena.allocator(), plugin.plugin.name, &plugin.table, fx, .{ .gpu = gpu });
+        defer pack.close();
+        var cache = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
+        defer cache.deinit();
+        const whole = try step(a, &pack, &cache, &prompt, 0, .all_rows);
+        defer a.free(whole);
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(s.whole), std.mem.sliceAsBytes(whole));
+    }
+}
+
 /// The release parsed and loaded through the plugin table (its defaults), for the tests that run it.
 const Release = struct {
     weights: @import("../../sdk/weights/resident.zig").Resident,

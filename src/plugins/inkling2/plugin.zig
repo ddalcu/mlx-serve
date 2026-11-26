@@ -1,4 +1,4 @@
-//! Thinking Machines Inkling 2 Mini (`inkling2_loop`, text and images), in mlx-lm's layout (`models/inkling2`) or as released:
+//! Thinking Machines Inkling 2 Mini (`inkling2_loop`, text and images), in mlx-lm's layout (`models/inkling2`), oMLX's oQ or as released:
 //! 24 layers of weights applied 48 times per token, the middle 12 run three times, each pass with its own KV cache and conv
 //! windows and, after the first, messages from the pass before. The stream between layers is depth attention over
 //! saved blocks, not a plain residual, so the forward is the plugin's own loop (`layers.zig`), not a base's.
@@ -1012,15 +1012,22 @@ fn load(ctx: *const abi.LoadCtx, out: *abi.Verdict) callconv(.c) ?*anyopaque {
 
 /// What tensors are read with: the pack, what the model owns and the layer. Each read names the tensor twice: in
 /// mlx-lm's layout, then as the release publishes it (`release`: thinkingmachines' own names under `model.llm`,
-/// which mlx-lm renames at load).
+/// which mlx-lm renames at load). oMLX's oQ layout (`oq`) is read by mlx-lm's name, renamed.
 const At = struct {
     r: *loader.Reader,
     o: *loader.Owned,
     layer: ?u32 = null,
     release: bool,
+    /// oMLX's oQ layout: mlx-lm's tensors under `oqLeaf`'s names, the projections off one input stored joined along
+    /// their rows, a looped layer's gates and message queries stacked under the layer.
+    oq: bool = false,
 
     fn name(a: At, buf: []u8, comptime leaf: []const u8, comptime rel: []const u8) ![]const u8 {
         if (a.release) return if (a.layer) |i| a.r.name(buf, "layers.{d}." ++ rel, .{i}) else a.r.name(buf, rel, .{});
+        if (a.oq) {
+            const short = comptime oqLeaf(leaf);
+            return if (a.layer) |i| a.r.name(buf, "layers.{d}." ++ short, .{i}) else a.r.name(buf, short, .{});
+        }
         return if (a.layer) |i| a.r.name(buf, "layers.{d}." ++ leaf, .{i}) else a.r.name(buf, leaf, .{});
     }
 
@@ -1097,9 +1104,47 @@ const At = struct {
         return a.keep(&g, try g.transpose(raw, axes));
     }
 
-    /// A depthwise conv kernel `[C, K, 1]`; the release stores `[C, 1, K]`.
+    /// A depthwise conv kernel `[C, K, 1]`; the release stores `[C, 1, K]`, oQ `[C, K]`.
     fn kernel(a: At, comptime leaf: []const u8, comptime rel: []const u8) !Array {
-        return if (a.release) a.permuted(leaf, rel, &.{ 0, 2, 1 }) else a.need(leaf, rel);
+        if (a.release) return a.permuted(leaf, rel, &.{ 0, 2, 1 });
+        if (!a.oq) return a.need(leaf, rel);
+        var buf: [256]u8 = undefined;
+        const raw = try a.r.need(try a.name(&buf, leaf, rel));
+        defer _ = mlx.mlx_array_free(raw);
+        var g = ops.Graph.init(gpa, a.r.s);
+        defer g.deinit();
+        const sh = ops.shape(raw);
+        return a.keep(&g, try g.reshape(raw, &.{ sh[0], sh[1], 1 }));
+    }
+
+    /// Rows `[start, start + n)` of a projection, evaluated and unowned: a part of one oQ stores joined.
+    fn rowsOf(a: At, l: Linear, start: c_int, n: c_int) !Linear {
+        var g = ops.Graph.init(gpa, a.r.s);
+        defer g.deinit();
+        var out = l;
+        for ([_]*Array{ &out.w, &out.s, &out.b }) |x| if (x.ctx != null) {
+            const cut = try g.contiguous(try g.sliceAxis(x.*, 0, start, start + n));
+            try ops.eval(cut);
+            x.* = g.escape(cut);
+        };
+        return out;
+    }
+
+    /// The projection oQ stores under `base` (mlx-lm's leaf), cut into parts of `widths` rows; `base`'s own handles
+    /// are freed.
+    fn cutRows(a: At, comptime base: []const u8, in_dim: u32, widths: []const c_int, parts: []const *Linear) !void {
+        const whole = try a.projRaw(base, "", in_dim);
+        defer for ([_]Array{ whole.w, whole.s, whole.b }) |x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x);
+        };
+        var total: c_int = 0;
+        for (widths) |n| total += n;
+        if (ops.shape(whole.w)[0] != total) return error.Inkling2PackLayoutUnknown;
+        var start: c_int = 0;
+        for (parts, widths) |p, n| {
+            p.* = try a.rowsOf(whole, start, n);
+            start += n;
+        }
     }
 
     /// A projection the caller owns once it has tried a join.
@@ -1173,14 +1218,15 @@ const At = struct {
         return j;
     }
 
-    fn conv(a: At, comptime x: []const u8, global: bool, hidden: u32) !layers.Conv {
+    /// `cut`: a global layer's kernel projection where the pack stores it behind the k or v projection's rows (oQ).
+    fn conv(a: At, comptime x: []const u8, global: bool, hidden: u32, cut: ?Linear) !layers.Conv {
         const leaf = "self_attn." ++ x ++ "_sconv";
         const rel = "attn." ++ x ++ "_sconv";
         if (!global) return .{ .static = try a.kernel(leaf ++ ".conv1d.weight", rel ++ ".weight") };
         return .{ .dynamic = .{
             .static = try a.need(leaf ++ ".static_weight", rel ++ ".static_w"),
             // The release's is a bare `[out, in]` tensor, with no `.weight` leaf for the format to find.
-            .proj = if (a.release) .{ .w = try a.need("", rel ++ ".weight_proj") } else try a.proj(leaf ++ ".weight_proj", "", hidden),
+            .proj = if (cut) |l| l else if (a.release) .{ .w = try a.need("", rel ++ ".weight_proj") } else try a.proj(leaf ++ ".weight_proj", "", hidden),
         } };
     }
 
@@ -1233,6 +1279,21 @@ const At = struct {
         var buf: [256]u8 = undefined;
         var g = ops.Graph.init(gpa, a.r.s);
         defer g.deinit();
+        if (a.oq) {
+            // `loop_down` [4, 2, D, rank] and `loop_gain_forget` [4, rank, 2 D]: the message gate's columns, then the
+            // forget gate's. oQ widens the down projection to f32; it is held at the pack's float width, as mlx-lm's
+            // layout holds it, so both serve the same text.
+            const norm = try g.adopt(try a.r.need(try a.name(&buf, "post_attention_layernorm.weight", "")));
+            const down = try g.astype(try g.adopt(try a.r.need(try a.name(&buf, "loop_down", ""))), ops.dtype(norm));
+            const both = try g.adopt(try a.r.need(try a.name(&buf, "loop_gain_forget", "")));
+            const sh = ops.shape(down);
+            const d = sh[2];
+            return .{
+                .down = try a.keep(&g, try g.reshape(try g.contiguous(try g.transpose(down, &.{ 0, 3, 1, 2 })), &.{ sh[0], sh[3], 2 * d })),
+                .forget = try a.keep(&g, try g.contiguous(try g.transpose(try g.sliceAxis(both, 2, d, 2 * d), &.{ 0, 2, 1 }))),
+                .message = try a.keep(&g, try g.contiguous(try g.transpose(try g.sliceAxis(both, 2, 0, d), &.{ 0, 2, 1 }))),
+            };
+        }
         var down: [4]Array = undefined;
         var forget: [4]Array = undefined;
         var message: [4]Array = undefined;
@@ -1250,10 +1311,15 @@ const At = struct {
     /// `[query, mlp]` and `[key, value]` rows per looped layer in two tensors.
     fn messageQuery(at: At, core: c_int, hidden: c_int, index: c_int) !Array {
         // The queries are the model's, not a layer's.
-        const a: At = .{ .r = at.r, .o = at.o, .release = at.release };
+        const a: At = .{ .r = at.r, .o = at.o, .release = at.release, .oq = at.oq };
         var buf: [256]u8 = undefined;
         var g = ops.Graph.init(gpa, a.r.s);
         defer g.deinit();
+        if (a.oq) {
+            // oQ keeps a looped layer's four rows under the layer.
+            const raw = try g.adopt(try at.r.need(try at.name(&buf, "loop_message.query", "")));
+            return a.depthQuery(&g, try g.reshape(try g.astype(raw, .float32), &.{ 1, 4, hidden }));
+        }
         if (!a.release) {
             const raw = try g.adopt(try a.r.need(try a.name(&buf, "message_input.query", "")));
             return a.depthQuery(&g, try g.sliceAxis(try g.reshape(try g.astype(raw, .float32), &.{ core, 4, hidden }), 0, index, index + 1));
@@ -1267,16 +1333,54 @@ const At = struct {
     }
 };
 
+/// mlx-lm's leaf as oMLX's oQ layout names it: the renamed stem, the rest of the leaf kept.
+fn oqLeaf(comptime leaf: []const u8) []const u8 {
+    const renames = .{
+        .{ "embed_tokens", "embed" },
+        .{ "attention_input.query", "attn_input.query" },
+        .{ "input_layernorm", "attn_norm" },
+        .{ "q_input_layernorm", "q_input_norm" },
+        .{ "k_input_layernorm", "k_input_norm" },
+        .{ "v_input_layernorm", "v_input_norm" },
+        .{ "post_attention_layernorm", "mlp_norm" },
+        .{ "post_attention_convolution.conv1d.weight", "attn_conv" },
+        .{ "post_mlp_convolution.conv1d.weight", "mlp_conv" },
+        .{ "self_attn.k_sconv.conv1d.weight", "attn.k_conv" },
+        .{ "self_attn.v_sconv.conv1d.weight", "attn.v_conv" },
+        .{ "self_attn.k_sconv.static_weight", "attn.k_static" },
+        .{ "self_attn.v_sconv.static_weight", "attn.v_static" },
+        .{ "self_attn.q_l2_clip.scale", "attn.q_scale" },
+        .{ "self_attn.rel_l2_clip.scale", "attn.r_scale" },
+        .{ "self_attn.rel_logits_proj.proj", "attn.rel_proj" },
+        .{ "self_attn.", "attn." },
+        .{ "mlp.gate.weight", "mlp.router_weight" },
+        .{ "mlp.gate.e_score_correction_bias", "mlp.router_bias" },
+        .{ "mlp.experts.gate_up_proj", "mlp.experts.w13" },
+        .{ "mlp.experts.down_proj", "mlp.experts.w2" },
+    };
+    inline for (renames) |r| {
+        if (std.mem.startsWith(u8, leaf, r[0])) return r[1] ++ leaf[r[0].len..];
+    }
+    return leaf;
+}
+
 fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     const c = config.of(ctx.parsed);
     var release = false;
+    var oq = false;
     var r = loader.Reader.open(ctx, c.block_json, &.{"model.language_model"}, "embed_tokens.weight") catch |e| switch (e) {
         error.MissingWeight => blk: {
             release = true;
-            // oMLX's oQ packs name the same tensors `model.embed`, `model.layers.N.attn.in_proj`, ...
-            break :blk loader.Reader.open(ctx, c.block_json, &.{"model.llm"}, "embed.weight") catch |e2| return switch (e2) {
-                error.MissingWeight => error.Inkling2PackLayoutUnknown,
-                else => e2,
+            break :blk loader.Reader.open(ctx, c.block_json, &.{"model.llm"}, "embed.weight") catch |e2| switch (e2) {
+                error.MissingWeight => blk2: {
+                    release = false;
+                    oq = true;
+                    break :blk2 loader.Reader.open(ctx, c.block_json, &.{"model"}, "embed.weight") catch |e3| return switch (e3) {
+                        error.MissingWeight => error.Inkling2PackLayoutUnknown,
+                        else => e3,
+                    };
+                },
+                else => return e2,
             };
         },
         else => return e,
@@ -1287,9 +1391,9 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     m.* = .{ .base = .{ .weights = undefined, .shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps), .a = gpa, .s = r.s, .placeholders = ctx.parsed.placeholder_ids } };
     errdefer m.release();
     m.layers = try gpa.alloc(layers.Layer, c.num_hidden_layers);
-    for (m.layers, 0..) |*L, i| L.* = try loadLayer(.{ .r = &r, .o = &m.owned, .layer = @intCast(i), .release = release }, c, @intCast(i));
+    for (m.layers, 0..) |*L, i| L.* = try loadLayer(.{ .r = &r, .o = &m.owned, .layer = @intCast(i), .release = release, .oq = oq }, c, @intCast(i));
 
-    const at: At = .{ .r = &r, .o = &m.owned, .release = release };
+    const at: At = .{ .r = &r, .o = &m.owned, .release = release, .oq = oq };
     const hidden: c_int = @intCast(c.hidden_size);
     var nb: [256]u8 = undefined;
     const embed = try r.tableAt(try at.name(&nb, "embed_tokens", "embed"), c.hidden_size);
@@ -1399,7 +1503,24 @@ fn loadLayer(at: At, c: *const config.Config, i: u32) !layers.Layer {
     else
         @splat(try at.need("input_layernorm.weight", "attn_norm.weight"));
     var lins: [6]Linear = undefined;
-    inline for (&lins, .{ "q_proj", "gate_proj", "r_proj", "sink_proj", "k_proj", "v_proj" }, .{ "wq_du", "gate_attn", "wr_du", "attn_sink_proj", "wk_dv", "wv_dv" }) |*l, leaf, rel|
+    // oQ's kernel projections of a global layer, stored behind its k and v rows.
+    var kernel_proj: [2]?Linear = @splat(null);
+    if (at.oq) {
+        const q: c_int = @intCast(c.num_attention_heads * c.head_dim);
+        const kvw: c_int = @intCast(c.num_key_value_heads * c.head_dim);
+        const r: c_int = @intCast(c.num_attention_heads * c.d_rel);
+        const heads: c_int = @intCast(c.num_attention_heads);
+        const taps: c_int = @intCast(c.num_key_value_heads * c.sconv_kernel);
+        if (global) {
+            try at.cutRows("self_attn.q_proj", hidden, &.{ q, r, q, heads }, &.{ &lins[0], &lins[2], &lins[1], &lins[3] });
+            inline for (.{ "k", "v" }, lins[4..6], &kernel_proj) |x, *l, *kp| {
+                var kernel: Linear = undefined;
+                try at.cutRows("self_attn." ++ x ++ "_proj", hidden, &.{ kvw, taps }, &.{ l, &kernel });
+                kp.* = kernel;
+                try at.o.linear(kernel);
+            }
+        } else try at.cutRows("self_attn.in_proj", hidden, &.{ q, kvw, kvw, r, q, heads }, &.{ &lins[0], &lins[4], &lins[5], &lins[2], &lins[1], &lins[3] });
+    } else inline for (&lins, .{ "q_proj", "gate_proj", "r_proj", "sink_proj", "k_proj", "v_proj" }, .{ "wq_du", "gate_attn", "wr_du", "attn_sink_proj", "wk_dv", "wv_dv" }) |*l, leaf, rel|
         l.* = try at.projRaw("self_attn." ++ leaf, "attn." ++ rel, hidden);
     // Projections off one input join into one matmul; a sliding layer's k and v read the q input too.
     const quantized = lins[0].s.ctx != null;
@@ -1432,8 +1553,8 @@ fn loadLayer(at: At, c: *const config.Config, i: u32) !layers.Layer {
         .rel_proj = rel_proj,
         .rel_proj_t = rel_proj_t,
         .rel_proj_rev = rel_proj_rev,
-        .k_conv = try at.conv("k", global, hidden),
-        .v_conv = try at.conv("v", global, hidden),
+        .k_conv = try at.conv("k", global, hidden, kernel_proj[0]),
+        .v_conv = try at.conv("v", global, hidden, kernel_proj[1]),
         .attn_conv = try at.kernel("post_attention_convolution.conv1d.weight", "attn_sconv.weight"),
         .mlp_conv = try at.kernel("post_mlp_convolution.conv1d.weight", "mlp_sconv.weight"),
         .post_norm = try at.need("post_attention_layernorm.weight", "mlp_norm.weight"),
@@ -1456,6 +1577,15 @@ fn loadLayer(at: At, c: *const config.Config, i: u32) !layers.Layer {
 /// The tiny pack the conformance suite runs, at `config.fixture_config`'s geometry: 8 layers of width 64 (global at
 /// 1, 5 and 7), the loop over layers 2..6 three times, 4 experts of 24, 60 of 64 vocab rows real; seeded random f32.
 pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
+    const fx = sdk.fixture;
+    return .{ .files = try a.dupe(fx.File, &.{
+        .{ .name = "config.json", .bytes = config.fixture_config },
+        .{ .name = "model.safetensors", .bytes = try fx.safetensors(a, try fixtureTensors(a)) },
+    }) };
+}
+
+/// The fixture's tensors, in mlx-lm's layout.
+pub fn fixtureTensors(a: std.mem.Allocator) ![]sdk.fixture.Tensor {
     const fx = sdk.fixture;
     const V = 64;
     const H = 64;
@@ -1535,10 +1665,7 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
             try p.rand(x ++ "_message_gate.message_gate_proj.weight", &.{ H, RANK }, 0.3, 0);
         };
     }
-    return .{ .files = try a.dupe(fx.File, &.{
-        .{ .name = "config.json", .bytes = config.fixture_config },
-        .{ .name = "model.safetensors", .bytes = try fx.safetensors(a, tensors.items) },
-    }) };
+    return tensors.items;
 }
 
 // ── tests ──
