@@ -121,7 +121,7 @@ pub const TwoTime = struct {
     pub fn parse(o: std.json.ObjectMap) error{BadPackConfig}!TwoTime {
         const d = o.get("default_steps") orelse return error.BadPackConfig;
         const g = o.get("sigma_grids") orelse return error.BadPackConfig;
-        if (d != .integer or d.integer < 1 or g != .object) return error.BadPackConfig;
+        if (d != .integer or d.integer < 1 or d.integer > MAX_STEPS or g != .object) return error.BadPackConfig;
         var tt = TwoTime{ .default_steps = @intCast(d.integer) };
         var it = g.object.iterator();
         while (it.next()) |e| {
