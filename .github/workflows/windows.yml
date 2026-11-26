@@ -63,7 +63,7 @@ jobs:
       ZIG_OPTIMIZE: ${{ github.event_name == 'pull_request' && 'Debug' || 'ReleaseFast' }}
       MLX_CUDA_ARCHITECTURES: "75;86;120"
       ZIG_CPU: x86_64_v3
-      ZIG_BUILD_ARGS: ${{ github.event_name == 'pull_request' && '-Dstrip=true' || '' }}
+      ZIG_BUILD_ARGS: ${{ github.event_name == 'pull_request' && '-Dunits=true -Dunit-groups=4 -Dstrip=true' || '' }}
     steps:
       - uses: actions/checkout@v4
 
