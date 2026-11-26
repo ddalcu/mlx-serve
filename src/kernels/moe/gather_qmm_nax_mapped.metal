@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Ported from oMLX (jundot/omlx) omlx/patches/m5_gather_qmm_nax.py @ d6b2b92.
+// sigtab: the paired epilogue's bf16 sigmoid table, or EPI < 0's f32 caps and scales (store_il reads it as f32).
 using Q = metal::conditional_t<MX == 1, omlx_gqmm::Fp4Q<T, GS>, omlx_gqmm::AffineQ<T, GS, BITS>>;
 using G = omlx_gqmm::Geo<BM, BK>;
 using WT = typename Q::WT;
@@ -13,10 +14,10 @@ Q uq{up_scales, up_biases};
 if constexpr (SCHED == 1) {
   omlx_gqmm::gather_mapped_db<T, Q, G, EPI, true, WEIGHTED>(x, rmap, (const device uint8_t*)w,
       (const device uint8_t*)up_w, q, uq, desc, y_col, y, params[0], params[1],
-      Ws, simdgroup_index_in_threadgroup, thread_index_in_simdgroup, sigtab, row_wt, params[2]);
+      Ws, simdgroup_index_in_threadgroup, thread_index_in_simdgroup, (const device T*)sigtab, row_wt, params[2]);
 } else {
   omlx_gqmm::gather_mapped_seg<T, Q, G, ALIGN_N, ALIGN_K, EPI, true, WEIGHTED>(x, rmap,
       (const device uint8_t*)w, (const device uint8_t*)up_w, q, uq, desc, y_col,
       y, params[0], params[1], Ws, simdgroup_index_in_threadgroup,
-      thread_index_in_simdgroup, sigtab, row_wt, params[2]);
+      thread_index_in_simdgroup, (const device T*)sigtab, row_wt, params[2]);
 }

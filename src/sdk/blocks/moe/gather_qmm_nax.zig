@@ -9,11 +9,12 @@ const log = @import("../../util/log.zig");
 pub const Plan = struct { sched: enum { seg, db }, bm: c_int, bk: c_int, gx: c_int, pad: c_int };
 /// `mx`: an FP4 bank (uint8 scales, no biases: e8m0 per 32 for MXFP4, e4m3 per 16 for NVFP4) instead of affine.
 const CanaryKey = struct { plan: Plan, bits: u32, group: u32, align_n: bool, align_k: bool, mx: bool };
-const MmKey = struct { rows: c_int, n: c_int, k: c_int, max_tiles: c_int, plan: Plan, bits: u32, group: u32, mx: bool, mapped: bool = false, paired: bool = false, weighted: bool = false, limit: u32 = 0 };
+const MmKey = struct { rows: c_int, n: c_int, k: c_int, max_tiles: c_int, plan: Plan, bits: u32, group: u32, mx: bool, mapped: bool = false, paired: bool = false, weighted: bool = false, limit: u32 = 0, il: bool = false };
 var scan_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mm_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mapped_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var paired_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var il_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var canaries: std.AutoHashMapUnmanaged(CanaryKey, bool) = .{};
 var mapped_canaries: std.AutoHashMapUnmanaged(CanaryKey, bool) = .{};
 var paired_canaries: std.AutoHashMapUnmanaged(CanaryKey, bool) = .{};
@@ -21,6 +22,7 @@ var weighted_canaries: std.AutoHashMapUnmanaged(CanaryKey, bool) = .{};
 var engaged_logged = false;
 var mapped_engaged_logged = false;
 var paired_engaged_logged = false;
+var il_engaged_logged = false;
 
 /// Tile configuration by mean rows per expert and K. The 96+-row rungs are ours: oMLX's
 /// seg tiles were measured against mlx 0.32.2, whose sorted kernel masked whole row blocks;
@@ -92,8 +94,16 @@ fn kernel(scan: bool) !mlx.mlx_fast_metal_kernel {
     return value;
 }
 
-fn mapKernel(paired: bool) !mlx.mlx_fast_metal_kernel {
-    const slot = if (paired) &paired_kernel else &mapped_kernel;
+/// The row-mapped kernel: plain (`.map`), the paired SwiGLU (`.pair`) or the interleaved soft-capped one (`.il`, its
+/// `sigtab` f32), each its own instantiation set.
+const MapKind = enum { map, pair, il };
+
+fn mapKernel(kind: MapKind) !mlx.mlx_fast_metal_kernel {
+    const slot = switch (kind) {
+        .map => &mapped_kernel,
+        .pair => &paired_kernel,
+        .il => &il_kernel,
+    };
     if (slot.*) |v| return v;
     const names = [_][*:0]const u8{ "x", "w", "scales", "biases", "up_w", "up_scales", "up_biases", "tiles", "tile_count", "params", "sigtab", "rmap", "row_wt" };
     const outs = [_][*:0]const u8{"y"};
@@ -102,7 +112,11 @@ fn mapKernel(paired: bool) !mlx.mlx_fast_metal_kernel {
     const outs_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
     defer _ = mlx.mlx_vector_string_free(outs_vec);
     const header = kernelSource("kernels/moe/gather_qmm_nax_header.metal") ++ kernelSource("kernels/moe/gather_qmm_nax_mapped_header.metal");
-    const value = mlx.mlx_fast_metal_kernel_new(if (paired) "msv_gqmm_affine_pair" else "msv_gqmm_affine_map", ins_vec, outs_vec, kernelSource("kernels/moe/gather_qmm_nax_mapped.metal"), header, true, false);
+    const value = mlx.mlx_fast_metal_kernel_new(switch (kind) {
+        .map => "msv_gqmm_affine_map",
+        .pair => "msv_gqmm_affine_pair",
+        .il => "msv_gqmm_affine_il",
+    }, ins_vec, outs_vec, kernelSource("kernels/moe/gather_qmm_nax_mapped.metal"), header, true, false);
     if (value.ctx == null) return error.MetalKernelCompileFailed;
     slot.* = value;
     return value;
@@ -170,7 +184,7 @@ fn mmConfig(key: MmKey) !mlx.mlx_fast_metal_kernel_config {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GX", key.plan.gx));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "PAD", key.plan.pad));
     if (key.mapped) {
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "EPI", if (key.paired) 1 + @as(c_int, @intCast(key.limit)) else 0));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "EPI", if (key.il) -1 else if (key.paired) 1 + @as(c_int, @intCast(key.limit)) else 0));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "WEIGHTED", key.weighted));
     }
     return cfg;
@@ -178,7 +192,9 @@ fn mmConfig(key: MmKey) !mlx.mlx_fast_metal_kernel_config {
 
 /// `limit`: a `swiglu_limit` the epilogue clamps at (whole numbers; 0 = none). `up_off`: the up rows' offset in an
 /// expert of a bank fused along its rows (gate rows, then up rows; `w` is then the gate's bank too), else 0.
-const Pair = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, sigtab: mlx.mlx_array, row_wt: mlx.mlx_array = .{ .ctx = null }, limit: u32 = 0, up_off: c_int = 0 };
+/// `il`: one bank `w` of interleaved gate (even) and up (odd) rows under the soft-capped epilogue; `sigtab` is then its
+/// f32 caps and per-expert scales.
+const Pair = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, sigtab: mlx.mlx_array, row_wt: mlx.mlx_array = .{ .ctx = null }, limit: u32 = 0, up_off: c_int = 0, il: bool = false };
 
 /// An MXFP4 bank has no biases; the kernel signature still binds the slot. 16
 /// elements: MLX binds an array under 8 in `constant`, not `device`.
@@ -202,7 +218,8 @@ fn launchMapped(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: 
     const m = mlx.getShape(idx)[0];
     const e = ws[0];
     const up_off: c_int = if (pair) |v| v.up_off else 0;
-    const n = ws[1] - up_off;
+    const il = if (pair) |v| v.il else false;
+    const n = if (il) @divExact(ws[1], 2) else ws[1] - up_off;
     const k = xs[2];
     const t = try scanTiles(idx, m, e, p.bm, s);
     defer t.deinit();
@@ -214,9 +231,9 @@ fn launchMapped(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: 
     const sigtab = if (pair) |v| v.sigtab else biasArg(.{ .ctx = null }); // unread without a pair
     const row_wt: mlx.mlx_array = if (pair) |v| v.row_wt else .{ .ctx = null };
     const inputs = [_]mlx.mlx_array{ x, w, sc, biasArg(bi), pw, ps, biasArg(pb), t.tiles, t.count, params, sigtab, row_map, wtArg(row_wt) };
-    const cfg = try mmConfig(.{ .rows = m, .n = n, .k = k, .max_tiles = t.max_tiles, .plan = p, .bits = bits, .group = group, .mx = mx, .mapped = true, .paired = pair != null, .weighted = row_wt.ctx != null, .limit = if (pair) |v| v.limit else 0 });
+    const cfg = try mmConfig(.{ .rows = m, .n = n, .k = k, .max_tiles = t.max_tiles, .plan = p, .bits = bits, .group = group, .mx = mx, .mapped = true, .paired = pair != null, .weighted = row_wt.ctx != null, .limit = if (pair) |v| v.limit else 0, .il = il });
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    return applyOne(try mapKernel(pair != null), &inputs, cfg, s);
+    return applyOne(try mapKernel(if (il) .il else if (pair != null) .pair else .map), &inputs, cfg, s);
 }
 
 fn applyOne(k: mlx.mlx_fast_metal_kernel, inputs: []const mlx.mlx_array, cfg: mlx.mlx_fast_metal_kernel_config, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -619,6 +636,26 @@ fn sortedGateUpFusedWithWt(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_
     if (!paired_engaged_logged) {
         paired_engaged_logged = true;
         log.info("[gather-nax] paired SwiGLU engaged (fused bank): M={d} E={d} N={d} K={d}\n", .{ mlx.getShape(idx)[0], ws[0], n, xs[2] });
+    }
+    return out;
+}
+
+/// `sortedGatherMappedPrompt` over a bank `[E, 2 n, K]` of interleaved gate (even) and up (odd) rows with the soft-capped
+/// SwiGLU in its epilogue (Inkling 2's act on the rounded products): `[M, 1, n]`. `aux` f32 `[4 + E]` holds
+/// { 1 / gate cap, gate cap, 1 / up cap, up cap } then each expert's scale (ones for none). The same tile, plan and K
+/// order as the plain mapped call, so the products are its products. Null where it does not serve.
+pub fn sortedGateUpInterleaved(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, aux: mlx.mlx_array, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!nax_available or !mlx.streamIsGpu(s)) return null;
+    if (!supported(x, w, sc, bi, idx, bits, group, mx, row_map, true)) return null;
+    const ws = mlx.getShape(w);
+    if (@rem(ws[1], 64) != 0) return null;
+    if (aux.ctx == null or mlx.mlx_array_dtype(aux) != .float32 or mlx.mlx_array_ndim(aux) != 1 or mlx.getShape(aux)[0] != 4 + ws[0]) return null;
+    const key = mappedKey(x, w, idx, bits, group, mx, false);
+    if (!armed(key, s) or !armedMapped(key, false, false, s)) return null;
+    const out = try launchMapped(x, row_map, w, sc, bi, idx, .{ .w = w, .sc = sc, .bi = bi, .sigtab = aux, .il = true }, bits, group, mx, key.plan, s);
+    if (!il_engaged_logged) {
+        il_engaged_logged = true;
+        log.info("[gather-nax] interleaved soft-capped SwiGLU engaged: M={d} E={d} N={d} K={d}\n", .{ mlx.getShape(idx)[0], ws[0], @divExact(ws[1], 2), mlx.getShape(x)[2] });
     }
     return out;
 }
@@ -1075,6 +1112,72 @@ test "segmented NAX sorted gather: weighted paired SwiGLU matches unweighted tim
         defer _ = mlx.mlx_array_free(got_fused);
         try expectBitEqual(want, got_fused, s);
     }
+}
+
+test "segmented NAX sorted gather: the interleaved soft-capped SwiGLU epilogue is the soft-capped SwiGLU of the mapped products" {
+    try requireNax();
+    errdefer dropOwnLatch();
+    const s = mlx.gpuStream();
+    const alloc = std.testing.allocator;
+    // Inkling 2 Mini's expert shape (2304 -> 2 x 1152 NVFP4, 128 experts, top 8) over a short prompt.
+    const tokens: c_int = 700;
+    const rows = tokens * 8;
+    const experts: c_int = 128;
+    const n2: c_int = 2304;
+    const k: c_int = 2304;
+    const ids_data = try alloc.alloc(u32, @intCast(rows));
+    defer alloc.free(ids_data);
+    skewedRouting(ids_data, @intCast(experts));
+    const map_data = try alloc.alloc(u32, @intCast(rows));
+    defer alloc.free(map_data);
+    for (map_data, 0..) |*v, i| v.* = @intCast((i * 73 + 11) % @as(usize, @intCast(tokens)));
+    const ids = mlx.mlx_array_new_data(ids_data.ptr, &[_]c_int{rows}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    const row_map = mlx.mlx_array_new_data(map_data.ptr, &[_]c_int{rows}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(row_map);
+    const bank = try randomBank(experts, n2, k, 4, 16, true, 0x2267, s);
+    defer bank.deinit();
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_random_normal(&x, &[_]c_int{ tokens, 1, k }, 3, .bfloat16, 0, 2.0, bank.key, s));
+    // Caps 4 and 25 as the release's, a per-expert scale spread around one.
+    var aux_host: [4 + 128]f32 = undefined;
+    aux_host[0] = 1.0 / 4.0;
+    aux_host[1] = 4.0;
+    aux_host[2] = 1.0 / 25.0;
+    aux_host[3] = 25.0;
+    for (aux_host[4..], 0..) |*v, e| v.* = 0.5 + @as(f32, @floatFromInt(e)) / 64.0;
+    const aux = mlx.mlx_array_new_data(&aux_host, &[_]c_int{aux_host.len}, 1, .float32);
+    defer _ = mlx.mlx_array_free(aux);
+    const prod = (try sortedGatherMappedPrompt(x, row_map, bank.w, bank.sc, bank.bi, ids, 4, 16, true, true, s)) orelse return error.KernelDeclinedTestShape;
+    defer _ = mlx.mlx_array_free(prod);
+    const got = (try sortedGateUpInterleaved(x, row_map, bank.w, bank.sc, bank.bi, ids, aux, 4, 16, true, true, s)) orelse return error.KernelDeclinedTestShape;
+    defer _ = mlx.mlx_array_free(got);
+    var p32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(p32);
+    try mlx.check(mlx.mlx_astype(&p32, prod, .float32, s));
+    var g32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g32);
+    try mlx.check(mlx.mlx_astype(&g32, got, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(p32));
+    try mlx.check(mlx.mlx_array_eval(g32));
+    try std.testing.expectEqualSlices(c_int, &[_]c_int{ rows, 1, @divExact(n2, 2) }, mlx.getShape(got));
+    const pd = (mlx.mlx_array_data_float32(p32) orelse return error.NoData)[0..mlx.mlx_array_size(p32)];
+    const gd = (mlx.mlx_array_data_float32(g32) orelse return error.NoData)[0..mlx.mlx_array_size(g32)];
+    const half: usize = @intCast(@divExact(n2, 2));
+    var worst: f64 = 0;
+    for (0..@intCast(rows)) |r| for (0..half) |i| {
+        const sc = aux_host[4 + ids_data[r]];
+        const g = pd[r * 2 * half + 2 * i] * sc;
+        const u = pd[r * 2 * half + 2 * i + 1] * sc;
+        const want: f64 = (std.math.tanh(@as(f64, g) * 0.25) * 4.0) * (std.math.tanh(@as(f64, u) / 25.0) * 25.0) / (1.0 + @exp(-@as(f64, g)));
+        const have: f64 = gd[r * half + i];
+        // A bf16 output: within 2^-7 of the f64 value, relative (one to two of its ulps).
+        const err = @abs(have - want) / (@abs(want) * 0x1p-7 + 0x1p-30);
+        worst = @max(worst, err);
+    };
+    std.debug.print("[gather-nax] interleaved SwiGLU epilogue: worst error {d:.3} of 2^-7 relative over {d} outputs\n", .{ worst, gd.len });
+    try std.testing.expect(worst <= 1.0);
 }
 
 /// `a` and `b` interleaved per rep after one warm run each: per-arm medians of the wall

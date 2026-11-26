@@ -110,6 +110,10 @@ METAL_FUNC void store_act(thread DTile& D, device T* y, const int ld,
                           const int rows, const device T* sigtab,
                           const device float* row_wt);
 
+template <typename T, typename DTile>
+METAL_FUNC void store_il(thread DTile& D, device T* y, const int ld,
+                         const int rows, const device T* aux, const uint expert);
+
 template <
     typename T,
     typename Q,
@@ -138,8 +142,10 @@ METAL_FUNC void gather_mapped_seg(
     const device float* row_wt = nullptr,
     const int up_off = 0) {
   using WT = typename Q::WT;
-  constexpr bool kPair = EPI != 0;
-  static_assert(!kPair || ALIGN_N, "paired gate/up tiles are full");
+  constexpr bool kPair = EPI > 0;
+  // EPI < 0: one bank's gate (even) and up (odd) rows, tiled as one product; the epilogue pairs adjacent columns.
+  constexpr bool kIL = EPI < 0;
+  static_assert(!(kPair || kIL) || ALIGN_N, "paired gate/up tiles are full");
   constexpr int BKP = G::kBK + 16 / sizeof(WT);
   const int row_start = int(desc.x);
   const uint32_t expert = desc.y;
@@ -152,7 +158,7 @@ METAL_FUNC void gather_mapped_seg(
   const int k_remain = K - K_it * G::kBK;
   const int half_n = N / 2;
   const int w_col = kPair ? y_col / 2 : y_col;
-  const int ldy = kPair ? half_n : N;
+  const int ldy = kPair || kIL ? half_n : N;
 
   // `up_off`: a gate/up bank fused along its rows (gate rows then up rows an expert) passes the up rows' offset.
   const size_t w_row = size_t(expert) * (kPair ? half_n + up_off : N) + w_col;
@@ -166,7 +172,7 @@ METAL_FUNC void gather_mapped_seg(
   if constexpr (!MAP) {
     x += size_t(row_start) * K;
   }
-  y += size_t(row_start) * ldy + w_col;
+  y += size_t(row_start) * ldy + (kIL ? y_col / 2 : w_col);
 
   const short tm = kSM * short(sgid / kWN);
   const short tn = kSN * short(sgid % kWN);
@@ -238,7 +244,11 @@ METAL_FUNC void gather_mapped_seg(
       }
     }
 
-    if constexpr (kPair) {
+    if constexpr (kIL) {
+      if (sg_active) {
+        store_il<T>(Dtile, y + tm * ldy + tn / 2, ldy, int(sgp_sm), sigtab, expert);
+      }
+    } else if constexpr (kPair) {
       if (sg_active) {
         store_act<T, EPI, WEIGHTED>(
             Dtile, y + tm * ldy + tn / 2, ldy, int(sgp_sm), sigtab,
@@ -273,7 +283,8 @@ METAL_FUNC void gather_mapped_db(
     const int up_off = 0) {
   using WT = typename Q::WT;
   static_assert(G::kBK == 64, "db runs 64-deep K steps");
-  constexpr bool kPair = EPI != 0;
+  constexpr bool kPair = EPI > 0;
+  constexpr bool kIL = EPI < 0;
   constexpr int BKP = G::kBK + 16 / sizeof(WT);
   constexpr int kTile = kBN * BKP;
   const int row_start = int(desc.x);
@@ -375,7 +386,17 @@ METAL_FUNC void gather_mapped_db(
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
-  if constexpr (kPair) {
+  if constexpr (kIL) {
+    if (rows > 0) {
+      store_il<T>(
+          D,
+          y + size_t(row_start + m0) * half_n + y_col / 2 + (kSN / 2) * (sgid % kWN),
+          half_n,
+          rows,
+          sigtab,
+          expert);
+    }
+  } else if constexpr (kPair) {
     if (rows > 0) {
       store_act<T, EPI, WEIGHTED>(
           D,
@@ -430,6 +451,38 @@ METAL_FUNC void store_act(
           }
         }
         *(device vec<T, 4>*)(y + size_t(r) * ld + sc.x) = v;
+      }
+    }
+  }
+}
+// EPI < 0: Inkling 2's soft-capped SwiGLU over one bank's interleaved gate (even) and up (odd) columns, as its
+// act.metal computes it on the rounded products: g, u = T(product) * the expert's scale; out = T(cap_g tanh(g / cap_g)
+// * cap_u tanh(u / cap_u) / (1 + exp(-g))). `aux` is f32 { 1 / cap_g, cap_g, 1 / cap_u, cap_u, scale[E] }.
+template <typename T, typename DTile>
+METAL_FUNC void store_il(
+    thread DTile& D, device T* y, const int ld, const int rows,
+    const device T* aux_t, const uint expert) {
+  const device float* aux = (const device float*)aux_t;
+  const float sc = aux[4 + expert];
+  const short2 xy = BaseNAXFrag::get_coord();
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < DTile::kTileRows; i++) {
+    STEEL_PRAGMA_UNROLL
+    for (short h = 0; h < 2; h++) {
+      const int r = i * 16 + h * 8 + xy.y;
+      if (r < rows) {
+        STEEL_PRAGMA_UNROLL
+        for (short f = 0; f < DTile::kTileCols; f++) {
+          vec<T, 2> v;
+          STEEL_PRAGMA_UNROLL
+          for (short p = 0; p < 2; p++) {
+            const float g = float(T(D.frag_at(i, f)[h * 4 + 2 * p])) * sc;
+            const float u = float(T(D.frag_at(i, f)[h * 4 + 2 * p + 1])) * sc;
+            const float capped = (metal::precise::tanh(g * aux[0]) * aux[1]) * (metal::precise::tanh(u * aux[2]) * aux[3]);
+            v[p] = T(capped / (1.0f + metal::precise::exp(-g)));
+          }
+          *(device vec<T, 2>*)(y + size_t(r) * ld + (f * 16 + xy.x) / 2) = v;
+        }
       }
     }
   }
