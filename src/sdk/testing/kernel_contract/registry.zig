@@ -111,11 +111,11 @@ test "kernel contract gate 5: every registered launch fits every chip, every lim
 
 /// The areas' names, in `areas` order: the per-area gates tests below name theirs.
 const area_names = [_][]const u8{
-    "controls",   "norms",  "rope",     "ssm",         "hc",           "gdn",       "kda",
-    "attention",  "qmm",    "sampling", "spec",        "gemma4",       "qwen4_exp", "sparse_block",
-    "minimax_h3", "ltx",    "ming_tts", "gguf",        "exl3",         "mlp",       "quant",
-    "dit",        "linear", "moe",      "deepseek_v4", "deepseek_v41", "idol",      "inkling2",
-};
+    "controls",   "norms",  "rope",     "ssm",         "hc",     "gdn",       "kda",
+    "attention",  "qmm",    "sampling", "spec",        "gemma4", "qwen4_exp", "sparse_block",
+    "minimax_h3", "ltx",    "ming_tts", "gguf",        "exl3",   "mlp",       "quant",
+    "dit",        "linear", "moe",      "deepseek_v4",
+} ++ (if (dsv41_link.on) [_][]const u8{"deepseek_v41"} else [_][]const u8{}) ++ [_][]const u8{ "idol", "inkling2" };
 
 comptime {
     // One gates test per area (and per part of a split one) below: an area added to `areas` needs its own.
@@ -127,6 +127,8 @@ comptime {
 /// not depend on which test runs it.
 fn gatesArea(comptime name: []const u8, part: usize, parts: usize) !void {
     if (!builtin.os.tag.isDarwin() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    // DeepSeek-V4.1's area is in macOS builds only.
+    if (comptime std.mem.eql(u8, name, "deepseek_v41") and !dsv41_link.on) return error.SkipZigTest;
     const i = comptime for (area_names, 0..) |n, j| {
         if (std.mem.eql(u8, n, name)) break j;
     } else @compileError("kernel contract: no area " ++ name);
