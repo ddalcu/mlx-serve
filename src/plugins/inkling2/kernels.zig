@@ -874,8 +874,9 @@ pub fn relative(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, r
 pub fn relativeWith(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, rel_states: Array, sinks: Array, k: Array, v: Array, offset: c_int, flash: bool, out_gate: ?Array) !Array {
     const s = ops.shape(q_rows)[1];
     // `MLX_SERVE_INKLING2_NAX_PREFILL` (default on): `relative_attention_nax.metal`'s read (=0: main's
-    // `relattn_nax.metal`).
-    const tiles = lever(.MLX_SERVE_INKLING2_NAX_PREFILL);
+    // `relattn_nax.metal`). A prompt that read cannot take (not bf16 at head dim 128, or no tensor units) gets main's.
+    const tiles = lever(.MLX_SERVE_INKLING2_NAX_PREFILL) and nax.verifyQmmNaxAvailable() and
+        ops.dtype(q_rows) == .bfloat16 and ops.dtype(k) == .bfloat16 and ops.dtype(v) == .bfloat16 and cfg.head_dim == 128;
     if (!tiles and s > small_rows) if (try relativeNax(g, L, cfg, q_rows, rel_states, sinks, k, v, offset)) |o| {
         return if (out_gate) |gt| gated(g, o, gt, s) else o;
     };

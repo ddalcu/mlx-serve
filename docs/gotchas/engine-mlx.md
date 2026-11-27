@@ -1709,9 +1709,9 @@ token flips. Fix: a greedy or seeded request (`SamplingParams.repeats`) adopts n
 an unseeded sampled one keeps both. Beside other requests the group rounds then made its text follow arrivals: a
 group's forward carries every slot's rows, and the kernels (MLX's matmul by row count, the router and expert paths past
 32 and 63 rows, the split-K by the launch's longest lane, the draft head and tree width by lanes) follow the group. Fix:
-such a request rounds alone (`native_group.roundsAlone`). Rule: a request that asks to repeat reads nothing another
-request chose, state or shape. Guards: `plugin native drafter: only an unseeded sampled request continues an earlier
-one`, `roundsAlone: a request that must answer the same twice never shares a forward`, `inkling2 release: a greedy lane's
+such a request can round alone (`native_group.roundsAlone`, opt-in `MLX_SERVE_GREEDY_SOLO_ROUNDS=1`: on by default it held
+multi-user greedy decode flat). Rule: a request that must repeat under load reads nothing another request chose. Guards: `plugin native drafter: only an unseeded sampled request continues an earlier
+one`, `roundsAlone: with the switch on, a request that must answer the same twice never shares a forward`, `inkling2 release: a greedy lane's
 rounds beside a sampled group are its rounds alone`.
 
 ### A kernel template argument that carried a launch's rows filled the proof table, and every launch then paid an evaluation
