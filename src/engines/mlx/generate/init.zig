@@ -1050,6 +1050,7 @@ pub fn initWithOptions(
             .dflash_ctx = dflash_ctx,
             .dflash_block_size = dflash_bs,
             .dflash_pol = if (dflash_active and options.dflash_policy) .{} else null,
+            .recall_loopback = options.recall_loopback,
             .dflash_min_accepted_per_round = options.dflash_min_accepted_per_round,
             .mtp = if (mtp_active) options.mtp else null,
             .mtp_accept_graph = accept_route.graph,

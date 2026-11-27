@@ -205,16 +205,11 @@ pub fn nextPld(
     // below exactly like an in-context draft — replies stay byte-identical.
     var recall_used = false;
     var recall_proposed: i64 = 0;
-    if (draft_slice == null and recall_mod.shared_state.get().enabled) {
-        if (self.recall == null) self.recall = recall_mod.armReader(self.tok);
-        if (self.recall) |*rd| {
-            self.recall_round += 1;
-            const copy = rd.propose(committed, max_draft, self.recall_round);
-            if (copy.len >= 2) {
-                draft_slice = copy;
-                recall_used = true;
-                recall_proposed = @intCast(copy.len);
-            }
+    if (draft_slice == null) {
+        if (self.recallAsk(committed, max_draft)) |copy| {
+            draft_slice = copy;
+            recall_used = true;
+            recall_proposed = @intCast(copy.len);
         }
     }
 

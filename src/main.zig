@@ -412,19 +412,28 @@ fn printUsage(io: std.Io) void {
         \\                        GB of disk, so it's opt-in; e.g. 10GB. 0/off
         \\                        disables.
         \\  --recall             Draft from a persistent record of the token ids
-        \\                        the server has read and written (default: off).
-        \\                        A re-sent request, a regenerated reply, or an
-        \\                        agent re-copying earlier output verifies the
-        \\                        earlier continuation in one round instead of
-        \\                        drafting token by token. Records ids only,
-        \\                        never text, under the --recall-dir, one record
-        \\                        per tokenizer. Replies are byte-identical with
-        \\                        it on, off or read-only. All --recall-* flags
+        \\                        the server has read and written, so repeated
+        \\                        text (a re-sent prompt, a regenerated reply,
+        \\                        re-copied code) verifies in one round.
+        \\                        THE RECORD STORES EVERY PROMPT AND REPLY, as
+        \\                        token ids that the model's tokenizer turns
+        \\                        back into their exact text; treat the record
+        \\                        directory as you would those conversations.
+        \\                        With an API key active the record serves
+        \\                        loopback requests only by default (a hit
+        \\                        decodes measurably faster, which would let
+        \\                        any other client probe what was said);
+        \\                        --recall-shared opts keyed and LAN clients
+        \\                        into it. Replies are byte-identical with it
+        \\                        on, off or read-only. All --recall-* flags
         \\                        imply --recall.
         \\  --recall-dir <dir>   Where the records live (default:
         \\                        ~/.cache/mlx-serve/recall).
         \\  --recall-gib <n>    Record disk per tokenizer in GiB (default
         \\                        0.0625 = 64 MiB); the oldest ids go first.
+        \\  --recall-shared     Keyed and LAN clients share the record too
+        \\                        (single-user deployments); without it they
+        \\                        never read or write the record.
         \\  --recall-read-only  Draft from the record and add nothing (also the
         \\                        behavior when another server holds the record).
         \\  --shutdown-persist-secs <n>
@@ -1119,6 +1128,11 @@ pub fn main(init: std.process.Init) !void {
             }
             const st = recall_mod.shared_state.get();
             st.cap_bytes = @max(@as(u64, @intFromFloat(gib * (1 << 30))), recall_mod.chunk_bytes);
+            st.enabled = true;
+            st.io = io;
+        } else if (std.mem.eql(u8, args[i], "--recall-shared")) {
+            const st = recall_mod.shared_state.get();
+            st.shared = true;
             st.enabled = true;
             st.io = io;
         } else if (std.mem.eql(u8, args[i], "--recall-read-only")) {

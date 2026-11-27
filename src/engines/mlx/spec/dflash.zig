@@ -250,17 +250,17 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         }
         var from_record = false;
         if (tree_copy == null) {
-            // Recall (sdk/recall): the context backs no continuation — the
-            // persistent record may (a reply this model wrote before, a
-            // re-sent turn). Same tree round, same verify; the record's own
-            // confidence bar (DFLASH_COPY_MATCH of match behind the copy)
-            // mirrors the in-context one, and its landing bands observe.
+            // Recall: the context backs no continuation — the persistent
+            // record may (a reply this model wrote before, a re-sent turn).
+            // Same tree round, same verify; the record's own confidence bar
+            // (DFLASH_COPY_MATCH of match behind the copy) mirrors the
+            // in-context one, and its landing bands observe.
             if (self.recallArm()) |rd| {
-                self.recall_round += 1;
-                const copy = rd.propose(committed, dflashTreeNodes(m), self.recall_round);
-                if (copy.len == dflashTreeNodes(m) and rd.last_match >= DFLASH_COPY_MATCH) {
-                    tree_copy = copy;
-                    from_record = true;
+                if (self.recallAsk(committed, dflashTreeNodes(m))) |copy| {
+                    if (copy.len == dflashTreeNodes(m) and rd.last_match >= DFLASH_COPY_MATCH) {
+                        tree_copy = copy;
+                        from_record = true;
+                    }
                 }
             }
         }
@@ -865,9 +865,7 @@ pub fn dflashCopyRound(self: *Generator, allocator: std.mem.Allocator, t1: u32, 
             const committed = try allocator.alloc(u32, @min(self.prompt_ids_owned.len + self.generated_ids.items.len + 1, DFLASH_COPY_WINDOW));
             defer allocator.free(committed);
             pld_index.tailWindow(committed, self.prompt_ids_owned, self.generated_ids.items, t1);
-            self.recall_round += 1;
-            const copy = rd.propose(committed, DFLASH_COPY_MAX, self.recall_round);
-            if (copy.len >= 2) {
+            if (self.recallAsk(committed, DFLASH_COPY_MAX)) |copy| {
                 found = .{ .draft = copy, .suffix = rd.last_match };
                 from_record = true;
             }
@@ -1450,7 +1448,12 @@ fn policyArm(arm: PolicyArm, serial: []const u32) !dflash_policy.PositionStats {
     const pol = &gen.dflash_pol.?;
     pol.pin_rows = arm.pin_rows;
     pol.drafting.owed = if (arm.copy or arm.record) 0 else 3;
-    if (arm.record) gen.recall = .{ .st = record_store.? };
+    // The test IS a trusted peer: the record lane would otherwise keep the
+    // grafts off (recall_loopback defaults false, as for keyed/LAN requests).
+    if (arm.record) {
+        gen.recall = .{ .st = record_store.? };
+        gen.recall_loopback = true;
+    }
     if (arm.copy) gen.next_token_id = COPY_PATTERN[9] else if (arm.record) gen.next_token_id = RECORD_T1;
     const plain_rounds: usize = if (arm.copy or arm.record) 0 else 3;
     if (arm.trust) for (0..10) |b| for (0..40) |_| pol.calib.observe((@as(f32, @floatFromInt(b)) + 0.5) / 10.0, true);

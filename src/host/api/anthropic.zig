@@ -23,6 +23,7 @@ const http_server = @import("../http/server.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
 const spec_gate_threshold = @import("request_options.zig").spec_gate_threshold;
+const recallGateExempts = @import("request_options.zig").recallGateExempts;
 const recall_mod = @import("../../sdk/recall/recall.zig");
 const parseKvAttnExplicit = @import("request_options.zig").parseKvAttnExplicit;
 const resolveSampling = @import("sampling.zig").resolveSampling;
@@ -768,10 +769,7 @@ pub fn handleAnthropicMessages(
             // score; realized acceptance (yield gate + landing rates) governs, and only
             // requests whose prompt tail the record actually holds are exempted
             // (promptMayDraft): arming PLD otherwise pays its mode overhead for nothing.
-            const recall_armed = if (lm.tokenizer) |t|
-                recall_mod.promptMayDraft(t, prompt_ids)
-            else
-                false;
+            const recall_armed = recallGateExempts(stream, lm.tokenizer, prompt_ids);
             if (enable_pld and !pld_explicit_in_json and !recall_armed) {
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld = false;

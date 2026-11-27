@@ -156,6 +156,10 @@ pub const Generator = struct {
     recall: ?recall_mod.Reader = null,
     /// Monotonic step counter feeding the reader's quiet-round arithmetic.
     recall_round: u64 = 0,
+    /// This request's peer is loopback: the record's trust lane. Keyed/LAN
+    /// peers keep it false, so they never read or write the shared record
+    /// unless the operator started the server with --recall-shared.
+    recall_loopback: bool = false,
     /// Stats for PLD benchmark logging. `pld_attempted` counts every step
     /// where lookup found a candidate (so a verify forward ran);
     /// `pld_accepted_tokens` is the cumulative number of *drafted* tokens
@@ -586,14 +590,33 @@ pub const Generator = struct {
         return 0;
     }
 
+    /// Whether this request may touch the record at all: its peer is
+    /// loopback, or the operator passed --recall-shared.
+    pub fn recallLaneOk(self: *const Generator) bool {
+        return self.recall_loopback or recall_mod.shared_state.get().shared;
+    }
+
     /// Recall: arm the per-stream reader on first use from any spec path
-    /// (PLD arms in nextPld; the DFlash copy round arms here). Null when
-    /// Recall is off or the tokenizer has no record.
+    /// (PLD arms in nextPld; the DFlash rounds arm here). Null when Recall
+    /// is off, the request's peer is outside the record's trust lane, or the
+    /// tokenizer has no record.
     pub fn recallArm(self: *Generator) ?*recall_mod.Reader {
+        if (!self.recallLaneOk()) return null;
         if (self.recall == null and recall_mod.shared_state.get().enabled) {
             self.recall = recall_mod.armReader(self.tok);
         }
         return if (self.recall) |*rd| rd else null;
+    }
+
+    /// Recall: the one record-ask helper every spec path shares (PLD's miss
+    /// path, the DFlash tree round, the DFlash copy round). `window` is the
+    /// trailing committed context — tailWindow for the DFlash paths, the
+    /// committed slice for PLD. Owned by the reader until the next ask.
+    pub fn recallAsk(self: *Generator, window: []const u32, most: usize) ?[]const u32 {
+        const rd = self.recallArm() orelse return null;
+        self.recall_round += 1;
+        const copy = rd.propose(window, most, self.recall_round);
+        return if (copy.len >= 2) copy else null;
     }
 
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
@@ -634,7 +657,9 @@ pub const Generator = struct {
             rd.deinit();
             self.recall = null;
         }
-        recall_mod.finishRequest(self.tok, self.prompt_ids_owned, self.generated_ids.items);
+        if (self.recallLaneOk()) {
+            recall_mod.finishRequest(self.tok, self.prompt_ids_owned, self.generated_ids.items);
+        }
         if (self.prompt_ids_alloc) |a| {
             a.free(self.prompt_ids_owned);
             self.prompt_ids_owned = &.{};

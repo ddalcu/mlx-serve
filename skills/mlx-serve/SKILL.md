@@ -53,13 +53,16 @@ do not substitute another 3D model.
 
 ## Recall (`--recall`, optional)
 
-Some servers run with `--recall`: a persistent record of token ids (never text)
-of what the server has read and written, so re-sent prompts, regenerated
-replies and re-copied boilerplate decode faster. If the user asks about it:
-`GET /v1/recall` reports each record (ids held, landing rates, whether it is
-writing or read-only); `DELETE /v1/recall` empties the records (token ids
-only — a record another server holds, or a `--recall-read-only` server,
-refuses). It is OFF unless the operator started the server with the flag.
+Some servers run with `--recall`: a persistent record of the token ids of what
+the server has read and written, so re-sent prompts, regenerated replies and
+re-copied boilerplate decode faster. THE RECORD STORES EVERY PROMPT AND REPLY
+— token ids decode back into their exact text, so treat it like the
+conversations themselves. If the user asks about it: `GET /v1/recall` reports
+each record (ids held, landing rates, whether it is writing or read-only);
+`DELETE /v1/recall` empties the records (a record another server holds, or a
+`--recall-read-only` server, refuses). With an API key active the record
+serves loopback requests only, unless the operator passed `--recall-shared`.
+It is OFF unless the operator started the server with the flag.
 
 ## Loading and memory
 

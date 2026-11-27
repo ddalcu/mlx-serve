@@ -58,6 +58,10 @@ pub const InitOptions = struct {
     /// (no-match) steps. The prompt-time gate disables PLD on novel content
     /// where cold-path dominates.
     pld_enabled: bool = false,
+    /// Recall lane: this request's peer is loopback (trusted with the shared
+    /// record). False = the request never reads or writes the record unless
+    /// --recall-shared is set; the safe default for keyed and LAN peers.
+    recall_loopback: bool = false,
     /// The machine-sized prefill chunk frozen at load
     /// (`ModelConfig.pinned_prefill_chunk`, resolved by
     /// `server.resolvePrefillChunk`). 0 = unpinned, keep the launch width.

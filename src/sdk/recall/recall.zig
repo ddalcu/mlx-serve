@@ -4,10 +4,18 @@
 //! A request re-sent, a reply regenerated, an agent re-copying code or a tool
 //! call it wrote in an earlier session, boilerplate copying itself: the PLD
 //! n-gram lookup only sees the CURRENT request's context, so all of that
-//! drafts token by token. Recall keeps the ids (never text) on disk, keyed by
-//! the tokenizer that wrote them, and offers the continuation that followed
-//! the same context earlier — the target model still verifies every copied
+//! drafts token by token. Recall keeps the token ids on disk, keyed by the
+//! tokenizer that wrote them, and offers the continuation that followed the
+//! same context earlier — the target model still verifies every copied
 //! token, so replies are byte-identical with Recall on, off or read-only.
+//!
+//! What is stored, plainly: EVERY prompt and reply the server reads and
+//! writes, as token ids. Ids are not encryption — the model's tokenizer
+//! turns them back into their exact text — so treat the record directory as
+//! you would those conversations. And a hit decodes measurably faster than a
+//! miss, so with an API key active the record is loopback-only unless
+//! --recall-shared opts keyed and LAN clients into sharing it: otherwise any
+//! client could probe, by timing, whether some text was seen before.
 //!
 //! Ported from TensorFold (Apache-2.0), files `zig/src/core/lanes/recall.zig`,
 //! `recall_record.zig` and `recall_store.zig` — record, pricing bands, dedup,
@@ -1051,6 +1059,11 @@ pub const State = struct {
     enabled: bool = false,
     /// --recall-read-only: draft from the record, add nothing.
     read_only: bool = false,
+    /// --recall-shared: with an API key active, let non-loopback peers use
+    /// the record too. Without it, only loopback requests read or write it —
+    /// a record hit decodes measurably faster, which would otherwise let any
+    /// keyed or LAN client probe what other clients' conversations held.
+    shared: bool = false,
     /// Bytes of record per tokenizer (chunk files' full bytes); the oldest chunk file goes first past it.
     cap_bytes: u64 = 64 << 20,
     /// Base directory (c_allocator-owned, set once from main before any request);

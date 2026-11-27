@@ -1,5 +1,6 @@
 //! extractResponseId, extractCompletedStatus; get/delete/compact, handleResponsesInner
 
+const auth = @import("../../http/auth.zig");
 const std = @import("std");
 const ablation = @import("../ablation.zig");
 const schema_check = @import("../schema_check.zig");
@@ -20,6 +21,7 @@ const http_server = @import("../../http/server.zig");
 
 const Conn = @import("../../http/conn.zig").Conn;
 const spec_gate_threshold = @import("../request_options.zig").spec_gate_threshold;
+const recallGateExempts = @import("../request_options.zig").recallGateExempts;
 const recall_mod = @import("../../../sdk/recall/recall.zig");
 const resolveKvAttnFused = @import("../request_options.zig").resolveKvAttnFused;
 const parseKvAttnExplicit = @import("../request_options.zig").parseKvAttnExplicit;
@@ -877,10 +879,7 @@ fn handleResponsesInner(
             // score; realized acceptance (yield gate + landing rates) governs, and only
             // requests whose prompt tail the record actually holds are exempted
             // (promptMayDraft): arming PLD otherwise pays its mode overhead for nothing.
-            const recall_armed = if (lm.tokenizer) |t|
-                recall_mod.promptMayDraft(t, prompt_ids)
-            else
-                false;
+            const recall_armed = recallGateExempts(stream, lm.tokenizer, prompt_ids);
             if (enable_pld_resp and !pld_explicit_in_json and !recall_armed) {
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld_resp = false;
@@ -930,6 +929,7 @@ fn handleResponsesInner(
             .max_tokens = effective_max_tokens,
             .timeout_ns = getTimeoutNs(),
             .enable_pld = stream_mode == .pld,
+            .recall_loopback = auth.peerIsLoopback(stream),
             .enable_drafter = stream_mode == .drafter,
             .drafter = if (stream_mode == .drafter) lm.drafter else null,
             .dflash = if (stream_mode == .drafter) lm.dflash else null,

@@ -11,8 +11,22 @@ const format = @import("format.zig");
 const Conn = @import("../http/conn.zig").Conn;
 const respond = @import("../http/respond.zig");
 const errors = @import("../http/errors.zig");
+const auth = @import("../http/auth.zig");
+
+/// The record's trust lane: loopback peers, or --recall-shared. Keyed and
+/// LAN peers must not even see the record's shape (ids held, landing rates)
+/// — the counts themselves say what was repeated.
+fn laneOk(stream: *const Conn) bool {
+    const st = recall_mod.shared_state.get();
+    return st.shared or auth.peerIsLoopback(stream);
+}
 
 pub fn handleGet(allocator: std.mem.Allocator, stream: *Conn) !void {
+    if (!laneOk(stream)) {
+        try errors.sendErrorResponse(allocator, stream, "403 Forbidden", "forbidden",
+            "the record is loopback-only while an API key is active; start the server with --recall-shared to share it", 403);
+        return;
+    }
     const st = recall_mod.shared_state.get();
     const rows = recall_mod.allStats(allocator);
     defer allocator.free(rows);
@@ -40,6 +54,11 @@ pub fn handleGet(allocator: std.mem.Allocator, stream: *Conn) !void {
 }
 
 pub fn handleDelete(allocator: std.mem.Allocator, stream: *Conn) !void {
+    if (!laneOk(stream)) {
+        try errors.sendErrorResponse(allocator, stream, "403 Forbidden", "forbidden",
+            "the record is loopback-only while an API key is active; start the server with --recall-shared to share it", 403);
+        return;
+    }
     const out = recall_mod.emptyAll(allocator);
     defer {
         for (out.rows) |row| {

@@ -111,6 +111,7 @@ pub const Slot = struct {
     has_tools: bool,
     enable_thinking: bool,
     enable_pld: bool,
+    recall_loopback: bool = false,
     enable_drafter: bool,
     drafter: ?*DrafterModel,
     dflash: ?*DflashModel,
@@ -333,6 +334,7 @@ pub const Slot = struct {
             .enable_thinking = params.enable_thinking,
             // A spoken reply forwards one row a slot: no speculative round.
             .enable_pld = params.enable_pld and params.speech == null,
+            .recall_loopback = params.recall_loopback,
             // Muse and Nemotron RADIO DFlash consume vision-conditioned
             // trunk captures; Qwen's external drafter lacks M-RoPE positions.
             .enable_drafter = assistantSidecarEnabledForRequest(
