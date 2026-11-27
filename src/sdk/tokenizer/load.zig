@@ -371,23 +371,6 @@ pub fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: 
         .parsed_json = parsed,
     };
     if (built.installMarkerAliases()) log.info("Tokenizer: K2-Horizon markers alias to <think> / GLM tool tags\n", .{});
-    // Recall (sdk/recall): the record's identity is the tokenizer's SOURCE —
-    // hash the content the tokenizer was built from (vocabulary, merges,
-    // specials and every behavioral flag in one shot), and gate record
-    // writes at the highest id any token or special holds.
-    std.crypto.hash.sha2.Sha256.hash(content, &built.recall_identity, .{});
-    var max_id: u32 = 0;
-    {
-        var it = built.id_to_token.iterator();
-        while (it.next()) |e| {
-            if (e.key_ptr.* > max_id) max_id = e.key_ptr.*;
-        }
-        var sit = built.special_tokens.iterator();
-        while (sit.next()) |e| {
-            if (e.value_ptr.* > max_id) max_id = e.value_ptr.*;
-        }
-    }
-    built.recall_vocab = max_id + 1;
     return built;
 }
 

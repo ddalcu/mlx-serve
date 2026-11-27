@@ -25,7 +25,6 @@ const http_server = @import("../http/server.zig");
 const Conn = @import("../http/conn.zig").Conn;
 const spec_gate_threshold = @import("request_options.zig").spec_gate_threshold;
 const recallGateExempts = @import("request_options.zig").recallGateExempts;
-const recall_mod = @import("../../sdk/recall/recall.zig");
 const parseKvAttnExplicit = @import("request_options.zig").parseKvAttnExplicit;
 const resolveSampling = @import("sampling.zig").resolveSampling;
 const parseLogitBias = @import("sampling.zig").parseLogitBias;

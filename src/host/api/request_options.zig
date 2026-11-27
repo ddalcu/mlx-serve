@@ -37,13 +37,10 @@ const StreamMode = @import("chat_stream.zig").StreamMode;
 /// never exempt the gate: a record hit decodes measurably faster, which
 /// would let them probe what other clients' conversations held.
 pub fn recallGateExempts(stream: *const @import("../http/conn.zig").Conn, tok: ?*const @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer, prompt_ids: []const u32) bool {
-    const recall_mod = @import("../../sdk/recall/recall.zig");
+    const engine = @import("../engines/mlx.zig");
     const auth = @import("../http/auth.zig");
-    const st = recall_mod.shared_state.get();
-    if (!st.enabled) return false;
-    if (!st.shared and !auth.peerIsLoopback(stream)) return false;
     const t = tok orelse return false;
-    return recall_mod.promptMayDraft(t, prompt_ids);
+    return engine.recallExempts(t, prompt_ids, auth.peerIsLoopback(stream));
 }
 
 pub const spec_gate_threshold: f32 = 0.01;

@@ -16,6 +16,7 @@ const model_state = @import("runtime/model_state.zig");
 const distributed = @import("cluster/distributed.zig");
 const request_policy = @import("request_policy.zig");
 const configure_mod = @import("configure.zig");
+const recall_mod = @import("spec/recall.zig");
 const Scheduler = scheduler.Scheduler;
 const Slot = scheduler.Slot;
 
@@ -59,6 +60,10 @@ pub const table: host.Api = .{
     .cluster_probe = clusterProbe,
     .cluster_connect = clusterConnect,
     .configure = configure_mod.apply,
+    .recall_rows = recall_mod.recallRowsAbi,
+    .recall_empty = recall_mod.recallEmptyAbi,
+    .recall_exempts = recall_mod.recallExemptsAbi,
+    .recall_lane = recall_mod.recallLaneAbi,
     .install_admission_hooks = @import("admission/admit.zig").installSchedulerHooks,
     .set_gen_yield = setGenYield,
 };

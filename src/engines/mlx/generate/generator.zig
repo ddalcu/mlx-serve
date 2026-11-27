@@ -27,7 +27,7 @@ const group_cost = @import("../spec/mtp_group_cost.zig");
 const group_planner = @import("../spec/mtp_group_planner.zig");
 const ane_mod = @import("../../../sdk/ane/offload.zig");
 const scheduler_mod = @import("../scheduler.zig");
-const recall_mod = @import("../../../sdk/recall/recall.zig");
+const recall_mod = @import("../spec/recall.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;

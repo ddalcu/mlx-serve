@@ -77,6 +77,12 @@ pub const Api = struct {
     run_offline: *const fn (*const Offline) Err,
     // ── process-wide engine settings, set once from the launch flags
     configure: *const fn (*const Flags) void,
+    // ── Recall: the record store lives in the engine; the host's flags,
+    // endpoint and gate helper reach it through these.
+    recall_rows: *const fn (std.mem.Allocator, *?[]RecallStats) []const u8,
+    recall_empty: *const fn (std.mem.Allocator, *?[]RecallEmptyRow, *bool) []const u8,
+    recall_exempts: *const fn (*const @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer, []const u32, bool) bool,
+    recall_lane: *const fn (bool) bool,
     install_admission_hooks: *const fn (bool) void,
     set_gen_yield: *const fn (bool) void,
 };
@@ -163,9 +169,71 @@ pub const Flags = struct {
     prefill_decode_share: f32 = 0,
     mtp_head_kv_quant: bool = false,
     mtp_acceptance: mtp_acceptance.Mode = .exact,
+    // ── Recall (--recall…; applied by the engine's configure, once) ──
+    recall: bool = false,
+    recall_shared: bool = false,
+    recall_read_only: bool = false,
+    recall_gib: f64 = 0,
+    recall_dir: ?[]const u8 = null,
+};
+
+/// A record row `GET /v1/recall` reports (host-owned type; the engine fills it).
+pub const RecallStats = struct {
+    writes: bool,
+    left: bool,
+    read_only: bool,
+    ids: u64,
+    disk_bytes: u64,
+    ram_bytes: u64,
+    cap_bytes: u64,
+    added: u64,
+    held: u64,
+    rates: [3]f64,
+    probe_every: u32,
+    proposals: u64,
+    proposed: u64,
+    accepted: u64,
+    problem: []const u8,
+    model: []const u8,
+};
+
+/// A `DELETE /v1/recall` outcome row (host-owned type; the engine fills it).
+pub const RecallEmptyRow = struct {
+    model: []const u8,
+    dir: []const u8,
+    ok: bool,
+    read_only: bool,
+    problem: []const u8,
 };
 
 extern fn mlx_serve_mlx_api() callconv(.c) *const anyopaque;
+
+/// Recall: the records the endpoint reports; null rows when none opened yet.
+/// The returned slice is engine-allocated with `a`.
+pub fn recallRows(a: std.mem.Allocator) []RecallStats {
+    var out: ?[]RecallStats = null;
+    err_name.check(api().recall_rows(a, &out)) catch |e| @panic(@errorName(e));
+    return out orelse &[_]RecallStats{};
+}
+
+/// Recall: empty every record; `all_failed` maps to the endpoint's 409.
+pub fn recallEmpty(a: std.mem.Allocator) struct { rows: []RecallEmptyRow, all_failed: bool } {
+    var rows: ?[]RecallEmptyRow = null;
+    var all_failed = false;
+    err_name.check(api().recall_empty(a, &rows, &all_failed)) catch |e| @panic(@errorName(e));
+    return .{ .rows = rows orelse &[_]RecallEmptyRow{}, .all_failed = all_failed };
+}
+
+/// Recall: whether this request's prompt tail exempts the spec gate; the
+/// engine checks the record and the shared flag, the host the peer lane.
+pub fn recallExempts(tok: *const @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer, prompt_ids: []const u32, peer_loopback: bool) bool {
+    return api().recall_exempts(tok, prompt_ids, peer_loopback);
+}
+
+/// Recall: whether this peer may see the records at all (loopback or shared).
+pub fn recallLane(peer_loopback: bool) bool {
+    return api().recall_lane(peer_loopback);
+}
 
 pub fn api() *const Api {
     return @ptrCast(@alignCast(mlx_serve_mlx_api()));

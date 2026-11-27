@@ -23,7 +23,7 @@ const specDecodeUnsupported = @import("verify.zig").specDecodeUnsupported;
 const specShouldReenable = @import("gates.zig").specShouldReenable;
 const verifyArgmax = @import("verify.zig").verifyArgmax;
 const yieldGateShouldDisable = @import("gates.zig").yieldGateShouldDisable;
-const recall_mod = @import("../../../sdk/recall/recall.zig");
+const recall_mod = @import("recall.zig");
 
 
 /// Selects the source slice that `initWithOptions` will dupe into

@@ -6,19 +6,18 @@
 //! empty `records` array) when Recall is off or nothing has opened a record.
 
 const std = @import("std");
-const recall_mod = @import("../../sdk/recall/recall.zig");
 const format = @import("format.zig");
 const Conn = @import("../http/conn.zig").Conn;
 const respond = @import("../http/respond.zig");
 const errors = @import("../http/errors.zig");
 const auth = @import("../http/auth.zig");
+const mlx_engine = @import("../engines/mlx.zig");
 
 /// The record's trust lane: loopback peers, or --recall-shared. Keyed and
 /// LAN peers must not even see the record's shape (ids held, landing rates)
 /// — the counts themselves say what was repeated.
 fn laneOk(stream: *const Conn) bool {
-    const st = recall_mod.shared_state.get();
-    return st.shared or auth.peerIsLoopback(stream);
+    return mlx_engine.recallLane(auth.peerIsLoopback(stream));
 }
 
 pub fn handleGet(allocator: std.mem.Allocator, stream: *Conn) !void {
@@ -27,15 +26,14 @@ pub fn handleGet(allocator: std.mem.Allocator, stream: *Conn) !void {
             "the record is loopback-only while an API key is active; start the server with --recall-shared to share it", 403);
         return;
     }
-    const st = recall_mod.shared_state.get();
-    const rows = recall_mod.allStats(allocator);
+    const rows = mlx_engine.recallRows(allocator);
     defer allocator.free(rows);
 
     var body = std.ArrayList(u8).empty;
     defer body.deinit(allocator);
     const w = &body;
     try w.appendSlice(allocator, "{\"recall\":{\"enabled\":");
-    try w.appendSlice(allocator, if (st.enabled) "true" else "false");
+    try w.appendSlice(allocator, if (mlx_engine.recallLane(auth.peerIsLoopback(stream))) "true" else "false");
     try w.appendSlice(allocator, ",\"records\":[");
     for (rows, 0..) |s, i| {
         if (i > 0) try w.append(allocator, ',');
@@ -59,7 +57,7 @@ pub fn handleDelete(allocator: std.mem.Allocator, stream: *Conn) !void {
             "the record is loopback-only while an API key is active; start the server with --recall-shared to share it", 403);
         return;
     }
-    const out = recall_mod.emptyAll(allocator);
+    const out = mlx_engine.recallEmpty(allocator);
     defer {
         for (out.rows) |row| {
             allocator.free(row.model);

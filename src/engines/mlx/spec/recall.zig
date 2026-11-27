@@ -48,13 +48,14 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const log = @import("../util/log.zig");
-const shared_util = @import("../util/shared.zig");
-const os_mutex = @import("../util/os_mutex.zig");
-const io_util = @import("../util/io_util.zig");
-const crt = @import("../util/crt.zig");
-const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
+const log = @import("../../../sdk/util/log.zig");
+const shared_util = @import("../../../sdk/util/shared.zig");
+const os_mutex = @import("../../../sdk/util/os_mutex.zig");
+const io_util = @import("../../../sdk/util/io_util.zig");
+const crt = @import("../../../sdk/util/crt.zig");
+const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
+const host = @import("../../../host/engines/mlx.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -483,24 +484,9 @@ pub const Options = struct {
 };
 
 /// The store's state for GET /v1/recall and the startup line.
-pub const Stats = struct {
-    writes: bool = false,
-    left: bool = false,
-    read_only: bool = false,
-    ids: u64 = 0,
-    disk_bytes: u64 = 0,
-    ram_bytes: u64 = 0,
-    cap_bytes: u64 = 0,
-    added: u64 = 0,
-    held: u64 = 0,
-    rates: [bands.len]f64 = .{ 0, 0, 0 },
-    probe_every: u32 = 0,
-    proposals: u64 = 0,
-    proposed: u64 = 0,
-    accepted: u64 = 0,
-    problem: []const u8 = "",
-    model: []const u8 = "",
-};
+pub const Stats = host.RecallStats;
+
+
 
 /// The POSIX record store: flock, append-mode open, 0700 files. Never
 /// analyzed on Windows — `Store` below is the stub there.
@@ -1161,13 +1147,97 @@ fn storeDir(a: Allocator, digest: [32]u8) ?[]const u8 {
 /// cannot be opened. The `enabled` flag is checked first, so every call site is
 /// a single null-check when Recall is off.
 pub fn storeFor(tok: *const Tokenizer) ?*Store {
-    return storeForIdentity(tok.recall_identity, tok.recall_vocab, tok.recall_name);
+    const id = tokenizerIdentity(tok);
+    return storeForIdentity(id.digest, id.vocab);
 }
+
+/// The identity for this tokenizer, computed HERE — from the tokenizer's own
+/// content, never fields on the Tokenizer — and cached per tokenizer pointer
+/// with a cheap fingerprint guard (the registry owns the pointer for the
+/// model's lifetime; a reused address holding a different tokenizer re-runs
+/// the digest).
+pub fn tokenizerIdentity(tok: *const Tokenizer) Identity {
+    const fp = fingerprint(tok);
+    {
+        registry_mutex.lock();
+        defer registry_mutex.unlock();
+        if (identities.get(@intFromPtr(tok))) |cached| {
+            if (std.mem.eql(u8, &cached.fp, &fp)) return .{ .digest = cached.digest, .vocab = cached.vocab, .name = "" };
+        }
+    }
+    // The full digest: an order-independent multiset hash over every
+    // (id, token) pair, the specials and the behavioral flags — two
+    // tokenizers that agree on it decode the same ids.
+    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    var max_id: u32 = 0;
+    {
+        var it = tok.id_to_token.iterator();
+        var acc: u64 = 0;
+        while (it.next()) |e| {
+            var h = std.hash.Wyhash.init(0x7ec011);
+            h.update(std.mem.asBytes(&e.key_ptr.*));
+            h.update(e.value_ptr.*);
+            acc ^= h.final();
+            if (e.key_ptr.* > max_id) max_id = e.key_ptr.*;
+        }
+        sha.update(std.mem.asBytes(&acc));
+    }
+    {
+        var it = tok.special_tokens.iterator();
+        var acc: u64 = 0;
+        while (it.next()) |e| {
+            var h = std.hash.Wyhash.init(0x5ec0a1);
+            h.update(e.key_ptr.*);
+            h.update(std.mem.asBytes(&e.value_ptr.*));
+            acc ^= h.final();
+        }
+        sha.update(std.mem.asBytes(&acc));
+    }
+    sha.update(&fp);
+    var digest: [32]u8 = undefined;
+    sha.final(&digest);
+    {
+        registry_mutex.lock();
+        defer registry_mutex.unlock();
+        identities.put(gpa, @intFromPtr(tok), .{ .digest = digest, .vocab = max_id + 1, .fp = fp }) catch {};
+    }
+    return .{ .digest = digest, .vocab = max_id + 1, .name = "" };
+}
+
+const Fp128 = [64]u8;
+
+/// A cheap shape/content guard: same pointer with a different tokenizer (a
+/// reload at a reused address) re-runs the digest.
+fn fingerprint(tok: *const Tokenizer) Fp128 {
+    var h = std.hash.Wyhash.init(0xfeedca7);
+    const counts = [_]usize{ tok.vocab.count(), tok.id_to_token.count(), tok.merge_ranks.count(), tok.special_tokens.count() };
+    h.update(std.mem.sliceAsBytes(&counts));
+    h.update(std.mem.asBytes(&tok.digit_group));
+    h.update(std.mem.asBytes(&tok.pretok_style));
+    h.update(std.mem.asBytes(&tok.metaspace_prepend));
+    h.update(std.mem.asBytes(&tok.metaspace_split));
+    h.update(std.mem.asBytes(&tok.byte_fallback));
+    h.update(std.mem.asBytes(&tok.nfc));
+    // Two sentinel contents catch same-shape different-content reuse.
+    if (tok.id_to_token.get(0)) |t0| h.update(t0);
+    if (tok.id_to_token.get(1000)) |tm| h.update(tm);
+    const bits = h.final();
+    var out: Fp128 = @splat(0);
+    @memcpy(out[0..8], std.mem.asBytes(&bits));
+    return out;
+}
+
+var registry_mutex: os_mutex.Mutex = .{};
+var identities: std.AutoHashMapUnmanaged(usize, struct {
+    digest: [32]u8,
+    vocab: u32,
+    fp: Fp128,
+}) = .empty;
 
 /// The record for one tokenizer identity, opened on first use (see storeFor).
 /// The runtime Windows return never analyzes — the `Store` alias is the stub there
 /// (see its comment); this early return is belt-and-braces for the sweep.
-fn storeForIdentity(digest: [32]u8, vocab: u32, name: []const u8) ?*Store {
+fn storeForIdentity(digest: [32]u8, vocab: u32) ?*Store {
     if (!shared_state.get().enabled) return null;
     if (vocab == 0) return null; // dummy/test tokenizer: never records
     const st_state = shared_state.get();
@@ -1184,7 +1254,7 @@ fn storeForIdentity(digest: [32]u8, vocab: u32, name: []const u8) ?*Store {
         return null;
     };
     defer gpa.free(dir);
-    const identity = Identity{ .digest = digest, .vocab = vocab, .name = name };
+    const identity = Identity{ .digest = digest, .vocab = vocab, .name = "" };
     const st = Store.open(identity, io, .{ .dir = dir, .cap_bytes = st_state.cap_bytes, .read_only = st_state.read_only }, &problem, gpa) catch {
         log.err("--recall: cannot open the record at {s}: {s}\n", .{ dir, problem });
         st_state.failures.put(gpa, digest, {}) catch {};
@@ -1198,8 +1268,7 @@ fn storeForIdentity(digest: [32]u8, vocab: u32, name: []const u8) ?*Store {
         st.close();
         return null;
     };
-    log.info("recall: record for {s} at {s} (cap {d} MiB, {s})\n", .{
-        name,
+    log.info("recall: record at {s} (cap {d} MiB, {s})\n", .{
         dir,
         st_state.cap_bytes >> 20,
         if (st_state.read_only) "read-only" else "writing",
@@ -1255,7 +1324,6 @@ const queue_cap_ids: usize = 4 << 20;
 const RecordJob = struct {
     digest: [32]u8,
     vocab: u32,
-    name: []u8,
     prompt: []u32,
     reply: []u32,
 };
@@ -1272,7 +1340,6 @@ const WorkerState = struct {
 pub const worker_state = shared_util.Shared(WorkerState, "recall_worker", .{});
 
 fn freeJob(j: RecordJob) void {
-    gpa.free(j.name);
     gpa.free(j.prompt);
     gpa.free(j.reply);
 }
@@ -1291,7 +1358,7 @@ fn workerLoop(io_foreign: std.Io) void {
         }
         if (job) |j| {
             defer freeJob(j);
-            if (storeForIdentity(j.digest, j.vocab, j.name)) |st| {
+            if (storeForIdentity(j.digest, j.vocab)) |st| {
                 st.readPrompt(j.prompt, 0);
                 st.readReply(j.prompt, j.reply);
             }
@@ -1319,8 +1386,10 @@ fn spawnWorker() bool {
 /// recording.
 pub fn finishRequestAsync(tok: *const Tokenizer, prompt: []const u32, reply: []const u32) bool {
     const st = shared_state.get();
-    if (!st.enabled or tok.recall_vocab == 0) return false;
+    if (!st.enabled) return false;
     const spawn_io = io_util.local(st.io orelse return false);
+    const id = tokenizerIdentity(tok);
+    if (id.vocab == 0) return false;
     const tail = if (prompt.len > prompt_tail_cap) prompt[prompt.len - prompt_tail_cap ..] else prompt;
     if (!spawnWorker()) return false;
     const p = gpa.dupe(u32, tail) catch {
@@ -1332,13 +1401,7 @@ pub fn finishRequestAsync(tok: *const Tokenizer, prompt: []const u32, reply: []c
         log.warn("recall: record copy failed; this request is not recorded\n", .{});
         return false;
     };
-    const n = gpa.dupe(u8, tok.recall_name) catch {
-        gpa.free(p);
-        gpa.free(r);
-        log.warn("recall: record copy failed; this request is not recorded\n", .{});
-        return false;
-    };
-    const job = RecordJob{ .digest = tok.recall_identity, .vocab = tok.recall_vocab, .name = n, .prompt = p, .reply = r };
+    const job = RecordJob{ .digest = id.digest, .vocab = id.vocab, .prompt = p, .reply = r };
     const w = worker_state.get();
     w.mutex.lockUncancelable(spawn_io);
     defer w.mutex.unlock(spawn_io);
@@ -1379,14 +1442,7 @@ pub fn allStats(a: Allocator) []Stats {
     return out;
 }
 
-pub const EmptyRow = struct {
-    /// Both `a`-owned: the caller frees every row's `model` and `dir`.
-    model: []const u8,
-    dir: []const u8,
-    ok: bool,
-    read_only: bool,
-    problem: []const u8,
-};
+pub const EmptyRow = host.RecallEmptyRow;
 
 /// `DELETE /v1/recall`: every record emptied — the open stores in memory and
 /// on disk, and the records on disk no request ever opened this run (stores
@@ -1568,6 +1624,35 @@ fn tryNameFromIdentity(a: Allocator, io: std.Io, base: []const u8, name: []const
     return a.dupe(u8, name) catch name;
 }
 
+
+
+// ── the host's table surface ─────��──────────────────────────────────────
+// The flags ride `configure` (mlx_engine.Flags); these serve the endpoint
+// and the spec-gate helper through the engine ABI table.
+
+pub fn recallRowsAbi(a: Allocator, out: *?[]host.RecallStats) []const u8 {
+    out.* = allStats(a);
+    return "";
+}
+
+pub fn recallEmptyAbi(a: Allocator, out: *?[]host.RecallEmptyRow, all_failed: *bool) []const u8 {
+    const r = emptyAll(a);
+    out.* = r.rows;
+    all_failed.* = r.all_failed;
+    return "";
+}
+
+pub fn recallExemptsAbi(tok: *const Tokenizer, prompt_ids: []const u32, peer_loopback: bool) bool {
+    const st = shared_state.get();
+    if (!st.enabled) return false;
+    if (!st.shared and !peer_loopback) return false;
+    return promptMayDraft(tok, prompt_ids);
+}
+
+pub fn recallLaneAbi(peer_loopback: bool) bool {
+    const st = shared_state.get();
+    return st.shared or peer_loopback;
+}
 // ── the Windows analysis guard ─────────────────────────────────────────
 // The Windows build is the gate that matters: a runtime early-return does
 // not prune Zig's analysis, and CI's first three runs proved it the hard
@@ -1740,36 +1825,37 @@ test "worker: async recording lands in the store off-thread" {
     _ = setBaseDir(dir);
 
     var prompt: [160]u32 = undefined;
-    for (&prompt, 0..) |*t, i| t.* = @intCast(9000 + i);
+    for (&prompt, 0..) |*t, i| t.* = @intCast(3000 + i);
     var reply: [160]u32 = undefined;
     for (&reply, 0..) |*t, i| t.* = @intCast(7000 + i);
 
-    const tok = struct {
-        fn fake() *const Tokenizer {
-            // A real-shaped tokenizer stand-in: only the three recall fields
-            // are read; nothing else on the pointee is touched.
-            const T = struct {
-                var instance: [4096]u8 align(8) = undefined;
-            };
-            const tp: *Tokenizer = @ptrCast(@alignCast(&T.instance));
-            tp.recall_identity = @splat(11);
-            tp.recall_vocab = 100_000;
-            tp.recall_name = "worker-test";
-            return tp;
-        }
-    }.fake();
+    // A real tokenizer whose id space covers the ids under test: the
+    // identity is computed from its content, at the store — no fields on
+    // the Tokenizer to fake.
+    var tok_json = std.ArrayList(u8).empty;
+    defer tok_json.deinit(testing.allocator);
+    try tok_json.appendSlice(testing.allocator, "{\"model\":{\"type\":\"BPE\",\"vocab\":{");
+    for (0..9000) |i| {
+        if (i > 0) try tok_json.append(testing.allocator, ',');
+        const entry = try std.fmt.allocPrint(testing.allocator, "\"t{d}\":{d}", .{ i, i });
+        defer testing.allocator.free(entry);
+        try tok_json.appendSlice(testing.allocator, entry);
+    }
+    try tok_json.appendSlice(testing.allocator, "},\"merges\":[],\"added_tokens\":[]}}");
+    var tok = try @import("../../../sdk/tokenizer/load.zig").parseTokenizerContent(std.testing.io, testing.allocator, tok_json.items);
+    defer tok.deinit();
 
-    try testing.expect(finishRequestAsync(tok, &prompt, &reply));
-    // The worker drains within seconds; poll for the record to appear.
+    try testing.expect(finishRequestAsync(&tok, &prompt, &reply));
+    const id = tokenizerIdentity(&tok);
     var waited: usize = 0;
     while (waited < 2500) : (waited += 1) {
-        if (storeForIdentity(@splat(11), 100_000, "worker-test")) |s2| {
+        if (storeForIdentity(id.digest, id.vocab)) |s2| {
             if (s2.stats().ids > 0) {
                 s2.mutex.lock();
                 defer s2.mutex.unlock();
                 const m = s2.record.longest(reply[0..100]);
                 try testing.expectEqual(recall_max_match, m.len);
-                return; // store left open in the registry: its digest is test-only
+                return;
             }
         }
         crt.sleepMs(2);
