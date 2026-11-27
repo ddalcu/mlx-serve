@@ -124,8 +124,9 @@ to a value that does not start with 0; then the stages load, and drafting stays 
 For a greedy request, the drafter proposes its argmax tokens, and the verify keeps the longest prefix that the model
 agrees with. The verify rows run multi-row kernels, which do the math of a plain decode step in another sum order. So
 greedy text with DSpark on can differ from plain decode by rounding. Under `MLX_SERVE_DSV41_EXACT=1`, greedy DSpark
-text is plain decode's bytes, one request at a time. We have not measured its speed cost (see "Switches that stay
-opt-in").
+text is plain decode's bytes, one request at a time: in the real-pack `DSV41_VERIFY_EXACT` test at the default
+switches no verify row of widths 1 to 6 differs from the plain step, and served EXACT DSpark text equals plain decode
+text (`edcff8fe3ea19d9f`). We have not measured its speed cost (see "Switches that stay opt-in").
 
 Sampled requests use standard speculative sampling (`MLX_SERVE_DSV41_DRAFT_SAMPLE`), so the output keeps the model's
 distribution (the block below has the rule).
@@ -479,8 +480,8 @@ Engine variables on the DeepSeek path: `MLX_SERVE_DSV4_DSPARK` (REORDER, by reas
 ## Switches that stay opt-in
 
 Four switches stay off by default (`EXACT`, `FLASH_PSUM`, `MXFP4_VIEW`, `PF_INT8`), and three value switches set
-memory and kernel choices. `MLX_SERVE_DSV41_EXACT=1` now also serves NAX; `MLX_SERVE_DSV41_EXACT_VERIFY`, which only
-earlier heads of PR 1256 had, is gone.
+memory and kernel choices. `MLX_SERVE_DSV41_EXACT=1` serves NAX and non-NAX GPUs; `MLX_SERVE_DSV41_EXACT_VERIFY`,
+which only earlier heads of PR 1256 had, is gone.
 
 <details>
 <summary>The opt-in and value switches</summary>
