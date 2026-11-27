@@ -374,6 +374,7 @@ pub const Parsed = extern struct {
 /// sits in its config.json is the plugin's knowledge, so a client renders this and invents nothing. Both are empty
 /// when the pack ships the rope it wants or the plugin offers no scaling. `overrides` is owned by the parse.
 pub const ScalingFacts = extern struct {
+    size: u32 = @sizeOf(ScalingFacts),
     overrides: Str = .{},
     /// The longest context `overrides` resolves to; 0 with no scaling.
     window: u32 = 0,
@@ -1208,7 +1209,7 @@ test "abi plugin: a Parsed of an older size ends before scaling, which it reads 
 }
 
 test "abi plugin: every struct opens with its size, set by default" {
-    inline for (.{ Ablation, LayerSpan, Quant, GenDefaults, Shell, NoThink, SamplingDefaults, ChatFacts, MarkerAlias, TokenizerFacts, SsmState, CacheFacts, SpecPolicy, SpecFacts, PlaceholderIds, EmbedFacts, WeightFacts, MropeFacts, Parsed, Shape, Bill, ForwardOut, KvView, LayerCache, CacheHooks, SpecHooks, EmbedHooks, WeightHooks, MediaItem, MediaInput, SpeechFacts, SpeechSampling }) |T| {
+    inline for (.{ Ablation, LayerSpan, Quant, GenDefaults, Shell, NoThink, SamplingDefaults, ChatFacts, MarkerAlias, TokenizerFacts, SsmState, CacheFacts, SpecPolicy, SpecFacts, PlaceholderIds, EmbedFacts, WeightFacts, MropeFacts, ScalingFacts, Parsed, Shape, Bill, ForwardOut, KvView, LayerCache, CacheHooks, SpecHooks, EmbedHooks, WeightHooks, MediaItem, MediaInput, SpeechFacts, SpeechSampling }) |T| {
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
         const v: T = .{};
         try testing.expectEqual(@as(u32, @sizeOf(T)), v.size);

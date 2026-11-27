@@ -1689,10 +1689,6 @@ pub const ModelConfig = struct {
         });
     }
 
-    /// Free the allocator-owned fields (`ngram_table_path`, allocPrint'd by
-    /// `parseConfig`, and `drafter_override`); everything else is plain data or a borrowed slice. Every
-    /// `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
-    /// path. Idempotent.
     /// The rope recipe the serving plugin advertises for this pack (the `config_overrides` document that
     /// scales it, and the window that resolves to); null when no plugin answers. Owned by the parse.
     pub fn scalingRecipe(self: *const ModelConfig) ?abi.ScalingFacts {
@@ -1702,6 +1698,10 @@ pub const ModelConfig = struct {
         return sc;
     }
 
+    /// Free the allocator-owned fields (`ngram_table_path`, allocPrint'd by
+    /// `parseConfig`, and `drafter_override`); everything else is plain data or a borrowed slice. Every
+    /// `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
+    /// path. Idempotent.
     pub fn deinit(self: *ModelConfig, allocator: std.mem.Allocator) void {
         if (self.ngram_table_path) |p| allocator.free(p);
         self.ngram_table_path = null;

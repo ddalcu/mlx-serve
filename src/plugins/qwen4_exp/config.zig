@@ -428,7 +428,7 @@ pub fn parseJson(c: *Config, outer: std.json.ObjectMap) ParseError!void {
     planScaling(c);
 }
 
-/// What this arch serves once scaled: the window PR #323 opened YaRN to.
+/// What this arch is validated to serve once scaled: 4x over the pack's own window.
 const yarn_ceiling: u32 = 1_048_576;
 
 /// The one-click rope recipe for a pack that shipped an unscaled rope: 4× over its own window when that stays
@@ -437,7 +437,8 @@ fn planScaling(c: *Config) void {
     if (c.rope_yarn) return;
     const orig = c.max_position_embeddings;
     if (orig == 0 or orig >= yarn_ceiling) return;
-    const factor: u32 = if (orig <= yarn_ceiling / 4) 4 else if (orig <= yarn_ceiling / 2) 2 else return;
+    if (orig > yarn_ceiling / 4) return; // only the 4x arm is validated for this arch
+    const factor: u32 = 4;
     const window = orig * factor;
     const doc = gpa.print("{{\"text_config\":{{\"rope_parameters\":{{\"rope_type\":\"yarn\",\"factor\":{d},\"original_max_position_embeddings\":{d}}},\"max_position_embeddings\":{d}}}}}", .{ factor, orig, window }) catch return;
     c.scaling_overrides = doc;
@@ -912,13 +913,12 @@ test "qwen4_exp config: the recipe scales an unscaled rope, and a scaled one is 
         try testing.expectEqual(@as(u32, 0), x.scaling_window);
         try testing.expectEqual(@as(?[]const u8, null), x.scaling_overrides);
     }
-    // Half the ceiling scales by 2, not by 4.
+    // A pack with room only for 2x is offered nothing: that arm is not validated here.
     var half: Config = .{};
     half.max_position_embeddings = yarn_ceiling / 2;
     planScaling(&half);
-    try testing.expectEqual(@as(u32, yarn_ceiling), half.scaling_window);
-    try testing.expect(std.mem.indexOf(u8, half.scaling_overrides.?, "\"factor\":2,") != null);
-    if (half.scaling_overrides) |d| gpa.free(d);
+    try testing.expectEqual(@as(u32, 0), half.scaling_window);
+    try testing.expectEqual(@as(?[]const u8, null), half.scaling_overrides);
 }
 
 test "qwen4_exp config: a bad bound is refused by name, another family's key is unsupported" {
