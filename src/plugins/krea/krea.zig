@@ -26,8 +26,7 @@ const rope_blk = @import("../../sdk/blocks/dit/rope.zig");
 const modulate_blk = @import("../../sdk/blocks/dit/modulate.zig");
 const timestep_blk = @import("../../sdk/blocks/dit/timestep.zig");
 const gelu = @import("../../sdk/blocks/mlp/gelu.zig");
-const conv_blk = @import("../../sdk/blocks/vae/conv.zig");
-const resnet_blk = @import("../../sdk/blocks/vae/resnet.zig");
+const qwen_vae = @import("../../sdk/blocks/vae/qwen_image_vae.zig");
 const flow_match = @import("../../sdk/blocks/schedulers/flow_match.zig");
 const dit_base = @import("../../sdk/bases/dit.zig");
 
@@ -35,7 +34,6 @@ const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
 const Graph = ops.Graph;
 const Array = ops.Array;
-const Resnet = resnet_blk.Resnet;
 
 // ── Load-time weight preparation (the forward runs on `ops.Graph`) ──
 
@@ -1337,338 +1335,26 @@ pub fn detachLora(dit: *Dit) void {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// B3. Autoencoder — Qwen-Image 3D causal VAE (decode path only, T=1, f16).
-//     Raw diffusers tensor names; conv weights transposed to MLX layout at load.
+// B3. Autoencoder — Qwen-Image 3D causal VAE (sdk `qwen_image_vae`, T=1, f16).
 // ════════════════════════════════════════════════════════════════════════
 
 const LATENTS_MEAN = [16]f32{ -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921 };
 const LATENTS_STD = [16]f32{ 2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.916 };
+const vae_latents: qwen_vae.Latents = .{ .per_channel = .{ .mean = &LATENTS_MEAN, .std = &LATENTS_STD } };
 
 /// The VAE's compute dtype: f16 decodes within ~56 dB of the reference's f32 and
 /// lets every conv run on the half-precision matrix path.
 const VAE_DT: mlx.mlx_dtype = .float16;
 
-/// Qwen-Image's RMSNorm over channels (x / max(‖x‖₂, eps) · √C · γ = rms_norm over the last axis of NHWC).
-const vae_norm: resnet_blk.Norm = .{ .rms = 1e-12 };
-
-/// Frees the arrays a loaded resnet owns.
-fn freeResnet(r: *Resnet) void {
-    inline for (.{ "n1w", "c1w", "c1b", "n2w", "c2w", "c2b" }) |f| _ = mlx.mlx_array_free(@field(r, f));
-    inline for (.{ "sw", "sb" }) |f| if (@field(r, f)) |x| {
-        _ = mlx.mlx_array_free(x);
-    };
-}
-
-const AttnBlock3D = struct {
-    norm: mlx.mlx_array,
-    qkv_w: mlx.mlx_array, // conv2d 1x1 [3C,1,1,C]
-    qkv_b: mlx.mlx_array,
-    proj_w: mlx.mlx_array,
-    proj_b: mlx.mlx_array,
-    fn deinit(self: *AttnBlock3D) void {
-        inline for (.{ "norm", "qkv_w", "qkv_b", "proj_w", "proj_b" }) |f| _ = mlx.mlx_array_free(@field(self, f));
-    }
-    fn forward(self: *const AttnBlock3D, g: *Graph, x: Array) !Array {
-        return resnet_blk.midAttentionQkv(g, vae_norm, x, self.norm, null, self.qkv_w, self.qkv_b, self.proj_w, self.proj_b);
-    }
-};
-
-const UpBlock3D = struct {
-    resnets: []Resnet,
-    up_w: ?mlx.mlx_array = null, // resample_conv (conv2d) [out,kh,kw,in]
-    up_b: ?mlx.mlx_array = null,
-    allocator: std.mem.Allocator,
-    fn deinit(self: *UpBlock3D) void {
-        for (self.resnets) |*r| freeResnet(r);
-        self.allocator.free(self.resnets);
-        if (self.up_w) |x| _ = mlx.mlx_array_free(x);
-        if (self.up_b) |x| _ = mlx.mlx_array_free(x);
-    }
-    fn forward(self: *const UpBlock3D, parent: *Graph, x: Array) !Array {
-        var g = parent.scope();
-        defer g.deinit();
-        var h = x;
-        for (self.resnets) |*r| h = try r.forward(&g, vae_norm, h);
-        if (self.up_w) |uw| h = try conv_blk.upsample2x(&g, h, uw, self.up_b.?);
-        return parent.keep(h);
-    }
-};
-
-/// Per-channel latent statistics [16] in `dt`.
-fn latentStat(g: *Graph, vals: *const [16]f32, dt: ops.Dtype) !Array {
-    var c = g.scope();
-    defer c.deinit();
-    return g.keep(try c.astype(try c.fromSlice(f32, vals, &.{16}), dt));
-}
-
-pub const Vae = struct {
-    allocator: std.mem.Allocator,
-    s: S,
-    pq_w: mlx.mlx_array, // post_quant_conv (1x1x1)
-    pq_b: mlx.mlx_array,
-    conv_in_w: mlx.mlx_array,
-    conv_in_b: mlx.mlx_array,
-    mid_r0: Resnet,
-    mid_attn: AttnBlock3D,
-    mid_r1: Resnet,
-    up_blocks: [4]UpBlock3D,
-    norm_out: mlx.mlx_array,
-    conv_out_w: mlx.mlx_array,
-    conv_out_b: mlx.mlx_array,
-
-    pub fn deinit(self: *Vae) void {
-        inline for (.{ "pq_w", "pq_b", "conv_in_w", "conv_in_b", "norm_out", "conv_out_w", "conv_out_b" }) |f| _ = mlx.mlx_array_free(@field(self, f));
-        freeResnet(&self.mid_r0);
-        self.mid_attn.deinit();
-        freeResnet(&self.mid_r1);
-        for (&self.up_blocks) |*b| b.deinit();
-    }
-
-    /// latent [1,16,lat_h,lat_w] f32 → image [1,3,H,W] f32 in [-1,1].
-    pub fn decode(self: *const Vae, parent: *Graph, latent: Array) !Array {
-        var g = parent.scope();
-        defer g.deinit();
-        const l = try g.astype(try g.transpose(latent, &.{ 0, 2, 3, 1 }), VAE_DT); // NHWC
-        // denorm: latent * STD + MEAN (per channel)
-        const dn = try g.add(try g.mul(l, try latentStat(&g, &LATENTS_STD, VAE_DT)), try latentStat(&g, &LATENTS_MEAN, VAE_DT));
-        var h = try conv_blk.conv2d(&g, dn, self.pq_w, self.pq_b, 1, 0, 1);
-        h = try conv_blk.conv2d(&g, h, self.conv_in_w, self.conv_in_b, 1, 1, 1);
-        h = try self.mid_r0.forward(&g, vae_norm, h);
-        h = try self.mid_attn.forward(&g, h);
-        h = try self.mid_r1.forward(&g, vae_norm, h);
-        for (&self.up_blocks) |*b| h = try b.forward(&g, h);
-        h = try g.silu(try g.rmsNorm(h, self.norm_out, 1e-12));
-        h = try conv_blk.conv2d(&g, h, self.conv_out_w, self.conv_out_b, 1, 1, 1);
-        return parent.keep(try g.contiguous(try g.astype(try g.transpose(h, &.{ 0, 3, 1, 2 }), .float32)));
-    }
-};
-
-/// Load a causal conv3d weight as the conv2d it is over one frame: raw PyTorch
-/// [out,in,kt,kh,kw] → its last temporal tap as MLX [out,kh,kw,in].
-fn loadConv3dW(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, s: S) !mlx.mlx_array {
-    const wk = try fmtKey(a, "{s}.weight", .{prefix});
-    defer a.free(wk);
-    const raw = try ownWeight(w, wk);
-    defer _ = mlx.mlx_array_free(raw);
-    const kt = mlx.getShape(raw)[2];
-    const tap = try sliceAxis(raw, 2, kt - 1, kt, s);
-    defer _ = mlx.mlx_array_free(tap);
-    const t = try transpose(tap, &[_]c_int{ 0, 2, 3, 4, 1 }, s); // [out,1,kh,kw,in]
-    defer _ = mlx.mlx_array_free(t);
-    const sh = mlx.getShape(t);
-    const t4 = try reshape(t, &[_]c_int{ sh[0], sh[2], sh[3], sh[4] }, s);
-    defer _ = mlx.mlx_array_free(t4);
-    const tc = try contig(t4, s);
-    defer _ = mlx.mlx_array_free(tc);
-    return astype(tc, VAE_DT, s);
-}
-/// Load a conv2d weight: raw [out,in,kh,kw] → MLX [out,kh,kw,in].
-fn loadConv2dW(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, s: S) !mlx.mlx_array {
-    const wk = try fmtKey(a, "{s}.weight", .{prefix});
-    defer a.free(wk);
-    const raw = try ownWeight(w, wk);
-    defer _ = mlx.mlx_array_free(raw);
-    const t = try transpose(raw, &[_]c_int{ 0, 2, 3, 1 }, s);
-    defer _ = mlx.mlx_array_free(t);
-    const tc = try contig(t, s);
-    defer _ = mlx.mlx_array_free(tc);
-    return astype(tc, VAE_DT, s);
-}
-fn loadVec(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, comptime suffix: []const u8, s: S) !mlx.mlx_array {
-    const k = try fmtKey(a, "{s}." ++ suffix, .{prefix});
-    defer a.free(k);
-    const raw = try ownWeight(w, k);
-    defer _ = mlx.mlx_array_free(raw);
-    return astype(raw, VAE_DT, s);
-}
-/// Load a `.gamma` RMSNorm vector, flattened to [C].
-fn loadGamma(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, s: S) !mlx.mlx_array {
-    const k = try fmtKey(a, "{s}.gamma", .{prefix});
-    defer a.free(k);
-    const raw = try ownWeight(w, k);
-    defer _ = mlx.mlx_array_free(raw);
-    const C: c_int = mlx.getShape(raw)[0];
-    const flat = try reshape(raw, &[_]c_int{C}, s);
-    defer _ = mlx.mlx_array_free(flat);
-    return astype(flat, VAE_DT, s);
-}
-
-fn loadResBlock(w: *const Weights, a: std.mem.Allocator, pfx: []const u8, s: S) !Resnet {
-    const c1 = try fmtKey(a, "{s}.conv1", .{pfx});
-    defer a.free(c1);
-    const c2 = try fmtKey(a, "{s}.conv2", .{pfx});
-    defer a.free(c2);
-    const n1 = try fmtKey(a, "{s}.norm1", .{pfx});
-    defer a.free(n1);
-    const n2 = try fmtKey(a, "{s}.norm2", .{pfx});
-    defer a.free(n2);
-    const sk = try fmtKey(a, "{s}.conv_shortcut", .{pfx});
-    defer a.free(sk);
-    const skwk = try fmtKey(a, "{s}.conv_shortcut.weight", .{pfx});
-    defer a.free(skwk);
-    var r: Resnet = .{
-        .n1w = try loadGamma(w, a, n1, s),
-        .c1w = try loadConv3dW(w, a, c1, s),
-        .c1b = try loadVec(w, a, c1, "bias", s),
-        .n2w = try loadGamma(w, a, n2, s),
-        .c2w = try loadConv3dW(w, a, c2, s),
-        .c2b = try loadVec(w, a, c2, "bias", s),
-    };
-    if (w.get(skwk) != null) {
-        r.sw = try loadConv3dW(w, a, sk, s);
-        r.sb = try loadVec(w, a, sk, "bias", s);
-    }
-    return r;
-}
+pub const Vae = qwen_vae.Decoder;
+pub const VaeEncoder = qwen_vae.Encoder;
 
 pub fn loadVae(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []const u8) !Vae {
-    const dir = try fmtKey(allocator, "{s}/vae", .{model_dir});
-    defer allocator.free(dir);
-    var w = try model_mod.loadWeights(io, allocator, dir);
-    defer w.deinit();
-    var v: Vae = undefined;
-    v.allocator = allocator;
-    v.s = s;
-    v.pq_w = try loadConv3dW(&w, allocator, "post_quant_conv", s);
-    v.pq_b = try loadVec(&w, allocator, "post_quant_conv", "bias", s);
-    v.conv_in_w = try loadConv3dW(&w, allocator, "decoder.conv_in", s);
-    v.conv_in_b = try loadVec(&w, allocator, "decoder.conv_in", "bias", s);
-    v.mid_r0 = try loadResBlock(&w, allocator, "decoder.mid_block.resnets.0", s);
-    v.mid_r1 = try loadResBlock(&w, allocator, "decoder.mid_block.resnets.1", s);
-    v.mid_attn = .{
-        .norm = try loadGamma(&w, allocator, "decoder.mid_block.attentions.0.norm", s),
-        .qkv_w = try loadConv2dW(&w, allocator, "decoder.mid_block.attentions.0.to_qkv", s),
-        .qkv_b = try loadVec(&w, allocator, "decoder.mid_block.attentions.0.to_qkv", "bias", s),
-        .proj_w = try loadConv2dW(&w, allocator, "decoder.mid_block.attentions.0.proj", s),
-        .proj_b = try loadVec(&w, allocator, "decoder.mid_block.attentions.0.proj", "bias", s),
-    };
-    // up_blocks: 0,1,2 upsample (resample.1 conv); 3 has no upsampler.
-    const nres = [_]usize{ 3, 3, 3, 3 };
-    for (0..4) |bi| {
-        var ub: UpBlock3D = .{ .resnets = try allocator.alloc(Resnet, nres[bi]), .allocator = allocator };
-        for (0..nres[bi]) |ri| {
-            const pfx = try fmtKey(allocator, "decoder.up_blocks.{d}.resnets.{d}", .{ bi, ri });
-            defer allocator.free(pfx);
-            ub.resnets[ri] = try loadResBlock(&w, allocator, pfx, s);
-        }
-        if (bi < 3) {
-            const up = try fmtKey(allocator, "decoder.up_blocks.{d}.upsamplers.0.resample.1", .{bi});
-            defer allocator.free(up);
-            ub.up_w = try loadConv2dW(&w, allocator, up, s);
-            ub.up_b = try loadVec(&w, allocator, up, "bias", s);
-        }
-        v.up_blocks[bi] = ub;
-    }
-    v.norm_out = try loadGamma(&w, allocator, "decoder.norm_out", s);
-    v.conv_out_w = try loadConv3dW(&w, allocator, "decoder.conv_out", s);
-    v.conv_out_b = try loadVec(&w, allocator, "decoder.conv_out", "bias", s);
-    return v;
+    return qwen_vae.loadDecoder(io, allocator, s, model_dir, VAE_DT, vae_latents);
 }
 
-/// One entry of the encoder's flat down_blocks list (resnets at 0,1,3,4,6,7,9,10;
-/// spatial resamples at 2,5,8).
-const EncBlock = union(enum) {
-    res: Resnet,
-    down: struct { w: mlx.mlx_array, b: mlx.mlx_array },
-};
-
-/// Qwen-Image 3D VAE encoder (T=1) — structural mirror of the decoder. Feeds
-/// img2img: pixels → per-channel-normalized latents, the space `Vae.decode` reads.
-pub const VaeEncoder = struct {
-    allocator: std.mem.Allocator,
-    s: S,
-    conv_in_w: mlx.mlx_array,
-    conv_in_b: mlx.mlx_array,
-    blocks: [11]EncBlock,
-    mid_r0: Resnet,
-    mid_attn: AttnBlock3D,
-    mid_r1: Resnet,
-    norm_out: mlx.mlx_array,
-    conv_out_w: mlx.mlx_array,
-    conv_out_b: mlx.mlx_array,
-    quant_w: mlx.mlx_array,
-    quant_b: mlx.mlx_array,
-
-    pub fn deinit(self: *VaeEncoder) void {
-        inline for (.{ "conv_in_w", "conv_in_b", "norm_out", "conv_out_w", "conv_out_b", "quant_w", "quant_b" }) |f| _ = mlx.mlx_array_free(@field(self, f));
-        for (&self.blocks) |*blk| switch (blk.*) {
-            .res => |*r| freeResnet(r),
-            .down => |*d| {
-                _ = mlx.mlx_array_free(d.w);
-                _ = mlx.mlx_array_free(d.b);
-            },
-        };
-        freeResnet(&self.mid_r0);
-        self.mid_attn.deinit();
-        freeResnet(&self.mid_r1);
-    }
-
-    /// image [1,3,H,W] f32 [0,1] (NCHW, H/W multiples of 16) → latents
-    /// [1,16,H/8,W/8] f32, per-channel NORMALIZED ((z-mean)/std; distribution
-    /// mean — deterministic, no sampling).
-    pub fn encode(self: *const VaeEncoder, parent: *Graph, img: Array) !Array {
-        var g = parent.scope();
-        defer g.deinit();
-        // [0,1] → [-1,1], NHWC (T=1)
-        const signed = try g.sub(try g.mul(img, try g.scalar(2.0, .float32)), try g.scalar(1.0, .float32));
-        var h = try g.astype(try g.transpose(signed, &.{ 0, 2, 3, 1 }), VAE_DT);
-        h = try conv_blk.conv2d(&g, h, self.conv_in_w, self.conv_in_b, 1, 1, 1);
-        for (&self.blocks) |*blk| h = switch (blk.*) {
-            .res => |*rb| try rb.forward(&g, vae_norm, h),
-            .down => |*d| try conv_blk.downsample2x(&g, h, d.w, d.b),
-        };
-        h = try self.mid_r0.forward(&g, vae_norm, h);
-        h = try self.mid_attn.forward(&g, h);
-        h = try self.mid_r1.forward(&g, vae_norm, h);
-        h = try g.silu(try g.rmsNorm(h, self.norm_out, 1e-12));
-        const co = try conv_blk.conv2d(&g, h, self.conv_out_w, self.conv_out_b, 1, 1, 1); // [1,h,w,32]
-        const qc = try conv_blk.conv2d(&g, co, self.quant_w, self.quant_b, 1, 0, 1);
-        // mean = first 16 channels; logvar discarded. normalize: (z - MEAN) / STD (inverse of decode's denorm)
-        const mf = try g.astype(try g.sliceAxis(qc, 3, 0, 16), .float32);
-        const zn = try g.div(try g.sub(mf, try latentStat(&g, &LATENTS_MEAN, .float32)), try latentStat(&g, &LATENTS_STD, .float32));
-        return parent.keep(try g.contiguous(try g.transpose(zn, &.{ 0, 3, 1, 2 })));
-    }
-};
-
 pub fn loadVaeEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []const u8) !VaeEncoder {
-    const dir = try fmtKey(allocator, "{s}/vae", .{model_dir});
-    defer allocator.free(dir);
-    var w = try model_mod.loadWeights(io, allocator, dir);
-    defer w.deinit();
-    var v: VaeEncoder = undefined;
-    v.allocator = allocator;
-    v.s = s;
-    v.conv_in_w = try loadConv3dW(&w, allocator, "encoder.conv_in", s);
-    v.conv_in_b = try loadVec(&w, allocator, "encoder.conv_in", "bias", s);
-    for (0..11) |bi| {
-        const pfx = try fmtKey(allocator, "encoder.down_blocks.{d}", .{bi});
-        defer allocator.free(pfx);
-        if (bi == 2 or bi == 5 or bi == 8) {
-            const rp = try fmtKey(allocator, "{s}.resample.1", .{pfx});
-            defer allocator.free(rp);
-            v.blocks[bi] = .{ .down = .{
-                .w = try loadConv2dW(&w, allocator, rp, s),
-                .b = try loadVec(&w, allocator, rp, "bias", s),
-            } };
-        } else {
-            v.blocks[bi] = .{ .res = try loadResBlock(&w, allocator, pfx, s) };
-        }
-    }
-    v.mid_r0 = try loadResBlock(&w, allocator, "encoder.mid_block.resnets.0", s);
-    v.mid_r1 = try loadResBlock(&w, allocator, "encoder.mid_block.resnets.1", s);
-    v.mid_attn = .{
-        .norm = try loadGamma(&w, allocator, "encoder.mid_block.attentions.0.norm", s),
-        .qkv_w = try loadConv2dW(&w, allocator, "encoder.mid_block.attentions.0.to_qkv", s),
-        .qkv_b = try loadVec(&w, allocator, "encoder.mid_block.attentions.0.to_qkv", "bias", s),
-        .proj_w = try loadConv2dW(&w, allocator, "encoder.mid_block.attentions.0.proj", s),
-        .proj_b = try loadVec(&w, allocator, "encoder.mid_block.attentions.0.proj", "bias", s),
-    };
-    v.norm_out = try loadGamma(&w, allocator, "encoder.norm_out", s);
-    v.conv_out_w = try loadConv3dW(&w, allocator, "encoder.conv_out", s);
-    v.conv_out_b = try loadVec(&w, allocator, "encoder.conv_out", "bias", s);
-    v.quant_w = try loadConv3dW(&w, allocator, "quant_conv", s);
-    v.quant_b = try loadVec(&w, allocator, "quant_conv", "bias", s);
-    return v;
+    return qwen_vae.loadEncoder(io, allocator, s, model_dir, VAE_DT, vae_latents);
 }
 
 /// Conditioning rebalance: scale the stacked context [1,L,taps,d] by a global

@@ -102,7 +102,7 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 private let mediaModelTypeExactValues: Set<String> = [
     "qwen3_tts", "dense", "AudioVideo", "acestep", "minimax_h3", "minimax_h3_image", "minimax_music3", "kokoro",
     "mageflow", "laya", "kev", "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d",
-    "idol",
+    "idol", "bailingmm_moe_v2_lite",
 ]
 
 /// `dense` is a generic `model_type`: the server's ming_tts claims it only beside `ditar_config` and
@@ -178,7 +178,8 @@ enum MediaModality: CaseIterable {
     init?(modelType: String) {
         if modelType.hasPrefix("flux2") || modelType.hasPrefix("krea")
             || modelType.hasPrefix("mage_flow") || modelType == "mageflow"
-            || modelType.hasPrefix("qwen_image") || modelType == "moss_image" || modelType == "minimax_h3_image" { self = .image; return }
+            || modelType.hasPrefix("qwen_image") || modelType == "moss_image" || modelType == "minimax_h3_image"
+            || modelType == "bailingmm_moe_v2_lite" { self = .image; return }
         if modelType.hasPrefix("hunyuan3d") || modelType == "trellis2" || modelType == "pixal3d" || modelType == "idol" { self = .mesh; return }
         switch modelType {
         case "qwen3_tts", "kokoro", "dense": self = .voice

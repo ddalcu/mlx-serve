@@ -1,6 +1,6 @@
 //! One Qwen3 decoder layer as the media pipelines run their prompt encoders: pre-norm GQA
-//! attention with q/k RMS norm (optional additive mask), SwiGLU MLP, both residual. RoPE is
-//! the variant point:
+//! attention with q/k RMS norm (optional additive mask), SwiGLU MLP, both residual; a `w` with
+//! no `q_norm` field is Qwen2's layer (Ming-Image's connector). RoPE is the variant point:
 //! - `fast`: mlx's kernel; FLUX.2 klein runs the SDPA in f32 and casts back (`attn_f32`),
 //!   ACE-Step's encoder does not;
 //! - `table`: rotate-half over full-width tables (Krea: a bf16 -1; mage_flow and Qwen-Image's
@@ -35,8 +35,15 @@ pub fn layerForward(parent: *Graph, w: anytype, cfg: Cfg, rope: Rope, x: Array, 
     const seq = ops.shape(x)[1];
     const xn = try g.rmsNorm(x, w.input_ln, cfg.eps);
     const perm = [_]c_int{ 0, 2, 1, 3 };
-    const qt = try g.transpose(try g.rmsNorm(try g.reshape(try w.q.forward(&g, xn), &.{ b, seq, cfg.heads, cfg.head_dim }), w.q_norm, cfg.eps), &perm);
-    const kt = try g.transpose(try g.rmsNorm(try g.reshape(try w.k.forward(&g, xn), &.{ b, seq, cfg.kv_heads, cfg.head_dim }), w.k_norm, cfg.eps), &perm);
+    const q4 = try g.reshape(try w.q.forward(&g, xn), &.{ b, seq, cfg.heads, cfg.head_dim });
+    const k4 = try g.reshape(try w.k.forward(&g, xn), &.{ b, seq, cfg.kv_heads, cfg.head_dim });
+    const W = switch (@typeInfo(@TypeOf(w))) {
+        .pointer => |ptr| ptr.child,
+        else => @TypeOf(w),
+    };
+    const qk_norm = @hasField(W, "q_norm");
+    const qt = try g.transpose(if (qk_norm) try g.rmsNorm(q4, w.q_norm, cfg.eps) else q4, &perm);
+    const kt = try g.transpose(if (qk_norm) try g.rmsNorm(k4, w.k_norm, cfg.eps) else k4, &perm);
     const vt = try g.transpose(try g.reshape(try w.v.forward(&g, xn), &.{ b, seq, cfg.kv_heads, cfg.head_dim }), &perm);
     const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
     const m: ops.Mask = if (mask) |mm| .{ .array = mm } else .none;
