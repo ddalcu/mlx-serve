@@ -273,3 +273,65 @@ final class ConfigOverridesFieldTests: XCTestCase {
         XCTAssertFalse(ConfigOverrides.isObject("   "))
     }
 }
+
+/// The box's edit decision: what the typed text does to the stored key, and when it blocks the save.
+final class ConfigOverridesEditTests: XCTestCase {
+    /// Already in the canonical order `ConfigOverrides.text` writes, so a `.set` compares by text.
+    private let yarn = "{\"text_config\":{\"rope_parameters\":{\"factor\":4,\"rope_type\":\"yarn\"}}}"
+
+    func testEmptyTextAndAnEmptyObjectBothClearTheKey() {
+        XCTAssertEqual(ConfigOverrides.edit(""), .clear)
+        XCTAssertEqual(ConfigOverrides.edit("  \n "), .clear)
+        XCTAssertEqual(ConfigOverrides.edit("{}"), .clear)
+        XCTAssertNil(ConfigOverrides.rejection(""))
+        XCTAssertNil(ConfigOverrides.rejection("{}"), "a no-op object is not a mistake")
+    }
+
+    func testValidTextStoresAndHalfTypedTextOnlyBlocks() {
+        XCTAssertEqual(ConfigOverrides.edit(yarn), .set(yarn))
+        XCTAssertNil(ConfigOverrides.rejection(yarn))
+        for bad in ["{oops", "\"yarn\"", "[1,2]", "4"] {
+            XCTAssertEqual(ConfigOverrides.edit(bad), .keep, bad)
+            XCTAssertNotNil(ConfigOverrides.rejection(bad), bad)
+        }
+    }
+}
+
+/// The one-click YaRN recipe: only the arch that scales this way, and only numbers the pack itself states.
+final class YarnTemplateTests: XCTestCase {
+    func testOfferedOnlyForTheArchAndOnlyWhenThereIsRoom() throws {
+        XCTAssertNil(YarnTemplate.plan(modelType: nil, native: 262_144))
+        XCTAssertNil(YarnTemplate.plan(modelType: "qwen3_5", native: 262_144))
+        XCTAssertNil(YarnTemplate.plan(modelType: "qwen4_exp", native: 0), "no window read is no recipe")
+        XCTAssertNil(YarnTemplate.plan(modelType: "qwen4_exp", native: 1_048_576), "already at the target")
+        let four = try XCTUnwrap(YarnTemplate.plan(modelType: "qwen4_exp", native: 262_144))
+        XCTAssertEqual(four.factor, 4)
+        XCTAssertEqual(four.ctxSize, 1_048_576)
+        let two = try XCTUnwrap(YarnTemplate.plan(modelType: "qwen4_exp_text", native: 524_288))
+        XCTAssertEqual(two.factor, 2)
+        XCTAssertEqual(two.ctxSize, 1_048_576)
+    }
+
+    func testTheDocumentNamesThePacksOwnWindowAndNothingElse() throws {
+        let plan = try XCTUnwrap(YarnTemplate.plan(modelType: "qwen4_exp", native: 262_144))
+        let data = try XCTUnwrap(plan.json.data(using: .utf8))
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let tc = try XCTUnwrap(root["text_config"] as? [String: Any])
+        let rp = try XCTUnwrap(tc["rope_parameters"] as? [String: Any])
+        XCTAssertEqual(rp["rope_type"] as? String, "yarn")
+        XCTAssertEqual(rp["factor"] as? Int, 4)
+        XCTAssertEqual(rp["original_max_position_embeddings"] as? Int, 262_144)
+        XCTAssertEqual(tc["max_position_embeddings"] as? Int, 1_048_576)
+        // What the sheet writes is what the server accepts.
+        XCTAssertNotNil(ConfigOverrides.object(plan.json))
+    }
+
+    func testNativeWindowReadsTextConfigFirstThenTheRoot() {
+        XCTAssertEqual(YarnTemplate.nativeWindow(config: ["text_config": ["max_position_embeddings": 262_144],
+                                                           "max_position_embeddings": 32_768]), 262_144)
+        XCTAssertEqual(YarnTemplate.nativeWindow(config: ["max_position_embeddings": 131_072]), 131_072)
+        XCTAssertEqual(YarnTemplate.nativeWindow(config: [:]), 0)
+        XCTAssertEqual(YarnTemplate.nativeWindow(config: ["text_config": ["max_position_embeddings": 0],
+                                                          "max_position_embeddings": 4_096]), 4_096)
+    }
+}

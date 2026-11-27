@@ -72,6 +72,8 @@ struct ModelSettingsSheet: View {
     @State private var customValue = ""
     /// The `config_overrides` box, as typed; `override.configOverrides` only takes it while it is valid.
     @State private var configText = ""
+    /// The one-click YaRN recipe for this pack, when its arch scales that way and its own window is readable.
+    @State private var yarnPlan: YarnTemplate.Plan?
     @State private var busy = false
     /// The save reloads the model; the sheet stays up and shows the load until it is ready.
     @State private var reloading = false
@@ -107,11 +109,7 @@ struct ModelSettingsSheet: View {
     }
 
     /// Why the typed `config_overrides` cannot be stored, if it cannot.
-    private var configError: String? {
-        let t = configText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty, !ConfigOverrides.isObject(t) else { return nil }
-        return "Config overrides must be one JSON object, like {\"text_config\": {\"rope_parameters\": {\"rope_type\": \"yarn\", \"factor\": 4}})."
-    }
+    private var configError: String? { ConfigOverrides.rejection(configText) }
 
     /// A running server answers from `/v1/models`; otherwise the app's own disk probe.
     private var mtpAvailable: Bool? {
@@ -128,8 +126,13 @@ struct ModelSettingsSheet: View {
         ModelSettingsApply.engineChoices(engines: live?.engines ?? [], stored: override.engineChoice)
     }
 
+    /// The pack's architecture, as the app's own disk probe read it.
+    private var modelType: String? {
+        appState.localModels.first { $0.path == request.path }?.modelType
+    }
+
     private var hasInt8PrefillRoute: Bool {
-        ModelSettingsApply.hasInt8PrefillRoute(modelType: appState.localModels.first { $0.path == request.path }?.modelType)
+        ModelSettingsApply.hasInt8PrefillRoute(modelType: modelType)
     }
 
     private var rows: (mtp: Bool, acceptance: Bool) {
@@ -300,14 +303,27 @@ struct ModelSettingsSheet: View {
                             .font(.app(.body).monospaced())
                             .lineLimit(1...6)
                             .onChange(of: configText) { _, v in
-                                // A valid object applies, an empty one clears the key; half-typed text leaves the
-                                // stored value alone and only blocks the save.
-                                if ConfigOverrides.isObject(v) {
-                                    override.configOverrides = ConfigOverrides.object(v).map { ConfigOverrides.text($0) }
+                                switch ConfigOverrides.edit(v) {
+                                case .clear: override.configOverrides = nil
+                                case .set(let text): override.configOverrides = text
+                                case .keep: break // half-typed: keep what is stored, and block the save
                                 }
                             }
                     } header: {
-                        Text("Config overrides").font(.app(.body))
+                        HStack {
+                            Text("Config overrides").font(.app(.body))
+                            Spacer()
+                            if let yarn = yarnPlan {
+                                Button {
+                                    configText = yarn.json
+                                    override.ctxSize = yarn.ctxSize
+                                } label: {
+                                    Text("YaRN ×\(yarn.factor) to \(ContextSizeDisplay.formatTokens(yarn.ctxSize))")
+                                        .font(.app(.body))
+                                }
+                                .help("Fills the box with rope_parameters of this pack's own window, and sets the context size to what that rope resolves.")
+                            }
+                        }
                     } footer: {
                         Text(L10n.text("A JSON object the server deep-merges into this model's config.json at load — the per-model form of --config-overrides. A rope the model was not trained with reads as one-token answers: state it here as rope_parameters (rope_type yarn, its factor and original_max_position_embeddings) and raise max_position_embeddings with it. A launch --config-overrides wins a key both name.")).font(.app(.body))
                     }
@@ -411,6 +427,7 @@ struct ModelSettingsSheet: View {
             override = settingsFile.override(for: request.path) ?? ModelOverride()
             initialOverride = override
             configText = override.configOverrides ?? ""
+            yarnPlan = YarnTemplate.plan(modelType: modelType, native: Self.nativeWindow(in: request.path))
             inheritedGeneration = (try? GenerationDefaultsFile.load()) ?? .init()
             packDrafter = DrafterGems.packDrafterFolder(modelDir: request.path)
             let gems = SpeculationSocketRow.gems(repoId: repoId, packDrafter: packDrafter, mtpAvailable: rows.mtp,
@@ -456,6 +473,14 @@ struct ModelSettingsSheet: View {
             }
         }
         dismiss()
+    }
+
+    /// The pack's declared window from its own `config.json`; 0 when the file cannot be read (a GGUF, another tool's layout).
+    private static func nativeWindow(in dir: String) -> Int {
+        let path = (dir as NSString).appendingPathComponent("config.json")
+        guard let data = FileManager.default.contents(atPath: path),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return 0 }
+        return YarnTemplate.nativeWindow(config: obj)
     }
 
     private static func weightsGB(in dir: String) -> Double {

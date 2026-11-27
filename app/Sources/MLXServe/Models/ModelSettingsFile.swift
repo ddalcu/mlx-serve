@@ -240,6 +240,14 @@ struct ModelSettingsFile {
 /// deep-merged into the pack's `config.json` at load. The sheet edits text, the file holds an object,
 /// and `text` is canonical so two entries that mean the same compare equal.
 enum ConfigOverrides {
+    /// What the box's text means for the stored key.
+    enum Edit: Equatable {
+        case clear
+        case set(String)
+        /// Half-typed text: keep what is stored and block the save.
+        case keep
+    }
+
     /// The typed text as the object to store; nil when it is empty, names nothing, or is not a JSON object.
     static func object(_ text: String) -> [String: Any]? {
         guard let dict = parsed(text), !dict.isEmpty else { return nil }
@@ -249,6 +257,18 @@ enum ConfigOverrides {
     /// Whether the box may hold the text: any JSON object, an empty one included — it names nothing, which is a
     /// cleared setting rather than a mistake, so it must never block the save.
     static func isObject(_ text: String) -> Bool { parsed(text) != nil }
+
+    /// The one decision the sheet makes with the text, so clearing it is testable.
+    static func edit(_ text: String) -> Edit {
+        if let dict = parsed(text) { return dict.isEmpty ? .clear : .set(ConfigOverrides.text(dict)) }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .clear : .keep
+    }
+
+    /// Why the text cannot be stored; nil when it is empty or a JSON object.
+    static func rejection(_ text: String) -> String? {
+        edit(text) != .keep ? nil
+            : "Config overrides must be one JSON object, like {\"text_config\": {\"rope_parameters\": {\"rope_type\": \"yarn\", \"factor\": 4}}}."
+    }
 
     private static func parsed(_ text: String) -> [String: Any]? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -262,6 +282,41 @@ enum ConfigOverrides {
         guard !object.isEmpty, let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
               let s = String(data: data, encoding: .utf8) else { return "" }
         return s
+    }
+}
+
+/// The one-click YaRN recipe, so extending a context is a choice rather than a string to remember. It is
+/// offered only for the arch the engine scales this way (`qwen4_exp`, the recipe in `--help`) and every number
+/// comes from the pack's own declared window.
+enum YarnTemplate {
+    struct Plan: Equatable {
+        /// The document for `config_overrides`.
+        var json: String
+        /// The context the scaled rope resolves, for the Context size picker.
+        var ctxSize: Int
+        var factor: Int
+    }
+
+    static let target = 1_048_576
+
+    /// The pack's own window: `text_config` first, then the root; 0 when it names neither.
+    static func nativeWindow(config: [String: Any]) -> Int {
+        if let tc = config["text_config"] as? [String: Any],
+           let n = tc["max_position_embeddings"] as? Int, n > 0 { return n }
+        return (config["max_position_embeddings"] as? Int) ?? 0
+    }
+
+    /// ×4 over `native`, or ×2 when 4× would pass the target; nil for another arch, an unknown window, or a
+    /// pack already there.
+    static func plan(modelType: String?, native: Int) -> Plan? {
+        guard modelType == "qwen4_exp" || modelType == "qwen4_exp_text" else { return nil }
+        guard native > 0 else { return nil }
+        let factor = native * 4 <= target ? 4 : (native * 2 <= target ? 2 : 0)
+        guard factor > 0 else { return nil }
+        let scaled = native * factor
+        let json = "{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":\(factor),"
+            + "\"original_max_position_embeddings\":\(native)},\"max_position_embeddings\":\(scaled)}}"
+        return Plan(json: json, ctxSize: scaled, factor: factor)
     }
 }
 
