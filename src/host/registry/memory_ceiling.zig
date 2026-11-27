@@ -202,7 +202,7 @@ pub fn parseGpuCeilingGib(raw: []const u8) error{InvalidGpuCeiling}!u64 {
 /// `preset_reserve_gib` (macOS and the host's own memory).
 pub const MemoryPreset = struct { name: []const u8, ram_gib: u32 };
 pub const preset_reserve_gib: u32 = 16;
-/// The one table of presets: the usage text and the parser both read it.
+/// The one table of presets: the usage text and the parser both read it. A preset is a ceiling, never a model choice.
 pub const memory_presets = [_]MemoryPreset{
     .{ .name = "m5-96", .ram_gib = 96 },
     .{ .name = "m5-128", .ram_gib = 128 },

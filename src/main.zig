@@ -448,7 +448,10 @@ fn printUsage(io: std.Io) void {
         \\                      --gpu-ceiling-gib for a named Mac: its RAM
         \\                        less 16 GiB:
     ++ " " ++ memory_ceiling.memory_preset_list ++ ".\n" ++
-        \\                        Give it or --gpu-ceiling-gib, not both.
+        \\                        Give it or --gpu-ceiling-gib, not both. A preset
+        \\                        sets the ceiling only: any model runs under
+        \\                        any preset (what does not fit streams from
+        \\                        the SSD or is refused at load, named).
         \\
     ++
         \\  --tokenize-cache-entries <n>
