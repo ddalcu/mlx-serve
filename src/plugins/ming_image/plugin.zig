@@ -11,6 +11,7 @@ const image_pixels = @import("../../sdk/media/image_pixels.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
 const ming = @import("ming_image.zig");
+const llm = @import("llm.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -75,12 +76,17 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     };
     if (j.negative_prompt.len > 0) return Verdict.named(.unsupported, "'negative_prompt' is not supported by Ming-Image (its guidance contrasts the prompt with an empty condition)");
     const dims = config.bucket(j.req_w, j.req_h);
+    if (dims.w != j.req_w or dims.h != j.req_h) log.info("[ming-image] asked {d}x{d} -> bucket {d}x{d}\n", .{ j.req_w, j.req_h, dims.w, dims.h });
     const need = config.genTransientBytes(dims.w, dims.h);
     const room = job.gpuHeadroom();
     if (need > room) log.info("[image] bill refused: {d}x{d} needs {d} MB, headroom {d} MB\n", .{ dims.w, dims.h, need >> 20, room >> 20 });
     if (image_request.canvasRefusal(req, dims.w, dims.h, need, room)) |v| return v;
     const img = e.m.generateImage(j.prompt, dims.w, dims.h, j.seed, j.steps, .{ .guidance_scale = j.guidance_scale }, job.progressOf(progress)) catch |err|
-        return if (err == error.Cancelled) job.client_left else job.failure(err, "generation failed");
+        return switch (err) {
+            error.Cancelled => job.client_left,
+            error.PromptTooLong => Verdict.named(.unsupported, "'prompt' is longer than the 4096 tokens Ming-Image reads (with its chat template); shorten it"),
+            else => job.failure(err, "generation failed"),
+        };
     defer _ = mlx.mlx_array_free(img);
     // The image is lazy until here: a Metal failure in the denoise surfaces in the encode.
     const png = image_pixels.toPng(gpa, img, e.m.s) catch |err| return job.failure(err, "generation failed");
@@ -269,6 +275,23 @@ test "ming_image: a job on the tiny pack is an RGBA PNG at its bucket; a negativ
     try testing.expectEqual(@as(u8, 6), png[25]); // IHDR colour type: truecolour with alpha
     const refused = (try pack.run("{\"prompt\":\"a\",\"negative_prompt\":\"b\"}")).refused;
     try testing.expect(refused.code == .unsupported);
+}
+
+test "ming_image: a prompt past the encoder's token cap is refused by name, never cut short" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var pack = try MediaPack(@This()).open(arena.allocator());
+    defer pack.close();
+    const long = try arena.allocator().alloc(u8, llm.MAX_PROMPT_TOKENS);
+    @memset(long, 'x');
+    const body = try std.fmt.allocPrint(arena.allocator(), "{{\"prompt\":\"{s}\"}}", .{long});
+    switch (try pack.run(body)) {
+        .refused => |v| {
+            try testing.expect(v.code == .unsupported);
+            try testing.expect(std.mem.indexOf(u8, v.why.slice(), "4096 tokens") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "ming_image: guidance past 1 runs the zeroed-condition branch and moves the image" {

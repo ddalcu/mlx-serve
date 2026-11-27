@@ -30,7 +30,10 @@ decodes to RGBA. Port of github.com/inclusionAI/Ming-Image (`modeling_bailingmm2
   f32, and the caption concat promoted all 30 DiT blocks to f32 (1.6x slower). Guard: `ming_image: both caption
   streams reach the DiT in bf16 from a connector quantized with f32 scales`.
 - The quantized DiT linears stay on stock qmm: dequant + GEMM measured slower on the M5 Ultra.
-- A request runs at the release's nearest aspect bucket (`config.bucket`); the model trained on those sizes only.
+- A request runs at the release's nearest aspect bucket (`config.bucket`); the model trained on those sizes only. A
+  snapped size is logged (`asked WxH -> bucket WxH`); the PNG carries the real size (4096x4096 renders 2048x2048).
+- A chat-formatted prompt past 4096 tokens is a named 400, never cut: the release truncates nowhere, and a cut drops
+  the assistant turn both caption streams are read after.
 - Both sequences' pad-to-32 rows are masked in the release (`zero_masked`), so they are dropped; only the caption's
   padded length survives, as the image tokens' first RoPE position.
 - Packs: the release (bf16) and mlx-community's layout (the same tree, MLX affine triples beside each weight);

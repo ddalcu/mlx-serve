@@ -32,7 +32,8 @@ pub const DT: ops.Dtype = .bfloat16;
 const SYSTEM = "<role>SYSTEM</role>你是一个友好的AI助手。\n\ndetailed thinking off<|role_end|>";
 const PROMPT_PREFIX = SYSTEM ++ "<role>HUMAN</role>";
 const PROMPT_SUFFIX = "<|role_end|><role>ASSISTANT</role>";
-/// The prompt tokens kept (the release truncates nowhere; this bounds a request's encode).
+/// The longest chat-formatted prompt a request may encode (the release truncates nowhere, so a longer one is refused:
+/// cutting it would drop the assistant turn the caption streams are read after).
 pub const MAX_PROMPT_TOKENS: usize = 4096;
 
 // ── loading helpers (also the DiT's) ──
@@ -452,14 +453,16 @@ pub const Encoder = struct {
         self.tok.deinit();
     }
 
-    /// The chat-formatted prompt's ids (the release's processor), at most `MAX_PROMPT_TOKENS`.
+    /// The chat-formatted prompt's ids (the release's processor); `error.PromptTooLong` past `MAX_PROMPT_TOKENS`.
     pub fn promptIds(self: *const Encoder, a: std.mem.Allocator, prompt: []const u8) ![]u32 {
         const text = try std.mem.concat(a, u8, &.{ PROMPT_PREFIX, prompt, PROMPT_SUFFIX });
         defer a.free(text);
         const ids = try self.tok.encode(a, text);
-        if (ids.len <= MAX_PROMPT_TOKENS) return ids;
-        defer a.free(ids);
-        return a.dupe(u32, ids[0..MAX_PROMPT_TOKENS]);
+        if (ids.len > MAX_PROMPT_TOKENS) {
+            a.free(ids);
+            return error.PromptTooLong;
+        }
+        return ids;
     }
 
     pub const Cond = struct {
