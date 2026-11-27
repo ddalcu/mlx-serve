@@ -179,22 +179,22 @@ pub const Flags = struct {
 
 /// A record row `GET /v1/recall` reports (host-owned type; the engine fills it).
 pub const RecallStats = struct {
-    writes: bool,
-    left: bool,
-    read_only: bool,
-    ids: u64,
-    disk_bytes: u64,
-    ram_bytes: u64,
-    cap_bytes: u64,
-    added: u64,
-    held: u64,
-    rates: [3]f64,
-    probe_every: u32,
-    proposals: u64,
-    proposed: u64,
-    accepted: u64,
-    problem: []const u8,
-    model: []const u8,
+    writes: bool = false,
+    left: bool = false,
+    read_only: bool = false,
+    ids: u64 = 0,
+    disk_bytes: u64 = 0,
+    ram_bytes: u64 = 0,
+    cap_bytes: u64 = 0,
+    added: u64 = 0,
+    held: u64 = 0,
+    rates: [3]f64 = .{ 0, 0, 0 },
+    probe_every: u32 = 0,
+    proposals: u64 = 0,
+    proposed: u64 = 0,
+    accepted: u64 = 0,
+    problem: []const u8 = "",
+    model: []const u8 = "",
 };
 
 /// A `DELETE /v1/recall` outcome row (host-owned type; the engine fills it).
