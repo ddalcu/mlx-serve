@@ -546,6 +546,9 @@ pub const ModelConfig = struct {
     drafter_ctx_bytes_per_token: u64 = 0,
     /// `drafter` setting: null or "auto" = the in-dir probe, "off", or a path. Owned.
     drafter_override: ?[]const u8 = null,
+    /// The pack's `config_overrides` document that was deep-merged into the bytes this config was parsed
+    /// from. The SSD KV root hashes THIS, so a stored cache is never filed under a rope the load did not use. Owned.
+    config_overrides_applied: ?[]const u8 = null,
     /// The plugin serving this pack and its parse (`engines/mlx/plugin/config.zig`); null = the legacy path.
     plugin: ?*plugin_config.Binding = null,
     /// The facts the legacy parse declares for its family; a served config reads its plugin's (`caps`,
@@ -1697,6 +1700,8 @@ pub const ModelConfig = struct {
         self.pack_dir = null;
         if (self.drafter_override) |p| allocator.free(p);
         self.drafter_override = null;
+        if (self.config_overrides_applied) |p| allocator.free(p);
+        self.config_overrides_applied = null;
         if (self.plugin) |b| b.destroy(allocator);
         self.plugin = null;
     }
@@ -1738,7 +1743,7 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     // The pack's per-model `config_overrides` land before both parses, so the window the plugin's rope builds, the
     // window the engine bills and the window the row advertises are one window. The launch's `--config-overrides`
     // is merged by the two parses below and wins a key both layers name.
-    const per_model = model_settings.configOverridesFor(allocator, io, model_dir);
+    var per_model = model_settings.configOverridesFor(allocator, io, model_dir);
     defer if (per_model) |p| allocator.free(p);
     const scoped = try plugin_config.mergeOverrides(allocator, content, per_model, null);
     defer if (scoped.ptr != content.ptr) allocator.free(scoped);
@@ -1749,17 +1754,17 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     // parse asks for it (`Parsed.engine_config`); otherwise its facts alone.
     const binding = if (served) try plugin_config.bindServed(io, allocator, model_dir, scoped) else null;
     errdefer if (binding) |b| b.destroy(allocator);
-    if (binding) |b| if (b.outside and !b.parsed.wantsEngineConfig()) return plugin_config.adapted(b);
+    if (binding) |b| if (b.outside and !b.parsed.wantsEngineConfig()) return stamped(plugin_config.adapted(b), &per_model);
     var config = parseConfigFromJson(allocator, scoped) catch |e| {
         const b = binding orelse return e;
         log.info("[plugin] {s}: the legacy parse refused {s} ({s}); the engine config is the plugin's facts\n", .{ b.table.name.slice(), b.parsed.shell.model_type.slice(), @errorName(e) });
-        return plugin_config.adapted(b);
+        return stamped(plugin_config.adapted(b), &per_model);
     };
     // A type the legacy parse knows only as a llama guess is the plugin's facts alone (the layout, the recurrent
     // states), never a full-attention llama.
     if (binding) |b| if (std.mem.eql(u8, config.model_type, "unknown")) {
         config.deinit(allocator);
-        return plugin_config.adapted(b);
+        return stamped(plugin_config.adapted(b), &per_model);
     };
     errdefer config.deinit(allocator);
     if (config.isDsv41()) config.pack_dir = try allocator.dupe(u8, model_dir);
@@ -1910,7 +1915,16 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     }
 
     config.plugin = binding;
-    return config;
+    return stamped(config, &per_model);
+}
+
+/// Moves the `config_overrides` document that was merged into these bytes onto the config they produced, so the
+/// SSD KV root hashes what the load actually parsed. Takes it once: the caller's `defer` frees what is left.
+fn stamped(c: ModelConfig, pm: *?[]const u8) ModelConfig {
+    var out = c;
+    out.config_overrides_applied = pm.*;
+    pm.* = null;
+    return out;
 }
 
 /// Sampling recommendations parsed out of a model's generation_config.json.

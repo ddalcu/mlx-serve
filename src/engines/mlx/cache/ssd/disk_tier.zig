@@ -53,7 +53,6 @@ const mlx = @import("../../../../mlx/ffi.zig");
 const kv_quant = @import("../kv_quant.zig");
 const transformer_mod = @import("../../transformer.zig");
 const model = @import("../../../../sdk/config/model.zig");
-const model_settings = @import("../../../../host/registry/model_settings.zig");
 const io_util = @import("../../../../sdk/util/io_util.zig");
 const disk_writer = @import("writer.zig");
 pub const module_record = @import("module_record.zig");
@@ -4370,7 +4369,7 @@ fn deleteTreeAbsolute(io: std.Io, dir_abs: []const u8) void {
 /// Historical fingerprint for the default cache layout. Kept as a wrapper so
 /// existing callers and existing SSD roots remain stable.
 pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) ![]u8 {
-    return modelFingerprintWithLayout(allocator, io, model_dir, null);
+    return modelFingerprintWithLayout(allocator, io, model_dir, null, null);
 }
 
 /// Fingerprint a model plus an optional cache-layout namespace
@@ -4382,6 +4381,7 @@ pub fn modelFingerprintWithLayout(
     io: std.Io,
     model_dir: []const u8,
     layout_namespace: ?[]const u8,
+    model_overrides: ?[]const u8,
 ) ![]u8 {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return error.BadModelDir;
     var h = std.hash.XxHash64.init(0x6b76_6361_6368_6531);
@@ -4395,9 +4395,9 @@ pub fn modelFingerprintWithLayout(
     }
     if (model.getConfigOverrides()) |raw| h.update(raw);
     // A per-model `config_overrides` re-shapes the same geometry (a rope scaling, a window), so it rolls the root:
-    // keys stored under another rope mean something else.
-    if (model_settings.configOverridesFor(allocator, io, model_dir)) |ov| {
-        defer allocator.free(ov);
+    // keys stored under another rope mean something else. It is the document the LOAD parsed, not a fresh read of
+    // the file, so an edit landing mid-load cannot file this cache under the other rope's root.
+    if (model_overrides) |ov| {
         h.update("\x00mlx-serve-model-overrides\x00");
         h.update(ov);
     }
@@ -6662,9 +6662,9 @@ test "modelFingerprint: the Nemotron-H NoPE layout gets its own SSD root" {
     );
     const old = try modelFingerprint(testing.allocator, io, dir);
     defer testing.allocator.free(old);
-    const fp_nemo = try modelFingerprintWithLayout(testing.allocator, io, dir, nemo.cacheLayoutNamespace());
+    const fp_nemo = try modelFingerprintWithLayout(testing.allocator, io, dir, nemo.cacheLayoutNamespace(), null);
     defer testing.allocator.free(fp_nemo);
-    const fp_qwen = try modelFingerprintWithLayout(testing.allocator, io, dir, qwen.cacheLayoutNamespace());
+    const fp_qwen = try modelFingerprintWithLayout(testing.allocator, io, dir, qwen.cacheLayoutNamespace(), null);
     defer testing.allocator.free(fp_qwen);
     try testing.expect(!std.mem.eql(u8, old, fp_nemo));
     try testing.expectEqualStrings(old, fp_qwen);
@@ -6694,13 +6694,13 @@ test "modelFingerprint: a qwen4_exp f32 GatedDeltaNet state gets its own SSD roo
     const q4 = try model.parseConfigFromJson(testing.allocator, QWEN4_TINY_GDN);
     const old = try modelFingerprint(testing.allocator, io, dir);
     defer testing.allocator.free(old);
-    const fp = try modelFingerprintWithLayout(testing.allocator, io, dir, q4.cacheLayoutNamespace());
+    const fp = try modelFingerprintWithLayout(testing.allocator, io, dir, q4.cacheLayoutNamespace(), null);
     defer testing.allocator.free(fp);
     try testing.expect(!std.mem.eql(u8, old, fp));
     model.gdn_state_f32_override = false;
     defer model.gdn_state_f32_override = null;
     const q4_bf16 = try model.parseConfigFromJson(testing.allocator, QWEN4_TINY_GDN);
-    const fp_bf16 = try modelFingerprintWithLayout(testing.allocator, io, dir, q4_bf16.cacheLayoutNamespace());
+    const fp_bf16 = try modelFingerprintWithLayout(testing.allocator, io, dir, q4_bf16.cacheLayoutNamespace(), null);
     defer testing.allocator.free(fp_bf16);
     try testing.expectEqualStrings(old, fp_bf16);
 }
@@ -6744,11 +6744,12 @@ test "modelFingerprint: rolls with --config-overrides" {
     try testing.expect(!std.mem.eql(u8, fp_over, fp_ws));
 }
 
-// Bar: a model whose YaRN comes from `model-settings.json` rather than the flag gets a fresh root too, and
-// another model's entry never moves this one's.
-test "modelFingerprint: rolls with a model's config_overrides" {
+// Bar: the YaRN a load got from `model-settings.json` rolls the root just like the flag's. The document is the
+// one the load parsed (`ModelConfig.config_overrides_applied`), never re-read here: an edit landing mid-load must
+// not file this cache under the rope the parse did not use.
+test "modelFingerprint: rolls with the model's own config_overrides" {
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
     const base = try tmpRoot(&tmp, io, &buf);
@@ -6756,49 +6757,26 @@ test "modelFingerprint: rolls with a model's config_overrides" {
     try tmp.dir.writeFile(io, .{ .sub_path = "model-a/config.json", .data = "{\"model_type\":\"x\"}" });
     const dir_a = try std.fmt.allocPrint(testing.allocator, "{s}/model-a", .{base});
     defer testing.allocator.free(dir_a);
-    try tmp.dir.createDirPath(io, ".mlx-serve");
-
-    const home = try testing.allocator.dupeSentinel(u8, base, 0);
-    defer testing.allocator.free(home);
-    const prev = if (env.get(.HOME)) |h| try testing.allocator.dupeSentinel(u8, std.mem.span(h), 0) else null;
-    defer if (prev) |p| {
-        env.set(.HOME, p);
-        testing.allocator.free(p);
-    } else env.unset(.HOME);
-    env.set(.HOME, home);
-
-    // No settings file at all: the root the flag alone (here, none) gives.
-    model.setConfigOverrides(null);
-    const none = try modelFingerprint(testing.allocator, io, dir_a);
-    defer testing.allocator.free(none);
 
     const yarn = "{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":4.0}}}";
-    try writeOverrides(&tmp, io, dir_a, yarn);
-    const fp_yarn = try modelFingerprint(testing.allocator, io, dir_a);
-    defer testing.allocator.free(fp_yarn);
-    const fp_again = try modelFingerprint(testing.allocator, io, dir_a);
-    defer testing.allocator.free(fp_again);
-    try testing.expectEqualStrings(fp_yarn, fp_again);
-    try testing.expect(!std.mem.eql(u8, none, fp_yarn));
+    const none = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(none);
+    const four = try modelFingerprintWithLayout(testing.allocator, io, dir_a, null, yarn);
+    defer testing.allocator.free(four);
+    const four_again = try modelFingerprintWithLayout(testing.allocator, io, dir_a, null, yarn);
+    defer testing.allocator.free(four_again);
+    try testing.expect(!std.mem.eql(u8, none, four));
+    try testing.expectEqualStrings(four, four_again);
 
-    // Another rope factor is another cache; so is another window.
-    try writeOverrides(&tmp, io, dir_a, "{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":2.0}}}");
-    const fp_half = try modelFingerprint(testing.allocator, io, dir_a);
-    defer testing.allocator.free(fp_half);
-    try testing.expect(!std.mem.eql(u8, fp_yarn, fp_half));
-
-    // A file that names no override for this pack leaves the root alone.
-    try tmp.dir.writeFile(io, .{ .sub_path = ".mlx-serve/model-settings.json", .data = "{\"/other\":{\"config_overrides\":{\"a\":1}}}" });
-    const fp_bare = try modelFingerprint(testing.allocator, io, dir_a);
-    defer testing.allocator.free(fp_bare);
-    try testing.expectEqualStrings(none, fp_bare);
-}
-
-/// `model-settings.json` under the test HOME, one entry for `path`.
-fn writeOverrides(tmp: *std.testing.TmpDir, io: std.Io, path: []const u8, ov: []const u8) !void {
-    const file = try std.fmt.allocPrint(testing.allocator, "{{\"{s}\":{{\"config_overrides\":{s}}}}}", .{ path, ov });
-    defer testing.allocator.free(file);
-    try tmp.dir.writeFile(io, .{ .sub_path = ".mlx-serve/model-settings.json", .data = file });
+    // Another factor is another cache; the flag alone still moves the root on its own.
+    const two = try modelFingerprintWithLayout(testing.allocator, io, dir_a, null, "{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":2.0}}}");
+    defer testing.allocator.free(two);
+    try testing.expect(!std.mem.eql(u8, four, two));
+    defer model.setConfigOverrides(null);
+    model.setConfigOverrides(yarn);
+    const by_flag = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(by_flag);
+    try testing.expect(!std.mem.eql(u8, none, by_flag));
 }
 
 test "spec meta json: the v5 head half round-trips and a v4 record parses without one" {

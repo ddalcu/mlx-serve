@@ -523,6 +523,9 @@ fn glmStreamingJson() ![]u8 {
 
 const ling_stream_json = @embedFile("../../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json");
 
+// A plain MLX pack its in-tree plugin parses: root max_position_embeddings 131072.
+const ling_tiny_json = @embedFile("../../../fixtures/model-configs/bailing_hybrid-ling-3.0-tiny-4bit.json");
+
 // Bar: an outside model plugin that asks for the engine's config (`Parsed.engine_config`) over a type the engine
 // parses gets the engine's own config with its binding attached, as an in-tree plugin does: the GLM streaming pack's
 // expert_bank (the trunk renames) and every family field the engine's bills read. Without the ask, or over a type the
@@ -619,12 +622,13 @@ test "plugin config: a pack's config_overrides reach the config its parse reads"
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
     try tmp.dir.createDirPath(io, "pack");
-    try tmp.dir.writeFile(io, .{ .sub_path = "pack/config.json", .data = "{\"text_config\":{\"max_position_embeddings\":262144}}" });
+    // A pack the registry really serves, at its released window (131072).
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/config.json", .data = ling_tiny_json });
     try tmp.dir.createDirPath(io, ".mlx-serve");
 
     const pack_dir = try std.fmt.allocPrint(t, "{s}/pack", .{root});
     defer t.free(pack_dir);
-    const ov = "{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":4},\"max_position_embeddings\":1048576}}";
+    const ov = "{\"max_position_embeddings\":1048576,\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":4}}";
     const file = try std.fmt.allocPrint(t, "{{\"{s}\":{{\"config_overrides\":{s}}}}}", .{ pack_dir, ov });
     defer t.free(file);
     try tmp.dir.writeFile(io, .{ .sub_path = ".mlx-serve/model-settings.json", .data = file });
@@ -638,11 +642,18 @@ test "plugin config: a pack's config_overrides reach the config its parse reads"
     } else env.unset(.HOME);
     env.set(.HOME, home);
 
-    const raw = "{\"text_config\":{\"max_position_embeddings\":262144}}";
-    var pack = model_settings.settingsForPack(t, io, pack_dir);
-    defer pack.deinit(t);
-    const merged = try mergeOverrides(t, raw, pack.config_overrides, null);
-    defer if (merged.ptr != raw.ptr) t.free(merged);
-    try testing.expectEqual(@as(i64, 1048576), try jsonInt(t, merged, &.{ "text_config", "max_position_embeddings" }));
-    try testing.expectEqual(@as(i64, 4), try jsonInt(t, merged, &.{ "text_config", "rope_parameters", "factor" }));
+    // The load's own parse, not a hand-built merge: the merged window is what the engine reads, and the document
+    // rides on the config so the SSD root hashes what this load used.
+    var cfg = try model.parseConfig(io, t, pack_dir);
+    defer cfg.deinit(t);
+    try testing.expectEqual(@as(u32, 1048576), cfg.max_position_embeddings);
+    const applied = cfg.config_overrides_applied orelse return error.TestExpectedStampedDocument;
+    try testing.expectEqualStrings(ov, applied);
+
+    // With nothing set for the pack, its own config stands and nothing is stamped.
+    try tmp.dir.writeFile(io, .{ .sub_path = ".mlx-serve/model-settings.json", .data = "{\"/other\":{\"ctx_size\":1}}" });
+    var bare = try model.parseConfig(io, t, pack_dir);
+    defer bare.deinit(t);
+    try testing.expectEqual(@as(u32, 131072), bare.max_position_embeddings);
+    try testing.expectEqual(@as(?[]const u8, null), bare.config_overrides_applied);
 }
