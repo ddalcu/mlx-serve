@@ -1081,6 +1081,11 @@ fn storeDir(a: Allocator, digest: [32]u8) ?[]const u8 {
 /// cannot be opened. The `enabled` flag is checked first, so every call site is
 /// a single null-check when Recall is off.
 pub fn storeFor(tok: *const Tokenizer) ?*Store {
+    // The record is POSIX by design (flock, append-mode open, 0700 files); a
+    // Windows build has none of it. The comptime gate also prunes the whole
+    // fd layer from the Windows target's analysis (std.c's open/close/write
+    // are Windows-shaped there), so recall compiles as off-with-a-reason.
+    if (builtin.os.tag == .windows) return null;
     if (!shared_state.get().enabled) return null;
     if (tok.recall_vocab == 0) return null; // dummy/test tokenizer: never records
     const digest = tok.recall_identity;
@@ -1154,6 +1159,7 @@ pub fn finishRequest(tok: *const Tokenizer, prompt: []const u32, reply: []const 
 
 /// All open records' stats, for `GET /v1/recall`. Caller frees.
 pub fn allStats(a: Allocator) []Stats {
+    if (builtin.os.tag == .windows) return &[_]Stats{};
     const st_state = shared_state.get();
     st_state.mutex.lock();
     const n = st_state.stores.count();
@@ -1183,6 +1189,7 @@ pub const EmptyRow = struct {
 /// run left). `all_failed` maps to 409 (no record could be emptied); `rows`
 /// is caller-freed.
 pub fn emptyAll(a: Allocator) struct { rows: []EmptyRow, all_failed: bool } {
+    if (builtin.os.tag == .windows) return .{ .rows = &[_]EmptyRow{}, .all_failed = false };
     const st_state = shared_state.get();
     var rows: std.ArrayList(EmptyRow) = .empty;
     defer rows.deinit(a);
