@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
+const pool = @import("../../../mlx/pool.zig");
 const gen_sse = @import("../../../host/media_jobs/sse.zig");
 const media_progress = @import("../../../sdk/media/progress.zig");
 const model_registry_mod = @import("../../../host/registry/registry.zig");
@@ -103,25 +104,8 @@ pub fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
         invalidateDecodeClocks(sch.decoding.items);
         sch.queue_mu.unlock(sch.io);
     }
-    // On small-RAM machines (≤16 GB — mini class; also the phone), bound
-    // MLX's buffer-cache growth DURING the generation: the post-request
-    // clear below can't help mid-loop, and a diffusion denoise + VAE decode
-    // otherwise accumulates GBs of one-off transients against a ~12 GB Metal
-    // working-set ceiling. 1 GB still covers step-to-step buffer reuse.
-    // Never RAISE a tighter existing cap (the iOS boot cap is 384 MB).
-    const small_ram = blk: {
-        const total = status.getTotalMemBytes();
-        break :blk total > 0 and total <= 17 * 1024 * 1024 * 1024;
-    };
-    var prev_cache_limit: usize = 0;
-    if (small_ram) {
-        const cap: usize = 1024 * 1024 * 1024;
-        _ = mlx.mlx_set_cache_limit(&prev_cache_limit, cap);
-        if (prev_cache_limit < cap) {
-            var tmp: usize = 0;
-            _ = mlx.mlx_set_cache_limit(&tmp, prev_cache_limit);
-        }
-    }
+    // Small-RAM Macs bound the pool DURING the generation: the post-request clear below can't help mid-loop.
+    const pool_cap = pool.forMediaJob(status.getTotalMemBytes());
     var prev_mem_limit: usize = 0;
     const gen_mem_limit = genMemoryLimit(mlx.cudaAvailable(), sch.gen_reserve_bytes);
     if (gen_mem_limit) |lim| _ = mlx.mlx_set_memory_limit(&prev_mem_limit, lim);
@@ -130,10 +114,7 @@ pub fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
         var tmp: usize = 0;
         _ = mlx.mlx_set_memory_limit(&tmp, prev_mem_limit);
     }
-    if (small_ram) {
-        var tmp: usize = 0;
-        _ = mlx.mlx_set_cache_limit(&tmp, prev_cache_limit);
-    }
+    pool_cap.restore();
     req.model.gen_busy = false;
     // Return the generation's transients to the OS. MLX parks freed buffers
     // in its allocator cache (RSS stays), and unlike chat decode (which

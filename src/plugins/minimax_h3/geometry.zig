@@ -3,8 +3,12 @@
 
 const std = @import("std");
 const env = @import("../../env.zig");
+const pool_rule = @import("../../sdk/media/pool.zig");
 
 pub const FPS: u32 = 24;
+/// A request's canvas side and `num_frames` when it names none.
+pub const DEFAULT_SIDE: u32 = 256;
+pub const DEFAULT_FRAMES: u32 = 56;
 pub const AUDIO_LATENT_FPS: u32 = 40;
 /// Spatial compression: VAE 16x, then the DiT's 2x2 patch → 32x effective.
 pub const VAE_SPATIAL: u32 = 16;
@@ -13,6 +17,30 @@ pub const PATCH_W: u32 = 2;
 /// The video VAE's ratios (16x spatial, 4x temporal).
 pub const VAE_RATIO: u32 = 16;
 pub const VAE_RATIO_T: u32 = 4;
+/// The video VAE works in 17-frame clips and 256-px spatial tiles; the encoder's widest activation is 128 f32 channels.
+pub const VAE_CLIP: u32 = 17;
+pub const VAE_TILE: u32 = 256;
+const ENC_WIDE_BYTES: u64 = 128 * 4;
+/// Copies of that widest activation one encoder tile pass holds at its peak. A smaller tile holds less, so the full
+/// tile bounds every canvas.
+pub const ENC_PASS_COPIES: u64 = 28;
+
+/// The peak of one encoder tile pass above what the encode already holds.
+pub fn encodePassBytes() u64 {
+    return ENC_PASS_COPIES * VAE_TILE * VAE_TILE * VAE_CLIP * ENC_WIDE_BYTES;
+}
+
+/// The pool an encode runs under: room for what one tile pass frees and the next allocates again, as much of it as
+/// `headroom` holds. MLX hands a cached buffer only to a request of about its size, so that takes twice the pass's peak.
+pub fn encodeLiftBytes(total_ram: u64, headroom: u64) u64 {
+    return pool_rule.liftBytes(2 * encodePassBytes(), total_ram, headroom);
+}
+
+/// The whole-clip f32 copies an encode holds beside its passes: the pixels, the encoder's input and its padded clips.
+pub fn encodeClipBytes(width: u32, height: u32, frames: u32) u64 {
+    const padded: u64 = (@as(u64, frames) + VAE_CLIP - 1) / VAE_CLIP * VAE_CLIP;
+    return 4 * padded * width * height * 3 * 4;
+}
 
 /// Snap UP to the model's 17k+5 grid. 40 -> 56, 200 -> 209, 363 -> 379.
 pub fn alignFrameCount(n: u32) u32 {
@@ -209,3 +237,12 @@ pub const DecCfg = struct {
         return self.out_channels * self.patch_size_t * self.patch_size * self.patch_size;
     }
 };
+
+// ── tests ──
+
+test "h3 encode lift: twice the tile pass where the headroom holds it, less where not, never on a small-RAM Mac" {
+    const GB: u64 = 1 << 30;
+    try std.testing.expectEqual(2 * encodePassBytes(), encodeLiftBytes(36 * GB, 200 * GB));
+    try std.testing.expectEqual(5 * GB, encodeLiftBytes(36 * GB, 5 * GB));
+    try std.testing.expectEqual(@as(u64, 0), encodeLiftBytes(16 * GB, 200 * GB));
+}

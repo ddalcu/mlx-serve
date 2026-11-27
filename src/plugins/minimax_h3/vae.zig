@@ -28,6 +28,7 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../sdk/weights/load.zig");
 const log = @import("../../sdk/util/log.zig");
+const pool = @import("../../mlx/pool.zig");
 const h3 = @import("h3.zig");
 const geometry = @import("geometry.zig");
 pub const DecCfg = geometry.DecCfg;
@@ -39,14 +40,14 @@ const S = mlx.mlx_stream;
 // ── Reference constants (vae.py MiniMaxH3VideoVAE.__init__) ─────────────────
 
 /// Frames folded into one VAE clip. Drives every temporal constant below.
-pub const CLIP_LENGTH: u32 = 17;
+pub const CLIP_LENGTH: u32 = geometry.VAE_CLIP;
 /// Temporal compression (prod of the encoder's time_down factors).
 pub const VAE_RATIO_T = geometry.VAE_RATIO_T;
 /// Spatial compression.
 pub const VAE_RATIO = geometry.VAE_RATIO;
 pub const TOKEN_DROP: u32 = 3;
 /// Spatial tile extent, in PIXELS.
-pub const TILE_SIZE: u32 = 256;
+pub const TILE_SIZE: u32 = geometry.VAE_TILE;
 
 /// (-clip_length) % ratio_t = 3 — frames shaved off the front of each decode.
 pub const FRAME_PRE_PADDING: u32 = (VAE_RATIO_T - (CLIP_LENGTH % VAE_RATIO_T)) % VAE_RATIO_T;
@@ -1466,6 +1467,23 @@ pub const Encoder = struct {
         return self;
     }
 
+    /// Reads and converts every weight now, so a caller can time the load apart from the encode.
+    pub fn materialize(self: *const Encoder) !void {
+        for ([_]mlx.mlx_array{
+            self.conv_in_w,  self.conv_in_b,  self.norm_out_w,   self.norm_out_b,
+            self.conv_out_w, self.conv_out_b, self.quant_wt,     self.quant_b,
+            self.latents_mean, self.latents_std,
+        }) |a2| try mlx.check(mlx.mlx_array_eval(a2));
+        for (&self.levels) |*lv| {
+            for (&lv.blocks) |*bk| {
+                for ([_]mlx.mlx_array{ bk.norm1_w, bk.norm1_b, bk.conv1_w, bk.conv1_b, bk.norm2_w, bk.norm2_b, bk.conv2_w, bk.conv2_b, bk.nin_wt, bk.nin_b }) |a2|
+                    if (a2.ctx != null) try mlx.check(mlx.mlx_array_eval(a2));
+            }
+            if (lv.down_w.ctx != null) try mlx.check(mlx.mlx_array_eval(lv.down_w));
+            if (lv.down_b.ctx != null) try mlx.check(mlx.mlx_array_eval(lv.down_b));
+        }
+    }
+
     pub fn deinit(self: *Encoder) void {
         for ([_]mlx.mlx_array{
             self.conv_in_w,  self.conv_in_b,  self.norm_out_w,   self.norm_out_b,
@@ -1571,8 +1589,8 @@ pub const Encoder = struct {
     /// reference encodes tiled ALWAYS (`tiling=True`), blending MOMENTS at
     /// latent granularity against the RAW neighbours, so parity means doing
     /// the same.
-    pub fn encodeImage(self: *const Encoder, pixels: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
-        return self.encodeVideo(pixels, alloc, s);
+    pub fn encodeImage(self: *const Encoder, pixels: mlx.mlx_array, pool_lift: u64, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+        return self.encodeVideo(pixels, pool_lift, alloc, s);
     }
 
     /// `pixels` [1, 3, T, H, W] f32 in [-1, 1] -> NORMALIZED latents
@@ -1582,8 +1600,11 @@ pub const Encoder = struct {
     /// video, encoded in 17-FRAME CLIPS with the tail repeat-padded and the
     /// last `TOKEN_DROP` latent frames discarded. `videoLatentT` is the same
     /// ladder read from the other end, so a caller that snapped its frame
-    /// count to 17k+5 gets exactly `5k+2` latent frames back.
-    pub fn encodeVideo(self: *const Encoder, pixels: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+    /// count to 17k+5 gets exactly `5k+2` latent frames back. MLX's pool is
+    /// lifted to `pool_lift` while it runs (`config.plan` sizes it).
+    pub fn encodeVideo(self: *const Encoder, pixels: mlx.mlx_array, pool_lift: u64, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+        const lift = pool.Cap.raise(pool_lift);
+        defer lift.restore();
         const pshp = mlx.getShape(pixels);
         const pt: u32 = @intCast(pshp[2]);
         const ph: u32 = @intCast(pshp[3]);
@@ -1784,6 +1805,48 @@ pub const Encoder = struct {
     }
 };
 
+test "minimax h3 vae: a real encode stays within the billed pass and clip" {
+    // Bar: the active peak of the real encoder over full 256-px tiles stays under `encodePassBytes` + `encodeClipBytes`.
+    const raw_model = std.c.getenv("MINIMAX_H3_MODEL") orelse return error.SkipZigTest;
+    const model_dir = std.mem.sliceTo(raw_model, 0);
+    if (model_dir.len == 0 or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const vae_path = try std.fmt.allocPrint(a, "{s}/video_vae.safetensors", .{model_dir});
+    defer a.free(vae_path);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (std.Io.Dir.openFileAbsolute(io, vae_path, .{})) |f| f.close(io) else |_| return error.SkipZigTest;
+    var vw = try model_mod.loadWeightsSingleFile(a, vae_path);
+    defer vw.deinit();
+    var enc = try Encoder.load(a, &vw, s);
+    defer enc.deinit();
+    try enc.materialize();
+    const t: u32 = 22;
+    const h: u32 = 512;
+    const w: u32 = 768;
+    const shp = [_]c_int{ 1, 3, t, h, w };
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 7));
+    const lo = mlx.mlx_array_new_float(-1.0);
+    defer _ = mlx.mlx_array_free(lo);
+    const hi = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(hi);
+    var px = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(px);
+    try mlx.check(mlx.mlx_random_uniform(&px, lo, hi, &shp, shp.len, mlx.mlx_dtype.float32, key, s));
+    try mlx.check(mlx.mlx_array_eval(px));
+    _ = mlx.mlx_clear_cache();
+    var start: usize = 0;
+    _ = mlx.mlx_get_active_memory(&start);
+    _ = mlx.mlx_reset_peak_memory();
+    const lat = try enc.encodeVideo(px, 0, a, s);
+    _ = mlx.mlx_array_free(lat);
+    var peak: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&peak);
+    try testing.expect(peak - start <= geometry.encodePassBytes() + geometry.encodeClipBytes(w, h, t));
+}
+
 test "minimax h3 vae: encoder geometry ladder matches the reference config" {
     // block_in = [mid[0]] ++ mid[:-1]; mid = ch * ch_mult.
     const want_in = [_]u32{ 128, 128, 256, 256, 512, 512 };
@@ -1844,7 +1907,7 @@ test "minimax h3 vae live: encoder parity vs the executed reference" {
         defer _ = mlx.mlx_array_free(x);
         const want = try ownWeight(&fx, pair[1]);
         defer _ = mlx.mlx_array_free(want);
-        const got = try enc.encodeVideo(x, a, s);
+        const got = try enc.encodeVideo(x, 0, a, s);
         defer _ = mlx.mlx_array_free(got);
         // Shape first: a temporal ladder that is one token off still scores a
         // high cosine on the overlapping rows, and cosineSimV would compare
@@ -1951,7 +2014,7 @@ test "minimax h3 vae live: encode->decode round trip preserves orientation" {
     const img = mlx.mlx_array_new_data(buf.ptr, &shape5, 5, mlx.mlx_dtype.float32);
     defer _ = mlx.mlx_array_free(img);
 
-    const lat = try enc.encodeImage(img, a, s);
+    const lat = try enc.encodeImage(img, 0, a, s);
     defer _ = mlx.mlx_array_free(lat);
     const pixels = try decode(&dec, lat, a, s);
     defer _ = mlx.mlx_array_free(pixels);
@@ -2034,7 +2097,7 @@ test "minimax h3 vae live: the Latent2RGB preview resembles the decoded frame" {
     const img = mlx.mlx_array_new_data(buf.ptr, &shape5, 5, mlx.mlx_dtype.float32);
     defer _ = mlx.mlx_array_free(img);
 
-    const lat = try enc.encodeImage(img, a, s);
+    const lat = try enc.encodeImage(img, 0, a, s);
     defer _ = mlx.mlx_array_free(lat);
     const latf = try astype(lat, mlx.mlx_dtype.float32, s);
     defer _ = mlx.mlx_array_free(latf);

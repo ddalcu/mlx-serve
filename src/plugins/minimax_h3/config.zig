@@ -171,13 +171,120 @@ pub fn billLoad(dir: *const abi.PackDir, m: *const abi.Machine) callconv(.c) u64
     return peakBytes(dir.fileBytes("text_encoder.safetensors"), dit, dir.fileBytes("video_vae.safetensors"), dir.fileBytes("audio_vae.safetensors"));
 }
 
-/// No reserve beyond the model's own estimate (legacy set none): the step itself refuses a canvas that does not fit,
-/// by name, against live memory (`canvasBill`).
+/// What a video VAE encode holds beside the VAE and its lifted pool: one tile pass, and the clip's own copies for an
+/// init_video clip (keyframes and references are small beside a pass).
+pub fn encodeHeldBytes(width: u32, height: u32, frames: u32) u64 {
+    return h3.encodePassBytes() + h3.encodeClipBytes(width, height, frames);
+}
+
+/// The pool an encode may lift to inside a plan that has `room` and holds `held` beside the lift, never past `billed`.
+pub fn encodeLift(billed: u64, total_ram: u64, room: u64, held: u64) u64 {
+    return @min(billed, h3.encodeLiftBytes(total_ram, room -| held));
+}
+
+/// The lift a request is billed for: what the staged encode stage (the video VAE and `held`) leaves of the memory
+/// the engine saw free at load, less the margin kept for everything else. The step lifts at most this, so the bill
+/// covers the pool the encode runs under.
+pub fn billedEncodeLift(video_vae: u64, held: u64, m: *const abi.Machine) u64 {
+    const room = availBytes(m.ram_available, m.gpu_working_set, 0) -| residentMargin(m.ram_total);
+    return encodeLift(std.math.maxInt(u64), m.ram_total, room, video_vae + held);
+}
+
+/// A request with `init_video` reserves its encode stage too: the video VAE (its file bills the f32 encoder, which
+/// is smaller), one pass, the clip and the billed lift. Any other request reserves the load's peak (0 here); the step
+/// refuses a request that does not fit against live memory, by name (`plan`).
 pub fn billRequest(dir: *const abi.PackDir, m: *const abi.Machine, body: abi.Str) callconv(.c) u64 {
-    _ = dir;
-    _ = m;
-    _ = body;
-    return 0;
+    const c = initCanvas(body.slice()) orelse return 0;
+    const held = encodeHeldBytes(c.width, c.height, h3.temporalShape(c.frames).frame_count);
+    const vae = dir.fileBytes("video_vae.safetensors");
+    return @max(billLoad(dir, m), vae + held + billedEncodeLift(vae, held, m));
+}
+
+/// The pack's file sizes a plan prices.
+pub const PackSizes = struct { te: u64, dit_file: u64, video_vae: u64, audio_vae: u64, turbo_lora: u64 };
+
+pub const PlanIn = struct {
+    sizes: PackSizes,
+    /// The DiT term of the staged plan: AdaLN precompute on (not a two-time pack), the Turbo LoRA in use.
+    precompute: bool,
+    turbo: bool,
+    /// Residency is allowed (`residentEnabled`, no `--ane-video`), and what the cache holds now.
+    may_keep: bool,
+    cache_now: u64,
+    host_avail: u64,
+    total_ram: u64,
+    gpu_limit: u64,
+    gpu_active: u64,
+    weights_page: bool,
+    activations: u64,
+    /// What the request's encodes hold beside the lift (`encodeHeldBytes`); `init` when one is the init_video clip.
+    encode_held: u64,
+    init: bool,
+    billed_lift: u64,
+};
+
+pub const Plan = struct {
+    /// The resident set's bytes, or null for the staged plan.
+    resident: ?u64 = null,
+    /// The pool the encodes run under.
+    lift: u64 = 0,
+    refused: ?struct { what: enum { encode, canvas }, need: u64, avail: u64, dit: u64 = 0 } = null,
+};
+
+/// A request's memory plan before any stage loads (a Metal OOM mid-step is uncatchable): resident while the whole set,
+/// the request and a margin fit; else staged, refused by name when its encode or DiT stage does not fit. The encode's
+/// lift then takes what the plan leaves of live free memory less that margin, never past the billed lift.
+pub fn plan(in: PlanIn) Plan {
+    const sz = in.sizes;
+    const avail = availBytes(in.host_avail, in.gpu_limit, in.gpu_active);
+    const init_held = if (in.init) in.encode_held else 0;
+    const need = residentBytes(sz.te, sz.dit_file, sz.video_vae + sz.audio_vae, sz.turbo_lora, @max(in.activations, init_held));
+    const margin = residentMargin(in.total_ram);
+    if (in.may_keep and keepResident(avail, in.cache_now, need, margin)) {
+        const set = need - @max(in.activations, init_held);
+        const lift = encodeLift(in.billed_lift, in.total_ram, (avail +| in.cache_now) -| margin, set + in.encode_held);
+        // What the cache holds afterwards: the weights and the request's activations. The clip's f32 copies and the
+        // encode's lift are freed when the request ends, so counting them would let the next request keep the set
+        // on room that is not there.
+        return .{ .resident = set + in.activations, .lift = lift };
+    }
+    if (in.init and avail > 0 and sz.video_vae + in.encode_held > avail)
+        return .{ .refused = .{ .what = .encode, .need = sz.video_vae + in.encode_held, .avail = avail } };
+    const dit = ditResidentBytes(sz.dit_file, in.precompute) + (if (in.turbo) sz.turbo_lora else 0);
+    const bill = canvasBill(dit, in.activations, in.host_avail, in.gpu_limit, in.gpu_active, in.weights_page);
+    if (dit > 0 and bill.avail > 0 and bill.need > bill.avail)
+        return .{ .refused = .{ .what = .canvas, .need = bill.need, .avail = bill.avail, .dit = dit } };
+    return .{ .lift = encodeLift(in.billed_lift, in.total_ram, avail -| margin, sz.video_vae + in.encode_held) };
+}
+
+const InitCanvas = struct { width: u32 = h3.DEFAULT_SIDE, height: u32 = h3.DEFAULT_SIDE, frames: u32 = h3.DEFAULT_FRAMES };
+
+/// The canvas of a body that carries `init_video`, read without copying its frames; null without one.
+fn initCanvas(body: []const u8) ?InitCanvas {
+    var stack: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&stack);
+    var sc = std.json.Scanner.initCompleteInput(fba.allocator(), body);
+    if ((sc.next() catch return null) != .object_begin) return null;
+    var c: InitCanvas = .{};
+    var has_init = false;
+    while (true) {
+        const key = switch (sc.next() catch return null) {
+            .string => |k| k,
+            else => break,
+        };
+        const field: ?*u32 = if (std.mem.eql(u8, key, "width")) &c.width else if (std.mem.eql(u8, key, "height")) &c.height else if (std.mem.eql(u8, key, "num_frames")) &c.frames else null;
+        if (field) |f| {
+            switch (sc.next() catch return null) {
+                .number => |n| f.* = std.fmt.parseInt(u32, n, 10) catch f.*,
+                .array_begin, .object_begin => return null,
+                else => {},
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, key, "init_video")) has_init = (sc.peekNextTokenType() catch return null) != .null;
+        sc.skipValue() catch return null;
+    }
+    return if (has_init) c else null;
 }
 
 test "h3 staged-residency peak bills the BIGGEST stage, never a sum of disjoint ones" {
@@ -345,4 +452,120 @@ test "h3 two-time packs: the schedule and gate come from config.json; a grid tha
         "{\"two_time\":{\"gate\":0.25,\"default_steps\":4294967298,\"sigma_grids\":{\"2\":[1.0,0.4,0.0]}}}",
         "{\"pdd_steps\":32,\"pdd_step_indices\":[0,32],\"grid_max_t\":0.999,\"two_time\":{\"gate\":0.25,\"default_steps\":2,\"sigma_grids\":{\"2\":[1.0,0.4,0.0]}}}",
     }) |bad| try std.testing.expectError(error.BadPackConfig, geometry(a, bad));
+}
+
+test "h3 init_video bill: a request with a clip reserves its encode stage and the lift its headroom holds" {
+    const GB: u64 = 1 << 30;
+    const mem: @import("../../sdk/testing/fixture.zig").MemDir = .{ .files = &.{.{ .name = "video_vae.safetensors", .bytes = "12345678" }} };
+    const d = mem.packDir();
+    const body = "{\"prompt\":\"a \\\"b\\\"\",\"width\":1344,\"height\":768,\"num_frames\":124,\"init_video\":{\"frames\":[\"iVBO\\/R\",\"x\"],\"audio\":\"UklG\"},\"init_step\":3}";
+    const held = encodeHeldBytes(1344, 768, 124);
+    // Room for the whole lift, for part of it (64 GB, 56 GB free, less the 10 GB margin), and for none of it.
+    try std.testing.expectEqual(8 + held + 2 * h3.encodePassBytes(), billRequest(&d, &.{ .ram_total = 256 * GB, .ram_available = 240 * GB }, .of(body)));
+    try std.testing.expectEqual(8 + held + (46 * GB - 8 - held), billRequest(&d, &.{ .ram_total = 64 * GB, .ram_available = 56 * GB }, .of(body)));
+    try std.testing.expectEqual(8 + held, billRequest(&d, &.{ .ram_total = 36 * GB, .ram_available = 30 * GB }, .of(body)));
+    // The GPU working set bounds the room like live RAM does.
+    try std.testing.expectEqual(8 + held + (46 * GB - 8 - held), billRequest(&d, &.{ .ram_total = 64 * GB, .ram_available = 60 * GB, .gpu_working_set = 56 * GB }, .of(body)));
+    // A small-RAM Mac, or RAM the host could not read, bills no pool lift: it never gets one.
+    try std.testing.expectEqual(8 + held, billRequest(&d, &.{ .ram_total = 16 * GB, .ram_available = 15 * GB }, .of(body)));
+    try std.testing.expectEqual(8 + held, billRequest(&d, &.{ .ram_total = 256 * GB }, .of(body)));
+    const default_held = encodeHeldBytes(h3.DEFAULT_SIDE, h3.DEFAULT_SIDE, h3.DEFAULT_FRAMES);
+    try std.testing.expectEqual(8 + default_held + 2 * h3.encodePassBytes(), billRequest(&d, &.{ .ram_total = 256 * GB, .ram_available = 240 * GB }, .of("{\"init_video\":{\"frames\":[]}}")));
+    try std.testing.expectEqual(@as(u64, 0), billRequest(&d, &.{ .ram_total = 256 * GB, .ram_available = 240 * GB }, .of("{\"width\":1344,\"init_video\":null}")));
+    try std.testing.expectEqual(@as(u64, 0), billRequest(&d, &.{ .ram_total = 256 * GB, .ram_available = 240 * GB }, .of("{\"width\":1344,\"height\":768}")));
+}
+
+test "h3 init_video encode stage outweighs a small canvas's DiT stage and stays above the measured peak" {
+    const GB: u64 = 1 << 30;
+    // The HyperFlow Flash REF2VA 8-bit pack: a two-time DiT keeps its whole file and runs no attention cache.
+    const vae: u64 = 5_207_808_496;
+    const dit = ditResidentBytes(14_971_410_087, false);
+    try std.testing.expect(vae + encodeHeldBytes(256, 256, 22) > dit + activationBytes(requestRows(256, 256, 22, 0), 0));
+    // A real 1344x768 x 124 encode on a 256 GB Mac: 1.0 GB of f32 encoder, then 36.3 GB more process footprint.
+    const held = encodeHeldBytes(1344, 768, 124);
+    try std.testing.expect(vae + held + billedEncodeLift(vae, held, &.{ .ram_total = 256 * GB, .ram_available = 240 * GB }) > 37 * GB + 300 * (GB >> 10));
+}
+
+/// The HyperFlow Flash REF2VA 8-bit pack's files.
+const flash8: PackSizes = .{ .te = 16_460_999_117, .dit_file = 14_971_410_087, .video_vae = 5_207_808_496, .audio_vae = 605_254_808, .turbo_lora = 0 };
+
+fn flashPlan(total: u64, free: u64, cache_now: u64, w: u32, h: u32, frames: u32, init: bool) struct { p: Plan, in: PlanIn, billed: u64, held: u64 } {
+    const held = if (init) encodeHeldBytes(w, h, frames) else h3.encodePassBytes();
+    const billed = billedEncodeLift(flash8.video_vae, held, &.{ .ram_total = total, .ram_available = free });
+    const in: PlanIn = .{
+        .sizes = flash8,
+        .precompute = false,
+        .turbo = false,
+        .may_keep = true,
+        .cache_now = cache_now,
+        .host_avail = free,
+        .total_ram = total,
+        .gpu_limit = 0,
+        .gpu_active = 0,
+        .weights_page = false,
+        .activations = activationBytes(requestRows(w, h, frames, 0), 0),
+        .encode_held = held,
+        .init = init,
+        .billed_lift = billed,
+    };
+    return .{ .held = held, .billed = billed, .in = in, .p = plan(in) };
+}
+
+test "h3 plan: the encode lifts into what the plan leaves of free memory less the margin, never past its bill" {
+    const GB: u64 = 1 << 30;
+    for ([_]u64{ 36, 48, 64, 96, 128, 256 }) |t| for ([_]u64{ 4, 8, 16, 32 }) |used| for ([_]u64{ 0, 1 }) |warm| {
+        if (used >= t) continue;
+        const total = t * GB;
+        const free = total - used * GB;
+        const r = flashPlan(total, free, 0, 1344, 768, 124, true);
+        const warm_cache = if (warm == 1) (r.p.resident orelse continue) else 0;
+        const q = flashPlan(total, free - warm_cache, warm_cache, 1344, 768, 124, true);
+        try std.testing.expect(q.p.lift <= q.billed);
+        try std.testing.expect(q.p.lift <= 2 * h3.encodePassBytes());
+        const margin = residentMargin(total);
+        if (q.p.refused) |f| {
+            try std.testing.expect(f.what != .encode or flash8.video_vae + q.held > free - warm_cache);
+        } else if (q.p.resident) |bytes| {
+            try std.testing.expect(bytes <= free -| margin);
+        } else if (q.p.lift > 0) {
+            try std.testing.expect(flash8.video_vae + q.held + q.p.lift + margin <= free);
+        }
+    };
+}
+
+test "h3 plan: the resident set's bytes leave out the init clip and the encode lift" {
+    const GB: u64 = 1 << 30;
+    // 256 GB Mac, nothing else running: resident either way, and the init request really gets a lift.
+    const plain = flashPlan(256 * GB, 240 * GB, 0, 1344, 768, 124, false);
+    const clip = flashPlan(256 * GB, 240 * GB, 0, 1344, 768, 124, true);
+    try std.testing.expect(plain.p.resident != null and clip.p.resident != null);
+    try std.testing.expect(clip.p.lift > 0);
+    // The cache keeps weights + activations after either request; the clip and the lift are gone by then.
+    try std.testing.expectEqual(plain.p.resident.?, clip.p.resident.?);
+    try std.testing.expectEqual(residentBytes(flash8.te, flash8.dit_file, flash8.video_vae + flash8.audio_vae, 0, clip.in.activations), clip.p.resident.?);
+}
+
+test "h3 plan: other apps' memory shrinks the lift, and an encode that cannot fit even unlifted is refused" {
+    const GB: u64 = 1 << 30;
+    // 64 GB Mac, 768x768 x 124, staged (the resident set does not fit): room past the stage and the margin.
+    const idle = flashPlan(64 * GB, 60 * GB, 0, 768, 768, 124, true);
+    const busy = flashPlan(64 * GB, 44 * GB, 0, 768, 768, 124, true);
+    try std.testing.expect(idle.p.resident == null and busy.p.resident == null);
+    try std.testing.expectEqual(60 * GB - 10 * GB - flash8.video_vae - idle.held, idle.p.lift);
+    try std.testing.expectEqual(44 * GB - 10 * GB - flash8.video_vae - busy.held, busy.p.lift);
+    // With the margin gone, no lift; the encode still runs while its stage fits.
+    const tight = flashPlan(64 * GB, flash8.video_vae + idle.held + 5 * GB, 0, 768, 768, 124, true);
+    try std.testing.expect(tight.p.refused == null);
+    try std.testing.expectEqual(@as(u64, 0), tight.p.lift);
+    const none = flashPlan(64 * GB, flash8.video_vae + idle.held - 1, 0, 768, 768, 124, true);
+    try std.testing.expect(none.p.refused.?.what == .encode);
+    try std.testing.expectEqual(flash8.video_vae + idle.held, none.p.refused.?.need);
+    // Memory freed since load never lifts past what the request was billed for.
+    const late = flashPlan(64 * GB, 60 * GB, 0, 768, 768, 124, true);
+    try std.testing.expect(late.p.lift > busy.billed);
+    var in = late.in;
+    in.billed_lift = busy.billed;
+    try std.testing.expectEqual(busy.billed, plan(in).lift);
+    // Without init_video the same memory refuses nothing on the encode's account.
+    try std.testing.expect(flashPlan(64 * GB, flash8.video_vae + idle.held - 1, 0, 768, 768, 124, false).p.refused == null);
 }
