@@ -204,6 +204,7 @@ pub const MemoryPreset = struct { name: []const u8, ram_gib: u32 };
 pub const preset_reserve_gib: u32 = 16;
 /// The one table of presets: the usage text and the parser both read it.
 pub const memory_presets = [_]MemoryPreset{
+    .{ .name = "m5-96", .ram_gib = 96 },
     .{ .name = "m5-128", .ram_gib = 128 },
     .{ .name = "m5-256", .ram_gib = 256 },
 };
@@ -226,7 +227,7 @@ pub fn ceilingFlag(gib: ?u64, preset: ?u64) error{BothCeilingFlags}!?struct { by
     return null;
 }
 
-/// The presets as the usage text lists them: `m5-128 (112 GiB), m5-256 (240 GiB)`.
+/// The presets as the usage text lists them: `m5-96 (80 GiB), m5-128 (112 GiB), m5-256 (240 GiB)`.
 pub const memory_preset_list: []const u8 = blk: {
     var s: []const u8 = "";
     for (memory_presets, 0..) |p, i| s = s ++ (if (i > 0) ", " else "") ++ p.name ++ std.fmt.comptimePrint(" ({d} GiB)", .{presetCeilingGib(p)});
@@ -382,17 +383,18 @@ test "parseGpuCeilingGib takes whole GiB in range and names a bad value" {
         try t.expectError(error.InvalidGpuCeiling, parseGpuCeilingGib(bad));
 }
 
-test "memory presets are the Mac's RAM less 16 GiB: m5-256 = 240 GiB, m5-128 = 112 GiB" {
+test "memory presets are the Mac's RAM less 16 GiB: m5-256 = 240 GiB, m5-128 = 112 GiB, m5-96 = 80 GiB" {
     const t = std.testing;
     try t.expectEqual(@as(u64, 240) << 30, try parseMemoryPreset("m5-256"));
     try t.expectEqual(@as(u64, 112) << 30, try parseMemoryPreset("m5-128"));
+    try t.expectEqual(@as(u64, 80) << 30, try parseMemoryPreset("m5-96"));
     try t.expectError(error.UnknownMemoryPreset, parseMemoryPreset("m5-512"));
     try t.expectError(error.UnknownMemoryPreset, parseMemoryPreset("M5-256"));
     for (memory_presets) |p| {
         var buf: [8]u8 = undefined;
         try t.expectEqual(try parseGpuCeilingGib(try std.fmt.bufPrint(&buf, "{d}", .{presetCeilingGib(p)})), try parseMemoryPreset(p.name));
     }
-    try t.expectEqualStrings("m5-128 (112 GiB), m5-256 (240 GiB)", memory_preset_list);
+    try t.expectEqualStrings("m5-96 (80 GiB), m5-128 (112 GiB), m5-256 (240 GiB)", memory_preset_list);
 }
 
 test "the ceiling flags: either one sets the ceiling, both is refused, neither keeps the machine's" {
