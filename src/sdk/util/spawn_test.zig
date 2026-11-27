@@ -34,6 +34,24 @@ fn eofWithin(fd: std.c.fd_t, ms: i64) bool {
     }
 }
 
+/// Reads `fd` into `buf` until end-of-file, a full buffer or `ms`; the bytes read.
+fn readAll(fd: std.c.fd_t, buf: []u8, ms: i64) usize {
+    var len: usize = 0;
+    const deadline = nowMs() + ms;
+    while (len < buf.len) {
+        const left = deadline - nowMs();
+        if (left <= 0) break;
+        var pfd = [1]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+        const ready = std.c.poll(&pfd, 1, @intCast(left));
+        if (ready < 0) continue;
+        if (ready == 0) break;
+        const n = std.c.read(fd, buf[len..].ptr, buf.len - len);
+        if (n <= 0) break;
+        len += @intCast(n);
+    }
+    return len;
+}
+
 /// A child that lives long and names no descriptor of its own: stdio all on /dev/null.
 fn spawnHolder(io: Io) !std.process.Child {
     return std.process.spawn(io, .{ .argv = &.{ "/bin/sleep", "60" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
@@ -66,27 +84,35 @@ test "spawn: a child keeps inherited stdio and the descriptors in inherit_files"
     defer _ = std.c.close(fds[0]);
     _ = std.c.fcntl(fds[0], std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
     _ = std.c.fcntl(fds[1], std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
-    var script_buf: [128]u8 = undefined;
-    // `exec 9<&0` fails when the child has no stdin; the echo then goes to the inherited descriptor by its number.
-    const script = try std.fmt.bufPrint(&script_buf, "exec 9<&0 && echo stdin-open >&{d}", .{fds[1]});
-    const out: Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+    // The write end at its own number and again at 20 or above (two-digit descriptors too).
+    const high = std.c.fcntl(fds[1], std.c.F.DUPFD_CLOEXEC, @as(c_int, 20));
+    try testing.expect(high >= 20);
+    var script_buf: [160]u8 = undefined;
+    // Opens no descriptor of its own, so it cannot shadow an inherited one: fails without stdin or without either end.
+    const script = try std.fmt.bufPrint(&script_buf, "[ -e /dev/fd/0 ] && echo a >&{d} && echo b >&{d}", .{ fds[1], high });
+    const ends = [_]Io.File{ .{ .handle = fds[1], .flags = .{ .nonblocking = false } }, .{ .handle = high, .flags = .{ .nonblocking = false } } };
     var child = std.process.spawn(io, .{
         .argv = &.{ "/bin/sh", "-c", script },
         .stdin = .inherit,
         .stdout = .ignore,
-        .stderr = .ignore,
-        .inherit_files = &.{out},
+        .stderr = .pipe,
+        .inherit_files = &ends,
     }) catch |e| {
         _ = std.c.close(fds[1]);
+        _ = std.c.close(high);
         return e;
     };
     _ = std.c.close(fds[1]);
+    _ = std.c.close(high);
+    var err_buf: [512]u8 = undefined;
+    const err_len = readAll(child.stderr.?.handle, &err_buf, 2000);
     const term = try child.wait(io);
-    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
     var buf: [64]u8 = undefined;
-    const n = std.c.read(fds[0], &buf, buf.len);
-    try testing.expect(n > 0);
-    try testing.expectEqualStrings("stdin-open\n", buf[0..@intCast(n)]);
+    const n = readAll(fds[0], &buf, 2000);
+    if (!std.meta.eql(term, std.process.Child.Term{ .exited = 0 }) or !std.mem.eql(u8, "a\nb\n", buf[0..n])) {
+        std.debug.print("spawn inherit: descriptors {d} and {d}, {any}, read \"{s}\", child stderr: {s}\n", .{ fds[1], high, term, buf[0..n], err_buf[0..err_len] });
+        return error.TestUnexpectedResult;
+    }
 }
 
 test "spawn: beside children spawned at the same time that live on, a child's stdout ends when it exits" {
