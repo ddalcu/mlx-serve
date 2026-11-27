@@ -8,8 +8,9 @@ const log = @import("../util/log.zig");
 /// keeps every sibling it passes through, exactly like vLLM's
 /// `_apply_dict_overrides` — and anything else replaces. The whole merge lives
 /// in an arena that dies before this returns; only the re-serialized bytes (in
-/// `allocator`) escape.
-pub fn mergeConfigJson(allocator: std.mem.Allocator, base: []const u8, overrides: []const u8) ![]const u8 {
+/// `allocator`) escape. `layer` names where the overrides came from, so a
+/// refusal points at the setting the reader can actually edit.
+pub fn mergeConfigJson(allocator: std.mem.Allocator, base: []const u8, overrides: []const u8, layer: []const u8) ![]const u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -17,7 +18,7 @@ pub fn mergeConfigJson(allocator: std.mem.Allocator, base: []const u8, overrides
     const src = try std.json.parseFromSliceLeaky(std.json.Value, a, overrides, .{});
     if (dst != .object or src != .object) return error.ConfigOverridesMustBeObject;
     if (src.object.contains("qwen4_norm_convention")) {
-        log.err("[qwen4] qwen4_norm_convention cannot be set through server-wide --config-overrides; remove that override and use a checkpoint-local config.json marker.\n", .{});
+        log.err("[qwen4] qwen4_norm_convention cannot be set through {s}; remove that override and use a checkpoint-local config.json marker.\n", .{layer});
         return error.GlobalQwen4NormOverride;
     }
     try mergeObjects(a, &dst.object, src.object);

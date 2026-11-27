@@ -266,7 +266,7 @@ pub fn parse(table: *const abi.ModelTable, dir: []const u8, config_json: []const
     const pd = fs.packDir();
     const bind = try a.create(plugin_config.Binding);
     bind.* = .{ .table = table };
-    const json = try plugin_config.withOverrides(a, config_json);
+    const json = try plugin_config.mergeOverrides(a, config_json, null, model.getConfigOverrides());
     defer if (json.ptr != config_json.ptr) a.free(json);
     const v = table.parse(&pd, abi.Str.of(json), .{}, null, false, &bind.parsed);
     if (!v.isOk()) {

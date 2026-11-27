@@ -12,6 +12,7 @@ const exl3 = @import("../quant/exl3/format.zig");
 const sushi_pack = @import("../../engines/mlx/load/sushi_adapt.zig");
 const modelopt_pack = @import("../quant/nvfp4/modelopt_pack.zig");
 const model_discovery = @import("../../host/registry/discovery.zig");
+const model_settings = @import("../../host/registry/model_settings.zig");
 const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
 const transcription = @import("../../host/api/audio/transcription.zig");
 const qwen4_exp = @import("../../plugins/qwen4_exp/qwen4_exp.zig");
@@ -1734,14 +1735,22 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     const content = try json_text.quoteInfinity(allocator, raw);
     defer allocator.free(content);
 
+    // The pack's per-model `config_overrides` land before both parses, so the window the plugin's rope builds, the
+    // window the engine bills and the window the row advertises are one window. The launch's `--config-overrides`
+    // is merged by the two parses below and wins a key both layers name.
+    const per_model = model_settings.configOverridesFor(allocator, io, model_dir);
+    defer if (per_model) |p| allocator.free(p);
+    const scoped = try plugin_config.mergeOverrides(allocator, content, per_model, null);
+    defer if (scoped.ptr != content.ptr) allocator.free(scoped);
+
     // A served pack's engine config is the legacy parse with the plugin's binding attached, so every engine read
     // (bills, cache sizing, batching, sampling and thinking defaults) stays as it was; the plugin's facts alone
     // only for a type the legacy parse cannot read. An outside plugin's binding takes the legacy parse only when its
     // parse asks for it (`Parsed.engine_config`); otherwise its facts alone.
-    const binding = if (served) try plugin_config.bindServed(io, allocator, model_dir, content) else null;
+    const binding = if (served) try plugin_config.bindServed(io, allocator, model_dir, scoped) else null;
     errdefer if (binding) |b| b.destroy(allocator);
     if (binding) |b| if (b.outside and !b.parsed.wantsEngineConfig()) return plugin_config.adapted(b);
-    var config = parseConfigFromJson(allocator, content) catch |e| {
+    var config = parseConfigFromJson(allocator, scoped) catch |e| {
         const b = binding orelse return e;
         log.info("[plugin] {s}: the legacy parse refused {s} ({s}); the engine config is the plugin's facts\n", .{ b.table.name.slice(), b.parsed.shell.model_type.slice(), @errorName(e) });
         return plugin_config.adapted(b);
@@ -1755,7 +1764,7 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     errdefer config.deinit(allocator);
     if (config.isDsv41()) config.pack_dir = try allocator.dupe(u8, model_dir);
     // Its outside plugin reads no vision tower.
-    if (config.isGlm5() and declaresExpertStreaming(allocator, content)) {
+    if (config.isGlm5() and declaresExpertStreaming(allocator, scoped)) {
         config.expert_bank = true;
         config.has_vision = false;
     }
@@ -2437,7 +2446,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     // load, discovery stubs), so the advertised context and the loaded model
     // can never disagree about what window the checkpoint has.
     const merged: ?[]const u8 = if (modelCli().config_overrides) |ov| blk: {
-        break :blk try mergeConfigJson(allocator, content, ov);
+        break :blk try mergeConfigJson(allocator, content, ov, "server-wide --config-overrides");
     } else null;
     defer if (merged) |m| allocator.free(m);
 

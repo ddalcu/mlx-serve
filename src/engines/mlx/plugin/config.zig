@@ -10,6 +10,7 @@ const registry = @import("../../../plugins/registry.zig");
 const served = @import("served.zig");
 const model = @import("../../../sdk/config/model.zig");
 const log = @import("../../../sdk/util/log.zig");
+const env = @import("../../../env.zig");
 const FsPackDir = @import("../../../host/registry/pack_dir.zig").FsPackDir;
 const intree = @import("intree.zig");
 const outside = @import("../../../host/plugins/loader.zig");
@@ -128,12 +129,14 @@ pub fn bindTableWith(io: std.Io, a: std.mem.Allocator, dir: []const u8, table: *
     defer a.free(buf);
     var why: abi.Verdict = .{};
     const raw = pd.readFile("config.json", buf, &why) orelse return error.ConfigUnreadable;
-    const cfg = try model.mergeConfigJson(a, raw, overrides);
+    const cfg = try model.mergeConfigJson(a, raw, overrides, "a trunk override");
     defer a.free(cfg);
     const b = try a.create(Binding);
     b.* = .{ .table = table };
+    var pack = model_settings.settingsForPack(a, io, dir);
+    defer pack.deinit(a);
     var settings: [48]u8 = undefined;
-    if (!table.parse(&pd, .of(cfg), .of(parseSettings(a, io, &settings, dir)), null, false, &b.parsed).isOk()) {
+    if (!table.parse(&pd, .of(cfg), .of(parseSettings(&pack, &settings)), null, false, &b.parsed).isOk()) {
         a.destroy(b);
         return null;
     }
@@ -141,24 +144,32 @@ pub fn bindTableWith(io: std.Io, a: std.mem.Allocator, dir: []const u8, table: *
     return b;
 }
 
-/// The settings a plugin's parse reads: the pack's per-model `stream_experts`, which decides the caps of a pack that
+/// The `settings_json` a plugin's parse reads: the pack's `stream_experts`, which decides the caps of a pack that
 /// can stream (`buf` holds the text).
-fn parseSettings(a: std.mem.Allocator, io: std.Io, buf: []u8, model_dir: []const u8) []const u8 {
-    var path: [std.fs.max_path_bytes]u8 = undefined;
-    var s = model_settings.load(a, io, model_settings.defaultPath(&path));
-    defer s.deinit();
-    var o = model_settings.lookupPack(&s, a, io, model_dir);
-    defer o.deinit(a);
+fn parseSettings(o: *const model_settings.Override, buf: []u8) []const u8 {
     return switch (o.stream_experts orelse return "") {
         .on => "{\"stream_experts\":true}",
         .rows => |n| std.fmt.bufPrint(buf, "{{\"stream_experts\":{d}}}", .{n}) catch "",
     };
 }
 
-/// `config_json` with the launch's `--config-overrides` merged in, as the legacy parse reads it; in `a`.
-pub fn withOverrides(a: std.mem.Allocator, config_json: []const u8) ![]const u8 {
-    const ov = model.getConfigOverrides() orelse return config_json;
-    return model.mergeConfigJson(a, config_json, ov);
+/// The overrides a pack's config.json is served under, deep-merged in order: the pack's per-model
+/// `config_overrides` first, then the launch's `--config-overrides`, so the launch flag wins a key both name.
+/// Returns `config_json` itself when neither is set; an intermediate is freed, so `a` owns the result.
+pub fn mergeOverrides(a: std.mem.Allocator, config_json: []const u8, per_model: ?[]const u8, launch: ?[]const u8) ![]const u8 {
+    const layers = [_]struct { ov: ?[]const u8, name: []const u8 }{
+        .{ .ov = per_model, .name = "a model's config_overrides in model-settings.json" },
+        .{ .ov = launch, .name = "server-wide --config-overrides" },
+    };
+    var cur = config_json;
+    var owned = false;
+    for (layers) |l| if (l.ov) |o| {
+        const next = try model.mergeConfigJson(a, cur, o, l.name);
+        if (owned) a.free(cur);
+        cur = next;
+        owned = true;
+    };
+    return cur;
 }
 
 /// Who serves a pack: its plugin's binding (caller owns it), or why none does (static text).
@@ -168,7 +179,9 @@ pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     // The plugin parses what the legacy parse reads: the overrides land in both.
-    const config_json = try withOverrides(arena.allocator(), raw_json);
+    var pack = model_settings.settingsForPack(a, io, model_dir);
+    defer pack.deinit(a);
+    const config_json = try mergeOverrides(arena.allocator(), raw_json, pack.config_overrides, model.getConfigOverrides());
     const model_type = try sdk_plugin.modelTypeOf(arena.allocator(), config_json);
     if (!served.serves(model_type) and outside.loaded().len == 0) return .{ .declined = "type not served" };
     var fs = FsPackDir.open(io, model_dir) catch return .{ .declined = "pack dir unreadable" };
@@ -179,7 +192,7 @@ pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json
     const b = try a.create(Binding);
     b.* = .{ .table = table, .outside = outside.ownerOf(table) != null };
     var settings: [48]u8 = undefined;
-    const v = table.parse(&dir, abi.Str.of(config_json), .of(parseSettings(a, io, &settings, model_dir)), null, false, &b.parsed);
+    const v = table.parse(&dir, abi.Str.of(config_json), .of(parseSettings(&pack, &settings)), null, false, &b.parsed);
     if (!v.isOk()) {
         a.destroy(b);
         return .{ .declined = v.why.slice() };
@@ -205,7 +218,9 @@ pub const Stub = @import("../../../host/engines/mlx.zig").PluginStub;
 pub fn stubOf(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json: []const u8) ?Stub {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const config_json = withOverrides(arena.allocator(), raw_json) catch return null;
+    var pack = model_settings.settingsForPack(a, io, model_dir);
+    defer pack.deinit(a);
+    const config_json = mergeOverrides(arena.allocator(), raw_json, pack.config_overrides, model.getConfigOverrides()) catch return null;
     const model_type = sdk_plugin.modelTypeOf(arena.allocator(), config_json) catch return null;
     if (!served.serves(model_type) and outside.loaded().len == 0) return null;
     var fs = FsPackDir.open(io, model_dir) catch return null;
@@ -561,4 +576,73 @@ test "outside model plugin keeps the engine's config: asked, a type the engine c
     var c = try ToyOutside.parseConfig("{\"model_type\":\"toy_outside_arch\",\"hidden_size\":4096,\"num_hidden_layers\":45}", true);
     defer c.deinit(testing.allocator);
     try ToyOutside.expectAdapted(&c);
+}
+
+/// The integer at `path` in `json`; a failure names a missing field or another type.
+fn jsonInt(a: std.mem.Allocator, json: []const u8, path: []const []const u8) !i64 {
+    var doc = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer doc.deinit();
+    var v: std.json.Value = doc.value;
+    for (path) |k| {
+        if (v != .object) return error.TestUnexpectedResult;
+        v = v.object.get(k) orelse return error.TestUnexpectedResult;
+    }
+    if (v != .integer) return error.TestUnexpectedResult;
+    return v.integer;
+}
+
+test "plugin config: a pack's config_overrides merge under the launch's --config-overrides" {
+    const t = testing.allocator;
+    const base = "{\"model_type\":\"qwen4_exp\",\"text_config\":{\"max_position_embeddings\":262144}}";
+    const per_model = "{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":4},\"max_position_embeddings\":1048576}}";
+    const launch = "{\"text_config\":{\"max_position_embeddings\":524288}}";
+
+    // Neither layer: the pack's own bytes, untouched.
+    try testing.expectEqualStrings(base, try mergeOverrides(t, base, null, null));
+    // The pack's layer alone: its rope and window land beside the siblings it did not name.
+    const one = try mergeOverrides(t, base, per_model, null);
+    defer t.free(one);
+    try testing.expectEqual(@as(i64, 1048576), try jsonInt(t, one, &.{ "text_config", "max_position_embeddings" }));
+    try testing.expectEqual(@as(i64, 4), try jsonInt(t, one, &.{ "text_config", "rope_parameters", "factor" }));
+    // Both layers: the launch flag wins the key they share, the pack keeps the one it names alone.
+    const both = try mergeOverrides(t, base, per_model, launch);
+    defer t.free(both);
+    try testing.expectEqual(@as(i64, 524288), try jsonInt(t, both, &.{ "text_config", "max_position_embeddings" }));
+    try testing.expectEqual(@as(i64, 4), try jsonInt(t, both, &.{ "text_config", "rope_parameters", "factor" }));
+}
+
+test "plugin config: a pack's config_overrides reach the config its parse reads" {
+    const t = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    try tmp.dir.createDirPath(io, "pack");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/config.json", .data = "{\"text_config\":{\"max_position_embeddings\":262144}}" });
+    try tmp.dir.createDirPath(io, ".mlx-serve");
+
+    const pack_dir = try std.fmt.allocPrint(t, "{s}/pack", .{root});
+    defer t.free(pack_dir);
+    const ov = "{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":4},\"max_position_embeddings\":1048576}}";
+    const file = try std.fmt.allocPrint(t, "{{\"{s}\":{{\"config_overrides\":{s}}}}}", .{ pack_dir, ov });
+    defer t.free(file);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".mlx-serve/model-settings.json", .data = file });
+
+    const home = try t.dupeSentinel(u8, root, 0);
+    defer t.free(home);
+    const prev = if (env.get(.HOME)) |h| try t.dupeSentinel(u8, std.mem.span(h), 0) else null;
+    defer if (prev) |p| {
+        env.set(.HOME, p);
+        t.free(p);
+    } else env.unset(.HOME);
+    env.set(.HOME, home);
+
+    const raw = "{\"text_config\":{\"max_position_embeddings\":262144}}";
+    var pack = model_settings.settingsForPack(t, io, pack_dir);
+    defer pack.deinit(t);
+    const merged = try mergeOverrides(t, raw, pack.config_overrides, null);
+    defer if (merged.ptr != raw.ptr) t.free(merged);
+    try testing.expectEqual(@as(i64, 1048576), try jsonInt(t, merged, &.{ "text_config", "max_position_embeddings" }));
+    try testing.expectEqual(@as(i64, 4), try jsonInt(t, merged, &.{ "text_config", "rope_parameters", "factor" }));
 }

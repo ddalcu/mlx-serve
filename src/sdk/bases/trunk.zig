@@ -37,7 +37,7 @@ pub const Trunk = struct {
         defer a.free(buf);
         var why: abi.Verdict = .{};
         const raw = pd.readFile("config.json", buf, &why) orelse return error.ConfigUnreadable;
-        const cfg = try mergeConfigJson(a, raw, overrides);
+        const cfg = try mergeConfigJson(a, raw, overrides, "a trunk override");
         defer a.free(cfg);
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();

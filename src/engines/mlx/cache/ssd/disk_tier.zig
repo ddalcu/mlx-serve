@@ -53,6 +53,7 @@ const mlx = @import("../../../../mlx/ffi.zig");
 const kv_quant = @import("../kv_quant.zig");
 const transformer_mod = @import("../../transformer.zig");
 const model = @import("../../../../sdk/config/model.zig");
+const model_settings = @import("../../../../host/registry/model_settings.zig");
 const io_util = @import("../../../../sdk/util/io_util.zig");
 const disk_writer = @import("writer.zig");
 pub const module_record = @import("module_record.zig");
@@ -4393,6 +4394,13 @@ pub fn modelFingerprintWithLayout(
         h.update(std.mem.asBytes(&mt));
     }
     if (model.getConfigOverrides()) |raw| h.update(raw);
+    // A per-model `config_overrides` re-shapes the same geometry (a rope scaling, a window), so it rolls the root:
+    // keys stored under another rope mean something else.
+    if (model_settings.configOverridesFor(allocator, io, model_dir)) |ov| {
+        defer allocator.free(ov);
+        h.update("\x00mlx-serve-model-overrides\x00");
+        h.update(ov);
+    }
     if (layout_namespace) |layout| {
         h.update("\x00mlx-serve-kv-layout\x00");
         h.update(layout);
@@ -6734,6 +6742,63 @@ test "modelFingerprint: rolls with --config-overrides" {
     const fp_ws = try modelFingerprint(testing.allocator, io, dir_a);
     defer testing.allocator.free(fp_ws);
     try testing.expect(!std.mem.eql(u8, fp_over, fp_ws));
+}
+
+// Bar: a model whose YaRN comes from `model-settings.json` rather than the flag gets a fresh root too, and
+// another model's entry never moves this one's.
+test "modelFingerprint: rolls with a model's config_overrides" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    try tmp.dir.createDirPath(io, "model-a");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-a/config.json", .data = "{\"model_type\":\"x\"}" });
+    const dir_a = try std.fmt.allocPrint(testing.allocator, "{s}/model-a", .{base});
+    defer testing.allocator.free(dir_a);
+    try tmp.dir.createDirPath(io, ".mlx-serve");
+
+    const home = try testing.allocator.dupeSentinel(u8, base, 0);
+    defer testing.allocator.free(home);
+    const prev = if (env.get(.HOME)) |h| try testing.allocator.dupeSentinel(u8, std.mem.span(h), 0) else null;
+    defer if (prev) |p| {
+        env.set(.HOME, p);
+        testing.allocator.free(p);
+    } else env.unset(.HOME);
+    env.set(.HOME, home);
+
+    // No settings file at all: the root the flag alone (here, none) gives.
+    model.setConfigOverrides(null);
+    const none = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(none);
+
+    const yarn = "{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":4.0}}}";
+    try writeOverrides(&tmp, io, dir_a, yarn);
+    const fp_yarn = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp_yarn);
+    const fp_again = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp_again);
+    try testing.expectEqualStrings(fp_yarn, fp_again);
+    try testing.expect(!std.mem.eql(u8, none, fp_yarn));
+
+    // Another rope factor is another cache; so is another window.
+    try writeOverrides(&tmp, io, dir_a, "{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":2.0}}}");
+    const fp_half = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp_half);
+    try testing.expect(!std.mem.eql(u8, fp_yarn, fp_half));
+
+    // A file that names no override for this pack leaves the root alone.
+    try tmp.dir.writeFile(io, .{ .sub_path = ".mlx-serve/model-settings.json", .data = "{\"/other\":{\"config_overrides\":{\"a\":1}}}" });
+    const fp_bare = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp_bare);
+    try testing.expectEqualStrings(none, fp_bare);
+}
+
+/// `model-settings.json` under the test HOME, one entry for `path`.
+fn writeOverrides(tmp: *std.testing.TmpDir, io: std.Io, path: []const u8, ov: []const u8) !void {
+    const file = try std.fmt.allocPrint(testing.allocator, "{{\"{s}\":{{\"config_overrides\":{s}}}}}", .{ path, ov });
+    defer testing.allocator.free(file);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".mlx-serve/model-settings.json", .data = file });
 }
 
 test "spec meta json: the v5 head half round-trips and a v4 record parses without one" {

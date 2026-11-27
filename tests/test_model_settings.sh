@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Per-model settings (`~/.mlx-serve/model-settings.json`, issue #269): a model's
-# `ctx_size` / `kv_quant` / `mtp_greedy_tail` follow the MODEL, apply on its load
+# `ctx_size` / `kv_quant` / `mtp_greedy_tail` / `config_overrides` follow the MODEL, apply on its load
 # (boot AND cold load), and a second model in the same process keeps the globals.
 #
 # Runs under a private HOME so the real settings file is never touched.
@@ -56,13 +56,14 @@ UP=0
 srv_wait_health "http://127.0.0.1:$PORT" 240 0.5 "$SRV" && UP=1
 [ "$UP" = "1" ] || { echo "FAIL: server never became healthy"; tail -5 "$LOG"; exit 1; }
 
-row() { # row <model path> <field> — top-level context_length or meta.kv_quant of the READY row
+row() { # row <model path> <field> — context_length, meta.kv_quant or meta.model_max_tokens of the READY row
     curl -s "http://127.0.0.1:$PORT/v1/models" | python3 -c "
 import sys, json
 want = sys.argv[1].rstrip('/')
 for m in json.load(sys.stdin)['data']:
     if want.endswith('/' + m['id']):
-        print(m['context_length'] if sys.argv[2] == 'ctx' else m['meta'].get('kv_quant'))
+        f = sys.argv[2]
+        print(m['context_length'] if f == 'ctx' else m['meta'].get('kv_quant' if f == 'kv' else 'model_max_tokens'))
         break
 " "$1" "$2"
 }
@@ -138,6 +139,26 @@ print(next((m['meta'].get('drafter_loaded') for m in json.load(sys.stdin)['data'
 else
     echo "  SKIP [5]: no pack with a drafter/ (DRAFT_MODEL=$DRAFT_MODEL)"
 fi
+
+# [6] config_overrides: the pack's config.json is merged per model before it is parsed, so the window
+# the model loads with follows the FILE and not only the pack. MODEL_A is a flat qwen3_5 pack, where
+# `max_position_embeddings` sits at the root of its config.json. The row's `context_length` stays
+# `--ctx-size` here (the manual context outranks the window); the merged document shows in
+# `meta.model_max_tokens`.
+NATIVE="$(row "$MODEL_A" maxtok)"
+printf '{ "%s": { "config_overrides": { "max_position_embeddings": 4096 } } }' "$MODEL_A" >"$SETTINGS"
+post unload-model "{\"model\":\"$MODEL_A\"}" >/dev/null
+CODE="$(post load-model "{\"model\":\"$MODEL_A\"}")"
+check "[6] config_overrides load -> 200 (got $CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
+check "[6] config_overrides moves the loaded window to 4096 (pack native $NATIVE, got $(row "$MODEL_A" maxtok))" \
+    "$([ "$(row "$MODEL_A" maxtok)" = "4096" ] && echo 1 || echo 0)"
+check "[6] the load line names cfg" "$(grep -q "\[model-settings\] .*cfg={\"max_position_embeddings\":4096}" "$LOG" && echo 1 || echo 0)"
+# A non-object is not the key: the pack loads on its own config.
+printf '{ "%s": { "config_overrides": "yarn" } }' "$MODEL_A" >"$SETTINGS"
+post unload-model "{\"model\":\"$MODEL_A\"}" >/dev/null
+CODE="$(post load-model "{\"model\":\"$MODEL_A\"}")"
+check "[6] a non-object config_overrides is ignored (load $CODE, maxtok $(row "$MODEL_A" maxtok), pack native $NATIVE)" \
+    "$([ "$CODE" = "200" ] && [ "$(row "$MODEL_A" maxtok)" = "$NATIVE" ] && echo 1 || echo 0)"
 
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = "0" ]
