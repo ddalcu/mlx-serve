@@ -1,0 +1,90 @@
+{
+  "model_type": "hy_v4_flash",
+  "hidden": 32,
+  "vocab": 64,
+  "layers": 4,
+  "eps": 0.0001,
+  "hc_mult": 2,
+  "hc_magnitude": 2.0,
+  "indexed_heads": 2,
+  "swa_heads": 4,
+  "qk_nope": 8,
+  "rope_dim": 8,
+  "v_dim": 8,
+  "swa_qk_nope": 8,
+  "swa_v_dim": 8,
+  "kv_lora": 12,
+  "q_lora": 12,
+  "indexed_theta": 10000.0,
+  "swa_theta": 1000.0,
+  "mrope": [
+    2,
+    1,
+    1
+  ],
+  "layer_types": [
+    "indexed_attention",
+    "sliding_attention",
+    "indexed_attention",
+    "sliding_attention"
+  ],
+  "mlp_types": [
+    "dense",
+    "sparse",
+    "sparse",
+    "sparse"
+  ],
+  "experts": 4,
+  "top_k": 2,
+  "moe_inter": 16,
+  "latent": 12,
+  "inter": 32,
+  "route_scale": 1.5,
+  "swiglu_limit": 1.0,
+  "sliding": 4,
+  "ratio": 2,
+  "idx_heads": 2,
+  "idx_head_dim": 16,
+  "group_topk": 3,
+  "candidate_topk": 8,
+  "engram_layers": [
+    1
+  ],
+  "max_ngram": 3,
+  "head_dim": 8,
+  "lookup_size": 80,
+  "pad": 2,
+  "engram_sizes": [
+    [
+      11,
+      13
+    ],
+    [
+      17,
+      19
+    ]
+  ],
+  "hash_mult": [
+    3,
+    5,
+    7
+  ],
+  "ids": [
+    59,
+    40,
+    44,
+    56,
+    37,
+    49,
+    53,
+    16,
+    6,
+    21,
+    20,
+    55,
+    57,
+    3,
+    32,
+    52
+  ]
+}

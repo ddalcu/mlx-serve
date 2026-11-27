@@ -7,6 +7,19 @@ decided: the measured default stays, the losing opt-in was deleted. Engine code 
 (`spec/`, `cache/`, `kv/`, `sampling/`, `generate/`), shared blocks and kernels under `src/sdk/blocks/` and
 `src/kernels/`.
 
+### Hy4 Engram projections carry biases
+
+Real Hy4 checkpoints contain separate value_proj.bias and key_projs.*.bias tensors in addition to quantization biases. Apply those projection biases before Engram normalization and honor engram_fp8_embedding with per-head E4M3 rounding. A previously saved real-A layer reference diverges when projection biases are applied; its provenance needs investigation before using it as an acceptance oracle.
+
+### Hy4 Engram rows and formatted special tokens
+
+Engram table heads occupy consecutive slices; advance the row offset by each head's vocabulary size, not once per n-gram order. Hy4 also builds its special tokens with .format(HYTK) in the chat template: reserved-output suppression must recognize those expressions or it masks valid thinking and tool markers.
+
+### Hy4 prefix snapshots omit module-owned state
+
+Hy4 keeps its KV and Engram history on the model, so the generic hot prefix snapshot cannot restore it. Exclude hy_v4_flash from the hot prefix cache until that state can be snapshotted; otherwise a reused prefix can change greedy output.
+
+
 ### ds4's disk-only tails are not resident weights
 Qwen's BF16 n-grams and V4.1's encoded Engram rows live outside ds4's weight mapping. Billing the full file can
 refuse a model whose mapped weights and session fit. Deduct their tensor bytes only after the header's encoding,

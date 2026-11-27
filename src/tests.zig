@@ -51,6 +51,8 @@ test {
     _ = @import("plugins/qwen3_next/proof_test.zig");
     _ = @import("plugins/hy_v3/proof_test.zig");
     _ = @import("plugins/hy_v3/mtp_head_test.zig");
+    _ = @import("plugins/hy_v4_flash/proof_test.zig");
+    _ = @import("plugins/hy_v4_flash/hy_v4_flash.zig");
     _ = @import("plugins/gemma3/proof_test.zig");
     _ = @import("plugins/inkling/proof_test.zig");
     _ = @import("plugins/inkling2/proof_test.zig");
