@@ -10,7 +10,47 @@ pub const Mode = enum { off, on };
 pub const Error = error{
     /// MLX_SERVE_DSV41_FLASH_ATTN is neither 0 nor 1 (unset or empty: on).
     FlashAttnSetting,
+    /// MLX_SERVE_DSV41_FLASH_TRIM is neither 0 nor 1 (unset or empty: FLASH_ATTN's setting).
+    FlashTrimSetting,
+    /// MLX_SERVE_DSV41_FLASH_TRIM=1 beside MLX_SERVE_DSV41_FLASH_ATTN=0: the flash kernel asked for and turned off.
+    FlashTrimOff,
+    /// MLX_SERVE_DSV41_FLASH_PSUM is neither 0 nor 1 (unset or empty: off).
+    FlashPsumSetting,
+    /// MLX_SERVE_DSV41_FLASH_PSUM=1 beside MLX_SERVE_DSV41_FLASH_ATTN=0: the flash kernel asked for and turned off.
+    FlashPsumOff,
 };
+
+/// MLX_SERVE_DSV41_FLASH_TRIM: on by default (unset or empty), `1` asked for, `0` off (the flash spans then run
+/// `source` without `definesTrim`). The default follows FLASH_ATTN: with the flash kernel off it is off too; only an
+/// asked-for `1` beside FLASH_ATTN=0 is refused (`FlashTrimOff`).
+pub const Trim = enum { off, default, on };
+pub fn parseTrim(value: ?[]const u8) Error!Trim {
+    const v = value orelse return .default;
+    if (v.len == 0) return .default;
+    if (std.mem.eql(u8, v, "0")) return .off;
+    if (std.mem.eql(u8, v, "1")) return .on;
+    return error.FlashTrimSetting;
+}
+
+/// MLX_SERVE_DSV41_FLASH_PSUM: off unless `1` (the flash spans then run `source` under `definesPsum`).
+pub fn parsePsum(value: ?[]const u8) Error!bool {
+    const v = value orelse return false;
+    if (v.len == 0 or std.mem.eql(u8, v, "0")) return false;
+    if (std.mem.eql(u8, v, "1")) return true;
+    return error.FlashPsumSetting;
+}
+
+/// The defines a flash text's header ends with: FA_TRIM (MLX_SERVE_DSV41_FLASH_TRIM), FA_PSUM
+/// (MLX_SERVE_DSV41_FLASH_PSUM) and `plant` (tests only: 1 reads the window's keys a row late).
+pub fn defines(comptime trim: bool, comptime psum: bool, comptime plant: u1) [:0]const u8 {
+    return std.fmt.comptimePrint("#define FA_TRIM {d}\n#define FA_PSUM {d}\n#define FA_PLANT {d}\n", .{ @intFromBool(trim), @intFromBool(psum), plant });
+}
+pub fn definesTrim(comptime plant: u1) [:0]const u8 {
+    return defines(true, false, plant);
+}
+pub fn definesPsum(comptime plant: u1) [:0]const u8 {
+    return defines(false, true, plant);
+}
 
 /// On unless the setting says otherwise (: flash attention judged on speed and quality, not words).
 pub fn parse(value: ?[]const u8) Error!Mode {
@@ -64,4 +104,17 @@ test "flash_attn region twin: the grouped store's address moved to the run regio
     try testing.expect(std.mem.indexOf(u8, t, region_store.new) != null);
     try testing.expect(std.mem.indexOf(u8, t, region_store.old) == null);
     try testing.expect(std.mem.startsWith(u8, t, "device OT* o = (device OT*) o_dst;\n"));
+}
+
+test "flash_trim setting: on by default unset or empty, 0 off, 1 asked for; anything else refused by name" {
+    for ([_]?[]const u8{ null, "" }) |v| try testing.expectEqual(Trim.default, try parseTrim(v));
+    try testing.expectEqual(Trim.off, try parseTrim("0"));
+    try testing.expectEqual(Trim.on, try parseTrim("1"));
+    for ([_][]const u8{ "on", "2", "true", " 1" }) |v| try testing.expectError(error.FlashTrimSetting, parseTrim(v));
+}
+
+test "flash_psum setting: off unset, empty or 0; 1 on; anything else refused by name" {
+    for ([_]?[]const u8{ null, "", "0" }) |v| try testing.expect(!try parsePsum(v));
+    try testing.expect(try parsePsum("1"));
+    for ([_][]const u8{ "on", "2", "true", " 1" }) |v| try testing.expectError(error.FlashPsumSetting, parsePsum(v));
 }

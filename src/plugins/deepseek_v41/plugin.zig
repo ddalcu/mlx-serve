@@ -22,9 +22,13 @@ const streamed = @import("../../sdk/weights/streamed.zig");
 const outside = @import("../../sdk/quant/outside.zig");
 const outside_model = @import("../../sdk/quant/outside_model.zig");
 const env = @import("../../env.zig");
+const lev = @import("levers.zig");
 const engram_decode = @import("decode/engram_decode.zig");
+const engram_kvc = @import("decode/engram_kvc.zig");
+const mx_view = @import("mx_view.zig");
 const flash_attn = @import("prompt/flash_attn.zig");
 const scratch_attn = @import("prompt/scratch_attn.zig");
+const keep_wide = @import("prompt/keep_wide.zig");
 const ablation = @import("ablation.zig");
 pub const config = @import("config.zig");
 
@@ -246,14 +250,25 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
 }
 
-/// The settings a load reads, each refused by name at a bad value. A plugin-streamed bank's own (flash attention by
-/// default) apply to it alone.
+/// The settings a load reads, each refused by name at a bad value: the precision and the stack switches
+/// (`levers.check`, then the load's settings line), the Engram LRU, flash attention. Flash attention is on for every pack by default
+/// (`MLX_SERVE_DSV41_FLASH_ATTN`: unset, empty or 1 on, =0 the exact gather; its f32 output sits closer to float64 than
+/// The DSpark typical pair a sampled request takes by default (`levers.lossyTypical`: under `--precision lossy`).
+pub fn lossyTypical() ?@import("../../sdk/spec/mtp_acceptance.zig").Typical {
+    return lev.lossyTypical();
+}
+
+/// the gather's).
 fn configureLoad(c: *const config.Config) !void {
-    const exl3 = c.dsv41_exl3_bank;
-    engram_decode.ps().lru_mb = try engram_decode.parseMb(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB));
+    _ = c;
+    try lev.check();
+    lev.logSettings();
+    engram_decode.ps().lru_mb = try engram_decode.parseMb(lev.span(.ENGRAM_LRU_MB));
     flash_attn.ps().mode = .off;
     flash_attn.ps().explicit = false;
-    if (exl3 or env.span(.MLX_SERVE_DSV41_FLASH_ATTN) != null) try flash_attn.configure(env.span(.MLX_SERVE_DSV41_FLASH_ATTN));
+    flash_attn.ps().trim = false;
+    flash_attn.ps().psum = false;
+    try flash_attn.configure(lev.span(.FLASH_ATTN), try flash_attn.plan.parseTrim(lev.span(.FLASH_TRIM)), try flash_attn.plan.parsePsum(lev.span(.FLASH_PSUM)));
     scratch_attn.ps().ring_regions = flash_attn.ps().mode != .on;
 }
 
@@ -309,8 +324,13 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .tp_sum = try dsv41.tpSumWanted(), .draft_shard = ctx.tp_size > 0, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice(), .quant = quant });
     errdefer m.mdl.deinit();
     // The fused Markov chain's kernels compiled now, not in the first draft; a sharded draft holds only its rows of the
-    // Markov head, which the fused chain's shape check refuses, and runs its own chain.
-    if (m.mdl.dspark) |*w| if (!m.mdl.draft_shard) try @import("spec/markov.zig").warm(m.mdl.s, w.markov_embed, w.markov_head, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true);
+    // Markov head, which the fused chain's shape check refuses, and runs its own chain (no draft vocabulary either).
+    if (m.mdl.dspark) |*w| if (!m.mdl.draft_shard) {
+        const mk = w.markovFor();
+        try @import("spec/markov.zig").warm(m.mdl.s, mk.emb, mk.mh, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true, dsv41.draftSampleOn());
+        try dsv41.warmDraftVocab(m.mdl, dsv41.draftSampleOn());
+    };
+    try dsv41.syncWarm(m.mdl);
     m.bank = null;
     m.bank_streams = false;
     m.owner = 0;
@@ -350,6 +370,8 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     errdefer if (m.vision_dir) |d| gpa.free(d);
     m.tower = if (c.dsv41_vision and taken == null and !lazy_tower) try vision.Dsv41Vision.init(gpa, m.cfg, &m.weights) else null;
     if (lazy_tower) std.log.info("deepseek_v41: the vision tower is read from the pack for each image, not resident", .{});
+    // keep_wide.zig: the reserve's buffers a row, made at the engine's pin of the pass width.
+    keep_wide.prepare(&m.cfg);
     return m;
 }
 
@@ -448,6 +470,7 @@ fn ctxSetting(settings_json: []const u8) ?u64 {
 
 fn unload(mp: *anyopaque) callconv(.c) void {
     const m: *Model = @ptrCast(@alignCast(mp));
+    keep_wide.disarm();
     closeBank(m);
     if (m.tower) |*t| t.deinit();
     if (m.vision_dir) |d| gpa.free(d);
@@ -923,9 +946,15 @@ fn auxImportArrays(mp: *anyopaque, ids: abi.Span(u32), header: abi.Str, arrays: 
 }
 
 /// The load reads its Engram tables from disk per lookup and drops the tensors it never loads
-/// (`dsv41.residentDiskBytes`); the `mtp` setting decides the DSpark stages.
+/// (`dsv41.residentDiskBytes`, with the Engram partials' cache where the load allocates it); the `mtp` setting decides
+/// the DSpark stages; plus a draft-only head (`dsv41.draftHeadBytes`).
 fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, settings_json: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
-    out.* = dsv41.residentDiskBytes(gpa, model_dir.slice(), config.of(p), mtpSetting(settings_json.slice()), shards) catch |e| return Verdict.named(.failed, @errorName(e));
+    const mtp = mtpSetting(settings_json.slice());
+    out.* = dsv41.residentDiskBytes(gpa, model_dir.slice(), config.of(p), mtp, shards) catch |e| return Verdict.named(.failed, @errorName(e));
+    if (mx_view.on()) out.* -|= mx_view.savedBytes(gpa, model_dir.slice(), dsv41.dsparkWanted(config.of(p), null, mtp)) catch |e| return Verdict.named(.failed, @errorName(e));
+    out.* += dsv41.draftHeadBytes(config.of(p), dsv41.dsparkWanted(config.of(p), null, mtp), model_dir.slice());
+    // MLX_SERVE_DSV41_PF_INT8's int8 trunk weights.
+    out.* += @import("prompt/pf_int8.zig").residentBytes(config.of(p));
     return .ok;
 }
 
@@ -936,14 +965,19 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 // ── tests ──
 
-/// The Engram LRU every load of a pack with Engram layers bills.
+/// The Engram LRU every load of a pack with Engram layers bills (the affine fixture's table allocates no partials' cache).
 fn lru() u64 {
-    return @import("decode/engram_decode.zig").billBytes(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB));
+    return @import("decode/engram_decode.zig").billBytes(lev.span(.ENGRAM_LRU_MB));
 }
 
 /// `residentBytes` over the Engram fixture (`engram.writeAffineFixture`) in `dir`, from `shards` bytes.
 fn engramResident(dir: []const u8, settings_json: []const u8, shards: u64) !u64 {
-    var c: config.Config = .{ .model_type = "deepseek_v41", .dsv41_n_engram_layers = 1, .dsv41_engram_head_dim = 64 };
+    return engramResidentAt(dir, settings_json, shards, 64, false);
+}
+
+/// `engramResident` over a table `head_dim` wide, the experts streamed or not.
+fn engramResidentAt(dir: []const u8, settings_json: []const u8, shards: u64, head_dim: u32, streams: bool) !u64 {
+    var c: config.Config = .{ .model_type = "deepseek_v41", .dsv41_n_engram_layers = 1, .dsv41_engram_head_dim = head_dim, .dsv41_streamed = streams };
     c.dsv41_engram_layers[0] = 1;
     c.dsv41_engram_rows[0] = 4;
     var out: u64 = 0;
@@ -967,18 +1001,64 @@ test "deepseek_v41 resident bill: a --mlx-gguf set (a file, not a pack dir) bill
     try std.testing.expectEqual(@as(u64, 10_000), out);
 }
 
-test "deepseek_v41 resident bill: the Engram tables it preads bill their LRU, not their shards" {
+test "deepseek_v41 resident bill: Engram tables it preads bill their LRU, not their shards; tables it holds bill their bytes" {
+    const env_mod = @import("../../env.zig");
+    defer env_mod.unset(.MLX_SERVE_DSV41_ENGRAM_RESIDENT);
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
     try @import("engram.zig").writeAffineFixture(io, td.dir, "");
     var buf: [512]u8 = undefined;
     const dir = buf[0..try td.dir.realPath(io, &buf)];
+    env_mod.set(.MLX_SERVE_DSV41_ENGRAM_RESIDENT, "0");
     try std.testing.expectEqual(10_000 - 288 + lru(), try engramResident(dir, "", 10_000));
+    env_mod.unset(.MLX_SERVE_DSV41_ENGRAM_RESIDENT);
+    try std.testing.expectEqual(10_000 + lru(), try engramResident(dir, "", 10_000));
+}
+
+test "deepseek_v41 resident bill: MLX_SERVE_DSV41_ENGRAM_KV_CACHE bills the partials' cache at its bound only where the load allocates it: held mxfp4 tables 256 wide, ENGRAM_GPU_IDS on, resident experts" {
+    const env_mod = @import("../../env.zig");
+    const o1 = env_mod.override(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE, null);
+    defer o1.restore();
+    const o2 = env_mod.override(.MLX_SERVE_DSV41_ENGRAM_GPU_IDS, null);
+    defer o2.restore();
+    const o3 = env_mod.override(.MLX_SERVE_DSV41_ENGRAM_RESIDENT, null);
+    defer o3.restore();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var ta = std.testing.tmpDir(.{});
+    defer ta.cleanup();
+    try @import("engram.zig").writeAffineFixture(io, ta.dir, "");
+    var tm = std.testing.tmpDir(.{});
+    defer tm.cleanup();
+    try @import("engram.zig").writeMxfp4SlotFixture(io, tm.dir);
+    var ab: [512]u8 = undefined;
+    const affine = ab[0..try ta.dir.realPath(io, &ab)];
+    var mb: [512]u8 = undefined;
+    const mx = mb[0..try tm.dir.realPath(io, &mb)];
+    const Arm = struct { cache: ?[*:0]const u8 = null, ids: ?[*:0]const u8 = null, resident: ?[*:0]const u8 = null, streamed: bool = false };
+    const at = struct {
+        fn bill(dir: []const u8, hd: u32, a: Arm) !u64 {
+            env.set(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE, "0");
+            if (a.ids) |v| env.set(.MLX_SERVE_DSV41_ENGRAM_GPU_IDS, v) else env.unset(.MLX_SERVE_DSV41_ENGRAM_GPU_IDS);
+            if (a.resident) |v| env.set(.MLX_SERVE_DSV41_ENGRAM_RESIDENT, v) else env.unset(.MLX_SERVE_DSV41_ENGRAM_RESIDENT);
+            const off = try engramResidentAt(dir, "", 10_000, hd, a.streamed);
+            if (a.cache) |v| env.set(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE, v) else env.unset(.MLX_SERVE_DSV41_ENGRAM_KV_CACHE);
+            return try engramResidentAt(dir, "", 10_000, hd, a.streamed) - off;
+        }
+    };
+    try std.testing.expectEqual(engram_kvc.cap_bytes, try at.bill(mx, 256, .{}));
+    // The switch off, ENGRAM_GPU_IDS off, the tables read from disk, the experts streamed, an affine table.
+    try std.testing.expectEqual(@as(u64, 0), try at.bill(mx, 256, .{ .cache = "0" }));
+    try std.testing.expectEqual(@as(u64, 0), try at.bill(mx, 256, .{ .ids = "0" }));
+    try std.testing.expectEqual(@as(u64, 0), try at.bill(mx, 256, .{ .resident = "0" }));
+    try std.testing.expectEqual(@as(u64, 0), try at.bill(mx, 256, .{ .streamed = true }));
+    try std.testing.expectEqual(@as(u64, 0), try at.bill(affine, 64, .{}));
 }
 
 test "deepseek_v41 resident bill: neither the vision tower nor DSpark stages that will not load" {
     @import("../../env.zig").unset(.MLX_SERVE_DSV4_DSPARK); // test-order hygiene: `--dspark` (and tests) force the stages on
+    @import("../../env.zig").set(.MLX_SERVE_DSV41_ENGRAM_RESIDENT, "0");
+    defer @import("../../env.zig").unset(.MLX_SERVE_DSV41_ENGRAM_RESIDENT);
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
@@ -1000,6 +1080,65 @@ test "deepseek_v41 resident bill: neither the vision tower nor DSpark stages tha
     // The stages load by default; the tower never does.
     try std.testing.expectEqual(10_000 - 288 - 32 + lru(), try engramResident(dir, "", 10_000));
     try std.testing.expectEqual(10_000 - 288 - 32 - 64 + lru(), try engramResident(dir, "{\"mtp\":false}", 10_000));
+}
+
+test "deepseek_v41 resident bill: under the mxfp4 view an NVFP4 bank's e4m3 scales bill as e8m0 (half) and its globals not at all; a bank without globals and stages that do not load bill as before" {
+    const env_mod = @import("../../env.zig");
+    env_mod.unset(.MLX_SERVE_DSV4_DSPARK);
+    defer env_mod.unset(.MLX_SERVE_DSV41_MXFP4_VIEW);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    // name, dtype, shape, bytes: one NVFP4 trunk bank and one stage bank with their globals, a shared expert's and an
+    // MXFP4 bank's scales beside them.
+    const ts = .{
+        .{ "layers.0.ffn.experts.0.w1.weight", "U32", "[2,2]", 16 },
+        .{ "layers.0.ffn.experts.0.w1.scales", "U8", "[2,4]", 8 },
+        .{ "layers.0.ffn.experts.0.w3.scales", "U8", "[2,4]", 8 },
+        .{ "layers.0.ffn.experts.0.w2.scales", "U8", "[2,4]", 8 },
+        .{ "layers.0.ffn.experts.gate_proj.expert_scale", "BF16", "[1]", 2 },
+        .{ "layers.0.ffn.experts.up_proj.expert_scale", "BF16", "[1]", 2 },
+        .{ "layers.0.ffn.experts.expert_scale", "BF16", "[1]", 2 },
+        .{ "layers.0.ffn.shared_experts.w1.scales", "U8", "[2,4]", 8 },
+        .{ "layers.1.ffn.experts.0.w1.scales", "U8", "[2,2]", 4 },
+        .{ "mtp.0.ffn.experts.0.w1.scales", "U8", "[2,4]", 8 },
+        .{ "mtp.0.ffn.experts.gate_proj.expert_scale", "BF16", "[1]", 2 },
+        .{ "mtp.0.ffn.experts.up_proj.expert_scale", "BF16", "[1]", 2 },
+        .{ "mtp.0.ffn.experts.expert_scale", "BF16", "[1]", 2 },
+    };
+    const hdr, const idx, const data = comptime blk: {
+        var h: []const u8 = "{";
+        var x: []const u8 = "{\"weight_map\":{";
+        var off: u32 = 0;
+        for (ts, 0..) |t, i| {
+            const sep = if (i > 0) "," else "";
+            h = h ++ sep ++ std.fmt.comptimePrint("\"{s}\":{{\"dtype\":\"{s}\",\"shape\":{s},\"data_offsets\":[{d},{d}]}}", .{ t[0], t[1], t[2], off, off + t[3] });
+            x = x ++ sep ++ "\"" ++ t[0] ++ "\":\"model-00001.safetensors\"";
+            off += t[3];
+        }
+        break :blk .{ h ++ "}", x ++ "}}", off };
+    };
+    var shard: [8 + hdr.len + data]u8 = @splat(0);
+    std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
+    @memcpy(shard[8..][0..hdr.len], hdr);
+    try td.dir.writeFile(io, .{ .sub_path = "model-00001.safetensors", .data = &shard });
+    try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = idx });
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try td.dir.realPath(io, &buf)];
+    var c: config.Config = .{ .model_type = "deepseek_v41" };
+    const bill = struct {
+        fn of(cfg: *config.Config, d: []const u8, settings: []const u8, view: bool) !u64 {
+            if (view) env_mod.set(.MLX_SERVE_DSV41_MXFP4_VIEW, "1") else env_mod.unset(.MLX_SERVE_DSV41_MXFP4_VIEW);
+            var out: u64 = 0;
+            if (!residentBytes(&.{ .private = cfg }, .of(d), .of(settings), 10_000, &out).isOk()) return error.Refused;
+            return out;
+        }
+    };
+    // The trunk bank: (3 x 8) / 2 + 3 x 2 = 18 bytes less; the stage bank's 8 / 2 + 6 = 10 while it loads.
+    try std.testing.expectEqual(@as(u64, 10_000), try bill.of(&c, dir, "", false));
+    try std.testing.expectEqual(@as(u64, 10_000 - 18 - 10), try bill.of(&c, dir, "", true));
+    try std.testing.expectEqual(@as(u64, 10_000 - 14), try bill.of(&c, dir, "{\"mtp\":false}", false));
+    try std.testing.expectEqual(@as(u64, 10_000 - 14 - 18), try bill.of(&c, dir, "{\"mtp\":false}", true));
 }
 
 test "deepseek_v41 tap: a diag value that names no directory is off, not a directory in the server's cwd" {
@@ -1024,4 +1163,5 @@ test {
     _ = @import("contract.zig");
     _ = @import("decode/decode.zig");
     _ = @import("ablation_test.zig");
+    _ = @import("tf32_test.zig");
 }

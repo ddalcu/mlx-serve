@@ -1569,16 +1569,35 @@ prompt and a first chat at a fraction of their rates), and the second pass did n
 at its first evaluation, and each wrapper builds one variant per row count, prompt size class, cache state and
 speculative mode. The load's warmup ran three bare forwards and reached a fraction of them; the rest compiled
 inside whichever request selected them first. Metal keeps what it compiled per bundle
-id, so only a build's first run on a machine paid, and paid again after every rebuild. Fix: the first time a build
-loads a model it serves requests of its own through the scheduler (`warm_requests.zig`), on a RAM twin of the prefix
+id, so only a build's first run on a machine paid, and paid again after every rebuild. Fix: every load serves
+requests of its own through the scheduler (`warm_requests.zig`; a marker once kept this to a build's first load, see
+the next entry), on a RAM twin of the prefix
 cache and outside every metric. Serving them all before ready made that load several times longer, so by default
 the model is ready first and serves a short plan when the server is idle (a forward at every verify width, a short
-chat, a long prompt, that prompt with other endings), each request admitted alone so a real one never decodes
+chat, a 256-token prompt, that prompt with other endings), each request admitted alone so a real one never decodes
 beside it, the model never held so it stays evictable (an unload drops the warm-up first); `--warmup-full` serves
-that and a ladder of prompt sizes before ready, which a benchmark needs. A marker per plan beside Metal's cache,
-keyed on the build, the OS build and the pack, makes every later load owe nothing. macOS only. Guards:
+that and a ladder of prompt sizes before ready, which a benchmark needs. macOS only. Guards:
 `tests/test_first_request_compiles.sh` (a copy of the binary under another bundle id starts with an empty cache),
-`owed`, `nextStep`, `forget`, `an idle warm-up waits beside a real request without holding its model`.
+`nextStep`, `forget`, `an idle warm-up waits beside a real request without holding its model`.
+
+### A warm-up marker keyed on the load's inputs skipped the warm-up of loads that compile other kernels
+Defect: after an NVFP4 load of a DeepSeek-V4.1 pack, a load of the same build and pack under
+`MLX_SERVE_DSV41_MXFP4_VIEW=1` skipped its warm requests and compiled its MXFP4 kernels inside its first prompt (a
+p01 at 4,312 prefill tok/s against 5,554). A first fix added the kill switches and the pack's top-level
+quantization to the marker's key; a review then found a DSpark-on load after a DSpark-off one skipping the same way,
+and a map of the class (65 inputs) found 38 that pick kernels outside the key: public and diag variables, foreign MLX
+variables, outside-plugin options, CLI arms, per-model settings, memory at load (pass rows), pack bytes replaced
+under the same path, outside dylib versions, and a marker written after a partial plan; Metal's own cache can also
+be cleared under a marker. Pattern: a copied proxy fact. The marker was an allow-list of inputs its owner chose,
+standing in for "these pipelines are compiled", which every other part of the program decides. Fix: no marker.
+Invariant: a load serves its first request only after its own warm plan ran in this process; Metal's shader cache is
+the one record of what is compiled, so on a matching load the plan costs only its forwards. `--warmup-full` also
+serves a prompt at the load's widest pass (`pinned_prefill_chunk`: the ladder stopped at 10,248 rows, so a wider
+pass compiled in the first long prompt) and drops the ladder's 10 s time budget (a slow machine dropped the widest
+rung). The benchmark harness's unmeasured pre-warm masked the class; a test of it measures the first request after a
+load with no pre-warm. Guards: `tests/test_first_request_compiles.sh` (a load after another under DSpark, the MXFP4
+view, `PF_GU_SEG`, `--no-mtp` or a replaced pack compiles nothing; the widest pass compiles nothing),
+`widestRung`, `the full plan`, `stop: a warm-up still owed at shutdown is dropped, cut short`.
 
 ### A fresh build's warm-up taught the round-cost table its shader compiles
 Defect: on a build's first load of Flash Next, the first requests drafted 2 wide where 3 to 5 pay, and a release
@@ -1658,6 +1677,17 @@ which `rollbackSsmTo` cannot undo after a drafted round, so no decode-end entry 
 round the request's stop ids (`Forward.stop_ids`) and the drafter never verifies one (`draftsToVerify`): the trunk's
 token carries the stop. Guards: `plugin native drafter: a round is handed the request's stop ids`, `inkling2 draft: a
 round never verifies a stop`.
+
+### A default flip broke tests that leaned on the old default or on the machine
+Defect: five times a lever's default flipped, or the suite ran on the M5 Ultra 512 GiB instead of another Mac, and a
+DeepSeek test that leaned on the old setting failed or checked nothing: PF_PASS_CEIL on by default made `dsv41
+prefill chunk: the pass plan pins the widest...` fail on the M5 Ultra only (`passCeil` read the real chip and RAM),
+and a test that left PF_COMP_BF16=0 behind made a later PF_COMP_PASS test fail in file order. Cause: tests read
+lever defaults, the real machine and process-global latches that no test owned; each test pinned what its author
+remembered. Fix: the test world (`sdk/testing/world.zig`) puts every test back at the process's variables, MLX's
+limits, the reference machine and the latched state `src/tests.zig` lists; machine-keyed tables read
+`device.machineId`; the flip proof (`scripts/flip_proof.py`, `-Dtest-flip`) lists the tests a flip changes. Guards:
+`sharded: dsv41 test world: ...` (a leak, then the next test), `test world: ...`, lint `machine-read-in-test`.
 
 ### A round priced on a clock inside the request read 93 or 208 tok/s by seed
 Defect: Inkling 2's sampled requests ran at plain-decode speed or at twice it depending on the seed and the boot,

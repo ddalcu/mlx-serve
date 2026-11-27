@@ -20,7 +20,7 @@ const claim = @import("fp8_block128_claim.zig");
 pub const block_rows: u32 = claim.block_rows;
 pub const block_cols: u32 = claim.block_cols;
 
-const header = kernelSource("kernels/linear/fp8_block128_header.metal");
+const header = @import("fp4.zig").SCALE_HEADER ++ kernelSource("kernels/linear/fp8_block128_header.metal");
 const gemv_source = kernelSource("kernels/linear/fp8_block128_gemv.metal");
 const dequant_source = kernelSource("kernels/linear/fp8_block128_dequant.metal");
 

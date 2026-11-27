@@ -2,7 +2,7 @@
 //! Max).
 //!
 //! The model's `gateLogits` past the decode width runs `matmul(astype(x, f32), transpose(astype(gate_w, f32)))`,
-//! x bf16 [rows, 5,120] and gate_w [384, 5,120] (F16 on the pack): two casts and MLX's NAX matmul (MLX_ENABLE_TF32
+//! x bf16 [rows, 5,120] and gate_w [384, 5,120] (bf16 on the NVFP4 pack): two casts and MLX's NAX matmul (MLX_ENABLE_TF32
 //! unset: 1), its regular fused kernel from 1,707 rows (K < 3 max(M, N)), its split K below. This runs the chain as
 //! one launch: MLX's fused NAX GEMM kernel at nt (steel/gemm/kernels/steel_gemm_fused_nax.h `gemm`, MLX 0.32.3:
 //! kernels/gate_gemm_nt.metal) and its gemm_loop (kernels/gate_gemm_loop.metal: verbatim but A's and B's memory
@@ -126,7 +126,7 @@ fn shapeOf(a: A, b: A) ?[3]u32 {
 /// The launch at tile `t`: y f32 [M, N] = a [M, K] b [N, K]^T, the MMA in `mma`, the accumulators rounded to `out_r` and
 /// widened, MLX's grid (tiles_n << swz by ceil(tiles_m >> swz) threadgroups) in MLX's threadgroup shape (32, WN, WM);
 /// lazy, the caller owns y.
-fn launch(s: mlx.mlx_stream, a: A, b: A, mma: mlx.mlx_dtype, out_r: mlx.mlx_dtype, t: Tile, mnk: [3]u32) !A {
+fn launch(s: mlx.mlx_stream, a: A, b: A, mma: mlx.mlx_dtype, out_r: mlx.mlx_dtype, t: Tile, mnk: [3]u32, blocked: bool) !A {
     const m, const n, const kd = mnk;
     const swz: u32 = @as(u32, 1) << @intCast(t.swz);
     const tiles_m = (m + t.bm - 1) / t.bm;
@@ -145,6 +145,7 @@ fn launch(s: mlx.mlx_stream, a: A, b: A, mma: mlx.mlx_dtype, out_r: mlx.mlx_dtyp
         .{ "BM", t.bm },                         .{ "BN", t.bn },                         .{ "BK", t.bk },
         .{ "WM", t.wm },                         .{ "WN", t.wn },                         .{ "SWZ", t.swz },
         .{ "AM", @intFromBool(m % t.bm == 0) }, .{ "AN", @intFromBool(n % t.bn == 0) }, .{ "AK", @intFromBool(kd % t.bk == 0) },
+        .{ "KBLK", @intFromBool(blocked) },
     };
     for (ints) |p| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, p[0], @intCast(p[1])));
     const iv = mlx.mlx_vector_array_new_data(&[_]A{ a, b }, 2);
@@ -167,8 +168,33 @@ pub fn router(s: mlx.mlx_stream, x: A, w: A, nax: bool) !?A {
     if (!nax or !mlx.streamIsGpu(s)) return null;
     const mnk = shapeOf(x, w) orelse return null;
     if (!mlxRegular(mnk[0], mnk[1], mnk[2])) return null;
-    return try launch(s, x, w, .float32, .float32, tile, mnk);
+    return try launch(s, x, w, .float32, .float32, tile, mnk, false);
 }
+
+/// `MLX_SERVE_DSV41_PF_COMP_BF16` / `MLX_SERVE_DSV41_PF_ROUTER_BF16`: y f32 [M, N] = x [M, K] w [N, K]^T with x and w
+/// both stored bf16, the launch's MMA in bf16 (bf16 tiles into f32 accumulators: each product of two bf16 values is
+/// exact in f32, as in the f32 chain's MMA, so only the sums' order can differ) and the accumulators stored as f32
+/// (lazy, the caller owns y); null where it declines (no NAX, a CPU stream, another type or shape). `sum`: `.single`,
+/// one running f32 sum over K (MLX's regular kernel's order: the router's words); `.blocked`, each BK block's products
+/// summed apart and the blocks' sums added (the compressor: no farther from float64 than the per-span split K it
+/// replaces).
+pub const Sum = enum { single, blocked };
+pub fn bf16F32(s: mlx.mlx_stream, x: A, w: A, nax: bool, sum: Sum) !?A {
+    return bf16F32At(s, x, w, nax, bf16_tile, sum);
+}
+
+/// `bf16F32` at tile `t` (the ubench's other tiles).
+pub fn bf16F32At(s: mlx.mlx_stream, x: A, w: A, nax: bool, t: Tile, sum: Sum) !?A {
+    if (!nax or !mlx.streamIsGpu(s) or !admitted(t)) return null;
+    if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(w) != .bfloat16) return null;
+    const mnk = shapeOf(x, w) orelse return null;
+    return try launch(s, x, w, .bfloat16, .float32, t, mnk, sum == .blocked and !blocked_plant);
+}
+/// The compressor float64 test's planted control: `.blocked` runs the single running sum.
+pub var blocked_plant = false;
+
+/// The bf16 MMA's tile (the ubench's pick at the compressor's and router's shapes).
+pub const bf16_tile: Tile = tile;
 
 test "gate_gemm tiles: MLX's own and the pick are exact by construction; SN must be N pairs, BK whole steps" {
     try std.testing.expect(admitted(tile));

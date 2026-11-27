@@ -343,10 +343,24 @@ const Bank = struct {
             }
             var g: [4]u8 = undefined;
             try rd.read(src.get("{s}.mlp.experts.{d}.{s}.weight_scale_2", .{ b, e, pj }) orelse return error.ModelOptMissingExpert, &g);
-            self.gs[e] = @bitCast(std.mem.readInt(u32, &g, .little));
+            self.gs[e] = try globalScale(@bitCast(std.mem.readInt(u32, &g, .little)), b, e, pj);
         }
     }
 };
+
+/// A per-expert global scale (`weight_scale_2`, f32), checked once here at load so no kernel need: a NaN, an
+/// infinity, zero or a negative refuses the pack, naming the tensor.
+fn globalScale(v: f32, base: []const u8, expert: usize, proj: []const u8) !f32 {
+    if (std.math.isFinite(v) and v > 0) return v;
+    log.err("[modelopt] {s}.mlp.experts.{d}.{s}.weight_scale_2 is {d}: a global scale must be finite and positive\n", .{ base, expert, proj, v });
+    return error.ModelOptBadGlobalScale;
+}
+
+test "ModelOpt global scales: finite and positive, else refused" {
+    try std.testing.expectEqual(@as(f32, 1.5e-4), try globalScale(1.5e-4, "m", 0, "gate_proj"));
+    for ([_]f32{ 0, -0.0, -1e-4, std.math.inf(f32), -std.math.inf(f32), std.math.nan(f32) }) |bad|
+        try std.testing.expectError(error.ModelOptBadGlobalScale, globalScale(bad, "m", 3, "up_proj"));
+}
 
 fn pageAlloc(len: usize) ![]align(std.heap.page_size_min) u8 {
     return std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), len);

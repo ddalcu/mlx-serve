@@ -1,0 +1,49 @@
+[dsv41] MLX_SERVE_DSV41_PROMPT_ASYNC_EVAL engaged
+[dsv41] MLX_SERVE_DSV41_PF_CED_HC engaged
+[dsv41] MLX_SERVE_DSV41_PF_ROPE_PAIRS engaged
+[dsv41] MLX_SERVE_DSV41_PF_RMS_ROWS engaged
+[dsv41] MLX_SERVE_DSV41_IN_PROJ_MIXR engaged
+[dsv41] MLX_SERVE_DSV41_HC_EXPAND_NORM engaged
+[dsv41] MLX_SERVE_DSV41_PF_GU_SEG engaged
+[dsv41] MLX_SERVE_DSV41_PF_KV_ROWS engaged
+[dsv41] MLX_SERVE_DSV41_PF_COMP_PASS engaged
+[dsv41] MLX_SERVE_DSV41_PF_CED_COMP engaged
+[dsv41] MLX_SERVE_DSV41_PF_DOWN_TOKORD engaged
+[dsv41] MLX_SERVE_DSV41_PF_DOWN_BK32 engaged
+[dsv41] MLX_SERVE_DSV41_WOA_JOIN engaged
+[dsv41] MLX_SERVE_DSV41_PF_ROUTE_PACK engaged
+[dsv41] MLX_SERVE_DSV41_PF_ROUTER_BF16 engaged
+[dsv41] MLX_SERVE_DSV41_PF_KEEP_WIDE engaged
+[dsv41] MLX_SERVE_DSV41_PF_ENGRAM_PASS engaged
+[dsv41] MLX_SERVE_DSV41_FLASH_TRIM engaged
+[dsv41] MLX_SERVE_DSV41_FFN_IN_SINK engaged
+[dsv41] MLX_SERVE_DSV41_SPEC_ENGRAM_AHEAD engaged	if=greedy,spec
+[dsv41] MLX_SERVE_DSV41_FFN_IN_R5_COLS1 engaged
+[dsv41] MLX_SERVE_DSV41_DRAFT_POS_ONCE engaged	if=spec
+[dsv41] MLX_SERVE_DSV41_FUSE_WQB_RING engaged
+[dsv41] MLX_SERVE_DSV41_ENGRAM_KV_CACHE engaged
+[dsv41] MLX_SERVE_DSV41_FP4_DEC_WORD engaged
+[dsv41] MLX_SERVE_DSV41_FP4_UP_SPLIT engaged
+deepseek_v41: decode mxfp8 reads folded
+[dsv41] MLX_SERVE_DSV41_MOE_DOWN_ORDER engaged
+deepseek_v41: fused down scale	if=nvfp4
+deepseek_v41: fused fp4 MoE decode kernels on
+[dsv41] MLX_SERVE_DSV41_MOE_PAIR_FP4 engaged
+[dsv41] MLX_SERVE_DSV41_PF_HC_V2 engaged
+[dsv41] MLX_SERVE_DSV41_PF_PASS_SIZE engaged
+[dsv41] MLX_SERVE_DSV41_PF_IDX_NAX engaged
+[dsv41] MLX_SERVE_DSV41_PF_COMP_BF16 engaged
+[dsv41] MLX_SERVE_DSV41_PF_IDX_PASS engaged
+[dsv41] MLX_SERVE_DSV41_FLASH_ATTN engaged
+[dsv41] MLX_SERVE_DSV41_ENGRAM_GPU_IDS engaged
+[dsv41] MLX_SERVE_DSV41_FP4_READS engaged
+[dsv41] MLX_SERVE_DSV41_ATTN_DEC engaged
+[dsv41] MLX_SERVE_DSV41_WOA_PLAIN engaged
+deepseek_v41: fused mxfp8 prompt linears
+[dsv41] MLX_SERVE_DSV41_DRAFT_FUSED engaged	if=spec
+[dsv41] MLX_SERVE_DSV41_DRAFT_SAMPLE engaged	if=spec
+[dsv41] MLX_SERVE_DSV41_DRAFT_QKV engaged
+[dsv41] MLX_SERVE_DSV41_SPEC_SYNC engaged	if=spec
+deepseek_v41: weight path resident (
+dspark policy2: next_decided	if=spec
+dspark policy2 modeled:	if=spec

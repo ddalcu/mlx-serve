@@ -17,7 +17,7 @@ inline float msv_ink2_chunk(int fmt, const device uint* row, const device uchar*
   }
   const float d = mlxserve_fp4_dot16(((const device uint2*)row)[c], x);
   const uint b = uint(srow[fmt == 0 ? c : c / 2]);
-  const float s = fmt == 0 ? mlxserve_fp4_scale(b) : as_type<float>(b == 0u ? 0x400000u : (b << 23)) * 0.00390625f;
+  const float s = fmt == 0 ? mlxserve_fp4_e4m3_x2m8(b) : as_type<float>(b == 0u ? 0x400000u : (b << 23)) * 0.00390625f;
   // The nibble and scale decodes leave 2^14 and 2^8 out.
   return d * s * 4194304.0f;
 }
@@ -103,7 +103,7 @@ inline void msv_ink2_decode16_v4(int fmt, const device uint* row, const device u
   w2 = half4(py0.x, py1.x, py2.x, py3.x);
   w3 = half4(py0.y, py1.y, py2.y, py3.y);
   const uint b = uint(srow[fmt == 0 ? c : c / 2]);
-  const float s = fmt == 0 ? mlxserve_fp4_scale(b) : as_type<float>(b == 0u ? 0x400000u : (b << 23)) * 0.00390625f;
+  const float s = fmt == 0 ? mlxserve_fp4_e4m3_x2m8(b) : as_type<float>(b == 0u ? 0x400000u : (b << 23)) * 0.00390625f;
   scale = s * 4194304.0f;
 }
 

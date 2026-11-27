@@ -1,4 +1,4 @@
+// Two e4m3 bytes (bits 0-7 and 16-23) as MLX's fp8_e4m3 reads them, each times 2^-8 (the shared fp4_scale header).
 inline float2 mlxserve_e4m3x2(uint w) {
-  const uint v = w & 0x00FF00FFu;
-  return float2(as_type<half2>(((v & 0x007F007Fu) << 7) | ((v & 0x00800080u) << 8)));
+  return float2(mlxserve_e4m3x2_h(w));
 }

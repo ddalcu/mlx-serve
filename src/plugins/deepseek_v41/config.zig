@@ -13,6 +13,11 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw"},
 };
 
+/// No non-macOS build can serve it (Metal kernels, MLX's wide reserve, the streamed bank's POSIX calls): the plugin
+/// registry (build/plugins.zig) leaves it out of iOS, Linux and Windows builds, and the rest of the tree reaches it only
+/// through `engines/mlx/plugin/dsv41_link.zig`.
+pub const macos_only = true;
+
 pub const model_types = [_][]const u8{"deepseek_v41"};
 
 pub const claims = sdk.claimsByType(&model_types);

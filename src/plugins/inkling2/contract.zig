@@ -3822,7 +3822,7 @@ test "kernel contract inkling2: each declared launch is the shipped wrapper's, b
     try vision_contract.checkWrappers(a, set.kernels.items[end..]);
 }
 
-// Bar: gates 1-4 on this area alone (the registry's sharded test runs them with every other area).
+// Bar: gates 1-4 on this area alone, from the plugin's own file (the registry's inkling2 test runs the same gates).
 test "kernel contract inkling2: gates 1-4 pass" {
     if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;

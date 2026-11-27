@@ -6,6 +6,18 @@ threadgroup ushort4 xs[R * 320]; // bf16 bits: half the bytes, so two threadgrou
 threadgroup float ps[R * SGS];
 threadgroup float t_s[16];
 
+#if DSV41_WQB_RING
+// `ring_out` is the window ring `ring` [CAP, D] with this launch's rows at their slots (pos % CAP): every threadgroup
+// copies a share of the rows no row of the launch lands on, a word a thread; the window threadgroups write the rest.
+// `PLANT` (0 served) moves the written slot, the tests' planted bug.
+for (int q = int(tg) * NT + int(tid); q < CAP * (D / 8); q += int(G) * NT) {
+  const int slot = q / (D / 8);
+  bool mine = false;
+  for (int r = 0; r < R; ++r) mine = mine || (pos[r] % CAP) == slot;
+  if (!mine) ((device uint4*)ring_out)[q] = ((const device uint4*)ring)[q];
+}
+#endif
+
 // The last threadgroup takes the hc split, the ones before it the window rows; then each walks its units.
 const int kv_l = int(G) - 2 - int(tg);
 if (int(tg) == G - 1) {
@@ -64,8 +76,12 @@ if (int(tg) == G - 1) {
     const float scale = dsv41_pow2ceil(metal::max(metal::simd_max(metal::abs(r)), 1e-4f) * (1.0f / 448.0f));
     r = dsv41_fp8_roundtrip(metal::clamp(r / scale, -448.0f, 448.0f)) * scale;
     kv_row[kv_l * D + d] = T(r);
+#if DSV41_WQB_RING
+    ring_out[((pos[kv_l] + PLANT) % CAP) * D + d] = T(r);
+#endif
   }
 }
+
 
 // qr = rms(qa, q_norm) of the R rows into xs (each value a bf16 already): a thread takes 8 consecutive k of each row.
 float inv[R];
@@ -116,7 +132,7 @@ if constexpr (UI > 0) {
     dsv41_wqb_w<PI> wi;
     dsv41_wqb_load<PI>(wi, (const device uint4*)w_i + n_base * 80, (const device uchar*)s_i + n_base * 40, lane);
     float acc[PI][R];
-    dsv41_wqb_dots<R, PI>(wi, xs, lane, acc);
+    dsv41_wqb_dots<R, PI, FOLD>(wi, xs, lane, acc);
     float vals[PI];
     float amax = 0.0f;
     for (int p = 0; p < PI; ++p) {
@@ -165,7 +181,7 @@ if (i_q < UI + UQ) {
       dsv41_wqb_load<1>(nx, (const device uint4*)w_q + n_next * 80, (const device uchar*)s_q + n_next * 40, lane);
     }
     float acc[1][R];
-    dsv41_wqb_dots<R, 1>(wq, xs, lane, acc);
+    dsv41_wqb_dots<R, 1, FOLD>(wq, xs, lane, acc);
     float vr = 0.0f;
     for (int r = 0; r < R; ++r) {
       const float t = float(T(dsv41_wqb_sum16(acc[0][r])));

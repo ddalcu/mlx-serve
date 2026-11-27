@@ -29,7 +29,42 @@ const max_files = 8;
 const State = struct {
     files: [max_files]struct { fd: c_int, block: u64 } = @splat(.{ .fd = -1, .block = 0 }),
     n_files: usize = 0,
+    held: [max_held]Held = @splat(.{}),
+    n_held: usize = 0,
 };
+
+/// A file region held in memory (`hold`): reads inside it are copies, never a pread.
+const max_held = 16;
+const Held = struct { fd: c_int = -1, lo: u64 = 0, mem: []const u8 = &.{} };
+
+/// Reads of `fd` inside [lo, lo + mem.len) copy from `mem` (borrowed until `unhold`). False when the list is full.
+pub fn hold(fd: c_int, lo: u64, mem: []const u8) bool {
+    if (ps().n_held == max_held) return false;
+    ps().held[ps().n_held] = .{ .fd = fd, .lo = lo, .mem = mem };
+    ps().n_held += 1;
+    return true;
+}
+
+/// Every region of `fd` let go of.
+pub fn unhold(fd: c_int) void {
+    var i: usize = 0;
+    while (i < ps().n_held) {
+        if (ps().held[i].fd == fd) {
+            ps().held[i] = ps().held[ps().n_held - 1];
+            ps().n_held -= 1;
+        } else i += 1;
+    }
+}
+
+/// `dst.len` bytes at `off` of `fd` copied from a held region; false when none holds them all.
+fn readHeld(fd: c_int, dst: []u8, off: u64) bool {
+    for (ps().held[0..ps().n_held]) |h| {
+        if (h.fd != fd or off < h.lo or off + dst.len > h.lo + h.mem.len) continue;
+        @memcpy(dst, h.mem[@intCast(off - h.lo)..][0..dst.len]);
+        return true;
+    }
+    return false;
+}
 pub const shared_state = @import("../../../sdk/util/shared.zig").Shared(State, "dsv41_engram_direct", .{});
 pub inline fn ps() *State {
     return shared_state.get();
@@ -76,6 +111,7 @@ fn blockOf(fd: c_int) u64 {
 pub fn readRow(fd: c_int, dst: []u8, off: u64) bool {
     // Windows opens no Engram table (`engram.Table.open`).
     if (comptime builtin.os.tag == .windows) return false;
+    if (ps().n_held > 0 and readHeld(fd, dst, off)) return true;
     const block = blockOf(fd);
     const lo = if (block > 0) off / block * block else off;
     const hi = if (block > 0) std.mem.alignForward(u64, off + dst.len, block) else off + dst.len;
@@ -115,6 +151,7 @@ pub const Block = struct {
     /// cover them (kept for the next row); one pread when `fd` is not registered or the span is past `max_span`.
     pub fn read(b: *Block, fd: c_int, dst: []u8, off: u64) bool {
         if (comptime builtin.os.tag == .windows) return false;
+        if (ps().n_held > 0 and readHeld(fd, dst, off)) return true;
         const block = blockOf(fd);
         if (block == 0) return readRow(fd, dst, off);
         if (b.lo != std.math.maxInt(u64) and off >= b.lo and off + dst.len <= b.lo + b.len) {
@@ -158,4 +195,25 @@ test "engram_direct readRecord: a record's codes then scales in one read, split;
     try std.testing.expectEqualSlices(u8, data[264..520], &cw);
     try std.testing.expectEqualSlices(u8, data[520..528], &cs);
     try std.testing.expect(!readRecord(fd, &cw, &cs, 2 * 264 + 100));
+}
+
+test "engram_direct hold: reads inside a held region copy from memory, never the file; outside it they read the file" {
+    var mem: [64]u8 = undefined;
+    for (&mem, 0..) |*x, i| x.* = @truncate(i *% 5 +% 1);
+    // A descriptor no file has: any pread through it fails.
+    const fd: c_int = 1 << 20;
+    try std.testing.expect(hold(fd, 1000, &mem));
+    defer unhold(fd);
+    var w: [8]u8 = undefined;
+    var s: [4]u8 = undefined;
+    try std.testing.expect(readRecord(fd, &w, &s, 1010));
+    try std.testing.expectEqualSlices(u8, mem[10..18], &w);
+    try std.testing.expectEqualSlices(u8, mem[18..22], &s);
+    var b: Block = .{};
+    try std.testing.expect(b.read(fd, &w, 1056));
+    try std.testing.expectEqualSlices(u8, mem[56..64], &w);
+    // Past the region's end: the file is read, and fails.
+    try std.testing.expect(!readRow(fd, &w, 1060));
+    unhold(fd);
+    try std.testing.expect(!readRow(fd, &w, 1010));
 }

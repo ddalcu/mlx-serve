@@ -75,6 +75,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--mtp-greedy-tail` | off | Sampled requests draft only the first MTP token by sampling, later ones by argmax; pairs with `--mtp-typical`. A model's `mtp_greedy_tail` in `model-settings.json` outranks it |
 | `--mtp-history-window N` | `0` (full) | Prompts past 16K tokens only build MTP head history for the last N tokens (windowing costs acceptance on stock Qwen heads) |
 | `--dspark` | off | DeepSeek V4's own block-parallel draft stages (~11 GB on top of the model). DeepSeek-V4.1 runs the stages its pack ships unless `--no-mtp` |
+| `--precision <p>` | lossless | DeepSeek-V4.1: `lossless` serves every lossless lever and the 8-bit LM head; `lossy` adds the LOSSY ones (int8 prompt trunk projections, the f16 attention core without NAX, DSpark typical acceptance at δ 0.3, ε 0.09 for sampled requests unless `--mtp-typical`, `--mtp-tokenv3` or a model setting sets it). The stack switches and every lever are in [the plugin README](../src/plugins/deepseek_v41/README.md) |
 | `--ssd-streaming` | off | ds4 / DeepSeek-V4-Flash GGUF only: stream expert weights from SSD instead of holding the whole model in RAM |
 | `--ane` | off | Serve dense qwen3_5 and Qwen3 MLX packs on the Neural Engine instead of the GPU, contexts up to 64K (a model's `"ane"` in `model-settings.json` wins); the first load on a Mac compiles its programs (minutes, then cached) |
 | `--ane-slots N` | `1` | Requests each Neural Engine model runs at once (1..4); slots share the weights, each adds its own KV and state |
@@ -111,8 +112,8 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--max-resident-mem N{MB,GB}` | auto | Summed memory cap across loaded models; decides whether a model may load at all (auto = the GPU working-set limit, `0` disables) |
 | `--max-resident-models N` | `3` | How many models stay loaded at once (LRU-evicted) |
 | `--idle-evict-secs N` | off | Unload models nobody is using after this many idle seconds |
-| `--no-warmup-eager` | off | Skip the eager warmup at boot and the warm-up a build owes a model the first time it loads it (the first prompts then compile its Metal kernels) |
-| `--warmup-full` | off | Compile a model's Metal kernels before it reports ready: the first time a build loads a model it serves itself a ladder of prompt sizes first (seconds to a minute, that one load only). **Strongly recommended when benchmarking.** Without it the model is ready at once, a short warm-up runs when the server is idle, and the first long prompts still compile |
+| `--no-warmup-eager` | off | Skip the eager warmup at boot and every load's warm requests (the first prompts then compile its Metal kernels) |
+| `--warmup-full` | off | Compile a model's Metal kernels before it reports ready: every load serves itself a ladder of prompt sizes and a prompt at its widest pass first (seconds; longer the first time a build compiles them). **Strongly recommended when benchmarking.** Without it the model is ready at once, a short warm-up runs on every load when the server is idle, and the first long prompts still compile |
 | `--skip-mem-preflight` | off | Skip the free-RAM pre-flight on load (the cap above is checked first, and still applies). Either way, a load that would not fit in free RAM first unloads idle models when that makes it fit |
 | `--no-tool-autocorrect` | off | Turn off schema-driven repair of model-emitted tool arguments |
 | `--log-level` | `info` | Log level (error, warn, info, debug) |

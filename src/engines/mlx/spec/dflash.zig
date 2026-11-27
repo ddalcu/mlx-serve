@@ -65,6 +65,8 @@ pub const DflashPol = struct {
     copy: dflash_policy.CopyStats = .{},
     /// Since the last pipelined plain tick ended; null once any other kind of round has run.
     plain_watch: ?io_util.Stopwatch = null,
+    /// `MLX_SERVE_DSPARK_POLICY2`: a solo DeepSeek-V4.1 round's rows, calibration and backoff instead of the fields above.
+    p2: ?@import("dflash/policy2.zig").Policy = null,
     /// A served drafter's rounds are chosen here, on the ladder its load timed; null = no ladder yet: plain steps.
     rounds: ?spec_rounds.Controller = null,
     /// Set on the request a load times its ladder with: the rounds it runs, and when the last one ended.

@@ -4,6 +4,7 @@ const transformer_mod = @import("../transformer.zig");
 const gdn_decode = @import("../../../sdk/blocks/gdn/decode.zig");
 const MtpBatchedGraph = @import("mtp/batched_graph.zig").MtpBatchedGraph;
 const SamplingParams = @import("../sampling/params.zig").SamplingParams;
+const AcceptParam = @import("../../../sdk/spec/mtp_acceptance.zig").Param;
 
 /// The verify forward's inputs for a draft tree of `parents` (row 0 the root,
 /// -1) at `depth`: the GDN tree table and each row's ancestor path.
@@ -33,4 +34,4 @@ pub fn specTreeFor(parents: []const i32, depth: []const i32, max_depth: i32) tra
     };
 }
 
-pub const MtpGraphFn = *const fn (mlx.mlx_array, []const mlx.mlx_array, ?[]const mlx.mlx_array, u32, f32, SamplingParams, mlx.mlx_stream) anyerror!MtpBatchedGraph;
+pub const MtpGraphFn = *const fn (mlx.mlx_array, []const mlx.mlx_array, ?[]const mlx.mlx_array, u32, AcceptParam, SamplingParams, mlx.mlx_stream) anyerror!MtpBatchedGraph;

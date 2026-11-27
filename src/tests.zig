@@ -14,6 +14,22 @@ comptime {
 /// The test process caps MLX's buffer pool as the server's `main` does; `build/test_runner.zig` calls it first.
 export fn msv_test_process_init() void {
     @import("mlx/state.zig").applyMlxCacheLimit();
+    @import("sdk/testing/world.zig").processInit();
+}
+
+/// Before every test (`build/test_runner.zig`): the test world, then the latched state it resets, listed here because
+/// only the test root reaches every module.
+export fn msv_test_enter() void {
+    @import("sdk/testing/world.zig").enter();
+    @import("engines/mlx/generate.zig").prefillCli().* = .{};
+    @import("host/registry/memory_ceiling.zig").overrides().* = .{};
+    if (@import("engines/mlx/plugin/dsv41_link.zig").on) {
+        @import("plugins/deepseek_v41/fuse.zig").shared_state.get().* = .{};
+        @import("plugins/deepseek_v41/decode/fp8_codes.zig").shared_state.get().* = .{};
+        @import("plugins/deepseek_v41/prompt/flash_attn.zig").shared_state.get().* = .{};
+        @import("plugins/deepseek_v41/deepseek_v41.zig").testReset();
+    }
+    @import("plugins/deepseek_v4/deepseek_v4.zig").testReset();
 }
 
 test {
@@ -37,7 +53,10 @@ test {
     _ = @import("sdk/blocks/mlp/fused_activations_test.zig");
     _ = @import("sdk/blocks/moe/decode_test.zig");
     _ = @import("sdk/blocks/moe/verify_kernels_test.zig");
+    _ = @import("sdk/blocks/moe/gqmv_fp4_test.zig");
     _ = @import("sdk/quant/block_test.zig");
+    _ = @import("sdk/quant/fp4.zig");
+    _ = @import("sdk/quant/fp_encode.zig");
     _ = @import("sdk/quant/hadamard/format_test.zig");
     _ = @import("sdk/vision/splice_test.zig");
     _ = @import("sdk/blocks/kda/gate_test.zig");
@@ -72,8 +91,27 @@ test {
     _ = @import("plugins/bert/proof_test.zig");
     _ = @import("plugins/deepseek_v4/proof_test.zig");
     _ = @import("plugins/deepseek_v4/served_test.zig");
-    _ = @import("plugins/deepseek_v41/proof_test.zig");
-    _ = @import("plugins/deepseek_v41/draft_test.zig");
+    // DeepSeek-V4.1 is in macOS builds only (`dsv41_link`).
+    _ = @import("engines/mlx/plugin/dsv41_link.zig");
+    if (@import("engines/mlx/plugin/dsv41_link.zig").on) {
+        _ = @import("plugins/deepseek_v41/proof_test.zig");
+        _ = @import("plugins/deepseek_v41/draft_test.zig");
+        _ = @import("plugins/deepseek_v41/streamed_test.zig");
+        _ = @import("plugins/deepseek_v41/mx_view.zig");
+        _ = @import("plugins/deepseek_v41/vision.zig");
+        _ = @import("engines/mlx/plugin/deepseek_test.zig");
+        _ = @import("plugins/deepseek_v41/engram.zig");
+        _ = @import("plugins/deepseek_v41/deepseek_v41.zig");
+        _ = @import("plugins/deepseek_v41/levers.zig");
+        _ = @import("plugins/deepseek_v41/decode/moe_fp4_test.zig");
+        _ = @import("plugins/deepseek_v41/prompt/m_invariance_test.zig");
+        _ = @import("plugins/deepseek_v41/prompt/pass_async_test.zig");
+        _ = @import("plugins/deepseek_v41/prompt/ced_lazy_test.zig");
+        _ = @import("plugins/deepseek_v41/prompt/wide_test.zig");
+        _ = @import("plugins/deepseek_v41/prompt/trunk_q_test.zig");
+        _ = @import("plugins/deepseek_v41/prompt/pf_int8_plan_test.zig");
+        _ = @import("plugins/deepseek_v41/fuse.zig");
+    }
     _ = @import("plugins/muse_glimmer/proof_test.zig");
     _ = @import("plugins/qwen3_asr/proof_test.zig");
     _ = @import("plugins/qwen3_5/proof_test.zig");
@@ -95,6 +133,7 @@ test {
     _ = @import("sdk/util/rtfmt.zig");
     _ = @import("env.zig");
     _ = @import("sdk/util/win_io.zig");
+    _ = @import("sdk/util/spawn_test.zig");
     _ = @import("sdk/quant/gguf/claim.zig");
     _ = @import("sdk/weights/streamed/expert.zig");
     _ = @import("sdk/weights/streamed/expert/io.zig");
@@ -117,7 +156,6 @@ test {
     _ = @import("sdk/weights/streamed/expert/direct_parts_test.zig");
     _ = @import("sdk/weights/streamed/expert/demand_first_test.zig");
     _ = @import("sdk/weights/streamed/mlx_pack_test.zig");
-    _ = @import("plugins/deepseek_v41/streamed_test.zig");
     _ = @import("version.zig");
     _ = @import("mlx/ops.zig");
     _ = @import("mlx/kernels.zig");
@@ -174,7 +212,6 @@ test {
     _ = @import("plugins/muse_glimmer/vision.zig");
     _ = @import("plugins/lfm2/vision.zig");
     _ = @import("plugins/glm5_next/vision.zig");
-    _ = @import("plugins/deepseek_v41/vision.zig");
     _ = @import("plugins/qwen3_5/minicpm_vision.zig");
     _ = @import("plugins/qwen3_5/minicpm_canvas.zig");
     _ = @import("plugins/qwen3_asr/audio_tower.zig");
@@ -247,6 +284,7 @@ test {
     _ = @import("engines/mlx/spec/dflash/dflash.zig");
     _ = @import("engines/mlx/spec/dflash/lilicorr.zig");
     _ = @import("engines/mlx/spec/dflash/policy.zig");
+    _ = @import("engines/mlx/spec/dflash/policy2.zig");
     _ = @import("sdk/spec/mtp/mtp.zig");
     _ = @import("engines/mlx/spec/mtp_test.zig");
     _ = @import("engines/mlx/spec/round_cost.zig");
@@ -258,10 +296,7 @@ test {
     _ = @import("plugins/glm5_next/served_test.zig");
     _ = @import("sdk/bases/kda_hybrid/cuts_test.zig");
     _ = @import("plugins/bailing_hybrid/bill_test.zig");
-    _ = @import("engines/mlx/plugin/deepseek_test.zig");
-    _ = @import("plugins/deepseek_v41/engram.zig");
     _ = @import("sdk/weights/nocache_reader.zig");
-    _ = @import("plugins/deepseek_v41/deepseek_v41.zig");
     _ = @import("plugins/qwen4_exp/qwen4_exp.zig");
     _ = @import("plugins/qwen4_exp/ple_gpu.zig");
     _ = @import("plugins/kokoro/kokoro.zig");

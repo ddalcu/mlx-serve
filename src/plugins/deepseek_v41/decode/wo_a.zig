@@ -9,21 +9,23 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
+const world = @import("../../../sdk/testing/world.zig");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
-const mxfp8_qmv = @import("../../../sdk/blocks/qmm/mxfp8_qmv.zig");
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 const kit = @import("../../deepseek_v4/contract_kit.zig");
 const contract = @import("../contract.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
+const owner = @import("plan.zig");
 const fixture = @import("fixture.zig");
 
 const A = mlx.mlx_array;
 const Scope = dsv41.Scope;
 
 pub const SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_wo_a.metal");
-/// The e4m3 pair decode the SDK's mxfp8 GEMV uses, a word's four values, and the matrix units' tile op.
-pub const HEADER = mxfp8_qmv.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_wo_a_header.metal") ++ kernelSource("plugins/deepseek_v41/kernels/dec_nax_header.metal");
+/// The mxfp8 reads (MLX's, or the fold under `FOLD`) and the matrix units' tile op.
+pub const HEADER = decode.FP8_READ_HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_nax_header.metal");
 pub const INS = [_][*:0]const u8{ "pacc", "pm", "pl", "sink", "meta", "periods", "w", "scales", "counter" };
 pub const OUTS = [_][*:0]const u8{ "out", "parts" };
 
@@ -47,16 +49,18 @@ fn ci(v: usize) c_int {
 }
 
 /// Simdgroups of a threadgroup and the weight rows each streams: a threadgroup owns NSG * NR outputs. The matrix units
-/// take 32 rows a simdgroup, from `nax_rows` activation rows on (below, the vector units' one pass over the weights is
-/// the cheaper); they exist on M5 and newer.
+/// take 32 rows a simdgroup; they exist on M5 and newer.
 const NSG = 8;
 const NR = 8;
 const NAX_NSG = 4;
 const NAX_NR = 32;
+/// The matrix units serve from `nax_rows` rows on (below, the vector units' one pass over the weights is the cheaper).
+/// The owner's `one_row` (`plan.zig`, an exact verify) keeps every row on the vector units, the plain step's kernel:
+/// the matrix units' tile sums a row in another order.
 const nax_rows = 4;
 
-fn useNax(rows: c_int) bool {
-    return rows >= nax_rows and device.naxAvailable();
+pub fn useNax(rows: c_int, k: owner.Kernel) bool {
+    return k == .rows and rows >= nax_rows and device.naxAvailable();
 }
 
 /// One dispatch from the shapes: the grid, the threadgroup, the outputs and the template ints; null where the kernel
@@ -97,14 +101,15 @@ pub fn plan(rows: c_int, heads: c_int, splits: c_int, dim: c_int, groups: c_int,
 /// `oa` [R, groups * o_lora] in `act` from the split partials (`pacc` [R, H, S, D] f32, `pm` and `pl` [R, H, S]),
 /// the sink [H], `meta` (int32, [0] the first row's position), the inverse rope periods and wo_a's mxfp8 words
 /// `w` [groups, o_lora, K / 4] and scales [groups, o_lora, K / 32]; `extra` is an input the kernel never reads (a
-/// chain's dependency). Null where the shapes or formats are not the kernel's.
-pub fn launch(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, rd: usize, odt: mlx.mlx_dtype, ins: [8]A, counter: A, extra: ?A) !?A {
+/// chain's dependency); `k` the owner's kernel for the call (`plan.zig`). Null where the shapes or formats are not the
+/// kernel's.
+pub fn launch(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, rd: usize, odt: mlx.mlx_dtype, ins: [8]A, counter: A, extra: ?A, k: owner.Kernel) !?A {
     const ps = mlx.getShape(ins[0]);
     const ws = mlx.getShape(ins[6]);
     if (ps.len != 4 or ws.len != 3) return null;
     const dts = [_]mlx.mlx_dtype{ .float32, .float32, .float32, .float32, .int32, .float32, .uint32, .uint8 };
     for (ins, dts) |x, dt| if (mlx.mlx_array_dtype(x) != dt) return null;
-    const p = plan(ps[0], ps[1], ps[2], ps[3], ws[0], ws[1], rd, useNax(ps[0])) orelse return null;
+    const p = plan(ps[0], ps[1], ps[2], ps[3], ws[0], ws[1], rd, useNax(ps[0], k)) orelse return null;
     if (mlx.mlx_array_size(ins[3]) != ps[1] or mlx.mlx_array_size(ins[5]) != rd / 2 or ws[2] * 4 != p.ints[5].v * ps[3]) return null;
     const c = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
@@ -114,6 +119,7 @@ pub fn launch(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, rd: usize, odt: mlx.m
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, p.tg[0], p.tg[1], p.tg[2]));
     for (p.ints) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, t.name, t.v));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OT", odt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "FOLD", decode.fp8Fold()));
     var all: [10]A = undefined;
     @memcpy(all[0..8], &ins);
     all[8] = counter;
@@ -129,11 +135,11 @@ pub fn launch(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, rd: usize, odt: mlx.m
 
 /// The layer's `attnOutRoped` input from the splits: `oa` [R, 8192] in the model's activation dtype, what wo_b reads.
 /// Null (the old path runs) off the GPU, where wo_a is not the release's 8-bit mxfp8 of group 32, or past the rows,
-/// splits or head width `plan` declines.
-pub fn apply(sc: *Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer, kern: mlx.mlx_fast_metal_kernel, counter: A, inv: A, meta: A, pacc: A, pm: A, pl: A) !?A {
+/// splits or head width `plan` declines; `k` the owner's kernel for the call (`plan.zig`).
+pub fn apply(sc: *Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer, kern: mlx.mlx_fast_metal_kernel, counter: A, inv: A, meta: A, pacc: A, pm: A, pl: A, k: owner.Kernel) !?A {
     const wo = &ly.wo_a;
     if (!mlx.streamIsGpu(sc.s) or wo.s.ctx == null or wo.qp.mode != .mxfp8 or wo.qp.bits != 8 or wo.qp.group_size != 32) return null;
-    return launch(sc, kern, m.cfg.dsv4_rope_head_dim, m.act, .{ pacc, pm, pl, ly.sink, meta, inv, wo.w, wo.s }, counter, null);
+    return launch(sc, kern, m.cfg.dsv4_rope_head_dim, m.act, .{ pacc, pm, pl, ly.sink, meta, inv, wo.w, wo.s }, counter, null, k);
 }
 
 // ── the kernel contract ──
@@ -152,7 +158,7 @@ const OL = 1024;
 const act: mlx.mlx_dtype = .bfloat16;
 
 /// An e4m3 byte's value (sign, 4 exponent bits at bias 7, 3 mantissa bits; subnormal at exponent 0).
-fn e4m3(b: u8) f64 {
+pub fn e4m3(b: u8) f64 {
     const s: f64 = if (b & 0x80 != 0) -1 else 1;
     const e: i32 = (b >> 3) & 15;
     const m: f64 = @floatFromInt(b & 7);
@@ -160,7 +166,7 @@ fn e4m3(b: u8) f64 {
 }
 
 /// The e4m3 byte of the integer `c` (|c| <= 15, exact).
-fn e4m3Of(c: i32) u8 {
+pub fn e4m3Of(c: i32) u8 {
     if (c == 0) return 0;
     const a: u32 = @abs(c);
     const e: u5 = @intCast(31 - @clz(a));
@@ -192,6 +198,7 @@ const WoA = struct {
         g.out(&pl.parts, .float32);
         for (pl.ints) |t| g.int(t.name, t.v);
         g.dtype("OT", act);
+        g.int("FOLD", 0);
         return g;
     }
 
@@ -357,9 +364,11 @@ const served = [_]Shape{
     .{ .rows = 1, .n = 256, .k = HPG * HD },
     .{ .rows = 2, .n = 256, .k = HPG * HD },
     .{ .rows = 3, .n = 256, .k = HPG * HD },
+    .{ .rows = 4, .n = 256, .k = HPG * HD },
+    .{ .rows = decode.max_rows, .n = 256, .k = HPG * HD },
 };
 const served_nax = [_]Shape{
-    .{ .rows = nax_rows, .n = 256, .k = HPG * HD },
+    .{ .rows = 4, .n = 256, .k = HPG * HD },
     .{ .rows = decode.max_rows, .n = 256, .k = HPG * HD },
 };
 
@@ -451,11 +460,11 @@ fn chainWoA(sc: *Scope, r: A, w: A, s: A) !A {
     return sc.astype(try sc.reshape(try sc.transpose(oa, &.{ 1, 0, 2 }), &.{ L, -1 }), act);
 }
 
-const Parts = struct { pacc: []f32, pm: []f32, pl: []f32 };
+pub const Parts = struct { pacc: []f32, pm: []f32, pl: []f32 };
 
 /// Split partials with the structure the split kernel writes: each split's max `pm`, its weights' sum `pl` (>= 1),
 /// its output `pacc` = the weighted rows (so about `pl` times a row); some splits empty (max -inf, sum 0).
-fn makeParts(a: std.mem.Allocator, seed: u64, R: usize, H: usize, S: usize, D: usize) !Parts {
+pub fn makeParts(a: std.mem.Allocator, seed: u64, R: usize, H: usize, S: usize, D: usize) !Parts {
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
     const pm = try a.alloc(f32, R * H * S);
@@ -481,6 +490,11 @@ fn upload(data: []const f32, shape: []const c_int) A {
 /// The float64 truth: merge of the partials with the sink, the inverse rope, then wo_a over the dequantized `wd`
 /// [groups, o_lora, K] (f32 values, exact for the release's fp8), no rounding anywhere: [R, groups * o_lora].
 fn truth(a: std.mem.Allocator, parts: Parts, sink: []const f32, periods: []const f32, wd: []const f32, p0: usize, R: usize, S: usize) ![]f32 {
+    return truthAs(f32, a, parts, sink, periods, wd, p0, R, S);
+}
+
+/// `truth` kept in `T`.
+pub fn truthAs(comptime T: type, a: std.mem.Allocator, parts: Parts, sink: []const f32, periods: []const f32, wd: []const f32, p0: usize, R: usize, S: usize) ![]T {
     const H = 64;
     const G = 8;
     const K = H / G * HD;
@@ -510,13 +524,13 @@ fn truth(a: std.mem.Allocator, parts: Parts, sink: []const f32, periods: []const
             o[HD - RD + 2 * p + 1] = x1 * @sin(th) + x2 * @cos(th);
         }
     };
-    const out = try a.alloc(f32, R * G * OL);
+    const out = try a.alloc(T, R * G * OL);
     for (0..R) |m| for (0..G) |g| for (0..OL) |n| {
         const wr = wd[(g * OL + n) * K ..][0..K];
         const xr = x[m * H * HD + g * K ..][0..K];
         var s: f64 = 0;
         for (wr, xr) |wv, xv| s += @as(f64, wv) * xv;
-        out[m * G * OL + g * OL + n] = @floatCast(s);
+        out[m * G * OL + g * OL + n] = if (T == f64) s else @floatCast(s);
     };
     return out;
 }
@@ -564,12 +578,12 @@ test "dsv41 dec wo_a: 1 to 6 rows are no further from the float64 truth than tod
         defer gpa.free(t);
         const w32 = try dsv41.hostF32(want);
         defer gpa.free(w32);
-        const got = (try apply(&sc, fx.m, ly, kern, counter, inv, meta, pacc, pm, pl)) orelse return error.Declined;
+        const got = (try apply(&sc, fx.m, ly, kern, counter, inv, meta, pacc, pm, pl, .rows)) orelse return error.Declined;
         try testing.expectEqual(@as(c_int, ci(8 * OL)), mlx.getShape(got)[1]);
         const g32 = try dsv41.hostF32(got);
         defer gpa.free(g32);
         // The counter has moved on: the same inputs give the same bytes.
-        const again = (try apply(&sc, fx.m, ly, kern, counter, inv, meta, pacc, pm, pl)) orelse return error.Declined;
+        const again = (try apply(&sc, fx.m, ly, kern, counter, inv, meta, pacc, pm, pl, .rows)) orelse return error.Declined;
         const a32 = try dsv41.hostF32(again);
         defer gpa.free(a32);
         try testing.expectEqualSlices(f32, g32, a32);
@@ -598,19 +612,22 @@ test "dsv41 dec wo_a: the declared launches are the wrapper's, byte for byte" {
     defer _ = mlx.mlx_fast_metal_kernel_free(kern);
     var sc = Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
-    for ([_]bool{ false, true }) |nax| {
-        if (nax and !device.naxAvailable()) continue;
+    // The vector launch below `nax_rows`, the matrix units' from there on NAX, and on the owner's `one_row` (an exact
+    // verify) the vector launch at every row count a verify block has (`useNax`).
+    const Arm = struct { rows: usize, nax: bool, exact: bool };
+    for ([_]Arm{ .{ .rows = 3, .nax = false, .exact = false }, .{ .rows = decode.max_rows, .nax = true, .exact = false }, .{ .rows = decode.max_rows, .nax = false, .exact = true } }) |arm| {
+        if (arm.nax and !world.nax()) continue;
         const c = try a.create(kit.Case(WoA));
         defer {
             c.deinit();
             a.destroy(c);
         }
-        c.* = .init(a, if (nax) &decl_nax else &decl, .{ .nax = nax });
-        try testing.expect(try c.prepare(.{ .rows = if (nax) 6 else 3, .n = 128, .k = HPG * HD }, .random, 7));
+        c.* = .init(a, if (arm.nax) &decl_nax else &decl, .{ .nax = arm.nax });
+        try testing.expect(try c.prepare(.{ .rows = arm.rows, .n = 128, .k = HPG * HD }, .random, 7));
         try c.run();
         const mine = try a.dupe(u8, c.rig.outputBytes());
         defer a.free(mine);
-        const got = (try launch(&sc, kern, RD, act, c.args[0..8].*, c.args[8], null)) orelse return error.Declined;
+        const got = (try launch(&sc, kern, RD, act, c.args[0..8].*, c.args[8], null, if (arm.exact) .one_row else .rows)) orelse return error.Declined;
         try testing.expectEqualSlices(u8, mine, try c.rig.bytesOf(&.{got}));
     }
 }
@@ -654,7 +671,7 @@ const Bench = struct {
         self.prev = if (self.old) blk: {
             const heads = try chainMerge(self.sc, self.merge, RD, self.common, dep);
             break :blk try chainWoA(self.sc, heads, c.w, c.s);
-        } else (try launch(self.sc, self.kern, RD, act, .{ self.common[0], self.common[1], self.common[2], self.common[3], self.common[4], self.common[5], c.w, c.s }, self.counter, dep)) orelse return error.Declined;
+        } else (try launch(self.sc, self.kern, RD, act, .{ self.common[0], self.common[1], self.common[2], self.common[3], self.common[4], self.common[5], c.w, c.s }, self.counter, dep, .rows)) orelse return error.Declined;
         return self.prev;
     }
 };
@@ -726,4 +743,19 @@ test "dsv41 dec wo_a: ubench" {
         decode.report("wo_a", R, try decode.chainUs(&b, copies.len), bytes, old_us);
         std.debug.print("[dec-ubench] wo_a R={d}: eval-only {d:.1} us, replaced chain {d:.1} us\n", .{ R, try evalUs(&b, copies.len), old_eval });
     }
+}
+
+test "dsv41 wo_a: on the owner's one_row (an exact verify) every row takes the vector kernel a plain step takes" {
+    for (1..decode.max_rows + 1) |r| try testing.expect(!useNax(@intCast(r), .one_row));
+}
+
+test "dsv41 wo_a: on the owner's rows a NAX GPU's verify takes the matrix units from 4 rows" {
+    try testing.expect(!useNax(3, .rows));
+    try testing.expectEqual(world.nax(), useNax(4, .rows));
+}
+
+test "dsv41 dec wo_a: MLX's mxfp8 reads give the FOLD form's bytes on finite codes, vector and matrix units" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try decode.expectFoldSame(WoA, &decl, .{}, &served);
+    if (world.nax()) try decode.expectFoldSame(WoA, &decl_nax, .{ .nax = true }, &served_nax);
 }

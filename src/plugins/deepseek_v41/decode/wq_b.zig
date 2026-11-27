@@ -1,6 +1,8 @@
 //! k2 `wq_b` (`~/plans/dsv41-decode-kernels-spec.md`): q_norm, then wq_b (and the indexer's) with the rope tails, the window row and the attention split.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
@@ -13,7 +15,7 @@ const A = mlx.mlx_array;
 const none: A = .{ .ctx = null };
 
 pub const SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_wq_b.metal");
-pub const HEADER = dsv41.FP8_HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_wq_b_header.metal");
+pub const HEADER = dsv41.FP8_HEADER ++ @import("../../../sdk/quant/fp4.zig").SCALE_HEADER ++ kernelSource("plugins/deepseek_v41/kernels/fp8_read_header.metal") ++ kernelSource("plugins/deepseek_v41/kernels/dec_wq_b_header.metal");
 pub const INS = [_][*:0]const u8{ "qa", "qn", "w_q", "s_q", "w_i", "s_i", "kv", "kvn", "periods", "periods_i", "pos", "z", "eps" };
 pub const OUTS = [_][*:0]const u8{ "q", "q_idx", "kv_row", "pre", "post", "comb" };
 
@@ -25,7 +27,26 @@ pub fn build() !mlx.mlx_fast_metal_kernel {
     return dsv41.buildKernel("dsv41_dec_wq_b", &INS, &OUTS, SOURCE, HEADER);
 }
 
-pub const Out = struct { q: A, q_idx: ?A, kv_row: A, sa: dsv41.Split };
+/// The ring variant (`MLX_SERVE_DSV41_FUSE_WQB_RING`): the same kernel, also given the layer's window ring, returns it
+/// with the launch's window rows at their slots, so no slice_update launch sits between wq_b and attention.
+pub const RING_HEADER = HEADER ++ "#define DSV41_WQB_RING 1\n";
+pub const RING_INS = INS ++ [_][*:0]const u8{"ring"};
+pub const RING_OUTS = OUTS ++ [_][*:0]const u8{"ring_out"};
+
+pub fn buildRing() !mlx.mlx_fast_metal_kernel {
+    return dsv41.buildKernel("dsv41_dec_wq_b_ring", &RING_INS, &RING_OUTS, SOURCE, RING_HEADER);
+}
+
+/// `MLX_SERVE_DSV41_FUSE_WQB_RING` (read each call): =1 the plain step and verify write the window ring in wq_b.
+pub fn ringOn() bool {
+    return lev.onUnlessZero(.FUSE_WQB_RING);
+}
+
+/// The ring a launch writes into: the layer's ring buffer `[cap, 512]` (the window's dtype, the rows'), `plant` 0
+/// served (the tests' planted slot shift otherwise).
+pub const RingArg = struct { kern: mlx.mlx_fast_metal_kernel, buf: A, plant: usize = 0 };
+
+pub const Out = struct { q: A, q_idx: ?A, kv_row: A, sa: dsv41.Split, ring: A = none };
 
 /// Simdgroups a threadgroup holds, and the threadgroups that walk the units: two a GPU core (one where the GPU's
 /// cores are unknown).
@@ -82,6 +103,17 @@ pub fn rowsAt(sc: *dsv41.Scope, p0: usize, rows: usize) !A {
 
 /// `run` with `g` threadgroups walking the units.
 pub fn launch(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: mlx.mlx_fast_metal_kernel, ly: *const dsv41.Layer, li: usize, qa: A, kv: A, z: A, pos: A, g: usize) !?Out {
+    return launchWith(sc, m, kern, ly, li, qa, kv, z, pos, g, null);
+}
+
+/// `run` that also writes the rows into one state's window ring (`RingArg`; `Out.ring` the new ring): null where the
+/// kernel or the ring's shape declines (the caller then writes the ring itself).
+pub fn runRing(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: mlx.mlx_fast_metal_kernel, ly: *const dsv41.Layer, li: usize, qa: A, kv: A, z: A, pos: A, ring: RingArg) !?Out {
+    return launchWith(sc, m, kern, ly, li, qa, kv, z, pos, groups(), ring);
+}
+
+/// `launch`, with the ring variant where `ring` is given.
+pub fn launchWith(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: mlx.mlx_fast_metal_kernel, ly: *const dsv41.Layer, li: usize, qa: A, kv: A, z: A, pos: A, g: usize, ring: ?RingArg) !?Out {
     const c = &m.cfg;
     if (m.qat_off or m.act != .bfloat16 or !mlx.streamIsGpu(sc.s)) return null;
     const rows = dim(qa, 0);
@@ -95,6 +127,10 @@ pub fn launch(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: mlx.mlx_fast_m
     if (ly.idx) |iw| if (c.dsv4_index_head_dim != 128 or idx_n % 32 != 0 or !mxfp8Rows(iw.wq_b, idx_n)) return null;
     if (heads * hd % (SGS * 2) != 0 or g < rows + 1) return null;
     const iw_q = if (ly.idx) |iw| iw.wq_b else ly.wq_b;
+    if (ring) |r| {
+        const rs = mlx.getShape(r.buf);
+        if (rs.len != 2 or rs[1] != KV or rs[0] < rows or mlx.mlx_array_dtype(r.buf) != mlx.mlx_array_dtype(kv)) return null;
+    }
 
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
@@ -108,6 +144,7 @@ pub fn launch(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: mlx.mlx_fast_m
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(rows), ci(hc) }, 2, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(rows), ci(hc) }, 2, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(rows), ci(hc), ci(hc) }, 3, .float32));
+    if (ring) |r| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, mlx.getShape(r.buf).ptr, 2, act));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(g * SGS * 32), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(SGS * 32), 1, 1));
     inline for (.{
@@ -121,19 +158,25 @@ pub fn launch(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: mlx.mlx_fast_m
         .{ "RD", c.dsv4_rope_head_dim },
     }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", act));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "FOLD", decode.fp8Fold()));
+    if (ring) |r| {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "CAP", mlx.getShape(r.buf)[0]));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "PLANT", ci(r.plant)));
+    }
     const eps = try dsv41.hcEps(sc, m);
-    const iv = mlx.mlx_vector_array_new_data(&[_]A{ qa, ly.q_norm, ly.wq_b.w, ly.wq_b.s, iw_q.w, iw_q.s, kv, ly.kv_norm, dsv41.ropeFor(m, li).fwd, m.rope_yarn.fwd, pos, z, eps }, INS.len);
+    const ins = [_]A{ qa, ly.q_norm, ly.wq_b.w, ly.wq_b.s, iw_q.w, iw_q.s, kv, ly.kv_norm, dsv41.ropeFor(m, li).fwd, m.rope_yarn.fwd, pos, z, eps, if (ring) |r| r.buf else none };
+    const iv = mlx.mlx_vector_array_new_data(&ins, if (ring != null) RING_INS.len else INS.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, sc.s));
-    var o: [OUTS.len]A = undefined;
-    for (&o, 0..) |*a, k| {
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, if (ring) |r| r.kern else kern, iv, cfg, sc.s));
+    var o: [RING_OUTS.len]A = undefined;
+    for (o[0..if (ring != null) RING_OUTS.len else OUTS.len], 0..) |*a, k| {
         a.* = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_vector_array_get(a, ov, k));
         _ = try sc.keep(a.*);
     }
-    return .{ .q = o[0], .q_idx = if (ly.idx != null) o[1] else null, .kv_row = o[2], .sa = .{ .pre = o[3], .post = o[4], .comb = o[5] } };
+    return .{ .q = o[0], .q_idx = if (ly.idx != null) o[1] else null, .kv_row = o[2], .sa = .{ .pre = o[3], .post = o[4], .comb = o[5] }, .ring = if (ring != null) o[6] else none };
 }
 
 // ── kernel contract ──
@@ -159,6 +202,20 @@ const wq_b_l = metal.Launch{
     .m2 = 512,
 };
 
+const wq_b_ring_l = metal.Launch{
+    .name = "dsv41_dec_wq_b_ring",
+    .inputs = &RING_INS,
+    .outputs = &RING_OUTS,
+    .source = SOURCE,
+    .header = RING_HEADER,
+    .tg_bytes = wq_b_l.tg_bytes,
+    .m1 = 512,
+    .m2 = 512,
+};
+
+/// The contract's window ring: the release's (sliding window 128 and the state's 16 rows of slack).
+const RING_CAP = 144;
+
 /// The kernel's inputs, in `INS` order.
 const I = struct {
     const qa = 0;
@@ -172,6 +229,7 @@ const I = struct {
     const pos = 10;
     const z = 11;
     const eps = 12;
+    const ring = 13;
 };
 
 /// An e4m3 byte's value (the OCP fn variant; S.1111.111 is never drawn).
@@ -319,11 +377,15 @@ fn preN(s: Shape) usize {
 fn combN(s: Shape) usize {
     return s.rows * cx.HC * cx.HC;
 }
+fn ringN(_: Shape) usize {
+    return RING_CAP * KV;
+}
 
 /// Contract shapes: `rows` the step's rows, `n` the q rows (heads x 512), `k` the indexer's rows (0: none); the
 /// latent is always K = 1280 wide. `g`: threadgroups that walk the units.
 const Wqb = struct {
-    pub const Params = struct { g: usize };
+    /// `ring`: the ring variant (`RING_INS`), its ring `[RING_CAP, 512]` the last input and output.
+    pub const Params = struct { g: usize, ring: bool = false };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows < 1 or s.rows > decode.max_rows or s.n == 0 or s.n % KV != 0 or s.k % cx.IHD != 0 or p.g < s.rows + 1) return null;
@@ -340,7 +402,13 @@ const Wqb = struct {
         g.out(&.{ ci(s.rows), cx.HC }, .float32);
         g.out(&.{ ci(s.rows), cx.HC, cx.HC }, .float32);
         inline for (.{ .{ "R", s.rows }, .{ "SGS", SGS }, .{ "G", p.g }, .{ "NQ", s.n }, .{ "NI", s.k }, .{ "HC", cx.HC }, .{ "ITERS", cx.ITERS }, .{ "RD", cx.RD } }) |t| g.int(t[0], t[1]);
+        if (p.ring) g.out(&.{ RING_CAP, KV }, cx.act);
         g.dtype("T", cx.act);
+        g.int("FOLD", 0);
+        if (p.ring) {
+            g.int("CAP", RING_CAP);
+            g.int("PLANT", 0);
+        }
         return g;
     }
 
@@ -362,6 +430,7 @@ const Wqb = struct {
         const pos = try k.add(.int32, &.{R});
         const z = try k.add(.float32, &.{ R, cx.MIX });
         const eps = try k.add(.float32, &.{2});
+        if (k.p.ring) kit.uniform(rng, try k.add(cx.act, &.{ RING_CAP, KV }), -3, 3);
         kit.uniform(rng, qa, -3, 3);
         kit.uniform(rng, qn, 0.5, 1.5);
         kit.uniform(rng, kv, -3, 3);
@@ -406,8 +475,45 @@ const Wqb = struct {
         }
     }
 
-    pub fn count(_: Params, s: Shape) usize {
-        return s.rows * (s.n + s.k + KV + cx.MIX);
+    pub fn count(p: Params, s: Shape) usize {
+        return s.rows * (s.n + s.k + KV + cx.MIX) + if (p.ring) ringN(s) else 0;
+    }
+
+    /// The ring variant's ring: the input ring with each row's window row at its slot (position % RING_CAP), from
+    /// `kv` (the window rows, `[rows, 512]`).
+    fn ringOf(k: anytype, kv: []const f64, out: []f64) void {
+        @memcpy(out, k.in(I.ring)[0 .. RING_CAP * KV]);
+        for (0..k.shape.rows) |r| {
+            const slot: usize = @as(usize, @intFromFloat(k.in(I.pos)[r])) % RING_CAP;
+            @memcpy(out[slot * KV ..][0..KV], kv[r * KV ..][0..KV]);
+        }
+    }
+
+    /// The ring variant's ring bytes against the input ring's and the launch's own window rows' bytes: every slot no
+    /// row lands on is the input's row, every row's slot that row's bytes (null: they agree).
+    fn ringCheck(k: anytype) ?[]const u8 {
+        const s = k.shape;
+        const R = s.rows;
+        const bytes = k.rig.outputBytes();
+        const kv_off = 2 * qN(s) + 4 * idxN(s);
+        const ring_off = kv_off + 2 * kvN(s) + 4 * R * cx.MIX;
+        for (0..RING_CAP) |slot| {
+            var src: ?usize = null;
+            for (0..R) |r| if (@as(usize, @intFromFloat(k.in(I.pos)[r])) % RING_CAP == slot) {
+                src = r;
+            };
+            const got = bytes[ring_off + slot * 2 * KV ..][0 .. 2 * KV];
+            if (src) |r| {
+                if (!std.mem.eql(u8, got, bytes[kv_off + r * 2 * KV ..][0 .. 2 * KV]))
+                    return std.fmt.bufPrint(&k.msg, "ring slot {d} is not row {d}'s window row", .{ slot, r }) catch "ring";
+            } else for (0..KV) |i| {
+                const want = k.in(I.ring)[slot * KV + i];
+                const g = spec.read(.bf16, got, i);
+                if (!(g == want or (std.math.isNan(g) and std.math.isNan(want))))
+                    return std.fmt.bufPrint(&k.msg, "ring slot {d} [{d}] is {e}, the input's {e}", .{ slot, i, g, want }) catch "ring";
+            }
+        }
+        return null;
     }
 
     /// The pre | post | comb outputs, one row of `z` after another.
@@ -461,8 +567,14 @@ const Wqb = struct {
         for (kv, o[0 .. R * KV]) |*v, iv| v.* = iv.lo;
         qatRows(.fp8, kv);
         const at = R * (s.n + s.k + KV);
-        splits(k, out[at..], sum);
-        for (mag[at..], out[at..]) |*m, w| m.* = @abs(w);
+        const n_split = R * cx.MIX;
+        splits(k, out[at..][0..n_split], sum);
+        for (mag[at..][0..n_split], out[at..][0..n_split]) |*m, w| m.* = @abs(w);
+        if (k.p.ring) {
+            const rg = out[at + n_split ..][0..ringN(s)];
+            ringOf(k, kv, rg);
+            for (mag[at + n_split ..][0..ringN(s)], rg) |*m, w| m.* = @abs(w);
+        }
     }
 
     /// Every output as the last run wrote it.
@@ -471,7 +583,7 @@ const Wqb = struct {
         const bytes = k.rig.outputBytes();
         var off: usize = 0;
         var at: usize = 0;
-        inline for (.{ .{ spec.Elem.bf16, qN(s) }, .{ spec.Elem.f32, idxN(s) }, .{ spec.Elem.bf16, kvN(s) }, .{ spec.Elem.f32, s.rows * cx.MIX } }) |part| {
+        inline for (.{ .{ spec.Elem.bf16, qN(s) }, .{ spec.Elem.f32, idxN(s) }, .{ spec.Elem.bf16, kvN(s) }, .{ spec.Elem.f32, s.rows * cx.MIX }, .{ spec.Elem.bf16, if (k.p.ring) ringN(s) else 0 } }) |part| {
             for (0..part[1]) |i| got[at + i] = spec.read(part[0], bytes[off..], i);
             off += part[1] * spec.size(part[0]);
             at += part[1];
@@ -488,16 +600,19 @@ const Wqb = struct {
         const got = buf[0..n];
         outputs(k, got);
         const at = R * (s.n + s.k + KV);
+        // The ring is a copy: its bytes are the input ring's and the launch's own window rows' at every gate.
+        if (k.p.ring) if (ringCheck(k)) |why| return why;
+        const end = at + R * cx.MIX;
         if (gate == .nonfinite) {
             const want = buf[n .. 2 * n];
             try compute(k, want, buf[2 * n ..], .{});
             // The quantized outputs last: a NaN row's codes are the known finding.
             if (cx.classes(&k.msg, got[0 .. R * s.n], want[0 .. R * s.n])) |why| return why;
-            if (cx.classes(&k.msg, got[at..], want[at..])) |why| return why;
+            if (cx.classes(&k.msg, got[at..end], want[at..end])) |why| return why;
             return cx.classes(&k.msg, got[R * s.n .. at], want[R * s.n .. at]);
         }
-        splits(k, buf[n + at .. 2 * n], .{});
-        if (cx.splitOk(&k.msg, got[at..], buf[n + at .. 2 * n])) |why| return why;
+        splits(k, buf[n + at .. n + end], .{});
+        if (cx.splitOk(&k.msg, got[at..end], buf[n + at .. n + end])) |why| return why;
         const wide = @max(s.n, s.k, KV);
         const qr = try a.alloc(Iv, R * K);
         defer a.free(qr);
@@ -539,6 +654,18 @@ pub fn register(set: *kc.Set) !void {
         .known = cx.nan_code,
         .tiles = .{ .{ .size = 4 }, .{}, .{ .size = cx.IHD, .step = cx.IHD, .min = cx.IHD } },
         .served = &.{ .{ .rows = 1, .n = 2 * KV, .k = 2 * cx.IHD }, .{ .rows = 6, .n = KV, .k = cx.IHD }, .{ .rows = 1, .n = KV, .k = 0 }, .{ .rows = 6, .n = 2 * KV, .k = 0 } },
+    });
+    try kit.add(set, Wqb, &wq_b_ring_l, .{ .g = 9, .ring = true }, .{
+        .name = "dsv41 dec wq_b ring (wq_b, and the window ring with the rows at their slots)",
+        .accum = .f32,
+        .depth = depthWqb,
+        .ops = cx.sinkhorn_ops,
+        .out = .bf16,
+        .outs = &.{ .{ .elem = .bf16, .count = qN }, .{ .elem = .f32, .count = idxN }, .{ .elem = .bf16, .count = kvN }, .{ .elem = .f32, .count = preN }, .{ .elem = .f32, .count = preN }, .{ .elem = .f32, .count = combN }, .{ .elem = .bf16, .count = ringN } },
+        .nan = cx.quant_nan,
+        .known = cx.nan_code,
+        .tiles = .{ .{ .size = 4 }, .{}, .{ .size = cx.IHD, .step = cx.IHD, .min = cx.IHD } },
+        .served = &.{ .{ .rows = 1, .n = 2 * KV, .k = 2 * cx.IHD }, .{ .rows = 6, .n = KV, .k = 0 } },
     });
 }
 
@@ -878,7 +1005,7 @@ test "dsv41 dec wq_b: the declared launch is the wrapper's dispatch, with and wi
     var set = kc.Set.init(testing.allocator);
     defer set.deinit();
     try register(&set);
-    try testing.expectEqual(@as(usize, 1), set.kernels.items.len);
+    try testing.expectEqual(@as(usize, 2), set.kernels.items.len);
     const fx = try fixture.Fixture.init(testing.allocator, .{ .lo = 20, .hi = 21, .experts = 2, .ctx = 0 });
     defer fx.deinit();
     var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
@@ -909,7 +1036,109 @@ test "dsv41 dec wq_b: the declared launch is the wrapper's dispatch, with and wi
             n += 1;
         };
         try testing.expectEqualSlices(u8, try rig.bytesOf(outs[0..n]), declared);
+        // The ring variant at the contract's ring: the wrapper's dispatch is the declared one.
+        const ring_k = try buildRing();
+        defer _ = mlx.mlx_fast_metal_kernel_free(ring_k);
+        const ring = try randn(&sc, 101 + rows, &.{ RING_CAP, KV }, .bfloat16, 2);
+        const gr = (try launchWith(&sc, fx.m, kern, &ly, 20, qa, kv, z, pos, 9, .{ .kern = ring_k, .buf = ring })) orelse return error.Declined;
+        const rargs = args ++ [_]A{ring};
+        try rig.launch(&wq_b_ring_l, Wqb.geometry(.{ .g = 9, .ring = true }, shape).?, &rargs);
+        const rdeclared = try testing.allocator.dupe(u8, rig.outputBytes());
+        defer testing.allocator.free(rdeclared);
+        var routs: [7]A = undefined;
+        var rn: usize = 0;
+        for ([_]?A{ gr.q, gr.q_idx, gr.kv_row, gr.sa.pre, gr.sa.post, gr.sa.comb, gr.ring }) |o| if (o) |a| {
+            routs[rn] = a;
+            rn += 1;
+        };
+        try testing.expectEqualSlices(u8, try rig.bytesOf(routs[0..rn]), rdeclared);
     };
+}
+
+/// The host ring after the chain's write (`Ring.write`): `ring` with row r of `kv` at slot (p0 + r) % cap.
+fn ringAfter(ring: A, kv: A, p0: usize) ![]f32 {
+    const h = try dsv41.hostF32(ring);
+    const rows = try dsv41.hostF32(kv);
+    defer testing.allocator.free(rows);
+    const cap = dim(ring, 0);
+    for (0..dim(kv, 0)) |r| @memcpy(h[((p0 + r) % cap) * KV ..][0..KV], rows[r * KV ..][0..KV]);
+    return h;
+}
+
+test "dsv41 dec wq_b ring: the ring variant's outputs are the plain launch's and its ring the chain's write, 1..6 rows, across the ring's end; a shifted slot fails" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const kern = try build();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    const ring_k = try buildRing();
+    defer _ = mlx.mlx_fast_metal_kernel_free(ring_k);
+    const fx = try fixture.Fixture.init(testing.allocator, .{ .lo = 20, .hi = 21, .experts = 2, .ctx = 0 });
+    defer fx.deinit();
+    var n_cases: usize = 0;
+    for ([_]bool{ true, false }) |with_idx| for (1..decode.max_rows + 1) |rows| for ([_]usize{ 3001, 144 * 21 - 3, 144 * 30 }) |p0| {
+        var ly = fx.layer(20).*;
+        if (!with_idx) ly.idx = null;
+        var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+        defer sc.deinit();
+        const qa = try randn(&sc, 111 + rows, &.{ ci(rows), K }, .bfloat16, 2);
+        const kv = try randn(&sc, 121 + rows, &.{ ci(rows), KV }, .bfloat16, 2);
+        const z = try randn(&sc, 131 + rows, &.{ ci(rows), 24 }, .float32, 1.5);
+        const ring = try randn(&sc, 141 + rows + p0, &.{ RING_CAP, KV }, .bfloat16, 2);
+        const pos = try rowsAt(&sc, p0, rows);
+        const want = (try run(&sc, fx.m, kern, &ly, 20, qa, kv, z, pos)) orelse return error.Declined;
+        const got = (try runRing(&sc, fx.m, kern, &ly, 20, qa, kv, z, pos, .{ .kern = ring_k, .buf = ring })) orelse return error.Declined;
+        try testing.expectEqual(@as(usize, 0), try differing(got.q, want.q));
+        if (with_idx) try testing.expectEqual(@as(usize, 0), try differing(got.q_idx.?, want.q_idx.?));
+        try testing.expectEqual(@as(usize, 0), try differing(got.kv_row, want.kv_row));
+        try testing.expectEqual(@as(usize, 0), try differing(got.sa.pre, want.sa.pre) + try differing(got.sa.post, want.sa.post) + try differing(got.sa.comb, want.sa.comb));
+        const exp = try ringAfter(ring, want.kv_row, p0);
+        defer testing.allocator.free(exp);
+        const g = try dsv41.hostF32(got.ring);
+        defer testing.allocator.free(g);
+        try testing.expectEqualSlices(f32, exp, g);
+        // The planted bug: each row one slot late. The ring must differ from the chain's write.
+        const bad = (try runRing(&sc, fx.m, kern, &ly, 20, qa, kv, z, pos, .{ .kern = ring_k, .buf = ring, .plant = 1 })) orelse return error.Declined;
+        const b = try dsv41.hostF32(bad.ring);
+        defer testing.allocator.free(b);
+        var off: usize = 0;
+        for (exp, b) |e, v| off += @intFromBool(e != v);
+        try testing.expect(off > 0);
+        n_cases += 1;
+    };
+    std.debug.print("[wq_b ring] {d} cases: ring = the chain's write, outputs = the plain launch's; the shifted slot fails each\n", .{n_cases});
+}
+
+test "dsv41 dec wq_b ring: MLX_SERVE_DSV41_FUSE_WQB_RING=1 decodes the fixture's layers to the switch-off bytes over plain steps and a verify block" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const steps = [_]usize{ 1, 1, decode.max_rows, 1, 3, 1 };
+    for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 } }) |range| {
+        var outs: [2][steps.len][]f32 = undefined;
+        for ([_]bool{ false, true }, 0..) |on, arm| {
+            var ov = env.override(.MLX_SERVE_DSV41_FUSE_WQB_RING, if (on) "1" else "0");
+            defer ov.restore();
+            const fx = try fixture.Fixture.init(gpa, .{ .lo = range[0], .hi = range[1], .ctx = 601, .seed = 9, .act = .bfloat16, .fused = true });
+            defer fx.deinit();
+            var p0: usize = 601;
+            for (steps, 0..) |rows, k| {
+                const x = try fx.stream(rows);
+                defer _ = mlx.mlx_array_free(x);
+                const pre = try fx.cpre(rows);
+                defer _ = mlx.mlx_array_free(pre);
+                const out = try dsv41.workerStep(fx.m, gpa, x, pre, p0, false, false);
+                defer for (out) |o| {
+                    _ = mlx.mlx_array_free(o);
+                };
+                outs[arm][k] = try dsv41.hostF32(out[0]);
+                p0 += rows;
+            }
+        }
+        for (outs[0], outs[1], steps) |a, b, rows| {
+            defer gpa.free(a);
+            defer gpa.free(b);
+            std.debug.print("[wq_b ring] layers {d}..{d}, {d} rows: rel rms on vs off {e:.2}\n", .{ range[0], range[1], rows, decode.relRms(b, a) });
+            try testing.expectEqualSlices(f32, a, b);
+        }
+    }
 }
 
 test "dsv41 dec wq_b: gates 1-4 of the kernel contract hold for the registration" {
@@ -969,4 +1198,70 @@ test "dsv41 dec wq_b: ubench" {
         const sc_ = try splitTime(b, kern, groups(), rows, with_idx, true);
         std.debug.print("[dec-ubench-eval] {s} R={d}: host build {d:.1} us of the above, device alone {d:.1} us ({d:.0} GB/s); replaced chain {d:.1} + {d:.1}\n", .{ if (with_idx) "wq_b+idx" else "wq_b", rows, sp[0], sp[1], bytes / sp[1] / 1e3, sc_[0], sc_[1] });
     };
+}
+
+test "dsv41 dec wq_b: MLX's mxfp8 reads give the FOLD form's bytes on finite codes" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try decode.expectFoldSame(Wqb, &wq_b_l, .{ .g = 9 }, &.{ .{ .rows = 1, .n = 2 * KV, .k = 2 * cx.IHD }, .{ .rows = 6, .n = KV, .k = cx.IHD } });
+}
+
+
+/// One layer's wq_b over rows of fixed inputs at positions from `p0` (`decode.rowsInvariant`); `ring` the ring
+/// variant's kernel (its window buffer `buf`), or the plain launch.
+const RowsCase = struct {
+    sc: *dsv41.Scope,
+    m: *const dsv41.Dsv41Model,
+    kern: mlx.mlx_fast_metal_kernel,
+    ring: ?mlx.mlx_fast_metal_kernel,
+    buf: A,
+    ly: *const dsv41.Layer,
+    li: usize,
+    qa: A,
+    kv: A,
+    z: A,
+    p0: usize,
+
+    pub fn runRows(c: *RowsCase, lo: usize, hi: usize) !decode.RowOuts {
+        const sc = c.sc;
+        const pos = try rowsAt(sc, c.p0 + lo, hi - lo);
+        const qa = try sc.slice(c.qa, 0, lo, hi);
+        const kv = try sc.slice(c.kv, 0, lo, hi);
+        const z = try sc.slice(c.z, 0, lo, hi);
+        const o = (if (c.ring) |r| try runRing(sc, c.m, c.kern, c.ly, c.li, qa, kv, z, pos, .{ .kern = r, .buf = c.buf }) else try run(sc, c.m, c.kern, c.ly, c.li, qa, kv, z, pos)) orelse return error.Declined;
+        return .{ o.q, o.q_idx orelse none, o.kv_row, o.sa.pre, o.sa.post, o.sa.comb, none, none };
+    }
+};
+
+test "dsv41 exact rows: wq_b: each row of an R-row launch is its one-row launch's bytes at its position (q, the index q, the kv row, the hc split), R = 1..6, the plain and the ring launch (FUSE_WQB_RING), layers 20..25 and 2..4" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const kern = try build();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    const kr = try buildRing();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kr);
+    const MR = decode.max_rows;
+    var bad: usize = 0;
+    for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 } }) |range| {
+        const fx = try fixture.Fixture.init(testing.allocator, .{ .lo = range[0], .hi = range[1], .experts = 2, .ctx = 0 });
+        defer fx.deinit();
+        for (range[0]..range[1]) |li| for ([_]bool{ false, true }) |ring| {
+            var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+            defer sc.deinit();
+            var c: RowsCase = .{
+                .sc = &sc,
+                .m = fx.m,
+                .kern = kern,
+                .ring = if (ring) kr else null,
+                .buf = try sc.zeros(&.{ 144, KV }, .bfloat16),
+                .ly = fx.layer(li),
+                .li = li,
+                .qa = try randn(&sc, 141 + li, &.{ MR, K }, .bfloat16, 2),
+                .kv = try randn(&sc, 151 + li, &.{ MR, KV }, .bfloat16, 2),
+                .z = try randn(&sc, 161 + li, &.{ MR, 24 }, .float32, 1.5),
+                .p0 = 3001 + 13 * li,
+            };
+            var buf: [48]u8 = undefined;
+            bad += try decode.rowsInvariant(try std.fmt.bufPrint(&buf, "wq_b layer {d}{s}", .{ li, if (ring) " ring" else "" }), &c);
+        };
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
 }

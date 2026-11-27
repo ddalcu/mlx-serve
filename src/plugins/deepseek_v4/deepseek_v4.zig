@@ -1657,6 +1657,14 @@ pub fn decChainSetForTest(v: ?bool) void {
     dec_chain_state = v;
 }
 
+/// The test world's reset (`src/tests.zig` calls it before every test): the arms the test hooks force and the latched
+/// trace switch, as a fresh process holds them.
+pub fn testReset() void {
+    emit_kernel_state = null;
+    dec_chain_state = null;
+    dsv4_trace_state = null;
+}
+
 /// comp_in decode-side int8 requant engagement counter — the serving arm is
 /// gated by the user-facing `--decode-attn-quant` config flag
 /// (`decode_attn_quant.decodeAttnQuantEnabled`), same contract as the laguna
@@ -6224,10 +6232,12 @@ fn winStack(ext: mlx.mlx_array, off: usize, n_win: usize, r: usize, cd: usize, s
 /// with the ext-row indexing (pre-ring rows vs comp_in chunk rows + ape)
 /// resolved in-kernel. Softmax/RMS reduction trees are ascending-f32 like the
 /// composed chain (drift snapped by the sims; decode-equivalence arbitrates,
-/// sinkhorn-kernel precedent); the QAT sim's scale/grid exponents use
-/// frexp/ldexp bit arithmetic — EXACT, matching the host f64 semantics rather
-/// than the composed chain's f32 log2/ceil approximations.
+/// sinkhorn-kernel precedent); the QAT sim's scales and grid are MLX's e8m0
+/// (rounded up) and e4m3 / e2m1 encoders — EXACT, matching the host f64
+/// semantics rather than the composed chain's f32 log2/ceil approximations.
 pub const EMIT_WIN_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/emit_win.metal");
+/// The QAT sims' encoders (emission and decode chain): MLX's e8m0 / e4m3 / e2m1 and its NaN-keeping max and clip.
+pub const QAT_HEADER = @import("../../sdk/quant/fp_encode.zig").HEADER;
 
 var emit_kernel_obj: ?mlx.mlx_fast_metal_kernel = null;
 var emit_kernel_build_failed: bool = false;
@@ -6240,7 +6250,7 @@ fn emitKernelObj() ?mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
-    const kernel = mlx.mlx_fast_metal_kernel_new("dsv4_emit_win", in_vec, out_vec, EMIT_WIN_KERNEL_SOURCE, "", true, false);
+    const kernel = mlx.mlx_fast_metal_kernel_new("dsv4_emit_win", in_vec, out_vec, EMIT_WIN_KERNEL_SOURCE, QAT_HEADER, true, false);
     if (kernel.ctx == null) {
         emit_kernel_build_failed = true;
         log.warn("dsv4: fused emission kernel failed to build — composed graph fallback\n", .{});
@@ -6468,7 +6478,7 @@ fn decChainObj() ?mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
-    const kernel = mlx.mlx_fast_metal_kernel_new("dsv4_dec_chain", in_vec, out_vec, DEC_CHAIN_KERNEL_SOURCE, "", true, false);
+    const kernel = mlx.mlx_fast_metal_kernel_new("dsv4_dec_chain", in_vec, out_vec, DEC_CHAIN_KERNEL_SOURCE, QAT_HEADER, true, false);
     if (kernel.ctx == null) {
         dec_chain_build_failed = true;
         log.warn("dsv4: fused decode-chain kernel failed to build — composed chain fallback\n", .{});

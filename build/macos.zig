@@ -6,6 +6,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const libs = @import("libs.zig");
 const plugins = @import("plugins.zig");
+const linux = @import("linux.zig");
 
 pub const Graph = struct {
     b: *std.Build,
@@ -255,17 +256,21 @@ fn unitModule(g: *const Graph, includes: []const std.Build.Module.IncludeDir, ro
 pub const Tests = struct {
     /// `zig build test`.
     step: *std.Build.Step,
+    /// `zig build test-aux`: what `test` runs besides the unit-test binary (a gate that runs the binary itself runs this).
+    aux: *std.Build.Step,
     /// `zig build test-build`.
     build: *std.Build.Step,
     /// The unit-test binary's shard runs.
     runs: []const *std.Build.Step.Run,
-    filter: ?[]const u8,
+    /// `-Dtest-filter`, once or repeated: a test runs when its name contains any of them; empty = every test.
+    filters: []const []const u8,
 };
 
 /// `test-build` and `test`: the unit tests, plus the plugins' own tests, the lint's and the import closure check.
 pub fn addUnitTests(g: *const Graph) Tests {
     const b = g.b;
-    const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
+    // Repeat `-Dtest-filter` to run several groups from ONE compile (a test runs when it matches any of them).
+    const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this substring (repeat it: a test runs if it matches any)") orelse &.{};
     const qwen_preprocess_fixture = b.option(
         []const u8,
         "qwen-preprocess-fixture",
@@ -273,16 +278,18 @@ pub fn addUnitTests(g: *const Graph) Tests {
     );
     const unit_tests = b.addTest(.{
         .root_module = g.test_mod,
-        .filters = if (test_filter) |f| &.{f} else &.{},
+        .filters = test_filters,
         .test_runner = .{ .path = b.path("build/test_runner.zig"), .mode = .server },
     });
 
     const test_build = b.step("test-build", "Compile unit tests without running them");
     test_build.dependOn(&b.addInstallArtifact(unit_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
 
-    // The one test binary runs as `test-shards` processes in parallel, each every n-th test (build/test_runner.zig);
-    // a filtered run is one process.
-    const shards: u32 = if (test_filter != null) 1 else b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse defaultShards();
+    // The one test binary runs as `test-shards` processes in parallel, each a time-balanced share of the tests
+    // (build/test_runner.zig), filtered or not; a `sharded:` test runs in every one. `-Dtest-shards=1`: one process.
+    const shards: u32 = b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse defaultShards();
+    // The flip proof (`scripts/flip_proof.py`): every test starts with this lever at its other arm (sdk/testing/world.zig).
+    const test_flip = b.option([]const u8, "test-flip", "Run every test with this lever (NAME or NAME=value) at its other arm: the flip proof");
     const test_runs = b.allocator.alloc(*std.Build.Step.Run, shards) catch @panic("OOM");
     const test_step = b.step("test", "Run unit tests");
     // A Run step given an env var copies the WHOLE configure-time environment into the cached configuration, so the
@@ -293,10 +300,16 @@ pub fn addUnitTests(g: *const Graph) Tests {
         if (shards > 1) {
             run.*.setEnvironmentVariable("MLX_SERVE_TEST_SHARD", b.fmt("{d}/{d}", .{ k, shards }));
             run.*.setName(b.fmt("run test shard {d}/{d}", .{ k, shards }));
+            // Shards balanced by each test's measured time (`scripts/test_plan.py` writes the plan).
+            run.*.addPrefixedFileArg("--plan=", b.path("build/test_plan.tsv"));
         }
         // A filtered run is a targeted one, often gated on an env var (ANE_TEST_PACK, QWEN4_TEST_MODEL)
         // that the run's cache key does not see: it reruns every time.
-        if (test_filter != null) run.*.has_side_effects = true;
+        if (test_filters.len != 0) run.*.has_side_effects = true;
+        if (test_flip) |f| {
+            run.*.setEnvironmentVariable("MLX_SERVE_TEST_FLIP", f);
+            run.*.has_side_effects = true;
+        }
         if (qwen_preprocess_fixture) |fixture| {
             run.*.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
             run.*.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
@@ -305,11 +318,33 @@ pub fn addUnitTests(g: *const Graph) Tests {
         }
         test_step.dependOn(&run.*.step);
     }
-    plugins.addTests(b, test_step);
-    config.addTests(b, test_step);
-    test_step.dependOn(&b.top_level_steps.get("lint-test").?.step);
-    test_step.dependOn(&b.top_level_steps.get("unit-closure").?.step);
-    return .{ .step = test_step, .build = test_build, .runs = test_runs, .filter = test_filter };
+    const aux = b.step("test-aux", "Run the build's, the lint's and the vz agent's own tests and the import closure check");
+    plugins.addTests(b, aux);
+    config.addTests(b, aux);
+    aux.dependOn(&b.top_level_steps.get("lint-test").?.step);
+    aux.dependOn(&b.top_level_steps.get("unit-closure").?.step);
+    test_step.dependOn(aux);
+    return .{ .step = test_step, .aux = aux, .build = test_build, .runs = test_runs, .filters = test_filters };
+}
+
+/// `test-compile`: what the unit-test runs need (the binary, the kit plugins they load), built with no test run. A gate
+/// compiles off the GPU (in parallel with other compiles), then `test` with the same options finds it all cached and only
+/// runs. Wired after `kit.add`, which hangs the kit plugins' builds on the runs.
+pub fn addTestCompile(b: *std.Build, tests: Tests) void {
+    const step = b.step("test-compile", "Build everything the unit-test runs need, running no test");
+    for (tests.runs[0].step.dependencies.items) |d| step.dependOn(d);
+}
+
+/// `test-aux-build`: the zig tests `test-aux` runs, compiled into `zig-out/tests/aux/` and not run. A gate runs each
+/// binary itself (from the repo root, as `test-aux` does) and reads its per-test lines. Called after every `test-aux`
+/// test is added.
+pub fn addAuxBuild(b: *std.Build, tests: Tests) void {
+    const step = b.step("test-aux-build", "Compile the zig tests of test-aux into zig-out/tests/aux, running none");
+    for (tests.aux.dependencies.items) |d| {
+        const run = d.cast(std.Build.Step.Run) orelse continue;
+        const t = run.producer orelse continue;
+        step.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests/aux" } } }).step);
+    }
 }
 
 /// Every shard holds its own GPU tests' memory, and the heaviest (dsv41 moe_down) wants ~10 GB: a 16 GB Mac hung with
@@ -330,7 +365,7 @@ pub fn addPluginTests(g: *const Graph, tests: Tests) void {
         libs.addMlxLib(b, host);
         if (g.host.frameworks) |fw| host.addFrameworkPath(.{ .cwd_relative = fw });
         for ([_][]const u8{ "IOKit", "CoreFoundation", "Foundation", "Metal", "IOSurface" }) |f| host.linkFramework(f, .{});
-        const t = b.addTest(.{ .name = "exl3-test", .root_module = libs.addExl3Module(b, host, g.target, opt), .filters = if (tests.filter) |f| &.{f} else &.{} });
+        const t = b.addTest(.{ .name = "exl3-test", .root_module = libs.addExl3Module(b, host, g.target, opt), .filters = tests.filters });
         tests.build.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         // ~13 min and 14 GB: its own step, run at phase gates, outside `zig build test`.
         b.step("exl3-test", "Run the in-tree EXL3/STQ (sushi) tests").dependOn(&b.addRunArtifact(t).step);
@@ -342,9 +377,26 @@ pub fn addPluginTests(g: *const Graph, tests: Tests) void {
 /// binary, so this is AstGen + Sema alone — the whole tree in seconds, where
 /// emitting it costs minutes (LLVM, single-threaded, ~4x more again at
 /// ReleaseFast). For the edit loop; a real build still gates every change.
+/// `zig build check-cross`: the same for the server on Windows and Linux, as build/linux.zig sets its module up
+/// (`linux.options`, `linux.serverModule`): code that compiles only on macOS (a macOS-only plugin's use its stubs
+/// elsewhere do not cover: `engines/mlx/plugin/dsv41_absent.zig`) fails there, on a Mac.
 pub fn addCheck(g: *const Graph) void {
     const b = g.b;
     const check = b.step("check", "Type-check everything, emitting no binary");
     check.dependOn(&b.addExecutable(.{ .name = "mlx-serve", .root_module = g.exe_mod }).step);
     check.dependOn(&b.addTest(.{ .root_module = g.test_mod }).step);
+    const cross = b.step("check-cross", "Type-check the server for Windows and Linux, emitting no binary");
+    for (cross_check) |q| {
+        const t = b.resolveTargetQuery(q);
+        const opts = linux.options(b, t, .{ .version = g.version, .mlx_c_version = "unknown", .ds4_commit = "unknown", .llama_tag = "unknown", .units = false, .slow_tests = false });
+        const mod = linux.serverModule(b, t, g.optimize, "src/main.zig", opts, null);
+        cross.dependOn(&b.addExecutable(.{ .name = b.fmt("mlx-serve-{s}", .{@tagName(q.os_tag.?)}), .root_module = mod }).step);
+    }
 }
+
+/// The targets `check-cross` type-checks (build/linux.zig's graph builds them). glibc 2.39 (Ubuntu 24.04's): `std.c`
+/// declares what the Linux build calls (arc4random_buf, 2.36) from the target's version.
+const cross_check = [_]std.Target.Query{
+    .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu },
+    .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 39, .patch = 0 } },
+};

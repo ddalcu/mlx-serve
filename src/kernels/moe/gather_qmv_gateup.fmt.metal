@@ -1,6 +1,9 @@
 auto lane = thread_index_in_simdgroup;
 uint n = thread_position_in_grid.y;      // output row within the expert
-uint e = thread_position_in_grid.z;      // top-K slot
+// grid.z: a (batch row, top-k slot) pair; ONE_ROW (the single-row decode) has one row, so z is the slot.
+uint combo = thread_position_in_grid.z;
+uint e = ONE_ROW ? combo : combo % uint(TOPK);
+uint row = ONE_ROW ? 0u : combo / uint(TOPK);
 
 int K = int(K_size);
 int N = int(N_size);
@@ -10,10 +13,10 @@ int K_by_w = K * BITS / 32;
 int K_by_gs = K / GS;
 uint mask = (1u << BITS) - 1u;
 
-uint eid = inds[e];
+uint eid = inds[(size_t)row * (size_t)TOPK + e];
 size_t wbase = (size_t)eid * (size_t)N * (size_t)K_by_w + (size_t)n * (size_t)K_by_w;
 size_t gbase = (size_t)eid * (size_t)N * (size_t)K_by_gs + (size_t)n * (size_t)K_by_gs;
-size_t xrow = 0;
+size_t xrow = (size_t)row * (size_t)K;
 
 // Every lane's packed words are issued up front (KP = K_by_p is a
 // template constant): −0.7% per forward in idle same-boot pairs vs
@@ -39,17 +42,22 @@ for (int i = 0; i < IT; ++i) {{
   int gi = k_base / GS;
 {s}
 }}
-float acc_g = simd_sum((g0 + g1) + (g2 + g3)){s};
-float acc_u = simd_sum((u0 + u1) + (u2 + u3)){s};
+float acc_g = simd_sum((g0 + g1) + (g2 + g3));
+float acc_u = simd_sum((u0 + u1) + (u2 + u3));
 if (lane == 0) {{
-  // Round exactly where the unfused path's two kernels wrote T(acc),
-  // then the same table-lookup SwiGLU.
+  // Round where the split path's gathers write T(acc); each expert's scale is the split path's rounded multiply.
   T gt = T(acc_g);
   T ut = T(acc_u);
-  if constexpr (LIMIT > 0) {{ // a swiglu_limit: clampedSwiGLU's clamps on the rounded values
-    gt = metal::min(gt, T(LIMIT));
-    ut = metal::max(metal::min(ut, T(LIMIT)), T(-LIMIT));
+  if constexpr (GSCALE != 0) gt = T(gt * gsc[eid]);
+  if constexpr (USCALE != 0) ut = T(ut * usc[eid]);
+  if constexpr (LIMIT > 0) {{
+    // clampedSwiGLU's minimum and clip on the rounded values; a NaN compares false and stays NaN, as MLX keeps it.
+    const T lim = T(LIMIT);
+    const T nlim = T(-LIMIT);
+    gt = gt > lim ? lim : gt;
+    ut = ut < nlim ? nlim : ut;
+    ut = ut > lim ? lim : ut;
   }}
   T sig = sigtab[as_type<ushort>(gt)];
-  y[(size_t)e * (size_t)N + (size_t)n] = (gt * sig) * ut;
+  y[(((size_t)row * (size_t)TOPK) + e) * (size_t)N + (size_t)n] = (gt * sig) * ut;
 }}

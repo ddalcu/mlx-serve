@@ -9,7 +9,7 @@ const iou = @import("../../sdk/util/io_util.zig");
 const decode = @import("decode/decode.zig");
 const fixture = @import("decode/fixture.zig");
 const dsv41 = @import("deepseek_v41.zig");
-const device = @import("../../mlx/device.zig");
+const world = @import("../../sdk/testing/world.zig");
 
 const A = mlx.mlx_array;
 const testing = std.testing;
@@ -106,7 +106,7 @@ fn groupDraft(gpa: std.mem.Allocator, ms: *Models, states: [ranks][]const *dsv41
 
 /// The same ids; the confidences within the four-rank trunk's bar, against the largest one.
 fn expectSameIds(want: []const dsv41.DsparkDraft, got: []const dsv41.DsparkDraft) !void {
-    const tol: f32 = if (device.naxAvailable()) 1e-2 else 1e-3;
+    const tol: f32 = if (world.nax()) 1e-2 else 1e-3;
     var peak: f32 = 0;
     for (want) |a| for (a.confidence) |u| {
         peak = @max(peak, @abs(u));

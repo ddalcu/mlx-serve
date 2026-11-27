@@ -1,0 +1,17 @@
+# Tests that run in the serial lane: one process, after the parallel lanes, beside no other test. A line is a substring
+# of the test's name, then a tab and `#` and why (scripts/test_plan.py reads it into build/test_plan.tsv).
+the bell wakes rank 1 once per ring and reports a host that left	# binds 127.0.0.1:39412
+the worker answers whether it has the host's copy of the model when it joins	# binds 127.0.0.1:39422
+an override directory replaces whole-file kernel texts and nothing else	# a fixed .zig-cache/tmp path it deletes
+crt: write, reopen to append, read back, rename over an existing file	# fixed crt_test_*.tmp files in the cwd
+dsv41 io: the watchdog forces a gate whose bytes never land; stop and the host release the rest	# 90-450 ms window
+glm io: an id's 4 minis (one submit, GLM-5.3's shape: 4 gate/up and 4 down ranges) read on several workers	# reads inside a 200 ms delay
+dsv41 io cov: q3ld_stop alone wakes and joins a worker held at a pre-range's bind point	# 2 s join window
+validatePath refuses a FIFO without waiting for a writer	# 2 s probe window
+fake engine: the own-thread table passes the contract	# 300 ms status gate
+fake engine: the host-GPU-thread table passes the contract	# 300 ms status gate
+fake engine: the contract catches every planted flaw, by name, in both threading modes	# 300 ms status gate
+llama adapter: the contract holds over a model-free bridge, batched and with MTP rounds	# 500 ms status gate
+ds4 adapter: the contract holds over a model-free bridge, speculative rounds and the plain path	# 500 ms status gate
+ane adapter: the contract holds over a model-free lm, several slots, and DFlash cycles	# 500 ms status gate
+dsv41 perplexity: non-overlapping windows of a token corpus through extend	# the whole pack resident (400+ GB)

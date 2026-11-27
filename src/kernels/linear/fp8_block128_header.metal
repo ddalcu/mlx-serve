@@ -7,8 +7,9 @@
 // and its sign at bit 15; subnormal codes land on half subnormals. The release holds no NaN code (S.1111.111: the
 // converter refuses one), so every word decodes exactly; the half -> float widen is exact.
 static inline void fp8r_halves(uint u, thread half2& lo, thread half2& hi) {
-  lo = as_type<half2>(((u & 0x007F007Fu) << 7) | ((u << 8) & 0x80008000u));
-  hi = as_type<half2>(((u >> 1) & 0x3F803F80u) | (u & 0x80008000u));
+  // MLX's e4m3 read (the shared fp4_scale header): 0x7f / 0xff are NaN.
+  lo = mlxserve_e4m3x2_h(u);
+  hi = mlxserve_e4m3x2_h(u >> 8);
 }
 
 // The GEMV's weights: f32 code x scale, given s256 = scale x 256 (exact): (e4m3(c) / 256) x (256 x scale) is the

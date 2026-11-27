@@ -3,6 +3,7 @@
 //! random stream rows through those layers: what the decode kernels' tests and ubenches run against.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const resident = @import("../../../sdk/weights/resident.zig");
 const sdk_fixture = @import("../../../sdk/testing/fixture.zig");
@@ -10,6 +11,7 @@ const config = @import("../config.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
 const device = @import("../../../mlx/device.zig");
+const world = @import("../../../sdk/testing/world.zig");
 const Shard = @import("../../../sdk/weights/shard.zig").Shard;
 
 const A = mlx.mlx_array;
@@ -34,7 +36,16 @@ pub const Opts = struct {
     /// Every routed projection affine at this width over groups of 128 (the expert-pruned packs) instead of the iQ
     /// pack's plan (gate/up 2 or 3 bits, down 3, groups of 64).
     experts_affine: ?u32 = null,
+    /// The routed experts as `dsv41_nvfp4_pack.py --experts-nvfp4` writes NVIDIA's: MLX nvfp4, group 16.
+    experts_nvfp4: bool = false,
+    /// ModelOpt's per-expert globals beside the routed experts, under the converter's names.
+    expert_scales: ExpertScales = .none,
+    /// An mxfp8 linear's base name whose first row's first 32-group is zeroed under e8m0 scale code 250 (`plantCode`).
+    plant: ?[]const u8 = null,
 };
+
+/// The per-expert global tensors a fixture writes: none, all three in (0.5, 2), or a set the load refuses.
+pub const ExpertScales = enum { none, all, missing_up, nan_gate };
 
 pub const DraftOpts = struct {
     /// The DSpark stages' routed experts (the release has 128).
@@ -55,6 +66,10 @@ pub const Fixture = struct {
     draws: u64 = 0,
     /// The routed experts' affine group.
     group: c_int = 64,
+    /// The routed experts in MLX nvfp4 (`Opts.experts_nvfp4`).
+    nvfp4: bool = false,
+    /// The DSpark stages' routed experts in nvfp4 too (`initStagesAs`; the packs ship the stages' in mxfp4).
+    nvfp4_stages: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, opts: Opts) !*Fixture {
         mlx.installErrorHandler(); // the model's threadgroup probes raise on M1/M2: latch it, never exit
@@ -62,11 +77,15 @@ pub const Fixture = struct {
         errdefer gpa.destroy(fx);
         var cfg = try releaseConfig();
         cfg.num_experts = opts.experts;
-        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed, .group = if (opts.experts_affine != null) 128 else 64 };
+        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed, .group = if (opts.experts_affine != null) 128 else 64, .nvfp4 = opts.experts_nvfp4 };
         errdefer fx.w.deinit();
-        for (opts.lo..opts.hi) |li| try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4, opts.experts_affine);
+        for (opts.lo..opts.hi) |li| {
+            try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4, opts.experts_affine);
+            try fx.putExpertScales("layers.{d}.", li, opts.experts, opts.expert_scales);
+        }
+        if (opts.plant) |base| try fx.plantCode(base);
         if (opts.tp) |t| try fx.sliceShard(t);
-        fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = .{ .lo = opts.lo, .hi = opts.hi, .worker = true }, .act = opts.act, .tp = opts.tp });
+        fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = .{ .lo = opts.lo, .hi = opts.hi, .worker = true }, .act = opts.act, .tp = opts.tp, .exact_pair_ok = true });
         errdefer fx.m.deinit();
         if (!opts.fused) fx.m.dec.deinit();
         var p0: usize = 0;
@@ -81,6 +100,66 @@ pub const Fixture = struct {
             p0 += L;
         }
         if (opts.ctx == 0) fx.m.dec_state = try dsv41.initState(fx.m, gpa);
+        return fx;
+    }
+
+    /// A layer pair's host holding no trunk layer: the embedding, the final norm, the 8-bit head and the DSpark stages
+    /// with `experts` routed experts each (mxfp4, as both packs ship the stages'), what a draft runs on.
+    pub fn initStages(gpa: std.mem.Allocator, experts: u32, seed: u64) !*Fixture {
+        return initStagesAs(gpa, experts, seed, false, .none);
+    }
+
+    /// `initStages` with the stages' routed experts in MLX nvfp4 (`nvfp4`) and ModelOpt's per-expert globals (`scales`):
+    /// a format no pack ships (the stages' are mxfp4, which the loader refuses scales beside), for the code that would
+    /// read one.
+    pub fn initStagesAs(gpa: std.mem.Allocator, experts: u32, seed: u64, nvfp4: bool, scales: ExpertScales) !*Fixture {
+        const fx = try gpa.create(Fixture);
+        errdefer gpa.destroy(fx);
+        var cfg = try releaseConfig();
+        cfg.dsv41_dspark_experts = experts;
+        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = seed, .nvfp4 = nvfp4, .nvfp4_stages = nvfp4 };
+        errdefer fx.w.deinit();
+        const d: c_int = @intCast(cfg.hidden_size);
+        const v: c_int = @intCast(cfg.vocab_size);
+        const rank: c_int = @intCast(cfg.dsv4_dspark_markov_rank);
+        const targets: c_int = @intCast(cfg.dsv4_n_dspark_target_layers);
+        const last = cfg.dsv4_n_compress_ratios - cfg.num_hidden_layers - 1;
+        try fx.putLin("embed", .{}, &.{ v, d }, .bf16);
+        try fx.putLin("head", .{}, &.{ v, d }, .bf16);
+        try fx.putVec("norm.weight", .{}, &.{d}, .bfloat16, 1, 0.1);
+        for (0..last + 1) |si| {
+            try fx.putLayer(&cfg, "mtp.{d}.", si, experts, true, null);
+            try fx.putExpertScales("mtp.{d}.", si, experts, scales);
+        }
+        try fx.putLin("mtp.0.main_proj", .{}, &.{ d, targets * d }, .mxfp8);
+        try fx.putVec("mtp.0.main_norm.weight", .{}, &.{d}, .bfloat16, 1, 0.1);
+        try fx.putVec("mtp.{d}.norm.weight", .{last}, &.{d}, .bfloat16, 1, 0.1);
+        try fx.putLin("mtp.{d}.markov_head.markov_w1", .{last}, &.{ v, rank }, .bf16);
+        try fx.putLin("mtp.{d}.markov_head.markov_w2", .{last}, &.{ v, rank }, .bf16);
+        try fx.putLin("mtp.{d}.confidence_head.proj", .{last}, &.{ 1, d + rank }, .bf16);
+        fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = .{ .lo = 0, .hi = cfg.num_hidden_layers, .worker = false }, .dspark = true, .head_8bit = true });
+        return fx;
+    }
+
+    /// A whole model (embedding, head and trunk; no pair, Engram or DSpark) over `full_ratios`' layers at the release's
+    /// attention shapes: ratio 0, then ratio 2 with a KV and index source and a layer reading it, then the CED decoder
+    /// at ratio 1 from its own source (the split), an index source and a reader. `vocab` rows of embedding and head.
+    /// Its state is `m.dec_state`, as the plugin serves it.
+    pub fn initFull(gpa: std.mem.Allocator, experts: u32, vocab: u32, seed: u64) !*Fixture {
+        mlx.installErrorHandler();
+        const fx = try gpa.create(Fixture);
+        errdefer gpa.destroy(fx);
+        const cfg = try fullConfig(experts, vocab);
+        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = seed };
+        errdefer fx.w.deinit();
+        const d: c_int = @intCast(cfg.hidden_size);
+        try fx.putLin("embed", .{}, &.{ @intCast(vocab), d }, .bf16);
+        try fx.putLin("head", .{}, &.{ @intCast(vocab), d }, .bf16);
+        try fx.putVec("norm.weight", .{}, &.{d}, .bfloat16, 1, 0.1);
+        for (0..full_ratios.len) |li| try fx.putLayer(&cfg, "layers.{d}.", li, experts, true, null);
+        fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{});
+        errdefer fx.m.deinit();
+        if (fx.m.dec_state == null) fx.m.dec_state = try dsv41.initState(fx.m, gpa);
         return fx;
     }
 
@@ -186,6 +265,31 @@ pub const Fixture = struct {
         }
     }
 
+    /// `Opts.plant`: MLX reads the group as 0 x 2^123 = 0, an e8m0 read as a float exponent times 2^8 as 0 x +Inf.
+    fn plantCode(fx: *Fixture, base: []const u8) !void {
+        var nb: [160]u8 = undefined;
+        for ([_][]const u8{ ".weight", ".scales" }, 0..) |part, k| {
+            const p = fx.w.map.getPtr(try std.fmt.bufPrint(&nb, "{s}{s}", .{ base, part })) orelse return error.PlantMissing;
+            try mlx.check(mlx.mlx_array_eval(p.*));
+            const shape = mlx.getShape(p.*);
+            const n = mlx.mlx_array_size(p.*);
+            var b: A = undefined;
+            if (k == 0) {
+                const words = try fx.gpa.dupe(u32, (mlx.mlx_array_data_uint32(p.*) orelse return error.NoData)[0..n]);
+                defer fx.gpa.free(words);
+                @memset(words[0..8], 0);
+                b = mlx.mlx_array_new_data(words.ptr, shape.ptr, @intCast(shape.len), .uint32);
+            } else {
+                const codes = try fx.gpa.dupe(u8, (mlx.mlx_array_data_uint8(p.*) orelse return error.NoData)[0..n]);
+                defer fx.gpa.free(codes);
+                codes[0] = 250;
+                b = mlx.mlx_array_new_data(codes.ptr, shape.ptr, @intCast(shape.len), .uint8);
+            }
+            _ = mlx.mlx_array_free(p.*);
+            p.* = b;
+        }
+    }
+
     pub fn deinit(fx: *Fixture) void {
         fx.m.deinit();
         fx.w.deinit();
@@ -276,14 +380,40 @@ pub const Fixture = struct {
                 try mlx.check(mlx.mlx_array_eval(d));
                 return fx.putNamed(base ++ ".weight", args, d);
             },
-            .mxfp8, .mxfp4, .affine => {
+            .mxfp8, .mxfp4, .nvfp4, .affine => {
                 defer _ = mlx.mlx_array_free(w);
-                const q = if (fmt == .mxfp8) try quantize(w, 32, 8, "mxfp8") else if (fmt == .mxfp4) try quantize(w, 32, 4, "mxfp4") else try quantize(w, fx.group, @intCast(fmt.affine), "affine");
+                const q = switch (fmt) {
+                    .mxfp8 => try quantize(w, 32, 8, "mxfp8"),
+                    .mxfp4 => try quantize(w, 32, 4, "mxfp4"),
+                    .nvfp4 => try quantize(w, 16, 4, "nvfp4"),
+                    else => try quantize(w, fx.group, @intCast(fmt.affine), "affine"),
+                };
                 try fx.putNamed(base ++ ".weight", args, q[0]);
                 try fx.putNamed(base ++ ".scales", args, q[1]);
                 if (q[2].ctx != null) try fx.putNamed(base ++ ".biases", args, q[2]);
             },
         }
+    }
+
+    /// Layer `li`'s per-expert globals as `dsv41_nvfp4_pack.py --experts-nvfp4` names them, `[E]` bf16.
+    fn putExpertScales(fx: *Fixture, comptime pfx: []const u8, li: usize, E: u32, plan: ExpertScales) !void {
+        if (plan == .none) return;
+        const names = .{ "gate_proj.expert_scale", "up_proj.expert_scale", "expert_scale" };
+        inline for (names, 0..) |n, i| if (!(plan == .missing_up and i == 1)) {
+            const u = try fx.uniform(&.{@intCast(E)}, 0.5, 2);
+            defer _ = mlx.mlx_array_free(u);
+            var v = mlx.mlx_array_new();
+            if (plan == .nan_gate and i == 0) {
+                const nan = mlx.mlx_array_new_float(std.math.nan(f32));
+                defer _ = mlx.mlx_array_free(nan);
+                var t = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(t);
+                try mlx.check(mlx.mlx_add(&t, u, nan, mlx.gpuStream()));
+                try mlx.check(mlx.mlx_astype(&v, t, .bfloat16, mlx.gpuStream()));
+            } else try mlx.check(mlx.mlx_astype(&v, u, .bfloat16, mlx.gpuStream()));
+            try mlx.check(mlx.mlx_array_eval(v));
+            try fx.putNamed(pfx ++ "ffn.experts." ++ n, .{li}, v);
+        };
     }
 
     fn putVec(fx: *Fixture, comptime name: []const u8, args: anytype, shape: []const c_int, dt: mlx.mlx_dtype, mean: f32, std_: f32) !void {
@@ -305,8 +435,10 @@ pub const Fixture = struct {
         const ih: c_int = @intCast(c.dsv4_index_n_heads);
         const ihd: c_int = @intCast(c.dsv4_index_head_dim);
         const e: c_int = @intCast(E);
-        const kv_src = (c.dsv41_kv_sources >> @intCast(li)) & 1 != 0;
-        const ix_src = (c.dsv41_index_sources >> @intCast(li)) & 1 != 0;
+        // A stage compresses nothing and keeps no index.
+        const stage = comptime std.mem.startsWith(u8, pfx, "mtp.");
+        const kv_src = !stage and (c.dsv41_kv_sources >> @intCast(li)) & 1 != 0;
+        const ix_src = !stage and (c.dsv41_index_sources >> @intCast(li)) & 1 != 0;
         const ratio = c.dsv4_compress_ratios[li];
         // The release's expert plan: gate/up 3-bit at layers 1-9 and 14, 2-bit elsewhere; down 3-bit.
         const gu_bits: u32 = affine orelse if ((li >= 1 and li <= 9) or li == 14) 3 else 2;
@@ -340,20 +472,21 @@ pub const Fixture = struct {
         }
         try fx.putLin(pfx ++ "ffn.gate", .{li}, &.{ e, d }, .bf16);
         try fx.putVec(pfx ++ "ffn.gate.bias", .{li}, &.{e}, .float32, 0, 0.05);
-        try fx.putVec(pfx ++ "ffn.gate.bias_vl", .{li}, &.{e}, .float32, 0, 0.05);
+        if (!stage) try fx.putVec(pfx ++ "ffn.gate.bias_vl", .{li}, &.{e}, .float32, 0, 0.05);
         try fx.putLin(pfx ++ "ffn.shared_experts.w1", .{li}, &.{ inter, d }, .mxfp8);
         try fx.putLin(pfx ++ "ffn.shared_experts.w3", .{li}, &.{ inter, d }, .mxfp8);
         try fx.putLin(pfx ++ "ffn.shared_experts.w2", .{li}, &.{ d, inter }, .mxfp8);
         // One tensor an expert (the loader stacks them), so a full 384-expert bank never exists in bf16.
         for (0..E) |x| {
-            try fx.putLin(pfx ++ "ffn.experts.{d}.w1", .{ li, x }, &.{ inter, d }, if (fp4) .mxfp4 else .{ .affine = gu_bits });
-            try fx.putLin(pfx ++ "ffn.experts.{d}.w3", .{ li, x }, &.{ inter, d }, if (fp4) .mxfp4 else .{ .affine = gu_bits });
-            try fx.putLin(pfx ++ "ffn.experts.{d}.w2", .{ li, x }, &.{ d, inter }, if (fp4) .mxfp4 else .{ .affine = affine orelse 3 });
+            const nv = fx.nvfp4 and (std.mem.startsWith(u8, pfx, "layers.") or fx.nvfp4_stages);
+            try fx.putLin(pfx ++ "ffn.experts.{d}.w1", .{ li, x }, &.{ inter, d }, if (nv) .nvfp4 else if (fp4) .mxfp4 else .{ .affine = gu_bits });
+            try fx.putLin(pfx ++ "ffn.experts.{d}.w3", .{ li, x }, &.{ inter, d }, if (nv) .nvfp4 else if (fp4) .mxfp4 else .{ .affine = gu_bits });
+            try fx.putLin(pfx ++ "ffn.experts.{d}.w2", .{ li, x }, &.{ d, inter }, if (nv) .nvfp4 else if (fp4) .mxfp4 else .{ .affine = affine orelse 3 });
         }
     }
 };
 
-const Fmt = union(enum) { bf16, fp8_exact, mxfp8, mxfp4, affine: u32 };
+const Fmt = union(enum) { bf16, fp8_exact, mxfp8, mxfp4, nvfp4, affine: u32 };
 
 pub fn quantize(w: A, gs: c_int, bits: c_int, mode: [*:0]const u8) ![3]A {
     var qv = mlx.mlx_vector_array_new();
@@ -369,6 +502,28 @@ pub fn quantize(w: A, gs: c_int, bits: c_int, mode: [*:0]const u8) ![3]A {
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_eval(vec));
     return out;
+}
+
+/// `Fixture.initFull`'s layers' compress ratios.
+pub const full_ratios = [_]u8{ 0, 2, 2, 1, 1, 1 };
+
+/// The release's config cut to `full_ratios`' layers: KV sources 1 and 3 (3 the CED split, as 20 is the release's),
+/// index sources 1, 3 and 4, the candidate blocks from 3; no Engram, DSpark targets or vision.
+pub fn fullConfig(experts: u32, vocab: u32) !config.Config {
+    var cfg = try releaseConfig();
+    cfg.num_experts = experts;
+    cfg.vocab_size = vocab;
+    cfg.num_hidden_layers = full_ratios.len;
+    cfg.dsv4_n_compress_ratios = full_ratios.len;
+    @memset(&cfg.dsv4_compress_ratios, 0);
+    @memcpy(cfg.dsv4_compress_ratios[0..full_ratios.len], &full_ratios);
+    cfg.dsv41_kv_sources = (1 << 1) | (1 << 3);
+    cfg.dsv41_index_sources = (1 << 1) | (1 << 3) | (1 << 4);
+    cfg.dsv41_candidate_source = 3;
+    cfg.dsv41_n_engram_layers = 0;
+    cfg.dsv4_n_dspark_target_layers = 0;
+    cfg.dsv41_vision = false;
+    return cfg;
 }
 
 /// The release pack's config (`src/fixtures/model-configs`), parsed by the plugin.
@@ -456,7 +611,7 @@ test "dsv41 tensor parallel: two ranks on half the heads and experts, summing ea
     try std.testing.expectEqual(whole.m.cfg.num_attention_heads / 2, rank1.m.cfg.num_attention_heads);
     // On a NAX GPU MLX runs these f32 GEMMs as TF32 (`MLX_ENABLE_TF32`, on by default): a 10-bit mantissa. A wrong
     // shard sum is off by the summand, far above either bound.
-    const tol: f32 = if (device.naxAvailable()) 1e-2 else 1e-3;
+    const tol: f32 = if (world.nax()) 1e-2 else 1e-3;
     // Two spans and a tail: a wide chunk, whose spans each sum their attention.
     for ([_]usize{ 1, 6, dsv41.region_rows + 9, 2 * dsv41.SPAN + 8 }) |rows| {
         const in = try Input.of(whole, rows);
@@ -485,7 +640,7 @@ test "dist N-rank: four ranks on a quarter of the heads and experts, summing eac
     try std.testing.expectEqual(whole.m.cfg.num_attention_heads / 4, rank3.m.cfg.num_attention_heads);
     try std.testing.expectEqual(whole.m.cfg.dsv4_o_groups / 4, rank3.m.cfg.dsv4_o_groups);
     try std.testing.expectEqual(whole.m.cfg.moe_intermediate_size / 4, rank3.m.cfg.moe_intermediate_size);
-    const tol: f32 = if (device.naxAvailable()) 1e-2 else 1e-3;
+    const tol: f32 = if (world.nax()) 1e-2 else 1e-3;
     for ([_]usize{ 1, dsv41.region_rows + 9 }) |rows| {
         const in = try Input.of(whole, rows);
         defer in.deinit();
@@ -878,6 +1033,255 @@ fn expectSameArray(gpa: std.mem.Allocator, a: A, b: A) !void {
     const v = try dsv41.hostF32(b);
     defer gpa.free(v);
     try std.testing.expectEqualSlices(f32, u, v);
+}
+
+/// One stage over `x` from the mix `pre`, the stream as host f32 (`MLX_SERVE_DSV41_DRAFT_FUSED` as `fused` sets it).
+fn stageOut(gpa: std.mem.Allocator, m: *dsv41.Dsv41Model, st: *dsv41.State, li: usize, x: A, pre: A, fused: bool) ![]f32 {
+    const o = env.override(.MLX_SERVE_DSV41_DRAFT_FUSED, if (fused) "1" else "0");
+    defer o.restore();
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var p = pre;
+    return dsv41.hostF32(try dsv41.stageBlock(&sc, m, &.{st}, li, x, &p, m.ds_block, null));
+}
+
+test "dsv41 draft fused: a stage's attn_out and FFN on the fused decode kernels (MLX_SERVE_DSV41_DRAFT_FUSED) give the op chain's stream; a stream with its rows swapped fails" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    // Reordered sums only: the median over seeds and stages within 1% rel rms of the chain's stream.
+    const bar = 1e-2;
+    var rel: [9]f64 = undefined;
+    var n: usize = 0;
+    for ([_]u64{ 5, 6, 7 }) |seed| {
+        const fx = try initStagesNoQkv(gpa, 16, seed);
+        defer fx.deinit();
+        const m = fx.m;
+        var st = try dsv41.initState(m, gpa);
+        defer st.deinit();
+        for (st.ds) |*ring| {
+            const rows = try fx.normal(&.{ @intCast(ring.cap), @intCast(ring.width) }, .bfloat16, 0, 1);
+            _ = mlx.mlx_array_free(ring.buf);
+            ring.buf = rows;
+        }
+        st.n = 300;
+        const B: c_int = @intCast(m.ds_block);
+        const hc: c_int = @intCast(m.cfg.dsv4_hc_mult);
+        const d: c_int = @intCast(m.cfg.hidden_size);
+        for (0..m.n_mtp) |si| {
+            const li = m.n_layers + si;
+            const x = try fx.normal(&.{ B, hc, d }, .bfloat16, 0, 1);
+            defer _ = mlx.mlx_array_free(x);
+            var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+            defer sc.deinit();
+            const pre = try dsv41.onehotPre(&sc, m, @intCast(B));
+            const chain = try stageOut(gpa, m, &st, li, x, pre, false);
+            defer gpa.free(chain);
+            const fused = try stageOut(gpa, m, &st, li, x, pre, true);
+            defer gpa.free(fused);
+            for (fused) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+            // Bit-equal streams would mean the fused kernels never ran.
+            if (std.mem.eql(u8, std.mem.sliceAsBytes(chain), std.mem.sliceAsBytes(fused))) return error.FusedNotEngaged;
+            rel[n] = decode.relRms(fused, chain);
+            std.debug.print("[draft fused] seed {d} stage {d}: fused vs chain rel rms {e:.2}\n", .{ seed, si, rel[n] });
+            n += 1;
+            // The planted state bug: the fused stage over the stream with its first two rows swapped.
+            const swapped = try sc.concat(&.{ try sc.slice(x, 0, 1, 2), try sc.slice(x, 0, 0, 1), try sc.slice(x, 0, 2, m.ds_block) }, 0);
+            const bad = try stageOut(gpa, m, &st, li, swapped, pre, true);
+            defer gpa.free(bad);
+            if (decode.relRms(bad, chain) <= bar) return error.PlantedPassed;
+        }
+    }
+    std.mem.sort(f64, rel[0..n], {}, std.sort.asc(f64));
+    if (rel[n / 2] > bar) return error.FurtherFromChain;
+}
+
+test "dsv41 draft fused: an NVFP4 stage with ModelOpt's per-expert scales gives the op chain's stream, its route's down scale on (dropped, it fails)" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    mlx.installErrorHandler();
+    // Reordered sums only, as the stage test: the median over seeds and stages within 1% rel rms of the chain's stream.
+    const bar = 1e-2;
+    var rel: [6]f64 = undefined;
+    var n: usize = 0;
+    for ([_]u64{ 41, 42 }) |seed| {
+        const fx = try Fixture.initStagesAs(gpa, 16, seed, true, .all);
+        defer fx.deinit();
+        const m = fx.m;
+        var st = try dsv41.initState(m, gpa);
+        defer st.deinit();
+        for (st.ds) |*ring| {
+            const rows = try fx.normal(&.{ @intCast(ring.cap), @intCast(ring.width) }, .bfloat16, 0, 1);
+            _ = mlx.mlx_array_free(ring.buf);
+            ring.buf = rows;
+        }
+        st.n = 300;
+        const B: c_int = @intCast(m.ds_block);
+        const hc: c_int = @intCast(m.cfg.dsv4_hc_mult);
+        const d: c_int = @intCast(m.cfg.hidden_size);
+        for (0..m.n_mtp) |si| {
+            const li = m.n_layers + si;
+            const ly = &m.layers[li];
+            if (ly.experts.scale[2] == null) return error.NoDownScale;
+            const x = try fx.normal(&.{ B, hc, d }, .bfloat16, 0, 1);
+            defer _ = mlx.mlx_array_free(x);
+            var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+            defer sc.deinit();
+            const pre = try dsv41.onehotPre(&sc, m, @intCast(B));
+            const chain = try stageOut(gpa, m, &st, li, x, pre, false);
+            defer gpa.free(chain);
+            const fused = try stageOut(gpa, m, &st, li, x, pre, true);
+            defer gpa.free(fused);
+            for (fused) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+            if (std.mem.eql(u8, std.mem.sliceAsBytes(chain), std.mem.sliceAsBytes(fused))) return error.FusedNotEngaged;
+            rel[n] = decode.relRms(fused, chain);
+            // The planted bug, the one this test pins: the fused stage with the route's down scale dropped.
+            const ds = ly.experts.scale[2];
+            m.layers[li].experts.scale[2] = null;
+            const bad = stageOut(gpa, m, &st, li, x, pre, true);
+            m.layers[li].experts.scale[2] = ds;
+            const badv = try bad;
+            defer gpa.free(badv);
+            const prel = decode.relRms(badv, chain);
+            std.debug.print("[draft fused] nvfp4 + scales seed {d} stage {d}: fused vs chain rel rms {e:.2}, down scale dropped {e:.2}\n", .{ seed, si, rel[n], prel });
+            n += 1;
+            if (prel <= bar) return error.PlantedPassed;
+        }
+    }
+    std.mem.sort(f64, rel[0..n], {}, std.sort.asc(f64));
+    if (rel[n / 2] > bar) return error.FurtherFromChain;
+}
+
+/// `Fixture.initStages` with `MLX_SERVE_DSV41_DRAFT_QKV=0` at load: the stages' wq_a and wkv rows apart, so `dkern.in_proj`
+/// declines a stage and DRAFT_FUSED fuses only its attn_out and FFN.
+fn initStagesNoQkv(gpa: std.mem.Allocator, experts: u32, seed: u64) !*Fixture {
+    const o = env.override(.MLX_SERVE_DSV41_DRAFT_QKV, "0");
+    defer o.restore();
+    return Fixture.initStages(gpa, experts, seed);
+}
+
+/// `Fixture.initStages` with `MLX_SERVE_DSV41_DRAFT_QKV=1` at load, as a server with the switch loads: the stages' wq_a
+/// and wkv rows fused into q_kv, which `dkern.in_proj` needs to take a stage.
+fn initStagesQkv(gpa: std.mem.Allocator, experts: u32, seed: u64) !*Fixture {
+    const o = env.override(.MLX_SERVE_DSV41_DRAFT_QKV, "1");
+    defer o.restore();
+    return Fixture.initStages(gpa, experts, seed);
+}
+
+test "dsv41 draft qkv: with the switch at load a stage's wkv is a view of its fused q_kv rows and projects what q_kv's wkv rows do at 1, 5 and 300 rows; a view one row early fails" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    mlx.installErrorHandler();
+    const fx = try initStagesQkv(gpa, 16, 31);
+    defer fx.deinit();
+    const m = fx.m;
+    const hd = m.cfg.head_dim;
+    const d: c_int = @intCast(m.cfg.hidden_size);
+    for (0..m.n_mtp) |si| {
+        const ly = &m.layers[m.n_layers + si];
+        const qkv = ly.q_kv orelse return error.NoStageQkv;
+        if (ly.wq_a.w.ctx != null or ly.wkv.w.ctx == null) return error.StageRowsNotFused;
+        const rows: usize = @intCast(mlx.getShape(qkv.w)[0]);
+        // The planted view: the wkv rows one row early (q_a's last row in, wkv's last row out).
+        const bad_view = try dsv41.rowView(m, qkv, rows - hd - 1, rows - 1);
+        // The main rows `kvRow` projects: a prompt's worth and a round's.
+        for ([_]c_int{ 1, 5, 300 }) |n| {
+            var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+            defer sc.deinit();
+            const x = try fx.normal(&.{ n, d }, .bfloat16, 0, 1);
+            defer _ = mlx.mlx_array_free(x);
+            const y = try qkv.apply(&sc, x);
+            const nq: usize = @intCast(mlx.getShape(y)[1]);
+            const want = try dsv41.hostF32(try sc.slice(y, -1, nq - hd, nq));
+            defer gpa.free(want);
+            const got = try dsv41.hostF32(try ly.wkv.apply(&sc, x));
+            defer gpa.free(got);
+            const bad = try dsv41.hostF32(try bad_view.apply(&sc, x));
+            defer gpa.free(bad);
+            const rel = decode.relRms(got, want);
+            const prel = decode.relRms(bad, want);
+            std.debug.print("[draft qkv] stage {d} n {d}: the wkv view {e:.2} from q_kv's rows, a view one row early {e:.2}\n", .{ si, n, rel, prel });
+            if (rel > 1e-3) return error.ViewFurther;
+            if (prel <= 1e-2) return error.PlantedPassed;
+        }
+    }
+}
+
+test "dsv41 draft qkv: a stage on the fused in_proj and wq_b (DRAFT_QKV at load, DRAFT_FUSED) is no further from the op chain than the served stage (DRAFT_FUSED's FFN half), median over seeds; a stream with its rows swapped fails" {
+    try draftQkvFusedStage();
+}
+
+test "dsv41 draft qkv: on a GPU before in_proj's first generation (M1, M2) the fused-stage check skips, as in_proj's own tests do" {
+    device.device_gen_override = .{ .gen = 13, .phone = false };
+    defer device.device_gen_override = null;
+    try std.testing.expectError(error.SkipZigTest, draftQkvFusedStage());
+}
+
+fn draftQkvFusedStage() !void {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    if (world.gpuGen() < @import("in_proj.zig").first_gen) return error.SkipZigTest; // in_proj declines there
+    const gpa = std.testing.allocator;
+    mlx.installErrorHandler();
+    // Reordered sums only: each stage's distance to the op chain against the served stage's, the median over seeds and
+    // stages within 1.15x of it, or within the fused stage test's 1% bar.
+    const bar = 1e-2;
+    var rel: [9]f64 = undefined;
+    var served_rel: [9]f64 = undefined;
+    var n: usize = 0;
+    for ([_]u64{ 5, 6, 7 }) |seed| {
+        const fx = try initStagesQkv(gpa, 16, seed);
+        defer fx.deinit();
+        const m = fx.m;
+        var st = try dsv41.initState(m, gpa);
+        defer st.deinit();
+        for (st.ds) |*ring| {
+            const rows = try fx.normal(&.{ @intCast(ring.cap), @intCast(ring.width) }, .bfloat16, 0, 1);
+            _ = mlx.mlx_array_free(ring.buf);
+            ring.buf = rows;
+        }
+        st.n = 300;
+        const B: c_int = @intCast(m.ds_block);
+        const hc: c_int = @intCast(m.cfg.dsv4_hc_mult);
+        const d: c_int = @intCast(m.cfg.hidden_size);
+        for (0..m.n_mtp) |si| {
+            const li = m.n_layers + si;
+            const ly = &m.layers[li];
+            const x = try fx.normal(&.{ B, hc, d }, .bfloat16, 0, 1);
+            defer _ = mlx.mlx_array_free(x);
+            var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+            defer sc.deinit();
+            const pre = try dsv41.onehotPre(&sc, m, @intCast(B));
+            const chain = try stageOut(gpa, m, &st, li, x, pre, false);
+            defer gpa.free(chain);
+            const runs0 = dsv41.stage_fused_runs.load(.monotonic);
+            const got = try stageOut(gpa, m, &st, li, x, pre, true);
+            defer gpa.free(got);
+            if (dsv41.stage_fused_runs.load(.monotonic) == runs0) return error.QkvNotEngaged;
+            // The served stage: the same weights with the rows apart (q_kv off the layer, wq_a a view of its rows), so
+            // in_proj declines and DRAFT_FUSED runs the FFN half alone, as without the switch.
+            const qkv = ly.q_kv.?;
+            const qa_rows: usize = @intCast(mlx.getShape(qkv.w)[0] - @as(c_int, @intCast(m.cfg.head_dim)));
+            ly.q_kv = null;
+            ly.wq_a = try dsv41.rowView(m, qkv, 0, qa_rows);
+            const served = stageOut(gpa, m, &st, li, x, pre, true);
+            ly.q_kv = qkv;
+            ly.wq_a = .{ .w = none };
+            const sv = try served;
+            defer gpa.free(sv);
+            for (got) |v| if (!std.math.isFinite(v)) return error.NonFinite;
+            rel[n] = decode.relRms(got, chain);
+            served_rel[n] = decode.relRms(sv, chain);
+            std.debug.print("[draft qkv] seed {d} stage {d}: vs chain rel rms {e:.2}, the served stage {e:.2}\n", .{ seed, si, rel[n], served_rel[n] });
+            n += 1;
+            const swapped = try sc.concat(&.{ try sc.slice(x, 0, 1, 2), try sc.slice(x, 0, 0, 1), try sc.slice(x, 0, 2, m.ds_block) }, 0);
+            const bad = try stageOut(gpa, m, &st, li, swapped, pre, true);
+            defer gpa.free(bad);
+            if (decode.relRms(bad, chain) <= bar) return error.PlantedPassed;
+        }
+    }
+    std.mem.sort(f64, rel[0..n], {}, std.sort.asc(f64));
+    std.mem.sort(f64, served_rel[0..n], {}, std.sort.asc(f64));
+    std.debug.print("[draft qkv] median vs chain {e:.2}, the served stage's {e:.2}\n", .{ rel[n / 2], served_rel[n / 2] });
+    if (rel[n / 2] > @max(bar, 1.15 * served_rel[n / 2])) return error.FurtherFromChain;
 }
 
 fn expectSameCaches(gpa: std.mem.Allocator, a: *const dsv41.Dsv41Model, b: *const dsv41.Dsv41Model) !void {

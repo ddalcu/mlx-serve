@@ -203,17 +203,10 @@ struct Fp4Q {
     scales += n;
   }
   METAL_FUNC P params(const int g) const thread {
-    const uint b = scales[g];
-    if constexpr (GS == 16) {
-      const uint v = b & 0x7Fu;
-      const ushort u = ushort((v << 7) | (((v + 1u) >> 7) << 14) | ((b & 0x80u) << 8));
-      return P{float(as_type<half>(u)) * 256.0f};
-    }
-    return P{as_type<float>(b == 0u ? 0x400000u : (b << 23))};
+    return P{mlxserve_fp4_scale_of<GS>(uint(scales[g]))};
   }
   METAL_FUNC static WT dq(thread const P& p, const uint32_t q) {
-    const float v = float(as_type<half>(ushort((q & 0x7u) << 9))) * 16384.0f;
-    return static_cast<WT>(p.s * ((q & 0x8u) ? -v : v));
+    return static_cast<WT>(p.s * mlxserve_fp4_e2m1_value(q));
   }
 };
 
@@ -653,8 +646,8 @@ METAL_FUNC void gather_db(
 // The row tile and output column of this threadgroup. GX == 0: grid
 // (columns, tiles) as mlx lays it out. GX > 0: tile t on grid x t % GX and
 // (t / GX, column) on y, so all threadgroups of a row tile share one x
-// coordinate and a tile's columns run GX threadgroups apart.
-template <int GX>
+// coordinate and a tile's columns run GX threadgroups apart. BN: the columns a threadgroup holds.
+template <int GX, int BN = kBN>
 METAL_FUNC bool tile_of(
     const device uint32_t* tiles,
     const uint tile_count,
@@ -665,7 +658,7 @@ METAL_FUNC bool tile_of(
   uint t;
   uint c;
   if constexpr (GX > 0) {
-    const uint n_cols = uint((N + kBN - 1) / kBN);
+    const uint n_cols = uint((N + BN - 1) / BN);
     t = (tid.y / n_cols) * GX + tid.x;
     c = tid.y % n_cols;
   } else {
@@ -676,7 +669,7 @@ METAL_FUNC bool tile_of(
     return false;
   }
   desc = *((const device uint4*)tiles + t);
-  y_col = int(c) * kBN;
+  y_col = int(c) * BN;
   return true;
 }
 

@@ -118,7 +118,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_memory_pressure_4way.sh` low guard ceiling · `test_oom_preflight.sh` **H** refusal exits cleanly
 - `test_kv_cache_growth_memory.sh` long decode does not ratchet · `test_evict_returns_memory.sh` make-room frees memory
 - `test_idle_evict.sh` --idle-evict-secs · `test_load_progress.sh` /v1/load-progress · `test_cold_load_launch_flags.sh` cold loads keep flags
-- `test_first_request_compiles.sh` a build's first load of a model warms its kernels: when idle by default, before ready with `--warmup-full` (empty shader cache via a re-identified copy)
+- `test_first_request_compiles.sh` every load of a model warms its kernels: when idle by default, before ready with `--warmup-full`; a load after another under other switches, flags or pack compiles nothing in its first requests, nor at the widest pass (empty shader cache via a re-identified copy)
 - `test_load_failure_no_fallback.sh` a broken pack never falls back · `test_load_model_api.sh`, `test_load_model_default.sh` /v1/load-model
 - `test_model_alias.sh` Model Settings alias · `test_model_settings.sh` per-model settings · `test_model_settings_symlink.sh` settings through a symlinked folder · `test_model_discovery.sh` discovery
 - `test_model_rescan.sh` **H** rescan · `test_multi_model_dir.sh` **H** repeatable --model-dir
@@ -136,6 +136,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_llama_gguf.sh` **E**, `test_llama_concurrent.sh` **E**, `test_llama_multi_session.sh`, `test_llama_persistent_session.sh` llama.cpp · `test_llama_q2_0.sh` **E** a Q2_0 GGUF answers correctly
 - `test_ds4_serve.sh`, `test_ds4_smoke.sh`, `test_ds4_ssd_streaming.sh` ds4 · `test_mlx_gguf.sh` MLX GGUF · `test_qwen4exp_gguf_route.sh`
 - `test_ane_prefill.sh`, `test_ane_engine.sh` Neural Engine · `test_mlx_staged_nax.sh` **H** NAX-enabled mlx stage
+- `test_mlx_wide_reserve_inert.sh` the unarmed `mlx-metal-wide-reserve.patch` serves stock MLX's bytes and memory (stock vs patched libmlx, one binary)
 - `test_phase2_forward_equivalence.sh` forward pinned vs a baseline · `test_decode_graph_dump.sh` graph dump guard
 - `test_plugin_kit.sh` **H** the kit builds `_example` and `_example_engine` from itself; `plugin new|check|fixture|install`; a kit-built dylib serves its pack, the engine its named folder
 

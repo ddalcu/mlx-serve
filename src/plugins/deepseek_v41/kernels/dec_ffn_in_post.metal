@@ -141,10 +141,29 @@ if (is_mix) {
     // The sqrt-softplus score of the logit.
     const float z = red[8 * RG + sg * RG + rr] + red[8 * RG + (sg + 1) * RG + rr];
     const float y = metal::exp(-metal::abs(z));
-    const float lp = y < 1e-4f ? y * (1.0f - y * (0.5f - y / 3.0f)) : metal::log(1.0f + y);
+    // log1p(y) below 1/4 as 2 atanh(y / (2 + y)): log(1 + y) loses y's low bits when 1 + y rounds.
+    const float lt = y / (2.0f + y), lt2 = lt * lt;
+    const float lp = y < 0.25f ? 2.0f * lt * (1.0f + lt2 * (1.0f / 3.0f + lt2 * (0.2f + lt2 * (1.0f / 7.0f + lt2 * (1.0f / 9.0f + lt2 * (1.0f / 11.0f)))))) : metal::log(1.0f + y);
     atomic_store_explicit(scorea + (size_t)(r0 + rr) * E + e, metal::sqrt(metal::max(z, 0.0f) + lp), metal::memory_order_relaxed);
   }
 }
+#if DSV41_FFN_NOTAIL
+// ubench bound only (never served): no counters and no tails; the outputs the tails write get fixed valid values.
+if (tg == 0 && tid < R * HC) {
+  pre[tid] = 1.0f;
+  post[tid] = 1.0f;
+  *(device float4*)(comb + tid * HC) = float4(0.25f);
+}
+if (tg == P && tid < R * TOPK) {
+  idx[tid] = uint(tid % TOPK);
+  wts[tid] = 0.25f;
+}
+return;
+#endif
+#if DSV41_FFN_SINK_APART
+// MLX_SERVE_DSV41_FFN_IN_SINK: the mixes' reduce and split run in their own launch (dec_ffn_in_sink.metal).
+if (is_mix) return;
+#endif
 atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, metal::thread_scope_device);
 threadgroup_barrier(metal::mem_flags::mem_device);
 if (tid == 0) {
@@ -156,6 +175,7 @@ threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 if (!last) return;
 atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, metal::thread_scope_device);
 
+#if !DSV41_FFN_SINK_APART
 if (is_mix) {
   threadgroup float* zr = tgm + R * P * PL;
   for (int i = tid; i < R * P * PL; i += 256) tgm[i] = atomic_load_explicit(partsa + i, metal::memory_order_relaxed);
@@ -202,7 +222,9 @@ if (is_mix) {
     }
     *(device float4*)(comb + (r * HC + i) * HC) = float4(v[0], v[1], v[2], v[3]);
   }
-} else {
+} else
+#endif
+{
   // Scores and their biased values in threadgroup memory; a NaN is the lowest pick (lowest index first) and weighs NaN.
   for (int i = tid; i < R * E; i += 256) {
     const float s = atomic_load_explicit(scorea + i, metal::memory_order_relaxed);

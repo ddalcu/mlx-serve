@@ -54,12 +54,12 @@ Generation defaults for omitted fields: body > model `generation_defaults` > glo
 - First-time: `./scripts/fetch-zig.sh` stages the pinned Zig at `.zig-toolchain/`.
 - Zig caches configure-time subprocess output: after a toolchain/SDK change `rm -rf .zig-cache` or the link references a ghost path.
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug 2–4× slower ⇒ fake regressions). `zig build test` does NOT refresh `zig-out/bin/mlx-serve` — rebuild before any live A/B.
-- **Edit loop: `zig build check`** (35 s, Sema only) → `zig build test` (parallel shards, one per 16 GiB of RAM past the first 16, 1 to 8, `-Dtest-shards=N`; a `sharded:` test splits its own work) → ReleaseFast only to RUN or MEASURE. ReleaseFast is single-threaded LLVM `-O3` per object (no flag tunes it): a plugin edit rebuilds in 0:30 with `-Dunits`, 3:30 without.
+- **Edit loop: `zig build check`** (35 s, Sema only) → `zig build test` (parallel shards, one per 16 GiB of RAM past the first 16, 1 to 8, `-Dtest-shards=N`, balanced by measured time: `build/test_plan.tsv`) → ReleaseFast only to RUN or MEASURE. ReleaseFast is single-threaded LLVM `-O3` per object (no flag tunes it): a plugin edit rebuilds in 0:30 with `-Dunits`, 3:30 without.
 - **`-Dunits=true`** (off by default; `test`/`check` run without it) builds the host and a plugin group per core (2-8, `-Dunit-groups=N`; fewer cores, fewer and larger units) as parallel objects; a plugin edit rebuilds its group only while `zig build unit-closure` holds (the plugin's imports stay in `sdk/`, `mlx/`, `abi/`, `kernels/`).
   A unit copies every global it reaches: host state is `Shared` / `SharedThreadLocal` (`sdk/util/shared.zig`), checked by `zig build units-check -Dunits=true` (data AND thread-local sections).
 - **Every kernel registers with the kernel contract** (`sdk/testing/kernel_contract/REGISTERING.md`: one `contract.zig`
-  per area or plugin, five gates against a float64 reference, planted controls must fail); it runs as ONE `sharded:`
-  test split across the shards. Lint: `python3 scripts/lint.py --strict` (`zig build lint`) stays 0.
+  per area or plugin, five gates against a float64 reference, planted controls must fail); gates 1-4 run as one test per
+  area, a slow one in parts (`registry.zig`). Lint: `python3 scripts/lint.py --strict` (`zig build lint`) stays 0.
 - Swift app: `bash app/build.sh`. The two bundle binaries move together.
 - mlx + mlx-c: submodules built by `scripts/build-mlx.sh` (deployment target 26.2 → NAX kernels; script + `tests/test_mlx_staged_nax.sh` ASSERT `*_nax` in the metallib). Min macOS 26.2. Bump = checkout tag → rerun → re-diff `src/mlx/ffi.zig` externs. Brew: webp ≥ 1.6.0.
 - **An MLX bump must not turn every proof tape red**: stamp the MLX build in the tape header, and on a different MLX drop a tape to a tolerance check against an f32 reference (as dsv41 `expectNoWorse` does) that asks for a re-record (`MLX_SERVE_TAPE_RECORD`).
@@ -79,6 +79,8 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 **A test that dispatches a Metal kernel, or runs a Neural Engine program, skips on a virtual GPU** (a VM has no ANE either). CI's `macos-26` runner reports the device `air64_v27`, caps threadgroups at 384-896 and kills command buffers with `Insufficient Memory`, so an unguarded kernel test fails or exits 255 there and turns the `zig` job red. Start it with `if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;` (`mlx.virtualGpu()` alone when it has no other skip). A bulk patch must scan the whole test body for the guard, not the next few lines. PR runs omit `-Dslow-tests` unless the diff touches the replay's paths and pushes to main add it, so a green PR can still hide a slow-test failure on main.
 
 **Green CI does not run a kernel or the proofs of a plugin that owns one** (#1027: they skip on the runner). Before merging a change to a kernel, a quant path or a model plugin, run its tests on a real Mac (`zig build test -Dtest-filter=<plugin>`, or the full suite): a parity test merged green and failed on the first M5 run.
+
+**A unit test starts in the test world** (`sdk/testing/world.zig`, entered before every test): the variables the process started with, MLX's limits, the M5 Ultra 512 GiB for machine-keyed tables. Declare another machine with `world.with`; read NAX/TF32/generation through `world.*` (lint `machine-read-in-test`). Before a default flip: `scripts/flip_proof.py run LEVER`.
 
 ## Releases & benchmarking
 

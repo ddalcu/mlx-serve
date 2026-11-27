@@ -4,6 +4,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const nax = @import("../../../mlx/device.zig");
+const world = @import("../../../sdk/testing/world.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 const kit = @import("../../deepseek_v4/contract_kit.zig");
@@ -503,7 +504,7 @@ pub fn register(set: *kc.Set) !void {
 const testing = std.testing;
 
 /// Host copy of `x` as f64 (any float dtype).
-fn hostF64(x: A) ![]f64 {
+pub fn hostF64(x: A) ![]f64 {
     const f = try dsv41.hostF32(x);
     defer testing.allocator.free(f);
     const out = try testing.allocator.alloc(f64, f.len);
@@ -512,7 +513,7 @@ fn hostF64(x: A) ![]f64 {
 }
 
 /// Rows [0, n) of the layer's index keys.
-fn keyRows(sc: *dsv41.Scope, ls: *const dsv41.LState, n: usize) !A {
+pub fn keyRows(sc: *dsv41.Scope, ls: *const dsv41.LState, n: usize) !A {
     const rows = ls.idx_k.?;
     var o = mlx.mlx_array_new();
     return sc.res(mlx.mlx_slice(&o, rows.buf, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(n), ci(rows.width) }, 2, &[_]c_int{ 1, 1 }, 2, sc.s), &o);
@@ -520,15 +521,15 @@ fn keyRows(sc: *dsv41.Scope, ls: *const dsv41.LState, n: usize) !A {
 
 /// The unit roundoff of f32 and the bound on a sum of n terms: gamma_n = n u / (1 - n u).
 const u32_: f64 = 0x1p-24;
-fn gamma(n: usize) f64 {
+pub fn gamma(n: usize) f64 {
     const nu = @as(f64, @floatFromInt(n)) * u32_;
     return nu / (1 - nu);
 }
 
-const Truth = struct { val: []f64, mag: []f64 };
+pub const Truth = struct { val: []f64, mag: []f64 };
 
 /// The scores in float64 from the host copies of q, w and keys (slot `s` of row r reads key `key_of(r, s)` or -inf).
-fn truthScores(q: []const f64, w: []const f64, keys: []const f64, rows: usize, nb: usize, p0: usize, ratio: usize, cand: ?[]const i32, ncols: usize) !Truth {
+pub fn truthScores(q: []const f64, w: []const f64, keys: []const f64, rows: usize, nb: usize, p0: usize, ratio: usize, cand: ?[]const i32, ncols: usize) !Truth {
     const val = try testing.allocator.alloc(f64, rows * ncols);
     const mag = try testing.allocator.alloc(f64, rows * ncols);
     const wsc: f64 = wscale;
@@ -560,7 +561,7 @@ fn truthScores(q: []const f64, w: []const f64, keys: []const f64, rows: usize, n
 }
 
 /// q `[R, 32, 128]` as the indexer makes it (rope + fp4 round trip, f32), w `[R, 32]` bf16.
-fn randomQ(fx: *fixture.Fixture, sc: *dsv41.Scope, rows: usize, p0: usize) !struct { q: A, w: A } {
+pub fn randomQ(fx: *fixture.Fixture, sc: *dsv41.Scope, rows: usize, p0: usize) !struct { q: A, w: A } {
     const x = try fx.normal(&.{ ci(rows), heads, channels }, .float32, 0, 1.5);
     defer _ = mlx.mlx_array_free(x);
     const off = try sc.keep(mlx.mlx_array_new_int(@intCast(p0)));
@@ -673,7 +674,7 @@ const ByScore = struct {
 
 /// Per row, the picks of `x`'s top half (finite scores, ties to the lower index) that `y`'s top half lacks, and how many
 /// of those lie further from the half's last score than f32 reassociation moves a score (`mag`: its terms' magnitude).
-fn pickDiffs(gpa: std.mem.Allocator, x: []const f32, y: []const f32, mag: []const f64, rows: usize, ncols: usize) ![2]usize {
+pub fn pickDiffs(gpa: std.mem.Allocator, x: []const f32, y: []const f32, mag: []const f64, rows: usize, ncols: usize) ![2]usize {
     const order = try gpa.alloc(usize, ncols);
     defer gpa.free(order);
     const in_y = try gpa.alloc(bool, ncols);
@@ -826,7 +827,7 @@ test "dsv41 dec idx_score: the declared launches are the shipped wrappers', byte
     defer k.deinit();
     var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
-    if (nax.naxAvailable()) for ([_]bool{ false, true }) |gather| {
+    if (world.nax()) for ([_]bool{ false, true }) |gather| {
         var c = kit.Case(ScoreCase).init(gpa, if (gather) &gather_l else &score_l, .{ .gather = gather });
         defer c.deinit();
         try testing.expect(try c.prepare(.{ .rows = 3, .n = 600, .k = channels }, .random, 7));
@@ -892,7 +893,7 @@ fn nowUs() i64 {
 
 /// Median over 7 evaluations (after 2) of the `ctx.n` steps `ctx.build` makes off the clock (the arrays it returns
 /// are evaluated), in microseconds in all; the host's graph building is not timed.
-fn evalTotalUs(gpa: std.mem.Allocator, s: mlx.mlx_stream, ctx: anytype) !f64 {
+pub fn evalTotalUs(gpa: std.mem.Allocator, s: mlx.mlx_stream, ctx: anytype) !f64 {
     var times: [7]f64 = undefined;
     for (0..2 + times.len) |rep| {
         var sc = dsv41.Scope.init(gpa, s);
@@ -911,7 +912,7 @@ fn evalTotalUs(gpa: std.mem.Allocator, s: mlx.mlx_stream, ctx: anytype) !f64 {
 
 /// Microseconds a step of a dependent chain on the GPU: the difference of a chain of `ctx.n` steps and one of half as
 /// many, over the steps between, which leaves out the commit and wait every evaluation pays.
-fn evalUs(gpa: std.mem.Allocator, s: mlx.mlx_stream, ctx: anytype) !f64 {
+pub fn evalUs(gpa: std.mem.Allocator, s: mlx.mlx_stream, ctx: anytype) !f64 {
     var shorter = ctx;
     shorter.n = ctx.n / 2;
     const long = try evalTotalUs(gpa, s, ctx);

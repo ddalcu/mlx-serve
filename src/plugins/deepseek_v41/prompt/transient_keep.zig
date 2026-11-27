@@ -51,8 +51,10 @@ fn bytesOf(x: A) u64 {
     return @as(u64, mlx.mlx_array_size(x)) * @as(u64, mlx.mlx_array_itemsize(x));
 }
 
-/// The buffer's data pointer (0 unevaluated).
+/// The buffer's data pointer (0 unevaluated: MLX's data read faults on an array with no buffer yet).
 fn dataOf(x: A) usize {
+    var ready = false;
+    if (mlx._mlx_array_is_available(&ready, x) != 0 or !ready) return 0;
     const p = mlx.mlx_array_data_uint8(x) orelse return 0;
     return @intFromPtr(p);
 }
@@ -102,4 +104,32 @@ pub fn release() void {
 pub fn drop() void {
     for (ps().kept[0..ps().n_kept]) |k| _ = mlx.mlx_array_free(k);
     ps().n_kept = 0;
+}
+
+test "dsv41 transient keep: a wide layer's output not yet evaluated is kept by reference, its buffer never read" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    drop();
+    defer drop();
+    const s = mlx.gpuStream();
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    // `min_bytes` of f16 that nothing has evaluated: no buffer behind it yet.
+    var z = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(z);
+    try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{@intCast(min_bytes / 2)}, 1, .float16, s));
+    var lazy = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lazy);
+    try mlx.check(mlx.mlx_add(&lazy, z, one, s));
+    var ready = true;
+    try mlx.check(mlx._mlx_array_is_available(&ready, lazy));
+    try std.testing.expect(!ready);
+    layerEnd(&.{lazy}, true);
+    try std.testing.expectEqual(@as(usize, 1), ps().n_kept);
+    // Evaluated, the same array is one buffer already kept: not a second reference.
+    try mlx.check(mlx.mlx_array_eval(lazy));
+    const kept = ps().kept[0];
+    ps().n_kept = 0;
+    layerEnd(&.{ kept, lazy }, true);
+    _ = mlx.mlx_array_free(kept);
+    try std.testing.expectEqual(@as(usize, 1), ps().n_kept);
 }

@@ -646,12 +646,11 @@ const dequant_shapes: []const Shape = &.{ .{ .rows = 3, .n = 1, .k = 2048 }, .{ 
 const matvec_shapes: []const Shape = &.{ .{ .rows = 1, .n = 2048, .k = 512 }, .{ .rows = 3, .n = 512, .k = 4096 }, .{ .rows = 8, .n = 1024, .k = 1024 } };
 const matvec_cols_shapes: []const Shape = &.{ .{ .rows = 1, .n = 2048, .k = 2048 }, .{ .rows = 1, .n = 2048, .k = 2560 }, .{ .rows = 2, .n = 512, .k = 4096 } };
 
-const mxfp4_tiny_scale: spec.Known = .{ .gate = .shapes, .finding = "an E8M0 scale byte of 0 or 1 is a subnormal fp32 scale, which the GPU flushes to zero where ggml's reference keeps it: such blocks dequantize to 0 instead of values below 1e-37" };
 const q3k_inconclusive: spec.Known = .{ .gate = .limits, .finding = "every offline M1/M2 build of the f32 Q3_K dequant changes with the thread request (INCONCLUSIVE), so no limit is recorded; it launches 64 threads" };
 
 fn dequantSpec(comptime ty: GgmlType, comptime out: spec.Elem) spec.Spec {
     return .{
-        .known = if (ty == .q3_k and out == .f32) q3k_inconclusive else if (ty == .mxfp4) mxfp4_tiny_scale else null,
+        .known = if (ty == .q3_k and out == .f32) q3k_inconclusive else null,
         .name = "gguf dequant " ++ @tagName(ty) ++ (if (out == .f32) " f32" else " bf16"),
         .accum = .none,
         .depth = none,

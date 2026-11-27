@@ -7,7 +7,6 @@ const mlx = @import("../../../mlx/ffi.zig");
 const keyed_sample = @import("../sampling/keyed_sample.zig");
 const transformer_mod = @import("../transformer.zig");
 const dsv4_mod = @import("../../../plugins/deepseek_v4/deepseek_v4.zig");
-const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
 const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const model_mod = @import("../../../sdk/config/model.zig");
 const log = @import("../../../sdk/util/log.zig");
@@ -164,10 +163,19 @@ pub const Generator = struct {
     /// chokepoint when the request samples (temp ≥ 0.01, top_k ≠ 1) and the
     /// stochastic arm isn't env-killed; meaningless unless `dspark_enabled`.
     dspark_stochastic: bool = false,
+    /// The stochastic arm's typical pair (`dspark.Rule.typical`, LOSSY; the request's `mtp_acceptance`), null for the
+    /// exact rule. Copied drafts keep the exact rule whatever it is (`dspark.draftRule`).
+    dspark_typical: ?mtp_acceptance.Typical = null,
+    /// Sampled rounds the typical rule decided (`dspark.stochasticVerdict`), for `[spec-stats] dspark typical`.
+    dspark_typical_rounds: u64 = 0,
     dspark_attempted: u64 = 0,
     dspark_accepted_tokens: u64 = 0,
     /// Rounds whose drafts were copied from the context (`dsparkCopyStep`), included in `dspark_attempted`.
     dspark_copies: u64 = 0,
+    /// The module's draft vocabulary took this request's prompt (`dsv41.draftPromptVocab`, its first solo round).
+    dspark_prompt_vocab: bool = false,
+    /// The module's draft vocabulary mode is this request's (`dsv41.draftVocabMode`, its first round, solo or group).
+    dspark_vocab_mode: bool = false,
     dspark_copy_drafted: u64 = 0,
     dspark_copy_accepted: u64 = 0,
     /// DeepSeek-V4.1's stage rounds under `dflash_policy` (verify rows by the confidence head, plain ticks
@@ -266,7 +274,7 @@ pub const Generator = struct {
     /// Installed verifier route; selected once at init, not checked per token.
     mtp_accept_graph: MtpGraphFn = mtpBatchedExactGraph,
     mtp_accept_prefix: mtp_acceptance.PrefixFn = mtp_acceptance.exactPrefix,
-    mtp_accept_param: f32 = 0,
+    mtp_accept_param: mtp_acceptance.Param = .{},
     /// A sampled request drafts only depth 0 from the draft sampler, every later depth by argmax.
     mtp_greedy_tail: bool = false,
     /// A row-exact trunk verifies sampled rounds with the serial sampler itself:

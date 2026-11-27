@@ -5,15 +5,21 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
+const env = @import("../../env.zig");
 const device = @import("../../mlx/device.zig");
+const world = @import("../../sdk/testing/world.zig");
 const kit = @import("../deepseek_v4/contract_kit.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const v41 = @import("deepseek_v41.zig");
 const qtail = @import("prompt/q_tail.zig");
 const hcf = @import("prompt/hc_fuse.zig");
 const sx1 = @import("prompt/scratch_x1.zig");
+const hv2 = @import("prompt/hc_v2.zig");
+const inax = @import("prompt/idx_nax.zig");
+const mtail = @import("prompt/moe_tail.zig");
 const gtwin = @import("decode/gemv_twin.zig");
 const ggemm = @import("prompt/gate_gemm.zig");
+const pfroute = @import("prompt/pf_route.zig");
 const markov = @import("spec/markov.zig");
 const mplan = @import("spec/markov_plan.zig");
 const fa = @import("prompt/flash_attn.zig");
@@ -153,6 +159,12 @@ pub fn depthOne(_: Shape) usize {
 }
 fn rowsN(s: Shape) usize {
     return s.rows * s.n;
+}
+fn pairs3(s: Shape) usize {
+    return 3 * s.rows * s.k;
+}
+fn pairs1(s: Shape) usize {
+    return s.rows * s.k;
 }
 fn rowsMix(s: Shape) usize {
     return s.rows * MIX;
@@ -370,6 +382,210 @@ const Route = struct {
     }
 };
 
+/// `MLX_SERVE_DSV41_PF_ROUTE_PACK`'s top-6 (`pf_route_rows.metal`): route.metal's rule and outputs on a simdgroup a row.
+const RouteRows = struct {
+    pub const Params = Route.Params;
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        const E = s.k;
+        if (s.rows == 0 or E % 128 != 0 or E > 1024 or p.k == 0 or p.k > 16) return null;
+        const sg = pfroute.rows_sg;
+        var g = metal.Geometry{ .grid = .{ ci((s.rows + sg - 1) / sg * 32 * sg), 1, 1 }, .tg = .{ ci(32 * sg), 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(p.k) }, .uint32);
+        g.out(&.{ ci(s.rows), ci(p.k) }, .float32);
+        g.int("E", E);
+        g.int("K", p.k);
+        g.flag("NORM", p.norm);
+        g.int("SG", sg);
+        g.int("PLANT", 0);
+        g.int("DS", 0);
+        return g;
+    }
+
+    /// Route's inputs and the down scale it reads only with DS (bound, unread here).
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        try Route.fill(k, f, rng);
+        @memset(try k.add(.float32, &.{k.shape.k}), 1);
+    }
+
+    pub const count = Route.count;
+    pub const compute = Route.compute;
+    pub const check = Route.check;
+};
+
+/// `MLX_SERVE_DSV41_PF_ROUTE_PACK`'s scan (`pf_route_scan.metal`): `rows` 256-pair blocks' histograms over `n` experts
+/// in, each (block, expert)'s first sorted place out (expert-major, blocks in order).
+const RouteScan = struct {
+    pub const Params = struct {};
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n % 128 != 0 or s.n > 1024) return null;
+        var g = metal.Geometry{ .grid = .{ pfroute.scan_threads, 1, 1 }, .tg = .{ pfroute.scan_threads, 1, 1 } };
+        g.out(&.{ci(s.rows * s.n)}, .uint32);
+        g.int("E", s.n);
+        g.int("PLANT", 0);
+        return g;
+    }
+
+    /// Each block's 256 pairs (the last block part full) routed as prompts route: half on four hot experts.
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const nb = k.shape.rows;
+        const E = k.shape.n;
+        const c = try k.add(.uint32, &.{nb * E});
+        @memset(c, 0);
+        for (0..nb) |b| {
+            const pairs: usize = if (b + 1 == nb) 1 + rng.uintLessThan(usize, pfroute.block) else pfroute.block;
+            for (0..pairs) |_| {
+                // The extremes at the nonfinite gate (no float exists): every pair on the first or the last expert.
+                const e: usize = if (f == .nonfinite) (if (rng.boolean()) 0 else E - 1) else if (rng.boolean()) rng.uintLessThan(usize, 4) else rng.uintLessThan(usize, E);
+                c[b * E + e] += 1;
+            }
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n;
+    }
+
+    fn expected(k: anytype, want: []u32) void {
+        const nb = k.shape.rows;
+        const E = k.shape.n;
+        var at: u32 = 0;
+        for (0..E) |e| for (0..nb) |b| {
+            want[b * E + e] = at;
+            at += @intFromFloat(k.in(0)[b * E + e]);
+        };
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, _: Sum) !void {
+        const want = try k.scratch().alloc(u32, out.len);
+        defer k.scratch().free(want);
+        expected(k, want);
+        for (out, want) |*o, w| o.* = @floatFromInt(w);
+        @memset(mag, 0);
+    }
+
+    /// Exact: every offset is the counting sort's.
+    pub fn check(k: anytype, _: spec.Gate) !?[]const u8 {
+        const want = try k.scratch().alloc(u32, count(k.p, k.shape));
+        defer k.scratch().free(want);
+        expected(k, want);
+        const got = k.rig.outputBytes();
+        for (want, 0..) |w, i| {
+            const v = std.mem.readInt(u32, got[4 * i ..][0..4], .little);
+            if (v != w) return std.fmt.bufPrint(&k.msg, "offset {d} is {d} where the counting sort gives {d}", .{ i, v, w }) catch "offset";
+        }
+        return null;
+    }
+};
+
+/// `MLX_SERVE_DSV41_PF_ROUTE_PACK`'s scatter (`pf_route_scatter.metal`): the SDK's stable placement of `rows` x `k`
+/// routed pairs over `n` experts from the scan's offsets, each pair's weight moved to its place.
+const RouteScatter = struct {
+    pub const Params = struct {};
+
+    fn blocks(s: Shape) usize {
+        return (s.rows * s.k + pfroute.block - 1) / pfroute.block;
+    }
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        const n = s.rows * s.k;
+        if (n == 0 or s.n == 0 or s.n > 1024) return null;
+        var g = metal.Geometry{ .grid = .{ ci(blocks(s) * pfroute.block), 1, 1 }, .tg = .{ ci(pfroute.block), 1, 1 } };
+        for (0..3) |_| g.out(&.{ci(n)}, .uint32);
+        g.out(&.{ci(n)}, .float32);
+        g.int("E", s.n);
+        g.int("TOPK", s.k);
+        return g;
+    }
+
+    /// Distinct experts a row, half the pairs on four hot experts; the offsets the counting sort gives them.
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const s = k.shape;
+        const n = s.rows * s.k;
+        const E = s.n;
+        const ids = try k.add(.uint32, &.{n});
+        for (0..s.rows) |r| {
+            var j: usize = 0;
+            while (j < s.k) {
+                const e: f64 = @floatFromInt(if (rng.boolean()) rng.uintLessThan(usize, @min(4, E)) else rng.uintLessThan(usize, E));
+                if (std.mem.indexOfScalar(f64, ids[r * s.k ..][0..j], e) != null) continue;
+                ids[r * s.k + j] = e;
+                j += 1;
+            }
+        }
+        const nb = blocks(s);
+        const off = try k.add(.uint32, &.{nb * E});
+        @memset(off, 0);
+        for (ids, 0..) |v, i| off[(i / pfroute.block) * E + @as(usize, @intFromFloat(v))] += 1;
+        var at: f64 = 0;
+        for (0..E) |e| for (0..nb) |b| {
+            const c = off[b * E + e];
+            off[b * E + e] = at;
+            at += c;
+        };
+        const w = try k.add(.float32, &.{n});
+        kit.uniform(rng, w, 0.01, 2);
+        // Non-finite weights move as they are.
+        if (f == .nonfinite) {
+            w[0] = nan;
+            w[n / 2] = inf;
+            w[n - 1] = -inf;
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return 4 * s.rows * s.k;
+    }
+
+    /// Pair i's place: the pairs before it in (expert, pair) order.
+    fn places(k: anytype, inv: []u32) void {
+        const ids = k.in(0);
+        for (ids, 0..) |v, i| {
+            var p: u32 = 0;
+            for (ids, 0..) |o, j| if (o < v or (o == v and j < i)) {
+                p += 1;
+            };
+            inv[i] = p;
+        }
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, _: Sum) !void {
+        const n = k.shape.rows * k.shape.k;
+        const inv = try k.scratch().alloc(u32, n);
+        defer k.scratch().free(inv);
+        places(k, inv);
+        for (inv, 0..) |p, i| {
+            out[i] = @floatFromInt(p);
+            out[n + p] = k.in(0)[i];
+            out[2 * n + p] = @floatFromInt(i / k.shape.k);
+            out[3 * n + p] = k.in(2)[i];
+        }
+        @memset(mag, 0);
+    }
+
+    /// Exact: every place, expert and row the stable sort's, every weight moved bit for bit.
+    pub fn check(k: anytype, _: spec.Gate) !?[]const u8 {
+        const n = k.shape.rows * k.shape.k;
+        const inv = try k.scratch().alloc(u32, n);
+        defer k.scratch().free(inv);
+        places(k, inv);
+        const got = k.rig.outputBytes();
+        const word = struct {
+            fn at(b: []const u8, i: usize) u32 {
+                return std.mem.readInt(u32, b[4 * i ..][0..4], .little);
+            }
+        }.at;
+        for (inv, 0..) |p, i| {
+            const want = [4]u32{ p, @intFromFloat(k.in(0)[i]), @intCast(i / k.shape.k), @bitCast(@as(f32, @floatCast(k.in(2)[i]))) };
+            const at = [4]usize{ i, n + p, 2 * n + p, 3 * n + p };
+            for (want, at, 0..) |w, o, part| if (word(got, o) != w)
+                return std.fmt.bufPrint(&k.msg, "pair {d}'s output {d} (part {d}) is {d} where the stable sort gives {d}", .{ i, o, part, word(got, o), w }) catch "scatter";
+        }
+        return null;
+    }
+};
+
 // ── radix top-k: the K largest of each row by the float's order key, as ascending indices, ties to the lower index ──
 
 fn orderKey(v: f64) u32 {
@@ -510,7 +726,8 @@ const MoeAct = struct {
 };
 
 const MoeCombine = struct {
-    pub const Params = struct { k: usize = TOPK };
+    /// `tok` (`MoeParts.tok`, the `TOK` build): the down rows in pair order, read in place; `inv` the identity.
+    pub const Params = struct { k: usize = TOPK, tok: bool = false };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         const total = s.rows * s.n;
@@ -532,13 +749,16 @@ const MoeCombine = struct {
         const sh = try k.add(act, &.{ L, D });
         kit.uniform(rng, dn, -2, 2);
         kit.uniform(rng, sh, -2, 2);
-        // A permutation of the sorted rows, as argsort of the expert order gives.
+        // A permutation of the sorted rows, as argsort of the expert order gives (the TOK build: the rows in pair order,
+        // so the identity).
         for (inv, 0..) |*v, i| v.* = @floatFromInt(i);
-        const perm = try k.scratch().alloc(f64, inv.len);
-        defer k.scratch().free(perm);
-        @memcpy(perm, inv);
-        rng.shuffle(f64, perm);
-        @memcpy(inv, perm);
+        if (!k.p.tok) {
+            const perm = try k.scratch().alloc(f64, inv.len);
+            defer k.scratch().free(perm);
+            @memcpy(perm, inv);
+            rng.shuffle(f64, perm);
+            @memcpy(inv, perm);
+        }
         switch (f) {
             .random => {},
             .nonfinite => {
@@ -590,6 +810,76 @@ const MoeCombine = struct {
         };
     }
 };
+
+/// kernels/moe_tail.metal (`MLX_SERVE_DSV41_MOE_TAIL`): moe_combine's rows (rounded to T), then the hc expand from them.
+const MoeTail = struct {
+    pub const Params = struct { k: usize = TOPK, tok: bool = false };
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n == 0 or s.n % 4 != 0 or s.k != p.k) return null;
+        var g = metal.Geometry{ .grid = .{ ci(s.n / 4), ci(s.rows), 1 }, .tg = .{ ci(@min(256, s.n / 4)), 1, 1 } };
+        g.out(&.{ ci(s.rows), HC, ci(s.n) }, act);
+        g.dtype("T", act);
+        g.int("HC", HC);
+        g.int("D", s.n);
+        g.int("K", p.k);
+        return g;
+    }
+
+    /// moe_combine's `dn`, `inv` and `sh`, then the expand's `res`, `post` and `comb`.
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        try MoeCombine.fill(k, f, rng);
+        const L = k.shape.rows;
+        const D = k.shape.n;
+        const res = try k.add(act, &.{ L, HC, D });
+        const post = try k.add(.float32, &.{ L, HC });
+        const comb = try k.add(.float32, &.{ L, HC, HC });
+        kit.uniform(rng, res, -3, 3);
+        kit.uniform(rng, post, 0, 2);
+        kit.uniform(rng, comb, 0, 0.5);
+        if (f == .nonfinite) kit.plantRows(res, L, HC * D);
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * HC * s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const D = k.shape.n;
+        const K = k.p.k;
+        const res = k.in(3);
+        const post = k.in(4);
+        const comb = k.in(5);
+        var t: [17]f64 = undefined;
+        for (0..k.shape.rows) |l| for (0..D) |d| {
+            var ym: f64 = 0;
+            for (0..K) |j| {
+                const row: usize = @intFromFloat(k.in(1)[l * K + j]);
+                t[j] = k.in(0)[row * D + d];
+            }
+            t[K] = k.in(2)[l * D + d];
+            for (t[0 .. K + 1]) |v| ym += @abs(v);
+            // The combined row rounds to T before the expand reads it.
+            const y = bf(sum.of(t[0 .. K + 1]));
+            for (0..HC) |i| {
+                const o = (l * HC + i) * D + d;
+                var v = post[l * HC + i] * y;
+                var m = @abs(post[l * HC + i]) * ym;
+                for (0..HC) |j| {
+                    const c = comb[(l * HC + j) * HC + i] * res[(l * HC + j) * D + d];
+                    v += c;
+                    m += @abs(c);
+                }
+                out[o] = v;
+                mag[o] = m;
+            }
+        };
+    }
+};
+
+fn depthTail(s: Shape) usize {
+    return s.k + 1 + HC;
+}
 
 // ── hyper-connections: mix (dots and rms of the flattened stream), split (Sinkhorn), norm (split + collapse + rms) ──
 
@@ -669,15 +959,14 @@ const HcSplit = struct {
 };
 
 const HcMix = struct {
-    pub const Params = struct { tg: usize = 1024, cols: usize = 6 };
-    const R = 4;
+    pub const Params = struct { tg: usize = 1024, cols: usize = 6, rows: usize = 4 };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or MIX % p.cols != 0) return null;
-        var g = metal.Geometry{ .grid = .{ ci(MIX / p.cols * p.tg), ci((s.rows + R - 1) / R), 1 }, .tg = .{ ci(p.tg), 1, 1 } };
+        var g = metal.Geometry{ .grid = .{ ci(MIX / p.cols * p.tg), ci((s.rows + p.rows - 1) / p.rows), 1 }, .tg = .{ ci(p.tg), 1, 1 } };
         g.out(&.{ ci(s.rows), MIX }, .float32);
         g.int("TG", p.tg);
-        g.int("R", R);
+        g.int("R", p.rows);
         g.int("M", p.cols);
         return g;
     }
@@ -877,7 +1166,34 @@ const IdxTile = struct {
     }
 };
 
+/// `MLX_SERVE_DSV41_PF_IDX_NAX`'s wide indexer (prompt/idx_nax.zig): idx_tile's scores on the matrix units, the
+/// release's 32 heads of 128 channels only.
 const IdxNax = struct {
+    pub const Params = struct { ih: usize = IH };
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n == 0 or p.ih != inax.heads or s.k != inax.channels) return null;
+        var g = metal.Geometry{ .grid = .{ ci(inax.ranges(s.rows, s.n) * inax.NSG * 32), ci((s.rows + inax.NSG - 1) / inax.NSG), 1 }, .tg = .{ ci(inax.NSG * 32), 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(s.n) }, .float32);
+        g.int("NSG", inax.NSG);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        try idxFill(k, f, rng, act, act);
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        try idxCompute(k, out, mag, sum);
+    }
+};
+
+/// The upstream matmul2d wide scorer (`v41.indexScoresNax`, `idx_nax.metal`).
+const IdxNaxMm = struct {
     pub const Params = struct { ih: usize = IH };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
@@ -1157,12 +1473,11 @@ fn normedCollapse(x: []const f64, cpre: []const f64, ws: []const []const f64, ep
 }
 
 const HcMixNorm = struct {
-    pub const Params = struct { tg: usize = 1024, cols: usize = 6, h2: bool = true };
-    const R = 4;
+    pub const Params = struct { tg: usize = 1024, cols: usize = 6, h2: bool = true, rows: usize = 4 };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or s.n == 0 or MIX % p.cols != 0) return null;
-        var g = metal.Geometry{ .grid = .{ ci((MIX / p.cols + 1) * p.tg), ci((s.rows + R - 1) / R), 1 }, .tg = .{ ci(p.tg), 1, 1 } };
+        var g = metal.Geometry{ .grid = .{ ci((MIX / p.cols + 1) * p.tg), ci((s.rows + p.rows - 1) / p.rows), 1 }, .tg = .{ ci(p.tg), 1, 1 } };
         g.out(&.{ ci(s.rows), MIX }, .float32);
         g.out(&.{ ci(s.rows), ci(s.n) }, act);
         if (p.h2) g.out(&.{ ci(s.rows), ci(s.n) }, act) else {
@@ -1170,7 +1485,7 @@ const HcMixNorm = struct {
             g.unread = 1 << 2;
         }
         g.int("TG", p.tg);
-        g.int("R", R);
+        g.int("R", p.rows);
         g.int("M", p.cols);
         g.int("HC", HC);
         g.int("H2", @intFromBool(p.h2));
@@ -1395,6 +1710,364 @@ const ExpandNorm = struct {
     }
 };
 
+// ── hc_v2 (`MLX_SERVE_DSV41_PF_HC_V2`): a wide layer's stream rows formed, collapsed and mixed in one pass, then the
+// slices summed into the mixes, split and normed collapse ──
+
+/// kernels/hc_v2_mix.metal at `p.pro`: x2 (the tail), the raw collapse and each slice's partial dots and squares.
+const HcV2Mix = struct {
+    /// `tok`: a combining tail's `TOK` build (`MoeParts.tok`), its down rows in pair order (`inv` the identity).
+    pub const Params = struct { pro: hv2.Pro, tok: bool = false };
+
+    fn mixes(p: Params) bool {
+        return hv2.mixes(p.pro);
+    }
+    fn expands(p: Params) usize {
+        return switch (p.pro) {
+            .plain => 0,
+            .ffn => 1,
+            else => 2,
+        };
+    }
+
+    /// The shape's `k` is the launch's d-slices (`slicesFor` picks them by rows; a case names them, so small cases
+    /// cover every slicing the wide widths take).
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n != hv2.D or s.k == 0 or s.n % (hv2.DC * s.k) != 0) return null;
+        const S = s.k;
+        var g = metal.Geometry{ .grid = .{ ci((s.rows + hv2.ROWS - 1) / hv2.ROWS * 256), ci(S), 1 }, .tg = .{ 256, 1, 1 } };
+        if (expands(p) == 2) g.out(&.{ ci(s.rows), HC, ci(s.n) }, act);
+        if (mixes(p)) {
+            g.out(&.{ ci(s.rows), ci(s.n) }, act);
+            g.out(&.{ ci(S), ci(s.rows), hv2.PW }, .float32);
+        }
+        g.dtype("T", act);
+        g.int("D", s.n);
+        g.int("S", S);
+        if (hv2.combines(p.pro)) g.int("K", hv2.K);
+        return g;
+    }
+
+    /// The inputs in the wrapper's order: x, then y / post / comb (and y2 / post2 / comb2), then cpre and fn.
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const L = k.shape.rows;
+        const D = k.shape.n;
+        const x = try k.add(act, &.{ L, HC, D });
+        kit.uniform(rng, x, -3, 3);
+        if (f == .nonfinite) kit.plantRows(x, L, HC * D);
+        for (0..expands(k.p)) |e| {
+            if (e == 1 and hv2.combines(k.p.pro)) {
+                // The MoE's sorted down rows, the unsort (a permutation) and the shared rows.
+                const n = L * hv2.K;
+                const dn = try k.add(act, &.{ n, D });
+                const inv = try k.add(.uint32, &.{n});
+                const sh = try k.add(act, &.{ L, D });
+                kit.uniform(rng, dn, -1, 1);
+                kit.uniform(rng, sh, -1, 1);
+                for (inv, 0..) |*v, q| v.* = @floatFromInt(q);
+                if (!k.p.tok) for (0..n) |q| {
+                    const j = q + rng.uintLessThan(usize, n - q);
+                    std.mem.swap(f64, &inv[q], &inv[j]);
+                };
+            } else {
+                const y = try k.add(act, &.{ L, D });
+                kit.uniform(rng, y, -3, 3);
+            }
+            const post = try k.add(.float32, &.{ L, HC });
+            const comb = try k.add(.float32, &.{ L, HC, HC });
+            kit.uniform(rng, post, 0, 2);
+            kit.uniform(rng, comb, 0, 0.5);
+        }
+        if (!mixes(k.p)) return;
+        const cpre = try k.add(.float32, &.{ L, HC });
+        kit.uniform(rng, cpre, 0, 1);
+        const fnw = try k.add(.float32, &.{ MIX, HC * D });
+        kit.uniform(rng, fnw, -0.02, 0.02);
+    }
+
+    fn rowsX(s: Shape) usize {
+        return s.rows * HC * s.n;
+    }
+    fn partCount(s: Shape) usize {
+        return s.k * s.rows * hv2.PW;
+    }
+
+    pub fn count(p: Params, s: Shape) usize {
+        var n: usize = 0;
+        if (expands(p) == 2) n += rowsX(s);
+        if (mixes(p)) n += rowsN(s) + partCount(s);
+        return n;
+    }
+
+    /// Row `l`'s formed stream into `st` [HC, D] (each expand rounded to `act`, the stored x2 left unrounded in
+    /// `last` for the output), its terms' magnitudes into `sm` and into `se` the spread its bf16 roundings leave (a
+    /// rounding that lands a step apart from float64's moves every later term by that step).
+    fn stream(k: anytype, l: usize, st: []f64, sm: []f64, se: []f64, last: []f64) void {
+        const D = k.shape.n;
+        const x = k.in(0);
+        for (0..HC) |i| for (0..D) |d| {
+            st[i * D + d] = x[(l * HC + i) * D + d];
+            sm[i * D + d] = @abs(st[i * D + d]);
+            se[i * D + d] = 0;
+        };
+        var te: [HC]f64 = undefined;
+        var t: [HC]f64 = undefined;
+        const c = hv2.combines(k.p.pro);
+        for (0..expands(k.p)) |e| {
+            const base: usize = 1 + 3 * e;
+            const y = k.in(base);
+            const pc = if (e == 1 and c) base + 2 else base;
+            const post = k.in(pc + 1);
+            const comb = k.in(pc + 2);
+            for (0..D) |d| {
+                // The combine (moe_tail's words): the row's routes' down rows in route order plus its shared row.
+                var yv = y[l * D + d];
+                var ye: f64 = 0;
+                if (e == 1 and c) {
+                    var acc: f64 = 0;
+                    for (0..hv2.K) |j| acc += k.in(base)[@as(usize, @intFromFloat(k.in(base + 1)[l * hv2.K + j])) * D + d];
+                    acc += k.in(base + 2)[l * D + d];
+                    yv = bf(acc);
+                    ye = 0x1p-7 * @abs(acc);
+                }
+                for (0..HC) |j| {
+                    t[j] = st[j * D + d];
+                    te[j] = se[j * D + d];
+                }
+                var tm: [HC]f64 = undefined;
+                for (0..HC) |j| tm[j] = sm[j * D + d];
+                for (0..HC) |i| {
+                    var v = post[l * HC + i] * yv;
+                    var m = @abs(v);
+                    var er: f64 = @abs(post[l * HC + i]) * ye;
+                    for (0..HC) |j| {
+                        v += comb[(l * HC + j) * HC + i] * t[j];
+                        m += @abs(comb[(l * HC + j) * HC + i]) * tm[j];
+                        er += @abs(comb[(l * HC + j) * HC + i]) * te[j];
+                    }
+                    if (e + 1 == expands(k.p)) last[i * D + d] = v;
+                    st[i * D + d] = bf(v);
+                    sm[i * D + d] = m;
+                    se[i * D + d] = er + 0x1p-7 * @abs(v);
+                }
+            }
+        }
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const L = k.shape.rows;
+        const D = k.shape.n;
+        const S = k.shape.k;
+        const DS = D / S;
+        const a = k.scratch();
+        const st = try a.alloc(f64, 4 * HC * D);
+        defer a.free(st);
+        const sm = st[HC * D ..][0 .. HC * D];
+        const last = st[2 * HC * D ..][0 .. HC * D];
+        const se = st[3 * HC * D ..][0 .. HC * D];
+        // The roundings' spread in the bound's units: the bound grants gamma(depth) of `mag`.
+        const per = 1 / spec.gamma(@floatFromInt(depthV2(k.shape)), u);
+        var off: usize = 0;
+        const xo = off;
+        if (expands(k.p) == 2) off += rowsX(k.shape);
+        const ho = off;
+        const po = off + rowsN(k.shape);
+        const fnw: []const f64 = if (mixes(k.p)) k.in(k.n_in - 1) else &.{};
+        // A simulated sum (gate 4) needs each sum's terms; float64's runs as it goes.
+        const keep = sum.acc != null;
+        const T = HC * DS;
+        const terms = try a.alloc(f64, if (keep) (hv2.MIX + 2) * T else 0);
+        defer a.free(terms);
+        const hb = try a.alloc(f64, 2 * D);
+        defer a.free(hb);
+        for (0..L) |l| {
+            stream(k, l, st[0 .. HC * D], sm, se, last);
+            if (expands(k.p) == 2) for (0..HC * D) |q| {
+                out[xo + l * HC * D + q] = last[q];
+                // The stored x2's own rounding is the bound's; the spread before it is x1's.
+                mag[xo + l * HC * D + q] = sm[q] + (se[q] - 0x1p-7 * @abs(last[q])) * per;
+            };
+            if (!mixes(k.p)) continue;
+            const cpre = k.in(k.n_in - 2);
+            for (0..D) |d| {
+                var h: f64 = 0;
+                var m: f64 = 0;
+                var er: f64 = 0;
+                for (0..HC) |i| {
+                    h += cpre[l * HC + i] * st[i * D + d];
+                    m += @abs(cpre[l * HC + i]) * sm[i * D + d];
+                    er += @abs(cpre[l * HC + i]) * se[i * D + d];
+                }
+                out[ho + l * D + d] = h;
+                mag[ho + l * D + d] = m + er * per;
+                hb[d] = bf(h);
+                hb[D + d] = er + 0x1p-7 * @abs(h);
+            }
+            for (0..S) |sl| {
+                const base = po + (sl * L + l) * hv2.PW;
+                // One pass over the slice's stream values for all 24 dots and both squares.
+                var dot: [hv2.MIX]f64 = @splat(0);
+                var mg: [hv2.MIX]f64 = @splat(0);
+                var de: [hv2.MIX]f64 = @splat(0);
+                var sq: f64 = 0;
+                var sqe: f64 = 0;
+                var n: usize = 0;
+                for (0..HC) |i| for (sl * DS..(sl + 1) * DS) |d| {
+                    const v = st[i * D + d];
+                    const e = se[i * D + d];
+                    for (0..hv2.MIX) |mx| {
+                        const w = fnw[mx * hv2.N + i * D + d];
+                        const t = v * w;
+                        if (keep) terms[mx * T + n] = t else dot[mx] += t;
+                        mg[mx] += @abs(t);
+                        de[mx] += @abs(w) * e;
+                    }
+                    if (keep) terms[hv2.MIX * T + n] = v * v else sq += v * v;
+                    sqe += 2 * @abs(v) * e;
+                    n += 1;
+                };
+                for (0..hv2.MIX) |mx| {
+                    out[base + mx] = if (keep) sum.of(terms[mx * T ..][0..T]) else dot[mx];
+                    mag[base + mx] = mg[mx] + de[mx] * per;
+                }
+                out[base + hv2.MIX] = if (keep) sum.of(terms[hv2.MIX * T ..][0..T]) else sq;
+                mag[base + hv2.MIX] = out[base + hv2.MIX] + sqe * per;
+                var hs: f64 = 0;
+                var hse: f64 = 0;
+                for (sl * DS..(sl + 1) * DS, 0..) |d, q| {
+                    if (keep) terms[(hv2.MIX + 1) * T + q] = hb[d] * hb[d] else hs += hb[d] * hb[d];
+                    hse += 2 * @abs(hb[d]) * hb[D + d];
+                }
+                out[base + hv2.MIX + 1] = if (keep) sum.of(terms[(hv2.MIX + 1) * T ..][0..DS]) else hs;
+                mag[base + hv2.MIX + 1] = out[base + hv2.MIX + 1] + hse * per;
+            }
+        }
+    }
+};
+
+/// hc_v2_mix's longest chain: a slice's dots run over at most HC x D terms (the bound stays the shape-free one).
+fn depthV2(_: Shape) usize {
+    return HC * DIM;
+}
+
+/// kernels/hc_v2_fin.metal: the slices' partials into the mixes, the split and the normed collapse.
+const HcV2Fin = struct {
+    pub const Params = struct {};
+
+    /// The shape's `k` is the slices the partials hold.
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n != hv2.D or s.k == 0 or s.k > 64) return null;
+        var g = metal.Geometry{ .grid = .{ hv2.FIN_TG, ci(s.rows), 1 }, .tg = .{ hv2.FIN_TG, 1, 1 } };
+        g.out(&.{ ci(s.rows), MIX }, .float32);
+        g.out(&.{ ci(s.rows), HC }, .float32);
+        g.out(&.{ ci(s.rows), HC }, .float32);
+        g.out(&.{ ci(s.rows), HC, HC }, .float32);
+        g.out(&.{ ci(s.rows), ci(s.n) }, act);
+        g.dtype("T", act);
+        g.int("D", s.n);
+        g.int("S", s.k);
+        g.int("HC", HC);
+        g.int("ITERS", ITERS);
+        g.int("TG", hv2.FIN_TG);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const L = k.shape.rows;
+        const D = k.shape.n;
+        const S = k.shape.k;
+        const part = try k.add(.float32, &.{ S, L, hv2.PW });
+        const hraw = try k.add(act, &.{ L, D });
+        const scale = try k.add(.float32, &.{MIX});
+        const base = try k.add(.float32, &.{MIX});
+        const w = try k.add(act, &.{D});
+        const eps = try k.add(.float32, &.{2});
+        kit.uniform(rng, hraw, -3, 3);
+        kit.uniform(rng, scale, 0.5, 1.5);
+        kit.uniform(rng, base, -0.5, 0.5);
+        kit.uniform(rng, w, 0.5, 1.5);
+        eps[0] = EPS_RMS;
+        eps[1] = EPS_HC;
+        // Each slice's dots about its share of an O(1) mix, its squares its share of the row's.
+        for (0..S) |sl| for (0..L) |l| {
+            const o = (sl * L + l) * hv2.PW;
+            kit.uniform(rng, part[o..][0..MIX], -2, 2);
+            part[o + MIX] = (2 + 4 * rng.float(f64)) * @as(f64, @floatFromInt(HC * D / S));
+            var hs: f64 = 0;
+            for (sl * (D / S)..(sl + 1) * (D / S)) |d| hs += bf(hraw[l * D + d]) * bf(hraw[l * D + d]);
+            part[o + MIX + 1] = hs;
+        };
+        if (f == .nonfinite) {
+            kit.plantRows(part, S * L, hv2.PW);
+            kit.plantRows(hraw, L, D);
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return rowsSplit(s) + s.rows * s.n;
+    }
+    fn rowsSplit(s: Shape) usize {
+        return s.rows * (MIX + 2 * HC + HC * HC);
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const L = k.shape.rows;
+        const D = k.shape.n;
+        const S = k.shape.k;
+        const part = k.in(0);
+        const hraw = k.in(1);
+        const scale = k.in(2);
+        const base = k.in(3);
+        const w = k.in(4);
+        const eps0 = spec.roundTo(.f32, k.in(5)[0]);
+        var t: [64]f64 = undefined;
+        var pk: [2 * HC + HC * HC]f64 = undefined;
+        var zr: [MIX]f64 = undefined;
+        const ho = L * (MIX + 2 * HC + HC * HC);
+        for (0..L) |l| {
+            for (0..S) |sl| t[sl] = part[(sl * L + l) * hv2.PW + MIX];
+            const rr = 1 / @sqrt(sum.of(t[0..S]) / @as(f64, @floatFromInt(HC * D)) + eps0);
+            for (0..MIX) |m| {
+                var mg: f64 = 0;
+                for (0..S) |sl| {
+                    t[sl] = part[(sl * L + l) * hv2.PW + m];
+                    mg += @abs(t[sl]);
+                }
+                const y = sum.of(t[0..S]) * rr * scale[m];
+                zr[m] = y + base[m];
+                out[l * MIX + m] = zr[m];
+                mag[l * MIX + m] = mg * @abs(rr * scale[m]) + @abs(y) / 2;
+            }
+            splitRow(&zr, spec.roundTo(.f32, EPS_HC), sum, &pk);
+            const po = L * MIX;
+            // The mixes' own error moves the split: sigmoid' <= 1/4, 2 sigmoid' <= 1/2, and the Sinkhorn of exp(z)
+            // (each normalization contracting) by at most its row's largest comb-mix error, taken 4 times.
+            var zc: f64 = 0;
+            for (2 * HC..MIX) |m| zc = @max(zc, mag[l * MIX + m]);
+            for (0..HC) |j| {
+                out[po + l * HC + j] = pk[j];
+                mag[po + l * HC + j] = @abs(pk[j]) + mag[l * MIX + j] / 4;
+                out[po + L * HC + l * HC + j] = pk[HC + j];
+                mag[po + L * HC + l * HC + j] = @abs(pk[HC + j]) + mag[l * MIX + HC + j] / 2;
+            }
+            for (0..HC * HC) |q| {
+                out[po + 2 * L * HC + l * HC * HC + q] = pk[2 * HC + q];
+                mag[po + 2 * L * HC + l * HC * HC + q] = @abs(pk[2 * HC + q]) + 4 * zc;
+            }
+            for (0..S) |sl| t[sl] = part[(sl * L + l) * hv2.PW + MIX + 1];
+            const inv = 1 / @sqrt(sum.of(t[0..S]) / @as(f64, @floatFromInt(D)) + eps0);
+            for (0..D) |d| {
+                out[ho + l * D + d] = w[d] * bf(hraw[l * D + d] * inv);
+                mag[ho + l * D + d] = @abs(out[ho + l * D + d]);
+            }
+        }
+    }
+};
+
+/// hc_v2_fin's longest chain: the slices' sums, then the split's four-term sums.
+fn depthFin(s: Shape) usize {
+    return s.k + HC;
+}
+
 // ── decode/gemv_twin.zig: MLX's one-row gemv over a verify's rows, each row its one-row words ──
 
 /// A launch shape of the twin: the header `gemv_twin.header` writes for the plan of an [n, k] weight tiled by `v`;
@@ -1489,20 +2162,22 @@ const GemvTwin = struct {
 // ── prompt/gate_gemm.zig: the wide router's f32 logits as MLX's fused NAX GEMM over the stored types ──
 
 const GateGemm = struct {
-    pub const Params = struct {};
-    const t = ggemm.tile;
+    /// `bf16`: `gate_gemm.bf16F32` (PF_COMP_BF16, PF_ROUTER_BF16): both operands bf16, the MMA in bf16, at any rows.
+    pub const Params = struct { bf16: bool = false, blocked: bool = false };
 
-    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
-        if (s.rows == 0 or s.n == 0 or s.k == 0 or !ggemm.mlxRegular(@intCast(s.rows), @intCast(s.n), @intCast(s.k))) return null;
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        const t: ggemm.Tile = if (p.bf16) ggemm.bf16_tile else ggemm.tile;
+        if (s.rows == 0 or s.n == 0 or s.k == 0 or (!p.bf16 and !ggemm.mlxRegular(@intCast(s.rows), @intCast(s.n), @intCast(s.k)))) return null;
         const swz: usize = @as(usize, 1) << @intCast(t.swz);
         const tiles_m = (s.rows + t.bm - 1) / t.bm;
         const tiles_n = (s.n + t.bn - 1) / t.bn;
         var g = metal.Geometry{ .grid = .{ ci(tiles_n * swz * 32), ci((tiles_m + swz - 1) / swz * t.wn), ci(t.wm) }, .tg = .{ 32, ci(t.wn), ci(t.wm) } };
         g.out(&.{ ci(s.rows), ci(s.n) }, .float32);
-        g.dtype("T", .float32);
+        g.dtype("T", if (p.bf16) .bfloat16 else .float32);
         g.dtype("TA", act);
-        g.dtype("TB", .float16);
+        g.dtype("TB", if (p.bf16) .bfloat16 else .float16);
         g.dtype("OUT_R", .float32);
+        g.int("KBLK", @intFromBool(p.blocked));
         g.int("BM", t.bm);
         g.int("BN", t.bn);
         g.int("BK", t.bk);
@@ -1519,7 +2194,7 @@ const GateGemm = struct {
         const M = k.shape.rows;
         const K = k.shape.k;
         const x = try k.add(act, &.{ M, K });
-        const w = try k.add(.float16, &.{ k.shape.n, K });
+        const w = try k.add(if (k.p.bf16) .bfloat16 else .float16, &.{ k.shape.n, K });
         kit.uniform(rng, x, -2, 2);
         kit.uniform(rng, w, -2, 2);
         switch (f) {
@@ -1549,6 +2224,35 @@ const GateGemm = struct {
     }
 };
 
+// ── MLX_SERVE_DSV41_PF_IDX_PASS: the indexer's head weights over a pass (kernels/idx_wproj.metal) ──
+
+/// x [rows, 5120] . W [32, 5120]^T in f32, bf16 out: the model's shape compiled in (any rows), 16 partial sums of
+/// 320 products added as a tree, so an f32 sum in another order than MLX's split GEMM.
+const IdxWproj = struct {
+    pub const Params = struct {};
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n != @as(usize, @intCast(v41.idx_wproj_n)) or s.k != @as(usize, @intCast(v41.idx_wproj_k))) return null;
+        var g = metal.Geometry{ .grid = .{ 256, ci((s.rows + 15) / 16), 1 }, .tg = .{ 256, 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(s.n) }, act);
+        g.dtype("T", act);
+        g.dtype("OT", act);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        return GemvTwin.fill(k, f, rng);
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        return GemvTwin.compute(k, out, mag, sum);
+    }
+};
+
 // ── prompt/flash_attn.zig: a wide span's attention as one kernel, an online softmax over blocks of 128 keys ──
 
 /// Lossy (P rounds to f16 against the running max), so within the float64 online softmax's bound (the SDK attention
@@ -1559,8 +2263,9 @@ const AttnFlash = struct {
     const HGN: usize = @intCast(fa.hgn);
     const BK = 128;
 
+    /// Any pick count (the gather's own kernels take multiples of 64).
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
-        if (!Gathered.ok(s) or s.n % (16 * HGN) != 0 or s.n % p.og != 0) return null;
+        if (s.rows == 0 or s.n != HEADS or WINDOW + s.k > 1024 or s.n % (16 * HGN) != 0 or s.n % p.og != 0) return null;
         var g = metal.Geometry{ .grid = .{ ci(32 * s.n / (16 * HGN)), ci(s.rows), ci(4 * HGN) }, .tg = .{ 32, 1, ci(4 * HGN) } };
         g.out(&.{ ci(p.og), ci(s.rows), ci(s.n / p.og * HD) }, act);
         g.int("HGN", HGN);
@@ -1959,6 +2664,28 @@ const MarkovFinal = struct {
 
 // ── the query tail: rope_tail's roped channels alone, [L, H, RD] ──
 
+/// PF_ROPE_PAIRS (kernels/rope_tail_pairs.metal): rope_tail_only's words, a thread a (row, pair) over the heads.
+const RopeTailPairs = struct {
+    pub const Params = RopeTailOnly.Params;
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        const n = s.rows * RD / 2;
+        if (n == 0 or s.n == 0 or s.k < RD or s.k % 2 != 0) return null;
+        var g = metal.Geometry{ .grid = .{ ci(n), 1, 1 }, .tg = .{ ci(@min(n, 256)), 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(s.n), RD }, act);
+        g.int("RD", RD);
+        g.int("HH", s.n);
+        g.dtype("T", act);
+        g.dtype("OT", act);
+        return g;
+    }
+    pub const fill = RopeTailOnly.fill;
+    pub const count = RopeTailOnly.count;
+    pub const compute = RopeTailOnly.compute;
+    pub const check = RopeTailOnly.check;
+    pub const replaced = RopeTailOnly.replaced;
+};
+
 const RopeTailOnly = struct {
     /// `RopeTail`'s (its `fill` and `pre` read them).
     pub const Params = struct { scal: f64 = 1, off: i32 = 3001, sign: f64 = 1 };
@@ -2031,10 +2758,22 @@ const RopeTailOnly = struct {
 // ── the window row: rms norm, the tail rope at its position, the fp8 round trip ──
 
 const KvRow = struct {
-    pub const Params = struct { off: i32 = 3001 };
+    /// `rows`: the PF_KV_ROWS build (kernels/kv_rows.metal), one simdgroup a row, KV_ROWS_NSG rows a threadgroup.
+    pub const Params = struct { off: i32 = 3001, rows: bool = false };
 
-    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or s.k == 0 or s.k > 1024 or s.k % 32 != 0 or s.k < RD) return null;
+        if (p.rows) {
+            const nsg = v41.KV_ROWS_NSG;
+            var g = metal.Geometry{ .grid = .{ 32 * nsg, ci((s.rows + nsg - 1) / nsg), 1 }, .tg = .{ 32 * nsg, 1, 1 } };
+            g.out(&.{ ci(s.rows), ci(s.k) }, act);
+            g.int("D", s.k);
+            g.int("RD", RD);
+            g.int("NSG", nsg);
+            g.flag("QAT", true);
+            g.dtype("T", act);
+            return g;
+        }
         var g = metal.Geometry{ .grid = .{ ci(s.k), ci(s.rows), 1 }, .tg = .{ ci(s.k), 1, 1 } };
         g.out(&.{ ci(s.rows), ci(s.k) }, act);
         g.int("RD", RD);
@@ -4109,6 +4848,9 @@ const hc_stage_x_ins: []const [*:0]const u8 = &.{ "x", "y", "spost", "scomb", "c
 const gate_l = launch("dsv41_gate", &.{ "x", "w" }, &.{"logits"}, v41.GATE_SOURCE, "", 0, 1024, false);
 const dense_l = launch("dsv41_dense_f32x", &.{ "x", "w" }, &.{"out"}, v41.DENSE_F32X_SOURCE, "", 0, 928, false);
 const route_l = launch("dsv41_route", &.{ "logits", "bias", "scal" }, &.{ "idx", "wts" }, v41.ROUTE_SOURCE, "", 4 * (1024 + 32 + 32 + TOPK), 1024, false);
+const route_rows_l = launch("dsv41_pf_route_rows", &pfroute.ROWS_INS, &pfroute.ROWS_OUTS, pfroute.ROWS_SOURCE, "", 0, 32 * pfroute.rows_sg, false);
+const route_scatter_l = launch("dsv41_pf_route_scatter", &pfroute.SCATTER_INS, &pfroute.SCATTER_OUTS, pfroute.SCATTER_SOURCE, "", 4 * 256, 256, false);
+const route_scan_l = launch("dsv41_pf_route_scan", &pfroute.SCAN_INS, &pfroute.SCAN_OUTS, pfroute.SCAN_SOURCE, "", 16 * 1024 + 4 * (1024 + 32), pfroute.scan_threads, false);
 const topk_l = launch("dsv41_topk", &.{"x"}, &.{"out"}, v41.TOPK_SOURCE, v41.TOPK_HEADER, 4 * (256 + 2 + TopK.TG / 32), 1024, false);
 const split_l = launch("dsv41_hc_split", &.{ "z", "eps" }, &.{ "pre", "post", "comb" }, v41.HC_SPLIT_SOURCE, "", 0, 1024, false);
 const mix_l = launch("dsv41_hc_mix", &.{ "x", "fn", "scale", "base", "eps" }, &.{"z"}, v41.HC_MIX_SOURCE, "", 4 * (4 * 6 + 4) * 32, 1024, true);
@@ -4116,8 +4858,10 @@ const norm_l = launch("dsv41_hc_norm", &.{ "z", "x", "cpre", "w", "eps" }, &.{ "
 const stage_l = launch("dsv41_hc_stage", hc_stage_ins, &.{ "h_out", "z" }, v41.HC_STAGE_SOURCE, "", 2 * 4 * 32, 1024, true);
 const stage_x_l = launch("dsv41_hc_stage_x", hc_stage_x_ins, &.{ "h_out", "z", "x1" }, v41.HC_STAGE_X_SOURCE, "", 2 * 4 * 32, 1024, true);
 const idx_l = launch("dsv41_index_scores", &.{ "q", "keys", "w", "meta", "wsc" }, &.{"scores"}, v41.IDX_SCORE_SOURCE, "", 4 * IH * IHD, 416, false);
+const idx_nax_l = metal.Launch{ .name = "dsv41_pf_idx_score", .inputs = &inax.ins, .outputs = &.{"scores"}, .source = inax.source, .header = inax.header, .tg_bytes = 0, .offline = false, .min_gen = 17 };
 const tile_l = launch("dsv41_index_tile", &.{ "q", "keys", "w", "meta", "wsc" }, &.{"scores"}, v41.IDX_TILE_SOURCE, "", 2 * IdxTile.KT * IHD + 4 * IH + 4 * 4 * 64, 1024, false);
-const idx_nax_l = metal.Launch{ .name = "dsv41_index_nax", .inputs = &.{ "q", "keys", "w", "meta", "wsc" }, .outputs = &.{"scores"}, .source = v41.IDX_NAX_SOURCE, .header = @import("decode/attn.zig").HEADER, .tg_bytes = v41.idxNaxGeom(1, 1, IHD).bn * IHD * 2, .offline = false, .min_gen = 17 };
+/// The upstream matmul2d wide scorer (`v41.indexScoresNax`), beside `MLX_SERVE_DSV41_PF_IDX_NAX`'s.
+const idx_nax_mm_l = metal.Launch{ .name = "dsv41_index_nax", .inputs = &.{ "q", "keys", "w", "meta", "wsc" }, .outputs = &.{"scores"}, .source = v41.IDX_NAX_SOURCE, .header = @import("decode/attn.zig").HEADER, .tg_bytes = v41.idxNaxGeom(1, 1, IHD).bn * IHD * 2, .offline = false, .min_gen = 17 };
 pub const rope_l = launch("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, v41.ROPE_TAIL_SOURCE, v41.FP8_HEADER, 0, 1024, false);
 const expand_into_l = launch("dsv41_hc_expand_into", &.{ "x", "res", "post", "comb", "dst", "after" }, &.{"carrier"}, sx1.expand_into_source, "", 0, 704, false);
 const expand_norm_l = launch("dsv41_hc_expand_norm", &.{ "y", "res", "post", "comb", "cpre", "w", "eps" }, &.{ "h_out", "x1" }, hcf.expand_norm_source, hcf.expand_norm_fresh_header, 4 * 32, 1024, true);
@@ -4125,12 +4869,56 @@ const expand_norm_into_l = launch("dsv41_hc_expand_norm_into", &.{ "y", "res", "
 const gate_gemm_l = metal.Launch{ .name = "dsv41_gate_gemm", .inputs = &.{ "a", "b" }, .outputs = &.{"y"}, .source = ggemm.body, .header = ggemm.header, .tg_bytes = 0, .offline = false, .min_gen = 17 };
 const markov_step_l = launch("dsv41_markov_step", &.{ "lg", "emb", "mh", "t1", "pin" }, &.{ "pout", "row" }, markov.step_source, markov.header, 4 * (2 * 8 + 1), 1024, false);
 const markov_final_l = launch("dsv41_markov_final", &.{ "parts", "t1", "hout", "emb", "cw" }, &.{ "toks", "conf" }, markov.final_source, markov.header, 4 * (3 * 16 + 1), 1024, false);
+const idx_wproj_l = metal.Launch{ .name = "dsv41_idx_wproj", .inputs = &.{ "x", "w" }, .outputs = &.{"y"}, .source = v41.IDX_WPROJ_SOURCE, .header = v41.IDX_WPROJ_HEADER, .tg_bytes = 4 * 8 * 16 * 32, .offline = false, .min_gen = 17 };
 const flash_l = metal.Launch{ .name = "dsv41_attn_flash", .inputs = &v41.GatherAttn.FLASH_INS, .outputs = &.{"o"}, .source = fa.source, .header = @import("decode/attn.zig").HEADER, .tg_bytes = 4 * 2 * 128 + 4 * 2 * 4 * 4 * 16 + 2 * 4 * 8 * 256, .offline = false, .min_gen = 17 };
+const flash_trim_l = metal.Launch{ .name = "dsv41_attn_flash_trim", .inputs = flash_l.inputs, .outputs = flash_l.outputs, .source = fa.source, .header = fa.header_trim, .tg_bytes = flash_l.tg_bytes, .offline = false, .min_gen = 17 };
+const flash_psum_l = metal.Launch{ .name = "dsv41_attn_flash_psum", .inputs = flash_l.inputs, .outputs = flash_l.outputs, .source = fa.source, .header = fa.header_psum, .tg_bytes = flash_l.tg_bytes, .offline = false, .min_gen = 17 };
+const flash_trim_psum_l = metal.Launch{ .name = "dsv41_attn_flash_trim_psum", .inputs = flash_l.inputs, .outputs = flash_l.outputs, .source = fa.source, .header = fa.header_trim_psum, .tg_bytes = flash_l.tg_bytes, .offline = false, .min_gen = 17 };
 const gather_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 } };
+/// The flash kernel's: the gather's, and pick counts not a multiple of 64 (a short prompt's last span, which the gather
+/// declines).
+const flash_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 }, .{ .rows = 3, .n = HEADS, .k = 150 }, .{ .rows = 4, .n = HEADS, .k = 200 }, .{ .rows = 5, .n = HEADS, .k = 500 }, .{ .rows = 3, .n = HEADS, .k = 511 }, .{ .rows = 2, .n = HEADS, .k = 8 }, .{ .rows = 3, .n = HEADS, .k = 17 }, .{ .rows = 4, .n = HEADS, .k = 99 } };
+/// A call with no window rows before it (a replay tail, a short first turn: fewer keys than the window), `wp = 0`.
+const flash_first_served: []const Shape = &.{ .{ .rows = 7, .n = HEADS, .k = 3 }, .{ .rows = 12, .n = HEADS, .k = 12 }, .{ .rows = 17, .n = HEADS, .k = 8 }, .{ .rows = 5, .n = HEADS, .k = 99 }, .{ .rows = 3, .n = HEADS, .k = 449 } };
 const qk_t_l = metal.Launch{ .name = "dsv41_attn_qk_t", .inputs = &.{ "q", "kw", "comp", "picks", "meta", "qt" }, .outputs = &.{"s"}, .source = qtail.attn_qk_t_source, .header = v41.MPP_HEADER, .tg_bytes = 2 * 64 * 64 * 2, .offline = false, .min_gen = 17 };
+/// The slicing a variant's contract cases run at.
+fn v2Slices(p: hv2.Pro) usize {
+    return switch (p) {
+        .plain, .tail_only => 10,
+        .ffn, .tail_c => 20,
+        .tail, .tail_only_c => 40,
+    };
+}
+fn v2Served(comptime S: usize) []const Shape {
+    return &.{ .{ .rows = 17, .n = DIM, .k = S }, .{ .rows = 65, .n = DIM, .k = S } };
+}
+
+fn hcV2MixLaunch(comptime p: hv2.Pro) metal.Launch {
+    return .{ .name = hv2.name(p), .inputs = hv2.ins(p), .outputs = hv2.outs(p), .source = hv2.mix_source, .header = hv2.header(p), .tg_bytes = if (hv2.mixes(p)) 4 * hv2.FSTEP else 0, .offline = false, .min_gen = 17 };
+}
+const hc_v2_mix_l = blk: {
+    var l: [hv2.all.len]metal.Launch = undefined;
+    for (hv2.all, 0..) |p, i| l[i] = hcV2MixLaunch(p);
+    break :blk l;
+};
+/// The combining tails' `TOK` builds (`MoeParts.tok`: the down rows in pair order, read in place).
+const hc_v2_tok = [_]hv2.Pro{ .tail_c, .tail_only_c };
+const hc_v2_mix_tok_l = blk: {
+    var l: [hc_v2_tok.len]metal.Launch = undefined;
+    for (hc_v2_tok, 0..) |p, i| {
+        l[i] = hcV2MixLaunch(p);
+        l[i].name = hv2.name(p) ++ "_tok";
+        l[i].header = hv2.header(p) ++ "#define TOK 1\n";
+    }
+    break :blk l;
+};
+/// hc_v2's launches serve on NAX GPUs only (`hc_v2.serves`).
+const hc_v2_fin_l = metal.Launch{ .name = "dsv41_hc_v2_fin", .inputs = &hv2.fin_ins, .outputs = &hv2.fin_outs, .source = hv2.fin_source, .header = "", .tg_bytes = 0, .offline = false, .min_gen = 17 };
 const mix_norm_l = launch("dsv41_hc_mix_norm", &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, &.{ "z", "h_out", "h2" }, hcf.mix_norm_source, "", 4 * (4 * 6 + 4) * 32, 1024, true);
 const rope_only_l = launch("dsv41_rope_tail_only", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_only_source, "", 0, 1024, false);
+const rope_pairs_l = launch("dsv41_rope_tail_pairs", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_pairs_source, "", 0, 1024, false);
 const kv_l = launch("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, v41.KV_ROW_SOURCE, v41.FP8_HEADER, 4 * (32 + 1024), 1024, false);
+const kv_rows_l = launch("dsv41_kv_rows", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, v41.KV_ROWS_SOURCE, v41.FP8_HEADER, 0, 1024, false);
 const engram_l = launch("dsv41_engram", &.{ "x", "kv", "qk", "cst" }, &.{"out"}, v41.ENGRAM_SOURCE, "", 4 * (3 * 32 + 1), 928, false);
 const dec_l = launch("dsv41_attn_decode", attn_ins ++ &[_][*:0]const u8{"periods"}, &.{"out"}, v41.ATTN_DEC_SOURCE, v41.UNROPE_HEADER, 4 * (AttnDec.NSG * HD + 2 * AttnDec.NSG), 768, false);
 const split_attn_l = launch("dsv41_attn_split", attn_ins, &.{ "pacc", "pm", "pl" }, v41.ATTN_SPLIT_SOURCE, "", 4 * (AttnSplit.NSG * HD + 2 * AttnSplit.NSG), 768, false);
@@ -4151,6 +4939,10 @@ fn GgufMoe(comptime ty: gguf_quants.GgmlType) type {
 const dn_l = launch("dsv41_moe_dn", moe_dn_ins, &.{"out"}, v41.MOE_DN_SOURCE, v41.MOE_HEADER, 0, 928, false);
 const act_l = launch("dsv41_moe_act", &.{ "y", "wts", "lim" }, &.{"out"}, v41.MOE_ACT_SOURCE, "", 0, 1024, false);
 const combine_l = launch("dsv41_moe_combine", &.{ "dn", "inv", "sh" }, &.{"out"}, v41.MOE_COMBINE_SOURCE, "", 0, 1024, false);
+const moe_tail_l = launch("dsv41_moe_tail", &mtail.ins, &.{"out"}, mtail.source, "", 0, 1024, false);
+/// `MLX_SERVE_DSV41_PF_DOWN_TOKORD`'s builds: the down rows in pair order, read in place.
+const combine_tok_l = launch("dsv41_moe_combine_tok", &.{ "dn", "inv", "sh" }, &.{"out"}, v41.MOE_COMBINE_SOURCE, "#define TOK 1\n", 0, 1024, false);
+const moe_tail_tok_l = launch("dsv41_moe_tail_tok", &mtail.ins, &.{"out"}, mtail.source, "#define TOK 1\n", 0, 1024, false);
 
 pub const relu_nan: spec.Known = .{ .gate = .nonfinite, .finding = "a NaN q . k dot scores as 0: metal::max(dot, 0) drops NaN where relu (the reference, torch) propagates it" };
 pub const quant_nan: spec.Nan = .{ .stated = "classes as float64 gives them; quantized entries within the quantizer's envelope of their bounds" };
@@ -4189,6 +4981,32 @@ pub fn register(set: *kc.Set) !void {
         .outs = &.{ .{ .elem = .u32, .count = rowsN }, .{ .elem = .f32, .count = rowsN } },
         .nan = .{ .stated = "a NaN score is never picked; weights classed as float64 gives them" },
         .served = &.{ .{ .rows = 1, .n = TOPK, .k = EXPERTS }, .{ .rows = REGION, .n = TOPK, .k = EXPERTS } },
+    });
+    try kit.add(set, RouteRows, &route_rows_l, .{}, .{
+        .name = "dsv41 pf route rows (PF_ROUTE_PACK: sqrt-softplus top-6 on a simdgroup a row)",
+        .accum = .none,
+        .depth = depthOne,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .u32, .count = rowsN }, .{ .elem = .f32, .count = rowsN } },
+        .nan = .{ .stated = "a NaN score is never picked; weights classed as float64 gives them" },
+        .served = &.{ .{ .rows = 128, .n = TOPK, .k = EXPERTS }, .{ .rows = 2048, .n = TOPK, .k = EXPERTS }, .{ .rows = 33, .n = TOPK, .k = EXPERTS } },
+    });
+    try kit.add(set, RouteScan, &route_scan_l, .{}, .{
+        .name = "dsv41 pf route scan (PF_ROUTE_PACK: the route pack's offsets on one 1024-thread threadgroup)",
+        .accum = .none,
+        .depth = depthOne,
+        .out = .u32,
+        .nan = .{ .stated = "integer counts in, integer offsets out: no non-finite value exists; the extremes (every pair on the first or the last expert) keep every offset exact" },
+        .served = &.{ .{ .rows = 414, .n = EXPERTS, .k = 1 }, .{ .rows = 3, .n = EXPERTS, .k = 1 }, .{ .rows = 1, .n = EXPERTS, .k = 1 } },
+    });
+    try kit.add(set, RouteScatter, &route_scatter_l, .{}, .{
+        .name = "dsv41 pf route scatter (PF_ROUTE_PACK: the stable placement with the weights put)",
+        .accum = .none,
+        .depth = depthOne,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .u32, .count = pairs3 }, .{ .elem = .f32, .count = pairs1 } },
+        .nan = .{ .stated = "a weight moves bit for bit, NaN and infinities included; ids and places are integers" },
+        .served = &.{ .{ .rows = 128, .n = EXPERTS, .k = TOPK }, .{ .rows = 700, .n = EXPERTS, .k = TOPK }, .{ .rows = 33, .n = EXPERTS, .k = TOPK } },
     });
     try kit.add(set, TopK, &topk_l, .{}, .{
         .name = "dsv41 topk (radix select)",
@@ -4270,6 +5088,16 @@ pub fn register(set: *kc.Set) !void {
         .known = relu_nan,
     });
     try kit.add(set, IdxNax, &idx_nax_l, .{}, .{
+        .name = "dsv41 pf idx_nax (wide indexer, NAX)",
+        .accum = .f32,
+        .depth = depthIdx,
+        .out = .f32,
+        .tiles = .{ .{ .size = inax.NSG }, .{ .size = 16 }, .{} },
+        .served = &.{ .{ .rows = 17, .n = 300, .k = IHD }, .{ .rows = 40, .n = 200, .k = IHD } },
+        .nax = true,
+        .known = relu_nan,
+    });
+    try kit.add(set, IdxNaxMm, &idx_nax_mm_l, .{}, .{
         .name = "dsv41 idx_nax (wide indexer, NAX matmul2d)",
         .accum = .f32,
         .depth = depthIdx,
@@ -4330,6 +5158,16 @@ pub fn register(set: *kc.Set) !void {
         .nan = quant_nan,
         .known = nan_code,
         .served = &.{ .{ .rows = 1, .n = 1, .k = HD }, .{ .rows = 64, .n = 1, .k = HD } },
+        .sums = squares,
+    });
+    try kit.add(set, KvRow, &kv_rows_l, .{ .rows = true }, .{
+        .name = "dsv41 kv_rows (PF_KV_ROWS: kv_row a simdgroup a row)",
+        .accum = .f32,
+        .depth = depthK,
+        .out = .bf16,
+        .nan = quant_nan,
+        .known = nan_code,
+        .served = &.{ .{ .rows = 17, .n = 1, .k = HD }, .{ .rows = 64, .n = 1, .k = HD } },
         .sums = squares,
     });
     try kit.add(set, Engram, &engram_l, .{}, .{
@@ -4489,6 +5327,31 @@ pub fn register(set: *kc.Set) !void {
         .out = .bf16,
         .served = &.{ .{ .rows = 17, .n = DIM, .k = TOPK }, .{ .rows = 64, .n = 256, .k = TOPK } },
     });
+    try kit.add(set, MoeTail, &moe_tail_l, .{}, .{
+        .name = "dsv41 moe_tail (prefill combine + hc expand)",
+        .accum = .f32,
+        .depth = depthTail,
+        .ops = 2,
+        .mids = 1,
+        .out = .bf16,
+        .served = &.{ .{ .rows = 17, .n = DIM, .k = TOPK }, .{ .rows = 64, .n = 256, .k = TOPK } },
+    });
+    try kit.add(set, MoeCombine, &combine_tok_l, .{ .tok = true }, .{
+        .name = "dsv41 moe_combine tok (prefill K-sum + shared, the down rows in pair order)",
+        .accum = .f32,
+        .depth = depthK1,
+        .out = .bf16,
+        .served = &.{ .{ .rows = 17, .n = DIM, .k = TOPK }, .{ .rows = 64, .n = 256, .k = TOPK } },
+    });
+    try kit.add(set, MoeTail, &moe_tail_tok_l, .{ .tok = true }, .{
+        .name = "dsv41 moe_tail tok (prefill combine + hc expand, the down rows in pair order)",
+        .accum = .f32,
+        .depth = depthTail,
+        .ops = 2,
+        .mids = 1,
+        .out = .bf16,
+        .served = &.{ .{ .rows = 17, .n = DIM, .k = TOPK }, .{ .rows = 64, .n = 256, .k = TOPK } },
+    });
 }
 
 // ── tests ──
@@ -4548,7 +5411,7 @@ const Shell = struct {
         m.moe_dn_kernel = try b("dsv41_moe_dn", &v41.MOE_DN_INS, &.{"out"}, v41.MOE_DN_SOURCE, v41.MOE_HEADER);
         m.moe_act_kernel = try b("dsv41_moe_act", &v41.MOE_ACT_INS, &.{"out"}, v41.MOE_ACT_SOURCE, "");
         m.moe_combine_kernel = try b("dsv41_moe_combine", &v41.MOE_COMBINE_INS, &.{"out"}, v41.MOE_COMBINE_SOURCE, "");
-        const use_nax = device.naxAvailable();
+        const use_nax = world.nax();
         m.idx_nax_kernel = if (use_nax) try v41.buildIdxNaxKernel() else null;
         return .{ .m = m };
     }
@@ -4581,7 +5444,54 @@ fn registerStreamed(set: *kc.Set) !void {
         .depth = kc.host.depthOne,
         .out = .bf16,
         .nax = true,
-        .served = gather_served,
+        .served = flash_served,
+        .sums = .{ .exact = false },
+    });
+    // FLASH_TRIM's text (FLASH_ATTN's values): the same bound.
+    inline for (.{ true, false }) |qt| try kit.add(set, AttnFlash, &flash_trim_l, .{ .qt = qt }, .{
+        .name = if (qt) "dsv41 attn_flash trim (one launch, f16 weights, max over raw scores, 8-byte stores, the roped tail from qt)" else "dsv41 attn_flash trim (one launch, f16 weights, max over raw scores, 8-byte stores)",
+        .accum = .f32,
+        .depth = kc.host.depthOne,
+        .out = .bf16,
+        .nax = true,
+        .served = flash_served,
+        .sums = .{ .exact = false },
+    });
+    inline for (.{ true, false }) |qt| try kit.add(set, AttnFlash, &flash_trim_l, .{ .qt = qt, .wp = 0, .nc = 500 }, .{
+        .name = if (qt) "dsv41 attn_flash trim (no window rows before the call, the roped tail from qt)" else "dsv41 attn_flash trim (no window rows before the call)",
+        .accum = .f32,
+        .depth = kc.host.depthOne,
+        .out = .bf16,
+        .nax = true,
+        .served = flash_first_served,
+        .sums = .{ .exact = false },
+    });
+    try kit.add(set, IdxWproj, &idx_wproj_l, .{}, .{
+        .name = "dsv41 idx_wproj (PF_IDX_PASS: the indexer's head weights over a pass, 32 x 5,120 compiled in, bf16 out)",
+        .accum = .f32,
+        .depth = depthK,
+        .out = .bf16,
+        .nax = true,
+        .served = &.{ .{ .rows = 33, .n = 32, .k = 5120 }, .{ .rows = 256, .n = 32, .k = 5120 }, .{ .rows = 1000, .n = 32, .k = 5120 } },
+    });
+    // FLASH_TRIM and FLASH_PSUM together: the same bound.
+    inline for (.{ true, false }) |qt| try kit.add(set, AttnFlash, &flash_trim_psum_l, .{ .qt = qt }, .{
+        .name = if (qt) "dsv41 attn_flash trim+psum (one launch, f16 weights, the roped tail from qt)" else "dsv41 attn_flash trim+psum (one launch, f16 weights)",
+        .accum = .f32,
+        .depth = kc.host.depthOne,
+        .out = .bf16,
+        .nax = true,
+        .served = flash_served,
+        .sums = .{ .exact = false },
+    });
+    // FLASH_PSUM's sums (l over the rounded P): the same bound.
+    inline for (.{ true, false }) |qt| try kit.add(set, AttnFlash, &flash_psum_l, .{ .qt = qt }, .{
+        .name = if (qt) "dsv41 attn_flash psum (one launch, f16 weights, l over the rounded P, the roped tail from qt)" else "dsv41 attn_flash psum (one launch, f16 weights, l over the rounded P)",
+        .accum = .f32,
+        .depth = kc.host.depthOne,
+        .out = .bf16,
+        .nax = true,
+        .served = flash_served,
         .sums = .{ .exact = false },
     });
     // The vocabulary cut to 40,000 (129,280 served): the step is vocabulary-generic, and this still gives a simdgroup
@@ -4638,6 +5548,25 @@ fn registerStreamed(set: *kc.Set) !void {
         .replaces = "astype f32, MLX's matmul (its regular NAX kernel)",
         .served = &.{ .{ .rows = 256, .n = 384, .k = 512 }, .{ .rows = 100, .n = 384, .k = 768 }, .{ .rows = 77, .n = 200, .k = 300 } },
     });
+    try kit.add(set, GateGemm, &gate_gemm_l, .{ .bf16 = true }, .{
+        .name = "dsv41 gate_gemm bf16 (the MMA in bf16 over bf16 x and w, f32 out: PF_COMP_BF16's compressor, PF_ROUTER_BF16's router)",
+        .accum = .f32,
+        .depth = depthK,
+        .out = .f32,
+        .nax = true,
+        .replaces = "astype f32, MLX's matmul (TF32 or f32 MMA: the same exact products, reordered sums)",
+        .served = &.{ .{ .rows = 256, .n = 512, .k = 512 }, .{ .rows = 100, .n = 384, .k = 768 }, .{ .rows = 77, .n = 200, .k = 300 } },
+    });
+    try kit.add(set, GateGemm, &gate_gemm_l, .{ .bf16 = true, .blocked = true }, .{
+        .name = "dsv41 gate_gemm bf16 blocked (each BK block's sum apart, then added: PF_COMP_BF16's compressor)",
+        .accum = .f32,
+        .depth = depthK,
+        .out = .f32,
+        .nax = true,
+        // Another order of the same exact products than the split-K chain it replaces (not its bytes): held to the
+        // float64 bound of f32 sums, as an exact-sum kernel.
+        .served = &.{ .{ .rows = 256, .n = 1024, .k = 1024 }, .{ .rows = 100, .n = 384, .k = 768 }, .{ .rows = 77, .n = 200, .k = 300 } },
+    });
     try kit.add(set, AttnQkT, &qk_t_l, .{}, .{
         .name = "dsv41 attn_qk_t (prompt width, the heads and their roped tail)",
         .accum = .f32,
@@ -4672,6 +5601,50 @@ fn registerStreamed(set: *kc.Set) !void {
         .sums = fused_sums,
     });
     const mix_norm_served: []const Shape = &.{ .{ .rows = 17, .n = DIM, .k = HC * DIM }, .{ .rows = 64, .n = DIM, .k = HC * DIM } };
+    const v2_outs_tail: []const spec.Part = &.{ .{ .elem = .bf16, .count = HcV2Mix.rowsX }, .{ .elem = .bf16, .count = rowsN }, .{ .elem = .f32, .count = HcV2Mix.partCount } };
+    const v2_outs_mix: []const spec.Part = &.{ .{ .elem = .bf16, .count = rowsN }, .{ .elem = .f32, .count = HcV2Mix.partCount } };
+    const v2_outs_none: []const spec.Part = &.{};
+    const v2_sums: spec.Sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "its sums reorder the stock kernels' fp32 terms, held to the float64 bound (gate 3); random rows, not a stress" };
+    // Each variant at one of the slicings the wide widths take (k = slices: 10 from 2048 rows, 20 from 512, 40 below),
+    // so every slicing runs on two variants; 65 rows cross the 64-row threadgroup edge.
+    inline for (hv2.all) |p| try kit.add(set, HcV2Mix, &hc_v2_mix_l[@intFromEnum(p)], .{ .pro = p }, .{
+        .name = "dsv41 hc_v2_mix (" ++ @tagName(p) ++ ": stream rows formed, collapsed and mixed in one pass)",
+        .accum = .f32,
+        .depth = depthV2,
+        .ops = 4,
+        .mids = 3,
+        .out = .bf16,
+        .outs = if (hv2.isTail(p) and hv2.mixes(p)) v2_outs_tail else if (!hv2.mixes(p)) v2_outs_none else v2_outs_mix,
+        .tiles = .{ .{ .size = hv2.ROWS }, .{}, .{} },
+        .served = comptime v2Served(v2Slices(p)),
+        .sums = v2_sums,
+        .nax = true,
+    });
+    inline for (hc_v2_tok, 0..) |p, i| try kit.add(set, HcV2Mix, &hc_v2_mix_tok_l[i], .{ .pro = p, .tok = true }, .{
+        .name = "dsv41 hc_v2_mix (" ++ @tagName(p) ++ " tok: the down rows in pair order, read in place)",
+        .accum = .f32,
+        .depth = depthV2,
+        .ops = 4,
+        .mids = 3,
+        .out = .bf16,
+        .outs = if (hv2.mixes(p)) v2_outs_tail else v2_outs_none,
+        .tiles = .{ .{ .size = hv2.ROWS }, .{}, .{} },
+        .served = comptime v2Served(v2Slices(p)),
+        .sums = v2_sums,
+        .nax = true,
+    });
+    try kit.add(set, HcV2Fin, &hc_v2_fin_l, .{}, .{
+        .name = "dsv41 hc_v2_fin (slices into the mixes, the split and the normed collapse)",
+        .accum = .f32,
+        .depth = depthFin,
+        .ops = sinkhorn_ops + 8,
+        .mids = 2,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .f32, .count = HcV2Fin.rowsSplit }, .{ .elem = .bf16, .count = rowsN } },
+        .served = &.{ .{ .rows = 17, .n = DIM, .k = 40 }, .{ .rows = 65, .n = DIM, .k = 10 } },
+        .nax = true,
+        .sums = short_sums,
+    });
     inline for (.{ true, false }) |h2| try kit.add(set, HcMixNorm, &mix_norm_l, .{ .h2 = h2 }, .{
         .name = if (h2) "dsv41 hc_mix_norm (mixes + normed collapse, twice)" else "dsv41 hc_mix_norm (mixes + normed collapse)",
         .accum = .f32,
@@ -4687,6 +5660,15 @@ fn registerStreamed(set: *kc.Set) !void {
     });
     try kit.add(set, RopeTailOnly, &rope_only_l, .{}, .{
         .name = "dsv41 rope_tail_only (the query tail)",
+        .accum = .none,
+        .depth = depthOne,
+        .out = .bf16,
+        .replaces = "rope_tail's roped channels",
+        .nan = quant_nan,
+        .served = &.{ .{ .rows = 1, .n = HEADS, .k = HD }, .{ .rows = REGION, .n = HEADS, .k = HD } },
+    });
+    try kit.add(set, RopeTailPairs, &rope_pairs_l, .{}, .{
+        .name = "dsv41 rope_tail_pairs (PF_ROPE_PAIRS: the query tail a pair a thread over the heads)",
         .accum = .none,
         .depth = depthOne,
         .out = .bf16,
@@ -4805,16 +5787,51 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         defer _ = mlx.mlx_array_free(y);
         try Expect.same(r.c, r.bytes, &.{y});
     }
-    if (@import("../../mlx/device.zig").naxAvailable()) {
+    if (world.nax()) {
         const r = try ours(GateGemm, a, &gate_gemm_l, .{}, .{ .rows = 100, .n = 384, .k = 768 });
         const y = (try ggemm.router(m.s, r.c.args[0], r.c.args[1], true)).?;
         defer _ = mlx.mlx_array_free(y);
         try Expect.same(r.c, r.bytes, &.{y});
+        const rb = try ours(GateGemm, a, &gate_gemm_l, .{ .bf16 = true }, .{ .rows = 100, .n = 384, .k = 768 });
+        const yb = (try ggemm.bf16F32(m.s, rb.c.args[0], rb.c.args[1], true, .single)).?;
+        defer _ = mlx.mlx_array_free(yb);
+        try Expect.same(rb.c, rb.bytes, &.{yb});
+        const rk = try ours(GateGemm, a, &gate_gemm_l, .{ .bf16 = true, .blocked = true }, .{ .rows = 100, .n = 384, .k = 768 });
+        const yk = (try ggemm.bf16F32(m.s, rk.c.args[0], rk.c.args[1], true, .blocked)).?;
+        defer _ = mlx.mlx_array_free(yk);
+        try Expect.same(rk.c, rk.bytes, &.{yk});
     }
     // The flash kernel as the model launches it (`flashLaunch`, grouped).
-    if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
+    if (world.nax()) inline for (.{ true, false }) |qt| {
         const r = try ours(AttnFlash, a, &flash_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
         const fk = try v41.buildKernel("dsv41_attn_flash", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, @import("decode/attn.zig").HEADER);
+        defer _ = mlx.mlx_fast_metal_kernel_free(fk);
+        var got: [1]A = .{none};
+        try v41.flashLaunch(&sc, fk, r.c.args[0..9], &.{.{ .shape = &.{ 8, 3, HEADS / 8 * HD }, .dt = act }}, 3, HEADS, qt, act, &got);
+        try Expect.same(r.c, r.bytes, &got);
+    };
+    // FLASH_TRIM's kernel as the model builds and launches it (`fa.header_trim`).
+    if (world.nax()) inline for (.{ true, false }) |qt| {
+        const r = try ours(AttnFlash, a, &flash_trim_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
+        const fk = try v41.buildKernel("dsv41_attn_flash_trim", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, fa.header_trim);
+        defer _ = mlx.mlx_fast_metal_kernel_free(fk);
+        var got: [1]A = .{none};
+        try v41.flashLaunch(&sc, fk, r.c.args[0..9], &.{.{ .shape = &.{ 8, 3, HEADS / 8 * HD }, .dt = act }}, 3, HEADS, qt, act, &got);
+        try Expect.same(r.c, r.bytes, &got);
+    };
+    // Both switches' kernel as the model builds and launches it (`fa.header_trim_psum`).
+    if (world.nax()) inline for (.{ true, false }) |qt| {
+        const r = try ours(AttnFlash, a, &flash_trim_psum_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
+        const fk = try v41.buildKernel("dsv41_attn_flash_trim_psum", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, fa.header_trim_psum);
+        defer _ = mlx.mlx_fast_metal_kernel_free(fk);
+        var got: [1]A = .{none};
+        try v41.flashLaunch(&sc, fk, r.c.args[0..9], &.{.{ .shape = &.{ 8, 3, HEADS / 8 * HD }, .dt = act }}, 3, HEADS, qt, act, &got);
+        try Expect.same(r.c, r.bytes, &got);
+    };
+    // FLASH_PSUM's kernel as the model builds and launches it (`fa.header_psum`).
+    if (world.nax()) inline for (.{ true, false }) |qt| {
+        const r = try ours(AttnFlash, a, &flash_psum_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
+        const fk = try v41.buildKernel("dsv41_attn_flash_psum", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, fa.header_psum);
         defer _ = mlx.mlx_fast_metal_kernel_free(fk);
         var got: [1]A = .{none};
         try v41.flashLaunch(&sc, fk, r.c.args[0..9], &.{.{ .shape = &.{ 8, 3, HEADS / 8 * HD }, .dt = act }}, 3, HEADS, qt, act, &got);
@@ -4883,6 +5900,22 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
             try Expect.same(r.c, r.bytes, &.{ f.h, dst });
         } else try Expect.same(r.c, r.bytes, &.{ f.h, f.x1 });
     }
+    inline for (hv2.all) |p| {
+        const r = try ours(HcV2Mix, a, &hc_v2_mix_l[@intFromEnum(p)], .{ .pro = p }, .{ .rows = 70, .n = DIM, .k = v2Slices(p) });
+        const o = try hv2.mixLaunch(&sc, p, r.c.args[0..r.c.n_in], 70, v2Slices(p));
+        try Expect.same(r.c, r.bytes, o[0..hv2.nOuts(p)]);
+    }
+    inline for (hc_v2_tok, 0..) |p, i| {
+        const r = try ours(HcV2Mix, a, &hc_v2_mix_tok_l[i], .{ .pro = p, .tok = true }, .{ .rows = 70, .n = DIM, .k = v2Slices(p) });
+        const o = try hv2.mixLaunchTo(&sc, p, r.c.args[0..r.c.n_in], 70, v2Slices(p), true);
+        try Expect.same(r.c, r.bytes, o[0..hv2.nOuts(p)]);
+    }
+    {
+        const r = try ours(HcV2Fin, a, &hc_v2_fin_l, .{}, .{ .rows = 70, .n = DIM, .k = 20 });
+        const hc: v41.Hc = .{ .fn_w = none, .scale = r.c.args[2], .base = r.c.args[3] };
+        const f = try hv2.finLaunch(&sc, r.c.args[0], r.c.args[1], &hc, r.c.args[4], r.c.args[5], 20, ITERS);
+        try Expect.same(r.c, r.bytes, &.{ f.z, f.n.sp.pre, f.n.sp.post, f.n.sp.comb, f.n.h });
+    }
     {
         const r = try ours(ExpandInto, a, &expand_into_l, .{}, .{ .rows = 6, .n = 300, .k = HC });
         const dst = try freshRegion(r.c, 6, 300);
@@ -4913,6 +5946,13 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
     }
     {
         const r = try ours(KvRow, a, &kv_l, .{}, .{ .rows = 3, .n = 1, .k = HD });
+        ly.kv_norm = r.c.args[1];
+        try Expect.same(r.c, r.bytes, &.{try v41.kvRow(&sc, m, &ly, r.c.args[2], r.c.args[0], r.c.args[3])});
+    }
+    {
+        const sw = env.override(.MLX_SERVE_DSV41_PF_KV_ROWS, "1");
+        defer sw.restore();
+        const r = try ours(KvRow, a, &kv_rows_l, .{ .rows = true }, .{ .rows = 40, .n = 1, .k = HD });
         ly.kv_norm = r.c.args[1];
         try Expect.same(r.c, r.bytes, &.{try v41.kvRow(&sc, m, &ly, r.c.args[2], r.c.args[0], r.c.args[3])});
     }
@@ -4976,8 +6016,12 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         const r = try ours(IdxTile, a, &tile_l, .{}, .{ .rows = 18, .n = 200, .k = IHD });
         try Expect.same(r.c, r.bytes, &.{try v41.indexScoresTiled(&sc, m, r.c.args[0], r.c.args[1], r.c.args[2], @floatCast(r.c.in(4)[0]), @intFromFloat(r.c.in(3)[0]), @intFromFloat(r.c.in(3)[1]))});
     }
-    if (m.idx_nax_kernel != null) {
+    if (world.nax()) {
         const r = try ours(IdxNax, a, &idx_nax_l, .{}, .{ .rows = 18, .n = 200, .k = IHD });
+        try Expect.same(r.c, r.bytes, &.{try inax.launch(&sc, try inax.kernel(), r.c.args[0..5])});
+    }
+    if (m.idx_nax_kernel != null) {
+        const r = try ours(IdxNaxMm, a, &idx_nax_mm_l, .{}, .{ .rows = 18, .n = 200, .k = IHD });
         try Expect.same(r.c, r.bytes, &.{try v41.indexScoresNax(&sc, m, r.c.args[0], r.c.args[1], r.c.args[2], @floatCast(r.c.in(4)[0]), @intFromFloat(r.c.in(3)[0]), @intFromFloat(r.c.in(3)[1]))});
     }
     {
@@ -5046,5 +6090,46 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
     {
         const r = try ours(MoeCombine, a, &combine_l, .{}, .{ .rows = 3, .n = 256, .k = TOPK });
         try Expect.same(r.c, r.bytes, &.{try v41.flatKernel(&sc, m.moe_combine_kernel, r.c.args[0..3], &.{ 3, 256 }, act, 3 * 256, &.{ .{ .name = "D", .v = 256 }, .{ .name = "K", .v = TOPK } })});
+    }
+    {
+        const r = try ours(MoeTail, a, &moe_tail_l, .{}, .{ .rows = 3, .n = 256, .k = TOPK });
+        const sp: v41.Split = .{ .pre = none, .post = r.c.args[4], .comb = r.c.args[5] };
+        try Expect.same(r.c, r.bytes, &.{try mtail.launch(&sc, .{ .dn = r.c.args[0], .inv = r.c.args[1], .sh = r.c.args[2] }, r.c.args[3], &sp)});
+    }
+    {
+        const r = try ours(MoeCombine, a, &combine_tok_l, .{ .tok = true }, .{ .rows = 3, .n = 256, .k = TOPK });
+        try Expect.same(r.c, r.bytes, &.{try v41.flatKernel(&sc, try v41.moeCombineTok(), r.c.args[0..3], &.{ 3, 256 }, act, 3 * 256, &.{ .{ .name = "D", .v = 256 }, .{ .name = "K", .v = TOPK } })});
+    }
+    {
+        const r = try ours(MoeTail, a, &moe_tail_tok_l, .{ .tok = true }, .{ .rows = 3, .n = 256, .k = TOPK });
+        const sp: v41.Split = .{ .pre = none, .post = r.c.args[4], .comb = r.c.args[5] };
+        try Expect.same(r.c, r.bytes, &.{try mtail.launch(&sc, .{ .dn = r.c.args[0], .inv = r.c.args[1], .sh = r.c.args[2], .tok = true }, r.c.args[3], &sp)});
+    }
+}
+
+test "kernel contract dsv41: the router's scores at logits near -9 (e^z about 1e-4) are within 1e-5 of float64" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    var rig = metal.Rig.init(std.testing.allocator);
+    defer rig.deinit();
+    // z_e = -(8 + (e % 24) / 16), exact in f32; the bias makes experts 16..21 (z -9 .. -9.3125) the picks.
+    var z: [EXPERTS]f64 = undefined;
+    var bias: [EXPERTS]f64 = undefined;
+    for (0..EXPERTS) |e| {
+        z[e] = -(8.0 + @as(f64, @floatFromInt(e % 24)) / 16.0);
+        bias[e] = if (e >= 16 and e < 22) 10 else 0;
+    }
+    const lz = try rig.input(.float32, &.{ 1, EXPERTS }, &z);
+    const lb = try rig.input(.float32, &.{ 1, EXPERTS }, &bias);
+    const ls = try rig.input(.float32, &.{1}, &.{1.5});
+    try rig.launch(&route_l, Route.geometry(.{ .norm = false }, .{ .rows = 1, .n = TOPK, .k = EXPERTS }).?, &.{ lz, lb, ls });
+    const out = rig.outputBytes();
+    for (0..TOPK) |q| {
+        const e = std.mem.readInt(u32, out[4 * q ..][0..4], .little);
+        try std.testing.expectEqual(@as(u32, @intCast(16 + q)), e);
+        const got: f64 = @as(f32, @bitCast(std.mem.readInt(u32, out[4 * (TOPK + q) ..][0..4], .little)));
+        const want = softplusSqrt(z[e]) * 1.5;
+        const rel = @abs(got - want) / want;
+        std.debug.print("[dsv41] route pick {d}: z {d:.4}, weight {e} where float64 gives {e} ({e} rel)\n", .{ e, z[e], got, want, rel });
+        try std.testing.expect(rel <= 1e-5);
     }
 }

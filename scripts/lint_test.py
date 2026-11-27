@@ -42,6 +42,17 @@ class Boundaries(unittest.TestCase):
         self.assertEqual(count("media-plugin-imports-engine", {"src/plugins/krea/a.zig": imp}), 1)
         self.assertEqual(count("media-plugin-imports-engine", {"src/plugins/qwen4_exp/a.zig": imp}), 0)
 
+    def test_dsv41_import(self):
+        imp = 'const m = @import("../../plugins/deepseek_v41/deepseek_v41.zig");\n'
+        self.assertEqual(count("dsv41-import", {"src/engines/mlx/x.zig": HDR + imp}), 1)
+        self.assertEqual(count("dsv41-import", {"src/host/a/x.zig": HDR + 'const v = @import("../../plugins/deepseek_v41/vision.zig");\n'}), 1)
+        self.assertEqual(count("dsv41-import", {"src/plugins/deepseek_v4/x.zig": HDR + 'const c = @import("../deepseek_v41/config.zig");\n'}), 1)
+        ok = {"src/engines/mlx/plugin/dsv41_link.zig": HDR + 'const m = @import("../../../plugins/deepseek_v41/plugin.zig");\n',
+              "src/plugins/deepseek_v41/plugin.zig": HDR + 'const m = @import("deepseek_v41.zig");\n',
+              "src/plugins/deepseek_v4/model_config.zig": HDR + 'const c = @import("../deepseek_v41/config.zig");\n',
+              "src/engines/mlx/x.zig": HDR + 'const l = @import("plugin/dsv41_link.zig");\n'}
+        self.assertEqual(count("dsv41-import", ok), 0)
+
 
 class ModelNames(unittest.TestCase):
     def test_model_type_compare(self):
@@ -117,6 +128,14 @@ class Hygiene(unittest.TestCase):
         self.assertEqual(count("graph-scope", {"src/sdk/x.zig": bad}), 1)
         ok = HDR + "fn f(parent: *ops.Graph, x: Array) !Array {\n    var g = parent.scope();\n    defer g.deinit();\n    return parent.keep(try g.add(x, x));\n}\n"
         self.assertEqual(count("graph-scope", {"src/sdk/x.zig": ok}), 0)
+
+    def test_machine_read_in_test(self):
+        body = HDR + ("fn plan() bool {\n    return device.naxAvailable();\n}\n// ── tests ──\n"
+                      "test \"a\" {\n    if (!device.naxAvailable()) return error.SkipZigTest;\n"
+                      "    const tol: f32 = if (device.naxAvailable()) 1e-2 else 1e-3;\n    _ = world.nax();\n"
+                      "    _ = ane.chipBrand();\n}\n")
+        self.assertEqual(count("machine-read-in-test", {"src/plugins/deepseek_v41/x.zig": body}), 2)
+        self.assertEqual(count("machine-read-in-test", {"src/plugins/qwen3/x.zig": body}), 0)
 
 
 class PinsForksRatchets(unittest.TestCase):

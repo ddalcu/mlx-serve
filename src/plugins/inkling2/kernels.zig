@@ -65,7 +65,7 @@ pub fn clearHost(raw: ?*const anyopaque) void {
 }
 
 /// The SDK's fp4 and fp8 decodes under the packed expert kernels' chunk reader.
-pub const bank_header = moe_fp4.NV_SCALE ++ moe_fp4.DOT16 ++ mxfp8.HEADER ++ kernelSource("plugins/inkling2/kernels/bank_header.metal");
+pub const bank_header = moe_fp4.SCALE ++ moe_fp4.DOT16 ++ mxfp8.HEADER ++ kernelSource("plugins/inkling2/kernels/bank_header.metal");
 /// `relsplit_lanes.metal`'s matrix element: half, and float where the stream is float32 (its read is then the chain's sums).
 const lanes_header = "template <typename T> struct msv_ink2_el { typedef half type; };\ntemplate <> struct msv_ink2_el<float> { typedef float type; };\n";
 /// Output rows a SIMD group of a packed expert kernel owns (one: a lane's loop sets the launch's latency, and here

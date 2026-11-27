@@ -244,9 +244,12 @@ fn unpackTokenMap(map: []u32, raw: []const u8) !void {
 }
 
 /// One layer's table, read per lookup from disk: the repack's flat mxfp8
-/// records (code bytes, then one e8m0 scale per 32), or an MLX affine
-/// table inside a safetensors shard (weight / scales / biases tensors).
+/// records (code bytes, then one e8m0 scale per 32), an MLX affine
+/// table inside a safetensors shard (weight / scales / biases tensors),
+/// or NVIDIA's mxfp4 rows (e2m1 codes, one e8m0 `scale` per 32).
 pub const Table = struct {
+    /// The table's regions in memory (`hold`), each read from the file once; empty: read per lookup.
+    held: [3][]align(std.heap.page_size_min) u8 = @splat(&.{}),
     fd: c_int,
     rows: u64,
     head_dim: u32,
@@ -305,11 +308,115 @@ pub const Table = struct {
         edec.forget(self.fd);
         // The direct Engram reads: the descriptor's block registration dropped with it.
         edir.unregister(self.fd);
+        edir.unhold(self.fd);
         crt.close(self.fd);
         if (self.cfd >= 0) {
             edir.unregister(self.cfd);
+            edir.unhold(self.cfd);
             crt.close(self.cfd);
         }
+        for (&self.held) |*m| if (m.len > 0) {
+            std.posix.munmap(m.*);
+            m.* = &.{};
+        };
+    }
+
+    /// The file regions the table reads (codes, scales, biases; a record table's one): offset and length.
+    fn fileRegions(self: *const Table, out: *[3][2]u64) [][2]u64 {
+        out[0] = .{ self.w_off, self.rows * self.w_stride };
+        if (self.records() or self.slen == 0) return out[0..1];
+        out[1] = .{ self.s_off, self.rows * self.s_stride };
+        if (self.mode != .affine) return out[0..2];
+        out[2] = .{ self.b_off, self.rows * self.s_stride };
+        return out[0..3];
+    }
+
+    /// Bytes `hold` takes: every region the table reads.
+    pub fn tableBytes(self: *const Table) u64 {
+        var buf: [3][2]u64 = undefined;
+        var n: u64 = 0;
+        for (self.fileRegions(&buf)) |r| n += r[1];
+        return n;
+    }
+
+    /// Whether `hold` holds the table.
+    pub fn isHeld(self: *const Table) bool {
+        return self.held[0].len > 0;
+    }
+
+    /// The table read into memory once (past the page cache, on `threads` threads), every later lookup a copy from
+    /// it; with `wire`, mlock'd. Exact: the same bytes, only where they are read from. Frees what it took on failure.
+    pub fn hold(self: *Table, threads: usize, wire: bool) !void {
+        if (comptime !builtin.os.tag.isDarwin()) return error.EngramHoldUnsupported;
+        var path: [std.c.PATH_MAX]u8 = undefined;
+        if (std.c.fcntl(self.fd, std.c.F.GETPATH, &path) == -1) return error.EngramHoldPath;
+        const fd = crt.openRead(@ptrCast(&path));
+        if (fd < 0) return error.EngramHoldPath;
+        defer crt.close(fd);
+        _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1));
+        errdefer self.unholdAll();
+        var buf: [3][2]u64 = undefined;
+        const page: u64 = std.heap.pageSize();
+        for (self.fileRegions(&buf), 0..) |r, i| {
+            const lo = r[0] / page * page;
+            const len: usize = @intCast(std.mem.alignForward(u64, r[0] + r[1] - lo, page));
+            const mem = try std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+            self.held[i] = mem;
+            try readRegion(fd, mem, lo, @intCast(r[0] + r[1] - lo), threads);
+            if (wire and std.c.mlock(mem.ptr, mem.len) != 0) return error.EngramWire;
+            const used = mem[0..@intCast(r[0] + r[1] - lo)];
+            if (!edir.hold(self.fd, lo, used)) return error.EngramHoldFull;
+            if (self.cfd >= 0 and !edir.hold(self.cfd, lo, used)) return error.EngramHoldFull;
+        }
+    }
+
+    /// The held regions let go of; the table reads from disk again.
+    pub fn unholdAll(self: *Table) void {
+        edir.unhold(self.fd);
+        if (self.cfd >= 0) edir.unhold(self.cfd);
+        for (&self.held) |*m| if (m.len > 0) {
+            std.posix.munmap(m.*);
+            m.* = &.{};
+        };
+    }
+
+    /// `need` bytes of `fd` from `lo` into `mem`, in page-aligned chunks across `threads` threads.
+    fn readRegion(fd: c_int, mem: []u8, lo: u64, need: usize, threads: usize) !void {
+        const chunk: usize = 64 << 20;
+        const R = struct {
+            fd: c_int,
+            mem: []u8,
+            lo: u64,
+            need: usize,
+            next: std.atomic.Value(usize) = .init(0),
+            bad: std.atomic.Value(bool) = .init(false),
+            fn go(r: *@This()) void {
+                while (!r.bad.load(.acquire)) {
+                    const at = r.next.fetchAdd(chunk, .acq_rel);
+                    if (at >= r.need) return;
+                    const want = @min(chunk, r.need - at);
+                    var got: usize = 0;
+                    // The last page may end past the file: a short read there is the end.
+                    const ask = @min(std.mem.alignForward(usize, want, std.heap.pageSize()), r.mem.len - at);
+                    while (got < want) {
+                        const n = std.c.pread(r.fd, r.mem[at + got ..].ptr, ask - got, @intCast(r.lo + at + got));
+                        if (n <= 0) {
+                            if (n < 0 and std.c._errno().* == @backingInt(std.posix.E.INTR)) continue;
+                            r.bad.store(true, .release);
+                            return;
+                        }
+                        got += @intCast(n);
+                    }
+                }
+            }
+        };
+        var r: R = .{ .fd = fd, .mem = mem, .lo = lo, .need = need };
+        var ts: [64]?std.Thread = @splat(null);
+        const n = std.math.clamp(threads, 1, ts.len);
+        for (ts[1..n]) |*t| t.* = std.Thread.spawn(.{}, R.go, .{&r}) catch null;
+        r.go();
+        for (ts[1..n]) |t| if (t) |th| th.join();
+        if (r.bad.load(.acquire) or r.next.load(.acquire) < need) return error.EngramRead;
     }
 
     /// A repacked table (`engram/engram-manifest.json`): a row's codes then its scales, one record a row, read with
@@ -355,6 +462,7 @@ pub const Table = struct {
             return error.EngramManifest;
         } else |_| {}
         if (try openRawTable(a, dir, dir_path, layer, rows, head_dim)) |t| return t;
+        if (try openMxfp4Table(a, io, dir, dir_path, layer, rows, head_dim)) |t| return t;
         // An MLX pack: the three tensors in one shard named by the index.
         const index_raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(64 << 20)) catch return error.EngramTableMissing;
         const idx = std.json.parseFromSliceLeaky(std.json.Value, a, index_raw, .{}) catch return error.EngramTableMissing;
@@ -494,6 +602,44 @@ pub const Table = struct {
         if (w.rows != rows or s.rows != rows) return error.EngramTableSize;
         if (w.cols != head_dim or s.cols * 32 != head_dim) return error.EngramTableGeometry;
         return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .mxfp8, .bits = 8, .group_size = 32, .w_off = base + w.start, .w_stride = head_dim, .wlen = head_dim, .s_off = base + s.start, .s_stride = s.cols, .slen = s.cols, .in_shards = billedShard(a, io, dir, spec.weight_file) };
+    }
+
+    /// NVIDIA's mxfp4 table (`layers.<l>.engram.embed.weight` U8 e2m1 pairs [rows, head_dim/2] beside `.scale`, one
+    /// e8m0 per 32, F8_E8M0 or relabelled U8, in the same shard): MLX's mxfp4 at group 32, read as stored. Null
+    /// where the index names no `.scale` beside the table.
+    fn openMxfp4Table(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, dir_path: []const u8, layer: usize, rows: u64, head_dim: u32) !?Table {
+        const index_raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(64 << 20)) catch return null;
+        const idx = std.json.parseFromSliceLeaky(std.json.Value, a, index_raw, .{}) catch return null;
+        const wm = (if (idx == .object) idx.object.get("weight_map") else null) orelse return null;
+        if (wm != .object) return null;
+        var names: [2][]const u8 = undefined;
+        var file: ?[]const u8 = null;
+        for ([_][]const u8{ "weight", "scale" }, 0..) |part, i| {
+            names[i] = try std.fmt.allocPrint(a, "layers.{d}.engram.embed.{s}", .{ layer, part });
+            if (wm.object.get(names[i]) == null) names[i] = try std.fmt.allocPrint(a, "{s}{s}", .{ weights_load.dsv41_text_prefix, names[i] });
+            const f = wm.object.get(names[i]) orelse return null;
+            if (f != .string or std.mem.indexOfAny(u8, f.string, "/\\") != null) return error.EngramTableMissing;
+            if (file) |prev| if (!std.mem.eql(u8, prev, f.string)) return error.EngramTableSplit;
+            file = f.string;
+        }
+        const fd = try openAt(a, dir_path, file.?);
+        errdefer crt.close(fd);
+        var hl: [8]u8 = undefined;
+        if (crt.pread(fd, &hl, 8, 0) != 8) return error.EngramTableHeader;
+        const hlen = std.mem.readInt(u64, &hl, .little);
+        if (hlen > 16 << 20) return error.EngramTableHeader;
+        const hbuf = try a.alloc(u8, @intCast(hlen));
+        if (crt.pread(fd, hbuf.ptr, hbuf.len, 8) != @as(isize, @intCast(hlen))) return error.EngramTableHeader;
+        const hdr = std.json.parseFromSliceLeaky(std.json.Value, a, hbuf, .{}) catch return error.EngramTableHeader;
+        if (hdr != .object) return error.EngramTableHeader;
+        const size: usize = @intCast(fileSize(fd));
+        const base: usize = @intCast(8 + hlen);
+        const w = qwen4_ple.headerRegion(hdr.object, names[0], "U8", 1, size, base, .matrix) catch return error.EngramTableHeader;
+        const s = qwen4_ple.headerRegion(hdr.object, names[1], "F8_E8M0", 1, size, base, .matrix) catch
+            qwen4_ple.headerRegion(hdr.object, names[1], "U8", 1, size, base, .matrix) catch return error.EngramTableHeader;
+        if (w.rows != rows or s.rows != rows) return error.EngramTableSize;
+        if (w.cols * 2 != head_dim or s.cols * 32 != head_dim) return error.EngramTableGeometry;
+        return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .mxfp4, .bits = 4, .group_size = 32, .w_off = base + w.start, .w_stride = w.cols, .wlen = @intCast(w.cols), .s_off = base + s.start, .s_stride = s.cols, .slen = @intCast(s.cols), .in_shards = true };
     }
 
     /// Whether the preflight bills `file` (`preflight.modelDiskBytes`): a shard the index names, or with no index a
@@ -682,6 +828,17 @@ pub const Table = struct {
     }
     /// The first `n` rows of `raw` dequantized: f32 `[n, head_dim]` (caller frees).
     pub fn dequant(self: *const Table, raw: Raw, n: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+        return self.dequantTo(raw, n, .float32, s);
+    }
+
+    /// Whether `dequantTo` honours its dtype: mxfp4 and mxfp8 codes, each times a power of two (exact in f32) and
+    /// rounded once into the output type, so the rows in `dt` hold what f32 rows cast to `dt` hold.
+    pub fn dequantsTo(self: *const Table) bool {
+        return self.mode == .mxfp4 or self.mode == .mxfp8;
+    }
+
+    /// `dequant` into `dt` where `dequantsTo`, else f32.
+    pub fn dequantTo(self: *const Table, raw: Raw, n: usize, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
         if (self.mode == .gguf) {
             // IQ4_NL blocks in the kernels' split row layout.
             const kernels = gguf_root.kernels;
@@ -707,7 +864,8 @@ pub const Table = struct {
         };
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
-        try mlx.check(mlx.mlx_dequantize(&out, wa, sa, ba, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), self.mode.cstr(), .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+        const out_dt: mlx.mlx_dtype = if (self.dequantsTo()) dt else .float32;
+        try mlx.check(mlx.mlx_dequantize(&out, wa, sa, ba, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), self.mode.cstr(), .{ .ctx = null }, .{ .value = out_dt, .has_value = true }, s));
         return out;
     }
 
@@ -806,6 +964,26 @@ pub const Table = struct {
         }
     };
 };
+
+/// `MLX_SERVE_DSV41_ENGRAM_RESIDENT`: unset, empty, `auto` or 1 holds the tables where they fit, `wired` also
+/// mlocks them, 0 or `off` reads them from disk per lookup.
+pub const Resident = enum { off, auto, wired };
+
+pub fn residentSetting(raw: ?[]const u8) !Resident {
+    const v = raw orelse return .auto;
+    if (v.len == 0 or std.mem.eql(u8, v, "auto") or std.mem.eql(u8, v, "1")) return .auto;
+    if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off")) return .off;
+    if (std.mem.eql(u8, v, "wired")) return .wired;
+    return error.EngramResidentSetting;
+}
+
+/// Whether `tables` bytes of Engram fit beside `other` bytes in memory: within 7/8 of RAM and, for the bill (`other` =
+/// the pack's other bytes), the GPU working set the load preflight holds it to (`gpu`; 0 = none: the load's own check,
+/// `other` = the memory in use once the weights are in).
+pub fn residentFits(other: u64, tables: u64, total_ram: u64, gpu: u64) bool {
+    const need = other +| tables;
+    return need <= total_ram - total_ram / 8 and (gpu == 0 or need <= gpu);
+}
 
 /// Whether the page cache has no room for a prompt's Engram codes: under an eighth of RAM free or reclaimable, a
 /// chunk's code pages (16 KiB a row read) push the tables' scales out of it.
@@ -1134,6 +1312,23 @@ test "dsv41 engram: a dead token (an image span's) makes every n-gram across it 
     // The token before the image hashes as if nothing followed it (no look-ahead).
     h.rows(&.{}, &.{3}, want[0..48]);
     try testing.expectEqualSlices(u32, want[0..48], got[0..48]);
+}
+
+/// NVIDIA's mxfp4 table layout (`openMxfp4Table`) at 4 rows of 256: e2m1 pairs [4, 128] then e8m0 scales [4, 8],
+/// the codes 16-byte aligned in the file.
+pub fn writeMxfp4SlotFixture(io: std.Io, dir: std.Io.Dir) !void {
+    const n = "layers.1.engram.embed.";
+    const raw = "{\"" ++ n ++ "weight\":{\"dtype\":\"U8\",\"shape\":[4,128],\"data_offsets\":[0,512]}," ++
+        "\"" ++ n ++ "scale\":{\"dtype\":\"U8\",\"shape\":[4,8],\"data_offsets\":[512,544]}}";
+    const pad: [(16 - (8 + raw.len) % 16) % 16]u8 = @splat(' ');
+    const hdr = raw ++ &pad;
+    var shard: [8 + hdr.len + 544]u8 = @splat(0);
+    std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
+    @memcpy(shard[8..][0..hdr.len], hdr);
+    @memset(shard[8 + hdr.len + 512 ..], 127);
+    try dir.writeFile(io, .{ .sub_path = "model-00001.safetensors", .data = &shard });
+    try dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{" ++
+        "\"" ++ n ++ "weight\":\"model-00001.safetensors\",\"" ++ n ++ "scale\":\"model-00001.safetensors\"}}" });
 }
 
 /// An MLX pack's layer-1 table in one shard: 4 rows, head_dim 64, 8-bit g32
@@ -1522,4 +1717,101 @@ test "dsv41 engram: an affine table bills the shard bytes it occupies, a repack 
     var r = try Table.open(testing.allocator, dir, 0, 1, 4, 64);
     defer r.close();
     try testing.expectEqual(@as(u64, 0), r.shardBytes());
+}
+
+/// NVIDIA's mxfp4 table in one top-level shard: layer 1, 4 rows of head_dim 64, every code byte 0x42 (e2m1 1.0 then
+/// 2.0), row r's first scale 2^r, its second 0.5; `scale_dtype` F8_E8M0 as shipped or U8 as relabelled.
+fn writeMxfp4Fixture(io: std.Io, dir: std.Io.Dir, comptime scale_dtype: []const u8) !void {
+    const hdr = "{\"layers.1.engram.embed.weight\":{\"dtype\":\"U8\",\"shape\":[4,32],\"data_offsets\":[0,128]}," ++
+        "\"layers.1.engram.embed.scale\":{\"dtype\":\"" ++ scale_dtype ++ "\",\"shape\":[4,2],\"data_offsets\":[128,136]}}";
+    var shard: [8 + hdr.len + 136]u8 = undefined;
+    std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
+    @memcpy(shard[8..][0..hdr.len], hdr);
+    const data = shard[8 + hdr.len ..];
+    @memset(data[0..128], 0x42);
+    for (0..4) |r| {
+        data[128 + 2 * r] = @intCast(127 + r);
+        data[128 + 2 * r + 1] = 126;
+    }
+    try dir.writeFile(io, .{ .sub_path = "model-00001-of-00001.safetensors", .data = &shard });
+    try dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"layers.1.engram.embed.weight\":\"model-00001-of-00001.safetensors\"," ++
+        "\"layers.1.engram.embed.scale\":\"model-00001-of-00001.safetensors\"}}" });
+}
+
+test "dsv41 engram: NVIDIA's mxfp4 table reads as stored (e2m1 low nibble first, one e8m0 per 32), F8_E8M0 or relabelled U8" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    inline for (.{ "F8_E8M0", "U8" }) |sdt| {
+        var td = testing.tmpDir(.{});
+        defer td.cleanup();
+        try writeMxfp4Fixture(io, td.dir, sdt);
+        var buf: [512]u8 = undefined;
+        var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 0, 1, 4, 64);
+        defer t.close();
+        try testing.expectEqual(QuantMode.mxfp4, t.mode);
+        try testing.expectEqual(@as(u64, 4 * (32 + 2)), t.shardBytes());
+        const s = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(s);
+        const rows = try t.gather(testing.allocator, &.{ 3, 0 }, s);
+        defer _ = mlx.mlx_array_free(rows);
+        try mlx.check(mlx.mlx_array_eval(rows));
+        const v = mlx.mlx_array_data_float32(rows).?;
+        try testing.expectEqual(@as(f32, 8), v[0]);
+        try testing.expectEqual(@as(f32, 16), v[1]);
+        try testing.expectEqual(@as(f32, 0.5), v[32]);
+        try testing.expectEqual(@as(f32, 1), v[63]);
+        try testing.expectEqual(@as(f32, 1), v[64]);
+        try testing.expectEqual(@as(f32, 0.5), v[64 + 32]);
+    }
+}
+
+test "dsv41 engram: a held table serves every row from memory: the file rewritten after the hold changes no row" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeMxfp4Fixture(io, td.dir, "F8_E8M0");
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try td.dir.realPath(io, &buf)];
+    var t = try Table.open(testing.allocator, dir, 0, 1, 4, 64);
+    defer t.close();
+    t.openCodes();
+    const ids = [_]u32{ 3, 0, 2, 2, 1 };
+    const before = try t.read(testing.allocator, &ids);
+    defer before.deinit(testing.allocator);
+    try t.hold(4, false);
+    try testing.expect(t.isHeld());
+    try testing.expectEqual(@as(u64, 4 * (32 + 2)), t.tableBytes());
+    // The same inode rewritten in place: a read that reached the file would see zeros.
+    const len: usize = @intCast(fileSize(t.fd));
+    const zeros = try testing.allocator.alloc(u8, len);
+    defer testing.allocator.free(zeros);
+    @memset(zeros, 0);
+    try td.dir.writeFile(io, .{ .sub_path = "model-00001-of-00001.safetensors", .data = zeros });
+    try testing.expectEqual(@as(u64, len), fileSize(t.fd));
+    // Nothing from the LRU: every row below is a read.
+    edec.forget(t.fd);
+    t.pastCache(true);
+    const after = try t.read(testing.allocator, &ids);
+    defer after.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, before.w, after.w);
+    try testing.expectEqualSlices(u8, before.s, after.s);
+    const many: [600]u32 = @splat(3);
+    const wide = try t.read(testing.allocator, &many);
+    defer wide.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, before.w[0..32], wide.w[599 * 32 ..][0..32]);
+}
+
+test "dsv41 engram: the resident setting reads its four spellings and refuses another by name; the fit keeps an eighth of RAM and the GPU bound" {
+    try testing.expectEqual(Resident.auto, try residentSetting(null));
+    try testing.expectEqual(Resident.auto, try residentSetting(""));
+    try testing.expectEqual(Resident.auto, try residentSetting("1"));
+    try testing.expectEqual(Resident.off, try residentSetting("0"));
+    try testing.expectEqual(Resident.wired, try residentSetting("wired"));
+    try testing.expectError(error.EngramResidentSetting, residentSetting("yes"));
+    const gib: u64 = 1 << 30;
+    // 512 GiB: 302 GiB of weights and 104 GiB of tables fit under 448 GiB, but not under the default 384 GiB GPU bound.
+    try testing.expect(residentFits(302 * gib, 104 * gib, 512 * gib, 0));
+    try testing.expect(!residentFits(302 * gib, 104 * gib, 512 * gib, 384 * gib));
+    try testing.expect(residentFits(302 * gib, 104 * gib, 512 * gib, 420 * gib));
+    try testing.expect(!residentFits(350 * gib, 104 * gib, 512 * gib, 0));
 }

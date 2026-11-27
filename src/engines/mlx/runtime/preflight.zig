@@ -14,6 +14,7 @@ const model_registry_mod = @import("../../../host/registry/registry.zig");
 const model_discovery = @import("../../../host/registry/discovery.zig");
 const mlx_gguf = @import("../../../sdk/quant/gguf/claim.zig");
 const status = @import("../../../host/status.zig");
+const memory_ceiling = @import("../../../host/registry/memory_ceiling.zig");
 const streamed = @import("../../../sdk/weights/streamed.zig");
 const testing = std.testing;
 
@@ -252,7 +253,7 @@ fn settledAvail(need: u64, first: u64, ctx: anytype, comptime measure: fn (@Type
 /// The GPU ceiling on loaded weights. MLX's CUDA backend keeps file-loaded arrays in managed
 /// memory that pages to host RAM, so there RAM is the bound (and an allocation failure is a
 /// catchable error, not Metal's process-killing OOM); 0 = none.
-fn loadGpuLimit() u64 {
+pub fn loadGpuLimit() u64 {
     return if (mlx.cudaAvailable()) 0 else mlx.maxRecommendedWorkingSet();
 }
 
@@ -320,6 +321,15 @@ pub fn loadRequirementBytes(weights_bytes: u64) u64 {
     const HEADROOM_CAP: u64 = 6 * 1024 * 1024 * 1024;
     const headroom: u64 = @min(weights_bytes / 8, HEADROOM_CAP) + 1024 * 1024 * 1024;
     return weights_bytes + headroom;
+}
+
+/// The `iogpu.wired_limit_mb` that admits a load needing `need` bytes when Metal's working-set limit (`gpu_limit`)
+/// is what refuses it and RAM (`ram_avail`, `total_ram`) holds it with the wired margin; null otherwise.
+pub fn wiredLimitAdviceMb(need: u64, gpu_limit: u64, ram_avail: u64, total_ram: u64) ?u64 {
+    if (gpu_limit == 0 or need <= gpu_limit or need > ram_avail) return null;
+    const want = need +| memory_ceiling.WIRED_LIMIT_MARGIN_BYTES;
+    if (want > total_ram) return null;
+    return (want + (1 << 20) - 1) >> 20;
 }
 
 // ── tests ──
@@ -565,6 +575,16 @@ test "media bill: CUDA checks the weights against RAM and only the working set a
     const staged = mediaBill(15 * GB, 40 * GB, true);
     try std.testing.expectEqual(15 * GB, staged.ram);
     try std.testing.expectEqual(@as(u64, 0), staged.gpu);
+}
+
+test "wiredLimitAdviceMb: the sysctl value only when the working-set limit alone refuses the load" {
+    const gib: u64 = 1 << 30;
+    // DeepSeek-V4.1 NVFP4 on a 512 GB Mac at the default limit: 407 GiB needed, 384 GiB working set, RAM holds it.
+    try testing.expectEqual(@as(?u64, (407 + 8) * 1024), wiredLimitAdviceMb(407 * gib, 384 * gib, 470 * gib, 512 * gib));
+    try testing.expectEqual(@as(?u64, null), wiredLimitAdviceMb(407 * gib, 430 * gib, 470 * gib, 512 * gib)); // fits
+    try testing.expectEqual(@as(?u64, null), wiredLimitAdviceMb(407 * gib, 384 * gib, 300 * gib, 512 * gib)); // RAM short
+    try testing.expectEqual(@as(?u64, null), wiredLimitAdviceMb(507 * gib, 384 * gib, 508 * gib, 512 * gib)); // no margin
+    try testing.expectEqual(@as(?u64, null), wiredLimitAdviceMb(407 * gib, 0, 470 * gib, 512 * gib)); // limit unknown
 }
 
 test "a refusal quotes the number it actually compared" {

@@ -4,7 +4,7 @@ const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const dsv4_mod = @import("../../../plugins/deepseek_v4/deepseek_v4.zig");
-const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
+const dsv41_mod = @import("../plugin/dsv41_link.zig").deepseek_v41;
 const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const model_mod = @import("../../../sdk/config/model.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
@@ -26,6 +26,8 @@ const capAcceptedForTokenBudget = @import("verify.zig").capAcceptedForTokenBudge
 const dsparkCopyLen = @import("verify.zig").dsparkCopyLen;
 const mtp_lookup = @import("mtp_lookup.zig");
 const mtpBatchedAcceptGraph = @import("mtp/batched_graph.zig").mtpBatchedAcceptGraph;
+const mtpBatchedTypicalGraph = @import("mtp/batched_graph.zig").mtpBatchedTypicalGraph;
+const mtp_acceptance = @import("../../../sdk/spec/mtp_acceptance.zig");
 const MtpBatchedGraph = @import("mtp/batched_graph.zig").MtpBatchedGraph;
 const mtpSerialOneToken = @import("mtp/serial.zig").mtpSerialOneToken;
 const probsAllPositions = @import("../sampling/spec_sampling.zig").probsAllPositions;
@@ -61,6 +63,25 @@ pub fn dsparkArmFor(sampling: SamplingParams, logprobs_n: u32) DsparkArm {
     if (greedy) return .greedy;
     return .stochastic;
 }
+
+/// A sampled round's accept rule. `exact` (the default, lossless): draft k kept with probability min(1, p_k / q_k), the
+/// output distribution serial sampling's. `typical` (opt-in, LOSSY: the request's `mtp_acceptance`, `--mtp-typical
+/// <delta>` / `--mtp-typical-eps <eps>`): draft k kept iff p_k > min(eps, delta * e^-H(p)), Medusa's form, deterministic,
+/// the first reject resampled from p (`mtpBatchedTypicalGraph`, the MTP head's graph). Greedy requests never reach
+/// either (argmax equality).
+pub const Rule = union(enum) { exact, typical: mtp_acceptance.Typical };
+
+/// The one owner of a sampled round's rule: typical only where the request asked for it (`typical` set) and the drafts
+/// are the model's own proposals. A draft copied from the context (DSpark's copy round, as a prompt lookup's) is a point
+/// mass the model did not propose: typical acceptance keeps it whenever the target clears its floor, so an echo of the
+/// context would feed itself; it keeps the exact rule.
+pub fn draftRule(typical: ?mtp_acceptance.Typical, context_draft: bool) Rule {
+    if (context_draft) return .exact;
+    return if (typical) |t| .{ .typical = t } else .exact;
+}
+
+/// The planted bug of the typical verdict's test: the floor's comparison inverted.
+pub var typical_plant = false;
 
 /// Shared by dispatch and /props; this disables drafting, not resident stages.
 pub fn dsparkEnabled() bool {
@@ -126,7 +147,7 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
 /// Whether this tick is a plain step of the serial pipeline: the policy owes one, or no round pays.
 fn staysPlain(self: *Generator, pol: *DflashPol, allocator: std.mem.Allocator) !bool {
     if (pol.pin_rows != 0) return false;
-    if (plugin_driver.nativeDrafter(self.xfm) == null) return !pol.drafting.shouldDraft() and self.dflashCanPipeline();
+    if (plugin_driver.nativeDrafter(self.xfm) == null) return !policyDrafts(pol) and self.dflashCanPipeline();
     if (!self.dflashCanPipeline()) return false;
     if (pol.timing) |*t| return t.next().?.kind == .plain;
     const ctl = if (pol.rounds) |*c| c else return true;
@@ -234,7 +255,8 @@ fn nativeSampledRound(self: *Generator, allocator: std.mem.Allocator, plan: Nati
     errdefer if (!closed) {
         _ = plugin_driver.nativeFinish(self.xfm, &self.ctx, 0) catch 0;
     };
-    const drawn = try stochasticVerdict(self, v.logits, ids, self.xfm.config.vocab_size, ask.cap, if (v.law.ctx != null) v.law else null);
+    // The plugin's round does not say which drafts it copied from the context: the exact rule.
+    const drawn = try stochasticVerdict(self, v.logits, ids, self.xfm.config.vocab_size, ask.cap, if (v.law.ctx != null) v.law else null, .exact);
     const verdict = stopPending(drawn, ids, ask.stops);
     closed = true;
     const position = try plugin_driver.nativeFinish(self.xfm, &self.ctx, verdict.accepted);
@@ -418,7 +440,7 @@ pub fn nativeGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
     for (gens, verified[0..m], pend[0..m], 0..) |gen, v, *p, k| {
         const ids = v.round.tokens[0..v.round.n];
         if (gen.dspark_stochastic) {
-            drawn[k] = if (p.*) |*x| try acceptRead(gen, x, asks[k].cap) else try stochasticVerdict(gen, v.logits, ids, vocab, asks[k].cap, null);
+            drawn[k] = if (p.*) |*x| try acceptRead(gen, x, asks[k].cap) else try stochasticVerdict(gen, v.logits, ids, vocab, asks[k].cap, null, .exact);
             verdicts[k] = stopPending(drawn[k], ids, asks[k].stops);
         } else {
             drawn[k] = greedyVerdict(ids, picks[row .. row + ids.len]);
@@ -533,6 +555,12 @@ pub fn moduleRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStep
         try plugin_settle.activate(self.xfm, &self.ctx);
         // An exact greedy accept masks what the serial sampler masks.
         mdl.suppress = self.xfm.suppress_mask orelse .{ .ctx = null };
+        // A draft vocabulary takes the request's prompt ids before its first round; a sampled request drafts every id.
+        if (!self.dspark_prompt_vocab) {
+            self.dspark_prompt_vocab = true;
+            self.dspark_vocab_mode = true;
+            try dsv41_mod.draftPromptVocab(mdl, &mdl.dec_state.?, self.prompt_ids_owned, !self.dspark_stochastic);
+        }
         if (try self.dsparkCopyStep(allocator, mdl)) |res| return res;
         return self.dsparkPolicyStep(allocator, mdl);
     }
@@ -556,7 +584,7 @@ pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4
     const st = &mdl.dec_state.?;
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
     const round = if (self.dspark_stochastic)
-        try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &copy)
+        try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &copy, null, .context)
     else
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &copy, cap);
     self.noteCopy(n, round.accepted);
@@ -573,7 +601,7 @@ pub fn dsparkStep(self: *Generator, allocator: std.mem.Allocator, comptime mod: 
         self.max_tokens,
     );
     const round = if (self.dspark_stochastic)
-        try self.dsparkStochasticRound(allocator, mod, mdl, t1, accepted_cap, null)
+        try self.dsparkStochasticRound(allocator, mod, mdl, t1, accepted_cap, null, null, .model)
     else
         try mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1, accepted_cap);
     return self.commitDsparkRound(allocator, round, mdl.dec_state.?.n);
@@ -587,10 +615,46 @@ pub fn dsparkPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?Dr
     // A served drafter's plain steps fade its counts; a module's time the plain step.
     if (pol.rounds) |*ctl| ctl.acc.idle();
     if (plugin_driver.nativeDrafter(self.xfm) == null) {
-        if (pol.plain_watch) |*w| pol.plain.sample(@as(f32, @floatFromInt(w.read())) / @as(f32, std.time.ns_per_ms));
+        if (pol.plain_watch) |*w| {
+            const ms = @as(f32, @floatFromInt(w.read())) / @as(f32, std.time.ns_per_ms);
+            pol.plain.sample(ms);
+            if (pol.p2) |*p| p.plainDone(pol.plain.ms, ms);
+        }
         pol.plain_watch = io_util.Stopwatch.init(self.timer.io);
     }
     return try mtpSerialOneToken(allocator, tok);
+}
+
+/// A test hook, never set by serving: N > 0 pins every DSpark round at N verify rows (t1 and N - 1 drafts), the
+/// width sweep's arm. 0 leaves the adaptive policy.
+pub var test_pin_rows: u32 = 0;
+
+/// The DSpark policy's pinned verify rows: a streamed EXL3 bank's greedy request verifies the whole block (`whole`);
+/// else `test_pin_rows`, which serving leaves at 0 (the adaptive policy).
+pub fn dsparkPinRows(whole: bool) u32 {
+    if (whole) return std.math.maxInt(u32);
+    return test_pin_rows;
+}
+
+/// Drafts a pinned round verifies: `pin_rows` rows are t1 and `pin_rows - 1` drafts, at most the `len` drafted.
+pub fn pinnedDrafts(len: usize, pin_rows: u32) usize {
+    return @min(len, pin_rows - 1);
+}
+
+test "dspark pin rows: test_pin_rows = N verifies N rows a round, 0 is adaptive, an EXL3 bank the block" {
+    defer test_pin_rows = 0;
+    try testing.expectEqual(@as(u32, 0), dsparkPinRows(false));
+    test_pin_rows = 3;
+    try testing.expectEqual(std.math.maxInt(u32), dsparkPinRows(true));
+    for (2..7) |n| {
+        test_pin_rows = @intCast(n);
+        const pin = dsparkPinRows(false);
+        try testing.expectEqual(@as(u32, @intCast(n)), pin);
+        // A 5-draft block: N rows are t1 and N - 1 drafts.
+        try testing.expectEqual(n - 1, pinnedDrafts(5, pin));
+    }
+    try testing.expectEqual(@as(usize, 5), pinnedDrafts(5, 8));
+    try testing.expectEqual(@as(usize, 5), pinnedDrafts(5, std.math.maxInt(u32)));
 }
 
 /// One DeepSeek-V4.1 stage round under `dspark_pol`: draft, verify the prefix the calibrated confidence pays
@@ -600,24 +664,57 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     const pol = &self.dspark_pol.?;
     const st = &mdl.dec_state.?;
     const t1 = self.next_token_id;
-    var d = try dsv41_mod.dsparkDraft(mdl, allocator, st, t1);
+    // MLX_SERVE_DSV41_DRAFT_SAMPLE: a sampled round's drafts drawn from the draft's own distribution q.
+    var q: mlx.mlx_array = .{ .ctx = null };
+    defer if (q.ctx != null) {
+        _ = mlx.mlx_array_free(q);
+    };
+    var d = if (self.dspark_stochastic and dsv41_mod.draftSampleServes(mdl)) blk: {
+        const sd = try draftSampled(self, allocator, mdl, st, t1);
+        q = sd.q;
+        break :blk sd.d;
+    } else try dsv41_mod.dsparkDraft(mdl, allocator, st, t1);
     defer d.deinit(allocator);
-    d.len = if (pol.pin_rows > 0) @min(d.len, pol.pin_rows - 1) else dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
+    const drafted = d.len;
+    d.len = if (pol.pin_rows > 0)
+        pinnedDrafts(d.len, pol.pin_rows)
+    else if (pol.p2) |*p|
+        p.verifyDrafts(d.confidence[0..d.len], pol.plain.ms)
+    else
+        dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
     // An exact verify stays within the decode-width rows (`maxVerifyDrafts`; the block itself otherwise).
     d.len = @min(d.len, dsv41_mod.maxVerifyDrafts(mdl));
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
     const round = if (self.dspark_stochastic)
-        try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &d)
+        try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &d, if (q.ctx != null) q else null, .model)
     else
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &d, cap);
+    self.dspark_stats.record(@intCast(d.len), round.accepted);
+    // `MLX_SERVE_DSV41_SPEC_SYNC`: the round's own draft and verify (the next round's draft, built here, is its).
+    const wall_ms = @max(0, @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms) - dsv41_mod.takeRoundShiftMs(mdl));
+    if (pol.p2) |*p| {
+        p.learn(d.confidence[0..drafted], d.len, round.accepted, nextDecides(&d, drafted, round.accepted, round.next_token, self.dspark_stochastic));
+        p.roundDone(pol.plain.ms, d.len + 1, round.tokens.len, wall_ms);
+        return self.commitDsparkRound(allocator, round, st.n);
+    }
     for (d.confidence[0..d.len], 0..) |c, k| {
         if (k > round.accepted) break;
         pol.calib.observe(sigmoid(c), k < round.accepted);
     }
-    self.dspark_stats.record(@intCast(d.len), round.accepted);
-    const wall_ms = @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms);
     pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, wall_ms);
     return self.commitDsparkRound(allocator, round, st.n);
+}
+
+/// Whether this round drafts at all, under the request's backoff.
+pub fn policyDrafts(pol: *DflashPol) bool {
+    return if (pol.p2) |*p| p.drafting.shouldDraft() else pol.drafting.shouldDraft();
+}
+
+/// A greedy round that kept every verified draft of `drafted` knows the first one it did not verify: the trunk's
+/// `next_token` stands where it would. Null when there is none, or the round was sampled (its next token is a draw).
+pub fn nextDecides(d: *const dsv41_mod.DsparkDraft, drafted: usize, accepted: usize, next_token: u32, stochastic: bool) ?bool {
+    if (stochastic or accepted != d.len or d.len >= drafted or d.len + 1 >= d.ids.len) return null;
+    return d.ids[d.len + 1] == next_token;
 }
 
 pub fn sigmoid(x: f32) f32 {
@@ -659,6 +756,9 @@ pub fn nextDraw(self: *Generator) SamplingParams {
     return sp;
 }
 
+/// Where a sampled round's drafts came from: the model's stages (`model`), or the context (`context`, a copy round).
+pub const DraftSource = enum { model, context };
+
 /// One stochastic DSpark round: dsv4's own greedy stage draft (a one-hot
 /// proposal) verified with the MTP acceptance machinery — filtered target
 /// probs at EVERY verify position (`probsAllPositions`, the request's own
@@ -670,11 +770,13 @@ pub fn nextDraw(self: *Generator) SamplingParams {
 /// (the toy-vocab exactness test's invariant), and the correction always
 /// derives from the ORIGINAL verify logits at the acceptance point — the
 /// house partial-accept invariant in sampled form.
-/// `copy`, when set, is the draft instead of the stages' (a one-hot proposal too).
-pub fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, comptime mod: type, mdl: anytype, t1: u32, accepted_cap: u32, copy: ?*const mod.DsparkDraft) !mod.DsparkRound {
+/// `copy`, when set, is the draft instead of the stages' (a one-hot proposal too): the policy step's own stage draft, or
+/// the copy step's draft from the context. `source` says which, for the accept rule (`draftRule`): a draft the caller
+/// passes is not by itself a copy.
+pub fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, comptime mod: type, mdl: anytype, t1: u32, accepted_cap: u32, copy: ?*const mod.DsparkDraft, q: ?mlx.mlx_array, source: DraftSource) !mod.DsparkRound {
     var pending = if (copy) |d| try mod.dsparkBeginWith(mdl, allocator, &mdl.dec_state.?, t1, d) else try mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
     defer pending.deinit();
-    const verdict = try stochasticVerdict(self, pending.vl_g, pending.verify[0 .. pending.b + 1], mdl.vocab, accepted_cap, null);
+    const verdict = try stochasticVerdict(self, pending.vl_g, pending.verify[0 .. pending.b + 1], mdl.vocab, accepted_cap, q, draftRule(self.dspark_typical, source == .context));
     pending.lapVerify(mdl);
 
     const round = try mod.dsparkFinish(mdl, allocator, &mdl.dec_state.?, &pending, verdict.accepted, verdict.next_token);
@@ -694,30 +796,57 @@ fn stopPending(v: Verdict, ids: []const u32, stops: []const u32) Verdict {
     return v;
 }
 
-/// The sampled accept of a verify chunk: `verify` is `[t1, drafts...]` and `vl_g` its logits `[rows, vocab]`. Keeps each
-/// draft (a point mass) with the probability the request's filtered density gives it; the token pending after the kept
-/// prefix is the residual sample at the first reject, or the bonus draw from the last row on a full accept. With
-/// MLX_SERVE_KEYED_SAMPLING a keyed request takes the serial verdict instead.
-/// `law`: the drafts' law `[drafts, vocab]` when the drafter drew them (accepted with min(1, p/q), the residual
-/// max(p - q, 0)); null = point masses (accepted with p).
-pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const u32, vocab: usize, accepted_cap: u32, law: ?mlx.mlx_array) !Verdict {
+/// The sampled accept of a verify chunk: `verify` is `[t1, drafts...]` and `vl_g` its logits `[rows, vocab]`, `q` the
+/// drafts' law `[drafts, vocab]` when they were drawn (a sampled draft's, a served drafter's) or null (each draft a
+/// point mass): `verdictOf` over the request's filtered density under `rule`. With MLX_SERVE_KEYED_SAMPLING a keyed
+/// request takes the serial verdict instead.
+pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const u32, vocab: usize, accepted_cap: u32, q: ?mlx.mlx_array, rule: Rule) !Verdict {
     if (env.on(.MLX_SERVE_KEYED_SAMPLING) and keyedSerial(self.sampling)) return serialVerdict(self, vl_g, verify, vocab, accepted_cap);
-    if (verify.len > 1) {
-        var p = try acceptStart(self, vl_g, verify, vocab, law);
-        defer p.deinit();
-        acceptKick(&p);
-        return acceptRead(self, &p, accepted_cap);
-    }
-    // The confidence gate submitted nothing: this round verifies t1 alone and row 0 IS the bonus row: sample the next
-    // trunk token from it directly.
+    // The rounds the typical rule decided (`[spec-stats] dspark typical`): the proof it engaged, not only its setting.
+    if (rule == .typical) self.dspark_typical_rounds += 1;
     const s = self.xfm.s;
-    const vshape = [_]c_int{ 1, 1, @intCast(vocab) };
+    // Filtered target probs over every verify row: [b+1, V] -> [1, b+1, V].
+    const vshape = [_]c_int{ 1, @intCast(verify.len), @intCast(vocab) };
     var vl3 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(vl3);
     try mlx.check(mlx.mlx_reshape(&vl3, vl_g, &vshape, 3, s));
     const sp = self.nextDraw();
     const probs_all = try probsAllPositions(vl3, sp, s);
     defer _ = mlx.mlx_array_free(probs_all);
+    return verdictOf(probs_all, verify, q, accepted_cap, sp, self.prng.random(), s, rule);
+}
+
+/// A sampled draft (`MLX_SERVE_DSV41_DRAFT_SAMPLE`): the block's uniforms from a fresh draw of the request's seed, its
+/// tokens drawn from softmax(row / T) in the fused Markov chain, and their proposal rows `q`.
+fn draftSampled(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv41_mod.Dsv41Model, st: *dsv41_mod.State, t1: u32) !dsv41_mod.SampledDraft {
+    const s = self.xfm.s;
+    const sp = self.nextDraw();
+    const key = seedKey(sp);
+    defer _ = mlx.mlx_array_free(key);
+    const lo = mlx.mlx_array_new_float(0);
+    defer _ = mlx.mlx_array_free(lo);
+    const hi = mlx.mlx_array_new_float(1);
+    defer _ = mlx.mlx_array_free(hi);
+    var u = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(u);
+    try mlx.check(mlx.mlx_random_uniform(&u, lo, hi, &[_]c_int{ @intCast(mdl.ds_block), @intCast(mdl.vocab) }, 2, .float32, key, s));
+    return dsv41_mod.dsparkDraftSampled(mdl, allocator, st, t1, u, 1 / @max(sp.temperature, 1e-5));
+}
+
+/// The verdict of a verify over `verify` = `[t1, drafts...]` from the filtered target probs `probs_all` [1, rows, V]:
+/// draft k kept with probability min(1, p_k / q_k), q the drafts' proposal rows ([drafts, V], drawn from them) or a
+/// point mass on each draft (null: an argmax or copy draft); the token after the kept prefix is the residual sample
+/// max(0, p - q) at the first reject, or the bonus row's draw on a full accept. Under `rule` `.typical` draft k is kept
+/// iff p_k clears min(eps, delta * e^-H(p_k's row)), no uniform drawn, and the first reject is a draw from p itself.
+pub fn verdictOf(probs_all: mlx.mlx_array, verify: []const u32, q: ?mlx.mlx_array, accepted_cap: u32, sp: SamplingParams, rnd: std.Random, s: mlx.mlx_stream, rule: Rule) !Verdict {
+    if (verify.len > 1) {
+        var p = try acceptStartRule(probs_all, sp, verify, q, if (q) |qa| mlx.getShape(qa)[1] else 0, rule, s);
+        defer p.deinit();
+        acceptKick(&p);
+        return acceptReadWith(&p, accepted_cap, rnd);
+    }
+    // The confidence gate submitted nothing: this round verifies t1 alone and row 0 IS the bonus row: sample the next
+    // trunk token from it directly.
     var log_p = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(log_p);
     try mlx.check(mlx.mlx_log(&log_p, probs_all, s));
@@ -744,6 +873,7 @@ pub const PendingAccept = struct {
     q_rows: [16]mlx.mlx_array = undefined,
     n_q: usize = 0,
     b: u32,
+    rule: Rule = .exact,
 
     pub fn deinit(p: *PendingAccept) void {
         p.bg.deinit();
@@ -752,7 +882,8 @@ pub const PendingAccept = struct {
     }
 };
 
-/// `stochasticVerdict`'s accept graph for `verify` (`[t1, drafts...]`, two rows or more) over its logits `vl_g`.
+/// `stochasticVerdict`'s accept graph for `verify` (`[t1, drafts...]`, two rows or more) over its logits `vl_g`, under
+/// the exact rule.
 pub fn acceptStart(self: *Generator, vl_g: mlx.mlx_array, verify: []const u32, vocab: usize, law: ?mlx.mlx_array) !PendingAccept {
     const s = self.xfm.s;
     // Filtered target probs over every verify row: [b+1, V] -> [1, b+1, V].
@@ -768,10 +899,16 @@ pub fn acceptStart(self: *Generator, vl_g: mlx.mlx_array, verify: []const u32, v
 
 /// `acceptStart` over the rows' filtered probs `probs_all` `[1, b+1, V]` (`probsAllPositions` under `sp`).
 pub fn acceptStartProbs(self: *Generator, probs_all: mlx.mlx_array, sp: SamplingParams, verify: []const u32, vocab: usize, law: ?mlx.mlx_array) !PendingAccept {
-    const s = self.xfm.s;
+    return acceptStartRule(probs_all, sp, verify, law, @intCast(vocab), .exact, self.xfm.s);
+}
+
+/// The accept graph of `verify` under `rule`, `law`'s rows read `width` wide: `.exact` keeps draft k with min(1, p/q)
+/// (p for a point mass), `.typical` gives each draft's p and its row's floor min(eps, delta * e^-H) and corrections
+/// drawn from p.
+fn acceptStartRule(probs_all: mlx.mlx_array, sp: SamplingParams, verify: []const u32, law: ?mlx.mlx_array, width: c_int, rule: Rule, s: mlx.mlx_stream) !PendingAccept {
     const b: u32 = @intCast(verify.len - 1);
     if (law != null and b > 16) return error.SpecDraftLawTooWide;
-    var p: PendingAccept = .{ .bg = undefined, .b = b };
+    var p: PendingAccept = .{ .bg = undefined, .b = b, .rule = rule };
     errdefer {
         for (p.draft_arrs[0..p.n_arrs]) |a| _ = mlx.mlx_array_free(a);
         for (p.q_rows[0..p.n_q]) |a| _ = mlx.mlx_array_free(a);
@@ -787,9 +924,14 @@ pub fn acceptStartProbs(self: *Generator, probs_all: mlx.mlx_array, sp: Sampling
         const ki: c_int = @intCast(k);
         p.q_rows[k] = mlx.mlx_array_new();
         p.n_q += 1;
-        try mlx.check(mlx.mlx_slice(&p.q_rows[k], q, &[_]c_int{ ki, 0 }, 2, &[_]c_int{ ki + 1, @intCast(vocab) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        try mlx.check(mlx.mlx_slice(&p.q_rows[k], q, &[_]c_int{ ki, 0 }, 2, &[_]c_int{ ki + 1, width }, 2, &[_]c_int{ 1, 1 }, 2, s));
     };
-    p.bg = try mtpBatchedAcceptGraph(probs_all, p.draft_arrs[0..b], if (law != null) p.q_rows[0..b] else null, b, sp, s);
+    const q_in: ?[]const mlx.mlx_array = if (law != null) p.q_rows[0..b] else null;
+    p.bg = switch (rule) {
+        .exact => try mtpBatchedAcceptGraph(probs_all, p.draft_arrs[0..b], q_in, b, sp, s),
+        // accept_p = p(draft), accept_q = the row's floor min(eps, delta * e^-H); the corrections draw from p.
+        .typical => |t| try mtpBatchedTypicalGraph(probs_all, p.draft_arrs[0..b], q_in, b, mtp_acceptance.param(.{ .typical = t }), sp, s),
+    };
     return p;
 }
 
@@ -798,6 +940,7 @@ pub fn acceptKick(p: *const PendingAccept) void {
     const ev = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ev);
     _ = mlx.mlx_vector_array_append_value(ev, p.bg.accept_p);
+    if (p.bg.accept_q.ctx != null) _ = mlx.mlx_vector_array_append_value(ev, p.bg.accept_q);
     _ = mlx.mlx_vector_array_append_value(ev, p.bg.corr_samples);
     _ = mlx.mlx_async_eval(ev);
 }
@@ -805,6 +948,11 @@ pub fn acceptKick(p: *const PendingAccept) void {
 /// Reads `p`: each draft kept with its probability under the request's draws, the token pending after the kept prefix
 /// the correction at the first reject (or the bonus draw on a full accept), cut at the request's token budget.
 pub fn acceptRead(self: *Generator, p: *PendingAccept, accepted_cap: u32) !Verdict {
+    return acceptReadWith(p, accepted_cap, self.prng.random());
+}
+
+/// `acceptRead` with the uniforms from `rnd`; a typical rule draws none.
+fn acceptReadWith(p: *PendingAccept, accepted_cap: u32, rnd: std.Random) !Verdict {
     const bg = &p.bg;
     try mlx.check(mlx.mlx_array_eval(bg.accept_p));
     const p_data = mlx.mlx_array_data_float32(bg.accept_p) orelse return error.MlxArrayDataNull;
@@ -813,11 +961,17 @@ pub fn acceptRead(self: *Generator, p: *PendingAccept, accepted_cap: u32) !Verdi
         break :blk mlx.mlx_array_data_float32(bg.accept_q) orelse return error.MlxArrayDataNull;
     } else null;
     var accepted: u32 = 0;
-    while (accepted < p.b) {
-        const accept_prob = acceptProb(p_data[accepted], if (q_data) |q| q[accepted] else null);
-        const u: f32 = self.prng.random().float(f32);
-        if (u >= accept_prob) break;
-        accepted += 1;
+    switch (p.rule) {
+        .exact => while (accepted < p.b) {
+            const accept_prob = acceptProb(p_data[accepted], if (q_data) |q| q[accepted] else null);
+            const u: f32 = rnd.float(f32);
+            if (u >= accept_prob) break;
+            accepted += 1;
+        },
+        .typical => {
+            const floor = q_data orelse return error.MlxArrayDataNull;
+            while (accepted < p.b and mtp_acceptance.typicalAccept(p_data[accepted], floor[accepted]) != typical_plant) accepted += 1;
+        },
     }
     // Pick the correction at the request-budget boundary and let the model's state roll back to that same point.
     accepted = @min(accepted, accepted_cap);
@@ -1308,6 +1462,22 @@ test "dsparkVerifyDrafts: a sure head verifies the block, an unsure one t1 alone
     try testing.expectEqual(@as(usize, 0), G.dsparkVerifyDrafts(&.{ 9, 9, 9, 9, 9 }, &calib, 17.6));
 }
 
+test "dspark nextDecides: a greedy round that kept every verified draft learns the first unverified one from its next token" {
+    var ids = [_]u32{ 10, 11, 12, 13, 14, 15 };
+    var conf = [_]f32{ 1, 1, 1, 1, 1 };
+    var d: dsv41_mod.DsparkDraft = .{ .ids = &ids, .len = 2, .logits = &.{}, .confidence = &conf };
+    // Drafts 0 and 1 (ids 11, 12) kept: the trunk's next token is draft 2 (id 13), a hit; any other id, a miss.
+    try testing.expectEqual(@as(?bool, true), nextDecides(&d, 5, 2, 13, false));
+    try testing.expectEqual(@as(?bool, false), nextDecides(&d, 5, 2, 99, false));
+    // A reject among the verified drafts, a sampled round, or no draft past the verified ones: nothing to learn.
+    try testing.expectEqual(@as(?bool, null), nextDecides(&d, 5, 1, 12, false));
+    try testing.expectEqual(@as(?bool, null), nextDecides(&d, 5, 2, 13, true));
+    try testing.expectEqual(@as(?bool, null), nextDecides(&d, 2, 2, 13, false));
+    // A round that verified t1 alone learns draft 0 (id 11).
+    d.len = 0;
+    try testing.expectEqual(@as(?bool, true), nextDecides(&d, 5, 0, 11, false));
+}
+
 test "dspark drafting backoff: prose rounds that lose to the plain step are skipped, copy-like rounds are not" {
     // A round that commits few tokens for its cost loses to the plain step (costs in ms).
     var prose = dflash_policy.Drafting{};
@@ -1318,6 +1488,180 @@ test "dspark drafting backoff: prose rounds that lose to the plain step are skip
     try testing.expect(echo.shouldDraft());
     echo.record(5.5 * 17.6, 70);
     try testing.expect(echo.shouldDraft());
+}
+
+/// Pearson's chi-square of `counts` against `n` draws from `p`.
+fn chiSquare(counts: []const u64, p: []const f64, n: usize) f64 {
+    var x: f64 = 0;
+    for (counts, p) |c, pi| {
+        const e = pi * @as(f64, @floatFromInt(n));
+        const d = @as(f64, @floatFromInt(c)) - e;
+        x += d * d / e;
+    }
+    return x;
+}
+
+test "dspark sampled verdict (GPU): drafts drawn from q, kept at min(1, p / q) and resampled from max(0, p - q), emit p over fixed seeds; a flat proposal in the ratio for the same draws fails" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const V = 6;
+    // The target's filtered rows at the draft's position and the bonus row, and the draft's proposal.
+    const p = [_]f64{ 0.05, 0.10, 0.15, 0.20, 0.20, 0.30 };
+    const q = [_]f64{ 0.30, 0.25, 0.20, 0.10, 0.10, 0.05 };
+    var pv: [2 * V]f32 = undefined;
+    for (0..V) |i| {
+        pv[i] = @floatCast(p[i]);
+        pv[V + i] = @floatCast(p[V - 1 - i]);
+    }
+    var qv: [V]f32 = undefined;
+    for (&qv, q) |*o, v| o.* = @floatCast(v);
+    const probs = mlx.mlx_array_new_data(&pv, &[_]c_int{ 1, 2, V }, 3, .float32);
+    defer _ = mlx.mlx_array_free(probs);
+    const qa = mlx.mlx_array_new_data(&qv, &[_]c_int{ 1, V }, 2, .float32);
+    defer _ = mlx.mlx_array_free(qa);
+    // planted: the ratio and the residual read a flat proposal, not the q the drafts came from
+    const flat: [V]f32 = @splat(1.0 / @as(f32, V));
+    const qf = mlx.mlx_array_new_data(&flat, &[_]c_int{ 1, V }, 2, .float32);
+    defer _ = mlx.mlx_array_free(qf);
+    const N = 4000;
+    var got: [2][V]u64 = .{ @splat(0), @splat(0) };
+    for (0..2) |arm| {
+        var prng = std.Random.DefaultPrng.init(0xD5A2);
+        const rnd = prng.random();
+        for (0..N) |trial| {
+            var u = rnd.float(f64);
+            var x: u32 = V - 1;
+            for (q, 0..) |qi, i| {
+                if (u < qi) {
+                    x = @intCast(i);
+                    break;
+                }
+                u -= qi;
+            }
+            const v = try verdictOf(probs, &.{ 0, x }, if (arm == 0) qa else qf, 1, .{ .temperature = 1, .seed = 1234 + trial }, rnd, s, .exact);
+            got[arm][if (v.accepted == 1) x else v.next_token] += 1;
+        }
+    }
+    const exact = chiSquare(&got[0], &p, N);
+    const planted = chiSquare(&got[1], &p, N);
+    std.debug.print("[dspark sample] chi-square of the emitted token against p over {d} seeded rounds (5 dof): q in the ratio {d:.1}, a flat proposal {d:.1}\n", .{ N, exact, planted });
+    // 5 degrees of freedom: 30 is past the 1e-5 tail; the flat proposal's bias is about 345 at this count.
+    try testing.expect(exact < 30);
+    try testing.expect(planted > 150);
+}
+
+test "dspark sampled verdict (GPU): a draft vocabulary's q (0 past it, renormalized over it) in the ratio and the residual emits p; the whole row's q for the same draws fails" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const V = 6;
+    const p = [_]f64{ 0.05, 0.10, 0.15, 0.20, 0.20, 0.30 };
+    // The draft's whole-row softmax, and its vocabulary {0, 2, 3, 5}: the drafts come from the row over those ids alone
+    // (`dsv41.draftChain` with `MLX_SERVE_DSV41_DRAFT_VOCAB`), the renormalized restriction, 0 at ids 1 and 4.
+    const whole = [_]f64{ 0.30, 0.25, 0.20, 0.10, 0.10, 0.05 };
+    const in_vocab = [_]bool{ true, false, true, true, false, true };
+    var z: f64 = 0;
+    for (whole, in_vocab) |w, in| z += if (in) w else 0;
+    var q: [V]f64 = undefined;
+    for (&q, whole, in_vocab) |*o, w, in| o.* = if (in) w / z else 0;
+    var pv: [2 * V]f32 = undefined;
+    for (0..V) |i| {
+        pv[i] = @floatCast(p[i]);
+        pv[V + i] = @floatCast(p[V - 1 - i]);
+    }
+    var qv: [V]f32 = undefined;
+    for (&qv, q) |*o, v| o.* = @floatCast(v);
+    var wv: [V]f32 = undefined;
+    for (&wv, whole) |*o, v| o.* = @floatCast(v);
+    const probs = mlx.mlx_array_new_data(&pv, &[_]c_int{ 1, 2, V }, 3, .float32);
+    defer _ = mlx.mlx_array_free(probs);
+    const qa = mlx.mlx_array_new_data(&qv, &[_]c_int{ 1, V }, 2, .float32);
+    defer _ = mlx.mlx_array_free(qa);
+    // planted: the ratio and the residual read the whole row's softmax, not the restricted q the drafts came from
+    const wa = mlx.mlx_array_new_data(&wv, &[_]c_int{ 1, V }, 2, .float32);
+    defer _ = mlx.mlx_array_free(wa);
+    const N = 4000;
+    var got: [2][V]u64 = .{ @splat(0), @splat(0) };
+    for (0..2) |arm| {
+        var prng = std.Random.DefaultPrng.init(0xD5A3);
+        const rnd = prng.random();
+        for (0..N) |trial| {
+            var u = rnd.float(f64);
+            var x: u32 = V - 1;
+            for (q, 0..) |qi, i| {
+                if (u < qi) {
+                    x = @intCast(i);
+                    break;
+                }
+                u -= qi;
+            }
+            try testing.expect(in_vocab[x]);
+            const v = try verdictOf(probs, &.{ 0, x }, if (arm == 0) qa else wa, 1, .{ .temperature = 1, .seed = 4321 + trial }, rnd, s, .exact);
+            got[arm][if (v.accepted == 1) x else v.next_token] += 1;
+        }
+    }
+    const exact = chiSquare(&got[0], &p, N);
+    const planted = chiSquare(&got[1], &p, N);
+    std.debug.print("[dspark sample] draft vocabulary: chi-square of the emitted token against p over {d} seeded rounds (5 dof): the restricted q {d:.1}, the whole row's {d:.1}\n", .{ N, exact, planted });
+    // The whole row's q never resamples id 1 (p 0.10 < q 0.25): its expected chi-square is about 900 at this count.
+    try testing.expect(exact < 30);
+    try testing.expect(planted > 150);
+}
+
+test "draftRule: typical only where the request asked for it and the drafts are the model's; a copied draft stays exact" {
+    const t: mtp_acceptance.Typical = .{ .delta = 0.3, .eps = 0.09 };
+    try testing.expectEqual(Rule.exact, draftRule(null, false));
+    try testing.expectEqual(Rule.exact, draftRule(null, true));
+    try testing.expectEqual(Rule{ .typical = t }, draftRule(t, false));
+    try testing.expectEqual(Rule.exact, draftRule(t, true));
+}
+
+test "dspark typical verdict (GPU): p(draft) against min(eps, delta * e^-H) at eps 1 decides with no uniform, the reject draws from p; a floor of 1 keeps nothing (serial sampling), a floor near 0 keeps any draft; an inverted floor fails" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const V = 4;
+    const p = [V]f64{ 0.7, 0.2, 0.05, 0.05 };
+    // The draft's row is p; the bonus row (never reached: one draft, cap 1, reads it only on a full accept) is p too.
+    var pv: [2 * V]f32 = undefined;
+    for (0..V) |i| {
+        pv[i] = @floatCast(p[i]);
+        pv[V + i] = @floatCast(p[i]);
+    }
+    const probs = mlx.mlx_array_new_data(&pv, &[_]c_int{ 1, 2, V }, 3, .float32);
+    defer _ = mlx.mlx_array_free(probs);
+    // The CPU oracle's floor at delta 0.2: H(p) = 0.871, e^-H = 0.418, floor 0.0837.
+    const floor = mtp_acceptance.typicalThreshold(&p, 0.2, 1.0);
+    try testing.expect(floor > 0.05 and floor < 0.2);
+    const N = 2000;
+    // kept[case]: rounds that kept the draft; emitted: the token each rejecting round drew.
+    const Case = struct { x: u32, delta: f32 };
+    const cases = [_]Case{ .{ .x = 0, .delta = 0.2 }, .{ .x = 2, .delta = 0.2 }, .{ .x = 0, .delta = 1e30 }, .{ .x = 2, .delta = 1e-9 } };
+    var kept: [cases.len]u64 = @splat(0);
+    var drawn: [cases.len][V]u64 = @splat(@as([V]u64, @splat(0)));
+    var prng = std.Random.DefaultPrng.init(0x7E51);
+    for (cases, 0..) |c, ci| for (0..N) |trial| {
+        const v = try verdictOf(probs, &.{ 0, c.x }, null, 1, .{ .temperature = 1, .seed = 1234 + trial }, prng.random(), s, .{ .typical = .{ .delta = c.delta, .eps = 1.0 } });
+        if (v.accepted == 1) kept[ci] += 1 else drawn[ci][v.next_token] += 1;
+    };
+    std.debug.print("[dspark typical] kept of {d}: p 0.7 at delta 0.2 {d}, p 0.05 at 0.2 {d}, p 0.7 at a floor of 1 {d}, p 0.05 at a floor near 0 {d}\n", .{ N, kept[0], kept[1], kept[2], kept[3] });
+    // Deterministic: the draft over the floor is always kept, the one under it never (exact keeps them 70% and 5%).
+    try testing.expectEqual(@as(u64, N), kept[0]);
+    try testing.expectEqual(@as(u64, 0), kept[1]);
+    // A floor of 1 keeps nothing: every round draws from p, which is serial sampling's distribution.
+    try testing.expectEqual(@as(u64, 0), kept[2]);
+    try testing.expect(chiSquare(&drawn[2], &p, N) < 30);
+    // The reject's draw is p itself (not max(0, p - onehot)): the rejected draft can come back.
+    try testing.expect(chiSquare(&drawn[1], &p, N) < 30);
+    // A floor near 0 keeps any draft with mass: the lossy end.
+    try testing.expectEqual(@as(u64, N), kept[3]);
+    // Planted: the floor's comparison inverted keeps the draft under the floor and drops the one over it.
+    typical_plant = true;
+    defer typical_plant = false;
+    var planted: [2]u64 = .{ 0, 0 };
+    for (0..2) |ci| for (0..N) |trial| {
+        const v = try verdictOf(probs, &.{ 0, cases[ci].x }, null, 1, .{ .temperature = 1, .seed = 1234 + trial }, prng.random(), s, .{ .typical = .{ .delta = 0.2, .eps = 1.0 } });
+        planted[ci] += v.accepted;
+    };
+    try testing.expect(planted[0] != N or planted[1] != 0);
 }
 
 test "an accepted stop id is the pending token, and the drafts before it are what the round keeps" {

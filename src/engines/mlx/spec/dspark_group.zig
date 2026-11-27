@@ -7,7 +7,7 @@ const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
-const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
+const dsv41_mod = @import("../plugin/dsv41_link.zig").deepseek_v41;
 const dflash_policy = @import("dflash/policy.zig");
 const intree = @import("../plugin/intree.zig");
 const modules = @import("../modules/call.zig");
@@ -166,6 +166,12 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
     var staged: [MAX_SLOTS]usize = undefined;
     var n_stage: usize = 0;
     for (gens, 0..) |gen, k| {
+        // The request's draft vocabulary mode before its first round (a sampled request drafts every id); the batched
+        // draft reads no prompt ids, so a later solo round makes them (`dsv41.draftPromptVocab`).
+        if (!gen.dspark_vocab_mode) {
+            gen.dspark_vocab_mode = true;
+            dsv41_mod.draftVocabMode(mdl, states[k], !gen.dspark_stochastic);
+        }
         const t1 = gen.next_token_id;
         caps[k] = capAcceptedForTokenBudget(std.math.maxInt(u32), gen.completion_tokens, gen.max_tokens);
         const idx = try gen.mtpLookupIndex(allocs[k]);
@@ -268,7 +274,7 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
         } else if (gen.dspark_stochastic) {
             const rows_l = try rowsOf(logits, off, ch.len, mdl.vocab, mdl.s);
             defer _ = mlx.mlx_array_free(rows_l);
-            const v = try dspark.stochasticVerdict(gen, rows_l, ch, mdl.vocab, caps[k], null);
+            const v = try dspark.stochasticVerdict(gen, rows_l, ch, mdl.vocab, caps[k], null, dspark.draftRule(gen.dspark_typical, kinds[k] == .copy));
             accepted[k] = v.accepted;
             next[k] = v.next_token;
         } else {

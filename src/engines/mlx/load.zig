@@ -55,6 +55,8 @@ const drafterResidentBytes = @import("runtime/preflight.zig").drafterResidentByt
 const preflightVerdict = @import("runtime/preflight.zig").preflightVerdict;
 const mlxActiveBytes = @import("runtime/preflight.zig").mlxActiveBytes;
 const loadRequirementBytes = @import("runtime/preflight.zig").loadRequirementBytes;
+const wiredLimitAdviceMb = @import("runtime/preflight.zig").wiredLimitAdviceMb;
+const loadGpuLimit = @import("runtime/preflight.zig").loadGpuLimit;
 const scheduler_mod = @import("scheduler.zig");
 
 /// Phase A1 → Plan 05: do the full model load on the inference thread.
@@ -145,6 +147,17 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 in_dir_drafter = null;
             },
             .refuse => {
+                const need = loadRequirementBytes(weights_bytes);
+                const ram = if (status.getProcAvailableMemBytes() > 0) status.getProcAvailableMemBytes() else status.getLoadAvailableMemBytes();
+                if (wiredLimitAdviceMb(need, loadGpuLimit(), ram, status.getTotalMemBytes())) |mb| {
+                    log.err("Insufficient memory to load model: Metal's working-set limit (iogpu.wired_limit_mb) holds {d:.1} GB, the load needs ~{d:.1} GB ({d:.1} GB of weights plus warmup headroom); RAM holds it. Raise the limit and retry: sudo sysctl iogpu.wired_limit_mb={d}\n", .{
+                        @as(f64, @floatFromInt(loadGpuLimit())) / gb,
+                        @as(f64, @floatFromInt(need)) / gb,
+                        @as(f64, @floatFromInt(weights_bytes)) / gb,
+                        mb,
+                    });
+                    return error.InsufficientMemory;
+                }
                 log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights{s} plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.{s}\n", .{
                     @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes))) / gb,
                     @as(f64, @floatFromInt(weights_bytes)) / gb,
@@ -727,8 +740,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Eager warmup: faults weight pages + compiles the decode-path kernels
     // on this thread's stream. ~600-900 ms at boot but the first user request
     // skips a cold path — observed savings on Gemma 4 E4B 4-bit.
-    var warm_marker_buf: [1280]u8 = undefined;
-    var warm_marker: ?[:0]const u8 = null;
+    // Every load serves its own warm requests (`warm_requests.zig`): nothing kept from an earlier load decides it.
+    var warm_owed = false;
     var verify_rows: u32 = 0;
     if (params.warmup_eager) {
         params.entry.load_progress.begin(.warming_up, 0, io_util.nowMsMonotonic(sch.io));
@@ -740,14 +753,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         else
             0;
         verify_rows = @max(8, sidecar_rows, head_rows) + 1;
-        warm_marker = warm_requests.owed(&warm_marker_buf, if (params.warmup_full) .full else .minimal, .{
-            .model_path = params.entry.path,
-            .model_type = params.config.model_type,
-            .verify_rows = verify_rows,
-            .kv_bits = kv_quant_config.bits,
-        });
+        warm_owed = warm_requests.wanted();
         // The sweep runs here only ahead of the full plan; the minimal one runs it once the model is ready.
-        xfm_ptr.warmup(if (params.warmup_full and warm_marker != null) verify_rows else 0) catch |err| {
+        xfm_ptr.warmup(if (params.warmup_full and warm_owed) verify_rows else 0) catch |err| {
             log.warn("Warmup failed ({s}); continuing without it — first request may be slow.\n", .{@errorName(err)});
         };
         const warmup_ns: u64 = @intCast(warmup_start.untilNow(sch.io, .awake).nanoseconds);
@@ -953,12 +961,12 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
 
     // `--warmup-full`: ready only once it has served its own first requests, so whoever asks next measures the model,
-    // not its compiles. Otherwise it is ready now and owes a short warm-up for when the server is idle.
+    // not its compiles. Otherwise it is ready now and owes a short warm-up for when the server is idle. Every load does.
     const chat = ModelRegistry.chatCapable(entry);
     if (params.warmup_full) {
-        if (warm_marker) |marker| {
-            if (!chat or warm_requests.run(sch, entry)) warm_requests.remember(marker);
-            warm_marker = null;
+        if (warm_owed) {
+            if (chat) warm_requests.run(sch, entry);
+            warm_owed = false;
         }
         warm_requests.timeRounds(sch, entry);
     }
@@ -967,7 +975,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.bytes_live = bytes_live;
     sch.registry.markReadyLocked(entry, bytes_resident);
     sch.registry.mutex.unlock(sch.io);
-    warm_requests.owe(sch, entry, warm_marker, verify_rows, chat);
+    if (warm_owed) {
+        warm_requests.owe(sch, entry, verify_rows, chat);
+    } else if (warm_requests.owesRounds(entry)) {
+        warm_requests.owe(sch, entry, 0, false);
+    }
     publishHotCacheResidency(sch);
 }
 

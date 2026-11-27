@@ -4,6 +4,13 @@ DeepSeek-V4.1-Flash (`model_type: deepseek_v41`, 1M context, MLX packs) with its
 module-owned arch. Unpaired captures transfer to the engine's prefix cache, keyed on image rows. Packs:
 `ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw`, `mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-mtp`, and
 OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin (its trunk and its `experts.bin` bank).
+NVIDIA's `DeepSeek-V4.1-Flash-1017-NVFP4` converted by `scripts/dsv41_nvfp4_pack.py` (headers only): its routed experts
+load as MLX nvfp4 banks with ModelOpt's per-expert globals (`Experts.scale`), its mxfp4 Engram tables as stored. The
+converter's `--experts-mxfp4` writes the experts as mxfp4 g32 instead: value-identical to NVIDIA's NVFP4 pack
+(16,986,931,200 groups checked) only because this release's scales are powers of two (NVFP4 is in general the more
+accurate format: 16-value groups and e4m3 scales capture spiky weights); faster prefill and 18 GB smaller. The core
+serves either from the pack, with no flag. Users' docs (the NVFP4 release: pack, defaults, M5 Ultra 512 GB setup,
+DSpark, lossless classes): `README.md`.
 
 ## Files
 - `plugin.zig`: the table; `CacheHooks.aux` / live `state_bytes`; streamed/paired legacy `resume_prompt`;
@@ -24,14 +31,26 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   equivalence tests and the `DSV41_DEC_UBENCH` meters.
 - `prompt/`: the wide prompt layers' exact rewrites (each file's header names its change and gain): the gather's
   kernels (`attn_core`, `q_tail`, `scratch_attn` regions and ring), the hc and router fusions (`hc_fuse`, `gate_gemm`),
-  span grouping (`idx_group`), buffers kept or reused (`transient_keep`, `scratch_x1` on `scratch`),
-  Engram's direct read (`engram_direct`), the embedding pread and a plugin bank's own pieces (`wide_early`, `woa_rows`,
-  `flash_attn`: the lossy flash kernel, default on beside a plugin bank only).
+  span grouping (`idx_group`), buffers kept or reused (`transient_keep`, `scratch_x1` on `scratch`, `keep_wide`: MLX's
+  reserve from `patches/mlx-metal-wide-reserve.patch`),
+  Engram's direct read (`engram_direct`), the embedding pread and a plugin bank's own pieces (`wide_early`, `woa_rows`),
+  `flash_attn` (the flash kernel, not exact, on by default for every pack), an NVFP4 bank's gate and up with its scales and `moe_act`
+  in one paired launch, and main's affine pair (`moe_pair`, one owner); `wide_test.zig` holds the default-on prompt rewrites to their `=0` paths, most
+  word for word or no farther from float64 (`MOE_PAIR_FP4` and `PF_HC_V2` to reorder bounds), some only to a
+  tolerance (`HC_EXPAND_NORM`, the pair-worker cases), with a planted bug each.
+- `fuse.zig`: launch fusions, each behind its own switch (`Dsv41Model.fuse`; `FUSE_DOWN_SCALE` and `FUSE_MXFP8_QMM` on
+  by default), served only on the resident weight path
+  (`MLX_SERVE_DSV41_WEIGHT_PATH`, `settle`); `ssd` keeps today's kernels.
 - `spec/markov.zig`: DSpark's Markov chain in B + 1 launches; `decode/engram_decode.zig` the Engram LRU,
   `decode/gemv_twin.zig` the batched GEMV twin of MLX's M=1 words.
-- `decode/moe_fp4.zig`: the MoE's two launches over mxfp4 routed experts (the Lossless pack), rows 1..6, built only
-  without NAX (unmeasured on M5); `moe_up` / `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or
-  128 (the expert-pruned packs are 2-bit g128). Otherwise `routed` runs.
+- `decode/moe_fp4.zig`: the MoE's two launches over fp4 routed experts (MXFP4; NVFP4 with ModelOpt's
+  per-expert scales through `moeUpScaled`), rows 1..6, serving everywhere (`MLX_SERVE_DSV41_MOE_FP4_NAX=0` turns
+  them off on NAX); with `wo_a` on its vector kernel a verify row is its plain step's bytes; `moe_up` /
+  `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or 128 (the expert-pruned packs are 2-bit g128).
+  Otherwise `routed` runs.
+- `mx_view.zig`: `MLX_SERVE_DSV41_MXFP4_VIEW` (off): an NVFP4 bank whose every 32-span is one power of two loads as
+  the MXFP4 bank of its values (the converter's `--experts-mxfp4` bytes), a layer at a time, billed so
+  (`residentBytes`); a bank with any other span stays NVFP4, named in the log.
 - Under `tp` each `tpSum` is a CPU-stream JACCL all_sum, two a layer. With `MLX_METAL_FAST_SYNCH` (on in a group) MLX
   hands off through its fences (`mlx/backend/metal/fence.cpp`): the GPU dispatches `input_coherent` and `fence_update`
   before the sum and spins in the one-thread `fence_wait` kernel until the CPU finishes it, so the collective's wait
@@ -66,7 +85,9 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   order: `blockFused` and `batchedLayer` sum between their stages (`tpFfn`).
 - DSpark under `tp` (rank 0's plan decides whether the stages load): every rank drafts on its slice of the stages and rows
   of both heads, after rank 0's `tp_draft`; each Markov step gathers every rank's best `[value, id]`. A worker's verify
-  follow commits the kept main rows to its windows (`finishVerify`), or its next draft reads stale rows.
+  follow commits the kept main rows to its windows (`finishVerify`), or its next draft reads stale rows. A sharded
+  draft takes none of the paths that would not sum or gather on every rank: `DRAFT_FUSED`'s fused stages,
+  `DRAFT_VOCAB` (declined at load) and `DRAFT_SAMPLE` (`draftSampleServes`) keep their `=0` paths there.
 - Under `tp` a plain decode step whose token is still on the GPU goes by bell alone: every rank gathers
   rank 0's token in its graph (`tpToken`). Rank 0 pipes only the state the workers last stepped, where they left it
   (distributed.zig `TpLive`, cleared by any other message), never a step a header carries (snapshot, verify, all rows).
@@ -94,8 +115,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   (`Hash.DEAD`).
 - The resume key includes the image rows: a different image at the same tokens is a cold prompt.
 - DSpark = DFlash + Markov head: `block_size` at ROOT; `rope_is_neox_style:false` = MLX `traditional=true`; `w1`
-  DENSE; sampled requests via one-hot acceptance. Per-model `mtp:false` keeps the
-  stages off (`mtpSetting`).
+  DENSE; sampled requests draw drafts from q and keep them at min(1, p / q) (`MLX_SERVE_DSV41_DRAFT_SAMPLE`; `=0`
+  one-hot acceptance). Per-model `mtp:false` keeps the stages off (`mtpSetting`).
 - The confidence head is calibrated: a draft is accepted at about the sigmoid of its logit, at every block position.
   The policy's bins start from it (`Calibration.head`); the GLM-fitted prior read 0.93 as 0.65 and starved rows.
 - Engine code that drives the module directly (a DSpark round) activates its slot first (`activate_slot`); a
@@ -113,6 +134,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   about a plain tick, and the adaptive policy's prior ladder cut novel text from 54 to 40 tok/s.
 - A streamed bank's phase follows its decode capacity (`promptPhase`): a call past the decode regions OR past
   `Routed.decode_ids` routed ids runs the prompt phase; a 9-16 token prompt on the EXL3 bank failed `NotPrefill`.
+- Engram tables are held in memory where they fit (`Table.hold`, `MLX_SERVE_DSV41_ENGRAM_RESIDENT`, billed by
+  `residentDiskBytes`): read once past the page cache at load, each lookup a copy; else the reads below.
 - Engram tables are read whole and past the page cache only beside a streamed bank (`Table.readDirect`): on a resident
   MLX pack the direct whole-grid read slowed warm prompts (the cache served their rows), and the bank needs that memory.
 - A resident pack reads its Engram CODES past the page cache while memory is tight (`Table.openCodes`, `pastCache`,
@@ -128,6 +151,15 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - A prompt chunk of 4096 rows or more that nothing read ahead runs as its first half, then the rest (`extendCold`,
   `leadRows`; the lead is `Want.encode`: no decoder replay, which the rest makes): the drive reads the rest's Engram
   rows behind the lead. The log's `waited ... ms` is the meter.
+- Every switch is a row of `levers.zig` (its stack, class, picks and README row), read through `lev.*` and logged
+  through `lev.line`; the README's `levers:` blocks and `accepted-lines.txt` are rendered from the table and tested
+  against it (rerun the levers tests after any row change and paste what they print). Every default-on switch is
+  EXACT, REORDER, DRAFT-ONLY or TF32 except `HEAD8` (REQUANT, the one accepted requantization). A LOSSY switch
+  (`PF_INT8`, `ATTN_F16`) is off under lossless and gets a lossy pick: `README.md` "Accuracy". A new default-on switch
+  owes a standing word or float64 test against its `=0` path, a plant failing.
+- One function picks every prompt-attention call's core (`attnCore`), from the call's shape and the load alone: on NAX
+  flash, else the gather, else the f32 chain; never the f16 core unless `ATTN_F16` is named on. Its meter is `core_calls`.
+  On the f32 chain's routes (tp, FLASH_ATTN=0 at odd K, non-bf16) attention's words depend on chunk width (a reorder).
 - Construct each MPP cooperative tensor from its owning op; copying one invokes incompatible Metal layout
   interfaces on some SDKs. Fill each operand's independent storage before running the matmul.
 
@@ -157,6 +189,10 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 ## Known issues
 - Auxiliary snapshots persist through the disk tensor hooks as exact v10 module records; one-shot serialization
   still returns a named unsupported verdict. SSD-only module retention is unsupported.
+- An NVFP4 bank's per-expert globals (`expertScales`: gate, up and down, `[E]` bf16, finite and positive, all three or
+  none) apply where the SDK block applies them: the gate and up gather outputs (`gateUp`, `moePrefill`, the fused
+  kernel's flags), each rounded again; the down scale on the routing weight (`routeFrom`, `blockTail`; under
+  `fuse.down_scale` the fused gate/up launch's `DSCALE`). Streamed or tensor-split experts with them are refused by name.
 - Serial decode near the memory wall: 720 GB/s of ~1.1 TB/s, so kernel work buys 15-25%, not 2x.
 - Without NAX (M4 and older) `attn`, `idx_score` and the `wo_a` / `ffn_in` fusion behind them stay off: decode runs the
   pre-NAX split kernel and the compiled regions. The affine `moe_up` / `moe_down` stay off too (they lose to the
@@ -164,6 +200,18 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - Prefill is chunked at 8192 at most (`prefillChunkMax`, an explicit `--prefill-chunk` included), one MoE call per
   chunk: each chunk still reads every expert bank once (the CED replay runs the decoder layers), so a narrower chunk
   pays that read twice as often.
+  `MLX_SERVE_DSV41_PF_PASS_SIZE` (on by default, `=0` the 8192-row cut; resident loads with no pair or tensor split) replaces that cap: the load
+  pins the widest whole-span pass whose prompt bill fits the ladder's memory share, up to the context
+  (`dsv41PassRows`; an explicit `--prefill-chunk` is the pass), every prompt is cut into the fewest near-equal passes
+  no wider (`passRows`), each pass runs its MoE in one call, and with every Engram table held a chunk sends no lead.
+  The hot cache snapshots at chunk ends, so fewer passes leave fewer reuse points.
+- A load that Metal's working-set limit refuses but RAM holds names `iogpu.wired_limit_mb` and logs the
+  `sudo sysctl iogpu.wired_limit_mb=<N>` that admits it (`wiredLimitAdviceMb`: the load's bill plus the 8 GiB wired
+  margin), never paging. The NVFP4 release runs raise it on a 512 GB Mac (`README.md` has the value).
+- Under `MLX_SERVE_DSV41_EXACT=1` a resident pack's greedy DSpark text is plain decode's: `decode/plan.zig` alone picks
+  each decode op's kernel for plain steps and verifies (a verify row the plain step's, or an R-row plan an `exact rows`
+  test holds); a decline is a counted miss, a load it cannot serve is refused, every verify keeps to `max_rows`.
+  Off (default) the multi-row kernels serve: the same math in another order. The greedy accept's mask is always on.
 - Past 0.95 x Metal's working set MLX's allocator evicts its buffer cache on every miss (two residency commits per
   allocation): DSpark at 8192 crosses it on a 256 GB Mac at the default `iogpu.wired_limit_mb`; raise it to bench.
 - DSpark on prose falls back to plain (acceptance 1.04/round): correct, prose runs ~54 tok/s.

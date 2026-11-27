@@ -10,13 +10,15 @@ int y_col;
 if (!omlx_gqmm::tile_of<GX>(tiles, tile_count[0], threadgroup_position_in_grid, params[0], desc, y_col)) return;
 Q q{scales, biases};
 Q uq{up_scales, up_biases};
+const float lim = as_type<float>(params[3]);
 if constexpr (SCHED == 1) {
-  omlx_gqmm::gather_mapped_db<T, Q, G, EPI, true, WEIGHTED>(x, rmap, (const device uint8_t*)w,
+  omlx_gqmm::gather_mapped_db<T, Q, G, EPI, true, ESC, WEIGHTED>(x, rmap, (const device uint8_t*)w,
       (const device uint8_t*)up_w, q, uq, desc, y_col, y, params[0], params[1],
-      Ws, simdgroup_index_in_threadgroup, thread_index_in_simdgroup, sigtab, row_wt, params[2]);
+      Ws, simdgroup_index_in_threadgroup, thread_index_in_simdgroup, sigtab, params[2],
+      gsc, usc, rw, lim, row_wt);
 } else {
-  omlx_gqmm::gather_mapped_seg<T, Q, G, ALIGN_N, ALIGN_K, EPI, true, WEIGHTED>(x, rmap,
+  omlx_gqmm::gather_mapped_seg<T, Q, G, ALIGN_N, ALIGN_K, EPI, true, ESC, WEIGHTED>(x, rmap,
       (const device uint8_t*)w, (const device uint8_t*)up_w, q, uq, desc, y_col,
       y, params[0], params[1], Ws, simdgroup_index_in_threadgroup,
-      thread_index_in_simdgroup, sigtab, row_wt, params[2]);
+      thread_index_in_simdgroup, sigtab, params[2], gsc, usc, rw, lim, row_wt);
 }

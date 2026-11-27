@@ -61,7 +61,7 @@ if constexpr (NAX) {
   const bool live = int(fm) < R;
   float acc[16];
   for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
-  dsv41_nax_mxfp8<D / 64, 4, 2, 8>(acc, rows, first, (const threadgroup uint4*)(xw + (live ? int(fm) : 0) * (PITCH / 2)) + f4 * 2, live);
+  dsv41_nax_mxfp8<D / 64, 4, 2, 8, FOLD>(acc, rows, first, (const threadgroup uint4*)(xw + (live ? int(fm) : 0) * (PITCH / 2)) + f4 * 2, live);
   if (live) {
     const uint col = row0 + uint(f4) * 4u;
     for (int i = 0; i < 4; ++i) {
@@ -112,14 +112,14 @@ if constexpr (NAX) {
       for (int j = 0; j < 4; ++j) xr[mm][j] = (m0 + mm < R) ? xs[(m0 + mm) * D4 + j * 32 + lane] : float4(0.0f);
     #pragma clang loop unroll(full)
     for (int r = 0; r < NR; ++r) {
-      // e8m0 as 2^(e - 127), times the 2^8 the e4m3 bit placement leaves out.
-      const float sc = as_type<float>(ce[r] == 0u ? 0x400000u : (ce[r] << 23)) * 256.0f;
-      const float4 w0 = dsv41_wo_a_e4m3x4(cq[r].x), w1 = dsv41_wo_a_e4m3x4(cq[r].y), w2 = dsv41_wo_a_e4m3x4(cq[r].z), w3 = dsv41_wo_a_e4m3x4(cq[r].w);
+      // The e8m0 scale and the 2^8 the e4m3 reads leave out (fp8_read_header.metal).
+      const float2 sc = dsv41_e8m0<FOLD>(ce[r]);
+      const float4 w0 = dsv41_e4m3x4<FOLD>(cq[r].x), w1 = dsv41_e4m3x4<FOLD>(cq[r].y), w2 = dsv41_e4m3x4<FOLD>(cq[r].z), w3 = dsv41_e4m3x4<FOLD>(cq[r].w);
       #pragma clang loop unroll(full)
       for (int mm = 0; mm < MB; ++mm) {
         if (m0 + mm < R) {
           const int m = m0 + mm;
-          const float v = metal::simd_sum(sc * (metal::dot(xr[mm][0], w0) + metal::dot(xr[mm][1], w1) + metal::dot(xr[mm][2], w2) + metal::dot(xr[mm][3], w3)));
+          const float v = metal::simd_sum(sc.x * ((metal::dot(xr[mm][0], w0) + metal::dot(xr[mm][1], w1) + metal::dot(xr[mm][2], w2) + metal::dot(xr[mm][3], w3)) * sc.y));
           if (lane == uint(r * R + m) % 32u) metal::atomic_store_explicit((device metal::atomic_float*)parts + (hh * R + m) * OW + row0 + r, v, metal::memory_order_relaxed);
         }
       }

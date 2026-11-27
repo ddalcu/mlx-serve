@@ -1,11 +1,12 @@
 //! The moe area's kernel contract. The decode gathers that read an expert bank in place: `gather_qmv` (one
-//! projection, shared or per-expert x, optional ReLU^2) is held to float64. The fused gate+up+SwiGLU (solo and rows)
-//! replaces two gathers and MLX's SwiGLU chain bit for bit; the rows down+reduce replaces the solo one per row; the
+//! projection, shared or per-expert x, optional ReLU^2) is held to float64. The fused gate+up+SwiGLU (one kernel for
+//! one row and for rows; per-expert gate / up scales and the clamp) replaces two gathers, the scale multiplies and
+//! MLX's SwiGLU chain bit for bit; the rows down+reduce replaces the solo one per row; the
 //! solo down+reduce (8 or 16 lanes a row, a bf16 sum over the slots) is held to float64 with its rounding chain priced.
 //! Listed in `kernel_contract/registry.zig`. Shapes: rows are top-k slots (solo kernels) or batch rows (rows kernels,
 //! top-k 8); a bank holds 8 experts (16 and 24 for Nemotron's wider top-k), N is cut to a few hundred rows (a runtime
 //! argument). NaN enters through x where an x row feeds only some outputs, else through the bank's scales: affine
-//! scales take NaN and Inf, an NVFP4 scale only e4m3's NaN code 0x7f.
+//! scales take NaN and Inf, an fp4 scale only its NaN code (e4m3 0x7f, e8m0 0xff).
 //! The rows down+reduce is compared with the solo kernel through its declared launch: the shipped `gatherQmvDownReduce`
 //! and `gatherQmvDownReduceRows` cache their config without K (KP is a template argument), so a second K at the same
 //! (top-k, N, bits, group, dtype) reuses the first K's KP (reported; not a gate's finding).
@@ -16,15 +17,17 @@
 //! replace MLX's: gather_qmm row by row (`verify_expert_reuse`, N cut to 256 from 2560), the unsort-weight-sum (`verify_expert_reduce`, summing in bf16 as MLX does), the stable argsort
 //! (`verify_route_pack`, `prefill_route_scatter`); the prefill histogram and its scan are held exact.
 //! The NAX sorted gather (prefill; NAX GPUs only, no pre-NAX skip) replaces MLX's sorted gather_qmm bit for bit at
-//! one shape per plan, its mapped arm the row take first, its paired arm also MLX's SwiGLU; its tile scan is held
-//! exact. A mapped launch under 8 routed rows does not compile (MLX binds the row map in `constant`); the wrapper
+//! one shape per plan, its mapped arm the row take first, its paired arm also MLX's SwiGLU; its routed epilogue
+//! (deepseek_v41's moe_act, whose bits the plugin's tests prove) is held to float64 over MLX's gathers; its tile scan is
+//! held exact. A mapped launch under 8 routed rows does not compile (MLX binds the row map in `constant`); the wrapper
 //! takes 16 rows or more, so the registration's mapped rows are tokens of four routed rows.
 //! `ubench_stream_wide` (a read-ceiling probe, not served) is held exact as integers.
-//! Known issues: e4m3_nan_code (the NVFP4 kernels whose x feeds every output), act2_drops_nan, limit_drops_nan.
+//! Known issues: routed_nan (the routed epilogue's clamp).
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const ops = @import("../../../mlx/ops.zig");
+const env = @import("../../../env.zig");
 const kc = @import("../../testing/kernel_contract/root.zig");
 const gq = @import("gather_qmv.zig");
 const gqr = @import("gather_qmv_rows.zig");
@@ -58,44 +61,35 @@ const Kind = enum { qmv, gateup, gateup_rows, down, down_rows };
 
 const aff_in = [_][*:0]const u8{ "x", "w_q", "scales", "biases", "inds", "K_size", "N_size" };
 const nv_in = [_][*:0]const u8{ "x", "w_q", "scales", "inds", "K_size", "N_size" };
-const gu_aff_in = [_][*:0]const u8{ "x", "wg_q", "g_scales", "g_biases", "wu_q", "u_scales", "u_biases", "inds", "sigtab", "K_size", "N_size" };
-const gu_nv_in = [_][*:0]const u8{ "x", "wg_q", "g_scales", "wu_q", "u_scales", "inds", "sigtab", "K_size", "N_size" };
-const gur_nv_in = gu_nv_in ++ [_][*:0]const u8{"gsc"};
 const dr_aff_in = [_][*:0]const u8{ "x", "w_q", "scales", "biases", "inds", "scores", "K_size", "N_size" };
 const dr_nv_in = [_][*:0]const u8{ "x", "w_q", "scales", "inds", "scores", "K_size", "N_size" };
 
-fn header(nv: bool) [:0]const u8 {
-    return if (nv) gq.GQMV_NVFP4_HEADER else gq.GQMV_AFFINE_HEADER;
+fn dequantOf(f: Fmt) gq.Dequant {
+    return if (f == .affine) .affine else .fp4;
 }
 
-/// Indexed [nvfp4][x per expert].
+/// Indexed [Dequant][x per expert].
 const qmv_launches = [2][2]metal.Launch{
     .{
-        .{ .name = "mlxserve_moe_gather_qmv", .inputs = &aff_in, .outputs = &.{"y"}, .source = gq.GQMV_SOURCES[0][0], .header = header(false), .tg_bytes = 0, .m1 = 928, .m2 = 928 },
-        .{ .name = "mlxserve_moe_gather_qmv_px", .inputs = &aff_in, .outputs = &.{"y"}, .source = gq.GQMV_SOURCES[0][1], .header = header(false), .tg_bytes = 0, .m1 = 928, .m2 = 928 },
+        .{ .name = "mlxserve_moe_gather_qmv", .inputs = &aff_in, .outputs = &.{"y"}, .source = gq.GQMV_SOURCES[0][0], .header = gq.header(.affine), .tg_bytes = 0, .m1 = 928, .m2 = 928 },
+        .{ .name = "mlxserve_moe_gather_qmv_px", .inputs = &aff_in, .outputs = &.{"y"}, .source = gq.GQMV_SOURCES[0][1], .header = gq.header(.affine), .tg_bytes = 0, .m1 = 928, .m2 = 928 },
     },
     .{
-        .{ .name = "mlxserve_moe_gather_qmv_nvfp4", .inputs = &nv_in, .outputs = &.{"y"}, .source = gq.GQMV_SOURCES[1][0], .header = header(true), .tg_bytes = 0, .m1 = 1024, .m2 = 1024 },
-        .{ .name = "mlxserve_moe_gather_qmv_nvfp4_px", .inputs = &nv_in, .outputs = &.{"y"}, .source = gq.GQMV_SOURCES[1][1], .header = header(true), .tg_bytes = 0, .m1 = 928, .m2 = 928 },
+        .{ .name = "mlxserve_moe_gather_qmv_fp4", .inputs = &nv_in, .outputs = &.{"y"}, .source = gq.GQMV_SOURCES[1][0], .header = gq.header(.fp4), .tg_bytes = 0, .m1 = 1024, .m2 = 1024 },
+        .{ .name = "mlxserve_moe_gather_qmv_fp4_px", .inputs = &nv_in, .outputs = &.{"y"}, .source = gq.GQMV_SOURCES[1][1], .header = gq.header(.fp4), .tg_bytes = 0, .m1 = 928, .m2 = 928 },
     },
 };
+/// One gate+up+SwiGLU kernel for one row and for 2..8 (ONE_ROW), indexed by `Dequant`.
 const gateup_launches = [2]metal.Launch{
-    .{ .name = "mlxserve_moe_gather_qmv_gateup", .inputs = &gu_aff_in, .outputs = &.{"y"}, .source = gq.GQMV_GATEUP_SOURCES[0], .header = header(false), .tg_bytes = 0, .m1 = 576, .m2 = 576 },
-    .{ .name = "mlxserve_moe_gather_qmv_gateup_nvfp4", .inputs = &gu_nv_in, .outputs = &.{"y"}, .source = gq.GQMV_GATEUP_SOURCES[1], .header = header(true), .tg_bytes = 0, .m1 = 512, .m2 = 512 },
-};
-const gateup_rows_launches = [2]metal.Launch{
-    .{ .name = "mlxserve_moe_gather_qmv_gateup_rows", .inputs = &gu_aff_in, .outputs = &.{"y"}, .source = gqr.GQMV_GATEUP_ROWS_SOURCES[0], .header = header(false), .tg_bytes = 0, .m1 = 576, .m2 = 576 },
-    .{ .name = "mlxserve_moe_gather_qmv_gateup_rows_nvfp4", .inputs = &gur_nv_in, .outputs = &.{"y"}, .source = gqr.GQMV_GATEUP_ROWS_SOURCES[1], .header = header(true), .tg_bytes = 0, .m1 = 928, .m2 = 928 },
+    .{ .name = gq.GQMV_GATEUP_NAMES[0], .inputs = &gq.GQMV_GATEUP_INPUTS_AFFINE, .outputs = &.{"y"}, .source = gq.GQMV_GATEUP_SOURCES[0], .header = gq.header(.affine), .tg_bytes = 0, .m1 = 576, .m2 = 576 },
+    .{ .name = gq.GQMV_GATEUP_NAMES[1], .inputs = &gq.GQMV_GATEUP_INPUTS_FP4, .outputs = &.{"y"}, .source = gq.GQMV_GATEUP_SOURCES[1], .header = gq.header(.fp4), .tg_bytes = 0, .m1 = 512, .m2 = 512 },
 };
 /// `slot_vals[TOPK * ROWS]` T: 32 slots of 4 rows at most.
 const down_tg: u32 = 32 * 4 * 2;
+/// One down+reduce kernel for one row and for 2..8 (ONE_ROW), indexed by `Dequant`.
 const down_launches = [2]metal.Launch{
-    .{ .name = "mlxserve_moe_gather_qmv_downred", .inputs = &dr_aff_in, .outputs = &.{"y"}, .source = dr.GQMV_DOWNRED_SOURCES[0], .header = header(false), .tg_bytes = down_tg, .m1 = 512, .m2 = 512 },
-    .{ .name = "mlxserve_moe_gather_qmv_downred_nvfp4", .inputs = &dr_nv_in, .outputs = &.{"y"}, .source = dr.GQMV_DOWNRED_SOURCES[1], .header = header(true), .tg_bytes = down_tg, .m1 = 512, .m2 = 512 },
-};
-const down_rows_launches = [2]metal.Launch{
-    .{ .name = "mlxserve_moe_gather_qmv_downred_rows", .inputs = &dr_aff_in, .outputs = &.{"y"}, .source = dr.GQMV_DOWNRED_ROWS_SOURCES[0], .header = header(false), .tg_bytes = down_tg, .m1 = 512, .m2 = 512 },
-    .{ .name = "mlxserve_moe_gather_qmv_downred_rows_nvfp4", .inputs = &dr_nv_in, .outputs = &.{"y"}, .source = dr.GQMV_DOWNRED_ROWS_SOURCES[1], .header = header(true), .tg_bytes = down_tg, .m1 = 512, .m2 = 512 },
+    .{ .name = dr.GQMV_DOWNRED_NAMES[0], .inputs = &dr_aff_in, .outputs = &.{"y"}, .source = dr.GQMV_DOWNRED_SOURCES[0], .header = gq.header(.affine), .tg_bytes = down_tg, .m1 = 512, .m2 = 512 },
+    .{ .name = dr.GQMV_DOWNRED_NAMES[1], .inputs = &dr_nv_in, .outputs = &.{"y"}, .source = dr.GQMV_DOWNRED_SOURCES[1], .header = gq.header(.fp4), .tg_bytes = down_tg, .m1 = 512, .m2 = 512 },
 };
 
 /// An expert bank [E, N, K] as its checkpoint stores it: affine (MLX's quantize), NVFP4 (e2m1 nibbles, one e4m3 scale
@@ -152,7 +146,7 @@ const Bank = struct {
         for (b.scf, b.sc) |*o, s| o.* = @floatFromInt(s);
     }
 
-    /// Element (r, i) dequantized as MLX reads the format (an e4m3 code 0x7f / 0xff is NaN).
+    /// Element (r, i) dequantized as MLX reads the format (an e4m3 code 0x7f / 0xff, an e8m0 code 0xff is NaN).
     fn w(b: *const Bank, r: usize, i: usize) f64 {
         const at = r * b.aff.k + i;
         if (b.fmt == .affine) {
@@ -160,7 +154,7 @@ const Bank = struct {
             return @as(f64, @floatFromInt(b.aff.codes[at])) * b.aff.scales[g] + b.aff.biases[g];
         }
         const s = b.sc[at / b.aff.gs];
-        if (b.fmt == .mxfp4) return host.e2m1(b.codes[at]) * host.e8m0(s);
+        if (b.fmt == .mxfp4) return if (s == 0xff) std.math.nan(f64) else host.e2m1(b.codes[at]) * host.e8m0(s);
         if (s & 0x7f == 0x7f) return std.math.nan(f64);
         return host.e2m1(b.codes[at]) * host.e4m3(s);
     }
@@ -241,6 +235,7 @@ const Gather = struct {
     act2: bool = false,
     limit: u32 = 0,
     gscale: bool = false,
+    uscale: bool = false,
     lpr: usize = 8,
     /// Experts in the bank.
     ne: usize = E,
@@ -251,11 +246,12 @@ const Gather = struct {
     inds: []f64 = &.{},
     scores: []f64 = &.{},
     gsc: []f64 = &.{},
+    usc: []f64 = &.{},
     table: []f64 = &.{},
     /// Exact dot products [bank][slot * N + n] and their magnitudes, computed once a prepare.
     dv: []f64 = &.{},
     dm: []f64 = &.{},
-    args: [12]mlx.mlx_array = undefined,
+    args: [14]mlx.mlx_array = undefined,
     n_args: usize = 0,
     msg: [256]u8 = undefined,
     /// The rows down+reduce's baseline: the solo kernel's launches and their bytes.
@@ -263,13 +259,11 @@ const Gather = struct {
     base_bytes: std.ArrayList(u8) = .empty,
 
     fn init(a: std.mem.Allocator, kind: Kind, f: Fmt, b: u32, g: usize) Gather {
-        const nv = f == .nvfp4;
+        const di: usize = @intFromEnum(dequantOf(f));
         const l: *const metal.Launch = switch (kind) {
-            .qmv => &qmv_launches[@intFromBool(nv)][0],
-            .gateup => &gateup_launches[@intFromBool(nv)],
-            .gateup_rows => &gateup_rows_launches[@intFromBool(nv)],
-            .down => &down_launches[@intFromBool(nv)],
-            .down_rows => &down_rows_launches[@intFromBool(nv)],
+            .qmv => &qmv_launches[di][0],
+            .gateup, .gateup_rows => &gateup_launches[di],
+            .down, .down_rows => &down_launches[di],
         };
         return .{ .rig = metal.Rig.init(a), .base = metal.Rig.init(a), .launch = l, .kind = kind, .banks = .{ Bank.init(f, b, g), Bank.init(f, b, g) } };
     }
@@ -280,7 +274,7 @@ const Gather = struct {
         self.base.deinit();
         self.base_bytes.deinit(a);
         for (&self.banks) |*b| b.deinit(a);
-        for ([_][]f64{ self.x, self.inds, self.scores, self.gsc, self.table, self.dv, self.dm }) |s| a.free(s);
+        for ([_][]f64{ self.x, self.inds, self.scores, self.gsc, self.usc, self.table, self.dv, self.dm }) |s| a.free(s);
     }
 
     fn fmt(self: *const Gather) Fmt {
@@ -349,14 +343,13 @@ const Gather = struct {
                 g.int("BITS", self.bits());
                 switch (self.kind) {
                     .qmv => g.flag("ACT2", self.act2),
-                    .gateup => {
-                        g.int("KP", kp);
-                        g.int("LIMIT", self.limit);
-                    },
                     else => {
                         g.int("KP", kp);
-                        g.int("TOPK", TOPK);
-                        if (self.fmt() == .nvfp4) g.int("GSCALE", @intFromBool(self.gscale));
+                        g.int("TOPK", if (self.kind == .gateup) shape.rows else TOPK);
+                        g.flag("ONE_ROW", self.kind == .gateup);
+                        g.int("LIMIT", self.limit);
+                        g.int("GSCALE", @intFromBool(self.gscale));
+                        g.int("USCALE", @intFromBool(self.uscale));
                     },
                 }
             },
@@ -376,6 +369,7 @@ const Gather = struct {
                 g.int("ROWS", rows);
                 g.int("LPR", self.lpr);
                 g.int("KP", kp);
+                g.flag("ONE_ROW", self.kind == .down);
             },
         }
         return g;
@@ -385,7 +379,7 @@ const Gather = struct {
         if (self.geometry(shape) == null) return false;
         const a = self.rig.a;
         self.shape = shape;
-        for ([_]*[]f64{ &self.x, &self.inds, &self.scores, &self.gsc, &self.dv, &self.dm }) |p| {
+        for ([_]*[]f64{ &self.x, &self.inds, &self.scores, &self.gsc, &self.usc, &self.dv, &self.dm }) |p| {
             a.free(p.*);
             p.* = &.{};
         }
@@ -411,6 +405,8 @@ const Gather = struct {
         for (self.scores) |*s| s.* = if (stress) 1 else host.rt(self.dt, 0.05 + 0.25 * rng.float(f64));
         self.gsc = try a.alloc(f64, self.ne);
         for (self.gsc) |*s| s.* = if (stress) 1 else host.rt(self.dt, 0.5 + 1.5 * rng.float(f64));
+        self.usc = try a.alloc(f64, self.ne);
+        for (self.usc) |*s| s.* = if (stress) 1 else host.rt(self.dt, 0.5 + 1.5 * rng.float(f64));
         if (fill == .nonfinite) self.plant(k);
         try self.bind();
         return true;
@@ -436,9 +432,11 @@ const Gather = struct {
         const b = &self.banks[0];
         const n = self.shape.n;
         const row = [3]usize{ @as(usize, @intFromFloat(self.inds[0])) * n + 1, @as(usize, @intFromFloat(self.inds[1])) * n + 2, @as(usize, @intFromFloat(self.inds[2])) * n + 3 };
-        if (b.fmt == .nvfp4) {
-            b.sc[row[0] * k / 16] = 0x7f;
-            b.scf[row[0] * k / 16] = 0x7f;
+        if (b.fmt != .affine) {
+            // The format's NaN code: e4m3 0x7f, e8m0 0xff.
+            const code: u8 = if (b.fmt == .nvfp4) 0x7f else 0xff;
+            b.sc[row[0] * k / b.aff.gs] = code;
+            b.scf[row[0] * k / b.aff.gs] = @floatFromInt(code);
             return;
         }
         const groups = k / b.aff.gs;
@@ -447,7 +445,7 @@ const Gather = struct {
         b.aff.biases[row[2] * groups] = -inf;
     }
 
-    const Args = struct { x: mlx.mlx_array, b: [2][3]mlx.mlx_array, inds: mlx.mlx_array, sig: mlx.mlx_array, scores: mlx.mlx_array, gsc: mlx.mlx_array, kk: mlx.mlx_array, nn: mlx.mlx_array };
+    const Args = struct { x: mlx.mlx_array, b: [2][3]mlx.mlx_array, inds: mlx.mlx_array, sig: mlx.mlx_array, scores: mlx.mlx_array, gsc: mlx.mlx_array, usc: mlx.mlx_array, kk: mlx.mlx_array, nn: mlx.mlx_array };
 
     fn bind(self: *Gather) !void {
         const rig = &self.rig;
@@ -469,9 +467,10 @@ const Gather = struct {
         if (self.twoBanks()) h.sig = try rig.input(self.dt, &.{65536}, self.table);
         if (self.kind == .down or self.kind == .down_rows) h.scores = try rig.input(self.dt, if (self.rowsKind()) &.{ @intCast(self.shape.rows), @intCast(TOPK) } else &.{ns}, self.scores);
         if (self.gscale) h.gsc = try rig.input(self.dt, &.{@intCast(self.ne)}, self.gsc);
+        if (self.uscale) h.usc = try rig.input(self.dt, &.{@intCast(self.ne)}, self.usc);
         h.kk = try rig.input(.int32, &.{}, &.{@floatFromInt(self.shape.k)});
         h.nn = try rig.input(.int32, &.{}, &.{@floatFromInt(n)});
-        const nv = self.fmt() == .nvfp4;
+        const nv = self.fmt() != .affine;
         var list: std.ArrayList(mlx.mlx_array) = .initBuffer(&self.args);
         list.appendAssumeCapacity(h.x);
         switch (self.kind) {
@@ -489,8 +488,11 @@ const Gather = struct {
         }
         list.appendAssumeCapacity(h.kk);
         list.appendAssumeCapacity(h.nn);
-        // Without a gate scale the rows kernel never reads `gsc`; any array binds, as in the wrapper.
-        if (self.kind == .gateup_rows and nv) list.appendAssumeCapacity(if (self.gscale) h.gsc else h.sig);
+        // An absent scale is never read; any array binds, as in the wrapper.
+        if (self.twoBanks()) {
+            list.appendAssumeCapacity(if (self.gscale) h.gsc else h.sig);
+            list.appendAssumeCapacity(if (self.uscale) h.usc else h.sig);
+        }
         self.n_args = list.items.len;
     }
 
@@ -562,6 +564,7 @@ const Gather = struct {
                 var gt = host.rt(dt, dv[at]);
                 var u = host.rt(dt, dv[sn + at]);
                 if (self.gscale) gt = host.rt(dt, gt * self.gsc[self.expert(s)]);
+                if (self.uscale) u = host.rt(dt, u * self.usc[self.expert(s)]);
                 if (self.limit > 0) {
                     const lim: f64 = @floatFromInt(self.limit);
                     gt = clampNaN(gt, -std.math.inf(f64), lim);
@@ -639,13 +642,13 @@ const Gather = struct {
     }
 
     fn bankArgs(self: *const Gather, bi: usize) [3]mlx.mlx_array {
-        const nv = self.fmt() == .nvfp4;
+        const nv = self.fmt() != .affine;
         const base: usize = 1 + bi * @as(usize, if (nv) 2 else 3);
         return .{ self.args[base], self.args[base + 1], if (nv) .{ .ctx = null } else self.args[base + 2] };
     }
 
     fn indsArg(self: *const Gather) mlx.mlx_array {
-        const nv = self.fmt() == .nvfp4;
+        const nv = self.fmt() != .affine;
         const per: usize = if (nv) 2 else 3;
         return self.args[1 + per * @as(usize, if (self.twoBanks()) 2 else 1)];
     }
@@ -676,11 +679,11 @@ const Gather = struct {
                 var list: [8]mlx.mlx_array = undefined;
                 var len: usize = 0;
                 for ([_]mlx.mlx_array{ try g.reshape(xr, &.{ topk, @intCast(self.shape.k) }), b[0], b[1], b[2], ir, sc, self.args[self.n_args - 2], self.args[self.n_args - 1] }, 0..) |v, i| {
-                    if (i == 3 and self.fmt() == .nvfp4) continue;
+                    if (i == 3 and self.fmt() != .affine) continue;
                     list[len] = v;
                     len += 1;
                 }
-                try self.base.launch(&down_launches[@intFromBool(self.fmt() == .nvfp4)], solo.geometry(solo.shape).?, list[0..len]);
+                try self.base.launch(&down_launches[@intFromEnum(dequantOf(self.fmt()))], solo.geometry(solo.shape).?, list[0..len]);
                 try self.base_bytes.appendSlice(self.rig.a, self.base.outputBytes());
                 continue;
             }
@@ -689,10 +692,12 @@ const Gather = struct {
                 const b = self.bankArgs(bi);
                 p.* = try g.adopt((try gq.gatherQmv(s, xr, b[0], b[1], b[2], ir, self.bits(), @intCast(self.gs()), self.mode(), false)) orelse return error.Declined);
             }
-            if (self.gscale) {
-                const per = try g.reshape(try g.take(self.args[self.n_args - 1], ir, 0), &.{ topk, 1 });
-                pair[0] = try g.mul(pair[0], per);
-            }
+            // Each expert's scale as the split path multiplies it: gate before the SiLU, up before the clamp.
+            const per_row: c_int = @intCast(if (self.rowsKind()) TOPK else self.shape.rows);
+            for ([_]bool{ self.gscale, self.uscale }, 0..) |on, i| if (on) {
+                const per = try g.reshape(try g.take(self.args[self.n_args - 2 + i], ir, 0), &.{ per_row, 1 });
+                pair[i] = try g.mul(pair[i], per);
+            };
             outs[r] = if (self.limit > 0)
                 try g.adopt(try activations.clampedSwiGLU(s, pair[0], pair[1], @floatFromInt(self.limit)))
             else
@@ -710,15 +715,20 @@ const Gather = struct {
         const b0 = self.bankArgs(0);
         const nb = self.bits();
         const gsz: u32 = @intCast(self.gs());
+        const sc: gq.Scales = .{
+            .gate = if (self.gscale) self.args[self.n_args - 2] else null,
+            .up = if (self.uscale) self.args[self.n_args - 1] else null,
+            .clamp = self.limit,
+        };
         const y = switch (self.kind) {
             .qmv => try gq.gatherQmvAct(s, x, b0[0], b0[1], b0[2], inds, nb, gsz, self.mode(), self.px, self.act2),
             .gateup => blk: {
                 const b1 = self.bankArgs(1);
-                break :blk try gq.gatherQmvGateUp(s, x, b0[0], b0[1], b0[2], b1[0], b1[1], b1[2], inds, nb, gsz, self.mode(), self.limit);
+                break :blk try gq.gatherQmvGateUpScaled(s, x, b0[0], b0[1], b0[2], b1[0], b1[1], b1[2], inds, nb, gsz, self.mode(), sc);
             },
             .gateup_rows => blk: {
                 const b1 = self.bankArgs(1);
-                break :blk try gqr.gatherQmvGateUpRows(s, x, b0[0], b0[1], b0[2], b1[0], b1[1], b1[2], inds, nb, gsz, self.mode(), if (self.gscale) self.args[self.n_args - 1] else null);
+                break :blk try gqr.gatherQmvGateUpRowsScaled(s, x, b0[0], b0[1], b0[2], b1[0], b1[1], b1[2], inds, nb, gsz, self.mode(), sc);
             },
             .down => try dr.gatherQmvDownReduce(s, x, b0[0], b0[1], b0[2], inds, self.args[self.n_args - 3], nb, gsz, self.mode()),
             .down_rows => try dr.gatherQmvDownReduceRows(s, x, b0[0], b0[1], b0[2], inds, self.args[self.n_args - 3], nb, gsz, self.mode()),
@@ -731,10 +741,6 @@ const Gather = struct {
 fn depthK(shape: Shape) usize {
     return shape.k + 4; // a row's sum, behind the dequant (q * s + b) and the product
 }
-
-const e4m3_nan_code: spec.Known = .{ .gate = .nonfinite, .finding = "an NVFP4 scale decodes by bit placement, so e4m3's NaN code 0x7f reads as 480 where MLX's fp8_e4m3 gives NaN; with one x for every output, a NaN code is the only non-finite input that leaves some outputs finite, and it comes out finite" };
-const act2_drops_nan: spec.Known = .{ .gate = .nonfinite, .finding = "ReLU^2 runs metal::max(o, 0), which returns 0 for a NaN, where MLX's maximum (the chain it stands for) keeps the NaN: a NaN sum gives 0" };
-const limit_drops_nan: spec.Known = .{ .gate = .nonfinite, .finding = "metal::min / max return the other operand for a NaN, where MLX's Minimum and Clip (the clampedSwiGLU chain it replaces) keep the NaN: a NaN gate or up gives a finite output" };
 
 fn gatherSpec(comptime name: []const u8, g: Gather, served: []const Shape, replaces: ?[]const u8, known: ?spec.Known) spec.Spec {
     const vpw: usize = @intCast(@divExact(@as(c_int, 32 * 8), gq.affineQmvPackUnits(32 * 8, g.bits())));
@@ -765,7 +771,7 @@ fn add(set: *kc.Set, g0: Gather, comptime name: []const u8, served: []const Shap
 
 const fp4_gateup_in = [_][*:0]const u8{ "x", "wg_q", "g_scales", "wu_q", "u_scales", "inds", "sigtab", "gsc", "usc" };
 const fp4_downred_in = [_][*:0]const u8{ "act", "wd_q", "d_scales", "inds", "scores", "sdown", "glog" };
-const fp4_headers = [2][:0]const u8{ moe_fp4.E2M1_HEADER ++ moe_fp4.NV_SCALE ++ moe_fp4.DOT16, moe_fp4.E2M1_HEADER ++ moe_fp4.MX_SCALE ++ moe_fp4.DOT16 };
+const fp4_headers = [2][:0]const u8{ moe_fp4.HEADER, moe_fp4.HEADER };
 /// Indexed [part][nv, mx].
 const fp4_launches = [2][2]metal.Launch{
     .{
@@ -2144,10 +2150,10 @@ fn registerVerify(set: *kc.Set) !void {
 const ksrc = @import("../../../mlx/kernels.zig").source;
 const gqn = @import("gather_qmm_nax.zig");
 const hc_prefill = @import("../hc/hc_prefill.zig");
-const nax_header = ksrc("kernels/moe/gather_qmm_nax_header.metal");
+const nax_header = gqn.NAX_HEADER;
 const nax_mapped_header = nax_header ++ ksrc("kernels/moe/gather_qmm_nax_mapped_header.metal");
 const nax_mm_in = [_][*:0]const u8{ "x", "w", "scales", "biases", "tiles", "tile_count", "params" };
-const nax_map_in = [_][*:0]const u8{ "x", "w", "scales", "biases", "up_w", "up_scales", "up_biases", "tiles", "tile_count", "params", "sigtab", "rmap", "row_wt" };
+const nax_map_in = [_][*:0]const u8{ "x", "w", "scales", "biases", "up_w", "up_scales", "up_biases", "tiles", "tile_count", "params", "sigtab", "rmap", "gsc", "usc", "rw", "row_wt" };
 
 /// `Ws` at the largest plan: seg 128 x 128, one 64 x (128 + 8) bf16 tile and its 8 KiB pad.
 const nax_tg: u32 = 64 * 136 * 2 + 8192;
@@ -2158,6 +2164,13 @@ const nax_launches = [3]metal.Launch{
     .{ .name = "msv_gqmm_affine_map", .inputs = &nax_map_in, .outputs = &.{"y"}, .source = ksrc("kernels/moe/gather_qmm_nax_mapped.metal"), .header = nax_mapped_header, .tg_bytes = nax_tg, .m1 = 1024, .m2 = 1024, .offline = false, .min_gen = 17 },
     .{ .name = "msv_gqmm_affine_pair", .inputs = &nax_map_in, .outputs = &.{"y"}, .source = ksrc("kernels/moe/gather_qmm_nax_mapped.metal"), .header = nax_mapped_header, .tg_bytes = nax_tg, .m1 = 1024, .m2 = 1024, .offline = false, .min_gen = 17 },
 };
+/// The staged schedule's threadgroup arrays at its largest tile: one 64 x (64 + 8) bf16 weight buffer and 128 x (64 + 8)
+/// bf16 activations (the register-prefetch tiles hold two weight buffers, 18 KiB).
+const staged_launch = metal.Launch{ .name = "msv_gqmm_staged", .inputs = &gqn.STAGED_INPUTS, .outputs = &.{"y"}, .source = gqn.STAGED_SOURCE, .header = gqn.STAGED_HEADER, .tg_bytes = 64 * 72 * 2 + 128 * 72 * 2, .m1 = 1024, .m2 = 1024, .offline = false, .min_gen = 17 };
+/// The staged plain tile with its rows scattered to their pairs' slots (`gqn.sortedGatherPromptStagedTok`, deepseek_v41's
+/// `MLX_SERVE_DSV41_PF_DOWN_TOKORD`), at the release's 6 picks a token.
+const SCAT_K = 6;
+const staged_scat_launch = metal.Launch{ .name = "msv_gqmm_staged_scat", .inputs = &gqn.STAGED_SCAT_INPUTS, .outputs = &.{"y"}, .source = gqn.STAGED_SOURCE, .header = gqn.stagedScatHeader(SCAT_K), .tg_bytes = 64 * 72 * 2 + 128 * 72 * 2, .m1 = 1024, .m2 = 1024, .offline = false, .min_gen = 17 };
 
 /// Sorted ragged expert runs over `ne` experts: one in sixteen empty, one in eight four times the mean, the
 /// remainder on the last.
@@ -2234,7 +2247,7 @@ const NaxScan = struct {
     }
 
     pub fn geometry(self: *const NaxScan, shape: Shape) ?metal.Geometry {
-        if (shape.rows == 0 or self.ne > 2048 or (shape.n != 64 and shape.n != 96 and shape.n != 128)) return null;
+        if (shape.rows == 0 or self.ne > 2048 or std.mem.indexOfScalar(usize, &.{ 32, 64, 96, 128, 256 }, shape.n) == null) return null;
         var g = metal.Geometry{ .grid = .{ 1024, 1, 1 }, .tg = .{ 1024, 1, 1 } };
         g.out(&.{@intCast(4 * self.maxTiles(shape))}, .uint32);
         g.out(&.{1}, .uint32);
@@ -2301,9 +2314,28 @@ const GqmmNax = struct {
     launch: *const metal.Launch,
     kind: NaxKind,
     ne: usize,
+    /// The staged schedule (`gqn.launchStaged`) at the planner's tile, in place of the seg/db plan.
+    staged: bool = false,
+    /// The staged tile in place of the planner's (`gqn.sortedGateUpRoutedTile`, `gqn.sortedGatherPromptTokTile`).
+    tile: ?gqn.Staged = null,
     limit: u32 = 0,
+    /// The pair's per-expert scales (`gqn.ExpertScales`): bit 0 the gate's, bit 1 the up's, `[ne]` bf16 each.
+    esc: u32 = 0,
+    escv: [2][]f64 = .{ &.{}, &.{} },
+    /// The routed epilogue (`gqn.sortedGateUpRouted`, deepseek_v41's `moe_act`): clamped under `rlim`, times each routed
+    /// row's f32 weight `rwv`.
+    moe_act: bool = false,
+    rlim: f32 = 0,
+    rwv: []f64 = &.{},
     weighted: bool = false,
     banks: [2]Bank,
+    /// The scatter (`initScat`): picks a token; 0 = the sorted output. The shape's rows are tokens, each picking `scat`
+    /// distinct experts (token t's pick j: expert (7 t + 5 j) mod ne); sorted row p (by expert, tokens in order) is
+    /// token `tokr[p]`'s pick, written at row `dest[p]` = t * scat + j; `ridx` the flat picks.
+    scat: usize = 0,
+    tokr: []f64 = &.{},
+    dest: []f64 = &.{},
+    ridx: []f64 = &.{},
     shape: Shape = undefined,
     m: usize = 0,
     x: []f64 = &.{},
@@ -2313,7 +2345,7 @@ const GqmmNax = struct {
     table: []f64 = &.{},
     dv: []f64 = &.{},
     dm: []f64 = &.{},
-    args: [13]mlx.mlx_array = undefined,
+    args: [17]mlx.mlx_array = undefined,
     n_args: usize = 0,
 
     fn init(a: std.mem.Allocator, kind: NaxKind, f: Fmt, b: u32, g: usize, ne: usize) GqmmNax {
@@ -2321,11 +2353,35 @@ const GqmmNax = struct {
         return .{ .rig = metal.Rig.init(a), .launch = &nax_launches[@backingInt(kind)], .kind = kind, .ne = ne, .banks = .{ bank, bank } };
     }
 
+    fn initStaged(a: std.mem.Allocator, kind: NaxKind, f: Fmt, b: u32, g: usize, ne: usize) GqmmNax {
+        var t = init(a, kind, f, b, g, ne);
+        t.launch = &staged_launch;
+        t.staged = true;
+        return t;
+    }
+
+    fn initScat(a: std.mem.Allocator, f: Fmt, b: u32, g: usize, ne: usize) GqmmNax {
+        var t = initStaged(a, .mm, f, b, g, ne);
+        t.launch = &staged_scat_launch;
+        t.scat = SCAT_K;
+        return t;
+    }
+
     pub fn deinit(self: *GqmmNax) void {
         const a = self.rig.a;
         self.rig.deinit();
         for (&self.banks) |*b| b.deinit(a);
-        for ([_][]f64{ self.x, self.rmap, self.row_wt, self.ids, self.table, self.dv, self.dm }) |s| a.free(s);
+        for ([_][]f64{ self.x, self.rmap, self.ids, self.table, self.dv, self.dm, self.escv[0], self.escv[1], self.rwv, self.row_wt, self.tokr, self.dest, self.ridx }) |s| a.free(s);
+    }
+
+    /// The sorted rows' values `src` (`m` rows of n) at their output rows: the scatter's slots, else in order.
+    fn place(self: *const GqmmNax, src: []const f64, dst: []f64) void {
+        if (self.scat == 0) return @memcpy(dst, src[0..dst.len]);
+        const n = self.shape.n;
+        for (0..self.m) |r| {
+            const o: usize = @intFromFloat(self.dest[r]);
+            @memcpy(dst[o * n ..][0..n], src[r * n ..][0..n]);
+        }
     }
 
     fn mx(self: *const GqmmNax) bool {
@@ -2336,8 +2392,10 @@ const GqmmNax = struct {
         return if (self.kind == .paired) 2 else 1;
     }
 
-    /// Routed rows: the shape's rows, or four a token through the row map (a top-4 routing).
+    /// Routed rows: the shape's rows, or four a token through the row map (a top-4 routing), or the scatter's picks a
+    /// token.
     fn routed(self: *const GqmmNax, shape: Shape) usize {
+        if (self.scat > 0) return self.scat * shape.rows;
         return if (self.kind == .mm) shape.rows else 4 * shape.rows;
     }
 
@@ -2345,8 +2403,53 @@ const GqmmNax = struct {
         return gqn.plan(@intCast(self.routed(shape)), @intCast(self.ne), @intCast(shape.k), @intCast(shape.n), self.kind == .paired);
     }
 
+    fn stagedAt(self: *const GqmmNax, shape: Shape) gqn.Staged {
+        return self.tile orelse gqn.stagedPlan(@intCast(self.routed(shape)), @intCast(self.ne));
+    }
+
+    /// The rows a tile holds: what the scan cuts at.
+    fn tileBm(self: *const GqmmNax, shape: Shape) usize {
+        return @intCast(if (self.staged) self.stagedAt(shape).bm else self.planAt(shape).bm);
+    }
+
+    /// The 15-input launches: the mapped and paired ones, and the staged one for every kind.
+    fn wide(self: *const GqmmNax) bool {
+        return self.kind != .mm or self.staged;
+    }
+
+    fn stagedGeometry(self: *const GqmmNax, shape: Shape) ?metal.Geometry {
+        const n: c_int = @intCast(shape.n);
+        const width = if (self.kind == .paired) 2 * n else n;
+        const st = self.stagedAt(shape);
+        if (@rem(width, 64) != 0 or shape.k % 64 != 0 or !self.mx() or @rem(width, st.bn) != 0 or @rem(@as(c_int, @intCast(shape.k)), st.bk) != 0) return null;
+        const mt: c_int = @intCast(naxMaxTiles(self.routed(shape), self.ne, @intCast(st.bm)));
+        const cols = @divExact(width, st.bn);
+        const gx = if (st.gx > 0) st.gx else cols;
+        const gy = if (st.gx > 0) @divTrunc(mt + st.gx - 1, st.gx) * cols else mt;
+        var g = metal.Geometry{ .grid = .{ @intCast(gx * 32), @intCast(gy * st.wn), @intCast(st.wm) }, .tg = .{ 32, @intCast(st.wn), @intCast(st.wm) } };
+        g.out(&.{ @intCast(self.routed(shape)), 1, n }, .bfloat16);
+        g.dtype("T", .bfloat16);
+        g.int("GS", self.banks[0].aff.gs);
+        g.int("BITS", self.banks[0].aff.bits);
+        g.int("MX", @intFromBool(self.mx()));
+        g.int("BM", st.bm);
+        g.int("WM", st.wm);
+        g.int("WN", st.wn);
+        g.int("GX", st.gx);
+        g.int("NW", width);
+        g.int("KD", @as(c_int, @intCast(shape.k)));
+        g.int("EPI", if (self.moe_act) -1 else if (self.kind == .paired) 1 + @as(c_int, @intCast(self.limit)) else 0);
+        g.int("ESC", @as(c_int, @intCast(self.esc)));
+        g.int("AS", @as(c_int, @intFromBool(st.tg_a)));
+        g.int("BN", st.bn);
+        g.int("BK", st.bk);
+        g.flag("MAP", self.kind != .mm);
+        return g;
+    }
+
     pub fn geometry(self: *const GqmmNax, shape: Shape) ?metal.Geometry {
         if (shape.rows == 0 or shape.n % 32 != 0 or shape.k % 32 != 0 or shape.k % self.banks[0].aff.gs != 0) return null;
+        if (self.staged) return self.stagedGeometry(shape);
         const p = self.planAt(shape);
         const mt: c_int = @intCast(naxMaxTiles(self.routed(shape), self.ne, @intCast(p.bm)));
         const n: c_int = @intCast(shape.n);
@@ -2368,7 +2471,8 @@ const GqmmNax = struct {
         g.int("GX", p.gx);
         g.int("PAD", p.pad);
         if (self.kind != .mm) {
-            g.int("EPI", if (self.kind == .paired) 1 + self.limit else 0);
+            g.int("EPI", if (self.moe_act) -1 else if (self.kind == .paired) 1 + @as(c_int, @intCast(self.limit)) else 0);
+            g.int("ESC", @as(c_int, @intCast(self.esc)));
             g.flag("WEIGHTED", self.weighted);
         }
         return g;
@@ -2379,7 +2483,7 @@ const GqmmNax = struct {
         if (self.geometry(shape) == null) return false;
         const a = self.rig.a;
         self.shape = shape;
-        for ([_]*[]f64{ &self.x, &self.rmap, &self.row_wt, &self.ids, &self.dv, &self.dm }) |p| {
+        for ([_]*[]f64{ &self.x, &self.rmap, &self.ids, &self.dv, &self.dm, &self.escv[0], &self.escv[1], &self.rwv, &self.row_wt, &self.tokr, &self.dest, &self.ridx }) |p| {
             a.free(p.*);
             p.* = &.{};
         }
@@ -2390,13 +2494,48 @@ const GqmmNax = struct {
         for (self.banks[0..self.nb()]) |*b| try b.fill(a, rng, self.ne * shape.n, shape.k, .bfloat16, stress);
         self.m = self.routed(shape);
         self.ids = try a.alloc(f64, self.m);
-        raggedIds(self.ids, self.ne);
-        const xr = shape.rows;
+        if (self.scat > 0) {
+            const K = self.scat;
+            const T = shape.rows;
+            if (K > self.ne) return false;
+            self.tokr = try a.alloc(f64, self.m);
+            self.dest = try a.alloc(f64, self.m);
+            self.ridx = try a.alloc(f64, self.m);
+            // The picks (distinct in a token: 5 j mod ne is), then a counting sort by expert, tokens in order.
+            const counts = try a.alloc(usize, self.ne + 1);
+            defer a.free(counts);
+            @memset(counts, 0);
+            for (0..T) |t| for (0..K) |j| {
+                const e = (7 * t + 5 * j) % self.ne;
+                self.ridx[t * K + j] = @floatFromInt(e);
+                counts[e + 1] += 1;
+            };
+            for (1..self.ne + 1) |e| counts[e] += counts[e - 1];
+            for (0..T) |t| for (0..K) |j| {
+                const e: usize = @intFromFloat(self.ridx[t * K + j]);
+                const p = counts[e];
+                counts[e] += 1;
+                self.ids[p] = @floatFromInt(e);
+                self.tokr[p] = @floatFromInt(t);
+                self.dest[p] = @floatFromInt(t * K + j);
+            };
+        } else raggedIds(self.ids, self.ne);
+        // The scatter's x rows are its sorted rows (a plain call over them).
+        const xr = if (self.scat > 0) self.m else shape.rows;
         self.x = try a.alloc(f64, xr * shape.k);
         if (stress) stressX(rng, self.x, shape.k) else host.uniformInto(rng, self.x, -1, 1, .bfloat16);
         if (fill == .nonfinite) plantRows(self.x, shape.k);
         self.rmap = try a.alloc(f64, self.m);
         for (self.rmap, 0..) |*v, i| v.* = @floatFromInt((i * 73 + 11) % xr);
+        // Per-expert scales over two octaves either side of 1, so the rounding after the multiply and the clamp both act.
+        for (&self.escv, 0..) |*v, bit| if (self.esc & (@as(u32, 1) << @intCast(bit)) != 0) {
+            v.* = try a.alloc(f64, self.ne);
+            host.uniformInto(rng, v.*, 0.25, 4.0, .bfloat16);
+        };
+        if (self.moe_act) {
+            self.rwv = try a.alloc(f64, self.m);
+            host.uniformInto(rng, self.rwv, 0.05, 1.05, .float32);
+        }
         if (self.weighted) {
             self.row_wt = try a.alloc(f64, self.m);
             host.uniformInto(rng, self.row_wt, 0.05, 1.5, .float32);
@@ -2413,17 +2552,17 @@ const GqmmNax = struct {
         const rows: c_int = @intCast(self.m);
         // The ids are input 0 of the rig (the wrapper's and the baseline's); the kernel reads them through the tiles.
         _ = try rig.input(.uint32, &.{rows}, self.ids);
-        const p = self.planAt(shape);
-        const mt = naxMaxTiles(self.m, self.ne, @intCast(p.bm));
+        const bm = self.tileBm(shape);
+        const mt = naxMaxTiles(self.m, self.ne, bm);
         const tiles = try a.alloc(u32, 4 * mt);
         defer a.free(tiles);
-        const tc = hostTiles(self.ids, self.ne, @intCast(p.bm), mt, tiles);
+        const tc = hostTiles(self.ids, self.ne, bm, mt, tiles);
         const tf = try a.alloc(f64, tiles.len);
         defer a.free(tf);
         for (tf, tiles) |*o, v| o.* = @floatFromInt(v);
         const t = try rig.input(.uint32, &.{@intCast(tf.len)}, tf);
         const count_ = try rig.input(.uint32, &.{1}, &.{@floatFromInt(tc)});
-        const x = try rig.input(.bfloat16, &.{ @intCast(shape.rows), 1, @intCast(shape.k) }, self.x);
+        const x = try rig.input(.bfloat16, &.{ @intCast(if (self.scat > 0) self.m else shape.rows), 1, @intCast(shape.k) }, self.x);
         var b: [2][3]mlx.mlx_array = undefined;
         for (&b, 0..) |*v, i| v.* = try self.banks[if (i < self.nb()) i else 0].bind(rig, .bfloat16, self.ne, shape.n, shape.k);
         // An FP4 bank has no biases; its slot binds 16 zeros, as the wrapper's does.
@@ -2432,16 +2571,35 @@ const GqmmNax = struct {
             v[2] = try rig.input(.bfloat16, &.{16}, &zeros);
         };
         const width: f64 = @floatFromInt(if (self.kind == .paired) 2 * shape.n else shape.n);
-        const params = try rig.input(.int32, &.{3}, &.{ width, @floatFromInt(shape.k), 0 });
-        if (self.kind == .mm) {
+        // The mapped launches' fourth word: the routed epilogue's limit as f32 bits.
+        const pv = [4]f64{ width, @floatFromInt(shape.k), 0, @floatFromInt(@as(i32, @bitCast(self.rlim))) };
+        const np: usize = if (self.wide()) 4 else 3;
+        const params = try rig.input(.int32, &.{@intCast(np)}, pv[0..np]);
+        if (!self.wide()) {
             self.args[0..7].* = .{ x, b[0][0], b[0][1], b[0][2], t, count_, params };
             self.n_args = 7;
             return;
         }
         const sig = if (self.kind == .paired) try rig.input(.bfloat16, &.{65536}, self.table) else b[0][2];
-        const wt = if (self.weighted) try rig.input(.float32, &.{rows}, self.row_wt) else try rig.input(.float32, &.{16}, &zeros);
-        self.args = .{ x, b[0][0], b[0][1], b[0][2], b[1][0], b[1][1], b[1][2], t, count_, params, sig, try rig.input(.uint32, &.{rows}, self.rmap), wt };
-        self.n_args = 13;
+        // An absent scale binds the sigmoid table (or the bias slot), as the wrapper does; ESC leaves it unread.
+        var sc: [2]mlx.mlx_array = .{ sig, sig };
+        for (&sc, self.escv) |*o, v| if (v.len > 0) {
+            o.* = try rig.input(.bfloat16, &.{@intCast(self.ne)}, v);
+        };
+        // Without the routed epilogue its weights' slot binds 16 f32 zeros, as the wrapper's does.
+        const zeros32: [16]f64 = @splat(0);
+        const rw = if (self.moe_act) try rig.input(.float32, &.{rows}, self.rwv) else try rig.input(.float32, &.{16}, &zeros32);
+        self.args[0..15].* = .{ x, b[0][0], b[0][1], b[0][2], b[1][0], b[1][1], b[1][2], t, count_, params, sig, try rig.input(.uint32, &.{rows}, if (self.scat > 0) self.tokr else self.rmap), sc[0], sc[1], rw };
+        self.n_args = 15;
+        // The scatter: `rmap` carries each sorted row's token, `ridx` the flat picks.
+        if (self.scat > 0) {
+            self.args[15] = try rig.input(.uint32, &.{rows}, self.ridx);
+            self.n_args = 16;
+        } else if (!self.staged) {
+            // The mapped kernels' per-row weights after the staged inputs: unweighted, 16 f32 zeros, as the wrapper's.
+            self.args[15] = if (self.weighted) try rig.input(.float32, &.{rows}, self.row_wt) else try rig.input(.float32, &.{16}, &zeros32);
+            self.n_args = 16;
+        }
     }
 
     pub fn run(self: *GqmmNax) !void {
@@ -2478,15 +2636,31 @@ const GqmmNax = struct {
         };
     }
 
-    /// The bf16 product, or for the pair MLX's SwiGLU on the two rounded products (clamped first under a limit),
-    /// optionally weighted on the rounded activation.
+    /// The bf16 product, or for the pair MLX's SwiGLU on the two rounded products (each first times its expert's
+    /// scale, rounded again, then clamped under a limit), optionally weighted on the rounded activation.
     fn epilogue(self: *const GqmmNax, dv: []const f64, want: []f64) void {
-        if (self.kind != .paired) return @memcpy(want, dv[0..want.len]);
+        if (self.kind != .paired) return self.place(dv, want);
         const cnt = want.len;
         const lim: f64 = @floatFromInt(self.limit);
         for (want, 0..) |*y, i| {
             var g = host.rt(.bfloat16, dv[i]);
             var u = host.rt(.bfloat16, dv[cnt + i]);
+            const e: usize = @intFromFloat(self.ids[i / self.shape.n]);
+            if (self.escv[0].len > 0) g = host.rt(.bfloat16, g * self.escv[0][e]);
+            if (self.escv[1].len > 0) u = host.rt(.bfloat16, u * self.escv[1][e]);
+            if (self.moe_act) {
+                // moe_act: the clamp under the limit, the SwiGLU and the routing weight, unrounded; the kernel's f32
+                // flushes a result under 2^-126 (a subnormal) to a zero of its sign.
+                const rl: f64 = self.rlim;
+                if (rl > 0) {
+                    g = clampNaN(g, -std.math.inf(f64), rl);
+                    u = clampNaN(u, -rl, rl);
+                }
+                const q = @exp(-@abs(g));
+                const v = (if (g < 0) g * q / (1 + q) else g / (1 + q)) * u * self.rwv[i / self.shape.n];
+                y.* = if (@abs(v) < 0x1p-126) std.math.copysign(@as(f64, 0), v) else v;
+                continue;
+            }
             if (self.limit > 0) {
                 g = clampNaN(g, -std.math.inf(f64), lim);
                 u = clampNaN(u, -lim, lim);
@@ -2498,8 +2672,32 @@ const GqmmNax = struct {
 
     pub fn reference(self: *GqmmNax, want: []f64, mag: []f64) !void {
         try self.dots();
+        if (self.moe_act) {
+            const dv = try self.products();
+            defer self.rig.a.free(dv);
+            self.epilogue(dv, want);
+            return @memset(mag, 0);
+        }
         self.epilogue(self.dv, want);
-        if (self.kind == .paired) @memset(mag, 0) else @memcpy(mag, self.dm);
+        if (self.kind == .paired) @memset(mag, 0) else self.place(self.dm, mag);
+    }
+
+    /// The routed epilogue's inputs as the kernel holds them: MLX's gate and up gathers of the mapped rows (the NAX
+    /// gathers' bits), so the bound prices its f32 epilogue alone.
+    fn products(self: *GqmmNax) ![]f64 {
+        const s = self.rig.stream();
+        var g = ops.Graph.init(self.rig.a, s);
+        defer g.deinit();
+        const x = try g.take(self.args[0], self.args[11], 0);
+        const cnt = self.count();
+        const out = try self.rig.a.alloc(f64, 2 * cnt);
+        errdefer self.rig.a.free(out);
+        for (0..2) |bi| {
+            const v = try host.read(self.rig.a, try self.gatherQmm(&g, x, bi), s);
+            defer self.rig.a.free(v);
+            @memcpy(out[bi * cnt ..][0..cnt], v);
+        }
+        return out;
     }
 
     pub fn simulate(self: *GqmmNax, acc: spec.Accum, order: spec.Order, out: []f64) !void {
@@ -2543,16 +2741,55 @@ const GqmmNax = struct {
         var g = ops.Graph.init(self.rig.a, s);
         defer g.deinit();
         const x = if (self.kind == .mm) self.args[0] else try g.take(self.args[0], self.args[11], 0);
-        const gate = try self.gatherQmm(&g, x, 0);
+        var gate = try self.gatherQmm(&g, x, 0);
+        if (self.scat > 0) {
+            // The scatter: output row o is sorted row p where dest[p] = o.
+            const src = try self.rig.a.alloc(u32, self.m);
+            defer self.rig.a.free(src);
+            for (self.dest, 0..) |o, p| src[@intFromFloat(o)] = @intCast(p);
+            const at = try g.adopt(mlx.mlx_array_new_data(src.ptr, &[_]c_int{@intCast(self.m)}, 1, .uint32));
+            return self.rig.bytesOf(&.{try g.take(gate, at, 0)});
+        }
         if (self.kind != .paired) return self.rig.bytesOf(&.{gate});
-        const up = try self.gatherQmm(&g, x, 1);
+        var up = try self.gatherQmm(&g, x, 1);
+        // The split path's `scaleExperts`: each row times its expert's scale.
+        const ids = self.rig.ins.items[0].view;
+        if (self.escv[0].len > 0) gate = try g.mul(gate, try g.reshape(try g.take(self.args[12], ids, 0), &.{ -1, 1, 1 }));
+        if (self.escv[1].len > 0) up = try g.mul(up, try g.reshape(try g.take(self.args[13], ids, 0), &.{ -1, 1, 1 }));
         const swi = if (self.limit > 0)
             try g.adopt(try activations.clampedSwiGLU(s, gate, up, @floatFromInt(self.limit)))
         else
             try g.mul(try g.mul(gate, try g.sigmoid(gate)), up);
         if (!self.weighted) return self.rig.bytesOf(&.{swi});
-        const wt = try g.reshape(self.args[12], &.{ @intCast(self.m), 1, 1 });
+        const wt = try g.reshape(self.args[15], &.{ @intCast(self.m), 1, 1 });
         return self.rig.bytesOf(&.{try g.astype(try g.mul(try g.astype(swi, .float32), wt), .bfloat16)});
+    }
+
+    /// The staged wrappers on the same inputs (their own scan and plan).
+    fn stagedWrapper(self: *GqmmNax) ![]const u8 {
+        const s = self.rig.stream();
+        const ids = self.rig.ins.items[0].view;
+        const x = self.args;
+        const bits = self.banks[0].aff.bits;
+        const group: u32 = @intCast(self.banks[0].aff.gs);
+        var g = ops.Graph.init(self.rig.a, s);
+        defer g.deinit();
+        const y = switch (self.kind) {
+            .mm => if (self.scat > 0)
+                try gqn.sortedGatherPromptTokTile(x[0], x[1], x[2], .{ .ctx = null }, ids, x[11], x[15], @intCast(self.scat), bits, group, self.mx(), true, self.tile, s)
+            else if (self.tile != null)
+                return error.Unregistered
+            else
+                try gqn.sortedGatherPromptStaged(x[0], x[1], x[2], .{ .ctx = null }, ids, bits, group, self.mx(), true, s),
+            .mapped => return error.Unregistered,
+            // One bank of each expert's gate rows, then its up rows, as the routed wrapper reads.
+            .paired => try gqn.sortedGateUpRoutedTile(x[0], x[11], try g.concat(&.{ x[1], x[4] }, 1), try g.concat(&.{ x[2], x[5] }, 1), .{ .ctx = null }, ids, x[14], self.rlim, .{
+                .gate = if (self.escv[0].len > 0) x[12] else null,
+                .up = if (self.escv[1].len > 0) x[13] else null,
+            }, bits, group, self.mx(), true, self.tile, s),
+        } orelse return error.Declined;
+        defer _ = mlx.mlx_array_free(y);
+        return self.rig.bytesOf(&.{y});
     }
 
     /// The shipped wrapper on the same inputs (its own scan, plan and canaries).
@@ -2565,13 +2802,26 @@ const GqmmNax = struct {
         const up_bias = if (self.mx()) none else x[6];
         const bits = self.banks[0].aff.bits;
         const group: u32 = @intCast(self.banks[0].aff.gs);
+        if (self.staged) return self.stagedWrapper();
         const y = switch (self.kind) {
             .mm => try gqn.sortedGather(x[0], x[1], x[2], bias, ids, bits, group, self.mx(), true, s),
             .mapped => try gqn.sortedGatherMapped(x[0], x[11], x[1], x[2], bias, ids, bits, group, self.mx(), true, s),
-            .paired => if (self.weighted)
-                try gqn.sortedGateUpWeighted(x[0], x[11], x[1], x[2], bias, x[4], x[5], up_bias, ids, x[10], x[12], self.limit, bits, group, self.mx(), true, s)
-            else
-                try gqn.sortedGateUp(x[0], x[11], x[1], x[2], bias, x[4], x[5], up_bias, ids, x[10], self.limit, bits, group, self.mx(), true, s),
+            .paired => if (self.moe_act) blk: {
+                // The routed wrapper reads one bank of each expert's gate rows, then its up rows.
+                var g = ops.Graph.init(self.rig.a, s);
+                defer g.deinit();
+                const w = try g.concat(&.{ x[1], x[4] }, 1);
+                const sc = try g.concat(&.{ x[2], x[5] }, 1);
+                break :blk try gqn.sortedGateUpRouted(x[0], x[11], w, sc, none, ids, x[14], self.rlim, .{
+                    .gate = if (self.escv[0].len > 0) x[12] else null,
+                    .up = if (self.escv[1].len > 0) x[13] else null,
+                }, bits, group, self.mx(), true, s);
+            } else if (self.weighted)
+                try gqn.sortedGateUpWeighted(x[0], x[11], x[1], x[2], bias, x[4], x[5], up_bias, ids, x[10], x[15], self.limit, bits, group, self.mx(), true, s)
+            else try gqn.sortedGateUpScaled(x[0], x[11], x[1], x[2], bias, x[4], x[5], if (self.mx()) none else x[6], ids, x[10], self.limit, .{
+                .gate = if (self.escv[0].len > 0) x[12] else null,
+                .up = if (self.escv[1].len > 0) x[13] else null,
+            }, bits, group, self.mx(), true, s),
         } orelse return error.Declined;
         defer _ = mlx.mlx_array_free(y);
         return self.rig.bytesOf(&.{y});
@@ -2585,8 +2835,8 @@ fn registerNax(set: *kc.Set) !void {
     // One shape per plan at 32 experts: db 64 (under 36 rows an expert), db 96 with 32 column groups (K under
     // 1024, 120+ rows an expert), db 64 with 32 groups (K 1024, under 48), seg 64 (N off the 64-column grid).
     const plans: []const Shape = &.{ .{ .rows = 1024, .n = 128, .k = 256 }, .{ .rows = 4096, .n = 128, .k = 512 }, .{ .rows = 1280, .n = 128, .k = 1024 }, .{ .rows = 2048, .n = 96, .k = 256 } };
-    // The scan's n is BM: each tile height its plans use.
-    try set.add(NaxScan, .init(a, 32), .{ .name = "gather_qmm_nax tile scan (32 experts)", .accum = .none, .depth = routeDepth, .out = .f32, .nan = .{ .stated = nax_rule }, .served = &.{ .{ .rows = 1024, .n = 64, .k = 1 }, .{ .rows = 4096, .n = 96, .k = 1 }, .{ .rows = 4096, .n = 128, .k = 1 }, .{ .rows = 33, .n = 64, .k = 1 } } }, null);
+    // The scan's n is BM: each tile height its plans use (the seg/db plans' and the staged plans').
+    try set.add(NaxScan, .init(a, 32), .{ .name = "gather_qmm_nax tile scan (32 experts)", .accum = .none, .depth = routeDepth, .out = .f32, .nan = .{ .stated = nax_rule }, .served = &.{ .{ .rows = 1024, .n = 64, .k = 1 }, .{ .rows = 4096, .n = 96, .k = 1 }, .{ .rows = 4096, .n = 128, .k = 1 }, .{ .rows = 33, .n = 64, .k = 1 }, .{ .rows = 512, .n = 32, .k = 1 }, .{ .rows = 8192, .n = 256, .k = 1 } } }, null);
     try set.add(NaxScan, .init(a, 512), .{ .name = "gather_qmm_nax tile scan (512 experts)", .accum = .none, .depth = routeDepth, .out = .f32, .nan = .{ .stated = nax_rule }, .served = &.{ .{ .rows = 81920, .n = 96, .k = 1 }, .{ .rows = 2000, .n = 64, .k = 1 } } }, null);
     const gather = "MLX gather_qmm (sorted rhs indices)";
     const Case = struct { name: []const u8, f: Fmt, bits: u32, gs: usize, served: []const Shape };
@@ -2608,15 +2858,67 @@ fn registerNax(set: *kc.Set) !void {
     try set.add(GqmmNax, .init(a, .paired, .mxfp4, 4, 32, 32), .{ .name = "gather_qmm_nax paired bf16 (MXFP4)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = chain, .served = paired[0..1] }, null);
     var lim = GqmmNax.init(a, .paired, .affine, 4, 64, 32);
     lim.limit = 7;
-    try set.add(GqmmNax, lim, .{ .name = "gather_qmm_nax paired bf16 (4-bit g64, limit 7)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = "take (the row map) -> " ++ gather ++ " for gate and up -> clampedSwiGLU", .served = paired[0..1], .known = limit_drops_nan }, null);
+    try set.add(GqmmNax, lim, .{ .name = "gather_qmm_nax paired bf16 (4-bit g64, limit 7)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = "take (the row map) -> " ++ gather ++ " for gate and up -> clampedSwiGLU", .served = paired[0..1] }, null);
     var wt4 = GqmmNax.init(a, .paired, .affine, 4, 64, 32);
     wt4.weighted = true;
     try set.add(GqmmNax, wt4, .{ .name = "gather_qmm_nax paired weighted bf16 (4-bit g64)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = chain ++ " -> weight multiply", .served = paired }, null);
     var wt3 = GqmmNax.init(a, .paired, .affine, 3, 64, 32);
     wt3.limit = 10;
     wt3.weighted = true;
-    try set.add(GqmmNax, wt3, .{ .name = "gather_qmm_nax paired weighted bf16 (3-bit g64, limit 10)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = "take (the row map) -> " ++ gather ++ " for gate and up -> clampedSwiGLU -> weight multiply", .served = paired[0..1], .known = limit_drops_nan }, null);
+    try set.add(GqmmNax, wt3, .{ .name = "gather_qmm_nax paired weighted bf16 (3-bit g64, limit 10)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = "take (the row map) -> " ++ gather ++ " for gate and up -> clampedSwiGLU -> weight multiply", .served = paired[0..1] }, null);
+    // Per-expert scales (ModelOpt NVFP4's global scales) in the pair's epilogue, both fp4 formats: the gate's alone
+    // (an unclamped SwiGLU, the up x down scales riding the scores), and gate and up before a clamp.
+    try set.add(GqmmNax, .init(a, .paired, .nvfp4, 4, 16, 32), .{ .name = "gather_qmm_nax paired bf16 (NVFP4)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = chain, .served = paired[0..1] }, null);
+    const scaled_chain = "take (the row map) -> " ++ gather ++ " for gate and up -> take (the scales) -> multiply -> sigmoid -> multiply -> multiply";
+    for ([_]Fmt{ .nvfp4, .mxfp4 }) |f| {
+        var gs = GqmmNax.init(a, .paired, f, 4, if (f == .nvfp4) 16 else 32, 32);
+        gs.esc = 1;
+        try set.add(GqmmNax, gs, .{ .name = if (f == .nvfp4) "gather_qmm_nax paired bf16 (NVFP4, gate scale)" else "gather_qmm_nax paired bf16 (MXFP4, gate scale)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = scaled_chain, .served = paired[0..1] }, null);
+    }
+    var both = GqmmNax.init(a, .paired, .nvfp4, 4, 16, 32);
+    both.esc = 3;
+    both.limit = 7;
+    try set.add(GqmmNax, both, .{ .name = "gather_qmm_nax paired bf16 (NVFP4, gate and up scales, limit 7)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = "take (the row map) -> " ++ gather ++ " for gate and up -> take (the scales) -> multiply -> clampedSwiGLU", .served = paired[0..1] }, null);
+    // deepseek_v41's routed epilogue at its limit, both fp4 formats (NVFP4 with both scales): moe_act's f32 statements
+    // (the plugin's kernel, so no op chain here gives its bits), held to float64 over MLX's gathers of the same rows.
+    for ([_]Fmt{ .mxfp4, .nvfp4 }) |f| {
+        var r = GqmmNax.init(a, .paired, f, 4, if (f == .nvfp4) 16 else 32, 32);
+        r.moe_act = true;
+        r.rlim = 10;
+        if (f == .nvfp4) r.esc = 3;
+        try set.add(GqmmNax, r, .{ .name = if (f == .nvfp4) "gather_qmm_nax paired bf16 (NVFP4, gate and up scales, routed moe_act, limit 10)" else "gather_qmm_nax paired bf16 (MXFP4, routed moe_act, limit 10)", .accum = .f32, .depth = gqDepth, .ops = 12, .out = .bf16, .served = paired[0..1], .known = routed_nan }, null);
+    }
 }
+
+/// The staged schedule on fp4 banks at the planner's three tiles (32 experts: 16, 64 and 128 rows an expert); the
+/// pair with deepseek_v41's routed epilogue, rows four a token.
+fn registerStaged(set: *kc.Set) !void {
+    const a = set.a;
+    const gather = "MLX gather_qmm (sorted rhs indices)";
+    const plain: []const Shape = &.{ .{ .rows = 512, .n = 128, .k = 256 }, .{ .rows = 2048, .n = 128, .k = 512 }, .{ .rows = 4096, .n = 192, .k = 256 } };
+    // The scatter's rows are tokens (6 routed rows each): 516, 2052 and 4098 routed rows.
+    const plain_scat: []const Shape = &.{ .{ .rows = 86, .n = 128, .k = 256 }, .{ .rows = 342, .n = 128, .k = 512 }, .{ .rows = 683, .n = 192, .k = 256 } };
+    const paired: []const Shape = &.{ .{ .rows = 128, .n = 128, .k = 512 }, .{ .rows = 512, .n = 128, .k = 256 }, .{ .rows = 1024, .n = 96, .k = 512 } };
+    // The 32-deep down tile's calls: 96 routed rows an expert (512 tokens of 6 picks).
+    const wide_scat: []const Shape = &.{.{ .rows = 512, .n = 128, .k = 256 }};
+    for ([_]Fmt{ .nvfp4, .mxfp4 }) |f| {
+        const gs: usize = if (f == .nvfp4) 16 else 32;
+        try set.add(GqmmNax, .initStaged(a, .mm, f, 4, gs, 32), .{ .name = if (f == .nvfp4) "gather_qmm_nax staged bf16 (NVFP4)" else "gather_qmm_nax staged bf16 (MXFP4)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = gather, .served = plain }, null);
+        // The scatter (6 picks a token): the same tiles, each row at its pair's slot; MLX's gather in that order.
+        try set.add(GqmmNax, .initScat(a, f, 4, gs, 32), .{ .name = if (f == .nvfp4) "gather_qmm_nax staged scatter bf16 (NVFP4, rows to their pairs' slots)" else "gather_qmm_nax staged scatter bf16 (MXFP4, rows to their pairs' slots)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = gather ++ " -> take (each pair's sorted row)", .served = plain_scat }, null);
+        var r = GqmmNax.initStaged(a, .paired, f, 4, gs, 32);
+        r.moe_act = true;
+        r.rlim = 10;
+        if (f == .nvfp4) r.esc = 3;
+        try set.add(GqmmNax, r, .{ .name = if (f == .nvfp4) "gather_qmm_nax staged paired bf16 (NVFP4, gate and up scales, routed moe_act, limit 10)" else "gather_qmm_nax staged paired bf16 (MXFP4, routed moe_act, limit 10)", .accum = .f32, .depth = gqDepth, .ops = 12, .out = .bf16, .served = paired, .known = routed_nan }, null);
+        // deepseek_v41's MLX_SERVE_DSV41_PF_DOWN_BK32 tile: the down's scatter, 32 deep a step.
+        var wd = GqmmNax.initScat(a, f, 4, gs, 32);
+        wd.tile = gqn.wide_down;
+        try set.add(GqmmNax, wd, .{ .name = if (f == .nvfp4) "gather_qmm_nax staged scatter bf16 (NVFP4, PF_DOWN_BK32 tile)" else "gather_qmm_nax staged scatter bf16 (MXFP4, PF_DOWN_BK32 tile)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = gather ++ " -> take (each pair's sorted row)", .served = wide_scat }, null);
+    }
+}
+
+const routed_nan: spec.Known = .{ .gate = .nonfinite, .finding = "moe_act's clamp (metal::min / clamp) returns the limit for a NaN gate or up, where float64 keeps the NaN, as in the deepseek_v41 moe_act kernel it replaces" };
 
 // ── the stream-read microbenchmark ──
 
@@ -2742,6 +3044,7 @@ pub fn register(set: *kc.Set) !void {
     try registerRouter(set);
     try registerVerify(set);
     try registerNax(set);
+    try registerStaged(set);
     try registerStream(set);
 }
 
@@ -2766,15 +3069,18 @@ fn registerGathers(set: *kc.Set) !void {
         g = Gather.init(a, .qmv, .affine, 4, 64);
         g.act2 = true;
         g.ne = 24;
-        try add(set, g, "gather_qmv bf16 (4-bit g64, ReLU^2)", &.{ .{ .rows = 6, .n = 512, .k = 2688 }, .{ .rows = 22, .n = 256, .k = 1024 } }, null, act2_drops_nan);
+        try add(set, g, "gather_qmv bf16 (4-bit g64, ReLU^2)", &.{ .{ .rows = 6, .n = 512, .k = 2688 }, .{ .rows = 22, .n = 256, .k = 1024 } }, null, null);
         g = Gather.init(a, .qmv, .affine, 4, 64);
         g.launch = &qmv_launches[0][1];
         g.px = true;
         g.act2 = true;
         g.ne = 16;
-        try add(set, g, "gather_qmv bf16 (4-bit g64, ReLU^2, x per pair)", &.{.{ .rows = 12, .n = 256, .k = 2688 }}, null, act2_drops_nan);
-        g = Gather.init(a, .qmv, .nvfp4, 4, 16);
-        try add(set, g, "gather_qmv bf16 (NVFP4)", up_served, null, e4m3_nan_code);
+        try add(set, g, "gather_qmv bf16 (4-bit g64, ReLU^2, x per pair)", &.{.{ .rows = 12, .n = 256, .k = 2688 }}, null, null);
+    }
+    // fp4: NVFP4 (e4m3 per 16).
+    {
+        var g = Gather.init(a, .qmv, .nvfp4, 4, 16);
+        try add(set, g, "gather_qmv bf16 (NVFP4)", up_served, null, null);
         g = Gather.init(a, .qmv, .nvfp4, 4, 16);
         g.launch = &qmv_launches[1][1];
         g.px = true;
@@ -2782,6 +3088,7 @@ fn registerGathers(set: *kc.Set) !void {
     }
     const chain = "gather_qmv gate and up -> sigmoid -> multiply -> multiply";
     const clamp_chain = "gather_qmv gate and up -> minimum, clip -> sigmoid -> multiply -> multiply";
+    const scaled_chain = "gather_qmv gate and up -> take, multiply (the gate and up scales) -> minimum, clip -> sigmoid -> multiply -> multiply";
     inline for (.{ .{ 4, 64 }, .{ 3, 64 }, .{ 8, 64 }, .{ 5, 32 }, .{ 6, 64 }, .{ 2, 64 } }) |bg| {
         try add(set, .init(a, .gateup, .affine, bg[0], bg[1]), std.fmt.comptimePrint("gather_qmv_gateup bf16 ({d}-bit g{d})", .{ bg[0], bg[1] }), up_served, chain, null);
     }
@@ -2791,8 +3098,7 @@ fn registerGathers(set: *kc.Set) !void {
         try add(set, g, "gather_qmv_gateup f16 (4-bit g64)", up_served, chain, null);
         g = Gather.init(a, .gateup, .affine, 4, 64);
         g.limit = LIMIT;
-        try add(set, g, "gather_qmv_gateup bf16 (4-bit g64, limit 10)", up_served, clamp_chain, limit_drops_nan);
-        try add(set, .init(a, .gateup, .nvfp4, 4, 16), "gather_qmv_gateup bf16 (NVFP4)", up_served, chain, e4m3_nan_code);
+        try add(set, g, "gather_qmv_gateup bf16 (4-bit g64, limit 10)", up_served, clamp_chain, null);
     }
     // The batched decode tick: 2..8 rows of top-k 8.
     const rows_served: []const Shape = &.{ .{ .rows = 4, .n = 256, .k = 2048 }, .{ .rows = 8, .n = 128, .k = 1024 } };
@@ -2803,20 +3109,38 @@ fn registerGathers(set: *kc.Set) !void {
     try add(set, .init(a, .gateup_rows, .affine, 6, 64), "gather_qmv_gateup_rows bf16 (6-bit g64)", rows_served, per_row, null);
     // GGUF Q2_0 expert banks load as 2-bit g64 (sdk/quant/gguf/affine.zig).
     try add(set, .init(a, .gateup_rows, .affine, 2, 64), "gather_qmv_gateup_rows bf16 (2-bit g64)", rows_served, per_row, null);
-    try add(set, .init(a, .gateup_rows, .nvfp4, 4, 16), "gather_qmv_gateup_rows bf16 (NVFP4)", rows_served, per_row, null);
     {
-        var g = Gather.init(a, .gateup_rows, .nvfp4, 4, 16);
-        g.gscale = true;
-        try add(set, g, "gather_qmv_gateup_rows bf16 (NVFP4, ModelOpt gate scale)", rows_served, "gather_qmv gate and up per row -> multiply by the gate scale -> sigmoid -> multiply -> multiply", null);
+        var g = Gather.init(a, .gateup_rows, .affine, 4, 64);
+        g.limit = LIMIT;
+        try add(set, g, "gather_qmv_gateup_rows bf16 (4-bit g64, limit 10)", rows_served, clamp_chain, null);
+    }
+    // fp4 one row and rows: plain, ModelOpt's gate scale, gate and up scales with GLM's clamp.
+    inline for (.{ .{ Kind.gateup, up_served, "gather_qmv_gateup" }, .{ Kind.gateup_rows, rows_served, "gather_qmv_gateup_rows" } }) |kk| {
+        inline for (.{.{ Fmt.nvfp4, 16, "NVFP4" }}) |f| {
+            try add(set, .init(a, kk[0], f[0], 4, f[1]), kk[2] ++ " bf16 (" ++ f[2] ++ ")", kk[1], chain, null);
+            var g = Gather.init(a, kk[0], f[0], 4, f[1]);
+            g.gscale = true;
+            try add(set, g, kk[2] ++ " bf16 (" ++ f[2] ++ ", gate scale)", kk[1], "gather_qmv gate and up -> take, multiply (the gate scale) -> sigmoid -> multiply -> multiply", null);
+            g = Gather.init(a, kk[0], f[0], 4, f[1]);
+            g.gscale = true;
+            g.uscale = true;
+            g.limit = LIMIT;
+            try add(set, g, kk[2] ++ " bf16 (" ++ f[2] ++ ", gate and up scales, limit 10)", kk[1], scaled_chain, null);
+        }
     }
     // Down + score weighting + top-k sum, at 8 lanes a row (every GPU but M5) and 16 (M5).
     inline for (.{ 8, 16 }) |lpr| {
         var g = Gather.init(a, .down, .affine, 4, 64);
         g.lpr = lpr;
         try add(set, g, std.fmt.comptimePrint("down_reduce bf16 (4-bit g64, {d} lanes)", .{lpr}), down_served, null, null);
-        g = Gather.init(a, .down, .nvfp4, 4, 16);
-        g.lpr = lpr;
-        try add(set, g, std.fmt.comptimePrint("down_reduce bf16 (NVFP4, {d} lanes)", .{lpr}), down_served, null, e4m3_nan_code);
+        inline for (.{.{ Fmt.nvfp4, 16, "NVFP4" }}) |f| {
+            g = Gather.init(a, .down, f[0], 4, f[1]);
+            g.lpr = lpr;
+            try add(set, g, std.fmt.comptimePrint("down_reduce bf16 ({s}, {d} lanes)", .{ f[2], lpr }), down_served, null, null);
+            g = Gather.init(a, .down_rows, f[0], 4, f[1]);
+            g.lpr = lpr;
+            try add(set, g, std.fmt.comptimePrint("down_reduce_rows bf16 ({s}, {d} lanes)", .{ f[2], lpr }), &.{.{ .rows = 4, .n = 1024, .k = 512 }}, "down_reduce per row", null);
+        }
         g = Gather.init(a, .down_rows, .affine, 4, 64);
         g.lpr = lpr;
         try add(set, g, std.fmt.comptimePrint("down_reduce_rows bf16 (4-bit g64, {d} lanes)", .{lpr}), &.{ .{ .rows = 4, .n = 1024, .k = 512 }, .{ .rows = 8, .n = 256, .k = 768 } }, "down_reduce per row", null);
@@ -2836,9 +3160,6 @@ fn registerGathers(set: *kc.Set) !void {
         g = Gather.init(a, .down_rows, .affine, 2, 64);
         g.lpr = lpr;
         try add(set, g, std.fmt.comptimePrint("down_reduce_rows bf16 (2-bit g64, {d} lanes)", .{lpr}), &.{.{ .rows = 4, .n = 1024, .k = 512 }}, "down_reduce per row", null);
-        g = Gather.init(a, .down_rows, .nvfp4, 4, 16);
-        g.lpr = lpr;
-        try add(set, g, std.fmt.comptimePrint("down_reduce_rows bf16 (NVFP4, {d} lanes)", .{lpr}), &.{.{ .rows = 4, .n = 1024, .k = 512 }}, "down_reduce per row", null);
     }
     {
         var g = Gather.init(a, .down, .affine, 8, 64);
@@ -2865,7 +3186,7 @@ fn registerFp4(set: *kc.Set) !void {
         f = Fp4.init(a, .gateup, .nvfp4);
         f.gscale = true;
         f.clamp = LIMIT;
-        try addFp4(set, f, "moe_fp4 gateup bf16 (NVFP4, gate scale, clamp 10)", gu_served, limit_drops_nan);
+        try addFp4(set, f, "moe_fp4 gateup bf16 (NVFP4, gate scale, clamp 10)", gu_served, null);
         f = Fp4.init(a, .gateup, .mxfp4);
         try addFp4(set, f, "moe_fp4 gateup bf16 (MXFP4)", gu_served, null);
         f = Fp4.init(a, .gateup, .mxfp4);
@@ -3017,7 +3338,7 @@ test "kernel contract moe: each verify launch is its wrapper's bytes, the prefil
 test "kernel contract moe: the NAX scan chained into each NAX gather launch is the wrapper's bytes" {
     if (mlx.noGpuBackend() or !device_mod.naxAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
-    const Case = struct { kind: NaxKind, f: Fmt = .affine, bits: u32 = 4, gs: usize = 64, shape: Shape };
+    const Case = struct { kind: NaxKind, f: Fmt = .affine, bits: u32 = 4, gs: usize = 64, moe_act: bool = false, staged: bool = false, scat: bool = false, tile: ?gqn.Staged = null, shape: Shape };
     const cases = [_]Case{
         .{ .kind = .mm, .shape = .{ .rows = 1024, .n = 128, .k = 256 } },
         .{ .kind = .mm, .shape = .{ .rows = 2048, .n = 96, .k = 256 } },
@@ -3025,13 +3346,30 @@ test "kernel contract moe: the NAX scan chained into each NAX gather launch is t
         .{ .kind = .mapped, .shape = .{ .rows = 1024, .n = 128, .k = 512 } },
         .{ .kind = .paired, .shape = .{ .rows = 960, .n = 128, .k = 512 } },
         .{ .kind = .paired, .f = .mxfp4, .gs = 32, .shape = .{ .rows = 1024, .n = 128, .k = 1024 } },
+        .{ .kind = .paired, .f = .nvfp4, .gs = 16, .moe_act = true, .shape = .{ .rows = 512, .n = 128, .k = 512 } },
+        .{ .kind = .mm, .f = .nvfp4, .gs = 16, .staged = true, .shape = .{ .rows = 4096, .n = 128, .k = 512 } },
+        .{ .kind = .mm, .f = .mxfp4, .gs = 32, .staged = true, .shape = .{ .rows = 512, .n = 128, .k = 256 } },
+        .{ .kind = .paired, .f = .nvfp4, .gs = 16, .moe_act = true, .staged = true, .shape = .{ .rows = 512, .n = 128, .k = 256 } },
+        // deepseek_v41's MOE_PAIR_FP4 on an MXFP4 bank: the routed pair without per-expert scales, seg and staged.
+        .{ .kind = .paired, .f = .mxfp4, .gs = 32, .moe_act = true, .shape = .{ .rows = 512, .n = 128, .k = 512 } },
+        .{ .kind = .paired, .f = .mxfp4, .gs = 32, .moe_act = true, .staged = true, .shape = .{ .rows = 512, .n = 128, .k = 256 } },
+        .{ .kind = .mm, .f = .nvfp4, .gs = 16, .staged = true, .scat = true, .shape = .{ .rows = 683, .n = 128, .k = 512 } },
+        .{ .kind = .mm, .f = .mxfp4, .gs = 32, .staged = true, .scat = true, .shape = .{ .rows = 86, .n = 128, .k = 256 } },
+        .{ .kind = .mm, .f = .nvfp4, .gs = 16, .staged = true, .scat = true, .tile = gqn.wide_down, .shape = .{ .rows = 512, .n = 128, .k = 256 } },
     };
     for (cases) |c| {
-        var t = GqmmNax.init(a, c.kind, c.f, c.bits, c.gs, 32);
+        var t = if (c.scat) GqmmNax.initScat(a, c.f, c.bits, c.gs, 32) else if (c.staged) GqmmNax.initStaged(a, c.kind, c.f, c.bits, c.gs, 32) else GqmmNax.init(a, c.kind, c.f, c.bits, c.gs, 32);
         defer t.deinit();
+        t.tile = c.tile;
+        if (c.moe_act) {
+            t.moe_act = true;
+            t.rlim = 10;
+            // NVFP4 brings both per-expert scales; MXFP4 has none (the step compiled out).
+            t.esc = if (c.f == .nvfp4) 3 else 0;
+        }
         try std.testing.expect(try t.prepare(c.shape, .random, 7));
         const scan = NaxScan.init(a, 32);
-        const bm: usize = @intCast(t.planAt(c.shape).bm);
+        const bm = t.tileBm(c.shape);
         const shape = Shape{ .rows = t.m, .n = bm, .k = 1 };
         const mt = naxMaxTiles(shape.rows, 32, bm);
         const params = try t.rig.input(.int32, &.{3}, &.{ @floatFromInt(shape.rows), 32, @floatFromInt(mt) });
@@ -3041,7 +3379,7 @@ test "kernel contract moe: the NAX scan chained into each NAX gather launch is t
             _ = mlx.mlx_array_free(x);
         };
         for (&tiles, 0..) |*x, i| try mlx.check(mlx.mlx_array_set(x, t.rig.output(i)));
-        const at: usize = if (c.kind == .mm) 4 else 7;
+        const at: usize = if (t.wide()) 7 else 4;
         t.args[at] = tiles[0];
         t.args[at + 1] = tiles[1];
         try t.run();

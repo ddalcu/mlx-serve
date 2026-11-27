@@ -175,10 +175,11 @@ fn q5_0(b: []const u8, y: []f32, off: f32, m: f32, qs: usize) void {
 
 const kvalues_fp4 = [16]i8{ 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 };
 
-/// One E8M0 scale byte (ggml scales it by half) and 16 bytes of FP4 nibbles, low nibbles first.
+/// One E8M0 scale byte (ggml scales it by half) and 16 bytes of FP4 nibbles, low nibbles first. E8M0 0xff is NaN (OCP
+/// MX; ggml reads it as 2^127), as every fp4 kernel's shared decode reads it.
 fn mxfp4(b: []const u8, y: []f32) void {
     const e = b[0];
-    const bits: u32 = if (e < 2) @as(u32, 0x00200000) << @intCast(e) else @as(u32, e - 1) << 23;
+    const bits: u32 = if (e == 0xFF) 0x7FC00000 else if (e < 2) @as(u32, 0x00200000) << @intCast(e) else @as(u32, e - 1) << 23;
     const d: f32 = @bitCast(bits);
     for (b[1..17], 0..) |q, j| {
         y[j] = int(kvalues_fp4[q & 0xF]) * d;

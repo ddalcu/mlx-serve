@@ -1,7 +1,13 @@
-//! Zig 0.17's test runner (lib/compiler/test_runner.zig) with one change: `MLX_SERVE_TEST_SHARD=k/n` keeps every
-//! n-th test from index k, and every test named `sharded: …` (which splits its own work by the same variable), so
-//! `zig build test` runs n copies of one binary in parallel. Unset = every test, as std's runner. And it runs the
-//! test root's process setup (`msv_test_process_init`) before the first test.
+//! Zig 0.17's test runner (lib/compiler/test_runner.zig) with these changes. `MLX_SERVE_TEST_SHARD=k/n` keeps one
+//! shard of the tests, plus every test named `sharded: …` (it runs in every process), so `zig build test` runs n copies
+//! of one binary in parallel. With `--plan=<file>` (`build/test_plan.tsv`: each test's measured time and lane) the
+//! shards are balanced by time, longest first, and `--lane=cpu|gpu|serial` keeps one lane's tests; without a plan a
+//! shard is every n-th test. `--test-filter=<s>` (repeatable) keeps, at run time, the tests whose name contains any of
+//! them and every unnamed test (as Zig's compile-time filter does), so one binary serves every filter. `--list` prints
+//! this process's tests and runs none; `--skip=<n>` resumes after the first n (a gate restarting a crashed shard);
+//! `--times-out=<file>` appends one record per test (status, wall and CPU time, MLX peak bytes: what
+//! `scripts/test_plan.py` builds the plan from). Unset = every test, as std's runner. And it runs the test root's
+//! process setup (`msv_test_process_init`) before the first test and `msv_test_enter` before each.
 const builtin = @import("builtin");
 
 const std = @import("std");
@@ -18,7 +24,7 @@ pub const std_options: std.Options = .{
 
 var log_err_count: usize = 0;
 var fba: std.heap.FixedBufferAllocator = .init(&fba_buffer);
-var fba_buffer: [8192]u8 = undefined;
+var fba_buffer: [65536]u8 = undefined;
 var stdin_buffer: [4096]u8 = undefined;
 var stdout_buffer: [4096]u8 = undefined;
 var stdin_reader: Io.File.Reader = undefined;
@@ -36,50 +42,200 @@ const need_simple = switch (builtin.zig_backend) {
     else => false,
 };
 
-/// This process's tests: `builtin.test_functions` narrowed to the shard.
+/// This process's tests: `builtin.test_functions` narrowed by the options below.
 var tests: []const std.builtin.TestFn = &.{};
 
-fn shardTests() void {
-    tests = builtin.test_functions;
-    if (builtin.os.tag == .windows) return;
-    const raw = std.mem.span(std.c.getenv("MLX_SERVE_TEST_SHARD") orelse return);
+const Lane = enum { cpu, gpu, serial };
+
+/// The command line's selection options (the rest of the arguments are std's).
+var opt_plan: ?[:0]const u8 = null;
+var opt_lane: ?Lane = null;
+var opt_filters: std.ArrayList([]const u8) = .empty;
+var opt_list = false;
+var opt_skip: usize = 0;
+var opt_times_out: ?[:0]const u8 = null;
+
+/// A test missing from the plan (measured under this many ms, or added since) is placed as a CPU test of this many ms.
+const unplanned_ms: u64 = 20;
+
+const Planned = struct { ms: u64, lane: Lane };
+
+fn isSharded(t: std.builtin.TestFn) bool {
+    return std.mem.indexOf(u8, t.name, ".sharded: ") != null;
+}
+
+/// An unnamed `test {}` (`<namespace>.test_<n>`): a filter keeps it, as Zig's compile-time `-Dtest-filter` does.
+fn isUnnamed(t: std.builtin.TestFn) bool {
+    if (std.mem.indexOf(u8, t.name, ".test.") != null) return false;
+    const dot = std.mem.lastIndexOfScalar(u8, t.name, '.') orelse return false;
+    return std.mem.startsWith(u8, t.name[dot + 1 ..], "test_");
+}
+
+fn readFile(path: [:0]const u8) []u8 {
+    const gpa = std.heap.page_allocator;
+    const fd = std.c.open(path, .{}, @as(c_uint, 0));
+    if (fd < 0) panic("--plan: cannot open {s}", .{path});
+    defer _ = std.c.close(fd);
+    var out: std.ArrayList(u8) = .empty;
+    while (true) {
+        out.ensureUnusedCapacity(gpa, 1 << 16) catch panic("out of memory", .{});
+        const room = out.unusedCapacitySlice();
+        const n = std.c.read(fd, room.ptr, room.len);
+        if (n < 0) panic("--plan: cannot read {s}", .{path});
+        if (n == 0) break;
+        out.items.len += @intCast(n);
+    }
+    return out.items;
+}
+
+/// `<lane>\t<ms>\t<test name>` per line; `#` starts a comment.
+fn loadPlan(path: [:0]const u8) std.StringHashMapUnmanaged(Planned) {
+    const gpa = std.heap.page_allocator;
+    var map: std.StringHashMapUnmanaged(Planned) = .empty;
+    var lines = std.mem.splitScalar(u8, readFile(path), '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        var f = std.mem.splitScalar(u8, line, '\t');
+        const lane = std.meta.stringToEnum(Lane, f.next() orelse continue) orelse panic("--plan: bad lane in {s}", .{line});
+        const ms = std.fmt.parseUnsigned(u64, f.next() orelse continue, 10) catch panic("--plan: bad ms in {s}", .{line});
+        const name = f.rest();
+        map.put(gpa, name, .{ .ms = ms, .lane = lane }) catch panic("out of memory", .{});
+    }
+    return map;
+}
+
+fn shardEnv() struct { k: usize, n: usize } {
+    if (builtin.os.tag == .windows) return .{ .k = 0, .n = 1 };
+    const raw = std.mem.span(std.c.getenv("MLX_SERVE_TEST_SHARD") orelse return .{ .k = 0, .n = 1 });
     const slash = std.mem.indexOfScalar(u8, raw, '/') orelse panic("MLX_SERVE_TEST_SHARD: want k/n, got {s}", .{raw});
     const k = std.fmt.parseUnsigned(usize, raw[0..slash], 10) catch panic("MLX_SERVE_TEST_SHARD: {s}", .{raw});
     const n = std.fmt.parseUnsigned(usize, raw[slash + 1 ..], 10) catch panic("MLX_SERVE_TEST_SHARD: {s}", .{raw});
     if (n == 0 or k >= n) panic("MLX_SERVE_TEST_SHARD: {s}", .{raw});
-    const all = builtin.test_functions;
-    const mine = std.heap.page_allocator.alloc(std.builtin.TestFn, all.len) catch panic("out of memory", .{});
-    var len: usize = 0;
-    for (all, 0..) |t, i| {
-        if (i % n != k and std.mem.indexOf(u8, t.name, ".sharded: ") == null) continue;
-        mine[len] = t;
-        len += 1;
+    return .{ .k = k, .n = n };
+}
+
+const ByTime = struct {
+    ms: []const u64,
+    fn longerFirst(c: ByTime, a: u32, b: u32) bool {
+        return c.ms[a] > c.ms[b] or (c.ms[a] == c.ms[b] and a < b);
     }
-    tests = mine[0..len];
+};
+
+/// Filters, then the lane, then this shard (by time with a plan, else every n-th), then `--skip`.
+fn selectTests() void {
+    const gpa = std.heap.page_allocator;
+    const all = builtin.test_functions;
+    var kept: std.ArrayList(std.builtin.TestFn) = .empty;
+    for (all) |t| {
+        if (opt_filters.items.len > 0 and !isUnnamed(t)) {
+            for (opt_filters.items) |f| {
+                if (std.mem.indexOf(u8, t.name, f) != null) break;
+            } else continue;
+        }
+        kept.append(gpa, t) catch panic("out of memory", .{});
+    }
+    const sh = shardEnv();
+    var plan: std.StringHashMapUnmanaged(Planned) = .empty;
+    if (opt_plan) |p| plan = loadPlan(p);
+    const planned = struct {
+        fn of(m: *const std.StringHashMapUnmanaged(Planned), t: std.builtin.TestFn) Planned {
+            return m.get(t.name) orelse .{ .ms = unplanned_ms, .lane = .cpu };
+        }
+    }.of;
+    if (opt_lane) |lane| {
+        if (opt_plan == null) panic("--lane needs --plan", .{});
+        var len: usize = 0;
+        for (kept.items) |t| if (isSharded(t) or planned(&plan, t).lane == lane) {
+            kept.items[len] = t;
+            len += 1;
+        };
+        kept.items.len = len;
+    }
+    const mine = gpa.alloc(bool, kept.items.len) catch panic("out of memory", .{});
+    @memset(mine, false);
+    if (opt_plan != null and sh.n > 1) {
+        // Longest first onto the least loaded shard: every process computes the same split from the same plan.
+        var order: std.ArrayList(u32) = .empty;
+        const ms = gpa.alloc(u64, kept.items.len) catch panic("out of memory", .{});
+        for (kept.items, 0..) |t, i| {
+            ms[i] = planned(&plan, t).ms;
+            if (isSharded(t)) mine[i] = true else order.append(gpa, @intCast(i)) catch panic("out of memory", .{});
+        }
+        std.mem.sort(u32, order.items, ByTime{ .ms = ms }, ByTime.longerFirst);
+        const load = gpa.alloc(u64, sh.n) catch panic("out of memory", .{});
+        @memset(load, 0);
+        for (order.items) |i| {
+            var least: usize = 0;
+            for (load, 0..) |l, s| if (l < load[least]) {
+                least = s;
+            };
+            // A test measured at 0 ms still counts, so a shard of many tiny tests is not taken for an empty one.
+            load[least] += @max(ms[i], 1);
+            if (least == sh.k) mine[i] = true;
+        }
+    } else {
+        for (kept.items, 0..) |t, i| mine[i] = i % sh.n == sh.k or isSharded(t);
+    }
+    var len: usize = 0;
+    for (kept.items, mine) |t, m| if (m) {
+        kept.items[len] = t;
+        len += 1;
+    };
+    tests = kept.items[@min(opt_skip, len)..len];
 }
 
 /// The test root's process setup (`src/tests.zig`).
 extern fn msv_test_process_init() void;
+/// The test root's per-test setup (`src/tests.zig`): every test starts in the test world (`src/sdk/testing/world.zig`).
+extern fn msv_test_enter() void;
 
-pub fn main(init: std.process.Init.Minimal) void {
-    msv_test_process_init();
-    @disableInstrumentation();
-    shardTests();
+extern fn mlx_get_peak_memory(res: *usize) c_int;
+extern fn mlx_reset_peak_memory() c_int;
 
-    if (builtin.cpu.arch.isSpirV()) {
-        // SPIR-V needs an special test-runner
-        return;
+fn clockNs(comptime id: std.c.clockid_t) u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(id, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+/// `--times-out`: one record per test, appended: its status, wall and CPU microseconds, and MLX's peak bytes in it (more
+/// than 0: the test used the GPU).
+const Record = struct {
+    fd: c_int = -1,
+    wall_ns: u64 = 0,
+    cpu_ns: u64 = 0,
+
+    fn open() Record {
+        const path = opt_times_out orelse return .{};
+        const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(c_uint, 0o644));
+        if (fd < 0) panic("--times-out: cannot open {s}", .{path});
+        return .{ .fd = fd };
     }
 
-    if (need_simple) {
-        return mainSimple() catch |err| panic("test failure: {t}", .{err});
+    fn begin(r: *Record) void {
+        if (r.fd < 0) return;
+        _ = mlx_reset_peak_memory();
+        r.wall_ns = clockNs(.MONOTONIC);
+        r.cpu_ns = clockNs(.PROCESS_CPUTIME_ID);
     }
 
-    const args = init.args.toSlice(fba.allocator()) catch |err| panic("unable to parse command line args: {t}", .{err});
+    fn end(r: *Record, status: []const u8, name: []const u8) void {
+        if (r.fd < 0) return;
+        const wall = clockNs(.MONOTONIC) -| r.wall_ns;
+        const cpu = clockNs(.PROCESS_CPUTIME_ID) -| r.cpu_ns;
+        var peak: usize = 0;
+        _ = mlx_get_peak_memory(&peak);
+        var buf: [256]u8 = undefined;
+        const head = std.fmt.bufPrint(&buf, "{s}\t{d}\t{d}\t{d}\t", .{ status, wall / 1000, cpu / 1000, peak }) catch unreachable;
+        _ = std.c.write(r.fd, head.ptr, head.len);
+        _ = std.c.write(r.fd, name.ptr, name.len);
+        _ = std.c.write(r.fd, "\n", 1);
+    }
+};
 
+fn parseArgs(args: []const [:0]const u8) struct { listen: bool, cache_dir: ?[]const u8 } {
     var listen = false;
     var opt_cache_dir: ?[]const u8 = null;
-
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--listen=-")) {
             listen = true;
@@ -88,17 +244,57 @@ pub fn main(init: std.process.Init.Minimal) void {
                 @panic("unable to parse --seed command line argument");
         } else if (std.mem.startsWith(u8, arg, "--cache-dir")) {
             opt_cache_dir = arg["--cache-dir=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--plan=")) {
+            opt_plan = arg["--plan=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--lane=")) {
+            opt_lane = std.meta.stringToEnum(Lane, arg["--lane=".len..]) orelse panic("--lane: cpu, gpu or serial, got {s}", .{arg});
+        } else if (std.mem.startsWith(u8, arg, "--test-filter=")) {
+            opt_filters.append(std.heap.page_allocator, arg["--test-filter=".len..]) catch panic("out of memory", .{});
+        } else if (std.mem.eql(u8, arg, "--list")) {
+            opt_list = true;
+        } else if (std.mem.startsWith(u8, arg, "--skip=")) {
+            opt_skip = std.fmt.parseUnsigned(usize, arg["--skip=".len..], 10) catch panic("--skip: {s}", .{arg});
+        } else if (std.mem.startsWith(u8, arg, "--times-out=")) {
+            opt_times_out = arg["--times-out=".len..];
         } else {
             panic("unrecognized command line argument: {s}", .{arg});
         }
     }
+    return .{ .listen = listen, .cache_dir = opt_cache_dir };
+}
+
+pub fn main(init: std.process.Init.Minimal) void {
+    msv_test_process_init();
+    @disableInstrumentation();
+
+    if (builtin.cpu.arch.isSpirV()) {
+        // SPIR-V needs an special test-runner
+        return;
+    }
+
+    if (need_simple) {
+        tests = builtin.test_functions;
+        return mainSimple() catch |err| panic("test failure: {t}", .{err});
+    }
+
+    const args = init.args.toSlice(fba.allocator()) catch |err| panic("unable to parse command line args: {t}", .{err});
+    const parsed = parseArgs(args);
+    selectTests();
+
+    if (opt_list) {
+        for (tests) |t| {
+            _ = std.c.write(1, t.name.ptr, t.name.len);
+            _ = std.c.write(1, "\n", 1);
+        }
+        return;
+    }
 
     if (builtin.fuzz) {
-        const cache_dir = opt_cache_dir orelse @panic("missing --cache-dir=[path] argument");
+        const cache_dir = parsed.cache_dir orelse @panic("missing --cache-dir=[path] argument");
         fuzz_abi.fuzzer_init(.fromSlice(cache_dir));
     }
 
-    if (listen) {
+    if (parsed.listen) {
         return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
     } else {
         return mainTerminal(init);
@@ -170,6 +366,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 try server.serveStringMessage(.test_started, &.{});
 
                 const TestResults = std.zig.Server.Message.TestResults;
+                msv_test_enter();
                 const status: TestResults.Status = if (test_fn.func()) |v| s: {
                     v;
                     break :s .pass;
@@ -301,6 +498,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
     const have_tty = Io.File.stderr().isTty(runner_threaded_io) catch unreachable;
 
     var leaks: usize = 0;
+    var record: Record = .open();
     for (test_fn_list, 0..) |test_fn, i| {
         testing.allocator_instance = .init(std.heap.page_allocator, .{
             .canary = 0xc3a701ba,
@@ -310,9 +508,16 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
             .argv0 = .init(init.args),
             .environ = init.environ,
         });
+        const ok_before = ok_count;
+        const skip_before = skip_count;
+        const log_err_before = log_err_count;
+        record.begin();
         defer {
             testing.io_instance.deinit();
-            if (testing.allocator_instance.deinit() != 0) leaks += 1;
+            const leaked = testing.allocator_instance.deinit() != 0;
+            if (leaked) leaks += 1;
+            const status = if (ok_count == ok_before and skip_count == skip_before) "fail" else if (leaked) "leak" else if (log_err_count != log_err_before) "logerr" else if (skip_count != skip_before) "skip" else "pass";
+            record.end(status, test_fn.name);
         }
         testing.log_level = .warn;
         testing.environ = init.environ;
@@ -322,6 +527,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
             std.debug.print("{d}/{d} {s}...", .{ i + 1, test_fn_list.len, test_fn.name });
         }
         is_fuzz_test = false;
+        msv_test_enter();
         if (test_fn.func()) |_| {
             ok_count += 1;
             test_node.end();
@@ -421,6 +627,7 @@ pub fn mainSimple() anyerror!void {
             stdout.writeStreamingAll(runner_threaded_io, test_fn.name) catch {};
             stdout.writeStreamingAll(runner_threaded_io, "... ") catch {};
         }
+        msv_test_enter();
         if (test_fn.func()) |_| {
             if (enable_write) stdout.writeStreamingAll(runner_threaded_io, "PASS\n") catch {};
         } else |err| {
@@ -478,6 +685,7 @@ var fuzz_runner: if (builtin.fuzz) struct {
         });
         defer testing.io_instance.deinit();
 
+        msv_test_enter();
         tests[fuzz_runner.indexes[i]].func() catch |err| switch (err) {
             error.SkipZigTest => return,
             else => {

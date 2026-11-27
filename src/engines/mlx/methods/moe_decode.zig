@@ -21,9 +21,9 @@ const gatherQmvDownReduce = @import("../../../sdk/blocks/moe/down_reduce.zig").g
 const gatherQmvDownReduceRows = @import("../../../sdk/blocks/moe/down_reduce.zig").gatherQmvDownReduceRows;
 const gatherQmvDownReduceRowsEligible = @import("../../../sdk/blocks/moe/down_reduce.zig").gatherQmvDownReduceRowsEligible;
 const gatherQmv = @import("../../../sdk/blocks/moe/gather_qmv.zig").gatherQmv;
-const gatherQmvGateUp = @import("../../../sdk/blocks/moe/gather_qmv.zig").gatherQmvGateUp;
+const gatherQmvGateUpScaled = @import("../../../sdk/blocks/moe/gather_qmv.zig").gatherQmvGateUpScaled;
 const gatherQmvGateUpEnabled = @import("../../../sdk/blocks/moe/gather_qmv.zig").gatherQmvGateUpEnabled;
-const gatherQmvGateUpRows = @import("../../../sdk/blocks/moe/gather_qmv_rows.zig").gatherQmvGateUpRows;
+const gatherQmvGateUpRowsScaled = @import("../../../sdk/blocks/moe/gather_qmv_rows.zig").gatherQmvGateUpRowsScaled;
 const MoeMlpWeights = @import("../../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
 
 /// Decode-width MoE expert compute through the in-place gather-qmv kernel
@@ -80,7 +80,7 @@ pub fn moeDecodeGatherQmv(
     } else if (self.config.hidden_act == .silu and
         gate_qp.bits == up_qp.bits and gate_qp.group_size == up_qp.group_size and gate_qp.mode == up_qp.mode)
     {
-        if (try gatherQmvGateUp(
+        if (try gatherQmvGateUpScaled(
             self.s,
             x_flat,
             mw.switch_gate_w,
@@ -93,7 +93,11 @@ pub fn moeDecodeGatherQmv(
             gate_qp.bits,
             gate_qp.group_size,
             gate_qp.mode,
-            swigluClampLimit(self.config.swiglu_limit, self.config.swiglu_clamp).?,
+            .{
+                .gate = if (mw.gate_expert_scale.ctx != null) mw.gate_expert_scale else null,
+                .up = if (mw.up_expert_scale.ctx != null) mw.up_expert_scale else null,
+                .clamp = swigluClampLimit(self.config.swiglu_limit, self.config.swiglu_clamp).?,
+            },
         )) |fused| {
             _ = mlx.mlx_array_free(act_2d);
             act_2d = fused; // [K, inter], activation already applied
@@ -306,7 +310,7 @@ pub fn moeDecodeGatherQmvRows(
     const dshape = [_]c_int{ B, D };
     try mlx.check(mlx.mlx_reshape(&x_2d, expert_x, &dshape, 2, self.s));
 
-    const act_3d = (try gatherQmvGateUpRows(
+    const act_3d = (try gatherQmvGateUpRowsScaled(
         self.s,
         x_2d,
         mw.switch_gate_w,
@@ -319,7 +323,11 @@ pub fn moeDecodeGatherQmvRows(
         gate_qp.bits,
         gate_qp.group_size,
         gate_qp.mode,
-        if (mw.gate_expert_scale.ctx != null) mw.gate_expert_scale else null,
+        .{
+            .gate = if (mw.gate_expert_scale.ctx != null) mw.gate_expert_scale else null,
+            .up = if (mw.up_expert_scale.ctx != null) mw.up_expert_scale else null,
+            .clamp = swigluClampLimit(self.config.swiglu_limit, self.config.swiglu_clamp).?,
+        },
     )) orelse return false;
     defer _ = mlx.mlx_array_free(act_3d);
     var scores_2d = mlx.mlx_array_new();

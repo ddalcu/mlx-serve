@@ -11,7 +11,7 @@ const uint u = sg % uint(TOPK * R + 1);
 const uint n_col = sg / uint(TOPK * R + 1);
 if (u == uint(TOPK * R)) {
   float acc[R][2];
-  dec_up_shared<R, K, N, T>(sw, sscales, n_col, x, lane, acc);
+  dec_up_shared<R, K, N, T, FOLD>(sw, sscales, n_col, x, lane, acc);
   if (lane == 0) {
 #pragma unroll
     for (int r = 0; r < R; ++r) out[(r * (TOPK + 1) + TOPK) * N + n_col] = dec_up_act<T>(acc[r][0], acc[r][1], lim[0], 1.0f);

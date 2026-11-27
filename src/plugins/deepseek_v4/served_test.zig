@@ -22,6 +22,7 @@ const prefix_cache = @import("../../engines/mlx/cache/prefix_cache.zig");
 const verdict = @import("../../engines/mlx/batching/verdict.zig");
 const env = @import("../../env.zig");
 const Generator = @import("../../engines/mlx/generate/generator.zig").Generator;
+const dspark_spec = @import("../../engines/mlx/spec/dspark.zig");
 const SamplingParams = @import("../../engines/mlx/sampling/params.zig").SamplingParams;
 const Tokenizer = @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer;
 const Tape = @import("../../engines/mlx/plugin/tape.zig").Tape;
@@ -31,6 +32,8 @@ const finish_request = @import("../../engines/mlx/finish.zig");
 const scheduler = @import("../../engines/mlx/scheduler.zig");
 const RequestSlot = @import("../../engines/mlx/slot.zig").Slot;
 const registry = @import("../../host/registry/registry.zig");
+/// DeepSeek-V4.1 is in macOS builds only: its tests skip elsewhere.
+const plugin_registry = @import("../registry.zig");
 const metrics_mod = @import("../../host/metrics/metrics.zig");
 
 const testing = std.testing;
@@ -156,6 +159,7 @@ test "deepseek_v4 served: chunked prefill, host and pipelined decodes and a new 
 }
 
 test "deepseek_v41 served: chunked prefill, host and pipelined decodes and a new request equal the legacy forward bit for bit" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -164,6 +168,7 @@ test "deepseek_v41 served: chunked prefill, host and pipelined decodes and a new
 }
 
 test "deepseek_v41 served: two slots decode in one batched tick through the driver, each slot's step following its state" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -189,6 +194,7 @@ test "deepseek_v41 served: two slots decode in one batched tick through the driv
 }
 
 test "deepseek_v41 served: disk-disabled requests retain alternating RAM conversations after slot release" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -232,6 +238,7 @@ test "deepseek_v41 served: disk-disabled requests retain alternating RAM convers
 }
 
 test "deepseek_v41 served: a prefill admitted at a chunk boundary leaves the outer prefill's progress gauges alone" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -255,6 +262,7 @@ test "deepseek_v41 served: a prefill admitted at a chunk boundary leaves the out
 }
 
 test "deepseek_v41 served: an ablated request restores and commits only entries of its own profile and strength" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -438,6 +446,7 @@ fn diskPrompt() [513]u32 {
 }
 
 test "deepseek_v41 served: disk import restores exact counters and cold-reference logits" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -475,6 +484,7 @@ test "deepseek_v41 served: disk import restores exact counters and cold-referenc
 }
 
 test "deepseek_v41 served: entries zero and RAM disabled bypass a valid disk history" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -500,6 +510,7 @@ test "deepseek_v41 served: entries zero and RAM disabled bypass a valid disk his
 }
 
 test "deepseek_v41 served: peak refusal precedes tensor loading and preserves the disk record" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const old_fits = scheduler.prefill_admission_fits;
     defer scheduler.prefill_admission_fits = old_fits;
@@ -536,6 +547,7 @@ test "deepseek_v41 served: peak refusal precedes tensor loading and preserves th
 }
 
 test "deepseek_v41 served: idle staging pressure cancels its source before materialization" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -562,6 +574,7 @@ test "deepseek_v41 served: idle staging pressure cancels its source before mater
 }
 
 test "deepseek_v41 served: unsupported disk hooks preserve RAM reuse" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -641,16 +654,19 @@ fn expectDiskMedia(appended: bool) !void {
 }
 
 test "deepseek_v41 served: changed covered media rows miss without poisoning disk history" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (mlx.virtualGpu()) return error.SkipZigTest;
     try expectDiskMedia(false);
 }
 
 test "deepseek_v41 served: appended media leaves an exact disk checkpoint eligible" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (mlx.virtualGpu()) return error.SkipZigTest;
     try expectDiskMedia(true);
 }
 
 test "deepseek_v41 served: disk imports use their owning model with a foreign cache view" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -680,16 +696,19 @@ test "deepseek_v41 served: disk imports use their owning model with a foreign ca
 }
 
 test "deepseek_v41 served: failed imported restore resets the prompt and retires only its record" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (mlx.virtualGpu()) return error.SkipZigTest;
     try expectImportFallback(.restore);
 }
 
 test "deepseek_v41 served: failed restored prompt setup retries cold with zero cached tokens" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (mlx.virtualGpu()) return error.SkipZigTest;
     try expectImportFallback(.prompt);
 }
 
 test "deepseek_v41 served: failed tensor import releases its inputs and prefills cold" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (mlx.virtualGpu()) return error.SkipZigTest;
     try expectImportFallback(.arrays);
 }
@@ -750,6 +769,7 @@ fn expectImportFallback(comptime failure: enum { arrays, restore, prompt }) !voi
 }
 
 test "deepseek_v41 served: cancel, pad-only, failed forward and mismatched snapshot IDs commit nothing" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -789,6 +809,7 @@ test "deepseek_v41 served: cancel, pad-only, failed forward and mismatched snaps
 }
 
 test "deepseek_v41 served: a cancelled slot drained from the cleanup queue returns its buffers to the OS" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -820,6 +841,7 @@ test "deepseek_v41 served: a cancelled slot drained from the cleanup queue retur
 }
 
 test "deepseek_v41 served: a prefill cancelled past the commit floor is committed where it stopped, and the same prompt resumes there" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -879,6 +901,7 @@ test "deepseek_v41 served: a prefill cancelled past the commit floor is committe
 }
 
 test "deepseek_v41 served: a request that ends inside a decode tick is charged that tick's decode time" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -910,6 +933,7 @@ test "deepseek_v41 served: a request that ends inside a decode tick is charged t
 }
 
 test "deepseek_v41 served: restored state is discarded once when only cold prefill fits" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -962,6 +986,7 @@ test "deepseek_v41 served: restored state is discarded once when only cold prefi
 }
 
 test "deepseek_v41 served: two models retain separate histories even with a foreign current-cache view" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -988,6 +1013,7 @@ test "deepseek_v41 served: two models retain separate histories even with a fore
 }
 
 test "deepseek_v41 served: ordinary unload frees retained module entries before their plugin binding" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1015,6 +1041,7 @@ test "deepseek_v41 served: ordinary unload frees retained module entries before 
 }
 
 test "deepseek_v41 served: an excluded instance keeps legacy resume through request prefill" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1041,6 +1068,7 @@ test "deepseek_v41 served: an excluded instance keeps legacy resume through requ
 }
 
 test "deepseek_v41 served: image rows from Forward.media splice as the legacy seam splices them, across a chunk boundary" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1113,8 +1141,11 @@ fn expectDspark(comptime P: type, files: []const sdk.fixture.File, sampling: Sam
     });
     defer gen.deinit(a);
     try testing.expect(gen.dspark_enabled);
-    // The tapes' rounds were recorded under the logistic calibration prior.
-    if (gen.dspark_pol) |*pol| pol.calib.head = false;
+    // The tapes' rounds were recorded under the GLM-5.3-priced policy and its logistic calibration prior.
+    if (gen.dspark_pol) |*pol| {
+        pol.calib.head = false;
+        pol.p2 = null;
+    }
     // Each round as `[tokens..., accepted drafts, next token, position]`.
     var rec: [16]u32 = undefined;
     for (0..16) |_| {
@@ -1139,16 +1170,24 @@ test "deepseek_v4 served: DSpark rounds (greedy, then seeded sampling) equal the
 }
 
 test "deepseek_v41 served: DSpark rounds (greedy, then seeded sampling) equal the legacy shell's" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const files = try fixture.v41DsparkFiles(arena.allocator(), 7);
+    // Every round verifies 3 rows (t1 and 2 drafts): the adaptive widths follow measured round times.
+    dspark_spec.test_pin_rows = 3;
+    defer dspark_spec.test_pin_rows = 0;
     try expectDspark(@import("../deepseek_v41/plugin.zig"), files, .{ .temperature = 0 }, 4, @embedFile("../deepseek_v41/fixtures/dspark-greedy.tape"));
+    // The sampled tape records the legacy shell's one-hot acceptance of argmax drafts (DRAFT_SAMPLE=0).
+    const one_hot = env.override(.MLX_SERVE_DSV41_DRAFT_SAMPLE, "0");
+    defer one_hot.restore();
     try expectDspark(@import("../deepseek_v41/plugin.zig"), files, .{ .temperature = 0.8, .top_p = 0.95, .seed = 4 }, 4, @embedFile("../deepseek_v41/fixtures/dspark-sampled.tape"));
 }
 
 test "deepseek_v41 served: a pack that quantized its DSpark heads drafts from them dequantized" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const dsv41 = @import("../deepseek_v41/deepseek_v41.zig");
@@ -1196,6 +1235,7 @@ fn relGap(g: *ops.Graph, got: Array, want: Array) !f32 {
 }
 
 test "deepseek_v41 served: a batched verify gives each state its solo verify's rows, and its kept prefix the state a solo round leaves" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const dsv41 = @import("../deepseek_v41/deepseek_v41.zig");
@@ -1306,6 +1346,7 @@ fn groupRounds(files: []const sdk.fixture.File, prompts: []const []const u32, ou
 }
 
 test "deepseek_v41 served: a slot's greedy DSpark group rounds emit the same tokens whichever slot shares them" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1325,6 +1366,224 @@ test "deepseek_v41 served: a slot's greedy DSpark group rounds emit the same tok
     try testing.expectEqualSlices(u32, &x[0], &y[1]);
 }
 
+/// The tokens a request's DSpark rounds emit (up to `out.len`) on a fresh load of `files`, with the draft-only head the
+/// environment asks for at that load, and the drafts it accepted.
+fn dsparkTokens(files: []const sdk.fixture.File, sampling: SamplingParams, out: []u32) !struct { n: usize, accepted: u64, rounds: u64 } {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, files, "");
+    defer p.close();
+    var tok: Tokenizer = undefined;
+    const prompt = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60, 11, 2, 30, 31 };
+    var gen = try Generator.initWithOptions(io, a, &p.xfm, &tok, &prompt, @intCast(out.len), sampling, &.{}, .{
+        .pld_enabled = true,
+        .mtp_enabled = true,
+        .skip_lazy_preforward = true,
+        .lookup_prompt = &prompt,
+    });
+    defer gen.deinit(a);
+    try testing.expect(gen.dspark_enabled);
+    var n: usize = 0;
+    while (n < out.len) {
+        const r = (try gen.nextDspark(a)) orelse break;
+        defer a.free(r.tokens);
+        const k = @min(r.tokens.len, out.len - n);
+        @memcpy(out[n..][0..k], r.tokens[0..k]);
+        n += k;
+    }
+    return .{ .n = n, .accepted = gen.dspark_accepted_tokens, .rounds = gen.dspark_attempted };
+}
+
+test "deepseek_v41 served: a draft-only head (DRAFT_VOCAB) changes the drafts, never the tokens, greedy and seeded" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const dsv41 = @import("../deepseek_v41/deepseek_v41.zig");
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const files = try fixture.v41DsparkFiles(arena.allocator(), 7);
+    const ds = env.override(.MLX_SERVE_DSV4_DSPARK, "1");
+    defer ds.restore();
+    // A vocabulary of 64 of the fixture's 96 ids: every id but those one past a multiple of 3, so the peaked head's 7
+    // is never drafted while its 5 is.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(a);
+    for (0..96) |v| if (v % 3 != 1) try text.print(a, "{d}\n", .{v});
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "vocab.txt", .data = text.items });
+    var dbuf: [512]u8 = undefined;
+    const dir = dbuf[0..try tmp.dir.realPath(io, &dbuf)];
+    var pbuf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/vocab.txt", .{dir}, 0);
+    const arms = [_]?[*:0]const u8{ null, path.ptr };
+    // A seeded request on the keyed sampler (MLX_SERVE_KEYED_SAMPLING: the draw at each generated index is fixed by the
+    // seed) emits serial decoding's tokens whatever the drafts; the one-hot acceptance gives the trunk's distribution
+    // either way (`dsparkStochasticRound`).
+    const keyed = env.override(.MLX_SERVE_KEYED_SAMPLING, "1");
+    defer keyed.restore();
+    const samplings = [_]SamplingParams{ .{ .temperature = 0 }, .{ .temperature = 0.8, .top_p = 0.95, .seed = 4 } };
+    for (samplings) |sampling| {
+        var want: [48]u32 = undefined;
+        var want_n: usize = 0;
+        var want_acc: u64 = 0;
+        var want_rounds: u64 = 0;
+        for (arms, 0..) |vocab, i| {
+            const arm_dv = env.override(.MLX_SERVE_DSV41_DRAFT_VOCAB, vocab);
+            defer arm_dv.restore();
+            var got: [48]u32 = undefined;
+            const r = try dsparkTokens(files, sampling, &got);
+            std.debug.print("[draft head] temperature {d}: vocab {any}: {d} tokens, {d} drafts accepted\n", .{ sampling.temperature, vocab != null, r.n, r.accepted });
+            if (i == 0) {
+                want = got;
+                want_n = r.n;
+                want_acc = r.accepted;
+                want_rounds = r.rounds;
+                continue;
+            }
+            // The verify decides every kept token (greedy) and the request's keyed draws every sampled one.
+            try testing.expectEqualSlices(u32, want[0..want_n], got[0..r.n]);
+            // A sampled request drafts every id under DRAFT_VOCAB: its rounds are control's.
+            if (sampling.temperature > 0) {
+                try testing.expectEqual(want_acc, r.accepted);
+                try testing.expectEqual(want_rounds, r.rounds);
+            }
+        }
+    }
+    // The drafts themselves: a vocabulary's ids only, a batched draft each state's solo one, rows -inf past it.
+    const dv = env.override(.MLX_SERVE_DSV41_DRAFT_VOCAB, path.ptr);
+    defer dv.restore();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, files, "");
+    defer p.close();
+    var g = ops.Graph.init(a, mlx.gpuStream());
+    defer g.deinit();
+    const m = intree.dsv41(&p.xfm).?;
+    const draft = m.dspark.?.draft.?;
+    try testing.expectEqual(@as(usize, 64), draft.k);
+    try testing.expectEqual(@as(u32, 8), draft.head.qp.bits);
+    try testing.expectEqual(@as(u32, 8), m.head.qp.bits);
+    const prompts = [_][]const u32{ &.{ 3, 17, 42, 9, 7, 25, 1, 60, 11, 2, 90 }, &.{ 5, 8, 13, 21, 34, 55, 89, 4, 6, 10, 12, 14, 16, 18 } };
+    var sts: [2]dsv41.State = undefined;
+    for (&sts, prompts) |*st, pr| {
+        st.* = try dsv41.initState(m, a);
+        _ = try g.adopt(try dsv41.extend(m, a, st, pr, .last));
+    }
+    defer for (&sts) |*st| st.deinit();
+    var drafts: [2]dsv41.DsparkDraft = undefined;
+    // t1 = 7, outside the vocabulary: it enters the chain all the same.
+    try dsv41.dsparkDraftBatched(m, a, &.{ &sts[0], &sts[1] }, &.{ 0, 1 }, &.{ 7, 5 }, true, &drafts);
+    defer for (&drafts) |*d| d.deinit(a);
+    for (&sts, &drafts) |*st, *d| {
+        for (d.ids[1..]) |id| try testing.expect(id < 96 and id % 3 != 1);
+        for (0..d.ids.len - 1) |k| for (d.logits[k * 96 ..][0..96], 0..) |x, id| try testing.expectEqual(id % 3 == 1, std.math.isNegativeInf(x));
+        var alone = try dsv41.dsparkDraft(m, a, st, d.ids[0]);
+        defer alone.deinit(a);
+        try testing.expectEqualSlices(u32, alone.ids, d.ids);
+    }
+    // A sampled draft (`MLX_SERVE_DSV41_DRAFT_SAMPLE`) over the vocabulary: its tokens are the vocabulary's, and its q, the
+    // proposal the verdict's min(1, p / q) and max(0, p - q) read, is 0 past it and sums to 1 over it.
+    {
+        var key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(key);
+        try mlx.check(mlx.mlx_random_key(&key, 5));
+        const lo = mlx.mlx_array_new_float(0);
+        defer _ = mlx.mlx_array_free(lo);
+        const hi = mlx.mlx_array_new_float(1);
+        defer _ = mlx.mlx_array_free(hi);
+        var u = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(u);
+        try mlx.check(mlx.mlx_random_uniform(&u, lo, hi, &[_]c_int{ @intCast(m.ds_block), 96 }, 2, .float32, key, mlx.gpuStream()));
+        var sd = try dsv41.dsparkDraftSampled(m, a, &sts[1], 7, u, 1.25);
+        defer sd.d.deinit(a);
+        defer _ = mlx.mlx_array_free(sd.q);
+        for (sd.d.ids[1..]) |id| try testing.expect(id % 3 != 1);
+        const qd = mlx.mlx_array_data_float32(sd.q) orelse return error.NoData;
+        for (0..m.ds_block) |k| {
+            var sum: f64 = 0;
+            for (qd[k * 96 ..][0..96], 0..) |x, id| {
+                if (id % 3 == 1) try testing.expectEqual(@as(f32, 0), x);
+                sum += x;
+            }
+            try testing.expectApproxEqAbs(@as(f64, 1), sum, 1e-4);
+        }
+    }
+    // A sampled request's state (`draftPromptVocab` with greedy false) drafts as without the vocabulary at all: the same
+    // tokens and the same whole-row q, bit for bit, as the model with its draft head taken away.
+    {
+        var key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(key);
+        try mlx.check(mlx.mlx_random_key(&key, 9));
+        const lo = mlx.mlx_array_new_float(0);
+        defer _ = mlx.mlx_array_free(lo);
+        const hi = mlx.mlx_array_new_float(1);
+        defer _ = mlx.mlx_array_free(hi);
+        var u = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(u);
+        try mlx.check(mlx.mlx_random_uniform(&u, lo, hi, &[_]c_int{ @intCast(m.ds_block), 96 }, 2, .float32, key, mlx.gpuStream()));
+        try dsv41.draftPromptVocab(m, &sts[1], &.{ 7, 31 }, false);
+        try testing.expect(sts[1].draft_whole and sts[1].draft_extra == null);
+        var whole = try dsv41.dsparkDraftSampled(m, a, &sts[1], 7, u, 1.25);
+        defer whole.d.deinit(a);
+        defer _ = mlx.mlx_array_free(whole.q);
+        const kept = m.dspark.?.draft;
+        m.dspark.?.draft = null;
+        const plain = dsv41.dsparkDraftSampled(m, a, &sts[1], 7, u, 1.25);
+        m.dspark.?.draft = kept;
+        var ctl = try plain;
+        defer ctl.d.deinit(a);
+        defer _ = mlx.mlx_array_free(ctl.q);
+        try testing.expectEqualSlices(u32, ctl.d.ids, whole.d.ids);
+        const nq = @as(usize, m.ds_block) * 96 * 4;
+        try testing.expectEqualSlices(u8, (mlx.mlx_array_data_uint8(ctl.q) orelse return error.NoData)[0..nq], (mlx.mlx_array_data_uint8(whole.q) orelse return error.NoData)[0..nq]);
+        // A batch holding that state drafts every id for both states, as the model without the vocabulary does.
+        var bw: [2]dsv41.DsparkDraft = undefined;
+        try dsv41.dsparkDraftBatched(m, a, &.{ &sts[0], &sts[1] }, &.{ 0, 1 }, &.{ 7, 5 }, true, &bw);
+        defer for (&bw) |*d| d.deinit(a);
+        m.dspark.?.draft = null;
+        var bc: [2]dsv41.DsparkDraft = undefined;
+        const plain_b = dsv41.dsparkDraftBatched(m, a, &.{ &sts[0], &sts[1] }, &.{ 0, 1 }, &.{ 7, 5 }, true, &bc);
+        m.dspark.?.draft = kept;
+        try plain_b;
+        defer for (&bc) |*d| d.deinit(a);
+        for (bw, bc) |w, cd| {
+            try testing.expectEqualSlices(u32, cd.ids, w.ids);
+            try testing.expectEqualSlices(f32, cd.logits, w.logits);
+        }
+        try dsv41.draftPromptVocab(m, &sts[1], &.{}, true);
+        try testing.expect(!sts[1].draft_whole);
+        // A group round's mode alone: no prompt-id gather, an earlier request's set dropped, the mode set.
+        try dsv41.draftPromptVocab(m, &sts[1], &.{ 7, 31 }, true);
+        try testing.expect(sts[1].draft_extra != null);
+        dsv41.draftVocabMode(m, &sts[1], true);
+        try testing.expect(sts[1].draft_extra == null and !sts[1].draft_whole);
+        dsv41.draftVocabMode(m, &sts[1], false);
+        try testing.expect(sts[1].draft_extra == null and sts[1].draft_whole);
+        dsv41.draftVocabMode(m, &sts[1], true);
+    }
+    // A request's prompt ids join its state's vocabulary: 7 and 31 (outside the file) become draftable; 5 (inside)
+    // adds nothing; an id the prompt repeats counts once; the bucket fills with the lowest ids outside (1 and 4 here,
+    // to the fixture's 96 ids). Off (MLX_SERVE_DSV41_DRAFT_VOCAB_PROMPT=0): the file's alone.
+    try dsv41.draftPromptVocab(m, &sts[0], &.{ 7, 5, 31, 7, 5 }, true);
+    const ex = sts[0].draft_extra.?;
+    try testing.expectEqual(@as(usize, 32), ex.e);
+    try testing.expectEqual(@as(usize, 96), ex.k);
+    const xids = (mlx.mlx_array_data_int32(ex.ids) orelse return error.NoData)[0..ex.k];
+    for ([_]i32{ 7, 31 }) |id| try testing.expect(std.mem.indexOfScalar(i32, xids, id) != null);
+    for ([_]u32{ 7, 31 }) |t1| {
+        var d = try dsv41.dsparkDraft(m, a, &sts[0], t1);
+        defer d.deinit(a);
+        for (d.ids[1..]) |id| try testing.expect(id < 96);
+    }
+    {
+        const off = env.override(.MLX_SERVE_DSV41_DRAFT_VOCAB_PROMPT, "0");
+        defer off.restore();
+        try dsv41.draftPromptVocab(m, &sts[0], &.{ 7, 31 }, true);
+        try testing.expect(sts[0].draft_extra == null);
+    }
+}
+
 test "deepseek_v4 served: mlx-community's withdrawn preview pack is refused by the legacy parse and, at load, by name" {
     const preview = @embedFile("fixtures/real/mlx-community_DeepSeek-V4-Flash-4bit.json");
     try testing.expectError(error.UnsupportedDsv4Config, model.parseConfigFromJson(testing.allocator, preview));
@@ -1339,6 +1598,7 @@ test "deepseek_v4 served: mlx-community's withdrawn preview pack is refused by t
 
 
 test "deepseek_v41 served: a prefill that fails after admission gives its memory promise back" {
+    if (!plugin_registry.has("deepseek_v41")) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

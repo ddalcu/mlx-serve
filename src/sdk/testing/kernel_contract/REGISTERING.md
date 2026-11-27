@@ -8,7 +8,8 @@ is `src/sdk/blocks/norms/contract.zig` (add_norm's three arms, the residual-norm
 
 One `contract.zig` per area, beside the area's Zig code (`src/sdk/blocks/<area>/contract.zig`,
 `src/plugins/<name>/contract.zig`), exporting `pub fn register(set: *kc.Set) !void`, added to `areas` in
-`registry.zig`. The kernel files and their launch code do not change; a private source const the contract needs
+`registry.zig` with its name in `area_names` and its own `kernel contract gates 1-4: <area>` test there (an area
+slower than about 80 s runs in parts, so the test shards spread it). The kernel files and their launch code do not change; a private source const the contract needs
 becomes `pub` (one word). The to-do list is `.bb/reports/kernel-registry-todo.tsv`.
 
 ## What a registration holds

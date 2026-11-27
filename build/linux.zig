@@ -32,54 +32,25 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     // CI passes -Dstrip: without debug info LLVM has less to emit, and the PR gate's binary is never shipped.
     const strip = b.option(bool, "strip", "Omit debug info and Zig symbols from the mlx-serve executable");
 
-    const version = b.option([]const u8, "version", "Version string") orelse config.readAppVersion(b) orelse "0.0.0-dev";
-    const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse config.readMlxcPin(b) orelse "unknown";
-
-    const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", version);
-    build_options.addOption(bool, "mas", false);
-    build_options.addOption([]const u8, "mlx_c_version", mlx_c_version);
-    build_options.addOption([]const u8, "ds4_commit", b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse config.readDs4Commit(b) orelse "unknown");
-    build_options.addOption([]const u8, "llama_tag", config.readLlamaTag(b) orelse "unknown");
-    build_options.addOption([]const u8, "git_sha", "");
-    build_options.addOption(bool, "ios", false);
-    build_options.addOption(bool, "units", units);
-    build_options.addOption(bool, "ds4_engine", !windows);
-    build_options.addOption(bool, "llama_engine", true);
-    // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
-    // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
-    build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
-
-    const embedded: libs.Embedded = .init(b, target, optimize);
+    const build_options = options(b, target, .{
+        .version = b.option([]const u8, "version", "Version string") orelse config.readAppVersion(b) orelse "0.0.0-dev",
+        .mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse config.readMlxcPin(b) orelse "unknown",
+        .ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse config.readDs4Commit(b) orelse "unknown",
+        .llama_tag = config.readLlamaTag(b) orelse "unknown",
+        .units = units,
+        // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
+        // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
+        .slow_tests = b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false,
+    });
 
     // The server and its unit tests (`zig build test`, root src/tests.zig) share one module setup.
-    const mlx_stamp = config.mlxStampModule(b, if (windows) "lib/mlx-win/.version" else "lib/mlx/.version");
     var mods: [2]*std.Build.Module = undefined;
     for (&mods, [_][]const u8{ "src/main.zig", "src/tests.zig" }) |*slot, root| {
-        const mod = b.createModule(.{
-            .root_source_file = b.path(root),
-            .target = target,
-            .optimize = optimize,
-            .strip = strip,
-            .link_libcpp = true,
-            .imports = &.{
-                .{ .name = "build_options", .module = build_options.createModule() },
-                .{ .name = "mlx_stamp", .module = mlx_stamp },
-                .{ .name = "mlx_steel_sources", .module = embedded.mlx_steel_sources },
-                .{ .name = "opencode2_plugin", .module = embedded.opencode2_plugin },
-                .{ .name = "agent_skills", .module = embedded.agent_skills },
-                .{ .name = "jinja_c", .module = libs.addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
-                .{ .name = "stb", .module = libs.addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
-                .{ .name = "webp", .module = if (windows)
-                    libs.addCHeaderModule(b, b.path("src/webp_stub.h"), b.path("src"), target, optimize, "")
-                else
-                    libs.addCHeaderModule(b, .{ .cwd_relative = "/usr/include/webp/decode.h" }, .{ .cwd_relative = "/usr/include" }, target, optimize, "") },
-            },
-        });
+        const mod = serverModule(b, target, optimize, root, build_options, if (windows) null else "/usr/include");
+        mod.strip = strip;
 
         // Jinja2 template engine — same vendored sources as the macOS graph, built
         // as an ELF static lib by scripts/build-mlx-linux.sh (zig c++).
-        _ = libs.addExl3Module(b, mod, target, optimize);
         if (windows) {
             mod.addCSourceFiles(.{
                 .root = b.path("lib/jinja_cpp"),
@@ -142,10 +113,10 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     const run_step = b.step("run", "Run mlx-serve");
     run_step.dependOn(&run_cmd.step);
 
-    const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
+    const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this substring (repeat it: a test runs if it matches any)") orelse &.{};
     const unit_tests = b.addTest(.{
         .root_module = mods[1],
-        .filters = if (test_filter) |f| &.{f} else &.{},
+        .filters = test_filters,
         .test_runner = .{ .path = b.path("build/test_runner.zig"), .mode = .server },
     });
     const test_step = b.step("test", "Run unit tests");
@@ -153,7 +124,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     if (builtin.os.tag != .windows) test_step.dependOn(&b.top_level_steps.get("unit-closure").?.step);
     const run_unit_tests = b.addRunArtifact(unit_tests);
     // Rerun every time when filtered, as on macOS (env-gated tests).
-    if (test_filter != null) run_unit_tests.has_side_effects = true;
+    if (test_filters.len != 0) run_unit_tests.has_side_effects = true;
     test_step.dependOn(&run_unit_tests.step);
 }
 
@@ -213,6 +184,64 @@ fn unitModule(
     libs.addMlxLib(b, m);
     _ = libs.addExl3Module(b, m, target, optimize);
     return m;
+}
+
+/// The values `options` takes from the build's own flags and stamps.
+pub const Pins = struct {
+    version: []const u8,
+    mlx_c_version: []const u8,
+    ds4_commit: []const u8,
+    llama_tag: []const u8,
+    units: bool,
+    slow_tests: bool,
+};
+
+/// `build_options` of the server and its tests on Linux and Windows: this graph and the macOS `check-cross` take
+/// them from here, so an option added for these targets is type-checked there too.
+pub fn options(b: *std.Build, target: std.Build.ResolvedTarget, p: Pins) *std.Build.Step.Options {
+    const windows = target.result.os.tag == .windows;
+    const o = b.addOptions();
+    o.addOption([]const u8, "version", p.version);
+    o.addOption(bool, "mas", false);
+    o.addOption([]const u8, "mlx_c_version", p.mlx_c_version);
+    o.addOption([]const u8, "ds4_commit", p.ds4_commit);
+    o.addOption([]const u8, "llama_tag", p.llama_tag);
+    o.addOption([]const u8, "git_sha", "");
+    o.addOption(bool, "ios", false);
+    o.addOption(bool, "units", p.units);
+    o.addOption(bool, "ds4_engine", !windows);
+    o.addOption(bool, "llama_engine", true);
+    o.addOption(bool, "slow_tests", p.slow_tests);
+    return o;
+}
+
+/// The Zig side of the server's or the tests' module (`root`) on Linux and Windows: its named modules and Sushi's
+/// EXL3, no C sources or libraries. This graph adds those; the macOS `check-cross` type-checks it as it is.
+/// `webp_dir`: the directory holding libwebp's `webp/decode.h`; null = the Windows stub's API (`src/webp_stub.h`).
+pub fn serverModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, root: []const u8, build_options: *std.Build.Step.Options, webp_dir: ?[]const u8) *std.Build.Module {
+    const windows = target.result.os.tag == .windows;
+    const embedded: libs.Embedded = .init(b, target, optimize);
+    const mod = b.createModule(.{
+        .root_source_file = b.path(root),
+        .target = target,
+        .optimize = optimize,
+        .link_libcpp = true,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "mlx_stamp", .module = config.mlxStampModule(b, if (windows) "lib/mlx-win/.version" else "lib/mlx/.version") },
+            .{ .name = "mlx_steel_sources", .module = embedded.mlx_steel_sources },
+            .{ .name = "opencode2_plugin", .module = embedded.opencode2_plugin },
+            .{ .name = "agent_skills", .module = embedded.agent_skills },
+            .{ .name = "jinja_c", .module = libs.addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
+            .{ .name = "stb", .module = libs.addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
+            .{ .name = "webp", .module = if (webp_dir) |dir|
+                libs.addCHeaderModule(b, .{ .cwd_relative = b.fmt("{s}/webp/decode.h", .{dir}) }, .{ .cwd_relative = dir }, target, optimize, "")
+            else
+                libs.addCHeaderModule(b, b.path("src/webp_stub.h"), b.path("src"), target, optimize, "") },
+        },
+    });
+    _ = libs.addExl3Module(b, mod, target, optimize);
+    return mod;
 }
 
 /// Linux counterpart of verifyMlxStage: fail loudly when scripts/

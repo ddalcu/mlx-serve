@@ -8,9 +8,6 @@ const int QW = (ROTATE != 0) ? D : (D - RD);
 const int NG = QW / GROUP;
 const float CODE_MAX = (ROTATE != 0) ? 6.0f : 448.0f;
 const float AMAX_FLOOR = (ROTATE != 0) ? metal::ldexp(6.0f, -126) : 1e-4f;
-const int MANT_BITS = (ROTATE != 0) ? 1 : 3;
-const int MIN_EXP = (ROTATE != 0) ? 0 : -6;
-const float MIN_SUB = metal::ldexp(1.0f, MIN_EXP);
 threadgroup float row[D];
 threadgroup float row2[(ROTATE != 0) ? D : 1];
 threadgroup float red[TG];
@@ -80,18 +77,14 @@ if (ROTATE != 0) {
   }
   threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 }
-// phase 5: ue8m0 per-group scales — 2^ceil(log2(amax/code_max)), exact
+// phase 5: ue8m0 per-group scales, 2^ceil(log2(amax/code_max)): MLX's e8m0 rounded up, the max keeping a NaN
 for (int g = lane; g < NG; g += TG) {
   float amax = AMAX_FLOOR;
   for (int e = 0; e < GROUP; ++e) {
     float v = (ROTATE != 0) ? row2[g * GROUP + e] : row[g * GROUP + e];
-    amax = metal::max(amax, metal::abs(v));
+    amax = mlxserve_maximum(amax, metal::abs(v));
   }
-  float q = amax / CODE_MAX;
-  int ee = 0;
-  float mm = metal::frexp(q, ee);
-  int ce = (mm == 0.5f) ? (ee - 1) : ee;
-  gsc[g] = metal::ldexp(1.0f, ce);
+  gsc[g] = mlxserve_mx_scale_round_up(amax / CODE_MAX);
 }
 threadgroup_barrier(metal::mem_flags::mem_threadgroup);
 // phase 6: quant-dequant (rope tail stays raw on the fp8 path) + write
@@ -100,18 +93,11 @@ for (int j = lane; j < D; j += TG) {
   float res = v;
   if (ROTATE != 0 || j < D - RD) {
     float scale = gsc[j / GROUP];
-    float y = metal::clamp(v / scale, -CODE_MAX, CODE_MAX);
-    float a = metal::abs(y);
-    float af = metal::max(a, MIN_SUB);
-    int ee2 = 0;
-    float mm2 = metal::frexp(af, ee2);
-    int e2 = ee2 - 1; // floor(log2(af)): mm2 in [0.5, 1)
-    (void)mm2;
-    if (e2 < MIN_EXP) e2 = MIN_EXP;
-    float quantum = metal::ldexp(1.0f, e2 - MANT_BITS);
-    float qv = metal::min(metal::rint(a / quantum) * quantum, CODE_MAX);
-    float sq = (y < 0.0f) ? -qv : ((y > 0.0f) ? qv : 0.0f);
-    res = sq * scale;
+    float y = mlxserve_clip(v / scale, -CODE_MAX, CODE_MAX);
+    // MLX's encoder on |y|, the sign the composed chain's sign(y): a zero comes out +0.
+    const float a = metal::abs(y);
+    const float qv = (ROTATE != 0) ? mlxserve_fp4_e2m1_round(a) : mlxserve_fp8_e4m3_round(a);
+    res = (qv * float((y > 0.0f) - (y < 0.0f))) * scale;
   }
   outw[w * D + j] = res;
 }

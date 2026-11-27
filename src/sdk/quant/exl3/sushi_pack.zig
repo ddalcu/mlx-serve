@@ -384,7 +384,7 @@ pub fn fp8Linear(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.m
 // e4m3 GEMV ported from sushi's fp8_block.zig (beamivalice/sushi, MIT): each simdgroup owns NR
 // weight rows for all M input rows, lanes stride a row in 16-byte chunks, products sum in f32.
 // The e4m3 decode is bit-exact: the code's low 7 bits as a half, times 256.
-pub const GEMV_HEADER = kernelSource("kernels/quant/sushi_gemv_header.metal");
+pub const GEMV_HEADER = @import("../fp4.zig").SCALE_HEADER ++ kernelSource("kernels/quant/sushi_gemv_header.metal");
 pub const GEMV_SOURCE = kernelSource("kernels/quant/sushi_gemv.metal");
 const GEMV_MAX_ROWS = 8;
 const GemvKey = struct { m: c_int, n: c_int, k: c_int, dt: mlx.mlx_dtype };

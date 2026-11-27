@@ -549,7 +549,7 @@ fn routedExperts(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, shared_d
     {
         reduced = true;
         shared_fused = shared_down != null or ungated_a4 != null;
-    } else if (gather_qmv_rows.moeDecodeDispatchArm(B, S, K, false, (w.clamp orelse 1) != 0) == .rows and
+    } else if (gather_qmv_rows.moeDecodeDispatchArm(B, S, K, false, gather_qmv_rows.rowsDeclineClamp(w.clamp)) == .rows and
         useGatherQmv(w) and w.gate.s.ctx != null and w.up.s.ctx != null and w.down.s.ctx != null and
         try gatherQmvRows(w, g, &out, x, r, D, K, B, S))
     {
@@ -702,13 +702,21 @@ fn cudaDecode(w: *const Moe.Weights, g: *Graph, out: *Array, x: Array, r: Routed
     return put(g, out, y, &.{ xs[0], xs[1], xs[2] });
 }
 
+/// The layer's per-expert gate / up scales and whole-number clamp, as the fused decode kernels take them.
+fn expertScales(w: *const Moe.Weights) gather_qmv.Scales {
+    return .{
+        .gate = if (w.gate.expert_scale.ctx != null) w.gate.expert_scale else null,
+        .up = if (w.up.expert_scale.ctx != null) w.up.expert_scale else null,
+        .clamp = w.clamp.?,
+    };
+}
+
 fn gatherQmvRows(w: *const Moe.Weights, g: *Graph, out: *Array, x: Array, r: Routed, D: c_int, K: c_int, batch: c_int, seq: c_int) !bool {
     const B = batch * seq;
     if (!down_reduce.gatherQmvDownReduceRowsEligible(HiddenAct.silu, w.gate.qp, w.up.qp, w.down.qp, D)) return false;
     const ind = try g.astype(try g.reshape(r.inds, &.{ B, K }), .uint32);
     const x2 = try g.reshape(x, &.{ B, D });
-    const gscale: ?Array = if (w.gate.expert_scale.ctx != null) w.gate.expert_scale else null;
-    const act = try g.adopt((try gather_qmv_rows.gatherQmvGateUpRows(g.s, x2, w.gate.w, w.gate.s, w.gate.b, w.up.w, w.up.s, w.up.b, ind, w.gate.qp.bits, w.gate.qp.group_size, w.gate.qp.mode, gscale)) orelse return false);
+    const act = try g.adopt((try gather_qmv_rows.gatherQmvGateUpRowsScaled(g.s, x2, w.gate.w, w.gate.s, w.gate.b, w.up.w, w.up.s, w.up.b, ind, w.gate.qp.bits, w.gate.qp.group_size, w.gate.qp.mode, expertScales(w))) orelse return false);
     const sc = try g.reshape(r.scores, &.{ B, K });
     const sum = (try down_reduce.gatherQmvDownReduceRows(g.s, act, w.down.w, w.down.s, w.down.b, ind, sc, w.down.qp.bits, w.down.qp.group_size, w.down.qp.mode)) orelse return false;
     const hidden = ops.shape(sum)[1];
@@ -728,7 +736,7 @@ fn gatherQmvDecode(w: *const Moe.Weights, g: *Graph, out: *Array, reduced: *bool
     const dq = w.down.qp;
     var act: ?Array = null;
     if (gq.bits == uq.bits and gq.group_size == uq.group_size and gq.mode == uq.mode) {
-        if (try gather_qmv.gatherQmvGateUp(g.s, x1, w.gate.w, w.gate.s, w.gate.b, w.up.w, w.up.s, w.up.b, ind, gq.bits, gq.group_size, gq.mode, w.clamp.?)) |y|
+        if (try gather_qmv.gatherQmvGateUpScaled(g.s, x1, w.gate.w, w.gate.s, w.gate.b, w.up.w, w.up.s, w.up.b, ind, gq.bits, gq.group_size, gq.mode, expertScales(w))) |y|
             act = try g.adopt(y);
     }
     if (act == null) {
@@ -830,11 +838,15 @@ fn sortedDown(w: *const Moe.Weights, g: *Graph, x_flat: Array, lhs: Array, gate:
     if (blocked and nax and gq.mode == uq.mode and (gq.mode == .affine or gq.mode.isFp4())) {
         const x_tok = try g.reshape(x_flat, &.{ ops.shape(x_flat)[0], 1, D });
         const row_map = try g.astype(lhs, .uint32);
-        if (fused_act.swigluFusedEnabled() and w.clamp != null and gate.expert_scale.ctx == null and up.expert_scale.ctx == null and
+        if (fused_act.swigluFusedEnabled() and w.clamp != null and
             gq.bits == uq.bits and gq.group_size == uq.group_size)
         {
             const sigtab = try sigmoidTable(g.s);
-            if (try gather_qmm_nax.sortedGateUp(x_tok, row_map, gate.w, gate.s, gate.b, up.w, up.s, up.b, idx, sigtab, w.clamp.?, gq.bits, gq.group_size, gq.mode.isFp4(), nax, g.s)) |a3| {
+            const esc: gather_qmm_nax.ExpertScales = .{
+                .gate = if (gate.expert_scale.ctx != null) gate.expert_scale else null,
+                .up = if (up.expert_scale.ctx != null) up.expert_scale else null,
+            };
+            if (try gather_qmm_nax.sortedGateUpScaled(x_tok, row_map, gate.w, gate.s, gate.b, up.w, up.s, up.b, idx, sigtab, w.clamp.?, esc, gq.bits, gq.group_size, gq.mode.isFp4(), nax, g.s)) |a3| {
                 const sh = ops.shape(a3);
                 act = try g.reshape(try g.adopt(a3), &.{ sh[0], sh[2] });
             }
@@ -966,7 +978,7 @@ fn streamedRouted(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Arra
         return slotArms(w, g, x, r, &sl, shared_down, n);
     }
     const one_row = B * S == 1;
-    const rows_arm = gather_qmv_rows.moeDecodeDispatchArm(B, S, K, false, (w.clamp orelse 1) != 0) == .rows;
+    const rows_arm = gather_qmv_rows.moeDecodeDispatchArm(B, S, K, false, gather_qmv_rows.rowsDeclineClamp(w.clamp)) == .rows;
     if (!one_row and !rows_arm) return sortedGroups(w, st, g, x, r, ids, B, S, D, K);
     if (distinctCount(ids) <= routed.max_call_experts) return slotArms(w, g, x, r, &(try fetchSlotsWith(w, st, ids, scores)), shared_down, n);
     return rowChunks(w, st, g, x, r, ids, B, S, D, K);

@@ -69,6 +69,7 @@ pub fn addVzAgent(
 
     // Host-side tests of the same source.
     const tests = b.addTest(.{
+        .name = "vz-agent-test",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/host/sandbox/vz_agent.zig"),
             .target = host_target,

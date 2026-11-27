@@ -720,8 +720,11 @@ test "driver: a whole-prompt pass's checkpoints are billed at the plugin's check
     binding.parsed.caps.whole_prompt_prefill = false;
     try t.expectEqual(@as(u64, 18_380) + chunk, streamPromptNeed(&cfg, 18_380, chunk).?);
 
-    const v41_config = @import("../../../plugins/deepseek_v41/config.zig");
-    const v41_bill = @import("../../../plugins/deepseek_v41/bill.zig");
+    const dsv41_link = @import("dsv41_link.zig");
+    // DeepSeek-V4.1 is in macOS builds only.
+    if (!dsv41_link.on) return;
+    const v41_config = dsv41_link.config;
+    const v41_bill = dsv41_link.bill;
     const json = model.dsv41_release_config;
     const mem: @import("../../../sdk/root.zig").fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = json }} };
     const dir = mem.packDir();

@@ -22,7 +22,7 @@ pub const Out = struct { shape: [4]c_int = @splat(0), ndim: usize, dtype: mlx.ml
 pub const Geometry = struct {
     grid: [3]c_int,
     tg: [3]c_int,
-    outs: [6]Out = undefined,
+    outs: [8]Out = undefined,
     n_outs: usize = 0,
     targs: [20]TArg = undefined,
     n_targs: usize = 0,

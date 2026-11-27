@@ -15,14 +15,6 @@ inline uint dec_up_field(thread const uint* q, int i) {
   return (q[wi] >> s) & MASK;
 }
 
-// Four e4m3 bytes of `w` as floats, bytes 0..3 in order, each 2^-8 of its value (the half exponent bias is 8 above e4m3's).
-inline float4 dec_up_e4m3x4(uint w) {
-  const uint lo = ((w << 7) & 0x3F803F80u) | ((w << 8) & 0x80008000u);
-  const uint hi = ((w >> 1) & 0x3F803F80u) | (w & 0x80008000u);
-  const half2 a = as_type<half2>(lo), c = as_type<half2>(hi);
-  return float4(a.x, c.x, a.y, c.y);
-}
-
 // Entry i of the decode table: the EPL fields packed in i (one byte of 2-bit fields, six bits of 3-bit ones), as floats.
 template <int BITS>
 inline void dec_up_table(threadgroup vec<float, BITS == 2 ? 4 : 2>* lut, uint tid, uint threads) {
@@ -99,8 +91,8 @@ inline void dec_up_routed(const device uint32_t* w, const device T* sc, const de
 }
 
 // The shared expert's gate (acc[r][0]) and up (acc[r][1]) of output row n against each of R x rows; its weights are
-// decoded once whatever R is.
-template <int R, int K, int N, typename T>
+// decoded once whatever R is. Its mxfp8 reads are fp8_read_header.metal's (FOLD: `MLX_SERVE_DSV41_FP8_FOLD`).
+template <int R, int K, int N, typename T, int FOLD = 0>
 inline void dec_up_shared(const device uint32_t* sw, const device uint8_t* ss, uint n, const device T* x, uint lane, thread float (*acc)[2]) {
   constexpr uint KWS = K / 4, KGS = K / 32, UPL = K / 1024;
   const uint wo[2] = {n * KWS + lane * 8, (n + N) * KWS + lane * 8};
@@ -110,13 +102,13 @@ inline void dec_up_shared(const device uint32_t* sw, const device uint8_t* ss, u
 #pragma unroll
   for (int k = 0; k < UPL; ++k) {
     uint q[2][8];
-    float f[2];
+    float2 f[2];
 #pragma unroll
     for (int wr = 0; wr < 2; ++wr) {
 #pragma unroll
       for (int j = 0; j < 8; ++j) q[wr][j] = sw[wo[wr] + k * 256 + j];
       const uint e = uint(ss[so[wr] + 32 * k]);
-      f[wr] = as_type<float>(e == 0u ? 0x400000u : (e << 23)) * 256.0f;
+      f[wr] = dsv41_e8m0<FOLD>(e);
     }
     float dq[R][2];
 #pragma unroll
@@ -126,8 +118,8 @@ inline void dec_up_shared(const device uint32_t* sw, const device uint8_t* ss, u
       float4 wv[2][2];
 #pragma unroll
       for (int wr = 0; wr < 2; ++wr) {
-        wv[wr][0] = dec_up_e4m3x4(q[wr][2 * c]);
-        wv[wr][1] = dec_up_e4m3x4(q[wr][2 * c + 1]);
+        wv[wr][0] = dsv41_e4m3x4<FOLD>(q[wr][2 * c]);
+        wv[wr][1] = dsv41_e4m3x4<FOLD>(q[wr][2 * c + 1]);
       }
 #pragma unroll
       for (int r = 0; r < R; ++r) {
@@ -147,8 +139,8 @@ inline void dec_up_shared(const device uint32_t* sw, const device uint8_t* ss, u
     }
 #pragma unroll
     for (int r = 0; r < R; ++r) {
-      acc[r][0] = fma(f[0], dq[r][0], acc[r][0]);
-      acc[r][1] = fma(f[1], dq[r][1], acc[r][1]);
+      acc[r][0] = fma(f[0].x, dq[r][0] * f[0].y, acc[r][0]);
+      acc[r][1] = fma(f[1].x, dq[r][1] * f[1].y, acc[r][1]);
     }
   }
 #pragma unroll

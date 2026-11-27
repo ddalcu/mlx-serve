@@ -44,7 +44,7 @@ pub fn build(b: *std.Build) void {
     const units_opt = b.option(bool, "units", "Compile the host, the engine and each plugin group as their own units, in parallel");
     const units = units_opt orelse (builtin.os.tag == .macos);
     // A plugin registers by its folder: the scan writes src/plugins/registry.zig, every graph compiles it.
-    const plugin_names = plugins.generate(b);
+    const plugin_names = plugins.generate(b, target.result.os.tag);
 
     // `lint`, `lint-test`, `unit-closure`.
     lint.add(b);
@@ -66,13 +66,17 @@ pub fn build(b: *std.Build) void {
     const tests = macos.addUnitTests(&graph);
     // `kit`, and the kit's example plugins built from it as dylibs the unit tests load; its closure's tests join `test`.
     kit.add(b, graph.version, tests.runs);
-    kit.addTests(b, tests.step);
+    kit.addTests(b, tests.aux);
+    // `test-compile` (after `kit.add`: it takes the runs' dependencies).
+    macos.addTestCompile(b, tests);
     // `exl3-test`.
     macos.addPluginTests(&graph, tests);
-    // `check`.
+    // `check`, `check-cross`.
     macos.addCheck(&graph);
     // `vz-agent`, `vz-agent-host`; its host-side tests join `test`.
-    standalone.addVzAgent(b, target, optimize, tests.step);
+    standalone.addVzAgent(b, target, optimize, tests.aux);
+    // `test-aux-build` (after every `test-aux` test is added).
+    macos.addAuxBuild(b, tests);
     // `ios-lib`, `ios-lib-sim`.
     ios.add(b, graph.version, host.brew_prefix);
 }

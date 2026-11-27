@@ -171,15 +171,15 @@ for (int f = 0; f < PAIRS; ++f) {
       float d = 0.0f;
       for (int k = 0; k < 8; ++k) {
         const uint wk = sr[2 * q + k / 4][k % 4];
-        const float2 lo = mlxserve_e4m3x2(wk), hi = mlxserve_e4m3x2(wk >> 8);
+        const float2 lo = dsv41_e4m3x2<FOLD>(wk), hi = dsv41_e4m3x2<FOLD>(wk >> 8);
         d = metal::fma(xf[4 * k], lo.x, d);
         d = metal::fma(xf[4 * k + 1], hi.x, d);
         d = metal::fma(xf[4 * k + 2], lo.y, d);
         d = metal::fma(xf[4 * k + 3], hi.y, d);
       }
-      // e8m0 as 2^(e - 127), times the 2^8 the e4m3 bit placement leaves out.
-      const uint e8 = (ss_ >> (8 * q)) & 0xFFu;
-      c = metal::fma(as_type<float>(e8 == 0u ? 0x400000u : (e8 << 23)) * 256.0f, d, c);
+      // The e8m0 scale and the 2^8 the e4m3 reads leave out.
+      const float2 f = dsv41_e8m0<FOLD>((ss_ >> (8 * q)) & 0xFFu);
+      c = metal::fma(f.x, d * f.y, c);
     }
     for (int a = 0; a < ROWS; ++a) accr[a] += rr == a ? c : 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);

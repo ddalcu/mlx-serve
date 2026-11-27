@@ -1,3 +1,4 @@
 # The patches scripts/build-mlx.sh applies before it builds lib/mlx, in order. Their SHA-1 is the stamp's patch=,
 # which build/config.zig checks against this same list. Format: `<submodule> <patch>` from the repo root; `#` comments.
 lib/mlxc-src patches/mlxc-gather-qmm-global-scale.patch
+lib/mlx-src patches/mlx-metal-wide-reserve.patch

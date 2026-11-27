@@ -78,7 +78,7 @@ pub fn verifyExpertReuse(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, 
 // Match the eight bf16 partial sums used by MLX col_reduce_small (top-k rows, hidden H).
 pub const VERIFY_EXPERT_REDUCE_SOURCE = kernelSource("kernels/moe/verify_expert_reduce.metal");
 var verify_expert_reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
-const ExpertReduceCfgs = QsaCfgCache([3]c_int, 1);
+const ExpertReduceCfgs = QsaCfgCache([4]c_int, 1);
 var verify_expert_reduce_cfgs = ExpertReduceCfgs{};
 var prefill_expert_reduce_cfgs = ExpertReduceCfgs{};
 
@@ -128,7 +128,8 @@ fn expertReduceApply(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_ar
         verify_expert_reduce_kernel = value;
         break :blk value;
     };
-    const key = [3]c_int{ batch, tokens, topk };
+    // The config carries the output shape and H: hidden is part of the key.
+    const key = [4]c_int{ batch, tokens, topk, hidden };
     const cfg = blk: {
         if (cfgs.get(key)) |hit| break :blk hit[0];
         const value = mlx.mlx_fast_metal_kernel_config_new();

@@ -6,8 +6,8 @@ const env = @import("../../env.zig");
 const generate_mod = @import("generate.zig");
 const transformer_mod = @import("transformer.zig");
 const model_mod = @import("../../sdk/config/model.zig");
-const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
-const v41_plugin = @import("../../plugins/deepseek_v41/plugin.zig");
+const dsv41_mod = @import("plugin/dsv41_link.zig").deepseek_v41;
+const v41_plugin = @import("plugin/dsv41_link.zig").plugin;
 const plugin_config = @import("plugin/config.zig");
 const plugin_driver = @import("plugin/driver.zig");
 const LoadedModel = @import("../../host/registry/registry.zig").LoadedModel;
@@ -31,6 +31,7 @@ const mtpCapable = request_options.mtpCapable;
 const defaultEnableMtp = request_options.defaultEnableMtp;
 
 test "native speculation: resolved opt-out gates capability and API defaults" {
+    if (!@import("plugin/dsv41_link.zig").on) return error.SkipZigTest;
     const saved = env.override(.MLX_SERVE_DSV4_DSPARK, null);
     defer saved.restore();
     // A served V4.1 whose module loaded three DSpark stages.

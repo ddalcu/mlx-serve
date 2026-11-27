@@ -7,6 +7,7 @@
 //   pin  uint32 [K NT 2]: steps 0..K-1's (value bits, index) pair a threadgroup (a placeholder at K = 0)
 //   pout uint32 [(K + 1) NT 2]: pin, then this step's pairs
 //   row  f32 [V] with KEEP: the biased row (else unwritten)
+//   gu   f32 [B, V], it f32 [1] (DSV41_MK_SAMPLE): uniforms in [0, 1) and 1 / T; the step's token is then a draw
 const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
 const uint tid = thread_index_in_threadgroup, tg = threadgroup_position_in_grid.x;
 constexpr uint SGN = 8u;
@@ -56,10 +57,19 @@ for (uint q = gs; q < Q; q += NS) {
     for (uint tm = 0; tm < 4u; ++tm) {
       const float v = lg[KC * VC + r0 + tm] + static_cast<float>(static_cast<T>(result[tm]));
       if (KEEP != 0) row[r0 + tm] = v;
+#ifdef DSV41_MK_SAMPLE
+      // Sampled (MLX_SERVE_DSV41_DRAFT_SAMPLE): Gumbel-max over v / T with gu's uniforms, a draw from softmax(v / T).
+      const float sv = v * it[0] - metal::precise::log(-metal::precise::log(gu[KC * VC + r0 + tm]));
+      if (dsv41_mk_better(sv, r0 + tm, bv, bi)) {
+        bv = sv;
+        bi = r0 + tm;
+      }
+#else
       if (dsv41_mk_better(v, r0 + tm, bv, bi)) {
         bv = v;
         bi = r0 + tm;
       }
+#endif
     }
   }
 }

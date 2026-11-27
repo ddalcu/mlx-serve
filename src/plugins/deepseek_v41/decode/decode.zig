@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const env = @import("../../../env.zig");
+const lev = @import("../levers.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 
@@ -13,10 +14,16 @@ pub const idx_score = @import("idx_score.zig");
 pub const topk = @import("topk.zig");
 pub const attn = @import("attn.zig");
 pub const wo_a = @import("wo_a.zig");
+pub const woa_plain = @import("woa_plain.zig");
 pub const ffn_in = @import("ffn_in.zig");
 pub const moe_up = @import("moe_up.zig");
 pub const moe_fp4 = @import("moe_fp4.zig");
 pub const moe_down = @import("moe_down.zig");
+pub const engram_kv = @import("engram_kv.zig");
+pub const engram_ids = @import("engram_ids.zig");
+pub const engram_kvc = @import("engram_kvc.zig");
+pub const plan = @import("plan.zig");
+pub const fp8_codes = @import("fp8_codes.zig");
 
 const dsv41 = @import("../deepseek_v41.zig");
 
@@ -24,12 +31,58 @@ const A = mlx.mlx_array;
 
 /// The most rows a decode kernel serves in one launch: a plain step, or a DSpark verify block.
 pub const max_rows = 6;
+comptime {
+    std.debug.assert(plan.max_rows == max_rows);
+}
 
 /// What this machine streams from memory in practice (a plain reduction on the M5 Ultra), bytes a microsecond.
 pub const stream_bytes_per_us: f64 = 1.065e6;
 
 pub fn register(set: *kc.Set) !void {
-    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_fp4, moe_down }) |k| try k.register(set);
+    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, woa_plain, ffn_in, moe_up, moe_fp4, moe_down, engram_kv, engram_kvc }) |k| try k.register(set);
+}
+
+/// An op's outputs for one launch over some rows (the rows on axis 0; an unused slot has no array), for
+/// `rowsInvariant`.
+pub const RowOuts = [8]A;
+
+/// The words of row `r` of `got` (an R-row launch's output) that differ from `want` (that row's one-row launch), as
+/// f32 bits (bf16, f32 and small integers read exactly).
+pub fn rowWordsDiffer(got: A, r: usize, want: A) !usize {
+    const gpa = std.testing.allocator;
+    const g = try dsv41.hostF32(got);
+    defer gpa.free(g);
+    const w = try dsv41.hostF32(want);
+    defer gpa.free(w);
+    const rows: usize = @intCast(mlx.getShape(got)[0]);
+    if (w.len * rows != g.len) return error.ShapeMismatch;
+    var n: usize = 0;
+    for (g[r * w.len ..][0..w.len], w) |a, b| n += @intFromBool(@as(u32, @bitCast(a)) != @as(u32, @bitCast(b)));
+    return n;
+}
+
+/// The R-invariance bar of `plan.zig`'s `r_invariant` covers: `c.runRows(lo, hi)` runs an op over input rows [lo, hi)
+/// (`RowOuts`); the rows of each R-row launch, R = 1..`max_rows`, whose words differ from that row's one-row launch,
+/// each printed. 0 is the bar.
+pub fn rowsInvariant(label: []const u8, c: anytype) !usize {
+    var one: [max_rows]RowOuts = undefined;
+    for (0..max_rows) |r| one[r] = try c.runRows(r, r + 1);
+    var bad: usize = 0;
+    var checked: usize = 0;
+    for (1..max_rows + 1) |R| {
+        const got = try c.runRows(0, R);
+        for (0..R) |r| for (got, one[r], 0..) |g, w, o| {
+            if (g.ctx == null) continue;
+            checked += 1;
+            const d = try rowWordsDiffer(g, r, w);
+            if (d == 0) continue;
+            bad += 1;
+            std.debug.print("[exact-rows] {s} R={d} row {d} output {d}: {d} words differ from its one-row launch\n", .{ label, R, r, o, d });
+        };
+    }
+    if (checked == 0) return error.NothingChecked;
+    std.debug.print("[exact-rows] {s}: {d} of {d} row outputs differ from their one-row launches, R = 1..{d}\n", .{ label, bad, checked, max_rows });
+    return bad;
 }
 
 /// Root-mean-square of `got - want` over that of `want`.
@@ -44,6 +97,66 @@ pub fn relRms(got: []const f32, want: []const f32) f64 {
     return @sqrt(e / @max(t, 1e-300));
 }
 
+/// An output's distance from its float64 truth, summed over calls: squared error, the truth's square, the largest
+/// absolute error, and the non-finite values (each one farther than anything).
+pub const Dist = struct {
+    se: f64 = 0,
+    ss: f64 = 0,
+    max: f64 = 0,
+    bad: usize = 0,
+
+    /// `got` f32 or f64 values against `truth`.
+    pub fn add(d: *Dist, got: anytype, truth: []const f64) void {
+        std.debug.assert(got.len == truth.len);
+        for (got, truth) |g, t| {
+            const v: f64 = g;
+            if (!std.math.isFinite(v)) {
+                d.bad += 1;
+                continue;
+            }
+            d.se += (v - t) * (v - t);
+            d.ss += t * t;
+            d.max = @max(d.max, @abs(v - t));
+        }
+    }
+
+    pub fn l2(d: Dist) f64 {
+        return @sqrt(d.se / @max(d.ss, 1e-300));
+    }
+
+    /// No farther from float64 than `o` in l2 and in max.
+    pub fn within(d: Dist, o: Dist) bool {
+        return d.bad == 0 and d.se <= o.se and d.max <= o.max;
+    }
+
+    pub fn join(d: *Dist, o: Dist) void {
+        d.se += o.se;
+        d.ss += o.ss;
+        d.max = @max(d.max, o.max);
+        d.bad += o.bad;
+    }
+};
+
+/// The words where `a` and `b` differ, and of those how many `a` holds nearer to `truth` and how many farther.
+pub const WordDiff = struct {
+    differ: usize = 0,
+    nearer: usize = 0,
+    farther: usize = 0,
+    words: usize = 0,
+
+    pub fn add(w: *WordDiff, a: []const f32, b: []const f32, truth: []const f64) void {
+        for (a, b, truth) |x, y, t| {
+            w.words += 1;
+            if (@as(u32, @bitCast(x)) == @as(u32, @bitCast(y))) continue;
+            w.differ += 1;
+            const ex = @abs(@as(f64, x) - t);
+            const ey = @abs(@as(f64, y) - t);
+            w.nearer += @intFromBool(ex < ey);
+            w.farther += @intFromBool(ex > ey);
+        }
+    }
+};
+
 /// The fusion bar: `new` is no further from `truth` than today's `chain` (1.25x, plus 1e-4 of truth's scale).
 pub fn expectNoWorse(label: []const u8, new: []const f32, chain: []const f32, truth: []const f32) !void {
     const en = relRms(new, truth);
@@ -51,6 +164,42 @@ pub fn expectNoWorse(label: []const u8, new: []const f32, chain: []const f32, tr
     std.debug.print("[dec] {s}: new-truth {e:.2}, chain-truth {e:.2} (rel rms)\n", .{ label, en, ec });
     for (new) |v| if (!std.math.isFinite(v)) return error.NonFinite;
     if (en > 1.25 * ec + 1e-4) return error.FurtherFromTruth;
+}
+
+/// The mxfp8 reads (MLX's, or the 2^8 fold under `FOLD`): `fp8_read_header.metal` after the e4m3 / e8m0 reads.
+pub const FP8_READ_HEADER = @import("../../../sdk/quant/fp4.zig").SCALE_HEADER ++ @import("../../../mlx/kernels.zig").source("plugins/deepseek_v41/kernels/fp8_read_header.metal");
+
+/// The mxfp8 reads' template int `FOLD` (`MLX_SERVE_DSV41_FP8_FOLD`, read every call): 1 the 2^8 fold (the default:
+/// the same product on every finite code under 247, fewer operations), 0 MLX's reads (=0, or where the load found a
+/// code the fold reads apart from MLX, `fp8_codes.settle`).
+pub fn fp8Fold() c_int {
+    return @intFromBool(lev.onUnlessZero(.FP8_FOLD) and fp8_codes.ps().fold);
+}
+
+/// A contract kernel at `FOLD` 0 (MLX's mxfp8 reads) and 1 (the fold) on the same inputs, each served shape over three
+/// seeds of its random fill (finite e4m3 codes, e8m0 under 247): byte for byte, else `error.FoldDiffers`.
+pub fn expectFoldSame(comptime D: type, comptime launch: *const kc.metal.Launch, p: D.Params, shapes: []const kc.spec.Shape) !void {
+    const kit = @import("../../deepseek_v4/contract_kit.zig");
+    const a = std.testing.allocator;
+    for (shapes) |shape| for (1..4) |seed| {
+        var c = kit.Case(D).init(a, launch, p);
+        defer c.deinit();
+        if (!try c.prepare(shape, .random, seed)) continue;
+        var g = D.geometry(p, shape).?;
+        const mlx_reads = try a.dupe(u8, blk: {
+            try c.rig.launch(launch, g, c.args[0..c.n_in]);
+            break :blk c.rig.outputBytes();
+        });
+        defer a.free(mlx_reads);
+        for (g.targs[0..g.n_targs]) |*t| if (std.mem.orderZ(u8, t.name, "FOLD") == .eq) {
+            t.v = .{ .int = 1 };
+        };
+        try c.rig.launch(launch, g, c.args[0..c.n_in]);
+        if (!std.mem.eql(u8, mlx_reads, c.rig.outputBytes())) {
+            std.debug.print("{s} {d}x{d}x{d} seed {d}: FOLD=1 bytes differ from MLX's reads\n", .{ launch.name, shape.rows, shape.n, shape.k, seed });
+            return error.FoldDiffers;
+        }
+    };
 }
 
 /// The ubenches run only with `DSV41_DEC_UBENCH` set (under `~/claude-tmp/dsdec/with.sh gpu`).
@@ -92,6 +241,17 @@ test "dsv41 dec layers: the fused kernels decode no further from an f32 model th
 test "dsv41 dec layers: the fused kernels over mxfp4 experts decode no further from an f32 model than today's chain" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     try layersAgree(std.testing.allocator, 20, 23, true);
+}
+
+test "dsv41 dec layers: under MLX_SERVE_DSV41_FUSE_WQB_RING on and off, the fused kernels decode no further from an f32 model than today's chain" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    inline for (.{ "1", "0" }) |arm| {
+        var o0 = env.override(.MLX_SERVE_DSV41_FUSE_WQB_RING, arm);
+        defer o0.restore();
+        std.debug.print("[dec] switches ring={s}\n", .{arm});
+        for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 } }) |range| try layersAgree(gpa, range[0], range[1], false);
+    }
 }
 
 fn layersAgree(gpa: std.mem.Allocator, lo: usize, hi: usize, fp4: bool) !void {
@@ -141,6 +301,11 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
     const gpa = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const iou = @import("../../../sdk/util/io_util.zig");
+    // `DSV41_DEC_UBENCH` naming "nvfp4" or "mxfp4": the experts in that format, the fp4 MoE kernels' levers off against
+    // the arms it names (`layersFp4Levers`).
+    if (env.span(.DSV41_DEC_UBENCH)) |v| for ([_][]const u8{ "nvfp4", "mxfp4" }) |f| {
+        if (std.mem.indexOf(u8, v, f) != null) return layersFp4Levers(gpa, f[0] == 'n', v);
+    };
     // A fixture an arm: the compiled `.ffn` region keeps the MoE kernels of its first trace.
     for ([_]bool{ true, false }) |fused| {
         // 64 experts a layer: 20 layers hold ~20 GB, so a step's weights come from DRAM, not the SLC.
@@ -164,6 +329,91 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
             std.debug.print("[dec-ubench] layers 20..40 R={d} {s}: {d:.1} us a layer (median step {d:.0} us)\n", .{ rows, if (fused) "fused" else "chain", times[times.len / 2] / 20, times[times.len / 2] });
         }
     }
+}
+
+/// The layers ubench over fp4 experts (`nv`: NVFP4 with per-expert scales, else MXFP4), R = 1..6: the fp4 MoE
+/// kernels' levers (`moe_fp4.Levers`) off (A) against each B arm, A first, twice over (a fixture an arm). B arms: the
+/// words "dw", "us" (one lever each) and "all" in `DSV41_DEC_UBENCH`, else the levers as their switches are set.
+fn layersFp4Levers(gpa: std.mem.Allocator, nv: bool, spec_: []const u8) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const iou = @import("../../../sdk/util/io_util.zig");
+    const L = moe_fp4.Levers;
+    // The third field: `MLX_SERVE_DSV41_MOE_DOWN_ORDER` (the down launch's column block major grid at 2 rows and up); the
+    // fourth `MLX_SERVE_DSV41_FFN_IN_SINK` (ffn_in launch 2's mix tail in its own launch).
+    const Arm = struct { []const u8, L, bool, bool };
+    const named = [_]Arm{
+        .{ "dw", .{ .dec_word = true }, false, false },
+        .{ "us", .{ .up_split = true }, false, false },
+        .{ "all", .{ .dec_word = true, .up_split = true }, false, false },
+        .{ "ctl", .{ .dec_word = true }, moe_fp4.orderOn(), false },
+        .{ "order", .{ .dec_word = true }, true, false },
+        .{ "sink", .{ .dec_word = true }, moe_fp4.orderOn(), true },
+    };
+    var arms: [1 + named.len]Arm = undefined;
+    arms[0] = .{ "A (off)", .{}, false, false };
+    var n: usize = 1;
+    var it = std.mem.tokenizeAny(u8, spec_, " ,:");
+    while (it.next()) |w| for (named) |c| if (std.mem.eql(u8, w, c[0])) {
+        arms[n] = c;
+        n += 1;
+    };
+    if (n == 1) {
+        arms[1] = .{ "as set", L.fromEnv(), moe_fp4.orderOn(), ffn_in.sinkOn() };
+        n = 2;
+    }
+    std.debug.print("[dec-ubench] layers 20..40 {s} experts, {d} arms, two rounds\n", .{ if (nv) "nvfp4 + per-expert scales" else "mxfp4", n });
+    var us: [1 + named.len][max_rows]f64 = undefined;
+    for (&us) |*row| row.* = @splat(0);
+    for (0..2 * n) |k| {
+        const arm = arms[k % n];
+        const lv = arm[1];
+        const o0 = env.override(.MLX_SERVE_DSV41_FP4_DEC_WORD, if (lv.dec_word) "1" else "0");
+        defer o0.restore();
+        const o1 = env.override(.MLX_SERVE_DSV41_FP4_UP_SPLIT, if (lv.up_split) "1" else "0");
+        defer o1.restore();
+        const o2 = env.override(.MLX_SERVE_DSV41_MOE_DOWN_ORDER, if (arm[2]) "1" else "0");
+        defer o2.restore();
+        const o3 = env.override(.MLX_SERVE_DSV41_FFN_IN_SINK, if (arm[3]) "1" else "0");
+        defer o3.restore();
+        const t_fx = iou.nowUsMonotonic(io);
+        // 64 experts a layer: 20 layers hold ~30 GB, so a step's weights come from DRAM, not the SLC.
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 40, .experts = 64, .ctx = 4096, .fused = true, .experts_fp4 = !nv, .experts_nvfp4 = nv, .expert_scales = if (nv) .all else .none });
+        defer fx.deinit();
+        std.debug.print("[dec-ubench] arm {s}: fixture {d:.1} s\n", .{ arm[0], @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t_fx)) / 1e6 });
+        var p0: usize = 4096;
+        for (1..max_rows + 1) |rows| {
+            const x = try fx.stream(rows);
+            defer _ = mlx.mlx_array_free(x);
+            const pre = try fx.cpre(rows);
+            defer _ = mlx.mlx_array_free(pre);
+            var times: [21]f64 = undefined;
+            for (0..3 + times.len) |rep| {
+                const t0 = iou.nowUsMonotonic(io);
+                const out = try dsv41.workerStep(fx.m, gpa, x, pre, p0, false, false);
+                for (out) |o| _ = mlx.mlx_array_free(o);
+                if (rep >= 3) times[rep - 3] = @floatFromInt(iou.nowUsMonotonic(io) - t0);
+                p0 += rows;
+            }
+            std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+            const med = times[times.len / 2] / 20;
+            us[k % n][rows - 1] += med / 2;
+            std.debug.print("[dec-ubench] layers 20..40 R={d} {s}: {d:.1} us a layer (median step {d:.0} us, p10 {d:.0}, p90 {d:.0})\n", .{ rows, arm[0], med, times[times.len / 2], times[times.len / 10], times[times.len * 9 / 10] });
+        }
+    }
+    // Each arm against A, and an arm after "ctl" (the control's levers) against "ctl" too.
+    var ctl: ?usize = null;
+    for (arms[0..n], 0..) |a, j| if (std.mem.eql(u8, a[0], "ctl")) {
+        ctl = j;
+    };
+    for (1..max_rows + 1) |rows| for (1..n) |j| {
+        const a = us[0][rows - 1];
+        const b = us[j][rows - 1];
+        std.debug.print("[dec-ubench] layers 20..40 R={d} {s}: {d:.1} us a layer against A {d:.1} ({d:.1} us, {d:.2}%)\n", .{ rows, arms[j][0], b, a, b - a, 100 * (b - a) / a });
+        if (ctl) |c| if (j > c) {
+            const cu = us[c][rows - 1];
+            std.debug.print("[dec-ubench] layers 20..40 R={d} {s}: {d:.1} us a layer against ctl {d:.1} ({d:.1} us, {d:.2}%)\n", .{ rows, arms[j][0], b, cu, b - cu, 100 * (b - cu) / cu });
+        };
+    };
 }
 
 /// One link of `HandOff`'s chain, shaped like a tensor split's decode `tpSum` past two ranks: a GPU producer of the
@@ -215,5 +465,87 @@ test "dsv41 dec ubench: a tensor sum's GPU-CPU-GPU hand-off without the network 
 test {
     _ = fixture;
     _ = @import("exact_test.zig");
-    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_down }) |k| _ = k;
+    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, woa_plain, ffn_in, moe_up, moe_down, engram_kv, engram_ids, engram_kvc, fp8_codes, plan }) |k| _ = k;
+}
+
+test "dsv41 dec fp8 reads: every e4m3 code at every byte reads as MLX's from_fp8, every e8m0 code as MLX's fp8.h; FOLD differs only where it overflows or misses a NaN" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    // Word w holds codes 4w .. 4w + 3 rotated by w % 4 bytes, so each code lands at each byte position.
+    var words: [256]u32 = undefined;
+    for (&words, 0..) |*w, i| {
+        const base: u32 = @intCast((i / 4) * 4);
+        const raw = base | (base + 1) << 8 | (base + 2) << 16 | (base + 3) << 24;
+        w.* = std.math.rotl(u32, raw, 8 * (i % 4));
+    }
+    const src =
+        \\const uint i = thread_position_in_grid.x;
+        \\const float4 v = FOLD != 0 ? dsv41_e4m3x4<1>(w[i]) : dsv41_e4m3x4<0>(w[i]);
+        \\for (int b = 0; b < 4; ++b) e4[4 * i + b] = v[b] * 256.0f;
+        \\const float2 f = FOLD != 0 ? dsv41_e8m0<1>(i) : dsv41_e8m0<0>(i);
+        \\e8[2 * i] = f.x;
+        \\e8[2 * i + 1] = f.y;
+        \\
+    ;
+    const k = try dsv41.buildKernel("dsv41_fp8_read_codes", &.{"w"}, &.{ "e4", "e8" }, src, FP8_READ_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(k);
+    const wa = mlx.mlx_array_new_data(&words, &[_]c_int{256}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(wa);
+    var code_bytes: [1024]u8 = undefined;
+    for (&code_bytes, 0..) |*c, j| c.* = @truncate(words[j / 4] >> @intCast(8 * (j % 4)));
+    const ca = mlx.mlx_array_new_data(&code_bytes, &[_]c_int{1024}, 1, .uint8);
+    defer _ = mlx.mlx_array_free(ca);
+    var mlx_e4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mlx_e4);
+    try mlx.check(mlx.mlx_from_fp8(&mlx_e4, ca, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(mlx_e4));
+    const want_e4 = mlx.mlx_array_data_float32(mlx_e4) orelse return error.NoData;
+    for ([_]c_int{ 0, 1 }) |fold| {
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{1024}, 1, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{512}, 1, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "FOLD", fold));
+        const iv = mlx.mlx_vector_array_new_data(&[_]A{wa}, 1);
+        defer _ = mlx.mlx_vector_array_free(iv);
+        var ov = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ov);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k, iv, cfg, s));
+        var outs: [2]A = undefined;
+        for (&outs, 0..) |*o, i| {
+            o.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(o, ov, i));
+            try mlx.check(mlx.mlx_array_eval(o.*));
+        }
+        defer for (outs) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        const e4 = mlx.mlx_array_data_float32(outs[0]) orelse return error.NoData;
+        const e8 = mlx.mlx_array_data_float32(outs[1]) orelse return error.NoData;
+        var differ: usize = 0;
+        for (0..1024) |j| {
+            const nan_code = code_bytes[j] & 0x7F == 0x7F;
+            const same = if (std.math.isNan(want_e4[j])) std.math.isNan(e4[j]) else @as(u32, @bitCast(e4[j])) == @as(u32, @bitCast(want_e4[j]));
+            if (fold == 0 or !nan_code) try std.testing.expect(same) else differ += @intFromBool(!same);
+        }
+        // MLX's e8m0 read (0 is 2^-127, 0xFF NaN) and the 2^8 on the dot; the fold's 2^8 x read is +Inf from 247 up.
+        for (0..256) |e| {
+            const read: f32 = if (e == 0xFF) std.math.nan(f32) else @bitCast(@as(u32, if (e == 0) 0x400000 else @as(u32, @intCast(e)) << 23));
+            if (fold == 0) {
+                try std.testing.expect(if (e == 0xFF) std.math.isNan(e8[2 * e]) else @as(u32, @bitCast(e8[2 * e])) == @as(u32, @bitCast(read)));
+                try std.testing.expectEqual(@as(f32, 256), e8[2 * e + 1]);
+            } else {
+                try std.testing.expectEqual(@as(f32, 1), e8[2 * e + 1]);
+                // Code 0's 2^-127 is a subnormal the GPU flushes before the x256 (MLX's products flush it too).
+                const want: f32 = if (e == 0) 0 else read * 256.0;
+                if (e < 247) try std.testing.expectEqual(want, e8[2 * e]) else differ += @intFromBool(std.math.isInf(e8[2 * e]));
+            }
+        }
+        // The fold reads S.1111.111 as 480 (8 bytes) and e8m0 247..255 as +Inf (9 codes).
+        if (fold == 1) try std.testing.expectEqual(@as(usize, 8 + 9), differ);
+    }
+    _ = a;
 }

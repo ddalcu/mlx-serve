@@ -495,6 +495,14 @@ with the headers it includes, embedded from the pinned submodule (Copyright
 (`steel/gemm/kernels/steel_gemm_fused_nax.h`) by way of turboexl3's copy
 (Copyright (c) 2023-2025 Apple Inc., MIT License).
 
+`src/kernels/common/fp4_scale.metal` copies MLX's fp8 / fp4 reads (`fp8_e8m0` and
+`fp8_e4m3` `operator float` in `backend/metal/kernels/fp8.h`, `fp4_e2m1`'s in `fp4.h`,
+`dequantize_scale` in `fp_quantized.h`), and `src/kernels/common/fp_encode.metal` its
+encoders (the `fp8_e4m3`, `fp8_e8m0` and `fp4_e2m1` constructors and `mx_scale_round_up`),
+so every fp4 / fp8 kernel of ours reads and writes these formats as MLX does (Copyright
+(c) 2023-2025 Apple Inc., MIT License). MLX's `fp8_e4m3` constructor is itself taken
+from PyTorch (see below).
+
 --------------------------------------------------------------------------------
 mlx-lm
 https://github.com/ml-explore/mlx-lm
@@ -699,6 +707,41 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
 ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
 WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
 DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+--------------------------------------------------------------------------------
+PyTorch
+https://github.com/pytorch/pytorch
+Copyright (c) 2016- Facebook, Inc (Adam Paszke), and the other copyright holders
+listed in PyTorch's LICENSE.
+Licensed under the BSD 3-Clause License.
+
+The float-to-e4m3 conversion in `src/kernels/common/fp_encode.metal`
+(`mlxserve_fp8_e4m3_bits`) reaches us through MLX's `fp8.h`, which takes it from
+`c10/util/Float8_e4m3fn.h` (commit e3643e1e0e923f0fc063dfab6f45c956d568919d).
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+  * Redistributions of source code must retain the above copyright notice, this
+    list of conditions and the following disclaimer.
+  * Redistributions in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+  * Neither the names of Facebook, Deepmind Technologies, NYU, NEC Laboratories
+    America and IDIAP Research Institute nor the names of its contributors may
+    be used to endorse or promote products derived from this software without
+    specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE
 FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
 DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
 SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER

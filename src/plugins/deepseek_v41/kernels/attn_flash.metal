@@ -10,6 +10,20 @@
 // (m = sink, l = 1), so it joins the denominator only. Epilogue: O / l, the last RD dims inverse-roped at position
 // meta[6] + l (rope_tail's rotation on the f32 values), stored as attnOut's grouped projection reads them,
 // [G, L, H / G * D]. Nothing of the scores or probabilities leaves the threadgroup.
+// FA_TRIM 1 (MLX_SERVE_DSV41_FLASH_TRIM), the same values: the block's max is taken over the raw scores and scaled once
+// (scale > 0, so max and the scaling commute exactly), and the epilogue stores each lane's 4 adjacent dims as one
+// 8-byte store. FA_PSUM 1 (MLX_SERVE_DSV41_FLASH_PSUM): l sums the f16 P the accumulator takes, not the f32 exps
+// before their rounding, so a key that carries the row has its rounding cancel in O / l; alpha is 1 where the max
+// holds. FA_PLANT 1 (tests only): the window's keys a row late.
+#ifndef FA_TRIM
+#define FA_TRIM 0
+#endif
+#ifndef FA_PSUM
+#define FA_PSUM 0
+#endif
+#ifndef FA_PLANT
+#define FA_PLANT 0
+#endif
 constexpr int D = 512;
 constexpr int BK = 128;
 constexpr int NSG = 4 * HGN;
@@ -82,7 +96,11 @@ for (int b = 0; b < nb; ++b) {
     const int c = b * BK + int(tid);
     int s = -1;
     if (c < W) {
+#if FA_PLANT
+      const int r = wp + l - (W - 1) + c - 1;
+#else
       const int r = wp + l - (W - 1) + c;
+#endif
       if (r >= 0 && r < Wk) s = RING | r;
     } else if (c < NK) {
       const int r = picks[size_t(l) * K + (c - W)];
@@ -130,10 +148,17 @@ for (int b = 0; b < nb; ++b) {
     float m = -INFINITY;
     for (short tn = 0; tn < 2; ++tn)
       for (short j = 0; j < 4; ++j)
+#if FA_TRIM
+        if (ok[tn][j]) m = metal::max(m, float(sc[tn * 8 + i * 4 + j]));
+    m = metal::max(m, metal::simd_shuffle_xor(m, ushort(1)));
+    m = metal::max(m, metal::simd_shuffle_xor(m, ushort(8)));
+    bmx[i] = scale * m;
+#else
         if (ok[tn][j]) m = metal::max(m, scale * float(sc[tn * 8 + i * 4 + j]));
     m = metal::max(m, metal::simd_shuffle_xor(m, ushort(1)));
     m = metal::max(m, metal::simd_shuffle_xor(m, ushort(8)));
     bmx[i] = m;
+#endif
   }
   if (row_writer) {
     red_max[sg][fm] = bmx[0];
@@ -146,7 +171,11 @@ for (int b = 0; b < nb; ++b) {
     const int s0 = hgl * 4;
     const float bm = metal::max(metal::max(red_max[s0][r], red_max[s0 + 1][r]), metal::max(red_max[s0 + 2][r], red_max[s0 + 3][r]));
     mnew[i] = metal::max(m_run[i], bm);
+#if FA_PSUM
+    alpha[i] = mnew[i] == m_run[i] ? 1.0f : metal::exp(m_run[i] - mnew[i]);
+#else
     alpha[i] = metal::exp(m_run[i] - mnew[i]);
+#endif
     m_run[i] = mnew[i];
   }
 
@@ -158,7 +187,11 @@ for (int b = 0; b < nb; ++b) {
       for (short j = 0; j < 4; ++j) {
         const float e = ok[tn][j] ? metal::exp(scale * float(sc[tn * 8 + i * 4 + j]) - mnew[i]) : 0.0f;
         hv[i * 4 + j] = half(e);
+#if FA_PSUM
+        rs[i] += float(hv[i * 4 + j]);
+#else
         rs[i] += e;
+#endif
       }
     *(threadgroup metal::vec<half, 8>*)(&p_tg[hgl][qq * 2 + tn][lane * 8]) = hv;
   }
@@ -233,8 +266,32 @@ auto dst_of = [&](int h, int d) -> device OT* {
     }                                                                                               \
     *(device metal::vec<OT, 2>*)dst_of(h, d) = metal::vec<OT, 2>(OT(a), OT(bb));                    \
   }
+#if FA_TRIM
+#define FA4_STORE(OO, NP)                                                                           \
+  for (short e = 0; e < 16; e += 4) {                                                               \
+    const short i = (e >> 2) & 1, tn = e >> 3;                                                      \
+    const int d = qq * 128 + (NP) * 32 + tn * 16 + fn;                                              \
+    const int h = h0 + i * 8;                                                                       \
+    float v[4] = {OO[e] * inv[i], OO[e + 1] * inv[i], OO[e + 2] * inv[i], OO[e + 3] * inv[i]};      \
+    if (d >= head)                                                                                  \
+      for (short k = 0; k < 4; k += 2) {                                                            \
+        const float theta = pos * (1.0f / periods[(d + k - head) / 2]);                             \
+        const float cs = metal::fast::cos(theta), sn = metal::fast::sin(theta);                     \
+        const float ra = v[k] * cs - v[k + 1] * sn;                                                 \
+        v[k + 1] = v[k] * sn + v[k + 1] * cs;                                                       \
+        v[k] = ra;                                                                                  \
+      }                                                                                             \
+    *(device metal::vec<OT, 4>*)dst_of(h, d) = metal::vec<OT, 4>(OT(v[0]), OT(v[1]), OT(v[2]), OT(v[3])); \
+  }
+FA4_STORE(o0, 0)
+FA4_STORE(o1, 1)
+FA4_STORE(o2, 2)
+FA4_STORE(o3, 3)
+#undef FA4_STORE
+#else
 FA1_STORE(o0, 0)
 FA1_STORE(o1, 1)
 FA1_STORE(o2, 2)
 FA1_STORE(o3, 3)
+#endif
 #undef FA1_STORE

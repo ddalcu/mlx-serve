@@ -61,13 +61,33 @@ pub fn logSpecStats(self: *const Generator) void {
             "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2} stage_rounds={d} copy_rounds={d} copy_drafted={d} copy_accepted={d} group_rounds={d}\n",
             .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round, self.dspark_attempted - self.dspark_copies, self.dspark_copies, self.dspark_copy_drafted, self.dspark_copy_accepted, self.dspark_group_rounds },
         );
-        if (self.dspark_pol) |pol| if (pol.rounds) |ctl| log.info(
-            "  [spec-stats] dspark rounds: plain_ticks={d} plain_ms={d:.2} acc={d:.2} acc_pos={s} rows_hist={s}\n",
-            .{ self.dspark_plain, ctl.ladder.plain, ctl.acc.overall(), self.dspark_stats.formatAcc(&acc_buf), self.dspark_stats.formatRows(&rows_buf) },
-        ) else log.info(
-            "  [spec-stats] dspark policy: plain_ticks={d} skipped={d} probes={d} plain_ms={d:.2} acc_pos={s} rows_hist={s}\n",
-            .{ self.dspark_plain, pol.drafting.skipped, pol.drafting.probes, pol.plain.ms, self.dspark_stats.formatAcc(&acc_buf), self.dspark_stats.formatRows(&rows_buf) },
+        if (self.dspark_typical) |t| log.info(
+            "  [spec-stats] dspark typical: delta={d:.3} eps={d:.3} rounds={d} of {d} (copied drafts exact)\n",
+            .{ t.delta, t.eps, self.dspark_typical_rounds, self.dspark_attempted },
         );
+        if (self.dspark_pol) |pol| {
+            if (pol.rounds) |ctl| {
+                log.info(
+                    "  [spec-stats] dspark rounds: plain_ticks={d} plain_ms={d:.2} acc={d:.2} acc_pos={s} rows_hist={s}\n",
+                    .{ self.dspark_plain, ctl.ladder.plain, ctl.acc.overall(), self.dspark_stats.formatAcc(&acc_buf), self.dspark_stats.formatRows(&rows_buf) },
+                );
+            } else {
+                const skipped = if (pol.p2) |p| p.drafting.skipped else pol.drafting.skipped;
+                const probes = if (pol.p2) |p| p.drafting.probes else pol.drafting.probes;
+                log.info(
+                    "  [spec-stats] dspark policy: plain_ticks={d} skipped={d} probes={d} plain_ms={d:.2} acc_pos={s} rows_hist={s}\n",
+                    .{ self.dspark_plain, skipped, probes, pol.plain.ms, self.dspark_stats.formatAcc(&acc_buf), self.dspark_stats.formatRows(&rows_buf) },
+                );
+                if (pol.p2) |p| {
+                    const c = p.cost.costs(pol.plain.ms);
+                    log.info(
+                        "  [spec-stats] dspark policy2: next_decided={d} next_took={d} rate_tok_ms={d:.4} round_ms={d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}\n",
+                        .{ p.free_seen, p.free_hit, p.rate.perMs(pol.plain.ms), c[1], c[2], c[3], c[4], c[5], c[6] },
+                    );
+                    if (p.modeled) log.info("  [spec-stats] dspark policy2 modeled: widths priced by the fitted ladder in plain steps, rate_tok_step={d:.4}\n", .{p.rate.perMs(1)});
+                }
+            }
+        }
         return;
     }
     if (self.mtp != null and (self.mtp_attempted > 0 or self.mtp_lookup_rounds > 0)) {

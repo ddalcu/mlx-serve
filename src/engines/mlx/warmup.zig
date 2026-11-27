@@ -12,7 +12,7 @@ const Transformer = @import("transformer.zig").Transformer;
 /// then resets the cache so the first real request starts from clean state.
 /// Idempotent — calling twice is wasted work but not incorrect.
 /// `verify_rows` is the widest block a speculative round verifies, 0 on a load that leaves the sweep to its idle
-/// warm-up or owes none (`warm_requests.owed`).
+/// warm-up (`warm_requests.owe`) or serves none (`warm_requests.wanted`).
 pub fn warmup(self: *Transformer, verify_rows: u32) !void {
     const dummy_id: i32 = 0; // BOS-ish placeholder; the actual id doesn't matter for warmup
     const decode_shape = [_]c_int{ 1, 1 };

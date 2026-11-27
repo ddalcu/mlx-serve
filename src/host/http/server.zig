@@ -946,7 +946,7 @@ test {
     _ = @import("../registry/memory_ceiling.zig");
     _ = @import("../../mlx/state.zig");
     _ = @import("../../plugins/deepseek_v4/bill.zig");
-    _ = @import("../../plugins/deepseek_v41/bill.zig");
+    _ = @import("../../engines/mlx/plugin/dsv41_link.zig").bill;
     _ = @import("../../plugins/lfm2/media.zig");
     _ = @import("../../plugins/nemotron_h/media.zig");
     _ = @import("../../plugins/qwen3_5/minicpm_media.zig");

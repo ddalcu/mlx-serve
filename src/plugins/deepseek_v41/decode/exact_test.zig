@@ -18,6 +18,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const fixture = @import("fixture.zig");
 const device = @import("../../../mlx/device.zig");
+const world = @import("../../../sdk/testing/world.zig");
 
 const A = mlx.mlx_array;
 
@@ -29,9 +30,10 @@ const ranges = [_]Range{
     // saturation at 511.
     // 190: a two-row verify straddles 191. 286: the rows wrap the window ring (cap 128 + 16 = 144 slots). 16382: the
     // rows straddle 16384 groups, past which the candidate source pins blocks (2048 blocks of 8).
-    .{ .lo = 20, .hi = 25, .p0s = &.{ 60, 187, 190, 260, 286, 348, 509, 700, 16382 } },
+    // 17640: the coding prompt's first decode step, every layer's index picks a few of its compressed rows.
+    .{ .lo = 20, .hi = 25, .p0s = &.{ 60, 187, 190, 260, 286, 348, 509, 700, 16382, 17640 } },
     // Ratio 2 (a KV source pooling pairs): S 1 -> 2 at p 383, 2 -> 3 at 703, saturation at 1023; pairs straddle.
-    .{ .lo = 2, .hi = 4, .p0s = &.{ 61, 380, 382, 701, 1021, 1100 } },
+    .{ .lo = 2, .hi = 4, .p0s = &.{ 61, 380, 382, 701, 1021, 1100, 17640 } },
     // Ratio 0: the window alone, filling at 128.
     .{ .lo = 0, .hi = 1, .p0s = &.{ 60, 126 } },
 };
@@ -183,16 +185,25 @@ fn checkCase(fx: *fixture.Fixture, in: Inputs, p0: usize, R: usize, keep: usize,
     }
 }
 
+/// The routed experts a gate run builds: the iQ pack's affine plan, or the release's fp4 (MXFP4, or NVIDIA's NVFP4 with
+/// its per-expert scales).
+const Experts = enum { iq, mxfp4, nvfp4 };
+
 fn runGate(exact_on: bool) !Tally {
+    return runGateWith(exact_on, .iq, false);
+}
+
+/// `quick`: each range at its first position only.
+fn runGateWith(exact_on: bool, experts: Experts, quick: bool) !Tally {
     const gpa = std.testing.allocator;
     var tally: Tally = .{};
     var ab: [64]u8 = undefined;
-    std.debug.print("[exact-gate] gpu {s}, NAX {any}, exact={any}\n", .{ device.gpuArchitecture(&ab) orelse "?", device.naxAvailable(), exact_on });
+    std.debug.print("[exact-gate] gpu {s}, NAX {any}, exact={any}, experts {t}\n", .{ device.gpuArchitecture(&ab) orelse "?", device.naxAvailable(), exact_on, experts });
     var misses: u64 = 0;
-    for (ranges) |rg| for (rg.p0s) |p0| {
-        const fx = try fixture.Fixture.init(gpa, .{ .lo = rg.lo, .hi = rg.hi, .ctx = p0 - 1, .seed = 7 + p0, .act = .bfloat16, .fused = true });
+    for (ranges) |rg| for (rg.p0s[0..if (quick) 1 else rg.p0s.len]) |p0| {
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = rg.lo, .hi = rg.hi, .ctx = p0 - 1, .seed = 7 + p0, .act = .bfloat16, .fused = true, .experts_fp4 = experts == .mxfp4, .experts_nvfp4 = experts == .nvfp4, .expert_scales = if (experts == .nvfp4) .all else .none });
         defer fx.deinit();
-        fx.m.exact = dsv41.exactBatched(.{ .on = exact_on }, env.get(.DSV41_EXACT_GATE_BATCHED));
+        fx.m.exact = dsv41.exactBatched(.{ .on = exact_on, .whole_row = exact_on and !world.nax() }, env.get(.DSV41_EXACT_GATE_BATCHED));
         fx.m.exact_pair_ok = true;
         // One plain step to p0 with a snapshot there: every case rewinds to it.
         {
@@ -220,7 +231,7 @@ test "dsv41 exact: verify rows and the state they leave equal plain steps bit fo
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     // Exact is the non-NAX kernels' (`Dsv41Model.exact` stays off on NAX): on an M5, run it with
     // MLX_SERVE_DIAG=force-gpu-family-fallback=1, which takes this plugin's non-NAX kernels (MLX's own stay NAX's).
-    if (device.naxAvailable()) {
+    if (world.nax()) {
         std.debug.print("[exact-gate] skipped: NAX GPU (set MLX_SERVE_DIAG=force-gpu-family-fallback=1)\n", .{});
         return error.SkipZigTest;
     }
@@ -233,6 +244,107 @@ test "dsv41 exact: verify rows and the state they leave equal plain steps bit fo
     try std.testing.expectEqual(@as(usize, 0), t.probe_diffs);
     try std.testing.expectEqual(@as(usize, 0), t.state_diffs);
     try std.testing.expectEqual(@as(u64, 0), t.misses);
+}
+
+test "dsv41 exact rows: verify layers on the fused decode kernels (NAX, exact on): a verify block's rows, the state it leaves and the step after are its plain steps' bits, the release's NVFP4 experts with their scales, each layer range at its first position, no misses" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    const xv = env.override(.MLX_SERVE_DSV41_EXACT, "1");
+    defer xv.restore();
+    // Every position (the band edges, the pooling groups, the long contexts): `DSV41_EXACT_GATE` (gates.sh's exact step).
+    const t = try runGateWith(true, .nvfp4, env.get(.DSV41_EXACT_GATE) == null);
+    try std.testing.expectEqual(@as(usize, 0), t.row_diffs);
+    try std.testing.expectEqual(@as(usize, 0), t.probe_diffs);
+    try std.testing.expectEqual(@as(usize, 0), t.state_diffs);
+    try std.testing.expectEqual(@as(u64, 0), t.misses);
+}
+
+test "dsv41 exact: verify rows against plain steps with fp4 experts, the fused fp4 MoE on and off, exact off (DSV41_EXACT_GATE)" {
+    if (env.get(.DSV41_EXACT_GATE) == null) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const xv = env.override(.MLX_SERVE_DSV41_EXACT, "1");
+    defer xv.restore();
+    for ([_]?[*:0]const u8{ "1", "0" }) |fused| {
+        const sw = env.override(.MLX_SERVE_DSV41_MOE_FP4_NAX, fused);
+        defer sw.restore();
+        std.debug.print("[exact-gate] MLX_SERVE_DSV41_MOE_FP4_NAX={s}\n", .{fused.?});
+        for ([_]Experts{ .mxfp4, .nvfp4 }) |e| {
+            const bar = fused.?[0] == '1' and world.nax();
+            // The served default (NVFP4, fused on) at every position, the long contexts' index picks included.
+            const t = try runGateWith(false, e, !(bar and e == .nvfp4));
+            // On NAX the fused fp4 decode serves every verify row on its plain step's kernels: the bar is every byte.
+            if (bar) {
+                try std.testing.expectEqual(@as(usize, 0), t.row_diffs);
+                try std.testing.expectEqual(@as(usize, 0), t.probe_diffs);
+                try std.testing.expectEqual(@as(usize, 0), t.state_diffs);
+            }
+        }
+    }
+}
+
+test "dsv41 verify: on exact's NAX path (MLX_SERVE_DSV41_EXACT) the head and the Engram write on MLX's chain give each verify row its plain step's bits" {
+    // The head, and the Engram where the load arms no slot kernel (with it: `engram_ids.zig`'s exact rows test).
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    const xv = env.override(.MLX_SERVE_DSV41_EXACT, "1");
+    defer xv.restore();
+    const gpa = std.testing.allocator;
+    const s = mlx.gpuStream();
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 0, .hi = 1, .ctx = 8, .act = .bfloat16, .fused = true });
+    defer fx.deinit();
+    const m = fx.m;
+    const d: c_int = @intCast(m.cfg.hidden_size);
+    const hc: c_int = @intCast(m.cfg.dsv4_hc_mult);
+    // The release's 8-bit head (MLX_SERVE_DSV41_HEAD8) and the NVFP4 pack's mxfp8 Engram wkv.
+    const hw = try randBf16(&.{ 129280, d }, 0.02, 41);
+    defer _ = mlx.mlx_array_free(hw);
+    const hq = try fixture.quantize(hw, 64, 8, "affine");
+    defer freeAll(&hq);
+    const ew = try randBf16(&.{ (hc + 1) * d, 6144 }, 0.02, 43);
+    defer _ = mlx.mlx_array_free(ew);
+    const eq = try fixture.quantize(ew, 32, 8, "mxfp8");
+    defer freeAll(&eq);
+    const norm = try randBf16(&.{d}, 1.0, 45);
+    defer _ = mlx.mlx_array_free(norm);
+    const qk = try randBf16(&.{ hc, d }, 0.05, 47);
+    defer _ = mlx.mlx_array_free(qk);
+    var qk32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(qk32);
+    try mlx.check(mlx.mlx_astype(&qk32, qk, .float32, s));
+    const saved_head = m.head;
+    const saved_norm = m.norm;
+    defer {
+        m.head = saved_head;
+        m.norm = saved_norm;
+    }
+    m.head = .{ .w = hq[0], .s = hq[1], .b = hq[2], .qp = .{ .bits = 8, .group_size = 64, .mode = .affine } };
+    m.norm = norm;
+    const e: dsv41.EngramLayer = .{ .layer = 0, .wkv = .{ .w = eq[0], .s = eq[1], .b = eq[2], .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } }, .qk = qk32, .table = undefined };
+    var sc = dsv41.Scope.init(gpa, s);
+    defer sc.deinit();
+    var bad: usize = 0;
+    // First the batched kernels (`Exact` parts off), printed only: how far they are from the plain steps.
+    for ([_]bool{ true, false }) |batched| {
+        m.exact.head = !batched;
+        m.exact.engram = !batched;
+        for (2..max_rows + 1) |R| {
+            const r: c_int = @intCast(R);
+            const h = try sc.keep(try randBf16(&.{ r, d }, 1.0, 500 + R));
+            const x = try sc.keep(try randBf16(&.{ r, hc, d }, 1.0, 600 + R));
+            const er = try sc.keep(try randBf16(&.{ r, 6144 }, 1.0, 700 + R));
+            const lg = try dsv41.headLogits(&sc, m, h, true);
+            const ys = try dsv41.engramWrite(&sc, m, &e, x, er, dsv41.kernelAt(m, .engram, R, true));
+            var dh: usize = 0;
+            var de: usize = 0;
+            for (0..R) |i| {
+                const want_l = try dsv41.headLogits(&sc, m, try sc.keep(try sliceAxis(h, 0, i, i + 1)), false);
+                dh += try differing(try sc.keep(try sliceAxis(lg, 0, i, i + 1)), want_l);
+                const want_e = try dsv41.engramWrite(&sc, m, &e, try sc.keep(try sliceAxis(x, 0, i, i + 1)), try sc.keep(try sliceAxis(er, 0, i, i + 1)), .rows);
+                de += try differing(try sc.keep(try sliceAxis(ys, 0, i, i + 1)), want_e);
+            }
+            std.debug.print("[exact-gate] verify R={d} {s}: head {d}, engram {d} elements differ from the plain steps\n", .{ R, if (batched) "batched" else "served", dh, de });
+            if (!batched and dh + de > 0) bad += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
 }
 
 fn randBf16(shape: []const c_int, std_: f32, seed: u64) !A {

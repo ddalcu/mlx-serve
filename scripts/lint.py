@@ -38,6 +38,7 @@ RULES = [
     ("engine-imports-plugin", "src/engines/mlx/ imports a file under src/plugins/"),
     ("plugin-imports-core", "a plugin imports a file outside src/sdk/, src/mlx/, src/abi/, src/plugins/"),
     ("media-plugin-imports-engine", "a media plugin imports a file under src/engines/"),
+    ("dsv41-import", "a file outside src/plugins/deepseek_v41/ imports one of its files, not through dsv41_link.zig"),
     ("model-type-compare", "a model_type string compare outside src/plugins/"),
     ("model-predicate", "an is<Model>() call outside src/plugins/"),
     ("plugin-name", "a plugin identity (code identifier or model-type string) in src/engines/ or src/host/"),
@@ -49,6 +50,8 @@ RULES = [
     ("history-comment", "a comment carrying \"PR #\", an ISO date, a P1 move marker or \"this/it/we/code used to\""),
     ("source-scan-test", "a test that @embedFile's a .zig file, directly or through a const"),
     ("graph-scope", "a fn taking *Graph and returning an Array without a scope()"),
+    ("machine-read-in-test", "a DeepSeek test reading the machine (NAX, GPU generation, TF32, chip, RAM) but to skip, "
+     "not through the test world (sdk/testing/world.zig)"),
     ("pin-unmatched", "a scripts/lint_pins.txt line no file matches (a `!` line: one some file holds)"),
     ("file-over-cap", f"a file over {SOFT_CAP} production lines"),
 ]
@@ -208,6 +211,23 @@ def plugin_core(src, dest):
 
 def media_engine(src, dest):
     return plugin_of(src) in MEDIA_PLUGINS and under(dest, "src/engines")
+
+
+DSV41 = "src/plugins/deepseek_v41"
+# DeepSeek-V4.1 is macOS only: the rest of the tree reaches it through its one boundary module. Beside it: the MLX-free
+# manifest another plugin reads (a plugin cannot import engine code), the generated roots that list every plugin, the
+# test root and the test files it includes only under `dsv41_link.on`, and deepseek_v4's served proofs, whose V4.1
+# tests skip unless the registry `has` it.
+DSV41_IMPORTERS = {"src/engines/mlx/plugin/dsv41_link.zig", "src/plugins/registry.zig", "src/tests.zig",
+                   "src/engines/mlx/plugin/deepseek_test.zig", "src/plugins/deepseek_v4/served_test.zig"}
+DSV41_MANIFEST = ("src/plugins/deepseek_v4/model_config.zig", DSV41 + "/config.zig")
+UNIT_ROOT = re.compile(r'^src/unit_\d+\.zig$')
+
+
+def dsv41_import(src, dest):
+    if not under(dest, DSV41) or under(src, DSV41) or src in DSV41_IMPORTERS or UNIT_ROOT.match(src):
+        return False
+    return (src, dest) != DSV41_MANIFEST
 
 
 def r_model_type_compare(f, ctx):
@@ -377,6 +397,20 @@ def r_graph_scope(f, ctx):
             yield i, f"fn {m.group(2)}"
 
 
+# A test decides from the machine only where it says so: a skip, or the test world's accessors (`world.nax()`), whose
+# reads the world owns; everything else plans for the world's reference machine.
+MACHINE_READ = re.compile(r'\b(naxAvailable|deviceGeneration|tf32Matmul|chipBrand|totalMemBytes|machineId)\s*\(')
+MACHINE_READ_SCOPE = ("src/plugins/deepseek_v41", "src/plugins/deepseek_v4", "src/engines/mlx/plugin/deepseek_test.zig")
+
+
+def r_machine_read_in_test(f, ctx):
+    if not under(f.path, *MACHINE_READ_SCOPE):
+        return
+    for i, c in enumerate(f.code):
+        if f.is_test[i] and MACHINE_READ.search(c) and "SkipZigTest" not in c:
+            yield i, f.lines[i].strip()[:120]
+
+
 def r_file_over_cap(f, ctx):
     if f.prod_lines > SOFT_CAP:
         yield 0, f"{f.prod_lines} production lines"
@@ -388,6 +422,7 @@ FILE_RULES = {
     "engine-imports-plugin": r_imports(engine_plugin, "imports"),
     "plugin-imports-core": r_imports(plugin_core, "imports"),
     "media-plugin-imports-engine": r_imports(media_engine, "imports"),
+    "dsv41-import": r_imports(dsv41_import, "imports"),
     "model-type-compare": r_model_type_compare,
     "model-predicate": r_model_predicate,
     "plugin-name": r_plugin_name,
@@ -399,6 +434,7 @@ FILE_RULES = {
     "history-comment": r_history_comment,
     "source-scan-test": r_source_scan_test,
     "graph-scope": r_graph_scope,
+    "machine-read-in-test": r_machine_read_in_test,
     "file-over-cap": r_file_over_cap,
 }
 

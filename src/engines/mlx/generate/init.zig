@@ -36,6 +36,7 @@ const countSpliceRows = @import("prefill_chunk.zig").countSpliceRows;
 const decodeShareCapped = @import("prefill_chunk.zig").decodeShareCapped;
 const dsparkArmFor = @import("../spec/dspark.zig").dsparkArmFor;
 const dsparkEnabled = @import("../spec/dspark.zig").dsparkEnabled;
+const dsparkPinRows = @import("../spec/dspark.zig").dsparkPinRows;
 const effectiveMtpHistoryWindow = @import("prefill_chunk.zig").effectiveMtpHistoryWindow;
 const effectivePrefillChunk = @import("prefill_chunk.zig").effectivePrefillChunk;
 const effectiveSsmCheckpointStride = @import("prefill_chunk.zig").effectiveSsmCheckpointStride;
@@ -111,6 +112,7 @@ pub fn initWithOptions(
     var options = options_in;
     var dspark_active = false;
     var dspark_stochastic = false;
+    var dspark_typical: ?mtp_acceptance.Typical = null;
     if ((intree.dsv4(xfm) != null or intree.dsv41(xfm) != null or plugin_driver.nativeDrafter(xfm) != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
         // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
         // snapshot rollback inside deepseek_v4.zig) may engage when the
@@ -136,6 +138,21 @@ pub fn initWithOptions(
         if (xfm.dsparkStages() > 0 and !dspark_env_off and arm != .off) {
             dspark_active = true;
             dspark_stochastic = arm == .stochastic;
+            // DeepSeek-V4.1 under --precision lossy: a sampled request whose acceptance nothing set (exact, no model
+            // setting, no process flag) takes its plugin's typical pair.
+            if (dspark_stochastic and std.meta.activeTag(options.mtp_acceptance) == .exact and xfm.config.mtp_acceptance_override == null and
+                std.meta.activeTag(generate_mod.mtp_acceptance_default) == .exact)
+                if (intree.dsv41LossyTypical(xfm)) |t| {
+                    options.mtp_acceptance = .{ .typical = t };
+                };
+            // The sampled arm takes the request's acceptance mode: typical (LOSSY) where it asks for it, else exact.
+            if (dspark_stochastic) switch (options.mtp_acceptance) {
+                .typical => |cfg| {
+                    dspark_typical = cfg;
+                    log.info("  [dspark-accept] typical delta={d:.3} eps={d:.3} NOT distribution-exact (copied drafts exact)\n", .{ cfg.delta, cfg.eps });
+                },
+                .exact, .tokenv3 => {},
+            };
             if (dspark_stochastic) {
                 log.info("  spec=dspark (stochastic; {s} native draft stages, block={d})\n", .{ xfm.config.model_type, ds_block });
             } else {
@@ -213,15 +230,18 @@ pub fn initWithOptions(
     // start at ssm_checkpoint_pos_offset, so the final KV length is that
     // offset plus everything we're about to forward.
     const total_ctx_for_chunk = options.ssm_checkpoint_pos_offset + prompt_ids.len;
-    const PREFILL_CHUNK: usize = decodeShareCapped(xfm.config.cappedPrefillChunk(effectivePrefillChunk(
-        xfm.config.prefillScoreHeadDim(),
-        xfm.config.num_attention_heads,
-        total_ctx_for_chunk,
-        xfm.config.has_sliding_window,
-        xfm.config.isMoe(),
-        xfm.config.longCtxGated(),
-        options.pinned_prefill_chunk,
-    )), options.decode_share_width_cap);
+    // DeepSeek-V4.1's pass plan: the admitted width (its pinned pass) cut near-equal over the chunk loop's rows (the
+    // prompt less its logits row).
+    const PREFILL_CHUNK: usize = xfm.config.passPrefillChunk(decodeShareCapped(options.pinned_prefill_chunk, options.decode_share_width_cap), prompt_ids.len -| 1) orelse
+        decodeShareCapped(xfm.config.cappedPrefillChunk(effectivePrefillChunk(
+            xfm.config.prefillScoreHeadDim(),
+            xfm.config.num_attention_heads,
+            total_ctx_for_chunk,
+            xfm.config.has_sliding_window,
+            xfm.config.isMoe(),
+            xfm.config.longCtxGated(),
+            options.pinned_prefill_chunk,
+        )), options.decode_share_width_cap);
     // Phase-level prefill instrumentation. Enabled at debug level OR via
     // diag prefill-trace (which forces the trace line at info).
     // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill
@@ -291,12 +311,12 @@ pub fn initWithOptions(
     const AcceptRoute = struct {
         graph: MtpGraphFn,
         prefix: mtp_acceptance.PrefixFn,
-        param: f32,
+        param: mtp_acceptance.Param,
     };
     const accept_route: AcceptRoute = switch (options.mtp_acceptance) {
-        .exact => .{ .graph = mtpBatchedExactGraph, .prefix = mtp_acceptance.exactPrefix, .param = 0 },
-        .typical => |cfg| .{ .graph = mtpBatchedTypicalGraph, .prefix = mtp_acceptance.typicalPrefix, .param = cfg.delta },
-        .tokenv3 => |alpha| .{ .graph = mtpBatchedTokenV3Graph, .prefix = mtp_acceptance.tokenV3Prefix, .param = alpha },
+        .exact => .{ .graph = mtpBatchedExactGraph, .prefix = mtp_acceptance.exactPrefix, .param = mtp_acceptance.param(options.mtp_acceptance) },
+        .typical => .{ .graph = mtpBatchedTypicalGraph, .prefix = mtp_acceptance.typicalPrefix, .param = mtp_acceptance.param(options.mtp_acceptance) },
+        .tokenv3 => .{ .graph = mtpBatchedTokenV3Graph, .prefix = mtp_acceptance.tokenV3Prefix, .param = mtp_acceptance.param(options.mtp_acceptance) },
     };
     if (mtp_active and std.meta.activeTag(options.mtp_acceptance) != .exact) {
         switch (options.mtp_acceptance) {
@@ -1038,9 +1058,11 @@ pub fn initWithOptions(
             .pld_enabled = pld_active,
             .dspark_enabled = dspark_active,
             .dspark_stochastic = dspark_stochastic,
+            .dspark_typical = dspark_typical,
             // A streamed EXL3 bank verifies the whole block on a greedy request: its verify costs about a plain tick.
-            // A plugin's drafter runs the rounds its load's ladder prices; a load not timed yet decodes plainly.
-            .dspark_pol = if (!dspark_active) null else if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else if (plugin_driver.nativeDrafter(xfm) != null) .{
+            // `dspark.test_pin_rows` (a test hook) pins every round at N rows. A plugin's drafter runs the rounds its
+            // load's ladder prices; a load not timed yet decodes plainly.
+            .dspark_pol = if (!dspark_active) null else if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = dsparkPinRows(!dspark_stochastic and dm.cfg.dsv41_exl3_bank), .p2 = if (env.onUnlessZero(.MLX_SERVE_DSPARK_POLICY2)) .{ .modeled = env.onUnlessZero(.MLX_SERVE_DSPARK_POLICY2_MODELED) } else null } else if (plugin_driver.nativeDrafter(xfm) != null) .{
                 .rounds = if (xfm.plugin.?.ladder) |l| .{ .ladder = l, .acc = .{ .prior = if (dspark_stochastic) spec_rounds.Acceptance.SAMPLED else spec_rounds.Acceptance.GREEDY } } else null,
             } else null,
             .drafter = if (drafter_active) options.drafter else null,

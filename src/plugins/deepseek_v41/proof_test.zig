@@ -810,6 +810,10 @@ fn attachTinyEngramForTest(mdl: *dsv41.Dsv41Model, dir: []const u8) !void {
 
 test "deepseek_v41 CED encode interior: cold Engram chunk splits leadRows and matches cold bit for bit" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    // The lead split this test counts is the off arm of `MLX_SERVE_DSV41_PF_PASS_SIZE` (on, a chunk whose Engram
+    // tables are all held runs as one pass, no lead).
+    const pass_off = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, "0");
+    defer pass_off.restore();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const files = try fixture.v41Files(arena.allocator(), 7);
@@ -1434,4 +1438,240 @@ fn importForAllocationTest(gpa: std.mem.Allocator, m: *const dsv41.Dsv41Model, i
     const sn = try dsv41.importSnapshot(m, gpa, ids, header, arrays);
     defer gpa.destroy(sn);
     defer sn.deinit(gpa);
+}
+
+// ── MLX_SERVE_DSV41_PF_PASS_SIZE: a snapshot at a wide pass's end, sliced to a shorter prefix ──
+
+/// The tiny pack with room for a prompt past 8192 rows (its own cap is 128 positions; the rope is yarn's either way).
+fn longFiles(a: std.mem.Allocator) ![]const sdk.fixture.File {
+    const files = try fixture.v41Files(a, 7);
+    const out = try a.dupe(sdk.fixture.File, files);
+    for (out) |*f| if (std.mem.eql(u8, f.name, "config.json")) {
+        const cfg = try std.mem.replaceOwned(u8, a, f.bytes, "\"max_position_embeddings\": 128", "\"max_position_embeddings\": 32768");
+        if (std.mem.eql(u8, cfg, f.bytes)) return error.FixtureConfigMoved;
+        f.bytes = cfg;
+    };
+    return out;
+}
+
+/// The widest pass the test pins, as a box with room pins it (`dsv41PassRows`).
+const pass_pin: usize = 16_384;
+
+/// `ids[0..n]` prefilled cold on a fresh twin as the pass plan cuts it (`passRows` at `pass_pin`), then (`tail_w` > 0) the
+/// last `tail_w` rows as a call of their own, as a slice's window replay makes them. Caller closes.
+fn coldPrefix(files: []const sdk.fixture.File, ids: []const u32, n: usize, tail_w: usize) !WideTwin {
+    const cold = try WideTwin.open(files);
+    errdefer cold.close();
+    const body = n - tail_w;
+    const chunk = dsv41.passRows(body, pass_pin);
+    var at: usize = 0;
+    while (at < body) : (at += chunk) {
+        const hi = @min(body, at + chunk);
+        testing.allocator.free(try slotForward(cold.t, .prefill, &.{1}, ids[at..hi], &.{@intCast(at)}));
+    }
+    if (tail_w > 0) testing.allocator.free(try slotForward(cold.t, .prefill, &.{1}, ids[body..n], &.{@intCast(body)}));
+    return cold;
+}
+
+/// The largest |a - b| over the first `rows` rows of two `[cap, width]` arrays, over b's largest there (0: the same words).
+fn rowsRel(a: mlx.mlx_array, b: mlx.mlx_array, rows: usize) !f32 {
+    const x = try hostRows(a);
+    defer testing.allocator.free(x);
+    const y = try hostRows(b);
+    defer testing.allocator.free(y);
+    const wa = x.len / @as(usize, @intCast(mlx.getShape(a)[0]));
+    const wb = y.len / @as(usize, @intCast(mlx.getShape(b)[0]));
+    if (wa != wb or rows * wa > x.len or rows * wb > y.len) return std.math.inf(f32);
+    var d: f32 = 0;
+    var peak: f32 = 0;
+    for (x[0 .. rows * wa], y[0 .. rows * wb]) |p, q| {
+        d = @max(d, @abs(p - q));
+        peak = @max(peak, @abs(q));
+    }
+    return if (peak > 0) d / peak else d;
+}
+
+/// `rowsRel` over the ring slots of positions [lo, hi) (a ring of `cap` rows).
+fn ringRel(a: mlx.mlx_array, b: mlx.mlx_array, lo: usize, hi: usize, cap: usize) !f32 {
+    const x = try hostRows(a);
+    defer testing.allocator.free(x);
+    const y = try hostRows(b);
+    defer testing.allocator.free(y);
+    const width = x.len / @as(usize, @intCast(mlx.getShape(a)[0]));
+    if (x.len != y.len) return std.math.inf(f32);
+    var d: f32 = 0;
+    var peak: f32 = 0;
+    for (lo..hi) |pos| {
+        const slot = pos % cap;
+        for (x[slot * width ..][0..width], y[slot * width ..][0..width]) |p, q| {
+            d = @max(d, @abs(p - q));
+            peak = @max(peak, @abs(q));
+        }
+    }
+    return if (peak > 0) d / peak else d;
+}
+
+/// The snapshot `sn` (a wide pass's end) cut at `cut_at` and restored, against a cold prefill of `ids[0..cold_n]`: the
+/// position; every layer's global rows and index keys, bit for bit the snapshot's own and within a reorder of the cold
+/// prefix's (`rows_tol`); the Engram history; the first layer's window, the cold prefix's whose last window is its own
+/// call (the replay's width). Also the next rows' logits after a tail (`logits`, caller frees) and their cosine against
+/// the cold prefix's, printed, not held: the window replay of a slice is bounded by design (`rewind`), whatever made
+/// the snapshot. Prints each bar; `ok` false where any fails.
+const SliceCheck = struct { ok: bool, logits: []f32 };
+
+fn sliceMatchesCold(files: []const sdk.fixture.File, wide: WideTwin, sn: abi.Handle, ids: []const u32, cut_at: usize, cold_n: usize, label: []const u8) !SliceCheck {
+    const t = wide.t;
+    const model = wide.model();
+    const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
+    const src: *const dsv41.Snap = @ptrCast(@alignCast(sn.?));
+    const w: usize = model.mdl.cfg.sliding_window;
+    const tail = [_]u32{ 11, 29, 5 };
+    var ok = true;
+    var cut: abi.Handle = null;
+    if (!aux.slice(t.m, sn, cut_at, &cut).isOk()) {
+        std.debug.print("[pfpass-slice] {s}: the slice at {d} was refused\n", .{ label, cut_at });
+        return .{ .ok = false, .logits = try testing.allocator.alloc(f32, 0) };
+    }
+    defer aux.free(t.m, cut);
+    var info: abi.AuxSnapshotInfo = .{};
+    try testing.expect(aux.describe(t.m, cut, &info).isOk());
+    const n: usize = @intCast(info.n);
+    try testing.expect(aux.restore_at(t.m, 2, cut, info.n).isOk());
+    const ws = &model.mdl.dec_state.?;
+    if (ws.n != cold_n) {
+        std.debug.print("[pfpass-slice] {s}: restored at {d}, the cold prefix is {d}\n", .{ label, ws.n, cold_n });
+        ok = false;
+    }
+    const cold = try coldPrefix(files, ids, cold_n, 0);
+    defer cold.close();
+    const cs = &cold.model().mdl.dec_state.?;
+    var worst: f32 = 0;
+    var bits = true;
+    for (ws.layers, cs.layers, src.layers) |*wl, *cl, sl| {
+        inline for (.{ "comp", "idx_k" }) |f| if (@field(wl, f)) |rows| {
+            const crow = @field(cl, f).?;
+            if (crow.used != rows.used) {
+                std.debug.print("[pfpass-slice] {s}: {s} rows {d}, the cold prefix's {d}\n", .{ label, f, rows.used, crow.used });
+                ok = false;
+            } else {
+                // The cut keeps the snapshot's own rows.
+                if (try rowsRel(rows.buf, @field(sl, f).?.buf, rows.used) != 0) ok = false;
+                const e = try rowsRel(rows.buf, crow.buf, rows.used);
+                worst = @max(worst, e);
+                if (e != 0) bits = false;
+            }
+        };
+    }
+    const rows_tol: f32 = 2e-2;
+    if (!(worst <= rows_tol)) ok = false;
+    const hist_same = std.mem.eql(u32, cs.hist.items, ws.hist.items);
+    if (!hist_same) ok = false;
+    // The replay makes the first layer's window in one call of `w` rows: judged against a cold prefix ending in that call.
+    const split = try coldPrefix(files, ids, cold_n, @min(w, cold_n));
+    defer split.close();
+    const first = split.model().mdl.dec_state.?.layers[0].win;
+    const win_e = if (ws.n == cold_n and ws.layers[0].win.cap == first.cap) try ringRel(ws.layers[0].win.buf, first.buf, cold_n - @min(w, cold_n), cold_n, first.cap) else std.math.inf(f32);
+    if (win_e != 0) ok = false;
+    // The next rows after a tail: the restored state against the cold prefix's.
+    const prompt = try testing.allocator.alloc(u32, n + tail.len);
+    defer testing.allocator.free(prompt);
+    @memcpy(prompt[0..n], ids[0..n]);
+    @memcpy(prompt[n..], &tail);
+    try testing.expect(aux.begin_prompt(t.m, 2, .of(prompt), .{}, info.n, false).isOk());
+    const warm = try slotForward(t, .prefill, &.{2}, &tail, &.{@intCast(n)});
+    errdefer testing.allocator.free(warm);
+    v41.table.release_slot.?(t.m, 2);
+    const cold_out = try slotForward(split.t, .prefill, &.{1}, &tail, &.{@intCast(cold_n)});
+    defer testing.allocator.free(cold_out);
+    var dot: f64 = 0;
+    var gg: f64 = 0;
+    var cc: f64 = 0;
+    for (warm, cold_out) |a, b| {
+        dot += @as(f64, a) * b;
+        gg += @as(f64, a) * a;
+        cc += @as(f64, b) * b;
+    }
+    const cos = dot / @sqrt(gg * cc);
+    std.debug.print("[pfpass-slice] {s}: cut at {d} stands at {d} (cold {d}); global rows the snapshot's, against the cold prefix's: worst {e:.3} (same words {}); history same {}; first window against the split cold {e:.3}; next-row logits against the cold prefix's cos {d:.6} (the bounded replay, not held) -> {s}\n", .{ label, cut_at, n, cold_n, worst, bits, hist_same, win_e, cos, if (ok) "MATCHES" else "DIFFERS" });
+    return .{ .ok = ok, .logits = warm };
+}
+
+test "deepseek_v41 aux: under MLX_SERVE_DSV41_PF_PASS_SIZE a snapshot at the end of a pass past 8192 rows, sliced to a shorter prefix, restores there as a cold prefill of that prefix and continues as the default plan's snapshot sliced there; a slice to the wrong cut fails" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const was = env.override(.MLX_SERVE_DSV41_PF_PASS_SIZE, "1");
+    defer was.restore();
+    // The tiny pack's 4 heads take neither the flash kernel nor the gather. The f32 chain's GEMMs round a 160-row last
+    // span's rows otherwise than a 256-row span's, and the f16 core's here do not.
+    const f16_on = env.override(.MLX_SERVE_DSV41_ATTN_F16, "1");
+    defer f16_on.restore();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try longFiles(arena.allocator());
+    // A prompt whose rows but the last the plan runs as one pass wider than the old cap.
+    const N: usize = 12_000;
+    const ids = try testing.allocator.alloc(u32, N + 1);
+    defer testing.allocator.free(ids);
+    for (ids, 0..) |*x, i| x.* = @intCast(3 + (i * 37 + i * i / 7) % 90);
+    const chunk = dsv41.passRows(N, pass_pin);
+    try testing.expectEqual(N, chunk);
+    try testing.expect(chunk > dsv41.PASS_MIN_ROWS);
+    const wide = try WideTwin.open(files);
+    defer wide.close();
+    const t = wide.t;
+    // The switch engaged at load: the MoE takes the whole pass.
+    try testing.expect(wide.model().mdl.pass_plan and wide.model().mdl.moe_rows >= N);
+    const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
+    try testing.expect(aux.begin_prompt(t.m, 1, .of(ids), .{}, 0, true).isOk());
+    testing.allocator.free(try slotForward(t, .prefill, &.{1}, ids[0..N], &.{0}));
+    var sn: abi.Handle = null;
+    try testing.expect(aux.snapshot(t.m, 1, &sn).isOk());
+    try testing.expect(sn != null);
+    defer aux.free(t.m, sn);
+    const src: *const dsv41.Snap = @ptrCast(@alignCast(sn.?));
+    try testing.expectEqual(N, src.n);
+    v41.table.release_slot.?(t.m, 1);
+    // The same prompt's snapshot under the default plan (the switch's MoE and lead undone, the engine's 8192-row cut),
+    // to show the slice's restore is what it is for a default-plan snapshot.
+    const ctl = try WideTwin.open(files);
+    defer ctl.close();
+    ctl.model().mdl.pass_plan = false;
+    ctl.model().mdl.pass_no_lead = false;
+    ctl.model().mdl.moe_rows = dsv41.PASS_MIN_ROWS;
+    try testing.expect(aux.begin_prompt(ctl.t.m, 1, .of(ids), .{}, 0, true).isOk());
+    var at0: usize = 0;
+    while (at0 < N) : (at0 += 8192) testing.allocator.free(try slotForward(ctl.t, .prefill, &.{1}, ids[at0..@min(N, at0 + 8192)], &.{@intCast(at0)}));
+    var ctl_sn: abi.Handle = null;
+    try testing.expect(aux.snapshot(ctl.t.m, 1, &ctl_sn).isOk());
+    defer aux.free(ctl.t.m, ctl_sn);
+    v41.table.release_slot.?(ctl.t.m, 1);
+    // Shorter prefixes, still wider than the old cap and under it: each restores as its cold prefill, and continues as
+    // the default plan's snapshot sliced there continues.
+    for ([_]usize{ 9_000, 4_001 }) |at| {
+        var cut: abi.Handle = null;
+        try testing.expect(aux.slice(t.m, sn, at, &cut).isOk());
+        var info: abi.AuxSnapshotInfo = .{};
+        try testing.expect(aux.describe(t.m, cut, &info).isOk());
+        aux.free(t.m, cut);
+        var lb: [48]u8 = undefined;
+        const got = try sliceMatchesCold(files, wide, sn, ids, at, @intCast(info.n), try std.fmt.bufPrint(&lb, "prefix {d}, pass plan", .{at}));
+        defer testing.allocator.free(got.logits);
+        const ref = try sliceMatchesCold(files, ctl, ctl_sn, ids, at, @intCast(info.n), try std.fmt.bufPrint(&lb, "prefix {d}, default plan", .{at}));
+        defer testing.allocator.free(ref.logits);
+        try testing.expect(got.ok and ref.ok);
+        var dot: f64 = 0;
+        var gg: f64 = 0;
+        var rr: f64 = 0;
+        for (got.logits, ref.logits) |a, b| {
+            dot += @as(f64, a) * b;
+            gg += @as(f64, a) * a;
+            rr += @as(f64, b) * b;
+        }
+        const cos = dot / @sqrt(gg * rr);
+        std.debug.print("[pfpass-slice] prefix {d}: next-row logits after the restore, pass plan against default plan: cos {d:.6}, same words {}\n", .{ at, cos, std.mem.eql(f32, got.logits, ref.logits) });
+        try testing.expect(cos >= 0.999);
+    }
+    // Planted: the slice cut 64 rows short of the prefix it is judged as.
+    const bad = try sliceMatchesCold(files, wide, sn, ids, 9_000 - 64, 9_000, "planted: the wrong cut");
+    defer testing.allocator.free(bad.logits);
+    try testing.expect(!bad.ok);
 }
