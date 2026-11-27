@@ -140,5 +140,5 @@ test "embedding_gemma2 plugin: a pack the plugin declines is refused by name (no
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
     var buf: [512]u8 = undefined;
     const dir = buf[0..try tmp.dir.realPath(io, &buf)];
-    try testing.expectError(error.PluginDeclinedNoLegacy, @import("../../engines/mlx/plugin/config.zig").bindServed(io, a, dir, json));
+    try testing.expectError(error.PluginDeclinedNoLegacy, @import("../../engines/mlx/plugin/config.zig").bindServed(io, a, dir, json, null));
 }

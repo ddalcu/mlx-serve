@@ -79,6 +79,11 @@ pub const Config = struct {
     ssm_state_f32: bool = false,
 
     rope_yarn: bool = false,
+    /// The recipe a client offers for THIS pack when it shipped an unscaled rope: the `config_overrides` document
+    /// that scales it, and the context that resolves to. Owned by the Config; empty when it is already scaled
+    /// or has no room under this arch's ceiling.
+    scaling_overrides: ?[]const u8 = null,
+    scaling_window: u32 = 0,
     yarn_factor: f32 = 1.0,
     yarn_orig_max_pos: u32 = 0,
     yarn_beta_fast: f32 = 32.0,
@@ -420,6 +425,24 @@ pub fn parseJson(c: *Config, outer: std.json.ObjectMap) ParseError!void {
         if (c.linear_num_key_heads == 0 or c.linear_num_value_heads == 0 or c.linear_num_value_heads % c.linear_num_key_heads != 0)
             return error.InvalidConfigField;
     }
+    planScaling(c);
+}
+
+/// What this arch is validated to serve once scaled: 4x over the pack's own window.
+const yarn_ceiling: u32 = 1_048_576;
+
+/// The one-click rope recipe for a pack that shipped an unscaled rope: 4× over its own window when that stays
+/// under this arch's ceiling, 2× when only that does. The block sits where THIS arch reads it.
+fn planScaling(c: *Config) void {
+    if (c.rope_yarn) return;
+    const orig = c.max_position_embeddings;
+    if (orig == 0 or orig >= yarn_ceiling) return;
+    if (orig > yarn_ceiling / 4) return; // only the 4x arm is validated for this arch
+    const factor: u32 = 4;
+    const window = orig * factor;
+    const doc = gpa.print("{{\"text_config\":{{\"rope_parameters\":{{\"rope_type\":\"yarn\",\"factor\":{d},\"original_max_position_embeddings\":{d}}},\"max_position_embeddings\":{d}}}}}", .{ factor, orig, window }) catch return;
+    c.scaling_overrides = doc;
+    c.scaling_window = window;
 }
 
 /// The pack's `ngram_table` block when it names `exl3_ngram_trellis` (`NgramTable`'s trellis arm): the file holding
@@ -704,13 +727,18 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
 }
 
 pub fn freeParsed(p: *abi.Parsed) callconv(.c) void {
-    if (p.private) |ptr| gpa.destroy(@as(*Config, @ptrCast(@alignCast(ptr))));
+    if (p.private) |ptr| {
+        const c: *Config = @ptrCast(@alignCast(ptr));
+        if (c.scaling_overrides) |doc| gpa.free(doc);
+        gpa.destroy(c);
+    }
     p.private = null;
 }
 
 /// What the host reads off a parsed pack.
 pub fn facts(c: *Config) abi.Parsed {
     var p: abi.Parsed = .{ .private = c };
+    if (c.scaling_overrides) |doc| p.scaling = .{ .overrides = abi.Str.of(doc), .window = c.scaling_window };
     p.caps = .{
         .batches_decode = true,
         // Each slot's QSA keys are read per slot inside one stacked forward; the per-slot attention arm declines.
@@ -859,6 +887,38 @@ test "qwen4_exp config: the flat text pack parses with the family defaults and i
     try testing.expect(p.caps.batches_decode and p.caps.long_ctx and p.caps.moe and !p.caps.images and !p.caps.batch_per_slot_attn);
     try testing.expectEqual(@as(u32, 1), p.shell.eos_count);
     try testing.expectEqual(@as(f32, 1.0), p.spec.policy.draft_temperature);
+}
+
+test "qwen4_exp config: the recipe scales an unscaled rope, and a scaled one is offered nothing" {
+    const c = try parseOk(tiny_text);
+    defer if (c.scaling_overrides) |d| gpa.free(d);
+    defer gpa.destroy(c);
+    const orig = c.max_position_embeddings;
+    try testing.expect(!c.rope_yarn);
+    try testing.expect(orig > 0 and c.scaling_window > orig and c.scaling_window <= yarn_ceiling);
+    const sc = facts(c).scalingOf();
+    try testing.expectEqual(c.scaling_window, sc.window);
+    const doc = sc.overrides.slice();
+    try testing.expect(std.mem.indexOf(u8, doc, "\"rope_type\":\"yarn\"") != null);
+    var needle: [64]u8 = undefined;
+    const want = std.fmt.bufPrint(&needle, "\"original_max_position_embeddings\":{d}", .{orig}) catch return error.OutOfMemory;
+    try testing.expect(std.mem.indexOf(u8, doc, want) != null);
+
+    // A pack that already ships the scaled rope gets no recipe; so does one at the ceiling.
+    for ([_]struct { mpe: u32, yarn: bool }{ .{ .mpe = orig, .yarn = true }, .{ .mpe = yarn_ceiling, .yarn = false } }) |tcase| {
+        var x: Config = .{};
+        x.max_position_embeddings = tcase.mpe;
+        x.rope_yarn = tcase.yarn;
+        planScaling(&x);
+        try testing.expectEqual(@as(u32, 0), x.scaling_window);
+        try testing.expectEqual(@as(?[]const u8, null), x.scaling_overrides);
+    }
+    // A pack with room only for 2x is offered nothing: that arm is not validated here.
+    var half: Config = .{};
+    half.max_position_embeddings = yarn_ceiling / 2;
+    planScaling(&half);
+    try testing.expectEqual(@as(u32, 0), half.scaling_window);
+    try testing.expectEqual(@as(?[]const u8, null), half.scaling_overrides);
 }
 
 test "qwen4_exp config: a bad bound is refused by name, another family's key is unsupported" {

@@ -58,7 +58,7 @@ pub fn toModelConfig(a: std.mem.Allocator, c: *const Config, dir: ?[]const u8) !
 /// The family's fields the engine's config has no slot for.
 fn isPluginOnly(comptime name: []const u8) bool {
     @setEvalBranchQuota(10_000);
-    for ([_][]const u8{ "embedded_ngram", "mrope_inv_freq", "expert_quant", "trunk_quant", "ngram_file", "ngram_file_len" }) |n| {
+    for ([_][]const u8{ "embedded_ngram", "mrope_inv_freq", "expert_quant", "trunk_quant", "ngram_file", "ngram_file_len", "scaling_overrides", "scaling_window" }) |n| {
         if (std.mem.eql(u8, name, n)) return true;
     }
     return false;

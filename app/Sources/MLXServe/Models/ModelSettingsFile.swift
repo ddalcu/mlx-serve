@@ -58,11 +58,16 @@ struct ModelOverride: Equatable {
     /// `chat_template_kwargs`: variables handed to the model's Jinja template
     /// verbatim (`TemplateKwargs` types and names them).
     var templateKwargs: [String: Any] = [:]
+    /// `config_overrides`: a JSON object the server deep-merges into the pack's `config.json` at load — this
+    /// model's share of `--config-overrides`, the way to state a rope scaling the checkpoint does not carry.
+    /// Held as the text the sheet edits, canonicalized by `ConfigOverrides`.
+    var configOverrides: String?
     var generationDefaults = GenerationDefaults()
     var extra: [String: Any] = [:]
 
     init(ctxSize: Int? = nil, kvQuant: KvQuantChoice? = nil, mtp: Bool? = nil,
-         mtpAcceptance: MtpAcceptanceChoice? = nil, mtpGreedyTail: Bool? = nil, int8Prefill: Bool? = nil, templateKwargs: [String: Any] = [:]) {
+         mtpAcceptance: MtpAcceptanceChoice? = nil, mtpGreedyTail: Bool? = nil, int8Prefill: Bool? = nil, templateKwargs: [String: Any] = [:],
+         configOverrides: String? = nil) {
         self.ctxSize = ctxSize
         self.kvQuant = kvQuant
         self.mtp = mtp
@@ -70,6 +75,7 @@ struct ModelOverride: Equatable {
         self.mtpGreedyTail = mtpGreedyTail
         self.int8Prefill = int8Prefill
         self.templateKwargs = templateKwargs
+        self.configOverrides = configOverrides
     }
 
     init(json: [String: Any]) {
@@ -100,6 +106,12 @@ struct ModelOverride: Equatable {
         }
         if let e = rest.removeValue(forKey: "engine") { engine = e as? String }
         if let kw = rest.removeValue(forKey: "chat_template_kwargs") as? [String: Any] { templateKwargs = kw }
+        // Only an object is the server's key; another shape stays in `extra` and survives untouched.
+        if let ov = rest["config_overrides"] as? [String: Any] {
+            let text = ConfigOverrides.text(ov)
+            if !text.isEmpty { configOverrides = text }
+            rest.removeValue(forKey: "config_overrides")
+        }
         if let profile = rest["generation_defaults"] as? [String: Any],
            let data = try? JSONSerialization.data(withJSONObject: profile),
            let parsed = try? JSONDecoder().decode(GenerationDefaults.self, from: data) {
@@ -113,7 +125,7 @@ struct ModelOverride: Equatable {
     /// True when any field the sheet edits is set.
     var hasSettings: Bool {
         alias != nil || ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil || mtpGreedyTail != nil || drafter != nil || int8Prefill != nil || ane != nil || engine != nil
-            || !templateKwargs.isEmpty || !generationDefaults.rules.isEmpty
+            || !templateKwargs.isEmpty || configOverrides != nil || !generationDefaults.rules.isEmpty
     }
     var sortedKwargKeys: [String] { templateKwargs.keys.sorted() }
 
@@ -130,6 +142,7 @@ struct ModelOverride: Equatable {
         if let ane { out["ane"] = ane }
         if let engine { out["engine"] = engine }
         if !templateKwargs.isEmpty { out["chat_template_kwargs"] = templateKwargs }
+        if let c = configOverrides, let o = ConfigOverrides.object(c) { out["config_overrides"] = o }
         if !generationDefaults.rules.isEmpty { out["generation_defaults"] = generationDefaults.json }
         return out
     }
@@ -163,6 +176,7 @@ struct ModelOverride: Equatable {
     static func == (a: ModelOverride, b: ModelOverride) -> Bool {
         a.alias == b.alias && a.ctxSize == b.ctxSize && a.kvQuant == b.kvQuant && a.mtp == b.mtp && a.mtpAcceptance == b.mtpAcceptance && a.mtpGreedyTail == b.mtpGreedyTail && a.drafter == b.drafter
             && a.int8Prefill == b.int8Prefill && a.ane == b.ane && a.engine == b.engine && a.generationDefaults == b.generationDefaults
+            && a.configOverrides == b.configOverrides
             && NSDictionary(dictionary: a.templateKwargs).isEqual(to: b.templateKwargs)
             && NSDictionary(dictionary: a.extra).isEqual(to: b.extra)
     }
@@ -219,6 +233,55 @@ struct ModelSettingsFile {
         let root = entries.mapValues { $0.json }
         let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
         try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+    }
+}
+
+/// The per-model `config_overrides` field: a JSON object in the server's `--config-overrides` grammar,
+/// deep-merged into the pack's `config.json` at load. The sheet edits text, the file holds an object,
+/// and `text` is canonical so two entries that mean the same compare equal.
+enum ConfigOverrides {
+    /// What the box's text means for the stored key.
+    enum Edit: Equatable {
+        case clear
+        case set(String)
+        /// Half-typed text: keep what is stored and block the save.
+        case keep
+    }
+
+    /// The typed text as the object to store; nil when it is empty, names nothing, or is not a JSON object.
+    static func object(_ text: String) -> [String: Any]? {
+        guard let dict = parsed(text), !dict.isEmpty else { return nil }
+        return dict
+    }
+
+    /// Whether the box may hold the text: any JSON object, an empty one included — it names nothing, which is a
+    /// cleared setting rather than a mistake, so it must never block the save.
+    static func isObject(_ text: String) -> Bool { parsed(text) != nil }
+
+    /// The one decision the sheet makes with the text, so clearing it is testable.
+    static func edit(_ text: String) -> Edit {
+        if let dict = parsed(text) { return dict.isEmpty ? .clear : .set(ConfigOverrides.text(dict)) }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .clear : .keep
+    }
+
+    /// Why the text cannot be stored; nil when it is empty or a JSON object.
+    static func rejection(_ text: String) -> String? {
+        edit(text) != .keep ? nil
+            : "Config overrides must be one JSON object, like {\"text_config\": {\"rope_parameters\": {\"rope_type\": \"yarn\", \"factor\": 4}}}."
+    }
+
+    private static func parsed(_ text: String) -> [String: Any]? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8),
+              let parsed = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        return parsed as? [String: Any]
+    }
+
+    /// The stored object as one line of JSON for the box; "" when it names nothing.
+    static func text(_ object: [String: Any]) -> String {
+        guard !object.isEmpty, let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+              let s = String(data: data, encoding: .utf8) else { return "" }
+        return s
     }
 }
 

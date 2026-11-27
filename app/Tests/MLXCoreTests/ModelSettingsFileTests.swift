@@ -209,3 +209,90 @@ final class EffectiveContextLengthTests: XCTestCase {
         XCTAssertEqual(AgentEngine.effectiveContextLength(appContextSize: 0, modelContextLength: 0), 32_768)
     }
 }
+
+/// The per-model `config_overrides` box: the server's own deep-merge grammar (`--config-overrides`),
+/// written as a JSON OBJECT and held as the text the user typed.
+final class ConfigOverridesFieldTests: XCTestCase {
+    private func tempPath() -> String {
+        NSTemporaryDirectory() + "model-settings-\(UUID().uuidString)/model-settings.json"
+    }
+
+    private let yarn = "{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":4},\"max_position_embeddings\":1048576}}"
+
+    func testTheFieldAcceptsOnlyANonEmptyJSONObject() {
+        XCTAssertNotNil(ConfigOverrides.object(yarn))
+        XCTAssertNil(ConfigOverrides.object(""))
+        XCTAssertNil(ConfigOverrides.object("   "))
+        XCTAssertNil(ConfigOverrides.object("{}"), "an object that names nothing overrides nothing")
+        XCTAssertNil(ConfigOverrides.object("[1,2]"))
+        XCTAssertNil(ConfigOverrides.object("\"yarn\""))
+        XCTAssertNil(ConfigOverrides.object("{oops"))
+        XCTAssertEqual(ConfigOverrides.text([:]), "")
+    }
+
+    func testTheFieldKeepsTheStoredShape() {
+        guard let o = ConfigOverrides.object(yarn),
+              let tc = o["text_config"] as? [String: Any],
+              let rp = tc["rope_parameters"] as? [String: Any] else { return XCTFail("the nested block did not survive") }
+        XCTAssertEqual(rp["rope_type"] as? String, "yarn")
+        XCTAssertEqual(tc["max_position_embeddings"] as? Int, 1_048_576)
+        // The text is canonical, so two entries that mean the same compare equal.
+        XCTAssertEqual(ConfigOverrides.text(o), ConfigOverrides.text(ConfigOverrides.object(ConfigOverrides.text(o))!))
+    }
+
+    func testTheKeyRoundTripsAsAnObjectAndMarksTheLoadChanged() throws {
+        let path = tempPath()
+        var file = ModelSettingsFile()
+        file.set(ModelOverride(ctxSize: 1_048_576, configOverrides: yarn), for: "/m/a")
+        try file.save(path: path)
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let entry = root["/m/a"] as? [String: Any] else { return XCTFail("the file is not an object of objects") }
+        XCTAssertTrue(entry["config_overrides"] is [String: Any], "the server reads an object, not a string: \(entry)")
+
+        let back = try XCTUnwrap(ModelSettingsFile.load(path: path).override(for: "/m/a"))
+        XCTAssertEqual(ConfigOverrides.object(back.configOverrides ?? "")?.count, 1)
+        XCTAssertTrue(back.changesLoad(from: ModelOverride(ctxSize: 1_048_576)))
+        XCTAssertFalse(back.changesLoad(from: ModelOverride(ctxSize: 1_048_576, configOverrides: ConfigOverrides.text(ConfigOverrides.object(yarn)!))))
+    }
+
+    func testAValueThatIsNotAnObjectIsLeftAlone() {
+        let stored = ModelOverride(json: ["config_overrides": "yarn"])
+        XCTAssertNil(stored.configOverrides)
+        XCTAssertEqual(stored.extra["config_overrides"] as? String, "yarn", "a shape the app does not know still survives the save")
+    }
+
+    /// An empty object names nothing, so it clears the key: the box must not refuse it and freeze the save.
+    func testTheBoxAcceptsAnyObjectAndOnlyStoresANonEmptyOne() {
+        XCTAssertTrue(ConfigOverrides.isObject("{}"))
+        XCTAssertNil(ConfigOverrides.object("{}"))
+        XCTAssertTrue(ConfigOverrides.isObject(yarn))
+        XCTAssertFalse(ConfigOverrides.isObject("\"yarn\""))
+        XCTAssertFalse(ConfigOverrides.isObject("[1,2]"))
+        XCTAssertFalse(ConfigOverrides.isObject("{oops"))
+        XCTAssertFalse(ConfigOverrides.isObject("   "))
+    }
+}
+
+/// The box's edit decision: what the typed text does to the stored key, and when it blocks the save.
+final class ConfigOverridesEditTests: XCTestCase {
+    /// Already in the canonical order `ConfigOverrides.text` writes, so a `.set` compares by text.
+    private let yarn = "{\"text_config\":{\"rope_parameters\":{\"factor\":4,\"rope_type\":\"yarn\"}}}"
+
+    func testEmptyTextAndAnEmptyObjectBothClearTheKey() {
+        XCTAssertEqual(ConfigOverrides.edit(""), .clear)
+        XCTAssertEqual(ConfigOverrides.edit("  \n "), .clear)
+        XCTAssertEqual(ConfigOverrides.edit("{}"), .clear)
+        XCTAssertNil(ConfigOverrides.rejection(""))
+        XCTAssertNil(ConfigOverrides.rejection("{}"), "a no-op object is not a mistake")
+    }
+
+    func testValidTextStoresAndHalfTypedTextOnlyBlocks() {
+        XCTAssertEqual(ConfigOverrides.edit(yarn), .set(yarn))
+        XCTAssertNil(ConfigOverrides.rejection(yarn))
+        for bad in ["{oops", "\"yarn\"", "[1,2]", "4"] {
+            XCTAssertEqual(ConfigOverrides.edit(bad), .keep, bad)
+            XCTAssertNotNil(ConfigOverrides.rejection(bad), bad)
+        }
+    }
+}

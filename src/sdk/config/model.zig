@@ -12,6 +12,7 @@ const exl3 = @import("../quant/exl3/format.zig");
 const sushi_pack = @import("../../engines/mlx/load/sushi_adapt.zig");
 const modelopt_pack = @import("../quant/nvfp4/modelopt_pack.zig");
 const model_discovery = @import("../../host/registry/discovery.zig");
+const model_settings = @import("../../host/registry/model_settings.zig");
 const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
 const transcription = @import("../../host/api/audio/transcription.zig");
 const qwen4_exp = @import("../../plugins/qwen4_exp/qwen4_exp.zig");
@@ -545,6 +546,9 @@ pub const ModelConfig = struct {
     drafter_ctx_bytes_per_token: u64 = 0,
     /// `drafter` setting: null or "auto" = the in-dir probe, "off", or a path. Owned.
     drafter_override: ?[]const u8 = null,
+    /// The pack's `config_overrides` document that was deep-merged into the bytes this config was parsed
+    /// from. The SSD KV root hashes THIS, so a stored cache is never filed under a rope the load did not use. Owned.
+    config_overrides_applied: ?[]const u8 = null,
     /// The plugin serving this pack and its parse (`engines/mlx/plugin/config.zig`); null = the legacy path.
     plugin: ?*plugin_config.Binding = null,
     /// The facts the legacy parse declares for its family; a served config reads its plugin's (`caps`,
@@ -1690,6 +1694,15 @@ pub const ModelConfig = struct {
         });
     }
 
+    /// The rope recipe the serving plugin advertises for this pack (the `config_overrides` document that
+    /// scales it, and the window that resolves to); null when no plugin answers. Owned by the parse.
+    pub fn scalingRecipe(self: *const ModelConfig) ?abi.ScalingFacts {
+        const b = self.plugin orelse return null;
+        const sc = b.parsed.scalingOf();
+        if (sc.window == 0 or sc.overrides.len == 0) return null;
+        return sc;
+    }
+
     /// Free the allocator-owned fields (`ngram_table_path`, allocPrint'd by
     /// `parseConfig`, and `drafter_override`); everything else is plain data or a borrowed slice. Every
     /// `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
@@ -1701,6 +1714,8 @@ pub const ModelConfig = struct {
         self.pack_dir = null;
         if (self.drafter_override) |p| allocator.free(p);
         self.drafter_override = null;
+        if (self.config_overrides_applied) |p| allocator.free(p);
+        self.config_overrides_applied = null;
         if (self.plugin) |b| b.destroy(allocator);
         self.plugin = null;
     }
@@ -1739,28 +1754,36 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     const content = try json_text.quoteInfinity(allocator, raw);
     defer allocator.free(content);
 
+    // The pack's per-model `config_overrides` land before both parses, so the window the plugin's rope builds, the
+    // window the engine bills and the window the row advertises are one window. The launch's `--config-overrides`
+    // is merged by the two parses below and wins a key both layers name.
+    var per_model = model_settings.configOverridesFor(allocator, io, model_dir);
+    defer if (per_model) |p| allocator.free(p);
+    const scoped = try plugin_config.mergeOverrides(allocator, content, per_model, null);
+    defer if (scoped.ptr != content.ptr) allocator.free(scoped);
+
     // A served pack's engine config is the legacy parse with the plugin's binding attached, so every engine read
     // (bills, cache sizing, batching, sampling and thinking defaults) stays as it was; the plugin's facts alone
     // only for a type the legacy parse cannot read. An outside plugin's binding takes the legacy parse only when its
     // parse asks for it (`Parsed.engine_config`); otherwise its facts alone.
-    const binding = if (served) try plugin_config.bindServed(io, allocator, model_dir, content) else null;
+    const binding = if (served) try plugin_config.bindServed(io, allocator, model_dir, scoped, null) else null;
     errdefer if (binding) |b| b.destroy(allocator);
-    if (binding) |b| if (b.outside and !b.parsed.wantsEngineConfig()) return plugin_config.adapted(b);
-    var config = parseConfigFromJson(allocator, content) catch |e| {
+    if (binding) |b| if (b.outside and !b.parsed.wantsEngineConfig()) return stamped(plugin_config.adapted(b), &per_model);
+    var config = parseConfigFromJson(allocator, scoped) catch |e| {
         const b = binding orelse return e;
         log.info("[plugin] {s}: the legacy parse refused {s} ({s}); the engine config is the plugin's facts\n", .{ b.table.name.slice(), b.parsed.shell.model_type.slice(), @errorName(e) });
-        return plugin_config.adapted(b);
+        return stamped(plugin_config.adapted(b), &per_model);
     };
     // A type the legacy parse knows only as a llama guess is the plugin's facts alone (the layout, the recurrent
     // states), never a full-attention llama.
     if (binding) |b| if (std.mem.eql(u8, config.model_type, "unknown")) {
         config.deinit(allocator);
-        return plugin_config.adapted(b);
+        return stamped(plugin_config.adapted(b), &per_model);
     };
     errdefer config.deinit(allocator);
     if (config.isDsv41()) config.pack_dir = try allocator.dupe(u8, model_dir);
     // Its outside plugin reads no vision tower.
-    if (config.isGlm5() and declaresExpertStreaming(allocator, content)) {
+    if (config.isGlm5() and declaresExpertStreaming(allocator, scoped)) {
         config.expert_bank = true;
         config.has_vision = false;
     }
@@ -1906,7 +1929,16 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     }
 
     config.plugin = binding;
-    return config;
+    return stamped(config, &per_model);
+}
+
+/// Moves the `config_overrides` document that was merged into these bytes onto the config they produced, so the
+/// SSD KV root hashes what the load actually parsed. Takes it once: the caller's `defer` frees what is left.
+fn stamped(c: ModelConfig, pm: *?[]const u8) ModelConfig {
+    var out = c;
+    out.config_overrides_applied = pm.*;
+    pm.* = null;
+    return out;
 }
 
 /// Sampling recommendations parsed out of a model's generation_config.json.
@@ -2442,7 +2474,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     // load, discovery stubs), so the advertised context and the loaded model
     // can never disagree about what window the checkpoint has.
     const merged: ?[]const u8 = if (modelCli().config_overrides) |ov| blk: {
-        break :blk try mergeConfigJson(allocator, content, ov);
+        break :blk try mergeConfigJson(allocator, content, ov, "server-wide --config-overrides");
     } else null;
     defer if (merged) |m| allocator.free(m);
 

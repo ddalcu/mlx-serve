@@ -70,6 +70,8 @@ struct ModelSettingsSheet: View {
     @State private var addingCustom = false
     @State private var customKey = ""
     @State private var customValue = ""
+    /// The `config_overrides` box, as typed; `override.configOverrides` only takes it while it is valid.
+    @State private var configText = ""
     @State private var busy = false
     /// The save reloads the model; the sheet stays up and shows the load until it is ready.
     @State private var reloading = false
@@ -104,6 +106,16 @@ struct ModelSettingsSheet: View {
         return nil
     }
 
+    /// Why the typed `config_overrides` cannot be stored, if it cannot.
+    private var configError: String? { ConfigOverrides.rejection(configText) }
+
+    /// The rope recipe the server's plugin advertises for this model. The plugin decides which arch scales and
+    /// how far; the sheet only offers what it is told.
+    private var yarnRecipe: (json: String, window: Int)? {
+        guard let live, live.loaded, let json = live.yarnOverrides, live.yarnWindow > 0 else { return nil }
+        return (json, live.yarnWindow)
+    }
+
     /// A running server answers from `/v1/models`; otherwise the app's own disk probe.
     private var mtpAvailable: Bool? {
         if let a = live?.mtpAvailable { return a }
@@ -119,8 +131,13 @@ struct ModelSettingsSheet: View {
         ModelSettingsApply.engineChoices(engines: live?.engines ?? [], stored: override.engineChoice)
     }
 
+    /// The pack's architecture, as the app's own disk probe read it.
+    private var modelType: String? {
+        appState.localModels.first { $0.path == request.path }?.modelType
+    }
+
     private var hasInt8PrefillRoute: Bool {
-        ModelSettingsApply.hasInt8PrefillRoute(modelType: appState.localModels.first { $0.path == request.path }?.modelType)
+        ModelSettingsApply.hasInt8PrefillRoute(modelType: modelType)
     }
 
     private var rows: (mtp: Bool, acceptance: Bool) {
@@ -153,6 +170,7 @@ struct ModelSettingsSheet: View {
         if !isGguf { n += 2 + (specLine == nil ? 0 : 1) }
         if rows.acceptance { n += 2 }
         if live?.loaded == true { n += 1 }
+        if !isGguf { n += 2 } // the config_overrides box and its explainer
         if !isGguf { n += 2 + override.templateKwargs.count + (addingCustom ? 1 : 0) }
         return min(650, CGFloat(44 * n + 50 + 10 * 72))
     }
@@ -283,6 +301,37 @@ struct ModelSettingsSheet: View {
                 }
                 .help("What serves this model; Automatic leaves it to the server. The Neural Engine leaves the GPU free (text only; the first load on this Mac compiles it for minutes).")
                 }
+                if !isGguf {
+                    Section {
+                        TextField("", text: $configText,
+                                  prompt: Text(verbatim: "{}").font(.app(.body).monospaced()), axis: .vertical)
+                            .font(.app(.body).monospaced())
+                            .lineLimit(1...6)
+                            .onChange(of: configText) { _, v in
+                                switch ConfigOverrides.edit(v) {
+                                case .clear: override.configOverrides = nil
+                                case .set(let text): override.configOverrides = text
+                                case .keep: break // half-typed: keep what is stored, and block the save
+                                }
+                            }
+                    } header: {
+                        HStack {
+                            Text("Config overrides").font(.app(.body))
+                            Spacer()
+                            if let yarn = yarnRecipe {
+                                Button {
+                                    configText = yarn.json
+                                    override.ctxSize = yarn.window
+                                } label: {
+                                    Text("YaRN to \(ContextSizeDisplay.formatTokens(yarn.window))").font(.app(.body))
+                                }
+                                .help("Fills the box with the rope document this model's plugin advertises, and sets the context size to what it resolves to.")
+                            }
+                        }
+                    } footer: {
+                        Text(L10n.text("A JSON object the server deep-merges into this model's config.json at load — the per-model form of --config-overrides. A rope the model was not trained with reads as one-token answers: state it here as rope_parameters (rope_type yarn, its factor and original_max_position_embeddings) and raise max_position_embeddings with it. A launch --config-overrides wins a key both name.")).font(.app(.body))
+                    }
+                }
                 Section("Generation defaults") {
                     if override.extra["generation_defaults"] != nil {
                         Text("The stored generation policy contains invalid or unsupported fields. It is preserved; correct model-settings.json before editing it here.")
@@ -354,6 +403,9 @@ struct ModelSettingsSheet: View {
             if let aliasError {
                 Text(verbatim: aliasError).font(.app(.caption)).foregroundStyle(.red).padding(.horizontal, 16)
             }
+            if let configError {
+                Text(verbatim: configError).font(.app(.caption)).foregroundStyle(.red).padding(.horizontal, 16)
+            }
             if let error {
                 Text(error).font(.app(.caption)).foregroundStyle(.red).padding(.horizontal, 16)
             }
@@ -369,7 +421,7 @@ struct ModelSettingsSheet: View {
                 Button { Task { await save() } } label: { Text(L10n.text(plan == .restart ? "Save & Restart" : "Save"))
                     .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(busy || aliasError != nil)
+                    .disabled(busy || aliasError != nil || configError != nil)
             }
             .padding(16)
         }
@@ -378,6 +430,7 @@ struct ModelSettingsSheet: View {
             settingsFile = ModelSettingsFile.load()
             override = settingsFile.override(for: request.path) ?? ModelOverride()
             initialOverride = override
+            configText = override.configOverrides ?? ""
             inheritedGeneration = (try? GenerationDefaultsFile.load()) ?? .init()
             packDrafter = DrafterGems.packDrafterFolder(modelDir: request.path)
             let gems = SpeculationSocketRow.gems(repoId: repoId, packDrafter: packDrafter, mtpAvailable: rows.mtp,

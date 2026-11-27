@@ -179,6 +179,9 @@ fn printUsage(io: std.Io) void {
         \\                      e.g. '{"text_config":{"rope_parameters":{"rope_type":
         \\                      "yarn","factor":4.0,"original_max_position_embeddings":
         \\                      262144},"max_position_embeddings":1048576}}'
+        \\                      A model's "config_overrides" in model-settings.json
+        \\                      is the per-model form of this flag; this flag wins a
+        \\                      key both name.
         \\  --embedding-max-length <n>  Per-input token ceiling for /v1/embeddings
         \\                      (default auto = the model's declared window; over-limit
         \\                      inputs get a 400 naming index/count/limit, never truncation)

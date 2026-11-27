@@ -201,6 +201,12 @@ class APIClient {
         // Encoder-only entries advertise "embeddings" even as unloaded stubs
         // (the server peeks model_type at discovery); architecture is the
         // belt-and-suspenders signal for loaded entries.
+        let yarn = meta["yarn"] as? [String: Any]
+        var yarnJSON: String?
+        if let ov = yarn?["overrides"] as? [String: Any],
+           let data = try? JSONSerialization.data(withJSONObject: ov, options: [.sortedKeys]) {
+            yarnJSON = String(data: data, encoding: .utf8)
+        }
         let supportsEmbeddings = caps.contains("embeddings")
             || (meta["architecture"] as? String) == "bert"
         return ModelInfo(
@@ -211,6 +217,8 @@ class APIClient {
             vocabSize: meta["vocab_size"] as? Int ?? 0,
             contextLength: meta["context_length"] as? Int ?? 0,
             modelMaxTokens: meta["model_max_tokens"] as? Int ?? 0,
+            yarnOverrides: yarnJSON,
+            yarnWindow: yarn?["window"] as? Int ?? 0,
             architecture: meta["architecture"] as? String ?? "",
             engineName: meta["engine"] as? String ?? "",
             isMoE: meta["is_moe"] as? Bool ?? false,

@@ -36,13 +36,17 @@ pub const Override = struct {
     /// Extra template variables as a JSON object (vLLM/llama.cpp
     /// `chat_template_kwargs`), e.g. `{"preserve_thinking": true}`. Owned.
     chat_template_kwargs: ?[]const u8 = null,
+    /// A JSON object deep-merged into the pack's `config.json` before it is parsed — this model's share of
+    /// `--config-overrides` (the launch flag still wins a key both name): the per-model way to state a rope
+    /// scaling the checkpoint does not carry. Owned.
+    config_overrides: ?[]const u8 = null,
     /// The speculation sidecar: "off", "auto" (the pack's own `drafter/`) or an
     /// absolute path. Owned.
     drafter: ?[]const u8 = null,
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
-            o.mtp_greedy_tail == null and o.int8_prefill == null and o.lm_head_mxfp8 == null and o.ane == null and o.stream_experts == null and o.engine == null and o.chat_template_kwargs == null and o.drafter == null;
+            o.mtp_greedy_tail == null and o.int8_prefill == null and o.lm_head_mxfp8 == null and o.ane == null and o.stream_experts == null and o.engine == null and o.chat_template_kwargs == null and o.config_overrides == null and o.drafter == null;
     }
 
     /// Whether the model runs on the Neural Engine: the engine setting's choice, else the `ane` switch.
@@ -65,8 +69,10 @@ pub const Override = struct {
 
     pub fn deinit(o: *Override, alloc: std.mem.Allocator) void {
         if (o.chat_template_kwargs) |k| alloc.free(k);
+        if (o.config_overrides) |c| alloc.free(c);
         if (o.drafter) |d| alloc.free(d);
         o.chat_template_kwargs = null;
+        o.config_overrides = null;
         o.drafter = null;
     }
 };
@@ -238,6 +244,10 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
     };
     if (obj.get("chat_template_kwargs")) |k| if (k == .object) {
         o.chat_template_kwargs = std.json.Stringify.valueAlloc(alloc, k, .{}) catch null;
+    };
+    // An object that names nothing overrides nothing, so it reads as unset.
+    if (obj.get("config_overrides")) |c| if (c == .object and c.object.count() > 0) {
+        o.config_overrides = std.json.Stringify.valueAlloc(alloc, c, .{}) catch null;
     };
     return o;
 }
@@ -423,7 +433,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         };
     };
     var rows_buf: [16]u8 = undefined;
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} int8={s} lm_head_mxfp8={s} ane={s} stream_experts={s} engine={s} drafter={s} kwargs={s}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} int8={s} lm_head_mxfp8={s} ane={s} stream_experts={s} engine={s} drafter={s} kwargs={s} cfg={s}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
@@ -440,8 +450,28 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         if (o.engine) |e| @tagName(e) else "auto",
         o.drafter orelse "auto",
         o.chat_template_kwargs orelse "none",
+        o.config_overrides orelse "none",
     });
     return o;
+}
+
+/// `model_path`'s entry as an `Override`, without the load log: the one read a parse or a fingerprint makes.
+/// The caller owns it (`Override.deinit`).
+pub fn settingsForPack(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8) Override {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var s = load(alloc, io, defaultPath(&buf));
+    defer s.deinit();
+    return lookupPack(&s, alloc, io, model_path);
+}
+
+/// The pack's `config_overrides` document, deep-merged into its `config.json` where a parse reads it; null when
+/// the model names none. The caller owns the text (`alloc`).
+pub fn configOverridesFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8) ?[]const u8 {
+    var o = settingsForPack(alloc, io, model_path);
+    const ov = o.config_overrides;
+    o.config_overrides = null;
+    o.deinit(alloc);
+    return ov;
 }
 
 test "model_settings: parse + lookup with and without trailing slash" {
@@ -577,6 +607,32 @@ test "model_settings: chat_template_kwargs is an object carried verbatim, anythi
     defer a.deinit(t);
     try std.testing.expectEqualStrings("{\"preserve_thinking\":true,\"x\":[1]}", a.chat_template_kwargs.?);
     try std.testing.expect(s.lookup(t, "/m/b").isEmpty());
+}
+
+test "model_settings: config_overrides is a JSON object carried verbatim; anything else is unset" {
+    const t = std.testing.allocator;
+    var s = try parse(t,
+        \\{"/m/a": {"config_overrides": {"text_config":{"rope_parameters":{"rope_type":"yarn","factor":4}}}},
+        \\ "/m/b": {"config_overrides": "yarn"}, "/m/c": {"config_overrides": [1]},
+        \\ "/m/d": {"config_overrides": {}}, "/m/e": {"config_overrides": {"max_position_embeddings": 1048576}}}
+    );
+    defer s.deinit();
+    var a = s.lookup(t, "/m/a");
+    defer a.deinit(t);
+    var doc = try std.json.parseFromSlice(std.json.Value, t, a.config_overrides.?, .{});
+    defer doc.deinit();
+    try std.testing.expectEqualStrings("yarn", doc.value.object.get("text_config").?.object.get("rope_parameters").?.object.get("rope_type").?.string);
+    try std.testing.expect(!a.isEmpty());
+    var e = s.lookup(t, "/m/e");
+    defer e.deinit(t);
+    try std.testing.expectEqualStrings("{\"max_position_embeddings\":1048576}", e.config_overrides.?);
+    // A non-object and an object that names nothing both override nothing.
+    for ([_][]const u8{ "/m/b", "/m/c", "/m/d" }) |p| {
+        var o = s.lookup(t, p);
+        defer o.deinit(t);
+        try std.testing.expectEqual(@as(?[]const u8, null), o.config_overrides);
+        try std.testing.expect(o.isEmpty());
+    }
 }
 
 test "model_settings: generation rules re-read per request; kwargs thinking keys fill rules the entry leaves unset" {

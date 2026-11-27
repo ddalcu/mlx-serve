@@ -447,6 +447,11 @@ struct ModelInfo {
     /// only by what the architecture supports. Stable across server restarts;
     /// use this for UI like the "Model max" pill in Settings.
     var modelMaxTokens: Int
+    /// The rope recipe the serving plugin advertises for this model (`meta.yarn`): the JSON document to merge as
+    /// the model's `config_overrides`, and the context it resolves to. Only a loaded model carries it, and only
+    /// the plugin knows which arch scales and how far — the app renders it and invents nothing.
+    var yarnOverrides: String? = nil
+    var yarnWindow: Int = 0
     /// `model_type` from config.json — "gemma4", "qwen3_5_moe", "llama", etc.
     /// Empty string when talking to a pre-drafter-UX server build.
     var architecture: String = ""

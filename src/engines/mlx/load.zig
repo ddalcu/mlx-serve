@@ -877,6 +877,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 sch.io,
                 entry.path,
                 params.config.cacheLayoutNamespace(),
+                params.config.config_overrides_applied,
             ) catch |err| {
                 log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
                 break :attach;
