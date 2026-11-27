@@ -678,6 +678,22 @@ extension MediaBundle {
         )
     }
 
+    /// Ming-Image: the release's component tree (`assets/` stays on the hub).
+    static func mingImage(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "mingimage:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, excludeSubstrings: ["assets/"]),
+                    readyMarkers: ["config.json", "mllm", "connector", "mlp", "transformer", "vae", "scheduler"]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// A MiniMax-H3-Image pack: the three weight files at the root beside config + tokenizer (`assets/` stays on the hub).
     static func minimaxH3Image(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
         MediaBundle(
@@ -730,6 +746,8 @@ extension ImageModelPreset {
             return .mossImage(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .minimaxH3Image:
             return .minimaxH3Image(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        case .mingImage:
+            return .mingImage(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .flux2Klein9B, .flux2Klein9BBase:
             // The MLX conversions of klein 9B — distilled and base alike —
             // ship no root config.json.

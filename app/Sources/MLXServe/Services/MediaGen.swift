@@ -165,6 +165,7 @@ enum FluxVariant: String, Hashable, Codable {
     case qwenImage21Turbo // Qwen-Image-2.1-Turbo — same backend; its pack's 8-sigma grid sets the steps server-side
     case mossImage        // OpenMOSS MOSS-Image 5B single-stream DiT — served by the moss_image backend; undistilled (50 steps, CFG 3)
     case minimaxH3Image   // MiniMax-H3-Image — H3's DiT as a six-step PDD student, served by the minimax_h3_image backend
+    case mingImage        // inclusionAI Ming-Image — MoE MLLM + 6B DiT, RGBA output, served by the ming_image plugin
 }
 
 struct ImageQualitySettings: Hashable {
@@ -623,6 +624,40 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "OpenMOSS's 5B image model — long prompts, tag lists or a JSON layout that places each object and line of text, with in-image text in English and Chinese. Undistilled: 50 steps with guidance, so it is slow. Open (Apache-2.0)."
     )
 
+    /// Exact entries of the release's aspect buckets (the server snaps any other size to the nearest one).
+    private static let mingImageResolutions: [ResolutionOption] = [
+        .init(width: 1024, height: 1024, label: "1024 × 1024 (square)"),
+        .init(width: 1216, height: 832,  label: "1216 × 832 (landscape 3:2)"),
+        .init(width: 832,  height: 1216, label: "832 × 1216 (portrait 2:3)"),
+        .init(width: 1344, height: 768,  label: "1344 × 768 (landscape 16:9)"),
+        .init(width: 768,  height: 1344, label: "768 × 1344 (portrait 9:16)"),
+        .init(width: 2048, height: 2048, label: "2048 × 2048 (square, 4 MP)"),
+        .init(width: 2560, height: 1440, label: "2560 × 1440 (landscape 16:9, 4 MP)"),
+        .init(width: 1440, height: 2560, label: "1440 × 2560 (portrait 9:16, 4 MP)"),
+    ]
+
+    /// Ming-Image-0.2-Design, 8-bit (`tests/convert_ming_image_weights.py`): 25 GB resident, 7 s at 1024² and
+    /// 40 s at 2048² on an M5 Ultra, renders matching bf16 at the same seed.
+    static let mingImage_8bit = ImageModelPreset(
+        id: "ddalcu/ming-image-0.2-design-8bit",
+        name: "Ming-Image 0.2 Design 8-bit (~29 GB)",
+        variant: .mingImage,
+        configName: "ming_image",
+        repo: "ddalcu/Ming-Image-0.2-Design-MLX-Serve-8bit",
+        approxDownloadGB: 29,
+        approxRAMGB: 29,
+        resolutions: mingImageResolutions,
+        defaultResolution: mingImageResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 8),
+            .good:         .init(steps: 12),
+            .quality:      .init(steps: 20),
+            .superQuality: .init(steps: 30),
+        ],
+        defaultQuality: .good,
+        description: "inclusionAI's design model — photographs, posters, product shots and text-heavy layouts, delivered as PNGs with real transparency, in 12 steps. Open (MIT)."
+    )
+
     /// The release's 16 MP sizes and their 4 MP halves. Any side from 16 to 6272 is taken as typed: the server
     /// generates on its own 32-pixel canvas (at least 2048x2048 in area) and resizes back to the request.
     private static let h3ImageResolutions: [ResolutionOption] = [
@@ -675,6 +710,7 @@ struct ImageModelPreset: Identifiable, Hashable {
         .qwenImage21_8bit,                             // 18
         .qwenImage21Turbo_8bit,                        // 18
         .mossImageSFT_bf16,                            // 27
+        .mingImage_8bit,                               // 29
         .minimaxH3Image_4bit,                          // 37
     ]
 }
@@ -2511,7 +2547,7 @@ extension ImageModelPreset {
     var condWeightCount: Int {
         switch variant {
         case .krea2Turbo: return 12
-        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo, .mossImage, .minimaxH3Image: return 0
+        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo, .mossImage, .minimaxH3Image, .mingImage: return 0
         default: return 3
         }
     }
@@ -2532,6 +2568,9 @@ extension ImageModelPreset {
         // The plugin resizes its 32-pixel canvas back to the requested size, so nothing is rounded.
         case .minimaxH3Image:
             return ResolutionGrid(alignment: 1, minDim: 16, maxDim: 6272)
+        // The release's buckets: /16 sides from 256 (4:1 at 512²) to 4096 (4:1 at 2048²).
+        case .mingImage:
+            return ResolutionGrid(alignment: 16, minDim: 256, maxDim: 4096)
         }
     }
 
@@ -2544,7 +2583,7 @@ extension ImageModelPreset {
         case .flux2Klein4B, .flux2Klein9B, .flux2Klein9BBase, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo,
              .minimaxH3Image:
             return true
-        case .krea2Turbo, .mageFlowTurbo, .mossImage:
+        case .krea2Turbo, .mageFlowTurbo, .mossImage, .mingImage:
             return false
         }
     }
@@ -2591,7 +2630,7 @@ extension ImageModelPreset {
     /// all: sending a source without `mode:"edit"` is a 400.
     var supportsImg2Img: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo, .mossImage, .minimaxH3Image: return false
+        case .mageFlowTurbo, .mageFlowEditTurbo, .mossImage, .minimaxH3Image, .mingImage: return false
         default: return true
         }
     }
@@ -2600,7 +2639,7 @@ extension ImageModelPreset {
     /// Mage-Flow has no LoRA path, so a picked adapter matches 0 modules → 400.
     var supportsLoRA: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo, .minimaxH3Image: return false
+        case .mageFlowTurbo, .mageFlowEditTurbo, .minimaxH3Image, .mingImage: return false
         default: return true
         }
     }

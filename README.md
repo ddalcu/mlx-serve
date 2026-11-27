@@ -47,7 +47,7 @@ Every release has Linux downloads for NVIDIA GPUs: x64 for RTX 20 to 50 cards, a
 ## What it does
 
 - **Coding agents on a local model.** `mlx-serve launch claude` starts Claude Code against your Mac, set up with the model's real context window. Codex, OpenCode, pi, Grok and others work the same way. [Integrations](docs/integrations.md)
-- **Pictures, video, music, speech and 3D.** FLUX.2, Qwen-Image, MiniMax-H3-Image, Krea, MOSS-Image, LTX-Video, MiniMax-H3, ACE-Step, YuE2, Qwen3-TTS with voice cloning, and Hunyuan3D, in the app or over HTTP. [The app](docs/app.md)
+- **Pictures, video, music, speech and 3D.** FLUX.2, Qwen-Image, MiniMax-H3-Image, Krea, MOSS-Image, Ming-Image, LTX-Video, MiniMax-H3, ACE-Step, YuE2, Qwen3-TTS with voice cloning, and Hunyuan3D, in the app or over HTTP. [The app](docs/app.md)
 - **Transcripts and meeting notes.** Speech to text in 30 languages, with word timings and who said what. The menu bar records a call and writes the notes. [API](docs/api.md#other-endpoints)
 - **Models bigger than your Mac.** GLM-5.3-Flash and DeepSeek-V4.1-Flash run on a 128 GB Mac by reading their experts from the SSD. Two Macs on a Thunderbolt 5 cable can run one model together, and Macs on your network can use each other's models. [CLI](docs/cli.md) · [FAQ](docs/faq.md#can-my-macs-share-models-over-the-network)
 - **An assistant that lives on your Mac.** Chat with your documents, talk to it hands-free, give agents a sandboxed shell and MCP tools, or schedule tasks in plain English. [The app](docs/app.md)

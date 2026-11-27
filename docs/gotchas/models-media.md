@@ -885,3 +885,10 @@ Defect: past 16 users Inkling 2 Mini decodes plain in one batched group, and at 
 cap read 32 short contexts (35..105 tokens, 1.8x "waste") and sent 8 slots through a serial forward each tick, though
 `attendSlots` reads each slot's own cache and pads nothing. Fix: the plugin declares `batch_pads_kv = false`, as
 GLM-5-Next does (636 tok/s at 32 users). Guard: `inkling2 config: a batched tick pads no KV`.
+
+### Ming-Image held its 30 GB of MoE experts twice
+Defect: the bf16 pack sat at 77.5 GB active after load against 47 GB of weights. Cause: the loader stacked each
+layer's 256 per-expert tensors into one bank through transposed views it built in the encoder's long-lived `Graph`;
+the map dropped the originals, but a view shares its source's buffer, so every expert stayed resident beside its
+bank. Fix: the views live in a child scope and only the stacked bank is kept. Guard: `ming_image llm: a stacked
+expert bank holds no reference to the per-expert tensors` (active memory flat across the stack and drop).

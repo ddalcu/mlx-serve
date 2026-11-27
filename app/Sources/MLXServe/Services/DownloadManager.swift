@@ -372,7 +372,7 @@ class DownloadManager: ObservableObject {
         case "heartmula": return "codec.safetensors"
         case "acestep": return "text_encoder/model.safetensors"
         case "stable_audio3": return "t5gemma-b-b-ul2/model.safetensors"
-        case "moss_image": return "vae/diffusion_pytorch_model.safetensors"
+        case "moss_image", "bailingmm_moe_v2_lite": return "vae/diffusion_pytorch_model.safetensors"
         case "trellis2": return "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors"
         case "pixal3d": return "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors"
         case "idol": return "vae/model.safetensors"

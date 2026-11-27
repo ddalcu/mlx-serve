@@ -1,6 +1,6 @@
 //! diffusers' ResnetBlock2D and the VAE mid-block's single-head attention, channels-last,
 //! over the norm a backend's VAE uses (`Norm`): FLUX.2 and Hunyuan3D paint (flat GroupNorm),
-//! MOSS-Image (axes GroupNorm), Krea and Qwen-Image's 3D causal VAE per frame (RMS, eps 1e-12).
+//! MOSS-Image (axes GroupNorm), Qwen-Image's 3D causal VAE per frame (`qwen_image_vae`; RMS, eps 1e-12).
 //! mage_flow's resnet is this without a shortcut. The mid attention comes with separate q/k/v/o
 //! projections (`midAttention`: FLUX.2, Hunyuan3D paint, MOSS) or one 1x1 qkv conv and a 1x1
 //! out conv (`midAttentionQkv`: Krea, Qwen-Image).
