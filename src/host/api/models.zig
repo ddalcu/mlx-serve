@@ -291,8 +291,16 @@ pub fn renderModelEntry(
             try allocator.dupe(u8, "null");
         defer allocator.free(embed_limit_str);
 
+        // The rope recipe the plugin advertises for this pack: a client renders it instead of deciding
+        // which arch scales and by how much. Absent when the plugin offers none.
+        const yarn_str = if (config.scalingRecipe()) |sc|
+            try std.fmt.allocPrint(allocator, ",\"yarn\":{{\"overrides\":{s},\"window\":{d}}}}}", .{ sc.overrides.slice(), sc.window })
+        else
+            "";
+        defer if (yarn_str.len > 0) allocator.free(yarn_str);
+
         return std.fmt.allocPrint(allocator,
-            \\{{"id":{s},"object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s}{s}{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{s},"context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":{s},"object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s}{s}{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{s},"context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}{s}}}}}
         , .{
             model_id_json,
             nowSecs(io),
@@ -328,6 +336,7 @@ pub fn renderModelEntry(
             gen_temp_str,
             gen_top_p_str,
             gen_top_k_str,
+            yarn_str,
         });
     }
 

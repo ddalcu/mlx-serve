@@ -4,7 +4,8 @@ Owns `qwen4_exp`, `qwen4_exp_text`: a qwen3_5 GDN+MoE trunk in 4 hyper-connectio
 (`ngram_table.bin` or the n-gram rows embedded in the pack's shards), QSA sparse attention past `indexer_budget`,
 an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`; fixtures: `fixtures/MANIFEST.md`.
 
-- Table: `config.zig` (MLX-free claims + parse; `Config` carries `ModelConfig`'s names, `model_config.zig` maps them
+- Table: `config.zig` (MLX-free claims + parse; a pack that shipped an unscaled rope also answers `Parsed.scaling` — the `config_overrides` document that YaRNs it and the window it resolves to, so a client offers the extension without knowing this arch)
+   `Config` carries `ModelConfig`'s names, `model_config.zig` maps them
   one to one, pinned against `parseConfigLegacy` on both shipped packs), `bill.zig`, `plugin.zig` (load + forward),
   `contract.zig` (kernel contract).
 - SERVED by the driver (`served.zig`); the legacy forward is deleted (`served.legacy_removed`, refused by name). The

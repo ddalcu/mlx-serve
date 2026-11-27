@@ -354,11 +354,29 @@ pub const Parsed = extern struct {
     /// sizes and bills the pack as it does that type, so the plugin must match the engine's layout for that type.
     /// A pack the engine cannot parse keeps the generic config. Read through `wantsEngineConfig`.
     engine_config: bool = false,
+    /// The rope scaling this pack can be booted into, for a client that offers it. Read through `scalingOf`.
+    scaling: ScalingFacts = .{},
 
     /// `engine_config`; false for a plugin built before it (its `size` ends before the field).
     pub fn wantsEngineConfig(p: *const Parsed) bool {
         return p.size >= @offsetOf(Parsed, "engine_config") + @sizeOf(bool) and p.engine_config;
     }
+
+    /// `scaling`; empty facts for a plugin built before it (its `size` ends before the field).
+    pub fn scalingOf(p: *const Parsed) ScalingFacts {
+        if (p.size < @offsetOf(Parsed, "scaling") + @sizeOf(ScalingFacts)) return .{};
+        return p.scaling;
+    }
+};
+
+/// A plugin's answer to "how is this pack's rope extended": the JSON object a client deep-merges as the model's
+/// `config_overrides`, and the context that document resolves to. Which arch scales, how far, and where the block
+/// sits in its config.json is the plugin's knowledge, so a client renders this and invents nothing. Both are empty
+/// when the pack ships the rope it wants or the plugin offers no scaling. `overrides` is owned by the parse.
+pub const ScalingFacts = extern struct {
+    overrides: Str = .{},
+    /// The longest context `overrides` resolves to; 0 with no scaling.
+    window: u32 = 0,
 };
 
 // ── Bill ──
@@ -1178,6 +1196,15 @@ test "abi plugin: a Parsed of an older size ends before engine_config, which it 
     try testing.expect(!p.wantsEngineConfig());
     p = .{};
     try testing.expect(!p.wantsEngineConfig());
+}
+
+test "abi plugin: a Parsed of an older size ends before scaling, which it reads empty" {
+    var p: Parsed = .{ .scaling = .{ .overrides = .of("{\"a\":1}"), .window = 1_048_576 } };
+    try testing.expectEqual(@as(u32, 1_048_576), p.scalingOf().window);
+    try testing.expectEqual(@as(usize, 7), p.scalingOf().overrides.len);
+    p.size = @offsetOf(Parsed, "scaling"); // what a plugin built before the field writes
+    try testing.expectEqual(@as(u32, 0), p.scalingOf().window);
+    try testing.expectEqual(@as(usize, 0), p.scalingOf().overrides.len);
 }
 
 test "abi plugin: every struct opens with its size, set by default" {

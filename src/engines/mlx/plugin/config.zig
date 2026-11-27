@@ -583,6 +583,22 @@ test "outside model plugin keeps the engine's config: asked, a type the engine c
     try ToyOutside.expectAdapted(&c);
 }
 
+test "plugin config: the recipe the row advertises comes from the plugin's facts" {
+    const t: abi.ModelTable = .{ .name = .of("t"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &.{}, .weights = undefined };
+    var b: Binding = .{ .table = &t };
+    var c: ModelConfig = .{ .model_type = "qwen4_exp" };
+    c.plugin = &b;
+    // No facts yet (a plugin built before the field, or one that offers nothing): no recipe.
+    try testing.expect(c.scalingRecipe() == null);
+    b.parsed.scaling = .{ .overrides = .of("{\"a\":1}"), .window = 1_048_576 };
+    try testing.expectEqual(@as(u32, 1_048_576), c.scalingRecipe().?.window);
+    // A document without a window is not a recipe either, and an unbound config never has one.
+    b.parsed.scaling = .{ .overrides = .of("{}"), .window = 0 };
+    try testing.expect(c.scalingRecipe() == null);
+    c.plugin = null;
+    try testing.expect(c.scalingRecipe() == null);
+}
+
 /// The integer at `path` in `json`; a failure names a missing field or another type.
 fn jsonInt(a: std.mem.Allocator, json: []const u8, path: []const []const u8) !i64 {
     var doc = try std.json.parseFromSlice(std.json.Value, a, json, .{});
