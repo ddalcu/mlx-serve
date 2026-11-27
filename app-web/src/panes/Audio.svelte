@@ -268,7 +268,7 @@
             {#if !voice}{@render templates("prompt")}{/if}
           </div>
           <textarea id="audio-prompt" name="prompt" bind:value={ws.d.prompt} placeholder={voice ? t("Enter the text to speak…") : music ? t("Genre, mood, instruments…") : t("What makes it, the material, the space…")}></textarea>
-          {#if music}<p class="field-note">{p?.family === "yue2" ? t('Comma-separated tags: language or genre, instruments, mood, lead vocal — e.g. "English, indie pop, bright acoustic guitar, soft drums, warm lead vocal".') : t('Genre, mood, instruments — e.g. "upbeat synthwave with driving bass and dreamy pads".')}</p>{/if}
+          {#if music}<p class="field-note">{p?.family === "yue2" ? t('Comma-separated tags: language or genre, instruments, mood, lead vocal — e.g. "English, indie pop, bright acoustic guitar, soft drums, warm lead vocal".') : p?.family === "heartmula" ? t('Lowercase tags, comma-separated without spaces — e.g. "pop,piano,female vocal,upbeat".') : t('Genre, mood, instruments — e.g. "upbeat synthwave with driving bass and dreamy pads".')}</p>{/if}
         </section>
         {#if p?.voices}
           <section class="image-section">
@@ -352,6 +352,11 @@
               {#if p.steps}{@render slider("steps", music ? t("Quality passes") : t("Steps"), p.stepsRange[0]!, p.stepsRange[1]!, 1)}{/if}
               {#if music}
                 <div class="audio-knobs">
+                  {#if p.sampling}
+                  <label><span>{t("Guidance (CFG)")}</span><input name="cfgScale" inputmode="decimal" placeholder="3" bind:value={ws.d.cfgScale} /></label>
+                  <label><span>{t("Temperature")}</span><input name="temperature" inputmode="decimal" placeholder="1" bind:value={ws.d.temperature} /></label>
+                  <label><span>{t("Top-k")}</span><input name="topK" inputmode="numeric" placeholder="50" bind:value={ws.d.topK} /></label>
+                  {/if}
                   {#if p.tempo}
                   <label class="audio-tempo">
                     <span>{t("Tempo (BPM)")}</span>

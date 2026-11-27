@@ -369,6 +369,7 @@ class DownloadManager: ObservableObject {
         case "minimax_h3", "minimax_h3_image": return "transformer.safetensors"
         case "minimax_music3": return "vocoder.safetensors"
         case "yue2": return "vae.safetensors"
+        case "heartmula": return "codec.safetensors"
         case "acestep": return "text_encoder/model.safetensors"
         case "stable_audio3": return "t5gemma-b-b-ul2/model.safetensors"
         case "moss_image": return "vae/diffusion_pytorch_model.safetensors"

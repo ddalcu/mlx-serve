@@ -2489,3 +2489,6 @@
 "Buy Me a Coffee" = "커피 한 잔 사주기";
 "A one-off thank-you helps too." = "한 번의 감사 표시도 큰 도움이 됩니다.";
 "Open Buy Me a Coffee ↗" = "Buy Me a Coffee 열기 ↗";
+"Guidance (CFG)" = "가이던스 (CFG)";
+"How closely the song follows the style tags. Higher is stricter, lower sounds more natural. Default 3." = "곡이 스타일 태그를 얼마나 충실히 따를지 정합니다. 높을수록 엄격하고, 낮을수록 더 자연스럽게 들립니다. 기본값 3.";
+"Lower plays it safe, higher takes more chances. Default 1." = "낮을수록 안정적이고, 높을수록 더 과감해집니다. 기본값 1.";

@@ -76,6 +76,7 @@ enum CustomMediaModels {
         case "acestep": return .acestepXLTurbo8bit
         case "minimax_music3": return .miniMaxMusic3_8bit
         case "yue2": return .yue2_3B_8bit
+        case "heartmula": return .heartMuLa3B_8bit
         default: return nil
         }
     }

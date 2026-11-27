@@ -5,7 +5,7 @@ export type Rewrite = { system: string; user: string };
 
 const styleExamples = (family: string) => (family === "acestep" ? musicStyles : family === "yue2" ? yue2Styles : music3Styles);
 const lyricsExamples = (family: string) => (family === "yue2" ? yue2Lyrics : musicLyrics);
-const tagsFor = (family: string) => (family === "yue2" ? yue2SectionTags : sectionTags);
+const tagsFor = (family: string) => (family === "yue2" || family === "heartmula" ? yue2SectionTags : sectionTags);
 const languageName = (code: string) => languages.find(([, id]) => id === code)?.[0] ?? code;
 const examples = (list: { body: string }[]) => list.map((e) => e.body).join("\n\n---\n\n");
 /** How many earlier prompts a radio request shows the model. */

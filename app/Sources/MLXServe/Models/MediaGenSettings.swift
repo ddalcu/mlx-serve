@@ -311,6 +311,10 @@ struct MusicGenSettings: Codable, Equatable {
     var coverStrength: Double = 1.0
     var coverNoiseStrength: Double = 0.0
     var trackClasses: [String] = []
+    /// HeartMuLa's sampler; nil = the server default.
+    var cfgScale: Double? = nil
+    var temperature: Double? = nil
+    var topK: Int? = nil
 
     private static let storageKey = "musicGenSettings"
 
@@ -370,6 +374,9 @@ extension MusicGenSettings {
         if let v = try c.decodeIfPresent(Double.self, forKey: .coverStrength) { coverStrength = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .coverNoiseStrength) { coverNoiseStrength = v }
         if let v = try c.decodeIfPresent([String].self, forKey: .trackClasses) { trackClasses = v }
+        cfgScale = try c.decodeIfPresent(Double.self, forKey: .cfgScale)
+        temperature = try c.decodeIfPresent(Double.self, forKey: .temperature)
+        topK = try c.decodeIfPresent(Int.self, forKey: .topK)
     }
 }
 

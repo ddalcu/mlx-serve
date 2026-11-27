@@ -1713,6 +1713,7 @@ enum MusicEngineFamily {
     case acestep
     case minimaxMusic3
     case yue2
+    case heartmula
 }
 
 /// Whether YuE2 plans an ABC score before it sings (server `cot`). Raw values
@@ -1779,13 +1780,13 @@ struct MusicModelPreset: Identifiable, Hashable {
     /// unsupported knobs, which read as "this model can't do tempo".
     /// YuE2 has no tempo or key field and no caption text for them: the score
     /// carries both, and the server names the fields a 400.
-    var supportsTempoAndKey: Bool { family != .yue2 }
+    var supportsTempoAndKey: Bool { family != .yue2 && family != .heartmula }
     /// Music 3 and YuE2 are lyric-conditioned; the server 400s empty lyrics.
     /// ACE-Step defaults empty lyrics to "[Instrumental]".
     var requiresLyrics: Bool { family != .acestep }
-    /// A wordless track: ACE-Step marks it, Music 3 asks in text. YuE2 has no
-    /// such mode, and the server names `instrumental` a 400.
-    var supportsInstrumental: Bool { family != .yue2 }
+    /// A wordless track: ACE-Step marks it, Music 3 asks in text. YuE2 and
+    /// HeartMuLa have no such mode, and the server names `instrumental` a 400.
+    var supportsInstrumental: Bool { family != .yue2 && family != .heartmula }
     /// Server-valid duration bounds (ACE [10,600]; Music 3 [1,360], floored
     /// at 5 for a usable slider).
     var durationRange: ClosedRange<Double> {
@@ -1799,8 +1800,20 @@ struct MusicModelPreset: Identifiable, Hashable {
     var supportsSteps: Bool { family != .acestep }
     /// YuE2 ends its own song (an end token after the last lyric); its duration is only a cap, so
     /// the pane can leave the cap off. ACE-Step and Music 3 make exactly the length asked.
-    var supportsAutoLength: Bool { family == .yue2 }
-    var stepsRange: ClosedRange<Int> { family == .yue2 ? 1...100 : 4...100 }
+    var supportsAutoLength: Bool { family == .yue2 || family == .heartmula }
+    /// HeartMuLa's sampler knobs (server `cfg_scale`, `temperature`, `top_k`); nil values are the
+    /// server's defaults (3.0, 1.0, 50) and are omitted.
+    var supportsSampling: Bool { family == .heartmula }
+    static let cfgRange: ClosedRange<Double> = 1...10
+    static let temperatureRange: ClosedRange<Double> = 0.1...5
+    static let topKRange: ClosedRange<Int> = 1...1000
+    var stepsRange: ClosedRange<Int> {
+        switch family {
+        case .yue2: return 1...100
+        case .heartmula: return 4...50
+        default: return 4...100
+        }
+    }
     /// YuE2's score: the plan mode and the ABC text that replaces the model's
     /// own. Gates the controls AND the `cot`/`abc` fields.
     var supportsScore: Bool { family == .yue2 }
@@ -1874,8 +1887,22 @@ struct MusicModelPreset: Identifiable, Hashable {
         description: "Full songs with vocals in English and Chinese, planned from an editable score: it writes the melody and chords first, then sings them in 48 kHz stereo. Non-commercial license (CC BY-NC 4.0)."
     )
 
+    /// HeartMuLa-oss-3B, 8-bit — a Llama-3.2-3B backbone + depth decoder
+    /// writes 12.5 Hz codec frames, HeartCodec renders 48 kHz stereo. Apache-2.0.
+    static let heartMuLa3B_8bit = MusicModelPreset(
+        id: "heartmula-3b-8bit",
+        name: "HeartMuLa 3B (8-bit)",
+        repo: "ddalcu/HeartMuLa-3B-MLX-Serve-8bit",
+        family: .heartmula,
+        approxRAMGB: 12,
+        approxDownloadGB: 7.0,
+        fixedSteps: 10,
+        supportsLyrics: true,
+        description: "Full songs with sung lyrics in almost any language, from comma-separated style tags, in 48 kHz stereo. Apache-2.0."
+    )
+
     /// Catalog, best-first per family.
-    static let all: [MusicModelPreset] = [.acestepXLTurbo8bit, .acestepXLTurbo4bit, .miniMaxMusic3_8bit, .yue2_3B_8bit]
+    static let all: [MusicModelPreset] = [.acestepXLTurbo8bit, .acestepXLTurbo4bit, .miniMaxMusic3_8bit, .yue2_3B_8bit, .heartMuLa3B_8bit]
 }
 
 /// Text-to-audio checkpoints (Stable Audio 3), served on
@@ -1969,7 +1996,7 @@ enum MusicOptions {
     ]
 
     static func sectionTagHint(for family: MusicEngineFamily) -> String {
-        (family == .yue2 ? yue2SectionTags : sectionTags).joined(separator: " ")
+        (family == .yue2 || family == .heartmula ? yue2SectionTags : sectionTags).joined(separator: " ")
     }
 
     /// What the server accepts for `bpm`. The pane used to offer only the ten
@@ -2059,14 +2086,27 @@ struct MusicPrompt: Codable, Equatable, Identifiable {
         case .acestep: return builtinStyles
         case .minimaxMusic3: return music3Styles
         case .yue2: return yue2Styles
+        case .heartmula: return heartmulaStyles
         }
     }
 
     /// Lyrics starters per family: YuE2 was trained on capitalized section
     /// tags ([Verse], [Pre-Chorus]) where the others take lowercase.
     static func builtinLyrics(for family: MusicEngineFamily) -> [MusicPrompt] {
-        family == .yue2 ? yue2Lyrics : builtinLyrics
+        family == .yue2 || family == .heartmula ? yue2Lyrics : builtinLyrics
     }
+
+    /// HeartMuLa's tag line as training wrote it (paper, Table 6): at most one short tag per category,
+    /// in the order genre, timbre, gender, mood, instrument, scene, region, topic; lowercase,
+    /// comma-separated with no spaces. One genre only: a second competes with the first.
+    static let heartmulaStyles: [MusicPrompt] = [
+        MusicPrompt(title: "Pop", body: "pop,bright,female,happy,piano,party"),
+        MusicPrompt(title: "Hip-hop", body: "hip-hop,deep,male,confident,drums,workout"),
+        MusicPrompt(title: "R&B ballad", body: "r&b,smooth,female,melancholic,synthesizer,night,heartbreak"),
+        MusicPrompt(title: "Rock", body: "rock,raspy,male,energetic,electric guitar,driving"),
+        MusicPrompt(title: "Folk", body: "folk,warm,male,nostalgic,acoustic guitar,campfire,memory"),
+        MusicPrompt(title: "Latin", body: "pop,sweet,female,joyful,guitar,beach,latin,love"),
+    ]
 
     /// YuE2 takes a comma-separated tag line: language or genre first, then
     /// instruments, mood and the lead vocal. Three are the model card's own.
@@ -2838,6 +2878,10 @@ struct MusicGenRequest {
     /// Complete: instruments to add, from `MusicTask.trackClasses`; empty =
     /// the model decides.
     var trackClasses: [String] = []
+    /// HeartMuLa's sampler (`supportsSampling`); nil = the server default, omitted.
+    var cfgScale: Double? = nil
+    var temperature: Double? = nil
+    var topK: Int? = nil
     /// Set when the pane picked a network model: the LAN routing id
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.

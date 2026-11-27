@@ -134,6 +134,9 @@ final class MusicGenControlsTests: XCTestCase {
         s.instrumental = true
         s.showAdvanced = true
         s.keepResident = true
+        s.cfgScale = 2.5
+        s.temperature = 0.8
+        s.topK = 30
 
         let data = try! JSONEncoder().encode(s)
         let back = try! JSONDecoder().decode(MusicGenSettings.self, from: data)
