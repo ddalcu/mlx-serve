@@ -362,6 +362,9 @@ pub const Reader = struct {
     probing: bool = false, // the last copy was a probe
     quiet_until: u64 = 0,
     memo: ?u64 = null, // the last ask's context and width, hashed: the same ask again in its round gets the same answer
+    /// The winning match's length behind the last non-empty `propose` (0 after
+    /// any empty return): the DFlash copy round prices and observes by it.
+    last_match: u32 = 0,
     lookups: u64 = 0,
     proposals: u64 = 0,
     proposed: u64 = 0,
@@ -400,6 +403,7 @@ pub const Reader = struct {
         x.out.items.len = got.len;
         x.band = b;
         x.probing = probing;
+        x.last_match = m.len;
         x.proposals += 1;
         x.proposed += got.len;
         return x.out.items;
@@ -408,6 +412,15 @@ pub const Reader = struct {
     /// What a lookup reads of `ctx` (its last max_match ids) and the width asked, hashed.
     fn memoKey(ctx: []const u32, most: usize) u64 {
         return std.hash.Wyhash.hash(most, std.mem.sliceAsBytes(ctx[ctx.len -| max_match..]));
+    }
+
+    /// The record's own landing rate for the band the last proposal matched
+    /// in: the DFlash record round prices its rows from this, never the
+    /// in-context copy ladder.
+    pub fn landingRate(x: *const Reader) f64 {
+        x.st.mutex.lock();
+        defer x.st.mutex.unlock();
+        return x.st.rates.rate(x.band);
     }
 
     /// The last copy landed `accepted` of its `proposed` ids; none landed keeps the stream off a few rounds.

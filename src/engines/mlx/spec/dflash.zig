@@ -8,6 +8,7 @@ const model_mod = @import("../../../sdk/config/model.zig");
 const log = @import("../../../sdk/util/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const pld_index = @import("../../../sdk/spec/pld_index.zig");
+const recall_mod = @import("../../../sdk/recall/recall.zig");
 const spec_rounds = @import("../../../sdk/spec/rounds.zig");
 const mtp_lookup = @import("mtp_lookup.zig");
 const round_cost = @import("round_cost.zig");
@@ -243,8 +244,34 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         const committed = try allocator.alloc(u32, @min(prompt.len + gen.len + 1, DFLASH_COPY_WINDOW));
         defer allocator.free(committed);
         pld_index.tailWindow(committed, prompt, gen, t1);
-        if (pld_index.backedCopy(committed, dflashTreeNodes(m), DFLASH_COPY_MATCH)) |c| if (c.draft.len == dflashTreeNodes(m))
-            return try self.dflashTreeRound(allocator, model, dctx, null, null, t1, m, anchor_pos, kv_step_snap, serial, c.draft);
+        var tree_copy: ?[]const u32 = null;
+        if (pld_index.backedCopy(committed, dflashTreeNodes(m), DFLASH_COPY_MATCH)) |c| {
+            if (c.draft.len == dflashTreeNodes(m)) tree_copy = c.draft;
+        }
+        var from_record = false;
+        if (tree_copy == null) {
+            // Recall (sdk/recall): the context backs no continuation — the
+            // persistent record may (a reply this model wrote before, a
+            // re-sent turn). Same tree round, same verify; the record's own
+            // confidence bar (DFLASH_COPY_MATCH of match behind the copy)
+            // mirrors the in-context one, and its landing bands observe.
+            if (self.recallArm()) |rd| {
+                self.recall_round += 1;
+                const copy = rd.propose(committed, dflashTreeNodes(m), self.recall_round);
+                if (copy.len == dflashTreeNodes(m) and rd.last_match >= DFLASH_COPY_MATCH) {
+                    tree_copy = copy;
+                    from_record = true;
+                }
+            }
+        }
+        if (tree_copy) |chain| {
+            const res = try self.dflashTreeRound(allocator, model, dctx, null, null, t1, m, anchor_pos, kv_step_snap, serial, chain);
+            if (from_record) {
+                if (self.recall) |*rd| rd.observe(@intCast(chain.len), @intCast(res.accepted_tokens), self.recall_round);
+                self.dflash_recalls += 1;
+            }
+            return res;
+        }
     }
 
     // ── Phase 1: one assistant forward drafts all m tokens ──
@@ -796,6 +823,10 @@ pub fn dflashVerify(self: *Generator, allocator: std.mem.Allocator, r: VerifyIn)
         self.dflash_gap_watch = io_util.Stopwatch.init(self.timer.io);
     }
 
+    // Recall: the drafter's own realized yield sets the bar the record's
+    // copies must beat; copy rounds feed their landing bands instead (observe).
+    if (self.recall) |*rd| rd.noteHead(1 + @as(usize, accepted));
+
     return DrafterStepResult{
         .tokens = tokens,
         .accepted_tokens = accepted,
@@ -805,24 +836,59 @@ pub fn dflashVerify(self: *Generator, allocator: std.mem.Allocator, r: VerifyIn)
 /// Longest copied continuation a round verifies: the fused row kernels reach 16 rows.
 pub const DFLASH_COPY_MAX: u32 = dflash_policy.MAX_DRAFTS;
 
+/// Rows for a copy round whose draft came from the recall record: priced by
+/// the record's own landing bands (the band its last proposal matched in),
+/// against this request's measured plain cost. `pol.copy` is deliberately
+/// untouched — that ladder stays trained by in-context copies alone.
+fn recordRowsFor(rd: *const recall_mod.Reader, avail: usize, plain_ms: f32) u32 {
+    var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
+    const n = @min(avail, p.len);
+    @memset(p[0..n], @floatCast(rd.landingRate()));
+    return dflash_policy.chooseRows(p[0..n], &dflash_policy.priorCosts(plain_ms)).rows;
+}
+
 /// A round whose drafts are the context's own continuation after `t1` (an echo, an edit, a repeated block):
 /// no assistant forward, and as many rows as the cost ladder and the copies' record pay for.
 pub fn dflashCopyRound(self: *Generator, allocator: std.mem.Allocator, t1: u32, anchor_pos: usize, kv_step_snap: usize, serial: bool, stochastic: bool, tracing: bool, ph: *io_util.Stopwatch, watch: io_util.Stopwatch) !?DrafterStepResult {
     const pol = &self.dflash_pol.?;
     const idx = try self.mtpLookupIndex(allocator);
-    const found = idx.matchBest(t1, DFLASH_COPY_MAX) orelse return null;
-    if (found.suffix < mtp_lookup.MIN_SUFFIX or found.draft.len == 0) return null;
-    const avail: usize = @min(found.draft.len, DFLASH_COPY_MAX, @as(usize, self.max_tokens -| self.completion_tokens -| 1));
+    var found = idx.matchBest(t1, DFLASH_COPY_MAX);
+    var from_record = false;
+    if (found == null or found.?.draft.len == 0 or found.?.suffix < mtp_lookup.MIN_SUFFIX) {
+        // Recall (sdk/recall): the persistent record's continuation when the
+        // request's own context backs none — a regenerated reply or a re-sent
+        // turn. Same round, same verify. The record is priced by its own
+        // landing bands only (never `pol.copy`, which stays trained by
+        // in-context copies alone), and the lookup keys off the trailing
+        // window, never the whole history.
+        if (self.recallArm()) |rd| {
+            const committed = try allocator.alloc(u32, @min(self.prompt_ids_owned.len + self.generated_ids.items.len + 1, DFLASH_COPY_WINDOW));
+            defer allocator.free(committed);
+            pld_index.tailWindow(committed, self.prompt_ids_owned, self.generated_ids.items, t1);
+            self.recall_round += 1;
+            const copy = rd.propose(committed, DFLASH_COPY_MAX, self.recall_round);
+            if (copy.len >= 2) {
+                found = .{ .draft = copy, .suffix = rd.last_match };
+                from_record = true;
+            }
+        }
+    }
+    const f = found orelse return null;
+    if (f.suffix < mtp_lookup.MIN_SUFFIX or f.draft.len == 0) return null;
+    const avail: usize = @min(f.draft.len, DFLASH_COPY_MAX, @as(usize, self.max_tokens -| self.completion_tokens -| 1));
     if (avail == 0) return null;
-    const rows = pinnedRows(pol, avail) orelse dflash_policy.copyRowsFor(&pol.copy, found.suffix, avail, pol.plain.ms);
+    const rows = pinnedRows(pol, avail) orelse if (from_record)
+        recordRowsFor(&self.recall.?, avail, pol.plain.ms)
+    else
+        dflash_policy.copyRowsFor(&pol.copy, f.suffix, avail, pol.plain.ms);
     if (rows < 2) return null;
     const m: u32 = rows - 1;
     var ids: [dflash_policy.MAX_DRAFTS]i32 = undefined;
-    for (found.draft[0..m], ids[0..m]) |t, *d| d.* = @intCast(t);
+    for (f.draft[0..m], ids[0..m]) |t, *d| d.* = @intCast(t);
     const draft_ids = mlx.mlx_array_new_data(&ids, &[_]c_int{ 1, @intCast(m) }, 2, .int32);
     defer _ = mlx.mlx_array_free(draft_ids);
     self.dflash_round_width = m;
-    const suffix = found.suffix;
+    const suffix = f.suffix;
     const res = try self.dflashVerify(allocator, .{
         .t1 = t1,
         .m = m,
@@ -838,8 +904,12 @@ pub fn dflashCopyRound(self: *Generator, allocator: std.mem.Allocator, t1: u32, 
         .sel_path = null,
         .draft_q = .{ .ctx = null },
     });
-    pol.copy.observe(suffix, m, res.accepted_tokens);
-    log.debug("  [dflash-copy] suffix={d} avail={d} drafts={d} accepted={d}\n", .{ suffix, avail, m, res.accepted_tokens });
+    if (!from_record) pol.copy.observe(suffix, m, res.accepted_tokens);
+    if (from_record) {
+        if (self.recall) |*rd| rd.observe(@intCast(m), @intCast(res.accepted_tokens), self.recall_round);
+        self.dflash_recalls += 1;
+    }
+    log.debug("  [dflash-copy] src={s} suffix={d} avail={d} drafts={d} accepted={d}\n", .{ @as([]const u8, if (from_record) "record" else "context"), suffix, avail, m, res.accepted_tokens });
     self.dflash_copies += 1;
     self.dflash_copy_drafted += m;
     self.dflash_copy_accepted += res.accepted_tokens;
@@ -1284,10 +1354,17 @@ const PolicyArm = struct {
     sampled: bool = false,
     /// A prompt that ends mid-repeat, so the first round copies the context's continuation.
     copy: bool = false,
+    record: bool = false,
 };
 
 /// Ten distinct ids repeated, then the first nine again: `COPY_PATTERN[9]` as t1 continues the repeat.
 const COPY_PATTERN = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17 };
+/// Twenty-four distinct ids above the fixture's usual range: no in-context
+/// 4-gram can repeat inside it, and its last three ids occur nowhere earlier,
+/// so the record graft's test round 1 can only draft from the RECORD.
+const RECORD_PROMPT = [_]u32{ 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63 };
+/// The fabricated t1 of the record-graft test: distinct from every prompt id.
+const RECORD_T1: u32 = 70;
 
 /// One request through `nextDflash` under the round policy on the tiny fixture pair, three plain
 /// rounds first: the trunk and assistant cursors agree after EVERY round whatever mix of plain and
@@ -1320,7 +1397,7 @@ fn policyArm(arm: PolicyArm, serial: []const u32) !dflash_policy.PositionStats {
     var tok_dummy: Tokenizer = undefined; // never read by the Generator
     const copy_prompt = COPY_PATTERN ++ COPY_PATTERN ++ COPY_PATTERN[0..9].*;
     const plain_prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
-    const prompt: []const u32 = if (arm.copy) &copy_prompt else &plain_prompt;
+    const prompt: []const u32 = if (arm.copy) &copy_prompt else if (arm.record) &RECORD_PROMPT else &plain_prompt;
     var copy_serial: [16]u32 = undefined;
     if (arm.copy) {
         var sx = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
@@ -1330,7 +1407,38 @@ fn policyArm(arm: PolicyArm, serial: []const u32) !dflash_policy.PositionStats {
         sg.next_token_id = COPY_PATTERN[9];
         for (&copy_serial) |*t| t.* = (try sg.next(allocator)).?;
     }
-    const reference: []const u32 = if (arm.copy) &copy_serial else serial;
+    var record_serial: [16]u32 = undefined;
+    var record_store: ?*recall_mod.Store = null;
+    defer if (record_store) |*st| st.*.close();
+    if (arm.record) {
+        var sx = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
+        defer sx.deinit();
+        var sg = try Generator.initWithOptions(io, allocator, &sx, &tok_dummy, prompt, 16, SamplingParams{ .temperature = 0.0 }, &.{}, .{ .skip_lazy_preforward = true });
+        defer sg.deinit(allocator);
+        sg.next_token_id = RECORD_T1;
+        for (&record_serial) |*t| t.* = (try sg.next(allocator)).?;
+        // The record holds prompt + reply, exactly what finishRequest writes.
+        var tmp_rec = std.testing.tmpDir(.{});
+        var rec_buf: [512]u8 = undefined;
+        const rec_root = rec_buf[0..try tmp_rec.dir.realPath(io, &rec_buf)];
+        const rec_dir0 = try std.fmt.allocPrint(testing.allocator, "{s}/rec", .{rec_root});
+        defer testing.allocator.free(rec_dir0);
+        const rec_dir = try testing.allocator.dupeSentinel(u8, rec_dir0, 0);
+        defer testing.allocator.free(rec_dir);
+        var problem: []const u8 = "";
+        defer if (problem.len > 0) testing.allocator.free(problem);
+        record_store = (try recall_mod.Store.open(
+            .{ .digest = @splat(5), .vocab = 100_000, .name = "dflash-record-fixture" },
+            io,
+            .{ .dir = rec_dir, .cap_bytes = 4 * 1024 * 1024, .read_only = false },
+            &problem,
+            testing.allocator,
+        )) orelse return error.TestStoreOpen;
+        record_store.?.readPrompt(prompt, 0);
+        record_store.?.readReply(prompt, &record_serial);
+        defer tmp_rec.cleanup();
+    }
+    const reference: []const u32 = if (arm.copy) &copy_serial else if (arm.record) &record_serial else serial;
     const sampling = if (arm.sampled) SamplingParams{ .temperature = 1.0, .seed = 7 } else SamplingParams{ .temperature = 0.0 };
     const want: u32 = 16;
     var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, prompt, want, sampling, &.{}, .{
@@ -1341,9 +1449,10 @@ fn policyArm(arm: PolicyArm, serial: []const u32) !dflash_policy.PositionStats {
     defer gen.deinit(allocator);
     const pol = &gen.dflash_pol.?;
     pol.pin_rows = arm.pin_rows;
-    pol.drafting.owed = if (arm.copy) 0 else 3;
-    if (arm.copy) gen.next_token_id = COPY_PATTERN[9];
-    const plain_rounds: usize = if (arm.copy) 0 else 3;
+    pol.drafting.owed = if (arm.copy or arm.record) 0 else 3;
+    if (arm.record) gen.recall = .{ .st = record_store.? };
+    if (arm.copy) gen.next_token_id = COPY_PATTERN[9] else if (arm.record) gen.next_token_id = RECORD_T1;
+    const plain_rounds: usize = if (arm.copy or arm.record) 0 else 3;
     if (arm.trust) for (0..10) |b| for (0..40) |_| pol.calib.observe((@as(f32, @floatFromInt(b)) + 0.5) / 10.0, true);
 
     var got = std.ArrayList(u32).empty;
@@ -1372,6 +1481,10 @@ fn policyArm(arm: PolicyArm, serial: []const u32) !dflash_policy.PositionStats {
     }
     try testing.expect(gen.dflash_plain >= plain_rounds);
     if (arm.copy) try testing.expect(gen.dflash_copies > 0);
+    if (arm.record) {
+        try testing.expect(gen.dflash_recalls > 0);
+        try testing.expect(gen.dflash_copies >= gen.dflash_recalls);
+    }
     try testing.expect(!gen.spec_disabled_runtime);
     try testing.expectEqual(@as(usize, want), got.items.len);
     if (!arm.sampled) for (reference, got.items) |a, b| try testing.expectEqual(a, b);
@@ -1420,6 +1533,12 @@ test "dflash: the round policy runs plain rounds between drafted ones, the strea
     // A copied continuation (no assistant forward) is verified like any draft.
     _ = try policyArm(.{ .v2 = false, .copy = true }, &serial);
     _ = try policyArm(.{ .v2 = false, .copy = true, .sampled = true }, &serial);
+    // The record graft: with no in-context continuation, the persistent
+    // record's reply drafts the round and the output stays byte-identical.
+    // pin_rows: the ladder prices copy rounds off measured plain-tick ms,
+    // which a parallel-loaded shard can skew — the graft is what is under
+    // test, not the ladder's timing, so the rows are pinned.
+    _ = try policyArm(.{ .v2 = false, .record = true, .pin_rows = 8 }, &serial);
     // Sampled requests: the Leviathan accept reads q at the draft's own stride, whatever was kept.
     _ = try policyArm(.{ .v2 = true, .pin_rows = 2, .sampled = true }, &serial);
     _ = try policyArm(.{ .v2 = true, .trust = true, .sampled = true }, &serial);

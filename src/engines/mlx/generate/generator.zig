@@ -223,6 +223,8 @@ pub const Generator = struct {
     dflash_pol: ?DflashPol = null,
     /// Stats: rounds drafted from the context (no assistant forward), the tokens they proposed and the ones kept.
     dflash_copies: u64 = 0,
+    /// Recall grafts: copy rounds whose draft came from the persistent record.
+    dflash_recalls: u64 = 0,
     dflash_copy_drafted: u64 = 0,
     dflash_copy_accepted: u64 = 0,
     /// Stats: rounds that verified one row (no drafts), whether or not the assistant drafted for them.
@@ -582,6 +584,16 @@ pub const Generator = struct {
     pub fn mtpCacheBytes(self: *const Generator) u64 {
         if (self.mtp_cache) |*cache| return cache.residentBytes();
         return 0;
+    }
+
+    /// Recall: arm the per-stream reader on first use from any spec path
+    /// (PLD arms in nextPld; the DFlash copy round arms here). Null when
+    /// Recall is off or the tokenizer has no record.
+    pub fn recallArm(self: *Generator) ?*recall_mod.Reader {
+        if (self.recall == null and recall_mod.shared_state.get().enabled) {
+            self.recall = recall_mod.armReader(self.tok);
+        }
+        return if (self.recall) |*rd| rd else null;
     }
 
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
