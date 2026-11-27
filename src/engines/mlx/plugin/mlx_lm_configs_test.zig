@@ -72,6 +72,8 @@ const cases = [_]Case{
     case("Jundot_Qwen3.8-Flash-Next-oQ4e-mtp"),
     pinned("glm5_next-mlx-community-4bit"),
     pinned("bailing_hybrid-ling-3.0-tiny-4bit"),
+    // Ling VL: the 4-bit VL pack this branch serves (vision tower + linear_proj kept bf16).
+    case("teejer_Ling-3.2-air-MLX-4bit-VL"),
     gemma("gemma-3-1b-it-4bit"),
     gemma("gemma-3-4b-it-4bit"),
     gemma("gemma-4-e4b-it-4bit"),
