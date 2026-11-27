@@ -52,6 +52,7 @@ const log = @import("../util/log.zig");
 const shared_util = @import("../util/shared.zig");
 const os_mutex = @import("../util/os_mutex.zig");
 const io_util = @import("../util/io_util.zig");
+const crt = @import("../util/crt.zig");
 const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 
@@ -483,25 +484,27 @@ pub const Options = struct {
 
 /// The store's state for GET /v1/recall and the startup line.
 pub const Stats = struct {
-    writes: bool,
-    left: bool, // the last empty left a chunk file: nothing is added until one succeeds
-    read_only: bool,
-    ids: u64,
-    disk_bytes: u64,
-    ram_bytes: u64,
-    cap_bytes: u64,
-    added: u64,
-    held: u64,
-    rates: [bands.len]f64,
-    probe_every: u32,
-    proposals: u64,
-    proposed: u64,
-    accepted: u64,
-    problem: []const u8,
-    model: []const u8,
+    writes: bool = false,
+    left: bool = false,
+    read_only: bool = false,
+    ids: u64 = 0,
+    disk_bytes: u64 = 0,
+    ram_bytes: u64 = 0,
+    cap_bytes: u64 = 0,
+    added: u64 = 0,
+    held: u64 = 0,
+    rates: [bands.len]f64 = .{ 0, 0, 0 },
+    probe_every: u32 = 0,
+    proposals: u64 = 0,
+    proposed: u64 = 0,
+    accepted: u64 = 0,
+    problem: []const u8 = "",
+    model: []const u8 = "",
 };
 
-pub const Store = struct {
+/// The POSIX record store: flock, append-mode open, 0700 files. Never
+/// analyzed on Windows — `Store` below is the stub there.
+const PosixStore = struct {
     io: std.Io,
     dir: [:0]u8,
     name: []u8,
@@ -530,7 +533,7 @@ pub const Store = struct {
     const stride: usize = 16;
 
     /// Everything `open` allocated, for the paths that hand it back null.
-    fn freeOpen(s: *Store) void {
+    fn freeOpen(s: *PosixStore) void {
         s.record.deinit();
         gpa.free(s.name);
         gpa.free(s.dir);
@@ -538,8 +541,8 @@ pub const Store = struct {
     }
 
     /// The record in `o.dir` (made 0700), or null with `problem` set when another tokenizer wrote it.
-    pub fn open(identity: Identity, io: std.Io, o: Options, problem: *[]const u8, a: Allocator) !?*Store {
-        const s = try gpa.create(Store);
+    pub fn open(identity: Identity, io: std.Io, o: Options, problem: *[]const u8, a: Allocator) !?*PosixStore {
+        const s = try gpa.create(PosixStore);
         const dir = try gpa.dupeSentinel(u8, o.dir, 0);
         const name = try gpa.dupe(u8, identity.name);
         const cap_chunks: usize = @max(2, o.cap_bytes / chunk_bytes);
@@ -571,7 +574,7 @@ pub const Store = struct {
         return s;
     }
 
-    pub fn close(s: *Store) void {
+    pub fn close(s: *PosixStore) void {
         s.closeFile();
         if (s.lock_fd >= 0) _ = std.c.close(s.lock_fd);
         s.record.deinit();
@@ -580,7 +583,7 @@ pub const Store = struct {
         gpa.destroy(s);
     }
 
-    fn closeFile(s: *Store) void {
+    fn closeFile(s: *PosixStore) void {
         if (s.file < 0) return;
         _ = std.c.fsync(s.file);
         _ = std.c.close(s.file);
@@ -595,7 +598,7 @@ pub const Store = struct {
     }
 
     /// The identity file names the tokenizer that wrote the record: another one is refused by its name.
-    fn checkIdentity(s: *Store, a: Allocator, problem: *[]const u8) !bool {
+    fn checkIdentity(s: *PosixStore, a: Allocator, problem: *[]const u8) !bool {
         var buf: [1100]u8 = undefined;
         const path = std.fmt.bufPrintSentinel(&buf, "{s}/identity", .{s.dir}, 0) catch return error.RecallDir;
         const want = std.fmt.allocPrint(a, "mlx-serve recall {d}\ndigest {x}\nvocab {d}\nname ", .{ version, &s.identity.digest, s.identity.vocab }) catch return error.RecallWrite;
@@ -635,7 +638,7 @@ pub const Store = struct {
     }
 
     /// The directory's lock: a second server with the same record reads it as it was and writes nothing.
-    fn takeLock(s: *Store) void {
+    fn takeLock(s: *PosixStore) void {
         var buf: [1100]u8 = undefined;
         const path = std.fmt.bufPrintSentinel(&buf, "{s}/lock", .{s.dir}, 0) catch return s.readOnly();
         const fd = std.c.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true }, @as(std.c.mode_t, 0o600));
@@ -647,12 +650,12 @@ pub const Store = struct {
         s.lock_fd = fd;
     }
 
-    fn readOnly(s: *Store) void {
+    fn readOnly(s: *PosixStore) void {
         s.writes = false;
     }
 
     /// Chunk files in order from the first: each full but the last, ids read up to the last mark; the rest cut away.
-    fn load(s: *Store) !void {
+    fn load(s: *PosixStore) !void {
         var seqs: std.ArrayList(u64) = .empty;
         defer seqs.deinit(gpa);
         try s.listChunks(&seqs);
@@ -672,7 +675,7 @@ pub const Store = struct {
     }
 
     /// One chunk file's ids into the record a segment at a time; its count of ids (error: a bad header or id).
-    fn readChunk(s: *Store, seq: u64, pending: *std.ArrayList(u32), ids: []u32) !usize {
+    fn readChunk(s: *PosixStore, seq: u64, pending: *std.ArrayList(u32), ids: []u32) !usize {
         var buf: [1100]u8 = undefined;
         const path = try s.chunkPath(&buf, seq);
         const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
@@ -702,7 +705,7 @@ pub const Store = struct {
     }
 
     /// The files cut to what the record read: the last one's torn tail truncated, the files after it deleted.
-    fn cut(s: *Store, seqs: []const u64) void {
+    fn cut(s: *PosixStore, seqs: []const u64) void {
         const r = &s.record;
         const chunks: usize = (@as(usize, r.end) + chunk_tokens - 1) / chunk_tokens;
         for (seqs, 0..) |seq, k| {
@@ -721,12 +724,12 @@ pub const Store = struct {
         }
     }
 
-    fn chunkPath(s: *const Store, buf: []u8, seq: u64) ![:0]const u8 {
+    fn chunkPath(s: *const PosixStore, buf: []u8, seq: u64) ![:0]const u8 {
         return std.fmt.bufPrintSentinel(buf, "{s}/{x:0>16}.ids", .{ s.dir, seq }, 0);
     }
 
     /// The chunk files' numbers, ascending.
-    fn listChunks(s: *Store, out: *std.ArrayList(u64)) !void {
+    fn listChunks(s: *PosixStore, out: *std.ArrayList(u64)) !void {
         var dir = std.Io.Dir.openDirAbsolute(s.io, s.dir, .{ .iterate = true }) catch return error.RecallRead;
         defer dir.close(s.io);
         var it = dir.iterate();
@@ -739,7 +742,7 @@ pub const Store = struct {
     }
 
     /// The oldest chunk freed and its file deleted.
-    fn drop(s: *Store) bool {
+    fn drop(s: *PosixStore) bool {
         const r = &s.record;
         if (!r.dropOldest()) return false;
         if (s.writes) {
@@ -754,14 +757,14 @@ pub const Store = struct {
     /// A prompt read from its resume point: the ids an earlier request's state did not cover, less the overlap.
     /// `resumed` is the prefix the hot cache already covered (0 when unknown):
     /// the held-run dedup below still keeps a re-sent prefix from being written again.
-    pub fn readPrompt(s: *Store, prompt: []const u32, resumed: u32) void {
+    pub fn readPrompt(s: *PosixStore, prompt: []const u32, resumed: u32) void {
         s.mutex.lock();
         defer s.mutex.unlock();
         s.add(prompt[@min(prompt.len, resumed) -| overlap ..]);
     }
 
     /// A finished reply, after its prompt's last `overlap` ids so the keys across the join are found.
-    pub fn readReply(s: *Store, prompt: []const u32, reply: []const u32) void {
+    pub fn readReply(s: *PosixStore, prompt: []const u32, reply: []const u32) void {
         if (reply.len == 0) return;
         const seg = std.mem.concat(gpa, u32, &.{ prompt[prompt.len -| overlap ..], reply }) catch return;
         defer gpa.free(seg);
@@ -771,7 +774,7 @@ pub const Store = struct {
     }
 
     /// The runs of `seg` the record lacks, each with its overlaps (the caller holds the lock).
-    fn add(s: *Store, seg: []const u32) void {
+    fn add(s: *PosixStore, seg: []const u32) void {
         if (!s.writes or s.failed) return;
         const r = &s.record;
         var fresh: usize = 0; // where the ids not yet written start
@@ -799,7 +802,7 @@ pub const Store = struct {
     }
 
     /// The ids `seg[from..to]` with their overlaps, added and written behind the free-disk floor.
-    fn put(s: *Store, seg: []const u32, from: usize, to: usize) void {
+    fn put(s: *PosixStore, seg: []const u32, from: usize, to: usize) void {
         if (to <= from) return;
         const piece = seg[from -| overlap .. @min(seg.len, to + overlap)];
         const r = &s.record;
@@ -819,7 +822,7 @@ pub const Store = struct {
     }
 
     /// The record's positions [start, end) appended to their chunk files.
-    fn write(s: *Store, start: u32, end: u32) bool {
+    fn write(s: *PosixStore, start: u32, end: u32) bool {
         const r = &s.record;
         var ids: [4096]u32 = undefined;
         var p = start;
@@ -838,7 +841,7 @@ pub const Store = struct {
     }
 
     /// The file for record chunk `k`, open to append: the one on disk, or a new one with its header.
-    fn fileFor(s: *Store, k: u32) bool {
+    fn fileFor(s: *PosixStore, k: u32) bool {
         if (s.file >= 0 and s.file_chunk == k) return true;
         s.closeFile();
         var buf: [1100]u8 = undefined;
@@ -862,7 +865,7 @@ pub const Store = struct {
     }
 
     /// A chunk file's header for this record: magic, version, vocabulary size, the identity's first 16 bytes.
-    fn header(s: *const Store) [head_bytes]u8 {
+    fn header(s: *const PosixStore) [head_bytes]u8 {
         var head: [head_bytes]u8 = undefined;
         @memcpy(head[0..8], magic);
         std.mem.writeInt(u32, head[8..12], version, .little);
@@ -872,7 +875,7 @@ pub const Store = struct {
     }
 
     /// Chunk files deleted; record, rates and counters emptied (identity, lock stay). Unlinked: `why` names one left.
-    pub fn empty(s: *Store) error{ ReadOnly, Unlinked }!void {
+    pub fn empty(s: *PosixStore) error{ ReadOnly, Unlinked }!void {
         s.mutex.lock();
         defer s.mutex.unlock();
         if (!s.writes) return error.ReadOnly;
@@ -901,15 +904,15 @@ pub const Store = struct {
     }
 
     /// Why the last empty failed, for its reply.
-    pub fn why(s: *const Store) []const u8 {
+    pub fn why(s: *const PosixStore) []const u8 {
         return s.problem;
     }
 
-    fn note(s: *Store, comptime fmt: []const u8, args: anytype) void {
+    fn note(s: *PosixStore, comptime fmt: []const u8, args: anytype) void {
         s.problem = std.fmt.bufPrint(&s.problem_buf, fmt, args) catch "a chunk file could not be removed";
     }
 
-    pub fn stats(s: *Store) Stats {
+    pub fn stats(s: *PosixStore) Stats {
         s.mutex.lock();
         defer s.mutex.unlock();
         const r = &s.record;
@@ -935,6 +938,57 @@ pub const Store = struct {
         return out;
     }
 };
+
+
+/// The Windows stub: `PosixStore` on that target. None of the POSIX methods
+/// exist here, so nothing the surface functions reference can pull the fd
+/// layer into Windows analysis — a runtime `if (windows) return` in the
+/// wiring provably does not prune the call graph (CI: recall.zig std.c
+/// close/write/O); the type gate does. Recall on Windows is off-with-a-
+/// reason: every surface answers empty/no/null.
+const WindowsStub = struct {
+    record: Record = undefined,
+    rates: Rates = .{},
+    mutex: os_mutex.Mutex = .{},
+
+    pub fn open(identity: Identity, io: std.Io, o: Options, problem: *[]const u8, a: Allocator) !?*Store {
+        _ = identity;
+        _ = io;
+        _ = o;
+        _ = a;
+        problem.* = "--recall is not available on Windows builds (the record is POSIX: flock, append-mode open, 0700 files)";
+        return null;
+    }
+    pub fn close(s: *WindowsStub) void {
+        _ = s;
+    }
+    pub fn readPrompt(s: *WindowsStub, prompt: []const u32, resumed: u32) void {
+        _ = s;
+        _ = prompt;
+        _ = resumed;
+    }
+    pub fn readReply(s: *WindowsStub, prompt: []const u32, reply: []const u32) void {
+        _ = s;
+        _ = prompt;
+        _ = reply;
+    }
+    pub fn stats(s: *WindowsStub) Stats {
+        _ = s;
+        return .{};
+    }
+    pub fn empty(s: *WindowsStub) error{ ReadOnly, Unlinked }!void {
+        _ = s;
+        return error.ReadOnly;
+    }
+    pub fn why(s: *WindowsStub) []const u8 {
+        _ = s;
+        return "";
+    }
+};
+
+/// The record store. POSIX for real; the Windows stub above there, so the
+/// fd layer is never analyzed on a Windows build.
+pub const Store = if (builtin.os.tag == .windows) WindowsStub else PosixStore;
 
 /// `dir` and its missing parents, each made 0700.
 fn makePath(dir: [:0]const u8) !void {
@@ -1107,14 +1161,15 @@ fn storeDir(a: Allocator, digest: [32]u8) ?[]const u8 {
 /// cannot be opened. The `enabled` flag is checked first, so every call site is
 /// a single null-check when Recall is off.
 pub fn storeFor(tok: *const Tokenizer) ?*Store {
-    // The record is POSIX by design (flock, append-mode open, 0700 files); a
-    // Windows build has none of it. The comptime gate also prunes the whole
-    // fd layer from the Windows target's analysis (std.c's open/close/write
-    // are Windows-shaped there), so recall compiles as off-with-a-reason.
-    if (builtin.os.tag == .windows) return null;
+    return storeForIdentity(tok.recall_identity, tok.recall_vocab, tok.recall_name);
+}
+
+/// The record for one tokenizer identity, opened on first use (see storeFor).
+/// The runtime Windows return never analyzes — the `Store` alias is the stub there
+/// (see its comment); this early return is belt-and-braces for the sweep.
+fn storeForIdentity(digest: [32]u8, vocab: u32, name: []const u8) ?*Store {
     if (!shared_state.get().enabled) return null;
-    if (tok.recall_vocab == 0) return null; // dummy/test tokenizer: never records
-    const digest = tok.recall_identity;
+    if (vocab == 0) return null; // dummy/test tokenizer: never records
     const st_state = shared_state.get();
     st_state.mutex.lock();
     defer st_state.mutex.unlock();
@@ -1129,7 +1184,7 @@ pub fn storeFor(tok: *const Tokenizer) ?*Store {
         return null;
     };
     defer gpa.free(dir);
-    const identity = Identity{ .digest = digest, .vocab = tok.recall_vocab, .name = tok.recall_name };
+    const identity = Identity{ .digest = digest, .vocab = vocab, .name = name };
     const st = Store.open(identity, io, .{ .dir = dir, .cap_bytes = st_state.cap_bytes, .read_only = st_state.read_only }, &problem, gpa) catch {
         log.err("--recall: cannot open the record at {s}: {s}\n", .{ dir, problem });
         st_state.failures.put(gpa, digest, {}) catch {};
@@ -1144,10 +1199,10 @@ pub fn storeFor(tok: *const Tokenizer) ?*Store {
         return null;
     };
     log.info("recall: record for {s} at {s} (cap {d} MiB, {s})\n", .{
-        tok.recall_name,
-        st.dir,
+        name,
+        dir,
         st_state.cap_bytes >> 20,
-        if (st.writes) "writing" else "read-only",
+        if (st_state.read_only) "read-only" else "writing",
     });
     return st;
 }
@@ -1183,9 +1238,126 @@ pub fn finishRequest(tok: *const Tokenizer, prompt: []const u32, reply: []const 
     st.readReply(prompt, reply);
 }
 
+// ── the recording worker ──────────────────────────────────────────────
+// Recording (the dedup walk, the statfs floor check, write(2), fsync) never
+// runs on the thread other slots decode on: `finishRequestAsync` copies the
+// ids and hands the job to this one worker thread. A process exit mid-write
+// leaves a torn chunk tail — exactly what load()'s tail-cut already handles.
+
+/// Ids of prompt recorded, past the tail cap: drafts key off TRAILING
+/// context (a lookup never reaches further back than `max_match`), so the
+/// head of a very long prompt is walked and stored for nothing.
+const prompt_tail_cap: usize = 4096 + PosixStore.overlap;
+/// Pending ids beyond this drop the OLDEST job; the queue never grows
+/// unbounded on a stalled disk, and a drop is logged, never silent.
+const queue_cap_ids: usize = 4 << 20;
+const worker_poll_ms: u32 = 2;
+
+const RecordJob = struct {
+    digest: [32]u8,
+    vocab: u32,
+    name: []u8,
+    prompt: []u32,
+    reply: []u32,
+};
+
+var worker_state: struct {
+    mutex: os_mutex.Mutex = .{},
+    queue: std.ArrayList(RecordJob) = .empty,
+    spawned: bool = false,
+    queued_ids: usize = 0,
+} = .{};
+
+fn freeJob(j: RecordJob) void {
+    gpa.free(j.name);
+    gpa.free(j.prompt);
+    gpa.free(j.reply);
+}
+
+fn workerLoop() void {
+    while (true) {
+        var job: ?RecordJob = null;
+        {
+            worker_state.mutex.lock();
+            defer worker_state.mutex.unlock();
+            if (worker_state.queue.items.len > 0) {
+                job = worker_state.queue.orderedRemove(0);
+                worker_state.queued_ids -= job.?.prompt.len + job.?.reply.len;
+            }
+        }
+        if (job) |j| {
+            defer freeJob(j);
+            if (storeForIdentity(j.digest, j.vocab, j.name)) |st| {
+                st.readPrompt(j.prompt, 0);
+                st.readReply(j.prompt, j.reply);
+            }
+            continue;
+        }
+        crt.sleepMs(worker_poll_ms);
+    }
+}
+
+fn spawnWorker() bool {
+    worker_state.mutex.lock();
+    defer worker_state.mutex.unlock();
+    if (worker_state.spawned) return true;
+    const t = std.Thread.spawn(.{}, workerLoop, .{}) catch {
+        log.warn("recall: the recording worker could not start; this request is not recorded\n", .{});
+        return false;
+    };
+    t.detach();
+    worker_state.spawned = true;
+    return true;
+}
+
+/// Hand a finished request's ids to the recording worker and return at once.
+/// False (with a logged reason) means not recorded — serving never waits on
+/// recording.
+pub fn finishRequestAsync(tok: *const Tokenizer, prompt: []const u32, reply: []const u32) bool {
+    const st = shared_state.get();
+    if (!st.enabled or tok.recall_vocab == 0) return false;
+    const tail = if (prompt.len > prompt_tail_cap) prompt[prompt.len - prompt_tail_cap ..] else prompt;
+    if (!spawnWorker()) return false;
+    const p = gpa.dupe(u32, tail) catch {
+        log.warn("recall: record copy failed; this request is not recorded\n", .{});
+        return false;
+    };
+    const r = gpa.dupe(u32, reply) catch {
+        gpa.free(p);
+        log.warn("recall: record copy failed; this request is not recorded\n", .{});
+        return false;
+    };
+    const n = gpa.dupe(u8, tok.recall_name) catch {
+        gpa.free(p);
+        gpa.free(r);
+        log.warn("recall: record copy failed; this request is not recorded\n", .{});
+        return false;
+    };
+    const job = RecordJob{ .digest = tok.recall_identity, .vocab = tok.recall_vocab, .name = n, .prompt = p, .reply = r };
+    worker_state.mutex.lock();
+    defer worker_state.mutex.unlock();
+    while (worker_state.queued_ids + p.len + r.len > queue_cap_ids and worker_state.queue.items.len > 0) {
+        const old = worker_state.queue.orderedRemove(0);
+        worker_state.queued_ids -= old.prompt.len + old.reply.len;
+        freeJob(old);
+        log.warn("recall: the recording queue is over its cap; the oldest request is not recorded\n", .{});
+    }
+    if (worker_state.queued_ids + p.len + r.len > queue_cap_ids) {
+        freeJob(job);
+        log.warn("recall: a reply longer than the recording queue cannot be recorded\n", .{});
+        return false;
+    }
+    worker_state.queue.append(gpa, job) catch {
+        freeJob(job);
+        log.warn("recall: the recording queue could not grow; this request is not recorded\n", .{});
+        return false;
+    };
+    worker_state.queued_ids += p.len + r.len;
+    return true;
+}
+
 /// All open records' stats, for `GET /v1/recall`. Caller frees.
 pub fn allStats(a: Allocator) []Stats {
-    if (builtin.os.tag == .windows) return &[_]Stats{};
     const st_state = shared_state.get();
     st_state.mutex.lock();
     const n = st_state.stores.count();
@@ -1215,6 +1387,8 @@ pub const EmptyRow = struct {
 /// run left). `all_failed` maps to 409 (no record could be emptied); `rows`
 /// is caller-freed.
 pub fn emptyAll(a: Allocator) struct { rows: []EmptyRow, all_failed: bool } {
+    // Comptime gate: the sweep's file-scope helpers use the POSIX O struct
+    // (void on Windows); the stub never opens a store, so nothing can sweep.
     if (builtin.os.tag == .windows) return .{ .rows = &[_]EmptyRow{}, .all_failed = false };
     const st_state = shared_state.get();
     var rows: std.ArrayList(EmptyRow) = .empty;
@@ -1495,6 +1669,66 @@ test "store: identity roundtrip, dedup, restart, lock makes second writer read-o
     try testing.expect(other == null);
     try testing.expect(std.mem.indexOf(u8, problem, "other-model") != null);
     s.close();
+}
+
+test "worker: async recording lands in the store off-thread" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const d0 = try std.fmt.allocPrint(testing.allocator, "{s}/worker", .{root});
+    defer testing.allocator.free(d0);
+    const dir = try testing.allocator.dupeSentinel(u8, d0, 0);
+    defer testing.allocator.free(dir);
+
+    const st = shared_state.get();
+    const prev = .{ st.enabled, st.io, st.base_dir };
+    defer {
+        const s2 = shared_state.get();
+        s2.enabled = prev[0];
+        s2.io = prev[1];
+        s2.base_dir = prev[2];
+    }
+    st.enabled = true;
+    st.io = std.testing.io;
+    _ = setBaseDir(dir);
+
+    var prompt: [160]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(9000 + i);
+    var reply: [160]u32 = undefined;
+    for (&reply, 0..) |*t, i| t.* = @intCast(7000 + i);
+
+    const tok = struct {
+        fn fake() *const Tokenizer {
+            // A real-shaped tokenizer stand-in: only the three recall fields
+            // are read; nothing else on the pointee is touched.
+            const T = struct {
+                var instance: [4096]u8 align(8) = undefined;
+            };
+            const tp: *Tokenizer = @ptrCast(@alignCast(&T.instance));
+            tp.recall_identity = @splat(11);
+            tp.recall_vocab = 100_000;
+            tp.recall_name = "worker-test";
+            return tp;
+        }
+    }.fake();
+
+    try testing.expect(finishRequestAsync(tok, &prompt, &reply));
+    // The worker drains within seconds; poll for the record to appear.
+    var waited: usize = 0;
+    while (waited < 2500) : (waited += 1) {
+        if (storeForIdentity(@splat(11), 100_000, "worker-test")) |s2| {
+            if (s2.stats().ids > 0) {
+                s2.mutex.lock();
+                defer s2.mutex.unlock();
+                const m = s2.record.longest(reply[0..100]);
+                try testing.expectEqual(recall_max_match, m.len);
+                return; // store left open in the registry: its digest is test-only
+            }
+        }
+        crt.sleepMs(2);
+    }
+    return error.WorkerDidNotRecord;
 }
 
 test "rates: expected tokens, bands, probe backoff, quiet rounds" {

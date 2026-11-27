@@ -658,7 +658,9 @@ pub const Generator = struct {
             self.recall = null;
         }
         if (self.recallLaneOk()) {
-            recall_mod.finishRequest(self.tok, self.prompt_ids_owned, self.generated_ids.items);
+            // Off the inference thread: the worker owns the dedup walk and
+            // the writes; this only copies the ids out.
+            _ = recall_mod.finishRequestAsync(self.tok, self.prompt_ids_owned, self.generated_ids.items);
         }
         if (self.prompt_ids_alloc) |a| {
             a.free(self.prompt_ids_owned);
