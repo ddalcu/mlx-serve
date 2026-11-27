@@ -1752,7 +1752,7 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     // (bills, cache sizing, batching, sampling and thinking defaults) stays as it was; the plugin's facts alone
     // only for a type the legacy parse cannot read. An outside plugin's binding takes the legacy parse only when its
     // parse asks for it (`Parsed.engine_config`); otherwise its facts alone.
-    const binding = if (served) try plugin_config.bindServed(io, allocator, model_dir, scoped) else null;
+    const binding = if (served) try plugin_config.bindServed(io, allocator, model_dir, scoped, null) else null;
     errdefer if (binding) |b| b.destroy(allocator);
     if (binding) |b| if (b.outside and !b.parsed.wantsEngineConfig()) return stamped(plugin_config.adapted(b), &per_model);
     var config = parseConfigFromJson(allocator, scoped) catch |e| {

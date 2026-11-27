@@ -160,7 +160,7 @@ test "muse_glimmer plugin: a vision pack is served by the plugin (the engine loa
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
     var path_buf: [512]u8 = undefined;
     const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-    const bind = (try plugin_config.bindServed(io, a, dir, json)) orelse return error.NotServed;
+    const bind = (try plugin_config.bindServed(io, a, dir, json, null)) orelse return error.NotServed;
     defer bind.destroy(a);
     try testing.expect(bind.table == &plugin.table and bind.parsed.caps.images);
 }

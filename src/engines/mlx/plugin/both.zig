@@ -407,7 +407,7 @@ fn expectRefused(json: []const u8) !void {
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
     var path_buf: [512]u8 = undefined;
     const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-    try testing.expectError(error.PluginDeclinedNoLegacy, plugin_config.bindServed(io, a, dir, json));
+    try testing.expectError(error.PluginDeclinedNoLegacy, plugin_config.bindServed(io, a, dir, json, null));
 }
 
 /// The engine config of `config_json` served under the caller's `--config-overrides`: the plugin binds and the
@@ -606,7 +606,7 @@ pub fn expectServedWithDrafter(config_json: []const u8) !void {
     try dflash_mod.TinyFix.writeAssistant(io, sub, drafter, fixture.stream());
     const p = dflash_mod.resolveInDirDrafter(io, a, dir) orelse return error.TestExpectedDrafter;
     a.free(p);
-    const b = (try plugin_config.bindServed(io, a, dir, config_json)) orelse return error.TestExpectedPluginServed;
+    const b = (try plugin_config.bindServed(io, a, dir, config_json, null)) orelse return error.TestExpectedPluginServed;
     b.destroy(a);
 }
 

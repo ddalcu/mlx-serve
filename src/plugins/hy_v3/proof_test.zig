@@ -164,7 +164,7 @@ fn expectBinds(json: []const u8) !void {
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
     var path_buf: [512]u8 = undefined;
     const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-    const bound = (try plugin_config.bindServed(io, a, dir, json)) orelse return error.TestPackNotServed;
+    const bound = (try plugin_config.bindServed(io, a, dir, json, null)) orelse return error.TestPackNotServed;
     bound.destroy(a);
 }
 

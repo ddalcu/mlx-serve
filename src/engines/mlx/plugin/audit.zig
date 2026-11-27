@@ -3,6 +3,7 @@
 //! parse's own reads: safetensors headers at most), never weights or MLX.
 
 const std = @import("std");
+const model_settings = @import("../../../host/registry/model_settings.zig");
 const plugin_config = @import("config.zig");
 const served = @import("served.zig");
 const sdk_plugin = @import("../../../sdk/plugin.zig");
@@ -14,7 +15,9 @@ pub const Row = struct { model_type: []const u8, why: ?[]const u8 };
 /// The verdict on the pack at `model_dir`; `model_type` and `why` are static or arena-owned.
 pub fn auditPack(io: std.Io, arena: std.mem.Allocator, model_dir: []const u8, config_json: []const u8) Row {
     const model_type = sdk_plugin.modelTypeOf(arena, config_json) catch |e| return .{ .model_type = "?", .why = @errorName(e) };
-    const out = plugin_config.resolve(io, std.heap.page_allocator, model_dir, config_json) catch |e| return .{ .model_type = model_type, .why = @errorName(e) };
+    const per_model = model_settings.configOverridesFor(arena, io, model_dir);
+    defer if (per_model) |ov| arena.free(ov);
+    const out = plugin_config.resolve(io, std.heap.page_allocator, model_dir, config_json, per_model) catch |e| return .{ .model_type = model_type, .why = @errorName(e) };
     switch (out) {
         .bound => |b| {
             b.destroy(std.heap.page_allocator);

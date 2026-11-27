@@ -272,7 +272,7 @@ test "lfm2 served: mlx-community's `lfm2-vl` spelling binds as the text model th
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
     var buf: [512]u8 = undefined;
     const dir = buf[0..try tmp.dir.realPath(io, &buf)];
-    const bound = (try @import("../../engines/mlx/plugin/config.zig").bindServed(io, testing.allocator, dir, json)) orelse return error.TestPackNotServed;
+    const bound = (try @import("../../engines/mlx/plugin/config.zig").bindServed(io, testing.allocator, dir, json, null)) orelse return error.TestPackNotServed;
     defer bound.destroy(testing.allocator);
     try testing.expect(!bound.parsed.caps.images);
     try expectParse(json);
@@ -290,7 +290,7 @@ test "lfm2 served: a D1 decision pack (an LFM2-VL config naming modeling_d1) is 
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
     var buf: [512]u8 = undefined;
     const dir = buf[0..try tmp.dir.realPath(io, &buf)];
-    try testing.expectError(error.PluginDeclinedNoLegacy, @import("../../engines/mlx/plugin/config.zig").bindServed(io, testing.allocator, dir, json));
+    try testing.expectError(error.PluginDeclinedNoLegacy, @import("../../engines/mlx/plugin/config.zig").bindServed(io, testing.allocator, dir, json, null));
 }
 
 // ── a `--mlx-gguf` file ──

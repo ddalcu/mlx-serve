@@ -276,9 +276,9 @@ test "plugin config: a shape its plugin declines is refused by name; a drafter s
         var path_buf: [512]u8 = undefined;
         const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
         if (c.refused) {
-            try testing.expectError(error.PluginDeclinedNoLegacy, plugin_config.parseServed(io, a, dir, c.json));
+            try testing.expectError(error.PluginDeclinedNoLegacy, plugin_config.parseServed(io, a, dir, c.json, null));
         } else {
-            var got = (try plugin_config.parseServed(io, a, dir, c.json)) orelse return error.TestExpectedPluginParse;
+            var got = (try plugin_config.parseServed(io, a, dir, c.json, null)) orelse return error.TestExpectedPluginParse;
             got.deinit(a);
         }
     }
@@ -290,7 +290,7 @@ test "plugin config: a shape its plugin declines is refused by name; a drafter s
     // The overrides reach the plugin's parse as they reach the legacy one.
     model.setConfigOverrides("{\"max_position_embeddings\":8192}");
     defer model.setConfigOverrides(null);
-    var got = (try plugin_config.parseServed(io, a, dir, q4)) orelse return error.TestExpectedPluginParse;
+    var got = (try plugin_config.parseServed(io, a, dir, q4, null)) orelse return error.TestExpectedPluginParse;
     defer got.deinit(a);
     try testing.expectEqual(@as(u32, 8192), got.max_position_embeddings);
     // A served load (an outside plugin's too: both bind in `resolve`) reads its bill's terms once, where it binds.

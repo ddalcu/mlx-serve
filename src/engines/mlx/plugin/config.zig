@@ -83,8 +83,8 @@ fn claimantIn(list: []const sdk_plugin.Entry, model_type: []const u8, config_jso
 
 /// The plugin's parse of the pack at `model_dir` (`config_json` its config.json), as the generic `ModelConfig` of its
 /// facts alone carrying its binding (`adapted`); null when no plugin serves it.
-pub fn parseServed(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config_json: []const u8) !?ModelConfig {
-    const b = (try bindServed(io, a, model_dir, config_json)) orelse return null;
+pub fn parseServed(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config_json: []const u8, per_model: ?[]const u8) !?ModelConfig {
+    const b = (try bindServed(io, a, model_dir, config_json, per_model)) orelse return null;
     return adapted(b);
 }
 
@@ -101,8 +101,8 @@ pub fn adapted(b: *Binding) ModelConfig {
 /// The plugin's claim and parse of the pack at `model_dir` (caller owns the binding); null for a pack of a type no
 /// plugin serves, `error.PluginDeclinedNoLegacy` for a served type's pack
 /// its plugin declines. The engine's config of a served pack is the legacy parse with this binding attached.
-pub fn bindServed(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config_json: []const u8) !?*Binding {
-    const why = switch (try resolve(io, a, model_dir, config_json)) {
+pub fn bindServed(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config_json: []const u8, per_model: ?[]const u8) !?*Binding {
+    const why = switch (try resolve(io, a, model_dir, config_json, per_model)) {
         .bound => |b| return b,
         .declined => |why| why,
     };
@@ -175,13 +175,15 @@ pub fn mergeOverrides(a: std.mem.Allocator, config_json: []const u8, per_model: 
 /// Who serves a pack: its plugin's binding (caller owns it), or why none does (static text).
 pub const Outcome = union(enum) { bound: *Binding, declined: []const u8 };
 
-pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json: []const u8) !Outcome {
+/// `per_model` is the pack's `config_overrides` document; null when `raw_json` already has it merged
+/// (`model.parseConfigWith`), so one load merges the layer ONCE and the fingerprint hashes what was parsed.
+pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json: []const u8, per_model: ?[]const u8) !Outcome {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     // The plugin parses what the legacy parse reads: the overrides land in both.
     var pack = model_settings.settingsForPack(a, io, model_dir);
     defer pack.deinit(a);
-    const config_json = try mergeOverrides(arena.allocator(), raw_json, pack.config_overrides, model.getConfigOverrides());
+    const config_json = try mergeOverrides(arena.allocator(), raw_json, per_model, model.getConfigOverrides());
     const model_type = try sdk_plugin.modelTypeOf(arena.allocator(), config_json);
     if (!served.serves(model_type) and outside.loaded().len == 0) return .{ .declined = "type not served" };
     var fs = FsPackDir.open(io, model_dir) catch return .{ .declined = "pack dir unreadable" };
@@ -649,6 +651,16 @@ test "plugin config: a pack's config_overrides reach the config its parse reads"
     try testing.expectEqual(@as(u32, 1048576), cfg.max_position_embeddings);
     const applied = cfg.config_overrides_applied orelse return error.TestExpectedStampedDocument;
     try testing.expectEqualStrings(ov, applied);
+
+    // The plugin's own parse gets the same document: `resolve` merges what it is handed, and `parseConfigWith`
+    // hands it null because its bytes already carry the layer. One merge per load, one rope.
+    switch (try resolve(io, t, pack_dir, ling_tiny_json, ov)) {
+        .bound => |b| {
+            defer b.destroy(t);
+            try testing.expectEqual(@as(u32, 1_048_576), b.parsed.shell.max_position_embeddings);
+        },
+        .declined => return error.TestExpectedBound,
+    }
 
     // With nothing set for the pack, its own config stands and nothing is stamped.
     try tmp.dir.writeFile(io, .{ .sub_path = ".mlx-serve/model-settings.json", .data = "{\"/other\":{\"ctx_size\":1}}" });
