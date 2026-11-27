@@ -66,37 +66,47 @@ const foreign_fields = [_][]const u8{ "bpm", "keyscale", "timesignature", "vocal
 /// A song request, validated (the strings borrow the body).
 fn parse(b: *const job.Body) union(enum) { ok: heartmula.Request, bad: Verdict } {
     inline for (foreign_fields) |f| if (b.get(f)) |v| {
-        const present = v == .string or v == .integer or v == .float or (v == .bool and v.bool);
+        const present = !(v == .null or (v == .bool and !v.bool));
         if (present) return .{ .bad = bad("'" ++ f ++ "' is not supported by HeartMuLa (style tags go in 'prompt', lyrics with [Verse]-style tags in 'lyrics')") };
     };
-    if (b.str("task")) |t| if (!std.mem.eql(u8, t, "text2music"))
+    if (b.get("task")) |t| if (t != .null and !(t == .string and std.mem.eql(u8, t.string, "text2music")))
         return .{ .bad = bad("'task' is not supported by HeartMuLa (text2music only)") };
     const prompt = b.str("prompt") orelse return .{ .bad = bad("missing 'prompt' (comma-separated style tags: genre, instruments, mood, vocal)") };
     if (std.mem.trim(u8, prompt, " \t\r\n").len == 0) return .{ .bad = bad("empty 'prompt'") };
     const lyrics = b.str("lyrics") orelse return .{ .bad = bad("missing 'lyrics' (HeartMuLa is lyric-conditioned; structure tags like [Verse] go on their own lines)") };
     if (std.mem.trim(u8, lyrics, " \t\r\n").len == 0) return .{ .bad = bad("empty 'lyrics'") };
     var req: heartmula.Request = .{ .tags = prompt, .lyrics = lyrics };
-    const seconds = b.uint("duration_seconds") orelse heartmula.DEFAULT_SECONDS;
-    if (seconds < heartmula.MIN_SECONDS or seconds > heartmula.MAX_SECONDS) return .{ .bad = bad("'duration_seconds' must be in [5,360]") };
+    const seconds_why = "'duration_seconds' must be a whole number in [5,360]";
+    const seconds = (b.whole("duration_seconds") catch return .{ .bad = bad(seconds_why) }) orelse heartmula.DEFAULT_SECONDS;
+    if (seconds < heartmula.MIN_SECONDS or seconds > heartmula.MAX_SECONDS) return .{ .bad = bad(seconds_why) };
     req.seconds = @intCast(seconds);
-    const steps = b.uint("steps") orelse heartmula.DEFAULT_STEPS;
-    if (steps < 4 or steps > 50) return .{ .bad = bad("'steps' must be in [4,50]") };
+    const steps_why = "'steps' must be a whole number in [4,50]";
+    const steps = (b.whole("steps") catch return .{ .bad = bad(steps_why) }) orelse heartmula.DEFAULT_STEPS;
+    if (steps < 4 or steps > 50) return .{ .bad = bad(steps_why) };
     req.steps = @intCast(steps);
-    if (b.float("cfg_scale")) |g| {
-        if (!(g >= 1 and g <= 10)) return .{ .bad = bad("'cfg_scale' must be in [1,10]") };
+    if (number(b, "cfg_scale") catch return .{ .bad = bad("'cfg_scale' must be a number in [1,10]") }) |g| {
+        if (!(g >= 1 and g <= 10)) return .{ .bad = bad("'cfg_scale' must be a number in [1,10]") };
         req.sampling.cfg = @floatCast(g);
     }
-    if (b.float("temperature")) |t| {
-        if (!(t > 0 and t <= 5)) return .{ .bad = bad("'temperature' must be in (0,5]") };
+    if (number(b, "temperature") catch return .{ .bad = bad("'temperature' must be a number in (0,5]") }) |t| {
+        if (!(t > 0 and t <= 5)) return .{ .bad = bad("'temperature' must be a number in (0,5]") };
         req.sampling.temperature = @floatCast(t);
     }
-    if (b.get("top_k") != null) {
-        const k = b.uint("top_k") orelse 0;
-        if (k < 1 or k > 1000) return .{ .bad = bad("'top_k' must be in [1,1000]") };
+    const top_k_why = "'top_k' must be a whole number in [1,1000]";
+    if (b.whole("top_k") catch return .{ .bad = bad(top_k_why) }) |k| {
+        if (k < 1 or k > 1000) return .{ .bad = bad(top_k_why) };
         req.sampling.top_k = @intCast(k);
     }
-    req.sampling.seed = b.uint("seed") orelse 42;
+    req.sampling.seed = (b.whole("seed") catch return .{ .bad = bad("'seed' must be a whole number >= 0") }) orelse 42;
     return .{ .ok = req };
+}
+
+/// A number field: null when absent, `error.NotNumber` for a string, bool, object or array (never a silent default).
+fn number(b: *const job.Body, key: []const u8) error{NotNumber}!?f64 {
+    const v = b.get(key) orelse return null;
+    if (b.float(key)) |f| return f;
+    if (v == .null) return null;
+    return error.NotNumber;
 }
 
 fn step(ep: *anyopaque, r: *const abi.Request, progress: *const abi.Progress) callconv(.c) Verdict {
@@ -250,17 +260,26 @@ test "heartmula plugin: a request is validated before any forward, by name" {
         .{ "{\"lyrics\":\"x\"}", "missing 'prompt' (comma-separated style tags: genre, instruments, mood, vocal)" },
         .{ "{\"prompt\":\"p\"}", "missing 'lyrics' (HeartMuLa is lyric-conditioned; structure tags like [Verse] go on their own lines)" },
         .{ "{\"prompt\":\"p\",\"lyrics\":\" \"}", "empty 'lyrics'" },
-        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"duration_seconds\":4}", "'duration_seconds' must be in [5,360]" },
-        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"steps\":3}", "'steps' must be in [4,50]" },
-        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"cfg_scale\":0.5}", "'cfg_scale' must be in [1,10]" },
-        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"temperature\":0}", "'temperature' must be in (0,5]" },
-        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"top_k\":0}", "'top_k' must be in [1,1000]" },
+        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"ref_audio\":{\"url\":\"a.wav\"}}", "'ref_audio' is not supported by HeartMuLa (style tags go in 'prompt', lyrics with [Verse]-style tags in 'lyrics')" },
+        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"src_audio\":[1]}", "'src_audio' is not supported by HeartMuLa (style tags go in 'prompt', lyrics with [Verse]-style tags in 'lyrics')" },
+        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"task\":7}", "'task' is not supported by HeartMuLa (text2music only)" },
+        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"duration_seconds\":4}", "'duration_seconds' must be a whole number in [5,360]" },
+        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"duration_seconds\":30.5}", "'duration_seconds' must be a whole number in [5,360]" },
+        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"duration_seconds\":\"30\"}", "'duration_seconds' must be a whole number in [5,360]" },
+        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"steps\":3}", "'steps' must be a whole number in [4,50]" },
+        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"steps\":10.5}", "'steps' must be a whole number in [4,50]" },
+        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"cfg_scale\":0.5}", "'cfg_scale' must be a number in [1,10]" },
+        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"cfg_scale\":\"3\"}", "'cfg_scale' must be a number in [1,10]" },
+        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"temperature\":0}", "'temperature' must be a number in (0,5]" },
+        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"top_k\":0}", "'top_k' must be a whole number in [1,1000]" },
+        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"top_k\":2.5}", "'top_k' must be a whole number in [1,1000]" },
+        .{ "{\"prompt\":\"p\",\"lyrics\":\"x\",\"seed\":-1}", "'seed' must be a whole number >= 0" },
     }) |c| {
         var b = job.Body.parse(testing.allocator, c[0]).?;
         defer b.deinit();
         try testing.expectEqualStrings(c[1], parse(&b).bad.why.slice());
     }
-    var b = job.Body.parse(testing.allocator, "{\"prompt\":\"p\",\"lyrics\":\"x\",\"instrumental\":false,\"task\":\"text2music\"}").?;
+    var b = job.Body.parse(testing.allocator, "{\"prompt\":\"p\",\"lyrics\":\"x\",\"instrumental\":false,\"ref_audio\":null,\"task\":\"text2music\",\"cfg_scale\":null,\"temperature\":1}").?;
     defer b.deinit();
     const r = parse(&b).ok;
     try testing.expect(r.seconds == heartmula.DEFAULT_SECONDS and r.steps == heartmula.DEFAULT_STEPS and r.sampling.cfg == heartmula.DEFAULT_CFG and r.sampling.top_k == 50);

@@ -26,7 +26,9 @@ Euler, default 10), `seed`. `bpm`, `keyscale`, `timesignature`, `vocal_language`
 - Window arithmetic is heartlib's float truncation (`songSamples`): `int(n / 12.5 * 48000)` is not `n * 3840`.
 - The 4-bit pack (trunk 4-bit, depth + heads 8-bit) agrees with the fp32 greedy codes far less often than 8-bit
   (replay oracle); 8-bit matches bf16.
-- Tags are joined with no space around a comma (`joinTags`, heartlib's README format), then lowercased.
+- Tags are joined with no space around a comma (`joinTags`, heartlib's README format), then lowercased exactly as
+  CPython's `str.lower` (`pyLower` over `lower_table.zig`, regenerate with `scripts/gen_lower_table.py`): a hand-listed
+  subset missed Vietnamese and fullwidth letters, `İ` and final sigma, and changed the prompt ids.
 - Training kept at most ONE short tag per category (paper Table 6: genre .95, timbre .5, gender .375, mood .325,
   instrument .25, scene .2, region .125, topic .1): a long tag list or several genres is off-distribution and the
   style stops following it. The app's templates and Enhance write that shape.

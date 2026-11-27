@@ -5,7 +5,8 @@ USER-RUN with heartlib's own environment (torch + torchtune + vector_quantize_py
 UPSTREAM checkpoints (the bf16 pack is what the oracles load: `HEARTMULA_TEST_MODEL`).
 
 Files in --out (point `HEARTMULA_FIXTURES` at it):
-  tags_{a,b,c}.txt / lyrics_{a,b,c}.txt / ids_{a,b,c}.i32 : the prompt's text column (muq slot = 0); c has empty tags
+  tags_{a,b,c,d}.txt / lyrics_{a,b,c,d}.txt / ids_{a,b,c,d}.i32 : the prompt's text column (muq slot = 0); c has empty
+                       tags, d the scripts `str.lower` maps beyond Latin (Vietnamese, fullwidth, final sigma, İ)
   c0_prefill.f32 [2, V]   : codebook-0 logits of both CFG rows after the prompt (sample a, cfg 3)
   guided.f32 [4, 8, V]    : the guided logits each of the first 4 frames samples its 8 codes from
   codes.i32 [N, 8]        : the greedy (argmax) frames, teacher-forced replay for the AR stage
@@ -33,6 +34,7 @@ SAMPLES = {
           "[Verse]\nNeon lights across the bay\nWe keep running anyway\n\n[Chorus]\nHold on, hold on tonight"),
     "b": ("ballad,strings,emotional", "[Intro]\n\n[Verse]\n月光洒在窗前\n我在等你回来\n[Outro]"),
     "c": ("", "[Verse]\nOne line, café, 12345 don't stop"),
+    "d": ("Pop,Ballad,ＦＥＭＡＬＥ", "[Verse]\nẠnh Yêu Em ＡＢＣ\nΟΔΟΣ ΣΑΣ İstanbul Ǆ Ա Ⅷ"),
 }
 CFG = 3.0
 FRAMES = 200

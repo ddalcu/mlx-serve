@@ -20,6 +20,7 @@ const sse = @import("../../sdk/media/progress.zig");
 const params = @import("../../sdk/quant/params.zig");
 const embedding = @import("../../sdk/blocks/embedding.zig");
 const rope_scaled = @import("../../sdk/blocks/rope/scaled.zig");
+const lower_table = @import("lower_table.zig");
 const ops = @import("../../mlx/ops.zig");
 const scope_mod = @import("../../mlx/scope.zig");
 const Graph = ops.Graph;
@@ -135,32 +136,86 @@ pub fn parseConfig(a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Cfg
 // Prompt byte contract (pipelines/music_generation.py `preprocess`)
 // ════════════════════════════════════════════════════════════════════════
 
-/// Python `str.lower()` over the scripts with a simple case mapping (ASCII, Latin-1, Latin Extended-A, Greek,
-/// Cyrillic); every other code point passes through (CJK has no case). Invalid UTF-8 is copied byte for byte.
+/// Python `str.lower()`: the generated one-to-one runs, the full mappings (U+0130) and Final_Sigma
+/// (`lower_table.zig`). Invalid UTF-8 is copied byte for byte and counts as neither cased nor case-ignorable.
 pub fn pyLower(a: std.mem.Allocator, text: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(a);
+    // Decoded first: Final_Sigma looks both ways. A raw byte is kept as `RAW | byte`.
+    var cps: std.ArrayList(u32) = .empty;
+    defer cps.deinit(a);
     var i: usize = 0;
     while (i < text.len) {
-        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-        const cp = if (i + n <= text.len) std.unicode.utf8Decode(text[i .. i + n]) catch null else null;
-        const c = cp orelse {
-            try out.append(a, text[i]);
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
+        const cp = if (n > 0 and i + n <= text.len) std.unicode.utf8Decode(text[i .. i + n]) catch null else null;
+        if (cp) |c| {
+            try cps.append(a, c);
+            i += n;
+        } else {
+            try cps.append(a, RAW | text[i]);
             i += 1;
+        }
+    }
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    for (cps.items, 0..) |c, k| {
+        if (c & RAW != 0) {
+            try out.append(a, @intCast(c & 0xFF));
             continue;
-        };
-        const l: u21 = switch (c) {
-            'A'...'Z', 0xC0...0xD6, 0xD8...0xDE, 0x391...0x3A1, 0x3A3...0x3AB, 0x410...0x42F => c + 32,
-            0x100...0x137, 0x14A...0x177 => c | 1,
-            0x139...0x148 => if (c % 2 == 1) c + 1 else c,
-            0x400...0x40F => c + 80,
-            else => c,
-        };
-        var buf: [4]u8 = undefined;
-        try out.appendSlice(a, buf[0 .. std.unicode.utf8Encode(l, &buf) catch unreachable]);
-        i += n;
+        }
+        const cp: u21 = @intCast(c);
+        if (cp == 0x03A3) {
+            try appendCp(a, &out, if (finalSigma(cps.items, k)) 0x03C2 else 0x03C3);
+        } else if (multiLower(cp)) |m| {
+            for (m) |x| if (x != 0) try appendCp(a, &out, x);
+        } else try appendCp(a, &out, simpleLower(cp));
     }
     return out.toOwnedSlice(a);
+}
+
+const RAW: u32 = 1 << 31;
+
+fn appendCp(a: std.mem.Allocator, out: *std.ArrayList(u8), cp: u21) !void {
+    var buf: [4]u8 = undefined;
+    try out.appendSlice(a, buf[0 .. std.unicode.utf8Encode(cp, &buf) catch unreachable]);
+}
+
+fn simpleLower(cp: u21) u21 {
+    const runs = lower_table.simple;
+    var lo: usize = 0;
+    var hi: usize = runs.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (runs[mid][1] < cp) lo = mid + 1 else hi = mid;
+    }
+    if (lo == runs.len) return cp;
+    const r = runs[lo];
+    if (cp < r[0] or (cp - r[0]) % r[3] != 0) return cp;
+    return @intCast(@as(i32, cp) + r[2]);
+}
+
+fn multiLower(cp: u21) ?[]const u21 {
+    for (&lower_table.multi) |*m| if (m[0] == cp) return m[1..];
+    return null;
+}
+
+fn inRanges(ranges: []const [2]u21, c: u32) bool {
+    if (c & RAW != 0) return false;
+    var lo: usize = 0;
+    var hi: usize = ranges.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (ranges[mid][1] < c) lo = mid + 1 else hi = mid;
+    }
+    return lo < ranges.len and c >= ranges[lo][0];
+}
+
+/// CPython's Final_Sigma: a cased letter before (case-ignorables skipped) and none after.
+fn finalSigma(cps: []const u32, k: usize) bool {
+    var j = k;
+    while (j > 0 and inRanges(&lower_table.case_ignorable, cps[j - 1])) j -= 1;
+    if (j == 0 or !inRanges(&lower_table.cased, cps[j - 1])) return false;
+    var n = k + 1;
+    while (n < cps.len and inRanges(&lower_table.case_ignorable, cps[n])) n += 1;
+    return n == cps.len or !inRanges(&lower_table.cased, cps[n]);
 }
 
 pub const Prompt = struct {
@@ -1166,11 +1221,19 @@ test "heartmula crossfade: the overlap ramps from the old window to the new one"
     try testing.expectApproxEqAbs(@as(f32, 2), song[0].items[HOP_SAMPLES + OVLP_SAMPLES / 2], 1e-4);
 }
 
-test "heartmula lower: Python's str.lower on the cased scripts, CJK untouched" {
+test "heartmula lower: CPython's str.lower, full mappings and Final_Sigma included" {
     const a = testing.allocator;
-    const got = try pyLower(a, "Pop, CAFÉ Ŀ Ωmega ДОМ 月光 [Verse]");
-    defer a.free(got);
-    try testing.expectEqualStrings("pop, café ŀ ωmega дом 月光 [verse]", got);
+    // the expected strings are CPython 3.15's own `.lower()` of each input
+    inline for (.{
+        .{ "Pop, CAFÉ Ŀ Ωmega ДОМ 月光 [Verse]", "pop, café ŀ ωmega дом 月光 [verse]" },
+        .{ "ẠNH ＡＢＣ ΟΔΟΣ İstanbul Ǆ Ա Ⅷ ΣΑΣ. Σ", "ạnh ａｂｃ οδος i̇stanbul ǆ ա ⅷ σας. σ" },
+        .{ "ΣΑΣ\u{301} aΣ\u{301}b", "σας\u{301} aσ\u{301}b" },
+        .{ "a\xffΣ", "a\xffσ" },
+    }) |c| {
+        const got = try pyLower(a, c[0]);
+        defer a.free(got);
+        try testing.expectEqualStrings(c[1], got);
+    }
 }
 
 test "heartmula tags: joined the way training wrote them, empties dropped" {
@@ -1281,7 +1344,7 @@ test "heartmula oracle: the prompt ids are byte-exact" {
     defer e.deinit();
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = std.mem.span(std.c.getenv("HEARTMULA_FIXTURES").?);
-    for ([_][]const u8{ "a", "b", "c" }) |k| {
+    for ([_][]const u8{ "a", "b", "c", "d" }) |k| {
         const tn = try std.fmt.allocPrint(a, "tags_{s}.txt", .{k});
         defer a.free(tn);
         const ln = try std.fmt.allocPrint(a, "lyrics_{s}.txt", .{k});
