@@ -78,7 +78,7 @@ if constexpr (LAW) {
                 k = (k ^ (k >> 30)) * 0xBF58476D1CE4E5B9ul;
                 k = (k ^ (k >> 27)) * 0x94D049BB133111EBul;
                 k ^= (k >> 31);
-                const float u = (float(uint(k >> 40)) + 0.5f) * (1.0f / 16777216.0f);
+                const float u = (float(uint(k >> 41)) + 0.5f) * (1.0f / 8388608.0f);
                 const float gval = sc - metal::log(-metal::log(u));
                 if (mi == NONE || msv_ink2_better(gval, v, gm, mi)) {
                     gm = gval;
