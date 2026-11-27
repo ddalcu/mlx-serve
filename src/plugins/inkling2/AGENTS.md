@@ -84,7 +84,7 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
   one-row qmv on this shape too. Affine at every width or dense (`oFormat`); anything else keeps `gated` + `projectRows`.
 - **The draft head** (`mtp.safetensors`): a round drafts 7 tokens, verifies the drafts worth their rows
   (`draftsToVerify`, on the engine's ladder `Forward.round_ms`; never a stop id) as ONE forward that appends nothing
-  (`kernels.Open`), and commits the rows the trunk agrees with (`kernels.commit`): no rollback. State is per slot (`Spec.select`).
+  (`kernels.Open`), and commits the rows the trunk agrees with (`kernels.commitPaths`): no rollback. State is per slot (`Spec.select`).
 - **A `drafter/` folder in the pack serves in place of the bundled head** when `config.readDflash2` runs its config
   (`incoai/Inkling-2-Mini-DFlash2`, `dflash2.zig`, z-lab's MLX model the reference): five sliding layers over the taps, a
   selector chaining top-16 candidates a row, its soft cap AFTER the edge (`after_correction`, the one mode ported).
@@ -97,8 +97,13 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
   banks, the forward's largest read). A chain block never has more than 15 rows: 16 takes the NAX quantized tile lane, 3x slower.
 - **A float32 stream's tree read keeps float matrices** (`relsplit_lanes`, `msv_ink2_el`): in half, one flipped expert pick
   on the fixture moved a node's logits (cosine 0.97) on a GPU without the tensor unit.
+- **A DFlash2 slot's context keys and values are a ring written in place** (`ContextKv.k` `[1, 2 kv, slots, hd]` a layer,
+  position p at slot p % slots, slots doubling to `window - 1`) that `dflash_attn` reads for every lane in one launch: a round
+  writes its fresh rows only, the old handle freed first so MLX donates it (joined and cut back, a lane copied its window twice).
+- **A draft's head rows on NAX go 16 a call through a quantized head** (`headLogits`): past 16 rows MLX leaves its few-row
+  kernel for a tiled one that, at the head's 200K width, costs more than several 16-row calls.
 - **The DFlash2 context is the newest `window - 1` (2047) committed positions** (`Spec.keep`): a row attends a ring key
-  only within `window` of its index, so past 2040 keys the block's later rows lose the oldest (`windowMask`); the
+  only within `window` of its index, so past 2040 keys the block's later rows lose the oldest (`dflash_attn`'s `WINDOW`); the
   parity test runs both sides of it. The engine's own sidecar resolver also sees `drafter/` and declines it by name.
 - **The plugin times nothing and the verify stays lazy** (`verifyRound`): the engine prices rounds
   (`Forward.round_ms`) and its accept evaluates the verify with it, one evaluation a round.
@@ -133,7 +138,7 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 
 - **A verify of several slots is ONE forward** (`openGroup`, `Spec.opens`, `NativeDrafter.verify_group`/`finish_group`): blocks stack
   `rows` a slot (shorter ones padded), the conv kernels read `RPS` rows behind each slot's own state, `attendOpen` reads each
-  slot's own cache, `commitLane` keeps a slot's accepted rows. A slot's rows equal its verify alone (proof test).
+  slot's own cache, `commitLanes` keeps each slot's accepted rows. A slot's rows equal its verify alone (proof test).
 - **Both drafters batch across slots** (`dflash2.draftBatch`, `draft.draftBatchPacked`, `draft.draftBatchSampled`): dense
   work over every lane's rows, attention per lane over its own context; `stepGroupBundled` runs greedy and sampled
   bundled groups in one GPU sync with adaptive width (`bundledGroupRows`) and `markov_fold_batch` sharing one `FOLD` read per 8 lanes.
@@ -171,6 +176,6 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
   `markov_pick_sample`, `oproj`, `router`, `norm`.
 - Contract entries owed (GPU proofs in `proof_test.zig` cover each): `pre`, `prep`, `mid`, `ups`, `downs`, `relattn`,
   `gate`'s prompt arm, `group`, `ups_grp`, `downs_grp`, `few_tail`, `topk_group`, `tile_scan`, `moe_wide`,
-  `markov_fold_q8`, `markov_pick_rnn`, `relsplit_nax`, `relsplit_lanes`, `commit_conv`,
-  `accept_tree`, `sample_tree_draw`/`_mass`/`_search`, `dflash_conv`/`_edges`/`_top16_shard`/`_top16_merge`/`_tree`.
+  `markov_fold_q8`, `markov_pick_rnn`, `relsplit_nax`, `relsplit_lanes`,
+  `accept_tree`, `sample_tree_draw`/`_mass`/`_search`, `dflash_conv`/`_edges`/`_top16_shard`/`_top16_merge`/`_tree`/`_attn`.
 - Not verified: an image against mlx-lm's tower, the drafter's tokens against oMLX's.

@@ -30,6 +30,7 @@ var dflash_conv_kernel: kernels.Kernel = .{ .name = "msv_inkling2_dflash_conv", 
 var dflash_top16_shard_kernel: kernels.Kernel = .{ .name = "msv_inkling2_dflash_top16_shard", .ins = &.{"LOGITS"}, .outs = &.{ "PIDS", "PVALS" }, .source = kernelSource("plugins/inkling2/kernels/dflash_top16_shard.metal") };
 var dflash_top16_merge_kernel: kernels.Kernel = .{ .name = "msv_inkling2_dflash_top16_merge", .ins = &.{ "PIDS", "PVALS" }, .outs = &.{ "IDS", "VALS" }, .source = kernelSource("plugins/inkling2/kernels/dflash_top16_merge.metal") };
 var dflash_edges_kernel: kernels.Kernel = .{ .name = "msv_inkling2_dflash_edges", .ins = &.{ "T1", "CANDS", "UNARY", "PROJ", "PRED", "SUCC", "CAP" }, .outs = &.{"PROBS"}, .source = kernelSource("plugins/inkling2/kernels/dflash_edges.metal") };
+var dflash_attn_kernel: kernels.Kernel = .{ .name = "msv_inkling2_dflash_attn", .ins = &.{ "q", "kb", "vb", "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "LANES", "scale" }, .outs = &.{ "PART", "ML" }, .source = kernelSource("plugins/inkling2/kernels/dflash_attn.metal") };
 var dflash_tree_kernel: kernels.Kernel = .{ .name = "msv_inkling2_dflash_tree", .ins = &.{ "T1", "CANDS", "PROBS", "CALIB", "TEMPS", "SEEDS", "COPY_IDS", "COPY_LEN", "COPY_RATE", "STOPS", "PARAMS" }, .outs = &.{ "TOKENS", "PARENT", "TMETA", "NEXT_Q", "DRAWS", "SCORES" }, .source = kernelSource("plugins/inkling2/kernels/dflash_tree.metal") };
 
 /// One sublayer's grouped dynamic convolution: `base` `[2, kernel, hidden]` (prepare, finish) and the projection of
@@ -152,10 +153,10 @@ pub const Drafter = struct {
     sel: Linear = .{},
     /// The mask token's normed embedding `[1, 1, hidden]`, set by the plugin (`setMask`).
     mask: Array = .{},
-    /// Cached full-window additive mask `[block, window - 1 + block]` in `norm`'s dtype.
-    win_mask: Array = .{},
     /// An 8-bit copy of a dense trunk head, which the block rows are read through (`draft.headCopy`); null = the trunk's.
     head: ?Linear = null,
+    /// Ones `[max_lanes * block * heads * head_dim]` f32, the unit gate `attendKernel` joins its splits under.
+    unit: Array = .{},
 
     /// The draft in `dir` (`config.json` parsed as `cfg`, `model.safetensors`), its projections held as affine `bits`
     /// copies in groups of 64 (0 = as shipped, bf16), its head reading through a copy of `head` when one is given and
@@ -208,7 +209,7 @@ pub const Drafter = struct {
         if (fsh.len != 2 or fsh[0] != @as(c_int, @intCast(hidden)) or fc_in != @as(c_int, @intCast(cfg.tap_count * hidden))) return error.Inkling2DraftGeometry;
         if (ops.shape(d.pred)[1] != @as(c_int, @intCast(cfg.rank)) or ops.shape(d.succ)[1] != @as(c_int, @intCast(cfg.rank))) return error.Inkling2DraftGeometry;
         if (head) |h| d.head = try at.draftHead(h);
-        if (cfg.window > 1) d.win_mask = try at.keep(try d.windowMask(&g, @intCast(cfg.window - 1), @intCast(cfg.block)));
+        d.unit = try at.keep(try g.ones(&.{@intCast(max_lanes * cfg.block * cfg.heads * cfg.head_dim)}, .float32));
         return d;
     }
 
@@ -217,6 +218,24 @@ pub const Drafter = struct {
     fn headFor(d: *const Drafter, trunk: *const Linear, rows: c_int) *const Linear {
         const own = if (d.head) |*h| h else return trunk;
         return if (rows > dense_head_rows and device.naxAvailable()) trunk else own;
+    }
+
+    /// `rows` `[B, r, hidden]` through `head`, `[B, r, out]`: on the tensor unit a quantized head reads at most
+    /// `head_rows` rows a call, MLX's few-row kernel (past it the tiled one, at the head's width, cost several times one
+    /// call). Other GPUs keep one call: their few-row kernels' reach is unmeasured.
+    fn headLogits(g: *Graph, head: *const Linear, rows: Array) !Array {
+        const sh = ops.shape(rows);
+        const total = sh[0] * sh[1];
+        if (head.s.ctx == null or total <= head_rows or !device.naxAvailable()) return project(g, head, rows);
+        const flat = try g.reshape(rows, &.{ 1, total, sh[2] });
+        var parts: [max_lanes * abi_max_round]Array = undefined;
+        var n: usize = 0;
+        var at: c_int = 0;
+        while (at < total) : (at += head_rows) {
+            parts[n] = try project(g, head, try g.sliceAxis(flat, 1, at, @min(total, at + head_rows)));
+            n += 1;
+        }
+        return g.reshape(try g.concat(parts[0..n], 1), &.{ sh[0], sh[1], -1 });
     }
 
     fn release(d: *Drafter) void {
@@ -322,84 +341,111 @@ pub const Drafter = struct {
     }
 
     /// `blockRows` for several lanes at once: `noise` `[N, block, hidden]`, lane `j`'s block its row `j`. The layers' dense
-    /// work (projections, convolutions, MLP) runs over all the lanes' rows; each lane's attention reads its own context.
+    /// work (projections, convolutions, MLP, the context rows' keys and values) runs over all the lanes' rows; each lane's
+    /// attention reads its own ring.
     pub fn blockRowsBatch(d: *const Drafter, g: *Graph, noise: Array, lanes: []const BlockLane) !Array {
         const cfg = &d.cfg;
         const block = ops.shape(noise)[1];
         const count = lanes.len;
-        if (count == 0 or count > max_lanes or ops.shape(noise)[0] != @as(c_int, @intCast(count))) return error.Inkling2DraftRound;
+        if (count == 0 or count > max_lanes or ops.shape(noise)[0] != @as(c_int, @intCast(count)) or block != @as(c_int, @intCast(cfg.block))) return error.Inkling2DraftRound;
         const dt = ops.dtype(d.norm);
-        const mask_all: ?Array = if (cfg.window > 1) d.win_mask else null;
-        // Per lane: the rows its cache lacks (those committed since its end, when it still reaches back to the ring's
-        // first), their normed projection from the taps, and the mask over its ring and the block.
+        const keep: c_int = @intCast(cfg.window - 1);
+        const kvh: c_int = @intCast(cfg.kv_heads);
+        const hd: c_int = @intCast(cfg.head_dim);
+        // Per lane: its ring (a temporary one without a cache), the context rows it reads and the rows its ring lacks
+        // (those committed since its end, while it holds the rest of the window).
+        var own: [max_lanes]bundled.ContextKv = @splat(.{});
+        defer for (own[0..count]) |*c| c.release();
+        var ring: [max_lanes]*bundled.ContextKv = undefined;
+        var held: [max_lanes]c_int = undefined;
         var fresh: [max_lanes]c_int = undefined;
-        var ctx: [max_lanes]Array = undefined;
-        var masks: [max_lanes]ops.Mask = undefined;
-        var rope_at: [max_lanes]i32 = undefined;
+        var positions: [max_lanes]c_int = undefined;
+        // Every lane's newest `block` taps (the first repeated in front while it has fewer) go through `fc` and each
+        // layer's `kv` together, its fresh rows the last of them: a lane's rows depend on the batch's width, never on
+        // its neighbours'. A lane that rebuilds its ring projects its own (`srcs[1..]`); `group[j]` is lane j's
+        // projection and `first[j]` its first fresh row there.
+        var srcs: [max_lanes + 1]Array = undefined;
+        var src_pos: [max_lanes + 1]Array = undefined;
+        var n_srcs: usize = 1;
+        var group: [max_lanes]usize = @splat(0);
+        var first: [max_lanes]c_int = @splat(0);
+        var newest: [max_lanes]Array = undefined;
+        var newest_pos: [max_lanes * abi_max_round]i32 = undefined;
         for (lanes, 0..) |lane, j| {
-            const n = ops.shape(lane.taps)[1];
+            const all = ops.shape(lane.taps)[1];
+            // Rows older than the newest `window - 1` are out of every block row's reach.
+            const n = @min(all, keep);
             if (n == 0) return error.Inkling2DraftRound;
-            const at: u64 = @intCast(lane.position);
+            const at = lane.position;
+            const end: u64 = @intCast(at);
+            const cc = lane.cache orelse &own[j];
+            ring[j] = cc;
+            held[j] = n;
+            positions[j] = at;
             fresh[j] = n;
-            if (lane.cache) |cc| if (cc.k[0].ctx != null and cc.end <= at and at - cc.end <= @as(u64, @intCast(n))) {
-                const since: c_int = @intCast(at - cc.end);
-                if (since + ops.shape(cc.k[0])[2] >= n) fresh[j] = since;
-            };
-            ctx[j] = if (fresh[j] > 0) try g.rmsNorm(try project(g, &d.fc, try g.sliceAxis(lane.taps, 1, n - fresh[j], n)), d.hidden_norm, cfg.eps) else Array{};
-            // The newest `window - 1` context rows are the ring; a query row j reads ring row i only within `window`.
-            masks[j] = if (n + block > @as(c_int, @intCast(cfg.window)))
-                .{ .array = if (mask_all != null and n == @as(c_int, @intCast(cfg.window - 1)) and block == @as(c_int, @intCast(cfg.block))) mask_all.? else try d.windowMask(g, n, block) }
-            else
-                .none;
-            rope_at[j] = lane.position;
+            const whole = cc.k[0].ctx != null and ops.shape(cc.k[0])[1] == 2 * kvh and ops.shape(cc.k[0])[2] == ringSlots(n, keep);
+            if (whole and cc.end <= end and end - cc.end <= @as(u64, @intCast(n)) and @as(c_int, @intCast(end - cc.end)) + cc.rows >= n) fresh[j] = @intCast(end - cc.end);
+            const f = fresh[j];
+            const tail = try g.sliceAxis(lane.taps, 1, all - @min(all, block), all);
+            newest[j] = if (all >= block) tail else try g.concat(&.{ try g.broadcast(try g.sliceAxis(tail, 1, 0, 1), &.{ 1, block - all, ops.shape(tail)[2] }), tail }, 1);
+            for (newest_pos[j * @as(usize, @intCast(block)) ..][0..@intCast(block)], 0..) |*p, r| p.* = at - block + @as(c_int, @intCast(r));
+            first[j] = @as(c_int, @intCast(j)) * block + block - f;
+            if (f > block) {
+                const pos = try gpa.alloc(i32, @intCast(f));
+                defer gpa.free(pos);
+                for (pos, 0..) |*p, r| p.* = at - f + @as(c_int, @intCast(r));
+                group[j] = n_srcs;
+                first[j] = 0;
+                srcs[n_srcs] = try g.sliceAxis(lane.taps, 1, all - f, all);
+                src_pos[n_srcs] = try g.fromSlice(i32, pos, &.{f});
+                n_srcs += 1;
+            }
         }
-        const rope: Rope = if (count == 1) .{ .at = lanes[0].position } else .{ .each = try g.fromSlice(i32, rope_at[0..count], &.{@intCast(count)}) };
-        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
-        const back = [_]c_int{ 0, 2, 1, 3 };
+        srcs[0] = if (count == 1) newest[0] else try g.concat(newest[0..count], 1);
+        src_pos[0] = try g.fromSlice(i32, newest_pos[0 .. count * @as(usize, @intCast(block))], &.{@as(c_int, @intCast(count)) * block});
+        var ctx: [max_lanes + 1]Array = undefined;
+        for (srcs[0..n_srcs], ctx[0..n_srcs]) |x, *c| c.* = try g.rmsNorm(try project(g, &d.fc, x), d.hidden_norm, cfg.eps);
+        const rope: Rope = if (count == 1) .{ .at = lanes[0].position } else .{ .each = try g.fromSlice(i32, positions[0..count], &.{@intCast(count)}) };
+        // A row-per-batch `[rows, heads, 1, hd]` as heads `[1, heads, rows, hd]`.
+        const as_heads = [_]c_int{ 2, 1, 0, 3 };
         const q_dim: c_int = @intCast(cfg.heads * cfg.head_dim);
-        const kv_dim: c_int = @intCast(cfg.kv_heads * cfg.head_dim);
+        const kv_dim = kvh * hd;
         const inter_dim: c_int = ops.shape(d.layers[0].gate.w)[0];
+        const attn = try d.plan(g, dt, positions[0..count], held[0..count]);
         var h = try g.astype(noise, dt);
         for (d.layers, 0..) |*L, i| {
             var lg = g.scope();
             defer lg.deinit();
-            var kc: [max_lanes]Array = undefined;
-            var vc: [max_lanes]Array = undefined;
-            for (lanes, 0..) |lane, j| {
-                const n = ops.shape(lane.taps)[1];
-                if (fresh[j] > 0) {
-                    if (L.kv.w.ctx != null) {
-                        const kv_c = try project(&lg, &L.kv, ctx[j]);
-                        kc[j] = try d.heads(&lg, try lg.sliceAxis(kv_c, 2, 0, kv_dim), cfg.kv_heads, L.k_norm, .{ .at = lane.position - fresh[j] });
-                        vc[j] = try d.heads(&lg, try lg.sliceAxis(kv_c, 2, kv_dim, 2 * kv_dim), cfg.kv_heads, null, .none);
-                    } else {
-                        kc[j] = try d.heads(&lg, try project(&lg, &L.k, ctx[j]), cfg.kv_heads, L.k_norm, .{ .at = lane.position - fresh[j] });
-                        vc[j] = try d.heads(&lg, try project(&lg, &L.v, ctx[j]), cfg.kv_heads, null, .none);
-                    }
+            // The fresh rows' keys, normed and rotated each at its position, then their values, as heads `[1, 2 kv_heads,
+            // rows, hd]`, written into their lanes' rings: in place, the old handle freed before the write runs.
+            var ckv: [max_lanes + 1]Array = undefined;
+            for (ctx[0..n_srcs], src_pos[0..n_srcs], 0..) |c, pos, s| {
+                const rows = ops.shape(c)[1];
+                var k_raw: Array = undefined;
+                var v_raw: Array = undefined;
+                if (L.kv.w.ctx != null) {
+                    const kv_c = try project(&lg, &L.kv, c);
+                    k_raw = try lg.sliceAxis(kv_c, 2, 0, kv_dim);
+                    v_raw = try lg.sliceAxis(kv_c, 2, kv_dim, 2 * kv_dim);
+                } else {
+                    k_raw = try project(&lg, &L.k, c);
+                    v_raw = try project(&lg, &L.v, c);
                 }
-                if (fresh[j] < n) {
-                    const cc = lane.cache.?;
-                    if (fresh[j] > 0) {
-                        kc[j] = try lg.concat(&.{ cc.k[i], kc[j] }, 2);
-                        vc[j] = try lg.concat(&.{ cc.v[i], vc[j] }, 2);
-                    } else {
-                        kc[j] = cc.k[i];
-                        vc[j] = cc.v[i];
-                    }
-                    const total = ops.shape(kc[j])[2];
-                    kc[j] = try lg.sliceAxis(kc[j], 2, total - n, total);
-                    vc[j] = try lg.sliceAxis(vc[j], 2, total - n, total);
-                }
-                if (lane.cache) |cc| {
-                    const k_held = lg.escape(kc[j]);
-                    const v_held = lg.escape(vc[j]);
+                const k_rows = try lg.ropeEach(try lg.rmsNorm(try lg.reshape(k_raw, &.{ rows, kvh, 1, hd }), L.k_norm, cfg.eps), hd, cfg.theta, pos);
+                ckv[s] = try lg.transpose(try lg.concat(&.{ k_rows, try lg.reshape(v_raw, &.{ rows, kvh, 1, hd }) }, 1), &as_heads);
+            }
+            var rings: [max_lanes]Array = undefined;
+            for (0..count) |j| {
+                const cc = ring[j];
+                const f = fresh[j];
+                const slots = ringSlots(held[j], keep);
+                if (f > 0) {
+                    const base = if (cc.k[i].ctx != null and ops.shape(cc.k[i])[1] == 2 * kvh and ops.shape(cc.k[i])[2] == slots) cc.k[i] else try lg.zeros(&.{ 1, 2 * kvh, slots, hd }, dt);
+                    const next = lg.escape(try ringWrite(&lg, base, try lg.sliceAxis(ckv[group[j]], 2, first[j], first[j] + f), @mod(positions[j] - f, slots)));
                     if (cc.k[i].ctx != null) _ = mlx.mlx_array_free(cc.k[i]);
-                    if (cc.v[i].ctx != null) _ = mlx.mlx_array_free(cc.v[i]);
-                    cc.k[i] = k_held;
-                    cc.v[i] = v_held;
-                    kc[j] = k_held;
-                    vc[j] = v_held;
+                    cc.k[i] = next;
                 }
+                rings[j] = cc.k[i];
             }
             const x = try lg.rmsNorm(h, L.in_norm, cfg.eps);
             const prep = try d.prepare(&lg, &L.attn, x);
@@ -416,16 +462,7 @@ pub const Drafter = struct {
                 kb = try d.heads(&lg, try project(&lg, &L.k, prep.out), cfg.kv_heads, L.k_norm, rope);
                 vb = try d.heads(&lg, try project(&lg, &L.v, prep.out), cfg.kv_heads, null, .none);
             }
-            var reads: [max_lanes]Array = undefined;
-            for (0..count) |j| {
-                const at: c_int = @intCast(j);
-                const solo = count == 1;
-                const keys = try lg.concat(&.{ kc[j], if (solo) kb else try lg.sliceAxis(kb, 0, at, at + 1) }, 2);
-                const values = try lg.concat(&.{ vc[j], if (solo) vb else try lg.sliceAxis(vb, 0, at, at + 1) }, 2);
-                reads[j] = try lg.sdpa(if (solo) q else try lg.sliceAxis(q, 0, at, at + 1), keys, values, scale, masks[j]);
-            }
-            const attn = if (count == 1) reads[0] else try lg.concat(reads[0..count], 0);
-            const read = try lg.reshape(try lg.transpose(attn, &back), &.{ @intCast(count), block, -1 });
+            const read = try d.attend(&lg, q, kb, vb, rings[0..count], &attn);
             const mid = try d.finishAdd(&lg, &L.attn, try project(&lg, &L.o, read), prep.kernel, h);
             const y = try lg.rmsNorm(mid, L.post_norm, cfg.eps);
             const prep2 = try d.prepare(&lg, &L.mlp, y);
@@ -436,22 +473,106 @@ pub const Drafter = struct {
             const mlp = try project(&lg, &L.down, act);
             h = try g.keep(try d.finishAdd(&lg, &L.mlp, mlp, prep2.kernel, mid));
         }
+        for (ring[0..count], held[0..count]) |cc, n| cc.rows = n;
         return g.rmsNorm(h, d.norm, cfg.eps);
     }
 
-    /// Which of the `n + block` keys a block row reads: every block key, and a ring key within `window` of the row's
-    /// index (the reference counts the ring rows before the block's, so row j reads ring row i while `n + j - i <
-    /// window`), as `[block, n + block]` additive in the stream's dtype.
-    fn windowMask(d: *const Drafter, g: *Graph, n: c_int, block: c_int) !Array {
-        const total: usize = @intCast(n + block);
-        const bits = try gpa.alloc(f32, @as(usize, @intCast(block)) * total);
-        defer gpa.free(bits);
-        for (0..@intCast(block)) |j| for (0..total) |i| {
-            const ring = i < @as(usize, @intCast(n));
-            const visible = !ring or @as(usize, @intCast(n)) + j - i < d.cfg.window;
-            bits[j * total + i] = if (visible) 0 else -std.math.inf(f32);
-        };
-        return g.astype(try g.fromSlice(f32, bits, &.{ block, @intCast(total) }), ops.dtype(d.norm));
+    /// The block rows `q` `[N, heads, block, hd]` of N lanes, each over its ring (`rings[j]` `[1, 2 kv_heads, slots, hd]`,
+    /// keys then values, position p at slot p % slots; the `ns[j]` positions before `positions[j]` its context, which
+    /// row r reads only within `window` of `positions[j] + r`) and its block's own keys and values `kb`, `vb` `[N,
+    /// kv_heads, block, hd]`: `[N, block, heads * hd]`. One `dflash_attn` launch on the GPU, else per lane MLX's
+    /// attention over the ring and the block under a mask.
+    fn attend(d: *const Drafter, g: *Graph, q: Array, kb: Array, vb: Array, rings: []const Array, p: *const Plan) !Array {
+        if (p.splits > 0) return d.attendKernel(g, q, kb, vb, rings, p);
+        return d.attendChain(g, q, kb, vb, rings, p.positions, p.ns);
+    }
+
+    /// A round's draft attention besides each layer's arrays: each lane's position and context rows and, where
+    /// `dflash_attn` runs, its launch's (position, n, ring slots, keys a split) a lane, splits, scale and the unit gate
+    /// `relcomb` joins the splits under.
+    const Plan = struct { positions: []const c_int, ns: []const c_int, meta: Array = .{}, splits: c_int = 0, scale: Array = .{}, unit: Array = .{} };
+
+    fn plan(d: *const Drafter, g: *Graph, dt: ops.Dtype, positions: []const c_int, ns: []const c_int) !Plan {
+        var p: Plan = .{ .positions = positions, .ns = ns };
+        const c = &d.cfg;
+        if (!(mlx.streamIsGpu(g.s) and kernels.enabled() and (dt == .bfloat16 or dt == .float16 or dt == .float32) and
+            c.block <= 8 and c.head_dim % 8 == 0 and c.heads % c.kv_heads == 0 and c.heads / c.kv_heads <= 8)) return p;
+        const block: c_int = @intCast(c.block);
+        const hkv: c_int = @intCast(c.kv_heads);
+        const nl: c_int = @intCast(ns.len);
+        var meta: [4 * max_lanes]i32 = undefined;
+        p.splits = 1;
+        // A lane's keys a split: enough splits that the launch fills the GPU, whole 16-key tiles, at least
+        // `attn_keys`; its own keys and the lane count set them, so its rows do not move with its neighbours'.
+        const want = @divTrunc(attn_groups + nl * hkv - 1, nl * hkv);
+        for (positions, ns, 0..) |at, n, j| {
+            const keys = n + block;
+            const kps = @max(attn_keys, @divTrunc(@divTrunc(keys + want - 1, want) + 15, 16) * 16);
+            meta[4 * j ..][0..4].* = .{ at, n, ringSlots(n, @intCast(c.window - 1)), kps };
+            p.splits = @max(p.splits, @divTrunc(keys + kps - 1, kps));
+        }
+        p.meta = try g.fromSlice(i32, meta[0..@intCast(4 * nl)], &.{ nl, 4 });
+        p.scale = try g.scalar(1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim))), .float32);
+        p.unit = try g.sliceAxis(d.unit, 0, 0, nl * block * @as(c_int, @intCast(c.heads * c.head_dim)));
+        return p;
+    }
+
+    fn attendKernel(d: *const Drafter, g: *Graph, q: Array, kb: Array, vb: Array, rings: []const Array, p: *const Plan) !Array {
+        const c = &d.cfg;
+        const block: c_int = @intCast(c.block);
+        const hd: c_int = @intCast(c.head_dim);
+        const hq: c_int = @intCast(c.heads);
+        const hkv: c_int = @intCast(c.kv_heads);
+        const nl: c_int = @intCast(rings.len);
+        var inputs: [5 + max_lanes]Array = undefined;
+        inputs[0] = q;
+        inputs[1] = kb;
+        inputs[2] = vb;
+        // Every lane input is bound; past the lanes they repeat the first, unread.
+        for (inputs[3..][0..max_lanes], 0..) |*x, j| x.* = rings[if (j < rings.len) j else 0];
+        inputs[3 + max_lanes] = p.meta;
+        inputs[4 + max_lanes] = p.scale;
+        const rows = nl * block * hq;
+        const part = try kernels.launchGrid(g, &dflash_attn_kernel, &inputs, 2, .{
+            .{ .shape = &.{ p.splits, rows, hd }, .dtype = .float32 },
+            .{ .shape = &.{ p.splits, rows, 2 }, .dtype = .float32 },
+        }, .{ p.splits * 32 * @divExact(hq, hkv), hkv, nl }, .{ 32 * @divExact(hq, hkv), 1, 1 }, &.{
+            .{ "T", .{ .dtype = ops.dtype(q) } }, .{ "D", .{ .int = hd } },     .{ "HQ", .{ .int = hq } },
+            .{ "HKV", .{ .int = hkv } },          .{ "B", .{ .int = block } }, .{ "WINDOW", .{ .int = @intCast(c.window) } },
+        });
+        return g.reshape(try kernels.splitJoin(g, part, p.unit, nl * block, ops.dtype(q)), &.{ nl, block, hq * hd });
+    }
+
+    fn attendChain(d: *const Drafter, g: *Graph, q: Array, kb: Array, vb: Array, rings: []const Array, positions: []const c_int, ns: []const c_int) !Array {
+        const c = &d.cfg;
+        const block: c_int = @intCast(c.block);
+        const keep: c_int = @intCast(c.window - 1);
+        const hkv: c_int = @intCast(c.kv_heads);
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim)));
+        const count = rings.len;
+        var reads: [max_lanes]Array = undefined;
+        for (0..count) |j| {
+            const at: c_int = @intCast(j);
+            const solo = count == 1;
+            const slots = ops.shape(rings[j])[2];
+            const total: usize = @intCast(slots + block);
+            const bits = try gpa.alloc(bool, @as(usize, @intCast(block)) * total);
+            defer gpa.free(bits);
+            // Slot s holds the position `slots - rank` before `positions[j]`; row r reads ranks from
+            // max(slots - n, slots - keep + r), and every block key.
+            for (0..@intCast(block)) |r| {
+                const from = @max(slots - ns[j], slots - keep + @as(c_int, @intCast(r)));
+                for (bits[r * total ..][0..total], 0..) |*b, s| b.* = s >= @as(usize, @intCast(slots)) or @mod(@as(c_int, @intCast(s)) - positions[j], slots) >= from;
+            }
+            const kb_j = if (solo) kb else try g.sliceAxis(kb, 0, at, at + 1);
+            const vb_j = if (solo) vb else try g.sliceAxis(vb, 0, at, at + 1);
+            const keys = try g.concat(&.{ try g.sliceAxis(rings[j], 1, 0, hkv), kb_j }, 2);
+            const values = try g.concat(&.{ try g.sliceAxis(rings[j], 1, hkv, 2 * hkv), vb_j }, 2);
+            const mask = try g.fromSlice(bool, bits, &.{ 1, 1, block, @intCast(total) });
+            reads[j] = try g.sdpa(if (solo) q else try g.sliceAxis(q, 0, at, at + 1), keys, values, scale, .{ .array = mask });
+        }
+        const attn = if (count == 1) reads[0] else try g.concat(reads[0..count], 0);
+        return g.reshape(try g.transpose(attn, &.{ 0, 2, 1, 3 }), &.{ @intCast(count), block, -1 });
     }
 
     /// Top-k candidates `[B, r, k]` i32 and their raw logits `[B, r, k]` f32 from `raw` `[B, r, >= vocab]`.
@@ -573,6 +694,14 @@ pub const Drafter = struct {
         };
     }
 
+    /// The blocks of `anchors` (each `[1, 1, hidden]`, a committed token's normed embedding): `[N, block, hidden]`, each
+    /// anchor's row then the mask token's.
+    fn blockNoise(d: *const Drafter, g: *Graph, anchors: []const Array) !Array {
+        const first = try g.astype(if (anchors.len == 1) anchors[0] else try g.concat(anchors, 0), ops.dtype(d.norm));
+        const masks = try g.broadcast(d.mask, &.{ @intCast(anchors.len), @as(c_int, @intCast(d.cfg.block)) - 1, @intCast(d.hidden) });
+        return g.concat(&.{ first, masks }, 1);
+    }
+
     /// One lane of a batched draft: the committed token `t1` (`[1]` int32) and its normed embedding `anchor` `[1, 1, hidden]`,
     /// the lane's trunk taps and context (`BlockLane`), and the drafts it asks for (`steps`, at most `block - 1`).
     pub const DraftLane = struct { t1: Array, anchor: Array, taps: Array, position: c_int, cache: ?*bundled.ContextKv, steps: u32 };
@@ -583,22 +712,22 @@ pub const Drafter = struct {
     pub fn draftBatch(d: *const Drafter, g: *Graph, lanes: []const DraftLane, draws: ?Draws, head: *const Linear, vocab: c_int, out: []bundled.Drafter.Block) !void {
         const block: c_int = @intCast(d.cfg.block);
         const count = lanes.len;
-        var noise: [max_lanes]Array = undefined;
+        var anchors: [max_lanes]Array = undefined;
         var lane_in: [max_lanes]BlockLane = undefined;
         var t1s: [max_lanes]Array = undefined;
         var most: c_int = 1;
         for (lanes, 0..) |lane, j| {
-            noise[j] = try g.concat(&.{ try g.astype(lane.anchor, ops.dtype(d.norm)), try g.broadcast(d.mask, &.{ 1, block - 1, @intCast(d.hidden) }) }, 1);
+            anchors[j] = lane.anchor;
             lane_in[j] = .{ .taps = lane.taps, .position = lane.position, .cache = lane.cache };
             t1s[j] = lane.t1;
             most = @max(most, @min(block - 1, @as(c_int, @intCast(lane.steps))));
         }
-        const rows_all = try d.blockRowsBatch(g, if (count == 1) noise[0] else try g.concat(noise[0..count], 0), lane_in[0..count]);
+        const rows_all = try d.blockRowsBatch(g, try d.blockNoise(g, anchors[0..count]), lane_in[0..count]);
         for (lanes) |lane| if (lane.cache) |cc| {
             cc.end = @intCast(lane.position);
         };
         const rows = try g.sliceAxis(rows_all, 1, 1, 1 + most);
-        const b = try d.pickBatch(g, if (count == 1) t1s[0] else try g.concat(t1s[0..count], 0), rows, try project(g, d.headFor(head, ops.shape(rows)[0] * ops.shape(rows)[1]), rows), vocab, draws);
+        const b = try d.pickBatch(g, if (count == 1) t1s[0] else try g.concat(t1s[0..count], 0), rows, try headLogits(g, d.headFor(head, ops.shape(rows)[0] * ops.shape(rows)[1]), rows), vocab, draws);
         for (lanes, out[0..count], 0..) |lane, *o, j| {
             const at: c_int = @intCast(j);
             const steps: c_int = @min(block - 1, @as(c_int, @intCast(lane.steps)));
@@ -762,30 +891,54 @@ pub const Drafter = struct {
         const block: c_int = @intCast(d.cfg.block);
         const count = lanes.len;
         if (count == 0 or count > max_lanes) return error.Inkling2DraftRound;
-        var noise: [max_lanes]Array = undefined;
+        var anchors: [max_lanes]Array = undefined;
         var lane_in: [max_lanes]BlockLane = undefined;
         for (lanes, 0..) |lane, j| {
-            noise[j] = try g.concat(&.{ try g.astype(lane.anchor, ops.dtype(d.norm)), try g.broadcast(d.mask, &.{ 1, block - 1, @intCast(d.hidden) }) }, 1);
+            anchors[j] = lane.anchor;
             lane_in[j] = .{ .taps = lane.taps, .position = lane.position, .cache = lane.cache };
         }
-        const rows_all = try d.blockRowsBatch(g, if (count == 1) noise[0] else try g.concat(noise[0..count], 0), lane_in[0..count]);
+        const noise = try d.blockNoise(g, anchors[0..count]);
+        const rows_all = try d.blockRowsBatch(g, noise, lane_in[0..count]);
         for (lanes) |lane| if (lane.cache) |cc| {
             cc.end = @intCast(lane.position);
         };
         const r: c_int = @min(block - 1, @max(@as(c_int, 1), w - 1));
         const rows = try g.sliceAxis(rows_all, 1, 1, 1 + r);
-        const logits = try project(g, d.headFor(head, @as(c_int, @intCast(count)) * r), rows);
+        const logits = try headLogits(g, d.headFor(head, @as(c_int, @intCast(count)) * r), rows);
         return d.buildTreeFromLogits(g, lanes, rows, logits, vocab, w, max_children, stops);
     }
 };
 
 const abi_max_round = @import("../../abi/plugin.zig").max_round_tokens;
 
+
+/// The slots of a ring that holds `n` context rows, at most `keep`: a power of two from 128 up, so a short context holds
+/// little, and the ring is rebuilt the few times it grows.
+fn ringSlots(n: c_int, keep: c_int) c_int {
+    return @min(keep, std.math.ceilPowerOfTwoAssert(u32, @intCast(@max(n, 128))));
+}
+
+/// `rows` `[1, heads, m, hd]` written into the ring `buf` `[1, heads, slots, hd]` from slot `start` on, wrapping.
+fn ringWrite(g: *Graph, buf: Array, rows: Array, start: c_int) !Array {
+    const sh = ops.shape(buf);
+    const m = ops.shape(rows)[2];
+    const head = @min(m, sh[2] - start);
+    var out = try g.sliceUpdate(buf, if (head == m) rows else try g.sliceAxis(rows, 2, 0, head), &.{ 0, 0, start, 0 }, &.{ sh[0], sh[1], start + head, sh[3] });
+    if (head < m) out = try g.sliceUpdate(out, try g.sliceAxis(rows, 2, head, m), &.{ 0, 0, 0, 0 }, &.{ sh[0], sh[1], m - head, sh[3] });
+    return out;
+}
+
 /// The lanes one batched pass of the drafter carries.
 pub const max_lanes = 16;
 
+/// The threadgroups a `dflash_attn` launch aims for, and its fewest keys a split.
+const attn_groups = 512;
+const attn_keys = 32;
+
 /// The block rows past which a draft reads the trunk's dense head (`Drafter.headFor`).
 pub const dense_head_rows = 16;
+/// The rows one call through a quantized head takes (`Drafter.headLogits`).
+const head_rows = 16;
 
 // ── tests ──
 
@@ -810,6 +963,158 @@ fn host(g: *Graph, x: Array) ![]const f32 {
     try ops.eval(f);
     const data = mlx.mlx_array_data_float32(f) orelse return error.NoData;
     return data[0..mlx.mlx_array_size(f)];
+}
+
+/// A drafter of `layers` random f32 layers (hidden 32, 2 heads of 16 over one KV head, block 4) on `g`'s stream; layer 0
+/// runs the joined projections, the others the separate ones.
+fn tinyDrafter(g: *Graph, layers: []Layer, window: u32, seed: u64) !Drafter {
+    const H = 32;
+    const hd = 16;
+    const inter = 32;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    const rand = struct {
+        fn make(gr: *Graph, r: std.Random, sh: []const c_int, sc: f32) !Array {
+            var n: usize = 1;
+            for (sh) |x| n *= @intCast(x);
+            const buf = try gpa.alloc(f32, n);
+            defer gpa.free(buf);
+            for (buf) |*x| x.* = r.floatNorm(f32) * sc;
+            return gr.fromSlice(f32, buf, sh);
+        }
+    }.make;
+    var d: Drafter = .{
+        .cfg = .{ .layers = @intCast(layers.len), .heads = 2, .kv_heads = 1, .head_dim = hd, .intermediate = inter, .window = window, .block = 4, .mask_id = 0, .tap_count = 2, .conv_kernel = 2, .conv_group = 8, .rank = 4, .top_k = 4, .softcap = 30 },
+        .hidden = H,
+        .s = g.s,
+        .layers = layers,
+    };
+    const lin = struct {
+        fn make(gr: *Graph, r: std.Random, out: c_int, in: c_int) !Linear {
+            return .{ .w = try rand(gr, r, &.{ out, in }, 1.0 / @sqrt(@as(f32, @floatFromInt(in)))) };
+        }
+    }.make;
+    for (layers, 0..) |*L, i| {
+        L.* = .{
+            .in_norm = try rand(g, rng, &.{H}, 0.1),
+            .post_norm = try rand(g, rng, &.{H}, 0.1),
+            .q_norm = try rand(g, rng, &.{hd}, 0.1),
+            .k_norm = try rand(g, rng, &.{hd}, 0.1),
+            .q = try lin(g, rng, 2 * hd, H),
+            .k = try lin(g, rng, hd, H),
+            .v = try lin(g, rng, hd, H),
+            .o = try lin(g, rng, H, 2 * hd),
+            .gate = try lin(g, rng, inter, H),
+            .up = try lin(g, rng, inter, H),
+            .down = try lin(g, rng, H, inter),
+            .attn = .{ .base = try rand(g, rng, &.{ 2, 2, H }, 0.3), .proj = try lin(g, rng, 2 * 2 * 4, H) },
+            .mlp = .{ .base = try rand(g, rng, &.{ 2, 2, H }, 0.3), .proj = try lin(g, rng, 2 * 2 * 4, H) },
+        };
+        for ([_]*Array{ &L.in_norm, &L.post_norm, &L.q_norm, &L.k_norm }) |x| x.* = try g.addScalar(x.*, 1);
+        if (i == 0) {
+            L.kv = .{ .w = try g.concat(&.{ L.k.w, L.v.w }, 0) };
+            L.qkv = .{ .w = try g.concat(&.{ L.q.w, L.k.w, L.v.w }, 0) };
+            L.gate_up = .{ .w = try g.concat(&.{ L.gate.w, L.up.w }, 0) };
+        }
+    }
+    d.fc = try lin(g, rng, H, 2 * H);
+    d.hidden_norm = try g.addScalar(try rand(g, rng, &.{H}, 0.1), 1);
+    d.norm = try g.addScalar(try rand(g, rng, &.{H}, 0.1), 1);
+    return d;
+}
+
+// Bar: a lane's context ring carried over rounds (growing through its sizes to the window, sliding past it, wrapping
+// its slots, rebuilt after a jump) drafts what a fresh projection of the same taps does, and is written in place.
+test "inkling2 dflash2: a carried context ring is written in place and drafts what a fresh one does" {
+    const s = cpu();
+    defer _ = mlx.mlx_stream_free(s);
+    var g0 = Graph.init(testing.allocator, s);
+    defer g0.deinit();
+    var layers: [2]Layer = undefined;
+    const d = try tinyDrafter(&g0, &layers, 300, 41);
+    var prng = std.Random.DefaultPrng.init(42);
+    const T = 420;
+    const all_host = try testing.allocator.alloc(f32, T * 64);
+    defer testing.allocator.free(all_host);
+    for (all_host) |*x| x.* = prng.random().floatNorm(f32);
+    const all = try g0.fromSlice(f32, all_host, &.{ 1, T, 64 });
+    const noise_host = try testing.allocator.alloc(f32, 4 * 32);
+    defer testing.allocator.free(noise_host);
+    for (noise_host) |*x| x.* = prng.random().floatNorm(f32);
+    const noise = try g0.fromSlice(f32, noise_host, &.{ 1, 4, 32 });
+    // (position, ring rows): growing a few rows a round and by a long run, through 128 and 256 slots to the window's
+    // 299, sliding and wrapping, a jump past the ring onto a short one, regrowing.
+    const rounds = [_][2]c_int{ .{ 5, 5 }, .{ 8, 8 }, .{ 120, 120 }, .{ 127, 127 }, .{ 130, 130 }, .{ 255, 255 }, .{ 258, 258 }, .{ 300, 299 }, .{ 303, 299 }, .{ 307, 299 }, .{ 350, 299 }, .{ 400, 6 }, .{ 403, 9 } };
+    var carried: bundled.ContextKv = .{};
+    defer carried.release();
+    var where: usize = 0;
+    var slots: c_int = 0;
+    for (rounds) |rd| {
+        var g = Graph.init(testing.allocator, s);
+        defer g.deinit();
+        const ring = try g.sliceAxis(all, 1, rd[0] - rd[1], rd[0]);
+        const got = try d.blockRows(&g, noise, ring, rd[0], &carried);
+        carried.end = @intCast(rd[0]);
+        const want = try d.blockRows(&g, noise, ring, rd[0], null);
+        const x = try host(&g, got);
+        const y = try host(&g, want);
+        for (x, y) |u, v| try testing.expectApproxEqAbs(v, u, 1e-4 * @max(1, @abs(v)));
+        const at = @intFromPtr(mlx.mlx_array_data_float32(carried.k[0]).?);
+        if (ops.shape(carried.k[0])[2] == slots) try testing.expectEqual(where, at);
+        where = at;
+        slots = ops.shape(carried.k[0])[2];
+    }
+}
+
+// Bar: on the GPU the draft attention kernel (`dflash_attn`, joined by `relcomb`) reads each lane's ring and its block's
+// keys as the op chain does (MLX's attention under the ring mask): full and short rings of their own sizes, wrapped
+// slots, several splits, 1 to 10 lanes, in bf16, f16 and f32.
+test "inkling2 dflash2: the draft attention kernel reads each lane's ring as the op chain does" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xd2a7);
+    const rng = prng.random();
+    const H = 8;
+    const KV = 2;
+    const HD = 128;
+    const B = 8;
+    const W = 600;
+    const keep = W - 1;
+    var d: Drafter = .{
+        .cfg = .{ .layers = 1, .heads = H, .kv_heads = KV, .head_dim = HD, .intermediate = 64, .window = W, .block = B, .mask_id = 0, .tap_count = 2, .conv_kernel = 2, .conv_group = 16, .rank = 16, .top_k = 16, .softcap = 30 },
+        .hidden = 64,
+        .s = s,
+    };
+    const ns = [_]c_int{ keep, keep, 5, 300, keep, 1, keep, 450, keep, 12 };
+    const pos = [_]c_int{ 5000, 1234, 5, 300, 640, 9, 2 * keep + 3, 450, 9999, 12 };
+    const rand = struct {
+        fn make(gr: *Graph, r: std.Random, sh: []const c_int, sc: f32, dt: ops.Dtype) !Array {
+            var n: usize = 1;
+            for (sh) |x| n *= @intCast(x);
+            const buf = try gpa.alloc(f32, n);
+            defer gpa.free(buf);
+            for (buf) |*x| x.* = r.floatNorm(f32) * sc;
+            return gr.astype(try gr.fromSlice(f32, buf, sh), dt);
+        }
+    }.make;
+    for ([_]ops.Dtype{ .bfloat16, .float16, .float32 }) |dt| for ([_]usize{ 1, 3, ns.len }) |count| {
+        var g = Graph.init(testing.allocator, s);
+        defer g.deinit();
+        d.unit = try g.ones(&.{max_lanes * B * H * HD}, .float32);
+        const nl: c_int = @intCast(count);
+        const q = try rand(&g, rng, &.{ nl, H, B, HD }, 1.0, dt);
+        const kb = try rand(&g, rng, &.{ nl, KV, B, HD }, 1.0, dt);
+        const vb = try rand(&g, rng, &.{ nl, KV, B, HD }, 1.0, dt);
+        var rings: [ns.len]Array = undefined;
+        for (rings[0..count], ns[0..count]) |*r, n| r.* = try rand(&g, rng, &.{ 1, 2 * KV, ringSlots(n, keep), HD }, 1.0, dt);
+        const plan = try d.plan(&g, dt, pos[0..count], ns[0..count]);
+        try testing.expect(plan.splits > 0);
+        const got = try host(&g, try d.attendKernel(&g, q, kb, vb, rings[0..count], &plan));
+        const want = try host(&g, try d.attendChain(&g, q, kb, vb, rings[0..count], pos[0..count], ns[0..count]));
+        try testing.expectEqual(want.len, got.len);
+        const tol: f32 = if (dt == .float32) 2e-3 else 3e-2;
+        for (got, want) |u, v| try testing.expectApproxEqAbs(v, u, tol);
+    };
 }
 
 // Bar: the grouped dynamic convolution is, per group of channels and per tap, the base plus the dynamic kernel times

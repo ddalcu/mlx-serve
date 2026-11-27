@@ -847,3 +847,10 @@ Nemotron-Transcribe packs carried the same layout. Cause: the scan resolves a du
 placement dropped any quant leaf whose weight's carrier was another shard; mlx-lm shards by size, so a leaf alone in the
 next shard is its pair's only copy. Fix: a leaf is a retired copy only when its own shard also carries its weight.
 Guard: `loadWeights keeps a quant triple the shards split, with no key duplicated` (valid and stale index).
+
+### Inkling 2 sent a quarter of 32 users to serial decode for padding it never pays
+Defect: past 16 users Inkling 2 Mini decodes plain in one batched group, and at 32 users throughput fell from 640 to
+~386 tok/s (Splash 511). Cause: the plugin left `Caps.batch_pads_kv` at its default `true`, so the engine's pad-waste
+cap read 32 short contexts (35..105 tokens, 1.8x "waste") and sent 8 slots through a serial forward each tick, though
+`attendSlots` reads each slot's own cache and pads nothing. Fix: the plugin declares `batch_pads_kv = false`, as
+GLM-5-Next does (636 tok/s at 32 users). Guard: `inkling2 config: a batched tick pads no KV`.

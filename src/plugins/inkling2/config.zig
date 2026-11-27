@@ -452,7 +452,8 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         c.draft = readDraft(mc.object, &c);
     };
 
-    var p: abi.Parsed = .{ .caps = .{ .moe = true, .images = c.vision != null, .batches_decode = fusedOn(), .prompt_last_row = true } };
+    // A batched tick reads each slot's own cache (`attendSlots`): no slot pads KV to its neighbours'.
+    var p: abi.Parsed = .{ .caps = .{ .moe = true, .images = c.vision != null, .batches_decode = fusedOn(), .batch_pads_kv = false, .prompt_last_row = true } };
     // A DFlash2 draft in `drafter/` serves in place of the bundled head, when the port runs it.
     if (!stub and dir.exists(dir.ctx, abi.Str.of(dflash2_dir ++ "/model.safetensors"))) c.dflash2 = readDflash2File(dir, c.hidden_size, c.visits());
     if (c.dflash2) |d| {
@@ -703,6 +704,14 @@ test "inkling2 config: the kernels off batch no slots" {
     try testing.expect(parseJson(fixture_config, &off).isOk());
     defer freeParsed(&off);
     try testing.expect(!off.caps.batches_decode);
+}
+
+// Bar: a batched tick reads each slot's own cache (`attendSlots`), so the engine's pad-waste cap never splits a group.
+test "inkling2 config: a batched tick pads no KV" {
+    var p: abi.Parsed = .{};
+    try testing.expect(parseJson(fixture_config, &p).isOk());
+    defer freeParsed(&p);
+    try testing.expect(!p.caps.batch_pads_kv);
 }
 
 // Bar: the step kernels serve only a Metal build, and there only while the kill switch is not 0.

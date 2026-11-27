@@ -51,9 +51,10 @@ pub const max_layers = config.max_draft_layers;
 const draft_head_bits = 8;
 const draft_head_group = 64;
 
-/// The drafter's context keys and values a layer (`[1, kv_heads, rows, hd]`, normed and rotated at their positions)
-/// for the positions before `end`, kept across one slot's rounds: a round projects only the rows committed since. It
-/// is valid while the taps ring it was projected from continues, and is released when the ring restarts.
+/// The drafter's context keys and values a layer (`[1, kv_heads, rows, hd]`, normed and rotated at their positions;
+/// DFlash2's a ring of `window - 1` slots, `dflash2.Drafter.blockRowsBatch`) for the positions before `end`, kept
+/// across one slot's rounds: a round projects only the rows committed since. It is valid while the taps ring it was
+/// projected from continues, and is released when the ring restarts.
 pub const ContextKv = struct {
     k: [max_layers]Array = @splat(.{}),
     v: [max_layers]Array = @splat(.{}),
@@ -66,6 +67,8 @@ pub const ContextKv = struct {
     full_end: u64 = 0,
     /// The buffers' growth, in positions.
     chunk: c_int = 4096,
+    /// The context rows before `end` DFlash2's ring holds.
+    rows: c_int = 0,
 
     /// Keeps the full context of the positions before `at` and drops the ring's keys and values (re-projected from the
     /// ring at the next draft).

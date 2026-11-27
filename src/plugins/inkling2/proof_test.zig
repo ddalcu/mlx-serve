@@ -665,6 +665,143 @@ test "inkling2 release: a DFlash2 draft's greedy rounds commit the plain decode 
     try testing.expect(nd.finish.?(rel.m, 0, &fin).isOk());
 }
 
+/// A slot's cache as the engine keeps it (`engines/mlx/kv`): dense, or quantized as `--kv-quant` asks.
+const EngineCache = struct {
+    const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
+    const SSMCacheEntry = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
+    const cache_ops = @import("../../engines/mlx/kv/cache_ops.zig");
+    const KVQuantConfig = @import("../../engines/mlx/cache/kv_quant.zig").KVQuantConfig;
+
+    kv: KVCache,
+    entries: []SSMCacheEntry,
+    slot: cache_ops.Slot,
+
+    fn create(n_layers: u32, config: KVQuantConfig) !*EngineCache {
+        const a = std.heap.c_allocator;
+        const e = try a.create(EngineCache);
+        e.kv = try KVCache.initWithConfig(a, n_layers, config);
+        e.entries = try a.alloc(SSMCacheEntry, n_layers);
+        for (e.entries) |*x| x.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+        e.slot = .{ .kv = &e.kv, .ssm = e.entries };
+        return e;
+    }
+
+    fn destroy(e: *EngineCache) void {
+        e.kv.deinit();
+        for (e.entries) |x| {
+            _ = mlx.mlx_array_free(x.conv_state);
+            _ = mlx.mlx_array_free(x.ssm_state);
+        }
+        std.heap.c_allocator.free(e.entries);
+        std.heap.c_allocator.destroy(e);
+    }
+
+    /// The last row's logits of `tokens` forwarded at `pos` as slot `slot`.
+    fn forward(e: *EngineCache, m: *plugin.Loaded, a: std.mem.Allocator, tokens: []const u32, pos: u32, slot: u32) ![]f32 {
+        var h = [_]abi.Handle{e.slot.handle()};
+        var out: abi.ForwardOut = .{};
+        const mode: abi.Mode = if (tokens.len == 1) .decode else .prefill;
+        try testing.expect(plugin.table.forward(m, &.{ .mode = mode, .logits = .last_row, .rows = @intCast(tokens.len), .tokens = .of(tokens), .slots = .of(&[_]u32{slot}), .positions = .of(&[_]u32{pos}), .caches = .of(&h), .cache_ops = &cache_ops.ops }, &out).isOk());
+        return conformance.consumeF32(a, out.logits);
+    }
+};
+
+// Bar: on the DFlash2 pair (`INKLING2_DFLASH2_PACK`), DFlash2 group rounds (`step_group`) of four slots ending at
+// different lengths, each capped to what its slot has left (none at all for one slot's first round), are refused only
+// for a slot alone with one token left, and commit each slot's plain greedy decode up to a near tie of the plain step's
+// logits, on the engine's dense cache and at `--kv-quant 8`.
+test "inkling2 release: DFlash2 group rounds commit each slot's plain decode to its last token, dense and 8-bit KV" {
+    const env = @import("../../env.zig");
+    const pack_dir = std.mem.span(env.get(.INKLING2_DFLASH2_PACK) orelse return error.SkipZigTest);
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var rel = try Release.open(a, pack_dir);
+    defer rel.close();
+    if (rel.m.drafter2 == null) return error.SkipZigTest;
+    const step_group = plugin.table.spec.?.native_drafter.?.step_group.?;
+    const n_layers = rel.parsed.shell.num_hidden_layers;
+    const B = 4;
+    const lens = [B]usize{ 24, 30, 36, 42 };
+    const gens = [B]usize{ 13, 17, 20, 24 };
+    for ([_]EngineCache.KVQuantConfig{ .dense, EngineCache.KVQuantConfig.affine(8) }, 0..) |kvq, arm| {
+        const base: u32 = @intCast(500 + 100 * arm);
+        var want: [B][24]u32 = undefined;
+        var step_logits: [B][24][]f32 = undefined;
+        for (0..B) |i| {
+            const plain = try EngineCache.create(n_layers, kvq);
+            defer plain.destroy();
+            const slot = base + @as(u32, @intCast(i));
+            step_logits[i][0] = try plain.forward(rel.m, a, quokka_def[0..lens[i]], 0, slot);
+            want[i][0] = argmaxOf(step_logits[i][0]);
+            for (1..gens[i]) |t| {
+                step_logits[i][t] = try plain.forward(rel.m, a, want[i][t - 1 .. t], @intCast(lens[i] + t - 1), slot);
+                want[i][t] = argmaxOf(step_logits[i][t]);
+            }
+        }
+        var caches: [B]*EngineCache = undefined;
+        var made: usize = 0;
+        defer for (caches[0..made]) |c| c.destroy();
+        var t1: [B]u32 = undefined;
+        var pos: [B]u32 = undefined;
+        for (0..B) |i| {
+            caches[i] = try EngineCache.create(n_layers, kvq);
+            made += 1;
+            t1[i] = argmaxOf(try caches[i].forward(rel.m, a, quokka_def[0..lens[i]], 0, base + 50 + @as(u32, @intCast(i))));
+            pos[i] = @intCast(lens[i]);
+        }
+        var got: [B][24]u32 = undefined;
+        var got_n: [B]usize = @splat(0);
+        var rounds_run: usize = 0;
+        while (rounds_run < 64) : (rounds_run += 1) {
+            var fs: [B]abi.Forward = undefined;
+            var outs: [B]abi.ForwardOut = @splat(.{});
+            var lane: [B]usize = undefined;
+            var hs: [B]abi.Handle = undefined;
+            var ss: [B]u32 = undefined;
+            var n: usize = 0;
+            for (0..B) |i| if (got_n[i] < gens[i]) {
+                hs[n] = caches[i].slot.handle();
+                ss[n] = base + 50 + @as(u32, @intCast(i));
+                const left: u32 = @intCast(gens[i] - got_n[i]);
+                fs[n] = .{ .mode = .verify, .rows = 1, .tokens = .of(t1[i .. i + 1]), .slots = .of(ss[n .. n + 1]), .positions = .of(pos[i .. i + 1]), .caches = .of(hs[n .. n + 1]), .cache_ops = &EngineCache.cache_ops.ops, .accept_cap = if (rounds_run == 0 and i == 0) 0 else left - 1 };
+                lane[n] = i;
+                n += 1;
+            };
+            if (n == 0) break;
+            if (n == 1 and fs[0].accept_cap == 0) {
+                // Alone with one token left, a slot steps plainly: `step_group` declines it, and the token is its `t1`.
+                try testing.expect(step_group(rel.m, &fs, &outs, 1).code == .unsupported);
+                got[lane[0]][got_n[lane[0]]] = t1[lane[0]];
+                got_n[lane[0]] += 1;
+                continue;
+            }
+            try testing.expect(step_group(rel.m, &fs, &outs, @intCast(n)).isOk());
+            for (lane[0..n], outs[0..n], fs[0..n]) |i, o, f| {
+                const r = o.round;
+                try testing.expect(r.n >= 1 and r.n <= 1 + f.accept_cap);
+                @memcpy(got[i][got_n[i]..][0..r.n], r.tokens[0..r.n]);
+                got_n[i] += r.n;
+                t1[i] = r.next_token;
+                pos[i] = @intCast(r.position);
+            }
+        }
+        for (0..B) |i| {
+            try testing.expectEqual(gens[i], got_n[i]);
+            var same: usize = 0;
+            while (same < gens[i] and want[i][same] == got[i][same]) same += 1;
+            if (same < gens[i]) {
+                try testing.expect(same >= 1);
+                const lg = step_logits[i][same];
+                const gap = lg[want[i][same]] - lg[got[i][same]];
+                std.debug.print("inkling2 release: kv arm {d} slot {d} parts from plain decode at token {d}: gap {d:.4} of {d:.3}\n", .{ arm, i, same, gap, lg[want[i][same]] });
+                try testing.expect(gap <= 0.01 * @abs(lg[want[i][same]]));
+            }
+        }
+    }
+}
+
 test "inkling2 proof: a step reads every visit's conv windows and each loop pass's own KV" {
     for (streams()) |gpu| try stateMutations(gpu);
 }
@@ -782,13 +919,16 @@ test "inkling2 proof: a verified block's kept rows leave the state a forward of 
         const pos = [_]u32{split};
         const r: run_mod.Run = .{ .mode = .verify, .rows = @intCast(kept), .positions = &pos, .caches = &h, .cache_ops = &test_cache.ops };
         var c = r.ctx(&g, &m.base.shared);
-        try kernels.commit(&c, &m.base.weights.body.cfg, opens, @intCast(kept), 0, 1);
+        try kernels.commitPaths(&c, &m.base.weights.body.cfg, opens, &.{chain_rows[0..kept]});
         try testing.expectEqual(@as(u64, split + kept), test_cache.ops.len(cache.handle(), 0));
         const got = try step(a, &s.pack, &cache, prompt[split + kept .. split + kept + 1], split + kept, .last_row);
         defer a.free(got);
         try testing.expect(parity.qwen4CompareRows(got, want, 1, VOCAB).min_cos > 0.999);
     }
 }
+
+/// A chain's rows: the path a block's accepted prefix takes.
+const chain_rows = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7 };
 
 /// One verify forward of `width` rows for each of several slots (`.batched_rows`): slot i's `tokens[i * width ..]` at
 /// `positions[i]` on `caches[i]`; every row's logits.
@@ -867,6 +1007,11 @@ test "inkling2 proof: a verify of several slots' blocks serves what each slot's 
             sp.opens = null;
             try testing.expect(parity.qwen4CompareRows(rows[i * width * VOCAB ..][0 .. width * VOCAB], want_rows, width, VOCAB).min_cos > 0.999);
         }
+        var h: [3]abi.Handle = undefined;
+        for (&h, &caches) |*x, *c| x.* = c.handle();
+        const r: run_mod.Run = .{ .mode = .verify, .rows = 1, .slots = 3, .positions = &positions, .caches = &h, .cache_ops = &test_cache.ops };
+        var c = r.ctx(&g, &m.base.shared);
+        try kernels.commitPaths(&c, &m.base.weights.body.cfg, opens, &.{ chain_rows[0..kept[0]], chain_rows[0..kept[1]], chain_rows[0..kept[2]] });
         for (splits, kept, 0..) |split, keep, i| {
             var serial = try test_cache.TestCache.init(a, visits);
             defer serial.deinit();
@@ -874,11 +1019,6 @@ test "inkling2 proof: a verify of several slots' blocks serves what each slot's 
             a.free(try step(a, &s.pack, &serial, prompt[split .. split + keep], split, .last_row));
             const want = try step(a, &s.pack, &serial, prompt[split + keep .. split + keep + 1], split + keep, .last_row);
             defer a.free(want);
-            var h = [_]abi.Handle{caches[i].handle()};
-            const pos = [_]u32{@intCast(split)};
-            const r: run_mod.Run = .{ .mode = .verify, .rows = @intCast(keep), .positions = &pos, .caches = &h, .cache_ops = &test_cache.ops };
-            var c = r.ctx(&g, &m.base.shared);
-            try kernels.commit(&c, &m.base.weights.body.cfg, opens, @intCast(keep), i, 3);
             try testing.expectEqual(@as(u64, split + keep), test_cache.ops.len(caches[i].handle(), 0));
             const got = try step(a, &s.pack, &caches[i], prompt[split + keep .. split + keep + 1], split + keep, .last_row);
             defer a.free(got);
@@ -2692,53 +2832,26 @@ test "inkling2 kernels: a forward of another length instantiates no kernel anew"
     try testing.expectEqual(counts[1], counts[2]);
 }
 
-// Bar: a branching draft tree verified in one forward (with `Open.tree`) produces the same logits at every node as
-// a fresh forward of that node's ancestor path, and committing a non-linear branch via `commitPath` leaves the cache
-// and conv windows identical to serial forward along that branch.
-test "inkling2 proof: branching tree verify and commitPath match serial forward along every branch" {
+// Bar: a draft tree verified alone (`Open.tree`) reads at every node what a forward of the node's branch reads, and a
+// commit of a branch leaves the caches and conv states that forward leaves. Three lanes' trees verified as one forward
+// read what each lane's alone reads, and one `commitPaths` of their paths (branching, chain, root alone; chains only)
+// leaves each lane as its own commit does.
+test "inkling2 proof: tree verifies of several lanes and one commit of their paths match each lane alone" {
     if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const a = testing.allocator;
     var s = try Setup.init(a, true);
     defer s.deinit(a);
     const m: *plugin.Loaded = @ptrCast(@alignCast(s.pack.model));
     const run_mod = @import("../../sdk/bases/run.zig");
+    const cfg = &m.base.weights.body.cfg;
     const visits = s.pack.parsed.shell.num_hidden_layers;
-    const split: usize = 8;
-
-    // 8-node branching tree:
-    //   0 (root) -> 1, 2
-    //   1 -> 3, 4
-    //   2 -> 5
-    //   4 -> 6
-    //   5 -> 7
+    const splits = [_]usize{ 8, 11, 5 };
     const W: usize = 8;
-    const tree_toks = [W]u32{ prompt[split], 10, 20, 11, 12, 21, 13, 22 };
-    const tree_par = [W]i32{ -1, 0, 0, 1, 1, 2, 4, 5 };
-    var tree_meta: [W * 2]i32 = undefined;
-    for (0..W) |r| {
-        if (r == 0) {
-            tree_meta[0] = 0;
-            tree_meta[1] = 1;
-        } else {
-            const p: usize = @intCast(tree_par[r]);
-            tree_meta[r * 2 + 0] = tree_meta[p * 2 + 0] + 1;
-            tree_meta[r * 2 + 1] = tree_meta[p * 2 + 1] | (@as(i32, 1) << @intCast(r));
-        }
-    }
-
-    var cache = try test_cache.TestCache.init(a, visits);
-    defer cache.deinit();
-    a.free(try step(a, &s.pack, &cache, prompt[0..split], 0, .last_row));
-
-    var g = ops.Graph.init(a, m.base.s);
-    defer g.deinit();
-    const opens = try a.alloc(kernels.Open, visits);
-    defer a.free(opens);
-    const tctx: kernels.TreeCtx = .{
-        .parent = try g.fromSlice(i32, &tree_par, &.{ 1, @intCast(W) }),
-        .meta = try g.fromSlice(i32, &tree_meta, &.{ @intCast(W), 2 }),
-    };
-    for (opens) |*o| o.* = .{ .g = &g, .tree = tctx };
+    // A branching tree: 0 (root) -> 1, 2; 1 -> 3, 4; 2 -> 5; 4 -> 6; 5 -> 7. And a chain.
+    const trees = [_][W]i32{ .{ -1, 0, 0, 1, 1, 2, 4, 5 }, .{ -1, 0, 1, 2, 3, 4, 5, 6 } };
+    // Each lane's committed path: a branch, a prefix of the tree's first chain, the root alone; then chains only.
+    const paths = [_][3][]const u32{ .{ &.{ 0, 2, 5, 7 }, &.{ 0, 1, 3 }, &.{0} }, .{ &.{ 0, 1, 2 }, &.{0}, &.{ 0, 1, 2, 3, 4 } } };
+    const follow = [_]u32{33};
     var sp: plugin.Spec = .{ .visits = &.{}, .keep = 4 };
     defer {
         m.base.weights.spec = null;
@@ -2747,51 +2860,116 @@ test "inkling2 proof: branching tree verify and commitPath match serial forward 
         };
     }
     m.base.weights.spec = &sp;
-    sp.opens = opens;
-    const tree_logits = try step(a, &s.pack, &cache, &tree_toks, split, .all_rows);
-    defer a.free(tree_logits);
-    sp.opens = null;
-
-    // Every tree node's logits must match serial forward along its ancestor chain.
-    for (0..W) |node| {
-        var chain: [W]u32 = undefined;
-        var len: usize = 0;
-        var cur: i32 = @intCast(node);
-        while (cur >= 0) {
-            chain[len] = tree_toks[@intCast(cur)];
-            len += 1;
-            cur = tree_par[@intCast(cur)];
+    for (trees, paths, 0..) |tree_par, lane_paths, case| {
+        var meta: [W * 2]i32 = undefined;
+        for (0..W) |r| meta[r * 2 ..][0..2].* = if (r == 0) .{ 0, 1 } else blk: {
+            const p: usize = @intCast(tree_par[r]);
+            break :blk .{ meta[p * 2] + 1, meta[p * 2 + 1] | (@as(i32, 1) << @intCast(r)) };
+        };
+        var tokens: [3 * W]u32 = undefined;
+        for (0..3) |i| for (0..W) |r| {
+            const branch_toks = [W]u32{ 0, 10, 20, 11, 12, 21, 13, 22 };
+            tokens[i * W + r] = if (r == 0) prompt[splits[i]] else branch_toks[r] + @as(u32, @intCast(7 * i));
+        };
+        var g = ops.Graph.init(a, m.base.s);
+        defer g.deinit();
+        var caches: [3]test_cache.TestCache = undefined;
+        var alone: [3]test_cache.TestCache = undefined;
+        var positions: [3]u32 = undefined;
+        for (&caches, &alone, splits, &positions) |*c, *l, split, *pos| {
+            c.* = try test_cache.TestCache.init(a, visits);
+            l.* = try test_cache.TestCache.init(a, visits);
+            a.free(try step(a, &s.pack, c, prompt[0..split], 0, .last_row));
+            a.free(try step(a, &s.pack, l, prompt[0..split], 0, .last_row));
+            pos.* = @intCast(split);
         }
-        std.mem.reverse(u32, chain[0..len]);
-        var serial = try test_cache.TestCache.init(a, visits);
-        defer serial.deinit();
-        a.free(try step(a, &s.pack, &serial, prompt[0..split], 0, .last_row));
-        const want = try step(a, &s.pack, &serial, chain[0..len], split, .last_row);
-        defer a.free(want);
-        const got_row = tree_logits[node * VOCAB .. (node + 1) * VOCAB];
-        try testing.expect(parity.qwen4CompareRows(got_row, want, 1, VOCAB).min_cos > 0.999);
+        defer for (&caches, &alone) |*c, *l| {
+            c.deinit();
+            l.deinit();
+        };
+
+        // Each lane alone: its tree's rows, its path committed, the step after it.
+        var alone_rows: [3][]f32 = undefined;
+        var alone_next: [3][]f32 = undefined;
+        var made: usize = 0;
+        defer for (alone_rows[0..made], alone_next[0..made]) |x, y| {
+            a.free(x);
+            a.free(y);
+        };
+        for (0..3) |i| {
+            const opens = try a.alloc(kernels.Open, visits);
+            defer a.free(opens);
+            const tctx: kernels.TreeCtx = .{ .parent = try g.fromSlice(i32, &tree_par, &.{ 1, @intCast(W) }), .meta = try g.fromSlice(i32, &meta, &.{ @intCast(W), 2 }) };
+            for (opens) |*o| o.* = .{ .g = &g, .tree = tctx };
+            sp.opens = opens;
+            alone_rows[i] = try step(a, &s.pack, &alone[i], tokens[i * W ..][0..W], splits[i], .all_rows);
+            sp.opens = null;
+            var h = [_]abi.Handle{alone[i].handle()};
+            const r: run_mod.Run = .{ .mode = .verify, .rows = 1, .positions = positions[i .. i + 1], .caches = &h, .cache_ops = &test_cache.ops };
+            var c = r.ctx(&g, &m.base.shared);
+            try kernels.commitPaths(&c, cfg, opens, &.{lane_paths[i]});
+            alone_next[i] = try step(a, &s.pack, &alone[i], &follow, splits[i] + lane_paths[i].len, .last_row);
+            made += 1;
+        }
+
+        // The branch alone against a forward along it (lane 0 of the branching tree).
+        if (case == 0) {
+            for (0..W) |node| {
+                var branch: [W]u32 = undefined;
+                var len: usize = 0;
+                var cur: i32 = @intCast(node);
+                while (cur >= 0) : (cur = tree_par[@intCast(cur)]) {
+                    branch[len] = tokens[@intCast(cur)];
+                    len += 1;
+                }
+                std.mem.reverse(u32, branch[0..len]);
+                var serial = try test_cache.TestCache.init(a, visits);
+                defer serial.deinit();
+                a.free(try step(a, &s.pack, &serial, prompt[0..splits[0]], 0, .last_row));
+                const want = try step(a, &s.pack, &serial, branch[0..len], splits[0], .last_row);
+                defer a.free(want);
+                try testing.expect(parity.qwen4CompareRows(alone_rows[0][node * VOCAB ..][0..VOCAB], want, 1, VOCAB).min_cos > 0.999);
+            }
+            var path_toks: [W]u32 = undefined;
+            for (lane_paths[0], 0..) |r, k| path_toks[k] = tokens[r];
+            var serial = try test_cache.TestCache.init(a, visits);
+            defer serial.deinit();
+            a.free(try step(a, &s.pack, &serial, prompt[0..splits[0]], 0, .last_row));
+            a.free(try step(a, &s.pack, &serial, path_toks[0..lane_paths[0].len], splits[0], .last_row));
+            const want = try step(a, &s.pack, &serial, &follow, splits[0] + lane_paths[0].len, .last_row);
+            defer a.free(want);
+            try testing.expect(parity.qwen4CompareRows(alone_next[0], want, 1, VOCAB).min_cos > 0.999);
+        }
+
+        // The three lanes as one verify and one commit.
+        var parents: [3 * W]i32 = undefined;
+        var metas: [3 * W * 2]i32 = undefined;
+        for (0..3) |i| {
+            @memcpy(parents[i * W ..][0..W], &tree_par);
+            @memcpy(metas[i * W * 2 ..][0 .. W * 2], &meta);
+        }
+        const opens = try a.alloc(kernels.Open, visits);
+        defer a.free(opens);
+        const tctx: kernels.TreeCtx = .{ .parent = try g.fromSlice(i32, &parents, &.{ 3, @intCast(W) }), .meta = try g.fromSlice(i32, &metas, &.{ 3 * @as(c_int, @intCast(W)), 2 }) };
+        for (opens) |*o| o.* = .{ .g = &g, .tree = tctx };
+        sp.opens = opens;
+        const rows = try groupStep(a, &s.pack, &caches, &tokens, &positions, W);
+        defer a.free(rows);
+        sp.opens = null;
+        for (0..3) |i| try testing.expect(parity.qwen4CompareRows(rows[i * W * VOCAB ..][0 .. W * VOCAB], alone_rows[i], W, VOCAB).min_cos > 0.999);
+        var h: [3]abi.Handle = undefined;
+        for (&h, &caches) |*x, *c| x.* = c.handle();
+        const cr: run_mod.Run = .{ .mode = .verify, .rows = 1, .slots = 3, .positions = &positions, .caches = &h, .cache_ops = &test_cache.ops };
+        var cc = cr.ctx(&g, &m.base.shared);
+        try kernels.commitPaths(&cc, cfg, opens, &lane_paths);
+        for (0..3) |i| {
+            const at = splits[i] + lane_paths[i].len;
+            try testing.expectEqual(@as(u64, at), test_cache.ops.len(caches[i].handle(), 0));
+            const got = try step(a, &s.pack, &caches[i], &follow, at, .last_row);
+            defer a.free(got);
+            try testing.expect(parity.qwen4CompareRows(got, alone_next[i], 1, VOCAB).min_cos > 0.999);
+        }
     }
-
-    // Commit non-linear branch {0, 2, 5, 7} and verify the next step matches serial forward along {0, 2, 5, 7}.
-    const branch = [_]u32{ 0, 2, 5, 7 };
-    const branch_toks = [_]u32{ tree_toks[0], tree_toks[2], tree_toks[5], tree_toks[7] };
-    const follow = [_]u32{33};
-    var h = [_]abi.Handle{cache.handle()};
-    const pos = [_]u32{split};
-    const cr: run_mod.Run = .{ .mode = .verify, .rows = @intCast(branch.len), .positions = &pos, .caches = &h, .cache_ops = &test_cache.ops };
-    var cc = cr.ctx(&g, &m.base.shared);
-    try kernels.commitPath(&cc, &m.base.weights.body.cfg, opens, &branch, 0, 1);
-    try testing.expectEqual(@as(u64, split + branch.len), test_cache.ops.len(cache.handle(), 0));
-    const got_next = try step(a, &s.pack, &cache, &follow, split + branch.len, .last_row);
-    defer a.free(got_next);
-
-    var serial = try test_cache.TestCache.init(a, visits);
-    defer serial.deinit();
-    a.free(try step(a, &s.pack, &serial, prompt[0..split], 0, .last_row));
-    a.free(try step(a, &s.pack, &serial, &branch_toks, split, .last_row));
-    const want_next = try step(a, &s.pack, &serial, &follow, split + branch.len, .last_row);
-    defer a.free(want_next);
-    try testing.expect(parity.qwen4CompareRows(got_next, want_next, 1, VOCAB).min_cos > 0.999);
 }
 
 // Bar: `sampleAndAcceptTree` matches greedy argmax (with suppress mask, stops, non-linear tree walk), enforces
@@ -2971,11 +3149,14 @@ test "inkling2 plugin: a lane's tree rows follow the device, the lanes and the s
     const nax = @import("../../mlx/device.zig").naxAvailable();
     try testing.expectEqual(@as(u32, 8), plugin.treeWidth(1, false));
     try testing.expectEqual(@as(u32, if (nax) 8 else 5), plugin.treeWidth(2, false));
+    try testing.expectEqual(@as(u32, if (nax) 6 else 5), plugin.treeWidth(3, false));
     try testing.expectEqual(@as(u32, if (nax) 6 else 5), plugin.treeWidth(4, false));
+    try testing.expectEqual(@as(u32, 4), plugin.treeWidth(8, false));
     try testing.expectEqual(@as(u32, if (nax) 6 else 4), plugin.treeWidth(16, false));
     try testing.expectEqual(@as(u32, if (nax) 6 else 8), plugin.treeWidth(1, true));
     try testing.expectEqual(@as(u32, 5), plugin.treeWidth(4, true));
     try testing.expectEqual(@as(u32, 4), plugin.treeWidth(8, true));
+    try testing.expectEqual(@as(u32, if (nax) 6 else 4), plugin.treeWidth(16, true));
 }
 
 /// The command-buffer pair a fake host holds.

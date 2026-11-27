@@ -113,7 +113,6 @@ pub var relmask_kernel: Kernel = .{ .name = "msv_inkling2_relmask", .ins = &.{ "
 pub var sum_kernel: Kernel = .{ .name = "msv_inkling2_sum", .ins = &.{ "DN", "IDX", "INV", "SC", "WTS", "RES", "ST", "MW", "PR", "PARENT" }, .outs = &.{ "HOUT", "XM" }, .source = kernelSource("plugins/inkling2/kernels/sum.metal") };
 pub var few_tail_kernel: Kernel = .{ .name = "msv_inkling2_few_tail", .ins = &.{ "DN", "IDX", "SC", "WTS", "RES", "ST", "MW", "PR", "KP", "VP", "OP", "PARENT" }, .outs = &.{ "HOUT", "XM", "WIN" }, .source = kernelSource("plugins/inkling2/kernels/few_tail.metal") };
 pub var state_kernel: Kernel = .{ .name = "msv_inkling2_state", .ins = &.{ "ST", "KP", "VP", "OP", "XM" }, .outs = &.{"NST"}, .source = kernelSource("plugins/inkling2/kernels/state.metal") };
-pub var commit_conv_kernel: Kernel = .{ .name = "msv_inkling2_commit_conv", .ins = &.{ "WIN", "IDX" }, .outs = &.{"NST"}, .source = kernelSource("plugins/inkling2/kernels/commit_conv.metal") };
 pub var sample_mass_kernel: Kernel = .{ .name = "msv_inkling2_sample_mass", .ins = &.{ "LOGITS", "SUPPRESS", "LPARAMS" }, .outs = &.{"PMASS"}, .source = kernelSource("plugins/inkling2/kernels/sample_tree_mass.metal") };
 pub var sample_search_kernel: Kernel = .{ .name = "msv_inkling2_sample_search", .ins = &.{ "LOGITS", "SUPPRESS", "LPARAMS", "PMASS" }, .outs = &.{"VROW"}, .source = kernelSource("plugins/inkling2/kernels/sample_tree_search.metal") };
 pub var sample_draw_kernel: Kernel = .{ .name = "msv_inkling2_sample_draw", .ins = &.{ "LOGITS", "SUPPRESS", "LPARAMS", "VROW", "SEEDS", "TMETA", "CANDS", "NEXT_Q", "DRAWS" }, .outs = &.{"SELECTED"}, .source = kernelSource("plugins/inkling2/kernels/sample_tree_draw.metal") };
@@ -1146,62 +1145,48 @@ fn readRows(g: *Graph, L: *const Layer, cfg: *const Config, p: *const Prep, sink
 /// then every row's conv inputs). When `tree` is set, the verify rows form a per-slot tree.
 pub const Open = struct { g: *Graph, k: Array = .{}, v: Array = .{}, window: Array = .{}, tree: ?TreeCtx = null };
 
-/// Keeps the first `rows` rows of slot `lane` of a verify of `lanes` slots: each visit's keys and values appended, its
-/// conv state the window behind them.
-pub fn commit(c: *block.Ctx, cfg: *const Config, opens: []const Open, rows: c_int, lane: usize, lanes: usize) !void {
-    const kt: c_int = @intCast(cfg.sconv_kernel);
-    const slot: c_int = @intCast(lane);
-    for (opens, 0..) |*o, v| {
-        c.layer = @intCast(v);
-        const per = @divExact(ops.shape(o.k)[2], @as(c_int, @intCast(lanes)));
-        const at = slot * per;
-        var view = try layers.appendKv(c, c.cache(), cfg.global[cfg.visit(@intCast(v)).layer], cfg, try c.g.sliceAxis(o.k, 2, at, at + rows), try c.g.sliceAxis(o.v, 2, at, at + rows), 0);
-        kv.release(c, &view);
-        const window = if (lanes == 1) o.window else try c.g.sliceAxis(o.window, 0, slot, slot + 1);
-        try kv.setState(c, .conv, try c.g.sliceAxis(window, 1, rows, rows + kt - 1));
-    }
-}
-
-/// Keeps the accepted tree path `path` (row indices within slot `lane`, root 0 first) of a verify of `lanes` slots:
-/// gathers the path's K/V rows into each visit's cache and gathers the last `KT - 1` conv window rows along `path`.
-pub fn commitPath(c: *block.Ctx, cfg: *const Config, opens: []const Open, path: []const u32, lane: usize, lanes: usize) !void {
-    const kept: c_int = @intCast(path.len);
-    var linear = true;
-    for (path, 0..) |r, idx| {
-        if (r != idx) {
-            linear = false;
-            break;
-        }
-    }
-    if (linear) return commit(c, cfg, opens, kept, lane, lanes);
+/// Keeps each lane's accepted path of a verify of `paths.len` lanes, lane i on `c.caches[i]` (`paths[i]`: its row
+/// indices, root 0 first; a chain's are 0, 1, ...): each visit's K/V rows appended to the lane's cache and its conv
+/// state the window's last `KT - 1` rows along the path. A visit gathers every lane's rows in one take a source (a lone
+/// chain's are views).
+pub fn commitPaths(c: *block.Ctx, cfg: *const Config, opens: []const Open, paths: []const []const u32) !void {
+    const n = paths.len;
     const kt: usize = @intCast(cfg.sconv_kernel);
-    const slot: c_int = @intCast(lane);
-    const per = @divExact(ops.shape(opens[0].k)[2], @as(c_int, @intCast(lanes)));
-    const at: i32 = @intCast(slot * per);
-    var kv_idx_buf: [open_rows]i32 = undefined;
-    for (path, kv_idx_buf[0..path.len]) |r, *dst| dst.* = at + @as(i32, @intCast(r));
-    const kv_idx = try c.g.fromSlice(i32, kv_idx_buf[0..path.len], &.{kept});
-    var conv_idx_buf: [8]i32 = undefined;
-    for (0..kt - 1) |j| {
-        const seq_pos = path.len + j;
-        conv_idx_buf[j] = if (seq_pos < kt - 1) @intCast(seq_pos) else @intCast((kt - 1) + path[seq_pos - (kt - 1)]);
+    const per: usize = @intCast(@divExact(ops.shape(opens[0].k)[2], @as(c_int, @intCast(n))));
+    var kv_idx: [max_slots * open_rows]i32 = undefined;
+    var conv_idx: [max_slots * 8]i32 = undefined;
+    var from: [max_slots]c_int = undefined;
+    var rows: usize = 0;
+    var chains = true;
+    for (paths, 0..) |path, i| {
+        from[i] = @intCast(rows);
+        for (path, 0..) |r, k| {
+            kv_idx[rows + k] = @intCast(i * per + r);
+            chains = chains and r == k;
+        }
+        rows += path.len;
+        for (0..kt - 1) |j| {
+            const at = path.len + j;
+            conv_idx[i * (kt - 1) + j] = @intCast(if (at < kt - 1) at else kt - 1 + path[at - (kt - 1)]);
+        }
     }
-    const conv_idx = try c.g.fromSlice(i32, conv_idx_buf[0 .. kt - 1], &.{@intCast(kt - 1)});
-    const sw = ops.shape(opens[0].window)[2];
-    const use_gpu = mlx.streamIsGpu(c.g.s) and enabled();
+    if (chains) for (0..n) |i| {
+        from[i] = @intCast(i * per);
+    };
+    const kv_ids = if (chains) null else try c.g.fromSlice(i32, kv_idx[0..rows], &.{@intCast(rows)});
+    const conv_ids = try c.g.fromSlice(i32, conv_idx[0 .. n * (kt - 1)], &.{ @intCast(n), @intCast(kt - 1), 1 });
     for (opens, 0..) |*o, v| {
         c.layer = @intCast(v);
-        const ks = try c.g.take(o.k, kv_idx, 2);
-        const vs = try c.g.take(o.v, kv_idx, 2);
-        var view = try layers.appendKv(c, c.cache(), cfg.global[cfg.visit(@intCast(v)).layer], cfg, ks, vs, 0);
-        kv.release(c, &view);
-        if (use_gpu) {
-            const st = try launch(c.g, &commit_conv_kernel, &.{ o.window, conv_idx }, 1, .{.{ .shape = &.{ 1, @intCast(kt - 1), sw }, .dtype = .float32 }}, @as(c_int, @intCast(kt - 1)) * sw, 64, &.{.{ "SLOT", .{ .int = slot } }});
-            try kv.setState(c, .conv, st[0]);
-        } else {
-            const window = if (lanes == 1) o.window else try c.g.sliceAxis(o.window, 0, slot, slot + 1);
-            try kv.setState(c, .conv, try c.g.take(window, conv_idx, 1));
+        const global = cfg.global[cfg.visit(@intCast(v)).layer];
+        const ks = if (kv_ids) |ids| try c.g.take(o.k, ids, 2) else o.k;
+        const vs = if (kv_ids) |ids| try c.g.take(o.v, ids, 2) else o.v;
+        for (paths, c.caches, from[0..n]) |path, cache, at| {
+            const kept: c_int = @intCast(path.len);
+            var view = try layers.appendKv(c, cache, global, cfg, try c.g.sliceAxis(ks, 2, at, at + kept), try c.g.sliceAxis(vs, 2, at, at + kept), 0);
+            kv.release(c, &view);
         }
+        const lone: c_int = @intCast(paths[0].len);
+        try slot_state.put(c, .conv, if (chains and n == 1) try c.g.sliceAxis(o.window, 1, lone, lone + @as(c_int, @intCast(kt - 1))) else try c.g.takeAlong(o.window, conv_ids, 1));
     }
 }
 

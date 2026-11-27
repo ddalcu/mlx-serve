@@ -745,24 +745,58 @@ fn draftsToVerify(sure: []const f32, tokens: []const i32, stops: []const u32, ca
     return rounds.chooseRows(p[0..n], &costs).rows - 1;
 }
 
-/// Keeps `t1` and the first `accepted` drafts of lane `i`: their keys, values and conv windows committed, as the serial
-/// steps would have left them, and their taps on the ring. The position after them.
-fn commitLane(m: *Loaded, o: *Opened, i: usize, accepted: u32) !u64 {
-    const lane = &o.lanes[i];
-    if (o.plain()) return @as(u64, lane.position) + 1;
-    if (accepted > lane.drafts) return error.Inkling2DraftRound;
+/// Keeps each lane's `t1` and its first `accepted` drafts: their keys, values and conv windows committed, as the serial
+/// steps would have left them, and their taps on the ring.
+fn commitLanes(m: *Loaded, o: *Opened, accepted: []const u32) !void {
+    if (o.plain()) return;
     const sp = m.base.weights.spec.?;
-    sp.select(lane.slot);
-    for (lane.sure[0..@min(lane.sure_n, accepted + 1)], 0..) |c, k| sp.calib.observe(c, k < accepted);
-    const kept: c_int = @intCast(1 + accepted);
-    const handles = [_]abi.Handle{lane.cache orelse return error.Inkling2DraftRound};
-    const positions = [_]u32{lane.position};
-    const r: run_mod.Run = .{ .mode = .verify, .rows = kept, .positions = &positions, .caches = &handles, .cache_ops = o.cache_ops };
-    var c = r.ctx(o.g, &m.base.shared);
-    try kernels.commit(&c, &m.base.weights.body.cfg, o.opens, kept, i, o.n);
-    const at: c_int = @intCast(i * o.rows);
-    try sp.push(o.g, lane.position, &.{try o.g.sliceAxis(o.held, 1, at, at + kept)});
-    return @as(u64, lane.position) + @as(u64, @intCast(kept));
+    var paths: [max_open][]const u32 = undefined;
+    var slots: [max_open]u32 = undefined;
+    var positions: [max_open]u32 = undefined;
+    var handles: [max_open]abi.Handle = undefined;
+    for (o.lanes[0..o.n], accepted, 0..) |*lane, a, i| {
+        if (a > lane.drafts) return error.Inkling2DraftRound;
+        sp.select(lane.slot);
+        for (lane.sure[0..@min(lane.sure_n, a + 1)], 0..) |c, k| sp.calib.observe(c, k < a);
+        paths[i] = chain[0 .. 1 + a];
+        slots[i] = lane.slot;
+        positions[i] = lane.position;
+        handles[i] = lane.cache orelse return error.Inkling2DraftRound;
+    }
+    try keepPaths(m, o.g, o.opens, o.held, o.rows, slots[0..o.n], positions[0..o.n], handles[0..o.n], o.cache_ops, paths[0..o.n]);
+}
+
+/// A chain's rows, the path a block's accepted prefix takes.
+const chain: [kernels.open_rows]u32 = std.simd.iota(u32, kernels.open_rows);
+
+/// Keeps each lane's accepted path (`paths[i]`, rows of lane i's `rows` in the verify): one commit of every lane's
+/// keys, values and conv states, each lane's taps along its path on its ring, and the rings evaluated together.
+fn keepPaths(m: *Loaded, g: *ops.Graph, opens: []const kernels.Open, held: ops.Array, rows: usize, slots: []const u32, positions: []const u32, handles: []const abi.Handle, cache_ops: ?*const abi.CacheOps, paths: []const []const u32) !void {
+    const sp = m.base.weights.spec.?;
+    const n = paths.len;
+    const run: run_mod.Run = .{ .mode = .verify, .rows = 1, .slots = @intCast(n), .positions = positions, .caches = handles, .cache_ops = cache_ops };
+    var c = run.ctx(g, &m.base.shared);
+    try kernels.commitPaths(&c, &m.base.weights.body.cfg, opens, paths);
+    var idx: [max_open * kernels.open_rows]i32 = undefined;
+    var total: usize = 0;
+    var chains = true;
+    for (paths, 0..) |path, i| for (path, 0..) |r, k| {
+        idx[total] = @intCast(i * rows + r);
+        total += 1;
+        chains = chains and r == k;
+    };
+    const taps = if (chains) held else try g.take(held, try g.fromSlice(i32, idx[0..total], &.{@intCast(total)}), 1);
+    var rings: [max_open]ops.Array = undefined;
+    var at: c_int = 0;
+    for (paths, slots, positions, 0..) |path, slot, position, i| {
+        const from: c_int = if (chains) @intCast(i * rows) else at;
+        const kept: c_int = @intCast(path.len);
+        sp.select(slot);
+        try sp.pushOpt(g, position, &.{try g.sliceAxis(taps, 1, from, from + kept)}, false);
+        rings[i] = sp.ring;
+        at += kept;
+    }
+    try ops.asyncMany(rings[0..n]);
 }
 
 fn solo(f: *const abi.Forward) []const abi.Forward {
@@ -784,8 +818,8 @@ fn round(m: *Loaded, f: *const abi.Forward, out: *abi.ForwardOut) !void {
     const want = mlx.mlx_array_data_int32(picked) orelse return error.Inkling2DraftRound;
     var accepted: u32 = 0;
     while (accepted < lane.drafts and want[accepted] == @as(i32, @intCast(lane.ids[1 + accepted]))) accepted += 1;
-    const position = try commitLane(m, o, 0, accepted);
-    out.round = .{ .n = 1 + accepted, .accepted = accepted, .next_token = @intCast(want[accepted]), .rows = 1 + lane.drafts, .position = position };
+    try commitLanes(m, o, &.{accepted});
+    out.round = .{ .n = 1 + accepted, .accepted = accepted, .next_token = @intCast(want[accepted]), .rows = 1 + lane.drafts, .position = @as(u64, lane.position) + 1 + accepted };
     @memcpy(out.round.tokens[0 .. 1 + accepted], lane.ids[0 .. 1 + accepted]);
 }
 
@@ -834,16 +868,19 @@ fn finishGroup(m: *Loaded, slots: ?[]const u32, accepted: []const u32, outs: []a
     defer closeOpen(o);
     if (accepted.len != o.n) return error.Inkling2NoOpenVerify;
     if (slots) |s| for (s, o.lanes[0..o.n]) |slot, lane| if (slot != lane.slot) return error.Inkling2NoOpenVerify;
-    for (accepted, outs, 0..) |a, *out, i| out.round.position = try commitLane(m, o, i, a);
+    try commitLanes(m, o, accepted);
+    for (accepted, outs, o.lanes[0..o.n]) |a, *out, lane| out.round.position = @as(u64, lane.position) + 1 + (if (o.plain()) 0 else a);
 }
 
 /// A lane's verify rows (the nodes of its draft tree) by the round's lanes and whether one of them samples, with the
 /// tensor unit and without it. Every row reads its experts' banks, so more lanes take fewer rows each, and a sampled
-/// lane, which keeps fewer of its rows, fewer again.
+/// lane, which keeps fewer of its rows, fewer again. Past `kernels.packed_rows` rows (at 6 a lane) the experts read
+/// through MLX's gather, whose cost grows slowly with rows: there 6 pay again (measured on an M5 Ultra).
 pub fn treeWidth(n: usize, sampled: bool) u32 {
     if (!device.naxAvailable()) return if (n == 1) 8 else if (n <= 4) 5 else 4;
+    if (n * 6 > kernels.packed_rows) return 6;
     if (sampled) return if (n <= 2) 6 else if (n <= 4) 5 else 4;
-    return if (n <= 2) 8 else 6;
+    return if (n <= 2) 8 else if (n <= 4) 6 else 4;
 }
 
 /// Verify rows per lane for a grouped bundled-drafter round (`stepGroupBundled`), picking the width `2..block`
@@ -1044,7 +1081,7 @@ fn stepGroupBundled(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut)
     };
     if (!v.isOk()) return v;
 
-    var rings: [max_open]ops.Array = undefined;
+    var paths: [max_open][]const u32 = undefined;
     if (!sampled) {
         const flat_logits = try g.reshape(.{ .ctx = fo.logits.ctx }, &.{ @intCast(n * w_rows), -1 });
         const picked = try picks(&g, flat_logits, fs[0].suppress_mask);
@@ -1068,14 +1105,7 @@ fn stepGroupBundled(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut)
             sp.select(slot_ids[i]);
             for (lane_sure[0..@min(lane_cap, accepted + 1)], 0..) |conf, k| sp.calib.observe(conf, k < accepted);
             const kept: c_int = @intCast(1 + accepted);
-            const h_one = [_]abi.Handle{handles[i]};
-            const p_one = [_]u32{positions[i]};
-            const crun: run_mod.Run = .{ .mode = .verify, .rows = kept, .positions = &p_one, .caches = &h_one, .cache_ops = fs[0].cache_ops };
-            var cc = crun.ctx(&g, &m.base.shared);
-            try kernels.commit(&cc, cfg, opens, kept, i, n);
-            const at: c_int = @intCast(i * w_rows);
-            try sp.pushOpt(&g, positions[i], &.{try g.sliceAxis(held, 1, at, at + kept)}, false);
-            rings[i] = sp.ring;
+            paths[i] = chain[0..@intCast(kept)];
 
             outs[i].round = .{
                 .n = @intCast(kept),
@@ -1115,15 +1145,7 @@ fn stepGroupBundled(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut)
             const tested = @min(lane_cap, accepted + 1);
             sp.group_hit = sp.group_hit * 0.92 + @as(f32, @floatFromInt(accepted));
             sp.group_seen = sp.group_seen * 0.92 + @as(f32, @floatFromInt(tested));
-
-            const h_one = [_]abi.Handle{handles[i]};
-            const p_one = [_]u32{positions[i]};
-            const crun: run_mod.Run = .{ .mode = .verify, .rows = @intCast(kept), .positions = &p_one, .caches = &h_one, .cache_ops = fs[0].cache_ops };
-            var cc = crun.ctx(&g, &m.base.shared);
-            try kernels.commit(&cc, cfg, opens, @intCast(kept), i, n);
-            const at: c_int = @intCast(i * w_rows);
-            try sp.pushOpt(&g, positions[i], &.{try g.sliceAxis(held, 1, at, at + @as(c_int, @intCast(kept)))}, false);
-            rings[i] = sp.ring;
+            paths[i] = chain[0..kept];
 
             outs[i].round = .{
                 .n = @intCast(kept),
@@ -1135,7 +1157,7 @@ fn stepGroupBundled(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut)
             for (0..kept) |k| outs[i].round.tokens[k] = @intCast(row[2 + w_rows + k]);
         }
     }
-    try ops.asyncMany(rings[0..n]);
+    try keepPaths(m, &g, opens, held, w_rows, slot_ids[0..n], positions[0..n], handles[0..n], fs[0].cache_ops, paths[0..n]);
     return .ok;
 }
 
@@ -1166,7 +1188,8 @@ fn stepGroup(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut) !abi.V
         const slot = f.slots.slice()[0];
         const pos = f.positions.slice()[0];
         sp.select(slot);
-        if (sp.rows(pos) == 0 or f.accept_cap == 0) return abi.Verdict.refuse(.unsupported, "lane needs plain step");
+        // A lane with no draft left to keep rides a group (its walk keeps none); alone it steps plainly.
+        if (sp.rows(pos) == 0 or (n == 1 and f.accept_cap == 0)) return abi.Verdict.refuse(.unsupported, "lane needs plain step");
         slot_ids[i] = slot;
         positions[i] = pos;
         handles[i] = f.caches.slice()[0];
@@ -1286,21 +1309,17 @@ fn stepGroup(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut) !abi.V
     const par_data = mlx.mlx_array_data_int32(tree.parent) orelse return error.Inkling2DraftRound;
     const stride = 2 + 2 * @as(usize, w_rows);
 
+    var path_rows: [max_open][kernels.open_rows]u32 = undefined;
+    var paths: [max_open][]const u32 = undefined;
     for (0..n) |i| {
         const row = res_data[i * stride .. (i + 1) * stride];
         const accepted: u32 = @intCast(row[0]);
         const next_token: u32 = @intCast(row[1]);
         const kept: usize = 1 + @as(usize, accepted);
         if (kept > w_rows or kept > abi.max_round_tokens) return error.Inkling2DraftRound;
-
-        var path: [kernels.open_rows]u32 = undefined;
-        var emitted: [kernels.open_rows]u32 = undefined;
-        var linear = true;
-        for (0..kept) |k| {
-            path[k] = @intCast(row[2 + k]);
-            emitted[k] = @intCast(row[2 + w_rows + k]);
-            if (path[k] != k) linear = false;
-        }
+        const path = path_rows[i][0..kept];
+        for (path, 0..) |*p, k| p.* = @intCast(row[2 + k]);
+        paths[i] = path;
 
         sp.select(slot_ids[i]);
         // Update per-slot online logistic calibration along accepted path + top rejected child if any.
@@ -1315,23 +1334,8 @@ fn stepGroup(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut) !abi.V
         for (1..w_rows) |r_idx| {
             if (par_lane[r_idx] == last_row and sc_lane[r_idx] > best_rej_q) best_rej_q = sc_lane[r_idx];
         }
-        if (best_rej_q > 0.0) sp.tree_calib.observe(kept - 1, best_rej_q, false);
-
-        const h_one = [_]abi.Handle{handles[i]};
-        const p_one = [_]u32{positions[i]};
-        const crun: run_mod.Run = .{ .mode = .verify, .rows = @intCast(kept), .positions = &p_one, .caches = &h_one, .cache_ops = fs[0].cache_ops };
-        var cc = crun.ctx(&g, &m.base.shared);
-        try kernels.commitPath(&cc, cfg, opens, path[0..kept], i, n);
-
-        const at: c_int = @intCast(i * w_rows);
-        const lane_taps = if (linear)
-            try g.sliceAxis(held, 1, at, at + @as(c_int, @intCast(kept)))
-        else blk: {
-            var tidx: [kernels.open_rows]i32 = undefined;
-            for (0..kept) |k| tidx[k] = at + @as(i32, @intCast(path[k]));
-            break :blk try g.take(held, try g.fromSlice(i32, tidx[0..kept], &.{@intCast(kept)}), 1);
-        };
-        try sp.push(&g, positions[i], &.{lane_taps});
+        // A walk the lane's cap stopped rejected nothing.
+        if (best_rej_q > 0.0 and accepted < sample_lanes[i].accept_cap) sp.tree_calib.observe(kept - 1, best_rej_q, false);
 
         outs[i].round = .{
             .n = @intCast(kept),
@@ -1340,8 +1344,9 @@ fn stepGroup(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut) !abi.V
             .rows = w_rows,
             .position = @as(u64, positions[i]) + @as(u64, @intCast(kept)),
         };
-        @memcpy(outs[i].round.tokens[0..kept], emitted[0..kept]);
+        for (0..kept) |k| outs[i].round.tokens[k] = @intCast(row[2 + w_rows + k]);
     }
+    try keepPaths(m, &g, opens, held, w_rows, slot_ids[0..n], positions[0..n], handles[0..n], fs[0].cache_ops, paths[0..n]);
     return .ok;
 }
 
