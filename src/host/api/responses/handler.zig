@@ -20,6 +20,7 @@ const http_server = @import("../../http/server.zig");
 
 const Conn = @import("../../http/conn.zig").Conn;
 const spec_gate_threshold = @import("../request_options.zig").spec_gate_threshold;
+const recall_mod = @import("../../../sdk/recall/recall.zig");
 const resolveKvAttnFused = @import("../request_options.zig").resolveKvAttnFused;
 const parseKvAttnExplicit = @import("../request_options.zig").parseKvAttnExplicit;
 const resolveSampling = @import("../sampling.zig").resolveSampling;
@@ -871,7 +872,12 @@ fn handleResponsesInner(
     if ((enable_pld_resp and !pld_explicit_in_json) or (enable_drafter_resp and !drafter_explicit_in_json)) {
         const score = pld_index.ngramRepeatScore(allocator, prompt_ids, 3) catch 1.0;
         if (score < spec_gate_threshold) {
-            if (enable_pld_resp and !pld_explicit_in_json) {
+            // Recall exemption — same rule as the other surfaces: the record
+            // can draft what earlier requests wrote, invisible to the prompt's
+            // score; realized acceptance (yield gate + landing rates) governs.
+            const recall_armed = recall_mod.shared_state.get().enabled and
+                if (lm.tokenizer) |t| recall_mod.storeFor(t) != null else false;
+            if (enable_pld_resp and !pld_explicit_in_json and !recall_armed) {
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld_resp = false;
             }

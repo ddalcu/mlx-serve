@@ -14,6 +14,7 @@ pub const io_util = @import("sdk/util/io_util.zig");
 const mlx_gguf = @import("sdk/quant/gguf/claim.zig");
 const model_mod = @import("sdk/config/model.zig");
 const tokenizer_mod = @import("sdk/tokenizer/tokenizer.zig");
+const recall_mod = @import("sdk/recall/recall.zig");
 comptime {
     // The plugins' host surface: plugin_host.zig's list, every name re-exported here.
     @import("plugin_host_check.zig").reexports(@This());
@@ -410,6 +411,22 @@ fn printUsage(io: std.Io) void {
         \\                        evictions instead of recomputed. Can use many
         \\                        GB of disk, so it's opt-in; e.g. 10GB. 0/off
         \\                        disables.
+        \\  --recall             Draft from a persistent record of the token ids
+        \\                        the server has read and written (default: off).
+        \\                        A re-sent request, a regenerated reply, or an
+        \\                        agent re-copying earlier output verifies the
+        \\                        earlier continuation in one round instead of
+        \\                        drafting token by token. Records ids only,
+        \\                        never text, under the --recall-dir, one record
+        \\                        per tokenizer. Replies are byte-identical with
+        \\                        it on, off or read-only. All --recall-* flags
+        \\                        imply --recall.
+        \\  --recall-dir <dir>   Where the records live (default:
+        \\                        ~/.cache/mlx-serve/recall).
+        \\  --recall-gib <n>    Record disk per tokenizer in GiB (default
+        \\                        0.0625 = 64 MiB); the oldest ids go first.
+        \\  --recall-read-only  Draft from the record and add nothing (also the
+        \\                        behavior when another server holds the record).
         \\  --shutdown-persist-secs <n>
         \\                      On SIGTERM, finish writing the SSD-tier slices not
         \\                        yet on disk, for at most <n> seconds, then exit
@@ -1075,6 +1092,40 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--prefix-cache-disk: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--recall")) {
+            // Persistent token-id record + drafting from it (sdk/recall,
+            // ported from TensorFold). Every --recall-* flag implies --recall.
+            const st = recall_mod.shared_state.get();
+            st.enabled = true;
+            st.io = io;
+        } else if (std.mem.eql(u8, args[i], "--recall-dir") and i + 1 < args.len) {
+            i += 1;
+            if (!recall_mod.setBaseDir(args[i])) {
+                log.err("--recall-dir: cannot keep '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
+            const st = recall_mod.shared_state.get();
+            st.enabled = true;
+            st.io = io;
+        } else if (std.mem.eql(u8, args[i], "--recall-gib") and i + 1 < args.len) {
+            i += 1;
+            const gib = std.fmt.parseFloat(f64, args[i]) catch {
+                log.err("--recall-gib: expected a number of GiB, e.g. 0.5 or 2; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+            if (!std.math.isFinite(gib) or gib <= 0) {
+                log.err("--recall-gib: expected a positive number of GiB; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
+            const st = recall_mod.shared_state.get();
+            st.cap_bytes = @max(@as(u64, @intFromFloat(gib * (1 << 30))), recall_mod.chunk_bytes);
+            st.enabled = true;
+            st.io = io;
+        } else if (std.mem.eql(u8, args[i], "--recall-read-only")) {
+            const st = recall_mod.shared_state.get();
+            st.read_only = true;
+            st.enabled = true;
+            st.io = io;
         } else if (std.mem.eql(u8, args[i], "--shutdown-persist-secs") and i + 1 < args.len) {
             i += 1;
             server_mod.shutdown_persist_secs = std.fmt.parseInt(u32, args[i], 10) catch {
@@ -1588,6 +1639,7 @@ pub fn main(init: std.process.Init) !void {
     };
     // defer-only (see config note above): errdefer + defer with the same body
     // double-frees on the error-return path.
+    tok.setRecallName(model_dir);
     defer if (!tok_owned_by_registry) {
         tok.deinit();
         allocator.destroy(tok);

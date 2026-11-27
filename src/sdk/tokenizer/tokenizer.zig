@@ -110,6 +110,17 @@ pub const Tokenizer = struct {
     /// (left_str, right_str) -> merge rank (lower = higher priority)
     merge_ranks: std.HashMap(MergePair, u32, MergePairContext, std.hash_map.default_max_load_percentage),
     allocator: std.mem.Allocator,
+    /// Recall (sdk/recall): identity of this tokenizer for the persistent
+    /// token-id record — sha256 of the tokenizer's source JSON, so any two
+    /// tokenizers that share a record decode the same ids. All zero = not
+    /// computed (test/manual tokenizers never record).
+    recall_identity: [32]u8 = @splat(0),
+    /// Recall: highest token id + 1 — the record's write gate (an id at or
+    /// past this never enters, so a foreign tokenizer cannot corrupt it).
+    recall_vocab: u32 = 0,
+    /// Recall: the model directory's basename, for the record's identity
+    /// file ("which model first wrote this record"). Owned by `allocator`.
+    recall_name: []const u8 = "",
     /// Special tokens (string -> id)
     special_tokens: std.StringHashMap(u32),
     /// Tokenizer type determines encode/decode behavior
@@ -263,11 +274,19 @@ pub const Tokenizer = struct {
         };
     }
 
+    /// Recall (sdk/recall): the model directory's basename for the record's
+    /// identity file. Takes ownership of a copy made with `allocator`.
+    pub fn setRecallName(self: *Tokenizer, model_dir: []const u8) void {
+        if (self.recall_name.len > 0) self.allocator.free(self.recall_name);
+        self.recall_name = self.allocator.dupe(u8, std.fs.path.basename(model_dir)) catch "";
+    }
+
     pub fn deinit(self: *Tokenizer) void {
         // Map keys/values either point into `parsed_json`'s arena (no
         // per-entry free needed) or were duped explicitly when no parsed
         // JSON is held (e.g., the test-only constructors). Freeing the
         // parsed JSON deinits its arena in one shot.
+        if (self.recall_name.len > 0) self.allocator.free(self.recall_name);
         if (self.flagged_specials.len > 0) self.allocator.free(self.flagged_specials);
         if (self.special_index) |*x| x.deinit(self.allocator);
         if (self.marker_aliases) |*m| m.deinit();

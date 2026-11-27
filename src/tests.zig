@@ -17,6 +17,7 @@ export fn msv_test_process_init() void {
 }
 
 test {
+    _ = @import("sdk/recall/recall.zig");
     _ = @import("sdk/blocks/hc/hc_cuda_test.zig");
     _ = @import("plugins/stable_audio3/plugin.zig");
     _ = @import("host/media_jobs/plugin/served.zig");

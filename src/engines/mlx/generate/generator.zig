@@ -27,6 +27,7 @@ const group_cost = @import("../spec/mtp_group_cost.zig");
 const group_planner = @import("../spec/mtp_group_planner.zig");
 const ane_mod = @import("../../../sdk/ane/offload.zig");
 const scheduler_mod = @import("../scheduler.zig");
+const recall_mod = @import("../../../sdk/recall/recall.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -148,6 +149,13 @@ pub const Generator = struct {
     /// PLD's counterpart of the `gen.mtp != null` / `gen.drafter != null`
     /// conjuncts; PLD has no model handle, so the bit has to be explicit.
     pld_enabled: bool = false,
+    // ── Recall (sdk/recall) state ──
+    // Per-stream reader over the persistent token-id record, armed on the
+    // first PLD step that misses an in-context lookup; freed in `deinit`, which
+    // also records the request's prompt delta + reply into the record.
+    recall: ?recall_mod.Reader = null,
+    /// Monotonic step counter feeding the reader's quiet-round arithmetic.
+    recall_round: u64 = 0,
     /// Stats for PLD benchmark logging. `pld_attempted` counts every step
     /// where lookup found a candidate (so a verify forward ran);
     /// `pld_accepted_tokens` is the cumulative number of *drafted* tokens
@@ -605,6 +613,16 @@ pub const Generator = struct {
             st.a.destroy(st);
             self.speech = null;
         }
+        // Recall (sdk/recall): what this request read and wrote goes into
+        // the persistent record — every spec mode ends here, so MTP/drafter/
+        // plain requests record too. Must run BEFORE `prompt_ids_owned` is
+        // freed. A null store (recall off, or an unopenable record) is a
+        // no-op.
+        if (self.recall) |*rd| {
+            rd.deinit();
+            self.recall = null;
+        }
+        recall_mod.finishRequest(self.tok, self.prompt_ids_owned, self.generated_ids.items);
         if (self.prompt_ids_alloc) |a| {
             a.free(self.prompt_ids_owned);
             self.prompt_ids_owned = &.{};

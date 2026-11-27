@@ -130,6 +130,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/models/rescan",
     "/v1/providers",
     "/v1/providers/reload",
+    "/v1/recall",
     "/v1/responses",
     "/v1/responses/compact",
     "/v1/unload-model",
@@ -428,6 +429,22 @@ pub fn handleConnection(
         const body = if (http_server.g_providers) |p| try p.statusJson(allocator) else try allocator.dupe(u8, "{\"providers\":[]}");
         defer allocator.free(body);
         try sendResponse(stream, "200 OK", "application/json", body);
+        return;
+    }
+    if (isRoute(path, "/v1/recall")) {
+        // A status read over the persistent token-id records: dispatched
+        // before any model resolution (like /v1/providers) so a poll never
+        // cold-loads a model, and answers with no model at all.
+        const recall_api = @import("../api/recall.zig");
+        if (std.mem.eql(u8, method, "GET")) {
+            try recall_api.handleGet(allocator, stream);
+            return;
+        }
+        if (std.mem.eql(u8, method, "DELETE")) {
+            try recall_api.handleDelete(allocator, stream);
+            return;
+        }
+        try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "method_not_allowed", "GET or DELETE /v1/recall", 405);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/models/rescan")) {

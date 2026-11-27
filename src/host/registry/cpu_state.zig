@@ -111,6 +111,7 @@ fn preloadTextCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []co
     errdefer allocator.destroy(tok);
     tok.* = try tokenizer_mod.loadTokenizerAny(io, allocator, model_dir);
     errdefer tok.deinit();
+    tok.setRecallName(model_dir);
 
     const cc = try allocator.create(ChatConfig);
     errdefer allocator.destroy(cc);
