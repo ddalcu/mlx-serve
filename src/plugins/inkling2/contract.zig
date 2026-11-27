@@ -158,7 +158,8 @@ const OProj = struct {
 
     pub fn geometry(self: *const OProj, shape: Shape) ?metal.Geometry {
         if (shape.n != 1 or shape.rows == 0 or shape.k == 0 or shape.k % 16 != 0 or shape.k % self.gs != 0) return null;
-        var g = metal.Geometry{ .grid = .{ 32, @intCast(shape.rows), 1 }, .tg = .{ 32, 4, 1 } };
+        const rows: usize = @intCast(kernels.oprojRows(@intCast(shape.rows)));
+        var g = metal.Geometry{ .grid = .{ 32, @intCast(shape.rows / rows), 1 }, .tg = .{ 32, 4, 1 } };
         g.out(&.{ 1, 1, @intCast(shape.rows) }, .bfloat16);
         g.dtype("T", .bfloat16);
         g.dtype("S", .bfloat16);
@@ -166,6 +167,7 @@ const OProj = struct {
         g.int("GS", if (self.bits == 0) @as(usize, 16) else self.gs);
         g.int("BITS", if (self.bits == 0) @as(u32, 16) else self.bits);
         g.int("FMT", @as(u32, if (self.bits == 0) 4 else 3));
+        g.int("ROWS", rows);
         return g;
     }
 

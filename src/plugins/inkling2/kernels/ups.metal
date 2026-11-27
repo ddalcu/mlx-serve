@@ -63,8 +63,12 @@ for (uint k = lane * 16; k < K; k += 512) {
         v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w,
         v2.x, v2.y, v2.z, v2.w, v3.x, v3.y, v3.z, v3.w,
     };
+    float xs[16];
+    float sx = 0.0f;
+    if (FMT == 3 && BITS == 3) { for (uint i = 0; i < 16; i++) sx += xr[i]; msv_ink2_prescale3w(xr, xs); }
     for (uint r = 0; r < 2 * ROWS; r++)
-        acc[r] += FMT == 3 ? msv_ink2_affine_chunk<S, BITS, GS>(arow + r * WBR, sa + r * SPR, ba + r * SPR, k / 16, xr)
+        acc[r] += FMT == 3 ? (BITS == 3 ? msv_ink2_affine3w<S, GS>(arow + r * WBR, sa + r * SPR, ba + r * SPR, k / 16, xs, sx)
+                                        : msv_ink2_affine_chunk<S, BITS, GS>(arow + r * WBR, sa + r * SPR, ba + r * SPR, k / 16, xr))
                            : msv_ink2_chunk(FMT, wrow + r * WPR, srow + r * SPR, k / 16, xr);
 }
 const float sc = SCALED ? SC[ex] : 1.0f;

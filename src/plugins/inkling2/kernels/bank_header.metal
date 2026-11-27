@@ -145,3 +145,35 @@ inline void msv_ink2_decode16_affine_v4(const device uchar* row, const device S*
   scale = float(srow[g]);
   bias = float(brow[g]);
 }
+
+// 3-bit fast path (decode on M1/M2 is ALU-bound here). Word variant: three ushort loads per 16 values; value i at bit 3i of the 48-bit stream, masked inside its word and
+// x divided by 2^(offset in the word); the two values that straddle a word are assembled exactly.
+inline void msv_ink2_prescale3w(thread const float* x, thread float* xs) {
+  const float f[16] = {1.0f, 0.125f, 0.015625f, 0.001953125f, 0.000244140625f, 1.0f, 0.25f, 0.03125f,
+                       0.00390625f, 0.00048828125f, 1.0f, 0.5f, 0.0625f, 0.0078125f, 0.0009765625f, 0.0001220703125f};
+  for (int i = 0; i < 16; ++i) xs[i] = x[i] * f[i];
+}
+template <typename S, int GS>
+inline float msv_ink2_affine3w(const device uchar* row, const device S* srow, const device S* brow, uint c, thread const float* xs, float sx) {
+  const device ushort* p = (const device ushort*)(row + c * 6);
+  const uint w0 = p[0], w1 = p[1], w2 = p[2];
+  float qx = 0.0f;
+  qx += float(w0 & 0x0007u) * xs[0];
+  qx += float(w0 & 0x0038u) * xs[1];
+  qx += float(w0 & 0x01c0u) * xs[2];
+  qx += float(w0 & 0x0e00u) * xs[3];
+  qx += float(w0 & 0x7000u) * xs[4];
+  qx += float((w0 >> 15) | ((w1 & 0x0003u) << 1)) * xs[5];
+  qx += float(w1 & 0x001cu) * xs[6];
+  qx += float(w1 & 0x00e0u) * xs[7];
+  qx += float(w1 & 0x0700u) * xs[8];
+  qx += float(w1 & 0x3800u) * xs[9];
+  qx += float((w1 >> 14) | ((w2 & 0x0001u) << 2)) * xs[10];
+  qx += float(w2 & 0x000eu) * xs[11];
+  qx += float(w2 & 0x0070u) * xs[12];
+  qx += float(w2 & 0x0380u) * xs[13];
+  qx += float(w2 & 0x1c00u) * xs[14];
+  qx += float(w2 & 0xe000u) * xs[15];
+  const uint g = (c * 16) / GS;
+  return float(srow[g]) * qx + float(brow[g]) * sx;
+}

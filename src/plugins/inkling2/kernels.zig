@@ -73,6 +73,22 @@ const lanes_header = "template <typename T> struct msv_ink2_el { typedef half ty
 /// ranks its row's picks: fewer, wider ones rank fewer times).
 const bank_rows: c_int = 1;
 const bank_groups: c_int = 8;
+/// On a GPU before Apple9 (M1, M2) more rows a SIMD group win in a dependent chain of decode launches: up 2,
+/// down 4 (the output is the same at every width).
+fn preApple9() bool {
+    const gen = @import("../../mlx/device.zig").deviceGeneration().gen;
+    return gen != 0 and gen < 15;
+}
+fn upRows() c_int {
+    return if (preApple9()) 2 else bank_rows;
+}
+fn downRows() c_int {
+    return if (preApple9()) 4 else bank_rows;
+}
+/// `oproj`'s rows a SIMD group for `n` output rows: `downRows` where it divides them.
+pub fn oprojRows(n: c_int) c_int {
+    return if (@rem(n, downRows()) == 0) downRows() else 1;
+}
 
 pub var pre_kernel: Kernel = .{ .name = "msv_inkling2_pre", .ins = &.{ "HIN", "BLK", "QY", "NW0", "NW1", "NW2", "BANK", "BPART", "MQ", "PR" }, .outs = &.{ "X", "NORMED", "A", "MSGO", "BOTH" }, .source = kernelSource("plugins/inkling2/kernels/pre.metal") };
 pub var prep_kernel: Kernel = .{ .name = "msv_inkling2_prep", .ins = &.{ "QP", "GP", "RP", "KP", "VP", "KDY", "VDY", "ST", "KW", "VW", "QS", "RS", "RJ", "PR", "PARENT" }, .outs = &.{ "Q", "GATE", "K", "V", "BIAS", "REL" }, .source = kernelSource("plugins/inkling2/kernels/prep.metal") };
@@ -506,9 +522,11 @@ pub fn oGated(g: *Graph, o: *const layers.Linear, att: Array, gate_sigmoid: Arra
     const f = oFormat(o, dt) orelse return error.Inkling2OutputLayout;
     const n = ops.shape(o.w)[0];
     const affine = f.fmt == 3;
-    const y = try launchGrid(g, &oproj_kernel, &.{ att, gate_sigmoid, o.w, if (affine) o.s else o.w, if (affine) o.b else o.w }, 1, .{.{ .shape = &.{ 1, 1, n }, .dtype = dt }}, .{ 32, n, 1 }, .{ 32, 4, 1 }, &.{
+    const rows = oprojRows(n);
+    const y = try launchGrid(g, &oproj_kernel, &.{ att, gate_sigmoid, o.w, if (affine) o.s else o.w, if (affine) o.b else o.w }, 1, .{.{ .shape = &.{ 1, 1, n }, .dtype = dt }}, .{ 32, @divExact(n, rows), 1 }, .{ 32, 4, 1 }, &.{
         .{ "T", .{ .dtype = dt } },            .{ "S", .{ .dtype = if (affine) ops.dtype(o.s) else dt } }, .{ "K", .{ .int = f.k } },
         .{ "GS", .{ .int = @intCast(f.gs) } }, .{ "BITS", .{ .int = @intCast(f.bits) } },                  .{ "FMT", .{ .int = f.fmt } },
+        .{ "ROWS", .{ .int = rows } },
     });
     return y[0];
 }
@@ -1566,7 +1584,7 @@ pub fn packedFormat(bank: anytype, in_dim: c_int) ?c_int {
         else => return null,
     };
     const rows = ops.shape(bank.w)[1];
-    return if (@rem(in_dim, 32) == 0 and @rem(rows, 2 * bank_rows) == 0 and @rem(rows, 2 * bank_groups) == 0) fmt else null;
+    return if (@rem(in_dim, 32) == 0 and @rem(rows, 2 * @max(upRows(), downRows())) == 0 and @rem(rows, 2 * bank_groups) == 0) fmt else null;
 }
 
 fn affineWidth(bits: u32, group: u32) bool {
@@ -1621,9 +1639,9 @@ pub fn ups(g: *Graph, L: *const Layer, cfg: *const Config, x: Array, route: UpsR
         .{ .shape = &.{ s * top_k, 1, inter }, .dtype = dt },
         if (ranked) .{ .shape = &.{ 1, s, top_k }, .dtype = .uint32 } else unused,
         if (ranked) .{ .shape = &.{ 1, s, top_k }, .dtype = .float32 } else unused,
-    }, .{ 32, @divExact(inter, bank_rows), s * top_k }, .{ 32, bank_groups, 1 }, &.{
+    }, .{ 32, @divExact(inter, upRows()), s * top_k }, .{ 32, bank_groups, 1 }, &.{
         .{ "T", .{ .dtype = dt } },                               .{ "K", .{ .int = hidden } },                            .{ "I", .{ .int = inter } },
-        .{ "GS", .{ .int = @intCast(L.gate_up.qp.group_size) } }, .{ "FMT", .{ .int = fmt } },                             .{ "ROWS", .{ .int = bank_rows } },
+        .{ "GS", .{ .int = @intCast(L.gate_up.qp.group_size) } }, .{ "FMT", .{ .int = fmt } },                             .{ "ROWS", .{ .int = upRows() } },
         .{ "BITS", .{ .int = @intCast(L.gate_up.qp.bits) } },     .{ "S", .{ .dtype = ops.dtype(L.gate_up.s) } },          .{ "SCALED", .{ .int = @intFromBool(scaled) } },
         .{ "KSEL", .{ .int = top_k } },                           .{ "E", .{ .int = if (ranked) sh[sh.len - 1] else 1 } }, .{ "SGS", .{ .int = bank_groups } },
         .{ "ROUTE", .{ .int = @intFromBool(ranked) } },
@@ -1834,10 +1852,10 @@ fn expertsWithConsts(g: *Graph, L: *const Layer, cfg: *const Config, consts: ?*c
         const st_sh = ops.shape(st);
         const o = try launchGrid(g, &downs_kernel, &.{ act[0], L.down.w, L.down.s, biasesOf(&L.down), sel, dn_scale, weights, m.residual, st, L.mlp_conv, conv_scale, kp, vp, m.op }, 3, .{
             tail_out[0], tail_out[1], .{ .shape = &.{ st_sh[0], st_sh[1], st_sh[2] }, .dtype = .float32 },
-        }, .{ 32, top_k, @divExact(hidden, bank_rows) }, .{ 32, top_k, 1 }, &.{
+        }, .{ 32, top_k, @divExact(hidden, downRows()) }, .{ 32, top_k, 1 }, &.{
             .{ "T", .{ .dtype = dt } },                        .{ "WT", .{ .dtype = ops.dtype(L.mlp_conv) } },        .{ "I", .{ .int = inter } },
             .{ "D", .{ .int = hidden } },                      .{ "GS", .{ .int = @intCast(L.down.qp.group_size) } }, .{ "FMT", .{ .int = fmt } },
-            .{ "ROWS", .{ .int = bank_rows } },                .{ "KSEL", .{ .int = top_k } },                        .{ "KT", .{ .int = kt } },
+            .{ "ROWS", .{ .int = downRows() } },               .{ "KSEL", .{ .int = top_k } },                        .{ "KT", .{ .int = kt } },
             .{ "BITS", .{ .int = @intCast(L.down.qp.bits) } }, .{ "S", .{ .dtype = ops.dtype(L.down.s) } },           .{ "SCALED", dn_scaled },
             .{ "TAIL", .{ .int = 1 } },
         });
