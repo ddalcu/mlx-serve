@@ -82,14 +82,20 @@ pub fn mlxActiveBytes() u64 {
     return n;
 }
 
-/// The n-gram table is resident, wired, only on the `--ple-gpu` arm, and sits outside the
-/// `.safetensors` sum; the host gather only faults in the rows it reads.
-pub fn pleTableBill(io: std.Io, config: *const model_mod.ModelConfig) u64 {
-    if (!ple_gpu.pleGpu().enabled) return 0;
-    if (config.embedded_ple_payload_bytes) |bytes| return bytes;
-    const p = config.ngram_table_path orelse return 0;
-    const st = std.Io.Dir.cwd().statFile(io, p, .{}) catch return 0;
-    return @intCast(st.size);
+/// The n-gram table is resident, wired, only on the GPU-gather arm (`--ple-gpu`, or the auto
+/// default when RAM covers weights + table + headroom + a 256k-token context), and sits outside
+/// the `.safetensors` sum; the host gather only faults in the rows it reads. The auto arm is
+/// predicted by the same RAM test `ple_gpu.load` applies.
+pub fn pleTableBill(io: std.Io, config: *const model_mod.ModelConfig, model_bytes: u64) u64 {
+    const mode = ple_gpu.pleGpu().mode;
+    if (mode == .off) return 0;
+    const bytes: u64 = if (config.embedded_ple_payload_bytes) |embedded| embedded else blk: {
+        const p = config.ngram_table_path orelse return 0;
+        const st = std.Io.Dir.cwd().statFile(io, p, .{}) catch return 0;
+        break :blk @intCast(st.size);
+    };
+    if (mode == .auto and !ple_gpu.autoWouldEnable(model_bytes, bytes, ple_gpu.autoCtxRoom(config))) return 0;
+    return bytes;
 }
 
 /// Sum of `*.safetensors` bytes in `model_dir` — the MLX weight footprint used
@@ -324,7 +330,7 @@ pub fn loadRequirementBytes(weights_bytes: u64) u64 {
 
 // ── tests ──
 
-test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included; the host gather bills nothing" {
+test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included; the host gather bills nothing; auto bills what the RAM test will allow" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -335,18 +341,23 @@ test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/ngram_table.bin", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(path);
 
-    const was = ple_gpu.pleGpu().enabled;
-    defer ple_gpu.pleGpu().enabled = was;
+    const was = ple_gpu.pleGpu().mode;
+    defer ple_gpu.pleGpu().mode = was;
     var config: model_mod.ModelConfig = .{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .ngram_table_path = path };
-    ple_gpu.pleGpu().enabled = false;
-    try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, &config));
-    ple_gpu.pleGpu().enabled = true;
-    try std.testing.expectEqual(@as(u64, 10), pleTableBill(io, &config));
+    ple_gpu.pleGpu().mode = .off;
+    try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, &config, 0));
+    ple_gpu.pleGpu().mode = .on;
+    try std.testing.expectEqual(@as(u64, 10), pleTableBill(io, &config, 0));
     // An embedded pack bills its shards' payload; its `ngram_table.bin` path names no file.
     config.embedded_ple_payload_bytes = 120;
-    try std.testing.expectEqual(@as(u64, 120), pleTableBill(io, &config));
+    try std.testing.expectEqual(@as(u64, 120), pleTableBill(io, &config, 0));
+    // Auto predicts `load`: RAM that cannot hold weights + table + headroom + context bills nothing.
+    ple_gpu.pleGpu().mode = .auto;
+    try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, &config, std.math.maxInt(u64)));
+    ple_gpu.pleGpu().mode = .on;
+    try std.testing.expectEqual(@as(u64, 120), pleTableBill(io, &config, std.math.maxInt(u64)));
     config = .{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } } };
-    try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, &config));
+    try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, &config, 0));
 }
 
 test "residentModelDiskBytes: a ModelOpt pack is billed its decoded expert banks" {

@@ -935,7 +935,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
     // Commit the same validated weight estimate used by the eviction gate
     // and preflight (zero means no disk estimate), plus a GPU-resident n-gram table.
-    const bytes_resident = committedTextBytes(model_bytes, params.config) + pleTableBill(sch.io, params.config);
+    const bytes_resident = committedTextBytes(model_bytes, params.config) + pleTableBill(sch.io, params.config, model_bytes);
 
     const bytes_live = mlxActiveBytes() -| live_before;
 

@@ -265,7 +265,7 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
     _ = mlx.mlx_get_active_memory(&weights_bytes);
     // A pipeline rank without the PLE layer, or a tensor worker, never reads the table.
     if (config.pleLocalLayer() != null and !(if (config.dist_shard) |sh| sh.rank != 0 else false)) {
-        st.gpu = ple_gpu.load(&st.table, ple_gpu.pleGpu().enabled, weights_bytes);
+        st.gpu = ple_gpu.load(&st.table, ple_gpu.pleGpu().mode, weights_bytes, ple_gpu.autoCtxRoom(config));
         if (st.gpu == null) st.table.calibrateArm();
         // The weights load just evicted the table from page cache; an embedded pack's GPU arm holds its own copy.
         if (st.gpu == null or st.table.embedded == null) st.table.startWarm();

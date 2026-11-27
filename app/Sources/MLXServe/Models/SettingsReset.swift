@@ -92,7 +92,7 @@ enum SettingsReset {
                 f("hotPrefixCacheEnabled") { $0.hotPrefixCacheEnabled = $1.hotPrefixCacheEnabled },
                 f("prefixCacheEntries") { $0.prefixCacheEntries = $1.prefixCacheEntries },
                 f("prefixCacheMem") { $0.prefixCacheMem = $1.prefixCacheMem },
-                f("pleGpu") { $0.pleGpu = $1.pleGpu },
+                f("pleGpuHostRead") { $0.pleGpuHostRead = $1.pleGpuHostRead },
             ]
 
         // One section, so one reset: the universal knob and the MLX-only ones.

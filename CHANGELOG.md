@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Qwen3.8-Flash-Next long replies get faster when your Mac can spare the room.** The n-gram table is now gathered on the GPU automatically when RAM comfortably covers its ~30 GB plus a full 256k-token context — about 9–10% more decoded tokens a second from 50k-token contexts; Macs without that room keep the memory-light host read, and `--no-ple-gpu` (an app toggle) keeps it everywhere.
+
 ## v26.11.4 — Inkling 2 Mini
 
 - **Inkling 2 Mini.** Thinking Machines' looped 26B model runs straight from its released checkpoint, an mlx-lm pack or an oMLX oQ pack: it reads images, drafts ahead with the head it ships, and serves several chats at once, checking their drafts together on the GPU. With a DFlash2 drafter in the pack, each round checks a small tree of candidate continuations in one pass (thanks @CerebralCoding, @davidtai, @JaySNL).

@@ -144,12 +144,17 @@ pub const ModelProps = struct {
     mtp_greedy_tail: bool = false,
 };
 
+/// The launch's choice for the qwen4 n-gram table read, shared host↔engine by name.
+pub const PleGpuChoice = enum { auto, on, off };
+
 /// The launch flags that set the engine's own process-wide settings, applied once (`configure`) before a model loads.
 pub const Flags = struct {
     no_vision: bool = false,
     prevent_sleep: bool = true,
     skip_mem_preflight: bool = false,
-    ple_gpu: bool = false,
+    /// `--ple-gpu` / `--no-ple-gpu` for the qwen4 n-gram table; auto enables the GPU gather
+    /// only when RAM covers the table, the weights, headroom and a 256k-token context.
+    ple_gpu: PleGpuChoice = .auto,
     /// `--mtp-min-depth` / `--mtp-max-depth`; a max of 0 leaves the planner's own cap.
     mtp_depth_min: u32 = 1,
     mtp_depth_max: u32 = 0,
