@@ -57,6 +57,7 @@ const io_util = @import("../../../../sdk/util/io_util.zig");
 const disk_writer = @import("writer.zig");
 pub const module_record = @import("module_record.zig");
 const log = @import("../../../../sdk/util/log.zig");
+const boundary_mod = @import("../boundary.zig");
 
 const KVCache = transformer_mod.KVCache;
 
@@ -504,6 +505,56 @@ pub const DiskTier = struct {
         header: []const u8,
         tensors: []const module_record.Tensor,
     };
+
+    /// A committed module record found by its boundary; the slices belong to the tier.
+    pub const ModuleRef = struct {
+        id: u64,
+        tokens: []const u32,
+        media: []const MediaSpan,
+        has_tools: bool,
+        quant: kv_quant.KVQuantConfig,
+        prefix_key: u64,
+    };
+
+    /// The newest committed record of the prompt boundary `n` tokens long that `boundary.id` names: the RAM entry's
+    /// twin on the SSD, found by identity and never by length or recency.
+    pub fn moduleByBoundary(self: *DiskTier, id: u64, n: usize) ?ModuleRef {
+        self.pollModuleWrites();
+        return self.moduleByBoundaryNow(id, n);
+    }
+
+    /// `moduleByBoundary` against the records as the last poll left them.
+    pub fn moduleByBoundaryNow(self: *const DiskTier, id: u64, n: usize) ?ModuleRef {
+        var best: ?*const IndexEntry = null;
+        for (self.entries.items) |*e| {
+            if (e.kind != .module or e.poisoned or e.module.?.state != .committed) continue;
+            if (!moduleIsBoundary(e, id, n)) continue;
+            if (best == null or e.id > best.?.id) best = e;
+        }
+        const e = best orelse return null;
+        return .{
+            .id = e.id,
+            .tokens = e.tokens,
+            .media = e.media,
+            .has_tools = e.has_tools,
+            .quant = e.quant,
+            .prefix_key = @bitCast(e.module.?.manifest.prefix_key),
+        };
+    }
+
+    /// Whether a record of that prompt boundary is registered and still being written, so it may yet commit.
+    pub fn moduleWritePending(self: *const DiskTier, id: u64, n: usize) bool {
+        for (self.entries.items) |*e| {
+            if (e.kind != .module or e.poisoned) continue;
+            if (e.module.?.state != .registered and e.module.?.state != .exporting and e.module.?.state != .submitted) continue;
+            if (moduleIsBoundary(e, id, n)) return true;
+        }
+        return false;
+    }
+
+    fn moduleIsBoundary(e: *const IndexEntry, id: u64, n: usize) bool {
+        return e.kv_len == n and boundary_mod.id(@bitCast(e.module.?.manifest.prefix_key), e.tokens, e.media, e.has_tools, e.quant) == id;
+    }
 
     pub const ModuleSlice = enum { progress, busy, done };
     pub const ModuleCandidate = struct { id: u64, n: u32, prefix_key: u64 };

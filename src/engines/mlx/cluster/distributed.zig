@@ -1119,6 +1119,12 @@ pub fn holds(model_dir: []const u8) bool {
     return cluster().joined.load(.acquire) and serves(model_dir);
 }
 
+/// Whether this server is configured for or joined to an active JACCL distributed cluster (`--dist`).
+pub fn isActive() bool {
+    if (comptime builtin.os.tag != .macos) return false;
+    return cluster().group != null or cluster().joined.load(.acquire);
+}
+
 /// Whether `model_dir` is the model this server's group serves.
 pub fn serves(model_dir: []const u8) bool {
     if (comptime builtin.os.tag != .macos) return false; // a cluster exists only on macOS

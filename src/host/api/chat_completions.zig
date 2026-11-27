@@ -90,6 +90,7 @@ const sendErrorResponse = @import("../http/errors.zig").sendErrorResponse;
 const cachedFormatChat = @import("format.zig").cachedFormatChat;
 const speech_stream = @import("speech_stream.zig");
 const speech_api = @import("speech.zig");
+const cache_transfer = @import("cache_transfer.zig");
 const formatChatUsage = @import("format.zig").formatChatUsage;
 const formatChatUsageWithReasoning = @import("format.zig").formatChatUsageWithReasoning;
 const formatTimingsObject = @import("format.zig").formatTimingsObject;
@@ -124,6 +125,7 @@ pub fn handleChatCompletions(
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
+    if (stream.cache_export and stream.session_key != 0 and cache_transfer.isBodylessExport(allocator, body)) return cache_transfer.handleSessionExport(allocator, stream, lm);
     // NOTE: no `lm.transformer.?` here — this handler also serves engine-backed
     // models (GGUF/llama, ds4) whose `transformer` is null. The only MLX-specific
     // gate below reads `config.has_hybrid_layers` (valid for every model incl. the
@@ -230,6 +232,10 @@ pub fn handleChatCompletions(
                     if (part != .object) continue;
                     const ptype = part.object.get("type") orelse continue;
                     if (ptype != .string) continue;
+                    if (stream.cache_export and (std.mem.eql(u8, ptype.string, "image_url") or std.mem.eql(u8, ptype.string, "video_url") or std.mem.eql(u8, ptype.string, "input_audio"))) {
+                        try sendErrorResponse(allocator, stream, "422 Unprocessable Entity", "invalid_request_error", "Cache export does not support media content", 422);
+                        return;
+                    }
                     if (std.mem.eql(u8, ptype.string, "image_url")) {
                         const url = imageUrlOfPart(part.object) orelse {
                             image_decode_failed = true;
@@ -331,6 +337,10 @@ pub fn handleChatCompletions(
         // A spoken reply comes back as its id (OpenAI's history shape): it replays as its transcript.
         var spoken = content;
         if (content.len == 0 and std.mem.eql(u8, role_val.string, "assistant")) if (obj.get("audio")) |au| if (au == .object) if (au.object.get("id")) |aid| {
+            if (stream.cache_export) {
+                try sendErrorResponse(allocator, stream, "422 Unprocessable Entity", "invalid_request_error", "Cache export does not support audio history", 422);
+                return;
+            }
             const text = if (aid == .string) try speech_api.store.get(stream.io, allocator, aid.string, nowSecs(stream.io)) else null;
             if (text) |t| {
                 try content_allocs.append(allocator, t);
@@ -387,6 +397,10 @@ pub fn handleChatCompletions(
     const max_tokens_origin = maxTokensOrigin(requested_max_tokens, launchMaxTokensDefault());
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
+    if (stream.cache_export and cache_transfer.speechAsked(root)) {
+        try sendErrorResponse(allocator, stream, "422 Unprocessable Entity", "invalid_request_error", "Cache export does not support speech output", 422);
+        return;
+    }
     const speech_ask: ?speech_api.Ask = switch (speech_api.parse(root, config.speech() != null, is_stream)) {
         .none => null,
         .ask => |ask| ask,
@@ -778,6 +792,20 @@ pub fn handleChatCompletions(
     log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
     const cache_key = requestCacheKey(root);
+    if (stream.cache_export) {
+        defer allocator.free(prompt_ids_raw);
+        return cache_transfer.handleCacheExport(
+            allocator,
+            stream,
+            lm,
+            prompt_ids_raw,
+            has_tools,
+            kv_quant_override,
+            if (stream.ablation) |a| a.key else 0,
+            cache_key,
+            stream.cache_deadline_ms,
+        );
+    }
     var mm: MultimodalPrompt = .{};
     defer mm.deinit(allocator);
     if (lm.vision_encoder != null) {

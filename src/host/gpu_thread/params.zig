@@ -212,6 +212,8 @@ pub const SubmitParams = struct {
     media: []const MediaSpan = &.{},
     /// Workload key for hot-cache eviction (`server.requestCacheKey`, 0 = anonymous).
     cache_key: u64 = 0,
+    /// Optional `X-Session-Key` tag (0 = none): tags the module entries the request commits.
+    session: u64 = 0,
     /// A prefix cache of the request's own, in place of the model's (a warm request leaves the model's untouched).
     prefix_cache: ?*handles.HotPrefixCache = null,
     client: metrics_mod.Client = .other,

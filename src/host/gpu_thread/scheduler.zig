@@ -30,6 +30,10 @@ const EmbedRequest = requests.EmbedRequest;
 const LoadRequest = requests.LoadRequest;
 const GenRequest = requests.GenRequest;
 const UnloadRequest = requests.UnloadRequest;
+const CacheExportRequest = requests.CacheExportRequest;
+const CacheExportOutcome = requests.CacheExportOutcome;
+const CacheImportRequest = requests.CacheImportRequest;
+const CacheImportOutcome = requests.CacheImportOutcome;
 
 /// Most slots one batched decode tick advances.
 pub const MAX_BATCH_GROUP = 32;
@@ -296,6 +300,8 @@ pub const Scheduler = struct {
     /// Pending embedding requests (encoder-only models). Same shape as
     /// vision_queue; serviced inline between decode ticks.
     embed_queue: std.ArrayList(*EmbedRequest),
+    cache_export_queue: std.ArrayList(*CacheExportRequest) = .empty,
+    cache_import_queue: std.ArrayList(*CacheImportRequest) = .empty,
     /// Phase D: pending cold-load requests. Conn threads post here via
     /// `scheduler.ensureLoaded`; the inference thread drains between ticks
     /// (load runs after cleanup + vision/embed, before prefill). Multiple
@@ -435,6 +441,14 @@ pub const Scheduler = struct {
 
     pub fn encodeVision(self: *Scheduler, req: *VisionEncodeRequest) !mlx.mlx_array {
         return mlx_engine.encodeVision(self, req);
+    }
+
+    pub fn exportCache(self: *Scheduler, req: *CacheExportRequest) !CacheExportOutcome {
+        return mlx_engine.exportCache(self, req);
+    }
+
+    pub fn importCache(self: *Scheduler, req: *CacheImportRequest) !CacheImportOutcome {
+        return mlx_engine.importCache(self, req);
     }
 };
 

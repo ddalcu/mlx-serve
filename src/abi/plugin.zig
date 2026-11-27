@@ -25,6 +25,13 @@ const nan = std.math.nan(f32);
 /// An object the engine owns and the plugin only passes back (a slot's KV cache): opaque until P3 types it.
 pub const Handle = ?*anyopaque;
 
+pub const AuxImportPlan = extern struct {
+    size: u32 = @sizeOf(AuxImportPlan),
+    peak: u64 = 0,
+    loaded: u64 = 0,
+    destination: u64 = 0,
+};
+
 /// The layers this process serves when a model is split across machines; null = all of them.
 pub const LayerSpan = extern struct {
     size: u32 = @sizeOf(LayerSpan),
@@ -853,6 +860,10 @@ pub const AuxExport = extern struct {
 /// Every call runs on the inference thread, except `free` at process teardown, which runs on the thread tearing the
 /// model down after the inference thread has exited. A snapshot's caller owns it until `free`.
 pub const AuxHooks = extern struct {
+    /// The smallest table a host accepts: the required members. `import_plan_details` and `settings_key` are optional
+    /// tails, absent from a table that ends before them.
+    pub const min_size = @offsetOf(AuxHooks, "import_plan_details");
+
     size: u32 = @sizeOf(AuxHooks),
     reserve: *const fn (m: *anyopaque, slot: u32, tokens: u64) callconv(.c) Verdict,
     commit: *const fn (m: *anyopaque, slot: u32, len: u64) callconv(.c) Verdict,
@@ -887,6 +898,10 @@ pub const AuxHooks = extern struct {
     /// Borrows all inputs; validates every name/shape/dtype before allocating destination state. Success returns
     /// an evaluated, independent snapshot with growth headroom; failure frees partial state and leaves out null.
     import_arrays: *const fn (m: *anyopaque, ids: Span(u32), header: Str, arrays: Span(AuxTensor), out: *Handle) callconv(.c) Verdict,
+    import_plan_details: ?*const fn (m: *anyopaque, header: Str, out: *AuxImportPlan) callconv(.c) Verdict = null,
+    /// A hash of this loaded instance's settings that change the bytes it caches, beyond the engine's own (a numerics
+    /// lever, the arm the load chose). Hosts refuse a peer's entry when it differs; null contributes nothing.
+    settings_key: ?*const fn (m: *anyopaque) callconv(.c) u64 = null,
 };
 
 pub const CacheHooks = extern struct {
@@ -1198,12 +1213,17 @@ test "auxiliary tensor structures start with their size" {
     }
 }
 
-test "abi plugin: auxiliary callbacks are required function pointers" {
+test "abi plugin: auxiliary callbacks are function pointers, only the trailing extras optional" {
     const info = @typeInfo(AuxHooks).@"struct";
     inline for (info.field_names, info.field_types, info.field_attrs) |name, T, attrs| {
         if (comptime std.mem.eql(u8, name, "size")) continue;
-        try testing.expect(@typeInfo(T) == .pointer);
-        try testing.expect(attrs.defaultValue(T) == null);
+        if (@typeInfo(T) == .optional) {
+            try testing.expect(@typeInfo(@typeInfo(T).optional.child) == .pointer);
+            try testing.expect(attrs.defaultValue(T).? == null);
+        } else {
+            try testing.expect(@typeInfo(T) == .pointer);
+            try testing.expect(attrs.defaultValue(T) == null);
+        }
     }
 }
 

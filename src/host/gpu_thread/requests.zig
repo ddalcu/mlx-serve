@@ -358,3 +358,91 @@ pub const EmbedRequest = struct {
     done_mu: std.Io.Mutex = .init,
     done_cond: std.Io.Condition = .init,
 };
+
+pub const CacheExportOutcome = union(enum) {
+    not_found,
+    transfer_unsupported,
+    identity_pending,
+    deadline_passed,
+    too_large: u64,
+    no_memory,
+    ok: struct {
+        bytes: []u8,
+        n: usize,
+        export_ms: u64,
+        planned_peak: u64,
+    },
+};
+
+pub const CacheExportRequest = struct {
+    model: *LoadedModel,
+    prompt_ids: []const u32,
+    has_tools: bool,
+    kv_quant_override: ?kv_quant.KVQuantConfig = null,
+    variant: u64 = 0,
+    cache_key: u64 = 0,
+    /// Nonzero: export the prompt boundary the session's tip names (`sessionTip`); `prompt_ids` is ignored.
+    session: u64 = 0,
+    deadline_ms: ?u64 = null,
+    max_bytes: usize,
+    admit_transfer_budget: bool = false,
+    outcome: CacheExportOutcome = .not_found,
+    /// A static `@errorName` or literal: allocation must not be able to hide a failure.
+    error_name: ?[]const u8 = null,
+    done: bool = false,
+    allocator: std.mem.Allocator,
+    done_mu: std.Io.Mutex = .init,
+    done_cond: std.Io.Condition = .init,
+};
+
+pub const CacheImportRefusal = enum {
+    deadline_passed,
+    bad_envelope,
+    unknown_version,
+    truncated_body,
+    bad_dtype,
+    bad_shape,
+    bad_offsets,
+    bad_checksum,
+    bad_quant_config,
+    unsupported_model,
+    layout_key,
+    pack_identity,
+    settings,
+    quant_config,
+    stale,
+    no_memory,
+    import_plan,
+    import_arrays,
+    describe_mismatch,
+    commit_declined,
+    transfer_unsupported,
+    identity_pending,
+};
+
+pub const CacheImportStats = struct {
+    n: usize,
+    bytes: usize,
+    decode_ms: u64,
+    admit_ms: u64,
+    import_ms: u64,
+    commit_ms: u64,
+};
+
+pub const CacheImportOutcome = union(enum) {
+    ok: CacheImportStats,
+    refused: CacheImportRefusal,
+};
+
+pub const CacheImportRequest = struct {
+    model: *LoadedModel,
+    body: []const u8,
+    deadline_ms: ?u64 = null,
+    outcome: CacheImportOutcome = .{ .refused = .bad_envelope },
+    /// A static `@errorName` or literal: allocation must not be able to hide a failure.
+    error_name: ?[]const u8 = null,
+    done: bool = false,
+    allocator: std.mem.Allocator,
+    done_mu: std.Io.Mutex = .init,
+    done_cond: std.Io.Condition = .init,
+};

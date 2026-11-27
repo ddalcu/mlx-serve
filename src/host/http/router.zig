@@ -50,6 +50,8 @@ const handleTokenize = @import("../api/tokenize.zig").handleTokenize;
 const handleDetokenize = @import("../api/tokenize.zig").handleDetokenize;
 const handleChatCompletions = @import("../api/chat_completions.zig").handleChatCompletions;
 const handleCompletions = @import("../api/completions.zig").handleCompletions;
+const handleCacheImport = @import("../api/cache_transfer.zig").handleCacheImport;
+const cache_rdma = @import("../api/cache_rdma.zig");
 const sendResponse = @import("respond.zig").sendResponse;
 const sendResponseQuiet = @import("respond.zig").sendResponseQuiet;
 const logHttpRequest = @import("respond.zig").logHttpRequest;
@@ -58,6 +60,8 @@ const logSafeBody = @import("respond.zig").logSafeBody;
 const findHeaderValue = @import("request.zig").findHeaderValue;
 const apiKeyGateApplies = @import("auth.zig").apiKeyGateApplies;
 const peerIsLoopback = @import("auth.zig").peerIsLoopback;
+const checkCacheTransferAuth = @import("auth.zig").checkCacheTransferAuth;
+const sendCacheTransferDenial = @import("auth.zig").sendCacheTransferDenial;
 const lanGateApplies = @import("../lan/http.zig").lanGateApplies;
 const isTunneledRequest = @import("../lan/http.zig").isTunneledRequest;
 const lanShareDenial = @import("../lan/http.zig").lanShareDenial;
@@ -116,6 +120,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/audio/sound-generations",
     "/v1/audio/speech",
     "/v1/audio/transcriptions",
+    "/v1/cache/import",
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/decisions",
@@ -161,6 +166,8 @@ pub const max_request_bytes: usize = max_media_request_bytes;
 /// A decision prompt keeps at most `max_len` state tokens, so a larger body only
 /// buys tokenizer work on the inference thread.
 pub const max_decision_request_bytes: usize = 4 * 1024 * 1024;
+pub const max_cache_transfer_body_bytes: usize = 4 * 1024 * 1024 * 1024;
+pub const max_cache_export_bytes: usize = max_cache_transfer_body_bytes;
 
 /// Per-route request-body cap. Media bodies are base64 payloads — a single
 /// ref2va reference video is ~100 MB of JPEG frames, three plus full-res
@@ -168,6 +175,8 @@ pub const max_decision_request_bytes: usize = 4 * 1024 * 1024;
 /// history carries its screenshots the same way. Only a decision prompt is small.
 pub fn maxRequestBytesFor(target: []const u8) usize {
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+    if (isRoute(path, "/v1/cache/import")) return max_cache_transfer_body_bytes + 16 * 1024;
+    if (cache_rdma.isRdmaPath(path)) return 1024 * 1024;
     for ([_][]const u8{ "/v1/images/", "/v1/video/", "/v1/audio/", "/v1/3d/" }) |p|
         if (std.mem.startsWith(u8, path, p)) return max_media_request_bytes;
     if (isRoute(path, "/v1/decisions") or isRoute(path, "/v1/systemone")) return max_decision_request_bytes;
@@ -200,6 +209,12 @@ fn sendKeyRefusal(stream: *Conn, method: []const u8, path: []const u8, raw_heade
 /// The login form's POST carries a key of at most 512 encoded bytes.
 const LOGIN_FORM_MAX_BYTES = 4096;
 
+fn isCacheTransferHead(path: []const u8, raw_headers: []const u8) bool {
+    if (isRoute(path, "/v1/cache/import") or cache_rdma.isRdmaPath(path)) return true;
+    const v = findHeaderValue(raw_headers, "x-cache-export") orelse return false;
+    return std.mem.eql(u8, v, "1");
+}
+
 /// The key gate on the head alone, so a client without the key gets no `100 Continue` and no
 /// buffer for its body. Only the login form, which carries its key in the body, is let through.
 fn refusedBeforeBody(stream: *Conn, head: *const RequestHead) !bool {
@@ -209,6 +224,7 @@ fn refusedBeforeBody(stream: *Conn, head: *const RequestHead) !bool {
     const method = it.next() orelse return false;
     const raw_path = it.next() orelse return false;
     const path = raw_path[0 .. std.mem.indexOfScalar(u8, raw_path, '?') orelse raw_path.len];
+    if (isCacheTransferHead(path, raw_headers)) return false;
     if (!keyGateCovers(stream, method, path) or apiKeyAuthorized(raw_headers, raw_path)) return false;
     const content_type = findHeaderValue(raw_headers, "content-type") orelse "";
     if (std.mem.eql(u8, method, "POST") and isRoute(path, "/") and
@@ -235,7 +251,7 @@ pub fn handleConnection(
     if (!try readHead(stream, &head, REQUEST_READ_LIMIT_MS)) return;
     if (try refusedBeforeBody(stream, &head)) return drainBody(stream, &head, REQUEST_READ_LIMIT_MS);
     const raw = (try readBody(allocator, stream, &head, REQUEST_READ_LIMIT_MS)) orelse return;
-    defer allocator.free(raw.buf);
+    defer raw.deinit(allocator);
     // The request's ablation key points into `raw.buf`.
     defer stream.clearAblation();
     const total_read = raw.len;
@@ -255,11 +271,36 @@ pub fn handleConnection(
     // boundary lets us find (`parseModelFromRequest`).
     const request_content_type = findHeaderValue(request[0..header_end_pos], "content-type") orelse "";
     logHttpRequest(method, logSafePath(raw_path), logSafeBody(method, path, request_content_type, request_body));
-    if (multipart.boundaryFromContentType(request_content_type) == null and jsonNestingDepth(request_body) > MAX_JSON_DEPTH) {
+    if (!isRoute(path, "/v1/cache/import") and multipart.boundaryFromContentType(request_content_type) == null and jsonNestingDepth(request_body) > MAX_JSON_DEPTH) {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request JSON nests deeper than 4096 levels", 400);
         return;
     }
-    stream.noteRequestHeaders(request[0..header_end_pos]);
+    stream.noteRequestHeadersAt(request[0..header_end_pos], raw.header_read_ms);
+    if (cache_rdma.isRdmaPath(path)) {
+        try cache_rdma.handleRequest(allocator, stream, method, raw_path, path, request[0..header_end_pos], request_body);
+        return;
+    }
+    const cache_import = isRoute(path, "/v1/cache/import");
+    const cache_internal = stream.cache_export or cache_import;
+    if (cache_internal) {
+        const verdict = checkCacheTransferAuth(http_server.g_cache_transfer, stream.stream.socket.address, request[0..header_end_pos], raw_path);
+        if (verdict != .allowed) {
+            try sendCacheTransferDenial(allocator, stream, verdict, cache_import);
+            return;
+        }
+        if (stream.cache_export and !(std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/chat/completions"))) {
+            try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Cache export requires POST /v1/chat/completions", 404);
+            return;
+        }
+        if (cache_import and !std.mem.eql(u8, method, "POST")) {
+            try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Unknown endpoint", 404);
+            return;
+        }
+        if (stream.cache_deadline_invalid) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "X-Cache-Deadline-Ms must be a positive decimal integer", 400);
+            return;
+        }
+    }
 
     // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
     //    requires the key (the OpenAI/Anthropic/Ollama APIs AND the index page
@@ -270,7 +311,7 @@ pub fn handleConnection(
     //    exposure. Browser-facing pages get a `WWW-Authenticate: Basic`
     //    challenge so the index + metrics panel prompt for the key; API clients
     //    pass Bearer / x-api-key. null key ⇒ fully open. See `apiKeyAuthorized`.
-    if (keyGateCovers(stream, method, path)) {
+    if (!cache_internal and keyGateCovers(stream, method, path)) {
         const raw_headers = request[0..header_end_pos];
         if (loginFormKey(method, path, request_content_type, request_body)) |k| {
             if (encodedKeyMatches(k, http_server.g_api_key.?)) return sendKeyCookie(stream, k);
@@ -290,7 +331,7 @@ pub fn handleConnection(
     //    (lan.routeClass) on shared models only. With a key set, unauthorized
     //    non-loopback requests already died above and key-holders keep full
     //    access — so this gate only exists in keyless mode.
-    if (lanGateApplies(stream)) {
+    if (!cache_internal and lanGateApplies(stream)) {
         if (lanShareDenial(http_server.g_lan.?, registry, method, path, request_body, request_content_type, isTunneledRequest(request[0..header_end_pos]))) |denial| {
             log.debug("{s} {s} -> 403 (lan: {s})\n", .{ method, path, denial });
             try sendErrorResponse(allocator, stream, "403 Forbidden", "forbidden", denial, 403);
@@ -474,7 +515,7 @@ pub fn handleConnection(
     var model_id_buf: [512]u8 = undefined;
     var query_model_buf: [512]u8 = undefined;
     // The proxies splice over the value as written, so they also get the raw slice.
-    const body_model = parseModelFromRequest(request_body, request_content_type);
+    const body_model = if (isRoute(path, "/v1/cache/import")) null else parseModelFromRequest(request_body, request_content_type);
     var requested_model_id = lan_mod.unescapeJsonSlashes(
         &model_id_buf,
         body_model orelse queryModel(&query_model_buf, raw_path) orelse "",
@@ -490,14 +531,18 @@ pub fn handleConnection(
     // ── Configured provider (`<id>@<provider>`) → proxied to its
     //    /v1/chat/completions with the provider's key. Checked before the LAN
     //    table: a provider is a URL the user typed, a peer is discovered.
-    if (http_server.g_providers) |prov| if (lan_mod.splitRemoteId(requested_model_id)) |rid| if (prov.isProvider(rid.peer) and
+    if (cache_internal and lan_mod.splitRemoteId(requested_model_id) != null and registry.peek(requested_model_id) == null) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Cache transfer cannot target a remote proxied model", 400);
+        return;
+    }
+    if (!cache_internal) if (http_server.g_providers) |prov| if (lan_mod.splitRemoteId(requested_model_id)) |rid| if (prov.isProvider(rid.peer) and
         !isTunneledRequest(request[0..header_end_pos]) and registry.peek(requested_model_id) == null)
     {
         if (try refuseProxiedAblation(allocator, stream, request_body)) return;
         try handleProviderProxy(allocator, stream, prov, path, request_body, body_model, requested_model_id);
         return;
     };
-    if (http_server.g_lan != null and lan_mod.splitRemoteId(requested_model_id) != null and
+    if (!cache_internal and http_server.g_lan != null and lan_mod.splitRemoteId(requested_model_id) != null and
         !isTunneledRequest(request[0..header_end_pos]) and registry.peek(requested_model_id) == null)
     {
         if (try refuseProxiedAblation(allocator, stream, request_body)) return;
@@ -506,7 +551,7 @@ pub fn handleConnection(
     }
     // Counted from here to the response's end: a burst's requests decide their spec mode before any reaches the
     // engine, so the engine's own count misses them (`request_options.requestHasCompany`).
-    const text_gen = isTextGenRoute(method, path);
+    const text_gen = isTextGenRoute(method, path) and !stream.cache_export;
     if (text_gen) _ = request_options.text_gen_live.fetchAdd(1, .monotonic);
     defer if (text_gen) {
         _ = request_options.text_gen_live.fetchSub(1, .monotonic);
@@ -526,7 +571,7 @@ pub fn handleConnection(
     // to earn its 400. The post-load `text_gen_reject` below stays the
     // authoritative crash barrier (this peek can't see `--model` primaries
     // with no arch hint until they're resident).
-    if (requested_model_id.len > 0 and isTextGenRoute(method, path)) {
+    if (requested_model_id.len > 0 and (isTextGenRoute(method, path) or cache_import)) {
         // Entry and snapshot under ONE hold — plain `peek` unlocks before it
         // returns. `arch_hint` outlives the unlock: entry-owned, freed in
         // `deinit`.
@@ -630,6 +675,12 @@ pub fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleChatCompletions(allocator, stream, body, lm);
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/cache/import")) {
+        if (text_gen_reject) |reason| {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+            return;
+        }
+        try handleCacheImport(allocator, stream, request_body, lm);
     } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/completions")) {
         if (text_gen_reject) |reason| {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
@@ -847,7 +898,7 @@ test "the index page documents every endpoint the server serves (drift guard)" {
     for (ROUTE_PATHS) |p| {
         // "/" is the page itself — trivially present and not worth documenting
         // as an endpoint row.
-        if (std.mem.eql(u8, p, "/")) continue;
+        if (std.mem.eql(u8, p, "/") or std.mem.eql(u8, p, "/v1/cache/import")) continue;
         if (std.mem.indexOf(u8, page, p) == null) {
             std.debug.print("endpoint missing from the index page: {s}\n", .{p});
             return error.EndpointNotDocumented;
@@ -858,7 +909,7 @@ test "the index page documents every endpoint the server serves (drift guard)" {
 test "the mlx-serve agent skill documents every /v1 endpoint it does not deliberately leave out" {
     // The skill is what an agent reads before writing client code; an endpoint
     // missing there does not exist for it.
-    const left_out = [_][]const u8{ "/v1/completions", "/v1/models/rescan", "/v1/providers", "/v1/providers/reload", "/v1/responses/compact" };
+    const left_out = [_][]const u8{ "/v1/cache/import", "/v1/completions", "/v1/models/rescan", "/v1/providers", "/v1/providers/reload", "/v1/responses/compact" };
     const skills = @import("agent_skills");
     outer: for (ROUTE_PATHS) |p| {
         if (!std.mem.startsWith(u8, p, "/v1/")) continue;
@@ -1000,4 +1051,17 @@ test "an unauthenticated POST under --api-key-strict is refused before its body 
     try std.testing.expect(std.mem.startsWith(u8, chat, "HTTP/1.1 401"));
     const form = try keylessStrictReply("POST / HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 104857600\r\n\r\n", &buf);
     try std.testing.expect(std.mem.startsWith(u8, form, "HTTP/1.1 401"));
+}
+
+test "cache transfer routes accept bodies above 512 MiB under the 4 GiB ceiling" {
+    const body_size: usize = 768 * 1024 * 1024;
+    try std.testing.expect(body_size <= max_cache_export_bytes);
+    try std.testing.expect(body_size <= maxRequestBytesFor("/v1/cache/import"));
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), maxRequestBytesFor("/v1/chat/completions"));
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), maxRequestBytesFor("/v1/images/generations"));
+}
+
+test "cache import route allows bounded headers around a 4 GiB body" {
+    try std.testing.expectEqual(max_cache_transfer_body_bytes + 16 * 1024, maxRequestBytesFor("/v1/cache/import"));
+    try std.testing.expectEqual(max_cache_transfer_body_bytes, max_cache_export_bytes);
 }

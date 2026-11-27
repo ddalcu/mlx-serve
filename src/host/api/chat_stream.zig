@@ -255,6 +255,7 @@ pub fn handleStreamingGeneration(
         .vision_embeddings = slot_ve_s,
         .media = media,
         .cache_key = cache_key,
+        .session = if (@import("../http/auth.zig").sessionTagAllowed(stream)) stream.session_key else 0,
         .client = stream.client,
         .priority = stream.priority,
         .ablation = stream.ablation,

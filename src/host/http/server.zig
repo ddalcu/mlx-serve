@@ -71,6 +71,9 @@ pub var g_api_key_strict: bool = false;
 /// `--ablation-profiles` + `--ablation-key-file` (`api/ablation.zig`), set once before serving; null = off.
 pub var g_ablation: ?@import("../api/ablation.zig").Set = null;
 
+/// `--cache-transfer` / `--cache-transfer-key-file` (`http/auth.zig`), set once before serving; disabled by default.
+pub var g_cache_transfer: @import("auth.zig").CacheTransferConfig = .disabled;
+
 /// Tool-call ARGUMENT auto-correct. When true (default), parsed tool-call
 /// arguments are coerced to the types the request's tool schema declares
 /// (`chat.coerceToolArgsToSchema` — e.g. Python's `False` → JSON `false`, an
@@ -213,6 +216,8 @@ const ServerState = struct {
     server_config: ServerConfig = .{},
     /// `--wired-margin-gib` in bytes: what stays unplanned under a raised wired limit.
     wired_limit_margin_bytes: u64 = WIRED_LIMIT_MARGIN_BYTES,
+    cache_transfer_inbound_reserved: std.atomic.Value(u64) = .init(0),
+    cache_transfer_outbound_reserved: std.atomic.Value(u64) = .init(0),
 };
 /// The launch settings the engine's admission code reads beside the host, one copy for every compile unit (`Shared`).
 pub const Launch = struct {
@@ -234,6 +239,42 @@ pub inline fn launch() *Launch {
 pub const serverState_shared = @import("../../sdk/util/shared.zig").Shared(ServerState, "server_config", .{});
 pub inline fn serverState() *ServerState {
     return serverState_shared.get();
+}
+
+pub const CACHE_TRANSFER_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+fn reserveCacheTransferBytes(counter: *std.atomic.Value(u64), amount: u64) bool {
+    var current = counter.load(.acquire);
+    while (true) {
+        const next = current +| amount;
+        if (next > CACHE_TRANSFER_BUDGET_BYTES) return false;
+        if (counter.cmpxchgWeak(current, next, .acq_rel, .acquire)) |observed| {
+            current = observed;
+        } else {
+            return true;
+        }
+    }
+}
+
+pub fn reserveCacheImportBytes(amount: u64) bool {
+    return reserveCacheTransferBytes(&serverState().cache_transfer_inbound_reserved, amount);
+}
+
+pub fn releaseCacheImportBytes(amount: u64) void {
+    _ = serverState().cache_transfer_inbound_reserved.fetchSub(amount, .acq_rel);
+}
+
+pub fn reserveCacheExportBytes(amount: u64) bool {
+    return reserveCacheTransferBytes(&serverState().cache_transfer_outbound_reserved, amount);
+}
+
+pub fn releaseCacheExportBytes(amount: u64) void {
+    _ = serverState().cache_transfer_outbound_reserved.fetchSub(amount, .acq_rel);
+}
+
+pub fn cacheTransferReservedBytes() u64 {
+    const state = serverState();
+    return state.cache_transfer_inbound_reserved.load(.acquire) +| state.cache_transfer_outbound_reserved.load(.acquire);
 }
 
 pub fn getTimeoutNs() u64 {
@@ -637,7 +678,15 @@ pub fn serve(
         });
     }
 
+    var last_rdma_sweep_ms: i64 = 0;
     while (!shutdown_requested.load(.acquire)) {
+        if (g_cache_transfer.enabled()) {
+            const sweep_now_ms = nowMsMonotonic(io);
+            if (sweep_now_ms - last_rdma_sweep_ms >= 1_000) {
+                last_rdma_sweep_ms = sweep_now_ms;
+                @import("../api/cache_rdma.zig").sweepExpiredNonBlocking(io);
+            }
+        }
         // Poll with 1-second timeout so we can check shutdown flag
         const ready = socketReadable(server.socket.handle, 1000) catch |err| {
             if (shutdown_requested.load(.acquire)) break;
@@ -698,6 +747,7 @@ pub fn serve(
         armShutdownDeadline(&sch.shutdown_deadline_ms, nowMsMonotonic(io), shutdown_persist_secs);
         sch.cancelAllInFlight();
     }
+    @import("../api/cache_rdma.zig").quiesceGlobal(io);
     {
         var waited_ms: u64 = 0;
         while (active_conn_threads.load(.acquire) > 0 and waited_ms < 30_000) {
@@ -708,6 +758,7 @@ pub fn serve(
         if (remaining > 0)
             log.warn("shutdown: {d} connection thread(s) still active after {d}ms — proceeding\n", .{ remaining, waited_ms });
     }
+    @import("../api/cache_rdma.zig").quiesceGlobal(io);
 
     deinitGlobalResponseStore();
 
@@ -905,6 +956,8 @@ test {
     _ = @import("../api/anthropic_stream.zig");
     _ = @import("../api/audio.zig");
     _ = @import("../api/chat_completions.zig");
+    _ = @import("../api/cache_transfer.zig");
+    _ = @import("../api/cache_rdma.zig");
     _ = @import("../api/chat_stream.zig");
     _ = @import("../api/completions.zig");
     _ = @import("../api/embeddings.zig");

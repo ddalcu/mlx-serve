@@ -71,6 +71,7 @@ pub const Slot = struct {
     /// Media items in `full_prompt` (owned): the prefix-cache key of their rows.
     media: []prefix_cache_mod.MediaSpan,
     cache_key: u64 = 0,
+    session: u64 = 0,
     client: metrics_mod.Client = .other,
     request_id: u64 = 0,
     /// Hot-cache entry this request restored from (`LookupResult.entry_id`).
@@ -316,6 +317,7 @@ pub const Slot = struct {
             .vision_embeddings = params.vision_embeddings,
             .media = media_owned,
             .cache_key = params.cache_key,
+            .session = params.session,
             .client = params.client,
             .request_id = metrics_mod.nextRequestId(),
             .mrope_pos = params.mrope_pos,

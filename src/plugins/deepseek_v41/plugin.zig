@@ -25,6 +25,7 @@ const env = @import("../../env.zig");
 const engram_decode = @import("decode/engram_decode.zig");
 const flash_attn = @import("prompt/flash_attn.zig");
 const scratch_attn = @import("prompt/scratch_attn.zig");
+const numerics = @import("numerics.zig");
 const ablation = @import("ablation.zig");
 pub const config = @import("config.zig");
 
@@ -85,6 +86,7 @@ pub const Model = struct {
     cfg: config.Config,
     weights: Weights,
     mdl: *dsv41.Dsv41Model,
+    flash_mode: flash_attn.Mode = .off,
     tower: ?vision.Dsv41Vision,
     /// the pack whose vision tower the media hook reads for each image (`tower`
     /// then null).
@@ -313,6 +315,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     if (m.mdl.dspark) |*w| if (!m.mdl.draft_shard) try @import("spec/markov.zig").warm(m.mdl.s, w.markov_embed, w.markov_head, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true);
     m.bank = null;
     m.bank_streams = false;
+    m.flash_mode = flash_attn.ps().mode;
     m.owner = 0;
     m.parked = .empty;
     m.idle = null;
@@ -719,6 +722,7 @@ const aux_hooks = abi.AuxHooks{
     .prefix_key = &auxPrefixKey,
     .begin_prompt = &auxBeginPrompt,
     .import_plan = &auxImportPlan,
+    .import_plan_details = &auxImportPlanDetails,
     .export_arrays = &auxExportArrays,
     .import_arrays = &auxImportArrays,
     .reserve = &auxReserve,
@@ -729,7 +733,14 @@ const aux_hooks = abi.AuxHooks{
     .handoff = &auxHandoff,
     .free = &auxFree,
     .bytes = &auxBytes,
+    .settings_key = &auxSettingsKey,
 };
+
+fn auxSettingsKey(mp: *anyopaque) callconv(.c) u64 {
+    const m: *Model = @ptrCast(@alignCast(mp));
+    const tp_size: usize = if (m.mdl.tp) |tp| tp.size else 0;
+    return numerics.key(m.flash_mode, numerics.tpSumFor(tp_size, m.mdl.tp_sum));
+}
 
 fn auxEnabled(mp: *anyopaque) callconv(.c) bool {
     const m: *Model = @ptrCast(@alignCast(mp));
@@ -888,7 +899,18 @@ fn auxImportPlan(mp: *anyopaque, header: abi.Str, out: *u64) callconv(.c) Verdic
     out.* = 0;
     if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
     const m: *Model = @ptrCast(@alignCast(mp));
-    out.* = dsv41.snapshotImportPlan(m.mdl, header.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
+    out.* = (dsv41.snapshotImportPlan(m.mdl, header.slice()) catch |e| return Verdict.named(.failed, @errorName(e))).peak;
+    return .ok;
+}
+
+fn auxImportPlanDetails(mp: *anyopaque, header: abi.Str, out: *abi.AuxImportPlan) callconv(.c) Verdict {
+    out.* = .{};
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
+    const m: *Model = @ptrCast(@alignCast(mp));
+    const plan = dsv41.snapshotImportPlan(m.mdl, header.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
+    out.peak = plan.peak;
+    out.loaded = plan.loaded;
+    out.destination = plan.destination;
     return .ok;
 }
 

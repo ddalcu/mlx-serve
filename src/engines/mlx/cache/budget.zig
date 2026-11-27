@@ -9,6 +9,7 @@ const metrics_mod = @import("../../../host/metrics/metrics.zig");
 const model_registry_mod = @import("../../../host/registry/registry.zig");
 const log = @import("../../../sdk/util/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
+const http_server = @import("../../../host/http/server.zig");
 const plugin_driver = @import("../plugin/driver.zig");
 const ModelRegistry = model_registry_mod.ModelRegistry;
 const LoadedModel = model_registry_mod.LoadedModel;
@@ -213,7 +214,7 @@ pub fn flushOwedDiskSlices(sch: *Scheduler) prefix_cache_mod.FlushResult {
 
 /// Staged CPU bytes share the unified-memory ceiling with every resident binding's tensors.
 pub fn stagedHostBytes(sch: *Scheduler) u64 {
-    var bytes: u64 = 0;
+    var bytes: u64 = http_server.cacheTransferReservedBytes();
     sch.registry.mutex.lockUncancelable(sch.io);
     defer sch.registry.mutex.unlock(sch.io);
     var it = sch.registry.entries.valueIterator();
@@ -343,6 +344,20 @@ test "staged host bytes include every ready model writer regardless of the curre
     a.state = .unloaded;
     try testing.expectEqual(@as(u64, 6), stagedHostBytes(&sch));
     a.state = .ready;
+}
+
+test "staged host bytes include inbound and outbound cache transfer reservations" {
+    const reg = try ModelRegistry.init(testing.allocator, testing.io, null, 4, 0, null);
+    defer reg.deinit();
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = testing.io;
+
+    try testing.expect(http_server.reserveCacheImportBytes(11));
+    defer http_server.releaseCacheImportBytes(11);
+    try testing.expect(http_server.reserveCacheExportBytes(17));
+    defer http_server.releaseCacheExportBytes(17);
+    try testing.expectEqual(@as(u64, 28), stagedHostBytes(&sch));
 }
 
 test "idle flush reports busy while submitted module files await their writer" {

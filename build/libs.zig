@@ -142,6 +142,17 @@ pub fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
     module.addIncludePath(b.path("lib/ane"));
 }
 
+/// Dynamic ibverbs shim for macOS Thunderbolt 5 RDMA KV-cache transfer (`lib/rdma_shim`).
+/// Uses `dlopen("librdma.dylib")` at runtime so builds have zero link-time dependency on
+/// Thunderbolt RDMA and degrade cleanly on hosts without it.
+pub fn addRdmaShimSources(b: *std.Build, module: *std.Build.Module) void {
+    module.addCSourceFile(.{
+        .file = b.path("lib/rdma_shim/rdma_shim.c"),
+        .flags = &.{ "-O2", "-std=c11", "-Wall", "-Wextra" },
+    });
+    module.addIncludePath(b.path("lib/rdma_shim"));
+}
+
 pub fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
     // Link the prebuilt libllama staged by scripts/fetch-llama.sh. The dylib's
     // install-name is @rpath/libllama.dylib; we add an rpath to its build-tree

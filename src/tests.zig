@@ -74,6 +74,7 @@ test {
     _ = @import("plugins/deepseek_v4/served_test.zig");
     _ = @import("plugins/deepseek_v41/proof_test.zig");
     _ = @import("plugins/deepseek_v41/draft_test.zig");
+    _ = @import("plugins/deepseek_v41/peer_fetch_test.zig");
     _ = @import("plugins/muse_glimmer/proof_test.zig");
     _ = @import("plugins/qwen3_asr/proof_test.zig");
     _ = @import("plugins/qwen3_5/proof_test.zig");
@@ -156,6 +157,7 @@ test {
     _ = @import("engines/mlx/spec/mtp_replay_test.zig");
     _ = @import("engines/mlx/spec/mtp_lookup.zig");
     _ = @import("host/http/server.zig");
+    _ = @import("host/api/cache_rdma.zig");
     _ = @import("engines/mlx/admission/admit.zig");
     _ = @import("engines/mlx/admission/bills.zig");
     _ = @import("engines/mlx/admission/bills_test.zig");
@@ -260,6 +262,7 @@ test {
     _ = @import("plugins/bailing_hybrid/bill_test.zig");
     _ = @import("engines/mlx/plugin/deepseek_test.zig");
     _ = @import("plugins/deepseek_v41/engram.zig");
+    _ = @import("plugins/deepseek_v41/numerics.zig");
     _ = @import("sdk/weights/nocache_reader.zig");
     _ = @import("plugins/deepseek_v41/deepseek_v41.zig");
     _ = @import("plugins/qwen4_exp/qwen4_exp.zig");
@@ -274,11 +277,16 @@ test {
     _ = @import("sdk/tokenizer/tokenizer.zig");
     _ = @import("engines/mlx/cache/prefix_cache.zig");
     _ = @import("engines/mlx/cache/restore_dump.zig");
+    _ = @import("engines/mlx/cache/peer_wire.zig");
+    _ = @import("engines/mlx/cache/peer_transfer.zig");
+    _ = @import("engines/mlx/cache/pack_identity.zig");
     _ = @import("host/metrics/metrics.zig");
     _ = @import("sdk/util/system.zig");
     _ = @import("engines/mlx/runtime/sleep_inhibit.zig");
     _ = @import("engines/mlx/cache/ssd/disk_tier.zig");
     _ = @import("engines/mlx/cache/ssd/writer.zig");
+    _ = @import("engines/mlx/cache/ssd/session_index.zig");
+    _ = @import("engines/mlx/cache/boundary.zig");
     _ = @import("host/registry/discovery.zig");
     _ = @import("host/registry/stub_cache.zig");
     _ = @import("host/registry/pack_dir.zig");

@@ -100,6 +100,7 @@ Stateful chains via `previous_response_id`, full streaming SSE with per-event `s
 - `POST /tokenize`, `POST /detokenize`, `GET /props` — tokenizer round-trip and llama.cpp-style server props
 - `GET /metrics`, `GET /metrics.json` — Prometheus + JSON (needs `--metrics`)
 - `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}` — fetch / delete stored responses
+- `POST /v1/cache/import`, `GET /v1/cache/rdma/info`, `POST /v1/cache/rdma/{offer,accept,pull,quiesce}`, `DELETE /v1/cache/rdma/offer/{id}` — opt-in peer KV-cache transfer ([below](#kv-cache-transfer))
 
 Every media endpoint takes `"stream": true` for SSE progress ending in a base64 `complete` payload. Video streams also accept `"preview": true` for a cheap JPEG on each denoise step (off by default; cached-velocity H3 steps stay preview-less). Media LoRAs use one grammar everywhere: `lora_paths` + `lora_scales`, up to 8, stacked. The paths are files on the server's disk, so only a client on the server's own machine may send them; from anyone else (LAN sharing, `--api-key`) a request carrying them is a 403.
 
@@ -135,3 +136,38 @@ Use the [official RGBA prompt convention](https://github.com/QwenLM/Qwen-Image-2
 The option preserves generated alpha; it does not rewrite the prompt. It also applies
 to `"mode":"edit"`, so an instruction such as "remove the background" returns the
 edited image with its alpha channel.
+
+## KV-cache transfer
+
+Opt-in peer transfer moves a committed prefix-cache snapshot between `mlx-serve` instances without re-prefilling. Disabled by default: `/v1/cache/import` and `/v1/cache/rdma/*` return `404` and `X-Cache-Export: 1` returns `403`. `GET /props` advertises live support under `"cache_transfer": {"enabled": bool, "http": bool, "rdma": bool}`.
+
+- **Auth:** `--cache-transfer` admits loopback peers only (`403` from remote IPs; honors `--api-key-strict`). `--cache-transfer-key-file <path>` requires `Authorization: Bearer <key>` from any IP (including loopback), validated in constant time against a `0600` file (>= 32 bytes, owned by the server user, distinct from `--api-key`; `401` on mismatch).
+- **Session tagging:** passing `X-Session-Key: <id>` on chat requests tags the committed prefix-cache entry (and SSD session index) for bodyless session export; untrusted remote peers cannot tag sessions.
+
+### HTTP transport
+
+1. **Export (`POST /v1/chat/completions` with `X-Cache-Export: 1`):** returns `application/octet-stream` carrying a length-checked binary wire envelope (64-bit Wyhash checksum, background weight `pack_identity`, model layout, settings, and quant config) plus response headers `X-Cache-Tokens` and `X-Cache-Import-Peak` (planned destination peak bytes). Send a normal chat JSON body to export the longest matching RAM prefix, or an empty/`{}` body with `X-Session-Key` to export that session's latest tip (including a 2-member boundary + decode-tail bundle when present, or restored from `--prefix-cache-disk`). Optional `X-Cache-Deadline-Ms` bounds export time (`408` if exceeded).
+2. **Import (`POST /v1/cache/import`):** accepts the `application/octet-stream` body (optional `?model=<id>` query parameter, optional `X-Cache-Deadline-Ms`, optional `X-Cache-Import-Peak` checked before allocating the request body). Transfer bodies are capped at 4 GiB (`413 cache_transfer_too_large`) and bounded by a 4 GiB in-flight byte budget (`503 cache_import_busy` / `cache_import_peak_no_memory`).
+
+| Status | `error.reason` | Meaning |
+|---|---|---|
+| `400` | `bad_envelope`, `unknown_version`, `truncated_body`, `bad_dtype`, `bad_shape`, `bad_offsets`, `bad_checksum`, `bad_quant_config`, `cache_import_peak_invalid` | Corrupt wire payload or malformed header |
+| `404` | `session_not_found` | No matching RAM or SSD entry to export |
+| `408` | — | `X-Cache-Deadline-Ms` expired before export/import completed |
+| `409` | `transfer_unsupported`, `identity_pending`, `stale`, `commit_declined` | Model lacks transfer hooks, pack weight hash is still running, or destination already holds a newer/identical entry |
+| `413` | `cache_transfer_too_large` | Snapshot exceeds the 4 GiB transfer limit |
+| `422` | `unsupported_model`, `layout_key`, `pack_identity`, `settings`, `quant_config`, `import_plan`, `import_arrays`, `describe_mismatch` | Incompatible model weights, layout, settings, or KV quantization |
+| `503` | `cache_import_busy`, `cache_import_peak_no_memory`, `cache_export_no_memory`, `cache_import_no_memory` | Transfer byte budget full or insufficient GPU/RAM headroom |
+
+### macOS Thunderbolt 5 RDMA transport
+
+On macOS 26.2+ with Thunderbolt 5 RDMA (`rdma_ctl enable`), `mlx-serve` loads `librdma.dylib` lazily via `dlopen` (zero link-time dependency; `cache_transfer.rdma` stays `false` when unavailable). Transfer uses two-sided `IBV_QPT_UC` SEND/RECV over a pre-registered 4 MiB staging ring per directional QP (credit-paced 512 KiB x 4 window), carrying the exact same wire envelope verified by Wyhash on import. `mlx-serve` makes no outbound connections; an external coordinator mediates the control plane:
+
+- `GET /v1/cache/rdma/info` — returns `available`, `protocol` (`"uc_ring_v1"`), `distributed_active`, `server_version`, and available `devices` (e.g. `["rdma_en2"]`).
+- `POST /v1/cache/rdma/offer` — body `{"session_key", "peer_id", "rdma_dev", "model"?, "expires_ms"?}`; exports and pins the session snapshot, returning `transfer_id`, `server_version`, `byte_len`, `import_peak`, `token_count`, `qp_mode` (`"accept"` or `"persistent"`), and local `gid`/`qpn`/`psn`.
+- `POST /v1/cache/rdma/accept` — body `{"peer_id", "rdma_dev", "peer_gid"?, "peer_qpn"?, "peer_psn"?, "peer_lid"?, "transfer_id"?, "reset"?}`; transitions the directional UC QP `INIT -> RTR -> RTS` (pass `reset: true` without peer info on source to recreate an INIT sender QP; pass `transfer_id` on source to arm that pinned offer).
+- `POST /v1/cache/rdma/pull` — body `{"transfer_id", "peer_id", "rdma_dev", "model"?, "deadline_ms"?, "offer"}`; checks `offer.server_version` (`409 version_mismatch`), `import_peak` headroom (`400 import_no_room`), QP identity (`409 qp_reset`), and single-use `transfer_id` (`409 duplicate`) before pulling over TB5 and committing into the hot prefix cache.
+- `DELETE /v1/cache/rdma/offer/{id}?clean=1|0` — `clean=1` unpins and frees immediately; `clean=0` stops the responder and quarantines the buffer until `expires_ms` (reclaimed by a 1 s background sweep).
+- `POST /v1/cache/rdma/quiesce` — drains active offers and tears down all RDMA QPs and device handles cleanly.
+
+`offer`, `accept`, and `pull` return `503 rdma_distributed_active` while a `--dist` JACCL cluster is active (`info`, `DELETE`, and `quiesce` remain available).
