@@ -30,7 +30,7 @@ var dflash_conv_kernel: kernels.Kernel = .{ .name = "msv_inkling2_dflash_conv", 
 var dflash_top16_shard_kernel: kernels.Kernel = .{ .name = "msv_inkling2_dflash_top16_shard", .ins = &.{"LOGITS"}, .outs = &.{ "PIDS", "PVALS" }, .source = kernelSource("plugins/inkling2/kernels/dflash_top16_shard.metal") };
 var dflash_top16_merge_kernel: kernels.Kernel = .{ .name = "msv_inkling2_dflash_top16_merge", .ins = &.{ "PIDS", "PVALS" }, .outs = &.{ "IDS", "VALS" }, .source = kernelSource("plugins/inkling2/kernels/dflash_top16_merge.metal") };
 var dflash_edges_kernel: kernels.Kernel = .{ .name = "msv_inkling2_dflash_edges", .ins = &.{ "T1", "CANDS", "UNARY", "PROJ", "PRED", "SUCC", "CAP" }, .outs = &.{"PROBS"}, .source = kernelSource("plugins/inkling2/kernels/dflash_edges.metal") };
-var dflash_attn_kernel: kernels.Kernel = .{ .name = "msv_inkling2_dflash_attn", .ins = &.{ "q", "kb", "vb", "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "LANES", "scale" }, .outs = &.{ "PART", "ML" }, .source = kernelSource("plugins/inkling2/kernels/dflash_attn.metal") };
+pub var dflash_attn_kernel: kernels.Kernel = .{ .name = "msv_inkling2_dflash_attn", .ins = &.{ "q", "kb", "vb", "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "LANES", "scale" }, .outs = &.{ "PART", "ML" }, .source = kernelSource("plugins/inkling2/kernels/dflash_attn.metal") };
 var dflash_tree_kernel: kernels.Kernel = .{ .name = "msv_inkling2_dflash_tree", .ins = &.{ "T1", "CANDS", "PROBS", "CALIB", "TEMPS", "SEEDS", "COPY_IDS", "COPY_LEN", "COPY_RATE", "STOPS", "PARAMS" }, .outs = &.{ "TOKENS", "PARENT", "TMETA", "NEXT_Q", "DRAWS", "SCORES" }, .source = kernelSource("plugins/inkling2/kernels/dflash_tree.metal") };
 
 /// One sublayer's grouped dynamic convolution: `base` `[2, kernel, hidden]` (prepare, finish) and the projection of
@@ -502,12 +502,9 @@ pub const Drafter = struct {
         const nl: c_int = @intCast(ns.len);
         var meta: [4 * max_lanes]i32 = undefined;
         p.splits = 1;
-        // A lane's keys a split: enough splits that the launch fills the GPU, whole 16-key tiles, at least
-        // `attn_keys`; its own keys and the lane count set them, so its rows do not move with its neighbours'.
-        const want = @divTrunc(attn_groups + nl * hkv - 1, nl * hkv);
         for (positions, ns, 0..) |at, n, j| {
             const keys = n + block;
-            const kps = @max(attn_keys, @divTrunc(@divTrunc(keys + want - 1, want) + 15, 16) * 16);
+            const kps = keysPerSplit(nl, hkv, keys);
             meta[4 * j ..][0..4].* = .{ at, n, ringSlots(n, @intCast(c.window - 1)), kps };
             p.splits = @max(p.splits, @divTrunc(keys + kps - 1, kps));
         }
@@ -518,29 +515,9 @@ pub const Drafter = struct {
     }
 
     fn attendKernel(d: *const Drafter, g: *Graph, q: Array, kb: Array, vb: Array, rings: []const Array, p: *const Plan) !Array {
-        const c = &d.cfg;
-        const block: c_int = @intCast(c.block);
-        const hd: c_int = @intCast(c.head_dim);
-        const hq: c_int = @intCast(c.heads);
-        const hkv: c_int = @intCast(c.kv_heads);
-        const nl: c_int = @intCast(rings.len);
-        var inputs: [5 + max_lanes]Array = undefined;
-        inputs[0] = q;
-        inputs[1] = kb;
-        inputs[2] = vb;
-        // Every lane input is bound; past the lanes they repeat the first, unread.
-        for (inputs[3..][0..max_lanes], 0..) |*x, j| x.* = rings[if (j < rings.len) j else 0];
-        inputs[3 + max_lanes] = p.meta;
-        inputs[4 + max_lanes] = p.scale;
-        const rows = nl * block * hq;
-        const part = try kernels.launchGrid(g, &dflash_attn_kernel, &inputs, 2, .{
-            .{ .shape = &.{ p.splits, rows, hd }, .dtype = .float32 },
-            .{ .shape = &.{ p.splits, rows, 2 }, .dtype = .float32 },
-        }, .{ p.splits * 32 * @divExact(hq, hkv), hkv, nl }, .{ 32 * @divExact(hq, hkv), 1, 1 }, &.{
-            .{ "T", .{ .dtype = ops.dtype(q) } }, .{ "D", .{ .int = hd } },     .{ "HQ", .{ .int = hq } },
-            .{ "HKV", .{ .int = hkv } },          .{ "B", .{ .int = block } }, .{ "WINDOW", .{ .int = @intCast(c.window) } },
-        });
-        return g.reshape(try kernels.splitJoin(g, part, p.unit, nl * block, ops.dtype(q)), &.{ nl, block, hq * hd });
+        const sh = ops.shape(q);
+        const part = try attnParts(g, q, kb, vb, rings, p.meta, p.scale, p.splits, d.cfg.window);
+        return g.reshape(try kernels.splitJoin(g, part, p.unit, sh[0] * sh[2], ops.dtype(q)), &.{ sh[0], sh[2], sh[1] * sh[3] });
     }
 
     fn attendChain(d: *const Drafter, g: *Graph, q: Array, kb: Array, vb: Array, rings: []const Array, positions: []const c_int, ns: []const c_int) !Array {
@@ -914,7 +891,7 @@ const abi_max_round = @import("../../abi/plugin.zig").max_round_tokens;
 
 /// The slots of a ring that holds `n` context rows, at most `keep`: a power of two from 128 up, so a short context holds
 /// little, and the ring is rebuilt the few times it grows.
-fn ringSlots(n: c_int, keep: c_int) c_int {
+pub fn ringSlots(n: c_int, keep: c_int) c_int {
     return @min(keep, std.math.ceilPowerOfTwoAssert(u32, @intCast(@max(n, 128))));
 }
 
@@ -934,6 +911,41 @@ pub const max_lanes = 16;
 /// The threadgroups a `dflash_attn` launch aims for, and its fewest keys a split.
 const attn_groups = 512;
 const attn_keys = 32;
+
+/// A lane's keys a split in a launch of `nl` lanes over `hkv` KV heads, the lane holding `keys`: enough splits that the
+/// launch fills the GPU, whole 16-key tiles, at least `attn_keys`; its own keys and the lane count set them, so its rows
+/// do not move with its neighbours'.
+pub fn keysPerSplit(nl: c_int, hkv: c_int, keys: c_int) c_int {
+    const want = @divTrunc(attn_groups + nl * hkv - 1, nl * hkv);
+    return @max(attn_keys, @divTrunc(@divTrunc(keys + want - 1, want) + 15, 16) * 16);
+}
+
+/// One `dflash_attn` launch: the block rows `q` `[NL, HQ, B, D]` of NL lanes over each lane's ring (`rings`) and its
+/// block's own keys and values `kb`, `vb` `[NL, HKV, B, D]`, as `meta` `[NL, 4]` (position, context rows, ring slots,
+/// keys a split) lays them out in `splits` splits: each row's unnormalised sums `[splits, NL * B * HQ, D]` and its max
+/// and sum `[splits, NL * B * HQ, 2]` f32, which `kernels.splitJoin` joins.
+pub fn attnParts(g: *Graph, q: Array, kb: Array, vb: Array, rings: []const Array, meta: Array, scale: Array, splits: c_int, window: u32) ![2]Array {
+    const sh = ops.shape(q);
+    const hq = sh[1];
+    const block = sh[2];
+    const hd = sh[3];
+    const hkv = ops.shape(kb)[1];
+    var inputs: [5 + max_lanes]Array = undefined;
+    inputs[0] = q;
+    inputs[1] = kb;
+    inputs[2] = vb;
+    // Every lane input is bound; past the lanes they repeat the first, unread.
+    for (inputs[3..][0..max_lanes], 0..) |*x, j| x.* = rings[if (j < rings.len) j else 0];
+    inputs[3 + max_lanes] = meta;
+    inputs[4 + max_lanes] = scale;
+    return kernels.launchGrid(g, &dflash_attn_kernel, &inputs, 2, .{
+        .{ .shape = &.{ splits, sh[0] * block * hq, hd }, .dtype = .float32 },
+        .{ .shape = &.{ splits, sh[0] * block * hq, 2 }, .dtype = .float32 },
+    }, .{ splits * 32 * @divExact(hq, hkv), hkv, sh[0] }, .{ 32 * @divExact(hq, hkv), 1, 1 }, &.{
+        .{ "T", .{ .dtype = ops.dtype(q) } }, .{ "D", .{ .int = hd } },     .{ "HQ", .{ .int = hq } },
+        .{ "HKV", .{ .int = hkv } },          .{ "B", .{ .int = block } }, .{ "WINDOW", .{ .int = @intCast(window) } },
+    });
+}
 
 /// The block rows past which a draft reads the trunk's dense head (`Drafter.headFor`).
 pub const dense_head_rows = 16;
@@ -1028,6 +1040,8 @@ fn tinyDrafter(g: *Graph, layers: []Layer, window: u32, seed: u64) !Drafter {
 test "inkling2 dflash2: a carried context ring is written in place and drafts what a fresh one does" {
     const s = cpu();
     defer _ = mlx.mlx_stream_free(s);
+    // Buffers earlier tests left in MLX's cache, of the ring's size, would otherwise take its place (a full suite's order).
+    _ = mlx.mlx_clear_cache();
     var g0 = Graph.init(testing.allocator, s);
     defer g0.deinit();
     var layers: [2]Layer = undefined;

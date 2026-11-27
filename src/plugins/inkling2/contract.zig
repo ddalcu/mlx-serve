@@ -13,6 +13,7 @@ const ops = @import("../../mlx/ops.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const source = @import("../../mlx/kernels.zig").source;
 const kernels = @import("kernels.zig");
+const dflash2 = @import("dflash2.zig");
 const vision_contract = @import("vision_contract.zig");
 const layers = @import("layers.zig");
 const config = @import("config.zig");
@@ -1403,6 +1404,197 @@ const RelSplit = struct {
         defer g.deinit();
         const x = self.args;
         const parts = try kernels.splitParts(&g, x[0], x[1], x[2], if (self.own) .{ x[3], x[4] } else null, x[5], x[6], @intCast(self.window));
+        return self.rig.bytesOf(&parts);
+    }
+};
+
+const DHQ = 32;
+const DHKV = 8;
+const DB = 8;
+const DWIN = 2048;
+const DBK = 16;
+const dflash_launch = metal.Launch{ .name = "msv_inkling2_dflash_attn", .inputs = &.{ "q", "kb", "vb", "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "LANES", "scale" }, .outputs = &.{ "PART", "ML" }, .source = source("plugins/inkling2/kernels/dflash_attn.metal"), .tg_bytes = 2 * (SD * (DBK + 8) + DBK * (SD + 8)), .m1 = 1024, .m2 = 1024 };
+
+/// The DFlash2 draft's block rows (`dflash_attn`): rows = lanes, each lane's 8 rows of 32 query heads over 8 KV heads
+/// reading its context ring and its block's own keys; n = lane 0's context rows (each later lane's fewer, its ring
+/// sized as the drafter sizes it), k = how far the positions run past the context (where the rings wrap).
+const DflashAttn = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch = &dflash_launch,
+    arena: std.heap.ArenaAllocator,
+    shape: Shape = undefined,
+    /// `[NL, HQ, B, D]`, `[NL, HKV, B, D]` twice, a lane's ring `[2 HKV, C, D]` (keys then values).
+    q: []f64 = &.{},
+    kb: []f64 = &.{},
+    vb: []f64 = &.{},
+    rings: [dflash2.max_lanes][]f64 = undefined,
+    scale: f64 = @as(f32, 1.0 / @sqrt(@as(f32, SD))),
+    args: [21]mlx.mlx_array = undefined,
+
+    const Self = @This();
+    const Lane = struct { n: usize, pos: usize, c: usize, kps: usize };
+
+    fn init(a: std.mem.Allocator) Self {
+        return .{ .rig = metal.Rig.init(a), .arena = .init(a) };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    fn lane(shape: Shape, j: usize) Lane {
+        const n = 1 + (shape.n - 1) * (shape.rows - j) / shape.rows;
+        const nl: c_int = @intCast(shape.rows);
+        return .{
+            .n = n,
+            .pos = n + shape.k + 17 * j,
+            .c = @intCast(dflash2.ringSlots(@intCast(n), DWIN - 1)),
+            .kps = @intCast(dflash2.keysPerSplit(nl, DHKV, @intCast(n + DB))),
+        };
+    }
+
+    fn splits(shape: Shape) usize {
+        var most: usize = 1;
+        for (0..shape.rows) |j| {
+            const l = lane(shape, j);
+            most = @max(most, (l.n + DB + l.kps - 1) / l.kps);
+        }
+        return most;
+    }
+
+    pub fn geometry(self: *const Self, shape: Shape) ?metal.Geometry {
+        _ = self;
+        if (shape.rows == 0 or shape.rows > dflash2.max_lanes or shape.n < 1 or shape.n > DWIN - 1) return null;
+        const ns: c_int = @intCast(splits(shape));
+        const rows: c_int = @intCast(shape.rows * DB * DHQ);
+        var g = metal.Geometry{ .grid = .{ ns * 32 * (DHQ / DHKV), DHKV, @intCast(shape.rows) }, .tg = .{ 32 * (DHQ / DHKV), 1, 1 } };
+        g.out(&.{ ns, rows, SD }, .float32);
+        g.out(&.{ ns, rows, 2 }, .float32);
+        g.dtype("T", .bfloat16);
+        g.int("D", @as(c_int, SD));
+        g.int("HQ", @as(c_int, DHQ));
+        g.int("HKV", @as(c_int, DHKV));
+        g.int("B", @as(c_int, DB));
+        g.int("WINDOW", @as(c_int, DWIN));
+        return g;
+    }
+
+    pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const nl = shape.rows;
+        self.q = try host.uniform(a, rng, nl * DHQ * DB * SD, -2, 2, .bfloat16);
+        self.kb = try host.uniform(a, rng, nl * DHKV * DB * SD, -2, 2, .bfloat16);
+        self.vb = try host.uniform(a, rng, nl * DHKV * DB * SD, -2, 2, .bfloat16);
+        for (0..nl) |j| self.rings[j] = try host.uniform(a, rng, 2 * DHKV * lane(shape, j).c * SD, -2, 2, .bfloat16);
+        if (fill == .nonfinite) {
+            host.plant(self.q, nl * DHQ * DB, SD);
+            host.plant(self.vb, nl * DHKV * DB, SD);
+        }
+        self.rig.reset();
+        const ci = struct {
+            fn f(x: usize) c_int {
+                return @intCast(x);
+            }
+        }.f;
+        const meta = try a.alloc(f64, 4 * nl);
+        for (0..nl) |j| {
+            const l = lane(shape, j);
+            meta[4 * j ..][0..4].* = .{ @floatFromInt(l.pos), @floatFromInt(l.n), @floatFromInt(l.c), @floatFromInt(l.kps) };
+        }
+        self.args[0] = try self.rig.input(.bfloat16, &.{ ci(nl), DHQ, DB, SD }, self.q);
+        self.args[1] = try self.rig.input(.bfloat16, &.{ ci(nl), DHKV, DB, SD }, self.kb);
+        self.args[2] = try self.rig.input(.bfloat16, &.{ ci(nl), DHKV, DB, SD }, self.vb);
+        for (0..dflash2.max_lanes) |j| self.args[3 + j] = if (j < nl) try self.rig.input(.bfloat16, &.{ 1, 2 * DHKV, ci(lane(shape, j).c), SD }, self.rings[j]) else self.args[3];
+        self.args[19] = try self.rig.input(.int32, &.{ ci(nl), 4 }, meta);
+        self.args[20] = try self.rig.scalar(@floatCast(self.scale));
+        return true;
+    }
+
+    pub fn run(self: *Self) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Self) usize {
+        return splits(self.shape) * self.shape.rows * DB * DHQ * (SD + 2);
+    }
+
+    fn emit(self: *const Self, want: []f64, mag: ?[]f64, sim: attn.Sim) !void {
+        const a = self.rig.a;
+        const nl = self.shape.rows;
+        const ns = splits(self.shape);
+        const keys = try a.alloc(attn.Key, self.shape.n + DB);
+        defer a.free(keys);
+        const ends = try a.alloc(usize, self.shape.n + DB);
+        defer a.free(ends);
+        const terms = try a.alloc(f64, SD);
+        defer a.free(terms);
+        const eo = try a.alloc(f64, SD);
+        defer a.free(eo);
+        const qs: f64 = @as(f32, @floatCast(self.scale * LOG2E));
+        const parts = ns * nl * DB * DHQ;
+        for (0..ns) |s| for (0..nl) |z| for (0..DB) |r| for (0..DHQ) |h| {
+            const l = lane(self.shape, z);
+            const kvh = h / (DHQ / DHKV);
+            const kbeg = s * l.kps;
+            const kend = @min(l.n + DB, kbeg + l.kps);
+            const q = self.q[((z * DHQ + h) * DB + r) * SD ..][0..SD];
+            var n: usize = 0;
+            var nb: usize = 0;
+            var t0 = kbeg;
+            while (t0 < kend) : (t0 += DBK) {
+                for (t0..@min(t0 + DBK, kend)) |j| {
+                    // Context key j sits at ring slot (pos - n + j) % C; the block's own keys follow it.
+                    const own = j >= l.n;
+                    const slot = (l.pos - l.n + j) % l.c;
+                    const k = if (own) self.kb[((z * DHKV + kvh) * DB + j - l.n) * SD ..][0..SD] else self.rings[z][(kvh * l.c + slot) * SD ..][0..SD];
+                    const vrow = if (own) self.vb[((z * DHKV + kvh) * DB + j - l.n) * SD ..][0..SD] else self.rings[z][((DHKV + kvh) * l.c + slot) * SD ..][0..SD];
+                    // A context key past the row's window is masked, its value still in the tile's P·V at weight 0.
+                    if (!own and l.n + r - j >= DWIN) {
+                        keys[n] = .{ .s = -std.math.inf(f64), .on = false, .v = vrow, .ve = &half_sub_row };
+                        n += 1;
+                        continue;
+                    }
+                    const d = attn.dot(q, k, qs, SD, 1, sim, terms);
+                    var under: f64 = 0;
+                    for (q, k) |x, y| under += @abs(x) + @abs(y);
+                    keys[n] = .{ .s = d.v, .e = d.e + qs * HALF_SUB * under, .v = vrow, .ve = &half_sub_row };
+                    n += 1;
+                }
+                ends[nb] = n;
+                nb += 1;
+            }
+            const at = ((s * nl + z) * DB + r) * DHQ + h;
+            const o = want[at * SD ..][0..SD];
+            const st = attn.online(split_soft, .{ .m = @as(f32, -1e30) }, keys[0..n], ends[0..nb], o, eo);
+            want[parts * SD + 2 * at] = st.m;
+            want[parts * SD + 2 * at + 1] = st.l;
+            if (mag) |m| {
+                for (m[at * SD ..][0..SD], eo) |*x, e| x.* = host.allowance(e);
+                m[parts * SD + 2 * at] = host.allowance(st.em);
+                m[parts * SD + 2 * at + 1] = host.allowance(st.el);
+            }
+        };
+    }
+
+    pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+        try self.emit(want, mag, null);
+    }
+
+    pub fn simulate(self: *const Self, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+        try self.emit(out, null, .{ .acc = acc, .order = order });
+    }
+
+    fn wrapper(self: *Self) ![]const u8 {
+        var g = ops.Graph.init(self.rig.a, self.rig.stream());
+        defer g.deinit();
+        const x = self.args;
+        const parts = try dflash2.attnParts(&g, x[0], x[1], x[2], x[3..][0..self.shape.rows], x[19], x[20], @intCast(splits(self.shape)), DWIN);
         return self.rig.bytesOf(&parts);
     }
 };
@@ -3592,6 +3784,17 @@ pub fn register(set: *kc.Set) !void {
         .served = &.{ .{ .rows = 8, .n = kernels.split_rows, .k = 4104 }, .{ .rows = 8, .n = 2, .k = 300 } },
         .sums = split_sums,
     }, null);
+    // The DFlash2 draft: one lane, four at the full window (its oldest keys past the later rows' reach, the rings
+    // wrapped), and sixteen short rings, every lane input bound.
+    try set.add(DflashAttn, .init(set.a), .{
+        .name = "inkling2 dflash_attn bf16",
+        .accum = .f32,
+        .depth = host.depthOne,
+        .out = .f32,
+        .tiles = .{ .{}, .{ .size = DBK }, .{} },
+        .served = &.{ .{ .rows = 1, .n = 200, .k = 0 }, .{ .rows = 4, .n = DWIN - 1, .k = 900 }, .{ .rows = dflash2.max_lanes, .n = 120, .k = 333 } },
+        .sums = split_sums,
+    }, null);
     // A prompt's rows on the tensor unit: a sliding window's tiles and a global layer's, both dtypes the kernel serves.
     inline for (.{ .{ mlx.mlx_dtype.bfloat16, "bf16" }, .{ mlx.mlx_dtype.float16, "f16" } }) |d| inline for (.{ .{ 1024, "sliding 1024" }, .{ 0, "global" } }) |w| {
         try set.add(RelNax, .init(set.a, d[0], w[0]), .{
@@ -3793,7 +3996,7 @@ test "kernel contract inkling2: each declared launch is the shipped wrapper's, b
             try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
         }
     };
-    inline for (.{ RelSplit, RelSplit, RelSplit, RelSplit, RelNax, RelNax, RelNax, RelNax, RelComb, RelSlots, MarkovRnn, MarkovFold, MarkovPick, MarkovFoldBatch(2), MarkovFoldBatch(4), MarkovFoldBatch(9), MarkovPickBatch(4), MarkovPickSample(4), Gate, Router, Norm(.bfloat16, false), Norm(.bfloat16, true), Norm(.float32, false), Norm(.float32, true) }) |T| {
+    inline for (.{ RelSplit, RelSplit, RelSplit, RelSplit, DflashAttn, RelNax, RelNax, RelNax, RelNax, RelComb, RelSlots, MarkovRnn, MarkovFold, MarkovPick, MarkovFoldBatch(2), MarkovFoldBatch(4), MarkovFoldBatch(9), MarkovPickBatch(4), MarkovPickSample(4), Gate, Router, Norm(.bfloat16, false), Norm(.bfloat16, true), Norm(.float32, false), Norm(.float32, true) }) |T| {
         const k = set.kernels.items[at];
         at += 1;
         // Off NAX the tensor-unit read is not dispatched.

@@ -173,9 +173,9 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
   (GPU), and each kernel against its chain.
 - `contract.zig`: `gated`, `state`, `relmask`, `act`, `sum`, `topk`, `gate` (its one-row arm), `relsplit`, `relattn_nax`,
   `relcomb`, `relslots`, `markov_rnn`, `markov_fold`, `markov_pick`, `markov_fold_batch`, `markov_pick_batch`,
-  `markov_pick_sample`, `oproj`, `router`, `norm`.
+  `markov_pick_sample`, `oproj`, `router`, `norm`, `dflash_attn`.
 - Contract entries owed (GPU proofs in `proof_test.zig` cover each): `pre`, `prep`, `mid`, `ups`, `downs`, `relattn`,
   `gate`'s prompt arm, `group`, `ups_grp`, `downs_grp`, `few_tail`, `topk_group`, `tile_scan`, `moe_wide`,
   `markov_fold_q8`, `markov_pick_rnn`, `relsplit_nax`, `relsplit_lanes`,
-  `accept_tree`, `sample_tree_draw`/`_mass`/`_search`, `dflash_conv`/`_edges`/`_top16_shard`/`_top16_merge`/`_tree`/`_attn`.
+  `accept_tree`, `sample_tree_draw`/`_mass`/`_search`, `dflash_conv`/`_edges`/`_top16_shard`/`_top16_merge`/`_tree`.
 - Not verified: an image against mlx-lm's tower, the drafter's tokens against oMLX's.
