@@ -17,6 +17,7 @@ const kit = @import("../../deepseek_v4/contract_kit.zig");
 const contract = @import("../contract.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
+const owner = @import("plan.zig");
 const fixture = @import("fixture.zig");
 
 const A = mlx.mlx_array;
@@ -54,12 +55,12 @@ const NR = 8;
 const NAX_NSG = 4;
 const NAX_NR = 32;
 /// The matrix units serve from `nax_rows` rows on (below, the vector units' one pass over the weights is the cheaper).
-/// Under exact's NAX path (`MLX_SERVE_DSV41_EXACT`, `exactVerify`) every row stays on the vector kernel: the matrix units' tile sums a row in
-/// another order, so a verify block's rows would not carry the plain step's bytes.
+/// The owner's `one_row` (`plan.zig`, an exact verify) keeps every row on the vector units, the plain step's kernel:
+/// the matrix units' tile sums a row in another order.
 const nax_rows = 4;
 
-pub fn useNax(rows: c_int) bool {
-    return rows >= nax_rows and device.naxAvailable() and !dsv41.exactVerify();
+pub fn useNax(rows: c_int, k: owner.Kernel) bool {
+    return k == .rows and rows >= nax_rows and device.naxAvailable();
 }
 
 /// One dispatch from the shapes: the grid, the threadgroup, the outputs and the template ints; null where the kernel
@@ -100,14 +101,15 @@ pub fn plan(rows: c_int, heads: c_int, splits: c_int, dim: c_int, groups: c_int,
 /// `oa` [R, groups * o_lora] in `act` from the split partials (`pacc` [R, H, S, D] f32, `pm` and `pl` [R, H, S]),
 /// the sink [H], `meta` (int32, [0] the first row's position), the inverse rope periods and wo_a's mxfp8 words
 /// `w` [groups, o_lora, K / 4] and scales [groups, o_lora, K / 32]; `extra` is an input the kernel never reads (a
-/// chain's dependency). Null where the shapes or formats are not the kernel's.
-pub fn launch(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, rd: usize, odt: mlx.mlx_dtype, ins: [8]A, counter: A, extra: ?A) !?A {
+/// chain's dependency); `k` the owner's kernel for the call (`plan.zig`). Null where the shapes or formats are not the
+/// kernel's.
+pub fn launch(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, rd: usize, odt: mlx.mlx_dtype, ins: [8]A, counter: A, extra: ?A, k: owner.Kernel) !?A {
     const ps = mlx.getShape(ins[0]);
     const ws = mlx.getShape(ins[6]);
     if (ps.len != 4 or ws.len != 3) return null;
     const dts = [_]mlx.mlx_dtype{ .float32, .float32, .float32, .float32, .int32, .float32, .uint32, .uint8 };
     for (ins, dts) |x, dt| if (mlx.mlx_array_dtype(x) != dt) return null;
-    const p = plan(ps[0], ps[1], ps[2], ps[3], ws[0], ws[1], rd, useNax(ps[0])) orelse return null;
+    const p = plan(ps[0], ps[1], ps[2], ps[3], ws[0], ws[1], rd, useNax(ps[0], k)) orelse return null;
     if (mlx.mlx_array_size(ins[3]) != ps[1] or mlx.mlx_array_size(ins[5]) != rd / 2 or ws[2] * 4 != p.ints[5].v * ps[3]) return null;
     const c = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
@@ -133,11 +135,11 @@ pub fn launch(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, rd: usize, odt: mlx.m
 
 /// The layer's `attnOutRoped` input from the splits: `oa` [R, 8192] in the model's activation dtype, what wo_b reads.
 /// Null (the old path runs) off the GPU, where wo_a is not the release's 8-bit mxfp8 of group 32, or past the rows,
-/// splits or head width `plan` declines.
-pub fn apply(sc: *Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer, kern: mlx.mlx_fast_metal_kernel, counter: A, inv: A, meta: A, pacc: A, pm: A, pl: A) !?A {
+/// splits or head width `plan` declines; `k` the owner's kernel for the call (`plan.zig`).
+pub fn apply(sc: *Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer, kern: mlx.mlx_fast_metal_kernel, counter: A, inv: A, meta: A, pacc: A, pm: A, pl: A, k: owner.Kernel) !?A {
     const wo = &ly.wo_a;
     if (!mlx.streamIsGpu(sc.s) or wo.s.ctx == null or wo.qp.mode != .mxfp8 or wo.qp.bits != 8 or wo.qp.group_size != 32) return null;
-    return launch(sc, kern, m.cfg.dsv4_rope_head_dim, m.act, .{ pacc, pm, pl, ly.sink, meta, inv, wo.w, wo.s }, counter, null);
+    return launch(sc, kern, m.cfg.dsv4_rope_head_dim, m.act, .{ pacc, pm, pl, ly.sink, meta, inv, wo.w, wo.s }, counter, null, k);
 }
 
 // ── the kernel contract ──
@@ -576,12 +578,12 @@ test "dsv41 dec wo_a: 1 to 6 rows are no further from the float64 truth than tod
         defer gpa.free(t);
         const w32 = try dsv41.hostF32(want);
         defer gpa.free(w32);
-        const got = (try apply(&sc, fx.m, ly, kern, counter, inv, meta, pacc, pm, pl)) orelse return error.Declined;
+        const got = (try apply(&sc, fx.m, ly, kern, counter, inv, meta, pacc, pm, pl, .rows)) orelse return error.Declined;
         try testing.expectEqual(@as(c_int, ci(8 * OL)), mlx.getShape(got)[1]);
         const g32 = try dsv41.hostF32(got);
         defer gpa.free(g32);
         // The counter has moved on: the same inputs give the same bytes.
-        const again = (try apply(&sc, fx.m, ly, kern, counter, inv, meta, pacc, pm, pl)) orelse return error.Declined;
+        const again = (try apply(&sc, fx.m, ly, kern, counter, inv, meta, pacc, pm, pl, .rows)) orelse return error.Declined;
         const a32 = try dsv41.hostF32(again);
         defer gpa.free(a32);
         try testing.expectEqualSlices(f32, g32, a32);
@@ -610,13 +612,11 @@ test "dsv41 dec wo_a: the declared launches are the wrapper's, byte for byte" {
     defer _ = mlx.mlx_fast_metal_kernel_free(kern);
     var sc = Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
-    // The vector launch below `nax_rows`, the matrix units' from there on NAX, and under MLX_SERVE_DSV41_EXACT the
-    // vector launch at every row count a verify block has (`useNax`).
+    // The vector launch below `nax_rows`, the matrix units' from there on NAX, and on the owner's `one_row` (an exact
+    // verify) the vector launch at every row count a verify block has (`useNax`).
     const Arm = struct { rows: usize, nax: bool, exact: bool };
     for ([_]Arm{ .{ .rows = 3, .nax = false, .exact = false }, .{ .rows = decode.max_rows, .nax = true, .exact = false }, .{ .rows = decode.max_rows, .nax = false, .exact = true } }) |arm| {
         if (arm.nax and !world.nax()) continue;
-        const sw = env.override(.MLX_SERVE_DSV41_EXACT, if (arm.exact) "1" else null);
-        defer sw.restore();
         const c = try a.create(kit.Case(WoA));
         defer {
             c.deinit();
@@ -627,7 +627,7 @@ test "dsv41 dec wo_a: the declared launches are the wrapper's, byte for byte" {
         try c.run();
         const mine = try a.dupe(u8, c.rig.outputBytes());
         defer a.free(mine);
-        const got = (try launch(&sc, kern, RD, act, c.args[0..8].*, c.args[8], null)) orelse return error.Declined;
+        const got = (try launch(&sc, kern, RD, act, c.args[0..8].*, c.args[8], null, if (arm.exact) .one_row else .rows)) orelse return error.Declined;
         try testing.expectEqualSlices(u8, mine, try c.rig.bytesOf(&.{got}));
     }
 }
@@ -671,7 +671,7 @@ const Bench = struct {
         self.prev = if (self.old) blk: {
             const heads = try chainMerge(self.sc, self.merge, RD, self.common, dep);
             break :blk try chainWoA(self.sc, heads, c.w, c.s);
-        } else (try launch(self.sc, self.kern, RD, act, .{ self.common[0], self.common[1], self.common[2], self.common[3], self.common[4], self.common[5], c.w, c.s }, self.counter, dep)) orelse return error.Declined;
+        } else (try launch(self.sc, self.kern, RD, act, .{ self.common[0], self.common[1], self.common[2], self.common[3], self.common[4], self.common[5], c.w, c.s }, self.counter, dep, .rows)) orelse return error.Declined;
         return self.prev;
     }
 };
@@ -745,17 +745,13 @@ test "dsv41 dec wo_a: ubench" {
     }
 }
 
-test "dsv41 wo_a: under MLX_SERVE_DSV41_EXACT every row a verify serves takes the vector kernel a plain step takes" {
-    const sw = env.override(.MLX_SERVE_DSV41_EXACT, "1");
-    defer sw.restore();
-    for (1..decode.max_rows + 1) |r| try testing.expect(!useNax(@intCast(r)));
+test "dsv41 wo_a: on the owner's one_row (an exact verify) every row takes the vector kernel a plain step takes" {
+    for (1..decode.max_rows + 1) |r| try testing.expect(!useNax(@intCast(r), .one_row));
 }
 
-test "dsv41 wo_a: without MLX_SERVE_DSV41_EXACT a NAX GPU's verify takes the matrix units from 4 rows" {
-    const sw = env.override(.MLX_SERVE_DSV41_EXACT, null);
-    defer sw.restore();
-    try testing.expect(!useNax(3));
-    try testing.expectEqual(world.nax(), useNax(4));
+test "dsv41 wo_a: on the owner's rows a NAX GPU's verify takes the matrix units from 4 rows" {
+    try testing.expect(!useNax(3, .rows));
+    try testing.expectEqual(world.nax(), useNax(4, .rows));
 }
 
 test "dsv41 dec wo_a: MLX's mxfp8 reads give the FOLD form's bytes on finite codes, vector and matrix units" {

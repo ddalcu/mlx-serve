@@ -1617,3 +1617,60 @@ test "dsv41 dec moe_fp4 levers: DEC_WORD and UP_SPLIT, each and together, give t
     bad += try leversAgree(glm, lever_sets[2..]);
     try testing.expectEqual(@as(usize, 0), bad);
 }
+
+/// The MoE a plain step runs over rows of fixed routes (`decode.rowsInvariant`): `ffnDecode` on the scaled routes, or
+/// with `down_scale` the fused launches that carry the down scale themselves (`fuse.ffnDownScaled`, FUSE_DOWN_SCALE).
+const MoeRows = struct {
+    sc: *Scope,
+    m: *const dsv41.Dsv41Model,
+    ly: *const dsv41.Layer,
+    h: A,
+    idx: A,
+    wts: A,
+    x1: A,
+    post: A,
+    comb: A,
+    down_scale: bool,
+
+    pub fn runRows(c: *MoeRows, lo: usize, hi: usize) !decode.RowOuts {
+        const sc = c.sc;
+        const sp: dsv41.Split = .{ .pre = none, .post = try rowsOf(sc, c.post, lo, hi), .comb = try rowsOf(sc, c.comb, lo, hi) };
+        const h = try rowsOf(sc, c.h, lo, hi);
+        const idx = try rowsOf(sc, c.idx, lo, hi);
+        const wts = try rowsOf(sc, c.wts, lo, hi);
+        const x1 = try rowsOf(sc, c.x1, lo, hi);
+        const y = if (c.down_scale)
+            try @import("../fuse.zig").ffnDownScaled(sc, c.m, c.ly, h, idx, wts, x1, &sp)
+        else
+            try dsv41.ffnDecode(sc, c.m, c.ly, h, idx, try dsv41.routeScaled(sc, c.ly, idx, wts), x1, &sp);
+        return .{ y orelse return error.Fp4KernelsDeclined, none, none, none, none, none, none, none };
+    }
+};
+
+test "dsv41 exact rows: moe: the MoE a plain step runs gives each verify row its one-row bytes at R = 1..6, ffnDecode and the fused down scale (FUSE_DOWN_SCALE; the fixture's mxfp4, nvfp4 with per-expert scales, the iQ pack's affine and the pruned packs' 2-bit g128 banks)" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const Bank = enum { mxfp4, nvfp4, affine, affine2 };
+    var bad: usize = 0;
+    for (std.enums.values(Bank)) |bank| {
+        const nv = bank == .nvfp4;
+        const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 16, .ctx = 0, .experts_fp4 = bank == .mxfp4, .experts_nvfp4 = nv, .experts_affine = if (bank == .affine2) 2 else null, .expert_scales = if (nv) .all else .none, .fused = true });
+        defer fx.deinit();
+        const m = fx.m;
+        const ly = fx.layer(20);
+        const MR = decode.max_rows;
+        const hc = m.cfg.dsv4_hc_mult;
+        var sc = Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const h = try sc.keep(try fx.normal(&.{ ci(MR), ci(m.cfg.hidden_size) }, .bfloat16, 0, 1));
+        const r = try dsv41.route(&sc, m, ly, h, none);
+        for ([_]bool{ false, true }) |down_scale| {
+            // The fused down scale serves a bank with its per-expert scales alone.
+            if (down_scale and !nv) continue;
+            var c: MoeRows = .{ .sc = &sc, .m = m, .ly = ly, .h = h, .idx = r.idx, .wts = r.wts, .x1 = try sc.keep(try fx.stream(MR)), .post = try sc.keep(try fx.uniform(&.{ ci(MR), ci(hc) }, 0.05, 1.5)), .comb = try sc.keep(try fx.uniform(&.{ ci(MR), ci(hc), ci(hc) }, -0.5, 0.5)), .down_scale = down_scale };
+            var buf: [48]u8 = undefined;
+            bad += try decode.rowsInvariant(try std.fmt.bufPrint(&buf, "moe {t}{s}", .{ bank, if (down_scale) " down scale" else "" }), &c);
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}

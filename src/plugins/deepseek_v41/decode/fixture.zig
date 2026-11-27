@@ -85,7 +85,7 @@ pub const Fixture = struct {
         }
         if (opts.plant) |base| try fx.plantCode(base);
         if (opts.tp) |t| try fx.sliceShard(t);
-        fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = .{ .lo = opts.lo, .hi = opts.hi, .worker = true }, .act = opts.act, .tp = opts.tp });
+        fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = .{ .lo = opts.lo, .hi = opts.hi, .worker = true }, .act = opts.act, .tp = opts.tp, .exact_pair_ok = true });
         errdefer fx.m.deinit();
         if (!opts.fused) fx.m.dec.deinit();
         var p0: usize = 0;

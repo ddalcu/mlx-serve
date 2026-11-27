@@ -203,7 +203,7 @@ fn runGateWith(exact_on: bool, experts: Experts, quick: bool) !Tally {
     for (ranges) |rg| for (rg.p0s[0..if (quick) 1 else rg.p0s.len]) |p0| {
         const fx = try fixture.Fixture.init(gpa, .{ .lo = rg.lo, .hi = rg.hi, .ctx = p0 - 1, .seed = 7 + p0, .act = .bfloat16, .fused = true, .experts_fp4 = experts == .mxfp4, .experts_nvfp4 = experts == .nvfp4, .expert_scales = if (experts == .nvfp4) .all else .none });
         defer fx.deinit();
-        fx.m.exact = dsv41.exactBatched(.{ .on = exact_on }, env.get(.DSV41_EXACT_GATE_BATCHED));
+        fx.m.exact = dsv41.exactBatched(.{ .on = exact_on, .whole_row = exact_on and !world.nax() }, env.get(.DSV41_EXACT_GATE_BATCHED));
         fx.m.exact_pair_ok = true;
         // One plain step to p0 with a snapshot there: every case rewinds to it.
         {
@@ -246,6 +246,18 @@ test "dsv41 exact: verify rows and the state they leave equal plain steps bit fo
     try std.testing.expectEqual(@as(u64, 0), t.misses);
 }
 
+test "dsv41 exact rows: verify layers on the fused decode kernels (NAX, exact on): a verify block's rows, the state it leaves and the step after are its plain steps' bits, the release's NVFP4 experts with their scales, each layer range at its first position, no misses" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    const xv = env.override(.MLX_SERVE_DSV41_EXACT, "1");
+    defer xv.restore();
+    // Every position (the band edges, the pooling groups, the long contexts): `DSV41_EXACT_GATE` (gates.sh's exact step).
+    const t = try runGateWith(true, .nvfp4, env.get(.DSV41_EXACT_GATE) == null);
+    try std.testing.expectEqual(@as(usize, 0), t.row_diffs);
+    try std.testing.expectEqual(@as(usize, 0), t.probe_diffs);
+    try std.testing.expectEqual(@as(usize, 0), t.state_diffs);
+    try std.testing.expectEqual(@as(u64, 0), t.misses);
+}
+
 test "dsv41 exact: verify rows against plain steps with fp4 experts, the fused fp4 MoE on and off, exact off (DSV41_EXACT_GATE)" {
     if (env.get(.DSV41_EXACT_GATE) == null) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
@@ -269,8 +281,8 @@ test "dsv41 exact: verify rows against plain steps with fp4 experts, the fused f
     }
 }
 
-test "dsv41 verify: on exact's NAX path (MLX_SERVE_DSV41_EXACT) the head and the Engram write give each verify row its plain step's bits" {
-    // Without NAX exact runs the whole verify row (the gate above); this is the NAX path's per-row head and Engram.
+test "dsv41 verify: on exact's NAX path (MLX_SERVE_DSV41_EXACT) the head and the Engram write on MLX's chain give each verify row its plain step's bits" {
+    // The head, and the Engram where the load arms no slot kernel (with it: `engram_ids.zig`'s exact rows test).
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
     const xv = env.override(.MLX_SERVE_DSV41_EXACT, "1");
     defer xv.restore();
@@ -319,13 +331,13 @@ test "dsv41 verify: on exact's NAX path (MLX_SERVE_DSV41_EXACT) the head and the
             const x = try sc.keep(try randBf16(&.{ r, hc, d }, 1.0, 600 + R));
             const er = try sc.keep(try randBf16(&.{ r, 6144 }, 1.0, 700 + R));
             const lg = try dsv41.headLogits(&sc, m, h, true);
-            const ys = try dsv41.engramWrite(&sc, m, &e, x, er, true);
+            const ys = try dsv41.engramWrite(&sc, m, &e, x, er, dsv41.kernelAt(m, .engram, R, true));
             var dh: usize = 0;
             var de: usize = 0;
             for (0..R) |i| {
                 const want_l = try dsv41.headLogits(&sc, m, try sc.keep(try sliceAxis(h, 0, i, i + 1)), false);
                 dh += try differing(try sc.keep(try sliceAxis(lg, 0, i, i + 1)), want_l);
-                const want_e = try dsv41.engramWrite(&sc, m, &e, try sc.keep(try sliceAxis(x, 0, i, i + 1)), try sc.keep(try sliceAxis(er, 0, i, i + 1)), false);
+                const want_e = try dsv41.engramWrite(&sc, m, &e, try sc.keep(try sliceAxis(x, 0, i, i + 1)), try sc.keep(try sliceAxis(er, 0, i, i + 1)), .rows);
                 de += try differing(try sc.keep(try sliceAxis(ys, 0, i, i + 1)), want_e);
             }
             std.debug.print("[exact-gate] verify R={d} {s}: head {d}, engram {d} elements differ from the plain steps\n", .{ R, if (batched) "batched" else "served", dh, de });

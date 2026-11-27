@@ -362,7 +362,7 @@ test "dsv41 dec wo_a plain: the merged heads through the plain GEMV equal wo_a o
     const counter = try sc.keep(wo_a.newCounter());
     for (1..decode.max_rows + 1) |R| for ([_]usize{ 8, 2 }) |S| {
         const in = try Inputs.init(&sc, R, S, 77 + R * 10 + S);
-        const want_a = (try wo_a.launch(&sc, kw, 64, .bfloat16, .{ in.pacc, in.pm, in.pl, in.sink, in.meta, in.periods, in.w, in.s }, counter, null)) orelse return error.Declined;
+        const want_a = (try wo_a.launch(&sc, kw, 64, .bfloat16, .{ in.pacc, in.pm, in.pl, in.sink, in.meta, in.periods, in.w, in.s }, counter, null, .rows)) orelse return error.Declined;
         const want = try dsv41.hostF32(want_a);
         defer gpa.free(want);
         const x = try merge(&sc, k.merge, 64, in.pacc, in.pm, in.pl, in.sink, in.meta, in.periods);
@@ -452,11 +452,11 @@ fn layerCells(gpa: std.mem.Allocator, m: *dsv41.Dsv41Model, li: usize, k: Kernel
         var w: [2]decode.WordDiff = @splat(.{});
         for ([_]mlx.mlx_dtype{ .float32, m.act }, 0..) |odt, oi| {
             const arms = if (oi == 1) [3]A{
-                (try wo_a.apply(&sc, m, ly, kw, counter, inv, meta, pacc, pm, pl)) orelse return error.Declined,
+                (try wo_a.apply(&sc, m, ly, kw, counter, inv, meta, pacc, pm, pl, .rows)) orelse return error.Declined,
                 (try apply(&sc, k, m, ly, inv, meta, pacc, pm, pl)) orelse return error.Declined,
                 (try gemv(&sc, plant, odt, x, ly.wo_a.w, ly.wo_a.s, planFor(R))) orelse return error.Declined,
             } else [3]A{
-                (try wo_a.launch(&sc, kw, rd, odt, .{ pacc, pm, pl, ly.sink, meta, inv, ly.wo_a.w, ly.wo_a.s }, counter, null)) orelse return error.Declined,
+                (try wo_a.launch(&sc, kw, rd, odt, .{ pacc, pm, pl, ly.sink, meta, inv, ly.wo_a.w, ly.wo_a.s }, counter, null, .rows)) orelse return error.Declined,
                 (try gemv(&sc, k.gemv, odt, x, ly.wo_a.w, ly.wo_a.s, planFor(R))) orelse return error.Declined,
                 (try gemv(&sc, plant, odt, x, ly.wo_a.w, ly.wo_a.s, planFor(R))) orelse return error.Declined,
             };
@@ -468,7 +468,7 @@ fn layerCells(gpa: std.mem.Allocator, m: *dsv41.Dsv41Model, li: usize, k: Kernel
             defer for (h) |hh| gpa.free(hh);
             w[oi].add(h[1], h[0], truth);
         }
-        const vector = !wo_a.useNax(ci(R));
+        const vector = !wo_a.useNax(ci(R), .rows);
         const same = w[0].differ == 0 and w[1].differ == 0;
         for (0..2) |oi| for (0..2) |i| t.agg[oi][i].join(d[oi][i]);
         t.cells += 1;
@@ -523,4 +523,49 @@ test "dsv41 dec wo_a plain (MLX_SERVE_DSV41_WOA_PLAIN, DSV41_SPEC_SYNC pack): th
     var t: Tally = .{};
     for ([_]usize{ 0, m.n_layers / 2, m.n_layers - 1 }) |li| try layerCells(gpa, m, li, k, plant, kw, &t);
     try expectTally(t);
+}
+
+const no_out: A = .{ .ctx = null };
+
+/// The splits of `in` merged and projected over rows [lo, hi) at positions from 30001 (`decode.rowsInvariant`):
+/// WOA_PLAIN's merge and GEMV (`vector` false), or wo_a's fused merge on the owner's `one_row` (its vector units).
+const RowsCase = struct {
+    sc: *Scope,
+    k: Kernels,
+    kw: mlx.mlx_fast_metal_kernel,
+    counter: A,
+    in: Inputs,
+    vector: bool,
+
+    pub fn runRows(c: *RowsCase, lo: usize, hi: usize) !decode.RowOuts {
+        const sc = c.sc;
+        const meta = try sc.ints(&[_]i32{ @intCast(30001 + lo), @intCast(hi - lo), 512, 128, 144, 0 }, &.{6});
+        const pacc = try sc.slice(c.in.pacc, 0, lo, hi);
+        const pm = try sc.slice(c.in.pm, 0, lo, hi);
+        const pl = try sc.slice(c.in.pl, 0, lo, hi);
+        const y = if (c.vector)
+            try wo_a.launch(sc, c.kw, 64, .bfloat16, .{ pacc, pm, pl, c.in.sink, meta, c.in.periods, c.in.w, c.in.s }, c.counter, null, .one_row)
+        else
+            try gemv(sc, c.k.gemv, .bfloat16, try merge(sc, c.k.merge, 64, pacc, pm, pl, c.in.sink, meta, c.in.periods), c.in.w, c.in.s, planFor(hi - lo));
+        return .{ y orelse return error.Declined, no_out, no_out, no_out, no_out, no_out, no_out, no_out };
+    }
+};
+
+test "dsv41 exact rows: wo_a: each row of an R-row launch is its one-row launch's bytes, WOA_PLAIN's merge and GEMV and wo_a's vector units (the owner's one_row), R = 1..6, 8 and 2 splits" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const k = try build();
+    defer k.deinit();
+    const kw = try wo_a.build();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kw);
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const counter = try sc.keep(wo_a.newCounter());
+    var bad: usize = 0;
+    for ([_]usize{ 8, 2 }) |S| for ([_]bool{ false, true }) |vector| {
+        var c: RowsCase = .{ .sc = &sc, .k = k, .kw = kw, .counter = counter, .in = try Inputs.init(&sc, decode.max_rows, S, 91 + S), .vector = vector };
+        var buf: [48]u8 = undefined;
+        bad += try decode.rowsInvariant(try std.fmt.bufPrint(&buf, "wo_a {s} S={d}", .{ if (vector) "vector units" else "plain GEMV", S }), &c);
+    };
+    try testing.expectEqual(@as(usize, 0), bad);
 }

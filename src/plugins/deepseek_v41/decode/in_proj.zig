@@ -1263,3 +1263,43 @@ test "dsv41 dec in_proj: q_kv's MLX mxfp8 reads give the FOLD form's bytes on fi
     try decode.expectFoldSame(Main(true, 8, 16, true), &main_l, .{}, fused_shapes);
     try decode.expectFoldSame(Main(false, 8, 16, false), &main_l, .{}, staged_shapes);
 }
+
+/// One layer's in_proj over rows of a fixed stream (`decode.rowsInvariant`).
+const RowsCase = struct {
+    sc: *v41.Scope,
+    k: *const Kernels,
+    m: *const v41.Dsv41Model,
+    ly: *const v41.Layer,
+    x: A,
+    cpre: A,
+
+    pub fn runRows(c: *RowsCase, lo: usize, hi: usize) !decode.RowOuts {
+        const o = (try run(c.sc, c.k, c.m, c.ly, try c.sc.slice(c.x, 0, lo, hi), try c.sc.slice(c.cpre, 0, lo, hi))) orelse return error.Declined;
+        return .{ o.h, o.qa, o.kv, o.iw orelse none, o.comp orelse none, o.z, none, none };
+    }
+};
+
+test "dsv41 exact rows: in_proj: each row of an R-row launch is its one-row launch's bytes (h, q_kv, weights_proj, the compressor, the mixes), R = 1..6, IN_PROJ_MIXR on and off, layers 20..25 and 2..4" {
+    if (mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (device.deviceGeneration().gen < first_gen) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const k = try Kernels.build();
+    defer k.deinit();
+    var bad: usize = 0;
+    for ([_]?[*:0]const u8{ null, "0" }) |mixr| {
+        const sw = env.override(.MLX_SERVE_DSV41_IN_PROJ_MIXR, mixr);
+        defer sw.restore();
+        for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 } }) |rg| {
+            const fx = try fixture.Fixture.init(gpa, .{ .lo = rg[0], .hi = rg[1], .ctx = 0 });
+            defer fx.deinit();
+            for (rg[0]..rg[1]) |li| {
+                var sc = v41.Scope.init(gpa, fx.m.s);
+                defer sc.deinit();
+                var c: RowsCase = .{ .sc = &sc, .k = &k, .m = fx.m, .ly = fx.layer(li), .x = try sc.keep(try fx.stream(decode.max_rows)), .cpre = try sc.keep(try fx.cpre(decode.max_rows)) };
+                var buf: [64]u8 = undefined;
+                bad += try decode.rowsInvariant(try std.fmt.bufPrint(&buf, "in_proj layer {d} MIXR {s}", .{ li, if (mixr == null) "on" else "off" }), &c);
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}

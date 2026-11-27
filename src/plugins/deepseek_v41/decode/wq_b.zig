@@ -1205,3 +1205,63 @@ test "dsv41 dec wq_b: MLX's mxfp8 reads give the FOLD form's bytes on finite cod
     try decode.expectFoldSame(Wqb, &wq_b_l, .{ .g = 9 }, &.{ .{ .rows = 1, .n = 2 * KV, .k = 2 * cx.IHD }, .{ .rows = 6, .n = KV, .k = cx.IHD } });
 }
 
+
+/// One layer's wq_b over rows of fixed inputs at positions from `p0` (`decode.rowsInvariant`); `ring` the ring
+/// variant's kernel (its window buffer `buf`), or the plain launch.
+const RowsCase = struct {
+    sc: *dsv41.Scope,
+    m: *const dsv41.Dsv41Model,
+    kern: mlx.mlx_fast_metal_kernel,
+    ring: ?mlx.mlx_fast_metal_kernel,
+    buf: A,
+    ly: *const dsv41.Layer,
+    li: usize,
+    qa: A,
+    kv: A,
+    z: A,
+    p0: usize,
+
+    pub fn runRows(c: *RowsCase, lo: usize, hi: usize) !decode.RowOuts {
+        const sc = c.sc;
+        const pos = try rowsAt(sc, c.p0 + lo, hi - lo);
+        const qa = try sc.slice(c.qa, 0, lo, hi);
+        const kv = try sc.slice(c.kv, 0, lo, hi);
+        const z = try sc.slice(c.z, 0, lo, hi);
+        const o = (if (c.ring) |r| try runRing(sc, c.m, c.kern, c.ly, c.li, qa, kv, z, pos, .{ .kern = r, .buf = c.buf }) else try run(sc, c.m, c.kern, c.ly, c.li, qa, kv, z, pos)) orelse return error.Declined;
+        return .{ o.q, o.q_idx orelse none, o.kv_row, o.sa.pre, o.sa.post, o.sa.comb, none, none };
+    }
+};
+
+test "dsv41 exact rows: wq_b: each row of an R-row launch is its one-row launch's bytes at its position (q, the index q, the kv row, the hc split), R = 1..6, the plain and the ring launch (FUSE_WQB_RING), layers 20..25 and 2..4" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const kern = try build();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
+    const kr = try buildRing();
+    defer _ = mlx.mlx_fast_metal_kernel_free(kr);
+    const MR = decode.max_rows;
+    var bad: usize = 0;
+    for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 } }) |range| {
+        const fx = try fixture.Fixture.init(testing.allocator, .{ .lo = range[0], .hi = range[1], .experts = 2, .ctx = 0 });
+        defer fx.deinit();
+        for (range[0]..range[1]) |li| for ([_]bool{ false, true }) |ring| {
+            var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
+            defer sc.deinit();
+            var c: RowsCase = .{
+                .sc = &sc,
+                .m = fx.m,
+                .kern = kern,
+                .ring = if (ring) kr else null,
+                .buf = try sc.zeros(&.{ 144, KV }, .bfloat16),
+                .ly = fx.layer(li),
+                .li = li,
+                .qa = try randn(&sc, 141 + li, &.{ MR, K }, .bfloat16, 2),
+                .kv = try randn(&sc, 151 + li, &.{ MR, KV }, .bfloat16, 2),
+                .z = try randn(&sc, 161 + li, &.{ MR, 24 }, .float32, 1.5),
+                .p0 = 3001 + 13 * li,
+            };
+            var buf: [48]u8 = undefined;
+            bad += try decode.rowsInvariant(try std.fmt.bufPrint(&buf, "wq_b layer {d}{s}", .{ li, if (ring) " ring" else "" }), &c);
+        };
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}

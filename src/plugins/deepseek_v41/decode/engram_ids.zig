@@ -177,6 +177,22 @@ pub fn write(sc: *Scope, m: *dsv41.Dsv41Model, e: *const dsv41.EngramLayer, ids:
     return try dsv41.engramGate(sc, m, e.qk, x, kv);
 }
 
+/// `write` of each row of an exact verify's span `x` `[hi - lo, hc, dim]` alone, from its host-hashed ids (`ids` in
+/// `Hash.rows`' layout over `tables` tables: chunk row t's at `(t * tables + ek) * nc`), without the cache (a hit
+/// gives the slot kernel's bits, `engram_kvc.zig`): every row the served plain step's write at its position (the
+/// owner's `engram_slots`, `plan.zig`). Null where `write` declines a row.
+pub fn writeRows(sc: *Scope, m: *dsv41.Dsv41Model, e: *const dsv41.EngramLayer, ids: []const u32, tables: usize, lo: usize, hi: usize, ek: usize, nc: usize, x: A) !?A {
+    var ys: [decode.max_rows]A = undefined;
+    const L = hi - lo;
+    if (L == 0 or L > ys.len or ids.len < hi * tables * nc) return null;
+    for (0..L) |t| {
+        const row = ids[((lo + t) * tables + ek) * nc ..][0..nc];
+        const a = try sc.keep(mlx.mlx_array_new_data(row.ptr, &[_]c_int{@intCast(nc)}, 1, .uint32));
+        ys[t] = (try write(sc, m, e, a, .{ .ctx = null }, 0, nc, try sc.slice(x, 0, t, t + 1))) orelse return null;
+    }
+    return try sc.concat(ys[0..L], 0);
+}
+
 /// At load, after `fuse.settle`: the switch serves only where every Engram table is wrapped as GPU buffers (wrapped
 /// here) and the fused wkv reads it; one line says which.
 pub fn settle(m: *dsv41.Dsv41Model) !void {
@@ -671,4 +687,84 @@ test "dsv41 engram gpu ids (MLX_SERVE_DSV41_ENGRAM_GPU_IDS): the served fused wk
     try testing.expect(agg[1].bad == 0 and agg[1].max <= agg[0].max);
     try testing.expect(@as(f64, @floatFromInt(awf.differ)) <= 1e-4 * @as(f64, @floatFromInt(awf.words)));
     try testing.expectEqual(cells, caught);
+}
+
+test "dsv41 exact rows: engram: an exact verify's rows each write the served plain step's Engram (the slot kernel from the host-hashed ids, writeRows) bit for bit, R = 1..6, both tables, mxfp4 and mxfp8 rows; another token's ids differ" {
+    if (!gpuOk()) return error.SkipZigTest;
+    const fixture = @import("fixture.zig");
+    const gpa = testing.allocator;
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = 0, .hi = 1, .ctx = 8, .fused = true });
+    defer fx.deinit();
+    const m = fx.m;
+    const s = mlx.gpuStream();
+    const d = m.cfg.hidden_size;
+    const hc = m.cfg.dsv4_hc_mult;
+    var prng = std.Random.DefaultPrng.init(0xE1DA);
+    const rng = prng.random();
+    const hs = testHash(rng, 300);
+    const nc = hs.cols();
+    const hd: usize = 256;
+    const ew = try fx.normal(&.{ @intCast((hc + 1) * d), @intCast(nc * hd) }, .bfloat16, 0, 0.02);
+    defer _ = mlx.mlx_array_free(ew);
+    const eq = try fixture.quantize(ew, 32, 8, "mxfp8");
+    defer for (eq) |q| if (q.ctx != null) {
+        _ = mlx.mlx_array_free(q);
+    };
+    const qk = try fx.normal(&.{ @intCast(hc), @intCast(d) }, .float32, 0.5, 0.2);
+    defer _ = mlx.mlx_array_free(qk);
+    const map = try gpa.alloc(u32, 512);
+    defer gpa.free(map);
+    for (map) |*v| v.* = rng.uintLessThan(u32, 1 << 17);
+    var ctx = try ctxOf(&hs, map);
+    defer ctx.deinit();
+    const n_rows: usize = @intCast(hs.offsets[1][nc - 1] + hs.primes[1][nc - 1]);
+    const MR = decode.max_rows;
+    var bad: usize = 0;
+    var cases: usize = 0;
+    for ([_]@import("../../../sdk/quant/params.zig").QuantMode{ .mxfp4, .mxfp8 }) |mode| {
+        const bits: u32 = if (mode == .mxfp4) 4 else 8;
+        const wlen = hd * bits / 8;
+        const slen = hd / 32;
+        var e: dsv41.EngramLayer = .{ .layer = 0, .wkv = .{ .w = eq[0], .s = eq[1], .b = eq[2], .qp = .{ .bits = 8, .group_size = 32, .mode = .mxfp8 } }, .qk = qk, .table = .{ .fd = -1, .rows = n_rows, .head_dim = @intCast(hd), .mode = mode, .bits = bits, .group_size = 32, .w_off = 0, .w_stride = wlen, .wlen = wlen, .s_off = 0, .s_stride = slen, .slen = slen } };
+        try fusion.heldTable(&e.table, n_rows, if (bits == 4) 4096 + 952 else 4096 + 48, rng);
+        defer for (e.table.held[0..2]) |mem| std.posix.munmap(mem);
+        try testing.expect(fusion.wrapHeld(&e));
+        defer {
+            _ = mlx.mlx_synchronize(s);
+            fusion.unwrap(&e);
+        }
+        for (1..MR + 1) |R| for (0..2) |ek| {
+            var sc = Scope.init(gpa, s);
+            defer sc.deinit();
+            var hist: [3 + MR]u32 = undefined;
+            for (hist[0..3]) |*v| v.* = rng.uintLessThan(u32, 1 << 17);
+            var toks: [MR]u32 = undefined;
+            for (toks[0..R], hist[3..][0..R]) |*t, *c| {
+                t.* = rng.uintLessThan(u32, 512);
+                c.* = map[t.*];
+            }
+            const x = try sc.keep(try fx.normal(&.{ @intCast(R), @intCast(hc), @intCast(d) }, .bfloat16, 0, 1));
+            // The verify: the R tokens hashed on the host after the history, each row's slot write from its ids.
+            var host: [MR * engram.MAX_LAYERS * engram.MAX_COLS]u32 = undefined;
+            hs.rows(hist[0..3], hist[3..][0..R], host[0 .. R * ctx.n]);
+            const got = (try writeRows(&sc, m, &e, host[0 .. R * ctx.n], hs.n_layers, 0, R, ek, nc, x)) orelse return error.Declined;
+            // The plain steps: each token on the GPU after the history and the run's earlier tokens.
+            for (0..R) |r| {
+                const xr = try sc.slice(x, 0, r, r + 1);
+                const t = try sc.keep(mlx.mlx_array_new_data(&toks[r], &[_]c_int{1}, 1, .uint32));
+                const want = (try write(&sc, m, &e, try rows(&sc, &hs, &ctx, hist[0 .. 3 + r], t, 0), .{ .ctx = null }, ek, nc, xr)) orelse return error.Declined;
+                const differ = try decode.rowWordsDiffer(got, r, want);
+                const other: u32 = (toks[r] + 1) % 512;
+                const ot = try sc.keep(mlx.mlx_array_new_data(&other, &[_]c_int{1}, 1, .uint32));
+                const plant = (try write(&sc, m, &e, try rows(&sc, &hs, &ctx, hist[0 .. 3 + r], ot, 0), .{ .ctx = null }, ek, nc, xr)) orelse return error.Declined;
+                const moved = try decode.rowWordsDiffer(got, r, plant);
+                if (differ > 0) std.debug.print("[exact-rows] engram {t} R={d} table {d} row {d}: {d} words differ from the plain step's write\n", .{ mode, R, ek, r, differ });
+                bad += @intFromBool(differ > 0);
+                try testing.expect(moved > 0);
+                cases += 1;
+            }
+        };
+    }
+    std.debug.print("[exact-rows] engram: {d} of {d} verify rows differ from their plain step's write\n", .{ bad, cases });
+    try testing.expectEqual(@as(usize, 0), bad);
 }

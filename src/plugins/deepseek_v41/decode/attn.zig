@@ -1117,3 +1117,37 @@ test "dsv41 dec attn tile (MLX_SERVE_DSV41_ATTN_DEC): over the test set the tile
     try testing.expect(near);
     try testing.expectEqual(cells, caught);
 }
+
+/// The tile kernel over rows of a rig's queries, row r at position `p0 + r` over its own picks (`decode.rowsInvariant`).
+const RowsCase = struct {
+    sc: *Scope,
+    kern: mlx.mlx_fast_metal_kernel,
+    m: *const dsv41.Dsv41Model,
+    rig: *const Rig,
+
+    pub fn runRows(c: *RowsCase, lo: usize, hi: usize) !decode.RowOuts {
+        const picks = if (c.rig.k > 0) try c.sc.slice(c.rig.picks[0], 0, lo, hi) else none;
+        const p = (try partialsTile(c.sc, c.kern, c.m, try c.sc.slice(c.rig.q, 0, lo, hi), c.rig.win(), c.rig.comps[0], picks, c.rig.p0 + lo, SCALE)) orelse return error.Declined;
+        return .{ p.acc, p.m, p.l, none, none, none, none, none };
+    }
+};
+
+test "dsv41 exact rows: attention: each row of an R-row tile launch is its one-row launch's partials at its position (ATTN_DEC), R = 1..6, 512, 100 and no picks, short and long contexts" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var m = try todayModel();
+    defer freeTodayModel(&m);
+    const tile = try buildTile();
+    defer _ = mlx.mlx_fast_metal_kernel_free(tile);
+    var bad: usize = 0;
+    for ([_]usize{ 512, 100, 0 }) |k| for ([_]usize{ 300, 5000 }) |ctx| {
+        var sc = Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const rig = try Rig.init(&sc, decode.max_rows, ctx, k, 1, 1, ctx, 31 + k + ctx);
+        defer rig.deinit();
+        var c: RowsCase = .{ .sc = &sc, .kern = tile, .m = &m, .rig = rig };
+        var buf: [48]u8 = undefined;
+        bad += try decode.rowsInvariant(try std.fmt.bufPrint(&buf, "attention K={d} ctx={d}", .{ k, ctx }), &c);
+    };
+    try testing.expectEqual(@as(usize, 0), bad);
+}

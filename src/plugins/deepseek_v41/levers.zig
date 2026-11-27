@@ -17,6 +17,7 @@ const env = @import("../../env.zig");
 const shared = @import("../../sdk/util/shared.zig");
 const log = @import("../../sdk/util/log.zig");
 const acceptance = @import("../../sdk/spec/mtp_acceptance.zig");
+const plan = @import("decode/plan.zig");
 
 pub const Stack = enum { prefill, attention, decode, spec, memory, loader };
 /// The README's classes. `requant` is HEAD8 alone, the one accepted requantization that lossless keeps.
@@ -28,6 +29,10 @@ pub const Pick = union(enum) { site, value: [:0]const u8 };
 /// The line a served lever logs: `canonical` is `[dsv41] MLX_SERVE_DSV41_<NAME> engaged`, `line` a row's own
 /// prefix, `none` the reason the row logs none.
 pub const Engage = union(enum) { canonical, line: []const u8, none: []const u8 };
+/// How `MLX_SERVE_DSV41_EXACT` covers a lever at its default: `ops` the decode ops whose entry in the kernel owner
+/// (`decode/plan.zig`) covers what it changes (the plain step's kernel, or an R-row plan its test holds to the
+/// one-row launch), `not_verify` why no verify row's logits read what it changes.
+pub const ExactCover = union(enum) { ops: []const plan.Op, not_verify: []const u8 };
 
 pub const Row = struct {
     name: []const u8,
@@ -50,6 +55,8 @@ pub const Row = struct {
     class_text: []const u8,
     what: []const u8,
     evidence: []const u8,
+    /// EXACT's cover (`ExactCover`): every default-on decode or spec lever names one.
+    exact: ?ExactCover = null,
 };
 
 pub const prefix = "MLX_SERVE_DSV41_";
@@ -72,7 +79,7 @@ pub const rows = [_]Row{
     .{ .name = "PF_ROPE_PAIRS", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Query-tail rope computes each angle once per pair", .evidence = "test (word for word)" },
     .{ .name = "PF_RMS_ROWS", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Query-latent rms reads its rows in place", .evidence = "test (word for word)" },
     .{ .name = "CED_LAZY", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted = false, .class_text = "EXACT", .what = "Runs a CED replay once, for its first reader", .evidence = "test (word for word)" },
-    .{ .name = "IN_PROJ_MIXR", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Verify in_proj hc mixes as one threadgroup per (mix, row)", .evidence = "test (word for word; M3 or later)" },
+    .{ .name = "IN_PROJ_MIXR", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Verify in_proj hc mixes as one threadgroup per (mix, row)", .evidence = "test (word for word; M3 or later)", .exact = .{ .ops = &.{.in_proj} } },
     .{ .name = "HC_EXPAND_NORM", .stack = .prefill, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER", .what = "FFN-side hc expand and norm in one launch", .evidence = "A/B text (its test allows 1% relative error, not counted as a bound)" },
     .{ .name = "PF_MOE_EPI", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted = false, .class_text = "EXACT", .what = "Counting-sort route pack in place of two argsorts", .evidence = "test" },
     .{ .name = "PF_GU_SEG", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "PF_FP4_GEMM", .engage = .canonical, .class_text = "EXACT", .what = "128 x 128 paired gate/up where the planner picks it", .evidence = "test (word for word, to 8,192 rows, NVFP4 with per-expert scales; NAX)" },
@@ -89,19 +96,19 @@ pub const rows = [_]Row{
     .{ .name = "PF_ENGRAM_PASS", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Engram wkv once per 16 spans", .evidence = "test" },
     .{ .name = "MOE_TAIL", .stack = .prefill, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted = false, .class_text = "EXACT", .what = "MoE combine and hc expand in one launch", .evidence = "test" },
     .{ .name = "FLASH_TRIM", .stack = .attention, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "FLASH_ATTN", .engage = .canonical, .class_text = "EXACT (to FLASH_ATTN)", .what = "FLASH_ATTN with a raw-score block max and 8-byte stores", .evidence = "test" },
-    .{ .name = "FFN_IN_SINK", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "ffn_in mix tail in its own launch", .evidence = "test (word for word)" },
-    .{ .name = "SPEC_ENGRAM_AHEAD", .stack = .spec, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "SPEC_SYNC", .engage = .canonical, .accepted_if = "greedy,spec", .class_text = "EXACT", .what = "Queues the next verify's Engram kv behind the draft", .evidence = "test" },
-    .{ .name = "FFN_IN_R5_COLS1", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "5-row ffn_in launch 1 with one column per simdgroup", .evidence = "test (word for word)" },
-    .{ .name = "DRAFT_POS_ONCE", .stack = .spec, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "SPEC_SYNC", .engage = .canonical, .accepted_if = "spec", .class_text = "EXACT", .what = "Makes draft ring slots and positions once", .evidence = "commit" },
-    .{ .name = "FUSE_WQB_RING", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "The wq_b launch writes the window ring", .evidence = "contract" },
-    .{ .name = "ENGRAM_KV_CACHE", .stack = .memory, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "ENGRAM_KV_SLOTS", .engage = .canonical, .class_text = "EXACT (to ENGRAM_KV_SLOTS)", .what = "GPU cache of Engram slot partials, at most 4 GB", .evidence = "test" },
-    .{ .name = "FP4_DEC_WORD", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Decodes e2m1 codes a word at a time", .evidence = "test" },
-    .{ .name = "FP4_UP_SPLIT", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Shared gate and up rows on separate simdgroups", .evidence = "test" },
-    .{ .name = "FP8_FOLD", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .{ .line = "deepseek_v41: decode mxfp8 reads folded" }, .class_text = "EXACT (declines on rare codes)", .what = "Folds 2^8 into the e8m0 scale in mxfp8 reads", .evidence = "test (word for word on finite codes), load scan" },
-    .{ .name = "MOE_DOWN_ORDER", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Verify down launch in column-block order", .evidence = "test (bit for bit, R = 2 to 6)" },
-    .{ .name = "FUSE_DOWN_SCALE", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "WEIGHT_PATH", .engage = .{ .line = "deepseek_v41: fused down scale" }, .accepted_if = "nvfp4", .class_text = "EXACT", .what = "NVFP4 down scale inside the gate/up launch", .evidence = "test (word for word)" },
+    .{ .name = "FFN_IN_SINK", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "ffn_in mix tail in its own launch", .evidence = "test (word for word)", .exact = .{ .ops = &.{.ffn_in} } },
+    .{ .name = "SPEC_ENGRAM_AHEAD", .stack = .spec, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "SPEC_SYNC", .engage = .canonical, .accepted_if = "greedy,spec", .class_text = "EXACT", .what = "Queues the next verify's Engram kv behind the draft", .evidence = "test", .exact = .{ .ops = &.{.engram} } },
+    .{ .name = "FFN_IN_R5_COLS1", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "5-row ffn_in launch 1 with one column per simdgroup", .evidence = "test (word for word)", .exact = .{ .ops = &.{ .wo_b, .ffn_in } } },
+    .{ .name = "DRAFT_POS_ONCE", .stack = .spec, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "SPEC_SYNC", .engage = .canonical, .accepted_if = "spec", .class_text = "EXACT", .what = "Makes draft ring slots and positions once", .evidence = "commit", .exact = .{ .not_verify = "a draft-side lever: the verify recomputes every row it keeps" } },
+    .{ .name = "FUSE_WQB_RING", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "The wq_b launch writes the window ring", .evidence = "contract", .exact = .{ .ops = &.{.wq_b} } },
+    .{ .name = "ENGRAM_KV_CACHE", .stack = .memory, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "ENGRAM_KV_SLOTS", .engage = .canonical, .class_text = "EXACT (to ENGRAM_KV_SLOTS)", .what = "GPU cache of Engram slot partials, at most 4 GB", .evidence = "test", .exact = .{ .ops = &.{.engram} } },
+    .{ .name = "FP4_DEC_WORD", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Decodes e2m1 codes a word at a time", .evidence = "test", .exact = .{ .ops = &.{.moe} } },
+    .{ .name = "FP4_UP_SPLIT", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Shared gate and up rows on separate simdgroups", .evidence = "test", .exact = .{ .ops = &.{.moe} } },
+    .{ .name = "FP8_FOLD", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .{ .line = "deepseek_v41: decode mxfp8 reads folded" }, .class_text = "EXACT (declines on rare codes)", .what = "Folds 2^8 into the e8m0 scale in mxfp8 reads", .evidence = "test (word for word on finite codes), load scan", .exact = .{ .ops = &.{ .in_proj, .wq_b, .wo_a, .wo_b, .moe } } },
+    .{ .name = "MOE_DOWN_ORDER", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "EXACT", .what = "Verify down launch in column-block order", .evidence = "test (bit for bit, R = 2 to 6)", .exact = .{ .ops = &.{.moe} } },
+    .{ .name = "FUSE_DOWN_SCALE", .stack = .decode, .class = .exact, .kind = .on, .off = .{ .value = "0" }, .parent = "WEIGHT_PATH", .engage = .{ .line = "deepseek_v41: fused down scale" }, .accepted_if = "nvfp4", .class_text = "EXACT", .what = "NVFP4 down scale inside the gate/up launch", .evidence = "test (word for word)", .exact = .{ .ops = &.{.moe} } },
     .{ .name = "CED", .stack = .prefill, .class = .reorder, .kind = .on, .off = null, .engage = .{ .none = "the chunked prompt path itself; -prefill keeps it" }, .class_text = "REORDER (row count)", .what = "The chunked prompt path: the decoder layers run again over a chunk's last window rows only", .evidence = "commit (its fixture test is bit for bit only at 16-row chunks)" },
-    .{ .name = "MOE_FP4_NAX", .stack = .decode, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .{ .line = "deepseek_v41: fused fp4 MoE decode kernels on" }, .class_text = "REORDER (bounded)", .what = "Fused fp4 MoE decode kernels on the matrix units", .evidence = "test (within 1.25x of the `=0` path's rel-rms against f32, + 1e-4)" },
+    .{ .name = "MOE_FP4_NAX", .stack = .decode, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .{ .line = "deepseek_v41: fused fp4 MoE decode kernels on" }, .class_text = "REORDER (bounded)", .what = "Fused fp4 MoE decode kernels on the matrix units", .evidence = "test (within 1.25x of the `=0` path's rel-rms against f32, + 1e-4)", .exact = .{ .ops = &.{.moe} } },
     .{ .name = "MOE_PAIR_FP4", .stack = .prefill, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER (bounded)", .what = "fp4 prompt gate/up (NVFP4 and MXFP4), the scales (NVFP4) and activation in one launch", .evidence = "test" },
     .{ .name = "PF_HC_V2", .stack = .prefill, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER (bounded)", .what = "Wide-layer hc in three passes, not five", .evidence = "test" },
     .{ .name = "PF_PASS_SIZE", .stack = .memory, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER (partition)", .what = "Near-equal memory-sized prompt passes", .evidence = "commit" },
@@ -110,19 +117,19 @@ pub const rows = [_]Row{
     .{ .name = "PF_COMP_BF16", .stack = .prefill, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER", .what = "Compressor projection on a bf16 MMA, K blocks summed apart", .evidence = "test" },
     .{ .name = "PF_IDX_PASS", .stack = .prefill, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER", .what = "Indexer queries and head weights once over the pass, the head weights on a shape-cut kernel (16 partial sums)", .evidence = "test (head weights no farther from float64 than MLX's GEMM per span; +0.8 GB peak, billed)" },
     .{ .name = "FLASH_ATTN", .stack = .attention, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER", .what = "Every prompt-attention call on one flash kernel where it fits", .evidence = "test" },
-    .{ .name = "ENGRAM_GPU_IDS", .stack = .decode, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER (bounded)", .what = "Engram ids hashed on the GPU; fused wkv", .evidence = "test" },
-    .{ .name = "ENGRAM_KV_SLOTS", .stack = .decode, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted = false, .class_text = "REORDER", .what = "Slot-blocked Engram wkv", .evidence = "test" },
-    .{ .name = "FP4_READS", .stack = .decode, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER (bounded; declines on rare codes)", .what = "Bit-placement fp4 reads; each 16-group summed apart", .evidence = "test (within 1.25x of the `=0` path's rel-rms against f32, + 1e-4)" },
-    .{ .name = "ATTN_DEC", .stack = .decode, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER", .what = "Decode attention on a shape-cut tile kernel", .evidence = "test" },
-    .{ .name = "WOA_PLAIN", .stack = .decode, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER", .what = "Splits merged once; wo_a as a plain grouped GEMV", .evidence = "test" },
+    .{ .name = "ENGRAM_GPU_IDS", .stack = .decode, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER (bounded)", .what = "Engram ids hashed on the GPU; fused wkv", .evidence = "test", .exact = .{ .ops = &.{.engram} } },
+    .{ .name = "ENGRAM_KV_SLOTS", .stack = .decode, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted = false, .class_text = "REORDER", .what = "Slot-blocked Engram wkv", .evidence = "test", .exact = .{ .ops = &.{.engram} } },
+    .{ .name = "FP4_READS", .stack = .decode, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER (bounded; declines on rare codes)", .what = "Bit-placement fp4 reads; each 16-group summed apart", .evidence = "test (within 1.25x of the `=0` path's rel-rms against f32, + 1e-4)", .exact = .{ .ops = &.{.moe} } },
+    .{ .name = "ATTN_DEC", .stack = .decode, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER", .what = "Decode attention on a shape-cut tile kernel", .evidence = "test", .exact = .{ .ops = &.{.attention} } },
+    .{ .name = "WOA_PLAIN", .stack = .decode, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "REORDER", .what = "Splits merged once; wo_a as a plain grouped GEMV", .evidence = "test", .exact = .{ .ops = &.{.wo_a} } },
     .{ .name = "FUSE_MXFP8_QMM", .stack = .prefill, .class = .reorder, .kind = .on, .off = .{ .value = "0" }, .parent = "WEIGHT_PATH", .engage = .{ .line = "deepseek_v41: fused mxfp8 prompt linears" }, .class_text = "REORDER (bounded)", .what = "Prompt mxfp8 linears on MLX's quantized matmul", .evidence = "test (within 1.25x of the `=0` path's rel-rms against f32, + 1e-4)" },
-    .{ .name = "DRAFT_FUSED", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted_if = "spec", .class_text = "DRAFT-ONLY", .what = "DSpark stages on the fused decode kernels", .evidence = "test (within 1% relative rms of the op chain)" },
-    .{ .name = "DRAFT_SAMPLE", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted_if = "spec", .class_text = "DRAFT-ONLY", .what = "Sampled drafts from q, kept at min(1, p / q)", .evidence = "test (engine: `spec/dspark.zig`, \"dspark sampled verdict\")" },
-    .{ .name = "DRAFT_QKV", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "DRAFT-ONLY", .what = "Fuses a stage's wq_a and wkv at load", .evidence = "test (within 1e-3 relative rms, no farther from the op chain)" },
-    .{ .name = "SPEC_SYNC", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted_if = "spec", .class_text = "DRAFT-ONLY", .what = "Greedy accept on the GPU; next draft queued behind the verify", .evidence = "A/B text (its test needs a pack)" },
-    .{ .name = "DRAFT_VOCAB", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted = false, .class_text = "DRAFT-ONLY", .what = "Greedy drafts score only the pack's `draft-vocab.txt` ids (default: the pack's file, which the converter writes)", .evidence = "test (and `deepseek_v4/served_test.zig`)" },
-    .{ .name = "DRAFT_VOCAB_PROMPT", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .parent = "DRAFT_VOCAB", .engage = .canonical, .accepted = false, .class_text = "DRAFT-ONLY", .what = "A request's prompt ids join the draft vocabulary", .evidence = "test (`deepseek_v4/served_test.zig`)" },
-    .{ .name = "HEAD8", .stack = .decode, .class = .requant, .kind = .on, .off = .{ .value = "0" }, .engage = .{ .none = "a load-time requantization; the load logs the head" }, .class_text = "Requantized (KLD within one standard error)", .what = "LM head requantized to 8-bit g64", .evidence = "KLD measurement" },
+    .{ .name = "DRAFT_FUSED", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted_if = "spec", .class_text = "DRAFT-ONLY", .what = "DSpark stages on the fused decode kernels", .evidence = "test (within 1% relative rms of the op chain)", .exact = .{ .not_verify = "a draft-side lever: the verify recomputes every row it keeps" } },
+    .{ .name = "DRAFT_SAMPLE", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted_if = "spec", .class_text = "DRAFT-ONLY", .what = "Sampled drafts from q, kept at min(1, p / q)", .evidence = "test (engine: `spec/dspark.zig`, \"dspark sampled verdict\")", .exact = .{ .not_verify = "a draft-side lever: the verify recomputes every row it keeps" } },
+    .{ .name = "DRAFT_QKV", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .class_text = "DRAFT-ONLY", .what = "Fuses a stage's wq_a and wkv at load", .evidence = "test (within 1e-3 relative rms, no farther from the op chain)", .exact = .{ .not_verify = "a draft-side lever: the verify recomputes every row it keeps" } },
+    .{ .name = "SPEC_SYNC", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted_if = "spec", .class_text = "DRAFT-ONLY", .what = "Greedy accept on the GPU; next draft queued behind the verify", .evidence = "A/B text (its test needs a pack)", .exact = .{ .not_verify = "the next draft queued behind the verify, and the greedy accept on the GPU over its logits with the serial sampler's mask" } },
+    .{ .name = "DRAFT_VOCAB", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .engage = .canonical, .accepted = false, .class_text = "DRAFT-ONLY", .what = "Greedy drafts score only the pack's `draft-vocab.txt` ids (default: the pack's file, which the converter writes)", .evidence = "test (and `deepseek_v4/served_test.zig`)", .exact = .{ .not_verify = "a draft-side lever: the verify recomputes every row it keeps" } },
+    .{ .name = "DRAFT_VOCAB_PROMPT", .stack = .spec, .class = .draft_only, .kind = .on, .off = .{ .value = "0" }, .parent = "DRAFT_VOCAB", .engage = .canonical, .accepted = false, .class_text = "DRAFT-ONLY", .what = "A request's prompt ids join the draft vocabulary", .evidence = "test (`deepseek_v4/served_test.zig`)", .exact = .{ .not_verify = "a draft-side lever: the verify recomputes every row it keeps" } },
+    .{ .name = "HEAD8", .stack = .decode, .class = .requant, .kind = .on, .off = .{ .value = "0" }, .engage = .{ .none = "a load-time requantization; the load logs the head" }, .class_text = "Requantized (KLD within one standard error)", .what = "LM head requantized to 8-bit g64", .evidence = "KLD measurement", .exact = .{ .ops = &.{.head} } },
     .{ .name = "ATTN_F16", .stack = .attention, .class = .lossy, .kind = .off, .lossless = .{ .value = "0" }, .lossy = .site, .off = .{ .value = "0" }, .engage = .{ .none = "the core_calls meter counts its calls" }, .class_text = "LOSSY (measured, not gated)", .what = "f16 attention core: under precision=lossy on without NAX, off on NAX; off under lossless", .evidence = "printed float64 measurement, served-route tests" },
     .{ .name = "ENGRAM_LRU_MB", .stack = .loader, .class = .exact, .kind = .setting, .off = null, .engage = .{ .none = "a memory size" }, .class_text = "EXACT", .what = "The Engram LRU's size in MiB", .evidence = "bill test" },
     .{ .name = "ENGRAM_RESIDENT", .stack = .loader, .class = .reorder, .kind = .setting, .off = null, .engage = .{ .none = "a load-time residency choice; the load logs it" }, .class_text = "REORDER", .what = "The Engram tables held in memory at load (auto, wired, 0)", .evidence = "load log" },
@@ -596,6 +603,31 @@ test "deepseek_v41 levers: lossless purity holds, and a planted LOSSY default fa
     inline for (rows) |r| if (r.class == .lossy and ownOf(r) == null) {
         try testing.expectEqualStrings("0", std.mem.span(getOf(r).?));
     };
+}
+
+/// Default-on decode and spec rows of `rs` with no EXACT cover (`Row.exact`), each printed.
+fn exactUncovered(rs: []const Row) usize {
+    var n: usize = 0;
+    for (rs) |r| {
+        if (r.kind != .on or (r.stack != .decode and r.stack != .spec)) continue;
+        const ok = if (r.exact) |c| switch (c) {
+            .ops => |o| o.len > 0,
+            .not_verify => |w| w.len > 0,
+        } else false;
+        if (ok) continue;
+        n += 1;
+        std.debug.print("[levers] {s}: a default-on {t} lever with no EXACT cover\n", .{ r.name, r.stack });
+    }
+    return n;
+}
+
+test "deepseek_v41 levers: every default-on decode or spec lever declares how EXACT covers it (an op of the kernel owner, or why no verify row reads it); a planted row without one fails" {
+    try std.testing.expectEqual(@as(usize, 0), exactUncovered(&rows));
+    var planted = rows;
+    for (&planted) |*r| if (std.mem.eql(u8, r.name, "ATTN_DEC")) {
+        r.exact = null;
+    };
+    try std.testing.expectEqual(@as(usize, 1), exactUncovered(&planted));
 }
 
 test "deepseek_v41 levers: each stack switch turns off its stack's default-on switches, and a lever's own variable wins" {

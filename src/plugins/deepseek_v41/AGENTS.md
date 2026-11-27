@@ -208,11 +208,9 @@ DSpark, lossless classes): `README.md`.
 - A load that Metal's working-set limit refuses but RAM holds names `iogpu.wired_limit_mb` and logs the
   `sudo sysctl iogpu.wired_limit_mb=<N>` that admits it (`wiredLimitAdviceMb`: the load's bill plus the 8 GiB wired
   margin), never paging. The NVFP4 release runs raise it on a 512 GB Mac (`README.md` has the value).
-- On NAX a resident pack's greedy DSpark text under `MLX_SERVE_DSV41_EXACT=1` (its NAX path, the fused fp4 decode
-  on) is drafter-independent: a verify row's head and Engram wkv run a row at a time, every verify keeps to
-  `max_rows`. With `ENGRAM_GPU_IDS=0`, verify rows equal the plain step bit for bit at widths 1-6 (the real-pack
-  exact test); with it on (the default), the Engram projection differs by rounding, so the text is not yet plain
-  decode's bytes; a fix is in progress.
+- Under `MLX_SERVE_DSV41_EXACT=1` a resident pack's greedy DSpark text is plain decode's: `decode/plan.zig` alone picks
+  each decode op's kernel for plain steps and verifies (a verify row the plain step's, or an R-row plan an `exact rows`
+  test holds); a decline is a counted miss, a load it cannot serve is refused, every verify keeps to `max_rows`.
   Off (default) the multi-row kernels serve: the same math in another order. The greedy accept's mask is always on.
 - Past 0.95 x Metal's working set MLX's allocator evicts its buffer cache on every miss (two residency commits per
   allocation): DSpark at 8192 crosses it on a 256 GB Mac at the default `iogpu.wired_limit_mb`; raise it to bench.

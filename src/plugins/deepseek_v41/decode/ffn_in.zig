@@ -2058,3 +2058,59 @@ test "dsv41 dec ffn_in: wo_b's MLX mxfp8 reads give the FOLD form's bytes on fin
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     try decode.expectFoldSame(FfnA, &launch_a, .{}, &.{ .{ .rows = 1, .n = 256, .k = 8192 }, .{ .rows = 6, .n = 256, .k = 8192 }, .{ .rows = 1, .n = 5120, .k = 8192 } });
 }
+
+/// One layer's launch pair over rows of fixed inputs (`decode.rowsInvariant`): `sa` the attention split of all of them.
+const RowsCase = struct {
+    sc: *dsv41.Scope,
+    ks: Kernels,
+    m: *const dsv41.Dsv41Model,
+    ly: *const dsv41.Layer,
+    oa: A,
+    x: A,
+    sa: dsv41.Split,
+    eps: A,
+    scal: A,
+
+    pub fn runRows(c: *RowsCase, lo: usize, hi: usize) !decode.RowOuts {
+        const sc = c.sc;
+        const sa: dsv41.Split = .{ .pre = try sc.slice(c.sa.pre, 0, lo, hi), .post = try sc.slice(c.sa.post, 0, lo, hi), .comb = try sc.slice(c.sa.comb, 0, lo, hi) };
+        const p: Dims = .{ .rows = hi - lo, .d = c.m.cfg.hidden_size, .k = @intCast(mlx.getShape(c.oa)[1]), .e = @intCast(mlx.getShape(c.ly.gate_w)[0]), .top_k = c.ly.top_k, .iters = c.m.cfg.dsv4_hc_sinkhorn_iters, .norm = c.m.cfg.moe_route_norm and c.ly.top_k > 1 };
+        const o = (try launch(sc, c.ks, p, weightsOf(c.ly), try sc.slice(c.oa, 0, lo, hi), try sc.slice(c.x, 0, lo, hi), &sa, c.eps, c.scal)) orelse return error.Declined;
+        return .{ o.x1, o.h2, o.sf.pre, o.sf.post, o.sf.comb, o.idx, o.wts, none };
+    }
+};
+
+test "dsv41 exact rows: ffn_in: each row of an R-row launch pair is its one-row launch's bytes (wo_b and the expand, the FFN norm, mixes and router), R = 1..6, FFN_IN_SINK on and off, layers 21 and 23" {
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const fx = try Fixture.init(gpa, .{ .ctx = 8 });
+    defer fx.deinit();
+    const ks = try build();
+    defer free(ks);
+    const R = decode.max_rows;
+    var bad: usize = 0;
+    for ([_]?[*:0]const u8{ null, "0" }) |sink| for ([_]usize{ 21, 23 }) |li| {
+        const sw = env.override(.MLX_SERVE_DSV41_FFN_IN_SINK, sink);
+        defer sw.restore();
+        var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        const ly = fx.layer(li);
+        const x = try sc.keep(try fx.stream(R));
+        const cpre = try sc.keep(try fx.cpre(R));
+        const scal = try sc.keep(mlx.mlx_array_new_data(&[_]f32{fx.m.cfg.router_scaling_factor}, &[_]c_int{1}, 1, .float32));
+        var c: RowsCase = .{
+            .sc = &sc,
+            .ks = ks,
+            .m = fx.m,
+            .ly = ly,
+            .oa = try sc.keep(try fx.normal(&.{ ci(R), 8192 }, act, 0, 1)),
+            .x = x,
+            .sa = (try dsv41.hcStage(&sc, fx.m, x, null, cpre, &ly.hc_attn, ly.attn_norm)).sp,
+            .eps = try dsv41.hcEps(&sc, fx.m),
+            .scal = scal,
+        };
+        var buf: [48]u8 = undefined;
+        bad += try decode.rowsInvariant(try std.fmt.bufPrint(&buf, "ffn_in layer {d} SINK {s}", .{ li, if (sink == null) "on" else "off" }), &c);
+    };
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}

@@ -22,6 +22,7 @@ pub const moe_down = @import("moe_down.zig");
 pub const engram_kv = @import("engram_kv.zig");
 pub const engram_ids = @import("engram_ids.zig");
 pub const engram_kvc = @import("engram_kvc.zig");
+pub const plan = @import("plan.zig");
 pub const fp8_codes = @import("fp8_codes.zig");
 
 const dsv41 = @import("../deepseek_v41.zig");
@@ -30,12 +31,58 @@ const A = mlx.mlx_array;
 
 /// The most rows a decode kernel serves in one launch: a plain step, or a DSpark verify block.
 pub const max_rows = 6;
+comptime {
+    std.debug.assert(plan.max_rows == max_rows);
+}
 
 /// What this machine streams from memory in practice (a plain reduction on the M5 Ultra), bytes a microsecond.
 pub const stream_bytes_per_us: f64 = 1.065e6;
 
 pub fn register(set: *kc.Set) !void {
     inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, woa_plain, ffn_in, moe_up, moe_fp4, moe_down, engram_kv, engram_kvc }) |k| try k.register(set);
+}
+
+/// An op's outputs for one launch over some rows (the rows on axis 0; an unused slot has no array), for
+/// `rowsInvariant`.
+pub const RowOuts = [8]A;
+
+/// The words of row `r` of `got` (an R-row launch's output) that differ from `want` (that row's one-row launch), as
+/// f32 bits (bf16, f32 and small integers read exactly).
+pub fn rowWordsDiffer(got: A, r: usize, want: A) !usize {
+    const gpa = std.testing.allocator;
+    const g = try dsv41.hostF32(got);
+    defer gpa.free(g);
+    const w = try dsv41.hostF32(want);
+    defer gpa.free(w);
+    const rows: usize = @intCast(mlx.getShape(got)[0]);
+    if (w.len * rows != g.len) return error.ShapeMismatch;
+    var n: usize = 0;
+    for (g[r * w.len ..][0..w.len], w) |a, b| n += @intFromBool(@as(u32, @bitCast(a)) != @as(u32, @bitCast(b)));
+    return n;
+}
+
+/// The R-invariance bar of `plan.zig`'s `r_invariant` covers: `c.runRows(lo, hi)` runs an op over input rows [lo, hi)
+/// (`RowOuts`); the rows of each R-row launch, R = 1..`max_rows`, whose words differ from that row's one-row launch,
+/// each printed. 0 is the bar.
+pub fn rowsInvariant(label: []const u8, c: anytype) !usize {
+    var one: [max_rows]RowOuts = undefined;
+    for (0..max_rows) |r| one[r] = try c.runRows(r, r + 1);
+    var bad: usize = 0;
+    var checked: usize = 0;
+    for (1..max_rows + 1) |R| {
+        const got = try c.runRows(0, R);
+        for (0..R) |r| for (got, one[r], 0..) |g, w, o| {
+            if (g.ctx == null) continue;
+            checked += 1;
+            const d = try rowWordsDiffer(g, r, w);
+            if (d == 0) continue;
+            bad += 1;
+            std.debug.print("[exact-rows] {s} R={d} row {d} output {d}: {d} words differ from its one-row launch\n", .{ label, R, r, o, d });
+        };
+    }
+    if (checked == 0) return error.NothingChecked;
+    std.debug.print("[exact-rows] {s}: {d} of {d} row outputs differ from their one-row launches, R = 1..{d}\n", .{ label, bad, checked, max_rows });
+    return bad;
 }
 
 /// Root-mean-square of `got - want` over that of `want`.
@@ -418,7 +465,7 @@ test "dsv41 dec ubench: a tensor sum's GPU-CPU-GPU hand-off without the network 
 test {
     _ = fixture;
     _ = @import("exact_test.zig");
-    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, woa_plain, ffn_in, moe_up, moe_down, engram_kv, engram_ids, engram_kvc, fp8_codes }) |k| _ = k;
+    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, woa_plain, ffn_in, moe_up, moe_down, engram_kv, engram_ids, engram_kvc, fp8_codes, plan }) |k| _ = k;
 }
 
 test "dsv41 dec fp8 reads: every e4m3 code at every byte reads as MLX's from_fp8, every e8m0 code as MLX's fp8.h; FOLD differs only where it overflows or misses a NaN" {

@@ -124,10 +124,8 @@ to a value that does not start with 0; then the stages load, and drafting stays 
 For a greedy request, the drafter proposes its argmax tokens, and the verify keeps the longest prefix that the model
 agrees with. The verify rows run multi-row kernels, which do the math of a plain decode step in another sum order. So
 greedy text with DSpark on can differ from plain decode by rounding. Under `MLX_SERVE_DSV41_EXACT=1`, greedy DSpark
-text is drafter-independent, one request at a time. With `ENGRAM_GPU_IDS=0`, verify rows equal the plain step bit for
-bit at widths 1-6 (the real-pack exact test); with it on (the default), the Engram projection differs by rounding, so
-the text is not yet plain decode's bytes. A fix is in progress. We have not measured its speed cost (see "Switches
-that stay opt-in").
+text is plain decode's bytes, one request at a time. We have not measured its speed cost (see "Switches that stay
+opt-in").
 
 Sampled requests use standard speculative sampling (`MLX_SERVE_DSV41_DRAFT_SAMPLE`), so the output keeps the model's
 distribution (the block below has the rule).
@@ -481,22 +479,20 @@ Engine variables on the DeepSeek path: `MLX_SERVE_DSV4_DSPARK` (REORDER, by reas
 ## Switches that stay opt-in
 
 Four switches stay off by default (`EXACT`, `FLASH_PSUM`, `MXFP4_VIEW`, `PF_INT8`), and three value switches set
-memory and kernel choices. `MLX_SERVE_DSV41_EXACT=1` also serves NAX, with the same guarantee and gap;
-`MLX_SERVE_DSV41_EXACT_VERIFY`, which only earlier heads of PR 1256 had, is gone.
+memory and kernel choices. `MLX_SERVE_DSV41_EXACT=1` now also serves NAX; `MLX_SERVE_DSV41_EXACT_VERIFY`, which only
+earlier heads of PR 1256 had, is gone.
 
 <details>
 <summary>The opt-in and value switches</summary>
 
 Each of these is off by default. Names omit `MLX_SERVE_DSV41_` except where shown.
 
-- `EXACT=1|solo` makes greedy DSpark text drafter-independent, one request at a time. Any value other than unset,
-  empty or `0` turns it on. On NAX, it runs each verify row's head and Engram wkv a row at a time; on M3-generation or
-  later Apple GPUs without NAX, the whole verify row runs the plain step's kernels. With `ENGRAM_GPU_IDS=0`, verify
-  rows equal the plain step bit for bit at widths 1-6: in the real-pack exact test (`DSV41_VERIFY_EXACT`, the
-  `505081c6` gate binary), 0 of 132 verify rows differed on a 17K context; the test runs `scratch_attn.ring_regions`
-  at its own value, not the served one. With it on (the default), the Engram projection differs by rounding, so the
-  text is not yet plain decode's bytes. A fix is in progress. `solo` also makes every request decode alone, and it is
-  served only without NAX. We have not measured its speed cost.
+- `EXACT=1|solo` (EXACT) makes greedy DSpark text equal plain decode's bytes, one request at a time. Any value other
+  than unset, empty or `0` turns it on. One owner (`decode/plan.zig`) gives every decode op of a verify row its plain
+  step's kernel, or a multi-row plan that a test holds to the one-row launch; a kernel that declines counts a logged
+  miss. Without NAX (M3 generation or later) the verify tail runs a row at a time. A load it cannot serve (streamed
+  experts, a pair or tensor split, an outside quant plugin's weights) is refused. `solo` also makes every request
+  decode alone, and it is served only without NAX. We have not measured its speed cost.
 - `FLASH_PSUM=1` (REORDER) is a flash-attention variant that is nearer to float64. It measured no faster.
 - `MXFP4_VIEW=1` (REORDER) loads an NVFP4 bank whose every 32-value span is one power of two as MXFP4. On the
   release build the greedy A/B decides: the view is -1.70% prefill and -0.33% decode there, and its use is the
