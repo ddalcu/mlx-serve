@@ -54,9 +54,14 @@ const Setup = struct {
 
     /// The pack, on the CPU's stream or the GPU's, and the whole prompt's rows from one forward.
     fn init(a: std.mem.Allocator, gpu: bool) !Setup {
+        return initWith(a, gpu, "");
+    }
+
+    /// `init` under the model settings `settings` (the parse's and the load's).
+    fn initWith(a: std.mem.Allocator, gpu: bool, settings: []const u8) !Setup {
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
-        var pack = try conformance.Loaded.openWith(testing.io, arena.allocator(), plugin.plugin.name, &plugin.table, try plugin.conformanceFixture(arena.allocator()), .{ .gpu = gpu });
+        var pack = try conformance.Loaded.openWith(testing.io, arena.allocator(), plugin.plugin.name, &plugin.table, try plugin.conformanceFixture(arena.allocator()), .{ .gpu = gpu, .settings = settings });
         errdefer pack.close();
         var cache = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
         defer cache.deinit();
@@ -3987,5 +3992,248 @@ test "inkling2 kernels: fused LAW=1 sampled Markov chain returns valid law and c
         try testing.expectApproxEqAbs(@as(f32, 1), sum, 1e-4);
         try testing.expect(row[@intFromFloat(ids[i])] > 0);
         try testing.expectApproxEqAbs(std.mem.max(f32, row), sure[i], 1e-4);
+    }
+}
+
+/// The tiny looped fixture's whole-prompt logits under the model settings `settings`.
+fn runLoopCdWhole(a: std.mem.Allocator, settings: []const u8, gpu: bool) ![]f32 {
+    var s = try Setup.initWith(a, gpu, settings);
+    defer s.deinit(a);
+    return a.dupe(f32, s.whole);
+}
+
+/// The fixture's whole-prompt logits as a checkpoint of one pass, its weights unchanged: `z_1`.
+fn onePassWhole(a: std.mem.Allocator) ![]f32 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    const files = try ar.dupe(fixture.File, (try plugin.conformanceFixture(ar)).files);
+    files[0].bytes = try std.mem.replaceOwned(u8, ar, files[0].bytes, "\"num_passes\":3", "\"num_passes\":1");
+    var pack = try conformance.Loaded.openWith(testing.io, ar, plugin.plugin.name, &plugin.table, .{ .files = files }, .{});
+    defer pack.close();
+    try testing.expectEqual(@as(u32, 8), pack.parsed.shell.num_hidden_layers);
+    var cache = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
+    defer cache.deinit();
+    return step(a, &pack, &cache, &prompt, 0, .all_rows);
+}
+
+// Bar: LoopCD-Logits (fixed Eq. 3 and adaptive Eq. 4) on the 3-pass fixture with ref_pass=1 matches the exact
+// closed-form combination of independent 3-pass (`z_R`) and 1-pass (`z_1`) forwards on every row, and whole ==
+// chunked == stepwise holds for every LoopCD mode (hidden, logits, adaptive).
+test "inkling2 loopcd: logits and adaptive match the exact reference-pass oracle; whole == chunked == stepwise" {
+    const a = testing.allocator;
+    const z_strong = try runLoopCdWhole(a, "", false);
+    defer a.free(z_strong);
+    const z_weak = try onePassWhole(a);
+    defer a.free(z_weak);
+
+    // Fixed LoopCD-Logits (Eq. 3): z' = z_R + omega * (z_R - z_1).
+    {
+        const omega: f32 = 0.5;
+        const got = try runLoopCdWhole(a, "{\"loopcd\":{\"mode\":\"logits\",\"omega\":0.5,\"ref_pass\":1}}", false);
+        defer a.free(got);
+        var max_diff: f32 = 0;
+        var changed: f32 = 0;
+        for (got, z_strong, z_weak) |g_val, zs, zw| {
+            const want = zs + omega * (zs - zw);
+            max_diff = @max(max_diff, @abs(g_val - want));
+            changed = @max(changed, @abs(g_val - zs));
+        }
+        try testing.expect(changed > 1e-2);
+        try testing.expect(max_diff < 1e-4);
+    }
+
+    // Adaptive LoopCD-Logits (Eq. 4): omega = omega_max * (1 - (p_(1) - p_(2))).
+    {
+        const omega_max: f64 = 0.6;
+        const got = try runLoopCdWhole(a, "{\"loopcd\":{\"mode\":\"adaptive\",\"omega\":0.6,\"ref_pass\":1}}", false);
+        defer a.free(got);
+        const rows = prompt.len;
+        var max_diff: f64 = 0;
+        for (0..rows) |r| {
+            const zs = z_strong[r * VOCAB ..][0..VOCAB];
+            const zw = z_weak[r * VOCAB ..][0..VOCAB];
+            const gr = got[r * VOCAB ..][0..VOCAB];
+            var mx: f64 = -std.math.inf(f64);
+            for (zs) |v| mx = @max(mx, @as(f64, v));
+            var sum_exp: f64 = 0;
+            for (zs) |v| sum_exp += @exp(@as(f64, v) - mx);
+            var p1: f64 = 0;
+            var p2: f64 = 0;
+            for (zs) |v| {
+                const p = @exp(@as(f64, v) - mx) / sum_exp;
+                if (p > p1) {
+                    p2 = p1;
+                    p1 = p;
+                } else if (p > p2) {
+                    p2 = p;
+                }
+            }
+            const w_eff = omega_max * @max(0.0, 1.0 - (p1 - p2));
+            for (0..VOCAB) |j| {
+                const want = @as(f64, zs[j]) + w_eff * (@as(f64, zs[j]) - @as(f64, zw[j]));
+                max_diff = @max(max_diff, @abs(@as(f64, gr[j]) - want));
+            }
+        }
+        try testing.expect(max_diff < 1e-4);
+    }
+
+    // LoopCD-Hidden: omega=0 reproduces baseline; omega=0.5 differs and stays finite.
+    {
+        const hid0 = try runLoopCdWhole(a, "{\"loopcd\":{\"mode\":\"hidden\",\"omega\":0,\"ref_pass\":1}}", false);
+        defer a.free(hid0);
+        try expectRows(hid0, z_strong);
+
+        const hid5 = try runLoopCdWhole(a, "{\"loopcd\":{\"mode\":\"hidden\",\"omega\":0.5,\"ref_pass\":1}}", false);
+        defer a.free(hid5);
+        var max_shift: f32 = 0;
+        for (hid5, z_strong) |h_val, s_val| {
+            try testing.expect(std.math.isFinite(h_val));
+            max_shift = @max(max_shift, @abs(h_val - s_val));
+        }
+        try testing.expect(max_shift > 1e-2);
+    }
+
+    // Whole == chunked == stepwise on CPU for hidden, logits and adaptive.
+    for ([_][]const u8{
+        "{\"loopcd\":{\"mode\":\"hidden\",\"omega\":0.4,\"ref_pass\":1}}",
+        "{\"loopcd\":{\"mode\":\"logits\",\"omega\":0.4,\"ref_pass\":1}}",
+        "{\"loopcd\":{\"mode\":\"adaptive\",\"omega\":0.6,\"ref_pass\":2}}",
+    }) |spec| {
+        var s = try Setup.initWith(a, false, spec);
+        defer s.deinit(a);
+        var cache = try test_cache.TestCache.init(a, s.pack.parsed.shell.num_hidden_layers);
+        defer cache.deinit();
+        var at: usize = 0;
+        for ([_]usize{ 5, 7 }) |n| {
+            const rows = try step(a, &s.pack, &cache, prompt[at .. at + n], at, .all_rows);
+            defer a.free(rows);
+            try expectRows(rows, s.whole[at * VOCAB .. (at + n) * VOCAB]);
+            at += n;
+        }
+        while (at < prompt.len) : (at += 1) {
+            const row = try step(a, &s.pack, &cache, prompt[at .. at + 1], at, .last_row);
+            defer a.free(row);
+            try expectRows(row, s.whole[at * VOCAB .. (at + 1) * VOCAB]);
+        }
+    }
+}
+
+// Bar: batched decode under LoopCD (hidden, logits, adaptive) matches each slot decoded alone.
+test "inkling2 loopcd: batched decode matches solo decode across every mode" {
+    const a = testing.allocator;
+    for ([_][]const u8{
+        "{\"loopcd\":{\"mode\":\"hidden\",\"omega\":0.4,\"ref_pass\":1}}",
+        "{\"loopcd\":{\"mode\":\"logits\",\"omega\":0.4,\"ref_pass\":1}}",
+        "{\"loopcd\":{\"mode\":\"adaptive\",\"omega\":0.6,\"ref_pass\":1}}",
+    }) |spec| {
+        for (streams()) |gpu| {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var pack = try conformance.Loaded.openWith(testing.io, arena.allocator(), plugin.plugin.name, &plugin.table, try plugin.conformanceFixture(arena.allocator()), .{ .gpu = gpu, .settings = spec });
+            defer pack.close();
+            const n_layers = pack.parsed.shell.num_hidden_layers;
+            const p0 = prompt[0..8];
+            const p1 = prompt[4..15];
+            var c0 = try test_cache.TestCache.init(a, n_layers);
+            defer c0.deinit();
+            var c1 = try test_cache.TestCache.init(a, n_layers);
+            defer c1.deinit();
+            a.free(try step(a, &pack, &c0, p0, 0, .last_row));
+            a.free(try step(a, &pack, &c1, p1, 0, .last_row));
+
+            // Solo decode references on fresh copies of the same prompts.
+            var s0 = try test_cache.TestCache.init(a, n_layers);
+            defer s0.deinit();
+            var s1 = try test_cache.TestCache.init(a, n_layers);
+            defer s1.deinit();
+            a.free(try step(a, &pack, &s0, p0, 0, .last_row));
+            a.free(try step(a, &pack, &s1, p1, 0, .last_row));
+            const next_toks = [_]u32{ prompt[8], prompt[15] };
+            const want0 = try step(a, &pack, &s0, next_toks[0..1], p0.len, .last_row);
+            defer a.free(want0);
+            const want1 = try step(a, &pack, &s1, next_toks[1..2], p1.len, .last_row);
+            defer a.free(want1);
+
+            // Batched 2-slot tick.
+            var handles = [_]abi.Handle{ c0.handle(), c1.handle() };
+            const slot_ids = [_]u32{ 0, 1 };
+            const positions = [_]u32{ @intCast(p0.len), @intCast(p1.len) };
+            var out: abi.ForwardOut = .{};
+            const v = pack.table.forward(pack.model, &.{
+                .mode = .batched_rows,
+                .logits = .last_row,
+                .rows = 1,
+                .tokens = .of(&next_toks),
+                .slots = .of(&slot_ids),
+                .positions = .of(&positions),
+                .caches = .of(&handles),
+                .cache_ops = &test_cache.ops,
+            }, &out);
+            try testing.expect(v.isOk());
+            if (out.hidden.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = out.hidden.ctx });
+            const got = try conformance.consumeF32(a, out.logits);
+            defer a.free(got);
+            try expectRows(got[0..VOCAB], want0);
+            try expectRows(got[VOCAB .. 2 * VOCAB], want1);
+        }
+    }
+}
+
+// Bar: a draft round's open verify + commit under LoopCD (hidden and logits, where logits adds reference coda cache
+// entries) leaves every cache entry (main + ref coda) identical to forwarding the kept rows directly.
+test "inkling2 loopcd: verified block commit preserves main and reference coda caches" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const run_mod = @import("../../sdk/bases/run.zig");
+    for ([_][]const u8{
+        "{\"loopcd\":{\"mode\":\"hidden\",\"omega\":0.4,\"ref_pass\":1}}",
+        "{\"loopcd\":{\"mode\":\"logits\",\"omega\":0.4,\"ref_pass\":1}}",
+    }) |spec| {
+        var s = try Setup.initWith(a, true, spec);
+        defer s.deinit(a);
+        const m: *plugin.Loaded = @ptrCast(@alignCast(s.pack.model));
+        const n_entries = s.pack.parsed.shell.num_hidden_layers;
+        const split = 9;
+        const width = 5;
+        const kept = 3;
+
+        var serial = try test_cache.TestCache.init(a, n_entries);
+        defer serial.deinit();
+        a.free(try step(a, &s.pack, &serial, prompt[0..split], 0, .last_row));
+        a.free(try step(a, &s.pack, &serial, prompt[split .. split + kept], split, .last_row));
+        const want = try step(a, &s.pack, &serial, prompt[split + kept .. split + kept + 1], split + kept, .last_row);
+        defer a.free(want);
+
+        var cache = try test_cache.TestCache.init(a, n_entries);
+        defer cache.deinit();
+        a.free(try step(a, &s.pack, &cache, prompt[0..split], 0, .last_row));
+        var g = ops.Graph.init(a, m.base.s);
+        defer g.deinit();
+        const opens = try a.alloc(kernels.Open, n_entries);
+        defer a.free(opens);
+        @memset(opens, .{ .g = &g });
+        var sp: plugin.Spec = .{ .visits = &.{}, .keep = 4 };
+        defer {
+            m.base.weights.spec = null;
+            for ([_]mlx.mlx_array{ sp.ring, sp.held }) |x| if (x.ctx != null) {
+                _ = mlx.mlx_array_free(x);
+            };
+        }
+        m.base.weights.spec = &sp;
+        sp.opens = opens;
+        a.free(try step(a, &s.pack, &cache, prompt[split .. split + width], split, .all_rows));
+        sp.opens = null;
+        try testing.expectEqual(@as(u64, split), test_cache.ops.len(cache.handle(), 0));
+        try testing.expectEqual(@as(u64, split), test_cache.ops.len(cache.handle(), n_entries - 1));
+        var h = [_]abi.Handle{cache.handle()};
+        const pos = [_]u32{split};
+        const r: run_mod.Run = .{ .mode = .verify, .rows = @intCast(kept), .positions = &pos, .caches = &h, .cache_ops = &test_cache.ops };
+        var c = r.ctx(&g, &m.base.shared);
+        try kernels.commitPaths(&c, &m.base.weights.body.cfg, opens, &.{&[_]u32{ 0, 1, 2 }});
+        try testing.expectEqual(@as(u64, split + kept), test_cache.ops.len(cache.handle(), n_entries - 1));
+        const got = try step(a, &s.pack, &cache, prompt[split + kept .. split + kept + 1], split + kept, .last_row);
+        defer a.free(got);
+        try testing.expect(parity.qwen4CompareRows(got, want, 1, VOCAB).min_cos > 0.999);
     }
 }

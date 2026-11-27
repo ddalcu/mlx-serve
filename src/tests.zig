@@ -54,6 +54,7 @@ test {
     _ = @import("plugins/gemma3/proof_test.zig");
     _ = @import("plugins/inkling/proof_test.zig");
     _ = @import("plugins/inkling2/proof_test.zig");
+    _ = @import("plugins/inkling2/bill_test.zig");
     _ = @import("plugins/inkling2/served_test.zig");
     _ = @import("plugins/nemotron_h/proof_test.zig");
     _ = @import("plugins/nemotron_h/mtp_head_test.zig");

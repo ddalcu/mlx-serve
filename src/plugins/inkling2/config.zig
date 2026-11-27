@@ -122,6 +122,28 @@ pub const Dflash2 = struct {
 pub const dflash2_dir = "drafter";
 pub const dflash2_config = dflash2_dir ++ "/config.json";
 
+/// LoopCD contrastive decoding from recurrent states (arXiv:2610.02185): contrasts the final recurrent pass
+/// against an earlier pass (`ref_pass`, 1-indexed, default 1 = `h_1`) before the coda (`hidden`, Eq. 2) or after
+/// the coda and LM head (`logits` fixed Eq. 3, `adaptive` margin-gated Eq. 4).
+pub const LoopCd = struct {
+    pub const Mode = enum(u8) { off, hidden, logits, adaptive };
+
+    mode: Mode = .off,
+    /// Fixed strength `omega` (`hidden`/`logits`) or adaptive cap `omega_max` (`adaptive`); finite and >= 0.
+    omega: f32 = 0.0,
+    /// 1-indexed reference recurrent pass `b` in `1 .. passes - 1` (default 1 = `h_1`).
+    ref_pass: u32 = 1,
+
+    pub fn defaultOmega(mode: Mode) f32 {
+        return switch (mode) {
+            .off => 0.0,
+            .hidden, .logits => 0.3,
+            .adaptive => 0.5,
+        };
+    }
+
+};
+
 pub const Config = struct {
     vocab_size: u32,
     /// The logits the model emits: the padded vocab's real rows.
@@ -159,6 +181,9 @@ pub const Config = struct {
     core_end: u32 = 0,
     passes: u32 = 1,
     gate_rank: u32 = 0,
+    loopcd: LoopCd = .{},
+    /// Non-empty when LoopCD changes what the stored KV means (`CacheFacts.layout_namespace`).
+    cache_ns: []const u8 = "",
     quant: abi.Quant = .{},
     block_json: []const u8 = "{}",
     vision: ?Vision = null,
@@ -170,13 +195,29 @@ pub const Config = struct {
         return c.core_end - c.core_start;
     }
 
-    /// Layer applications per token.
+    /// Post-loop coda layers (`[core_end, num_hidden_layers)`).
+    pub fn coda(c: *const Config) u32 {
+        return if (c.core() > 0) c.num_hidden_layers - c.core_end else 0;
+    }
+
+    /// Whether LoopCD runs a second coda pass over the reference state with its own cache entries.
+    pub fn usesRefCoda(c: *const Config) bool {
+        return c.core() > 0 and c.passes >= 2 and (c.loopcd.mode == .logits or c.loopcd.mode == .adaptive);
+    }
+
+    /// Main layer applications per token.
     pub fn visits(c: *const Config) u32 {
         return c.num_hidden_layers + (c.passes - 1) * c.core();
     }
 
-    /// The layer visit `v` runs and its pass through the loop (0 outside it).
+    /// Cache entries per slot: one per main visit, plus one per coda layer for LoopCD-Logits's reference branch.
+    pub fn cacheEntries(c: *const Config) u32 {
+        return c.visits() + if (c.usesRefCoda()) c.coda() else 0;
+    }
+
+    /// The layer visit `v` runs and its pass through the loop (0 outside it; `v >= visits()` are the reference coda).
     pub fn visit(c: *const Config, v: u32) struct { layer: u32, pass: u32 } {
+        if (v >= c.visits()) return .{ .layer = c.core_end + (v - c.visits()), .pass = 0 };
         if (v < c.core_start or c.core() == 0) return .{ .layer = v, .pass = 0 };
         const looped = c.passes * c.core();
         if (v < c.core_start + looped) return .{ .layer = c.core_start + (v - c.core_start) % c.core(), .pass = (v - c.core_start) / c.core() };
@@ -347,12 +388,58 @@ fn readVision(o: std.json.ObjectMap) ?Vision {
     return v;
 }
 
+/// The model setting `loopcd`: a mode name, or `{"mode", "omega", "ref_pass"}`; null when the settings
+/// name none. `omega` and `ref_pass` need a mode that reads them.
+fn readSettingsLoopCd(a: std.mem.Allocator, settings_json: []const u8) !?LoopCd {
+    if (settings_json.len == 0) return null;
+    const doc = try std.json.parseFromSliceLeaky(std.json.Value, a, settings_json, .{});
+    if (doc != .object) return error.InvalidLoopCd;
+    const v = doc.object.get("loopcd") orelse return null;
+    var out: LoopCd = .{};
+    var tuned = false;
+    switch (v) {
+        .string => |s| out.mode = std.meta.stringToEnum(LoopCd.Mode, s) orelse return error.InvalidLoopCd,
+        .object => |o| {
+            var it = o.iterator();
+            while (it.next()) |kv| {
+                const k = kv.key_ptr.*;
+                const x = kv.value_ptr.*;
+                if (std.mem.eql(u8, k, "mode")) {
+                    if (x != .string) return error.InvalidLoopCd;
+                    out.mode = std.meta.stringToEnum(LoopCd.Mode, x.string) orelse return error.InvalidLoopCd;
+                } else if (std.mem.eql(u8, k, "omega")) {
+                    out.omega = @floatCast(float(x) orelse return error.InvalidLoopCd);
+                    if (!std.math.isFinite(out.omega) or out.omega < 0) return error.InvalidLoopCd;
+                    tuned = true;
+                } else if (std.mem.eql(u8, k, "ref_pass")) {
+                    out.ref_pass = int(x) orelse return error.InvalidLoopCd;
+                    if (out.ref_pass == 0) return error.InvalidLoopCd;
+                    tuned = true;
+                } else return error.InvalidLoopCd;
+            }
+            if (o.get("omega") == null) out.omega = LoopCd.defaultOmega(out.mode);
+        },
+        else => return error.InvalidLoopCd,
+    }
+    if (v == .string) out.omega = LoopCd.defaultOmega(out.mode);
+    if (out.mode == .off and tuned) return error.InvalidLoopCd;
+    return out;
+}
+
+/// The `loopcd` setting the model runs: `ref_pass` names a pass before the checkpoint's last.
+fn loopCdFor(a: std.mem.Allocator, settings_json: []const u8, c: *const Config) !LoopCd {
+    const lc = (try readSettingsLoopCd(a, settings_json)) orelse return .{};
+    if (lc.mode == .off) return lc;
+    if (c.core() == 0 or c.passes < 2) return error.LoopCdNeedsTwoPasses;
+    if (lc.ref_pass >= c.passes) return error.LoopCdRefPassOutOfRange;
+    return lc;
+}
+
 fn unsupported(comptime why: []const u8) abi.Verdict {
     return abi.Verdict.refuse(.unsupported, "inkling2_loop: " ++ why);
 }
 
 pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.Str, span: ?*const abi.LayerSpan, stub: bool, out: *abi.Parsed) callconv(.c) abi.Verdict {
-    _ = settings_json;
     if (span != null) return unsupported("a layer span (the cluster split)");
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -392,6 +479,8 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     c.core_end = 0;
     c.passes = 1;
     c.gate_rank = 0;
+    c.loopcd = .{};
+    c.cache_ns = "";
     c.quant = .{};
     c.block_json = "{}";
     c.vision = null;
@@ -441,7 +530,13 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
             c.gate_rank == 0 or c.gate_rank > 4096 or c.blocksBefore(c.core_end) - c.blocksBefore(c.core_start) < 2)
             return unsupported("loop_config out of range");
     }
-    if (c.visits() > max_visits) return unsupported("too many layer visits");
+    // A bad `loopcd` refuses the load: a typo must not serve another decoding mode.
+    c.loopcd = loopCdFor(arena.allocator(), settings_json.slice(), &c) catch |e| return switch (e) {
+        error.LoopCdNeedsTwoPasses => unsupported("the loopcd model setting needs a loop of at least 2 passes"),
+        error.LoopCdRefPassOutOfRange => unsupported("the loopcd model setting's ref_pass is not a pass before the last"),
+        else => unsupported("the loopcd model setting is not a mode or {mode, omega, ref_pass}"),
+    };
+    if (c.cacheEntries() > max_visits) return unsupported("too many layer visits");
 
     if (field(root, "vision_config")) |vc| if (vc == .object) {
         c.vision = readVision(vc.object) orelse return unsupported("vision_config out of range");
@@ -469,8 +564,8 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         .vocab_size = c.unpadded_vocab_size,
         .hidden_size = c.hidden_size,
         .intermediate_size = c.moe_intermediate_size,
-        // The engine sizes caches and bills per layer applied.
-        .num_hidden_layers = c.visits(),
+        // The engine sizes caches and bills per cache entry (main visits + optional reference coda).
+        .num_hidden_layers = c.cacheEntries(),
         .num_attention_heads = c.num_attention_heads,
         .num_key_value_heads = c.num_key_value_heads,
         .head_dim = c.head_dim,
@@ -486,7 +581,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     }
     c.quant = llama.readQuant(root) catch return unsupported("the quantization block");
     s.quant = c.quant;
-    p.cache.ssm_state = .{ .entries = c.visits(), .dtype = .f32 };
+    p.cache.ssm_state = .{ .entries = c.cacheEntries(), .dtype = .f32 };
     c.ring = sliding_ring.rows(c.sliding_window);
     p.cache.sliding_ring = c.ring;
     if (!stub) generation.apply(dir, s);
@@ -497,16 +592,28 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         gpa.destroy(cfg_out);
         return abi.Verdict.refuse(.failed, "inkling2_loop: out of memory");
     };
+    // LoopCD changes the logits the cached rows were served with and adds the coda's entries: a fresh SSD root.
+    if (c.loopcd.mode != .off) {
+        cfg_out.cache_ns = std.fmt.allocPrint(gpa, "loopcd-{s}-r{d}-w{d:.4}", .{
+            @tagName(c.loopcd.mode), c.loopcd.ref_pass, c.loopcd.omega,
+        }) catch {
+            gpa.free(cfg_out.block_json);
+            gpa.destroy(cfg_out);
+            return abi.Verdict.refuse(.failed, "inkling2_loop: out of memory");
+        };
+        p.cache.layout_namespace = abi.Str.of(cfg_out.cache_ns);
+    }
     p.private = cfg_out;
     out.* = p;
     return .ok;
 }
 
-/// One entry per layer visit: a global layer keeps full KV, a local one its window; no layer ropes.
+/// One entry per cache slot (main visits, plus reference coda visits under LoopCD-Logits): a global layer keeps full
+/// KV, a local one its window; no layer ropes.
 pub fn layout(p: *const abi.Parsed, span: ?*const abi.LayerSpan, out: [*]abi.LayerCache, cap: u32) callconv(.c) u32 {
     if (span != null) return 0;
     const c = of(p);
-    const n = @min(c.visits(), cap);
+    const n = @min(c.cacheEntries(), cap);
     for (out[0..n], 0..) |*o, v| {
         const g = c.global[c.visit(@intCast(v)).layer];
         o.* = .{
@@ -531,6 +638,7 @@ pub fn draftStatePerToken(p: *const abi.Parsed) u64 {
 pub fn freeParsed(p: *abi.Parsed) callconv(.c) void {
     if (p.private) |ptr| {
         const c: *Config = @ptrCast(@alignCast(ptr));
+        if (c.cache_ns.len > 0) gpa.free(c.cache_ns);
         gpa.free(c.block_json);
         gpa.destroy(c);
     }
@@ -811,5 +919,77 @@ test "inkling2 config: a DFlash2 drafter beside the pack serves in place of the 
         try testing.expectEqual(@as(u32, if (k.stages > 0) 8 else 0), p.spec.native_block);
         try testing.expectEqual(k.df2, of(&p).dflash2 != null);
         if (k.df2) try testing.expectEqual(@as(u64, 0), draftStatePerToken(&p));
+    }
+}
+
+test "inkling2 config: the loopcd setting, its defaults and what it refuses" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    try testing.expectEqual(@as(?LoopCd, null), try readSettingsLoopCd(ar, ""));
+    try testing.expectEqual(@as(?LoopCd, null), try readSettingsLoopCd(ar, "{\"stream_experts\":true}"));
+    for ([_]struct { json: []const u8, want: LoopCd }{
+        .{ .json = "{\"loopcd\":\"off\"}", .want = .{} },
+        .{ .json = "{\"loopcd\":\"hidden\"}", .want = .{ .mode = .hidden, .omega = 0.3 } },
+        .{ .json = "{\"loopcd\":\"logits\"}", .want = .{ .mode = .logits, .omega = 0.3 } },
+        .{ .json = "{\"loopcd\":\"adaptive\"}", .want = .{ .mode = .adaptive, .omega = 0.5 } },
+        .{ .json = "{\"loopcd\":{\"mode\":\"adaptive\",\"omega\":0.75,\"ref_pass\":2}}", .want = .{ .mode = .adaptive, .omega = 0.75, .ref_pass = 2 } },
+    }) |k| try testing.expectEqual(k.want, (try readSettingsLoopCd(ar, k.json)).?);
+    for ([_][]const u8{
+        "{\"loopcd\":\"bogus\"}",                  "{\"loopcd\":\"mode=logits\"}",            "{\"loopcd\":3}",
+        "{\"loopcd\":{\"mode\":\"nope\"}}",        "{\"loopcd\":{\"mode\":\"logits\",\"omega\":-0.1}}", "{\"loopcd\":{\"ref_pass\":0}}",
+        "{\"loopcd\":{\"mode\":\"logits\",\"passes\":2}}", "{\"loopcd\":{\"foo\":1}}",
+        "{\"loopcd\":{\"omega\":0.4}}",            "{\"loopcd\":{\"mode\":\"off\",\"ref_pass\":2}}",
+    }) |bad| try testing.expectError(error.InvalidLoopCd, readSettingsLoopCd(ar, bad));
+}
+
+test "inkling2 config: LoopCD sizes reference coda caches, namespaces SSD state and refuses invalid settings" {
+    const parseWith = struct {
+        fn run(json: []const u8, settings: []const u8, out: *abi.Parsed) abi.Verdict {
+            const mem: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = json }} };
+            const dir = mem.packDir();
+            return parse(&dir, abi.Str.of(json), abi.Str.of(settings), null, true, out);
+        }
+    }.run;
+
+    // Hidden: same 16 visits/caches, fresh namespace.
+    {
+        var p: abi.Parsed = .{};
+        try testing.expect(parseWith(fixture_config, "{\"loopcd\":\"hidden\"}", &p).isOk());
+        defer freeParsed(&p);
+        const c = of(&p);
+        try testing.expect(c.loopcd.mode == .hidden and !c.usesRefCoda());
+        try testing.expectEqual(@as(u32, 16), c.cacheEntries());
+        try testing.expectEqual(@as(u32, 16), p.shell.num_hidden_layers);
+        try testing.expect(p.cache.layout_namespace.len > 0);
+    }
+    // Logits & adaptive: 16 main visits + 2 coda cache entries (layers 6 sliding, 7 global).
+    for ([_][]const u8{ "{\"loopcd\":\"logits\"}", "{\"loopcd\":{\"mode\":\"adaptive\",\"omega\":0.8,\"ref_pass\":2}}" }) |settings| {
+        var p: abi.Parsed = .{};
+        try testing.expect(parseWith(fixture_config, settings, &p).isOk());
+        defer freeParsed(&p);
+        const c = of(&p);
+        try testing.expect(c.usesRefCoda());
+        try testing.expectEqual(@as(u32, 16), c.visits());
+        try testing.expectEqual(@as(u32, 18), c.cacheEntries());
+        try testing.expectEqual(@as(u32, 18), p.shell.num_hidden_layers);
+        try testing.expectEqual(@as(u32, 18), p.cache.ssm_state.entries);
+        try testing.expectEqual(@as(u32, 6), c.visit(16).layer);
+        try testing.expectEqual(@as(u32, 7), c.visit(17).layer);
+        var lay: [max_visits]abi.LayerCache = undefined;
+        try testing.expectEqual(@as(u32, 18), layout(&p, null, &lay, max_visits));
+        try testing.expect(lay[16].kind == .sliding and lay[16].window == 6);
+        try testing.expect(lay[17].kind == .full and lay[17].window == 0);
+        try testing.expect(p.cache.layout_namespace.len > 0);
+    }
+    // Invalid settings refused by name.
+    for ([_][]const u8{
+        "{\"loopcd\":{\"mode\":\"logits\",\"ref_pass\":3}}",
+        "{\"loopcd\":\"bogus\"}",
+    }) |bad| {
+        var p: abi.Parsed = .{};
+        const v = parseWith(fixture_config, bad, &p);
+        try testing.expect(!v.isOk() and p.private == null);
+        try testing.expect(std.mem.indexOf(u8, v.why.slice(), "loopcd") != null);
     }
 }

@@ -135,6 +135,10 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **Batched decode**: slots are rows with their own cache and conv state (`attendSlots`, `state.get`/`put`); their
   reads run as one `relslots` launch per 8 slots (each slot's K, V and K's strides a buffer: a kernel takes 31) into
   `relcomb`. A CPU stream or several rows a slot run a slot at a time.
+- **LoopCD** (arXiv:2610.02185) is the model setting `loopcd`, read at parse: `off|hidden|logits|adaptive`, or
+  `{mode, omega, ref_pass}`, at the checkpoint's passes. `hidden` extrapolates before the coda (no extra caches);
+  `logits`/`adaptive` add `coda()` reference entries (`visits()..cacheEntries()`), billed as any visit (`bill_test.zig`).
+  A bad value refuses the load by name: a typo must not serve another mode.
 
 - **A verify of several slots is ONE forward** (`openGroup`, `Spec.opens`, `NativeDrafter.verify_group`/`finish_group`): blocks stack
   `rows` a slot (shorter ones padded), the conv kernels read `RPS` rows behind each slot's own state, `attendOpen` reads each

@@ -39,10 +39,12 @@ pub const Override = struct {
     /// The speculation sidecar: "off", "auto" (the pack's own `drafter/`) or an
     /// absolute path. Owned.
     drafter: ?[]const u8 = null,
+    /// A looped model's LoopCD decoding, as its plugin's parse reads it: the entry's JSON value. Owned.
+    loopcd: ?[]const u8 = null,
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
-            o.mtp_greedy_tail == null and o.int8_prefill == null and o.lm_head_mxfp8 == null and o.ane == null and o.stream_experts == null and o.engine == null and o.chat_template_kwargs == null and o.drafter == null;
+            o.mtp_greedy_tail == null and o.int8_prefill == null and o.lm_head_mxfp8 == null and o.ane == null and o.stream_experts == null and o.engine == null and o.chat_template_kwargs == null and o.drafter == null and o.loopcd == null;
     }
 
     /// Whether the model runs on the Neural Engine: the engine setting's choice, else the `ane` switch.
@@ -66,8 +68,10 @@ pub const Override = struct {
     pub fn deinit(o: *Override, alloc: std.mem.Allocator) void {
         if (o.chat_template_kwargs) |k| alloc.free(k);
         if (o.drafter) |d| alloc.free(d);
+        if (o.loopcd) |l| alloc.free(l);
         o.chat_template_kwargs = null;
         o.drafter = null;
+        o.loopcd = null;
     }
 };
 
@@ -239,6 +243,7 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
     if (obj.get("chat_template_kwargs")) |k| if (k == .object) {
         o.chat_template_kwargs = std.json.Stringify.valueAlloc(alloc, k, .{}) catch null;
     };
+    if (obj.get("loopcd")) |l| o.loopcd = std.json.Stringify.valueAlloc(alloc, l, .{}) catch null;
     return o;
 }
 
@@ -423,7 +428,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         };
     };
     var rows_buf: [16]u8 = undefined;
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} int8={s} lm_head_mxfp8={s} ane={s} stream_experts={s} engine={s} drafter={s} kwargs={s}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} int8={s} lm_head_mxfp8={s} ane={s} stream_experts={s} engine={s} drafter={s} kwargs={s} loopcd={s}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
@@ -440,6 +445,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         if (o.engine) |e| @tagName(e) else "auto",
         o.drafter orelse "auto",
         o.chat_template_kwargs orelse "none",
+        o.loopcd orelse "off",
     });
     return o;
 }
@@ -697,6 +703,21 @@ test "model_settings: stream_experts is true or a row count, anything else is un
     try std.testing.expectEqual(@as(?streamed.Setting, .{ .rows = 32 }), s.lookup(t, "/m/b").stream_experts);
     try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
     try std.testing.expect(s.lookup(t, "/m/d").isEmpty());
+}
+
+test "model_settings: loopcd is kept as its JSON for the plugin's parse" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"loopcd": "hidden"}, "/m/b": {"loopcd": {"mode": "logits", "omega": 0.4}}}
+    );
+    defer s.deinit();
+    const t = std.testing.allocator;
+    var a = s.lookup(t, "/m/a");
+    defer a.deinit(t);
+    try std.testing.expectEqualStrings("\"hidden\"", a.loopcd.?);
+    var b = s.lookup(t, "/m/b");
+    defer b.deinit(t);
+    try std.testing.expectEqualStrings("{\"mode\":\"logits\",\"omega\":0.4}", b.loopcd.?);
+    try std.testing.expect(!b.isEmpty());
 }
 
 test "model_settings: bad values ignored, bad JSON = empty" {
