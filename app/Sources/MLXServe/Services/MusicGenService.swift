@@ -120,6 +120,11 @@ final class MusicGenService: ObservableObject {
             let abc = request.score.trimmingCharacters(in: .whitespacesAndNewlines)
             if request.plan != .off, !abc.isEmpty { body["abc"] = abc }
         }
+        if request.model.supportsSampling {
+            if let v = request.cfgScale { body["cfg_scale"] = min(max(v, MusicModelPreset.cfgRange.lowerBound), MusicModelPreset.cfgRange.upperBound) }
+            if let v = request.temperature { body["temperature"] = min(max(v, MusicModelPreset.temperatureRange.lowerBound), MusicModelPreset.temperatureRange.upperBound) }
+            if let v = request.topK { body["top_k"] = min(max(v, MusicModelPreset.topKRange.lowerBound), MusicModelPreset.topKRange.upperBound) }
+        }
         // -1 = fresh random seed, resolved HERE so the log can show it.
         body["seed"] = request.seed >= 0 ? request.seed : Int.random(in: 0..<1_000_000_000)
         return body
@@ -146,6 +151,11 @@ final class MusicGenService: ObservableObject {
         if request.model.supportsSteps, let steps = request.steps {
             let r = request.model.stepsRange
             lines.append("steps: \(min(max(steps, r.lowerBound), r.upperBound))")
+        }
+        if request.model.supportsSampling {
+            if let v = request.cfgScale { lines.append("cfg_scale: \(v)") }
+            if let v = request.temperature { lines.append("temperature: \(v)") }
+            if let v = request.topK { lines.append("top_k: \(v)") }
         }
         if request.model.supportsTempoAndKey {
             if let bpm = request.bpm { lines.append("bpm: \(bpm)") }
@@ -293,6 +303,7 @@ final class MusicGenService: ObservableObject {
                         case "frames": label = "Composing (frame \(step)/\(total))…"
                         case "abc": label = L10n.text("Writing the score…")
                         case "semantic": label = L10n.format("Composing (%d s so far)…", step / 25)
+                        case "song": label = L10n.format("Composing (%d s so far)…", step)
                         case "nar": label = "Rendering (step \(step)/\(total))…"
                         case "diffuse": label = "Composing (step \(step)/\(total))…"
                         case "decode": label = "Rendering audio (\(step)/\(total))…"

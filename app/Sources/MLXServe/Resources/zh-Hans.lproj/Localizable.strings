@@ -2560,3 +2560,6 @@
 "Buy Me a Coffee" = "请我喝杯咖啡";
 "A one-off thank-you helps too." = "一次性的感谢也很有帮助。";
 "Open Buy Me a Coffee ↗" = "打开 Buy Me a Coffee ↗";
+"Guidance (CFG)" = "引导强度 (CFG)";
+"How closely the song follows the style tags. Higher is stricter, lower sounds more natural. Default 3." = "歌曲遵循风格标签的程度。越高越严格，越低听起来越自然。默认 3。";
+"Lower plays it safe, higher takes more chances. Default 1." = "越低越稳妥，越高越大胆。默认 1。";

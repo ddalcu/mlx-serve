@@ -775,6 +775,17 @@ are not part of mlx-serve: they are CC BY-NC 4.0 (non-commercial); credit YuE2,
 its model name and https://huggingface.co/m-a-p/YuE2-3B when you publish output.
 
 --------------------------------------------------------------------------------
+HeartMuLa / heartlib
+https://github.com/HeartMuLa/heartlib
+https://huggingface.co/HeartMuLa/HeartMuLa-oss-3B-happy-new-year
+https://huggingface.co/HeartMuLa/HeartCodec-oss-20260123
+Licensed under the Apache License, Version 2.0.
+
+`src/plugins/heartmula/heartmula.zig` ports heartlib's HeartMuLa generation pipeline and the
+HeartCodec decode path (RVQ dequant, flow-matching DiT, Euler windows, scalar decoder); the
+weights (converted by `scripts/convert_heartmula_weights.py`) are Apache-2.0 as published.
+
+--------------------------------------------------------------------------------
 stb_image / stb_image_write
 https://github.com/nothings/stb
 Copyright (c) 2017 Sean Barrett

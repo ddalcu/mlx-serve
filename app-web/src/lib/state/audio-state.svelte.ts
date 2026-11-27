@@ -27,13 +27,16 @@ function audioProfile(model: Model | undefined) {
       "minimax_music3",
       "stable_audio3",
       "yue2",
+      "heartmula",
     ].includes(family)
   )
     return;
   const voice = ["kokoro", "qwen3_tts"].includes(family),
     ace = family === "acestep",
-    music = ace || ["minimax_music3", "yue2"].includes(family),
-    yue2 = family === "yue2";
+    music = ace || ["minimax_music3", "yue2", "heartmula"].includes(family),
+    yue2 = family === "yue2",
+    /** YuE2 and HeartMuLa sing words only and take no tempo or key. */
+    lyricsOnly = yue2 || family === "heartmula";
   return {
     family,
     tab: ((voice ? "voice" : music ? "music" : "sound") as AudioTab),
@@ -42,14 +45,16 @@ function audioProfile(model: Model | undefined) {
     reference: family === "qwen3_tts" || ace,
     source: ace,
     meta: ace,
-    instrumental: !yue2,
-    tempo: !yue2,
+    instrumental: !lyricsOnly,
+    tempo: !lyricsOnly,
     /** YuE2 plans an ABC score first (`cot`) and renders one you paste (`abc`). */
     score: yue2,
-    /** YuE2 ends its own song; its duration is only a cap. */
-    autoLength: yue2,
+    /** YuE2 and HeartMuLa end their own songs; the duration is only a cap. */
+    autoLength: lyricsOnly,
+    /** HeartMuLa's sampler knobs (`cfg_scale`, `temperature`, `top_k`). */
+    sampling: family === "heartmula",
     steps: !voice && !ace,
-    stepsRange: music ? (yue2 ? [1, 100] : [4, 100]) : [1, 50],
+    stepsRange: music ? (yue2 ? [1, 100] : family === "heartmula" ? [4, 50] : [4, 100]) : [1, 50],
     duration: music ? (ace ? [10, 600] : [5, 360]) : [0.5, 120],
   };
 }
@@ -66,6 +71,8 @@ function musicStageLabel(e: Record<string, unknown>) {
       return t("Writing the score…");
     case "semantic":
       return t("Composing (%@ s so far)…", [Math.floor(step / 25)]);
+    case "song":
+      return t("Composing (%@ s so far)…", [step]);
     case "nar":
       return t("Rendering (step %@/%@)…", [step, total]);
   }
@@ -83,7 +90,7 @@ function audioDefaults(model?: Model | undefined) {
     plan: "full",
     score: "",
     instrumental: false,
-    steps: p?.family === "yue2" ? 32 : p?.tab === "music" ? 30 : 8,
+    steps: p?.family === "yue2" ? 32 : p?.family === "heartmula" ? 10 : p?.tab === "music" ? 30 : 8,
     bpm: "",
     keyscale: "",
     timesignature: "",
@@ -93,6 +100,10 @@ function audioDefaults(model?: Model | undefined) {
     coverStrength: 1,
     coverNoise: 0,
     trackClasses: ([] as string[]),
+    /** HeartMuLa's sampler; empty = the server default. */
+    cfgScale: "",
+    temperature: "",
+    topK: "",
     advanced: true,
   };
 }
@@ -146,6 +157,14 @@ function buildAudioRequest(model: Model | undefined, d: ReturnType<typeof audioD
     body.steps = range(d.steps, p.stepsRange[0], p.stepsRange[1], t("Steps"));
     if (!Number.isInteger(body.steps))
       throw Error(t("Steps must be a whole number."));
+  }
+  if (p.sampling) {
+    if (d.cfgScale.trim()) body.cfg_scale = range(d.cfgScale, 1, 10, t("Guidance (CFG)"));
+    if (d.temperature.trim()) body.temperature = range(d.temperature, 0.1, 5, t("Temperature"));
+    if (d.topK.trim()) {
+      body.top_k = range(d.topK, 1, 1000, t("Top-k"));
+      if (!Number.isInteger(body.top_k)) throw Error(t("Top-k must be a whole number."));
+    }
   }
   if (p.tab === "sound")
     return {

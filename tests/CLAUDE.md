@@ -165,7 +165,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_multi_lora.sh` stacked LoRAs · `test_real_loras.sh` Hub LoRAs (+ `lora_noise.py`) · `test_media_gen_memory.sh` · `test_media_eviction_gate.sh` **H**
 - `test_video_gen.sh` LTX · `test_video_preview.sh` (part **H**) · `test_minimax_h3.sh`, `test_h3_resident.sh`, `test_fasth3_omni.sh`, `test_hyperflow_h3_flash.sh` H3 · `test_minimax_h3_image.sh` H3-Image
 - `test_tts.sh`, `test_tts_quant.sh`, `test_tts_clone_cache.sh`, `test_tts_language.sh` Qwen3-TTS · `test_kokoro_tts.sh`
-- `test_music_gen.sh` ACE-Step · `test_music3_gen.sh` · `test_yue2_gen.sh` · `test_sound_gen.sh` Stable Audio 3
+- `test_music_gen.sh` ACE-Step · `test_music3_gen.sh` · `test_yue2_gen.sh` · `test_heartmula_gen.sh` · `test_sound_gen.sh` Stable Audio 3
 - `test_3d_gen.sh`, `test_3d_paint.sh` Hunyuan3D · `test_trellis2_3d.sh` · `test_pixal3d_3d.sh` · `test_idol_3d.sh` · `film_skill.test.mjs` **H**
 
 **Static and release guards** (all **H**)
@@ -196,7 +196,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
   encoder), mageflow (dit, e2e, edit e2e, te, te edit, vae, vae encoder, vit), mimo_v2, ming_image, minicpmv4_7_vision, minimax_h3
   (+ layout, vision, vision tower, vae encoder, audio encoder, flash), moss_image, muse_vision, music3, nemotron_diarization,
   pixal3d, qwen3_aligner, qwen3_asr, qwen3_embedding, qwen3_tts (voice), qwen4_exp, qwen4_yarn, qwen_image21, radio (full, vision),
-  stable_audio, tokenizer_parity, trellis2, yue2
+  stable_audio, tokenizer_parity, trellis2, yue2, heartmula
 - `build_qwen_preprocess_fixture.py`, `build_qwen_vision_fixture.py` Qwen3-VL fixtures · `dsv4_mlx_ref.py` MLX reference
 - `dsv4_template_ab.py`, `dsv41_template_ab.py` byte-exact template A/B · `dsv4_task_compare.py` **R** native vs GGUF tasks
 - `dsv41_api_kld.py` **R** teacher-forced top-20 vs the hosted V4.1 API's continuations (ds4 fixtures): top-1 + KLD, paired runs

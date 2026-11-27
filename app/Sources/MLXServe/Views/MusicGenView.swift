@@ -76,6 +76,10 @@ struct MusicGenView: View {
     @State private var coverStrength: Double = 1.0
     @State private var coverNoiseStrength: Double = 0.0
     @State private var trackClasses: [String] = []
+    /// HeartMuLa's sampler; nil = the server default.
+    @State private var cfgScale: Double? = nil
+    @State private var temperature: Double? = nil
+    @State private var topK: Int? = nil
     /// Keep the model resident after generating (default off → unload).
     @State private var keepResident: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
@@ -255,6 +259,8 @@ struct MusicGenView: View {
                 )
             Text(model.family == .yue2
                  ? "Comma-separated tags: language or genre, instruments, mood, lead vocal — e.g. \"English, indie pop, bright acoustic guitar, soft drums, warm lead vocal\"."
+                 : model.family == .heartmula
+                 ? "A few short tags, one of each kind it needs: genre (just one), timbre, gender, mood, instrument, scene, region, topic — e.g. \"pop,bright,female,happy,piano\"."
                  : "Genre, mood, instruments — e.g. \"upbeat synthwave with driving bass and dreamy pads\".")
                 .font(.app(.caption2)).foregroundStyle(.secondary)
         }
@@ -326,6 +332,7 @@ struct MusicGenView: View {
         case .acestep: return "ACE-Step"
         case .minimaxMusic3: return "MiniMax Music 3"
         case .yue2: return "YuE2"
+        case .heartmula: return "HeartMuLa"
         }
     }
 
@@ -836,6 +843,7 @@ struct MusicGenView: View {
                         .font(.app(.caption2)).foregroundStyle(.secondary)
                 }
             }
+            if model.supportsSampling { samplingControls }
             // Dropdowns only — every choice is a value the server accepts,
             // "Auto" leaves the decision to the model (field omitted). The
             // whole musical-metadata knob set is ACE-Step's; Music 3 has no
@@ -912,6 +920,47 @@ struct MusicGenView: View {
             }
             Text("Same seed + prompt reproduces the track.")
                 .font(.app(.caption2)).foregroundStyle(.secondary)
+        }
+    }
+
+    /// HeartMuLa's sampler. Each control shows the server default until moved; Reset sends none.
+    private var samplingControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            samplingSlider("Guidance (CFG)", value: $cfgScale, fallback: 3.0, range: MusicModelPreset.cfgRange, step: 0.25,
+                           note: "How closely the song follows the style tags. Higher is stricter, lower sounds more natural. Default 3.")
+            samplingSlider("Temperature", value: $temperature, fallback: 1.0, range: MusicModelPreset.temperatureRange, step: 0.05,
+                           note: "Lower plays it safe, higher takes more chances. Default 1.")
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text("Top-k").font(.app(.caption))
+                    NumberField(range: MusicModelPreset.topKRange,
+                                value: Binding(get: { topK ?? 50 }, set: { topK = $0 }),
+                                width: 60, help: "Candidates per step, 1–1000. Default 50.")
+                    Spacer()
+                }
+                Text("How many candidate sounds the model picks from at each step. Default 50.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            }
+            if cfgScale != nil || temperature != nil || topK != nil {
+                Button { cfgScale = nil; temperature = nil; topK = nil } label: {
+                    Text("Reset to defaults").font(.app(.caption))
+                }
+            }
+        }
+    }
+
+    private func samplingSlider(_ label: String, value: Binding<Double?>, fallback: Double,
+                                range: ClosedRange<Double>, step: Double, note: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(L10n.text(label)).font(.app(.caption))
+                Spacer()
+                Text(String(format: "%.2f", value.wrappedValue ?? fallback))
+                    .font(.app(.caption).monospacedDigit()).foregroundStyle(.secondary)
+            }
+            Slider(value: Binding(get: { value.wrappedValue ?? fallback }, set: { value.wrappedValue = $0 }),
+                   in: range, step: step)
+            Text(L10n.text(note)).font(.app(.caption2)).foregroundStyle(.secondary)
         }
     }
 
@@ -1034,6 +1083,9 @@ struct MusicGenView: View {
         coverStrength = s.coverStrength
         coverNoiseStrength = s.coverNoiseStrength
         trackClasses = s.trackClasses
+        cfgScale = s.cfgScale
+        temperature = s.temperature
+        topK = s.topK
     }
 
     /// Every sticky field, as the blob it would persist to — `Equatable`, so
@@ -1063,6 +1115,9 @@ struct MusicGenView: View {
         s.coverStrength = coverStrength
         s.coverNoiseStrength = coverNoiseStrength
         s.trackClasses = trackClasses
+        s.cfgScale = cfgScale
+        s.temperature = temperature
+        s.topK = topK
         return s
     }
 
@@ -1183,6 +1238,9 @@ struct MusicGenView: View {
             coverStrength: coverStrength,
             coverNoiseStrength: coverNoiseStrength,
             trackClasses: trackClasses,
+            cfgScale: cfgScale,
+            temperature: temperature,
+            topK: topK,
             lanModelId: lanModel
         )
     }

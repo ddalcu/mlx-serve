@@ -9,6 +9,7 @@ const ace = model("org/ace-step", "acestep", "audio", "music");
 const music3 = model("org/minimax-music3", "minimax_music3", "audio", "music");
 const sound = model("org/stable-audio", "stable_audio3");
 const yue2 = model("org/yue2", "yue2", "audio", "music");
+const heartmula = model("org/heartmula", "heartmula", "audio", "music");
 const draft = (m: Model, patch: Record<string, unknown> = {}) => ({ ...audioDefaults(m), prompt: "hello there", seed: "5", ...patch });
 const clip = { base64: "AAAA", name: "ref.wav" };
 
@@ -21,6 +22,10 @@ describe("audioProfile", () => {
     expect(audioProfile(sound)).toMatchObject({ tab: "sound", steps: true, duration: [0.5, 120] });
     expect(audioProfile(yue2)).toMatchObject({ tab: "music", source: false, meta: false, steps: true, stepsRange: [1, 100], instrumental: false, tempo: false, score: true, autoLength: true, duration: [5, 360] });
     expect(audioProfile(music3)).toMatchObject({ stepsRange: [4, 100], score: false, autoLength: false });
+    expect(audioProfile(heartmula)).toMatchObject({ tab: "music", source: false, meta: false, steps: true, stepsRange: [4, 50], instrumental: false, tempo: false, score: false, autoLength: true, duration: [5, 360] });
+    expect(audioDefaults(heartmula).steps).toBe(10);
+    expect(audioProfile(heartmula)).toMatchObject({ autoLength: true, sampling: true });
+    expect(audioProfile(yue2)).toMatchObject({ sampling: false });
   });
 
   it("offers nothing for unknown architectures or non-audio models", () => {
@@ -167,5 +172,17 @@ describe("AudioController", () => {
     await controller.generate({} as never, buildAudioRequest(yue2, draft(yue2, { lyrics: "[Verse]\nla" }), {}), "s");
     expect(stage).toBe("Writing the score…");
     expect(controller.lastScore).toBe("X:1\nK:C");
+  });
+});
+
+describe("HeartMuLa sampler", () => {
+  const lyrics = "[Verse]\nla";
+  it("sends only the knobs the user set, validated", () => {
+    const body = (patch: Record<string, unknown>) => buildAudioRequest(heartmula, draft(heartmula, { lyrics, ...patch }), {}).body;
+    expect(body({})).not.toHaveProperty("cfg_scale");
+    expect(body({ cfgScale: "2.5", temperature: "0.8", topK: "30" })).toMatchObject({ cfg_scale: 2.5, temperature: 0.8, top_k: 30 });
+    expect(() => body({ cfgScale: "20" })).toThrow(/Guidance/);
+    expect(() => body({ topK: "2.5" })).toThrow(/whole number/);
+    expect(buildAudioRequest(yue2, draft(yue2, { lyrics, cfgScale: "2" }), {}).body).not.toHaveProperty("cfg_scale");
   });
 });

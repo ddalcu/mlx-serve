@@ -101,7 +101,7 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // asserts this agrees; the server's own discovery and dispatch read those plugins.
 private let mediaModelTypeExactValues: Set<String> = [
     "qwen3_tts", "dense", "AudioVideo", "acestep", "minimax_h3", "minimax_h3_image", "minimax_music3", "kokoro",
-    "mageflow", "laya", "kev", "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d",
+    "mageflow", "laya", "kev", "stable_audio3", "clef", "d1", "yue2", "heartmula", "nemotron_diarization", "trellis2", "pixal3d",
     "idol", "bailingmm_moe_v2_lite",
 ]
 
@@ -183,7 +183,7 @@ enum MediaModality: CaseIterable {
         if modelType.hasPrefix("hunyuan3d") || modelType == "trellis2" || modelType == "pixal3d" || modelType == "idol" { self = .mesh; return }
         switch modelType {
         case "qwen3_tts", "kokoro", "dense": self = .voice
-        case "acestep", "minimax_music3", "yue2": self = .music
+        case "acestep", "minimax_music3", "yue2", "heartmula": self = .music
         case "stable_audio3": self = .sound
         case "AudioVideo", "minimax_h3": self = .video
         default: return nil

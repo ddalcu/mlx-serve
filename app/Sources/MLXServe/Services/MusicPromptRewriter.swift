@@ -50,6 +50,8 @@ enum MusicPromptRewriter {
             shape = "Write the caption in the exact three-block format of the examples (Global Metadata / Vocal Details / Arrangement) with the same labelled lines, including bpm, key and scale."
         case .yue2:
             shape = "Write ONE line of comma-separated tags like the examples: language or genre first, then instruments, mood and the lead vocal. No sentences, no tempo or key (the score carries those)."
+        case .heartmula:
+            shape = "Write ONE line of at most 8 lowercase tags, comma-separated WITHOUT spaces, like the examples: at most one tag per category, in this order, skipping any the request does not need: genre (exactly ONE), timbre, gender (male or female), mood, instrument, scene, region, topic. Each tag is one or two words. No artist or song names, no sentences, no tempo numbers."
         case .acestep:
             shape = "Write ONE paragraph of plain prose like the examples: genre, mood, instruments, production. No tempo, key or time signature (those are separate controls). No headings, no lists."
         }
