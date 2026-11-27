@@ -938,13 +938,17 @@ fn head8From(v: ?[*:0]const u8) bool {
     return v == null or v.?[0] != '0';
 }
 
-/// `MLX_SERVE_DSV41_EXACT=1`: a DSpark verify row runs the kernels a plain step runs, so a greedy drafted request emits
-/// plain decode's tokens bit for bit, whatever the round schedule; plain decode itself is untouched. Copy verifies are
-/// cut to the decode-width rows (`maxVerifyDrafts`). Two paths serve the one guarantee: without NAX the whole verify
-/// row (`exactServes`, all the parts below); on a NAX GPU the verify path (`exactVerify`): the head and Engram wkv a
-/// row at a time, wo_a on the vector kernel, every resident verify within the decode-width rows, where the fused
-/// decode kernels already give a verify row its plain step's bits. The parts are all on when exact is; only the gate
-/// (`decode/exact_test.zig`, `DSV41_EXACT_GATE_BATCHED`) leaves some on the batched kernels, to measure each one.
+/// `MLX_SERVE_DSV41_EXACT=1`: a DSpark verify row runs the kernels a plain step runs, so a greedy drafted request's
+/// text is drafter-independent; plain decode itself is untouched. With `ENGRAM_GPU_IDS=0` verify rows equal the plain
+/// step bit for bit at widths 1-6 (the real-pack `DSV41_VERIFY_EXACT` test, which runs `scratch_attn.ring_regions` at
+/// its own value, not the served one). With it on (the default) the plain step's Engram projection takes
+/// `engram_ids.write` (the slot kernel) and a verify row `engramRows` (MLX's one-row qmv): they differ by rounding, so
+/// the text is not yet plain decode's bytes; a fix is in progress. Copy verifies are cut to the decode-width rows
+/// (`maxVerifyDrafts`). Two paths serve the one guarantee: without NAX the whole verify row (`exactServes`, all the
+/// parts below); on a NAX GPU the verify path (`exactVerify`): the head and Engram wkv a row at a time, every resident
+/// verify within the decode-width rows, where the fused decode kernels already give a verify row its plain step's bits.
+/// The parts are all on when exact is; only the gate (`decode/exact_test.zig`, `DSV41_EXACT_GATE_BATCHED`) leaves some
+/// on the batched kernels, to measure each.
 /// `argmax` serves every greedy accept; `tail` needs the non-NAX path.
 pub const Exact = struct {
     on: bool = false,
@@ -2749,7 +2753,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     if (m.exact.on and mlx.streamIsGpu(s) and device.naxAvailable()) {
         // A NAX GPU serves exact through its verify path (`exactVerify`): the fused NAX indexer and attention give a
         // verify row other picks than the plain step's, so the whole-row path stays off, and `solo` with it.
-        log.info("deepseek_v41: exact DSpark verify (MLX_SERVE_DSV41_EXACT) on a NAX GPU: the verify path (head, Engram wkv and wo_a as the plain step's, verifies within {d} drafts on a resident bank){s}\n", .{ dkern.max_rows - 1, if (m.exact.solo) "; solo is not served here" else "" });
+        log.info("deepseek_v41: exact DSpark verify (MLX_SERVE_DSV41_EXACT) on a NAX GPU: the verify path (head and Engram wkv a row at a time, verifies within {d} drafts on a resident bank){s}\n", .{ dkern.max_rows - 1, if (m.exact.solo) "; solo is not served here" else "" });
         m.exact.on = false;
     }
     if (m.exact.on) {
