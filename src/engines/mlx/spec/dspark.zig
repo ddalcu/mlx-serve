@@ -546,7 +546,9 @@ pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4
     const t1 = self.next_token_id;
     const idx = try self.mtpLookupIndex(allocator);
     const found = idx.matchBest(t1, @intCast(dsv41_mod.maxVerifyDrafts(mdl)));
-    const n = dsparkCopyLen(found, self.max_tokens -| self.completion_tokens -| 1, dsv41_mod.copyBlock(mdl));
+    const longest = dsparkCopyLen(found, self.max_tokens -| self.completion_tokens -| 1, dsv41_mod.copyBlock(mdl));
+    if (longest == 0) return null;
+    const n = sizedCopyLen(self, longest, found.?.suffix);
     if (n == 0) return null;
     const ids = try allocator.alloc(u32, n + 1);
     ids[0] = t1;
@@ -560,7 +562,21 @@ pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4
     else
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &copy, cap);
     self.noteCopy(n, round.accepted);
+    if (self.dspark_pol) |*pol| pol.copy.observe(found.?.suffix, @intCast(n), round.accepted);
     return self.commitDsparkRound(allocator, round, st.n);
+}
+
+/// The copied drafts worth verifying: each priced at the copy's measured survival (`CopyStats`) against the verify
+/// ladder, at most `longest`. Intentionally ignores `pol.pin_rows`: declining a failing copy falls through to the
+/// stage drafter rather than a plain step. `DSV41_COPY_SIZE=0` verifies `longest` every time.
+fn sizedCopyLen(self: *Generator, longest: usize, suffix: u32) usize {
+    const pol = if (self.dspark_pol) |*p| p else return longest;
+    if (!copySizing()) return longest;
+    return dflash_policy.copyRowsFor(&pol.copy, suffix, longest, pol.plain.ms) - 1;
+}
+
+fn copySizing() bool {
+    return !env.present(.DSV41_COPY_SIZE) or env.on(.DSV41_COPY_SIZE);
 }
 
 /// One DSpark round on module `mod` (deepseek_v4 or deepseek_v41, which
@@ -587,10 +603,27 @@ pub fn dsparkPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?Dr
     // A served drafter's plain steps fade its counts; a module's time the plain step.
     if (pol.rounds) |*ctl| ctl.acc.idle();
     if (plugin_driver.nativeDrafter(self.xfm) == null) {
-        if (pol.plain_watch) |*w| pol.plain.sample(@as(f32, @floatFromInt(w.read())) / @as(f32, std.time.ns_per_ms));
+        if (pol.plain_watch) |*w| samplePlainMs(self, msSince(w));
         pol.plain_watch = io_util.Stopwatch.init(self.timer.io);
     }
     return try mtpSerialOneToken(allocator, tok);
+}
+
+/// A DSpark request's round policy: `plain` is the model's own `dspark_plain`, seeded from this machine's first
+/// steps (`PlainCost.seeded`).
+pub fn dsparkPolicy(plain: dflash_policy.PlainCost, pin_rows: u32) DflashPol {
+    return .{ .calib = .{ .head = true }, .plain = plain, .pin_rows = pin_rows };
+}
+
+/// A plain step's cost, learned per model: the next request starts from it instead of the prior.
+fn samplePlainMs(self: *Generator, ms: f32) void {
+    const pol = &self.dspark_pol.?;
+    self.xfm.dspark_plain.sample(ms);
+    pol.plain = self.xfm.dspark_plain;
+}
+
+fn msSince(w: *const io_util.Stopwatch) f32 {
+    return @as(f32, @floatFromInt(w.read())) / @as(f32, std.time.ns_per_ms);
 }
 
 /// One DeepSeek-V4.1 stage round under `dspark_pol`: draft, verify the prefix the calibrated confidence pays
@@ -606,17 +639,19 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     // An exact verify stays within the decode-width rows (`maxVerifyDrafts`; the block itself otherwise).
     d.len = @min(d.len, dsv41_mod.maxVerifyDrafts(mdl));
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
+    const verify_watch = io_util.Stopwatch.init(self.timer.io);
     const round = if (self.dspark_stochastic)
         try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &d)
     else
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &d, cap);
+    const verify_ms = msSince(&verify_watch);
+    if (d.len == 0) samplePlainMs(self, verify_ms);
     for (d.confidence[0..d.len], 0..) |c, k| {
         if (k > round.accepted) break;
         pol.calib.observe(sigmoid(c), k < round.accepted);
     }
     self.dspark_stats.record(@intCast(d.len), round.accepted);
-    const wall_ms = @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms);
-    pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, wall_ms);
+    pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, msSince(&watch));
     return self.commitDsparkRound(allocator, round, st.n);
 }
 
@@ -1347,4 +1382,63 @@ test "dspark: a greedy verdict keeps the agreeing prefix and the pick after it" 
     try testing.expectEqual(Verdict{ .accepted = 3, .next_token = 3 }, greedyVerdict(&ids, &.{ 5, 6, 7, 3 }));
     try testing.expectEqual(Verdict{ .accepted = 0, .next_token = 4 }, greedyVerdict(&ids, &.{ 4, 6, 7, 3 }));
     try testing.expectEqual(Verdict{ .accepted = 0, .next_token = 8 }, greedyVerdict(ids[0..1], &.{8}));
+}
+
+test "Transformer.dspark_plain starts seeded, so every DSpark request measures the plain step" {
+    const info = @typeInfo(Transformer).@"struct";
+    const i = comptime for (info.field_names, 0..) |name, k| {
+        if (std.mem.eql(u8, name, "dspark_plain")) break k;
+    } else unreachable;
+    const plain = comptime info.field_attrs[i].defaultValue(dflash_policy.PlainCost).?;
+    try testing.expectEqual(dflash_policy.PlainCost.seeded.seed, plain.seed);
+    try testing.expect(plain.replace_prior);
+    try testing.expect(dflash_policy.PlainCost.seeded.seed > 0);
+}
+
+test "dsparkPolicy: DSpark measures the plain step, a DFlash policy keeps the prior" {
+    var dspark = dsparkPolicy(dflash_policy.PlainCost.seeded, 0);
+    var dflash = DflashPol{};
+    dspark.plain.sample(40);
+    dflash.plain.sample(40);
+    try testing.expectEqual(@as(f32, 40), dspark.plain.ms);
+    try testing.expect(dflash.plain.ms < 25);
+}
+
+test "sizedCopyLen: failing copies trim to zero even with pin_rows set; DSV41_COPY_SIZE=0 verifies longest" {
+    var gen: Generator = undefined;
+    gen.dspark_pol = dsparkPolicy(dflash_policy.PlainCost.seeded, std.math.maxInt(u32));
+    for (0..40) |_| gen.dspark_pol.?.copy.observe(20, 8, 0);
+    {
+        const ov = env.override(.DSV41_COPY_SIZE, null);
+        defer ov.restore();
+        try testing.expectEqual(@as(usize, 0), sizedCopyLen(&gen, 8, 20));
+    }
+    {
+        const ov = env.override(.DSV41_COPY_SIZE, "0");
+        defer ov.restore();
+        try testing.expectEqual(@as(usize, 8), sizedCopyLen(&gen, 8, 20));
+    }
+}
+
+test "samplePlainMs: concurrent requests share model plain-step learning without clobbering backwards" {
+    var xfm: Transformer = undefined;
+    xfm.dspark_plain = dflash_policy.PlainCost.seeded;
+    var a: Generator = undefined;
+    a.xfm = &xfm;
+    a.dspark_pol = dsparkPolicy(xfm.dspark_plain, 0);
+    var b: Generator = undefined;
+    b.xfm = &xfm;
+    b.dspark_pol = dsparkPolicy(xfm.dspark_plain, 0);
+
+    // Request A finishes seeding at 32 ms.
+    samplePlainMs(&a, 32);
+    samplePlainMs(&a, 35);
+    samplePlainMs(&a, 33);
+    try testing.expectEqual(@as(f32, 32), xfm.dspark_plain.ms);
+    try testing.expectEqual(@as(u8, 0), xfm.dspark_plain.seed);
+
+    // Request B takes a stalled plain step later: shared model state stays bounded, never overwritten back to 400.
+    samplePlainMs(&b, 400);
+    try testing.expect(xfm.dspark_plain.ms < 33.5);
+    try testing.expectEqual(xfm.dspark_plain.ms, b.dspark_pol.?.plain.ms);
 }
