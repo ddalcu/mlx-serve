@@ -146,13 +146,23 @@ fi
 # `--ctx-size` here (the manual context outranks the window); the merged document shows in
 # `meta.model_max_tokens`.
 NATIVE="$(row "$MODEL_A" maxtok)"
-printf '{ "%s": { "config_overrides": { "max_position_embeddings": 4096 } } }' "$MODEL_A" >"$SETTINGS"
+# The block goes where THIS pack states its window (a nested pack reads `text_config` first, per field).
+MPK="$(python3 -c "
+import json,sys
+d = json.load(open(sys.argv[1] + '/config.json'))
+print('text_config' if isinstance(d.get('text_config'), dict) and d['text_config'].get('max_position_embeddings') else 'root')" "$MODEL_A")"
+if [ "$MPK" = "text_config" ]; then
+    OV='{ "text_config": { "max_position_embeddings": 4096 } }'
+else
+    OV='{ "max_position_embeddings": 4096 }'
+fi
+printf '{ "%s": { "config_overrides": %s } }' "$MODEL_A" "$OV" >"$SETTINGS"
 post unload-model "{\"model\":\"$MODEL_A\"}" >/dev/null
 CODE="$(post load-model "{\"model\":\"$MODEL_A\"}")"
 check "[6] config_overrides load -> 200 (got $CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
-check "[6] config_overrides moves the loaded window to 4096 (pack native $NATIVE, got $(row "$MODEL_A" maxtok))" \
+check "[6] config_overrides moves the loaded window to 4096 (pack native $NATIVE at $MPK, got $(row "$MODEL_A" maxtok))" \
     "$([ "$(row "$MODEL_A" maxtok)" = "4096" ] && echo 1 || echo 0)"
-check "[6] the load line names cfg" "$(grep -q "\[model-settings\] .*cfg={\"max_position_embeddings\":4096}" "$LOG" && echo 1 || echo 0)"
+check "[6] the load line names cfg" "$(grep -q "\[model-settings\].*cfg={.*4096" "$LOG" && echo 1 || echo 0)"
 # A non-object is not the key: the pack loads on its own config.
 printf '{ "%s": { "config_overrides": "yarn" } }' "$MODEL_A" >"$SETTINGS"
 post unload-model "{\"model\":\"$MODEL_A\"}" >/dev/null
