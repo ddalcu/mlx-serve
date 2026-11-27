@@ -200,6 +200,9 @@ Sampling:
 - **Every decoding row runs `loopGuardTick` before its step** (the loop cut, `thinkBoundTick`, `toolForceTick`): the serial step, the MTP and DSpark group rounds and the batched tick's split loop, where a row whose guard spent the tick sits the group out. A crowded MTP group's rows (`mtp_plain_tick`) run it before they join the plain tick; a guard failure fails that row alone (`guardSpentTick`). Guards: `test_batched_tick_guards.sh`, decode.zig's two per-tick guard tests.
 
 Kernels + numerics:
+- **A kernel change is checked beyond its speed** (root AGENTS.md lists the loads it is timed at): with speculation off and
+  each drafter the model serves (MTP head, DFlash, DSpark); a parity proof against the old path (greedy text drifts at near
+  ties, so a text diff is not one); the admission bill and peak (the 8 GB iPhone target); CUDA still builds (Metal-only falls back).
 - **A Metal tensor over a whole matrix indexes in `int`**: past 2^31 elements its stores wrap into other memory (w8a8's
   GEMM washed out frames of H3's long clips, differently every run). Base each tile's tensor at its own rows with a
   64-bit offset. Guard: `w8a8 GEMM stores an output past 2^31 elements where it belongs`.
