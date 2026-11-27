@@ -24,6 +24,7 @@ const placeholdersMatchOf = @import("placeholders.zig").placeholdersMatchOf;
 const expandMedia = @import("placeholders.zig").expandMedia;
 const computeQwenMrope = @import("qwen_mrope.zig").computeQwenMrope;
 const computeMiniCpmMrope = @import("../../plugins/qwen3_5/minicpm_media.zig").computeMiniCpmMrope;
+const computeBailingMrope = @import("../../plugins/bailing_hybrid/mrope_media.zig").computeBailingMrope;
 const radioMediaTokens = @import("../../plugins/nemotron_h/media.zig").radioMediaTokens;
 const ByteTokenizer = @import("placeholders.zig").ByteTokenizer;
 const expandRuns = @import("placeholders.zig").expandRuns;
@@ -252,7 +253,7 @@ pub fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, co
     });
     allocator.free(prompt_ids.*);
     prompt_ids.* = expanded.ids;
-    out.mrope = (if (config.minicpm_vision) computeMiniCpmMrope(allocator, prompt_ids.*, items, config) else computeQwenMrope(allocator, prompt_ids.*, items, config)) catch |err| blk: {
+    out.mrope = (if (config.ling_vision) computeBailingMrope(allocator, prompt_ids.*, items, config) else if (config.minicpm_vision) computeMiniCpmMrope(allocator, prompt_ids.*, items, config) else computeQwenMrope(allocator, prompt_ids.*, items, config)) catch |err| blk: {
         log.warn("M-RoPE table failed ({s}); falling back to scalar RoPE\n", .{@errorName(err)});
         break :blk .{};
     };

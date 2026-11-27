@@ -62,6 +62,18 @@ pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vi
         .min_tokens = config.glmv_min_image_tokens,
         .max_tokens = config.glmv_max_image_tokens,
     };
+    // Ling VL: the qwen3-vl pixel geometry (patch 16, temporal 2, merge 2, a PIXEL-area budget),
+    // but the release processor normalizes with CLIP's mean/std (`preprocessor_config.json`).
+    if (config.ling_vision) return .{
+        .mode = .qwen,
+        .patch = config.qv_patch,
+        .tps = config.qv_temporal_patch,
+        .merge = config.qv_merge,
+        .min_pixels = config.qv_min_pixels,
+        .max_pixels = config.qv_max_pixels,
+        .mean = .{ 0.48145466, 0.4578275, 0.40821073 },
+        .std = .{ 0.26862954, 0.26130258, 0.27577711 },
+    };
     if (config.gv_budgeted) return .{
         .mode = .gemma_budget,
         .patch = config.vision_patch_size,

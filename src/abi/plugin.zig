@@ -300,6 +300,10 @@ pub const SpeechFacts = extern struct {
     tools: bool = false,
 };
 
+/// The axis-layout selector for `MropeFacts.sections`: which frequency slots each of the t/h/w axes
+/// takes. `interleaved` is Qwen3.5's; `bailing` is Ling VL's (T takes the last slots, H/W alternate).
+pub const MropeSelector = enum(u32) { interleaved = 0, bailing = 1 };
+
 /// The model's interleaved M-RoPE spectrum, from which the engine builds a prompt chunk's angles off the prompt's
 /// position table (`Forward.mrope`).
 pub const MropeFacts = extern struct {
@@ -308,6 +312,10 @@ pub const MropeFacts = extern struct {
     sections: [3]u32 = .{ 0, 0, 0 },
     /// Rotated dims per head.
     rope_dims: u32 = 0,
+    /// The axis-layout selector for `sections`. Declared in the struct's old padding slot (after
+    /// `rope_dims`, before the 8-aligned `inv_freq`), so the layout and size are unchanged and an
+    /// older plugin's zeros read as `.interleaved`.
+    selector: MropeSelector = .interleaved,
     /// `rope_dims / 2` inverse frequencies (YaRN-scaled when the model scales), plugin-owned until `free_parsed`.
     inv_freq: Span(f64) = .{},
     /// YaRN's attention factor on the angles; 1 = none.

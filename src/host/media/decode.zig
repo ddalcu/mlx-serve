@@ -139,7 +139,8 @@ pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp
     }
 
     // Patch-grid towers: smart-resize to a multiple of patch·merge, normalize
-    // (x/255−0.5)/0.5 (both processors use mean/std 0.5), then emit that
+    // (v/255 − mean)/std with the processor's own constants (the Qwen default is 0.5/0.5),
+    // then emit that
     // processor's pixel_values. `grid_h/grid_w` carry the full patch grid;
     // token count = (gh/merge)·(gw/merge). Qwen bounds the PIXEL area, muse the
     // merged-token count, and their patch orders differ — see muse_vision.zig.
@@ -167,7 +168,7 @@ pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp
         const chw = allocator.alloc(f32, @as(usize, C) * plane) catch return null;
         defer allocator.free(chw);
         const source_len: usize = @as(usize, src_h) * src_w * C;
-        qwen_vision.resizeRgbNormalizedChw(
+        qwen_vision.resizeRgbNormalizedChwNorm(
             allocator,
             chw,
             px[0..source_len],
@@ -176,6 +177,8 @@ pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp
             rh,
             rw,
             resampleFilterFor(vp),
+            vp.mean,
+            vp.std,
         ) catch return null;
 
         const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
@@ -315,7 +318,7 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
     for (decoded.items) |d| {
         const source_len: usize = @as(usize, d.h) * d.w * C;
         const chw = allocator.alloc(f32, @as(usize, C) * rh * rw) catch return null;
-        qwen_vision.resizeRgbNormalizedChw(allocator, chw, d.rgb[0..source_len], d.h, d.w, rh, rw, resampleFilterFor(vp)) catch {
+        qwen_vision.resizeRgbNormalizedChwNorm(allocator, chw, d.rgb[0..source_len], d.h, d.w, rh, rw, resampleFilterFor(vp), vp.mean, vp.std) catch {
             allocator.free(chw);
             return null;
         };
