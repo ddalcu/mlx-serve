@@ -957,6 +957,7 @@ pub fn initWithOptions(
         var gen = Generator{
             .xfm = xfm,
             .model_has_mtp = options.model_has_mtp,
+            .recall_loopback = options.recall_loopback,
             .ctx = ctx,
             .tok = tok,
             .next_token_id = 0,
@@ -1133,6 +1134,7 @@ pub fn initWithOptions(
             .pending_logprob = first_lp,
             .xfm = xfm,
             .model_has_mtp = options.model_has_mtp,
+            .recall_loopback = options.recall_loopback,
             .ctx = ctx,
             .tok = tok,
             .next_token_id = @intCast(first_val),
@@ -1190,6 +1192,7 @@ pub fn initWithOptions(
         .pending_logprob = first_lp,
         .xfm = xfm,
         .model_has_mtp = options.model_has_mtp,
+        .recall_loopback = options.recall_loopback,
         .ctx = ctx,
         .tok = tok,
         .next_token_id = @intCast(val),
