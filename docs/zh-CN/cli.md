@@ -46,7 +46,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 |---|---|---|
 | `--model PATH` | 必填 | 模型目录或 `.gguf` 文件的路径 |
 | `--serve` | 关闭 | 启动 HTTP 服务器 |
-| `--host ADDR` | `0.0.0.0` | 绑定地址（所有网络接口 —— 只想本机访问就设为 `127.0.0.1`） |
+| `--host ADDR` | `0.0.0.0` | 绑定地址：IPv4 地址或 `localhost`（`0.0.0.0` 为所有网络接口，`127.0.0.1` 仅限本机） |
 | `--port N` | `11234` | HTTP 服务器端口 |
 | `--prompt TEXT` | `"Hello"` | 交互模式的提示词 |
 | `--max-tokens N` | `100` | 最多生成多少 Token |

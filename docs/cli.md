@@ -53,7 +53,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 |---|---|---|
 | `--model PATH` | required | Path to the model directory or a `.gguf` file |
 | `--serve` | on unless `--prompt` | Start the HTTP server (implied; kept for older scripts) |
-| `--host ADDR` | `0.0.0.0` | Bind address (all interfaces — set `127.0.0.1` for strictly local) |
+| `--host ADDR` | `0.0.0.0` | Bind address: an IPv4 address or `localhost` (`0.0.0.0` = all interfaces, `127.0.0.1` = strictly local) |
 | `--port N` | `11234` | Port for the HTTP server |
 | `--prompt TEXT` | `"Hello"` | Prompt for interactive mode |
 | `--max-tokens N` | `100` | Maximum tokens to generate |

@@ -78,23 +78,12 @@ fn listenExclusiveLinux(addr: std.Io.net.IpAddress) !std.Io.net.Server {
     return .{ .socket = .{ .handle = fd, .address = bound }, .options = {} };
 }
 
-/// Start the HTTP server on the given host and port.
-///
-/// `cfg` carries all process-wide defaults (context size, timeouts, PLD
-/// defaults, reasoning budget). It's copied into the module-level
-/// `server_config` before the listen loop starts.
-/// Dotted-decimal IPv4 (`0.0.0.0` and anything unparsable read as zeros).
-pub fn parseIp4(host: []const u8) [4]u8 {
-    var out: [4]u8 = .{ 0, 0, 0, 0 };
-    if (std.mem.eql(u8, host, "0.0.0.0")) return out;
-    var parts = std.mem.splitScalar(u8, host, '.');
-    var idx: usize = 0;
-    while (parts.next()) |part| {
-        if (idx >= 4) break;
-        out[idx] = std.fmt.parseInt(u8, part, 10) catch 0;
-        idx += 1;
-    }
-    return out;
+/// The bind address `--host` names: a dotted-quad IPv4 or `localhost`. Anything else is null,
+/// never the wildcard: a host read as 0.0.0.0 serves the whole network.
+pub fn parseIp4(host: []const u8) ?[4]u8 {
+    if (std.ascii.eqlIgnoreCase(host, "localhost")) return .{ 127, 0, 0, 1 };
+    const addr = std.Io.net.Ip4Address.parse(host, 0) catch return null;
+    return addr.bytes;
 }
 
 /// Answers on the bound socket while the startup load runs, before the accept loop takes it:
@@ -195,4 +184,10 @@ test "listenExclusive: a second server cannot bind a port that is already listen
     var first = try listenExclusive(testing.io, .{ .ip4 = std.Io.net.Ip4Address.loopback(0) });
     defer first.deinit(testing.io);
     try testing.expectError(error.AddressInUse, listenExclusive(testing.io, first.socket.address));
+}
+
+test "parseIp4: localhost is loopback, and a host it cannot read is refused, never the wildcard" {
+    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &parseIp4("localhost").?);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &parseIp4("0.0.0.0").?);
+    for ([_][]const u8{ "", "::1", "my-mac.local" }) |host| try testing.expect(parseIp4(host) == null);
 }
