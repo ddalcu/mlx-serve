@@ -1251,7 +1251,6 @@ const prompt_tail_cap: usize = 4096 + PosixStore.overlap;
 /// Pending ids beyond this drop the OLDEST job; the queue never grows
 /// unbounded on a stalled disk, and a drop is logged, never silent.
 const queue_cap_ids: usize = 4 << 20;
-const worker_poll_ms: u32 = 2;
 
 const RecordJob = struct {
     digest: [32]u8,
@@ -1261,12 +1260,16 @@ const RecordJob = struct {
     reply: []u32,
 };
 
-var worker_state: struct {
-    mutex: os_mutex.Mutex = .{},
+/// The worker's queue + waiter, Shared so the -Dunits build holds one copy
+/// (the engine submits jobs; the host's DELETE empties them).
+const WorkerState = struct {
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
     queue: std.ArrayList(RecordJob) = .empty,
     spawned: bool = false,
     queued_ids: usize = 0,
-} = .{};
+};
+pub const worker_state = shared_util.Shared(WorkerState, "recall_worker", .{});
 
 fn freeJob(j: RecordJob) void {
     gpa.free(j.name);
@@ -1274,16 +1277,17 @@ fn freeJob(j: RecordJob) void {
     gpa.free(j.reply);
 }
 
-fn workerLoop() void {
+fn workerLoop(io_foreign: std.Io) void {
+    const io = io_util.local(io_foreign);
     while (true) {
         var job: ?RecordJob = null;
         {
-            worker_state.mutex.lock();
-            defer worker_state.mutex.unlock();
-            if (worker_state.queue.items.len > 0) {
-                job = worker_state.queue.orderedRemove(0);
-                worker_state.queued_ids -= job.?.prompt.len + job.?.reply.len;
-            }
+            const w = worker_state.get();
+            w.mutex.lockUncancelable(io);
+            defer w.mutex.unlock(io);
+            while (w.queue.items.len == 0) w.cond.waitUncancelable(io, &w.mutex);
+            job = w.queue.orderedRemove(0);
+            w.queued_ids -= job.?.prompt.len + job.?.reply.len;
         }
         if (job) |j| {
             defer freeJob(j);
@@ -1291,22 +1295,22 @@ fn workerLoop() void {
                 st.readPrompt(j.prompt, 0);
                 st.readReply(j.prompt, j.reply);
             }
-            continue;
         }
-        crt.sleepMs(worker_poll_ms);
     }
 }
 
 fn spawnWorker() bool {
-    worker_state.mutex.lock();
-    defer worker_state.mutex.unlock();
-    if (worker_state.spawned) return true;
-    const t = std.Thread.spawn(.{}, workerLoop, .{}) catch {
+    const io = shared_state.get().io orelse return false;
+    const w = worker_state.get();
+    w.mutex.lockUncancelable(io);
+    defer w.mutex.unlock(io);
+    if (w.spawned) return true;
+    const t = std.Thread.spawn(.{}, workerLoop, .{io}) catch {
         log.warn("recall: the recording worker could not start; this request is not recorded\n", .{});
         return false;
     };
     t.detach();
-    worker_state.spawned = true;
+    w.spawned = true;
     return true;
 }
 
@@ -1316,6 +1320,7 @@ fn spawnWorker() bool {
 pub fn finishRequestAsync(tok: *const Tokenizer, prompt: []const u32, reply: []const u32) bool {
     const st = shared_state.get();
     if (!st.enabled or tok.recall_vocab == 0) return false;
+    const spawn_io = io_util.local(st.io orelse return false);
     const tail = if (prompt.len > prompt_tail_cap) prompt[prompt.len - prompt_tail_cap ..] else prompt;
     if (!spawnWorker()) return false;
     const p = gpa.dupe(u32, tail) catch {
@@ -1334,25 +1339,27 @@ pub fn finishRequestAsync(tok: *const Tokenizer, prompt: []const u32, reply: []c
         return false;
     };
     const job = RecordJob{ .digest = tok.recall_identity, .vocab = tok.recall_vocab, .name = n, .prompt = p, .reply = r };
-    worker_state.mutex.lock();
-    defer worker_state.mutex.unlock();
-    while (worker_state.queued_ids + p.len + r.len > queue_cap_ids and worker_state.queue.items.len > 0) {
-        const old = worker_state.queue.orderedRemove(0);
-        worker_state.queued_ids -= old.prompt.len + old.reply.len;
+    const w = worker_state.get();
+    w.mutex.lockUncancelable(spawn_io);
+    defer w.mutex.unlock(spawn_io);
+    while (w.queued_ids + p.len + r.len > queue_cap_ids and w.queue.items.len > 0) {
+        const old = w.queue.orderedRemove(0);
+        w.queued_ids -= old.prompt.len + old.reply.len;
         freeJob(old);
         log.warn("recall: the recording queue is over its cap; the oldest request is not recorded\n", .{});
     }
-    if (worker_state.queued_ids + p.len + r.len > queue_cap_ids) {
+    if (w.queued_ids + p.len + r.len > queue_cap_ids) {
         freeJob(job);
         log.warn("recall: a reply longer than the recording queue cannot be recorded\n", .{});
         return false;
     }
-    worker_state.queue.append(gpa, job) catch {
+    w.queue.append(gpa, job) catch {
         freeJob(job);
         log.warn("recall: the recording queue could not grow; this request is not recorded\n", .{});
         return false;
     };
-    worker_state.queued_ids += p.len + r.len;
+    w.queued_ids += p.len + r.len;
+    w.cond.broadcast(spawn_io);
     return true;
 }
 
@@ -1390,6 +1397,17 @@ pub fn emptyAll(a: Allocator) struct { rows: []EmptyRow, all_failed: bool } {
     // Comptime gate: the sweep's file-scope helpers use the POSIX O struct
     // (void on Windows); the stub never opens a store, so nothing can sweep.
     if (builtin.os.tag == .windows) return .{ .rows = &[_]EmptyRow{}, .all_failed = false };
+    // A DELETE empties the record: queued-but-unwritten jobs die with it, or
+    // they would re-write what the operator just asked to forget.
+    {
+        const w = worker_state.get();
+        const io = io_util.local(shared_state.get().io orelse return .{ .rows = &[_]EmptyRow{}, .all_failed = false });
+        w.mutex.lockUncancelable(io);
+        defer w.mutex.unlock(io);
+        for (w.queue.items) |j| freeJob(j);
+        w.queue.clearRetainingCapacity();
+        w.queued_ids = 0;
+    }
     const st_state = shared_state.get();
     var rows: std.ArrayList(EmptyRow) = .empty;
     defer rows.deinit(a);
@@ -1548,6 +1566,34 @@ fn tryNameFromIdentity(a: Allocator, io: std.Io, base: []const u8, name: []const
         if (std.mem.startsWith(u8, l, "name ") and l.len > 5) return a.dupe(u8, l[5..]) catch name;
     }
     return a.dupe(u8, name) catch name;
+}
+
+// ── the Windows analysis guard ─────────────────────────────────────────
+// The Windows build is the gate that matters: a runtime early-return does
+// not prune Zig's analysis, and CI's first three runs proved it the hard
+// way. On that target this force-references every surface entry the host
+// and engine call (including the worker), so an fd-layer leak fails THIS
+// target's compile immediately — here, not in a fourth CI round.
+comptime {
+    if (builtin.os.tag == .windows) {
+        _ = &storeFor;
+        _ = &armReader;
+        _ = &finishRequest;
+        _ = &finishRequestAsync;
+        _ = &allStats;
+        _ = &emptyAll;
+        _ = &promptMayDraft;
+        _ = &setBaseDir;
+        _ = &Store.open;
+        _ = &Store.readPrompt;
+        _ = &Store.readReply;
+        _ = &Store.stats;
+        _ = &Store.empty;
+        _ = &Reader.propose;
+        _ = &Reader.observe;
+        _ = &Reader.noteHead;
+        _ = &Reader.deinit;
+    }
 }
 
 // ────────────────────────── tests ──────────────────────────
