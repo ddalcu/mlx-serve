@@ -120,6 +120,7 @@ test "format corpus: late system notes never vanish or rewrite supported history
         .{ .source = @embedFile("../../fixtures/qwen38_27b_chat_template.jinja"), .in_place = true },
         .{ .source = @embedFile("../../fixtures/qwen38_chat_template.jinja"), .in_place = true },
         .{ .source = @embedFile("../../fixtures/inkling_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("../../fixtures/inkling2_chat_template.jinja"), .in_place = true },
         .{ .source = @embedFile("../../fixtures/muse_chat_template.jinja"), .in_place = true },
         .{ .source = @embedFile("../../fixtures/dsv4_chat_template.jinja"), .in_place = true },
         .{ .source = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('system must be first') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}", .in_place = false },
@@ -1568,6 +1569,19 @@ const corpus = [_]Expect{
         .raw = "<|content_text|>4<|end_message|>",
         .thinking = false,
         .content_exact = "4",
+    },
+    .{
+        // Thinking-off prompt committed `<|message_model|><|content_text|>`: no marker, ends at its end.
+        .family = "inkling",
+        .name = "committed text message ends at its end_message",
+        .raw = "The answer is 4.<|end_message|>",
+        .content_exact = "The answer is 4.",
+    },
+    .{
+        .family = "inkling",
+        .name = "committed text message cut by max_tokens is content",
+        .raw = "def fib(n):\n    return n if n < 2 else",
+        .content_exact = "def fib(n):\n    return n if n < 2 else",
     },
     .{
         // Live-shaped: thinking message then a fresh model text message.
@@ -3139,6 +3153,7 @@ test "format corpus: a content-borne control marker never becomes a special id, 
         @embedFile("../../fixtures/flint_chat_template.jinja"),        @embedFile("../../fixtures/glm5_next_chat_template.jinja"),
         @embedFile("../../fixtures/inkling_chat_template.jinja"),      @embedFile("../../fixtures/lfm2_vl_chat_template.jinja"),
         @embedFile("../../fixtures/minicpmv4_7_chat_template.jinja"),  @embedFile("../../fixtures/muse_chat_template.jinja"),
+        @embedFile("../../fixtures/inkling2_chat_template.jinja"),
         "", // no template: the generic fallback format
     };
     for (templates) |tpl| {
@@ -3154,4 +3169,75 @@ test "format corpus: a content-borne control marker never becomes a special id, 
         const config = chat.ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
         try expectContentMarkersAreText(&tok, &config, payload.items, false);
     }
+}
+
+/// Byte-level ids 0..255, plus Inkling 2's channel markers at their tokenizer.json ids.
+fn inklingTokenizer(a: std.mem.Allocator) !Tokenizer {
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    errdefer tok.deinit();
+    for (tok.byte_to_unicode, 0..) |cp, byte| {
+        var buf: [4]u8 = undefined;
+        const text = try a.dupe(u8, buf[0..try std.unicode.utf8Encode(cp, &buf)]);
+        try tok.vocab.put(text, @intCast(byte));
+        try tok.id_to_token.put(@intCast(byte), text);
+        try tok.unicode_to_byte.put(cp, @intCast(byte));
+    }
+    const markers = [_]struct { []const u8, u32 }{
+        .{ "<|message_user|>", 200000 },     .{ "<|message_model|>", 200001 }, .{ "<|message_system|>", 200002 },
+        .{ "<|content_text|>", 200004 },     .{ "<|content_thinking|>", 200008 }, .{ "<|end_message|>", 200010 },
+        .{ "<|content_model_end_sampling|>", 200006 },
+    };
+    for (markers) |m| {
+        const text = try a.dupe(u8, m[0]);
+        try tok.special_tokens.put(text, m[1]);
+        try tok.id_to_token.put(m[1], text);
+    }
+    return tok;
+}
+
+test "format corpus: Inkling thinking-off without tools commits the text message" {
+    const a = testing.allocator;
+    var tok = try inklingTokenizer(a);
+    defer tok.deinit();
+    const ink2 = chat.ChatConfig{ .chat_template = @embedFile("../../fixtures/inkling2_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a };
+    const ask = [_]chat.Message{.{ .role = "user", .content = "What is 2+2?" }};
+    const turn = "<|message_user|><|content_text|>What is 2+2?<|end_message|>";
+    const template_off = "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|>" ++ turn;
+
+    // Inkling 2 (no generation prompt): exactly two more tokens, <|message_model|> <|content_text|>.
+    const off = try chat.renderChatTemplate(a, &ask, &ink2, null, null, false, null, false);
+    defer a.free(off);
+    try testing.expectEqualStrings(template_off ++ "<|message_model|><|content_text|>", off);
+    const off_ids = try chat.formatChat(a, &tok, &ask, &ink2, null, null, false, null, false);
+    defer a.free(off_ids);
+    const template_ids = try tok.encode(a, template_off);
+    defer a.free(template_ids);
+    try testing.expectEqualSlices(u32, template_ids, off_ids[0 .. off_ids.len - 2]);
+    try testing.expectEqualSlices(u32, &.{ 200001, 200004 }, off_ids[template_ids.len..]);
+
+    // Thinking on, and thinking off with tools: the template's own prompt.
+    const on = try chat.renderChatTemplate(a, &ask, &ink2, null, null, true, null, false);
+    defer a.free(on);
+    try testing.expectEqualStrings("<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>" ++ turn, on);
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{}}}}]
+    ;
+    const off_tools = try chat.renderChatTemplate(a, &ask, &ink2, tools_json, null, false, null, false);
+    defer a.free(off_tools);
+    try testing.expect(std.mem.endsWith(u8, off_tools, "Thinking effort level: 0<|end_message|>" ++ turn));
+
+    // A continuation resumes inside the same text message.
+    const partial = [_]chat.Message{ ask[0], .{ .role = "assistant", .content = "The answer is" } };
+    const cont = try chat.renderChatTemplate(a, &partial, &ink2, null, null, false, null, true);
+    defer a.free(cont);
+    try testing.expectEqualStrings(template_off ++ "<|message_model|><|content_text|>The answer is", cont);
+
+    // Inkling Small renders `<|message_model|>` itself: only <|content_text|> is added.
+    const small = chat.ChatConfig{ .chat_template = @embedFile("../../fixtures/inkling_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a };
+    const small_off = try chat.renderChatTemplate(a, &ask, &small, null, null, false, null, false);
+    defer a.free(small_off);
+    try testing.expect(std.mem.endsWith(u8, small_off, turn ++ "<|message_model|><|content_text|>"));
+    const small_on = try chat.renderChatTemplate(a, &ask, &small, null, null, true, null, false);
+    defer a.free(small_on);
+    try testing.expect(std.mem.endsWith(u8, small_on, turn ++ "<|message_model|>"));
 }

@@ -43,6 +43,13 @@ Declared today:
 - **Concurrent**: archs that batch decode (B > 1) are not row-exact across batch widths; serial archs (`qwen3_next`,
   `laguna`, `kolibri1`, `bailing_hybrid`, `hy_v3`, `inkling`, `gpt_oss`, `nemotron_h`, `lfm2`) and the single-flight
   `deepseek_v4`/`deepseek_v41` are equal to solo by construction but no guard checks it.
+- **Concurrent, a served drafter's groups** (`inkling2`): a greedy or seeded request groups with the others by default, so
+  a near-tie token can follow who else is served and in what order. With `MLX_SERVE_GREEDY_SOLO_ROUNDS=1` it rounds
+  alone (`native_group.roundsAlone`, at a multi-user throughput cost), so its text is the one it gets alone, except: past 16
+  requests drafting on the model its drafter ring can be parked out and restart (`max_open`); a prompt prefilled while
+  others decode runs 2048-row chunks (1024 under a decode share; `companyPrefillChunk`); with speculation off it decodes
+  in the batched group; and a prompt restored from another request's prefix-cache entry is outside `exact_resumed`
+  (above). An unseeded sampled request groups, and its tokens follow who else is served and in what order.
 - **Embedded engines** (`ds4`, `llama`, `ane`): every contract unverified. The adapters ignore `Request.no_drafts` and
   `CacheHint.cold`, and ds4 reports `Stats.drafted = 0`, so a drafted check could not see a draft.
 - Embedding, decision and media plugins have no token decode loop; their bar is seeded outputs identical.

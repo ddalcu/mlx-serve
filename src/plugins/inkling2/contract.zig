@@ -17,6 +17,9 @@ const vision_contract = @import("vision_contract.zig");
 const layers = @import("layers.zig");
 const config = @import("config.zig");
 const attn = @import("../../sdk/blocks/attention/contract.zig");
+const rounds_contract = @import("rounds_contract.zig");
+const group_contract = @import("group_contract.zig");
+const trunk_contract = @import("trunk_contract.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;
@@ -989,6 +992,171 @@ const Gate = struct {
     }
 };
 
+const gate_mm_launch = metal.Launch{ .name = "msv_inkling2_gate_mm", .inputs = &.{ "A", "MS", "ST", "F", "G" }, .outputs = &.{"Y"}, .source = source("plugins/inkling2/kernels/gate_mm.metal"), .header = "#include <metal_simdgroup_matrix>\n", .tg_bytes = 4 * (2 * 64 * 32 + 32 * 32), .m1 = 1024, .m2 = 1024 };
+
+/// GATE_MM: a prompt chunk's loop message gates on the matrix units: rows = gates, n = the chunk's rows, k = D.
+/// `bt`: the tile's rows (`kernels.gate_mm_rows`, 64).
+fn GateMmOf(comptime bt: c_int) type {
+    return struct {
+        const Self = @This();
+        rig: metal.Rig,
+        launch: *const metal.Launch = &gate_mm_launch,
+        arena: std.heap.ArenaAllocator,
+        shape: Shape = undefined,
+        /// `[J, S, D]` each; `st` `[J, S, RANK]`; `f`, `g` `[J, D, RANK]`.
+        a: []f64 = &.{},
+        ms: []f64 = &.{},
+        st: []f64 = &.{},
+        f: []f64 = &.{},
+        g: []f64 = &.{},
+        args: [5]mlx.mlx_array = undefined,
+        wt: mlx.mlx_dtype,
+
+        fn init(al: std.mem.Allocator, wt: mlx.mlx_dtype) Self {
+            return .{ .rig = metal.Rig.init(al), .arena = .init(al), .wt = wt };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.rig.deinit();
+            self.arena.deinit();
+        }
+
+        pub fn geometry(_: *const Self, shape: Shape) ?metal.Geometry {
+            if (shape.rows == 0 or shape.n <= kernels.small_rows or shape.k == 0 or shape.k % 32 != 0) return null;
+            const d: c_int = @intCast(shape.k);
+            const nt: c_int = @divExact(bt, 16) * 2 * 32;
+            var geo = metal.Geometry{ .grid = .{ nt * @divExact(d, 32), @divFloor(@as(c_int, @intCast(shape.n)) + bt - 1, bt), @intCast(shape.rows) }, .tg = .{ nt, 1, 1 } };
+            geo.int("BM", @as(c_int, bt));
+            geo.out(&.{ @intCast(shape.rows), @intCast(shape.n), d }, .float32);
+            geo.int("D", d);
+            geo.int("RANK", @as(c_int, RANK));
+            return geo;
+        }
+
+        pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+            if (self.geometry(shape) == null) return false;
+            self.shape = shape;
+            _ = self.arena.reset(.retain_capacity);
+            const al = self.arena.allocator();
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rng = prng.random();
+            const j = shape.rows;
+            const s = shape.n;
+            const d = shape.k;
+            self.a = try spread(al, rng, j * s * d, .f32);
+            self.ms = try spread(al, rng, j * s * d, .f32);
+            self.st = try al.alloc(f64, j * s * RANK);
+            for (self.st) |*v| v.* = spec.roundTo(.bf16, rng.float(f64) * 2 - 1);
+            self.f = try al.alloc(f64, j * d * RANK);
+            self.g = try al.alloc(f64, j * d * RANK);
+            for ([_][]f64{ self.f, self.g }) |w| for (w) |*v| {
+                v.* = spec.roundTo(elemOf(self.wt), 0.2 * (rng.float(f64) * 2 - 1));
+            };
+            switch (fill) {
+                .random => {},
+                .nonfinite => {
+                    plant(self.a, d);
+                    // An infinite state saturates its gate's row: the stream leaves, the message stays whole.
+                    if (s > 1) self.st[RANK + 3] = std.math.inf(f64);
+                },
+                // Gate 4, as Gate's: states of one, projections 1, then 62 of 2^-12, then -1.
+                .stress => {
+                    @memset(self.a, 2);
+                    @memset(self.ms, 1);
+                    @memset(self.st, 1);
+                    for ([_][]f64{ self.f, self.g }) |w| for (w, 0..) |*v, i| {
+                        v.* = switch (i % RANK) {
+                            0 => 1,
+                            RANK - 1 => -1,
+                            else => 0x1p-12,
+                        };
+                    };
+                },
+            }
+            self.rig.reset();
+            const jj: c_int = @intCast(j);
+            const ss: c_int = @intCast(s);
+            const dd: c_int = @intCast(d);
+            self.args = .{
+                try self.rig.input(.float32, &.{ jj, ss, dd }, self.a),
+                try self.rig.input(.float32, &.{ jj, ss, dd }, self.ms),
+                try self.rig.input(.bfloat16, &.{ jj, ss, RANK }, self.st),
+                try self.rig.input(self.wt, &.{ jj, dd, RANK }, self.f),
+                try self.rig.input(self.wt, &.{ jj, dd, RANK }, self.g),
+            };
+            return true;
+        }
+
+        pub fn run(self: *Self) !void {
+            try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+        }
+
+        pub fn count(self: *const Self) usize {
+            return self.shape.rows * self.shape.n * self.shape.k;
+        }
+
+        /// Element `e`'s forget and message terms.
+        fn terms(self: *const Self, e: usize, tf: *[RANK]f64, tg: *[RANK]f64) void {
+            const d = self.shape.k;
+            const s = self.shape.n;
+            const j = e / (s * d);
+            const row = (e / d) % s;
+            const i = e % d;
+            for (tf, tg, 0..) |*x, *y, r| {
+                const st = self.st[(j * s + row) * RANK + r];
+                x.* = self.f[(j * d + i) * RANK + r] * st;
+                y.* = self.g[(j * d + i) * RANK + r] * st;
+            }
+        }
+
+        fn mix(self: *const Self, e: usize, f: f64, g: f64) f64 {
+            return (1 - std.math.tanh(f)) * self.a[e] + std.math.tanh(g) * self.ms[e];
+        }
+
+        pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+            var tf: [RANK]f64 = undefined;
+            var tg: [RANK]f64 = undefined;
+            for (want, mag, 0..) |*w, *m, e| {
+                self.terms(e, &tf, &tg);
+                var f: f64 = 0;
+                var g: f64 = 0;
+                var af: f64 = 0;
+                var ag: f64 = 0;
+                for (tf, tg) |x, y| {
+                    f += x;
+                    g += y;
+                    af += @abs(x);
+                    ag += @abs(y);
+                }
+                w.* = self.mix(e, f, g);
+                m.* = af * @abs(self.a[e]) + ag * @abs(self.ms[e]) + @abs((1 - std.math.tanh(f)) * self.a[e]) + @abs(std.math.tanh(g) * self.ms[e]);
+                if (!std.math.isFinite(m.*)) m.* = 0;
+            }
+        }
+
+        pub fn simulate(self: *const Self, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+            var tf: [RANK]f64 = undefined;
+            var tg: [RANK]f64 = undefined;
+            for (out, 0..) |*o, e| {
+                self.terms(e, &tf, &tg);
+                o.* = self.mix(e, spec.sumIn(acc, order, &tf), spec.sumIn(acc, order, &tg));
+            }
+        }
+
+        fn wrapper(self: *Self) ![]const u8 {
+            const ov = @import("../../env.zig").override(.MLX_SERVE_INKLING2_GATE_MM, "1");
+            defer ov.restore();
+            var g = ops.Graph.init(self.rig.a, self.rig.stream());
+            defer g.deinit();
+            const x = self.args;
+            const gates: layers.Gates = .{ .down = x[2], .forget = x[3], .message = x[4] };
+            return self.rig.bytesOf(&.{try kernels.gate(&g, &gates, x[0], x[1], x[2], 0, @intCast(self.shape.rows))});
+        }
+
+    };
+}
+const GateMm = GateMmOf(kernels.gate_mm_rows);
+
 fn rankDepth(_: Shape) usize {
     return RANK;
 }
@@ -1195,6 +1363,255 @@ const TopK = struct {
         return self.rig.bytesOf(&o);
     }
 };
+
+/// Mini's attention for `prep.metal`: query and KV heads, relative state width; the head width is `SD`, the conv's taps
+/// `KT`, the relative extent `R`. The joined projection a row: q, gate, relative, k, v.
+const PH = 24;
+const PHKV = 8;
+const PDREL = 16;
+const PC = PHKV * SD;
+const PQD = PH * SD;
+const PJW = 2 * PQD + PH * PDREL + 2 * PC;
+/// Where each part starts in a joined row, then the row's end.
+const prep_starts = [_]usize{ 0, PQD, 2 * PQD, 2 * PQD + PH * PDREL, 2 * PQD + PH * PDREL + PC, PJW };
+
+const prep_ins_c = &[_][*:0]const u8{ "QP", "GP", "RP", "KP", "VP", "KDY", "VDY", "ST", "KW", "VW", "QS", "RS", "RJ", "PR", "PARENT" };
+const prep_outs_c = &[_][*:0]const u8{ "Q", "GATE", "K", "V", "BIAS", "REL" };
+const prep_launch = metal.Launch{ .name = "msv_inkling2_prep", .inputs = prep_ins_c, .outputs = prep_outs_c, .source = source("plugins/inkling2/kernels/prep.metal"), .tg_bytes = 4 * SD, .m1 = 1024, .m2 = 1024 };
+const prep_strided_launch = metal.Launch{ .name = "msv_inkling2_prep_strided", .inputs = prep_ins_c, .outputs = prep_outs_c, .source = source("plugins/inkling2/kernels/prep.metal"), .contiguous = false, .tg_bytes = 4 * SD, .m1 = 1024, .m2 = 1024 };
+
+/// PREP_STRIDED: `prep.metal` reading q, gate, relative, k and v as views of one joined projection (their row
+/// strides), bit-equal to the kernel on contiguous copies. rows = S, n = a one-row read's keys (0 for more), k = R.
+const PrepStrided = PrepCase(true);
+
+fn prepHeads(shape: Shape) usize {
+    return shape.rows * PQD;
+}
+
+/// Q, GATE and K's element types and counts.
+const prep_outs: []const spec.Part = &.{ .{ .elem = .bf16, .count = prepHeads }, .{ .elem = .f32, .count = prepHeads }, .{ .elem = .bf16, .count = prepHeads } };
+
+fn PrepCase(comptime strided: bool) type {
+    return struct {
+        rig: metal.Rig,
+        launch: *const metal.Launch = if (strided) &prep_strided_launch else &prep_launch,
+        arena: std.heap.ArenaAllocator,
+        shape: Shape = undefined,
+        /// `[S, PJW]`: the rows' joined projection.
+        joined: []f64 = &.{},
+        args: [15]mlx.mlx_array = undefined,
+        /// `strided`: the five parts' views of the joined input, freed at the next prepare.
+        views: [5]mlx.mlx_array = @splat(.{ .ctx = null }),
+        note: [200]u8 = undefined,
+
+        const Self = @This();
+
+        fn init(a: std.mem.Allocator) Self {
+            return .{ .rig = metal.Rig.init(a), .arena = .init(a) };
+        }
+
+        fn dropViews(self: *Self) void {
+            for (&self.views) |*v| {
+                if (v.ctx != null) _ = mlx.mlx_array_free(v.*);
+                v.* = .{ .ctx = null };
+            }
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.dropViews();
+            self.rig.deinit();
+            self.arena.deinit();
+        }
+
+        fn wide(shape: Shape) bool {
+            return shape.rows > 1;
+        }
+
+        /// The tail's one-row bias or more rows' states, elements.
+        fn tail(shape: Shape) usize {
+            return if (wide(shape)) shape.rows * PH * PDREL else PH * shape.n;
+        }
+
+        pub fn geometry(_: *const Self, shape: Shape) ?metal.Geometry {
+            const s = shape.rows;
+            if (s == 0 or shape.k != R or (!wide(shape) and shape.n == 0)) return null;
+            const ci = struct {
+                fn f(x: usize) c_int {
+                    return @intCast(x);
+                }
+            }.f;
+            const x = PQD + 2 * PC + PH * (if (wide(shape)) PDREL else shape.n);
+            var g = metal.Geometry{ .grid = .{ ci(x), ci(s), 1 }, .tg = .{ SD, 1, 1 } };
+            const unused1: []const c_int = &.{1};
+            if (wide(shape)) g.out(&.{ 1, ci(s), PH, SD }, .bfloat16) else g.out(&.{ 1, PH, 1, SD }, .bfloat16);
+            g.out(&.{ci(s * PQD)}, .float32);
+            g.out(&.{ 1, PHKV, ci(s), SD }, .bfloat16);
+            g.out(&.{ 1, PHKV, ci(s), SD }, .bfloat16);
+            if (wide(shape)) g.out(unused1, .float32) else g.out(&.{ 1, PH, 1, ci(shape.n) }, .bfloat16);
+            if (wide(shape)) g.out(&.{ 1, ci(s), PH, PDREL }, .bfloat16) else g.out(unused1, .float32);
+            g.unread = if (wide(shape)) @as(u8, 1 << 4) else 1 << 5;
+            g.dtype("T", .bfloat16);
+            g.dtype("WT", .bfloat16);
+            g.dtype("S", .bfloat16);
+            g.int("H", @as(c_int, PH));
+            g.int("HD", @as(c_int, SD));
+            g.int("HKV", @as(c_int, PHKV));
+            g.int("DREL", @as(c_int, PDREL));
+            g.int("KT", @as(c_int, KT));
+            g.int("DYN", @as(c_int, 0));
+            g.int("WIDE", @as(c_int, @intFromBool(wide(shape))));
+            g.int("TREE", @as(c_int, 0));
+            return g;
+        }
+
+        pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+            if (self.geometry(shape) == null) return false;
+            self.shape = shape;
+            self.dropViews();
+            _ = self.arena.reset(.retain_capacity);
+            const a = self.arena.allocator();
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rng = prng.random();
+            const s = shape.rows;
+            self.joined = try host.uniform(a, rng, s * PJW, -2, 2, .bfloat16);
+            const st = try host.uniform(a, rng, (KT - 1) * 2 * PC, -1, 1, .float32);
+            const kw = try host.uniform(a, rng, PC * KT, -0.5, 0.5, .bfloat16);
+            const vw = try host.uniform(a, rng, PC * KT, -0.5, 0.5, .bfloat16);
+            const qs = try host.uniform(a, rng, PH * SD, 0.5, 1.5, .bfloat16);
+            const rs = try host.uniform(a, rng, PH * PDREL, 0.5, 1.5, .bfloat16);
+            const rj = try host.uniform(a, rng, PDREL * R, -1, 1, .float32);
+            // qk clip, relative clip, eps, tau (one row's log scale), the static conv's scale, a one-row read's keys.
+            var pr = [6]f64{ @as(f32, 22.627416997969522), 8, @as(f32, 1e-6), if (wide(shape)) 1 else 1.25, @as(f32, 1.0 / @sqrt(@as(f32, KT + 1))), @floatFromInt(shape.n) };
+            switch (fill) {
+                .random => {},
+                // In every part of the rows' projections (a NaN in row 0, infinities in rows 1 to 3).
+                .nonfinite => for (0..5) |part| {
+                    const at = prep_starts[part];
+                    const w = prep_starts[part + 1] - at;
+                    const puts = [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64), std.math.inf(f64) };
+                    for (0..@min(s, 4)) |r| {
+                        const row = self.joined[r * PJW + at ..][0..w];
+                        row[(part * 37 + r * 11) % w] = puts[r];
+                        if (r == 3) row[w - 1] = -std.math.inf(f64);
+                    }
+                },
+                // States of one, unclipped (a relative clip no norm reaches).
+                .stress => {
+                    for (0..s) |r| @memset(self.joined[r * PJW + 2 * PQD ..][0 .. PH * PDREL], 1);
+                    @memset(rs, 1);
+                    pr[1] = 1e30;
+                },
+            }
+            self.rig.reset();
+            const ci = struct {
+                fn f(x: usize) c_int {
+                    return @intCast(x);
+                }
+            }.f;
+            const starts = prep_starts;
+            var parts: [5]mlx.mlx_array = undefined;
+            if (strided) {
+                const whole = try self.rig.input(.bfloat16, &.{ 1, ci(s), PJW }, self.joined);
+                for (&self.views, 0..) |*v, i| {
+                    v.* = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_slice(v, whole, &[_]c_int{ 0, 0, ci(starts[i]) }, 3, &[_]c_int{ 1, ci(s), ci(starts[i + 1]) }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.rig.stream()));
+                    try mlx.check(mlx.mlx_array_eval(v.*));
+                }
+                parts = self.views;
+            } else for (&parts, 0..) |*x, i| {
+                const w = starts[i + 1] - starts[i];
+                const vals = try a.alloc(f64, s * w);
+                for (0..s) |r| @memcpy(vals[r * w ..][0..w], self.joined[r * PJW + starts[i] ..][0..w]);
+                x.* = try self.rig.input(.bfloat16, &.{ 1, ci(s), ci(w) }, vals);
+            }
+            self.args = .{
+                parts[0],                                        parts[1],                                           parts[2],                                                  parts[3],                                           parts[4],
+                // A static conv's KDY, VDY slots hold k and v, which it never reads.
+                parts[3],                                        parts[4],                                           try self.rig.input(.float32, &.{ 1, KT - 1, 2 * PC }, st), try self.rig.input(.bfloat16, &.{ PC, KT, 1 }, kw), try self.rig.input(.bfloat16, &.{ PC, KT, 1 }, vw),
+                try self.rig.input(.bfloat16, &.{ PH, SD }, qs), try self.rig.input(.bfloat16, &.{ PH, PDREL }, rs), try self.rig.input(.float32, &.{ PDREL, R }, rj),          try self.rig.input(.float32, &.{6}, &pr),
+                try self.rig.input(.int32, &.{1}, &.{0}),
+            };
+            return true;
+        }
+
+        pub fn run(self: *Self) !void {
+            try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+        }
+
+        pub fn count(self: *const Self) usize {
+            const s = self.shape.rows;
+            return 2 * s * PQD + 2 * s * PC + tail(self.shape);
+        }
+
+        fn dims(self: *const Self) kernels.PrepDims {
+            return .{ .heads = PH, .kv_heads = PHKV, .hd = SD, .d_rel = PDREL, .kt = KT, .keys = @intCast(self.shape.n), .dynamic = false };
+        }
+
+        fn bytesOf(self: *Self, o: [6]mlx.mlx_array) ![]const u8 {
+            return self.rig.bytesOf(&.{ o[0], o[1], o[2], o[3], if (wide(self.shape)) o[5] else o[4] });
+        }
+
+        /// The kernel on contiguous inputs in the plain order (the engine's path with both switches off): its bytes.
+        fn plain(self: *Self) ![]const u8 {
+            var g = ops.Graph.init(self.rig.a, self.rig.stream());
+            defer g.deinit();
+            return self.bytesOf(try kernels.prepLaunch(&g, &self.args, self.dims(), false));
+        }
+
+        /// `strided`: the contiguous kernel on the same views (MLX copies them first).
+        pub const replaced = if (strided) plain else notReplacing;
+
+        fn notReplacing(_: *Self) ![]const u8 {
+            return error.NotAReplacement;
+        }
+
+        /// The plain kernel's values (its bytes read back) with their magnitude.
+        fn values(self: *Self, out: []f64, mag: ?[]f64) !void {
+            const s = self.shape.rows;
+            const nq = s * PQD;
+            const nk = s * PC;
+            const nt = tail(self.shape);
+            const b = try self.plain();
+            var at: usize = 0;
+            var off: usize = 0;
+            for ([_]spec.Elem{ .bf16, .f32, .bf16, .bf16, .bf16 }, [_]usize{ nq, nq, nk, nk, nt }) |e, n| {
+                for (0..n) |i| out[at + i] = spec.read(e, b[off..], i);
+                at += n;
+                off += n * spec.size(e);
+            }
+            if (mag) |m| for (m[0..at], out[0..at]) |*x, w| {
+                x.* = @abs(w);
+            };
+        }
+
+        pub fn reference(self: *Self, want: []f64, mag: []f64) !void {
+            try self.values(want, mag);
+        }
+
+        pub fn simulate(self: *Self, _: spec.Accum, _: spec.Order, out: []f64) !void {
+            try self.values(out, null);
+        }
+
+        /// Gates 1 and 3: every output bit-equal to the plain kernel's.
+        pub fn check(self: *Self, _: spec.Gate) !?[]const u8 {
+            const al = self.rig.a;
+            const got = try al.dupe(u8, self.rig.outputBytes());
+            defer al.free(got);
+            const want = try self.plain();
+            const head = want.len;
+            if (got.len < head or !std.mem.eql(u8, got[0..head], want))
+                return std.fmt.bufPrint(&self.note, "its bytes differ from the contiguous kernel's from byte {d}", .{std.mem.indexOfDiff(u8, got, want) orelse head}) catch "its bytes differ from the plain kernel's";
+            if (got.len == head) return null;
+            return "it writes more than the plain kernel";
+        }
+
+        fn wrapper(self: *Self) ![]const u8 {
+            var g = ops.Graph.init(self.rig.a, self.rig.stream());
+            defer g.deinit();
+            return self.bytesOf(try kernels.prepLaunch(&g, &self.args, self.dims(), strided));
+        }
+    };
+}
 
 /// The model's head width and query heads a KV head; the split read's keys a threadgroup and a tile.
 const SD = 128;
@@ -1415,7 +1832,7 @@ const NAX_BK = 32;
 /// A prompt's rows on the tensor unit: rows = query rows, n = KV heads (3 query heads each), k = keys, the rows at the last
 /// `rows` of them; `window` 0 on a global layer. Each SIMD group's 16 rows walk 32-key tiles from their first row's window
 /// to their last row, the keys a row may not see entering P V at weight 0.
-const RelNax = struct {
+const RelattnNax = struct {
     rig: metal.Rig,
     launch: *const metal.Launch = &nax_launch,
     arena: std.heap.ArenaAllocator,
@@ -1604,6 +2021,232 @@ const RelNax = struct {
         const x = self.args;
         const out = [_]mlx.mlx_array{try kernels.naxRead(&g, x[0], x[1], x[2], x[3], x[4], x[5], @intCast(self.window))};
         return self.rig.bytesOf(&out);
+    }
+};
+
+
+/// The tensor-unit read's rows a threadgroup and keys a block, and `relPad`'s projection width.
+const NBQ = 64;
+const NBK = 32;
+const NRP = kernels.relp_before + R + 64;
+/// Gate 4's q: the largest 8-bit integer, exact in bf16.
+const NAX_STRESS_Q = 251;
+
+const relnax_launch = metal.Launch{
+    .name = "msv_inkling2_relnax",
+    .inputs = &.{ "q", "k", "v", "rel", "sinks", "key_start", "sizes", "scale", "relp" },
+    .outputs = &.{"out"},
+    .source = source("plugins/inkling2/kernels/relative_attention_nax.metal"),
+    .header = source("kernels/attention/nax_tiles.metal") ++ source("kernels/attention/nax_attention.metal"),
+    .contiguous = false,
+    // Mtg: four simdgroups' 16 x 49 f32 bias rows.
+    .tg_bytes = 4 * 16 * 49 * 4,
+    .offline = false,
+    .min_gen = 17,
+};
+
+/// NAX_PREFILL with BIAS_IN_ATTN: `relative_attention_nax.metal` over a prompt chunk's rows with the relative bias
+/// made inside the read, rows = KV heads, n = L query rows, k = S keys.
+const RelNax = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch = &relnax_launch,
+    arena: std.heap.ArenaAllocator,
+    window: usize,
+    shape: Shape = undefined,
+    /// `[HQ, L, SD]`, `[HKV, S, SD]` twice, `[L, HQ, 16]`, `[16, R]`, `[L, HQ]`.
+    q: []f64 = &.{},
+    k: []f64 = &.{},
+    v: []f64 = &.{},
+    st: []f64 = &.{},
+    proj: []f64 = &.{},
+    sinks: []f64 = &.{},
+    scale: f64 = @as(f32, 1.0 / @sqrt(@as(f32, SD))),
+    args: [9]mlx.mlx_array = undefined,
+
+    const Self = @This();
+
+    fn init(a: std.mem.Allocator, window: usize) Self {
+        return .{ .rig = metal.Rig.init(a), .arena = .init(a), .window = window };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    pub fn geometry(self: *const Self, shape: Shape) ?metal.Geometry {
+        if (shape.rows == 0 or shape.n < 2 or shape.k < shape.n) return null;
+        const hq: c_int = @intCast(shape.rows * SG);
+        const l: c_int = @intCast(shape.n);
+        var g = metal.Geometry{ .grid = .{ @divTrunc(l + NBQ - 1, NBQ) * 128, hq, 1 }, .tg = .{ 128, 1, 1 } };
+        g.out(&.{ 1, l, hq, SD }, .bfloat16);
+        g.dtype("T", .bfloat16);
+        g.int("D", @as(c_int, SD));
+        g.int("HQ", hq);
+        g.int("HKV", @as(c_int, @intCast(shape.rows)));
+        g.int("R", @as(c_int, R));
+        g.int("WINDOW", @as(c_int, @intCast(self.window)));
+        g.flag("ALIGN_Q", shape.n % NBQ == 0);
+        g.flag("ALIGN_K", shape.k % NBK == 0);
+        g.flag("BIA", true);
+        g.int("RP", @as(c_int, NRP));
+        g.int("PADL", @as(c_int, kernels.relp_before));
+        return g;
+    }
+
+    pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const hq = shape.rows * SG;
+        const l = shape.n;
+        if (fill == .stress) {
+            // Integer q and k whose dots are exact in f32 in any order while their partial sums leave fp16's range
+            // and bf16's precision (the SDK's NAX case's rows); integer states and projection, exact anywhere.
+            self.q = try a.alloc(f64, hq * l * SD);
+            for (self.q, 0..) |*x, i| x.* = if (i % SD < SD / 2) NAX_STRESS_Q else -NAX_STRESS_Q;
+            self.k = try host.ints(a, rng, shape.rows * shape.k * SD, 0, 127);
+            var r: usize = 0;
+            while (r < self.k.len) : (r += SD) for (0..SD / 2) |i| {
+                self.k[r + SD / 2 + i] = self.k[r + (i + 1) % (SD / 2)] + @as(f64, if (i < 2) @floatFromInt(rng.uintLessThan(u32, 2)) else 0);
+            };
+            self.st = try host.ints(a, rng, l * hq * 16, -1, 1);
+            self.proj = try host.ints(a, rng, 16 * R, -1, 1);
+        } else {
+            self.q = try host.uniform(a, rng, hq * l * SD, -1, 1, .bfloat16);
+            self.k = try host.uniform(a, rng, shape.rows * shape.k * SD, -1, 1, .bfloat16);
+            self.st = try host.uniform(a, rng, l * hq * 16, -1, 1, .bfloat16);
+            self.proj = try host.uniform(a, rng, 16 * R, -1, 1, .bfloat16);
+        }
+        self.v = try host.uniform(a, rng, shape.rows * shape.k * SD, -2, 2, .bfloat16);
+        self.sinks = try host.uniform(a, rng, l * hq, -1, 3, .float32);
+        if (fill == .nonfinite) {
+            host.plant(self.q, hq * l, SD);
+            host.plant(self.v, shape.rows * shape.k, SD);
+        }
+        const relp = try a.alloc(f64, 16 * NRP);
+        @memset(relp, 0);
+        for (0..16) |i| @memcpy(relp[i * NRP + kernels.relp_before ..][0..R], self.proj[i * R ..][0..R]);
+        self.rig.reset();
+        const ci = struct {
+            fn f(x: usize) c_int {
+                return @intCast(x);
+            }
+        }.f;
+        self.args = .{
+            try self.rig.input(.bfloat16, &.{ 1, ci(hq), ci(l), SD }, self.q),
+            try self.rig.input(.bfloat16, &.{ 1, ci(shape.rows), ci(shape.k), SD }, self.k),
+            try self.rig.input(.bfloat16, &.{ 1, ci(shape.rows), ci(shape.k), SD }, self.v),
+            try self.rig.input(.bfloat16, &.{ 1, ci(l), ci(hq), 16 }, self.st),
+            try self.rig.input(.float32, &.{ 1, ci(l), ci(hq) }, self.sinks),
+            try self.rig.input(.int32, &.{1}, &.{0}),
+            try self.rig.input(.int32, &.{2}, &.{ @floatFromInt(l), @floatFromInt(shape.k) }),
+            try self.rig.scalar(@floatCast(self.scale)),
+            try self.rig.input(.bfloat16, &.{ 16, NRP }, relp),
+        };
+        return true;
+    }
+
+    pub fn run(self: *Self) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Self) usize {
+        return self.shape.n * self.shape.rows * SG * SD;
+    }
+
+    /// Whether the simdgroup of rows [lo, hi] (its rows below L) sees no key of block kb: all its scores are -inf.
+    fn dead(self: *const Self, off: usize, lo: usize, hi: usize, kb: usize) bool {
+        const c_lo = kb * NBK;
+        return c_lo > off + hi or (self.window > 0 and off + lo >= c_lo + NBK - 1 + self.window);
+    }
+
+    fn emit(self: *const Self, want: []f64, mag: ?[]f64, sim: attn.Sim) !void {
+        const a = self.rig.a;
+        const l = self.shape.n;
+        const s = self.shape.k;
+        const hq = self.shape.rows * SG;
+        const off = s - l;
+        const nk = (s + NBK - 1) / NBK;
+        const keys = try a.alloc(attn.Key, (nk + 1) * NBK);
+        defer a.free(keys);
+        const ends = try a.alloc(usize, nk + 1);
+        defer a.free(ends);
+        const terms = try a.alloc(f64, SD);
+        defer a.free(terms);
+        const o = try a.alloc(f64, SD);
+        defer a.free(o);
+        const eo = try a.alloc(f64, SD);
+        defer a.free(eo);
+        const zero: [SD]f64 = @splat(0);
+        var pc: [16]f64 = undefined;
+        const scale2: f64 = @as(f32, @floatCast(self.scale * LOG2E));
+        for (0..hq) |h| for (0..l) |r| {
+            const kv = h / SG;
+            const q0 = r / NBQ * NBQ;
+            const lo = q0 + (r - q0) / 16 * 16;
+            const hi = @min(lo + 16, l) -| 1;
+            const first_diag = off + q0;
+            const last_diag = off + @min(q0 + NBQ, l) - 1;
+            const first_key = if (self.window > 0) (first_diag + 1) -| self.window else 0;
+            const kb_hi = @min(nk, last_diag / NBK + 1);
+            const at = off + r;
+            const qrow = self.q[(h * l + r) * SD ..][0..SD];
+            const srow = self.st[(r * hq + h) * 16 ..][0..16];
+            var n: usize = 0;
+            var nb: usize = 0;
+            for (first_key / NBK..kb_hi) |kb| {
+                if (self.dead(off, lo, hi, kb)) continue;
+                for (kb * NBK..kb * NBK + NBK) |c| {
+                    const vrow: []const f64 = if (c < s) self.v[(kv * s + c) * SD ..][0..SD] else &zero;
+                    if (c >= s or c > at or (self.window > 0 and at - c >= self.window)) {
+                        keys[n] = .{ .s = -std.math.inf(f64), .on = false, .v = vrow };
+                        n += 1;
+                        continue;
+                    }
+                    const d = attn.dot(qrow, self.k[(kv * s + c) * SD ..][0..SD], scale2, SD + 1, 3, sim, terms);
+                    var b: host.Val = .{ .v = 0 };
+                    if (at - c < R) {
+                        for (&pc, 0..) |*x, i| x.* = self.proj[i * R + at - c];
+                        b = attn.dot(srow, &pc, LOG2E, 17, 0, sim, terms);
+                    }
+                    const sv = d.v + b.v;
+                    keys[n] = .{ .s = sv, .e = d.e + b.e + host.U * @abs(sv), .v = vrow };
+                    n += 1;
+                }
+                ends[nb] = n;
+                nb += 1;
+            }
+            const m0: f64 = @as(f32, @floatCast(self.sinks[r * hq + h] * LOG2E));
+            const row = attn.online(.{ .base2 = true, .p_unit = 0.5 * host.ulpOf(.bfloat16) }, .{ .m = m0, .e = host.U * @abs(m0), .l = 1 }, keys[0..n], ends[0..nb], o, eo);
+            attn.normalize(row, o, eo);
+            const out_at = (r * hq + h) * SD;
+            @memcpy(want[out_at..][0..SD], o);
+            if (mag) |m| for (m[out_at..][0..SD], eo) |*x, e| {
+                x.* = host.allowance(e);
+            };
+        };
+    }
+
+    pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+        try self.emit(want, mag, null);
+    }
+
+    pub fn simulate(self: *const Self, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+        try self.emit(out, null, .{ .acc = acc, .order = order });
+    }
+
+    fn wrapper(self: *Self) ![]const u8 {
+        const ov = @import("../../env.zig").override(.MLX_SERVE_INKLING2_NAX_PREFILL, "1");
+        defer ov.restore();
+        var g = ops.Graph.init(self.rig.a, self.rig.stream());
+        defer g.deinit();
+        const x = self.args;
+        const o = (try kernels.relativeNaxStates(&g, @intCast(self.shape.rows * SG), @intCast(self.shape.rows), x[0], x[1], x[2], x[3], x[8], x[4], @intCast(self.window), @intCast(self.shape.n), @intCast(self.shape.k), R, @floatCast(self.scale))) orelse return error.Declined;
+        return self.rig.bytesOf(&.{o});
     }
 };
 
@@ -2026,6 +2669,309 @@ const mk_pick_sample_launch = markovLaunch("markov_pick_sample", &.{ "PM", "PI",
 fn cint(x: usize) c_int {
     return @intCast(x);
 }
+
+const mk_step_rnn_launch = markovLaunch("markov_step_rnn", &.{ "W", "KAPPA", "ST", "PREV", "TOK", "AT" }, &.{"P"}, false, 0);
+const mk_fold_q8_launch = markovLaunch("markov_fold_q8_row", &.{ "P", "FQ", "FSC", "BASE", "AT", "CAP" }, &.{ "PM", "PI", "PS" }, true, 4 * (256 + 64 + 8 + 8 + 2));
+
+/// Precomputed-kappa Markov RNN step (`markov_step_rnn.metal`): n = rank.
+const MarkovStepRnn = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch = &mk_step_rnn_launch,
+    arena: std.heap.ArenaAllocator,
+    shape: Shape = undefined,
+    w: []f64 = &.{},
+    kappa: []f64 = &.{},
+    st: []f64 = &.{},
+    prev: []f64 = &.{},
+    tok: usize = 0,
+    at: usize = 0,
+    args: [6]mlx.mlx_array = undefined,
+
+    const Self = @This();
+
+    fn init(a: std.mem.Allocator) Self {
+        return .{ .rig = metal.Rig.init(a), .arena = .init(a) };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    pub fn geometry(_: *const Self, shape: Shape) ?metal.Geometry {
+        if (shape.n == 0 or 3 * shape.n * 32 % 256 != 0) return null;
+        var g = metal.Geometry{ .grid = .{ cint(32 * 3 * shape.n), 1, 1 }, .tg = .{ 256, 1, 1 } };
+        g.out(&.{cint(3 * shape.n)}, .float32);
+        g.dtype("T", .bfloat16);
+        g.int("R", cint(shape.n));
+        return g;
+    }
+
+    pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const r = shape.n;
+        self.w = try host.uniform(a, rng, 3 * r * (2 * r), -0.05, 0.05, .bfloat16);
+        self.kappa = try host.uniform(a, rng, MSTEPS * 3 * r, -0.5, 0.5, .float32);
+        self.st = try host.uniform(a, rng, r, -1, 1, .bfloat16);
+        self.prev = try host.uniform(a, rng, MPREV * r, -0.5, 0.5, .bfloat16);
+        self.tok = rng.uintLessThan(usize, MPREV);
+        self.at = rng.uintLessThan(usize, MSTEPS);
+        if (fill == .nonfinite) host.plant(self.w, 3 * r, 2 * r);
+        self.rig.reset();
+        self.args = .{
+            try self.rig.input(.bfloat16, &.{ cint(3 * r), cint(2 * r) }, self.w),
+            try self.rig.input(.float32, &.{ MSTEPS, cint(3 * r) }, self.kappa),
+            try self.rig.input(.bfloat16, &.{ 1, 1, cint(r) }, self.st),
+            try self.rig.input(.bfloat16, &.{ MPREV, cint(r) }, self.prev),
+            try self.rig.input(.int32, &.{1}, &.{@floatFromInt(self.tok)}),
+            try self.rig.input(.int32, &.{1}, &.{@floatFromInt(self.at)}),
+        };
+        return true;
+    }
+
+    pub fn run(self: *Self) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Self) usize {
+        return 3 * self.shape.n;
+    }
+
+    fn emit(self: *const Self, want: []f64, mag: ?[]f64, sim: attn.Sim) !void {
+        const r = self.shape.n;
+        const n = 2 * r;
+        const t = try self.rig.a.alloc(f64, n);
+        defer self.rig.a.free(t);
+        for (want, 0..) |*w, row| {
+            var abs: f64 = 0;
+            for (t, 0..) |*x, c| {
+                const fv = if (c < r) self.st[c] else self.prev[self.tok * r + (c - r)];
+                x.* = self.w[row * n + c] * fv;
+                abs += @abs(x.*);
+            }
+            const s = if (sim) |x| spec.sumIn(x.acc, x.order, t) else host.sum(t);
+            const k = self.kappa[self.at * 3 * r + row];
+            const res = bf(.{ .v = s + k, .e = spec.gamma(@floatFromInt(n + 1), host.U) * (abs + @abs(k)) });
+            w.* = res.v;
+            if (mag) |m| m[row] = if (std.math.isFinite(res.e)) host.allowance(res.e) else 0;
+        }
+    }
+
+    pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+        try self.emit(want, mag, null);
+    }
+
+    pub fn simulate(self: *const Self, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+        try self.emit(out, null, .{ .acc = acc, .order = order });
+    }
+
+    fn wrapper(self: *Self) ![]const u8 {
+        var g = ops.Graph.init(self.rig.a, self.rig.stream());
+        defer g.deinit();
+        const x = self.args;
+        return self.rig.bytesOf(&.{try kernels.markovStepRnn(&g, x[0], x[1], x[2], x[3], x[4], x[5])});
+    }
+};
+
+fn foldQ8Groups(shape: Shape) usize {
+    return (shape.k + 63) / 64;
+}
+
+/// Coalesced per-vocab-row Q8 Markov fold (`markov_fold_q8_row.metal`, MARKOV_Q8): rows = rank, n = padded V, k = real vocab.
+const MarkovFoldQ8 = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch = &mk_fold_q8_launch,
+    arena: std.heap.ArenaAllocator,
+    shape: Shape = undefined,
+    p: []f64 = &.{},
+    fq: []f64 = &.{},
+    fsc: []f64 = &.{},
+    base: []f64 = &.{},
+    at: usize = 0,
+    logit: []host.Val = &.{},
+    note: [200]u8 = undefined,
+    args: [6]mlx.mlx_array = undefined,
+
+    const Self = @This();
+
+    fn init(a: std.mem.Allocator) Self {
+        return .{ .rig = metal.Rig.init(a), .arena = .init(a) };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    pub fn geometry(_: *const Self, shape: Shape) ?metal.Geometry {
+        if (shape.rows == 0 or shape.rows % 4 != 0 or shape.k == 0 or shape.k > shape.n) return null;
+        const ng = cint(foldQ8Groups(shape));
+        var g = metal.Geometry{ .grid = .{ ng * 256, 1, 1 }, .tg = .{ 256, 1, 1 } };
+        g.out(&.{ng}, .float32);
+        g.out(&.{ng}, .uint32);
+        g.out(&.{ng}, .float32);
+        g.dtype("T", .bfloat16);
+        g.int("R", cint(shape.rows));
+        g.int("VOCAB", cint(shape.k));
+        return g;
+    }
+
+    pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const r = shape.rows;
+        const v = shape.n;
+        self.p = try host.uniform(a, rng, 3 * r, -2, 2, .float32);
+        self.fq = try a.alloc(f64, v * r);
+        for (self.fq) |*x| x.* = @floatFromInt(rng.intRangeAtMost(i8, -127, 127));
+        self.fsc = try host.uniform(a, rng, v, 0.0005, 0.003, .float32);
+        self.base = try host.uniform(a, rng, MSTEPS * v, -8, 8, .float32);
+        self.at = rng.uintLessThan(usize, MSTEPS);
+        const row = self.base[self.at * v ..][0..v];
+        switch (fill) {
+            .random => {},
+            .nonfinite => for ([_]usize{ 5, 64 + 9, 128 + 1 }, [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |c, x| {
+                if (c < shape.k) row[c] = x;
+            },
+            .stress => for (0..foldQ8Groups(shape)) |g| {
+                row[@min(shape.k - 1, g * 64 + rng.uintLessThan(usize, 64))] = 48;
+            },
+        }
+        self.logit = try a.alloc(host.Val, shape.k);
+        self.rig.reset();
+        self.args = .{
+            try self.rig.input(.float32, &.{cint(3 * r)}, self.p),
+            try self.rig.input(.int8, &.{ cint(v), cint(r) }, self.fq),
+            try self.rig.input(.float32, &.{cint(v)}, self.fsc),
+            try self.rig.input(.float32, &.{ 1, MSTEPS, cint(v) }, self.base),
+            try self.rig.input(.int32, &.{1}, &.{@floatFromInt(self.at)}),
+            try self.rig.input(.float32, &.{1}, &.{MCAP}),
+        };
+        return true;
+    }
+
+    pub fn run(self: *Self) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Self) usize {
+        return 3 * foldQ8Groups(self.shape);
+    }
+
+    fn logits(self: *Self, sim: attn.Sim) !void {
+        const r = self.shape.rows;
+        const v = self.shape.n;
+        const a = self.rig.a;
+        const lat = try a.alloc(host.Val, r);
+        defer a.free(lat);
+        for (lat, 0..) |*l, i| {
+            const t = std.math.tanh(self.p[2 * r + i]);
+            l.* = bf(.{ .v = t, .e = PRECISE * @abs(t) });
+        }
+        const t = try a.alloc(f64, r);
+        defer a.free(t);
+        for (self.logit, 0..) |*o, c| {
+            var abs: f64 = 0;
+            var flips: f64 = 0;
+            for (t, lat, 0..) |*x, l, i| {
+                x.* = l.v * self.fq[c * r + i];
+                abs += @abs(x.*);
+                flips += l.e * @abs(self.fq[c * r + i]);
+            }
+            const s = if (sim) |x| spec.sumIn(x.acc, x.order, t) else host.sum(t);
+            const scaled = s * self.fsc[c];
+            const se = (spec.gamma(@floatFromInt(r), host.U) * abs + flips) * @abs(self.fsc[c]) + host.U * @abs(scaled);
+            const x = self.base[self.at * v + c] + scaled;
+            o.* = .{ .v = x, .e = se + host.U * @abs(x) };
+        }
+    }
+
+    fn group(self: *const Self, g: usize) struct { at: usize, e: f64, sum: f64 } {
+        const lo = g * 64;
+        const hi = @min(self.shape.k, lo + 64);
+        var best = lo;
+        var e: f64 = 0;
+        for (lo..hi) |c| {
+            if (better(self.logit[c].v, c, self.logit[best].v, best)) best = c;
+            if (std.math.isFinite(self.logit[c].e)) e = @max(e, self.logit[c].e);
+        }
+        var sum: f64 = 0;
+        for (lo..hi) |c| sum += @exp(capped(self.logit[c].v) - capped(self.logit[best].v));
+        return .{ .at = best, .e = e, .sum = sum };
+    }
+
+    fn emit(self: *Self, want: []f64, mag: ?[]f64, sim: attn.Sim) !void {
+        try self.logits(sim);
+        const ng = foldQ8Groups(self.shape);
+        for (0..ng) |g| {
+            const x = self.group(g);
+            want[g] = self.logit[x.at].v;
+            want[ng + g] = @floatFromInt(x.at);
+            want[2 * ng + g] = x.sum;
+            if (mag) |m| {
+                m[g] = host.allowance(x.e);
+                m[ng + g] = 0;
+                m[2 * ng + g] = host.allowance(x.sum * (2 * x.e + PRECISE + spec.gamma(64, host.U)));
+            }
+        }
+    }
+
+    pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+        try @constCast(self).emit(want, mag, null);
+    }
+
+    pub fn simulate(self: *const Self, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+        try @constCast(self).emit(out, null, .{ .acc = acc, .order = order });
+    }
+
+    fn fail(self: *Self, comptime fmt: []const u8, args: anytype) []const u8 {
+        return std.fmt.bufPrint(&self.note, fmt, args) catch "a group breaks the rule";
+    }
+
+    pub fn check(self: *Self, _: spec.Gate) !?[]const u8 {
+        try self.logits(null);
+        const bytes = self.rig.outputBytes();
+        const ng = foldQ8Groups(self.shape);
+        for (0..ng) |g| {
+            const x = self.group(g);
+            const pm = spec.read(.f32, bytes, g);
+            const pi: usize = @intFromFloat(spec.read(.u32, bytes[4 * ng ..], g));
+            const ps = spec.read(.f32, bytes[8 * ng ..], g);
+            const top = self.logit[x.at];
+            if (!std.math.isFinite(top.v)) {
+                if (pi != x.at) return self.fail("group {d}: column {d} where {d} leads", .{ g, pi, x.at });
+                if (std.math.isNan(top.v) != std.math.isNan(pm) or (!std.math.isNan(top.v) and pm != top.v)) return self.fail("group {d}: max {d} where float64 gives {d}", .{ g, pm, top.v });
+                if (std.math.isNan(x.sum) != std.math.isNan(ps)) return self.fail("group {d}: sum {d} where float64 gives {d}", .{ g, ps, x.sum });
+                continue;
+            }
+            if (pi < g * 64 or pi >= @min(self.shape.k, (g + 1) * 64)) return self.fail("group {d}: column {d} outside it", .{ g, pi });
+            const mine = self.logit[pi];
+            if (!(mine.v + mine.e + x.e >= top.v)) return self.fail("group {d}: column {d} ({d}) where {d} leads ({d})", .{ g, pi, mine.v, x.at, top.v });
+            if (!(@abs(pm - mine.v) <= mine.e + 0x1p-24 * @abs(mine.v))) return self.fail("group {d}: max {d} where its column's logit is {d}", .{ g, pm, mine.v });
+            var sum: f64 = 0;
+            for (g * 64..@min(self.shape.k, (g + 1) * 64)) |c| sum += @exp(capped(self.logit[c].v) - capped(mine.v));
+            if (!(@abs(ps - sum) <= sum * (2 * x.e + PRECISE + spec.gamma(64, host.U)))) return self.fail("group {d}: sum {d} where float64 gives {d}", .{ g, ps, sum });
+        }
+        return null;
+    }
+
+    fn wrapper(self: *Self) ![]const u8 {
+        var g = ops.Graph.init(self.rig.a, self.rig.stream());
+        defer g.deinit();
+        const x = self.args;
+        return self.rig.bytesOf(&(try kernels.markovFoldQ8Row(&g, x[0], x[1], x[2], x[3], x[4], @intCast(self.shape.k), x[5], .bfloat16)));
+    }
+};
+
 
 /// `x` rounded to bf16 where the device holds it within `e` of it.
 fn bf(x: host.Val) host.Val {
@@ -3309,7 +4255,8 @@ fn sum64(x: []const f64) f64 {
 
 /// The visit's weighted RMS norms (`kernels.norm`): a later pass's three attention inputs, or the MLP input with the
 /// router's scores over it; rows x streams x hidden.
-fn Norm(comptime dt: mlx.mlx_dtype, comptime routed: bool) type {
+/// `one_tg`: STREAM_ROW's grid, one threadgroup a row (`kernels.streamRow`, a prompt's rows).
+fn Norm(comptime dt: mlx.mlx_dtype, comptime routed: bool, comptime one_tg: bool) type {
     return struct {
         const Self = @This();
         const J: usize = if (routed) 1 else 3;
@@ -3338,7 +4285,7 @@ fn Norm(comptime dt: mlx.mlx_dtype, comptime routed: bool) type {
             const tg = kernels.streamGroup(@intCast(shape.k)) orelse return null;
             const d: c_int = @intCast(shape.k);
             const extra: c_int = if (routed) @divTrunc(@as(c_int, E) * 32 + tg - 1, tg) * tg else 0;
-            var geo = metal.Geometry{ .grid = .{ d + extra, @intCast(shape.rows), 1 }, .tg = .{ tg, 1, 1 } };
+            var geo = metal.Geometry{ .grid = .{ (if (one_tg) tg else d) + extra, @intCast(shape.rows), 1 }, .tg = .{ tg, 1, 1 } };
             geo.out(&.{ @intCast(J), @intCast(shape.rows), d }, dt);
             if (routed) geo.out(&.{ @intCast(shape.rows), @intCast(E) }, .float32) else {
                 geo.out(&.{1}, .float32);
@@ -3349,6 +4296,7 @@ fn Norm(comptime dt: mlx.mlx_dtype, comptime routed: bool) type {
             geo.int("D", d);
             geo.int("J", @as(c_int, J));
             geo.int("E", @as(c_int, E));
+            geo.int("ROW", @intFromBool(one_tg));
             return geo;
         }
 
@@ -3408,6 +4356,8 @@ fn Norm(comptime dt: mlx.mlx_dtype, comptime routed: bool) type {
             defer a.free(normed);
             const terms = try a.alloc(f64, d);
             defer a.free(terms);
+            const flips = try a.alloc(f64, d);
+            defer a.free(flips);
             for (0..J) |j| for (0..s) |r| {
                 const row = self.y[(j * s + r) * d ..][0..d];
                 for (sq, row) |*q, v| q.* = v * v;
@@ -3417,13 +4367,27 @@ fn Norm(comptime dt: mlx.mlx_dtype, comptime routed: bool) type {
                 if (!routed or j != 0) continue;
                 // The router reads the normed row as the stream holds it.
                 for (normed, row, self.nw[0]) |*n, v, w| n.* = spec.roundTo(elemOf(dt), v * inv * w);
+                // The kernel rounds its own normed row: y times its f32 rsqrt of an f32 sum, times the weight. An
+                // element within that path's relative error `eps` of a rounding midpoint can round to the other
+                // neighbour; `flips` holds each such element's step (0 elsewhere), and every score's bound takes
+                // those steps times the router's weights on top of its sum's.
+                const g24 = spec.gamma(@floatFromInt(d), 0x1p-24);
+                const eps = g24 + 4 * 0x1p-24;
+                for (flips, row, self.nw[0], normed) |*f, v, w, n| {
+                    const x = v * inv * w;
+                    const lo = spec.roundTo(elemOf(dt), x * (1 - eps));
+                    const hi = spec.roundTo(elemOf(dt), x * (1 + eps));
+                    f.* = @max(@abs(lo - n), @abs(hi - n));
+                }
                 for (0..E) |ex| {
                     for (terms, normed, self.rt[ex * d ..][0..d]) |*t, n, q| t.* = n * q;
                     want[nx + r * E + ex] = if (acc) |ac| spec.sumIn(ac, order, terms) else sum64(terms);
                     if (mag) |m| {
                         var abs: f64 = 0;
                         for (terms) |t| abs += @abs(t);
-                        m[nx + r * E + ex] = if (std.math.isFinite(abs)) abs else 0;
+                        var step: f64 = 0;
+                        for (flips, self.rt[ex * d ..][0..d]) |f, q| step += f * @abs(q);
+                        m[nx + r * E + ex] = if (std.math.isFinite(abs) and std.math.isFinite(step)) abs + step / g24 else 0;
                     }
                 }
             };
@@ -3447,6 +4411,8 @@ fn Norm(comptime dt: mlx.mlx_dtype, comptime routed: bool) type {
             cfg.hidden_size = @intCast(self.shape.k);
             cfg.num_experts = @intCast(EXPERTS);
             cfg.rms_norm_eps = NORM_EPS;
+            const ov = @import("../../env.zig").override(.MLX_SERVE_INKLING2_STREAM_ROW, if (one_tg) "1" else "0");
+            defer ov.restore();
             const x = self.args;
             const o = try kernels.norm(&g, &cfg, x[0], .{ x[1], x[2], x[3] }, @intCast(J), dt, if (routed) x[4] else null);
             return self.rig.bytesOf(if (routed) &.{ o[0], o[1] } else &.{o[0]});
@@ -3471,6 +4437,12 @@ const dtypes = [_]mlx.mlx_dtype{ .bfloat16, .float32 };
 fn name(comptime what: []const u8, comptime dt: mlx.mlx_dtype) []const u8 {
     return what ++ (if (dt == .bfloat16) " bf16" else " f32");
 }
+
+/// The Markov kernels' gate-4 sums.
+const markov_sums: spec.Sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "the outputs round to bf16 or pass an exp: the stress inputs check the fp32 sums within the float64 bound" };
+
+/// The split reads' gate-4 sums: the softmax's exp leaves no sum exact.
+const split_sums: spec.Sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "the softmax's exp leaves no sum exact: the stress inputs check the fp32 sums within the float64 bound" };
 
 pub fn register(set: *kc.Set) !void {
     try set.add(Act, .init(set.a), .{
@@ -3553,7 +4525,6 @@ pub fn register(set: *kc.Set) !void {
             .served = &.{ .{ .rows = 8, .n = 1031, .k = 1024 }, .{ .rows = 8, .n = 4104, .k = 0 }, .{ .rows = kernels.small_rows, .n = 1055, .k = 1024 }, .{ .rows = 2, .n = 2, .k = 1024 } },
         }, null);
     }
-    const split_sums: spec.Sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "the softmax's exp leaves no sum exact: the stress inputs check the fp32 sums within the float64 bound" };
     // 4 and 8 rows behind a sliding layer's window and a global layer's keys; 8 KV heads of 3 query heads.
     try set.add(RelSplit, .init(set.a, 1024, false), .{
         .name = "inkling2 relsplit bf16 (sliding 1024)",
@@ -3594,7 +4565,7 @@ pub fn register(set: *kc.Set) !void {
     }, null);
     // A prompt's rows on the tensor unit: a sliding window's tiles and a global layer's, both dtypes the kernel serves.
     inline for (.{ .{ mlx.mlx_dtype.bfloat16, "bf16" }, .{ mlx.mlx_dtype.float16, "f16" } }) |d| inline for (.{ .{ 1024, "sliding 1024" }, .{ 0, "global" } }) |w| {
-        try set.add(RelNax, .init(set.a, d[0], w[0]), .{
+        try set.add(RelattnNax, .init(set.a, d[0], w[0]), .{
             .name = "inkling2 relattn_nax " ++ d[1] ++ " (" ++ w[1] ++ ")",
             .accum = .none,
             .depth = host.depthOne,
@@ -3626,7 +4597,6 @@ pub fn register(set: *kc.Set) !void {
         .served = &.{ .{ .rows = 8, .n = 1031, .k = 1024 }, .{ .rows = 8, .n = 4104, .k = 0 }, .{ .rows = 2, .n = 300, .k = 0 } },
         .sums = split_sums,
     }, null);
-    const markov_sums: spec.Sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "the outputs round to bf16 or pass an exp: the stress inputs check the fp32 sums within the float64 bound" };
     // The release's drafter: rank 256, hidden 2304, 201024 head rows (the fold's real vocab 200058, 98 groups).
     try set.add(MarkovRnn, .init(set.a), .{
         .name = "inkling2 markov_rnn bf16",
@@ -3730,7 +4700,7 @@ pub fn register(set: *kc.Set) !void {
         .served = &.{ .{ .rows = 8, .n = EXPERTS, .k = 2304 }, .{ .rows = 2, .n = EXPERTS, .k = 2304 }, .{ .rows = kernels.small_rows, .n = EXPERTS, .k = 2304 } },
     }, null);
     inline for (dtypes) |dt| {
-        try set.add(Norm(dt, false), .init(set.a), .{
+        try set.add(Norm(dt, false, false), .init(set.a), .{
             .name = name("inkling2 norm (three streams)", dt),
             .accum = .f32,
             .depth = rowLength,
@@ -3741,7 +4711,7 @@ pub fn register(set: *kc.Set) !void {
             .served = &.{ .{ .rows = 1, .n = 3, .k = 2304 }, .{ .rows = 8, .n = 3, .k = 2304 }, .{ .rows = 512, .n = 3, .k = 2304 } },
             .sums = .{ .f16 = 32, .bf16 = 0, .why = "positive squares: a pairwise bf16 sum stays near the output's rounding" },
         }, null);
-        try set.add(Norm(dt, true), .init(set.a), .{
+        try set.add(Norm(dt, true, false), .init(set.a), .{
             .name = name("inkling2 norm (MLP input + router)", dt),
             .accum = .f32,
             .depth = rowLength,
@@ -3753,11 +4723,86 @@ pub fn register(set: *kc.Set) !void {
             .sums = .{ .f16 = 32, .bf16 = 0, .why = "positive squares: a pairwise bf16 sum stays near the output's rounding" },
         }, null);
     }
+    try set.add(PrepStrided, .init(set.a), .{
+        .name = "inkling2 prep bf16 (a joined projection's parts in place)",
+        .accum = .none,
+        .depth = none,
+        .out = .bf16,
+        .outs = prep_outs,
+        .replaces = "prep on contiguous copies",
+        .nan = .{ .stated = "the contiguous kernel's bytes" },
+        // A draft verify's 8 rows, a sliding and a global one-row read, a short prompt chunk.
+        .served = &.{ .{ .rows = 8, .n = 0, .k = R }, .{ .rows = 1, .n = 1024, .k = R }, .{ .rows = 1, .n = 4104, .k = R }, .{ .rows = 64, .n = 0, .k = R } },
+    }, null);
+    // GATE_MM: a prompt chunk's three attention-input gates at 64-row tiles, 128 rows and a ragged 100.
+    inline for (.{ .float32, .bfloat16 }) |wt| try set.add(GateMm, .init(set.a, wt), .{
+        .name = if (wt == .float32) "inkling2 gate_mm (a prompt chunk, f32 projections)" else "inkling2 gate_mm (a prompt chunk, bf16 projections)",
+        .accum = .f32,
+        .depth = rankDepth,
+        .ops = 6,
+        .out = .f32,
+        .served = &.{ .{ .rows = 3, .n = 128, .k = 2304 }, .{ .rows = 3, .n = 100, .k = 2304 } },
+        .sums = .{ .f16 = 16, .exact = false, .why = "a half sum drops only the few small terms it meets beside the one" },
+    }, null);
     // Every affine width a pack's attention may carry at g64, 4-bit at g32 and g128, and the release's dense bf16.
+    // STREAM_ROW: a prompt chunk's three attention-input norms and its MLP input with the router, one threadgroup a row.
+    try set.add(Norm(.bfloat16, false, true), .init(set.a), .{
+        .name = "inkling2 norm bf16 (three streams, one threadgroup a row)",
+        .accum = .f32,
+        .depth = rowLength,
+        .ops = 6,
+        .out = .bf16,
+        .served = &.{ .{ .rows = 64, .n = 3, .k = 2304 }, .{ .rows = 512, .n = 3, .k = 2304 } },
+        .sums = .{ .f16 = 32, .bf16 = 0, .why = "positive squares: a pairwise bf16 sum stays near the output's rounding" },
+    }, null);
+    try set.add(Norm(.bfloat16, true, true), .init(set.a), .{
+        .name = "inkling2 norm bf16 (MLP input + router, one threadgroup a row)",
+        .accum = .f32,
+        .depth = rowLength,
+        .ops = 6,
+        .out = .bf16,
+        .outs = &.{ .{ .elem = .bf16, .count = normsOf }, .{ .elem = .f32, .count = scoresOf } },
+        .served = &.{ .{ .rows = 64, .n = 1, .k = 2304 }, .{ .rows = 512, .n = 1, .k = 2304 } },
+        .sums = .{ .f16 = 32, .bf16 = 0, .why = "positive squares: a pairwise bf16 sum stays near the output's rounding" },
+    }, null);
+    // NAX_PREFILL with BIAS_IN_ATTN, a sliding (1024) and a global layer: 9 ragged rows behind 1,291 keys (one simdgroup
+    // of four holds rows), 100 rows (a remainder of 64) and 256 (whole threadgroups), ragged keys.
+    inline for (.{ 1024, 0 }) |window| try set.add(RelNax, .init(set.a, window), .{
+        .name = if (window > 0) "inkling2 relnax bf16 (in-read bias, sliding 1024)" else "inkling2 relnax bf16 (in-read bias, global)",
+        .nax = true,
+        .accum = .f32,
+        .depth = host.depthOne,
+        .out = .bf16,
+        .tiles = .{ .{}, .{ .size = NBQ, .min = 2 }, .{} },
+        .served = if (window > 0) &.{ .{ .rows = 8, .n = 9, .k = 1300 }, .{ .rows = 8, .n = 100, .k = 1123 }, .{ .rows = 8, .n = 256, .k = 1279 } } else &.{ .{ .rows = 8, .n = 9, .k = 1300 }, .{ .rows = 8, .n = 100, .k = 1200 }, .{ .rows = 8, .n = 256, .k = 1290 } },
+        .sums = .{ .exact = false },
+    }, null);
     inline for (.{ 2, 3, 4, 5, 6, 8 }) |bits| try set.add(OProj, .init(set.a, bits, 64), oprojSpec(std.fmt.comptimePrint("inkling2 oproj bf16 ({d}-bit g64)", .{bits}), 64, .{}), null);
     try set.add(OProj, .init(set.a, 4, 32), oprojSpec("inkling2 oproj bf16 (4-bit g32)", 32, .{ .f16 = 40, .why = "stress codes under 16 in groups of 32: an fp16 sum misses by ~45x, short of 100x but far past fp32's exact sums" }), null);
     try set.add(OProj, .init(set.a, 4, 128), oprojSpec("inkling2 oproj bf16 (4-bit g128)", 128, .{}), null);
     try set.add(OProj, .init(set.a, 0, 16), oprojSpec("inkling2 oproj bf16 (dense)", 16, .{}), null);
+    // MARKOV_Q8's two kernels (the step's RNN over the precomputed context, the 8-bit fold).
+    try set.add(MarkovStepRnn, .init(set.a), .{
+        .name = "inkling2 markov_step_rnn bf16",
+        .accum = .f32,
+        .depth = host.depthOne,
+        .out = .f32,
+        .served = &.{.{ .rows = 1, .n = 256, .k = 1 }},
+        .sums = markov_sums,
+    }, null);
+    try set.add(MarkovFoldQ8, .init(set.a), .{
+        .name = "inkling2 markov_fold_q8_row bf16",
+        .accum = .f32,
+        .depth = host.depthOne,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .f32, .count = foldQ8Groups }, .{ .elem = .u32, .count = foldQ8Groups }, .{ .elem = .f32, .count = foldQ8Groups } },
+        .nan = .{ .stated = "MLX's argmax order: a NaN logit is a group's pick, its max and sum NaN" },
+        .served = &.{ .{ .rows = 256, .n = 4096, .k = 4000 }, .{ .rows = 256, .n = 512, .k = 512 } },
+        .sums = markov_sums,
+    }, null);
+    try rounds_contract.register(set);
+    try group_contract.register(set);
+    try trunk_contract.register(set);
     try vision_contract.register(set);
 }
 
@@ -3793,20 +4838,22 @@ test "kernel contract inkling2: each declared launch is the shipped wrapper's, b
             try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
         }
     };
-    inline for (.{ RelSplit, RelSplit, RelSplit, RelSplit, RelNax, RelNax, RelNax, RelNax, RelComb, RelSlots, MarkovRnn, MarkovFold, MarkovPick, MarkovFoldBatch(2), MarkovFoldBatch(4), MarkovFoldBatch(9), MarkovPickBatch(4), MarkovPickSample(4), Gate, Router, Norm(.bfloat16, false), Norm(.bfloat16, true), Norm(.float32, false), Norm(.float32, true) }) |T| {
+    inline for (.{ RelSplit, RelSplit, RelSplit, RelSplit, RelattnNax, RelattnNax, RelattnNax, RelattnNax, RelComb, RelSlots, MarkovRnn, MarkovFold, MarkovPick, MarkovFoldBatch(2), MarkovFoldBatch(4), MarkovFoldBatch(9), MarkovPickBatch(4), MarkovPickSample(4), Gate, Router, Norm(.bfloat16, false, false), Norm(.bfloat16, true, false), Norm(.float32, false, false), Norm(.float32, true, false), PrepStrided, GateMm, GateMm, Norm(.bfloat16, false, true), Norm(.bfloat16, true, true), RelNax, RelNax }) |T| {
         const k = set.kernels.items[at];
         at += 1;
-        // Off NAX the tensor-unit read is not dispatched.
-        const served = T != RelNax or @import("../../mlx/device.zig").naxAvailable();
-        const p: *T = @ptrCast(@alignCast(k.ctx));
-        if (served) for (k.spec.served) |shape| {
-            try std.testing.expect(try p.prepare(shape, .random, 7));
-            try p.run();
-            const ours = try a.dupe(u8, p.rig.outputBytes());
-            defer a.free(ours);
-            try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
-        };
+        // The tensor-unit read runs where the engine calls it.
+        if (!k.spec.nax or @import("../../mlx/device.zig").naxAvailable()) {
+            const p: *T = @ptrCast(@alignCast(k.ctx));
+            for (k.spec.served) |shape| {
+                try std.testing.expect(try p.prepare(shape, .random, 7));
+                try p.run();
+                const ours = try a.dupe(u8, p.rig.outputBytes());
+                defer a.free(ours);
+                try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
+            }
+        }
     }
+    // After the output projections (bounded by name): MARKOV_Q8's two cases, the speculative rounds' kernels, the vision tower's.
     var end = at;
     while (end < set.kernels.items.len and std.mem.startsWith(u8, set.kernels.items[end].spec.name, "inkling2 oproj")) end += 1;
     for (set.kernels.items[at..end]) |k| {
@@ -3819,7 +4866,35 @@ test "kernel contract inkling2: each declared launch is the shipped wrapper's, b
             try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
         }
     }
-    try vision_contract.checkWrappers(a, set.kernels.items[end..]);
+    at = end;
+    inline for (.{ MarkovStepRnn, MarkovFoldQ8 }) |T| {
+        const k = set.kernels.items[at];
+        at += 1;
+        const p: *T = @ptrCast(@alignCast(k.ctx));
+        for (k.spec.served) |shape| {
+            try std.testing.expect(try p.prepare(shape, .random, 7));
+            try p.run();
+            const ours = try a.dupe(u8, p.rig.outputBytes());
+            defer a.free(ours);
+            try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
+        }
+    }
+    var rset = kc.Set.init(a);
+    defer rset.deinit();
+    try rounds_contract.register(&rset);
+    try rounds_contract.checkWrappers(a, set.kernels.items[at..][0..rset.kernels.items.len]);
+    at += rset.kernels.items.len;
+    var gset = kc.Set.init(a);
+    defer gset.deinit();
+    try group_contract.register(&gset);
+    try group_contract.checkWrappers(set.kernels.items[at..][0..gset.kernels.items.len]);
+    at += gset.kernels.items.len;
+    var tset = kc.Set.init(a);
+    defer tset.deinit();
+    try trunk_contract.register(&tset);
+    try trunk_contract.checkWrappers(set.kernels.items[at..][0..tset.kernels.items.len]);
+    at += tset.kernels.items.len;
+    try vision_contract.checkWrappers(a, set.kernels.items[at..]);
 }
 
 // Bar: gates 1-4 on this area alone (the registry's sharded test runs them with every other area).
@@ -3832,6 +4907,29 @@ test "kernel contract inkling2: gates 1-4 pass" {
     var t: kc.gates.Tally = .{};
     try kc.gates.runAll(a, set.kernels.items, 0xc0de, &t);
     try std.testing.expectEqual(@as(usize, 0), t.problems());
-    // Off NAX the tensor-unit reads skip.
-    try std.testing.expectEqual(set.kernels.items.len, t.passed + t.skipped);
+    // Off NAX the tensor-unit reads skip; every planted control went red.
+    try std.testing.expectEqual(set.kernels.items.len, t.passed + t.skipped + t.caught);
+}
+
+// Bar: the norm at one threadgroup a row (STREAM_ROW) writes the bytes the norm at D / TG threadgroups a row writes, on
+// the same inputs: a prompt chunk's three streams and its MLP input with the router, 512 rows, random and stress fills.
+test "kernel contract inkling2: the norm at one threadgroup a row is the three-threadgroup norm's bytes" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    inline for (.{ false, true }) |routed| {
+        var three = Norm(.bfloat16, routed, false).init(a);
+        defer three.deinit();
+        var row1 = Norm(.bfloat16, routed, true).init(a);
+        defer row1.deinit();
+        const shape: Shape = .{ .rows = 512, .n = if (routed) 1 else 3, .k = 2304 };
+        for ([_]spec.Fill{ .random, .stress }) |fill| for ([_]u64{ 7, 0xc0de }) |seed| {
+            try std.testing.expect(try three.prepare(shape, fill, seed));
+            try three.run();
+            const want = try a.dupe(u8, three.rig.outputBytes());
+            defer a.free(want);
+            try std.testing.expect(try row1.prepare(shape, fill, seed));
+            try row1.run();
+            try std.testing.expectEqualSlices(u8, want, row1.rig.outputBytes());
+        };
+    }
 }

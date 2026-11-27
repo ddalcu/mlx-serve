@@ -7,7 +7,8 @@
 // its own). Static convs take KW, VW [C, KT, 1] (WT) and round their sum to WT as the conv op does; dynamic ones (DYN)
 // take KW, VW [KT, C] (WT) plus each head's projected taps KDY, VDY [1, S, HKV * KT] (T), tap `lag` on the input
 // `lag` rows back. QS [H, HD] and RS [H, DREL] (S) scale q and the relative states before their L2 clips.
-// PR = { qk clip, rel clip, eps, tau, conv scale, KV }.
+// PR = { qk clip, rel clip, eps, tau, conv scale, KV }. QP, GP, RP, KP and VP are read by their row strides (unit
+// last stride): a joined projection's parts arrive as views.
 // Q [1, S, H, HD] T (clipped, times tau), GATE [S * H * HD] f32 (sigmoid), K, V [1, HKV, S, HD] T (conv, then the L2
 // clip or the unweighted RMS norm). The tail is, WIDE: REL [1, S, H, DREL] T, the clipped relative states; else (one
 // row): BIAS [1, H, 1, KV] T, the row's additive bias over its KV keys, the newest last (the clipped states through
@@ -23,11 +24,12 @@ const uint C = HKV * HD;
 const uint R = RJ_shape[1];
 const uint SW = ST_shape[2];
 const float qk_thr = PR[0], rel_thr = PR[1], eps = PR[2], tau = PR[3], cs = PR[4];
+const uint QRS = QP_strides[1], GRS = GP_strides[1], RRS = RP_strides[1], KRS = KP_strides[1], VRS = VP_strides[1];
 threadgroup float buf[HD];
 threadgroup float n2_sh;
 if (i < QD) {
     const uint at = row * QD + i;
-    const float mine = float(QP[at]) * float(QS[i]);
+    const float mine = float(QP[row * QRS + i]) * float(QS[i]);
     buf[t] = mine * mine;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (t == 0) {
@@ -41,7 +43,7 @@ if (i < QD) {
     T q = T(mine * f);
     if (tau != 1.0f) q = T(float(q) * tau);
     Q[at] = q;
-    GATE[at] = 1.0f / (1.0f + exp(-float(GP[at])));
+    GATE[at] = 1.0f / (1.0f + exp(-float(GP[row * GRS + i])));
     return;
 }
 uint r = i - QD;
@@ -50,7 +52,7 @@ if (r < 2 * C) {
     const uint c = is_v ? r - C : r;
     const uint h = c / HD;
     const uint off = is_v ? C : 0u;
-    const float x = float(is_v ? VP[row * C + c] : KP[row * C + c]);
+    const float x = float(is_v ? VP[row * VRS + c] : KP[row * KRS + c]);
     const uint slot = row / RPS;
     float y = 0.0f;
     for (uint j = 0; j < KT; j++) {
@@ -64,7 +66,7 @@ if (r < 2 * C) {
         }
         float wv = x;
         if (p < 0) wv = ST[(slot * (KT - 1) + uint(int(KT - 1) + p)) * SW + off + c];
-        else if (j + 1 < KT) wv = float(is_v ? VP[(slot * RPS + uint(p)) * C + c] : KP[(slot * RPS + uint(p)) * C + c]);
+        else if (j + 1 < KT) wv = float(is_v ? VP[(slot * RPS + uint(p)) * VRS + c] : KP[(slot * RPS + uint(p)) * KRS + c]);
         float wt;
         if (DYN) {
             const uint lag = KT - 1 - j;
@@ -104,19 +106,20 @@ if (!WIDE) {
     }
 }
 const uint rp = row * H * DREL + h * DREL;
+const uint rin = row * RRS + h * DREL;
 float n2 = 0.0f;
 for (uint j = 0; j < DREL; j++) {
-    const float v = float(RP[rp + j]) * float(RS[h * DREL + j]);
+    const float v = float(RP[rin + j]) * float(RS[h * DREL + j]);
     n2 += v * v;
 }
 const float f = min(rel_thr / (sqrt(n2) + 1e-6f), 1.0f);
 if (WIDE) {
     const uint j = r % DREL;
-    REL[rp + j] = T(float(RP[rp + j]) * float(RS[h * DREL + j]) * f);
+    REL[rp + j] = T(float(RP[rin + j]) * float(RS[h * DREL + j]) * f);
     return;
 }
 const uint col = r % KV;
 const uint d = col + R - KV;
 float acc = 0.0f;
-for (uint j = 0; j < DREL; j++) acc += float(T(float(RP[rp + j]) * float(RS[h * DREL + j]) * f)) * RJ[j * R + d];
+for (uint j = 0; j < DREL; j++) acc += float(T(float(RP[rin + j]) * float(RS[h * DREL + j]) * f)) * RJ[j * R + d];
 BIAS[r] = T(acc * tau);

@@ -502,7 +502,8 @@ pub fn route(g: *Graph, L: *const Layer, cfg: *const Config, x: Array) !Route {
 /// A call's (row, pick) pairs as the banks read them: `rows` `[N, 1, D]` (or one row broadcast over its picks) and
 /// their experts `sel` `[N]`. From `sort_from` pairs on they are sorted by expert, so a wide call reads one bank at
 /// a time (mlx-lm's `_gather_sort`), with `inverse` the place of pair (row, pick) in that order.
-pub const Pairs = struct { rows: Array, sel: Array, inverse: ?Array };
+/// `token`: a sorted pair's row (the gather's row map), set where they are sorted.
+pub const Pairs = struct { rows: Array, sel: Array, inverse: ?Array, token: ?Array = null };
 
 pub fn pairs(g: *Graph, cfg: *const Config, x: Array, idx: Array) !Pairs {
     const sh = ops.shape(x);
@@ -522,6 +523,7 @@ pub fn pairs(g: *Graph, cfg: *const Config, x: Array, idx: Array) !Pairs {
         .sel = try g.take(flat, order, 0),
         .rows = try g.reshape(try g.take(try g.reshape(x, &.{ s, d }), token, 0), &.{ n, 1, d }),
         .inverse = try g.argsort(order, 0),
+        .token = token,
     };
 }
 

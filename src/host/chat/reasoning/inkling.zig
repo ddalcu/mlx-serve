@@ -70,5 +70,56 @@ pub fn splitInklingChannels(text: []const u8) ?ThinkSplit {
     if (std.mem.startsWith(u8, t, INKLING_TEXT_TAG)) {
         return .{ .reasoning_content = null, .content = inklingTrimContentTail(t[INKLING_TEXT_TAG.len..]) };
     }
+    // A thinking-off prompt committed the text message (`contentChannelTail`): the answer has no
+    // marker and ends at its `<|end_message|>`. A tool call message is left to the tool parser.
+    if (std.mem.indexOf(u8, t, INKLING_END_TAG)) |em| {
+        if (std.mem.indexOf(u8, t[0..em], INKLING_INVOKE_TAG) == null)
+            return .{ .reasoning_content = null, .content = inklingTrimContentTail(t) };
+    }
     return null;
+}
+
+// ── tests ──
+
+const testing = std.testing;
+const modelThinkOpener = @import("think_tags.zig").modelThinkOpener;
+const splitThinkBlock = @import("split.zig").splitThinkBlock;
+
+/// What the chat stream's plain arm (no tools, no prompt-opened block) does with each token before a
+/// think block opens: the visible bytes it sends, and whether a model opener latched the block.
+const PlainArm = struct { visible: []const u8, latched: bool };
+
+fn replayPlainArm(buf: []u8, tokens: []const []const u8) PlainArm {
+    var n: usize = 0;
+    for (tokens) |tt| {
+        if (n == 0 and modelThinkOpener(false, tt) != null) return .{ .visible = buf[0..n], .latched = true };
+        if (isChannelMarkerToken(tt)) continue;
+        @memcpy(buf[n..][0..tt.len], tt);
+        n += tt.len;
+    }
+    return .{ .visible = buf[0..n], .latched = false };
+}
+
+test "an answer in a committed Inkling text message streams and splits as the same content" {
+    var buf: [64]u8 = undefined;
+    const answer = [_][]const u8{ "The answer", " is 4.", INKLING_END_TAG };
+    const arm = replayPlainArm(&buf, &answer);
+    try testing.expect(!arm.latched);
+    try testing.expectEqualStrings("The answer is 4.", arm.visible);
+    const split = splitThinkBlock("The answer is 4.<|end_message|>", true, false);
+    try testing.expect(split.reasoning_content == null);
+    try testing.expectEqualStrings("The answer is 4.", split.content);
+
+    // Cut by max_tokens before its <|end_message|>.
+    const cut = replayPlainArm(&buf, answer[0..2]);
+    try testing.expectEqualStrings("The answer is 4.", cut.visible);
+    try testing.expectEqualStrings("The answer is 4.", splitThinkBlock("The answer is 4.", true, false).content);
+
+    // A later message the stop token did not end is not part of the answer.
+    try testing.expectEqualStrings("4", splitThinkBlock("4<|end_message|><|message_model|><|content_thinking|>x", true, false).content);
+}
+
+test "an Inkling tool call message is left to the tool parser" {
+    try testing.expect(splitInklingChannels("<|message_model|>get_time<|content_invoke_tool_json|>{\"args\":{},\"name\":\"get_time\"}<|end_message|>") == null);
+    try testing.expect(splitInklingChannels("get_time<|content_invoke_tool_json|>{\"args\":{}}") == null);
 }

@@ -321,11 +321,13 @@ content, any other recipient is an ATEM tool call (raw string values, JSON keeps
 tests, `tests/test_muse_glimmer.sh`.
 
 ### Thinking-off is enforced in the prompt; reasoning is always delivered
-Defect: thinking-off on Muse and LFM2.5 still generated the whole reasoning pass, then discarded it. Fix:
-`noThinkTailSuffix` commits ` to=user<|message|>` (Muse, no tools) or `</think>` (an unconditional opener) at the
-render's tail; every delivery site splits with `splitThinkBlock(text, true, …)` and ships whatever reasoning exists.
-`splitMuseChannels` classifies the eom-cut body, not the raw chunk (it once dropped the whole answer). Guard: the
-render tail-commit tests, `tests/test_muse_glimmer.sh` [2]/[2b].
+Defect: thinking-off on Muse and LFM2.5 still generated the whole reasoning pass, then discarded it; Inkling 2 at
+effort 0 thought through all of `max_tokens` on a coding prompt. Fix: `noThinkTailSuffix` commits
+` to=user<|message|>` (Muse, no tools), `<|message_model|><|content_text|>` (Inkling, no tools) or `</think>` (an
+unconditional opener) at the render's tail; every delivery site splits with `splitThinkBlock(text, true, …)` and ships
+whatever reasoning exists. `splitMuseChannels` classifies the eom-cut body, not the raw chunk (it once dropped the whole
+answer); `splitInklingChannels` cuts a markerless answer at its `<|end_message|>`. Guard: the render tail-commit tests,
+corpus `Inkling thinking-off without tools`, `tests/test_muse_glimmer.sh` [2]/[2b].
 
 ### Assistant-history reasoning must round-trip (Laguna)
 Defect: Laguna thought on turn 1 and never again in a pi session. Cause: `chat.Message` had no `reasoning_content`, so

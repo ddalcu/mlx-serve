@@ -513,7 +513,9 @@ Used in mlx-serve:
   * `src/plugins/inkling2/kernels/relattn.metal` ports the `relative_attention`
     kernel of the Inkling 2 model (`mlx_lm/models/inkling2/kernels.py`,
     https://github.com/ml-explore/mlx-lm/pull/2086); `relsplit.metal` and
-    `relslots.metal` split that kernel's read over the keys and over slots.
+    `relslots.metal` split that kernel's read over the keys and over slots;
+    `relative_attention_nax.metal` (Stéphane Busso's, from his inkling2-final
+    branch of PR 1261) runs MLX's NAX attention loop with that kernel's score.
 
 Modifications by mlx-serve: reimplemented in Zig against mlx-c, and the GDN
 kernel is extended by a sequence variant (`GDN_KERNEL_SEQ_SOURCE`) that records

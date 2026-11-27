@@ -8,6 +8,9 @@ const BARE_THINK_OPENER = @import("muse.zig").BARE_THINK_OPENER;
 const INKLING_THINKING_TAG = @import("inkling.zig").INKLING_THINKING_TAG;
 const splitThinkBlock = @import("split.zig").splitThinkBlock;
 const nextThinkOpen = @import("split.zig").nextThinkOpen;
+const INKLING_MODEL_TAG = @import("inkling.zig").INKLING_MODEL_TAG;
+const INKLING_TEXT_TAG = @import("inkling.zig").INKLING_TEXT_TAG;
+const INKLING_END_TAG = @import("inkling.zig").INKLING_END_TAG;
 
 /// The FIRST unclosed think/thought opener: the earliest `<|channel>thought`
 /// or `<think>` in `text` with no matching close tag anywhere after it.
@@ -311,6 +314,8 @@ pub fn promptThinkTailClass(tail: []const u8) ThinkTailClass {
 ///     the header (` to=user<|message|>`, byte-exactly what the template
 ///     renders for history content turns) makes `to=self` unreachable. Never
 ///     with tools — a tool call is a `to=<fn>` header.
+///   • Inkling: effort 0 is only a hint, so commit `<|message_model|><|content_text|>`. Never
+///     with tools — a tool call is a `<|message_model|>NAME` message.
 ///   • Unconditional think opener (LFM2.5 class): close the block the
 ///     template opened. Thinking-off Qwen-style renders end CLOSED and never
 ///     match; no tools gate — tool calls ride outside the think block.
@@ -339,6 +344,12 @@ pub fn contentChannelTail(tpl: []const u8, rendered: []const u8, allow_channel_c
         std.mem.endsWith(u8, rendered, "<|start|>assistant"))
     {
         return " to=user<|message|>";
+    }
+    // Inkling: commit the model's text message, byte-exactly as the template renders a history
+    // answer. Inkling Small's template ends at `<|message_model|>`, Inkling 2's after the last turn.
+    if (allow_channel_commit and std.mem.indexOf(u8, tpl, "Thinking effort level") != null) {
+        if (std.mem.endsWith(u8, rendered, INKLING_MODEL_TAG)) return INKLING_TEXT_TAG;
+        if (std.mem.endsWith(u8, rendered, INKLING_END_TAG)) return INKLING_MODEL_TAG ++ INKLING_TEXT_TAG;
     }
     const tail = std.mem.trimEnd(u8, rendered[rendered.len -| 64 ..], "\n\r\t ");
     if (k2ThinkOpenerAt(tail)) |opener| {

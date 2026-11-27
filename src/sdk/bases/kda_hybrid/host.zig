@@ -77,12 +77,8 @@ pub fn hostIds(tokens: []const u32) !Array {
     return mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ 1, @intCast(tokens.len) }, 2, .int32);
 }
 
-/// The rows a `Caps.prompt_last_row` model's head reads of a last-row prompt (`finish`): past the 16 rows a decode call
-/// takes, so the head's matmul runs as the prompt's.
-pub const head_tail_rows: c_int = 32;
-
 /// Fills `out` from the final-normed hidden `[1, S, H]` (consumed): the hidden when asked, and the logits the
-/// forward wants (`[S, V]` or the last row `[1, V]`).
+/// forward wants (`[S, V]`, or the last row `[1, V]` sliced from the same head call over every row).
 pub fn finish(m: *Model, f: *const abi.Forward, hidden: Array, out: *abi.ForwardOut) !void {
     defer _ = mlx.mlx_array_free(hidden);
     if (f.want_hidden) {
@@ -92,17 +88,7 @@ pub fn finish(m: *Model, f: *const abi.Forward, hidden: Array, out: *abi.Forward
     }
     if (f.logits == .none) return;
     const s = m.s;
-    // A model that declares `Caps.prompt_last_row` (bailing_hybrid's streaming pack) runs a last-row prompt's head over
-    // its last `head_tail_rows` rows only: still a prompt call, whose rows its outside plugin's matmul computes as the
-    // whole prompt's call does, so the last row keeps its `.all_rows` bytes.
-    var tail = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(tail);
-    const hsh = mlx.getShape(hidden);
-    const head_in = if (f.logits == .last_row and m.caps.prompt_last_row and hsh[1] > head_tail_rows) blk: {
-        try mlx.check(mlx.mlx_slice(&tail, hidden, &[_]c_int{ 0, hsh[1] - head_tail_rows, 0 }, 3, &[_]c_int{ 1, hsh[1], hsh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
-        break :blk tail;
-    } else hidden;
-    const logits = try m.lmHead(head_in);
+    const logits = try m.lmHead(hidden);
     defer _ = mlx.mlx_array_free(logits);
     const sh = mlx.getShape(logits);
     var rows = mlx.mlx_array_new();
@@ -199,4 +185,52 @@ pub fn settleBank(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) abi.Ve
         return abi.Verdict.named(.failed, @errorName(e));
     };
     return .ok;
+}
+
+// Bar: on the GPU, a last-row ask returns the bytes of the all-rows ask's last row through a dense bf16 head of K 2304
+// and N 8192 at 65 rows, where MLX's matmul takes another kernel at 32 rows than at 65.
+test "kda_hybrid finish: a last-row prompt serves the all-rows head's last row bit for bit (dense bf16 head, 65 rows)" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const testing = std.testing;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const k: c_int = 2304;
+    const n_out: c_int = 8192;
+    const rows: c_int = 65;
+    var prng = std.Random.DefaultPrng.init(65);
+    const wbuf = try testing.allocator.alloc(f32, @intCast(n_out * k));
+    defer testing.allocator.free(wbuf);
+    for (wbuf) |*x| x.* = prng.random().floatNorm(f32) * 0.02;
+    const xbuf = try testing.allocator.alloc(f32, @intCast(rows * k));
+    defer testing.allocator.free(xbuf);
+    for (xbuf) |*x| x.* = prng.random().floatNorm(f32);
+    const wf = mlx.mlx_array_new_data(wbuf.ptr, &[_]c_int{ n_out, k }, 2, .float32);
+    defer _ = mlx.mlx_array_free(wf);
+    const xf = mlx.mlx_array_new_data(xbuf.ptr, &[_]c_int{ 1, rows, k }, 3, .float32);
+    defer _ = mlx.mlx_array_free(xf);
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_astype(&w, wf, .bfloat16, s));
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, xf, .bfloat16, s));
+    var m: Model = .{ .c = undefined, .s = s, .caps = .{ .prompt_last_row = true }, .embed = .{}, .head = .{ .w = w }, .final_norm = .{} };
+    var got: [2][]f32 = undefined;
+    for ([_]abi.Logits{ .all_rows, .last_row }, 0..) |mode, i| {
+        var h = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&h, x);
+        var out: abi.ForwardOut = .{};
+        try finish(&m, &.{ .mode = .prefill, .logits = mode, .rows = @intCast(rows), .tokens = .{} }, h, &out);
+        const l: Array = .{ .ctx = out.logits.ctx };
+        defer _ = mlx.mlx_array_free(l);
+        var f32s = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f32s);
+        try mlx.check(mlx.mlx_astype(&f32s, l, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(f32s));
+        const sh = mlx.getShape(f32s);
+        const last = mlx.mlx_array_data_float32(f32s).?[@intCast((sh[0] - 1) * sh[1])..@intCast(sh[0] * sh[1])];
+        got[i] = try testing.allocator.dupe(f32, last);
+    }
+    defer for (got) |g| testing.allocator.free(g);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(got[0]), std.mem.sliceAsBytes(got[1]));
 }

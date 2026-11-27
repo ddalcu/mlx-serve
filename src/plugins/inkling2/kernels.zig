@@ -18,6 +18,12 @@ const moe_fp4 = @import("../../sdk/blocks/moe/moe_fp4.zig");
 const mxfp8 = @import("../../sdk/blocks/qmm/mxfp8_qmv.zig");
 const rel = @import("../inkling/attention.zig");
 const layers = @import("layers.zig");
+const MoeBank = @import("../../sdk/bases/blocks/moe.zig").Bank;
+const log = @import("../../sdk/util/log.zig");
+
+const lever = @import("config.zig").lever;
+const optIn = @import("config.zig").optIn;
+const nax = @import("../../sdk/blocks/linear/verify_qmm_nax.zig");
 const Config = @import("config.zig").Config;
 
 const Graph = ops.Graph;
@@ -67,7 +73,7 @@ pub fn clearHost(raw: ?*const anyopaque) void {
 /// The SDK's fp4 and fp8 decodes under the packed expert kernels' chunk reader.
 pub const bank_header = moe_fp4.NV_SCALE ++ moe_fp4.DOT16 ++ mxfp8.HEADER ++ kernelSource("plugins/inkling2/kernels/bank_header.metal");
 /// `relsplit_lanes.metal`'s matrix element: half, and float where the stream is float32 (its read is then the chain's sums).
-const lanes_header = "template <typename T> struct msv_ink2_el { typedef half type; };\ntemplate <> struct msv_ink2_el<float> { typedef float type; };\n";
+pub const lanes_header = "template <typename T> struct msv_ink2_el { typedef half type; };\ntemplate <> struct msv_ink2_el<float> { typedef float type; };\n";
 /// Output rows a SIMD group of a packed expert kernel owns (one: a lane's loop sets the launch's latency, and here
 /// that beats keeping x in registers across rows), and the up kernel's SIMD groups per threadgroup (each threadgroup
 /// ranks its row's picks: fewer, wider ones rank fewer times).
@@ -75,11 +81,18 @@ const bank_rows: c_int = 1;
 const bank_groups: c_int = 8;
 
 pub var pre_kernel: Kernel = .{ .name = "msv_inkling2_pre", .ins = &.{ "HIN", "BLK", "QY", "NW0", "NW1", "NW2", "BANK", "BPART", "MQ", "PR" }, .outs = &.{ "X", "NORMED", "A", "MSGO", "BOTH" }, .source = kernelSource("plugins/inkling2/kernels/pre.metal") };
-pub var prep_kernel: Kernel = .{ .name = "msv_inkling2_prep", .ins = &.{ "QP", "GP", "RP", "KP", "VP", "KDY", "VDY", "ST", "KW", "VW", "QS", "RS", "RJ", "PR", "PARENT" }, .outs = &.{ "Q", "GATE", "K", "V", "BIAS", "REL" }, .source = kernelSource("plugins/inkling2/kernels/prep.metal") };
+const prep_ins = &[_][*:0]const u8{ "QP", "GP", "RP", "KP", "VP", "KDY", "VDY", "ST", "KW", "VW", "QS", "RS", "RJ", "PR", "PARENT" };
+const prep_outs = &[_][*:0]const u8{ "Q", "GATE", "K", "V", "BIAS", "REL" };
+pub var prep_kernel: Kernel = .{ .name = "msv_inkling2_prep", .ins = prep_ins, .outs = prep_outs, .source = kernelSource("plugins/inkling2/kernels/prep.metal") };
+/// `prep_kernel` taking its inputs as they are (`MLX_SERVE_INKLING2_PREP_STRIDED`): a joined projection's parts read
+/// by their strides, not copied first.
+pub var prep_strided_kernel: Kernel = .{ .name = "msv_inkling2_prep_strided", .ins = prep_ins, .outs = prep_outs, .source = kernelSource("plugins/inkling2/kernels/prep.metal"), .contiguous = false };
 pub var oproj_kernel: Kernel = .{ .name = "msv_inkling2_oproj", .ins = &.{ "ATT", "GATE", "WQ", "WS", "WB" }, .outs = &.{"Y"}, .source = kernelSource("plugins/inkling2/kernels/oproj.metal"), .header = bank_header };
 pub var gated_kernel: Kernel = .{ .name = "msv_inkling2_gated", .ins = &.{ "ATT", "GATE" }, .outs = &.{"OUT"}, .source = kernelSource("plugins/inkling2/kernels/gated.metal") };
 pub var mid_kernel: Kernel = .{ .name = "msv_inkling2_mid", .ins = &.{ "OP", "ST", "AW", "HIN", "NORMED", "BLK", "QY", "PN", "MSG3", "PR", "PARENT" }, .outs = &.{ "RES", "X", "X32", "M", "BOTH" }, .source = kernelSource("plugins/inkling2/kernels/mid.metal") };
 pub var gate_kernel: Kernel = .{ .name = "msv_inkling2_gate", .ins = &.{ "A", "MS", "ST", "F", "G" }, .outs = &.{"Y"}, .source = kernelSource("plugins/inkling2/kernels/gate.metal") };
+/// A prompt chunk's message gates on the matrix units (`MLX_SERVE_INKLING2_GATE_MM`).
+pub var gate_mm_kernel: Kernel = .{ .name = "msv_inkling2_gate_mm", .ins = &.{ "A", "MS", "ST", "F", "G" }, .outs = &.{"Y"}, .source = kernelSource("plugins/inkling2/kernels/gate_mm.metal"), .header = "#include <metal_simdgroup_matrix>\n" };
 pub var norm_kernel: Kernel = .{ .name = "msv_inkling2_norm", .ins = &.{ "Y", "NW0", "NW1", "NW2", "RT", "PR" }, .outs = &.{ "X", "SCORES" }, .source = kernelSource("plugins/inkling2/kernels/norm.metal") };
 pub var topk_kernel: Kernel = .{ .name = "msv_inkling2_topk", .ins = &.{ "SC", "RB", "PR" }, .outs = &.{ "IDX", "WTS" }, .source = kernelSource("plugins/inkling2/kernels/topk.metal") };
 pub var topk_group_kernel: Kernel = .{ .name = "msv_inkling2_topk_group", .ins = &.{ "SC", "RB", "PR" }, .outs = &.{ "IDX", "WTS", "TEXP", "TCNT", "TPICK" }, .source = kernelSource("plugins/inkling2/kernels/topk_group.metal") };
@@ -103,6 +116,9 @@ const markov_header = kernelSource("plugins/inkling2/kernels/markov_header.metal
 pub var markov_rnn_kernel: Kernel = .{ .name = "msv_inkling2_markov_rnn", .ins = &.{ "W", "B", "ST", "PREV", "ROWS", "NEW", "TOK", "AT" }, .outs = &.{"P"}, .source = kernelSource("plugins/inkling2/kernels/markov_rnn.metal") };
 pub var markov_fold_kernel: Kernel = .{ .name = "msv_inkling2_markov_fold", .ins = &.{ "P", "FOLD", "FB", "BASE", "AT", "CAP" }, .outs = &.{ "PM", "PI", "PS" }, .source = kernelSource("plugins/inkling2/kernels/markov_fold.metal"), .header = markov_header };
 pub var markov_fold_q8_kernel: Kernel = .{ .name = "msv_inkling2_markov_fold_q8", .ins = &.{ "P", "FQ", "FS", "FQB", "FB", "BASE", "AT", "CAP", "LPARAMS" }, .outs = &.{ "PM", "PI", "PS", "GM", "SCALED" }, .source = kernelSource("plugins/inkling2/kernels/markov_fold_q8.metal"), .header = markov_header };
+/// `MLX_SERVE_INKLING2_MARKOV_Q8` (opt-in): one RNN step over a block's precomputed context, and the int8 fold a vocab row.
+pub var markov_step_rnn_kernel: Kernel = .{ .name = "msv_inkling2_markov_step_rnn", .ins = &.{ "W", "KAPPA", "ST", "PREV", "TOK", "AT" }, .outs = &.{"P"}, .source = kernelSource("plugins/inkling2/kernels/markov_step_rnn.metal") };
+pub var markov_fold_q8_row_kernel: Kernel = .{ .name = "msv_inkling2_markov_fold_q8_row", .ins = &.{ "P", "FQ", "FSC", "BASE", "AT", "CAP" }, .outs = &.{ "PM", "PI", "PS" }, .source = kernelSource("plugins/inkling2/kernels/markov_fold_q8_row.metal"), .header = markov_header };
 pub var markov_pick_kernel: Kernel = .{ .name = "msv_inkling2_markov_pick", .ins = &.{ "PM", "PI", "PS", "P", "ST", "CAP" }, .outs = &.{ "TOKN", "CONF", "NST" }, .source = kernelSource("plugins/inkling2/kernels/markov_pick.metal"), .header = markov_header };
 pub var markov_fold_batch_kernel: Kernel = .{ .name = "msv_inkling2_markov_fold_batch", .ins = &.{ "P", "FOLD", "FB", "BASE", "AT", "CAP" }, .outs = &.{ "PM", "PI", "PS" }, .source = kernelSource("plugins/inkling2/kernels/markov_fold_batch.metal"), .header = markov_header };
 pub var markov_pick_batch_kernel: Kernel = .{ .name = "msv_inkling2_markov_pick_batch", .ins = &.{ "PM", "PI", "PS", "P", "ST", "CAP" }, .outs = &.{ "TOKN", "CONF", "NST" }, .source = kernelSource("plugins/inkling2/kernels/markov_pick_batch.metal"), .header = markov_header };
@@ -120,7 +136,7 @@ pub var sample_draw_kernel: Kernel = .{ .name = "msv_inkling2_sample_draw", .ins
 pub var accept_tree_kernel: Kernel = .{ .name = "msv_inkling2_accept_tree", .ins = &.{ "TOKENS", "PARENT", "SELECTED", "ACCEPT_CAP", "STOPS", "N_STOPS" }, .outs = &.{"RESULT"}, .source = kernelSource("plugins/inkling2/kernels/accept_tree.metal") };
 pub const enabled = @import("config.zig").fusedOn;
 
-pub const TArg = union(enum) { dtype: Dtype, int: c_int };
+pub const TArg = union(enum) { dtype: Dtype, int: c_int, flag: bool };
 pub const Out = struct { shape: []const c_int, dtype: Dtype };
 /// An output a kernel variant never writes.
 pub const unused: Out = .{ .shape = &.{1}, .dtype = .float32 };
@@ -141,6 +157,7 @@ pub fn launchGrid(g: *Graph, k: *Kernel, inputs: []const Array, comptime n: usiz
     for (targs) |t| switch (t[1]) {
         .dtype => |d| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, t[0], d)),
         .int => |v| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], v)),
+        .flag => |v| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, t[0], v)),
     };
     const iv = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(iv);
@@ -201,6 +218,7 @@ pub fn launchGrid(g: *Graph, k: *Kernel, inputs: []const Array, comptime n: usiz
         };
         try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernel, iv, cfg, g.s));
     }
+    pipes.saw(k, inputs, &outs, grid, tg, targs);
     if (unproven(k, tg, targs)) |key| if (!mlx.errorPending()) {
         _ = mlx.mlx_eval(ov);
         if (mlx.takeErrorIf("maximum allowed threads per threadgroup")) return error.ThreadLimit;
@@ -219,6 +237,244 @@ pub fn launchGrid(g: *Graph, k: *Kernel, inputs: []const Array, comptime n: usiz
     return res;
 }
 
+/// Every plugin kernel, by name, for a pipeline record's replay.
+const all_kernels = [_]*Kernel{ &pre_kernel, &prep_kernel, &prep_strided_kernel, &oproj_kernel, &gated_kernel, &mid_kernel, &gate_kernel, &gate_mm_kernel, &norm_kernel, &topk_kernel, &topk_group_kernel, &act_kernel, &ups_kernel, &downs_kernel, &group_kernel, &ups_grp_kernel, &downs_grp_kernel, &relattn_kernel, &tile_scan_kernel, &moe_wide_kernel, &router_kernel, &relattn_nax_kernel, &relsplit_nax_kernel, &relsplit_lanes_kernel, &relsplit_kernel, &relcomb_kernel, &markov_rnn_kernel, &markov_fold_kernel, &markov_fold_q8_kernel, &markov_step_rnn_kernel, &markov_fold_q8_row_kernel, &markov_pick_kernel, &markov_fold_batch_kernel, &markov_pick_batch_kernel, &markov_pick_sample_kernel, &markov_pick_rnn_kernel, &relslots_kernel, &relmask_kernel, &sum_kernel, &few_tail_kernel, &state_kernel, &commit_conv_kernel, &sample_mass_kernel, &sample_search_kernel, &sample_draw_kernel, &accept_tree_kernel };
+
+/// The plugin's kernel pipelines (`MLX_SERVE_INKLING2_PIPELINES_AT_LOAD`): MLX builds one for each kernel, template
+/// arguments and input and output dtypes at its first launch. Each first launch is counted (and, with the switch, its
+/// launch appended to the build's record); a first launch while a decode, verify or draft is built is a pipeline
+/// built inside a measured decode window, logged and counted (one while a prompt is built is logged and counted
+/// apart). At load, the record's launches are replayed on zero inputs of their shapes, so their pipelines are built
+/// before ready.
+pub const Pipes = struct {
+    seen: [1024]u64 = undefined,
+    n: usize = 0,
+    /// A forward other than a prompt's is being built.
+    in_decode: bool = false,
+    built_in_decode: u64 = 0,
+    /// First launches while a prompt chunk is built (log only: a server's first prompts pay these in TTFT).
+    built_in_prompt: u64 = 0,
+    record: [512]u8 = undefined,
+    record_len: usize = 0,
+    replaying: bool = false,
+
+    fn keyOf(k: *const Kernel, inputs: []const Array, outs: []const Out, targs: TArgs) u64 {
+        var h = std.hash.Wyhash.init(0x51ce);
+        h.update(std.mem.span(k.name));
+        for (targs) |t| {
+            h.update(std.mem.span(t[0]));
+            switch (t[1]) {
+                .dtype => |d| h.update(std.mem.asBytes(&d)),
+                .int => |v| h.update(std.mem.asBytes(&v)),
+                .flag => |v| h.update(std.mem.asBytes(&v)),
+            }
+        }
+        for (inputs) |x| {
+            const d = ops.dtype(x);
+            h.update(std.mem.asBytes(&d));
+        }
+        for (outs) |o| h.update(std.mem.asBytes(&o.dtype));
+        return h.final();
+    }
+
+    /// `keyOf` for a record line: the same kernel, template arguments and dtypes give the same key.
+    fn keyOfLine(r: *const RecordLine) u64 {
+        var h = std.hash.Wyhash.init(0x51ce);
+        h.update(std.mem.span(r.kernel.name));
+        for (r.targs) |t| {
+            h.update(std.mem.span(t[0]));
+            switch (t[1]) {
+                .dtype => |d| h.update(std.mem.asBytes(&d)),
+                .int => |v| h.update(std.mem.asBytes(&v)),
+                .flag => |v| h.update(std.mem.asBytes(&v)),
+            }
+        }
+        for (r.ins) |x| h.update(std.mem.asBytes(&x.dtype));
+        for (r.outs) |o| h.update(std.mem.asBytes(&o.dtype));
+        return h.final();
+    }
+
+    fn saw(p: *Pipes, k: *const Kernel, inputs: []const Array, outs: []const Out, grid: [3]c_int, tg: [3]c_int, targs: TArgs) void {
+        const key = keyOf(k, inputs, outs, targs);
+        if (std.mem.indexOfScalar(u64, p.seen[0..p.n], key) != null) return;
+        if (p.n < p.seen.len) {
+            p.seen[p.n] = key;
+            p.n += 1;
+        }
+        if (p.replaying) return;
+        if (p.in_decode) {
+            p.built_in_decode += 1;
+            log.debug("[inkling2] pipeline built in decode: {s} ({d} so far)\n", .{ k.name, p.built_in_decode });
+        } else {
+            p.built_in_prompt += 1;
+            log.debug("[inkling2] pipeline built in prompt: {s} ({d} so far)\n", .{ k.name, p.built_in_prompt });
+        }
+        if (p.record_len > 0) p.append(k, inputs, outs, grid, tg, targs) catch {};
+    }
+
+    /// One launch as a record line: name, grid, threadgroup, template arguments, inputs, outputs.
+    fn append(p: *Pipes, k: *const Kernel, inputs: []const Array, outs: []const Out, grid: [3]c_int, tg: [3]c_int, targs: TArgs) !void {
+        var buf: [8192]u8 = undefined;
+        var at: usize = 0;
+        const put = struct {
+            fn f(b: []u8, n: *usize, comptime fmt: []const u8, args: anytype) !void {
+                const w = try std.fmt.bufPrint(b[n.*..], fmt, args);
+                n.* += w.len;
+            }
+        }.f;
+        try put(&buf, &at, "{s}\t{d},{d},{d}\t{d},{d},{d}\t", .{ k.name, grid[0], grid[1], grid[2], tg[0], tg[1], tg[2] });
+        for (targs) |t| switch (t[1]) {
+            .dtype => |d| try put(&buf, &at, "{s}=d{d};", .{ t[0], @intFromEnum(d) }),
+            .int => |v| try put(&buf, &at, "{s}=i{d};", .{ t[0], v }),
+            .flag => |v| try put(&buf, &at, "{s}=f{d};", .{ t[0], @intFromBool(v) }),
+        };
+        try put(&buf, &at, "\t", .{});
+        for (inputs) |x| {
+            try put(&buf, &at, "{d}:", .{@intFromEnum(ops.dtype(x))});
+            for (ops.shape(x), 0..) |d, i| try put(&buf, &at, "{s}{d}", .{ if (i == 0) "" else "x", d });
+            try put(&buf, &at, ";", .{});
+        }
+        try put(&buf, &at, "\t", .{});
+        for (outs) |o| {
+            try put(&buf, &at, "{d}:", .{@intFromEnum(o.dtype)});
+            for (o.shape, 0..) |d, i| try put(&buf, &at, "{s}{d}", .{ if (i == 0) "" else "x", d });
+            try put(&buf, &at, ";", .{});
+        }
+        try put(&buf, &at, "\n", .{});
+        const fh = std.c.fopen(@ptrCast(&p.record), "ab") orelse return error.PipelineRecordOpen;
+        _ = std.c.fwrite(&buf, 1, at, fh);
+        _ = std.c.fclose(fh);
+    }
+};
+pub var pipes: Pipes = .{};
+
+/// A shape as a record writes it, `2x3`; empty for a scalar.
+fn parseShape(a: std.mem.Allocator, txt: []const u8) ![]c_int {
+    var out: std.ArrayList(c_int) = .empty;
+    if (txt.len == 0) return out.toOwnedSlice(a);
+    var it = std.mem.splitScalar(u8, txt, 'x');
+    while (it.next()) |d| try out.append(a, try std.fmt.parseInt(c_int, d, 10));
+    return out.toOwnedSlice(a);
+}
+
+/// One record line: a kernel's launch, its inputs as dtypes and shapes.
+const RecordLine = struct {
+    kernel: *Kernel,
+    grid: [3]c_int,
+    tg: [3]c_int,
+    targs: TArgs,
+    ins: []const Out,
+    outs: []const Out,
+};
+
+fn parseOuts(a: std.mem.Allocator, txt: []const u8) ![]const Out {
+    var outs: std.ArrayList(Out) = .empty;
+    var it = std.mem.splitScalar(u8, txt, ';');
+    while (it.next()) |x| {
+        if (x.len == 0) continue;
+        const c = std.mem.indexOfScalar(u8, x, ':') orelse return error.PipelineRecordLine;
+        try outs.append(a, .{ .shape = try parseShape(a, x[c + 1 ..]), .dtype = @enumFromInt(try std.fmt.parseInt(std.meta.Tag(Dtype), x[0..c], 10)) });
+    }
+    return outs.toOwnedSlice(a);
+}
+
+/// A record line parsed; null for a kernel this build does not have.
+fn parseRecordLine(a: std.mem.Allocator, line: []const u8) !?RecordLine {
+    var f = std.mem.splitScalar(u8, line, '\t');
+    const name = f.next() orelse return error.PipelineRecordLine;
+    const kp = for (all_kernels) |k| {
+        if (std.mem.eql(u8, std.mem.span(k.name), name)) break k;
+    } else return null;
+    var r: RecordLine = .{ .kernel = kp, .grid = undefined, .tg = undefined, .targs = &.{}, .ins = &.{}, .outs = &.{} };
+    for ([_]*[3]c_int{ &r.grid, &r.tg }) |dst| {
+        var it = std.mem.splitScalar(u8, f.next() orelse return error.PipelineRecordLine, ',');
+        for (dst) |*v| v.* = try std.fmt.parseInt(c_int, it.next() orelse return error.PipelineRecordLine, 10);
+    }
+    var targs: std.ArrayList(std.meta.Child(TArgs)) = .empty;
+    var ti = std.mem.splitScalar(u8, f.next() orelse return error.PipelineRecordLine, ';');
+    while (ti.next()) |t| {
+        if (t.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, t, '=') orelse return error.PipelineRecordLine;
+        if (eq + 2 > t.len) return error.PipelineRecordLine;
+        const nm = try a.dupeSentinel(u8, t[0..eq], 0);
+        const v = t[eq + 2 ..];
+        const arg: TArg = switch (t[eq + 1]) {
+            'd' => .{ .dtype = @enumFromInt(try std.fmt.parseInt(std.meta.Tag(Dtype), v, 10)) },
+            'i' => .{ .int = try std.fmt.parseInt(c_int, v, 10) },
+            'f' => .{ .flag = (try std.fmt.parseInt(c_int, v, 10)) != 0 },
+            else => return error.PipelineRecordLine,
+        };
+        try targs.append(a, .{ nm.ptr, arg });
+    }
+    r.targs = targs.items;
+    r.ins = try parseOuts(a, f.next() orelse return error.PipelineRecordLine);
+    r.outs = try parseOuts(a, f.next() orelse return error.PipelineRecordLine);
+    return r;
+}
+
+/// `MLX_SERVE_INKLING2_PIPELINES_AT_LOAD`: the record at `path` (this build, machine and composition) replayed on `s`,
+/// each launch on zero inputs of its shapes, all evaluated: its pipelines built before ready. Returns (pipelines
+/// built, launches replayed, lines unreadable); keeps `path` as the record later first launches append to. An
+/// unreadable line is skipped, never the record.
+pub fn pipelinesAtLoad(s: mlx.mlx_stream, path: []const u8) ![3]usize {
+    if (path.len + 1 >= pipes.record.len) return error.PipelineRecordPath;
+    @memcpy(pipes.record[0..path.len], path);
+    pipes.record[path.len] = 0;
+    pipes.record_len = path.len;
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fh = std.c.fopen(@ptrCast(&pipes.record), "rb") orelse return .{ 0, 0, 0 };
+    var text_list: std.ArrayList(u8) = .empty;
+    var chunk: [65536]u8 = undefined;
+    while (true) {
+        const got = std.c.fread(&chunk, 1, chunk.len, fh);
+        if (got == 0) break;
+        try text_list.appendSlice(a, chunk[0..got]);
+    }
+    _ = std.c.fclose(fh);
+    pipes.replaying = true;
+    defer pipes.replaying = false;
+    const before = pipes.n;
+    var done: usize = 0;
+    var bad: usize = 0;
+    var lines = std.mem.splitScalar(u8, text_list.items, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const r = (parseRecordLine(a, line) catch {
+            bad += 1;
+            continue;
+        }) orelse continue;
+        // One launch a pipeline, each evaluated and freed before the next: the record repeats keys at other shapes.
+        if (std.mem.indexOfScalar(u64, pipes.seen[0..pipes.n], Pipes.keyOfLine(&r)) != null) continue;
+        var g = Graph.init(std.heap.c_allocator, s);
+        defer g.deinit();
+        var ins: std.ArrayList(Array) = .empty;
+        for (r.ins) |x| try ins.append(a, try g.zeros(x.shape, x.dtype));
+        const made = replayOne(&g, r.kernel, ins.items, r.outs, r.grid, r.tg, r.targs) catch continue;
+        try ops.evalMany(made);
+        done += 1;
+    }
+    return .{ pipes.n - before, done, bad };
+}
+
+/// A record line's launch, its output count at run time (the record's), each output's array.
+fn replayOne(g: *Graph, k: *Kernel, inputs: []const Array, outs: []const Out, grid: [3]c_int, tg: [3]c_int, targs: TArgs) ![]const Array {
+    const res = struct {
+        var buf: [8]Array = undefined;
+    };
+    switch (outs.len) {
+        inline 1...8 => |n| {
+            var o: [n]Out = undefined;
+            for (&o, outs[0..n]) |*d, x| d.* = x;
+            const r = try launchGrid(g, k, inputs, n, o, grid, tg, targs);
+            for (res.buf[0..n], r) |*d, x| d.* = x;
+            return res.buf[0..n];
+        },
+        else => return error.PipelineRecordOutputs,
+    }
+}
+
 fn floating(dt: Dtype) bool {
     return dt == .bfloat16 or dt == .float16 or dt == .float32;
 }
@@ -233,6 +489,18 @@ pub fn streamGroup(hidden: u32) ?c_int {
     var tg: u32 = stream_threads;
     while (tg >= 32) : (tg -= 32) if (hidden % tg == 0) return @intCast(tg);
     return null;
+}
+
+/// `MLX_SERVE_INKLING2_STREAM_ROW` (default on): whether the norm kernel over `s` rows runs one threadgroup a row (a
+/// prompt's rows; a few rows keep the D / TG threadgroups a row, which spread their latency over more cores). `pre`
+/// and `mid` take one threadgroup a row by their own rule (`ONE_TG`).
+pub fn streamRow(s: c_int) bool {
+    return s > small_rows and lever(.MLX_SERVE_INKLING2_STREAM_ROW);
+}
+
+/// A stream kernel's grid width over a row of `d` at threadgroup `tg`: `d` (a thread an element) or `tg` (`streamRow`).
+fn streamWidth(d: c_int, tg: c_int, row: bool) c_int {
+    return if (row) tg else d;
 }
 
 /// After a refused stream launch: whether a narrower threadgroup is left to try.
@@ -265,6 +533,7 @@ fn unproven(k: *const Kernel, tg: [3]c_int, targs: TArgs) ?u64 {
     for (targs) |t| switch (t[1]) {
         .dtype => |d| h.update(std.mem.asBytes(&d)),
         .int => |v| h.update(std.mem.asBytes(&v)),
+        .flag => |v| h.update(std.mem.asBytes(&v)),
     };
     const key = h.final() | 1;
     return if (std.mem.indexOfScalar(u64, probed[0..probed_n], key) == null) key else null;
@@ -321,11 +590,25 @@ fn streams(g: *Graph, cfg: *const Config, consts: ?*const layers.Consts, h: Arra
 /// streams), from each gate's state `st` `[n, S, rank]`: `[n, S, D]` f32. A few rows' threads take the forget and
 /// message projections themselves (MLX's f32 matmul at two rows is several launches' latency); a prompt's rows take
 /// them from two matmuls.
+/// GATE_MM's rows a threadgroup.
+pub const gate_mm_rows: c_int = 64;
+
 pub fn gate(g: *Graph, gates: *const layers.Gates, a: Array, ms: Array, st: Array, from: c_int, n: c_int) !Array {
     const sh = ops.shape(gates.forget);
     const s = ops.shape(st)[1];
     var forget = try g.sliceAxis(gates.forget, 0, from, from + n);
     var message = try g.sliceAxis(gates.message, 0, from, from + n);
+    // `MLX_SERVE_INKLING2_GATE_MM` (default on): past `packed_rows`, a prompt's rows through one tiled kernel, F st and
+    // G st on the matrix units in f32 and the mix in its epilogue: no [n, S, D] product written and read back, no TF32
+    // (precision-up against the TF32 matmuls). 64-row tiles (eight SIMD groups), each projection slice staged once.
+    if (s > packed_rows and @rem(sh[1], 32) == 0 and @rem(sh[2], 32) == 0 and lever(.MLX_SERVE_INKLING2_GATE_MM)) {
+        const bm: c_int = gate_mm_rows;
+        const nt = @divExact(bm, 16) * 2 * 32;
+        const o = try launchGrid(g, &gate_mm_kernel, &.{ a, ms, st, forget, message }, 1, .{.{ .shape = &.{ n, s, sh[1] }, .dtype = .float32 }}, .{ nt * @divExact(sh[1], 32), @divTrunc(s + bm - 1, bm), n }, .{ nt, 1, 1 }, &.{
+            .{ "D", .{ .int = sh[1] } }, .{ "RANK", .{ .int = sh[2] } }, .{ "BM", .{ .int = bm } },
+        });
+        return o[0];
+    }
     const projected = s > packed_rows;
     if (projected) {
         const st32 = try g.astype(st, .float32);
@@ -356,11 +639,13 @@ fn normWithConsts(g: *Graph, cfg: *const Config, consts: ?*const layers.Consts, 
     const eps = if (consts != null and consts.?.eps.ctx != null) consts.?.eps else try g.fromSlice(f32, &.{cfg.rms_norm_eps}, &.{1});
     while (true) {
         const tg = streamGroup(cfg.hidden_size) orelse return error.ThreadLimit;
+        const row = streamRow(s);
         return launchGrid(g, &norm_kernel, &.{ y, nw[0], nw[1], nw[2], router orelse y, eps }, 2, .{
             .{ .shape = &.{ n, s, d }, .dtype = dt },
             if (router != null) .{ .shape = &.{ s, experts_n }, .dtype = .float32 } else unused,
-        }, .{ d + if (router != null) routerThreads(cfg, tg) else 0, s, 1 }, .{ tg, 1, 1 }, &.{
+        }, .{ streamWidth(d, tg, row) + if (router != null) routerThreads(cfg, tg) else 0, s, 1 }, .{ tg, 1, 1 }, &.{
             .{ "T", .{ .dtype = dt } }, .{ "TG", .{ .int = tg } }, .{ "D", .{ .int = d } }, .{ "J", .{ .int = n } }, .{ "E", .{ .int = experts_n } },
+            .{ "ROW", .{ .int = @intFromBool(row) } },
         }) catch |e| if (e == error.ThreadLimit and narrow(cfg.hidden_size)) continue else return e;
     }
 }
@@ -431,6 +716,12 @@ pub fn keysSeen(L: *const Layer, cfg: *const Config, total: c_int) c_int {
 
 /// `layers.prepare` as one launch. One row takes its log-scaling factor `tau` and the count of `keys` it will read,
 /// for its bias row; more rows leave both to the read. Null where the projections are not one float dtype.
+/// Whether `x`'s last axis is unit-strided (a joined projection's part is).
+fn unitLast(x: Array) bool {
+    const n = mlx.mlx_array_ndim(x);
+    return n > 0 and mlx.mlx_array_strides(x)[n - 1] == 1;
+}
+
 pub fn prep(g: *Graph, L: *const Layer, cfg: *const Config, proj: *const [6]Array, taps: ?[2]Array, st: Array, tau: f32, keys: c_int) !?Prep {
     return prepWith(g, L, cfg, proj, taps, st, tau, keys, null);
 }
@@ -457,7 +748,6 @@ fn prepWithConsts(g: *Graph, L: *const Layer, cfg: *const Config, consts: ?*cons
     const hd: c_int = @intCast(cfg.head_dim);
     const d_rel: c_int = @intCast(cfg.d_rel);
     const kt: c_int = @intCast(cfg.sconv_kernel);
-    const kv_dim = kv_heads * hd;
     const conv_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(if (dynamic) 2 * kt + 1 else kt + 1)));
     const cached_pr = if (wide and tau == 1.0 and keys == 0 and consts != null)
         (if (dynamic) consts.?.prep_pr_dyn else consts.?.prep_pr_static)
@@ -465,20 +755,44 @@ fn prepWithConsts(g: *Graph, L: *const Layer, cfg: *const Config, consts: ?*cons
         Array{};
     const pr = if (cached_pr.ctx != null) cached_pr else try g.fromSlice(f32, &.{ cfg.qk_clip, cfg.rel_clip, cfg.rms_norm_eps, tau, conv_scale, @floatFromInt(keys) }, &.{6});
     const par = parent orelse (if (consts != null and consts.?.zero_i32.ctx != null) consts.?.zero_i32 else try g.zeros(&.{1}, .int32));
-    const o = try launchGrid(g, &prep_kernel, &.{ proj[0], proj[1], proj[2], proj[4], proj[5], dyn[0], dyn[1], st, kw, vw, L.q_scale, L.rel_scale, L.rel_proj_rev, pr, par }, 6, .{
-        .{ .shape = if (wide) &.{ 1, s, heads, hd } else &.{ 1, heads, 1, hd }, .dtype = dt },
-        .{ .shape = &.{s * heads * hd}, .dtype = .float32 },
-        .{ .shape = &.{ 1, kv_heads, s, hd }, .dtype = dt },
-        .{ .shape = &.{ 1, kv_heads, s, hd }, .dtype = dt },
-        if (wide) unused else .{ .shape = &.{ 1, heads, 1, keys }, .dtype = dt },
-        if (wide) .{ .shape = &.{ 1, s, heads, d_rel }, .dtype = dt } else unused,
-    }, .{ heads * hd + 2 * kv_dim + heads * (if (wide) d_rel else keys), s, 1 }, .{ hd, 1, 1 }, &.{
-        .{ "T", .{ .dtype = dt } },                  .{ "WT", .{ .dtype = ops.dtype(kw) } },                .{ "S", .{ .dtype = ops.dtype(L.q_scale) } },
-        .{ "H", .{ .int = heads } },                 .{ "HD", .{ .int = hd } },                             .{ "HKV", .{ .int = kv_heads } },
-        .{ "DREL", .{ .int = d_rel } },              .{ "KT", .{ .int = kt } },                             .{ "DYN", .{ .int = @intFromBool(dynamic) } },
-        .{ "WIDE", .{ .int = @intFromBool(wide) } }, .{ "TREE", .{ .int = @intFromBool(parent != null) } },
-    });
+    var ins = [_]Array{ proj[0], proj[1], proj[2], proj[4], proj[5], dyn[0], dyn[1], st, kw, vw, L.q_scale, L.rel_scale, L.rel_proj_rev, pr, par };
+    // `MLX_SERVE_INKLING2_PREP_STRIDED` (default on; prompt chunks): the projections' parts as they are (views with a
+    // unit last stride), the rest made contiguous here (a no-op where they are).
+    const strided = s > split_rows and lever(.MLX_SERVE_INKLING2_PREP_STRIDED) and for (proj) |x| {
+        if (unitLast(x) == false) break false;
+    } else true;
+    // A static conv's KDY, VDY slots hold k and v, which it never reads.
+    if (strided) for (ins[if (dynamic) 5 else 7..13]) |*x| {
+        x.* = try g.contiguous(x.*);
+    };
+    if (strided) ins[14] = try g.contiguous(ins[14]);
+    const o = try prepLaunch(g, &ins, .{ .heads = heads, .kv_heads = kv_heads, .hd = hd, .d_rel = d_rel, .kt = kt, .keys = keys, .dynamic = dynamic, .tree = parent != null }, strided);
     return .{ .q = o[0], .gate = o[1], .k = o[2], .v = o[3], .bias = o[4], .rel = o[5] };
+}
+
+/// What `prepLaunch` takes besides its inputs: the attention's widths, the conv's taps, a one-row read's `keys`, the
+/// conv's kind and whether the rows are a verify tree's.
+pub const PrepDims = struct { heads: c_int, kv_heads: c_int, hd: c_int, d_rel: c_int, kt: c_int, keys: c_int, dynamic: bool, tree: bool = false };
+
+/// `prep.metal` over `ins` (`prep_ins`' order) at the rows of `ins[0]`: `prep_strided_kernel` with `strided` (the
+/// projections read as they are), else `prep_kernel`. Q, GATE, K, V, then BIAS (one row) or REL (more).
+pub fn prepLaunch(g: *Graph, ins: []const Array, d: PrepDims, strided: bool) ![6]Array {
+    const dt = ops.dtype(ins[0]);
+    const s = ops.shape(ins[0])[1];
+    const wide = s > 1;
+    return launchGrid(g, if (strided) &prep_strided_kernel else &prep_kernel, ins, 6, .{
+        .{ .shape = if (wide) &.{ 1, s, d.heads, d.hd } else &.{ 1, d.heads, 1, d.hd }, .dtype = dt },
+        .{ .shape = &.{s * d.heads * d.hd}, .dtype = .float32 },
+        .{ .shape = &.{ 1, d.kv_heads, s, d.hd }, .dtype = dt },
+        .{ .shape = &.{ 1, d.kv_heads, s, d.hd }, .dtype = dt },
+        if (wide) unused else .{ .shape = &.{ 1, d.heads, 1, d.keys }, .dtype = dt },
+        if (wide) .{ .shape = &.{ 1, s, d.heads, d.d_rel }, .dtype = dt } else unused,
+    }, .{ d.heads * d.hd + 2 * d.kv_heads * d.hd + d.heads * (if (wide) d.d_rel else d.keys), s, 1 }, .{ d.hd, 1, 1 }, &.{
+        .{ "T", .{ .dtype = dt } },                    .{ "WT", .{ .dtype = ops.dtype(ins[8]) } }, .{ "S", .{ .dtype = ops.dtype(ins[10]) } },
+        .{ "H", .{ .int = d.heads } },                 .{ "HD", .{ .int = d.hd } },                .{ "HKV", .{ .int = d.kv_heads } },
+        .{ "DREL", .{ .int = d.d_rel } },              .{ "KT", .{ .int = d.kt } },                .{ "DYN", .{ .int = @intFromBool(d.dynamic) } },
+        .{ "WIDE", .{ .int = @intFromBool(wide) } },   .{ "TREE", .{ .int = @intFromBool(d.tree) } },
+    });
 }
 
 /// `x` (any shape) times the output gate's sigmoid element by element, `[1, S, H * hd]` in its dtype.
@@ -533,6 +847,16 @@ pub fn relMask(g: *Graph, bias: Array, sinks: Array, keys: c_int, window: c_int,
     return mask[0];
 }
 
+/// Logs `[inkling2] <name> engaged` the first time an opt-in arm serves a launch, so an A/B arm shows in its own log.
+pub fn engaged(comptime name: @EnumLiteral()) void {
+    const once = struct {
+        var told = false;
+    };
+    if (once.told) return;
+    once.told = true;
+    log.info("[inkling2] {s} engaged\n", .{@tagName(name)});
+}
+
 /// The rows a read hands MLX's attention under a built mask: the flash kernel walks the keys 16 at a time on one
 /// threadgroup, which is a prompt's throughput and a draft verify's latency.
 pub const small_rows = 32;
@@ -549,7 +873,11 @@ pub fn relative(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, r
 /// `[1, S, H * hd]` directly (fused into `relattn.metal` on non-NAX GPUs, or via `gated` on NAX / small-row paths).
 pub fn relativeWith(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, rel_states: Array, sinks: Array, k: Array, v: Array, offset: c_int, flash: bool, out_gate: ?Array) !Array {
     const s = ops.shape(q_rows)[1];
-    if (s > small_rows) if (try relativeNax(g, L, cfg, q_rows, rel_states, sinks, k, v, offset)) |o| {
+    // `MLX_SERVE_INKLING2_NAX_PREFILL` (default on): `relative_attention_nax.metal`'s read (=0: main's
+    // `relattn_nax.metal`). A prompt that read cannot take (not bf16 at head dim 128, or no tensor units) gets main's.
+    const tiles = lever(.MLX_SERVE_INKLING2_NAX_PREFILL) and nax.verifyQmmNaxAvailable() and
+        ops.dtype(q_rows) == .bfloat16 and ops.dtype(k) == .bfloat16 and ops.dtype(v) == .bfloat16 and cfg.head_dim == 128;
+    if (!tiles and s > small_rows) if (try relativeNax(g, L, cfg, q_rows, rel_states, sinks, k, v, offset)) |o| {
         return if (out_gate) |gt| gated(g, o, gt, s) else o;
     };
     const dt = ops.dtype(q_rows);
@@ -557,6 +885,13 @@ pub fn relativeWith(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Arra
     if (ops.dtype(k) != dt or ops.dtype(v) != dt or @rem(hd, 8) != 0) return error.Inkling2StepDtype;
     const heads: c_int = @intCast(cfg.num_attention_heads);
     const keys = ops.shape(k)[2];
+    // `MLX_SERVE_INKLING2_BIAS_IN_ATTN` (default on; acts under NAX_PREFILL): that read makes its bias from the states.
+    if (tiles and (s > small_rows or flash) and lever(.MLX_SERVE_INKLING2_BIAS_IN_ATTN)) {
+        const st = try readStates(g, L, cfg, q_rows, rel_states, sinks, offset);
+        const win: c_int = if (L.global) 0 else @intCast(cfg.sliding_window);
+        const sc = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+        if (try relativeNaxStates(g, heads, @intCast(cfg.num_key_value_heads), st.q, k, v, st.states, try relPad(g, L, dt), st.sinks, win, s, keys, ops.shape(L.rel_proj)[1], sc)) |o| return if (out_gate) |gt| gated(g, o, gt, s) else o;
+    }
     const in = try readInputs(g, L, cfg, q_rows, rel_states, sinks, offset);
     const q = in.q;
     const bias = in.bias;
@@ -569,6 +904,7 @@ pub fn relativeWith(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Arra
         const out = try g.transpose(read, &.{ 0, 2, 1, 3 });
         return if (out_gate) |gt| gated(g, out, gt, s) else out;
     }
+    if (tiles) if (try relativeNaxTiles(g, heads, @intCast(cfg.num_key_value_heads), q, k, v, bias, sink_rows, window, s, keys, ops.shape(L.rel_proj)[1], scale)) |o| return if (out_gate) |gt| gated(g, o, gt, s) else o;
     const fused_gate = out_gate != null;
     const wide = s >= 4096;
     const bq: c_int = if (wide) 64 else 32;
@@ -582,6 +918,52 @@ pub fn relativeWith(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Arra
         .{ "R", .{ .int = ops.shape(L.rel_proj)[1] } }, .{ "WINDOW", .{ .int = window } },
         .{ "BQ", .{ .int = bq } },                      .{ "BK", .{ .int = bk } },
         .{ "TG", .{ .int = tg } },                      .{ "GATED", .{ .int = @intFromBool(fused_gate) } },
+    });
+    return o[0];
+}
+
+/// `relative_attention_nax.metal` (Stéphane Busso's): the flash read's loop on the tensor units, 64 rows a threadgroup
+/// of 4 SIMD groups, keys 32 at a time.
+pub var relnax_kernel: Kernel = .{ .name = "msv_inkling2_relnax", .ins = &.{ "q", "k", "v", "rel", "sinks", "key_start", "sizes", "scale", "relp" }, .outs = &.{"out"}, .source = kernelSource("plugins/inkling2/kernels/relative_attention_nax.metal"), .header = kernelSource("kernels/attention/nax_tiles.metal") ++ kernelSource("kernels/attention/nax_attention.metal"), .contiguous = false };
+
+/// A prompt's flash read (`relative`'s arguments) on the tensor units (`MLX_SERVE_INKLING2_NAX_PREFILL`, default on),
+/// or null (switched off, no tensor units, not bf16 at head dim 128).
+pub fn relativeNaxTiles(g: *Graph, heads: c_int, kv_heads: c_int, q: Array, k: Array, v: Array, bias: Array, sinks: Array, window: c_int, s: c_int, keys: c_int, r: c_int, scale: f32) !?Array {
+    // The unread `relp` slot: 16 elements, so MLX binds it in `device` as the source declares.
+    return relnaxLaunch(g, heads, kv_heads, q, k, v, bias, try g.zeros(&.{16}, .bfloat16), false, sinks, window, s, keys, r, scale);
+}
+
+/// `relativeNaxTiles` with the bias made inside the read (`MLX_SERVE_INKLING2_BIAS_IN_ATTN`): `states` the rows' clipped
+/// relative states `[1, S, H, 16]`, `relp` the projection padded by `relPad`.
+pub fn relativeNaxStates(g: *Graph, heads: c_int, kv_heads: c_int, q: Array, k: Array, v: Array, states: Array, relp: Array, sinks: Array, window: c_int, s: c_int, keys: c_int, r: c_int, scale: f32) !?Array {
+    if (ops.dtype(states) != .bfloat16 or ops.shape(states)[3] != 16 or ops.dtype(relp) != .bfloat16) return null;
+    return relnaxLaunch(g, heads, kv_heads, q, k, v, try g.contiguous(states), relp, true, sinks, window, s, keys, r, scale);
+}
+
+/// Zero columns `relPad` puts before a projection's distance 0 and after its last (the read's blocks reach 94 before
+/// and 63 after).
+pub const relp_before = 128;
+const relp_after = 64;
+
+/// The layer's bias projection `[16, R]` in `dt`, `relp_before` zero columns before it and `relp_after` after.
+pub fn relPad(g: *Graph, L: *const Layer, dt: Dtype) !Array {
+    const sh = ops.shape(L.rel_proj);
+    return g.contiguous(try g.concat(&.{ try g.zeros(&.{ sh[0], relp_before }, dt), try g.astype(L.rel_proj, dt), try g.zeros(&.{ sh[0], relp_after }, dt) }, 1));
+}
+
+fn relnaxLaunch(g: *Graph, heads: c_int, kv_heads: c_int, q: Array, k: Array, v: Array, rel_in: Array, relp: Array, bia: bool, sinks: Array, window: c_int, s: c_int, keys: c_int, r: c_int, scale: f32) !?Array {
+    if (!lever(.MLX_SERVE_INKLING2_NAX_PREFILL) or !nax.verifyQmmNaxAvailable()) return null;
+    if (ops.dtype(q) != .bfloat16 or ops.dtype(k) != .bfloat16 or ops.dtype(v) != .bfloat16 or ops.shape(q)[3] != 128 or s < 2) return null;
+    engaged(.MLX_SERVE_INKLING2_NAX_PREFILL);
+    const o = try launchGrid(g, &relnax_kernel, &.{
+        q, k, v, try g.contiguous(rel_in), try g.contiguous(sinks), try g.zeros(&.{1}, .int32), try g.fromSlice(i32, &.{ s, keys }, &.{2}), try g.scalar(scale, .float32), relp,
+    }, 1, .{.{ .shape = &.{ 1, s, heads, 128 }, .dtype = .bfloat16 }}, .{ @divTrunc(s + 63, 64) * 128, heads, 1 }, .{ 128, 1, 1 }, &.{
+        .{ "T", .{ .dtype = .bfloat16 } },             .{ "D", .{ .int = 128 } },
+        .{ "HQ", .{ .int = heads } },                  .{ "HKV", .{ .int = kv_heads } },
+        .{ "R", .{ .int = r } },                       .{ "WINDOW", .{ .int = window } },
+        .{ "ALIGN_Q", .{ .flag = @rem(s, 64) == 0 } }, .{ "ALIGN_K", .{ .flag = @rem(keys, 32) == 0 } },
+        .{ "BIA", .{ .flag = bia } },                  .{ "RP", .{ .int = if (bia) ops.shape(relp)[1] else 0 } },
+        .{ "PADL", .{ .int = relp_before } },
     });
     return o[0];
 }
@@ -655,6 +1037,44 @@ pub fn markovStep(g: *Graph, rnn: Array, rnn_bias: Array, state: Array, prev_row
     const p = try markovRnn(g, rnn, rnn_bias, state, prev_rows, rows, newest, token, step);
     const o = try markovPick(g, try markovFold(g, p, fold, fold_bias, base, step, vocab, cap), p, state, cap);
     return .{ .token = o[0], .confidence = o[1], .state = o[2] };
+}
+
+/// Whether `markovStepQ8` serves a drafter with the RNN's step columns `rnn_step` `[3R, 2R]` and the 8-bit fold
+/// `fold_q` `[V, R]` (`MLX_SERVE_INKLING2_MARKOV_Q8`, opt-in).
+pub fn markovQ8Runs(g: *const Graph, rnn_step: Array, fold_q: Array, rank: c_int) bool {
+    const dt = ops.dtype(rnn_step);
+    if (!mlx.streamIsGpu(g.s) or !enabled() or (dt != .bfloat16 and dt != .float16) or ops.dtype(fold_q) != .int8) return false;
+    return @rem(rank, 4) == 0 and @rem(3 * rank, 8) == 0;
+}
+
+/// `markovStep` over the 8-bit fold: the step's RNN reads its block-row and newest-mix share from `kappa`
+/// `[steps, 3R]` f32 (made once a block), and the fold `fold_q` `[V, R]` int8 with a scale a vocab row `fold_sc` `[V]`
+/// f32; `base_b` `[1, steps, V]` f32 is the rows' head logits with the fold's bias in.
+pub fn markovStepQ8(g: *Graph, rnn_step: Array, kappa: Array, state: Array, prev_rows: Array, token: Array, fold_q: Array, fold_sc: Array, base_b: Array, at: c_int, vocab: c_int, softcap: f32) !MarkovStep {
+    const step = try g.fromSlice(i32, &.{at}, &.{1});
+    const cap = try g.fromSlice(f32, &.{softcap}, &.{1});
+    const p = try markovStepRnn(g, rnn_step, kappa, state, prev_rows, token, step);
+    const o = try markovPick(g, try markovFoldQ8Row(g, p, fold_q, fold_sc, base_b, step, vocab, cap, ops.dtype(rnn_step)), p, state, cap);
+    return .{ .token = o[0], .confidence = o[1], .state = o[2] };
+}
+
+/// `markov_step_rnn.metal`: the step's RNN projection `[3 R]` f32 over `rnn_step` `[3 R, 2 R]` plus `kappa`'s row.
+pub fn markovStepRnn(g: *Graph, rnn_step: Array, kappa: Array, state: Array, prev_rows: Array, token: Array, step: Array) !Array {
+    const rank = @divExact(ops.shape(rnn_step)[0], 3);
+    const o = try launch(g, &markov_step_rnn_kernel, &.{ rnn_step, kappa, state, prev_rows, token, step }, 1, .{.{ .shape = &.{3 * rank}, .dtype = .float32 }}, 32 * 3 * rank, 256, &.{
+        .{ "T", .{ .dtype = ops.dtype(rnn_step) } }, .{ "R", .{ .int = rank } },
+    });
+    return o[0];
+}
+
+/// `markov_fold_q8_row.metal`: each threadgroup's (max, argmax, sum of exp) over 64 vocab rows of the 8-bit fold.
+pub fn markovFoldQ8Row(g: *Graph, p: Array, fold_q: Array, fold_sc: Array, base_b: Array, step: Array, vocab: c_int, cap: Array, dt: Dtype) ![3]Array {
+    const groups = @divTrunc(vocab + 63, 64);
+    return launch(g, &markov_fold_q8_row_kernel, &.{ p, fold_q, fold_sc, base_b, step, cap }, 3, .{
+        .{ .shape = &.{groups}, .dtype = .float32 }, .{ .shape = &.{groups}, .dtype = .uint32 }, .{ .shape = &.{groups}, .dtype = .float32 },
+    }, groups * 256, 256, &.{
+        .{ "T", .{ .dtype = dt } }, .{ "R", .{ .int = ops.shape(fold_q)[1] } }, .{ "VOCAB", .{ .int = vocab } },
+    });
 }
 
 /// `markov_rnn.metal`: the step's RNN projection `[3 R]` f32.
@@ -858,7 +1278,11 @@ pub fn markovPickRnnLaw(g: *Graph, part: [4]Array, p: Array, state: Array, cap: 
 /// `[1, S, H, R]` and the sinks `[1, S, H]` f32.
 const ReadInputs = struct { q: Array, bias: Array, sinks: Array };
 
-fn readInputs(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, rel_states: Array, sinks: Array, offset: c_int) !ReadInputs {
+/// `readInputs` before the bias projection: q, the relative states as the projection reads them (log-scaled on a
+/// global layer past the floor) and the sinks.
+const ReadStates = struct { q: Array, states: Array, sinks: Array };
+
+fn readStates(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, rel_states: Array, sinks: Array, offset: c_int) !ReadStates {
     const dt = ops.dtype(q_rows);
     const s = ops.shape(q_rows)[1];
     var q = try g.transpose(q_rows, &.{ 0, 2, 1, 3 });
@@ -869,8 +1293,14 @@ fn readInputs(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, rel
         q = try g.astype(try g.mul(try g.astype(q, .float32), tau), dt);
         states = try g.astype(try g.mul(try g.astype(states, .float32), try g.reshape(tau, &.{ 1, s, 1, 1 })), dt);
     }
-    return .{ .q = q, .bias = try g.matmul(states, try g.astype(L.rel_proj, dt)), .sinks = try g.contiguous(try g.astype(sinks, .float32)) };
+    return .{ .q = q, .states = states, .sinks = try g.contiguous(try g.astype(sinks, .float32)) };
 }
+
+fn readInputs(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, rel_states: Array, sinks: Array, offset: c_int) !ReadInputs {
+    const r = try readStates(g, L, cfg, q_rows, rel_states, sinks, offset);
+    return .{ .q = r.q, .bias = try g.matmul(r.states, try g.astype(L.rel_proj, ops.dtype(q_rows))), .sinks = r.sinks };
+}
+
 
 /// Rows from which a read behind a cache splits over the keys (`splitRead`): below it MLX's attention under a mask is
 /// as fast; up to `split_rows`, the kernel's one 8-row fragment.
@@ -956,7 +1386,7 @@ pub const nax_lanes = 4;
 
 /// Keys per split for long-context attention: saturates wide GPUs up to 128 splits solo (bounded per-launch partial
 /// memory across multi-lane batches so `splits * here <= 128`).
-fn splitKps(most: c_int, here: usize) c_int {
+pub fn splitKps(most: c_int, here: usize) c_int {
     const max_splits: c_int = @max(@as(c_int, 16), @divTrunc(@as(c_int, 128), @as(c_int, @intCast(here))));
     const base: c_int = if (most <= 1040) 64 else if (most <= 4096) 128 else if (most <= 16384) 256 else 512;
     const floor_kps: c_int = @divTrunc(@divTrunc(most + max_splits - 1, max_splits) + 31, 32) * 32;
@@ -1593,6 +2023,35 @@ fn biasesOf(bank: anytype) Array {
     return if (bank.b.ctx != null) bank.b else bank.s;
 }
 
+/// The sorted pairs' gate_up over the prompt rows `x` `[1, S, D]` read through `token` (each pair's row): the NAX
+/// gather's mapped kernel, `[N, 1, out]`; null where it does not serve (no NAX, another format).
+fn gatherMapped(g: *Graph, x: Array, token: Array, bank: *const MoeBank, sel: Array) !?Array {
+    const gnax = @import("../../sdk/blocks/moe/gather_qmm_nax.zig");
+    const sh = ops.shape(x);
+    const rows = try g.reshape(x, &.{ sh[1], 1, sh[2] });
+    const map = try g.contiguous(try g.astype(token, .uint32));
+    const ids = try g.contiguous(try g.astype(sel, .uint32));
+    const y = (try gnax.sortedGatherMappedPrompt(rows, map, bank.w, bank.s, bank.b, ids, bank.qp.bits, bank.qp.group_size, bank.qp.mode.isFp4(), nax.verifyQmmNaxAvailable(), g.s)) orelse return null;
+    return try g.adopt(y);
+}
+
+/// `gatherMapped` then `activation` as one launch (`MLX_SERVE_INKLING2_GU_ACT`, default on): the NAX gather's
+/// interleaved epilogue takes the rounded gate (even) and up (odd) products, times the expert's `scale` (null = none),
+/// through act.metal's soft-capped SwiGLU under `caps`: `[N, 1, I]`, the same values. Null where it does not serve.
+fn gatherMappedAct(g: *Graph, x: Array, token: Array, bank: *const MoeBank, sel: Array, scale: ?Array, caps: Array) !?Array {
+    if (!lever(.MLX_SERVE_INKLING2_GU_ACT)) return null;
+    const gnax = @import("../../sdk/blocks/moe/gather_qmm_nax.zig");
+    const sh = ops.shape(x);
+    const banks = ops.shape(bank.w)[0];
+    const per = if (scale) |sc| try g.reshape(try g.astype(sc, .float32), &.{banks}) else try g.ones(&.{banks}, .float32);
+    const aux = try g.contiguous(try g.concat(&.{ try g.astype(caps, .float32), per }, 0));
+    const rows = try g.reshape(x, &.{ sh[1], 1, sh[2] });
+    const map = try g.contiguous(try g.astype(token, .uint32));
+    const ids = try g.contiguous(try g.astype(sel, .uint32));
+    const y = (try gnax.sortedGateUpInterleaved(rows, map, bank.w, bank.s, bank.b, ids, aux, bank.qp.bits, bank.qp.group_size, bank.qp.mode.isFp4(), nax.verifyQmmNaxAvailable(), g.s)) orelse return null;
+    return try g.adopt(y);
+}
+
 /// Tile width for grouped expert picks: 4 up to 128 picks (low register footprint for solo/2-slot verifies), 8 past that.
 pub fn groupTileWidth(n: c_int) c_int {
     return if (n <= 128) 4 else 8;
@@ -1837,9 +2296,13 @@ fn expertsWithConsts(g: *Graph, L: *const Layer, cfg: *const Config, consts: ?*c
     const pairs = try layers.pairs(g, cfg, m.x, picks[0]);
     const sel = pairs.sel;
     const sorted = pairs.inverse != null;
+    // `MLX_SERVE_INKLING2_GATHER_ROWMAP` (default on): a prompt chunk's gate_up reads each sorted pair's row through its
+    // row map (the NAX gather's mapped kernel, the same tile and bytes), so the pairs' rows are never written out.
+    const mapped: ?Array = if (s > 1 and L.gate_up.qp.mode.isFp4() and ops.dtype(m.x) == .bfloat16 and lever(.MLX_SERVE_INKLING2_GATHER_ROWMAP)) pairs.token else null;
 
     const act: [1]Array = if (up) |u| .{u[0]} else blk: {
-        const gu = try layers.gather(g, pairs.rows, &L.gate_up, sel, sorted);
+        if (mapped) |t| if (try gatherMappedAct(g, m.x, t, &L.gate_up, sel, if (L.gate_up_scale.ctx != null) L.gate_up_scale else null, caps)) |act_rows| break :blk .{act_rows};
+        const gu = if (mapped) |t| (try gatherMapped(g, m.x, t, &L.gate_up, sel)) orelse try layers.gather(g, pairs.rows, &L.gate_up, sel, sorted) else try layers.gather(g, pairs.rows, &L.gate_up, sel, sorted);
         if (!floating(ops.dtype(gu))) return error.Inkling2StepDtype;
         break :blk .{try activation(g, gu, sel, if (L.gate_up_scale.ctx != null) L.gate_up_scale else caps, caps, L.gate_up_scale.ctx != null)};
     };
@@ -2051,4 +2514,17 @@ test "inkling2 kernels: a threadgroup past the pipeline's limit is refused by na
     try std.testing.expectEqualSlices(c_int, &.{ 768, 576, 384, 288, 256, 192, 128, 96 }, seen[0..count]);
     stream_threads = 64;
     try std.testing.expect(streamGroup(64).? == 64 and narrow(64) and streamGroup(64).? == 32 and !narrow(64));
+}
+
+test "inkling2 pipeline record: a scalar input parses to no dimensions; a malformed line is an error, not a record's end" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = (try parseRecordLine(a, "msv_inkling2_relsplit\t96,8,1\t96,1,1\tT=d12;D=i128;F=f1;\t12:1x24x8x128;10:;\t10:1x192x2;")).?;
+    try std.testing.expectEqual(@as(usize, 2), r.ins.len);
+    try std.testing.expectEqual(@as(usize, 0), r.ins[1].shape.len);
+    try std.testing.expectEqual(@as(usize, 4), r.ins[0].shape.len);
+    try std.testing.expectEqual(@as(usize, 3), r.targs.len);
+    try std.testing.expectError(error.PipelineRecordLine, parseRecordLine(a, "msv_inkling2_relsplit\t96,8"));
+    try std.testing.expect((try parseRecordLine(a, "msv_not_a_kernel\t1,1,1")) == null);
 }

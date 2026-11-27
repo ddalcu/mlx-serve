@@ -138,7 +138,9 @@ pub const Caps = packed struct(u64) {
     ablation: bool = false,
     /// A prompt forward asked for `Logits.last_row` returns its last row's logits alone, bit-identical to that row of
     /// its `.all_rows` result, and still every hidden and captured row it is asked for. The host asks for it on the
-    /// prefill's prompt forwards unless the request echoes prompt logprobs.
+    /// prefill's prompt forwards unless the request echoes prompt logprobs. The SDK's bases slice the head's call over
+    /// every row of the forward, so the bytes do not depend on the mode; a plugin that runs its own head owns the same
+    /// contract.
     prompt_last_row: bool = false,
     /// The load streams an MLX pack's routed experts on the `stream_experts` setting (`sdk/weights/streamed.zig`):
     /// the preflight bills their slot rows, not the experts. Without it the setting is refused by name.
