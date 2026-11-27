@@ -67,7 +67,7 @@ fn step(m: *trunk.Model, h: *const trunk.LingHead, ops: *const abi.CacheOps, f: 
     defer _ = mlx.mlx_array_free(x);
     const a_in = try m.rmsNorm(x, h.input_norm);
     defer _ = mlx.mlx_array_free(a_in);
-    const attn = try mla.mlaAttn(m, sl, a_in, &h.mla, 0, @intCast(len), 1, n, n > 1);
+    const attn = try mla.mlaAttn(m, sl, a_in, &h.mla, 0, @intCast(len), 1, n, n > 1, .{ .ctx = null });
     defer _ = mlx.mlx_array_free(attn);
     var x1 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x1);

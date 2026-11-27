@@ -6,6 +6,9 @@ const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const family = @import("../../sdk/bases/kda_hybrid/config.zig");
+const mrope = @import("../../sdk/vision/mrope.zig");
+
+const gpa = std.heap.c_allocator;
 
 const Config = family.Config;
 const Objects = family.Objects;
@@ -22,7 +25,7 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"rapid-mlx/Ling-3.0-tiny-MLX-4bit"},
 };
 
-pub const model_types = [_][]const u8{"bailing_hybrid"};
+pub const model_types = [_][]const u8{ "bailing_hybrid", "bailing_moe_v3_vl" };
 
 pub const claims = sdk.claimsByType(&model_types);
 
@@ -95,6 +98,35 @@ fn readLing(c: *Config, o: Objects) ParseError!void {
     // Ling-3.1's clamps after the SiLU, one entry a trunk layer (0 = none).
     try limitList(cfg, "expert_swiglu_limit_list", &c.expert_limit_out);
     try limitList(cfg, "share_expert_swiglu_limit_list", &c.shared_limit_out);
+
+    // VL packs (`bailing_moe_v3_vl`): the Qwen3-VL-shaped tower beside the trunk (its weights are the
+    // engine's `vision_encoder`'s; the plugin only needs the facts). Serve exactly the release shape:
+    // patch 16 / temporal 2 / merge 2, a projection-less merger, no deepstack outputs, and an
+    // M-RoPE split summing to half the MLA rope width. The M-RoPE facts themselves are plugin-owned
+    // and attached to `Parsed.mrope` by `parse` — the base Config carries no VL fields.
+    if (field(o.root, "vision_config")) |vc| if (vc == .object) {
+        const mt = field(o.root, "model_type") orelse return error.InvalidConfigField;
+        if (mt != .string or !std.mem.eql(u8, mt.string, "bailing_moe_v3_vl")) return error.Unsupported;
+        const vco = vc.object;
+        try intIf(vco, "depth", &c.qv_depth);
+        try intIf(vco, "hidden_size", &c.qv_hidden);
+        try intIf(vco, "num_heads", &c.qv_heads);
+        try intIf(vco, "intermediate_size", &c.qv_intermediate);
+        try intIf(vco, "patch_size", &c.qv_patch);
+        try intIf(vco, "temporal_patch_size", &c.qv_temporal_patch);
+        try intIf(vco, "spatial_merge_size", &c.qv_merge);
+        try intIf(vco, "num_position_embeddings", &c.qv_num_pos_emb);
+        if (c.qv_patch != 16 or c.qv_temporal_patch != 2 or c.qv_merge != 2) return error.Unsupported;
+        if (c.qv_heads == 0 or c.qv_hidden % c.qv_heads != 0) return error.Unsupported;
+        c.qv_head_dim = c.qv_hidden / c.qv_heads;
+        if (field(vco, "deepstack_visual_indexes")) |d| if (d == .array and d.array.items.len > 0) return error.Unsupported;
+        if (field(vco, "disable_merger_proj")) |d| if (d == .bool and !d.bool) return error.Unsupported;
+        var sections: [3]u32 = .{ 0, 0, 0 };
+        const ms = field(cfg, "mrope_section") orelse return error.Unsupported;
+        if (ms != .array or ms.array.items.len != 3) return error.InvalidConfigField;
+        for (ms.array.items, 0..) |item, i| sections[i] = try u32v(item);
+        if ((sections[0] + sections[1] + sections[2]) * 2 != c.mla_qk_rope_head_dim) return error.Unsupported;
+    };
     try intIf(cfg, "num_nextn_predict_layers", &c.nextn_layers);
 
     // A Ling streaming pack (the EXL3 repack beside its `experts.bin`) keeps the release's config.json, so it names no
@@ -135,10 +167,38 @@ fn lingFacts(c: *const Config, p: *abi.Parsed) void {
 
 pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.Str, span: ?*const abi.LayerSpan, stub: bool, out: *abi.Parsed) callconv(.c) abi.Verdict {
     _ = settings_json;
-    return family.parseWith("bailing_hybrid", &model_types, readLing, lingFacts, dir, config_json, span, stub, out);
+    const v = family.parseWith("bailing_hybrid", &model_types, readLing, lingFacts, dir, config_json, span, stub, out);
+    if (!v.isOk()) return v;
+    // A VL pack's M-RoPE: the MLA rope slice's plain theta spectrum (no YaRN), the checkpoint's
+    // section split, and the bailing axis layout (`mrope.zig`); plus image advertising at the
+    // image-pad token. The spectrum is plugin-owned until `freeParsed`.
+    const c: *const Config = family.of(out);
+    if (c.streamed_bank) return v;
+    const root = std.json.parseFromSlice(std.json.Value, gpa, config_json.slice(), .{ .ignore_unknown_fields = true }) catch return v;
+    defer root.deinit();
+    const vc = root.value.object.get("vision_config") orelse return v;
+    if (vc == .object) {
+        const rd: usize = c.mla_qk_rope_head_dim;
+        if (rd == 0 or rd % 2 != 0) return abi.Verdict.named(.failed, "bailing_hybrid: a VL pack without an MLA rope width");
+        var sections: [3]u32 = .{ 0, 0, 0 };
+        if (root.value.object.get("mrope_section")) |ms| if (ms == .array) for (ms.array.items, 0..) |item, i| {
+            if (i >= 3) break;
+            if (item == .integer) sections[i] = @intCast(item.integer);
+        };
+        const freqs = gpa.alloc(f64, rd / 2) catch return abi.Verdict.named(.failed, "bailing_hybrid: out of memory");
+        mrope.computeInvFreq(freqs, rd, c.rope_theta);
+        out.*.mrope = .{ .sections = sections, .rope_dims = @intCast(rd), .selector = .bailing, .inv_freq = .of(freqs), .mscale = 1 };
+        out.*.caps.images = true;
+        out.*.placeholder_ids.image = c.image_token_id;
+    }
+    return v;
 }
 
-pub const freeParsed = family.freeParsed;
+pub fn freeParsed(p: *abi.Parsed) callconv(.c) void {
+    if (p.mrope.inv_freq.len > 0) gpa.free(@constCast(p.mrope.inv_freq.slice()));
+    p.mrope.inv_freq = .{};
+    family.freeParsed(p);
+}
 pub const of = family.of;
 
 // ── tests ──

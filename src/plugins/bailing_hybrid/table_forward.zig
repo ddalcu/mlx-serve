@@ -7,6 +7,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const slots_mod = @import("../../sdk/bases/kda_hybrid/slots.zig");
 const trunk = @import("../../sdk/bases/kda_hybrid/trunk.zig");
 const glm_moe = @import("../../sdk/bases/kda_hybrid/moe.zig");
+const spliceVisionRows = @import("../../sdk/vision/splice.zig").spliceVisionRows;
 const mla = @import("mla.zig");
 
 const Array = mlx.mlx_array;
@@ -16,6 +17,13 @@ pub const Step = struct {
     capture: bool = false,
     capture_ids: []const u32 = &.{},
     capture_out: []Array = &.{},
+    /// Media rows spliced at the image placeholders of a prompt chunk, from row `media_offset`
+    /// (a VL prompt; empty for text, whose rows never carry a media table).
+    media: Array = .{ .ctx = null },
+    media_offset: usize = 0,
+    /// The prompt chunk's M-RoPE angles `[2, 1, 1, rows, rope_dims]` (a VL prefill inside the
+    /// position table); empty where the 1-D position carries the delta (text, and every decode row).
+    mrope: Array = .{ .ctx = null },
     eval_every: u32 = 0,
 };
 
@@ -24,6 +32,12 @@ pub fn hidden(m: *trunk.Model, st: *const Step, token_ids: Array) !Array {
     const offset: c_int = @intCast(st.slots.positions[0]);
     var h = try m.embedding(token_ids);
     defer _ = mlx.mlx_array_free(h);
+    {
+        errdefer _ = mlx.mlx_array_free(h);
+        // Prompt rows only; the splice frees the embedding it replaces.
+        if (st.media.ctx != null and mlx.getShape(h)[1] > 1 and m.c.image_token_id != 0)
+            h = try spliceVisionRows(h, token_ids, st.media, m.c.image_token_id, 0, 0, st.media_offset, m.s);
+    }
     const x_shape = mlx.getShape(h);
     const batch: c_int = x_shape[0];
     const seq_len: c_int = x_shape[1];
@@ -43,7 +57,7 @@ pub fn hidden(m: *trunk.Model, st: *const Step, token_ids: Array) !Array {
 
         const attn_out = switch (lw.mixer) {
             .kda => |*la| try slots_mod.kda(m, st.slots, 0, normed, la, li, batch, seq_len, is_prefill, st.capture),
-            .mla => |*w| try mla.mlaAttn(m, st.slots, normed, w, li, offset, batch, seq_len, is_prefill),
+            .mla => |*w| try mla.mlaAttn(m, st.slots, normed, w, li, offset, batch, seq_len, is_prefill, st.mrope),
             .dsa => return error.LingLayerIsDsa,
         };
         defer _ = mlx.mlx_array_free(attn_out);

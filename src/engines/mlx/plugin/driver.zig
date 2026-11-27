@@ -27,6 +27,7 @@ const dsv41VisionKey = @import("../../../sdk/weights/load.zig").dsv41VisionKey;
 const KVCache = @import("../kv/cache.zig").KVCache;
 const bf16Scalar = @import("../load/weights.zig").bf16Scalar;
 const mrope = @import("../../../sdk/vision/mrope.zig");
+const bailing_mrope = @import("../../../plugins/bailing_hybrid/mrope.zig");
 const mropeContext = @import("../methods/mrope.zig").mropeContext;
 const SSMCacheEntry = @import("../ssm/entry.zig").SSMCacheEntry;
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
@@ -1229,7 +1230,7 @@ fn mropeAngles(xfm: *const Transformer, ctx: *const ForwardCtx, base: usize, row
     const a = xfm.allocator;
     const sel = try a.alloc(u8, inv.len);
     defer a.free(sel);
-    mrope.interleavedSelector(sel, m.sections);
+    if (m.selector == .bailing) bailing_mrope.bailingSelector(sel, m.sections) else mrope.interleavedSelector(sel, m.sections);
     const buf = try a.alloc(f32, 2 * rows * rd);
     defer a.free(buf);
     mrope.fillCosSin(buf[0 .. rows * rd], buf[rows * rd ..], mropeContext(ctx), base, 1, rows, inv, sel, rd, m.mscale);

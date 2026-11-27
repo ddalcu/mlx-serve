@@ -30,6 +30,11 @@ with the KDA-hybrid family's readers (`sdk/bases/kda_hybrid/config.zig`) and loa
   not `exact_drafted` (sampled MTP is not position-keyed). Bar: `served_test.zig`.
 - Ling-3.1's clamps AFTER the SiLU, per layer: `expert_swiglu_limit_list` (routed, the bank's or the composed chain's)
   and `share_expert_swiglu_limit_list` (shared, `moe.Moe.Weights.shared_limit_out`); GLM's clamp is BEFORE it.
+- Ling VL (`bailing_moe_v3_vl`): the Qwen3-VL tower runs in the engine's qwen arm; `QwenVision.Geometry`'s merger key
+  stems load the tail from the pack-root `linear_proj.0`/`linear_proj.2` (Qwen's merger weights under other names,
+  same linear→exact-GELU→linear); `mrope.zig` owns the bailing axis selector + position table (`MropeFacts.selector =
+  .bailing`) and `parse` the plugin-owned spectrum; the processor's CLIP mean/std ride `VisionPreproc`.
+  Oracle: `vision_test.zig` + `mrope.zig`.
 
 Served, legacy forward deleted (`engines/mlx/plugin/served.zig`; `glm5_next/served_test.zig`: steps and greedy
 through the driver). DFlash via `trunk_weight` + captures.

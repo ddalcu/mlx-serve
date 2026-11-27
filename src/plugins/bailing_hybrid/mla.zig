@@ -7,6 +7,8 @@ const Slots = @import("../../sdk/bases/kda_hybrid/slots.zig").Slots;
 const trunk = @import("../../sdk/bases/kda_hybrid/trunk.zig");
 const rowByRowSdpa = @import("../../sdk/blocks/attention/sdpa.zig").rowByRowSdpa;
 
+const Array = mlx.mlx_array;
+
 pub fn mlaAttn(
     self: *const trunk.Model,
     sl: Slots,
@@ -17,6 +19,9 @@ pub fn mlaAttn(
     batch: c_int,
     seq_len: c_int,
     is_prefill: bool,
+    /// A VL prompt chunk's M-RoPE angles `[2, 1, 1, rows, rope_dims]`; empty = scalar rope at `offset`
+    /// (every text row, and every decode row, whose position already carries the M-RoPE delta).
+    mrope: mlx.mlx_array,
 ) !mlx.mlx_array {
     const cfg = self.c;
     const h_count: c_int = @intCast(cfg.num_attention_heads);
@@ -97,14 +102,30 @@ pub fn mlaAttn(
         try mlx.check(mlx.mlx_transpose_axes(&k_pe_t, k_pe_h, &perm, 4, self.s));
     }
 
-    // RoPE over the whole rope slice, adjacent-pair rotation.
-    const traditional = cfg.rope_interleaved_pairs;
-    var q_rot = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q_rot);
-    var k_rot = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(k_rot);
-    try mlx.check(mlx.mlx_fast_rope(&q_rot, q_rot_raw, rope_d, traditional, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, offset, .{ .ctx = null }, self.s));
-    try mlx.check(mlx.mlx_fast_rope(&k_rot, k_pe_t, rope_d, traditional, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, offset, .{ .ctx = null }, self.s));
+    // RoPE over the whole rope slice, adjacent-pair rotation. A VL prefill chunk inside the
+    // position table ropes from its per-token angles (the checkpoint's interleaved arm reads one
+    // value a pair from the duplicated first half); everything else takes scalar theta, whose
+    // position the caller already shifted by the slot's M-RoPE delta.
+    var q_rot: Array = .{ .ctx = null };
+    var k_rot: Array = .{ .ctx = null };
+    errdefer {
+        _ = mlx.mlx_array_free(q_rot);
+        _ = mlx.mlx_array_free(k_rot);
+    }
+    defer {
+        _ = mlx.mlx_array_free(q_rot);
+        _ = mlx.mlx_array_free(k_rot);
+    }
+    if (mrope.ctx != null) {
+        q_rot = try applyMropeInterleaved(self.s, q_rot_raw, mrope);
+        k_rot = try applyMropeInterleaved(self.s, k_pe_t, mrope);
+    } else {
+        const traditional = cfg.rope_interleaved_pairs;
+        q_rot = mlx.mlx_array_new();
+        k_rot = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_fast_rope(&q_rot, q_rot_raw, rope_d, traditional, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, offset, .{ .ctx = null }, self.s));
+        try mlx.check(mlx.mlx_fast_rope(&k_rot, k_pe_t, rope_d, traditional, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, offset, .{ .ctx = null }, self.s));
+    }
 
     // The rope key is MQA — one head, replicated so the cached K is a
     // plain [B,H,S,qk_dim] tensor the standard cache path can carry.
@@ -195,4 +216,77 @@ pub fn mlaAttn(
     // shipped mirror) skip the path either way; this only binds a future
     // bf16 mirror, and it can opt in once someone A/Bs it.
     return self.mm(&fa.o, attn_flat);
+}
+
+/// Apply the M-RoPE table `[2, 1, 1, rows, rd]` (cos over sin, the driver's `Forward.mrope`) to a
+/// `[B, H, rows, rd]` rope slice with ADJACENT-pair rotation: pair (2j, 2j+1) turns by table slot j,
+/// read from the duplicated first half — what the checkpoint's `apply_rotary_pos_emb_interleave`
+/// does ("one value per pair is taken from the first half").
+fn applyMropeInterleaved(s: mlx.mlx_stream, x: mlx.mlx_array, table: mlx.mlx_array) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    const b = sh[0];
+    const hd = sh[1];
+    const rows = sh[2];
+    const rd = sh[3];
+    const half: c_int = @divExact(rd, 2);
+    const s5 = [_]c_int{ 1, 1, 1, 1, 1 };
+
+    var cos = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(cos);
+    try mlx.check(mlx.mlx_slice(&cos, table, &[_]c_int{ 0, 0, 0, 0, 0 }, 5, &[_]c_int{ 1, 1, 1, rows, half }, 5, &s5, 5, s));
+    defer _ = mlx.mlx_array_free(cos);
+    var sin = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(sin);
+    try mlx.check(mlx.mlx_slice(&sin, table, &[_]c_int{ 1, 0, 0, 0, 0 }, 5, &[_]c_int{ 2, 1, 1, rows, half }, 5, &s5, 5, s));
+    defer _ = mlx.mlx_array_free(sin);
+
+    // The pair halves, by striding the last axis 2.
+    const s4 = [_]c_int{ 1, 1, 1, 2 };
+    var x1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x1);
+    try mlx.check(mlx.mlx_slice(&x1, x, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ b, hd, rows, rd }, 4, &s4, 4, s));
+    var x2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x2);
+    try mlx.check(mlx.mlx_slice(&x2, x, &[_]c_int{ 0, 0, 0, 1 }, 4, &[_]c_int{ b, hd, rows, rd }, 4, &s4, 4, s));
+
+    var t1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t1);
+    try mlx.check(mlx.mlx_multiply(&t1, x1, cos, s));
+    var t2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t2);
+    try mlx.check(mlx.mlx_multiply(&t2, x2, sin, s));
+    var o1 = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o1);
+    try mlx.check(mlx.mlx_subtract(&o1, t1, t2, s));
+
+    var t3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t3);
+    try mlx.check(mlx.mlx_multiply(&t3, x2, cos, s));
+    var t4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t4);
+    try mlx.check(mlx.mlx_multiply(&t4, x1, sin, s));
+    var o2 = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o2);
+    try mlx.check(mlx.mlx_add(&o2, t3, t4, s));
+
+    // Interleave back: stack the pair halves along a new last axis and flatten it.
+    const pshape = [_]c_int{ b, hd, rows, half, 1 };
+    var p1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(p1);
+    try mlx.check(mlx.mlx_reshape(&p1, o1, &pshape, 5, s));
+    var p2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(p2);
+    try mlx.check(mlx.mlx_reshape(&p2, o2, &pshape, 5, s));
+    const cat_arrs = [_]mlx.mlx_array{ p1, p2 };
+    const cat_vec = mlx.mlx_vector_array_new_data(&cat_arrs, 2);
+    defer _ = mlx.mlx_vector_array_free(cat_vec);
+    var stacked = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(stacked);
+    try mlx.check(mlx.mlx_concatenate_axis(&stacked, cat_vec, 4, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, stacked, &[_]c_int{ b, hd, rows, rd }, 4, s));
+    _ = mlx.mlx_array_free(stacked);
+    _ = mlx.mlx_array_free(o1);
+    _ = mlx.mlx_array_free(o2);
+    return out;
 }

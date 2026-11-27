@@ -48,6 +48,10 @@ pub const VisionPreproc = struct {
     merge: u32 = 2,
     min_pixels: u32 = 0,
     max_pixels: u32 = 0,
+    /// The processor's per-channel normalization ((v/255 − mean)/std). Qwen's 0.5/0.5 default;
+    /// CLIP-lineage towers ship their own in `preprocessor_config.json`.
+    mean: [3]f32 = .{ 0.5, 0.5, 0.5 },
+    std: [3]f32 = .{ 0.5, 0.5, 0.5 },
     /// muse/lfm2/glm: the resize cap is on MERGED tokens, not pixels.
     max_tokens: u32 = 0,
     /// lfm2/glm: the budget has a FLOOR too — a small image is upscaled to it.

@@ -232,7 +232,7 @@ pub const VisionEncoder = struct {
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
         if (config.radio_vision) return initRadio(allocator, config, weights);
         if (config.is_gemma4_unified) return initUnified(allocator, config, weights);
-        if (config.qwen_vision) return initQwen(allocator, config, weights);
+        if (config.qwen_vision or config.ling_vision) return initQwen(allocator, config, weights);
         if (config.muse_vision) return initMuse(allocator, config, weights);
         if (config.lfm2_vision) return initLfm2(allocator, config, weights);
         if (config.glm_vision) return initGlm(allocator, config, weights);

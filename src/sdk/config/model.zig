@@ -662,6 +662,10 @@ pub const ModelConfig = struct {
     qv_merge: u32 = 2, // spatial merge: merge×merge patches → one LLM token
     qv_num_pos_emb: u32 = 0, // learned pos table entries (e.g. 2304 = 48×48)
     qv_out_hidden: u32 = 0, // merger output dim (= text hidden_size)
+    // Merger tail key stems; Ling VL ships the same tail as `linear_proj.0`/`.2` (probed at the
+    // pack root — see sdk/vision/qwen_vision.zig `mergerWeight`).
+    qv_merger_fc1_key: []const u8 = "merger.linear_fc1",
+    qv_merger_fc2_key: []const u8 = "merger.linear_fc2",
     // Image-area bounds from processor_config.json / preprocessor_config.json.
     // 0 means absent: the Qwen processor defaults remain the fallback.
     qv_min_pixels: u32 = 0,
@@ -698,6 +702,10 @@ pub const ModelConfig = struct {
     // vision_config keys as Qwen's); these are the tower's own extras and the
     // processor's token budget, in MERGED tokens.
     glm_vision: bool = false,
+    /// Ling VL (`bailing_moe_v3_vl`): the Qwen3-VL-shaped `model.visual.*` tower plus `linear_proj`
+    /// (its merger tail loads from the pack-root `linear_proj.*`); geometry rides the qwen3-vl
+    /// `qv_*` fields, the M-RoPE layout lives in `plugins/bailing_hybrid/mrope.zig`.
+    ling_vision: bool = false,
     glmv_proj_intermediate: u32 = 10240,
     glmv_eps: f32 = 1e-5,
     glmv_swiglu_limit: f32 = 10.0,
@@ -3520,7 +3528,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.query_pre_attn_scalar = config.head_dim;
         }
         config.ensureHy3Terminators();
-    } else if (std.mem.eql(u8, model_type, "bailing_hybrid")) {
+    } else if (std.mem.eql(u8, model_type, "bailing_hybrid") or std.mem.eql(u8, model_type, "bailing_moe_v3_vl")) {
         // inclusionAI Ling 3.0 (bailing_hybrid; BailingMoeV3ForCausalLM). A
         // KDA + MLA hybrid MoE: three Kimi-Delta-Attention linear layers for
         // every Multi-head-Latent-Attention layer (layer_group_size 4, so
@@ -3743,6 +3751,48 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // The MTP head ships disabled (num_nextn_predict_layers 0) and no
         // mtp.* weights are in the checkpoint. The single terminator
         // (`<|role_end|>`) rides the root eos_token_id — no additive merge.
+
+        // VL packs (`bailing_moe_v3_vl`): a Qwen3-VL-shaped tower (`qwen3_moe_vit`, `model.visual.*`)
+        // splices rows at ``, with 3-D M-RoPE positions. The tower's geometry rides the
+        // qwen3-vl `qv_*` fields; the release's processor bounds (min/max pixels) default to the
+        // checkpoint's and its token ids are top-level. Vision is only on when a vision_config ships:
+        // text packs (which strip it) keep the exact `bailing_hybrid` behaviour.
+        if (jsonField(cfg_obj, "vision_config")) |vc_val| {
+            if (vc_val == .object) {
+                config.ling_vision = true;
+                try parseQvGeometry(&config, vc_val.object);
+                if (jsonField(vc_val.object, "min_pixels")) |v| {
+                    if (v == .integer) config.qv_min_pixels = try jsonU32(v);
+                }
+                if (jsonField(vc_val.object, "max_pixels")) |v| {
+                    if (v == .integer) config.qv_max_pixels = try jsonU32(v);
+                }
+                if (config.qv_min_pixels == 0) config.qv_min_pixels = 4096;
+                if (config.qv_max_pixels == 0) config.qv_max_pixels = 4194304;
+                // The merged width is 4·hidden and the merger tail (loaded from `linear_proj.*`)
+                // carries it to the text width; the engine's out-hidden is the TEXT width the
+                // trunk splices at.
+                config.qv_out_hidden = config.hidden_size;
+                config.qv_merger_fc1_key = "linear_proj.0";
+                config.qv_merger_fc2_key = "linear_proj.2";
+            }
+        }
+        // Interleaved M-RoPE sections, top-level on a VL pack (the text config flattens them here).
+        if (jsonField(cfg_obj, "mrope_section")) |v| {
+            if (v == .array) for (v.array.items, 0..) |item, i| {
+                if (i >= 3) break;
+                if (item == .integer) config.mrope_section[i] = try jsonU32(item);
+            };
+        }
+        if (jsonField(cfg_obj, "image_token_id")) |v| {
+            if (v == .integer) config.image_token_id = try jsonU32(v);
+        }
+        if (jsonField(cfg_obj, "vision_start_token_id")) |v| {
+            if (v == .integer) config.vision_start_token_id = try jsonU32(v);
+        }
+        if (jsonField(cfg_obj, "vision_end_token_id")) |v| {
+            if (v == .integer) config.vision_end_token_id = try jsonU32(v);
+        }
     } else if (std.mem.eql(u8, model_type, "laguna")) {
         // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder; nvfp4 experts, 256K
         // ctx). Pure-attention MoE that rides the qwen3.5/hy_v3 MoE forward

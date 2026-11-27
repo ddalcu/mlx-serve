@@ -164,6 +164,7 @@ fn one(comptime fwd: type, m: *Model, ops: *const abi.CacheOps, f: *const abi.Fo
         st.media = .{ .ctx = f.media.ctx };
         st.media_offset = f.media_offset;
     }
+    if (@hasField(fwd.Step, "mrope")) st.mrope = .{ .ctx = f.mrope.ctx };
     try finish(m, f, try fwd.hidden(m, &st, ids), out);
     for (caps[0..n_cap], 0..) |c, i| {
         var r = mlx.mlx_array_new();

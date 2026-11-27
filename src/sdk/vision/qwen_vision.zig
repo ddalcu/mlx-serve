@@ -316,6 +316,12 @@ fn normalizeQwenPixel(value: u8) f32 {
     return @as(f32, @floatFromInt(value)) / 127.5 - 1.0;
 }
 
+/// A processor's own normalization, ((v/255 − mean)/std). Qwen's 0.5/0.5 reduces to
+/// `normalizeQwenPixel` bit for bit (dividing by 0.5 is an exact exponent shift).
+fn normalizePixel(value: u8, mean: f32, stdev: f32) f32 {
+    return (@as(f32, @floatFromInt(value)) / 255.0 - mean) / stdev;
+}
+
 pub fn resizeRgbBicubicNormalizedChw(
     allocator: std.mem.Allocator,
     dst: []f32,
@@ -329,7 +335,7 @@ pub fn resizeRgbBicubicNormalizedChw(
 }
 
 /// Pillow-compatible resize of interleaved RGB, followed by float32 CHW
-/// normalization (mean/std 0.5 — both processors use it). Each separable pass
+/// normalization at the Qwen default (mean/std 0.5). Each separable pass
 /// is quantized to uint8, matching the reference's `PIL.Image.resize` boundary.
 pub fn resizeRgbNormalizedChw(
     allocator: std.mem.Allocator,
@@ -340,6 +346,23 @@ pub fn resizeRgbNormalizedChw(
     target_h: u32,
     target_w: u32,
     filter: Filter,
+) !void {
+    return resizeRgbNormalizedChwNorm(allocator, dst, rgb, source_h, source_w, target_h, target_w, filter, .{ 0.5, 0.5, 0.5 }, .{ 0.5, 0.5, 0.5 });
+}
+
+/// `resizeRgbNormalizedChw` with the PROCESSOR's per-channel mean/std (CLIP packs ship their own;
+/// Qwen's is 0.5/0.5). The quantized-to-uint8 resize is shared, so a 0.5/0.5 call is bit-equal.
+pub fn resizeRgbNormalizedChwNorm(
+    allocator: std.mem.Allocator,
+    dst: []f32,
+    rgb: []const u8,
+    source_h: u32,
+    source_w: u32,
+    target_h: u32,
+    target_w: u32,
+    filter: Filter,
+    mean: [3]f32,
+    stdev: [3]f32,
 ) !void {
     const source_plane: usize = @as(usize, source_h) * source_w;
     const target_plane: usize = @as(usize, target_h) * target_w;
@@ -388,7 +411,7 @@ pub fn resizeRgbNormalizedChw(
                         const source = ((bound.start + source_offset) * target_w + x) * 3 + channel;
                         sum += @as(i64, horizontal[source]) * @as(i64, weight);
                     }
-                    dst[channel * target_plane + destination] = normalizeQwenPixel(clipFixedResample(sum));
+                    dst[channel * target_plane + destination] = normalizePixel(clipFixedResample(sum), mean[channel], stdev[channel]);
                 }
             }
         }
@@ -398,7 +421,7 @@ pub fn resizeRgbNormalizedChw(
                 const source = (y * target_w + x) * 3;
                 const destination = y * target_w + x;
                 inline for (0..3) |channel| {
-                    dst[channel * target_plane + destination] = normalizeQwenPixel(horizontal[source + channel]);
+                    dst[channel * target_plane + destination] = normalizePixel(horizontal[source + channel], mean[channel], stdev[channel]);
                 }
             }
         }
@@ -626,9 +649,14 @@ pub const QwenVision = struct {
         merge: u32,
         num_pos_emb: u32,
         out_hidden: u32,
+        /// The merger's two projections' key stems (`.weight`/`.bias`-suffixed at load). Ling VL
+        /// runs this same tower with the tail under `linear_proj.0`/`linear_proj.2`, which sit at
+        /// the pack ROOT rather than under the tower prefix.
+        merger_fc1_key: []const u8 = "merger.linear_fc1",
+        merger_fc2_key: []const u8 = "merger.linear_fc2",
 
         pub fn of(cfg: anytype) Geometry {
-            return .{ .patch = cfg.qv_patch, .temporal_patch = cfg.qv_temporal_patch, .depth = cfg.qv_depth, .hidden = cfg.qv_hidden, .heads = cfg.qv_heads, .head_dim = cfg.qv_head_dim, .merge = cfg.qv_merge, .num_pos_emb = cfg.qv_num_pos_emb, .out_hidden = cfg.qv_out_hidden };
+            return .{ .patch = cfg.qv_patch, .temporal_patch = cfg.qv_temporal_patch, .depth = cfg.qv_depth, .hidden = cfg.qv_hidden, .heads = cfg.qv_heads, .head_dim = cfg.qv_head_dim, .merge = cfg.qv_merge, .num_pos_emb = cfg.qv_num_pos_emb, .out_hidden = cfg.qv_out_hidden, .merger_fc1_key = cfg.qv_merger_fc1_key, .merger_fc2_key = cfg.qv_merger_fc2_key };
         }
     };
 
@@ -720,10 +748,10 @@ pub const QwenVision = struct {
             .blocks = blocks,
             .merger_norm_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.norm.weight")),
             .merger_norm_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.norm.bias")),
-            .merger_fc1_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc1.weight")),
-            .merger_fc1_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc1.bias")),
-            .merger_fc2_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc2.weight")),
-            .merger_fc2_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc2.bias")),
+            .merger_fc1_w = try mergerWeight(weights, &kbuf, prefix, config.merger_fc1_key, "weight"),
+            .merger_fc1_b = try mergerWeight(weights, &kbuf, prefix, config.merger_fc1_key, "bias"),
+            .merger_fc2_w = try mergerWeight(weights, &kbuf, prefix, config.merger_fc2_key, "weight"),
+            .merger_fc2_b = try mergerWeight(weights, &kbuf, prefix, config.merger_fc2_key, "bias"),
         };
     }
 
@@ -1266,6 +1294,16 @@ fn fmtLayer(buf: *[256]u8, prefix: []const u8, layer: usize, suffix: []const u8)
 
 fn fmtKey(buf: *[256]u8, prefix: []const u8, suffix: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, suffix }) catch unreachable;
+}
+
+/// A merger projection: the key under the tower prefix first, then BARE — Ling VL's merger tail
+/// (`linear_proj.0`/`linear_proj.2`) sits at the pack root beside the prefixed tower.
+fn mergerWeight(weights: *const Weights, kbuf: *[256]u8, prefix: []const u8, stem: []const u8, leaf: []const u8) !mlx.mlx_array {
+    var leafbuf: [96]u8 = undefined;
+    const leaf_key = std.fmt.bufPrint(&leafbuf, "{s}.{s}", .{ stem, leaf }) catch unreachable;
+    if (weights.get(fmtKey(kbuf, prefix, leaf_key)) orelse weights.get(leaf_key)) |arr| return arr;
+    log.warn("MISSING QWEN VISION WEIGHT: {s}{s}\n", .{ prefix, leaf_key });
+    return error.MissingVisionWeights;
 }
 
 /// Tower spellings we serve, most common first. Qwen3-VL checkpoints say

@@ -59,6 +59,7 @@ pub const types = [_][]const u8{
     "glm5_next",
     "glm5_next_text",
     "bailing_hybrid",
+    "bailing_moe_v3_vl",
 };
 
 /// Decoder types whose plugin serves the embedding arm too (a padded batch, no cache): a pack whose folder name makes

@@ -585,7 +585,9 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
         std.mem.startsWith(u8, key, "vision_projection.") or
         // avlp12's Qwen3.8 "Alis" packs spell the Qwen3-VL tower
         // `model.visual.` (pure rename of `vision_tower.`).
-        std.mem.startsWith(u8, key, "model.visual."))) return false;
+        std.mem.startsWith(u8, key, "model.visual.") or
+        // Ling VL's merger tail (`linear_proj.*`), the pack root beside the prefixed tower.
+        std.mem.startsWith(u8, key, "linear_proj."))) return false;
     if (is_vision and !load_vision) return false;
     return true;
 }
