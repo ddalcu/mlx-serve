@@ -2005,6 +2005,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         var dir: [std.fs.max_path_bytes]u8 = undefined;
         const d = try dflash2.Drafter.load(try std.fmt.bufPrint(&dir, "{s}/{s}", .{ ctx.model_dir.slice(), config.dflash2_dir }), dc, c.hidden_size, &head, r.s, draft_bits);
         m.drafter2 = d;
+        log.info("[inkling2] drafter: dflash2 ({s})\n", .{config.dflash2_dir});
         // The mask token's row as the anchor's: through the table, then its norm.
         var g = ops.Graph.init(gpa, r.s);
         defer g.deinit();
@@ -2018,6 +2019,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         m.base.weights.spec = &m.spec;
     } else if (drafts_on) if (c.draft) |dc| if (try draft.Drafter.load(ctx, dc, c.hidden_size, &head, r.s, draft_bits)) |d| {
         m.drafter = d;
+        log.info("[inkling2] drafter: the bundled mtp head\n", .{});
         m.tap_visits = dc.taps;
         m.spec = .{ .visits = m.tap_visits[0 .. dc.tap_count - 1], .keep = @intCast(dc.window - 1) };
         if (dc.fullBytesPerToken() > 0) m.spec.full = d;
