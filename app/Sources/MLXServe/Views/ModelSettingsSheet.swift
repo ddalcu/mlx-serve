@@ -72,8 +72,6 @@ struct ModelSettingsSheet: View {
     @State private var customValue = ""
     /// The `config_overrides` box, as typed; `override.configOverrides` only takes it while it is valid.
     @State private var configText = ""
-    /// The one-click YaRN recipe for this pack, when its arch scales that way and its own window is readable.
-    @State private var yarnPlan: YarnTemplate.Plan?
     @State private var busy = false
     /// The save reloads the model; the sheet stays up and shows the load until it is ready.
     @State private var reloading = false
@@ -110,6 +108,13 @@ struct ModelSettingsSheet: View {
 
     /// Why the typed `config_overrides` cannot be stored, if it cannot.
     private var configError: String? { ConfigOverrides.rejection(configText) }
+
+    /// The rope recipe the server's plugin advertises for this model. The plugin decides which arch scales and
+    /// how far; the sheet only offers what it is told.
+    private var yarnRecipe: (json: String, window: Int)? {
+        guard let live, live.loaded, let json = live.yarnOverrides, live.yarnWindow > 0 else { return nil }
+        return (json, live.yarnWindow)
+    }
 
     /// A running server answers from `/v1/models`; otherwise the app's own disk probe.
     private var mtpAvailable: Bool? {
@@ -313,15 +318,14 @@ struct ModelSettingsSheet: View {
                         HStack {
                             Text("Config overrides").font(.app(.body))
                             Spacer()
-                            if let yarn = yarnPlan {
+                            if let yarn = yarnRecipe {
                                 Button {
                                     configText = yarn.json
-                                    override.ctxSize = yarn.ctxSize
+                                    override.ctxSize = yarn.window
                                 } label: {
-                                    Text("YaRN ×\(yarn.factor) to \(ContextSizeDisplay.formatTokens(yarn.ctxSize))")
-                                        .font(.app(.body))
+                                    Text("YaRN to \(ContextSizeDisplay.formatTokens(yarn.window))").font(.app(.body))
                                 }
-                                .help("Fills the box with rope_parameters of this pack's own window, and sets the context size to what that rope resolves.")
+                                .help("Fills the box with the rope document this model's plugin advertises, and sets the context size to what it resolves to.")
                             }
                         }
                     } footer: {
@@ -427,7 +431,6 @@ struct ModelSettingsSheet: View {
             override = settingsFile.override(for: request.path) ?? ModelOverride()
             initialOverride = override
             configText = override.configOverrides ?? ""
-            yarnPlan = YarnTemplate.plan(modelType: modelType, native: Self.nativeWindow(in: request.path))
             inheritedGeneration = (try? GenerationDefaultsFile.load()) ?? .init()
             packDrafter = DrafterGems.packDrafterFolder(modelDir: request.path)
             let gems = SpeculationSocketRow.gems(repoId: repoId, packDrafter: packDrafter, mtpAvailable: rows.mtp,
@@ -473,14 +476,6 @@ struct ModelSettingsSheet: View {
             }
         }
         dismiss()
-    }
-
-    /// The pack's declared window from its own `config.json`; 0 when the file cannot be read (a GGUF, another tool's layout).
-    private static func nativeWindow(in dir: String) -> Int {
-        let path = (dir as NSString).appendingPathComponent("config.json")
-        guard let data = FileManager.default.contents(atPath: path),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return 0 }
-        return YarnTemplate.nativeWindow(config: obj)
     }
 
     private static func weightsGB(in dir: String) -> Double {

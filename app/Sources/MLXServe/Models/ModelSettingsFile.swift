@@ -285,41 +285,6 @@ enum ConfigOverrides {
     }
 }
 
-/// The one-click YaRN recipe, so extending a context is a choice rather than a string to remember. It is
-/// offered only for the arch the engine scales this way (`qwen4_exp`, the recipe in `--help`) and every number
-/// comes from the pack's own declared window.
-enum YarnTemplate {
-    struct Plan: Equatable {
-        /// The document for `config_overrides`.
-        var json: String
-        /// The context the scaled rope resolves, for the Context size picker.
-        var ctxSize: Int
-        var factor: Int
-    }
-
-    static let target = 1_048_576
-
-    /// The pack's own window: `text_config` first, then the root; 0 when it names neither.
-    static func nativeWindow(config: [String: Any]) -> Int {
-        if let tc = config["text_config"] as? [String: Any],
-           let n = tc["max_position_embeddings"] as? Int, n > 0 { return n }
-        return (config["max_position_embeddings"] as? Int) ?? 0
-    }
-
-    /// ×4 over `native`, or ×2 when 4× would pass the target; nil for another arch, an unknown window, or a
-    /// pack already there.
-    static func plan(modelType: String?, native: Int) -> Plan? {
-        guard modelType == "qwen4_exp" || modelType == "qwen4_exp_text" else { return nil }
-        guard native > 0 else { return nil }
-        let factor = native * 4 <= target ? 4 : (native * 2 <= target ? 2 : 0)
-        guard factor > 0 else { return nil }
-        let scaled = native * factor
-        let json = "{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":\(factor),"
-            + "\"original_max_position_embeddings\":\(native)},\"max_position_embeddings\":\(scaled)}}"
-        return Plan(json: json, ctxSize: scaled, factor: factor)
-    }
-}
-
 /// Where the overflow card's "increase context" button goes.
 enum ContextIncreaseTarget: Equatable {
     case modelSettings
