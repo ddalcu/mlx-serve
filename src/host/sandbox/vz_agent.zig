@@ -47,6 +47,7 @@ const c = struct {
     extern "c" fn waitpid(pid: c_int, status: *c_int, options: c_int) c_int;
     extern "c" fn kill(pid: c_int, sig: c_int) c_int;
     extern "c" fn setsid() c_int;
+    extern "c" fn setpgid(pid: c_int, pgid: c_int) c_int;
     extern "c" fn chdir(path: [*:0]const u8) c_int;
     // `open` is VARIADIC in C. Declaring `mode` as a fixed third parameter is
     // an ABI mismatch on Darwin arm64 (variadic args go on the stack, named
@@ -352,17 +353,19 @@ fn childExec(spawn: Spawn, cwd_z: ?[*:0]const u8) noreturn {
     c._exit(127); // exec failed — the shell's own "command not found" code
 }
 
-/// SIGTERM, a real grace interval, then SIGKILL any survivor. The waitpid here
+/// SIGTERM to the child's process group, a real grace interval, then SIGKILL any survivor. The group (`foregroundRun`
+/// makes the child its leader) holds what the shell started, which outlives the shell otherwise. The waitpid here
 /// uses WNOHANG only to PROBE — the caller still does the reaping wait.
 fn killChild(pid: c_int) void {
-    _ = c.kill(pid, SIGTERM);
+    _ = c.kill(-pid, SIGTERM);
     var status: c_int = 0;
     var waited_us: c_uint = 0;
     while (waited_us < 500_000) : (waited_us += 20_000) {
-        if (c.waitpid(pid, &status, WNOHANG) != 0) return; // exited (or gone)
+        // The shell exited (or is gone) and nothing is left in its group.
+        if (c.waitpid(pid, &status, WNOHANG) != 0 and c.kill(-pid, 0) != 0) return;
         _ = c.usleep(20_000);
     }
-    _ = c.kill(pid, SIGKILL);
+    _ = c.kill(-pid, SIGKILL);
 }
 
 // ─── Serving one connection ──────────────────────────────────────────────────
@@ -418,6 +421,7 @@ fn foregroundRun(gpa: std.mem.Allocator, sock: c_int, spawn: Spawn, cwd_z: ?[*:0
     const pid = c.fork();
     if (pid < 0) return error.ForkFailed;
     if (pid == 0) {
+        _ = c.setpgid(0, 0); // its own group, which a hangup kills whole (killChild)
         _ = c.dup2(in_fds[0], 0);
         _ = c.dup2(out_fds[1], 1);
         _ = c.dup2(err_fds[1], 2);
@@ -427,6 +431,7 @@ fn foregroundRun(gpa: std.mem.Allocator, sock: c_int, spawn: Spawn, cwd_z: ?[*:0
         childExec(spawn, cwd_z);
     }
 
+    _ = c.setpgid(pid, pid); // also here, so a hangup right after the fork finds the group
     _ = c.close(in_fds[0]);
     _ = c.close(out_fds[1]);
     _ = c.close(err_fds[1]);
@@ -948,9 +953,9 @@ test "e2e: a large payload survives framing" {
 }
 
 test "e2e: host hangup kills a running child instead of leaking it" {
-    var h = try Harness.start(.{ .command = "echo up; sleep 60" });
+    // The shell starts a process and reports its pid before the hangup: the kill must reach it, not only the shell.
+    var h = try Harness.start(.{ .command = "sleep 60 & echo $!; wait" });
 
-    // Wait for proof the child is alive, then hang up mid-run.
     var header: [header_len]u8 = undefined;
     try readExact(h.host, &header); // started
     const started = try decodeHeader(&header);
@@ -959,16 +964,29 @@ test "e2e: host hangup kills a running child instead of leaking it" {
     try readExact(h.host, &pid_buf);
     const pid = std.mem.readInt(i32, &pid_buf, .big);
 
-    try readExact(h.host, &header); // stdout "up\n"
-    var out_buf: [3]u8 = undefined;
-    try readExact(h.host, &out_buf);
+    // stdout: the background process's pid, one line (it may come in more than one frame).
+    var line: [32]u8 = undefined;
+    var len: usize = 0;
+    while (std.mem.indexOfScalar(u8, line[0..len], '\n') == null) {
+        try readExact(h.host, &header);
+        const head = try decodeHeader(&header);
+        try std.testing.expectEqual(Channel.stdout, head.channel);
+        try std.testing.expect(len + head.len <= line.len);
+        try readExact(h.host, line[len..][0..head.len]);
+        len += head.len;
+    }
+    const grandchild = try std.fmt.parseInt(c_int, std.mem.trimEnd(u8, line[0..len], "\n"), 10);
+    defer if (c.kill(grandchild, 0) == 0) {
+        _ = c.kill(grandchild, SIGKILL); // a failed run leaves nothing running
+    };
 
-    h.deinit(); // closes the socket; `pump` must SIGTERM the child
+    h.deinit(); // closes the socket; `pump` must kill the child's process group
 
-    // The child is gone: reaped by the agent, so `kill(pid, 0)` fails.
-    // (A leaked `sleep 60` would still answer.)
-    _ = usleep(200_000);
+    // Both are gone (the shell reaped by the agent, its child by init), within 2 s.
+    var waited_us: c_uint = 0;
+    while ((c.kill(pid, 0) == 0 or c.kill(grandchild, 0) == 0) and waited_us < 2_000_000) : (waited_us += 20_000) _ = usleep(20_000);
     try std.testing.expect(c.kill(pid, 0) != 0);
+    try std.testing.expect(c.kill(grandchild, 0) != 0);
 }
 
 test "e2e: a detached process outlives the connection and reports its pid" {
