@@ -140,8 +140,9 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   (`wideLayer`), its routes predicted before the attention (`readAhead`) so the reads overlap it.
 - Slot rows per phase (`Routed.phase`): a call wider than `region_rows` is a prompt, else decode; the phase change
   grows the rows into what the prompt's working set held.
-- The bank bills its rows at the load (`streamBudget`: the GPU working set less the wired margin, `stream_host_bytes`,
-  the memory in use settled from the load's start (`inUseAt`) and the phase's working set at the context); the context
+- The bank bills its rows at the load (`streamBudget`: the host's GPU ceiling `LoadCtx.gpuCeiling`, never the device's,
+  less the wired margin, `stream_host_bytes`, the memory in use settled from the load's start (`inUseAt`) and the
+  phase's working set at the context); the context
   is `ctx_size`, else the largest `stream_context_rungs` rung keeping `stream_min_rows` (`bank_rows`). The engine's
   prefill guard leaves the pack to it (`streamed_weights`); a prompt past the billed context is refused by name.
 - A plain MLX pack streams with the per-model `stream_experts` (`openPackBank`, the `trunk` arm): one fetch serves

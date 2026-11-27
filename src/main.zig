@@ -27,6 +27,7 @@ const drafter_mod = @import("plugins/gemma4/assistant_drafter.zig");
 const mtp_mod = @import("sdk/spec/mtp/mtp.zig");
 const chat_mod = @import("host/chat/chat.zig");
 const server_mod = @import("host/http/server.zig");
+const memory_ceiling = @import("host/registry/memory_ceiling.zig");
 const ablation_api = @import("host/api/ablation.zig");
 const launchSsmCheckpointStride = @import("engines/mlx/admission/hot_cache_plan.zig").launchSsmCheckpointStride;
 const scheduler_mod = @import("engines/mlx/scheduler.zig");
@@ -436,6 +437,20 @@ fn printUsage(io: std.Io) void {
         \\  --wired-margin-gib <n>
         \\                      How far under iogpu.wired_limit_mb a plan may
         \\                        reach (default: 8, integers 2..32).
+        \\  --gpu-ceiling-gib <n>
+        \\                      Plan every memory bill (load, context, a
+        \\                        streamed expert bank) as if the GPU's
+        \\                        working set were <n> GiB (integers 4..4096;
+        \\                        default: the machine's). Bounds the plans,
+        \\                        not what Metal grants. Wins over
+        \\                        MLX_SERVE_GPU_CEILING_MB.
+        \\  --memory-preset <name>
+        \\                      --gpu-ceiling-gib for a named Mac: its RAM
+        \\                        less 16 GiB:
+    ++ " " ++ memory_ceiling.memory_preset_list ++ ".\n" ++
+        \\                        Give it or --gpu-ceiling-gib, not both.
+        \\
+    ++
         \\  --tokenize-cache-entries <n>
         \\                      Per-model LRU cache of chat-template render +
         \\                        tokenize results (default: 4). Skips re-
@@ -751,6 +766,8 @@ pub fn main(init: std.process.Init) !void {
     var engine_override: ?gguf_meta.Engine = null;
     var log_level_explicit = false;
     var decode_share_flag: ?[]const u8 = null;
+    var gpu_ceiling_gib: ?u64 = null;
+    var memory_preset: ?u64 = null;
     var i: usize = arg_start;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
@@ -1112,6 +1129,18 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--os-reserve-gib: expected an integer 0..64, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--gpu-ceiling-gib") and i + 1 < args.len) {
+            i += 1;
+            gpu_ceiling_gib = memory_ceiling.parseGpuCeilingGib(args[i]) catch {
+                log.err("--gpu-ceiling-gib: expected an integer {d}..{d}, got '{s}'\n", .{ memory_ceiling.min_ceiling_gib, memory_ceiling.max_ceiling_gib, args[i] });
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--memory-preset") and i + 1 < args.len) {
+            i += 1;
+            memory_preset = memory_ceiling.parseMemoryPreset(args[i]) catch {
+                log.err("--memory-preset: expected one of {s}, got '{s}'\n", .{ memory_ceiling.memory_preset_list, args[i] });
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
             i += 1;
             server_mod.serverState().wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
@@ -1240,6 +1269,10 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
+    if (memory_ceiling.ceilingFlag(gpu_ceiling_gib, memory_preset) catch {
+        log.err("--gpu-ceiling-gib and --memory-preset both set the GPU ceiling: give one\n", .{});
+        std.process.exit(1);
+    }) |c| memory_ceiling.forceGpuCeiling(c.bytes, c.flag);
     if (!server_mod.mtpAllowedByDefault(mtp_forced, mlx.metalKernelsAvailable(), mlx.cudaAvailable())) enable_mtp = false;
 
     // One value for the three media seams (they run under gen.zig with no
@@ -1747,7 +1780,7 @@ const logResolveGgufError = model_discovery.logResolveGgufError;
 /// Registry resident-memory cap: the user's explicit value, or Metal's working-set limit.
 /// 0 = query failed → unlimited (the count cap still applies).
 fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
-    return model_registry_mod.ModelRegistry.residentMemCap(explicit, val, mlx.maxRecommendedWorkingSet());
+    return model_registry_mod.ModelRegistry.residentMemCap(explicit, val, memory_ceiling.deviceWorkingSet());
 }
 
 fn dirBasename(path: []const u8) []const u8 {

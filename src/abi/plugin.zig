@@ -443,7 +443,7 @@ pub const LoadCtx = extern struct {
     /// GPU bytes a streamed bank may fill in the decode phase: the GPU ceiling less the decode phase's bill at 16K + 1K
     /// and the wired margin; 0 = the host has none (`decodeRoom`).
     stream_room_decode: u64 = 0,
-    /// The GPU ceiling both rooms were taken from (a bank calibration's key); 0 = unknown.
+    /// The GPU ceiling both rooms were taken from (a bank calibration's key, a streamed bank's budget); 0 = unknown.
     gpu_ceiling_bytes: u64 = 0,
     /// Each phase's bill growth from the rooms' cell (`stream_room_cell`) to the server's context limit: what a bank
     /// calibrated at the cell gives up for a longer context; 0 = none or unknown.

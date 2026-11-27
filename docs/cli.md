@@ -108,6 +108,8 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--dist-device rdma_enX` | none | The RDMA port facing the worker (`ibv_devinfo`) |
 | `--dist-split N` | by free memory | Pipeline: layers kept on this Mac, on a full-attention boundary |
 | `--model-dir PATH` | none | Discover and serve every model in a folder (LRU resident set). Repeatable — folders merge first-wins |
+| `--gpu-ceiling-gib N` | the machine's | Plan every memory bill (load, context, a streamed expert bank) as if the GPU's working set were N GiB, 4 to 4096: serve as a smaller Mac would. It bounds the plans, not what Metal grants; it wins over `MLX_SERVE_GPU_CEILING_MB` |
+| `--memory-preset m5-128\|m5-256` | none | `--gpu-ceiling-gib` for a named Mac, its RAM less 16 GiB: `m5-128` = 112, `m5-256` = 240. Give it or `--gpu-ceiling-gib`, not both |
 | `--max-resident-mem N{MB,GB}` | auto | Summed memory cap across loaded models; decides whether a model may load at all (auto = the GPU working-set limit, `0` disables) |
 | `--max-resident-models N` | `3` | How many models stay loaded at once (LRU-evicted) |
 | `--idle-evict-secs N` | off | Unload models nobody is using after this many idle seconds |

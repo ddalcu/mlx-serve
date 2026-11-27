@@ -253,7 +253,7 @@ fn settledAvail(need: u64, first: u64, ctx: anytype, comptime measure: fn (@Type
 /// memory that pages to host RAM, so there RAM is the bound (and an allocation failure is a
 /// catchable error, not Metal's process-killing OOM); 0 = none.
 fn loadGpuLimit() u64 {
-    return if (mlx.cudaAvailable()) 0 else mlx.maxRecommendedWorkingSet();
+    return if (mlx.cudaAvailable()) 0 else @import("../../../host/registry/memory_ceiling.zig").deviceWorkingSet();
 }
 
 fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64) u64 {
