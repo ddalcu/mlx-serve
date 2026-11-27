@@ -1121,6 +1121,22 @@ pub fn storeFor(tok: *const Tokenizer) ?*Store {
     return st;
 }
 
+/// The spec-gate exemption's probe: does the record hold a continuation for
+/// this request's exact prompt tail? A full-tail match (the backward extension
+/// reaches the whole probe window) means a reply to this prompt ending was
+/// recorded before — the one case the prompt's own n-gram score cannot see.
+/// Anything less (a novel prompt, an empty record, a variant that shares only
+/// part of the tail) fails, so the gate treats the request exactly as upstream
+/// does: arming PLD there costs its mode overhead with nothing to draft.
+pub fn promptMayDraft(tok: *const Tokenizer, prompt: []const u32) bool {
+    if (prompt.len < key_len) return false;
+    const st = storeFor(tok) orelse return false;
+    st.mutex.lock();
+    defer st.mutex.unlock();
+    const m = st.record.longest(prompt);
+    return m.len >= @min(prompt.len, max_match);
+}
+
 /// A per-stream reader over the record for this tokenizer (null when Recall is off).
 pub fn armReader(tok: *const Tokenizer) ?Reader {
     const st = storeFor(tok) orelse return null;

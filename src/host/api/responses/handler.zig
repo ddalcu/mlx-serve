@@ -874,9 +874,13 @@ fn handleResponsesInner(
         if (score < spec_gate_threshold) {
             // Recall exemption — same rule as the other surfaces: the record
             // can draft what earlier requests wrote, invisible to the prompt's
-            // score; realized acceptance (yield gate + landing rates) governs.
-            const recall_armed = recall_mod.shared_state.get().enabled and
-                if (lm.tokenizer) |t| recall_mod.storeFor(t) != null else false;
+            // score; realized acceptance (yield gate + landing rates) governs, and only
+            // requests whose prompt tail the record actually holds are exempted
+            // (promptMayDraft): arming PLD otherwise pays its mode overhead for nothing.
+            const recall_armed = if (lm.tokenizer) |t|
+                recall_mod.promptMayDraft(t, prompt_ids)
+            else
+                false;
             if (enable_pld_resp and !pld_explicit_in_json and !recall_armed) {
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld_resp = false;

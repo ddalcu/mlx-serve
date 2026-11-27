@@ -837,8 +837,10 @@ pub fn handleChatCompletions(
             // pricing disable on REALIZED acceptance, the same evidence that
             // exempts the DFlash drafter below. Without this, a novel prompt
             // (a re-sent question whose reply the record holds) never drafts.
-            const recall_armed = recall_mod.shared_state.get().enabled and
-                if (lm.tokenizer) |t| recall_mod.storeFor(t) != null else false;
+            const recall_armed = if (lm.tokenizer) |t|
+                recall_mod.promptMayDraft(t, prompt_ids)
+            else
+                false;
             if (enable_pld and !pld_explicit_in_json and !recall_armed) {
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld = false;
