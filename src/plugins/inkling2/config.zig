@@ -464,6 +464,8 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         p.spec.native_block = d.block;
     };
     if (c.vision != null) p.placeholder_ids.image = int(field(root, "image_token_id")) orelse 200054;
+    // The release thinks unless asked not to: its template's effort defaults to high (0.9).
+    p.chat.thinking_default = .on;
     const s = &p.shell;
     s.* = .{
         .vocab_size = c.unpadded_vocab_size,

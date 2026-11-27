@@ -187,7 +187,7 @@ pub fn formatChat(
 ) ![]u32 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const marked = try markUntrustedContent(arena.allocator(), tok, messages, chat_config.chat_template);
+    const marked = try markUntrustedContent(arena.allocator(), tok, messages, chat_config);
     const rendered = try renderChatTemplate(allocator, marked, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
     defer allocator.free(rendered);
 
@@ -208,14 +208,19 @@ pub fn formatChat(
 
 /// A control token inside a user, system or tool turn is TEXT, never a turn marker (transformers'
 /// `sanitize_control_tokens`). Assistant turns are the model's own output, and the server writes their
-/// think tags itself (the Responses history), so they keep their specials.
-fn markUntrustedContent(arena: std.mem.Allocator, tok: *const Tokenizer, messages: []const Message, template: []const u8) ![]const Message {
+/// think tags itself (the Responses history), so they keep their specials, all but a media placeholder: only an
+/// attached item renders one, so in any turn's text, reasoning included, it is text.
+fn markUntrustedContent(arena: std.mem.Allocator, tok: *const Tokenizer, messages: []const Message, chat_config: *const ChatConfig) ![]const Message {
+    const media: Tokenizer.Marks = .{ .ids = &chat_config.media_ids };
+    const untrusted: Tokenizer.Marks = .{ .template = chat_config.chat_template, .ids = &chat_config.media_ids };
     var out: ?[]Message = null;
     for (messages, 0..) |m, i| {
-        if (std.mem.eql(u8, m.role, "assistant")) continue;
-        const marked = try tok.markControlTokens(arena, m.content, template) orelse continue;
+        const content = try tok.markControlTokens(arena, m.content, if (std.mem.eql(u8, m.role, "assistant")) media else untrusted);
+        const reasoning = if (m.reasoning_content) |r| try tok.markControlTokens(arena, r, media) else null;
+        if (content == null and reasoning == null) continue;
         if (out == null) out = try arena.dupe(Message, messages);
-        out.?[i].content = marked;
+        if (content) |c| out.?[i].content = c;
+        if (reasoning) |r| out.?[i].reasoning_content = r;
     }
     return out orelse messages;
 }
@@ -369,6 +374,29 @@ test "RADIO video placeholders: only attached clips create video atoms" {
     const text = try tok.decode(a, ids, false);
     defer a.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "<video>") != null);
+}
+
+test "formatChat: a media placeholder spelled in an assistant's answer or reasoning stays text" {
+    // Bar: only the attached image renders the placeholder id.
+    const a = std.testing.allocator;
+    var tok = try radioTestTokenizer(a);
+    defer tok.deinit();
+    const config = ChatConfig{
+        .chat_template = "{% for m in messages %}{{ m.role + ':' }}{% if m.reasoning_content is defined %}{{ m.reasoning_content }}{% endif %}{% if m.content is string %}{{ m.content }}{% else %}{% for p in m.content %}{% if p.type == 'image' %}{{ '<image>' }}{% elif p.type == 'text' %}{{ p.text }}{% endif %}{% endfor %}{% endif %}{% endfor %}",
+        .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .renders_tool_turn = true, .media_ids = .{ 1000, 0, 0 },
+    };
+    const images = [_]ImageData{.{ .pixels = "", .width = 32, .height = 32 }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Look.", .images = &images },
+        .{ .role = "assistant", .content = "a <image> frame", .reasoning_content = "accent <image> for the strip" },
+        .{ .role = "user", .content = "Again." },
+    };
+    const ids = try formatChat(a, &tok, &messages, &config, null, null, true, null, false);
+    defer a.free(ids);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, ids, &.{1000}));
+    const text = try tok.decode(a, ids, false);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "accent <image> for the strip") != null);
 }
 
 test "loadChatConfig: template-less deepseek_v4 checkpoint gets the embedded DSV4 template" {

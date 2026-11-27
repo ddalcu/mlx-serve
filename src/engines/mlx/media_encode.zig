@@ -193,7 +193,12 @@ fn encodePiece(req: *VisionEncodeRequest, vision_enc: *VisionEncoder, item: Visi
 /// The plugin's decoded input for one piece: RGB8 frames (an image is one) or 16 kHz f32 samples.
 fn pluginInput(item: VisionItem) abi.MediaInput {
     return switch (item) {
-        .image => |img| .{ .kind = .image, .rgb = .of(img.pixels), .width = img.width, .height = img.height, .frames = 1 },
+        .image => |img| blk: {
+            // RGB8, then the RGBA8 of an image with transparency (`decodeImageToPixels`, `.plugin_rgb`).
+            const n = @as(usize, img.width) * img.height * 3;
+            const has_alpha = img.pixels.len == n / 3 * 7;
+            break :blk .{ .kind = .image, .rgb = .of(img.pixels[0..if (has_alpha) n else img.pixels.len]), .rgba = if (has_alpha) .of(img.pixels[n..]) else .{}, .width = img.width, .height = img.height, .frames = 1 };
+        },
         .video => |v| .{ .kind = .video, .rgb = .of(v.pixels), .width = v.grid_w, .height = v.grid_h, .frames = v.grid_t, .fps = v.fps },
         .audio => |pcm| .{ .kind = .audio, .samples = .of(@as([*]const f32, @ptrCast(@alignCast(pcm.ptr)))[0 .. pcm.len / 4]), .sample_rate = 16000 },
     };
@@ -297,4 +302,16 @@ fn finishEmbedRequest(sch: *Scheduler, req: *EmbedRequest, err_name: []const u8)
     req.error_name = req.allocator.dupe(u8, err_name) catch null;
     req.done = true;
     req.done_cond.broadcast(sch.io);
+}
+
+// Bar: a transparent image's RGBA, carried behind its RGB, reaches the plugin as `rgba`; an opaque one as RGB only.
+test "pluginInput: an image's RGBA behind its RGB reaches the plugin as rgba" {
+    var both: [2 * 3 * 7]u8 = undefined;
+    for (&both, 0..) |*b, i| b.* = @intCast(i);
+    const in = pluginInput(.{ .image = .{ .pixels = &both, .width = 2, .height = 3 } });
+    try std.testing.expectEqualSlices(u8, both[0 .. 2 * 3 * 3], in.rgb.slice());
+    try std.testing.expectEqualSlices(u8, both[2 * 3 * 3 ..], in.rgba.slice());
+    const plain = pluginInput(.{ .image = .{ .pixels = both[0 .. 2 * 3 * 3], .width = 2, .height = 3 } });
+    try std.testing.expectEqual(@as(usize, 2 * 3 * 3), plain.rgb.len);
+    try std.testing.expectEqual(@as(usize, 0), plain.rgba.len);
 }

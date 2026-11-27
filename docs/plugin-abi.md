@@ -897,6 +897,7 @@ One request's media item as the host decoded it: RGB8 frames (an image is one fr
 | `fps` | `f32` | `0` | The rate a video's frames were sampled at; 0 = the client did not say. |
 | `samples` | `Span(f32)` | `.{}` |  |
 | `sample_rate` | `u32` | `0` |  |
+| `rgba` | `Span(u8)` | `.{}` | An image with transparency as decoded, RGBA8 with straight alpha (`rgb` is it composited onto white); empty for an opaque image. A processor that composites onto its own background reads it (check `size` first). |
 
 ### `MediaItem` (extern struct)
 

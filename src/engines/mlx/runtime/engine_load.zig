@@ -162,7 +162,7 @@ pub fn aneOpen(sch: *Scheduler, params: anytype) !bool {
     defer if (in_dir) |d| gpa.free(d);
     const drafter: ?[]const u8 = if (chosen) |d| (if (d.len > 0) d else null) else in_dir;
     // The GPU's sampling rule (`installSuppressMask`): reserved specials and padding rows are never drawn.
-    const suppress_ids: []u32 = tokenizer_mod.reservedOutputIds(gpa, params.tok.flagged_specials, params.chat_config.chat_template, params.config.eosTokenSlice()) catch &.{};
+    const suppress_ids: []u32 = tokenizer_mod.reservedOutputIds(gpa, params.tok.flagged_specials, params.chat_config.chat_template, params.config.eosTokenSlice(), &params.config.mediaPlaceholderIds()) catch &.{};
     defer gpa.free(suppress_ids);
     const settings = try std.json.Stringify.valueAlloc(gpa, AneSettings{
         .slots = params.ane_slots,

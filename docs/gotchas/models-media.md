@@ -214,6 +214,37 @@ true` tokens minus EOS ids minus specials the chat template uses (derived, never
 to the logits (`unpadded_vocab_size`), riding `SamplingParams.suppress_mask` into both samplers and the stochastic
 verify; logprobs stay raw, so rank 1 may differ from the emitted token by design. `[suppress]` logs engagement.
 
+### A media placeholder the model sampled killed its session (Inkling 2)
+Defect: in 2 of 9 long pi sessions Inkling 2 Mini wrote its image placeholder `<|unused_200054|>` into its reasoning;
+pi sent the reasoning back, the prompt rendered 11 placeholders for 10 images, and every later request was a 400.
+Cause: the reserved mask exempts every special the chat template spells, and the template spells the placeholder; on
+replay only user, system and tool content had its control tokens marked as text, so the assistant's reasoning
+tokenized back to the placeholder id. Fix: `reservedOutputIds` reserves the declared placeholders
+(`ModelConfig.mediaPlaceholderIds`) whatever the template says, and `markUntrustedContent` marks them as text in an
+assistant's answer and in every reasoning (`ChatConfig.media_ids`), so a poisoned history recovers; a request whose
+attached items and rendered placeholders disagree still 400s. Guard: `reservedOutputIds: a media placeholder the
+template renders is never output`, `formatChat: a media placeholder spelled in an assistant's answer or reasoning
+stays text`, corpus `a media placeholder spelled in any turn's text or reasoning never renders as one`.
+
+### Inkling 2 thought at effort 0 for every client that named none
+Defect: a request without `reasoning_effort` or `enable_thinking` rendered "Thinking effort level: 0", so chat UIs and
+agents that never send an effort got the model's least reasoning. Cause: the plugin declared no thinking default, and
+unset means off; the release's template (and the HF launch post) default to high, 0.9. Fix: `inkling2/config.zig` sets
+`p.chat.thinking_default = .on`; an explicit `"none"` or `enable_thinking: false` still turns it off. Guard:
+`inkling2 served: a request that names no effort thinks, with or without tools`.
+
+### Transparent images reached Inkling 2 on white, and a WebP's alpha was dropped
+Defect: the host composited a transparent PNG onto white for every model, while Inkling 2's reference (mlx-lm's
+`_composite_alpha`) composites onto a 204/153 checkerboard of 8-pixel squares; a WebP decoded as RGB, its alpha
+dropped with no composite at all. Fix: `decodeRgbOwned` reads every format as RGBA, composites one way, and keeps the
+RGBA of an image that has transparency (`DecodedRgb.rgba`); it reaches the plugin as `MediaInput.rgba` (appended,
+`size`-checked): an outside plugin's through `plugin_media`, an in-tree one's behind the RGB in `ImageData.pixels`, split
+by `pluginInput` (unit tests of the outside path alone passed while Inkling, in-tree, still saw white: a live run caught
+it). inkling2's `opaqueRgb` composites as the reference does. Guard: `decode: transparency composites onto white from a
+PNG and a WebP alike`, `decode: a plugin's transparent image carries its RGBA behind its RGB`, `pluginInput: an image's
+RGBA behind its RGB reaches the plugin as rgba`, `inkling2 media: an image with transparency is composited onto the
+reference's 8-pixel checkerboard`.
+
 ### `suppress_cjk` rides the reserved mask, and PLD's greedy verify skipped it
 Defect: PLD's greedy verify compared each draft with the raw argmax, so a masked id copied from the prompt was
 committed. Fix: it reads `verifyArgmax` like every other block decoder. `suppress_cjk` takes the same chokepoint with a

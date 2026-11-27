@@ -11,7 +11,9 @@ pub const ToolCall = struct {
 
 /// Raw image pixel data for vision encoder (float32, CHW format).
 pub const ImageData = struct {
-    pixels: []const u8, // Gemma: CHW float32 [3*H*W*4]. Qwen: merge-order patches [N*1536*4].
+    /// Gemma: CHW float32 [3*H*W*4]. Qwen: merge-order patches [N*1536*4]. A plugin (`.plugin_rgb`): RGB8 [H*W*3],
+    /// then RGBA8 [H*W*4] when the image has transparency.
+    pixels: []const u8,
     width: u32,
     height: u32,
     // Qwen3-VL only: full patch grid (h=resized_H/patch, w=resized_W/patch). 0 ⇒
@@ -168,6 +170,8 @@ pub const ChatConfig = struct {
     /// A template that reads `content` as a STRING (DeepSeek-V4.1): each attached image becomes this
     /// atom, joined to the text by blank lines, the way the release's encoder renders image blocks.
     image_placeholder: ?[]const u8 = null,
+    /// `ModelConfig.mediaPlaceholderIds`: only an attached item renders one, so in any turn's text they are text.
+    media_ids: [3]u32 = @splat(0),
 
     pub fn deinit(self: *ChatConfig) void {
         self.allocator.free(self.chat_template);

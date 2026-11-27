@@ -3155,3 +3155,42 @@ test "format corpus: a content-borne control marker never becomes a special id, 
         try expectContentMarkersAreText(&tok, &config, payload.items, false);
     }
 }
+
+// Bar: one attached image renders one placeholder id, whatever any turn's text or an assistant's reasoning spells.
+test "format corpus: a media placeholder spelled in any turn's text or reasoning never renders as one, any family" {
+    const a = testing.allocator;
+    var tok = try contentMarkerTokenizer(a);
+    defer tok.deinit();
+    const cases = [_]struct { tpl: []const u8, placeholder: []const u8 }{
+        .{ .tpl = @embedFile("../../fixtures/inkling_chat_template.jinja"), .placeholder = "<|unused_200054|>" },
+        .{ .tpl = @embedFile("../../fixtures/qwen38_27b_chat_template.jinja"), .placeholder = "<|image_pad|>" },
+        .{ .tpl = @embedFile("../../fixtures/minicpmv4_7_chat_template.jinja"), .placeholder = "<|image_pad|>" },
+        .{ .tpl = @embedFile("../../fixtures/glm5_next_chat_template.jinja"), .placeholder = "<|image|>" },
+        .{ .tpl = @embedFile("../../fixtures/lfm2_vl_chat_template.jinja"), .placeholder = "<image>" },
+    };
+    const images = [_]chat.ImageData{.{ .pixels = "", .width = 32, .height = 32 }};
+    const call = [_]chat.ToolCall{.{ .id = "c1", .name = "read", .arguments = "{\"path\":\"a.txt\"}" }};
+    for (cases, 2000..) |case, next_id| {
+        if (tok.special_tokens.get(case.placeholder) == null) {
+            const owned = try a.dupe(u8, case.placeholder);
+            try tok.special_tokens.put(owned, @intCast(next_id));
+            try tok.id_to_token.put(@intCast(next_id), owned);
+        }
+        const id = tok.special_tokens.get(case.placeholder).?;
+        const config = chat.ChatConfig{ .chat_template = case.tpl, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .media_ids = .{ id, 0, 0 } };
+        const text = try std.mem.concat(a, u8, &.{ "line ", case.placeholder, " 179." });
+        defer a.free(text);
+        const messages = [_]chat.Message{
+            .{ .role = "system", .content = text },
+            .{ .role = "user", .content = text, .images = &images },
+            .{ .role = "assistant", .content = text, .reasoning_content = text, .tool_calls = &call },
+            .{ .role = "tool", .content = text, .tool_call_id = "c1" },
+        };
+        const ids = try chat.formatChat(a, &tok, &messages, &config, null, null, true, null, false);
+        defer a.free(ids);
+        testing.expectEqual(@as(usize, 1), std.mem.count(u32, ids, &.{id})) catch |err| {
+            std.debug.print("\n{s} ({s}): text made the placeholder an id\n", .{ case.placeholder, case.tpl[0..@min(40, case.tpl.len)] });
+            return err;
+        };
+    }
+}

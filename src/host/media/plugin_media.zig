@@ -13,7 +13,7 @@ const decodeRgbOwned = @import("decode.zig").decodeRgbOwned;
 pub fn prepareImage(allocator: std.mem.Allocator, b: *const Binding, encoded: []const u8) ?chat_mod.ImageData {
     const src = decodeRgbOwned(allocator, encoded, true) orelse return null;
     defer src.deinit(allocator);
-    return prepareDecoded(allocator, b, .{ .kind = .image, .rgb = .of(src.rgb), .width = src.w, .height = src.h, .frames = 1 });
+    return prepareDecoded(allocator, b, .{ .kind = .image, .rgb = .of(src.rgb), .rgba = .of(src.rgba), .width = src.w, .height = src.h, .frames = 1 });
 }
 
 /// The plugin hands host bytes: this runs on a connection thread, where nothing calls MLX.
@@ -78,4 +78,33 @@ test "plugin images: host pixels and the grid ride an ImageData, the buffer is r
     try std.testing.expect(prepareDecoded(a, &b, .{ .width = 'x' }) == null);
     const arr = prepareDecoded(a, &b, .{ .width = 'a' });
     try std.testing.expect(arr == null);
+}
+
+/// Records what `prepare` was handed.
+const Seen = struct {
+    var rgba: usize = 0;
+    var rgb: usize = 0;
+    fn prepare(_: *const abi.Parsed, in: *const abi.MediaInput, _: u64, _: *abi.MediaItem) callconv(.c) abi.Verdict {
+        rgba = in.rgba.len;
+        rgb = in.rgb.len;
+        return abi.Verdict.refuse(.failed, "recorded");
+    }
+};
+
+// Bar: a transparent image reaches the plugin as its RGBA too (a processor may composite onto its own background).
+test "plugin images: a transparent image reaches prepare with its RGBA, an opaque one with RGB only" {
+    const hooks = abi.MediaHooks{ .tower = &Fake.tower, .prepare = &Seen.prepare };
+    const table = abi.ModelTable{ .name = .of("t"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = undefined, .weights = undefined, .media = &hooks };
+    const b: Binding = .{ .table = &table, .outside = true };
+    const a = std.testing.allocator;
+    const readFile = @import("../../plugins/clef/http_test.zig").readFile;
+    const png = try readFile(std.testing.io, "tests/fixtures/robot.png");
+    defer a.free(png);
+    try std.testing.expect(prepareImage(a, &b, png) == null);
+    try std.testing.expectEqual(@as(usize, 360 * 360 * 4), Seen.rgba);
+    try std.testing.expectEqual(@as(usize, 360 * 360 * 3), Seen.rgb);
+    const jpeg = try readFile(std.testing.io, "tests/fixtures/house.jpeg");
+    defer a.free(jpeg);
+    try std.testing.expect(prepareImage(a, &b, jpeg) == null);
+    try std.testing.expectEqual(@as(usize, 0), Seen.rgba);
 }

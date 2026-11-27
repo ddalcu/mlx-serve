@@ -1618,6 +1618,11 @@ pub const ModelConfig = struct {
         return self.eos_token_ids[0..self.num_eos_tokens];
     }
 
+    /// The ids a media item's rows replace (0 = none): the template renders one per attached item, the model never writes one.
+    pub fn mediaPlaceholderIds(self: *const ModelConfig) [3]u32 {
+        return .{ self.image_token_id, self.video_token_id, self.audio_token_id };
+    }
+
     /// Everything a load derives from the tokenizer; both load paths call it.
     pub fn applyTokenizer(
         self: *ModelConfig,

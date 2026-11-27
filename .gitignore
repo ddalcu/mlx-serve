@@ -112,3 +112,6 @@ app-web/node_modules/
 # Generated at configure time by build/plugins.zig
 /src/plugins/registry.zig
 /src/unit_*.zig
+
+# Remotion's Chrome Headless Shell download (film.mjs renders from the folder it runs in)
+.remotion/

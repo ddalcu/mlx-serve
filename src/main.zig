@@ -1616,6 +1616,7 @@ pub fn main(init: std.process.Init) !void {
     }
     config.applyTokenizer(tok, chat_config.eos_token);
     if (config.radio_vision) chat_config.video_placeholder = "<img>";
+    chat_config.media_ids = config.mediaPlaceholderIds();
 
     const load_vision = config.has_vision and !no_vision;
 

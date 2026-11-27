@@ -19,15 +19,18 @@ pub fn prepare(p: *const abi.Parsed, in: *const abi.MediaInput, budget: u64, out
     const v = config.of(p).vision orelse return Verdict.refuse(.unsupported, "inkling2: this pack has no image tower");
     if (in.kind != .image) return Verdict.refuse(.unsupported, "inkling2: images only");
     if (in.width == 0 or in.height == 0 or in.rgb.len != @as(usize, in.width) * in.height * C) return Verdict.refuse(.failed, "inkling2: an image is one RGB frame");
+    const composited = opaqueRgb(in);
+    defer if (composited) |c| gpa.free(c);
+    const rgb = composited orelse in.rgb.slice();
     const size = fitted(in.height, in.width, budget);
     const plane = @as(usize, size.h) * size.w;
     const chw = gpa.alloc(f32, C * plane) catch return Verdict.refuse(.failed, "inkling2: out of memory");
     defer gpa.free(chw);
     if (size.h == in.height and size.w == in.width) {
         for (0..plane) |i| for (0..C) |c| {
-            chw[c * plane + i] = (@as(f32, @floatFromInt(in.rgb.slice()[i * C + c])) * (1.0 / 255.0) - 0.5) / 0.5;
+            chw[c * plane + i] = (@as(f32, @floatFromInt(rgb[i * C + c])) * (1.0 / 255.0) - 0.5) / 0.5;
         };
-    } else qwen_vision.resizeRgbNormalizedChw(gpa, chw, in.rgb.slice(), in.height, in.width, size.h, size.w, .bicubic) catch return Verdict.refuse(.failed, "inkling2: out of memory");
+    } else qwen_vision.resizeRgbNormalizedChw(gpa, chw, rgb, in.height, in.width, size.h, size.w, .bicubic) catch return Verdict.refuse(.failed, "inkling2: out of memory");
     const rows = (size.h + v.block() - 1) / v.block();
     const cols = (size.w + v.block() - 1) / v.block();
     const feat: usize = C * v.patch * v.patch;
@@ -42,6 +45,24 @@ pub fn prepare(p: *const abi.Parsed, in: *const abi.MediaInput, budget: u64, out
         .pixels = .{ .ctx = mlx.mlx_array_new_data(values.ptr, &[_]c_int{ @intCast(patches), @intCast(feat) }, 2, .float32).ctx },
     };
     return .ok;
+}
+
+/// An image with transparency as the processor sees it (owned by `gpa`), null when `in.rgb` is the image as it is:
+/// mlx-lm's `_composite_alpha`, the reference's, over a 204/153 checkerboard of 8-pixel squares, where the host's
+/// `rgb` is composited onto white.
+fn opaqueRgb(in: *const abi.MediaInput) ?[]u8 {
+    if (in.size < @offsetOf(abi.MediaInput, "rgba") + @sizeOf(abi.Span(u8))) return null;
+    const rgba = in.rgba.slice();
+    const w: usize = in.width;
+    if (rgba.len == 0 or rgba.len != w * in.height * 4) return null;
+    const out = gpa.alloc(u8, w * in.height * C) catch return null;
+    for (0..in.height) |y| for (0..w) |x| {
+        const i = y * w + x;
+        const bg: u32 = if ((x / 8 + y / 8) % 2 == 0) 204 else 153;
+        const a: u32 = rgba[i * 4 + 3];
+        for (0..C) |c| out[i * C + c] = @intCast((@as(u32, rgba[i * 4 + c]) * a + bg * (255 - a) + 127) / 255);
+    };
+    return out;
 }
 
 /// The image's size, or the largest of its aspect within `budget` pixels.
@@ -117,4 +138,33 @@ test "inkling2 media: an image past the budget keeps its aspect within it" {
     try testing.expectEqual(qwen_vision.Resized{ .h = 300, .w = 400 }, fitted(300, 400, 1 << 20));
     const s = fitted(3000, 4000, 1 << 20);
     try testing.expect(@as(u64, s.h) * s.w <= 1 << 20 and s.h == 886 and s.w == 1182);
+}
+
+// Bar: mlx-lm's `_composite_alpha`, the reference's: transparency over a 204/153 checkerboard of 8-pixel squares.
+test "inkling2 media: an image with transparency is composited onto the reference's 8-pixel checkerboard" {
+    // 17 x 9, so the squares change at x 8 and 16 and at y 8.
+    const w = 17;
+    const h = 9;
+    var rgba: [w * h * 4]u8 = undefined;
+    for (0..w * h) |i| {
+        rgba[i * 4 + 0] = @intCast(i * 7 % 256);
+        rgba[i * 4 + 1] = @intCast(i * 13 % 256);
+        rgba[i * 4 + 2] = @intCast(i * 29 % 256);
+        rgba[i * 4 + 3] = ([_]u8{ 0, 64, 128, 255 })[i % 4];
+    }
+    const white: [w * h * 3]u8 = @splat(255);
+    const in: abi.MediaInput = .{ .rgb = .of(&white), .rgba = .of(&rgba), .width = w, .height = h, .frames = 1 };
+    const got = opaqueRgb(&in) orelse return error.TestUnexpectedResult;
+    defer gpa.free(got);
+    for (0..h) |y| for (0..w) |x| for (0..3) |c| {
+        const i = y * w + x;
+        const bg: u32 = if ((x / 8 + y / 8) % 2 == 0) 204 else 153;
+        const a: u32 = rgba[i * 4 + 3];
+        try testing.expectEqual(@as(u8, @intCast((@as(u32, rgba[i * 4 + c]) * a + bg * (255 - a) + 127) / 255)), got[i * 3 + c]);
+    };
+    // An opaque image, and a host too old to hand RGBA, feed their RGB as it is.
+    try testing.expect(opaqueRgb(&.{ .rgb = .of(&white), .width = w, .height = h, .frames = 1 }) == null);
+    var old = in;
+    old.size = @offsetOf(abi.MediaInput, "rgba");
+    try testing.expect(opaqueRgb(&old) == null);
 }

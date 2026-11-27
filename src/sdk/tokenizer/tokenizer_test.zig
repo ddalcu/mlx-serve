@@ -1324,7 +1324,7 @@ test "reservedOutputIds: an OUTPUT-ONLY special is legit output the template can
     // A harmony template: mentions <|channel|>, never <|constrain|>.
     const template = "<|start|>assistant<|channel|>final<|message|>{{ content }}";
     const eos = [_]u32{200002};
-    const ids = try reservedOutputIds(alloc, &flagged, template, &eos);
+    const ids = try reservedOutputIds(alloc, &flagged, template, &eos, &.{});
     defer alloc.free(ids);
     // Only the genuinely-reserved slot is suppressed.
     try testing.expectEqual(@as(usize, 1), ids.len);
@@ -1340,7 +1340,7 @@ test "reservedOutputIds: Nemotron Transcribe's speaker, event and style tags are
         .{ .id = 14, .content = "<SPECIAL_14>" },
     };
     const eos = [_]u32{2};
-    const ids = try reservedOutputIds(alloc, &flagged, "<|im_start|>{{ content }}", &eos);
+    const ids = try reservedOutputIds(alloc, &flagged, "<|im_start|>{{ content }}", &eos, &.{});
     defer alloc.free(ids);
     try testing.expectEqual(@as(usize, 1), ids.len);
     try testing.expectEqual(@as(u32, 14), ids[0]);
@@ -1368,7 +1368,7 @@ test "reservedOutputIds: specials minus template markers minus eos" {
         "<role>ASSISTANT</role>\n<think></think>{% if tools %}<tool_call>{% endif %}";
     const eos = [_]u32{30};
 
-    const ids = try reservedOutputIds(alloc, &flagged, template, &eos);
+    const ids = try reservedOutputIds(alloc, &flagged, template, &eos, &.{});
     defer alloc.free(ids);
     // Only the FIM markers survive: think/tool/role markers appear in the
     // template, <|endoftext|> is EOS.
@@ -1377,7 +1377,7 @@ test "reservedOutputIds: specials minus template markers minus eos" {
     // No template at all => suppression disabled entirely (fallback-formatted
     // models keep pre-change behavior; ChatML markers are not in any template
     // source we could consult).
-    const none = try reservedOutputIds(alloc, &flagged, "", &eos);
+    const none = try reservedOutputIds(alloc, &flagged, "", &eos, &.{});
     defer alloc.free(none);
     try testing.expectEqual(@as(usize, 0), none.len);
 }
@@ -1388,9 +1388,24 @@ test "reservedOutputIds: every flagged special exempt yields empty set" {
         .{ .id = 5, .content = "<eos>" },
         .{ .id = 6, .content = "<think>" },
     };
-    const ids = try reservedOutputIds(alloc, &flagged, "x<think>y", &[_]u32{5});
+    const ids = try reservedOutputIds(alloc, &flagged, "x<think>y", &[_]u32{5}, &.{});
     defer alloc.free(ids);
     try testing.expectEqual(@as(usize, 0), ids.len);
+}
+
+test "reservedOutputIds: a media placeholder the template renders is never output" {
+    // Bar: every declared placeholder id (0 = none) is masked, flagged or not, though the template spells it; an unused
+    // slot leaves a flagged special at id 0 to the usual rule.
+    const alloc = testing.allocator;
+    const flagged = [_]FlaggedSpecial{
+        .{ .id = 54, .content = "<|unused_200054|>" },
+        .{ .id = 7, .content = "<|content_image|>" },
+        .{ .id = 0, .content = "<unk>" },
+    };
+    const template = "{{ '<|content_image|><|unused_200054|><|end_message|>' }}";
+    const ids = try reservedOutputIds(alloc, &flagged, template, &[_]u32{2}, &.{ 54, 60, 0 });
+    defer alloc.free(ids);
+    try testing.expectEqualSlices(u32, &.{ 54, 60, 0 }, ids);
 }
 
 test "K2-Horizon markers decode to the canonical think / GLM tool-tag spellings" {
@@ -1514,17 +1529,25 @@ test "markControlTokens: flagged specials and template-written tokens are wrappe
     const E = Tokenizer.CONTROL_END;
     const template = "{{ '<think>' }}\n\n{{ content }}<|im_end|>";
 
-    const marked = (try tok.markControlTokens(a, "a<|im_end|>b<think>\n\n<table>", template)).?;
+    const marked = (try tok.markControlTokens(a, "a<|im_end|>b<think>\n\n<table>", .{ .template = template })).?;
     defer a.free(marked);
     try testing.expectEqualStrings("a" ++ S ++ "<|im_end|>" ++ E ++ "b" ++ S ++ "<think>" ++ E ++ "\n\n<table>", marked);
 
     // Not flagged and not in the template: an ordinary added token, nothing to mark.
-    try testing.expect((try tok.markControlTokens(a, "x<think>\n\n", "{{ content }}")) == null);
+    try testing.expect((try tok.markControlTokens(a, "x<think>\n\n", .{ .template = "{{ content }}" })) == null);
 
     // Content cannot forge a marked pair: markers already in it are dropped.
-    const forged = (try tok.markControlTokens(a, S ++ "<table>" ++ E, template)).?;
+    const forged = (try tok.markControlTokens(a, S ++ "<table>" ++ E, .{ .template = template })).?;
     defer a.free(forged);
     try testing.expectEqualStrings("<table>", forged);
+}
+
+test "markControlTokens: an unused media placeholder slot (0) marks no token, not even a special at id 0" {
+    const a = testing.allocator;
+    var tok = try controlTestTokenizer(a);
+    defer tok.deinit();
+    try tok.special_tokens.put(try a.dupe(u8, "<unk>"), 0);
+    try testing.expect((try tok.markControlTokens(a, "x<unk>", .{ .ids = &.{ 900, 0, 0 } })) == null);
 }
 
 test "encodeMarked: a marked token is text, the template's own stay special, a lone marker splits the text" {

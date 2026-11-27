@@ -119,6 +119,7 @@ fn preloadTextCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []co
 
     config.applyTokenizer(tok, cc.eos_token);
     if (config.radio_vision) cc.video_placeholder = "<img>";
+    cc.media_ids = config.mediaPlaceholderIds();
 
     return .{ .config = config, .tok = tok, .chat_config = cc };
 }

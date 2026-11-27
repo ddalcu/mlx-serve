@@ -48,9 +48,12 @@ pub const DecodedRgb = struct {
     rgb: []u8,
     w: u32,
     h: u32,
+    /// The image as decoded, RGBA8 with straight alpha, when it has transparency; empty when opaque.
+    rgba: []u8 = &.{},
 
     pub fn deinit(self: DecodedRgb, allocator: std.mem.Allocator) void {
         allocator.free(self.rgb);
+        if (self.rgba.len > 0) allocator.free(self.rgba);
     }
 };
 
@@ -58,29 +61,35 @@ pub fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8, composi
     var w: c_int = 0;
     var h: c_int = 0;
     var channels: c_int = 0;
-    // stb first (JPEG/PNG/GIF first frame/BMP) — 4 channels so transparency composites onto white.
+    // stb first (JPEG/PNG/GIF first frame/BMP), then libwebp, both as RGBA so transparency is read one way.
     if (stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &channels, 4)) |rgba| {
         defer stb.stbi_image_free(rgba);
-        const total_px: usize = @intCast(w * h);
-        const rgb = allocator.alloc(u8, total_px * 3) catch return null;
-        for (0..total_px) |i| {
-            const a: u16 = if (composite_alpha) rgba[i * 4 + 3] else 255;
-            const inv_a = 255 - a;
-            rgb[i * 3 + 0] = @intCast((a * @as(u16, rgba[i * 4 + 0]) + inv_a * 255) / 255);
-            rgb[i * 3 + 1] = @intCast((a * @as(u16, rgba[i * 4 + 1]) + inv_a * 255) / 255);
-            rgb[i * 3 + 2] = @intCast((a * @as(u16, rgba[i * 4 + 2]) + inv_a * 255) / 255);
-        }
-        return .{ .rgb = rgb, .w = @intCast(w), .h = @intCast(h) };
+        return fromRgba(allocator, rgba[0 .. @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4], @intCast(w), @intCast(h), composite_alpha);
     }
-
-    var webp_w: c_int = 0;
-    var webp_h: c_int = 0;
-    const decoded = webp.WebPDecodeRGB(encoded.ptr, encoded.len, &webp_w, &webp_h) orelse return null;
+    const decoded = webp.WebPDecodeRGBA(encoded.ptr, encoded.len, &w, &h) orelse return null;
     defer webp.WebPFree(decoded);
-    const total: usize = @as(usize, @intCast(webp_w)) * @as(usize, @intCast(webp_h)) * 3;
-    const rgb = allocator.alloc(u8, total) catch return null;
-    @memcpy(rgb, decoded[0..total]);
-    return .{ .rgb = rgb, .w = @intCast(webp_w), .h = @intCast(webp_h) };
+    return fromRgba(allocator, decoded[0 .. @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4], @intCast(w), @intCast(h), composite_alpha);
+}
+
+/// RGB composited onto white (or alpha dropped), keeping the RGBA when any pixel is not opaque.
+fn fromRgba(allocator: std.mem.Allocator, rgba: []const u8, w: u32, h: u32, composite_alpha: bool) ?DecodedRgb {
+    const total_px = @as(usize, w) * h;
+    const rgb = allocator.alloc(u8, total_px * 3) catch return null;
+    var opaque_all = true;
+    for (0..total_px) |i| {
+        opaque_all = opaque_all and rgba[i * 4 + 3] == 255;
+        const a: u16 = if (composite_alpha) rgba[i * 4 + 3] else 255;
+        const inv_a = 255 - a;
+        rgb[i * 3 + 0] = @intCast((a * @as(u16, rgba[i * 4 + 0]) + inv_a * 255) / 255);
+        rgb[i * 3 + 1] = @intCast((a * @as(u16, rgba[i * 4 + 1]) + inv_a * 255) / 255);
+        rgb[i * 3 + 2] = @intCast((a * @as(u16, rgba[i * 4 + 2]) + inv_a * 255) / 255);
+    }
+    if (opaque_all) return .{ .rgb = rgb, .w = w, .h = h };
+    const kept = allocator.dupe(u8, rgba) catch {
+        allocator.free(rgb);
+        return null;
+    };
+    return .{ .rgb = rgb, .w = w, .h = h, .rgba = kept };
 }
 
 pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
@@ -88,7 +97,15 @@ pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp
     if (vp.mode == .plugin) return plugin_media.prepareImage(allocator, @ptrCast(@alignCast(vp.plugin.?)), encoded);
 
     const src = decodeRgbOwned(allocator, encoded, vp.composite_alpha) orelse return null;
-    if (vp.mode == .plugin_rgb) return .{ .pixels = src.rgb, .width = src.w, .height = src.h };
+    if (vp.mode == .plugin_rgb) {
+        // An image with transparency carries its RGBA behind its RGB, one buffer: the plugin composites its own way.
+        if (src.rgba.len == 0) return .{ .pixels = src.rgb, .width = src.w, .height = src.h };
+        defer src.deinit(allocator);
+        const both = allocator.alloc(u8, src.rgb.len + src.rgba.len) catch return null;
+        @memcpy(both[0..src.rgb.len], src.rgb);
+        @memcpy(both[src.rgb.len..], src.rgba);
+        return .{ .pixels = both, .width = src.w, .height = src.h };
+    }
     defer src.deinit(allocator);
     const px = src.rgb.ptr;
     const src_w: u32 = src.w;
@@ -379,7 +396,7 @@ test "decodeRgbOwned reads a GIF's first frame and a BMP, the formats the Anthro
     const bmp = "\x42\x4d\x46\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00\x28\x00\x00\x00\x02\x00\x00\x00\x02\x00\x00\x00\x01\x00\x18\x00\x00\x00\x00\x00\x10\x00\x00\x00\xc4\x0e\x00\x00\xc4\x0e\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\x00\x00\xff\xff\xff\x00\x00\x00\x00\xff\x00\xff\x00\x00\x00";
     for ([_][]const u8{ gif, bmp }) |bytes| {
         const d = decodeRgbOwned(std.testing.allocator, bytes, true) orelse return error.TestUnexpectedResult;
-        defer std.testing.allocator.free(d.rgb);
+        defer d.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u32, 2), d.w);
         try std.testing.expectEqual(@as(u32, 2), d.h);
         try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255 }, d.rgb);
@@ -397,6 +414,50 @@ test "clef: transparent image RGB follows the checkpoint processor" {
     defer rgb.deinit(a);
     try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255 }, composited.rgb[0..3]);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, rgb.rgb[0..3]);
+}
+
+// Bar: a PNG and a WebP with transparency composite onto white alike, and both keep their RGBA; an opaque image none.
+test "decode: transparency composites onto white from a PNG and a WebP alike, and the RGBA is kept" {
+    const a = std.testing.allocator;
+    const readFile = @import("../../plugins/clef/http_test.zig").readFile;
+    const png = try readFile(std.testing.io, "tests/fixtures/robot.png");
+    defer a.free(png);
+    const p = decodeRgbOwned(a, png, true) orelse return error.BadImage;
+    defer p.deinit(a);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255 }, p.rgb[0..3]);
+    try std.testing.expectEqual(@as(usize, p.w) * p.h * 4, p.rgba.len);
+    try std.testing.expectEqual(@as(u8, 0), p.rgba[3]);
+    // 4 x 4: pixel 0 clear (10, 20, 30 under it), pixel 1 (200, 100, 50) at alpha 128, the rest opaque.
+    const webp_bytes = try readFile(std.testing.io, "tests/fixtures/alpha_4x4.webp");
+    defer a.free(webp_bytes);
+    const w = decodeRgbOwned(a, webp_bytes, true) orelse return error.BadImage;
+    defer w.deinit(a);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 227, 177, 152, 40, 80, 120 }, w.rgb[0..9]);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 20, 30, 0, 200, 100, 50, 128 }, w.rgba[0..8]);
+    const jpeg = try readFile(std.testing.io, "tests/fixtures/house.jpeg");
+    defer a.free(jpeg);
+    const j = decodeRgbOwned(a, jpeg, true) orelse return error.BadImage;
+    defer j.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), j.rgba.len);
+}
+
+// Bar: an in-tree plugin's image (`.plugin_rgb`) carries its RGBA behind its RGB in the one `pixels` buffer.
+test "decode: a plugin's transparent image carries its RGBA behind its RGB, an opaque one RGB only" {
+    const a = std.testing.allocator;
+    const readFile = @import("../../plugins/clef/http_test.zig").readFile;
+    const png = try readFile(std.testing.io, "tests/fixtures/robot.png");
+    defer a.free(png);
+    const img = decodeImageToPixels(a, png, .{ .mode = .plugin_rgb }) orelse return error.BadImage;
+    defer a.free(img.pixels);
+    const n = @as(usize, img.width) * img.height;
+    try std.testing.expectEqual(n * 7, img.pixels.len);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255 }, img.pixels[0..3]);
+    try std.testing.expectEqual(@as(u8, 0), img.pixels[n * 3 + 3]);
+    const jpeg = try readFile(std.testing.io, "tests/fixtures/house.jpeg");
+    defer a.free(jpeg);
+    const opaque_img = decodeImageToPixels(a, jpeg, .{ .mode = .plugin_rgb }) orelse return error.BadImage;
+    defer a.free(opaque_img.pixels);
+    try std.testing.expectEqual(@as(usize, opaque_img.width) * opaque_img.height * 3, opaque_img.pixels.len);
 }
 
 test "RequestMedia frees every decoded buffer it was handed" {

@@ -63,14 +63,20 @@ pub fn reservedOutputIds(
     flagged: []const FlaggedSpecial,
     template_source: []const u8,
     exempt_ids: []const u32,
+    /// Media placeholder ids (0 = none): reserved though the template spells them, only the host places one.
+    placeholder_ids: []const u32,
 ) ![]u32 {
     if (template_source.len == 0) return allocator.alloc(u32, 0);
     var out = std.ArrayList(u32).empty;
     errdefer out.deinit(allocator);
+    for (placeholder_ids) |id| {
+        if (id != 0 and std.mem.indexOfScalar(u32, exempt_ids, id) == null) try out.append(allocator, id);
+    }
     outer: for (flagged) |sp| {
         for (exempt_ids) |e| {
             if (sp.id == e) continue :outer;
         }
+        if (sp.id != 0 and std.mem.indexOfScalar(u32, placeholder_ids, sp.id) != null) continue;
         if (std.mem.indexOf(u8, template_source, sp.content) != null) continue;
         if (isOutputOnlySpecial(sp.content)) continue;
         try out.append(allocator, sp.id);
@@ -372,9 +378,13 @@ pub const Tokenizer = struct {
         return !isAllWhitespace(token.bytes) and std.mem.indexOf(u8, template, token.bytes) != null;
     }
 
-    /// `text` with every control token wrapped in CONTROL_START/CONTROL_END for `encodeMarked`, and the markers
+    /// What `markControlTokens` wraps: the control tokens of `template` (null = none) and the tokens `ids` names (0 = none).
+    pub const Marks = struct { template: ?[]const u8 = null, ids: []const u32 = &.{} };
+
+    /// `text` with every token `marks` names wrapped in CONTROL_START/CONTROL_END for `encodeMarked`, and the markers
     /// already in it dropped so content cannot forge a pair; null when that changes nothing.
-    pub fn markControlTokens(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8, template: []const u8) !?[]u8 {
+    pub fn markControlTokens(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8, marks: Marks) !?[]u8 {
+        if (marks.template == null and std.mem.allEqual(u32, marks.ids, 0)) return null;
         var local_index: ?SpecialIndex = null;
         defer if (local_index) |*x| x.deinit(allocator);
         const index = try self.specialIndex(allocator, &local_index);
@@ -390,7 +400,10 @@ pub const Tokenizer = struct {
                 continue;
             }
             for (index.candidates(text[pos])) |c| {
-                if (!std.mem.startsWith(u8, text[pos..], c.bytes) or !self.isControlToken(c, template)) continue;
+                if (!std.mem.startsWith(u8, text[pos..], c.bytes)) continue;
+                const marked = (c.id != 0 and std.mem.indexOfScalar(u32, marks.ids, c.id) != null) or
+                    if (marks.template) |t| self.isControlToken(c, t) else false;
+                if (!marked) continue;
                 try out.appendSlice(allocator, text[copied..pos]);
                 try out.appendSlice(allocator, CONTROL_START);
                 try out.appendSlice(allocator, c.bytes);

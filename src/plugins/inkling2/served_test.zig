@@ -52,6 +52,34 @@ fn expectSame(what: []const u8, at: usize, want: *const Logprobs, got: *const Lo
     try testing.expectEqualSlices(u8, std.mem.asBytes(want), std.mem.asBytes(got));
 }
 
+// Bar: the engine config of a pack whose config.json names no `image_token_id` carries the plugin's image placeholder.
+test "inkling2 served: the engine config names the media placeholder the plugin declares" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const config = @import("config.zig");
+    const json = "{\"model_type\":\"inkling2_loop\",\"eos_token_id\":2,\"vision_config\":{\"native_patch_size\":20,\"adapter_merge_size\":2,\"hidden_size\":1024,\"num_attention_heads\":16}," ++ config.fixture_text ++ "}";
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = json });
+    var buf: [512]u8 = undefined;
+    var cfg = try model.parseConfig(testing.io, a, buf[0..try tmp.dir.realPath(testing.io, &buf)]);
+    defer cfg.deinit(a);
+    try testing.expectEqual(@as(u32, 200054), cfg.mediaPlaceholderIds()[0]);
+}
+
+// Bar: a request naming no effort thinks, as the release documents (its template's default is high, 0.9).
+test "inkling2 served: a request that names no effort thinks, with or without tools" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const config = @import("config.zig");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = config.fixture_config });
+    var buf: [512]u8 = undefined;
+    var cfg = try model.parseConfig(testing.io, a, buf[0..try tmp.dir.realPath(testing.io, &buf)]);
+    defer cfg.deinit(a);
+    try testing.expect(cfg.defaultEnableThinking(false));
+    try testing.expect(cfg.defaultEnableThinking(true));
+}
+
 // Bar: an exact repeat takes the first token's top-20 logprobs its first run took, bit for bit: a cold prompt's at two
 // lengths, and a prompt's that first restored from another's checkpoint inside their shared prefix.
 test "inkling2 pack: a prompt restored from the prefix cache decodes from the logits its first run decoded from, bit for bit (INKLING2_PACK)" {

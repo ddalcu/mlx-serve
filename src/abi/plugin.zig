@@ -996,6 +996,9 @@ pub const MediaInput = extern struct {
     fps: f32 = 0,
     samples: Span(f32) = .{},
     sample_rate: u32 = 0,
+    /// An image with transparency as decoded, RGBA8 with straight alpha (`rgb` is it composited onto white); empty for
+    /// an opaque image. A processor that composites onto its own background reads it (check `size` first).
+    rgba: Span(u8) = .{},
 };
 
 /// One prepared media item: its pixels (or samples) as a new reference the host owns, and its row plan.
