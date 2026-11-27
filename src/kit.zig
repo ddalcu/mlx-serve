@@ -102,6 +102,7 @@ pub const blocks = struct {
     };
     pub const vae = struct {
         pub const conv = @import("sdk/blocks/vae/conv.zig");
+        pub const qwen_image_vae = @import("sdk/blocks/vae/qwen_image_vae.zig");
         pub const resnet = @import("sdk/blocks/vae/resnet.zig");
         pub const snake = @import("sdk/blocks/vae/snake.zig");
     };

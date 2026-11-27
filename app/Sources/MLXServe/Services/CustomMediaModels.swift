@@ -48,6 +48,7 @@ enum CustomMediaModels {
         }
         if arch == "moss_image" { return .mossImageSFT_8bit }
         if arch == "minimax_h3_image" { return .minimaxH3Image_4bit }
+        if arch == "bailingmm_moe_v2_lite" { return .mingImage_8bit }
         return nil
     }
 

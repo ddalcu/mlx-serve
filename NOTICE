@@ -159,6 +159,18 @@ app/Sources/MLXServe/Services/MossLayout.swift ports its
 scripts/compile_prompt.py.
 
 --------------------------------------------------------------------------------
+Ming-Image
+https://github.com/inclusionAI/Ming-Image
+Copyright (c) 2026 inclusionAI
+Licensed under the MIT License (diffusion/transformer.py: the Apache License, Version 2.0).
+
+src/plugins/ming_image/ ports the Ming-Image inference pipeline to MLX: the image-generation
+conditioning of modeling_bailingmm2.py (with the Bailing-MoE-v2 decoder and its video-RoPE
+positions from modeling_bailing_moe_v2.py), diffusion/transformer.py, diffusion/pipeline.py's
+sampling loop and the aspect buckets of bailingmm_utils.py. tests/dump_ming_image_fixtures.py
+runs the release's own classes as the parity oracle.
+
+--------------------------------------------------------------------------------
 laya-mlx
 https://github.com/mizorewww/laya-mlx
 Copyright laya-mlx contributors

@@ -32,6 +32,9 @@ Weights, quant, loading:
   `Caps.experts_stream`): conformance serves its fixture streamed vs in memory (1e-3 of the top logit, one slot and 16
   batched) and fails a load that reads them. Several lazy passes evaluate each before the next fetch rewrites the rows.
   An MoE on its own block (inkling) leaves the cap off.
+- **A load-time view kept past its source pins the source** (a transpose or slice in a long-lived `Graph`): build
+  derived weights in a child scope and keep only the result. Ming-Image held its 30 GB of per-expert tensors twice.
+  Guard: `ming_image llm: a stacked expert bank holds no reference to the per-expert tensors`.
 - **A loader that COPIES a large file reads it uncached** (`gguf.File.readUncached`: `F_NOCACHE`, page-aligned): macOS
   keeps every read page (no madvise/msync drops it) and compresses the copies first; DeepSeek-V4.1's 138 GB set swapped.
 - **A GGUF weight is `.gguf` ONLY when its scales are the bool TYPE SENTINEL**: affine-coded types load as MLX affine
