@@ -350,6 +350,7 @@ test {
 }
 
 test "ming_tts plugin: a job on the tiny pack is a 44.1 kHz mono WAV, repeatable by seed" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

@@ -255,6 +255,7 @@ pub fn computeEmbeddingsBatchWith(
         allocator.free(results);
     }
     defer {
+        _ = mlx.mlx_synchronize(xfm.s);
         xfm.resetCache() catch {};
         _ = mlx.mlx_clear_cache();
     }

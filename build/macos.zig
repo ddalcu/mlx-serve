@@ -266,6 +266,8 @@ fn unitModule(g: *const Graph, includes: []const std.Build.Module.IncludeDir, ro
 pub const Tests = struct {
     /// `zig build test`.
     step: *std.Build.Step,
+    /// Step owning the host/build-graph sub-tests (`test-host` under `-Dunits`, else `test`).
+    host_step: *std.Build.Step,
     /// `zig build test-build`.
     build: *std.Build.Step,
     /// The unit-test binary's shard runs.
@@ -291,6 +293,7 @@ pub fn addUnitTests(g: *const Graph, plugin_names: []const []const u8) Tests {
     // tests' own variables (MLX_SERVE_TAPE_RECORD, *_TEST_MODEL) would stay frozen at the last reconfigure.
     b.graph.poisonCache();
 
+    const host_step = if (g.units) b.step("test-core-media", "Run core, media, kit, build and lint tests") else test_step;
     const test_runs: []*std.Build.Step.Run = if (!g.units) blk: {
         const unit_tests = b.addTest(.{
             .root_module = g.test_mod,
@@ -337,6 +340,7 @@ pub fn addUnitTests(g: *const Graph, plugin_names: []const []const u8) Tests {
         const llm_step = b.step("test-llm", "Run LLM model plugin proof, served and conformance tests");
         const media_step = b.step("test-media", "Run media/3D/audio/image plugin unit tests");
         const contracts_step = b.step("test-contracts", "Run kernel contract and SDK block/quant/weight unit tests");
+        const llm_contracts_step = b.step("test-llm-contracts", "Run LLM plugin and kernel contract unit tests");
         const llm_shards: u32 = if (test_filter != null) 1 else @min(shards, if (shards <= 4) @as(u32, 2) else 3);
         const media_shards: u32 = if (test_filter != null or shards <= 4) 1 else @min(shards, 2);
         const contract_shards: u32 = if (test_filter != null or shards <= 4) 1 else @min(shards, 5);
@@ -344,18 +348,20 @@ pub fn addUnitTests(g: *const Graph, plugin_names: []const []const u8) Tests {
         _ = addShardedRuns(b, llm_bin, llm_step, "llm", media_csv, llm_shards, test_filter != null, null);
         _ = addShardedRuns(b, media_bin, media_step, "media", media_csv, media_shards, test_filter != null, null);
         _ = addShardedRuns(b, contracts_bin, contracts_step, "contracts", media_csv, contract_shards, test_filter != null, null);
-        test_step.dependOn(core_step);
-        test_step.dependOn(llm_step);
-        test_step.dependOn(media_step);
-        test_step.dependOn(contracts_step);
+        host_step.dependOn(core_step);
+        host_step.dependOn(media_step);
+        llm_contracts_step.dependOn(llm_step);
+        llm_contracts_step.dependOn(contracts_step);
+        test_step.dependOn(host_step);
+        test_step.dependOn(llm_contracts_step);
         break :blk core_runs;
     };
 
-    plugins.addTests(b, test_step);
-    config.addTests(b, test_step);
-    test_step.dependOn(&b.top_level_steps.get("lint-test").?.step);
-    test_step.dependOn(&b.top_level_steps.get("unit-closure").?.step);
-    return .{ .step = test_step, .build = test_build, .runs = test_runs, .filter = test_filter };
+    plugins.addTests(b, host_step);
+    config.addTests(b, host_step);
+    host_step.dependOn(&b.top_level_steps.get("lint-test").?.step);
+    host_step.dependOn(&b.top_level_steps.get("unit-closure").?.step);
+    return .{ .step = test_step, .host_step = host_step, .build = test_build, .runs = test_runs, .filter = test_filter };
 }
 
 fn addShardedRuns(

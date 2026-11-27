@@ -141,6 +141,10 @@ jobs:
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.zig == 'true') }}
     runs-on: macos-26
     timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [core-media, llm-contracts]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -152,7 +156,7 @@ jobs:
 
       - name: Zig cache key
         id: zigkey
-        run: echo "key=zig-cache-test-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.stage.outputs.submodules }}-${{ steps.stage.outputs.xcode }}-$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+        run: echo "key=zig-cache-test-${{ matrix.slice }}-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.stage.outputs.submodules }}-${{ steps.stage.outputs.xcode }}-$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
 
       - name: Restore Zig build artifacts
         id: zigcache
@@ -168,10 +172,10 @@ jobs:
       # is the only guard for the "hard invariants (replay-pinned)" in CLAUDE.md.
       # Pushes to main always run them.
       - name: Run Zig tests
-        # 4 shards: the default sizes them by RAM. Not every GPU test skips on this virtual GPU, and at 8 they ran it
-        # out of memory (a different kernel test exited 255 on each run).
+        # Two balanced slices (`core-media` and `llm-contracts`) keep peak concurrent macOS jobs at 4 (avoiding
+        # runner-pool queueing) while separating the two heavy virtual-GPU suites (`llm` and `media`).
         # -Dstrip on a PR keeps the test compile's memory down; a panic there prints no stack, so rerun it without.
-        run: zig build test --summary all -Dtest-shards=4 ${{ (needs.changes.result != 'success' || needs.changes.outputs.slow == 'true') && '-Dslow-tests' || '' }} ${{ github.event_name == 'pull_request' && '-Dstrip' || '' }}
+        run: zig build test-${{ matrix.slice }} --summary all -Dtest-shards=4 ${{ (needs.changes.result != 'success' || needs.changes.outputs.slow == 'true') && '-Dslow-tests' || '' }} ${{ github.event_name == 'pull_request' && '-Dstrip' || '' }}
 
       - name: Save Zig build artifacts
         if: ${{ success() && github.ref == 'refs/heads/main' && steps.zigcache.outputs.cache-hit != 'true' }}
