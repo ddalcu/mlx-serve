@@ -8,7 +8,8 @@ what sets the voice: `base` clones a clip (ECAPA-TDNN speaker encoder), `custom_
 ## Files
 - `plugin.zig`: the media table (speech and warm-up jobs) and the tiny conformance pack.
 - `config.zig`: claims (`model_type: qwen3_tts`, complete once `speech_tokenizer/model.safetensors` lands), bills.
-- `tts.zig`: talker, code predictor (compiled chain, KV-cached steps), speaker encoder + clone cache, codec decoder.
+- `tts.zig`: talker, code predictor (compiled chain, KV-cached steps), speaker encoder + clone cache; the
+  codec decoder is `sdk/media/mimi_codec.zig` (shared with breeze_tts).
 
 ## Request contract
 `input` (or `text`), `ref_audio` (base64 24 kHz mono PCM16 WAV: clones on a checkpoint with a speaker encoder; an
@@ -34,7 +35,10 @@ Voice controls are honoured or refused by name, never dropped:
 - The codec decoder's geometry is `speech_tokenizer/config.json`'s `decoder_config` (published values = defaults).
 
 ## Shared blocks
-- `sdk/blocks/mlp/gelu.geluErf` (ConvNeXt GELU), `sdk/blocks/vae/snake.snakeBetaLog` (decoder SnakeBeta).
+- `sdk/media/mimi_codec.zig` — the whole speech-tokenizer codec (RVQ decoder, config parse,
+  Bundle). Its ConvNeXt GELU is `sdk/blocks/mlp/gelu.geluErf`, the decoder SnakeBeta is
+  `sdk/blocks/vae/snake.snakeBetaLog`. `Bundle.open` is the live-pack seam (published widths);
+  the tiny conformance packs load through the same path.
 
 ## Levers
 Diag `tts-trace` only.

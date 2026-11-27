@@ -90,7 +90,7 @@ Stateful chains via `previous_response_id`, full streaming SSE with per-event `s
 - `POST /v1/embeddings` — text embeddings (BERT, EmbeddingGemma, and last-token pooling models like Qwen3-Embedding; pooling follows the checkpoint's sentence-transformers metadata, `dimensions` truncates and renormalizes; EmbeddingGemma 2 wants its task prefix in the text, `task: search result | query: …` for a query and `title: none | text: …` for a document). EmbeddingGemma 2 also embeds images and video: send `messages` (one prompt, one embedding, like vLLM's chat embeddings) instead of `input`, with `{"type": "text"}`, `{"type": "image_url", "image_url": {"url": "data:image/png;base64,…"}}` and `{"type": "video_url", "video_url": {"frames": ["data:image/jpeg;base64,…", …]}}` parts. The parts are concatenated in order (system turns first, as the model's own template does), images keep their aspect ratio and are sized to 280 soft tokens and video frames to 140 (`processor_config.json`), at most 32 frames of a longer clip are kept, and the whole prompt must fit the 8192-token window. Remote URLs are not fetched and audio is refused by name.
 - `POST /v1/decisions` — Laya typed decisions: `{"model", "state": <string|object>, "questions": {id: {"type": "choice"|"score"|"noul", "instructions", "criteria"}}}` returns laya's `predict` schema (`answers` with `type`, `confidence`, `action.act_probability`, plus `choice`+`probabilities`, `score`+`legend`+`probabilities`, or `noul`). An object state is serialized like Python's `json.dumps`. Limits: 64 questions (`MLX_SERVE_LAYA_MAX_QUESTIONS`), 32768 input tokens (`MLX_SERVE_LAYA_MAX_INPUT_TOKENS`), 4 MB body. A Kev pack (`kev_config.json`) takes the same request, `choice` criteria as an object or a list of labels, and answers without `action` (and without `confidence` on `noul`); the same question and input-token limits (the `MLX_SERVE_LAYA_*` pair above), 255 options, 8192 tokens per question including the state. A D1 pack (`LiquidAI/d1-3B`, bf16) takes the same request as text only: `images` is a 400, and its `choice` and `score` answers carry a `confidence` (the chosen probability) while `noul` answers carry none
 - `POST /v1/images/generations`, `POST /v1/images/edits` — image generation and instruction edits; the edits endpoint speaks the OpenAI SDK's multipart shape (`client.images.edit`), including repeated `image[]` for multi-reference
-- `POST /v1/audio/speech` — Qwen3-TTS (Base: `ref_audio` clones a voice; CustomVoice: `voice` names a built-in speaker, `instructions` style it; VoiceDesign: `instructions` describe the voice; `seed`), Kokoro (`voice` picks or blends one of 54) or Ming-3.0-tts (below), WAV out
+- `POST /v1/audio/speech` — Qwen3-TTS (Base: `ref_audio` clones a voice; CustomVoice: `voice` names a built-in speaker, `instructions` style it; VoiceDesign: `instructions` describe the voice; `seed`), Kokoro (`voice` picks or blends one of 54), Breeze-TTS-2 or Ming-3.0-tts (below), WAV out
 - `POST /v1/audio/transcriptions` — speech to text with Qwen3-ASR (mlx-community's `Qwen3-ASR-0.6B`/`1.7B` packs), the OpenAI SDK's multipart form (`client.audio.transcriptions.create`): a WAV `file` (any rate and channel count; one past 20 minutes is transcribed in pieces cut where it is quietest), optional `language` (ISO code or name; omitted, the model detects it), `prompt` (context such as names to spell), `temperature`, `response_format` `json`, `text`, `verbose_json`, `srt`, `vtt` or `diarized_json`, and `timestamp_granularities[]` (`word` adds `words`). Times come from Qwen3-ForcedAligner (`mlx-community/Qwen3-ForcedAligner-0.6B-8bit`, listed with the `alignment` capability and loaded when a request asks for times): `verbose_json` segments end at sentences and pauses, every word carries `start`/`end`, `srt`/`vtt` are those segments, and a clip past 180 s is cut where it is quietest and each piece transcribed and timed, as the official toolkit does. It times Chinese, Cantonese, English, German, Spanish, French, Italian, Portuguese, Russian, Korean and Japanese; another language, or no aligner on disk, gives one segment over the clip (`srt`/`vtt` without an aligner are a named 400). `diarized_json` is OpenAI's speaker-labelled shape (`segments` with `speaker` "A", "B", … in the order they first speak) from Nemotron 3 Diarization (`mlx-community/Nemotron-3-Diarization-8bit`, up to eight speakers, listed with the `diarization` capability), run once over the whole clip; a segment also closes where the speaker changes. Without the diarizer on disk it is a named 400; `known_speaker_names[]` is too. With Nemotron 3.5 Transcribe loaded none of this needs a companion: it times every word with its own CTC head (NVIDIA's banded aligner; a pack converted without the head, like mlx-audio's, answers `verbose_json` untimed and `srt`/`vtt` with a named 400), `diarized_json` asks it for the card's speaker-tagged transcript and names each word's speaker from its own speaker model, and it drafts with its MTP head. No `stream`; other audio formats are named 400s
 - `POST /v1/audio/music-generations` — text-to-music, WAV out: ACE-Step (48 kHz stereo, fast) MiniMax Music 3 (`lyrics` required, 44.1 kHz, songs up to six minutes) or YuE2 (`lyrics` required, 48 kHz, plans an editable ABC score: `cot` and `abc`)
 - `POST /v1/video/generations` — LTX-Video 2.3 / 2.5 or MiniMax-H3; base64 `rgb8` frames plus `pcm_s16le` audio, mux on your side. LTX 2.5 takes `"decoder": "diffusion"` for its sharper diffusion decoder; long H3 clips chain via `chain_windows`. Opt-in `"preview": true` on `"stream": true` attaches a Latent2RGB JPEG to each denoise `progress` event (`preview_frames`, `preview_max_side`)
@@ -112,6 +112,50 @@ On `POST /v1/audio/speech`, Qwen3-TTS uses `ref_audio` (a base64-encoded WAV) to
 - A non-empty `ref_audio` must be a decodable WAV and the model must have a speaker encoder. Invalid base64/WAV or a missing encoder returns HTTP 400 before synthesis or SSE headers. Omit `ref_audio` (or send an empty string) to use the plain voice.
 - `voice` (or `speaker`) and `instructions` are honoured or refused, never dropped. A CustomVoice pack needs `voice`, one of its `talker_config.spk_id` names (the 400 lists them); its 1.7B size also takes `instructions` as a speaking style. A VoiceDesign pack needs `instructions`, a description of the voice. A Base pack takes neither (`voice` may be absent or `default`).
 - To check a reference without generating speech, send `"warm_only": true` with `ref_audio` to the same endpoint. Missing or undecodable reference audio and a missing speaker encoder return HTTP 400 instead of silently falling back. This checks reference handling, not pronunciation or accent quality.
+
+### Breeze-TTS-2 speech
+
+Breeze-TTS-2 (`model_type: breeze_tts`) serves `POST /v1/audio/speech` as a
+24 kHz mono, 16-bit PCM WAV. Use the complete
+`mlx-community/Breeze-TTS-2-mlx` bf16 pack, including `audio_tokenizer/`.
+The weights are research/non-commercial, not covered by the server's MIT license.
+See the [Breeze guide](breeze-tts.md) for download/loading instructions, full
+field reference, cloning examples, long-text behavior and troubleshooting.
+
+```bash
+curl --fail-with-body http://localhost:11234/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "input": "The forecast is clear skies.",
+    "voice": "S2",
+    "instruction": "A calm, warm voice with clear articulation.",
+    "seed": 7
+  }' \
+  --output breeze.wav
+```
+
+This example assumes Breeze is the server's default model. With multiple models,
+add `"model": "<Breeze id from GET /v1/models>"`.
+
+- `input` is required (`text` is an alias). `voice` is optional and accepts only
+  speaker slots `S0` through `S9`, case-insensitive, not Kokoro/OpenAI voice names.
+- `instruction` describes the voice/delivery; `instructions` is an alias.
+  Singular `instruction` takes precedence when both are strings.
+- Cloning requires `ref_audio` (standard base64 of a WAV file) **and**
+  non-empty `ref_text` matching that recording. Normalize the reference to
+  **24 kHz mono PCM WAV** before sending it. `input` is the new text to speak.
+  This differs from Qwen3-TTS's transcript-free speaker-embedding path above.
+- `seed` is a non-negative integer, default `42`. `max_frames` is an optional
+  non-negative integer cap **per text segment**, not a duration or token count;
+  use a positive value. The text estimate, pack ceiling and context can impose
+  a smaller cap; EOS can stop earlier. Long text is segmented and joined.
+- `"stream": true` returns SSE progress (stage `breeze`) followed by
+  `{"type":"complete","format":"wav","data":"<base64 WAV>"}`. It does not stream
+  playable PCM chunks. Handle SSE `error` events as well as HTTP errors.
+- Unknown plugin fields, including `language`, `temperature`, `max_tokens` and
+  `warm_only`, are refused by name. Language is inferred from the text.
+  Common keys `speed` and `response_format` are accepted for compatibility,
+  but do not change Breeze's generated rate or WAV output.
 
 ### Ming-3.0-tts speech
 

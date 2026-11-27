@@ -3,20 +3,20 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Voice Cloning on Mac — Zero-Shot, On-Device, No Transcript · mlx-serve</title>
-  <meta name="description" content="Clone any voice from a few seconds of reference audio, entirely on your Apple Silicon Mac. Qwen3-TTS runs natively on MLX — zero-shot cloning with no training and no transcript, validated bit-for-bit against the reference. Your voice data never leaves the machine.">
+  <title>Voice Cloning on Mac — Qwen3-TTS and Breeze-TTS-2 · mlx-serve</title>
+  <meta name="description" content="Local speech and voice cloning on Apple Silicon: Qwen3-TTS from reference audio, or Breeze-TTS-2 from audio plus its transcript. Breeze also supports speaker slots and instruction-based voice design over the server API.">
   <meta name="keywords" content="voice cloning Mac, on-device voice cloning, local text to speech Mac, zero-shot voice clone, clone voice offline, Qwen3-TTS Mac, private voice cloning, AI voice generator local, TTS Apple Silicon">
   <meta name="author" content="David Dalcu">
   <link rel="canonical" href="https://mlxserve.com/voice-cloning/">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://mlxserve.com/voice-cloning/">
   <meta property="og:title" content="Clone any voice from a few seconds of audio — on your Mac">
-  <meta property="og:description" content="Zero-shot voice cloning and neural TTS, entirely on-device. No training, no transcript, no cloud — your voice data never leaves the machine.">
+  <meta property="og:description" content="On-device Qwen3-TTS cloning without a transcript, plus Breeze-TTS-2 speech, voice design and transcript-conditioned cloning over HTTP.">
   <meta property="og:image" content="https://mlxserve.com/screenshots/audiogen-voice-clone.png">
   <meta property="og:site_name" content="mlx-serve">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Clone any voice from a few seconds of audio — on your Mac">
-  <meta name="twitter:description" content="Zero-shot voice cloning and neural TTS, entirely on-device. No training, no transcript, no cloud.">
+  <meta name="twitter:description" content="On-device Qwen3-TTS cloning without a transcript, plus Breeze-TTS-2 speech, voice design and transcript-conditioned cloning over HTTP.">
   <meta name="twitter:image" content="https://mlxserve.com/screenshots/audiogen-voice-clone.png">
   <script type="application/ld+json">
   {
@@ -41,7 +41,7 @@
       {
         "@type": "Question",
         "name": "Do I need a transcript of the reference audio?",
-        "acceptedAnswer": { "@type": "Answer", "text": "No — the reference clip alone is enough. The model extracts a speaker embedding from the audio itself, so a voice memo or any short recording works as-is." }
+        "acceptedAnswer": { "@type": "Answer", "text": "It depends on the backend. Qwen3-TTS Base uses the reference clip alone to extract a speaker embedding. Breeze-TTS-2 requires both a reference WAV and a matching non-empty transcript in ref_text; the new words to synthesize go in input." }
       },
       {
         "@type": "Question",
@@ -126,15 +126,15 @@
     </div>
     <div class="hero-f-meta">
       <span><b>Zero-shot</b> — no training run</span>
-      <span><b>No transcript</b> needed</span>
-      <span><b>Bit-for-bit validated</b> vs the reference</span>
+      <span><b>Qwen3-TTS</b> — no transcript needed</span>
+      <span><b>Breeze API</b> — audio + transcript</span>
     </div>
   </section>
 
   <section class="section" id="how">
     <div class="split">
       <div class="split-copy reveal">
-        <span class="split-kicker">How it works</span>
+        <span class="split-kicker">How Qwen3-TTS works</span>
         <h3>Record. Type. Listen.</h3>
         <p>Open the Audio pane, record 6–8 seconds of any voice in-app (or pick a file — reference clips are normalized automatically), type your text, and generate. The model extracts a <b>speaker embedding</b> from the clip — a compact fingerprint of timbre and delivery — and conditions the synthesis on it. No fine-tune, no waiting, no dataset.</p>
         <p>The embedding pipeline was validated <b>bit-for-bit against the reference implementation</b> — the clone you get locally is the clone the model's authors shipped.</p>
@@ -178,7 +178,12 @@
       <div class="mini-card reveal">
         <span class="mini-k">Kokoro</span>
         <h4>54 built-in voices</h4>
-        <p>Kokoro-82M ships 54 ready-made voices in a 345 MB download, speaks about 17× faster than realtime, and runs fully on device. Pick one, or blend several into your own mix. Cloning stays Qwen3-TTS's job.</p>
+        <p>Kokoro-82M ships 54 ready-made voices in a 345 MB download, speaks about 17× faster than realtime, and runs fully on device. Pick one, or blend several into your own mix. For cloning, use Qwen3-TTS or the <a class="prose-link" href="#breeze-tts-2">Breeze server API</a>, not Kokoro.</p>
+      </div>
+      <div class="mini-card reveal">
+        <span class="mini-k">Breeze-TTS-2</span>
+        <h4>Design a voice over HTTP</h4>
+        <p>Optional S0–S9 speaker slots, an instruction describing the delivery, or a reference WAV plus its transcript for cloning. <a class="prose-link" href="#breeze-tts-2">Breeze setup and controls</a>.</p>
       </div>
       <div class="mini-card reveal">
         <span class="mini-k">Video</span>
@@ -188,13 +193,50 @@
       <div class="mini-card reveal">
         <span class="mini-k">API</span>
         <h4>One endpoint for developers</h4>
-        <p><code>POST /v1/audio/speech</code> with <code>input</code> text and an optional base64 <code>ref_audio</code> clip — the same OpenAI-style shape your tooling already speaks.</p>
+        <p><code>POST /v1/audio/speech</code> with <code>input</code> text and backend-specific controls. Breeze cloning needs both base64 <code>ref_audio</code> and its transcript in <code>ref_text</code>; Qwen3-TTS Base does not read a transcript.</p>
       </div>
       <div class="mini-card reveal">
         <span class="mini-k">Voice Mode</span>
         <h4>Talk to your model, hands-free</h4>
         <p>The same audio stack powers <a class="prose-link" href="../local-ai-assistant/">"Hey Loki" Voice Mode</a> — on-device speech recognition in, spoken replies out, no window open.</p>
       </div>
+    </div>
+  </section>
+
+  <section class="section" id="breeze-tts-2">
+    <div class="section-header reveal">
+      <div class="section-label">Breeze-TTS-2 server API</div>
+      <h2 class="section-title">Speech, voice design and cloning</h2>
+      <p class="section-desc">24 kHz mono WAV from the built-in <code>breeze_tts</code> plugin. These are HTTP controls, not a Breeze-specific app catalog, Audio pane or Voice Mode integration.</p>
+    </div>
+    <div class="code-wrap reveal">
+      <p>Use a server build containing Breeze support and the complete dense bf16 <a class="prose-link" href="https://huggingface.co/mlx-community/Breeze-TTS-2-mlx">mlx-community/Breeze-TTS-2-mlx</a> repository. Keep its root config, tokenizer and weight shards together with <code>audio_tokenizer/</code>; without <code>audio_tokenizer/model.safetensors</code> the pack is incomplete. Downloading the pack does not add the plugin to an older server binary.</p>
+      <div class="code-block">
+        <div class="code-header"><span>Download with the Hugging Face CLI, then serve locally</span></div>
+        <div class="code-body"><pre>hf download mlx-community/Breeze-TTS-2-mlx \
+  --local-dir "$HOME/models/Breeze-TTS-2-mlx"
+
+mlx-serve --model "$HOME/models/Breeze-TTS-2-mlx" \
+  --host 127.0.0.1 --port 11234</pre></div>
+      </div>
+      <p>Once <code>GET /health</code> succeeds, send a request from another terminal. Omit <code>voice</code> for untagged speech, or select <code>S0</code> through <code>S9</code> (case-insensitive). These are speaker slots, not Kokoro/OpenAI voice names. <code>instruction</code> describes the voice or delivery; <code>instructions</code> is an alias, with singular taking precedence.</p>
+      <div class="code-block">
+        <div class="code-header"><span>Generate a designed voice</span></div>
+        <div class="code-body"><pre>curl --fail-with-body http://localhost:11234/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "input": "Clear skies today.",
+    "voice": "S2",
+    "instruction": "A calm, warm voice.",
+    "seed": 7
+  }' \
+  --output breeze.wav</pre></div>
+      </div>
+      <p>This pinned-model example needs no <code>model</code> field. On a multi-model server, add the Breeze id from <code>GET /v1/models</code>. Success is raw 24 kHz mono, 16-bit PCM WAV, not JSON. The non-negative integer <code>seed</code> defaults to 42 and repeats a request with the same model/build.</p>
+      <p><b>Cloning is transcript-conditioned:</b> prepare a clean, short 24 kHz mono PCM WAV, put standard base64 of the entire file in <code>ref_audio</code>, and its exact words in non-empty <code>ref_text</code>. Put the <em>new</em> words in <code>input</code>. A filename, URL or MP3 is not a reference upload. Normalize the clip yourself rather than relying on automatic resampling; the first clone request also loads the Mimi encoder. Only clone voices you have permission to use.</p>
+      <p><code>max_frames</code> optionally caps codec frames per text segment, not the whole request (12.5 frames/s). EOS, the text estimate and context can shorten a take; a small cap can truncate it. Long text is segmented and joined, which can reset prosody. <code>stream: true</code> returns SSE progress at stage <code>breeze</code> and a final <code>complete</code> event containing base64 WAV, not playable PCM chunks. Handle SSE <code>error</code> events even after HTTP 200.</p>
+      <p>Unknown fields such as <code>language</code>, <code>temperature</code> and <code>warm_only</code> are refused by name. Breeze infers language from text. The common <code>speed</code> and <code>response_format</code> keys do not change Breeze's generated rate or WAV output. See the <a class="prose-link" href="../api/#breeze-tts-2">API summary</a> and <a class="prose-link" href="https://github.com/ddalcu/mlx-serve/blob/main/docs/breeze-tts.md">complete guide</a> for cloning commands, request fields and troubleshooting.</p>
+      <p><b>License and validation:</b> the weights are for research and non-commercial use only; read the <a class="prose-link" href="https://huggingface.co/BreezeBlue/Breeze-TTS-2#license-and-responsible-use">model's terms</a>. The server's MIT license does not relicense them. Breeze has synthetic conformance and real-pack Mimi encoder parity checks, not an end-to-end reference-synthesis or clone-quality oracle; the Qwen3-TTS validation claims on this page do not apply to Breeze.</p>
     </div>
   </section>
 
@@ -206,11 +248,15 @@
     <div class="faq-wrap reveal">
       <details class="faq-item">
         <summary>How much reference audio do I need?</summary>
-        <p>A few seconds — 6–8 is plenty. Record it in-app or drop in a file; clips are normalized automatically, and no transcript is needed.</p>
+        <p>For Qwen3-TTS in the app, a few seconds — 6–8 is plenty; clips are normalized automatically and no transcript is needed. For the Breeze API, use a short clean reference, normalize it to 24 kHz mono PCM WAV yourself, and send its matching transcript. Longer Breeze references consume more context.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Do I need a transcript of the reference audio?</summary>
+        <p>It depends on the backend. Qwen3-TTS Base extracts a speaker embedding from the clip alone. Breeze-TTS-2 requires both <code>ref_audio</code> and a matching non-empty <code>ref_text</code>. The new words to speak go in <code>input</code>, not <code>ref_text</code>.</p>
       </details>
       <details class="faq-item">
         <summary>Is this a fine-tune? How long does "cloning" take?</summary>
-        <p>No fine-tune — it's <b>zero-shot</b>. The model computes a speaker embedding from your clip in a moment and conditions generation on it immediately. Cloning is as fast as generating.</p>
+        <p>No fine-tune — it's <b>zero-shot</b>. Qwen3-TTS computes a speaker embedding from your clip. Breeze conditions on encoded reference audio and its transcript; the first clone request also loads its audio encoder. Neither needs a training run.</p>
       </details>
       <details class="faq-item">
         <summary>How good is the clone, really?</summary>

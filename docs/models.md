@@ -29,6 +29,24 @@
 | **Embeddings** | `bert`, `gemma3_text`, `embedding_gemma2`, `qwen3` | bge, mxbai, EmbeddingGemma 1 and 2 (2: 768 dims, `dimensions` down to 128, 8192 tokens, text, image and video), Qwen3-Embedding (pooling read from the checkpoint) | n/a | EmbeddingGemma 2: SigLIP (images, video) |
 | **Anything else as GGUF** | via embedded llama.cpp | any `.gguf` on HuggingFace | per-template | -- |
 
-Media models live in the same registry and are classified the same way: FLUX.2, Krea-2, Mage-Flow, Qwen-Image-2.1, MOSS-Image and MiniMax-H3-Image (image), Qwen3-TTS, Kokoro, Ming-3.0-tts, ACE-Step and MiniMax Music 3 (speech + music), LTX-Video 2.3 / 2.5 and MiniMax-H3 (video), Hunyuan3D-2.1 (3D). A chat request naming one of them gets a 400 that names the endpoint to use instead.
+Media models live in the same registry and are classified the same way: FLUX.2, Krea-2, Mage-Flow, Qwen-Image-2.1, MOSS-Image and MiniMax-H3-Image (image), Qwen3-TTS, Kokoro, Breeze-TTS-2, Ming-3.0-tts, ACE-Step and MiniMax Music 3 (speech + music), LTX-Video 2.3 / 2.5 and MiniMax-H3 (video), Hunyuan3D-2.1 (3D). A chat request naming one of them gets a 400 that names the endpoint to use instead.
 
 Any quantized MLX model using one of the above architectures works natively. Anything else can be served as GGUF through the embedded llama.cpp engine — just pick the `.gguf` file in the Model Browser and the server auto-routes by format. Models with unsupported architectures are flagged in the Model Browser but can still be downloaded.
+
+## Breeze-TTS-2
+
+| Property | Support |
+|---|---|
+| Plugin / `model_type` | `breeze_tts` |
+| Reference pack | [`mlx-community/Breeze-TTS-2-mlx`](https://huggingface.co/mlx-community/Breeze-TTS-2-mlx), dense bf16 |
+| Endpoint | `POST /v1/audio/speech` |
+| Output | 24 kHz mono, 16-bit PCM WAV |
+| Conditioning | Plain text, optional `S0`-`S9` speaker slot, `instruction` / `instructions` voice design, or reference WAV **plus its transcript** |
+| Required codec | Complete `audio_tokenizer/` directory, including `config.json` and `model.safetensors` |
+| License | Research and non-commercial use only; see the [model's terms](https://huggingface.co/BreezeBlue/Breeze-TTS-2#license-and-responsible-use) |
+
+Use the full bf16 repository as the reference layout; the existence of other
+Breeze quantizations does not establish support in this loader. An incomplete
+pack missing `audio_tokenizer/model.safetensors` is not discovered as a usable
+media model. This is server API support, not a Breeze-specific app catalog or
+Voice Mode integration. See the [Breeze setup and usage guide](breeze-tts.md).
