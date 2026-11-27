@@ -70,6 +70,8 @@ struct ModelSettingsSheet: View {
     @State private var addingCustom = false
     @State private var customKey = ""
     @State private var customValue = ""
+    /// The `config_overrides` box, as typed; `override.configOverrides` only takes it while it is valid.
+    @State private var configText = ""
     @State private var busy = false
     /// The save reloads the model; the sheet stays up and shows the load until it is ready.
     @State private var reloading = false
@@ -102,6 +104,13 @@ struct ModelSettingsSheet: View {
             return "\"\(a)\" is already the id of another model."
         }
         return nil
+    }
+
+    /// Why the typed `config_overrides` cannot be stored, if it cannot.
+    private var configError: String? {
+        let t = configText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty, !ConfigOverrides.isObject(t) else { return nil }
+        return "Config overrides must be one JSON object, like {\"text_config\": {\"rope_parameters\": {\"rope_type\": \"yarn\", \"factor\": 4}})."
     }
 
     /// A running server answers from `/v1/models`; otherwise the app's own disk probe.
@@ -153,6 +162,7 @@ struct ModelSettingsSheet: View {
         if !isGguf { n += 2 + (specLine == nil ? 0 : 1) }
         if rows.acceptance { n += 2 }
         if live?.loaded == true { n += 1 }
+        if !isGguf { n += 2 } // the config_overrides box and its explainer
         if !isGguf { n += 2 + override.templateKwargs.count + (addingCustom ? 1 : 0) }
         return min(650, CGFloat(44 * n + 50 + 10 * 72))
     }
@@ -283,6 +293,25 @@ struct ModelSettingsSheet: View {
                 }
                 .help("What serves this model; Automatic leaves it to the server. The Neural Engine leaves the GPU free (text only; the first load on this Mac compiles it for minutes).")
                 }
+                if !isGguf {
+                    Section {
+                        TextField("", text: $configText,
+                                  prompt: Text(verbatim: "{}").font(.app(.body).monospaced()), axis: .vertical)
+                            .font(.app(.body).monospaced())
+                            .lineLimit(1...6)
+                            .onChange(of: configText) { _, v in
+                                // A valid object applies, an empty one clears the key; half-typed text leaves the
+                                // stored value alone and only blocks the save.
+                                if ConfigOverrides.isObject(v) {
+                                    override.configOverrides = ConfigOverrides.object(v).map { ConfigOverrides.text($0) }
+                                }
+                            }
+                    } header: {
+                        Text("Config overrides").font(.app(.body))
+                    } footer: {
+                        Text(L10n.text("A JSON object the server deep-merges into this model's config.json at load — the per-model form of --config-overrides. A rope the model was not trained with reads as one-token answers: state it here as rope_parameters (rope_type yarn, its factor and original_max_position_embeddings) and raise max_position_embeddings with it. A launch --config-overrides wins a key both name.")).font(.app(.body))
+                    }
+                }
                 Section("Generation defaults") {
                     if override.extra["generation_defaults"] != nil {
                         Text("The stored generation policy contains invalid or unsupported fields. It is preserved; correct model-settings.json before editing it here.")
@@ -354,6 +383,9 @@ struct ModelSettingsSheet: View {
             if let aliasError {
                 Text(verbatim: aliasError).font(.app(.caption)).foregroundStyle(.red).padding(.horizontal, 16)
             }
+            if let configError {
+                Text(verbatim: configError).font(.app(.caption)).foregroundStyle(.red).padding(.horizontal, 16)
+            }
             if let error {
                 Text(error).font(.app(.caption)).foregroundStyle(.red).padding(.horizontal, 16)
             }
@@ -369,7 +401,7 @@ struct ModelSettingsSheet: View {
                 Button { Task { await save() } } label: { Text(L10n.text(plan == .restart ? "Save & Restart" : "Save"))
                     .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(busy || aliasError != nil)
+                    .disabled(busy || aliasError != nil || configError != nil)
             }
             .padding(16)
         }
@@ -378,6 +410,7 @@ struct ModelSettingsSheet: View {
             settingsFile = ModelSettingsFile.load()
             override = settingsFile.override(for: request.path) ?? ModelOverride()
             initialOverride = override
+            configText = override.configOverrides ?? ""
             inheritedGeneration = (try? GenerationDefaultsFile.load()) ?? .init()
             packDrafter = DrafterGems.packDrafterFolder(modelDir: request.path)
             let gems = SpeculationSocketRow.gems(repoId: repoId, packDrafter: packDrafter, mtpAvailable: rows.mtp,
