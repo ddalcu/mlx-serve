@@ -7,5 +7,5 @@ inline float tf_uniform(ulong seed, uint pos, uint id) {
   ulong x = tf_mix(seed + 0x9E3779B97F4A7C15UL);
   x = tf_mix(x ^ (ulong(pos) * 0xD1B54A32D192ED03UL));
   x = tf_mix(x ^ ulong(id));
-  return (float(uint(x >> 40)) + 0.5f) * (1.0f / 16777216.0f);
+  return (float(uint(x >> 41)) + 0.5f) * (1.0f / 8388608.0f);
 }

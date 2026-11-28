@@ -3989,3 +3989,35 @@ test "inkling2 kernels: fused LAW=1 sampled Markov chain returns valid law and c
         try testing.expectApproxEqAbs(std.mem.max(f32, row), sure[i], 1e-4);
     }
 }
+
+test "inkling2 kernels: sampled Q8 fold keeps Gumbel scores finite" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(testing.allocator, s);
+    defer g.deinit();
+    const rank = 64;
+    const vocab = 16;
+    const p = try g.zeros(&.{3 * rank}, .float32);
+    const fq = try g.zeros(&.{ rank, vocab }, .uint8);
+    const fs = try g.ones(&.{ 1, vocab }, .float16);
+    const fqb = try g.zeros(&.{ 1, vocab }, .float16);
+    const fb = try g.zeros(&.{vocab}, .float16);
+    var logits: [vocab]f32 = @splat(0);
+    logits[0] = 32;
+    const base = try g.fromSlice(f32, &logits, &.{ 1, 1, vocab });
+    const at = try g.fromSlice(i32, &.{0}, &.{1});
+    const cap = try g.fromSlice(f32, &.{0}, &.{1});
+    const state = try g.zeros(&.{ 1, 1, rank }, .float16);
+    // These seeds hash to 0 and maxInt(u64) for step 0, token 1.
+    for ([_]u64{ 13787848793156543929, 8125131182100662393 }) |seed| {
+        const params = try g.fromSlice(u32, &.{ @bitCast(@as(f32, 1)), @truncate(seed), @truncate(seed >> 32), 0 }, &.{4});
+        const part = try kernels.markovFoldQ8Law(&g, p, fq, fs, fqb, fb, base, at, vocab, cap, params, .float16);
+        const scores = try hostValues(testing.allocator, &g, part[3]);
+        defer testing.allocator.free(scores);
+        for (scores) |score| try testing.expect(std.math.isFinite(score));
+        const picked = try kernels.markovPickRnnLaw(&g, .{ part[0], part[1], part[2], part[3] }, p, state, cap, state, state, state, state, state, at, false);
+        try mlx.check(mlx.mlx_array_eval(picked[0]));
+        try testing.expectEqual(@as(i32, 0), mlx.mlx_array_data_int32(picked[0]).?[0]);
+    }
+}

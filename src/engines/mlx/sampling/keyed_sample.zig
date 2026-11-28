@@ -46,7 +46,7 @@ pub fn gumbel(seed: u64, position: u64, id: u32) f32 {
     var x = mix(seed +% 0x9E3779B97F4A7C15);
     x = mix(x ^ (@as(u64, @as(u32, @truncate(position))) *% 0xD1B54A32D192ED03));
     x = mix(x ^ id);
-    const u = (@as(f32, @floatFromInt(@as(u32, @truncate(x >> 40)))) + 0.5) * (1.0 / 16777216.0);
+    const u = (@as(f32, @floatFromInt(@as(u32, @truncate(x >> 41)))) + 0.5) * (1.0 / 8388608.0);
     return -@log(-@log(u));
 }
 
@@ -203,5 +203,21 @@ test "keyed_sample min_p retains the temperature-scaled nucleus" {
         const score0 = raw[0] / p.temperature + gumbel(p.seed, pos, 0);
         const score1 = raw[1] / p.temperature + gumbel(p.seed, pos, 1);
         try testing.expectEqual(@as(u32, if (score0 >= score1) 0 else 1), mlx.mlx_array_data_uint32(tok).?[0]);
+    }
+}
+
+test "keyed_sample: endpoint hashes keep Gumbel noise finite" {
+    // These seeds hash to 0 and maxInt(u64) for position 0, token 1.
+    const seeds = [_]u64{ 11086404627213290158, 11060275429047018169 };
+    for (seeds) |seed| try testing.expect(std.math.isFinite(gumbel(seed, 0, 1)));
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const raw = [_]f32{ 32, 0 };
+    const logits = mlx.mlx_array_new_data(&raw, &[_]c_int{ 1, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    for (seeds) |seed| {
+        const tok = try sample(logits, .{ .seed = seed, .temperature = 1, .top_p = 1, .top_k = 0 }, &.{0}, mlx.gpuStream());
+        defer _ = mlx.mlx_array_free(tok);
+        try mlx.check(mlx.mlx_array_eval(tok));
+        try testing.expectEqual(@as(u32, 0), mlx.mlx_array_data_uint32(tok).?[0]);
     }
 }
