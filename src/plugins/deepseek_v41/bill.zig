@@ -50,12 +50,14 @@ pub fn inUseAt(now: outside_model.Reading, start: outside_model.Reading, device_
     return if (device_weights) now.in_use else outside_model.settled(now, start).in_use;
 }
 
-/// The bytes a streamed bank's slot rows may take in each phase: the GPU working set less `wired_margin` (the host's
-/// `--wired-margin-gib`) and `stream_host_bytes`, the memory in use (`inUseAt`: the residents loaded, every other
-/// process) and the phase's working set at `context` positions (a prompt: one `stream_call_rows` call's; decode: the
-/// state at `context + stream_generation`).
-pub fn streamBudget(config: *const cfg_mod.Config, context: u64, wired_margin: u64, in_use: u64) struct { prompt: u64, decode: u64 } {
-    const box = @as(u64, mlx.maxRecommendedWorkingSet()) -| wired_margin -| stream_host_bytes -| engramStore(config) -| in_use;
+/// The bytes a streamed bank's slot rows may take in each phase: the GPU working set (`ceiling`, the host's
+/// `LoadCtx.gpu_ceiling_bytes`; 0 = the device's) less `wired_margin` (the host's `--wired-margin-gib`) and
+/// `stream_host_bytes`, the memory in use (`inUseAt`: the residents loaded, every other process) and the phase's
+/// working set at `context` positions (a prompt: one `stream_call_rows` call's; decode: the state at
+/// `context + stream_generation`).
+pub fn streamBudget(config: *const cfg_mod.Config, context: u64, wired_margin: u64, in_use: u64, ceiling: u64) struct { prompt: u64, decode: u64 } {
+    const working_set = if (ceiling > 0) ceiling else @as(u64, mlx.maxRecommendedWorkingSet());
+    const box = working_set -| wired_margin -| stream_host_bytes -| engramStore(config) -| in_use;
     return .{
         .prompt = box -| prefillAt(config, context, stream_call_rows),
         .decode = box -| prefillAt(config, context + stream_generation, 1),
@@ -108,4 +110,19 @@ test "dsv41 bill: a bank bills the Engram LRU whenever the pack has Engram layer
     try std.testing.expectEqual(@as(u64, 0), engramStore(&c));
     c.dsv41_n_engram_layers = 1;
     try std.testing.expect(engramStore(&c) > 0);
+}
+
+test "dsv41 bill: a bank's budget follows the host's ceiling, the device's only when the host has none" {
+    const GiB: u64 = 1 << 30;
+    var c: cfg_mod.Config = .{ .model_type = "deepseek_v41" };
+    c.dsv41_n_engram_layers = 1;
+    const at240 = streamBudget(&c, 1 << 20, 8 * GiB, 20 * GiB, 240 * GiB);
+    const at300 = streamBudget(&c, 1 << 20, 8 * GiB, 20 * GiB, 300 * GiB);
+    try std.testing.expectEqual(60 * GiB, at300.prompt - at240.prompt);
+    try std.testing.expectEqual(60 * GiB, at300.decode - at240.decode);
+    try std.testing.expectEqual(240 * GiB - 8 * GiB - stream_host_bytes - engramStore(&c) - 20 * GiB, at240.prompt + prefillAt(&c, 1 << 20, stream_call_rows));
+    const device = streamBudget(&c, 1 << 20, 8 * GiB, 20 * GiB, 0);
+    const own = streamBudget(&c, 1 << 20, 8 * GiB, 20 * GiB, @as(u64, mlx.maxRecommendedWorkingSet()));
+    try std.testing.expectEqual(own.prompt, device.prompt);
+    try std.testing.expectEqual(own.decode, device.decode);
 }

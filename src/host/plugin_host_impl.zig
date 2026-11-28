@@ -241,11 +241,11 @@ fn memoryCeiling(ctx: ?*anyopaque) callconv(.c) u64 {
     return self.opts.ceiling(self.opts.ceiling_ctx);
 }
 
-/// The default ceiling: the device's working-set limit less MLX's active bytes.
+/// The default ceiling: the working-set limit (`memory_ceiling.deviceWorkingSet`) less MLX's active bytes.
 fn workingSetHeadroom(_: ?*anyopaque) u64 {
     var active: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
-    return mlx.maxRecommendedWorkingSet() -| active;
+    return @import("registry/memory_ceiling.zig").deviceWorkingSet() -| active;
 }
 
 // ── HostGpu ──

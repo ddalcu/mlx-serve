@@ -38,9 +38,16 @@ fn getMetalBufferLimit() u64 {
 /// oversubscribe. Falls back to `getMetalBufferLimit()` when the device query
 /// is unavailable (CI / non-Metal hosts).
 fn getGpuWorkingSetLimit() u64 {
+    const ws = deviceWorkingSet();
+    return if (ws > 0) ws else getMetalBufferLimit();
+}
+
+/// THE working-set limit every bill reads: the operator's forced ceiling (`--gpu-ceiling-gib`, `--memory-preset`,
+/// `MLX_SERVE_GPU_CEILING_MB`), else Metal's recommended working set; 0 when neither is known (CI, no GPU).
+/// A bill that reads `mlx.maxRecommendedWorkingSet()` itself escapes the forced ceiling.
+pub fn deviceWorkingSet() u64 {
     if (overrides().static_ceiling) |v| return v;
-    const max_rec = mlx.maxRecommendedWorkingSet();
-    return if (max_rec > 0) max_rec else getMetalBufferLimit();
+    return mlx.maxRecommendedWorkingSet();
 }
 
 /// PURE (unit-testable): the real ceiling a NEW MLX allocation must fit under.
@@ -172,6 +179,60 @@ pub fn applyGpuCeilingEnv() void {
     overrides().static_ceiling = mb << 20;
     log.warn("[diag] GPU ceiling forced to {d} MB (MLX_SERVE_GPU_CEILING_MB)\n", .{mb});
 }
+
+/// `--gpu-ceiling-gib <n>` / `--memory-preset <name>`: the same override as `MLX_SERVE_GPU_CEILING_MB`, set after
+/// it, so a flag wins over the env. It bounds the guards' arithmetic (as if the Mac had this working set), not what
+/// Metal will grant.
+pub fn forceGpuCeiling(bytes: u64, why: []const u8) void {
+    overrides().static_ceiling = bytes;
+    log.warn("[mem] GPU ceiling forced to {d} MiB ({s})\n", .{ bytes >> 20, why });
+}
+
+pub const min_ceiling_gib: u32 = 4;
+pub const max_ceiling_gib: u32 = 4096;
+
+/// `--gpu-ceiling-gib <n>`: whole GiB, `min_ceiling_gib`..`max_ceiling_gib`.
+pub fn parseGpuCeilingGib(raw: []const u8) error{InvalidGpuCeiling}!u64 {
+    const n = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidGpuCeiling;
+    if (n < min_ceiling_gib or n > max_ceiling_gib) return error.InvalidGpuCeiling;
+    return @as(u64, n) << 30;
+}
+
+/// A `--memory-preset`: a Mac named by its chip and RAM, served as if its GPU could hold the RAM less
+/// `preset_reserve_gib` (macOS and the host's own memory).
+pub const MemoryPreset = struct { name: []const u8, ram_gib: u32 };
+pub const preset_reserve_gib: u32 = 16;
+/// The one table of presets: the usage text and the parser both read it. A preset is a ceiling, never a model choice.
+pub const memory_presets = [_]MemoryPreset{
+    .{ .name = "m5-96", .ram_gib = 96 },
+    .{ .name = "m5-128", .ram_gib = 128 },
+    .{ .name = "m5-256", .ram_gib = 256 },
+};
+
+pub fn presetCeilingGib(p: MemoryPreset) u32 {
+    return p.ram_gib - preset_reserve_gib;
+}
+
+/// `--memory-preset <name>`: the preset's ceiling in bytes.
+pub fn parseMemoryPreset(raw: []const u8) error{UnknownMemoryPreset}!u64 {
+    for (memory_presets) |p| if (std.mem.eql(u8, raw, p.name)) return @as(u64, presetCeilingGib(p)) << 30;
+    return error.UnknownMemoryPreset;
+}
+
+/// The ceiling the two flags ask for (`parseGpuCeilingGib`, `parseMemoryPreset`), null for neither; both is refused.
+pub fn ceilingFlag(gib: ?u64, preset: ?u64) error{BothCeilingFlags}!?struct { bytes: u64, flag: []const u8 } {
+    if (gib != null and preset != null) return error.BothCeilingFlags;
+    if (gib) |b| return .{ .bytes = b, .flag = "--gpu-ceiling-gib" };
+    if (preset) |b| return .{ .bytes = b, .flag = "--memory-preset" };
+    return null;
+}
+
+/// The presets as the usage text lists them: `m5-96 (80 GiB), m5-128 (112 GiB), m5-256 (240 GiB)`.
+pub const memory_preset_list: []const u8 = blk: {
+    var s: []const u8 = "";
+    for (memory_presets, 0..) |p, i| s = s ++ (if (i > 0) ", " else "") ++ p.name ++ std.fmt.comptimePrint(" ({d} GiB)", .{presetCeilingGib(p)});
+    break :blk s;
+};
 
 /// What the ceiling counts as free. A request's memory is given back when it ends, so it may count
 /// what macOS can compress or swap out of other apps; the hot cache stays while the server idles, so
@@ -311,4 +372,50 @@ test "the MLX buffer pool is inside `available` by construction, so a refusal ca
     try t.expectEqual(pool + free_system, ceiling - active);
     const cleared = physicalMemoryCeiling(wired, active, free_system + pool);
     try t.expectEqual(ceiling, cleared);
+}
+
+test "parseGpuCeilingGib takes whole GiB in range and names a bad value" {
+    const t = std.testing;
+    try t.expectEqual(@as(u64, 240) << 30, try parseGpuCeilingGib("240"));
+    try t.expectEqual(@as(u64, min_ceiling_gib) << 30, try parseGpuCeilingGib("4"));
+    try t.expectEqual(@as(u64, max_ceiling_gib) << 30, try parseGpuCeilingGib("4096"));
+    for ([_][]const u8{ "3", "4097", "0", "-1", "240.5", "240G", "" }) |bad|
+        try t.expectError(error.InvalidGpuCeiling, parseGpuCeilingGib(bad));
+}
+
+test "memory presets are the Mac's RAM less 16 GiB: m5-256 = 240 GiB, m5-128 = 112 GiB, m5-96 = 80 GiB" {
+    const t = std.testing;
+    try t.expectEqual(@as(u64, 240) << 30, try parseMemoryPreset("m5-256"));
+    try t.expectEqual(@as(u64, 112) << 30, try parseMemoryPreset("m5-128"));
+    try t.expectEqual(@as(u64, 80) << 30, try parseMemoryPreset("m5-96"));
+    try t.expectError(error.UnknownMemoryPreset, parseMemoryPreset("m5-512"));
+    try t.expectError(error.UnknownMemoryPreset, parseMemoryPreset("M5-256"));
+    for (memory_presets) |p| {
+        var buf: [8]u8 = undefined;
+        try t.expectEqual(try parseGpuCeilingGib(try std.fmt.bufPrint(&buf, "{d}", .{presetCeilingGib(p)})), try parseMemoryPreset(p.name));
+    }
+    try t.expectEqualStrings("m5-96 (80 GiB), m5-128 (112 GiB), m5-256 (240 GiB)", memory_preset_list);
+}
+
+test "the ceiling flags: either one sets the ceiling, both is refused, neither keeps the machine's" {
+    const t = std.testing;
+    try t.expectEqual(@as(?u64, null), if (try ceilingFlag(null, null)) |c| c.bytes else null);
+    const g = (try ceilingFlag(try parseGpuCeilingGib("200"), null)).?;
+    try t.expectEqual(@as(u64, 200) << 30, g.bytes);
+    try t.expectEqualStrings("--gpu-ceiling-gib", g.flag);
+    const p = (try ceilingFlag(null, try parseMemoryPreset("m5-128"))).?;
+    try t.expectEqual(@as(u64, 112) << 30, p.bytes);
+    try t.expectEqualStrings("--memory-preset", p.flag);
+    try t.expectError(error.BothCeilingFlags, ceilingFlag(240 << 30, 240 << 30));
+}
+
+test "a forced ceiling is the working set every bill reads" {
+    const t = std.testing;
+    const saved = overrides().static_ceiling;
+    defer overrides().static_ceiling = saved;
+    overrides().static_ceiling = null;
+    try t.expectEqual(@as(u64, mlx.maxRecommendedWorkingSet()), deviceWorkingSet());
+    overrides().static_ceiling = try parseMemoryPreset("m5-256");
+    try t.expectEqual(@as(u64, 240) << 30, deviceWorkingSet());
+    try t.expectEqual(@as(u64, 240) << 30, staticGpuMemoryCeiling());
 }
