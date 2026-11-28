@@ -44,7 +44,8 @@ pub fn build(b: *std.Build) void {
     const units_opt = b.option(bool, "units", "Compile the host, the engine and each plugin group as their own units, in parallel");
     const units = units_opt orelse (builtin.os.tag == .macos);
     // A plugin registers by its folder: the scan writes src/plugins/registry.zig, every graph compiles it.
-    const plugin_names = plugins.generate(b);
+    const linux_or_windows = target.result.os.tag == .linux or target.result.os.tag == .windows;
+    const plugin_names = plugins.generate(b, if (linux_or_windows) units_opt orelse false else units);
 
     // `lint`, `lint-test`, `unit-closure`.
     lint.add(b);
@@ -56,23 +57,23 @@ pub fn build(b: *std.Build) void {
 
     // `install`, `run`, `test` for Linux and Windows, gated on the TARGET so the Linux exe can be built on any host
     // zig can target; the host gate below still guards the macOS graph.
-    if (target.result.os.tag == .linux or target.result.os.tag == .windows) return linux.add(b, target, optimize, units_opt orelse false, plugin_names);
+    if (linux_or_windows) return linux.add(b, target, optimize, units_opt orelse false, plugin_names);
     if (builtin.os.tag != .macos) return;
 
     const graph: macos.Graph = .init(b, target, optimize, host, units);
     // `install`, `units`, `units-check`, `run`.
     macos.addServer(&graph, plugin_names);
     // `test-build`, `test`.
-    const tests = macos.addUnitTests(&graph);
+    const tests = macos.addUnitTests(&graph, plugin_names);
     // `kit`, and the kit's example plugins built from it as dylibs the unit tests load; its closure's tests join `test`.
     kit.add(b, graph.version, tests.runs);
-    kit.addTests(b, tests.step);
+    kit.addTests(b, tests.host_step);
     // `exl3-test`.
     macos.addPluginTests(&graph, tests);
     // `check`.
-    macos.addCheck(&graph);
+    macos.addCheck(&graph, plugin_names);
     // `vz-agent`, `vz-agent-host`; its host-side tests join `test`.
-    standalone.addVzAgent(b, target, optimize, tests.step);
+    standalone.addVzAgent(b, target, optimize, tests.host_step);
     // `ios-lib`, `ios-lib-sim`.
     ios.add(b, graph.version, host.brew_prefix);
 }

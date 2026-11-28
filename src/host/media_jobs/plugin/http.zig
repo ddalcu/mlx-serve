@@ -315,39 +315,10 @@ const Sink = struct {
 // ── tests ──
 
 const testing = std.testing;
-const served_mod = @import("served.zig");
-const sa_plugin = @import("../../../plugins/stable_audio3/plugin.zig");
 const test_conn = @import("test_conn.zig");
 
 const capture = test_conn.capture;
 const captureMany = test_conn.captureMany;
-
-test "plugin arm: a stable_audio3 pack is the plugin's, billed as the legacy arm billed it" {
-    const a = testing.allocator;
-    const io = testing.io;
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const fx = try sa_plugin.conformanceFixture(arena.allocator());
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "t5gemma-b-b-ul2");
-    for (fx.files) |f| try tmp.dir.writeFile(io, .{ .sub_path = f.name, .data = f.bytes });
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = pbuf[0..try tmp.dir.realPath(io, &pbuf)];
-
-    // Identity and bills: the pack is the plugin's, billed as the legacy arm billed it (every safetensors, resident).
-    const mt = gen.peekModelType(io, a, path).?;
-    defer a.free(mt);
-    try testing.expectEqualStrings("stable_audio3", mt);
-    try testing.expectEqual(gen.Modality.audio, gen.detectModality(io, a, path).?);
-    const legacy_bill = gen.sumSafetensorsAt(io, path);
-    try testing.expect(legacy_bill > 0);
-    try testing.expectEqual(legacy_bill, gen.estimatePeakResidentBytes(io, path, mt));
-
-    const pe = try Engine.load(io, a, path, served_mod.byName(mt).?, mlx.mlx_default_cpu_stream_new());
-    defer pe.deinit();
-    try testing.expectEqual(@as(u64, 0), pe.requestPeak(fx.body));
-}
 
 test "plugin arm: chat gets one turn per step boundary, from the driver, through a backend's progress" {
     var sv: [2]std.posix.fd_t = undefined;

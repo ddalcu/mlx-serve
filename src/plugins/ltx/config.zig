@@ -15,6 +15,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"dgrauet/ltx-2.3-mlx-q4"},
 };
 
+pub const modality: abi.Modality = .video;
+
 pub const model_types = [_][]const u8{"AudioVideo"};
 
 pub const claims = sdk.mediaClaimsByType(&model_types);

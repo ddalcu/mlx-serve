@@ -7,6 +7,8 @@ pub const io_util = @import("sdk/util/io_util.zig");
 pub const log = @import("sdk/util/log.zig");
 pub const env = @import("env.zig");
 comptime {
+    // Every plugin compiled in, exporting the tables `plugins/registry.zig` takes by name under `-Dunits`.
+    _ = @import("plugins/registry_full.zig");
     // The plugins' host surface: plugin_host.zig's list, every name re-exported here.
     @import("plugin_host_check.zig").reexports(@This());
 }
@@ -21,6 +23,7 @@ test {
     _ = @import("plugins/stable_audio3/plugin.zig");
     _ = @import("host/media_jobs/plugin/served.zig");
     _ = @import("host/media_jobs/plugin/flip_test.zig");
+    _ = @import("host/media_jobs/plugin/clef_flip_test.zig");
     _ = @import("host/media_jobs/plugin/flip_image_test.zig");
     _ = @import("plugins/gemma4/gelu_ple_test.zig");
     _ = @import("sdk/quant/gguf/claim_test.zig");

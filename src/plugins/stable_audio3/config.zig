@@ -12,6 +12,9 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"stabilityai/stable-audio-3-small"},
 };
 
+pub const modality: abi.Modality = .audio;
+pub const required_file = "t5gemma-b-b-ul2/model.safetensors";
+
 pub const model_types = [_][]const u8{"stable_audio3"};
 
 pub const DEFAULT_STEPS: u32 = 8;

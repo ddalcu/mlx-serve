@@ -41,7 +41,7 @@ def exits(plugin, skipped=()):
             if not t.startswith('src/') or not os.path.exists(t):
                 continue
             # The registry imports every plugin: reaching it puts them all in the closure.
-            if not (t.startswith(ALLOWED) or t == 'src/env.zig') or t == 'src/plugins/registry.zig':
+            if not (t.startswith(ALLOWED) or t == 'src/env.zig') or t in ('src/plugins/registry.zig', 'src/plugins/registry_full.zig', 'src/plugins/registry_test_core.zig', 'src/plugins/registry_test_media.zig', 'src/plugins/registry_test_stubs.zig'):
                 (notes if plugin_of(p) in skipped else out).append((p, line, t))
                 continue
             if t not in seen:

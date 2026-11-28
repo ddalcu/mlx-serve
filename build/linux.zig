@@ -12,8 +12,8 @@
 //!     libjinja.a holds Mach-O objects).
 //! Windows reuses this graph without ds4, libwebp or Bonjour (src/windows_stubs.c), linking the
 //! MSVC-built mlx + mlx-c staged in lib/mlx-win/{include,lib} and llama.cpp's release DLLs.
-//! `-Dunits` (ELF only) compiles the host, the MLX engine and the plugin groups as parallel objects, as on macOS
-//! (`macos.addServer`); `src/exe.zig` and `src/host_unit.zig` read POSIX argv/envp, so Windows stays one unit.
+//! `-Dunits` compiles the host, the MLX engine and the plugin groups as parallel objects, as on macOS
+//! (`macos.addServer`).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,10 +24,6 @@ const plugins = @import("plugins.zig");
 /// `install`, `run`, `test`, `units`.
 pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, units: bool, plugin_names: []const []const u8) void {
     const windows = target.result.os.tag == .windows;
-    if (windows and units) {
-        std.debug.print("\n[mlx-serve] -Dunits is not wired for Windows (src/exe.zig reads POSIX argv); build without it.\n\n", .{});
-        std.process.exit(1);
-    }
     if (!windows) verifyMlxStageLinux(b);
     // CI passes -Dstrip: without debug info LLVM has less to emit, and the PR gate's binary is never shipped.
     const strip = b.option(bool, "strip", "Omit debug info and Zig symbols from the mlx-serve executable");
@@ -176,14 +172,8 @@ fn addUnits(
         .{ "engine-modules", "src/modules_unit.zig" },
     }) |u| addUnit(b, mod, units_step, unitModule(b, mod, includes, target, optimize, strip, u[1]), u[0], u[0]);
     mod.root_source_file = b.path("src/exe.zig");
-    const n_groups = @min(plugin_names.len, b.option(usize, "unit-groups", "Plugin objects under -Dunits (default 8)") orelse 8);
-    const groups = b.allocator.alloc([]const []const u8, n_groups) catch @panic("OOM");
-    for (groups, 0..) |*names, gi| {
-        var list: std.ArrayList([]const u8) = .empty;
-        var i = gi;
-        while (i < plugin_names.len) : (i += n_groups) list.append(b.allocator, plugin_names[i]) catch @panic("OOM");
-        names.* = list.items;
-    }
+    const max_groups = b.option(usize, "unit-groups", "Most plugin objects under -Dunits (default 8)") orelse 8;
+    const groups = plugins.unitGroups(b.allocator, plugin_names, max_groups, optimize) catch @panic("OOM");
     for (plugins.writeUnitRoots(b, groups), 0..) |root, gi| {
         addUnit(b, mod, units_step, unitModule(b, mod, includes, target, optimize, strip, root), b.fmt("unit-{d}", .{gi}), b.fmt("{d}", .{gi}));
     }
@@ -210,7 +200,7 @@ fn unitModule(
     var it = exe_mod.import_table.iterator();
     while (it.next()) |e| if (!std.mem.eql(u8, e.key_ptr.*, "sushi_exl3")) m.addImport(e.key_ptr.*, e.value_ptr.*);
     m.include_dirs.appendSlice(b.allocator, includes) catch @panic("OOM");
-    libs.addMlxLib(b, m);
+    if (target.result.os.tag != .windows) libs.addMlxLib(b, m);
     _ = libs.addExl3Module(b, m, target, optimize);
     return m;
 }

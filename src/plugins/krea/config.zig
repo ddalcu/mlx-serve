@@ -13,6 +13,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"krea/Krea-2-Turbo"},
 };
 
+pub const modality: abi.Modality = .image;
+
 pub const model_types = [_][]const u8{"krea2_turbo"};
 
 /// No marker (as discovery has always treated these packs).

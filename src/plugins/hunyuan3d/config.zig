@@ -12,6 +12,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"tencent/Hunyuan3D-2.1"},
 };
 
+pub const modality: abi.Modality = .mesh;
+
 pub const model_types = [_][]const u8{"hunyuan3d"};
 
 /// No marker (as discovery has always treated these packs).

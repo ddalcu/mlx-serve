@@ -33,6 +33,14 @@ pub fn expectRegistry(comptime R: type) !void {
     try expectOneClaimant(&R.entries, &R.model_configs);
 }
 
+/// A split test registry's slice of conformance: every plugin (and template, when declared) in `R`, plus the
+/// fixture-pack claimant check when `R` supplies `claimant_entries` and `model_configs`.
+pub fn expectRegistrySlice(comptime R: type) !void {
+    if (@hasDecl(R, "templates")) inline for (R.templates) |M| try expectPlugin(M);
+    inline for (R.plugins) |M| try expectPlugin(M);
+    if (@hasDecl(R, "claimant_entries")) try expectOneClaimant(&R.claimant_entries, &R.model_configs);
+}
+
 /// A plugin as the suite sees it: a built-in from its root (`subjectOf`) or an outside one from its dylib's manifest.
 pub const Subject = struct {
     name: []const u8,

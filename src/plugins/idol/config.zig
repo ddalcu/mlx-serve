@@ -13,6 +13,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"speridlabs/idol"},
 };
 
+pub const modality: abi.Modality = .mesh;
+
 pub const model_types = [_][]const u8{"idol"};
 
 /// The FLUX.2 VAE sorts last of what a pull lands.

@@ -15,11 +15,12 @@ name: Linux
 # checks, and the CUDA runtime libraries the ldd gate resolves, not the 4 GB toolkit.
 #
 # A PR runs only when its files reach the Zig graph (`changes`, scripts/ci-changes.sh;
-# a skipped job counts as passing) and builds the fast variant: `-Dunits` (the host,
-# the engine and the plugin groups compile as parallel objects) and `-Dstrip`. push to
-# main and workflow_dispatch build and package what release.yml attaches to a release,
-# as one unit with debug info. Only main saves the cheap caches: a PR's copy is
-# unreadable to every other PR and pushed the repo over the 10 GB cap.
+# a skipped job counts as passing) and builds the fast variant: Debug, `-Dunits` (the
+# host, the engine and the plugin groups compile as parallel objects) and `-Dstrip`; its
+# binary is linked and ldd-checked, never shipped, so a ReleaseFast-only break shows on
+# main. push to main and workflow_dispatch build and package what release.yml attaches to
+# a release: ReleaseFast, one unit, with debug info. Only main saves the cheap caches: a
+# PR's copy is unreadable to every other PR and pushed the repo over the 10 GB cap.
 #
 # The tarball keeps the repo layout the binary's $ORIGIN rpaths expect
 # (zig-out/bin/mlx-serve next to lib/mlx/lib, lib/llama/lib, lib/ds4-linux; lib/mlx/include holds the
@@ -93,6 +94,7 @@ jobs:
       CUDA_ARCH: ${{ matrix.cuda_arch }}
       ZIG_CPU: ${{ matrix.zig_cpu }}
       NATIVE_CPU_FLAG: ${{ matrix.cpu_flag }}
+      ZIG_OPTIMIZE: ${{ github.event_name == 'pull_request' && 'Debug' || 'ReleaseFast' }}
       ZIG_BUILD_ARGS: ${{ github.event_name == 'pull_request' && '-Dunits=true -Dunit-groups=4 -Dstrip=true' || '' }}
     steps:
       - uses: actions/checkout@v4
@@ -147,6 +149,16 @@ jobs:
           path: .zig-toolchain
           key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}
 
+      # build-linux.sh rebuilds it unless the stamp matches: the key hashes every input the stamp does.
+      - name: Restore libjinja
+        id: jinja
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            lib/jinja_cpp/libjinja-linux.a
+            lib/jinja_cpp/.linux-version
+          key: jinja-linux-${{ matrix.name }}-${{ env.ZIG_CPU }}-${{ hashFiles('lib/jinja_cpp/*.cpp', 'lib/jinja_cpp/*.h', 'lib/jinja_cpp/nlohmann/*.hpp', 'scripts/fetch-zig.sh', 'scripts/build-linux.sh', 'scripts/build-mlx-linux.sh') }}
+
       # With both stages cached the build compiles only mlx-serve, which needs no toolkit.
       - name: Is the build only mlx-serve
         id: warm
@@ -163,8 +175,8 @@ jobs:
 
       # Not cached: the .debs are ~4 GB per arch, and two of them pushed the repo past
       # GitHub's 10 GB cache limit, evicting the MLX stage (an hour to rebuild).
-      # Warm: the stage scripts still check for nvcc, cmake, LAPACKE and the cuDNN header
-      # before they find the stamp, and the ldd gate below needs the runtime libraries
+      # Warm: the build scripts still check for nvcc, cmake, LAPACKE and the cuDNN header
+      # before they find the stamps, and the ldd gate below needs the runtime libraries
       # libmlx.so (cublasLt, cufft, cusolver, nvrtc, cudnn) and libds4.so (cudart, cublas) link.
       - name: Install CUDA 13, cuDNN and build dependencies
         env:
@@ -228,3 +240,12 @@ jobs:
         with:
           path: .zig-toolchain
           key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}
+
+      - name: Save libjinja
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.jinja.outputs.cache-hit != 'true' && hashFiles('lib/jinja_cpp/.linux-version') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            lib/jinja_cpp/libjinja-linux.a
+            lib/jinja_cpp/.linux-version
+          key: ${{ steps.jinja.outputs.cache-primary-key }}

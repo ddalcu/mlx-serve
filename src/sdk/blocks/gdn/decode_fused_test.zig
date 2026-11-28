@@ -617,6 +617,7 @@ test "gdn packed prework: fused at production Hk/Hv serves B=6,8,16 S=1 per row"
 }
 
 test "gdn_decode.step and recur: bit-identical to prework -> recurrence -> norm-gate -> rotation, states included" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     decode_fused.gdn_decode_fused_override = true;
     defer decode_fused.gdn_decode_fused_override = null;
@@ -637,6 +638,7 @@ test "gdn_decode.recurSeq: bit-identical to prework -> capture recurrence at ver
 }
 
 test "gdn_decode.recurSeq: a T-row window equals T one-row calls" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     for ([_][2]mlx.mlx_dtype{ .{ .bfloat16, .bfloat16 }, .{ .float16, .float32 }, .{ .bfloat16, .float32 } }) |dts| {
         var t: c_int = 2;
@@ -736,6 +738,7 @@ fn gdnDecodeRowsCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, t_
 }
 
 test "gdn_decode.recurSeqFold: bit-identical to recurSeq -> norm-gate -> conv-input concat" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const s = mlx.gpuStream();
     decode_fused.gdn_decode_fused_override = true;
@@ -750,6 +753,7 @@ test "gdn_decode.recurSeqFold: bit-identical to recurSeq -> norm-gate -> conv-in
 }
 
 test "gdn_decode.recurSeqFold: a threadgroup the GPU refuses declines cleanly, and MLX keeps working" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const s = mlx.gpuStream();
     decode_fused.gdn_decode_fused_override = true;
@@ -928,6 +932,7 @@ test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kerne
 
 test "gdn_decode.recurTree: every node of a draft tree equals a chain over its own path" {
     // A tree of 1 or 2 nodes has fewer rows than the conv window it commits.
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     for ([_]usize{ 1, 2, 8 }) |nodes| {
         try gdnDecodeTreeCase(.bfloat16, nodes);
         try gdnDecodeTreeCase(.float32, nodes);

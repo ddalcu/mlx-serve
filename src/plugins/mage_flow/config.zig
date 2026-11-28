@@ -13,6 +13,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"microsoft/Mage-Flow-Turbo"},
 };
 
+pub const modality: abi.Modality = .image;
+
 pub const model_types = [_][]const u8{ "mage_flow", "mageflow" };
 
 /// No marker (as discovery has always treated these packs).

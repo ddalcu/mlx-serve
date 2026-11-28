@@ -336,6 +336,7 @@ test "fused residual norm chain is bit-identical to the composed ops in every st
     // Bar: pre-norm / scale / post-norm on and off in all eight combinations,
     // aligned and ragged widths, rows 1 and 3, bf16 and f32, byte for byte
     // against rms_norm -> add -> multiply -> rms_norm as separate MLX ops.
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5EA3);
@@ -514,6 +515,7 @@ test "fused residual+RMSNorm is bit-identical to mlx_add + mlx_fast_rms_norm" {
     // 512), the ragged tail (2050 — not a multiple of 4), and a non-power-of-2
     // axis (5120) where `acc / axis_size` could differ if a compiler turned the
     // divide into a reciprocal multiply.
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x0DDBA11);

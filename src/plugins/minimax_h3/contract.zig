@@ -883,7 +883,7 @@ test "kernel contract h3: each declared launch is the shipped wrapper's, byte fo
 }
 
 test "kernel contract h3: the VSA launches are the shipped wrappers', byte for byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const Scope = @import("../../mlx/scope.zig").Scope;
     var rig = metal.Rig.init(a);

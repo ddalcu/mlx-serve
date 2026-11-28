@@ -13,6 +13,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"},
 };
 
+pub const modality: abi.Modality = .audio;
+
 pub const model_types = [_][]const u8{"qwen3_tts"};
 
 pub const claims = sdk.mediaClaimsByType(&model_types);

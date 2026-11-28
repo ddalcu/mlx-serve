@@ -12,6 +12,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"aac6fef/laya-multilingual-mlx"},
 };
 
+pub const modality: abi.Modality = .decision;
+
 pub const model_types = [_][]const u8{"laya"};
 
 pub fn claims(model_type: abi.Str, dir: *const abi.PackDir) callconv(.c) abi.Claim {

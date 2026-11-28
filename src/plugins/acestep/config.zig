@@ -13,6 +13,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{"ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit"},
 };
 
+pub const modality: abi.Modality = .audio;
+
 pub const model_types = [_][]const u8{"acestep"};
 
 pub const claims = sdk.mediaClaimsByType(&model_types);

@@ -368,6 +368,7 @@ test "down+reduce lanes per row: 16 on G17, 8 on every other generation and on p
 }
 
 test "moe down+reduce fused: no worse than gatherQmv + multiply + sum vs fp32 truth (nvfp4 + affine)" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xD09E);
     const rnd = prng.random();

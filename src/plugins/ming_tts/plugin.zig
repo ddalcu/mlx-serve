@@ -19,7 +19,7 @@ pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),
     .claims = config.claims,
     .required_file = abi.Str.of(config.required_file),
-    .modality = .audio,
+    .modality = config.modality,
     .caps = &config.caps,
     .bill_load = &config.billLoad,
     .bill_request = &config.billRequest,
@@ -350,6 +350,7 @@ test {
 }
 
 test "ming_tts plugin: a job on the tiny pack is a 44.1 kHz mono WAV, repeatable by seed" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
