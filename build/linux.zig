@@ -143,6 +143,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     run_step.dependOn(&run_cmd.step);
 
     const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
+    mods[1].addImport("jinja_conformance", config.jinjaConformanceModule(b));
     const unit_tests = b.addTest(.{
         .root_module = mods[1],
         .filters = if (test_filter) |f| &.{f} else &.{},

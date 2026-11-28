@@ -1,0 +1,1356 @@
+{
+ "template": "inkling_chat_template",
+ "sha256": "0aa1aa0c729d90176dcaa00c440c8faffca2957ffb2cc4b79456ee6d02bcf43b",
+ "cases": [
+  {
+   "id": "simple/think_off",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "none"
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>What is the capital of France?<|end_message|><|message_model|>"
+  },
+  {
+   "id": "simple/think_on",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is the capital of France?<|end_message|><|message_model|>"
+  },
+  {
+   "id": "simple/defaults",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is the capital of France?<|end_message|><|message_model|>"
+  },
+  {
+   "id": "simple/effort_none",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is the capital of France?<|end_message|><|message_model|>"
+  },
+  {
+   "id": "simple/effort_minimal",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "minimal"
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.1<|end_message|><|message_user|><|content_text|>What is the capital of France?<|end_message|><|message_model|>"
+  },
+  {
+   "id": "simple/effort_low",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "low"
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>What is the capital of France?<|end_message|><|message_model|>"
+  },
+  {
+   "id": "simple/effort_medium",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "medium"
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>What is the capital of France?<|end_message|><|message_model|>"
+  },
+  {
+   "id": "simple/effort_high",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is the capital of France?<|end_message|><|message_model|>"
+  },
+  {
+   "id": "simple/effort_xhigh",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "max"
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>What is the capital of France?<|end_message|><|message_model|>"
+  },
+  {
+   "id": "simple/effort_max",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "max"
+   },
+   "expected": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>What is the capital of France?<|end_message|><|message_model|>"
+  },
+  {
+   "id": "multi/think_off",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Why is the sky blue?"
+    },
+    {
+     "role": "assistant",
+     "content": "Rayleigh scattering.",
+     "reasoning_content": "Shorter wavelengths scatter more."
+    },
+    {
+     "role": "user",
+     "content": "And sunsets?"
+    },
+    {
+     "role": "assistant",
+     "content": "The light crosses more air."
+    },
+    {
+     "role": "user",
+     "content": "Thanks!"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "none"
+   },
+   "expected": "<|message_system|><|content_text|>You are a helpful assistant.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Why is the sky blue?<|end_message|><|message_model|><|content_thinking|>Shorter wavelengths scatter more.<|end_message|><|message_model|><|content_text|>Rayleigh scattering.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>And sunsets?<|end_message|><|message_model|><|content_text|>The light crosses more air.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Thanks!<|end_message|><|message_model|>"
+  },
+  {
+   "id": "multi/think_on",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Why is the sky blue?"
+    },
+    {
+     "role": "assistant",
+     "content": "Rayleigh scattering.",
+     "reasoning_content": "Shorter wavelengths scatter more."
+    },
+    {
+     "role": "user",
+     "content": "And sunsets?"
+    },
+    {
+     "role": "assistant",
+     "content": "The light crosses more air."
+    },
+    {
+     "role": "user",
+     "content": "Thanks!"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|message_system|><|content_text|>You are a helpful assistant.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Why is the sky blue?<|end_message|><|message_model|><|content_thinking|>Shorter wavelengths scatter more.<|end_message|><|message_model|><|content_text|>Rayleigh scattering.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>And sunsets?<|end_message|><|message_model|><|content_text|>The light crosses more air.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Thanks!<|end_message|><|message_model|>"
+  },
+  {
+   "id": "multi/defaults",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Why is the sky blue?"
+    },
+    {
+     "role": "assistant",
+     "content": "Rayleigh scattering.",
+     "reasoning_content": "Shorter wavelengths scatter more."
+    },
+    {
+     "role": "user",
+     "content": "And sunsets?"
+    },
+    {
+     "role": "assistant",
+     "content": "The light crosses more air."
+    },
+    {
+     "role": "user",
+     "content": "Thanks!"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "<|message_system|><|content_text|>You are a helpful assistant.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Why is the sky blue?<|end_message|><|message_model|><|content_thinking|>Shorter wavelengths scatter more.<|end_message|><|message_model|><|content_text|>Rayleigh scattering.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>And sunsets?<|end_message|><|message_model|><|content_text|>The light crosses more air.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Thanks!<|end_message|><|message_model|>"
+  },
+  {
+   "id": "tool_round/think_off",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "none"
+   },
+   "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"},\"lat\":{\"type\":\"number\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>You are a helpful assistant.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"days\":3,\"lat\":47.3769181}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>Sunny, 22C<|end_message|><|message_user|><|content_text|>Thanks<|end_message|><|message_model|>"
+  },
+  {
+   "id": "tool_round/think_on",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"},\"lat\":{\"type\":\"number\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>You are a helpful assistant.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"days\":3,\"lat\":47.3769181}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>Sunny, 22C<|end_message|><|message_user|><|content_text|>Thanks<|end_message|><|message_model|>"
+  },
+  {
+   "id": "tool_round/defaults",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"},\"lat\":{\"type\":\"number\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>You are a helpful assistant.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"days\":3,\"lat\":47.3769181}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>Sunny, 22C<|end_message|><|message_user|><|content_text|>Thanks<|end_message|><|message_model|>"
+  },
+  {
+   "id": "tool_round/effort_none",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"},\"lat\":{\"type\":\"number\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>You are a helpful assistant.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"days\":3,\"lat\":47.3769181}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>Sunny, 22C<|end_message|><|message_user|><|content_text|>Thanks<|end_message|><|message_model|>"
+  },
+  {
+   "id": "tool_round/effort_minimal",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "minimal"
+   },
+   "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"},\"lat\":{\"type\":\"number\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>You are a helpful assistant.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.1<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"days\":3,\"lat\":47.3769181}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>Sunny, 22C<|end_message|><|message_user|><|content_text|>Thanks<|end_message|><|message_model|>"
+  },
+  {
+   "id": "tool_round/effort_low",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "low"
+   },
+   "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"},\"lat\":{\"type\":\"number\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>You are a helpful assistant.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"days\":3,\"lat\":47.3769181}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>Sunny, 22C<|end_message|><|message_user|><|content_text|>Thanks<|end_message|><|message_model|>"
+  },
+  {
+   "id": "tool_round/effort_medium",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "medium"
+   },
+   "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"},\"lat\":{\"type\":\"number\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>You are a helpful assistant.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"days\":3,\"lat\":47.3769181}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>Sunny, 22C<|end_message|><|message_user|><|content_text|>Thanks<|end_message|><|message_model|>"
+  },
+  {
+   "id": "tool_round/effort_high",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"},\"lat\":{\"type\":\"number\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>You are a helpful assistant.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"days\":3,\"lat\":47.3769181}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>Sunny, 22C<|end_message|><|message_user|><|content_text|>Thanks<|end_message|><|message_model|>"
+  },
+  {
+   "id": "tool_round/effort_xhigh",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "max"
+   },
+   "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"},\"lat\":{\"type\":\"number\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>You are a helpful assistant.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"days\":3,\"lat\":47.3769181}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>Sunny, 22C<|end_message|><|message_user|><|content_text|>Thanks<|end_message|><|message_model|>"
+  },
+  {
+   "id": "tool_round/effort_max",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "max"
+   },
+   "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"},\"lat\":{\"type\":\"number\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>You are a helpful assistant.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"days\":3,\"lat\":47.3769181}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>Sunny, 22C<|end_message|><|message_user|><|content_text|>Thanks<|end_message|><|message_model|>"
+  },
+  {
+   "id": "parallel_tools/think_off",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris and Rome?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "Call_A",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      },
+      {
+       "type": "function",
+       "id": "call_a",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Rome: cloudy, 19C",
+     "tool_call_id": "call_a"
+    },
+    {
+     "role": "tool",
+     "content": "Paris: sunny, 22C",
+     "tool_call_id": "Call_A"
+    },
+    {
+     "role": "user",
+     "content": "Which is warmer?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "none"
+   },
+   "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"},\"lat\":{\"type\":\"number\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Weather in Paris and Rome?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Rome\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>Rome: cloudy, 19C<|end_message|><|message_tool|>get_weather<|content_text|>Paris: sunny, 22C<|end_message|><|message_user|><|content_text|>Which is warmer?<|end_message|><|message_model|>"
+  },
+  {
+   "id": "parallel_tools/think_on",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris and Rome?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "Call_A",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      },
+      {
+       "type": "function",
+       "id": "call_a",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Rome: cloudy, 19C",
+     "tool_call_id": "call_a"
+    },
+    {
+     "role": "tool",
+     "content": "Paris: sunny, 22C",
+     "tool_call_id": "Call_A"
+    },
+    {
+     "role": "user",
+     "content": "Which is warmer?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"},\"lat\":{\"type\":\"number\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris and Rome?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Rome\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>Rome: cloudy, 19C<|end_message|><|message_tool|>get_weather<|content_text|>Paris: sunny, 22C<|end_message|><|message_user|><|content_text|>Which is warmer?<|end_message|><|message_model|>"
+  },
+  {
+   "id": "parallel_tools/defaults",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris and Rome?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "Call_A",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      },
+      {
+       "type": "function",
+       "id": "call_a",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Rome: cloudy, 19C",
+     "tool_call_id": "call_a"
+    },
+    {
+     "role": "tool",
+     "content": "Paris: sunny, 22C",
+     "tool_call_id": "Call_A"
+    },
+    {
+     "role": "user",
+     "content": "Which is warmer?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"description\":\"City name\",\"type\":\"string\"},\"days\":{\"type\":\"integer\"},\"lat\":{\"type\":\"number\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris and Rome?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Rome\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>Rome: cloudy, 19C<|end_message|><|message_tool|>get_weather<|content_text|>Paris: sunny, 22C<|end_message|><|message_user|><|content_text|>Which is warmer?<|end_message|><|message_model|>"
+  },
+  {
+   "id": "unicode/think_off",
+   "messages": [
+    {
+     "role": "system",
+     "content": "　Réponds brièvement. "
+    },
+    {
+     "role": "user",
+     "content": "　日本語で答えて 🙂 "
+    },
+    {
+     "role": "assistant",
+     "content": "はい どうぞ\u0000。"
+    },
+    {
+     "role": "user",
+     "content": "ok"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "none"
+   },
+   "expected": "<|message_system|><|content_text|>　Réponds brièvement. <|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>　日本語で答えて 🙂 <|end_message|><|message_model|><|content_text|>はい どうぞ\u0000。<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>ok<|end_message|><|message_model|>"
+  },
+  {
+   "id": "unicode/think_on",
+   "messages": [
+    {
+     "role": "system",
+     "content": "　Réponds brièvement. "
+    },
+    {
+     "role": "user",
+     "content": "　日本語で答えて 🙂 "
+    },
+    {
+     "role": "assistant",
+     "content": "はい どうぞ\u0000。"
+    },
+    {
+     "role": "user",
+     "content": "ok"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|message_system|><|content_text|>　Réponds brièvement. <|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>　日本語で答えて 🙂 <|end_message|><|message_model|><|content_text|>はい どうぞ\u0000。<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>ok<|end_message|><|message_model|>"
+  },
+  {
+   "id": "unicode/defaults",
+   "messages": [
+    {
+     "role": "system",
+     "content": "　Réponds brièvement. "
+    },
+    {
+     "role": "user",
+     "content": "　日本語で答えて 🙂 "
+    },
+    {
+     "role": "assistant",
+     "content": "はい どうぞ\u0000。"
+    },
+    {
+     "role": "user",
+     "content": "ok"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "<|message_system|><|content_text|>　Réponds brièvement. <|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>　日本語で答えて 🙂 <|end_message|><|message_model|><|content_text|>はい どうぞ\u0000。<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>ok<|end_message|><|message_model|>"
+  }
+ ]
+}

@@ -152,6 +152,7 @@ test {
     _ = @import("host/engines/prompt.zig");
     _ = @import("engines/mlx/runtime/engine_load.zig");
     _ = @import("host/chat/format_corpus_test.zig");
+    _ = @import("host/chat/jinja_conformance_test.zig");
     _ = @import("host/chat/tool_traffic_replay_test.zig");
     _ = @import("engines/mlx/spec/mtp_replay_test.zig");
     _ = @import("engines/mlx/spec/mtp_lookup.zig");

@@ -152,6 +152,7 @@ const Shared = struct {
         libs.addLlamaLib(b, mod);
         _ = libs.addExl3Module(b, mod, target, optimize);
         libs.addStreamSources(b, mod, std.mem.eql(u8, root, "src/tests.zig"));
+        if (std.mem.eql(u8, root, "src/tests.zig")) mod.addImport("jinja_conformance", config.jinjaConformanceModule(b));
 
         // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
         // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels

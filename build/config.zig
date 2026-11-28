@@ -123,6 +123,40 @@ pub fn mlxStampModule(b: *std.Build, stamp_path: []const u8) *std.Build.Module {
     return b.createModule(.{ .root_source_file = wf.add("mlx_stamp.zig", src) });
 }
 
+/// Module `jinja_conformance`: every `src/fixtures/*.jinja` and every `src/fixtures/jinja_conformance/*.json`, embedded,
+/// so a new template or a regenerated reference changes the test binary (a directory read at run time would not).
+pub fn jinjaConformanceModule(b: *std.Build) *std.Build.Module {
+    const wf = b.addWriteFiles();
+    var src: std.ArrayList(u8) = .empty;
+    src.appendSlice(b.allocator, "pub const Entry = struct { name: []const u8, bytes: []const u8 };\n") catch @panic("OOM");
+    for ([_][2][]const u8{ .{ "templates", "src/fixtures" }, .{ "references", "src/fixtures/jinja_conformance" } }) |set| {
+        const ext = if (std.mem.eql(u8, set[0], "templates")) ".jinja" else ".json";
+        src.print(b.allocator, "pub const {s} = [_]Entry{{\n", .{set[0]}) catch @panic("OOM");
+        for (sortedFiles(b, set[1], ext)) |name| {
+            _ = wf.addCopyFile(b.path(b.fmt("{s}/{s}", .{ set[1], name })), b.fmt("{s}/{s}", .{ set[0], name }));
+            src.print(b.allocator, "    .{{ .name = \"{s}\", .bytes = @embedFile(\"{s}/{s}\") }},\n", .{ name[0 .. name.len - ext.len], set[0], name }) catch @panic("OOM");
+        }
+        src.appendSlice(b.allocator, "};\n") catch @panic("OOM");
+    }
+    return b.createModule(.{ .root_source_file = wf.add("jinja_conformance.zig", src.items) });
+}
+
+fn sortedFiles(b: *std.Build, dir_path: []const u8, ext: []const u8) []const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    var dir = buildRootHandle(b).openDir(b.graph.io, dir_path, .{ .iterate = true }) catch return &.{};
+    defer dir.close(b.graph.io);
+    var it = dir.iterate();
+    while (it.next(b.graph.io) catch null) |e| {
+        if (e.kind == .file and std.mem.endsWith(u8, e.name, ext)) names.append(b.allocator, b.dupe(e.name)) catch @panic("OOM");
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return names.items;
+}
+
 /// Configure-time check that scripts/build-mlx.sh has staged the pinned
 /// mlx/mlx-c build. Mirrors verifyBrewDeps: fail loudly with the fix, never
 /// let the linker produce a confusing -lmlxc error (or silently pick up a
