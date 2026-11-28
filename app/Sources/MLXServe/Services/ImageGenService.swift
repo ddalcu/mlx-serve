@@ -204,7 +204,8 @@ final class ImageGenService: ObservableObject {
         if !request.model.stepsSetByCheckpoint { json["steps"] = request.steps }
         // width/height 0 = "Match source": OMIT `size` so the server keeps the
         // reference image's own resolution instead of re-gridding it to a bucket.
-        if request.width > 0 && request.height > 0 {
+        let sizedBySource = request.editMode && request.initImagePath != nil && request.model.editSizedBySource
+        if request.width > 0 && request.height > 0 && !sizedBySource {
             json["size"] = "\(request.width)x\(request.height)"
         }
         if let src = request.initImagePath,

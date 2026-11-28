@@ -124,7 +124,12 @@ struct ImageGenView: View {
                     promptSection
                     sourceImageSection
                     qualitySection
-                    canvasSection
+                    if sizedBySource {
+                        Text("The edit keeps the picture's shape at about 1 megapixel.")
+                            .font(.app(.caption)).foregroundStyle(.secondary)
+                    } else {
+                        canvasSection
+                    }
                     advancedSection
                     // Generate stands apart from the settings it acts on.
                     actionRow.padding(.top, 14)
@@ -679,7 +684,10 @@ struct ImageGenView: View {
     }
 
     /// Generate is gated on the verdict, never on a stale unparseable value.
-    private var customSizeValid: Bool { customResolutionVerdict.isValid }
+    private var customSizeValid: Bool { sizedBySource || customResolutionVerdict.isValid }
+
+    /// The picture sets an edit's size here, so the canvas fields are hidden and never gate Generate.
+    private var sizedBySource: Bool { isEditing && model.editSizedBySource }
 
     /// What the selected model's grid makes of the typed size. Non-numeric or
     /// empty text reads as 0, which the grid already refuses by name.

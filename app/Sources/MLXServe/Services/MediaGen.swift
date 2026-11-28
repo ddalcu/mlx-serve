@@ -2659,6 +2659,9 @@ extension ImageModelPreset {
     /// `steps` field would be a control that does nothing.
     var stepsSetByCheckpoint: Bool { variant == .qwenImage21Turbo || variant == .minimaxH3Image }
 
+    /// An edit is sized from the picture (Ming-Image: its aspect at about 1 MP); the server refuses a `size`.
+    var editSizedBySource: Bool { variant == .mingImage }
+
     /// The fixed step count for a distilled preset (its `.good` profile).
     var fixedSteps: Int { settings(.good).steps }
 
@@ -2693,8 +2696,7 @@ extension ImageModelPreset {
     /// model offers "Match source" first — the reference pipeline's default and
     /// the only choice that can't distort the picture the user handed over.
     func resolutionOptions(editMode: Bool) -> [ResolutionOption] {
-        // Ming-Image edits at the picture's own aspect (about 1 MP); the server refuses a size.
-        if editMode && variant == .mingImage { return [.matchSource] }
+        if editMode && editSizedBySource { return [.matchSource] }
         let base = (editMode && supportsReferenceEdit) ? [.matchSource] + resolutions : resolutions
         // Last, so the fixed buckets stay the obvious pick and the fields only
         // appear for someone who went looking for them.

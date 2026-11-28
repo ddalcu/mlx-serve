@@ -2566,3 +2566,4 @@
 "Require the key on this Mac too" = "这台 Mac 也需要密钥";
 "Apps on this Mac must send the key as well; this app and the coding agents it launches send it for you." = "这台 Mac 上的应用也必须提供密钥；本应用及其启动的编程智能体会自动提供。";
 "%@ can't send this server's API key; turn off \"Require the key on this Mac too\" and restart the server" = "%@ 无法提供此服务器的 API 密钥；请关闭“这台 Mac 也需要密钥”并重启服务器";
+"The edit keeps the picture's shape at about 1 megapixel." = "编辑结果保持原图的宽高比，约 100 万像素。";

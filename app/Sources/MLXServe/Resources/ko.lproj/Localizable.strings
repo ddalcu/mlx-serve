@@ -2498,3 +2498,4 @@
 "Require the key on this Mac too" = "이 Mac에서도 키 요구";
 "Apps on this Mac must send the key as well; this app and the coding agents it launches send it for you." = "이 Mac의 앱도 키를 보내야 합니다. 이 앱과 이 앱이 실행하는 코딩 에이전트는 자동으로 키를 보냅니다.";
 "%@ can't send this server's API key; turn off \"Require the key on this Mac too\" and restart the server" = "%@은(는) 이 서버의 API 키를 보낼 수 없습니다. \"이 Mac에서도 키 요구\"를 끄고 서버를 다시 시작하세요";
+"The edit keeps the picture's shape at about 1 megapixel." = "편집 결과는 사진의 비율을 유지하며 약 1메가픽셀로 나옵니다.";

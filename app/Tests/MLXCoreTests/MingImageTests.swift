@@ -27,6 +27,20 @@ final class MingImageTests: XCTestCase {
         }
     }
 
+    func testAnEditSendsNoSizeWhateverTheFieldsHold() throws {
+        let src = FileManager.default.temporaryDirectory.appendingPathComponent("ming-edit-src-\(UUID()).png")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: src)
+        defer { try? FileManager.default.removeItem(at: src) }
+        var req = ImageGenRequest(model: preset, prompt: "x", width: 1920, height: 1440, steps: 12)
+        req.initImagePath = src.path
+        req.editMode = true
+        let edit = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertEqual(edit["mode"] as? String, "edit")
+        XCTAssertNil(edit["size"], "the release sizes an edit from the picture; 'size' is a named 400")
+        let t2i = ImageGenRequest(model: preset, prompt: "x", width: 1920, height: 1440, steps: 12)
+        XCTAssertEqual(ImageGenService.requestJson(for: t2i, modelName: "m", seed: 1)["size"] as? String, "1920x1440")
+    }
+
     func testPacksOnDiskAndOnTheHubAdoptTheFamily() throws {
         XCTAssertEqual(MediaModality(modelType: "bailingmm_moe_v2_lite"), .image)
         XCTAssertEqual(DownloadManager.requiredMediaMarker(modelType: "bailingmm_moe_v2_lite"),
