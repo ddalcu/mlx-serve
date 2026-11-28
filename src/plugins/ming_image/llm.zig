@@ -9,6 +9,7 @@
 //!    projected (`proj_directvlm`): the DiT's second caption stream, already at its width.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const log = @import("../../sdk/util/log.zig");
@@ -29,9 +30,28 @@ const S = mlx.mlx_stream;
 
 pub const DT: ops.Dtype = .bfloat16;
 
-const SYSTEM = "<role>SYSTEM</role>你是一个友好的AI助手。\n\ndetailed thinking off<|role_end|>";
-const PROMPT_PREFIX = SYSTEM ++ "<role>HUMAN</role>";
+/// The release's system-turn content (its chat template's `detailed thinking off` follows it).
+pub const DEFAULT_SYSTEM = "你是一个友好的AI助手。";
 const PROMPT_SUFFIX = "<|role_end|><role>ASSISTANT</role>";
+
+/// The chat template's system turn for `content`: `<role>SYSTEM</role>` + `content` + `\n\n` + the thinking option.
+/// Empty content leaves the turn bare, as the template does with no system message.
+pub fn systemTurn(a: std.mem.Allocator, content: []const u8) ![]u8 {
+    return std.mem.concat(a, u8, &.{ "<role>SYSTEM</role>", content, if (content.len > 0) "\n\n" else "", "detailed thinking off<|role_end|>" });
+}
+
+/// `MLX_SERVE_MING_SYSTEM` replaces the system-turn content: the MLLM reads the prompt only (no assistant turn is
+/// generated), so that line is all the instruction its caption conditioning is steered by. Empty drops it.
+fn systemContent() []const u8 {
+    return env.span(.MLX_SERVE_MING_SYSTEM) orelse DEFAULT_SYSTEM;
+}
+
+fn promptPrefix(a: std.mem.Allocator) ![]u8 {
+    const sys = try systemTurn(a, systemContent());
+    defer a.free(sys);
+    return std.mem.concat(a, u8, &.{ sys, "<role>HUMAN</role>" });
+}
+
 /// The longest chat-formatted prompt a request may encode (the release truncates nowhere, so a longer one is refused:
 /// cutting it would drop the assistant turn the caption streams are read after).
 pub const MAX_PROMPT_TOKENS: usize = 4096;
@@ -472,13 +492,15 @@ pub const Encoder = struct {
     /// The chat-formatted prompt's ids (the release's processor); an edit's picture is `<image>`, `picture` patch
     /// tokens, `</image>` and a newline before the prompt. `error.PromptTooLong` past `MAX_PROMPT_TOKENS`.
     pub fn promptIds(self: *const Encoder, a: std.mem.Allocator, prompt: []const u8, picture: u32) ![]u32 {
+        const prefix = try promptPrefix(a);
+        defer a.free(prefix);
         const ids = if (picture == 0) blk: {
-            const text = try std.mem.concat(a, u8, &.{ PROMPT_PREFIX, prompt, PROMPT_SUFFIX });
+            const text = try std.mem.concat(a, u8, &.{ prefix, prompt, PROMPT_SUFFIX });
             defer a.free(text);
             break :blk try self.tok.encode(a, text);
         } else blk: {
             // `</image>` is a special token: the text after it starts a new pretokenizer segment either way.
-            const head = try self.tok.encode(a, PROMPT_PREFIX);
+            const head = try self.tok.encode(a, prefix);
             defer a.free(head);
             const text = try std.mem.concat(a, u8, &.{ "\n", prompt, PROMPT_SUFFIX });
             defer a.free(text);
@@ -699,4 +721,17 @@ test "ming_image llm: a stacked expert bank holds no reference to the per-expert
     // The 8 MiB of originals moved into the bank: active memory stays put (it grew by 8 MiB with the view kept).
     try testing.expect(after <= before + (2 << 20));
     try testing.expectEqual(@as(u32, 0), w.count());
+}
+
+test "ming_image llm: the system turn is the release's line; an empty one leaves the template bare" {
+    const a = std.testing.allocator;
+    const sys = try systemTurn(a, DEFAULT_SYSTEM);
+    defer a.free(sys);
+    try std.testing.expectEqualStrings("<role>SYSTEM</role>你是一个友好的AI助手。\n\ndetailed thinking off<|role_end|>", sys);
+    const bare = try systemTurn(a, "");
+    defer a.free(bare);
+    try std.testing.expectEqualStrings("<role>SYSTEM</role>detailed thinking off<|role_end|>", bare);
+    const prefix = try promptPrefix(a);
+    defer a.free(prefix);
+    try std.testing.expectEqualStrings("<role>SYSTEM</role>你是一个友好的AI助手。\n\ndetailed thinking off<|role_end|><role>HUMAN</role>", prefix);
 }

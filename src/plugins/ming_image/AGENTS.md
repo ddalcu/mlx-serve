@@ -43,6 +43,9 @@ decodes to RGBA. Port of github.com/inclusionAI/Ming-Image (`modeling_bailingmm2
 - A pack edits only with the MLLM's `vision.*` + `linear_proj.*` and `mllm/preprocessor_config.json` (`caps.edit`).
 - A chat-formatted prompt past 4096 tokens is a named 400, never cut: the release truncates nowhere, and a cut drops
   the assistant turn both caption streams are read after.
+- The system turn is the ONLY instruction the MLLM sees (it generates no assistant text): `MLX_SERVE_MING_SYSTEM`
+  replaces its content (empty drops the turn), which is how a prompt that the friendly-assistant line steers toward
+  a bland answer gets the bare prompt's conditioning.
 - Both sequences' pad-to-32 rows are masked in the release (`zero_masked`), so they are dropped; only the caption's
   padded length survives, as the image tokens' first RoPE position.
 - Packs: the release (bf16) and mlx-community's layout (the same tree, MLX affine triples beside each weight);

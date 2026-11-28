@@ -381,3 +381,17 @@ test "ming_image: both caption streams reach the DiT in bf16 from a connector qu
     try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(cond.learn));
     try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(cond.direct));
 }
+
+test "ming_image: a prompt's ids are the release's chat text around its system turn" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var pack = try MediaPack(@This()).open(arena.allocator());
+    defer pack.close();
+    const e: *Engine = @ptrCast(@alignCast(pack.engine));
+    const ids = try e.m.enc.promptIds(testing.allocator, "a red cat", 0);
+    defer testing.allocator.free(ids);
+    const text = "<role>SYSTEM</role>你是一个友好的AI助手。\n\ndetailed thinking off<|role_end|><role>HUMAN</role>a red cat<|role_end|><role>ASSISTANT</role>";
+    const want = try e.m.enc.tok.encode(testing.allocator, text);
+    defer testing.allocator.free(want);
+    try testing.expectEqualSlices(u32, want, ids);
+}
