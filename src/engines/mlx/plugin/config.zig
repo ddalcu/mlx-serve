@@ -130,10 +130,11 @@ pub fn bindTableWith(io: std.Io, a: std.mem.Allocator, dir: []const u8, table: *
     const raw = pd.readFile("config.json", buf, &why) orelse return error.ConfigUnreadable;
     const cfg = try model.mergeConfigJson(a, raw, overrides);
     defer a.free(cfg);
+    const settings = try parseSettings(a, io, dir);
+    defer a.free(settings);
     const b = try a.create(Binding);
     b.* = .{ .table = table };
-    var settings: [48]u8 = undefined;
-    if (!table.parse(&pd, .of(cfg), .of(parseSettings(a, io, &settings, dir)), null, false, &b.parsed).isOk()) {
+    if (!table.parse(&pd, .of(cfg), .of(settings), null, false, &b.parsed).isOk()) {
         a.destroy(b);
         return null;
     }
@@ -141,18 +142,28 @@ pub fn bindTableWith(io: std.Io, a: std.mem.Allocator, dir: []const u8, table: *
     return b;
 }
 
-/// The settings a plugin's parse reads: the pack's per-model `stream_experts`, which decides the caps of a pack that
-/// can stream (`buf` holds the text).
-fn parseSettings(a: std.mem.Allocator, io: std.Io, buf: []u8, model_dir: []const u8) []const u8 {
+/// The settings a plugin's parse reads, from the pack's model settings: `stream_experts`, which decides the caps of a
+/// pack that can stream, and a looped model's `loopcd`. Caller frees.
+fn parseSettings(a: std.mem.Allocator, io: std.Io, model_dir: []const u8) ![]const u8 {
     var path: [std.fs.max_path_bytes]u8 = undefined;
     var s = model_settings.load(a, io, model_settings.defaultPath(&path));
     defer s.deinit();
     var o = model_settings.lookupPack(&s, a, io, model_dir);
     defer o.deinit(a);
-    return switch (o.stream_experts orelse return "") {
-        .on => "{\"stream_experts\":true}",
-        .rows => |n| std.fmt.bufPrint(buf, "{{\"stream_experts\":{d}}}", .{n}) catch "",
+    return parseSettingsOf(a, o);
+}
+
+fn parseSettingsOf(a: std.mem.Allocator, o: model_settings.Override) ![]const u8 {
+    var w: std.Io.Writer.Allocating = .init(a);
+    defer w.deinit();
+    if (o.stream_experts) |st| switch (st) {
+        .on => try w.writer.writeAll(",\"stream_experts\":true"),
+        .rows => |n| try w.writer.print(",\"stream_experts\":{d}", .{n}),
     };
+    if (o.loopcd) |l| try w.writer.print(",\"loopcd\":{s}", .{l});
+    const body = w.written();
+    if (body.len == 0) return a.dupe(u8, "");
+    return std.fmt.allocPrint(a, "{{{s}}}", .{body[1..]});
 }
 
 /// `config_json` with the launch's `--config-overrides` merged in, as the legacy parse reads it; in `a`.
@@ -176,11 +187,12 @@ pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json
     const dir = fs.packDir();
     const table = claimant(model_type, config_json, &dir) orelse
         return .{ .declined = if (served.serves(model_type)) "no single claimant" else "type not served" };
+    const settings = try parseSettings(arena.allocator(), io, model_dir);
     const b = try a.create(Binding);
     b.* = .{ .table = table, .outside = outside.ownerOf(table) != null };
-    var settings: [48]u8 = undefined;
-    const v = table.parse(&dir, abi.Str.of(config_json), .of(parseSettings(a, io, &settings, model_dir)), null, false, &b.parsed);
+    const v = table.parse(&dir, abi.Str.of(config_json), .of(settings), null, false, &b.parsed);
     if (!v.isOk()) {
+        if (settings.len > 0) log.err("[plugin] {s}: refused under its model settings {s}\n", .{ model_type, settings });
         a.destroy(b);
         return .{ .declined = v.why.slice() };
     }
@@ -339,6 +351,21 @@ fn ringCoversWindows(table: *const abi.ModelTable, p: *const abi.Parsed) bool {
 
 const testing = std.testing;
 const fixture = @import("../../../sdk/testing/fixture.zig");
+
+test "plugin parse settings: the pack's stream_experts and loopcd, as the plugin reads them" {
+    const a = testing.allocator;
+    for ([_]struct { o: model_settings.Override, want: []const u8 }{
+        .{ .o = .{}, .want = "" },
+        .{ .o = .{ .stream_experts = .on }, .want = "{\"stream_experts\":true}" },
+        .{ .o = .{ .stream_experts = .{ .rows = 32 } }, .want = "{\"stream_experts\":32}" },
+        .{ .o = .{ .loopcd = "\"hidden\"" }, .want = "{\"loopcd\":\"hidden\"}" },
+        .{ .o = .{ .stream_experts = .on, .loopcd = "{\"mode\":\"logits\"}" }, .want = "{\"stream_experts\":true,\"loopcd\":{\"mode\":\"logits\"}}" },
+    }) |k| {
+        const got = try parseSettingsOf(a, k.o);
+        defer a.free(got);
+        try testing.expectEqualStrings(k.want, got);
+    }
+}
 
 test "plugin claimant: a served type goes to its one claimant; an unserved type or two claimants to legacy" {
     const T = struct {

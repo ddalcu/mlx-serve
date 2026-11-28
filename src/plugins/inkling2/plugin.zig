@@ -4,6 +4,7 @@
 //! saved blocks, not a plain residual, so the forward is the plugin's own loop (`layers.zig`), not a base's.
 
 const std = @import("std");
+const log = @import("../../sdk/util/log.zig");
 const abi = @import("../../abi/plugin.zig");
 const env = @import("../../env.zig");
 const sdk = @import("../../sdk/root.zig");
@@ -292,8 +293,13 @@ pub const Model = struct {
         var bank_partial: ops.Array = .{};
 
         const visits = cfg.visits();
+        const lc = cfg.loopcd;
         const spec: ?*Spec = if (batched) null else w.spec;
         var taps: [config.max_taps]ops.Array = undefined;
+        // LoopCD reference state captured at the end of pass `lc.ref_pass - 1`.
+        var ref_h: ops.Array = .{};
+        var ref_bank: ops.Array = .{};
+        var ref_blocks: ?ops.Array = null;
         for (0..visits) |v| {
             const at = cfg.visit(@intCast(v));
             if (cfg.core() > 0 and at.layer == cfg.core_start) {
@@ -333,7 +339,28 @@ pub const Model = struct {
             }
             if (old.ctx != loop_in.ctx) g.drop(old);
             try run.capture(g, @intCast(v), h);
-            try run.cadence(v, visits, h);
+            if (cfg.core() > 0 and lc.mode != .off and at.layer == cfg.core_end - 1) {
+                if (at.pass == lc.ref_pass - 1) {
+                    ref_h = try g.keep(h);
+                    if (lc.mode == .hidden) {
+                        if (n_blocks > loop_blocks + 1) ref_bank = try g.keep(try g.sliceAxis(blocks.?, 2, loop_blocks + 1, n_blocks));
+                    } else if (blocks) |bk| {
+                        ref_blocks = try g.keep(bk);
+                    }
+                }
+                if (lc.mode == .hidden and lc.omega > 0 and at.pass == cfg.passes - 1) {
+                    const old_h = h;
+                    h = try loopcdHidden(g, h, ref_h, lc.omega);
+                    if (old_h.ctx != loop_in.ctx) g.drop(old_h);
+                    if (ref_bank.ctx != null and n_blocks > loop_blocks + 1) {
+                        const prefix = try g.sliceAxis(blocks.?, 2, 0, loop_blocks + 1);
+                        const cur_bank = try g.sliceAxis(blocks.?, 2, loop_blocks + 1, n_blocks);
+                        const guided_bank = try layers.passOutput(g, &w.body, try loopcdExtrapolateF32(g, cur_bank, ref_bank, lc.omega));
+                        blocks = try g.concat(&.{ prefix, guided_bank }, 2);
+                    }
+                }
+            }
+            try run.cadence(v, cfg.cacheEntries(), h);
         }
         const stepped: ?ops.Array = try kernels.finalStream(g, &w.body, h, blocks, w.final_norm);
         var final = stepped orelse try g.astype(try g.rmsNorm(try layers.finalInput(g, &w.body, h, blocks), w.final_norm, cfg.rms_norm_eps), ops.dtype(h));
@@ -350,9 +377,87 @@ pub const Model = struct {
             } else try sp.push(g, run.positions[0] + @as(u64, @intCast(from)), parts[0 .. sp.visits.len + 1]);
         }
         if (batched) final = try g.reshape(final, &.{ run.slots, 1, -1 });
-        return run.finish(g, &c, final, layers.Head, &w.head);
+        var res = try run.finish(g, &c, final, layers.Head, &w.head);
+        if (cfg.usesRefCoda()) {
+            // LoopCD-Logits / Adaptive: advance the reference branch's own coda caches so prefill and decode stay exact.
+            var rh = ref_h;
+            var rblocks = ref_blocks;
+            const coda_n = cfg.coda();
+            for (0..coda_n) |ci| {
+                const v_ref: usize = visits + ci;
+                const layer_idx = cfg.core_end + @as(u32, @intCast(ci));
+                var lg = g.scope();
+                defer lg.deinit();
+                c.g = &lg;
+                c.layer = @intCast(v_ref);
+                const L = &w.body.layers[layer_idx];
+                const open: ?*kernels.Open = if (spec) |sp| (if (sp.opens) |o| &o[v_ref] else null) else null;
+                const stepped_ref: ?layers.Post = try kernels.visit(&c, L, &w.body, rh, rblocks, null, open);
+                if (stepped_ref == null and (open != null or batched)) return error.Inkling2KernelVisit;
+                const post = stepped_ref orelse try layers.layerForward(L, &w.body, &c, rh, rblocks, null);
+                c.g = g;
+                const old_r = rh;
+                rh = try g.keep(post.h);
+                if (post.blocks) |stack| rblocks = try g.keep(stack);
+                g.drop(old_r);
+                try run.cadence(v_ref, cfg.cacheEntries(), rh);
+            }
+            if (run.logits != .none) {
+                const stepped_rf: ?ops.Array = try kernels.finalStream(g, &w.body, rh, rblocks, w.final_norm);
+                var ref_final = stepped_rf orelse try g.astype(try g.rmsNorm(try layers.finalInput(g, &w.body, rh, rblocks), w.final_norm, cfg.rms_norm_eps), ops.dtype(rh));
+                if (batched) ref_final = try g.reshape(ref_final, &.{ run.slots, 1, -1 });
+                const rsh = ops.shape(ref_final);
+                const ref_in = if (run.logits == .last_row and rsh[1] > 1)
+                    try g.sliceAxis(ref_final, 1, rsh[1] - 1, rsh[1])
+                else
+                    ref_final;
+                const z_ref_3d = try layers.Head.forward(&w.head, &c, ref_in);
+                const zsh = ops.shape(z_ref_3d);
+                const z_ref = try g.reshape(z_ref_3d, &.{ zsh[0] * zsh[1], zsh[2] });
+                res.logits = try loopcdLogits(g, res.logits, z_ref, lc.mode, lc.omega);
+            }
+        }
+        return res;
     }
 };
+
+/// `strong + omega * (strong - weak)` in f32.
+fn loopcdExtrapolateF32(g: *ops.Graph, strong: ops.Array, weak: ops.Array, omega: f32) !ops.Array {
+    const s = try g.astype(strong, .float32);
+    const wk = try g.astype(weak, .float32);
+    return g.add(s, try g.mulScalar(try g.sub(s, wk), omega));
+}
+
+/// LoopCD-Hidden (Eq. 2): extrapolates in f32 and casts back to `strong`'s dtype.
+fn loopcdHidden(g: *ops.Graph, strong: ops.Array, weak: ops.Array, omega: f32) !ops.Array {
+    return g.astype(try loopcdExtrapolateF32(g, strong, weak, omega), ops.dtype(strong));
+}
+
+/// LoopCD-Logits (Eq. 3) with fixed strength or adaptive top-2 probability margin gating (Eq. 4):
+///   fixed:    z' = z_R + omega * (z_R - z_b)
+///   adaptive: p_R = softmax(z_R), omega = omega_max * (1 - (p_(1) - p_(2))), z' = z_R + omega * (z_R - z_b)
+pub fn loopcdLogits(g: *ops.Graph, z_strong: ops.Array, z_weak: ops.Array, mode: config.LoopCd.Mode, omega: f32) !ops.Array {
+    const zs = try g.astype(z_strong, .float32);
+    if (omega == 0) return zs;
+    const zw = try g.astype(z_weak, .float32);
+    const diff = try g.sub(zs, zw);
+    const w_eff = switch (mode) {
+        .logits => try g.scalar(omega, .float32),
+        .adaptive => blk: {
+            if (ops.shape(zs)[1] < 2) return zs;
+            const probs = try g.softmax(zs, -1, true);
+            const top2 = try g.call(mlx.mlx_topk_axis, .{ probs, @as(c_int, 2), @as(c_int, -1) });
+            const t0 = try g.sliceAxis(top2, 1, 0, 1);
+            const t1 = try g.sliceAxis(top2, 1, 1, 2);
+            // topk returns the 2 largest probabilities in unspecified order; |t0 - t1| = p_(1) - p_(2).
+            const margin = try g.abs(try g.sub(t0, t1));
+            const unc = try g.maximum(try g.sub(try g.scalar(1.0, .float32), margin), try g.scalar(0.0, .float32));
+            break :blk try g.mulScalar(unc, omega);
+        },
+        else => return zs,
+    };
+    return g.add(zs, try g.mul(w_eff, diff));
+}
 
 pub const table = abi.ModelTable{
     .name = abi.Str.of(plugin.name),
@@ -703,7 +808,7 @@ fn openGroup(m: *Loaded, fs: []const abi.Forward) !*Opened {
         }
     }
     const sp = w.spec.?;
-    o.opens = try gpa.alloc(kernels.Open, cfg.visits());
+    o.opens = try gpa.alloc(kernels.Open, cfg.cacheEntries());
     @memset(o.opens, .{ .g = g });
     sp.opens = o.opens;
     defer sp.opens = null;
@@ -1050,7 +1155,7 @@ fn stepGroupBundled(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut)
         sp.context = contexts[i];
     }
 
-    const opens = try gpa.alloc(kernels.Open, cfg.visits());
+    const opens = try gpa.alloc(kernels.Open, cfg.cacheEntries());
     defer gpa.free(opens);
     @memset(opens, .{ .g = &g });
     sp.opens = opens;
@@ -1257,7 +1362,7 @@ fn stepGroup(m: *Loaded, fs: []const abi.Forward, outs: []abi.ForwardOut) !abi.V
         sp.context = contexts[i];
     }
 
-    const opens = try gpa.alloc(kernels.Open, cfg.visits());
+    const opens = try gpa.alloc(kernels.Open, cfg.cacheEntries());
     defer gpa.free(opens);
     const tctx: kernels.TreeCtx = .{ .parent = tree.parent, .meta = tree.tmeta };
     for (opens) |*o| o.* = .{ .g = &g, .tree = tctx };
@@ -1930,11 +2035,17 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         if (dc.fullBytesPerToken() > 0) m.spec.full = d;
         m.base.weights.spec = &m.spec;
     };
-    // The parse's quant block is freed with it; the forward reads none of it.
+    // The parse's quant block and cache namespace are freed with it; the forward reads none of them.
     m.base.weights.body.cfg.block_json = "{}";
+    m.base.weights.body.cfg.cache_ns = "";
     m.split = BufferSplit.of(ctx.host);
     m.host = ctx.host;
     kernels.setHost(ctx.host);
+    if (c.loopcd.mode != .off) {
+        log.info("[inkling2] loopcd: mode={s} omega={d:.3} ref_pass={d} passes={d} (visits={d} caches={d})\n", .{
+            @tagName(c.loopcd.mode), c.loopcd.omega, c.loopcd.ref_pass, c.passes, c.visits(), c.cacheEntries(),
+        });
+    }
 
     return m;
 }
@@ -2329,4 +2440,70 @@ test "inkling2 draft: bundledGroupRows stays within packed_rows and adapts to ac
         try std.testing.expect(n * @as(usize, high) <= @as(usize, @intCast(kernels.packed_rows)));
     }
     try std.testing.expect(bundledGroupRows(2, 8, 0.65) >= 5);
+}
+
+// Bar: LoopCD-Logits fixed (Eq. 3) and adaptive margin gating (Eq. 4) match their closed-form f64 formulas
+// across tied, dominant, and intermediate probability rows, and omega = 0 leaves z_R unchanged.
+test "inkling2 loopcd: fixed and adaptive logit guidance formulas" {
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    // Row 0: exact top-2 tie (margin = 0 -> w = omega_max).
+    // Row 1: dominant token (margin ~ 1 -> w ~ 0).
+    // Row 2: intermediate margin.
+    const zs_data = [_]f32{
+        2.0, 2.0, -5.0, -5.0,
+        20.0, 0.0, -1.0, -2.0,
+        1.5, 1.0, 0.0, -1.0,
+    };
+    const zw_data = [_]f32{
+        0.5, 1.0, 0.0, -1.0,
+        1.0, 2.0, 0.0, 0.0,
+        0.2, 1.4, -0.5, 0.1,
+    };
+    const zs = try g.fromSlice(f32, &zs_data, &.{ 3, 4 });
+    const zw = try g.fromSlice(f32, &zw_data, &.{ 3, 4 });
+
+    // Fixed omega = 0.5
+    const fixed = try loopcdLogits(&g, zs, zw, .logits, 0.5);
+    try ops.eval(fixed);
+    const fd = mlx.mlx_array_data_float32(fixed).?;
+    for (0..12) |i| try std.testing.expectApproxEqAbs(zs_data[i] + 0.5 * (zs_data[i] - zw_data[i]), fd[i], 1e-5);
+
+    // Zero omega -> exact identity
+    const zero = try loopcdLogits(&g, zs, zw, .adaptive, 0.0);
+    try ops.eval(zero);
+    const zd = mlx.mlx_array_data_float32(zero).?;
+    for (0..12) |i| try std.testing.expectEqual(zs_data[i], zd[i]);
+
+    // Adaptive omega_max = 0.8
+    const adapt = try loopcdLogits(&g, zs, zw, .adaptive, 0.8);
+    try ops.eval(adapt);
+    const ad = mlx.mlx_array_data_float32(adapt).?;
+    for (0..3) |r| {
+        const row_s = zs_data[r * 4 ..][0..4];
+        const row_w = zw_data[r * 4 ..][0..4];
+        var mx: f64 = -std.math.inf(f64);
+        for (row_s) |v| mx = @max(mx, @as(f64, v));
+        var se: f64 = 0;
+        for (row_s) |v| se += @exp(@as(f64, v) - mx);
+        var p1: f64 = 0;
+        var p2: f64 = 0;
+        for (row_s) |v| {
+            const p = @exp(@as(f64, v) - mx) / se;
+            if (p > p1) {
+                p2 = p1;
+                p1 = p;
+            } else if (p > p2) {
+                p2 = p;
+            }
+        }
+        const we = 0.8 * @max(0.0, 1.0 - (p1 - p2));
+        for (0..4) |j| {
+            const want: f32 = @floatCast(@as(f64, row_s[j]) + we * (@as(f64, row_s[j]) - @as(f64, row_w[j])));
+            try std.testing.expectApproxEqAbs(want, ad[r * 4 + j], 1e-5);
+        }
+    }
 }
