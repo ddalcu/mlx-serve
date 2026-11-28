@@ -11,6 +11,8 @@ Mac'inizde açık modelleri çalıştırın: sohbet, kodlama ajanları, görsel,
 
 **[Mac için İndir](https://github.com/ddalcu/mlx-serve/releases/latest/download/MLX-Serve.dmg)** · [Homebrew](#kurulum) · [iPhone](https://apps.apple.com/us/app/mlx-chat-local-ai/id6787603518) · [Linux](#linux-ve-windows) · [mlxserve.com](https://mlxserve.com/) · [English](README.md) · [简体中文](README.zh-CN.md)
 
+*Bu dosya [README.md](README.md) dosyasından çevrilmiştir; İngilizce aslıyla çelişmesi durumunda İngilizce aslı geçerlidir.*
+
 ![Yerel bir modelle sohbet etme, görsel üretme ve Claude Code ile kodlama — hepsi tek bir Mac'te](website/assets/demo.gif)
 
 ## Kurulum
