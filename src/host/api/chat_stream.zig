@@ -36,6 +36,7 @@ const streamToolCallDelta = @import("../chat/tools/pipeline.zig").streamToolCall
 const shouldParseToolCalls = @import("../chat/tools/pipeline.zig").shouldParseToolCalls;
 const appendRawToolDump = @import("../chat/tools/pipeline.zig").appendRawToolDump;
 const parseToolCallsForRequest = @import("../chat/tools/pipeline.zig").parseToolCallsForRequest;
+const toolParseText = @import("../chat/tools/pipeline.zig").toolParseText;
 const slotFailure = @import("../http/errors.zig").slotFailure;
 const StopStream = @import("../chat/stops.zig").StopStream;
 const emitConstrainedChat = @import("chat_completions.zig").emitConstrainedChat;
@@ -925,7 +926,7 @@ pub fn handleStreamingGeneration(
         const norm_owned = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools) else null;
+        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, toolParseText(gen_text, opens_think and !think_closed), tools_json, allow_parallel_tools) else null;
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {

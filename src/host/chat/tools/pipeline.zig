@@ -45,6 +45,14 @@ pub fn shouldParseToolCalls(finish_details: ?[]const u8) bool {
     return !std.mem.eql(u8, d, "repetition_loop");
 }
 
+/// The text a finished generation's tool calls are parsed from. A thought the TEMPLATE opened and the model
+/// never closed is reasoning to its last byte, so a call written in it is not work, also when the generation
+/// ended on EOS (finish "stop"): a call inside the think block is never recovered (docs/gotchas/tool-calling.md).
+pub fn toolParseText(text: []const u8, opened_by_template: bool) []const u8 {
+    if (opened_by_template and chat_mod.splitThinkBlockKeepingMarkup(text, true, true).content.len == 0) return "";
+    return text;
+}
+
 /// The `finish_details` object emitted BESIDE `finish_reason` on a choice,
 /// or "" when there is nothing to say. Comes with its leading comma so call
 /// sites splice it straight into the choice literal.
@@ -539,6 +547,25 @@ test "loopTrimmedIds: the degenerate span is cut, and a bad index degrades to em
     // must emit everything rather than slice out of bounds.
     try std.testing.expectEqualSlices(u32, &ids, loopTrimmedIds(&ids, 5));
     try std.testing.expectEqualSlices(u32, &ids, loopTrimmedIds(&ids, 99));
+}
+
+test "a call in a thought the template opened and the model never closed is not parsed" {
+    const allocator = std.testing.allocator;
+    const sketch = "Plan: <tool_call>\n<function=Bash>\n<parameter=command>\nrm -rf build\n</parameter>\n</function>\n</tool_call> but first check";
+    try std.testing.expect(try parseToolCallsForRequest(allocator, toolParseText(sketch, true), null, true) == null);
+    const answered = sketch ++ "</think>\n\n<tool_call>\n<function=Bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>";
+    inline for (.{ .{ sketch, false }, .{ answered, true } }) |c| {
+        const calls = (try parseToolCallsForRequest(allocator, toolParseText(c[0], c[1]), null, true)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try std.testing.expectEqual(@as(usize, 1), calls.len);
+        try std.testing.expectEqualStrings("Bash", calls[0].name);
+    }
 }
 
 test "parseToolCallsForRequest: bare <invoke> string params keep their bytes (package.json class)" {

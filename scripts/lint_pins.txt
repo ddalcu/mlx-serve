@@ -19,6 +19,12 @@ src/host/http/router.zig	if (!routeExists(path)) {	the route-existence 404 is an
 src/host/http/server.zig	conn_thread.detach();	every connection thread is detached after spawn
 src/host/api/chat_completions.zig	RequestMedia.init(allocator)	request media is owned by RequestMedia, never a handler-local list
 src/host/api/anthropic.zig	RequestMedia.init(allocator)	request media is owned by RequestMedia, never a handler-local list
+src/host/api/chat_stream.zig	parseToolCallsForRequest(allocator, toolParseText(gen_text, opens_think and !think_closed),	every surface parses tool calls from the text left after a template-opened thought, never the raw generation
+src/host/api/anthropic_stream.zig	parseToolCallsForRequest(allocator, toolParseText(gen_text, opens_think and !think_closed),	every surface parses tool calls from the text left after a template-opened thought, never the raw generation
+src/host/api/chat_completions.zig	parseToolCallsForRequest(allocator, toolParseText(final_text, opens_think),	every surface parses tool calls from the text left after a template-opened thought, never the raw generation
+src/host/api/responses/handler.zig	parseToolCallsForRequest(allocator, toolParseText(final_text, opens_think),	every surface parses tool calls from the text left after a template-opened thought, never the raw generation
+src/host/api/anthropic.zig	final_text = think_split.content;	every surface parses tool calls from the text left after a template-opened thought, never the raw generation
+src/host/api/*.zig	!parseToolCallsForRequest(allocator, gen_text,	every surface parses tool calls from the text left after a template-opened thought, never the raw generation
 src/engines/mlx/*.zig	sleep_inhibit.setActive(holdsSleepWhileParked(sch));	the inference loop drops the sleep assertion before it parks
 src/engines/mlx/scheduler.zig	coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path)	the cold-load LoadRequest re-applies the retained launch settings
 src/engines/mlx/load.zig	clamped_prefix_mem,	HotPrefixCache.initWithMem takes the clamped budget, never the raw launch flag

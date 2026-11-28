@@ -43,6 +43,7 @@ const parseRequestSeed = @import("../sampling.zig").parseRequestSeed;
 const clampJsonI32 = @import("../sampling.zig").clampJsonI32;
 const shouldParseToolCalls = @import("../../chat/tools/pipeline.zig").shouldParseToolCalls;
 const parseToolCallsForRequest = @import("../../chat/tools/pipeline.zig").parseToolCallsForRequest;
+const toolParseText = @import("../../chat/tools/pipeline.zig").toolParseText;
 const getOrInitResponseStore = @import("store.zig").getOrInitResponseStore;
 const getEffectiveContextLength = @import("../admission.zig").getEffectiveContextLength;
 const sendGenerationError = @import("../../http/errors.zig").sendGenerationError;
@@ -1305,7 +1306,7 @@ fn handleResponsesInner(
 
     var tool_calls: ?[]chat_mod.ParsedToolCall = null;
     if (active_has_tools and shouldParseToolCalls(result.finish_details)) {
-        tool_calls = try parseToolCallsForRequest(allocator, final_text, active_tools_json, parallel_tool_calls_echo);
+        tool_calls = try parseToolCallsForRequest(allocator, toolParseText(final_text, opens_think), active_tools_json, parallel_tool_calls_echo);
     }
     defer if (tool_calls) |tcs| {
         for (tcs) |tc| {

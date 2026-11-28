@@ -2428,6 +2428,27 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
     try testing.expectEqual(chat.StreamThinkGate.flush_text, chat.streamThinkGate("The visible answer.", true, true));
 }
 
+test "format corpus: every surface's parse text drops a call sketched in a never-closed template thought" {
+    // Bar: no call from any surface's parse text (toolParseText, or /v1/messages' split content); without the thought, one.
+    const a = testing.allocator;
+    const pipeline = @import("tools/pipeline.zig");
+    const raw = "The user wants a clean tree. Plan: <tool_call>\n<function=bash>\n<parameter=command>\nrm -rf build\n</parameter>\n</function>\n</tool_call> but first I should che";
+    var routed: ?@import("../../sdk/grammar/protocol.zig").Delivery = null;
+    const split = try @import("../api/chat_completions.zig").splitConstrainedResponse(a, &routed, .{}, raw, null, true, true);
+    for ([_][]const u8{ pipeline.toolParseText(raw, true), split.content }) |text| {
+        try testing.expect(try pipeline.parseToolCallsForRequest(a, text, bash_tool_schema, true) == null);
+    }
+    const calls = (try pipeline.parseToolCallsForRequest(a, pipeline.toolParseText(raw, false), bash_tool_schema, true)).?;
+    defer {
+        for (calls) |tc| {
+            a.free(tc.name);
+            a.free(tc.arguments);
+        }
+        a.free(calls);
+    }
+    try testing.expectEqualStrings("bash", calls[0].name);
+}
+
 /// Length of a `<|…>` special-token marker starting `s`, or null.
 fn specialMarkerLenAt(s: []const u8) ?usize {
     if (!std.mem.startsWith(u8, s, "<|")) return null;
