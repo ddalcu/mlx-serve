@@ -1,0 +1,1356 @@
+{
+ "template": "nemo_speechlm_chat_template",
+ "sha256": "cfd0319081bcc6846c0f2d000fba3f480a2f9f20cb3beb27f8b6f054776403ab",
+ "cases": [
+  {
+   "id": "simple/think_off",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "no_think"
+   },
+   "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "id": "simple/think_on",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "simple/defaults",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "simple/effort_none",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "simple/effort_minimal",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "simple/effort_low",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "simple/effort_medium",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "simple/effort_high",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "simple/effort_xhigh",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "simple/effort_max",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "multi/think_off",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Why is the sky blue?"
+    },
+    {
+     "role": "assistant",
+     "content": "Rayleigh scattering.",
+     "reasoning_content": "Shorter wavelengths scatter more."
+    },
+    {
+     "role": "user",
+     "content": "And sunsets?"
+    },
+    {
+     "role": "assistant",
+     "content": "The light crosses more air."
+    },
+    {
+     "role": "user",
+     "content": "Thanks!"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "no_think"
+   },
+   "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhy is the sky blue?<|im_end|>\n<|im_start|>assistant\n<think></think>Rayleigh scattering.<|im_end|>\n<|im_start|>user\nAnd sunsets?<|im_end|>\n<|im_start|>assistant\n<think></think>The light crosses more air.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "id": "multi/think_on",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Why is the sky blue?"
+    },
+    {
+     "role": "assistant",
+     "content": "Rayleigh scattering.",
+     "reasoning_content": "Shorter wavelengths scatter more."
+    },
+    {
+     "role": "user",
+     "content": "And sunsets?"
+    },
+    {
+     "role": "assistant",
+     "content": "The light crosses more air."
+    },
+    {
+     "role": "user",
+     "content": "Thanks!"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhy is the sky blue?<|im_end|>\n<|im_start|>assistant\n<think></think>Rayleigh scattering.<|im_end|>\n<|im_start|>user\nAnd sunsets?<|im_end|>\n<|im_start|>assistant\n<think></think>The light crosses more air.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "multi/defaults",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Why is the sky blue?"
+    },
+    {
+     "role": "assistant",
+     "content": "Rayleigh scattering.",
+     "reasoning_content": "Shorter wavelengths scatter more."
+    },
+    {
+     "role": "user",
+     "content": "And sunsets?"
+    },
+    {
+     "role": "assistant",
+     "content": "The light crosses more air."
+    },
+    {
+     "role": "user",
+     "content": "Thanks!"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhy is the sky blue?<|im_end|>\n<|im_start|>assistant\n<think></think>Rayleigh scattering.<|im_end|>\n<|im_start|>user\nAnd sunsets?<|im_end|>\n<|im_start|>assistant\n<think></think>The light crosses more air.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "tool_round/think_off",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "no_think"
+   },
+   "expected": "<|im_start|>system\nYou are a helpful assistant.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Get the weather for a city</description>\n<parameters>\n<parameter>\n<name>city</name>\n<type>string</type>\n<description>City name</description>\n</parameter>\n<parameter>\n<name>days</name>\n<type>integer</type>\n</parameter>\n<parameter>\n<name>lat</name>\n<type>number</type>\n</parameter>\n<required>[\"city\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=lat>\n47.3769181\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response>\n<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "id": "tool_round/think_on",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\nYou are a helpful assistant.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Get the weather for a city</description>\n<parameters>\n<parameter>\n<name>city</name>\n<type>string</type>\n<description>City name</description>\n</parameter>\n<parameter>\n<name>days</name>\n<type>integer</type>\n</parameter>\n<parameter>\n<name>lat</name>\n<type>number</type>\n</parameter>\n<required>[\"city\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=lat>\n47.3769181\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response>\n<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "tool_round/defaults",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "<|im_start|>system\nYou are a helpful assistant.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Get the weather for a city</description>\n<parameters>\n<parameter>\n<name>city</name>\n<type>string</type>\n<description>City name</description>\n</parameter>\n<parameter>\n<name>days</name>\n<type>integer</type>\n</parameter>\n<parameter>\n<name>lat</name>\n<type>number</type>\n</parameter>\n<required>[\"city\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=lat>\n47.3769181\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response>\n<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "tool_round/effort_none",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\nYou are a helpful assistant.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Get the weather for a city</description>\n<parameters>\n<parameter>\n<name>city</name>\n<type>string</type>\n<description>City name</description>\n</parameter>\n<parameter>\n<name>days</name>\n<type>integer</type>\n</parameter>\n<parameter>\n<name>lat</name>\n<type>number</type>\n</parameter>\n<required>[\"city\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=lat>\n47.3769181\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response>\n<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "tool_round/effort_minimal",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\nYou are a helpful assistant.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Get the weather for a city</description>\n<parameters>\n<parameter>\n<name>city</name>\n<type>string</type>\n<description>City name</description>\n</parameter>\n<parameter>\n<name>days</name>\n<type>integer</type>\n</parameter>\n<parameter>\n<name>lat</name>\n<type>number</type>\n</parameter>\n<required>[\"city\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=lat>\n47.3769181\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response>\n<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "tool_round/effort_low",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\nYou are a helpful assistant.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Get the weather for a city</description>\n<parameters>\n<parameter>\n<name>city</name>\n<type>string</type>\n<description>City name</description>\n</parameter>\n<parameter>\n<name>days</name>\n<type>integer</type>\n</parameter>\n<parameter>\n<name>lat</name>\n<type>number</type>\n</parameter>\n<required>[\"city\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=lat>\n47.3769181\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response>\n<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "tool_round/effort_medium",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\nYou are a helpful assistant.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Get the weather for a city</description>\n<parameters>\n<parameter>\n<name>city</name>\n<type>string</type>\n<description>City name</description>\n</parameter>\n<parameter>\n<name>days</name>\n<type>integer</type>\n</parameter>\n<parameter>\n<name>lat</name>\n<type>number</type>\n</parameter>\n<required>[\"city\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=lat>\n47.3769181\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response>\n<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "tool_round/effort_high",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\nYou are a helpful assistant.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Get the weather for a city</description>\n<parameters>\n<parameter>\n<name>city</name>\n<type>string</type>\n<description>City name</description>\n</parameter>\n<parameter>\n<name>days</name>\n<type>integer</type>\n</parameter>\n<parameter>\n<name>lat</name>\n<type>number</type>\n</parameter>\n<required>[\"city\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=lat>\n47.3769181\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response>\n<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "tool_round/effort_xhigh",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\nYou are a helpful assistant.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Get the weather for a city</description>\n<parameters>\n<parameter>\n<name>city</name>\n<type>string</type>\n<description>City name</description>\n</parameter>\n<parameter>\n<name>days</name>\n<type>integer</type>\n</parameter>\n<parameter>\n<name>lat</name>\n<type>number</type>\n</parameter>\n<required>[\"city\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=lat>\n47.3769181\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response>\n<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "tool_round/effort_max",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\nYou are a helpful assistant.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Get the weather for a city</description>\n<parameters>\n<parameter>\n<name>city</name>\n<type>string</type>\n<description>City name</description>\n</parameter>\n<parameter>\n<name>days</name>\n<type>integer</type>\n</parameter>\n<parameter>\n<name>lat</name>\n<type>number</type>\n</parameter>\n<required>[\"city\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=lat>\n47.3769181\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response>\n<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "parallel_tools/think_off",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris and Rome?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "Call_A",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      },
+      {
+       "type": "function",
+       "id": "call_a",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Rome: cloudy, 19C",
+     "tool_call_id": "call_a"
+    },
+    {
+     "role": "tool",
+     "content": "Paris: sunny, 22C",
+     "tool_call_id": "Call_A"
+    },
+    {
+     "role": "user",
+     "content": "Which is warmer?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "no_think"
+   },
+   "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Get the weather for a city</description>\n<parameters>\n<parameter>\n<name>city</name>\n<type>string</type>\n<description>City name</description>\n</parameter>\n<parameter>\n<name>days</name>\n<type>integer</type>\n</parameter>\n<parameter>\n<name>lat</name>\n<type>number</type>\n</parameter>\n<required>[\"city\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris and Rome?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nRome: cloudy, 19C\n</tool_response>\n<tool_response>\nParis: sunny, 22C\n</tool_response>\n<|im_end|>\n<|im_start|>user\nWhich is warmer?<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "id": "parallel_tools/think_on",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris and Rome?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "Call_A",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      },
+      {
+       "type": "function",
+       "id": "call_a",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Rome: cloudy, 19C",
+     "tool_call_id": "call_a"
+    },
+    {
+     "role": "tool",
+     "content": "Paris: sunny, 22C",
+     "tool_call_id": "Call_A"
+    },
+    {
+     "role": "user",
+     "content": "Which is warmer?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Get the weather for a city</description>\n<parameters>\n<parameter>\n<name>city</name>\n<type>string</type>\n<description>City name</description>\n</parameter>\n<parameter>\n<name>days</name>\n<type>integer</type>\n</parameter>\n<parameter>\n<name>lat</name>\n<type>number</type>\n</parameter>\n<required>[\"city\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris and Rome?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nRome: cloudy, 19C\n</tool_response>\n<tool_response>\nParis: sunny, 22C\n</tool_response>\n<|im_end|>\n<|im_start|>user\nWhich is warmer?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "parallel_tools/defaults",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris and Rome?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "Call_A",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      },
+      {
+       "type": "function",
+       "id": "call_a",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Rome: cloudy, 19C",
+     "tool_call_id": "call_a"
+    },
+    {
+     "role": "tool",
+     "content": "Paris: sunny, 22C",
+     "tool_call_id": "Call_A"
+    },
+    {
+     "role": "user",
+     "content": "Which is warmer?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_weather</name>\n<description>Get the weather for a city</description>\n<parameters>\n<parameter>\n<name>city</name>\n<type>string</type>\n<description>City name</description>\n</parameter>\n<parameter>\n<name>days</name>\n<type>integer</type>\n</parameter>\n<parameter>\n<name>lat</name>\n<type>number</type>\n</parameter>\n<required>[\"city\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris and Rome?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nRome: cloudy, 19C\n</tool_response>\n<tool_response>\nParis: sunny, 22C\n</tool_response>\n<|im_end|>\n<|im_start|>user\nWhich is warmer?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "unicode/think_off",
+   "messages": [
+    {
+     "role": "system",
+     "content": "　Réponds brièvement. "
+    },
+    {
+     "role": "user",
+     "content": "　日本語で答えて 🙂 "
+    },
+    {
+     "role": "assistant",
+     "content": "はい どうぞ\u0000。"
+    },
+    {
+     "role": "user",
+     "content": "ok"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "no_think"
+   },
+   "expected": "<|im_start|>system\n　Réponds brièvement. <|im_end|>\n<|im_start|>user\n　日本語で答えて 🙂 <|im_end|>\n<|im_start|>assistant\n<think></think>はい どうぞ\u0000。<|im_end|>\n<|im_start|>user\nok<|im_end|>\n<|im_start|>assistant\n<think></think>"
+  },
+  {
+   "id": "unicode/think_on",
+   "messages": [
+    {
+     "role": "system",
+     "content": "　Réponds brièvement. "
+    },
+    {
+     "role": "user",
+     "content": "　日本語で答えて 🙂 "
+    },
+    {
+     "role": "assistant",
+     "content": "はい どうぞ\u0000。"
+    },
+    {
+     "role": "user",
+     "content": "ok"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<|im_start|>system\n　Réponds brièvement. <|im_end|>\n<|im_start|>user\n　日本語で答えて 🙂 <|im_end|>\n<|im_start|>assistant\n<think></think>はい どうぞ\u0000。<|im_end|>\n<|im_start|>user\nok<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "id": "unicode/defaults",
+   "messages": [
+    {
+     "role": "system",
+     "content": "　Réponds brièvement. "
+    },
+    {
+     "role": "user",
+     "content": "　日本語で答えて 🙂 "
+    },
+    {
+     "role": "assistant",
+     "content": "はい どうぞ\u0000。"
+    },
+    {
+     "role": "user",
+     "content": "ok"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "<|im_start|>system\n　Réponds brièvement. <|im_end|>\n<|im_start|>user\n　日本語で答えて 🙂 <|im_end|>\n<|im_start|>assistant\n<think></think>はい どうぞ\u0000。<|im_end|>\n<|im_start|>user\nok<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ ]
+}

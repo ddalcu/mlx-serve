@@ -1,12 +1,20 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "utils.h"
 
 namespace jinja {
+
+// Python's str.isspace() set: what str.strip() and Jinja2's whitespace control remove.
+bool is_py_space(uint32_t cp);
+// Byte length of the leading / trailing run of Python whitespace in s (whole UTF-8 sequences).
+size_t py_space_prefix(std::string_view s);
+size_t py_space_suffix(std::string_view s);
 
 // allow differentiate between user input strings and template strings
 // transformations should handle this information as follows:

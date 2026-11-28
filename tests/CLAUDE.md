@@ -198,6 +198,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
   pixal3d, qwen3_aligner, qwen3_asr, qwen3_embedding, qwen3_tts (voice), qwen4_exp, qwen4_yarn, qwen_image21, radio (full, vision),
   stable_audio, tokenizer_parity, trellis2, yue2, heartmula
 - `build_qwen_preprocess_fixture.py`, `build_qwen_vision_fixture.py` Qwen3-VL fixtures · `dsv4_mlx_ref.py` MLX reference
+- `jinja_conformance_ref.py` (+ `jinja_conformance_constructs.jsonl`) Python Jinja2 references for the `jinja conformance` test: every fixture template and the construct corpus
 - `dsv4_template_ab.py`, `dsv41_template_ab.py` byte-exact template A/B · `dsv4_task_compare.py` **R** native vs GGUF tasks
 - `dsv41_api_kld.py` **R** teacher-forced top-20 vs the hosted V4.1 API's continuations (ds4 fixtures): top-1 + KLD, paired runs
 

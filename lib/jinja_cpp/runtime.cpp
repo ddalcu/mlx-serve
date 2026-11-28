@@ -167,6 +167,17 @@ value binary_expression::execute_impl(context & ctx) {
         }
         throw std::runtime_error("Cannot perform operation " + op.value + " on undefined values");
     } else if (is_val<value_none>(left_val) || is_val<value_none>(right_val)) {
+        // Python: `None in [..]` is membership by equality; a string haystack still raises.
+        if (is_val<value_none>(left_val) && (op.value == "in" || op.value == "not in") &&
+            (is_val<value_array>(right_val) || is_val<value_object>(right_val))) {
+            bool found = false;
+            if (is_val<value_array>(right_val)) {
+                for (const auto & item : right_val->as_array()) found = found || is_val<value_none>(item);
+            } else {
+                for (const auto & kv : right_val->as_ordered_object()) found = found || is_val<value_none>(kv.first);
+            }
+            return mk_val<value_bool>(found == (op.value == "in"));
+        }
         if (op.value == "+" || op.value == "~") {
             value res = mk_val<value_undefined>();
             if (workaround_concat_null_with_str(res)) {
@@ -425,17 +436,16 @@ value if_statement::execute_impl(context & ctx) {
     value test_val = test->execute(ctx);
 
     auto out = mk_val<value_array>();
-    if (test_val->as_bool()) {
-        for (auto & stmt : body) {
-            JJ_DEBUG("IF --> Executing THEN body, current block: %s", stmt->type().c_str());
-            out->push_back(stmt->execute(ctx));
-        }
-    } else {
-        for (auto & stmt : alternate) {
-            JJ_DEBUG("IF --> Executing ELSE body, current block: %s", stmt->type().c_str());
-            out->push_back(stmt->execute(ctx));
+    std::vector<value> done;
+    for (auto & stmt : test_val->as_bool() ? body : alternate) {
+        try {
+            done.push_back(stmt->execute(ctx));
+        } catch (loop_signal & s) {
+            s.parts.insert(s.parts.begin(), done.begin(), done.end());
+            throw;
         }
     }
+    for (auto & v : done) out->push_back(v);
     // convert to string parts
     value_string str = mk_val<value_string>();
     gather_string_parts_recursive(out, str);
@@ -587,9 +597,11 @@ value for_statement::execute_impl(context & ctx) {
                 value val = stmt->execute(loop_scope);
                 result->push_back(val);
             }
-        } catch (const continue_statement::signal &) {
+        } catch (const continue_statement::signal & s) {
+            for (auto & p : s.parts) result->push_back(p);
             continue;
-        } catch (const break_statement::signal &) {
+        } catch (const break_statement::signal & s) {
+            for (auto & p : s.parts) result->push_back(p);
             break;
         }
         noIteration = false;

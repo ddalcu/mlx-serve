@@ -11,6 +11,9 @@
 #include <vector>
 #include <optional>
 #include <algorithm>
+#include <cerrno>
+#include <cmath>
+#include <cstdlib>
 
 #define FILENAME "jinja-value"
 
@@ -257,6 +260,136 @@ static value selectattr(const func_args & args) {
     return out;
 }
 
+// Python's int(s, base) and float(s) grammars: the whole string (whitespace aside) or nothing.
+static std::string_view py_trimmed(const std::string & s) {
+    std::string_view v(s);
+    v.remove_prefix(py_space_prefix(v));
+    v.remove_suffix(py_space_suffix(v));
+    return v;
+}
+
+// ASCII digits of `base` with single underscores between them; false if any other byte appears.
+static bool py_digits(std::string_view v, int base, bool lead_underscore_ok, std::string & out) {
+    bool prev_digit = lead_underscore_ok;
+    if (v.empty()) return false;
+    for (char c : v) {
+        if (c == '_') {
+            if (!prev_digit) return false;
+            prev_digit = false;
+            continue;
+        }
+        const int d = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'z') ? c - 'a' + 10 : (c >= 'A' && c <= 'Z') ? c - 'A' + 10 : 99;
+        if (d >= base) return false;
+        out += c;
+        prev_digit = true;
+    }
+    return prev_digit;
+}
+
+static bool py_parse_int(const std::string & s, int base, int64_t & res) {
+    std::string_view v = py_trimmed(s);
+    bool neg = false;
+    if (!v.empty() && (v[0] == '+' || v[0] == '-')) { neg = v[0] == '-'; v.remove_prefix(1); }
+    bool prefixed = false;
+    if (v.size() >= 2 && v[0] == '0') {
+        const char p = static_cast<char>(std::tolower(static_cast<unsigned char>(v[1])));
+        const int pb = p == 'x' ? 16 : p == 'o' ? 8 : p == 'b' ? 2 : 0;
+        if (pb != 0 && (base == 0 || base == pb)) { base = pb; v.remove_prefix(2); prefixed = true; }
+    }
+    if (base == 0) {
+        base = 10;
+        // Python refuses a decimal literal with a leading zero ("010") at base 0.
+        if (v.size() > 1 && v[0] == '0' && v.find_first_not_of("0_") != std::string_view::npos) return false;
+    }
+    if (base < 2 || base > 36) return false;
+    std::string digits;
+    if (!py_digits(v, base, prefixed, digits)) return false;
+    errno = 0;
+    char * end = nullptr;
+    const long long n = std::strtoll(digits.c_str(), &end, base);
+    if (errno == ERANGE || *end != '\0') return false;
+    res = neg ? -n : n;
+    return true;
+}
+
+static bool py_parse_float(const std::string & s, double & res) {
+    std::string_view v = py_trimmed(s);
+    std::string norm;
+    if (!v.empty() && (v[0] == '+' || v[0] == '-')) { norm += v[0]; v.remove_prefix(1); }
+    std::string lower(v);
+    for (char & c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower == "inf" || lower == "infinity" || lower == "nan") {
+        res = std::strtod((norm + lower).c_str(), nullptr);
+        return true;
+    }
+    const size_t e = lower.find('e');
+    const std::string_view mant = std::string_view(lower).substr(0, e);
+    const size_t dot = mant.find('.');
+    std::string ip, fp;
+    if (dot == std::string_view::npos) {
+        if (!py_digits(mant, 10, false, ip)) return false;
+    } else {
+        const std::string_view a = mant.substr(0, dot), b = mant.substr(dot + 1);
+        if (a.empty() && b.empty()) return false;
+        if (!a.empty() && !py_digits(a, 10, false, ip)) return false;
+        if (!b.empty() && !py_digits(b, 10, false, fp)) return false;
+    }
+    norm += (ip.empty() ? "0" : ip) + "." + (fp.empty() ? "0" : fp);
+    if (e != std::string::npos) {
+        std::string_view ex = std::string_view(lower).substr(e + 1);
+        norm += 'e';
+        if (!ex.empty() && (ex[0] == '+' || ex[0] == '-')) { norm += ex[0]; ex.remove_prefix(1); }
+        std::string ed;
+        if (!py_digits(ex, 10, false, ed)) return false;
+        norm += ed;
+    }
+    res = std::strtod(norm.c_str(), nullptr);
+    return true;
+}
+
+// Python's str(v), as the value's own `string` filter spells it.
+static std::string py_str(context & ctx, const value & v) {
+    func_args a(ctx);
+    a.push_back(v);
+    return v->get_builtins().at("string")(a)->as_string().str();
+}
+
+// Jinja2's do_int: int(x) (int(s, base) for a string), else int(float(x)), else the default.
+static value py_int_filter(const func_args & args) {
+    value input = args.get_pos(0);
+    value val_default = args.get_kwarg_or_pos("default", 1);
+    value val_base = args.get_kwarg_or_pos("base", 2);
+    auto fallback = [&]() -> value { return val_default->is_undefined() ? mk_val<value_int>(0) : val_default; };
+    auto from_float = [&](double d) -> value {
+        if (std::isinf(d)) throw raised_exception("int(): cannot convert float infinity to integer");
+        if (std::isnan(d) || d >= 9.2233720368547758e18 || d < -9.2233720368547758e18) return fallback();
+        return mk_val<value_int>(static_cast<int64_t>(d));
+    };
+    if (is_val<value_bool>(input)) return mk_val<value_int>(input->as_bool() ? 1 : 0);
+    if (is_val<value_int>(input)) return mk_val<value_int>(input->as_int());
+    if (is_val<value_float>(input)) return from_float(input->as_float());
+    if (is_val<value_string>(input)) {
+        const std::string s = input->as_string().str();
+        int64_t n = 0;
+        if (py_parse_int(s, val_base->is_undefined() ? 10 : static_cast<int>(val_base->as_int()), n)) return mk_val<value_int>(n);
+        double d = 0.0;
+        if (py_parse_float(s, d) && !std::isinf(d)) return from_float(d);
+    }
+    return fallback();
+}
+
+// Jinja2's do_float: float(x), else the default.
+static value py_float_filter(const func_args & args) {
+    value input = args.get_pos(0);
+    value val_default = args.get_kwarg_or_pos("default", 1);
+    if (is_val<value_bool>(input)) return mk_val<value_float>(input->as_bool() ? 1.0 : 0.0);
+    if (is_val<value_int>(input)) return mk_val<value_float>(static_cast<double>(input->as_int()));
+    if (is_val<value_float>(input)) return mk_val<value_float>(input->as_float());
+    double d = 0.0;
+    if (is_val<value_string>(input) && py_parse_float(input->as_string().str(), d)) return mk_val<value_float>(d);
+    return val_default->is_undefined() ? mk_val<value_float>(0.0) : val_default;
+}
+
 static value default_value(const func_args & args) {
     args.ensure_count(2, 3);
     value val_check = args.get_kwarg_or_pos("boolean", 2);
@@ -469,11 +602,8 @@ const func_builtins & value_int_t::get_builtins() const {
             int64_t val = args.get_pos(0)->as_int();
             return mk_val<value_int>(val < 0 ? -val : val);
         }},
-        {"float", [](const func_args & args) -> value {
-            args.ensure_vals<value_int>();
-            double val = static_cast<double>(args.get_pos(0)->as_int());
-            return mk_val<value_float>(val);
-        }},
+        {"float", py_float_filter},
+        {"int", py_int_filter},
         {"safe", tojson},
         {"string", tojson},
         {"tojson", tojson},
@@ -490,11 +620,8 @@ const func_builtins & value_float_t::get_builtins() const {
             double val = args.get_pos(0)->as_float();
             return mk_val<value_float>(val < 0.0 ? -val : val);
         }},
-        {"int", [](const func_args & args) -> value {
-            args.ensure_vals<value_float>();
-            int64_t val = static_cast<int64_t>(args.get_pos(0)->as_float());
-            return mk_val<value_int>(val);
-        }},
+        {"float", py_float_filter},
+        {"int", py_int_filter},
         {"safe", tojson},
         {"string", tojson},
         {"tojson", tojson},
@@ -696,31 +823,8 @@ const func_builtins & value_string_t::get_builtins() const {
             res->val_str.mark_input_based_on(args.get_pos(0)->val_str);
             return res;
         }},
-        {"int", [](const func_args & args) -> value {
-            value val_input   = args.get_pos(0);
-            value val_default = args.get_kwarg_or_pos("default", 1);
-            value val_base    = args.get_kwarg_or_pos("base",    2);
-            const int base = val_base->is_undefined() ? 10 : val_base->as_int();
-            if (is_val<value_string>(val_input) == false) {
-                throw raised_exception("int() first argument must be a string");
-            }
-            std::string str = val_input->as_string().str();
-            try {
-                return mk_val<value_int>(std::stoi(str, nullptr, base));
-            } catch (...) {
-                return mk_val<value_int>(val_default->is_undefined() ? 0 : val_default->as_int());
-            }
-        }},
-        {"float", [](const func_args & args) -> value {
-            args.ensure_vals<value_string>();
-            value val_default = args.get_kwarg_or_pos("default", 1);
-            std::string str = args.get_pos(0)->as_string().str();
-            try {
-                return mk_val<value_float>(std::stod(str));
-            } catch (...) {
-                return mk_val<value_float>(val_default->is_undefined() ? 0.0 : val_default->as_float());
-            }
-        }},
+        {"int", py_int_filter},
+        {"float", py_float_filter},
         {"string", [](const func_args & args) -> value {
             // no-op
             args.ensure_vals<value_string>();
@@ -836,16 +940,8 @@ const func_builtins & value_bool_t::get_builtins() const {
     };
     static const func_builtins builtins = {
         {"default", default_value},
-        {"int", [](const func_args & args) -> value {
-            args.ensure_vals<value_bool>();
-            bool val = args.get_pos(0)->as_bool();
-            return mk_val<value_int>(val ? 1 : 0);
-        }},
-        {"float", [](const func_args & args) -> value {
-            args.ensure_vals<value_bool>();
-            bool val = args.get_pos(0)->as_bool();
-            return mk_val<value_float>(val ? 1.0 : 0.0);
-        }},
+        {"int", py_int_filter},
+        {"float", py_float_filter},
         {"safe", tostring},
         {"string", tostring},
         {"tojson", tojson},
@@ -857,6 +953,8 @@ const func_builtins & value_bool_t::get_builtins() const {
 const func_builtins & value_array_t::get_builtins() const {
     static const func_builtins builtins = {
         {"default", default_value},
+        {"float", py_float_filter},
+        {"int", py_int_filter},
         {"list", [](const func_args & args) -> value {
             args.ensure_vals<value_array>();
             const auto & arr = args.get_pos(0)->as_array();
@@ -979,10 +1077,7 @@ const func_builtins & value_array_t::get_builtins() const {
                         val_arr = val_arr->at(attribute);
                     }
                 }
-                if (!is_val<value_string>(val_arr) && !is_val<value_int>(val_arr) && !is_val<value_float>(val_arr)) {
-                    throw raised_exception("join() can only join arrays of strings or numerics");
-                }
-                result += val_arr->as_string().str();
+                result += is_val<value_string>(val_arr) ? val_arr->as_string().str() : py_str(args.ctx, val_arr);
                 if (i < arr.size() - 1) {
                     result += delim;
                 }
@@ -1143,6 +1238,8 @@ const func_builtins & value_object_t::get_builtins() const {
 
     static const func_builtins builtins = {
         // {"default", default_value}, // cause issue with gpt-oss
+        {"float", py_float_filter},
+        {"int", py_int_filter},
         {"get", [](const func_args & args) -> value {
             args.ensure_count(2, 3);
             if (!is_val<value_object>(args.get_pos(0))) {
@@ -1239,6 +1336,8 @@ const func_builtins & value_none_t::get_builtins() const {
     };
     static const func_builtins builtins = {
         {"default", default_value},
+        {"float", py_float_filter},
+        {"int", py_int_filter},
         {"tojson", tojson},
         {"string", tostring},
         {"safe", tostring},

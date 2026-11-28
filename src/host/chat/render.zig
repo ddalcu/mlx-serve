@@ -55,101 +55,20 @@ pub fn renderChatTemplate(
         return base;
     }
 
-    // Some chat templates (e.g. DeepSeek V4) don't reference `tools` or `role == 'tool'`
-    // at all — Jinja silently drops the tool definitions, and tool-result messages render
-    // as empty. Detect that gap and synthesize an equivalent system-prompt + user-message
-    // form so the model still sees the tool context.
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const in = try engineInput(arena, msgs, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort);
     const tpl = chat_config.chat_template;
-    const tpl_has_tools = std.mem.indexOf(u8, tpl, "tools") != null;
-    const has_tool_content = messagesHaveToolContent(msgs);
-    const tpl_has_tool_role = templateReferencesToolRole(tpl) or
-        (has_tool_content and (chat_config.renders_tool_turn orelse try templateRendersToolTurn(allocator, tpl)));
-    const needs_inject_tools = tools_json != null and !tpl_has_tools;
-    const needs_rewrite_tool_role = !tpl_has_tool_role and has_tool_content;
 
-    var fallback_arena: ?std.heap.ArenaAllocator = null;
-    defer if (fallback_arena) |*a| a.deinit();
-    var effective_messages = msgs;
-    var effective_tools_json = tools_json;
-    // Optional keys a template may dump blindly (see fillOptionalToolDefKeys).
-    // Arena-owned, so the rewritten bytes outlive the render with no free path
-    // of their own.
-    if (tools_json) |tj| {
-        if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
-        if (try fillOptionalToolDefKeys(fallback_arena.?.allocator(), tj)) |filled| {
-            effective_tools_json = filled;
-        }
-    }
-    if (needs_inject_tools or needs_rewrite_tool_role or tool_choice_instruction != null) {
-        // NEVER re-init: the tool-def fill above may already own this arena,
-        // and clobbering it orphans everything allocated there (a leak here, a
-        // use-after-free the moment `effective_tools_json` points into it).
-        if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
-        const arena_alloc = fallback_arena.?.allocator();
-        effective_messages = try synthesizeToolFallbackMessages(
-            arena_alloc,
-            msgs,
-            tools_json,
-            tool_choice_instruction,
-            needs_inject_tools,
-            !tpl_has_tool_role,
-            !tpl_has_tools,
-        );
-        if (needs_inject_tools) {
-            effective_tools_json = null; // already inlined as system content
-        }
-    }
-
-    // Muse (harmony convention): reasoning belongs to the CURRENT turn only.
-    // The app round-trips `reasoning_content` on assistant history, and this
-    // template renders it as a to=self segment — so one bad chain (a loop-cut
-    // tail) would replay in the prompt on every later turn. Drop it on
-    // assistant messages before the last user message; tool rounds after it
-    // keep theirs. Families whose templates NEED history reasoning (laguna,
-    // inkling) are untouched — same sniff `noThinkTailSuffix` uses.
-    if (std.mem.indexOf(u8, tpl, "reasoning_strength") != null) {
-        if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
-        if (try dropPriorTurnReasoning(fallback_arena.?.allocator(), effective_messages)) |stripped| {
-            effective_messages = stripped;
-        }
-    }
-
-    // Serialize messages to JSON — Gemma 4 templates handle role:"tool" natively
-    // (producing <|turn>tool in the rendered output). No transformation needed.
-    // Harmony (gpt_oss) indexes into `message.content` after only checking that
-    // the KEY exists, so a null there breaks every tool round-trip. Sniffed off
-    // the template's own channel marker, like the reasoning drop above.
-    // LFM2-VL iterates any non-string content, so a null there raises on every
-    // tool-call turn.
-    const empty_content: EmptyContent = if (std.mem.indexOf(u8, tpl, "<|channel|>") != null or
-        std.mem.indexOf(u8, tpl, "if content is not string") != null)
-        .empty_string
-    else
-        .null_literal;
-    const extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking, effort);
-    defer allocator.free(extra_json);
-    if (hasExtraSystemMessages(effective_messages)) {
-        if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
-        const a = fallback_arena.?.allocator();
-        var prepared = std.ArrayList(Message).empty;
-        try prepared.appendSlice(a, effective_messages);
-        const preserve = try templatePreservesMidSystem(a, effective_messages, chat_config, effective_tools_json, extra_json, empty_content);
-        if (!preserve) if (lateFoldWarningId(tpl)) |id| {
-            log.warn("chat template {x:0>16} cannot keep a late system message in place; it is folded into the leading system prompt, so each new note changes the prompt head and prefix reuse stops there (render a non-first system turn in place to keep it)\n", .{id});
-        };
-        _ = try foldSystemMessages(a, &prepared, preserve);
-        effective_messages = prepared.items;
-    }
-
-    if (try renderJinja(allocator, effective_messages, chat_config, effective_tools_json, extra_json, empty_content)) |rendered| {
+    if (try renderJinja(allocator, in.messages, chat_config, in.tools_json, in.extra_json, in.empty_content)) |rendered| {
         defer allocator.free(rendered);
         return finishRendered(allocator, rendered, tpl, prefill, enable_thinking, tools_json != null);
     }
     // A template that rejects a system turn (Mistral v0.3's `default`: roles alternate from user) gets it inside the
     // first user turn: the generic format below speaks another family's turn markers.
-    if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
-    if (try systemInFirstUser(fallback_arena.?.allocator(), effective_messages)) |folded| {
-        if (try renderJinja(allocator, folded, chat_config, effective_tools_json, extra_json, empty_content)) |rendered| {
+    if (try systemInFirstUser(arena, in.messages)) |folded| {
+        if (try renderJinja(allocator, folded, chat_config, in.tools_json, in.extra_json, in.empty_content)) |rendered| {
             defer allocator.free(rendered);
             if (lateFoldWarningId(tpl)) |id| log.warn("chat template {x:0>16} rejects a system turn; it is rendered inside the first user turn\n", .{id});
             return finishRendered(allocator, rendered, tpl, prefill, enable_thinking, tools_json != null);
@@ -170,6 +89,93 @@ pub fn renderChatTemplate(
         return std.mem.concat(allocator, u8, &.{ base, partial });
     }
     return base;
+}
+
+/// What the engine renders for one request, after every host transform. `jinja_render_chat` gets `messages`
+/// serialized with `empty_content`, `tools_json` and `extra_json`.
+pub const EngineInput = struct {
+    messages: []const Message,
+    tools_json: ?[]const u8,
+    extra_json: []const u8,
+    empty_content: EmptyContent,
+};
+
+/// The request as the template sees it; everything returned lives in `arena`.
+pub fn engineInput(
+    arena: std.mem.Allocator,
+    msgs: []const Message,
+    chat_config: *const ChatConfig,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
+    effort: ?[]const u8,
+) !EngineInput {
+    // Some chat templates (e.g. DeepSeek V4) don't reference `tools` or `role == 'tool'`
+    // at all — Jinja silently drops the tool definitions, and tool-result messages render
+    // as empty. Detect that gap and synthesize an equivalent system-prompt + user-message
+    // form so the model still sees the tool context.
+    const tpl = chat_config.chat_template;
+    const tpl_has_tools = std.mem.indexOf(u8, tpl, "tools") != null;
+    const has_tool_content = messagesHaveToolContent(msgs);
+    const tpl_has_tool_role = templateReferencesToolRole(tpl) or
+        (has_tool_content and (chat_config.renders_tool_turn orelse try templateRendersToolTurn(arena, tpl)));
+    const needs_inject_tools = tools_json != null and !tpl_has_tools;
+    const needs_rewrite_tool_role = !tpl_has_tool_role and has_tool_content;
+
+    var effective_messages = msgs;
+    var effective_tools_json = tools_json;
+    // Optional keys a template may dump blindly (see fillOptionalToolDefKeys).
+    if (tools_json) |tj| {
+        if (try fillOptionalToolDefKeys(arena, tj)) |filled| effective_tools_json = filled;
+    }
+    if (needs_inject_tools or needs_rewrite_tool_role or tool_choice_instruction != null) {
+        effective_messages = try synthesizeToolFallbackMessages(
+            arena,
+            msgs,
+            tools_json,
+            tool_choice_instruction,
+            needs_inject_tools,
+            !tpl_has_tool_role,
+            !tpl_has_tools,
+        );
+        if (needs_inject_tools) {
+            effective_tools_json = null; // already inlined as system content
+        }
+    }
+
+    // Muse (harmony convention): reasoning belongs to the CURRENT turn only.
+    // The app round-trips `reasoning_content` on assistant history, and this
+    // template renders it as a to=self segment — so one bad chain (a loop-cut
+    // tail) would replay in the prompt on every later turn. Drop it on
+    // assistant messages before the last user message; tool rounds after it
+    // keep theirs. Families whose templates NEED history reasoning (laguna,
+    // inkling) are untouched — same sniff `noThinkTailSuffix` uses.
+    if (std.mem.indexOf(u8, tpl, "reasoning_strength") != null) {
+        if (try dropPriorTurnReasoning(arena, effective_messages)) |stripped| effective_messages = stripped;
+    }
+
+    // Harmony (gpt_oss) indexes into `message.content` after only checking that
+    // the KEY exists, so a null there breaks every tool round-trip. Sniffed off
+    // the template's own channel marker, like the reasoning drop above.
+    // LFM2-VL iterates any non-string content, so a null there raises on every
+    // tool-call turn.
+    const empty_content: EmptyContent = if (std.mem.indexOf(u8, tpl, "<|channel|>") != null or
+        std.mem.indexOf(u8, tpl, "if content is not string") != null)
+        .empty_string
+    else
+        .null_literal;
+    const extra_json = try serializeExtraContext(arena, chat_config, enable_thinking, effort);
+    if (hasExtraSystemMessages(effective_messages)) {
+        var prepared = std.ArrayList(Message).empty;
+        try prepared.appendSlice(arena, effective_messages);
+        const preserve = try templatePreservesMidSystem(arena, effective_messages, chat_config, effective_tools_json, extra_json, empty_content);
+        if (!preserve) if (lateFoldWarningId(tpl)) |id| {
+            log.warn("chat template {x:0>16} cannot keep a late system message in place; it is folded into the leading system prompt, so each new note changes the prompt head and prefix reuse stops there (render a non-first system turn in place to keep it)\n", .{id});
+        };
+        _ = try foldSystemMessages(arena, &prepared, preserve);
+        effective_messages = prepared.items;
+    }
+    return .{ .messages = effective_messages, .tools_json = effective_tools_json, .extra_json = extra_json, .empty_content = empty_content };
 }
 
 var late_fold_warned: [32]u64 = undefined;
@@ -256,7 +262,7 @@ fn qwenLateSystemTemplate(allocator: std.mem.Allocator, tpl: []const u8) !?[]con
     return null;
 }
 
-fn renderJinja(
+pub fn renderJinja(
     allocator: std.mem.Allocator,
     messages: []const Message,
     config: *const ChatConfig,

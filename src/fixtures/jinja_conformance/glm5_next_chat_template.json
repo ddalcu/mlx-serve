@@ -1,0 +1,1356 @@
+{
+ "template": "glm5_next_chat_template",
+ "sha256": "34d5ee66b12fa6446cdae131c352b8f68cd85369e0e6fda115583805fada3891",
+ "cases": [
+  {
+   "id": "simple/think_off",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "max"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>What is the capital of France?<|assistant|><think>"
+  },
+  {
+   "id": "simple/think_on",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "max"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>What is the capital of France?<|assistant|><think>"
+  },
+  {
+   "id": "simple/defaults",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>What is the capital of France?<|assistant|><think>"
+  },
+  {
+   "id": "simple/effort_none",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "low"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>What is the capital of France?<|assistant|><think>"
+  },
+  {
+   "id": "simple/effort_minimal",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "low"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>What is the capital of France?<|assistant|><think>"
+  },
+  {
+   "id": "simple/effort_low",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "low"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>What is the capital of France?<|assistant|><think>"
+  },
+  {
+   "id": "simple/effort_medium",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>What is the capital of France?<|assistant|><think>"
+  },
+  {
+   "id": "simple/effort_high",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>What is the capital of France?<|assistant|><think>"
+  },
+  {
+   "id": "simple/effort_xhigh",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "max"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>What is the capital of France?<|assistant|><think>"
+  },
+  {
+   "id": "simple/effort_max",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "max"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>What is the capital of France?<|assistant|><think>"
+  },
+  {
+   "id": "multi/think_off",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Why is the sky blue?"
+    },
+    {
+     "role": "assistant",
+     "content": "Rayleigh scattering.",
+     "reasoning_content": "Shorter wavelengths scatter more."
+    },
+    {
+     "role": "user",
+     "content": "And sunsets?"
+    },
+    {
+     "role": "assistant",
+     "content": "The light crosses more air."
+    },
+    {
+     "role": "user",
+     "content": "Thanks!"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "max"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are a helpful assistant.<|user|>Why is the sky blue?<|assistant|><think>Shorter wavelengths scatter more.</think>Rayleigh scattering.<|user|>And sunsets?<|assistant|><think></think>The light crosses more air.<|user|>Thanks!<|assistant|><think>"
+  },
+  {
+   "id": "multi/think_on",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Why is the sky blue?"
+    },
+    {
+     "role": "assistant",
+     "content": "Rayleigh scattering.",
+     "reasoning_content": "Shorter wavelengths scatter more."
+    },
+    {
+     "role": "user",
+     "content": "And sunsets?"
+    },
+    {
+     "role": "assistant",
+     "content": "The light crosses more air."
+    },
+    {
+     "role": "user",
+     "content": "Thanks!"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "max"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are a helpful assistant.<|user|>Why is the sky blue?<|assistant|><think>Shorter wavelengths scatter more.</think>Rayleigh scattering.<|user|>And sunsets?<|assistant|><think></think>The light crosses more air.<|user|>Thanks!<|assistant|><think>"
+  },
+  {
+   "id": "multi/defaults",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Why is the sky blue?"
+    },
+    {
+     "role": "assistant",
+     "content": "Rayleigh scattering.",
+     "reasoning_content": "Shorter wavelengths scatter more."
+    },
+    {
+     "role": "user",
+     "content": "And sunsets?"
+    },
+    {
+     "role": "assistant",
+     "content": "The light crosses more air."
+    },
+    {
+     "role": "user",
+     "content": "Thanks!"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>You are a helpful assistant.<|user|>Why is the sky blue?<|assistant|><think>Shorter wavelengths scatter more.</think>Rayleigh scattering.<|user|>And sunsets?<|assistant|><think></think>The light crosses more air.<|user|>Thanks!<|assistant|><think>"
+  },
+  {
+   "id": "tool_round/think_off",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "max"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a helpful assistant.<|user|>Weather in Paris?<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value><arg_key>lat</arg_key><arg_value>47.3769181</arg_value></tool_call><|observation|><tool_response>Sunny, 22C</tool_response><|user|>Thanks<|assistant|><think>"
+  },
+  {
+   "id": "tool_round/think_on",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "max"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a helpful assistant.<|user|>Weather in Paris?<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value><arg_key>lat</arg_key><arg_value>47.3769181</arg_value></tool_call><|observation|><tool_response>Sunny, 22C</tool_response><|user|>Thanks<|assistant|><think>"
+  },
+  {
+   "id": "tool_round/defaults",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a helpful assistant.<|user|>Weather in Paris?<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value><arg_key>lat</arg_key><arg_value>47.3769181</arg_value></tool_call><|observation|><tool_response>Sunny, 22C</tool_response><|user|>Thanks<|assistant|><think>"
+  },
+  {
+   "id": "tool_round/effort_none",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "low"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a helpful assistant.<|user|>Weather in Paris?<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value><arg_key>lat</arg_key><arg_value>47.3769181</arg_value></tool_call><|observation|><tool_response>Sunny, 22C</tool_response><|user|>Thanks<|assistant|><think>"
+  },
+  {
+   "id": "tool_round/effort_minimal",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "low"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a helpful assistant.<|user|>Weather in Paris?<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value><arg_key>lat</arg_key><arg_value>47.3769181</arg_value></tool_call><|observation|><tool_response>Sunny, 22C</tool_response><|user|>Thanks<|assistant|><think>"
+  },
+  {
+   "id": "tool_round/effort_low",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "low"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a helpful assistant.<|user|>Weather in Paris?<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value><arg_key>lat</arg_key><arg_value>47.3769181</arg_value></tool_call><|observation|><tool_response>Sunny, 22C</tool_response><|user|>Thanks<|assistant|><think>"
+  },
+  {
+   "id": "tool_round/effort_medium",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a helpful assistant.<|user|>Weather in Paris?<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value><arg_key>lat</arg_key><arg_value>47.3769181</arg_value></tool_call><|observation|><tool_response>Sunny, 22C</tool_response><|user|>Thanks<|assistant|><think>"
+  },
+  {
+   "id": "tool_round/effort_high",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a helpful assistant.<|user|>Weather in Paris?<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value><arg_key>lat</arg_key><arg_value>47.3769181</arg_value></tool_call><|observation|><tool_response>Sunny, 22C</tool_response><|user|>Thanks<|assistant|><think>"
+  },
+  {
+   "id": "tool_round/effort_xhigh",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "max"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a helpful assistant.<|user|>Weather in Paris?<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value><arg_key>lat</arg_key><arg_value>47.3769181</arg_value></tool_call><|observation|><tool_response>Sunny, 22C</tool_response><|user|>Thanks<|assistant|><think>"
+  },
+  {
+   "id": "tool_round/effort_max",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Sunny, 22C",
+     "tool_call_id": "call_1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "max"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a helpful assistant.<|user|>Weather in Paris?<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value><arg_key>lat</arg_key><arg_value>47.3769181</arg_value></tool_call><|observation|><tool_response>Sunny, 22C</tool_response><|user|>Thanks<|assistant|><think>"
+  },
+  {
+   "id": "parallel_tools/think_off",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris and Rome?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "Call_A",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      },
+      {
+       "type": "function",
+       "id": "call_a",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Rome: cloudy, 19C",
+     "tool_call_id": "call_a"
+    },
+    {
+     "role": "tool",
+     "content": "Paris: sunny, 22C",
+     "tool_call_id": "Call_A"
+    },
+    {
+     "role": "user",
+     "content": "Which is warmer?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "max"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Weather in Paris and Rome?<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Rome</arg_value></tool_call><|observation|><tool_response>Paris: sunny, 22C</tool_response><tool_response>Rome: cloudy, 19C</tool_response><|user|>Which is warmer?<|assistant|><think>"
+  },
+  {
+   "id": "parallel_tools/think_on",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris and Rome?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "Call_A",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      },
+      {
+       "type": "function",
+       "id": "call_a",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Rome: cloudy, 19C",
+     "tool_call_id": "call_a"
+    },
+    {
+     "role": "tool",
+     "content": "Paris: sunny, 22C",
+     "tool_call_id": "Call_A"
+    },
+    {
+     "role": "user",
+     "content": "Which is warmer?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "max"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Weather in Paris and Rome?<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Rome</arg_value></tool_call><|observation|><tool_response>Paris: sunny, 22C</tool_response><tool_response>Rome: cloudy, 19C</tool_response><|user|>Which is warmer?<|assistant|><think>"
+  },
+  {
+   "id": "parallel_tools/defaults",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris and Rome?"
+    },
+    {
+     "role": "assistant",
+     "content": null,
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "Call_A",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      },
+      {
+       "type": "function",
+       "id": "call_a",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "Rome: cloudy, 19C",
+     "tool_call_id": "call_a"
+    },
+    {
+     "role": "tool",
+     "content": "Paris: sunny, 22C",
+     "tool_call_id": "Call_A"
+    },
+    {
+     "role": "user",
+     "content": "Which is warmer?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Weather in Paris and Rome?<|assistant|><think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Rome</arg_value></tool_call><|observation|><tool_response>Paris: sunny, 22C</tool_response><tool_response>Rome: cloudy, 19C</tool_response><|user|>Which is warmer?<|assistant|><think>"
+  },
+  {
+   "id": "unicode/think_off",
+   "messages": [
+    {
+     "role": "system",
+     "content": "　Réponds brièvement. "
+    },
+    {
+     "role": "user",
+     "content": "　日本語で答えて 🙂 "
+    },
+    {
+     "role": "assistant",
+     "content": "はい どうぞ\u0000。"
+    },
+    {
+     "role": "user",
+     "content": "ok"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "max"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>　Réponds brièvement. <|user|>　日本語で答えて 🙂 <|assistant|><think></think>はい どうぞ\u0000。<|user|>ok<|assistant|><think>"
+  },
+  {
+   "id": "unicode/think_on",
+   "messages": [
+    {
+     "role": "system",
+     "content": "　Réponds brièvement. "
+    },
+    {
+     "role": "user",
+     "content": "　日本語で答えて 🙂 "
+    },
+    {
+     "role": "assistant",
+     "content": "はい どうぞ\u0000。"
+    },
+    {
+     "role": "user",
+     "content": "ok"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "max"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>　Réponds brièvement. <|user|>　日本語で答えて 🙂 <|assistant|><think></think>はい どうぞ\u0000。<|user|>ok<|assistant|><think>"
+  },
+  {
+   "id": "unicode/defaults",
+   "messages": [
+    {
+     "role": "system",
+     "content": "　Réponds brièvement. "
+    },
+    {
+     "role": "user",
+     "content": "　日本語で答えて 🙂 "
+    },
+    {
+     "role": "assistant",
+     "content": "はい どうぞ\u0000。"
+    },
+    {
+     "role": "user",
+     "content": "ok"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>　Réponds brièvement. <|user|>　日本語で答えて 🙂 <|assistant|><think></think>はい どうぞ\u0000。<|user|>ok<|assistant|><think>"
+  }
+ ]
+}

@@ -1,0 +1,652 @@
+{
+ "cases": [
+  {
+   "id": "s01_set",
+   "template": "{% set x = 1 %}{{ x }}",
+   "context": "{}",
+   "expected": "1"
+  },
+  {
+   "id": "s02_ns_attr",
+   "template": "{% set ns = namespace(a=1) %}{% set ns.a = ns.a + 1 %}{{ ns.a }}",
+   "context": "{}",
+   "expected": "2"
+  },
+  {
+   "id": "s03_ns_new_attr",
+   "template": "{% set ns = namespace() %}{% set ns.b = 3 %}{{ ns.b }}",
+   "context": "{}",
+   "expected": "3"
+  },
+  {
+   "id": "s04_block_set",
+   "template": "{% set x %}a{{ 1 }}{% endset %}[{{ x }}]",
+   "context": "{}",
+   "expected": "[a1]"
+  },
+  {
+   "id": "s07_set_loop_scope",
+   "template": "{% set x = 'o' %}{% for i in [1,2] %}{% if i == 1 %}{% set x = 'i' %}{% endif %}{{ x }}{% endfor %}{{ x }}",
+   "context": "{}",
+   "expected": "ioo"
+  },
+  {
+   "id": "s08_for_items_unpack",
+   "template": "{% for k, v in {'a': 1, 'b': 2}.items() %}{{ k }}={{ v }};{% endfor %}",
+   "context": "{}",
+   "expected": "a=1;b=2;"
+  },
+  {
+   "id": "s09_for_dict_keys",
+   "template": "{% for k in {'a': 1, 'b': 2} %}{{ k }}{% endfor %}",
+   "context": "{}",
+   "expected": "ab"
+  },
+  {
+   "id": "s10_for_if_filter",
+   "template": "{% for x in [1,2,3,4] if x is even %}{{ x }}{{ loop.index }}{{ loop.length }}|{% endfor %}",
+   "context": "{}",
+   "expected": "212|422|"
+  },
+  {
+   "id": "s13_loop_attrs",
+   "template": "{% for x in [10,20,30] %}{{ loop.index0 }}{{ loop.revindex }}{{ loop.first }}{{ loop.last }}{{ loop.previtem }}{{ loop.nextitem }};{% endfor %}",
+   "context": "{}",
+   "expected": "03TrueFalse20;12FalseFalse1030;21FalseTrue20;"
+  },
+  {
+   "id": "s19_break_output_in_if",
+   "template": "{% for x in [1,2,3] %}{% if x == 2 %}found{% break %}{% endif %}{{ x }}{% endfor %}",
+   "context": "{}",
+   "expected": "1found"
+  },
+  {
+   "id": "s20_continue_output_in_if",
+   "template": "{% for x in [1,2] %}{% if x == 1 %}skip{% continue %}{% endif %}{{ x }}{% endfor %}",
+   "context": "{}",
+   "expected": "skip2"
+  },
+  {
+   "id": "s21_if_elif_else",
+   "template": "{% if false %}a{% elif true %}b{% else %}c{% endif %}",
+   "context": "{}",
+   "expected": "b"
+  },
+  {
+   "id": "s22_macro_defaults",
+   "template": "{% macro f(a, b='B') %}{{ a }}{{ b }}{% endmacro %}{{ f(1) }}{{ f(1, 2) }}{{ f(1, b=3) }}",
+   "context": "{}",
+   "expected": "1B1213"
+  },
+  {
+   "id": "s30_comment",
+   "template": "a{# c #}b",
+   "context": "{}",
+   "expected": "ab"
+  },
+  {
+   "id": "s31_macro_late_def",
+   "template": "{% macro a() %}{{ b() }}{% endmacro %}{% macro b() %}B{% endmacro %}{{ a() }}",
+   "context": "{}",
+   "expected": "B"
+  },
+  {
+   "id": "w01_trim_blocks",
+   "template": "{% if true %}\nX{% endif %}",
+   "context": "{}",
+   "expected": "X"
+  },
+  {
+   "id": "w02_lstrip_blocks",
+   "template": "a\n   {% if true %}X{% endif %}",
+   "context": "{}",
+   "expected": "a\nX"
+  },
+  {
+   "id": "w03_no_lstrip_expr",
+   "template": "a\n   {{ 'X' }}",
+   "context": "{}",
+   "expected": "a\n   X"
+  },
+  {
+   "id": "w04_dash_strip",
+   "template": "a  {{- 'X' -}}  b",
+   "context": "{}",
+   "expected": "aXb"
+  },
+  {
+   "id": "w05_trim_after_comment",
+   "template": "{# c #}\nX",
+   "context": "{}",
+   "expected": "X"
+  },
+  {
+   "id": "w06_lstrip_first_text",
+   "template": "A {% if true %}B{% endif %}",
+   "context": "{}",
+   "expected": "A B"
+  },
+  {
+   "id": "w07_leading_newline",
+   "template": "\n{% if true %}B{% endif %}",
+   "context": "{}",
+   "expected": "\nB"
+  },
+  {
+   "id": "w09_dash_unicode_ws",
+   "template": "{{ 'a' }}　 {{- 'b' }}",
+   "context": "{}",
+   "expected": "ab"
+  },
+  {
+   "id": "w10_block_dash_then_text",
+   "template": "{% if true -%}   \n  X{% endif %}",
+   "context": "{}",
+   "expected": "X"
+  },
+  {
+   "id": "w12_trailing_newline",
+   "template": "a\n\n",
+   "context": "{}",
+   "expected": "a\n"
+  },
+  {
+   "id": "w13_mid_line_block",
+   "template": "{{ 'x' }}  {% if true %}Y{% endif %}",
+   "context": "{}",
+   "expected": "x  Y"
+  },
+  {
+   "id": "l01_dict_literal",
+   "template": "{{ {'a': 1, 'b': [1, 2]}['b'][1] }}",
+   "context": "{}",
+   "expected": "2"
+  },
+  {
+   "id": "l02_list_trailing_comma",
+   "template": "{{ [1, 2,]|length }}",
+   "context": "{}",
+   "expected": "2"
+  },
+  {
+   "id": "l03_tuple",
+   "template": "{{ ('a', 'b')|join(',') }}",
+   "context": "{}",
+   "expected": "a,b"
+  },
+  {
+   "id": "l06_float_literal",
+   "template": "{{ 0.9 }}|{{ 1.0 }}",
+   "context": "{}",
+   "expected": "0.9|1.0"
+  },
+  {
+   "id": "l09_neg_literal",
+   "template": "{{ -1 }}|{{ [-1][0] }}|{{ x == -1 }}",
+   "context": "{}",
+   "expected": "-1|-1|False"
+  },
+  {
+   "id": "l12_basic_escapes",
+   "template": "{{ 'a\\nb\\t\\'\"' }}",
+   "context": "{}",
+   "expected": "a\nb\t'\""
+  },
+  {
+   "id": "l13_x_escape",
+   "template": "{{ '\\x41\\xe9' }}",
+   "context": "{}",
+   "expected": "Aé"
+  },
+  {
+   "id": "l17_bool_none_literals",
+   "template": "{{ True }}{{ none is none }}{{ False }}",
+   "context": "{}",
+   "expected": "TrueTrueFalse"
+  },
+  {
+   "id": "o01_tilde",
+   "template": "{{ 'a' ~ 1 ~ true }}",
+   "context": "{}",
+   "expected": "a1True"
+  },
+  {
+   "id": "o03_tilde_none",
+   "template": "{{ 'a' ~ none }}",
+   "context": "{}",
+   "expected": "aNone"
+  },
+  {
+   "id": "o05_in_forms",
+   "template": "{{ 2 in [1,2] }}{{ 'b' in 'abc' }}{{ 'k' in {'k':1} }}{{ 3 not in (1,2) }}{{ 'a' in u }}",
+   "context": "{}",
+   "expected": "TrueTrueTrueTrueFalse"
+  },
+  {
+   "id": "o06_none_in_list",
+   "template": "{{ none in [none] }}",
+   "context": "{}",
+   "expected": "True"
+  },
+  {
+   "id": "o06b_none_in_list_of_str",
+   "template": "{{ none in ['low', 'high'] }}",
+   "context": "{}",
+   "expected": "False"
+  },
+  {
+   "id": "o17_list_plus",
+   "template": "{{ ([1] + [2])|length }}",
+   "context": "{}",
+   "expected": "2"
+  },
+  {
+   "id": "o20_not_in_precedence",
+   "template": "{{ not 1 in [1] }}",
+   "context": "{}",
+   "expected": "False"
+  },
+  {
+   "id": "o22_numeric_eq",
+   "template": "{{ 1 == 1.0 }}{{ true == 1 }}",
+   "context": "{}",
+   "expected": "TrueTrue"
+  },
+  {
+   "id": "i01_neg_index_list",
+   "template": "{{ [1,2,3][-1] }}",
+   "context": "{}",
+   "expected": "3"
+  },
+  {
+   "id": "i04_slices",
+   "template": "{{ [1,2,3,4][1:3]|join }}{{ 'abcd'[:2] }}{{ [1,2,3][::-1]|join }}{{ [1,2,3][-2:]|join }}",
+   "context": "{}",
+   "expected": "23ab32123"
+  },
+  {
+   "id": "i06_slice_utf8",
+   "template": "{{ 'éa'[:1] }}",
+   "context": "{}",
+   "expected": "é"
+  },
+  {
+   "id": "i07b_dot_int_attr",
+   "template": "{% set l = [{'t': 'x'}] %}{{ l.0.t }}",
+   "context": "{}",
+   "expected": "x"
+  },
+  {
+   "id": "i09_len_utf8",
+   "template": "{{ 'é'|length }}",
+   "context": "{}",
+   "expected": "1"
+  },
+  {
+   "id": "f01_default_undef",
+   "template": "{{ u|default('d') }}",
+   "context": "{}",
+   "expected": "d"
+  },
+  {
+   "id": "f02_default_none",
+   "template": "{{ none|default('d') }}",
+   "context": "{}",
+   "expected": ""
+  },
+  {
+   "id": "f03_default_bool",
+   "template": "{{ ''|default('d', true) }}{{ u|default('d', boolean=true) }}",
+   "context": "{}",
+   "expected": "dd"
+  },
+  {
+   "id": "f06_tojson_default",
+   "template": "{{ {'a': [1, 'é', none, true, 1.5]}|tojson }}",
+   "context": "{}",
+   "expected": "{\"a\": [1, \"é\", null, true, 1.5]}"
+  },
+  {
+   "id": "f08_tojson_sep_sort",
+   "template": "{{ {'b': 1, 'a': {'d': 2, 'c': 3}}|tojson(sort_keys=true, separators=(',', ':')) }}",
+   "context": "{}",
+   "expected": "{\"a\":{\"c\":3,\"d\":2},\"b\":1}"
+  },
+  {
+   "id": "f10_tojson_escapes",
+   "template": "{{ 'a\"\\\\\\n\\x01<'|tojson }}",
+   "context": "{}",
+   "expected": "\"a\\\"\\\\\\n\\u0001<\""
+  },
+  {
+   "id": "f10b_tojson_ensure_ascii_false",
+   "template": "{{ {'k': 'é'}|tojson(ensure_ascii=False) }}",
+   "context": "{}",
+   "expected": "{\"k\": \"é\"}"
+  },
+  {
+   "id": "f12_int_on_int",
+   "template": "{{ 3|int }}",
+   "context": "{}",
+   "expected": "3"
+  },
+  {
+   "id": "f13_int_on_none",
+   "template": "{{ none|int }}",
+   "context": "{}",
+   "expected": "0"
+  },
+  {
+   "id": "f15_float_on_float",
+   "template": "{% set eff = 0.9 %}{{ eff|float }}",
+   "context": "{}",
+   "expected": "0.9"
+  },
+  {
+   "id": "f16_float_on_int",
+   "template": "{{ 1|float }}",
+   "context": "{}",
+   "expected": "1.0"
+  },
+  {
+   "id": "f17_float_on_none",
+   "template": "{{ none|float }}",
+   "context": "{}",
+   "expected": "0.0"
+  },
+  {
+   "id": "f18_string_filter",
+   "template": "{{ 1|string }}{{ 1.5|string }}{{ true|string }}{{ none|string }}{{ ['a', 1]|string }}{{ {'k': none}|string }}",
+   "context": "{}",
+   "expected": "11.5TrueNone['a', 1]{'k': None}"
+  },
+  {
+   "id": "f19_string_list_newline",
+   "template": "{{ ['a\\nb']|string }}",
+   "context": "{}",
+   "expected": "['a\\nb']"
+  },
+  {
+   "id": "f20_trim",
+   "template": "[{{ '  a \\n'|trim }}]",
+   "context": "{}",
+   "expected": "[a]"
+  },
+  {
+   "id": "f21_trim_unicode_ws",
+   "template": "[{{ '\\x1fa\\xa0'|trim }}]",
+   "context": "{}",
+   "expected": "[a]"
+  },
+  {
+   "id": "f22_trim_chars",
+   "template": "{{ 'xxaxx'|trim('x') }}",
+   "context": "{}",
+   "expected": "a"
+  },
+  {
+   "id": "f23_upper_unicode",
+   "template": "{{ 'é'|upper }}",
+   "context": "{}",
+   "expected": "É"
+  },
+  {
+   "id": "f24_capitalize",
+   "template": "{{ 'hELLO'|capitalize }}",
+   "context": "{}",
+   "expected": "Hello"
+  },
+  {
+   "id": "f26a_replace",
+   "template": "{{ 'aaa'|replace('a', 'b') }}",
+   "context": "{}",
+   "expected": "bbb"
+  },
+  {
+   "id": "f28_length",
+   "template": "{{ [1,2]|length }}{{ {'a':1}|length }}{{ 'ab'|length }}{{ u|length }}",
+   "context": "{}",
+   "expected": "2120"
+  },
+  {
+   "id": "f30_join",
+   "template": "{{ ['a','b']|join(', ') }}",
+   "context": "{}",
+   "expected": "a, b"
+  },
+  {
+   "id": "f31_join_non_str",
+   "template": "{{ [1, none, true]|join(',') }}",
+   "context": "{}",
+   "expected": "1,None,True"
+  },
+  {
+   "id": "f34_map_attr",
+   "template": "{{ [{'n':'a'},{'n':'b'}]|map(attribute='n')|join }}",
+   "context": "{}",
+   "expected": "ab"
+  },
+  {
+   "id": "f38_selectattr_in",
+   "template": "{{ [{'type':'text'},{'type':'audio'},{'x':1}]|selectattr('type','in',['text'])|list|length }}",
+   "context": "{}",
+   "expected": "1"
+  },
+  {
+   "id": "f42_sort",
+   "template": "{{ [3,1,2]|sort|join }}{{ [3,1,2]|sort(reverse=true)|join }}",
+   "context": "{}",
+   "expected": "123321"
+  },
+  {
+   "id": "f43_sort_case_default",
+   "template": "{{ ['a','B']|sort|join }}",
+   "context": "{}",
+   "expected": "aB"
+  },
+  {
+   "id": "f44_sort_attr",
+   "template": "{{ [{'i':2},{'i':1}]|sort(attribute='i')|map(attribute='i')|join }}",
+   "context": "{}",
+   "expected": "12"
+  },
+  {
+   "id": "f45_sort_stable",
+   "template": "{{ [{'k':1,'v':'a'},{'k':0,'v':'b'},{'k':1,'v':'c'}]|sort(attribute='k')|map(attribute='v')|join }}",
+   "context": "{}",
+   "expected": "bac"
+  },
+  {
+   "id": "f48_unique",
+   "template": "{{ ['a','A','b']|unique|join }}",
+   "context": "{}",
+   "expected": "ab"
+  },
+  {
+   "id": "f49_min_max",
+   "template": "{{ [3,1,2]|min }}{{ [3,1,2]|max }}",
+   "context": "{}",
+   "expected": "13"
+  },
+  {
+   "id": "f55_items_filter",
+   "template": "{% for k, v in {'a':1}|items %}{{ k }}{{ v }}{% endfor %}{% for k, v in u|items %}x{% endfor %}",
+   "context": "{}",
+   "expected": "a1"
+  },
+  {
+   "id": "f62_safe",
+   "template": "{{ '<a>'|safe }}",
+   "context": "{}",
+   "expected": "<a>"
+  },
+  {
+   "id": "f65_lower",
+   "template": "{{ 'AbC'|lower }}",
+   "context": "{}",
+   "expected": "abc"
+  },
+  {
+   "id": "t01_type_tests",
+   "template": "{{ 'a' is string }}{{ 1 is number }}{{ 1.0 is float }}{{ 1 is integer }}{{ none is none }}{{ {} is mapping }}{{ [] is iterable }}{{ u is defined }}{{ u is undefined }}{{ true is boolean }}",
+   "context": "{}",
+   "expected": "TrueTrueTrueTrueTrueTrueTrueFalseTrueTrue"
+  },
+  {
+   "id": "t03_dict_iterable_sequence",
+   "template": "{{ {} is iterable }}{{ {} is sequence }}",
+   "context": "{}",
+   "expected": "TrueTrue"
+  },
+  {
+   "id": "t04_list_str_sequence",
+   "template": "{{ [] is sequence }}{{ 'a' is sequence }}{{ none is iterable }}{{ 1 is sequence }}",
+   "context": "{}",
+   "expected": "TrueTrueFalseFalse"
+  },
+  {
+   "id": "t07_sameas",
+   "template": "{{ none is sameas none }}{{ false is sameas false }}{{ 0 is sameas false }}",
+   "context": "{}",
+   "expected": "TrueTrueFalse"
+  },
+  {
+   "id": "t11_true_false",
+   "template": "{{ true is true }}{{ 1 is true }}{{ false is false }}{{ enable_thinking is false }}",
+   "context": "{\"enable_thinking\": false}",
+   "expected": "TrueFalseTrueTrue"
+  },
+  {
+   "id": "t18_not_is_defined",
+   "template": "{{ not u is defined }}",
+   "context": "{}",
+   "expected": "True"
+  },
+  {
+   "id": "g01_range",
+   "template": "{{ range(3)|join }}{{ range(1, 3)|join }}{{ range(5, 0, -2)|join }}",
+   "context": "{}",
+   "expected": "01212531"
+  },
+  {
+   "id": "g06_raise_exception",
+   "template": "{{ raise_exception('boom') }}",
+   "context": "{}",
+   "raises": "TemplateError: boom"
+  },
+  {
+   "id": "m01_split",
+   "template": "{{ 'a,b'.split(',')|join('|') }}",
+   "context": "{}",
+   "expected": "a|b"
+  },
+  {
+   "id": "m05_strip_methods",
+   "template": "{{ '\\nab\\n'.strip() }}{{ 'xax'.lstrip('x') }}{{ 'xax'.rstrip('x') }}",
+   "context": "{}",
+   "expected": "abaxxa"
+  },
+  {
+   "id": "m10_format_positional",
+   "template": "{{ '<{}>'.format('x') }}{{ '{0}{0}'.format('y') }}",
+   "context": "{}",
+   "expected": "<x>yy"
+  },
+  {
+   "id": "m17_dict_get",
+   "template": "{{ {'a': 1}.get('a') }}{{ {'a': 1}.get('b') }}{{ {'a': 1}.get('b', 2) }}",
+   "context": "{}",
+   "expected": "12"
+  },
+  {
+   "id": "m19_dict_keys_values",
+   "template": "{{ {'a': 1}.keys()|join }}{{ {'a': 1}.values()|join }}",
+   "context": "{}",
+   "expected": "a1"
+  },
+  {
+   "id": "m21_endswith",
+   "template": "{{ 'abc'.endswith('c') }}{{ 'abc'.startswith('a') }}",
+   "context": "{}",
+   "expected": "TrueTrue"
+  },
+  {
+   "id": "p01_print_none",
+   "template": "[{{ none }}]",
+   "context": "{}",
+   "expected": "[]"
+  },
+  {
+   "id": "p01b_print_null_content",
+   "template": "{% for m in messages %}[{{ m.content }}]{% endfor %}",
+   "context": "{\"messages\": [{\"content\": null, \"role\": \"assistant\"}]}",
+   "expected": "[]"
+  },
+  {
+   "id": "p02_print_list",
+   "template": "{{ ['a', 1] }}",
+   "context": "{}",
+   "expected": "['a', 1]"
+  },
+  {
+   "id": "p04_print_undefined",
+   "template": "[{{ u }}]",
+   "context": "{}",
+   "expected": "[]"
+  },
+  {
+   "id": "p05_print_numbers",
+   "template": "{{ true }}|{{ 1.5 }}|{{ 10000000000000000.0 }}|{{ 0.0001 }}|{{ 0.00001 }}",
+   "context": "{}",
+   "expected": "True|1.5|1e+16|0.0001|1e-05"
+  },
+  {
+   "id": "p07_tools_absent",
+   "template": "{{ tools is defined }}|{{ tools is none }}|{{ documents is defined }}",
+   "context": "{}",
+   "expected": "False|False|False"
+  },
+  {
+   "id": "p09_tojson_order",
+   "template": "{{ {'b':1,'a':2}|tojson }}",
+   "context": "{}",
+   "expected": "{\"b\": 1, \"a\": 2}"
+  },
+  {
+   "id": "p10_input_key_order",
+   "template": "{% for k in messages[0] %}{{ k }}{% endfor %}",
+   "context": "{\"messages\": [{\"z\": 1, \"a\": 2}]}",
+   "expected": "za"
+  },
+  {
+   "id": "p11_attr_on_none",
+   "template": "[{{ none.a }}]",
+   "context": "{}",
+   "expected": "[]"
+  },
+  {
+   "id": "p12_iter_undefined",
+   "template": "{% for x in u %}x{% endfor %}.",
+   "context": "{}",
+   "expected": "."
+  },
+  {
+   "id": "f71_tojson_floats",
+   "template": "{{ v|tojson }}|{{ v[0] }}|{{ v[1] }}|{{ v[2] }}",
+   "context": "{\"v\": [47.3769181, 1e-07, 1.0]}",
+   "expected": "[47.3769181, 1e-07, 1.0]|47.3769181|1e-07|1.0"
+  },
+  {
+   "id": "p13_print_nul",
+   "template": "[{{ s }}]",
+   "context": "{\"s\": \"a\\u0000b\"}",
+   "expected": "[a\u0000b]"
+  },
+  {
+   "id": "s32_namespace_attr_items",
+   "template": "{%- set ns = namespace(items=[]) -%}{%- for m in messages -%}{%- set ns.items = ns.items + [m.content] -%}{%- endfor -%}ITEMS={{ ns.items | join(\",\") }}",
+   "context": "{\"messages\": [{\"content\": \"hi\", \"role\": \"user\"}, {\"content\": \"there\", \"role\": \"assistant\"}]}",
+   "expected": "ITEMS=hi,there"
+  }
+ ]
+}

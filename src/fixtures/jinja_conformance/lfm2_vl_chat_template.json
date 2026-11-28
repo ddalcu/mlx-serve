@@ -1,0 +1,1340 @@
+{
+ "template": "lfm2_vl_chat_template",
+ "sha256": "6a8d45c22d0d1d8662fdbce62e970eab58825f0b8531a75a3574d88e9ea538f7",
+ "cases": [
+  {
+   "id": "simple/think_off",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "no_think"
+   },
+   "expected": "<bos><|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "simple/think_on",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "simple/defaults",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "<bos><|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "simple/effort_none",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "simple/effort_minimal",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "simple/effort_low",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "simple/effort_medium",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "simple/effort_high",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "simple/effort_xhigh",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "simple/effort_max",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "multi/think_off",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Why is the sky blue?"
+    },
+    {
+     "role": "assistant",
+     "content": "Rayleigh scattering.",
+     "reasoning_content": "Shorter wavelengths scatter more."
+    },
+    {
+     "role": "user",
+     "content": "And sunsets?"
+    },
+    {
+     "role": "assistant",
+     "content": "The light crosses more air."
+    },
+    {
+     "role": "user",
+     "content": "Thanks!"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "no_think"
+   },
+   "expected": "<bos><|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhy is the sky blue?<|im_end|>\n<|im_start|>assistant\nRayleigh scattering.<|im_end|>\n<|im_start|>user\nAnd sunsets?<|im_end|>\n<|im_start|>assistant\nThe light crosses more air.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "multi/think_on",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Why is the sky blue?"
+    },
+    {
+     "role": "assistant",
+     "content": "Rayleigh scattering.",
+     "reasoning_content": "Shorter wavelengths scatter more."
+    },
+    {
+     "role": "user",
+     "content": "And sunsets?"
+    },
+    {
+     "role": "assistant",
+     "content": "The light crosses more air."
+    },
+    {
+     "role": "user",
+     "content": "Thanks!"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhy is the sky blue?<|im_end|>\n<|im_start|>assistant\nRayleigh scattering.<|im_end|>\n<|im_start|>user\nAnd sunsets?<|im_end|>\n<|im_start|>assistant\nThe light crosses more air.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "multi/defaults",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Why is the sky blue?"
+    },
+    {
+     "role": "assistant",
+     "content": "Rayleigh scattering.",
+     "reasoning_content": "Shorter wavelengths scatter more."
+    },
+    {
+     "role": "user",
+     "content": "And sunsets?"
+    },
+    {
+     "role": "assistant",
+     "content": "The light crosses more air."
+    },
+    {
+     "role": "user",
+     "content": "Thanks!"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "<bos><|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhy is the sky blue?<|im_end|>\n<|im_start|>assistant\nRayleigh scattering.<|im_end|>\n<|im_start|>user\nAnd sunsets?<|im_end|>\n<|im_start|>assistant\nThe light crosses more air.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "tool_round/think_off",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nSunny, 22C\n</tool_response>"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "no_think"
+   },
+   "expected": "<bos><|im_start|>system\nYou are a helpful assistant.\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}}]<|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response><|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "tool_round/think_on",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nSunny, 22C\n</tool_response>"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>system\nYou are a helpful assistant.\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}}]<|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response><|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "tool_round/defaults",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nSunny, 22C\n</tool_response>"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "<bos><|im_start|>system\nYou are a helpful assistant.\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}}]<|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response><|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "tool_round/effort_none",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nSunny, 22C\n</tool_response>"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>system\nYou are a helpful assistant.\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}}]<|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response><|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "tool_round/effort_minimal",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nSunny, 22C\n</tool_response>"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>system\nYou are a helpful assistant.\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}}]<|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response><|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "tool_round/effort_low",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nSunny, 22C\n</tool_response>"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>system\nYou are a helpful assistant.\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}}]<|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response><|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "tool_round/effort_medium",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nSunny, 22C\n</tool_response>"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>system\nYou are a helpful assistant.\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}}]<|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response><|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "tool_round/effort_high",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nSunny, 22C\n</tool_response>"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>system\nYou are a helpful assistant.\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}}]<|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response><|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "tool_round/effort_xhigh",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nSunny, 22C\n</tool_response>"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>system\nYou are a helpful assistant.\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}}]<|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response><|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "tool_round/effort_max",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "call_1",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 3,
+         "lat": 47.3769181
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nSunny, 22C\n</tool_response>"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>system\nYou are a helpful assistant.\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}}]<|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>user\n<tool_response>\nSunny, 22C\n</tool_response><|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "parallel_tools/think_off",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris and Rome?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "Call_A",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      },
+      {
+       "type": "function",
+       "id": "call_a",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nRome: cloudy, 19C\n</tool_response>"
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nParis: sunny, 22C\n</tool_response>"
+    },
+    {
+     "role": "user",
+     "content": "Which is warmer?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "no_think"
+   },
+   "expected": "<bos><|im_start|>system\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}}]<|im_end|>\n<|im_start|>user\nWeather in Paris and Rome?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>user\n<tool_response>\nRome: cloudy, 19C\n</tool_response><|im_end|>\n<|im_start|>user\n<tool_response>\nParis: sunny, 22C\n</tool_response><|im_end|>\n<|im_start|>user\nWhich is warmer?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "parallel_tools/think_on",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris and Rome?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "Call_A",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      },
+      {
+       "type": "function",
+       "id": "call_a",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nRome: cloudy, 19C\n</tool_response>"
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nParis: sunny, 22C\n</tool_response>"
+    },
+    {
+     "role": "user",
+     "content": "Which is warmer?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>system\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}}]<|im_end|>\n<|im_start|>user\nWeather in Paris and Rome?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>user\n<tool_response>\nRome: cloudy, 19C\n</tool_response><|im_end|>\n<|im_start|>user\n<tool_response>\nParis: sunny, 22C\n</tool_response><|im_end|>\n<|im_start|>user\nWhich is warmer?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "parallel_tools/defaults",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris and Rome?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "id": "Call_A",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      },
+      {
+       "type": "function",
+       "id": "call_a",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nRome: cloudy, 19C\n</tool_response>"
+    },
+    {
+     "role": "user",
+     "content": "<tool_response>\nParis: sunny, 22C\n</tool_response>"
+    },
+    {
+     "role": "user",
+     "content": "Which is warmer?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        },
+        "lat": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "<bos><|im_start|>system\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\"}, \"lat\": {\"type\": \"number\"}}, \"required\": [\"city\"]}}}]<|im_end|>\n<|im_start|>user\nWeather in Paris and Rome?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>user\n<tool_response>\nRome: cloudy, 19C\n</tool_response><|im_end|>\n<|im_start|>user\n<tool_response>\nParis: sunny, 22C\n</tool_response><|im_end|>\n<|im_start|>user\nWhich is warmer?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "unicode/think_off",
+   "messages": [
+    {
+     "role": "system",
+     "content": "　Réponds brièvement. "
+    },
+    {
+     "role": "user",
+     "content": "　日本語で答えて 🙂 "
+    },
+    {
+     "role": "assistant",
+     "content": "はい どうぞ\u0000。"
+    },
+    {
+     "role": "user",
+     "content": "ok"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": false,
+    "reasoning_effort": "no_think"
+   },
+   "expected": "<bos><|im_start|>system\n　Réponds brièvement. <|im_end|>\n<|im_start|>user\n　日本語で答えて 🙂 <|im_end|>\n<|im_start|>assistant\nはい どうぞ\u0000。<|im_end|>\n<|im_start|>user\nok<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "unicode/think_on",
+   "messages": [
+    {
+     "role": "system",
+     "content": "　Réponds brièvement. "
+    },
+    {
+     "role": "user",
+     "content": "　日本語で答えて 🙂 "
+    },
+    {
+     "role": "assistant",
+     "content": "はい どうぞ\u0000。"
+    },
+    {
+     "role": "user",
+     "content": "ok"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "enable_thinking": true,
+    "reasoning_effort": "high"
+   },
+   "expected": "<bos><|im_start|>system\n　Réponds brièvement. <|im_end|>\n<|im_start|>user\n　日本語で答えて 🙂 <|im_end|>\n<|im_start|>assistant\nはい どうぞ\u0000。<|im_end|>\n<|im_start|>user\nok<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "id": "unicode/defaults",
+   "messages": [
+    {
+     "role": "system",
+     "content": "　Réponds brièvement. "
+    },
+    {
+     "role": "user",
+     "content": "　日本語で答えて 🙂 "
+    },
+    {
+     "role": "assistant",
+     "content": "はい どうぞ\u0000。"
+    },
+    {
+     "role": "user",
+     "content": "ok"
+    }
+   ],
+   "tools": null,
+   "extra": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+   },
+   "expected": "<bos><|im_start|>system\n　Réponds brièvement. <|im_end|>\n<|im_start|>user\n　日本語で答えて 🙂 <|im_end|>\n<|im_start|>assistant\nはい どうぞ\u0000。<|im_end|>\n<|im_start|>user\nok<|im_end|>\n<|im_start|>assistant\n"
+  }
+ ]
+}
