@@ -191,7 +191,7 @@ const opencode_reasoning =
 /// never sends max_tokens), so it carries the reserve, not the response cap.
 /// `compaction` (opencode2) scales its global buffer/keep to the pinned
 /// model's window: the defaults compact a 24k window before its first reply.
-pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, key: []const u8, entries: []const Entry, pin_model: ?[]const u8, compaction: bool) ![]u8 {
+pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, keyed: bool, entries: []const Entry, pin_model: ?[]const u8, compaction: bool) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"$schema\": \"https://opencode.ai/config.json\", ");
@@ -215,7 +215,8 @@ pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, key: []c
     try out.print(allocator,
         \\"provider": {{"mlx": {{"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {{"baseURL": "{s}/v1"
     , .{base_url});
-    if (key.len > 0) try out.print(allocator, ", \"apiKey\": {f}", .{std.json.fmt(key, .{})});
+    // The config rides the launch script, so it names the key (opencode substitutes `{env:…}`), never holds it.
+    if (keyed) try out.appendSlice(allocator, ", \"apiKey\": \"{env:" ++ key_env ++ "}\"");
     try out.appendSlice(allocator, "}, \"models\": {");
     for (entries, 0..) |e, i| {
         const name = try std.fmt.allocPrint(allocator, "{s} (mlx-serve)", .{e.id});
@@ -1292,7 +1293,7 @@ pub fn remoteScript(allocator: std.mem.Allocator, kind: AgentKind, base_url: []c
     }
     for (try configFiles(a, null, kind, base_url, "", model, budget, entries)) |f| try appendHeredoc(&out, a, f.path, f.data, f.merged);
 
-    const oc: ?OpenCodeLaunch = if (kind == .opencode2) .{ .config = try opencodeJson(a, base_url, "", entries, model, true), .bin = "$OC_BIN" } else null;
+    const oc: ?OpenCodeLaunch = if (kind == .opencode2) .{ .config = try opencodeJson(a, base_url, false, entries, model, true), .bin = "$OC_BIN" } else null;
     const run = try std.mem.concat(a, u8, &.{ if (kind == .opencode2) opencode2_bin_probe else "", try scriptFor(a, kind, base_url, false, model, budget, oc, &.{}) });
     try out.appendSlice(a, "login=$(command -v zsh || command -v bash || echo sh)\ns=");
     try appendQuoted(&out, a, run);
@@ -1309,6 +1310,17 @@ pub fn remoteScript(allocator: std.mem.Allocator, kind: AgentKind, base_url: []c
 }
 
 // ── Command entry ───────────────────────────────────────────────────────
+
+/// What `launch` hands its login shell: OpenCode's inline config, then the agent's script. It rides that
+/// shell's argv, so it only ever names the key (`scriptKey`, `{env:…}`).
+fn launchScript(allocator: std.mem.Allocator, kind: AgentKind, base_url: []const u8, key: []const u8, model: []const u8, budget: Budget, entries: []const Entry, oc_bin: []const u8, extras: []const []const u8) ![]u8 {
+    const oc_config: ?[]u8 = if (kind == .opencode or kind == .opencode2)
+        try opencodeJson(allocator, base_url, key.len > 0, entries, if (kind == .opencode2) model else null, kind == .opencode2)
+    else
+        null;
+    defer if (oc_config) |c| allocator.free(c);
+    return scriptFor(allocator, kind, base_url, key.len > 0, model, budget, if (oc_config) |config| .{ .config = config, .bin = oc_bin } else null, extras);
+}
 
 const LaunchArgs = struct {
     kind: AgentKind,
@@ -1526,13 +1538,7 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
         std.process.exit(1);
     };
 
-    const oc_config: ?[]u8 = if (oc_kind == .opencode or oc_kind == .opencode2)
-        try opencodeJson(allocator, base_url, key, models.entries, if (oc_kind == .opencode2) chosen.id else null, oc_kind == .opencode2)
-    else
-        null;
-    defer if (oc_config) |c| allocator.free(c);
-
-    const script = try scriptFor(allocator, oc_kind, base_url, key.len > 0, chosen.id, chosen.budget, if (oc_config) |config| .{ .config = config, .bin = oc_bin } else null, parsed.extras);
+    const script = try launchScript(allocator, oc_kind, base_url, key, chosen.id, chosen.budget, models.entries, oc_bin, parsed.extras);
     defer allocator.free(script);
 
     if (oc_kind == .opencode2) {
@@ -1677,7 +1683,7 @@ test "pi models.json and opencode config parse as JSON and stay single-quote-fre
     };
     const pi_json = try piModelsJson(t.allocator, "http://127.0.0.1:11234", "", &entries);
     defer t.allocator.free(pi_json);
-    const oc_json = try opencodeJson(t.allocator, "http://127.0.0.1:11234", "", &entries, "m1", true);
+    const oc_json = try opencodeJson(t.allocator, "http://127.0.0.1:11234", false, &entries, "m1", true);
     defer t.allocator.free(oc_json);
     for ([_][]const u8{ pi_json, oc_json }) |json| {
         const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
@@ -1817,7 +1823,7 @@ test "opencode config: limit.output is the compaction reserve, opencode2 gets a 
     const entries = [_]Entry{
         .{ .id = "m1", .budget = budgetForContext(24576), .vision = false, .loaded = true },
     };
-    const v1 = try opencodeJson(t.allocator, "http://127.0.0.1:11234", "", &entries, null, false);
+    const v1 = try opencodeJson(t.allocator, "http://127.0.0.1:11234", false, &entries, null, false);
     defer t.allocator.free(v1);
     const p1 = try std.json.parseFromSlice(std.json.Value, t.allocator, v1, .{});
     defer p1.deinit();
@@ -1830,7 +1836,7 @@ test "opencode config: limit.output is the compaction reserve, opencode2 gets a 
     try t.expectEqualStrings("none", m1.get("variants").?.object.get("none").?.object.get("reasoningEffort").?.string);
     try t.expectEqualStrings("high", m1.get("variants").?.object.get("high").?.object.get("reasoningEffort").?.string);
 
-    const v2 = try opencodeJson(t.allocator, "http://127.0.0.1:11234", "", &entries, "m1", true);
+    const v2 = try opencodeJson(t.allocator, "http://127.0.0.1:11234", false, &entries, "m1", true);
     defer t.allocator.free(v2);
     const p2 = try std.json.parseFromSlice(std.json.Value, t.allocator, v2, .{});
     defer p2.deinit();
@@ -2050,7 +2056,7 @@ test "opencode launch routing: the detected generation picks the script, config,
     const entries = [_]Entry{.{ .id = "m1", .budget = b, .vision = false, .loaded = true }};
     // A Homebrew migration under ONE command: a v1 install gets the inline
     // config + --model arm and nothing under the v2 config dir.
-    const v1_cfg = try opencodeJson(t.allocator, "http://x:1", "", &entries, null, false);
+    const v1_cfg = try opencodeJson(t.allocator, "http://x:1", false, &entries, null, false);
     defer t.allocator.free(v1_cfg);
     const before = try scriptFor(t.allocator, .opencode, "http://x:1", false, "m1", b, .{ .config = v1_cfg, .bin = "opencode" }, &.{});
     defer t.allocator.free(before);
@@ -2061,7 +2067,7 @@ test "opencode launch routing: the detected generation picks the script, config,
     // After the same `opencode` name upgrades to 2.x, the SAME launch routes
     // to the v2 arm: standalone invocation under the RESOLVED binary name,
     // the dedicated XDG dir, and the model pinned in the config.
-    const v2_cfg = try opencodeJson(t.allocator, "http://x:1", "", &entries, "m1", true);
+    const v2_cfg = try opencodeJson(t.allocator, "http://x:1", false, &entries, "m1", true);
     defer t.allocator.free(v2_cfg);
     const after = try scriptFor(t.allocator, .opencode2, "http://x:1", false, "m1", b, .{ .config = v2_cfg, .bin = "opencode" }, &.{});
     defer t.allocator.free(after);
@@ -2080,11 +2086,11 @@ test "opencode launch routing: the detected generation picks the script, config,
 
 test "opencodeJson pins the default model only when asked" {
     const entries = [_]Entry{.{ .id = "m1", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = false }};
-    const plain = try opencodeJson(t.allocator, "http://127.0.0.1:11234", "", &entries, null, false);
+    const plain = try opencodeJson(t.allocator, "http://127.0.0.1:11234", false, &entries, null, false);
     defer t.allocator.free(plain);
     try t.expect(std.mem.indexOf(u8, plain, "\"model\"") == null);
 
-    const pinned = try opencodeJson(t.allocator, "http://127.0.0.1:11234", "", &entries, "m1", true);
+    const pinned = try opencodeJson(t.allocator, "http://127.0.0.1:11234", false, &entries, "m1", true);
     defer t.allocator.free(pinned);
     try t.expect(std.mem.indexOf(u8, pinned, "\"model\": \"mlx/m1\"") != null);
 }
@@ -2146,7 +2152,7 @@ test "launch scripts point every agent at the skill and export MLX_SERVE_URL" {
     try t.expect(std.mem.indexOf(u8, claude, "claude --plugin-dir \"$HOME/.mlx-serve/claude/plugin\" --model m1") != null);
 
     const entries = [_]Entry{.{ .id = "m1", .budget = b, .vision = false, .loaded = true }};
-    const oc = try opencodeJson(t.allocator, "http://x:1", "", &entries, null, false);
+    const oc = try opencodeJson(t.allocator, "http://x:1", false, &entries, null, false);
     defer t.allocator.free(oc);
     try t.expect(std.mem.indexOf(u8, oc, "\"skills\": {\"paths\": [\"~/.mlx-serve/skills/mlx-serve\"]}") != null);
 }
@@ -2251,7 +2257,7 @@ test "a model id with shell or JSON bytes stays one value in the claude and open
     try t.expect(std.mem.indexOf(u8, claude, "export ANTHROPIC_DEFAULT_OPUS_MODEL='x'\\''\"$(touch p)'\n") != null);
     try t.expect(std.mem.indexOf(u8, claude, "export CLAUDE_CODE_SUBAGENT_MODEL='x'\\''\"$(touch p)'\n") != null);
 
-    const json = try opencodeJson(t.allocator, "http://h:1", "", &entries, id, true);
+    const json = try opencodeJson(t.allocator, "http://h:1", false, &entries, id, true);
     defer t.allocator.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
     defer parsed.deinit();
@@ -2348,11 +2354,13 @@ test "launch --api-key: no generated argv holds the key" {
     try t.expectEqualStrings("@-", keyed[keyed.len - 2]);
     const keyless = try curlArgv(a, &.{ "-fsS", "-m", "5" }, "http://x:1/v1/models", false);
     try t.expect(std.mem.indexOf(u8, keyless[keyless.len - 2], "@-") == null);
-    // The `-c` script the login shell runs holds no key for any agent: it can only name one.
+    // The `-c` script cmdLaunch hands the login shell, opencode's inline config included, holds no
+    // planted key for any agent.
+    const entries = [_]Entry{.{ .id = "m1", .budget = .{ .context = 65536, .output = 8192 }, .vision = false, .loaded = true }};
     for (std.enums.values(AgentKind)) |kind| {
-        const oc: ?OpenCodeLaunch = if (kind == .opencode or kind == .opencode2) .{ .config = try opencodeJson(a, "http://x:1", "", &.{}, null, false), .bin = "opencode" } else null;
-        const script = try scriptFor(a, kind, "http://x:1", true, "m1", .{ .context = 65536, .output = 8192 }, oc, &.{});
-        try t.expect(std.mem.indexOf(u8, script, key_env ++ "=") == null);
+        const script = try launchScript(a, kind, "http://x:1", nasty_key, "m1", entries[0].budget, &entries, "opencode", &.{});
+        try t.expect(std.mem.indexOf(u8, script, nasty_key) == null);
+        try t.expect(std.mem.indexOf(u8, script, "'b\"c") == null); // nor a fragment of it
     }
 }
 
@@ -2370,11 +2378,11 @@ test "launch --api-key: each config file holds the key in its own syntax" {
     const pi_v = try std.json.parseFromSlice(std.json.Value, a, pi, .{});
     defer pi_v.deinit();
     try t.expectEqualStrings(want_pi, jsonField(pi_v.value, &.{ "providers", "mlx", "apiKey" }).?.string);
-    const oc = try opencodeJson(a, "http://x:1", nasty_key, &entries, null, false);
+    const oc = try opencodeJson(a, "http://x:1", true, &entries, null, false);
     defer a.free(oc);
     const oc_v = try std.json.parseFromSlice(std.json.Value, a, oc, .{});
     defer oc_v.deinit();
-    try t.expectEqualStrings(nasty_key, jsonField(oc_v.value, &.{ "provider", "mlx", "options", "apiKey" }).?.string);
+    try t.expectEqualStrings("{env:MLX_SERVE_API_KEY}", jsonField(oc_v.value, &.{ "provider", "mlx", "options", "apiKey" }).?.string);
     const zc = try zcodeConfigJson(a, "http://x:1", nasty_key, "m1", &entries);
     defer a.free(zc);
     const zc_v = try std.json.parseFromSlice(std.json.Value, a, zc, .{});
