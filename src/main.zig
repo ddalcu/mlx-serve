@@ -1272,6 +1272,18 @@ pub fn main(init: std.process.Init) !void {
         model_dir = d;
         serve_mode = true;
     }
+    // The MLX plugin seam (FsPackDir) is absolute-only while the embedded GGUF
+    // engines take a relative path: resolve --model once so every engine serves
+    // the one name and a refusal names the absolute path it looked for.
+    var model_dir_abs: ?[]u8 = null;
+    defer if (model_dir_abs) |p| allocator.free(p);
+    if (model_dir.len > 0 and !std.fs.path.isAbsolute(model_dir)) {
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+        const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+        model_dir_abs = try cli_mod.absolutizeModelPath(allocator, cwd, model_dir);
+        model_dir = model_dir_abs.?;
+    }
     if (use_default_models_root) serve_mode = true;
     // Offline mode is one --prompt; without one, serving is the default (--serve stays accepted).
     if (prompt == null) serve_mode = true;
