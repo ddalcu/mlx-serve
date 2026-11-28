@@ -750,17 +750,15 @@ const PosixStore = struct {
     pub fn readPrompt(s: *PosixStore, prompt: []const u32, resumed: u32) void {
         s.mutex.lock();
         defer s.mutex.unlock();
-        s.add(prompt[@min(prompt.len, resumed) -| overlap ..]);
+        s.addPromptLocked(prompt, resumed);
     }
 
     /// A finished reply, after its prompt's last `overlap` ids so the keys across the join are found.
     pub fn readReply(s: *PosixStore, prompt: []const u32, reply: []const u32) void {
         if (reply.len == 0) return;
-        const seg = std.mem.concat(gpa, u32, &.{ prompt[prompt.len -| overlap ..], reply }) catch return;
-        defer gpa.free(seg);
         s.mutex.lock();
         defer s.mutex.unlock();
-        s.add(seg);
+        s.addReplyLocked(prompt, reply);
     }
 
     /// The worker's record of a finished request, atomically against a
@@ -771,12 +769,20 @@ const PosixStore = struct {
         s.mutex.lock();
         defer s.mutex.unlock();
         if (s.record_gen > gen) return false;
-        s.add(prompt[@min(prompt.len, 0) -| overlap ..]);
-        if (reply.len == 0) return true;
-        const seg = std.mem.concat(gpa, u32, &.{ prompt[prompt.len -| overlap ..], reply }) catch return true;
+        s.addPromptLocked(prompt, 0);
+        s.addReplyLocked(prompt, reply);
+        return true;
+    }
+
+    fn addPromptLocked(s: *PosixStore, prompt: []const u32, resumed: u32) void {
+        s.add(prompt[@min(prompt.len, resumed) -| overlap ..]);
+    }
+
+    fn addReplyLocked(s: *PosixStore, prompt: []const u32, reply: []const u32) void {
+        if (reply.len == 0) return;
+        const seg = std.mem.concat(gpa, u32, &.{ prompt[prompt.len -| overlap ..], reply }) catch return;
         defer gpa.free(seg);
         s.add(seg);
-        return true;
     }
 
     /// The runs of `seg` the record lacks, each with its overlaps (the caller holds the lock).
@@ -1297,7 +1303,7 @@ fn storeForIdentity(digest: [32]u8, vocab: u32) ?*Store {
         st_state.failures.put(gpa, digest, {}) catch {};
         return null;
     };
-    st.record_gen = worker_state.get().generation;
+    st.record_gen = worker_state.get().generation.load(.acquire);
     st_state.stores.put(gpa, digest, st) catch {
         st.close();
         return null;
@@ -1378,7 +1384,7 @@ const WorkerState = struct {
     /// Bumped by every DELETE (`emptyAll`); stores carry the generation
     /// they were last emptied under, so a job popped before a DELETE never
     /// writes into the record it emptied.
-    generation: u64 = 0,
+    generation: std.atomic.Value(u64) = .init(0),
 };
 pub const worker_state = shared_util.Shared(WorkerState, "recall_worker", .{});
 
@@ -1397,7 +1403,7 @@ fn workerLoop(io_foreign: std.Io) void {
             defer w.mutex.unlock(io);
             while (w.queue.items.len == 0) w.cond.waitUncancelable(io, &w.mutex);
             job = w.queue.orderedRemove(0);
-            job.?.gen = w.generation;
+            job.?.gen = w.generation.load(.acquire);
             w.queued_ids -= job.?.prompt.len + job.?.reply.len;
         }
         if (job) |j| {
@@ -1508,8 +1514,7 @@ pub fn emptyAll(a: Allocator) struct { rows: []EmptyRow, all_failed: bool } {
         for (w.queue.items) |j| freeJob(j);
         w.queue.clearRetainingCapacity();
         w.queued_ids = 0;
-        w.generation += 1;
-        emptied_gen = w.generation;
+        emptied_gen = w.generation.fetchAdd(1, .acq_rel) + 1;
     }
     const st_state = shared_state.get();
     var rows: std.ArrayList(EmptyRow) = .empty;
@@ -1931,8 +1936,8 @@ test "worker: a job popped before a DELETE never writes into the emptied record"
     defer st.close();
 
     // The store was opened at the current generation.
-    const w = worker_state.get();
-    try testing.expectEqual(w.generation, st.record_gen);
+    const gen = worker_state.get().generation.load(.acquire);
+    try testing.expectEqual(gen, st.record_gen);
 
     var prompt: [160]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = @intCast(3000 + i);
@@ -1940,14 +1945,14 @@ test "worker: a job popped before a DELETE never writes into the emptied record"
     for (&reply, 0..) |*t, i| t.* = @intCast(7000 + i);
 
     // A job popped under generation G writes when the store has not moved...
-    try testing.expect(st.writeQueued(&prompt, &reply, w.generation));
+    try testing.expect(st.writeQueued(&prompt, &reply, gen));
     try testing.expect(st.stats().ids > 0);
     // ...and is dropped when a DELETE stamped a newer generation.
-    try st.empty(w.generation + 1);
-    try testing.expect(!st.writeQueued(&prompt, &reply, w.generation));
+    try st.empty(gen + 1);
+    try testing.expect(!st.writeQueued(&prompt, &reply, gen));
     try testing.expectEqual(@as(u64, 0), st.stats().ids);
     // A job popped after the empty (the new generation) writes again.
-    try testing.expect(st.writeQueued(&prompt, &reply, w.generation + 1));
+    try testing.expect(st.writeQueued(&prompt, &reply, gen + 1));
     try testing.expect(st.stats().ids > 0);
 }
 
