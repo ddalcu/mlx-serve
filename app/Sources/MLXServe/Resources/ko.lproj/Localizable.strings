@@ -2170,7 +2170,7 @@
 "Save the server log to ~/.mlx-serve/logs so you can check it after a crash." = "서버 로그를 ~/.mlx-serve/logs에 저장해 충돌 후에 확인할 수 있게 합니다.";
 "How long one request may run, in seconds; 0 means no limit." = "요청 하나가 실행될 수 있는 시간(초)이며, 0은 제한이 없습니다.";
 "Show live speed and memory charts on the server's web page." = "서버 웹 페이지에 실시간 속도와 메모리 그래프를 보여 줍니다.";
-"A key other devices must send to use this server; this Mac never needs it." = "다른 기기가 이 서버를 쓰려면 보내야 하는 키이며, 이 Mac에는 필요 없습니다.";
+"A key other devices must send to use this server; this Mac is exempt unless the switch below is on." = "다른 기기가 이 서버를 쓰려면 보내야 하는 키이며, 아래 스위치를 켜지 않으면 이 Mac에는 필요 없습니다.";
 "Let other Macs on your network use the models you share." = "네트워크의 다른 Mac이 내가 공유한 모델을 쓰게 합니다.";
 "Share every model, or turn off to choose which ones." = "모든 모델을 공유하며, 끄면 공유할 모델을 고를 수 있습니다.";
 "The name other Macs see; leave blank to use this Mac's name." = "다른 Mac에 보이는 이름이며, 비워 두면 이 Mac의 이름을 씁니다.";
@@ -2495,3 +2495,6 @@
 "Guidance (CFG)" = "가이던스 (CFG)";
 "How closely the song follows the style tags. Higher is stricter, lower sounds more natural. Default 3." = "곡이 스타일 태그를 얼마나 충실히 따를지 정합니다. 높을수록 엄격하고, 낮을수록 더 자연스럽게 들립니다. 기본값 3.";
 "Lower plays it safe, higher takes more chances. Default 1." = "낮을수록 안정적이고, 높을수록 더 과감해집니다. 기본값 1.";
+"Require the key on this Mac too" = "이 Mac에서도 키 요구";
+"Apps on this Mac must send the key as well; this app and the coding agents it launches send it for you." = "이 Mac의 앱도 키를 보내야 합니다. 이 앱과 이 앱이 실행하는 코딩 에이전트는 자동으로 키를 보냅니다.";
+"%@ can't send this server's API key; turn off \"Require the key on this Mac too\" and restart the server" = "%@은(는) 이 서버의 API 키를 보낼 수 없습니다. \"이 Mac에서도 키 요구\"를 끄고 서버를 다시 시작하세요";

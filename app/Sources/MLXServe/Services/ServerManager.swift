@@ -221,6 +221,7 @@ class ServerManager: ObservableObject {
         }
         port = options.port
         api.host = options.host
+        APIClient.localKey = options.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         status = .starting
         lastError = ""
         clearServerLog()

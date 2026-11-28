@@ -311,6 +311,7 @@ pub const vars = struct {
     pub const MLX_PTX_CACHE_DIR: Var = .{ .kind = .public, .type = .text, .default = "$TMPDIR/mlx/<mlx stamp>/ptx", .owner = "mlx", .since = "26.10.3", .doc = "MLX's CUDA PTX cache; exported per MLX build when unset" };
     pub const MLX_SERVE_ANE_CACHE_CAP_GB: Var = .{ .kind = .public, .type = .int, .default = "40", .owner = "engines/ane", .since = "26.10.3", .doc = "ANE compile cache cap, GB (read by lib/ane)" };
     pub const MLX_SERVE_ANE_CACHE_DIR: Var = .{ .kind = .public, .type = .text, .default = "~/.mlx-serve/ane-cache", .owner = "engines/ane", .since = "26.10.3", .doc = "ANE compile cache root (read by lib/ane)" };
+    pub const MLX_SERVE_API_KEY: Var = .{ .kind = .public, .type = .text, .default = "unset (keyless)", .owner = "host/launch", .since = "26.11.5", .doc = "the server's --api-key for `launch`: sent on its model list and written into the agent's config" };
     pub const MLX_SERVE_CACHE_LIMIT: Var = .{ .kind = .public, .type = .text, .default = "by RAM", .owner = "mlx", .since = "26.7.12", .doc = "MLX allocator cache cap" };
     pub const MLX_SERVE_DIAG: Var = .{ .kind = .public, .type = .text, .default = "unset", .owner = ".", .since = "-", .doc = "comma list of diag tokens (`step-trace`, `decode-graph-dump=/path`): arms each diag variable by name" };
     pub const MLX_SERVE_DSV4_DSPARK: Var = .{ .kind = .public, .type = .flag, .default = "on (drafting; --dspark sets 1 to load the stages)", .owner = "engines/mlx/spec", .since = "26.7.12", .doc = "DeepSeek-V4 DSpark drafting (=0 off)" };

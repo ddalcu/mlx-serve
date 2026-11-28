@@ -371,7 +371,7 @@ final class VoiceCloneTTS {
             }
             guard let json = VoiceCloneTTS.warmBody(model: loadedModelId ?? dir, voice: sel) else { return }
             api.host = server.api.host
-            var req = URLRequest(url: api.serverURL(port: port, path: "/v1/audio/speech"))
+            var req = APIClient.request(api.serverURL(port: port, path: "/v1/audio/speech"))
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try? JSONSerialization.data(withJSONObject: json)

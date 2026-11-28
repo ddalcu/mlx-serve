@@ -2170,6 +2170,18 @@ private struct ServerSectionContent: View {
                 .frame(width: 180).font(.app(.body))
             }
         }
+        if let m = meta["apiKeyStrict"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.apiKeyStrict)
+            ) {
+                Toggle("", isOn: $appState.serverOptions.apiKeyStrict)
+                    .labelsHidden()
+                    .toggleStyle(.switch).font(.app(.body))
+                    .disabled(appState.serverOptions.apiKey.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
         if let m = meta["toolAutocorrect"] {
             SettingsRow(
                 title: m.title,

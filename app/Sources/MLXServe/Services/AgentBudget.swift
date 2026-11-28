@@ -109,7 +109,7 @@ enum AgentConfigs {
             "mlx": {
               "baseUrl": "\(baseURL)/v1",
               "api": "openai-completions",
-              "apiKey": "\(apiKey)",
+              "apiKey": \(quoted(piLiteral(apiKey))),
               "compat": {
                 "supportsDeveloperRole": false,
                 "supportsReasoningEffort": true,
@@ -173,7 +173,7 @@ enum AgentConfigs {
         """
         // written by mlx-serve — live model list for the `mlx` provider.
         // Regenerated at each launch; edits here are overwritten.
-        const API_KEY = "\(apiKey)";
+        const API_KEY = \(quoted(apiKey));
         const FALLBACK_BUDGET = { context: \(AgentBudget.fallback.context), output: \(AgentBudget.fallback.output) };
         const COMPAT = {
           supportsDeveloperRole: false,
@@ -227,7 +227,7 @@ enum AgentConfigs {
           pi.registerProvider("mlx", {
             name: "MLX Serve (local)",
             baseUrl: "\(baseURL)/v1",
-            apiKey: API_KEY,
+            apiKey: \(quoted(piLiteral(apiKey))),
             api: "openai-completions",
             models,
             refreshModels: async () => {
@@ -260,7 +260,7 @@ enum AgentConfigs {
 
     static func opencodeJSON(baseURL: String, defaultModel: String,
                              entries: [AgentModelEntry], pinModel: Bool = false,
-                             compaction: Bool = false) -> String {
+                             compaction: Bool = false, apiKey: String = "") -> String {
         var list = entries
         if !list.contains(where: { $0.id == defaultModel }) {
             list.insert(AgentModelEntry(id: defaultModel, budget: AgentBudget.fallback,
@@ -272,6 +272,7 @@ enum AgentConfigs {
                 + "\"limit\": { \"context\": \(e.budget.context), \"output\": \(e.budget.compactionReserve) }, "
                 + opencodeReasoning + " }"
         }.joined(separator: ",\n        ")
+        let key = apiKey.isEmpty ? "" : ", \"apiKey\": \(quoted(apiKey))"
         let pinned = pinModel ? "\n  \"model\": \"mlx/\(defaultModel)\"," : ""
         var compactionBlock = ""
         if compaction {
@@ -286,7 +287,7 @@ enum AgentConfigs {
             "mlx": {
               "npm": "@ai-sdk/openai-compatible",
               "name": "MLX Serve (local)",
-              "options": { "baseURL": "\(baseURL)/v1" },
+              "options": { "baseURL": "\(baseURL)/v1"\(key) },
               "models": {
                 \(models)
               }
@@ -298,9 +299,10 @@ enum AgentConfigs {
 
     /// Single-model convenience — the MAS instructions panel's shape (a user
     /// typing a config by hand gets the minimal one).
-    static func opencodeJSON(baseURL: String, model: String, budget: AgentBudget.Budget) -> String {
+    static func opencodeJSON(baseURL: String, model: String, budget: AgentBudget.Budget,
+                             apiKey: String = "") -> String {
         opencodeJSON(baseURL: baseURL, defaultModel: model,
-                     entries: [AgentModelEntry(id: model, budget: budget, vision: false)])
+                     entries: [AgentModelEntry(id: model, budget: budget, vision: false)], apiKey: apiKey)
     }
 
     static func isLoopbackBaseURL(_ url: String) -> Bool {
@@ -401,7 +403,7 @@ enum AgentConfigs {
     /// the word onto the model's own vocabulary. Twin of launch.zig `ompModelsYml`.
     static func ompModelsYML(baseURL: String, defaultModel: String,
                              entries: [AgentModelEntry],
-                             apiKey: String = "mlx-serve") -> String {
+                             keyed: Bool = false) -> String {
         var list = entries
         if !list.contains(where: { $0.id == defaultModel }) {
             list.insert(AgentModelEntry(id: defaultModel, budget: AgentBudget.fallback,
@@ -432,7 +434,7 @@ enum AgentConfigs {
           mlx:
             baseUrl: \(baseURL)/v1
             api: openai-completions
-            apiKey: \(apiKey)
+            apiKey: \(keyed ? keyEnv : "mlx-serve")
             compat:
               supportsDeveloperRole: false
               supportsReasoningEffort: true
@@ -446,23 +448,47 @@ enum AgentConfigs {
 
     /// Single-model convenience — the MAS instructions panel's shape.
     static func ompModelsYML(baseURL: String, model: String,
-                             budget: AgentBudget.Budget) -> String {
+                             budget: AgentBudget.Budget, keyed: Bool = false) -> String {
         ompModelsYML(baseURL: baseURL, defaultModel: model,
-                     entries: [AgentModelEntry(id: model, budget: budget, vision: false)])
+                     entries: [AgentModelEntry(id: model, budget: budget, vision: false)], keyed: keyed)
     }
 
     /// A model-derived arg, quoted only when needed so plain ids keep the exact
     /// script bytes (twin of launch.zig `appendModelArg`).
     static func shellArg(_ s: String) -> String {
+        isPlain(s) ? s : CLIInstaller.shellQuote(s)
+    }
+
+    private static func isPlain(_ s: String) -> Bool {
         let safe = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_/+:@=")
-        return !s.isEmpty && s.unicodeScalars.allSatisfy(safe.contains) ? s : CLIInstaller.shellQuote(s)
+        return !s.isEmpty && s.unicodeScalars.allSatisfy(safe.contains)
+    }
+
+    /// The env var a keyed launch exports the server's key in, for agents that read it by name (codex, omp).
+    static let keyEnv = "MLX_SERVE_API_KEY"
+
+    /// The line a keyed launch script starts with; empty without a key.
+    static func keyExport(_ key: String) -> String {
+        key.isEmpty ? "" : "export \(keyEnv)=\(shellArg(key))\n"
+    }
+
+    /// A JSON string literal, which is also a valid JS string, TOML basic string and YAML double-quoted scalar.
+    static func quoted(_ s: String) -> String {
+        let data = try? JSONSerialization.data(withJSONObject: s, options: [.fragmentsAllowed, .withoutEscapingSlashes])
+        return data.flatMap { String(data: $0, encoding: .utf8) } ?? "\"\""
+    }
+
+    /// pi reads a key as a template: a leading `!` runs a command and `$NAME` reads the env; `$$` and `$!` escape them.
+    static func piLiteral(_ key: String) -> String {
+        let s = key.replacingOccurrences(of: "$", with: "$$")
+        return s.hasPrefix("!") ? "$" + s : s
     }
 
     /// codex launch-line overrides, merged over the user's own config.toml so
     /// nothing is written into their Codex home. Responses wire API only;
-    /// keyless (no `env_key`). Twin of launch.zig `codexConfigOverrides`.
+    /// keyless unless `keyed` (then `env_key` names `keyEnv`). Twin of launch.zig `codexConfigOverrides`.
     static func codexConfigArgs(baseURL: String, model: String,
-                                budget: AgentBudget.Budget) -> String {
+                                budget: AgentBudget.Budget, keyed: Bool = false) -> String {
         func opt(_ key: String, _ value: String) -> String {
             let toml = value.replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"")
@@ -473,6 +499,7 @@ enum AgentConfigs {
         args += [opt("model_providers.mlx.name", "MLX Serve (local)"),
                  opt("model_providers.mlx.base_url", "\(baseURL)/v1"),
                  opt("model_providers.mlx.wire_api", "responses")]
+        if keyed { args.append(opt("model_providers.mlx.env_key", keyEnv)) }
         return args.joined(separator: " ")
     }
 
@@ -597,7 +624,7 @@ enum AgentConfigs {
     /// server's default model, so they are pinned to the launched one. The
     /// served model is force-included. Twin of Zig `launch.grokConfigToml`.
     static func grokConfigTOML(baseURL: String, model: String, budget: AgentBudget.Budget,
-                               entries: [AgentModelEntry]) -> String {
+                               entries: [AgentModelEntry], apiKey: String = "mlx-serve") -> String {
         var list = entries
         if !list.contains(where: { $0.id == model }) {
             list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
@@ -609,7 +636,7 @@ enum AgentConfigs {
             model = "\(e.id)"
             base_url = "\(baseURL)/v1"
             name = "\(e.id) (mlx-serve)"
-            api_key = "mlx-serve"
+            api_key = \(quoted(apiKey))
             context_window = \(e.budget.context)
             max_completion_tokens = \(e.budget.output)
             supports_reasoning_effort = true
@@ -633,7 +660,7 @@ enum AgentConfigs {
     /// one rule per chat model so ZCode never guesses limits from the id.
     /// The served model is force-included.
     static func zcodeProviderJSON(baseURL: String, model: String, budget: AgentBudget.Budget,
-                                  entries: [AgentModelEntry]) -> String {
+                                  entries: [AgentModelEntry], apiKey: String = "mlx-serve") -> String {
         var list = entries
         if !list.contains(where: { $0.id == model }) {
             list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
@@ -664,7 +691,7 @@ enum AgentConfigs {
             "providerConfigRules": ["providerRules": [[
                 "providerId": "mlx", "providerName": "mlx-serve", "enabled": true,
                 "config": ["group": "standard-personal",
-                           "access": ["type": "api-key", "apiKey": "mlx-serve"],
+                           "access": ["type": "api-key", "apiKey": apiKey],
                            "api": ["type": "openai-chat-completions", "baseUrl": "\(baseURL)/v1"],
                            "personalModelIds": list.map(\.id)],
             ]]],
@@ -691,8 +718,13 @@ enum AgentConfigs {
         # written by mlx-serve — OPENAI_BASE_URL marks a provider as configured,
         # which is what keeps the first-run setup wizard out of the session.
         OPENAI_BASE_URL=\(baseURL)/v1
-        OPENAI_API_KEY=\(apiKey)
+        OPENAI_API_KEY=\(dotenvValue(apiKey))
         """
+    }
+
+    /// python-dotenv expands `${VAR}` unless the value is single-quoted, and a single-quoted value cannot hold `'`.
+    static func dotenvValue(_ s: String) -> String {
+        isPlain(s) ? s : s.contains("'") ? quoted(s) : "'\(s)'"
     }
 
     /// hermes `config.yaml` — mirrors EXACTLY what `hermes setup`'s
@@ -720,12 +752,12 @@ enum AgentConfigs {
           default: "\(model)"
           provider: custom
           base_url: "\(baseURL)/v1"
-          api_key: "\(apiKey)"
+          api_key: \(quoted(apiKey))
           api_mode: chat_completions
         custom_providers:
           - name: mlx-serve
             base_url: "\(baseURL)/v1"
-            api_key: "\(apiKey)"
+            api_key: \(quoted(apiKey))
             model: "\(model)"
             api_mode: chat_completions
             models:
@@ -735,7 +767,8 @@ enum AgentConfigs {
 
     /// Env exports for the Claude Code launch script (no trailing newline).
     /// Twin of Zig `launch.scriptFor(.claude, …)` — change both together.
-    static func claudeCodeExports(baseURL: String, model: String, budget: AgentBudget.Budget) -> String {
+    static func claudeCodeExports(baseURL: String, model: String, budget: AgentBudget.Budget,
+                                  apiKey: String = "mlx-serve") -> String {
         // A model outside Claude Code's own catalog is assumed to hold 200k and
         // auto-compacted there; CLAUDE_CODE_MAX_CONTEXT_TOKENS is the documented
         // override. Declared VERBATIM like every other agent's context field —
@@ -745,7 +778,7 @@ enum AgentConfigs {
         return """
         export ANTHROPIC_BASE_URL='\(baseURL)'
         export ANTHROPIC_API_KEY=
-        export ANTHROPIC_AUTH_TOKEN=mlx-serve
+        export ANTHROPIC_AUTH_TOKEN=\(shellArg(apiKey))
         export CLAUDE_CODE_ATTRIBUTION_HEADER=0
         export ANTHROPIC_DEFAULT_OPUS_MODEL=\(model)
         export ANTHROPIC_DEFAULT_SONNET_MODEL=\(model)

@@ -77,6 +77,8 @@ enum BenchmarkCLI {
 
     @MainActor
     static func run(_ options: Options) async -> Int32 {
+        // The app's server is the one this benches; its key is the app's saved one.
+        APIClient.localKey = ServerOptions.load().apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let models = await listModels(port: options.port) else {
             warn("nothing answered on 127.0.0.1:\(options.port)")
             return 1
@@ -112,7 +114,7 @@ enum BenchmarkCLI {
     /// connectivity, so a port with nothing on it would hang the shell instead of failing.
     private static func listModels(port: UInt16) async -> [ModelInfo]? {
         guard let url = URL(string: "http://127.0.0.1:\(port)/v1/models") else { return nil }
-        var request = URLRequest(url: url)
+        var request = APIClient.request(url)
         request.timeoutInterval = 10
         guard let (data, _) = try? await URLSession.shared.data(for: request),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

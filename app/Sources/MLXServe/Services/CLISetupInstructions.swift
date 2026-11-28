@@ -21,8 +21,11 @@ enum CLISetupInstructions {
     }
 
     /// Same CLIs, same order as the DMG launcher dropdown.
+    /// `apiKey` is the running server's launch key, "" for none.
     static func tabs(baseURL: String, servedModelId: String,
-                     budget: AgentBudget.Budget) -> [Tab] {
+                     budget: AgentBudget.Budget, apiKey: String = "") -> [Tab] {
+        let agentKey = apiKey.isEmpty ? "mlx-serve" : apiKey
+        let keyExport = AgentConfigs.keyExport(apiKey)
         let fxSettings = AgentConfigs.fxSettingsJSON(
             existing: "{}", baseURL: baseURL,
             entries: [AgentModelEntry(id: servedModelId, budget: budget, vision: false)]) ?? ""
@@ -31,7 +34,7 @@ enum CLISetupInstructions {
                 title: "Claude Code",
                 installHint: "Requires the claude CLI: npm install -g @anthropic-ai/claude-code",
                 command: """
-                \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: servedModelId, budget: budget))
+                \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: servedModelId, budget: budget, apiKey: agentKey))
                 claude --model \(AgentConfigs.shellArg(servedModelId))
                 """),
             // pi has no env-var/flag route for a custom base URL (a models.json
@@ -44,7 +47,7 @@ enum CLISetupInstructions {
                 command: """
                 mkdir -p ~/.mlx-serve/pi
                 cat > ~/.mlx-serve/pi/models.json <<'EOF'
-                \(AgentConfigs.piModelsJSON(baseURL: baseURL, model: servedModelId, budget: budget))
+                \(AgentConfigs.piModelsJSON(baseURL: baseURL, model: servedModelId, budget: budget, apiKey: agentKey))
                 EOF
                 export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/pi"
                 pi --provider mlx --model \(AgentConfigs.shellArg(servedModelId))
@@ -57,9 +60,9 @@ enum CLISetupInstructions {
                 title: "oh-my-pi",
                 installHint: "Requires the omp CLI: curl -fsSL https://omp.sh/install | sh",
                 command: """
-                mkdir -p ~/.mlx-serve/omp
+                \(keyExport)mkdir -p ~/.mlx-serve/omp
                 cat > ~/.mlx-serve/omp/models.yml <<'EOF'
-                \(AgentConfigs.ompModelsYML(baseURL: baseURL, model: servedModelId, budget: budget))
+                \(AgentConfigs.ompModelsYML(baseURL: baseURL, model: servedModelId, budget: budget, keyed: !apiKey.isEmpty))
                 EOF
                 export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
                 export OMP_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
@@ -75,7 +78,7 @@ enum CLISetupInstructions {
                 # OpenCode 1.x (the v1 integration). OpenCode 2.x+ ships under the
                 # same name — `mlx-serve launch opencode` detects the version and
                 # routes itself; this block is the manual v1 setup.
-                export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, model: servedModelId, budget: budget))'
+                export OPENCODE_CONFIG_CONTENT=\(CLIInstaller.shellQuote(AgentConfigs.opencodeJSON(baseURL: baseURL, model: servedModelId, budget: budget, apiKey: apiKey)))
                 opencode --model \(AgentConfigs.shellArg("mlx/" + servedModelId))
                 """),
             Tab(id: "opencode2",
@@ -89,10 +92,10 @@ enum CLISetupInstructions {
                 mkdir -p ~/.mlx-serve/opencode2/opencode/plugins
                 [ -d ~/.mlx-serve/opencode2/opencode/plugins/mlx-serve ] || git clone https://github.com/beamivalice/opencode2-mlx-serve ~/.mlx-serve/opencode2/opencode/plugins/mlx-serve
                 cat > ~/.mlx-serve/opencode2/opencode/cli.json <<'EOF'
-                \(AgentConfigs.opencode2CliJSON(existing: "{}", baseURL: baseURL))
+                \(AgentConfigs.opencode2CliJSON(existing: "{}", baseURL: baseURL, apiKey: apiKey))
                 EOF
                 export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
-                export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: servedModelId, entries: [AgentModelEntry(id: servedModelId, budget: budget, vision: false)], pinModel: true, compaction: true))'
+                export OPENCODE_CONFIG_CONTENT=\(CLIInstaller.shellQuote(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: servedModelId, entries: [AgentModelEntry(id: servedModelId, budget: budget, vision: false)], pinModel: true, compaction: true, apiKey: apiKey)))
                 \(opencodeV2BinResolver)
                 """),
             // codex settings ride `-c` overrides; nothing is written into their Codex
@@ -102,8 +105,8 @@ enum CLISetupInstructions {
                 title: "Codex",
                 installHint: "Requires the codex CLI (npm install -g @openai/codex) or the ChatGPT desktop app, which bundles it",
                 command: """
-                \(AgentConfigs.codexInstructionsSetup() ?? "")\(AgentConfigs.codexBinResolver)
-                \(AgentConfigs.codexLaunchGate(args: AgentConfigs.codexConfigArgs(baseURL: baseURL, model: servedModelId, budget: budget)))
+                \(keyExport)\(AgentConfigs.codexInstructionsSetup() ?? "")\(AgentConfigs.codexBinResolver)
+                \(AgentConfigs.codexLaunchGate(args: AgentConfigs.codexConfigArgs(baseURL: baseURL, model: servedModelId, budget: budget, keyed: !apiKey.isEmpty)))
                 codex_launch
                 """),
             // hermes reads its whole tree from HERMES_HOME; the .env is the
@@ -114,11 +117,11 @@ enum CLISetupInstructions {
                 command: """
                 mkdir -p ~/.mlx-serve/hermes
                 cat > ~/.mlx-serve/hermes/config.yaml <<'EOF'
-                \(AgentConfigs.hermesConfigYAML(baseURL: baseURL, apiKey: "mlx-serve",
+                \(AgentConfigs.hermesConfigYAML(baseURL: baseURL, apiKey: agentKey,
                                                 model: servedModelId, budget: budget, entries: []))
                 EOF
                 cat > ~/.mlx-serve/hermes/.env <<'ENVEOF'
-                \(AgentConfigs.hermesEnvFile(baseURL: baseURL))
+                \(AgentConfigs.hermesEnvFile(baseURL: baseURL, apiKey: agentKey))
                 ENVEOF
                 export HERMES_HOME="$HOME/.mlx-serve/hermes"
                 hermes
@@ -134,7 +137,7 @@ enum CLISetupInstructions {
                 \(AgentConfigs.aiderModelMetadataJSON(model: servedModelId, budget: budget, entries: []))
                 EOF
                 export OPENAI_API_BASE='\(baseURL)/v1'
-                export OPENAI_API_KEY=mlx-serve
+                export OPENAI_API_KEY=\(AgentConfigs.shellArg(agentKey))
                 aider --model \(AgentConfigs.shellArg("openai/" + servedModelId)) --weak-model \(AgentConfigs.shellArg("openai/" + servedModelId)) --model-metadata-file ~/.mlx-serve/aider/model-metadata.json
                 """),
             // fx reads providers only from ~/.fx/settings.json; a shell block
@@ -164,7 +167,7 @@ enum CLISetupInstructions {
                 command: """
                 mkdir -p ~/.mlx-serve/grok
                 cat > ~/.mlx-serve/grok/config.toml <<'EOF'
-                \(AgentConfigs.grokConfigTOML(baseURL: baseURL, model: servedModelId, budget: budget, entries: []))
+                \(AgentConfigs.grokConfigTOML(baseURL: baseURL, model: servedModelId, budget: budget, entries: [], apiKey: agentKey))
                 EOF
                 export GROK_HOME="$HOME/.mlx-serve/grok"
                 grok
@@ -175,7 +178,7 @@ enum CLISetupInstructions {
                 command: """
                 mkdir -p ~/.mlx-serve/zcode
                 cat > ~/.mlx-serve/zcode/provider_config.json <<'EOF'
-                \(AgentConfigs.zcodeProviderJSON(baseURL: baseURL, model: servedModelId, budget: budget, entries: []))
+                \(AgentConfigs.zcodeProviderJSON(baseURL: baseURL, model: servedModelId, budget: budget, entries: [], apiKey: agentKey))
                 EOF
                 \(AgentConfigs.zcodeExports)
                 zcode
@@ -219,7 +222,8 @@ struct CLISetupInstructionsButton: View {
                 tabs: CLISetupInstructions.tabs(
                     baseURL: baseURL,
                     servedModelId: servedModelId,
-                    budget: serverBudget ?? AgentBudget.fallback))
+                    budget: serverBudget ?? AgentBudget.fallback,
+                    apiKey: APIClient.localKey))
         }
     }
 }
