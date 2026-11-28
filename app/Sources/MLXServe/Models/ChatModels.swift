@@ -325,6 +325,7 @@ struct ChatVideo: Identifiable, Codable, Equatable {
 }
 
 struct ChatMessage: Identifiable, Codable, Equatable {
+    var contextCheckpoint: ContextCheckpoint? = nil
     let id: UUID
     var role: Role
     var content: String
@@ -374,6 +375,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     /// reader keep reading `content` and never learn this field exists.
     var revisions: [MessageRevision] = []
     var activeRevision: Int = 0
+    var isLegacyFailure: Bool { role == .assistant && content.contains("couldn't generate a response") }
 
     enum Role: String, Codable {
         case system, user, assistant
@@ -393,6 +395,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case id, role, content, reasoningContent, isStreaming, timestamp
+        case contextCheckpoint
         case agentPlan, toolResults, isAgentSummary
         case promptTokens, completionTokens, tokensPerSecond, thinkingSeconds
         case toolCallId, toolName, toolCalls, images, videos, audio, failedRetry, processHandles
@@ -403,6 +406,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(UUID.self, forKey: .id)
         role = try c.decode(Role.self, forKey: .role)
+        contextCheckpoint = try c.decodeIfPresent(ContextCheckpoint.self, forKey: .contextCheckpoint)
         content = try c.decode(String.self, forKey: .content)
         reasoningContent = try c.decodeIfPresent(String.self, forKey: .reasoningContent)
         isStreaming = try c.decode(Bool.self, forKey: .isStreaming)
