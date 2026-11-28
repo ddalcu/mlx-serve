@@ -208,8 +208,6 @@ def quantize(weights: dict, bits: int, plan=(), overrides=None, ends=None) -> di
 def config_for(src: dict, bits: int, overrides: dict) -> dict:
     cfg = {k: v for k, v in src.items() if k not in ("dtype", "quantization_config")}
     cfg["text_config"] = {k: v for k, v in src["text_config"].items() if k != "model_type"}
-    if "vision_config" in src:
-        cfg["vision_config"] = {k: v for k, v in src["vision_config"].items() if k not in ("model_type", "text_hidden_size")}
     if bits < 16 or overrides:
         block = {"group_size": GROUP_SIZE, "bits": bits if bits < 16 else 4, "mode": "affine", **overrides}
         cfg["quantization"] = block
