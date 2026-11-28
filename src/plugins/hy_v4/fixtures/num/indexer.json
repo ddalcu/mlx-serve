@@ -1,0 +1,14 @@
+{
+ "hidden": 8,
+ "q_lora": 2,
+ "heads": 2,
+ "dim": 2,
+ "ratio": 2,
+ "group_topk": 3,
+ "rope": 2,
+ "theta": 10000000.0,
+ "eps": 1e-05,
+ "kv_len": 8,
+ "rows": 3,
+ "base_pos": 0
+}

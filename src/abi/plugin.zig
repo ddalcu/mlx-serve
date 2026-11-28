@@ -312,6 +312,10 @@ pub const MropeFacts = extern struct {
     inv_freq: Span(f64) = .{},
     /// YaRN's attention factor on the angles; 1 = none.
     mscale: f64 = 1,
+    /// A newline-row layout: an image run is `(h/merge) * (w/merge + 1)` rows (one newline row per merged
+    /// row) and every frame starts a block of `max(h/merge, w/merge+1)` positions. Any tower that appends
+    /// a newline row per merged row reuses it.
+    mrope_newline_rows: bool = false,
 };
 
 pub const Pooling = enum(u8) { unset, mean, cls, last_token };
@@ -549,6 +553,8 @@ pub const Forward = extern struct {
     /// A prompt chunk's M-RoPE angles, cos and sin stacked `[2, 1, 1, rows, rope_dims]` (built from `Parsed.mrope`);
     /// null = 1-D positions, which then carry the slot's M-RoPE delta.
     mrope: Array = .{},
+    /// A prompt chunk's RAW 3-D positions `[3, rows]` int32 (Hy4 ropes per layer kind from these); null = none.
+    mrope_positions: Array = .{},
     /// How the forward reads and writes `caches`; null = a forward that keeps no state (an encoder).
     cache_ops: ?*const CacheOps = null,
     /// The token ids as a device array `[slots, rows]` (a still-lazy sampled token); when set, `tokens` is empty.

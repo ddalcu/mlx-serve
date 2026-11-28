@@ -28,6 +28,7 @@ pub const types = [_][]const u8{
     "nemotron_h",
     "nemotron_h_puzzle",
     "hy_v3",
+    "hy_v4_flash",
     "deepseek_v4",
     "deepseek_v41",
     "inkling_mm_model",
@@ -76,5 +77,5 @@ pub fn serves(model_type: []const u8) bool {
 }
 
 test "served: the listed types only" {
-    try std.testing.expect(serves("llama") and serves("qwen2") and serves("laguna") and serves("gemma4") and serves("gemma3_text") and !serves(""));
+    try std.testing.expect(serves("llama") and serves("qwen2") and serves("laguna") and serves("gemma4") and serves("gemma3_text") and serves("hy_v4_flash") and !serves(""));
 }

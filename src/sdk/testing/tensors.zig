@@ -72,6 +72,27 @@ pub const Tensors = struct {
         try t.put(fmt, args, .U32, shape, out);
     }
 
+    /// Random little-endian words of `dtype` (I32 lookup tables, U16 id rows).
+    pub fn ints(t: *Tensors, comptime fmt: []const u8, args: anytype, shape: []const u64, dtype: Dtype) !void {
+        const n = count(shape);
+        const out = try t.a.alloc(u8, n * dtype.width());
+        t.prng.random().bytes(out);
+        try t.put(fmt, args, dtype, shape, out);
+    }
+
+    /// Consecutive ids `0..n` of `dtype` (an identity lookup map, an id row).
+    pub fn intsSeq(t: *Tensors, comptime fmt: []const u8, args: anytype, shape: []const u64, dtype: Dtype) !void {
+        const n = count(shape);
+        const out = try t.a.alloc(u8, n * dtype.width());
+        for (0..n) |i| switch (dtype) {
+            .I32 => std.mem.writeInt(i32, out[i * 4 ..][0..4], @intCast(i), .little),
+            .U32 => std.mem.writeInt(u32, out[i * 4 ..][0..4], @intCast(i), .little),
+            .U16 => std.mem.writeInt(u16, out[i * 2 ..][0..2], @intCast(i), .little),
+            else => unreachable,
+        };
+        try t.put(fmt, args, dtype, shape, out);
+    }
+
     /// Uniform random halfwords (EXL3 trellis codes).
     pub fn halfwords(t: *Tensors, comptime fmt: []const u8, args: anytype, shape: []const u64) !void {
         const out = try t.a.alloc(u8, count(shape) * 2);

@@ -147,6 +147,7 @@ DSpark arms with `--dspark` when a `-DSpark-` GGUF sits beside the model (`mtpDr
 | `deepseek_v4`, `deepseek_v41` | `deepseek_v4`, `deepseek_v41` | 1M ctx, module-owned state (V4 single-flight; V4.1 one state per slot, decode and DSpark rounds batched), DSML tools on our byte-pinned templates, DSpark; V4.1 images; EXL3 stream packs through a quant plugin's bank; `stream_experts` streams an MLX pack's experts |
 | `bailing_hybrid` | `bailing_hybrid` | Ling 3.0: KDA + MLA hybrid MoE |
 | `glm5_next(_text)` | `glm5_next` | GLM-5.3-Flash: KDA + DSA inside mHC, 288-expert MoE, batched decode, `mtp.0` head, vision |
+| `hy_v4_flash` | `hy_v4` | Hy4-flash 220B-A12B (WIP): MLA + compressed DSA, iHC streams, Engram n-gram PLE (SSD stream), SigLIP-style vision |
 | `kev`, `laya`, `d1`, `clef` | same | Typed decisions (`POST /v1/decisions`) |
 | `qwen3_asr` | `qwen3_asr` | `/v1/audio/transcriptions` only, + the forced aligner (`qwen3_forced_aligner`) |
 | `nemotron_diarization` | `nemotron_diarization` | `diarized_json` speakers, run once over the whole clip |

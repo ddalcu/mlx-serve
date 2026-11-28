@@ -1335,6 +1335,25 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     defer if (angles.ctx != null) {
         _ = mlx.mlx_array_free(angles);
     };
+    // Hy4 ropes per layer kind from the RAW 3-D positions: slice this chunk out of the slot's table.
+    var mrope_pos: mlx.mlx_array = .{};
+    var mrope_pos_owned = false;
+    defer if (mrope_pos_owned) {
+        _ = mlx.mlx_array_free(mrope_pos);
+    };
+    if (xfm.config.plugin) |pb| {
+        if (pb.parsed.mrope.mrope_newline_rows and ctx.mrope_pos != null and rows > 1) {
+            const total = ctx.mrope_total;
+            const rr: usize = rows;
+            if (base + rr <= total) {
+                const buf = try xfm.allocator.alloc(i32, 3 * rr);
+                defer xfm.allocator.free(buf);
+                for (0..3) |ax| @memcpy(buf[ax * rr ..][0..rr], ctx.mrope_pos.?[ax * total + base ..][0..rr]);
+                mrope_pos = mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ 3, @intCast(rows) }, 2, .int32);
+                mrope_pos_owned = true;
+            }
+        }
+    }
     // A capturing forward leaves each recurrent row's state for the partial-accept rollback (`Ctx.capture_spec`).
     const capture = ctx.capture_ssm_seq and ctx.ssm_entries != null;
     const head = !(ctx.skip_lm_head or xfm.embedding_mode);
@@ -1371,6 +1390,7 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         .media = .{ .ctx = if (ctx.vision_embeddings) |ve| ve.ctx else null },
         .media_offset = @intCast(ctx.vision_splice_offset),
         .mrope = .{ .ctx = angles.ctx },
+        .mrope_positions = .{ .ctx = mrope_pos.ctx },
         .cache_ops = &cache_ops.ops,
         .eval_every = evalEvery(&xfm.config, b.positions, rows, base + rows, ctx.cache.config.scheme != .off),
         .offload = if (offload) |*o| o else null,

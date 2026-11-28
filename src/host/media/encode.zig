@@ -23,6 +23,7 @@ const MEDIA_PLACEHOLDER_REJECT = @import("placeholders.zig").MEDIA_PLACEHOLDER_R
 const placeholdersMatchOf = @import("placeholders.zig").placeholdersMatchOf;
 const expandMedia = @import("placeholders.zig").expandMedia;
 const computeQwenMrope = @import("qwen_mrope.zig").computeQwenMrope;
+const computeNewlineMrope = @import("../../plugins/hy_v4/mrope.zig").computeNewlineMrope;
 const computeMiniCpmMrope = @import("../../plugins/qwen3_5/minicpm_media.zig").computeMiniCpmMrope;
 const radioMediaTokens = @import("../../plugins/nemotron_h/media.zig").radioMediaTokens;
 const ByteTokenizer = @import("placeholders.zig").ByteTokenizer;
@@ -252,7 +253,7 @@ pub fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, co
     });
     allocator.free(prompt_ids.*);
     prompt_ids.* = expanded.ids;
-    out.mrope = (if (config.minicpm_vision) computeMiniCpmMrope(allocator, prompt_ids.*, items, config) else computeQwenMrope(allocator, prompt_ids.*, items, config)) catch |err| blk: {
+    out.mrope = (if (config.mrope_newline_rows) computeNewlineMrope(allocator, prompt_ids.*, items, config) else if (config.minicpm_vision) computeMiniCpmMrope(allocator, prompt_ids.*, items, config) else computeQwenMrope(allocator, prompt_ids.*, items, config)) catch |err| blk: {
         log.warn("M-RoPE table failed ({s}); falling back to scalar RoPE\n", .{@errorName(err)});
         break :blk .{};
     };

@@ -1,0 +1,8 @@
+{
+ "hidden": 8,
+ "lanes": 4,
+ "heads": 4,
+ "head_dim": 2,
+ "emb_width": 8,
+ "rows": 3
+}

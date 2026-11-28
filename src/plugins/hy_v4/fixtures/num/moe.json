@@ -1,0 +1,12 @@
+{
+ "hidden": 8,
+ "latent": 4,
+ "mi": 4,
+ "experts": 4,
+ "top_k": 2,
+ "rows": 3,
+ "scale": 1.5,
+ "swiglu_limit": 10.0,
+ "eps": 1e-05,
+ "shared_mi": 4
+}

@@ -34,6 +34,8 @@ test "quant block: each fixture config's quantization block is claimed by one bu
         .{ .file = "glm5_next-mlx-community-4bit.json", .key = "quantization_config", .format = "affine" },
         .{ .file = "glm5_next-nvidia-fp4-local.json", .key = "quantization_config", .format = "nvfp4" },
         .{ .file = "glm5_next-sushi-2.4bpw.json", .key = "quantization", .format = "affine" },
+        .{ .file = "hy_v4-flash.json", .key = "quantization_config", .format = "affine" },
+        .{ .file = "hy_v4-flash.json", .key = "quantization", .format = "affine" },
         .{ .file = "glm5_next-sushi-2.4bpw.json", .key = "expert_quant", .format = "exl3" },
         .{ .file = "bailing_hybrid-ling-3.0-flash-oq4e-mtp.json", .key = "quantization", .format = "affine" },
         .{ .file = "bailing_hybrid-ling-3.0-flash-oq4e-mtp.json", .key = "quantization_config", .format = "affine" },

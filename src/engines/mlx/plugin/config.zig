@@ -262,6 +262,7 @@ pub fn modelConfig(p: *const abi.Parsed) ModelConfig {
         .image_token_id = p.placeholder_ids.image,
         .video_token_id = p.placeholder_ids.video,
         .audio_token_id = p.placeholder_ids.audio,
+        .mrope_newline_rows = p.mrope.mrope_newline_rows,
         // Recurrent layers: the slots get SSM entries, the prefix cache keeps checkpoints.
         .has_hybrid_layers = p.cache.ssm_state.entries > 0,
         .ssm_state_f32 = p.cache.ssm_state.dtype == .f32,
