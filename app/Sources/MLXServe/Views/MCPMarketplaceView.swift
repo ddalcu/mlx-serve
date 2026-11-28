@@ -139,16 +139,19 @@ struct MCPMarketplaceView: View {
         // Keyed on the VISIBLE catalog: an entry whose curated row is hidden in
         // this build (e.g. playwright config carried over from a DMG install)
         // surfaces here with its spawn error instead of disappearing.
-        let custom = mcpManager.config.mcpServers.filter { id, _ in
-            MCPCatalog.visibleEntry(for: id) == nil
+        let custom = mcpManager.config.mcpServers.filter { id, server in
+            guard let catalog = MCPCatalog.visibleEntry(for: id) else { return true }
+            return !catalog.matchesCommand(server)
         }
         if custom.isEmpty {
             return AnyView(EmptyView())
         }
+        let origins = MCPConfigStore.agentsImport().origins
+        let ownedIDs = Set(MCPConfigStore.loadOwned().mcpServers.keys)
         return AnyView(
             VStack(alignment: .leading, spacing: 8) {
                 Divider().padding(.vertical, 8)
-                Text("Custom servers (from mcp.json)")
+                Text(customSectionTitle(origins: origins, ownedIDs: ownedIDs, ids: custom.keys))
                     .font(.app(.subheadline).weight(.semibold))
                 // OrderedDictionary doesn't conform to RandomAccessCollection directly; .elements does.
                 ForEach(custom.elements, id: \.key) { id, entry in
@@ -164,6 +167,12 @@ struct MCPMarketplaceView: View {
                                 .font(.app(.caption).monospaced())
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
+                            if let file = origins[id], !ownedIDs.contains(id) {
+                                Text(MCPConfigStore.agentsOriginLabel(file))
+                                    .font(.app(.caption2))
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                            }
                         }
                         Spacer()
                         if let session = mcpManager.sessions[id] {
@@ -206,7 +215,7 @@ struct MCPMarketplaceView: View {
             } label: {
                 Label("Open mcp.json", systemImage: "doc.text").font(.app(.body))
             }
-            .help("Edit ~/.mlx-serve/mcp.json to add custom servers or fine-tune existing ones")
+            .help("Edit ~/.mlx-serve/mcp.json. An id here overrides the same server from ~/.agents. That directory is only read.")
 
             if let err = saveError {
                 Text(err)
@@ -261,6 +270,8 @@ struct MCPMarketplaceView: View {
         guard let entry = MCPCatalog.visibleEntry(for: entryID) else { return }
         let isOn = enabledByID[entryID] ?? false
         var newConfig = mcpManager.config
+        // A commons server that only shares this id is not the curated row.
+        if let existing = newConfig.mcpServers[entryID], !entry.matchesCommand(existing) { return }
         if isOn {
             // Don't spawn if a required field is still empty — wait for the user to fill it in.
             let values = valuesByID[entryID] ?? [:]
@@ -285,6 +296,48 @@ struct MCPMarketplaceView: View {
         // ChatView last set (or nil if MCP was never used in chat yet). The marketplace is most often
         // opened from chat, so this is usually fine.
         Task { await mcpManager.startEnabled() }
+    }
+
+    private func customSectionTitle(origins: [String: String], ownedIDs: Set<String>, ids: some Sequence<String>) -> String {
+        let fromAgents = ids.contains { origins[$0] != nil && !ownedIDs.contains($0) }
+        guard fromAgents else { return "Custom servers (from mcp.json)" }
+        let dir = MCPConfigStore.agentsDirectory().map { ($0 as NSString).abbreviatingWithTildeInPath } ?? "~/.agents"
+        return "Custom servers (from \(dir))"
+    }
+
+    /// The marketplace form written onto `config`. A stored server whose command
+    /// is not the catalog row's is left alone, so Save of another row does not
+    /// stall on its missing token or rewrite it into the curated command.
+    static func applyingCatalogForm(
+        to config: MCPConfig,
+        enabled: [String: Bool],
+        values: [String: [String: String]]
+    ) -> (config: MCPConfig, error: String?) {
+        var newConfig = config
+        // Visible entries only: Save must never touch config for rows this build
+        // doesn't render (their enabledByID is never hydrated, so iterating the
+        // full catalog would silently disable a carried-over hidden entry).
+        for entry in MCPCatalog.visibleEntries() {
+            if let existing = newConfig.mcpServers[entry.id], !entry.matchesCommand(existing) {
+                continue
+            }
+            let isOn = enabled[entry.id] ?? false
+            let rowValues = values[entry.id] ?? [:]
+            if isOn {
+                let missing = entry.inputs.filter { input in
+                    input.required && (rowValues[input.id]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+                }
+                if !missing.isEmpty {
+                    return (config, "\(entry.name): missing \(missing.map(\.label).joined(separator: ", "))")
+                }
+                newConfig.mcpServers[entry.id] = Self.materialized(entry, over: newConfig.mcpServers[entry.id], values: rowValues)
+            } else if var existing = newConfig.mcpServers[entry.id] {
+                // Toggle off: keep the entry but mark disabled (preserves user-entered tokens for next time).
+                existing.disabled = true
+                newConfig.mcpServers[entry.id] = existing
+            }
+        }
+        return (newConfig, nil)
     }
 
     /// Materialize a catalog row over the stored entry. The file has a second
@@ -341,7 +394,7 @@ struct MCPMarketplaceView: View {
     private func hydrateFromConfig() {
         mcpManager.reloadConfig()
         for entry in MCPCatalog.visibleEntries() {
-            if let server = mcpManager.config.mcpServers[entry.id] {
+            if let server = mcpManager.config.mcpServers[entry.id], entry.matchesCommand(server) {
                 enabledByID[entry.id] = server.isEnabled
                 valuesByID[entry.id] = entry.extractValues(from: server)
             } else {
@@ -355,32 +408,13 @@ struct MCPMarketplaceView: View {
     }
 
     private func saveAndDismiss() {
-        var newConfig = mcpManager.config
-        // Visible entries only: Save must never touch config for rows this build
-        // doesn't render (their enabledByID is never hydrated, so iterating the
-        // full catalog would silently disable a carried-over hidden entry).
-        for entry in MCPCatalog.visibleEntries() {
-            let isOn = enabledByID[entry.id] ?? false
-            let values = valuesByID[entry.id] ?? [:]
-            if isOn {
-                let missing = entry.inputs.filter { input in
-                    input.required && (values[input.id]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-                }
-                if !missing.isEmpty {
-                    saveError = "\(entry.name): missing \(missing.map(\.label).joined(separator: ", "))"
-                    return
-                }
-                newConfig.mcpServers[entry.id] = Self.materialized(entry, over: newConfig.mcpServers[entry.id], values: values)
-            } else {
-                // Toggle off: keep the entry but mark disabled (preserves user-entered tokens for next time).
-                if var existing = newConfig.mcpServers[entry.id] {
-                    existing.disabled = true
-                    newConfig.mcpServers[entry.id] = existing
-                }
-            }
+        let applied = Self.applyingCatalogForm(to: mcpManager.config, enabled: enabledByID, values: valuesByID)
+        if let err = applied.error {
+            saveError = err
+            return
         }
         do {
-            try mcpManager.saveConfig(newConfig)
+            try mcpManager.saveConfig(applied.config)
             saveError = nil
             dismiss()
         } catch {

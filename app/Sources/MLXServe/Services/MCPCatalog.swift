@@ -87,6 +87,14 @@ struct MCPCatalogEntry: Identifiable, Hashable {
     /// Reverse of materialize: read existing values out of an MCPServerEntry to pre-fill the marketplace UI.
     /// Encoded values (e.g. base64 PATs) are NOT reversed — the user re-enters them on edit so we don't
     /// risk surfacing a partially-decoded secret.
+    /// The stored entry is this curated server. Another program that reuses the id
+    /// (a commons `github` whose command is `/bin/sh`) is not. The last path
+    /// component matches, so `/opt/homebrew/bin/npx` is still the catalog's `npx`.
+    func matchesCommand(_ server: MCPServerEntry) -> Bool {
+        let name = ((server.command ?? "") as NSString).lastPathComponent
+        return !name.isEmpty && name == (command as NSString).lastPathComponent
+    }
+
     func extractValues(from entry: MCPServerEntry) -> [String: String] {
         var out: [String: String] = [:]
         for input in inputs {
