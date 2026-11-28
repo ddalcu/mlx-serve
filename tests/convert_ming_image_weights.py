@@ -124,6 +124,10 @@ Or pick it in the MLX Serve app's image tab. A size snaps to the release's neare
 tables, 1:4 to 4:1). `steps` defaults to 12; `guidance_scale` above 1 runs the release's guidance (two forwards per
 step); the release has no negative prompt.
 
+Edits: send one picture with `"mode": "edit"` and an instruction (`"image"` as base64, e.g. "Change the yellow
+raincoat to red" or "Remove the background"). The result keeps the picture's aspect at about 1 MP, alpha included;
+an edit takes about 19 s at 1024² on an M5 Ultra (the reference doubles the DiT's sequence).
+
 Prompting: describe the picture as a photographer or designer would. Brand and magazine names in a prompt get typeset
 into the image (it is a design model), so leave them out unless you want the lettering.
 

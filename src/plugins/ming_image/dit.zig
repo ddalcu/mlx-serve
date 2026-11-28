@@ -165,13 +165,15 @@ pub fn padded(n: usize) usize {
     return std.mem.alignForward(usize, n, SEQ_MULTI_OF);
 }
 
-/// Image ids `(cap_padded + 1, h, w)` then caption ids `(1 + i, 0, 0)`, the unified order.
-pub fn positions(a: std.mem.Allocator, ht: u32, wt: u32, cap_len: usize) ![][3]u32 {
-    const n_img: usize = @as(usize, ht) * wt;
+/// Image ids `(cap_padded + 1 + f, h, w)` frame by frame (an edit's reference is frame 1), then caption ids
+/// `(1 + i, 0, 0)`: the unified order.
+pub fn positions(a: std.mem.Allocator, ht: u32, wt: u32, frames: u32, cap_len: usize) ![][3]u32 {
+    const per: usize = @as(usize, ht) * wt;
+    const n_img = per * frames;
     const ids = try a.alloc([3]u32, n_img + cap_len);
     const t0: u32 = @intCast(padded(cap_len) + 1);
-    for (0..ht) |h| for (0..wt) |w| {
-        ids[h * wt + w] = .{ t0, @intCast(h), @intCast(w) };
+    for (0..frames) |f| for (0..ht) |h| for (0..wt) |w| {
+        ids[f * per + h * wt + w] = .{ t0 + @as(u32, @intCast(f)), @intCast(h), @intCast(w) };
     };
     for (0..cap_len) |i| ids[n_img + i] = .{ @intCast(1 + i), 0, 0 };
     return ids;
@@ -316,7 +318,8 @@ pub const Dit = struct {
     }
 
     pub const Step = struct {
-        /// Patchified latents [1, N, 4·C] f32, the refined caption, per-block mods, the unified table.
+        /// Patchified latents [1, N, 4·C] f32 (an edit's reference patches after the target's), the refined caption,
+        /// per-block mods, the unified table.
         patches: Array,
         caption: Array,
         mods: []const Mod,

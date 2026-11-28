@@ -1,6 +1,6 @@
 //! Ming-Image on the media table: text to image over its MoE MLLM prompt conditioning, single-stream DiT and the
-//! Qwen-Image VAE decoding RGBA. A job is one prompt at the release's nearest aspect bucket; the result is a PNG
-//! with its alpha.
+//! Qwen-Image VAE decoding RGBA. A job is one prompt at the release's nearest aspect bucket, or an edit of one
+//! picture at its own bucket, resized back to its aspect; the result is a PNG with its alpha.
 
 const std = @import("std");
 const abi = @import("../../abi/media.zig");
@@ -12,6 +12,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
 const ming = @import("ming_image.zig");
 const llm = @import("llm.zig");
+const vision = @import("vision.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -60,7 +61,7 @@ fn unload(ep: *anyopaque) callconv(.c) void {
     gpa.destroy(e);
 }
 
-const spec: image_request.Spec = .{ .guidance = true, .default_guidance = config.DEFAULT_GUIDANCE };
+const spec: image_request.Spec = .{ .guidance = true, .default_guidance = config.DEFAULT_GUIDANCE, .edit_ref_cap = 1, .too_many_refs = "Ming-Image edits one picture: 'ref_images' is not supported" };
 
 fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) callconv(.c) Verdict {
     const e: *Engine = @ptrCast(@alignCast(ep));
@@ -70,11 +71,15 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     const in = req.inputs.slice();
     if (in.len > inputs.len) return Verdict.named(.unsupported, spec.too_many_refs);
     for (in, 0..) |s, i| inputs[i] = s.slice();
-    const j = switch (image_request.parse(.{ .obj = body.parsed.value.object }, inputs[0..in.len], spec)) {
+    var sp = spec;
+    sp.edit = e.m.edit != null;
+    const j = switch (image_request.parse(.{ .obj = body.parsed.value.object }, inputs[0..in.len], sp)) {
         .ok => |j| j,
         .bad => |v| return v,
     };
     if (j.negative_prompt.len > 0) return Verdict.named(.unsupported, "'negative_prompt' is not supported by Ming-Image (its guidance contrasts the prompt with an empty condition)");
+    if (j.mode == .edit) return editJob(e, req, &j, progress);
+    if (promptRefusal(e, j.prompt, 0)) |v| return v;
     const dims = config.bucket(j.req_w, j.req_h);
     if (dims.w != j.req_w or dims.h != j.req_h) log.info("[ming-image] asked {d}x{d} -> bucket {d}x{d}\n", .{ j.req_w, j.req_h, dims.w, dims.h });
     const need = config.genTransientBytes(dims.w, dims.h);
@@ -82,14 +87,51 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     if (need > room) log.info("[image] bill refused: {d}x{d} needs {d} MB, headroom {d} MB\n", .{ dims.w, dims.h, need >> 20, room >> 20 });
     if (image_request.canvasRefusal(req, dims.w, dims.h, need, room)) |v| return v;
     const img = e.m.generateImage(j.prompt, dims.w, dims.h, j.seed, j.steps, .{ .guidance_scale = j.guidance_scale }, job.progressOf(progress)) catch |err|
-        return switch (err) {
-            error.Cancelled => job.client_left,
-            error.PromptTooLong => Verdict.named(.unsupported, "'prompt' is longer than the 4096 tokens Ming-Image reads (with its chat template); shorten it"),
-            else => job.failure(err, "generation failed"),
-        };
+        return if (err == error.Cancelled) job.client_left else job.failure(err, "generation failed");
     defer _ = mlx.mlx_array_free(img);
     // The image is lazy until here: a Metal failure in the denoise surfaces in the encode.
     const png = image_pixels.toPng(gpa, img, e.m.s) catch |err| return job.failure(err, "generation failed");
+    gpa.free(e.png);
+    e.png = png;
+    return .ok;
+}
+
+/// A request's own fault, named before it is billed against live headroom: a prompt past the encoder's cap.
+fn promptRefusal(e: *Engine, prompt: []const u8, picture: u32) ?Verdict {
+    const ids = e.m.enc.promptIds(gpa, prompt, picture) catch |err| return switch (err) {
+        error.PromptTooLong => Verdict.named(.unsupported, "'prompt' is longer than the 4096 tokens Ming-Image reads (with its chat template and the picture); shorten it"),
+        else => job.failure(err, "generation failed"),
+    };
+    gpa.free(ids);
+    return null;
+}
+
+/// An edit: the picture at its bucket in the release's edit table, the result resized (LANCZOS) to its aspect.
+fn editJob(e: *Engine, req: *const abi.Request, j: *const image_request.Job, progress: *const abi.Progress) Verdict {
+    const ed = &e.m.edit.?;
+    if (j.size_given) return Verdict.named(.unsupported, "'size' is not supported for a Ming-Image edit: the result keeps the picture's aspect at about 1 MP");
+    const src = image_pixels.decodeRgba(gpa, j.image.?) orelse return Verdict.refuse(.unsupported, "could not decode 'image' (PNG/JPEG/WebP supported)");
+    defer src.deinit(gpa);
+    if (promptRefusal(e, j.prompt, vision.tokensFor(ed.vcfg, src.h, src.w))) |v| return v;
+    const sz = config.editSizes(src.w, src.h, config.EDIT_HIGHRES);
+    // The reference rides as a second frame: the DiT's sequence doubles.
+    const need = config.genTransientBytes(sz.canvas.w, sz.canvas.h * 2);
+    const room = job.gpuHeadroom();
+    if (image_request.canvasRefusal(req, sz.canvas.w, sz.canvas.h, need, room)) |v| return v;
+    log.info("[ming-image] edit {d}x{d} -> canvas {d}x{d} -> {d}x{d}\n", .{ src.w, src.h, sz.canvas.w, sz.canvas.h, sz.out.w, sz.out.h });
+    const img = e.m.editImage(j.prompt, src.pix, src.w, src.h, config.EDIT_HIGHRES, j.seed, j.steps, .{ .guidance_scale = j.guidance_scale }, job.progressOf(progress)) catch |err|
+        return if (err == error.Cancelled) job.client_left else job.failure(err, "generation failed");
+    defer _ = mlx.mlx_array_free(img);
+    const px = image_pixels.toPixels8(gpa, img, e.m.s) catch |err| return job.failure(err, "generation failed");
+    defer px.deinit(gpa);
+    const out: image_pixels.Pixels8 = if (px.w == sz.out.w and px.h == sz.out.h) px else .{
+        .px = vision.resizeRgba(gpa, px.px, px.h, px.w, sz.out.h, sz.out.w, .lanczos) catch |err| return job.failure(err, "generation failed"),
+        .w = sz.out.w,
+        .h = sz.out.h,
+        .channels = px.channels,
+    };
+    defer if (out.px.ptr != px.px.ptr) gpa.free(out.px);
+    const png = image_pixels.encodePng(gpa, out) catch |err| return job.failure(err, "generation failed");
     gpa.free(e.png);
     e.png = png;
     return .ok;
@@ -294,6 +336,17 @@ test "ming_image: a prompt past the encoder's token cap is refused by name, neve
     }
 }
 
+test "ming_image: an edit on a pack without the vision tower is refused by name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var pack = try MediaPack(@This()).open(arena.allocator());
+    defer pack.close();
+    switch (try pack.run("{\"prompt\":\"x\",\"mode\":\"edit\",\"image\":\"x\"}")) {
+        .refused => |v| try testing.expect(std.mem.indexOf(u8, v.why.slice(), "Ming-Image model with its vision tower") != null),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "ming_image: guidance past 1 runs the zeroed-condition branch and moves the image" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -322,9 +375,9 @@ test "ming_image: both caption streams reach the DiT in bf16 from a connector qu
     const e: *Engine = @ptrCast(@alignCast(pack.engine));
     var g = @import("../../mlx/ops.zig").Graph.init(testing.allocator, e.m.s);
     defer g.deinit();
-    const ids = try e.m.enc.promptIds(testing.allocator, "a red cat");
+    const ids = try e.m.enc.promptIds(testing.allocator, "a red cat", 0);
     defer testing.allocator.free(ids);
-    const cond = try e.m.enc.encode(&g, ids);
+    const cond = try e.m.enc.encode(&g, ids, null);
     try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(cond.learn));
     try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(cond.direct));
 }

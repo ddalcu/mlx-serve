@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # test_ming_image_gen.sh — Ming-Image on the release tree (or mlx-community's quantized one): load by path (`image`
 # capability + `Ming-Image ready`), a 512x512 RGBA PNG at the default (`one forward per step`), guidance_scale 2
-# running two forwards and rendering differently, a non-bucket size snapped to the release's bucket, negative_prompt,
-# img2img and edit as named 400s, unload, alive + no MLX error. 4 steps: the wire contract, never picture quality.
+# running two forwards and rendering differently, a non-bucket size snapped to the release's bucket, negative_prompt
+# and img2img as named 400s, an edit of the 1280x720 render returned at its aspect (and `size` / `ref_images` on an
+# edit as named 400s), unload, alive + no MLX error. 4 steps: the wire contract, never picture quality.
 #
 #   MING_IMAGE_MODEL=<dir> ./tests/test_ming_image_gen.sh [port]   # default inclusionAI/Ming-Image-*
 #
@@ -27,9 +28,10 @@ FAILS=0
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; FAILS=$((FAILS + 1)); }
 ID="$(basename "$MODEL")"
-gen() { # gen <out.json> <json fields> -> http code
+gen() { # gen <out.json> <json fields> -> http code (the body goes through a file: an image outgrows argv)
+  printf '{"model":"%s","steps":4,"seed":3,%s}' "$ID" "$2" >"$1.req"
   curl -s -m 3600 "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
-    -d "{\"model\":\"$ID\",\"steps\":4,\"seed\":3,$2}" -o "$1" -w '%{http_code}'
+    -d @"$1.req" -o "$1" -w '%{http_code}'
 }
 png_check() { python3 - "$1" "$2" "$3" <<'PY'
 import sys, json, base64, struct
@@ -67,8 +69,16 @@ code="$(gen "$OUT/neg.json" "$P,\"size\":\"512x512\",\"negative_prompt\":\"blurr
 IMG="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['data'][0]['b64_json'])" "$OUT/g1.json")"
 code="$(gen "$OUT/i2i.json" "\"prompt\":\"x\",\"image\":\"$IMG\"")"
 [ "$code" = 400 ] && pass "img2img refused by name" || fail "img2img not refused (HTTP $code)"
-code="$(gen "$OUT/edit.json" "\"prompt\":\"x\",\"mode\":\"edit\",\"image\":\"$IMG\"")"
-[ "$code" = 400 ] && pass "edit refused by name" || fail "edit not refused (HTTP $code)"
+WIDE="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['data'][0]['b64_json'])" "$OUT/wide.json")"
+E='"prompt":"Make the fox blue","mode":"edit"'
+code="$(gen "$OUT/edit.json" "$E,\"image\":\"$WIDE\"")"
+[ "$code" = 200 ] && png_check "$OUT/edit.json" 1280 720 && pass "edit returns an RGBA PNG at the picture's aspect" || fail "edit (HTTP $code)"
+grep -q "edit 1280x720 -> canvas 1280x720 -> 1280x720" "$LOG" && grep -q "\[ming-image\] edit 1280x720 steps=" "$LOG" \
+  && pass "edit ran with the reference frame" || fail "no edit engagement lines"
+code="$(gen "$OUT/edit_size.json" "$E,\"image\":\"$WIDE\",\"size\":\"512x512\"")"
+[ "$code" = 400 ] && grep -q "keeps the picture's aspect" "$OUT/edit_size.json" && pass "size on an edit refused by name" || fail "size on an edit (HTTP $code)"
+code="$(gen "$OUT/edit_refs.json" "$E,\"image\":\"$WIDE\",\"ref_images\":[\"$IMG\"]")"
+[ "$code" = 400 ] && grep -q "edits one picture" "$OUT/edit_refs.json" && pass "ref_images refused by name" || fail "ref_images (HTTP $code)"
 
 curl -s "http://127.0.0.1:$PORT/v1/unload-model" -H 'Content-Type: application/json' -d "{\"model\":\"$ID\"}" >/dev/null
 kill -0 $SRV 2>/dev/null && pass "server alive" || fail "server died"

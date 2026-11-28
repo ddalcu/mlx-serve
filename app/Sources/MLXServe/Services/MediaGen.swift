@@ -655,7 +655,7 @@ struct ImageModelPreset: Identifiable, Hashable {
             .superQuality: .init(steps: 30),
         ],
         defaultQuality: .good,
-        description: "inclusionAI's design model — photographs, posters, product shots and text-heavy layouts, delivered as PNGs with real transparency, in 12 steps. Open (MIT)."
+        description: "inclusionAI's design model — photographs, posters, product shots and text-heavy layouts as PNGs with real transparency, and instruction edits of a picture you give it, in 12 steps. Open (MIT)."
     )
 
     /// The release's 16 MP sizes and their 4 MP halves. Any side from 16 to 6272 is taken as typed: the server
@@ -2581,9 +2581,9 @@ extension ImageModelPreset {
     var supportsReferenceEdit: Bool {
         switch variant {
         case .flux2Klein4B, .flux2Klein9B, .flux2Klein9BBase, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo,
-             .minimaxH3Image:
+             .minimaxH3Image, .mingImage:
             return true
-        case .krea2Turbo, .mageFlowTurbo, .mossImage, .mingImage:
+        case .krea2Turbo, .mageFlowTurbo, .mossImage:
             return false
         }
     }
@@ -2595,6 +2595,7 @@ extension ImageModelPreset {
         switch variant {
         case .qwenImage21, .qwenImage21Turbo: return 9
         case .minimaxH3Image: return 15
+        case .mingImage: return 0
         default: return 3
         }
     }
@@ -2692,6 +2693,8 @@ extension ImageModelPreset {
     /// model offers "Match source" first — the reference pipeline's default and
     /// the only choice that can't distort the picture the user handed over.
     func resolutionOptions(editMode: Bool) -> [ResolutionOption] {
+        // Ming-Image edits at the picture's own aspect (about 1 MP); the server refuses a size.
+        if editMode && variant == .mingImage { return [.matchSource] }
         let base = (editMode && supportsReferenceEdit) ? [.matchSource] + resolutions : resolutions
         // Last, so the fixed buckets stay the obvious pick and the fields only
         // appear for someone who went looking for them.

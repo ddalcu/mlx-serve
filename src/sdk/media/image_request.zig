@@ -124,7 +124,7 @@ pub fn parse(body: Fields, inputs: []const []const u8, spec: Spec) Parsed {
     const has_image = body.str("image") != null;
     var rest = inputs;
     if (has_image) {
-        if (edit and !spec.edit) return bad("instruction editing (mode:\"edit\") requires a FLUX.2, Mage-Flow-Edit, or Qwen-Image-2.1 model with its vision tower (re-convert with the current converter)");
+        if (edit and !spec.edit) return bad("instruction editing (mode:\"edit\") requires a FLUX.2, Mage-Flow-Edit, Qwen-Image-2.1 or Ming-Image model with its vision tower (re-convert with the current converter)");
         if (!edit and !spec.img2img) return bad("image-to-image (mode:\"variation\") isn't available for this model — either its VAE encoder failed to load, or this backend has no variation path");
         if (body.float("strength")) |sv| {
             if (!(sv > 0.0 and sv <= 1.0)) return bad("'strength' must be in (0,1]");

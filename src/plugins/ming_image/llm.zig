@@ -64,13 +64,13 @@ pub fn castFloats(w: *Weights, dt: ops.Dtype, s: S) !void {
     }
 }
 
-fn loadDir(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, sub: []const u8, opts: weights_load.LoadOpts) !Weights {
+pub fn loadDir(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, sub: []const u8, opts: weights_load.LoadOpts) !Weights {
     const dir = try std.fmt.allocPrint(a, "{s}/{s}", .{ model_dir, sub });
     defer a.free(dir);
     return weights_load.loadWeightsOpt(io, a, dir, opts);
 }
 
-fn readJson(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, rel: []const u8) !std.json.Parsed(std.json.Value) {
+pub fn readJson(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, rel: []const u8) !std.json.Parsed(std.json.Value) {
     const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ model_dir, rel });
     defer a.free(path);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(4 << 20));
@@ -78,7 +78,7 @@ fn readJson(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, rel: []cons
     return std.json.parseFromSlice(std.json.Value, a, bytes, .{});
 }
 
-fn num(v: std.json.Value, key: []const u8) !f64 {
+pub fn num(v: std.json.Value, key: []const u8) !f64 {
     const x = v.object.get(key) orelse {
         log.err("[ming-image] config misses {s}\n", .{key});
         return error.MingImageBadConfig;
@@ -90,7 +90,7 @@ fn num(v: std.json.Value, key: []const u8) !f64 {
     };
 }
 
-fn int(v: std.json.Value, key: []const u8) !u32 {
+pub fn int(v: std.json.Value, key: []const u8) !u32 {
     const f = try num(v, key);
     if (f < 0 or f > 1 << 24 or f != @floor(f)) return error.MingImageBadConfig;
     return @intFromFloat(f);
@@ -191,13 +191,43 @@ pub const Config = struct {
     }
 };
 
-/// `get_t_scale_rope_index` for `[prompt | start | query block | end]`, the video-RoPE channel order and its
-/// half-width rotation: the prompt and its start token at 0..p-1 on every axis; query j at t = h = p,
-/// w = p + j − (n−1)/2 (one row of the 2-merged [1, 2, 2n] grid); the end token at p + 1. A rotary channel's
-/// frequency is `c mod (rope_dim/2)`; its axis h/w alternating over the first 3/8 of each half, t over the rest.
-pub fn ropeTables(g: *Graph, cfg: Config, p: usize) !struct { cos: Array, sin: Array } {
-    const n: usize = cfg.queries();
-    const L = p + n + 1;
+/// Where an edit's picture sits in the prompt: its first patch row and its merged grid.
+pub const Pic = struct { at: usize, hm: u32, wm: u32 };
+
+/// `get_t_scale_rope_index` (scale 2, one frame per block) for `[prompt | start | query block | end]`, `pic` inside
+/// the prompt: text runs 1-D; a block of merged grid (hm, wm) starting at s sits at t = s, h = s + r − ⌊(hm−1)/2⌋,
+/// w = s + c − ⌊(wm−1)/2⌋, and the text after it resumes at s + 1. The query block is a 1 x n grid. A rotary
+/// channel's frequency is `c mod (rope_dim/2)`; its axis h (even c) / w (odd c) over the first 3/8 of each half, t
+/// over the rest.
+pub fn ropeTables(g: *Graph, cfg: Config, n: usize, pic: ?Pic) !struct { cos: Array, sin: Array } {
+    const q: usize = cfg.queries();
+    const L = n + 1 + q + 1;
+    const pos = try g.a.alloc([3]f64, L);
+    defer g.a.free(pos);
+    var next: f64 = 0; // the next text position
+    var i: usize = 0;
+    const blocks = [_]?struct { at: usize, hm: u32, wm: u32 }{
+        if (pic) |pc| .{ .at = pc.at, .hm = pc.hm, .wm = pc.wm } else null,
+        .{ .at = n + 1, .hm = 1, .wm = @intCast(q) },
+    };
+    for (blocks) |ob| if (ob) |b| {
+        while (i < b.at) : (i += 1) {
+            pos[i] = .{ next, next, next };
+            next += 1;
+        }
+        const s0 = next;
+        for (0..b.hm) |r| for (0..b.wm) |c| {
+            const hh = s0 + @as(f64, @floatFromInt(r)) - @as(f64, @floatFromInt((b.hm - 1) / 2));
+            const ww = s0 + @as(f64, @floatFromInt(c)) - @as(f64, @floatFromInt((b.wm - 1) / 2));
+            pos[i] = .{ s0, hh, ww };
+            i += 1;
+        };
+        next = s0 + 1;
+    };
+    while (i < L) : (i += 1) {
+        pos[i] = .{ next, next, next };
+        next += 1;
+    }
     const rd: usize = cfg.rope_dim;
     const half = rd / 2;
     const hw = half * 3 / 4; // [8,12,12] sections × 2 over the 64-wide rotary: 24 of every 32 are h/w
@@ -205,28 +235,14 @@ pub fn ropeTables(g: *Graph, cfg: Config, p: usize) !struct { cos: Array, sin: A
     defer g.a.free(cos);
     const sin = try g.a.alloc(f32, L * rd);
     defer g.a.free(sin);
-    for (0..L) |i| {
-        var t: f64 = undefined;
-        var w: f64 = undefined;
-        if (i < p) {
-            t = @floatFromInt(i);
-            w = t;
-        } else if (i < p + n) {
-            t = @floatFromInt(p);
-            w = @as(f64, @floatFromInt(p + (i - p))) - @as(f64, @floatFromInt((n - 1) / 2));
-        } else {
-            t = @floatFromInt(p + 1);
-            w = t;
-        }
-        for (0..rd) |c| {
-            const k = c % half;
-            const pos = if (k < hw and c % 2 == 1) w else t; // h = t for every row here
-            const inv = 1.0 / std.math.pow(f64, cfg.rope_theta, @as(f64, @floatFromInt(2 * k)) / @as(f64, @floatFromInt(rd)));
-            const ang: f32 = @floatCast(pos * @as(f64, @as(f32, @floatCast(inv))));
-            cos[i * rd + c] = @cos(ang);
-            sin[i * rd + c] = @sin(ang);
-        }
-    }
+    for (pos, 0..) |pp, row| for (0..rd) |c| {
+        const k = c % half;
+        const at = if (k >= hw) pp[0] else if (c % 2 == 0) pp[1] else pp[2];
+        const inv = 1.0 / std.math.pow(f64, cfg.rope_theta, @as(f64, @floatFromInt(2 * k)) / @as(f64, @floatFromInt(rd)));
+        const ang: f32 = @floatCast(at * @as(f64, @as(f32, @floatCast(inv))));
+        cos[row * rd + c] = @cos(ang);
+        sin[row * rd + c] = @sin(ang);
+    };
     const sh = [_]c_int{ 1, 1, @intCast(L), @intCast(rd) };
     return .{ .cos = try g.astype(try g.fromSlice(f32, cos, &sh), DT), .sin = try g.astype(try g.fromSlice(f32, sin, &sh), DT) };
 }
@@ -453,11 +469,29 @@ pub const Encoder = struct {
         self.tok.deinit();
     }
 
-    /// The chat-formatted prompt's ids (the release's processor); `error.PromptTooLong` past `MAX_PROMPT_TOKENS`.
-    pub fn promptIds(self: *const Encoder, a: std.mem.Allocator, prompt: []const u8) ![]u32 {
-        const text = try std.mem.concat(a, u8, &.{ PROMPT_PREFIX, prompt, PROMPT_SUFFIX });
-        defer a.free(text);
-        const ids = try self.tok.encode(a, text);
+    /// The chat-formatted prompt's ids (the release's processor); an edit's picture is `<image>`, `picture` patch
+    /// tokens, `</image>` and a newline before the prompt. `error.PromptTooLong` past `MAX_PROMPT_TOKENS`.
+    pub fn promptIds(self: *const Encoder, a: std.mem.Allocator, prompt: []const u8, picture: u32) ![]u32 {
+        const ids = if (picture == 0) blk: {
+            const text = try std.mem.concat(a, u8, &.{ PROMPT_PREFIX, prompt, PROMPT_SUFFIX });
+            defer a.free(text);
+            break :blk try self.tok.encode(a, text);
+        } else blk: {
+            // `</image>` is a special token: the text after it starts a new pretokenizer segment either way.
+            const head = try self.tok.encode(a, PROMPT_PREFIX);
+            defer a.free(head);
+            const text = try std.mem.concat(a, u8, &.{ "\n", prompt, PROMPT_SUFFIX });
+            defer a.free(text);
+            const tail = try self.tok.encode(a, text);
+            defer a.free(tail);
+            const out = try a.alloc(u32, head.len + picture + 2 + tail.len);
+            @memcpy(out[0..head.len], head);
+            out[head.len] = self.start_id;
+            @memset(out[head.len + 1 ..][0..picture], self.cfg.patch_token);
+            out[head.len + 1 + picture] = self.end_id;
+            @memcpy(out[head.len + picture + 2 ..], tail);
+            break :blk out;
+        };
         if (ids.len > MAX_PROMPT_TOKENS) {
             a.free(ids);
             return error.PromptTooLong;
@@ -465,14 +499,17 @@ pub const Encoder = struct {
         return ids;
     }
 
+    /// An edit's picture in the MLLM: the tower's rows and their merged grid.
+    pub const Picture = struct { embeds: Array, hm: u32, wm: u32 };
+
     pub const Cond = struct {
         /// The connector's caption features [1, queries, cap_dim] and the projected direct stream [1, prompt, inner].
         learn: Array,
         direct: Array,
     };
 
-    /// Both caption streams for the prompt `ids`, in `parent`.
-    pub fn encode(self: *const Encoder, parent: *Graph, ids: []const u32) !Cond {
+    /// Both caption streams for the prompt `ids` (with `pic`'s patch tokens when editing), in `parent`.
+    pub fn encode(self: *const Encoder, parent: *Graph, ids: []const u32, pic: ?Picture) !Cond {
         var g = parent.scope();
         defer g.deinit();
         const cfg = self.cfg;
@@ -484,13 +521,24 @@ pub const Encoder = struct {
         @memcpy(head[0..n], ids);
         head[n] = self.start_id;
         const end = [_]u32{self.end_id};
-        const x0 = try g.concat(&.{
-            try g.take(self.embed, try g.fromSlice(u32, head, &.{@intCast(p)}), 0),
-            self.query,
-            try g.take(self.embed, try g.fromSlice(u32, &end, &.{1}), 0),
-        }, 0);
+        var emb = try g.take(self.embed, try g.fromSlice(u32, head, &.{@intCast(p)}), 0);
+        var span: ?Pic = null;
+        if (pic) |pc| {
+            const at = std.mem.indexOfScalar(u32, ids, cfg.patch_token) orelse return error.MingImageBadPicture;
+            const rows: usize = @as(usize, pc.hm) * pc.wm;
+            if (at + rows > n or ops.shape(pc.embeds)[0] != rows or std.mem.count(u32, ids, &.{cfg.patch_token}) != rows)
+                return error.MingImageBadPicture;
+            emb = try g.concat(&.{ try g.sliceAxis(emb, 0, 0, @intCast(at)), try g.astype(pc.embeds, DT), try g.sliceAxis(emb, 0, @intCast(at + rows), @intCast(p)) }, 0);
+            span = .{ .at = at, .hm = pc.hm, .wm = pc.wm };
+        }
+        const x0 = try g.concat(&.{ emb, self.query, try g.take(self.embed, try g.fromSlice(u32, &end, &.{1}), 0) }, 0);
         var x = try g.expandDims(x0, 0);
-        const rt = try ropeTables(&g, cfg, p);
+        const rt = try ropeTables(&g, cfg, n, span);
+        // The image router reads the picture's rows and the query block; the text router the rest.
+        var img_rows: std.ArrayList(u32) = .empty;
+        defer img_rows.deinit(g.a);
+        if (span) |sp| for (sp.at..sp.at + @as(usize, sp.hm) * sp.wm) |r| try img_rows.append(g.a, @intCast(r));
+        for (p..p + q) |r| try img_rows.append(g.a, @intCast(r));
         var taps: [3]?Array = .{ null, null, null };
         for (self.layers, 0..) |*L, i| {
             for (cfg.taps, 0..) |t, ti| if (t == i) {
@@ -498,7 +546,7 @@ pub const Encoder = struct {
             };
             var step = g.scope();
             defer step.deinit();
-            const next = try g.keep(try self.layer(&step, L, x, rt.cos, rt.sin, p));
+            const next = try g.keep(try self.layer(&step, L, x, rt.cos, rt.sin, img_rows.items));
             try mlx.check(mlx.mlx_array_eval(next));
             x = next;
         }
@@ -526,7 +574,7 @@ pub const Encoder = struct {
         return .{ .learn = try parent.keep(try g.astype(learn, DT)), .direct = try parent.keep(try g.astype(direct, DT)) };
     }
 
-    fn layer(self: *const Encoder, parent: *Graph, L: *const Layer, x: Array, cos: Array, sin: Array, p: usize) !Array {
+    fn layer(self: *const Encoder, parent: *Graph, L: *const Layer, x: Array, cos: Array, sin: Array, img_rows: []const u32) !Array {
         var g = parent.scope();
         defer g.deinit();
         const cfg = self.cfg;
@@ -545,7 +593,7 @@ pub const Encoder = struct {
         const hn = try g.rmsNorm(h1, L.post_ln, cfg.eps);
         const m = switch (L.mlp) {
             .dense => |d| try d.down.forward(&g, try g.mul(try g.silu(try d.gate.forward(&g, hn)), try d.up.forward(&g, hn))),
-            .moe => |*r| try routedRows(&g, &r.text, &r.image, hn, @intCast(p), @intCast(cfg.queries())),
+            .moe => |*r| try routedRows(&g, &r.text, &r.image, hn, img_rows),
         };
         return parent.keep(try g.add(h1, m));
     }
@@ -562,16 +610,32 @@ pub const Encoder = struct {
     }
 };
 
-/// The MoE over `x`'s rows, the query block `[p, p + q)` routed by the image router and every other row by the
-/// text router (rows are independent through the experts).
-fn routedRows(parent: *Graph, text: *const moe.Moe.Weights, image: *const moe.Moe.Weights, x: Array, p: c_int, q: c_int) !Array {
+/// The MoE over `x`'s rows, `img_rows` (ascending) routed by the image router and every other row by the text router
+/// (rows are independent through the experts).
+fn routedRows(parent: *Graph, text: *const moe.Moe.Weights, image: *const moe.Moe.Weights, x: Array, img_rows: []const u32) !Array {
     var g = parent.scope();
     defer g.deinit();
-    const L = ops.shape(x)[1];
-    const tx = try g.concat(&.{ try g.sliceAxis(x, 1, 0, p), try g.sliceAxis(x, 1, p + q, L) }, 1);
-    const yt = try moe.mlp(text, &g, tx);
-    const yi = try moe.mlp(image, &g, try g.sliceAxis(x, 1, p, p + q));
-    return parent.keep(try g.concat(&.{ try g.sliceAxis(yt, 1, 0, p), yi, try g.sliceAxis(yt, 1, p, L - q) }, 1));
+    const L: usize = @intCast(ops.shape(x)[1]);
+    const order = try g.a.alloc(u32, L); // text rows, then image rows
+    defer g.a.free(order);
+    const back = try g.a.alloc(u32, L);
+    defer g.a.free(back);
+    var t: usize = 0;
+    var k: usize = 0;
+    for (0..L) |r| {
+        if (k < img_rows.len and img_rows[k] == r) {
+            k += 1;
+            continue;
+        }
+        order[t] = @intCast(r);
+        t += 1;
+    }
+    @memcpy(order[t..], img_rows);
+    for (order, 0..) |r, i| back[r] = @intCast(i);
+    const ti = try g.fromSlice(u32, order[0..t], &.{@intCast(t)});
+    const ii = try g.fromSlice(u32, img_rows, &.{@intCast(img_rows.len)});
+    const y = try g.concat(&.{ try moe.mlp(text, &g, try g.take(x, ti, 1)), try moe.mlp(image, &g, try g.take(x, ii, 1)) }, 1);
+    return parent.keep(try g.take(y, try g.fromSlice(u32, back, &.{@intCast(L)}), 1));
 }
 
 fn outDim(l: Linear) !u32 {

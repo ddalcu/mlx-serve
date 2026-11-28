@@ -10,7 +10,10 @@ the release's code, in FP32 on CPU:
   - `get_condition_embeds_for_image_gen`: the learnable stream (connector output) and the direct stream;
   - one DiT forward at an odd canvas (both caption and image need the pad-to-32);
   - one VAE decode;
-  - a 3-step pipeline from fixed noise, with and without CFG.
+  - a 3-step pipeline from fixed noise, with and without CFG;
+  - an edit: the release's image processor on a seeded RGBA picture, the Qwen2.5-VL tower (one windowed block, one
+    full) through `linear_proj`, both caption streams with the picture in the prompt, the reference's VAE encode and
+    bucket, a DiT forward with the reference frame, and a 3-step edit pipeline (the 512 table keeps it small).
 
     <venv>/bin/python tests/dump_ming_image_fixtures.py <Ming-Image repo> <release pack dir (configs + mllm tokenizer)> <OUT>
 
@@ -33,6 +36,10 @@ HEIGHT, WIDTH = 80, 112  # latent 10 x 14 -> 5 x 7 = 35 image tokens: pads to 64
 STEPS = 3
 CFG = 2.5
 T_MODEL = 0.37  # the DiT's t in [0, 1] (the pipeline passes (1000 - t) / 1000)
+EDIT_PROMPT = "Make the sky purple."
+SRC_H, SRC_W = 110, 150  # the edited picture: vision grid 10 x 12 (partial windows), 512-table bucket 416 x 576
+VIS_PIXELS = 112 * 168
+EDIT_HIGHRES = 512
 
 
 def shrink(cfg, **kw):
@@ -74,8 +81,9 @@ def main():
     llm = shrink(rel["llm_config"], hidden_size=64, intermediate_size=96, num_hidden_layers=3, num_attention_heads=2,
                  num_key_value_heads=1, head_dim=128, num_experts=8, num_experts_per_tok=2, n_group=2, topk_group=1,
                  moe_intermediate_size=64, _attn_implementation="eager")
-    vis = shrink(rel["vision_config"], depth=1, hidden_size=32, intermediate_size=64, num_heads=2, out_hidden_size=32,
-                 fullatt_block_indexes=[0], _attn_implementation="eager")
+    # out_hidden_size stays the release's 8192: `linear_proj` reads the tower's hard-coded `image_emb_dim`.
+    vis = shrink(rel["vision_config"], depth=2, hidden_size=32, intermediate_size=64, num_heads=2,
+                 fullatt_block_indexes=[1], _attn_implementation="eager")
     cfg = BailingMM2Config(mlp_depth=rel.get("mlp_depth", 2), llm_config=llm, vision_config=vis)
     cfg.architectures = rel["architectures"]
     model = BailingMM2NativeForConditionalGeneration(cfg)
@@ -83,6 +91,9 @@ def main():
     model.save_pretrained(os.path.join(pack, "mllm"), safe_serialization=True)
     for f in ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
         shutil.copy(os.path.join(release, "mllm", f), os.path.join(pack, "mllm", f))
+    pre = json.load(open(os.path.join(release, "mllm", "preprocessor_config.json")))
+    pre.update(min_pixels=VIS_PIXELS, max_pixels=VIS_PIXELS)
+    json.dump(pre, open(os.path.join(pack, "mllm", "preprocessor_config.json"), "w"))
     shutil.copy(os.path.join(release, "config.json"), os.path.join(pack, "config.json"))
 
     # ── connector/ ──
@@ -157,10 +168,70 @@ def main():
                                 latents=noise.clone(), output_type="pt", device="cpu", sample_mode="argmax").images
             fx[name] = img.float().contiguous()
 
-    meta = {"prompt": PROMPT, "steps": str(STEPS), "cfg": str(CFG), "t": str(T_MODEL)}
+        edit(ref, tok, pack, fx)
+
+    meta = {"prompt": PROMPT, "edit_prompt": EDIT_PROMPT, "steps": str(STEPS), "cfg": str(CFG), "t": str(T_MODEL),
+            "edit_highres": str(EDIT_HIGHRES)}
     save_file(fx, os.path.join(out, "ming_image_fixture.safetensors"), metadata=meta)
     for k, v in fx.items():
         print(f"{k:12s} {tuple(v.shape)} {v.dtype}")
+
+
+def edit(ref, tok, pack, fx):
+    """The image-edit oracles: one source picture through every stage of the release's edit path."""
+    from PIL import Image
+    from image_processing_bailingmm2 import BailingMM2ImageProcessor
+    from processing_bailingmm2 import transform_reference_images
+    from bailingmm_utils import process_ratio
+
+    g = torch.Generator().manual_seed(SEED + 3)
+    src = (torch.rand(SRC_H, SRC_W, 4, generator=g) * 255).round().to(torch.uint8)
+    src[..., 3] = torch.where(torch.arange(SRC_W) < SRC_W // 3, 0, 255).to(torch.uint8)  # a transparent strip
+    fx["edit_src"] = src.contiguous()
+    pil = Image.fromarray(src.numpy(), "RGBA")
+
+    proc = BailingMM2ImageProcessor.from_pretrained(os.path.join(pack, "mllm"))
+    vin = proc(images=[pil.convert("RGB")], videos=None, return_tensors="pt")
+    pix, thw = vin["pixel_values"].float(), vin["image_grid_thw"]
+    fx["edit_pixels"], fx["edit_grid"] = pix.contiguous(), thw[0].to(torch.int32)
+
+    n_img = int(thw[0].prod()) // 4
+    text = ("<role>SYSTEM</role>你是一个友好的AI助手。\n\ndetailed thinking off<|role_end|>"
+            "<role>HUMAN</role><image>" + "<imagePatch>" * n_img + "</image>\n"
+            f"{EDIT_PROMPT}<|role_end|><role>ASSISTANT</role>")
+    ids = torch.tensor([tok.encode(text, add_special_tokens=False)])
+    fx["edit_ids"] = ids[0].to(torch.int32)
+
+    vision = ref.extract_image_feature(pix, grid_thw=thw)
+    fx["edit_vision"] = vision.float().contiguous()
+    learn, direct = ref.get_condition_embeds_for_image_gen(ids, torch.ones_like(ids), vision, None, False, thw, None)
+    fx["edit_learn"], fx["edit_direct"] = learn[0].float().contiguous(), direct[0].float().contiguous()
+
+    ref_px, oh, ow = transform_reference_images([pil], None, EDIT_HIGHRES, 4)
+    (bh, bw), (rh, rw) = process_ratio(ori_h=oh, ori_w=ow, highres=EDIT_HIGHRES)
+    fx["edit_ref_px"] = ref_px.float().contiguous()
+    fx["edit_sizes"] = torch.tensor([bh, bw, rh, rw], dtype=torch.int32)
+
+    gen = ref.diffusion_loss
+    vae = gen.vae
+    zr = vae.encode(ref_px.unsqueeze(2)).latent_dist.mode()[:, :, 0]
+    zr = (zr - vae.config.shift_factor) * vae.config.scaling_factor
+    fx["edit_ref_latent"] = zr.float().contiguous()
+
+    lat = torch.randn(1, 16, bh // 8, bw // 8, generator=torch.Generator().manual_seed(SEED + 4))
+    fx["edit_dit_latent"] = lat.contiguous()
+    out = gen.train_model(list(lat.unsqueeze(2).unbind(0)), torch.tensor([T_MODEL]), [learn[0]], return_dict=False,
+                          encoder_hidden_states_2=[direct[0]], ref_hidden_states=list(zr.unsqueeze(2).unbind(0)))[0]
+    fx["edit_dit_out"] = out[0][:, 0].float().contiguous()
+
+    noise = torch.randn(1, 16, bh // 8, bw // 8, generator=torch.Generator().manual_seed(SEED + 5))
+    fx["edit_noise"] = noise.contiguous()
+    img = gen.pipelines(prompt_embeds=[learn[0]], negative_prompt_embeds=[learn[0] * 0],
+                        prompt_embeds_2=[direct[0]], negative_prompt_embeds_2=[direct[0] * 0],
+                        guidance_scale=1.0, num_inference_steps=STEPS, height=bh, width=bw,
+                        latents=noise.clone(), output_type="pt", device="cpu", sample_mode="argmax",
+                        ref_hidden_states=ref_px).images
+    fx["edit_e2e"] = img.float().contiguous()
 
 
 if __name__ == "__main__":

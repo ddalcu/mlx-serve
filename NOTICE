@@ -162,13 +162,16 @@ scripts/compile_prompt.py.
 Ming-Image
 https://github.com/inclusionAI/Ming-Image
 Copyright (c) 2026 inclusionAI
-Licensed under the MIT License (diffusion/transformer.py: the Apache License, Version 2.0).
+Licensed under the MIT License (diffusion/transformer.py and qwen2_5_vit.py, Copyright 2025 The
+Qwen Team and The HuggingFace Inc. team: the Apache License, Version 2.0).
 
 src/plugins/ming_image/ ports the Ming-Image inference pipeline to MLX: the image-generation
 conditioning of modeling_bailingmm2.py (with the Bailing-MoE-v2 decoder and its video-RoPE
 positions from modeling_bailing_moe_v2.py), diffusion/transformer.py, diffusion/pipeline.py's
-sampling loop and the aspect buckets of bailingmm_utils.py. tests/dump_ming_image_fixtures.py
-runs the release's own classes as the parity oracle.
+sampling loop, the aspect buckets of bailingmm_utils.py, and for edits the Qwen2.5-VL vision
+tower of qwen2_5_vit.py with the picture prep of image_processing_bailingmm2.py and
+processing_bailingmm2.py. tests/dump_ming_image_fixtures.py runs the release's own classes as
+the parity oracle.
 
 --------------------------------------------------------------------------------
 laya-mlx

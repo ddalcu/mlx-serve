@@ -32,10 +32,11 @@ pub fn claims(model_type: abi.Str, dir: *const abi.PackDir) callconv(.c) abi.Cla
     return if (dir.has("mlp/config.json") and dir.has("connector/config.json")) .by_type else .no;
 }
 
-/// Text to image. The layer-decomposition and edit checkpoints share the layout; they are not served yet.
+/// Text to image, and one-picture edits where the pack ships the MLLM's vision tower and its processor config. The
+/// layer-decomposition checkpoint shares the layout; it is not served.
 pub fn caps(dir: *const abi.PackDir, out: *abi.MediaCaps) callconv(.c) void {
-    _ = dir;
-    out.* = .{ .guidance = true, .default_guidance = DEFAULT_GUIDANCE, .max_dim = max_dim };
+    const edits = dir.has("mllm/preprocessor_config.json");
+    out.* = .{ .guidance = true, .default_guidance = DEFAULT_GUIDANCE, .max_dim = max_dim, .edit = edits, .edit_ref_cap = if (edits) 1 else 0 };
 }
 
 /// The canvas a request runs at: the release's aspect bucket nearest the asked ratio, from the table whose
@@ -50,6 +51,11 @@ pub fn bucket(w: u32, h: u32) Dims {
             table = c.t;
         }
     }
+    return nearest(table, w, h);
+}
+
+/// The table entry whose height/width ratio is nearest `h/w` (the first on a tie, as `get_closest_ratio`).
+fn nearest(table: []const Bucket, w: u32, h: u32) Dims {
     const ratio = @as(f64, @floatFromInt(h)) / @as(f64, @floatFromInt(w));
     var pick = table[0];
     for (table) |b| if (@abs(b.ratio - ratio) < @abs(pick.ratio - ratio)) {
@@ -59,6 +65,26 @@ pub fn bucket(w: u32, h: u32) Dims {
 }
 
 pub const Dims = struct { w: u32, h: u32 };
+
+/// The edit table: the release's image-edit task runs at the 1024 buckets.
+pub const EDIT_HIGHRES: u32 = 1024;
+
+/// An edit's canvas and output (`process_ratio`): the bucket nearest the source's ratio in the `highres` table,
+/// and the size the result is resized to: the source's aspect, scaled to cover the bucket on its tighter side.
+pub fn editSizes(w: u32, h: u32, highres: u32) struct { canvas: Dims, out: Dims } {
+    const table: []const Bucket = switch (highres) {
+        512 => &buckets_512,
+        2048 => &buckets_2048,
+        else => &buckets_1024,
+    };
+    const c = nearest(table, w, h);
+    const fw: f64 = @floatFromInt(w);
+    const fh: f64 = @floatFromInt(h);
+    const ch: f64 = @floatFromInt(c.h);
+    const cw: f64 = @floatFromInt(c.w);
+    const out: Dims = if (ch / fh > cw / fw) .{ .w = @intFromFloat(@trunc(fw * ch / fh)), .h = c.h } else .{ .w = c.w, .h = @intFromFloat(@trunc(fh * cw / fw)) };
+    return .{ .canvas = c, .out = out };
+}
 const Bucket = struct { ratio: f64, h: u32, w: u32 };
 
 /// `bailingmm_utils.process_ratio`'s tables: height/width ratio → [height, width].
@@ -175,6 +201,21 @@ test "ming_image config: claimed by type only with the image components; a chat 
     try testing.expectEqual(abi.Claim.no, claims(.of("flux2"), &dir));
     const omni: fixture.MemDir = .{ .files = files[0..1] };
     try testing.expectEqual(abi.Claim.no, claims(.of("bailingmm_moe_v2_lite"), &omni.packDir()));
+}
+
+test "ming_image config: an edit runs at the source's bucket and resizes back to the source's aspect" {
+    // `process_ratio(h, w, highres)` from the release.
+    const cases = [_]struct { w: u32, h: u32, hr: u32, cw: u32, ch: u32, ow: u32, oh: u32 }{
+        .{ .w = 150, .h = 110, .hr = 512, .cw = 576, .ch = 416, .ow = 576, .oh = 422 },
+        .{ .w = 1920, .h = 1080, .hr = 1024, .cw = 1280, .ch = 720, .ow = 1280, .oh = 720 },
+        .{ .w = 1024, .h = 1536, .hr = 1024, .cw = 832, .ch = 1248, .ow = 832, .oh = 1248 },
+        .{ .w = 2560, .h = 640, .hr = 1024, .cw = 2048, .ch = 512, .ow = 2048, .oh = 512 },
+    };
+    for (cases) |c| {
+        const e = editSizes(c.w, c.h, c.hr);
+        try testing.expectEqual(Dims{ .w = c.cw, .h = c.ch }, e.canvas);
+        try testing.expectEqual(Dims{ .w = c.ow, .h = c.oh }, e.out);
+    }
 }
 
 test "ming_image config: a request size snaps to the release's nearest bucket" {
