@@ -1137,7 +1137,7 @@ func launchClaudeCode(baseURL: String, workingDirectory: String? = nil,
                                          budget: budget, apiKey: APIClient.agentKey)
     let path = NSTemporaryDirectory() + "mlx-claude-code.command"
     try? scriptContent.write(toFile: path, atomically: true, encoding: .utf8)
-    try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+    try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: path)
     NSWorkspace.shared.open(URL(fileURLWithPath: path))
 }
 

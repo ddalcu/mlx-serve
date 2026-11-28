@@ -698,9 +698,9 @@ struct ServerOptions: Codable, Equatable {
         if enableMetrics {
             args += ["--metrics"]
         }
-        let trimmedApiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedApiKey.isEmpty {
-            args += ["--api-key", trimmedApiKey]
+        // The key rides the environment (`ServerManager.launch`): argv is in the world-readable process table.
+        if !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            args += ["--api-key-env", AgentConfigs.keyEnv]
             if apiKeyStrict { args += ["--api-key-strict"] }
         }
         // Emit ONLY when disabled — the server default is on, so a default launch

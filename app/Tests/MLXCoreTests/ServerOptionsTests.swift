@@ -87,6 +87,16 @@ final class ServerOptionsTests: XCTestCase {
         // --api-key is emit-only-when-set.
         XCTAssertTrue(args.contains("--metrics"))
         XCTAssertFalse(args.contains("--api-key"))
+        XCTAssertFalse(args.contains("--api-key-env"))
+    }
+
+    func testTheKeyNeverRidesTheServersArgv() {
+        var o = ServerOptions()
+        o.apiKey = "s3cret"; o.apiKeyStrict = true
+        let args = o.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB)
+        XCTAssertFalse(args.contains { $0.contains("s3cret") }, "argv is in the world-readable process table")
+        XCTAssertTrue(contains(args, flag: "--api-key-env", value: AgentConfigs.keyEnv))
+        XCTAssertTrue(args.contains("--api-key-strict"))
     }
 
     /// 4096 was too low: a single thinking trace + agentic answer routinely

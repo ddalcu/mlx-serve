@@ -321,7 +321,7 @@ final class CLILauncher: ObservableObject {
         let filename = "mlx-launch-\(cli.id).command"
         let path = NSTemporaryDirectory() + filename
         try? fullScript.write(toFile: path, atomically: true, encoding: String.Encoding.utf8)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: path)
         return ("/bin/zsh", ["-l", "-i", path])
     }
 }

@@ -244,7 +244,9 @@ class ServerManager: ObservableObject {
         proc.arguments = args
         lastLaunchedOptions = options
 
-        proc.environment = Self.launchEnvironment()
+        var environment = Self.launchEnvironment()
+        environment[AgentConfigs.keyEnv] = APIClient.localKey.isEmpty ? nil : APIClient.localKey
+        proc.environment = environment
 
         // Echo the launch command at the top of the log (the buffer was just
         // cleared, so this lands above the server's own first line). Lets the
