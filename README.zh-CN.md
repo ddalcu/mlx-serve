@@ -9,7 +9,7 @@
 [![Stars](https://img.shields.io/github/stars/ddalcu/mlx-serve?style=flat-square&color=f7a41d)](https://github.com/ddalcu/mlx-serve/stargazers)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
-**[下载 Mac 版](https://github.com/ddalcu/mlx-serve/releases/latest/download/MLX-Serve.dmg)** · [Homebrew](#安装) · [iPhone](https://apps.apple.com/us/app/mlx-chat-local-ai/id6787603518) · [Linux](#linux-与-windows) · [mlxserve.com](https://mlxserve.com/) · [English](README.md)
+**[下载 Mac 版](https://github.com/ddalcu/mlx-serve/releases/latest/download/MLX-Serve.dmg)** · [Homebrew](#安装) · [iPhone](https://apps.apple.com/us/app/mlx-chat-local-ai/id6787603518) · [Linux](#linux-与-windows) · [mlxserve.com](https://mlxserve.com/) · [English](README.md) · [Türkçe](README.tr.md)
 
 *本文件译自 [README.md](README.md)，如与英文原文有出入，以英文原文为准。*
 

@@ -9,7 +9,7 @@ Run open models on your Mac: chat, coding agents, images, video, music, speech a
 [![Stars](https://img.shields.io/github/stars/ddalcu/mlx-serve?style=flat-square&color=f7a41d)](https://github.com/ddalcu/mlx-serve/stargazers)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
-**[Download for Mac](https://github.com/ddalcu/mlx-serve/releases/latest/download/MLX-Serve.dmg)** · [Homebrew](#install) · [iPhone](https://apps.apple.com/us/app/mlx-chat-local-ai/id6787603518) · [Linux](#linux-and-windows) · [mlxserve.com](https://mlxserve.com/) · [简体中文](README.zh-CN.md)
+**[Download for Mac](https://github.com/ddalcu/mlx-serve/releases/latest/download/MLX-Serve.dmg)** · [Homebrew](#install) · [iPhone](https://apps.apple.com/us/app/mlx-chat-local-ai/id6787603518) · [Linux](#linux-and-windows) · [mlxserve.com](https://mlxserve.com/) · [简体中文](README.zh-CN.md) · [Türkçe](README.tr.md)
 
 ![Chatting with a local model, making a picture and coding with Claude Code, all on one Mac](website/assets/demo.gif)
 
