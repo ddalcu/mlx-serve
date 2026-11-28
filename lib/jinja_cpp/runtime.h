@@ -186,10 +186,15 @@ struct for_statement : public statement {
     value execute_impl(context & ctx) override;
 };
 
+// A break or continue unwinding the loop body; `parts` is the output the enclosing ifs had already produced.
+struct loop_signal : public std::exception {
+    std::vector<value> parts;
+};
+
 struct break_statement : public statement {
     std::string type() const override { return "Break"; }
 
-    struct signal : public std::exception {
+    struct signal : public loop_signal {
         const char* what() const noexcept override {
             return "Break statement executed";
         }
@@ -203,7 +208,7 @@ struct break_statement : public statement {
 struct continue_statement : public statement {
     std::string type() const override { return "Continue"; }
 
-    struct signal : public std::exception {
+    struct signal : public loop_signal {
         const char* what() const noexcept override {
             return "Continue statement executed";
         }

@@ -93,6 +93,17 @@ for the next; Jinja2 starts each iteration fresh. Fix: a child scope per iterati
 `namespace()` attributes still carry. Guard: `renderChatTemplate: a set inside a for loop does not carry into the next
 iteration`.
 
+### jinja.cpp drifted from Jinja2 one construct at a time (twelve fixes)
+Defect: a template valid under Python Jinja2 raised in jinja.cpp, or rendered other bytes, and the request silently fell
+back to the generic format. Eleven one-off fixes (`min`/`max`, a loop's `set`, `unique`, float printing, `sort_keys`,
+`str.format`, `sameas`, NUL output, `x.0`, namespace names, `\xHH`) each pinned one construct; the twelfth, `x | float`
+on a float, broke Inkling's template on its own default effort. Cause: nothing compared the engine with Jinja2 as a
+whole, so each gap was found by a model in production. Fix: one conformance test holds every fixture template, over
+the request shapes the server builds, and a construct corpus to Python Jinja2's bytes (transformers' environment);
+`int`/`float` follow `do_int`/`do_float`, `none in [...]` is membership, `join` stringifies, whitespace stripping is
+Python's `str.isspace` set, a template's leading text survives, and `break`/`continue` keep the output an `if` made.
+Guard: `jinja conformance` (`src/host/chat/jinja_conformance_test.zig`, references from `tests/jinja_conformance_ref.py`).
+
 ### A generic role header rewrote tool results into user turns (MiMo)
 Defect: MiMo-V2.6 got every tool result as a `<tool_response>` user turn. Cause: its template renders `<|im_start|>{{
 message.role }}` and never spells `'tool'`; the literal check read that as no tool role. Fix: a template that renders

@@ -11,22 +11,12 @@
 
 namespace jinja {
 
-static void string_lstrip(std::string & s, const char * chars) {
-    size_t start = s.find_first_not_of(chars);
-    if (start == std::string::npos) {
-        s.clear();
-    } else {
-        s.erase(0, start);
-    }
+static void string_lstrip(std::string & s) {
+    s.erase(0, py_space_prefix(s));
 }
 
-static void string_rstrip(std::string & s, const char * chars) {
-    size_t end = s.find_last_not_of(chars);
-    if (end == std::string::npos) {
-        s.clear();
-    } else {
-        s.erase(end + 1);
-    }
+static void string_rstrip(std::string & s) {
+    s.resize(s.size() - py_space_suffix(s));
 }
 
 lexer_result lexer::tokenize(const std::string & source) {
@@ -173,21 +163,14 @@ lexer_result lexer::tokenize(const std::string & source) {
 
             // equivalent to hf.js code: template.replace(/^[ \t]*({[#%-])/gm, "$1");
             if (opt_lstrip_blocks && src[pos] == '{' && next_pos_is({'%', '#', '-'})) {
-                size_t current = end;
-                while (current > start) {
-                    char c = src[current - 1];
-                    if (current == 1) {
-                        end = 0; // Trim from the start of the string
-                        break;
-                    }
-                    if (c == '\n') {
-                        end = current; // Trim from the start of the line
-                        break;
-                    }
-                    if (!std::isspace(static_cast<unsigned char>(c))) {
-                        break; // Found non-whitespace before newline, keep
-                    }
-                    --current;
+                // Only whitespace back to the line start (or the template start) goes.
+                const std::string_view seg(src.data() + start, end - start);
+                const size_t ws = py_space_suffix(seg);
+                const size_t nl = seg.find_last_of('\n');
+                if (nl != std::string_view::npos && nl + 1 >= seg.size() - ws) {
+                    end = start + nl + 1;
+                } else if (nl == std::string_view::npos && ws == seg.size() && start == 0) {
+                    end = 0;
                 }
             }
 
@@ -204,7 +187,7 @@ lexer_result lexer::tokenize(const std::string & source) {
                 // example: {last_block}[space]text
                 // doing lstrip on text, effectively rstrip the LAST block
                 // JJ_DEBUG("RSTRIP block detected, current text: '%s'", text.c_str());
-                string_lstrip(text, " \t\r\n");
+                string_lstrip(text);
             }
 
             is_lstrip_block = src[pos] == '{' && next_pos_is({'{', '%', '#'}) && next_pos_is({'-'}, 2);
@@ -212,7 +195,7 @@ lexer_result lexer::tokenize(const std::string & source) {
                 // example: text[space]{current_block}
                 // doing rstrip on text, effectively lstrip the CURRENT block
                 // JJ_DEBUG("LSTRIP block detected, current text: '%s'", text.c_str());
-                string_rstrip(text, " \t\r\n");
+                string_rstrip(text);
             }
 
             if (!text.empty()) {
