@@ -50,9 +50,14 @@ struct ServerOptions: Codable, Equatable {
     /// Optional API key (`--api-key`). When non-empty, remote (non-loopback)
     /// requests to the OpenAI/Anthropic/Ollama APIs AND the index page + metrics
     /// panel require it (Authorization: Bearer / x-api-key / HTTP Basic / query
-    /// param). Loopback is trusted, so this app (127.0.0.1) never needs to send
-    /// it — the key protects the server when bound to the network (0.0.0.0).
+    /// param). The app's own requests carry it (`APIClient.localKey`).
     var apiKey: String = ""
+    /// `--api-key-strict`: loopback must send the key too (off = this Mac is exempt).
+    var apiKeyStrict: Bool = false
+    /// Strict only means something with a key set.
+    var apiKeyStrictActive: Bool {
+        apiKeyStrict && !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
     /// Tool-call argument auto-correct (`--no-tool-autocorrect` disables). When
     /// true (default, mirrors the server's `g_tool_autocorrect`), parsed
     /// tool-call arguments are coerced to the types the tool schema declares
@@ -553,6 +558,7 @@ struct ServerOptions: Codable, Equatable {
         requestTimeout == other.requestTimeout &&
         enableMetrics == other.enableMetrics &&
         apiKey == other.apiKey &&
+        apiKeyStrictActive == other.apiKeyStrictActive &&
         toolAutocorrect == other.toolAutocorrect &&
         lanShareEnabled == other.lanShareEnabled &&
         lanShareAll == other.lanShareAll &&
@@ -692,9 +698,10 @@ struct ServerOptions: Codable, Equatable {
         if enableMetrics {
             args += ["--metrics"]
         }
-        let trimmedApiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedApiKey.isEmpty {
-            args += ["--api-key", trimmedApiKey]
+        // The key rides the environment (`ServerManager.launch`): argv is in the world-readable process table.
+        if !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            args += ["--api-key-env", AgentConfigs.keyEnv]
+            if apiKeyStrict { args += ["--api-key-strict"] }
         }
         // Emit ONLY when disabled — the server default is on, so a default launch
         // stays flag-free (guarded by testDefaultLaunchOmitsAllMatchDefaultFlags).
@@ -934,6 +941,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Int.self, forKey: .requestTimeout) { requestTimeout = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMetrics) { enableMetrics = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .apiKey) { apiKey = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .apiKeyStrict) { apiKeyStrict = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .toolAutocorrect) { toolAutocorrect = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePLD) { enablePLD = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldDraftLen) { pldDraftLen = v }
@@ -1141,7 +1149,11 @@ extension ServerOptions {
             needsRestart: true),
         "apiKey": .init(
             title: "API key",
-            explainer: "A key other devices must send to use this server; this Mac never needs it.",
+            explainer: "A key other devices must send to use this server; this Mac is exempt unless the switch below is on.",
+            needsRestart: true),
+        "apiKeyStrict": .init(
+            title: "Require the key on this Mac too",
+            explainer: "Apps on this Mac must send the key as well; this app and the coding agents it launches send it for you.",
             needsRestart: true),
         "lanShareEnabled": .init(
             title: "Share my models on this network",

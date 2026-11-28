@@ -192,7 +192,7 @@ final class CLILauncher: ObservableObject {
             list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
         }
         return """
-        export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list))'
+        export OPENCODE_CONFIG_CONTENT=\(CLIInstaller.shellQuote(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list, apiKey: APIClient.localKey)))
         \(cdLine)
         opencode --model \(AgentConfigs.shellArg("mlx/" + model)) "$@"
         """
@@ -209,7 +209,7 @@ final class CLILauncher: ObservableObject {
             list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
         }
         return """
-        export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list, pinModel: true, compaction: true))'
+        export OPENCODE_CONFIG_CONTENT=\(CLIInstaller.shellQuote(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list, pinModel: true, compaction: true, apiKey: APIClient.localKey)))
         export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
         \(cdLine)
         if ! command -v \(binary) >/dev/null 2>&1; then echo "\(binary) is not installed"; exit 127; fi
@@ -262,6 +262,19 @@ final class CLILauncher: ObservableObject {
         }
     }
 
+    /// The launch script around an agent's body; a keyed server's key rides `AgentConfigs.keyEnv`.
+    nonisolated static func fullScript(baseURL: String, body: String, key: String) -> String {
+        "#!/bin/zsh -l\nexport MLX_SERVE_URL='\(baseURL)'\n\(AgentConfigs.keyExport(key))\(body)\n"
+    }
+
+    /// An agent's config dir under `~/.mlx-serve`, owner-only: its files can hold the server's key.
+    nonisolated static func privateConfigDir(_ path: String) -> String {
+        let dir = NSString(string: path).expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+        return dir
+    }
+
     /// Write a shell script that sets the right env vars / config for the given
     /// CLI and return the command an embedded terminal spawns to run it: a
     /// login+interactive zsh (rc files are where PATH lives — the same shell
@@ -303,12 +316,12 @@ final class CLILauncher: ObservableObject {
             // Nothing to resume fails the CLI (claude: "No conversation found to continue"): start fresh then.
             script = "mlx_agent() {\n\(script)\n}\nmlx_agent \(args) || mlx_agent"
         }
-        let fullScript = "#!/bin/zsh -l\nexport MLX_SERVE_URL='\(baseURL)'\n\(script)\n"
+        let fullScript = Self.fullScript(baseURL: baseURL, body: script, key: APIClient.localKey)
 
         let filename = "mlx-launch-\(cli.id).command"
         let path = NSTemporaryDirectory() + filename
         try? fullScript.write(toFile: path, atomically: true, encoding: String.Encoding.utf8)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: path)
         return ("/bin/zsh", ["-l", "-i", path])
     }
 }
@@ -375,7 +388,7 @@ extension LauncherCLI {
         resumeArgs: "--continue",
         scriptBody: { baseURL, model, cdLine, budget, _ in
             """
-            \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: model, budget: budget))
+            \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: model, budget: budget, apiKey: APIClient.agentKey))
             \(cdLine)
             claude --dangerously-skip-permissions --plugin-dir "$HOME/.mlx-serve/\(AgentSkills.claudePluginDir)" --model \(AgentConfigs.shellArg(model)) "$@"
             """
@@ -397,9 +410,8 @@ extension LauncherCLI {
         // and the same dir the MAS instructions panel tells the user to create
         // (CLISetupInstructionsTests pins the two against each other).
         prepareConfig: { baseURL, model, budget, _ in
-            let dir = NSString(string: "~/.mlx-serve/pi").expandingTildeInPath
-            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            let config = AgentConfigs.piModelsJSON(baseURL: baseURL, model: model, budget: budget)
+            let dir = CLILauncher.privateConfigDir("~/.mlx-serve/pi")
+            let config = AgentConfigs.piModelsJSON(baseURL: baseURL, model: model, budget: budget, apiKey: APIClient.agentKey)
             let path = (dir as NSString).appendingPathComponent("models.json")
             try? config.write(toFile: path, atomically: true, encoding: .utf8)
             let settingsPath = (dir as NSString).appendingPathComponent("settings.json")
@@ -417,7 +429,7 @@ extension LauncherCLI {
             // provider. models.json above stays the offline fallback.
             let extDir = (dir as NSString).appendingPathComponent("extensions")
             try? FileManager.default.createDirectory(atPath: extDir, withIntermediateDirectories: true)
-            try? AgentConfigs.piModelsExtensionJS(baseURL: baseURL)
+            try? AgentConfigs.piModelsExtensionJS(baseURL: baseURL, apiKey: APIClient.agentKey)
                 .write(toFile: (extDir as NSString).appendingPathComponent("mlx-models.js"),
                        atomically: true, encoding: .utf8)
         },
@@ -444,9 +456,8 @@ extension LauncherCLI {
         iconSystemName: "terminal",
         useClaudeIcon: false,
         prepareConfig: { baseURL, model, budget, entries in
-            let dir = NSString(string: "~/.mlx-serve/omp").expandingTildeInPath
-            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            try? AgentConfigs.ompModelsYML(baseURL: baseURL, defaultModel: model, entries: entries)
+            let dir = CLILauncher.privateConfigDir("~/.mlx-serve/omp")
+            try? AgentConfigs.ompModelsYML(baseURL: baseURL, defaultModel: model, entries: entries, keyed: !APIClient.localKey.isEmpty)
                 .write(toFile: (dir as NSString).appendingPathComponent("models.yml"),
                        atomically: true, encoding: .utf8)
         },
@@ -487,7 +498,8 @@ extension LauncherCLI {
         ],
         resumeArgs: "resume --last",
         scriptBody: { baseURL, model, cdLine, budget, _ in
-            let args = AgentConfigs.codexConfigArgs(baseURL: baseURL, model: model, budget: budget)
+            let args = AgentConfigs.codexConfigArgs(baseURL: baseURL, model: model, budget: budget,
+                                                    keyed: !APIClient.localKey.isEmpty)
             return """
             \(AgentConfigs.codexBinResolver)
             \(cdLine)
@@ -507,13 +519,12 @@ extension LauncherCLI {
         iconSystemName: "terminal",
         useClaudeIcon: false,
         prepareConfig: { baseURL, model, budget, _ in
-            let dir = NSString(string: "~/.mlx-serve/hermes").expandingTildeInPath
-            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            try? AgentConfigs.hermesConfigYAML(baseURL: baseURL, apiKey: "mlx-serve",
+            let dir = CLILauncher.privateConfigDir("~/.mlx-serve/hermes")
+            try? AgentConfigs.hermesConfigYAML(baseURL: baseURL, apiKey: APIClient.agentKey,
                                                model: model, budget: budget, entries: [])
                 .write(toFile: (dir as NSString).appendingPathComponent("config.yaml"),
                        atomically: true, encoding: .utf8)
-            try? AgentConfigs.hermesEnvFile(baseURL: baseURL)
+            try? AgentConfigs.hermesEnvFile(baseURL: baseURL, apiKey: APIClient.agentKey)
                 .write(toFile: (dir as NSString).appendingPathComponent(".env"),
                        atomically: true, encoding: .utf8)
         },
@@ -533,9 +544,8 @@ extension LauncherCLI {
         id: "zcode", displayName: "ZCode", binaryName: "zcode",
         iconSystemName: "terminal", useClaudeIcon: false,
         prepareConfig: { baseURL, model, budget, entries in
-            let dir = NSString(string: "~/.mlx-serve/zcode").expandingTildeInPath
-            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            try? AgentConfigs.zcodeProviderJSON(baseURL: baseURL, model: model, budget: budget, entries: entries)
+            let dir = CLILauncher.privateConfigDir("~/.mlx-serve/zcode")
+            try? AgentConfigs.zcodeProviderJSON(baseURL: baseURL, model: model, budget: budget, entries: entries, apiKey: APIClient.agentKey)
                 .write(toFile: "\(dir)/provider_config.json", atomically: true, encoding: .utf8)
         },
         resumeArgs: "--continue",
@@ -568,7 +578,7 @@ extension LauncherCLI {
         scriptBody: { baseURL, model, cdLine, _, _ in
             """
             export OPENAI_API_BASE='\(baseURL)/v1'
-            export OPENAI_API_KEY=mlx-serve
+            export OPENAI_API_KEY=\(AgentConfigs.shellArg(APIClient.agentKey))
             \(cdLine)
             aider --model \(AgentConfigs.shellArg("openai/" + model)) --weak-model \(AgentConfigs.shellArg("openai/" + model)) --model-metadata-file ~/.mlx-serve/aider/model-metadata.json "$@"
             """
@@ -621,9 +631,8 @@ extension LauncherCLI {
         iconSystemName: "terminal",
         useClaudeIcon: false,
         prepareConfig: { baseURL, model, budget, entries in
-            let dir = NSString(string: "~/.mlx-serve/grok").expandingTildeInPath
-            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            try? AgentConfigs.grokConfigTOML(baseURL: baseURL, model: model, budget: budget, entries: entries)
+            let dir = CLILauncher.privateConfigDir("~/.mlx-serve/grok")
+            try? AgentConfigs.grokConfigTOML(baseURL: baseURL, model: model, budget: budget, entries: entries, apiKey: APIClient.agentKey)
                 .write(toFile: (dir as NSString).appendingPathComponent("config.toml"),
                        atomically: true, encoding: .utf8)
         },
@@ -664,10 +673,9 @@ extension LauncherCLI {
         iconSystemName: "chevron.left.forwardslash.chevron.right",
         useClaudeIcon: false,
         prepareConfig: { baseURL, _, _, _ in
+            let cliDir = CLILauncher.privateConfigDir("~/.mlx-serve/opencode2/opencode")
             let pluginDest = NSString(string: "~/.mlx-serve/opencode2/opencode/plugins/mlx-serve").expandingTildeInPath
             AgentConfigs.copyOpencode2Plugin(to: pluginDest)
-            let cliDir = NSString(string: "~/.mlx-serve/opencode2/opencode").expandingTildeInPath
-            try? FileManager.default.createDirectory(atPath: cliDir, withIntermediateDirectories: true)
             let userCli: String
             if let xdg = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"], !xdg.isEmpty {
                 userCli = (xdg as NSString).appendingPathComponent("opencode/cli.json")
@@ -675,7 +683,7 @@ extension LauncherCLI {
                 userCli = NSString(string: "~/.config/opencode/cli.json").expandingTildeInPath
             }
             let existing = (try? String(contentsOfFile: userCli, encoding: .utf8)) ?? "{}"
-            let json = AgentConfigs.opencode2CliJSON(existing: existing, baseURL: baseURL)
+            let json = AgentConfigs.opencode2CliJSON(existing: existing, baseURL: baseURL, apiKey: APIClient.localKey)
             try? json.write(toFile: (cliDir as NSString).appendingPathComponent("cli.json"),
                             atomically: true, encoding: .utf8)
         },
@@ -686,7 +694,7 @@ extension LauncherCLI {
                 list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
             }
             return """
-            export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list, pinModel: true, compaction: true))'
+            export OPENCODE_CONFIG_CONTENT=\(CLIInstaller.shellQuote(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list, pinModel: true, compaction: true, apiKey: APIClient.localKey)))
             export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
             \(cdLine)
             \(opencodeV2BinResolver) "$@"

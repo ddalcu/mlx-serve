@@ -605,7 +605,11 @@ pub fn serve(
     }
     log.info("\nServer listening on http://{s}:{d}\n", .{ host, port });
     if (g_api_key != null) {
-        log.info("API key auth: ENABLED for non-loopback requests (localhost is trusted; /health stays open)\n", .{});
+        if (g_api_key_strict) {
+            log.info("API key auth: ENABLED for every request, localhost included (--api-key-strict; /health stays open)\n", .{});
+        } else {
+            log.info("API key auth: ENABLED for non-loopback requests (localhost is trusted; /health stays open)\n", .{});
+        }
     }
     log.info("  GET  /\n", .{});
     log.info("  GET  /health\n", .{});

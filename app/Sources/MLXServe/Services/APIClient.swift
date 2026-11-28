@@ -88,6 +88,24 @@ class APIClient {
     /// a server bound to a specific interface address is still reachable;
     /// wide binds stay on loopback (the no-api-key trust boundary).
     var host: String = "127.0.0.1"
+    /// The `--api-key` the app launched its server with. Every request to that server carries it, so
+    /// `--api-key-strict` (and a bind to one interface, reached off loopback) still answers the app.
+    static var localKey: String {
+        get { keyLock.lock(); defer { keyLock.unlock() }; return launchKey }
+        set { keyLock.lock(); launchKey = newValue; keyLock.unlock() }
+    }
+    nonisolated(unsafe) private static var launchKey = ""
+    private static let keyLock = NSLock()
+
+    /// The key a coding agent the app launches sends: the launch key, else a placeholder loopback ignores.
+    static var agentKey: String { localKey.isEmpty ? "mlx-serve" : localKey }
+
+    /// A request to this app's server, carrying `localKey` when one is set.
+    static func request(_ url: URL) -> URLRequest {
+        var r = URLRequest(url: url)
+        if !localKey.isEmpty { r.setValue("Bearer \(localKey)", forHTTPHeaderField: "Authorization") }
+        return r
+    }
 
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
@@ -120,7 +138,7 @@ class APIClient {
 
     func checkHealth(port: UInt16) async throws -> Bool {
         let url = serverURL(port: port, path: "/health")
-        let (data, response) = try await session.data(from: url)
+        let (data, response) = try await session.data(for: APIClient.request(url))
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             return false
         }
@@ -148,7 +166,7 @@ class APIClient {
     /// `/v1/models` whole: the rows, the LAN peers that refused us for want of a key, and
     /// every peer's address.
     func fetchModelList(port: UInt16) async throws -> (models: [ModelInfo], lanNeedsKey: [String], lanPeers: [String: LanPeer]) {
-        let (data, _) = try await session.data(from: serverURL(port: port, path: "/v1/models"))
+        let (data, _) = try await session.data(for: APIClient.request(serverURL(port: port, path: "/v1/models")))
         return Self.parseModelsBody(data)
     }
 
@@ -263,7 +281,7 @@ class APIClient {
 
     func loadModel(port: UInt16, id: String, setDefault: Bool = false) async throws -> ModelInfo {
         let url = serverURL(port: port, path: "/v1/load-model")
-        var request = URLRequest(url: url)
+        var request = APIClient.request(url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         // Load can take 10–60 s on a fresh model; raise above the default.
@@ -294,7 +312,7 @@ class APIClient {
     /// only walks the roots at startup). Add-only and idempotent server-side.
     func reloadProviders(port: UInt16) async throws {
         let url = serverURL(port: port, path: "/v1/providers/reload")
-        var request = URLRequest(url: url)
+        var request = APIClient.request(url)
         request.httpMethod = "POST"
         request.timeoutInterval = 10
         let (data, response) = try await session.data(for: request)
@@ -306,7 +324,7 @@ class APIClient {
 
     func providerStatus(port: UInt16) async throws -> [ProviderStatus] {
         let url = serverURL(port: port, path: "/v1/providers")
-        var request = URLRequest(url: url)
+        var request = APIClient.request(url)
         request.timeoutInterval = 10
         let (data, _) = try await session.data(for: request)
         return ProviderStatus.decodeList(data)
@@ -314,7 +332,7 @@ class APIClient {
 
     func rescanModels(port: UInt16) async throws {
         let url = serverURL(port: port, path: "/v1/models/rescan")
-        var request = URLRequest(url: url)
+        var request = APIClient.request(url)
         request.httpMethod = "POST"
         request.timeoutInterval = 30
         let (_, response) = try await session.data(for: request)
@@ -325,7 +343,7 @@ class APIClient {
 
     /// `GET /v1/load-progress`: every model mid-load, by path.
     func loadProgress(port: UInt16) async throws -> [String: LoadProgress] {
-        var request = URLRequest(url: serverURL(port: port, path: "/v1/load-progress"))
+        var request = APIClient.request(serverURL(port: port, path: "/v1/load-progress"))
         request.timeoutInterval = 5
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
@@ -336,7 +354,7 @@ class APIClient {
 
     func unloadModel(port: UInt16, id: String) async throws {
         let url = serverURL(port: port, path: "/v1/unload-model")
-        var request = URLRequest(url: url)
+        var request = APIClient.request(url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 120
@@ -359,7 +377,7 @@ class APIClient {
                 do {
                     var body = json
                     body["stream"] = true
-                    var req = URLRequest(url: serverURL(port: port, path: path))
+                    var req = APIClient.request(serverURL(port: port, path: path))
                     req.httpMethod = "POST"
                     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
@@ -405,7 +423,7 @@ class APIClient {
     /// Returns one vector per input, in input order.
     func embeddings(port: UInt16, model: String, input: [String]) async throws -> [[Double]] {
         let url = serverURL(port: port, path: "/v1/embeddings")
-        var request = URLRequest(url: url)
+        var request = APIClient.request(url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         // First call may cold-load the encoder model (seconds, not minutes).
@@ -442,7 +460,7 @@ class APIClient {
 
     func fetchProps(port: UInt16) async throws -> PropsSnapshot? {
         let url = serverURL(port: port, path: "/props")
-        let (data, _) = try await session.data(from: url)
+        let (data, _) = try await session.data(for: APIClient.request(url))
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let mem = json["memory"] as? [String: Any] else { return nil }
         return PropsSnapshot(memory: MemoryInfo.parse(mem), specCost: SpecCostInfo.parse(json), batching: BatchingInfo.parse(json),
@@ -460,7 +478,7 @@ class APIClient {
         var components = URLComponents(url: serverURL(port: port, path: "/props"), resolvingAgainstBaseURL: false)
         components?.queryItems = model.map { [URLQueryItem(name: "model", value: $0)] }
         let url = components?.url ?? serverURL(port: port, path: "/props")
-        let (data, _) = try await session.data(from: url)
+        let (data, _) = try await session.data(for: APIClient.request(url))
         return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
     }
 
@@ -468,7 +486,7 @@ class APIClient {
     /// `--metrics`, which reads as nil (the tray hides the rows).
     func fetchThroughput(port: UInt16) async throws -> ThroughputSnapshot? {
         let url = serverURL(port: port, path: "/metrics.json")
-        let (data, response) = try await pollSession.data(from: url)
+        let (data, response) = try await pollSession.data(for: APIClient.request(url))
         guard (response as? HTTPURLResponse)?.statusCode == 200,
               let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return ThroughputSnapshot.parse(json, at: Date().timeIntervalSinceReferenceDate)
@@ -517,7 +535,7 @@ class APIClient {
         timeout: TimeInterval = 900
     ) async throws -> CompletionTimings {
         let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
-        var request = URLRequest(url: url)
+        var request = APIClient.request(url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         // A cold load on a large checkpoint is minutes, and a 128-token decode
@@ -781,7 +799,7 @@ class APIClient {
         continuation: AsyncThrowingStream<SSEEvent, Error>.Continuation
     ) async throws {
         let url = serverURL(port: port, path: "/v1/chat/completions")
-        var request = URLRequest(url: url)
+        var request = APIClient.request(url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("close", forHTTPHeaderField: "Connection")

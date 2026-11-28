@@ -1131,21 +1131,26 @@ func launchClaudeCodeWithPicker(baseURL: String, serverBudget: AgentBudget.Budge
 /// env block must not drift between the two entry points.
 func launchClaudeCode(baseURL: String, workingDirectory: String? = nil,
                       serverBudget: AgentBudget.Budget? = nil) {
-    let model = "mlx-serve"
-    let cdLine = workingDirectory.map { "cd '\($0)'" } ?? ""
     let budget = serverBudget ?? AgentBudget.fallback
     warnIfSmallContext(agentId: "claude", budget: budget)
-    let scriptContent = """
+    let scriptContent = claudeCodeScript(baseURL: baseURL, workingDirectory: workingDirectory,
+                                         budget: budget, apiKey: APIClient.agentKey)
+    let path = NSTemporaryDirectory() + "mlx-claude-code.command"
+    try? scriptContent.write(toFile: path, atomically: true, encoding: .utf8)
+    try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: path)
+    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+}
+
+func claudeCodeScript(baseURL: String, workingDirectory: String?, budget: AgentBudget.Budget,
+                      apiKey: String) -> String {
+    let model = "mlx-serve"
+    let cdLine = workingDirectory.map { "cd '\($0)'" } ?? ""
+    return """
     #!/bin/zsh -l
-    \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: model, budget: budget))
+    \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: model, budget: budget, apiKey: apiKey))
     \(cdLine)
     claude --dangerously-skip-permissions --model \(model)
     """
-
-    let path = NSTemporaryDirectory() + "mlx-claude-code.command"
-    try? scriptContent.write(toFile: path, atomically: true, encoding: .utf8)
-    try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
-    NSWorkspace.shared.open(URL(fileURLWithPath: path))
 }
 
 /// Full-window terminal-style view of the live server stderr buffer.

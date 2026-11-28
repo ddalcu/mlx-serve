@@ -67,4 +67,13 @@ final class APIClientServerURLTests: XCTestCase {
         XCTAssertEqual(api.serverURL(port: 11234, path: "/health").absoluteString,
                        "http://127.0.0.1:11234/health")
     }
+
+    func testRequestsCarryTheLaunchKeyOnlyWhenOneIsSet() {
+        defer { APIClient.localKey = "" }
+        let url = URL(string: "http://127.0.0.1:11234/v1/models")!
+        APIClient.localKey = ""
+        XCTAssertNil(APIClient.request(url).value(forHTTPHeaderField: "Authorization"))
+        APIClient.localKey = "sekrit"
+        XCTAssertEqual(APIClient.request(url).value(forHTTPHeaderField: "Authorization"), "Bearer sekrit")
+    }
 }

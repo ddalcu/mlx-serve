@@ -118,6 +118,12 @@ final class TerminalSessionStore: ObservableObject {
         SandboxAgentRegistry.all.first { $0.id == s.agentId }
     }
 
+    /// fx's config has no key slot we know of, so the server it would talk to must not demand one from loopback.
+    nonisolated static func keylessRefusal(_ cli: LauncherCLI, launched: ServerOptions?) -> String? {
+        guard cli == .fx, launched?.apiKeyStrictActive == true else { return nil }
+        return L10n.format("%@ can't send this server's API key; turn off \"Require the key on this Mac too\" and restart the server", cli.displayName)
+    }
+
     private func preflightAndLaunch(into id: UUID) {
         guard let s = sessions.session(id) else { return }
         if s.kind == .host {
@@ -129,6 +135,10 @@ final class TerminalSessionStore: ObservableObject {
             // same Start Server fix.
             guard !cli.requiresServer || server.status == .running else {
                 sessions.markFailed(id, message: L10n.format("the server isn't running — load a model first; %@ talks to it", cli.displayName))
+                return
+            }
+            if let refusal = Self.keylessRefusal(cli, launched: server.liveLaunchedOptions) {
+                sessions.markFailed(id, message: refusal)
                 return
             }
             let budget = server.chatModelInfo?.agentBudget ?? AgentBudget.fallback

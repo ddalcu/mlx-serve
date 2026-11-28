@@ -34,7 +34,7 @@ final class SettingsSectionResetTests: XCTestCase {
         var o = ServerOptions()
         o.host = "127.0.0.1"; o.port = 9999; o.ctxSize = 32768; o.noVision = true
         o.logLevel = .debug; o.requestTimeout = 5; o.enableMetrics = true
-        o.apiKey = "hunter2"; o.toolAutocorrect = false; o.skipMemPreflight = true
+        o.apiKey = "hunter2"; o.apiKeyStrict = true; o.toolAutocorrect = false; o.skipMemPreflight = true
         o.enablePLD = false; o.pldDraftLen = 9; o.pldKeyLen = 9
         o.enableMTP = false; o.mtpDepth = 6
         o.maxConcurrent = 8; o.kvQuant = .int4; o.hotPrefixCacheEnabled = false; o.prefixCacheEntries = 99

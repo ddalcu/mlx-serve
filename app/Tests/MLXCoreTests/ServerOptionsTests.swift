@@ -65,6 +65,7 @@ final class ServerOptionsTests: XCTestCase {
         // reads /metrics.json for its throughput rows.
         XCTAssertEqual(d.enableMetrics, true)
         XCTAssertEqual(d.apiKey, "")                  // server.zig g_api_key (null = open)
+        XCTAssertEqual(d.apiKeyStrict, false)         // server.zig g_api_key_strict
         XCTAssertEqual(d.enablePrefixCacheDisk, false) // server.zig prefix_cache_disk_bytes (0 = off)
 
         // Corollary: with defaults matching the server, a fresh launch omits
@@ -86,6 +87,16 @@ final class ServerOptionsTests: XCTestCase {
         // --api-key is emit-only-when-set.
         XCTAssertTrue(args.contains("--metrics"))
         XCTAssertFalse(args.contains("--api-key"))
+        XCTAssertFalse(args.contains("--api-key-env"))
+    }
+
+    func testTheKeyNeverRidesTheServersArgv() {
+        var o = ServerOptions()
+        o.apiKey = "s3cret"; o.apiKeyStrict = true
+        let args = o.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB)
+        XCTAssertFalse(args.contains { $0.contains("s3cret") }, "argv is in the world-readable process table")
+        XCTAssertTrue(contains(args, flag: "--api-key-env", value: AgentConfigs.keyEnv))
+        XCTAssertTrue(args.contains("--api-key-strict"))
     }
 
     /// 4096 was too low: a single thinking trace + agentic answer routinely
@@ -347,6 +358,24 @@ final class ServerOptionsTests: XCTestCase {
         opts.tokenizeCacheEntries = 16
         args = opts.toCLIArgs()
         XCTAssertTrue(contains(args, flag: "--tokenize-cache-entries", value: "16"))
+    }
+
+    func testApiKeyStrictIsSentOnlyWithAKey() {
+        var o = ServerOptions()
+        o.apiKeyStrict = true
+        XCTAssertFalse(o.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB).contains("--api-key-strict"))
+        XCTAssertFalse(o.apiKeyStrictActive)
+        o.apiKey = "k"
+        XCTAssertTrue(o.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB).contains("--api-key-strict"))
+        XCTAssertTrue(o.apiKeyStrictActive)
+        o.apiKeyStrict = false
+        XCTAssertFalse(o.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB).contains("--api-key-strict"))
+        var strict = o
+        strict.apiKeyStrict = true
+        XCTAssertFalse(o.serverLaunchEquals(strict))
+        var keyless = ServerOptions()
+        keyless.apiKeyStrict = true
+        XCTAssertTrue(ServerOptions().serverLaunchEquals(keyless), "strict without a key changes no launch")
     }
 
     func testServerLaunchEqualsCoversNewFields() {

@@ -193,7 +193,7 @@ final class TrayTranscript: ObservableObject {
     nonisolated static func transcribeRecording(_ mic: [Float], _ desktop: [Float], model: String, server: String, speakers: Bool) async throws -> [(start: Double, text: String, speaker: String?)] {
         let rate = Int(AudioRecorder.targetSampleRate)
         // Models downloaded since the server started (this ASR, its aligner and diarizer) register first.
-        var rescan = URLRequest(url: URL(string: server + "/v1/models/rescan")!)
+        var rescan = APIClient.request(URL(string: server + "/v1/models/rescan")!)
         rescan.httpMethod = "POST"
         _ = try? await URLSession.shared.data(for: rescan)
         let wav = AudioReference.wavData(fromMonoFloat: mix(mic, desktop), sampleRate: rate)
@@ -233,7 +233,8 @@ final class TrayTranscript: ObservableObject {
             "model": model, "max_tokens": 2048, "temperature": 0.3, "enable_thinking": false,
             "messages": [["role": "system", "content": notesPrompt], ["role": "user", "content": notesInput(segments)]],
         ]
-        var request = URLRequest(url: URL(string: server + "/v1/chat/completions")!, timeoutInterval: 3600)
+        var request = APIClient.request(URL(string: server + "/v1/chat/completions")!)
+        request.timeoutInterval = 3600
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -403,7 +404,8 @@ final class TrayTranscript: ObservableObject {
         body.append(wav)
         body.append(Data("\r\n--\(boundary)--\r\n".utf8))
         // An hour of meeting is minutes of work before the first byte comes back.
-        var request = URLRequest(url: URL(string: server + "/v1/audio/transcriptions")!, timeoutInterval: 3600)
+        var request = APIClient.request(URL(string: server + "/v1/audio/transcriptions")!)
+        request.timeoutInterval = 3600
         request.httpMethod = "POST"
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         let (data, response) = try await URLSession.shared.upload(for: request, from: body)

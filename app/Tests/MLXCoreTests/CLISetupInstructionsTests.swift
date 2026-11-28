@@ -743,4 +743,124 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertTrue(CLISetupInstructions.replacesLauncher(features: .mas))
         XCTAssertFalse(CLISetupInstructions.replacesLauncher(features: .developerID))
     }
+
+    func testLaunchedAgentsCarryTheServersKeyOnlyWhenOneIsSet() {
+        defer { APIClient.localKey = "" }
+        let url = "http://localhost:11234"
+        APIClient.localKey = ""
+        XCTAssertTrue(LauncherCLI.claudeCode.scriptBody(url, "m", "", budget, []).contains("ANTHROPIC_AUTH_TOKEN=mlx-serve"))
+        XCTAssertFalse(LauncherCLI.codex.scriptBody(url, "m", "", budget, []).contains("env_key"))
+        XCTAssertFalse(LauncherCLI.opencode.scriptBody(url, "m", "", budget, []).contains("apiKey"))
+        XCTAssertFalse(CLILauncher.fullScript(baseURL: url, body: "x", key: "").contains(AgentConfigs.keyEnv))
+
+        APIClient.localKey = "k"
+        XCTAssertTrue(LauncherCLI.claudeCode.scriptBody(url, "m", "", budget, []).contains("ANTHROPIC_AUTH_TOKEN=k"))
+        XCTAssertTrue(LauncherCLI.aider.scriptBody(url, "m", "", budget, []).contains("OPENAI_API_KEY=k"))
+        let codex = LauncherCLI.codex.scriptBody(url, "m", "", budget, [])
+        XCTAssertTrue(codex.contains("model_providers.mlx.env_key=\"MLX_SERVE_API_KEY\""), codex)
+        XCTAssertFalse(codex.contains("=k"), "the key rides the env, never the command line")
+        XCTAssertTrue(LauncherCLI.opencode.scriptBody(url, "m", "", budget, []).contains("\"apiKey\": \"k\""))
+        XCTAssertTrue(claudeCodeScript(baseURL: url, workingDirectory: nil, budget: budget, apiKey: APIClient.agentKey)
+            .contains("ANTHROPIC_AUTH_TOKEN=k"), "the Tools menu launch must match the launcher row")
+    }
+
+    /// A key with every character the formats treat specially.
+    private let nastyKey = #"!a'b"c\d$HOME e#f"#
+
+    private func shell(_ script: String) throws -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", script]
+        p.environment = ["PATH": "/usr/bin:/bin"]
+        let out = Pipe()
+        p.standardOutput = out
+        try p.run()
+        p.waitUntilExit()
+        return String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    }
+
+    func testEveryShellPlacementCarriesTheKeyVerbatim() throws {
+        let export = AgentConfigs.keyExport(nastyKey)
+        XCTAssertEqual(try shell(export + "printf %s \"$MLX_SERVE_API_KEY\""), nastyKey)
+        let claude = AgentConfigs.claudeCodeExports(baseURL: "http://h:1", model: "m", budget: budget, apiKey: nastyKey)
+        XCTAssertEqual(try shell(claude + "\nprintf %s \"$ANTHROPIC_AUTH_TOKEN\""), nastyKey)
+        defer { APIClient.localKey = "" }
+        APIClient.localKey = nastyKey
+        let body = CLILauncher.opencodeV1Body(baseURL: "http://h:1", model: "m", cdLine: "", budget: budget, entries: [])
+        let line = try XCTUnwrap(body.components(separatedBy: "\nopencode --model").first)
+        let json = try shell(line + "\nprintf %s \"$OPENCODE_CONFIG_CONTENT\"")
+        let obj = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        let options = ((obj["provider"] as? [String: Any])?["mlx"] as? [String: Any])?["options"] as? [String: Any]
+        XCTAssertEqual(options?["apiKey"] as? String, nastyKey)
+    }
+
+    func testConfigFilesCarryTheKeyInTheirOwnSyntax() throws {
+        // pi reads `!cmd` and `$VAR` in a key; its escapes keep the key literal.
+        XCTAssertEqual(AgentConfigs.piLiteral("!x$y"), "$!x$$y")
+        XCTAssertEqual(AgentConfigs.piLiteral("mlx-serve"), "mlx-serve")
+        let pi = AgentConfigs.piModelsJSON(baseURL: "http://h:1", model: "m", budget: budget, apiKey: nastyKey)
+        let piObj = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(pi.utf8)) as? [String: Any])
+        let mlx = (piObj["providers"] as? [String: Any])?["mlx"] as? [String: Any]
+        XCTAssertEqual(mlx?["apiKey"] as? String, AgentConfigs.piLiteral(nastyKey))
+        let ext = AgentConfigs.piModelsExtensionJS(baseURL: "http://h:1", apiKey: nastyKey)
+        XCTAssertTrue(ext.contains("const API_KEY = \(AgentConfigs.quoted(nastyKey));"), "the fetch header sends the raw key")
+        XCTAssertTrue(ext.contains("apiKey: \(AgentConfigs.quoted(AgentConfigs.piLiteral(nastyKey))),"))
+        // omp resolves an env var by name and runs `!cmd`, so a keyed launch names ours.
+        XCTAssertTrue(AgentConfigs.ompModelsYML(baseURL: "http://h:1", defaultModel: "m", entries: [], keyed: true)
+            .contains("apiKey: MLX_SERVE_API_KEY"))
+        XCTAssertTrue(AgentConfigs.ompModelsYML(baseURL: "http://h:1", defaultModel: "m", entries: [])
+            .contains("apiKey: mlx-serve"))
+        XCTAssertTrue(AgentConfigs.grokConfigTOML(baseURL: "http://h:1", model: "m", budget: budget, entries: [], apiKey: nastyKey)
+            .contains("api_key = \(AgentConfigs.quoted(nastyKey))"))
+        let zcode = AgentConfigs.zcodeProviderJSON(baseURL: "http://h:1", model: "m", budget: budget, entries: [], apiKey: nastyKey)
+        let zObj = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(zcode.utf8)) as? [String: Any])
+        let rules = ((zObj["config"] as? [String: Any])?["providerConfigRules"] as? [String: Any])?["providerRules"] as? [[String: Any]]
+        let access = (rules?.first?["config"] as? [String: Any])?["access"] as? [String: Any]
+        XCTAssertEqual(access?["apiKey"] as? String, nastyKey)
+        XCTAssertTrue(AgentConfigs.hermesConfigYAML(baseURL: "http://h:1", apiKey: nastyKey, model: "m", budget: budget, entries: [])
+            .contains("api_key: \(AgentConfigs.quoted(nastyKey))"))
+        // python-dotenv expands `${VAR}` outside single quotes.
+        XCTAssertEqual(AgentConfigs.dotenvValue("mlx-serve"), "mlx-serve")
+        XCTAssertEqual(AgentConfigs.dotenvValue("a b$c"), "'a b$c'")
+        XCTAssertEqual(AgentConfigs.dotenvValue("a'b"), AgentConfigs.quoted("a'b"))
+        let cli = AgentConfigs.opencode2CliJSON(existing: "{}", baseURL: "http://localhost:1", apiKey: nastyKey)
+        let cliObj = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(cli.utf8)) as? [String: Any])
+        let plugin = (cliObj["plugins"] as? [[String: Any]])?.last?["options"] as? [String: Any]
+        XCTAssertEqual(plugin?["metricsToken"] as? String, nastyKey)
+    }
+
+    func testInstructionsCarryTheKeyWhenTheServerHasOne() throws {
+        let keyed = CLISetupInstructions.tabs(baseURL: "http://localhost:11234", servedModelId: "m",
+                                              budget: budget, apiKey: "k")
+        func cmd(_ id: String) throws -> String { try XCTUnwrap(keyed.first { $0.id == id }).command }
+        XCTAssertTrue(try cmd("codex").hasPrefix("export MLX_SERVE_API_KEY=k\n"))
+        XCTAssertTrue(try cmd("codex").contains("env_key"))
+        XCTAssertTrue(try cmd("omp").hasPrefix("export MLX_SERVE_API_KEY=k\n"))
+        XCTAssertTrue(try cmd("claude").contains("ANTHROPIC_AUTH_TOKEN=k"))
+        XCTAssertTrue(try cmd("aider").contains("OPENAI_API_KEY=k"))
+        XCTAssertTrue(try cmd("opencode").contains("\"apiKey\": \"k\""))
+        XCTAssertTrue(try cmd("hermes").contains("OPENAI_API_KEY=k"))
+        XCTAssertFalse(tabs.contains { $0.command.contains(AgentConfigs.keyEnv) }, "no key, no export")
+    }
+
+    func testOnlyFxIsRefusedAndOnlyByAStrictRunningServer() {
+        var strict = ServerOptions()
+        strict.apiKey = "k"; strict.apiKeyStrict = true
+        XCTAssertNotNil(TerminalSessionStore.keylessRefusal(.fx, launched: strict))
+        XCTAssertNil(TerminalSessionStore.keylessRefusal(.fx, launched: nil), "a stopped server refuses nothing")
+        var keyless = strict
+        keyless.apiKey = " "
+        XCTAssertNil(TerminalSessionStore.keylessRefusal(.fx, launched: keyless))
+        XCTAssertNil(TerminalSessionStore.keylessRefusal(.claudeCode, launched: strict))
+    }
+
+    func testAgentConfigDirsAreOwnerOnly() throws {
+        let dir = NSTemporaryDirectory() + "mlx-private-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o755])
+        XCTAssertEqual(CLILauncher.privateConfigDir(dir), dir)
+        let mode = try FileManager.default.attributesOfItem(atPath: dir)[.posixPermissions] as? Int
+        XCTAssertEqual(mode, 0o700)
+    }
 }

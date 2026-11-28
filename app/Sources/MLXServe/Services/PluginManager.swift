@@ -77,7 +77,7 @@ final class PluginManager: ObservableObject {
 
     nonisolated private static func fetchServerStatus(port: UInt16) async -> [String: PluginCatalog.ServerStatus] {
         guard let url = URL(string: "http://127.0.0.1:\(port)/props") else { return [:] }
-        var request = URLRequest(url: url)
+        var request = APIClient.request(url)
         request.timeoutInterval = 3
         guard let (data, _) = try? await URLSession.shared.data(for: request) else { return [:] }
         return PluginCatalog.serverStatus(fromProps: data)

@@ -249,7 +249,7 @@ struct DecisionsPane: View {
             let info = try await server.loadModel(id: dir)
             var body = requestBody
             body["model"] = info.name
-            var req = URLRequest(url: URL(string: "http://localhost:\(port)/v1/decisions")!)
+            var req = APIClient.request(URL(string: "http://localhost:\(port)/v1/decisions")!)
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try JSONSerialization.data(withJSONObject: body)
