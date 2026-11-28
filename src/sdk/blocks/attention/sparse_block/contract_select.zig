@@ -249,7 +249,7 @@ fn wrapper(k: *Select, split: bool) ![]const u8 {
 }
 
 test "kernel contract sparse_block: qsa_select's declared launches, chained, are the shipped wrapper's bytes" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var single = Select.init(a, .single);
     defer single.deinit();

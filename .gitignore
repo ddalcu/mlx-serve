@@ -36,6 +36,7 @@ zig-out/
 /.work-mlx-linux-cuda/
 /.work-mlx-linux-cpu/
 /lib/jinja_cpp/libjinja-linux.a
+/lib/jinja_cpp/.linux-version
 # ds4 CUDA library (scripts/build-ds4-linux.sh)
 /lib/ds4-linux/
 

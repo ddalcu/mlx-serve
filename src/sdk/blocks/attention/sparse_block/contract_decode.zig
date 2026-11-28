@@ -563,7 +563,7 @@ pub fn register(set: *kc.Set) !void {
 // ── tests ──
 
 test "kernel contract sparse_block: the qsa_decode launches, chained over a strided cache view, are attend's bytes" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var p = Parts.init(a);
     defer p.deinit();

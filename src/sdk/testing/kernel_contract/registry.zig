@@ -5,11 +5,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const mlx = @import("../../../mlx/ffi.zig");
-const env = @import("../../../env.zig");
 const spec = @import("spec.zig");
 const gates = @import("gates.zig");
 const limits = @import("limits.zig");
 const metal = @import("metal.zig");
+const shard = @import("../shard.zig");
 
 const areas = .{
     @import("controls.zig"),
@@ -109,24 +109,16 @@ test "kernel contract gate 5: every registered launch fits every chip, every lim
     try std.testing.expectEqual(@as(usize, 0), bad);
 }
 
-fn shard() struct { k: usize, n: usize } {
-    const raw = env.span(.MLX_SERVE_TEST_SHARD) orelse return .{ .k = 0, .n = 1 };
-    const slash = std.mem.indexOfScalar(u8, raw, '/') orelse return .{ .k = 0, .n = 1 };
-    const k = std.fmt.parseUnsigned(usize, raw[0..slash], 10) catch return .{ .k = 0, .n = 1 };
-    const n = std.fmt.parseUnsigned(usize, raw[slash + 1 ..], 10) catch return .{ .k = 0, .n = 1 };
-    return if (n == 0 or k >= n) .{ .k = 0, .n = 1 } else .{ .k = k, .n = n };
-}
-
 test "sharded: kernel contract gates 1-4: every registered kernel passes, every planted control goes red" {
     if (!builtin.os.tag.isDarwin() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var set = try build(a);
     defer set.deinit();
     // A sharded run (`MLX_SERVE_TEST_SHARD=k/n`) checks every n-th kernel from k.
-    const sh = shard();
+    const sh = shard.current();
     var mine: std.ArrayList(gates.Kernel) = .empty;
     defer mine.deinit(a);
-    for (set.kernels.items, 0..) |k, i| if (i % sh.n == sh.k) try mine.append(a, k);
+    for (set.kernels.items, 0..) |k, i| if (sh.owns(i)) try mine.append(a, k);
     var t: gates.Tally = .{};
     try gates.runAll(a, mine.items, 0xc0de, &t);
     std.debug.print("SUMMARY kernel contract: {d}/{d} kernels pass gates 1-4, {d} known findings, {d}/{d} controls red, {d} need NAX\n", .{ t.passed, t.kernels, t.known, t.caught, t.controls, t.skipped });

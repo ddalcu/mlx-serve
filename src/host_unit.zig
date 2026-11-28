@@ -3,6 +3,7 @@
 //! `src/exe.zig` calls. Builds the `Init` std's start code would have (std.start `callMain`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const main_mod = @import("main.zig");
 
 // What the absorbed modules read from their host root (`mlx_host`), as `main.zig` declares them.
@@ -12,7 +13,7 @@ pub const io_util = main_mod.io_util;
 pub const log = main_mod.log;
 
 comptime {
-    @export(&hostMain, .{ .name = "mlx_serve_host_main" });
+    @export(if (builtin.os.tag == .windows) &hostMainWindows else &hostMain, .{ .name = "mlx_serve_host_main" });
     // The host owns every `Shared`'s storage; the engine and plugin units link to it.
     _ = @import("shared_all.zig");
 }
@@ -30,6 +31,14 @@ fn hostMain(argc: c_int, argv: [*][*:0]u8, envp: [*:null]?[*:0]u8) callconv(.c) 
         t.environ = .{ .process_environ = .{ .block = environ } };
         t.environ_initialized = environ.isEmpty();
     }
+    return runMain(args, environ);
+}
+
+fn hostMainWindows(command_line: [*]const u16, len: usize) callconv(.c) u8 {
+    return runMain(command_line[0..len], .global);
+}
+
+fn runMain(args: std.process.Args.Vector, environ: std.process.Environ.Block) u8 {
     const gpa = std.heap.c_allocator;
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena.deinit();

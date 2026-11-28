@@ -2913,7 +2913,7 @@ test "kernel contract moe: each declared launch is the shipped wrapper's, byte f
 }
 
 test "kernel contract moe: the fp4 launches, chained, are moe_fp4.decode's bytes" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var set = kc.Set.init(a);
     defer set.deinit();
@@ -2948,7 +2948,7 @@ test "kernel contract moe: each router launch is moeRouterTopK's bytes" {
 }
 
 test "kernel contract moe: each verify launch is its wrapper's bytes, the prefill route's three chained" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const outer = vp.verify_group_rows;
     vp.verify_group_rows = 2; // a two-stream group: the dual-die M5 takes the shared kernels only then

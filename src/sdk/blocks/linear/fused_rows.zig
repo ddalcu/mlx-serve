@@ -290,6 +290,7 @@ test "fused row projections are bit-identical to the separate matmuls at decode 
     // Bar: for M in 1..FUSED_ROWS_MAX_M the joined matmul's slices equal the
     // separate matmuls byte for byte, and each rewritten VIEW equals its
     // original at a prefill width too (the separate path must not move).
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xF05ED);

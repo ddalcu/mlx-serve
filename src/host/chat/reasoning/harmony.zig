@@ -195,8 +195,16 @@ pub fn harmonyStreamVerdict(buf: []const u8) ?StreamThinkGate {
     const seg = buf[seg_start..];
     const chan_rel = std.mem.indexOf(u8, seg, HARMONY_CHANNEL_TAG) orelse return .hold_thinking;
     const msg_rel = std.mem.indexOfPos(u8, seg, chan_rel, HARMONY_MSG_TAG) orelse return .hold_thinking;
-    const header = seg[0..msg_rel];
+    const closed = std.mem.indexOf(u8, seg, HARMONY_END_TAG) != null or
+        std.mem.indexOf(u8, seg, HARMONY_RETURN_TAG) != null;
+    return harmonyRouteVerdict(harmonyHeaderRoute(seg[0..msg_rel], chan_rel), closed);
+}
 
+/// Where a segment's resolved header sends its body.
+pub const HarmonyRoute = enum { tool, analysis, visible };
+
+/// `header` is a segment up to its `<|message|>`; `chan_rel` is its `<|channel|>`.
+pub fn harmonyHeaderRoute(header: []const u8, chan_rel: usize) HarmonyRoute {
     const after = header[chan_rel + HARMONY_CHANNEL_TAG.len ..];
     var n: usize = 0;
     while (n < after.len and museIsRecipientChar(after[n])) n += 1;
@@ -209,15 +217,19 @@ pub fn harmonyStreamVerdict(buf: []const u8) ?StreamThinkGate {
         break :blk r[0..m];
     } else "";
 
-    // Tool payload: the tools path buffers before this gate is consulted;
-    // hold defensively on a no-tools request rather than leak raw arguments.
-    if (std.mem.startsWith(u8, recipient, "functions.")) return .hold_thinking;
-    if (std.mem.eql(u8, channel, "analysis")) {
-        const closed = std.mem.indexOf(u8, seg, HARMONY_END_TAG) != null or
-            std.mem.indexOf(u8, seg, HARMONY_RETURN_TAG) != null;
-        return if (closed) .split_think else .hold_thinking;
-    }
-    return .split_think;
+    if (std.mem.startsWith(u8, recipient, "functions.")) return .tool;
+    return if (std.mem.eql(u8, channel, "analysis")) .analysis else .visible;
+}
+
+/// The current segment's verdict. A null route is a header still arriving.
+pub fn harmonyRouteVerdict(route: ?HarmonyRoute, closed: bool) StreamThinkGate {
+    return switch (route orelse return .hold_thinking) {
+        // The tools path buffers before this gate is consulted; hold on a
+        // no-tools request rather than leak raw arguments.
+        .tool => .hold_thinking,
+        .analysis => if (closed) .split_think else .hold_thinking,
+        .visible => .split_think,
+    };
 }
 
 /// gpt_oss streaming tool hold: true while a segment header is unresolved

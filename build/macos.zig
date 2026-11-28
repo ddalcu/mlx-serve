@@ -81,6 +81,13 @@ pub const Graph = struct {
             }),
             .embedded = .init(b, target, optimize),
         };
+        const strip = b.option(bool, "strip", "Omit debug info and Zig symbols from mlx-serve and its main test binary");
+        const exe_mod = shared.engineModule(b, target, optimize, host, "src/main.zig");
+        const test_mod = shared.engineModule(b, target, optimize, host, "src/tests.zig");
+        // CI and release strip mlx-serve because ReleaseFast debug info can exceed the macOS runner's 7 GB.
+        // Tests keep Zig frames in failure traces unless the caller opts into stripping.
+        exe_mod.strip = strip;
+        test_mod.strip = strip;
         return .{
             .b = b,
             .target = target,
@@ -88,14 +95,8 @@ pub const Graph = struct {
             .host = host,
             .version = version,
             .units = units,
-            .exe_mod = blk: {
-                const m = shared.engineModule(b, target, optimize, host, "src/main.zig");
-                // CI and release pass -Dstrip: debug info is most of the ReleaseFast compile's peak memory, which
-                // otherwise outgrows a GitHub macOS runner's 7 GB. A stripped binary's crash traces lose Zig names.
-                m.strip = b.option(bool, "strip", "Omit debug info and Zig symbols from the mlx-serve executable");
-                break :blk m;
-            },
-            .test_mod = shared.engineModule(b, target, optimize, host, "src/tests.zig"),
+            .exe_mod = exe_mod,
+            .test_mod = test_mod,
         };
     }
 };
