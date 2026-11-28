@@ -6,7 +6,8 @@
 #
 # MLX_CUDA_ARCHITECTURES  GPU compute capabilities, e.g. "120" (default "75;86;120": RTX 20-50).
 # ZIG_CPU                 CPU baseline for the zig build, e.g. x86_64_v3 (CI); default native.
-# ZIG_BUILD_ARGS          Extra `zig build` arguments, space separated (CI: -Dstrip=true on a PR).
+# ZIG_OPTIMIZE            `zig build -Doptimize=`, default ReleaseFast (Debug on pull requests).
+# ZIG_BUILD_ARGS          Extra `zig build` arguments, space separated.
 # -NoZip                  Stage dist\mlx-serve-windows-x64 without zipping it (CI on a PR).
 #
 # Building MLX needs the CUDA 13.0 toolkit (CUDA_PATH) and cuDNN 9 (CUDNN_PATH); see
@@ -38,7 +39,8 @@ Bash "LLAMA_TARGET=windows scripts/fetch-llama.sh"
 # mlx-serve.
 $cpu = @(if ($env:ZIG_CPU) { "-Dcpu=$env:ZIG_CPU" }) # @(): an `if` would unroll a one-item array to a string
 $extra = @(if ($env:ZIG_BUILD_ARGS) { $env:ZIG_BUILD_ARGS -split ' ' })
-& $zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast @cpu @extra
+$optimize = if ($env:ZIG_OPTIMIZE) { $env:ZIG_OPTIMIZE } else { "ReleaseFast" }
+& $zig build -Dtarget=x86_64-windows-gnu "-Doptimize=$optimize" @cpu @extra
 if ($LASTEXITCODE) { throw "zig build failed" }
 
 # Package: the exe beside every DLL it loads, and MLX's headers for its kernel JIT.

@@ -248,7 +248,7 @@ fn randTriple(rows: c_int, d: c_int, s: mlx.mlx_stream) ![3]mlx.mlx_array {
 }
 
 test "addNorm declines, and stays declined, when the GPU refuses the looped width's threadgroup" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const s = mlx.gpuStream();
     looped_nt_override = 2048;

@@ -147,6 +147,7 @@ fn hostF32(s: mlx.mlx_stream, a: mlx.mlx_array) !struct { arr: mlx.mlx_array, da
 }
 
 test "qsa decode: the one-token kernel is no worse than the masked SDPA against the f64 truth" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const mask_mod = @import("mask.zig");
     const s = mlx.gpuStream();
     const hq: usize = 24;

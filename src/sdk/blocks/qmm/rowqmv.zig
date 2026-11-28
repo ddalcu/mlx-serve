@@ -387,7 +387,7 @@ test "rowqmv.qmv: a one-row call is bit-equal to stock quantized_matmul at 4, 6 
 }
 
 test "rowqmv.qmvAct: relu2 is max(bf16(y), 0)^2 rounded to bf16, rows width-invariant" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const a = testing.allocator;
     var prng = std.Random.DefaultPrng.init(11);

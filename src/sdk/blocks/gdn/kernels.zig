@@ -1399,7 +1399,7 @@ test "GDN pipelined route: each model type gets its own verdict in one process" 
 }
 
 test "GDN blocked-seq and pipelined kernels: no worse than stock vs f64 ground truth (T/GQA/Dv/TB sweep)" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     // T deliberately hits non-multiples of every supported TB (16/32/48);
     // Hk<Hv exercises GQA head mapping; Dv 32..128 exercises 1..4 DB blocks.

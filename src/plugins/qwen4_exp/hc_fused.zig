@@ -225,6 +225,7 @@ pub fn hcReadFused(
 // ── tests ──
 
 test "fused hyper-connection read matches the op chain per element, at every packed width and dense bf16" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     for ([_]u32{ 4, 5, 6, 8 }) |bits| for ([_]u32{ 64, 128 }) |gs| try hcFusedReadParity(bits, gs);
     try hcFusedReadParity(16, 64);
 }

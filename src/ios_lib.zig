@@ -36,6 +36,10 @@ pub const panic = std.debug.simple_panic;
 // pub: Sushi's EXL3 module (src/sdk/quant/exl3/sushi) reaches mlx, log, io_util and env through its host root (`mlx_host`).
 pub const mlx = @import("mlx/ffi.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
+comptime {
+    // iOS has no units: every plugin compiled in, exporting the tables `plugins/registry.zig` takes by name under -Dunits.
+    _ = @import("plugins/registry_full.zig");
+}
 const model_mod = @import("sdk/config/model.zig");
 const transformer_mod = @import("engines/mlx/transformer.zig");
 const model_discovery = @import("host/registry/discovery.zig");

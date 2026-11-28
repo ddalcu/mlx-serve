@@ -1,5 +1,5 @@
 //! Configure-time plugin registration: scans `src/plugins/*/plugin.zig`, checks that each plugin's `config.zig` reaches
-//! no MLX (its import closure), and writes `src/plugins/registry.zig` (generated, git-ignored). Folders starting with
+//! no MLX (its import closure), and writes `src/plugins/registry.zig` and `registry_full.zig` (generated, git-ignored). Folders starting with
 //! `_` are templates: compiled and tested, never registered.
 
 const std = @import("std");
@@ -7,13 +7,15 @@ const std = @import("std");
 const plugins_dir = "src/plugins";
 const configs_dir = "src/fixtures/model-configs";
 const registry_path = "src/plugins/registry.zig";
+const registry_full_path = "src/plugins/registry_full.zig";
 
 /// What a `config.zig` may never reach: the MLX layer and everything built on it. Anything outside `src/` too.
 const denied = [_][]const u8{ "src/mlx/", "src/engines/", "src/host/", "src/kernels/" };
 
 /// Zig caches the configure phase: every input the scan reads is declared, so a new plugin folder, a changed
-/// `config.zig` closure, a new fixture or a deleted registry re-runs it. Returns the registered plugins' names.
-pub fn generate(b: *std.Build) []const []const u8 {
+/// `config.zig` closure, a new fixture or a deleted registry re-runs it. `units`: the main graph builds `-Dunits`.
+/// Returns the registered plugins' names.
+pub fn generate(b: *std.Build, units: bool) []const []const u8 {
     const a = b.allocator;
     const io = b.graph.io;
     const root = b.root.root_dir.handle;
@@ -42,9 +44,12 @@ pub fn generate(b: *std.Build) []const []const u8 {
         const text = root.readFileAlloc(io, b.fmt("{s}/{s}/config.zig", .{ plugins_dir, n }), a, .limited(1 << 20)) catch "";
         f.* = std.mem.indexOf(u8, text, "\npub const plugin = ") != null;
     }
-    const src = render(a, split.plugins, in_config, split.templates, jsons.items) catch @panic("OOM");
-    writeIfChanged(io, root, registry_path, src) catch |e| std.process.fatal("plugins: cannot write {s}: {t}", .{ registry_path, e });
-    b.dependOnFileContents(b.path(registry_path));
+    const full = renderFull(a, split.plugins, split.templates, jsons.items) catch @panic("OOM");
+    const facade = renderFacade(a, units, split.plugins, in_config, jsons.items) catch @panic("OOM");
+    for ([_][2][]const u8{ .{ registry_full_path, full }, .{ registry_path, facade } }) |w| {
+        writeIfChanged(io, root, w[0], w[1]) catch |e| std.process.fatal("plugins: cannot write {s}: {t}", .{ w[0], e });
+        b.dependOnFileContents(b.path(w[0]));
+    }
     return split.plugins;
 }
 
@@ -82,6 +87,76 @@ pub fn writeUnitRoots(b: *std.Build, groups: []const []const []const u8) []const
         writeIfChanged(b.graph.io, b.root.root_dir.handle, path.*, out.items) catch |e| std.process.fatal("units: cannot write {s}: {t}", .{ path.*, e });
     }
     return paths;
+}
+
+/// `-Dunits` plugin groups packed so plugins that compile the same SDK code share an object, each at most as costly as
+/// the largest round-robin group for 8, 4 and 3 groups: same longest compile, about half the code compiled in total.
+/// Regenerate with `scripts/unit_groups.py` when plugins come or go; a test names any plugin the table misses.
+const packed_groups = [_][]const []const []const u8{
+    &.{
+        &.{ "clef", "d1", "hy_v3", "kev", "laguna", "lfm2", "llama", "moss_image", "nemotron_h", "nemotron_transcribe", "prism_hadamard_qwen35", "qwen3", "qwen3_5", "qwen3_asr", "qwen3_next", "qwen4_exp" },
+        &.{ "bailing_hybrid", "bert", "embedding_gemma", "embedding_gemma2", "flint", "gemma3", "gemma4", "glm5_next", "gpt_oss", "inkling", "inkling2", "k2_horizon", "kolibri1", "lfm3", "ltx", "mimo_v2", "minimax_h3", "minimax_h3_image", "muse_glimmer", "spark2_5" },
+        &.{ "acestep", "deepseek_v41", "flux2", "hunyuan3d", "idol", "krea", "laya", "mage_flow", "ming_tts", "music3", "nemotron_diarization", "pixal3d", "qwen3_tts", "qwen_image", "stable_audio3", "trellis2" },
+        &.{ "deepseek_v4", "kokoro", "yue2" },
+    },
+    &.{
+        &.{ "bailing_hybrid", "clef", "d1", "flint", "gemma3", "gemma4", "glm5_next", "gpt_oss", "hy_v3", "k2_horizon", "kev", "kolibri1", "laguna", "lfm2", "lfm3", "llama", "ltx", "mimo_v2", "moss_image", "muse_glimmer", "nemotron_h", "nemotron_transcribe", "prism_hadamard_qwen35", "qwen3", "qwen3_5", "qwen3_asr", "qwen3_next", "qwen4_exp", "spark2_5" },
+        &.{ "acestep", "bert", "deepseek_v41", "embedding_gemma", "embedding_gemma2", "flux2", "inkling", "inkling2", "krea", "mage_flow", "ming_tts", "minimax_h3", "minimax_h3_image", "music3", "qwen3_tts", "qwen_image" },
+        &.{ "deepseek_v4", "hunyuan3d", "idol", "kokoro", "laya", "nemotron_diarization", "pixal3d", "stable_audio3", "trellis2", "yue2" },
+    },
+    &.{
+        &.{ "bailing_hybrid", "bert", "clef", "d1", "embedding_gemma", "embedding_gemma2", "flint", "gemma3", "gemma4", "glm5_next", "gpt_oss", "hy_v3", "inkling", "inkling2", "k2_horizon", "kev", "kolibri1", "laguna", "lfm2", "lfm3", "llama", "ltx", "mimo_v2", "minimax_h3", "moss_image", "muse_glimmer", "nemotron_h", "nemotron_transcribe", "prism_hadamard_qwen35", "qwen3", "qwen3_5", "qwen3_asr", "qwen3_next", "qwen4_exp", "spark2_5" },
+        &.{ "acestep", "deepseek_v4", "deepseek_v41", "flux2", "hunyuan3d", "idol", "kokoro", "krea", "laya", "mage_flow", "ming_tts", "minimax_h3_image", "music3", "nemotron_diarization", "pixal3d", "qwen3_tts", "qwen_image", "stable_audio3", "trellis2", "yue2" },
+    },
+};
+
+/// `names` in at most `max_groups` plugin groups: one plugin each when that many fit (what `scripts/unit_groups.py`
+/// measures), else the largest packed table that fits, a plugin it misses dealt round-robin after the packed ones, or
+/// one group when only one fits.
+pub fn assignGroups(a: std.mem.Allocator, names: []const []const u8, max_groups: usize) ![]const []const []const u8 {
+    if (max_groups >= names.len) {
+        const solo = try a.alloc([]const []const u8, names.len);
+        for (solo, names) |*s, *n| s.* = n[0..1];
+        return solo;
+    }
+    const table: []const []const []const u8 = for (packed_groups) |t| {
+        if (t.len <= max_groups) break t;
+    } else &.{names};
+    const groups = try a.alloc(std.ArrayList([]const u8), table.len);
+    for (groups) |*g| g.* = .empty;
+    var spill: usize = 0;
+    for (names) |n| {
+        const gi = for (table, 0..) |t, i| {
+            if (contains(t, n)) break i;
+        } else blk: {
+            spill += 1;
+            break :blk (spill - 1) % table.len;
+        };
+        try groups[gi].append(a, n);
+    }
+    var out: std.ArrayList([]const []const u8) = .empty;
+    for (groups) |g| if (g.items.len > 0) try out.append(a, g.items);
+    return out.items;
+}
+
+/// The `-Dunits` plugin groups for a build at `optimize`: packed for Debug, where the tables were measured; dealt
+/// round-robin otherwise, where the packed media group compiles longer at -O3 than the engine object.
+pub fn unitGroups(a: std.mem.Allocator, names: []const []const u8, max_groups: usize, optimize: std.builtin.OptimizeMode) ![]const []const []const u8 {
+    if (optimize == .debug) return assignGroups(a, names, max_groups);
+    const n = @min(names.len, @max(max_groups, 1));
+    const groups = try a.alloc([]const []const u8, n);
+    for (groups, 0..) |*g, gi| {
+        var list: std.ArrayList([]const u8) = .empty;
+        var i = gi;
+        while (i < names.len) : (i += n) try list.append(a, names[i]);
+        g.* = list.items;
+    }
+    return groups;
+}
+
+fn contains(list: []const []const u8, name: []const u8) bool {
+    for (list) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
 }
 
 /// The build's own tests of this file (the scan, the closure check, the rendering), on the host.
@@ -200,20 +275,21 @@ fn chain(a: std.mem.Allocator, parent: *const std.StringHashMapUnmanaged([]const
     return std.mem.join(a, " -> ", hops.items);
 }
 
-/// `in_config[i]`: plugin i declares its metadata (`plugin`) in its `config.zig`.
-/// `units`: the `-Dunits` form, metadata only (each `config.zig`) and the extern tables the unit objects export, so the
-/// host's closure holds no plugin's code and a plugin edit rebuilds its unit alone. Tests need the full form.
-fn render(a: std.mem.Allocator, plugins: []const []const u8, in_config: []const bool, templates: []const []const u8, configs: []const []const u8) ![]u8 {
+const header =
+    \\//! GENERATED at configure time by build/plugins.zig from src/plugins/*/plugin.zig: never edit, never commit.
+    \\//! Folders starting with `_` are templates: compiled and tested, never registered.
+    \\
+    \\const sdk = @import("../sdk/plugin.zig");
+    \\const File = @import("../sdk/testing/fixture.zig").File;
+    \\
+    \\
+;
+
+/// `registry_full.zig`: every plugin's and template's code, compiled into one unit. The tests, the iOS library and every
+/// build without `-Dunits` serve it.
+fn renderFull(a: std.mem.Allocator, plugins: []const []const u8, templates: []const []const u8, configs: []const []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(a,
-        \\//! GENERATED at configure time by build/plugins.zig from src/plugins/*/plugin.zig: never edit, never commit.
-        \\//! Folders starting with `_` are templates: compiled and tested, never registered.
-        \\
-        \\const sdk = @import("../sdk/plugin.zig");
-        \\const File = @import("../sdk/testing/fixture.zig").File;
-        \\
-        \\
-    );
+    try out.appendSlice(a, header);
     inline for (.{ .{ "plugins", plugins }, .{ "templates", templates } }) |list| {
         try out.print(a, "pub const {s} = [_]type{{\n", .{list[0]});
         for (list[1]) |n| try out.print(a, "    @import(\"{s}/plugin.zig\"),\n", .{n});
@@ -221,17 +297,14 @@ fn render(a: std.mem.Allocator, plugins: []const []const u8, in_config: []const 
         for (list[1]) |n| try out.print(a, "    \"{s}\",\n", .{n});
         try out.appendSlice(a, "};\n");
     }
-    try renderMetas(a, &out, plugins, in_config, configs);
+    try renderConfigs(a, &out, configs);
     try out.appendSlice(a,
         \\
-        \\/// `-Dunits`: every plugin is its own compile unit (`src/unit.zig`) exporting its table; the host links them by name.
-        \\const units = @import("build_options").units and !@import("builtin").is_test;
-        \\
-        \\pub const entries = if (units) sdk.externEntries(&unit_metas) else sdk.entries(&plugins, &plugins_names);
+        \\pub const entries = sdk.entries(&plugins, &plugins_names);
         \\
         \\comptime {
         \\    _ = sdk.entries(&templates, &templates_names);
-        \\    if (!units) sdk.exportAll(&plugins);
+        \\    sdk.exportAll(&plugins);
         \\}
         \\
         \\test "plugin registry: every template and plugin passes conformance; one plugin claims each fixture pack" {
@@ -242,10 +315,44 @@ fn render(a: std.mem.Allocator, plugins: []const []const u8, in_config: []const 
     return out.items;
 }
 
-fn renderMetas(a: std.mem.Allocator, out: *std.ArrayList(u8), plugins: []const []const u8, in_config: []const bool, configs: []const []const u8) !void {
-    try out.appendSlice(a, "\n/// Each plugin's metadata as `-Dunits` reads it: from its `config.zig` (no plugin code), else its `plugin.zig`.\nconst unit_metas = [_]sdk.Plugin{\n");
+/// `registry.zig`, what the host and the engine import. Without `-Dunits` it is `registry_full.zig`. Under `-Dunits` it
+/// names no `plugin.zig` (Zig keys an object on every file its sources import, so the host, engine and modules objects
+/// would rebuild on any plugin edit): each `config.zig`'s metadata and the extern tables the unit objects export. The
+/// tests and the iOS library import `registry_full.zig`, whose `exportAll` defines the same tables in their binary.
+/// `in_config[i]`: plugin i declares its metadata (`plugin`) in its `config.zig`.
+fn renderFacade(a: std.mem.Allocator, units: bool, plugins: []const []const u8, in_config: []const bool, configs: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    if (!units) {
+        try out.appendSlice(a,
+            \\//! GENERATED at configure time by build/plugins.zig: never edit, never commit. Built without `-Dunits`: the
+            \\//! full registry.
+            \\
+            \\const full = @import("registry_full.zig");
+            \\pub const entries = full.entries;
+            \\pub const model_configs = full.model_configs;
+            \\
+            \\test {
+            \\    _ = full;
+            \\}
+            \\
+        );
+        return out.items;
+    }
+    try out.appendSlice(a, header);
+    try out.appendSlice(a, "/// Each plugin's metadata as `-Dunits` reads it: from its `config.zig` (no plugin code), else its `plugin.zig`.\nconst unit_metas = [_]sdk.Plugin{\n");
     for (plugins, in_config) |n, c| try out.print(a, "    @import(\"{s}/{s}.zig\").plugin,\n", .{ n, if (c) "config" else "plugin" });
     try out.appendSlice(a, "};\n");
+    try renderConfigs(a, &out, configs);
+    try out.appendSlice(a,
+        \\
+        \\/// The tables the unit objects export, or `registry_full.zig` exports where a root imports it (tests, iOS).
+        \\pub const entries = sdk.externEntries(&unit_metas);
+        \\
+    );
+    return out.items;
+}
+
+fn renderConfigs(a: std.mem.Allocator, out: *std.ArrayList(u8), configs: []const []const u8) !void {
     try out.appendSlice(a, "\n/// Every fixture config.json: the packs the claims test runs through every plugin.\npub const model_configs = [_]File{\n");
     for (configs) |c| try out.print(a, "    .{{ .name = \"{s}\", .bytes = @embedFile(\"../fixtures/model-configs/{s}\") }},\n", .{ c, c });
     try out.appendSlice(a, "};\n");
@@ -339,24 +446,95 @@ test "build plugins: templates compile beside the registry but are never registe
     const split = try splitTemplates(a, &.{ "_template", "flint", "_template_media", "laguna" });
     try testing.expectEqual(@as(usize, 2), split.plugins.len);
     try testing.expectEqualStrings("laguna", split.plugins[1]);
-    const in_config = try a.alloc(bool, split.plugins.len);
-    @memset(in_config, false);
-    const src = try render(a, split.plugins, in_config, split.templates, &.{"laguna.json"});
+    const src = try renderFull(a, split.plugins, split.templates, &.{"laguna.json"});
     try testing.expect(std.mem.indexOf(u8, src, "pub const plugins = [_]type{\n    @import(\"flint/plugin.zig\"),\n    @import(\"laguna/plugin.zig\"),\n};") != null);
     try testing.expect(std.mem.indexOf(u8, src, "pub const templates = [_]type{\n    @import(\"_template/plugin.zig\"),\n    @import(\"_template_media/plugin.zig\"),\n};") != null);
     try testing.expect(std.mem.indexOf(u8, src, "@embedFile(\"../fixtures/model-configs/laguna.json\")") != null);
     try testing.expect(std.mem.indexOf(u8, src, "sdk.exportAll(&plugins);") != null);
     // An empty registry still renders valid arrays.
-    const none = try render(a, &.{}, &.{}, &.{}, &.{});
+    const none = try renderFull(a, &.{}, &.{}, &.{});
     try testing.expect(std.mem.indexOf(u8, none, "pub const plugins = [_]type{\n};") != null);
 }
 
-test "build plugins: the -Dunits metadata reads each plugin's config.zig where it declares one" {
+test "build plugins: the -Dunits registry names no plugin.zig a config.zig can stand in for" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const src = try render(a, &.{ "flint", "laguna" }, &.{ true, false }, &.{"_template"}, &.{"laguna.json"});
+    const src = try renderFacade(a, true, &.{ "flint", "laguna" }, &.{ true, false }, &.{"laguna.json"});
     try testing.expect(std.mem.indexOf(u8, src, "@import(\"flint/config.zig\").plugin,") != null);
     try testing.expect(std.mem.indexOf(u8, src, "@import(\"laguna/plugin.zig\").plugin,") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "sdk.externEntries(&unit_metas)") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "/plugin.zig\").plugin"));
+    try testing.expect(std.mem.indexOf(u8, src, "[_]type") == null);
+    try testing.expect(std.mem.indexOf(u8, src, "pub const entries = sdk.externEntries(&unit_metas);") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "@embedFile(\"../fixtures/model-configs/laguna.json\")") != null);
+}
+
+test "build plugins: without -Dunits the registry is the full one" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src = try renderFacade(arena.allocator(), false, &.{"flint"}, &.{true}, &.{});
+    try testing.expect(std.mem.indexOf(u8, src, "const full = @import(\"registry_full.zig\");") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "/plugin.zig\")") == null);
+}
+
+test "build plugins: every packed table holds every registered plugin once (else rerun scripts/unit_groups.py)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const root = std.Io.Dir.cwd();
+    var registered: std.ArrayList([]const u8) = .empty;
+    for (try listDir(a, io, root, plugins_dir, .directory)) |f| {
+        if (f[0] == '_') continue;
+        if (root.access(io, try std.fmt.allocPrint(a, "{s}/{s}/build.zig", .{ plugins_dir, f }), .{})) |_| continue else |_| {}
+        root.access(io, try std.fmt.allocPrint(a, "{s}/{s}/plugin.zig", .{ plugins_dir, f }), .{}) catch continue;
+        try registered.append(a, f);
+    }
+    try testing.expect(registered.items.len > 0);
+    for (packed_groups) |table| {
+        var count: usize = 0;
+        for (table) |g| count += g.len;
+        for (registered.items) |n| {
+            var seen: usize = 0;
+            for (table) |g| seen += @intFromBool(contains(g, n));
+            if (seen != 1) std.debug.print("plugin {s} is in {d} groups of a {d}-group packed table: rerun scripts/unit_groups.py\n", .{ n, seen, table.len });
+            try testing.expectEqual(@as(usize, 1), seen);
+        }
+        try testing.expectEqual(registered.items.len, count);
+    }
+}
+
+test "build plugins: assignGroups takes the largest packed table that fits and deals unknown plugins round-robin" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const names = [_][]const u8{ "kokoro", "qwen3", "llama", "krea", "deepseek_v4", "zz_new_a", "zz_new_b" };
+    const four = try assignGroups(a, &names, 4);
+    try testing.expectEqual(@as(usize, 4), four.len);
+    var total: usize = 0;
+    for (four) |g| total += g.len;
+    try testing.expectEqual(names.len, total);
+    try testing.expect(contains(four[0], "qwen3") and contains(four[0], "llama"));
+    try testing.expect(contains(four[3], "kokoro") and contains(four[3], "deepseek_v4"));
+    try testing.expectEqual(@as(usize, 2), (try assignGroups(a, &names, 2)).len);
+    try testing.expectEqual(names.len, (try assignGroups(a, &names, names.len)).len);
+    const one = try assignGroups(a, &names, 1);
+    try testing.expectEqual(@as(usize, 1), one.len);
+    try testing.expectEqual(names.len, one[0].len);
+    try testing.expectEqual(@as(usize, 0), (try assignGroups(a, &.{}, 4)).len);
+}
+
+test "build plugins: only Debug builds take the packed groups; release builds deal round-robin" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const names = [_][]const u8{ "kokoro", "qwen3", "llama", "krea", "deepseek_v4" };
+    const debug = try unitGroups(a, &names, 4, .debug);
+    try testing.expect(contains(debug[0], "qwen3") and contains(debug[0], "llama"));
+    const fast = try unitGroups(a, &names, 2, .ReleaseFast);
+    try testing.expectEqual(@as(usize, 2), fast.len);
+    try testing.expectEqualStrings("kokoro", fast[0][0]);
+    try testing.expectEqualStrings("llama", fast[0][1]);
+    try testing.expectEqualStrings("qwen3", fast[1][0]);
+    try testing.expectEqual(@as(usize, 1), (try unitGroups(a, &names, 0, .ReleaseFast)).len);
 }

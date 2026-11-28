@@ -833,7 +833,7 @@ test "qsa sparse attn: one fused dispatch equals the union gather at verify widt
 test "qsa sparse attn: the split-K merge is invariant in the split count (1, 8, 64)" {
     // Splitting a row's key range and recombining the per-split online-softmax states must be
     // exact: a wrong merge would move the answer with NSPLIT. NSPLIT = 1 is the control.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
     const ratio: c_int = 4;

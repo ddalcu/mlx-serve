@@ -215,7 +215,7 @@ test "verify expert reduction preserves unsort multiply and sum" {
 }
 
 test "prefill expert reduction is bit-identical to unsort multiply and sum" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x5EED_3A11);
     // (top_k, hidden): Qwen3-30B-A3B (8, 2048), Qwen3.6-35B (10, 2560), and MiMo-V2.6 (8, 4096) geometries.

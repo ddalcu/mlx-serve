@@ -36,6 +36,7 @@ zig-out/
 /.work-mlx-linux-cuda/
 /.work-mlx-linux-cpu/
 /lib/jinja_cpp/libjinja-linux.a
+/lib/jinja_cpp/.linux-version
 # ds4 CUDA library (scripts/build-ds4-linux.sh)
 /lib/ds4-linux/
 
@@ -111,6 +112,7 @@ app-web/node_modules/
 
 # Generated at configure time by build/plugins.zig
 /src/plugins/registry.zig
+/src/plugins/registry_full.zig
 /src/unit_*.zig
 
 # Remotion's Chrome Headless Shell download (film.mjs renders from the folder it runs in)

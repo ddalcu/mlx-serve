@@ -7,6 +7,8 @@ pub const io_util = @import("sdk/util/io_util.zig");
 pub const log = @import("sdk/util/log.zig");
 pub const env = @import("env.zig");
 comptime {
+    // Every plugin compiled in, exporting the tables `plugins/registry.zig` takes by name under `-Dunits`.
+    _ = @import("plugins/registry_full.zig");
     // The plugins' host surface: plugin_host.zig's list, every name re-exported here.
     @import("plugin_host_check.zig").reexports(@This());
 }

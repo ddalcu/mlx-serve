@@ -833,7 +833,7 @@ fn expectLaunch(t: *Ming, theirs: []const mlx.mlx_array) !void {
 }
 
 test "kernel contract ming_tts: the DiT launches are the shipped block's, byte for byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = testing.allocator;
     const shape = Shape{ .rows = 6, .n = 2, .k = D };
     var ta = Ming.init(a, &qkv_launch, .dit_qkv, 0);
@@ -888,7 +888,7 @@ test "kernel contract ming_tts: the CFM launches are the shipped wrappers', byte
 }
 
 test "kernel contract ming_tts: the LM launches are the shipped layer's, byte for byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = testing.allocator;
     var la = Ming.init(a, &lm_qkv_launch, .lm_qkv, 0);
     defer la.deinit();

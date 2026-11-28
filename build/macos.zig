@@ -81,6 +81,13 @@ pub const Graph = struct {
             }),
             .embedded = .init(b, target, optimize),
         };
+        const strip = b.option(bool, "strip", "Omit debug info and Zig symbols from mlx-serve and its main test binary");
+        const exe_mod = shared.engineModule(b, target, optimize, host, "src/main.zig");
+        const test_mod = shared.engineModule(b, target, optimize, host, "src/tests.zig");
+        // CI and release strip mlx-serve because ReleaseFast debug info can exceed the macOS runner's 7 GB.
+        // Tests keep Zig frames in failure traces unless the caller opts into stripping.
+        exe_mod.strip = strip;
+        test_mod.strip = strip;
         return .{
             .b = b,
             .target = target,
@@ -88,14 +95,8 @@ pub const Graph = struct {
             .host = host,
             .version = version,
             .units = units,
-            .exe_mod = blk: {
-                const m = shared.engineModule(b, target, optimize, host, "src/main.zig");
-                // CI and release pass -Dstrip: debug info is most of the ReleaseFast compile's peak memory, which
-                // otherwise outgrows a GitHub macOS runner's 7 GB. A stripped binary's crash traces lose Zig names.
-                m.strip = b.option(bool, "strip", "Omit debug info and Zig symbols from the mlx-serve executable");
-                break :blk m;
-            },
-            .test_mod = shared.engineModule(b, target, optimize, host, "src/tests.zig"),
+            .exe_mod = exe_mod,
+            .test_mod = test_mod,
         };
     }
 };
@@ -205,18 +206,12 @@ pub fn addServer(g: *const Graph, plugin_names: []const []const u8) void {
             check_run.addFileArg(obj.getEmittedBin());
         }
         mod.root_source_file = b.path("src/exe.zig");
-        // Plugins dealt round-robin into `unit-groups` objects: each compiles the shared code it reaches once, so fewer
-        // groups cost less CPU, more groups more parallelism. The default is one group per core, 2 to 8.
+        // Plugins in at most `unit-groups` objects (`plugins.unitGroups`): each compiles the shared code it reaches once,
+        // so fewer groups cost less CPU, more groups more parallelism. The default is one per core, 2 to 8.
         const cores = std.Thread.getCpuCount() catch 8;
         const default_groups = std.math.clamp(cores, 2, 8);
-        const n_groups = @min(plugin_names.len, b.option(usize, "unit-groups", "Plugin objects under -Dunits (default: one per core, 2 to 8)") orelse default_groups);
-        const groups = b.allocator.alloc([]const []const u8, n_groups) catch @panic("OOM");
-        for (groups, 0..) |*names, gi| {
-            var list: std.ArrayList([]const u8) = .empty;
-            var i = gi;
-            while (i < plugin_names.len) : (i += n_groups) list.append(b.allocator, plugin_names[i]) catch @panic("OOM");
-            names.* = list.items;
-        }
+        const max_groups = b.option(usize, "unit-groups", "Most plugin objects under -Dunits (default: one per core, 2 to 8)") orelse default_groups;
+        const groups = plugins.unitGroups(b.allocator, plugin_names, max_groups, g.optimize) catch @panic("OOM");
         for (plugins.writeUnitRoots(b, groups), 0..) |root, gi| {
             const um = unitModule(g, unit_includes, root);
             const obj = b.addObject(.{ .name = b.fmt("unit-{d}", .{gi}), .root_module = um });

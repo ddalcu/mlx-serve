@@ -328,9 +328,13 @@ pub const File = struct {
     }
 
     pub fn deinit(self: *File) void {
-        for (self.shards) |m| std.posix.munmap(m);
+        if (comptime builtin.os.tag != .windows) {
+            for (self.shards) |m| std.posix.munmap(m);
+        }
         self.arena.deinit();
-        if (self.map) |m| std.posix.munmap(m);
+        if (comptime builtin.os.tag != .windows) {
+            if (self.map) |m| std.posix.munmap(m);
+        }
     }
 
     pub fn getString(self: *const File, key: []const u8) ?[]const u8 {
