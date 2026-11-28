@@ -7,6 +7,8 @@
 # Store-only block is staged by release.yml too, and FAST_DEV (default 0, Debug Swift only under its gate, one
 # ReleaseFast default, `-Doptimize=Debug` only under the ZIG_DEBUG gate, which is FAST_DEV-only and refused by name,
 # signing skipped only with the staging that invalidates it, the FAST_DEV exit after signing and before notarizing).
+# ci.yml, linux.yml, windows.yml and the two one-shot build scripts: only a pull request builds below ReleaseFast or
+# strips the test binary, and only main saves Actions caches (the MLX and ds4 stages aside).
 #
 #   ./tests/test_release_workflow_gates.sh   # hermetic: PyYAML parse, no runners
 
@@ -436,6 +438,73 @@ for f in ("Formula/mlx-serve.rb", "Casks/mlx-serve.rb"):
 formula = open("Formula/mlx-serve.rb").read()
 check(re.search(r'"@rpath/libmlx\.dylib",\s*"#\{libexec\}/libmlx\.dylib",\s*"#\{bin\}/mlx-serve"', formula),
       "formula repoints the binary's @rpath/libmlx.dylib into libexec")
+
+# ── Only a pull request may build below ReleaseFast: linux-assets and windows-assets attach what the push and
+# dispatch runs built.
+DEBUG_ON_PR = "${{ github.event_name == 'pull_request' && 'Debug' || 'ReleaseFast' }}"
+STRIP_ON_PR = "${{ github.event_name == 'pull_request' && '-Dstrip' || '' }}"
+
+def code_of(path):
+    return "\n".join(l for l in open(path).read().splitlines() if not l.lstrip().startswith("#"))
+
+workflows = {n: yaml.safe_load(open(f".github/workflows/{n}")) for n in ("ci.yml", "linux.yml", "windows.yml")}
+
+release_modes = re.findall(r"-Doptimize=(\w+)", code_of(".github/workflows/release.yml"))
+check(release_modes and set(release_modes) == {"ReleaseFast"}, "every release.yml build is ReleaseFast")
+
+linux, windows = workflows["linux.yml"], workflows["windows.yml"]
+check(linux["jobs"]["cuda"]["env"].get("ZIG_OPTIMIZE") == DEBUG_ON_PR,
+      "linux.yml builds Debug on pull requests and ReleaseFast otherwise")
+check("ZIG_OPTIMIZE" not in str(linux.get("env", {})) + str(linux["jobs"]["cuda"]["steps"]),
+      "no other linux.yml scope or step overrides ZIG_OPTIMIZE")
+check("ZIG_OPTIMIZE" not in str(windows),
+      "windows.yml leaves ZIG_OPTIMIZE unset (a Windows Debug link wants munmap)")
+for name in ("linux.yml", "windows.yml"):
+    scopes = (workflows[name], workflows[name]["jobs"]["cuda"])
+    check(not any("-Doptimize" in str(s.get("env", {}).get("ZIG_BUILD_ARGS", "")) for s in scopes),
+          f"{name} sets no optimize mode through ZIG_BUILD_ARGS")
+
+check(re.findall(r'-Doptimize=("[^"]*"|\S+)', code_of("scripts/build-linux.sh"))
+      == ['"${ZIG_OPTIMIZE:-ReleaseFast}"'],
+      "build-linux.sh defaults to ReleaseFast, in exactly one place")
+ps1 = code_of("scripts/build-windows.ps1")
+check(re.findall(r"^\$optimize = .*$", ps1, re.M)
+      == ['$optimize = if ($env:ZIG_OPTIMIZE) { $env:ZIG_OPTIMIZE } else { "ReleaseFast" }']
+      and re.findall(r"-Doptimize=[^\s\"]+", ps1) == ["-Doptimize=$optimize"],
+      "build-windows.ps1 defaults to ReleaseFast, in exactly one place")
+
+ci_jobs = workflows["ci.yml"]["jobs"]
+server = [s for s in ci_jobs["zig"]["steps"]
+          if re.search(r"^\s*zig build(\s+-|\s*$)", str(s.get("run", "")), re.M)]
+
+def builds_release_off_pr(step):
+    if "-Doptimize=ReleaseFast" in step["run"]:
+        return True
+    return '-Doptimize="$OPTIMIZE"' in step["run"] and step.get("env", {}).get("OPTIMIZE") == DEBUG_ON_PR
+
+check(len(server) == 1 and builds_release_off_pr(server[0]),
+      "ci.yml's zig job builds ReleaseFast outside pull requests")
+check(len(server) == 1 and "-Dstrip" in server[0]["run"].split(),
+      "ci.yml's zig job build stays stripped")
+test_runs = [str(s.get("run", "")) for s in ci_jobs["zig-test"]["steps"]
+             if "zig build test" in str(s.get("run", ""))]
+check(len(test_runs) == 1 and STRIP_ON_PR in test_runs[0]
+      and "-Dstrip" not in test_runs[0].replace(STRIP_ON_PR, ""),
+      "ci.yml strips the test binary on pull requests only")
+
+# ── The 10 GB Actions cache cap: only main saves. The MLX and ds4 stages take an hour to rebuild, so a pull request
+# that changes their inputs keeps its own copy.
+PR_MAY_SAVE = {"Cache MLX stage", "Cache ds4 stage", "Save MLX stage"}
+MAIN_ONLY = "github.ref == 'refs/heads/main'"
+for name, cwf in workflows.items():
+    cache_steps = [s for j in cwf["jobs"].values() for s in j["steps"]
+                   if str(s.get("uses", "")).startswith(("actions/cache@", "actions/cache/save@"))
+                   and s.get("name") not in PR_MAY_SAVE]
+    check(all(s["uses"].startswith("actions/cache/save@") for s in cache_steps),
+          f"{name} saves caches only through actions/cache/save steps, MLX and ds4 stages aside")
+    for s in cache_steps:
+        cond = str(s.get("if", ""))
+        check(MAIN_ONLY in cond and "||" not in cond, f"{name}: '{s.get('name')}' saves from main only")
 
 sys.exit(FAIL)
 EOF

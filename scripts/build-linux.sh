@@ -9,7 +9,8 @@
 #            (one build for RTX 20-50). Default: the local GPUs' (nvidia-smi).
 # ZIG_CPU    CPU baseline for the zig build, e.g. x86_64_v3 (CI); default native.
 #            ds4 reads NATIVE_CPU_FLAG the same way (default -march=native).
-# ZIG_BUILD_ARGS  Extra `zig build` arguments, space separated (CI: -Dunits=true -Dstrip=true on a PR).
+# ZIG_OPTIMIZE    `zig build -Doptimize=`, default ReleaseFast (CI: Debug on a PR, never for a binary anyone runs).
+# ZIG_BUILD_ARGS  Extra `zig build` arguments, space separated (CI: -Dunits=true -Dunit-groups=4 -Dstrip=true on a PR).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -58,5 +59,5 @@ bash scripts/fetch-llama.sh
 
 # ── mlx-serve ───────────────────────────────────────────────────────────────
 # shellcheck disable=SC2086
-"$ZIG" build -Doptimize=ReleaseFast ${ZIG_CPU:+-Dcpu=$ZIG_CPU} -Dds4-commit="$(git -C lib/ds4 rev-parse --short HEAD)" ${ZIG_BUILD_ARGS:-}
+"$ZIG" build -Doptimize="${ZIG_OPTIMIZE:-ReleaseFast}" ${ZIG_CPU:+-Dcpu=$ZIG_CPU} -Dds4-commit="$(git -C lib/ds4 rev-parse --short HEAD)" ${ZIG_BUILD_ARGS:-}
 echo "== built $ROOT/zig-out/bin/mlx-serve"

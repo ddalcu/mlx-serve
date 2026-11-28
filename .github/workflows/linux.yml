@@ -15,11 +15,12 @@ name: Linux
 # checks, and the CUDA runtime libraries the ldd gate resolves, not the 4 GB toolkit.
 #
 # A PR runs only when its files reach the Zig graph (`changes`, scripts/ci-changes.sh;
-# a skipped job counts as passing) and builds the fast variant: `-Dunits` (the host,
-# the engine and the plugin groups compile as parallel objects) and `-Dstrip`. push to
-# main and workflow_dispatch build and package what release.yml attaches to a release,
-# as one unit with debug info. Only main saves the cheap caches: a PR's copy is
-# unreadable to every other PR and pushed the repo over the 10 GB cap.
+# a skipped job counts as passing) and builds the fast variant: Debug, `-Dunits` (the
+# host, the engine and the plugin groups compile as parallel objects) and `-Dstrip`; its
+# binary is linked and ldd-checked, never shipped, so a ReleaseFast-only break shows on
+# main. push to main and workflow_dispatch build and package what release.yml attaches to
+# a release: ReleaseFast, one unit, with debug info. Only main saves the cheap caches: a
+# PR's copy is unreadable to every other PR and pushed the repo over the 10 GB cap.
 #
 # The tarball keeps the repo layout the binary's $ORIGIN rpaths expect
 # (zig-out/bin/mlx-serve next to lib/mlx/lib, lib/llama/lib, lib/ds4-linux; lib/mlx/include holds the
@@ -93,6 +94,7 @@ jobs:
       CUDA_ARCH: ${{ matrix.cuda_arch }}
       ZIG_CPU: ${{ matrix.zig_cpu }}
       NATIVE_CPU_FLAG: ${{ matrix.cpu_flag }}
+      ZIG_OPTIMIZE: ${{ github.event_name == 'pull_request' && 'Debug' || 'ReleaseFast' }}
       ZIG_BUILD_ARGS: ${{ github.event_name == 'pull_request' && '-Dunits=true -Dunit-groups=4 -Dstrip=true' || '' }}
     steps:
       - uses: actions/checkout@v4

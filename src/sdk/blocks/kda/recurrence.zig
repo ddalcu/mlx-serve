@@ -579,10 +579,12 @@ fn kdaRowsCase(rows: c_int) !void {
 }
 
 test "kda decode step over T rows equals T one-row steps, bit for bit, at the gate widths a verify window serves" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     try kdaRowsCase(4);
 }
 
 test "kda decode step in two launches (9 and 16 rows) equals the one-row steps, bit for bit" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     try kdaRowsCase(9);
     try kdaRowsCase(16);
 }

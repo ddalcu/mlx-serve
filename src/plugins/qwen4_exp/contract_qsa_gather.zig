@@ -436,7 +436,7 @@ pub fn register(set: *kc.Set) !void {
 // ── tests ──
 
 test "kernel contract qwen4_exp: the declared gathered-attention launches are the shipped wrapper's, byte for byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     inline for (.{ false, true }) |nax| {
         if (nax and !(gather.qsaNaxEnabled() and device.naxAvailable())) return error.SkipZigTest;

@@ -117,6 +117,8 @@ fn Fixture(comptime P: type, comptime golden: []const u8) type {
         s: mlx.mlx_stream = undefined,
         pe: *Engine = undefined,
         g: Golden = undefined,
+        /// Text the music route's answer to body `i` must hold on every device; cleared once seen.
+        music_needle: ?struct { i: usize, text: []const u8 } = null,
 
         fn open(self: *@This(), gpu: bool) !void {
             try self.p.open(P);
@@ -143,6 +145,10 @@ fn Fixture(comptime P: type, comptime golden: []const u8) type {
                 defer a.free(got);
                 var kb: [32]u8 = undefined;
                 try self.g.check(try std.fmt.bufPrint(&kb, "{s} {d}", .{ @tagName(route), i }), got);
+                if (self.music_needle) |n| if (route == .music and n.i == i) {
+                    try testing.expect(std.mem.indexOf(u8, got, n.text) != null);
+                    self.music_needle = null;
+                };
             }
         }
 
@@ -217,10 +223,9 @@ test "flip: yue2 answers its legacy arm's bytes, the planned score beside the st
     try f.open(false);
     defer f.close();
     const melody = "{\"stream\":true,\"prompt\":\"pop\",\"lyrics\":\"[verse]\\nla la\",\"cot\":\"melody\",\"duration_seconds\":5,\"steps\":2,\"seed\":3}";
+    f.music_needle = .{ .i = 2, .text = "\"type\":\"complete\",\"format\":\"wav\",\"abc\":\"" };
     try f.expectAudio(&.{ f.p.fx.body, try f.p.streamed(), melody, "{}", "{\"prompt\":\"p\",\"bpm\":120}" });
-    const scored = try capture(testing.allocator, pluginRoute, .{ testing.allocator, melody, f.pe, gen.GenRoute.music });
-    defer testing.allocator.free(scored);
-    try testing.expect(std.mem.indexOf(u8, scored, "\"type\":\"complete\",\"format\":\"wav\",\"abc\":\"") != null);
+    try testing.expect(f.music_needle == null);
 }
 
 test "flip: ltx answers its legacy arm's bytes" {

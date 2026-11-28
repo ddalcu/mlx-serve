@@ -149,7 +149,7 @@ fn maxAbsDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
 }
 
 test "dec_attn: decode and verify rows match fp32 attention no worse than MLX's bf16 kernel" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(7);
     const rnd = prng.random();

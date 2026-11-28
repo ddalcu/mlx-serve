@@ -29,6 +29,7 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const testing = std.testing;
 const chat = @import("chat.zig");
+const shard = @import("../../sdk/testing/shard.zig");
 
 const fixture = @embedFile("../../fixtures/tool_traffic.jsonl");
 
@@ -68,11 +69,12 @@ fn hardFail(comptime what: []const u8, idx: usize, detail: []const u8) void {
     std.debug.print("\n[replay record {d}] HARD {s}\n  {s}\n", .{ idx, what, detail[0..@min(detail.len, 400)] });
 }
 
-test "tool traffic replay: captured agent traffic survives parse + schema coercion" {
-    // 4,911 records, ~31 s in Debug: `zig build test -Dslow-tests` runs it.
+test "sharded: tool traffic replay: captured agent traffic survives parse + schema coercion" {
+    // 4,911 records, ~31 s in Debug: `zig build test -Dslow-tests` runs it, split across the test shards.
     if (!@import("build_options").slow_tests) return error.SkipZigTest;
     g_fail_count = 0;
     dump_soft = env.get(.REPLAY_DUMP_SOFT) != null;
+    const sh = shard.current();
     var line_it = std.mem.splitScalar(u8, fixture, '\n');
     var idx: usize = 0;
     var records: usize = 0;
@@ -84,6 +86,7 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
     while (line_it.next()) |line| {
         if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
         idx += 1;
+        if (!sh.owns(idx - 1)) continue;
 
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena_state.deinit();
@@ -209,7 +212,7 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
         }
     }
 
-    std.debug.print("[replay] {d} records, {d} calls, {d} repaired, {d} non-conforming (broken JSON), {d} soft wrapper-leaks, {d} HARD failures\n", .{ records, total_calls, coerced_calls, unresolved, soft_wrapper_leaks, g_fail_count });
+    std.debug.print("[replay {d}/{d}] {d} records, {d} calls, {d} repaired, {d} non-conforming (broken JSON), {d} soft wrapper-leaks, {d} HARD failures\n", .{ sh.k, sh.n, records, total_calls, coerced_calls, unresolved, soft_wrapper_leaks, g_fail_count });
     try testing.expect(records > 0); // an empty fixture is a broken harvest, not a pass
     // Only HARD invariant violations fail the gate. Soft signals (genuinely-broken
     // model output that the layer correctly declines to fabricate) are reported.

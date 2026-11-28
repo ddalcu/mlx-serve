@@ -510,6 +510,7 @@ fn moeRowsFusedCase(s: mlx.mlx_stream, rnd: std.Random, E: c_int, hid: c_int, in
 }
 
 test "moe rows fused nvfp4: verify rows with per-expert gate scales match fp32 truth" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x4E5F);
     const rnd = prng.random();
