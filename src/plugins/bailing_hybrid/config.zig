@@ -127,8 +127,9 @@ fn lingFacts(c: *const Config, p: *abi.Parsed) void {
         p.caps.prompt_last_row = true;
     }
     p.chat.thinking_default = .on;
-    // A streaming pack's NextN layer drafts one token a round over the trunk's final-normed hidden (`head.zig`).
-    if (c.streamed_bank and c.nextn_layers > 0) p.spec = .{ .mtp_default_depth = 1, .mtp_layout = .in_checkpoint, .head_reads_final_norm = true };
+    // A NextN layer drafts one token a round over the trunk's final-normed hidden (`head.zig`), on any pack that
+    // declares it. One that ships no `eh_proj` still loads: the head's `MissingMtpWeight` reads as a headless pack.
+    if (c.nextn_layers > 0) p.spec = .{ .mtp_default_depth = 1, .mtp_layout = .in_checkpoint, .head_reads_final_norm = true };
     p.cache.ssm_state = .{ .entries = c.num_hidden_layers, .dtype = .bf16 };
     p.weights.prefix = abi.Str.of(c.weight_prefix);
 }
@@ -236,7 +237,7 @@ test "bailing_hybrid config: a limit list past 128 layers, past 255 or not a lis
     try testing.expect(!v.isOk() and p.private == null);
 }
 
-test "bailing_hybrid config: a streaming pack's NextN layer declares the MTP head (one draft a round over the final-normed hidden); an MLX pack none" {
+test "bailing_hybrid config: a NextN layer declares the MTP head (one draft a round over the final-normed hidden), streaming or MLX pack; none without the layer" {
     const json = @embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json");
     const mem: sdk.fixture.MemDir = .{ .files = &.{ .{ .name = "config.json", .bytes = json }, .{ .name = "experts.bin", .bytes = "" } } };
     const dir = mem.packDir();
@@ -245,11 +246,17 @@ test "bailing_hybrid config: a streaming pack's NextN layer declares the MTP hea
     defer freeParsed(&p);
     try testing.expectEqual(@as(u32, 1), of(&p).nextn_layers);
     try testing.expect(p.spec.mtp_layout == .in_checkpoint and p.spec.mtp_default_depth == 1 and p.spec.head_reads_final_norm);
-    // MLX packs keep their facts: no head, a NextN layer or not.
-    inline for (.{ "bailing_hybrid-ling-3.0-tiny-4bit.json", "bailing_hybrid-ling-3.0-flash-oq4e-mtp.json" }) |name| {
+    // An MLX pack that ships its NextN layer declares the head too; one without the layer keeps its facts.
+    {
         var q: abi.Parsed = .{};
-        try testing.expect(parseJson(@embedFile("../../fixtures/model-configs/" ++ name), &q).isOk());
+        try testing.expect(parseJson(@embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.0-tiny-4bit.json"), &q).isOk());
         defer freeParsed(&q);
         try testing.expect(q.spec.mtp_layout == .none and q.spec.mtp_default_depth == 0 and !of(&q).streamed_bank);
+    }
+    {
+        var q: abi.Parsed = .{};
+        try testing.expect(parseJson(@embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.0-flash-oq4e-mtp.json"), &q).isOk());
+        defer freeParsed(&q);
+        try testing.expect(q.spec.mtp_layout == .in_checkpoint and q.spec.mtp_default_depth == 1 and !of(&q).streamed_bank);
     }
 }
