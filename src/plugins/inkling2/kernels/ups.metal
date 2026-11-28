@@ -2,7 +2,7 @@
 // in one launch, the packed bank read in place. grid (32, I / ROWS, S * KSEL), threadgroup (32, SGS, 1): a SIMD group
 // owns ROWS intermediate rows of one pick (their gate rows 2r and up rows 2r + 1 of WQ [E, 2 I, K * bits / 32] u32,
 // scales WS [E, 2 I, K / GS] u8) and a lane 16 values of its row's x per sweep, kept in registers across the rows.
-// FMT 3 is an affine bank (BITS bits, scales WS and biases WB [E, 2 I, K / GS] of S).
+// FMT 3 is an affine bank (BITS bits, scales WS and biases WB [E, 2 I, K / GS] of S); FAST3 takes its 3-bit word path.
 // With ROUTE each threadgroup ranks its row's picks as topk.metal does: SCR [S, E] f32 are the router's logits, RB [E]
 // f32 the selection bias, RS [1] the route scale; a pick's threadgroup of the first rows writes its PIDX and PWTS [1,
 // S, KSEL] (u32, f32), topk.metal's IDX and WTS, the pairs in (row, pick) order. Without, the picks are IDX [S * KSEL]
@@ -65,9 +65,9 @@ for (uint k = lane * 16; k < K; k += 512) {
     };
     float xs[16];
     float sx = 0.0f;
-    if (FMT == 3 && BITS == 3) { for (uint i = 0; i < 16; i++) sx += xr[i]; msv_ink2_prescale3w(xr, xs); }
+    if (FMT == 3 && BITS == 3 && FAST3) { for (uint i = 0; i < 16; i++) sx += xr[i]; msv_ink2_prescale3w(xr, xs); }
     for (uint r = 0; r < 2 * ROWS; r++)
-        acc[r] += FMT == 3 ? (BITS == 3 ? msv_ink2_affine3w<S, GS>(arow + r * WBR, sa + r * SPR, ba + r * SPR, k / 16, xs, sx)
+        acc[r] += FMT == 3 ? (BITS == 3 && FAST3 ? msv_ink2_affine3w<S, GS>(arow + r * WBR, sa + r * SPR, ba + r * SPR, k / 16, xs, sx)
                                         : msv_ink2_affine_chunk<S, BITS, GS>(arow + r * WBR, sa + r * SPR, ba + r * SPR, k / 16, xr))
                            : msv_ink2_chunk(FMT, wrow + r * WPR, srow + r * SPR, k / 16, xr);
 }
