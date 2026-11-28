@@ -505,6 +505,10 @@ const PosixStore = struct {
     file: c_int = -1, // the newest chunk's file, open to append (-1: none)
     file_chunk: u32 = 0, // the record chunk that file holds
     seq0: u64 = 0, // the file number of record chunk 0
+    /// The generation this store was last emptied under (0 = never). Set at
+    /// open from the worker's clock and stamped by `empty`; a queued job
+    /// whose generation this moved past is dropped, not written.
+    record_gen: u64 = 0,
     failed: bool = false, // a write failed: this server adds nothing more
     added: u64 = 0, // ids this server added
     held: u64 = 0, // ids its requests read or wrote that the record held already
@@ -759,6 +763,22 @@ const PosixStore = struct {
         s.add(seg);
     }
 
+    /// The worker's record of a finished request, atomically against a
+    /// concurrent DELETE: the generation check and the writes share one
+    /// hold of the store's mutex, so a job popped before an `empty` that
+    /// stamped a newer generation is dropped, never written back.
+    pub fn writeQueued(s: *PosixStore, prompt: []const u32, reply: []const u32, gen: u64) bool {
+        s.mutex.lock();
+        defer s.mutex.unlock();
+        if (s.record_gen > gen) return false;
+        s.add(prompt[@min(prompt.len, 0) -| overlap ..]);
+        if (reply.len == 0) return true;
+        const seg = std.mem.concat(gpa, u32, &.{ prompt[prompt.len -| overlap ..], reply }) catch return true;
+        defer gpa.free(seg);
+        s.add(seg);
+        return true;
+    }
+
     /// The runs of `seg` the record lacks, each with its overlaps (the caller holds the lock).
     fn add(s: *PosixStore, seg: []const u32) void {
         if (!s.writes or s.failed) return;
@@ -861,7 +881,9 @@ const PosixStore = struct {
     }
 
     /// Chunk files deleted; record, rates and counters emptied (identity, lock stay). Unlinked: `why` names one left.
-    pub fn empty(s: *PosixStore) error{ ReadOnly, Unlinked }!void {
+    /// `gen` is the generation this empty runs under; queued jobs older than
+    /// it never write back into the emptied record.
+    pub fn empty(s: *PosixStore, gen: u64) error{ ReadOnly, Unlinked }!void {
         s.mutex.lock();
         defer s.mutex.unlock();
         if (!s.writes) return error.ReadOnly;
@@ -881,6 +903,7 @@ const PosixStore = struct {
             }
         }
         r.clear();
+        s.record_gen = gen;
         s.rates = .{};
         s.added = 0;
         s.held = 0;
@@ -936,6 +959,7 @@ const WindowsStub = struct {
     record: Record = undefined,
     rates: Rates = .{},
     mutex: os_mutex.Mutex = .{},
+    record_gen: u64 = 0,
 
     pub fn open(identity: Identity, io: std.Io, o: Options, problem: *[]const u8, a: Allocator) !?*Store {
         _ = identity;
@@ -962,9 +986,18 @@ const WindowsStub = struct {
         _ = s;
         return .{};
     }
-    pub fn empty(s: *WindowsStub) error{ ReadOnly, Unlinked }!void {
+    pub fn empty(s: *WindowsStub, gen: u64) error{ ReadOnly, Unlinked }!void {
         _ = s;
+        _ = gen;
         return error.ReadOnly;
+    }
+
+    pub fn writeQueued(s: *WindowsStub, prompt: []const u32, reply: []const u32, gen: u64) bool {
+        _ = s;
+        _ = prompt;
+        _ = reply;
+        _ = gen;
+        return true;
     }
     pub fn why(s: *WindowsStub) []const u8 {
         _ = s;
@@ -1264,6 +1297,7 @@ fn storeForIdentity(digest: [32]u8, vocab: u32) ?*Store {
         st_state.failures.put(gpa, digest, {}) catch {};
         return null;
     };
+    st.record_gen = worker_state.get().generation;
     st_state.stores.put(gpa, digest, st) catch {
         st.close();
         return null;
@@ -1326,6 +1360,11 @@ const RecordJob = struct {
     vocab: u32,
     prompt: []u32,
     reply: []u32,
+    /// The generation of the record this job was popped under: a DELETE
+    /// bumps `WorkerState.generation` and stamps every emptied store with
+    /// it, and the worker drops a job whose generation the store moved past
+    /// — a job already dequeued must not write into an emptied record.
+    gen: u64 = 0,
 };
 
 /// The worker's queue + waiter, Shared so the -Dunits build holds one copy
@@ -1336,6 +1375,10 @@ const WorkerState = struct {
     queue: std.ArrayList(RecordJob) = .empty,
     spawned: bool = false,
     queued_ids: usize = 0,
+    /// Bumped by every DELETE (`emptyAll`); stores carry the generation
+    /// they were last emptied under, so a job popped before a DELETE never
+    /// writes into the record it emptied.
+    generation: u64 = 0,
 };
 pub const worker_state = shared_util.Shared(WorkerState, "recall_worker", .{});
 
@@ -1354,13 +1397,13 @@ fn workerLoop(io_foreign: std.Io) void {
             defer w.mutex.unlock(io);
             while (w.queue.items.len == 0) w.cond.waitUncancelable(io, &w.mutex);
             job = w.queue.orderedRemove(0);
+            job.?.gen = w.generation;
             w.queued_ids -= job.?.prompt.len + job.?.reply.len;
         }
         if (job) |j| {
             defer freeJob(j);
             if (storeForIdentity(j.digest, j.vocab)) |st| {
-                st.readPrompt(j.prompt, 0);
-                st.readReply(j.prompt, j.reply);
+                _ = st.writeQueued(j.prompt, j.reply, j.gen);
             }
         }
     }
@@ -1453,8 +1496,10 @@ pub fn emptyAll(a: Allocator) struct { rows: []EmptyRow, all_failed: bool } {
     // Comptime gate: the sweep's file-scope helpers use the POSIX O struct
     // (void on Windows); the stub never opens a store, so nothing can sweep.
     if (builtin.os.tag == .windows) return .{ .rows = &[_]EmptyRow{}, .all_failed = false };
-    // A DELETE empties the record: queued-but-unwritten jobs die with it, or
-    // they would re-write what the operator just asked to forget.
+    // A DELETE empties the record: queued-but-unwritten jobs die with it,
+    // and the generation it stamps the stores with drops any job the worker
+    // already popped, so neither re-writes what the operator asked to forget.
+    var emptied_gen: u64 = 0;
     {
         const w = worker_state.get();
         const io = io_util.local(shared_state.get().io orelse return .{ .rows = &[_]EmptyRow{}, .all_failed = false });
@@ -1463,6 +1508,8 @@ pub fn emptyAll(a: Allocator) struct { rows: []EmptyRow, all_failed: bool } {
         for (w.queue.items) |j| freeJob(j);
         w.queue.clearRetainingCapacity();
         w.queued_ids = 0;
+        w.generation += 1;
+        emptied_gen = w.generation;
     }
     const st_state = shared_state.get();
     var rows: std.ArrayList(EmptyRow) = .empty;
@@ -1490,7 +1537,7 @@ pub fn emptyAll(a: Allocator) struct { rows: []EmptyRow, all_failed: bool } {
                 .read_only = st.read_only,
                 .problem = "",
             };
-            st.empty() catch |e| switch (e) {
+            st.empty(emptied_gen) catch |e| switch (e) {
                 error.ReadOnly => {
                     row.ok = false;
                     row.problem = "the record is read-only";
@@ -1861,6 +1908,47 @@ test "worker: async recording lands in the store off-thread" {
         crt.sleepMs(2);
     }
     return error.WorkerDidNotRecord;
+}
+
+test "worker: a job popped before a DELETE never writes into the emptied record" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const d0 = try std.fmt.allocPrint(testing.allocator, "{s}/gen", .{root});
+    defer testing.allocator.free(d0);
+    const dir = try testing.allocator.dupeSentinel(u8, d0, 0);
+    defer testing.allocator.free(dir);
+    var problem: []const u8 = "";
+    defer if (problem.len > 0) testing.allocator.free(problem);
+    const st = (try PosixStore.open(
+        .{ .digest = @splat(13), .vocab = 100_000, .name = "gen-test" },
+        std.testing.io,
+        .{ .dir = dir, .cap_bytes = 4 * 1024 * 1024, .read_only = false },
+        &problem,
+        testing.allocator,
+    )) orelse return error.TestStoreOpen;
+    defer st.close();
+
+    // The store was opened at the current generation.
+    const w = worker_state.get();
+    try testing.expectEqual(w.generation, st.record_gen);
+
+    var prompt: [160]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(3000 + i);
+    var reply: [160]u32 = undefined;
+    for (&reply, 0..) |*t, i| t.* = @intCast(7000 + i);
+
+    // A job popped under generation G writes when the store has not moved...
+    try testing.expect(st.writeQueued(&prompt, &reply, w.generation));
+    try testing.expect(st.stats().ids > 0);
+    // ...and is dropped when a DELETE stamped a newer generation.
+    try st.empty(w.generation + 1);
+    try testing.expect(!st.writeQueued(&prompt, &reply, w.generation));
+    try testing.expectEqual(@as(u64, 0), st.stats().ids);
+    // A job popped after the empty (the new generation) writes again.
+    try testing.expect(st.writeQueued(&prompt, &reply, w.generation + 1));
+    try testing.expect(st.stats().ids > 0);
 }
 
 test "rates: expected tokens, bands, probe backoff, quiet rounds" {
