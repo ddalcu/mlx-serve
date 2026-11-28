@@ -1618,6 +1618,12 @@ const affine_formats = blk: {
     for (affine_bits, 0..) |bits, i| all[i] = .{ .mode = .affine, .bits = bits, .group = 32 };
     break :blk all;
 };
+/// Each width at one scale group as wide as the fixture's stream.
+const affine_formats_g64 = blk: {
+    var all: [affine_bits.len]ExpertFormat = undefined;
+    for (affine_bits, 0..) |bits, i| all[i] = .{ .mode = .affine, .bits = bits, .group = 64 };
+    break :blk all;
+};
 
 // Bar: the tail's launches against `layers.tail` from the router's own picks, with the new conv state (the old rows
 // behind the rows' k, v and output projections and the MLP's output): on the fixture's dense bank and on each packed
@@ -1674,6 +1680,74 @@ test "inkling2 kernels: the expert tail kernels serve the stream and the conv st
         const fed = try g.concat(&.{ try g.sliceAxis(st, 2, 0, 2 * kv_dim + hidden), try g.astype(try g.concat(&.{ kp, vp, op }, 2), .float32) }, 1);
         const left = try g.sliceAxis(fed, 1, rows, rows + taps - 1);
         try expectClose(got.state, try g.concat(&.{ left, want.mlp_state }, 2), tol, "conv state");
+    };
+}
+
+// Bar: one row's bank launches (`ups`, `downs`) and output projection serve the same bytes at the row widths and the
+// 3-bit word path a GPU before Apple9 takes (generation pinned to an M1's) as at Apple9+'s one row, bit for bit: every
+// packed and affine bank layout, f32 and bf16 rows, with and without per-expert scales, every attention width.
+test "inkling2 kernels: the bank and output projection launches serve the same bytes at every row width" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var s = try Stage.init(a);
+    defer s.deinit();
+    const saved = device.device_gen_override;
+    defer device.device_gen_override = saved;
+    const wide: device.DeviceGen = .{ .gen = 13, .phone = false };
+    const one: device.DeviceGen = .{ .gen = 17, .phone = false };
+    var body = s.body.*;
+    const hidden: c_int = @intCast(body.cfg.hidden_size);
+    const experts: c_int = @intCast(body.cfg.num_experts);
+    const kv_dim: c_int = @intCast(body.cfg.kvDim());
+    const taps: c_int = @intCast(body.cfg.sconv_kernel);
+    var seed: u64 = 17000;
+    var label: [96]u8 = undefined;
+    for ([_]ExpertFormat{ .{ .mode = .nvfp4, .bits = 4, .group = 16 }, .{ .mode = .mxfp4, .bits = 4, .group = 32 }, .{ .mode = .mxfp8, .bits = 8, .group = 32 } } ++ affine_formats ++ affine_formats_g64) |f| for ([_]ops.Dtype{ .float32, .bfloat16 }) |dt| for ([_]bool{ true, false }) |scaled| {
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 20;
+        var L = body.layers[3];
+        body.cfg.moe_intermediate_size = 64;
+        L.gate_up = try packedBank(&g, a, seed, &.{ experts, 128, hidden }, f.bits, f.group, f.mode.?);
+        L.down = try packedBank(&g, a, seed + 1, &.{ experts, hidden, 64 }, f.bits, f.group, f.mode.?);
+        if (scaled) {
+            L.gate_up_scale = try g.addScalar(try randomRow(&g, a, seed + 2, &.{experts}, 0.3, .float32), 1.5);
+            L.down_scale = try g.addScalar(try randomRow(&g, a, seed + 3, &.{experts}, 0.3, .float32), 1.5);
+        }
+        const x = try randomRow(&g, a, seed + 4, &.{ 1, 1, hidden }, 1.0, dt);
+        const residual = try randomRow(&g, a, seed + 5, &.{ 1, 1, hidden }, 1.0, .float32);
+        const st = try randomRow(&g, a, seed + 6, &.{ 1, taps - 1, 2 * kv_dim + 2 * hidden }, 1.0, .float32);
+        const kp = try randomRow(&g, a, seed + 7, &.{ 1, 1, kv_dim }, 1.0, dt);
+        const vp = try randomRow(&g, a, seed + 8, &.{ 1, 1, kv_dim }, 1.0, dt);
+        const op = try randomRow(&g, a, seed + 9, &.{ 1, 1, hidden }, 1.0, dt);
+        const scores = try g.matmul(try g.astype(x, .float32), try g.transpose(L.router, &.{ 1, 0 }));
+        const m: kernels.Middle = .{ .x = x, .scores = scores, .residual = residual, .blocks = null, .op = op };
+        device.device_gen_override = one;
+        const base = try kernels.experts(&g, &L, &body.cfg, &m, kp, vp, st, null);
+        device.device_gen_override = wide;
+        const got = try kernels.experts(&g, &L, &body.cfg, &m, kp, vp, st, null);
+        const what = .{ @tagName(f.mode.?), f.bits, f.group, @tagName(dt), scaled };
+        try expectClose(got.h, base.h, 0, try std.fmt.bufPrint(&label, "stream ({s} {d} bits g{d}, {s}, scaled {})", what));
+        try expectClose(got.state, base.state, 0, try std.fmt.bufPrint(&label, "conv state ({s} {d} bits g{d}, {s}, scaled {})", what));
+    };
+    const heads: c_int = 24;
+    const hd: c_int = 128;
+    for ([_]?u32{ null, 2, 3, 4, 5, 6, 8 }) |bits| for (affine_groups) |group| for ([_]c_int{ 256, 258 }) |n| {
+        if (bits == null and group != 64) continue;
+        var g = ops.Graph.init(a, fx_stream);
+        defer g.deinit();
+        seed += 10;
+        var o: layers.Linear = .{ .w = try randomRow(&g, a, seed, &.{ n, heads * hd }, 0.02, .bfloat16) };
+        if (bits) |b| {
+            const q = try packedBank(&g, a, seed, &.{ 1, n, heads * hd }, b, group, .affine);
+            o = .{ .w = try g.reshape(q.w, &.{ n, -1 }), .s = try g.reshape(q.s, &.{ n, -1 }), .b = try g.reshape(q.b, &.{ n, -1 }), .bits = b, .group_size = group };
+        }
+        const att = try randomRow(&g, a, seed + 1, &.{ 1, heads, 1, hd }, 1.0, .bfloat16);
+        const gate = try g.sigmoid(try randomRow(&g, a, seed + 2, &.{heads * hd}, 2.0, .float32));
+        device.device_gen_override = one;
+        const base = try kernels.oGated(&g, &o, att, gate);
+        device.device_gen_override = wide;
+        try expectClose(try kernels.oGated(&g, &o, att, gate), base, 0, try std.fmt.bufPrint(&label, "output projection ({?d} bits, g{d}, {d} rows)", .{ bits, group, n }));
     };
 }
 
