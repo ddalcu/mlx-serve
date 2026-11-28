@@ -914,6 +914,7 @@ test {
     _ = @import("../api/models.zig");
     _ = @import("../api/ollama_routes.zig");
     _ = @import("../api/props.zig");
+    _ = @import("../api/recall.zig");
     _ = @import("../api/request_model.zig");
     _ = @import("../api/request_text.zig");
     _ = @import("../api/responses/envelope.zig");

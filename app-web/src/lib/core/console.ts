@@ -249,6 +249,18 @@ const apiReference = [
   },
   {
     method: "GET",
+    path: "/v1/recall",
+    description: N(
+      "Persistent token-id record that drafts repeated text (enable with --recall): ids held, landing rates, read-only state",
+    ),
+  },
+  {
+    method: "DELETE",
+    path: "/v1/recall",
+    description: N("Empty the record: every stored prompt and reply, as token ids (a read-only or held record refuses)"),
+  },
+  {
+    method: "GET",
     path: "/v1/models",
     description: N(
       "OpenAI models list (id, capabilities, context length) \u2014 this console's model picker",

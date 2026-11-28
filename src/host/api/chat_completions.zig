@@ -24,6 +24,7 @@ const http_server = @import("../http/server.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
 const spec_gate_threshold = @import("request_options.zig").spec_gate_threshold;
+const recallGateExempts = @import("request_options.zig").recallGateExempts;
 const parseKvAttnExplicit = @import("request_options.zig").parseKvAttnExplicit;
 const resolveSampling = @import("sampling.zig").resolveSampling;
 const parseLogitBias = @import("sampling.zig").parseLogitBias;
@@ -830,7 +831,14 @@ pub fn handleChatCompletions(
         const score = pld_index.ngramRepeatScore(allocator, prompt_ids, 3) catch 1.0; // on error, don't gate
         log.info("  spec-gate: ngram-score={d:.3} (threshold={d:.3})\n", .{ score, spec_gate_threshold });
         if (score < spec_gate_threshold) {
-            if (enable_pld and !pld_explicit_in_json) {
+            // Recall exemption: a record for this tokenizer makes PLD's miss path
+            // able to draft from what earlier requests wrote, which the prompt's
+            // own score cannot see — the yield gate + Recall's landing-rate
+            // pricing disable on REALIZED acceptance, the same evidence that
+            // exempts the DFlash drafter below. Without this, a novel prompt
+            // (a re-sent question whose reply the record holds) never drafts.
+            const recall_armed = recallGateExempts(stream, lm.tokenizer, prompt_ids);
+            if (enable_pld and !pld_explicit_in_json and !recall_armed) {
                 log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_pld = false;
             }

@@ -588,6 +588,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         slot.eos_token_ids,
         .{
             .pld_enabled = use_pld,
+            .recall_loopback = slot.recall_loopback,
             .drafter_enabled = use_drafter,
             .drafter = if (use_drafter) slot.drafter else null,
             .drafter_block_size = slot.drafter_block_size,

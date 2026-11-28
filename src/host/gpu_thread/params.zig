@@ -187,6 +187,10 @@ pub const SubmitParams = struct {
     max_tokens: u32,
     timeout_ns: u64 = 0,
     enable_pld: bool = false,
+    /// Recall lane: the request's peer is loopback. Keyed/LAN peers keep it
+    /// false — they never read or write the shared record unless the
+    /// operator started the server with --recall-shared.
+    recall_loopback: bool = false,
     enable_drafter: bool = false,
     drafter: ?*handles.DrafterModel = null,
     /// DFlash assistant for this model. Rides the SAME `enable_drafter`

@@ -410,6 +410,31 @@ fn printUsage(io: std.Io) void {
         \\                        evictions instead of recomputed. Can use many
         \\                        GB of disk, so it's opt-in; e.g. 10GB. 0/off
         \\                        disables.
+        \\  --recall             Draft from a persistent record of the token ids
+        \\                        the server has read and written, so repeated
+        \\                        text (a re-sent prompt, a regenerated reply,
+        \\                        re-copied code) verifies in one round.
+        \\                        THE RECORD STORES EVERY PROMPT AND REPLY, as
+        \\                        token ids that the model's tokenizer turns
+        \\                        back into their exact text; treat the record
+        \\                        directory as you would those conversations.
+        \\                        With an API key active the record serves
+        \\                        loopback requests only by default (a hit
+        \\                        decodes measurably faster, which would let
+        \\                        any other client probe what was said);
+        \\                        --recall-shared opts keyed and LAN clients
+        \\                        into it. Replies are byte-identical with it
+        \\                        on, off or read-only. All --recall-* flags
+        \\                        imply --recall.
+        \\  --recall-dir <dir>   Where the records live (default:
+        \\                        ~/.cache/mlx-serve/recall).
+        \\  --recall-gib <n>    Record disk per tokenizer in GiB (default
+        \\                        0.0625 = 64 MiB); the oldest ids go first.
+        \\  --recall-shared     Keyed and LAN clients share the record too
+        \\                        (single-user deployments); without it they
+        \\                        never read or write the record.
+        \\  --recall-read-only  Draft from the record and add nothing (also the
+        \\                        behavior when another server holds the record).
         \\  --shutdown-persist-secs <n>
         \\                      On SIGTERM, finish writing the SSD-tier slices not
         \\                        yet on disk, for at most <n> seconds, then exit
@@ -696,6 +721,9 @@ pub fn main(init: std.process.Init) !void {
     var stream_mode = false;
     // The engine's own launch settings, applied once after parsing (`mlx_engine.Flags`).
     var engine_flags: mlx_engine.Flags = .{};
+    // Recall flags parse into the engine's launch flags (applied once at
+    // configure, alongside every other engine-wide setting).
+    var recall_gib: f64 = 0;
     var prompt: ?[]const u8 = null;
     var max_tokens: u32 = 100;
     var temperature: f32 = 0.0;
@@ -1075,6 +1103,29 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--prefix-cache-disk: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--recall")) {
+            engine_flags.recall = true;
+        } else if (std.mem.eql(u8, args[i], "--recall-shared")) {
+            engine_flags.recall_shared = true;
+            engine_flags.recall = true;
+        } else if (std.mem.eql(u8, args[i], "--recall-read-only")) {
+            engine_flags.recall_read_only = true;
+            engine_flags.recall = true;
+        } else if (std.mem.eql(u8, args[i], "--recall-dir") and i + 1 < args.len) {
+            i += 1;
+            engine_flags.recall_dir = args[i];
+            engine_flags.recall = true;
+        } else if (std.mem.eql(u8, args[i], "--recall-gib") and i + 1 < args.len) {
+            i += 1;
+            recall_gib = std.fmt.parseFloat(f64, args[i]) catch {
+                log.err("--recall-gib: expected a number of GiB, e.g. 0.5 or 2; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+            if (!std.math.isFinite(recall_gib) or recall_gib <= 0) {
+                log.err("--recall-gib: expected a positive number of GiB; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
+            engine_flags.recall = true;
         } else if (std.mem.eql(u8, args[i], "--shutdown-persist-secs") and i + 1 < args.len) {
             i += 1;
             server_mod.shutdown_persist_secs = std.fmt.parseInt(u32, args[i], 10) catch {
@@ -1261,6 +1312,7 @@ pub fn main(init: std.process.Init) !void {
         log.err("--mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ engine_flags.mtp_depth_min, engine_flags.mtp_depth_max });
         std.process.exit(1);
     };
+    engine_flags.recall_gib = recall_gib;
     mlx_engine.api().configure(&engine_flags);
 
     // Subcommand plumbing: `run <model>` supplies the model dir + serve

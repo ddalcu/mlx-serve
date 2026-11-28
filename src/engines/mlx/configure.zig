@@ -91,4 +91,16 @@ pub fn apply(f: *const host.Flags) void {
     scheduler_mod.prefill_decode_share = f.prefill_decode_share;
     @import("transformer.zig").cli().mtp_head_kv_quant = f.mtp_head_kv_quant;
     generate_mod.mtp_acceptance_default = f.mtp_acceptance;
+    // Recall: the launch flags become the store's Shared state, once, here.
+    {
+        const recall_mod = @import("spec/recall.zig");
+        const st = recall_mod.shared_state.get();
+        st.enabled = f.recall;
+        st.shared = f.recall_shared;
+        st.read_only = f.recall_read_only;
+        st.cap_bytes = if (f.recall_gib > 0) @max(@as(u64, @intFromFloat(f.recall_gib * (1 << 30))), recall_mod.chunk_bytes) else st.cap_bytes;
+        if (f.recall_dir) |d| {
+            if (!recall_mod.setBaseDir(d)) return; // configure can't fail loudly; setBaseDir logs OOM
+        }
+    }
 }

@@ -1,6 +1,7 @@
 //! A streamed spoken reply on `/v1/chat/completions`: OpenAI's `delta.audio`, the text as `transcript` deltas (the
 //! frame slots and mode markers are not text) and the speech as 16-bit PCM `data` deltas as the codec makes it final.
 
+const auth = @import("../http/auth.zig");
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
@@ -61,6 +62,7 @@ pub fn handle(
         .max_tokens = max_tokens,
         .timeout_ns = http_server.getTimeoutNs(),
         .enable_pld = false,
+        .recall_loopback = auth.peerIsLoopback(stream),
         .enable_drafter = false,
         .drafter = null,
         .dflash = null,

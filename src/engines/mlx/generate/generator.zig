@@ -27,6 +27,7 @@ const group_cost = @import("../spec/mtp_group_cost.zig");
 const group_planner = @import("../spec/mtp_group_planner.zig");
 const ane_mod = @import("../../../sdk/ane/offload.zig");
 const scheduler_mod = @import("../scheduler.zig");
+const recall_mod = @import("../spec/recall.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -148,6 +149,17 @@ pub const Generator = struct {
     /// PLD's counterpart of the `gen.mtp != null` / `gen.drafter != null`
     /// conjuncts; PLD has no model handle, so the bit has to be explicit.
     pld_enabled: bool = false,
+    // ── Recall (sdk/recall) state ──
+    // Per-stream reader over the persistent token-id record, armed on the
+    // first PLD step that misses an in-context lookup; freed in `deinit`, which
+    // also records the request's prompt delta + reply into the record.
+    recall: ?recall_mod.Reader = null,
+    /// Monotonic step counter feeding the reader's quiet-round arithmetic.
+    recall_round: u64 = 0,
+    /// This request's peer is loopback: the record's trust lane. Keyed/LAN
+    /// peers keep it false, so they never read or write the shared record
+    /// unless the operator started the server with --recall-shared.
+    recall_loopback: bool = false,
     /// Stats for PLD benchmark logging. `pld_attempted` counts every step
     /// where lookup found a candidate (so a verify forward ran);
     /// `pld_accepted_tokens` is the cumulative number of *drafted* tokens
@@ -215,6 +227,8 @@ pub const Generator = struct {
     dflash_pol: ?DflashPol = null,
     /// Stats: rounds drafted from the context (no assistant forward), the tokens they proposed and the ones kept.
     dflash_copies: u64 = 0,
+    /// Recall grafts: copy rounds whose draft came from the persistent record.
+    dflash_recalls: u64 = 0,
     dflash_copy_drafted: u64 = 0,
     dflash_copy_accepted: u64 = 0,
     /// Stats: rounds that verified one row (no drafts), whether or not the assistant drafted for them.
@@ -576,6 +590,35 @@ pub const Generator = struct {
         return 0;
     }
 
+    /// Whether this request may touch the record at all: its peer is
+    /// loopback, or the operator passed --recall-shared.
+    pub fn recallLaneOk(self: *const Generator) bool {
+        return self.recall_loopback or recall_mod.shared_state.get().shared;
+    }
+
+    /// Recall: arm the per-stream reader on first use from any spec path
+    /// (PLD arms in nextPld; the DFlash rounds arm here). Null when Recall
+    /// is off, the request's peer is outside the record's trust lane, or the
+    /// tokenizer has no record.
+    pub fn recallArm(self: *Generator) ?*recall_mod.Reader {
+        if (!self.recallLaneOk()) return null;
+        if (self.recall == null and recall_mod.shared_state.get().enabled) {
+            self.recall = recall_mod.armReader(self.tok);
+        }
+        return if (self.recall) |*rd| rd else null;
+    }
+
+    /// Recall: the one record-ask helper every spec path shares (PLD's miss
+    /// path, the DFlash tree round, the DFlash copy round). `window` is the
+    /// trailing committed context — tailWindow for the DFlash paths, the
+    /// committed slice for PLD. Owned by the reader until the next ask.
+    pub fn recallAsk(self: *Generator, window: []const u32, most: usize) ?[]const u32 {
+        const rd = self.recallArm() orelse return null;
+        self.recall_round += 1;
+        const copy = rd.propose(window, most, self.recall_round);
+        return if (copy.len >= 2) copy else null;
+    }
+
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
         // A GPU-arm PLE settle still owed dies with the slot's history (the finish settled it first when the cache kept it).
         self.xfm.discardDeferredPle(&self.ctx);
@@ -604,6 +647,20 @@ pub const Generator = struct {
             st.deinit();
             st.a.destroy(st);
             self.speech = null;
+        }
+        // Recall (sdk/recall): what this request read and wrote goes into
+        // the persistent record — every spec mode ends here, so MTP/drafter/
+        // plain requests record too. Must run BEFORE `prompt_ids_owned` is
+        // freed. A null store (recall off, or an unopenable record) is a
+        // no-op.
+        if (self.recall) |*rd| {
+            rd.deinit();
+            self.recall = null;
+        }
+        if (self.recallLaneOk()) {
+            // Off the inference thread: the worker owns the dedup walk and
+            // the writes; this only copies the ids out.
+            _ = recall_mod.finishRequestAsync(self.tok, self.prompt_ids_owned, self.generated_ids.items);
         }
         if (self.prompt_ids_alloc) |a| {
             a.free(self.prompt_ids_owned);

@@ -1,5 +1,6 @@
 //! nonStreamingViaScheduler
 
+const auth = @import("../http/auth.zig");
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
@@ -79,6 +80,7 @@ pub fn nonStreamingViaScheduler(
         .max_tokens = max_tokens,
         .timeout_ns = timeout_ns,
         .enable_pld = enable_pld,
+        .recall_loopback = if (conn) |c| auth.peerIsLoopback(c) else false,
         .enable_drafter = enable_drafter and (lm.drafter != null or lm.dflash != null),
         .drafter = if (enable_drafter) lm.drafter else null,
         .dflash = if (enable_drafter) lm.dflash else null,

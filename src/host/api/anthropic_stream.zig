@@ -1,5 +1,6 @@
 //! handleAnthropicStreaming, delta/thinking emitters
 
+const auth = @import("../http/auth.zig");
 const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
@@ -121,6 +122,7 @@ pub fn handleAnthropicStreaming(
         .max_tokens = max_tokens,
         .timeout_ns = getTimeoutNs(),
         .enable_pld = stream_mode == .pld,
+        .recall_loopback = auth.peerIsLoopback(stream),
         .enable_drafter = stream_mode == .drafter,
         .drafter = if (stream_mode == .drafter) lm.drafter else null,
         .dflash = if (stream_mode == .drafter) lm.dflash else null,

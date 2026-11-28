@@ -4,6 +4,8 @@
 
 comptime {
     _ = @import("sdk/util/err_name.zig").last_tls;
+    _ = @import("engines/mlx/spec/recall.zig").shared_state;
+    _ = @import("engines/mlx/spec/recall.zig").worker_state;
     _ = @import("sdk/weights/streamed/expert.zig").expertState_shared;
     _ = @import("host/plugins/loader.zig").process;
     _ = @import("sdk/quant/outside.zig").tables;

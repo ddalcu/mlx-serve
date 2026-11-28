@@ -69,6 +69,17 @@ const plugin_driver = @import("../plugin/driver.zig");
 /// block.
 pub const verify_rows_max: usize = @max(mtp_group_planner.MAX_DEPTH + 1, dflash_policy.MAX_ROWS);
 
+/// The ONE home of per-request fields that are identical for every
+/// spec-dispatch arm: each arm builds its own `Generator` literal and returns
+/// through here, so a new field rides every arm or none — the recall lane
+/// once landed in one of five, silently disabling the feature for every
+/// served request while the suite stayed green.
+fn finishGen(gen: Generator, options: InitOptions) Generator {
+    var g = gen;
+    g.recall_loopback = options.recall_loopback;
+    return g;
+}
+
 pub fn initWithOptions(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -979,7 +990,7 @@ pub fn initWithOptions(
         gen.pending_logits = logits;
         gen.has_pending_logits = true;
         attachCp(&gen, &ssm_checkpoints, &ring_tail, allocator);
-        return gen;
+        return finishGen(gen, options);
     }
 
     if (dspark_active) if (intree.dsv41(xfm)) |m41| {
@@ -1073,7 +1084,7 @@ pub fn initWithOptions(
         // skipped under PLD / drafter / MTP. The speculative `next*` paths
         // drive every subsequent step with predictable cache offset.
         attachCp(&gen, &ssm_checkpoints, &ring_tail, allocator);
-        return gen;
+        return finishGen(gen, options);
     }
 
     // Phase 2: scheduler-managed slots ask init to sample t1 synchronously
@@ -1114,7 +1125,7 @@ pub fn initWithOptions(
         gen.pending_logits = logits;
         gen.has_pending_logits = true;
         attachCp(&gen, &ssm_checkpoints, &ring_tail, allocator);
-        return gen;
+        return finishGen(gen, options);
     }
     if (options.skip_lazy_preforward) {
         const sample_lazy = sampleTokenLazy(logits, sampling, s);
@@ -1157,7 +1168,7 @@ pub fn initWithOptions(
             .prompt_ids_alloc = allocator,
         };
         attachCp(&gen, &ssm_checkpoints, &ring_tail, allocator);
-        return gen;
+        return finishGen(gen, options);
     }
 
     // Regular path: sample first token lazily, then build the next forward pass
@@ -1218,7 +1229,7 @@ pub fn initWithOptions(
     gen.has_pending_logits = true;
 
     attachCp(&gen, &ssm_checkpoints, &ring_tail, allocator);
-    return gen;
+    return finishGen(gen, options);
 }
 
 // ── tests ──

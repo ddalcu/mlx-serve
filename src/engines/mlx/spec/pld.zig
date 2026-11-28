@@ -23,6 +23,7 @@ const specDecodeUnsupported = @import("verify.zig").specDecodeUnsupported;
 const specShouldReenable = @import("gates.zig").specShouldReenable;
 const verifyArgmax = @import("verify.zig").verifyArgmax;
 const yieldGateShouldDisable = @import("gates.zig").yieldGateShouldDisable;
+const recall_mod = @import("recall.zig");
 
 
 /// Selects the source slice that `initWithOptions` will dupe into
@@ -197,6 +198,21 @@ pub fn nextPld(
         if (d.len == 0) draft_slice = null;
     }
 
+    // ── Phase 1b: Recall ──
+    // The in-context lookup found nothing; ask the persistent record of what
+    // earlier requests read and wrote (sdk/recall). Priced by landing rate, so
+    // a cold or noisy record stops proposing by itself; the copy is verified
+    // below exactly like an in-context draft — replies stay byte-identical.
+    var recall_used = false;
+    var recall_proposed: i64 = 0;
+    if (draft_slice == null) {
+        if (self.recallAsk(committed, max_draft)) |copy| {
+            draft_slice = copy;
+            recall_used = true;
+            recall_proposed = @intCast(copy.len);
+        }
+    }
+
     const stochastic = self.sampling.temperature > 0.01;
 
     // ── Phase 2: Cold path (no n-gram match) ──
@@ -236,6 +252,8 @@ pub fn nextPld(
             self.spec_disabled_runtime = true;
             self.disabled_steps = 0;
         }
+
+        if (self.recall) |*rd| rd.noteHead(1); // a cold round lands one token
 
         const tokens = try allocator.alloc(u32, 1);
         tokens[0] = t1;
@@ -503,6 +521,17 @@ pub fn nextPld(
         );
         self.spec_disabled_runtime = true;
         self.disabled_steps = 0;
+    }
+
+    if (self.recall) |*rd| {
+        if (recall_used) {
+            // The copy's landing feeds its band's rate (and a zero-landing
+            // copy quiets the stream for a few rounds).
+            rd.observe(recall_proposed, @intCast(accepted), self.recall_round);
+        } else {
+            // The stream's own in-context round landed 1+accepted tokens.
+            rd.noteHead(num_emit);
+        }
     }
 
     return PldStepResult{

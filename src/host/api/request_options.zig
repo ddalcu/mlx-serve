@@ -30,6 +30,19 @@ const StreamMode = @import("chat_stream.zig").StreamMode;
 /// "pure novel" (PLD overhead-only). Re-tune by sweeping `enable_pld` on/off
 /// across an echo-heavy vs novel-content prompt set and picking the threshold
 /// that maximizes (echo_speedup / novel_overhead).
+/// Recall's exemption from the spec gate, the ONE copy all three surfaces
+/// (chat-completions, Anthropic, Responses) call: a record for this
+/// tokenizer holds this request's prompt tail, AND the request's peer may
+/// touch the record at all — loopback, or --recall-shared. Keyed/LAN peers
+/// never exempt the gate: a record hit decodes measurably faster, which
+/// would let them probe what other clients' conversations held.
+pub fn recallGateExempts(stream: *const @import("../http/conn.zig").Conn, tok: ?*const @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer, prompt_ids: []const u32) bool {
+    const engine = @import("../engines/mlx.zig");
+    const auth = @import("../http/auth.zig");
+    const t = tok orelse return false;
+    return engine.recallExempts(t, prompt_ids, auth.peerIsLoopback(stream));
+}
+
 pub const spec_gate_threshold: f32 = 0.01;
 
 /// MTP-vs-PLD coexistence routing. When a model has BOTH a trained MTP head and
